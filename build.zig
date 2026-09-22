@@ -51,7 +51,6 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
 fn addTestRunArtifact(
     b: *std.Build,
     artifact: *std.Build.Step.Compile,
-    windows_prelude: ?*std.Build.Step.Run,
 ) *std.Build.Step.Run {
     const run = b.addRunArtifact(artifact);
     // A test gate must execute on every invocation; a warm build cache may
@@ -59,7 +58,6 @@ fn addTestRunArtifact(
     // steps regardless, but state the doctrine here so a future caching change
     // cannot silently turn cached test binaries into stale green evidence.
     run.has_side_effects = true;
-    if (windows_prelude) |prelude| run.step.dependOn(&prelude.step);
     return run;
 }
 
@@ -495,23 +493,6 @@ pub fn build(b: *std.Build) void {
     if (integration_test_shards == 0 or integration_test_shards > 64) @panic("-Dintegration-test-shards must be between 1 and 64");
     const agentcore_strip = b.option(bool, "agentcore-strip", "Strip AgentCore library debug information") orelse (optimize != .Debug);
 
-    // Compatibility prelude for the remaining tests that spell temporary
-    // paths as `/tmp/...`. On Windows that means `\tmp` at the current drive
-    // root. Every Windows test run depends on this host-native step so a fresh
-    // machine cannot fail merely because the legacy directory is absent.
-    const windows_test_prelude = if (target.result.os.tag == .windows) blk: {
-        const prelude_mod = b.createModule(.{
-            .root_source_file = b.path("scripts/windows_test_prelude.zig"),
-            .target = b.graph.host,
-            .optimize = .ReleaseSafe,
-        });
-        const prelude_exe = b.addExecutable(.{
-            .name = "windows-test-prelude",
-            .root_module = prelude_mod,
-        });
-        break :blk b.addRunArtifact(prelude_exe);
-    } else null;
-
     // 固定产出两个二进制：metacodes (ReleaseSmall) 和 metacodes-debug (Debug)。
     // 不受 -Doptimize 影响，一次 build 同时得到发布版和调试版。
     const release_mod = b.createModule(.{
@@ -898,7 +879,7 @@ pub fn build(b: *std.Build) void {
         "Enforce the unique HTTP response status boundary",
     );
     http_status_gate_step.dependOn(&http_status_gate_run.step);
-    http_status_gate_step.dependOn(&addTestRunArtifact(b, http_status_gate_unit, windows_test_prelude).step);
+    http_status_gate_step.dependOn(&addTestRunArtifact(b, http_status_gate_unit).step);
 
     // One-shot paid feasibility probe for the isolated rule-author adapter.
     // It is intentionally absent from the default install graph; the Python
@@ -991,25 +972,25 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_abi_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test).step);
     const agentcore_types_test = b.addTest(.{
         .name = "agentcore-types-unit",
         .root_module = agentcore_types_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test).step);
     const agentcore_protocol_test = b.addTest(.{
         .name = "agentcore-protocol-unit",
         .root_module = agentcore_protocol_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test).step);
     const agentcore_sdk_test = b.addTest(.{
         .name = "agentcore-sdk-unit",
         .root_module = agentcore_sdk_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_sdk_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_sdk_test).step);
     const agentcore_zig_package_build_test_mod = b.createModule(.{
         .root_source_file = b.path("sdk/zig/build.zig"),
         .target = b.graph.host,
@@ -1020,7 +1001,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_zig_package_build_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_zig_package_build_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_zig_package_build_test).step);
     const agentcore_manifest_contract_mod = b.createModule(.{
         .root_source_file = b.path("tests/agentcore_artifact_consumer/manifest_contract.zig"),
         .target = target,
@@ -1031,7 +1012,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_manifest_contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_contract_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_contract_test).step);
     const agentcore_manifest_tool_mod = b.createModule(.{
         .root_source_file = b.path("scripts/agentcore_manifest.zig"),
         .target = b.graph.host,
@@ -1052,7 +1033,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_manifest_tool_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test).step);
 
     // ── release:manifest / release:check / release:verify (#80, #47 stage 5) ──
     // The CLI release unit is the staged prefix sealed with manifest.json
@@ -1100,9 +1081,9 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     const release_test_step = b.step("release:test", "Unit tests of the release manifest generator and contract");
-    release_test_step.dependOn(&addTestRunArtifact(b, release_manifest_tool_test, windows_test_prelude).step);
-    release_test_step.dependOn(&addTestRunArtifact(b, manifest_common_test, windows_test_prelude).step);
-    release_test_step.dependOn(&addTestRunArtifact(b, release_contract_test, windows_test_prelude).step);
+    release_test_step.dependOn(&addTestRunArtifact(b, release_manifest_tool_test).step);
+    release_test_step.dependOn(&addTestRunArtifact(b, manifest_common_test).step);
+    release_test_step.dependOn(&addTestRunArtifact(b, release_contract_test).step);
 
     const release_manifest_cmd = b.addRunArtifact(release_manifest_tool);
     release_manifest_cmd.addArgs(&.{
@@ -1195,7 +1176,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_symbol_gate_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_symbol_gate_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_symbol_gate_test).step);
     // header 可编译性检查:走 zig 构建系统原生 C 对象(不 install,只编译)。
     // 不用系统 cc(Windows 没有),也不用 `zig cc -fsyntax-only`(zig 0.16 Windows 实测
     // 对任何输入报 FileNotFound;`-c` 正常)。对象编译 = 语法+类型检查,跨平台等价。
@@ -1239,7 +1220,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_contract_test, windows_test_prelude).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_contract_test).step);
 
     const agentcore_lib = b.addLibrary(.{
         .name = "metask_agentcore",
@@ -1701,7 +1682,7 @@ pub fn build(b: *std.Build) void {
     const core_test_step = b.step("test:lib", "Run the complete metacodes-core suite in checked deterministic shards");
     const core_shard_reports = b.allocator.alloc(std.Build.LazyPath, lib_test_shards) catch @panic("OOM");
     for (0..lib_test_shards) |shard_index| {
-        const run_shard = addTestRunArtifact(b, core_test, windows_test_prelude);
+        const run_shard = addTestRunArtifact(b, core_test);
         // captureStdOut would otherwise make the Run step cacheable. A test
         // gate must execute on every invocation; cached reports are evidence
         // from an earlier repository/environment state, not current feedback.
@@ -1725,7 +1706,7 @@ pub fn build(b: *std.Build) void {
     for (core_shard_reports) |report| run_core_shard_reporter.addFileArg(report);
     core_test_step.dependOn(&run_core_shard_reporter.step);
 
-    const core_monolithic_run = addTestRunArtifact(b, core_test, windows_test_prelude);
+    const core_monolithic_run = addTestRunArtifact(b, core_test);
     core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
     const core_test_monolithic_step = b.step("test:lib-monolithic", "Run the complete metacodes-core suite in one diagnostic process");
@@ -1762,7 +1743,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const core_test_times_step = b.step("test:lib-times", "Run metacodes-core tests with per-test timing diagnostics");
-    core_test_times_step.dependOn(&addTestRunArtifact(b, core_timed_test, windows_test_prelude).step);
+    core_test_times_step.dependOn(&addTestRunArtifact(b, core_timed_test).step);
     core_test_step.dependOn(http_status_gate_step);
 
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
@@ -1777,7 +1758,7 @@ pub fn build(b: *std.Build) void {
     addPlatform(b, lsp_test_mod); // lsp/ 依赖 platform（sync/process），隔离测试也需
     const lsp_test = b.addTest(.{ .name = "lsp-test", .root_module = lsp_test_mod });
     const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
-    lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test, windows_test_prelude).step);
+    lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test).step);
 
     // test:provider —— issue #16 provider offer kernel, in isolation.
     // Compiles the subsystem from a narrow root, which proves it *builds*
@@ -1795,7 +1776,7 @@ pub fn build(b: *std.Build) void {
     addPlatform(b, provider_test_mod); // control_plane guards its state with platform/sync
     const provider_test = b.addTest(.{ .name = "provider-test", .root_module = provider_test_mod });
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
-    provider_test_step.dependOn(&addTestRunArtifact(b, provider_test, windows_test_prelude).step);
+    provider_test_step.dependOn(&addTestRunArtifact(b, provider_test).step);
 
     // subsystem:boundary —— the provider kernel and the picker may import only
     // what their doc comments say. The compile-from-a-narrow-root gates below
@@ -1822,7 +1803,7 @@ pub fn build(b: *std.Build) void {
         "Enforce the provider and picker import boundaries (issue #16)",
     );
     subsystem_boundary_step.dependOn(&subsystem_boundary_run.step);
-    subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit, windows_test_prelude).step);
+    subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit).step);
 
     // test:picker —— issue #16 cross-UI model picker, in isolation.
     // Same shape as `test:provider`: it proves the picker builds standalone.
@@ -1837,7 +1818,7 @@ pub fn build(b: *std.Build) void {
     addPlatform(b, picker_test_mod);
     const picker_test = b.addTest(.{ .name = "picker-test", .root_module = picker_test_mod });
     const picker_test_step = b.step("test:picker", "Test the cross-UI model picker in isolation (issue #16)");
-    picker_test_step.dependOn(&addTestRunArtifact(b, picker_test, windows_test_prelude).step);
+    picker_test_step.dependOn(&addTestRunArtifact(b, picker_test).step);
 
     // test:platform —— 可移植抽象层(sync/process/fs/signal/rng/paths)。platform 成独立命名模块后
     // 其测试不再聚合进 cc-test，故独立入口。process fork 真子进程测试需 METACODES_PROC_TEST=1 启用。
@@ -1849,7 +1830,7 @@ pub fn build(b: *std.Build) void {
     });
     const platform_test = b.addTest(.{ .name = "platform-test", .root_module = platform_test_mod });
     const platform_test_step = b.step("test:platform", "Test the portable platform abstraction layer");
-    const platform_test_run = addTestRunArtifact(b, platform_test, windows_test_prelude);
+    const platform_test_run = addTestRunArtifact(b, platform_test);
     platform_test_step.dependOn(&platform_test_run.step);
 
     // example —— 独立消费者,经 module 用库跑一轮 agent loop(见 example/main.zig)。
@@ -1990,7 +1971,7 @@ pub fn build(b: *std.Build) void {
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const test_run = addTestRunArtifact(b, test_obj, windows_test_prelude);
+    const test_run = addTestRunArtifact(b, test_obj);
     wireTinyKgTestInput(test_run, staged_tinykg);
     wireTinyKgdTestInput(test_run, staged_tinykgd);
     test_step.dependOn(&test_run.step);
@@ -2118,7 +2099,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         spike_step.dependOn(&run_t.step);
     }
 
@@ -2146,7 +2127,7 @@ pub fn build(b: *std.Build) void {
     });
     const integration_reports = b.allocator.alloc(std.Build.LazyPath, integration_test_shards) catch @panic("OOM");
     for (0..integration_test_shards) |shard_index| {
-        const run_shard = addTestRunArtifact(b, integration_suite_test, windows_test_prelude);
+        const run_shard = addTestRunArtifact(b, integration_suite_test);
         run_shard.has_side_effects = true;
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{integration_test_shards}));
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
@@ -2163,7 +2144,7 @@ pub fn build(b: *std.Build) void {
     for (integration_reports) |report| run_integration_reporter.addFileArg(report);
     spike_step.dependOn(&run_integration_reporter.step);
 
-    const integration_monolithic_run = addTestRunArtifact(b, integration_suite_test, windows_test_prelude);
+    const integration_monolithic_run = addTestRunArtifact(b, integration_suite_test);
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
     integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
@@ -2181,7 +2162,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const integration_timed_run = addTestRunArtifact(b, integration_timed_test, windows_test_prelude);
+    const integration_timed_run = addTestRunArtifact(b, integration_timed_test);
     integration_timed_run.step.dependOn(&install_mock_mcp.step);
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
     wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
@@ -2207,7 +2188,7 @@ pub fn build(b: *std.Build) void {
         .root_module = dispatcher_metadata_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const dispatcher_metadata_run = addTestRunArtifact(b, dispatcher_metadata_test, windows_test_prelude);
+    const dispatcher_metadata_run = addTestRunArtifact(b, dispatcher_metadata_test);
     const dispatcher_metadata_step = b.step("test:dispatcher-metadata", "Run the ToolDispatcher metadata acceptance suite");
     dispatcher_metadata_step.dependOn(&dispatcher_metadata_run.step);
     test_step.dependOn(&dispatcher_metadata_run.step);
@@ -2238,7 +2219,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         skill_runtime_step.dependOn(&run_t.step);
     }
     const skill_runtime_unit_mod = b.createModule(.{
@@ -2262,7 +2243,6 @@ pub fn build(b: *std.Build) void {
         &addTestRunArtifact(
             b,
             skill_runtime_unit,
-            windows_test_prelude,
         ).step,
     );
 
@@ -2348,7 +2328,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        new_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
+        new_step.dependOn(&addTestRunArtifact(b, t).step);
     }
 
     // 五个 AgentDef 运行字段的聚焦门；开发时无需编译整套 component artifacts。
@@ -2368,7 +2348,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        agentdef_fields_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
+        agentdef_fields_step.dependOn(&addTestRunArtifact(b, t).step);
     }
 
     // test:mem —— 记忆系统 L2 组件测试(隔离 artifact,绕开主套件 integration 挂起)。
@@ -2394,7 +2374,7 @@ pub fn build(b: *std.Build) void {
                 .root_module = m,
                 .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
             });
-            mem_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
+            mem_step.dependOn(&addTestRunArtifact(b, t).step);
         }
     }
 
@@ -2416,7 +2396,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG governance:"},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         wireTinyKgTestInput(run_t, staged_tinykg);
         wireTinyKgdTestInput(run_t, staged_tinykgd);
         kg_governance_step.dependOn(&run_t.step);
@@ -2441,7 +2421,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG ontology feedback:"},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         wireTinyKgTestInput(run_t, staged_tinykg);
         wireTinyKgdTestInput(run_t, staged_tinykgd);
         kg_ontology_feedback_step.dependOn(&run_t.step);
@@ -2466,7 +2446,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG experience feedback:"},
         });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        const run_t = addTestRunArtifact(b, t);
         wireTinyKgTestInput(run_t, staged_tinykg);
         wireTinyKgdTestInput(run_t, staged_tinykgd);
         kg_experience_feedback_step.dependOn(&run_t.step);
@@ -2544,7 +2524,6 @@ pub fn build(b: *std.Build) void {
         windows_tty_cmd.step.dependOn(&install_debug.step);
         windows_tty_cmd.step.dependOn(&install_mock_mcp.step);
         windows_tty_cmd.step.dependOn(&install_replay.step);
-        if (windows_test_prelude) |prelude| windows_tty_cmd.step.dependOn(&prelude.step);
         windows_tty_step.dependOn(&windows_tty_cmd.step);
     }
 

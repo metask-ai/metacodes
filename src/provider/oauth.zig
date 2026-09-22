@@ -20,6 +20,7 @@
 //!   a fake exchange rather than a network.
 
 const std = @import("std");
+const util_fs = @import("../util/fs.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
@@ -751,7 +752,12 @@ const FakeExchange = struct {
 
 fn tempSession(a: std.mem.Allocator, name: []const u8) !Session {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buffer, "/tmp/metacodes-oauth-{s}.json", .{name});
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buffer, "{s}/cc-zig-oauth-{s}-{d}.json", .{
+        util_fs.testing.tmpRoot(&root_buf),
+        name,
+        @import("platform").process.currentPid(),
+    });
     var cleanup: [std.fs.max_path_bytes]u8 = undefined;
     for ([_][]const u8{ "", ".tmp" }) |suffix| {
         const target = std.fmt.bufPrintZ(&cleanup, "{s}{s}", .{ path, suffix }) catch continue;
@@ -1092,26 +1098,12 @@ test "the lifecycle serves the OAuth kinds and leaves Metask on its own path" {
 
 test "the token store creates every missing parent directory" {
     const a = std.testing.allocator;
-    const root = "/tmp/metacodes-oauth-parents";
-    const path = root ++ "/nested/deeper/openai.json";
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const cleanup = struct {
-        fn run(buf: []u8) void {
-            for ([_][]const u8{
-                root ++ "/nested/deeper/openai.json",
-                root ++ "/nested/deeper/openai.json.tmp",
-            }) |target| {
-                const z = std.fmt.bufPrintZ(buf, "{s}", .{target}) catch continue;
-                pfs.unlinkPath(z) catch {};
-            }
-            for ([_][]const u8{ root ++ "/nested/deeper", root ++ "/nested", root }) |dir| {
-                const z = std.fmt.bufPrintZ(buf, "{s}", .{dir}) catch continue;
-                _ = std.c.rmdir(z.ptr);
-            }
-        }
-    }.run;
-    cleanup(&buffer);
-    defer cleanup(&buffer);
+    var root_buf: [512]u8 = undefined;
+    const root = util_fs.testing.perPidDir(&root_buf, "cc-zig-oauth-parents");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/nested/deeper/openai.json", .{root});
+    util_fs.testing.rmrfBestEffort(root);
+    defer util_fs.testing.rmrfBestEffort(root);
 
     var session = try Session.init(a, Slug.lit("openai"), path);
     defer session.deinit();

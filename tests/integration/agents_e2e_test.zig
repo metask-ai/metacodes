@@ -54,7 +54,8 @@ test "Subagents E2E: 3 builtins injected on init" {
 
 test "Subagents E2E: custom personal-level agent loaded" {
     const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-agents-personal";
+    var dir_buf: [512]u8 = undefined;
+    const dir = cc.util_fs.testing.perPidDir(&dir_buf, "cc-zig-agents-personal");
     defer {
         rmAgent(dir, "code-reviewer.md");
         rmDir(dir);
@@ -73,8 +74,10 @@ test "Subagents E2E: custom personal-level agent loaded" {
 
 test "Subagents E2E: project overrides personal" {
     const a = std.testing.allocator;
-    const p1 = "/tmp/cc-zig-ag-prio1";
-    const p2 = "/tmp/cc-zig-ag-prio2";
+    var p1_buf: [512]u8 = undefined;
+    const p1 = cc.util_fs.testing.perPidDir(&p1_buf, "cc-zig-ag-prio1");
+    var p2_buf: [512]u8 = undefined;
+    const p2 = cc.util_fs.testing.perPidDir(&p2_buf, "cc-zig-ag-prio2");
     defer {
         rmAgent(p1, "x.md");
         rmDir(p1);

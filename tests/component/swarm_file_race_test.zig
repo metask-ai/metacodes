@@ -27,8 +27,8 @@ const Writer = struct {
 
 test "swarm file protocol race: atomicWrite and load stay valid during replacement" {
     const a = std.testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-swarm-file-race-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-swarm-file-race");
     defer cc.util_fs.testing.rmrfBestEffort(home);
     try cc.util_fs.mkdirParents(home);
 

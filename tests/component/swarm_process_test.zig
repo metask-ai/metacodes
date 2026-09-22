@@ -48,8 +48,8 @@ fn mockSawFlag(needle: []const u8) bool {
 
 test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 追踪,mock fork)" {
     const a = std.testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw6-spawn-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-spawn");
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
     try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
@@ -82,8 +82,8 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
 
 test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {
     const a = std.testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw6-res-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-res");
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
     try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
@@ -98,8 +98,8 @@ test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {
 
 test "L2 SW6: process teammate rejects a parent session different from swarm routing" {
     const a = std.testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw6-session-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-session");
     defer cc.util_fs.testing.rmrfBestEffort(home);
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
     try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
@@ -146,8 +146,8 @@ test "L2 SW6 A: --teammate 身份 args 解析进 config" {
 test "L2 SW6 B: worktree 隔离 create + remove(真 git)" {
     const a = std.testing.allocator;
     // 临时 git repo。
-    var root_buf: [128]u8 = undefined;
-    const root = try std.fmt.bufPrint(&root_buf, "/tmp/cc-zig-sw6-wt-{d}", .{cc.util_time.nowNs()});
+    var root_buf: [256]u8 = undefined;
+    const root = cc.util_fs.testing.uniqueDir(&root_buf, "cc-zig-sw6-wt");
     defer cc.util_fs.testing.rmrfBestEffort(root);
     try cc.util_fs.mkdirParents(root);
     // git init + 一个 commit(worktree add 需至少一个 ref)。
@@ -277,8 +277,8 @@ test "L2: lead 的 --no-lsp 跟着进程外 teammate 过进程边界" {
     // LSP 默认开之后,不透传就等于"lead 关了、teammate 照样起 language server"——逃生口
     // 在进程边界上漏掉,而进程外 teammate 恰恰是资源开销最该被尊重的地方。
     const a = std.testing.allocator;
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-sw6-nolsp-{d}", .{cc.util_time.nowNs()});
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-nolsp");
     defer cc.util_fs.testing.rmrfBestEffort(home);
     for ([_]bool{ true, false }) |lead_lsp_on| {
         // 每轮重建:lead 的 sw.deinit() 会做 orphan 清理删掉整个 team 目录。

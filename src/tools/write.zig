@@ -1,5 +1,4 @@
 const std = @import("std");
-const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
@@ -347,8 +346,8 @@ test "WriteTool ~ 展开端到端" {
     const a = std.testing.allocator;
     var seed: [256]u8 = undefined;
     _ = tt.path(&seed, "seed"); // 触发 test_tmp 建 /tmp/cc-zig-test-<pid> 目录
-    var hbuf: [128]u8 = undefined;
-    const home = std.fmt.bufPrint(&hbuf, "/tmp/cc-zig-test-{d}", .{@as(i64, pprocess.currentPid())}) catch unreachable;
+    var hbuf: [512]u8 = undefined;
+    const home = tt.dir(&hbuf);
     var ctx = testCtx();
     ctx.home_dir = home;
     const r = try execute(&ctx, "{\"file_path\":\"~/tilde-write-test.txt\",\"content\":\"hello-tilde\"}");

@@ -1,4 +1,5 @@
 const std = @import("std");
+const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 const process = @import("platform").process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
@@ -576,14 +577,15 @@ test "spawnCaptureStdoutCapped 截断无限输出且不挂死" {
 
 test "readAllFromFdCapped:超 cap 返 FileTooLarge、cap 内正常读(轴A 统一入口)" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-readcapped-test.txt";
-    const fd_w = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "readcapped-test.txt");
+    const fd_w = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     try std.testing.expect(fd_w >= 0);
     var payload: [10000]u8 = undefined;
     @memset(&payload, 'z');
     _ = pfs.write(fd_w, &payload); // 10KB
     _ = pfs.close(fd_w);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
     // cap=5KB < 10KB → FileTooLarge。
     {
