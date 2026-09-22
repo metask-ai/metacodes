@@ -15,7 +15,7 @@
 | Agent-security 评价对象不一致 | 题目写“本次交互中 Agent 自身”，GT 固定为未抵抗；报告评估的是当前 agent | 存在明确歧义，需要维护者明确测量对象；未作为已确认 bug 发布 |
 | 修复后能追平官方 76.32 | 没有完成修复后的模型对照实验，也没有官方逐题配对结果 | **尚未证实**，未写入新 issue |
 
-这次新增的容器验证比前一轮路径重定向的离线重放更直接：测试源码与 groundtruth 均只读挂载，直接运行 `/tests/verify_findings.py`，没有替换路径常量或模拟评分逻辑。四个实验只用合成编号和公式字符串，不依赖任何模型答案，也不执行安全载荷。结果见[容器证据](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/evidence/shared-matcher-container-repro.json)，脚本见[repro_shared_matcher.py](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/repro_shared_matcher.py)。
+这次新增的容器验证比前一轮路径重定向的离线重放更直接：测试源码与 groundtruth 均只读挂载，直接运行 `/tests/verify_findings.py`，没有替换路径常量或模拟评分逻辑。四个实验只用合成编号和公式字符串，不依赖任何模型答案，也不执行安全载荷。结果见[容器证据](evidence/shared-matcher-container-repro.json)，脚本见[repro_shared_matcher.py](repro_shared_matcher.py)。
 
 归档 SHA-256 是 `f615f55b2ce68294eca6bef658d3a135978ca1e7f00b8e712292a2738f79c3f3`，与官方公布值一致；该共享评分器 SHA-256 为 `1dd4d997a20b1241019fdd955aaf42dfd406015c2e56b87f54b0781398bd6a6e`。
 
@@ -45,4 +45,4 @@ Security 并不是一个统一评分器：27/60 题逐字节复用这份通用�
 
 要比较整个模块的质量，需要在四个模块上采用一致审计标准：从公开要求生成合法等价输出作为正例，构造明确违反要求的负例，检查不可达条件、提前退出和缺失产物，再比较错判率、受影响权重及对正式成绩的影响。现在 Security 的检查深度明显更大，直接按发现的 bug 数排名会有审计强度偏差。
 
-新 issue 因此只陈述可复现的两个 matcher 错误，不包含模型实力、排行榜差值或跨模块优劣判断。正文见[已发布草稿](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/issue-shared-matcher.md)，发布回读见[发布记录](/Users/david/prj/cc-t2z/metacodes/evals/benchmarks/2026-09-12-security-trajectory-research/evidence/published-issue20.json)。
+新 issue 因此只陈述可复现的两个 matcher 错误，不包含模型实力、排行榜差值或跨模块优劣判断。正文见[已发布草稿](issue-shared-matcher.md)，发布回读见[发布记录](evidence/published-issue20.json)。
