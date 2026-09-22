@@ -1,0 +1,20 @@
+{
+  "sysctl_protected_regular": "2",
+  "same_uid_reopen": "success",
+  "root_unique_tmpfile": "success",
+  "results": [
+    {
+      "path": "/tmp/uid-probe.log",
+      "owner_uid": 1001,
+      "mode": "0o666",
+      "root_reopen": "PermissionError",
+      "errno": 13
+    },
+    {
+      "path": "/workdir/uid-probe.log",
+      "owner_uid": 1001,
+      "mode": "0o666",
+      "root_reopen": "success"
+    }
+  ]
+}

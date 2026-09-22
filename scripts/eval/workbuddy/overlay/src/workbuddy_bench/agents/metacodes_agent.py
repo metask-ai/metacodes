@@ -585,6 +585,24 @@ class MetacodesAgent(BaseInstalledAgent):
                 # fail-soft repair cannot fail before its guarded body runs.
                 cwd="/" if task_workdir else None,
             )
+            # Sec-style audit tasks instruct the agent to write its report
+            # beside the audited source (e.g. /app/report.jsonl) while the
+            # image owns that directory as root:root 755 and the rollout runs
+            # as the non-root agent user.  Without this grant the agent's
+            # report silently never reaches the verifier's path.  Grant the
+            # directory itself only — never recurse, so task source files
+            # keep their original ownership for the verifier's diff checks.
+            # Best effort: tasks without /app (or with it already writable)
+            # are unaffected.
+            await self.exec_as_root(
+                environment,
+                command=(
+                    "(if [ -d /app ] && [ ! -L /app ]; then "
+                    f"chown {escaped_user} /app && chmod u+rwx /app; "
+                    "fi) || true"
+                ),
+                cwd="/",
+            )
 
     def _collect_outcomes(self):
         """已完成 trial 的 verifier 结局(本 run 的兄弟 trial + 声明的

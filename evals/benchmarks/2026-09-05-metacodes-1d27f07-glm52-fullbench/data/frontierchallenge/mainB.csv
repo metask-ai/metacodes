@@ -1,0 +1,22 @@
+task_id,trial_name,agent,model,task_score,passed,evaluation_complete,scored_zero_missing_artifact,error
+task_007_pxrd_indexing_cell_refinement,task_007_pxrd_indexing_cell_refi__pTJ7DVH,metacodes_agent:MetacodesCLI,glm-5.2,0.9208,1.0,1.0,False,
+task_010_polarization_316l_corrosion,task_010_polarization_316l_corro__ykKrHNC,metacodes_agent:MetacodesCLI,glm-5.2,0.9818000000000001,1.0,1.0,False,
+task_023_tce_dual_isotope_degradation,task_023_tce_dual_isotope_degrad__AhCbXrf,metacodes_agent:MetacodesCLI,glm-5.2,0.8437,1.0,1.0,False,
+task_026_suzuki_reaction_kinetics,task_026_suzuki_reaction_kinetic__nHCp7BU,metacodes_agent:MetacodesCLI,glm-5.2,0.8774,1.0,1.0,False,
+task_029_extraction_crystallization_balance,task_029_extraction_crystallizat__yuAQwgz,metacodes_agent:MetacodesCLI,glm-5.2,0.65,0.0,1.0,False,
+task_032_co2_capture_solvent_cycle,task_032_co2_capture_solvent_cyc__bAPBkHW,metacodes_agent:MetacodesCLI,glm-5.2,0.9451999999999999,1.0,1.0,False,
+task_035_ebsd_austenite_reconstruction,task_035_ebsd_austenite_reconstr__8Ss9pr3,metacodes_agent:MetacodesCLI,glm-5.2,0.4073,0.0,1.0,False,
+task_038_hzo_pund_polarization,task_038_hzo_pund_polarization__jh6j7XH,metacodes_agent:MetacodesCLI,glm-5.2,0.55,0.0,1.0,False,
+task_041_chromium_speciation_lcicpms,task_041_chromium_speciation_lci__tvsK6si,metacodes_agent:MetacodesCLI,glm-5.2,0.9516,1.0,1.0,False,
+task_044_asymmetric_reduction_characterization,task_044_asymmetric_reduction_ch__E4zWwHR,metacodes_agent:MetacodesCLI,glm-5.2,0.0,0.0,1.0,True,required artifact missing from submission - genuine 0
+task_048_scxrd_twin_disorder,task_048_scxrd_twin_disorder__M5RZobu,metacodes_agent:MetacodesCLI,glm-5.2,0.5,0.0,1.0,False,
+task_053_protein_cgmd_structure_prep,task_053_protein_cgmd_structure__uhXF8Nc,metacodes_agent:MetacodesCLI,glm-5.2,0.5,0.0,1.0,False,
+task_059_alanine_dipeptide_md,task_059_alanine_dipeptide_md__pZmRDHx,metacodes_agent:MetacodesCLI,glm-5.2,0.958367,1.0,1.0,False,
+task_062_hydration_free_energy_ti,task_062_hydration_free_energy_t__fVksCFP,metacodes_agent:MetacodesCLI,glm-5.2,0.0,0.0,1.0,True,required artifact missing from submission - genuine 0
+task_066_rnaseq_differential_expression,task_066_rnaseq_differential_exp__QTk6mhu,metacodes_agent:MetacodesCLI,glm-5.2,0.85,1.0,1.0,False,
+task_097_dsc_kissinger_kinetics,task_097_dsc_kissinger_kinetics__iLnUY6G,metacodes_agent:MetacodesCLI,glm-5.2,0.9730329999999999,1.0,1.0,False,
+task_101_ic_anion_quantification,task_101_ic_anion_quantification__NP4nCLx,metacodes_agent:MetacodesCLI,glm-5.2,0.894633,1.0,1.0,False,
+task_104_aln_bn_laser_flash,task_104_aln_bn_laser_flash__3E44uHm,metacodes_agent:MetacodesCLI,glm-5.2,0.607,0.0,1.0,False,
+task_107_aln_lfa_thermal,task_107_aln_lfa_thermal__TnZtMv8,metacodes_agent:MetacodesCLI,glm-5.2,0.5806,0.0,1.0,False,
+task_110_bi2te3_thermoelectric,task_110_bi2te3_thermoelectric__epWtgSG,metacodes_agent:MetacodesCLI,glm-5.2,0.9473,1.0,1.0,False,
+task_113_jr_curve_toughness,task_113_jr_curve_toughness__G8BCBnx,metacodes_agent:MetacodesCLI,glm-5.2,0.9686,1.0,1.0,False,

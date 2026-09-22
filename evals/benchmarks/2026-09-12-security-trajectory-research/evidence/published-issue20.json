@@ -1,0 +1,8 @@
+{
+  "number": 20,
+  "url": "https://github.com/Tencent/workbuddy-bench/issues/20",
+  "state": "OPEN",
+  "title": "[WB-Bench-Sec] Shared matcher accepts CWE-78 as CWE-787 and rejects equivalent formula spacing",
+  "body_sha256": "8e306d8017135c935e665d37086fbd713e926d77e306a357bfe46989e8ef9e73",
+  "readback_matches_draft": true
+}

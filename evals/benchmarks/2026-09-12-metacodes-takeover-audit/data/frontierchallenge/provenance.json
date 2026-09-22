@@ -1,0 +1,60 @@
+{
+  "archived_round": "2026-09-05-metacodes-1d27f07-glm52-fullbench",
+  "system_under_test": {
+    "scaffold": "metacodes",
+    "commit": "1d27f074f7ae90a428d805b8b387b20d574ca9df",
+    "commit_title": "core: MCP, host stream and process-plugin results are sealed during execution and published at the batch commit boundary (#65) (#76)",
+    "zig": "0.16.0",
+    "binary_sha256": "e2552aad56c3c11139d2a8f042599adab49382e90d84bda399e76ac6d2e81cd6",
+    "model": "glm-5.2",
+    "gateway": "napi.metask-ai.com (anthropic wire, /v1/messages)"
+  },
+  "frontierchallenge": {
+    "source": "ApodexAI/FrontierAgent benchmarks/frontierchallenge",
+    "track": "open",
+    "official_denominator": 97,
+    "open_track_tasks": 81,
+    "excluded": [
+      "task_098_orca_claisen_thermochemistry (ORCA licence, upstream #27)"
+    ],
+    "judge": {
+      "model": "gpt-5.6-sol",
+      "repeats": 3,
+      "endpoint": "napi.metask-ai.com/v1 (OpenAI route)",
+      "official_pinned": true
+    },
+    "topology": "patron(vm-ubuntu3): long(15, conc3) + mainA(43, conc5); kunshan(vm-ubuntu4): mainB(22, conc3)",
+    "job": "mc1d27f07-oj",
+    "adapter": "metacodes_agent.py headless -p --permission bypassPermissions --add-dir /app (binary served over docker bridge :4401)",
+    "reference_previous_round": {
+      "round": "2026-09-01-frontierchallenge-official-judge",
+      "tasks_present": 78,
+      "graded": 72,
+      "passed": 45,
+      "pass_graded": 0.625,
+      "mean_graded_100": 70.4,
+      "median": 0.885,
+      "pass_97": 0.464,
+      "score_97_100": 52.3,
+      "pass_81": 0.556
+    },
+    "rerun_rounds": {
+      "long": 1,
+      "mainA": 1,
+      "mainB": 2
+    },
+    "absent_tasks": [
+      {
+        "task": "task_072_pt_co_adsorption",
+        "reason": "harness failed while collecting /app/output ('no container found for service main'), pruned as infra in rerun round 1 but not re-enqueued on resume (same chronic failure as the 2026-08-31 and 2026-09-01 rounds); counted zero"
+      }
+    ],
+    "judge_shape_incident": "~40% of first-pass trials came back 'judge response lacks criterion_scores array'; the FC_DIAG stderr patch showed gpt-5.6-sol returning criterion_scores as {id: {...}} (complete content, wrong container shape). FC_NORM (shape normalization, 63/69 grader variants) + 5 judge attempts per repetition were applied from the rerun rounds on; all pruned trials then graded. Scores from the first pass and the rerun rounds are therefore not judged under byte-identical wrapper code, but the normalization changes only the parsed container shape, never scores or ids."
+  },
+  "source_sha256": {
+    "evals/benchmarks/2026-09-05-metacodes-1d27f07-glm52-fullbench/data/frontierchallenge/long.json": "95fc10901759f3f1e013e278f41d38c078f2207f89bfae14ecd878454569e162",
+    "evals/benchmarks/2026-09-05-metacodes-1d27f07-glm52-fullbench/data/frontierchallenge/mainA.json": "9ba578b0720b7c5c4bdab8be246c7f51b1e602d875104ff6ea9b0e3b5d313d8e",
+    "evals/benchmarks/2026-09-05-metacodes-1d27f07-glm52-fullbench/data/frontierchallenge/mainB.json": "7a26e369bf8484345e18a8b8979fc274305be6ff9450ef7c83b13f970ab71a80",
+    "evals/benchmarks/2026-09-05-metacodes-1d27f07-glm52-fullbench/data/frontierchallenge/tasks_attempted.txt": "9b71114b4211e075a20525769febfaf814d48740f962650846a7695a9b2b5737"
+  }
+}

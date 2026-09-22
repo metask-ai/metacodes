@@ -1,0 +1,674 @@
+{
+ "metacodes-glm52-security-dev-diag1": {
+  "launches": [
+   "launch-20260905t0657z.json"
+  ],
+  "journals": [
+   "budget-20260905t0657z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0657z.json",
+    "run_id": "wb-metacodes-glm52-security-dev-diag1-20260905t0657z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 66.0,
+    "elapsed_s": 1094.993802583,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0657z.json",
+  "run_id": "wb-metacodes-glm52-security-dev-diag1-20260905t0657z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 66.0,
+  "elapsed_s": 1094.993802583,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-dev-diag3": {
+  "launches": [
+   "launch-20260905t1642z.json"
+  ],
+  "journals": [
+   "budget-20260905t1642z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t1642z.json",
+    "run_id": "wb-metacodes-glm52-security-dev-diag3-20260905t1642z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 6.0,
+    "elapsed_s": 174.461255089,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t1642z.json",
+  "run_id": "wb-metacodes-glm52-security-dev-diag3-20260905t1642z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 6.0,
+  "elapsed_s": 174.461255089,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-dev-diag5": {
+  "launches": [
+   "launch-20260906t0600z.json"
+  ],
+  "journals": [
+   "budget-20260906t0600z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260906t0600z.json",
+    "run_id": "wb-metacodes-glm52-security-dev-diag5-20260906t0600z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 54.0,
+    "elapsed_s": 496.49294906,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260906t0600z.json",
+  "run_id": "wb-metacodes-glm52-security-dev-diag5-20260906t0600z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 54.0,
+  "elapsed_s": 496.49294906,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-dev-full1": {
+  "launches": [],
+  "journals": [],
+  "receipts": [],
+  "state": "no receipt"
+ },
+ "metacodes-glm52-security-proma-diag5": {
+  "launches": [
+   "launch-20260906t0608z.json"
+  ],
+  "journals": [
+   "budget-20260906t0608z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260906t0608z.json",
+    "run_id": "wb-metacodes-glm52-security-proma-diag5-20260906t0608z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 24.0,
+    "elapsed_s": 234.146383907,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260906t0608z.json",
+  "run_id": "wb-metacodes-glm52-security-proma-diag5-20260906t0608z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 24.0,
+  "elapsed_s": 234.146383907,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-proma-full1": {
+  "launches": [
+   "launch-20260905t0521z.json"
+  ],
+  "journals": [
+   "budget-20260905t0521z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0521z.json",
+    "run_id": "wb-metacodes-glm52-security-proma-full1-20260905t0521z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 18.0,
+    "elapsed_s": 888.188343438,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0521z.json",
+  "run_id": "wb-metacodes-glm52-security-proma-full1-20260905t0521z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 18.0,
+  "elapsed_s": 888.188343438,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-promb-diag1": {
+  "launches": [
+   "launch-20260905t0816z.json",
+   "launch-20260905t0904z.json"
+  ],
+  "journals": [
+   "budget-20260905t0816z.json",
+   "budget-20260905t0904z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t0816z.json",
+    "run_id": "wb-metacodes-glm52-security-promb-diag1-20260905t0816z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 24.0,
+    "elapsed_s": 2297.975918363,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t0904z.json",
+    "run_id": "wb-metacodes-glm52-security-promb-diag1-20260905t0904z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 24.0,
+    "elapsed_s": 2977.091810585,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t0904z.json",
+  "run_id": "wb-metacodes-glm52-security-promb-diag1-20260905t0904z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 24.0,
+  "elapsed_s": 2977.091810585,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-promb-diag3": {
+  "launches": [
+   "launch-20260905t1647z.json"
+  ],
+  "journals": [
+   "budget-20260905t1647z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t1647z.json",
+    "run_id": "wb-metacodes-glm52-security-promb-diag3-20260905t1647z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 12.0,
+    "elapsed_s": 179.187764717,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t1647z.json",
+  "run_id": "wb-metacodes-glm52-security-promb-diag3-20260905t1647z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 12.0,
+  "elapsed_s": 179.187764717,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-promb-diag5": {
+  "launches": [
+   "launch-20260906t0612z.json"
+  ],
+  "journals": [
+   "budget-20260906t0612z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260906t0612z.json",
+    "run_id": "wb-metacodes-glm52-security-promb-diag5-20260906t0612z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 6.0,
+    "elapsed_s": 29.934266507,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260906t0612z.json",
+  "run_id": "wb-metacodes-glm52-security-promb-diag5-20260906t0612z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 6.0,
+  "elapsed_s": 29.934266507,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-promb-full1": {
+  "launches": [],
+  "journals": [],
+  "receipts": [],
+  "state": "no receipt"
+ },
+ "metacodes-glm52-security-sealed-diag1": {
+  "launches": [
+   "launch-20260905t1028z.json",
+   "launch-20260905t1055z.json",
+   "launch-20260905t1113z.json"
+  ],
+  "journals": [
+   "budget-20260905t1028z.json",
+   "budget-20260905t1055z.json",
+   "budget-20260905t1113z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t1028z.json",
+    "run_id": "wb-metacodes-glm52-security-sealed-diag1-20260905t1028z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 144.0,
+    "elapsed_s": 353.753942213,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t1055z.json",
+    "run_id": "wb-metacodes-glm52-security-sealed-diag1-20260905t1055z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "runner_nonzero",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 144.0,
+    "elapsed_s": 361.724277825,
+    "returncode": 1,
+    "task_count": 0
+   },
+   {
+    "file": "receipt-20260905t1113z.json",
+    "run_id": "wb-metacodes-glm52-security-sealed-diag1-20260905t1113z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 144.0,
+    "elapsed_s": 6163.282272757,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t1113z.json",
+  "run_id": "wb-metacodes-glm52-security-sealed-diag1-20260905t1113z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 144.0,
+  "elapsed_s": 6163.282272757,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-sealed-diag2": {
+  "launches": [
+   "launch-20260905t1540z.json"
+  ],
+  "journals": [
+   "budget-20260905t1540z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t1540z.json",
+    "run_id": "wb-metacodes-glm52-security-sealed-diag2-20260905t1540z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 6.0,
+    "elapsed_s": 147.084756876,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t1540z.json",
+  "run_id": "wb-metacodes-glm52-security-sealed-diag2-20260905t1540z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 6.0,
+  "elapsed_s": 147.084756876,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-sealed-diag3": {
+  "launches": [
+   "launch-20260905t1652z.json"
+  ],
+  "journals": [
+   "budget-20260905t1652z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t1652z.json",
+    "run_id": "wb-metacodes-glm52-security-sealed-diag3-20260905t1652z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 66.0,
+    "elapsed_s": 4052.473427266,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t1652z.json",
+  "run_id": "wb-metacodes-glm52-security-sealed-diag3-20260905t1652z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 66.0,
+  "elapsed_s": 4052.473427266,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-sealed-diag4": {
+  "launches": [
+   "launch-20260906t0540z.json"
+  ],
+  "journals": [
+   "budget-20260906t0540z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260906t0540z.json",
+    "run_id": "wb-metacodes-glm52-security-sealed-diag4-20260906t0540z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 6.0,
+    "elapsed_s": 81.293453147,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260906t0540z.json",
+  "run_id": "wb-metacodes-glm52-security-sealed-diag4-20260906t0540z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 6.0,
+  "elapsed_s": 81.293453147,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-security-sealed-diag5": {
+  "launches": [
+   "launch-20260906t0613z.json"
+  ],
+  "journals": [
+   "budget-20260906t0613z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260906t0613z.json",
+    "run_id": "wb-metacodes-glm52-security-sealed-diag5-20260906t0613z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 72.0,
+    "elapsed_s": 765.143688708,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260906t0613z.json",
+  "run_id": "wb-metacodes-glm52-security-sealed-diag5-20260906t0613z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 72.0,
+  "elapsed_s": 765.143688708,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-web-dev-full1": {
+  "launches": [
+   "launch-20260905t1933z.json"
+  ],
+  "journals": [
+   "budget-20260905t1933z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t1933z.json",
+    "run_id": "wb-metacodes-glm52-web-dev-full1-20260905t1933z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 56.0,
+    "elapsed_s": 5328.7476838,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t1933z.json",
+  "run_id": "wb-metacodes-glm52-web-dev-full1-20260905t1933z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 56.0,
+  "elapsed_s": 5328.7476838,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-web-proma-full1": {
+  "launches": [
+   "launch-20260905t2102z.json"
+  ],
+  "journals": [
+   "budget-20260905t2102z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t2102z.json",
+    "run_id": "wb-metacodes-glm52-web-proma-full1-20260905t2102z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 28.0,
+    "elapsed_s": 2277.153404192,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t2102z.json",
+  "run_id": "wb-metacodes-glm52-web-proma-full1-20260905t2102z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 28.0,
+  "elapsed_s": 2277.153404192,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-web-promb-full1": {
+  "launches": [
+   "launch-20260905t2140z.json"
+  ],
+  "journals": [
+   "budget-20260905t2140z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t2140z.json",
+    "run_id": "wb-metacodes-glm52-web-promb-full1-20260905t2140z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 28.0,
+    "elapsed_s": 2817.116491762,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t2140z.json",
+  "run_id": "wb-metacodes-glm52-web-promb-full1-20260905t2140z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 28.0,
+  "elapsed_s": 2817.116491762,
+  "returncode": 0,
+  "task_count": 0
+ },
+ "metacodes-glm52-web-sealed-full1": {
+  "launches": [
+   "launch-20260905t2227z.json"
+  ],
+  "journals": [
+   "budget-20260905t2227z.json"
+  ],
+  "receipts": [
+   {
+    "file": "receipt-20260905t2227z.json",
+    "run_id": "wb-metacodes-glm52-web-sealed-full1-20260905t2227z",
+    "state": "authorized_failure",
+    "schema": "metacodes-workbuddy-authorized-failure-v2",
+    "quality_evidence": false,
+    "failure_stage": "post_run_evidence_audit",
+    "actual_cost_usd": null,
+    "actual_metered_tokens": null,
+    "max_cost_usd": 168.0,
+    "elapsed_s": 13841.573647579,
+    "returncode": 0,
+    "task_count": 0
+   }
+  ],
+  "file": "receipt-20260905t2227z.json",
+  "run_id": "wb-metacodes-glm52-web-sealed-full1-20260905t2227z",
+  "state": "authorized_failure",
+  "schema": "metacodes-workbuddy-authorized-failure-v2",
+  "quality_evidence": false,
+  "failure_stage": "post_run_evidence_audit",
+  "actual_cost_usd": null,
+  "actual_metered_tokens": null,
+  "max_cost_usd": 168.0,
+  "elapsed_s": 13841.573647579,
+  "returncode": 0,
+  "task_count": 0
+ }
+}
