@@ -21,8 +21,8 @@ status, compatibility boundaries, and entry points are defined by
   red, project-rule activation failing closed) — while the TinyKG lookup, which
   already applied `realpath`, resolved. All three now derive their prefix from
   one helper, `platform.paths.selfExeRealPath` (self-exe path resolved through
-  `realpath`, falling back to the invoked path only when `realpath` fails and
-  that path is absolute). The REPL's TinyKG client no longer receives an
+  `realpath`; a relative invoked path is refused outright, and the fallback to
+  the invoked path applies only when `realpath` fails). The REPL's TinyKG client no longer receives an
   `argv[0]`-derived executable directory (forgeable, empty for a bare-name
   `PATH` start, and a second basis next to the OS-reported one); it uses the
   same helper.
