@@ -21,6 +21,7 @@ const tui_backend = cc.tui_backend;
 const render_region = cc.tui_render_region;
 const theme_mod = cc.tui_theme;
 const msg_queue = cc.repl_msg_queue;
+const history_mod = cc.repl_history;
 const abort = cc.util_abort;
 
 const CoreEvent = ui_event.CoreEvent;
@@ -238,11 +239,12 @@ test "TuiBackend.poll: AbortSignal → interrupt(优先于 queue)" {
     // 未中断 + 空队列 → null
     try testing.expect(be.pollEvent(S) == null);
 
-    // 入队一条 + 触发中断:interrupt 优先
+    // 入队一条 + 触发中断:interrupt 优先,消息留在队列(Run 结束后 REPL 续发)
     _ = q.push("queued");
     sig.abort(.timeout);
     const e = be.pollEvent(S) orelse return error.NoEvent;
     try testing.expectEqual(abort.Reason.timeout, e.interrupt);
+    try testing.expectEqual(@as(usize, 1), q.len());
 }
 
 test "TuiBackend.poll: 仅队列有消息 → queue_message" {
@@ -260,6 +262,57 @@ test "TuiBackend.poll: 仅队列有消息 → queue_message" {
     try testing.expectEqualStrings("hello", e.queue_message);
     testing.allocator.free(e.queue_message); // poll 转移所有权,调用方 free
     try testing.expect(be.pollEvent(S) == null); // 取完返 null
+}
+
+test "TuiBackend.poll: 队首是 REPL 命令 → 留在队列,后面的普通消息一起等(FIFO 不重排)" {
+    var region = try makeRegion(testing.allocator);
+    defer region.deinit();
+    var q = msg_queue.MsgQueue.init(testing.allocator);
+    defer q.deinit();
+
+    var tb = tui_backend.TuiBackend.init(&region);
+    tb.queue = &q;
+    const be = tb.backend();
+
+    // `/model`、`!shell`、裸 `exit` 都归 REPL:Core 不认识它们,不能当 prompt 喂给模型(#115 review)。
+    _ = q.push("/model claude-x");
+    _ = q.push("plain steer");
+    try testing.expect(be.pollEvent(S) == null);
+    try testing.expectEqual(@as(usize, 2), q.len()); // 一条都没动
+
+    // REPL 在 Run 结束后按老规矩取走命令,下一轮 poll 才轮到普通消息。
+    const cmd = q.popFront() orelse return error.NoEvent;
+    testing.allocator.free(cmd);
+    const e = be.pollEvent(S) orelse return error.NoEvent;
+    try testing.expectEqualStrings("plain steer", e.queue_message);
+    testing.allocator.free(e.queue_message);
+
+    _ = q.push("!ls");
+    try testing.expect(be.pollEvent(S) == null);
+    _ = q.push("exit");
+    try testing.expect(be.pollEvent(S) == null);
+    try testing.expectEqual(@as(usize, 2), q.len());
+}
+
+test "TuiBackend.poll: 取走的消息进 readline 历史(与 Run 之间消费队列时对齐)" {
+    var region = try makeRegion(testing.allocator);
+    defer region.deinit();
+    var q = msg_queue.MsgQueue.init(testing.allocator);
+    defer q.deinit();
+    var hist = history_mod.History.init(testing.allocator);
+    defer hist.deinit();
+
+    var tb = tui_backend.TuiBackend.init(&region);
+    tb.queue = &q;
+    tb.history = &hist;
+    const be = tb.backend();
+
+    _ = q.push("remember me");
+    const e = be.pollEvent(S) orelse return error.NoEvent;
+    testing.allocator.free(e.queue_message);
+    try testing.expectEqual(@as(usize, 1), hist.len());
+    const back = (try hist.prev("")) orelse return error.NoEvent;
+    try testing.expectEqualStrings("remember me", back);
 }
 
 // ---------------------------------------------------------------------------

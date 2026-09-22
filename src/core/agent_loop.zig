@@ -815,11 +815,59 @@ pub fn drainFileChangesForTest(
     drainFileChanges(slots, base_ctx, backend, sess, journal, allocator);
 }
 
+/// One mapping for every way a Run can be stopped from outside: only the
+/// evaluation budget is a `budget` stop, everything else is `aborted`.
+fn stopReasonForReason(reason: @import("../util/abort.zig").Reason) StopReason {
+    return if (reason == .evaluation_budget) .budget else .aborted;
+}
+
 fn stopReasonForAbort(abort: ?*const AbortSignal) StopReason {
-    return if (abort) |signal|
-        if (signal.reason() == .evaluation_budget) .budget else .aborted
-    else
-        .aborted;
+    return if (abort) |signal| stopReasonForReason(signal.reason()) else .aborted;
+}
+
+/// UI → core input (#115). Drains `UiBackend.poll` at a turn boundary — the
+/// previous turn's tool_results are already appended and the next provider
+/// request has not been built yet — so a message the user queued during the
+/// previous stream rides the very next request of the same Run instead of
+/// waiting for the Run to finish. Returns the interrupt reason when the
+/// backend asked to stop, null after everything queued was consumed.
+///
+/// * `queue_message`: appended as a user record (blank text is dropped). The
+///   protocol transfers ownership of the slice to the poll caller; it is freed
+///   with the Run's allocator, so an in-process backend must allocate it with
+///   that allocator (TuiBackend's MsgQueue and the REPL's `run()` share one).
+///   The producer decides what is steerable: TuiBackend hands over plain
+///   prompts only and keeps `/commands`, `!shell` and `exit` queued for the
+///   REPL, which dispatches them after the Run as before.
+/// * `interrupt`: returned immediately; any further queued events stay on the
+///   backend for the host to decide about. This does not replace AbortSignal
+///   (mid-stream interruption still only goes through it, see
+///   doc/UI_DECOUPLE_BACKEND_FRAMEWORK.md §3.4); with `opts.abort` set the
+///   loop-top abort check wins first, so this arm serves a backend that has
+///   no shared signal.
+///
+/// Never called while a provider stream is being consumed, and skipped at a
+/// max_tokens continuation boundary (the group must stay one answer).
+fn drainUiEvents(
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    conversation: *Conversation,
+    allocator: std.mem.Allocator,
+    turn: u32,
+) !?@import("../util/abort.zig").Reason {
+    while (backend.pollEvent(sess)) |event| {
+        switch (event) {
+            .interrupt => |reason| return reason,
+            .queue_message => |text| {
+                defer allocator.free(text);
+                const trimmed = std.mem.trim(u8, text, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                try conversation.appendText(.user, trimmed);
+                log.info("agent", "queued user message consumed at turn {d} boundary bytes={d}", .{ turn, trimmed.len });
+            },
+        }
+    }
+    return null;
 }
 
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
@@ -851,6 +899,8 @@ pub fn run(
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
+    // 上一轮以 max_tokens 续写提示收尾 → 下一个 turn 边界不消费 UI 队列(见 drainUiEvents)。
+    var continuation_pending = false;
     // 输出语义通道:每个 provider stream 一个可见输出段,定性在 loop **真正知道**时才发。
     // defer 是兜底——任何忘记定性的退出路径把仍打开的段记为 partial(诚实读法:Run 结束了,
     // 但从没判定这段是答案)。显式定性发生在前,兜底只在遗漏时生效。
@@ -966,6 +1016,20 @@ pub fn run(
             log.info("agent", "background requested before turn {d} → backgrounding", .{turns + 1});
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
         };
+
+        // UI → core 输入(#115):生成期入队的用户消息在这里进对话,本 Run 的下一次请求就带上它;
+        // backend 的 interrupt 在边界结束本 Run。见 drainUiEvents 注。max_tokens 续写边界跳过:
+        // 刚追加的"接着写"提示与转向指令并排会让模型换题,而 Ledger 仍把下一段当同一答案的续写。
+        if (continuation_pending) {
+            continuation_pending = false;
+        } else if (try drainUiEvents(backend, sess, conversation, allocator, turns + 1)) |reason| {
+            log.warn("agent", "interrupt from UI backend before turn {d}: {s}", .{ turns + 1, @tagName(reason) });
+            return finishRun(backend, sess, trace_id, depth, .{
+                .stop_reason = stopReasonForReason(reason),
+                .turns = turns,
+                .tool_calls = total_tool_calls,
+            });
+        }
 
         // 2026-09-19 polling incident: deliver metadata at the boundary so
         // the model need not poll, while keeping child bytes behind BashOutput
@@ -2199,6 +2263,7 @@ pub fn run(
                 // L4 诊断:续写。
                 backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations, .max = MAX_CONTINUATIONS } });
                 try conversation.appendText(.user, "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
+                continuation_pending = true;
                 continue;
             }
             const kg_pending = kgEnumerationPending(

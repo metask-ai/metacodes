@@ -70,7 +70,32 @@ CoreEvent 携带的 text/id/name 是借用切片,emit **必须同步消费**(Tui
 → `poll-as-interrupt` 会与 AbortSignal **双轨冗余 + 引入新时序窗口**(高风险)。
 **正确做法**:AbortSignal 仍是中断原语(SIGINT handler + watcher esc 都直戳它,
 stream.next 仍 throwIfAborted);backend 的输入端(watcher)收到 esc 时**也直戳 AbortSignal**。
-`poll()` 只用于轮间拉取 queue_message 这类非紧急事件,不承担动中断。
+`poll()` 在 turn 边界拉取 queue_message 这类非紧急事件;它返回的 `interrupt` 是**边界粒度**的停止
+(给没有共享 AbortSignal 的进程外后端;设了 `opts.abort` 时循环顶部的 abort 检查先命中),不承担动中断。
+
+**接线(#115)**:`agent_loop.run` 在**每个 turn 边界**(上一轮 tool_result 已追加、下一次 provider
+请求尚未构造)`pollEvent()` 直到 null;流式消费期间不 poll。
+- `queue_message` → 追加为一条 user 消息进 Conversation,**本 Run 的下一次请求就带上它**——生成期
+  入队的转向/补充指令不必等整个 Run 结束;空白消息丢弃。所有权按协议转移给 agent_loop,用
+  `run()` 的 allocator 释放,所以 in-process backend 必须用同一个 allocator 分配它(TuiBackend
+  的 MsgQueue 与 REPL 传给 run 的是同一个)。max_tokens 续写边界不拉取:刚追加的"接着写"提示与
+  转向指令并排会让模型换题,而输出语义 Ledger 仍把下一段当同一答案的续写。
+- `interrupt` → 在边界结束本 Run(stop_reason=aborted;`evaluation_budget` → budget)。这是给
+  没有共享 AbortSignal 的进程外后端的边界粒度停止,不是动中断的替代。
+- **生产方契约(TuiBackend.poll)**:只交出 `session_intent.parse` 判为普通 prompt(或空白)的条目;
+  `/命令`、`!shell`、裸 `exit` 留在队列(FIFO 不重排,队首是命令时后面的普通消息一起等),Run
+  结束后由 loop.zig 按老规矩派发——Core 不认识 REPL 命令。取走的消息回显 `❯ <消息>` 进
+  scrollback(排版与 Run 之间消费时同源,`repl/user_echo.zig`)并追加进 readline 历史。Esc 是
+  "草稿入队再 abort",poll 取出后再查一次 AbortSignal,已中断则把消息放回队首、按 interrupt 处理。
+  web 后端(`web/backend.zig`)的 poll 恒返 null:它的 inbox 仍只在两个 Run 之间被消费。
+
+REPL 因此是两级语义:Run 内的 turn 边界由 agent_loop 消费;Run 结束时仍留在队列里的(最后一次
+流式期间入队的)由 loop.zig `popAllJoined` 合并成下一个 Run 的输入并回显。AgentCore Session
+(`agent_session.zig`)的 backend.poll 恒返 null:二进制 ABI 没有活动 Run 的输入操作,宿主自己
+排队、Run 返回后再 `session_run_input`,或 `session_abort`(见 AGENTCORE_BINARY_ABI.md)。
+L2 证据:`tests/component/ui_queue_message_test.zig`(队列消息出现在同一 Run 的第二次请求里、
+interrupt 在边界停、空白消息丢弃、max_tokens 续写边界不 poll);`ui_backend_test.zig`(命令留队、
+取走进历史、中断时消息不丢)。
 
 ### 3.5 输入采集归 backend,但中断原语共享
 
@@ -113,8 +138,8 @@ GUI/语音后端各自决定 tick(GUI=requestAnimationFrame,语音=无 tick)。
 
 | 变体 | 语义 | 所有权 |
 |---|---|---|
-| `interrupt: AbortReason` | 打断当前任务 | 无所有权 |
-| `queue_message: []const u8` | 生成期入队消息 | poll 调用方拥有,须 free |
+| `interrupt: AbortReason` | 打断当前任务;agent_loop 在 turn 边界据此结束 Run | 无所有权 |
+| `queue_message: []const u8` | 生成期入队消息;agent_loop 在 turn 边界追加为 user 消息,下一次请求带上 | poll 调用方(agent_loop)拥有,用 run 的 allocator free |
 
 ### UiBackend vtable
 
