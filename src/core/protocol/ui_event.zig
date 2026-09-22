@@ -388,6 +388,9 @@ pub const CoreEvent = union(enum) {
 /// - `interrupt` → 在边界结束本 Run(stop_reason=aborted;`evaluation_budget` → budget)。它补充
 ///   而不取代 AbortSignal:动中断(流式期间)仍只走 AbortSignal(见 UI_DECOUPLE_BACKEND_FRAMEWORK
 ///   §3.4);in-process 的 TuiBackend 两条都戳,进程外后端只有这条。
+/// - max_tokens 续写边界不 poll(续写段必须仍是同一个答案)。
+/// **生产方契约**:什么可转向由 backend 定——`queue_message` 只能是要喂给模型的普通 prompt;REPL
+/// 命令(`/x`、`!shell`、`exit`)Core 不认识,TuiBackend 把它们留在队列给 loop.zig 在 Run 结束后派发。
 /// input_complete 不走这条:输入期由各 UI 后端各自收集完整输入,返回给 loop 编排。
 /// AgentCore Session(agent_session.zig)的 backend.poll 恒返 null——二进制 ABI 没有活动 Run 的
 /// 输入操作,宿主自己排队、Run 返回后再 run_input,或 abort。

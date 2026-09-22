@@ -236,9 +236,11 @@ pub const Phase = enum(u8) { input = 0, generating = 1 };
 请求尚未构造)`pollEvent()` 直到 null,流式期间不 poll。`queue_message` 追加为一条 user 消息,
 **本 Run 的下一次请求就带上它**(空白消息丢弃;slice 用传给 `run()` 的 allocator 释放,in-process
 后端须用同一个 allocator 分配);`interrupt` 在边界结束本 Run(`aborted`,`evaluation_budget` →
-`budget`),它补充而不取代 AbortSignal 的动中断。REPL 里 Run 内的边界由 `run()` 消费,Run 结束时
-仍留在队列里的由 loop.zig 合并成下一个 Run 的输入。AgentCore Session 的 backend.poll 恒返 null:
-二进制 ABI 没有活动 Run 的输入操作,宿主自己排队、Run 返回后再 run_input,或 abort。
+`budget`),它补充而不取代 AbortSignal 的动中断;max_tokens 续写边界不 poll(续写段必须仍是同一个
+答案)。生产方决定什么可转向:TuiBackend 只交出普通 prompt,`/命令`、`!shell`、`exit` 留在队列由
+REPL 在 Run 结束后派发。REPL 里 Run 内的边界由 `run()` 消费,Run 结束时仍留在队列里的由 loop.zig
+合并成下一个 Run 的输入。AgentCore Session 的 backend.poll 恒返 null:二进制 ABI 没有活动 Run 的
+输入操作,宿主自己排队、Run 返回后再 run_input,或 abort。
 
 ### 3.4 UiRequest — core 向前端**请求一个回答**(交互式)
 

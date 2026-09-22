@@ -2,8 +2,10 @@
 //! returned by `UiBackend.poll` at a turn boundary is appended to the
 //! Conversation as a user message and rides the very next provider request of
 //! the same Run; an `interrupt` returned there ends the Run as aborted before
-//! another request is sent; a blank message is dropped. Nothing here involves
-//! a provider model: the evidence is the captured request bytes.
+//! another request is sent; a blank message is dropped; the boundary right
+//! after a max_tokens truncation is not polled at all (the continuation must
+//! stay one answer). Nothing here involves a provider model: the evidence is
+//! the captured request bytes and the backend's poll count.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -38,6 +40,23 @@ fn textThenToolSse(allocator: std.mem.Allocator, id: []const u8, text: []const u
             "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
             "data: {{\"type\":\"message_stop\"}}\n\n",
         .{ id, text_encoded, id, input_encoded },
+    );
+}
+
+/// Visible text cut off by the output token limit: the loop appends its
+/// continuation prompt and sends the next request of the same Run.
+fn truncatedSse(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const text_encoded = try encodeJson(allocator, text);
+    defer allocator.free(text_encoded);
+    return std.fmt.allocPrint(
+        allocator,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"cut\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{s}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"max_tokens\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{text_encoded},
     );
 }
 
@@ -225,8 +244,41 @@ test "L2 queue_message: a blank message is dropped and changes nothing" {
 
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, outcome.result.stop_reason);
     try std.testing.expectEqual(@as(usize, 2), outcome.requests);
+    // The backend really handed the whitespace over at the boundary (otherwise
+    // the count below would hold for the wrong reason).
+    try std.testing.expect(ui.delivered);
+    try std.testing.expect(outcome.polls > 0);
     const second = outcome.second_body orelse return error.TestUnexpectedResult;
     // Exactly the original prompt and the tool_result carry role user; no third
     // user record was appended for whitespace.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, second, "\"role\":\"user\""));
+}
+
+test "L2 queue_message: the boundary after a max_tokens truncation is not polled, the continuation stays one answer" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buf);
+    const cut = try truncatedSse(a, "The answer is the first half of");
+    defer a.free(cut);
+    const rest = try finalSse(a, " a long explanation.");
+    defer a.free(rest);
+
+    const steer = "Actually, switch to the other topic.";
+    var ui = QueueBackend{ .allocator = a, .message = steer };
+    var outcome = try runWith(a, root, &ui, &.{ cut, rest });
+    defer outcome.deinit(a);
+
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, outcome.result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), outcome.requests);
+    // Polled once, before the first request; the continuation boundary was
+    // skipped, so the queued steer never entered this Run …
+    try std.testing.expectEqual(@as(u32, 1), outcome.polls);
+    try std.testing.expect(!ui.delivered);
+    const second = outcome.second_body orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, second, steer) == null);
+    // … and the second request carries the continuation prompt right after the
+    // truncated assistant text, as before #115.
+    try std.testing.expect(std.mem.indexOf(u8, second, "Continue exactly where you left off") != null);
 }

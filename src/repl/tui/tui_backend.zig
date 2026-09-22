@@ -36,6 +36,9 @@ const render_region = @import("render_region.zig");
 const ui_backend = @import("../../core/protocol/ui_backend.zig");
 const ui_event = @import("../../core/protocol/ui_event.zig");
 const msg_queue = @import("../msg_queue.zig");
+const history_mod = @import("../history.zig");
+const user_echo = @import("../user_echo.zig");
+const session_intent = @import("../../session_intent.zig");
 const abort = @import("../../util/abort.zig");
 const util_time = @import("../../util/time.zig");
 const api_stream = @import("../../api/stream.zig");
@@ -109,6 +112,9 @@ pub const TuiBackend = struct {
     usage_acc: ?*@import("../../core/usage.zig").UsageTotals = null,
     /// poll 输入源(可选)。
     queue: ?*msg_queue.MsgQueue = null,
+    /// 生成期被 agent_loop 取走的消息也要进 readline 历史(与 REPL 在两个 Run 之间消费队列时
+    /// `history.append` 对齐)。loop.zig 注入;与 poll 同在 driver 线程,无并发。
+    history: ?*history_mod.History = null,
     abort_signal: ?*const abort.AbortSignal = null,
 
     // ── 生成期输入子系统(阶段 C:watcher 归属 backend)──────────────────────
@@ -360,33 +366,45 @@ pub const TuiBackend = struct {
         if (self.abort_signal) |sig| {
             if (sig.isAborted()) return .{ .interrupt = sig.reason() };
         }
-        if (self.queue) |q| {
-            // popFront 转移所有权 → 调用方须 free(见 ui_event.zig queue_message 注)。agent_loop
-            // 在 turn 边界取走它并追加进对话(#115);这里同步回显,用户看得到它去了哪。
-            if (q.popFront()) |msg| {
-                self.echoQueuedSubmission(msg);
-                return .{ .queue_message = msg };
-            }
-        }
-        return null;
+        const q = self.queue orelse return null;
+        // 只交出普通 prompt(和空白):`/命令`、`!shell`、`exit` 留在队列,Run 结束后由 REPL 按老
+        // 规矩派发——Core 不认识 REPL 命令,直接喂给模型会把 `/model x` 变成一句聊天(#115 review)。
+        // 队首是命令时后面的普通消息也一起等:FIFO 不重排,用户敲的顺序就是生效顺序。
+        const msg = q.popFrontIf(isSteerable) orelse return null;
+        // 取出后再看一次中断:Esc 处理是"先把草稿入队、再 abort",若 abort 恰好落在上面的检查与
+        // popFront 之间,这条本该"中断后自动续发"的草稿会被当成本 Run 的转向。放回队首,按中断处理。
+        if (self.abort_signal) |sig| if (sig.isAborted()) {
+            if (!q.pushFront(msg)) q.allocator.free(msg);
+            return .{ .interrupt = sig.reason() };
+        };
+        // popFront 转移所有权 → 调用方(agent_loop)用 run 的 allocator free(见 ui_event.zig)。
+        // agent_loop 在 turn 边界把它追加进对话(#115);这里同步回显 + 记历史,用户看得到它去了哪、
+        // ↑ 也翻得到它——与 Run 之间消费队列时的 echoUserSubmission/history.append 对齐。
+        self.echoQueuedSubmission(msg);
+        if (self.history) |h| h.append(msg) catch {};
+        return .{ .queue_message = msg };
     }
 
-    /// 生成期入队的消息被 agent_loop 在 turn 边界取走时,回显 `❯ <msg>` 进 scrollback(与 REPL
-    /// 在两个 Run 之间消费队列时 `echoUserSubmission` 的样子一致)。不回显的话它会从队列预览里
-    /// 静默消失,用户无从知道转向指令已经进了对话。writeGenText 按行缓冲,分几次写同一行是安全的。
+    /// 生成期队列里能在 turn 边界交给 agent_loop 的条目:普通 prompt(空白也交出去,让 loop 丢弃)。
+    fn isSteerable(text: []const u8) bool {
+        return switch (session_intent.parse(text)) {
+            .prompt, .empty => true,
+            .shell, .command, .skill => false,
+        };
+    }
+
+    /// 生成期入队的消息被 agent_loop 在 turn 边界取走时,回显 `❯ <msg>` 进 scrollback。排版与
+    /// REPL 在两个 Run 之间消费队列时的 `echoUserSubmission` 同源(user_echo.zig:软折 + 悬挂缩进)。
+    /// 不回显的话它会从队列预览里静默消失,用户无从知道转向指令已经进了对话。
     fn echoQueuedSubmission(self: *TuiBackend, msg: []const u8) void {
-        const trimmed = std.mem.trim(u8, msg, " \t\r\n");
-        if (trimmed.len == 0) return;
-        if (self.theme) |th| {
-            self.region.writeGenText(th.accent);
-            self.region.writeGenText("❯");
-            self.region.writeGenText(th.reset);
-            self.region.writeGenText(" ");
-        } else {
-            self.region.writeGenText("❯ ");
-        }
-        self.region.writeGenText(trimmed);
-        self.region.writeGenText("\n");
+        if (std.mem.trim(u8, msg, " \t\r\n").len == 0) return;
+        const a = self.alloc orelse return;
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(a);
+        const accent: []const u8 = if (self.theme) |th| th.accent else "";
+        const reset: []const u8 = if (self.theme) |th| th.reset else "";
+        user_echo.render(&out, a, accent, reset, self.region.cols, msg) catch return;
+        self.region.writeGenText(out.items);
     }
 
     // ── 生成期输入子系统 ────────────────────────────────────────────────────
