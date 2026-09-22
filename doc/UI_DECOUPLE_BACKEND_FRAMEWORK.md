@@ -72,6 +72,22 @@ CoreEvent 携带的 text/id/name 是借用切片,emit **必须同步消费**(Tui
 stream.next 仍 throwIfAborted);backend 的输入端(watcher)收到 esc 时**也直戳 AbortSignal**。
 `poll()` 只用于轮间拉取 queue_message 这类非紧急事件,不承担动中断。
 
+**接线(#115)**:`agent_loop.run` 在**每个 turn 边界**(上一轮 tool_result 已追加、下一次 provider
+请求尚未构造)`pollEvent()` 直到 null;流式消费期间不 poll。
+- `queue_message` → 追加为一条 user 消息进 Conversation,**本 Run 的下一次请求就带上它**——生成期
+  入队的转向/补充指令不必等整个 Run 结束;空白消息丢弃。所有权按协议转移给 agent_loop,用
+  `run()` 的 allocator 释放,所以 in-process backend 必须用同一个 allocator 分配它(TuiBackend
+  的 MsgQueue 与 REPL 传给 run 的是同一个)。TuiBackend 取走时回显 `❯ <消息>` 进 scrollback。
+- `interrupt` → 在边界结束本 Run(stop_reason=aborted;`evaluation_budget` → budget)。这是给
+  没有共享 AbortSignal 的进程外后端的边界粒度停止,不是动中断的替代。
+
+REPL 因此是两级语义:Run 内的 turn 边界由 agent_loop 消费;Run 结束时仍留在队列里的(最后一次
+流式期间入队的)由 loop.zig `popAllJoined` 合并成下一个 Run 的输入并回显。AgentCore Session
+(`agent_session.zig`)的 backend.poll 恒返 null:二进制 ABI 没有活动 Run 的输入操作,宿主自己
+排队、Run 返回后再 `session_run_input`,或 `session_abort`(见 AGENTCORE_BINARY_ABI.md)。
+L2 证据:`tests/component/ui_queue_message_test.zig`(队列消息出现在同一 Run 的第二次请求里、
+interrupt 在边界停、空白消息丢弃)。
+
 ### 3.5 输入采集归 backend,但中断原语共享
 
 生成期键盘 watcher(读 stdin、回车入队、esc 中断、超时 tickSpinner)是 **TUI 专属**,
@@ -113,8 +129,8 @@ GUI/语音后端各自决定 tick(GUI=requestAnimationFrame,语音=无 tick)。
 
 | 变体 | 语义 | 所有权 |
 |---|---|---|
-| `interrupt: AbortReason` | 打断当前任务 | 无所有权 |
-| `queue_message: []const u8` | 生成期入队消息 | poll 调用方拥有,须 free |
+| `interrupt: AbortReason` | 打断当前任务;agent_loop 在 turn 边界据此结束 Run | 无所有权 |
+| `queue_message: []const u8` | 生成期入队消息;agent_loop 在 turn 边界追加为 user 消息,下一次请求带上 | poll 调用方(agent_loop)拥有,用 run 的 allocator free |
 
 ### UiBackend vtable
 

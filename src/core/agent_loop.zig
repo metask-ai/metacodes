@@ -822,6 +822,56 @@ fn stopReasonForAbort(abort: ?*const AbortSignal) StopReason {
         .aborted;
 }
 
+const UiDrain = union(enum) {
+    /// Nothing queued.
+    none,
+    /// This many non-blank queued messages were appended as user records.
+    queued: u32,
+    /// The backend asked to stop; the Run ends at this boundary.
+    interrupted: @import("../util/abort.zig").Reason,
+};
+
+/// UI → core input (#115). Drains `UiBackend.poll` at a turn boundary — the
+/// previous turn's tool_results are already appended and the next provider
+/// request has not been built yet — so a message the user queued during the
+/// previous stream rides the very next request of the same Run instead of
+/// waiting for the Run to finish.
+///
+/// * `queue_message`: appended as a user record (blank text is dropped). The
+///   protocol transfers ownership of the slice to the poll caller; it is freed
+///   with the Run's allocator, so an in-process backend must allocate it with
+///   that allocator (TuiBackend's MsgQueue and the REPL's `run()` share one).
+/// * `interrupt`: returned immediately; any further queued events stay on the
+///   backend for the host to decide about. This does not replace AbortSignal
+///   (mid-stream interruption still only goes through it, see
+///   doc/UI_DECOUPLE_BACKEND_FRAMEWORK.md §3.4); it gives a backend without a
+///   shared signal — an out-of-process frontend — a boundary-granular stop.
+///
+/// Never called while a provider stream is being consumed.
+fn drainUiEvents(
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    conversation: *Conversation,
+    allocator: std.mem.Allocator,
+    turn: u32,
+) !UiDrain {
+    var queued: u32 = 0;
+    while (backend.pollEvent(sess)) |event| {
+        switch (event) {
+            .interrupt => |reason| return .{ .interrupted = reason },
+            .queue_message => |text| {
+                defer allocator.free(text);
+                const trimmed = std.mem.trim(u8, text, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                try conversation.appendText(.user, trimmed);
+                queued += 1;
+                log.info("agent", "queued user message consumed at turn {d} boundary bytes={d}", .{ turn, trimmed.len });
+            },
+        }
+    }
+    return if (queued == 0) .none else .{ .queued = queued };
+}
+
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
 /// 收集事件到 assistant message 里（text 和 tool_use blocks），
 /// 如果有 tool_use 则执行、追加 tool_result 到 conversation，继续下一轮。
@@ -966,6 +1016,20 @@ pub fn run(
             log.info("agent", "background requested before turn {d} → backgrounding", .{turns + 1});
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
         };
+
+        // UI → core 输入(#115):生成期入队的用户消息在这里进对话,本 Run 的下一次请求就带上它;
+        // backend 的 interrupt 在边界结束本 Run。见 drainUiEvents 注。
+        switch (try drainUiEvents(backend, sess, conversation, allocator, turns + 1)) {
+            .none, .queued => {},
+            .interrupted => |reason| {
+                log.warn("agent", "interrupt from UI backend before turn {d}: {s}", .{ turns + 1, @tagName(reason) });
+                return finishRun(backend, sess, trace_id, depth, .{
+                    .stop_reason = if (reason == .evaluation_budget) .budget else .aborted,
+                    .turns = turns,
+                    .tool_calls = total_tool_calls,
+                });
+            },
+        }
 
         // 2026-09-19 polling incident: deliver metadata at the boundary so
         // the model need not poll, while keeping child bytes behind BashOutput

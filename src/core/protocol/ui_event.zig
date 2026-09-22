@@ -381,16 +381,24 @@ pub const CoreEvent = union(enum) {
 
 /// UI → core:用户产生的事件(非阻塞 poll 拉取)。
 ///
-/// 注:取代现状 watcher 直接操作 AbortSignal/MsgQueue。agent_loop 在流消费
-/// 检查点 poll(),收到 .interrupt → 自行 abort。
+/// **消费点(#115)**:`agent_loop.run` 在**每个 turn 边界**(上一轮 tool_result 已追加、下一次
+/// provider 请求尚未构造)`pollEvent()` 直到 null;流式消费期间不 poll。两个变体的运行期语义:
+/// - `queue_message` → 追加为一条 user 消息进 Conversation,**本 Run 的下一次请求就带上它**
+///   (生成期入队的转向/补充指令不必等整个 Run 结束);空白消息丢弃。
+/// - `interrupt` → 在边界结束本 Run(stop_reason=aborted;`evaluation_budget` → budget)。它补充
+///   而不取代 AbortSignal:动中断(流式期间)仍只走 AbortSignal(见 UI_DECOUPLE_BACKEND_FRAMEWORK
+///   §3.4);in-process 的 TuiBackend 两条都戳,进程外后端只有这条。
 /// input_complete 不走这条:输入期由各 UI 后端各自收集完整输入,返回给 loop 编排。
+/// AgentCore Session(agent_session.zig)的 backend.poll 恒返 null——二进制 ABI 没有活动 Run 的
+/// 输入操作,宿主自己排队、Run 返回后再 run_input,或 abort。
 pub const UiEvent = union(enum) {
     /// 打断当前任务(esc/ctrl+c/语音"停")。携带原因便于日志/错误消息。
     interrupt: abort.Reason,
 
     /// 生成期入队消息。
     /// **所有权**:in-process backend(TuiBackend)从 MsgQueue.popFront 取出,所有权
-    /// 转移给 poll 调用方——**调用方消费后须 free**(对齐现状 loop 的 popAllJoined 语义)。
+    /// 转移给 poll 调用方——agent_loop 消费后用 **`run()` 的 allocator** free,所以 in-process
+    /// backend 必须用同一个 allocator 分配它(TuiBackend 的 MsgQueue 与 REPL 传给 run 的是同一个)。
     /// 序列化传输时(WsBackend)则是值拷贝,无所有权问题。协议层视为"调用方拥有的字节"。
     queue_message: []const u8,
 };

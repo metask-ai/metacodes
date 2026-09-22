@@ -361,10 +361,32 @@ pub const TuiBackend = struct {
             if (sig.isAborted()) return .{ .interrupt = sig.reason() };
         }
         if (self.queue) |q| {
-            // popFront 转移所有权 → 调用方须 free(见 ui_event.zig queue_message 注)。
-            if (q.popFront()) |msg| return .{ .queue_message = msg };
+            // popFront 转移所有权 → 调用方须 free(见 ui_event.zig queue_message 注)。agent_loop
+            // 在 turn 边界取走它并追加进对话(#115);这里同步回显,用户看得到它去了哪。
+            if (q.popFront()) |msg| {
+                self.echoQueuedSubmission(msg);
+                return .{ .queue_message = msg };
+            }
         }
         return null;
+    }
+
+    /// 生成期入队的消息被 agent_loop 在 turn 边界取走时,回显 `❯ <msg>` 进 scrollback(与 REPL
+    /// 在两个 Run 之间消费队列时 `echoUserSubmission` 的样子一致)。不回显的话它会从队列预览里
+    /// 静默消失,用户无从知道转向指令已经进了对话。writeGenText 按行缓冲,分几次写同一行是安全的。
+    fn echoQueuedSubmission(self: *TuiBackend, msg: []const u8) void {
+        const trimmed = std.mem.trim(u8, msg, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (self.theme) |th| {
+            self.region.writeGenText(th.accent);
+            self.region.writeGenText("❯");
+            self.region.writeGenText(th.reset);
+            self.region.writeGenText(" ");
+        } else {
+            self.region.writeGenText("❯ ");
+        }
+        self.region.writeGenText(trimmed);
+        self.region.writeGenText("\n");
     }
 
     // ── 生成期输入子系统 ────────────────────────────────────────────────────

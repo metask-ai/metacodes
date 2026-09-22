@@ -12,6 +12,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `UiEvent.queue_message` and `UiEvent.interrupt` were declared by the UI
+  protocol and produced by `TuiBackend.poll`, but no production path ever
+  called `UiBackend.poll` (#115): the CLI implemented queued messages entirely
+  at the REPL layer, so a message typed during a Run could not reach the
+  Conversation until the whole Run had finished, and an embedder had no way to
+  steer an active Run at all. The agent loop now drains `poll` at every turn
+  boundary (previous tool_results appended, next provider request not yet
+  built; never during a stream): a `queue_message` is appended as a user
+  message and rides the very next request of the same Run (blank messages are
+  dropped; the slice is freed with the Run's allocator, so in-process backends
+  allocate it with that allocator), and an `interrupt` ends the Run there as
+  `aborted` (`evaluation_budget` → `budget`) without replacing AbortSignal's
+  mid-stream interruption. The TUI echoes a consumed queued message (`❯ …`)
+  into the scrollback; messages still queued when a Run ends become the next
+  Run's input exactly as before. The AgentCore Session API is unchanged: it
+  has no active-Run input operation, its backend poll returns null, and
+  `doc/AGENTCORE_BINARY_ABI.md` now states the Host-side queueing contract.
+  `tests/component/ui_queue_message_test.zig` proves the queued text appears in
+  the second request of the same Run after the tool_result, that a boundary
+  interrupt stops before a second request, and that whitespace is dropped.
 - Adjacent-artifact resolution disagreed across resolvers when `metacodes` was
   started through a symlink (the common `ln -s <prefix>/bin/metacodes
   ~/bin/metacodes` install): macOS reports the invoked symlink as the

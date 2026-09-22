@@ -1276,6 +1276,16 @@ not remain valid after the callback returns.
 | `session_abort` | May run concurrently with the matching synchronous Run, including from a callback | Cooperative; callback or provider code that blocks can delay completion |
 | `session_abort_compact` | May run concurrently only with the matching synchronous compact | Cancellation propagates to in-flight provider I/O |
 
+There is no input operation for an active Run. `session_run_input` is
+synchronous and a Session admits one Run at a time, so a Host that receives
+user input while a Run is active either queues it itself and submits it as the
+next `session_run_input` once the Run returns (the CLI does exactly this at its
+REPL layer), or calls `session_abort` and resubmits. The in-process steering
+seam — `UiBackend.poll` returning `UiEvent.queue_message`, which the shared
+agent loop appends to the Conversation at the next turn boundary — is a
+source-level `metacodes-core` facility and is not exposed through the binary
+ABI; the facade's backend poll always returns null.
+
 Callbacks may request abort. A callback attempt to re-enter Run or destroy on
 the same handle returns `METASK_AGENTCORE_STATUS_BUSY`; callers must not spin or wait for that
 operation from inside the callback. Matching abort is the only concurrency

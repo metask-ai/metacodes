@@ -2272,6 +2272,11 @@ pub const AgentSession = struct {
         };
     }
 
+    /// The AgentCore Session has no input operation for an active Run: the
+    /// binary ABI is one synchronous `session_run_input` at a time, so a Host
+    /// queues later input itself and submits it as the next Run (or aborts).
+    /// The in-process `UiEvent.queue_message` steering seam that `agent_loop`
+    /// drains at each turn boundary is therefore never fed here (#115).
     fn backendPoll(_: *anyopaque, _: SessionId) ?UiEvent {
         return null;
     }

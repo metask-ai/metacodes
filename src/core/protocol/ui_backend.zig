@@ -33,8 +33,9 @@ pub const UiBackend = struct {
     emit: *const fn (ctx: *anyopaque, session: SessionId, ev: CoreEvent) void,
 
     /// UI→core:非阻塞拉取 session 这个会话的一个用户事件。无事件返 null。
-    /// 返回 .queue_message 时,其 slice 所有权转移给调用方(须 free,见 ui_event.zig);
-    /// .interrupt 无所有权。
+    /// 返回 .queue_message 时,其 slice 所有权转移给调用方(agent_loop 用 run 的 allocator
+    /// free,见 ui_event.zig);.interrupt 无所有权。agent_loop 在每个 turn 边界反复调到 null
+    /// 为止(#115),流式期间不调。
     poll: *const fn (ctx: *anyopaque, session: SessionId) ?UiEvent,
 
     /// 便利转发(可读性 + 给 agent_loop 接线用)。
