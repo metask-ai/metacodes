@@ -1441,7 +1441,7 @@ class SystemOneDecisionTraceTests(unittest.TestCase):
         payload.update(overrides)
         return {"system_one_decision": payload}
 
-    def _trace(self, events):
+    def _trace(self, events, ensure_ascii=True):
         framed = [{"run_started": {"trace_id": "t", "metadata": self.METADATA}}] + events + [
             {
                 "run_finished": {
@@ -1466,7 +1466,8 @@ class SystemOneDecisionTraceTests(unittest.TestCase):
                             "monotonic_elapsed_ns": index,
                             "session_id": "single",
                             "event": event,
-                        }
+                        },
+                        ensure_ascii=ensure_ascii,
                     )
                     + "\n"
                     for index, event in enumerate(framed)
@@ -1474,6 +1475,16 @@ class SystemOneDecisionTraceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             return _native_trace_metrics(path)
+
+    def test_raw_unicode_line_separator_inside_an_event_is_not_a_record_break(self):
+        # metacodes writes non-ASCII raw; a U+2028 inside a string must not
+        # split the record the way str.splitlines() would.
+        native, error = self._trace(
+            [self._recall(), self._decision(model="metask\u2028jev")], ensure_ascii=False
+        )
+        self.assertIsNone(error)
+        assert native is not None
+        self.assertEqual(native["system_one_decisions"][0]["model"], "metask\u2028jev")
 
     def test_shadow_decision_follows_its_scoped_recall(self):
         native, error = self._trace([self._recall(), self._decision()])

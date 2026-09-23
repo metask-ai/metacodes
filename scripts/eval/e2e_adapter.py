@@ -561,7 +561,9 @@ def _assistant_text(path: Path) -> Tuple[Optional[str], Optional[str]]:
         return None, read_error
     assistant_blocks: List[str] = []
     try:
-        for line_no, line in enumerate((text or "").splitlines(), 1):
+        # LF only: the transcript keeps non-ASCII raw, and splitlines() would
+        # also cut a record at a U+2028 inside a tool result.
+        for line_no, line in enumerate((text or "").split("\n"), 1):
             if not line.strip():
                 continue
             message = json.loads(line)
@@ -1199,7 +1201,9 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     events: List[Tuple[str, Dict[str, Any], int, str]] = []
     event_elapsed_ns: List[int] = []
     try:
-        for line_no, line in enumerate(text.splitlines(), 1):
+        # LF only, like the partial-line check above: splitlines() would also
+        # cut a record at a raw U+2028 inside a string.
+        for line_no, line in enumerate(text.split("\n"), 1):
             if not line.strip():
                 continue
             envelope = json.loads(line)

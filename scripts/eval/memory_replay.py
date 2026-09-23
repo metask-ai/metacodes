@@ -1091,7 +1091,8 @@ def _native_warm_cache_metrics(
         _fail(f"{where}.native_events", artifact_error or "cannot read native events")
 
     usages: List[Mapping[str, Any]] = []
-    for line_no, line in enumerate(text.splitlines(), 1):
+    # LF only: splitlines() would also cut at U+2028 inside a JSON string.
+    for line_no, line in enumerate(text.split("\n"), 1):
         if not line.strip():
             continue
         try:
@@ -1374,7 +1375,7 @@ def render_warm_context_cache_markdown(
 def _native_pricing_provenance(path: Path, where: str) -> str:
     observed: set[str] = set()
     try:
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
             if not line.strip():
                 continue
             value = json.loads(line)
@@ -1417,7 +1418,8 @@ def _load_unique_json(path: Path, label: str) -> Mapping[str, Any]:
 
 def load_observations(path: Path) -> List[Mapping[str, Any]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        # LF only: splitlines() would also cut at U+2028 inside a JSON string.
+        lines = path.read_text(encoding="utf-8").split("\n")
     except (OSError, UnicodeError) as exc:
         raise ValidationError(f"cannot read memory observations {path}: {exc}") from exc
     result: List[Mapping[str, Any]] = []

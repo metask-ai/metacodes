@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.eval.memory_agent_runtime import (
+    _agent_batch,
     PRODUCTION_MODEL_FINGERPRINT,
     ProductionRuntimeConfig,
     _assert_production_sandbox_identity,
@@ -3042,6 +3043,94 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertFalse((memory / "new-memory.md").exists())
             self.assertFalse((store / "new-store-file").exists())
             _assert_production_sandbox_identity(sandbox, evidence_path)
+
+    def test_agent_batch_keeps_unicode_line_separators_inside_node_text(self):
+        # LongMemEval chat turns contain U+2028/U+0085; str.splitlines() cut
+        # the JSONL record there and the paid run failed before its rollout.
+        from scripts.eval.memory_tinykg_local import _batch_bytes
+
+        text = "user: first line\u2028second line\u0085third"
+        raw = _batch_bytes([{"op": "node", "id": 1, "kind": "concept", "name": text}], [])
+        batch, logical, root, counts = _agent_batch(raw, {1: "session-a"}, 1, "proj-a")
+        records = [json.loads(line) for line in batch.decode("utf-8").split("\n") if line]
+        # The project root takes id 1; the session node follows it intact.
+        self.assertIn({"op": "node", "id": 2, "kind": "concept", "name": text}, records)
+        self.assertEqual((logical, root, counts["nodes"]), ({2: "session-a"}, 2, 2))
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and REAL_TINYKG.is_file(),
+        "requires macOS Seatbelt and the pinned TinyKG binary",
+    )
+    def test_production_seatbelt_lets_an_online_tinykg_store_take_its_daemon_lock(self):
+        # An online rollout owns a read-write store, but TinyKG opens its
+        # daemon-ownership flock O_RDWR on a sibling of the store. Without that
+        # one literal the CLI fails inside the sandbox and KG silently degrades.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "run" / "rollouts" / "current"
+            workspace = root / "run" / "projects" / "current-workspace"
+            store = root / "run" / "stores" / "current.kg"
+            for path in (artifact, workspace, store.parent):
+                path.mkdir(parents=True, exist_ok=True)
+            batch = artifact / "episode.jsonl"
+            write_text_lf(
+                batch,
+                stable_json({"version": 1})
+                + "\n"
+                + stable_json({"op": "node", "id": 1, "kind": "observation", "name": "online episode"})
+                + "\n",
+                encoding="utf-8",
+            )
+            env = {"PATH": os.defpath, "LC_ALL": "C", "LANG": "C"}
+            for action, *arguments in (("init", store), ("rebuild-text", store)):
+                completed = subprocess.run(
+                    [str(REAL_TINYKG), action, *map(str, arguments)],
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            ripgrep = artifact / "sealed-home" / ".metacodes" / "toolchain" / "rg"
+            ripgrep.parent.mkdir(parents=True)
+            ripgrep.write_bytes(TEST_RIPGREP.read_bytes())
+            ripgrep.chmod(0o500)
+            sandbox = _materialize_production_sandbox(
+                profile_path=artifact / "production-seatbelt.sb",
+                evidence_path=artifact / "production-seatbelt-probe.json",
+                artifact_dir=artifact,
+                workspace=workspace,
+                store=store,
+                metacodes=Path("/bin/echo"),
+                tinykg=REAL_TINYKG,
+                ripgrep=ripgrep,
+            )
+            for arguments in (("store-info", store), ("apply", store, batch)):
+                completed = subprocess.run(
+                    sandbox.command([str(REAL_TINYKG), *map(str, arguments)]),
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            # Nothing else beside the store became writable.
+            neighbour = store.with_name("neighbour.txt")
+            completed = subprocess.run(
+                sandbox.command(["/usr/bin/touch", str(neighbour)]),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(neighbour.exists())
 
     @unittest.skipUnless(
         platform.system() == "Darwin" and REAL_TINYKG.is_file(),

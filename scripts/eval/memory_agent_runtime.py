@@ -893,7 +893,10 @@ def _agent_batch(
 ) -> Tuple[bytes, Dict[int, str], int, Mapping[str, int]]:
     """Add the exact project-containment root used by KgClient recall."""
 
-    records = [json.loads(line) for line in batch.decode("utf-8").splitlines() if line]
+    # JSONL is split on LF only: str.splitlines() also breaks on U+2028,
+    # U+0085 and friends, which ensure_ascii=False leaves raw inside strings
+    # (LongMemEval chat text contains them).
+    records = [json.loads(line) for line in batch.decode("utf-8").split("\n") if line]
     if not records or records[0] != {"version": 1}:
         _fail("memory agent TinyKG batch", "invalid version header")
     nodes: List[Mapping[str, Any]] = []
@@ -1467,7 +1470,7 @@ def _read_workspace(workspace: Path, baseline: Mapping[str, str]) -> Dict[str, s
 
 def _parse_result(stdout: str) -> Mapping[str, Any]:
     rows: List[Mapping[str, Any]] = []
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
         if not line.strip():
             continue
         try:
@@ -2040,16 +2043,17 @@ def _production_sandbox_profile(
         path = parent.resolve(strict=True) / spelled.name
         if is_daemon_lock:
             # TinyKG storage v3 flocks a zero-byte rendezvous file that is a
-            # sibling of the store. Accept exactly `<sealed-root>` + suffix so
-            # the carve-out stays a single literal path derived from a sealed
-            # store; everything else in the parent stays deny-write.
+            # sibling of the store. Accept exactly `<store-root>` + suffix, for
+            # a sealed (offline) or a read-write (online) store, so the
+            # carve-out stays a single literal path derived from a store;
+            # everything else in the parent stays deny-write.
             if not any(
                 path == root.with_name(root.name + ".tinykg-daemon.lock")
-                for root in sealed_directories
+                for root in (*sealed_directories, *roots)
             ):
                 _fail(
                     "production sandbox transient write root",
-                    "daemon lock must be the sibling of a sealed read-only root",
+                    "daemon lock must be the sibling of a store root",
                 )
         else:
             if not any(_path_is_within(str(path), root) for root in sealed_directories):
@@ -2167,6 +2171,11 @@ def _materialize_production_sandbox(
                 ),
             )
             if tinykg_read_only_store is not None
+            # An online store is read-write already, but the same flock sits
+            # beside it, outside the store subpath: without this literal the
+            # CLI is denied inside the sandbox and KG silently degrades.
+            else (store.with_name(store.name + ".tinykg-daemon.lock"),)
+            if store is not None and tinykg is not None
             else ()
         ),
     )
