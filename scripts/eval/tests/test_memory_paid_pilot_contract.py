@@ -132,14 +132,43 @@ class PaidPilotContractTest(unittest.TestCase):
             ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(manifest["schedule"]))
 
-
     def test_v21_jev_arm_is_reproducible_balanced_and_budget_bound(self):
-        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v21"
+        self._assert_jev_pilot("procedural-glm52-v21")
+
+    def test_v22_reruns_the_jev_pilot_after_the_runner_fixes_within_the_authorization(self):
+        contract = self._assert_jev_pilot("procedural-glm52-v22")
+        self.assertEqual(
+            [(item["pilot_id"], item["status"]) for item in contract["predecessor_attempts"]],
+            [
+                ("procedural-glm52-v21", "halted-runner-online-store-seatbelt-daemon-lock"),
+                ("longmemeval-s-jev-pilot30-attempt1", "halted-runner-jsonl-unicode-line-separator"),
+            ],
+        )
+        self.assertFalse(contract["incident_guard"]["v21_transaction_reuse"])
+        self.assertEqual(contract["harness"]["runner_source_commit"], "42d16b2")
+        v21 = json.loads(
+            (ROOT / "evals/memory/pilots/procedural-glm52-v21/pilot-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        # Same families, binary and arms; only the runner revision moved.
+        self.assertEqual(contract["harness"]["binary_sha256"], v21["harness"]["binary_sha256"])
+        self.assertEqual(contract["protocol"]["arms"], v21["protocol"]["arms"])
+        budget = contract["budget_authority"]
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"]
+            + budget["max_total_cost_usd"]
+            + budget["companion_pilot_max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+
+    def _assert_jev_pilot(self, pilot_id):
+        pilot = ROOT / "evals/memory/pilots" / pilot_id
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(contract["pilot_id"], "procedural-glm52-v21")
+        self.assertEqual(contract["pilot_id"], pilot_id)
         for name, identity in contract["artifacts"].items():
             payload = (pilot / name).read_bytes()
             self.assertEqual(len(payload), identity["bytes"])
@@ -217,6 +246,7 @@ class PaidPilotContractTest(unittest.TestCase):
             ripgrep_binary=TEST_RIPGREP,
             ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(manifest["schedule"]))
+        return contract
 
 
 if __name__ == "__main__":
