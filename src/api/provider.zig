@@ -23,6 +23,7 @@ const request_overrides = @import("request_overrides.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const sync = @import("platform").sync;
 const log = @import("../util/log.zig");
+const error_class = @import("error_class.zig");
 
 pub const StreamHandle = api_stream.StreamHandle;
 pub const ApiResponse = api_stream.ApiResponse;
@@ -438,6 +439,13 @@ pub const Provider = struct {
     serverRequestIdFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
     httpStatusFn: ?*const fn (ctx: *anyopaque) u16 = null,
     retryAttemptFn: ?*const fn (ctx: *anyopaque) u32 = null,
+    /// Numbers from the last head-phase context-window-exceeded response body
+    /// (best effort; empty when the provider or the message carries none).
+    lastContextWindowNumbersFn: ?*const fn (ctx: *anyopaque) error_class.ContextWindowNumbers = null,
+    /// Stable identity of the endpoint requests go to (base URL). Learned
+    /// context caps are keyed by it together with the model: the same model
+    /// behind two gateways is two different walls.
+    endpointIdFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
 
     // ── 便利转发 ──────────────────────────────────────────────────────────
     pub inline fn model(self: Provider) []const u8 {
@@ -519,6 +527,14 @@ pub const Provider = struct {
     }
     pub inline fn serverRequestId(self: Provider) []const u8 {
         const f = self.serverRequestIdFn orelse return "";
+        return f(self.ctx);
+    }
+    pub inline fn lastContextWindowNumbers(self: Provider) error_class.ContextWindowNumbers {
+        const f = self.lastContextWindowNumbersFn orelse return .{};
+        return f(self.ctx);
+    }
+    pub inline fn endpointId(self: Provider) []const u8 {
+        const f = self.endpointIdFn orelse return "";
         return f(self.ctx);
     }
     pub inline fn httpStatus(self: Provider) u16 {

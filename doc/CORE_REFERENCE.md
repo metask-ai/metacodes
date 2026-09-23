@@ -130,7 +130,7 @@ pub const CoreEvent = union(enum) {
     tool_result: struct { id, name, input, content, is_error, elapsed_ms }, // 工具完成
     usage: UsageDelta,                            // token 计数增量
     phase_change: Phase,                          // input ↔ generating
-    auto_compact: struct { dropped, kept },       // 自动压缩历史
+    auto_compact: struct { dropped, kept, before_tokens, after_tokens, cause }, // 自动压缩历史;cause 以 context_window_exceeded_ 开头的是恢复,不是压缩
     retry_notice: struct { attempt, max, delay_ms }, // 流式建连重试
     ui_request_pending: struct { tool_use_id, request_json }, // 可挂起 UI 请求(异步前端,见 §5.3)
 
@@ -596,6 +596,28 @@ random id,所以后台命令跨 run 仍不逐字节一致。它不能简单换�
 request gate、`canonicalRequestBytes` 三处都这么漏过。`agent_loop.zig` 里有一条守卫测试直接
 钉住规则本身:生产函数中不得出现无参的 `provider.maxTokens()` / `maxInputTokens()`(判断
 每次出现前最近的顶层声明是 `test` 还是 `fn`,因为测试块在该文件里是穿插的)。
+
+**窗口是上界,墙是测出来的(`core/context_caps.zig`)**。catalog 的 `max_input_tokens` 是服务端的
+自述;真正的拒绝点只有服务端知道,而且同一个模型换一个网关就是另一堵墙(2026-09-22 Metask
+glm-5.3-flash:catalog 推出的可用输入 917,504,实测 ≈883K 就拒)。所以 `agent_loop` 里所有阈值
+都经 `pressureFor` 派生:`effective = min(catalog 可用输入, 学到的上限)`,三个 buffer 按
+`effective/200K` 线性放大(`context_pressure.scaledBuffer`,1M 窗口上仍是 6.5%/10%/1.5%,而不是
+1.3%/2%/0.3%)。学到的上限按 (endpoint, model) 记在 `~/.metacodes/context_caps.json`
+(`METACODES_CONTEXT_CAPS_FILE` 覆盖,置空则不落盘;测试构建默认不落盘),下个 session 从第一轮起就
+在墙内。
+
+**撞墙是一次测量,不是一个要绕过的坑**。采样请求被拒为 context-window-exceeded 时
+(`recoverContextWindowExceeded`):① 从错误正文解析数字(`error_class.parseContextWindowNumbers`,
+多方言尽力而为),有则记 `.server_message`,没有则用上次被接受的 prompt 大小记 `.observed`(任何后端
+都提供的下界);② 把 usage 锚点写成"已满"(Codex `set_total_tokens_full`);③ 强制走一次摘要压缩并
+在同一 turn 重试,每 turn 限 1 次(mecode `PRE_SEND_CONTEXT_COMPACT_RETRY_LIMIT`);④ 只有压缩无物可丢时
+才退到"删最老一对"——Rust 参考里那个一条条削的循环包的是**摘要请求**,从来不是采样请求。之后被
+接受的 prompt 若大于学到的上限:服务端自述作废、观测下界抬高(`context_caps.noteAccepted`)。
+**自动**压缩的摘要末尾附带用户原话(`compact_kernel.Options.preserve_user_prompts_tokens`,agent loop
+传 20K token;预算再按被丢前缀的 1/4 收紧,第一条请求必留),没有模型摘要时也至少保留这一段;
+手动 `/compact` 与 AgentCore 公共 compact 不开这项,契约不变。UI 事件仍是 `auto_compact`,但 cause 为
+`context_window_exceeded_recovery`(压缩应答了拒绝)或 `context_window_exceeded_trim`(退到削一对)
+时,两个前端都渲染成 recovery 而非压缩。
 
 **恢复面的两个原语**:`ReadArtifact` 只能取字节区间,恢复一个 N 字节结果要
 O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。`Grep` 因此接受

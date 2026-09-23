@@ -52,6 +52,26 @@ status, compatibility boundaries, and entry points are defined by
   process group that read the tty (`ssh` without `-n`) was stopped by SIGTTIN
   and never exited.
 
+- A context-window rejection from the provider is now a measurement and a real
+  compaction, not a one-pair shave. `recoverContextWindowExceeded` reads the
+  server's numbers from the error body (Anthropic, OpenAI-compatible/GLM and
+  Gemini wordings; `error_class.parseContextWindowNumbers`), records the wall
+  per (endpoint, model) in `~/.metacodes/context_caps.json`
+  (`core/context_caps.zig`, override with `METACODES_CONTEXT_CAPS_FILE`), marks
+  the conversation full, runs the summary compaction once per turn and retries
+  the same turn; trimming the oldest pair is only the fallback when nothing is
+  compactable. Thresholds derive from `min(catalog window, learned cap)` and
+  the 13K/20K/3K buffers scale with the window above 200K. Automatic
+  compaction keeps the user's requests verbatim in the summary (20K-token
+  budget, bounded to a quarter of the dropped prefix, first request always;
+  `compact_kernel.Options.preserve_user_prompts_tokens`, off for manual and
+  public compaction) and its fallback without a model summary keeps them too.
+  Both UI
+  backends render the two `context_window_exceeded_*` causes as recovery.
+  Before this, a catalog window above the real wall (Metask glm-5.3-flash:
+  917,504 derived vs ≈883K observed) pinned a session at the edge: 75
+  rejections in 21 minutes, two messages dropped per turn, the prompt cache
+  broken every turn, the original task dropped with no summary.
 - `UiEvent.queue_message` and `UiEvent.interrupt` were declared by the UI
   protocol and produced by `TuiBackend.poll`, but no production path ever
   called `UiBackend.poll` (#115): the CLI implemented queued messages entirely

@@ -270,7 +270,11 @@ pub const CoreEvent = union(enum) {
         after_tokens: u64 = 0,
         /// pre_sampling_pending_turn_threshold | pre_sampling_previous_model_smaller_window |
         /// post_tool_follow_up_threshold | summary_fallback | tool_result_pressure |
-        /// context_window_exceeded_recovery
+        /// context_window_exceeded_recovery (the server rejected the request; a
+        /// summary compaction answered it) | context_window_exceeded_trim (the
+        /// server rejected the request and nothing was compactable: the oldest
+        /// message pair was dropped). Frontends must render the two
+        /// `context_window_exceeded_*` causes as recovery, not as compaction.
         cause: []const u8 = "trigger",
     },
 

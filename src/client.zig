@@ -373,6 +373,9 @@ pub const Client = struct {
     request_setup_failure_injector: ?*RequestSetupFailureInjector = null,
     last_request_id: log.RequestId = .{ .bytes = .{0} ** 12 },
     last_http_status: u16 = 0,
+    /// Numbers the last head-phase overflow body carried (cleared on the next
+    /// accepted response). Read by the agent loop's context recovery.
+    last_context_window_numbers: error_class.ContextWindowNumbers = .{},
     /// Last gateway request id; overwritten at each response head. Borrowed
     /// metadata is copied so error responses are observable as well.
     server_request_id: [256]u8 = undefined,
@@ -461,7 +464,15 @@ pub const Client = struct {
             .serverRequestIdFn = &pServerRequestId,
             .httpStatusFn = &pHttpStatus,
             .retryAttemptFn = &pRetryAttempt,
+            .lastContextWindowNumbersFn = &pLastContextWindowNumbers,
+            .endpointIdFn = &pEndpointId,
         };
+    }
+    fn pLastContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
+        return asClient(ctx).last_context_window_numbers;
+    }
+    fn pEndpointId(ctx: *anyopaque) []const u8 {
+        return asClient(ctx).base_url;
     }
     fn pModel(ctx: *anyopaque) []const u8 {
         return asClient(ctx).modelSnapshot(); // task#13:一致读(避免撕裂)
@@ -1009,11 +1020,15 @@ pub const Client = struct {
         switch (classifyHttpStatus(status.code)) {
             // 成功即清陈旧错误现场——否则后续无记录的失败路径(如 mid-stream 断连)
             // 会把几轮前的无关错误当死因端给用户。
-            .ok => last_error.clear(),
+            .ok => {
+                last_error.clear();
+                client.last_context_window_numbers = .{};
+            },
             .failure => |failure| {
                 // Read every error body exactly once while the request reader is alive. Cleanup
                 // remains with the surrounding errdefers; do not deinit/destroy here.
                 const body_info = logErrorBody(req_ptr, rid, status, http_response);
+                client.last_context_window_numbers = body_info.context_window_numbers;
                 return resolveHttpFailure(failure, body_info);
             },
         }
@@ -1174,8 +1189,10 @@ fn logErrorBody(
         status.code, status.name, preview,
     });
     last_error.recordHttp(status.code, preview);
+    const context_window_exceeded = error_class.isContextWindowExceeded(preview);
     return .{
-        .context_window_exceeded = error_class.isContextWindowExceeded(preview),
+        .context_window_exceeded = context_window_exceeded,
+        .context_window_numbers = if (context_window_exceeded) error_class.parseContextWindowNumbers(preview) else .{},
         .token_expired = status.code == 401 and containsMetaskTokenExpired(preview),
     };
 }
@@ -1204,6 +1221,7 @@ fn containsMetaskTokenExpired(body: []const u8) bool {
 
 const ErrorBodyInfo = struct {
     context_window_exceeded: bool = false,
+    context_window_numbers: error_class.ContextWindowNumbers = .{},
     token_expired: bool = false,
 };
 
@@ -1264,6 +1282,9 @@ pub const StreamResponse = struct {
     id: log.RequestId,
     http_status: u16 = 0,
     retry_attempt: u32 = 0,
+    /// Copied from the event iterator when a mid-stream error frame reported a
+    /// context-window overflow; exposed through the StreamHandle hook.
+    context_window_numbers: error_class.ContextWindowNumbers = .{},
 
     fn init(allocator: std.mem.Allocator, sr: StreamResult, abort: ?*const AbortSignal) StreamResponse {
         return .{
@@ -1306,7 +1327,11 @@ pub const StreamResponse = struct {
             .serverRequestIdFn = &hServerRequestId,
             .httpStatusFn = &hHttpStatus,
             .retryAttemptFn = &hRetryAttempt,
+            .contextWindowNumbersFn = &hContextWindowNumbers,
         };
+    }
+    fn hContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
+        return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).context_window_numbers;
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
         return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).next();
@@ -1413,6 +1438,7 @@ pub const StreamResponse = struct {
                 return error.ApiError;
             },
             error.ContextWindowExceededEvent => {
+                self.context_window_numbers = self.event_iter.context_window_numbers;
                 log.warnId("stream", self.id, "context-window-exceeded error event surfaced", .{});
                 return error.ContextWindowExceeded;
             },

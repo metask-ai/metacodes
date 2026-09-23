@@ -77,6 +77,7 @@ pub const system_prompt = @import("core/system_prompt.zig");
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
+pub const context_caps = @import("core/context_caps.zig");
 pub const kg_task_projection = @import("kg/task_projection.zig"); // pure TinyKG snapshot/Markdown contract
 pub const kg_client = @import("kg/client.zig"); // local daemon/exclusive-store control-plane client
 pub const scoped_recall = @import("kg/scoped_recall.zig"); // deterministic outcome-note + scored recall

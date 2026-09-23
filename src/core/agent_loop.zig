@@ -29,6 +29,8 @@ const ReadState = @import("read_state.zig").ReadState;
 const api_stream = @import("../api/stream.zig");
 const tool_error = @import("tool_error.zig");
 const context_pressure_mod = @import("context_pressure.zig");
+const context_caps = @import("context_caps.zig");
+const error_class = @import("../api/error_class.zig");
 const compact_kernel = @import("compact_kernel.zig");
 const result_projection = @import("result_projection.zig");
 const result_budget_mod = @import("result_budget.zig");
@@ -1351,6 +1353,7 @@ pub fn run(
                     opts.auto_compact_threshold,
                     opts.auto_compact_keep_recent,
                     "pre_sampling_previous_model_smaller_window",
+                    false,
                     backend,
                     sess,
                     trace_id,
@@ -1385,6 +1388,7 @@ pub fn run(
                 opts.auto_compact_threshold,
                 opts.auto_compact_keep_recent,
                 "pre_sampling_pending_turn_threshold",
+                false,
                 backend,
                 sess,
                 trace_id,
@@ -1520,8 +1524,7 @@ pub fn run(
         // 1+2. 构造当前这一轮的 API 请求并发送。若建连/收头阶段或 SSE error
         // 明确报 context-window-exceeded,按 Rust compact recovery 路径逐步删最老
         // history 后重试。同一 turn 内重试,不把恢复尝试计成新 turn。
-        var context_recovery_attempts: usize = 0;
-        const context_recovery_cap = @max(conversation.len(), 1);
+        var context_recovery = ContextRecoveryState{ .cap = @max(conversation.len(), 1) };
         var turn_stop_reason: api_stream.StopReason = .unknown;
         var rid_for_turn: log.RequestId = undefined;
         // Re-issue counter for this turn. A context recovery or a mid-stream
@@ -1725,7 +1728,7 @@ pub fn run(
             if (!retry_ui.prepare(
                 request_sha256,
                 turns + 1,
-                @intCast(@min(context_recovery_attempts, std.math.maxInt(u32))),
+                @intCast(@min(context_recovery.attempts, std.math.maxInt(u32))),
                 max_provider_attempts,
             )) return finishRun(backend, sess, trace_id, depth, .{
                 .stop_reason = .api_error,
@@ -1773,27 +1776,36 @@ pub fn run(
                     .trace_id = trace_id,
                     .depth = depth,
                     .turn = turns + 1,
-                    .attempt = @intCast(@min(context_recovery_attempts, std.math.maxInt(u32))),
+                    .attempt = @intCast(@min(context_recovery.attempts, std.math.maxInt(u32))),
                     .elapsed_ms = elapsedSinceNs(model_request_started_ns),
                     .outcome = if (err == error.ContextWindowExceeded) "context_window_exceeded" else "api_error",
                 } });
                 switch (err) {
                     error.ContextWindowExceeded => {
-                        if (!recoverContextWindowExceeded(
-                            conversation,
-                            provider,
-                            effective_system_prompt,
-                            opts.inject_user_context,
-                            synthetic_user_input,
-                            provider_tool_defs,
-                            opts.model_override,
-                            backend,
-                            sess,
-                            &context_recovery_attempts,
-                            context_recovery_cap,
-                            turns + 1,
-                            allocator,
-                        )) {
+                        if (!recoverContextWindowExceeded(.{
+                            .conversation = conversation,
+                            .provider = provider,
+                            .system_prompt = effective_system_prompt,
+                            .inject_user_context = opts.inject_user_context,
+                            .synthetic_user_input = synthetic_user_input,
+                            .tool_defs = provider_tool_defs,
+                            .model_override = opts.model_override,
+                            .numbers = provider.lastContextWindowNumbers(),
+                            .keep_recent = opts.auto_compact_keep_recent,
+                            .backend = backend,
+                            .sess = sess,
+                            .trace_id = trace_id,
+                            .depth = depth,
+                            .state = &context_recovery,
+                            .turn_number = turns + 1,
+                            .context_warning_emitted = &context_warning_emitted,
+                            .allocator = allocator,
+                            .tasks = opts.tasks,
+                            .hookset = permission_ctx.hooks,
+                            .summary_reserve_tokens = &compact_summary_reserve_tokens,
+                            .request_gate = opts.request_gate,
+                            .abort = opts.abort,
+                        })) {
                             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
                         }
                         continue :request_recovery;
@@ -2054,6 +2066,13 @@ pub fn run(
             // 也会污染下一轮基线。
             if (!aborted_during_stream and !stream_error and response_usage.has_metering) {
                 conversation.setUsageAnchor(@intCast(response_usage.promptTokens()));
+                // An accepted prompt is a measurement too: a stated cap below it
+                // was wrong (forget it), an observed bound below it was low (raise it).
+                switch (context_caps.noteAccepted(provider.endpointId(), opts.model_override orelse provider.model(), response_usage.promptTokens())) {
+                    .invalidated => log.warnId("agent", rid, "learned context cap invalidated: server accepted {d} prompt tokens above its stated limit", .{response_usage.promptTokens()}),
+                    .raised => log.debugId("agent", rid, "learned context cap raised to {d} accepted prompt tokens", .{response_usage.promptTokens()}),
+                    .none => {},
+                }
                 if (cache_detector.checkResponse(response_usage.cache_read_tokens, response_usage.cache_write_tokens)) |reason| {
                     log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, response_usage.cache_read_tokens, response_usage.cache_write_tokens });
                     backend.emitEvent(sess, .{ .diag_cache_break = .{
@@ -2068,7 +2087,7 @@ pub fn run(
                 .trace_id = trace_id,
                 .depth = depth,
                 .turn = turns + 1,
-                .attempt = @intCast(@min(context_recovery_attempts, std.math.maxInt(u32))),
+                .attempt = @intCast(@min(context_recovery.attempts, std.math.maxInt(u32))),
                 .elapsed_ms = elapsedSinceNs(model_request_started_ns),
                 .outcome = if (aborted_during_stream)
                     "aborted"
@@ -2203,21 +2222,33 @@ pub fn run(
                 for (reasoning_items.items) |item| allocator.free(item);
                 reasoning_items.clearRetainingCapacity();
                 if (can_recover_context_error) {
-                    if (!recoverContextWindowExceeded(
-                        conversation,
-                        provider,
-                        effective_system_prompt,
-                        opts.inject_user_context,
-                        synthetic_user_input,
-                        provider_tool_defs,
-                        opts.model_override,
-                        backend,
-                        sess,
-                        &context_recovery_attempts,
-                        context_recovery_cap,
-                        turns + 1,
-                        allocator,
-                    )) {
+                    if (!recoverContextWindowExceeded(.{
+                        .conversation = conversation,
+                        .provider = provider,
+                        .system_prompt = effective_system_prompt,
+                        .inject_user_context = opts.inject_user_context,
+                        .synthetic_user_input = synthetic_user_input,
+                        .tool_defs = provider_tool_defs,
+                        .model_override = opts.model_override,
+                        .numbers = blk: {
+                            const from_frame = stream.contextWindowNumbers();
+                            break :blk if (from_frame.isEmpty()) provider.lastContextWindowNumbers() else from_frame;
+                        },
+                        .keep_recent = opts.auto_compact_keep_recent,
+                        .backend = backend,
+                        .sess = sess,
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .state = &context_recovery,
+                        .turn_number = turns + 1,
+                        .context_warning_emitted = &context_warning_emitted,
+                        .allocator = allocator,
+                        .tasks = opts.tasks,
+                        .hookset = permission_ctx.hooks,
+                        .summary_reserve_tokens = &compact_summary_reserve_tokens,
+                        .request_gate = opts.request_gate,
+                        .abort = opts.abort,
+                    })) {
                         return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
                     }
                     continue :request_recovery;
@@ -3359,6 +3390,7 @@ pub fn run(
             opts.auto_compact_threshold,
             opts.auto_compact_keep_recent,
             "post_tool_follow_up_threshold",
+            false,
             backend,
             sess,
             trace_id,
@@ -3846,7 +3878,44 @@ fn serializeToolSchemasForCache(
     return try out.toOwnedSlice(allocator);
 }
 
-fn recoverContextWindowExceeded(
+/// Pressure for the model a request will actually name, bounded by any wall
+/// learned on this endpoint (core.context_caps). Every threshold in this file
+/// must come from here, never from `ContextPressure.fromModel` directly, or a
+/// learned cap silently stops applying to that one check.
+fn pressureFor(
+    provider: provider_mod.Provider,
+    model_override: ?[]const u8,
+    configured_threshold: ?usize,
+    request_tokens: usize,
+) context_pressure_mod.ContextPressure {
+    const model = model_override orelse provider.model();
+    const learned = context_caps.learnedInputCap(provider.endpointId(), model);
+    return context_pressure_mod.ContextPressure.fromModelWithCap(
+        provider.maxInputTokensFor(model_override),
+        provider.maxTokensFor(model_override),
+        configured_threshold,
+        request_tokens,
+        if (learned) |cap| @intCast(@min(cap, @as(u64, std.math.maxInt(usize)))) else null,
+    );
+}
+
+/// Per-turn context-window recovery state.
+const ContextRecoveryState = struct {
+    /// Physical recovery attempts this turn (compaction retries and trims).
+    attempts: usize = 0,
+    /// Upper bound on attempts: one per message, so a turn cannot spin forever.
+    cap: usize,
+    /// Compaction retries spent this turn (see CONTEXT_RECOVERY_COMPACT_RETRIES).
+    compact_retries: u32 = 0,
+};
+
+/// How many times one turn may answer a rejection with a summary compaction
+/// before falling back to trimming (mecode: PRE_SEND_CONTEXT_COMPACT_RETRY_LIMIT).
+/// One is enough when compaction works; a second rejection right after a
+/// compaction means the retained suffix itself does not fit.
+pub const CONTEXT_RECOVERY_COMPACT_RETRIES: u32 = 1;
+
+const RecoveryArgs = struct {
     conversation: *Conversation,
     provider: provider_mod.Provider,
     system_prompt: ?[]const u8,
@@ -3854,39 +3923,151 @@ fn recoverContextWindowExceeded(
     synthetic_user_input: ?[]const u8,
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
+    /// Numbers from the rejection body (empty when the provider said nothing usable).
+    numbers: error_class.ContextWindowNumbers,
+    keep_recent: usize,
     backend: *const UiBackend,
     sess: @import("session_id.zig").SessionId,
-    attempts: *usize,
-    cap: usize,
+    trace_id: [12]u8,
+    depth: u8,
+    state: *ContextRecoveryState,
     turn_number: u32,
+    context_warning_emitted: ?*bool,
     allocator: std.mem.Allocator,
-) bool {
-    attempts.* += 1;
-    if (attempts.* > cap) {
-        log.err("agent", "context-window recovery exhausted turn={d} attempts={d}", .{ turn_number, attempts.* });
+    tasks: ?*@import("task_store.zig").TaskStore,
+    hookset: ?*const hooks_mod.HookSet,
+    summary_reserve_tokens: ?*usize,
+    request_gate: ?request_gate_mod.Gate,
+    abort: ?*const AbortSignal,
+};
+
+/// The server rejected the pending request as too large. Turn that into a
+/// measurement and a real compaction, not a one-message shave:
+///   1. learn the wall for (endpoint, model) — from the body's numbers when it
+///      has them, else from the last accepted size (provider-neutral);
+///   2. mark the conversation full (Codex `set_total_tokens_full`) so every
+///      later threshold check agrees that compaction is due;
+///   3. run the summary compaction once per turn (mecode's pre-send retry
+///      limit) and let the caller retry the same turn;
+///   4. only when compaction had nothing to drop, fall back to trimming the
+///      oldest message pair — the Rust one-item-at-a-time loop, which in the
+///      references wraps the *summary* request, never the sampling request.
+/// Returns false when the turn must end with api_error.
+///
+/// History: until 2026-09-22 this function was only step 4. With a threshold
+/// above the real wall (catalog 917,504 vs ≈883K on the Metask glm-5.3-flash
+/// route) that became the steady state: 75 rejections in 21 minutes, two
+/// messages shaved per turn, the prompt cache broken every turn, and the
+/// original task statement dropped with no summary.
+fn recoverContextWindowExceeded(args: RecoveryArgs) bool {
+    const st = args.state;
+    st.attempts += 1;
+    if (st.attempts > st.cap) {
+        log.err("agent", "context-window recovery exhausted turn={d} attempts={d}", .{ args.turn_number, st.attempts });
         return false;
     }
-    // 先作废 usage 锚点:removeOldest 反正会作废它,提前作废让 before/after 同用
-    // 冷路径基准——否则 before=锚点实计、after=冷估算,删消息后数字反而翻倍(假遥测,
-    // 实录 2026-07-06 fix4.log:dropped=1 before=203081 after=415469)。
+    const conversation = args.conversation;
+    const provider = args.provider;
+    const model = args.model_override orelse provider.model();
+    const endpoint = provider.endpointId();
+    const assumed_completion: u64 = provider.maxTokensFor(args.model_override);
+
+    // 1. Measure the wall.
+    const anchor_before = conversation.usageAnchor();
+    const local_estimate = estimateNextRequestTokensOrFallback(args.allocator, provider, conversation, args.system_prompt, args.inject_user_context, args.synthetic_user_input, args.tool_defs, args.model_override);
+    const server_cap = args.numbers.inputCap(assumed_completion);
+    const server_actual = args.numbers.inputActual(assumed_completion);
+    const input_cap: u64 = server_cap orelse blk: {
+        // No numbers: the last accepted size is a lower bound any backend
+        // provides; a cold session only has its own estimate of what it sent.
+        if (anchor_before) |a| break :blk @intCast(a.context_tokens);
+        break :blk @intCast(local_estimate);
+    };
+    const source: context_caps.Source = if (server_cap != null) .server_message else .observed;
+    const learn = context_caps.learnInputCap(endpoint, model, input_cap, source);
+    const pressure = pressureFor(provider, args.model_override, null, local_estimate);
+    log.warn("agent", "context window exceeded turn={d} attempt={d} model={s} server_limit={?d} server_actual={?d} input_cap={d} cap_source={s} learn={s} anchor={?d} local_estimate={d} catalog_effective={d} effective={d} auto_threshold={d}", .{
+        args.turn_number,
+        st.attempts,
+        model,
+        server_cap,
+        server_actual,
+        input_cap,
+        source.label(),
+        @tagName(learn),
+        if (anchor_before) |a| @as(?usize, a.context_tokens) else null,
+        local_estimate,
+        pressure.catalog_effective_window,
+        pressure.effective_context_window,
+        pressure.auto_compact_threshold,
+    });
+
+    // 2. Mark full: what was just sent is at least the wall.
+    const rejected_size: usize = @intCast(@max(server_actual orelse 0, input_cap));
+    conversation.setUsageAnchor(@max(rejected_size, 1));
+
+    // 3. Summary compaction, once per turn.
+    if (st.compact_retries < CONTEXT_RECOVERY_COMPACT_RETRIES) {
+        st.compact_retries += 1;
+        const outcome = runAutoCompactIfNeeded(
+            conversation,
+            provider,
+            args.system_prompt,
+            args.inject_user_context,
+            args.synthetic_user_input,
+            args.tool_defs,
+            args.model_override,
+            null,
+            null,
+            args.keep_recent,
+            "context_window_exceeded_recovery",
+            true,
+            args.backend,
+            args.sess,
+            args.trace_id,
+            args.depth,
+            args.turn_number,
+            args.context_warning_emitted,
+            args.allocator,
+            args.tasks,
+            args.hookset,
+            args.summary_reserve_tokens,
+            args.request_gate,
+            args.abort,
+        ) catch |err| {
+            log.err("agent", "context-window recovery compaction failed turn={d}: {s}", .{ args.turn_number, @errorName(err) });
+            return false;
+        };
+        switch (outcome) {
+            .compacted => return true,
+            .api_error, .aborted => return false,
+            // Nothing droppable (active window already ≤ keep_recent) or the
+            // savings gate refused: fall through to the trim.
+            .not_needed, .skipped_no_savings => {},
+        }
+    }
+
+    // 4. Last resort: shave the oldest pair. Invalidate the anchor first so
+    // before/after telemetry share the cold baseline (otherwise before is the
+    // marked-full anchor and after a cold estimate, and dropping one message
+    // reads as growth — 2026-07-06 fix4.log: dropped=1 before=203081 after=415469).
     conversation.invalidateUsageAnchor();
-    const before_tokens = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-    // 投影:removeOldest 推进 boundary(原始不删),收缩的是活跃窗口 → 遥测用活跃计数,否则 N->N。
+    const before_tokens = estimateNextRequestTokensOrFallback(args.allocator, provider, conversation, args.system_prompt, args.inject_user_context, args.synthetic_user_input, args.tool_defs, args.model_override);
     const before_active = conversation.activeMessages().len;
     const dropped = conversation.removeOldestForContextRecovery();
     if (dropped == 0) {
-        log.err("agent", "context-window recovery impossible turn={d} active_msgs={d}", .{ turn_number, conversation.activeMessages().len });
+        log.err("agent", "context-window recovery impossible turn={d} active_msgs={d}", .{ args.turn_number, conversation.activeMessages().len });
         return false;
     }
-    const after_tokens = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+    const after_tokens = estimateNextRequestTokensOrFallback(args.allocator, provider, conversation, args.system_prompt, args.inject_user_context, args.synthetic_user_input, args.tool_defs, args.model_override);
     const kept_active = conversation.activeMessages().len;
-    log.warn("agent", "context-window recovery: dropped={d} active_msgs={d}->{d} before_tokens={d} after_tokens={d} attempt={d}", .{ dropped, before_active, kept_active, before_tokens, after_tokens, attempts.* });
-    backend.emitEvent(sess, .{ .auto_compact = .{
+    log.warn("agent", "context-window recovery trim: dropped={d} active_msgs={d}->{d} before_tokens={d} after_tokens={d} attempt={d}", .{ dropped, before_active, kept_active, before_tokens, after_tokens, st.attempts });
+    args.backend.emitEvent(args.sess, .{ .auto_compact = .{
         .dropped = @as(u32, @intCast(dropped)),
         .kept = @as(u32, @intCast(kept_active)),
         .before_tokens = @intCast(before_tokens),
         .after_tokens = @intCast(after_tokens),
-        .cause = "context_window_exceeded_recovery",
+        .cause = "context_window_exceeded_trim",
     } });
     return true;
 }
@@ -3974,6 +4155,9 @@ fn runAutoCompactIfNeeded(
     configured_threshold: ?usize,
     keep_recent: usize,
     trigger_cause: []const u8,
+    /// The server just rejected the pending request: compact regardless of
+    /// what the local estimate says (the estimate was wrong by definition).
+    forced: bool,
     backend: *const UiBackend,
     sess: @import("session_id.zig").SessionId,
     trace_id: [12]u8,
@@ -3990,7 +4174,7 @@ fn runAutoCompactIfNeeded(
     var outcome: AutoCompactOutcome = .not_needed;
 
     var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-    var pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
+    var pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
     emitContextWarningIfNeeded(backend, sess, pressure, context_warning_emitted);
     // 正常:auto=max(formula, 32K floor);micro=其下一档。强制旋钮(仅测试/power-user)存在时,
     // auto/micro 一起钉到强制值——让短对话也能触发真实 summary 压缩+投影。一次 getenv,不在热路径重复读。
@@ -3999,7 +4183,7 @@ fn runAutoCompactIfNeeded(
         @max(pressure.auto_compact_threshold, MIN_AUTO_COMPACT_THRESHOLD);
     const micro_threshold = forced_threshold orelse
         @max(@min(pressure.warning_threshold, auto_threshold), MIN_AUTO_COMPACT_THRESHOLD);
-    if (request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
+    if (!forced and request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
         var reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
         // Clearing deliberately preserves the most recent results, and skips
         // anything whose artifact envelope is its only recovery capability.
@@ -4017,11 +4201,11 @@ fn runAutoCompactIfNeeded(
             log.info("agent", "microcompact: cleared={d} truncated={d} old tool_results bytes={d}->{d} keep_recent_results={d} threshold={d} cause={s}", .{ reduced.cleared, reduced.truncated, reduced.bytes_before, reduced.bytes_after, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP, micro_threshold, trigger_cause });
             emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
             request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
+            pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
         }
     }
 
-    if (request_tokens_before >= auto_threshold) {
+    if (forced or request_tokens_before >= auto_threshold) {
         // PreCompact hook(压缩前):喂 {trigger, active_msgs, tokens},side-effect(如存盘/记忆快照),非阻塞。
         if (hookset) |hs| if (hs.hasPreCompact()) {
             const pre_json = std.fmt.allocPrint(allocator, "{{\"hook_event_name\":\"PreCompact\",\"trigger\":\"{s}\",\"active_messages\":{d},\"tokens\":{d}}}", .{ trigger_cause, conversation.activeMessages().len, request_tokens_before }) catch null;
@@ -4111,6 +4295,9 @@ fn runAutoCompactIfNeeded(
                     0,
                 .request_gate = request_gate,
                 .target_tokens = auto_threshold,
+                // Automatic compaction is the lossy one nobody asked for: keep
+                // the user's requests verbatim (bounded) so the task survives.
+                .preserve_user_prompts_tokens = compact_summary.USER_PROMPTS_BUDGET_TOKENS,
             },
         ) catch |err| {
             log.warn("agent", "auto-compact kernel failed: {s}", .{@errorName(err)});
@@ -4180,7 +4367,7 @@ fn runAutoCompactIfNeeded(
                 } });
                 outcome = .compacted;
                 request_tokens_before = report.after_tokens;
-                pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
+                pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
             },
         }
     }
@@ -4200,7 +4387,7 @@ fn runAutoCompactIfNeeded(
             outcome = .compacted;
             const before_block_tokens = request_tokens_before;
             request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override), configured_threshold, request_tokens_before);
+            pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
             log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
             // This is the same lossy operation as the earlier stale-result
             // pressure valve.  Keep the mechanism kind stable; the trigger
@@ -4208,6 +4395,10 @@ fn runAutoCompactIfNeeded(
             emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
         }
         if (pressure.isAtBlockingLimit()) {
+            // A forced recovery already paid for its compaction; the retry the
+            // caller is about to make is the real test, not this local model
+            // (whose learned cap may be a small observed lower bound).
+            if (forced and outcome == .compacted) return outcome;
             log.err("agent", "context blocking limit reached: tokens={d} blocking_limit={d} raw_window={d} effective_window={d} cause={s}", .{ request_tokens_before, pressure.blocking_limit, pressure.raw_context_window, pressure.effective_context_window, trigger_cause });
             return .api_error;
         }
@@ -4787,6 +4978,7 @@ test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风
         null, // 阈值走窗口公式:auto=229144
         10,
         "post_tool_follow_up_threshold",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -4885,6 +5077,7 @@ test "auto-compact preflight never rewrites an already committed tool_result" {
         null,
         2,
         "post_tool_follow_up_threshold",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -5010,6 +5203,7 @@ test "auto-compact emits stale tool-result projection from the real microcompact
         null,
         2,
         "post_tool_follow_up_threshold",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -5119,6 +5313,7 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
         32_000,
         2,
         "post_tool_follow_up_threshold",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -5190,6 +5385,7 @@ test "auto-compact does not buy a summary when fixed request overhead makes savi
         32_000,
         2,
         "pre_sampling_pending_turn_threshold",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -5257,6 +5453,7 @@ test "auto-compact checks runtime request gate before provider side effect" {
         32_000,
         2,
         "pre_sampling_pending_turn_threshold",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -5323,6 +5520,7 @@ test "auto-compact feeds realized summary overhead back into retry preview" {
         32_000,
         2,
         "post_tool_follow_up_threshold",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -5352,6 +5550,7 @@ test "auto-compact feeds realized summary overhead back into retry preview" {
         32_000,
         2,
         "pre_sampling_pending_turn_threshold",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -5417,6 +5616,7 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
         32_000,
         2,
         "post_tool_follow_up_threshold",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -5479,7 +5679,7 @@ test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)
     const post_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &post_cmds }};
     const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .pre_compact = &pre_entries, .post_compact = &post_entries, .allocator = a };
 
-    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, &hs, null, null, null);
+    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, &hs, null, null, null);
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
     // PreCompact 真触发:marker 文件存在。
@@ -5582,6 +5782,7 @@ test "previous-model compact uses old model override before smaller-window sampl
         32_000,
         2,
         "pre_sampling_previous_model_smaller_window",
+        false,
         &backend,
         .single,
         [_]u8{0} ** 12,
@@ -5601,14 +5802,10 @@ test "previous-model compact uses old model override before smaller-window sampl
     try std.testing.expectEqualStrings("pre_sampling_previous_model_smaller_window", cap.cause.?);
 }
 
-test "stream context-window recovery retries before assistant payload" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    try c.appendText(.user, "oldest context");
-    try c.appendText(.assistant, "middle context");
-    try c.appendText(.user, "current request");
-
+/// Shared fixture for the context-window recovery tests: a provider whose
+/// first sampling request is rejected as too large, and a stream that answers
+/// "ok" to every later request (summary or retry alike).
+const ContextRecoveryFixture = struct {
     const FakeStream = struct {
         allocator: std.mem.Allocator,
         attempt: u32 = 0,
@@ -5634,10 +5831,15 @@ test "stream context-window recovery retries before assistant payload" {
             return self.rid;
         }
     };
+
     const FakeProvider = struct {
         allocator: std.mem.Allocator,
         sends: u32 = 0,
-        streams: [2]FakeStream = undefined,
+        /// Requests made through `sendStream` (the summary transport), by count.
+        summary_sends: u32 = 0,
+        streams: [4]FakeStream = undefined,
+        numbers: error_class.ContextWindowNumbers = .{},
+        endpoint: []const u8 = "",
 
         fn asState(ctx: *anyopaque) *@This() {
             return @ptrCast(@alignCast(ctx));
@@ -5660,6 +5862,7 @@ test "stream context-window recovery retries before assistant payload" {
             };
         }
         fn sendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!provider_mod.StreamHandle {
+            asState(ctx).summary_sends += 1;
             return sendStreamRetry(ctx, messages, system, tools, abort, model_override, tool_choice, 0, 0, null, user_query);
         }
         fn send(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?[]const u8) anyerror!provider_mod.ApiResponse {
@@ -5677,6 +5880,12 @@ test "stream context-window recovery retries before assistant payload" {
         fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
             return false;
         }
+        fn lastNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
+            return asState(ctx).numbers;
+        }
+        fn endpointId(ctx: *anyopaque) []const u8 {
+            return asState(ctx).endpoint;
+        }
         fn provider(self: *@This()) provider_mod.Provider {
             return .{
                 .ctx = @ptrCast(self),
@@ -5688,18 +5897,28 @@ test "stream context-window recovery retries before assistant payload" {
                 .maxInputTokensFn = maxInputTokens,
                 .reasoningEffortFn = reasoningEffort,
                 .supportsFn = supports,
+                .lastContextWindowNumbersFn = lastNumbers,
+                .endpointIdFn = endpointId,
             };
         }
     };
 
     const Capture = struct {
         auto_compacts: u32 = 0,
+        last_cause: []const u8 = "",
+        last_dropped: u32 = 0,
+        last_kept: u32 = 0,
         text: std.ArrayList(u8) = .empty,
         allocator: std.mem.Allocator,
         fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             switch (ev) {
-                .auto_compact => self.auto_compacts += 1,
+                .auto_compact => |c| {
+                    self.auto_compacts += 1;
+                    self.last_cause = c.cause;
+                    self.last_dropped = c.dropped;
+                    self.last_kept = c.kept;
+                },
                 .text_chunk => |t| self.text.appendSlice(self.allocator, t) catch {},
                 else => {},
             }
@@ -5708,27 +5927,122 @@ test "stream context-window recovery retries before assistant payload" {
             return null;
         }
     };
+};
 
-    var fp = FakeProvider{ .allocator = a };
-    var cap = Capture{ .allocator = a };
+test "context-window rejection with nothing to compact trims the oldest pair and records an observed cap" {
+    context_caps.resetForTest();
+    defer context_caps.resetForTest();
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "oldest context");
+    try c.appendText(.assistant, "middle context");
+    try c.appendText(.user, "current request");
+
+    var fp = ContextRecoveryFixture.FakeProvider{ .allocator = a, .endpoint = "https://fake.endpoint" };
+    var cap = ContextRecoveryFixture.Capture{ .allocator = a };
     defer cap.text.deinit(a);
-    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = ContextRecoveryFixture.Capture.emit, .poll = ContextRecoveryFixture.Capture.poll };
     const perm = permission_mod.createContext(.bypass_permissions, a);
+    // keep_recent (default 10) exceeds the history: compaction has nothing to
+    // drop, so recovery falls back to the trim.
     const result = try run(&c, fp.provider(), &.{}, &perm, .{ .max_turns = 2, .colorize = false }, &backend, a);
 
     try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
     try std.testing.expectEqual(@as(u32, 2), fp.sends);
+    try std.testing.expectEqual(@as(u32, 0), fp.summary_sends);
     try std.testing.expectEqual(@as(u32, 1), cap.auto_compacts);
+    try std.testing.expectEqualStrings("context_window_exceeded_trim", cap.last_cause);
     try std.testing.expectEqualStrings("ok", cap.text.items);
-    // 投影:context-window recovery 推进 boundary 丢 "oldest context",不删原始。
+    // 投影:trim 推进 boundary 丢 "oldest context",不删原始。
     // 全量 = [oldest, middle, current, ok(assistant 回复)];活跃窗口从 middle 起。
     try std.testing.expectEqual(@as(usize, 4), c.len());
     try std.testing.expectEqual(@as(usize, 1), c.activeStart());
     const active = c.activeMessages();
     try std.testing.expectEqualStrings("middle context", active[0].blocks[0].text);
     try std.testing.expectEqualStrings("current request", active[1].blocks[0].text);
-    // 被投影掉的 oldest 仍原样保留在头部(供 transcript/resume)。
     try std.testing.expectEqualStrings("oldest context", c.messages.items[0].blocks[0].text);
+    // No numbers in the rejection: the wall is recorded from the local size, as an observation.
+    const learned = context_caps.lookup("https://fake.endpoint", "fake") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(context_caps.Source.observed, learned.source);
+    try std.testing.expect(learned.input_cap > 0);
+}
+
+test "context-window rejection forces a summary compaction, keeps the first request verbatim, then retries" {
+    context_caps.resetForTest();
+    defer context_caps.resetForTest();
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    // Enough bulk that dropping the prefix clears the 5% savings gate even
+    // after the summary prefix and the preserved request are added back.
+    // ≈60K tokens in total, so the observed cap sits well above the fixed buffers.
+    const filler = "f" ** 60_000;
+    try c.appendText(.user, "oldest context: rerun the benchmark " ++ filler);
+    try c.appendText(.assistant, "middle one " ++ filler);
+    try c.appendText(.user, "middle two " ++ filler);
+    try c.appendText(.assistant, "middle three " ++ filler);
+    try c.appendText(.user, "current request");
+
+    var fp = ContextRecoveryFixture.FakeProvider{ .allocator = a, .endpoint = "https://fake.endpoint" };
+    var cap = ContextRecoveryFixture.Capture{ .allocator = a };
+    defer cap.text.deinit(a);
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = ContextRecoveryFixture.Capture.emit, .poll = ContextRecoveryFixture.Capture.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const result = try run(&c, fp.provider(), &.{}, &perm, .{ .max_turns = 2, .colorize = false, .auto_compact_keep_recent = 1 }, &backend, a);
+
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+    // rejected sampling → summary request → retried sampling
+    try std.testing.expectEqual(@as(u32, 3), fp.sends);
+    try std.testing.expectEqual(@as(u32, 1), fp.summary_sends);
+    try std.testing.expectEqual(@as(u32, 1), cap.auto_compacts);
+    try std.testing.expectEqualStrings("context_window_exceeded_recovery", cap.last_cause);
+    try std.testing.expectEqual(@as(u32, 4), cap.last_dropped);
+    try std.testing.expectEqualStrings("ok", cap.text.items);
+    // Projection: summary replaces the four dropped messages; only "current request" stays active.
+    try std.testing.expectEqual(@as(usize, 6), c.len());
+    try std.testing.expectEqual(@as(usize, 4), c.activeStart());
+    try std.testing.expectEqualStrings("current request", c.activeMessages()[0].blocks[0].text);
+    const summary = c.compact_summary orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, summary, "ok") != null);
+    // The user's first request survives verbatim; the assistant filler does not.
+    try std.testing.expect(std.mem.indexOf(u8, summary, "[1] oldest context: rerun the benchmark") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "middle one") == null);
+    // The trim path was never needed.
+    try std.testing.expectEqualStrings("oldest context: rerun the benchmark " ++ filler, c.messages.items[0].blocks[0].text);
+}
+
+test "context-window rejection with server numbers learns the stated cap for the endpoint" {
+    context_caps.resetForTest();
+    defer context_caps.resetForTest();
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "oldest context");
+    try c.appendText(.assistant, "middle context");
+    try c.appendText(.user, "current request");
+
+    var fp = ContextRecoveryFixture.FakeProvider{
+        .allocator = a,
+        .endpoint = "https://gateway.example/v1",
+        .numbers = .{ .input_limit = 150_000, .input_actual = 160_000 },
+    };
+    var cap = ContextRecoveryFixture.Capture{ .allocator = a };
+    defer cap.text.deinit(a);
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = ContextRecoveryFixture.Capture.emit, .poll = ContextRecoveryFixture.Capture.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const result = try run(&c, fp.provider(), &.{}, &perm, .{ .max_turns = 2, .colorize = false }, &backend, a);
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+
+    const learned = context_caps.lookup("https://gateway.example/v1", "fake") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 150_000), learned.input_cap);
+    try std.testing.expectEqual(context_caps.Source.server_message, learned.source);
+    // The same model on another endpoint learned nothing.
+    try std.testing.expectEqual(@as(?u64, null), context_caps.learnedInputCap("https://other.example", "fake"));
+    // With the wall learned, the pressure model now sits inside it.
+    const p = pressureFor(fp.provider(), null, null, 0);
+    try std.testing.expectEqual(@as(?usize, 150_000), p.learned_input_cap);
+    try std.testing.expect(p.auto_compact_threshold < 150_000);
 }
 
 test "context warning emits once only at medium pressure" {
