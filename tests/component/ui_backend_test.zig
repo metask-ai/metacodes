@@ -371,7 +371,20 @@ test "WriterBackend 字节锁: auto_compact == legacy 行" {
     const be = wb.backend();
 
     be.emitEvent(S, .{ .auto_compact = .{ .dropped = 5, .kept = 12 } });
-    try testing.expectEqualStrings("\x1b[33m[auto-compacted 5 old messages, kept last 12]\x1b[0m\n", cap.buf.items);
+    try testing.expectEqualStrings("\x1b[33m[auto-compacted 5 old messages, kept last 12; cause=trigger]\x1b[0m\n", cap.buf.items);
+}
+
+test "WriterBackend 字节锁: context-window recovery is not printed as a compaction" {
+    var cap = CaptureSink.init(testing.allocator);
+    defer cap.deinit();
+    var wb = writer_backend.WriterBackend{ .sink_ctx = @ptrCast(&cap), .sink = CaptureSink.sink };
+    const be = wb.backend();
+
+    be.emitEvent(S, .{ .auto_compact = .{ .dropped = 2, .kept = 3344, .cause = "context_window_exceeded_trim" } });
+    try testing.expectEqualStrings("\x1b[33m[context-window recovery (context_window_exceeded_trim): dropped 2 oldest messages, kept 3344]\x1b[0m\n", cap.buf.items);
+    cap.buf.clearRetainingCapacity();
+    be.emitEvent(S, .{ .auto_compact = .{ .dropped = 3300, .kept = 10, .cause = "context_window_exceeded_recovery" } });
+    try testing.expectEqualStrings("\x1b[33m[context-window recovery (context_window_exceeded_recovery): dropped 3300 oldest messages, kept 10]\x1b[0m\n", cap.buf.items);
 }
 
 test "WriterBackend 字节锁: context_warning visible" {

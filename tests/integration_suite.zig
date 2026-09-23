@@ -76,6 +76,7 @@ test {
     _ = @import("component/tool_smoke_test.zig");
     _ = @import("component/compact_summary_test.zig");
     _ = @import("component/auto_compact_request_test.zig");
+    _ = @import("component/context_window_recovery_test.zig");
     _ = @import("component/render_region_test.zig");
     _ = @import("component/stream_retry_test.zig");
     _ = @import("component/ui_state_test.zig");
