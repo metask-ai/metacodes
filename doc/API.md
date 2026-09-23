@@ -188,10 +188,12 @@ failure semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_ONE.md).
 | `METACODES_JEV_DECISIONS` | comma-separated subset of `scoped_recall`, `recall_evidence`, `memory_relation`, `enumeration_intent` (default: all); a surface left out behaves exactly as with no advisor, and an unknown or empty list disables the advisor |
 
 Every consultation emits a `system_one_decision` event
-(`schema_version: metacodes-system-one-decision-v1`) on the tool-observation
-and evaluation streams: decision, question set, mode, outcome, `actuated`,
-request SHA-256, model, latency, and judged/positive/changed counts. A user
-interrupt during a consultation surfaces as `Aborted`, never as a fallback.
+(`schema_version: metacodes-system-one-decision-v1`): decision, question set,
+mode, outcome, `actuated`, request SHA-256, model, latency, and
+judged/positive/changed counts. The scoped-recall decision goes to the
+evaluation event stream; the tool-surface decisions (KgRecall, KgRemember,
+enumeration) go to the session's tool-observation journal. A user interrupt
+during a consultation surfaces as `Aborted`, never as a fallback.
 
 ### Model tiers
 

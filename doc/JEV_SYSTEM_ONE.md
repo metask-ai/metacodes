@@ -58,9 +58,11 @@ src/jev/runtime.zig    METACODES_JEV_* 解析、堆上固定的 Runtime(App 持�
 
 每次咨询都写一条 `system_one_decision` 事件（schema `metacodes-system-one-decision-v1`）：
 decision、question_set、mode、outcome、actuated、request_sha256、model、elapsed_ms、
-question_count、state_bytes、judged、positive、changed。评估适配器
-（`scripts/eval/e2e_adapter.py`）对它做因果不变量校验：未应答的咨询不能带判断计数，
-`actuated` 只能出现在 advisory 且 `changed > 0` 时。
+question_count、state_bytes、judged、positive、changed。召回门的决定进评估事件流
+（native events，评估适配器 `scripts/eval/e2e_adapter.py` 对它做因果不变量校验：未应答的咨询
+不能带判断计数，`actuated` 只能出现在 advisory 且 `changed > 0` 时）；工具面（KgRecall、
+KgRemember、枚举）的决定进会话的 tool-observation journal（`tool-observations.jsonl`，
+rollout 产物摘要同样覆盖它）。
 
 配置（环境变量）：
 
@@ -146,10 +148,14 @@ Codex 的《Jev × metacodes Harness 接入方案》目标是用 Jev（+ JevTree
 
 | 库 | 切分 | 基线命中 | Jev 命中 | McNemar p | 注入条数/例 | 精度 | 噪声条数/例 |
 |---|---|---|---|---|---|---|---|
-| turn | dev 200 | 0.620 | **0.685** | 0.029 | 2.98 → 1.78 | 0.404 → 0.709 | 1.77 → 0.52 |
-| turn | **holdout 300** | 0.633 | **0.703** | **0.0019** | 2.98 → 1.70 | 0.387 → 0.686 | 1.83 → 0.53 |
-| mixed | dev 200 | 0.725 | 0.780 | 0.09 | 2.96 → 1.46 | 0.337 → 0.651 | 1.97 → 0.51 |
-| mixed | **holdout 300** | 0.717 | 0.740 | 0.39 | 2.96 → 1.41 | 0.349 → 0.666 | 1.93 → 0.47 |
+| turn | dev 200 | 0.620 | **0.685** | 0.029 | 2.98 → 1.77 | 0.404 → 0.710 | 1.77 → 0.51 |
+| turn | **holdout 300** | 0.633 | **0.703** | **0.0019** | 2.98 → 1.68 | 0.387 → 0.685 | 1.83 → 0.53 |
+| mixed | dev 200 | 0.725 | 0.780 | 0.09 | 2.96 → 1.45 | 0.337 → 0.655 | 1.97 → 0.50 |
+| mixed | **holdout 300** | 0.717 | 0.740 | 0.39 | 2.96 → 1.40 | 0.349 → 0.667 | 1.93 → 0.47 |
+
+表中是最终策略（含 §4 的 BM25 带）。带只改变选择、不改变发给判断器的字节，所以这些数字由
+生产驱动记录的同一批（确定性）判断直接算出；与不设带时相比，四个集合的命中一条都没变，注入与
+精度差在 ±0.02 以内。
 
 - 原子记忆上命中显著提高（holdout +7.0 个百分点），同时注入少 43%、噪声少 71%。
 - 整段会话记忆上命中持平略升（不显著），注入减半、噪声少 76%：主要收益是**不再往上下文里
@@ -232,13 +238,56 @@ Establish this family's protocol …”）；Jev 门在 2 行里注入了兄弟�
 同一个带在 LongMemEval 四个集合（dev/holdout × turn/mixed）上命中一条都没变（§6.2 的数字即
 带宽策略下的结果）。
 
-<!-- NEXT PAID -->
+**LongMemEval-S 归因试点（付费，二进制 `810591a`，含 BM25 带）**：同一规则从 holdout 再取 60 个
+新案例（两份各 30 例并行跑），四臂，`tinykg_jev_recall` = 只开召回门（`METACODES_JEV_DECISIONS=
+scoped_recall`）。合计 $9.44。
 
-## 7. 路线图
+| 臂 | 有效行 | EM | 已核实金标证据（全部行） | 暴露记忆 token/例 |
+|---|---|---|---|---|
+| `tinykg_lexical` | 52/60 | 25/52 = 0.481 | 33/60 | 7505 |
+| `tinykg_jev`（四个面全开） | 54/60 | 27/54 = 0.500 | 34/60 | 6579 |
+| `tinykg_jev_recall`（只开召回门） | 55/60 | 27/55 = 0.491 | **42/60** | 6937 |
 
-1. **advisory 默认化的前提**：付费配对试点（§6.3）在主指标上不劣于 `tinykg_lexical`，且
-   `system_one_decision` 的 `unavailable` 比例 < 5%。
-2. **缓存**：判断是确定性的，可按请求 SHA-256 在会话内缓存，重复查询零延迟。
-3. **写路径**：把 `memory-relation` 从注释升级为“矛盾时提示模型更新旧记忆”，仍不自动改写。
+- 端到端准确率三臂没有差别（配对分歧 4:4、3:4、6:5）。
+- 过程指标：只开召回门的臂让模型**打开核实到金标证据**的比例明显更高——对 lexical 的配对分歧
+  13:4（exact p = 0.049）；四面全开的臂对 lexical 是 13:12，被抵消了；两个 Jev 臂之间 15:7
+  （p = 0.13）。三臂**检索到**金标证据的比例相同（分歧 ≤ 1），差别只在模型是否去读它。这是
+  次要、探索性指标，但方向清楚：召回门注入了更对的记忆；KgRecall 上的相关度/充分性注释没有
+  增益，反而抵消了这份好处。
+- 与第一次 30 例合并后（90 例），“多个不同 seed 计划”导致的无效行 lexical 与四面全开各 9 行：
+  第一次试点里 3:1 的差异是噪声，不是注释诱发的。
+
+<!-- V23 RESULTS -->
+
+## 7. 结论与推荐配置
+
+按决策面汇总证据（全部是本项目评估）：
+
+| 决策面 | 证据 | 推荐 |
+|---|---|---|
+| `scoped_recall` 召回门 | 离线：原子记忆 holdout 命中 0.633 → 0.703（p = 0.0019），注入少 43%、噪声少 71%；整段会话记忆命中持平、噪声少 76%；程序性池与基线逐一相同（BM25 带）。付费：LongMemEval 准确率不变，已核实金标证据 33/60 → 42/60（p = 0.049） | **advisory** |
+| `recall_evidence` KgRecall 注释 | 付费归因：没有增益，且抵消了召回门带来的核实提升（34/60 对 42/60） | 关闭（待重新设计） |
+| `memory_relation` 写路径关系 | 所有付费试点里一次都没被咨询（没有写入与已有记忆冲突） | 暂不启用；需要有冲突写入的评测 |
+| `enumeration_intent` 枚举意图 | 付费试点里咨询 55 次，一次都没越过 80% 阈值、从未武装软提醒 | 暂不启用 |
+
+对应的配置：
+
+```sh
+export METACODES_JEV_URL=http://<host>:10420
+export METACODES_JEV_MODE=advisory
+export METACODES_JEV_DECISIONS=scoped_recall
+export METACODES_JEV_MODEL=metask-jev-4b
+```
+
+默认值保持保守：不设 URL 即关闭；设了 URL 默认 `shadow`、四个面全开（只记账不改行为，
+用来积累后续评估数据）。
+
+后续：
+
+1. **KgRecall 注释重做**：去掉数字与指导语，只按“判断 + BM25 带”重排命中顺序，再用同一个归因臂
+   验证；不能再抵消召回门。
+2. **写路径与枚举**：先造有冲突写入、需要枚举多项的评测，再决定 `memory_relation` /
+   `enumeration_intent` 是否启用。
+3. **缓存**：判断是确定性的，可按请求 SHA-256 在会话内缓存，重复查询零延迟。
 4. **动作面（Codex Stage 2/3）**：先建设“下一步动作”的离线金标（DecisionFixture），再做
    只读动作族的 shadow 评分；在拿到配对证据之前不进入 provider 可见字节。

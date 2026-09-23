@@ -42,7 +42,9 @@ status, compatibility boundaries, and entry points are defined by
   unadvised path without retries (30 s–5 min breaker); a user interrupt stays
   `Aborted`; a different model or a priced tariff is refused. Every
   consultation emits `system_one_decision`
-  (`metacodes-system-one-decision-v1`), which the evaluation adapters validate.
+  (`metacodes-system-one-decision-v1`): the scoped-recall decision on the
+  evaluation stream, which the evaluation adapters validate, and the
+  tool-surface decisions in the tool-observation journal.
   The paid memory runner gains `tinykg_jev` and the attribution arm
   `tinykg_jev_recall` (recall gate only) behind a loopback judge proxy, and
   `zig build eval:jev-recall-driver` replays LongMemEval-S candidate pools
