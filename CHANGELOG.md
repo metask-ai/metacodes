@@ -24,6 +24,12 @@ status, compatibility boundaries, and entry points are defined by
   (new category). A user or host interrupt is neither the model's fault nor
   an environment fault; it no longer counts toward the `environment_fault`
   breaker.
+- Zig source API: `PermissionContext` and `permission/decision.Context`
+  replace `sandbox_enabled` / `auto_allow_bash_if_sandboxed` with
+  `sandbox: ?*const SandboxSettings`, the same settings the Bash tool wraps
+  commands with, so the permission verdict and the execution cannot
+  disagree. On Windows (PowerShell/cmd) no Bash command is auto-allowed or
+  run concurrently as read-only: the classification models POSIX `sh` only.
 
 ### Added
 
@@ -37,6 +43,34 @@ status, compatibility boundaries, and entry points are defined by
   (in `doc:check`) closes the window between a release merging and reopen.
 
 ### Fixed
+
+- Bash auto-allow no longer runs writes without a prompt. The read-only
+  auto-allow (default, acceptEdits and auto mode) keyed on the first word of
+  the whole command, so `cd / && rm -rf *`, `echo x > ~/.bashrc`,
+  `sed -i …`, `find . -delete` and `ls; curl … -o x; sh x` ran unprompted.
+  `permission/bash_readonly.zig` now lexes the command the way `sh` does
+  (after the Bash tool's own JSON unescape) and accepts it only when every
+  simple command is read-only: no substitution, background job, subshell or
+  heredoc; output redirection only to `/dev/null` or a descriptor; write
+  options refused per command (`sed -i`/`w`/`e`, `find -delete`/`-exec`,
+  `sort -o`, `uniq IN OUT`, `awk` redirects and `system()`, `file -C`,
+  `rg --pre`, `git --output`/`branch NAME`/`config` writes, `printf -v`,
+  including GNU long-option abbreviations and quoting that spells them);
+  wrappers (`timeout`, `time`, `nice`, `stdbuf`, `xargs`, `command`) parsed
+  with their real options; `env`, `exec`, `nohup` and `cd … && git …` ask.
+  Anything it cannot parse asks. The concurrency gate
+  (`tools.isConcurrencySafeInput`, which also governs stream prefetch) uses
+  the same verdict. `rg` joins the read-only roster.
+- `autoAllowBashIfSandboxed` allowed every Bash call whenever the setting
+  was on, although off macOS (no Seatbelt), for `excludedCommands` and for
+  `dangerouslyDisableSandbox` the command runs outside the sandbox. It now
+  allows only a call `sandbox_exec.plan` says will run sandboxed, and a host
+  without a sandbox backend logs a warning at load.
+- `dangerouslyDisableSandbox` (not in the Bash schema) was honored even
+  under `allowUnsandboxedCommands: false`, the setting AgentCore's sandboxed
+  shell policy uses; it now takes effect only where that setting allows it.
+  A sandbox profile that cannot be written no longer makes Bash or Monitor
+  run the command unsandboxed; the call fails instead.
 
 - A Ctrl+C/Esc while the provider stream read was blocked was reported as a
   model API error: `provider.cancel` shuts the socket, the read wakes with

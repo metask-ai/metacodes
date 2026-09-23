@@ -1250,65 +1250,15 @@ pub fn isConcurrencySafe(name: []const u8) bool {
 }
 
 /// per-input 并发安全判定（对齐 cc isConcurrencySafe(input)，toolOrchestration.ts）。
-/// 非 Bash 工具沿用 per-tool 名单（isConcurrencySafe）；Bash 解析 command 字符串，
-/// 复合命令**每一段** stripWrappers 后都是 readonly 才算 safe，否则保守 unsafe。
-/// fail-closed：提取失败 / 危险子串(重定向·命令替换·管道入 shell) / 任一段非 readonly → unsafe。
+/// 非 Bash 工具沿用 per-tool 名单（isConcurrencySafe）；Bash 与权限链免询问共用
+/// permission/bash_readonly 的严格只读判定（完整词法、每段只读、无写重定向/替换/写选项）。
+/// fail-closed：无法完整判定 → unsafe（串行）。
 pub fn isConcurrencySafeInput(name: []const u8, input: []const u8) bool {
     if (!std.mem.eql(u8, name, "Bash")) return isConcurrencySafe(name);
-    return bashInputReadonly(input);
+    return bash_readonly.isReadonlyInput(input);
 }
 
-const bash_parser = @import("permission/bash_parser.zig");
-const shell_lex = @import("tools/shell_lex.zig");
-const common = @import("tools/common.zig");
-
-fn bashInputReadonly(input: []const u8) bool {
-    const cmd = common.extractJsonArg(input, "command") orelse return false;
-    if (cmd.len == 0) return false;
-    // 危险子串(管道入 shell / fork bomb / $(curl 等)→ 直接 unsafe。
-    shell_lex.validate(cmd) catch return false;
-    // 命令替换 $(...) / `...` 内是任意命令——并发安全无法保证,一律 unsafe
-    // (比 shell_lex 的安全语义更严:这里是并发门,宁可串行)。
-    if (std.mem.indexOf(u8, cmd, "$(") != null) return false;
-    if (std.mem.indexOfScalar(u8, cmd, '`') != null) return false;
-    // 输出重定向 > / >> 是写操作(shell_lex 不挡、splitCompound 不拆),显式判 unsafe。
-    // 注意 2>&1 / 2>/dev/null 这类 fd 重定向也按写处理(保守 unsafe，宁可串行)。
-    if (hasOutputRedirect(cmd)) return false;
-    // 复合拆分：每段剥 wrapper 后必须 readonly，否则按最危险段判 unsafe。
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const segs = bash_parser.splitCompound(arena.allocator(), cmd) catch return false;
-    if (segs.len == 0) return false;
-    for (segs) |seg| {
-        const real = bash_parser.stripWrappers(seg);
-        if (!bash_parser.isReadonlyCommand(real)) return false;
-    }
-    return true;
-}
-
-/// 检测引号外的输出重定向 `>` / `>>`（写文件，非并发安全）。
-fn hasOutputRedirect(cmd: []const u8) bool {
-    var in_single = false;
-    var in_double = false;
-    var i: usize = 0;
-    while (i < cmd.len) : (i += 1) {
-        const c = cmd[i];
-        if (c == '\\') {
-            i += 1;
-            continue;
-        }
-        if (!in_double and c == '\'') {
-            in_single = !in_single;
-            continue;
-        }
-        if (!in_single and c == '"') {
-            in_double = !in_double;
-            continue;
-        }
-        if (!in_single and !in_double and c == '>') return true;
-    }
-    return false;
-}
+const bash_readonly = @import("permission/bash_readonly.zig");
 
 test "isConcurrencySafeInput: Bash readonly per-input" {
     // 静态分类保守；拥有独立 provider factory 时由 tool_exec 动态升级。
@@ -1317,30 +1267,38 @@ test "isConcurrencySafeInput: Bash readonly per-input" {
     try std.testing.expect(isConcurrencySafe("Read"));
     try std.testing.expect(!isConcurrencySafe("Write"));
     try std.testing.expect(!isConcurrencySafe("Edit"));
-    // 单命令只读 → safe
-    try std.testing.expect(isConcurrencySafeInput("Bash", "{\"command\":\"ls -la /tmp\"}"));
-    try std.testing.expect(isConcurrencySafeInput("Bash", "{\"command\":\"cat /etc/hosts\"}"));
-    try std.testing.expect(isConcurrencySafeInput("Bash", "{\"command\":\"git status\"}"));
-    try std.testing.expect(isConcurrencySafeInput("Bash", "{\"command\":\"find . -name x\"}"));
+    // 单命令只读 → safe(Windows 跑 PowerShell/cmd,POSIX 只读判定不适用 → 串行)
+    const posix = bash_readonly.hostDialect() == .posix_sh;
+    try std.testing.expectEqual(posix, isConcurrencySafeInput("Bash", "{\"command\":\"ls -la /tmp\"}"));
+    try std.testing.expectEqual(posix, isConcurrencySafeInput("Bash", "{\"command\":\"cat /etc/hosts\"}"));
+    try std.testing.expectEqual(posix, isConcurrencySafeInput("Bash", "{\"command\":\"git status\"}"));
+    try std.testing.expectEqual(posix, isConcurrencySafeInput("Bash", "{\"command\":\"find . -name x\"}"));
     // 写/破坏类 → unsafe
     try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"rm -rf /\"}"));
     try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"git push\"}"));
     try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"npm install\"}"));
     try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"mkdir x\"}"));
+    try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"find . -delete\"}"));
+    try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"sed -i s/a/b/ f\"}"));
 }
 
 test "isConcurrencySafeInput: Bash compound 按最危险段" {
+    const posix = bash_readonly.hostDialect() == .posix_sh;
     try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"ls && rm -rf x\"}"));
-    try std.testing.expect(isConcurrencySafeInput("Bash", "{\"command\":\"ls && cat f && git log\"}"));
+    try std.testing.expectEqual(posix, isConcurrencySafeInput("Bash", "{\"command\":\"ls && cat f && git log\"}"));
+    // JSON 转义的换行也是分隔符:判定看 unescape 后 shell 真正收到的字节。
+    try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"ls\\nrm -rf x\"}"));
 }
 
 test "isConcurrencySafeInput: Bash 重定向/命令替换 → unsafe" {
     try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"cat a > b\"}"));
+    try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"cat a \\u003e b\"}"));
     try std.testing.expect(!isConcurrencySafeInput("Bash", "{\"command\":\"echo $(rm x)\"}"));
 }
 
 test "isConcurrencySafeInput: wrapper 剥离后判 readonly" {
-    try std.testing.expect(isConcurrencySafeInput("Bash", "{\"command\":\"timeout 5 git status\"}"));
+    const posix = bash_readonly.hostDialect() == .posix_sh;
+    try std.testing.expectEqual(posix, isConcurrencySafeInput("Bash", "{\"command\":\"timeout 5 git status\"}"));
 }
 
 test "isConcurrencySafeInput: 非 Bash 工具沿用名单" {

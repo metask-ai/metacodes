@@ -14,6 +14,9 @@ const settings_mod = @import("settings.zig");
 const SessionRules = @import("session_rules.zig").SessionRules;
 const rule_spec = @import("rule_spec.zig");
 const hooks_mod = @import("hooks.zig");
+const bash_readonly = @import("bash_readonly.zig");
+const sandbox_config = @import("../sandbox/config.zig");
+const sandbox_exec = @import("../sandbox/exec.zig");
 const log = @import("../util/log.zig");
 
 pub const Decision = enum { allow, deny, ask };
@@ -116,10 +119,11 @@ pub const Context = struct {
     decision_override: ?DecisionOverride = null,
     /// rule_spec 匹配上下文(cwd / project_root / home),用于 path / bash compound 等。
     match_ctx: rule_spec.MatchContext = .{},
-    /// 沙箱启用?(用于 autoAllowBashIfSandboxed)。
-    sandbox_enabled: bool = false,
-    /// autoAllowBashIfSandboxed:沙箱内 bash 自动放行(绕过 ask: Bash(*),deny 仍优先)。
-    auto_allow_bash_if_sandboxed: bool = false,
+    /// Bash 工具实际使用的沙箱设置(与 ToolContext.sandbox 同一份)。autoAllowBashIfSandboxed
+    /// 只放行 `sandbox_exec.plan` 判为 `.sandboxed` 的调用——设置开着但本机没有沙箱、
+    /// excludedCommands、逃生口 dangerouslyDisableSandbox 都会裸跑,不得按"沙箱内"放行。
+    /// null = 无沙箱。
+    sandbox: ?*const sandbox_config.SandboxSettings = null,
     /// PreToolUse hook 集合(最高优先,deny-first)。
     hooks: ?*const hooks_mod.HookSet = null,
     /// hook spawn 需要 allocator(构造 stdin JSON);未提供 → 跳过 hook。
@@ -138,6 +142,7 @@ pub const Context = struct {
     /// 转义原文 unescape,与工具层(write.zig/edit.zig 落盘前 unescapeString)逐字节等价。
     /// null → 降级为原始转义字节(仅单测/库最小上下文,那里路径不含转义,无绕过面)。
     /// 见 extractCheckedPath 注释与 B1 绕过。shim 填 ctx.allocator。
+    /// Bash 免询问判定同理:命令先按 bash.zig 的方式 unescape 再判;null → 栈上定长缓冲。
     path_check_allocator: ?std.mem.Allocator = null,
 };
 
@@ -305,23 +310,12 @@ pub fn checkClassified(
     }
 
     // 4. Bash 专属免询问(plan/dont_ask 除外,它们语义就是限制):
-    //    a. readonly 内置命令(ls/cat/grep/git status/...)→ ALLOW
-    //    b. autoAllowBashIfSandboxed + 沙箱启用 → ALLOW(物理边界已足够)
+    //    a. 只读命令(bash_readonly:完整词法,每段只读,无写重定向/替换/写选项)→ ALLOW
+    //    b. autoAllowBashIfSandboxed 且本次调用**确实**进沙箱(sandbox_exec.plan)→ ALLOW
+    //    其余落到下方模式兜底(default/acceptEdits/auto 下即 ask)。
     if (std.mem.eql(u8, tool_name, "Bash")) {
         const m4 = @import("mode.zig").canonical(ctx.mode);
-        if (m4 != .plan and m4 != .dont_ask) {
-            const cmd = rule_spec.extractCommand(args);
-            const bp = @import("bash_parser.zig");
-            const real = bp.stripWrappers(cmd);
-            if (bp.isReadonlyCommand(real)) {
-                log.debug("permission", "bash readonly auto-allow: {s}", .{real});
-                return .allow;
-            }
-            if (ctx.sandbox_enabled and ctx.auto_allow_bash_if_sandboxed) {
-                log.debug("permission", "autoAllowBashIfSandboxed -> allow", .{});
-                return .allow;
-            }
-        }
+        if (m4 != .plan and m4 != .dont_ask and bashAutoAllowed(ctx, args)) return .allow;
     }
 
     // 名字兜底只服务 legacy 路径(null dispatcher / dyn_registry):dispatcher 在场时
@@ -397,6 +391,26 @@ pub fn checkClassified(
         @tagName(decision),
     });
     return decision;
+}
+
+/// Step 4 for a Bash call: read-only, or confined by a sandbox that will
+/// really wrap it. Both verdicts are about the bytes the tool will run: the
+/// command is JSON-unescaped exactly as tools/bash.zig does it.
+fn bashAutoAllowed(ctx: *const Context, args: []const u8) bool {
+    var fallback_buf: [bash_readonly.MAX_COMMAND_BYTES]u8 = undefined;
+    var fallback = std.heap.FixedBufferAllocator.init(&fallback_buf);
+    const scratch = ctx.path_check_allocator orelse fallback.allocator();
+    const command = bash_readonly.commandFromInput(scratch, args) orelse return false;
+    defer scratch.free(command);
+    if (bash_readonly.isReadonly(bash_readonly.hostDialect(), command)) {
+        log.debug("permission", "bash readonly auto-allow: {s}", .{command});
+        return true;
+    }
+    const sb = ctx.sandbox orelse return false;
+    if (!sb.auto_allow_bash_if_sandboxed) return false;
+    if (sandbox_exec.plan(sb, command, sandbox_exec.escapeHatchHonored(sb, args)) != .sandboxed) return false;
+    log.debug("permission", "autoAllowBashIfSandboxed -> allow", .{});
+    return true;
 }
 
 test "classified Host effect replaces legacy unknown-name read fallback" {
@@ -819,13 +833,30 @@ test "protected path forces ask even with allow rule" {
 
 test "bash readonly auto-allow in default mode" {
     const ctx = Context{ .mode = .default };
+    // Windows 跑 PowerShell/cmd,POSIX 只读判定不适用 → 一律按模式兜底(ask)。
+    const readonly: Decision = if (bash_readonly.hostDialect() == .posix_sh) .allow else .ask;
     // ls / cat / git status → allow(免询问)
-    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"ls -la\"}") == .allow);
-    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git status\"}") == .allow);
-    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"timeout 5 cat foo\"}") == .allow);
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"ls -la\"}"));
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"git status\"}"));
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"timeout 5 cat foo\"}"));
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"rg foo src | head\"}"));
     // 写类命令仍 ask
     try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"rm foo\"}") == .ask);
     try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git push\"}") == .ask);
+    // 只读首词 + 写尾段 / 重定向 / 写选项 / JSON 转义换行:不再免询问
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"cd / && rm -rf *\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"echo x > ~/.bashrc\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"sed -i 's/a/b/' file\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"find . -delete\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"cat f\\nrm -rf x\"}") == .ask);
+}
+
+test "bash auto-allow judges the unescaped command (heap scratch as in production)" {
+    const ctx = Context{ .mode = .default, .path_check_allocator = std.testing.allocator };
+    const readonly: Decision = if (bash_readonly.hostDialect() == .posix_sh) .allow else .ask;
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"grep -n \\\"x y\\\" f\"}"));
+    try std.testing.expectEqual(Decision.ask, check(&ctx, "Bash", "{\"command\":\"ls \\u003e out\"}"));
+    try std.testing.expectEqual(Decision.ask, check(&ctx, "Bash", "{\"command\":\"ls \\u0026\\u0026 rm x\"}"));
 }
 
 test "bash readonly NOT auto-allowed in plan/dont_ask" {
@@ -837,17 +868,32 @@ test "bash readonly NOT auto-allowed in plan/dont_ask" {
     try std.testing.expect(check(&ctx_da, "Bash", "{\"command\":\"ls\"}") == .deny);
 }
 
-test "autoAllowBashIfSandboxed allows non-readonly bash" {
-    const ctx = Context{
-        .mode = .default,
-        .sandbox_enabled = true,
+test "autoAllowBashIfSandboxed allows only a call the sandbox will really wrap" {
+    const sb = sandbox_config.SandboxSettings{
+        .enabled = true,
         .auto_allow_bash_if_sandboxed = true,
+        .excluded_commands = &.{"docker"},
     };
-    // 沙箱内:即便是写命令也 allow(物理边界已限制)
-    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"npm install\"}") == .allow);
-    // 没开 autoAllow 时同命令 ask
-    const ctx2 = Context{ .mode = .default, .sandbox_enabled = true, .auto_allow_bash_if_sandboxed = false };
-    try std.testing.expect(check(&ctx2, "Bash", "{\"command\":\"npm install\"}") == .ask);
+    const ctx = Context{ .mode = .default, .sandbox = &sb };
+    // 沙箱内:即便是写命令也 allow(物理边界已限制)——前提是本机真有沙箱(macOS
+    // sandbox-exec)。Linux/Windows 上设置开着也裸跑 → 不得按沙箱放行。
+    const confined: Decision = if (sandbox_exec.hostSupported()) .allow else .ask;
+    try std.testing.expectEqual(confined, check(&ctx, "Bash", "{\"command\":\"npm install\"}"));
+    // excludedCommands 在沙箱外跑 → ask
+    try std.testing.expectEqual(Decision.ask, check(&ctx, "Bash", "{\"command\":\"docker run --rm x\"}"));
+    // 逃生口被采纳 → 沙箱外跑 → ask
+    try std.testing.expectEqual(Decision.ask, check(&ctx, "Bash", "{\"command\":\"npm install\",\"dangerouslyDisableSandbox\":true}"));
+    // allowUnsandboxedCommands=false:逃生口不被采纳,命令仍进沙箱
+    var strict = sb;
+    strict.allow_unsandboxed_commands = false;
+    try std.testing.expectEqual(confined, check(&.{ .mode = .default, .sandbox = &strict }, "Bash", "{\"command\":\"npm install\",\"dangerouslyDisableSandbox\":true}"));
+    // 没开 autoAllow / 沙箱关闭 → ask
+    var no_auto = sb;
+    no_auto.auto_allow_bash_if_sandboxed = false;
+    try std.testing.expectEqual(Decision.ask, check(&.{ .mode = .default, .sandbox = &no_auto }, "Bash", "{\"command\":\"npm install\"}"));
+    var disabled = sb;
+    disabled.enabled = false;
+    try std.testing.expectEqual(Decision.ask, check(&.{ .mode = .default, .sandbox = &disabled }, "Bash", "{\"command\":\"npm install\"}"));
 }
 
 test "accept_edits: 工作目录集 scope 门(cwd 内 allow / add-dir 内 allow / 集外 ask / .. 逃逸 ask)" {

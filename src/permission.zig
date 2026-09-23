@@ -43,9 +43,9 @@ pub const PermissionContext = struct {
     settings: ?*const settings_mod.MergedSettings = null,
     /// path / bash 匹配上下文(cwd / project_root / home)。
     match_ctx: rule_spec_mod.MatchContext = .{},
-    /// 沙箱启用 + autoAllowBashIfSandboxed(decision 用)。
-    sandbox_enabled: bool = false,
-    auto_allow_bash_if_sandboxed: bool = false,
+    /// Bash 工具实际使用的沙箱设置(与 ToolContext.sandbox 同一份,App 加载时挂)。
+    /// decision 据此判 autoAllowBashIfSandboxed:只放行真会被沙箱包裹的调用。
+    sandbox: ?*const @import("sandbox/config.zig").SandboxSettings = null,
     /// PreToolUse hook 集合(从 settings.hooks.PreToolUse 解析)。
     hooks: ?*const @import("permission/hooks.zig").HookSet = null,
     /// 当前 session plan 文件全路径(plan 模式特许写;App init 时算,挂此处)。空串=无。
@@ -132,8 +132,7 @@ pub fn checkPermissionClassified(
         .session_rules = ctx.session_rules,
         .decision_override = ctx.decision_override,
         .match_ctx = mctx,
-        .sandbox_enabled = ctx.sandbox_enabled,
-        .auto_allow_bash_if_sandboxed = ctx.auto_allow_bash_if_sandboxed,
+        .sandbox = ctx.sandbox,
         .hooks = ctx.hooks,
         .hook_allocator = ctx.allocator,
         .plan_file_path = ctx.plan_file_path,
@@ -155,6 +154,7 @@ test {
     _ = &decision_mod;
     _ = &rule_mod;
     _ = &prompt_mod;
+    _ = &@import("permission/bash_readonly.zig");
 }
 
 test "shim checkPermission bypass" {

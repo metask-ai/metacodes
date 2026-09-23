@@ -16,6 +16,7 @@ const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const profile_mod = @import("profile.zig");
 const config_mod = @import("config.zig");
+const util_json = @import("../util/json.zig");
 
 pub const WrappedCommand = struct {
     /// argv(以 NUL 结尾的指针数组由 caller 构造;这里给 []const []const u8)
@@ -59,30 +60,58 @@ pub const WrapResult = union(enum) {
     wrapped: WrappedCommand,
 };
 
+/// What `wrapCommand` does with one command, decided before any I/O other
+/// than the sandbox-exec probe. The permission chain's
+/// autoAllowBashIfSandboxed asks the same question: only `.sandboxed` earns
+/// the auto-allow, so a command that will run outside the sandbox (another
+/// platform, an excluded command, the escape hatch) is never auto-allowed
+/// as if it were confined.
+pub const Plan = enum {
+    /// Run as is: sandbox disabled, escape hatch honored, no sandbox on this
+    /// host with failIfUnavailable=false, or an excluded command.
+    passthrough,
+    /// No sandbox on this host and failIfUnavailable=true: refuse to run.
+    unavailable,
+    /// Run inside the Seatbelt profile.
+    sandboxed,
+};
+
+pub fn plan(sb: *const config_mod.SandboxSettings, cmd: []const u8, disable_for_this_command: bool) Plan {
+    // 1. 未启用 / 单次禁用 → passthrough
+    if (!sb.enabled or disable_for_this_command) return .passthrough;
+    // 2. 非 macOS / sandbox-exec 不存在 → unavailable / passthrough(Linux bubblewrap 留待 C.2)
+    if (!hostSupported()) return if (sb.fail_if_unavailable) .unavailable else .passthrough;
+    // 3. excludedCommands:命令首 token 命中 → passthrough
+    if (sb.isExcludedCommand(firstToken(cmd))) return .passthrough;
+    return .sandboxed;
+}
+
+/// Seatbelt is the only backend: macOS with /usr/bin/sandbox-exec.
+pub fn hostSupported() bool {
+    return builtin.os.tag == .macos and sandboxExecAvailable();
+}
+
+/// The Bash tool's per-call `dangerouslyDisableSandbox` escape hatch. It is
+/// not in the tool schema, and takes effect only when the settings allow
+/// unsandboxed commands (`allowUnsandboxedCommands`, default true; the
+/// AgentCore sandboxed shell policy sets it false). A call that uses it runs
+/// outside the sandbox, so `plan` says `.passthrough` and the permission
+/// chain does not auto-allow it as sandboxed.
+pub fn escapeHatchHonored(sb: *const config_mod.SandboxSettings, args_json: []const u8) bool {
+    if (!sb.allow_unsandboxed_commands) return false;
+    return util_json.extractBoolField(args_json, "dangerouslyDisableSandbox") orelse false;
+}
+
 /// 决定是否 / 如何沙箱化一条 bash 命令。
 pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions) !WrapResult {
     const sb = opts.sandbox;
-
-    // 1. 未启用 / 单次禁用 → passthrough
-    if (!sb.enabled or opts.disable_for_this_command) return .passthrough;
-
-    // 2. 非 macOS → 暂不支持(passthrough;Linux bubblewrap 留待 C.2)
-    if (builtin.os.tag != .macos) {
-        if (sb.fail_if_unavailable) return .unavailable;
-        return .passthrough;
+    switch (plan(sb, cmd, opts.disable_for_this_command)) {
+        .passthrough => return .passthrough,
+        .unavailable => return .unavailable,
+        .sandboxed => {},
     }
 
-    // 3. sandbox-exec 不存在 → unavailable / passthrough
-    if (!sandboxExecAvailable()) {
-        if (sb.fail_if_unavailable) return .unavailable;
-        return .passthrough;
-    }
-
-    // 4. excludedCommands:命令首 token 命中 → passthrough
-    const head = firstToken(cmd);
-    if (sb.isExcludedCommand(head)) return .passthrough;
-
-    // 5. 生成 profile
+    // 4. 生成 profile
     const prof = try profile_mod.generate(alloc, .{
         .cwd = opts.cwd,
         .home = opts.home,
@@ -95,7 +124,7 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
     });
     defer alloc.free(prof);
 
-    // 6. 写临时 profile 文件
+    // 5. 写临时 profile 文件
     const prof_path = try writeTempProfile(alloc, prof);
     errdefer {
         var pz: [std.fs.max_path_bytes]u8 = undefined;
@@ -107,7 +136,7 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
         alloc.free(prof_path);
     }
 
-    // 7. 构造 argv: sandbox-exec -f <profile> /bin/bash -c <cmd>
+    // 6. 构造 argv: sandbox-exec -f <profile> /bin/bash -c <cmd>
     var argv: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (argv.items) |a| alloc.free(a);
