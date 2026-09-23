@@ -863,7 +863,12 @@ fn buildScoredReceipt(
     const query_sha256 = sha256Hex(query);
 
     kg.setAbort(abort); // ESC 可中断
-    const pool: usize = if (options.advisor != null) JUDGED_CANDIDATES else TOP_K;
+    // An advisor that does not advise this surface leaves the path as if absent.
+    const advisor_here: ?*jev_advisor.Advisor = if (options.advisor) |advisor|
+        (if (advisor.advises(.scoped_recall)) advisor else null)
+    else
+        null;
+    const pool: usize = if (advisor_here != null) JUDGED_CANDIDATES else TOP_K;
     const hits = kg.recall(query, pool, false) catch return .{
         .text = null,
         .receipt = .{ .status = "search_error", .query_sha256 = query_sha256 },
@@ -893,7 +898,7 @@ fn buildScoredReceipt(
     // Below the floor the judged policy injects nothing either, so the judge
     // is not consulted there: it would only add latency to every turn whose
     // memory is irrelevant.
-    const consulted = if (baseline.len > 0) options.advisor else null;
+    const consulted = if (baseline.len > 0) advisor_here else null;
     if (consulted) |advisor| {
         var candidates: [JUDGED_CANDIDATES]jev_advisor.RecallCandidate = undefined;
         for (hits, 0..) |h, index| candidates[index] = .{

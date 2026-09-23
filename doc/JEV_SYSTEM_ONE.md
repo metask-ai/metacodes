@@ -70,6 +70,7 @@ question_count、state_bytes、judged、positive、changed。评估适配器
 | `METACODES_JEV_MODE` | `shadow`（默认）或 `advisory` |
 | `METACODES_JEV_TIMEOUT_MS` | 单次截止，默认 2500（8 候选判断单客户端 p50 0.91 s / p99 1.06 s，三个客户端共享服务时 p50 2.4 s；超时会退回基线并开熔断，所以给共享服务留余量） |
 | `METACODES_JEV_MODEL` | 期望的模型名（钉死）；不设则接受服务报告的任何模型 |
+| `METACODES_JEV_DECISIONS` | 逗号分隔的决策面子集：`scoped_recall`、`recall_evidence`、`memory_relation`、`enumeration_intent`（默认全部）；没列出的面行为与没有顾问完全相同；未知名或空列表会让顾问整体关闭并告警 |
 
 ## 4. 召回门：最终方案
 
@@ -163,7 +164,48 @@ Codex 的《Jev × metacodes Harness 接入方案》目标是用 Jev（+ JevTree
 | v2 措辞 + Jev 独自重排 θ = 40 + 聚焦窗口 | 0.730 | 0.700（dev） |
 | **v2 + 判断与 BM25 融合（定稿）** | 0.685 | 0.780（dev，生产驱动） |
 
-<!-- PAID -->
+### 6.3 付费配对试点（本项目自己的 production runner）
+
+两次试点都走 `scripts/eval/memory_agent_runtime_pilot.py`：GLM-5.2、receipt v9、Seatbelt 沙箱、
+持久预算 journal、无静默重试；Jev 臂的子进程只连 runner 自己的回环代理（`external_network_calls`
+保持 0），每次判断交换以请求/响应 SHA-256 记入 rollout 产物树。二进制 `4480d64`（sha256
+`fae24ca4…`），三臂 `no_memory` / `tinykg_lexical` / `tinykg_jev`，其中 `tinykg_jev` =
+`tinykg_lexical` + advisory 模式的 Jev（判断截止 10 s，排除超时这一混杂）。
+
+- **程序性迁移** `evals/memory/pilots/procedural-glm52-v22`：v20 同一批 4 个家族、12 个案例、
+  验证器逐字节相同，× 4 trials = 144 行，臂位置完全平衡。预注册主估计量：离线确定性成功率配对
+  差 `tinykg_jev − tinykg_lexical`（exact McNemar）。上限 $118。
+- **LongMemEval-S**：从未碰过的 holdout（位置 200–499）按固定规则选 30 例：去掉
+  single-session-preference（评分表式答案无法精确匹配），去掉所有金标都超过 4 个词的案例
+  （拒答句、自由回答），其余 5 类各取 holdout 顺序中的前 6 个。过滤后的上游文件 sha256
+  `15e93f32…`，经官方 `adapt-longmem-memory` 生成（源 sha256 `7e21db44…`）。90 行，
+  上限 $75。数据集不入库，这里只记哈希与规则。
+
+试点先暴露了两个与 Jev 无关、但让本项目付费记忆评测自 TinyKG storage v3 起就跑不动的 runner
+缺陷，已修复（`42d16b2`）并写入 CHANGELOG：在线（可写）库的 TinyKG daemon 锁是库的兄弟文件，
+不在沙箱放行范围内，TinyKG 臂全部降级；JSONL 用 `str.splitlines()` 切分，遇到 LongMemEval
+文本里的 U+2028 就把记录切断。两次中止的尝试（v21 与 LongMemEval 第一次）共提交 $0.104、
+保守敞口 $0.904，已记为 v22 的前序尝试；加上两份上限仍在 $200 授权内。
+
+**LongMemEval-S 30 例（付费，holdout）**，`scripts.eval.cli replay-memory` 打分：
+
+| 臂 | 有效行 | EM | F1 | 证据 R@K | 已核实证据 R@K | 暴露记忆 token/例 | 成本/例 |
+|---|---|---|---|---|---|---|---|
+| `no_memory` | 30 | 0.000 | 0.000 | 0.000 | 0.000 | 0 | $0.005 |
+| `tinykg_lexical` | 29 | 0.552 | 0.642 | 0.962 | 0.494 | 7854 | $0.052 |
+| `tinykg_jev` | 27 | 0.481 | 0.599 | 0.985 | **0.637** | **6930** | $0.050 |
+
+- 两臂都有效的 26 对里，只有 lexical 答对的 6 对、只有 Jev 答对的 4 对，exact McNemar p = 0.75：
+  30 例看不出端到端准确率差异。分歧对大多是精确匹配的格式噪声（“Target (via the Cartwheel
+  app).” 对金标 “Target”），两臂都有；答案长度中位数都是 2.5 个词。
+- 过程指标朝 Jev 一侧移动：模型真正打开核实的金标证据从 0.494 升到 0.637，暴露给模型的记忆
+  token 少 12%。
+- 无效行 3 对 1，原因都是 “一次运行里出现多个不同的 seed 检索计划”（治理协议判无效）。
+  样本太小，不能归因于 Jev；在 Jev 行里看到的一例，第一次检索的 `sufficient` 已是 88，模型仍
+  换了措辞重新 seed。
+- 这一臂每例多约 3 s 墙钟（判断延迟），token 与成本基本持平。
+
+<!-- PROCEDURAL RESULTS -->
 
 ## 7. 路线图
 

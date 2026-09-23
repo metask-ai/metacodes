@@ -3362,7 +3362,7 @@ pub fn run(
             try result_blocks.append(allocator, .{ .text = caution });
         }
         if (opts.jev) |advisor| {
-            if (!kg_enumeration_judged and !kg_enumeration_query_hint and
+            if (advisor.advises(.enumeration_intent) and !kg_enumeration_judged and !kg_enumeration_query_hint and
                 kgEnumerationPending(&kg_lexical_ledger, gated_tool_defs, false) == .none and
                 kgEnumerationPending(&kg_lexical_ledger, gated_tool_defs, true) == .batch)
             {

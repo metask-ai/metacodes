@@ -30,7 +30,8 @@ status, compatibility boundaries, and entry points are defined by
 - Optional System-One (Jev) memory-plane advisor (`src/jev/`,
   [doc/JEV_SYSTEM_ONE.md](doc/JEV_SYSTEM_ONE.md)), off unless
   `METACODES_JEV_URL` is set; `METACODES_JEV_MODE` is `shadow` by default
-  (consult and journal, provider-visible bytes unchanged) or `advisory`. It
+  (consult and journal, provider-visible bytes unchanged) or `advisory`, and
+  `METACODES_JEV_DECISIONS` narrows it to a subset of its surfaces. It
   advises four existing memory decisions and never gates a tool, permission,
   budget or TinyKG write: scoped recall ranks an 8-hit BM25 pool by judge
   probability plus normalized BM25 once the BM25 floor has passed (the judge is
@@ -55,6 +56,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Paid memory pilots could not run a TinyKG arm since TinyKG storage v3: an
+  online (read-write) rollout store's sibling daemon-ownership lock
+  (`<store>.tinykg-daemon.lock`) was outside the production Seatbelt
+  profile, so every TinyKG command in the child got `PermissionDenied`, KG
+  degraded, and treatment activation refused the arm. The carve-out that
+  sealed offline stores already had now covers read-write stores as one
+  literal path. The memory runner and replay also split JSONL on LF only:
+  `str.splitlines()` cut records at U+2028/U+0085 that stay raw inside
+  LongMemEval chat text.
 - A Ctrl+C/Esc while the provider stream read was blocked was reported as a
   model API error: `provider.cancel` shuts the socket, the read wakes with
   `ReadFailed`, and the stream clients classified that before consulting the

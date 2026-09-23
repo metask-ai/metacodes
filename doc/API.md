@@ -185,6 +185,7 @@ failure semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_ONE.md).
 | `METACODES_JEV_MODE` | `shadow` (default: consult and journal, provider-visible bytes unchanged) or `advisory` (judgments change injections and annotate tool results) |
 | `METACODES_JEV_TIMEOUT_MS` | per-consultation deadline, default 2500; a miss falls back to the unadvised path with no retry |
 | `METACODES_JEV_MODEL` | expected model id; a response from any other model, or one that reports a priced tariff, is refused |
+| `METACODES_JEV_DECISIONS` | comma-separated subset of `scoped_recall`, `recall_evidence`, `memory_relation`, `enumeration_intent` (default: all); a surface left out behaves exactly as with no advisor, and an unknown or empty list disables the advisor |
 
 Every consultation emits a `system_one_decision` event
 (`schema_version: metacodes-system-one-decision-v1`) on the tool-observation

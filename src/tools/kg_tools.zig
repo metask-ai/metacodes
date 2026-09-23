@@ -94,7 +94,7 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
         // System-One relation judgment (Jev-Mem write path): semantic
         // duplicates and contradictions the prefix test above cannot see. It
         // only annotates the result; the write below happens either way.
-        if (ctx.jev) |advisor| if (hits.len > 0) {
+        if (ctx.jev) |advisor| if (hits.len > 0 and advisor.advises(.memory_relation)) {
             relations = try judgeMemoryRelations(ctx, advisor, text_owned, hits, baseline_node);
         };
     } else |_| {} // 近重复检查失败不阻塞写入
@@ -390,7 +390,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             continue;
         }
         try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES, superseded_symbols);
-        try evidence.add(ctx.allocator, h, superseded_symbols);
+        if (evidenceAdvisor(ctx) != null) try evidence.add(ctx.allocator, h, superseded_symbols);
     }
     // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
@@ -567,7 +567,7 @@ fn executeRecallBatch(
                     first_new_evidence_node_id = hit.node_id;
                 }
                 try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true, batchHitTextBytes(merged_count - 1), superseded_symbols);
-                try evidence.add(ctx.allocator, hit, superseded_symbols);
+                if (evidenceAdvisor(ctx) != null) try evidence.add(ctx.allocator, hit, superseded_symbols);
             }
             const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
             for (known_types, 0..) |type_name, facet_index| {
@@ -798,13 +798,19 @@ pub const EVIDENCE_GUIDANCE =
 /// Jev-Mem read path on the tool surface: per-hit relevance plus evidence
 /// sufficiency for the bodies this result exposes. Advisory mode appends it
 /// to the envelope (never past the byte contract); shadow mode journals only.
+/// The advisor consulted on KgRecall evidence, or null when none advises it.
+fn evidenceAdvisor(ctx: *const ToolContext) ?*jev_advisor.Advisor {
+    const advisor = ctx.jev orelse return null;
+    return if (advisor.advises(.recall_evidence)) advisor else null;
+}
+
 fn appendEvidenceJudgment(
     ctx: *const ToolContext,
     out: *std.ArrayList(u8),
     evidence: *const EvidenceCandidates,
     query: []const u8,
 ) !void {
-    const advisor = ctx.jev orelse return;
+    const advisor = evidenceAdvisor(ctx) orelse return;
     if (evidence.len == 0) return;
     var request: std.ArrayList(u8) = .empty;
     defer request.deinit(ctx.allocator);

@@ -239,14 +239,25 @@ pub const ExistingMemory = struct {
 
 pub const ConsultError = error{ OutOfMemory, Aborted };
 
+/// The memory decisions an advisor can be consulted on. Each one is a separate
+/// operator choice (`METACODES_JEV_DECISIONS`); a surface the advisor does not
+/// advise behaves exactly as if no advisor were installed.
+pub const Surface = enum { scoped_recall, recall_evidence, memory_relation, enumeration_intent };
+pub const Surfaces = std.EnumSet(Surface);
+
 pub const Advisor = struct {
     client: *client_mod.Client,
     mode: Mode,
     /// Replaced by `~` in every state sent; empty disables home redaction.
     home: []const u8 = "",
+    surfaces: Surfaces = .initFull(),
 
     pub fn actuates(self: *const Advisor) bool {
         return self.mode == .advisory;
+    }
+
+    pub fn advises(self: *const Advisor, surface: Surface) bool {
+        return self.surfaces.contains(surface);
     }
 
     /// P(relevant) for each candidate against the request (Jev-Mem's

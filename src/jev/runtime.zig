@@ -4,9 +4,10 @@
 //! Off by default. Setting `METACODES_JEV_URL` installs an advisor in `shadow`
 //! mode — the judge is asked and journaled while every host decision keeps its
 //! deterministic baseline. `METACODES_JEV_MODE=advisory` lets the documented
-//! consumer policies use the answers. A malformed setting disables the advisor
-//! with a warning instead of guessing: an advisor is never worth failing a
-//! session over.
+//! consumer policies use the answers. `METACODES_JEV_DECISIONS` narrows the
+//! advisor to a comma-separated subset of its surfaces (default: all). A
+//! malformed setting disables the advisor with a warning instead of guessing:
+//! an advisor is never worth failing a session over.
 
 const std = @import("std");
 const client_mod = @import("client.zig");
@@ -17,23 +18,26 @@ pub const ENV_URL = "METACODES_JEV_URL";
 pub const ENV_MODE = "METACODES_JEV_MODE";
 pub const ENV_TIMEOUT_MS = "METACODES_JEV_TIMEOUT_MS";
 pub const ENV_MODEL = "METACODES_JEV_MODEL";
+pub const ENV_DECISIONS = "METACODES_JEV_DECISIONS";
 
 pub const Settings = struct {
     origin: []const u8,
     mode: advisor_mod.Mode = .shadow,
     timeout_ms: u32 = client_mod.DEFAULT_TIMEOUT_MS,
     expected_model: ?[]const u8 = null,
+    surfaces: advisor_mod.Surfaces = .initFull(),
 };
 
-pub const SettingsError = error{ InvalidMode, InvalidTimeout };
+pub const SettingsError = error{ InvalidMode, InvalidTimeout, InvalidDecisions };
 
-/// Pure interpretation of the four variables; a null or blank URL means the
+/// Pure interpretation of the five variables; a null or blank URL means the
 /// advisor is not configured. Borrowed slices stay borrowed.
 pub fn parseSettings(
     url: ?[]const u8,
     mode: ?[]const u8,
     timeout_ms: ?[]const u8,
     model: ?[]const u8,
+    decisions: ?[]const u8,
 ) SettingsError!?Settings {
     const origin = std.mem.trim(u8, url orelse return null, " \t\r\n");
     if (origin.len == 0) return null;
@@ -51,11 +55,26 @@ pub fn parseSettings(
         const value = std.mem.trim(u8, raw, " \t\r\n");
         if (value.len > 0) settings.expected_model = value;
     }
+    if (decisions) |raw| settings.surfaces = try parseSurfaces(raw);
     return settings;
 }
 
+/// A comma-separated, non-empty subset of `advisor.Surface` names. An empty
+/// list is refused rather than read as "none": that is what leaving
+/// METACODES_JEV_URL unset means.
+fn parseSurfaces(raw: []const u8) SettingsError!advisor_mod.Surfaces {
+    var surfaces: advisor_mod.Surfaces = .initEmpty();
+    var names = std.mem.splitScalar(u8, raw, ',');
+    while (names.next()) |name| {
+        const value = std.mem.trim(u8, name, " \t\r\n");
+        surfaces.insert(std.meta.stringToEnum(advisor_mod.Surface, value) orelse return error.InvalidDecisions);
+    }
+    if (surfaces.count() == 0) return error.InvalidDecisions;
+    return surfaces;
+}
+
 pub fn settingsFromEnv() SettingsError!?Settings {
-    return parseSettings(envGet(ENV_URL), envGet(ENV_MODE), envGet(ENV_TIMEOUT_MS), envGet(ENV_MODEL));
+    return parseSettings(envGet(ENV_URL), envGet(ENV_MODE), envGet(ENV_TIMEOUT_MS), envGet(ENV_MODEL), envGet(ENV_DECISIONS));
 }
 
 fn envGet(name: [:0]const u8) ?[]const u8 {
@@ -89,7 +108,7 @@ pub const Runtime = struct {
             .advisor = undefined,
             .home = home_copy,
         };
-        self.advisor = .{ .client = &self.client, .mode = settings.mode, .home = self.home };
+        self.advisor = .{ .client = &self.client, .mode = settings.mode, .home = self.home, .surfaces = settings.surfaces };
         return self;
     }
 
@@ -122,33 +141,43 @@ pub fn fromEnv(allocator: std.mem.Allocator, io: std.Io, home: []const u8) ?*Run
 const testing = std.testing;
 
 test "parseSettings: unset or blank URL means no advisor" {
-    try testing.expect((try parseSettings(null, "advisory", null, null)) == null);
-    try testing.expect((try parseSettings("  ", null, null, null)) == null);
+    try testing.expect((try parseSettings(null, "advisory", null, null, null)) == null);
+    try testing.expect((try parseSettings("  ", null, null, null, null)) == null);
 }
 
 test "parseSettings: shadow is the default mode and every field is honored" {
-    const defaults = (try parseSettings("http://127.0.0.1:10420", null, null, null)).?;
+    const defaults = (try parseSettings("http://127.0.0.1:10420", null, null, null, null)).?;
     try testing.expectEqual(advisor_mod.Mode.shadow, defaults.mode);
     try testing.expectEqual(client_mod.DEFAULT_TIMEOUT_MS, defaults.timeout_ms);
     try testing.expect(defaults.expected_model == null);
+    try testing.expectEqual(@as(usize, 4), defaults.surfaces.count());
 
-    const explicit = (try parseSettings(" http://h:1 ", "advisory", "800", "metask-jev-4b")).?;
+    const explicit = (try parseSettings(" http://h:1 ", "advisory", "800", "metask-jev-4b", " scoped_recall ,memory_relation")).?;
     try testing.expectEqualStrings("http://h:1", explicit.origin);
     try testing.expectEqual(advisor_mod.Mode.advisory, explicit.mode);
     try testing.expectEqual(@as(u32, 800), explicit.timeout_ms);
     try testing.expectEqualStrings("metask-jev-4b", explicit.expected_model.?);
+    try testing.expect(explicit.surfaces.contains(.scoped_recall));
+    try testing.expect(explicit.surfaces.contains(.memory_relation));
+    try testing.expect(!explicit.surfaces.contains(.recall_evidence));
+    try testing.expect(!explicit.surfaces.contains(.enumeration_intent));
 }
 
-test "parseSettings: malformed mode or timeout is refused, not guessed" {
-    try testing.expectError(error.InvalidMode, parseSettings("http://h", "enforced", null, null));
-    try testing.expectError(error.InvalidTimeout, parseSettings("http://h", null, "fast", null));
-    try testing.expectError(error.InvalidTimeout, parseSettings("http://h", null, "5", null));
+test "parseSettings: malformed mode, timeout or decisions are refused, not guessed" {
+    try testing.expectError(error.InvalidMode, parseSettings("http://h", "enforced", null, null, null));
+    try testing.expectError(error.InvalidTimeout, parseSettings("http://h", null, "fast", null, null));
+    try testing.expectError(error.InvalidTimeout, parseSettings("http://h", null, "5", null, null));
+    try testing.expectError(error.InvalidDecisions, parseSettings("http://h", null, null, null, "scoped_recall,routing"));
+    try testing.expectError(error.InvalidDecisions, parseSettings("http://h", null, null, null, ""));
+    try testing.expectError(error.InvalidDecisions, parseSettings("http://h", null, null, null, "scoped_recall,"));
 }
 
-test "Runtime pins the advisor to its own client and home copy" {
-    const runtime = try Runtime.create(testing.allocator, testing.io, .{ .origin = "http://127.0.0.1:9", .mode = .advisory }, "/Users/alice");
+test "Runtime pins the advisor to its own client, home copy and surfaces" {
+    const runtime = try Runtime.create(testing.allocator, testing.io, .{ .origin = "http://127.0.0.1:9", .mode = .advisory, .surfaces = .initOne(.scoped_recall) }, "/Users/alice");
     defer runtime.destroy(testing.allocator);
     try testing.expect(runtime.advisor.client == &runtime.client);
     try testing.expect(runtime.advisor.actuates());
     try testing.expectEqualStrings("/Users/alice", runtime.advisor.home);
+    try testing.expect(runtime.advisor.advises(.scoped_recall));
+    try testing.expect(!runtime.advisor.advises(.recall_evidence));
 }

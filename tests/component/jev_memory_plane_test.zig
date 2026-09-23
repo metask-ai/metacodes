@@ -233,6 +233,20 @@ test "L2 jev memory plane: scoped recall shadow keeps baseline bytes, advisory f
         try std.testing.expectEqual(@as(usize, 0), srv.requestCount());
     }
 
+    // An advisor narrowed away from scoped recall leaves it byte for byte.
+    {
+        var srv = try harness.MockServer.start(second_only, 0);
+        defer srv.stop();
+        const runtime = try startRuntime(a, io_runtime.io(), srv, .advisory);
+        defer runtime.destroy(a);
+        runtime.advisor.surfaces = .initOne(.recall_evidence);
+        var narrowed = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conv, &ab, .{ .advisor = &runtime.advisor });
+        defer narrowed.deinit(a);
+        try expectSameInjection(baseline, narrowed);
+        try std.testing.expect(narrowed.system_one == null);
+        try std.testing.expectEqual(@as(usize, 0), srv.requestCount());
+    }
+
     // A judge that is down leaves the baseline intact, in any mode.
     {
         var srv = try harness.MockServer.startWithStatus("{\"error\":\"down\"}", 0, "HTTP/1.1 503 Service Unavailable");
@@ -620,5 +634,20 @@ test "L2 jev memory plane: KgRecall evidence annotation is advisory-only and jou
         try std.testing.expectEqual(@as(usize, 1), sink.count);
         try std.testing.expect(!sink.actuated);
         try std.testing.expectEqual(@as(u32, 2), sink.judged);
+    }
+    // METACODES_JEV_DECISIONS without recall_evidence: KgRecall behaves as if
+    // no advisor were installed — no request, no journal entry, no block.
+    {
+        var srv = try harness.MockServer.start(body, 0);
+        defer srv.stop();
+        const runtime = try startRuntime(a, io_runtime.io(), srv, .advisory);
+        defer runtime.destroy(a);
+        runtime.advisor.surfaces = .initOne(.scoped_recall);
+        var sink: DecisionSink = .{};
+        const result = try recallWithJudge(a, bin, dir, "jev-recall-narrowed", &runtime.advisor, &sink);
+        defer a.free(result.output);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "\"system_one\"") == null);
+        try std.testing.expectEqual(@as(usize, 0), sink.count);
+        try std.testing.expectEqual(@as(usize, 0), srv.requestCount());
     }
 }
