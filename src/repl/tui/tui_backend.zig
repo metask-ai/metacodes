@@ -299,6 +299,17 @@ pub const TuiBackend = struct {
                     std.fmt.bufPrint(&buf, "Retrying in {d}s… (attempt {d}/{d})\n", .{ secs, r.attempt, r.max }) catch return;
                 self.region.writeGenText(s);
             },
+            .environment_fault => |f| {
+                // 环境故障:每次出现都明确告诉用户,不只靠一张红色工具卡;第 limit 次是本 run 的最后一次。
+                var buf: [768]u8 = undefined;
+                const detail = f.detail[0..@min(f.detail.len, 400)];
+                const tail: []const u8 = if (f.count >= f.limit) " — stopping this run; fix the environment, then continue." else "";
+                const s = if (self.colorize)
+                    std.fmt.bufPrint(&buf, "\x1b[33m⚠ environment fault {d}/{d} [{s} · {s}]: {s}{s}\x1b[0m\n", .{ f.count, f.limit, f.tool, f.code, detail, tail }) catch return
+                else
+                    std.fmt.bufPrint(&buf, "environment fault {d}/{d} [{s} · {s}]: {s}{s}\n", .{ f.count, f.limit, f.tool, f.code, detail, tail }) catch return;
+                self.region.writeGenText(s);
+            },
             .stream_done => {
                 // 结束助手文本行(幂等):半行补 \n,已在行首 no-op。
                 // 旧版无条件 writeGenText("\n") 在文本已以 \n 结尾时多吐空行 → 多批次 tool 卡间冒空行。

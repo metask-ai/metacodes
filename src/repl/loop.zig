@@ -772,6 +772,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
         const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
+        // 会话根目录跟着改名走:这里是唯一向用户说一句的地方(buildRunOptions 里的再次调用是 no-op)。
+        switch (app.refreshWorkspaceRoot()) {
+            .unchanged => {},
+            .renamed => |now| std.debug.print("working directory was renamed; now {s}\n", .{now}),
+            .missing => if (!app.root_missing_warned) {
+                app.root_missing_warned = true;
+                std.debug.print("working directory {s} no longer exists; shell commands will fail until it is restored\n", .{app.cwdAbs()});
+            },
+        }
         // U11:App 可导出字段统一走 canonical buildRunOptions(五处前端装配漂移的收敛点);
         // 宿主专属字段(eval gate/policy、run_control 三件套、预算、UI requester、心跳)在此补。
         var run_opts = session_service.buildRunOptions(app, scoped_recall);
@@ -891,6 +900,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("\x1b[33m已达 {d} 轮上限(共 {d} 次工具调用)。任务可能未完成——这可能是合法长任务,也可能在原地打转。\x1b[0m\n", .{ result.turns, result.tool_calls });
             if (bd) |b| std.debug.print("\x1b[33m  动作分布:{s}\x1b[0m\n", .{b});
             std.debug.print("\x1b[33m直接输入你的下一步(如\"继续\")续接对话,或调整方向。\x1b[0m\n", .{});
+        }
+        // 熔断停止(环境故障累计达 MAX_ENVIRONMENT_FAULTS,或插件契约 fail-closed):原因已在
+        // 上方逐条打印,这里只说明"为什么停、怎么续",不再复述。
+        if (result.stop_reason == .tool_loop) {
+            std.debug.print("\x1b[33m运行已被熔断停止(tool_loop):原因见上方各条提示。处理好之后直接输入下一步续接。\x1b[0m\n", .{});
         }
         // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
         // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。

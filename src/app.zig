@@ -399,8 +399,17 @@ pub const App = struct {
     sandbox_settings: ?@import("sandbox/config.zig").SandboxSettings = null,
     /// PreToolUse hooks(从 settings.hooks.PreToolUse 解析)。
     hooks: ?@import("permission/hooks.zig").HookSet = null,
-    /// 缓存的 cwd 绝对路径(供 permission match_ctx 用,session 期不变)。
+    /// 会话根目录:启动时对进程 cwd 拍的字符串快照。读它的有七处(Bash 子进程 chdir、
+    /// Read/Write/Edit/Glob 的 base_dir、权限 match_ctx.cwd、沙箱 profile、系统提示词、
+    /// project_dir、KG 项目目录),而 agent 的工作本身就会改名/搬走目录。它的唯一 owner 是
+    /// `refreshWorkspaceRoot`:每轮 run 装配前校验一次,改名了就整体跟过去。
     cwd_abs: ?[]u8 = null,
+    /// `refreshWorkspaceRoot` 已就"目录不存在"提醒过(每个状态只提醒一次,不刷屏)。
+    root_missing_warned: bool = false,
+    /// 改名后退役的旧根 / 旧 project_dir / 旧 system prompt:不释放,留到 deinit。web 与 daemon
+    /// 线程直接读 `cwdAbs()` / `project_dir_or_empty()`,正在跑的 run 也借着旧串;改名极少发生,
+    /// 每次多留几个字符串,换来"借用者永不悬垂"。
+    retired_workspace_strings: std.ArrayList([]u8) = .empty,
     /// 额外工作目录(--add-dir / settings additionalDirectories),已解析为**绝对路径**、
     /// owned(app.allocator)。loadSettings 每次重建(先 free 旧);消费点:
     /// permission match_ctx.additional_dirs(accept_edits scope 门)+ ToolContext.additional_dirs
@@ -1059,6 +1068,8 @@ pub const App = struct {
         if (app.sandbox_settings) |*s| s.deinit();
         if (app.hooks) |*h| h.deinit();
         if (app.cwd_abs) |c| app.allocator.free(c);
+        for (app.retired_workspace_strings.items) |s| app.allocator.free(s);
+        app.retired_workspace_strings.deinit(app.allocator);
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);
         if (app.user_context) |u| app.allocator.free(u);
@@ -2613,6 +2624,82 @@ pub const App = struct {
     /// cwd 绝对路径(sandbox profile 工作目录),空串 = 未知(用 process cwd)。
     pub fn cwdAbs(app: *const App) []const u8 {
         return app.cwd_abs orelse "";
+    }
+
+    pub const RootRefresh = union(enum) {
+        /// 目录还在(或本 App 没有记录根目录)。
+        unchanged,
+        /// 记录的路径不存在,进程 cwd 也给不出新名字:目录被删了。字符串保留原样;
+        /// Bash 的 working_dir_unavailable 错误负责向模型说明。
+        missing,
+        /// 目录被改名了:进程 cwd 是内核句柄,改名后照样解析出新名字。已整体切到新路径
+        /// (cwd_abs、project_dir、settings/permission match_ctx、系统提示词);值借自 cwd_abs。
+        renamed: []const u8,
+    };
+
+    /// 每轮 run 装配前调一次(`session_service.buildRunOptions` 是唯一装配点)。
+    ///
+    /// 事故 2026-09-22:agent 把自己的 cwd 改名后,记录的字符串失效,之后每次 Bash 都在
+    /// 子进程里 chdir 失败,模型在 exit 127 里空转到 400 轮上限。子进程报告通道让那次失败
+    /// 会说话;这里让根目录跟着改名走,失败根本不发生。
+    ///
+    /// 只在 App 里做:App 的 cwd_abs 就是从进程 cwd 拍的(init 与 teammate_process 两处),
+    /// 所以"字符串失效而 getcwd() 成功且不同"= 同一个目录换了名字。嵌入宿主的 AgentSession
+    /// 用 workspace.root,与进程 cwd 无关,不走这里。会话身份(transcript 目录、KG 项目目录)
+    /// 不随之漂移:那是会话开始时的目录,改名不改变它是哪一次会话。
+    pub fn refreshWorkspaceRoot(app: *App) RootRefresh {
+        const current = app.cwd_abs orelse return .unchanged;
+        var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        if (current.len >= path_buf.len) return .unchanged;
+        @memcpy(path_buf[0..current.len], current);
+        path_buf[current.len] = 0;
+        if (pfs.exists(@ptrCast(&path_buf))) return .unchanged;
+
+        const resolved = @import("util/fs.zig").getCwd(app.allocator) catch return .missing;
+        if (std.mem.eql(u8, resolved, current)) {
+            app.allocator.free(resolved);
+            return .missing;
+        }
+        app.adoptWorkspaceRoot(resolved);
+        return .{ .renamed = app.cwd_abs.? };
+    }
+
+    /// 把会话根切到 `resolved`(owned,接管所有权),并重建每个捕获过旧字符串的消费者。
+    fn adoptWorkspaceRoot(app: *App, resolved: []u8) void {
+        const log = @import("util/log.zig");
+        log.warn("workspace", "working directory renamed: {s} -> {s}", .{ app.cwdAbs(), resolved });
+        // project_dir 沿 cwd 上溯 .git;旧值可能就在改名的目录下。
+        if (app.project_dir) |old| app.retireWorkspaceString(old);
+        app.project_dir = @import("skills/skill.zig").findRepoRoot(app.allocator, resolved) catch null;
+        const old_root = app.cwd_abs;
+        app.cwd_abs = resolved;
+        // permission match_ctx 借的是 cwd_abs 的切片,settings 的 project 层按 project_dir 找:
+        // 与 addDirectory 同一套重建顺序(先 deinit 旧 settings,再 load)。load 失败时
+        // match_ctx 仍指向旧串,下面无条件覆写,保证旧串释放后没有借用者。
+        if (app.settings) |*s| s.deinit();
+        app.settings = null;
+        app.permission_ctx.settings = null;
+        app.loadSettings() catch |err| {
+            log.warn("workspace", "settings reload after working directory rename failed: {s}", .{@errorName(err)});
+        };
+        app.permission_ctx.match_ctx.cwd = resolved;
+        app.permission_ctx.match_ctx.project_root = app.project_dir orelse resolved;
+        // 系统提示词的环境段写死了 cwd;按新路径重建(与 /model 切换同一 builder)。
+        const sp_mod = @import("core/system_prompt.zig");
+        if (sp_mod.buildFullWithDefs(app.allocator, app.config.model_display_name orelse app.activeModel(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), resolved, app.tool_defs)) |sp| {
+            if (app.system_prompt) |old| app.retireWorkspaceString(old);
+            app.system_prompt = sp;
+        } else |err| {
+            log.warn("workspace", "system prompt rebuild after working directory rename failed: {s}", .{@errorName(err)});
+        }
+        if (old_root) |old| app.retireWorkspaceString(old);
+        app.root_missing_warned = false;
+    }
+
+    /// 旧串退役:借用者(其它线程的 `cwdAbs()` 读、正在跑的 run 的 ToolContext)可能还拿着它,
+    /// 所以只登记、不释放;记账本身 OOM 就任它泄漏——一个串泄漏比借用者悬垂强。
+    fn retireWorkspaceString(app: *App, s: []u8) void {
+        app.retired_workspace_strings.append(app.allocator, s) catch {};
     }
 
     /// HOME(sandbox ~/ 展开)。可移植:POSIX=$HOME,Windows=$USERPROFILE 回退(见 platform/paths.zig)。

@@ -298,6 +298,19 @@ pub const CoreEvent = union(enum) {
         delay_ms: u64,
     },
 
+    /// 环境故障:一次工具调用的结构化错误是 `system_error` 且 `recoverable:false`——换命令
+    /// 重试不可能修好的故障(工作目录没了、shell 起不来、依赖不可用)。每次出现都发,让前端
+    /// 明确告诉用户,而不是只靠一张红色工具卡;`count` 是本 run 内累计次数,`limit` 是熔断
+    /// 阈值(agent_loop.MAX_ENVIRONMENT_FAULTS),count == limit 的这条是本 run 的最后一条。
+    /// 字段全部借用(与 tool_result 同款生命周期:emit 期间有效)。
+    environment_fault: struct {
+        tool: []const u8,
+        code: []const u8,
+        detail: []const u8,
+        count: u32,
+        limit: u32,
+    },
+
     /// 一轮流式输出结束(取代旧 `print("\x1b[0m\n")`/`print("\n")`)。
     /// backend 决定闭颜色括号 + 尾换行。
     stream_done,
