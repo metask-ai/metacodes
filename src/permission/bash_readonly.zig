@@ -1043,24 +1043,35 @@ fn gitConfigIsRead(args: []const Word) bool {
     return action;
 }
 
-/// `git remote [-v]` lists; `show` and `get-url` read. `git remote -v add …`
-/// still adds: the subcommand after the verbosity flags decides.
+/// `git remote [-v]` lists and `get-url` reads the local config; `show`
+/// reads it only with `-n` — without it git queries every named remote
+/// (network, credentials, a transport command taken from the config).
+/// `git remote -v add …` still adds: the subcommand after the verbosity
+/// flags decides.
 fn gitRemoteIsRead(args: []const Word) bool {
     var i: usize = 0;
     while (i < args.len and isOneOf(args[i].value, &.{ "-v", "--verbose" })) i += 1;
     if (i == args.len) return true;
     const sub = args[i].value;
-    const flags: []const []const u8 = if (std.mem.eql(u8, sub, "show"))
-        &.{"-n"}
-    else if (std.mem.eql(u8, sub, "get-url"))
-        &.{ "--push", "--all" }
-    else
-        return false;
-    for (args[i + 1 ..]) |arg| {
-        const v = arg.value;
-        if (v.len > 0 and v[0] == '-' and !isOneOf(v, flags)) return false;
+    const rest = args[i + 1 ..];
+    if (std.mem.eql(u8, sub, "get-url")) {
+        for (rest) |arg| {
+            const v = arg.value;
+            if (v.len > 0 and v[0] == '-' and !isOneOf(v, &.{ "--push", "--all" })) return false;
+        }
+        return true;
     }
-    return true;
+    if (std.mem.eql(u8, sub, "show")) {
+        var no_query = false;
+        for (rest) |arg| {
+            const v = arg.value;
+            if (std.mem.eql(u8, v, "-n")) {
+                no_query = true;
+            } else if (v.len > 0 and v[0] == '-') return false;
+        }
+        return no_query;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -1439,7 +1450,8 @@ test "git: read subcommands only, no --output, branch/config/remote writes refus
     try testing.expect(readonly("git branch --list 'feat*'"));
     try testing.expect(readonly("git config --get user.name"));
     try testing.expect(readonly("git remote -v"));
-    try testing.expect(readonly("git remote show origin"));
+    try testing.expect(readonly("git remote show -n origin"));
+    try testing.expect(readonly("git remote get-url --push origin"));
     try testing.expect(!readonly("git push"));
     try testing.expect(!readonly("git diff --output=x"));
     try testing.expect(!readonly("git log --out=x"));
@@ -1448,6 +1460,9 @@ test "git: read subcommands only, no --output, branch/config/remote writes refus
     try testing.expect(!readonly("git config user.name x"));
     try testing.expect(!readonly("git config --get x --ad y z"));
     try testing.expect(!readonly("git remote -v add origin url"));
+    // Without -n, `show` queries the remote over the network.
+    try testing.expect(!readonly("git remote show origin"));
+    try testing.expect(!readonly("git remote show -- -n"));
     try testing.expect(!readonly("git -c core.pager=sh log"));
     try testing.expect(!readonly("git -C sub status"));
     try testing.expect(!readonly("git -P log"));

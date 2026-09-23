@@ -55,7 +55,8 @@ status, compatibility boundaries, and entry points are defined by
   options refused per command (`sed -i`/`w`/`e`, `find -delete`/`-exec`,
   `sort -o`, `uniq IN OUT`, `awk` redirects and `system()`, `file -C`,
   `rg --pre`, `git --output`/`branch NAME`/`config` writes, `printf -v`,
-  including GNU long-option abbreviations and quoting that spells them);
+  including GNU long-option abbreviations and quoting that spells them;
+  `git remote show` needs `-n`, since without it git queries the remote);
   wrappers (`timeout`, `time`, `nice`, `stdbuf`, `xargs`, `command`) parsed
   with their real options; `env`, `exec`, `nohup` and `cd … && git …` ask.
   Anything it cannot parse asks. The concurrency gate
