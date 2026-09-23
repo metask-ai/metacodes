@@ -70,12 +70,17 @@ pub const Category = enum {
     user_error, // 模型可以纠正
     system_error, // 环境/机器问题，重试可能有用
     safety, // 规则/沙箱拒绝，重试无用
+    /// 用户或宿主中断了这次调用(Esc/Ctrl+C/前端 Stop)。既不是模型的错,也不是环境坏了:
+    /// 用户重新发起时同一调用可以再跑。它**不是** system_error——2026-09-23 实录里一次 Esc
+    /// 中断被 environment_fault 熔断当成"环境故障 1/3"报给用户,就是因为它曾挂在 system_error 下。
+    interrupted,
 
     pub fn name(self: Category) []const u8 {
         return switch (self) {
             .user_error => "user_error",
             .system_error => "system_error",
             .safety => "safety",
+            .interrupted => "interrupted",
         };
     }
 };
@@ -128,7 +133,8 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "NotRead", .code = .not_read, .category = .user_error, .recoverable = true },
     .{ .name = "StaleFile", .code = .stale_file, .category = .user_error, .recoverable = true },
     .{ .name = "Timeout", .code = .timeout, .category = .system_error, .recoverable = true },
-    .{ .name = "Aborted", .code = .aborted, .category = .system_error, .recoverable = false },
+    // 用户/宿主中断:不是环境故障(不进 environment_fault 计数),用户再发一次即可重跑。
+    .{ .name = "Aborted", .code = .aborted, .category = .interrupted, .recoverable = true },
     .{ .name = "SpawnError", .code = .spawn_failed, .category = .system_error, .recoverable = true },
     // 子进程自己交代的启动失败(platform/process 报告通道):cwd 进不去 / 程序起不来。
     // 同一调用换个命令重试没有意义,所以不可恢复;它们是环境故障,不是模型的错。
@@ -479,6 +485,18 @@ test "no-recovery block detail names a non-regular target actionably" {
     defer a.free(plain);
     try std.testing.expect(std.mem.indexOf(u8, plain, "symlink") == null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "project_rule_blocked") != null);
+}
+
+test "Aborted 是用户/宿主中断:interrupted 类别、可恢复,与环境故障(system_error+不可恢复)分开" {
+    const a = std.testing.allocator;
+    const e = fromErrorName("Aborted", try a.dupe(u8, "Bash failed with Aborted"));
+    defer e.deinit(a);
+    try std.testing.expectEqual(Code.aborted, e.code);
+    try std.testing.expectEqual(Category.interrupted, e.category);
+    try std.testing.expect(e.recoverable);
+    const json = try e.toJson(a);
+    defer a.free(json);
+    try std.testing.expectEqualStrings("{\"error\":{\"code\":\"aborted\",\"category\":\"interrupted\",\"detail\":\"Bash failed with Aborted\",\"recoverable\":true}}", json);
 }
 
 test "spawn 报告通道的错误名:环境故障,不可恢复,带专属 code" {

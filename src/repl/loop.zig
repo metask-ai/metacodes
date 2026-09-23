@@ -889,8 +889,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
         if (result.stop_reason == .aborted) {
             std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
-            app.abort.resetForTesting();
         }
+        // 无条件复位,不看 stop_reason:标志由 SIGINT/Esc 在生成期置位,run 一结束就该清。
+        // 只在 .aborted 时复位的旧逻辑在"^C 被归为 api_error"时留下残留标志,下一次 run
+        // (排队消息)开跑即被吞掉。evaluation_budget 在上面已经 return,不会走到这里。
+        app.abort.reset();
 
         // 撞 backstop(防呆兜底,非防跑飞主闸):非静默 + 续接出口,不自动续(把"是否失控"
         // 交给唯一持全局意图的人——对齐 codex 只在有 pending 输入才续)。
@@ -4113,8 +4116,8 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
     app.persistTranscript();
     if (result.stop_reason == .aborted) {
         std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
-        app.abort.resetForTesting();
     }
+    app.abort.reset(); // 同主循环:run 边界无条件复位,不让残留标志毒化下一次 run
 }
 
 /// /resume：rest == "" 时列出最近 session；rest 是 session id 时加载。

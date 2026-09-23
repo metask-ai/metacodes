@@ -17,10 +17,17 @@
 //!       20-40KB 的调用 = 120-200s 真实沉默,确定性被杀。
 //! 本文件继续用真 HTTP 链路证明修法:
 //!   ⑤ input_json_delta 帧滴流(帧间隔 < 上限,总时长 ≫ 上限)→ 按字节续命,完整 tool_use 收齐;
-//!   ⑥ 只有 ping 的保活 → 算活着,本轮正常 end_turn;
+//!   ⑥ 只有 ping 的保活**不算进展**:超过正文上限即 stall,文案点名"网关 keepalive 仍在到达";
+//!   ⑥b ping 之间夹着真实进展(上限内)→ 正常 end_turn;
 //!   ⑦ 收头阶段用严上限,正文阶段用另一个(更大的)上限:两者独立生效;
 //!   ⑧ 非流式(auto-compact 那条路)正文 stall 同样点名而不是塌缩成 RequestFailed。
 //!   ⑨ napi 网关先发短文本,零字节沉默超过收头上限但未达正文上限,再突发完整 tool_use → 正常收齐。
+//!
+//! 2026-09-23 的第三次真实故障:第二次修法把"任何字节"都当活着,网关每 15 秒一条 ping 就把
+//! 空闲时钟一直复位——上游 55 分钟零产出,监视线程永远不开火,用户只能自己 Ctrl+C。ping 证明的
+//! 是网关连接活着,不是模型在产出。修法:传输层字节只更新"最近字节"时间戳(供 stall 报告点名
+//! 是 keepalive 撑着还是连接死了),正文空闲时钟只由**非保活行**续(`api/stream.zig isKeepaliveLine`)。
+//! ⑤⑨ 仍成立(input_json_delta 帧是非保活行);⑥ 反转;⑥b 补正例。
 
 const std = @import("std");
 const harness = @import("harness");
@@ -41,6 +48,12 @@ const MID_STREAM_PREFIX: usize = blk: {
     break :blk second;
 };
 
+/// 正文前三个事件的字节数(含 text_delta "alive"):沉默模式发完这些再停——用户取消时已有半截文本。
+const MID_STREAM_PREFIX_WITH_TEXT: usize = blk: {
+    const third = std.mem.indexOfPos(u8, OK_SSE, MID_STREAM_PREFIX, "\n\n").? + 2;
+    break :blk third;
+};
+
 /// 完整的 tool_use 参数,拆成 6 条 input_json_delta 滴流。老代码只在语义事件处 touch,而这 6 条
 /// 全是 `continue`——content_block_start 到 content_block_stop 之间时钟一动不动。
 const TOOL_INPUT_JSON = "{\"file_path\":\"/tmp/liveness.txt\",\"content\":\"0123456789\"}";
@@ -59,17 +72,37 @@ const TOOL_SSE =
 /// TOOL_SSE 的 SSE 事件数(MockServer 每个事件之间 sleep chunk_delay)。
 const TOOL_SSE_EVENTS: u64 = 11;
 
-/// 只靠 ping 保活的响应:文本块开了之后是 6 个 ping,再来正文。ping 在迭代器里走 `else => continue`。
+/// ping 之间夹着真实进展:每两条 text_delta 之间一个 ping,任意相邻两条**进展**行的间隔 = 2 × TRICKLE_MS
+/// < IDLE_MS。ping 不续命也不该被杀——续命的是 text_delta。
+const PING_PROGRESS_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n" ++
+    PING_EVENT ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"l\"}}\n\n" ++
+    PING_EVENT ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ive\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+const PING_PROGRESS_SSE_EVENTS: u64 = 10;
+
+/// 只靠 ping 保活的响应:文本块开了之后是 14 个 ping(14 × TRICKLE_MS = 2100ms > PING_ONLY_BODY_MS),
+/// 再来正文。这是 2026-09-23 的形状:网关 keepalive 一直到,模型什么都没产出。
+/// 正文上限用 1.5s 而不是 IDLE_MS(400ms):transport 空闲 ≤ 一个 ping 周期(150ms)+ 调度漂移,
+/// 与 progress 空闲(≥1500ms)拉开 10× 的距离,"keepalive 仍在到达"的判定在满载 CI 上也稳。
+const PING_ONLY_BODY_MS: u64 = 1_500;
 const PING_EVENT = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
 const PING_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
-    PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++
+    PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++
+    PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"alive\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
-const PING_SSE_EVENTS: u64 = 12;
+const PING_SSE_EVENTS: u64 = 20;
 
 /// 测试用空闲上限:秒级可复现,又远大于 MockServer 正常回包的耗时。
 const IDLE_MS: u64 = 400;
@@ -306,7 +339,7 @@ test "L2 liveness ⑤: input_json_delta 帧滴流(帧间隔 < 空闲上限,总�
     try std.testing.expect(takeLastError(&buf) == null);
 }
 
-test "L2 liveness ⑥: 只有 ping 的保活也算活着 → 本轮正常 end_turn" {
+test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限即 stall,文案点名网关 keepalive 仍在到达" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.startCassette(&[_][]const u8{PING_SSE}, TRICKLE_MS);
     defer srv.stop();
@@ -314,7 +347,35 @@ test "L2 liveness ⑥: 只有 ping 的保活也算活着 → 本轮正常 end_tu
     defer a.free(url);
     var io_rt = std.Io.Threaded.init(a, .{});
     defer io_rt.deinit();
-    var client = mkClient(a, io_rt.io(), url, IDLE_MS, IDLE_MS);
+    var client = mkClient(a, io_rt.io(), url, IDLE_MS, PING_ONLY_BODY_MS);
+    defer client.deinit();
+    clearLastError();
+
+    const t0 = cc.util_time.nowMs();
+    const result = try runOneTurn(a, &client, null);
+    const elapsed = cc.util_time.nowMs() - t0;
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    try std.testing.expect(elapsed >= @as(i64, @intCast(PING_ONLY_BODY_MS)));
+    try std.testing.expect(elapsed < BOUND_MS);
+    // 文案必须区分"keepalive 撑着的死上游"和"连接死了":前者查网关/上游,后者查网络。
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    const detail = takeLastError(&buf) orelse return error.TestExpectedLastError;
+    try std.testing.expect(std.mem.startsWith(u8, detail, "正文空闲超时: "));
+    try std.testing.expect(std.mem.indexOf(u8, detail, "网关 keepalive 仍在到达") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "(上限 1500 ms)") != null);
+}
+
+test "L2 liveness ⑥b: ping 之间夹着真实进展(进展间隔 < 上限)→ 正常 end_turn,ping 既不续命也不致命" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{PING_PROGRESS_SSE}, TRICKLE_MS);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    // 进展间隔 2 × TRICKLE_MS = 300ms;正文上限 1.5s 留 5× 余量给满载 CI(⑤ 的 150ms/400ms 已是下限)。
+    var client = mkClient(a, io_rt.io(), url, IDLE_MS, PING_ONLY_BODY_MS);
     defer client.deinit();
     clearLastError();
 
@@ -323,7 +384,7 @@ test "L2 liveness ⑥: 只有 ping 的保活也算活着 → 本轮正常 end_tu
     const elapsed = cc.util_time.nowMs() - t0;
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
-    try std.testing.expect(elapsed >= @as(i64, @intCast((PING_SSE_EVENTS - 1) * TRICKLE_MS)));
+    try std.testing.expect(elapsed >= @as(i64, @intCast((PING_PROGRESS_SSE_EVENTS - 1) * TRICKLE_MS)));
     try std.testing.expect(elapsed < BOUND_MS);
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     try std.testing.expect(takeLastError(&buf) == null);
@@ -451,4 +512,63 @@ test "L2 liveness ⑨: 短文本后零字节沉默超过收头上限,正文上�
     try std.testing.expect(elapsed >= @as(i64, delay_ms));
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     try std.testing.expect(takeLastError(&buf) == null);
+}
+
+/// 模拟 REPL 的 Ctrl+C 链路:SIGINT handler 置标志,watcher 的下一个 tick 代它 provider.cancel。
+fn cancelAfter(signal: *cc.util_abort.AbortSignal, client: *cc.client_mod.Client, delay_ms: u64) void {
+    cc.util_time.sleepMs(delay_ms);
+    signal.abort(.user_ctrl_c);
+    client.provider().cancel(signal);
+}
+
+test "L2 liveness ⑩: 正文阶段用户取消(abort + provider.cancel)→ aborted 而非 api_error,半截文本保留,不写 last_error" {
+    const a = std.testing.allocator;
+    // 服务端发完 message_start + block_start + text_delta("alive") 后沉默、不关连接;正文上限 60s——
+    // 只有 cancel 能结束它。2026-09-23 实录:cancel 关掉 socket,阻塞的读以 ReadFailed 醒来,曾被
+    // 归为 RequestFailed → api_error,半截文本被丢,屏幕打"模型 API 请求失败"。
+    var srv = try harness.MockServer.startCassetteSilent(&[_][]const u8{OK_SSE}, 0, MID_STREAM_PREFIX_WITH_TEXT);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = mkClient(a, io_rt.io(), url, IDLE_MS, 60_000);
+    defer client.deinit();
+    clearLastError();
+
+    var signal = cc.util_abort.AbortSignal.init();
+    const canceller = try std.Thread.spawn(.{}, cancelAfter, .{ &signal, &client, 400 });
+    defer canceller.join();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "hi");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs: []const cc.json_mod.ToolDefinition = &.{};
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const t0 = cc.util_time.nowMs();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 1,
+        .abort = &signal,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    const elapsed = cc.util_time.nowMs() - t0;
+    try std.testing.expectEqual(cc.agent_loop.StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    try std.testing.expect(elapsed >= 400);
+    try std.testing.expect(elapsed < BOUND_MS);
+    // 取消不是 API 错误:没有 last_error 现场(否则 TUI 会打"模型 API 请求失败")。
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    try std.testing.expect(takeLastError(&buf) == null);
+    // 已流出的文本以 partial 身份留在对话里(对齐 aborted 路径),不像 stream_error 那样整段丢弃。
+    const last = conv.messages.items[conv.messages.items.len - 1];
+    try std.testing.expectEqual(cc.message.Role.assistant, last.role);
+    var saw_partial = false;
+    for (last.blocks) |b| switch (b) {
+        .text => |t| saw_partial = std.mem.eql(u8, t, "alive"),
+        else => {},
+    };
+    try std.testing.expect(saw_partial);
 }

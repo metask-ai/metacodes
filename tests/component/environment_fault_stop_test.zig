@@ -40,6 +40,36 @@ fn slowExec(_: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque
     return error.Timeout;
 }
 
+/// 被用户/宿主中断的工具(Esc/Ctrl+C 时 Bash 的真实返回):Aborted → aborted / interrupted /
+/// recoverable:true。2026-09-23 实录:它曾被当成 system_error 计入"environment fault 1/3"。
+fn abortedExec(_: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8 {
+    return error.Aborted;
+}
+
+/// 只记 CoreEvent 的 tag 顺序:断言 environment_fault 排在它所属的 tool_result 之后。
+const OrderCapture = struct {
+    allocator: std.mem.Allocator,
+    tags: std.ArrayList([]const u8) = .empty,
+
+    fn emit(ctx: *anyopaque, _: cc.session_id.SessionId, ev: cc.ui_event.CoreEvent) void {
+        const self: *OrderCapture = @ptrCast(@alignCast(ctx));
+        self.tags.append(self.allocator, @tagName(std.meta.activeTag(ev))) catch {};
+    }
+    fn poll(_: *anyopaque, _: cc.session_id.SessionId) ?cc.ui_event.UiEvent {
+        return null;
+    }
+    fn backend(self: *OrderCapture) cc.ui_backend.UiBackend {
+        return .{ .ctx = @ptrCast(self), .emit = emit, .poll = poll };
+    }
+    fn deinit(self: *OrderCapture) void {
+        self.tags.deinit(self.allocator);
+    }
+    fn indexOf(self: *const OrderCapture, tag: []const u8) ?usize {
+        for (self.tags.items, 0..) |t, i| if (std.mem.eql(u8, t, tag)) return i;
+        return null;
+    }
+};
+
 /// 把 WriterBackend 的字节收进内存,断言用户看到了什么。
 const Capture = struct {
     allocator: std.mem.Allocator,
@@ -79,6 +109,7 @@ fn runCassette(a: std.mem.Allocator, bodies: []const []const u8, capture: *Captu
     defer dyn.deinit();
     try dyn.register("broken_tool", "Always hits an environment fault", &.{}, brokenExec, null, false);
     try dyn.register("slow_tool", "Always times out (recoverable)", &.{}, slowExec, null, false);
+    try dyn.register("aborted_tool", "Interrupted by the user (Aborted)", &.{}, abortedExec, null, false);
 
     var conv = cc.conversation.Conversation.init(a);
     defer conv.deinit();
@@ -130,4 +161,45 @@ test "可恢复的 system_error(Timeout)不计数:3 次超时照常跑到 end_tu
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.stop_reason);
     try std.testing.expectEqual(@as(usize, 4), out.requests);
     try std.testing.expect(!capture.has("environment fault"));
+}
+
+test "用户中断(Aborted → interrupted)不是环境故障:3 次也不计数、不告知、不熔断" {
+    const a = std.testing.allocator;
+    var capture = Capture{ .allocator = a };
+    defer capture.deinit();
+    const bodies = [_][]const u8{ callSse("c1", "aborted_tool"), callSse("c2", "aborted_tool"), callSse("c3", "aborted_tool"), FINAL_SSE };
+    const out = try runCassette(a, &bodies, &capture);
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.stop_reason);
+    try std.testing.expectEqual(@as(usize, 4), out.requests);
+    try std.testing.expect(!capture.has("environment fault"));
+}
+
+test "environment_fault 事件排在它所属的 tool_result 之后(TUI 才能把告警印在正确的卡片下面)" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ callSse("c1", "broken_tool"), FINAL_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = openai.OpenAIClient.init(a, io_rt.io(), "k", "gpt-4o", url);
+    defer client.deinit();
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("broken_tool", "Always hits an environment fault", &.{}, brokenExec, null, false);
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "do the thing");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const tool_defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(tool_defs);
+
+    var order = OrderCapture{ .allocator = a };
+    defer order.deinit();
+    const be = order.backend();
+    const result = try agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn, .emit_tool_cards = true }, &be, a);
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    const tool_result_at = order.indexOf("tool_result") orelse return error.TestExpectedToolResult;
+    const fault_at = order.indexOf("environment_fault") orelse return error.TestExpectedEnvironmentFault;
+    try std.testing.expect(fault_at > tool_result_at);
 }

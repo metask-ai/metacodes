@@ -620,6 +620,12 @@ const OpenAIStream = struct {
         return registry.stalled(self.request);
     }
 
+    /// 一条非保活 SSE 行 = 模型在产出 → 续正文空闲时钟(ping/注释行不算,见 stream.zig)。
+    fn touchProgress(self: *OpenAIStream) void {
+        const registry = self.abort_registry orelse return;
+        registry.touch(self.request);
+    }
+
     /// 读下一个中立事件。逐行读 SSE,翻译 OpenAI chunk → StreamEvent。
     fn next(self: *OpenAIStream) anyerror!?StreamEvent {
         // 先把已排队的 flush 事件(并行 tool_use_start)逐个吐出。
@@ -638,8 +644,9 @@ const OpenAIStream = struct {
         if (self.reader == null) {
             const raw = self.response.reader(&self.transfer_buf);
             // 字节级续命:每次 recv 到字节就 touch——tool_calls 参数增量 chunk 不再是"沉默"。
+            // 传输层字节只记"最近字节"时间戳;进展按非保活行续(下方)。
             self.reader = if (self.abort_registry) |registry| blk: {
-                self.liveness = liveness_reader.LivenessReader.init(raw, registry, self.request, &self.liveness_buf);
+                self.liveness = liveness_reader.LivenessReader.init(raw, registry, self.request, &self.liveness_buf, .transport_only);
                 break :blk &self.liveness.interface;
             } else raw;
         }
@@ -651,6 +658,8 @@ const OpenAIStream = struct {
                 // 读取/上限失败可能把传输层留在一行中间;置终态,防调用方再 next()
                 // 把行尾当新 SSE 帧解析(对齐 stream.zig next 的 fail-terminal 契约)。
                 self.done = true;
+                // 取消优先:cancel 关掉了 socket,读才失败的——是 Aborted,不是 API 错误。
+                if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
                 if (self.stalledVerdict()) |stall| {
                     client_mod.reportBodyStall("openai", self.id, stall);
                     return error.StreamStalled;
@@ -659,13 +668,17 @@ const OpenAIStream = struct {
             };
             const line = line_opt orelse {
                 self.done = true;
-                // EOF 而无 [DONE]:连接若是被监视线程 shutdown 的,这是 stall 而非正常收尾。
+                // 干净 EOF 而无 [DONE]:cancel 关掉的连接也可能这样醒来——是取消,不是收尾。
+                if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
+                // 连接若是被监视线程 shutdown 的,这是 stall 而非正常收尾。
                 if (self.stalledVerdict()) |stall| {
                     client_mod.reportBodyStall("openai", self.id, stall);
                     return error.StreamStalled;
                 }
                 return self.finishFlush();
             };
+            // 进展记账:非保活行(含被 continue 掉的 usage/空 chunk)才续正文空闲时钟。
+            if (!api_stream.isKeepaliveLine(line)) self.touchProgress();
             const trimmed = std.mem.trim(u8, line, " \r\n");
             if (trimmed.len == 0) continue;
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;

@@ -74,10 +74,19 @@ pub const AbortSignal = struct {
         if (self.isAborted()) return error.Aborted;
     }
 
-    /// 仅测试用：重置为未触发。生产代码不应调用（abort 应是单向的）。
-    pub fn resetForTesting(self: *AbortSignal) void {
+    /// 宿主在 run 边界复位。标志在 run 内是单向的(工具/流只读它);但一次 run 结束后,不论
+    /// 它以哪种 stop_reason 收口,残留的标志都不能活到下一次 run——否则下一条(常是排队的)
+    /// 消息会在开跑 1ms 内被 loop-top 检查吞掉。2026-09-23 实录:^C 打断一条卡住的流被
+    /// 归为 api_error,标志没复位,紧随的排队消息立刻显示 `^C (cancelled)`。
+    /// 只有宿主(REPL/web/daemon)在两次 run 之间调。
+    pub fn reset(self: *AbortSignal) void {
         self.reason_value.store(@intFromEnum(Reason.not_aborted), .release);
         self.flag.store(false, .release);
+    }
+
+    /// 历史名,测试沿用;生产代码用 `reset`。
+    pub fn resetForTesting(self: *AbortSignal) void {
+        self.reset();
     }
 };
 

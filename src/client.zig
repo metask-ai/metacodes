@@ -248,9 +248,12 @@ pub const DEFAULT_STREAM_BODY_IDLE_FLOOR_MS: u64 = 600_000;
 /// 正文阶段按 max_tokens 放大的预算:每个可能生成的 token 给 100ms(= 10 tok/s,比实测
 /// glm-5.3-flash 经网关 ~50 tok/s 慢 5 倍的"活着但慢"下界)。
 pub const STREAM_BODY_IDLE_MS_PER_TOKEN: u64 = 100;
-/// 正文阶段空闲上限的封顶(1 小时):零字节超过一小时的连接,中间设备早已把流丢了,
-/// 再等也是空等;用户随时能 Ctrl+C(真 cancel)。
-pub const STREAM_BODY_IDLE_CAP_MS: u64 = 3_600_000;
+/// 正文阶段空闲上限的封顶(30 分钟)。曾是 1 小时:2026-09-23 实录里 glm-5.3-flash 的目录
+/// max_tokens=131072 把上限直接推到封顶,用户在一条零产出的流上盲等了 55 分钟。合法的
+/// 沉默上界是"网关攒一整个工具调用":实测 34KB 参数 ≈ 96s;一个 400KB 的 Write 按 50 tok/s
+/// 也在 30 分钟内。误杀的代价是同轮重发一次(max_stream_turn_retries),漏判的代价是用户
+/// 半小时看不到任何东西——后者更贵。`METACODES_STREAM_BODY_IDLE_TIMEOUT_MS` 可显式覆盖。
+pub const STREAM_BODY_IDLE_CAP_MS: u64 = 1_800_000;
 
 /// `METACODES_STREAM_IDLE_TIMEOUT_MS` 覆盖收头阶段默认空闲上限(毫秒;0 关闭;非法值用默认)。
 pub fn streamIdleTimeoutMsFromEnv() u64 {
@@ -265,7 +268,7 @@ pub fn streamBodyIdleTimeoutMsFromEnv() ?u64 {
     return std.fmt.parseInt(u64, std.mem.span(raw), 10) catch null;
 }
 
-/// 正文阶段空闲上限:显式覆盖 > 收头上限为 0(整体关闭)→ 0 > clamp(max_tokens × 100ms, 10min, 1h)。
+/// 正文阶段空闲上限:显式覆盖 > 收头上限为 0(整体关闭)→ 0 > clamp(max_tokens × 100ms, 10min, 30min)。
 /// 按 max_tokens 放大是因为正文沉默的上界就是"一次生成能有多长";下限/封顶见各常量注释。
 pub fn bodyIdleLimitMs(override: ?u64, head_limit_ms: u64, max_tokens: u32) u64 {
     if (override) |flat| return flat;
@@ -300,10 +303,18 @@ pub fn reportHeadStall(comptime module: []const u8, rid: log.RequestId, stall: p
 /// 正文阶段 stall 的统一交代:日志 + last_error 现场。此前 mid-stream 的 StreamStalled 不写
 /// last_error,TUI 只能打"重试耗尽 / 后端错误 / 上下文超限"三选一的猜谜文案——排障靠翻
 /// 观测日志才知道是空闲超时。三个 provider client 共用。
+///
+/// 两种形状要分开点名:传输层也沉默 = 连接死了(网络/代理);传输层活着但没有模型输出 = 网关在
+/// 用 keepalive 撑着一条上游不再产出的流(2026-09-23:napi 每 15s 一条 ping,上游 55 分钟零输出)。
+/// 前者该查网络,后者该查网关/上游——文案让用户一眼分清,不用翻观测日志。
 pub fn reportBodyStall(comptime module: []const u8, rid: log.RequestId, stall: provider_mod.RequestAbortRegistry.Stall) void {
-    log.warnId(module, rid, "no bytes for {d}ms (body idle limit {d}ms): stream stalled, connection shut down", .{ stall.idle_ms, stall.limit_ms });
-    var buf: [128]u8 = undefined;
-    const detail = std.fmt.bufPrint(&buf, "{d} ms 内无任何字节(上限 {d} ms),连接已由客户端关闭", .{ stall.idle_ms, stall.limit_ms }) catch "StreamStalled";
+    const keepalive_only = stall.transport_idle_ms * 2 < stall.idle_ms;
+    log.warnId(module, rid, "no model output for {d}ms (body idle limit {d}ms, last transport byte {d}ms ago): stream stalled, connection shut down", .{ stall.idle_ms, stall.limit_ms, stall.transport_idle_ms });
+    var buf: [192]u8 = undefined;
+    const detail = if (keepalive_only)
+        std.fmt.bufPrint(&buf, "{d} ms 内无模型输出,但网关 keepalive 仍在到达(最近字节 {d} ms 前)(上限 {d} ms),连接已由客户端关闭;上游/网关卡住,不是网络断了", .{ stall.idle_ms, stall.transport_idle_ms, stall.limit_ms }) catch "StreamStalled"
+    else
+        std.fmt.bufPrint(&buf, "{d} ms 内无任何字节(上限 {d} ms),连接已由客户端关闭", .{ stall.idle_ms, stall.limit_ms }) catch "StreamStalled";
     last_error.recordNamed("正文空闲超时", detail);
 }
 
@@ -1034,8 +1045,14 @@ pub const Client = struct {
         const raw_body_reader = req_ptr.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
         // 字节级续命(同流式路径):大 body 分多次 recv 到达,每次都是活着的证据。
         var liveness_buf: [8192]u8 = undefined;
-        var liveness = liveness_reader.LivenessReader.init(raw_body_reader, &client.abort_registry, req_ptr, &liveness_buf);
+        // 非流式 body 里没有保活,每个字节都是进展。
+        var liveness = liveness_reader.LivenessReader.init(raw_body_reader, &client.abort_registry, req_ptr, &liveness_buf, .bytes_are_progress);
         const response_body = liveness.interface.allocRemaining(client.allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
+            // 取消优先于传输层错误分类:cancel 关闭了 socket,读才失败的。
+            if (abort) |a| if (a.isAborted()) {
+                log.warnId("client", rid, "read body failed after cancel ({s}) → Aborted", .{@errorName(err)});
+                return error.Aborted;
+            };
             if (client.abort_registry.stalled(req_ptr)) |stall| {
                 reportBodyStall("client", rid, stall);
                 return error.StreamStalled;
@@ -1330,6 +1347,21 @@ pub const StreamResponse = struct {
         return registry.stalled(self.stream_result.request);
     }
 
+    /// 用户/宿主已取消:传输层错误(含 cancel 关掉 socket 后醒来的 ReadFailed / 干净 EOF)
+    /// 一律归为 Aborted,不归 API 错误——否则 ^C 变成"模型 API 请求失败",部分文本被丢弃,
+    /// abort 标志残留到下一次 run(2026-09-23 实录)。
+    fn cancelled(self: *const StreamResponse) bool {
+        const a = self.abort orelse return false;
+        return a.isAborted();
+    }
+
+    /// EventIterator 的进展钩子:一条非保活 SSE 行 = 模型在产出 → 续正文空闲时钟。
+    fn progressThunk(raw: *anyopaque) void {
+        const self: *StreamResponse = @ptrCast(@alignCast(raw));
+        const registry = self.stream_result.abort_registry orelse return;
+        registry.touch(self.stream_result.request);
+    }
+
     /// 读下一个事件。首次调用时懒初始化 EventIterator——Response.reader 的返回是一个
     /// 指向 self.stream_result 内部字段的指针，必须在 self 稳定后才能取地址。
     pub fn next(self: *StreamResponse) !?StreamEvent {
@@ -1339,8 +1371,9 @@ pub const StreamResponse = struct {
             const raw_reader = self.stream_result.response.reader(&self.stream_result.transfer_buf);
             // 字节级续命:每次 recv 到字节就 touch——tool_use 参数的 input_json_delta 串、ping、
             // unknown 事件都不再是"沉默"。无注册表(纯测试构造)时直接用裸 reader。
+            // 传输层字节只更新"最近字节"时间戳(stall 报告用);进展由下面的钩子按非保活行续。
             const reader = if (self.stream_result.abort_registry) |registry| blk: {
-                self.liveness = liveness_reader.LivenessReader.init(raw_reader, registry, self.stream_result.request, &self.liveness_buf);
+                self.liveness = liveness_reader.LivenessReader.init(raw_reader, registry, self.stream_result.request, &self.liveness_buf, .transport_only);
                 break :blk &self.liveness.interface;
             } else raw_reader;
             self.event_iter = if (self.abort) |a|
@@ -1348,6 +1381,8 @@ pub const StreamResponse = struct {
             else
                 api_stream.EventIterator.init(reader);
             self.event_iter.setRequestId(self.id);
+            if (self.stream_result.abort_registry != null)
+                self.event_iter.setProgressHook(.{ .ctx = @ptrCast(self), .call = progressThunk });
             if (self.user_query.len > 0) self.event_iter.setUserQuery(self.user_query);
             self.iter_initialized = true;
         }
@@ -1358,6 +1393,11 @@ pub const StreamResponse = struct {
                 return error.Aborted;
             },
             error.ReadFailed => {
+                // 取消优先:cancel 关掉了 socket,阻塞的读才以 ReadFailed 醒来。
+                if (self.cancelled()) {
+                    log.warnId("stream", self.id, "read failed after cancel → Aborted", .{});
+                    return error.Aborted;
+                }
                 // 监视线程因沉默 shutdown 了连接 → 读失败的真因是 stall,不是网络。
                 if (self.stalledVerdict()) |stall| {
                     reportBodyStall("stream", self.id, stall);
@@ -1377,16 +1417,21 @@ pub const StreamResponse = struct {
                 return error.ContextWindowExceeded;
             },
             else => {
+                if (self.cancelled()) {
+                    log.warnId("stream", self.id, "event_iter.next failed after cancel ({s}) → Aborted", .{@errorName(err)});
+                    return error.Aborted;
+                }
                 log.warnId("stream", self.id, "event_iter.next failed: {s}", .{@errorName(err)});
                 return error.RequestFailed;
             },
         };
-        // 空闲时钟不在这里续:活性证据是字节(LivenessReader),不是解析出的事件——按事件续命
-        // 会把 tool_use 参数流(全是 continue 掉的 input_json_delta)当成沉默。
+        // 正文空闲时钟由 EventIterator 的进展钩子续(每条非保活行);LivenessReader 只记传输层字节。
         const ev = ev_opt orelse {
             self.done = true;
-            // EOF 而无 message_stop:若连接是被监视线程 shutdown 的(非 chunked 编码下读到的是
-            // 干净 EOF 而不是 ReadFailed),这仍是 stall,不能装成正常收尾。
+            // 干净 EOF 而无 message_stop:cancel 关掉的连接在非 chunked 编码下读到的就是 EOF——
+            // 是取消,不是模型说完了(否则半截文本被当成完整回复提交)。
+            if (self.cancelled()) return error.Aborted;
+            // 若连接是被监视线程 shutdown 的,这仍是 stall,不能装成正常收尾。
             if (self.stalledVerdict()) |stall| {
                 reportBodyStall("stream", self.id, stall);
                 return error.StreamStalled;

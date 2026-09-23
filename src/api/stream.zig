@@ -862,10 +862,56 @@ pub const RetryReporter = struct {
     }
 };
 
+/// SSE 保活行:证明"网关连接活着",不证明"模型在产出"。空行/纯空白是帧分隔;`:` 开头是
+/// SSE 规范的注释行(各类代理的 keep-alive);`event: ping` 与 `data: {"type":"ping"}` 是
+/// Anthropic 风格的 ping(napi 网关每 15 秒一条)。别的任何行——尤其是 tool_use 参数的
+/// `input_json_delta` 帧——都是进展。正文空闲时钟只由进展续命(见 liveness_reader.zig)。
+pub fn isKeepaliveLine(line: []const u8) bool {
+    const t = std.mem.trim(u8, line, " \t\r\n");
+    if (t.len == 0) return true;
+    if (t[0] == ':') return true;
+    if (std.mem.startsWith(u8, t, "event:")) {
+        return std.mem.eql(u8, std.mem.trim(u8, t["event:".len..], " \t"), "ping");
+    }
+    if (std.mem.startsWith(u8, t, "data:")) {
+        const payload = std.mem.trim(u8, t["data:".len..], " \t");
+        return payload.len > 0 and payload[0] == '{' and parseEventType(payload) == .ping;
+    }
+    return false;
+}
+
+test "isKeepaliveLine: pings and comments are keepalive, every data-bearing line is progress" {
+    try std.testing.expect(isKeepaliveLine(""));
+    try std.testing.expect(isKeepaliveLine("   \r"));
+    try std.testing.expect(isKeepaliveLine(": keep-alive"));
+    try std.testing.expect(isKeepaliveLine(": OPENROUTER PROCESSING"));
+    try std.testing.expect(isKeepaliveLine("event: ping"));
+    try std.testing.expect(isKeepaliveLine("event:ping"));
+    try std.testing.expect(isKeepaliveLine("data: {\"type\":\"ping\"}"));
+    try std.testing.expect(isKeepaliveLine("data: {\"type\": \"ping\"}"));
+    // Progress: every other event line, tool-argument frames, OpenAI chunks, [DONE].
+    try std.testing.expect(!isKeepaliveLine("event: content_block_delta"));
+    try std.testing.expect(!isKeepaliveLine("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"x\"}}"));
+    try std.testing.expect(!isKeepaliveLine("data: {\"type\":\"message_start\"}"));
+    try std.testing.expect(!isKeepaliveLine("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}"));
+    try std.testing.expect(!isKeepaliveLine("data: [DONE]"));
+    try std.testing.expect(!isKeepaliveLine("garbage"));
+}
+
+/// 进展回调(见 `setProgressHook`):迭代器每拿到一条非保活 SSE 行就调一次。
+pub const ProgressHook = struct {
+    ctx: *anyopaque,
+    call: *const fn (*anyopaque) void,
+};
+
 pub const EventIterator = struct {
     reader: *std.Io.Reader,
     abort: ?*const AbortSignal = null,
     done_flag: bool = false,
+    /// 正文空闲时钟的续命点:每条非保活行(含被 `continue` 掉的 input_json_delta / unknown 事件)
+    /// 调一次。ping / 注释行不算——它们只证明网关活着(client 层经 LivenessReader.transport_only
+    /// 另行记账)。null = 不记账(纯解析用、测试用)。
+    progress: ?ProgressHook = null,
     /// 本次 SSE 流对应的 request_id（client 层设置）。用来把 stream 事件日志和
     /// 更上游的 HTTP 请求/下游 agent turn 串起来。未设置时日志无 id 上下文。
     req_id: ?log.RequestId = null,
@@ -923,6 +969,11 @@ pub const EventIterator = struct {
     /// 注入本轮用户原始输入(borrowed),供 web_search 显示真实 query(对齐 mecode)。
     pub fn setUserQuery(self: *EventIterator, q: []const u8) void {
         self.ws_user_query = q;
+    }
+
+    /// 绑定进展回调(client 层把它接到 RequestAbortRegistry.touch)。
+    pub fn setProgressHook(self: *EventIterator, hook: ProgressHook) void {
+        self.progress = hook;
     }
 
     /// 清理未 emit 的 pending_tool（通常在 error 或提前 drop 时调用）。
@@ -1036,6 +1087,10 @@ pub const EventIterator = struct {
                 self.done_flag = true;
                 return null;
             };
+
+            // 进展记账:非保活行才续正文空闲时钟(包括下面会被 continue 掉的 input_json_delta /
+            // unknown 事件)。ping / 注释行不续——网关在上游沉默期间照样发它们。
+            if (self.progress) |hook| if (!isKeepaliveLine(line)) hook.call(hook.ctx);
 
             // record/replay(Stage 7):录原始 SSE 行(保留 data: 帧 + 空行框架)。no-op 当未录制。
             @import("../core/recorder.zig").recordSseLine(line);

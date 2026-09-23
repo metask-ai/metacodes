@@ -515,8 +515,12 @@ pub fn spawnToFilesWithEnv(
     }
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
+        // stdin 接 /dev/null。落盘作业在自己的进程组里跑,若继承控制终端当 stdin,任何读
+        // stdin 的子进程(ssh 不带 -n、交互式命令)一读就被 SIGTTIN 停成 T 态:不退出、不报错、
+        // 不被收尸(2026-09-23 实录:8 个 ssh 僵尸挂在各会话下)。open 失败(-1)保持旧的继承行为。
+        const in_fd = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         // out_fd/err_fd 是调用方开的落盘文件:父进程关着 stdio 时它们也可能落在 0..2。
-        wireStdioOrExit(.{ -1, out_fd, err_fd }, report.wr);
+        wireStdioOrExit(.{ in_fd, out_fd, err_fd }, report.wr);
         execChild(argv, inherit_env, cwd, report.wr);
     }
     _ = std.c.close(report.wr);
@@ -1792,4 +1796,55 @@ test "buildWindowsCmdline: env 前缀剥离 + argv0 正斜杠归一(非 argv0 �
     const u8out = try std.unicode.utf16LeToUtf8Alloc(a, w);
     defer a.free(u8out);
     try std.testing.expectEqualStrings("zig-out\\bin\\tool arg/with/slash", u8out);
+}
+
+test "spawnToFiles: 子进程 stdin 是 /dev/null,不继承父进程的 fd 0(读 stdin 的命令立即 EOF)" {
+    // 落盘作业跑在自己的进程组里;若继承控制终端当 stdin,`ssh`(不带 -n)这类读 stdin 的命令
+    // 一读就 SIGTTIN 停成 T 态,永远不退出(2026-09-23:8 个 ssh 僵尸)。副本里把 fd 0 换成一根
+    // 永不关闭写端的管道:子进程若继承它,`cat` 永远读不到 EOF;接了 /dev/null 则立即结束。
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    var result_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expect(std.c.pipe(&result_pipe) == 0);
+    const helper = std.c.fork();
+    try std.testing.expect(helper >= 0);
+    if (helper == 0) {
+        _ = std.c.close(result_pipe[0]);
+        var hang: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&hang) != 0) reportAndExit(result_pipe[1], "pipe-failed");
+        _ = std.c.dup2(hang[0], 0); // 写端 hang[1] 故意不关:继承者会永远阻塞
+        var out: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&out) != 0) reportAndExit(result_pipe[1], "pipe-failed");
+        const argv: []const ?[*:0]const u8 = &.{ "/bin/sh", "-c", "cat; if [ /dev/fd/0 -ef /dev/null ]; then echo stdin-is-devnull; else echo stdin-other; fi", null };
+        const proc = spawnToFiles(argv, out[1], out[1], null) catch reportAndExit(result_pipe[1], "spawn-error");
+        _ = std.c.close(out[1]);
+        const deadline = nowMs() + 5_000;
+        var exited = false;
+        while (nowMs() < deadline) {
+            switch (reapNonblock(proc)) {
+                .exited => {
+                    exited = true;
+                    break;
+                },
+                .running => {
+                    const req = std.c.timespec{ .sec = 0, .nsec = 20_000_000 };
+                    var rem: std.c.timespec = undefined;
+                    _ = std.c.nanosleep(&req, &rem);
+                },
+            }
+        }
+        if (!exited) {
+            killJob(proc);
+            reapBlocking(proc);
+            reportAndExit(result_pipe[1], "child-hung-on-inherited-stdin");
+        }
+        var buf: [128]u8 = undefined;
+        reportAndExit(result_pipe[1], readHelperReport(out[0], &buf));
+    }
+    _ = std.c.close(result_pipe[1]);
+    var buf: [128]u8 = undefined;
+    const got = readHelperReport(result_pipe[0], &buf);
+    _ = std.c.close(result_pipe[0]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(helper, &st, 0);
+    try std.testing.expectEqualStrings("stdin-is-devnull\n", got);
 }
