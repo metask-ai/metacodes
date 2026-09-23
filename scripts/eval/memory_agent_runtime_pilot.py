@@ -26,6 +26,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.eval.memory_agent_runtime import (  # type: ignore
         PRODUCTION_MODEL_FINGERPRINT,
+        SYSTEM_ONE_ARMS,
         PRODUCTION_MODEL_ID,
         ProductionRuntimeConfig,
         _write_new,
@@ -53,6 +54,7 @@ if __package__ in {None, ""}:
 else:
     from .memory_agent_runtime import (
         PRODUCTION_MODEL_FINGERPRINT,
+        SYSTEM_ONE_ARMS,
         PRODUCTION_MODEL_ID,
         ProductionRuntimeConfig,
         _write_new,
@@ -243,7 +245,7 @@ def _public_plan(
                 "upstream_sha256": hashlib.sha256(args.system_one_upstream.encode("utf-8")).hexdigest(),
                 "model": args.system_one_model,
                 "arms": sorted(
-                    {row["arm"] for row in manifest["schedule"]} & {"tinykg_jev"}
+                    {row["arm"] for row in manifest["schedule"]} & SYSTEM_ONE_ARMS
                 ),
             }
             if args.system_one_upstream
@@ -330,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resume-paid-run", action="store_true")
     parser.add_argument(
         "--system-one-upstream",
-        help="origin of the System-One (Jev) judge the runner proxies for tinykg_jev rows",
+        help="origin of the System-One (Jev) judge the runner proxies for System-One arm rows",
     )
     parser.add_argument(
         "--system-one-model",

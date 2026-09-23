@@ -121,7 +121,7 @@ test "L2 jev memory plane: scoped recall shadow keeps baseline bytes, advisory f
     kg.ensureReady();
     if (!kg.ready) return error.SkipZigTest;
     _ = try kg.remember(.observation, "zorblax parser rejects tab characters in indentation", "module", false);
-    _ = try kg.remember(.observation, "zorblax release checklist requires a signed tag", "decision", false);
+    _ = try kg.remember(.observation, "zorblax parser converts tab characters in indentation to four spaces unless strict mode is on", "decision", false);
     _ = try kg.remember(.observation, "zorblax cache eviction uses LRU with 64 entries", "module", false);
 
     const query = "How does the zorblax parser treat tab characters in indentation?";
@@ -137,6 +137,10 @@ test "L2 jev memory plane: scoped recall shadow keeps baseline bytes, advisory f
         kg.allocator.free(ranked);
     }
     try std.testing.expectEqual(@as(usize, 3), ranked.len);
+    // Fixture precondition: two parser memories inside the BM25 band (score
+    // at least half the top), the cache memory outside it.
+    try std.testing.expect(ranked[1].score >= ranked[0].score * 0.5);
+    try std.testing.expect(ranked[2].score < ranked[0].score * 0.5);
 
     var baseline = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conv, &ab, .{});
     defer baseline.deinit(a);
@@ -196,7 +200,7 @@ test "L2 jev memory plane: scoped recall shadow keeps baseline bytes, advisory f
     // pool, so the single best candidate by judge and BM25 together (here the
     // BM25 top hit) is injected.
     {
-        const weak = try answersBody(a, &.{ .{ "c0", 0.10 }, .{ "c1", 0.20 }, .{ "c2", 0.05 } });
+        const weak = try answersBody(a, &.{ .{ "c0", 0.30 }, .{ "c1", 0.05 }, .{ "c2", 0.05 } });
         defer a.free(weak);
         var srv = try harness.MockServer.start(weak, 0);
         defer srv.stop();
@@ -209,6 +213,25 @@ test "L2 jev memory plane: scoped recall shadow keeps baseline bytes, advisory f
         try std.testing.expect(!containsNode(text, ranked[1].node_id));
         try std.testing.expectEqual(@as(usize, 1), advisory.receipt.injected_count);
         try std.testing.expectEqual(@as(u32, 0), advisory.system_one.?.positive);
+    }
+
+    // The judge's favourite outside the BM25 band is never injected (the
+    // paid procedural pilot's failure: a sibling's diff at 1/9 of the top
+    // score displaced the protocol memory); the band's best stands in.
+    {
+        const out_of_band = try answersBody(a, &.{ .{ "c0", 0.10 }, .{ "c1", 0.10 }, .{ "c2", 0.99 } });
+        defer a.free(out_of_band);
+        var srv = try harness.MockServer.start(out_of_band, 0);
+        defer srv.stop();
+        const runtime = try startRuntime(a, io_runtime.io(), srv, .advisory);
+        defer runtime.destroy(a);
+        var advisory = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conv, &ab, .{ .advisor = &runtime.advisor });
+        defer advisory.deinit(a);
+        const text = advisory.text orelse return error.MissingInjection;
+        try std.testing.expect(!containsNode(text, ranked[2].node_id));
+        try std.testing.expect(containsNode(text, ranked[0].node_id));
+        try std.testing.expectEqual(@as(usize, 1), advisory.receipt.injected_count);
+        try std.testing.expectEqual(@as(u32, 1), advisory.system_one.?.positive);
     }
 
     // Below the BM25 floor the answer is absent for both policies: the judge

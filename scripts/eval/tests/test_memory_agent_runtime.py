@@ -37,6 +37,7 @@ from scripts.eval.memory_agent_runtime import (
     ARM_TO_RUNTIME,
     SYSTEM_ONE_ARMS,
     SystemOneJudgeProxy,
+    _system_one_environment,
     _verify_scoped_recall_activation,
     _write_failed_validation_checkpoint,
     _xxhash64,
@@ -5414,7 +5415,18 @@ class SystemOneJudgeProxyTests(unittest.TestCase):
 
     def test_jev_arm_is_the_tinykg_runtime_plus_the_judge(self):
         self.assertEqual(ARM_TO_RUNTIME["tinykg_jev"], "tinykg")
-        self.assertEqual(SYSTEM_ONE_ARMS, frozenset({"tinykg_jev"}))
+        self.assertEqual(ARM_TO_RUNTIME["tinykg_jev_recall"], "tinykg")
+        self.assertEqual(SYSTEM_ONE_ARMS, frozenset({"tinykg_jev", "tinykg_jev_recall"}))
+
+    def test_attribution_arm_narrows_the_child_advisor_to_the_recall_gate(self):
+        full = _system_one_environment("tinykg_jev", "http://127.0.0.1:9", "m")
+        narrowed = _system_one_environment("tinykg_jev_recall", "http://127.0.0.1:9", "m")
+        self.assertNotIn("METACODES_JEV_DECISIONS", full)
+        self.assertEqual(narrowed["METACODES_JEV_DECISIONS"], "scoped_recall")
+        self.assertEqual(
+            {key: value for key, value in narrowed.items() if key != "METACODES_JEV_DECISIONS"}, full
+        )
+        self.assertEqual(full["METACODES_JEV_MODE"], "advisory")
 
     def test_scripted_judge_answers_every_boolean_and_logs_hashes(self):
         with tempfile.TemporaryDirectory() as directory:

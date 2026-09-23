@@ -1466,7 +1466,7 @@ def _production_runtime_arm(arm_id: str) -> str:
         return "codex_style"
     if arm_id in {"markdown_memory", "claude_style"}:
         return "claude_style"
-    if arm_id in {"tinykg_lexical", "tinykg", "tinykg_jev"}:
+    if arm_id in {"tinykg_lexical", "tinykg", "tinykg_jev", "tinykg_jev_recall"}:
         return "tinykg"
     _fail("production runtime arm", f"unsupported arm {arm_id!r}")
     raise AssertionError("unreachable")
@@ -2902,7 +2902,7 @@ def validate_runtime_receipt(
             f"{rollout_where}.metacodes_binary_sha256",
         ) != metacodes_sha256:
             _fail(f"{rollout_where}.metacodes_binary_sha256", "binary identity drift")
-        tinykg_enabled = rollout["arm"] in {"tinykg", "tinykg_lexical", "tinykg_jev"}
+        tinykg_enabled = rollout["arm"] in {"tinykg", "tinykg_lexical", "tinykg_jev", "tinykg_jev_recall"}
         observed_tinykg = rollout["tinykg_binary_sha256"]
         if tinykg_enabled:
             if _hash(observed_tinykg, f"{rollout_where}.tinykg_binary_sha256") != tinykg_sha256:

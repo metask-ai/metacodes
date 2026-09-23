@@ -151,8 +151,12 @@ ARM_TO_RUNTIME = {
     # The TinyKG treatment plus the System-One (Jev) advisor in advisory mode,
     # reached only through the runner-owned loopback judge proxy.
     "tinykg_jev": "tinykg",
+    # Attribution arm: the same advisor on the scoped recall gate alone.
+    "tinykg_jev_recall": "tinykg",
 }
-SYSTEM_ONE_ARMS = frozenset({"tinykg_jev"})
+SYSTEM_ONE_ARMS = frozenset({"tinykg_jev", "tinykg_jev_recall"})
+# METACODES_JEV_DECISIONS for arms that advise a subset of the surfaces.
+SYSTEM_ONE_ARM_DECISIONS = {"tinykg_jev_recall": "scoped_recall"}
 SYSTEM_ONE_LOG_NAME = "system-one-judge.jsonl"
 SYSTEM_ONE_SCRIPTED_MODEL = "scripted-system-one"
 SYSTEM_ONE_TIMEOUT_MS = "10000"
@@ -1190,6 +1194,21 @@ class _ScriptedPlanner:
             self.memory_verified = True
             self.stage = "final"
         return _text_sse("runtime-smoke", request_id)
+
+
+def _system_one_environment(arm_id: str, origin: str, model: str) -> Dict[str, str]:
+    """The METACODES_JEV_* variables a System-One arm's child receives."""
+
+    env = {
+        "METACODES_JEV_URL": origin,
+        "METACODES_JEV_MODE": "advisory",
+        "METACODES_JEV_TIMEOUT_MS": SYSTEM_ONE_TIMEOUT_MS,
+        "METACODES_JEV_MODEL": model,
+    }
+    decisions = SYSTEM_ONE_ARM_DECISIONS.get(arm_id)
+    if decisions is not None:
+        env["METACODES_JEV_DECISIONS"] = decisions
+    return env
 
 
 class SystemOneJudgeProxy:
@@ -3512,11 +3531,12 @@ def run_memory_agent_schedule(
             system_one_proxy = SystemOneJudgeProxy(
                 production.system_one_upstream if production is not None else None
             ).__enter__()
-            env["METACODES_JEV_URL"] = system_one_proxy.origin
-            env["METACODES_JEV_MODE"] = "advisory"
-            env["METACODES_JEV_TIMEOUT_MS"] = SYSTEM_ONE_TIMEOUT_MS
-            env["METACODES_JEV_MODEL"] = (
-                production.system_one_model if production is not None else SYSTEM_ONE_SCRIPTED_MODEL
+            env.update(
+                _system_one_environment(
+                    arm_id,
+                    system_one_proxy.origin,
+                    production.system_one_model if production is not None else SYSTEM_ONE_SCRIPTED_MODEL,
+                )
             )
         common_args = [
             str(metacodes),

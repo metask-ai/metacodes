@@ -97,13 +97,22 @@ pub fn baselineSelection(scores: []const f64, floor: f64) Selection {
 }
 
 /// The judged policy. BM25 still decides whether any memory is injected (its
-/// floor is the answer-absent signal); judge and BM25 together decide which.
-/// Candidates are ranked by `percent / 100 + BM25_FUSION_WEIGHT * score / top`
+/// floor is the answer-absent signal) and which memories are plausible at all
+/// (the baseline's own band, score >= top * REL_RATIO, now over the whole
+/// pool); judge and BM25 together decide which plausible ones are injected.
+/// They are ranked by `percent / 100 + BM25_FUSION_WEIGHT * score / top`
 /// (BM25 rank breaks ties); the first TOP_K that clear
 /// RELEVANCE_THRESHOLD_PERCENT are injected, or the first one alone when none
-/// does. On the pinned LongMemEval-S dev split this recovered gold evidence
-/// more often than the floor alone (turn-level memories 0.685 vs 0.620,
-/// whole sessions 0.790 vs 0.725) with 1.4-1.8 instead of 3.0 lines injected.
+/// does.
+///
+/// The band is what keeps the judge from overruling a clear lexical winner.
+/// In the paid procedural-transfer pilot the judge rated a sibling task's
+/// protocol (BM25 top) below a concrete diff of that sibling (1/9 of its
+/// score) in every offline pool, the unbanded policy injected the diff, and
+/// the model replayed the sibling's edit. On LongMemEval-S, where pools are
+/// flat, the band changed no hit: turn-level holdout 0.703 vs 0.633 for the
+/// floor alone, whole-session holdout 0.740 vs 0.717, with 1.4-1.7 instead of
+/// 3.0 lines injected.
 pub fn judgedSelection(percents: []const u8, scores: []const f64, baseline: Selection) Selection {
     std.debug.assert(percents.len == scores.len and percents.len <= JUDGED_CANDIDATES);
     var selection: Selection = .{};
@@ -112,14 +121,19 @@ pub fn judgedSelection(percents: []const u8, scores: []const f64, baseline: Sele
     for (scores) |score| top = @max(top, score);
     var fused: [JUDGED_CANDIDATES]f64 = undefined;
     var order: [JUDGED_CANDIDATES]u8 = undefined;
+    var plausible: usize = 0;
     for (percents, scores, 0..) |percent, score, index| {
+        // Outside the BM25 band: never injected, whatever the judge says.
+        if (score < top * REL_RATIO) continue;
         const bm25 = if (top > 0) BM25_FUSION_WEIGHT * score / top else 0;
         fused[index] = @as(f64, @floatFromInt(percent)) / 100.0 + bm25;
-        order[index] = @intCast(index);
+        order[plausible] = @intCast(index);
+        plausible += 1;
     }
+    std.debug.assert(plausible > 0); // the top-scoring candidate is always in its own band
     // Stable, so equal fused scores keep BM25 rank order.
-    std.sort.insertion(u8, order[0..percents.len], @as([]const f64, fused[0..percents.len]), fusedDescending);
-    for (order[0..percents.len]) |index| {
+    std.sort.insertion(u8, order[0..plausible], @as([]const f64, &fused), fusedDescending);
+    for (order[0..plausible]) |index| {
         if (selection.len == TOP_K) break;
         if (percents[index] >= RELEVANCE_THRESHOLD_PERCENT) selection.push(index);
     }
@@ -1056,6 +1070,17 @@ test "baselineSelection keeps the BM25 floor and relative gate over the first TO
     try std.testing.expectEqual(@as(usize, 0), baselineSelection(&.{}, 3.0).len);
 }
 
+test "judgedSelection never lets the judge pick outside the BM25 band" {
+    const passed = baselineSelection(&.{ 9.0, 1.0, 1.0 }, 3.0);
+    // The procedural-transfer failure: a sibling's diff the judge loves but
+    // BM25 scores at 1/9 of the protocol memory stays out.
+    const banded = judgedSelection(&.{ 27, 68, 19, 32, 19 }, &.{ 9.0, 1.0, 0.6, 0.6, 0.5 }, passed);
+    try std.testing.expectEqualSlices(u8, &.{0}, banded.slice());
+    // Inside the band the judge still reorders and filters.
+    const inside = judgedSelection(&.{ 20, 90, 95 }, &.{ 9.0, 5.0, 4.0 }, passed);
+    try std.testing.expectEqualSlices(u8, &.{1}, inside.slice());
+}
+
 test "judgedSelection ranks by judge and BM25 together and keeps candidates that clear the floor" {
     const passed = baselineSelection(&.{ 9.0, 8.0, 1.0 }, 3.0);
     const flat = [_]f64{1.0} ** 8;
@@ -1064,8 +1089,8 @@ test "judgedSelection ranks by judge and BM25 together and keeps candidates that
     // Equal fused scores keep BM25 rank order; a candidate below the floor is dropped.
     const tie = judgedSelection(&.{ 70, 70, 10 }, &.{ 5.0, 5.0, 5.0 }, passed);
     try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, tie.slice());
-    // BM25 separates candidates the judge scores alike: 0.60 + 0.50 beats 0.65 + 0.05.
-    const fused = judgedSelection(&.{ 60, 65 }, &.{ 10.0, 1.0 }, passed);
+    // BM25 separates candidates the judge scores alike: 0.60 + 0.50 beats 0.65 + 0.30.
+    const fused = judgedSelection(&.{ 60, 65 }, &.{ 10.0, 6.0 }, passed);
     try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, fused.slice());
     // Nothing clears the floor: the single best fused candidate remains.
     const weak = judgedSelection(&.{ 9, 30, 0 }, &.{ 9.0, 8.0, 1.0 }, passed);
@@ -1079,7 +1104,7 @@ test "judgedSelection ranks by judge and BM25 together and keeps candidates that
 test "selectionDelta counts candidates only one policy injects" {
     const baseline = baselineSelection(&.{ 7.0, 6.0, 1.0 }, 3.0); // {0,1}
     try std.testing.expectEqual(@as(u32, 0), selectionDelta(baseline, baseline));
-    const judged = judgedSelection(&.{ 90, 10, 10, 10, 85 }, &.{ 7.0, 6.0, 1.0, 1.0, 1.0 }, baseline); // {0,4}
+    const judged = judgedSelection(&.{ 90, 10, 10, 10, 85 }, &.{ 7.0, 6.0, 1.0, 1.0, 5.0 }, baseline); // {0,4}
     try std.testing.expectEqual(@as(u32, 2), selectionDelta(baseline, judged));
     try std.testing.expectEqual(@as(u32, 2), selectionDelta(baseline, .{}));
 }

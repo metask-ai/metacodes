@@ -290,7 +290,7 @@
     "evals/experiments/tinykg-lean-factorial-block-v1-cases.json": "9a563ae27db1c5840339b2bda47c3f535dda06cc05a95be21a32779bc2ed2542",
     "evals/memory/MEMORY_MATURATION_V1.md": "3621d69f26c6e791033a6ba87887942bb620e92ad6103d5b6f2b6c23d7fff582",
     "scripts/eval/memory_agent_runtime_smoke.py": "230dc401501bdcccd2ef6d80a16e3af2cb4b019391edc6d503c6936b83de0673",
-    "scripts/eval/memory_agent_runtime_pilot.py": "166199d96bf209ad7927256a607c0a9a317e94f545293766a5c6c8e0a964b516",
+    "scripts/eval/memory_agent_runtime_pilot.py": "4c52eeb01dce1d0e8adccbbc844cb6c6b120441db0c2d0b7aeb72eeff6caa97b",
     "scripts/eval/project_harness_experiment.py": "31bea51bdf1a62932318464032bd929b235e52655eaed155b51ae5da0f103ddf",
     "scripts/eval/project_harness_rule_impact_prospective.py": "d5397e2bb23d4a730ef12ebfba4cd315da69d86d17decad534cf81299872e06b",
     "scripts/eval/run_project_rule_evolution_mac_pilot.py": "1a89e7c6116f4f43a016e7f1a93a820adf1b4a07514582c1366574ea7fa4019a",
