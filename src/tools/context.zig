@@ -365,6 +365,13 @@ pub const ToolContext = struct {
     /// 计算/提交真实命中增益。
     /// legacy query-only 路径不读取它。由 agent_loop.run 创建，绝不进 TinyKG store。
     kg_lexical_ledger: ?*@import("../kg/lexical_query_plan.zig").Ledger = null,
+    /// System-One advisor (`src/jev/advisor.zig`) for memory-plane judgments;
+    /// null = baseline only. Evidence, never authority: tools may annotate
+    /// their own results with it but never admit, deny or skip work on it.
+    jev: ?*@import("../jev/advisor.zig").Advisor = null,
+    /// The run's user request, for System-One judgments that need more than a
+    /// tool argument (KgRecall evidence). Empty when unknown or no advisor.
+    jev_request: []const u8 = "",
     /// KG per-project 指针目录(`{home}/.metacodes/projects/<git根hash>`)。plan 落图写 kg_root
     /// 到此。空串 = 未配置。设计 KG_DESIGN v3-final §3。
     kg_projects_dir: []const u8 = "",

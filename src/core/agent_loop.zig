@@ -376,6 +376,9 @@ pub const Options = struct {
     /// 模型 Task 清单（TaskCreate/Get/List/Update/Stop 共享）
     tasks: ?*@import("task_store.zig").TaskStore = null,
     kg: ?*@import("../kg/client.zig").KgClient = null,
+    /// System-One advisor for memory-plane judgments (enumeration intent here,
+    /// memory relations in KgRemember via ToolContext). null = baseline only.
+    jev: ?*@import("../jev/advisor.zig").Advisor = null,
     kg_projects_dir: []const u8 = "",
     /// 本 agent loop 的对外身份(KG claim 租约)。null = 沿用 session(主 loop:
     /// App.session_id 跨进程唯一且跨 turn 稳定)。subagent spawn 时必须显式 gen——
@@ -1074,6 +1077,15 @@ pub fn run(
             kg_retrieval_protocol.queryRequiresEnumerationCoverage(synthetic)
         else
             false);
+    // System-One enumeration sensor: consulted lazily, at most once per run,
+    // only after a governed recall committed while no deterministic hint armed
+    // the coverage gate. In advisory mode a positive answer arms the reminders
+    // only; the rejecting repair below stays bound to the deterministic hints,
+    // so a judge false positive can cost one reminder but never end a run.
+    const kg_enumeration_text: ?[]u8 = if (opts.jev != null) try allocator.dupe(u8, latestUserText(conversation)) else null;
+    defer if (kg_enumeration_text) |text| allocator.free(text);
+    var kg_enumeration_judged = false;
+    var kg_enumeration_soft_hint = false;
     var kg_coverage_reminder_emitted = false;
     var kg_context_reminder_emitted = false;
     var kg_coverage_repair_attempts: u8 = 0;
@@ -1606,6 +1618,8 @@ pub fn run(
             .tasks = opts.tasks,
             .kg = opts.kg,
             .kg_lexical_ledger = &kg_lexical_ledger,
+            .jev = opts.jev,
+            .jev_request = kg_enumeration_text orelse "",
             .kg_projects_dir = opts.kg_projects_dir,
             .memdir_abs = opts.memdir_abs,
             .api_client = opts.api_client,
@@ -2890,6 +2904,8 @@ pub fn run(
             .tasks = opts.tasks,
             .kg = opts.kg,
             .kg_lexical_ledger = &kg_lexical_ledger,
+            .jev = opts.jev,
+            .jev_request = kg_enumeration_text orelse "",
             .kg_projects_dir = opts.kg_projects_dir,
             .memdir_abs = opts.memdir_abs,
             .api_client = opts.api_client,
@@ -3345,10 +3361,19 @@ pub fn run(
             );
             try result_blocks.append(allocator, .{ .text = caution });
         }
+        if (opts.jev) |advisor| {
+            if (!kg_enumeration_judged and !kg_enumeration_query_hint and
+                kgEnumerationPending(&kg_lexical_ledger, gated_tool_defs, false) == .none and
+                kgEnumerationPending(&kg_lexical_ledger, gated_tool_defs, true) == .batch)
+            {
+                kg_enumeration_judged = true;
+                kg_enumeration_soft_hint = try judgeEnumerationIntent(advisor, allocator, opts, kg_enumeration_text.?);
+            }
+        }
         const kg_pending = kgEnumerationPending(
             &kg_lexical_ledger,
             gated_tool_defs,
-            kg_enumeration_query_hint,
+            kg_enumeration_query_hint or kg_enumeration_soft_hint,
         );
         if (kg_pending == .batch and !kg_coverage_reminder_emitted) {
             const reminder = try allocator.dupe(u8, kg_retrieval_protocol.ENUMERATION_COVERAGE_REMINDER);
@@ -3421,6 +3446,33 @@ pub fn run(
 }
 
 const KgEnumerationPending = enum { none, batch, context };
+
+/// Ask the System-One judge whether the run's user request needs enumeration
+/// coverage, journal the consultation, and return whether it armed the soft
+/// hint (advisory mode and a positive answer). Every failure arms nothing.
+fn judgeEnumerationIntent(
+    advisor: *@import("../jev/advisor.zig").Advisor,
+    allocator: std.mem.Allocator,
+    opts: Options,
+    text: []const u8,
+) error{OutOfMemory}!bool {
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return false;
+    const judgment = advisor.judgeEnumerationIntent(allocator, opts.abort, text) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // The loop's own abort check ends the run; a skipped judgment arms nothing.
+        error.Aborted => return false,
+    };
+    const threshold = @import("../kg/retrieval_protocol.zig").ENUMERATION_JUDGE_THRESHOLD_PERCENT;
+    const positive = judgment.answered() and judgment.percents[0] >= threshold;
+    const armed = positive and advisor.actuates();
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(judgment.audit.event(armed, @intCast(judgment.count), @intFromBool(positive), @intFromBool(positive)));
+    }
+    log.info("agent", "enumeration judge mode={s} outcome={s} percent={d} armed={}", .{
+        @tagName(judgment.audit.mode), @tagName(judgment.audit.outcome), judgment.percents[0], armed,
+    });
+    return armed;
+}
 
 fn kgEnumerationPending(
     ledger: *@import("../kg/lexical_query_plan.zig").Ledger,

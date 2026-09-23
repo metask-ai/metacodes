@@ -19,18 +19,148 @@ const conv_mod = @import("../core/conversation.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 const retrieval_protocol = @import("retrieval_protocol.zig");
+const jev_advisor = @import("../jev/advisor.zig");
+const observation = @import("../tools/observation.zig");
 
-const MIN_QUERY_LEN = 16; // 琐碎接话轮门(下界)
-const MAX_QUERY_LEN = 400; // BM25 query 上界(避免粘贴长文变噪声 query)
+pub const MIN_QUERY_LEN = 16; // 琐碎接话轮门(下界)
+pub const MAX_QUERY_LEN = 400; // BM25 query 上界(避免粘贴长文变噪声 query)
 // 自动命中既是上下文，也是 lexical→semantic 的桥。100 bytes 会把中文记忆压到约 33 字，
 // canonical alias/代码符号常在句尾被截掉，迫使模型重新宽搜。3 条×320B 仍是有界小预算。
 const MAX_HIT_TEXT_BYTES = 320;
-const TOP_K = 3;
+pub const TOP_K = 3;
 const REL_RATIO: f64 = 0.5; // 相对门:只留 ≥ top×0.5 的命中
 // 绝对地板(BM25;启发式,可 METACODES_RECALL_FLOOR 校准)。实测数据定初值:相关 query top≈7,
 // 无关 query top≈2.7 → 3.0 分界(auto-inject 精度优先,宁漏勿噪——PM:注入无关记忆=负价值)。
 // BM25 分跨 query 不可比,固定地板固有不精确;仪器日志(injected/top_score)供持续校准。
-const DEFAULT_ABS_FLOOR: f64 = 3.0;
+pub const DEFAULT_ABS_FLOOR: f64 = 3.0;
+
+// System-One relevance gate (Jev-Mem read path). With an advisor installed the
+// host asks TinyKG for `JUDGED_CANDIDATES` rank-ordered hits instead of TOP_K
+// and has the judge score each one. The first TOP_K of that pool are exactly
+// the hits the baseline would have seen, so the BM25 floor stays computable
+// alongside the judged policy (shadow compares both on identical input).
+const JUDGED_CANDIDATES = jev_advisor.MAX_RECALL_CANDIDATES;
+/// Floor of the judged policy below. A calibrated probability means the same
+/// thing across queries, which is the property the BM25 floor above admits it
+/// lacks. On the pinned LongMemEval-S dev split 40 kept the gold-evidence hit
+/// rate of floors 20-30 while injecting the fewest non-evidence lines.
+pub const RELEVANCE_THRESHOLD_PERCENT: u8 = 40;
+/// Weight of the pool-normalized BM25 score in the judged rank. The judge
+/// reads a JUDGE_WINDOW_BYTES window of each memory, BM25 the whole of it: on
+/// whole-session memories (median 13.7 KB) the judge alone lost gold evidence
+/// BM25 still ranked high (hit 0.700 vs 0.790 fused), while on turn-sized
+/// memories fusion cost less (0.730 vs 0.685).
+pub const BM25_FUSION_WEIGHT: f64 = 0.5;
+
+pub const Options = struct {
+    /// System-One judge; null keeps the BM25 floor path byte for byte.
+    advisor: ?*jev_advisor.Advisor = null,
+};
+
+/// Indices into the rank-ordered hit list, in injection order.
+pub const Selection = struct {
+    indices: [TOP_K]u8 = undefined,
+    len: usize = 0,
+
+    pub fn slice(self: *const Selection) []const u8 {
+        return self.indices[0..self.len];
+    }
+
+    fn contains(self: *const Selection, index: usize) bool {
+        for (self.slice()) |selected| {
+            if (selected == index) return true;
+        }
+        return false;
+    }
+
+    fn push(self: *Selection, index: usize) void {
+        self.indices[self.len] = @intCast(index);
+        self.len += 1;
+    }
+};
+
+/// The deterministic baseline over the first TOP_K rank-ordered scores: no
+/// injection when the best score is under the absolute floor, otherwise every
+/// hit within REL_RATIO of the best.
+pub fn baselineSelection(scores: []const f64, floor: f64) Selection {
+    var selection: Selection = .{};
+    const n = @min(scores.len, TOP_K);
+    if (n == 0) return selection;
+    var top: f64 = 0;
+    for (scores[0..n]) |score| top = @max(top, score);
+    if (top < floor) return selection;
+    const keep_min = top * REL_RATIO;
+    for (scores[0..n], 0..) |score, index| {
+        if (score >= keep_min) selection.push(index);
+    }
+    return selection;
+}
+
+/// The judged policy. BM25 still decides whether any memory is injected (its
+/// floor is the answer-absent signal); judge and BM25 together decide which.
+/// Candidates are ranked by `percent / 100 + BM25_FUSION_WEIGHT * score / top`
+/// (BM25 rank breaks ties); the first TOP_K that clear
+/// RELEVANCE_THRESHOLD_PERCENT are injected, or the first one alone when none
+/// does. On the pinned LongMemEval-S dev split this recovered gold evidence
+/// more often than the floor alone (turn-level memories 0.685 vs 0.620,
+/// whole sessions 0.790 vs 0.725) with 1.4-1.8 instead of 3.0 lines injected.
+pub fn judgedSelection(percents: []const u8, scores: []const f64, baseline: Selection) Selection {
+    std.debug.assert(percents.len == scores.len and percents.len <= JUDGED_CANDIDATES);
+    var selection: Selection = .{};
+    if (baseline.len == 0 or percents.len == 0) return selection;
+    var top: f64 = 0;
+    for (scores) |score| top = @max(top, score);
+    var fused: [JUDGED_CANDIDATES]f64 = undefined;
+    var order: [JUDGED_CANDIDATES]u8 = undefined;
+    for (percents, scores, 0..) |percent, score, index| {
+        const bm25 = if (top > 0) BM25_FUSION_WEIGHT * score / top else 0;
+        fused[index] = @as(f64, @floatFromInt(percent)) / 100.0 + bm25;
+        order[index] = @intCast(index);
+    }
+    // Stable, so equal fused scores keep BM25 rank order.
+    std.sort.insertion(u8, order[0..percents.len], @as([]const f64, fused[0..percents.len]), fusedDescending);
+    for (order[0..percents.len]) |index| {
+        if (selection.len == TOP_K) break;
+        if (percents[index] >= RELEVANCE_THRESHOLD_PERCENT) selection.push(index);
+    }
+    if (selection.len == 0) selection.push(order[0]);
+    return selection;
+}
+
+fn fusedDescending(fused: []const f64, a: u8, b: u8) bool {
+    return fused[a] > fused[b];
+}
+
+/// Candidates one policy injects and the other does not.
+pub fn selectionDelta(a: Selection, b: Selection) u32 {
+    var delta: u32 = 0;
+    for (a.slice()) |index| {
+        if (!b.contains(index)) delta += 1;
+    }
+    for (b.slice()) |index| {
+        if (!a.contains(index)) delta += 1;
+    }
+    return delta;
+}
+
+/// What the System-One judge said about this recall and what the host did.
+/// Node ids and percents are host evidence for replayable evaluation; they
+/// never enter the provider request.
+pub const SystemOneRecord = struct {
+    audit: jev_advisor.Audit,
+    actuated: bool = false,
+    judged: u32 = 0,
+    positive: u32 = 0,
+    changed: u32 = 0,
+    node_ids: [JUDGED_CANDIDATES]u64 = [_]u64{0} ** JUDGED_CANDIDATES,
+    percents: [JUDGED_CANDIDATES]u8 = [_]u8{0} ** JUDGED_CANDIDATES,
+    baseline: Selection = .{},
+    judged_selection: Selection = .{},
+
+    pub fn event(self: *const SystemOneRecord) observation.Event {
+        return self.audit.event(self.actuated, self.judged, self.positive, self.changed);
+    }
+};
 
 pub const RECEIPT_SCHEMA_VERSION = "metacodes-scoped-recall-v1";
 
@@ -51,6 +181,8 @@ pub const Receipt = struct {
 pub const BuildResult = struct {
     text: ?[]u8,
     receipt: Receipt,
+    /// Present whenever an advisor was consulted (shadow or advisory).
+    system_one: ?SystemOneRecord = null,
 
     pub fn deinit(self: *BuildResult, allocator: std.mem.Allocator) void {
         if (self.text) |text| allocator.free(text);
@@ -65,8 +197,9 @@ pub fn build(
     kg: *client_mod.KgClient,
     conversation: *const conv_mod.Conversation,
     abort: *const AbortSignal,
+    options: Options,
 ) !?[]u8 {
-    const result = try buildWithReceipt(allocator, kg, conversation, abort);
+    const result = try buildWithReceipt(allocator, kg, conversation, abort, options);
     return result.text;
 }
 
@@ -683,8 +816,9 @@ pub fn buildWithReceipt(
     kg: *client_mod.KgClient,
     conversation: *const conv_mod.Conversation,
     abort: *const AbortSignal,
+    options: Options,
 ) !BuildResult {
-    var scored = try buildScoredReceipt(allocator, kg, conversation, abort);
+    var scored = try buildScoredReceipt(allocator, kg, conversation, abort, options);
     if (disabled() or !kg.ready) return scored;
     const note = sameTaskOutcomeNote(allocator, kg) orelse return scored;
     defer allocator.free(note);
@@ -711,7 +845,7 @@ pub fn buildWithReceipt(
     log.warn("kg", "deterministic outcome note injected bytes={d} sha256={s}", .{
         note.len, note_sha[0..16],
     });
-    return .{ .text = text, .receipt = receipt };
+    return .{ .text = text, .receipt = receipt, .system_one = scored.system_one };
 }
 
 fn buildScoredReceipt(
@@ -719,6 +853,7 @@ fn buildScoredReceipt(
     kg: *client_mod.KgClient,
     conversation: *const conv_mod.Conversation,
     abort: *const AbortSignal,
+    options: Options,
 ) !BuildResult {
     if (disabled()) return noInjection("disabled"); // escape hatch(解耦 KG)
     if (!kg.ready) return noInjection("kg_not_ready");
@@ -728,7 +863,8 @@ fn buildScoredReceipt(
     const query_sha256 = sha256Hex(query);
 
     kg.setAbort(abort); // ESC 可中断
-    const hits = kg.recall(query, TOP_K, false) catch return .{
+    const pool: usize = if (options.advisor != null) JUDGED_CANDIDATES else TOP_K;
+    const hits = kg.recall(query, pool, false) catch return .{
         .text = null,
         .receipt = .{ .status = "search_error", .query_sha256 = query_sha256 },
     };
@@ -740,36 +876,75 @@ fn buildScoredReceipt(
         .text = null,
         .receipt = .{ .status = "no_hits", .query_sha256 = query_sha256 },
     };
+    std.debug.assert(hits.len <= pool);
+    // The receipt keeps its v1 meaning (hits the BM25 gate saw), so a shadow
+    // run's receipt is byte-identical to a run without an advisor.
+    const gate_visible = @min(hits.len, TOP_K);
 
     // 相关性门:top 分做绝对地板(答案缺席→0 条)+ 相对衰减(留 ≥top×REL)。
-    var top: f64 = 0;
-    for (hits) |h| {
-        if (h.score > top) top = h.score;
-    }
+    var scores: [JUDGED_CANDIDATES]f64 = undefined;
+    for (hits, 0..) |h, index| scores[index] = h.score;
+    const top = scores[0];
     const floor = absFloor();
-    if (top < floor) {
+    const baseline = baselineSelection(scores[0..hits.len], floor);
+
+    var selection = baseline;
+    var system_one: ?SystemOneRecord = null;
+    // Below the floor the judged policy injects nothing either, so the judge
+    // is not consulted there: it would only add latency to every turn whose
+    // memory is irrelevant.
+    const consulted = if (baseline.len > 0) options.advisor else null;
+    if (consulted) |advisor| {
+        var candidates: [JUDGED_CANDIDATES]jev_advisor.RecallCandidate = undefined;
+        for (hits, 0..) |h, index| candidates[index] = .{
+            .type_label = hitType(h),
+            .text = if (h.focus_text.len > 0) h.focus_text else h.text,
+        };
+        const judgment = try advisor.judgeRecallRelevance(allocator, abort, query, candidates[0..hits.len]);
+        var record: SystemOneRecord = .{ .audit = judgment.audit, .baseline = baseline };
+        for (hits, 0..) |h, index| record.node_ids[index] = h.node_id;
+        if (judgment.answered()) {
+            const judged = judgedSelection(judgment.percents[0..judgment.count], scores[0..judgment.count], baseline);
+            @memcpy(record.percents[0..judgment.count], judgment.percents[0..judgment.count]);
+            record.judged = @intCast(judgment.count);
+            record.positive = judgment.countAtLeast(RELEVANCE_THRESHOLD_PERCENT);
+            record.changed = selectionDelta(baseline, judged);
+            record.judged_selection = judged;
+            if (advisor.actuates()) {
+                selection = judged;
+                record.actuated = record.changed > 0;
+            }
+        }
+        log.info("kg", "scoped_recall system_one mode={s} outcome={s} judged={d} relevant={d} changed={d} actuated={}", .{
+            @tagName(record.audit.mode), @tagName(record.audit.outcome), record.judged, record.positive, record.changed, record.actuated,
+        });
+        system_one = record;
+    }
+
+    // The judged policy injects only when the floor passed, so an empty
+    // selection always means the BM25 floor judged the answer absent.
+    if (selection.len == 0) {
         log.info("kg", "scoped_recall injected=0 top_score={d:.2} (below floor {d:.2})", .{ top, floor });
         return .{
             .text = null,
             .receipt = .{
                 .status = "below_floor",
                 .query_sha256 = query_sha256,
-                .result_count = hits.len,
+                .result_count = gate_visible,
             },
+            .system_one = system_one,
         }; // 最相关的都弱 → 判为答案缺席,不注入噪声
     }
-    const keep_min = top * REL_RATIO;
 
     var out: std.ArrayList(u8) = .empty;
-    var injected: usize = 0;
     // 无 errdefer(本函数返回 !?[]u8;分配失败走 error 路径,显式 deinit 防泄漏——Linus 抓的死 errdefer)。
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "<system-reminder>\n# 相关持久记忆(按你的请求自动召回,可能不全)\n");
     try out.appendSlice(allocator, retrieval_protocol.AUTO_RECALL_NOTE);
     try out.appendSlice(allocator, "\n");
-    for (hits) |h| {
-        if (h.score < keep_min) continue; // 相对门:丢明显弱于最佳的
-        const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
+    for (selection.slice()) |index| {
+        const h = hits[index];
+        const type_str = hitType(h);
         // 带来源的 hit(记忆 markdown)标注文件名:模型更新该文件而非另存(PM P0-2)。
         const line = if (h.source_label.len > 0)
             try std.fmt.allocPrint(allocator, "- [node_id={d} {s}:{s}] {s}\n", .{ h.node_id, type_str, h.source_label, firstLine(h.text) })
@@ -777,25 +952,29 @@ fn buildScoredReceipt(
             try std.fmt.allocPrint(allocator, "- [node_id={d} {s}] {s}\n", .{ h.node_id, type_str, firstLine(h.text) });
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
-        injected += 1;
     }
     try out.appendSlice(allocator, retrieval_protocol.AUTO_RECALL_NEXT_ACTION);
     try out.appendSlice(allocator, "\n");
     try out.appendSlice(allocator, "</system-reminder>");
 
     const text = try out.toOwnedSlice(allocator);
-    log.info("kg", "scoped_recall injected={d} top_score={d:.2} query_len={d}", .{ injected, top, query.len });
+    log.info("kg", "scoped_recall injected={d} top_score={d:.2} query_len={d}", .{ selection.len, top, query.len });
     return .{
         .text = text,
         .receipt = .{
             .status = "injected",
             .query_sha256 = query_sha256,
-            .result_count = hits.len,
-            .injected_count = injected,
+            .result_count = gate_visible,
+            .injected_count = selection.len,
             .injected_bytes = text.len,
             .injection_sha256 = sha256Hex(text),
         },
+        .system_one = system_one,
     };
+}
+
+fn hitType(hit: client_mod.RecallHit) []const u8 {
+    return if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
 }
 
 fn noInjection(status: []const u8) BuildResult {
@@ -860,5 +1039,42 @@ test "build:kg 未就绪 → null(不阻塞)" {
     var kg = try client_mod.KgClient.init(a, .{ .home = "/tmp", .domain = "d", .env_bin = "", .env_store = "" });
     defer kg.deinit();
     var ab = AbortSignal.init();
-    try std.testing.expect((try build(a, &kg, &conv, &ab)) == null);
+    try std.testing.expect((try build(a, &kg, &conv, &ab, .{})) == null);
+}
+
+test "baselineSelection keeps the BM25 floor and relative gate over the first TOP_K only" {
+    // Below the floor: nothing, even if a later pool member scores high.
+    try std.testing.expectEqual(@as(usize, 0), baselineSelection(&.{ 2.9, 2.0, 1.0, 9.0 }, 3.0).len);
+    // Relative gate: 7.0 keeps >= 3.5.
+    const kept = baselineSelection(&.{ 7.0, 4.0, 3.0, 6.9, 6.8 }, 3.0);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, kept.slice());
+    try std.testing.expectEqual(@as(usize, 0), baselineSelection(&.{}, 3.0).len);
+}
+
+test "judgedSelection ranks by judge and BM25 together and keeps candidates that clear the floor" {
+    const passed = baselineSelection(&.{ 9.0, 8.0, 1.0 }, 3.0);
+    const flat = [_]f64{1.0} ** 8;
+    const selected = judgedSelection(&.{ 61, 12, 95, 61, 80, 3, 99, 40 }, &flat, passed);
+    try std.testing.expectEqualSlices(u8, &.{ 6, 2, 4 }, selected.slice());
+    // Equal fused scores keep BM25 rank order; a candidate below the floor is dropped.
+    const tie = judgedSelection(&.{ 70, 70, 10 }, &.{ 5.0, 5.0, 5.0 }, passed);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, tie.slice());
+    // BM25 separates candidates the judge scores alike: 0.60 + 0.50 beats 0.65 + 0.05.
+    const fused = judgedSelection(&.{ 60, 65 }, &.{ 10.0, 1.0 }, passed);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, fused.slice());
+    // Nothing clears the floor: the single best fused candidate remains.
+    const weak = judgedSelection(&.{ 9, 30, 0 }, &.{ 9.0, 8.0, 1.0 }, passed);
+    try std.testing.expectEqualSlices(u8, &.{1}, weak.slice());
+    const bm25_top = judgedSelection(&.{ 10, 20, 0 }, &.{ 9.0, 1.0, 1.0 }, passed);
+    try std.testing.expectEqualSlices(u8, &.{0}, bm25_top.slice());
+    // The BM25 floor still decides that the answer is absent.
+    try std.testing.expectEqual(@as(usize, 0), judgedSelection(&.{ 99, 99 }, &.{ 1.0, 1.0 }, .{}).len);
+}
+
+test "selectionDelta counts candidates only one policy injects" {
+    const baseline = baselineSelection(&.{ 7.0, 6.0, 1.0 }, 3.0); // {0,1}
+    try std.testing.expectEqual(@as(u32, 0), selectionDelta(baseline, baseline));
+    const judged = judgedSelection(&.{ 90, 10, 10, 10, 85 }, &.{ 7.0, 6.0, 1.0, 1.0, 1.0 }, baseline); // {0,4}
+    try std.testing.expectEqual(@as(u32, 2), selectionDelta(baseline, judged));
+    try std.testing.expectEqual(@as(u32, 2), selectionDelta(baseline, .{}));
 }

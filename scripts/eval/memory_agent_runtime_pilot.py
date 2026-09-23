@@ -129,6 +129,8 @@ def _config(args: argparse.Namespace, api_key: str, *, authorized: bool) -> Prod
         max_output_tokens=args.max_output_tokens,
         ripgrep_binary=args.ripgrep_binary.expanduser().resolve(),
         ripgrep_binary_sha256=file_sha256(args.ripgrep_binary.expanduser().resolve()),
+        system_one_upstream=args.system_one_upstream,
+        system_one_model=args.system_one_model,
     )
 
 
@@ -235,6 +237,18 @@ def _public_plan(
         "tinykg_preflight": tinykg_preflight,
         "source_sha256": file_sha256(args.source.resolve()),
         "credential_loaded": False,
+        # The judge origin is an operator endpoint; bind it without exposing it.
+        "system_one": (
+            {
+                "upstream_sha256": hashlib.sha256(args.system_one_upstream.encode("utf-8")).hexdigest(),
+                "model": args.system_one_model,
+                "arms": sorted(
+                    {row["arm"] for row in manifest["schedule"]} & {"tinykg_jev"}
+                ),
+            }
+            if args.system_one_upstream
+            else None
+        ),
     }
 
 
@@ -314,6 +328,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-paid-rollouts", action="store_true")
     parser.add_argument("--resume-paid-run", action="store_true")
+    parser.add_argument(
+        "--system-one-upstream",
+        help="origin of the System-One (Jev) judge the runner proxies for tinykg_jev rows",
+    )
+    parser.add_argument(
+        "--system-one-model",
+        help="model id the judge must report; any other answering model is refused",
+    )
     args = parser.parse_args(argv)
 
     metacodes = args.binary.expanduser().resolve()

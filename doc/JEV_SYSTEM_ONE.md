@@ -1,0 +1,175 @@
+# Jev System-One 记忆面顾问（Memory-plane advisor）
+
+> 状态：已实现，**默认关闭**。设 `METACODES_JEV_URL` 后默认 `shadow`（只记录不改行为），
+> `METACODES_JEV_MODE=advisory` 才让判断影响注入。实现：`src/jev/`；消费方：
+> `src/kg/scoped_recall.zig`、`src/tools/kg_tools.zig`、`src/core/agent_loop.zig`。
+> 评估复现：`zig build eval:jev-recall-driver`（零 provider 驱动）+ 本文 §6。
+
+## 1. 它是什么，不是什么
+
+Jev（`metask-jev-4b`，自建服务 `POST /v1/systemone`）是一个 **typed decision engine**：
+给一段 `state` 和一组封闭问题（boolean / choice），返回每个答案的校准概率。它不生成
+文本、不产出命令，也不是 coding agent 的 LLM。
+
+Jev-Mem（arXiv 2609.23986）把这种 System-One 判断放进记忆控制：写路径做类型与关系判定
+（`θ_rel = 0.60`），读路径做路由、候选打分与充分性停止（`θ_suff = 0.95`）。metacodes 采用的
+是它的**读路径候选打分**与**写路径关系判定**，而且只作为证据，不作为权威。
+
+实测服务特性（2026-09-23，自建端点）：
+
+- 判断是确定性的：同一请求字节得到同一概率，所以请求 SHA-256 就是完整审计键。
+- `criteria` 必须写：同一批 18 题，不带 `when_true/when_false` 准确 6/18，带上 17/18。
+- 单次大请求（8 候选）约 0.9 s（单客户端 p99 1.06 s）；多客户端共享时线性变慢；提示上限 4096 token。
+- `usage.tariff` 为 `"none"`（不计费）。
+
+## 2. 设计原则（融合 Codex 方案后的最终取舍）
+
+| 原则 | 落点 |
+|---|---|
+| 默认关闭，显式开启 | 未设 `METACODES_JEV_URL` 时 `App.jev == null`，所有消费方走原路径 |
+| shadow → advisory 渐进 | `shadow`：照常请求并写 `system_one_decision` 事件，注入/工具结果字节与无顾问时**逐字节相同**；`advisory`：判断才生效 |
+| 证据，永不是权威 | 判断只能改变“注入哪几条记忆”、“是否附上相关度注释”、“是否给软提醒”；从不拒绝工具、不改权限/沙箱/预算、不写 TinyKG、不参与 formal verdict |
+| 宿主枚举候选 | 候选全部来自 TinyKG BM25（宿主确定性枚举），Jev 只回答关于它们的封闭问题；问题目录是 comptime 校验的常量 |
+| 失败语义二分 | 服务故障（超时/5xx/畸形/模型不符/计费）→ 退回基线；**用户中断**→ `error.Aborted` 原样上抛，不被“降级”吞掉 |
+| 最小脱敏状态 | 请求 ≤ 400 B，候选窗口 480 B；`$HOME` → `~`，`sk-`/`ghp_`/`AKIA` 等密钥前缀 → `[redacted]`；不发送 transcript、时间戳、路径、插件代次 |
+| 零重试 + 熔断 | 不重试（2.5 s 截止内没有退避空间）；故障后熔断 30 s，指数加倍到 5 min |
+| 模型钉死 | `METACODES_JEV_MODEL` 钉住模型名，响应模型不符即拒收（`ModelMismatch`） |
+| 计费服务拒收 | 响应 `tariff != "none"` 即拒收（`PricedService`），直到内核有独立的花费记账 |
+| 缓存契约不破 | 判断只影响已有的追加面（scoped recall 的 `<system-reminder>`、工具结果）；不进 system prompt、不引入时间/代次字节 |
+
+## 3. 架构
+
+```
+src/jev/question.zig   封闭问题类型、comptime 校验、请求序列化、严格响应解析
+src/jev/client.zig     HTTP 客户端：Io.Select 竞速(响应/截止/中断)、熔断、模型钉、计费拒收
+src/jev/advisor.zig    问题目录(版本化) + 判断入口 + Audit(→ system_one_decision 事件)
+src/jev/excerpt.zig    判断窗口：候选全文中与请求词最密的 480 B
+src/jev/runtime.zig    METACODES_JEV_* 解析、堆上固定的 Runtime(App 持有生命周期)
+```
+
+四个消费点（全部是记忆面上已经存在的决策）：
+
+| 决策 | 问题目录 | 基线（无顾问） | advisory 下的变化 |
+|---|---|---|---|
+| 自动召回注入（scoped recall） | `metacodes.jev.recall-relevance.v2` | BM25 top-3，绝对地板 3.0 + 相对衰减 0.5 | 见 §4：地板通过后按“判断概率 + BM25”重排 8 个候选 |
+| `KgRecall` 结果 | `metacodes.jev.recall-evidence.v2` | 原结果 | 追加 `system_one` 块：每条相关度 + 证据充分性 + 使用说明 |
+| `KgRemember` 写入 | `metacodes.jev.memory-relation.v1` | 前缀近重复检测 | 追加 `relations` 块：同义/矛盾的已有记忆（写入照常发生） |
+| 枚举意图 | `metacodes.jev.enumeration-intent.v1` | 确定性关键词提示 | 只武装**软提醒**；拒绝型修复仍只绑定确定性提示 |
+
+每次咨询都写一条 `system_one_decision` 事件（schema `metacodes-system-one-decision-v1`）：
+decision、question_set、mode、outcome、actuated、request_sha256、model、elapsed_ms、
+question_count、state_bytes、judged、positive、changed。评估适配器
+（`scripts/eval/e2e_adapter.py`）对它做因果不变量校验：未应答的咨询不能带判断计数，
+`actuated` 只能出现在 advisory 且 `changed > 0` 时。
+
+配置（环境变量）：
+
+| 变量 | 含义 |
+|---|---|
+| `METACODES_JEV_URL` | 服务 origin（如 `http://host:10420`）；未设即关闭 |
+| `METACODES_JEV_MODE` | `shadow`（默认）或 `advisory` |
+| `METACODES_JEV_TIMEOUT_MS` | 单次截止，默认 2500（8 候选判断单客户端 p50 0.91 s / p99 1.06 s，三个客户端共享服务时 p50 2.4 s；超时会退回基线并开熔断，所以给共享服务留余量） |
+| `METACODES_JEV_MODEL` | 期望的模型名（钉死）；不设则接受服务报告的任何模型 |
+
+## 4. 召回门：最终方案
+
+```
+BM25 取 8 个候选 → 地板：top 分 < 3.0 ⇒ 判定答案缺席，不注入，也不咨询 Jev
+地板通过 ⇒ Jev 对 8 个候选各答一个 boolean（v2 措辞，读每条的 480 B 聚焦窗口）
+        ⇒ 融合分 = P(相关) + 0.5 × BM25 / BM25_top，降序（BM25 名次破平）
+        ⇒ 依次取 P ≥ 40% 的，最多 3 条；一条都没有 ⇒ 只注入融合分最高的 1 条
+```
+
+实现：`scoped_recall.judgedSelection`（`RELEVANCE_THRESHOLD_PERCENT = 40`，
+`BM25_FUSION_WEIGHT = 0.5`）。每一条设计都来自 dev 集上的失败：
+
+- **BM25 管“有没有”，Jev 与 BM25 一起管“是哪条”**。v1 让 Jev 独自决定注入（θ = 60，
+  全不相关就不注入），在 dev 上命中从 0.620 掉到 0.495：Jev 的“全部不相关”会把措辞迂回但
+  真正相关的记忆整批丢掉。答案缺席的信号于是还给 BM25 地板。
+- **融合 BM25**。Jev 只读 480 B 窗口，BM25 读全文。在整段会话这种长记忆上，只用 Jev 重排
+  反而低于基线（0.700 vs 0.725）；加回 0.5 倍归一 BM25 后到 0.790。短记忆上融合的代价是
+  0.730 → 0.685，两者都显著优于基线；在两种粒度上都显著优于基线的只有融合。
+- **地板以下不咨询 Jev**：此时两种策略都不注入，咨询只会给每个无关轮次加约 1 s 延迟。
+- **v2 措辞**（“是否关于请求所问的那个具体的人/事/物”）替换 v1（“是否回答请求所必需”）：
+  v1 过严，漏掉只提供线索的记忆（同一批 123 个 dev 案例 0.748 vs 0.724）。
+- **聚焦窗口**：取候选全文中与请求词最密的 480 B；停用词只含通用英文虚词。曾试过把评测提示
+  模板词也列为停用词（dev +0.03），那是在拟合评测集，已弃用；按池内 IDF 加权也试过，无增益。
+  窗口在长记忆上把命中从 0.750（头部）提到 0.790，在短记忆上持平（0.685 vs 0.700）。
+
+## 5. 与 Codex 方案的融合
+
+Codex 的《Jev × metacodes Harness 接入方案》目标是用 Jev（+ JevTree 图搜索）改进长任务的
+**下一步动作选择**。逐条取舍如下：
+
+| Codex 主张 | 处理 | 理由 |
+|---|---|---|
+| 内核独占 AgentLoop/权限/沙箱/预算/formal/TinyKG admission/CAS | **采纳** | 与 AGENTS.md 内核边界一致；Jev 不拿任何可变句柄 |
+| 默认 disabled；服务故障退回基线；取消/预算/journal 错误照旧 fail-closed | **采纳** | 实现为 `Outcome` 与 `error.Aborted` 的二分 |
+| DecisionAdvisor typed seam，由 Host 安装 | **采纳并收窄** | `Advisor` 由 App 持有、经 `AgentLoop.Options.jev` 与 `ToolContext.jev` 传入；但只接在记忆面四个已有决策点，不做通用 turn-boundary observation |
+| 候选只来自宿主确定性枚举，Jev 不生成命令/路径 | **采纳** | 候选 = BM25 命中；问题目录 comptime 校验 |
+| 最小脱敏 state；不发 transcript/秘密/路径/时间戳 | **采纳** | `appendRedacted` + 字节预算 |
+| 算术/计数/日期/权限由内核定，不交给 Jev | **采纳** | 计数、阈值、选择都在 Zig 里 |
+| 钉死具体模型，避免别名漂移 | **采纳** | `METACODES_JEV_MODEL` + `ModelMismatch` |
+| shadow / advisory / enforced-safe 三档 | **采纳前两档，拒绝 enforced-safe** | 记忆面没有需要“强制路由”的动作；而且判断是传感器，按 sensor/policy 分离原则“错判只能静音一个门，不能触发一个门” |
+| 重试须为零或逐次入预算 journal | **采纳零重试**；拒绝“截止内有限退避” | 2.5 s 截止里没有退避空间；用熔断代替 |
+| 内核 BudgetAccount/ProviderCharge，Jev 与主 provider 共享总上限 | **推迟，改为拒收计费服务** | 自建服务 `tariff: none`；在没有花费记账前，任何计费响应直接拒收，比“先建一个空转的账户”更诚实。延迟成本（elapsed_ms）逐次入事件：shadow 不是零成本 |
+| JevTree：状态合并、路径概率、unresolved mass、Pareto 选择、receding horizon | **推迟** | Codex 自己承认编码任务 `max_depth=1`、未执行分支全是 unresolved——图搜索退化为局部偏好，而且没有可测的地面真值。记忆面有 BM25 这个现成传感器和 LongMemEval 金标，先在这里证明价值 |
+| 动作族评分（Read/Grep/RunTests/Write…）与 bounded nudge | **推迟** | nudge 每轮进入 provider 可见字节，与缓存契约冲突，需先设计追加面；也缺少把“更好的下一步”变成分数的评估 |
+| Stage 0 离线回放 | **采纳为零 provider 驱动** | `scripts/jev_recall_eval_driver.zig` 直接调用生产策略函数回放候选池，见 §6 |
+| “JevTree README 的数字不是 metacodes 的 SLA，以本项目冻结配对评估为准” | **采纳** | §6 全部是本项目评估 |
+
+## 6. 评估
+
+### 6.1 方法（零 provider，召回门本身）
+
+- 数据：LongMemEval-S cleaned（sha256 `d6f21ea9…c442`），`adapt-longmem-memory --limit 500
+  --split-seed 20260806` 的案例顺序；金标 = 官方 `answer_session_ids`。
+- 记忆库：每个案例一个隔离 TinyKG 库，用固定 TinyKG 二进制建库。两种库：
+  **mixed** = 付费 runner 实际建的库（整段会话节点 + 每轮节点，候选中位 13.7 KB）；
+  **turn** = 只有每轮节点（原子记忆，中位 2.2 KB）。候选池 = `search --profile agent-memory`
+  的 BM25 前 8。
+- 指标：命中 = 注入集合里至少一条属于金标会话；另报每例注入条数、精度（注入中属于金标的比例）、
+  每例噪声条数。配对 exact McNemar。
+- 切分：案例 0–199 为 dev（所有设计选择都只看 dev），200–499 为 holdout（最终策略定稿前没有
+  跑过）。
+- 生产驱动：`zig build eval:jev-recall-driver` 构建 `metacodes-jev-recall-eval`，它直接调用
+  `scoped_recall.baselineSelection/judgedSelection` 与 `Advisor.judgeRecallRelevance`，
+  判断窗口与 `KgClient` 同一个函数——评估的就是生产代码，不是 Python 复刻。
+
+### 6.2 结果
+
+| 库 | 切分 | 基线命中 | Jev 命中 | McNemar p | 注入条数/例 | 精度 | 噪声条数/例 |
+|---|---|---|---|---|---|---|---|
+| turn | dev 200 | 0.620 | **0.685** | 0.029 | 2.98 → 1.78 | 0.404 → 0.709 | 1.77 → 0.52 |
+| turn | **holdout 300** | 0.633 | **0.703** | **0.0019** | 2.98 → 1.70 | 0.387 → 0.686 | 1.83 → 0.53 |
+| mixed | dev 200 | 0.725 | 0.780 | 0.09 | 2.96 → 1.46 | 0.337 → 0.651 | 1.97 → 0.51 |
+| mixed | **holdout 300** | 0.717 | 0.740 | 0.39 | 2.96 → 1.41 | 0.349 → 0.666 | 1.93 → 0.47 |
+
+- 原子记忆上命中显著提高（holdout +7.0 个百分点），同时注入少 43%、噪声少 71%。
+- 整段会话记忆上命中持平略升（不显著），注入减半、噪声少 76%：主要收益是**不再往上下文里
+  塞无关记忆**。
+- holdout 分类别（turn 库）：6 类里 5 类提高、multi-session 持平；mixed 库上
+  temporal-reasoning（0.786 → 0.750）与 single-session-preference（0.389 → 0.333）略降，
+  其余提高。
+- 1000 次生产驱动咨询全部应答（驱动截止 8 s）。单客户端延迟（100 次顺序请求）p50 0.91 s、
+  p99 1.06 s、最大 1.20 s；三个评测客户端共享服务时 p50 约 2.4 s。
+
+失败的设计（都在 dev 上，按时间顺序）：
+
+| 设计 | turn dev 命中 | mixed 命中 |
+|---|---|---|
+| 基线（BM25 地板） | 0.620 | 0.720（全 500） |
+| v1：严格措辞 + Jev 独自选择 θ = 60 + 头部摘录 | 0.495（p = 0.001，更差） | 0.450（全 500，p ≈ 1e-22，更差） |
+| v2 措辞 + Jev 独自重排 θ = 40 + 聚焦窗口 | 0.730 | 0.700（dev） |
+| **v2 + 判断与 BM25 融合（定稿）** | 0.685 | 0.780（dev，生产驱动） |
+
+<!-- PAID -->
+
+## 7. 路线图
+
+1. **advisory 默认化的前提**：付费配对试点（§6.3）在主指标上不劣于 `tinykg_lexical`，且
+   `system_one_decision` 的 `unavailable` 比例 < 5%。
+2. **缓存**：判断是确定性的，可按请求 SHA-256 在会话内缓存，重复查询零延迟。
+3. **写路径**：把 `memory-relation` 从注释升级为“矛盾时提示模型更新旧记忆”，仍不自动改写。
+4. **动作面（Codex Stage 2/3）**：先建设“下一步动作”的离线金标（DecisionFixture），再做
+   只读动作族的 shadow 评分；在拿到配对证据之前不进入 provider 可见字节。

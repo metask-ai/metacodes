@@ -27,6 +27,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Optional System-One (Jev) memory-plane advisor (`src/jev/`,
+  [doc/JEV_SYSTEM_ONE.md](doc/JEV_SYSTEM_ONE.md)), off unless
+  `METACODES_JEV_URL` is set; `METACODES_JEV_MODE` is `shadow` by default
+  (consult and journal, provider-visible bytes unchanged) or `advisory`. It
+  advises four existing memory decisions and never gates a tool, permission,
+  budget or TinyKG write: scoped recall ranks an 8-hit BM25 pool by judge
+  probability plus normalized BM25 once the BM25 floor has passed (the judge is
+  not consulted below it), `KgRecall` gains a relevance/sufficiency block,
+  `KgRemember` a same/contradicts relations block, and the enumeration judge
+  arms only the soft coverage reminder. Judge failures fall back to the
+  unadvised path without retries (30 s–5 min breaker); a user interrupt stays
+  `Aborted`; a different model or a priced tariff is refused. Every
+  consultation emits `system_one_decision`
+  (`metacodes-system-one-decision-v1`), which the evaluation adapters validate.
+  The paid memory runner gains a `tinykg_jev` arm behind a loopback judge
+  proxy, and `zig build eval:jev-recall-driver` replays LongMemEval-S candidate
+  pools through the production recall policies with no provider.
 - Release automation (`doc/RELEASE_AUTOMATION_DESIGN.md`): `scripts/release_cut.py`
   derives the next version from the Conventional-Commit types since the last
   tag, rewrites `build.zig.zon` / `src/version.zig` / this file in one release

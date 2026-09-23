@@ -180,7 +180,7 @@ test "L2 KG governance: scoped recall exposes stable node ids and candidate-only
         var conv = cc.conversation.Conversation.init(a);
         defer conv.deinit();
         try conv.appendText(.user, "client.zig 是怎么和 tinykg 集成的?子进程还是嵌入库集成方式?");
-        const inj = try cc.kg_scoped_recall.build(a, &kg, &conv, &ab);
+        const inj = try cc.kg_scoped_recall.build(a, &kg, &conv, &ab, .{});
         defer if (inj) |s| a.free(s);
         try std.testing.expect(inj != null);
         const expected_id = try std.fmt.allocPrint(a, "node_id={d}", .{memory_id});
@@ -203,7 +203,7 @@ test "L2 KG governance: scoped recall exposes stable node ids and candidate-only
         var conv = cc.conversation.Conversation.init(a);
         defer conv.deinit();
         try conv.appendText(.user, "今天天气怎么样适合出去散步吗周末有什么安排");
-        const inj = try cc.kg_scoped_recall.build(a, &kg, &conv, &ab);
+        const inj = try cc.kg_scoped_recall.build(a, &kg, &conv, &ab, .{});
         defer if (inj) |s| a.free(s);
         try std.testing.expect(inj == null);
     }

@@ -1382,3 +1382,141 @@ class E2EAdapterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SystemOneDecisionTraceTests(unittest.TestCase):
+    METADATA = {
+        "run_id": "system-one-run",
+        "invocation": 0,
+        "trial": 0,
+        "suite_id": "suite",
+        "task_id": "task",
+        "task_fingerprint": "task-fp",
+        "model_provider": "test",
+        "model_id": "model",
+        "model_fingerprint": "model-fp",
+        "runtime_model_provider": "test",
+        "runtime_model_id": "model",
+        "harness_config_id": "candidate",
+        "harness_revision": "abc",
+        "harness_fingerprint": "harness-fp",
+        "permission_mode": "default",
+        "runtime_permission_mode": "default",
+        "environment_fingerprint": "environment-fp",
+        "grader_fingerprint": "grader-fp",
+    }
+
+    def _recall(self, status="injected", injected=1):
+        return {
+            "scoped_recall": {
+                "trace_id": "t",
+                "schema_version": "metacodes-scoped-recall-v1",
+                "status": status,
+                "query_sha256": "a" * 64,
+                "result_count": 3,
+                "injected_count": injected,
+                "injected_bytes": 120 if injected else 0,
+                "injection_sha256": ("b" if injected else "0") * 64,
+            }
+        }
+
+    def _decision(self, **overrides):
+        payload = {
+            "trace_id": "t",
+            "schema_version": "metacodes-system-one-decision-v1",
+            "decision": "recall_relevance",
+            "question_set": "metacodes.jev.recall-relevance.v2",
+            "mode": "shadow",
+            "outcome": "answered",
+            "actuated": False,
+            "request_sha256": "c" * 64,
+            "model": "metask-jev-4b",
+            "elapsed_ms": 240,
+            "question_count": 8,
+            "state_bytes": 3100,
+            "judged": 8,
+            "positive": 2,
+            "changed": 1,
+        }
+        payload.update(overrides)
+        return {"system_one_decision": payload}
+
+    def _trace(self, events):
+        framed = [{"run_started": {"trace_id": "t", "metadata": self.METADATA}}] + events + [
+            {
+                "run_finished": {
+                    "trace_id": "t",
+                    "depth": 0,
+                    "turns": 1,
+                    "tool_calls": 0,
+                    "stop_reason": "end_turn",
+                    "wall_time_ms": 2,
+                    "dropped_events": 0,
+                }
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "schema_version": NATIVE_EVENT_SCHEMA_VERSION,
+                            "sequence": index,
+                            "monotonic_elapsed_ns": index,
+                            "session_id": "single",
+                            "event": event,
+                        }
+                    )
+                    + "\n"
+                    for index, event in enumerate(framed)
+                ),
+                encoding="utf-8",
+            )
+            return _native_trace_metrics(path)
+
+    def test_shadow_decision_follows_its_scoped_recall(self):
+        native, error = self._trace([self._recall(), self._decision()])
+        self.assertIsNone(error)
+        assert native is not None
+        self.assertEqual(native["metrics"]["system_one_decision_count"], 1)
+        self.assertEqual(native["metrics"]["system_one_actuated_count"], 0)
+        self.assertEqual(native["system_one_decisions"][0]["changed"], 1)
+
+    def test_advisory_decision_that_narrows_the_injection_is_accepted(self):
+        native, error = self._trace(
+            [
+                self._recall(injected=1),
+                self._decision(mode="advisory", actuated=True, positive=1, changed=2),
+            ]
+        )
+        self.assertIsNone(error)
+        assert native is not None
+        self.assertEqual(native["metrics"]["system_one_actuated_count"], 1)
+
+    def test_retired_not_relevant_status_is_rejected(self):
+        native, error = self._trace([self._recall(status="not_relevant", injected=0)])
+        self.assertIsNone(native)
+        self.assertIn("status", error)
+
+    def test_decision_invariants_fail_closed(self):
+        cases = {
+            "claims an actuation": self._decision(actuated=True),
+            "did not receive": self._decision(outcome="unavailable"),
+            "counts are inconsistent": self._decision(positive=9),
+            "unsupported schema_version": self._decision(schema_version="metacodes-system-one-decision-v0"),
+            "invalid request_sha256": self._decision(request_sha256="xyz"),
+            "invalid mode": self._decision(mode="enforced"),
+        }
+        for message, decision in cases.items():
+            with self.subTest(message=message):
+                native, error = self._trace([self._recall(), decision])
+                self.assertIsNone(native)
+                self.assertIn(message, error)
+        native, error = self._trace([self._decision()])
+        self.assertIsNone(native)
+        self.assertIn("without its scoped recall", error)
+        # An advisory answer that matched the baseline is not an actuation.
+        native, error = self._trace([self._recall(), self._decision(mode="advisory", actuated=True, changed=0)])
+        self.assertIsNone(native)
+        self.assertIn("claims an actuation", error)

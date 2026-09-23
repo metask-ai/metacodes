@@ -79,6 +79,57 @@ def _is_policy_failure_code(value: Any) -> bool:
     }
 
 
+SYSTEM_ONE_DECISION_SCHEMA_VERSION = "metacodes-system-one-decision-v1"
+SYSTEM_ONE_DECISIONS = {"recall_relevance", "memory_relation", "enumeration_intent"}
+SYSTEM_ONE_MODES = {"shadow", "advisory"}
+SYSTEM_ONE_OUTCOMES = {
+    "answered",
+    "unavailable",
+    "rejected",
+    "malformed",
+    "priced_service",
+    "model_mismatch",
+    "invalid_request",
+}
+
+
+def _system_one_decision_problem(payload: dict) -> str | None:
+    """Structural and causal invariants of one System-One consultation.
+
+    A judgment is evidence only: it can be actuated solely in advisory mode,
+    solely when answered, and solely when it changed the host decision. An
+    unanswered consultation cannot carry judged counts.
+    """
+    if payload.get("schema_version") != SYSTEM_ONE_DECISION_SCHEMA_VERSION:
+        return "system_one_decision has unsupported schema_version"
+    if payload.get("decision") not in SYSTEM_ONE_DECISIONS:
+        return "system_one_decision has invalid decision"
+    if payload.get("mode") not in SYSTEM_ONE_MODES:
+        return "system_one_decision has invalid mode"
+    outcome = payload.get("outcome")
+    if outcome not in SYSTEM_ONE_OUTCOMES:
+        return "system_one_decision has invalid outcome"
+    question_set = payload.get("question_set")
+    if not isinstance(question_set, str) or not question_set:
+        return "system_one_decision has invalid question_set"
+    if not isinstance(payload.get("model"), str):
+        return "system_one_decision has invalid model"
+    digest = payload.get("request_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        return "system_one_decision has invalid request_sha256"
+    actuated = payload.get("actuated")
+    if not isinstance(actuated, bool):
+        return "system_one_decision has invalid actuated"
+    judged, positive, changed = payload["judged"], payload["positive"], payload["changed"]
+    if not positive <= judged <= payload["question_count"]:
+        return "system_one_decision counts are inconsistent"
+    if outcome != "answered" and (judged or positive or changed or actuated):
+        return "system_one_decision reports a judgment it did not receive"
+    if actuated and (payload["mode"] != "advisory" or changed == 0):
+        return "system_one_decision claims an actuation it could not make"
+    return None
+
+
 def _is_model_tool_failure(error_code: Any, error_category: Any = None) -> bool:
     """Classify model-correctable tool failures without blaming the harness.
 
@@ -1161,6 +1212,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             known_kinds = {
                 "run_started",
                 "scoped_recall",
+                "system_one_decision",
                 "turn_started",
                 "turn_finished",
                 "model_request_finished",
@@ -1318,6 +1370,14 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 "injected_count",
                 "injected_bytes",
             ),
+            "system_one_decision": (
+                "elapsed_ms",
+                "question_count",
+                "state_bytes",
+                "judged",
+                "positive",
+                "changed",
+            ),
         }.get(kind, ())
         for field in integer_fields:
             value = payload.get(field)
@@ -1357,6 +1417,10 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 and payload.get("injection_sha256") != "0" * 64
             ):
                 return None, "scoped_recall injection fields contradict status"
+        if kind == "system_one_decision":
+            problem = _system_one_decision_problem(payload)
+            if problem is not None:
+                return None, problem
         if kind == "tool_finished" and not isinstance(payload.get("is_error"), bool):
             return None, "tool_finished has invalid is_error"
         if kind == "policy_decision":
@@ -1552,6 +1616,11 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     ]
     if len(scoped_recalls) > len(starts):
         return None, "native trace has more scoped recall receipts than invocations"
+    system_one_decisions = [
+        payload for kind, payload, _seq, _session in events if kind == "system_one_decision"
+    ]
+    if len(system_one_decisions) > len(scoped_recalls):
+        return None, "native trace has a System-One decision without its scoped recall"
     failures = [item for item in tool_finishes if item.get("is_error")]
     model_failures = [
         item
@@ -1703,6 +1772,10 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         "scoped_recall_injected_bytes": sum(
             int(item.get("injected_bytes", 0)) for item in scoped_recalls
         ),
+        "system_one_decision_count": len(system_one_decisions),
+        "system_one_actuated_count": sum(
+            1 for item in system_one_decisions if item.get("actuated") is True
+        ),
     }
     return {
         "metadata": metadata,
@@ -1725,6 +1798,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             for item in failures
         ],
         "scoped_recalls": scoped_recalls,
+        "system_one_decisions": system_one_decisions,
     }, None
 
 

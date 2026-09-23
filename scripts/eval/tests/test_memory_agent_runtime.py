@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -31,6 +33,9 @@ from scripts.eval.memory_agent_runtime import (
     _run_production_sandbox_probe,
     _safe_component,
     _sanitized_environment,
+    ARM_TO_RUNTIME,
+    SYSTEM_ONE_ARMS,
+    SystemOneJudgeProxy,
     _verify_scoped_recall_activation,
     _write_failed_validation_checkpoint,
     _xxhash64,
@@ -2878,6 +2883,20 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertEqual(clean, {"PATH": "/operator/bin"})
 
+    def test_scripted_environment_never_inherits_a_system_one_advisor(self):
+        # An operator's METACODES_JEV_* would install the advisor in every arm,
+        # the no-memory baseline included.
+        clean = _sanitized_environment(
+            {
+                "PATH": "/operator/bin",
+                "METACODES_JEV_URL": "http://judge.example:10420",
+                "METACODES_JEV_MODE": "advisory",
+                "METACODES_JEV_TIMEOUT_MS": "800",
+                "METACODES_JEV_MODEL": "metask-jev-4b",
+            }
+        )
+        self.assertEqual(clean, {"PATH": "/operator/bin"})
+
     def test_production_auth_rejects_parent_environment_and_reads_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
             auth = Path(directory) / "auth.json"
@@ -5277,3 +5296,74 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class SystemOneJudgeProxyTests(unittest.TestCase):
+    """The loopback judge that a Jev arm talks to instead of the network."""
+
+    REQUEST = json.dumps(
+        {
+            "state": "request: which flag omits TinyKG?",
+            "questions": {
+                "c0": {"type": "boolean", "description": "d", "criteria": {"true": "t", "false": "f"}},
+                "sufficient": {"type": "boolean", "description": "d", "criteria": {"true": "t", "false": "f"}},
+            },
+        }
+    ).encode("utf-8")
+
+    def _post(self, origin: str, body: bytes):
+        request = urllib.request.Request(
+            origin + "/v1/systemone", data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, None
+
+    def test_jev_arm_is_the_tinykg_runtime_plus_the_judge(self):
+        self.assertEqual(ARM_TO_RUNTIME["tinykg_jev"], "tinykg")
+        self.assertEqual(SYSTEM_ONE_ARMS, frozenset({"tinykg_jev"}))
+
+    def test_scripted_judge_answers_every_boolean_and_logs_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with SystemOneJudgeProxy(None) as proxy:
+                self.assertTrue(proxy.origin.startswith("http://127.0.0.1:"))
+                status, payload = self._post(proxy.origin, self.REQUEST)
+                self.assertEqual(status, 200)
+                self.assertEqual(set(payload["answers"]), {"c0", "sufficient"})
+                self.assertEqual(payload["usage"]["tariff"], "none")
+                bad_status, _ = self._post(proxy.origin, b'{"state":"s","questions":{"q":{"type":"enum"}}}')
+                self.assertEqual(bad_status, 400)
+            summary = proxy.summary()
+            self.assertEqual(summary["requests"], 2)
+            self.assertEqual(summary["answered"], 1)
+            log = Path(directory) / "system-one-judge.jsonl"
+            proxy.write_log(log)
+            records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(records[0]["request_sha256"], hashlib.sha256(self.REQUEST).hexdigest())
+            self.assertTrue(records[0]["answered"])
+            self.assertFalse(records[1]["answered"])
+
+    def test_forwarding_proxy_reports_an_unreachable_upstream_as_unanswered(self):
+        with SystemOneJudgeProxy("http://127.0.0.1:9", timeout_seconds=1.0) as proxy:
+            status, _ = self._post(proxy.origin, self.REQUEST)
+        self.assertEqual(status, 502)
+        self.assertEqual(proxy.summary()["answered"], 0)
+
+    def test_forwarding_proxy_relays_the_upstream_answer_verbatim(self):
+        with SystemOneJudgeProxy(None) as upstream:
+            with SystemOneJudgeProxy(upstream.origin) as proxy:
+                status, payload = self._post(proxy.origin, self.REQUEST)
+        self.assertEqual(status, 200)
+        self.assertIn("sufficient", payload["answers"])
+        self.assertEqual(proxy.summary()["answered"], 1)
+        self.assertEqual(upstream.summary()["requests"], 1)
+
+    def test_upstream_must_be_a_bare_origin(self):
+        for bad in ("58.211.6.133:10420", "http://judge/v1/systemone", "ftp://judge"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValidationError):
+                    SystemOneJudgeProxy(bad)

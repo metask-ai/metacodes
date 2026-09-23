@@ -16,6 +16,7 @@ const log = @import("../util/log.zig");
 const retrieval_protocol = @import("../kg/retrieval_protocol.zig");
 const lexical_query_plan = @import("../kg/lexical_query_plan.zig");
 const scoped_recall_mod = @import("../kg/scoped_recall.zig");
+const jev_advisor = @import("../jev/advisor.zig");
 
 fn requireKg(ctx: *const ToolContext) ?*kg_mod.KgClient {
     return ctx.kg;
@@ -75,18 +76,27 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
     // 绝对阈值不可靠(Linus M4)。文本归一化重合是尺度无关的确定性信号。
     var dup_note: ?[]u8 = null;
     defer if (dup_note) |n| ctx.allocator.free(n);
+    var relations: ?MemoryRelations = null;
     if (kg.recall(text_owned, 3, false)) |hits| {
         defer {
             // kg 内存契约:hits 是 kg.allocator 分的(subagent 线程 ctx.allocator 不同源)。
             for (hits) |*h| h.deinit(kg.allocator);
             kg.allocator.free(hits);
         }
+        var baseline_node: ?u64 = null;
         for (hits) |h| {
             if (isNearDuplicate(text_owned, h.text)) {
                 dup_note = try std.fmt.allocPrint(ctx.allocator, "已有高度相似记忆 node {d},若为同一事实请考虑更新而非新增", .{h.node_id});
+                baseline_node = h.node_id;
                 break;
             }
         }
+        // System-One relation judgment (Jev-Mem write path): semantic
+        // duplicates and contradictions the prefix test above cannot see. It
+        // only annotates the result; the write below happens either way.
+        if (ctx.jev) |advisor| if (hits.len > 0) {
+            relations = try judgeMemoryRelations(ctx, advisor, text_owned, hits, baseline_node);
+        };
     } else |_| {} // 近重复检查失败不阻塞写入
 
     // 写侧类型分布埋点(PM:kill-criterion 的 load-bearing 仪器,measure observation 是否仍霸榜)。
@@ -114,8 +124,99 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
         try out.appendSlice(ctx.allocator, ",\"note\":");
         try appendJsonString(&out, ctx.allocator, n);
     }
+    if (relations) |judged| if (judged.visible()) try judged.appendJson(&out, ctx.allocator);
     try out.appendSlice(ctx.allocator, "}");
     return out.toOwnedSlice(ctx.allocator);
+}
+
+/// Jev-Mem relation threshold for the write path. Probed on metask-jev-4b
+/// (2026-09-23, 6 pairs): same-fact and contradiction positives scored
+/// 0.88-0.93, negatives <= 0.19.
+pub const RELATION_THRESHOLD_PERCENT: u8 = 80;
+
+const RelationFlag = struct { node_id: u64, percent: u8 };
+
+/// Relations the System-One judge found between a new memory and the lexical
+/// neighbours it will sit next to. Rendered only in advisory mode and only
+/// when the judge adds something the prefix test did not already say; shadow
+/// mode journals the same judgment and leaves the tool result unchanged.
+const MemoryRelations = struct {
+    advisory: bool,
+    same: [jev_advisor.MAX_RELATION_CANDIDATES]RelationFlag = undefined,
+    same_len: usize = 0,
+    contradicts: [jev_advisor.MAX_RELATION_CANDIDATES]RelationFlag = undefined,
+    contradicts_len: usize = 0,
+    /// Flagged nodes the baseline note did not already name.
+    changed: u32 = 0,
+
+    fn visible(self: *const MemoryRelations) bool {
+        return self.advisory and self.changed > 0;
+    }
+
+    fn appendJson(self: *const MemoryRelations, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        try out.appendSlice(allocator, ",\"relations\":{\"judge\":\"system_one\",\"same_fact\":[");
+        for (self.same[0..self.same_len], 0..) |flag, index| {
+            if (index > 0) try out.append(allocator, ',');
+            try out.print(allocator, "{{\"node_id\":{d},\"percent\":{d}}}", .{ flag.node_id, flag.percent });
+        }
+        try out.appendSlice(allocator, "],\"contradicts\":[");
+        for (self.contradicts[0..self.contradicts_len], 0..) |flag, index| {
+            if (index > 0) try out.append(allocator, ',');
+            try out.print(allocator, "{{\"node_id\":{d},\"percent\":{d}}}", .{ flag.node_id, flag.percent });
+        }
+        try out.appendSlice(allocator, "],\"guidance\":");
+        try appendJsonString(out, allocator, RELATION_GUIDANCE);
+        try out.append(allocator, '}');
+    }
+};
+
+pub const RELATION_GUIDANCE =
+    "Probabilistic advisory judgment, not a verified fact. For a same_fact node, prefer updating it over keeping two copies. " ++
+    "For a contradicts node, check which account is current (KgContext) and retire or correct the stale one; the new memory was stored either way.";
+
+fn judgeMemoryRelations(
+    ctx: *const ToolContext,
+    advisor: *jev_advisor.Advisor,
+    text: []const u8,
+    hits: []const kg_mod.RecallHit,
+    baseline_node: ?u64,
+) !MemoryRelations {
+    var existing: [jev_advisor.MAX_RELATION_CANDIDATES]jev_advisor.ExistingMemory = undefined;
+    const n = @min(hits.len, jev_advisor.MAX_RELATION_CANDIDATES);
+    for (hits[0..n], 0..) |hit, index| existing[index] = .{ .text = hit.text };
+    const judgment = advisor.judgeMemoryRelations(ctx.allocator, ctx.abort, text, existing[0..n]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Aborted => return error.Aborted,
+    };
+    var relations: MemoryRelations = .{ .advisory = advisor.actuates() };
+    if (judgment.answered()) {
+        for (hits[0..n], 0..) |hit, index| {
+            const same = judgment.percents[2 * index];
+            const contradicts = judgment.percents[2 * index + 1];
+            var flagged = false;
+            if (same >= RELATION_THRESHOLD_PERCENT) {
+                relations.same[relations.same_len] = .{ .node_id = hit.node_id, .percent = same };
+                relations.same_len += 1;
+                flagged = true;
+            }
+            if (contradicts >= RELATION_THRESHOLD_PERCENT) {
+                relations.contradicts[relations.contradicts_len] = .{ .node_id = hit.node_id, .percent = contradicts };
+                relations.contradicts_len += 1;
+                flagged = true;
+            }
+            // A node only the judge flags is new information over the prefix
+            // test; a contradiction always is (the baseline cannot see one).
+            if (flagged and (contradicts >= RELATION_THRESHOLD_PERCENT or baseline_node != hit.node_id)) relations.changed += 1;
+        }
+    }
+    const positive: u32 = @intCast(relations.same_len + relations.contradicts_len);
+    if (ctx.tool_observer) |observer| {
+        _ = observer.emit(judgment.audit.event(relations.visible(), @intCast(judgment.count), positive, relations.changed));
+    }
+    log.info("kg", "kg_remember relation judge mode={s} outcome={s} same={d} contradicts={d} changed={d}", .{
+        @tagName(judgment.audit.mode), @tagName(judgment.audit.outcome), relations.same_len, relations.contradicts_len, relations.changed,
+    });
+    return relations;
 }
 
 /// 本 session 进行中的 kg 任务(store 镜像里 status=in_progress 且 id 形如 kg-<n>)。
@@ -260,6 +361,8 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall returned more hits than the governed 32-node ledger can represent", .{});
         return error.InvalidLexicalPlanState;
     }
+    var evidence: EvidenceCandidates = .{};
+    defer evidence.deinit(ctx.allocator);
     try out.appendSlice(ctx.allocator, "{\"hits\":[");
     for (hits, 0..) |h, i| {
         hit_ids[i] = h.node_id;
@@ -287,6 +390,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             continue;
         }
         try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES, superseded_symbols);
+        try evidence.add(ctx.allocator, h, superseded_symbols);
     }
     // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
@@ -331,6 +435,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try appendRecallEnvelope(&out, ctx.allocator);
     try out.appendSlice(ctx.allocator, ",\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
+    try appendEvidenceJudgment(ctx, &out, &evidence, effective_query);
     const tail = "}";
     try out.appendSlice(ctx.allocator, tail);
     const owned = try out.toOwnedSlice(ctx.allocator);
@@ -409,6 +514,8 @@ fn executeRecallBatch(
     var probe_repeated_count: usize = 0;
     var first_new_node_id: u64 = 0;
     var first_new_evidence_node_id: u64 = 0;
+    var evidence: EvidenceCandidates = .{};
+    defer evidence.deinit(ctx.allocator);
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
     var facet_counts = [_]usize{0} ** known_types.len;
 
@@ -460,6 +567,7 @@ fn executeRecallBatch(
                     first_new_evidence_node_id = hit.node_id;
                 }
                 try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true, batchHitTextBytes(merged_count - 1), superseded_symbols);
+                try evidence.add(ctx.allocator, hit, superseded_symbols);
             }
             const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
             for (known_types, 0..) |type_name, facet_index| {
@@ -539,6 +647,13 @@ fn executeRecallBatch(
         try out.append(ctx.allocator, '}');
         auto_context_node_id = context_observation.observed_node_id;
     }
+    var variants_query: std.ArrayList(u8) = .empty;
+    defer variants_query.deinit(ctx.allocator);
+    for (plan.variants, 0..) |variant, variant_index| {
+        if (variant_index > 0) try variants_query.appendSlice(ctx.allocator, " | ");
+        try variants_query.appendSlice(ctx.allocator, variant.text);
+    }
+    try appendEvidenceJudgment(ctx, &out, &evidence, variants_query.items);
     try out.append(ctx.allocator, '}');
 
     const owned = try out.toOwnedSlice(ctx.allocator);
@@ -641,6 +756,104 @@ pub fn appendRecallHitRow(
         try out.appendSlice(allocator, ",\"body_withheld\":true");
     }
     try out.append(allocator, '}');
+}
+
+/// Recall hits whose bodies this result exposes, in rank order, captured for
+/// the System-One evidence judgment (hit memory is released per probe).
+const EvidenceCandidates = struct {
+    node_ids: [jev_advisor.MAX_RECALL_CANDIDATES]u64 = undefined,
+    labels: [jev_advisor.MAX_RECALL_CANDIDATES][]u8 = undefined,
+    texts: [jev_advisor.MAX_RECALL_CANDIDATES][]u8 = undefined,
+    len: usize = 0,
+
+    fn add(self: *EvidenceCandidates, allocator: std.mem.Allocator, hit: kg_mod.RecallHit, superseded_symbols: []const []const u8) !void {
+        if (self.len == jev_advisor.MAX_RECALL_CANDIDATES) return;
+        const label = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
+        // A withdrawn body is not evidence the model can see; do not score it.
+        if (hitSupersededByArtifact(superseded_symbols, hit.text, label)) return;
+        const label_copy = try allocator.dupe(u8, label);
+        errdefer allocator.free(label_copy);
+        // The judge reads the query-focused window when the hit carries one.
+        const text_copy = try allocator.dupe(u8, if (hit.focus_text.len > 0) hit.focus_text else hit.text);
+        self.node_ids[self.len] = hit.node_id;
+        self.labels[self.len] = label_copy;
+        self.texts[self.len] = text_copy;
+        self.len += 1;
+    }
+
+    fn deinit(self: *EvidenceCandidates, allocator: std.mem.Allocator) void {
+        for (self.labels[0..self.len], self.texts[0..self.len]) |label, text| {
+            allocator.free(label);
+            allocator.free(text);
+        }
+        self.len = 0;
+    }
+};
+
+pub const EVIDENCE_GUIDANCE =
+    "Calibrated probabilities from a fast System-One judge, not verified facts. Read the most relevant node_ids first (KgContext) " ++
+    "before trusting them. A high `sufficient` means these candidates likely already cover the answer, so another recall round is " ++
+    "unlikely to help; a low one means the needed fact is probably not among them.";
+
+/// Jev-Mem read path on the tool surface: per-hit relevance plus evidence
+/// sufficiency for the bodies this result exposes. Advisory mode appends it
+/// to the envelope (never past the byte contract); shadow mode journals only.
+fn appendEvidenceJudgment(
+    ctx: *const ToolContext,
+    out: *std.ArrayList(u8),
+    evidence: *const EvidenceCandidates,
+    query: []const u8,
+) !void {
+    const advisor = ctx.jev orelse return;
+    if (evidence.len == 0) return;
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(ctx.allocator);
+    try request.appendSlice(ctx.allocator, "recall query: ");
+    try request.appendSlice(ctx.allocator, query);
+    if (ctx.jev_request.len > 0) {
+        try request.appendSlice(ctx.allocator, "\nuser request: ");
+        try request.appendSlice(ctx.allocator, ctx.jev_request);
+    }
+    var candidates: [jev_advisor.MAX_RECALL_CANDIDATES]jev_advisor.RecallCandidate = undefined;
+    for (0..evidence.len) |index| candidates[index] = .{ .type_label = evidence.labels[index], .text = evidence.texts[index] };
+    const judgment = advisor.judgeRecallEvidence(ctx.allocator, ctx.abort, request.items, candidates[0..evidence.len]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Aborted => return error.Aborted,
+    };
+    const n = evidence.len;
+    const answered = judgment.answered();
+    var positive: u32 = 0;
+    if (answered) {
+        for (judgment.percents[0..n]) |percent| {
+            if (percent >= scoped_recall_mod.RELEVANCE_THRESHOLD_PERCENT) positive += 1;
+        }
+    }
+    var rendered = false;
+    if (answered and advisor.actuates()) {
+        var block: std.ArrayList(u8) = .empty;
+        defer block.deinit(ctx.allocator);
+        try block.print(ctx.allocator, ",\"system_one\":{{\"judge\":\"system_one\",\"question_set\":\"{s}\",\"relevance\":[", .{jev_advisor.RECALL_EVIDENCE_SET});
+        for (0..n) |index| {
+            if (index > 0) try block.append(ctx.allocator, ',');
+            try block.print(ctx.allocator, "{{\"node_id\":{d},\"percent\":{d}}}", .{ evidence.node_ids[index], judgment.percents[index] });
+        }
+        try block.print(ctx.allocator, "],\"sufficient\":{d},\"guidance\":", .{judgment.percents[n]});
+        try appendJsonString(&block, ctx.allocator, EVIDENCE_GUIDANCE);
+        try block.append(ctx.allocator, '}');
+        // The closing brace still follows; stay inside the byte contract or
+        // leave the baseline envelope untouched.
+        if (out.items.len + block.items.len + 1 <= MAX_RECALL_RESULT_BYTES) {
+            try out.appendSlice(ctx.allocator, block.items);
+            rendered = true;
+        }
+    }
+    const judged: u32 = if (answered) @intCast(n) else 0;
+    if (ctx.tool_observer) |observer| {
+        _ = observer.emit(judgment.audit.event(rendered, judged, positive, judged));
+    }
+    log.info("kg", "kg_recall evidence judge mode={s} outcome={s} judged={d} relevant={d} sufficient={d} rendered={}", .{
+        @tagName(judgment.audit.mode), @tagName(judgment.audit.outcome), judged, positive, if (answered) judgment.percents[n] else 0, rendered,
+    });
 }
 
 fn appendRecallEnvelope(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {

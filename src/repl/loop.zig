@@ -770,7 +770,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         const mode_before = app.permission_ctx.modeValue();
         const started_ns = util_time.nowNs();
         // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
-        const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort) catch null) else null;
+        const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
         // 会话根目录跟着改名走:这里是唯一向用户说一句的地方(buildRunOptions 里的再次调用是 no-op)。
         switch (app.refreshWorkspaceRoot()) {

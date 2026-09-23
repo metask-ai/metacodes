@@ -30,6 +30,8 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Sequence, Tuple
@@ -146,7 +148,15 @@ ARM_TO_RUNTIME = {
     "claude_style": "claude_style",
     "tinykg_lexical": "tinykg",
     "tinykg": "tinykg",
+    # The TinyKG treatment plus the System-One (Jev) advisor in advisory mode,
+    # reached only through the runner-owned loopback judge proxy.
+    "tinykg_jev": "tinykg",
 }
+SYSTEM_ONE_ARMS = frozenset({"tinykg_jev"})
+SYSTEM_ONE_LOG_NAME = "system-one-judge.jsonl"
+SYSTEM_ONE_SCRIPTED_MODEL = "scripted-system-one"
+SYSTEM_ONE_TIMEOUT_MS = "10000"
+SYSTEM_ONE_MAX_REQUEST_BYTES = 64 * 1024
 SAFE_STOP_REASONS = frozenset({"end_turn", "max_turns", "tool_loop", "budget"})
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 BudgetFaultHook = Callable[[str, Mapping[str, Any]], None]
@@ -173,6 +183,10 @@ class ProductionRuntimeConfig:
     max_output_tokens: int = 4096
     ripgrep_binary: Path | None = None
     ripgrep_binary_sha256: str | None = None
+    # System-One judge for `tinykg_jev` rows: the runner's loopback proxy
+    # forwards to this origin, and the child refuses any other model.
+    system_one_upstream: str | None = None
+    system_one_model: str | None = None
 
     def validate(self, rollout_count: int) -> None:
         if not self.allow_paid_rollouts:
@@ -1175,6 +1189,143 @@ class _ScriptedPlanner:
         return _text_sse("runtime-smoke", request_id)
 
 
+class SystemOneJudgeProxy:
+    """Runner-owned loopback front for the System-One judge of a Jev arm.
+
+    The child talks only to 127.0.0.1, so its external_network_calls stays an
+    honest zero; every judge exchange the runner answers or forwards is logged
+    (request/response SHA-256, status) into the rollout's artifact tree, which
+    the receipt already hash-binds. Without an upstream the proxy is a scripted
+    judge (every boolean 0.75) so the zero-cost smoke stays offline.
+    """
+
+    def __init__(self, upstream: str | None, *, timeout_seconds: float = 10.0) -> None:
+        if upstream is not None:
+            upstream = upstream.rstrip("/")
+            if not re.fullmatch(r"https?://[^/\s]+", upstream):
+                _fail("System-One upstream", "expected a bare http(s) origin")
+        self.upstream = upstream
+        self.timeout_seconds = timeout_seconds
+        self.records: List[Mapping[str, Any]] = []
+        self._lock = threading.Lock()
+        self._server: http.server.ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self.port: int | None = None
+
+    @staticmethod
+    def scripted_answer(body: bytes) -> bytes:
+        request = json.loads(body)
+        answers: Dict[str, Any] = {}
+        for name, question in request["questions"].items():
+            if question.get("type") != "boolean":
+                raise ValueError("scripted judge answers boolean questions only")
+            answers[name] = {"probabilities": {"false": 0.25, "true": 0.75}, "type": "boolean"}
+        return json.dumps(
+            {
+                "answers": answers,
+                "model": SYSTEM_ONE_SCRIPTED_MODEL,
+                "usage": {"provider": "self-hosted", "tariff": "none"},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def _exchange(self, body: bytes) -> Tuple[int, bytes]:
+        if self.upstream is None:
+            try:
+                return 200, self.scripted_answer(body)
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                return 400, b'{"error":"scripted judge rejected the request"}'
+        request = urllib_request.Request(
+            self.upstream + "/v1/systemone",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(request, timeout=self.timeout_seconds) as response:
+                return int(response.status), response.read(SYSTEM_ONE_MAX_REQUEST_BYTES + 1)
+        except urllib_error.HTTPError as exc:
+            return int(exc.code), exc.read(SYSTEM_ONE_MAX_REQUEST_BYTES + 1)
+        except (OSError, urllib_error.URLError):
+            return 502, b'{"error":"upstream judge unavailable"}'
+
+    def __enter__(self) -> "SystemOneJudgeProxy":
+        proxy = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args: Any) -> None:
+                return
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib hook name
+                length = int(self.headers.get("content-length") or "0")
+                if self.path != "/v1/systemone" or length <= 0 or length > SYSTEM_ONE_MAX_REQUEST_BYTES:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                body = self.rfile.read(length)
+                status, payload = proxy._exchange(body)
+                answered = False
+                if status == 200:
+                    try:
+                        answered = isinstance(json.loads(payload).get("answers"), dict)
+                    except (ValueError, AttributeError):
+                        answered = False
+                with proxy._lock:
+                    proxy.records.append(
+                        {
+                            "sequence": len(proxy.records),
+                            "request_sha256": hashlib.sha256(body).hexdigest(),
+                            "response_sha256": hashlib.sha256(payload).hexdigest(),
+                            "status": status,
+                            "answered": answered,
+                        }
+                    )
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                try:
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.port = int(self._server.server_address[1])
+        self._thread = threading.Thread(target=self._server.serve_forever, name="memory-system-one-proxy", daemon=True)
+        self._thread.start()
+        return self
+
+    @property
+    def origin(self) -> str:
+        if self.port is None:
+            raise RuntimeError("System-One proxy has not started")
+        return f"http://127.0.0.1:{self.port}"
+
+    def summary(self) -> Mapping[str, Any]:
+        with self._lock:
+            records = list(self.records)
+        return {
+            "requests": len(records),
+            "answered": sum(1 for record in records if record["answered"]),
+            "log_sha256": hashlib.sha256(
+                "".join(stable_json(record) + "\n" for record in records).encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def write_log(self, path: Path) -> None:
+        with self._lock:
+            payload = "".join(stable_json(record) + "\n" for record in self.records)
+        _write_new(path, payload.encode("utf-8"))
+
+    def __exit__(self, *_args: Any) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+
 class ScriptedMemoryProvider:
     """Loopback-only deterministic Anthropic SSE provider for native L2."""
 
@@ -1678,10 +1829,15 @@ def _sanitized_environment(base: Mapping[str, str]) -> Dict[str, str]:
         "METACODES_RECALL_FLOOR",
         "METASK_API_KEY",
     }
+    # METACODES_JEV_* would silently install a System-One advisor in every arm
+    # (including the no-memory baseline); treatment settings are added only
+    # explicitly by the caller.
     return {
         key: value
         for key, value in base.items()
-        if not key.startswith("TINYKG_") and key not in forbidden_exact
+        if not key.startswith("TINYKG_")
+        and not key.startswith("METACODES_JEV_")
+        and key not in forbidden_exact
     }
 
 
@@ -3338,6 +3494,21 @@ def run_memory_agent_schedule(
             env["METACODES_FORCE_COMPACT_AT"] = PRODUCTION_FORCE_COMPACT_AT
             assert pinned_ripgrep is not None
             env["RG_BIN"] = str(pinned_ripgrep)
+        system_one_proxy: SystemOneJudgeProxy | None = None
+        if arm_id in SYSTEM_ONE_ARMS:
+            if production is not None and (
+                not production.system_one_upstream or not production.system_one_model
+            ):
+                _fail("System-One arm", "a paid Jev arm requires a pinned upstream and model")
+            system_one_proxy = SystemOneJudgeProxy(
+                production.system_one_upstream if production is not None else None
+            ).__enter__()
+            env["METACODES_JEV_URL"] = system_one_proxy.origin
+            env["METACODES_JEV_MODE"] = "advisory"
+            env["METACODES_JEV_TIMEOUT_MS"] = SYSTEM_ONE_TIMEOUT_MS
+            env["METACODES_JEV_MODEL"] = (
+                production.system_one_model if production is not None else SYSTEM_ONE_SCRIPTED_MODEL
+            )
         common_args = [
             str(metacodes),
             "--model",
@@ -3496,6 +3667,11 @@ def run_memory_agent_schedule(
             raise
         finally:
             os.close(metadata_fd)
+            if system_one_proxy is not None:
+                system_one_proxy.__exit__(None, None, None)
+        if system_one_proxy is not None:
+            # Hash-bound with the rest of the rollout artifact tree.
+            system_one_proxy.write_log(artifact_dir / SYSTEM_ONE_LOG_NAME)
         elapsed_ms = (time.monotonic_ns() - started) / 1_000_000.0
         # Persist the direct child evidence before parsing NDJSON or finalizing
         # native events.  A signal exit commonly leaves no result row; checking
@@ -4178,6 +4354,15 @@ def run_memory_agent_schedule(
                     "paid_cost_usd": 0.0,
                 }
             )
+        if system_one_proxy is not None:
+            judge = system_one_proxy.summary()
+            # Treatment attestation: a Jev arm whose judge was consulted but
+            # never answered ran the baseline and must not be scored as the
+            # treatment. No consultation at all is the treatment's own
+            # behavior: the host asks only when the BM25 floor admitted
+            # candidates or a memory tool ran.
+            if judge["requests"] > 0 and judge["answered"] < 1:
+                _fail(f"System-One treatment for rollout {run_id}", "the judge was consulted but never answered")
         rollout_receipts.append(rollout_receipt)
 
         if production is not None:
