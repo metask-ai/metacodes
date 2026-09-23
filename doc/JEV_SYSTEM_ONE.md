@@ -51,7 +51,7 @@ src/jev/runtime.zig    METACODES_JEV_* 解析、堆上固定的 Runtime(App 持�
 
 | 决策 | 问题目录 | 基线（无顾问） | advisory 下的变化 |
 |---|---|---|---|
-| 自动召回注入（scoped recall） | `metacodes.jev.recall-relevance.v2` | BM25 top-3，绝对地板 3.0 + 相对衰减 0.5 | 见 §4：地板通过后按“判断概率 + BM25”重排 8 个候选 |
+| 自动召回注入（scoped recall） | `metacodes.jev.recall-relevance.v2` | BM25 top-3，绝对地板 3.0 + 相对衰减 0.5 | 见 §4：地板通过后，在 BM25 带内按“判断概率 + BM25”重排 8 个候选 |
 | `KgRecall` 结果 | `metacodes.jev.recall-evidence.v2` | 原结果 | 追加 `system_one` 块：每条相关度 + 证据充分性 + 使用说明 |
 | `KgRemember` 写入 | `metacodes.jev.memory-relation.v1` | 前缀近重复检测 | 追加 `relations` 块：同义/矛盾的已有记忆（写入照常发生） |
 | 枚举意图 | `metacodes.jev.enumeration-intent.v1` | 确定性关键词提示 | 只武装**软提醒**；拒绝型修复仍只绑定确定性提示 |
@@ -166,22 +166,24 @@ Codex 的《Jev × metacodes Harness 接入方案》目标是用 Jev（+ JevTree
 - 1000 次生产驱动咨询全部应答（驱动截止 8 s）。单客户端延迟（100 次顺序请求）p50 0.91 s、
   p99 1.06 s、最大 1.20 s；三个评测客户端共享服务时 p50 约 2.4 s。
 
-失败的设计（都在 dev 上，按时间顺序）：
+设计迭代（按时间顺序）：
 
-| 设计 | turn dev 命中 | mixed 命中 |
-|---|---|---|
-| 基线（BM25 地板） | 0.620 | 0.720（全 500） |
-| v1：严格措辞 + Jev 独自选择 θ = 60 + 头部摘录 | 0.495（p = 0.001，更差） | 0.450（全 500，p ≈ 1e-22，更差） |
-| v2 措辞 + Jev 独自重排 θ = 40 + 聚焦窗口 | 0.730 | 0.700（dev） |
-| **v2 + 判断与 BM25 融合（定稿）** | 0.685 | 0.780（dev，生产驱动） |
+| 设计 | turn dev 命中 | mixed 命中 | 淘汰原因 |
+|---|---|---|---|
+| 基线（BM25 地板） | 0.620 | 0.720（全 500） | — |
+| v1：严格措辞 + Jev 独自选择 θ = 60 + 头部摘录 | 0.495（p = 0.001，更差） | 0.450（全 500，p ≈ 1e-22，更差） | 丢掉措辞迂回的相关记忆 |
+| v2 措辞 + Jev 独自重排 θ = 40 + 聚焦窗口 | 0.730 | 0.700（dev） | 长记忆上低于基线 |
+| v2 + 判断与 BM25 融合 | 0.685 | 0.780（dev，生产驱动） | 付费程序性试点注入兄弟任务的 diff（§6.3） |
+| **v2 + 融合 + BM25 带（定稿）** | 0.685 | 0.780（dev） | — |
 
 ### 6.3 付费配对试点（本项目自己的 production runner）
 
-两次试点都走 `scripts/eval/memory_agent_runtime_pilot.py`：GLM-5.2、receipt v9、Seatbelt 沙箱、
+所有付费试点都走 `scripts/eval/memory_agent_runtime_pilot.py`：GLM-5.2、receipt v9、Seatbelt 沙箱、
 持久预算 journal、无静默重试；Jev 臂的子进程只连 runner 自己的回环代理（`external_network_calls`
-保持 0），每次判断交换以请求/响应 SHA-256 记入 rollout 产物树。二进制 `4480d64`（sha256
-`fae24ca4…`），三臂 `no_memory` / `tinykg_lexical` / `tinykg_jev`，其中 `tinykg_jev` =
-`tinykg_lexical` + advisory 模式的 Jev（判断截止 10 s，排除超时这一混杂）。
+保持 0），每次判断交换以请求/响应 SHA-256 记入 rollout 产物树。`tinykg_jev` = `tinykg_lexical`
++ advisory 模式的 Jev（判断截止 10 s，排除超时这一混杂）。第一轮（v22、LongMemEval 30 例）用
+二进制 `4480d64`（sha256 `fae24ca4…`，无 BM25 带）；第二轮（v23、归因 60 例）用 `810591a`
+（sha256 `49f4b23e…`，含 BM25 带与 `METACODES_JEV_DECISIONS`）。第一轮的两份计划：
 
 - **程序性迁移** `evals/memory/pilots/procedural-glm52-v22`：v20 同一批 4 个家族、12 个案例、
   验证器逐字节相同，× 4 trials = 144 行，臂位置完全平衡。预注册主估计量：离线确定性成功率配对
@@ -257,7 +259,32 @@ scoped_recall`）。合计 $9.44。
 - 与第一次 30 例合并后（90 例），“多个不同 seed 计划”导致的无效行 lexical 与四面全开各 9 行：
   第一次试点里 3:1 的差异是噪声，不是注释诱发的。
 
-<!-- V23 RESULTS -->
+**程序性迁移 v23（付费，预注册，含 BM25 带，二进制 `810591a`）**：第 136 行（`no_memory` 臂）又遇到
+一次网关卡顿重发，同样按不变量中止；已核实的前 135 行覆盖全部 4 个家族：
+
+| 家族 | `no_memory` 离线 | `tinykg_lexical` 离线 | `tinykg_jev` 离线 |
+|---|---|---|---|
+| evidence-route | 0/8 | 7/8 | 7/8 |
+| rollback-ticket | 0/8 | 7/8 | 7/8 |
+| lease-release | 0/8 | 7/8 | 7/8 |
+| checkpoint-capsule | 0/6 | 6/6 | 6/6 |
+| 合计 | 0/30 | **27/30** | **27/30** |
+
+主估计量 `tinykg_jev − tinykg_lexical`：配对分歧 3:3，p = 1.0——v22 的迁移退化（15/18 对 18/18）
+消失。召回门在这 135 行里被咨询 16 次、一次都没有改变选择（与基线相同，正是带的设计）。在线行
+三臂 14–15/15；每行离线成本两臂都约 $0.10（`no_memory` $0.21，它没有记忆只能反复摸索）。
+
+**付费花费合计**（全部经持久预算 journal，无静默重试）：
+
+| 运行 | 结果 | 已提交 | 另计未结算敞口 |
+|---|---|---|---|
+| v21 | runner 缺陷中止（在线库 daemon 锁） | $0.046 | $0.80 |
+| LongMemEval 第一次 | runner 缺陷中止（JSONL U+2028） | $0.058 | — |
+| LongMemEval 30 例 | 完成 | $3.255 | — |
+| v22 | 网关卡顿中止，81 行已核实 | $8.315 | $0.80 |
+| 归因 60 例（两份） | 完成 | $9.443 | — |
+| v23 | 网关卡顿中止，135 行已核实 | $14.922 | $0.60 |
+| **合计** | | **$36.04** | 保守 **$38.24**（授权 $200） |
 
 ## 7. 结论与推荐配置
 
@@ -265,7 +292,7 @@ scoped_recall`）。合计 $9.44。
 
 | 决策面 | 证据 | 推荐 |
 |---|---|---|
-| `scoped_recall` 召回门 | 离线：原子记忆 holdout 命中 0.633 → 0.703（p = 0.0019），注入少 43%、噪声少 71%；整段会话记忆命中持平、噪声少 76%；程序性池与基线逐一相同（BM25 带）。付费：LongMemEval 准确率不变，已核实金标证据 33/60 → 42/60（p = 0.049） | **advisory** |
+| `scoped_recall` 召回门 | 离线：原子记忆 holdout 命中 0.633 → 0.703（p = 0.0019），注入少 43%、噪声少 71%；整段会话记忆命中持平、噪声少 76%；程序性池与基线逐一相同（BM25 带）。付费：程序性迁移离线 27/30 对 lexical 27/30（未设带的 v22 是 15/18 对 18/18）；LongMemEval 准确率不变，已核实金标证据 33/60 → 42/60（p = 0.049） | **advisory** |
 | `recall_evidence` KgRecall 注释 | 付费归因：没有增益，且抵消了召回门带来的核实提升（34/60 对 42/60） | 关闭（待重新设计） |
 | `memory_relation` 写路径关系 | 所有付费试点里一次都没被咨询（没有写入与已有记忆冲突） | 暂不启用；需要有冲突写入的评测 |
 | `enumeration_intent` 枚举意图 | 付费试点里咨询 55 次，一次都没越过 80% 阈值、从未武装软提醒 | 暂不启用 |
