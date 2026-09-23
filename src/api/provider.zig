@@ -62,10 +62,20 @@ pub const RequestAbortRegistry = struct {
         shutdown_fn: ShutdownFn,
         /// 0 = no liveness monitoring for this request.
         idle_limit_ms: u64 = 0,
+        /// Last *progress*: bytes that carry model output (any SSE line that is
+        /// not a keepalive, or any byte of a non-stream body). This is the clock
+        /// the idle limit is judged against.
         last_activity_ms: u64 = 0,
+        /// Last byte of any kind, keepalives included. Never judged, only
+        /// reported: it tells a stall apart from a dead connection (2026-09-23:
+        /// a gateway pinged every 15 s for 55 minutes while its upstream produced
+        /// nothing; counting those pings as activity made the stall invisible).
+        last_transport_ms: u64 = 0,
         /// Set once the monitor shut the request down for inactivity: how long
         /// it had been silent. Read by the transport to name the failure.
         stalled_after_ms: ?u64 = null,
+        /// Transport idle at the moment of the stall verdict (see `Stall`).
+        stalled_transport_idle_ms: u64 = 0,
     };
 
     /// Monitor wake-up interval; also bounds how late a stall is detected.
@@ -75,8 +85,13 @@ pub const RequestAbortRegistry = struct {
     /// the request had been silent and which limit was in force at the time
     /// (head- or body-phase). The transport names the failure with both.
     pub const Stall = struct {
+        /// Silence in *progress* terms (no model-output bytes for this long).
         idle_ms: u64,
         limit_ms: u64,
+        /// Silence in transport terms (no bytes at all, keepalives included).
+        /// Much smaller than `idle_ms` means the gateway kept the connection
+        /// alive while producing nothing; equal means the connection was dead.
+        transport_idle_ms: u64,
     };
 
     mutex: sync.Mutex = .{},
@@ -108,12 +123,14 @@ pub const RequestAbortRegistry = struct {
     ) error{OutOfMemory}!void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        const now = monotonicMs();
         try self.slots.append(allocator, .{
             .signal = signal,
             .ctx = ctx,
             .shutdown_fn = shutdown_fn,
             .idle_limit_ms = idle_limit_ms,
-            .last_activity_ms = monotonicMs(),
+            .last_activity_ms = now,
+            .last_transport_ms = now,
         });
         // Close the race where abort was accepted just before the transport
         // published its request in this registry.
@@ -144,7 +161,9 @@ pub const RequestAbortRegistry = struct {
         for (self.slots.items) |*active| {
             if (active.ctx != ctx) continue;
             active.idle_limit_ms = limit_ms;
-            active.last_activity_ms = monotonicMs();
+            const now = monotonicMs();
+            active.last_activity_ms = now;
+            active.last_transport_ms = now;
             self.ensureMonitorLocked(limit_ms);
             return;
         }
@@ -169,14 +188,32 @@ pub const RequestAbortRegistry = struct {
         }
     }
 
-    /// Bytes arrived for `ctx`: restart its idle clock. Cheap (one uncontended
-    /// lock); called per transport read (`LivenessReader`), i.e. per `recv`.
+    /// Progress arrived for `ctx` (model-output bytes: a non-keepalive SSE line,
+    /// or any byte of a non-stream body): restart the idle clock. Cheap (one
+    /// uncontended lock).
     pub fn touch(self: *RequestAbortRegistry, ctx: *anyopaque) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.slots.items) |*active| {
             if (active.ctx == ctx) {
-                active.last_activity_ms = monotonicMs();
+                const now = monotonicMs();
+                active.last_activity_ms = now;
+                active.last_transport_ms = now;
+                return;
+            }
+        }
+    }
+
+    /// Bytes of any kind arrived for `ctx` (called per transport read by
+    /// `LivenessReader` in transport-only mode). Does **not** restart the idle
+    /// clock: a keepalive proves the gateway is up, not that the model is
+    /// producing. Only the stall report reads this stamp.
+    pub fn touchTransport(self: *RequestAbortRegistry, ctx: *anyopaque) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.slots.items) |*active| {
+            if (active.ctx == ctx) {
+                active.last_transport_ms = monotonicMs();
                 return;
             }
         }
@@ -194,7 +231,8 @@ pub const RequestAbortRegistry = struct {
             const idle = now_ms -| active.last_activity_ms;
             if (idle < active.idle_limit_ms) continue;
             active.stalled_after_ms = idle;
-            log.warn("client", "stream idle for {d}ms (limit {d}ms): shutting down the connection so the blocked read returns", .{ idle, active.idle_limit_ms });
+            active.stalled_transport_idle_ms = now_ms -| active.last_transport_ms;
+            log.warn("client", "stream idle for {d}ms (limit {d}ms, last transport byte {d}ms ago): shutting down the connection so the blocked read returns", .{ idle, active.idle_limit_ms, active.stalled_transport_idle_ms });
             active.shutdown_fn(active.ctx);
             reaped += 1;
         }
@@ -215,7 +253,7 @@ pub const RequestAbortRegistry = struct {
         for (self.slots.items) |active| {
             if (active.ctx != ctx) continue;
             const idle = active.stalled_after_ms orelse return null;
-            return .{ .idle_ms = idle, .limit_ms = active.idle_limit_ms };
+            return .{ .idle_ms = idle, .limit_ms = active.idle_limit_ms, .transport_idle_ms = active.stalled_transport_idle_ms };
         }
         return null;
     }
@@ -561,6 +599,8 @@ test "RequestAbortRegistry: reapStalled shuts a silent request down once, touch 
     const verdict = registry.stalled(@ptrCast(&watched)).?;
     try std.testing.expect(verdict.idle_ms >= 1_000);
     try std.testing.expectEqual(@as(u64, 1_000), verdict.limit_ms);
+    // No transport activity was reported after the progress touch, so both clocks agree.
+    try std.testing.expectEqual(verdict.idle_ms, verdict.transport_idle_ms);
     try std.testing.expect(registry.stalled(@ptrCast(&unwatched)) == null);
     // A liveness-only slot is not cancellable through any signal.
     var signal = AbortSignal.init();
@@ -737,4 +777,27 @@ test "a subagent's budget follows its model_override, not the shared provider" {
     plain.maxTokensForFn = null;
     try std.testing.expectEqual(@as(u32, 200_000), plain.maxInputTokensFor("child-32k"));
     try std.testing.expectEqual(@as(u32, 32_000), plain.maxTokensFor("child-32k"));
+}
+
+test "RequestAbortRegistry: touchTransport keeps the connection's byte stamp fresh but never restarts the idle clock" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(a);
+    var probe = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&probe), LivenessProbe.shutdown, 1_000);
+    defer registry.unregister(@ptrCast(&probe));
+    const registered_at = registry.slots.items[0].last_activity_ms;
+    // Keepalive bytes keep arriving (gateway pings) — the transport stamp moves,
+    // the progress stamp does not.
+    registry.slots.items[0].last_transport_ms = registered_at + 900;
+    registry.touchTransport(@ptrCast(&probe));
+    try std.testing.expect(registry.slots.items[0].last_transport_ms >= registered_at);
+    try std.testing.expectEqual(registered_at, registry.slots.items[0].last_activity_ms);
+    // Force the stamps to known values so the verdict is deterministic.
+    registry.slots.items[0].last_transport_ms = registered_at + 950;
+    try std.testing.expectEqual(@as(usize, 1), registry.reapStalled(registered_at + 1_000));
+    const verdict = registry.stalled(@ptrCast(&probe)).?;
+    try std.testing.expectEqual(@as(u64, 1_000), verdict.idle_ms);
+    try std.testing.expectEqual(@as(u64, 50), verdict.transport_idle_ms);
+    try std.testing.expectEqual(@as(u32, 1), probe.shutdowns.load(.acquire));
 }

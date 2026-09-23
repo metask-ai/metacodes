@@ -86,7 +86,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         if (host.stopRequested()) continue;
         // 命令期被打断的残留 interrupt 复位——否则毒化紧随的 pending run / inbox 消息
         // (already-aborted 即刻吞掉)。
-        if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.resetForTesting();
+        if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.reset();
 
         if (!pending_run) {
             const msg = host.inbox.popFront() orelse {
@@ -172,7 +172,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         // abort 复位:user_interrupt(前端 Stop)复位继续下一条;user_ctrl_c(host 停)由循环条件
         // stopRequested() 处理(serve 关停时 requestStop 置 stop_flag),不在此复位。
         if (result.stop_reason == .aborted and app.abort.reason() == .user_interrupt) {
-            app.abort.resetForTesting();
+            app.abort.reset();
         }
     }
 }

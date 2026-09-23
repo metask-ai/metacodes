@@ -366,7 +366,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         // pending run / inbox 消息会被 already-aborted 即刻吞掉(S1 同类)。SIGINT 不复位;
         // 若 SIGINT 恰在残留 interrupt 存续期到达(first-reason-wins 遮蔽),该次按键随
         // 复位丢失、下一次生效——与既有空闲/run 后复位点的语义一致,可接受。
-        if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.resetForTesting();
+        if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.reset();
 
         if (!pending_run) {
             // ── 空闲期:等消息 ──────────────────────────────────────────────
@@ -376,7 +376,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
             const msg = inbox.popFront() orelse {
                 if (app.abort.isAborted()) {
                     if (app.abort.reason() == .user_ctrl_c) break :outer;
-                    app.abort.resetForTesting(); // 残留 interrupt,不退出
+                    app.abort.reset(); // 残留 interrupt,不退出
                 }
                 time.sleepMs(50);
                 continue;
@@ -457,7 +457,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         // user_ctrl_c=生成期真 SIGINT → 退出;user_interrupt=浏览器 Stop → 继续。
         if (result.stop_reason == .aborted) {
             if (app.abort.reason() == .user_ctrl_c) break :outer;
-            app.abort.resetForTesting();
+            app.abort.reset();
         }
     }
 

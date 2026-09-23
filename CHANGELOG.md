@@ -10,6 +10,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- Stream liveness no longer counts gateway keepalives as progress: the body
+  idle clock is restarted only by SSE lines that carry model output
+  (`api/stream.zig isKeepaliveLine`), while transport bytes of any kind only
+  refresh a "last byte" stamp that the stall report uses to say whether the
+  gateway was pinging over a dead upstream or the connection itself died.
+  The body-phase cap drops from 60 to 30 minutes (`STREAM_BODY_IDLE_CAP_MS`);
+  a catalog `max_tokens` of 131072 had pushed the tolerated silence to the
+  old cap. (2026-09-23 incident: 55 minutes of pings, zero output.)
+- `tool_error`: `Aborted` is now `category: interrupted`, `recoverable: true`
+  (new category). A user or host interrupt is neither the model's fault nor
+  an environment fault; it no longer counts toward the `environment_fault`
+  breaker.
+
 ### Added
 
 - Release automation (`doc/RELEASE_AUTOMATION_DESIGN.md`): `scripts/release_cut.py`
@@ -22,6 +37,20 @@ status, compatibility boundaries, and entry points are defined by
   (in `doc:check`) closes the window between a release merging and reopen.
 
 ### Fixed
+
+- A Ctrl+C/Esc while the provider stream read was blocked was reported as a
+  model API error: `provider.cancel` shuts the socket, the read wakes with
+  `ReadFailed`, and the stream clients classified that before consulting the
+  abort signal. All three clients (and `agent_loop` as a backstop) now report
+  `Aborted`, keep the streamed prefix as partial text, and the REPL resets the
+  abort signal at every run boundary instead of only after `.aborted`, so a
+  stale flag no longer kills the next queued message on its first millisecond.
+- `environment_fault` is emitted after the `tool_result` it belongs to, so the
+  TUI prints the warning under the right tool card.
+- Bash-tool children (`platform/process.spawnToFiles`) get `/dev/null` on
+  stdin instead of inheriting the controlling terminal: a child in its own
+  process group that read the tty (`ssh` without `-n`) was stopped by SIGTTIN
+  and never exited.
 
 - A context-window rejection from the provider is now a measurement and a real
   compaction, not a one-pair shave. `recoverContextWindowExceeded` reads the

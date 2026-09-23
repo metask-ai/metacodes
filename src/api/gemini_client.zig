@@ -409,6 +409,12 @@ const GeminiStream = struct {
         return registry.stalled(self.request);
     }
 
+    /// 一条非保活 SSE 行 = 模型在产出 → 续正文空闲时钟。
+    fn touchProgress(self: *GeminiStream) void {
+        const registry = self.abort_registry orelse return;
+        registry.touch(self.request);
+    }
+
     fn next(self: *GeminiStream) anyerror!?StreamEvent {
         // 并行 functionCall 队列优先 drain(一个 chunk 多个 functionCall 的其余)。
         if (self.fc_pos < self.fc_queue.items.len) {
@@ -425,8 +431,9 @@ const GeminiStream = struct {
         if (self.reader == null) {
             const raw = self.response.reader(&self.transfer_buf);
             // 字节级续命:每次 recv 到字节就 touch(见 liveness_reader.zig)。
+            // 传输层字节只记"最近字节"时间戳;进展按非保活行续(下方)。
             self.reader = if (self.abort_registry) |registry| blk: {
-                self.liveness = liveness_reader.LivenessReader.init(raw, registry, self.request, &self.liveness_buf);
+                self.liveness = liveness_reader.LivenessReader.init(raw, registry, self.request, &self.liveness_buf, .transport_only);
                 break :blk &self.liveness.interface;
             } else raw;
         }
@@ -435,6 +442,8 @@ const GeminiStream = struct {
             if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
             const line_opt = r.takeDelimiter('\n') catch |err| {
                 self.done = true;
+                // 取消优先:cancel 关掉了 socket,读才失败的——是 Aborted,不是 API 错误。
+                if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
                 if (self.stalledVerdict()) |stall| {
                     client_mod.reportBodyStall("gemini", self.id, stall);
                     return error.StreamStalled;
@@ -443,7 +452,9 @@ const GeminiStream = struct {
             };
             const line = line_opt orelse {
                 self.done = true;
-                // EOF:连接若是被监视线程 shutdown 的,这是 stall 而非正常收尾。
+                // 干净 EOF:cancel 关掉的连接也可能这样醒来——是取消,不是收尾。
+                if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
+                // 连接若是被监视线程 shutdown 的,这是 stall 而非正常收尾。
                 if (self.stalledVerdict()) |stall| {
                     client_mod.reportBodyStall("gemini", self.id, stall);
                     return error.StreamStalled;
@@ -455,6 +466,8 @@ const GeminiStream = struct {
                 }
                 return null;
             };
+            // 进展记账:非保活行才续正文空闲时钟(ping/注释行不算,见 stream.zig)。
+            if (!api_stream.isKeepaliveLine(line)) self.touchProgress();
             const trimmed = std.mem.trim(u8, line, " \r\n");
             if (trimmed.len == 0) continue;
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;

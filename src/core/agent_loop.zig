@@ -77,6 +77,8 @@ test "isEnvironmentFault: 只认 system_error + recoverable:false 的结构化�
     // user_error / safety 是模型或规则的事,不算。
     try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"not_read\",\"category\":\"user_error\",\"detail\":\"x\",\"recoverable\":true}}"));
     try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"permission_denied\",\"category\":\"safety\",\"detail\":\"x\",\"recoverable\":false}}"));
+    // 用户/宿主中断(Esc/Ctrl+C)不是环境故障:tool_error 把 Aborted 归为 interrupted。
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"aborted\",\"category\":\"interrupted\",\"detail\":\"Bash failed with Aborted\",\"recoverable\":true}}"));
     // 普通输出里哪怕带这些词也不算:必须是错误信封。
     try std.testing.expect(!isEnvironmentFault("{\"stdout\":\"category system_error recoverable false\",\"exit_code\":0}"));
     // 缺 recoverable 字段 → 不算(不猜)。
@@ -1893,6 +1895,14 @@ pub fn run(
                         break;
                     },
                     else => |e| {
+                        // 取消优先:provider.cancel 关掉 socket 后,阻塞的读可能以传输层错误醒来而没
+                        // 经过 provider 自己的 abort 检查。用户按了 Ctrl+C/Esc 就是取消,不是 API 错误
+                        // ——否则部分文本被当残片丢掉,屏幕上打"模型 API 请求失败"(2026-09-23 实录)。
+                        if (opts.abort) |a| if (a.isAborted()) {
+                            aborted_during_stream = true;
+                            log.warnId("agent", rid, "stream error {s} after abort → treated as cancel", .{@errorName(e)});
+                            break;
+                        };
                         stream_error = true;
                         log.errId("agent", rid, "stream returned error {s} at turn {d}", .{ @errorName(e), turns + 1 });
                         break;
@@ -3217,19 +3227,6 @@ pub fn run(
             } });
             content_transferred = true;
 
-            // 环境故障:出现即告知(事件),累计到阈值本轮结束后停(见下方对话提交处)。
-            // content 的所有权已归 result_blocks,这里只读。
-            if (s.is_error and isEnvironmentFault(content)) {
-                environment_faults += 1;
-                backend.emitEvent(sess, .{ .environment_fault = .{
-                    .tool = s.name,
-                    .code = util_json.extractStringField(content, "code") orelse "",
-                    .detail = util_json.extractStringField(content, "detail") orelse "",
-                    .count = environment_faults,
-                    .limit = MAX_ENVIRONMENT_FAULTS,
-                } });
-            }
-
             // PostToolUse hook(执行后,仅真跑过的 slot):收集 additionalContext 注入下轮上下文。
             if (s.decision == .run) {
                 if (hookset) |hs| if (hs.hasPost()) {
@@ -3253,6 +3250,21 @@ pub fn run(
                     .is_error = s.is_error,
                     .elapsed_ms = s.elapsed_ms,
                     .file_refs = s.file_refs,
+                } });
+            }
+
+            // 环境故障:出现即告知(事件),累计到阈值本轮结束后停(见下方对话提交处)。
+            // content 的所有权已归 result_blocks,这里只读。**必须在 tool_result 之后发**:
+            // TUI 在 tool_result 时才把动态卡 commit 进滚动区,先发故障行会让它印在上一张卡
+            // 下面,读起来像是上一条命令出了错(2026-09-23 实录)。
+            if (s.is_error and isEnvironmentFault(content)) {
+                environment_faults += 1;
+                backend.emitEvent(sess, .{ .environment_fault = .{
+                    .tool = s.name,
+                    .code = util_json.extractStringField(content, "code") orelse "",
+                    .detail = util_json.extractStringField(content, "detail") orelse "",
+                    .count = environment_faults,
+                    .limit = MAX_ENVIRONMENT_FAULTS,
                 } });
             }
         }
