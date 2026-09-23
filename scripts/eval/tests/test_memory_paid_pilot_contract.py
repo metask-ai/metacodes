@@ -162,6 +162,34 @@ class PaidPilotContractTest(unittest.TestCase):
             budget["user_authorization_max_cost_usd"],
         )
 
+    def test_v23_reruns_the_jev_pilot_with_the_bm25_band_within_the_authorization(self):
+        contract = self._assert_jev_pilot("procedural-glm52-v23")
+        self.assertEqual(
+            [item["pilot_id"] for item in contract["predecessor_attempts"]],
+            [
+                "procedural-glm52-v21",
+                "longmemeval-s-jev-pilot30-attempt1",
+                "procedural-glm52-v22",
+                "longmemeval-s-jev-pilot30-attempt2",
+            ],
+        )
+        self.assertEqual(
+            contract["predecessor_attempts"][2]["verified_prefix_offline_success"],
+            {"no_memory": "0/18", "tinykg_lexical": "18/18", "tinykg_jev": "15/18"},
+        )
+        self.assertFalse(contract["incident_guard"]["v22_transaction_reuse"])
+        self.assertIn(
+            "bm25-band", contract["system_one"]["arm_descriptor"]["system_one"]["recall_selection"]
+        )
+        self.assertEqual(contract["harness"]["runner_source_commit"], "810591a")
+        budget = contract["budget_authority"]
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"]
+            + budget["max_total_cost_usd"]
+            + budget["companion_pilot_max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+
     def _assert_jev_pilot(self, pilot_id):
         pilot = ROOT / "evals/memory/pilots" / pilot_id
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
