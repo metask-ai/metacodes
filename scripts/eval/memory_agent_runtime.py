@@ -354,25 +354,6 @@ def _host_recall_covers_missing_explicit_recall(
     )
 
 
-def _injection_only_lookup_completed(
-    scoped_recall: Mapping[str, Any] | None,
-    query_plan_trace: Mapping[str, Any] | None = None,
-) -> bool:
-    """An injection-only arm withholds KgRecall by design, so a completed host
-    lookup that injected nothing (`below_floor`, `no_hits`) is the treatment's
-    own answer, not a broken TinyKG. A failed lookup still invalidates it."""
-
-    completed = bool(
-        scoped_recall is not None
-        and scoped_recall.get("status") in {"injected", "no_hits", "below_floor"}
-    )
-    if query_plan_trace is None:
-        return completed
-    return completed and query_plan_trace.get("invalid_reasons") == [
-        "TinyKG backend executed no KgRecall"
-    ]
-
-
 def _disallowed_provider_tools(arm_id: str) -> Tuple[str, ...]:
     """The provider tools a production child is launched without."""
 
@@ -410,8 +391,6 @@ def _atomic_memory_batch(
 def _query_plan_evaluator_invalid_reason(
     scoped_recall: Mapping[str, Any] | None,
     query_plan_trace: Mapping[str, Any],
-    *,
-    injection_only: bool = False,
 ) -> str | None:
     """Return a treatment-invalid reason without erasing safe recovery.
 
@@ -425,8 +404,6 @@ def _query_plan_evaluator_invalid_reason(
     if query_plan_trace["status"] != "invalid":
         return None
     if _host_recall_covers_missing_explicit_recall(scoped_recall, query_plan_trace):
-        return None
-    if injection_only and _injection_only_lookup_completed(scoped_recall, query_plan_trace):
         return None
     host_recall_satisfied = bool(
         scoped_recall is not None
@@ -4261,7 +4238,6 @@ def run_memory_agent_schedule(
         evaluator_invalid = _query_plan_evaluator_invalid_reason(
             scoped_recall_activation,
             query_plan_trace,
-            injection_only=arm_id in INJECTION_ONLY_ARMS,
         )
         if case["benchmark"] == "procedural_transfer":
             validator_entry = validators.get(case["id"])
@@ -4279,10 +4255,7 @@ def run_memory_agent_schedule(
             explicit_recall = bool(
                 memory_reads > 0 and query_variants and int(exposure["tool_result_bytes"]) > 0
             )
-            injection_only_completed = arm_id in INJECTION_ONLY_ARMS and _injection_only_lookup_completed(
-                scoped_recall_activation
-            )
-            if not host_recall_injected and not explicit_recall and not injection_only_completed:
+            if not host_recall_injected and not explicit_recall:
                 evaluator_invalid = (
                     evaluator_invalid
                     or "TinyKG backend exposed no verified host or explicit recall"

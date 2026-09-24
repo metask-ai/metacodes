@@ -666,7 +666,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             _host_recall_covers_missing_explicit_recall(None, missing_explicit)
         )
 
-    def test_injection_only_arms_withhold_tinykg_tools_and_waive_only_completed_lookups(self):
+    def test_injection_only_arms_withhold_tinykg_tools_and_keep_the_host_recall_rule(self):
         for arm in ("tinykg_inject", "tinykg_jev_inject"):
             self.assertEqual(ARM_TO_RUNTIME[arm], "tinykg")
             withheld = _disallowed_provider_tools(arm)
@@ -691,15 +691,11 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 root, run_id="run-inject", arm="tinykg_inject", memory_backend="tinykg_integrated"
             )
         self.assertEqual(no_recall["invalid_reasons"], ["TinyKG backend executed no KgRecall"])
-        # Withholding KgRecall is the treatment: a completed host lookup that
-        # injected nothing is scored, a failed one is not.
-        self.assertIsNone(
-            _query_plan_evaluator_invalid_reason({"status": "below_floor"}, no_recall, injection_only=True)
-        )
+        # Injection-only rows follow the protocol's host-recall rule: an
+        # injected or no-hit lookup is scored, a gate that exposed nothing is
+        # an inactive treatment and stays invalid (for both gates alike).
+        self.assertIsNone(_query_plan_evaluator_invalid_reason({"status": "injected"}, no_recall))
         self.assertIsNotNone(_query_plan_evaluator_invalid_reason({"status": "below_floor"}, no_recall))
-        self.assertIsNotNone(
-            _query_plan_evaluator_invalid_reason({"status": "search_error"}, no_recall, injection_only=True)
-        )
 
     def test_injection_only_activation_requires_the_tinykg_tools_to_be_withheld(self):
         def cassette(directory, system, tools):

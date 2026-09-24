@@ -2349,6 +2349,9 @@ def _validate_production_runtime_receipt(
             "claude_style": (True, False, []),
             "tinykg": (True, True, ["KgContext", "KgRecall", "KgRemember"]),
         }[runtime_arm]
+        if rollout["arm"] in INJECTION_ONLY_ARMS:
+            # TinyKG tools withheld: capability projection drops the graph section.
+            expected_flags = (True, False, [])
         observed_flags = (
             activation["memory_prompt_active"],
             activation["knowledge_graph_prompt_active"],
