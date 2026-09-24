@@ -349,7 +349,7 @@ test "init accepts a bare origin and appends the endpoint path" {
 test "init rejects origins that would send the payload somewhere unexpected" {
     const bad = [_][]const u8{
         "",
-        "58.211.6.133:10420",
+        "192.0.2.10:10420",
         "ftp://example.com",
         "http://example.com/v1/systemone",
         "http://example.com?x=1",

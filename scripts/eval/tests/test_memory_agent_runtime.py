@@ -5558,7 +5558,7 @@ class SystemOneJudgeProxyTests(unittest.TestCase):
         self.assertEqual(upstream.summary()["requests"], 1)
 
     def test_upstream_must_be_a_bare_origin(self):
-        for bad in ("58.211.6.133:10420", "http://judge/v1/systemone", "ftp://judge"):
+        for bad in ("192.0.2.10:10420", "http://judge/v1/systemone", "ftp://judge"):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValidationError):
                     SystemOneJudgeProxy(bad)
