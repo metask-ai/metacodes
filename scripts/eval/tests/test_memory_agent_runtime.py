@@ -718,7 +718,19 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         exposed = ("# System\n# Memory\n# Knowledge Graph\ngraph rules", ["Read", "KgRecall", "KgContext", "KgRemember"])
         with tempfile.TemporaryDirectory() as directory:
             evidence = _cassette_treatment_activation(cassette(directory, *hidden), "tinykg", "glm-5.2", injection_only=True)
-            self.assertTrue(evidence["injection_only"])
+            # Same evidence schema as every other arm (receipts reject unknown fields).
+            self.assertEqual(
+                set(evidence),
+                {
+                    "runtime_arm",
+                    "system_prompt_sha256",
+                    "tool_names_sha256",
+                    "memory_prompt_active",
+                    "knowledge_graph_prompt_active",
+                    "tinykg_tools_active",
+                    "fingerprint",
+                },
+            )
             self.assertEqual(evidence["tinykg_tools_active"], [])
             with self.assertRaisesRegex(ValidationError, "does not match runtime arm"):
                 _cassette_treatment_activation(cassette(directory, *hidden), "tinykg", "glm-5.2")
@@ -726,7 +738,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "does not match runtime arm"):
                 _cassette_treatment_activation(cassette(directory, *exposed), "tinykg", "glm-5.2", injection_only=True)
             full = _cassette_treatment_activation(cassette(directory, *exposed), "tinykg", "glm-5.2")
-            self.assertNotIn("injection_only", full)
+            self.assertEqual(full["tinykg_tools_active"], ["KgContext", "KgRecall", "KgRemember"])
 
     def test_atomic_memory_batch_keeps_only_turn_level_memories(self):
         from scripts.eval.memory_tinykg_local import _batch_bytes

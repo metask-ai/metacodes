@@ -856,8 +856,6 @@ def _cassette_treatment_activation(
         "knowledge_graph_prompt_active": has_graph,
         "tinykg_tools_active": sorted(names & kg_tools),
     }
-    if injection_only:
-        evidence["injection_only"] = True
     return {**evidence, "fingerprint": _canonical_sha256(evidence)}
 
 
