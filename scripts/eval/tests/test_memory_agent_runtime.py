@@ -16,6 +16,9 @@ from unittest import mock
 
 from scripts.eval.memory_agent_runtime import (
     _agent_batch,
+    _atomic_memory_batch,
+    _disallowed_provider_tools,
+    _query_plan_evaluator_invalid_reason,
     PRODUCTION_MODEL_FINGERPRINT,
     ProductionRuntimeConfig,
     _assert_production_sandbox_identity,
@@ -662,6 +665,89 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         self.assertFalse(
             _host_recall_covers_missing_explicit_recall(None, missing_explicit)
         )
+
+    def test_injection_only_arms_withhold_tinykg_tools_and_waive_only_completed_lookups(self):
+        for arm in ("tinykg_inject", "tinykg_jev_inject"):
+            self.assertEqual(ARM_TO_RUNTIME[arm], "tinykg")
+            withheld = _disallowed_provider_tools(arm)
+            self.assertTrue({"KgRecall", "KgContext", "KgRemember"} <= set(withheld))
+            self.assertTrue(set(PRODUCTION_DISALLOWED_PROVIDER_TOOLS) <= set(withheld))
+        self.assertEqual(_disallowed_provider_tools("tinykg_lexical"), PRODUCTION_DISALLOWED_PROVIDER_TOOLS)
+        self.assertIn("tinykg_jev_inject", SYSTEM_ONE_ARMS)
+        self.assertNotIn("tinykg_inject", SYSTEM_ONE_ARMS)
+        self.assertEqual(
+            _system_one_environment("tinykg_jev_inject", "http://127.0.0.1:9", "m")["METACODES_JEV_DECISIONS"],
+            "scoped_recall",
+        )
+        from scripts.eval.memory_query_plan import build_query_plan_trace
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "req-001.json").write_text(
+                stable_json({"messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}]}) + "\n",
+                encoding="utf-8",
+            )
+            no_recall = build_query_plan_trace(
+                root, run_id="run-inject", arm="tinykg_inject", memory_backend="tinykg_integrated"
+            )
+        self.assertEqual(no_recall["invalid_reasons"], ["TinyKG backend executed no KgRecall"])
+        # Withholding KgRecall is the treatment: a completed host lookup that
+        # injected nothing is scored, a failed one is not.
+        self.assertIsNone(
+            _query_plan_evaluator_invalid_reason({"status": "below_floor"}, no_recall, injection_only=True)
+        )
+        self.assertIsNotNone(_query_plan_evaluator_invalid_reason({"status": "below_floor"}, no_recall))
+        self.assertIsNotNone(
+            _query_plan_evaluator_invalid_reason({"status": "search_error"}, no_recall, injection_only=True)
+        )
+
+    def test_injection_only_activation_requires_the_tinykg_tools_to_be_withheld(self):
+        def cassette(directory, system, tools):
+            root = Path(directory)
+            (root / "req-001.json").write_text(
+                json.dumps({"model": "glm-5.2", "system": system, "tools": [{"name": name} for name in tools]}),
+                encoding="utf-8",
+            )
+            return root
+
+        hidden = (
+            "# System\n# Memory\nmemory rules\n# Knowledge Graph\nA persistent TinyKG store exposes only the "
+            "durable-memory and task operations present in the current API tool list.",
+            ["Read", "Bash"],
+        )
+        exposed = ("# System\n# Memory\n# Knowledge Graph\ngraph rules", ["Read", "KgRecall", "KgContext", "KgRemember"])
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = _cassette_treatment_activation(cassette(directory, *hidden), "tinykg", "glm-5.2", injection_only=True)
+            self.assertTrue(evidence["injection_only"])
+            self.assertEqual(evidence["tinykg_tools_active"], [])
+            with self.assertRaisesRegex(ValidationError, "does not match runtime arm"):
+                _cassette_treatment_activation(cassette(directory, *hidden), "tinykg", "glm-5.2")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValidationError, "does not match runtime arm"):
+                _cassette_treatment_activation(cassette(directory, *exposed), "tinykg", "glm-5.2", injection_only=True)
+            full = _cassette_treatment_activation(cassette(directory, *exposed), "tinykg", "glm-5.2")
+            self.assertNotIn("injection_only", full)
+
+    def test_atomic_memory_batch_keeps_only_turn_level_memories(self):
+        from scripts.eval.memory_tinykg_local import _batch_bytes
+
+        raw = _batch_bytes(
+            [
+                {"op": "node", "id": 1, "kind": "concept", "name": "Session 2023/05/01\nuser: hi"},
+                {"op": "node", "id": 2, "kind": "evidence", "name": "Session 2023/05/01 user: hi"},
+                {"op": "node", "id": 3, "kind": "evidence", "name": "Session 2023/05/01 assistant: hello"},
+            ],
+            [
+                {"op": "edge", "id": 1, "src": 1, "rel": "based_on", "dst": 2},
+                {"op": "edge", "id": 2, "src": 1, "rel": "based_on", "dst": 3},
+            ],
+        )
+        batch, logical, root = _atomic_memory_batch(raw, {1: "s1", 2: "s1", 3: "s1"})
+        records = [json.loads(line) for line in batch.decode("utf-8").split("\n") if line]
+        self.assertEqual(records[0], {"version": 1})
+        self.assertEqual([record["id"] for record in records[1:]], [2, 3])
+        self.assertTrue(all(record["op"] == "node" for record in records[1:]))
+        self.assertEqual((logical, root), ({2: "s1", 3: "s1"}, 2))
 
     def test_v6_query_plan_source_identity_remains_replayable(self):
         receipt = {
@@ -5416,7 +5502,7 @@ class SystemOneJudgeProxyTests(unittest.TestCase):
     def test_jev_arm_is_the_tinykg_runtime_plus_the_judge(self):
         self.assertEqual(ARM_TO_RUNTIME["tinykg_jev"], "tinykg")
         self.assertEqual(ARM_TO_RUNTIME["tinykg_jev_recall"], "tinykg")
-        self.assertEqual(SYSTEM_ONE_ARMS, frozenset({"tinykg_jev", "tinykg_jev_recall"}))
+        self.assertEqual(SYSTEM_ONE_ARMS, frozenset({"tinykg_jev", "tinykg_jev_recall", "tinykg_jev_inject"}))
 
     def test_attribution_arm_narrows_the_child_advisor_to_the_recall_gate(self):
         full = _system_one_environment("tinykg_jev", "http://127.0.0.1:9", "m")

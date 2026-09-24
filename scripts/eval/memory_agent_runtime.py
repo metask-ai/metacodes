@@ -69,6 +69,8 @@ from .memory_replay import (
     PRODUCTION_PROVIDER_ID,
     PRODUCTION_ALLOWED_PROVIDER_TOOLS,
     PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
+    INJECTION_ONLY_ARMS,
+    INJECTION_ONLY_WITHHELD_TOOLS,
     PRODUCTION_AUTO_COMPACT_POLICY,
     PRODUCTION_CHILD_PATH,
     PRODUCTION_FORCE_COMPACT_AT,
@@ -153,10 +155,14 @@ ARM_TO_RUNTIME = {
     "tinykg_jev": "tinykg",
     # Attribution arm: the same advisor on the scoped recall gate alone.
     "tinykg_jev_recall": "tinykg",
+    # Injection-only arms (INJECTION_ONLY_ARMS): TinyKG tools withheld, memory
+    # reaches the model only through the scoped recall gate, BM25 or Jev.
+    "tinykg_inject": "tinykg",
+    "tinykg_jev_inject": "tinykg",
 }
-SYSTEM_ONE_ARMS = frozenset({"tinykg_jev", "tinykg_jev_recall"})
+SYSTEM_ONE_ARMS = frozenset({"tinykg_jev", "tinykg_jev_recall", "tinykg_jev_inject"})
 # METACODES_JEV_DECISIONS for arms that advise a subset of the surfaces.
-SYSTEM_ONE_ARM_DECISIONS = {"tinykg_jev_recall": "scoped_recall"}
+SYSTEM_ONE_ARM_DECISIONS = {"tinykg_jev_recall": "scoped_recall", "tinykg_jev_inject": "scoped_recall"}
 SYSTEM_ONE_LOG_NAME = "system-one-judge.jsonl"
 SYSTEM_ONE_SCRIPTED_MODEL = "scripted-system-one"
 SYSTEM_ONE_TIMEOUT_MS = "10000"
@@ -348,9 +354,64 @@ def _host_recall_covers_missing_explicit_recall(
     )
 
 
+def _injection_only_lookup_completed(
+    scoped_recall: Mapping[str, Any] | None,
+    query_plan_trace: Mapping[str, Any] | None = None,
+) -> bool:
+    """An injection-only arm withholds KgRecall by design, so a completed host
+    lookup that injected nothing (`below_floor`, `no_hits`) is the treatment's
+    own answer, not a broken TinyKG. A failed lookup still invalidates it."""
+
+    completed = bool(
+        scoped_recall is not None
+        and scoped_recall.get("status") in {"injected", "no_hits", "below_floor"}
+    )
+    if query_plan_trace is None:
+        return completed
+    return completed and query_plan_trace.get("invalid_reasons") == [
+        "TinyKG backend executed no KgRecall"
+    ]
+
+
+def _disallowed_provider_tools(arm_id: str) -> Tuple[str, ...]:
+    """The provider tools a production child is launched without."""
+
+    if arm_id in INJECTION_ONLY_ARMS:
+        return (*PRODUCTION_DISALLOWED_PROVIDER_TOOLS, *INJECTION_ONLY_WITHHELD_TOOLS)
+    return PRODUCTION_DISALLOWED_PROVIDER_TOOLS
+
+
+def _atomic_memory_batch(
+    batch: bytes,
+    logical_ids: Mapping[int, str],
+) -> Tuple[bytes, Dict[int, str], int]:
+    """Keep only the turn-level (`evidence`) nodes of an episodic batch.
+
+    Session documents are dropped with the edges that reach them; each turn
+    keeps its logical session id, so retrieval is still scored at the official
+    session unit."""
+
+    lines = [line for line in batch.decode("utf-8").split("\n") if line]
+    if not lines or json.loads(lines[0]) != {"version": 1}:
+        _fail("atomic memory batch", "invalid version header")
+    kept = [lines[0]]
+    kept_ids: List[int] = []
+    for line in lines[1:]:
+        record = json.loads(line)
+        if record.get("op") == "node" and record.get("kind") == "evidence":
+            kept.append(line)
+            kept_ids.append(int(record["id"]))
+    if not kept_ids:
+        _fail("atomic memory batch", "episodic case has no turn-level memories")
+    logical = {node_id: logical_ids[node_id] for node_id in kept_ids}
+    return ("\n".join(kept) + "\n").encode("utf-8"), logical, kept_ids[0]
+
+
 def _query_plan_evaluator_invalid_reason(
     scoped_recall: Mapping[str, Any] | None,
     query_plan_trace: Mapping[str, Any],
+    *,
+    injection_only: bool = False,
 ) -> str | None:
     """Return a treatment-invalid reason without erasing safe recovery.
 
@@ -364,6 +425,8 @@ def _query_plan_evaluator_invalid_reason(
     if query_plan_trace["status"] != "invalid":
         return None
     if _host_recall_covers_missing_explicit_recall(scoped_recall, query_plan_trace):
+        return None
+    if injection_only and _injection_only_lookup_completed(scoped_recall, query_plan_trace):
         return None
     host_recall_satisfied = bool(
         scoped_recall is not None
@@ -3290,6 +3353,10 @@ def run_memory_agent_schedule(
                         manifest,
                         case["id"],
                     )
+                    if arm_id in INJECTION_ONLY_ARMS:
+                        if case["benchmark"] != "episodic_recall":
+                            _fail("injection-only arm", "is defined for episodic recall stores only")
+                        raw_batch, raw_logical, root_id = _atomic_memory_batch(raw_batch, raw_logical)
                     batch, logical_ids, _root_id, counts = _agent_batch(
                         raw_batch,
                         raw_logical,
@@ -3606,7 +3673,7 @@ def run_memory_agent_schedule(
                                 "--max-tokens",
                                 str(production.max_output_tokens),
                                 "--disallowedTools",
-                                ",".join(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
+                                ",".join(_disallowed_provider_tools(arm_id)),
                                 *common_args[3:],
                             ]
                         ),
@@ -3638,8 +3705,11 @@ def run_memory_agent_schedule(
                     cassette,
                     runtime_arm,
                     PRODUCTION_MODEL_ID,
+                    injection_only=arm_id in INJECTION_ONLY_ARMS,
                 )
             else:
+                if arm_id in INJECTION_ONLY_ARMS:
+                    _fail("injection-only arm", "the scripted provider always calls TinyKG tools")
                 with ScriptedMemoryProvider(
                     case["prompt"],
                     runtime_arm,
@@ -4191,6 +4261,7 @@ def run_memory_agent_schedule(
         evaluator_invalid = _query_plan_evaluator_invalid_reason(
             scoped_recall_activation,
             query_plan_trace,
+            injection_only=arm_id in INJECTION_ONLY_ARMS,
         )
         if case["benchmark"] == "procedural_transfer":
             validator_entry = validators.get(case["id"])
@@ -4208,7 +4279,10 @@ def run_memory_agent_schedule(
             explicit_recall = bool(
                 memory_reads > 0 and query_variants and int(exposure["tool_result_bytes"]) > 0
             )
-            if not host_recall_injected and not explicit_recall:
+            injection_only_completed = arm_id in INJECTION_ONLY_ARMS and _injection_only_lookup_completed(
+                scoped_recall_activation
+            )
+            if not host_recall_injected and not explicit_recall and not injection_only_completed:
                 evaluator_invalid = (
                     evaluator_invalid
                     or "TinyKG backend exposed no verified host or explicit recall"
