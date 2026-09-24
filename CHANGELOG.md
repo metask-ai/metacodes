@@ -45,8 +45,10 @@ status, compatibility boundaries, and entry points are defined by
   (`metacodes-system-one-decision-v1`): the scoped-recall decision on the
   evaluation stream, which the evaluation adapters validate, and the
   tool-surface decisions in the tool-observation journal.
-  The paid memory runner gains `tinykg_jev` and the attribution arm
-  `tinykg_jev_recall` (recall gate only) behind a loopback judge proxy, and
+  The paid memory runner gains `tinykg_jev`, the attribution arm
+  `tinykg_jev_recall` (recall gate only) and the injection-only arms
+  `tinykg_inject` / `tinykg_jev_inject` (TinyKG tools withheld, turn-level
+  store) behind a loopback judge proxy, and
   `zig build eval:jev-recall-driver` replays LongMemEval-S candidate pools
   through the production recall policies with no provider.
 - Release automation (`doc/RELEASE_AUTOMATION_DESIGN.md`): `scripts/release_cut.py`
@@ -60,6 +62,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
+  `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
+  `firstLine` backed off while the last kept byte was a continuation byte,
+  which strands the lead byte of a character cut at the limit: a CJK memory
+  reached the provider with a trailing U+FFFD and the scoped recall receipt
+  hashed different bytes than the provider received. All three use
+  `util/utf8.prefixEnd`.
 - Paid memory pilots could not run a TinyKG arm since TinyKG storage v3: an
   online (read-write) rollout store's sibling daemon-ownership lock
   (`<store>.tinykg-daemon.lock`) was outside the production Seatbelt
