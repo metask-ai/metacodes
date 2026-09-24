@@ -3147,9 +3147,8 @@ fn extractGcCount(summary: []const u8, key: []const u8) usize {
 
 fn firstLine(text: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    var n = @min(end, 100);
-    while (n > 0 and (text[n - 1] & 0xC0) == 0x80) n -= 1; // 不切半个 CJK 字
-    return text[0..n];
+    if (end <= 100) return text[0..end];
+    return text[0..@import("../util/utf8.zig").prefixEnd(text, 100)]; // 不切半个 CJK 字
 }
 
 /// max_turns backstop 可配(METACODES_MAX_TURNS 覆盖;默认 400)。非法值退默认。

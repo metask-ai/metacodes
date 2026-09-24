@@ -1039,9 +1039,21 @@ fn lastUserText(conversation: *const conv_mod.Conversation) ?[]const u8 {
 
 fn firstLine(text: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    var n = @min(end, MAX_HIT_TEXT_BYTES);
-    while (n > 0 and (text[n - 1] & 0xC0) == 0x80) n -= 1; // 不切半个 CJK 字
-    return text[0..n];
+    if (end <= MAX_HIT_TEXT_BYTES) return text[0..end];
+    // 不切半个 CJK 字。旧写法看切点前一字节，切进多字节字符时会留下孤立首字节:
+    // 注入回执哈希的是坏字节，provider 收到的是 U+FFFD。
+    return text[0..@import("../util/utf8.zig").prefixEnd(text, MAX_HIT_TEXT_BYTES)];
+}
+
+test "firstLine never ends inside a multi-byte character" {
+    // Every cut position inside the three-byte "中" at the 320-byte limit.
+    inline for (.{ 318, 319, 320 }) |ascii| {
+        const text = "a" ** ascii ++ "中文 tail";
+        const visible = firstLine(text);
+        try std.testing.expect(visible.len <= MAX_HIT_TEXT_BYTES);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(visible));
+    }
+    try std.testing.expectEqual(@as(usize, 317 + 3), firstLine("a" ** 317 ++ "中文").len);
 }
 
 test "firstLine keeps a canonical bridge placed after the old 100-byte cutoff" {
