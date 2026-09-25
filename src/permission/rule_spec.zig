@@ -193,10 +193,12 @@ pub fn matches(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []co
     return matchesMode(spec, mctx, tool_name, args, .deny);
 }
 
-/// 规则的 allow/deny 语义影响 symlink 处理:
-///   allow:路径规则要求 [原路径] 和 [realpath 解析后] **都**匹配(指向区外的链接也 prompt)
-///   deny :路径规则 [原路径] 或 [realpath] **任一**匹配即触发(指向 denied 文件的链接也 deny)
-/// 非路径规则不受影响。
+/// 规则种类决定"一次调用有多个候选时,几个匹中才算命中"——allow 要**全部**(放行须每个都被
+/// 允许),deny/ask **任一**即触发(无害的那个稀释不了限制):
+///   路径规则:候选 = [原路径] 与 [realpath 解析后](指向区外的链接也 prompt,指向 denied
+///             文件的链接也 deny);
+///   Bash 规则:候选 = 复合命令的每一段(`ls && rm x` 的 rm 段触发 deny `Bash(rm *)`)。
+/// 其它规则只有一个候选,不受影响。
 pub const RuleMode = enum { allow, deny, ask };
 
 pub fn matchesMode(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []const u8, args: []const u8, mode: RuleMode) bool {
@@ -213,7 +215,7 @@ pub fn matchesMode(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: 
 
     return switch (spec.spec) {
         .all => true,
-        .bash_pattern => |pat| matchesBashCompound(pat, extractCommand(args)),
+        .bash_pattern => |pat| matchesBashCompound(pat, mctx, args, mode),
         .powershell_pattern => |pat| matchesBashPattern(pat, extractCommand(args)),
         .path_pattern => |pp| matchesPathDual(pp, mctx, extractPath(args), mode),
         .web_domain => |dom| matchesWebDomain(dom, args),
@@ -286,58 +288,46 @@ fn realpathZ(buf: []u8, file_path: []const u8) ?[]const u8 {
     return buf[0..resolved.len];
 }
 
-/// 复合 Bash 命令(allow 规则语义):每个子命令(strip wrappers 后)都得被 pattern 匹中。
-/// 任一段没匹中 → 整体不匹中(因为放行 = 必须每段都允许)。
-fn matchesBashCompound(pattern: []const u8, full_cmd: []const u8) bool {
+/// Bash 规则只描述**单条**命令:复合命令(&& || ; | |& & 换行)拆段,每段 stripWrappers 后
+/// 与 pattern 比对,按规则种类聚合(见 RuleMode)——
+///   allow:**每段**都匹中才命中(`git status && rm x` 不被 Bash(git *) 放行);
+///   deny/ask:**任一段**匹中即命中(`ls && rm x` 的 rm 段触发 Bash(rm *);否则无害前缀
+///   让 deny 失效,bypass_permissions 等兜底 allow 的模式照样执行被 deny 的命令)。
+/// 拆的是 shell 真正收到的字节(commandFromArgs)。判不了(内存不足)时 allow 不命中、
+/// deny/ask 命中:两个方向都 fail-closed。
+fn matchesBashCompound(pattern: []const u8, mctx: *const MatchContext, args: []const u8, mode: RuleMode) bool {
     const bp = @import("bash_parser.zig");
-    // 单段优化:无 compound 分隔符直接走老路径
-    if (!hasCompoundSep(full_cmd)) {
-        return matchesBashPattern(pattern, bp.stripWrappers(full_cmd));
-    }
-    // 拆 + 逐段判定
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const segs = bp.splitCompound(arena.allocator(), full_cmd) catch return false;
-    if (segs.len == 0) return false;
+    const fail_closed = mode != .allow;
+    // 常见命令不上堆;超长命令(heredoc 等)落到 mctx.alloc(未填则 page_allocator)。
+    var sfa = std.heap.stackFallback(2048, mctx.alloc orelse std.heap.page_allocator);
+    const scratch = sfa.get();
+    const command = commandFromArgs(scratch, args) catch return fail_closed;
+    defer if (command) |c| scratch.free(c);
+    const segs = bp.splitCompound(scratch, command orelse "") catch return fail_closed;
+    defer scratch.free(segs);
+    // 无段可比(没有 command 字段——未知工具名也按 bash-style pattern 解析,如 `Grep(**)`
+    // ——或空命令):pattern 对空串判定,与拆段前一致,这类规则不因拆段失效。
+    if (segs.len == 0) return matchesBashPattern(pattern, "");
     for (segs) |seg| {
-        const real = bp.stripWrappers(seg);
-        if (!matchesBashPattern(pattern, real)) return false;
+        const hit = matchesBashPattern(pattern, bp.stripWrappers(seg));
+        switch (mode) {
+            .allow => if (!hit) return false,
+            .deny, .ask => if (hit) return true,
+        }
     }
-    return true;
+    return mode == .allow; // allow:每段都匹中;deny/ask:没有一段匹中
 }
 
-fn hasCompoundSep(s: []const u8) bool {
-    var in_s = false;
-    var in_d = false;
-    var in_b = false;
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        const c = s[i];
-        if (!in_d and !in_b and c == '\'') {
-            in_s = !in_s;
-            continue;
-        }
-        if (!in_s and !in_b and c == '"') {
-            in_d = !in_d;
-            continue;
-        }
-        if (!in_s and !in_d and c == '`') {
-            in_b = !in_b;
-            continue;
-        }
-        if (in_s or in_d or in_b) continue;
-        if (c == '\\' and i + 1 < s.len) {
-            i += 1;
-            continue;
-        }
-        if (c == ';' or c == '\n' or c == '|') return true;
-        if (c == '&') {
-            if (i + 1 < s.len and s[i + 1] == '&') return true;
-            return true; // 单 & 也算后台分隔
-        }
-    }
-    return false;
+/// Bash 工具真正交给 shell 的命令:与 tools/bash.zig executeInner(及 monitor.zig)同一取字段
+/// (common.extractJsonArg)+ 同一 JSON unescape。拿转义原文拆段时 `\n`、`\u0026\u0026` 这类
+/// 分隔符不可见(deny 被当单段漏判,allow 被 `echo hi\nrm -rf ~` 骗过),`\"` 又让引号内的
+/// `;` 被误拆。字段缺失 → null。caller 持有返回值。旧 config.json 规则(rule_matcher)同用。
+pub fn commandFromArgs(gpa: std.mem.Allocator, args: []const u8) error{OutOfMemory}!?[]u8 {
+    const escaped = tools_common.extractJsonArg(args, "command") orelse return null;
+    return try util_json_mod.unescapeString(escaped, gpa);
 }
+
+const tools_common = @import("../tools/common.zig");
 
 // ============================================================================
 // Bash 通配:* 任意 + 末尾 word boundary + :* 后缀等价
@@ -792,6 +782,7 @@ fn try_concat(_: []const u8, _: []const u8) []const u8 {
 // args 抽字段(共用 util/json 但简化)
 // ============================================================================
 
+/// command 字段的 JSON 转义原文(未 unescape)。Bash 规则匹配不用它,用 commandFromArgs。
 pub fn extractCommand(args: []const u8) []const u8 {
     return extractStringField(args, "command") orelse "";
 }
@@ -997,15 +988,68 @@ test "matches: mcp__server__tool exact" {
     try testing.expect(!matches(&r, &mctx, "puppeteer__screenshot", "{}"));
 }
 
-test "matches: Bash compound — all segs must match" {
+test "matchesMode: Bash compound — allow 要每段都匹中,deny/ask 任一段即命中" {
     const r = try parseRule("Bash(git *)");
-    var mctx = MatchContext{};
+    const mctx = MatchContext{};
+    const mixed = "{\"command\":\"git status && rm -rf /\"}";
     // 单段:正常
-    try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"git status\"}"));
+    try testing.expect(matchesMode(&r, &mctx, "Bash", "{\"command\":\"git status\"}", .allow));
     // 复合且全是 git:OK
-    try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"git status && git log\"}"));
-    // 复合且夹了 rm:整体拒
-    try testing.expect(!matches(&r, &mctx, "Bash", "{\"command\":\"git status && rm -rf /\"}"));
+    try testing.expect(matchesMode(&r, &mctx, "Bash", "{\"command\":\"git status && git log\"}", .allow));
+    // 复合且夹了 rm:allow 整体拒;deny/ask 的 git 段已匹中 → 命中
+    try testing.expect(!matchesMode(&r, &mctx, "Bash", mixed, .allow));
+    try testing.expect(matchesMode(&r, &mctx, "Bash", mixed, .deny));
+    try testing.expect(matchesMode(&r, &mctx, "Bash", mixed, .ask));
+    // 没有一段匹中 → 都不命中
+    try testing.expect(!matchesMode(&r, &mctx, "Bash", "{\"command\":\"ls && rm x\"}", .deny));
+    // 空命令按空串判定:`git *` 匹不中空串 → allow 不放行,deny 不命中
+    try testing.expect(!matchesMode(&r, &mctx, "Bash", "{\"command\":\"\"}", .allow));
+    try testing.expect(!matchesMode(&r, &mctx, "Bash", "{\"command\":\"\"}", .deny));
+}
+
+test "matchesMode: 无 command 字段的 bash-style 规则仍按空命令判定" {
+    // 未知工具名按 bash-style pattern 解析;Grep 调用没有 command 字段,`**` 匹中空串 →
+    // 等价整工具,deny 与 allow 都命中(拆段前即如此,不能因拆段静默失效)。
+    const any = try parseRule("Grep(**)");
+    const mctx = MatchContext{};
+    try testing.expect(matchesMode(&any, &mctx, "Grep", "{\"pattern\":\"x\"}", .deny));
+    try testing.expect(matchesMode(&any, &mctx, "Grep", "{\"pattern\":\"x\"}", .allow));
+    // 匹不中空串的 pattern 照旧不命中
+    const rm = try parseRule("Bash(rm *)");
+    try testing.expect(!matchesMode(&rm, &mctx, "Bash", "{\"description\":\"x\"}", .deny));
+}
+
+test "commandFromArgs: 与 Bash 工具同一取字段 + unescape" {
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    // JSON 转义的换行、`&&`、引号是 shell 收到的真字节
+    try testing.expectEqualStrings("ls\nrm x", (try commandFromArgs(a, "{\"command\":\"ls\\nrm x\"}")).?);
+    try testing.expectEqualStrings("a && b", (try commandFromArgs(a, "{\"command\":\"a \\u0026\\u0026 b\"}")).?);
+    try testing.expectEqualStrings("echo \"x\"", (try commandFromArgs(a, "{\"command\": \"echo \\\"x\\\"\"}")).?);
+    // 非字符串值:Bash 工具照样把裸 token 交给 shell,规则也按它判
+    try testing.expectEqualStrings("true", (try commandFromArgs(a, "{\"command\":true}")).?);
+    try testing.expect((try commandFromArgs(a, "{\"description\":\"x\"}")) == null);
+}
+
+test "matchesMode: Bash 判不了(内存不足)时 allow 不命中、deny/ask 命中" {
+    // 超出栈缓冲的命令落到 mctx.alloc:失败分配器下 unescape 做不完。
+    var args: [4096]u8 = undefined;
+    const head = "{\"command\":\"echo ";
+    @memcpy(args[0..head.len], head);
+    @memset(args[head.len .. args.len - 2], 'a');
+    @memcpy(args[args.len - 2 ..], "\"}");
+    const deny_rm = try parseRule("Bash(rm *)");
+    const allow_echo = try parseRule("Bash(echo *)");
+
+    const oom = MatchContext{ .alloc = testing.failing_allocator };
+    try testing.expect(matchesMode(&deny_rm, &oom, "Bash", &args, .deny));
+    try testing.expect(matchesMode(&deny_rm, &oom, "Bash", &args, .ask));
+    try testing.expect(!matchesMode(&allow_echo, &oom, "Bash", &args, .allow));
+    // 对照:分配成功时按内容判定
+    const ok = MatchContext{ .alloc = testing.allocator };
+    try testing.expect(!matchesMode(&deny_rm, &ok, "Bash", &args, .deny));
+    try testing.expect(matchesMode(&allow_echo, &ok, "Bash", &args, .allow));
 }
 
 test "matches: Bash with wrapper stripped before match" {
