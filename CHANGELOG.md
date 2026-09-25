@@ -90,6 +90,23 @@ status, compatibility boundaries, and entry points are defined by
   separators and quotes: `Bash(npm *)` no longer auto-allows
   `npm test\nrm x`. Heredoc bodies are not parsed, so each of their lines
   is a segment of its own.
+- Legacy `permission_rules` in `~/.metacodes/config.json`
+  (`permission/rule_matcher.zig`) now split compound commands too. Their
+  `command_prefix` was a `startsWith` over the whole, still JSON-escaped
+  `command`, so an `allow` for `git ` approved `git status && rm -rf ~` (and
+  `git status\nrm -rf ~`), and a `deny` for `rm ` missed `ls && rm x`. The
+  command is now unescaped as the Bash tool does it and split into segments.
+  These rules are first-match-wins in array order, so the first matching rule
+  is taken for every segment, and for the whole command so that a prefix
+  spanning a separator still matches, and the strictest result wins: any
+  `deny` denies, otherwise any `ask` asks, otherwise the command is allowed
+  only when every segment is, and the mode decides the rest. An earlier
+  `ask` no longer hides a later `deny` on another segment, and an `allow`
+  exception listed before a general `deny` still covers its own segment. A
+  command inside a wrapper (`timeout`, `nohup`, `env`, ...) is matched again,
+  but only its `deny` and `ask` count: `env LD_PRELOAD=... git status` is not
+  allowed by `git `. A command that cannot be split (out of memory) gets the
+  strictest result the rules could reach.
 - A Ctrl+C/Esc while the provider stream read was blocked was reported as a
   model API error: `provider.cancel` shuts the socket, the read wakes with
   `ReadFailed`, and the stream clients classified that before consulting the

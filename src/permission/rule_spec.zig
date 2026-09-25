@@ -321,8 +321,8 @@ fn matchesBashCompound(pattern: []const u8, mctx: *const MatchContext, args: []c
 /// Bash 工具真正交给 shell 的命令:与 tools/bash.zig executeInner(及 monitor.zig)同一取字段
 /// (common.extractJsonArg)+ 同一 JSON unescape。拿转义原文拆段时 `\n`、`\u0026\u0026` 这类
 /// 分隔符不可见(deny 被当单段漏判,allow 被 `echo hi\nrm -rf ~` 骗过),`\"` 又让引号内的
-/// `;` 被误拆。字段缺失 → null。caller 持有返回值。
-fn commandFromArgs(gpa: std.mem.Allocator, args: []const u8) error{OutOfMemory}!?[]u8 {
+/// `;` 被误拆。字段缺失 → null。caller 持有返回值。旧 config.json 规则(rule_matcher)同用。
+pub fn commandFromArgs(gpa: std.mem.Allocator, args: []const u8) error{OutOfMemory}!?[]u8 {
     const escaped = tools_common.extractJsonArg(args, "command") orelse return null;
     return try util_json_mod.unescapeString(escaped, gpa);
 }
