@@ -460,6 +460,72 @@ fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *
     return mod;
 }
 
+/// src/lib.zig, the whole metacodes-core graph. Its suite compiles every
+/// declaration (`refAllDecls`), so a green build also proves that the library
+/// never reaches the UI layer.
+fn createCoreModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addHl(b, mod);
+    return mod;
+}
+
+/// The complete metacodes-core suite as one test executable whose tests
+/// scripts/sharded_test_runner.zig partitions deterministically. `test:lib`
+/// builds it at the invocation's -Doptimize and `gate:pr` at ReleaseSafe; both
+/// come from here, so at equal optimize they are one compilation.
+fn addCoreSuite(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    tfilter: ?[]const u8,
+) *std.Build.Step.Compile {
+    return b.addTest(.{
+        .name = "metacodes-core-test",
+        .root_module = root_module,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        .test_runner = .{
+            .path = b.path("scripts/sharded_test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+}
+
+/// Runs `suite` as `shards` processes that each execute only their own
+/// partition. The returned step is the reporter, which accepts the captured
+/// reports only when together they cover exactly the compiled test inventory.
+fn addCoreSuiteRun(
+    b: *std.Build,
+    suite: *std.Build.Step.Compile,
+    shards: u8,
+    reporter: *std.Build.Step.Compile,
+) *std.Build.Step {
+    const reports = b.allocator.alloc(std.Build.LazyPath, shards) catch @panic("OOM");
+    for (reports, 0..) |*report, shard_index| {
+        const run_shard = addTestRunArtifact(b, suite);
+        // captureStdOut would otherwise make the Run step cacheable. A test
+        // gate must execute on every invocation; cached reports are evidence
+        // from an earlier repository/environment state, not current feedback.
+        run_shard.has_side_effects = true;
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{shards}));
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
+        run_shard.expectExitCode(0);
+        report.* = run_shard.captureStdOut(.{
+            .basename = b.fmt("{s}-shard-{}.txt", .{ suite.name, shard_index }),
+        });
+    }
+    const run_reporter = b.addRunArtifact(reporter);
+    for (reports) |report| run_reporter.addFileArg(report);
+    return &run_reporter.step;
+}
+
 pub fn build(b: *std.Build) void {
     validateAggregateTestInventory(b);
     const target = b.standardTargetOptions(.{});
@@ -1538,13 +1604,7 @@ pub fn build(b: *std.Build) void {
     ).step);
 
     // test:lib —— 编译库全图(refAllDeclsRecursive),绿即证库与 UI 物理隔离。
-    const core_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    addHl(b, core_test_mod);
+    const core_test_mod = createCoreModule(b, target, optimize);
     const project_harness_eval_driver_mod = b.createModule(.{
         .root_source_file = b.path("scripts/project_harness_eval_driver.zig"),
         .target = target,
@@ -1670,30 +1730,7 @@ pub fn build(b: *std.Build) void {
         "Run the zero-provider journal-to-receipt-to-Lean RuleImpact L2",
     );
     rule_impact_driver_l2_step.dependOn(&rule_impact_driver_l2_cmd.step);
-    const core_test = b.addTest(.{
-        .name = "metacodes-core-test",
-        .root_module = core_test_mod,
-        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
-        .test_runner = .{
-            .path = b.path("scripts/sharded_test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const core_test_step = b.step("test:lib", "Run the complete metacodes-core suite in checked deterministic shards");
-    const core_shard_reports = b.allocator.alloc(std.Build.LazyPath, lib_test_shards) catch @panic("OOM");
-    for (0..lib_test_shards) |shard_index| {
-        const run_shard = addTestRunArtifact(b, core_test);
-        // captureStdOut would otherwise make the Run step cacheable. A test
-        // gate must execute on every invocation; cached reports are evidence
-        // from an earlier repository/environment state, not current feedback.
-        run_shard.has_side_effects = true;
-        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{lib_test_shards}));
-        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
-        run_shard.expectExitCode(0);
-        core_shard_reports[shard_index] = run_shard.captureStdOut(.{
-            .basename = b.fmt("metacodes-core-test-shard-{}.txt", .{shard_index}),
-        });
-    }
+    const core_test = addCoreSuite(b, core_test_mod, tfilter);
     const core_shard_reporter = b.addExecutable(.{
         .name = "metacodes-core-shard-reporter",
         .root_module = b.createModule(.{
@@ -1702,9 +1739,8 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    const run_core_shard_reporter = b.addRunArtifact(core_shard_reporter);
-    for (core_shard_reports) |report| run_core_shard_reporter.addFileArg(report);
-    core_test_step.dependOn(&run_core_shard_reporter.step);
+    const core_test_step = b.step("test:lib", "Run the complete metacodes-core suite in checked deterministic shards");
+    core_test_step.dependOn(addCoreSuiteRun(b, core_test, lib_test_shards, core_shard_reporter));
 
     const core_monolithic_run = addTestRunArtifact(b, core_test);
     core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
@@ -1977,10 +2013,22 @@ pub fn build(b: *std.Build) void {
     // The checklist ends with `git diff --check`; the aggregate gate runs it too,
     // so the one advertised command really is the whole list.
     const gate_diff_check = b.addSystemCommand(&.{ "git", "diff", "--check" });
+    // The checklist runs `zig build test` and `zig build test:lib
+    // -Doptimize=ReleaseSafe`, but one invocation has one -Doptimize. So the
+    // full suite runs at the invocation's (Debug by default) while the gate owns
+    // a ReleaseSafe build of the core suite: the same compilation as that
+    // checklist command, so either warms the cache for the other, and none extra
+    // when the invocation already is ReleaseSafe.
+    const gate_core_suite = if (optimize == .ReleaseSafe) core_test_step else addCoreSuiteRun(
+        b,
+        addCoreSuite(b, createCoreModule(b, target, .ReleaseSafe), tfilter),
+        lib_test_shards,
+        core_shard_reporter,
+    );
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
     gate_pr_step.dependOn(&gate_fmt.step);
     gate_pr_step.dependOn(test_step);
-    gate_pr_step.dependOn(core_test_step);
+    gate_pr_step.dependOn(gate_core_suite);
     gate_pr_step.dependOn(&gate_coverage.step);
     gate_pr_step.dependOn(doc_check_step);
     gate_pr_step.dependOn(&gate_diff_check.step);
