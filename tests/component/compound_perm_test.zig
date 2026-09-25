@@ -1,7 +1,7 @@
 //! L2 组件测试:Bash 复合命令(&& || ; | |& & 换行)的权限规则匹配。
 //!
-//! 规则只描述**单条**命令。rule_spec.matchesMode 把复合命令拆段(splitCompound + 逐段
-//! stripWrappers)后按规则种类聚合:
+//! 规则只描述**单条**命令。rule_spec.matchesMode 把复合命令拆段(splitCompound)后按规则
+//! 种类聚合:
 //!   - allow:**每段**都匹中才命中——`git add . && npm publish` 不被 Bash(git *) 放行;
 //!   - deny/ask:**任一段**匹中即命中——`ls && rm x` 的 rm 段触发 Bash(rm *),无害前缀
 //!     稀释不了用户的 deny(与 path 规则 deny/ask 的"任一路径匹配"对称)。
@@ -10,6 +10,11 @@
 //! 修复前 deny/ask 也要求"每段都匹中",`ls && rm x` 在 bypass_permissions(兜底 allow)与
 //! default(首词 ls 走 readonly 免询问)下都绕过了用户的 deny 规则;下方经
 //! cc.permission.checkPermission 端到端锁定两种模式下 deny 都赢。
+//! 每段先按原文比,再比 wrapper 包着的命令。deny/ask 看穿所有 wrapper(`timeout 5 rm x`、
+//! `ls && env X=1 rm x`、`ls | xargs rm` 都触发 Bash(rm *));allow 只看穿只改"怎么跑"的
+//! 良性 wrapper(`timeout 30 git push` 仍被 Bash(git *) 放行)。修复前 allow 也比剥掉 env
+//! 与 xargs 之后的命令,`Bash(git *)` 放行了 `env LD_PRELOAD=/tmp/x.so git status`;点名
+//! wrapper 的规则(`Bash(xargs *)`)则因为只比剥完的命令而永远匹不中。
 //! 旧 config.json permission_rules(rule_matcher.RuleSet)的 command_prefix 同一语义,只是规则
 //! 按数组顺序"第一个命中生效":逐段套用后整体取最严——前面的 ask 遮不住后面的 deny,排在
 //! 总 deny 之前的 allow 例外照样豁免它那一段;文件末尾一节经同一入口锁定。
@@ -95,12 +100,26 @@ test "L2 复合命令: 按 shell 收到的字节拆段(JSON 转义的分隔符�
     try std.testing.expect(try allowMatch("Bash(echo *)", "echo \\\"a; rm x\\\""));
 }
 
-test "L2 复合命令: wrapper 剥离后再匹配(timeout/nohup)" {
-    // stripWrappers 去掉 timeout/nohup 等前缀再比对 pattern;复合命令逐段剥。
-    try std.testing.expect(try denyMatch("Bash(rm *)", "timeout 5 rm foo"));
-    try std.testing.expect(try denyMatch("Bash(rm *)", "nohup rm foo"));
-    try std.testing.expect(try denyMatch("Bash(rm *)", "ls && timeout 5 rm foo"));
-    try std.testing.expect(try denyMatch("Bash(rm *)", "ls; nohup rm foo"));
+test "L2 复合命令: deny/ask 看穿所有 wrapper,allow 只看穿良性 wrapper" {
+    // 复合命令逐段剥;env 赋值与 xargs 也剥,多匹中对 deny/ask 是 fail-closed
+    const wrapped_rm = [_][]const u8{
+        "timeout 5 rm foo",
+        "nohup rm foo",
+        "ls && timeout 5 rm foo",
+        "ls; nohup rm foo",
+        "ls && env X=1 rm foo",
+        "ls | xargs rm",
+    };
+    for (wrapped_rm) |command| {
+        errdefer std.debug.print("command: {s}\n", .{command});
+        try std.testing.expect(try denyMatch("Bash(rm *)", command));
+        try std.testing.expect(try askMatch("Bash(rm *)", command));
+    }
+    // allow:良性 wrapper 只改怎么跑,照旧放行;剥掉 env/xargs 才像 git 的不放行
+    try std.testing.expect(try allowMatch("Bash(git *)", "timeout 30 git push"));
+    try std.testing.expect(try allowMatch("Bash(git *)", "nice -n 5 git push && nohup git fetch"));
+    try std.testing.expect(!try allowMatch("Bash(git *)", "env LD_PRELOAD=/tmp/x.so git status"));
+    try std.testing.expect(!try allowMatch("Bash(git *)", "git ls-files | xargs git rm"));
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +215,143 @@ test "L2 checkPermission: allow Bash(npm *) 仍要每段都是 npm(转义换行�
     try std.testing.expectEqual(Decision.ask, try checkBash(&ctx, "npm test && rm x"));
     // JSON 转义的换行也是分隔符:修复前整串当一段,`npm *` 前缀匹中 → 放行了 rm
     try std.testing.expectEqual(Decision.ask, try checkBash(&ctx, "npm test\\nrm x"));
+}
+
+// ---------------------------------------------------------------------------
+// 端到端:wrapper。deny/ask 看穿所有 wrapper;allow 只看穿良性 wrapper,剥掉 env / xargs
+// 才像被放行命令的调用不再被放行。
+// ---------------------------------------------------------------------------
+
+/// 剥掉 env / xargs 才是 `git …` 的命令:真正运行的代码换了(预加载库、PATH 里的假 git、
+/// ssh 命令),或参数从 stdin 追加。都不是只读命令,default 下没有免询问兜底。
+const smuggled_git = [_][]const u8{
+    "env LD_PRELOAD=/tmp/x.so git status",
+    "env PATH=/tmp/evil:$PATH git status",
+    "env GIT_SSH_COMMAND=/tmp/evil.sh git fetch",
+    "timeout 30 env LD_PRELOAD=/tmp/x.so git status",
+    "git status && env LD_PRELOAD=/tmp/x.so git status",
+    "git ls-files | xargs git rm",
+};
+
+/// 良性 wrapper 包着的 git:只改怎么跑。`git push` 不是只读,放行只能来自规则。
+const benign_git = [_][]const u8{
+    "git push",
+    "timeout 30 git push",
+    "nice -n 5 git push",
+    "timeout -s KILL 30 nohup git push",
+    "git fetch && timeout 30 git push",
+};
+
+test "L2 checkPermission: allow Bash(git *) 不替 env/xargs 包着的 git 放行(default / dont_ask)" {
+    const gpa = std.testing.allocator;
+    var settings = try loadSettings(gpa,
+        \\{"permissions":{"allow":["Bash(git *)"]}}
+    );
+    defer settings.deinit();
+    // allow 规则没命中时 default 兜底 ask,dont_ask 只认显式放行 → deny;修复前两种都 allow。
+    // bypass_permissions 兜底本就 allow,allow 规则越权在那里看 ask 规则被盖住(下一个测试)。
+    const Case = struct { mode: cc.types_mod.PermissionMode, unmatched: Decision };
+    const cases = [_]Case{
+        .{ .mode = .default, .unmatched = .ask },
+        .{ .mode = .dont_ask, .unmatched = .deny },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("mode: {s}\n", .{@tagName(case.mode)});
+        const ctx = cc.permission.PermissionContext{
+            .mode = .init(case.mode),
+            .allocator = gpa,
+            .settings = &settings,
+        };
+        for (smuggled_git) |command| {
+            errdefer std.debug.print("command: {s}\n", .{command});
+            try std.testing.expectEqual(case.unmatched, try checkBash(&ctx, command));
+        }
+        for (benign_git) |command| {
+            errdefer std.debug.print("command: {s}\n", .{command});
+            try std.testing.expectEqual(Decision.allow, try checkBash(&ctx, command));
+        }
+    }
+}
+
+test "L2 checkPermission: allow Bash(git *) 不再盖住 ask Bash(env *)(bypass_permissions / default)" {
+    // settings 先查 allow 后查 ask:allow 越权命中,用户的 ask 就轮不到,bypass 照样执行。
+    const gpa = std.testing.allocator;
+    var settings = try loadSettings(gpa,
+        \\{"permissions":{"allow":["Bash(git *)"],"ask":["Bash(env *)"]}}
+    );
+    defer settings.deinit();
+    for ([_]cc.types_mod.PermissionMode{ .bypass_permissions, .default }) |mode| {
+        errdefer std.debug.print("mode: {s}\n", .{@tagName(mode)});
+        const ctx = cc.permission.PermissionContext{
+            .mode = .init(mode),
+            .allocator = gpa,
+            .settings = &settings,
+        };
+        try std.testing.expectEqual(Decision.ask, try checkBash(&ctx, "env LD_PRELOAD=/tmp/x.so git status"));
+        try std.testing.expectEqual(Decision.ask, try checkBash(&ctx, "timeout 30 env GIT_SSH_COMMAND=/tmp/evil.sh git fetch"));
+        try std.testing.expectEqual(Decision.allow, try checkBash(&ctx, "timeout 30 git push"));
+    }
+}
+
+/// `rm x` 包在各种 wrapper 里(JSON 字符串原文)。
+const rm_in_wrapper = [_][]const u8{
+    "timeout 5 rm x",
+    "timeout -s KILL 5 rm x",
+    "nohup rm x",
+    "ls && env X=1 rm x",
+    "ls | xargs rm",
+    "ls && timeout 5 env X=1 nice rm x",
+};
+
+test "L2 checkPermission: deny Bash(rm *) 看穿 wrapper(default / bypass_permissions)" {
+    const gpa = std.testing.allocator;
+    var settings = try loadSettings(gpa, deny_rm_settings);
+    defer settings.deinit();
+    for ([_]cc.types_mod.PermissionMode{ .default, .bypass_permissions }) |mode| {
+        errdefer std.debug.print("mode: {s}\n", .{@tagName(mode)});
+        const ctx = cc.permission.PermissionContext{
+            .mode = .init(mode),
+            .allocator = gpa,
+            .settings = &settings,
+        };
+        for (rm_in_wrapper) |command| {
+            errdefer std.debug.print("command: {s}\n", .{command});
+            try std.testing.expectEqual(Decision.deny, try checkBash(&ctx, command));
+        }
+    }
+}
+
+test "L2 checkPermission: 点名 wrapper 的 deny 按原文生效(default / bypass_permissions)" {
+    // 修复前规则只比剥完的命令:`xargs rm` 比的是 `rm`,`Bash(xargs *)` 永远匹不中。
+    const gpa = std.testing.allocator;
+    var settings = try loadSettings(gpa,
+        \\{"permissions":{"deny":["Bash(xargs *)","Bash(env *)"]}}
+    );
+    defer settings.deinit();
+    for ([_]cc.types_mod.PermissionMode{ .default, .bypass_permissions }) |mode| {
+        errdefer std.debug.print("mode: {s}\n", .{@tagName(mode)});
+        const ctx = cc.permission.PermissionContext{
+            .mode = .init(mode),
+            .allocator = gpa,
+            .settings = &settings,
+        };
+        try std.testing.expectEqual(Decision.deny, try checkBash(&ctx, "find . -name '*.o' | xargs rm"));
+        try std.testing.expectEqual(Decision.deny, try checkBash(&ctx, "env X=1 make"));
+        try std.testing.expectEqual(Decision.deny, try checkBash(&ctx, "timeout 30 env X=1 make"));
+    }
+}
+
+test "L2 checkPermission: 只读免询问不看穿 env(default,无规则)" {
+    // decision 第 4 步是 bash_readonly 的完整词法判定,不剥 env:剥掉它的 `ls` 是只读,带着
+    // `LD_PRELOAD=` 跑的不是。Windows 跑 PowerShell/cmd,那里没有只读免询问。
+    const ctx = cc.permission.PermissionContext{
+        .mode = .init(.default),
+        .allocator = std.testing.allocator,
+    };
+    const readonly: Decision = if (cc.permission_bash_readonly.hostDialect() == .posix_sh) .allow else .ask;
+    try std.testing.expectEqual(Decision.ask, try checkBash(&ctx, "env LD_PRELOAD=/tmp/x.so ls"));
+    try std.testing.expectEqual(readonly, try checkBash(&ctx, "ls -la"));
+    try std.testing.expectEqual(readonly, try checkBash(&ctx, "timeout 5 ls -la"));
 }
 
 // ---------------------------------------------------------------------------

@@ -3,8 +3,13 @@
 //! 用于权限判定:Bash 规则只对**单个**命令成立,复合命令(&& || ; | & |& 换行)
 //! 必须每一段都被允许,否则按最危险的那段决策。
 //!
-//! 同时:wrapper 命令(timeout / time / nice / nohup / stdbuf / xargs / env)
-//! 只是包装层,真正要匹配的是 wrapper 后面的目标命令。
+//! 同时:wrapper 命令(timeout / time / nice / nohup / stdbuf / xargs / env)包着的才是
+//! 目标命令,两种剥法对应两个失败方向:
+//!   - stripWrapper(s):启发式,deny/ask 规则多一个候选(多匹中是 fail-closed),
+//!     `env X=1 rm x`、`timeout 5 rm x` 都按 rm 判;
+//!   - peelBenignWrapper:按 wrapper 的真实选项语法,只剥改"怎么跑"不改"跑什么"的
+//!     那几种,allow 规则据此放行包着的命令。env 换环境(LD_PRELOAD/PATH)、xargs 从
+//!     stdin 追加参数,剥掉它们看到的就不是真正运行的命令,不在其列。
 //!
 //! 还提供"readonly 命令"清单(READONLY_BASH + isReadonlyCommand):只看首词的
 //! token 级判定,现仅供 delivery-cadence 探针使用。权限免询问与并发安全走
@@ -113,17 +118,23 @@ pub const WRAPPERS = [_][]const u8{
 ///   "ls -la" → "ls -la"(没 wrapper)
 pub fn stripWrappers(cmd: []const u8) []const u8 {
     var s = std.mem.trim(u8, cmd, " \t");
-    while (true) {
-        const first_space = std.mem.indexOfAny(u8, s, " \t") orelse return s;
-        const head = s[0..first_space];
-        if (!isWrapper(head)) return s;
-        // 跳过 wrapper 自带参数(数字 / -x / KEY=val),直到第一个看起来是命令的 token
-        var rest = std.mem.trim(u8, s[first_space..], " \t");
-        rest = skipWrapperArgs(head, rest);
-        if (rest.len == 0) return s; // 剥光了反而异常,退回原始
-        if (std.mem.eql(u8, rest, s)) return s;
-        s = rest;
-    }
+    while (stripWrapper(s)) |inner| s = inner;
+    return s;
+}
+
+/// stripWrappers 的一层:cmd 以 wrapper 开头时返回它包着的命令,否则 null。参数按
+/// "-x / KEY=val / 数字"一律跳过,不保证剥到真正运行的命令(`timeout -s KILL 5 rm x`
+/// 剥成 `KILL 5 rm x`),所以只给 deny/ask 规则当额外候选、给非权限探针用;allow 规则
+/// 看穿 wrapper 走 peelBenignWrapper。
+pub fn stripWrapper(cmd: []const u8) ?[]const u8 {
+    const s = std.mem.trim(u8, cmd, " \t");
+    const first_space = std.mem.indexOfAny(u8, s, " \t") orelse return null;
+    const head = s[0..first_space];
+    if (!isWrapper(head)) return null;
+    // 跳过 wrapper 自带参数(数字 / -x / KEY=val),直到第一个看起来是命令的 token
+    const rest = skipWrapperArgs(head, std.mem.trim(u8, s[first_space..], " \t"));
+    if (rest.len == 0) return null; // 剥光了反而异常,不剥
+    return rest;
 }
 
 fn isWrapper(name: []const u8) bool {
@@ -184,6 +195,181 @@ fn looksLikeCommand(tok: []const u8) bool {
     if (tok[0] == '-') return false;
     if (std.mem.indexOfScalar(u8, tok, '=') != null) return false;
     return std.ascii.isAlphabetic(tok[0]) or tok[0] == '/' or tok[0] == '.';
+}
+
+// ============================================================================
+// 良性 wrapper(allow 规则可以看穿)
+// ============================================================================
+
+/// 只改命令"怎么跑"、不改"跑什么"的 wrapper:时限、计时、调度/IO 优先级、挂断信号、
+/// stdio 缓冲、PATH 查找、替换 shell 进程。运行哪个程序、带什么参数仍由被包的命令决定,
+/// 调用方也没法借它们注入环境变量或库(stdbuf 预加载的是它自带的 libstdbuf),所以
+/// `Bash(npm test)` 放行 `timeout 30 npm test` 与放行 `npm test` 是一回事。
+/// 不在其列:env(`LD_PRELOAD=`、`PATH=`、`GIT_SSH_COMMAND=`、BSD `-P` 换掉真正运行的
+/// 代码)、xargs(从 stdin 给命令追加参数)。
+const BenignWrapper = enum { timeout, time, nice, ionice, nohup, stdbuf, command, exec };
+
+/// cmd 以良性 wrapper 开头、且 wrapper 的参数完全落在它的选项语法内时,剥掉**一层**,
+/// 返回它运行的命令;否则 null。与 stripWrapper 相反,这里宁少剥,因为 allow 规则据此
+/// 替包着的命令放行:
+///   - wrapper 名与它的每个参数都必须是 plain 词(isPlainWord):shell 不对它做引号
+///     去除、展开、通配或重定向,wrapper 收到的 argv 就是这些字;
+///   - 只认 GNU 与 BSD 实现含义一致的选项。未知选项、长选项缩写、短选项簇都不剥:
+///     把带值的选项当成开关(或反过来),真正运行的命令就错开了一个词;
+///   - 剥出的命令不能以 `-` 开头(那是没认出来的选项,不是命令)。
+pub fn peelBenignWrapper(cmd: []const u8) ?[]const u8 {
+    var words = WrapperWords{ .rest = std.mem.trim(u8, cmd, " \t") };
+    const head = words.take() orelse return null;
+    const wrapper = std.meta.stringToEnum(BenignWrapper, head) orelse return null;
+    const parsed = switch (wrapper) {
+        .timeout => skipTimeoutArgs(&words),
+        .nice => skipNiceArgs(&words),
+        .ionice => skipOptions(&words, &IONICE_OPTIONS),
+        .stdbuf => skipOptions(&words, &STDBUF_OPTIONS),
+        // 别的选项都不收:`exec -a NAME` 改 argv[0](git 按它选子命令),`command -v`
+        // 只查名字不运行,GNU `time -o FILE` 写文件。
+        .time => words.skipOptional("-p"),
+        .command => words.skipOptional("-p") and words.skipOptional("--"),
+        .nohup, .exec => words.skipOptional("--"),
+    };
+    if (!parsed) return null;
+    const inner = words.rest;
+    if (inner.len == 0 or inner[0] == '-') return null;
+    return inner;
+}
+
+/// wrapper 前缀按空白切词的游标;rest 是尚未消费的原文(已去掉前导空白)。
+const WrapperWords = struct {
+    rest: []const u8,
+
+    fn peek(self: *const WrapperWords) ?[]const u8 {
+        if (self.rest.len == 0) return null;
+        const end = std.mem.indexOfAny(u8, self.rest, " \t") orelse self.rest.len;
+        return self.rest[0..end];
+    }
+
+    /// 消费下一个词作为 wrapper 语法的一部分;它不是 plain 词 → null。
+    fn take(self: *WrapperWords) ?[]const u8 {
+        const word = self.peek() orelse return null;
+        if (!isPlainWord(word)) return null;
+        self.rest = std.mem.trimStart(u8, self.rest[word.len..], " \t");
+        return word;
+    }
+
+    /// 可选的一个词:下一个词正是 `word` 就消费。总返回 true,便于和必选语法用 `and` 串起来。
+    fn skipOptional(self: *WrapperWords, word: []const u8) bool {
+        const next = self.peek() orelse return true;
+        if (std.mem.eql(u8, next, word)) _ = self.take();
+        return true;
+    }
+};
+
+/// shell 原样交给命令的词:只含字母数字与 `_ - + . , : / = @ %`。引号、`\`、`$`、反引号、
+/// 通配与花括号、`~`、`!`、`#`、重定向与括号、控制字节、非 ASCII 都不算。
+fn isPlainWord(word: []const u8) bool {
+    if (word.len == 0) return false;
+    for (word) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '+', '.', ',', ':', '/', '=', '@', '%' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// wrapper 的一个选项:短名(0 = 没有)、长名("" = 没有)、是否带值。
+const WrapperOption = struct { short: u8 = 0, long: []const u8 = "", value: bool };
+
+/// `timeout [OPTION]... DURATION COMMAND`
+const TIMEOUT_OPTIONS = [_]WrapperOption{
+    .{ .short = 'k', .long = "kill-after", .value = true },
+    .{ .short = 's', .long = "signal", .value = true },
+    .{ .short = 'v', .long = "verbose", .value = false },
+    .{ .long = "foreground", .value = false },
+    .{ .long = "preserve-status", .value = false },
+};
+
+/// `nice [-n N | --adjustment=N] COMMAND`
+const NICE_OPTIONS = [_]WrapperOption{
+    .{ .short = 'n', .long = "adjustment", .value = true },
+};
+
+/// `ionice [-c CLASS] [-n LEVEL] [-t] COMMAND`;`-p`/`-P`/`-u` 之后是进程号,不是命令。
+const IONICE_OPTIONS = [_]WrapperOption{
+    .{ .short = 'c', .long = "class", .value = true },
+    .{ .short = 'n', .long = "classdata", .value = true },
+    .{ .short = 't', .long = "ignore", .value = false },
+};
+
+/// `stdbuf -i/-o/-e MODE... COMMAND`
+const STDBUF_OPTIONS = [_]WrapperOption{
+    .{ .short = 'i', .long = "input", .value = true },
+    .{ .short = 'o', .long = "output", .value = true },
+    .{ .short = 'e', .long = "error", .value = true },
+};
+
+/// 消费 `options` 里的选项,停在第一个非选项词(或 `--` 之后):这几个 wrapper 都在第一个
+/// 非选项处停止解析(getopt `+`)。认不出的选项 → false。
+fn skipOptions(words: *WrapperWords, options: []const WrapperOption) bool {
+    while (words.peek()) |word| {
+        if (word.len < 2 or word[0] != '-') return true;
+        _ = words.take() orelse return false;
+        if (std.mem.eql(u8, word, "--")) return true;
+        const option = findOption(options, word) orelse return false;
+        // 值可以写在同一个词里(`--name=VALUE`、`-xVALUE`),否则是下一个词;不带值的选项
+        // 带了值(`--verbose=x`、短选项簇 `-vs`)不收。
+        const inline_value = if (word[1] == '-') std.mem.indexOfScalar(u8, word, '=') != null else word.len > 2;
+        if (inline_value and !option.value) return false;
+        if (option.value and !inline_value) _ = words.take() orelse return false;
+    }
+    return true;
+}
+
+/// word 是 `-x…` 或 `--name[=…]`;长名须完整(不认缩写)。
+fn findOption(options: []const WrapperOption, word: []const u8) ?WrapperOption {
+    for (options) |option| {
+        const matched = if (word[1] == '-') blk: {
+            const name = word[2..];
+            const end = std.mem.indexOfScalar(u8, name, '=') orelse name.len;
+            break :blk option.long.len > 0 and std.mem.eql(u8, option.long, name[0..end]);
+        } else option.short != 0 and option.short == word[1];
+        if (matched) return option;
+    }
+    return null;
+}
+
+fn skipTimeoutArgs(words: *WrapperWords) bool {
+    if (!skipOptions(words, &TIMEOUT_OPTIONS)) return false;
+    const duration = words.take() orelse return false;
+    return isDuration(duration);
+}
+
+/// `nice -N COMMAND` 是 GNU 与 BSD 都认的旧写法(`--N` 为负),只在第一个参数。
+fn skipNiceArgs(words: *WrapperWords) bool {
+    if (words.peek()) |first| {
+        if (first.len > 1 and first[0] == '-' and isInteger(first[1..])) _ = words.take();
+    }
+    return skipOptions(words, &NICE_OPTIONS);
+}
+
+fn isInteger(s: []const u8) bool {
+    const digits = if (s.len > 0 and (s[0] == '-' or s[0] == '+')) s[1..] else s;
+    return digits.len > 0 and allDigits(digits);
+}
+
+/// timeout 的 DURATION:`30`、`1.5`、`2m`(小数 + 可选 s/m/h/d 后缀)。
+fn isDuration(word: []const u8) bool {
+    var number = word;
+    if (number.len > 0 and std.mem.indexOfScalar(u8, "smhd", number[number.len - 1]) != null) {
+        number = number[0 .. number.len - 1];
+    }
+    const dot = std.mem.indexOfScalar(u8, number, '.') orelse return number.len > 0 and allDigits(number);
+    const whole = number[0..dot];
+    const fraction = number[dot + 1 ..];
+    return whole.len + fraction.len > 0 and allDigits(whole) and allDigits(fraction);
+}
+
+fn allDigits(s: []const u8) bool {
+    for (s) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 // ============================================================================
@@ -329,6 +515,98 @@ test "stripWrappers: nested wrappers" {
 test "stripWrappers: no wrapper passes through" {
     try testing.expectEqualStrings("ls -la", stripWrappers("ls -la"));
     try testing.expectEqualStrings("git status", stripWrappers("git status"));
+}
+
+test "stripWrapper: 一次剥一层,env 赋值与 xargs 也剥" {
+    try testing.expectEqualStrings("nice -n 5 npm test", stripWrapper("timeout 30 nice -n 5 npm test").?);
+    try testing.expectEqualStrings("git status", stripWrapper("env LD_PRELOAD=/tmp/x.so git status").?);
+    try testing.expectEqualStrings("rm x", stripWrapper("xargs rm x").?);
+    try testing.expect(stripWrapper("git status") == null);
+    try testing.expect(stripWrapper("timeout 30") == null);
+}
+
+test "peelBenignWrapper: 按 wrapper 的真实选项语法剥一层" {
+    const cases = [_][2][]const u8{
+        .{ "timeout 30 npm test", "npm test" },
+        .{ "timeout 1.5m npm test", "npm test" },
+        .{ "timeout -s KILL -k 5 30 npm test", "npm test" },
+        .{ "timeout -sKILL -k5 30 npm test", "npm test" },
+        .{ "timeout --signal=TERM --kill-after 5 --foreground --preserve-status -v 30 npm test", "npm test" },
+        .{ "timeout -- 30 npm test", "npm test" },
+        .{ "time npm test", "npm test" },
+        .{ "time -p npm test", "npm test" },
+        .{ "nice npm test", "npm test" },
+        .{ "nice -n 5 npm test", "npm test" },
+        .{ "nice -n5 npm test", "npm test" },
+        .{ "nice --adjustment=-5 npm test", "npm test" },
+        .{ "nice -10 npm test", "npm test" },
+        .{ "nice -- npm test", "npm test" },
+        .{ "ionice -c 3 -n 7 -t npm test", "npm test" },
+        .{ "ionice -c3 --classdata=7 npm test", "npm test" },
+        .{ "nohup npm test", "npm test" },
+        .{ "nohup -- npm test", "npm test" },
+        .{ "stdbuf -oL -e 0 --input=0 npm test", "npm test" },
+        .{ "command npm test", "npm test" },
+        .{ "command -p -- npm test", "npm test" },
+        .{ "exec npm test", "npm test" },
+        .{ "exec -- npm test", "npm test" },
+        // 一次一层;包着的命令原样返回(它的引号与展开由 pattern 按原文判)
+        .{ "timeout 30 nice -n 5 npm test", "nice -n 5 npm test" },
+        .{ "nohup  \t npm test 'a b' $X", "npm test 'a b' $X" },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("command: {s}\n", .{case[0]});
+        try testing.expectEqualStrings(case[1], peelBenignWrapper(case[0]) orelse return error.NotPeeled);
+    }
+}
+
+test "peelBenignWrapper: 换环境、追加参数、语法之外的写法都不剥" {
+    const refused = [_][]const u8{
+        // 不是良性 wrapper
+        "env LD_PRELOAD=/tmp/x.so git status",
+        "env git status",
+        "xargs git add",
+        "sudo git status",
+        "git status",
+        "/usr/bin/timeout 30 git status",
+        // wrapper 的词里有引号、展开、通配、重定向
+        "'timeout' 30 git status",
+        "timeout '30' git status",
+        "timeout $T git status",
+        "timeout -s $SIG 30 git status",
+        "nice -n5* git status",
+        "nice -n 2>/dev/null git status",
+        // 未知选项、长选项缩写、短选项簇、不带值的选项带了值、缺值、不是时长
+        "timeout -x 30 git status",
+        "timeout --sig=KILL 30 git status",
+        "timeout -vs KILL 30 git status",
+        "timeout --verbose=1 30 git status",
+        "timeout -s",
+        "timeout git status",
+        "timeout 1e3 git status",
+        "nice -n 5 -10 git status",
+        "nice -x git status",
+        "ionice -p 1 git status",
+        "ionice -tc3 git status",
+        "stdbuf -x L git status",
+        // 只认 `-p` / `--`:`exec -a` 改 argv[0],`command -v` 不运行,`time -o` 写文件
+        "exec -a git-push git status",
+        "exec -c git status",
+        "command -v git",
+        "time -o /tmp/out git status",
+        "nohup -x git status",
+        // 没有命令,或剥出来的是没认出的选项
+        "timeout 30",
+        "nice -n 5",
+        "nohup --",
+        "time -p",
+        "exec -- -a git status",
+        "timeout 30 -x git status",
+    };
+    for (refused) |command| {
+        errdefer std.debug.print("command: {s}\n", .{command});
+        try testing.expect(peelBenignWrapper(command) == null);
+    }
 }
 
 test "isReadonlyCommand: covers common reads" {

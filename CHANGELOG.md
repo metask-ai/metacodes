@@ -141,6 +141,20 @@ status, compatibility boundaries, and entry points are defined by
   but only its `deny` and `ask` count: `env LD_PRELOAD=... git status` is not
   allowed by `git `. A command that cannot be split (out of memory) gets the
   strictest result the rules could reach.
+- A Bash `allow` rule in settings.json approved commands it does not name.
+  Every rule kind was matched against `bash_parser.stripWrappers`, which drops
+  `env` together with its `KEY=VAL` arguments and drops `xargs`, so
+  `Bash(git *)` allowed `env LD_PRELOAD=/tmp/x.so git status`,
+  `env PATH=/tmp/evil:$PATH git status` and `xargs git rm`. Since `allow` is
+  evaluated before `ask`, such a match also hid the user's `ask` rules, under
+  `bypassPermissions` too. An `allow` rule now matches a segment as written,
+  or the command inside a wrapper that only changes how it runs (`timeout`,
+  `time [-p]`, `nice`, `ionice`, `nohup`, `stdbuf`, `command [-p]`, `exec`),
+  parsed with that wrapper's real options (`bash_parser.peelBenignWrapper`):
+  `Bash(npm test)` still allows `timeout 30 npm test`. `deny` and `ask` rules
+  still see through every wrapper, and now also match the command as written
+  and each wrapper layer: `Bash(xargs *)` catches `xargs rm`, `Bash(env *)`
+  catches `env X=1 make`, and `timeout -s KILL 5 rm x` triggers `Bash(rm *)`.
 - A Ctrl+C/Esc while the provider stream read was blocked was reported as a
   model API error: `provider.cancel` shuts the socket, the read wakes with
   `ReadFailed`, and the stream clients classified that before consulting the
