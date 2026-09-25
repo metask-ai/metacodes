@@ -2166,6 +2166,7 @@ pub fn build(b: *std.Build) void {
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
     integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
+    integration_monolithic_run.step.dependOn(&install_selfexe_probe.step);
     wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
     wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
@@ -2182,6 +2183,7 @@ pub fn build(b: *std.Build) void {
     });
     const integration_timed_run = addTestRunArtifact(b, integration_timed_test);
     integration_timed_run.step.dependOn(&install_mock_mcp.step);
+    integration_timed_run.step.dependOn(&install_selfexe_probe.step);
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
     wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
