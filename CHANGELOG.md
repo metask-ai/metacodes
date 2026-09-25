@@ -38,6 +38,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Bash `deny` and `ask` permission rules now match a compound command when
+  any segment matches (after wrapper stripping): `Bash(rm *)` catches
+  `ls && rm x`, `ls; rm x`, `ls | rm x` and a newline-separated `rm x`. They
+  used to require every segment to match, like `allow`, so a harmless prefix
+  defeated the rule and the command ran under `bypassPermissions`, and under
+  `default` whenever its first word was read-only. `allow` rules still need
+  every segment (`permission/rule_spec.zig matchesBashCompound`). Rules are
+  now matched against the command the shell receives (the Bash tool's own
+  field lookup and JSON unescape), so `\n`, `\u0026\u0026` and `\"` are real
+  separators and quotes: `Bash(npm *)` no longer auto-allows
+  `npm test\nrm x`. Heredoc bodies are not parsed, so each of their lines
+  is a segment of its own.
 - A Ctrl+C/Esc while the provider stream read was blocked was reported as a
   model API error: `provider.cancel` shuts the socket, the read wakes with
   `ReadFailed`, and the stream clients classified that before consulting the
