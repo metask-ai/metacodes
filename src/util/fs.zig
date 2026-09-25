@@ -291,15 +291,21 @@ pub const testing = struct {
         return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}", .{ tmpRoot(&rbuf), tag, pid }) catch unreachable;
     }
 
-    /// `<tmpRoot>/<tag>-<pid>-<单调纳秒>`:同一进程内多次调用也互不相同(同一 helper 被
-    /// 多个用例反复 setup 时用这个;只需进程级隔离用 `perPidDir`)。规则同上。
+    /// `<tmpRoot>/<tag>-<pid>-<单调纳秒>-<序号>`:同一进程内多次调用也互不相同(同一 helper
+    /// 被多个用例反复 setup 时用这个;只需进程级隔离用 `perPidDir`)。规则同上。
+    /// 进程内唯一靠原子序号,不靠时钟:macOS CLOCK_MONOTONIC 分辨率 1 µs、Windows QPC 常见
+    /// 100 ns,紧挨的两次读数相同(2026-09-25 macOS ReleaseSafe 自测撞过)。pid 隔开同时在跑
+    /// 的进程;纳秒让复用了 pid 的后来进程不会落进崩溃残留、没清理掉的旧目录。
     pub fn uniqueDir(buf: []u8, tag: []const u8) [:0]const u8 {
         std.debug.assert(std.mem.startsWith(u8, tag, "cc-zig-"));
         var rbuf: [std.fs.max_path_bytes]u8 = undefined;
         const pid = @import("platform").process.currentPid();
         const ns = @import("time.zig").nowNs();
-        return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}-{d}", .{ tmpRoot(&rbuf), tag, pid, ns }) catch unreachable;
+        const seq = unique_dir_seq.fetchAdd(1, .monotonic);
+        return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}-{d}-{d}", .{ tmpRoot(&rbuf), tag, pid, ns, seq }) catch unreachable;
     }
+
+    var unique_dir_seq = std.atomic.Value(u64).init(0);
 };
 
 // ============================================================================
@@ -307,21 +313,35 @@ pub const testing = struct {
 // ============================================================================
 
 test "testing.perPidDir / uniqueDir: root + tag + pid, forward slashes, NUL-terminated, guard accepts them" {
-    var buf: [512]u8 = undefined;
-    const d = testing.perPidDir(&buf, "cc-zig-fs-selftest");
+    var pid_buf: [64]u8 = undefined;
+    const tag_pid = try std.fmt.bufPrint(&pid_buf, "/cc-zig-fs-selftest-{d}", .{@import("platform").process.currentPid()});
+    var pbuf: [512]u8 = undefined;
+    var ubuf: [512]u8 = undefined;
+    const dirs = [_][:0]const u8{
+        testing.perPidDir(&pbuf, "cc-zig-fs-selftest"),
+        testing.uniqueDir(&ubuf, "cc-zig-fs-selftest"),
+    };
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    try std.testing.expect(std.mem.startsWith(u8, d, testing.tmpRoot(&rbuf)));
-    try std.testing.expect(std.mem.indexOf(u8, d, "/cc-zig-fs-selftest-") != null);
-    try std.testing.expect(std.mem.indexOf(u8, d, "\\") == null);
-    try std.testing.expect(d[d.len] == 0);
-    try std.testing.expect(testing.isFixturePath(d, &rbuf));
+    for (dirs) |d| {
+        try std.testing.expect(std.mem.startsWith(u8, d, testing.tmpRoot(&rbuf)));
+        try std.testing.expect(std.mem.indexOf(u8, d, tag_pid) != null);
+        try std.testing.expect(std.mem.indexOf(u8, d, "\\") == null);
+        try std.testing.expect(d[d.len] == 0);
+        try std.testing.expect(testing.isFixturePath(d, &rbuf));
+    }
+}
 
-    var b1: [512]u8 = undefined;
-    var b2: [512]u8 = undefined;
-    const first = testing.uniqueDir(&b1, "cc-zig-fs-selftest");
-    const second = testing.uniqueDir(&b2, "cc-zig-fs-selftest");
-    try std.testing.expect(!std.mem.eql(u8, first, second));
-    try std.testing.expect(testing.isFixturePath(first, &rbuf));
+test "testing.uniqueDir: back-to-back calls never repeat a path, whatever the clock resolution" {
+    // 先连调、后比较:循环体只放调用本身,相邻两次才会落进同一个时钟刻度。Debug 下一次调用
+    // 就要 ~1 µs(本机实测;ReleaseSafe ~0.1 µs),边调边查重会把读数错开、测不出撞名。macOS
+    // CLOCK_MONOTONIC 1 µs 一跳、Windows QPC 常见 100 ns,只靠时钟读数拼的名字在这里
+    // Debug/ReleaseSafe 都必撞(2026-09-25 macOS ReleaseSafe test:lib 的自测失败即此)。
+    var slots: [256][256]u8 = undefined;
+    var dirs: [slots.len][:0]const u8 = undefined;
+    for (&slots, &dirs) |*slot, *d| d.* = testing.uniqueDir(slot, "cc-zig-fs-selftest");
+    for (dirs, 0..) |d, i| {
+        for (dirs[i + 1 ..]) |later| try std.testing.expect(!std.mem.eql(u8, d, later));
+    }
 }
 
 test "testing.isFixturePath: refuses anything outside <tmpRoot>/cc-zig-" {
