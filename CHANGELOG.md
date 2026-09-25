@@ -68,6 +68,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `util/file_lock` could let two contenders hold one lock after its holder
+  died. Both judged the dead holder's record stale; the first renamed it away
+  and created a fresh lock, and the second's rename then moved that fresh
+  lock away instead and created its own, so both went on to rewrite the
+  shared file. Takeover is now single-winner per stale record: a contender
+  first creates that record's claim file
+  (`<path>.lock.claim.<fingerprint>.<generation>`, `O_EXCL`) and deletes the
+  lock only if it still holds the record it judged stale, so a fresh lock is
+  never moved or deleted. A claimant that dies mid-takeover leaves a claim
+  that goes stale after `stale_ms`, and the next generation takes over. The
+  lock guards the swarm mailbox and team config, the task-list mirror,
+  provider config, transcripts and the TinyKG migration lock.
 - `util/fs.testing.uniqueDir` promised a distinct path per call but built it
   from the monotonic clock alone. macOS `CLOCK_MONOTONIC` ticks in 1 µs
   (Windows QPC commonly in 100 ns), so back-to-back calls returned the same
