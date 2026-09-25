@@ -72,6 +72,10 @@ status, compatibility boundaries, and entry points are defined by
   hop. `zig build test` runs the rule-control suite (`test:rule-control`),
   which observes every rule on the checked-in tree, so this kind of drift
   fails its own pull request.
+- The maintainer rule-control gate also failed closed on a skipped test: the
+  paid-budget rule's feedback runs `scripts/eval/workbuddy_release_suite.py`,
+  whose roster of WorkBuddy tests that need an external checkout missed the
+  one #110 added. The roster lists all ten again.
 - Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
   `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
   `firstLine` backed off while the last kept byte was a continuation byte,
