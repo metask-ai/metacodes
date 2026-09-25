@@ -105,9 +105,12 @@ test "L2: --disallowedTools 'Bash(rm *)' → Bash(rm foo) deny" {
     try std.testing.expect(
         cc.permission.checkPermission(&perm_ctx, "Bash", "{\"command\":\"rm foo\"}") == .deny,
     );
-    // ls 不命中 deny,readonly auto-allow
-    try std.testing.expect(
-        cc.permission.checkPermission(&perm_ctx, "Bash", "{\"command\":\"ls\"}") == .allow,
+    // ls 不命中 deny,readonly auto-allow(Windows 跑 PowerShell/cmd,只读判定不适用 → ask)
+    const readonly: cc.permission.PermissionResult =
+        if (cc.permission_bash_readonly.hostDialect() == .posix_sh) .allow else .ask;
+    try std.testing.expectEqual(
+        readonly,
+        cc.permission.checkPermission(&perm_ctx, "Bash", "{\"command\":\"ls\"}"),
     );
 }
 

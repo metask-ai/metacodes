@@ -6,8 +6,10 @@
 //! 同时:wrapper 命令(timeout / time / nice / nohup / stdbuf / xargs / env)
 //! 只是包装层,真正要匹配的是 wrapper 后面的目标命令。
 //!
-//! 还提供"readonly 命令"清单:ls / cat / pwd / 等读类命令永远算 low risk,
-//! 在 default 模式不必询问。
+//! 还提供"readonly 命令"清单(READONLY_BASH + isReadonlyCommand):只看首词的
+//! token 级判定,现仅供 delivery-cadence 探针使用。权限免询问与并发安全走
+//! bash_readonly.zig 的严格判定(完整词法 + 逐段 + 重定向/写选项),两份清单
+//! 命名同一组命令(编译期校验)。
 //!
 //! 对齐 Claude Code 文档:
 //!   - permissions.md: Bash 规则匹配的是"single shell command";compound 需逐段判定
@@ -188,8 +190,9 @@ fn looksLikeCommand(tok: []const u8) bool {
 // Readonly 命令清单
 // ============================================================================
 
-/// 默认 readonly 命令:在 default 模式不询问,在 sandbox 下不需要专门白名单。
-/// 对齐官方默认 allowUnsandboxedCommands 列表(粗集)。
+/// 读类命令名清单(token 级,首词匹配)。**不是**免询问判定:同名命令的写选项
+/// (`sed -i`、`find -delete`、`sort -o` …)、重定向与复合段由 bash_readonly.zig
+/// 判定;该文件的命令表与本清单须同名(编译期校验)。
 pub const READONLY_BASH = [_][]const u8{
     "ls",    "cat",      "pwd",   "echo",  "printf",
     "head",  "tail",     "grep",  "egrep", "fgrep",
@@ -197,10 +200,11 @@ pub const READONLY_BASH = [_][]const u8{
     "stat",  "du",       "df",    "file",  "sort",
     "uniq",  "cut",      "tr",    "awk",   "sed",
     "cd",    "true",     "false", "id",    "whoami",
-    "uname", "hostname",
+    "uname", "hostname", "rg",
 };
 
 /// 检查 cmd(已 stripWrappers)的第一个 token 是否在 readonly 清单。
+/// token 级粗判(delivery-cadence 探针用);权限与并发门用 bash_readonly.isReadonly。
 pub fn isReadonlyCommand(cmd: []const u8) bool {
     const t = std.mem.trim(u8, cmd, " \t");
     const sp = std.mem.indexOfAny(u8, t, " \t") orelse t.len;
