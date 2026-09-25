@@ -19,7 +19,7 @@ L2 必要条件:一条组件测试要跨 ≥3 个真实模块接线(声明=接�
 ## 常用命令
 
 ```bash
-zig build test                   # 完整离线门:core + 聚合 L2/L3 + eval + TinyKG 合约
+zig build test                   # 完整离线门:core + 聚合 L2/L3 + eval + TinyKG 合约 + 规则传感器
 zig build test:lib               # core 全图;默认 4 个确定性、fail-closed 分片
 zig build test:lib -Dlib-test-shards=2   # 资源紧张机器可降低并发,不减覆盖
 zig build test:lib-monolithic    # 单进程诊断/与分片基线对照
@@ -48,7 +48,10 @@ hyperfine --warmup 3 './zig-out/bin/metacodes --help'
 TinyKG 相关门禁:`test:tinykg-binary`(bundled/显式二进制边界)、
 `test:kg-daemon-transport`(认证共享 Store daemon L2)、`test:kg-governance`、
 `test:kg-ontology-feedback`、`test:kg-experience-feedback`。发布相关门禁:
-`agentcore:gate`、`windows:gate`、`http-status:gate`。完整清单与语义见
+`agentcore:gate`、`windows:gate`、`http-status:gate`。规则控制面:
+`test:rule-control`(传感器负例,并在已检入的树上观测 `control-plane/rules.json`
+的每条规则;`zig build test` 包含它,Lean 判定与反馈回放仍只在
+`zig build --build-file control-plane/build.zig rule-check`)。完整清单与语义见
 `zig build --help` 与 [doc/README.md](../doc/README.md)。
 
 `scripts/eval/tests` 中依赖已编译 Lean SDK 的用例在

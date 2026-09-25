@@ -296,6 +296,38 @@ def _strip_zig_comments(source: str) -> str:
     return re.sub(r"//.*$", "", source, flags=re.MULTILINE)
 
 
+def _module_string_constant(source: str, name: str) -> str | None:
+    """The literal of the only module-level ``name = "..."`` binding, else None.
+
+    A second binding, a computed value, or unparseable source leaves the value
+    unknown; callers report that rather than guess.
+    """
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    bindings = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+        )
+        or (
+            isinstance(node, (ast.AnnAssign, ast.AugAssign))
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+        )
+    ]
+    if len(bindings) != 1 or not isinstance(bindings[0], ast.Assign):
+        return None
+    value = bindings[0].value
+    if len(bindings[0].targets) != 1 or not isinstance(value, ast.Constant):
+        return None
+    return value.value if isinstance(value.value, str) else None
+
+
 def observe_release_gate(
     repo: Path,
     workspace: Path,
@@ -1264,6 +1296,17 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         )
 
     sources = {name: _strip_zig_comments(read_text(path)) for name, path in paths.items()}
+    # The manifest must carry the schema the bundle builder writes. Read that
+    # authority instead of keeping a copy here: a copied ".../v1" outlived the
+    # v2 bundle (bb8284ab) and held this rule red against a correct manifest.
+    bundle_schema = _module_string_constant(read_text(paths["tinykg_stage"]), "BUNDLE_SCHEMA")
+    try:
+        bundle_manifest = json.loads(read_text(paths["tinykg_bundle"]))
+    except json.JSONDecodeError:
+        bundle_manifest = None
+    manifest_schema = (
+        bundle_manifest.get("bundle_schema") if isinstance(bundle_manifest, dict) else None
+    )
     timing_checks = {
         "enumerates compiled tests": "builtin.test_functions" in sources["timing"],
         "resets allocator per test": "std.testing.allocator_instance = .{}" in sources["timing"],
@@ -1449,16 +1492,19 @@ def observe_build_test_throughput(repo: Path) -> Observation:
                 '"--expected-sha256"',
             )
         ),
-        "bundle manifest pins source build target format and digest": all(
-            marker in sources["tinykg_bundle"]
-            for marker in (
-                '"metacodes.tinykg-bundle/v1"',
-                '"source_commit"',
-                '"ReleaseSafe"',
-                '"strip": true',
-                '"sha256"',
-                '"targets"',
-                '"format"',
+        "bundle manifest pins source build target format and digest": (
+            bundle_schema is not None
+            and manifest_schema == bundle_schema
+            and all(
+                marker in sources["tinykg_bundle"]
+                for marker in (
+                    '"source_commit"',
+                    '"ReleaseSafe"',
+                    '"strip": true',
+                    '"sha256"',
+                    '"targets"',
+                    '"format"',
+                )
             )
         ),
         "bundle staging enforces digest format target and native store probes": all(
@@ -1596,6 +1642,17 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         absent = [name for name, present in checks.items() if not present]
         if absent:
             errors.append(f"{obligation}: missing {', '.join(absent)}")
+    if bundle_schema is None:
+        errors.append(
+            "reproducible_shipped_artifacts: cannot read one BUNDLE_SCHEMA string constant "
+            f"from {relative_sources['tinykg_stage']}"
+        )
+    elif manifest_schema != bundle_schema:
+        errors.append(
+            f"reproducible_shipped_artifacts: {relative_sources['tinykg_bundle']} bundle_schema "
+            f"is {manifest_schema!r}, not the current {bundle_schema!r} from "
+            f"{relative_sources['tinykg_stage']}"
+        )
     if exclusions_unparsed:
         errors.append(
             "aggregate_source_inventory: cannot parse aggregate_test_exclusions from build.zig"
@@ -2113,7 +2170,6 @@ def observe_treatment_activation(repo: Path) -> Observation:
     receipt_source = function_source("model", "validate_treatment_activation_receipt")
     writer_source = function_source("model", "write_rollouts")
     marker_source = function_source("runner", "_mark_treatment_activation_invalid")
-    load_source = function_source("runner", "_load_checkpoint")
     promotion_source = function_source("promotion", "validate_multi_arm_evidence")
     cli_source = sources["cli"]
     attester_tests = sources["attester_tests"]
@@ -2147,12 +2203,56 @@ def observe_treatment_activation(repo: Path) -> Observation:
         and len(treatment_abort_lines) == 1
         and attach_lines[0] < mark_lines[0] < write_lines[0] < treatment_abort_lines[0]
     )
+
+    def verifier_arguments(function: ast.FunctionDef | None, name: str) -> list[ast.expr | None]:
+        """The ``treatment_verifier=`` value of each call to ``name`` (None: omitted)."""
+        if function is None:
+            return []
+        return [
+            next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "treatment_verifier"),
+                None,
+            )
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == name)
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+            )
+        ]
+
+    # 316a468a moved the row checks out of `_load_checkpoint` into
+    # `_validate_checkpoint_rows`, which the plugin analysis shares. Every hop
+    # must pass the verifier on: an omitted keyword leaves it None and resume
+    # skips the reattestation without any call disappearing.
+    supplied = verifier_arguments(runner, "_load_checkpoint")
+    verifier_supplied = (
+        len(supplied) == 1
+        and supplied[0] is not None
+        and not (isinstance(supplied[0], ast.Constant) and supplied[0].value is None)
+    )
+    forwarded = verifier_arguments(
+        function_node("runner", "_load_checkpoint"), "_validate_checkpoint_rows"
+    )
+    verifier_forwarded = (
+        len(forwarded) == 1
+        and isinstance(forwarded[0], ast.Name)
+        and forwarded[0].id == "treatment_verifier"
+    )
+    rows_reverified = bool(
+        call_lines(
+            function_node("runner", "_validate_checkpoint_rows"),
+            "reverify_treatment_activation",
+        )
+    )
     resume_before_network = (
         locked_runner_reachable
         and len(load_lines) == 1
         and len(run_lines) == 1
         and load_lines[0] < run_lines[0]
-        and "reverify_treatment_activation" in load_source
+        and verifier_supplied
+        and verifier_forwarded
+        and rows_reverified
     )
 
     obligations = {
@@ -2919,6 +3019,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     ]
     relative_sources = {
         "journal": "scripts/eval/memory_budget_journal.py",
+        "model": "scripts/eval/model.py",
         "runner": "scripts/eval/memory_agent_runtime.py",
         "pilot": "scripts/eval/memory_agent_runtime_pilot.py",
         "multi_runner": "scripts/eval/paired_runner.py",
@@ -3037,6 +3138,62 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     identity_validate = top_source("journal", "_validate_identity_record")
     journal_enter = method_source("journal", "BudgetJournal", "__enter__")
     journal_open_lock = method_source("journal", "BudgetJournal", "_open_lock")
+    # c9f73392 moved O_NOFOLLOW into model.open_nofollow (Windows has no such
+    # flag): the lock stays no-follow only while `_open_lock` opens through the
+    # shipped helper and that helper still sets the flag.
+    open_lock_node = method("journal", "BudgetJournal", "_open_lock")
+    lock_opens = (
+        []
+        if open_lock_node is None
+        else [
+            node
+            for node in ast.walk(open_lock_node)
+            if isinstance(node, ast.Call)
+            and dotted_name(node.func) in {"open_nofollow", "os.open", "open", "io.open"}
+        ]
+    )
+    lock_opens_nofollow = (
+        len(lock_opens) == 1
+        and dotted_name(lock_opens[0].func) == "open_nofollow"
+        and any(
+            keyword.arg == "dir_fd" and dotted_name(keyword.value) == "self._dir_fd"
+            for keyword in lock_opens[0].keywords
+        )
+    )
+    nofollow_bindings = [
+        node
+        for node in trees["journal"].body
+        if (
+            isinstance(node, (ast.Import, ast.ImportFrom))
+            and any((alias.asname or alias.name) == "open_nofollow" for alias in node.names)
+        )
+        or (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == "open_nofollow"
+        )
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "open_nofollow"
+                for target in node.targets
+            )
+        )
+    ]
+    journal_uses_shipped_nofollow = (
+        len(nofollow_bindings) == 1
+        and isinstance(nofollow_bindings[0], ast.ImportFrom)
+        and nofollow_bindings[0].module == "model"
+        and nofollow_bindings[0].level == 1
+    )
+    shipped_nofollow = top_function("model", "open_nofollow")
+    shipped_nofollow_sets_flag = shipped_nofollow is not None and any(
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.op, ast.BitOr)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "flags"
+        and dotted_name(node.value) == "os.O_NOFOLLOW"
+        for node in ast.walk(shipped_nofollow)
+    )
     journal_regular = method_source("journal", "BudgetJournal", "_validate_regular_fd")
     journal_persist = method_source("journal", "BudgetJournal", "_persist")
     journal_append = method_source("journal", "BudgetJournal", "_append")
@@ -3266,9 +3423,11 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 and pilot_lock_lines[0] < credential_lines[0] < schedule_lines[0]
                 and "with BudgetJournal(journal_path, authority) as budget_journal:" in pilot_source
             ),
-            "lock is exclusive nonblocking and held until context exit": all(
-                marker in journal_open_lock
-                for marker in ("os.O_NOFOLLOW", "self._validate_regular_fd")
+            "lock is exclusive nonblocking and held until context exit": (
+                lock_opens_nofollow
+                and journal_uses_shipped_nofollow
+                and shipped_nofollow_sets_flag
+                and "self._validate_regular_fd" in journal_open_lock
             ) and all(
                 marker in journal_enter
                 for marker in (
@@ -4387,7 +4546,8 @@ def redacted_workspace(workspace: Path) -> str:
     """Report-safe workspace label without the runner account's absolute path."""
 
     try:
-        return "~/" + str(workspace.relative_to(Path.home()))
+        # POSIX separators on every host, Windows runners included.
+        return "~/" + workspace.relative_to(Path.home()).as_posix()
     except (ValueError, RuntimeError):
         return workspace.name
 

@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import os
@@ -380,6 +381,29 @@ with BudgetJournal(Path(%r), authority):
                 self.assertNotEqual(completed.returncode, 91)
                 self.assertIn("another local runner holds it", completed.stderr)
                 self.assertEqual(journal.snapshot(), before)
+
+    @requires_posix_budget_journal
+    def test_symlinked_lock_is_refused_and_its_target_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # A file the lock checks would accept (regular, 0600, one link): if
+            # the open followed the link it would lock this file and go on to
+            # create the journal, instead of failing for an unrelated reason.
+            target = root / "unrelated.bin"
+            target.write_bytes(b"another file this user owns\n")
+            target.chmod(0o600)
+            path = root / "pilot-budget.json"
+            journal = BudgetJournal(path, self.authority())
+            journal.lock_path.symlink_to(target)
+            with self.assertRaisesRegex(
+                ValidationError, "budget journal lock: cannot open"
+            ) as refused:
+                with journal:
+                    pass
+            self.assertIsInstance(refused.exception.__cause__, OSError)
+            self.assertEqual(refused.exception.__cause__.errno, errno.ELOOP)
+            self.assertEqual(target.read_bytes(), b"another file this user owns\n")
+            self.assertFalse(path.exists())
 
     @requires_posix_budget_journal
     def test_corrupt_truncated_symlink_hardlink_and_temp_fail_closed(self):
