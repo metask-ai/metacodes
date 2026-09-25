@@ -57,8 +57,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .additional_dirs = ctx.additional_dirs,
             .disable_for_this_command = false, // Monitor 无 dangerouslyDisableSandbox 参数
         }) catch |e| {
-            if (e == error.SandboxUnavailable) return error.SandboxUnavailable; // failIfUnavailable → 拒绝
-            break :blk command; // 其它 error(profile 写失败)降级 passthrough(同 bash.zig)
+            if (e == error.SandboxUnavailable or e == error.OutOfMemory) return e; // failIfUnavailable → 拒绝
+            // 其它 error(profile 写失败):拒跑,绝不降级为裸命令(同 bash.zig / skills/render.zig)
+            return error.SandboxUnavailable;
         };
         if (maybe) |sw| {
             sandbox_wrap = sw;

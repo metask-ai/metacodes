@@ -4,8 +4,9 @@
 //!   "sandbox": {
 //!     "enabled": true,
 //!     "failIfUnavailable": false,
-//!     "allowUnsandboxedCommands": true,   // 逃生口开关
-//!     "autoAllowBashIfSandboxed": true,   // 沙箱内 bash 自动放行
+//!     "allowUnsandboxedCommands": true,   // 逃生口开关:false 时 dangerouslyDisableSandbox 被忽略
+//!     "autoAllowBashIfSandboxed": true,   // 沙箱内 bash 自动放行——仅限真会被包裹的调用
+//!                                         // (sandbox_exec.plan:本机有 Seatbelt、非 excluded、未走逃生口)
 //!     "filesystem": { "allowWrite":[], "denyWrite":[], "allowRead":[], "denyRead":[] },
 //!     "network": { "allowedDomains":[], "deniedDomains":[] },
 //!     "excludedCommands": ["docker"]      // 这些命令不进沙箱
