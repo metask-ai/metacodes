@@ -25,8 +25,8 @@ from typing import Optional, Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 from scripts.stage_tinykg_binary import (
-    COMMIT_RE, StageError, TinyKgBundle, TinyKgContract, _atomic_copy,
-    _atomic_json, _atomic_text, inspect_binary, sha256_file,
+    BUNDLE_SCHEMA, COMMIT_RE, StageError, TinyKgBundle, TinyKgContract,
+    _atomic_copy, _atomic_json, _atomic_text, inspect_binary, sha256_file,
     validate_bundle_bytes, validate_store_contract,
 )
 from scripts.verify_tinykg_binary import attest_native
@@ -222,7 +222,7 @@ def build(args: argparse.Namespace) -> int:
     validate_store_contract(cli_identity, contract)
     inspect_binary(native_daemon, sha256_file(native_daemon), contract, "daemon")
     generated = {
-        "bundle_schema": "metacodes.tinykg-bundle/v2", "source_commit": args.commit,
+        "bundle_schema": BUNDLE_SCHEMA, "source_commit": args.commit,
         "build": {"zig_version": old_bundle.zig_version, "optimize": "ReleaseSafe", "strip": True},
         "artifacts": artifacts,
     }

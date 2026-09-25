@@ -327,6 +327,8 @@ zig build --build-file control-plane/build.zig test
 python3 scripts/rule_control.py check
 ```
 
+The main build's `zig build test` runs the same unit tests (as `test:rule-control`), including an observation of every rule in `rules.json` against the checked-in tree, so a change that moves code a sensor reads fails in its own pull request. Lean decisions, counterexamples, and feedback replay run only in `rule-check`.
+
 The full run always writes `zig-out/reports/rule-control.json` before returning a blocked exit status. The report contains both observations, Lean decisions, counterexample verdicts, Zig feedback results, source hashes, violations, and remediation context.
 
 ## Adding a rule
@@ -334,6 +336,7 @@ The full run always writes `zig-out/reports/rule-control.json` before returning 
 Add a versioned entry to `rules.json` with all six links, implement a deterministic sensor that emits small facts rather than asking Lean to parse the repository, state the policy in `MetaCodesControl/`, and add both positive and negative fixtures. A rule must demonstrate:
 
 - its decision function is the one proved in Lean;
+- its sensor closes on the checked-in tree, not only on fixtures written to match it;
 - a representative repository violation reaches the sensor;
 - the Lean signal blocks that violation;
 - the actuator is observed in the real build and CI path and has an observable effect;

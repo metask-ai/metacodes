@@ -1985,6 +1985,22 @@ pub fn build(b: *std.Build) void {
     const release_cut_test_step = b.step("test:release-cut", "Test the release cut / reopen rules and the version-state gate");
     release_cut_test_step.dependOn(&release_cut_test_cmd.step);
     test_step.dependOn(&release_cut_test_cmd.step);
+    // The rule-control sensors read source text, so moving the code a sensor
+    // reads turns its rule red without failing any product test. Only the
+    // dispatch-only rule-control workflow ran them, and three drifted
+    // unnoticed. The suite observes every rule on the checked-in tree, which
+    // fails the drift in the change that causes it; the Lean decision and
+    // replayed feedback stay in `rule-check`.
+    const rule_control_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_rule_control",
+        "-v",
+    });
+    const rule_control_test_step = b.step("test:rule-control", "Test the rule-control sensors on fixtures and on the checked-in tree");
+    rule_control_test_step.dependOn(&rule_control_test_cmd.step);
+    test_step.dependOn(&rule_control_test_cmd.step);
     const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true });
     const gate_coverage = if (@import("builtin").os.tag == .windows)
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })

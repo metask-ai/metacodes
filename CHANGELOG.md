@@ -62,6 +62,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Three maintainer rule-control sensors had drifted from the code they read
+  and failed closed on a correct tree. The TinyKG bundle rule still required
+  `metacodes.tinykg-bundle/v1` after the bundle moved to v2; it now reads the
+  schema the bundle builder writes (`stage_tinykg_binary.BUNDLE_SCHEMA`). The
+  paid-budget lock and treatment-resume rules looked for `O_NOFOLLOW` and the
+  reattestation call where refactors had moved them into shared helpers
+  (`model.open_nofollow`, `_validate_checkpoint_rows`); they now check each
+  hop. `zig build test` runs the rule-control suite (`test:rule-control`),
+  which observes every rule on the checked-in tree, so this kind of drift
+  fails its own pull request.
 - Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
   `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
   `firstLine` backed off while the last kept byte was a continuation byte,
