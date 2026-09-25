@@ -277,10 +277,13 @@ test "L2 并发: executeSlots 保留聚合大结果给 hook/UI 后置投影" {
 }
 
 test "L2 并发: per-input 分类(Bash readonly safe / 写 unsafe)" {
-    try std.testing.expect(tools.isConcurrencySafeInput("Bash", "{\"command\":\"ls -la\"}"));
-    try std.testing.expect(tools.isConcurrencySafeInput("Bash", "{\"command\":\"git status\"}"));
+    // Windows 的 Bash 跑 PowerShell/cmd:POSIX 只读判定不适用,一律串行。
+    const posix = cc.permission_bash_readonly.hostDialect() == .posix_sh;
+    try std.testing.expectEqual(posix, tools.isConcurrencySafeInput("Bash", "{\"command\":\"ls -la\"}"));
+    try std.testing.expectEqual(posix, tools.isConcurrencySafeInput("Bash", "{\"command\":\"git status\"}"));
     try std.testing.expect(!tools.isConcurrencySafeInput("Bash", "{\"command\":\"rm -rf x\"}"));
     try std.testing.expect(!tools.isConcurrencySafeInput("Bash", "{\"command\":\"echo hi > f\"}"));
+    try std.testing.expect(!tools.isConcurrencySafeInput("Bash", "{\"command\":\"find . -delete\"}"));
     // 非 Bash 沿用名单
     try std.testing.expect(tools.isConcurrencySafeInput("Read", "{\"file_path\":\"/x\"}"));
     try std.testing.expect(!tools.isConcurrencySafeInput("Write", "{\"file_path\":\"/x\",\"content\":\"y\"}"));

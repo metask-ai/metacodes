@@ -2948,9 +2948,17 @@ pub const App = struct {
             var sb = sb_config.parse(app.allocator, parsed.value) catch continue;
             if (sb.enabled) {
                 app.sandbox_settings = sb;
-                app.permission_ctx.sandbox_enabled = true;
-                app.permission_ctx.auto_allow_bash_if_sandboxed = sb.auto_allow_bash_if_sandboxed;
+                // 权限链与 Bash 工具看同一份设置:autoAllowBashIfSandboxed 只放行
+                // sandbox_exec.plan 判为 .sandboxed 的调用(不再凭"设置开着"放行)。
+                app.permission_ctx.sandbox = app.sandboxPtr();
                 @import("util/log.zig").info("sandbox", "enabled (from {s})", .{path});
+                if (!@import("sandbox/exec.zig").hostSupported()) {
+                    const consequence = if (sb.fail_if_unavailable)
+                        "failIfUnavailable refuses every Bash command"
+                    else
+                        "Bash commands run unsandboxed and autoAllowBashIfSandboxed does not apply";
+                    @import("util/log.zig").warn("sandbox", "enabled in {s}, but this host has no sandbox backend (macOS sandbox-exec only): {s}", .{ path, consequence });
+                }
                 return;
             }
             sb.deinit();

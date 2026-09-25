@@ -666,14 +666,9 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
     _ = common.extractJsonArg(args, "description");
 
     // Sandbox 包裹(macOS Seatbelt):若 ctx.sandbox 启用,把 command 改写成
-    // `sandbox-exec -f <profile> /bin/bash -c <cmd>`。dangerouslyDisableSandbox=true 跳过。
+    // `sandbox-exec -f <profile> /bin/bash -c <cmd>`。dangerouslyDisableSandbox=true 仅在
+    // allowUnsandboxedCommands 允许时跳过(sandbox_exec.escapeHatchHonored,权限链同一判定)。
     // sandbox_wrap 非 null 时持有临时 profile 文件,函数返回前 deinit 清理。
-    const disable_sb = blk: {
-        if (common.extractJsonArg(args, "dangerouslyDisableSandbox")) |v| {
-            break :blk std.mem.eql(u8, v, "true");
-        }
-        break :blk false;
-    };
     var sandbox_wrap: ?@import("../sandbox/exec.zig").ShellWrap = null;
     defer if (sandbox_wrap) |*sw| sw.deinit();
     const command: []const u8 = blk: {
@@ -686,12 +681,14 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             .home = ctx.home_dir,
             .sandbox = sb,
             .additional_dirs = ctx.additional_dirs,
-            .disable_for_this_command = disable_sb,
+            .disable_for_this_command = sandbox_exec.escapeHatchHonored(sb, args),
         }) catch |e| {
             // failIfUnavailable=true 时沙箱不可用 → 拒绝执行(不降级裸跑)
-            if (e == error.SandboxUnavailable) return error.SandboxUnavailable;
-            // 其它 error(profile 写失败等):降级 passthrough
-            break :blk raw_command;
+            if (e == error.SandboxUnavailable or e == error.OutOfMemory) return e;
+            // 沙箱本该包裹(权限链可能正因此 autoAllowBashIfSandboxed 放行)却没备好 profile:
+            // 拒跑,绝不降级为裸命令(与 skills/render.zig 注入 shell 同一规则)。
+            common.setErrorDetail(ctx.error_detail, allocator, "the sandbox profile for this command could not be prepared ({s}); the command did not run. Retrying will fail the same way until the sandbox can write its profile to TMPDIR.", .{@errorName(e)});
+            return error.SandboxUnavailable;
         };
         if (maybe) |sw| {
             sandbox_wrap = sw;

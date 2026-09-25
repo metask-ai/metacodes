@@ -172,9 +172,10 @@ pub fn classify(allocator: std.mem.Allocator, name: []const u8, input: []const u
 
 /// A Bash call counts as exploration only when every compound segment is a
 /// read-only command with no file redirect and no in-place flag. The
-/// permission layer's read-only roster is a "no prompt needed" list, so the
-/// extra guards close the holes that matter here (`sed -i`, `find -delete`,
-/// `cat a > b`); anything doubtful disarms.
+/// token-level roster in bash_parser only names commands, so the extra
+/// guards close the holes that matter here (`sed -i`, `find -delete`,
+/// `cat a > b`); anything doubtful disarms. (The permission chain's own
+/// verdict is the stricter permission/bash_readonly.)
 fn classifyBash(allocator: std.mem.Allocator, input: []const u8) Class {
     const encoded = common.extractJsonArg(input, "command") orelse return .mutation;
     const raw = util_json.unescapeString(encoded, allocator) catch return .mutation;
