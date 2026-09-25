@@ -292,7 +292,7 @@ pub fn run(
     // scoped 自动召回(一等公民 P1):headless 单次 prompt 也按请求装配相关记忆(cache-safe 尾注入)。
     const scoped_recall_mod = @import("../kg/scoped_recall.zig");
     var scoped_recall_result: ?scoped_recall_mod.BuildResult = if (app.kg) |*k|
-        (scoped_recall_mod.buildWithReceipt(allocator, k, &app.conversation, &app.abort) catch null)
+        (scoped_recall_mod.buildWithReceipt(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null)
     else
         null;
     defer if (scoped_recall_result) |*result| result.deinit(allocator);
@@ -305,6 +305,13 @@ pub fn run(
             .injected_count = result.receipt.injected_count,
             .injected_bytes = result.receipt.injected_bytes,
             .injection_sha256 = result.receipt.injection_sha256,
+            .system_one = if (result.system_one) |record| .{
+                .audit = record.audit,
+                .actuated = record.actuated,
+                .judged = record.judged,
+                .positive = record.positive,
+                .changed = record.changed,
+            } else null,
         });
     };
     const scoped_recall = if (scoped_recall_result) |result| result.text else null;
@@ -538,6 +545,7 @@ fn buildOptions(
         .plan_prev_mode = &app.plan_prev_mode,
         .tasks = &app.tasks,
         .kg = if (app.kg) |*k| k else null,
+        .jev = app.jevAdvisor(),
         .kg_projects_dir = app.kg_projects_dir,
         .memdir_abs = app.memdir_abs,
         .api_client = app.anthropicClientOrNull(),

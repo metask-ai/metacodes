@@ -288,9 +288,8 @@ fn firstLineTrunc(text: []const u8, max: usize) []const u8 {
     // line_end 是自然边界(字符完整),不能回退——否则会把 '\n' 前最后一个完整 CJK
     // 字符切掉、产出坏 UTF-8("步骤一:读代码" → "步骤一:读代�")。
     if (line_end <= max) return text[0..line_end];
-    var end = max;
-    while (end > 0 and (text[end - 1] & 0xC0) == 0x80) end -= 1; // 回到字符起点,不切半个字
-    return text[0..end];
+    // 回到字符起点,不切半个字(看切点前一字节的旧写法会留下孤立首字节)。
+    return text[0..@import("../util/utf8.zig").prefixEnd(text, max)];
 }
 
 // ============================================================================
@@ -298,6 +297,15 @@ fn firstLineTrunc(text: []const u8, max: usize) []const u8 {
 // ============================================================================
 
 const testing = std.testing;
+
+test "firstLineTrunc never ends inside a multi-byte character" {
+    inline for (.{ 118, 119, 120 }) |ascii| {
+        const text = "a" ** ascii ++ "步骤一 tail";
+        const visible = firstLineTrunc(text, 120);
+        try testing.expect(visible.len <= 120);
+        try testing.expect(std.unicode.utf8ValidateSlice(visible));
+    }
+}
 
 test "renderSummary 空态外的完整渲染:计数/ready 前3/快照声明" {
     const a = testing.allocator;

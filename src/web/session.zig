@@ -419,7 +419,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         };
 
         // scoped 自动召回(对齐 headless.zig:按请求装配相关记忆,cache-safe 尾注入)
-        const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort) catch null) else null;
+        const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
 
         var options = buildWebOptions(app, &wb, scoped_recall);

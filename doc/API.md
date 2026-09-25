@@ -171,6 +171,30 @@ the same kind, and a character the block ends without completing is emitted
 as one U+FFFD line rather than dropped. Flag removals or semantic changes
 require a changelog entry.
 
+### System-One memory advisor (optional)
+
+A self-hosted Jev System-One judge can advise four memory decisions (scoped
+recall injection, `KgRecall` evidence, `KgRemember` relations, enumeration
+intent). It is off unless `METACODES_JEV_URL` is set, and it is evidence only:
+it never gates a tool, a permission, a budget, or a TinyKG write. Design,
+failure semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_ONE.md).
+
+| Environment | Contract |
+|---|---|
+| `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); unset or blank disables the advisor |
+| `METACODES_JEV_MODE` | `shadow` (default: consult and journal, provider-visible bytes unchanged) or `advisory` (judgments change injections and annotate tool results) |
+| `METACODES_JEV_TIMEOUT_MS` | per-consultation deadline, default 2500; a miss falls back to the unadvised path with no retry |
+| `METACODES_JEV_MODEL` | expected model id; a response from any other model, or one that reports a priced tariff, is refused |
+| `METACODES_JEV_DECISIONS` | comma-separated subset of `scoped_recall`, `recall_evidence`, `memory_relation`, `enumeration_intent` (default: all); a surface left out behaves exactly as with no advisor, and an unknown or empty list disables the advisor |
+
+Every consultation emits a `system_one_decision` event
+(`schema_version: metacodes-system-one-decision-v1`): decision, question set,
+mode, outcome, `actuated`, request SHA-256, model, latency, and
+judged/positive/changed counts. The scoped-recall decision goes to the
+evaluation event stream; the tool-surface decisions (KgRecall, KgRemember,
+enumeration) go to the session's tool-observation journal. A user interrupt
+during a consultation surfaces as `Aborted`, never as a fallback.
+
 ### Model tiers
 
 Subagent/skill model pins and `/model` accept tier names — `low`, `mid`,

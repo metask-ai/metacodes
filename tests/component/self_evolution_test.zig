@@ -352,7 +352,7 @@ test "L2: outcome ingestion is idempotent through the real recall path" {
     var conversation = cc.conversation.Conversation.init(a);
     defer conversation.deinit();
     var abort_signal = cc.util_abort.AbortSignal.init();
-    var built = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built.deinit(a);
     const injected_text = built.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, injected_text, "task=etag") != null);
@@ -584,7 +584,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     var conversation = cc.conversation.Conversation.init(a);
     defer conversation.deinit();
     var abort_signal = cc.util_abort.AbortSignal.init();
-    var built = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built.deinit(a);
     const text = built.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, text, "note=I concluded the (skipped) file was stale") != null);
@@ -616,7 +616,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
-    var built2 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built2 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built2.deinit(a);
     const text2 = built2.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, text2, "Per-point reading mode") != null);
@@ -644,7 +644,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
-    var built3 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built3 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built3.deinit(a);
     const text3 = built3.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, text3, "failed 3 consecutive attempt(s)") != null);
@@ -685,7 +685,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
-    var built4b = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built4b = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built4b.deinit(a);
     const text4b = built4b.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, text4b, "ESCALATED") != null);
@@ -747,7 +747,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     }
     try std.testing.expectEqual(@as(usize, 2), self_evolution.ingestOutcomes(a, &kg));
     ppaths.setEnv("METACODES_TASK_HINT", "long-wall-task");
-    var built_long = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built_long = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built_long.deinit(a);
     const text_long = built_long.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, text_long, "Per-point reading mode") != null);
@@ -784,7 +784,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     }
     try std.testing.expectEqual(@as(usize, 2), self_evolution.ingestOutcomes(a, &kg));
     ppaths.setEnv("METACODES_TASK_HINT", "reason-task");
-    var built_r = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built_r = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built_r.deinit(a);
     const text_r = built_r.text orelse return error.TestExpectedInjection;
     // 注解到达注入面(newest 行原文含理由)。
@@ -810,7 +810,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
-    var built_r3 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built_r3 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built_r3.deinit(a);
     const text_r3 = built_r3.text orelse return error.TestExpectedInjection;
     // 累积规格(v26 起为全量去重列表):历史结构理由仍在行上。
@@ -861,7 +861,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
-    var built_r4 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built_r4 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built_r4.deinit(a);
     const text_r4 = built_r4.text orelse return error.TestExpectedInjection;
     // 约束累积:r4 为 newest,mode 行须同时携带 r3(AttributeError)与
@@ -974,7 +974,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
             return error.TestExpectedSummary;
         try std.testing.expectEqual(@as(u32, 0), summary.passed);
         try std.testing.expectEqual(@as(usize, 1), summary.ingested);
-        var built_hc = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+        var built_hc = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
         defer built_hc.deinit(a);
         const text_hc = built_hc.text orelse return error.TestExpectedInjection;
         try std.testing.expect(std.mem.indexOf(u8, text_hc, "prov=host_run") != null);
@@ -1008,7 +1008,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     // 手工存一条陈年义务:解决态必须拒载(棘轮释放)。
     _ = kg.remember(.observation, "metacodes-provisional-obligation-v1 task=solved-task needle=tests/s.py::T::t_old reason=stale ghost", "provisional_obligation", false) catch {};
     try std.testing.expect(cc.obligation_gate.load(a, &kg, "solved-task") == null);
-    var built_s = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built_s = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built_s.deinit(a);
     const text_s = built_s.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, text_s, "already proven by the verdict above") != null);
@@ -1037,7 +1037,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
     ppaths.setEnv("METACODES_TASK_HINT", "solved-task");
     try std.testing.expect(cc.obligation_gate.load(a, &kg, "solved-task") == null);
-    var built_rg = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    var built_rg = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
     defer built_rg.deinit(a);
     const text_rg = built_rg.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, text_rg, "REGRESSED from an already-proven configuration") != null);
@@ -1149,7 +1149,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     // 里的 VERBATIM 指令永不送达,模型第三次徒手重打漏 'rb'):回归态
     // note 正文必须自带 FIRST-edit 逐字令与工件路径。
     {
-        var built_vb = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+        var built_vb = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
         defer built_vb.deinit(a);
         const text_vb = built_vb.text orelse return error.TestExpectedInjection;
         try std.testing.expect(std.mem.indexOf(u8, text_vb, "FIRST EDIT: write the artifact quoted above to `pkg/_helper.py`") != null);
@@ -1237,7 +1237,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         // **一次未达即失信** → 静默立刻解除(无 REGRESSED 措辞), 但多文件工件
         // 与逐字令必须仍在——失信的回应是加压, 不是丢掉唯一已证配置。
         {
-            var built_g = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+            var built_g = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
             defer built_g.deinit(a);
             const text_g = built_g.text orelse return error.TestExpectedInjection;
             try std.testing.expect(std.mem.indexOf(u8, text_g, "REGRESSED from an already-proven configuration") == null);
@@ -1247,7 +1247,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         // ① 第二次未达:失信保持稳定(不因再次失败而回摆)。
         _ = kg.remember(.observation, fail_row_2, "task_outcome", false) catch {};
         {
-            var built_i = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+            var built_i = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
             defer built_i.deinit(a);
             const text_i = built_i.text orelse return error.TestExpectedInjection;
             try std.testing.expect(std.mem.indexOf(u8, text_i, "REGRESSED from an already-proven configuration") == null);
@@ -1431,7 +1431,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         _ = kg.remember(.observation, "metacodes-provisional-obligation-v1 task=cap-task needle=tests/cap.py::T::t_ghost reason=stale ghost", "provisional_obligation", false) catch {};
         // 最佳行无工件 → 真静默(零义务);cap 若驱逐 1.0 行则鬼义务复载。
         try std.testing.expect(cc.obligation_gate.load(a, &kg, "cap-task") == null);
-        var built_cap = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+        var built_cap = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal, .{});
         defer built_cap.deinit(a);
         const text_cap = built_cap.text orelse return error.TestExpectedInjection;
         try std.testing.expect(std.mem.indexOf(u8, text_cap, "REGRESSED from an already-proven configuration") != null);

@@ -132,7 +132,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
             continue;
         };
 
-        const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(app_alloc, k, &app.conversation, &app.abort) catch null) else null;
+        const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(app_alloc, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
         defer if (scoped_recall) |s| app_alloc.free(s);
 
         // 生成期门(S1):transport 的 /interrupt 只在此窗口打 abort。true→run→false(defer 保证异常也复位)。

@@ -445,6 +445,7 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .plan_prev_mode = &app.plan_prev_mode,
         .tasks = &app.tasks,
         .kg = if (app.kg) |*k| k else null,
+        .jev = app.jevAdvisor(),
         .kg_projects_dir = app.kg_projects_dir,
         .memdir_abs = app.memdir_abs,
         .api_client = app.anthropicClientOrNull(),

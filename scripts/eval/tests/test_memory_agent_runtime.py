@@ -9,10 +9,16 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
 from scripts.eval.memory_agent_runtime import (
+    _agent_batch,
+    _atomic_memory_batch,
+    _disallowed_provider_tools,
+    _query_plan_evaluator_invalid_reason,
     PRODUCTION_MODEL_FINGERPRINT,
     ProductionRuntimeConfig,
     _assert_production_sandbox_identity,
@@ -31,6 +37,10 @@ from scripts.eval.memory_agent_runtime import (
     _run_production_sandbox_probe,
     _safe_component,
     _sanitized_environment,
+    ARM_TO_RUNTIME,
+    SYSTEM_ONE_ARMS,
+    SystemOneJudgeProxy,
+    _system_one_environment,
     _verify_scoped_recall_activation,
     _write_failed_validation_checkpoint,
     _xxhash64,
@@ -655,6 +665,97 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         self.assertFalse(
             _host_recall_covers_missing_explicit_recall(None, missing_explicit)
         )
+
+    def test_injection_only_arms_withhold_tinykg_tools_and_keep_the_host_recall_rule(self):
+        for arm in ("tinykg_inject", "tinykg_jev_inject"):
+            self.assertEqual(ARM_TO_RUNTIME[arm], "tinykg")
+            withheld = _disallowed_provider_tools(arm)
+            self.assertTrue({"KgRecall", "KgContext", "KgRemember"} <= set(withheld))
+            self.assertTrue(set(PRODUCTION_DISALLOWED_PROVIDER_TOOLS) <= set(withheld))
+        self.assertEqual(_disallowed_provider_tools("tinykg_lexical"), PRODUCTION_DISALLOWED_PROVIDER_TOOLS)
+        self.assertIn("tinykg_jev_inject", SYSTEM_ONE_ARMS)
+        self.assertNotIn("tinykg_inject", SYSTEM_ONE_ARMS)
+        self.assertEqual(
+            _system_one_environment("tinykg_jev_inject", "http://127.0.0.1:9", "m")["METACODES_JEV_DECISIONS"],
+            "scoped_recall",
+        )
+        from scripts.eval.memory_query_plan import build_query_plan_trace
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "req-001.json").write_text(
+                stable_json({"messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}]}) + "\n",
+                encoding="utf-8",
+            )
+            no_recall = build_query_plan_trace(
+                root, run_id="run-inject", arm="tinykg_inject", memory_backend="tinykg_integrated"
+            )
+        self.assertEqual(no_recall["invalid_reasons"], ["TinyKG backend executed no KgRecall"])
+        # Injection-only rows follow the protocol's host-recall rule: an
+        # injected or no-hit lookup is scored, a gate that exposed nothing is
+        # an inactive treatment and stays invalid (for both gates alike).
+        self.assertIsNone(_query_plan_evaluator_invalid_reason({"status": "injected"}, no_recall))
+        self.assertIsNotNone(_query_plan_evaluator_invalid_reason({"status": "below_floor"}, no_recall))
+
+    def test_injection_only_activation_requires_the_tinykg_tools_to_be_withheld(self):
+        def cassette(directory, system, tools):
+            root = Path(directory)
+            (root / "req-001.json").write_text(
+                json.dumps({"model": "glm-5.2", "system": system, "tools": [{"name": name} for name in tools]}),
+                encoding="utf-8",
+            )
+            return root
+
+        hidden = (
+            "# System\n# Memory\nmemory rules\n# Knowledge Graph\nA persistent TinyKG store exposes only the "
+            "durable-memory and task operations present in the current API tool list.",
+            ["Read", "Bash"],
+        )
+        exposed = ("# System\n# Memory\n# Knowledge Graph\ngraph rules", ["Read", "KgRecall", "KgContext", "KgRemember"])
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = _cassette_treatment_activation(cassette(directory, *hidden), "tinykg", "glm-5.2", injection_only=True)
+            # Same evidence schema as every other arm (receipts reject unknown fields).
+            self.assertEqual(
+                set(evidence),
+                {
+                    "runtime_arm",
+                    "system_prompt_sha256",
+                    "tool_names_sha256",
+                    "memory_prompt_active",
+                    "knowledge_graph_prompt_active",
+                    "tinykg_tools_active",
+                    "fingerprint",
+                },
+            )
+            self.assertEqual(evidence["tinykg_tools_active"], [])
+            with self.assertRaisesRegex(ValidationError, "does not match runtime arm"):
+                _cassette_treatment_activation(cassette(directory, *hidden), "tinykg", "glm-5.2")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValidationError, "does not match runtime arm"):
+                _cassette_treatment_activation(cassette(directory, *exposed), "tinykg", "glm-5.2", injection_only=True)
+            full = _cassette_treatment_activation(cassette(directory, *exposed), "tinykg", "glm-5.2")
+            self.assertEqual(full["tinykg_tools_active"], ["KgContext", "KgRecall", "KgRemember"])
+
+    def test_atomic_memory_batch_keeps_only_turn_level_memories(self):
+        from scripts.eval.memory_tinykg_local import _batch_bytes
+
+        raw = _batch_bytes(
+            [
+                {"op": "node", "id": 1, "kind": "concept", "name": "Session 2023/05/01\nuser: hi"},
+                {"op": "node", "id": 2, "kind": "evidence", "name": "Session 2023/05/01 user: hi"},
+                {"op": "node", "id": 3, "kind": "evidence", "name": "Session 2023/05/01 assistant: hello"},
+            ],
+            [
+                {"op": "edge", "id": 1, "src": 1, "rel": "based_on", "dst": 2},
+                {"op": "edge", "id": 2, "src": 1, "rel": "based_on", "dst": 3},
+            ],
+        )
+        batch, logical, root = _atomic_memory_batch(raw, {1: "s1", 2: "s1", 3: "s1"})
+        records = [json.loads(line) for line in batch.decode("utf-8").split("\n") if line]
+        self.assertEqual(records[0], {"version": 1})
+        self.assertEqual([record["id"] for record in records[1:]], [2, 3])
+        self.assertTrue(all(record["op"] == "node" for record in records[1:]))
+        self.assertEqual((logical, root), ({2: "s1", 3: "s1"}, 2))
 
     def test_v6_query_plan_source_identity_remains_replayable(self):
         receipt = {
@@ -2878,6 +2979,20 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertEqual(clean, {"PATH": "/operator/bin"})
 
+    def test_scripted_environment_never_inherits_a_system_one_advisor(self):
+        # An operator's METACODES_JEV_* would install the advisor in every arm,
+        # the no-memory baseline included.
+        clean = _sanitized_environment(
+            {
+                "PATH": "/operator/bin",
+                "METACODES_JEV_URL": "http://judge.example:10420",
+                "METACODES_JEV_MODE": "advisory",
+                "METACODES_JEV_TIMEOUT_MS": "800",
+                "METACODES_JEV_MODEL": "metask-jev-4b",
+            }
+        )
+        self.assertEqual(clean, {"PATH": "/operator/bin"})
+
     def test_production_auth_rejects_parent_environment_and_reads_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
             auth = Path(directory) / "auth.json"
@@ -3023,6 +3138,94 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertFalse((memory / "new-memory.md").exists())
             self.assertFalse((store / "new-store-file").exists())
             _assert_production_sandbox_identity(sandbox, evidence_path)
+
+    def test_agent_batch_keeps_unicode_line_separators_inside_node_text(self):
+        # LongMemEval chat turns contain U+2028/U+0085; str.splitlines() cut
+        # the JSONL record there and the paid run failed before its rollout.
+        from scripts.eval.memory_tinykg_local import _batch_bytes
+
+        text = "user: first line\u2028second line\u0085third"
+        raw = _batch_bytes([{"op": "node", "id": 1, "kind": "concept", "name": text}], [])
+        batch, logical, root, counts = _agent_batch(raw, {1: "session-a"}, 1, "proj-a")
+        records = [json.loads(line) for line in batch.decode("utf-8").split("\n") if line]
+        # The project root takes id 1; the session node follows it intact.
+        self.assertIn({"op": "node", "id": 2, "kind": "concept", "name": text}, records)
+        self.assertEqual((logical, root, counts["nodes"]), ({2: "session-a"}, 2, 2))
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and REAL_TINYKG.is_file(),
+        "requires macOS Seatbelt and the pinned TinyKG binary",
+    )
+    def test_production_seatbelt_lets_an_online_tinykg_store_take_its_daemon_lock(self):
+        # An online rollout owns a read-write store, but TinyKG opens its
+        # daemon-ownership flock O_RDWR on a sibling of the store. Without that
+        # one literal the CLI fails inside the sandbox and KG silently degrades.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "run" / "rollouts" / "current"
+            workspace = root / "run" / "projects" / "current-workspace"
+            store = root / "run" / "stores" / "current.kg"
+            for path in (artifact, workspace, store.parent):
+                path.mkdir(parents=True, exist_ok=True)
+            batch = artifact / "episode.jsonl"
+            write_text_lf(
+                batch,
+                stable_json({"version": 1})
+                + "\n"
+                + stable_json({"op": "node", "id": 1, "kind": "observation", "name": "online episode"})
+                + "\n",
+                encoding="utf-8",
+            )
+            env = {"PATH": os.defpath, "LC_ALL": "C", "LANG": "C"}
+            for action, *arguments in (("init", store), ("rebuild-text", store)):
+                completed = subprocess.run(
+                    [str(REAL_TINYKG), action, *map(str, arguments)],
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            ripgrep = artifact / "sealed-home" / ".metacodes" / "toolchain" / "rg"
+            ripgrep.parent.mkdir(parents=True)
+            ripgrep.write_bytes(TEST_RIPGREP.read_bytes())
+            ripgrep.chmod(0o500)
+            sandbox = _materialize_production_sandbox(
+                profile_path=artifact / "production-seatbelt.sb",
+                evidence_path=artifact / "production-seatbelt-probe.json",
+                artifact_dir=artifact,
+                workspace=workspace,
+                store=store,
+                metacodes=Path("/bin/echo"),
+                tinykg=REAL_TINYKG,
+                ripgrep=ripgrep,
+            )
+            for arguments in (("store-info", store), ("apply", store, batch)):
+                completed = subprocess.run(
+                    sandbox.command([str(REAL_TINYKG), *map(str, arguments)]),
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            # Nothing else beside the store became writable.
+            neighbour = store.with_name("neighbour.txt")
+            completed = subprocess.run(
+                sandbox.command(["/usr/bin/touch", str(neighbour)]),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(neighbour.exists())
 
     @unittest.skipUnless(
         platform.system() == "Darwin" and REAL_TINYKG.is_file(),
@@ -5277,3 +5480,85 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class SystemOneJudgeProxyTests(unittest.TestCase):
+    """The loopback judge that a Jev arm talks to instead of the network."""
+
+    REQUEST = json.dumps(
+        {
+            "state": "request: which flag omits TinyKG?",
+            "questions": {
+                "c0": {"type": "boolean", "description": "d", "criteria": {"true": "t", "false": "f"}},
+                "sufficient": {"type": "boolean", "description": "d", "criteria": {"true": "t", "false": "f"}},
+            },
+        }
+    ).encode("utf-8")
+
+    def _post(self, origin: str, body: bytes):
+        request = urllib.request.Request(
+            origin + "/v1/systemone", data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, None
+
+    def test_jev_arm_is_the_tinykg_runtime_plus_the_judge(self):
+        self.assertEqual(ARM_TO_RUNTIME["tinykg_jev"], "tinykg")
+        self.assertEqual(ARM_TO_RUNTIME["tinykg_jev_recall"], "tinykg")
+        self.assertEqual(SYSTEM_ONE_ARMS, frozenset({"tinykg_jev", "tinykg_jev_recall", "tinykg_jev_inject"}))
+
+    def test_attribution_arm_narrows_the_child_advisor_to_the_recall_gate(self):
+        full = _system_one_environment("tinykg_jev", "http://127.0.0.1:9", "m")
+        narrowed = _system_one_environment("tinykg_jev_recall", "http://127.0.0.1:9", "m")
+        self.assertNotIn("METACODES_JEV_DECISIONS", full)
+        self.assertEqual(narrowed["METACODES_JEV_DECISIONS"], "scoped_recall")
+        self.assertEqual(
+            {key: value for key, value in narrowed.items() if key != "METACODES_JEV_DECISIONS"}, full
+        )
+        self.assertEqual(full["METACODES_JEV_MODE"], "advisory")
+
+    def test_scripted_judge_answers_every_boolean_and_logs_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with SystemOneJudgeProxy(None) as proxy:
+                self.assertTrue(proxy.origin.startswith("http://127.0.0.1:"))
+                status, payload = self._post(proxy.origin, self.REQUEST)
+                self.assertEqual(status, 200)
+                self.assertEqual(set(payload["answers"]), {"c0", "sufficient"})
+                self.assertEqual(payload["usage"]["tariff"], "none")
+                bad_status, _ = self._post(proxy.origin, b'{"state":"s","questions":{"q":{"type":"enum"}}}')
+                self.assertEqual(bad_status, 400)
+            summary = proxy.summary()
+            self.assertEqual(summary["requests"], 2)
+            self.assertEqual(summary["answered"], 1)
+            log = Path(directory) / "system-one-judge.jsonl"
+            proxy.write_log(log)
+            records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(records[0]["request_sha256"], hashlib.sha256(self.REQUEST).hexdigest())
+            self.assertTrue(records[0]["answered"])
+            self.assertFalse(records[1]["answered"])
+
+    def test_forwarding_proxy_reports_an_unreachable_upstream_as_unanswered(self):
+        with SystemOneJudgeProxy("http://127.0.0.1:9", timeout_seconds=1.0) as proxy:
+            status, _ = self._post(proxy.origin, self.REQUEST)
+        self.assertEqual(status, 502)
+        self.assertEqual(proxy.summary()["answered"], 0)
+
+    def test_forwarding_proxy_relays_the_upstream_answer_verbatim(self):
+        with SystemOneJudgeProxy(None) as upstream:
+            with SystemOneJudgeProxy(upstream.origin) as proxy:
+                status, payload = self._post(proxy.origin, self.REQUEST)
+        self.assertEqual(status, 200)
+        self.assertIn("sufficient", payload["answers"])
+        self.assertEqual(proxy.summary()["answered"], 1)
+        self.assertEqual(upstream.summary()["requests"], 1)
+
+    def test_upstream_must_be_a_bare_origin(self):
+        for bad in ("192.0.2.10:10420", "http://judge/v1/systemone", "ftp://judge"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValidationError):
+                    SystemOneJudgeProxy(bad)
