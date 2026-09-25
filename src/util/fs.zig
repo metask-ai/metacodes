@@ -291,14 +291,20 @@ pub const testing = struct {
         return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}", .{ tmpRoot(&rbuf), tag, pid }) catch unreachable;
     }
 
-    /// `<tmpRoot>/<tag>-<pid>-<单调纳秒>`:同一进程内多次调用也互不相同(同一 helper 被
+    var unique_dir_seq = std.atomic.Value(u64).init(0);
+
+    /// `<tmpRoot>/<tag>-<pid>-<单调纳秒>-<序号>`:同一进程内多次调用也互不相同(同一 helper 被
     /// 多个用例反复 setup 时用这个;只需进程级隔离用 `perPidDir`)。规则同上。
+    /// 进程内唯一靠 `<序号>`(进程级原子计数,按构造成立),不押时钟:`nowNs` 在 macOS 上是
+    /// 1µs 粒度的 CLOCK_MONOTONIC,紧邻两次调用常读到同一值。`<单调纳秒>` 管跨进程:pid 会被
+    /// 复用而序号每个进程从 0 数起,靠它不撞上崩溃进程残留的同名目录。
     pub fn uniqueDir(buf: []u8, tag: []const u8) [:0]const u8 {
         std.debug.assert(std.mem.startsWith(u8, tag, "cc-zig-"));
         var rbuf: [std.fs.max_path_bytes]u8 = undefined;
         const pid = @import("platform").process.currentPid();
         const ns = @import("time.zig").nowNs();
-        return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}-{d}", .{ tmpRoot(&rbuf), tag, pid, ns }) catch unreachable;
+        const seq = unique_dir_seq.fetchAdd(1, .monotonic);
+        return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}-{d}-{d}", .{ tmpRoot(&rbuf), tag, pid, ns, seq }) catch unreachable;
     }
 };
 
@@ -322,6 +328,19 @@ test "testing.perPidDir / uniqueDir: root + tag + pid, forward slashes, NUL-term
     const second = testing.uniqueDir(&b2, "cc-zig-fs-selftest");
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expect(testing.isFixturePath(first, &rbuf));
+}
+
+test "testing.uniqueDir: 64 back-to-back calls stay distinct (process sequence, not clock resolution)" {
+    // macOS 的 CLOCK_MONOTONIC 是 1µs 粒度,紧邻的调用常落在同一微秒:唯一性若押在时钟上,
+    // 这 64 连发实测 Debug/ReleaseSafe 次次撞(上面只比两次的断言只是间歇失败)。
+    var bufs: [64][256]u8 = undefined;
+    var dirs: [64][]const u8 = undefined;
+    for (&bufs, &dirs) |*b, *d| d.* = testing.uniqueDir(b, "cc-zig-fs-selftest");
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    for (dirs, 0..) |x, i| {
+        try std.testing.expect(testing.isFixturePath(x, &rbuf));
+        for (dirs[i + 1 ..]) |y| try std.testing.expect(!std.mem.eql(u8, x, y));
+    }
 }
 
 test "testing.isFixturePath: refuses anything outside <tmpRoot>/cc-zig-" {
