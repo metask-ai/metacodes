@@ -68,6 +68,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `util/fs.testing.uniqueDir` promised a distinct path per call but built it
+  from the monotonic clock alone. macOS `CLOCK_MONOTONIC` ticks in 1 µs
+  (Windows QPC commonly in 100 ns), so back-to-back calls returned the same
+  directory: the self-test failed under `zig build test:lib
+  -Doptimize=ReleaseSafe` on macOS, and two fixtures set up in one tick could
+  share a directory. The name now ends in a process-wide atomic sequence
+  number (`<tag>-<pid>-<ns>-<seq>`), and the self-test compares 256
+  back-to-back calls. The task-list mirror's temporary file
+  (`<path>.tmp.<pid>.<ns>.<seq>`) gets the same suffix. Its writers were
+  already serialized by the mirror lock and no failure was observed there;
+  the name no longer depends on that lock to stay unique.
 - Bash auto-allow no longer runs writes without a prompt. The read-only
   auto-allow (default, acceptEdits and auto mode) keyed on the first word of
   the whole command, so `cd / && rm -rf *`, `echo x > ~/.bashrc`,

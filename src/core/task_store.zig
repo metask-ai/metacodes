@@ -23,6 +23,18 @@ const util_json = @import("../util/json.zig");
 
 const max_mirror_bytes = 4 * 1024 * 1024;
 
+/// 镜像写入的临时文件名 `<path>.tmp.<pid>.<单调纳秒>.<序号>`。EXCL 创建要求每次写入各用一个
+/// 新名字,时钟读数单独撑不起:macOS CLOCK_MONOTONIC 1 µs、Windows QPC 常见 100 ns 一跳,
+/// 紧挨的两次读数相同。进程内原子序号 + pid 让任意两个写入方(本进程线程 / 别的进程)必不
+/// 同名,不再依赖镜像锁把写入错开;纳秒让复用 pid 的后来进程不撞上崩溃残留的旧临时文件。
+fn mirrorTmpPath(buf: []u8, path: []const u8) error{PathTooLong}![:0]const u8 {
+    const pid = @import("platform").process.currentPid();
+    const seq = mirror_tmp_seq.fetchAdd(1, .monotonic);
+    return std.fmt.bufPrintZ(buf, "{s}.tmp.{d}.{d}.{d}", .{ path, pid, util_time.nowNs(), seq }) catch return error.PathTooLong;
+}
+
+var mirror_tmp_seq = std.atomic.Value(u64).init(0);
+
 /// Requirement-ledger counts for the session-end closure obligation.
 /// Mutex-held snapshot; kg-mirror rows count like local rows (they are the
 /// model's declared ledger either way).
@@ -175,7 +187,7 @@ pub const TaskStore = struct {
         defer self.allocator.free(written);
 
         var tmp_buf: [std.fs.max_path_bytes:0]u8 = undefined;
-        const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp.{d}", .{ path, util_time.nowNs() }) catch return error.PathTooLong;
+        const tmp = try mirrorTmpPath(&tmp_buf, path);
         // EXCL + unpredictable per-write suffix prevents a pre-existing hardlink at a
         // fixed `.tmp` pathname from being truncated before the atomic rename.
         const fd = pfs.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
@@ -782,6 +794,18 @@ test "TaskStore: mirror 开启时 updateStatus(t.id) 不悬垂(reload 释放旧 
     const cur4 = store.get("1").?;
     try store.addBlockedBy(cur4.id, &.{"8"});
     try testing.expect(store.get("1").?.blocked_by.items.len == 1);
+}
+
+test "TaskStore: mirror 临时文件名相邻调用不重名(EXCL 创建不靠时钟分辨率)" {
+    // 先连调、后比较(同 util/fs uniqueDir 自测):只拼 nowNs() 的名字在 macOS(1 µs 一跳)
+    // 上相邻调用大半同名,同名的第二个写入方会 MirrorOpenFailed。
+    var slots: [256][128]u8 = undefined;
+    var names: [slots.len][:0]const u8 = undefined;
+    for (&slots, &names) |*slot, *name| name.* = try mirrorTmpPath(slot, "/mirror/tasks.json");
+    for (names, 0..) |name, i| {
+        try testing.expect(std.mem.startsWith(u8, name, "/mirror/tasks.json.tmp."));
+        for (names[i + 1 ..]) |later| try testing.expect(!std.mem.eql(u8, name, later));
+    }
 }
 
 test "TaskStore: unique active KG task fails safe on ambiguity and malformed ids" {
