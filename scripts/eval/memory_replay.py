@@ -131,6 +131,11 @@ PRODUCTION_DISALLOWED_PROVIDER_TOOLS = (
     "WebFetch",
     "WebSearch",
 )
+# Arms whose memory reaches the model only through host auto-injection: the
+# TinyKG tools are withheld from the provider schema and an episodic store
+# holds atomic (turn-level) memories, the granularity metacodes itself writes.
+INJECTION_ONLY_ARMS = frozenset({"tinykg_inject", "tinykg_jev_inject"})
+INJECTION_ONLY_WITHHELD_TOOLS = ("KgRecall", "KgContext", "KgRemember")
 PRODUCTION_ALLOWED_PROVIDER_TOOLS = (
     "Read",
     "Write",
@@ -173,6 +178,8 @@ TREATMENT_LEAK_TERMS = (
     "no_memory",
     "markdown_memory",
     "tinykg_lexical",
+    "tinykg_jev",
+    "system_one",
     "treatment arm",
 )
 
@@ -803,6 +810,8 @@ def _cassette_treatment_activation(
     runtime_arm: str,
     model_id: str,
     where: str = "production treatment activation",
+    *,
+    injection_only: bool = False,
 ) -> Mapping[str, Any]:
     requests = sorted(root.glob("req-*.json"))
     if not requests:
@@ -828,6 +837,11 @@ def _cassette_treatment_activation(
         valid = not has_memory and not has_graph and not (names & kg_tools)
     elif runtime_arm == "claude_style":
         valid = has_memory and not has_graph and not (names & kg_tools)
+    elif runtime_arm == "tinykg" and injection_only:
+        # The store is live (host auto-injection reads it) but no TinyKG tool
+        # reaches the provider schema. The graph header may remain: capability
+        # projection reduces it to "only the operations in the tool list".
+        valid = has_memory and not (names & kg_tools)
     elif runtime_arm == "tinykg":
         valid = has_memory and has_graph and kg_tools <= names
     else:
@@ -1089,7 +1103,8 @@ def _native_warm_cache_metrics(
         _fail(f"{where}.native_events", artifact_error or "cannot read native events")
 
     usages: List[Mapping[str, Any]] = []
-    for line_no, line in enumerate(text.splitlines(), 1):
+    # LF only: splitlines() would also cut at U+2028 inside a JSON string.
+    for line_no, line in enumerate(text.split("\n"), 1):
         if not line.strip():
             continue
         try:
@@ -1372,7 +1387,7 @@ def render_warm_context_cache_markdown(
 def _native_pricing_provenance(path: Path, where: str) -> str:
     observed: set[str] = set()
     try:
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
             if not line.strip():
                 continue
             value = json.loads(line)
@@ -1415,7 +1430,8 @@ def _load_unique_json(path: Path, label: str) -> Mapping[str, Any]:
 
 def load_observations(path: Path) -> List[Mapping[str, Any]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        # LF only: splitlines() would also cut at U+2028 inside a JSON string.
+        lines = path.read_text(encoding="utf-8").split("\n")
     except (OSError, UnicodeError) as exc:
         raise ValidationError(f"cannot read memory observations {path}: {exc}") from exc
     result: List[Mapping[str, Any]] = []
@@ -1462,7 +1478,7 @@ def _production_runtime_arm(arm_id: str) -> str:
         return "codex_style"
     if arm_id in {"markdown_memory", "claude_style"}:
         return "claude_style"
-    if arm_id in {"tinykg_lexical", "tinykg"}:
+    if arm_id in {"tinykg_lexical", "tinykg", "tinykg_jev", "tinykg_jev_recall", *INJECTION_ONLY_ARMS}:
         return "tinykg"
     _fail("production runtime arm", f"unsupported arm {arm_id!r}")
     raise AssertionError("unreachable")
@@ -2333,6 +2349,9 @@ def _validate_production_runtime_receipt(
             "claude_style": (True, False, []),
             "tinykg": (True, True, ["KgContext", "KgRecall", "KgRemember"]),
         }[runtime_arm]
+        if rollout["arm"] in INJECTION_ONLY_ARMS:
+            # TinyKG tools withheld: capability projection drops the graph section.
+            expected_flags = (True, False, [])
         observed_flags = (
             activation["memory_prompt_active"],
             activation["knowledge_graph_prompt_active"],
@@ -2898,7 +2917,13 @@ def validate_runtime_receipt(
             f"{rollout_where}.metacodes_binary_sha256",
         ) != metacodes_sha256:
             _fail(f"{rollout_where}.metacodes_binary_sha256", "binary identity drift")
-        tinykg_enabled = rollout["arm"] in {"tinykg", "tinykg_lexical"}
+        tinykg_enabled = rollout["arm"] in {
+            "tinykg",
+            "tinykg_lexical",
+            "tinykg_jev",
+            "tinykg_jev_recall",
+            *INJECTION_ONLY_ARMS,
+        }
         observed_tinykg = rollout["tinykg_binary_sha256"]
         if tinykg_enabled:
             if _hash(observed_tinykg, f"{rollout_where}.tinykg_binary_sha256") != tinykg_sha256:
@@ -3929,6 +3954,7 @@ def validate_runtime_artifacts(
                         runtime_arm,
                         PRODUCTION_MODEL_ID,
                         f"{rollout_where}.treatment_activation",
+                        injection_only=str(raw_rollout.get("arm")) in INJECTION_ONLY_ARMS,
                     )
                     if activation != raw_rollout.get("treatment_activation"):
                         _fail(

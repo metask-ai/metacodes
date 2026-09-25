@@ -18,6 +18,8 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 
 - [Core reference](CORE_REFERENCE.md)
 - [Memory system](MEMORY_SYSTEM_DESIGN.md)
+- [Jev System-One memory advisor](JEV_SYSTEM_ONE.md) — optional judge for
+  recall injection, recall evidence, memory relations and enumeration intent.
 - [Performance and memory principles](PERF_MEMORY_PRINCIPLES.md)
 - [UI/backend boundary](UI_DECOUPLE_BACKEND_FRAMEWORK.md)
 - [TUI state architecture](TUI_STATE_ARCHITECTURE.md)

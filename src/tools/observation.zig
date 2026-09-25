@@ -29,6 +29,29 @@ pub const DELIVERY_CADENCE_SCHEMA_VERSION = "metacodes-delivery-cadence-v1";
 pub const PROGRESS_UPDATES_SCHEMA_VERSION = "metacodes-progress-updates-v1";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
 pub const TEST_WEAKENING_SCHEMA_VERSION = "metacodes-test-weakening-candidate-v1";
+pub const SYSTEM_ONE_DECISION_SCHEMA_VERSION = "metacodes-system-one-decision-v1";
+
+/// Which host decision consulted the System-One judge (`src/jev/advisor.zig`).
+pub const SystemOneDecision = enum {
+    recall_relevance,
+    memory_relation,
+    enumeration_intent,
+};
+
+/// `shadow` records the judgment while the deterministic baseline decides;
+/// `advisory` lets the documented policy use it. Neither mode can grant
+/// permission, admit memory or satisfy a formal gate.
+pub const SystemOneMode = enum { shadow, advisory };
+
+pub const SystemOneOutcome = enum {
+    answered,
+    unavailable,
+    rejected,
+    malformed,
+    priced_service,
+    model_mismatch,
+    invalid_request,
+};
 
 pub const Origin = enum {
     authoritative,
@@ -204,6 +227,30 @@ pub const EffectSlot = struct {
 };
 
 pub const Event = union(enum) {
+    /// One consultation of the System-One judge and what the host did with
+    /// it. Evidence only: `actuated=false` in shadow mode (or when the answer
+    /// matched the baseline), and a judge failure always falls back to the
+    /// baseline. `changed` counts host decisions that differ from the
+    /// baseline: applied in advisory mode, counterfactual in shadow mode.
+    system_one_decision: struct {
+        schema_version: []const u8 = SYSTEM_ONE_DECISION_SCHEMA_VERSION,
+        decision: SystemOneDecision,
+        /// Versioned question-set identity, e.g. `metacodes.jev.recall-relevance.v2`.
+        question_set: []const u8,
+        mode: SystemOneMode,
+        outcome: SystemOneOutcome,
+        actuated: bool,
+        /// SHA-256 of the exact request body sent (after redaction).
+        request_sha256: [64]u8,
+        /// Model identity the service reported; empty when unanswered.
+        model: []const u8,
+        elapsed_ms: u64,
+        question_count: u32,
+        state_bytes: u32,
+        judged: u32,
+        positive: u32,
+        changed: u32,
+    },
     /// A dispatch produced a governed effect class while **zero** active rules
     /// targeted its tool. The rule plane did not fail here — it was never
     /// consulted, because rule applicability is keyed on the tool name while

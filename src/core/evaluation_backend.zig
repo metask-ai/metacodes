@@ -17,6 +17,7 @@ const json_util = @import("../util/json.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const request_gate = @import("request_gate.zig");
 const ToolExecutionPolicy = @import("../tools/context.zig").ToolExecutionPolicy;
+const jev_advisor = @import("../jev/advisor.zig");
 
 const CoreEvent = ui_backend.CoreEvent;
 const UiEvent = ui_backend.UiEvent;
@@ -403,6 +404,26 @@ pub const EvalEvent = union(enum) {
         injected_bytes: usize,
         injection_sha256: []const u8,
     },
+    /// One System-One (Jev) consultation that shaped the scoped recall above
+    /// it. Additive: it never alters the `scoped_recall` v1 receipt, whose
+    /// bytes are identical with and without a shadow advisor.
+    system_one_decision: struct {
+        trace_id: []const u8,
+        schema_version: []const u8,
+        decision: []const u8,
+        question_set: []const u8,
+        mode: []const u8,
+        outcome: []const u8,
+        actuated: bool,
+        request_sha256: []const u8,
+        model: []const u8,
+        elapsed_ms: u64,
+        question_count: u32,
+        state_bytes: u32,
+        judged: u32,
+        positive: u32,
+        changed: u32,
+    },
     turn_started: struct { trace_id: []const u8, depth: u8, turn: u32 },
     turn_finished: struct { trace_id: []const u8, depth: u8, turn: u32, tool_calls: u32 },
     model_request_finished: struct { trace_id: []const u8, depth: u8, turn: u32, attempt: u32, elapsed_ms: u64, outcome: []const u8 },
@@ -485,6 +506,16 @@ pub const ScopedRecallEvidence = struct {
     injected_count: usize,
     injected_bytes: usize,
     injection_sha256: [64]u8,
+    /// Present when a System-One advisor judged the recall candidates.
+    system_one: ?SystemOneEvidence = null,
+};
+
+pub const SystemOneEvidence = struct {
+    audit: jev_advisor.Audit,
+    actuated: bool,
+    judged: u32,
+    positive: u32,
+    changed: u32,
 };
 
 pub const Envelope = struct {
@@ -815,6 +846,25 @@ pub const EvaluationBackend = struct {
                 .injected_bytes = evidence.injected_bytes,
                 .injection_sha256 = evidence.injection_sha256[0..],
             } });
+            if (self.pending_scoped_recall.?.system_one) |*system_one| {
+                self.append(session, .{ .system_one_decision = .{
+                    .trace_id = self.traceSlice(),
+                    .schema_version = @import("../tools/observation.zig").SYSTEM_ONE_DECISION_SCHEMA_VERSION,
+                    .decision = @tagName(system_one.audit.decision),
+                    .question_set = system_one.audit.question_set,
+                    .mode = @tagName(system_one.audit.mode),
+                    .outcome = @tagName(system_one.audit.outcome),
+                    .actuated = system_one.actuated,
+                    .request_sha256 = system_one.audit.request_sha256[0..],
+                    .model = system_one.audit.model(),
+                    .elapsed_ms = system_one.audit.elapsed_ms,
+                    .question_count = system_one.audit.question_count,
+                    .state_bytes = system_one.audit.state_bytes,
+                    .judged = system_one.judged,
+                    .positive = system_one.positive,
+                    .changed = system_one.changed,
+                } });
+            }
             self.scoped_recall_emitted = true;
         }
     }

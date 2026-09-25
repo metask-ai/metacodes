@@ -770,7 +770,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         const mode_before = app.permission_ctx.modeValue();
         const started_ns = util_time.nowNs();
         // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
-        const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort) catch null) else null;
+        const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
         // 会话根目录跟着改名走:这里是唯一向用户说一句的地方(buildRunOptions 里的再次调用是 no-op)。
         switch (app.refreshWorkspaceRoot()) {
@@ -3147,9 +3147,8 @@ fn extractGcCount(summary: []const u8, key: []const u8) usize {
 
 fn firstLine(text: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    var n = @min(end, 100);
-    while (n > 0 and (text[n - 1] & 0xC0) == 0x80) n -= 1; // 不切半个 CJK 字
-    return text[0..n];
+    if (end <= 100) return text[0..end];
+    return text[0..@import("../util/utf8.zig").prefixEnd(text, 100)]; // 不切半个 CJK 字
 }
 
 /// max_turns backstop 可配(METACODES_MAX_TURNS 覆盖;默认 400)。非法值退默认。

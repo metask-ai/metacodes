@@ -20,6 +20,7 @@
 //! permanent(二进制缺/版本不符 → degraded)、data(环/NotFound → 透传模型改参)。
 
 const std = @import("std");
+const jev_excerpt = @import("../jev/excerpt.zig");
 const pfs = @import("platform").fs;
 const time = @import("../util/time.zig");
 const sync = @import("platform").sync;
@@ -98,6 +99,10 @@ pub const RecallHit = struct {
     score: f64,
     /// 来源记忆文件(md 派生 document 根带;section/typed 节点为空)。owned。
     source_label: []u8 = &.{},
+    /// Query-focused window of the full node text for a System-One judge
+    /// (`src/jev/excerpt.zig`); empty when the hit was not produced by a
+    /// query search. Never provider-visible. owned.
+    focus_text: []u8 = &.{},
 
     pub fn deinit(self: *const RecallHit, allocator: std.mem.Allocator) void {
         allocator.free(self.kind);
@@ -105,6 +110,7 @@ pub const RecallHit = struct {
         allocator.free(self.schema_type);
         allocator.free(self.text);
         if (self.source_label.len > 0) allocator.free(self.source_label);
+        if (self.focus_text.len > 0) allocator.free(self.focus_text);
     }
 };
 
@@ -2412,6 +2418,10 @@ pub const KgClient = struct {
             errdefer self.allocator.free(t_owned);
             const sl_owned: []u8 = if (src_label.len > 0) (self.allocator.dupe(u8, src_label) catch return KgError.OutOfMemory) else @constCast(&[_]u8{});
             errdefer if (sl_owned.len > 0) self.allocator.free(sl_owned);
+            // The full text is only in hand here: cut the judge's window now.
+            const focus = jev_excerpt.focusedWindow(text, query, jev_excerpt.JUDGE_WINDOW_BYTES);
+            const f_owned: []u8 = if (focus.len > 0) (self.allocator.dupe(u8, focus) catch return KgError.OutOfMemory) else @constCast(&[_]u8{});
+            errdefer if (f_owned.len > 0) self.allocator.free(f_owned);
             results.append(self.allocator, .{
                 .node_id = node_id,
                 .kind = k_owned,
@@ -2422,6 +2432,7 @@ pub const KgClient = struct {
                 .text_truncated = text_truncated,
                 .score = score,
                 .source_label = sl_owned,
+                .focus_text = f_owned,
             }) catch return KgError.OutOfMemory;
         }
     }

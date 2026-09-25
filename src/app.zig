@@ -450,6 +450,8 @@ pub const App = struct {
     kg_projects_dir: []u8 = &.{},
     /// KG 启动注入快照(kg/inject.zig;owned)。空串=空态(不注入)。
     kg_summary: []u8 = &.{},
+    /// System-One advisor runtime (`src/jev/runtime.zig`); null = not configured.
+    jev: ?*@import("jev/runtime.zig").Runtime = null,
     /// 模型长任务 scratchpad（Task* 工具共享）
     tasks: TaskStore,
     /// Session-scoped objective state for /goal and /loop.
@@ -822,6 +824,10 @@ pub const App = struct {
         // 注入段不出现；允许 TinyKG 的 treatment 仍广告工具并显式返回 kg_unavailable。
         app.initKg();
 
+        // System-One advisor (Jev): off unless METACODES_JEV_URL is set, and then
+        // shadow unless METACODES_JEV_MODE=advisory. Never fatal.
+        app.jev = @import("jev/runtime.zig").fromEnv(app.allocator, app.api_client.http_client.io, app.homeDir());
+
         // 从 config.json 加载 permission_rules（旧 schema，向后兼容）
         app.loadPermissionRules() catch |err| {
             @import("util/log.zig").debug("permission", "no rules loaded: {s}", .{@errorName(err)});
@@ -1022,6 +1028,7 @@ pub const App = struct {
         if (app.kg) |*k| k.deinit();
         if (app.kg_projects_dir.len > 0) app.allocator.free(app.kg_projects_dir);
         if (app.kg_summary.len > 0) app.allocator.free(app.kg_summary);
+        if (app.jev) |runtime| runtime.destroy(app.allocator);
         app.allocator.free(app.tool_defs);
         if (app.active_skill) |*active| {
             active.deinit();
@@ -2708,6 +2715,12 @@ pub const App = struct {
         return platform_paths.homeDir() orelse "";
     }
 
+    /// The configured System-One advisor, if any (address-stable for the App's lifetime).
+    pub fn jevAdvisor(app: *App) ?*@import("jev/advisor.zig").Advisor {
+        const runtime = app.jev orelse return null;
+        return &runtime.advisor;
+    }
+
     /// EnterWorktree 工具用:把新 worktree 入栈。
     pub fn worktreePushTrampoline(
         state: *anyopaque,
@@ -2935,9 +2948,17 @@ pub const App = struct {
             var sb = sb_config.parse(app.allocator, parsed.value) catch continue;
             if (sb.enabled) {
                 app.sandbox_settings = sb;
-                app.permission_ctx.sandbox_enabled = true;
-                app.permission_ctx.auto_allow_bash_if_sandboxed = sb.auto_allow_bash_if_sandboxed;
+                // 权限链与 Bash 工具看同一份设置:autoAllowBashIfSandboxed 只放行
+                // sandbox_exec.plan 判为 .sandboxed 的调用(不再凭"设置开着"放行)。
+                app.permission_ctx.sandbox = app.sandboxPtr();
                 @import("util/log.zig").info("sandbox", "enabled (from {s})", .{path});
+                if (!@import("sandbox/exec.zig").hostSupported()) {
+                    const consequence = if (sb.fail_if_unavailable)
+                        "failIfUnavailable refuses every Bash command"
+                    else
+                        "Bash commands run unsandboxed and autoAllowBashIfSandboxed does not apply";
+                    @import("util/log.zig").warn("sandbox", "enabled in {s}, but this host has no sandbox backend (macOS sandbox-exec only): {s}", .{ path, consequence });
+                }
                 return;
             }
             sb.deinit();

@@ -47,6 +47,7 @@ test {
     _ = @import("component/output_semantics_test.zig");
     _ = @import("component/file_change_test.zig");
     _ = @import("component/compound_perm_test.zig");
+    _ = @import("component/bash_auto_allow_test.zig");
     _ = @import("component/protected_skill_inject_test.zig");
     _ = @import("component/read_state_test.zig");
     _ = @import("component/symbol_capability_test.zig");
@@ -114,6 +115,8 @@ test {
     _ = @import("component/ontology_rule_snapshot_adapter_test.zig");
     _ = @import("component/job_notification_test.zig");
     _ = @import("component/kg_state_test.zig");
+    _ = @import("component/jev_client_test.zig");
+    _ = @import("component/jev_memory_plane_test.zig");
     _ = @import("component/tinykgd_resolution_test.zig");
     _ = @import("component/adjacent_symlink_test.zig");
     _ = @import("component/swarm_file_race_test.zig");

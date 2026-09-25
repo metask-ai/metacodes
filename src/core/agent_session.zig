@@ -1389,8 +1389,10 @@ pub const AgentSession = struct {
             .project_root = self.workspace.root,
             .home = self.workspace.home,
         };
-        self.permission_ctx.sandbox_enabled = self.workspace.shell == .sandboxed;
-        self.permission_ctx.auto_allow_bash_if_sandboxed = self.workspace.shell == .sandboxed;
+        // The same settings the Bash tool wraps with (`.sandbox` in run
+        // options): autoAllowBashIfSandboxed allows only a call they really
+        // confine, and a sandboxed shell ignores `dangerouslyDisableSandbox`.
+        self.permission_ctx.sandbox = self.workspace.sandbox();
         return self;
     }
 

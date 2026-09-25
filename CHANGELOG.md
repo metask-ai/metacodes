@@ -24,9 +24,39 @@ status, compatibility boundaries, and entry points are defined by
   (new category). A user or host interrupt is neither the model's fault nor
   an environment fault; it no longer counts toward the `environment_fault`
   breaker.
+- Zig source API: `PermissionContext` and `permission/decision.Context`
+  replace `sandbox_enabled` / `auto_allow_bash_if_sandboxed` with
+  `sandbox: ?*const SandboxSettings`, the same settings the Bash tool wraps
+  commands with, so the permission verdict and the execution cannot
+  disagree. On Windows (PowerShell/cmd) no Bash command is auto-allowed or
+  run concurrently as read-only: the classification models POSIX `sh` only.
 
 ### Added
 
+- Optional System-One (Jev) memory-plane advisor (`src/jev/`,
+  [doc/JEV_SYSTEM_ONE.md](doc/JEV_SYSTEM_ONE.md)), off unless
+  `METACODES_JEV_URL` is set; `METACODES_JEV_MODE` is `shadow` by default
+  (consult and journal, provider-visible bytes unchanged) or `advisory`, and
+  `METACODES_JEV_DECISIONS` narrows it to a subset of its surfaces. It
+  advises four existing memory decisions and never gates a tool, permission,
+  budget or TinyKG write: scoped recall ranks the BM25-plausible part of an
+  8-hit pool (score at least half the top, the baseline's own band) by judge
+  probability plus normalized BM25 once the BM25 floor has passed (the judge is
+  not consulted below it), `KgRecall` gains a relevance/sufficiency block,
+  `KgRemember` a same/contradicts relations block, and the enumeration judge
+  arms only the soft coverage reminder. Judge failures fall back to the
+  unadvised path without retries (30 s–5 min breaker); a user interrupt stays
+  `Aborted`; a different model or a priced tariff is refused. Every
+  consultation emits `system_one_decision`
+  (`metacodes-system-one-decision-v1`): the scoped-recall decision on the
+  evaluation stream, which the evaluation adapters validate, and the
+  tool-surface decisions in the tool-observation journal.
+  The paid memory runner gains `tinykg_jev`, the attribution arm
+  `tinykg_jev_recall` (recall gate only) and the injection-only arms
+  `tinykg_inject` / `tinykg_jev_inject` (TinyKG tools withheld, turn-level
+  store) behind a loopback judge proxy, and
+  `zig build eval:jev-recall-driver` replays LongMemEval-S candidate pools
+  through the production recall policies with no provider.
 - Release automation (`doc/RELEASE_AUTOMATION_DESIGN.md`): `scripts/release_cut.py`
   derives the next version from the Conventional-Commit types since the last
   tag, rewrites `build.zig.zon` / `src/version.zig` / this file in one release
@@ -38,18 +68,62 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Bash auto-allow no longer runs writes without a prompt. The read-only
+  auto-allow (default, acceptEdits and auto mode) keyed on the first word of
+  the whole command, so `cd / && rm -rf *`, `echo x > ~/.bashrc`,
+  `sed -i …`, `find . -delete` and `ls; curl … -o x; sh x` ran unprompted.
+  `permission/bash_readonly.zig` now lexes the command the way `sh` does
+  (after the Bash tool's own JSON unescape) and accepts it only when every
+  simple command is read-only: no substitution, background job, subshell or
+  heredoc; output redirection only to `/dev/null` or a descriptor; write
+  options refused per command (`sed -i`/`w`/`e`, `find -delete`/`-exec`,
+  `sort -o`, `uniq IN OUT`, `awk` redirects and `system()`, `file -C`,
+  `rg --pre`, `git --output`/`branch NAME`/`config` writes, `printf -v`,
+  including GNU long-option abbreviations and quoting that spells them;
+  `git remote show` needs `-n`, since without it git queries the remote);
+  wrappers (`timeout`, `time`, `nice`, `stdbuf`, `xargs`, `command`) parsed
+  with their real options; `env`, `exec`, `nohup` and `cd … && git …` ask.
+  Anything it cannot parse asks. The concurrency gate
+  (`tools.isConcurrencySafeInput`, which also governs stream prefetch) uses
+  the same verdict. `rg` joins the read-only roster.
+- `autoAllowBashIfSandboxed` allowed every Bash call whenever the setting
+  was on, although off macOS (no Seatbelt), for `excludedCommands` and for
+  `dangerouslyDisableSandbox` the command runs outside the sandbox. It now
+  allows only a call `sandbox_exec.plan` says will run sandboxed, and a host
+  without a sandbox backend logs a warning at load.
+- `dangerouslyDisableSandbox` (not in the Bash schema) was honored even
+  under `allowUnsandboxedCommands: false`, the setting AgentCore's sandboxed
+  shell policy uses; it now takes effect only where that setting allows it.
+  A sandbox profile that cannot be written no longer makes Bash or Monitor
+  run the command unsandboxed; the call fails instead.
 - Bash `deny` and `ask` permission rules now match a compound command when
   any segment matches (after wrapper stripping): `Bash(rm *)` catches
   `ls && rm x`, `ls; rm x`, `ls | rm x` and a newline-separated `rm x`. They
   used to require every segment to match, like `allow`, so a harmless prefix
-  defeated the rule and the command ran under `bypassPermissions`, and under
-  `default` whenever its first word was read-only. `allow` rules still need
-  every segment (`permission/rule_spec.zig matchesBashCompound`). Rules are
-  now matched against the command the shell receives (the Bash tool's own
-  field lookup and JSON unescape), so `\n`, `\u0026\u0026` and `\"` are real
-  separators and quotes: `Bash(npm *)` no longer auto-allows
+  defeated the rule: `bypassPermissions` and `autoAllowBashIfSandboxed` ran
+  the command, and `default` asked instead of denying. `allow` rules still
+  need every segment (`permission/rule_spec.zig matchesBashCompound`). Rules
+  are now matched against the command the shell receives (the Bash tool's
+  own field lookup and JSON unescape), so `\n`, `\u0026\u0026` and `\"`
+  are real separators and quotes: `Bash(npm *)` no longer auto-allows
   `npm test\nrm x`. Heredoc bodies are not parsed, so each of their lines
   is a segment of its own.
+- Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
+  `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
+  `firstLine` backed off while the last kept byte was a continuation byte,
+  which strands the lead byte of a character cut at the limit: a CJK memory
+  reached the provider with a trailing U+FFFD and the scoped recall receipt
+  hashed different bytes than the provider received. All three use
+  `util/utf8.prefixEnd`.
+- Paid memory pilots could not run a TinyKG arm since TinyKG storage v3: an
+  online (read-write) rollout store's sibling daemon-ownership lock
+  (`<store>.tinykg-daemon.lock`) was outside the production Seatbelt
+  profile, so every TinyKG command in the child got `PermissionDenied`, KG
+  degraded, and treatment activation refused the arm. The carve-out that
+  sealed offline stores already had now covers read-write stores as one
+  literal path. The memory runner and replay also split JSONL on LF only:
+  `str.splitlines()` cut records at U+2028/U+0085 that stay raw inside
+  LongMemEval chat text.
 - A Ctrl+C/Esc while the provider stream read was blocked was reported as a
   model API error: `provider.cancel` shuts the socket, the read wakes with
   `ReadFailed`, and the stream clients classified that before consulting the

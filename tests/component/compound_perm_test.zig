@@ -7,9 +7,9 @@
 //!     稀释不了用户的 deny(与 path 规则 deny/ask 的"任一路径匹配"对称)。
 //! 拆的是 shell 真正收到的字节(与 Bash 工具同一取字段 + JSON unescape):args 里的 `\n`、
 //! `\u0026\u0026` 是真分隔符,`\"…\"` 内的分隔符不拆。
-//! 修复前 deny/ask 也要求"每段都匹中",`ls && rm x` 在 bypass_permissions(兜底 allow)与
-//! default(首词 ls 走 readonly 免询问)下都绕过了用户的 deny 规则;下方经
-//! cc.permission.checkPermission 端到端锁定两种模式下 deny 都赢。
+//! 修复前 deny/ask 也要求"每段都匹中",`ls && rm x` 绕过用户的 deny 规则:bypass_permissions
+//! 下照样执行(兜底 allow),default 下只落到询问;下方经 cc.permission.checkPermission
+//! 端到端锁定两种模式下 deny 都赢。
 //! 注:`rm -rf /` 这类硬危险命令另由 shell_lex.validate(扫所有段)兜底,不依赖规则系统。
 
 const std = @import("std");

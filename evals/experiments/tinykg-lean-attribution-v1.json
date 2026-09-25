@@ -289,8 +289,8 @@
   "source_contract": {
     "evals/experiments/tinykg-lean-factorial-block-v1-cases.json": "9a563ae27db1c5840339b2bda47c3f535dda06cc05a95be21a32779bc2ed2542",
     "evals/memory/MEMORY_MATURATION_V1.md": "3621d69f26c6e791033a6ba87887942bb620e92ad6103d5b6f2b6c23d7fff582",
-    "scripts/eval/memory_agent_runtime_smoke.py": "f0900594d9f6ab439f7194934bf801b34edfce14a6edb495fa6975f7a851deb6",
-    "scripts/eval/memory_agent_runtime_pilot.py": "caff3c557925b164b522c4b3f746e7a5b8526e1a6cfc050c1132f01b60cf1e0c",
+    "scripts/eval/memory_agent_runtime_smoke.py": "230dc401501bdcccd2ef6d80a16e3af2cb4b019391edc6d503c6936b83de0673",
+    "scripts/eval/memory_agent_runtime_pilot.py": "4c52eeb01dce1d0e8adccbbc844cb6c6b120441db0c2d0b7aeb72eeff6caa97b",
     "scripts/eval/project_harness_experiment.py": "31bea51bdf1a62932318464032bd929b235e52655eaed155b51ae5da0f103ddf",
     "scripts/eval/project_harness_rule_impact_prospective.py": "d5397e2bb23d4a730ef12ebfba4cd315da69d86d17decad534cf81299872e06b",
     "scripts/eval/run_project_rule_evolution_mac_pilot.py": "1a89e7c6116f4f43a016e7f1a93a820adf1b4a07514582c1366574ea7fa4019a",
