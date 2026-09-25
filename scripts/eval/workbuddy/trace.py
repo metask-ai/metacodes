@@ -1665,6 +1665,51 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 formal[observation_kind + "_events"] = (
                     formal.get(observation_kind + "_events", 0) + 1
                 )
+            elif observation_kind == "system_one_decision":
+                # One advisory System-One (Jev) consultation. Evidence only:
+                # it may be actuated solely in advisory mode, solely when the
+                # judge answered, and solely when it changed the host
+                # decision; an unanswered consultation carries no counts.
+                if (
+                    observation.get("schema_version")
+                    != "metacodes-system-one-decision-v1"
+                    or observation.get("decision")
+                    not in {"recall_relevance", "memory_relation", "enumeration_intent"}
+                    or observation.get("mode") not in {"shadow", "advisory"}
+                    or observation.get("outcome")
+                    not in {
+                        "answered",
+                        "unavailable",
+                        "rejected",
+                        "malformed",
+                        "priced_service",
+                        "model_mismatch",
+                        "invalid_request",
+                    }
+                    or not isinstance(observation.get("actuated"), bool)
+                ):
+                    raise TraceError("system one decision record is invalid")
+                counts = {}
+                for key in ("question_count", "judged", "positive", "changed"):
+                    value = observation.get(key)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        raise TraceError("system one decision record is invalid")
+                    counts[key] = value
+                if (
+                    not counts["positive"] <= counts["judged"] <= counts["question_count"]
+                    or (
+                        observation["outcome"] != "answered"
+                        and (counts["judged"] or counts["changed"] or observation["actuated"])
+                    )
+                    or (
+                        observation["actuated"]
+                        and (observation["mode"] != "advisory" or counts["changed"] == 0)
+                    )
+                ):
+                    raise TraceError("system one decision record violates the advisory contract")
+                formal["system_one_decisions"] = formal.get("system_one_decisions", 0) + 1
+                if observation["actuated"]:
+                    formal["system_one_actuated"] = formal.get("system_one_actuated", 0) + 1
             else:
                 raise TraceError("tool observation kind is unsupported")
     if run_started != 1 or run_finished != 1:

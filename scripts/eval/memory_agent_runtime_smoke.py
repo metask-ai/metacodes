@@ -24,6 +24,7 @@ if __package__ in {None, ""}:
     from scripts.eval.memory_agent_runtime import (  # type: ignore
         PRODUCTION_CHILD_PATH,
         SCRIPTED_PROVIDER_ID,
+        SYSTEM_ONE_LOG_NAME,
         ScriptedMemoryProvider,
         _cassette_memory_exposure,
         _materialize_production_sandbox,
@@ -42,6 +43,7 @@ else:
     from .memory_agent_runtime import (
         PRODUCTION_CHILD_PATH,
         SCRIPTED_PROVIDER_ID,
+        SYSTEM_ONE_LOG_NAME,
         ScriptedMemoryProvider,
         _cassette_memory_exposure,
         _materialize_production_sandbox,
@@ -63,16 +65,20 @@ def _digest(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
-def _execution() -> Mapping[str, Any]:
+def _execution(include_jev: bool = False) -> Mapping[str, Any]:
+    arms = [
+        {"id": "no_memory", "fingerprint": _digest("no-memory-native-v3")},
+        {"id": "markdown_memory", "fingerprint": _digest("markdown-native-v3")},
+        {"id": "tinykg_lexical", "fingerprint": _digest("tinykg-native-v3")},
+    ]
+    if include_jev:
+        # TinyKG plus the System-One advisor behind the runner's scripted judge.
+        arms.append({"id": "tinykg_jev", "fingerprint": _digest("tinykg-jev-native-v1")})
     return {
         "model_id": SCRIPTED_PROVIDER_ID,
         "model_fingerprint": _digest(SCRIPTED_PROVIDER_ID),
         "harness_revision": "native-memory-agent-lifecycle-smoke-v3",
-        "arms": [
-            {"id": "no_memory", "fingerprint": _digest("no-memory-native-v3")},
-            {"id": "markdown_memory", "fingerprint": _digest("markdown-native-v3")},
-            {"id": "tinykg_lexical", "fingerprint": _digest("tinykg-native-v3")},
-        ],
+        "arms": arms,
         "trials": 1,
         "retrieval_limits": {
             "max_k": 10,
@@ -400,7 +406,18 @@ def _run_adapter(
             where=f"{label} native query plan",
         )
         assert query_plan_trace is not None
-        if row["arm"] == "tinykg_lexical":
+        if row["arm"] == "tinykg_jev":
+            judge_log = (run_dir / rollout["artifact_paths"]["cassette"]).parent / SYSTEM_ONE_LOG_NAME
+            if not judge_log.is_file():
+                raise RuntimeError(f"{label}: System-One arm left no judge log")
+            answered = [
+                json.loads(line)["answered"]
+                for line in judge_log.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if not any(answered):
+                raise RuntimeError(f"{label}: System-One arm was never judged")
+        if row["arm"] in ("tinykg_lexical", "tinykg_jev"):
             if row["trajectory"]["tool_calls"] < 1 or not row["retrieval"]["query_variants"]:
                 raise RuntimeError(f"{label}: TinyKG treatment did not reach real tools")
             if query_plan_trace["status"] != "verified":
@@ -455,7 +472,13 @@ def main(argv: list[str] | None = None) -> int:
         "--output-dir",
         help="optional fresh local directory that keeps the native artifacts",
     )
+    parser.add_argument(
+        "--include-jev-arm",
+        action="store_true",
+        help="also run the tinykg_jev arm against the runner's scripted System-One judge",
+    )
     args = parser.parse_args(argv)
+    execution = _execution(args.include_jev_arm)
     metacodes = Path(args.binary).resolve()
     tinykg = Path(args.tinykg_binary).resolve()
     metacodes_sha = hashlib.sha256(metacodes.read_bytes()).hexdigest()
@@ -496,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
             raw_hotpot.write_text(stable_json([_hotpot_record()]) + "\n", encoding="utf-8")
             hotpot_slice, hotpot_manifest = adapt_hotpot(
                 raw_hotpot,
-                _execution(),
+                execution,
                 expected_source_sha256=hashlib.sha256(raw_hotpot.read_bytes()).hexdigest(),
                 limit=1,
                 split_seed=20260807,
@@ -518,7 +541,7 @@ def main(argv: list[str] | None = None) -> int:
             raw_longmem.write_text(stable_json([_longmem_record()]) + "\n", encoding="utf-8")
             longmem_slice, longmem_manifest = adapt_longmem(
                 raw_longmem,
-                _execution(),
+                execution,
                 expected_source_sha256=hashlib.sha256(raw_longmem.read_bytes()).hexdigest(),
                 limit=1,
                 split_seed=20260807,
@@ -539,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
             procedural_fixture = REPO_ROOT / "evals/memory/fixtures/procedural-coding-source-v3.json"
             procedural_slice, validators, procedural_manifest = adapt_procedural(
                 procedural_fixture,
-                _execution(),
+                execution,
                 expected_source_sha256=hashlib.sha256(procedural_fixture.read_bytes()).hexdigest(),
                 limit_families=1,
                 split_seed=20260807,
@@ -587,7 +610,8 @@ def main(argv: list[str] | None = None) -> int:
             )
     suffix = f", artifacts={Path(args.output_dir).resolve()}" if args.output_dir else ""
     print(
-        "memory-agent-runtime-smoke: FD auth Seatbelt + 3 adapters, 3 arms, durable lifecycle, native agent loop, "
+        f"memory-agent-runtime-smoke: FD auth Seatbelt + 3 adapters, {len(execution['arms'])} arms, "
+        "durable lifecycle, native agent loop, "
         f"paid=0, external_network=0{suffix}"
     )
     return 0

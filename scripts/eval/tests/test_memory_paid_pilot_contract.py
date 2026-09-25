@@ -132,6 +132,150 @@ class PaidPilotContractTest(unittest.TestCase):
             ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(manifest["schedule"]))
 
+    def test_v21_jev_arm_is_reproducible_balanced_and_budget_bound(self):
+        self._assert_jev_pilot("procedural-glm52-v21")
+
+    def test_v22_reruns_the_jev_pilot_after_the_runner_fixes_within_the_authorization(self):
+        contract = self._assert_jev_pilot("procedural-glm52-v22")
+        self.assertEqual(
+            [(item["pilot_id"], item["status"]) for item in contract["predecessor_attempts"]],
+            [
+                ("procedural-glm52-v21", "halted-runner-online-store-seatbelt-daemon-lock"),
+                ("longmemeval-s-jev-pilot30-attempt1", "halted-runner-jsonl-unicode-line-separator"),
+            ],
+        )
+        self.assertFalse(contract["incident_guard"]["v21_transaction_reuse"])
+        self.assertEqual(contract["harness"]["runner_source_commit"], "42d16b2")
+        v21 = json.loads(
+            (ROOT / "evals/memory/pilots/procedural-glm52-v21/pilot-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        # Same families, binary and arms; only the runner revision moved.
+        self.assertEqual(contract["harness"]["binary_sha256"], v21["harness"]["binary_sha256"])
+        self.assertEqual(contract["protocol"]["arms"], v21["protocol"]["arms"])
+        budget = contract["budget_authority"]
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"]
+            + budget["max_total_cost_usd"]
+            + budget["companion_pilot_max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+
+    def test_v23_reruns_the_jev_pilot_with_the_bm25_band_within_the_authorization(self):
+        contract = self._assert_jev_pilot("procedural-glm52-v23")
+        self.assertEqual(
+            [item["pilot_id"] for item in contract["predecessor_attempts"]],
+            [
+                "procedural-glm52-v21",
+                "longmemeval-s-jev-pilot30-attempt1",
+                "procedural-glm52-v22",
+                "longmemeval-s-jev-pilot30-attempt2",
+            ],
+        )
+        self.assertEqual(
+            contract["predecessor_attempts"][2]["verified_prefix_offline_success"],
+            {"no_memory": "0/18", "tinykg_lexical": "18/18", "tinykg_jev": "15/18"},
+        )
+        self.assertFalse(contract["incident_guard"]["v22_transaction_reuse"])
+        self.assertIn(
+            "bm25-band", contract["system_one"]["arm_descriptor"]["system_one"]["recall_selection"]
+        )
+        self.assertEqual(contract["harness"]["runner_source_commit"], "810591a")
+        budget = contract["budget_authority"]
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"]
+            + budget["max_total_cost_usd"]
+            + budget["companion_pilot_max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+
+    def _assert_jev_pilot(self, pilot_id):
+        pilot = ROOT / "evals/memory/pilots" / pilot_id
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(contract["pilot_id"], pilot_id)
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+
+        # The Jev pilot reuses v20's frozen families: only the arms differ.
+        for name in ("source.json", "validators.json"):
+            self.assertEqual((pilot / name).read_bytes(), (PILOT / name).read_bytes())
+        fixture = ROOT / contract["generation"]["source_path"]
+        regenerated = adapt_procedural(
+            fixture,
+            execution,
+            expected_source_sha256=contract["generation"]["expected_upstream_sha256"],
+            limit_families=contract["generation"]["limit_families"],
+            split_seed=contract["generation"]["split_seed"],
+        )
+        for value, name in zip(regenerated, ("source.json", "validators.json", "manifest.json")):
+            self.assertEqual(artifact_bytes(value), (pilot / name).read_bytes())
+
+        arms = [arm["id"] for arm in manifest["execution"]["arms"]]
+        self.assertEqual(arms, ["no_memory", "tinykg_lexical", "tinykg_jev"])
+        self.assertEqual(
+            {arm["id"]: arm["fingerprint"] for arm in contract["protocol"]["arms"]},
+            {arm["id"]: arm["fingerprint"] for arm in manifest["execution"]["arms"]},
+        )
+        descriptor = contract["system_one"]["arm_descriptor"]
+        self.assertEqual(
+            hashlib.sha256(
+                json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            dict(zip(arms, (arm["fingerprint"] for arm in manifest["execution"]["arms"])))["tinykg_jev"],
+        )
+        self.assertIn(
+            "metacodes.jev.recall-relevance.v2", descriptor["system_one"]["question_sets"]
+        )
+        self.assertIn("jev", manifest["execution"]["harness_revision"])
+
+        positions = {}
+        offline_by_arm = {}
+        cases = {case["id"]: case for case in manifest["cases"]}
+        for offset in range(0, len(manifest["schedule"]), 3):
+            for position, row in enumerate(manifest["schedule"][offset : offset + 3]):
+                positions[(row["arm"], position)] = positions.get((row["arm"], position), 0) + 1
+                if cases[row["case_id"]]["split"] == "offline":
+                    offline_by_arm[row["arm"]] = offline_by_arm.get(row["arm"], 0) + 1
+        self.assertEqual(set(positions.values()), {contract["schedule"]["arm_position_counts"]})
+        self.assertEqual(set(offline_by_arm.values()), {contract["schedule"]["offline_rows_per_arm"]})
+        rows = [
+            [item["sequence"], item["case_id"], item["trial"], item["arm"]]
+            for item in manifest["schedule"]
+        ]
+        ordered_tsv = "".join("\t".join(str(value) for value in row) + "\n" for row in rows)
+        self.assertEqual(
+            hashlib.sha256(ordered_tsv.encode("utf-8")).hexdigest(),
+            contract["schedule"]["ordered_tsv_sha256"],
+        )
+
+        self.assertEqual(
+            contract["analysis_plan"]["primary_estimand"],
+            "paired offline deterministic-success risk difference: tinykg_jev minus tinykg_lexical",
+        )
+        budget = contract["budget_authority"]
+        self.assertLessEqual(
+            budget["max_total_cost_usd"] + budget["companion_pilot_max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+        ).validate(len(manifest["schedule"]))
+        return contract
+
 
 if __name__ == "__main__":
     unittest.main()

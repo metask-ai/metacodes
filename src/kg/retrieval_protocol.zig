@@ -72,6 +72,11 @@ pub const ENUMERATION_CONTEXT_REMINDER =
 pub const ENUMERATION_CONTEXT_REPAIR =
     "[lexical-evidence-rejected-final] Your proposed final answer was rejected because the enumeration candidates remain unverified. Do not repeat KgRecall. Call KgContext once on the best node_id returned by the governed recall batch, inspect its graph and governance receipt, then produce the final answer. Only inspect another node if the first result explicitly signals contradiction, supersession, truncation, or missing evidence.";
 
+/// System-One (Jev) arming threshold for the soft enumeration hint. Probed on
+/// metask-jev-4b (2026-09-23, 18 paraphrases incl. zh): positives scored
+/// 0.89-0.95 and negatives <= 0.14, so 80 separates with margin on both sides.
+pub const ENUMERATION_JUDGE_THRESHOLD_PERCENT: u8 = 80;
+
 /// Deliberately high-precision host hint. The model-declared intent remains a
 /// second signal, but obvious cardinality wording must not be silently
 /// downgraded to fact_lookup as happened in a paid calibration.
