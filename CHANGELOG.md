@@ -75,7 +75,10 @@ status, compatibility boundaries, and entry points are defined by
 - The maintainer rule-control gate also failed closed on a skipped test: the
   paid-budget rule's feedback runs `scripts/eval/workbuddy_release_suite.py`,
   whose roster of WorkBuddy tests that need an external checkout missed the
-  one #110 added. The roster lists all ten again.
+  one #110 added. The roster lists all ten again, and `zig build test` now
+  checks that it is exactly the adapter tests that read
+  `METACODES_WORKBUDDY_CHECKOUT` (`roster_violations`), where the old check
+  only required the listed names to exist.
 - Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
   `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
   `firstLine` backed off while the last kept byte was a continuation byte,
