@@ -96,6 +96,18 @@ status, compatibility boundaries, and entry points are defined by
   shell policy uses; it now takes effect only where that setting allows it.
   A sandbox profile that cannot be written no longer makes Bash or Monitor
   run the command unsandboxed; the call fails instead.
+- Bash `deny` and `ask` permission rules now match a compound command when
+  any segment matches (after wrapper stripping): `Bash(rm *)` catches
+  `ls && rm x`, `ls; rm x`, `ls | rm x` and a newline-separated `rm x`. They
+  used to require every segment to match, like `allow`, so a harmless prefix
+  defeated the rule: `bypassPermissions` and `autoAllowBashIfSandboxed` ran
+  the command, and `default` asked instead of denying. `allow` rules still
+  need every segment (`permission/rule_spec.zig matchesBashCompound`). Rules
+  are now matched against the command the shell receives (the Bash tool's
+  own field lookup and JSON unescape), so `\n`, `\u0026\u0026` and `\"`
+  are real separators and quotes: `Bash(npm *)` no longer auto-allows
+  `npm test\nrm x`. Heredoc bodies are not parsed, so each of their lines
+  is a segment of its own.
 - Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
   `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
   `firstLine` backed off while the last kept byte was a continuation byte,
