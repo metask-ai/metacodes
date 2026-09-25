@@ -33,6 +33,30 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Optional System-One (Jev) memory-plane advisor (`src/jev/`,
+  [doc/JEV_SYSTEM_ONE.md](doc/JEV_SYSTEM_ONE.md)), off unless
+  `METACODES_JEV_URL` is set; `METACODES_JEV_MODE` is `shadow` by default
+  (consult and journal, provider-visible bytes unchanged) or `advisory`, and
+  `METACODES_JEV_DECISIONS` narrows it to a subset of its surfaces. It
+  advises four existing memory decisions and never gates a tool, permission,
+  budget or TinyKG write: scoped recall ranks the BM25-plausible part of an
+  8-hit pool (score at least half the top, the baseline's own band) by judge
+  probability plus normalized BM25 once the BM25 floor has passed (the judge is
+  not consulted below it), `KgRecall` gains a relevance/sufficiency block,
+  `KgRemember` a same/contradicts relations block, and the enumeration judge
+  arms only the soft coverage reminder. Judge failures fall back to the
+  unadvised path without retries (30 s–5 min breaker); a user interrupt stays
+  `Aborted`; a different model or a priced tariff is refused. Every
+  consultation emits `system_one_decision`
+  (`metacodes-system-one-decision-v1`): the scoped-recall decision on the
+  evaluation stream, which the evaluation adapters validate, and the
+  tool-surface decisions in the tool-observation journal.
+  The paid memory runner gains `tinykg_jev`, the attribution arm
+  `tinykg_jev_recall` (recall gate only) and the injection-only arms
+  `tinykg_inject` / `tinykg_jev_inject` (TinyKG tools withheld, turn-level
+  store) behind a loopback judge proxy, and
+  `zig build eval:jev-recall-driver` replays LongMemEval-S candidate pools
+  through the production recall policies with no provider.
 - Release automation (`doc/RELEASE_AUTOMATION_DESIGN.md`): `scripts/release_cut.py`
   derives the next version from the Conventional-Commit types since the last
   tag, rewrites `build.zig.zon` / `src/version.zig` / this file in one release
@@ -72,7 +96,22 @@ status, compatibility boundaries, and entry points are defined by
   shell policy uses; it now takes effect only where that setting allows it.
   A sandbox profile that cannot be written no longer makes Bash or Monitor
   run the command unsandboxed; the call fails instead.
-
+- Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
+  `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
+  `firstLine` backed off while the last kept byte was a continuation byte,
+  which strands the lead byte of a character cut at the limit: a CJK memory
+  reached the provider with a trailing U+FFFD and the scoped recall receipt
+  hashed different bytes than the provider received. All three use
+  `util/utf8.prefixEnd`.
+- Paid memory pilots could not run a TinyKG arm since TinyKG storage v3: an
+  online (read-write) rollout store's sibling daemon-ownership lock
+  (`<store>.tinykg-daemon.lock`) was outside the production Seatbelt
+  profile, so every TinyKG command in the child got `PermissionDenied`, KG
+  degraded, and treatment activation refused the arm. The carve-out that
+  sealed offline stores already had now covers read-write stores as one
+  literal path. The memory runner and replay also split JSONL on LF only:
+  `str.splitlines()` cut records at U+2028/U+0085 that stay raw inside
+  LongMemEval chat text.
 - A Ctrl+C/Esc while the provider stream read was blocked was reported as a
   model API error: `provider.cancel` shuts the socket, the read wakes with
   `ReadFailed`, and the stream clients classified that before consulting the
