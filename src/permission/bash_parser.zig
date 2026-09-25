@@ -31,6 +31,10 @@ const std = @import("std");
 ///
 /// 分隔符:&& || ; | |& & 换行。
 /// 注意引号内不拆(单引号 / 双引号 / 反引号)。
+/// 重定向运算符里的 `&`、`|` 不是分隔符:紧跟在未加引号、未转义的 `>`/`<` 后面的 `&`
+/// (`2>&1`、`>&2`、`<&3`、`>&-`)和 `>` 后面的 `|`(`>|`)。`&>`、`&>>` 仍在 `&` 处拆开:
+/// bash 把它当作两路输出写文件的重定向,dash 读成后台 `&` 加一条只有重定向的命令;按
+/// dash 拆,`&` 前的命令照样单独成段,bash 下多出的 `> file` 段只让 allow 规则多问一次。
 ///
 /// 返回的 slice 直接指向 input,调用方 free input 之前不能用。
 pub fn splitCompound(allocator: std.mem.Allocator, input: []const u8) ![][]const u8 {
@@ -42,9 +46,13 @@ pub fn splitCompound(allocator: std.mem.Allocator, input: []const u8) ![][]const
     var in_single = false;
     var in_double = false;
     var in_back = false;
+    // 上一个字节是未加引号、未转义的 `>` 或 `<` 时记下它,否则 0
+    var redirect_op: u8 = 0;
 
     while (i < input.len) : (i += 1) {
         const c = input[i];
+        const after_redirect = redirect_op;
+        redirect_op = 0;
 
         // 引号状态机
         if (!in_double and !in_back and c == '\'') {
@@ -67,8 +75,13 @@ pub fn splitCompound(allocator: std.mem.Allocator, input: []const u8) ![][]const
             continue;
         }
 
+        if (c == '>' or c == '<') redirect_op = c;
+
         // 找分隔符
         const split_len: usize = blk: {
+            // `>&`、`<&`、`>|` 是重定向运算符
+            if (c == '&' and after_redirect != 0) break :blk 0;
+            if (c == '|' and after_redirect == '>') break :blk 0;
             if (c == '&' and i + 1 < input.len and input[i + 1] == '&') break :blk 2;
             if (c == '|' and i + 1 < input.len and input[i + 1] == '|') break :blk 2;
             if (c == '|' and i + 1 < input.len and input[i + 1] == '&') break :blk 2;
@@ -500,6 +513,33 @@ test "splitCompound: backslash escape" {
     try testing.expectEqual(@as(usize, 2), segs.len);
     try testing.expectEqualStrings("echo a\\;b", segs[0]);
     try testing.expectEqualStrings("ls", segs[1]);
+}
+
+test "splitCompound: 重定向运算符里的 & 与 | 不拆" {
+    const Case = struct { input: []const u8, segments: []const []const u8 };
+    const cases = [_]Case{
+        .{ .input = "npm test 2>&1 | tail -20", .segments = &.{ "npm test 2>&1", "tail -20" } },
+        .{ .input = "echo x >&2", .segments = &.{"echo x >&2"} },
+        .{ .input = "cmd <&3", .segments = &.{"cmd <&3"} },
+        .{ .input = "exec 3>&-", .segments = &.{"exec 3>&-"} },
+        .{ .input = "make 2>&1&& rm x", .segments = &.{ "make 2>&1", "rm x" } },
+        .{ .input = "echo x >| out; ls", .segments = &.{ "echo x >| out", "ls" } },
+        // 后台 `&`、`|&` 照旧是分隔符;`>` 与 `&` 之间有空白,或 `>` 被转义、加了引号,`&` 也是
+        .{ .input = "ls & rm x", .segments = &.{ "ls", "rm x" } },
+        .{ .input = "ls 2>&1 |& cat", .segments = &.{ "ls 2>&1", "cat" } },
+        .{ .input = "echo x > &1", .segments = &.{ "echo x >", "1" } },
+        .{ .input = "echo \\>&1", .segments = &.{ "echo \\>", "1" } },
+        .{ .input = "echo '>'&1", .segments = &.{ "echo '>'", "1" } },
+        // `&>` 按 dash 的读法在 `&` 处拆开(bash 里是重定向)
+        .{ .input = "ls &> out", .segments = &.{ "ls", "> out" } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("input: {s}\n", .{case.input});
+        const segs = try splitCompound(testing.allocator, case.input);
+        defer testing.allocator.free(segs);
+        try testing.expectEqual(case.segments.len, segs.len);
+        for (case.segments, segs) |want, got| try testing.expectEqualStrings(want, got);
+    }
 }
 
 test "stripWrappers: timeout" {

@@ -513,11 +513,9 @@ fn verificationEvidence(allocator: std.mem.Allocator, command: []const u8) ?Evid
     if (semicolonDisplayChainEvidence(allocator, command)) |evidence| return evidence;
     const pipeline = stripDisplayPipeline(command) orelse return null;
     if (!onlyAndConjunctions(pipeline.command)) return null;
-    // The general permission parser deliberately treats every `&` as a shell
-    // separator.  Here `onlyAndConjunctions` has already admitted the narrow
-    // presentation redirect `2>&1`; feeding that string back through the
-    // general parser would split it into `2>` / `1` and silently miss the
-    // normal `pytest 2>&1 | tail` form used by real coding agents.
+    // `onlyAndConjunctions` has already admitted the narrow presentation
+    // redirect `2>&1` besides `&&`; split on exactly those `&&`, so the normal
+    // `pytest 2>&1 | tail` form used by real coding agents stays one conjunct.
     const segments = splitAndConjunctions(allocator, pipeline.command) catch return null;
     defer allocator.free(segments);
     if (segments.len == 0) return null;

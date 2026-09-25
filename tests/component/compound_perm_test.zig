@@ -10,6 +10,8 @@
 //! 修复前 deny/ask 也要求"每段都匹中",`ls && rm x` 在 bypass_permissions(兜底 allow)与
 //! default(首词 ls 走 readonly 免询问)下都绕过了用户的 deny 规则;下方经
 //! cc.permission.checkPermission 端到端锁定两种模式下 deny 都赢。
+//! 重定向运算符里的 `&`、`|` 不是分隔符(`2>&1`、`>&2`、`>|`):修复前 `npm test 2>&1` 被拆出
+//! `1` 这一段,`Bash(npm test *)` 放行不了这条最常见的命令;后台 `&` 照旧拆段。
 //! 每段先按原文比,再比 wrapper 包着的命令。deny/ask 看穿所有 wrapper(`timeout 5 rm x`、
 //! `ls && env X=1 rm x`、`ls | xargs rm` 都触发 Bash(rm *));allow 只看穿只改"怎么跑"的
 //! 良性 wrapper(`timeout 30 git push` 仍被 Bash(git *) 放行)。修复前 allow 也比剥掉 env
@@ -98,6 +100,17 @@ test "L2 复合命令: 按 shell 收到的字节拆段(JSON 转义的分隔符�
     // `\"` 是真引号:引号内的 `;` 不拆——deny 不误伤,allow 不误拒
     try std.testing.expect(!try denyMatch("Bash(rm *)", "echo \\\"a; rm x\\\""));
     try std.testing.expect(try allowMatch("Bash(echo *)", "echo \\\"a; rm x\\\""));
+}
+
+test "L2 复合命令: 重定向运算符里的 & 与 | 不拆段,后台 & 照旧拆" {
+    try std.testing.expect(try allowMatch("Bash(npm test *)", "npm test 2>&1"));
+    try std.testing.expect(try allowMatch("Bash(npm test *)", "npm test >&2"));
+    try std.testing.expect(try allowMatch("Bash(npm test *)", "npm test >| out.log"));
+    try std.testing.expect(try allowMatch("Bash(npm *)", "npm test 2>&1 && npm run build 2>&1"));
+    // 后台 `&` 仍是分隔符:rm 段让 allow 落空、让 deny 命中
+    try std.testing.expect(!try allowMatch("Bash(npm test *)", "npm test 2>&1 & rm x"));
+    try std.testing.expect(try denyMatch("Bash(rm *)", "ls & rm x"));
+    try std.testing.expect(try denyMatch("Bash(rm *)", "ls && rm x 2>&1"));
 }
 
 test "L2 复合命令: deny/ask 看穿所有 wrapper,allow 只看穿良性 wrapper" {
@@ -215,6 +228,44 @@ test "L2 checkPermission: allow Bash(npm *) 仍要每段都是 npm(转义换行�
     try std.testing.expectEqual(Decision.ask, try checkBash(&ctx, "npm test && rm x"));
     // JSON 转义的换行也是分隔符:修复前整串当一段,`npm *` 前缀匹中 → 放行了 rm
     try std.testing.expectEqual(Decision.ask, try checkBash(&ctx, "npm test\\nrm x"));
+}
+
+test "L2 checkPermission: allow Bash(npm test *) 放行 npm test 2>&1(default)" {
+    // 修复前 `2>&1` 的 `&` 被当成后台分隔符,拆出的 `1` 段匹不中 → 兜底 ask。
+    const gpa = std.testing.allocator;
+    var settings = try loadSettings(gpa,
+        \\{"permissions":{"allow":["Bash(npm test *)"]}}
+    );
+    defer settings.deinit();
+    const ctx = cc.permission.PermissionContext{
+        .mode = .init(.default),
+        .allocator = gpa,
+        .settings = &settings,
+    };
+    try std.testing.expectEqual(Decision.allow, try checkBash(&ctx, "npm test 2>&1"));
+    try std.testing.expectEqual(Decision.allow, try checkBash(&ctx, "npm test -- --silent >&2"));
+    // 后台 `&` 照旧拆段:rm 段没被放行
+    try std.testing.expectEqual(Decision.ask, try checkBash(&ctx, "npm test 2>&1 & rm x"));
+}
+
+test "L2 checkPermission: deny Bash(rm *) 仍拦 ls & rm x 与 ls && rm x 2>&1(default / bypass_permissions)" {
+    const gpa = std.testing.allocator;
+    var settings = try loadSettings(gpa, deny_rm_settings);
+    defer settings.deinit();
+    for ([_]cc.types_mod.PermissionMode{ .default, .bypass_permissions }) |mode| {
+        errdefer std.debug.print("mode: {s}\n", .{@tagName(mode)});
+        const ctx = cc.permission.PermissionContext{
+            .mode = .init(mode),
+            .allocator = gpa,
+            .settings = &settings,
+        };
+        for ([_][]const u8{ "ls & rm x", "ls && rm x 2>&1", "ls 2>&1 && rm x >&2", "rm x 2>&1 | tail -5" }) |command| {
+            errdefer std.debug.print("command: {s}\n", .{command});
+            try std.testing.expectEqual(Decision.deny, try checkBash(&ctx, command));
+        }
+        // 没有 rm 段:`2>&1` 不再拆出段,`Bash(ls *)` 放行整条
+        try std.testing.expectEqual(Decision.allow, try checkBash(&ctx, "ls -la 2>&1"));
+    }
 }
 
 // ---------------------------------------------------------------------------

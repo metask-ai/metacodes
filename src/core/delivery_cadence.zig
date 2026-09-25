@@ -184,9 +184,9 @@ fn classifyBash(allocator: std.mem.Allocator, input: []const u8) Class {
     // and the compound splitter cannot see inside them (`echo "$(touch f)"`
     // is one read-only-looking segment). Fail towards silence.
     if (containsSubstitution(raw)) return .mutation;
-    // The permission splitter treats a lone `&` as a separator, so `2>&1`
-    // would become the segments `cat f 2>` and `1`. Descriptor dups carry no
-    // file effect: drop them before splitting.
+    // Descriptor dups carry no file effect: drop them before splitting, so
+    // the per-command checks below never read `2>&1` as an operand (`uniq f
+    // 2>&1` would count it as uniq's OUTPUT file).
     const command = stripDescriptorDups(allocator, raw) catch return .mutation;
     defer allocator.free(command);
     const segments = bash_parser.splitCompound(allocator, command) catch return .mutation;

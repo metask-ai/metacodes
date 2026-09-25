@@ -155,6 +155,17 @@ status, compatibility boundaries, and entry points are defined by
   still see through every wrapper, and now also match the command as written
   and each wrapper layer: `Bash(xargs *)` catches `xargs rm`, `Bash(env *)`
   catches `env X=1 make`, and `timeout -s KILL 5 rm x` triggers `Bash(rm *)`.
+- The compound splitter behind Bash permission rules
+  (`bash_parser.splitCompound`) cut descriptor redirections at their `&`:
+  `npm test 2>&1 | tail -20` became the segments `npm test 2>`, `1` and
+  `tail -20`, so `Bash(npm test *)` did not allow `npm test 2>&1` (the `1`
+  segment matches nothing) and one of the most common agent commands asked.
+  An `&` right after an unquoted, unescaped `>` or `<` (`2>&1`, `>&2`, `<&3`,
+  `>&-`) and a `|` right after `>` (`>|`) now belong to the redirection;
+  `&&`, a lone `&`, `|&`, `;`, `|` and newline still separate. `&>` and `&>>`
+  still split at the `&`, the way dash reads them (a background job, then a
+  command that is only a redirection); under bash they redirect both
+  streams, and the extra `> file` segment only makes an `allow` rule ask.
 - A Ctrl+C/Esc while the provider stream read was blocked was reported as a
   model API error: `provider.cancel` shuts the socket, the read wakes with
   `ReadFailed`, and the stream clients classified that before consulting the
