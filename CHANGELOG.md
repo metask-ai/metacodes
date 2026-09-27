@@ -80,17 +80,30 @@ status, compatibility boundaries, and entry points are defined by
   that goes stale after `stale_ms`, and the next generation takes over. The
   lock guards the swarm mailbox and team config, the task-list mirror,
   provider config, transcripts and the TinyKG migration lock.
-- `util/fs.testing.uniqueDir` promised a distinct path per call but built it
-  from the monotonic clock alone. macOS `CLOCK_MONOTONIC` ticks in 1 µs
-  (Windows QPC commonly in 100 ns), so back-to-back calls returned the same
-  directory: the self-test failed under `zig build test:lib
-  -Doptimize=ReleaseSafe` on macOS, and two fixtures set up in one tick could
-  share a directory. The name now ends in a process-wide atomic sequence
-  number (`<tag>-<pid>-<ns>-<seq>`), and the self-test compares 256
-  back-to-back calls. The task-list mirror's temporary file
-  (`<path>.tmp.<pid>.<ns>.<seq>`) gets the same suffix. Its writers were
-  already serialized by the mirror lock and no failure was observed there;
+- The task-list mirror's temporary file was named from the monotonic clock
+  alone (`<path>.tmp.<ns>`) and is created with `O_EXCL` on every write.
+  macOS `CLOCK_MONOTONIC` ticks in 1 µs (Windows QPC commonly in 100 ns), so
+  two writes in one tick would get the same name. It is now
+  `<path>.tmp.<pid>.<ns>.<seq>` with a process-wide atomic sequence. The
+  mirror lock already serializes its writers and no failure was observed;
   the name no longer depends on that lock to stay unique.
+- Three maintainer rule-control sensors had drifted from the code they read
+  and failed closed on a correct tree. The TinyKG bundle rule still required
+  `metacodes.tinykg-bundle/v1` after the bundle moved to v2; it now reads the
+  schema the bundle builder writes (`stage_tinykg_binary.BUNDLE_SCHEMA`). The
+  paid-budget lock and treatment-resume rules looked for `O_NOFOLLOW` and the
+  reattestation call where refactors had moved them into shared helpers
+  (`model.open_nofollow`, `_validate_checkpoint_rows`); they now check each
+  hop. `zig build test` runs the rule-control suite (`test:rule-control`),
+  which observes every rule on the checked-in tree, so this kind of drift
+  fails its own pull request.
+- The maintainer rule-control gate also failed closed on a skipped test: the
+  paid-budget rule's feedback runs `scripts/eval/workbuddy_release_suite.py`,
+  whose roster of WorkBuddy tests that need an external checkout missed the
+  one #110 added. The roster lists all ten again, and `zig build test` now
+  checks that it is exactly the adapter tests that read
+  `METACODES_WORKBUDDY_CHECKOUT` (`roster_violations`), where the old check
+  only required the listed names to exist.
 - Bash auto-allow no longer runs writes without a prompt. The read-only
   auto-allow (default, acceptEdits and auto mode) keyed on the first word of
   the whole command, so `cd / && rm -rf *`, `echo x > ~/.bashrc`,
@@ -119,6 +132,18 @@ status, compatibility boundaries, and entry points are defined by
   shell policy uses; it now takes effect only where that setting allows it.
   A sandbox profile that cannot be written no longer makes Bash or Monitor
   run the command unsandboxed; the call fails instead.
+- Bash `deny` and `ask` permission rules now match a compound command when
+  any segment matches (after wrapper stripping): `Bash(rm *)` catches
+  `ls && rm x`, `ls; rm x`, `ls | rm x` and a newline-separated `rm x`. They
+  used to require every segment to match, like `allow`, so a harmless prefix
+  defeated the rule: `bypassPermissions` and `autoAllowBashIfSandboxed` ran
+  the command, and `default` asked instead of denying. `allow` rules still
+  need every segment (`permission/rule_spec.zig matchesBashCompound`). Rules
+  are now matched against the command the shell receives (the Bash tool's
+  own field lookup and JSON unescape), so `\n`, `\u0026\u0026` and `\"`
+  are real separators and quotes: `Bash(npm *)` no longer auto-allows
+  `npm test\nrm x`. Heredoc bodies are not parsed, so each of their lines
+  is a segment of its own.
 - Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
   `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
   `firstLine` backed off while the last kept byte was a continuation byte,
