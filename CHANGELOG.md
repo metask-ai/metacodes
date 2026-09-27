@@ -155,6 +155,48 @@ status, compatibility boundaries, and entry points are defined by
   are real separators and quotes: `Bash(npm *)` no longer auto-allows
   `npm test\nrm x`. Heredoc bodies are not parsed, so each of their lines
   is a segment of its own.
+- Legacy `permission_rules` in `~/.metacodes/config.json`
+  (`permission/rule_matcher.zig`) now split compound commands too. Their
+  `command_prefix` was a `startsWith` over the whole, still JSON-escaped
+  `command`, so an `allow` for `git ` approved `git status && rm -rf ~` (and
+  `git status\nrm -rf ~`), and a `deny` for `rm ` missed `ls && rm x`. The
+  command is now unescaped as the Bash tool does it and split into segments.
+  These rules are first-match-wins in array order, so the first matching rule
+  is taken for every segment, and for the whole command so that a prefix
+  spanning a separator still matches, and the strictest result wins: any
+  `deny` denies, otherwise any `ask` asks, otherwise the command is allowed
+  only when every segment is, and the mode decides the rest. An earlier
+  `ask` no longer hides a later `deny` on another segment, and an `allow`
+  exception listed before a general `deny` still covers its own segment. A
+  command inside a wrapper (`timeout`, `nohup`, `env`, ...) is matched again,
+  but only its `deny` and `ask` count: `env LD_PRELOAD=... git status` is not
+  allowed by `git `. A command that cannot be split (out of memory) gets the
+  strictest result the rules could reach.
+- A Bash `allow` rule in settings.json approved commands it does not name.
+  Every rule kind was matched against `bash_parser.stripWrappers`, which drops
+  `env` together with its `KEY=VAL` arguments and drops `xargs`, so
+  `Bash(git *)` allowed `env LD_PRELOAD=/tmp/x.so git status`,
+  `env PATH=/tmp/evil:$PATH git status` and `xargs git rm`. Since `allow` is
+  evaluated before `ask`, such a match also hid the user's `ask` rules, under
+  `bypassPermissions` too. An `allow` rule now matches a segment as written,
+  or the command inside a wrapper that only changes how it runs (`timeout`,
+  `time [-p]`, `nice`, `ionice`, `nohup`, `stdbuf`, `command [-p]`, `exec`),
+  parsed with that wrapper's real options (`bash_parser.peelBenignWrapper`):
+  `Bash(npm test)` still allows `timeout 30 npm test`. `deny` and `ask` rules
+  still see through every wrapper, and now also match the command as written
+  and each wrapper layer: `Bash(xargs *)` catches `xargs rm`, `Bash(env *)`
+  catches `env X=1 make`, and `timeout -s KILL 5 rm x` triggers `Bash(rm *)`.
+- The compound splitter behind Bash permission rules
+  (`bash_parser.splitCompound`) cut descriptor redirections at their `&`:
+  `npm test 2>&1 | tail -20` became the segments `npm test 2>`, `1` and
+  `tail -20`, so `Bash(npm test *)` did not allow `npm test 2>&1` (the `1`
+  segment matches nothing) and one of the most common agent commands asked.
+  An `&` right after an unquoted, unescaped `>` or `<` (`2>&1`, `>&2`, `<&3`,
+  `>&-`) and a `|` right after `>` (`>|`) now belong to the redirection;
+  `&&`, a lone `&`, `|&`, `;`, `|` and newline still separate. `&>` and `&>>`
+  still split at the `&`, the way dash reads them (a background job, then a
+  command that is only a redirection); under bash they redirect both
+  streams, and the extra `> file` segment only makes an `allow` rule ask.
 - Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
   `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
   `firstLine` backed off while the last kept byte was a continuation byte,

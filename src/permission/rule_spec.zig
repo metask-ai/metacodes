@@ -198,6 +198,8 @@ pub fn matches(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []co
 ///   路径规则:候选 = [原路径] 与 [realpath 解析后](指向区外的链接也 prompt,指向 denied
 ///             文件的链接也 deny);
 ///   Bash 规则:候选 = 复合命令的每一段(`ls && rm x` 的 rm 段触发 deny `Bash(rm *)`)。
+///             一段本身又按原文与 wrapper 包着的命令比对,看穿哪些 wrapper 同样由规则种类
+///             决定(见 bashSegmentMatches)。
 /// 其它规则只有一个候选,不受影响。
 pub const RuleMode = enum { allow, deny, ask };
 
@@ -288,8 +290,8 @@ fn realpathZ(buf: []u8, file_path: []const u8) ?[]const u8 {
     return buf[0..resolved.len];
 }
 
-/// Bash 规则只描述**单条**命令:复合命令(&& || ; | |& & 换行)拆段,每段 stripWrappers 后
-/// 与 pattern 比对,按规则种类聚合(见 RuleMode)——
+/// Bash 规则只描述**单条**命令:复合命令(&& || ; | |& & 换行)拆段,每段按
+/// bashSegmentMatches 与 pattern 比对,按规则种类聚合(见 RuleMode)——
 ///   allow:**每段**都匹中才命中(`git status && rm x` 不被 Bash(git *) 放行);
 ///   deny/ask:**任一段**匹中即命中(`ls && rm x` 的 rm 段触发 Bash(rm *);否则无害前缀
 ///   让 deny 失效,bypass_permissions 等兜底 allow 的模式照样执行被 deny 的命令)。
@@ -309,7 +311,7 @@ fn matchesBashCompound(pattern: []const u8, mctx: *const MatchContext, args: []c
     // ——或空命令):pattern 对空串判定,与拆段前一致,这类规则不因拆段失效。
     if (segs.len == 0) return matchesBashPattern(pattern, "");
     for (segs) |seg| {
-        const hit = matchesBashPattern(pattern, bp.stripWrappers(seg));
+        const hit = bashSegmentMatches(pattern, seg, mode);
         switch (mode) {
             .allow => if (!hit) return false,
             .deny, .ask => if (hit) return true,
@@ -318,13 +320,36 @@ fn matchesBashCompound(pattern: []const u8, mctx: *const MatchContext, args: []c
     return mode == .allow; // allow:每段都匹中;deny/ask:没有一段匹中
 }
 
+/// 一段命令:先按原文比,再一层层比 wrapper 包着的命令(`timeout 5 nice -n 5 x` 依次比
+/// `nice -n 5 x`、`x`)。看穿哪些 wrapper 由规则种类决定:
+///   良性 wrapper(bash_parser.peelBenignWrapper:timeout、nice、nohup…,按真实选项语法
+///   剥):所有规则都看穿,`Bash(npm test)` 放行 `timeout 30 npm test`;
+///   其余(env、xargs、选项没认出来的):只有 deny/ask 看穿(bash_parser.stripWrapper 启发式,
+///   多匹中是 fail-closed),`env X=1 rm x` 触发 `Bash(rm *)`;allow 只认原文——剥掉的
+///   `env LD_PRELOAD=/tmp/x.so` 换了真正运行的代码,`Bash(git *)` 不能因为剩下 `git status`
+///   就放行。wrapper 本身也是规则可以点名的命令:`Bash(xargs *)` 的 deny 拦 `xargs rm`。
+/// deny/ask 另外照旧比 stripWrappers 一口气剥完的命令(修复前它们唯一的候选):按真实语法
+/// 剥出的命令与它不同时两个都算,deny/ask 只会比以前匹中得多。
+fn bashSegmentMatches(pattern: []const u8, segment: []const u8, mode: RuleMode) bool {
+    const bp = @import("bash_parser.zig");
+    var command = std.mem.trim(u8, segment, " \t");
+    while (true) {
+        if (matchesBashPattern(pattern, command)) return true;
+        command = bp.peelBenignWrapper(command) orelse switch (mode) {
+            .allow => return false,
+            .deny, .ask => bp.stripWrapper(command) orelse break,
+        };
+    }
+    return matchesBashPattern(pattern, bp.stripWrappers(segment));
+}
+
 /// Bash 工具真正交给 shell 的命令:与 tools/bash.zig executeInner(及 monitor.zig)同一取字段
 /// (common.extractJsonArg)+ 同一 JSON unescape。拿转义原文拆段时 `\n`、`\u0026\u0026` 这类
 /// 分隔符不可见(deny 被当单段漏判,allow 被 `echo hi\nrm -rf ~` 骗过),`\"` 又让引号内的
 /// `;` 被误拆。与 bash_readonly.commandFromInput 取同一份字节,但内存不足要报出来(deny/ask
 /// 据此 fail-closed,不能当成"没有命令"),空串与非字符串值也照工具原样交出。
-/// 字段缺失 → null。caller 持有返回值。
-fn commandFromArgs(gpa: std.mem.Allocator, args: []const u8) error{OutOfMemory}!?[]u8 {
+/// 字段缺失 → null。caller 持有返回值。旧 config.json 规则(rule_matcher)同用。
+pub fn commandFromArgs(gpa: std.mem.Allocator, args: []const u8) error{OutOfMemory}!?[]u8 {
     const escaped = tools_common.extractJsonArg(args, "command") orelse return null;
     return try util_json_mod.unescapeString(escaped, gpa);
 }
@@ -1054,11 +1079,60 @@ test "matchesMode: Bash 判不了(内存不足)时 allow 不命中、deny/ask �
     try testing.expect(matchesMode(&allow_echo, &ok, "Bash", &args, .allow));
 }
 
-test "matches: Bash with wrapper stripped before match" {
+test "matchesMode: 良性 wrapper(timeout/nice/nohup…)所有规则都看穿" {
     const r = try parseRule("Bash(npm test)");
-    var mctx = MatchContext{};
-    try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"timeout 30 npm test\"}"));
-    try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"nice -n 5 npm test\"}"));
+    const mctx = MatchContext{};
+    const wrapped = [_][]const u8{
+        "{\"command\":\"timeout 30 npm test\"}",
+        "{\"command\":\"nice -n 5 npm test\"}",
+        "{\"command\":\"timeout -s KILL 30 nice -n 5 nohup npm test\"}",
+        "{\"command\":\"timeout 30 npm test && stdbuf -oL npm test\"}",
+    };
+    for (wrapped) |args| {
+        errdefer std.debug.print("args: {s}\n", .{args});
+        try testing.expect(matchesMode(&r, &mctx, "Bash", args, .allow));
+        try testing.expect(matchesMode(&r, &mctx, "Bash", args, .deny));
+    }
+}
+
+test "matchesMode: env/xargs 包着的命令只有 deny/ask 看穿,allow 不替它放行" {
+    const r = try parseRule("Bash(git *)");
+    const mctx = MatchContext{};
+    const wrapped = [_][]const u8{
+        "{\"command\":\"env LD_PRELOAD=/tmp/x.so git status\"}",
+        "{\"command\":\"env PATH=/tmp/evil:$PATH git status\"}",
+        "{\"command\":\"timeout 5 env GIT_SSH_COMMAND=/tmp/evil.sh git fetch\"}",
+        "{\"command\":\"xargs git add\"}",
+        "{\"command\":\"git status && env LD_PRELOAD=/tmp/x.so git status\"}",
+    };
+    for (wrapped) |args| {
+        errdefer std.debug.print("args: {s}\n", .{args});
+        try testing.expect(!matchesMode(&r, &mctx, "Bash", args, .allow));
+        try testing.expect(matchesMode(&r, &mctx, "Bash", args, .deny));
+        try testing.expect(matchesMode(&r, &mctx, "Bash", args, .ask));
+    }
+    // 良性 wrapper 的参数有展开:剥不动,allow 也不替它放行
+    try testing.expect(!matchesMode(&r, &mctx, "Bash", "{\"command\":\"timeout $T git status\"}", .allow));
+    // deny 按真实语法剥得比启发式准:`-s KILL` 的值不再被当成命令
+    const rm = try parseRule("Bash(rm *)");
+    try testing.expect(matchesMode(&rm, &mctx, "Bash", "{\"command\":\"timeout -s KILL 5 rm x\"}", .deny));
+    // 启发式一口气剥完的命令仍是 deny 的候选:真实语法剥出 `FOO=bar rm x`,启发式剥出 `rm x`
+    try testing.expect(matchesMode(&rm, &mctx, "Bash", "{\"command\":\"timeout 5 FOO=bar rm x\"}", .deny));
+}
+
+test "matchesMode: Bash 规则也按原文比,wrapper 本身可以被点名" {
+    const mctx = MatchContext{};
+    // 只比剥完的命令时,点名 wrapper 的规则永远匹不中
+    const xargs = try parseRule("Bash(xargs *)");
+    try testing.expect(matchesMode(&xargs, &mctx, "Bash", "{\"command\":\"find . | xargs rm\"}", .deny));
+    const env = try parseRule("Bash(env *)");
+    try testing.expect(matchesMode(&env, &mctx, "Bash", "{\"command\":\"env X=1 rm x\"}", .ask));
+    // 中间一层也是候选
+    const nice = try parseRule("Bash(nice *)");
+    try testing.expect(matchesMode(&nice, &mctx, "Bash", "{\"command\":\"timeout 5 nice rm x\"}", .deny));
+    // allow 点名 wrapper:放行的就是写出来的这条命令
+    const server = try parseRule("Bash(nohup ./server *)");
+    try testing.expect(matchesMode(&server, &mctx, "Bash", "{\"command\":\"nohup ./server --port 1\"}", .allow));
 }
 
 test "matchesMode: symlink deny triggers if target matches (任一)" {
