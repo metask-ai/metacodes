@@ -14,7 +14,7 @@ The repository is prepared for review but is **not approved for public visibilit
 - CI definitions scoped to the standalone repository;
 - current-tree and targeted history credential review.
 - repository-owned WorkBuddy release coverage that does not require an external
-  checkout; nine installed-checkout tests remain an explicit external-only gate.
+  checkout; ten installed-checkout tests remain an explicit external-only gate.
 
 ## Blocking owner decisions
 
