@@ -291,14 +291,30 @@ pub const testing = struct {
         return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}", .{ tmpRoot(&rbuf), tag, pid }) catch unreachable;
     }
 
-    /// `<tmpRoot>/<tag>-<pid>-<单调纳秒>`:同一进程内多次调用也互不相同(同一 helper 被
-    /// 多个用例反复 setup 时用这个;只需进程级隔离用 `perPidDir`)。规则同上。
+    /// `<tmpRoot>/<tag>-<pid>-<n>`,n 取自 `nextUniqueNs`(贴着单调纳秒、本进程严格递增):
+    /// 同一进程内多次调用(含多线程)也互不相同(同一 helper 被多个用例反复 setup 时用这个;
+    /// 只需进程级隔离用 `perPidDir`)。规则同上。
     pub fn uniqueDir(buf: []u8, tag: []const u8) [:0]const u8 {
         std.debug.assert(std.mem.startsWith(u8, tag, "cc-zig-"));
         var rbuf: [std.fs.max_path_bytes]u8 = undefined;
         const pid = @import("platform").process.currentPid();
-        const ns = @import("time.zig").nowNs();
-        return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}-{d}", .{ tmpRoot(&rbuf), tag, pid, ns }) catch unreachable;
+        return std.fmt.bufPrintZ(buf, "{s}/{s}-{d}-{d}", .{ tmpRoot(&rbuf), tag, pid, nextUniqueNs() }) catch unreachable;
+    }
+
+    /// 本进程已发出的最大 `uniqueDir` 后缀。
+    var last_unique_ns = std.atomic.Value(u64).init(0);
+
+    /// max(单调纳秒, 上次 + 1),CAS 发布:进程内(跨线程)严格递增,两次调用按构造不相同。
+    /// 裸时钟读数不行——macOS CLOCK_MONOTONIC 分辨率 1µs、Windows QPC 常见 100ns,同一 tick
+    /// 内的调用拿到同一读数(ReleaseSafe 连发两次就撞)。只在 tick 内连发时超前时钟几纳秒,
+    /// 数值量级与时钟读数相同,调用方按老格式留的定长 buffer 不受影响。u64 纳秒够开机 584 年。
+    fn nextUniqueNs() u64 {
+        const now = std.math.lossyCast(u64, @import("time.zig").nowNs());
+        var last = last_unique_ns.load(.monotonic);
+        while (true) {
+            const next = @max(now, last + 1);
+            last = last_unique_ns.cmpxchgWeak(last, next, .monotonic, .monotonic) orelse return next;
+        }
     }
 };
 
@@ -322,6 +338,65 @@ test "testing.perPidDir / uniqueDir: root + tag + pid, forward slashes, NUL-term
     const second = testing.uniqueDir(&b2, "cc-zig-fs-selftest");
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expect(testing.isFixturePath(first, &rbuf));
+}
+
+test "testing.uniqueDir: 10k back-to-back calls never repeat a path, even inside one clock tick" {
+    // macOS CLOCK_MONOTONIC 只有 1µs 分辨率(Windows QPC 常见 100ns):ReleaseSafe 下一个 tick
+    // 内能连发好几次,纯时钟后缀会重复。唯一性必须按构造成立,不能指望时钟跳得够快。
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    const calls = 10_000;
+    try seen.ensureTotalCapacity(arena, calls);
+    var buf: [512]u8 = undefined;
+    var prev: u64 = 0;
+    for (0..calls) |i| {
+        const d = testing.uniqueDir(&buf, "cc-zig-fs-unique-burst");
+        if (seen.getOrPutAssumeCapacity(try arena.dupe(u8, d)).found_existing) {
+            std.debug.print("uniqueDir repeated {s} on call {d}\n", .{ d, i });
+            return error.TestUnexpectedResult;
+        }
+        // 后缀严格递增,且超前时钟至多 1ns/次(末尾断言):量级不变,调用方定长 buffer 够用。
+        const n = try std.fmt.parseInt(u64, d[std.mem.lastIndexOfScalar(u8, d, '-').? + 1 ..], 10);
+        try std.testing.expect(n > prev);
+        prev = n;
+    }
+    const clock_after: u64 = @intCast(@import("time.zig").nowNs());
+    try std.testing.expect(prev <= clock_after + calls);
+}
+
+test "testing.uniqueDir: concurrent callers never get the same path" {
+    const threads = 4;
+    const per_thread = 2_500;
+    const gpa = std.testing.allocator;
+    const bufs = try gpa.alloc([512]u8, threads * per_thread);
+    defer gpa.free(bufs);
+    const paths = try gpa.alloc([:0]const u8, threads * per_thread);
+    defer gpa.free(paths);
+    const Racer = struct {
+        fn run(out_bufs: [][512]u8, out_paths: [][:0]const u8) void {
+            for (out_bufs, out_paths) |*b, *p| p.* = testing.uniqueDir(b, "cc-zig-fs-unique-race");
+        }
+    };
+    {
+        var handles: [threads]std.Thread = undefined;
+        var spawned: usize = 0;
+        defer for (handles[0..spawned]) |h| h.join(); // spawn 中途失败也先收齐已起的线程
+        while (spawned < threads) : (spawned += 1) {
+            const lo = spawned * per_thread;
+            handles[spawned] = try std.Thread.spawn(.{}, Racer.run, .{ bufs[lo..][0..per_thread], paths[lo..][0..per_thread] });
+        }
+    }
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+    try seen.ensureTotalCapacity(gpa, threads * per_thread);
+    for (paths) |p| {
+        if (seen.getOrPutAssumeCapacity(p).found_existing) {
+            std.debug.print("uniqueDir handed {s} to two callers\n", .{p});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "testing.isFixturePath: refuses anything outside <tmpRoot>/cc-zig-" {

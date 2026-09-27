@@ -68,6 +68,42 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `util/file_lock` could let two contenders hold one lock after its holder
+  died. Both judged the dead holder's record stale; the first renamed it away
+  and created a fresh lock, and the second's rename then moved that fresh
+  lock away instead and created its own, so both went on to rewrite the
+  shared file. Takeover is now single-winner per stale record: a contender
+  first creates that record's claim file
+  (`<path>.lock.claim.<fingerprint>.<generation>`, `O_EXCL`) and deletes the
+  lock only if it still holds the record it judged stale, so a fresh lock is
+  never moved or deleted. A claimant that dies mid-takeover leaves a claim
+  that goes stale after `stale_ms`, and the next generation takes over. The
+  lock guards the swarm mailbox and team config, the task-list mirror,
+  provider config, transcripts and the TinyKG migration lock.
+- The task-list mirror's temporary file was named from the monotonic clock
+  alone (`<path>.tmp.<ns>`) and is created with `O_EXCL` on every write.
+  macOS `CLOCK_MONOTONIC` ticks in 1 µs (Windows QPC commonly in 100 ns), so
+  two writes in one tick would get the same name. It is now
+  `<path>.tmp.<pid>.<ns>.<seq>` with a process-wide atomic sequence. The
+  mirror lock already serializes its writers and no failure was observed;
+  the name no longer depends on that lock to stay unique.
+- Three maintainer rule-control sensors had drifted from the code they read
+  and failed closed on a correct tree. The TinyKG bundle rule still required
+  `metacodes.tinykg-bundle/v1` after the bundle moved to v2; it now reads the
+  schema the bundle builder writes (`stage_tinykg_binary.BUNDLE_SCHEMA`). The
+  paid-budget lock and treatment-resume rules looked for `O_NOFOLLOW` and the
+  reattestation call where refactors had moved them into shared helpers
+  (`model.open_nofollow`, `_validate_checkpoint_rows`); they now check each
+  hop. `zig build test` runs the rule-control suite (`test:rule-control`),
+  which observes every rule on the checked-in tree, so this kind of drift
+  fails its own pull request.
+- The maintainer rule-control gate also failed closed on a skipped test: the
+  paid-budget rule's feedback runs `scripts/eval/workbuddy_release_suite.py`,
+  whose roster of WorkBuddy tests that need an external checkout missed the
+  one #110 added. The roster lists all ten again, and `zig build test` now
+  checks that it is exactly the adapter tests that read
+  `METACODES_WORKBUDDY_CHECKOUT` (`roster_violations`), where the old check
+  only required the listed names to exist.
 - Bash auto-allow no longer runs writes without a prompt. The read-only
   auto-allow (default, acceptEdits and auto mode) keyed on the first word of
   the whole command, so `cd / && rm -rf *`, `echo x > ~/.bashrc`,

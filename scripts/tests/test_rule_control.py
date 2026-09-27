@@ -15,6 +15,14 @@ from scripts import rule_control
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+def rewrite(path: Path, old: str, new: str) -> None:
+    """Replace the single ``old`` in ``path``; a mutation that edits nothing is a test bug."""
+    text = path.read_text(encoding="utf-8")
+    if text.count(old) != 1:
+        raise AssertionError(f"{path.name}: expected exactly one {old!r}, found {text.count(old)}")
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+
 class DeclarationSensorTests(unittest.TestCase):
     def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path, dict]:
         temporary = tempfile.TemporaryDirectory()
@@ -708,7 +716,7 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         )
         (root / "vendor/tinykg").mkdir(parents=True, exist_ok=True)
         (root / "vendor/tinykg/manifest.json").write_text(
-            '{"bundle_schema":"metacodes.tinykg-bundle/v1",'
+            '{"bundle_schema":"metacodes.tinykg-bundle/v2",'
             '"source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
             '"build":{"optimize":"ReleaseSafe","strip": true},'
             '"artifacts":[{"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
@@ -716,6 +724,7 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             encoding="utf-8",
         )
         (root / "scripts/stage_tinykg_binary.py").write_text(
+            'BUNDLE_SCHEMA = "metacodes.tinykg-bundle/v2"\n'
             "if artifact.sha256 != expected_sha256: fail()\n"
             "identity = validate_bundle_bytes(binary, artifact, contract)\n"
             "if target_family not in artifact.targets: fail()\n"
@@ -968,6 +977,80 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         observation = rule_control.observe_build_test_throughput(root)
         self.assertFalse(observation.sensor_ok)
         self.assertIn("reproducible_shipped_artifacts", observation.missing_declarations)
+
+    def test_stale_bundle_schema_is_observed(self) -> None:
+        """v1 is what this sensor once hard-coded; the checked-in bundle moved on."""
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        rewrite(
+            root / "vendor/tinykg/manifest.json",
+            '"metacodes.tinykg-bundle/v2"',
+            '"metacodes.tinykg-bundle/v1"',
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertEqual(["reproducible_shipped_artifacts"], observation.missing_declarations)
+        self.assertTrue(
+            any(
+                "'metacodes.tinykg-bundle/v1'" in error and "'metacodes.tinykg-bundle/v2'" in error
+                for error in observation.errors
+            ),
+            observation.errors,
+        )
+
+    def test_current_schema_text_outside_the_schema_field_is_not_a_pin(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        rewrite(
+            root / "vendor/tinykg/manifest.json",
+            '{"bundle_schema":"metacodes.tinykg-bundle/v2",',
+            '{"bundle_schema":"metacodes.tinykg-bundle/v1","note":"metacodes.tinykg-bundle/v2",',
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("reproducible_shipped_artifacts", observation.missing_declarations)
+
+    def test_bundle_schema_follows_the_staging_authority(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        rewrite(
+            root / "scripts/stage_tinykg_binary.py",
+            'BUNDLE_SCHEMA = "metacodes.tinykg-bundle/v2"',
+            'BUNDLE_SCHEMA = "metacodes.tinykg-bundle/v3"',
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("reproducible_shipped_artifacts", observation.missing_declarations)
+        # A manifest that follows the authority closes the rule again, so the
+        # sensor keeps no schema of its own.
+        rewrite(
+            root / "vendor/tinykg/manifest.json",
+            '"metacodes.tinykg-bundle/v2"',
+            '"metacodes.tinykg-bundle/v3"',
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+
+    def test_unreadable_bundle_schema_authority_fails_closed(self) -> None:
+        authority = 'BUNDLE_SCHEMA = "metacodes.tinykg-bundle/v2"'
+        for replacement in (
+            "",
+            'BUNDLE_SCHEMA = "metacodes.tinykg-bundle/" + "v2"',
+            authority + '\nBUNDLE_SCHEMA = "metacodes.tinykg-bundle/v3"',
+        ):
+            with self.subTest(replacement=replacement):
+                temporary, root = self.make_repo()
+                self.addCleanup(temporary.cleanup)
+                rewrite(root / "scripts/stage_tinykg_binary.py", authority, replacement)
+                observation = rule_control.observe_build_test_throughput(root)
+                self.assertFalse(observation.sensor_ok)
+                self.assertIn(
+                    "reproducible_shipped_artifacts", observation.missing_declarations
+                )
+                self.assertTrue(
+                    any("cannot read one BUNDLE_SCHEMA" in error for error in observation.errors),
+                    observation.errors,
+                )
 
     def test_time_bearing_formal_fingerprint_is_observed(self) -> None:
         temporary, root = self.make_repo()
@@ -1315,6 +1398,38 @@ class TreatmentActivationSensorTests(unittest.TestCase):
             observation.missing_declarations,
         )
 
+    def test_resume_loader_that_drops_the_verifier_is_observed(self) -> None:
+        """An omitted keyword defaults the verifier to None: no call disappears."""
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        rewrite(
+            root / "scripts/eval/paired_runner.py",
+            "        treatment_verifier=treatment_verifier,\n",
+            "",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertEqual(
+            ["resume_reverification_before_network"], observation.missing_declarations
+        )
+
+    def test_resume_call_site_without_a_verifier_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        rewrite(
+            root / "scripts/eval/paired_runner.py",
+            "            treatment_verifier=(\n"
+            '                Path(str(tinykg_identity["path"])),\n'
+            '                str(tinykg_identity["sha256"]),\n'
+            "            ),\n",
+            "            treatment_verifier=None,\n",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertEqual(
+            ["resume_reverification_before_network"], observation.missing_declarations
+        )
+
     def test_promotion_without_raw_reattestation_is_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
@@ -1475,6 +1590,7 @@ class MemoryLocalStoreIsolationSensorTests(unittest.TestCase):
 class PaidBudgetJournalSensorTests(unittest.TestCase):
     RELATIVE_SOURCES = (
         "scripts/eval/memory_budget_journal.py",
+        "scripts/eval/model.py",
         "scripts/eval/memory_agent_runtime.py",
         "scripts/eval/memory_agent_runtime_pilot.py",
         "scripts/eval/paired_runner.py",
@@ -1828,6 +1944,50 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
             observation.missing_declarations,
         )
 
+    def test_lock_opened_without_nofollow_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        rewrite(
+            root / "scripts/eval/memory_budget_journal.py",
+            "fd = open_nofollow(name, flags, 0o600, dir_fd=self._dir_fd)",
+            "fd = os.open(name, flags, 0o600, dir_fd=self._dir_fd)",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertEqual(
+            ["exclusive_lock_precedes_credentials_and_provider"],
+            observation.missing_declarations,
+        )
+
+    def test_nofollow_helper_that_stops_setting_the_flag_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        rewrite(root / "scripts/eval/model.py", "flags |= os.O_NOFOLLOW", "flags |= 0")
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertEqual(
+            ["exclusive_lock_precedes_credentials_and_provider"],
+            observation.missing_declarations,
+        )
+
+    def test_module_local_nofollow_is_not_the_shipped_helper(self) -> None:
+        """A later module-level def rebinds the imported name the lock opener calls."""
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        rewrite(
+            root / "scripts/eval/memory_budget_journal.py",
+            "\n\nclass BudgetJournal:",
+            "\n\ndef open_nofollow(path, flags, mode=0o600, *, dir_fd=None):\n"
+            "    return os.open(path, flags, mode, dir_fd=dir_fd)\n"
+            "\n\nclass BudgetJournal:",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertEqual(
+            ["exclusive_lock_precedes_credentials_and_provider"],
+            observation.missing_declarations,
+        )
+
 
 class FeedbackExecutionTests(unittest.TestCase):
     def test_default_feedback_environment_binds_verified_native_bundle(self) -> None:
@@ -2022,6 +2182,24 @@ class DaemonTransportSensorTests(unittest.TestCase):
                 "axiom escape : False\ntheorem unsound : False := by admit\ntheorem deferred : True := by sorry\n"
             ),
         )
+
+
+class RepositoryObservationTests(unittest.TestCase):
+    def test_every_rule_sensor_closes_on_the_checked_in_tree(self) -> None:
+        """Fixtures are written to match their sensor, so they cannot notice the
+        observed code moving away from it; three sensors drifted that way.
+        Observing the real tree here lets `zig build test` fail the change that
+        strands a sensor instead of the next maintainer rule-control run."""
+        manifest_path = PROJECT_ROOT / rule_control.DEFAULT_MANIFEST
+        rules = rule_control.require_schema(
+            rule_control.load_json(manifest_path), manifest_path
+        )["rules"]
+        self.assertTrue(rules)
+        for rule in rules:
+            with self.subTest(rule=rule["id"]):
+                observation = rule_control.observe_rule(PROJECT_ROOT, rule)
+                self.assertTrue(observation.sensor_ok, observation.errors)
+                self.assertEqual(observation.declared, observation.covered)
 
 
 class TopologyTests(unittest.TestCase):
