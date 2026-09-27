@@ -515,8 +515,11 @@ test "L2 liveness ⑨: 短文本后零字节沉默超过收头上限,正文上�
 }
 
 /// 模拟 REPL 的 Ctrl+C 链路:SIGINT handler 置标志,watcher 的下一个 tick 代它 provider.cancel。
-fn cancelAfter(signal: *cc.util_abort.AbortSignal, client: *cc.client_mod.Client, delay_ms: u64) void {
-    cc.util_time.sleepMs(delay_ms);
+/// 取消时刻是 util_time 时钟上的绝对时刻 `at_ms`,不是一次 Sleep 的名义时长:Windows 的 Sleep
+/// 在时钟中断 tick 上服务,可能早醒最多一个 tick(默认 15.625ms),醒早了就补睡剩余。
+fn cancelAt(signal: *cc.util_abort.AbortSignal, client: *cc.client_mod.Client, at_ms: i64) void {
+    var now = cc.util_time.nowMs();
+    while (now < at_ms) : (now = cc.util_time.nowMs()) cc.util_time.sleepMs(@intCast(at_ms - now));
     signal.abort(.user_ctrl_c);
     client.provider().cancel(signal);
 }
@@ -537,7 +540,9 @@ test "L2 liveness ⑩: 正文阶段用户取消(abort + provider.cancel)→ abor
     clearLastError();
 
     var signal = cc.util_abort.AbortSignal.init();
-    const canceller = try std.Thread.spawn(.{}, cancelAfter, .{ &signal, &client, 400 });
+    // t0 取在起取消线程之前,取消时刻 t0 + 400 与 elapsed 同一时钟:下界 elapsed >= 400 由构造成立。
+    const t0 = cc.util_time.nowMs();
+    const canceller = try std.Thread.spawn(.{}, cancelAt, .{ &signal, &client, t0 + 400 });
     defer canceller.join();
 
     var conv = cc.conversation.Conversation.init(a);
@@ -548,7 +553,6 @@ test "L2 liveness ⑩: 正文阶段用户取消(abort + provider.cancel)→ abor
     const defs: []const cc.json_mod.ToolDefinition = &.{};
     var render = cc.writer_backend.WriterBackend.initNull();
     const be = render.backend();
-    const t0 = cc.util_time.nowMs();
     const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
         .max_turns = 1,
         .abort = &signal,

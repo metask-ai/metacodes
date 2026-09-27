@@ -158,26 +158,30 @@ test "L2 jev: a stalled service costs one deadline, then the breaker fails fast"
     // race needs a real threaded Io.
     var io_runtime = std.Io.Threaded.init(a, .{});
     defer io_runtime.deinit();
+    const io = io_runtime.io();
     var srv = try harness.MockServer.startCassetteSilent(&.{ANSWER_BODY}, 0, 0);
     defer srv.stop();
     var origin_buf: [64]u8 = undefined;
-    var client = try jev.Client.init(a, io_runtime.io(), .{
+    var client = try jev.Client.init(a, io, .{
         .origin = try originFor(&origin_buf, srv),
         .timeout_ms = 300,
     });
     defer client.deinit();
 
-    const started = cc.util_time.nowMs();
+    // Timed on the awake clock the deadline is defined on, so the lower
+    // bound is exact on every platform; on macOS util_time reads a different
+    // clock (CLOCK_MONOTONIC, where the awake clock is CLOCK_UPTIME_RAW).
+    const started: std.Io.Clock.Timestamp = .now(io, .awake);
     try std.testing.expectError(error.Unavailable, client.ask(a, null, "state", &questions));
-    const waited = cc.util_time.nowMs() - started;
+    const waited = started.untilNow(io).raw.toMilliseconds();
     try std.testing.expect(waited >= 300);
     try std.testing.expect(waited < 2_000);
     try std.testing.expectEqual(jev.BREAKER_INITIAL_MS, client.breaker_backoff_ms);
 
     // Breaker open: no second connection, no second deadline.
-    const second_started = cc.util_time.nowMs();
+    const second_started: std.Io.Clock.Timestamp = .now(io, .awake);
     try std.testing.expectError(error.Unavailable, client.ask(a, null, "state", &questions));
-    try std.testing.expect(cc.util_time.nowMs() - second_started < 100);
+    try std.testing.expect(second_started.untilNow(io).raw.toMilliseconds() < 100);
     try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
 }
 
