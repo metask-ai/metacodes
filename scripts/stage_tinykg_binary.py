@@ -25,8 +25,11 @@ from typing import Mapping, Sequence
 
 
 CONTRACT_SCHEMA = "metacodes.tinykg-binary/v1"
-BUNDLE_SCHEMAS = {"metacodes.tinykg-bundle/v1", "metacodes.tinykg-bundle/v2"}
-BUNDLE_SCHEMA = "metacodes.tinykg-bundle/v1"
+# The schema build_tinykg_bundle.py writes and the checked-in bundle must carry
+# (scripts/rule_control.py reads it from here). Staging still accepts the
+# CLI-only v1 layout, whose artifacts are implicitly role "cli".
+BUNDLE_SCHEMA = "metacodes.tinykg-bundle/v2"
+BUNDLE_SCHEMAS = {"metacodes.tinykg-bundle/v1", BUNDLE_SCHEMA}
 RECEIPT_SCHEMA = "metacodes.tinykg-binary-receipt/v2"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
