@@ -68,6 +68,25 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `util/file_lock` could let two contenders hold one lock after its holder
+  died. Both judged the dead holder's record stale; the first renamed it away
+  and created a fresh lock, and the second's rename then moved that fresh
+  lock away instead and created its own, so both went on to rewrite the
+  shared file. Takeover is now single-winner per stale record: a contender
+  first creates that record's claim file
+  (`<path>.lock.claim.<fingerprint>.<generation>`, `O_EXCL`) and deletes the
+  lock only if it still holds the record it judged stale, so a fresh lock is
+  never moved or deleted. A claimant that dies mid-takeover leaves a claim
+  that goes stale after `stale_ms`, and the next generation takes over. The
+  lock guards the swarm mailbox and team config, the task-list mirror,
+  provider config, transcripts and the TinyKG migration lock.
+- The task-list mirror's temporary file was named from the monotonic clock
+  alone (`<path>.tmp.<ns>`) and is created with `O_EXCL` on every write.
+  macOS `CLOCK_MONOTONIC` ticks in 1 µs (Windows QPC commonly in 100 ns), so
+  two writes in one tick would get the same name. It is now
+  `<path>.tmp.<pid>.<ns>.<seq>` with a process-wide atomic sequence. The
+  mirror lock already serializes its writers and no failure was observed;
+  the name no longer depends on that lock to stay unique.
 - Three maintainer rule-control sensors had drifted from the code they read
   and failed closed on a correct tree. The TinyKG bundle rule still required
   `metacodes.tinykg-bundle/v1` after the bundle moved to v2; it now reads the
