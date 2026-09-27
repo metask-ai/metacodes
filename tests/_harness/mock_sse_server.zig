@@ -288,12 +288,23 @@ pub const MockServer = struct {
         self.gate_next_response.store(true, .release);
     }
 
+    /// `waitUntilResponseGated` 的上限:服务线程要先 accept、读完请求才进闸门,满载 CI 上给足余量。
+    const RESPONSE_GATE_WAIT_MS: i64 = 10_000;
+
+    /// 等服务线程进入 `gateNextResponse` 设下的闸门。上限按 awake 时钟计,不按自旋次数:
+    /// 一百万次 `Thread.yield()` 在空闲的 macOS 上只要 ~0.1 s,本核没有其它就绪线程时
+    /// Windows 的 yield 也立即返回;服务线程还没读完请求就判超时(2026-09-27 PR #167 的
+    /// Windows Gates:swarm_tools_test SW2 F6 在 0.67 s 时 ResponseGateTimeout)。
     pub fn waitUntilResponseGated(self: *MockServer) !void {
-        for (0..1_000_000) |_| {
-            if (self.response_gate_entered.load(.acquire)) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{
+            .raw = .fromMilliseconds(RESPONSE_GATE_WAIT_MS),
+            .clock = .awake,
+        });
+        while (!self.response_gate_entered.load(.acquire)) {
+            if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.ResponseGateTimeout;
             std.Thread.yield() catch {};
         }
-        return error.ResponseGateTimeout;
     }
 
     pub fn releaseGatedResponse(self: *MockServer) void {
@@ -798,6 +809,31 @@ test "MockServer: request ledger reports overflow without overwriting entries" {
         "{\"index\":0}",
         srv.requestAt(0).?.body(),
     );
+}
+
+test "MockServer: waitUntilResponseGated is bounded by wall time, not by a spin count" {
+    // 请求在开始等待半秒后才到闸门:一百万次 yield 在空闲的 macOS 上只要 ~0.1 s,
+    // 按自旋次数计的上限会先放弃。
+    const body = "data: {\"type\":\"message_stop\"}\n\n";
+    var srv = try MockServer.start(body, 0);
+    defer srv.stop();
+    srv.gateNextResponse();
+
+    const Client = struct {
+        fn run(port: u16, got_reply: *bool) void {
+            psync.sleepMs(500);
+            const reply = clientRoundtrip(std.heap.page_allocator, port, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", null) catch return;
+            defer std.heap.page_allocator.free(reply);
+            got_reply.* = std.mem.indexOf(u8, reply, "message_stop") != null;
+        }
+    };
+    var got_reply = false;
+    const client = try std.Thread.spawn(.{}, Client.run, .{ srv.port, &got_reply });
+    const gated = srv.waitUntilResponseGated();
+    srv.releaseGatedResponse();
+    client.join();
+    try gated;
+    try std.testing.expect(got_reply);
 }
 
 test "MockServer: flaky closed requests remain in the ledger" {
