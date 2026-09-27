@@ -68,6 +68,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Three maintainer rule-control sensors had drifted from the code they read
+  and failed closed on a correct tree. The TinyKG bundle rule still required
+  `metacodes.tinykg-bundle/v1` after the bundle moved to v2; it now reads the
+  schema the bundle builder writes (`stage_tinykg_binary.BUNDLE_SCHEMA`). The
+  paid-budget lock and treatment-resume rules looked for `O_NOFOLLOW` and the
+  reattestation call where refactors had moved them into shared helpers
+  (`model.open_nofollow`, `_validate_checkpoint_rows`); they now check each
+  hop. `zig build test` runs the rule-control suite (`test:rule-control`),
+  which observes every rule on the checked-in tree, so this kind of drift
+  fails its own pull request.
+- The maintainer rule-control gate also failed closed on a skipped test: the
+  paid-budget rule's feedback runs `scripts/eval/workbuddy_release_suite.py`,
+  whose roster of WorkBuddy tests that need an external checkout missed the
+  one #110 added. The roster lists all ten again, and `zig build test` now
+  checks that it is exactly the adapter tests that read
+  `METACODES_WORKBUDDY_CHECKOUT` (`roster_violations`), where the old check
+  only required the listed names to exist.
 - Bash auto-allow no longer runs writes without a prompt. The read-only
   auto-allow (default, acceptEdits and auto mode) keyed on the first word of
   the whole command, so `cd / && rm -rf *`, `echo x > ~/.bashrc`,
