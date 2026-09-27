@@ -797,8 +797,9 @@ test "TaskStore: mirror 开启时 updateStatus(t.id) 不悬垂(reload 释放旧 
 }
 
 test "TaskStore: mirror 临时文件名相邻调用不重名(EXCL 创建不靠时钟分辨率)" {
-    // 先连调、后比较(同 util/fs uniqueDir 自测):只拼 nowNs() 的名字在 macOS(1 µs 一跳)
-    // 上相邻调用大半同名,同名的第二个写入方会 MirrorOpenFailed。
+    // 先连调、后比较:循环体只放调用本身,相邻两次才会落进同一个时钟刻度(Debug 下一次调用
+    // 就近 1 µs,边调边查重会把读数错开)。只拼 nowNs() 的名字在 macOS(1 µs 一跳)上相邻调用
+    // 大半同名,同名的第二个写入方会 MirrorOpenFailed。
     var slots: [256][128]u8 = undefined;
     var names: [slots.len][:0]const u8 = undefined;
     for (&slots, &names) |*slot, *name| name.* = try mirrorTmpPath(slot, "/mirror/tasks.json");
