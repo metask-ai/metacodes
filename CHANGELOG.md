@@ -96,32 +96,16 @@ status, compatibility boundaries, and entry points are defined by
   shell policy uses; it now takes effect only where that setting allows it.
   A sandbox profile that cannot be written no longer makes Bash or Monitor
   run the command unsandboxed; the call fails instead.
-- Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
-  `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
-  `firstLine` backed off while the last kept byte was a continuation byte,
-  which strands the lead byte of a character cut at the limit: a CJK memory
-  reached the provider with a trailing U+FFFD and the scoped recall receipt
-  hashed different bytes than the provider received. All three use
-  `util/utf8.prefixEnd`.
-- Paid memory pilots could not run a TinyKG arm since TinyKG storage v3: an
-  online (read-write) rollout store's sibling daemon-ownership lock
-  (`<store>.tinykg-daemon.lock`) was outside the production Seatbelt
-  profile, so every TinyKG command in the child got `PermissionDenied`, KG
-  degraded, and treatment activation refused the arm. The carve-out that
-  sealed offline stores already had now covers read-write stores as one
-  literal path. The memory runner and replay also split JSONL on LF only:
-  `str.splitlines()` cut records at U+2028/U+0085 that stay raw inside
-  LongMemEval chat text.
 - Bash `deny` and `ask` permission rules now match a compound command when
   any segment matches (after wrapper stripping): `Bash(rm *)` catches
   `ls && rm x`, `ls; rm x`, `ls | rm x` and a newline-separated `rm x`. They
   used to require every segment to match, like `allow`, so a harmless prefix
-  defeated the rule and the command ran under `bypassPermissions`, and under
-  `default` whenever its first word was read-only. `allow` rules still need
-  every segment (`permission/rule_spec.zig matchesBashCompound`). Rules are
-  now matched against the command the shell receives (the Bash tool's own
-  field lookup and JSON unescape), so `\n`, `\u0026\u0026` and `\"` are real
-  separators and quotes: `Bash(npm *)` no longer auto-allows
+  defeated the rule: `bypassPermissions` and `autoAllowBashIfSandboxed` ran
+  the command, and `default` asked instead of denying. `allow` rules still
+  need every segment (`permission/rule_spec.zig matchesBashCompound`). Rules
+  are now matched against the command the shell receives (the Bash tool's
+  own field lookup and JSON unescape), so `\n`, `\u0026\u0026` and `\"`
+  are real separators and quotes: `Bash(npm *)` no longer auto-allows
   `npm test\nrm x`. Heredoc bodies are not parsed, so each of their lines
   is a segment of its own.
 - Legacy `permission_rules` in `~/.metacodes/config.json`
@@ -166,6 +150,22 @@ status, compatibility boundaries, and entry points are defined by
   still split at the `&`, the way dash reads them (a background job, then a
   command that is only a redirection); under bash they redirect both
   streams, and the extra `> file` segment only makes an `allow` rule ask.
+- Injected memory lines are cut on a UTF-8 boundary. Scoped recall's 320-byte
+  `firstLine`, the KG startup summary's `firstLineTrunc` and the REPL's
+  `firstLine` backed off while the last kept byte was a continuation byte,
+  which strands the lead byte of a character cut at the limit: a CJK memory
+  reached the provider with a trailing U+FFFD and the scoped recall receipt
+  hashed different bytes than the provider received. All three use
+  `util/utf8.prefixEnd`.
+- Paid memory pilots could not run a TinyKG arm since TinyKG storage v3: an
+  online (read-write) rollout store's sibling daemon-ownership lock
+  (`<store>.tinykg-daemon.lock`) was outside the production Seatbelt
+  profile, so every TinyKG command in the child got `PermissionDenied`, KG
+  degraded, and treatment activation refused the arm. The carve-out that
+  sealed offline stores already had now covers read-write stores as one
+  literal path. The memory runner and replay also split JSONL on LF only:
+  `str.splitlines()` cut records at U+2028/U+0085 that stay raw inside
+  LongMemEval chat text.
 - A Ctrl+C/Esc while the provider stream read was blocked was reported as a
   model API error: `provider.cancel` shuts the socket, the read wakes with
   `ReadFailed`, and the stream clients classified that before consulting the
