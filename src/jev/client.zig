@@ -280,19 +280,11 @@ pub const Client = struct {
     }
 
     /// Returns once `timeout_ms` has passed on the awake clock, so a stalled
-    /// service always gets the whole deadline. One sleep does not promise
-    /// that: on Windows `std.Io.Threaded` turns even an awake-clock deadline
-    /// into a relative NT wait, which the kernel services on clock-interrupt
-    /// ticks and can end up to one tick (15.625 ms by default) early. Each
-    /// wait is a cancelation point.
+    /// service always gets the whole deadline. One sleep can end up to a
+    /// timer tick early on Windows (see `util_time.sleepAtLeast`). Each wait
+    /// is a cancelation point.
     fn deadlineTask(io: std.Io, timeout_ms: u32) std.Io.Cancelable!void {
-        const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{
-            .raw = .fromMilliseconds(@as(i64, timeout_ms)),
-            .clock = .awake,
-        });
-        while (std.Io.Clock.Timestamp.now(io, deadline.clock).compare(.lt, deadline)) {
-            try deadline.wait(io);
-        }
+        return util_time.sleepAtLeast(io, .{ .raw = .fromMilliseconds(@as(i64, timeout_ms)), .clock = .awake });
     }
 
     fn abortTask(io: std.Io, signal: *const AbortSignal) std.Io.Cancelable!void {
@@ -350,59 +342,14 @@ const probe_question = [_]question.Named{.{ .name = "q", .question = .{ .boolean
     .when_false = "f",
 } } }};
 
-/// A virtual awake clock whose sleeps behave like an NT relative wait, which
-/// is what `std.Io.Threaded` issues on Windows even for a deadline: the wait
-/// is due at the interrupt time of the last clock tick plus the interval,
-/// and timers expire only on ticks, so a sleep that starts late in a tick
-/// can end up to one tick before the requested time.
-const TickServicedClock = struct {
-    now_ns: i96,
-    sleeps: u32 = 0,
-    /// A pending cancelation request; as with `std.Io`, only the next wait
-    /// observes it.
-    cancel_requested: bool = false,
-
-    /// The default Windows clock interrupt period (64 Hz).
-    const tick_ns: i96 = 15_625_000;
-
-    fn io(clock: *TickServicedClock, vtable: *std.Io.VTable) std.Io {
-        vtable.* = std.Io.failing.vtable.*;
-        vtable.now = now;
-        vtable.sleep = sleep;
-        return .{ .userdata = clock, .vtable = vtable };
-    }
-
-    fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
-        const self: *TickServicedClock = @ptrCast(@alignCast(userdata));
-        std.debug.assert(clock == .awake);
-        return .fromNanoseconds(self.now_ns);
-    }
-
-    fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
-        const self: *TickServicedClock = @ptrCast(@alignCast(userdata));
-        self.sleeps += 1;
-        if (self.cancel_requested) {
-            self.cancel_requested = false;
-            return error.Canceled;
-        }
-        const interval: i96 = switch (timeout) {
-            .none => unreachable,
-            .duration => |d| d.raw.nanoseconds,
-            .deadline => |d| d.raw.nanoseconds - self.now_ns,
-        };
-        // NT waits at least 100 ns, so the clock always advances.
-        const due = @divFloor(self.now_ns, tick_ns) * tick_ns + @max(interval, 100);
-        self.now_ns = (std.math.divCeil(i96, due, tick_ns) catch unreachable) * tick_ns;
-    }
-};
+const TickServicedClock = @import("platform").test_support.TickServicedClock;
 
 test "the deadline outlasts a sleep that wakes up to one timer tick early" {
     // 15 ms into a tick, a 300 ms wait is due at 300 ms and expires on the
     // 312.5 ms tick: 297.5 ms after it started.
     var clock: TickServicedClock = .{ .now_ns = 15 * std.time.ns_per_ms };
-    var vtable: std.Io.VTable = undefined;
     const started = clock.now_ns;
-    try Client.deadlineTask(clock.io(&vtable), 300);
+    try Client.deadlineTask(clock.io(), 300);
     try testing.expect(clock.now_ns - started >= 300 * std.time.ns_per_ms);
     // The first wait did end early; a second one closed the gap.
     try testing.expectEqual(@as(u32, 2), clock.sleeps);
@@ -410,8 +357,7 @@ test "the deadline outlasts a sleep that wakes up to one timer tick early" {
 
 test "a canceled deadline returns at the first wait" {
     var clock: TickServicedClock = .{ .now_ns = 0, .cancel_requested = true };
-    var vtable: std.Io.VTable = undefined;
-    try testing.expectError(error.Canceled, Client.deadlineTask(clock.io(&vtable), 300));
+    try testing.expectError(error.Canceled, Client.deadlineTask(clock.io(), 300));
     try testing.expectEqual(@as(u32, 1), clock.sleeps);
 }
 
