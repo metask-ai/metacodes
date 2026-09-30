@@ -3,6 +3,7 @@ probes, on fixtures and throwaway repositories (doc/RELEASE_AUTOMATION_DESIGN.md
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import subprocess
@@ -413,6 +414,103 @@ class OpenPrFailureTest(unittest.TestCase):
         with mock.patch.object(rc, "run", side_effect=AssertionError("no command may run")), self.assertRaisesRegex(rc.CutError, "nothing was pushed"):
             rc.open_pr(self.root, "release/0.2.0", "release: 0.2.0", "x" * (rc.PR_BODY_LIMIT + 1), "release", dry_run=False)
         self.assertEqual(_git("rev-parse", "--abbrev-ref", "HEAD", cwd=self.root), "main")
+
+
+# A stand-in for `gh api` with GitHub's answers for one repository and gh's
+# error behaviour: the error body on stdout, the status on stderr, exit 1.
+FAKE_GH = r'''#!/usr/bin/env python3
+import json, os, sys
+state = json.load(open(os.environ["FAKE_GH_STATE"], encoding="utf-8"))
+argv = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(argv) + "\n")
+assert argv[0] == "api", argv
+path, rest, fields, jq = argv[1], argv[2:], {}, None
+while rest:
+    flag, value, rest = rest[0], rest[1], rest[2:]
+    if flag == "-f":
+        key, _, val = value.partition("=")
+        fields[key] = val
+    elif flag == "--jq":
+        jq = value
+    else:
+        sys.exit("unexpected flag " + flag)
+assert path.startswith("repos/o/r/"), path
+path = path[len("repos/o/r/"):]
+tag = state["tag"]  # None or {"name", "type": "tag"|"commit", "sha", "peeled"}
+
+def not_found():
+    print(json.dumps({"message": "Not Found", "status": "404"}))
+    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+    sys.exit(1)
+
+if path.startswith("git/matching-refs/tags/"):
+    name = path[len("git/matching-refs/tags/"):]
+    assert jq == '.[] | select(.ref == "refs/tags/%s") | "\\(.object.type) \\(.object.sha)"' % name, jq
+    if tag and tag["name"] == name:
+        print(tag["type"] + " " + tag["sha"])
+elif path.startswith("git/ref/tags/"):
+    if not tag or path != "git/ref/tags/" + tag["name"]:
+        not_found()
+    print(tag["sha"] if jq == ".object.sha" else tag["type"])
+elif path.startswith("git/tags/"):
+    if not tag or path != "git/tags/" + tag["sha"]:
+        not_found()
+    print(tag["peeled"])
+elif path == "git/tags":
+    print("f" * 40)
+elif path != "git/refs":
+    sys.exit("unexpected path " + path)
+'''
+
+
+@unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+class ReleaseTagStepTest(unittest.TestCase):
+    """release-tag.yml's tag step, run by bash against the fake gh. The 0.2.0
+    run read the 404 body of a single-ref lookup as an existing tag and
+    failed before creating any."""
+
+    MERGE = "a" * 40
+    STEP = "Create the annotated tag at the merge commit (fail on a mismatched existing tag)"
+
+    def run_step(self, tag):
+        try:
+            import yaml
+        except ImportError:  # requirements-dev.txt
+            self.skipTest("PyYAML is not installed")
+        workflow = yaml.safe_load((ROOT / ".github/workflows/release-tag.yml").read_text(encoding="utf-8"))
+        script = next(s["run"] for s in workflow["jobs"]["tag"]["steps"] if s.get("name") == self.STEP)
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            (bindir / "gh").write_text(FAKE_GH, encoding="utf-8")
+            (bindir / "gh").chmod(0o755)
+            (Path(tmp) / "state.json").write_text(json.dumps({"tag": tag}), encoding="utf-8")
+            env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}", FAKE_GH_STATE=str(Path(tmp) / "state.json"),
+                       FAKE_GH_LOG=str(Path(tmp) / "calls.jsonl"), GITHUB_REPOSITORY="o/r", VERSION="0.2.0", MERGE_SHA=self.MERGE)
+            proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+            log = Path(tmp) / "calls.jsonl"
+            calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+        writes = [c[1] for c in calls if "-f" in c]
+        return proc, writes
+
+    def test_an_absent_tag_is_created_at_the_merge_commit(self):
+        proc, writes = self.run_step(None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"created tag 0.2.0 -> {self.MERGE}", proc.stdout)
+        self.assertEqual(writes, ["repos/o/r/git/tags", "repos/o/r/git/refs"])
+
+    def test_a_tag_already_at_the_merge_commit_is_accepted(self):
+        proc, writes = self.run_step({"name": "0.2.0", "type": "tag", "sha": "b" * 40, "peeled": self.MERGE})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("already points at", proc.stdout)
+        self.assertEqual(writes, [])
+
+    def test_a_tag_elsewhere_is_refused(self):
+        proc, writes = self.run_step({"name": "0.2.0", "type": "commit", "sha": "c" * 40, "peeled": None})
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("refusing", proc.stderr)
+        self.assertEqual(writes, [])
 
 
 if __name__ == "__main__":
