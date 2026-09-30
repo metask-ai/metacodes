@@ -1,6 +1,6 @@
 .{
     .name = .metacodes_core,
-    .version = "0.2.1",
+    .version = "0.2.2-dev",
     .fingerprint = 0x64f5da82b6a2a53,
     .minimum_zig_version = "0.16.0",
     .paths = .{
