@@ -269,6 +269,11 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 - **Draft exists / artifacts expired**: rerun rebuilds from the tag and updates
   the existing draft (§3 C).
 - **Malformed changelog**: the cut refuses with the line; nothing is pushed.
+- **The `opened` event lacks the release label** (0.2.1): `gh pr create
+  --label` labels the PR after creating it, so the event payload can predate
+  the label and the version state gate would refuse the release PR. `ci.yml`
+  reads the PR's labels when the gate runs instead of taking them from the
+  payload.
 - **A step after the push fails** (0.2.0: `gh pr create` refused the body):
   the checkout still ends on `main`, and the error says the branch is already
   pushed; re-running the same command regenerates it, pushes it with a lease
