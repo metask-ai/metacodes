@@ -222,9 +222,12 @@ source-free Zig, C, and C++17 consumers against the installed artifacts. The
 static library filename comes from Zig `out_filename` for that target (`.a` or
 `.lib`) and is recorded in the manifest. The Windows/MSVC archive also exports
 the `unlink`, `mkdir`, `rmdir`, `access`, `chdir`, and `getcwd` CRT spelling
-shims needed by the current implementation. These six link-visible support
-symbols are not AgentCore ABI entry points and carry no consumer stability
-promise; consumers must not call or otherwise depend on them.
+shims needed by the current implementation. The x86_64 Windows/GNU archive
+exports a strong `roundq`: bundled `compiler_rt` defines it weakly, GNU ld does
+not load an archive member for a weak definition, and MinGW's libraries do not
+provide it. These link-visible support symbols are not AgentCore ABI entry
+points and carry no consumer stability promise; consumers must not call or
+otherwise depend on them.
 `agentcore:consumer` additionally runs the resulting programs, while
 `agentcore:gate` combines that native consumer check with the ABI test suite
 and runs the Rust ABI link probe plus crate unit tests. macOS bundles are
