@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.2.0 — 2026-09-30
+
 ### Changed
 
 - Stream liveness no longer counts gateway keepalives as progress: the body
