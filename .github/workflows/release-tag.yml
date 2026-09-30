@@ -56,9 +56,13 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          existing=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.sha 2>/dev/null || true)
-          if [ -n "$existing" ]; then
-            type=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" --jq .object.type)
+          # matching-refs answers 200 with [] when the tag is absent. The
+          # single-ref endpoint answers 404 instead, and gh prints that error
+          # body on stdout, which the 0.2.0 run read as an existing tag.
+          ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${VERSION}" --jq ".[] | select(.ref == \"refs/tags/${VERSION}\") | \"\(.object.type) \(.object.sha)\"")
+          if [ -n "$ref" ]; then
+            type=${ref%% *}
+            existing=${ref#* }
             if [ "$type" = "tag" ]; then
               existing=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${existing}" --jq .object.sha)
             fi
