@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.2.1 — 2026-09-30
+
 ### Fixed
 
 - The release automation's first real run (0.2.0) hit two bugs. The cut
