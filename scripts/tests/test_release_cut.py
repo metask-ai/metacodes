@@ -2,17 +2,21 @@
 probes, on fixtures and throwaway repositories (doc/RELEASE_AUTOMATION_DESIGN.md)."""
 from __future__ import annotations
 
+import contextlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import check_version_state  # noqa: E402
 import release_cut as rc  # noqa: E402
+import release_notes  # noqa: E402
 
 CHANGELOG_FIXTURE = """# Changelog
 
@@ -180,6 +184,81 @@ class ChangelogTest(unittest.TestCase):
             self.assertIn(needle, body)
 
 
+def _section(entries: int, text: str = "fix number {i}, described at some length") -> str:
+    return "## 0.2.0 — 2026-09-30\n\n### Fixed\n\n" + "".join(f"- {text.format(i=i)}.\n" for i in range(entries))
+
+
+class BodyLimitTest(unittest.TestCase):
+    """GitHub refuses a PR body over 65,536 characters and a release body over
+    125,000; the 0.2.0 cut failed at `gh pr create` with a 90,841-character
+    section. Bodies are fitted before anything is pushed."""
+
+    DRIVERS = {"minor": ["feat: a"], "patch": ["fix: b"]}
+
+    def test_a_body_under_the_limit_is_unchanged(self):
+        # byte for byte what the cut produced before the limit existed
+        body = rc.pr_body("0.2.0", "minor", "## 0.2.0 — d\n\n- x\n", self.DRIVERS, ["merge main"], ["fix: squashed"])
+        self.assertEqual(
+            body,
+            "## 0.2.0 — d\n\n- x\n\n\n## Bump derivation\n\nLevel: **minor**\n\nminor:\n- feat: a\n\npatch:\n- fix: b\n\n"
+            "Commits whose subject does not follow `type(scope): text` (contributed nothing to the level; raise it by hand if one of them is a feature or a breaking change):\n- merge main\n\n"
+            "Squash/rebase-merged PRs (only the squash subject was classified; their inner commit types are not visible):\n- fix: squashed\n\n"
+            "Merging this PR is the decision to release; `release-tag.yml` tags the merge commit and starts `release.yml`. Then run `python3 scripts/release_cut.py --reopen`.\n",
+        )
+
+    def test_an_oversized_section_gives_way_to_a_pointer(self):
+        section = _section(2000)
+        self.assertGreater(rc.body_size(section), rc.PR_BODY_LIMIT)
+        body = rc.pr_body("0.2.0", "minor", section, self.DRIVERS, ["merge main"])
+        self.assertLessEqual(rc.body_size(body), rc.PR_BODY_LIMIT)
+        self.assertTrue(body.startswith("## 0.2.0 — 2026-09-30\n\nThis section is 2004 lines"))
+        self.assertNotIn("fix number 0,", body)
+        for needle in ("`CHANGELOG.md` diff", "`scripts/release_notes.py 0.2.0`", "Level: **minor**", "- feat: a", "- fix: b", "- merge main", "--reopen`."):
+            self.assertIn(needle, body)
+        self.assertNotIn("- … and", body)  # the derivation fits once the section is gone
+
+    def test_oversized_derivation_lists_keep_their_first_entries_and_count_the_rest(self):
+        patch = [f"fix(area): change number {i} with a subject of ordinary length" for i in range(3000)]
+        unknown = [f"merge main {i}" for i in range(500)]
+        body = rc.pr_body("0.2.0", "patch", _section(2000), {"patch": patch}, unknown, ["fix: squashed"])
+        self.assertLessEqual(rc.body_size(body), rc.PR_BODY_LIMIT)
+        self.assertIn("Level: **patch**", body)
+        self.assertTrue(body.endswith("Then run `python3 scripts/release_cut.py --reopen`.\n"))
+        shown = [line for line in body.splitlines() if line.startswith("- fix(area): ")]
+        self.assertEqual(shown[0], "- " + patch[0])  # the first entries, in order
+        self.assertEqual(shown, ["- " + s for s in patch[: len(shown)]])
+        counts = [int(n) for n in re.findall(r"^- … and (\d+) more$", body, re.M)]
+        self.assertIn(3000 - len(shown), counts)
+        self.assertIn("- fix: squashed", body)  # a short list is not cut
+        # the cap is the most that fits: one more entry per list would not
+        pointer = rc.section_pointer("0.2.0", _section(2000))
+        longer = rc._pr_body("patch", pointer, {"patch": patch}, unknown, ["fix: squashed"], len(shown) + 1)
+        self.assertGreater(rc.body_size(longer), rc.PR_BODY_LIMIT)
+
+    def test_the_limit_counts_utf8_bytes(self):
+        # 30,000 characters but 90,000 bytes: under GitHub's character count,
+        # yet never trusted to be, so the section still gives way
+        section = "## 0.2.0 — 2026-09-30\n\n- " + "修" * 30000 + "\n"
+        self.assertLess(len(section), rc.PR_BODY_LIMIT)
+        body = rc.pr_body("0.2.0", "minor", section, self.DRIVERS, [])
+        self.assertNotIn("修", body)
+        self.assertLessEqual(rc.body_size(body), rc.PR_BODY_LIMIT)
+
+    def test_release_notes_stop_after_the_last_whole_entry_that_fits(self):
+        section = _section(40, "entry {i}\n  continued on a second line")
+        self.assertEqual(release_notes.fit_notes(section, "0.2.0", limit=10_000), section)
+        notes = release_notes.fit_notes(section, "0.2.0", limit=1_000)
+        self.assertLessEqual(rc.body_size(notes), 1_000)
+        kept, _, tail = notes.partition("\n_The notes stop here: ")
+        self.assertTrue(kept.startswith("## 0.2.0 — 2026-09-30\n"))
+        self.assertTrue(kept.rstrip("\n").endswith("  continued on a second line."), kept[-80:])  # a whole entry
+        dropped = int(tail.split(" ", 1)[0])
+        self.assertEqual(len(kept.splitlines()) + dropped, len(section.rstrip("\n").splitlines()))
+        self.assertIn("`share/doc/CHANGELOG-0.2.0.md`", tail)
+        # the real limit leaves a section of today's size alone
+        self.assertEqual(release_notes.fit_notes(_section(2000), "0.2.0"), _section(2000))
+
+
 LOCAL: dict = {}  # the maintainer's checkout: no GitHub Actions environment
 
 
@@ -273,6 +352,67 @@ class ThrowawayRepoTest(unittest.TestCase):
         # a squash-style commit directly on the first-parent line is flagged
         _commit(self.root, "fix: squashed onto main")
         self.assertEqual(rc.first_parent_is_conventional(self.root, "0.1.0"), ["fix: squashed onto main"])
+
+
+class OpenPrFailureTest(unittest.TestCase):
+    """open_pr against a local bare `origin`, with `gh` replaced: whatever
+    fails, the checkout ends on main, and the error says whether the branch
+    was already pushed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.origin = base / "origin.git"
+        self.root = base / "clone"
+        _git("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=base)
+        _git("init", "-q", "-b", "main", str(self.root), cwd=base)
+        _git("config", "user.name", "t", cwd=self.root)
+        _git("config", "user.email", "t@x", cwd=self.root)
+        for rel in (rc.ZON, rc.VERSION_ZIG, rc.CHANGELOG, rc.PROTOCOL):
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / rel).write_text("0.2.0-dev\n", encoding="utf-8")
+        _git("add", "-A", cwd=self.root)
+        _git("commit", "-q", "-m", "chore: init", cwd=self.root)
+        _git("remote", "add", "origin", str(self.origin), cwd=self.root)
+        _git("push", "-q", "origin", "main", cwd=self.root)
+        (self.root / rc.ZON).write_text("0.2.0\n", encoding="utf-8")  # what the cut generated
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @contextlib.contextmanager
+    def gh_refuses_the_body(self):
+        real_run = rc.run
+
+        def run(argv, cwd, check=True):
+            if argv[0] == "gh":
+                raise rc.CutError(f"{' '.join(argv[:3])} failed (1): GraphQL: Body is too long (maximum is 65536 characters)")
+            return real_run(argv, cwd, check)
+
+        with mock.patch.object(rc, "open_release_prs", return_value=[]), mock.patch.object(rc, "branch_was_merged", return_value=False), mock.patch.object(rc, "run", side_effect=run):
+            yield
+
+    def test_a_failure_after_the_push_says_so_and_ends_on_main(self):
+        with self.gh_refuses_the_body(), self.assertRaises(rc.CutError) as caught:
+            rc.open_pr(self.root, "release/0.2.0", "release: 0.2.0", "body\n", "release", dry_run=False)
+        self.assertIn("Body is too long", str(caught.exception))
+        self.assertIn("release/0.2.0 is already pushed", str(caught.exception))
+        self.assertEqual(_git("rev-parse", "--abbrev-ref", "HEAD", cwd=self.root), "main")
+        self.assertEqual(_git("status", "--porcelain", "--untracked-files=no", cwd=self.root), "")
+        self.assertEqual(_git("rev-parse", "release/0.2.0", cwd=self.origin), _git("rev-parse", "release/0.2.0", cwd=self.root))
+
+    def test_a_failure_before_the_push_ends_on_main_and_claims_no_push(self):
+        _git("remote", "set-url", "origin", str(self.origin) + "-missing", cwd=self.root)
+        with self.gh_refuses_the_body(), self.assertRaises(rc.CutError) as caught:
+            rc.open_pr(self.root, "release/0.2.0", "release: 0.2.0", "body\n", "release", dry_run=False)
+        self.assertIn("git push", str(caught.exception))
+        self.assertNotIn("already pushed", str(caught.exception))
+        self.assertEqual(_git("rev-parse", "--abbrev-ref", "HEAD", cwd=self.root), "main")
+
+    def test_an_oversized_body_is_refused_before_any_command(self):
+        with mock.patch.object(rc, "run", side_effect=AssertionError("no command may run")), self.assertRaisesRegex(rc.CutError, "nothing was pushed"):
+            rc.open_pr(self.root, "release/0.2.0", "release: 0.2.0", "x" * (rc.PR_BODY_LIMIT + 1), "release", dry_run=False)
+        self.assertEqual(_git("rev-parse", "--abbrev-ref", "HEAD", cwd=self.root), "main")
 
 
 if __name__ == "__main__":

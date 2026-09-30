@@ -54,6 +54,11 @@ LEVELS = ("none", "patch", "minor", "major")
 MINOR_TYPES = {"feat"}
 PATCH_TYPES = {"fix", "perf"}
 
+# GitHub refuses a longer pull request body ("Body is too long (maximum is
+# 65536 characters)"). Sizes are counted in UTF-8 bytes, which never undercount
+# GitHub's character count, so a body that fits here fits there.
+PR_BODY_LIMIT = 65536
+
 
 class CutError(Exception):
     """A refusal with a message for the maintainer; nothing was written."""
@@ -197,21 +202,67 @@ def release_section(text: str, version: str) -> str:
     return "\n".join(lines[start:end]).rstrip("\n") + "\n"
 
 
-def pr_body(version: str, level: str, section: str, drivers: Dict[str, List[str]], unknown: List[str], squashed: Optional[List[str]] = None) -> str:
+def body_size(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def pr_body(version: str, level: str, section: str, drivers: Dict[str, List[str]], unknown: List[str], squashed: Optional[List[str]] = None, limit: int = PR_BODY_LIMIT) -> str:
+    """The new changelog section, then the bump derivation. A body over
+    GitHub's limit first shows a pointer instead of the section (it is in the
+    PR's CHANGELOG.md diff and becomes the release notes); if that is still too
+    long, each derivation list keeps its first entries and says how many it
+    left out. The level line and the closing instruction always stay."""
+    body = _pr_body(level, section, drivers, unknown, squashed, None)
+    if body_size(body) <= limit:
+        return body
+    pointer = section_pointer(version, section)
+    lo, hi = 0, max([len(v) for v in drivers.values()] + [len(unknown), len(squashed or [])])
+    while lo < hi:  # the most entries per list that still fit
+        mid = (lo + hi + 1) // 2
+        if body_size(_pr_body(level, pointer, drivers, unknown, squashed, mid)) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    body = _pr_body(level, pointer, drivers, unknown, squashed, lo)
+    if body_size(body) > limit:
+        raise CutError(f"the PR body is {body_size(body):,} bytes even without the changelog section and the derivation lists, over GitHub's {limit:,}")
+    return body
+
+
+def section_pointer(version: str, section: str) -> str:
+    """What the PR body shows instead of a changelog section too long for it."""
+    lines = section.rstrip("\n").splitlines()
+    heading = lines[0] if lines else f"## {version}"
+    return (
+        f"{heading}\n\n"
+        f"This section is {len(lines)} lines ({body_size(section):,} bytes), more than a pull request body holds. "
+        f"It is in this PR's `{CHANGELOG}` diff, and `release.yml` turns it into the release notes "
+        f"(`scripts/release_notes.py {version}`).\n"
+    )
+
+
+def _pr_body(level: str, section: str, drivers: Dict[str, List[str]], unknown: List[str], squashed: Optional[List[str]], keep: Optional[int]) -> str:
+    def listed(subjects: List[str]) -> List[str]:
+        shown = subjects if keep is None else subjects[:keep]
+        lines = [f"- {s}" for s in shown]
+        if len(shown) < len(subjects):
+            lines.append(f"- … and {len(subjects) - len(shown)} more")
+        return lines
+
     parts = [section, "", "## Bump derivation", "", f"Level: **{level}**", ""]
     for kind in ("major", "minor", "patch"):
         subjects = drivers.get(kind) or []
         if subjects:
             parts.append(f"{kind}:")
-            parts.extend(f"- {s}" for s in subjects)
+            parts.extend(listed(subjects))
             parts.append("")
     if unknown:
         parts.append("Commits whose subject does not follow `type(scope): text` (contributed nothing to the level; raise it by hand if one of them is a feature or a breaking change):")
-        parts.extend(f"- {s}" for s in unknown)
+        parts.extend(listed(unknown))
         parts.append("")
     if squashed:
         parts.append("Squash/rebase-merged PRs (only the squash subject was classified; their inner commit types are not visible):")
-        parts.extend(f"- {s}" for s in squashed)
+        parts.extend(listed(squashed))
         parts.append("")
     parts.append("Merging this PR is the decision to release; `release-tag.yml` tags the merge commit and starts `release.yml`. Then run `python3 scripts/release_cut.py --reopen`.")
     return "\n".join(parts).rstrip("\n") + "\n"
@@ -314,9 +365,13 @@ def branch_was_merged(root: Path, branch: str) -> bool:
 def open_pr(root: Path, branch: str, title: str, body: str, label: Optional[str], dry_run: bool) -> None:
     """Commit the generated files on `branch`, push, and create the PR — or
     update the body of the open PR that already has this head. Refuses when
-    a different release PR is open (one cut in flight) or when this branch
-    name already went through a merged PR (a version is released once)."""
+    a different release PR is open (one cut in flight), when this branch
+    name already went through a merged PR (a version is released once), or
+    when the body is over GitHub's limit (before anything is pushed). Ends on
+    `main` whether or not a step failed."""
     files = [ZON, VERSION_ZIG, CHANGELOG, PROTOCOL]
+    if body_size(body) > PR_BODY_LIMIT:
+        raise CutError(f"the PR body is {body_size(body):,} bytes, over GitHub's {PR_BODY_LIMIT:,}; nothing was pushed")
     existing = None
     if label == "release":
         for number, head in open_release_prs(root):
@@ -331,25 +386,33 @@ def open_pr(root: Path, branch: str, title: str, body: str, label: Optional[str]
         print(f"[dry-run] would commit {files} on {branch}, push --force-with-lease, and {action}")
         return
     run(["git", "checkout", "-B", branch], root)
-    run(["git", "add", "--"] + files, root)
-    run(["git", "commit", "-m", title], root)
-    # Lease against the remote tip as just fetched (empty = must not exist),
-    # not against whatever stale origin/<branch> the clone happened to hold.
-    run(["git", "fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], root, check=False)
-    expected = run(["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], root, check=False).strip()
-    run(["git", "push", f"--force-with-lease=refs/heads/{branch}:{expected}", "-u", "origin", branch], root)
-    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as handle:
-        handle.write(body)
-        body_path = handle.name
-    if existing:
-        run(["gh", "pr", "edit", str(existing), "--title", title, "--body-file", body_path], root)
-        print(f"updated PR #{existing}")
-    else:
-        argv = ["gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body-file", body_path]
-        if label:
-            argv += ["--label", label]
-        print(run(argv, root).strip())
-    run(["git", "checkout", "main"], root)
+    pushed = False
+    try:
+        run(["git", "add", "--"] + files, root)
+        run(["git", "commit", "-m", title], root)
+        # Lease against the remote tip as just fetched (empty = must not exist),
+        # not against whatever stale origin/<branch> the clone happened to hold.
+        run(["git", "fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], root, check=False)
+        expected = run(["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], root, check=False).strip()
+        run(["git", "push", f"--force-with-lease=refs/heads/{branch}:{expected}", "-u", "origin", branch], root)
+        pushed = True
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as handle:
+            handle.write(body)
+            body_path = handle.name
+        if existing:
+            run(["gh", "pr", "edit", str(existing), "--title", title, "--body-file", body_path], root)
+            print(f"updated PR #{existing}")
+        else:
+            argv = ["gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body-file", body_path]
+            if label:
+                argv += ["--label", label]
+            print(run(argv, root).strip())
+    except CutError as exc:
+        if pushed:
+            raise CutError(f"{exc}\n{branch} is already pushed; fix the cause and re-run the same command: it regenerates the branch, pushes it with a lease and opens or updates the PR") from None
+        raise
+    finally:
+        run(["git", "checkout", "main"], root, check=False)
 
 
 # ---------------------------------------------------------------- commands
@@ -378,11 +441,14 @@ def cmd_cut(root: Path, level_arg: str, force: bool, dry_run: bool) -> int:
             drivers.setdefault(commit_level, []).append(subject)
     date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
     new_changelog, section = rewrite_changelog(read(root, CHANGELOG), version, date)
+    body = pr_body(version, level, section, drivers, unknown, squashed)
     print(f"last tag {tag}, derived level {derived}, cutting {version}")
     if squashed:
         print(f"{len(squashed)} first-parent commit(s) are not merge commits (squash/rebase merges); their PR-internal commit types are not visible, only their subjects counted")
     if unknown:
         print(f"{len(unknown)} commit(s) with a non-conventional subject contributed nothing (listed in the PR body)")
+    if not body.startswith(section):
+        print(f"the changelog section ({body_size(section):,} bytes) is too long for a PR body; the PR points to its {CHANGELOG} diff instead")
     if dry_run:
         print(section)
         print(f"[dry-run] no files written")
@@ -390,7 +456,7 @@ def cmd_cut(root: Path, level_arg: str, force: bool, dry_run: bool) -> int:
     apply_version(root, version)
     write(root, CHANGELOG, new_changelog)
     repin_fingerprint(root)
-    open_pr(root, f"release/{version}", f"release: {version}", pr_body(version, level, section, drivers, unknown, squashed), "release", dry_run=False)
+    open_pr(root, f"release/{version}", f"release: {version}", body, "release", dry_run=False)
     print(f"after the PR merges and release-tag.yml has tagged {version}: python3 scripts/release_cut.py --reopen")
     return 0
 

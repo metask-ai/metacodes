@@ -117,7 +117,12 @@ month. The script (Python 3.9, stdlib only, tested under `scripts/tests/`):
    opens the PR with title `release: <version>` and label `release`. The body
    is the new changelog section plus the bump derivation (which commits drove
    the level, which are unknown-typed, which have no changelog line) so a
-   reviewer can dispute the level, not just the diff. Every external command
+   reviewer can dispute the level, not just the diff. GitHub refuses a body
+   over 65,536 characters (0.2.0's section alone was 90,841), so a longer body
+   shows a pointer to the section's `CHANGELOG.md` diff instead, and if the
+   derivation lists are still too long, each keeps its first entries and says
+   how many it left out. The size is checked in UTF-8 bytes, which never
+   undercount GitHub's characters, before anything is pushed. Every external command
    is an argv list (`subprocess.run([...])`, no shell), the body goes through
    `--body-file`, and repository, base and head are fixed arguments, so commit
    subjects and changelog text can never become flags or commands.
@@ -194,7 +199,10 @@ changelog rewrite imposes no parser contract on the bundle. Two changes to
   from the immutable tag rather than reusing artifacts.
 - release notes come from the CHANGELOG section for that version
   (`scripts/release_notes.py <version>` prints it) instead of the fixed
-  sentence; the draft is still published by a human.
+  sentence; the draft is still published by a human. A section over GitHub's
+  125,000-character release body stops after the last whole entry that fits
+  and points to `CHANGELOG.md` at the tag and `share/doc/CHANGELOG-<version>.md`
+  in every archive.
 
 `workflow_dispatch` remains for pre-releases: `dry_run` builds a
 `X.Y.Z-dev+<commit12>` bundle and uploads artifacts only. `--verify-tag` is
@@ -261,6 +269,10 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 - **Draft exists / artifacts expired**: rerun rebuilds from the tag and updates
   the existing draft (§3 C).
 - **Malformed changelog**: the cut refuses with the line; nothing is pushed.
+- **A step after the push fails** (0.2.0: `gh pr create` refused the body):
+  the checkout still ends on `main`, and the error says the branch is already
+  pushed; re-running the same command regenerates it, pushes it with a lease
+  and opens or updates the PR.
 - **Stale clone**: the cut and the reopen refuse unless `main` equals freshly
   fetched `origin/main`; the reopen also requires the tag to exist on origin
   and to point at a commit `main` contains.
