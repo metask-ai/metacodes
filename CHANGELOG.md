@@ -10,6 +10,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- The release automation's first real run (0.2.0) hit two bugs. The cut
+  (`scripts/release_cut.py`) put the whole changelog section into the
+  release PR body, and GitHub refuses a body over 65,536 characters (0.2.0's
+  section was 90,841), so it stopped after pushing the branch and left the
+  checkout on it. A body over the limit now points to the section's
+  `CHANGELOG.md` diff and shortens the bump-derivation lists with a count;
+  the size is checked before anything is pushed, and the checkout always
+  ends on `main`. `scripts/release_notes.py` likewise stops notes over
+  GitHub's 125,000-character release body at the last whole entry and points
+  to the full section. The tag job (`release-tag.yml`) looked the tag up
+  through an endpoint that answers 404 when it is missing, and `gh` prints
+  that error body on stdout, which read as an existing tag: the job failed
+  without tagging, and 0.2.0 was tagged by hand at its merge commit. It now
+  uses `git/matching-refs`, which answers an empty list.
+
 ## 0.2.0 — 2026-09-30
 
 ### Changed
