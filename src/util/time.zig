@@ -8,6 +8,7 @@
 //!   - `nowMs()`：MONOTONIC 毫秒；失败返 0（保持老语义）
 //!   - `nowNs()`：MONOTONIC 纳秒
 //!   - `nowWallNs()`：REALTIME 纳秒（transcript last_modified_ns 用）
+//!   - `sleepAtLeast()`：`std.Io` 上睡满一个时长才返回（截止任务用）
 //!
 //! 调用方一律 `util/time.zig` 导入；禁止再抄新的 `fn nowMs`。
 
@@ -87,6 +88,19 @@ pub fn sleepMs(ms: u64) void {
     _ = std.c.nanosleep(&req, &rem);
 }
 
+/// 等 `duration` 在它的时钟上真正走完才返回,每次等待都是取消点。与请求竞速的截止任务都走这里。
+/// 单次 sleep 不保证这个下界:Windows 上 `std.Io.Threaded` 把 awake 时钟的等待(连 `.deadline`
+/// 在内)都换算成相对的 NT 等待,内核在时钟中断 tick 上服务,可能早醒最多一个 tick(默认
+/// 15.625 ms)。所以先定下绝对截止,早醒了就补睡剩余时长。
+pub fn sleepAtLeast(io: std.Io, duration: std.Io.Clock.Duration) std.Io.Cancelable!void {
+    const deadline: std.Io.Clock.Timestamp = .fromNow(io, duration);
+    while (std.Io.Clock.Timestamp.now(io, deadline.clock).compare(.lt, deadline)) {
+        try deadline.wait(io);
+    }
+}
+
+const TickServicedClock = @import("platform").test_support.TickServicedClock;
+
 test "nowMs is monotonic and positive" {
     const a = nowMs();
     const b = nowMs();
@@ -103,4 +117,20 @@ test "nowNs is monotonic and positive" {
 
 test "nowWallNs is positive" {
     try std.testing.expect(nowWallNs() > 0);
+}
+
+test "sleepAtLeast outlasts a sleep that wakes up to one timer tick early" {
+    // tick 内 15 ms 处开始:单次 300 ms 的等待到期于 300 ms,在 312.5 ms 的 tick 上醒来,只过了 297.5 ms。
+    var clock: TickServicedClock = .{ .now_ns = 15 * std.time.ns_per_ms };
+    const started = clock.now_ns;
+    try sleepAtLeast(clock.io(), .{ .raw = .fromMilliseconds(300), .clock = .awake });
+    try std.testing.expect(clock.now_ns - started >= 300 * std.time.ns_per_ms);
+    // 第一次确实早醒了,第二次补齐。
+    try std.testing.expectEqual(@as(u32, 2), clock.sleeps);
+}
+
+test "a canceled sleepAtLeast returns at the first wait" {
+    var clock: TickServicedClock = .{ .now_ns = 0, .cancel_requested = true };
+    try std.testing.expectError(error.Canceled, sleepAtLeast(clock.io(), .{ .raw = .fromMilliseconds(300), .clock = .awake }));
+    try std.testing.expectEqual(@as(u32, 1), clock.sleeps);
 }

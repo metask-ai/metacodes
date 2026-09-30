@@ -68,6 +68,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- The TinyKG web transport could report a timeout before `timeout_ms` on
+  Windows. Its deadline was one sleep on the awake clock, which
+  `std.Io.Threaded` turns into a relative NT wait; the kernel services that
+  wait on clock-interrupt ticks, so it can end up to one tick (15.625 ms by
+  default) early. The 35 s default and the readiness probe's 2 s are whole
+  numbers of ticks, so a wait that started part-way into a tick ended early
+  by up to that offset: a write could report `AmbiguousCommit`, which blocks
+  every later write, before the daemon had its full timeout, and a read
+  could spend the leftover milliseconds on a second request. The deadline
+  now waits until the awake clock has passed it (`util/time.sleepAtLeast`),
+  as the System-One client's does.
 - `util/file_lock` could let two contenders hold one lock after its holder
   died. Both judged the dead holder's record stale; the first renamed it away
   and created a fresh lock, and the second's rename then moved that fresh

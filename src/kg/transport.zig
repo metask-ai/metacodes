@@ -470,8 +470,9 @@ pub const WebTransport = struct {
 
     /// `std.http.Client.request` does not expose an end-to-end timeout in Zig
     /// 0.16. Race the complete POST (connect, send, response head and body)
-    /// against an awake-clock deadline. Cancelation joins the losing task, so
-    /// no request or borrowed transport state survives this call.
+    /// against an awake-clock deadline, which fires only once `timeout_ms` has
+    /// passed on that clock. Cancelation joins the losing task, so no request
+    /// or borrowed transport state survives this call.
     fn postBeforeDeadline(
         self: *WebTransport,
         url: []const u8,
@@ -517,12 +518,13 @@ pub const WebTransport = struct {
         return self.post(url, body, request_id);
     }
 
+    /// Returns once `timeout_ms` has passed on the awake clock, so the daemon
+    /// always gets the whole deadline. One sleep can end up to a timer tick
+    /// early on Windows (see `time.sleepAtLeast`). Each wait is a cancelation
+    /// point, so a response that wins the race stops the deadline at once.
     fn deadlineTask(io: std.Io, timeout_ms: u64) std.Io.Cancelable!void {
         const bounded: i64 = @intCast(timeout_ms);
-        return std.Io.Timeout.sleep(.{ .duration = .{
-            .raw = .fromMilliseconds(bounded),
-            .clock = .awake,
-        } }, io);
+        return time.sleepAtLeast(io, .{ .raw = .fromMilliseconds(bounded), .clock = .awake });
     }
 
     fn post(self: *WebTransport, url: []const u8, body: []const u8, request_id: []const u8) Error!Result {
@@ -767,4 +769,26 @@ test "transport command policies bind sessions and task capabilities" {
     try std.testing.expect(provesNoCommit(Error.AuthenticationFailed));
     try std.testing.expect(provesNoCommit(Error.Backpressure));
     try std.testing.expect(!provesNoCommit(Error.RequestTimedOut));
+}
+
+const TickServicedClock = @import("platform").test_support.TickServicedClock;
+
+test "the web deadline outlasts a wait that ends up to one timer tick early" {
+    // Both deadlines the transport arms, the readiness probe's 2 s and the
+    // 35 s default, are whole numbers of 15.625 ms ticks. One wait that
+    // starts 15 ms into a tick is then due on a tick and ends 15 ms early.
+    for ([_]u64{ 2_000, default_timeout_ms }) |timeout_ms| {
+        var clock: TickServicedClock = .{ .now_ns = 15 * std.time.ns_per_ms };
+        const started = clock.now_ns;
+        try WebTransport.deadlineTask(clock.io(), timeout_ms);
+        try std.testing.expect(clock.now_ns - started >= @as(i96, timeout_ms) * std.time.ns_per_ms);
+        // The first wait did end early; a second one closed the gap.
+        try std.testing.expectEqual(@as(u32, 2), clock.sleeps);
+    }
+}
+
+test "a canceled web deadline returns at the first wait" {
+    var clock: TickServicedClock = .{ .now_ns = 0, .cancel_requested = true };
+    try std.testing.expectError(error.Canceled, WebTransport.deadlineTask(clock.io(), 2_000));
+    try std.testing.expectEqual(@as(u32, 1), clock.sleeps);
 }
