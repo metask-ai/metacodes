@@ -34,6 +34,15 @@ status, compatibility boundaries, and entry points are defined by
   it: 0.2.0 is tagged but was never published, and 0.2.1 is the first release
   that carries its changes. The consumer now falls back to Linux's 4096, as it
   already fell back to `MAX_PATH` on Windows.
+- The x86_64 Windows/GNU AgentCore archive could not be linked by MinGW's GNU
+  ld, so the Rust bindings' cargo builds failed with undefined references to
+  `roundq`. std.json's integer parsing calls it; the bundled compiler_rt
+  defines it only weakly, GNU ld does not load an archive member for a weak
+  definition, and MinGW's libraries do not provide it. The archive now
+  carries a strong `roundq` (`src/agentcore/windows_gnu_crt_shims.c`), a
+  support symbol like the MSVC CRT shims. The release job's AgentCore gate
+  also gets the five-minute test watchdog the Windows CI already uses: at
+  the one-minute default it killed a slow unit test.
 
 ## 0.2.0 — 2026-09-30
 
