@@ -13,7 +13,9 @@ Head branch detection: `GITHUB_HEAD_REF` (pull_request events check out a
 merge commit, so the branch name is only in the environment), else
 `git rev-parse --abbrev-ref HEAD`. In CI the release-PR exception also needs
 RELEASE_PR_TITLE == `release: <version>` and `release` in RELEASE_PR_LABELS
-(ci.yml passes both from the event payload); the merge-subject exception is
+(ci.yml passes the title from the event payload and the labels the PR has
+when the step runs: `gh pr create --label` adds the label after creating the
+PR, so the `opened` payload can lack it); the merge-subject exception is
 honoured only on push runs. Tags: `actions/checkout` with `fetch-depth: 0`
 fetches every branch and tag, so no fetch is needed here.
 
