@@ -99,8 +99,11 @@ jobs:
         run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release"
       - name: Installed prefix matches the release layout
         run: python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release" --release --doctor
+      # The same watchdog again, as agentcore-windows.yml runs this gate: at
+      # the one-minute default the 0.2.1 Windows dry run killed an
+      # agentcore-abi-unit test ("test runner failed to respond for 1m6s").
       - name: AgentCore gate for the native target
-        run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+        run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist"
       - name: Archive (AgentCore SDK)
@@ -163,7 +166,7 @@ jobs:
         run: python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release" --release --doctor
       - name: AgentCore gate for the native target
         shell: cmd
-        run: zig build agentcore:gate -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
+        run: zig build agentcore:gate -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
         shell: cmd
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist"

@@ -457,6 +457,8 @@ fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *
         mod.linkSystemLibrary("advapi32", .{ .use_pkg_config = .no });
     if (options.target.result.os.tag == .windows and options.target.result.abi == .msvc)
         mod.addCSourceFile(.{ .file = b.path("src/agentcore/windows_msvc_crt_shims.c"), .flags = &.{"-std=c11"} });
+    if (options.target.result.os.tag == .windows and options.target.result.abi == .gnu)
+        mod.addCSourceFile(.{ .file = b.path("src/agentcore/windows_gnu_crt_shims.c"), .flags = &.{"-std=c11"} });
     return mod;
 }
 
