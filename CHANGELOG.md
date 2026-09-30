@@ -26,6 +26,14 @@ status, compatibility boundaries, and entry points are defined by
   that error body on stdout, which read as an existing tag: the job failed
   without tagging, and 0.2.0 was tagged by hand at its merge commit. It now
   uses `git/matching-refs`, which answers an empty list.
+- The Linux release build could not compile the AgentCore C consumer
+  (`tests/agentcore_artifact_consumer/consumer.c`). It used `PATH_MAX`, which
+  glibc declares only under a POSIX feature macro, and the consumer is built
+  with `-std=c11`. The step runs only in tag builds (pull requests run the
+  AgentCore gate on Windows alone), so 0.2.0's build was the first to reach
+  it: 0.2.0 is tagged but was never published, and 0.2.1 is the first release
+  that carries its changes. The consumer now falls back to Linux's 4096, as it
+  already fell back to `MAX_PATH` on Windows.
 
 ## 0.2.0 — 2026-09-30
 

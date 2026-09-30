@@ -57,6 +57,11 @@ typedef int socket_handle;
 typedef pthread_t thread_handle;
 #define INVALID_SOCKET_HANDLE (-1)
 #define SHUTDOWN_BOTH SHUT_RDWR
+/* glibc declares PATH_MAX only with a POSIX feature macro, which -std=c11
+   does not set; 4096 is Linux's value. */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 #endif
 
 static const char RESPONSE_BODY[] =
