@@ -113,12 +113,10 @@ if [[ "$host_os" == "Darwin" ]]; then
     echo "build-formal-kernel: Darwin relink requires leanc and /usr/bin/clang" >&2
     exit 1
   fi
-  link_args=()
-  for library_dir in /opt/homebrew/lib /usr/local/lib; do
-    if [[ -d "$library_dir" ]]; then
-      link_args+=("-L$library_dir")
-    fi
-  done
+  # Link Lean's own static libgmp/libuv from the toolchain, never a host
+  # package manager's dylibs: the kernel ships in release archives and must
+  # start on a machine without Homebrew (scripts/check_kernel_self_contained.py).
+  link_args=("-L$lean_prefix/lib")
   # Apple's linker derives the ad-hoc code-sign identifier from the output
   # basename.  Passing mktemp's random basename here made otherwise identical
   # Lean IR produce a different LC_UUID and signature on every build.  Keep the
@@ -154,6 +152,15 @@ if [[ "$host_os" == "Darwin" ]]; then
 else
   install -m 0755 "$lean_dir/.lake/build/bin/metacodes-formal-kernel$executable_suffix" "$output"
 fi
+python=$(command -v python3 || command -v python || true)
+if [[ -z "$python" ]]; then
+  echo "build-formal-kernel: python3 is required for the self-containment check" >&2
+  exit 1
+fi
+"$python" "$repo_dir/scripts/check_kernel_self_contained.py" "$output" || {
+  echo "build-formal-kernel: the kernel depends on a library a clean $host_os host may lack" >&2
+  exit 1
+}
 
 hex_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 hex_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

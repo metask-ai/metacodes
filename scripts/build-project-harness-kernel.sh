@@ -3,9 +3,27 @@ set -euo pipefail
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 lean_dir="$repo_dir/control-plane/lean"
-output=${1:-"$repo_dir/zig-out/libexec/metacodes/metacodes-project-kernel"}
+
+# Same native-host normalization as build-formal-kernel.sh: GitHub's Windows
+# runners invoke this through Git Bash (`uname` says MINGW/MSYS) and Lake emits
+# an `.exe`; the provenance loader expects host_os Darwin/Linux/Windows.
+case "$(uname -s)" in
+  Darwin) host_os="Darwin"; executable_suffix="" ;;
+  Linux) host_os="Linux"; executable_suffix="" ;;
+  MINGW*|MSYS*|CYGWIN*) host_os="Windows"; executable_suffix=".exe" ;;
+  *) echo "build-project-harness-kernel: unsupported native host: $(uname -s)" >&2; exit 1 ;;
+esac
+
+output=${1:-"$repo_dir/zig-out/libexec/metacodes/metacodes-project-kernel$executable_suffix"}
 manifest=${2:-"$output.provenance.json"}
-lake=${LAKE:-"$HOME/.elan/bin/lake"}
+if [[ -n "${LAKE:-}" ]]; then
+  lake=$LAKE
+elif command -v lake >/dev/null 2>&1; then
+  lake=$(command -v lake)
+else
+  lake="$HOME/.elan/bin/lake$executable_suffix"
+fi
+python=$(command -v python3 || command -v python || true)
 
 if [[ ! -x "$lake" ]]; then
   echo "build-project-harness-kernel: lake not found: $lake" >&2
@@ -13,7 +31,6 @@ if [[ ! -x "$lake" ]]; then
 fi
 mkdir -p "$(dirname "$output")" "$(dirname "$manifest")"
 
-host_os=$(uname -s)
 (
   cd "$lean_dir"
   if [[ "$host_os" == "Darwin" ]]; then
@@ -70,10 +87,10 @@ if [[ "$host_os" == "Darwin" ]]; then
   tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/metacodes-project-kernel.XXXXXX")
   mkdir "$tmp_dir/first" "$tmp_dir/second"
   trap 'rm -rf "$tmp_dir"' EXIT
-  link_args=()
-  for library_dir in /opt/homebrew/lib /usr/local/lib; do
-    [[ -d "$library_dir" ]] && link_args+=("-L$library_dir")
-  done
+  # Link Lean's own static libgmp/libuv from the toolchain, never a host
+  # package manager's dylibs: the kernel ships in release archives and must
+  # start on a machine without Homebrew (scripts/check_kernel_self_contained.py).
+  link_args=("-L$lean_prefix/lib")
   for candidate in "$tmp_dir/first/metacodes-project-kernel" "$tmp_dir/second/metacodes-project-kernel"; do
     LEAN_CC=/usr/bin/clang "$leanc" -o "$candidate" \
       "$lean_dir/.lake/build/ir/ProjectHarnessMain.c.o.export" \
@@ -91,8 +108,16 @@ if [[ "$host_os" == "Darwin" ]]; then
   install -m 0755 "$tmp_dir/first/metacodes-project-kernel" "$output"
   linker="apple-clang"
 else
-  install -m 0755 "$lean_dir/.lake/build/bin/metacodes-project-kernel" "$output"
+  install -m 0755 "$lean_dir/.lake/build/bin/metacodes-project-kernel$executable_suffix" "$output"
 fi
+if [[ -z "$python" ]]; then
+  echo "build-project-harness-kernel: python3 is required for the self-containment check" >&2
+  exit 1
+fi
+"$python" "$repo_dir/scripts/check_kernel_self_contained.py" "$output" || {
+  echo "build-project-harness-kernel: the kernel depends on a library a clean $host_os host may lack" >&2
+  exit 1
+}
 
 hex_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 hex_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -294,7 +319,7 @@ else
   binary_bytes=$(stat -c '%s' "$output")
 fi
 host_arch=$(uname -m)
-lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\n')
+lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\r\n')
 printf '%s\n' \
   "{\"schema_version\":\"metacodes-project-kernel-artifact-v6\",\"checker_version\":\"metacodes-project-harness-kernel-v3\",\"request_schema\":\"metacodes-project-harness-request-v3\",\"verdict_schema\":\"metacodes-project-harness-verdict-v3\",\"batch_request_schema\":\"metacodes-project-harness-batch-request-v3\",\"batch_verdict_schema\":\"metacodes-project-harness-batch-verdict-v3\",\"impact_request_schema\":\"metacodes-rule-impact-governance-request-v1\",\"impact_verdict_schema\":\"metacodes-rule-impact-governance-verdict-v1\",\"impact_aggregate_request_schema\":\"metacodes-rule-impact-aggregate-governance-request-v1\",\"impact_aggregate_verdict_schema\":\"metacodes-rule-impact-aggregate-governance-verdict-v1\",\"max_batch_requests\":1024,\"max_impact_aggregate_members\":64,\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"rule_source_sha256\":\"$rule_source_sha256\",\"impact_source_sha256\":\"$impact_source_sha256\",\"impact_aggregate_source_sha256\":\"$impact_aggregate_source_sha256\",\"formal_kernel_source_sha256\":\"$formal_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_source_sha256\",\"axiom_policy\":\"propext\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"native_rule_author_promotion_smoke\":\"passed\",\"native_batch_smoke\":\"passed\",\"native_recovery_smoke\":\"passed\",\"native_impact_smoke\":\"passed\",\"native_impact_aggregate_smoke\":\"passed\"}" >"$manifest"
 

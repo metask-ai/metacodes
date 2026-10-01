@@ -361,6 +361,7 @@ fn findLake(b: *std.Build) ?[]const u8 {
 /// Every source the kernels are built from, so the cached build reruns exactly
 /// when one of them changes. `.lake` holds Lake's own products and is skipped.
 fn addLeanSourceInputs(b: *std.Build, run: *std.Build.Step.Run) void {
+    run.addFileInput(b.path("scripts/check_kernel_self_contained.py"));
     const root = "control-plane/lean";
     var dir = b.build_root.handle.openDir(b.graph.io, root, .{
         .iterate = true,
@@ -398,9 +399,7 @@ fn stageLeanKernels(
         return .{};
     }
     const host = b.graph.host.result;
-    const unavailable: ?[]const u8 = if (host.os.tag == .windows)
-        "the Lean kernel build scripts run on macOS and Linux hosts only"
-    else if (target.result.os.tag != host.os.tag or target.result.cpu.arch != host.cpu.arch)
+    const unavailable: ?[]const u8 = if (target.result.os.tag != host.os.tag or target.result.cpu.arch != host.cpu.arch)
         "Lean kernels are native host executables; this build targets another platform"
     else if (findLake(b) == null)
         "no Lean toolchain: set LAKE, put lake on PATH, or install elan (~/.elan/bin/lake)"
@@ -428,33 +427,38 @@ fn stageLeanKernels(
     }
     const lake = findLake(b).?;
     const dir: std.Build.InstallDir = .{ .custom = "libexec/metacodes" };
+    // The executable resolves `<prefix>/libexec/metacodes/<kernel>[.exe]`
+    // (src/util/toolchain.zig); the scripts run under Git Bash on Windows.
+    const exe_suffix = if (target.result.os.tag == .windows) ".exe" else "";
+    const formal_name = b.fmt("metacodes-formal-kernel{s}", .{exe_suffix});
+    const project_name = b.fmt("metacodes-project-kernel{s}", .{exe_suffix});
 
     const formal = b.addSystemCommand(&.{"bash"});
     formal.setName("build formal kernel");
     formal.addFileArg(b.path("scripts/build-formal-kernel.sh"));
-    const formal_bin = formal.addOutputFileArg("metacodes-formal-kernel");
-    const formal_provenance = formal.addOutputFileArg("metacodes-formal-kernel.provenance.json");
-    const formal_receipt = formal.addOutputFileArg("metacodes-formal-kernel.build-receipt.json");
+    const formal_bin = formal.addOutputFileArg(formal_name);
+    const formal_provenance = formal.addOutputFileArg(b.fmt("{s}.provenance.json", .{formal_name}));
+    const formal_receipt = formal.addOutputFileArg(b.fmt("{s}.build-receipt.json", .{formal_name}));
     formal.setEnvironmentVariable("LAKE", lake);
     addLeanSourceInputs(b, formal);
 
     const project = b.addSystemCommand(&.{"bash"});
     project.setName("build project kernel");
     project.addFileArg(b.path("scripts/build-project-harness-kernel.sh"));
-    const project_bin = project.addOutputFileArg("metacodes-project-kernel");
-    const project_provenance = project.addOutputFileArg("metacodes-project-kernel.provenance.json");
+    const project_bin = project.addOutputFileArg(project_name);
+    const project_provenance = project.addOutputFileArg(b.fmt("{s}.provenance.json", .{project_name}));
     project.setEnvironmentVariable("LAKE", lake);
     addLeanSourceInputs(b, project);
     // Both scripts drive Lake in the same control-plane/lean/.lake.
     project.step.dependOn(&formal.step);
 
-    const install_formal = b.addInstallFileWithDir(formal_bin, dir, "metacodes-formal-kernel");
-    const install_formal_provenance = b.addInstallFileWithDir(formal_provenance, dir, "metacodes-formal-kernel.provenance.json");
-    const install_formal_receipt = b.addInstallFileWithDir(formal_receipt, dir, "metacodes-formal-kernel.build-receipt.json");
+    const install_formal = b.addInstallFileWithDir(formal_bin, dir, formal_name);
+    const install_formal_provenance = b.addInstallFileWithDir(formal_provenance, dir, b.fmt("{s}.provenance.json", .{formal_name}));
+    const install_formal_receipt = b.addInstallFileWithDir(formal_receipt, dir, b.fmt("{s}.build-receipt.json", .{formal_name}));
     install_formal.step.dependOn(&install_formal_provenance.step);
     install_formal.step.dependOn(&install_formal_receipt.step);
-    const install_project = b.addInstallFileWithDir(project_bin, dir, "metacodes-project-kernel");
-    const install_project_provenance = b.addInstallFileWithDir(project_provenance, dir, "metacodes-project-kernel.provenance.json");
+    const install_project = b.addInstallFileWithDir(project_bin, dir, project_name);
+    const install_project_provenance = b.addInstallFileWithDir(project_provenance, dir, b.fmt("{s}.provenance.json", .{project_name}));
     install_project.step.dependOn(&install_project_provenance.step);
     stage_step.dependOn(&install_formal.step);
     stage_step.dependOn(&install_project.step);
@@ -463,12 +467,12 @@ fn stageLeanKernels(
     return .{
         .formal = if (env.get("METACODES_TEST_FORMAL_KERNEL_PATH") != null) null else .{
             .install_step = &install_formal.step,
-            .installed_path = b.getInstallPath(dir, "metacodes-formal-kernel"),
+            .installed_path = b.getInstallPath(dir, formal_name),
             .path_variable = "METACODES_TEST_FORMAL_KERNEL_PATH",
         },
         .project = if (env.get("METACODES_TEST_PROJECT_KERNEL_PATH") != null) null else .{
             .install_step = &install_project.step,
-            .installed_path = b.getInstallPath(dir, "metacodes-project-kernel"),
+            .installed_path = b.getInstallPath(dir, project_name),
             .path_variable = "METACODES_TEST_PROJECT_KERNEL_PATH",
         },
     };
