@@ -354,12 +354,69 @@ fn wireLeanKernelTestInputs(run: *std.Build.Step.Run, staged: StagedLeanKernels)
 }
 
 /// The `lake` the kernel scripts run: `$LAKE`, else PATH, else elan's default
-/// `~/.elan/bin`. The toolchain is the only shared input; every kernel it builds
-/// lands in this build's own prefix.
+/// `~/.elan/bin` (`%USERPROFILE%\.elan\bin` on Windows, where cmd and
+/// PowerShell set no HOME). The toolchain is the only shared input; every
+/// kernel it builds lands in this build's own prefix.
 fn findLake(b: *std.Build) ?[]const u8 {
-    if (b.graph.environ_map.get("LAKE")) |lake| if (lake.len != 0) return lake;
-    const home = b.graph.environ_map.get("HOME") orelse return b.findProgram(&.{"lake"}, &.{}) catch null;
+    const env = &b.graph.environ_map;
+    if (env.get("LAKE")) |lake| if (lake.len != 0) return lake;
+    const home = env.get("HOME") orelse
+        (if (b.graph.host.result.os.tag == .windows) env.get("USERPROFILE") else null) orelse
+        return b.findProgram(&.{"lake"}, &.{}) catch null;
     return b.findProgram(&.{"lake"}, &.{b.pathJoin(&.{ home, ".elan", "bin" })}) catch null;
+}
+
+/// The bash the kernel scripts run under. On Windows it must be Git Bash
+/// (MSYS2): the scripts take Windows paths and build a Windows kernel, but the
+/// `bash` cmd finds first is often WSL's launcher (System32\bash.exe or the
+/// WindowsApps alias), whose Linux shell can do neither. The first other
+/// bash.exe on PATH wins, else the one Git for Windows ships beside `git`.
+fn findBash(b: *std.Build) ?[]const u8 {
+    if (b.graph.host.result.os.tag != .windows) return "bash";
+    const io = b.graph.io;
+    if (b.graph.environ_map.get("PATH")) |path| {
+        var dirs = std.mem.tokenizeScalar(u8, path, ';');
+        while (dirs.next()) |raw_dir| {
+            const dir = std.mem.trimEnd(u8, raw_dir, "\\/");
+            const base = std.fs.path.basenameWindows(dir);
+            if (std.ascii.eqlIgnoreCase(base, "System32") or std.ascii.eqlIgnoreCase(base, "WindowsApps")) continue;
+            const candidate = b.pathJoin(&.{ dir, "bash.exe" });
+            std.Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
+            return candidate;
+        }
+    }
+    // Git for Windows: <root>\cmd\git.exe or <root>\mingw64\bin\git.exe, with
+    // the bash launcher at <root>\bin\bash.exe.
+    const git = b.findProgram(&.{"git"}, &.{}) catch return null;
+    var root = std.fs.path.dirnameWindows(git);
+    for (0..3) |_| {
+        const dir = root orelse return null;
+        const candidate = b.pathJoin(&.{ dir, "bin", "bash.exe" });
+        if (std.Io.Dir.accessAbsolute(io, candidate, .{})) |_| return candidate else |_| {}
+        root = std.fs.path.dirnameWindows(dir);
+    }
+    return null;
+}
+
+/// `<bash> <script> --lake <lake>`, with an empty pipe for stdin. A Run step
+/// with output-file arguments gets stdin and stdout "ignored", which Zig 0.16
+/// realises on Windows as one shared \Device\Null handle in both slots; the
+/// MSYS runtime behind Git Bash makes stderr distinct from stdout but not
+/// stdin. The first `$(...)` then closes the shared handle, and every native
+/// program started in a later command substitution inherits a dead or reused
+/// stdin: the elan `lake` proxy failed with "The handle is invalid (os error
+/// 6)" or "The request is not supported (os error 50)", and MSYS tools with
+/// EBADF (#180).
+fn addKernelScript(b: *std.Build, bash: []const u8, name: []const u8, script: []const u8, lake: []const u8) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{bash});
+    run.setName(name);
+    run.setStdIn(.{ .bytes = "" });
+    run.addFileArg(b.path(script));
+    // An argument, not setEnvironmentVariable: setting one variable copies the
+    // whole environment into the cache key, and the kernels (with their
+    // timestamped receipt) would rebuild whenever any variable changed.
+    run.addArgs(&.{ "--lake", lake });
+    return run;
 }
 
 /// Every source the kernels are built from, so the cached build reruns exactly
@@ -407,6 +464,8 @@ fn stageLeanKernels(
         "Lean kernels are native host executables; this build targets another platform"
     else if (findLake(b) == null)
         "no Lean toolchain: set LAKE, put lake on PATH, or install elan (~/.elan/bin/lake)"
+    else if (findBash(b) == null)
+        "no Git Bash: the kernel scripts need Git for Windows' bash.exe on PATH or beside git (WSL's bash cannot build a Windows kernel)"
     else
         null;
     if (unavailable) |reason| {
@@ -430,6 +489,7 @@ fn stageLeanKernels(
         };
     }
     const lake = findLake(b).?;
+    const bash = findBash(b).?;
     const dir: std.Build.InstallDir = .{ .custom = "libexec/metacodes" };
     // The executable resolves `<prefix>/libexec/metacodes/<kernel>[.exe]`
     // (src/util/toolchain.zig); the scripts run under Git Bash on Windows.
@@ -437,22 +497,13 @@ fn stageLeanKernels(
     const formal_name = b.fmt("metacodes-formal-kernel{s}", .{exe_suffix});
     const project_name = b.fmt("metacodes-project-kernel{s}", .{exe_suffix});
 
-    const formal = b.addSystemCommand(&.{"bash"});
-    formal.setName("build formal kernel");
-    formal.addFileArg(b.path("scripts/build-formal-kernel.sh"));
-    // An argument, not setEnvironmentVariable: setting one variable copies the
-    // whole environment into the cache key, and the kernels (with their
-    // timestamped receipt) would rebuild whenever any variable changed.
-    formal.addArgs(&.{ "--lake", lake });
+    const formal = addKernelScript(b, bash, "build formal kernel", "scripts/build-formal-kernel.sh", lake);
     const formal_bin = formal.addOutputFileArg(formal_name);
     const formal_provenance = formal.addOutputFileArg(b.fmt("{s}.provenance.json", .{formal_name}));
     const formal_receipt = formal.addOutputFileArg(b.fmt("{s}.build-receipt.json", .{formal_name}));
     addLeanSourceInputs(b, formal);
 
-    const project = b.addSystemCommand(&.{"bash"});
-    project.setName("build project kernel");
-    project.addFileArg(b.path("scripts/build-project-harness-kernel.sh"));
-    project.addArgs(&.{ "--lake", lake });
+    const project = addKernelScript(b, bash, "build project kernel", "scripts/build-project-harness-kernel.sh", lake);
     const project_bin = project.addOutputFileArg(project_name);
     const project_provenance = project.addOutputFileArg(b.fmt("{s}.provenance.json", .{project_name}));
     addLeanSourceInputs(b, project);

@@ -83,7 +83,8 @@ zig build test:lib -Doptimize=ReleaseSafe
 With a Lean toolchain (elan) on the machine, `zig build test` also builds both
 governance kernels from this checkout (`kernels:stage`, cached on the Lean
 sources) and runs every kernel-gated test against them; `-Dlean-kernels=on`
-turns a missing toolchain into a failure, `off` skips the kernels. A release
+turns a missing toolchain into a failure, `off` skips the kernels. On Windows
+the kernel scripts run under Git for Windows' bash, never WSL's. A release
 unit from source is `zig build kernels:stage --prefix <u>` followed by
 `zig build release:verify -Drelease-layout=true --prefix <u> $(python3
 scripts/kernel_pins.py <u>)`; `<u>/bin/metacodes install --prefix <dir>` then

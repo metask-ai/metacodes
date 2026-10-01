@@ -61,19 +61,6 @@ if ! axiom_audit=$(cd "$lean_dir" && "$lake" env lean ProjectHarnessAxiomAudit.l
   printf '%s\n' "$axiom_audit" >&2
   exit 1
 fi
-# The provenance label, taken here, right after the audit's call through the
-# same Lake: on the Windows runner a later call through the elan proxy fails
-# to start the toolchain's lake.exe ("The handle is invalid", os error 6;
-# os error 50 through a pipe) once the native smokes below have run, while
-# this position works on every host.  The label is Lake's own version line
-# ("Lake version … (Lean version 4.14.0)"), so no Lean child is started.
-if ! lean_version=$(cd "$lean_dir" && "$lake" --version 2>&1); then
-  echo "build-project-harness-kernel: \`lake --version\` failed:" >&2
-  printf '%s\n' "$lean_version" >&2
-  exit 1
-fi
-lean_version=${lean_version//$'\r'/}
-lean_version=${lean_version//$'\n'/}
 axiom_audit=${axiom_audit//$'\r'/} # Windows: Lean writes CRLF
 expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.correction_promotion_requires_receipt' depends on axioms: [propext]
@@ -331,10 +318,12 @@ aggregate_inexact_verdict=$(printf '%s' "$aggregate_inexact" | "$output")
   exit 1
 }
 
+# The file goes in on stdin: GNU sha256sum starts its line with `\` when the
+# name holds a backslash, and the build graph passes Windows paths here.
 if command -v shasum >/dev/null 2>&1; then
-  hash_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+  hash_file() { shasum -a 256 <"$1" | awk '{print $1}'; }
 else
-  hash_file() { sha256sum "$1" | awk '{print $1}'; }
+  hash_file() { sha256sum <"$1" | awk '{print $1}'; }
 fi
 binary_sha256=$(hash_file "$output")
 kernel_source_sha256=$(hash_file "$lean_dir/MetaCodesControl/ProjectHarness.lean")
@@ -350,6 +339,12 @@ else
   binary_bytes=$(stat -c '%s' "$output")
 fi
 host_arch=$(uname -m)
+if ! lean_version=$(cd "$lean_dir" && "$lake" env lean --version); then
+  echo "build-project-harness-kernel: \`lake env lean --version\` failed" >&2
+  exit 1
+fi
+lean_version=${lean_version//$'\r'/} # Windows: Lean writes CRLF
+lean_version=${lean_version//$'\n'/}
 printf '%s\n' \
   "{\"schema_version\":\"metacodes-project-kernel-artifact-v6\",\"checker_version\":\"metacodes-project-harness-kernel-v3\",\"request_schema\":\"metacodes-project-harness-request-v3\",\"verdict_schema\":\"metacodes-project-harness-verdict-v3\",\"batch_request_schema\":\"metacodes-project-harness-batch-request-v3\",\"batch_verdict_schema\":\"metacodes-project-harness-batch-verdict-v3\",\"impact_request_schema\":\"metacodes-rule-impact-governance-request-v1\",\"impact_verdict_schema\":\"metacodes-rule-impact-governance-verdict-v1\",\"impact_aggregate_request_schema\":\"metacodes-rule-impact-aggregate-governance-request-v1\",\"impact_aggregate_verdict_schema\":\"metacodes-rule-impact-aggregate-governance-verdict-v1\",\"max_batch_requests\":1024,\"max_impact_aggregate_members\":64,\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"rule_source_sha256\":\"$rule_source_sha256\",\"impact_source_sha256\":\"$impact_source_sha256\",\"impact_aggregate_source_sha256\":\"$impact_aggregate_source_sha256\",\"formal_kernel_source_sha256\":\"$formal_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_source_sha256\",\"axiom_policy\":\"propext\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"native_rule_author_promotion_smoke\":\"passed\",\"native_batch_smoke\":\"passed\",\"native_recovery_smoke\":\"passed\",\"native_impact_smoke\":\"passed\",\"native_impact_aggregate_smoke\":\"passed\"}" >"$manifest"
 
