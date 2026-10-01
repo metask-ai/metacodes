@@ -560,6 +560,7 @@ fn buildOptions(
         .cwd_abs = app.cwdAbs(),
         .additional_dirs = app.additionalDirs(),
         .home_dir = app.homeDir(),
+        .state_root = app.stateRoot(),
         .artifact_root = app.sessionDir() orelse "",
         .metask_ledger_protocol = if (std.ascii.eqlIgnoreCase(app.config.provider_profile orelse "", "metask"))
             if (app.config.provider_kind == .openai) "openai_chat" else "anthropic_messages"

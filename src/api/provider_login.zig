@@ -37,6 +37,9 @@ pub const Options = struct {
     timeout_seconds: u32 = 300,
     /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
     abort_signal: ?*const AbortSignal = null,
+    /// The host's state root: the login is stored under `<state_root>/oauth`
+    /// (unless METACODES_OAUTH_DIR overrides it).
+    state_root: []const u8 = "",
 };
 
 /// A stored login for this profile would never be consulted.
@@ -67,7 +70,7 @@ pub fn refusalText(err: PrepareError, method: Method) []const u8 {
             .loopback => "that provider declares no OAuth authorization endpoint",
             .device_code => "that provider declares no device authorization endpoint",
         },
-        error.ClientIdMissing => "that provider declares no OAuth client id; pass --client-id or set providers.<id>.oauth_client_id in ~/.metacodes/config.json",
+        error.ClientIdMissing => "that provider declares no OAuth client id; pass --client-id or set providers.<id>.oauth_client_id in <state root>/config.json",
     };
 }
 
@@ -137,7 +140,7 @@ pub const Prepared = struct {
             std.crypto.secureZero(u8, token_json);
             allocator.free(token_json);
         }
-        try importTokenResponse(allocator, self.profile.id, token_json, self.client_id, diagnostic);
+        try importTokenResponse(allocator, self.options.state_root, self.profile.id, token_json, self.client_id, diagnostic);
         return .{ .provider_id = self.profile.id, .client_id_source = self.client_id_source };
     }
 };
@@ -217,6 +220,7 @@ pub fn loginInteractive(
 /// The one durable import both provider login paths end in.
 pub fn importTokenResponse(
     allocator: std.mem.Allocator,
+    state_root: []const u8,
     provider_id: provider_ids.Slug,
     token_json: []const u8,
     client_id: ?[]const u8,
@@ -232,7 +236,7 @@ pub fn importTokenResponse(
         if (!metask_oauth.isGatewayOrigin(outcome.gateway_url.?)) return error.MetaskGatewayNotOrigin;
     }
 
-    var session = provider_oauth.Session.initHome(allocator, provider_id) catch |err|
+    var session = provider_oauth.Session.initHome(allocator, state_root, provider_id) catch |err|
         return failed(diagnostic, err, error.StoreOpenFailed);
     defer session.deinit();
     // Recorded before the import so it lands in the same atomic write as the

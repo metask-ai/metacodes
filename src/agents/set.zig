@@ -32,9 +32,10 @@ pub const AgentSet = struct {
         self.agents.deinit(self.allocator);
     }
 
-    /// 标准加载入口。cwd 用于沿父级向上扫 project 级;"" 跳过。
+    /// 标准加载入口。cwd 用于沿父级向上扫 project 级;"" 跳过。不读状态根下的
+    /// personal agents(宿主经 loadFromStandardPathsWithPluginSources 传入状态根)。
     pub fn loadFromStandardPaths(self: *AgentSet, cwd: []const u8) !void {
-        return self.loadFromStandardPathsWithPluginSources(cwd, &.{});
+        return self.loadFromStandardPathsWithPluginSources(cwd, &.{}, "");
     }
 
     /// 加载顺序严格保持 builtin < plugin < personal < project。插件 agent 的
@@ -44,6 +45,9 @@ pub const AgentSet = struct {
         self: *AgentSet,
         cwd: []const u8,
         plugin_sources: []const plugin_runtime.AgentSource,
+        /// Host state root; `<state_root>/agents` is the personal tier after
+        /// `~/.claude/agents`. "" skips it.
+        state_root: []const u8,
     ) !void {
         // 0. builtin
         try injectBuiltins(self);
@@ -53,13 +57,14 @@ pub const AgentSet = struct {
             try self.loadFromPluginDirRecursive(source.root, source.namespace);
         }
 
-        // 2. personal: ~/.claude/agents 然后 ~/.metacodes/agents
+        // 2. personal: ~/.claude/agents 然后 <state root>/agents
         if (@import("platform").paths.homeDir()) |home| {
             const claude_path = try std.fmt.allocPrint(self.allocator, "{s}/.claude/agents", .{home});
             defer self.allocator.free(claude_path);
             try self.loadFromDirRecursive(claude_path, .personal);
-
-            const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/.metacodes/agents", .{home});
+        }
+        if (state_root.len > 0) {
+            const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/agents", .{state_root});
             defer self.allocator.free(cczig_path);
             try self.loadFromDirRecursive(cczig_path, .personal);
         }

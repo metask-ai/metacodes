@@ -1067,7 +1067,7 @@ test "build:kg 未就绪 → null(不阻塞)" {
     const a = std.testing.allocator;
     var conv = conv_mod.Conversation.init(a);
     defer conv.deinit();
-    var kg = try client_mod.KgClient.init(a, .{ .home = "/tmp", .domain = "d", .env_bin = "", .env_store = "" });
+    var kg = try client_mod.KgClient.init(a, .{ .state_root = "/tmp", .domain = "d", .env_bin = "", .env_store = "" });
     defer kg.deinit();
     var ab = AbortSignal.init();
     try std.testing.expect((try build(a, &kg, &conv, &ab, .{})) == null);

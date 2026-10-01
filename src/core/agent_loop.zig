@@ -428,6 +428,8 @@ pub const Options = struct {
     /// embedding AgentSession 显式开启，使 Host 提供的 Workspace 真正成为工具执行基准。
     resolve_relative_paths: bool = false,
     home_dir: []const u8 = "",
+    /// Host-injected state root (util/state_root.zig), propagated to every ToolContext.
+    state_root: []const u8 = "",
     /// Session directory that owns recoverable tool-result artifacts. The
     /// artifact envelope never exposes this path to the model.
     artifact_root: []const u8 = "",
@@ -1643,6 +1645,7 @@ pub fn run(
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
+            .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,
             // Mirrors base_ctx: Bash bounds its own channels against this, so a
             // prefetched Bash result must be sized by the same window as a
@@ -1775,7 +1778,7 @@ pub fn run(
                         .retry_attempt = provider.retryAttempt(),
                         .wall_elapsed_ms = elapsedSinceNs(model_request_started_ns),
                     };
-                    @import("../provider/metask_ledger.zig").append(allocator, failed_record) catch |ledger_err|
+                    @import("../provider/metask_ledger.zig").append(allocator, opts.state_root, failed_record) catch |ledger_err|
                         log.debug("ledger", "Metask failed-request ledger append failed: {s}", .{@errorName(ledger_err)});
                 }
                 const attempt_outcome: execution_effect.ProviderAttemptOutcome = switch (err) {
@@ -1892,7 +1895,7 @@ pub fn run(
                     .cache_creation_tokens = cache_creation_tokens,
                     .wall_elapsed_ms = elapsedSinceNs(model_request_started_ns),
                 };
-                @import("../provider/metask_ledger.zig").append(allocator, record) catch |err|
+                @import("../provider/metask_ledger.zig").append(allocator, opts.state_root, record) catch |err|
                     log.debug("ledger", "Metask ledger append failed: {s}", .{@errorName(err)});
             };
             while (true) {
@@ -2938,6 +2941,7 @@ pub fn run(
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
+            .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,
             // The same value the projection pass below uses. Deriving it here
             // is what lets a tool bound its own output against the real window

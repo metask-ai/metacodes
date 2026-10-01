@@ -33,6 +33,7 @@ fn envNonEmpty(name: [*:0]const u8) ?[]const u8 {
 // 读环境(测试会 setEnv 后再调),并发调用写入同样的字节,无害。
 var home_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
 var temp_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
+var state_home_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
 
 fn envNonEmptyW(name: [*:0]const u16, out: []u8) ?[]const u8 {
     var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
@@ -53,6 +54,12 @@ pub fn homeDir() ?[]const u8 {
         return null;
     }
     return envNonEmpty("HOME");
+}
+
+/// `METACODES_HOME`(util/state_root.zig 的状态根覆盖),UTF-8;空值=未设。
+pub fn metacodesHomeEnv() ?[]const u8 {
+    if (is_windows) return envNonEmptyW(std.unicode.utf8ToUtf16LeStringLiteral("METACODES_HOME"), &state_home_utf8);
+    return envNonEmpty("METACODES_HOME");
 }
 
 /// 临时目录。POSIX=$TMPDIR or /tmp;Windows=$TEMP or $TMP or C:\Windows\Temp,UTF-8。

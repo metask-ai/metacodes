@@ -1,7 +1,7 @@
 //! Atomic, revisioned writer for control-plane documents (issue #16, "Write
 //! and crash-safety contract").
 //!
-//! One writer owns `~/.metacodes/config.json`'s control-plane keys and any
+//! One writer owns `<state root>/config.json`'s control-plane keys and any
 //! durable per-session `runtime-selection.json`. Every commit:
 //!
 //! 1. takes the cross-process lock for that path;
@@ -96,14 +96,14 @@ pub const Store = struct {
         return .{ .allocator = allocator, .path = try allocator.dupe(u8, path) };
     }
 
-    /// `~/.metacodes/config.json`, or `METACODES_CONFIG_FILE` when set.
-    pub fn initHome(allocator: std.mem.Allocator) StoreError!Store {
+    /// `METACODES_CONFIG_FILE` when set, else `<state_root>/config.json`; an
+    /// empty root is `error.NoHome`.
+    pub fn initHome(allocator: std.mem.Allocator, state_root: []const u8) StoreError!Store {
         if (std.c.getenv(CONFIG_PATH_ENV)) |raw| {
             return initPath(allocator, std.mem.span(raw));
         }
-        const home = @import("platform").paths.homeDir() orelse return error.NoHome;
-        const path = std.fmt.allocPrint(allocator, "{s}/.metacodes/config.json", .{home}) catch
-            return error.OutOfMemory;
+        if (state_root.len == 0) return error.NoHome;
+        const path = std.fs.path.join(allocator, &.{ state_root, "config.json" }) catch return error.OutOfMemory;
         return .{ .allocator = allocator, .path = path };
     }
 
@@ -498,21 +498,21 @@ test "an empty idempotency key is rejected rather than matching every other one"
     try std.testing.expect(!anonymous.idempotent_replay);
 }
 
-test "the home store resolves either the override or the home path" {
+test "the home store resolves either the override or <state_root>/config.json" {
     const a = std.testing.allocator;
     // `initHome` is the production entry point. Assert the branch this
     // environment actually takes rather than mutating the process environment,
     // which would leak into every other test in the shard.
-    var store = Store.initHome(a) catch |err| {
-        try std.testing.expectEqual(StoreError.NoHome, err);
-        return;
-    };
-    defer store.deinit();
     if (std.c.getenv(CONFIG_PATH_ENV)) |raw| {
+        var store = try Store.initHome(a, "/state");
+        defer store.deinit();
         try std.testing.expectEqualStrings(std.mem.span(raw), store.path);
-    } else {
-        try std.testing.expect(std.mem.endsWith(u8, store.path, "/.metacodes/config.json"));
+        return;
     }
+    var store = try Store.initHome(a, "/state");
+    defer store.deinit();
+    try std.testing.expectEqualStrings("/state/config.json", store.path);
+    try std.testing.expectError(StoreError.NoHome, Store.initHome(a, ""));
 }
 
 test "two sessions keep separate selections and neither touches the other" {

@@ -6,7 +6,7 @@
 //! 硬编码模型 ID(issue #11:Explore pin "haiku" 在 metask 中继上被解析成
 //! Anthropic ID,子请求 503 而父会话正常的差分根源)。
 //!
-//! 配置来源:`~/.metacodes/config.json` 顶层 `model_tiers` 字段,按 provider
+//! 配置来源:`<state_root>/config.json` 顶层 `model_tiers` 字段,按 provider
 //! kind 分组:
 //!
 //! ```json
@@ -132,11 +132,11 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-/// 读 `~/.metacodes/config.json` 并解析 model_tiers。文件缺失/不可读 → null
+/// 读 `<state_root>/config.json` 并解析 model_tiers。文件缺失/不可读 → null
 /// (未配置);解析错误原样上抛(调用方决定降级策略并告警)。
-pub fn loadFromHome(allocator: std.mem.Allocator, home: []const u8) ParseError!?TierTable {
+pub fn loadFromHome(allocator: std.mem.Allocator, state_root: []const u8) ParseError!?TierTable {
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/.metacodes/config.json\x00", .{home}) catch return null;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/config.json\x00", .{state_root}) catch return null;
     const pfs = @import("platform").fs;
     const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;

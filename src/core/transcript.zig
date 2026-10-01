@@ -1,7 +1,7 @@
 //! Session transcript 持久化。
 //!
 //! 设计：
-//! - **布局**：`$HOME/.metacodes/projects/<cwd_hash>/<session_id>/transcript.jsonl + meta.json`
+//! - **布局**：`<state_root>/projects/<cwd_hash>/<session_id>/transcript.jsonl + meta.json`(状态根见 util/state_root.zig;默认 `~/.metacodes`)
 //! - `cwd_hash`：cwd 的 xxhash64 → 16-char hex；同一项目目录的 session 聚在一起
 //! - `session_id`：启动时生成（毫秒时间戳 hex + 4 byte 随机 hex），自然按时间排序
 //! - **transcript.jsonl**：每 turn 结束时把 **新增** 的 message 追加成 JSONL
@@ -87,15 +87,16 @@ pub const Writer = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         cwd: []const u8,
-        home: []const u8,
+        /// The host's state root (util/state_root.zig).
+        state_root: []const u8,
         model: []const u8,
         /// 会话 id(由 App 传入,统一 App.session_id 与 transcript 目录名)。
         sid: SessionId,
     ) !Writer {
         const cwd_hash = hashCwd(cwd);
 
-        // 构造路径 $HOME/.metacodes/projects/<cwd_hash>/<session_id>/
-        const dir = try std.fmt.allocPrint(allocator, "{s}/.metacodes/projects/{s}/{s}", .{ home, cwd_hash[0..], sid.bytes[0..] });
+        // 构造路径 <state_root>/projects/<cwd_hash>/<session_id>/
+        const dir = try std.fmt.allocPrint(allocator, "{s}/projects/{s}/{s}", .{ state_root, cwd_hash[0..], sid.bytes[0..] });
         errdefer allocator.free(dir);
 
         // mkdir -p 递归
@@ -719,7 +720,7 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
 }
 
 // ============================================================================
-// Session 列表：扫 `$HOME/.metacodes/projects/<cwd_hash>/` 所有子目录读 meta.json
+// Session 列表：扫 `<state_root>/projects/<cwd_hash>/` 所有子目录读 meta.json
 // ============================================================================
 
 pub const SessionListEntry = struct {
@@ -733,10 +734,10 @@ pub const SessionListEntry = struct {
 
 /// 扫项目目录下所有 session，返回按 last_modified 降序的数组。
 /// 调用方负责 free 每个 entry 的各字段和 slice。
-pub fn listSessions(cwd: []const u8, home: []const u8, allocator: std.mem.Allocator) ![]SessionListEntry {
+pub fn listSessions(cwd: []const u8, state_root: []const u8, allocator: std.mem.Allocator) ![]SessionListEntry {
     const cwd_hash = hashCwd(cwd);
     var root_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const root_path = try std.fmt.bufPrint(&root_buf, "{s}/.metacodes/projects/{s}\x00", .{ home, cwd_hash[0..] });
+    const root_path = try std.fmt.bufPrint(&root_buf, "{s}/projects/{s}\x00", .{ state_root, cwd_hash[0..] });
 
     // 打开目录(可移植遍历)
     var it = pdir.open(@ptrCast(root_path.ptr)) orelse {
@@ -766,7 +767,7 @@ pub fn listSessions(cwd: []const u8, home: []const u8, allocator: std.mem.Alloca
         if (std.mem.eql(u8, &parsed_id.bytes, &SessionId.single.bytes)) continue;
         // 不判断 is_dir 兼容性——后面 readMeta 失败会跳过
 
-        const full_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/projects/{s}/{s}", .{ home, cwd_hash[0..], name });
+        const full_path = try std.fmt.allocPrint(allocator, "{s}/projects/{s}/{s}", .{ state_root, cwd_hash[0..], name });
         errdefer allocator.free(full_path);
 
         // 读 meta.json

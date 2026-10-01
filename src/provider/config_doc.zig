@@ -3,7 +3,7 @@
 //!
 //! This module owns the *document*: its schema version, monotonic revision,
 //! provider map, aliases, and global selection, plus the exact bytes written to
-//! and read from `~/.metacodes/config.json`. It performs no I/O, so the
+//! and read from `<state root>/config.json`. It performs no I/O, so the
 //! contract — round-trip fidelity, migration, rejection of newer schemas — is
 //! testable without a filesystem. `config_store.zig` owns the atomic write.
 //!

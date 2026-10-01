@@ -58,7 +58,7 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
 
-    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
     // deinit 会 kill(99999)(无害:不存在的 pid)+ free。
     defer sw.deinit();
 
@@ -91,7 +91,7 @@ test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {
     defer tf.deinit();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
-    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
     defer sw.deinit();
     try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true));
 }
@@ -107,7 +107,7 @@ test "L2 SW6: process teammate rejects a parent session different from swarm rou
     defer tf.deinit();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
-    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
     defer sw.deinit();
     try std.testing.expectError(
         error.SessionMismatch,
@@ -232,7 +232,7 @@ fn runGit(a: std.mem.Allocator, cwd: []const u8, args: []const []const u8) bool 
 test "L2 SW6 F7: 进程外 teammate 先等死再收尸——已死收掉,存活拒删,terminate 不留僵尸" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX fork/waitpid
     const a = std.testing.allocator;
-    var sw = swctx.SwarmContext{ .allocator = a, .home = "" };
+    var sw = swctx.SwarmContext{ .allocator = a, .state_root = "" };
     defer sw.deinit();
 
     // ① 立即退出的子进程:reap 应收尸并摘除记录(修 008 僵尸)。
@@ -289,7 +289,7 @@ test "L2: lead 的 --no-lsp 跟着进程外 teammate 过进程边界" {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
         try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
 
-        var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .home = home, .team_sanitized = try a.dupe(u8, "proj") };
+        var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
         defer sw.deinit();
 
         g_mock_flags_len = 0;

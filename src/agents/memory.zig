@@ -9,14 +9,16 @@ pub fn resolveDir(
     allocator: std.mem.Allocator,
     agent_name: []const u8,
     scope: MemoryScope,
-    home_dir: []const u8,
+    /// Host state root (util/state_root.zig): user-scope memory lives at
+    /// `<state_root>/agent-memory/<agent>`.
+    state_root: []const u8,
     project_dir: []const u8,
 ) !?[]u8 {
     if (scope == .none) return null;
 
     const base = switch (scope) {
         .none => unreachable,
-        .user => home_dir,
+        .user => state_root,
         .project, .local => project_dir,
     };
     if (base.len == 0) return error.AgentMemoryBaseUnavailable;
@@ -27,7 +29,7 @@ pub fn resolveDir(
     defer allocator.free(safe_name);
     const rel = switch (scope) {
         .none => unreachable,
-        .user => ".metacodes/agent-memory",
+        .user => "agent-memory",
         .project => ".metacodes/agent-memory",
         .local => ".metacodes/agent-memory-local",
     };
@@ -134,7 +136,7 @@ test "resolveDir maps scopes and sanitizes names" {
     const user = (try resolveDir(a, "plugin:reviewer", .user, base, "/repo")).?;
     defer a.free(user);
     const sep = std.fs.path.sep_str; // realpath 归一成原生分隔符,期望值须同源
-    const expected_user = try std.fmt.allocPrint(a, "{s}{s}.metacodes{s}agent-memory{s}plugin-reviewer-7d93a418a742abe5cefae5e0078afe85", .{ base, sep, sep, sep });
+    const expected_user = try std.fmt.allocPrint(a, "{s}{s}agent-memory{s}plugin-reviewer-7d93a418a742abe5cefae5e0078afe85", .{ base, sep, sep });
     defer a.free(expected_user);
     try std.testing.expectEqualStrings(expected_user, user);
 

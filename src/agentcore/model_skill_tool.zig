@@ -579,6 +579,7 @@ pub const Environment = struct {
                 .cwd_abs = self.session.workspace.root,
                 .resolve_relative_paths = true,
                 .home_dir = self.session.workspace.home,
+                .state_root = self.session.workspace.state_root,
                 .additional_dirs = self.session.permission_ctx.match_ctx.additional_dirs,
             },
             &child_backend,

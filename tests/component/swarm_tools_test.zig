@@ -82,7 +82,7 @@ test "L2 SW2 端到端: TeamCreate → Task spawn teammate → SendMessage → p
 
     var sw = swctx.SwarmContext{
         .allocator = a,
-        .home = home,
+        .state_root = home,
         .api_key = "k",
         .base_url = url,
         .model = "claude-sonnet-4-20250514",
@@ -210,7 +210,7 @@ test "L2 SW2 F1/F2: teammate SendMessage 回 lead 送达 lead 邮箱" {
     defer cc.util_fs.testing.rmrfBestEffort(home);
     try cc.util_fs.mkdirParents(home);
 
-    var sw = swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
+    var sw = swctx.SwarmContext{ .allocator = a, .state_root = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
     defer sw.deinit();
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
@@ -290,7 +290,7 @@ test "L2 SW2 F6: SendMessage 广播送达两 teammate" {
     defer cc.util_fs.testing.rmrfBestEffort(home);
     try cc.util_fs.mkdirParents(home);
 
-    var sw = swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
+    var sw = swctx.SwarmContext{ .allocator = a, .state_root = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
     defer sw.deinit();
     srv.gateNextResponse();
     defer srv.releaseGatedResponse(); // release before sw.deinit joins teammates
@@ -342,7 +342,7 @@ test "L2 SW2: 非 lead 上下文的 Task(name) 被拒(teammate 不 spawn teammat
     try cc.util_fs.mkdirParents(home);
 
     // teammate 视角:is_lead=false。
-    var sw = swctx.SwarmContext{ .allocator = a, .home = home, .is_lead = false, .self_name = "bob" };
+    var sw = swctx.SwarmContext{ .allocator = a, .state_root = home, .is_lead = false, .self_name = "bob" };
     defer sw.deinit();
 
     const perm = cc.permission.createContext(.bypass_permissions, a);

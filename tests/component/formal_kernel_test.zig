@@ -54,6 +54,7 @@ test "L2 FormalAuditTask schema is TinyKG-gated and reaches fail-closed runtime"
     const ctx = cc.tool_context.ToolContext{
         .allocator = allocator,
         .home_dir = root_buffer[0..root_len],
+        .state_root = root_buffer[0..root_len],
     };
     const receipt = try cc.tools.executeTool(tool, &ctx, "{\"root_task_id\":1}");
     defer allocator.free(receipt);
@@ -100,16 +101,14 @@ fn findDefinition(definitions: []const cc.json_mod.ToolDefinition, name: []const
 
 test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, and receipt" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const raw_checker = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_PATH") orelse return error.SkipZigTest;
-    const raw_hash = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_SHA256") orelse return error.SkipZigTest;
+    const kernel = (try cc.formal_test_kernel.resolve(std.testing.io, .formal)) orelse return error.SkipZigTest;
     // This L2 intentionally exercises the production host-config seam. Avoid
     // clobbering a caller's deployment pin inside the aggregate test process.
     if (std.c.getenv("METACODES_FORMAL_KERNEL_PATH") != null or
         std.c.getenv("METACODES_FORMAL_KERNEL_SHA256") != null)
         return error.SkipZigTest;
-    const checker_path = std.mem.span(raw_checker);
-    const checker_hash = std.mem.span(raw_hash);
-    if (!std.fs.path.isAbsolute(checker_path) or checker_hash.len != 64) return error.SkipZigTest;
+    const checker_path = kernel.path;
+    const checker_hash: []const u8 = &kernel.expected_sha256;
 
     const allocator = std.testing.allocator;
     const checker_path_z = try allocator.dupeZ(u8, checker_path);
@@ -135,7 +134,7 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
     const store_path = try std.fmt.allocPrint(allocator, "{s}/formal-headless.kg", .{root});
     defer allocator.free(store_path);
     var kg = try cc.kg_client.KgClient.init(allocator, .{
-        .home = root,
+        .state_root = root,
         .domain = "formal-headless-l2",
         .config_bin = tinykg_bin,
         .config_store = store_path,
@@ -210,6 +209,7 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
             .max_turns = 2,
             .kg = &kg,
             .home_dir = root,
+            .state_root = root,
             .activated_tools = &activated,
         },
         &backend,
@@ -341,6 +341,7 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
     const tool_ctx = cc.tool_context.ToolContext{
         .allocator = allocator,
         .home_dir = root,
+        .state_root = root,
         .kg = &kg,
     };
     const blocked_receipt = try cc.tools.executeTool(formal_tool, &tool_ctx, args);
@@ -395,13 +396,9 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
 }
 
 test "L2 native formal audit consumes a real TinyKG task snapshot" {
-    const raw_checker = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_PATH") orelse return error.SkipZigTest;
-    const raw_hash = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_SHA256") orelse return error.SkipZigTest;
-    const checker_path = std.mem.span(raw_checker);
-    const hash_text = std.mem.span(raw_hash);
-    if (hash_text.len != 64) return error.SkipZigTest;
-    var expected_sha256: [64]u8 = undefined;
-    @memcpy(&expected_sha256, hash_text);
+    const kernel = (try cc.formal_test_kernel.resolve(std.testing.io, .formal)) orelse return error.SkipZigTest;
+    const checker_path = kernel.path;
+    const expected_sha256 = kernel.expected_sha256;
 
     const allocator = std.testing.allocator;
     const tinykg_bin = findTinyKg(allocator) orelse return error.SkipZigTest;
@@ -414,7 +411,7 @@ test "L2 native formal audit consumes a real TinyKG task snapshot" {
     const store_path = try std.fmt.allocPrint(allocator, "{s}/formal-real.kg", .{root});
     defer allocator.free(store_path);
     var kg = try cc.kg_client.KgClient.init(allocator, .{
-        .home = root,
+        .state_root = root,
         .domain = "formal-audit-l2",
         .config_bin = tinykg_bin,
         .config_store = store_path,
@@ -441,6 +438,7 @@ test "L2 native formal audit consumes a real TinyKG task snapshot" {
     const ctx = cc.tool_context.ToolContext{
         .allocator = allocator,
         .home_dir = root,
+        .state_root = root,
         .kg = &kg,
     };
     const receipt = try cc.formal_task_audit.executeWithConfig(
@@ -477,13 +475,9 @@ test "L2 native formal audit consumes a real TinyKG task snapshot" {
 }
 
 test "L2 native Lean derives reversible memory supersession from observed nodes" {
-    const raw_checker = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_PATH") orelse return error.SkipZigTest;
-    const raw_hash = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_SHA256") orelse return error.SkipZigTest;
-    const checker_path = std.mem.span(raw_checker);
-    const hash_text = std.mem.span(raw_hash);
-    if (hash_text.len != 64) return error.SkipZigTest;
-    var expected_sha256: [64]u8 = undefined;
-    @memcpy(&expected_sha256, hash_text);
+    const kernel = (try cc.formal_test_kernel.resolve(std.testing.io, .formal)) orelse return error.SkipZigTest;
+    const checker_path = kernel.path;
+    const expected_sha256 = kernel.expected_sha256;
 
     const revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const snapshot =

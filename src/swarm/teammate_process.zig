@@ -137,19 +137,19 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
         }
     }
 
-    const home = app.homeDir();
-    if (home.len == 0) {
-        log.err("swarm", "teammate process: no HOME", .{});
+    const state_dir = app.stateRoot();
+    if (state_dir.len == 0) {
+        log.err("swarm", "teammate process: no state root", .{});
         return 2;
     }
 
     // 路径。
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const inbox = team_mod.inboxPath(home, team_s, name_s, &inbox_buf);
+    const inbox = team_mod.inboxPath(state_dir, team_s, name_s, &inbox_buf);
     var lead_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const lead_inbox = team_mod.inboxPath(home, team_s, team_mod.TEAM_LEAD_NAME, &lead_buf);
+    const lead_inbox = team_mod.inboxPath(state_dir, team_s, team_mod.TEAM_LEAD_NAME, &lead_buf);
     var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const config_path = team_mod.configPath(home, team_s, &cfg_buf);
+    const config_path = team_mod.configPath(state_dir, team_s, &cfg_buf);
     // The process has no in-memory registry, so the persisted config is its
     // ownership boundary. Fail closed if the team was replaced, the member
     // was removed, or an old config lacks session identities.
@@ -166,7 +166,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
         .allocator = allocator,
         .session = parent_session,
         .lease = lease_id,
-        .home = home,
+        .state_root = state_dir,
         .self_name = name_s,
         .is_lead = false,
         .team_sanitized = team_owned,
@@ -231,7 +231,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
                 .sandbox = app.sandboxPtr(),
                 .cwd_abs = app.cwdAbs(),
                 .additional_dirs = app.additionalDirs(),
-                .home_dir = home,
+                .home_dir = app.homeDir(),
+                .state_root = app.stateRoot(),
                 .artifact_root = app.sessionDir() orelse "",
                 .tool_result_metrics = &app.tool_result_metrics,
                 // agent_ident 仍是进程自己的 24-hex session id，用于通用

@@ -17,15 +17,16 @@ pub const Worktree = struct {
 
     pub fn create(
         allocator: std.mem.Allocator,
-        home_dir: []const u8,
+        /// Host state root: worktrees live under `<state_root>/worktrees`.
+        state_root: []const u8,
         repo: []const u8,
         abort: anytype,
     ) !Worktree {
-        if (home_dir.len == 0 or repo.len == 0) return error.AgentWorktreeUnavailable;
+        if (state_root.len == 0 or repo.len == 0) return error.AgentWorktreeUnavailable;
         const id = @import("../core/session_id.zig").gen();
         const id_s = id.asSlice();
         const slug = id_s[0..@min(id_s.len, 12)];
-        const path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/worktrees/agent-{s}", .{ home_dir, slug });
+        const path = try std.fmt.allocPrint(allocator, "{s}/worktrees/agent-{s}", .{ state_root, slug });
         errdefer allocator.free(path);
         const repo_owned = try allocator.dupe(u8, repo);
         errdefer allocator.free(repo_owned);

@@ -2,7 +2,7 @@
 //!
 //! 对齐 cc/src/memdir/*。模型用 Write/Read/Grep **自己管理**一个记忆目录(无专用 Memory 工具,
 //! 对齐 cc)。本模块只提供:
-//!   1. 路径解析:memdir = `{home}/.metacodes/projects/<cwd_hash>/memory/`
+//!   1. 路径解析:memdir = `{state_root}/projects/<cwd_hash>/memory/`
 //!      (复用 transcript.hashCwd —— 与现有 transcript 布局并列;cc 用 sanitized-git-root,
 //!       zig-cc 沿用项目既有 cwd_hash 标准,见 spec §2.1 divergence)
 //!   2. MEMORY.md 索引:读取 + 截断(≤200 行 / ≤25KB,对齐 cc MAX_ENTRYPOINT_*)
@@ -10,7 +10,7 @@
 //!   4. enable 开关
 //!
 //! 安全(Linus 盯):isAutoMemPath 必须用 realpath 归一化 + 严格前缀(带分隔符边界),
-//! 否则 `~/.metacodes/projects/<hash>/memory-evil` 或 `..` 穿越能骗过前缀匹配 → 任意写洞。
+//! 否则 `<state_root>/projects/<hash>/memory-evil` 或 `..` 穿越能骗过前缀匹配 → 任意写洞。
 
 const std = @import("std");
 const ppaths = @import("platform").paths;
@@ -32,26 +32,26 @@ pub fn isEnabled() bool {
     return true;
 }
 
-/// memdir 目录全路径:`{home}/.metacodes/projects/<cwd_hash>/memory`。写进 buf,返回 slice。
-/// home/cwd 任一为空 → 返回空串(memdir 不可用)。
-pub fn memdirPath(home: []const u8, cwd: []const u8, buf: []u8) []const u8 {
-    if (home.len == 0 or cwd.len == 0) return "";
+/// memdir 目录全路径:`{state_root}/projects/<cwd_hash>/memory`。写进 buf,返回 slice。
+/// state_root/cwd 任一为空 → 返回空串(memdir 不可用)。
+pub fn memdirPath(state_root: []const u8, cwd: []const u8, buf: []u8) []const u8 {
+    if (state_root.len == 0 or cwd.len == 0) return "";
     const cwd_hash = transcript.hashCwd(cwd);
-    return std.fmt.bufPrint(buf, "{s}/.metacodes/projects/{s}/memory", .{ home, cwd_hash[0..] }) catch "";
+    return std.fmt.bufPrint(buf, "{s}/projects/{s}/memory", .{ state_root, cwd_hash[0..] }) catch "";
 }
 
 /// MEMORY.md 索引文件全路径:`{memdir}/MEMORY.md`。写进 buf,返回 slice。
-pub fn memoryIndexPath(home: []const u8, cwd: []const u8, buf: []u8) []const u8 {
+pub fn memoryIndexPath(state_root: []const u8, cwd: []const u8, buf: []u8) []const u8 {
     var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = memdirPath(home, cwd, &dbuf);
+    const dir = memdirPath(state_root, cwd, &dbuf);
     if (dir.len == 0) return "";
     return std.fmt.bufPrint(buf, "{s}/MEMORY.md", .{dir}) catch "";
 }
 
 /// 确保 memdir 存在(mkdir -p)。失败返回 error,调用方决定是否致命(通常降级:不注入)。
-pub fn ensureDir(home: []const u8, cwd: []const u8) !void {
+pub fn ensureDir(state_root: []const u8, cwd: []const u8) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = memdirPath(home, cwd, &buf);
+    const dir = memdirPath(state_root, cwd, &buf);
     if (dir.len == 0) return error.NoMemdir;
     try @import("../../util/fs.zig").mkdirParents(dir);
 }
@@ -163,15 +163,15 @@ fn path_exists(path: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    return pfs.exists(@ptrCast(&buf)); // 宽字符(#121):CJK home 下窄字符 access 找不到 MEMORY.md
+    return pfs.exists(@ptrCast(&buf)); // 宽字符(#121):CJK state_root 下窄字符 access 找不到 MEMORY.md
 }
 
 /// 读 MEMORY.md 索引并按 cc 上限截断。返回 owned(caller free)。不存在/空 → null。
 /// 截断:先按字节裁到 ≤MAX_ENTRYPOINT_BYTES,再按行裁到 ≤MAX_ENTRYPOINT_LINES,
 /// 末尾加截断提示(对齐 cc truncateEntrypointContent 语义)。
-pub fn readIndexTruncated(allocator: std.mem.Allocator, home: []const u8, cwd: []const u8) !?[]u8 {
+pub fn readIndexTruncated(allocator: std.mem.Allocator, state_root: []const u8, cwd: []const u8) !?[]u8 {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = memoryIndexPath(home, cwd, &pbuf);
+    const path = memoryIndexPath(state_root, cwd, &pbuf);
     if (path.len == 0) return null;
 
     const raw = readFileAlloc(allocator, path) catch return null;
@@ -246,10 +246,10 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 const testing = std.testing;
 
-test "memdirPath: 拼路径 + 空 home/cwd 返空" {
+test "memdirPath: 拼路径 + 空 state_root/cwd 返空" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const p = memdirPath("/home/u", "/repo/x", &buf);
-    try testing.expect(std.mem.startsWith(u8, p, "/home/u/.metacodes/projects/"));
+    const p = memdirPath("/s", "/repo/x", &buf);
+    try testing.expect(std.mem.startsWith(u8, p, "/s/projects/"));
     try testing.expect(std.mem.endsWith(u8, p, "/memory"));
     try testing.expectEqualStrings("", memdirPath("", "/x", &buf));
     try testing.expectEqualStrings("", memdirPath("/h", "", &buf));
@@ -257,7 +257,7 @@ test "memdirPath: 拼路径 + 空 home/cwd 返空" {
 
 test "memoryIndexPath: 末尾 MEMORY.md" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const p = memoryIndexPath("/home/u", "/repo/x", &buf);
+    const p = memoryIndexPath("/s", "/repo/x", &buf);
     try testing.expect(std.mem.endsWith(u8, p, "/memory/MEMORY.md"));
 }
 
@@ -265,13 +265,13 @@ test "isAutoMemPath: 真实 memdir 内放行,外部拒绝(含分隔符边界 + �
     const a = testing.allocator;
     // 真建一个 memdir 子树
     var home_buf: [256]u8 = undefined;
-    const home = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memdir-test");
+    const state_root = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memdir-test");
     const fsmod = @import("../../util/fs.zig");
-    defer fsmod.testing.rmrfBestEffort(home);
+    defer fsmod.testing.rmrfBestEffort(state_root);
 
-    try ensureDir(home, "/fake/repo");
+    try ensureDir(state_root, "/fake/repo");
     var mdbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const memdir = memdirPath(home, "/fake/repo", &mdbuf);
+    const memdir = memdirPath(state_root, "/fake/repo", &mdbuf);
     const memdir_owned = try a.dupe(u8, memdir);
     defer a.free(memdir_owned);
 
@@ -305,13 +305,13 @@ test "isAutoMemPath: memdir 内 symlink 末段指向外部(悬空目标)→ 拒�
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 用 POSIX symlink() 造真符号链接测拒绝,windows 无此 syscall
     const a = testing.allocator;
     var home_buf: [256]u8 = undefined;
-    const home = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memdir-symlink");
+    const state_root = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memdir-symlink");
     const fsmod = @import("../../util/fs.zig");
-    defer fsmod.testing.rmrfBestEffort(home);
+    defer fsmod.testing.rmrfBestEffort(state_root);
 
-    try ensureDir(home, "/fake/repo");
+    try ensureDir(state_root, "/fake/repo");
     var mdbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const memdir = memdirPath(home, "/fake/repo", &mdbuf);
+    const memdir = memdirPath(state_root, "/fake/repo", &mdbuf);
     const memdir_owned = try a.dupe(u8, memdir);
     defer a.free(memdir_owned);
 
@@ -334,20 +334,20 @@ extern "c" fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
 test "readIndexTruncated: 不存在返 null;短文件原样;超行截断" {
     const a = testing.allocator;
     var home_buf: [256]u8 = undefined;
-    const home = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memidx-test");
+    const state_root = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memidx-test");
     const fsmod = @import("../../util/fs.zig");
-    defer fsmod.testing.rmrfBestEffort(home);
+    defer fsmod.testing.rmrfBestEffort(state_root);
 
     // 不存在 → null
-    try testing.expect((try readIndexTruncated(a, home, "/fake/repo")) == null);
+    try testing.expect((try readIndexTruncated(a, state_root, "/fake/repo")) == null);
 
-    try ensureDir(home, "/fake/repo");
+    try ensureDir(state_root, "/fake/repo");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const idx_path = memoryIndexPath(home, "/fake/repo", &pbuf);
+    const idx_path = memoryIndexPath(state_root, "/fake/repo", &pbuf);
 
     // 短文件 → 原样
     try writeFileZ(idx_path, "# Memory Index\n- [Foo](foo.md) — bar\n");
-    const short = (try readIndexTruncated(a, home, "/fake/repo")).?;
+    const short = (try readIndexTruncated(a, state_root, "/fake/repo")).?;
     defer a.free(short);
     try testing.expect(std.mem.indexOf(u8, short, "[Foo](foo.md)") != null);
     try testing.expect(std.mem.indexOf(u8, short, "truncated") == null);
@@ -358,7 +358,7 @@ test "readIndexTruncated: 不存在返 null;短文件原样;超行截断" {
     var i: usize = 0;
     while (i < 300) : (i += 1) try big.appendSlice(a, "- line\n");
     try writeFileZ(idx_path, big.items);
-    const trunc = (try readIndexTruncated(a, home, "/fake/repo")).?;
+    const trunc = (try readIndexTruncated(a, state_root, "/fake/repo")).?;
     defer a.free(trunc);
     try testing.expect(std.mem.indexOf(u8, trunc, "truncated") != null);
     // 截断后行数明显少于 300
@@ -372,12 +372,12 @@ test "readIndexTruncated: 不存在返 null;短文件原样;超行截断" {
 test "readIndexTruncated: 字节超限退到行边界不腰斩(Linus #2)" {
     const a = testing.allocator;
     var home_buf: [256]u8 = undefined;
-    const home = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memidx-bytes");
+    const state_root = @import("../../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-memidx-bytes");
     const fsmod = @import("../../util/fs.zig");
-    defer fsmod.testing.rmrfBestEffort(home);
-    try ensureDir(home, "/fake/repo");
+    defer fsmod.testing.rmrfBestEffort(state_root);
+    try ensureDir(state_root, "/fake/repo");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const idx_path = memoryIndexPath(home, "/fake/repo", &pbuf);
+    const idx_path = memoryIndexPath(state_root, "/fake/repo", &pbuf);
 
     // 造一个 >25KB 但行数 <200 的文件:少量超长行(每行含多字节 UTF-8 中文),
     // 触发字节上限而非行上限。验证截断点落在换行边界(末字符是 '\n' 或截断提示前是完整行)。
@@ -394,7 +394,7 @@ test "readIndexTruncated: 字节超限退到行边界不腰斩(Linus #2)" {
     try writeFileZ(idx_path, big.items);
     try testing.expect(big.items.len > MAX_ENTRYPOINT_BYTES); // 确实超字节上限
 
-    const trunc = (try readIndexTruncated(a, home, "/fake/repo")).?;
+    const trunc = (try readIndexTruncated(a, state_root, "/fake/repo")).?;
     defer a.free(trunc);
     try testing.expect(std.mem.indexOf(u8, trunc, "truncated") != null);
 

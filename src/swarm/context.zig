@@ -30,8 +30,8 @@ pub const SwarmContext = struct {
     /// session as their stable lease; production teammates set this to the
     /// persisted member lease before entering the tool loop.
     lease: SessionId = SessionId.single,
-    /// HOME(teams 目录根 `{home}/.metacodes/teams`)。空 = swarm 不可用。
-    home: []const u8 = "",
+    /// 状态根(util/state_root.zig;teams 目录根 `{state_root}/teams`)。空 = swarm 不可用。
+    state_root: []const u8 = "",
     /// 调用者身份(lead="team-lead";teammate=自己 sanitized 名)。
     self_name: []const u8 = team_mod.TEAM_LEAD_NAME,
     /// 是否 lead(只有 lead 能 TeamCreate/TeamDelete/spawn teammate)。
@@ -148,7 +148,7 @@ pub const SwarmContext = struct {
     /// conservative check prevents a resumed lead from deleting a live child's
     /// mailbox and worktree state.
     pub fn hasUntrackedProcessMember(self: *SwarmContext) bool {
-        if (!self.is_lead or self.home.len == 0 or self.team_sanitized.len == 0) return false;
+        if (!self.is_lead or self.state_root.len == 0 or self.team_sanitized.len == 0) return false;
         var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cfg = self.configPath(&cfg_buf);
         var tf = team_mod.load(self.allocator, cfg) orelse return true;
@@ -194,10 +194,10 @@ pub const SwarmContext = struct {
             self.teammates = null;
         }
         // SW4 orphan 清理:lead 退出或 resume 换 session 时删当前 team 目录。
-        if (!preserve_durable_team and self.is_lead and self.team_sanitized.len > 0 and self.home.len > 0) {
+        if (!preserve_durable_team and self.is_lead and self.team_sanitized.len > 0 and self.state_root.len > 0) {
             var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const dir = team_mod.teamDirPath(self.home, self.team_sanitized, &buf);
-            if (dir.len > 0) @import("../util/fs.zig").removeTeamDirTree(dir);
+            const dir = team_mod.teamDirPath(self.state_root, self.team_sanitized, &buf);
+            if (dir.len > 0) @import("../util/fs.zig").removeTeamDirTree(self.state_root, dir);
         }
         if (self.team_sanitized.len > 0) {
             self.allocator.free(self.team_sanitized);
@@ -223,6 +223,6 @@ pub const SwarmContext = struct {
     /// config.json 路径(当前 team;无 team → "")。写进 buf。
     pub fn configPath(self: *const SwarmContext, buf: []u8) []const u8 {
         if (!self.hasTeam()) return "";
-        return team_mod.configPath(self.home, self.team_sanitized, buf);
+        return team_mod.configPath(self.state_root, self.team_sanitized, buf);
     }
 };

@@ -320,6 +320,160 @@ fn wireTinyKgdTestInput(run: *std.Build.Step.Run, staged: ?StagedTinyKgd) void {
     run.setEnvironmentVariable("METACODES_TEST_TINYKGD_BIN", daemon.installed_path);
 }
 
+/// `-Dlean-kernels`: whether this build compiles the two Lean governance
+/// kernels from this checkout and installs them into `<prefix>/libexec/metacodes`.
+/// `auto` does so whenever a native Lean toolchain (`lake`) is found, so a
+/// machine with elan runs every kernel-gated test with no configuration; `on`
+/// fails the build instead of skipping when it is not; `off` never builds them.
+const LeanKernelsMode = enum { auto, on, off };
+
+const StagedLeanKernel = struct {
+    install_step: *std.Build.Step,
+    installed_path: []const u8,
+    /// The test-only variable that hands the kernel to the test process; the
+    /// digest comes from the provenance sidecar installed beside it
+    /// (src/formal/test_kernel.zig).
+    path_variable: []const u8,
+};
+
+const StagedLeanKernels = struct {
+    formal: ?StagedLeanKernel = null,
+    project: ?StagedLeanKernel = null,
+};
+
+fn wireLeanKernelTestInputs(run: *std.Build.Step.Run, staged: StagedLeanKernels) void {
+    for ([_]?StagedLeanKernel{ staged.formal, staged.project }) |maybe| {
+        const kernel = maybe orelse continue;
+        run.step.dependOn(kernel.install_step);
+        run.setEnvironmentVariable(kernel.path_variable, kernel.installed_path);
+    }
+}
+
+/// The `lake` the kernel scripts run: `$LAKE`, else PATH, else elan's default
+/// `~/.elan/bin`. The toolchain is the only shared input; every kernel it builds
+/// lands in this build's own prefix.
+fn findLake(b: *std.Build) ?[]const u8 {
+    if (b.graph.environ_map.get("LAKE")) |lake| if (lake.len != 0) return lake;
+    const home = b.graph.environ_map.get("HOME") orelse return b.findProgram(&.{"lake"}, &.{}) catch null;
+    return b.findProgram(&.{"lake"}, &.{b.pathJoin(&.{ home, ".elan", "bin" })}) catch null;
+}
+
+/// Every source the kernels are built from, so the cached build reruns exactly
+/// when one of them changes. `.lake` holds Lake's own products and is skipped.
+fn addLeanSourceInputs(b: *std.Build, run: *std.Build.Step.Run) void {
+    const root = "control-plane/lean";
+    var dir = b.build_root.handle.openDir(b.graph.io, root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| std.debug.panic("cannot scan {s}: {t}", .{ root, err });
+    defer dir.close(b.graph.io);
+    var walker = dir.walkSelectively(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(b.graph.io) catch |err|
+        std.debug.panic("cannot enumerate {s}: {t}", .{ root, err })) |entry|
+    {
+        switch (entry.kind) {
+            .directory => if (!std.mem.eql(u8, entry.basename, ".lake"))
+                walker.enter(b.graph.io, entry) catch |err|
+                    std.debug.panic("cannot enter {s}/{s}: {t}", .{ root, entry.path, err }),
+            .file => run.addFileInput(b.path(b.fmt("{s}/{s}", .{ root, entry.path }))),
+            else => {},
+        }
+    }
+}
+
+/// Builds both kernels with their own scripts (axiom audit + native smoke +
+/// provenance sidecar) into cached outputs and installs them, sidecars
+/// included, at `<prefix>/libexec/metacodes` — the layout the executable
+/// resolves adjacent kernels from. A kernel the operator already supplies via
+/// `METACODES_TEST_<KIND>_KERNEL_PATH` is left to that variable.
+fn stageLeanKernels(
+    b: *std.Build,
+    mode: LeanKernelsMode,
+    target: std.Build.ResolvedTarget,
+    stage_step: *std.Build.Step,
+) StagedLeanKernels {
+    if (mode == .off) {
+        stage_step.dependOn(&b.addFail("kernels:stage is disabled by -Dlean-kernels=off").step);
+        return .{};
+    }
+    const host = b.graph.host.result;
+    const unavailable: ?[]const u8 = if (host.os.tag == .windows)
+        "the Lean kernel build scripts run on macOS and Linux hosts only"
+    else if (target.result.os.tag != host.os.tag or target.result.cpu.arch != host.cpu.arch)
+        "Lean kernels are native host executables; this build targets another platform"
+    else if (findLake(b) == null)
+        "no Lean toolchain: set LAKE, put lake on PATH, or install elan (~/.elan/bin/lake)"
+    else
+        null;
+    if (unavailable) |reason| {
+        const fail = &b.addFail(b.fmt("kernels:stage: {s}", .{reason})).step;
+        stage_step.dependOn(fail);
+        if (mode == .auto) return .{};
+        // -Dlean-kernels=on: every wired test run that would have needed a
+        // staged kernel inherits the failure instead of skipping.
+        const env = &b.graph.environ_map;
+        return .{
+            .formal = if (env.get("METACODES_TEST_FORMAL_KERNEL_PATH") != null) null else .{
+                .install_step = fail,
+                .installed_path = "",
+                .path_variable = "METACODES_TEST_FORMAL_KERNEL_PATH",
+            },
+            .project = if (env.get("METACODES_TEST_PROJECT_KERNEL_PATH") != null) null else .{
+                .install_step = fail,
+                .installed_path = "",
+                .path_variable = "METACODES_TEST_PROJECT_KERNEL_PATH",
+            },
+        };
+    }
+    const lake = findLake(b).?;
+    const dir: std.Build.InstallDir = .{ .custom = "libexec/metacodes" };
+
+    const formal = b.addSystemCommand(&.{"bash"});
+    formal.setName("build formal kernel");
+    formal.addFileArg(b.path("scripts/build-formal-kernel.sh"));
+    const formal_bin = formal.addOutputFileArg("metacodes-formal-kernel");
+    const formal_provenance = formal.addOutputFileArg("metacodes-formal-kernel.provenance.json");
+    const formal_receipt = formal.addOutputFileArg("metacodes-formal-kernel.build-receipt.json");
+    formal.setEnvironmentVariable("LAKE", lake);
+    addLeanSourceInputs(b, formal);
+
+    const project = b.addSystemCommand(&.{"bash"});
+    project.setName("build project kernel");
+    project.addFileArg(b.path("scripts/build-project-harness-kernel.sh"));
+    const project_bin = project.addOutputFileArg("metacodes-project-kernel");
+    const project_provenance = project.addOutputFileArg("metacodes-project-kernel.provenance.json");
+    project.setEnvironmentVariable("LAKE", lake);
+    addLeanSourceInputs(b, project);
+    // Both scripts drive Lake in the same control-plane/lean/.lake.
+    project.step.dependOn(&formal.step);
+
+    const install_formal = b.addInstallFileWithDir(formal_bin, dir, "metacodes-formal-kernel");
+    const install_formal_provenance = b.addInstallFileWithDir(formal_provenance, dir, "metacodes-formal-kernel.provenance.json");
+    const install_formal_receipt = b.addInstallFileWithDir(formal_receipt, dir, "metacodes-formal-kernel.build-receipt.json");
+    install_formal.step.dependOn(&install_formal_provenance.step);
+    install_formal.step.dependOn(&install_formal_receipt.step);
+    const install_project = b.addInstallFileWithDir(project_bin, dir, "metacodes-project-kernel");
+    const install_project_provenance = b.addInstallFileWithDir(project_provenance, dir, "metacodes-project-kernel.provenance.json");
+    install_project.step.dependOn(&install_project_provenance.step);
+    stage_step.dependOn(&install_formal.step);
+    stage_step.dependOn(&install_project.step);
+
+    const env = &b.graph.environ_map;
+    return .{
+        .formal = if (env.get("METACODES_TEST_FORMAL_KERNEL_PATH") != null) null else .{
+            .install_step = &install_formal.step,
+            .installed_path = b.getInstallPath(dir, "metacodes-formal-kernel"),
+            .path_variable = "METACODES_TEST_FORMAL_KERNEL_PATH",
+        },
+        .project = if (env.get("METACODES_TEST_PROJECT_KERNEL_PATH") != null) null else .{
+            .install_step = &install_project.step,
+            .installed_path = b.getInstallPath(dir, "metacodes-project-kernel"),
+            .path_variable = "METACODES_TEST_PROJECT_KERNEL_PATH",
+        },
+    };
+}
+
 const aggregate_test_exclusions = [_][]const u8{
     // Has a dedicated ABI artifact/consumer gate with a different module graph.
     "component/agentcore_abi_test.zig",
@@ -508,6 +662,7 @@ fn addCoreSuiteRun(
     suite: *std.Build.Step.Compile,
     shards: u8,
     reporter: *std.Build.Step.Compile,
+    lean_kernels: StagedLeanKernels,
 ) *std.Build.Step {
     const reports = b.allocator.alloc(std.Build.LazyPath, shards) catch @panic("OOM");
     for (reports, 0..) |*report, shard_index| {
@@ -519,6 +674,7 @@ fn addCoreSuiteRun(
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{shards}));
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
         run_shard.expectExitCode(0);
+        wireLeanKernelTestInputs(run_shard, lean_kernels);
         report.* = run_shard.captureStdOut(.{
             .basename = b.fmt("{s}-shard-{}.txt", .{ suite.name, shard_index }),
         });
@@ -732,6 +888,22 @@ pub fn build(b: *std.Build) void {
             };
         },
     }
+
+    // ── Lean governance kernels (scripts/install.sh, kernel-gated tests) ───
+    // Built from this checkout's own control-plane/lean, so an install and the
+    // kernels it runs are always the same version. The release layout still
+    // ships none (release/LAYOUT.md); `kernels:stage` is what scripts/install.sh
+    // and the test steps below use.
+    const lean_kernels_mode = b.option(
+        LeanKernelsMode,
+        "lean-kernels",
+        "Build and install the Lean governance kernels for tests and scripts/install.sh: auto (when lake is found, default), on (fail without lake), off",
+    ) orelse .auto;
+    const kernels_stage_step = b.step(
+        "kernels:stage",
+        "Build both Lean kernels from this checkout and install them into <prefix>/libexec/metacodes",
+    );
+    const staged_lean_kernels = stageLeanKernels(b, lean_kernels_mode, target, kernels_stage_step);
 
     // ── ripgrep for the product install (#79, #47 stage 4) ─────────────────
     // Glob/Grep need rg at run time. The default install and the release
@@ -1758,11 +1930,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const core_test_step = b.step("test:lib", "Run the complete metacodes-core suite in checked deterministic shards");
-    core_test_step.dependOn(addCoreSuiteRun(b, core_test, lib_test_shards, core_shard_reporter));
+    core_test_step.dependOn(addCoreSuiteRun(b, core_test, lib_test_shards, core_shard_reporter, staged_lean_kernels));
 
     const core_monolithic_run = addTestRunArtifact(b, core_test);
     core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
+    wireLeanKernelTestInputs(core_monolithic_run, staged_lean_kernels);
     const core_test_monolithic_step = b.step("test:lib-monolithic", "Run the complete metacodes-core suite in one diagnostic process");
     core_test_monolithic_step.dependOn(&core_monolithic_run.step);
 
@@ -1797,7 +1970,9 @@ pub fn build(b: *std.Build) void {
         },
     });
     const core_test_times_step = b.step("test:lib-times", "Run metacodes-core tests with per-test timing diagnostics");
-    core_test_times_step.dependOn(&addTestRunArtifact(b, core_timed_test).step);
+    const core_timed_run = addTestRunArtifact(b, core_timed_test);
+    wireLeanKernelTestInputs(core_timed_run, staged_lean_kernels);
+    core_test_times_step.dependOn(&core_timed_run.step);
     core_test_step.dependOn(http_status_gate_step);
 
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
@@ -2058,6 +2233,7 @@ pub fn build(b: *std.Build) void {
         addCoreSuite(b, createCoreModule(b, target, .ReleaseSafe), tfilter),
         lib_test_shards,
         core_shard_reporter,
+        staged_lean_kernels,
     );
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
     gate_pr_step.dependOn(&gate_fmt.step);
@@ -2074,6 +2250,7 @@ pub fn build(b: *std.Build) void {
     const test_run = addTestRunArtifact(b, test_obj);
     wireTinyKgTestInput(test_run, staged_tinykg);
     wireTinyKgdTestInput(test_run, staged_tinykgd);
+    wireLeanKernelTestInputs(test_run, staged_lean_kernels);
     test_step.dependOn(&test_run.step);
 
     // Two independent Metacodes processes share one authenticated StoreActor.
@@ -2236,6 +2413,7 @@ pub fn build(b: *std.Build) void {
         run_shard.step.dependOn(&install_selfexe_probe.step);
         wireTinyKgTestInput(run_shard, staged_tinykg);
         wireTinyKgdTestInput(run_shard, staged_tinykgd);
+        wireLeanKernelTestInputs(run_shard, staged_lean_kernels);
         integration_reports[shard_index] = run_shard.captureStdOut(.{
             .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
         });
@@ -2251,6 +2429,7 @@ pub fn build(b: *std.Build) void {
     integration_monolithic_run.step.dependOn(&install_selfexe_probe.step);
     wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
     wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
+    wireLeanKernelTestInputs(integration_monolithic_run, staged_lean_kernels);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
     integration_monolithic_step.dependOn(&integration_monolithic_run.step);
 
@@ -2268,6 +2447,7 @@ pub fn build(b: *std.Build) void {
     integration_timed_run.step.dependOn(&install_selfexe_probe.step);
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
     wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
+    wireLeanKernelTestInputs(integration_timed_run, staged_lean_kernels);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
 

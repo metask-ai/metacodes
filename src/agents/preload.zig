@@ -31,6 +31,9 @@ pub const ContextOptions = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     cwd_abs: []const u8 = "",
     home_dir: []const u8 = "",
+    /// Host state root: `<state_root>/CLAUDE.md` is the user tier after
+    /// `~/.claude/CLAUDE.md`. "" skips it.
+    state_root: []const u8 = "",
     additional_dirs: []const []const u8 = &.{},
     /// AgentDef.memory 解析后的专属目录。为空表示 memory 未启用。
     memory_dir: []const u8 = "",
@@ -130,12 +133,14 @@ pub fn buildSubagentContext(
     return try out.toOwnedSlice();
 }
 
-/// 读 ~/.claude/CLAUDE.md + <project>/CLAUDE.md + <project>/CLAUDE.local.md,顺序追加。
+/// 读 ~/.claude/CLAUDE.md + <state_root>/CLAUDE.md + <project>/CLAUDE.md + <project>/CLAUDE.local.md,顺序追加。
 /// 缺失静默跳过。
 fn injectClaudeMd(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating, opts: ContextOptions) !void {
     if (@import("platform").paths.homeDir()) |home| {
         try injectFile(allocator, out, home, ".claude/CLAUDE.md", "User CLAUDE.md");
-        try injectFile(allocator, out, home, ".metacodes/CLAUDE.md", "User cc-zig CLAUDE.md");
+    }
+    if (opts.state_root.len > 0) {
+        try injectFile(allocator, out, opts.state_root, "CLAUDE.md", "User cc-zig CLAUDE.md");
     }
     if (opts.project_dir.len > 0) {
         try injectFile(allocator, out, opts.project_dir, "CLAUDE.md", "Project CLAUDE.md");

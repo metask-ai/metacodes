@@ -1,9 +1,9 @@
-//! ~/.metacodes/config.json 的 TUI 相关读写。
+//! <state_root>/config.json 的 TUI 相关读写。
 //!
 //! 现在管 1 个字段:`theme`("auto"/"dark"/"light"/"mono")。
 //!
-//! 读:启动时 App 调 loadTheme(home),返回 ?Variant。null = 文件不存在/无 theme 字段。
-//! 写:/theme 命令调 saveTheme(home, variant),原子读改写(保留其他字段)。
+//! 读:启动时 App 调 loadTheme(state_root),返回 ?Variant。null = 文件不存在/无 theme 字段。
+//! 写:/theme 命令调 saveTheme(state_root, variant),原子读改写(保留其他字段)。
 //!
 //! 容错:文件不存在 → 写时自建;JSON 解析失败 → 读返 null / 写直接覆盖为 {"theme":"X"}。
 
@@ -11,11 +11,11 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const theme_mod = @import("theme.zig");
 
-/// 读取 home 目录下 ~/.metacodes/config.json 的 theme 字段。
+/// 读取 state_root 目录下 <state_root>/config.json 的 theme 字段。
 /// 返回:成功且字段存在合法 → Variant;否则 null。
-pub fn loadTheme(alloc: std.mem.Allocator, home: []const u8) ?theme_mod.Variant {
+pub fn loadTheme(alloc: std.mem.Allocator, state_root: []const u8) ?theme_mod.Variant {
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const path_z = std.fmt.bufPrint(&path_buf, "{s}/.metacodes/config.json\x00", .{home}) catch return null;
+    const path_z = std.fmt.bufPrint(&path_buf, "{s}/config.json\x00", .{state_root}) catch return null;
     const path = path_z[0 .. path_z.len - 1];
 
     const content = readFile(alloc, path) catch return null;
@@ -31,15 +31,15 @@ pub fn loadTheme(alloc: std.mem.Allocator, home: []const u8) ?theme_mod.Variant 
 }
 
 /// 写入 theme 字段。原子读改写:读 → 改/插 → 写回。
-/// 文件不存在 → 自动 mkdir ~/.metacodes + 创建。其它 IO 错误 → 返回 error。
-pub fn saveTheme(alloc: std.mem.Allocator, home: []const u8, variant: theme_mod.Variant) !void {
-    // 确保 ~/.metacodes 存在
+/// 文件不存在 → 自动 mkdir <state_root> + 创建。其它 IO 错误 → 返回 error。
+pub fn saveTheme(alloc: std.mem.Allocator, state_root: []const u8, variant: theme_mod.Variant) !void {
+    // 确保 <state_root> 存在
     var dir_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const dir_z = try std.fmt.bufPrint(&dir_buf, "{s}/.metacodes\x00", .{home});
+    const dir_z = try std.fmt.bufPrint(&dir_buf, "{s}\x00", .{state_root});
     _ = pfs.mkdir(@ptrCast(dir_z.ptr), 0o755); // 已存在 EEXIST 忽略
 
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const path_z = try std.fmt.bufPrint(&path_buf, "{s}/.metacodes/config.json\x00", .{home});
+    const path_z = try std.fmt.bufPrint(&path_buf, "{s}/config.json\x00", .{state_root});
     const path = path_z[0 .. path_z.len - 1];
 
     // 读旧内容(可能没有);解析失败 → 直接覆盖
@@ -227,17 +227,17 @@ test "writeWithTheme: 字段不存在时追加" {
     try testing.expect(std.mem.indexOf(u8, out, "\"other\":\"x\"") != null);
 }
 
-test "loadTheme + saveTheme 往返(临时 home)" {
+test "loadTheme + saveTheme 往返(临时 state_root)" {
     var dir_buf: [512]u8 = undefined;
     const dir = @import("../../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-thtest");
     _ = pfs.mkdir(dir.ptr, 0o755);
     defer {
-        // 清理 ~/.metacodes/config.json + ~/.metacodes + tmp 目录
+        // 清理 <state_root>/config.json + <state_root> + tmp 目录
         var p1_buf: [256]u8 = undefined;
-        const p1 = std.fmt.bufPrint(&p1_buf, "{s}/.metacodes/config.json\x00", .{dir}) catch unreachable;
+        const p1 = std.fmt.bufPrint(&p1_buf, "{s}/config.json\x00", .{dir}) catch unreachable;
         pfs.unlinkPath(@ptrCast(p1.ptr)) catch {};
         var p2_buf: [256]u8 = undefined;
-        const p2 = std.fmt.bufPrint(&p2_buf, "{s}/.metacodes\x00", .{dir}) catch unreachable;
+        const p2 = std.fmt.bufPrint(&p2_buf, "{s}\x00", .{dir}) catch unreachable;
         _ = pfs.rmdir(@ptrCast(p2.ptr));
         _ = pfs.rmdir(dir.ptr);
     }

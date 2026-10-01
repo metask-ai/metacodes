@@ -53,6 +53,9 @@ pub fn defaultSources(
     arena: std.mem.Allocator,
     workspace_root: []const u8,
     workspace_home: []const u8,
+    /// Host state root: `<state_root>/skills` is the metacodes personal tier.
+    /// "" skips it.
+    state_root: []const u8,
 ) error{OutOfMemory}![]const Source {
     var sources: std.ArrayList(Source) = .empty;
     const enterprise = "/etc/metacodes/skills";
@@ -64,7 +67,7 @@ pub fn defaultSources(
         });
     }
     try appendDefaultSource(arena, &sources, workspace_home, &.{ ".claude", "skills" }, .personal, 200);
-    try appendDefaultSource(arena, &sources, workspace_home, &.{ ".metacodes", "skills" }, .personal, 201);
+    try appendDefaultSource(arena, &sources, state_root, &.{"skills"}, .personal, 201);
     try appendDefaultSource(arena, &sources, workspace_home, &.{ ".agents", "skills" }, .personal, 202);
     try appendDefaultSource(arena, &sources, workspace_root, &.{ ".claude", "skills" }, .project, 300);
     try appendDefaultSource(arena, &sources, workspace_root, &.{ ".metacodes", "skills" }, .project, 301);
@@ -1361,8 +1364,9 @@ test "product default sources preserve product-owned directory policy" {
     const a = arena.allocator();
     const workspace_root = try std.fs.path.join(a, &.{ root_buffer[0..root_len], "workspace" });
     const workspace_home = try std.fs.path.join(a, &.{ root_buffer[0..root_len], "home" });
+    const state_root = try std.fs.path.join(a, &.{ root_buffer[0..root_len], "state" });
 
-    const sources = try defaultSources(a, workspace_root, workspace_home);
+    const sources = try defaultSources(a, workspace_root, workspace_home, state_root);
     const has_enterprise: usize = @intFromBool(std.fs.path.isAbsolute("/etc/metacodes/skills"));
     try std.testing.expectEqual(6 + has_enterprise, sources.len);
     if (has_enterprise == 1) {
@@ -1373,7 +1377,7 @@ test "product default sources preserve product-owned directory policy" {
 
     const expected = [_]Source{
         .{ .root = try std.fs.path.join(a, &.{ workspace_home, ".claude", "skills" }), .scope = .personal, .priority = 200 },
-        .{ .root = try std.fs.path.join(a, &.{ workspace_home, ".metacodes", "skills" }), .scope = .personal, .priority = 201 },
+        .{ .root = try std.fs.path.join(a, &.{ state_root, "skills" }), .scope = .personal, .priority = 201 },
         .{ .root = try std.fs.path.join(a, &.{ workspace_home, ".agents", "skills" }), .scope = .personal, .priority = 202 },
         .{ .root = try std.fs.path.join(a, &.{ workspace_root, ".claude", "skills" }), .scope = .project, .priority = 300 },
         .{ .root = try std.fs.path.join(a, &.{ workspace_root, ".metacodes", "skills" }), .scope = .project, .priority = 301 },

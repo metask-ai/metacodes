@@ -149,10 +149,21 @@ pub const Expectations = struct {
     exe_path_override: ?[]const u8 = null,
 };
 
+/// Where this process keeps its state (util/state_root.zig). Borrowed,
+/// static strings: the resolver's cached buffer and literal labels.
+pub const StateRootDiagnosis = struct {
+    path: ?[]const u8,
+    /// `flag` / `env` / `install` / `home`; null when unresolved.
+    source: ?[]const u8,
+    /// The resolution error name; null when resolved.
+    err: ?[]const u8,
+};
+
 pub const Report = struct {
     /// `[0]` ripgrep, `[1]` TinyKG CLI, `[2]` formal kernel, `[3]` project kernel, `[4]` tinykgd.
     checks: [5]Check,
     kg: ?KgDiagnosis = null,
+    state_root: ?StateRootDiagnosis = null,
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
         for (&self.checks) |*check| check.deinit(allocator);
@@ -161,6 +172,9 @@ pub const Report = struct {
 
     /// Every binary resolved, and every one with an expectation matches it.
     pub fn healthy(self: *const Report) bool {
+        // A configured root that does not resolve (broken install.json,
+        // relative METACODES_HOME) is a broken install, not a degraded one.
+        if (self.state_root) |root| if (root.err != null) return false;
         for (&self.checks) |*check| {
             if (check.resolved_path == null) {
                 // An override that resolved nothing is a configuration the
@@ -223,9 +237,9 @@ pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
 
     // `exe_dir = null` resolves the adjacent layout from the real executable
     // directory; `config_bin = null` mirrors app.zig, where config.json carries
-    // no `kg_bin` yet. `home` and `domain` only shape the Store path, which
+    // no `kg_bin` yet. `state_root` and `domain` only shape the Store path, which
     // this pure resolution never touches.
-    var tinykg = try kg_client.KgClient.resolveTinykgBinary(allocator, .{ .home = "", .domain = "" });
+    var tinykg = try kg_client.KgClient.resolveTinykgBinary(allocator, .{ .state_root = "", .domain = "" });
     defer if (tinykg) |*found| found.deinit(allocator);
     const tinykg_resolved: ?Resolved = if (tinykg) |found| .{
         .path = found.path,
@@ -251,7 +265,7 @@ pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
     errdefer checks[3].deinit(allocator);
     if (project == .invalid_env) checks[3].source = .env;
     checks[3].provenance = try kernelProvenance(allocator, .project, &checks[3]);
-    var tinykgd = try kg_client.KgClient.resolveTinykgdBinary(allocator, .{ .home = "", .domain = "" });
+    var tinykgd = try kg_client.KgClient.resolveTinykgdBinary(allocator, .{ .state_root = "", .domain = "" });
     defer if (tinykgd) |*found| found.deinit(allocator);
     const tinykgd_resolved: ?Resolved = if (tinykgd) |found| .{
         .path = found.path,
@@ -420,6 +434,11 @@ pub fn writeText(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
         });
     }
     if (report.kg) |kg| try w.print("tinykg_daemon {s} transport={s} config={s} hint={s}\n", .{ kg.state, kg.transport, kg.config, kg.hint });
+    if (report.state_root) |root| try w.print("state_root {s} source={s} error={s}\n", .{
+        root.path orelse "unresolved",
+        root.source orelse "-",
+        root.err orelse "-",
+    });
 }
 
 /// The `doctor --json` document: `{"checks":[{name, resolved_path, sha256,
@@ -446,11 +465,23 @@ pub fn writeJson(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
             .provenance = check.provenance,
         };
     }
-    if (report.kg) |kg| {
-        try std.json.Stringify.value(.{ .checks = entries, .kg = .{ .state = kg.state, .transport = kg.transport, .config = kg.config, .hint = kg.hint } }, .{}, w);
-    } else {
-        try std.json.Stringify.value(.{ .checks = entries }, .{}, w);
+    // `kg` and `state_root` appear only when diagnosed; inside each object an
+    // absent value is `null`, as for the checks.
+    const KgJson = struct { state: []const u8, transport: []const u8, config: []const u8, hint: []const u8 };
+    const StateRootJson = struct { path: ?[]const u8, source: ?[]const u8, @"error": ?[]const u8 };
+    const kg: ?KgJson = if (report.kg) |d| .{ .state = d.state, .transport = d.transport, .config = d.config, .hint = d.hint } else null;
+    const state_root: ?StateRootJson = if (report.state_root) |root| .{ .path = root.path, .source = root.source, .@"error" = root.err } else null;
+    try w.writeAll("{\"checks\":");
+    try std.json.Stringify.value(entries, .{}, w);
+    if (kg) |value| {
+        try w.writeAll(",\"kg\":");
+        try std.json.Stringify.value(value, .{}, w);
     }
+    if (state_root) |value| {
+        try w.writeAll(",\"state_root\":");
+        try std.json.Stringify.value(value, .{}, w);
+    }
+    try w.writeByte('}');
     try w.writeByte('\n');
 }
 

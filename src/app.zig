@@ -255,6 +255,9 @@ pub const PendingOverlay = enum { none, model_picker, transcript };
 pub const App = struct {
     allocator: std.mem.Allocator,
     config: types.Config,
+    /// Owned `<$HOME>/.metacodes` when the host passed no `config.state_root`
+    /// (embedders and tests that build an App directly); the CLI always passes one.
+    state_root_default: ?[]u8 = null,
     api_key: []const u8,
     oauth_token_for_catalog: ?[]u8 = null,
     selected_api_key_owned: ?[]u8 = null,
@@ -304,7 +307,7 @@ pub const App = struct {
     /// Why the last committed selection was not written durably, if it was not.
     /// The route is live regardless; what is lost is surviving a `/resume`.
     last_persist_error: ?[]const u8 = null,
-    /// 模型档位表(~/.metacodes/config.json 的 model_tiers;null=未配置)。
+    /// 模型档位表(<state root>/config.json 的 model_tiers;null=未配置)。
     model_tiers_table: ?@import("api/model_tiers.zig").TierTable = null,
     pending_previous_model_for_compact: ?[]u8 = null,
     pending_previous_model_context_window: ?u32 = null,
@@ -537,6 +540,13 @@ pub const App = struct {
             .cron_registry = CronRegistry.init(allocator),
             .model_context = @import("app/model_context.zig").ModelContext.init(allocator),
         };
+        // The CLI resolves the state root (src/main.zig) and passes it in. An App
+        // built without one keeps the historical `$HOME/.metacodes`.
+        if (app.config.state_root.len == 0) if (platform_paths.homeDir()) |home| {
+            app.state_root_default = try @import("util/state_root.zig").legacyDefault(allocator, home);
+            app.config.state_root = app.state_root_default.?;
+        };
+        errdefer if (app.state_root_default) |owned| allocator.free(owned);
 
         // OpenAI 后端:仅当 provider_kind==.openai 才建(chat/completions 或 Responses,
         // 按 config.openai_protocol 显式选择)。base_url 复用 config.base_url(record/replay
@@ -559,7 +569,7 @@ pub const App = struct {
         // rotating token without opening a second single-flight domain.
         if (config.metask_oauth_selected) if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask")) {
             if (provider_ids_mod.Slug.parse("metask")) |provider_id| {
-                app.oauth_session = provider_oauth_mod.Session.initHome(allocator, provider_id) catch null;
+                app.oauth_session = provider_oauth_mod.Session.initHome(allocator, app.stateRoot(), provider_id) catch null;
                 if (app.oauth_session) |*loaded| {
                     if (loaded.load() catch false) {
                         app.oauth_session_provider = provider_id;
@@ -607,6 +617,7 @@ pub const App = struct {
             app.skill_runtime.loadDefaultWithExtraSources(
                 cwd,
                 @import("platform").paths.homeDir() orelse "",
+                app.stateRoot(),
                 if (app.plugin_snapshot != null) "plugin-generation-1" else "",
                 plugin_skill_sources,
                 &app.skills,
@@ -622,6 +633,7 @@ pub const App = struct {
         app.agents.loadFromStandardPathsWithPluginSources(
             cwd_for_skills orelse "",
             plugin_agent_sources,
+            app.stateRoot(),
         ) catch |err| {
             if (app.plugin_snapshot != null) return err;
         };
@@ -639,11 +651,8 @@ pub const App = struct {
         if (config.no_theme) {
             app.theme_variant = .monochrome;
         } else {
-            // ~/.metacodes/config.json 的 theme 字段覆盖默认 auto
-            const home_for_theme: ?[]const u8 = blk: {
-                break :blk @import("platform").paths.homeDir();
-            };
-            const persisted = if (home_for_theme) |h| tui_config.loadTheme(allocator, h) else null;
+            // <state root>/config.json 的 theme 字段覆盖默认 auto
+            const persisted = if (app.stateRoot().len > 0) tui_config.loadTheme(allocator, app.stateRoot()) else null;
             app.theme_variant = persisted orelse .auto;
         }
         // variant=.auto 且支持颜色:探测终端背景色自动选 dark/light(仿 mecode)。
@@ -656,10 +665,10 @@ pub const App = struct {
         }
         app.theme = theme_mod.select(app.theme_variant, cap);
 
-        // 模型档位表(model_tiers):同一份 ~/.metacodes/config.json。解析失败降级为
+        // 模型档位表(model_tiers):同一份 <state root>/config.json。解析失败降级为
         // 未配置(档位名全 inherit)并告警——配置拼写错误不该炸启动,但绝不静默。
-        if (@import("platform").paths.homeDir()) |home| {
-            app.model_tiers_table = @import("api/model_tiers.zig").loadFromHome(allocator, home) catch |err| tier_err: {
+        if (app.stateRoot().len > 0) {
+            app.model_tiers_table = @import("api/model_tiers.zig").loadFromHome(allocator, app.stateRoot()) catch |err| tier_err: {
                 @import("util/log.zig").warn("config", "model_tiers 解析失败({s}),按未配置处理", .{@errorName(err)});
                 break :tier_err null;
             };
@@ -727,7 +736,7 @@ pub const App = struct {
 
         // 加载模型上下文窗口表(~/.metacode/models.toml)并挂到 client。
         // precedence 高于 probe → auto-compact 阈值优先用此表(offline 可靠 + 用户可编辑)。
-        app.model_context.loadOrBundle();
+        app.model_context.loadOrBundle(app.stateRoot());
         app.api_client.model_context = &app.model_context;
         if (app.openai_client) |*client| {
             client.model_context = &app.model_context;
@@ -795,7 +804,7 @@ pub const App = struct {
             app.oauth_session != null;
         if (config.provider_kind == .anthropic) {
             if (std.c.getenv("METACODES_NO_PROBE") == null and !metask_session_active) {
-                app.oauth_token_for_catalog = @import("core/auth.zig").resolveStoredOAuthBearer(allocator) catch null;
+                app.oauth_token_for_catalog = @import("core/auth.zig").resolveStoredOAuthBearer(allocator, app.stateRoot()) catch null;
                 app.probeApiKeys();
                 app.api_client.probeModels();
             } else {
@@ -869,7 +878,7 @@ pub const App = struct {
         app.swarm = .{
             .allocator = allocator,
             .session = app.session_id,
-            .home = app.homeDir(),
+            .state_root = app.stateRoot(),
             .api_key = app.api_key,
             .base_url = config.base_url,
             .model = app.config.model,
@@ -919,13 +928,14 @@ pub const App = struct {
         const auto_mem: []u8 = blk: {
             if (app.memdir_abs.len == 0) break :blk &.{};
             const memdir = @import("core/memory/memdir.zig");
-            const idx = memdir.readIndexTruncated(allocator, app.homeDir(), app.cwdAbs()) catch null;
+            const idx = memdir.readIndexTruncated(allocator, app.stateRoot(), app.cwdAbs()) catch null;
             break :blk (idx orelse &.{});
         };
         defer if (auto_mem.len > 0) allocator.free(auto_mem);
         app.user_context = @import("core/memory/user_context.zig").build(allocator, .{
             .cwd = app.cwdAbs(),
             .home = app.homeDir(),
+            .state_root = app.stateRoot(),
             .auto_mem = auto_mem,
             .kg_summary = app.kg_summary,
         }) catch |err| blk: {
@@ -991,6 +1001,7 @@ pub const App = struct {
     }
 
     pub fn deinit(app: *App) void {
+        defer if (app.state_root_default) |owned| app.allocator.free(owned);
         // 最先 drain 后台 subagent：abort 全部 running → join 全部线程 → free。
         // 必须早于任何共享资源（agents/dyn_registry/skills/allocator）释放，
         // 否则在跑的后台线程会触碰已释放内存（UAF）。job 用专属 Client，不依赖 api_client。
@@ -1110,7 +1121,7 @@ pub const App = struct {
         // Seed the durable revision and any previously committed global
         // selection, so `selection.commit` compares against the number the
         // store actually holds rather than an invented one.
-        var store = provider_config_store.Store.initHome(app.allocator) catch {
+        var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch {
             app.provider_host = host;
             return host;
         };
@@ -1122,7 +1133,7 @@ pub const App = struct {
             // it to the configuration that caused it.
             @import("util/log.zig").warn(
                 "provider",
-                "part of ~/.metacodes/config.json did not apply ({s}); run `metacodes --check-providers`",
+                "part of <state root>/config.json did not apply ({s}); run `metacodes --check-providers`",
                 .{why},
             );
         }
@@ -1183,7 +1194,7 @@ pub const App = struct {
     /// Load the configuration document, or null when there is none to read.
     /// The caller owns it — see `credentialPoolFrom` for why that matters.
     pub fn loadConfigDocument(app: *App) ?provider_config_doc.Document {
-        var store = provider_config_store.Store.initHome(app.allocator) catch return null;
+        var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch return null;
         defer store.deinit();
         return store.load() catch null;
     }
@@ -1264,7 +1275,7 @@ pub const App = struct {
         const same_provider = if (app.oauth_session_provider) |id| id.eql(built.id) else false;
         if (!same_provider) {
             if (app.oauth_session) |*old_session| old_session.deinit();
-            app.oauth_session = try provider_oauth_mod.Session.initHome(app.allocator, built.id);
+            app.oauth_session = try provider_oauth_mod.Session.initHome(app.allocator, app.stateRoot(), built.id);
             app.oauth_session_provider = built.id;
             // No stored login is not an error: the provider simply falls
             // through to its API-key aliases.
@@ -1425,7 +1436,7 @@ pub const App = struct {
         host: *provider_host_mod.Host,
         selection: provider_selection_mod.RuntimeSelection,
     ) !void {
-        var store = try provider_config_store.Store.initHome(app.allocator);
+        var store = try provider_config_store.Store.initHome(app.allocator, app.stateRoot());
         defer store.deinit();
         const result = try provider_config_store.setGlobalSelection(
             &store,
@@ -1824,7 +1835,7 @@ pub const App = struct {
 
     pub fn persistLoginSelection(app: *App) void {
         const auth_mod = @import("core/auth.zig");
-        var stored = auth_mod.loadDefault(app.allocator) catch |err| switch (err) {
+        var stored = auth_mod.loadDefault(app.allocator, app.stateRoot()) catch |err| switch (err) {
             error.NotFound, error.NoHome => auth_mod.StoredCredentials{},
             else => {
                 @import("util/log.zig").warn("auth", "load for selection persist failed: {s}", .{@errorName(err)});
@@ -1842,7 +1853,7 @@ pub const App = struct {
         if (stored.selected_model) |old| app.allocator.free(old);
         stored.selected_model = app.allocator.dupe(u8, app.activeModel()) catch return; // U3:持久化当前 model
         stored.reasoning_effort = app.config.reasoning_effort;
-        auth_mod.saveDefault(app.allocator, stored) catch |err| {
+        auth_mod.saveDefault(app.allocator, app.stateRoot(), stored) catch |err| {
             @import("util/log.zig").warn("auth", "persist selection failed: {s}", .{@errorName(err)});
         };
     }
@@ -1898,14 +1909,14 @@ pub const App = struct {
     }
 
     fn initTranscriptWriter(app: *App) !void {
-        // HOME
-        const home = @import("platform").paths.homeDir() orelse return error.NoHome;
+        const state_dir = app.stateRoot();
+        if (state_dir.len == 0) return error.NoHome;
 
         const cwd = try @import("util/fs.zig").getCwd(app.allocator);
         defer app.allocator.free(cwd);
 
         // session_id 传入,使 transcript 目录名 == App.session_id(统一,不再两个独立 gen)。
-        const w = try transcript.Writer.init(app.allocator, cwd, home, app.activeModel(), app.session_id);
+        const w = try transcript.Writer.init(app.allocator, cwd, state_dir, app.activeModel(), app.session_id);
         app.transcript_writer = w;
     }
 
@@ -1943,8 +1954,8 @@ pub const App = struct {
     /// 稳定),否则时间兜底。失败仅降级(plan_file_path 留空,plan 模式靠对话文本)。
     fn initPlanFilePath(app: *App) void {
         const plan_file = @import("core/plan_file.zig");
-        const home = app.homeDir();
-        if (home.len == 0) return;
+        const state_dir = app.stateRoot();
+        if (state_dir.len == 0) return;
         // seed:session id(transcript dir basename)哈希;无 transcript → 时间。
         const seed: u64 = blk: {
             if (app.transcript_writer) |*w| {
@@ -1956,9 +1967,9 @@ pub const App = struct {
         var slug_buf: [64]u8 = undefined;
         const slug = plan_file.slugFromSeed(seed, &slug_buf);
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const path = plan_file.planFilePath(home, slug, &path_buf);
+        const path = plan_file.planFilePath(state_dir, slug, &path_buf);
         if (path.len == 0) return;
-        plan_file.ensureDir(home) catch {}; // mkdir 失败不致命:写盘时模型会拿到错误
+        plan_file.ensureDir(state_dir) catch {}; // mkdir 失败不致命:写盘时模型会拿到错误
         app.plan_file_path = app.allocator.dupe(u8, path) catch return;
         // 挂到 permission_ctx,plan 模式下 decision 据此特许写 plan 文件。
         app.permission_ctx.plan_file_path = app.plan_file_path;
@@ -1969,13 +1980,13 @@ pub const App = struct {
     fn initMemdir(app: *App) void {
         const memdir = @import("core/memory/memdir.zig");
         if (!app.config.long_horizon_arm.usesAutoMemory(memdir.isEnabled())) return;
-        const home = app.homeDir();
+        const state_dir = app.stateRoot();
         const cwd = app.cwdAbs();
-        if (home.len == 0 or cwd.len == 0) return;
+        if (state_dir.len == 0 or cwd.len == 0) return;
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const path = memdir.memdirPath(home, cwd, &buf);
+        const path = memdir.memdirPath(state_dir, cwd, &buf);
         if (path.len == 0) return;
-        memdir.ensureDir(home, cwd) catch {}; // mkdir 失败不致命:写盘时模型拿到错误
+        memdir.ensureDir(state_dir, cwd) catch {}; // mkdir 失败不致命:写盘时模型拿到错误
         app.memdir_abs = app.allocator.dupe(u8, path) catch return;
         // 挂到 permission_ctx:写 memdir 子树内文件任何模式豁免(decision isAutoMemPath)。
         app.permission_ctx.memdir_abs = app.memdir_abs;
@@ -2007,7 +2018,7 @@ pub const App = struct {
         class: provider_credential_mod.FailureClass,
     ) void {
         if (class == .transient) return;
-        var store = provider_config_store.Store.initHome(app.allocator) catch return;
+        var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch return;
         defer store.deinit();
         const result = provider_config_store.noteCredentialFailure(
             &store,
@@ -2109,7 +2120,7 @@ pub const App = struct {
     /// references; removing does not. Both take effect in every UI at once,
     /// because they change the catalog every UI reads.
     pub fn setProviderEnabled(app: *App, id: provider_ids_mod.Slug, enabled: bool) !void {
-        var store = try provider_config_store.Store.initHome(app.allocator);
+        var store = try provider_config_store.Store.initHome(app.allocator, app.stateRoot());
         defer store.deinit();
         const result = try provider_config_store.setProviderEnabled(&store, id, enabled, null);
         try app.reapplyProviderConfiguration(&store, result.config_revision);
@@ -2137,7 +2148,7 @@ pub const App = struct {
     }
 
     pub fn removeProviderConfiguration(app: *App, id: provider_ids_mod.Slug) !void {
-        var store = try provider_config_store.Store.initHome(app.allocator);
+        var store = try provider_config_store.Store.initHome(app.allocator, app.stateRoot());
         defer store.deinit();
         const result = try provider_config_store.removeProvider(&store, id, null);
         try app.reapplyProviderConfiguration(&store, result.config_revision);
@@ -2163,7 +2174,7 @@ pub const App = struct {
     /// alias already decided, and leaving it auto would let it re-resolve
     /// mid-turn against a catalog the user never saw.
     pub fn useAlias(app: *App, name: []const u8) !bool {
-        var store = provider_config_store.Store.initHome(app.allocator) catch return false;
+        var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch return false;
         defer store.deinit();
         var document = store.load() catch return false;
         defer document.deinit();
@@ -2206,7 +2217,7 @@ pub const App = struct {
     ///
     /// Returns the number of providers refreshed.
     pub fn refreshProviderCatalogs(app: *App) !usize {
-        var store = provider_config_store.Store.initHome(app.allocator) catch return 0;
+        var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch return 0;
         defer store.deinit();
         const text = store.readText() catch return 0;
         defer app.allocator.free(text);
@@ -2340,20 +2351,20 @@ pub const App = struct {
     /// **P2 待办**:移到后台线程(锁竞争最坏 35s;设计 §5 要求启动零阻塞)——已记账。
     fn initKg(app: *App) void {
         if (!app.config.long_horizon_arm.usesTinyKg()) return;
-        const home = app.homeDir();
+        const state_dir = app.stateRoot();
         const cwd = app.cwdAbs();
-        if (home.len == 0 or cwd.len == 0) return;
+        if (state_dir.len == 0 or cwd.len == 0) return;
 
         // **domain/指针目录都锚定 git 根**(H5:同一仓库无论从哪个子目录启动都是同一
         // domain,否则记忆按 cwd 碎片化——BM25/隔离/global 全建立在"一仓一 domain"上)。
         // project_dir = findRepoRoot(沿 cwd 上溯 .git);非 git repo 退 cwd。
         const anchor = app.project_dir orelse cwd;
         const anchor_hash = @import("core/transcript.zig").hashCwd(anchor);
-        app.kg_projects_dir = std.fmt.allocPrint(app.allocator, "{s}/.metacodes/projects/{s}", .{ home, anchor_hash[0..] }) catch return;
+        app.kg_projects_dir = std.fmt.allocPrint(app.allocator, "{s}/projects/{s}", .{ state_dir, anchor_hash[0..] }) catch return;
         // **必须建目录**(Linus H1):否则从 git 子目录启动时 anchor_hash != cwd_hash,
         // projects/<anchor_hash> 无人 mkdir → plan 落图的 kg_root 指针 writeIdPointer 失败
         // 被 catch{} 吞 → frontier 永不呈现 → 整个 P2 跨会话恢复静默半死。逐级 mkdir。
-        mkdirKgProjectsDir(app.allocator, home, anchor_hash);
+        mkdirKgProjectsDir(app.allocator, state_dir, anchor_hash);
 
         // domain = git 根 basename + git 根 hash 前 8(可读 + 防撞)。
         const domain_override: ?[]const u8 = if (std.c.getenv("METACODES_KG_DOMAIN")) |value|
@@ -2367,7 +2378,7 @@ pub const App = struct {
         defer app.allocator.free(domain);
 
         var client = @import("kg/client.zig").KgClient.init(app.allocator, .{
-            .home = home,
+            .state_root = state_dir,
             .domain = domain,
             .config_bin = null, // config.json kg_bin(P2 接线)
             .config_store = null,
@@ -2436,16 +2447,18 @@ pub const App = struct {
 
     /// 逐级建 `{home}/.metacodes/projects/<hash>`(Linus H1)。best-effort:失败静默
     /// (下游 writeIdPointer 会 log.warn;此处仅尽量把目录建出来)。
-    fn mkdirKgProjectsDir(allocator: std.mem.Allocator, home: []const u8, hash: [16]u8) void {
-        const parts = [_][]const u8{ ".metacodes", ".metacodes/projects" };
-        for (parts) |p| {
-            const dir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, p }) catch return;
+    fn mkdirKgProjectsDir(allocator: std.mem.Allocator, state_dir: []const u8, hash: [16]u8) void {
+        // The state root itself is created with its parents (an install's
+        // `<prefix>/state` or a --state-dir); below it, one level at a time.
+        @import("util/fs.zig").mkdirParents(state_dir) catch return;
+        {
+            const dir = std.fmt.allocPrint(allocator, "{s}/projects", .{state_dir}) catch return;
             defer allocator.free(dir);
             const dz = allocator.dupeZ(u8, dir) catch return;
             defer allocator.free(dz);
             _ = pfs.mkdir(dz, 0o700);
         }
-        const full = std.fmt.allocPrint(allocator, "{s}/.metacodes/projects/{s}", .{ home, hash[0..] }) catch return;
+        const full = std.fmt.allocPrint(allocator, "{s}/projects/{s}", .{ state_dir, hash[0..] }) catch return;
         defer allocator.free(full);
         const fz = allocator.dupeZ(u8, full) catch return;
         defer allocator.free(fz);
@@ -2510,7 +2523,7 @@ pub const App = struct {
         app.setPermModeTracked(nextPermMode(app.permMode()));
     }
 
-    /// 设置 TUI 主题(变体 → 派生 theme → 持久化 ~/.metacodes/config.json)。U2 S1:抽出
+    /// 设置 TUI 主题(变体 → 派生 theme → 持久化 <state root>/config.json)。U2 S1:抽出
     /// 原 loop.zig handleTheme 的**状态操作**(变体/theme/持久化),渲染留调用方。
     /// 返回 true=已持久化，false=无 HOME 跳过持久化(theme 仍已切);持久化 IO 失败返 error。
     /// cap 探测走 term(UI 环境)——init 也这么做。
@@ -2521,10 +2534,11 @@ pub const App = struct {
         const cap = tui_term.detectFromEnv(1);
         app.theme = theme_mod.select(variant, cap);
         const tui_config = @import("repl/tui/config.zig");
-        const home = @import("platform").paths.homeDir() orelse return false;
+        const state_dir = app.stateRoot();
+        if (state_dir.len == 0) return false;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        try tui_config.saveTheme(arena.allocator(), home, variant);
+        try tui_config.saveTheme(arena.allocator(), state_dir, variant);
         return true;
     }
 
@@ -2713,6 +2727,12 @@ pub const App = struct {
     pub fn homeDir(app: *const App) []const u8 {
         _ = app;
         return platform_paths.homeDir() orelse "";
+    }
+
+    /// This install's state root (util/state_root.zig); "" when unresolvable,
+    /// which every consumer already treats like a missing $HOME.
+    pub fn stateRoot(app: *const App) []const u8 {
+        return app.config.state_root;
     }
 
     /// The configured System-One advisor, if any (address-stable for the App's lifetime).
@@ -2985,12 +3005,13 @@ pub const App = struct {
         app.emitConfig(.{ .dirs = dir });
     }
 
-    /// 从 ~/.metacodes/config.json 读 permission_rules 数组。失败仅 log，不影响启动。
+    /// 从 <state root>/config.json 读 permission_rules 数组。失败仅 log，不影响启动。
     /// 同时把加载的 rule_set 绑到 permission_ctx.rules。
     fn loadPermissionRules(app: *App) !void {
-        const home = @import("platform").paths.homeDir() orelse return error.NoHome;
+        const state_dir = app.stateRoot();
+        if (state_dir.len == 0) return error.NoHome;
         var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/.metacodes/config.json\x00", .{home});
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/config.json\x00", .{state_dir});
         const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.NotFound;
         defer _ = pfs.close(fd);
@@ -3055,7 +3076,7 @@ pub const App = struct {
         @import("util/log.zig").info("permission", "loaded {d} rule(s) from config", .{app.rule_set.?.rules.items.len});
     }
 
-    /// 启动时连接 ~/.metacodes/config.json 里 mcp_servers 数组里声明的每个 server。
+    /// 启动时连接 <state root>/config.json 里 mcp_servers 数组里声明的每个 server。
     /// Schema：
     ///   {"mcp_servers": [
     ///       {"name": "github", "command": ["/usr/local/bin/mcp-github", "--token=..."]},
@@ -3064,9 +3085,10 @@ pub const App = struct {
     /// 每个 server 失败仅 log,不影响其它 server 或 App 启动。
     /// 成功的 session 注册的工具进 dyn_registry,naming: `<name>__<tool>`。
     fn connectMcpServers(app: *App) !void {
-        const home = @import("platform").paths.homeDir() orelse return error.NoHome;
+        const state_dir = app.stateRoot();
+        if (state_dir.len == 0) return error.NoHome;
         var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/.metacodes/config.json\x00", .{home});
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/config.json\x00", .{state_dir});
         const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.NotFound;
         defer _ = pfs.close(fd);

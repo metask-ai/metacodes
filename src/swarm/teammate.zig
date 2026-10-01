@@ -283,7 +283,7 @@ const TeammateInput = struct {
     tool_defs_owned: []json_mod.ToolDefinition,
     desc_copies: [][]u8, // 深拷贝的 description(同 AgentJobRegistry UAF 防护)
     project_dir: []u8,
-    home: []u8, // teammate SwarmContext 路径根(SendMessage 用)
+    state_root: []u8, // teammate SwarmContext 路径根(SendMessage 用)
     model_override: ?[]u8,
     model_tiers: ?*const @import("../api/model_tiers.zig").ProviderTiers,
     reasoning_effort_override: ?types_mod.ReasoningEffort,
@@ -315,7 +315,7 @@ const TeammateInput = struct {
         a.free(self.desc_copies);
         a.free(self.tool_defs_owned);
         a.free(self.project_dir);
-        a.free(self.home);
+        a.free(self.state_root);
         a.free(self.cwd_abs); // task#12
         a.free(self.home_dir);
         a.free(self.artifact_root);
@@ -352,7 +352,8 @@ pub const TeammateRegistry = struct {
     dialect_resolver: dialect_mod.Resolver = .builtin(),
     limits: ?@import("../api/model_limits.zig").ModelLimitsSource = null,
     catalog_snapshot: ?@import("../api/catalog.zig").Catalog = null,
-    home: []u8,
+    /// 状态根(util/state_root.zig),teams 路径根。
+    state_root: []u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -360,7 +361,7 @@ pub const TeammateRegistry = struct {
         base_url: ?[]const u8,
         model: []const u8,
         provider_kind: types_mod.ProviderKind,
-        home: []const u8,
+        state_root: []const u8,
     ) !TeammateRegistry {
         return initWithDialectResolver(
             allocator,
@@ -369,7 +370,7 @@ pub const TeammateRegistry = struct {
             model,
             provider_kind,
             .chat_completions,
-            home,
+            state_root,
             .builtin(),
         );
     }
@@ -381,17 +382,17 @@ pub const TeammateRegistry = struct {
         model: []const u8,
         provider_kind: types_mod.ProviderKind,
         openai_protocol: types_mod.OpenAIProtocol,
-        home: []const u8,
+        state_root: []const u8,
         dialect_resolver: dialect_mod.Resolver,
     ) !TeammateRegistry {
-        if (home.len == 0) return error.NoHome; // 路径 helper 空 home 约束(team.zig F9)
+        if (state_root.len == 0) return error.NoHome; // 路径 helper 空状态根约束(team.zig F9)
         const key_owned = try allocator.dupe(u8, api_key);
         errdefer allocator.free(key_owned);
         const url_owned: ?[]u8 = if (base_url) |u| try allocator.dupe(u8, u) else null;
         errdefer if (url_owned) |u| allocator.free(u);
         const model_owned = try allocator.dupe(u8, model);
         errdefer allocator.free(model_owned);
-        const home_owned = try allocator.dupe(u8, home);
+        const home_owned = try allocator.dupe(u8, state_root);
         errdefer allocator.free(home_owned);
         return .{
             .allocator = allocator,
@@ -401,7 +402,7 @@ pub const TeammateRegistry = struct {
             .provider_kind = provider_kind,
             .openai_protocol = openai_protocol,
             .dialect_resolver = dialect_resolver,
-            .home = home_owned,
+            .state_root = home_owned,
         };
     }
 
@@ -712,12 +713,12 @@ pub const TeammateRegistry = struct {
         var id_buf: [160]u8 = undefined;
         const agent_id = team_mod.formatAgentId(name_s, p.team, &id_buf) orelse return error.BadName;
         var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const config_path = team_mod.configPath(self.home, p.team, &cfg_buf);
+        const config_path = team_mod.configPath(self.state_root, p.team, &cfg_buf);
         if (config_path.len == 0) return error.BadPath;
         var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const inbox_path = team_mod.inboxPath(self.home, p.team, name_s, &inbox_buf);
+        const inbox_path = team_mod.inboxPath(self.state_root, p.team, name_s, &inbox_buf);
         var lead_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const lead_inbox_path = team_mod.inboxPath(self.home, p.team, team_mod.TEAM_LEAD_NAME, &lead_buf);
+        const lead_inbox_path = team_mod.inboxPath(self.state_root, p.team, team_mod.TEAM_LEAD_NAME, &lead_buf);
 
         // 1) entry(堆分配,地址稳定)。
         const entry = try a.create(TeammateEntry);
@@ -817,7 +818,7 @@ pub const TeammateRegistry = struct {
         }
         const pdir_owned = try a.dupe(u8, p.project_dir);
         errdefer if (!committed) a.free(pdir_owned);
-        const home_owned = try a.dupe(u8, self.home);
+        const home_owned = try a.dupe(u8, self.state_root);
         errdefer if (!committed) a.free(home_owned);
         const mover_owned: ?[]u8 = if (p.model_override) |m| try a.dupe(u8, m) else null;
         errdefer if (!committed) if (mover_owned) |m| a.free(m);
@@ -860,7 +861,7 @@ pub const TeammateRegistry = struct {
             .tool_defs_owned = defs_owned,
             .desc_copies = desc_copies,
             .project_dir = pdir_owned,
-            .home = home_owned,
+            .state_root = home_owned,
             .model_override = mover_owned,
             .model_tiers = p.model_tiers,
             .reasoning_effort_override = p.reasoning_effort_override,
@@ -959,7 +960,7 @@ pub const TeammateRegistry = struct {
         self.allocator.free(self.api_key);
         if (self.base_url) |u| self.allocator.free(u);
         self.allocator.free(self.model);
-        self.allocator.free(self.home);
+        self.allocator.free(self.state_root);
     }
 };
 
@@ -1370,7 +1371,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
         // file fallback; a teammate must not independently revive TinyKG and split the
         // backlog between graph and mirror.
         if (shared.ready) {
-            if (shared.cloneForThread(std.heap.c_allocator, input.home)) |c| {
+            if (shared.cloneForThread(std.heap.c_allocator, input.state_root)) |c| {
                 own_kg = c;
                 own_kg.?.ensureReady();
                 if (!own_kg.?.ready) {
@@ -1402,13 +1403,13 @@ fn teammateThreadMain(input: *TeammateInput) void {
     }
 
     // 每 teammate 一个 SwarmContext(is_lead=false):让 teammate 的 SendMessage 能回 lead/peer
-    // (Linus/PM F1)。team_sanitized 借 entry.team、home 借 input.home——**不 deinit 本地 sw**
+    // (Linus/PM F1)。team_sanitized 借 entry.team、home 借 input.state_root——**不 deinit 本地 sw**
     // (teammates=null 无 registry;两串是借用,deinit 会误 free)。
     var teammate_sw = @import("context.zig").SwarmContext{
         .allocator = a,
         .session = input.session,
         .lease = e.agent_ident,
-        .home = input.home,
+        .state_root = input.state_root,
         .self_name = e.name,
         .is_lead = false,
         .team_sanitized = e.team,
@@ -1467,6 +1468,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
                 .sandbox = input.sandbox,
                 .cwd_abs = input.cwd_abs,
                 .home_dir = input.home_dir,
+                .state_root = input.state_root,
                 .artifact_root = input.artifact_root,
                 .tool_result_metrics = input.tool_result_metrics,
                 .file_change_journal = input.file_change_journal,

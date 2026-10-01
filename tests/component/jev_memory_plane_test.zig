@@ -24,7 +24,7 @@ const Event = cc.tools.tool_observation.Event;
 
 fn makeKg(a: std.mem.Allocator, bin: []const u8, store: []const u8, domain: []const u8) !KgClient {
     return KgClient.init(a, .{
-        .home = "/tmp",
+        .state_root = "/tmp",
         .domain = domain,
         .config_bin = bin,
         .config_store = store,

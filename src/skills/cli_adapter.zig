@@ -69,9 +69,10 @@ pub const Runtime = struct {
         self: *Runtime,
         cwd: []const u8,
         home: []const u8,
+        state_root: []const u8,
         projection: *skill_projection.SkillSet,
     ) !void {
-        return self.loadDefaultWithExtraSources(cwd, home, "", &.{}, projection);
+        return self.loadDefaultWithExtraSources(cwd, home, state_root, "", &.{}, projection);
     }
 
     /// Product defaults plus Host-admitted plugin sources are resolved by one
@@ -81,6 +82,7 @@ pub const Runtime = struct {
         self: *Runtime,
         cwd: []const u8,
         home: []const u8,
+        state_root: []const u8,
         workspace_epoch: []const u8,
         extra_sources: []const runtime.catalog.Source,
         projection: *skill_projection.SkillSet,
@@ -95,6 +97,7 @@ pub const Runtime = struct {
             scratch.allocator(),
             workspace_root,
             home,
+            state_root,
         );
         var combined: std.ArrayList(runtime.catalog.Source) = .empty;
         try combined.appendSlice(scratch.allocator(), defaults);
@@ -576,6 +579,7 @@ pub fn handleSlash(
         .cwd_abs = app.cwdAbs(),
         .additional_dirs = app.additionalDirs(),
         .home_dir = app.homeDir(),
+        .state_root = app.stateRoot(),
         .agents = &app.agents,
         .parent_model = app.activeModel(),
         .skills = &app.skills,
@@ -795,6 +799,7 @@ fn executeFork(
                 .sandbox = ctx.sandbox,
                 .cwd_abs = ctx.cwd_abs,
                 .home_dir = ctx.home_dir,
+                .state_root = ctx.state_root,
                 .additional_dirs = ctx.additional_dirs,
             });
             system_prompt = owned_prompt.?;

@@ -140,7 +140,7 @@ test "L2: end-of-run evolution proposes and the next run arms the provisional ru
 
     // 真 store + 项目锚(KgRemember 建 project 节点 = 本体投影的前提)。
     var kg = try cc.kg_client.KgClient.init(a, .{
-        .home = root,
+        .state_root = root,
         .domain = "selfevo-l2",
         .config_bin = kg_bin,
         .config_store = store_dir,
@@ -280,7 +280,7 @@ test "L2: outcome ingestion is idempotent through the real recall path" {
     const project_root = try std.fmt.bufPrint(&project_buffer, "{s}/project", .{root});
     cc.util_fs.mkdirParents(project_root) catch {};
     var kg = try cc.kg_client.KgClient.init(a, .{
-        .home = root,
+        .state_root = root,
         .domain = "selfevo-l2b",
         .config_bin = kg_bin,
         .config_store = store_dir,
@@ -378,7 +378,7 @@ test "L2: task obligation rides the store and arms the gate for the same task on
     var store_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const store_dir = try std.fmt.bufPrint(&store_buffer, "{s}/store", .{root});
     var kg = try cc.kg_client.KgClient.init(a, .{
-        .home = root,
+        .state_root = root,
         .domain = "selfevo-l2c",
         .config_bin = kg_bin,
         .config_store = store_dir,
@@ -455,7 +455,7 @@ test "L2: author obligation proposal lands as an envelope the same task collects
     for ([_][]const u8{ state_dir, session_dir, rules_dir, project_root }) |dir|
         cc.util_fs.mkdirParents(dir) catch {};
     var kg = try cc.kg_client.KgClient.init(a, .{
-        .home = root,
+        .state_root = root,
         .domain = "selfevo-l2d",
         .config_bin = kg_bin,
         .config_store = store_dir,
@@ -543,7 +543,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     var store_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const store_dir = try std.fmt.bufPrint(&store_buffer, "{s}/store", .{root});
     var kg = try cc.kg_client.KgClient.init(a, .{
-        .home = root,
+        .state_root = root,
         .domain = "selfevo-l2e",
         .config_bin = kg_bin,
         .config_store = store_dir,
@@ -1483,7 +1483,7 @@ test "forensic replay: deterministic note against real store" {
     if (std.c.getenv("METACODES_REPLAY_OUTCOMES")) |of| {
         @import("platform").paths.setEnv("METACODES_TASK_OUTCOMES", of);
         var kg0 = try cc.kg_client.KgClient.init(a, .{
-            .home = "/tmp/replay-home",
+            .state_root = "/tmp/replay-home",
             .domain = "workspace-5807156e",
             .config_bin = kg_bin,
             .config_store = store,
@@ -1498,7 +1498,7 @@ test "forensic replay: deterministic note against real store" {
     const domains = [_][]const u8{ "workspace-5807156e", "workspace", "global" };
     for (domains) |domain| {
         var kg = try cc.kg_client.KgClient.init(a, .{
-            .home = "/tmp/replay-home",
+            .state_root = "/tmp/replay-home",
             .domain = domain,
             .config_bin = kg_bin,
             .config_store = store,

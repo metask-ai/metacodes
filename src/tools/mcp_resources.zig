@@ -25,7 +25,7 @@ const result_spool = @import("result_spool.zig");
 
 const LAST_ERROR_DETAIL_MAX_BYTES: usize = 512;
 
-const NO_MCP_SESSIONS_DETAIL = "No MCP servers are connected in this session. Declare servers in ~/.metacodes/config.json under \"mcp_servers\" (see /mcp) and restart; their tools then register as <server>__<tool> and are listed under \"# Deferred tools\".";
+const NO_MCP_SESSIONS_DETAIL = "No MCP servers are connected in this session. Declare servers in <state root>/config.json under \"mcp_servers\" (see /mcp) and restart; their tools then register as <server>__<tool> and are listed under \"# Deferred tools\".";
 
 fn extractDecodedField(a: std.mem.Allocator, args: []const u8, field: []const u8) !?[]u8 {
     const raw = common.extractJsonArg(args, field) orelse return null;

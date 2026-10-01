@@ -143,14 +143,14 @@ pub const Failure = union(enum) {
                     allocator,
                     "the stored selection pins offer {s}, which the current catalog does not " ++
                         "offer; pass --provider/--model to choose another route, or clear " ++
-                        "\"global_selection\" in ~/.metacodes/config.json",
+                        "\"global_selection\" in <state root>/config.json",
                     .{&pin.offer_id.render()},
                 ),
                 .auto_route => |route| std.fmt.allocPrint(
                     allocator,
                     "the stored selection '{s}' matches no route the current catalog allows; " ++
                         "pass --provider/--model to choose another route, or clear " ++
-                        "\"global_selection\" in ~/.metacodes/config.json",
+                        "\"global_selection\" in <state root>/config.json",
                     .{route.selector.slice()},
                 ),
             },

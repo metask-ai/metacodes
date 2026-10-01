@@ -837,7 +837,7 @@ test "L2: a globally committed selection routes the next process, model inferenc
     }
 
     {
-        var store = try cc.provider_config_store.Store.initHome(a);
+        var store = try cc.provider_config_store.Store.initHome(a, "");
         defer store.deinit();
         _ = try cc.provider_config_store.setGlobalSelection(
             &store,

@@ -3,7 +3,7 @@
 //! 终端 bracketed paste mode 下，粘贴内容被 ESC[200~ ... ESC[201~ 包裹。
 //! 驱动循环（loop.zig）收集这段字节后调 `process`：
 //!   - 小粘贴（行数/字节数都在阈值内）→ 原样内联插入。
-//!   - 大粘贴 → 写到 ~/.metacodes/pastes/<n>.txt，buffer 里只放占位符
+//!   - 大粘贴 → 写到 <state_root>/pastes/<n>.txt，buffer 里只放占位符
 //!     `[Pasted text #N +M lines]`，避免大段文字吃满 prompt + 终端刷屏。
 //!
 //! 占位符里的 #N 是本 session 内递增的粘贴编号；+M 是行数。
@@ -32,18 +32,18 @@ fn countLines(text: []const u8) usize {
     return n;
 }
 
-/// 把一段粘贴写到 ~/.metacodes/pastes/<id>.txt。返回占位符（owned）。
+/// 把一段粘贴写到 <state_root>/pastes/<id>.txt。返回占位符（owned）。
 /// id 由调用方维护（session 内递增）。失败时返回 null → 调用方退回内联。
-pub fn store(allocator: std.mem.Allocator, home: []const u8, id: usize, text: []const u8) !?[]u8 {
-    const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/pastes", .{home}, 0);
+pub fn store(allocator: std.mem.Allocator, state_root: []const u8, id: usize, text: []const u8) !?[]u8 {
+    const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}/pastes", .{state_root}, 0);
     defer allocator.free(dir_z);
-    // mkdir -p：先建 .metacodes，再建 pastes
-    const parent_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes", .{home}, 0);
+    // mkdir:先建状态根(单层),再建 pastes
+    const parent_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{state_root}, 0);
     defer allocator.free(parent_z);
     _ = pfs.mkdir(parent_z.ptr, 0o700);
     _ = pfs.mkdir(dir_z.ptr, 0o700);
 
-    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }, 0);
+    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/pastes/{d}.txt", .{ state_root, id }, 0);
     defer allocator.free(path_z);
 
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
@@ -61,8 +61,8 @@ pub fn store(allocator: std.mem.Allocator, home: []const u8, id: usize, text: []
 }
 
 /// 读回某个粘贴文件的内容（提交时 expand 用）。
-pub fn load(allocator: std.mem.Allocator, home: []const u8, id: usize) !?[]u8 {
-    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }, 0);
+pub fn load(allocator: std.mem.Allocator, state_root: []const u8, id: usize) !?[]u8 {
+    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/pastes/{d}.txt", .{ state_root, id }, 0);
     defer allocator.free(path_z);
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
@@ -80,7 +80,7 @@ pub fn load(allocator: std.mem.Allocator, home: []const u8, id: usize) !?[]u8 {
 
 /// 把一行里的所有 `[Pasted text #N +M lines]` 占位符替换为对应粘贴文件的真实内容。
 /// 无占位符则返回 input 的 dupe。提交前调用，让模型收到完整文本。
-pub fn expandPlaceholders(allocator: std.mem.Allocator, home: []const u8, input: []const u8) ![]u8 {
+pub fn expandPlaceholders(allocator: std.mem.Allocator, state_root: []const u8, input: []const u8) ![]u8 {
     const marker = "[Pasted text #";
     if (std.mem.indexOf(u8, input, marker) == null) return try allocator.dupe(u8, input);
 
@@ -104,7 +104,7 @@ pub fn expandPlaceholders(allocator: std.mem.Allocator, home: []const u8, input:
                 i += 1;
                 continue;
             };
-            if (try load(allocator, home, id)) |content| {
+            if (try load(allocator, state_root, id)) |content| {
                 defer allocator.free(content);
                 try out.appendSlice(allocator, content);
             } else {
@@ -148,29 +148,29 @@ test "isLarge by bytes" {
 test "store + load + expand round trip" {
     const a = testing.allocator;
     var home_buf: [512]u8 = undefined;
-    const home = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-home");
-    _ = pfs.mkdir(home.ptr, 0o700);
-    defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
+    const state_root = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-state_root");
+    _ = pfs.mkdir(state_root.ptr, 0o700);
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(state_root);
     defer {
         // cleanup
         var pz: [256]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pz, "{s}/.metacodes/pastes/1.txt", .{home}) catch unreachable;
+        const p = std.fmt.bufPrintZ(&pz, "{s}/pastes/1.txt", .{state_root}) catch unreachable;
         pfs.unlinkPath(p.ptr) catch {};
     }
 
     const text = "line A\nline B\nline C\n";
-    const placeholder = (try store(a, home, 1, text)).?;
+    const placeholder = (try store(a, state_root, 1, text)).?;
     defer a.free(placeholder);
     try testing.expect(std.mem.indexOf(u8, placeholder, "[Pasted text #1") != null);
 
-    const loaded = (try load(a, home, 1)).?;
+    const loaded = (try load(a, state_root, 1)).?;
     defer a.free(loaded);
     try testing.expectEqualStrings(text, loaded);
 
     // expand placeholder back to content
     const line = try std.fmt.allocPrint(a, "before {s} after", .{placeholder});
     defer a.free(line);
-    const expanded = try expandPlaceholders(a, home, line);
+    const expanded = try expandPlaceholders(a, state_root, line);
     defer a.free(expanded);
     try testing.expect(std.mem.indexOf(u8, expanded, "line A\nline B\nline C") != null);
     try testing.expect(std.mem.indexOf(u8, expanded, "before ") != null);
@@ -180,20 +180,20 @@ test "store + load + expand round trip" {
 test "store placeholder count = lines - 1 (cc v2.1.172)" {
     const a = testing.allocator;
     var home_buf: [512]u8 = undefined;
-    const home = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-home");
-    _ = pfs.mkdir(home.ptr, 0o700);
-    defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
+    const state_root = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-state_root");
+    _ = pfs.mkdir(state_root.ptr, 0o700);
+    defer @import("../util/fs.zig").testing.rmrfBestEffort(state_root);
     defer {
         var pz: [256]u8 = undefined;
         inline for (.{ 4, 20 }) |id| {
-            const p = std.fmt.bufPrintZ(&pz, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }) catch unreachable;
+            const p = std.fmt.bufPrintZ(&pz, "{s}/pastes/{d}.txt", .{ state_root, id }) catch unreachable;
             pfs.unlinkPath(p.ptr) catch {};
         }
     }
 
     // 4 行 → "+3 lines"
     const four = "L0\nL1\nL2\nL3";
-    const ph4 = (try store(a, home, 4, four)).?;
+    const ph4 = (try store(a, state_root, 4, four)).?;
     defer a.free(ph4);
     try testing.expect(std.mem.indexOf(u8, ph4, "+3 lines") != null);
 
@@ -204,7 +204,7 @@ test "store placeholder count = lines - 1 (cc v2.1.172)" {
         const seg = std.fmt.bufPrint(buf[w..], "R{d}\n", .{i}) catch unreachable;
         w += seg.len;
     }
-    const ph20 = (try store(a, home, 20, buf[0 .. w - 1])).?; // 去掉末尾 \n → 恰 20 行
+    const ph20 = (try store(a, state_root, 20, buf[0 .. w - 1])).?; // 去掉末尾 \n → 恰 20 行
     defer a.free(ph20);
     try testing.expect(std.mem.indexOf(u8, ph20, "+19 lines") != null);
 }
@@ -218,7 +218,7 @@ test "expandPlaceholders no marker returns dupe" {
 
 test "expandPlaceholders missing file keeps placeholder" {
     const a = testing.allocator;
-    const r = try expandPlaceholders(a, "/tmp/cc-zig-nonexistent-home", "[Pasted text #999 +3 lines]");
+    const r = try expandPlaceholders(a, "/tmp/cc-zig-nonexistent-state_root", "[Pasted text #999 +3 lines]");
     defer a.free(r);
     try testing.expectEqualStrings("[Pasted text #999 +3 lines]", r);
 }

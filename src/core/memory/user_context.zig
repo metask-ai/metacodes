@@ -52,6 +52,8 @@ fn formatToday(buf: []u8) []u8 {
 pub const BuildOptions = struct {
     cwd: []const u8 = "",
     home: []const u8 = "",
+    /// 状态根:User 级 `<state_root>/AGENTS.md`(claudemd.LoadOptions.state_root)。
+    state_root: []const u8 = "",
     /// AutoMem 段(memdir MEMORY.md 索引,已截断)。空则不加。owned-by-caller。
     auto_mem: []const u8 = "",
     /// KG 注入段(持久任务图启动快照,kg/inject.zig 构建)。空则不加(空态零输出,
@@ -64,7 +66,7 @@ pub const BuildOptions = struct {
 pub fn build(allocator: std.mem.Allocator, opts: BuildOptions) !?[]u8 {
     if (isDisabled()) return null;
 
-    const chain = try claudemd.load(allocator, .{ .cwd = opts.cwd, .home = opts.home });
+    const chain = try claudemd.load(allocator, .{ .cwd = opts.cwd, .home = opts.home, .state_root = opts.state_root });
     defer allocator.free(chain);
 
     const has_chain = chain.len > 0;

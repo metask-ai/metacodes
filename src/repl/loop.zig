@@ -96,8 +96,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     var history = history_mod.History.init(allocator);
     defer history.deinit();
 
-    // 历史文件路径：~/.metacodes/history
-    const hist_path = try historyPath(allocator);
+    // 历史文件路径：<state root>/history
+    const hist_path = try historyPath(allocator, app.stateRoot());
     defer allocator.free(hist_path);
     history.loadFromFile(hist_path) catch {};
     defer history.saveToFile(hist_path) catch {};
@@ -202,7 +202,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /goal [cmd]      View/manage the session goal
                 \\  /loop [cmd]      View/control automatic continuation
                 \\  /doctor          Show environment/config diagnostics
-                \\  /config [show|path]  Inspect config (~/.metacodes/config.json)
+                \\  /config [show|path]  Inspect config (<state root>/config.json)
                 \\  /init            Analyze the codebase and write CLAUDE.md (model-driven)
                 \\  /mcp             List configured MCP servers
                 \\  /agents          List available sub-agent capabilities
@@ -636,8 +636,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         try history.append(final_input);
         // 粘贴占位符 [Pasted text #N] → 展开成真实内容再喂给模型；history 保留紧凑占位符。
         const expanded = blk: {
-            const home_c = @import("platform").paths.homeDir() orelse break :blk null;
-            break :blk paste_mod.expandPlaceholders(allocator, home_c, final_input) catch null;
+            if (app.stateRoot().len == 0) break :blk null;
+            break :blk paste_mod.expandPlaceholders(allocator, app.stateRoot(), final_input) catch null;
         };
         defer if (expanded) |e| allocator.free(e);
         try app.conversation.appendText(.user, expanded orelse final_input);
@@ -988,6 +988,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
         .sandbox = app.sandboxPtr(),
         .cwd_abs = app.cwdAbs(),
         .home_dir = app.homeDir(),
+        .state_root = app.stateRoot(),
         .artifact_root = app.sessionDir() orelse "",
         .tool_result_metrics = &app.tool_result_metrics,
         .file_change_journal = &app.file_change_journal,
@@ -1066,6 +1067,7 @@ fn handlePaste(
     editor: *input.LineEditor,
     parser: *input.KeyParser,
     allocator: std.mem.Allocator,
+    state_root: []const u8,
 ) !void {
     var pasted = std.ArrayList(u8).empty;
     defer pasted.deinit(allocator);
@@ -1104,10 +1106,9 @@ fn handlePaste(
     if (text.len == 0) return;
 
     if (paste_mod.isLarge(text)) {
-        const home_c = @import("platform").paths.homeDir();
-        if (home_c) |home| {
+        if (state_root.len > 0) {
             g_paste_id += 1;
-            if (paste_mod.store(allocator, home, g_paste_id, text) catch null) |placeholder| {
+            if (paste_mod.store(allocator, state_root, g_paste_id, text) catch null) |placeholder| {
                 defer allocator.free(placeholder);
                 try insertAtCursor(editor, allocator, placeholder);
                 return;
@@ -1305,7 +1306,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
 
         // 括号粘贴：收集到 paste_end，决定内联还是外部存储 + 占位符
         if (key == .paste_begin) {
-            try handlePaste(fd, &editor, &parser, allocator);
+            try handlePaste(fd, &editor, &parser, allocator, app.stateRoot());
             redraw(&region, &editor, app);
             continue;
         }
@@ -1944,9 +1945,9 @@ fn printHistory(history: *const history_mod.History) void {
     }
 }
 
-fn historyPath(allocator: std.mem.Allocator) ![]u8 {
-    const home = @import("platform").paths.homeDir() orelse return error.NoHome;
-    return std.fmt.allocPrint(allocator, "{s}/.metacodes/history", .{home});
+fn historyPath(allocator: std.mem.Allocator, state_root: []const u8) ![]u8 {
+    if (state_root.len == 0) return error.NoHome;
+    return std.fs.path.join(allocator, &.{ state_root, "history" });
 }
 
 // ============================================================================
@@ -2171,7 +2172,7 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         return;
     }
 
-    var store = config_store.Store.initHome(allocator) catch |err| {
+    var store = config_store.Store.initHome(allocator, app.stateRoot()) catch |err| {
         std.debug.print("\x1b[31malias store unavailable: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
@@ -2456,7 +2457,7 @@ fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         if (refreshed == 0) {
             std.debug.print(
                 "No provider catalogs are configured. Add `provider_catalogs` to " ++
-                    "~/.metacodes/config.json with a models_url (or models_file).\n",
+                    "<state root>/config.json with a models_url (or models_file).\n",
                 .{},
             );
             return;
@@ -2725,11 +2726,11 @@ fn injectCompactStressHistory(app: *app_mod.App, allocator: std.mem.Allocator) !
 }
 
 fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
-    const home = @import("platform").paths.homeDir() orelse {
-        std.debug.print("HOME not set\n", .{});
+    if (app.stateRoot().len == 0) {
+        std.debug.print("no state root (HOME not set)\n", .{});
         return;
-    };
-    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/config.json", .{home});
+    }
+    const cfg_path = try std.fs.path.join(allocator, &.{ app.stateRoot(), "config.json" });
     defer allocator.free(cfg_path);
 
     if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
@@ -3587,7 +3588,7 @@ fn handleMcp(app: *app_mod.App) !void {
         std.debug.print(
             \\MCP servers: (none connected)
             \\
-            \\Declare servers in ~/.metacodes/config.json:
+            \\Declare servers in <state root>/config.json:
             \\  {{"mcp_servers":[{{"name":"foo","command":["/path/to/server","--flag"]}}]}}
             \\
         , .{});
@@ -3694,7 +3695,7 @@ fn handlePermissions(app: *app_mod.App) void {
             }
         }
     } else {
-        std.debug.print("rules: (none loaded — add a permission_rules array to ~/.metacodes/config.json)\n", .{});
+        std.debug.print("rules: (none loaded — add a permission_rules array to <state root>/config.json)\n", .{});
     }
 
     // 新 schema settings 层(permissions.allow/ask/deny)
@@ -3737,7 +3738,7 @@ fn handleTheme(app: *app_mod.App, rest: []const u8) void {
     std.debug.print("theme switched to \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(app.theme_variant)});
     switch (o.data) {
         .err_name => |e| std.debug.print("\x1b[2m(persist failed: {s})\x1b[0m\n", .{e}),
-        .theme => |t| if (t.persisted) std.debug.print("\x1b[2m(saved to ~/.metacodes/config.json)\x1b[0m\n", .{}),
+        .theme => |t| if (t.persisted) std.debug.print("\x1b[2m(saved to <state root>/config.json)\x1b[0m\n", .{}),
         else => {},
     }
 }
@@ -4121,10 +4122,11 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
 
 /// /resume：rest == "" 时列出最近 session；rest 是 session id 时加载。
 fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
-    const home = @import("platform").paths.homeDir() orelse {
-        std.debug.print("no HOME env set\n", .{});
+    const state_dir = app.stateRoot();
+    if (state_dir.len == 0) {
+        std.debug.print("no state root (HOME not set)\n", .{});
         return;
-    };
+    }
 
     const cwd = util_fs.getCwd(allocator) catch {
         std.debug.print("getcwd failed\n", .{});
@@ -4133,7 +4135,7 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     defer allocator.free(cwd);
 
     if (rest.len == 0) {
-        const list = transcript_mod.listSessions(cwd, home, allocator) catch |err| {
+        const list = transcript_mod.listSessions(cwd, state_dir, allocator) catch |err| {
             std.debug.print("listSessions failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -4155,7 +4157,7 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     }
 
     // rest 是 session id 或纯数字（对应列表位置 1..N）
-    const list = transcript_mod.listSessions(cwd, home, allocator) catch |err| {
+    const list = transcript_mod.listSessions(cwd, state_dir, allocator) catch |err| {
         std.debug.print("listSessions failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -4394,7 +4396,7 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     const home = util_fs.testing.perPidDir(&home_buf, "cc-zig-resume-l2-16");
     _ = pfs.mkdir(home.ptr, 0o755);
     defer util_fs.testing.rmrfBestEffort(home);
-    // handleResume 走 homeDir()(env);setEnv HOME 后 defer 还原,免污染同 binary 其它测试(单线程顺序跑)。
+    // App.init 无显式状态根时取 $HOME/.metacodes;setEnv HOME 后 defer 还原,免污染同 binary 其它测试(单线程顺序跑)。
     const old_home = std.c.getenv("HOME");
     ppaths.setEnv("HOME", home.ptr);
     defer if (old_home) |h| ppaths.setEnv("HOME", h) else ppaths.unsetEnv("HOME");
@@ -4410,14 +4412,14 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     defer app.deinit();
     const old_id = app.session_id; // 启动时 gen 的旧 id
 
-    // 造一个磁盘 session(与 handleResume 的 getCwd()+home 对齐 → listSessions 能找到)。
+    // 造一个磁盘 session(与 handleResume 的 getCwd()+app.stateRoot() 对齐 → listSessions 能找到)。
     const cwd = try util_fs.getCwd(a);
     defer a.free(cwd);
     var conv = Conversation.init(a);
     defer conv.deinit();
     try conv.appendText(.user, "resume me");
     const sid = transcript_mod.genSessionId();
-    var w = try transcript_mod.Writer.init(a, cwd, home, "claude-sonnet-4-20250514", sid);
+    var w = try transcript_mod.Writer.init(a, cwd, app.stateRoot(), "claude-sonnet-4-20250514", sid);
     w.flush(&conv);
     w.deinit();
 

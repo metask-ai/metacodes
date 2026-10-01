@@ -46,7 +46,7 @@ test "L2 SW3: 两 teammate 从共享 frontier 自领任务,租约互斥不撞车
     defer a.free(projects_dir);
     try cc.util_fs.mkdirParents(projects_dir);
 
-    var kg = try KgClient.init(a, .{ .home = base, .domain = "swarm-dag", .config_bin = bin, .config_store = store, .env_bin = "", .env_store = "" });
+    var kg = try KgClient.init(a, .{ .state_root = base, .domain = "swarm-dag", .config_bin = bin, .config_store = store, .env_bin = "", .env_store = "" });
     defer kg.deinit();
     kg.ensureReady();
     if (!kg.ready) return error.SkipZigTest;
@@ -122,7 +122,7 @@ test "L2 SW3 F1: 同一任务二次 claim 直接 ClaimHeld(租约互斥硬证)" 
     const store = try std.fmt.allocPrint(a, "{s}/held.kg", .{pbuf[0..dlen]});
     defer a.free(store);
 
-    var kg = try KgClient.init(a, .{ .home = pbuf[0..dlen], .domain = "held", .config_bin = bin, .config_store = store, .env_bin = "", .env_store = "" });
+    var kg = try KgClient.init(a, .{ .state_root = pbuf[0..dlen], .domain = "held", .config_bin = bin, .config_store = store, .env_bin = "", .env_store = "" });
     defer kg.deinit();
     kg.ensureReady();
     if (!kg.ready) return error.SkipZigTest;
@@ -154,7 +154,7 @@ test "L2 SW3 M3: 两线程并发自领同一 frontier,无任务被领两次(各�
     try cc.util_fs.mkdirParents(projects_dir);
 
     // seed store + 6 ready 任务。
-    var seed = try KgClient.init(a, .{ .home = base, .domain = "conc", .config_bin = bin, .config_store = store, .env_bin = "", .env_store = "" });
+    var seed = try KgClient.init(a, .{ .state_root = base, .domain = "conc", .config_bin = bin, .config_store = store, .env_bin = "", .env_store = "" });
     defer seed.deinit();
     seed.ensureReady();
     if (!seed.ready) return error.SkipZigTest;
@@ -178,7 +178,7 @@ test "L2 SW3 M3: 两线程并发自领同一 frontier,无任务被领两次(各�
 
         fn run(self: *@This()) void {
             const ca = std.heap.c_allocator;
-            var kc = KgClient.init(ca, .{ .home = self.base, .domain = "conc", .config_bin = self.bin, .config_store = self.store, .env_bin = "", .env_store = "" }) catch {
+            var kc = KgClient.init(ca, .{ .state_root = self.base, .domain = "conc", .config_bin = self.bin, .config_store = self.store, .env_bin = "", .env_store = "" }) catch {
                 self.ok = false;
                 return;
             };
@@ -245,12 +245,12 @@ test "L2 SW3: TeamCreate 建共享 root + teammate 线程自领跑起来(端到�
     defer a.free(home);
     try cc.util_fs.mkdirParents(home);
 
-    var kg = try KgClient.init(a, .{ .home = base, .domain = "swarm-dag2", .config_bin = bin, .config_store = store, .env_bin = "", .env_store = "" });
+    var kg = try KgClient.init(a, .{ .state_root = base, .domain = "swarm-dag2", .config_bin = bin, .config_store = store, .env_bin = "", .env_store = "" });
     defer kg.deinit();
     kg.ensureReady();
     if (!kg.ready) return error.SkipZigTest;
 
-    var sw = swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
+    var sw = swctx.SwarmContext{ .allocator = a, .state_root = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
     defer sw.deinit();
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};

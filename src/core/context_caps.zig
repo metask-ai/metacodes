@@ -30,7 +30,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
-const paths = @import("platform").paths;
 const util_json = @import("../util/json.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
@@ -102,6 +101,11 @@ var persist_path_buf: [std.fs.max_path_bytes]u8 = undefined;
 var persist_path_len: usize = 0;
 var persist_enabled: bool = false;
 var test_path_override: ?[]const u8 = null;
+/// Host-configured state root (`configureStateRoot`); the default persistence
+/// file is `<root>/context_caps.json`. Unset = in-memory only: core never
+/// decides where an embedding host keeps state.
+var state_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+var state_root_len: usize = 0;
 
 fn lock() void {
     _ = mutex.lock();
@@ -182,6 +186,18 @@ pub fn noteAccepted(endpoint: []const u8, model: []const u8, prompt_tokens: u64)
             return .raised;
         },
     }
+}
+
+/// Host entry point (src/main.zig): persist learned caps under `root`. Call
+/// before the first lookup; a later call reloads from the new location.
+pub fn configureStateRoot(root: []const u8) void {
+    lock();
+    defer unlock();
+    if (root.len >= state_root_buf.len) return;
+    @memcpy(state_root_buf[0..root.len], root);
+    state_root_len = root.len;
+    count = 0;
+    loaded = false;
 }
 
 /// Test hook: empty the registry and disable persistence until
@@ -268,8 +284,8 @@ fn resolvePersistPathLocked() void {
         persist_enabled = true;
         return;
     }
-    const home = paths.homeDir() orelse return;
-    const written = std.fmt.bufPrint(&persist_path_buf, "{s}/.metacodes/context_caps.json", .{home}) catch return;
+    if (state_root_len == 0) return;
+    const written = std.fmt.bufPrint(&persist_path_buf, "{s}/context_caps.json", .{state_root_buf[0..state_root_len]}) catch return;
     persist_path_len = written.len;
     persist_enabled = true;
 }

@@ -103,19 +103,22 @@ pub const StoredCredentials = struct {
     }
 };
 
-pub fn authFilePath(allocator: std.mem.Allocator) ![]u8 {
+/// `METACODES_AUTH_FILE`, else `<state_root>/auth.json`. An empty state root
+/// (the host has none) is `error.NoHome`.
+pub fn authFilePath(allocator: std.mem.Allocator, state_root: []const u8) ![]u8 {
     if (std.c.getenv(AUTH_FILE_ENV)) |p| return allocator.dupe(u8, std.mem.span(p));
-    const home = @import("platform").paths.homeDir() orelse return error.NoHome; // HOME / Windows USERPROFILE
-    return std.fmt.allocPrint(allocator, "{s}/.metacodes/auth.json", .{home});
+    if (state_root.len == 0) return error.NoHome;
+    return std.fs.path.join(allocator, &.{ state_root, "auth.json" });
 }
 
 pub fn resolveCredential(
     allocator: std.mem.Allocator,
+    state_root: []const u8,
     cli_api_key: ?[]const u8,
     precedence: AuthPrecedence,
 ) !ResolvedCredential {
     const env_api_key = if (std.c.getenv(METASK_API_KEY_ENV)) |v| std.mem.span(v) else null;
-    const path = authFilePath(allocator) catch |err| switch (err) {
+    const path = authFilePath(allocator, state_root) catch |err| switch (err) {
         error.NoHome => null,
         else => return err,
     };
@@ -152,6 +155,7 @@ pub fn resolveCredential(
 /// only the FD inside a minimal child environment.
 pub fn resolveRuntimeCredential(
     allocator: std.mem.Allocator,
+    state_root: []const u8,
     cli_api_key: ?[]const u8,
     precedence: AuthPrecedence,
 ) !ResolvedCredential {
@@ -173,7 +177,7 @@ pub fn resolveRuntimeCredential(
     var credential = if (fd_api_key) |runtime|
         try credentialFromApiKey(allocator, runtime.bytes, .fd_api_key)
     else
-        try resolveCredential(allocator, cli_api_key, precedence);
+        try resolveCredential(allocator, state_root, cli_api_key, precedence);
     errdefer credential.deinit(allocator);
     if (fd_api_key) |*runtime| {
         credential.spent_runtime_fd = runtime.fd;
@@ -264,8 +268,8 @@ fn credentialFromStoredOAuth(
     return .{ .bearer_token = try allocator.dupe(u8, stored.oauth.?.access_token), .source = .stored_oauth };
 }
 
-pub fn resolveStoredOAuthBearer(allocator: std.mem.Allocator) !?[]u8 {
-    const path = authFilePath(allocator) catch |err| switch (err) {
+pub fn resolveStoredOAuthBearer(allocator: std.mem.Allocator, state_root: []const u8) !?[]u8 {
+    const path = authFilePath(allocator, state_root) catch |err| switch (err) {
         error.NoHome => return null,
         else => return err,
     };
@@ -279,8 +283,8 @@ pub fn resolveStoredOAuthBearer(allocator: std.mem.Allocator) !?[]u8 {
     return credential.bearer_token;
 }
 
-pub fn loadDefault(allocator: std.mem.Allocator) !StoredCredentials {
-    const path = try authFilePath(allocator);
+pub fn loadDefault(allocator: std.mem.Allocator, state_root: []const u8) !StoredCredentials {
+    const path = try authFilePath(allocator, state_root);
     defer allocator.free(path);
     return loadFromPath(allocator, path);
 }
@@ -294,8 +298,8 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) !StoredCrede
     return parseStoredCredentials(allocator, parsed.value);
 }
 
-pub fn saveDefault(allocator: std.mem.Allocator, creds: StoredCredentials) !void {
-    const path = try authFilePath(allocator);
+pub fn saveDefault(allocator: std.mem.Allocator, state_root: []const u8, creds: StoredCredentials) !void {
+    const path = try authFilePath(allocator, state_root);
     defer allocator.free(path);
     try saveToPath(allocator, path, creds);
 }
@@ -314,8 +318,8 @@ pub fn saveToPath(allocator: std.mem.Allocator, path: []const u8, creds: StoredC
     if (n < 0 or @as(usize, @intCast(n)) != json.len) return error.WriteFailed;
 }
 
-pub fn clearDefault(allocator: std.mem.Allocator) !void {
-    const path = try authFilePath(allocator);
+pub fn clearDefault(allocator: std.mem.Allocator, state_root: []const u8) !void {
+    const path = try authFilePath(allocator, state_root);
     defer allocator.free(path);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);

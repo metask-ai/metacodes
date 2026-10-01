@@ -156,17 +156,18 @@ pub const Session = struct {
         };
     }
 
-    /// `<home>/.metacodes/oauth/<provider>.json`, or `METACODES_OAUTH_DIR`.
+    /// `METACODES_OAUTH_DIR/<provider>.json`, else
+    /// `<state_root>/oauth/<provider>.json`; an empty root is `error.NoHome`.
     pub fn initHome(
         allocator: std.mem.Allocator,
+        state_root: []const u8,
         provider_id: Slug,
     ) OAuthError!Session {
         const dir = if (std.c.getenv("METACODES_OAUTH_DIR")) |raw|
             std.mem.span(raw)
         else blk: {
-            const home = @import("platform").paths.homeDir() orelse return error.NoHome;
-            break :blk std.fmt.allocPrint(allocator, "{s}/.metacodes/oauth", .{home}) catch
-                return error.OutOfMemory;
+            if (state_root.len == 0) return error.NoHome;
+            break :blk std.fs.path.join(allocator, &.{ state_root, "oauth" }) catch return error.OutOfMemory;
         };
         const owned_dir = std.c.getenv("METACODES_OAUTH_DIR") == null;
         defer if (owned_dir) allocator.free(dir);

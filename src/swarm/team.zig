@@ -219,29 +219,29 @@ pub fn parseAgentId(id: []const u8) ?ParsedAgentId {
 // 路径
 // ============================================================================
 
-pub fn teamsDir(home: []const u8, buf: []u8) []const u8 {
-    if (home.len == 0) return "";
-    return std.fmt.bufPrint(buf, "{s}/.metacodes/teams", .{home}) catch "";
+pub fn teamsDir(state_root: []const u8, buf: []u8) []const u8 {
+    if (state_root.len == 0) return "";
+    return std.fmt.bufPrint(buf, "{s}/teams", .{state_root}) catch "";
 }
 
-pub fn teamDirPath(home: []const u8, team_sanitized: []const u8, buf: []u8) []const u8 {
-    if (home.len == 0 or team_sanitized.len == 0) return "";
-    return std.fmt.bufPrint(buf, "{s}/.metacodes/teams/{s}", .{ home, team_sanitized }) catch "";
+pub fn teamDirPath(state_root: []const u8, team_sanitized: []const u8, buf: []u8) []const u8 {
+    if (state_root.len == 0 or team_sanitized.len == 0) return "";
+    return std.fmt.bufPrint(buf, "{s}/teams/{s}", .{ state_root, team_sanitized }) catch "";
 }
 
-pub fn configPath(home: []const u8, team_sanitized: []const u8, buf: []u8) []const u8 {
-    if (home.len == 0 or team_sanitized.len == 0) return "";
-    return std.fmt.bufPrint(buf, "{s}/.metacodes/teams/{s}/config.json", .{ home, team_sanitized }) catch "";
+pub fn configPath(state_root: []const u8, team_sanitized: []const u8, buf: []u8) []const u8 {
+    if (state_root.len == 0 or team_sanitized.len == 0) return "";
+    return std.fmt.bufPrint(buf, "{s}/teams/{s}/config.json", .{ state_root, team_sanitized }) catch "";
 }
 
-pub fn inboxesDirPath(home: []const u8, team_sanitized: []const u8, buf: []u8) []const u8 {
-    if (home.len == 0 or team_sanitized.len == 0) return "";
-    return std.fmt.bufPrint(buf, "{s}/.metacodes/teams/{s}/inboxes", .{ home, team_sanitized }) catch "";
+pub fn inboxesDirPath(state_root: []const u8, team_sanitized: []const u8, buf: []u8) []const u8 {
+    if (state_root.len == 0 or team_sanitized.len == 0) return "";
+    return std.fmt.bufPrint(buf, "{s}/teams/{s}/inboxes", .{ state_root, team_sanitized }) catch "";
 }
 
-pub fn inboxPath(home: []const u8, team_sanitized: []const u8, agent_name_sanitized: []const u8, buf: []u8) []const u8 {
-    if (home.len == 0 or team_sanitized.len == 0 or agent_name_sanitized.len == 0) return "";
-    return std.fmt.bufPrint(buf, "{s}/.metacodes/teams/{s}/inboxes/{s}.json", .{ home, team_sanitized, agent_name_sanitized }) catch "";
+pub fn inboxPath(state_root: []const u8, team_sanitized: []const u8, agent_name_sanitized: []const u8, buf: []u8) []const u8 {
+    if (state_root.len == 0 or team_sanitized.len == 0 or agent_name_sanitized.len == 0) return "";
+    return std.fmt.bufPrint(buf, "{s}/teams/{s}/inboxes/{s}.json", .{ state_root, team_sanitized, agent_name_sanitized }) catch "";
 }
 
 // ============================================================================
@@ -575,10 +575,10 @@ test "agentId format/parse 往返 + 畸形拒绝" {
     try testing.expect(parseAgentId("name@") == null);
 }
 
-test "路径拼装 + 空 home 降级" {
+test "路径拼装 + 空状态根降级" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try testing.expectEqualStrings("/h/.metacodes/teams/t/config.json", configPath("/h", "t", &buf));
-    try testing.expectEqualStrings("/h/.metacodes/teams/t/inboxes/bob.json", inboxPath("/h", "t", "bob", &buf));
+    try testing.expectEqualStrings("/s/teams/t/config.json", configPath("/s", "t", &buf));
+    try testing.expectEqualStrings("/s/teams/t/inboxes/bob.json", inboxPath("/s", "t", "bob", &buf));
     try testing.expectEqualStrings("", configPath("", "t", &buf));
     try testing.expectEqualStrings("", inboxPath("/h", "", "bob", &buf));
 }
