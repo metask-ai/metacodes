@@ -164,6 +164,7 @@ pub const repl_headless = @import("repl/headless.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
 pub const app_route_strings = @import("app/route_strings.zig");
+pub const app_install = @import("app/install.zig");
 pub const tool_context = @import("tools/context.zig");
 pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
 pub const tool_error = @import("core/tool_error.zig");
@@ -1239,18 +1240,116 @@ fn hostRoot() []const u8 {
     return resolved.path;
 }
 
+const install_usage =
+    \\usage: metacodes install --prefix <dir> [--state-dir <dir>] [--sdk <agentcore-bundle-dir>]
+    \\                         [--link <bin-dir> [--link-name <name>]] [--force]
+    \\
+    \\Installs the release unit this executable belongs to at <dir> as one isolated
+    \\install: its own state root (default <dir>/state), kernels, TinyKG and, with
+    \\--sdk, the AgentCore SDK under <dir>/sdk/agentcore. --link writes a launcher
+    \\into a directory on PATH. Ends with the installed `doctor --strict`.
+    \\
+;
+
+fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: std.Io) u8 {
+    const install = @import("app/install.zig");
+    var options: install.Options = .{ .prefix = "" };
+    while (args.next()) |arg| {
+        const value_of = struct {
+            fn get(it: *std.process.Args.Iterator, name: []const u8) ?[]const u8 {
+                const value = it.next() orelse {
+                    std.debug.print("error: {s} needs a value\n{s}", .{ name, install_usage });
+                    return null;
+                };
+                return value;
+            }
+        };
+        if (std.mem.eql(u8, arg, "--prefix")) {
+            options.prefix = absolutePath(allocator, value_of.get(args, arg) orelse return 2) orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+            options.state_dir = absolutePath(allocator, value_of.get(args, arg) orelse return 2) orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--sdk")) {
+            options.sdk = absolutePath(allocator, value_of.get(args, arg) orelse return 2) orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--link")) {
+            options.link_dir = absolutePath(allocator, value_of.get(args, arg) orelse return 2) orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--link-name")) {
+            options.link_name = allocator.dupe(u8, value_of.get(args, arg) orelse return 2) catch return 1;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            options.force = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            std.debug.print("{s}", .{install_usage});
+            return 0;
+        } else {
+            std.debug.print("error: unknown install argument '{s}'\n{s}", .{ arg, install_usage });
+            return 2;
+        }
+    }
+    if (options.prefix.len == 0) {
+        std.debug.print("error: --prefix is required\n{s}", .{install_usage});
+        return 2;
+    }
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = @import("platform").paths.selfExeRealPath(&exe_buf) orelse {
+        std.debug.print("error: cannot locate this executable\n", .{});
+        return 1;
+    };
+    const source_root = @import("util/state_root.zig").prefixOf(exe) orelse {
+        std.debug.print("error: this executable is not inside a release unit (<root>/bin/metacodes)\n", .{});
+        return 1;
+    };
+    var log: std.Io.Writer.Allocating = .init(allocator);
+    defer log.deinit();
+    const outcome = install.run(allocator, io, source_root, options, &log.writer) catch |err| {
+        dumpWrite(log.written());
+        const hint: []const u8 = switch (err) {
+            error.NotAReleaseUnit => "run `metacodes install` from an unpacked release archive, or stage one from source: `zig build kernels:stage --prefix <u>` then `zig build release:verify -Drelease-layout=true --prefix <u> $(python3 scripts/kernel_pins.py <u>)`",
+            error.UnsupportedManifest => "the unit's manifest.json is not a metacodes-cli schema 2 release manifest",
+            error.PrefixOccupied => "the prefix holds files that are not a metacodes install; choose another or pass --force",
+            error.DifferentVersionInstalled => "another metacodes version is installed there; pass --force to replace it, or choose another prefix",
+            error.DigestMismatch => "a file does not match the release manifest; the unit is damaged",
+            error.InvalidSdkBundle => "--sdk must name an unpacked AgentCore bundle (its manifest.json says \"agentcore\")",
+            error.LinkOccupied => "the launcher name is taken by something else; pass --link-name or --force",
+            error.SelfCheckFailed => "the installed executable's `doctor --strict` failed (output above)",
+            else => "",
+        };
+        std.debug.print("error: install failed ({s}){s}{s}\n", .{ @errorName(err), if (hint.len > 0) ": " else "", hint });
+        return 1;
+    };
+    dumpWrite(log.written());
+    var summary: std.Io.Writer.Allocating = .init(allocator);
+    defer summary.deinit();
+    summary.writer.print("metacodes {s} is installed at {s}\n  run: {s}\n", .{ outcome.version, outcome.prefix, outcome.launcher orelse outcome.executable }) catch {};
+    if (outcome.launcher == null) summary.writer.print("  add {s}{c}bin to PATH, or reinstall with --link <dir on PATH>\n", .{ outcome.prefix, std.fs.path.sep }) catch {};
+    if (outcome.sdk) |sdk| summary.writer.print("  SDK: {s}\n", .{sdk}) catch {};
+    dumpWrite(summary.written());
+    return 0;
+}
+
+/// `path` made absolute against the cwd; null (after printing why) on failure.
+fn absolutePath(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path) catch null;
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = platform_fs.getCwd(&cwd_buf) orelse {
+        std.debug.print("error: cannot read the current directory to resolve {s}\n", .{path});
+        return null;
+    };
+    return std.fs.path.join(allocator, &.{ cwd, path }) catch null;
+}
+
 fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, leading: u8) !?u8 {
     var args = argsIter(init);
     defer args.deinit();
     _ = args.next(); // 跳过 argv[0](程序名)
     for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
-    const subcommands = [_][]const u8{ "doctor", "kgd", "kg", "ledger", "logout", "login" };
+    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login" };
     for (subcommands) |name| {
         if (std.mem.eql(u8, cmd, name)) break;
     } else return null;
-    // `doctor` diagnoses a broken state root instead of refusing to start.
+    // `doctor` diagnoses a broken state root instead of refusing to start, and
+    // `install` creates one: neither needs this process's own.
     if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator, init.io);
+    if (std.mem.eql(u8, cmd, "install")) return runInstall(&args, allocator, init.io);
     const state_dir = hostStateRoot() catch return 2;
     if (state_dir.len > 0) @import("core/context_caps.zig").configureStateRoot(state_dir);
     if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator, init.io);
@@ -2763,6 +2862,7 @@ test {
     _ = &@import("core/memory/memory_section.zig");
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
+    _ = &@import("app/install.zig");
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("util/abort.zig");

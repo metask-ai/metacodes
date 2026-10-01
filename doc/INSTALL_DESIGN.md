@@ -1,7 +1,7 @@
 # Installation, per-install state, and bundled governance kernels
 
-Status: in progress (one PR). Owner of the decisions below: the maintainer;
-this document records them so the implementation and reviews have one source.
+Status: implemented. Owner of the decisions below: the maintainer; this
+document records them so the implementation and reviews have one source.
 
 ## 1. Principles
 
@@ -71,24 +71,42 @@ process-global resolution.
 
 ## 4. Installer
 
-`bin/metacodes install --prefix <dir> [--state-dir <dir>] [--force]`, run from
-an extracted release bundle (or from a `release:stage` tree built from source):
+`bin/metacodes install --prefix <dir> [--state-dir <dir>] [--sdk <bundle>]
+[--link <dir> [--link-name <name>]] [--force]` (src/app/install.zig), run from
+an extracted release unit or one staged from source (`release:verify`):
 
-1. refuses a prefix holding a different install unless `--force`, and never
-   writes outside `<prefix>` and the chosen state root;
-2. copies the bundle tree it runs from into `<prefix>`;
-3. writes `etc/metacodes/install.json` and creates the state root (0700);
-4. runs the installed `bin/metacodes doctor --strict` and reports.
+1. refuses a prefix that holds anything but this product's install of the
+   same version unless `--force`, and writes only under `<prefix>`, the state
+   root and the `--link` directory;
+2. copies every file the unit's `manifest.json` lists and re-hashes it at the
+   destination (a damaged unit fails on the first mismatch);
+3. writes `etc/metacodes/install.json` (`"state_root": "state"`, or the
+   absolute `--state-dir`) and creates the state root (0700);
+4. with `--sdk`, replaces `<prefix>/sdk/agentcore/` with the AgentCore bundle,
+   each file verified against that bundle's manifest; with `--link`, writes a
+   launcher script (POSIX `sh`, Windows `.cmd`) that `exec`s the installed
+   executable, refusing a same-named launcher of another install unless
+   `--force`;
+5. runs the installed `bin/metacodes doctor --strict` in an empty environment
+   (POSIX) and requires every runtime asset adjacent and the state root to come
+   from the install record.
 
-`install.sh` (macOS/Linux) and `install.ps1` (Windows) only locate or extract
-the bundle and invoke step 1–4, so the install logic exists once, in Zig.
+`scripts/install.sh` (macOS/Linux; default prefix `~/.local/opt/metacodes`,
+launcher in `~/.local/bin`) and `scripts/install.ps1` (Windows; default prefix
+`%LOCALAPPDATA%\Programs\metacodes`, `<prefix>\bin` added to the user PATH
+unless `-NoPath`) only check an archive's `.sha256`, unpack it, and call step
+1–5, so the install logic exists once, in Zig. CI runs both scripts on the
+verified release unit, and release.yml on the archives it publishes.
 
 ## 5. Kernels in release builds
 
-Each release job installs the pinned elan (`scripts/ci/install-elan.sh`; the
-Windows job its PowerShell equivalent), builds both kernels natively with
-their scripts (axiom audit, native smoke, provenance), and builds the
-executable with the kernel digests pinned. `release/LAYOUT.md`,
+Each release job installs the pinned elan (`scripts/ci/install-elan.sh`, under
+Git Bash on Windows), builds both kernels natively with their scripts (axiom
+audit, native smoke, `check_kernel_self_contained.py`, provenance), and builds
+the executable with the kernel digests pinned (`scripts/kernel_pins.py`). The
+kernels link the Lean runtime, GMP and libuv statically; their licence texts
+ship under `share/licenses/` (vendor/lean-runtime/). aarch64-linux stays a
+cross-staged asset check until a native aarch64 runner can build its kernels. `release/LAYOUT.md`,
 `release/manifest.schema.json` and `scripts/verify_install_prefix.py` list the
 kernels and `tinykgd` as required runtime assets.
 

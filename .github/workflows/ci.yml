@@ -206,6 +206,11 @@ jobs:
           echo "KERNEL_PINS=$pins" >> "$GITHUB_ENV"
       - name: Release layout prefix
         run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
+      # The installer, through the same script users run, on the verified
+      # unit: every file re-verified at the new prefix, an install record and
+      # state root of its own, and the installed executable's doctor --strict.
+      - name: Install the release unit with scripts/install.sh
+        run: sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed" "$RUNNER_TEMP/release-prefix" && "$RUNNER_TEMP/installed/bin/metacodes" doctor --strict
       - name: Release bundle verifier self-test
         run: python3 scripts/verify_release_bundle.py --self-test
       - name: Release archive is reproducible
@@ -336,6 +341,9 @@ jobs:
       - name: Release layout prefix
         shell: cmd
         run: zig build release:verify -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release-prefix" --release --doctor
+      - name: Install the release unit with scripts/install.ps1
+        shell: cmd
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 "%RUNNER_TEMP%\release-prefix" -Prefix "%RUNNER_TEMP%\installed" -NoPath && "%RUNNER_TEMP%\installed\bin\metacodes.exe" doctor --strict
       - name: Release bundle verifier self-test
         shell: cmd
         run: python scripts\verify_release_bundle.py --self-test

@@ -10,7 +10,62 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- Installation as isolated, coexisting installs (doc/INSTALL_DESIGN.md).
+  `metacodes install --prefix <dir>` copies the release unit it belongs to,
+  re-verifies every file against the release manifest, writes
+  `<dir>/etc/metacodes/install.json`, creates the install's own state root
+  (`<dir>/state`, or `--state-dir`), optionally places the AgentCore SDK under
+  `<dir>/sdk/agentcore/` (`--sdk`) and a launcher on PATH (`--link`,
+  `--link-name`), and ends with the installed `doctor --strict`. It refuses a
+  prefix holding foreign files or another version unless `--force`.
+  `scripts/install.sh` (macOS/Linux) and `scripts/install.ps1` (Windows)
+  unpack an archive, check its `.sha256`, and call it.
+- The release unit is complete on every platform (manifest schema 2): it
+  ships the TinyKG daemon and both Lean governance kernels, built natively on
+  each release runner and pinned into the executable, with the licence texts
+  of the Lean runtime, GMP and libuv the kernels statically link
+  (`vendor/lean-runtime/`, `THIRD_PARTY_NOTICES.md`).
+- `zig build kernels:stage` builds both kernels from the checkout into
+  `<prefix>/libexec/metacodes`, and `zig build test` uses them whenever a Lean
+  toolchain is present, so every kernel-gated test runs with no
+  configuration; `-Dlean-kernels=on|off` forces or disables that.
+  `scripts/kernel_pins.py` prints the `-D…-kernel-sha256` pins for a staged
+  prefix.
+- `metacodes doctor` reports the state root, its source and any resolution
+  error; `--strict` fails on one.
+
+### Changed
+
+- User state lives under a state root instead of a hard-coded
+  `~/.metacodes`: `--state-dir` (first argument to cover subcommands), then
+  `METACODES_HOME`, then the install record beside the executable, then
+  `~/.metacodes`, which development builds and older installs keep. A broken
+  install record or a relative override stops the CLI instead of falling
+  back to another install's state. Project-scoped `<project>/.metacodes/` and
+  `~/.claude/` are unchanged.
+- Embedding API: metacodes-core no longer reads the user's home to find
+  state. `ToolContext`, `agent_loop.Options` and the subagent, job and
+  teammate snapshots carry `state_root`; `WorkspaceConfig.state_root`
+  configures an `AgentSession` (default `<home>/.metacodes`, so AgentCore
+  hosts are unchanged); `KgClient.ResolveOptions.home` is now `state_root`;
+  `auth`, `provider_oauth.Session.initHome`, `config_store.Store.initHome`,
+  `metask_ledger`, `AgentSet.loadFromStandardPathsWithPluginSources`,
+  `skills.runtime.catalog.defaultSources` and `context_caps`
+  (`configureStateRoot`) take the root explicitly.
+- The swarm team-directory removal guard requires a strict
+  `<state_root>/teams/` prefix instead of a `/.metacodes/teams/` substring.
+
 ### Fixed
+
+- The macOS Lean kernels linked Homebrew's `libgmp` and `libuv`, so they ran
+  only where Homebrew had installed them. Both kernel scripts now link the
+  static libraries of the Lean toolchain, and every kernel build ends in
+  `scripts/check_kernel_self_contained.py`, which refuses any dependency
+  outside the OS.
+- The coverage-gap L2 leaked the file-change records `executeOne` returned;
+  it only ran against a real project kernel, which no CI job provided.
 
 - A release PR could fail its own CI. The version state gate recognises the
   release PR by its title and its `release` label, and `ci.yml` took the

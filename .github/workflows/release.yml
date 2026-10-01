@@ -118,6 +118,13 @@ jobs:
         run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist"
+      # What a user does with the archive: scripts/install.sh, then doctor.
+      - name: The archive installs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed" "$RUNNER_TEMP"/dist/metacodes-*.tar.gz
+          "$RUNNER_TEMP/installed/bin/metacodes" doctor --strict
       - name: Archive (AgentCore SDK)
         run: zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
       - name: Archives are reproducible
@@ -192,6 +199,9 @@ jobs:
       - name: Archive (CLI unit)
         shell: cmd
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist"
+      - name: The archive installs
+        shell: cmd
+        run: for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 "%%F" -Prefix "%RUNNER_TEMP%\installed" -NoPath && "%RUNNER_TEMP%\installed\bin\metacodes.exe" doctor --strict
       - name: Archive (AgentCore SDK)
         shell: cmd
         run: zig build agentcore:archive -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -Dagentcore-archive-dir="%RUNNER_TEMP%\dist"
