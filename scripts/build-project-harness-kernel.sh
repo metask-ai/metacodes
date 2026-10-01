@@ -337,10 +337,15 @@ else
   binary_bytes=$(stat -c '%s' "$output")
 fi
 host_arch=$(uname -m)
-# No pipe from lake: on Windows the elan proxy cannot write into an MSYS pipe
-# to another process ("The request is not supported", os error 50), while a
-# command substitution (as the axiom audit uses) works on every host.
-lean_version=$(cd "$lean_dir" && "$lake" env lean --version 2>&1)
+# The label comes from Lake itself ("Lake version … (Lean version 4.14.0)"),
+# the toolchain that just built the kernel.  `lake env lean --version` spawned
+# a `lean` that exits 1 on the Windows runner right after `lake env lean <file>`
+# succeeded there, so no Lean child is started for a label.
+if ! lean_version=$(cd "$lean_dir" && "$lake" --version 2>&1); then
+  echo "build-project-harness-kernel: \`lake --version\` failed:" >&2
+  printf '%s\n' "$lean_version" >&2
+  exit 1
+fi
 lean_version=${lean_version//$'\r'/}
 lean_version=${lean_version//$'\n'/}
 printf '%s\n' \
