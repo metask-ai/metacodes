@@ -53,7 +53,16 @@ Resolution policy (host layer only, `src/util/state_root.zig`, pure
    a relative root being relative to `<prefix>` so the whole install can move;
 4. `$HOME/.metacodes` (development builds; installs predating this design).
 
-A present but invalid `install.json`, or a relative override, stops the CLI.
+A present but invalid `install.json`, or a relative override, stops the CLI
+(`doctor` still runs and reports it). A root that cannot be created (a
+read-only or missing home) only warns: each subsystem degrades as it did
+without `$HOME`. The resolved root carries no trailing separator.
+
+The record names one root for everyone who runs that install. A system-wide
+install (`--prefix /opt/metacodes` by root) therefore needs `--state-dir` (or
+each user's `METACODES_HOME`): its default `<prefix>/state` is created 0700
+for the installing user. A process teammate receives the lead's root as its
+leading `--state-dir`.
 
 Everything that used to live under `~/.metacodes` lives under the root with
 the same relative names (`config.json`, `auth.json`, `oauth/`, `kg/`,

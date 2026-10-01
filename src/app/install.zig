@@ -106,11 +106,43 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
     const cwd = std.Io.Dir.cwd();
     const in_place = samePath(io, source_root, options.prefix);
     if (!in_place) try checkPrefix(arena, io, options.prefix, version, options.force);
+    // Refuse a bad SDK before anything is written.
+    const sdk_manifest: ?SdkManifest = if (options.sdk) |sdk| try readSdkManifest(arena, io, sdk) else null;
+
+    // Everything below names the prefix by its physical path: the installed
+    // executable derives its prefix from its own real path, so `/tmp/x` on
+    // macOS is `/private/tmp/x` to it, and its doctor must report the same root.
+    // An existing prefix may itself be a symlink to a directory, which
+    // createDirPath refuses; open it first (following links).
+    if (cwd.openDir(io, options.prefix, .{})) |opened| {
+        var dir = opened;
+        dir.close(io);
+    } else |err| switch (err) {
+        error.FileNotFound => try cwd.createDirPath(io, options.prefix),
+        else => return err,
+    }
+    const prefix = try realPathAlloc(arena, io, options.prefix);
+
+    // The record first: a copy that fails half way leaves a prefix that the
+    // same version may retry without --force.
+    const recorded_root = options.state_dir orelse "state";
+    const resolved_root = if (options.state_dir) |dir| dir else try std.fs.path.join(arena, &.{ prefix, "state" });
+    try util_fs.mkdirParents(resolved_root);
+    const record = try std.json.Stringify.valueAlloc(arena, .{
+        .schema_version = state_root.manifest_schema,
+        .version = version,
+        .state_root = recorded_root,
+    }, .{ .whitespace = .indent_2 });
+    try cwd.createDirPath(io, try std.fs.path.join(arena, &.{ prefix, "etc", "metacodes" }));
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ prefix, install_manifest_rel }),
+        .data = try std.fmt.allocPrint(arena, "{s}\n", .{record}),
+    });
 
     // The unit's files, each re-hashed where it landed.
     for (manifest.files) |file| {
         try checkRelative(file.path);
-        const destination = try std.fs.path.join(arena, &.{ options.prefix, file.path });
+        const destination = try std.fs.path.join(arena, &.{ prefix, file.path });
         if (!in_place) {
             const source = try std.fs.path.join(arena, &.{ source_root, file.path });
             try cwd.copyFile(source, cwd, destination, io, .{ .make_path = true });
@@ -121,40 +153,24 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
         try cwd.copyFile(
             try std.fs.path.join(arena, &.{ source_root, "manifest.json" }),
             cwd,
-            try std.fs.path.join(arena, &.{ options.prefix, "manifest.json" }),
+            try std.fs.path.join(arena, &.{ prefix, "manifest.json" }),
             io,
             .{},
         );
     }
-    try log.print("installed metacodes {s}: {d} files verified under {s}\n", .{ version, manifest.files.len, options.prefix });
+    try log.print("installed metacodes {s}: {d} files verified under {s}\n", .{ version, manifest.files.len, prefix });
+    try log.print("state root: {s}\n", .{resolved_root});
 
     var outcome: Outcome = .{
         .version = version,
-        .prefix = options.prefix,
-        .executable = try std.fs.path.join(arena, &.{ options.prefix, "bin", if (is_windows) "metacodes.exe" else "metacodes" }),
-        .state_root = undefined,
+        .prefix = prefix,
+        .executable = try std.fs.path.join(arena, &.{ prefix, "bin", if (is_windows) "metacodes.exe" else "metacodes" }),
+        .state_root = resolved_root,
         .files = manifest.files.len,
         .in_place = in_place,
     };
 
-    if (options.sdk) |sdk| outcome.sdk = try installSdk(arena, io, sdk, options.prefix, log);
-
-    // This install's own state, and the record that points the executable at it.
-    const recorded_root = options.state_dir orelse "state";
-    outcome.state_root = if (options.state_dir) |dir| dir else try std.fs.path.join(arena, &.{ options.prefix, "state" });
-    try util_fs.mkdirParents(outcome.state_root);
-    const record = try std.json.Stringify.valueAlloc(arena, .{
-        .schema_version = state_root.manifest_schema,
-        .version = version,
-        .state_root = recorded_root,
-    }, .{ .whitespace = .indent_2 });
-    try cwd.createDirPath(io, try std.fs.path.join(arena, &.{ options.prefix, "etc", "metacodes" }));
-    try cwd.writeFile(io, .{
-        .sub_path = try std.fs.path.join(arena, &.{ options.prefix, install_manifest_rel }),
-        .data = try std.fmt.allocPrint(arena, "{s}\n", .{record}),
-    });
-    try log.print("state root: {s}\n", .{outcome.state_root});
-
+    if (sdk_manifest) |sdk| outcome.sdk = try installSdk(arena, io, options.sdk.?, sdk, prefix, log);
     if (options.link_dir) |dir| outcome.launcher = try writeLauncher(arena, io, dir, options.link_name, outcome.executable, options.force, log);
     if (options.self_check) try selfCheck(arena, outcome, log);
     return outcome;
@@ -192,19 +208,23 @@ fn checkPrefix(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, version
     if (!std.mem.eql(u8, record.version, version) and !force) return error.DifferentVersionInstalled;
 }
 
-fn installSdk(arena: std.mem.Allocator, io: std.Io, bundle: []const u8, prefix: []const u8, log: *std.Io.Writer) ![]const u8 {
-    const cwd = std.Io.Dir.cwd();
-    const bytes = cwd.readFileAlloc(io, try std.fs.path.join(arena, &.{ bundle, "manifest.json" }), arena, .limited(4 << 20)) catch
+fn readSdkManifest(arena: std.mem.Allocator, io: std.Io, bundle: []const u8) !SdkManifest {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ bundle, "manifest.json" }), arena, .limited(4 << 20)) catch
         return error.InvalidSdkBundle;
     const manifest = std.json.parseFromSliceLeaky(SdkManifest, arena, bytes, .{ .ignore_unknown_fields = true }) catch
         return error.InvalidSdkBundle;
     if (!std.mem.eql(u8, manifest.name, sdk_name)) return error.InvalidSdkBundle;
+    for (manifest.files) |file| checkRelative(file.path) catch return error.InvalidSdkBundle;
+    return manifest;
+}
+
+fn installSdk(arena: std.mem.Allocator, io: std.Io, bundle: []const u8, manifest: SdkManifest, prefix: []const u8, log: *std.Io.Writer) ![]const u8 {
+    const cwd = std.Io.Dir.cwd();
     const destination_root = try std.fs.path.join(arena, &.{ prefix, "sdk", "agentcore" });
     // Replace a previous SDK wholesale: a stale header beside a new library is
     // worse than none.
     cwd.deleteTree(io, destination_root) catch {};
     for (manifest.files) |file| {
-        try checkRelative(file.path);
         const destination = try std.fs.path.join(arena, &.{ destination_root, file.path });
         try cwd.copyFile(try std.fs.path.join(arena, &.{ bundle, file.path }), cwd, destination, io, .{ .make_path = true });
         try expectDigest(arena, io, destination, file.sha256);
@@ -227,25 +247,47 @@ fn writeLauncher(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []
     if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\") != null) return error.LinkOccupied;
     const file_name = if (is_windows) try std.fmt.allocPrint(arena, "{s}.cmd", .{name}) else name;
     const path = try std.fs.path.join(arena, &.{ dir, file_name });
-    const body = if (is_windows)
-        try std.fmt.allocPrint(arena, "@\"{s}\" %*\r\n", .{executable})
-    else
-        try std.fmt.allocPrint(arena, "#!/bin/sh\n# metacodes launcher written by `metacodes install`\nexec \"{s}\" \"$@\"\n", .{executable});
+    const body = try launcherBody(arena, executable);
     const cwd = std.Io.Dir.cwd();
-    if (cwd.readFileAlloc(io, path, arena, .limited(64 << 10))) |existing| {
+    const pfs = @import("platform").fs;
+    const path_z = try arena.dupeZ(u8, path);
+    // Never write through a symlink: `~/.local/bin/metacodes -> <a build>` is
+    // common, and following it would overwrite that binary with this script.
+    if (pfs.isSymlink(path_z.ptr)) {
+        if (!force) return error.LinkOccupied;
+        pfs.unlinkPath(path_z.ptr) catch return error.LinkOccupied;
+    } else if (cwd.readFileAlloc(io, path, arena, .limited(64 << 10))) |existing| {
         if (!std.mem.eql(u8, existing, body) and !force) return error.LinkOccupied;
     } else |err| switch (err) {
         error.FileNotFound => {},
+        // Something large sits there (a binary, not a launcher).
+        error.StreamTooLong => if (!force) return error.LinkOccupied,
         else => return err,
     }
     try cwd.createDirPath(io, dir);
     try cwd.writeFile(io, .{ .sub_path = path, .data = body });
-    if (!is_windows) {
-        const path_z = try arena.dupeZ(u8, path);
-        _ = @import("platform").fs.chmod(path_z.ptr, 0o755);
-    }
+    if (!is_windows) _ = pfs.chmod(path_z.ptr, 0o755);
     try log.print("launcher: {s}\n", .{path});
     return path;
+}
+
+/// The launcher script for `executable`, quoted so that no character of the
+/// path is interpreted by the shell (POSIX) or by cmd's `%` expansion.
+fn launcherBody(arena: std.mem.Allocator, executable: []const u8) ![]const u8 {
+    var quoted: std.ArrayList(u8) = .empty;
+    if (is_windows) {
+        for (executable) |c| {
+            if (c == '%') try quoted.append(arena, '%');
+            try quoted.append(arena, c);
+        }
+        return std.fmt.allocPrint(arena, "@\"{s}\" %*\r\n", .{quoted.items});
+    }
+    try quoted.append(arena, '\'');
+    for (executable) |c| {
+        if (c == '\'') try quoted.appendSlice(arena, "'\\''") else try quoted.append(arena, c);
+    }
+    try quoted.append(arena, '\'');
+    return std.fmt.allocPrint(arena, "#!/bin/sh\n# metacodes launcher written by `metacodes install`\nexec {s} \"$@\"\n", .{quoted.items});
 }
 
 /// The installed executable vouches for itself: every runtime asset resolves
@@ -260,12 +302,41 @@ fn selfCheck(arena: std.mem.Allocator, outcome: Outcome, log: *std.Io.Writer) !v
         return error.SelfCheckFailed;
     try log.writeAll(captured.stdout);
     if (captured.exit_code != 0) return error.SelfCheckFailed;
-    const expected = try std.fmt.allocPrint(arena, "state_root {s} source=", .{outcome.state_root});
-    const line = std.mem.indexOf(u8, captured.stdout, expected) orelse return error.SelfCheckFailed;
-    const source = captured.stdout[line + expected.len ..];
+    const reported = parseStateRootLine(captured.stdout) orelse return error.SelfCheckFailed;
+    if (std.mem.eql(u8, reported.source, "install") and std.mem.eql(u8, reported.path, outcome.state_root)) return;
     // Windows always hands the child the caller's environment, so an exported
-    // METACODES_HOME may legitimately win there; POSIX must read the record.
-    if (!is_windows and !std.mem.startsWith(u8, source, "install")) return error.SelfCheckFailed;
+    // METACODES_HOME legitimately wins there; POSIX must read the record.
+    if (is_windows and std.mem.eql(u8, reported.source, "env")) {
+        try log.print("note: METACODES_HOME ({s}) overrides this install's state root while it is set\n", .{reported.path});
+        return;
+    }
+    try log.print("the installed doctor resolved state_root {s} (source={s}), expected {s} from the install record\n", .{ reported.path, reported.source, outcome.state_root });
+    return error.SelfCheckFailed;
+}
+
+const StateRootLine = struct { path: []const u8, source: []const u8 };
+
+/// `state_root <path> source=<source> error=<error>` from `doctor` text output.
+fn parseStateRootLine(text: []const u8) ?StateRootLine {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (!std.mem.startsWith(u8, line, "state_root ")) continue;
+        const rest = line["state_root ".len..];
+        const source_at = std.mem.lastIndexOf(u8, rest, " source=") orelse return null;
+        const after = rest[source_at + " source=".len ..];
+        const source_end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
+        return .{ .path = rest[0..source_at], .source = after[0..source_end] };
+    }
+    return null;
+}
+
+fn realPathAlloc(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+    defer dir.close(io);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try dir.realPath(io, &buffer);
+    return arena.dupe(u8, buffer[0..len]);
 }
 
 fn expectDigest(arena: std.mem.Allocator, io: std.Io, path: []const u8, expected: []const u8) !void {
@@ -490,4 +561,79 @@ test "install places the SDK bundle and a launcher" {
 
     // A bundle of the wrong unit is not an SDK.
     try testing.expectError(error.InvalidSdkBundle, run(arena, testing.io, source, .{ .prefix = prefix, .sdk = source, .self_check = false }, &log.writer));
+}
+
+test "a failed install of a version may be retried without --force; a bad SDK writes nothing" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+    const source = try fixture.unit(arena, "0.3.0", &unit_files);
+    const prefix = try fixture.path(arena, "opt/mc");
+
+    try testing.expectError(error.InvalidSdkBundle, run(arena, testing.io, source, .{ .prefix = prefix, .sdk = try fixture.path(arena, "no-sdk"), .self_check = false }, &log.writer));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, prefix, .{}));
+
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "unit/vendor/tinykg/tinykgd", .data = "damaged" });
+    try testing.expectError(error.DigestMismatch, run(arena, testing.io, source, .{ .prefix = prefix, .self_check = false }, &log.writer));
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "unit/vendor/tinykg/tinykgd", .data = "daemon" });
+    _ = try run(arena, testing.io, source, .{ .prefix = prefix, .self_check = false }, &log.writer);
+}
+
+test "install names the prefix by its physical path" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+    const source = try fixture.unit(arena, "0.3.0", &unit_files);
+    try fixture.tmp.dir.createDirPath(testing.io, "real/opt");
+    try fixture.tmp.dir.symLink(testing.io, "real/opt", "alias", .{ .is_directory = true });
+    const outcome = try run(arena, testing.io, source, .{ .prefix = try fixture.path(arena, "alias"), .self_check = false }, &log.writer);
+    try testing.expectEqualStrings(try fixture.path(arena, "real/opt"), outcome.prefix);
+    try testing.expectEqualStrings(try fixture.path(arena, "real/opt/state"), outcome.state_root);
+    // What the installed executable resolves from its own real path.
+    var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const resolved = try state_root.resolveFrom(.{ .exe_path = outcome.executable }, &resolved_buf);
+    try testing.expectEqualStrings(outcome.state_root, resolved.path);
+}
+
+test "the launcher never writes through a symlink and quotes its path" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+    const source = try fixture.unit(arena, "0.3.0", &unit_files);
+    try fixture.tmp.dir.createDirPath(testing.io, "dev/zig-out/bin");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "dev/zig-out/bin/metacodes", .data = "developer build" });
+    try fixture.tmp.dir.createDirPath(testing.io, "local/bin");
+    const target = try fixture.path(arena, "dev/zig-out/bin/metacodes");
+    try fixture.tmp.dir.symLink(testing.io, target, "local/bin/metacodes", .{});
+    const bin_dir = try fixture.path(arena, "local/bin");
+    const prefix = try fixture.path(arena, "it's $HOME `x`");
+
+    try testing.expectError(error.LinkOccupied, run(arena, testing.io, source, .{ .prefix = prefix, .link_dir = bin_dir, .self_check = false }, &log.writer));
+    const outcome = try run(arena, testing.io, source, .{ .prefix = prefix, .link_dir = bin_dir, .force = true, .self_check = false }, &log.writer);
+    try testing.expectEqualStrings("developer build", try read(arena, target)); // untouched
+    const launcher = try read(arena, outcome.launcher.?);
+    const expected_exec = try std.fmt.allocPrint(arena, "exec '{s}/it'\\''s $HOME `x`/bin/metacodes' \"$@\"\n", .{fixture.root});
+    try testing.expect(std.mem.endsWith(u8, launcher, expected_exec));
+}
+
+test "the doctor state_root line parses paths with spaces" {
+    const line = parseStateRootLine("tinykg x\nstate_root /a b/state source=install error=-\n").?;
+    try testing.expectEqualStrings("/a b/state", line.path);
+    try testing.expectEqualStrings("install", line.source);
+    try testing.expect(parseStateRootLine("ripgrep /x\n") == null);
 }

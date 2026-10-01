@@ -544,6 +544,7 @@ const InteractiveRun = struct {
 
     fn run(self: *InteractiveRun) void {
         self.result = provider_login.loginInteractive(self.allocator, self.io, self.host, "relay", .{
+            .state_root = "",
             .method = .loopback,
             .open_browser = false,
             .port = 0,
@@ -651,11 +652,11 @@ test "loginInteractive fails closed with typed errors and persists nothing" {
     var io_runtime = std.Io.Threaded.init(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
-    const no_browser: provider_login.Options = .{ .open_browser = false, .port = 0 };
+    const no_browser: provider_login.Options = .{ .open_browser = false, .port = 0, .state_root = "" };
 
     try std.testing.expectError(error.UnknownProvider, provider_login.loginInteractive(a, io, host, "nope", no_browser, quiet.notify()));
     try std.testing.expectError(error.ProviderHasNoTokenEndpoint, provider_login.loginInteractive(a, io, host, "keyonly", no_browser, quiet.notify()));
-    try std.testing.expectError(error.FlowUnavailable, provider_login.loginInteractive(a, io, host, "relay", .{ .method = .device_code, .open_browser = false, .port = 0 }, quiet.notify()));
+    try std.testing.expectError(error.FlowUnavailable, provider_login.loginInteractive(a, io, host, "relay", .{ .method = .device_code, .open_browser = false, .port = 0, .state_root = "" }, quiet.notify()));
     // The built-in openai profile declares no client id (an owner decision):
     // without --client-id the flow must not even start.
     try std.testing.expectError(error.ClientIdMissing, provider_login.loginInteractive(a, io, host, "openai", no_browser, quiet.notify()));
@@ -734,7 +735,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
 
     // What picker_host does on MissingCredentials: prepare (typed refusals
     // happen here), then run on the worker. No browser; kernel-chosen port.
-    const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client" });
+    const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client", .state_root = "" });
     var worker = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), prepared);
     try worker.start();
     defer worker.join();
@@ -772,7 +773,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
         .oauth_token_url = token_url,
         .oauth_authorize_url = "http://127.0.0.1:1/authorize",
     };
-    const cancelled_prepared = try provider_login.prepareProfile(&cancelled_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client" });
+    const cancelled_prepared = try provider_login.prepareProfile(&cancelled_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client", .state_root = "" });
     var cancelled = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), cancelled_prepared);
     try cancelled.start();
     defer cancelled.join();
@@ -801,7 +802,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
         .oauth_token_url = garbage_url,
         .oauth_authorize_url = "http://127.0.0.1:1/authorize",
     };
-    const failing_prepared = try provider_login.prepareProfile(&failing_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client" });
+    const failing_prepared = try provider_login.prepareProfile(&failing_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client", .state_root = "" });
     var failing = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), failing_prepared);
     try failing.start();
     defer failing.join();

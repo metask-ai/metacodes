@@ -307,6 +307,7 @@ test "L2: buildTeammateArgv 写出的 argv,teammate 自己的解析器真的认 
         .name = "bob",
         .team = "proj",
         .cwd = "/tmp/wt",
+        .state_root = "/srv/lead-state",
         .extra_flags = &.{"--no-lsp"},
     });
     defer tp.freeArgv(a, argv);
@@ -329,4 +330,6 @@ test "L2: buildTeammateArgv 写出的 argv,teammate 自己的解析器真的认 
     try std.testing.expect(config.parse_error == null); // 整条命令行合法
     try std.testing.expect(!config.lsp_enabled); // 且真的关掉了
     try std.testing.expectEqualStrings("bob", config.teammate_name); // 身份没被挤掉
+    // The child resolves the lead's state root, not its own default.
+    try std.testing.expectEqualStrings("/srv/lead-state", config.state_dir.?);
 }

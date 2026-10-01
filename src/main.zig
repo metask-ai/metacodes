@@ -519,16 +519,6 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
     if (leading_state_dir.value == null) if (config.state_dir) |dir| applyStateDir(dir);
-    config.state_root = hostStateRoot() catch std.process.exit(2);
-    if (config.state_root.len > 0) {
-        // Every subsystem writes beneath the root; create it (and an install's
-        // `<prefix>/state` parent chain) once, owner-only, before any of them run.
-        @import("util/fs.zig").mkdirParents(config.state_root) catch |err| {
-            std.debug.print("error: cannot create the state root {s} ({s})\n", .{ config.state_root, @errorName(err) });
-            std.process.exit(2);
-        };
-        @import("core/context_caps.zig").configureStateRoot(config.state_root);
-    }
 
     // Process-mode teammates must bind the complete App initialization to
     // their parent's session. Adopting only after App.init would seed KG,
@@ -574,6 +564,20 @@ pub fn main(init: std.process.Init) !void {
         };
         dumpWrite(out.written());
         return;
+    }
+
+    // The state root, after `--version` (which needs no state) and before
+    // anything that reads or writes some.
+    config.state_root = hostStateRoot() catch std.process.exit(2);
+    if (config.state_root.len > 0) {
+        // Every subsystem writes beneath the root; create it (and an install's
+        // `<prefix>/state` parent chain) once, owner-only, before any of them
+        // run. A root that cannot be created (read-only or missing home) is
+        // what a missing $HOME always was: each subsystem degrades on its own.
+        @import("util/fs.zig").mkdirParents(config.state_root) catch |err| {
+            std.debug.print("warning: cannot create the state root {s} ({s}); sessions, credentials and memory will not persist\n", .{ config.state_root, @errorName(err) });
+        };
+        @import("core/context_caps.zig").configureStateRoot(config.state_root);
     }
 
     // 初始化日志：读 METACODES_LOG / METACODES_LOG_FILE 环境变量
@@ -1352,7 +1356,6 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (std.mem.eql(u8, cmd, "install")) return runInstall(&args, allocator, init.io);
     const state_dir = hostStateRoot() catch return 2;
     if (state_dir.len > 0) @import("core/context_caps.zig").configureStateRoot(state_dir);
-    if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator, init.io);
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "ledger")) {

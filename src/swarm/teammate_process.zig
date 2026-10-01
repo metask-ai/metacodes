@@ -458,6 +458,10 @@ pub const SpawnProcessParams = struct {
     lease_id: []const u8 = "",
     /// worktree/cwd 目录(非空 → teammate 进程 chdir 进去;lead 应已 git worktree add)。
     cwd: []const u8 = "",
+    /// The lead's state root, passed as the child's leading `--state-dir`: a
+    /// lead started with `--state-dir` must not have its teammate resolve
+    /// another root (team config, transcripts, KG). No default on purpose.
+    state_root: []const u8,
     /// 额外 CLI flag 透传(如 --agent-teams --model X);借用。
     extra_flags: []const []const u8 = &.{},
 };
@@ -468,6 +472,10 @@ pub fn buildTeammateArgv(a: std.mem.Allocator, exe: []const u8, p: SpawnProcessP
     var list: std.ArrayList(?[*:0]const u8) = .empty;
     errdefer freeArgv(a, list.items);
     try list.append(a, (try a.dupeZ(u8, exe)).ptr);
+    if (p.state_root.len > 0) {
+        try list.append(a, (try a.dupeZ(u8, "--state-dir")).ptr);
+        try list.append(a, (try a.dupeZ(u8, p.state_root)).ptr);
+    }
     try list.append(a, (try a.dupeZ(u8, "--teammate")).ptr);
     try list.append(a, (try a.dupeZ(u8, "--agent-name")).ptr);
     try list.append(a, (try a.dupeZ(u8, p.name)).ptr);
@@ -657,6 +665,7 @@ pub fn spawnTeammateProcess(
         .parent_session = parent_session,
         .lease_id = lease_id.asSlice(),
         .cwd = effective_wt,
+        .state_root = sw.state_root,
         .extra_flags = if (lsp_enabled) &.{} else &lsp_off,
     });
     // The child is live but not yet owned by process_teammates. Any
@@ -750,8 +759,12 @@ test "buildTeammateArgv: 身份 + cwd + 透传 flag 全在 argv" {
         .parent_session = "sess1",
         .lease_id = "lease1",
         .cwd = "/tmp/wt",
+        .state_root = "/srv/state",
         .extra_flags = &.{ "--agent-teams", "--model", "x" },
     });
+    // The lead's state root is the child's leading global option.
+    try testing.expectEqualStrings("--state-dir", std.mem.span(argv[1].?));
+    try testing.expectEqualStrings("/srv/state", std.mem.span(argv[2].?));
     defer freeArgv(a, argv);
     // 收集成字符串集合断言。
     var joined: std.ArrayList(u8) = .empty;
@@ -777,18 +790,20 @@ test "buildTeammateArgv: 身份 + cwd + 透传 flag 全在 argv" {
 
 test "buildTeammateArgv: 无 parent/cwd 时省略对应 flag" {
     const a = testing.allocator;
-    const argv = try buildTeammateArgv(a, "metacodes", .{ .name = "x", .team = "t" });
+    const argv = try buildTeammateArgv(a, "metacodes", .{ .name = "x", .team = "t", .state_root = "" });
     defer freeArgv(a, argv);
     var found_parent = false;
     var found_cwd = false;
+    var found_state = false;
     for (argv) |item| {
         if (item) |s| {
             const sp = std.mem.span(s);
             if (std.mem.eql(u8, sp, "--parent-session-id")) found_parent = true;
             if (std.mem.eql(u8, sp, "--teammate-cwd")) found_cwd = true;
+            if (std.mem.eql(u8, sp, "--state-dir")) found_state = true;
         }
     }
-    try testing.expect(!found_parent and !found_cwd);
+    try testing.expect(!found_parent and !found_cwd and !found_state);
 }
 
 test "process ownership requires lead session and per-spawn lease" {

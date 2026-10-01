@@ -83,7 +83,14 @@ pub const Inputs = struct {
 
 /// Pure resolution over explicit inputs (the filesystem is consulted only for
 /// install.json). The result's `path` lives in `buf`.
+/// Trailing separators are dropped (`/x/` is `/x`), so every path built from
+/// the root, and every prefix check against it, sees one spelling.
 pub fn resolveFrom(inputs: Inputs, buf: []u8) Error!Resolved {
+    const resolved = try resolveRaw(inputs, buf);
+    return .{ .path = trimTrailingSeparators(resolved.path), .source = resolved.source };
+}
+
+fn resolveRaw(inputs: Inputs, buf: []u8) Error!Resolved {
     if (nonEmpty(inputs.flag)) |dir| return .{ .path = try absoluteInto(dir, buf), .source = .flag };
     if (nonEmpty(inputs.env)) |dir| return .{ .path = try absoluteInto(dir, buf), .source = .env };
     if (inputs.exe_path) |exe| if (prefixOf(exe)) |prefix| {
@@ -91,6 +98,15 @@ pub fn resolveFrom(inputs: Inputs, buf: []u8) Error!Resolved {
     };
     const home = nonEmpty(inputs.home) orelse return error.NoStateRoot;
     return .{ .path = try joinInto(buf, &.{ home, default_dir_name }), .source = .home };
+}
+
+/// `/x//` → `/x`; a filesystem root (`/`, `C:\`) is kept as is.
+fn trimTrailingSeparators(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and (path[end - 1] == '/' or path[end - 1] == '\\')) : (end -= 1) {
+        if (end == 3 and path[1] == ':') break; // `C:\`
+    }
+    return path[0..end];
 }
 
 /// `<prefix>` of an executable installed at `<prefix>/bin/<exe>`.
@@ -294,6 +310,14 @@ test "flag beats env beats install manifest; both must be absolute" {
 
     try std.testing.expectError(error.StateRootNotAbsolute, resolveFrom(.{ .env = "rel/root" }, &buf));
     try std.testing.expectError(error.StateRootNotAbsolute, resolveFrom(.{ .flag = "rel/root" }, &buf));
+}
+
+test "the resolved root has one spelling: no trailing separator" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("/x", (try resolveFrom(.{ .flag = "/x/" }, &buf)).path);
+    try std.testing.expectEqualStrings("/x", (try resolveFrom(.{ .env = "/x//" }, &buf)).path);
+    try std.testing.expectEqualStrings("/", (try resolveFrom(.{ .env = "/" }, &buf)).path);
+    try std.testing.expectEqualStrings("/home/u/.metacodes", (try resolveFrom(.{ .home = "/home/u/" }, &buf)).path);
 }
 
 test "prefixOf is the executable's grandparent" {

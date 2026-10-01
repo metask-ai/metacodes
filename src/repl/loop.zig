@@ -2371,9 +2371,9 @@ const LoginParse = union(enum) { usage, unknown: []const u8, ok: LoginArgs };
 /// `/login` takes the CLI's flags with the CLI's rule: an argument it does not
 /// know refuses the whole command rather than starting a flow the user did not
 /// ask for.
-fn parseLoginArgs(rest: []const u8) LoginParse {
+fn parseLoginArgs(rest: []const u8, state_root: []const u8) LoginParse {
     var provider_name: ?[]const u8 = null;
-    var options: provider_login.Options = .{};
+    var options: provider_login.Options = .{ .state_root = state_root };
     var parts = std.mem.tokenizeAny(u8, rest, " \t");
     while (parts.next()) |arg| {
         if (std.mem.eql(u8, arg, "--device-code")) {
@@ -2393,7 +2393,7 @@ fn parseLoginArgs(rest: []const u8) LoginParse {
 }
 
 fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
-    const args = switch (parseLoginArgs(rest)) {
+    const args = switch (parseLoginArgs(rest, app.stateRoot())) {
         .usage => return printLoginUsage(),
         .unknown => |arg| {
             std.debug.print("\x1b[31munknown /login argument '{s}'\x1b[0m\n", .{arg});
@@ -4285,18 +4285,20 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
 }
 
 test "/login parses the CLI's flags and fails closed on an argument it does not know" {
-    const parsed = parseLoginArgs("relay --device-code --no-browser --client-id abc");
+    const parsed = parseLoginArgs("relay --device-code --no-browser --client-id abc", "/state");
     try std.testing.expect(parsed == .ok);
     try std.testing.expectEqualStrings("relay", parsed.ok.provider);
     try std.testing.expect(parsed.ok.options.method == .device_code);
     try std.testing.expect(!parsed.ok.options.open_browser);
     try std.testing.expectEqualStrings("abc", parsed.ok.options.client_id.?);
+    // The login is stored under the session's state root.
+    try std.testing.expectEqualStrings("/state", parsed.ok.options.state_root);
     // Flags may precede the name; a second bare word is refused, as is a typo.
-    try std.testing.expect(parseLoginArgs("--no-browser relay") == .ok);
-    try std.testing.expect(parseLoginArgs("relay extra") == .unknown);
-    try std.testing.expect(parseLoginArgs("") == .usage);
-    try std.testing.expect(parseLoginArgs("relay --client-id") == .usage);
-    const typo = parseLoginArgs("relay --device-cod");
+    try std.testing.expect(parseLoginArgs("--no-browser relay", "/state") == .ok);
+    try std.testing.expect(parseLoginArgs("relay extra", "/state") == .unknown);
+    try std.testing.expect(parseLoginArgs("", "/state") == .usage);
+    try std.testing.expect(parseLoginArgs("relay --client-id", "/state") == .usage);
+    const typo = parseLoginArgs("relay --device-cod", "/state");
     try std.testing.expect(typo == .unknown);
     try std.testing.expectEqualStrings("--device-cod", typo.unknown);
 }

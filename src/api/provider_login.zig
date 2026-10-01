@@ -38,8 +38,10 @@ pub const Options = struct {
     /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
     abort_signal: ?*const AbortSignal = null,
     /// The host's state root: the login is stored under `<state_root>/oauth`
-    /// (unless METACODES_OAUTH_DIR overrides it).
-    state_root: []const u8 = "",
+    /// (unless METACODES_OAUTH_DIR overrides it). No default: a caller that
+    /// forgot it would finish the browser flow and then fail to store the
+    /// login (the REPL `/login` did, before this field became required).
+    state_root: []const u8,
 };
 
 /// A stored login for this profile would never be consulted.
@@ -266,21 +268,21 @@ test "the client id precedence is explicit, then configured, then declared" {
         .oauth_authorize_url = "https://auth.example.com/authorize",
     };
     // No declaration, nothing configured, nothing explicit: refused.
-    try std.testing.expectError(error.ClientIdMissing, prepareProfileWith(&undeclared, .{}, null));
+    try std.testing.expectError(error.ClientIdMissing, prepareProfileWith(&undeclared, .{ .state_root = "" }, null));
     // The installation's client stands in for the missing declaration.
-    const configured = try prepareProfileWith(&undeclared, .{}, "app_installation");
+    const configured = try prepareProfileWith(&undeclared, .{ .state_root = "" }, "app_installation");
     try std.testing.expectEqual(ClientIdSource.configured, configured.client_id_source);
     try std.testing.expectEqualStrings("app_installation", configured.client_id);
     // An explicit client wins over the configured one.
-    const explicit = try prepareProfileWith(&undeclared, .{ .client_id = "cli-client" }, "app_installation");
+    const explicit = try prepareProfileWith(&undeclared, .{ .client_id = "cli-client", .state_root = "" }, "app_installation");
     try std.testing.expectEqual(ClientIdSource.explicit, explicit.client_id_source);
     try std.testing.expectEqualStrings("cli-client", explicit.client_id);
     // The configured client overrides a declaration, like --client-id does.
     undeclared.oauth_client_id = "declared-client";
-    const overridden = try prepareProfileWith(&undeclared, .{}, "app_installation");
+    const overridden = try prepareProfileWith(&undeclared, .{ .state_root = "" }, "app_installation");
     try std.testing.expectEqual(ClientIdSource.configured, overridden.client_id_source);
     try std.testing.expectEqualStrings("app_installation", overridden.client_id);
-    const declared = try prepareProfileWith(&undeclared, .{}, null);
+    const declared = try prepareProfileWith(&undeclared, .{ .state_root = "" }, null);
     try std.testing.expectEqual(ClientIdSource.declared, declared.client_id_source);
     try std.testing.expectEqualStrings("declared-client", declared.client_id);
 }

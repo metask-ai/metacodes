@@ -14,5 +14,8 @@
 *.zlib -text
 vendor/tinykg/bin/* -text -diff
 vendor/ripgrep/bin/* -text -diff
+# Upstream licence texts kept byte for byte (vendor/lean-runtime/manifest.json
+# pins their SHA-256), trailing blank lines included.
+vendor/lean-runtime/* -whitespace
 
 sdk/rust/src/raw.rs text eol=lf

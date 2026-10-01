@@ -56,6 +56,16 @@ status, compatibility boundaries, and entry points are defined by
   (`configureStateRoot`) take the root explicitly.
 - The swarm team-directory removal guard requires a strict
   `<state_root>/teams/` prefix instead of a `/.metacodes/teams/` substring.
+- A relative `METACODES_KG_STORE` or config `kg_store` is completed against
+  the state root, no longer against `$HOME`: with the default root,
+  `kg/my.kg` that meant `~/kg/my.kg` now means `~/.metacodes/kg/my.kg`. Use
+  an absolute path to keep a store outside the root.
+- Learned context caps (`context_caps.json`) persist only where the host
+  configures a state root; the CLI does, embedding hosts now keep them in
+  memory unless they call `context_caps.configureStateRoot`.
+- An install record wins over `$HOME`: a harness that isolates a run by
+  setting `HOME` must also set `METACODES_HOME` (or use a development build)
+  when it points at an installed executable.
 
 ### Fixed
 

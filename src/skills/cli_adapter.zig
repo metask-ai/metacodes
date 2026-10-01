@@ -831,6 +831,7 @@ fn executeFork(
         .{
             .system_prompt = system_prompt,
             .agent_depth = ctx.agent_depth + 1,
+            .state_root = ctx.state_root,
             .dyn_registry = ctx.dyn_registry,
             .model_override = model_override,
             .host_services = null,

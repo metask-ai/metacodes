@@ -174,7 +174,10 @@ pub const Report = struct {
     pub fn healthy(self: *const Report) bool {
         // A configured root that does not resolve (broken install.json,
         // relative METACODES_HOME) is a broken install, not a degraded one.
-        if (self.state_root) |root| if (root.err != null) return false;
+        // No root at all (no $HOME, nothing configured) degrades as before.
+        if (self.state_root) |root| if (root.err) |name| {
+            if (!std.mem.eql(u8, name, "NoStateRoot")) return false;
+        };
         for (&self.checks) |*check| {
             if (check.resolved_path == null) {
                 // An override that resolved nothing is a configuration the
@@ -556,6 +559,21 @@ test "doctor health: an override that resolved nothing is never healthy" {
     // Unpinned and absent the project kernel is optional; an environment pair
     // that the runtime rejected is a configuration, and it resolved nothing.
     report.checks[3].source = .env;
+    try std.testing.expect(!report.healthy());
+}
+
+test "doctor health: a configured state root that does not resolve is unhealthy, no root is not" {
+    const a = std.testing.allocator;
+    var report = try testReport(a);
+    defer report.deinit(a);
+    report.checks[1].resolved_path = try a.dupe(u8, "/opt/tools/tinykg");
+    report.state_root = .{ .path = "/opt/mc/state", .source = "install", .err = null };
+    try std.testing.expect(report.healthy());
+    // No $HOME and nothing configured: the subsystems degrade, as they always did.
+    report.state_root = .{ .path = null, .source = null, .err = "NoStateRoot" };
+    try std.testing.expect(report.healthy());
+    // A broken install record is a broken install.
+    report.state_root = .{ .path = null, .source = null, .err = "InstallManifestInvalid" };
     try std.testing.expect(!report.healthy());
 }
 

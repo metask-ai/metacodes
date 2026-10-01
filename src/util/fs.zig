@@ -147,7 +147,8 @@ fn isSymlink(path_z: [*:0]const u8) bool {
 /// 前缀生效)→ orphan cleanup/TeamDelete 在生产是静默 no-op(teams 僵尸目录堆积)。
 pub fn removeTeamDirTree(state_root: []const u8, path: []const u8) void {
     if (state_root.len == 0 or path.len == 0) return;
-    if (std.mem.indexOf(u8, path, "..") != null) return; // 护栏①:拒穿越
+    var components = std.mem.tokenizeAny(u8, path, "/\\");
+    while (components.next()) |component| if (std.mem.eql(u8, component, "..")) return; // 护栏①:拒穿越
     var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
     const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/teams/", .{std.mem.trimEnd(u8, state_root, "/")}) catch return;
     if (!std.mem.startsWith(u8, path, prefix) or path.len == prefix.len) return; // 护栏①:必须在 teams 下
@@ -465,6 +466,20 @@ test "removeTeamDirTree: `..` 穿越被拒" {
     // 不崩即通过(无副作用);拿各平台必存在的目录做"世界还在"锚点(Windows 无 /etc)。
     const anchor = if (@import("builtin").os.tag == .windows) "C:\\Windows" else "/etc";
     try std.testing.expect(pfs.exists(anchor));
+}
+
+test "removeTeamDirTree: a `..` inside a name is not traversal" {
+    var hb: [256]u8 = undefined;
+    const base = testing.uniqueDir(&hb, "cc-zig-rmteam-dots");
+    defer testing.rmrfBestEffort(base);
+    var rb: [400]u8 = undefined;
+    const root = std.fmt.bufPrint(&rb, "{s}/a..b", .{base}) catch unreachable;
+    var tb: [512:0]u8 = undefined;
+    const teamdir = std.fmt.bufPrintZ(&tb, "{s}/teams/proj", .{root}) catch unreachable;
+    mkdirParents(teamdir) catch unreachable;
+    try std.testing.expect(pfs.exists(teamdir.ptr));
+    removeTeamDirTree(root, teamdir);
+    try std.testing.expect(!pfs.exists(teamdir.ptr));
 }
 
 test "mkdirParents creates nested dirs" {

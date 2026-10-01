@@ -85,14 +85,18 @@ unpack() { # <archive-or-dir> <scratch-subdir>
   unit_root "$work/$2"
 }
 
+# Plain assignments: `set -e` stops on a failed command substitution only
+# there, not inside the arguments of another command.
 root=$(unpack "$unit" cli)
 [ -x "$root/bin/metacodes" ] || die "$root/bin/metacodes is missing; is this a metacodes release unit?"
+sdk_root=""
+if [ -n "$sdk" ]; then
+  sdk_root=$(unpack "$sdk" sdk)
+fi
 
 set -- install --prefix "$prefix"
 [ -n "$state_dir" ] && set -- "$@" --state-dir "$state_dir"
-if [ -n "$sdk" ]; then
-  set -- "$@" --sdk "$(unpack "$sdk" sdk)"
-fi
+[ -n "$sdk_root" ] && set -- "$@" --sdk "$sdk_root"
 if [ -n "$link" ]; then
   set -- "$@" --link "$link" --link-name "$link_name"
 fi
