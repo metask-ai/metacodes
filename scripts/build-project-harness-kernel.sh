@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+# A step that fails inside `$(...)` would otherwise end the script with its
+# output still captured: name the line and the command on the way out.
+trap 'status=$?; echo "build-project-harness-kernel: failed (exit $status) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 lean_dir="$repo_dir/control-plane/lean"
@@ -53,7 +56,12 @@ mkdir -p "$(dirname "$output")" "$(dirname "$manifest")"
   fi
 ) >&2 # Lake reports compile errors on stdout; the build graph shows only stderr
 
-axiom_audit=$(cd "$lean_dir" && "$lake" env lean ProjectHarnessAxiomAudit.lean 2>&1)
+if ! axiom_audit=$(cd "$lean_dir" && "$lake" env lean ProjectHarnessAxiomAudit.lean 2>&1); then
+  echo "build-project-harness-kernel: the axiom audit (ProjectHarnessAxiomAudit.lean) did not run" >&2
+  printf '%s\n' "$axiom_audit" >&2
+  exit 1
+fi
+axiom_audit=${axiom_audit//$'\r'/} # Windows: Lean writes CRLF
 expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.correction_promotion_requires_receipt' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.rule_author_promotion_requires_receipt' depends on axioms: [propext]

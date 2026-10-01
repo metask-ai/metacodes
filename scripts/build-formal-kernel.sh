@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+# A step that fails inside `$(...)` would otherwise end the script with its
+# output still captured: name the line and the command on the way out.
+trap 'status=$?; echo "build-formal-kernel: failed (exit $status) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 # Build the independently shipped Lean governance kernel and prove that the
 # artifact actually starts on the host.  A successful `lake build` is not a
@@ -91,7 +94,12 @@ mkdir -p "$(dirname "$output")" "$(dirname "$manifest")" "$(dirname "$receipt")"
 # audit, not merely a green `lake build`.  The current proof uses only Lean's
 # expected quotient/propositional extensionality axioms; any expansion of this
 # exact trust set is a release-blocking review event.
-axiom_audit=$(cd "$lean_dir" && "$lake" env lean FormalAxiomAudit.lean 2>&1)
+if ! axiom_audit=$(cd "$lean_dir" && "$lake" env lean FormalAxiomAudit.lean 2>&1); then
+  echo "build-formal-kernel: the axiom audit (FormalAxiomAudit.lean) did not run" >&2
+  printf '%s\n' "$axiom_audit" >&2
+  exit 1
+fi
+axiom_audit=${axiom_audit//$'\r'/} # Windows: Lean writes CRLF
 expected_axioms="'MetaCodesControl.FormalKernel.safeMigration_sound' depends on axioms: [propext, Quot.sound]"
 expected_axioms="$expected_axioms
 'MetaCodesControl.FormalKernel.taskAudit_verified_iff_safe' depends on axioms: [propext]
@@ -225,10 +233,10 @@ if [[ "$artifact_phase_block_verdict" != *'"decision":"block"'* || "$artifact_ph
   echo "build-formal-kernel: native artifact next-phase binding smoke failed" >&2
   exit 1
 fi
-set +e
-printf '%s\n' "$admit_request" | "$output" >/dev/null 2>&1
-trailing_status=$?
-set -e
+# The kernel must refuse a trailing newline (exit 64); `||` keeps that
+# expected failure out of errexit and the ERR trap.
+trailing_status=0
+printf '%s\n' "$admit_request" | "$output" >/dev/null 2>&1 || trailing_status=$?
 if [[ "$trailing_status" -ne 64 ]]; then
   echo "build-formal-kernel: canonical protocol accepted trailing newline" >&2
   exit 1
