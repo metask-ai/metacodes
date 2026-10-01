@@ -139,6 +139,7 @@ pub const doctor = @import("app/doctor.zig");
 pub const tools = @import("tools.zig"); // registry + dispatch
 pub const tool_read = @import("tools/read.zig"); // 图像上限/MIME 判定(多模态输入共用)
 pub const tool_context = @import("tools/context.zig"); // ToolContext
+pub const tool_file_target = @import("tools/file_target.zig"); // Write/Edit 目标文件(AgentCore 按文件授权共用)
 pub const read_artifact = @import("tools/read_artifact.zig");
 pub const tools_bash_output = @import("tools/bash_output.zig"); // 预算常量供 schema 防分叉守卫绑定
 pub const tools_dynamic = @import("tools/dynamic.zig"); // Skill/MCP DynRegistry

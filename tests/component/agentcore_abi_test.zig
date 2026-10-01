@@ -3956,7 +3956,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 15), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 17), wire.ABI_REVISION);
     try std.testing.expectEqual(
         @as(u32, 8),
         std.mem.readInt(u32, &abi_revision_bytes, .little),

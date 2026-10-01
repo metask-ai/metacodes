@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 15:
+C ABI v1 revision 17:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -10,7 +10,7 @@ C ABI v1 revision 15:
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 64-byte root, all
-five mandatory typed tables, function slots, and reserved fields. Revision 15 is
+five mandatory typed tables, function slots, and reserved fields. Revision 17 is
 the Agent Runtime surface; it does not expose an independent Completion client.
 `session_run_input` accepts text, typed Skill, and multimodal inputs; a
 `RUN_INPUT_MULTIMODAL` Run submits an ordered `RunInputPartV1` array of text and

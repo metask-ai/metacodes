@@ -1,6 +1,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
+const file_target = @import("file_target.zig");
 const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
 const read_state = @import("../core/read_state.zig");
@@ -9,7 +10,9 @@ const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
-    const file_path_raw = common.extractJsonArg(args, "file_path") orelse return error.MissingFilePath;
+    // Read through file_target: AgentCore's per-file Session grant derives its
+    // target the same way, so a grant names exactly the file edited here.
+    const file_path_raw = file_target.rawPath(.edit, args) orelse return error.MissingFilePath;
     const old_raw = common.extractJsonArg(args, "old_string") orelse return error.MissingOldString;
     const new_raw = common.extractJsonArg(args, "new_string") orelse return error.MissingNewString;
 

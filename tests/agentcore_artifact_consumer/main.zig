@@ -4,7 +4,7 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 15 or
+    if (wire.ABI_REVISION != 17 or
         @intFromEnum(wire.Status.skill_catalog_incomplete) != 27 or
         @intFromEnum(wire.Status.image_input_unsupported) != 28 or
         wire.RUN_INPUT_MULTIMODAL != 3 or
@@ -24,10 +24,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 15 codes must match the public contract");
+        @compileError("source-free Revision 17 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 15 must not expose the removed catalog refresh entry");
+        @compileError("revision 17 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -854,7 +854,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 15 Agent Runtime, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 17 Agent Runtime, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

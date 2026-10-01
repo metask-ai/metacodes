@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
+const file_target = @import("file_target.zig");
 const path_mod = @import("../util/path.zig");
 const util_fs = @import("../util/fs.zig");
 const util_json = @import("../util/json.zig");
@@ -13,9 +14,9 @@ const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     // 接受 `file_path`(Claude Code / 真 API 标准字段,也是本项目 descriptions.zig 宣称的)
-    // 与历史 `path` 两种字段名(向后兼容)。
-    const path_escaped = common.extractJsonArg(args, "file_path") orelse
-        common.extractJsonArg(args, "path") orelse return error.MissingPath;
+    // 与历史 `path` 两种字段名(向后兼容)。经 file_target 读取:AgentCore 的按文件
+    // Session 授权用同一读法派生目标,授权名下的文件就是这里写的文件。
+    const path_escaped = file_target.rawPath(.write, args) orelse return error.MissingPath;
     const content_escaped = common.extractJsonArg(args, "content") orelse return error.MissingContent;
     // unescape:content 里的 `\n`/`\t`/`\"`/`\uXXXX` 要还原成真实字节再落盘
     // (否则模型写的多行文件会变成一行字面 `\n`)。path 一般无转义但 unescape 也安全。

@@ -434,7 +434,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 15 SDK rejects Revision 13, Revision 14, and stale reference roots" {
+test "Revision 17 SDK rejects Revision 13 through 16 and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -450,14 +450,16 @@ test "Revision 15 SDK rejects Revision 13, Revision 14, and stale reference root
     try std.testing.expectEqual(@as(usize, 280), @sizeOf(Revision13Api));
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision13));
 
-    // A Revision 14 root shares the 64-byte shape; only the revision check
-    // rejects it, so it must fail exactly there.
-    var revision14: types.ApiV1 align(@alignOf(types.ApiV1)) =
-        std.mem.zeroes(types.ApiV1);
-    revision14.struct_size = @sizeOf(types.ApiV1);
-    revision14.abi_version = types.ABI_VERSION_V1;
-    revision14.abi_revision = 14;
-    try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision14));
+    // Revisions 14, 15 and the withdrawn 16 share the 64-byte shape; only the
+    // revision check rejects them, so each must fail exactly there.
+    for ([_]u32{ 14, 15, 16 }) |older| {
+        var root: types.ApiV1 align(@alignOf(types.ApiV1)) =
+            std.mem.zeroes(types.ApiV1);
+        root.struct_size = @sizeOf(types.ApiV1);
+        root.abi_version = types.ABI_VERSION_V1;
+        root.abi_revision = older;
+        try std.testing.expectError(error.UnsupportedAbi, Api.validate(&root));
+    }
 
     const StaleReferenceApi = extern struct {
         struct_size: u32,
@@ -470,7 +472,7 @@ test "Revision 15 SDK rejects Revision 13, Revision 14, and stale reference root
         std.mem.zeroes(StaleReferenceApi);
     stale_reference.struct_size = @sizeOf(StaleReferenceApi);
     stale_reference.abi_version = types.ABI_VERSION_V1;
-    stale_reference.abi_revision = 15;
+    stale_reference.abi_revision = types.ABI_REVISION;
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(StaleReferenceApi));
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&stale_reference));
 }
