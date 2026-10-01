@@ -7,18 +7,31 @@ manifest (#47 §5.2, stage 5 / #80). `zig build release:stage -Drelease-layout=t
 also runs the executables. Nothing outside this tree is part of the unit, and a
 file inside it that the manifest does not name fails `release:check`.
 
+The unit is complete on every release target (manifest `schema_version` 2,
+doc/INSTALL_DESIGN.md): the TUI, the full TinyKG (CLI and daemon) and both Lean
+governance kernels, with nothing to install beside it.
+
 ```
 metacodes-<version>-<target-id>/
 ├── bin/
 │   ├── metacodes[.exe]                 role=primary_executable
 │   └── rg[.exe]                        role=runtime_asset (ripgrep, Glob/Grep)
+├── libexec/metacodes/
+│   ├── metacodes-formal-kernel[.exe]   role=runtime_asset (formal_kernel)
+│   │   + .provenance.json, .build-receipt.json
+│   └── metacodes-project-kernel[.exe]  role=runtime_asset (project_kernel)
+│       + .provenance.json
 ├── vendor/tinykg/
 │   ├── tinykg[.exe]                    role=runtime_asset (memory / task control plane)
-│   └── tinykg.provenance.json          staging receipt (scripts/stage_tinykg_binary.py)
+│   ├── tinykg.provenance.json          staging receipt (scripts/stage_tinykg_binary.py)
+│   ├── tinykgd[.exe]                   role=runtime_asset (shared TinyKG store service)
+│   └── tinykgd.provenance.json         staging receipt
 ├── share/licenses/
 │   ├── metacodes-LICENSE               the repository LICENSE (MIT)
 │   ├── ripgrep-LICENSE-MIT             vendor/ripgrep/LICENSE-MIT
 │   ├── tinykg-LICENSE                  vendor/tinykg/LICENSE (Apache-2.0)
+│   ├── lean4-LICENSE, gmp-COPYING.LESSERv3, gmp-COPYINGv3, gmp-COPYINGv2,
+│   │   libuv-LICENSE, libuv-LICENSE-extra   vendor/lean-runtime/ (runtime linked into the kernels)
 │   └── THIRD_PARTY_NOTICES.md          rendered by scripts/gen_third_party_notices.py
 ├── share/doc/
 │   ├── README.md                       the repository README
@@ -32,17 +45,25 @@ metacodes-<version>-<target-id>/
 | `bin/rg[.exe]` | runtime asset | `scripts/stage_ripgrep_binary.py` from `vendor/ripgrep/manifest.json` | digest in `files[]` and `components[]`; `doctor --strict` resolves it here under the release layout |
 | `vendor/tinykg/tinykg[.exe]` | runtime asset | `scripts/stage_tinykg_binary.py` from `vendor/tinykg/manifest.json` | digest; `doctor --strict`; `tinykg version` equals `components[tinykg].version` (`release:verify`) |
 | `vendor/tinykg/tinykg.provenance.json` | staging receipt | same script | listed in `files[]`; `components[tinykg].provenance_path` |
+| `vendor/tinykg/tinykgd[.exe]` + receipt | runtime asset | the same bundle, role `daemon` | digest pinned by the executable under the release layout; `doctor --strict`; same version and source commit as `tinykg` (`release/manifest_contract.zig`) |
+| `libexec/metacodes/metacodes-{formal,project}-kernel[.exe]` + sidecars | runtime assets | `zig build kernels:stage` (scripts/build-{formal,project-harness}-kernel.sh: axiom audit, native smoke, `check_kernel_self_contained.py`) | digest pinned by the executable (`-D{formal,project}-kernel-sha256`); `doctor --strict` resolves each adjacent and its own loader accepts the sidecar |
 | `share/licenses/*` | licence texts and notices | repository files, `THIRD_PARTY_NOTICES.md` generated | every `components[].license_path` exists and is non-empty; the notices name every runtime asset |
 | `share/doc/*` | operator documentation | repository files | listed in `files[]` |
 | `manifest.json` | the contract | `scripts/release_manifest.zig` | `release/manifest_contract.zig` (schema, identity, files, components, compatibility) |
 
-The Lean governance kernels (`libexec/metacodes/metacodes-{formal,project}-kernel`
-and their provenance sidecars) are **not** part of this unit: a release
-executable is built without `-Dformal-kernel-sha256` / `-Dproject-kernel-sha256`,
-so `doctor` reports both kernel checks unresolved and `--strict` passes. An
-executable that pins a kernel must ship it beside itself with a sidecar its own
-loader accepts, or `release:verify` and `verify_install_prefix.py --doctor` name
-the pin (`scripts/verify_kernel_provenance.py` runs real kernels through doctor).
+The Lean kernels are built natively on each release runner, linked
+self-contained (only OS libraries; the Lean runtime, GMP and libuv are static,
+their licences ship under `share/licenses/`), and pinned into the executable,
+so a release build is two invocations:
+
+```
+zig build kernels:stage --prefix <dir>
+zig build release:verify -Drelease-layout=true --prefix <dir> $(python3 scripts/kernel_pins.py <dir>)
+```
+
+`release:stage` refuses to run without both pins, and `release:verify` /
+`verify_install_prefix.py --release --doctor` fail unless every runtime asset
+resolves inside the unit and matches what the executable pins.
 
 The relative position of `bin/` and `vendor/tinykg/` is load-bearing: the
 executable resolves TinyKG at `../vendor/tinykg/` from its own directory and, under

@@ -125,6 +125,9 @@ def load_bundle(bundle_root: Path, kind: str) -> Bundle:
         raise ValueError("manifest.json is not a regular file")
     label = "AgentCore" if kind == "agentcore" else "metacodes CLI"
     expected_name = "agentcore" if kind == "agentcore" else "metacodes-cli"
+    # The CLI unit is manifest v2 since it ships the TinyKG daemon and the Lean
+    # kernels (release/LAYOUT.md); the AgentCore unit is still v1.
+    expected_schema = 1 if kind == "agentcore" else 2
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         schema_version = manifest["schema_version"]
@@ -134,8 +137,8 @@ def load_bundle(bundle_root: Path, kind: str) -> Bundle:
         raise ValueError(f"invalid {kind} manifest: {error}") from error
     # Identity before shape: a manifest of the other unit is refused by name,
     # not by whichever field it happens to lack.
-    if schema_version != 1 or vendor != "metask" or name != expected_name:
-        raise ValueError(f"manifest is not metask {label} schema 1")
+    if schema_version != expected_schema or vendor != "metask" or name != expected_name:
+        raise ValueError(f"manifest is not metask {label} schema {expected_schema}")
     try:
         target_id = manifest["target"]["id"]
         target_os = manifest["target"]["os"]
@@ -320,7 +323,7 @@ def _cli_fixture(root: Path, target_os: str, target_id: str, version: str, chann
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"metacodes")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "vendor": "metask",
         "name": "metacodes-cli",
         "release": {"version": version, "channel": channel, "tag": version if channel == "stable" else None},

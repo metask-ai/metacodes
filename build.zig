@@ -192,13 +192,15 @@ fn buildInfoOptions(
         .explicit => |input| input.sha256,
         .disabled, .unavailable => null,
     });
-    // The daemon digest is pinned only once the daemon is part of the install,
-    // exactly like the Lean kernels: doctor calls a pinned-but-unresolvable
-    // binary unhealthy, so pinning something the prefix does not carry would
-    // make `doctor --strict` fail on every release. Staging still compares the
-    // build table against the bundle manifest. The change that installs the
-    // daemon pins it here in the same commit.
-    options.addOption(?[]const u8, "tinykgd_expected_sha256", @as(?[]const u8, null));
+    // The daemon digest is pinned exactly where the daemon is part of the
+    // install: the release layout ships it (manifest v2), so doctor holds the
+    // shipped copy to the bundle table. A development install carries no
+    // daemon, and doctor calls a pinned-but-unresolvable binary unhealthy.
+    const daemon_pin: ?[]const u8 = if (release_layout and tinykg_input == .bundled)
+        if (bundledTinyKgForTarget(b, target, "daemon")) |daemon| daemon.sha256 else null
+    else
+        null;
+    options.addOption(?[]const u8, "tinykgd_expected_sha256", daemon_pin);
     options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
     options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
     return options;
@@ -303,6 +305,8 @@ const StagedTinyKg = struct {
 
 const StagedTinyKgd = struct {
     install_step: *std.Build.Step,
+    /// `vendor/tinykg/tinykgd.provenance.json`, which the release unit ships.
+    receipt_install_step: *std.Build.Step,
     artifact: std.Build.LazyPath,
     installed_path: []const u8,
     source_sha256: []const u8,
@@ -837,16 +841,12 @@ pub fn build(b: *std.Build) void {
                 const staged_daemon_receipt = daemon_stage.addOutputFileArg("tinykgd.provenance.json");
                 const install_daemon = b.addInstallFileWithDir(staged_daemon, .{ .custom = "vendor/tinykg" }, daemon_name);
                 const install_daemon_receipt = b.addInstallFileWithDir(staged_daemon_receipt, .{ .custom = "vendor/tinykg" }, "tinykgd.provenance.json");
-                // Deliberately NOT part of the default install step. Nothing
-                // starts the daemon yet, and the product install carries only
-                // what `release/manifest_contract.zig` declares and
-                // `scripts/verify_install_prefix.py` expects. `tinykg:stage`
-                // and the test wiring still stage it, so the bundle stays
-                // attested and the resolution path stays covered; the release
-                // layout gains it in the change that starts it.
+                // Not part of the default (development) install step; the
+                // release layout ships it (`release:stage`, manifest v2), and
+                // `tinykg:stage` plus the test wiring stage it everywhere else.
                 tinykg_stage_step.dependOn(&install_daemon.step);
                 tinykg_stage_step.dependOn(&install_daemon_receipt.step);
-                staged_tinykgd = .{ .install_step = &install_daemon.step, .artifact = staged_daemon, .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, daemon_name), .source_sha256 = daemon.sha256 };
+                staged_tinykgd = .{ .install_step = &install_daemon.step, .receipt_install_step = &install_daemon_receipt.step, .artifact = staged_daemon, .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, daemon_name), .source_sha256 = daemon.sha256 };
             }
         },
         .explicit => |input| {
@@ -921,7 +921,7 @@ pub fn build(b: *std.Build) void {
     const ripgrep_bundle = ripgrepBundleInfo(b, target.result);
     const release_stage_step = b.step(
         "release:stage",
-        "Install the release layout (bin/metacodes, bin/rg, vendor/tinykg, share/licenses); requires -Drelease-layout=true and fails closed for a target without vendored runtime assets",
+        "Install the release layout (bin/metacodes, bin/rg, libexec/metacodes kernels, vendor/tinykg CLI + daemon, share/licenses); requires -Drelease-layout=true, a Lean toolchain and pinned kernel digests, and fails closed for a target without vendored runtime assets",
     );
     release_stage_step.dependOn(b.getInstallStep());
     if (!release_layout) {
@@ -932,6 +932,23 @@ pub fn build(b: *std.Build) void {
     if (staged_tinykg == null) {
         release_stage_step.dependOn(&b.addFail(
             "release:stage needs the vendored TinyKG binary for this target (it is disabled or unavailable)",
+        ).step);
+    }
+    // A v2 release unit is complete on every platform (doc/INSTALL_DESIGN.md):
+    // the TinyKG daemon and both Lean kernels ship, the executable pins the
+    // kernels it ships, and the kernels' runtime licences come along.
+    if (staged_tinykgd) |daemon| {
+        release_stage_step.dependOn(daemon.install_step);
+        release_stage_step.dependOn(daemon.receipt_install_step);
+    } else {
+        release_stage_step.dependOn(&b.addFail(
+            "release:stage needs the vendored TinyKG daemon for this target (it is disabled or unavailable)",
+        ).step);
+    }
+    release_stage_step.dependOn(kernels_stage_step);
+    if (release_layout and (g_formal_kernel_sha256 == null or g_project_kernel_sha256 == null)) {
+        release_stage_step.dependOn(&b.addFail(
+            "release:stage pins the kernels it ships: build them first (`zig build kernels:stage --prefix <dir>`) and pass their digests, e.g. `$(python3 scripts/kernel_pins.py <dir>)`",
         ).step);
     }
     const target_family = b.fmt("{s}-{s}", .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) });
@@ -959,6 +976,12 @@ pub fn build(b: *std.Build) void {
             .{ .source = "LICENSE", .dir = "share/licenses", .name = "metacodes-LICENSE" },
             .{ .source = "vendor/tinykg/LICENSE", .dir = "share/licenses", .name = "tinykg-LICENSE" },
             .{ .source = "THIRD_PARTY_NOTICES.md", .dir = "share/licenses", .name = "THIRD_PARTY_NOTICES.md" },
+            .{ .source = "vendor/lean-runtime/lean4-LICENSE", .dir = "share/licenses", .name = "lean4-LICENSE" },
+            .{ .source = "vendor/lean-runtime/gmp-COPYING.LESSERv3", .dir = "share/licenses", .name = "gmp-COPYING.LESSERv3" },
+            .{ .source = "vendor/lean-runtime/gmp-COPYINGv3", .dir = "share/licenses", .name = "gmp-COPYINGv3" },
+            .{ .source = "vendor/lean-runtime/gmp-COPYINGv2", .dir = "share/licenses", .name = "gmp-COPYINGv2" },
+            .{ .source = "vendor/lean-runtime/libuv-LICENSE", .dir = "share/licenses", .name = "libuv-LICENSE" },
+            .{ .source = "vendor/lean-runtime/libuv-LICENSE-extra", .dir = "share/licenses", .name = "libuv-LICENSE-extra" },
             .{ .source = "README.md", .dir = "share/doc", .name = "README.md" },
             .{ .source = "CHANGELOG.md", .dir = "share/doc", .name = b.fmt("CHANGELOG-{s}.md", .{manifest.version}) },
         };
@@ -1297,6 +1320,12 @@ pub fn build(b: *std.Build) void {
     });
     release_manifest_tool_mod.addImport("metask_agentcore_types", agentcore_manifest_types_mod);
     release_manifest_tool_mod.addImport("metacodes_release_contract", release_contract_mod);
+    // The generator writes exactly the files and schema the reader validates.
+    release_manifest_tool_mod.addImport("metacodes_manifest_contract", b.createModule(.{
+        .root_source_file = b.path("release/manifest_contract.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }));
     const release_manifest_tool = b.addExecutable(.{
         .name = "release-manifest",
         .root_module = release_manifest_tool_mod,

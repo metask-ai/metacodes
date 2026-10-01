@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const abi_types = @import("metask_agentcore_types");
 const release_contract = @import("metacodes_release_contract");
+const contract = @import("metacodes_manifest_contract");
 const common = @import("manifest_common.zig");
 
 const TOOL_NAME = "release manifest";
@@ -64,7 +65,7 @@ const Effect = struct {
 };
 
 const Manifest = struct {
-    schema_version: u32 = 1,
+    schema_version: u32 = contract.SCHEMA_VERSION,
     vendor: []const u8 = "metask",
     name: []const u8 = "metacodes-cli",
     release: struct {
@@ -127,6 +128,14 @@ const Provenance = struct {
     binary_sha256: []const u8,
 };
 
+/// The fields of a Lean kernel sidecar the manifest repeats.
+const KernelProvenance = struct {
+    binary_sha256: []const u8,
+    checker_version: []const u8,
+};
+
+const kernel_license = "MIT AND Apache-2.0 AND (LGPL-3.0-or-later OR GPL-2.0-or-later)";
+
 const Channel = enum { stable, pre };
 
 pub fn main(init: std.process.Init) !void {
@@ -158,6 +167,10 @@ pub fn main(init: std.process.Init) !void {
     const metacodes_rel: []const u8 = if (is_windows) "bin/metacodes.exe" else "bin/metacodes";
     const ripgrep_rel: []const u8 = if (is_windows) "bin/rg.exe" else "bin/rg";
     const tinykg_rel: []const u8 = if (is_windows) "vendor/tinykg/tinykg.exe" else "vendor/tinykg/tinykg";
+    const tinykgd_rel: []const u8 = if (is_windows) "vendor/tinykg/tinykgd.exe" else "vendor/tinykg/tinykgd";
+    var kernel_path_buffers: [contract.kernels.len][contract.MAX_COMPONENT_PATH]u8 = undefined;
+    var kernel_rels: [contract.kernels.len][]const u8 = undefined;
+    for (contract.kernels, 0..) |kernel, index| kernel_rels[index] = contract.kernelPath(os, kernel.stem, &kernel_path_buffers[index]);
     // The changelog is named after the declared version (build.zig installs
     // it as CHANGELOG-<build.zig.zon version>.md); the pre channel's build
     // metadata stays out of file names.
@@ -169,6 +182,14 @@ pub fn main(init: std.process.Init) !void {
     const provenance_rel = "vendor/tinykg/tinykg.provenance.json";
     const provenance_path = try std.fs.path.join(allocator, &.{ prefix, provenance_rel });
     const provenance = try readJson(Provenance, allocator, init.io, provenance_path);
+    const daemon_provenance_rel = "vendor/tinykg/tinykgd.provenance.json";
+    const daemon_provenance = try readJson(Provenance, allocator, init.io, try std.fs.path.join(allocator, &.{ prefix, daemon_provenance_rel }));
+    var kernel_provenance_rels: [contract.kernels.len][]const u8 = undefined;
+    var kernel_provenances: [contract.kernels.len]KernelProvenance = undefined;
+    for (kernel_rels, 0..) |kernel_rel, index| {
+        kernel_provenance_rels[index] = try std.fmt.allocPrint(allocator, "{s}.provenance.json", .{kernel_rel});
+        kernel_provenances[index] = try readJson(KernelProvenance, allocator, init.io, try std.fs.path.join(allocator, &.{ prefix, kernel_provenance_rels[index] }));
+    }
 
     // The licence text is part of the unit; a stable release without it is
     // not a release (#47 Q6), a pre-release only says so.
@@ -183,20 +204,12 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}: warning: {s} is missing (pre channel)\n", .{ TOOL_NAME, license_rel });
     }
 
+    // Exactly the reader's whitelist (release/manifest_contract.zig).
+    var expected_buffer: [contract.MAX_EXPECTED_FILES][]const u8 = undefined;
+    var expected_storage: [5][contract.MAX_COMPONENT_PATH]u8 = undefined;
+    const expected_paths = contract.expectedFiles(os, changelog_rel, has_license, &expected_buffer, &expected_storage);
     var relative_paths: std.ArrayList([]const u8) = .empty;
-    try relative_paths.appendSlice(allocator, &.{
-        metacodes_rel,
-        ripgrep_rel,
-        tinykg_rel,
-        provenance_rel,
-        "share/licenses/ripgrep-LICENSE-MIT",
-        "share/licenses/tinykg-LICENSE",
-        "share/licenses/THIRD_PARTY_NOTICES.md",
-        "share/doc/README.md",
-        changelog_rel,
-    });
-    if (has_license) try relative_paths.append(allocator, license_rel);
-    std.mem.sort([]const u8, relative_paths.items, {}, lessThanPath);
+    for (expected_paths) |path| try relative_paths.append(allocator, try allocator.dupe(u8, path));
 
     const digests = try allocator.alloc([64]u8, relative_paths.items.len);
     const files = try allocator.alloc(FileEntry, relative_paths.items.len);
@@ -214,6 +227,18 @@ pub fn main(init: std.process.Init) !void {
     if (!std.mem.eql(u8, tinykg_sha, provenance.binary_sha256)) {
         std.debug.print("{s}: staged TinyKG digest {s} does not match its provenance receipt {s}\n", .{ TOOL_NAME, tinykg_sha, provenance.binary_sha256 });
         return error.TinykgProvenanceMismatch;
+    }
+    const tinykgd_sha = digestOf(files, tinykgd_rel) orelse unreachable;
+    if (!std.mem.eql(u8, tinykgd_sha, daemon_provenance.binary_sha256)) {
+        std.debug.print("{s}: staged TinyKG daemon digest {s} does not match its provenance receipt {s}\n", .{ TOOL_NAME, tinykgd_sha, daemon_provenance.binary_sha256 });
+        return error.TinykgdProvenanceMismatch;
+    }
+    for (kernel_rels, kernel_provenances) |kernel_rel, kernel_provenance| {
+        const kernel_sha = digestOf(files, kernel_rel) orelse unreachable;
+        if (!std.mem.eql(u8, kernel_sha, kernel_provenance.binary_sha256)) {
+            std.debug.print("{s}: staged kernel {s} digest {s} does not match its provenance sidecar {s}\n", .{ TOOL_NAME, kernel_rel, kernel_sha, kernel_provenance.binary_sha256 });
+            return error.KernelProvenanceMismatch;
+        }
     }
 
     const components = [_]Component{
@@ -253,6 +278,41 @@ pub fn main(init: std.process.Init) !void {
             },
             .purpose = "memory / task control plane",
         },
+        .{
+            .role = "runtime_asset",
+            .name = "tinykgd",
+            .path = tinykgd_rel,
+            .sha256 = tinykgd_sha,
+            .version = tinykg_contract.tinykg_version,
+            .source_commit = tinykg_bundle.source_commit,
+            .upstream = tinykg_contract.source_repository,
+            .license = tinykg_contract.license,
+            .license_path = "share/licenses/tinykg-LICENSE",
+            .provenance_path = daemon_provenance_rel,
+            .purpose = "shared TinyKG store service",
+        },
+        .{
+            .role = "runtime_asset",
+            .name = contract.kernels[0].name,
+            .path = kernel_rels[0],
+            .sha256 = digestOf(files, kernel_rels[0]) orelse unreachable,
+            .version = kernel_provenances[0].checker_version,
+            .license = kernel_license,
+            .license_path = "share/licenses/THIRD_PARTY_NOTICES.md",
+            .provenance_path = kernel_provenance_rels[0],
+            .purpose = "Lean task-audit / memory-migration / artifact-verification checker",
+        },
+        .{
+            .role = "runtime_asset",
+            .name = contract.kernels[1].name,
+            .path = kernel_rels[1],
+            .sha256 = digestOf(files, kernel_rels[1]) orelse unreachable,
+            .version = kernel_provenances[1].checker_version,
+            .license = kernel_license,
+            .license_path = "share/licenses/THIRD_PARTY_NOTICES.md",
+            .provenance_path = kernel_provenance_rels[1],
+            .purpose = "Lean project-rule gate",
+        },
     };
 
     const manifest = Manifest{
@@ -281,7 +341,12 @@ pub fn main(init: std.process.Init) !void {
                 .store_schema_version = tinykg_contract.store_schema_version,
             }},
             .fails_without = &.{.{ .component = "ripgrep", .effect = "Grep / Glob unavailable" }},
-            .degraded_without = &.{.{ .component = "tinykg", .effect = "KG memory/task degrade; agent loop unaffected" }},
+            .degraded_without = &.{
+                .{ .component = "tinykg", .effect = "KG memory/task degrade; agent loop unaffected" },
+                .{ .component = "tinykgd", .effect = "no shared KG service; sessions use the exclusive TinyKG CLI store" },
+                .{ .component = "formal_kernel", .effect = "formal task audit and governed memory migration fail closed" },
+                .{ .component = "project_kernel", .effect = "promoted project rules fail closed before dispatch" },
+            },
         },
         .files = files,
     };
@@ -337,10 +402,6 @@ fn minorSeries(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
 fn digestOf(files: []const FileEntry, path: []const u8) ?[]const u8 {
     for (files) |file| if (std.mem.eql(u8, file.path, path)) return file.sha256;
     return null;
-}
-
-fn lessThanPath(_: void, lhs: []const u8, rhs: []const u8) bool {
-    return std.mem.order(u8, lhs, rhs) == .lt;
 }
 
 fn readJson(comptime T: type, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !T {

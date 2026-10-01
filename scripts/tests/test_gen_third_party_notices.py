@@ -72,6 +72,25 @@ class GeneratedNoticesTest(unittest.TestCase):
                 self.assertEqual(2, main(["--root", str(root), "--check"]))
             self.assertIn("table marker", stderr.getvalue())
 
+    def test_lean_runtime_licenses_must_describe_the_pinned_toolchain(self) -> None:
+        """A toolchain bump may change the GMP/libuv the kernels link, so the
+        license record has to be re-checked before the notices render."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _copy_inputs(root)
+            rendered = generate(root)
+            self.assertIn("| GMP ", rendered)
+            self.assertIn("| libuv ", rendered)
+            _write(root / INPUT_FILES[4], "leanprover/lean4:v4.15.0\n")
+            with self.assertRaisesRegex(NoticesError, "re-check the bundled GMP/libuv"):
+                generate(root)
+            _write(root / INPUT_FILES[4], "leanprover/lean4:v4.14.0\n")
+            manifest = json.loads((root / INPUT_FILES[6]).read_text(encoding="utf-8"))
+            manifest["components"][1]["license_files"] = []
+            _write(root / INPUT_FILES[6], json.dumps(manifest))
+            with self.assertRaisesRegex(NoticesError, "lacks license_files"):
+                generate(root)
+
 
 if __name__ == "__main__":
     unittest.main()
