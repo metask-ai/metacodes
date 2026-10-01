@@ -23,7 +23,12 @@ elif command -v lake >/dev/null 2>&1; then
 else
   lake="$HOME/.elan/bin/lake$executable_suffix"
 fi
-python=$(command -v python3 || command -v python || true)
+# Windows: `python3` may be the Microsoft Store stub; prefer the real `python`.
+if [[ "$host_os" == "Windows" ]]; then
+  python=$(command -v python || command -v python3 || true)
+else
+  python=$(command -v python3 || command -v python || true)
+fi
 
 if [[ ! -x "$lake" ]]; then
   echo "build-project-harness-kernel: lake not found: $lake" >&2

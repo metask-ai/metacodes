@@ -152,7 +152,12 @@ if [[ "$host_os" == "Darwin" ]]; then
 else
   install -m 0755 "$lean_dir/.lake/build/bin/metacodes-formal-kernel$executable_suffix" "$output"
 fi
-python=$(command -v python3 || command -v python || true)
+# Windows: `python3` may be the Microsoft Store stub; prefer the real `python`.
+if [[ "$host_os" == "Windows" ]]; then
+  python=$(command -v python || command -v python3 || true)
+else
+  python=$(command -v python3 || command -v python || true)
+fi
 if [[ -z "$python" ]]; then
   echo "build-formal-kernel: python3 is required for the self-containment check" >&2
   exit 1

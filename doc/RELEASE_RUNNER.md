@@ -24,8 +24,8 @@ job.
 |---|---|
 | Runners | `ubuntu-latest`, `macos-latest`, `windows-latest`; one job per platform, `publish` on `ubuntu-latest` |
 | Trigger | `workflow_dispatch` only, inputs `tag` (bare `X.Y.Z` for the stable channel, a branch or full 40-hex commit SHA for `0.x.y-dev` pre-releases; `actions/checkout` rejects short SHAs) and `dry_run` (default `true`: build, verify, archive and upload artifacts, no draft) |
-| Toolchain | Zig 0.16.0 from `mlugg/setup-zig` (no cache); the images' Python and Rust stable (`cargo`); `bindgen` 0.72.1 installed by `cargo install bindgen-cli --locked` in the job for the AgentCore gate's bindings-regen check; PyYAML from `requirements-dev.txt` |
-| Network | `zig build` downloads nothing: ripgrep and TinyKG are vendored and hash-checked (`verify_ripgrep_binary.py`, `verify_tinykg_binary.py`). The job itself reaches GitHub (checkout, `setup-zig`, artifacts) and crates.io (`bindgen`) |
+| Toolchain | Zig 0.16.0 from `mlugg/setup-zig` (no cache); the images' Python and Rust stable (`cargo`); `bindgen` 0.72.1 installed by `cargo install bindgen-cli --locked` in the job for the AgentCore gate's bindings-regen check; PyYAML from `requirements-dev.txt`; elan 4.2.4 from its pinned release asset (`scripts/ci/install-elan.sh`, Git Bash on Windows) and the Lean toolchain `control-plane/lean/lean-toolchain` names, to build both kernels the unit ships (`zig build kernels:stage`, then `scripts/kernel_pins.py`) |
+| Network | `zig build` downloads nothing: ripgrep and TinyKG are vendored and hash-checked (`verify_ripgrep_binary.py`, `verify_tinykg_binary.py`). The job itself reaches GitHub (checkout, `setup-zig`, artifacts, the elan asset and the Lean toolchain elan resolves) and crates.io (`bindgen`) |
 
 ## Credentials
 

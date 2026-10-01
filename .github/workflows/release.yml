@@ -90,13 +90,25 @@ jobs:
         run: python3 -m pip install --break-system-packages -r requirements-dev.txt
       - name: Vendored runtime assets are attested
         run: python3 scripts/verify_tinykg_binary.py && python3 scripts/verify_ripgrep_binary.py
+      # The unit ships both Lean kernels (manifest v2, release/LAYOUT.md),
+      # built here natively and cold like everything else in a release: the
+      # pinned elan, no Lean cache.
+      - name: Install pinned elan
+        run: bash scripts/ci/install-elan.sh
+      - name: Build the Lean kernels and their pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build kernels:stage -Dlean-kernels=on -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release"
+          pins=$(python3 scripts/kernel_pins.py "$RUNNER_TEMP/release")
+          echo "KERNEL_PINS=$pins" >> "$GITHUB_ENV"
       # Same test watchdog as ci.yml: the build runner's one-minute default
       # is what the Windows dry runs tripped (a few I/O-bound unit tests sit
       # near a minute on that box).
       - name: Full suite in release configuration
-        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m
+        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
       - name: Stage, manifest and verify the release unit
-        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release"
+        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS
       - name: Installed prefix matches the release layout
         run: python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release" --release --doctor
       # The same watchdog again, as agentcore-windows.yml runs this gate: at
@@ -105,17 +117,17 @@ jobs:
       - name: AgentCore gate for the native target
         run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
-        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist"
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist"
       - name: Archive (AgentCore SDK)
         run: zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
       - name: Archives are reproducible
         run: |
-          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
+          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
           cmp "$RUNNER_TEMP"/dist/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-again/metacodes-*.tar.gz
-      # aarch64-linux has a vendored musl ripgrep since #86; ci.yml proves the
-      # cross-staged unit with `release:check -Dtarget=aarch64-linux-musl`.
-      # Building it here as a cross-compiled release unit is a matrix change
-      # for a later issue: it needs a runner-independent verify path.
+      # aarch64-linux has a vendored musl ripgrep since #86 and ci.yml proves
+      # the cross-staged assets. A release unit for it also needs both Lean
+      # kernels, which only a native aarch64 runner can build: adding it is a
+      # matrix change for a later issue (doc/INSTALL_DESIGN.md §5).
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: archives-${{ matrix.os }}-${{ matrix.arch }}
@@ -155,12 +167,22 @@ jobs:
       - name: Vendored runtime assets are attested
         shell: cmd
         run: python scripts\verify_tinykg_binary.py && python scripts\verify_ripgrep_binary.py
+      # See build-posix: the Windows unit ships both Lean kernels too.
+      - name: Install pinned elan
+        shell: bash
+        run: bash scripts/ci/install-elan.sh
+      - name: Build the Lean kernels and their pins
+        shell: cmd
+        run: |
+          zig build kernels:stage -Dlean-kernels=on -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" || exit /b 1
+          for /f "delims=" %%P in ('python scripts\kernel_pins.py "%RUNNER_TEMP%\release"') do echo KERNEL_PINS=%%P>> "%GITHUB_ENV%"
+          findstr /B KERNEL_PINS= "%GITHUB_ENV%" || exit /b 1
       - name: Full suite in release configuration
         shell: cmd
-        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m
+        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
       - name: Stage, manifest and verify the release unit
         shell: cmd
-        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release"
+        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS%
       - name: Installed prefix matches the release layout
         shell: cmd
         run: python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release" --release --doctor
@@ -169,13 +191,13 @@ jobs:
         run: zig build agentcore:gate -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
         shell: cmd
-        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist"
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist"
       - name: Archive (AgentCore SDK)
         shell: cmd
         run: zig build agentcore:archive -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -Dagentcore-archive-dir="%RUNNER_TEMP%\dist"
       - name: Archives are reproducible
         shell: cmd
-        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: archives-Windows-X64
