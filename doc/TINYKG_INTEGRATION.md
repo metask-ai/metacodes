@@ -137,7 +137,8 @@ reviewed upstream commit/build receipt or a documented reproducibility finding.
 ## Runtime modes
 
 The normal shared-store mode is an authenticated Metacodes-owned Web transport to
-one `tinykgd`/StoreActor. Configure it through `~/.metacodes/kg/daemon.json`,
+one `tinykgd`/StoreActor. Configure it through `<state root>/kg/daemon.json`
+(the install's state root, doc/INSTALL_DESIGN.md §3),
 `METACODES_KG_CONFIG`, or the explicit URL/key/build-id environment variables.
 Build identity and schema are pinned by the client. Failure degrades KG features
 without disabling the rest of the agent; it never falls back to a raw shared store.
@@ -201,11 +202,11 @@ Properties worth knowing:
 - A `tinykgd` that accepts a request and stops answering desynchronizes the
   pipe. The service reports 503, stops, and says to start it again rather than
   queueing every later request behind a read that will not return.
-- Nothing starts the daemon automatically yet, there is no idle exit, and the
-  daemon is still not part of the product install.
+- Nothing starts the daemon automatically yet and there is no idle exit: run
+  `metacodes kgd` (one per install; give each install its own `--port`).
 - Markdown import stages the document where the engine can read it back by
-  pathname, always at `~/.metacodes/kg/import`. The location is derived from the
-  home directory alone, never from `--config` or `--store`: both can point
+  pathname, always at `<state root>/kg/import`. The location is derived from the
+  install's state root alone, never from `--config` or `--store`: both can point
   anywhere, and the engine reopens the staged path after the service renames the
   file into place, so an ancestor someone else can rename is an ingestion
   someone else can redirect. Before staging, every directory from that path to
@@ -231,21 +232,20 @@ Properties worth knowing:
   product ships, so the exposure is a misbehaving child rather than a hostile
   one; making it interruptible needs overlapped I/O.
 
-Because nothing starts it, the daemon is **not** part of the default install or
-the release layout: `zig build tinykg:stage` (and the test wiring) install it
-under `zig-out/vendor/tinykg/`, while `zig build --prefix <dir>` carries only
-the assets `release/manifest_contract.zig` declares and
-`scripts/verify_install_prefix.py` expects. `metacodes doctor` therefore reports
-`tinykgd` as unresolved in a plain install. The change that starts the daemon
-adds it to the install step, the release manifest and the prefix inventory
-together.
+The release unit ships `tinykgd` beside `tinykg` (`vendor/tinykg/`, digest pinned
+by the executable under the release layout, release/LAYOUT.md), so an installed
+`metacodes doctor --strict` resolves both. The development install step
+(`zig build --prefix <dir>`) still carries only the CLI; `zig build tinykg:stage`
+and the test wiring stage the daemon there, and `doctor` reports `tinykgd` as
+unresolved in a development prefix without it. Starting it is a separate,
+explicit `metacodes kgd`.
 
 When the runtime is degraded, the diagnosis is retained with a kind and a
 fixed repair hint:
 
 | Kind | Hint |
 |---|---|
-| `unconfigured` | write `~/.metacodes/kg/daemon.json` (0600) or set the KG URL/key/build-id variables |
+| `unconfigured` | write `<state root>/kg/daemon.json` (0600) or set the KG URL/key/build-id variables |
 | `config_unsafe` | make the file regular, non-symlink, under 64 KB, and mode 0600 |
 | `config_invalid` | fix the URL, API key, and expected build-id JSON |
 | `daemon_unreachable` | start tinykgd/tinykg-web at the configured URL |
