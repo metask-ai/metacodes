@@ -97,6 +97,7 @@ pub const kgd_server = @import("kg/kgd/server.zig"); // the authenticated HTTP c
 pub const kgd_install = @import("kg/kgd/install.zig"); // provisioning the store, key and configuration
 pub const kgd_runtime = @import("kg/kgd/runtime.zig"); // `metacodes kgd` wiring
 pub const formal_runtime = @import("formal/runtime.zig"); // precompiled Lean sidecar trust boundary
+pub const formal_test_kernel = @import("formal/test_kernel.zig"); // test-only: staged Lean kernel resolution
 pub const formal_artifact_store = @import("formal/artifact_store.zig"); // immutable research evidence bundles
 pub const formal_provenance = @import("formal/provenance.zig"); // strict sidecar build identity
 pub const formal_project_provenance = @import("formal/project_provenance.zig"); // project kernel sidecar build identity (v6 manifest)
@@ -185,6 +186,7 @@ pub const util_abort = @import("util/abort.zig"); // AbortSignal
 pub const util_log = @import("util/log.zig");
 pub const util_time = @import("util/time.zig");
 pub const util_toolchain = @import("util/toolchain.zig"); // ripgrep 解析/可用性探测(Glob/Grep 依赖)
+pub const util_state_root = @import("util/state_root.zig"); // per-install state root (--state-dir / METACODES_HOME / install.json / ~/.metacodes)
 
 test {
     // 引用所有 re-export → 强制编译每个库模块。若任何模块间接拉到 repl/tui/app(UI 层),

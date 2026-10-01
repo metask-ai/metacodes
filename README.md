@@ -5,11 +5,11 @@ It owns a fixed agent loop, deterministic provider projection, permission and
 sandbox enforcement, durable tool-result artifacts, Lean-backed governance, and
 optional TinyKG memory/task coordination. Hosts can extend tools, provider
 dialects, UI, MCP, and process plugins without replacing those kernel boundaries.
-The Lean governance kernels live under `libexec/metacodes/` beside `bin/` when an
-executable pins them (`-Dformal-kernel-sha256` / `-Dproject-kernel-sha256`); the
-release unit does not ship them (`release/LAYOUT.md`). Runtime resolution checks
-the environment-variable pair first, then the adjacent file with its compiled-in
-digest, and `metacodes doctor` reports both kernels.
+The release unit is complete on every supported platform: the TUI, TinyKG (CLI
+and daemon) and both Lean governance kernels under `libexec/metacodes/`, each
+pinned into the executable (`release/LAYOUT.md`). Runtime resolution checks the
+environment-variable pair first, then the adjacent file with its compiled-in
+digest, and `metacodes doctor` reports every runtime asset and the state root.
 
 > Repository status: pre-publication, pre-1.0 (version declared in
 > `build.zig.zon`). The history has been extracted from the original monorepo,
@@ -30,6 +30,30 @@ digest, and `metacodes doctor` reports both kernels.
   receipts, and provenance but does not become the agent loop.
 - Source-level Zig embedding and a source-free C ABI bundle for C, C++, Zig, Rust,
   Go, and other native hosts.
+
+## Install
+
+From a release archive (macOS / Linux, then Windows):
+
+```sh
+sh scripts/install.sh metacodes-<version>-<target>.tar.gz
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 metacodes-<version>-x86_64-windows-gnu.zip
+```
+
+Each install is self-contained and isolated: it keeps its state (config,
+credentials, TinyKG store, sessions, plans, Lean rules) in its own state root,
+`<prefix>/state` unless `--state-dir` says otherwise, recorded in
+`<prefix>/etc/metacodes/install.json`. Several installs coexist on one machine;
+give each its own `--prefix` and launcher name (`--link-name`). `--sdk` adds the
+AgentCore SDK under `<prefix>/sdk/agentcore/` (`include/metask/agentcore.h`,
+`lib/`, Zig and Rust bindings). The scripts only unpack; the install is
+`bin/metacodes install` (`--help` lists its options), which ends with the
+installed `doctor --strict`. A process picks its state root from `--state-dir`,
+then `METACODES_HOME`, then the install record, then `~/.metacodes`
+([doc/INSTALL_DESIGN.md](doc/INSTALL_DESIGN.md)).
 
 ## Build
 
@@ -55,6 +79,16 @@ Common gates:
 zig build test
 zig build test:lib -Doptimize=ReleaseSafe
 ```
+
+With a Lean toolchain (elan) on the machine, `zig build test` also builds both
+governance kernels from this checkout (`kernels:stage`, cached on the Lean
+sources) and runs every kernel-gated test against them; `-Dlean-kernels=on`
+turns a missing toolchain into a failure, `off` skips the kernels. On Windows
+the kernel scripts run under Git for Windows' bash, never WSL's. A release
+unit from source is `zig build kernels:stage --prefix <u>` followed by
+`zig build release:verify -Drelease-layout=true --prefix <u> $(python3
+scripts/kernel_pins.py <u>)`; `<u>/bin/metacodes install --prefix <dir>` then
+installs it.
 
 The AgentCore bundle and its native consumption gates (`agentcore:test`,
 `agentcore:bundle`, `agentcore:gate`) are documented once, in

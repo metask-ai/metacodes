@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, action, "client-config") or std.mem.eql(u8, action, "client-config-degraded")) {
         var client = try cc.kg_client.KgClient.init(init.gpa, .{
-            .home = "/unused-because-config-is-explicit",
+            .state_root = "/unused-because-config-is-explicit",
             .domain = "daemon-config-probe",
             .io = init.io,
         });
@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
     // 第四个函数(cloneForThread)里,于是"禁止共享 store 回落 CLI"这条规则一直是绿的。
     if (std.mem.eql(u8, action, "unconfigured-clone-no-store")) {
         var parent = try cc.kg_client.KgClient.init(init.gpa, .{
-            .home = "/unused-because-unconfigured",
+            .state_root = "/unused-because-unconfigured",
             .domain = "unconfigured-clone-probe",
             .io = init.io,
         });

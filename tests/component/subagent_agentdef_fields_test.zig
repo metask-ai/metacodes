@@ -701,6 +701,7 @@ test "L2 后台组合: effort/memory_scope/mcp_servers/isolation 穿过 JobInput
     ctx.cwd_abs = repo;
     ctx.project_dir = repo;
     ctx.home_dir = home;
+    ctx.state_root = home; // isolation worktrees live under <state_root>/worktrees
 
     const spawn_out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"background-all\",\"prompt\":\"go\"}");
     defer a.free(spawn_out);
@@ -778,6 +779,7 @@ test "L3 AgentDef.isolation=worktree: 相对 Write 只落隔离树，有变化�
     ctx.cwd_abs = repo;
     ctx.project_dir = repo;
     ctx.home_dir = home;
+    ctx.state_root = home; // isolation worktrees live under <state_root>/worktrees
 
     const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"isolated-agent\",\"prompt\":\"write it\"}");
     defer a.free(out);
@@ -843,6 +845,7 @@ test "L2 AgentDef isolation cleanup failure reports worktree_kept true" {
     ctx.cwd_abs = repo;
     ctx.project_dir = repo;
     ctx.home_dir = home;
+    ctx.state_root = home; // isolation worktrees live under <state_root>/worktrees
 
     const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"cleanup-agent\",\"prompt\":\"lock it\"}");
     defer a.free(out);

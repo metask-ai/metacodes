@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "vendor", "name", "release", "source", "toolchain", "target", "build", "contract", "components", "compatibility", "files"],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "vendor": { "const": "metask" },
     "name": { "const": "metacodes-cli" },
     "release": {
@@ -70,15 +70,15 @@
     },
     "components": {
       "type": "array",
-      "minItems": 3,
-      "maxItems": 3,
+      "minItems": 6,
+      "maxItems": 6,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["role", "name", "path", "sha256", "version"],
         "properties": {
           "role": { "enum": ["primary_executable", "runtime_asset"] },
-          "name": { "enum": ["metacodes", "ripgrep", "tinykg"] },
+          "name": { "enum": ["metacodes", "ripgrep", "tinykg", "tinykgd", "formal_kernel", "project_kernel"] },
           "path": { "type": "string" },
           "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "version": { "type": "string" },
@@ -132,7 +132,7 @@
         "additionalProperties": false,
         "required": ["path", "sha256"],
         "properties": {
-          "path": { "type": "string", "pattern": "^(bin|share|vendor)/" },
+          "path": { "type": "string", "pattern": "^(bin|libexec|share|vendor)/" },
           "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
         }
       }

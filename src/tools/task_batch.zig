@@ -239,6 +239,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         .max_turns = max_turns,
         .session = ctx.session,
         .agent_depth = ctx.agent_depth + 1,
+        .state_root = ctx.state_root,
         .dyn_registry = ctx.dyn_registry,
         .tool_defs_override = sub_tool_defs, // 始终 override(含剥 TaskBatch);spawnAgentSink 内 override 赢
         .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,

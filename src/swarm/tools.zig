@@ -71,7 +71,7 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
     const sw = ctx.swarm orelse return error.SwarmUnavailable;
     if (!sw.is_lead) return error.NotTeamLead;
     if (!std.mem.eql(u8, sw.session.asSlice(), ctx.session.asSlice())) return error.NoActiveTeam;
-    if (sw.home.len == 0) return error.SwarmUnavailable;
+    if (sw.state_root.len == 0) return error.SwarmUnavailable;
     if (sw.hasTeam()) return error.TeamAlreadyExists;
 
     const name_raw = util_json.extractStringField(args, "name") orelse return error.MissingName;
@@ -85,7 +85,7 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
 
     // 目录 + config.json(lead 为非成员,members 空)。
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = team_mod.teamDirPath(sw.home, team_s, &dirbuf);
+    const dir = team_mod.teamDirPath(sw.state_root, team_s, &dirbuf);
     try @import("../util/fs.zig").mkdirParents(dir);
 
     var lead_id_buf: [96]u8 = undefined;
@@ -107,12 +107,12 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
         tf.description = desc; // owned by tf, freed in deinit
     }
     var cfgbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const cfg_path = team_mod.configPath(sw.home, team_s, &cfgbuf);
+    const cfg_path = team_mod.configPath(sw.state_root, team_s, &cfgbuf);
     try team_mod.save(ctx.allocator, &tf, cfg_path);
 
     // lead 邮箱就位(teammate 通知投这里)。
     var leadbuf: [std.fs.max_path_bytes]u8 = undefined;
-    try mailbox.ensureInbox(team_mod.inboxPath(sw.home, team_s, team_mod.TEAM_LEAD_NAME, &leadbuf));
+    try mailbox.ensureInbox(team_mod.inboxPath(sw.state_root, team_s, team_mod.TEAM_LEAD_NAME, &leadbuf));
 
     // teammates registry。ctx 虽是 *const,但 swarm 字段是 ?*SwarmContext,pointee 可变
     // (Zig const 浅层),无需 @constCast(Linus L2)。
@@ -127,7 +127,7 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
         sw.model,
         sw.provider_kind,
         sw.openai_protocol,
-        sw.home,
+        sw.state_root,
         sw.dialect_resolver,
     );
     errdefer if (sw.teammates) |*t| {
@@ -185,8 +185,8 @@ pub fn executeTeamDelete(ctx: *const ToolContext, args: []const u8) anyerror![]u
     }
     // 删 team 目录(best-effort)。
     var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = team_mod.teamDirPath(sw.home, sw.team_sanitized, &dirbuf);
-    rmrf(dir);
+    const dir = team_mod.teamDirPath(sw.state_root, sw.team_sanitized, &dirbuf);
+    rmrf(sw.state_root, dir);
 
     const team_name = sw.team_sanitized;
     defer {
@@ -265,7 +265,7 @@ pub fn executeSendMessage(ctx: *const ToolContext, args: []const u8) anyerror![]
         }
     }
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, to_s, &inbox_buf);
+    const inbox = team_mod.inboxPath(sw.state_root, sw.team_sanitized, to_s, &inbox_buf);
     const sender_lease = sw.senderLease();
     try mailbox.deliverWithIdentity(
         ctx.allocator,
@@ -314,7 +314,7 @@ fn broadcast(ctx: *const ToolContext, sw: *SwarmContext, message: []const u8, su
             }
         }
         var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, m.name, &inbox_buf);
+        const inbox = team_mod.inboxPath(sw.state_root, sw.team_sanitized, m.name, &inbox_buf);
         const sender_lease = sw.senderLease();
         mailbox.deliverWithIdentity(
             ctx.allocator,
@@ -334,7 +334,7 @@ fn broadcast(ctx: *const ToolContext, sw: *SwarmContext, message: []const u8, su
     // teammate 广播也抄送 lead(除非发送者就是 lead)。
     if (!std.mem.eql(u8, sw.self_name, team_mod.TEAM_LEAD_NAME)) {
         var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, team_mod.TEAM_LEAD_NAME, &inbox_buf);
+        const inbox = team_mod.inboxPath(sw.state_root, sw.team_sanitized, team_mod.TEAM_LEAD_NAME, &inbox_buf);
         const sender_lease = sw.senderLease();
         mailbox.deliverWithIdentity(
             ctx.allocator,
@@ -366,7 +366,7 @@ pub fn pollLeadInbox(allocator: std.mem.Allocator, sw: *SwarmContext) !?[]u8 {
     // process remains in `process_teammates` and is checked below.
     _ = sw.reapDeadProcessTeammates();
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const inbox = team_mod.inboxPath(sw.home, sw.team_sanitized, team_mod.TEAM_LEAD_NAME, &inbox_buf);
+    const inbox = team_mod.inboxPath(sw.state_root, sw.team_sanitized, team_mod.TEAM_LEAD_NAME, &inbox_buf);
 
     var unread = mailbox.readUnread(allocator, inbox) catch return null;
     defer unread.deinit();
@@ -605,10 +605,10 @@ fn renderIdleNotice(allocator: std.mem.Allocator, m: *const mailbox.Message) ![]
     return out.toOwnedSlice(allocator);
 }
 
-fn rmrf(path: []const u8) void {
+fn rmrf(state_root: []const u8, path: []const u8) void {
     // 生产安全递归删(Linus HIGH-1:旧 testing.rmrfBestEffort 仅 /tmp/cc-zig- 生效,
-    // TeamDelete 在生产静默 no-op)。护栏=路径须在 /.metacodes/teams/ 下 + symlink 不跟随。
-    @import("../util/fs.zig").removeTeamDirTree(path);
+    // TeamDelete 在生产静默 no-op)。护栏=路径须在 <state_root>/teams/ 下 + symlink 不跟随。
+    @import("../util/fs.zig").removeTeamDirTree(state_root, path);
 }
 
 // ============================================================================
@@ -635,7 +635,7 @@ test "TeamCreate → SendMessage(lead→lead 自投拒 via unknown?) + TeamDelet
     const home = try mkHome(&hbuf);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
 
-    var sw = SwarmContext{ .allocator = a, .home = home, .api_key = "k", .model = "m", .provider_kind = .anthropic };
+    var sw = SwarmContext{ .allocator = a, .state_root = home, .api_key = "k", .model = "m", .provider_kind = .anthropic };
     defer sw.deinit();
     const ctx = leadCtx(a, &sw);
 
@@ -673,12 +673,12 @@ test "SendMessage 无 team → NoActiveTeam;非 lead TeamCreate → NotTeamLead"
     const home = try mkHome(&hbuf);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
 
-    var sw = SwarmContext{ .allocator = a, .home = home };
+    var sw = SwarmContext{ .allocator = a, .state_root = home };
     defer sw.deinit();
     const ctx = leadCtx(a, &sw);
     try testing.expectError(error.NoActiveTeam, executeSendMessage(&ctx, "{\"to\":\"x\",\"message\":\"y\"}"));
 
-    var sw2 = SwarmContext{ .allocator = a, .home = home, .is_lead = false, .self_name = "bob" };
+    var sw2 = SwarmContext{ .allocator = a, .state_root = home, .is_lead = false, .self_name = "bob" };
     defer sw2.deinit();
     const ctx2 = leadCtx(a, &sw2);
     try testing.expectError(error.NotTeamLead, executeTeamCreate(&ctx2, "{\"name\":\"x\"}"));
@@ -690,7 +690,7 @@ test "pollLeadInbox: plain + idle_notification 消费,协议回执留未读" {
     const home = try mkHome(&hbuf);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(home);
 
-    var sw = SwarmContext{ .allocator = a, .home = home, .api_key = "k", .model = "m" };
+    var sw = SwarmContext{ .allocator = a, .state_root = home, .api_key = "k", .model = "m" };
     defer sw.deinit();
     const ctx = leadCtx(a, &sw);
     const r1 = try executeTeamCreate(&ctx, "{\"name\":\"proj\"}");

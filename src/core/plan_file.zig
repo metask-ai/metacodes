@@ -1,6 +1,6 @@
 //! Plan 模式的计划文件机制(对齐 cc utils/plans.ts)。
 //!
-//! plan 模式下模型把计划写到 `{home}/.metacodes/plans/{slug}.md`——这是 plan 模式下**唯一可写**
+//! plan 模式下模型把计划写到 `{state_root}/plans/{slug}.md`——这是 plan 模式下**唯一可写**
 //! 的文件(权限链特许,见 decision.zig)。ExitPlanMode 模型未传 plan 参数时从此文件读回兜底。
 //!
 //! slug:双词(形容词-名词,如 `cozy-canyon`),每 session 稳定,由 seed 派生(对齐 cc word-slug,
@@ -36,23 +36,23 @@ pub fn slugFromSeed(seed: u64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}-{s}", .{ adj, noun }) catch adj;
 }
 
-/// plans 目录:`{home}/.metacodes/plans`。写进 buf,返回 slice。home 为空 → 返回空串。
-pub fn plansDir(home: []const u8, buf: []u8) []const u8 {
-    if (home.len == 0) return "";
-    return std.fmt.bufPrint(buf, "{s}/.metacodes/plans", .{home}) catch "";
+/// plans 目录:`{state_root}/plans`。写进 buf,返回 slice。state_root 为空 → 返回空串。
+pub fn plansDir(state_root: []const u8, buf: []u8) []const u8 {
+    if (state_root.len == 0) return "";
+    return std.fmt.bufPrint(buf, "{s}/plans", .{state_root}) catch "";
 }
 
-/// plan 文件全路径:`{home}/.metacodes/plans/{slug}.md`。写进 buf,返回 slice。
-/// home/slug 任一为空 → 返回空串(plan 文件机制不可用,降级:模型把计划写对话文本)。
-pub fn planFilePath(home: []const u8, slug: []const u8, buf: []u8) []const u8 {
-    if (home.len == 0 or slug.len == 0) return "";
-    return std.fmt.bufPrint(buf, "{s}/.metacodes/plans/{s}.md", .{ home, slug }) catch "";
+/// plan 文件全路径:`{state_root}/plans/{slug}.md`。写进 buf,返回 slice。
+/// state_root/slug 任一为空 → 返回空串(plan 文件机制不可用,降级:模型把计划写对话文本)。
+pub fn planFilePath(state_root: []const u8, slug: []const u8, buf: []u8) []const u8 {
+    if (state_root.len == 0 or slug.len == 0) return "";
+    return std.fmt.bufPrint(buf, "{s}/plans/{s}.md", .{ state_root, slug }) catch "";
 }
 
 /// 确保 plans 目录存在(mkdir -p)。失败仅降级(返回 error),调用方决定是否致命。
-pub fn ensureDir(home: []const u8) !void {
+pub fn ensureDir(state_root: []const u8) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = plansDir(home, &buf);
+    const dir = plansDir(state_root, &buf);
     if (dir.len == 0) return error.NoHome;
     try fs.mkdirParents(dir);
 }
@@ -124,21 +124,21 @@ test "slugFromSeed: 双词稳定 + 同 seed 同 slug" {
     try testing.expect(!std.mem.eql(u8, s1, s3) or true); // 容忍偶碰,主要验不崩
 }
 
-test "planFilePath: 拼路径 + 空 home/slug 返空" {
+test "planFilePath: 拼路径 + 空 state_root/slug 返空" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const p = planFilePath("/home/u", "cozy-canyon", &buf);
-    try testing.expectEqualStrings("/home/u/.metacodes/plans/cozy-canyon.md", p);
+    const p = planFilePath("/s", "cozy-canyon", &buf);
+    try testing.expectEqualStrings("/s/plans/cozy-canyon.md", p);
     try testing.expectEqualStrings("", planFilePath("", "cozy-canyon", &buf));
-    try testing.expectEqualStrings("", planFilePath("/home/u", "", &buf));
+    try testing.expectEqualStrings("", planFilePath("/s", "", &buf));
 }
 
 test "isPlanFile: 精确匹配 + agent 变体 + 拒非 plan 文件" {
-    const exp = "/home/u/.metacodes/plans/cozy-canyon.md";
-    try testing.expect(isPlanFile(exp, "/home/u/.metacodes/plans/cozy-canyon.md")); // 精确
-    try testing.expect(isPlanFile(exp, "/home/u/.metacodes/plans/cozy-canyon-agent-7.md")); // agent 变体
-    try testing.expect(!isPlanFile(exp, "/home/u/.metacodes/plans/other.md")); // 别的 plan
+    const exp = "/s/plans/cozy-canyon.md";
+    try testing.expect(isPlanFile(exp, "/s/plans/cozy-canyon.md")); // 精确
+    try testing.expect(isPlanFile(exp, "/s/plans/cozy-canyon-agent-7.md")); // agent 变体
+    try testing.expect(!isPlanFile(exp, "/s/plans/other.md")); // 别的 plan
     try testing.expect(!isPlanFile(exp, "/home/u/src/main.zig")); // 完全无关
-    try testing.expect(!isPlanFile(exp, "/home/u/.metacodes/plans/cozy-canyon.md.evil")); // 不以 .md 结尾
+    try testing.expect(!isPlanFile(exp, "/s/plans/cozy-canyon.md.evil")); // 不以 .md 结尾
     try testing.expect(!isPlanFile("", "/x")); // 空 expected → false
 }
 
@@ -150,11 +150,11 @@ test "readPlan: 不存在返 null" {
 test "ensureDir + readPlan 往返" {
     const a = testing.allocator;
     var home_buf: [256]u8 = undefined;
-    const home = @import("../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-planfile-test");
-    defer fs.testing.rmrfBestEffort(home);
-    try ensureDir(home);
+    const state_root = @import("../util/fs.zig").testing.uniqueDir(&home_buf, "cc-zig-planfile-test");
+    defer fs.testing.rmrfBestEffort(state_root);
+    try ensureDir(state_root);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = planFilePath(home, "cozy-canyon", &pbuf);
+    const path = planFilePath(state_root, "cozy-canyon", &pbuf);
     // 写一份计划。
     var wpath: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(wpath[0..path.len], path);

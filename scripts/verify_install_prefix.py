@@ -16,10 +16,10 @@ the report carries them: a kernel the executable pins must be shipped under
 `libexec/metacodes/` with a matching digest and a provenance sidecar that the
 kernel's own loader accepts (`provenance: true`); a pinned-but-absent kernel and
 a rejected sidecar are both named, as is a report without the kernel checks;
-the TinyKG daemon check is held to the same pinned-must-ship rule. The release
-layout ships no kernel today
-(release/LAYOUT.md), so a release executable is expected to pin none. Python
-3.9, stdlib only.
+the TinyKG daemon check is held to the same pinned-must-ship rule. A release
+prefix (`--release`, manifest v2) ships the daemon and both kernels, so there
+every one of them must resolve adjacent and match; a development prefix ships
+neither and pins neither. Python 3.9, stdlib only.
 """
 from __future__ import annotations
 
@@ -32,15 +32,37 @@ from pathlib import Path
 
 ALLOWED_ENTRIES = frozenset(("bin", "bin/metacodes", "bin/metacodes.exe", "vendor", "vendor/tinykg", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.exe", "vendor/tinykg/tinykg.provenance.json"))
 RIPGREP_ENTRIES = frozenset(("share", "share/licenses", "share/licenses/ripgrep-LICENSE-MIT", "bin/rg", "bin/rg.exe"))
-# release:stage adds the unit's own licence, TinyKG's, the notices, the docs and,
-# after release:manifest, manifest.json (release/LAYOUT.md, #80).
+# release:stage adds the unit's own licence, TinyKG's, the notices, the docs,
+# the TinyKG daemon, both Lean kernels with their sidecars and the licences of
+# the Lean runtime they link, and, after release:manifest, manifest.json
+# (release/LAYOUT.md, manifest v2).
 RELEASE_ENTRIES = frozenset((
     "share/licenses/metacodes-LICENSE",
     "share/licenses/tinykg-LICENSE",
     "share/licenses/THIRD_PARTY_NOTICES.md",
+    "share/licenses/lean4-LICENSE",
+    "share/licenses/gmp-COPYING.LESSERv3",
+    "share/licenses/gmp-COPYINGv3",
+    "share/licenses/gmp-COPYINGv2",
+    "share/licenses/libuv-LICENSE",
+    "share/licenses/libuv-LICENSE-extra",
     "share/doc",
     "share/doc/README.md",
+    "vendor/tinykg/tinykgd.provenance.json",
+    "libexec",
+    "libexec/metacodes",
 ))
+# Executables whose name gains `.exe` on Windows: (posix path, release only).
+SUFFIXED = (
+    ("vendor/tinykg/tinykgd", True),
+    ("libexec/metacodes/metacodes-formal-kernel", True),
+    ("libexec/metacodes/metacodes-project-kernel", True),
+)
+# A kernel's sidecars are named after the executable file, `.exe` included.
+KERNEL_SIDECARS = {
+    "libexec/metacodes/metacodes-formal-kernel": (".provenance.json", ".build-receipt.json"),
+    "libexec/metacodes/metacodes-project-kernel": (".provenance.json",),
+}
 RELEASE_CHANGELOG_PREFIX = "share/doc/CHANGELOG-"
 KERNEL_CHECKS = ("formal_kernel", "project_kernel")
 # Everything doctor reads from the environment; stripped so the report describes
@@ -81,10 +103,17 @@ def check(prefix: Path, ripgrep: bool = True, release: bool = False) -> list[str
             expected.remove("bin/rg")
         else:
             expected.remove("bin/rg.exe")
-    if any(p.endswith(".exe") for p in actual if p.startswith("vendor/tinykg/")):
+    windows = any(p.endswith(".exe") for p in actual if p.startswith("vendor/tinykg/"))
+    if windows:
         expected.remove("vendor/tinykg/tinykg")
     else:
         expected.remove("vendor/tinykg/tinykg.exe")
+    if release:
+        suffix = ".exe" if windows else ""
+        for path, _ in SUFFIXED:
+            expected.add(path + suffix)
+        for kernel, sidecars in KERNEL_SIDECARS.items():
+            expected.update(kernel + suffix + sidecar for sidecar in sidecars)
     findings = ["missing: " + entry for entry in sorted(expected - actual)]
     findings.extend("unexpected: " + entry for entry in sorted(actual - expected))
     return findings
@@ -123,18 +152,17 @@ def evaluate_doctor(report: object, prefix: Path, release: bool = False) -> list
         findings.append(f"doctor: tinykg source is {tinykg.get('source')!r}, expected 'adjacent'")
     if tinykg.get("match") is not True:
         findings.append(f"doctor: tinykg match is {tinykg.get('match')!r}, expected true")
-    findings.extend(evaluate_kernels(by_name, prefix))
-    findings.extend(evaluate_daemon(by_name, prefix))
+    findings.extend(evaluate_kernels(by_name, prefix, release))
+    findings.extend(evaluate_daemon(by_name, prefix, release))
     return findings
 
 
-def evaluate_daemon(by_name: dict, prefix: Path) -> list[str]:
+def evaluate_daemon(by_name: dict, prefix: Path, release: bool = False) -> list[str]:
     """Findings for the TinyKG daemon check, which the report always carries.
-    The v1 bundle ships no daemon and the build pins none (build.zig keeps
-    `tinykgd` out of the default install, and `ALLOWED_ENTRIES` refuses it), so
-    through the command line only the unpinned-and-absent shape reaches here;
-    the resolved branch is the contract for a v2 bundle that ships the daemon:
-    beside the CLI, adjacent, matching."""
+    A development install ships no daemon and pins none (build.zig keeps
+    `tinykgd` out of the default install, and `ALLOWED_ENTRIES` refuses it); a
+    release prefix (manifest v2) ships it beside the CLI, adjacent, pinned and
+    matching."""
     daemon = by_name.get("tinykgd")
     if daemon is None:
         return ["doctor: no tinykgd check"]
@@ -145,7 +173,11 @@ def evaluate_daemon(by_name: dict, prefix: Path) -> list[str]:
     if resolved is None:
         if expected is not None:
             findings.append(f"doctor: tinykgd is pinned ({expected}) but not shipped under {vendored_dir}")
+        elif release:
+            findings.append(f"doctor: a release prefix ships tinykgd under {vendored_dir}, but doctor did not resolve it")
         return findings
+    if release and expected is None:
+        findings.append("doctor: the release executable does not pin the tinykgd it ships")
     if daemon.get("source") != "adjacent":
         findings.append(f"doctor: tinykgd source is {daemon.get('source')!r}, expected 'adjacent'")
     if not isinstance(resolved, str) or Path(resolved).resolve().parent != vendored_dir:
@@ -155,16 +187,15 @@ def evaluate_daemon(by_name: dict, prefix: Path) -> list[str]:
     return findings
 
 
-def evaluate_kernels(by_name: dict, prefix: Path) -> list[str]:
+def evaluate_kernels(by_name: dict, prefix: Path, release: bool = False) -> list[str]:
     """Findings for the Lean kernel checks. The report always carries both (a
     report without them is not this doctor's). With no environment override a
     kernel resolves only beside the executable and only when the build pinned
     its digest, so a resolved kernel must sit under `libexec/metacodes/`,
     match, and carry a sidecar its own loader accepts; a pinned kernel that did
-    not resolve was not shipped. Today `check()` refuses any `libexec/` entry
-    (the layout ships no kernel), so through the command line only the
-    unpinned-and-absent shape reaches here; the resolved branch is the
-    contract for a layout that ships kernels."""
+    not resolve was not shipped. A development install refuses `libexec/`
+    (`check()`), so there only the unpinned-and-absent shape occurs; a release
+    prefix (manifest v2) must resolve both."""
     findings: list[str] = []
     kernel_dir = (prefix / "libexec" / "metacodes").resolve()
     for name in KERNEL_CHECKS:
@@ -177,6 +208,8 @@ def evaluate_kernels(by_name: dict, prefix: Path) -> list[str]:
         if resolved is None:
             if expected is not None:
                 findings.append(f"doctor: {name} is pinned ({expected}) but not shipped under {kernel_dir}")
+            elif release:
+                findings.append(f"doctor: a release prefix ships {name} under {kernel_dir}, but doctor did not resolve it")
             continue
         if kernel.get("source") != "adjacent":
             findings.append(f"doctor: {name} source is {kernel.get('source')!r}, expected 'adjacent'")

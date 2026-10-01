@@ -37,6 +37,11 @@ pub const Options = struct {
     timeout_seconds: u32 = 300,
     /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
     abort_signal: ?*const AbortSignal = null,
+    /// The host's state root: the login is stored under `<state_root>/oauth`
+    /// (unless METACODES_OAUTH_DIR overrides it). No default: a caller that
+    /// forgot it would finish the browser flow and then fail to store the
+    /// login (the REPL `/login` did, before this field became required).
+    state_root: []const u8,
 };
 
 /// A stored login for this profile would never be consulted.
@@ -67,7 +72,7 @@ pub fn refusalText(err: PrepareError, method: Method) []const u8 {
             .loopback => "that provider declares no OAuth authorization endpoint",
             .device_code => "that provider declares no device authorization endpoint",
         },
-        error.ClientIdMissing => "that provider declares no OAuth client id; pass --client-id or set providers.<id>.oauth_client_id in ~/.metacodes/config.json",
+        error.ClientIdMissing => "that provider declares no OAuth client id; pass --client-id or set providers.<id>.oauth_client_id in <state root>/config.json",
     };
 }
 
@@ -137,7 +142,7 @@ pub const Prepared = struct {
             std.crypto.secureZero(u8, token_json);
             allocator.free(token_json);
         }
-        try importTokenResponse(allocator, self.profile.id, token_json, self.client_id, diagnostic);
+        try importTokenResponse(allocator, self.options.state_root, self.profile.id, token_json, self.client_id, diagnostic);
         return .{ .provider_id = self.profile.id, .client_id_source = self.client_id_source };
     }
 };
@@ -217,6 +222,7 @@ pub fn loginInteractive(
 /// The one durable import both provider login paths end in.
 pub fn importTokenResponse(
     allocator: std.mem.Allocator,
+    state_root: []const u8,
     provider_id: provider_ids.Slug,
     token_json: []const u8,
     client_id: ?[]const u8,
@@ -232,7 +238,7 @@ pub fn importTokenResponse(
         if (!metask_oauth.isGatewayOrigin(outcome.gateway_url.?)) return error.MetaskGatewayNotOrigin;
     }
 
-    var session = provider_oauth.Session.initHome(allocator, provider_id) catch |err|
+    var session = provider_oauth.Session.initHome(allocator, state_root, provider_id) catch |err|
         return failed(diagnostic, err, error.StoreOpenFailed);
     defer session.deinit();
     // Recorded before the import so it lands in the same atomic write as the
@@ -262,21 +268,21 @@ test "the client id precedence is explicit, then configured, then declared" {
         .oauth_authorize_url = "https://auth.example.com/authorize",
     };
     // No declaration, nothing configured, nothing explicit: refused.
-    try std.testing.expectError(error.ClientIdMissing, prepareProfileWith(&undeclared, .{}, null));
+    try std.testing.expectError(error.ClientIdMissing, prepareProfileWith(&undeclared, .{ .state_root = "" }, null));
     // The installation's client stands in for the missing declaration.
-    const configured = try prepareProfileWith(&undeclared, .{}, "app_installation");
+    const configured = try prepareProfileWith(&undeclared, .{ .state_root = "" }, "app_installation");
     try std.testing.expectEqual(ClientIdSource.configured, configured.client_id_source);
     try std.testing.expectEqualStrings("app_installation", configured.client_id);
     // An explicit client wins over the configured one.
-    const explicit = try prepareProfileWith(&undeclared, .{ .client_id = "cli-client" }, "app_installation");
+    const explicit = try prepareProfileWith(&undeclared, .{ .client_id = "cli-client", .state_root = "" }, "app_installation");
     try std.testing.expectEqual(ClientIdSource.explicit, explicit.client_id_source);
     try std.testing.expectEqualStrings("cli-client", explicit.client_id);
     // The configured client overrides a declaration, like --client-id does.
     undeclared.oauth_client_id = "declared-client";
-    const overridden = try prepareProfileWith(&undeclared, .{}, "app_installation");
+    const overridden = try prepareProfileWith(&undeclared, .{ .state_root = "" }, "app_installation");
     try std.testing.expectEqual(ClientIdSource.configured, overridden.client_id_source);
     try std.testing.expectEqualStrings("app_installation", overridden.client_id);
-    const declared = try prepareProfileWith(&undeclared, .{}, null);
+    const declared = try prepareProfileWith(&undeclared, .{ .state_root = "" }, null);
     try std.testing.expectEqual(ClientIdSource.declared, declared.client_id_source);
     try std.testing.expectEqualStrings("declared-client", declared.client_id);
 }

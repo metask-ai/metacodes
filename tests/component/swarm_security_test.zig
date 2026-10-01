@@ -29,7 +29,7 @@ fn sleepMs(ms: u32) void {
 fn setup(a: std.mem.Allocator, home_buf: []u8, url: []const u8) !swctx.SwarmContext {
     const home = cc.util_fs.testing.uniqueDir(home_buf, "cc-zig-sw4");
     try cc.util_fs.mkdirParents(home);
-    return swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
+    return swctx.SwarmContext{ .allocator = a, .state_root = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
 }
 
 test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
@@ -48,9 +48,9 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
 
     var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
-    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
+    defer cc.util_fs.testing.rmrfBestEffort(sw.state_root); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
-    const home = sw.home;
+    const home = sw.state_root;
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
@@ -102,7 +102,7 @@ test "L2 SW4 A2: 'team-lead' 是保留名,不能 spawn 冒充队友" {
     const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw4-reserved");
     try cc.util_fs.mkdirParents(home);
     defer cc.util_fs.testing.rmrfBestEffort(home);
-    var sw = swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .model = "m" };
+    var sw = swctx.SwarmContext{ .allocator = a, .state_root = home, .api_key = "k", .model = "m" };
     defer sw.deinit();
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .swarm = &sw };
     a.free(try swtools.executeTeamCreate(&ctx, "{\"name\":\"proj\"}"));
@@ -129,9 +129,9 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
 
     var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
-    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
+    defer cc.util_fs.testing.rmrfBestEffort(sw.state_root); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
-    const home = sw.home;
+    const home = sw.state_root;
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
@@ -246,11 +246,11 @@ test "L2 SW4 MED-1: 仍在跑的 teammate 自发 shutdown_approved 不摘牌(防
 
     var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
-    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
+    defer cc.util_fs.testing.rmrfBestEffort(sw.state_root); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
     srv.gateNextResponse();
     defer srv.releaseGatedResponse(); // release before sw.deinit joins teammate
-    const home = sw.home;
+    const home = sw.state_root;
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .api_client = &client, .tool_defs = empty_defs, .permission_ctx = @constCast(&perm), .agents = &agents, .swarm = &sw, .parent_model = "claude-sonnet-4-20250514" };
@@ -293,9 +293,9 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
     try agents.loadFromStandardPaths("");
     var home_buf: [256]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
-    defer cc.util_fs.testing.rmrfBestEffort(sw.home); // 声明在 deinit 之前 → deinit 之后才删整棵
+    defer cc.util_fs.testing.rmrfBestEffort(sw.state_root); // 声明在 deinit 之前 → deinit 之后才删整棵
     defer sw.deinit();
-    const home = sw.home;
+    const home = sw.state_root;
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .api_client = &client, .tool_defs = empty_defs, .permission_ctx = @constCast(&perm), .agents = &agents, .swarm = &sw, .parent_model = "claude-sonnet-4-20250514" };
@@ -339,7 +339,7 @@ test "L2 SW4 C: orphan 清理(lead deinit 删会话 team 目录)" {
     try cc.util_fs.mkdirParents(home);
     defer cc.util_fs.testing.rmrfBestEffort(home);
 
-    var sw = swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .model = "m", .provider_kind = .anthropic };
+    var sw = swctx.SwarmContext{ .allocator = a, .state_root = home, .api_key = "k", .model = "m", .provider_kind = .anthropic };
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .swarm = &sw };
     a.free(try swtools.executeTeamCreate(&ctx, "{\"name\":\"proj\"}"));
     // config.json 存在(目录建好)。

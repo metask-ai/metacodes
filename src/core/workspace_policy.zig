@@ -17,6 +17,10 @@ pub const ShellPolicy = enum {
 pub const Config = struct {
     root: []const u8,
     home: []const u8 = "",
+    /// Where this session keeps metacodes state (agentcore sessions, KG,
+    /// worktrees, telemetry). The host decides; "" = `<home>/.metacodes`, the
+    /// layout every host had before the state root existed.
+    state_root: []const u8 = "",
     shell: ShellPolicy = .disabled,
 };
 
@@ -24,6 +28,7 @@ pub const WorkspacePolicy = struct {
     allocator: std.mem.Allocator,
     root: []u8,
     home: []u8,
+    state_root: []u8,
     shell: ShellPolicy,
     sandbox_settings: sandbox_config.SandboxSettings,
 
@@ -36,11 +41,18 @@ pub const WorkspacePolicy = struct {
         if (!std.fs.path.isAbsolute(home_source)) return error.InvalidWorkspaceHome;
         const home = try allocator.dupe(u8, home_source);
         errdefer allocator.free(home);
+        if (config.state_root.len > 0 and !std.fs.path.isAbsolute(config.state_root)) return error.InvalidWorkspaceStateRoot;
+        const state_root = if (config.state_root.len > 0)
+            try allocator.dupe(u8, config.state_root)
+        else
+            try @import("../util/state_root.zig").legacyDefault(allocator, home);
+        errdefer allocator.free(state_root);
 
         return .{
             .allocator = allocator,
             .root = root,
             .home = home,
+            .state_root = state_root,
             .shell = config.shell,
             .sandbox_settings = .{
                 .enabled = config.shell == .sandboxed,
@@ -52,6 +64,7 @@ pub const WorkspacePolicy = struct {
     }
 
     pub fn deinit(self: *WorkspacePolicy) void {
+        self.allocator.free(self.state_root);
         self.allocator.free(self.home);
         self.allocator.free(self.root);
         self.* = undefined;

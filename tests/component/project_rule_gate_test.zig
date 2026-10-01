@@ -272,28 +272,14 @@ const RejectDispatchStartSink = struct {
     }
 };
 
-fn parseHex(value: []const u8) ?[64]u8 {
-    if (value.len != 64) return null;
-    var result: [64]u8 = undefined;
-    for (value, 0..) |byte, index| {
-        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return null;
-        result[index] = byte;
-    }
-    return result;
-}
-
-fn testKernel() ?cc.project_harness_runtime.Config {
+fn testKernel() !?cc.project_harness_runtime.Config {
     if (builtin.os.tag == .windows) return null;
-    const path_raw = std.c.getenv("METACODES_TEST_PROJECT_KERNEL_PATH") orelse return null;
-    const hash_raw = std.c.getenv("METACODES_TEST_PROJECT_KERNEL_SHA256") orelse return null;
-    const path = std.mem.span(path_raw);
-    const hash = parseHex(std.mem.span(hash_raw)) orelse return null;
-    if (!std.fs.path.isAbsolute(path)) return null;
-    return .{ .checker_path = path, .expected_sha256 = hash };
+    const kernel = (try cc.formal_test_kernel.resolve(std.testing.io, .project)) orelse return null;
+    return .{ .checker_path = kernel.path, .expected_sha256 = kernel.expected_sha256 };
 }
 
 test "L2 Lean-selected source-CAS rewrites existing Write through one host-synthesized exact Edit" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -385,7 +371,7 @@ test "L2 Lean-selected source-CAS rewrites existing Write through one host-synth
 }
 
 test "L2 malformed Write cannot be normalized by source-CAS lowering" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -489,7 +475,7 @@ test "L2 malformed Write cannot be normalized by source-CAS lowering" {
 }
 
 test "L2 host synthesis rejects non-UTF8 source without starting a dispatch" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -558,7 +544,7 @@ test "L2 host synthesis rejects non-UTF8 source without starting a dispatch" {
 }
 
 test "L2 execution policy can reject synthesized Edit with zero file effect" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -624,7 +610,7 @@ test "L2 execution policy can reject synthesized Edit with zero file effect" {
 }
 
 test "L2 rejected auto-recovery dispatch start cancels inflight authorization" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -681,7 +667,7 @@ test "L2 rejected auto-recovery dispatch start cancels inflight authorization" {
 }
 
 test "L2 source drift between synthesis selection and recovery pre starts no dispatch" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -751,7 +737,7 @@ test "L2 source drift between synthesis selection and recovery pre starts no dis
 }
 
 test "L2 source drift after recovery admission is reobserved without overwrite" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -871,7 +857,7 @@ test "L2 admitted new-file Write cannot truncate a target created after observat
 }
 
 test "L2 Lean-admitted exact Edit refuses a source changed before native dispatch" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -985,7 +971,7 @@ test "L2 Lean-admitted exact Edit refuses a source changed before native dispatc
 }
 
 test "L2 exact recovery preserves content CAS across the blocked Write and later Edit" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1078,7 +1064,7 @@ test "L2 exact recovery preserves content CAS across the blocked Write and later
 }
 
 test "L2 exact recovery can fill an existing empty file without ordinary empty-needle semantics" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1164,7 +1150,7 @@ test "L2 exact recovery can fill an existing empty file without ordinary empty-n
 }
 
 test "L2 malformed unrelated Edit remains a tool error while an exact obligation is pending" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1244,7 +1230,7 @@ test "L2 malformed unrelated Edit remains a tool error while an exact obligation
 }
 
 test "L2 rejected dispatch start cancels exact recovery inflight state" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1747,7 +1733,7 @@ fn loadAndDispatchProbe(
 }
 
 test "L2 promoted Lean deny rule blocks the real dispatcher before side effects" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2087,7 +2073,7 @@ fn promoteFixture(
 }
 
 test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edit" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2437,7 +2423,7 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
 }
 
 test "L2 shadow project rule records Lean blocks without changing real dispatch" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2562,7 +2548,7 @@ test "L2 shadow project rule records Lean blocks without changing real dispatch"
 }
 
 test "L2 active project rules fail closed before dispatch on artifact or kernel drift" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2715,7 +2701,7 @@ test "L2 active project rules fail closed before dispatch on artifact or kernel 
 }
 
 test "L2 normal RunControl finish publishes a bound operational observer" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2847,7 +2833,7 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
 }
 
 test "L2 extending an active bundle reattests the prior promotion before mutation" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3148,7 +3134,7 @@ fn syntheticRecoveryWithEditAndBash(
 }
 
 test "L2 multi-target recovery keeps obligations independent and journals one mixed checker batch" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3340,7 +3326,7 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
 }
 
 test "L2 exact recovery obligation capacity fails closed before a new target" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3410,7 +3396,7 @@ test "L2 exact recovery obligation capacity fails closed before a new target" {
 }
 
 test "L2 multi-rule recovery follows the first blocking Lean verdict only" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3481,13 +3467,8 @@ test "L2 multi-rule recovery follows the first blocking Lean verdict only" {
     }
 }
 
-const BatchRuntimeStats = struct {
-    elapsed_ns: u64,
-    checker_elapsed_ns: u64,
-};
-
-fn runBatchRuntimeFixture(rule_count: usize) !BatchRuntimeStats {
-    const config = testKernel() orelse return error.SkipZigTest;
+fn runBatchRuntimeFixture(rule_count: usize) !void {
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3585,26 +3566,22 @@ fn runBatchRuntimeFixture(rule_count: usize) !BatchRuntimeStats {
     try std.testing.expectEqual(rule_count, pre_count);
     try std.testing.expectEqual(rule_count, post_count);
     try std.testing.expect(!std.mem.eql(u8, &(pre_call orelse unreachable), &(post_call orelse unreachable)));
-    const stats = BatchRuntimeStats{
-        .elapsed_ns = @intCast(@max(elapsed, 0)),
-        .checker_elapsed_ns = pre_elapsed + post_elapsed,
-    };
+    // Wall time is reported, never asserted (see the 64-rule test).
     if (std.c.getenv("METACODES_BENCH_REPORT") != null) {
         std.debug.print("batch-runtime-metric rules={d} execute_ms={d:.3} checker_ms={d:.3}\n", .{
             rule_count,
-            @as(f64, @floatFromInt(stats.elapsed_ns)) / std.time.ns_per_ms,
-            @as(f64, @floatFromInt(stats.checker_elapsed_ns)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(@max(elapsed, 0))) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(pre_elapsed + post_elapsed)) / std.time.ns_per_ms,
         });
     }
-    return stats;
 }
 
 test "L2 project rule batch runtime uses two checker calls for 1 rule" {
-    _ = try runBatchRuntimeFixture(1);
+    try runBatchRuntimeFixture(1);
 }
 
 test "L2 project rule batch runtime uses two checker calls for 4 rules" {
-    _ = try runBatchRuntimeFixture(4);
+    try runBatchRuntimeFixture(4);
 }
 
 test "L2 target mismatch skips checker while retaining auditable dispatch filters" {
@@ -3704,7 +3681,7 @@ test "L2 target mismatch skips checker while retaining auditable dispatch filter
 }
 
 test "L2 exact recovery retains source and Edit rules while pruning unrelated tools" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3800,7 +3777,7 @@ test "L2 exact recovery retains source and Edit rules while pruning unrelated to
 }
 
 test "L2 repeated identical signals retain distinct physical checker calls" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3895,14 +3872,19 @@ test "L2 repeated identical signals retain distinct physical checker calls" {
 }
 
 test "L2 project rule batch runtime uses two checker calls for 16 rules" {
-    _ = try runBatchRuntimeFixture(16);
+    try runBatchRuntimeFixture(16);
 }
 
 test "L2 project rule batch runtime uses two checker calls for 64 rules" {
-    const stats = try runBatchRuntimeFixture(64);
-    // A generous regression ceiling catches accidental reintroduction of 128
-    // process spawns without turning a correctness test into a microbenchmark.
-    try std.testing.expect(stats.elapsed_ns < 750 * std.time.ns_per_ms);
+    // The fixture proves the two calls from the journal, not the clock: every
+    // decision must carry checker_batch_size == 64 and share its phase's one
+    // checker call identity. A gate back on one kernel process per rule
+    // records batch size 1 and per-request identities and fails there on any
+    // machine. A wall-clock ceiling measured something else: the runtime
+    // hashes the whole kernel before each spawn, which in this Debug test
+    // binary is ~0.55 s per call on Linux against ~10 ms for the two checker
+    // runs, whatever the rule count.
+    try runBatchRuntimeFixture(64);
 }
 
 test "L2 malformed Lean batch verdict fails before the real dispatcher" {
@@ -3988,7 +3970,7 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
 
 test "L2 exact recovery checker fault fails closed before Edit side effects" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const real_kernel = testKernel() orelse return error.SkipZigTest;
+    const real_kernel = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4083,7 +4065,7 @@ test "L2 exact recovery checker fault fails closed before Edit side effects" {
 
 test "L2 same-cardinality batch binding drift has no durable verdict and no dispatch" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const real_kernel = testKernel() orelse return error.SkipZigTest;
+    const real_kernel = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4159,7 +4141,7 @@ test "L2 same-cardinality batch binding drift has no durable verdict and no disp
 }
 
 test "L2 promoted Lean post rule admits matched Write and poisons unavailable reobservation" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4415,7 +4397,7 @@ test "L2 an Edit that rewrites an existing file under Write-only rules reports a
     // rule plane admits (nothing claims Edit) — correct — but the governed
     // effect still happened with zero coverage, and that must be reported
     // rather than reconstructed from transcripts afterwards.
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4497,7 +4479,7 @@ test "L2 a covered dispatch and a harmless uncovered dispatch report no coverage
     // Negative side: the signal must not fire merely because a tool is
     // uncovered. Creating a new file is not the governed effect class, and a
     // Write is covered by the active rules, so neither may report a gap.
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4556,6 +4538,7 @@ test "L2 a covered dispatch and a harmless uncovered dispatch report no coverage
         try std.testing.expect(err == error.FileNotFound or err == error.NotRead);
         break :blk cc.tool_exec.OneResult{ .host_fatal = .{} };
     };
+    defer missing.freeFileChanges(allocator);
     switch (missing) {
         .done => |done| {
             if (done.content) |bytes| allocator.free(bytes);
@@ -4635,7 +4618,7 @@ test "L2 effect-class rule reaches the checker for Edit and is pruned for Bash" 
     // effect-class rule must route that same Edit INTO the checker — and must
     // still statically prune tools outside the mutating roster (Bash), so the
     // pruning fast path keeps its proof-backed semantics.
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4773,7 +4756,7 @@ test "L2 verify-only rule admits an oversized new-file Write and reports the ove
     // missing path, under the exact static-bundle rule shape.  The dispatch
     // must run; the envelope overflow must surface as an observation with
     // the real numbers; nothing may block.
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

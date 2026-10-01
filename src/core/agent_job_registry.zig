@@ -327,6 +327,8 @@ pub const SpawnParams = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     cwd_abs: []const u8 = "",
     home_dir: []const u8 = "",
+    /// Host state root; job-owned copy in JobInput (survives the parent turn).
+    state_root: []const u8 = "",
     artifact_root: []const u8 = "",
     tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
     file_change_journal: ?*@import("file_change.zig").Journal = null,
@@ -374,6 +376,7 @@ const JobInput = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings,
     cwd_abs: []u8,
     home_dir: []u8,
+    state_root: []u8,
     artifact_root: []u8,
     tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics,
     file_change_journal: ?*@import("file_change.zig").Journal,
@@ -415,6 +418,7 @@ const JobInput = struct {
         a.free(self.parent_model);
         a.free(self.cwd_abs); // task#12
         a.free(self.home_dir);
+        a.free(self.state_root);
         a.free(self.artifact_root);
         for (self.additional_dirs) |d| a.free(d);
         a.free(self.additional_dirs);
@@ -814,6 +818,8 @@ pub const AgentJobRegistry = struct {
         errdefer if (!committed) a.free(cwd_owned);
         const home_owned = try a.dupe(u8, p.home_dir);
         errdefer if (!committed) a.free(home_owned);
+        const state_root_owned = try a.dupe(u8, p.state_root);
+        errdefer if (!committed) a.free(state_root_owned);
         const artifact_root_owned = try a.dupe(u8, p.artifact_root);
         errdefer if (!committed) a.free(artifact_root_owned);
         const adirs_owned = try a.alloc([]u8, p.additional_dirs.len);
@@ -871,6 +877,7 @@ pub const AgentJobRegistry = struct {
             .sandbox = p.sandbox, // task#12:borrow(App-lifetime)
             .cwd_abs = cwd_owned,
             .home_dir = home_owned,
+            .state_root = state_root_owned,
             .artifact_root = artifact_root_owned,
             .tool_result_metrics = p.tool_result_metrics,
             .file_change_journal = p.file_change_journal,
@@ -1640,6 +1647,7 @@ fn jobThreadMain(input: *JobInput) void {
         .sandbox = input.sandbox,
         .cwd_abs = input.cwd_abs,
         .home_dir = input.home_dir,
+        .state_root = input.state_root,
         .artifact_root = input.artifact_root,
         .tool_result_metrics = input.tool_result_metrics,
         .file_change_journal = input.file_change_journal,

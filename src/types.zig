@@ -164,6 +164,12 @@ pub const Config = struct {
     /// `--record <dir>` / `METACODES_RECORD_DIR`:把每次请求 body + SSE 响应原始字节
     /// dump 到该目录(cassette),供 replay 确定性复现。null = 不录制。
     record_dir: ?[]const u8 = null,
+    /// `--state-dir <dir>`: this process's state root (util/state_root.zig),
+    /// above METACODES_HOME and the install's etc/metacodes/install.json.
+    state_dir: ?[]const u8 = null,
+    /// The resolved state root the host hands to every subsystem ("" = none,
+    /// as with a missing $HOME). Set by src/main.zig, never by core code.
+    state_root: []const u8 = "",
     /// LLM 后端协议选择。默认 anthropic;`METACODES_PROVIDER=openai` 或 model 前缀
     /// gpt*/o1*/o3* → openai(讲 chat/completions 协议)。**只在 App 组装层据此选 Client,
     /// core/UI 零感知**(多 Provider 重构 P3)。

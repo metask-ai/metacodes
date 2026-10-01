@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
-const paths = @import("platform").paths;
 const fs_util = @import("../util/fs.zig");
 const json_util = @import("../util/json.zig");
 
@@ -26,11 +25,12 @@ pub const Record = struct {
     wall_elapsed_ms: u64 = 0,
 };
 
-pub fn ledgerPath(allocator: std.mem.Allocator) ![]u8 {
+/// `METACODES_LEDGER_DIR/metask.ndjson`, else `<state_root>/ledger/metask.ndjson`.
+pub fn ledgerPath(allocator: std.mem.Allocator, state_root: []const u8) ![]u8 {
     if (std.c.getenv("METACODES_LEDGER_DIR")) |raw|
         return std.fmt.allocPrint(allocator, "{s}/metask.ndjson", .{std.mem.trimEnd(u8, std.mem.span(raw), "/")});
-    const home = paths.homeDir() orelse return error.NoHome;
-    return std.fmt.allocPrint(allocator, "{s}/.metacodes/ledger/metask.ndjson", .{home});
+    if (state_root.len == 0) return error.NoHome;
+    return std.fs.path.join(allocator, &.{ state_root, "ledger", "metask.ndjson" });
 }
 
 pub fn render(allocator: std.mem.Allocator, record: Record) ![]u8 {
@@ -61,8 +61,8 @@ pub fn render(allocator: std.mem.Allocator, record: Record) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-pub fn append(allocator: std.mem.Allocator, record: Record) !void {
-    const path = try ledgerPath(allocator);
+pub fn append(allocator: std.mem.Allocator, state_root: []const u8, record: Record) !void {
+    const path = try ledgerPath(allocator, state_root);
     defer allocator.free(path);
     const dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
     try fs_util.mkdirParents(dir);
@@ -81,8 +81,8 @@ pub fn append(allocator: std.mem.Allocator, record: Record) !void {
     }
 }
 
-pub fn read(allocator: std.mem.Allocator) ![]u8 {
-    const path = try ledgerPath(allocator);
+pub fn read(allocator: std.mem.Allocator, state_root: []const u8) ![]u8 {
+    const path = try ledgerPath(allocator, state_root);
     defer allocator.free(path);
     const z = try allocator.dupeZ(u8, path);
     defer allocator.free(z);

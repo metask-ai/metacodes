@@ -473,6 +473,9 @@ pub const ToolContext = struct {
     additional_dirs: []const []const u8 = &.{},
     /// HOME(sandbox profile ~/ 展开)。
     home_dir: []const u8 = "",
+    /// This install's state root (util/state_root.zig), injected by the host:
+    /// worktrees, KG, telemetry and the Metask ledger live under it. "" = none.
+    state_root: []const u8 = "",
     /// Session-scoped root for content-addressed tool-result artifacts.
     /// Empty means persistence/recovery is unavailable and projection must
     /// return an explicit non-recoverable fallback envelope.
@@ -509,7 +512,7 @@ pub const ToolContext = struct {
     /// 图片照旧进 tool_result,由序列化层按方言发原生块或占位文本。
     image_input_supported: ?bool = null,
     /// 当前 provider 的模型档位表(low/mid/high → {model, effort};App 启动时按
-    /// provider_kind 从 ~/.metacodes/config.json 选定)。null = 未配置:档位名
+    /// provider_kind 从 <state root>/config.json 选定)。null = 未配置:档位名
     /// 一律 inherit 父模型,绝不回退硬编码模型 ID。
     model_tiers: ?*const @import("../api/model_tiers.zig").ProviderTiers = null,
     /// Skill 集合(供 subagent preload_skills 字段读取 skill body)。

@@ -1,4 +1,4 @@
-//! 用户配置持久化：~/.metacodes/config.json
+//! 用户配置持久化：<state root>/config.json
 //!
 //! 字段（全部可选，缺失用默认）：
 //!   {
@@ -31,14 +31,14 @@ pub const FileConfig = struct {
     }
 };
 
-/// Schema version of `~/.metacodes/config.json` this build reads and writes
+/// Schema version of `<state root>/config.json` this build reads and writes
 /// (doc/API.md); `--version --json` reports it as `contract.config_schema_version`
 /// and the release manifest carries the same number (`src/release_contract.zig`).
 pub const SCHEMA_VERSION: u32 = @import("../release_contract.zig").CONFIG_SCHEMA_VERSION;
 
-/// 从 ~/.metacodes/config.json 加载。文件不存在返回全默认（null 字段）。
-pub fn loadFromHome(allocator: std.mem.Allocator) !FileConfig {
-    const path = try homePath(allocator);
+/// 从 <state_root>/config.json 加载。文件不存在返回全默认（null 字段）。
+pub fn loadFromHome(allocator: std.mem.Allocator, state_root: []const u8) !FileConfig {
+    const path = try homePath(allocator, state_root);
     defer allocator.free(path);
     return loadFromFile(allocator, path);
 }
@@ -65,9 +65,9 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !FileConfig 
     return parseJson(allocator, contents.items);
 }
 
-/// 保存到 ~/.metacodes/config.json（覆盖写 + fsync）。
-pub fn saveToHome(config: FileConfig, allocator: std.mem.Allocator) !void {
-    const path = try homePath(allocator);
+/// 保存到 <state_root>/config.json（覆盖写 + fsync）。
+pub fn saveToHome(config: FileConfig, allocator: std.mem.Allocator, state_root: []const u8) !void {
+    const path = try homePath(allocator, state_root);
     defer allocator.free(path);
     return saveToFile(config, allocator, path);
 }
@@ -209,9 +209,9 @@ fn parseBoolField(data: []const u8, field: []const u8) ?bool {
     return null;
 }
 
-fn homePath(allocator: std.mem.Allocator) ![]u8 {
-    const home = @import("platform").paths.homeDir() orelse return error.NoHome; // HOME / Windows USERPROFILE
-    return std.fmt.allocPrint(allocator, "{s}/.metacodes/config.json", .{home});
+fn homePath(allocator: std.mem.Allocator, state_root: []const u8) ![]u8 {
+    if (state_root.len == 0) return error.NoHome;
+    return std.fs.path.join(allocator, &.{ state_root, "config.json" });
 }
 
 // ============================================================================

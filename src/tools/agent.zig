@@ -80,7 +80,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             ctx.allocator,
             d.name,
             d.memory_scope,
-            ctx.home_dir,
+            ctx.state_root,
             ctx.project_dir,
         );
     }
@@ -98,7 +98,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (d.isolation == .worktree and !out_of_process_teammate) {
             agent_worktree = try @import("../agents/isolation.zig").Worktree.create(
                 std.heap.c_allocator,
-                ctx.home_dir,
+                ctx.state_root,
                 ctx.project_dir,
                 ctx.abort,
             );
@@ -254,6 +254,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .sandbox = ctx.sandbox,
             .cwd_abs = effective_cwd,
             .home_dir = ctx.home_dir,
+            .state_root = ctx.state_root,
             .additional_dirs = effective_additional_dirs,
             .memory_dir = memory_dir,
             // def.tools 是意图白名单；真正可用集合还受父 arm/capability 与永久禁用集约束。
@@ -283,8 +284,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             var name_buf: [64]u8 = undefined;
             const name_s = @import("../swarm/team.zig").sanitizeAgentName(name, &name_buf);
             var wt_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const wt: []const u8 = if (ctx.home_dir.len > 0 and ctx.project_dir.len > 0)
-                (std.fmt.bufPrint(&wt_buf, "{s}/.metacodes/worktrees/{s}-{s}", .{ ctx.home_dir, sw.team_sanitized, name_s }) catch "")
+            const wt: []const u8 = if (ctx.state_root.len > 0 and ctx.project_dir.len > 0)
+                (std.fmt.bufPrint(&wt_buf, "{s}/worktrees/{s}-{s}", .{ ctx.state_root, sw.team_sanitized, name_s }) catch "")
             else
                 "";
             // ctx.lsp 就是 lead 的 LSP 装配结果(--no-lsp → null),据此把逃生口带过进程边界。
@@ -385,6 +386,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .sandbox = ctx.sandbox,
             .cwd_abs = effective_cwd,
             .home_dir = ctx.home_dir,
+            .state_root = ctx.state_root,
             .artifact_root = ctx.artifact_root,
             .tool_result_metrics = ctx.tool_result_metrics,
             .file_change_journal = ctx.file_change_journal,
@@ -510,6 +512,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .cwd_abs = effective_cwd,
             .resolve_relative_paths = agent_worktree != null,
             .home_dir = ctx.home_dir,
+            .state_root = ctx.state_root,
             .artifact_root = ctx.artifact_root,
             .tool_result_metrics = ctx.tool_result_metrics,
             .file_change_journal = ctx.file_change_journal,

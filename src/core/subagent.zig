@@ -109,6 +109,8 @@ pub const SpawnOptions = struct {
     cwd_abs: []const u8 = "",
     resolve_relative_paths: bool = false,
     home_dir: []const u8 = "",
+    /// Host state root, propagated to the child's ToolContext and KG clone.
+    state_root: []const u8 = "",
     /// Parent session-owned content-addressed result store. Synchronous
     /// children borrow it for the duration of the run; background callers
     /// must pass a job-owned copy.
@@ -209,7 +211,7 @@ pub fn spawnAgentSink(
     // 变成“未配置”；版本/环境不就绪则保留 degraded clone，让工具返回结构化原因。
     var child_kg: ?@import("../kg/client.zig").KgClient = null;
     if (opts.kg) |parent_kg| {
-        child_kg = try parent_kg.cloneForThread(allocator, opts.home_dir);
+        child_kg = try parent_kg.cloneForThread(allocator, opts.state_root);
         child_kg.?.ensureReady();
     }
     defer if (child_kg) |*kg| kg.deinit();
@@ -259,6 +261,7 @@ pub fn spawnAgentSink(
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
+            .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,
             .tool_result_metrics = opts.tool_result_metrics,
             .file_change_journal = opts.file_change_journal,

@@ -13,6 +13,7 @@ const lifecycle = @import("rule_lifecycle.zig");
 const spec_mod = @import("project_rule_spec.zig");
 const journal_mod = @import("tool_observation_journal.zig");
 const kernel = @import("../formal/project_harness_runtime.zig");
+const test_kernel = @import("../formal/test_kernel.zig");
 
 pub const REPLAY_CORPUS_SCHEMA = "metacodes-project-rule-replay-corpus-v2";
 pub const REPLAY_RESULT_SCHEMA = "metacodes-project-rule-replay-result-v2";
@@ -817,7 +818,7 @@ fn readExact(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 test "replay and shadow require mixed cases and a completed grounded interval" {
-    const config = testKernelConfig() orelse return error.SkipZigTest;
+    const config = (try testKernelConfig()) orelse return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -978,11 +979,7 @@ test "replay and shadow require mixed cases and a completed grounded interval" {
     try std.testing.expectEqual(lifecycle.Stage.shadow_passed, loaded.stage);
 }
 
-fn testKernelConfig() ?kernel.Config {
-    const path_raw = std.c.getenv("METACODES_TEST_PROJECT_KERNEL_PATH") orelse return null;
-    const hash_raw = std.c.getenv("METACODES_TEST_PROJECT_KERNEL_SHA256") orelse return null;
-    const hash = parseHex(std.mem.span(hash_raw)) orelse return null;
-    const path = std.mem.span(path_raw);
-    if (!std.fs.path.isAbsolute(path)) return null;
-    return .{ .checker_path = path, .expected_sha256 = hash };
+fn testKernelConfig() !?kernel.Config {
+    const resolved = (try test_kernel.resolve(std.testing.io, .project)) orelse return null;
+    return .{ .checker_path = resolved.path, .expected_sha256 = resolved.expected_sha256 };
 }

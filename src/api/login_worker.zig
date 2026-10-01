@@ -180,7 +180,7 @@ test "login worker: a loopback login that never gets its callback is cancelled t
     const profile = testProfile("worker-loopback", "http://127.0.0.1:1/token", "http://127.0.0.1:1/authorize", null);
     // A test must never launch a browser; port 0 keeps a developer's real
     // login server out of the way.
-    const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "worker-client" });
+    const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "worker-client", .state_root = "" });
 
     var worker = LoginWorker.init(a, io_runtime.io(), prepared);
     try worker.start();
@@ -204,7 +204,7 @@ test "login worker: the transcript is bounded and says when it was cut" {
     var io_runtime = std.Io.Threaded.init(a, .{});
     defer io_runtime.deinit();
     const profile = testProfile("worker-bounded", "http://127.0.0.1:1/token", "http://127.0.0.1:1/authorize", null);
-    const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "worker-client" });
+    const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "worker-client", .state_root = "" });
     var worker = LoginWorker.init(a, io_runtime.io(), prepared);
 
     const sink = worker.notify();

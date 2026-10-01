@@ -204,7 +204,7 @@ test "L2 provider login: a loopback PKCE grant becomes a durable per-provider lo
 
     const provider_id = cc.provider_ids.Slug.lit("openai");
     {
-        var session = try provider_oauth.Session.initHome(a, provider_id);
+        var session = try provider_oauth.Session.initHome(a, "", provider_id);
         defer session.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -213,7 +213,7 @@ test "L2 provider login: a loopback PKCE grant becomes a durable per-provider lo
         try session.importOutcome(outcome, 1_000);
     }
 
-    var reloaded = try provider_oauth.Session.initHome(a, provider_id);
+    var reloaded = try provider_oauth.Session.initHome(a, "", provider_id);
     defer reloaded.deinit();
     try std.testing.expect(try reloaded.load());
     try std.testing.expectEqualStrings("provider-access", reloaded.tokens.?.access_token);
@@ -325,7 +325,7 @@ test "L2 provider login: the recorded client is the one the refresh grant presen
 
     const provider_id = cc.provider_ids.Slug.lit("openai");
     {
-        var session = try provider_oauth.Session.initHome(a, provider_id);
+        var session = try provider_oauth.Session.initHome(a, "", provider_id);
         defer session.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -336,7 +336,7 @@ test "L2 provider login: the recorded client is the one the refresh grant presen
         try session.importOutcome(outcome, 1_000);
     }
 
-    var session = try provider_oauth.Session.initHome(a, provider_id);
+    var session = try provider_oauth.Session.initHome(a, "", provider_id);
     defer session.deinit();
     try std.testing.expect(try session.load());
     // Precedence: the recorded client wins over what the profile declares,
@@ -403,7 +403,7 @@ test "L2 provider login: an imported token response records the installation's c
         cc.loginProviderWithTokenResponse(a, openai, token_json, null, "app_installation"),
     );
     {
-        var session = try provider_oauth.Session.initHome(a, openai.id);
+        var session = try provider_oauth.Session.initHome(a, "", openai.id);
         defer session.deinit();
         try std.testing.expect(try session.load());
         try std.testing.expectEqualStrings("app_installation", session.clientIdFor(openai.oauth_client_id));
@@ -414,7 +414,7 @@ test "L2 provider login: an imported token response records the installation's c
         @as(u8, 0),
         cc.loginProviderWithTokenResponse(a, openai, token_json, "explicit-client", "app_installation"),
     );
-    var session = try provider_oauth.Session.initHome(a, openai.id);
+    var session = try provider_oauth.Session.initHome(a, "", openai.id);
     defer session.deinit();
     try std.testing.expect(try session.load());
     try std.testing.expectEqualStrings("explicit-client", session.clientIdFor(openai.oauth_client_id));
@@ -445,7 +445,7 @@ test "L2 provider login: an imported token response records the explicit client"
         cc.loginProviderWithTokenResponse(a, openai, token_json, "explicit-client", null),
     );
 
-    var session = try provider_oauth.Session.initHome(a, openai.id);
+    var session = try provider_oauth.Session.initHome(a, "", openai.id);
     defer session.deinit();
     try std.testing.expect(try session.load());
     try std.testing.expectEqualStrings("imported-access", session.tokens.?.access_token);
@@ -484,7 +484,7 @@ test "L2 provider login: a provider that accepts no OAuth kind is refused before
         @as(u8, 2),
         cc.loginProviderWithTokenResponse(a, &key_only, token_json, "some-client", null),
     );
-    var session = try provider_oauth.Session.initHome(a, key_only.id);
+    var session = try provider_oauth.Session.initHome(a, "", key_only.id);
     defer session.deinit();
     try std.testing.expect(!(try session.load()));
 }
@@ -544,6 +544,7 @@ const InteractiveRun = struct {
 
     fn run(self: *InteractiveRun) void {
         self.result = provider_login.loginInteractive(self.allocator, self.io, self.host, "relay", .{
+            .state_root = "",
             .method = .loopback,
             .open_browser = false,
             .port = 0,
@@ -553,7 +554,7 @@ const InteractiveRun = struct {
 };
 
 fn expectNoLogin(allocator: std.mem.Allocator, comptime id: []const u8) !void {
-    var session = try provider_oauth.Session.initHome(allocator, cc.provider_ids.Slug.lit(id));
+    var session = try provider_oauth.Session.initHome(allocator, "", cc.provider_ids.Slug.lit(id));
     defer session.deinit();
     try std.testing.expect(!(try session.load()));
 }
@@ -612,7 +613,7 @@ test "loginInteractive persists the login and reports through the notify sink" {
     const exchanged = token_server.lastRequest() orelse return error.NoTokenRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, exchanged.body(), "client_id=explicit-client") != null);
     // The durable import both login paths end in.
-    var reloaded = try provider_oauth.Session.initHome(a, cc.provider_ids.Slug.lit("relay"));
+    var reloaded = try provider_oauth.Session.initHome(a, "", cc.provider_ids.Slug.lit("relay"));
     defer reloaded.deinit();
     try std.testing.expect(try reloaded.load());
     try std.testing.expectEqualStrings("relay-access", reloaded.tokens.?.access_token);
@@ -651,11 +652,11 @@ test "loginInteractive fails closed with typed errors and persists nothing" {
     var io_runtime = std.Io.Threaded.init(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
-    const no_browser: provider_login.Options = .{ .open_browser = false, .port = 0 };
+    const no_browser: provider_login.Options = .{ .open_browser = false, .port = 0, .state_root = "" };
 
     try std.testing.expectError(error.UnknownProvider, provider_login.loginInteractive(a, io, host, "nope", no_browser, quiet.notify()));
     try std.testing.expectError(error.ProviderHasNoTokenEndpoint, provider_login.loginInteractive(a, io, host, "keyonly", no_browser, quiet.notify()));
-    try std.testing.expectError(error.FlowUnavailable, provider_login.loginInteractive(a, io, host, "relay", .{ .method = .device_code, .open_browser = false, .port = 0 }, quiet.notify()));
+    try std.testing.expectError(error.FlowUnavailable, provider_login.loginInteractive(a, io, host, "relay", .{ .method = .device_code, .open_browser = false, .port = 0, .state_root = "" }, quiet.notify()));
     // The built-in openai profile declares no client id (an owner decision):
     // without --client-id the flow must not even start.
     try std.testing.expectError(error.ClientIdMissing, provider_login.loginInteractive(a, io, host, "openai", no_browser, quiet.notify()));
@@ -734,7 +735,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
 
     // What picker_host does on MissingCredentials: prepare (typed refusals
     // happen here), then run on the worker. No browser; kernel-chosen port.
-    const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client" });
+    const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client", .state_root = "" });
     var worker = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), prepared);
     try worker.start();
     defer worker.join();
@@ -756,7 +757,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
 
     // The whole point: the login is durable and carries the client, so the
     // retried commit finds a credential and later refreshes present it.
-    var reloaded = try provider_oauth.Session.initHome(a, profile.id);
+    var reloaded = try provider_oauth.Session.initHome(a, "", profile.id);
     defer reloaded.deinit();
     try std.testing.expect(try reloaded.load());
     try std.testing.expectEqualStrings("picker-access", reloaded.tokens.?.access_token);
@@ -772,7 +773,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
         .oauth_token_url = token_url,
         .oauth_authorize_url = "http://127.0.0.1:1/authorize",
     };
-    const cancelled_prepared = try provider_login.prepareProfile(&cancelled_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client" });
+    const cancelled_prepared = try provider_login.prepareProfile(&cancelled_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client", .state_root = "" });
     var cancelled = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), cancelled_prepared);
     try cancelled.start();
     defer cancelled.join();
@@ -781,7 +782,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
     if (!awaitWorker(&cancelled, workerSettled)) return error.WorkerNeverSettled;
     try std.testing.expectEqual(cc.api_login_worker.State.cancelled, cancelled.currentState());
     try std.testing.expect(token_server.requestCount() == 1);
-    var absent = try provider_oauth.Session.initHome(a, cancelled_profile.id);
+    var absent = try provider_oauth.Session.initHome(a, "", cancelled_profile.id);
     defer absent.deinit();
     try std.testing.expect(!(try absent.load()));
 
@@ -801,7 +802,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
         .oauth_token_url = garbage_url,
         .oauth_authorize_url = "http://127.0.0.1:1/authorize",
     };
-    const failing_prepared = try provider_login.prepareProfile(&failing_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client" });
+    const failing_prepared = try provider_login.prepareProfile(&failing_profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client", .state_root = "" });
     var failing = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), failing_prepared);
     try failing.start();
     defer failing.join();
@@ -813,7 +814,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
     if (!awaitWorker(&failing, workerSettled)) return error.WorkerNeverSettled;
     try std.testing.expectEqual(cc.api_login_worker.State.failed, failing.currentState());
     try std.testing.expectEqualStrings("InvalidTokenResponse", failing.failureName());
-    var not_stored = try provider_oauth.Session.initHome(a, failing_profile.id);
+    var not_stored = try provider_oauth.Session.initHome(a, "", failing_profile.id);
     defer not_stored.deinit();
     try std.testing.expect(!(try not_stored.load()));
 }

@@ -7,12 +7,44 @@ from pathlib import Path
 from scripts.verify_install_prefix import check, evaluate_daemon, evaluate_doctor, evaluate_kernels
 
 # The doctor always reports both kernels and the daemon; unpinned and absent is
-# the release shape.
+# the development-install shape.
 KERNELS_ABSENT = [
     {"name": "formal_kernel", "resolved_path": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
     {"name": "project_kernel", "resolved_path": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
     {"name": "tinykgd", "resolved_path": None, "expected_sha256": None, "match": None, "source": None, "provenance": None},
 ]
+
+
+RELEASE_FILES = (
+    "bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "share/licenses/metacodes-LICENSE",
+    "share/licenses/tinykg-LICENSE", "share/licenses/THIRD_PARTY_NOTICES.md", "share/doc/README.md",
+    "share/licenses/lean4-LICENSE", "share/licenses/gmp-COPYING.LESSERv3", "share/licenses/gmp-COPYINGv3",
+    "share/licenses/gmp-COPYINGv2", "share/licenses/libuv-LICENSE", "share/licenses/libuv-LICENSE-extra",
+    "share/doc/CHANGELOG-0.2.0-dev.md", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json",
+    "vendor/tinykg/tinykgd", "vendor/tinykg/tinykgd.provenance.json",
+    "libexec/metacodes/metacodes-formal-kernel", "libexec/metacodes/metacodes-formal-kernel.provenance.json",
+    "libexec/metacodes/metacodes-formal-kernel.build-receipt.json",
+    "libexec/metacodes/metacodes-project-kernel", "libexec/metacodes/metacodes-project-kernel.provenance.json",
+)
+
+
+def release_report(root, **overrides):
+    """The doctor report of a healthy v2 release prefix; `overrides` maps a
+    check name to the fields that differ."""
+    shipped = {
+        "ripgrep": "bin/rg",
+        "tinykg": "vendor/tinykg/tinykg",
+        "tinykgd": "vendor/tinykg/tinykgd",
+        "formal_kernel": "libexec/metacodes/metacodes-formal-kernel",
+        "project_kernel": "libexec/metacodes/metacodes-project-kernel",
+    }
+    checks = []
+    for name, path in shipped.items():
+        check = {"name": name, "resolved_path": str(root / path), "sha256": "ab" * 32, "expected_sha256": "ab" * 32,
+                 "match": True, "source": "adjacent", "provenance": True if name.endswith("_kernel") else None}
+        check.update(overrides.get(name, {}))
+        checks.append(check)
+    return {"checks": checks}
 
 
 class VerifyInstallPrefixTest(unittest.TestCase):
@@ -64,15 +96,13 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         self.assertEqual(evaluate_doctor(report, root), [])
 
     def test_release_doctor_requires_adjacent_ripgrep(self):
-        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
-        base = {"name": "tinykg", "resolved_path": str(root / "vendor/tinykg/tinykg"), "match": True, "source": "adjacent"}
-        report = {"checks": [{"name": "ripgrep", "resolved_path": str(root / "bin/rg"), "match": True, "source": "adjacent"}, base, *KERNELS_ABSENT]}
-        self.assertEqual(evaluate_doctor(report, root, release=True), [])
-        report["checks"][0]["source"] = "path"
+        root = self._make(RELEASE_FILES)
+        self.assertEqual(evaluate_doctor(release_report(root), root, release=True), [])
+        report = release_report(root, ripgrep={"source": "path", "expected_sha256": None, "match": None})
         findings = evaluate_doctor(report, root, release=True)
-        self.assertEqual(len(findings), 1)
-        self.assertIn("expected 'adjacent'", findings[0])
-        # Without --release the same report passes: a development install
+        self.assertEqual(len(findings), 2)
+        self.assertTrue(any("expected 'adjacent'" in finding for finding in findings))
+        # Without --release the ripgrep shape passes: a development install
         # resolves rg from PATH first.
         self.assertEqual(evaluate_doctor(report, root), [])
 
@@ -94,19 +124,34 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         self.assertTrue(any("expected true" in finding for finding in findings))
         self.assertEqual(evaluate_doctor({"nope": 1}, root), ["doctor: report has no checks array"])
 
-    def test_release_prefix_carries_licences_docs_and_manifest(self):
-        release_files = (
-            "bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "share/licenses/metacodes-LICENSE",
-            "share/licenses/tinykg-LICENSE", "share/licenses/THIRD_PARTY_NOTICES.md", "share/doc/README.md",
-            "share/doc/CHANGELOG-0.2.0-dev.md", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json",
-        )
-        root = self._make(release_files)
+    def test_release_prefix_carries_licences_docs_kernels_daemon_and_manifest(self):
+        root = self._make(RELEASE_FILES)
         self.assertEqual(check(root, release=True), [])
         self.assertIn("unexpected: share/licenses/metacodes-LICENSE", check(root))
+        self.assertIn("unexpected: libexec/metacodes/metacodes-project-kernel", check(root))
         (root / "manifest.json").write_text("{}", encoding="utf-8")
         self.assertEqual(check(root, release=True), [])
         (root / "share/doc/CHANGELOG-0.2.0-dev.md").unlink()
         self.assertIn("missing: share/doc/CHANGELOG-<version>.md", check(root, release=True))
+        (root / "vendor/tinykg/tinykgd").unlink()
+        (root / "libexec/metacodes/metacodes-formal-kernel.build-receipt.json").unlink()
+        findings = check(root, release=True)
+        self.assertIn("missing: vendor/tinykg/tinykgd", findings)
+        self.assertIn("missing: libexec/metacodes/metacodes-formal-kernel.build-receipt.json", findings)
+
+    def test_windows_release_prefix_names_exe_kernels_and_their_sidecars(self):
+        renames = {
+            "bin/metacodes": "bin/metacodes.exe", "bin/rg": "bin/rg.exe", "vendor/tinykg/tinykg": "vendor/tinykg/tinykg.exe",
+            "vendor/tinykg/tinykgd": "vendor/tinykg/tinykgd.exe",
+        }
+        files = []
+        for name in RELEASE_FILES:
+            name = renames.get(name, name)
+            for stem in ("metacodes-formal-kernel", "metacodes-project-kernel"):
+                name = name.replace(f"libexec/metacodes/{stem}", f"libexec/metacodes/{stem}.exe")
+            files.append(name)
+        root = self._make(files)
+        self.assertEqual(check(root, release=True), [])
 
     def _kernel_report(self, root, **kernel):
         base = [
@@ -117,18 +162,25 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         entry.update(kernel)
         return {"checks": base + [{"name": "formal_kernel", "resolved_path": None, "expected_sha256": None, "provenance": None}, entry, KERNELS_ABSENT[2]]}
 
-    def test_an_unpinned_absent_kernel_is_fine_and_a_pinned_absent_one_is_named(self):
+    def test_an_unpinned_absent_kernel_is_fine_in_development_only(self):
         root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
-        self.assertEqual(evaluate_doctor(self._kernel_report(root), root, release=True), [])
-        findings = evaluate_doctor(self._kernel_report(root, expected_sha256="ab" * 32), root, release=True)
+        self.assertEqual(evaluate_doctor(self._kernel_report(root), root), [])
+        findings = evaluate_doctor(self._kernel_report(root, expected_sha256="ab" * 32), root)
         self.assertEqual(len(findings), 1)
         self.assertIn("project_kernel is pinned", findings[0])
         self.assertIn("not shipped", findings[0])
+        # A release prefix ships both kernels and the daemon: absent is a finding.
+        findings = evaluate_doctor(release_report(root, project_kernel={"resolved_path": None, "expected_sha256": None}, tinykgd={"resolved_path": None, "expected_sha256": None}), root, release=True)
+        self.assertEqual(len(findings), 2)
+        self.assertTrue(any("ships project_kernel" in finding for finding in findings))
+        self.assertTrue(any("ships tinykgd" in finding for finding in findings))
+        findings = evaluate_doctor(release_report(root, tinykgd={"expected_sha256": None, "match": None}), root, release=True)
+        self.assertTrue(any("does not pin the tinykgd it ships" in finding for finding in findings))
 
     def test_a_shipped_kernel_needs_a_matching_digest_and_an_accepted_sidecar(self):
         root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json", "libexec/metacodes/metacodes-project-kernel"))
         shipped = dict(resolved_path=str(root / "libexec/metacodes/metacodes-project-kernel"), sha256="ab" * 32, expected_sha256="ab" * 32, match=True, source="adjacent", provenance=True)
-        self.assertEqual(evaluate_doctor(self._kernel_report(root, **shipped), root, release=True), [])
+        self.assertEqual(evaluate_doctor(self._kernel_report(root, **shipped), root), [])
         # The 2026-09-21 failure shape: everything matches, the sidecar was
         # read with the wrong kernel's loader.
         findings = evaluate_doctor(self._kernel_report(root, **dict(shipped, provenance=False)), root)

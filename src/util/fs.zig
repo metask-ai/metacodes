@@ -140,14 +140,18 @@ fn isSymlink(path_z: [*:0]const u8) bool {
 }
 
 /// **生产安全**递归删除 swarm team 目录。**双重护栏**:
-///   ① 路径必须含 `/.metacodes/teams/`(拒删任意目录)且不含 `..`(拒穿越);
+///   ① 路径必须严格位于 `<state_root>/teams/` 之下(前缀匹配,拒删任意目录与 teams 根本身)
+///      且不含 `..`(拒穿越);
 ///   ② 递归中遇 symlink **不跟随**(unlink 链接本身,绝不删目标)——防对抗性 symlink 逃逸。
 /// best-effort:遇错跳过。Linus SW4 HIGH-1:旧代码误用 testing.rmrfBestEffort(仅 /tmp/cc-zig-
-/// 前缀生效)→ orphan cleanup/TeamDelete 在生产是静默 no-op(~/.metacodes/teams 僵尸目录堆积)。
-pub fn removeTeamDirTree(path: []const u8) void {
-    if (std.mem.indexOf(u8, path, "/.metacodes/teams/") == null) return; // 护栏①:必须在 teams 下
-    if (std.mem.indexOf(u8, path, "..") != null) return; // 护栏①:拒穿越
-    if (path.len == 0) return;
+/// 前缀生效)→ orphan cleanup/TeamDelete 在生产是静默 no-op(teams 僵尸目录堆积)。
+pub fn removeTeamDirTree(state_root: []const u8, path: []const u8) void {
+    if (state_root.len == 0 or path.len == 0) return;
+    var components = std.mem.tokenizeAny(u8, path, "/\\");
+    while (components.next()) |component| if (std.mem.eql(u8, component, "..")) return; // 护栏①:拒穿越
+    var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/teams/", .{std.mem.trimEnd(u8, state_root, "/")}) catch return;
+    if (!std.mem.startsWith(u8, path, prefix) or path.len == prefix.len) return; // 护栏①:必须在 teams 下
     rmrfSafeImpl(path, 64);
 }
 
@@ -417,10 +421,10 @@ const pfs = @import("platform").fs;
 
 test "removeTeamDirTree: 删 teams 子树 + 护栏拒非 teams 路径 + 不跟随 symlink" {
     var hb: [256]u8 = undefined;
-    // 造 {home}/.metacodes/teams/proj/{config.json, inboxes/bob.json}(home 在 <tmpRoot>/cc-zig-)。
+    // 造 {root}/teams/proj/{config.json, inboxes/bob.json}(root 在 <tmpRoot>/cc-zig-)。
     const home = testing.uniqueDir(&hb, "cc-zig-rmteam");
     var db: [512]u8 = undefined;
-    const teamdir = std.fmt.bufPrint(&db, "{s}/.metacodes/teams/proj", .{home}) catch unreachable;
+    const teamdir = std.fmt.bufPrint(&db, "{s}/teams/proj", .{home}) catch unreachable;
     var ib: [600]u8 = undefined;
     const inboxdir = std.fmt.bufPrint(&ib, "{s}/inboxes", .{teamdir}) catch unreachable;
     mkdirParents(inboxdir) catch unreachable;
@@ -434,18 +438,22 @@ test "removeTeamDirTree: 删 teams 子树 + 护栏拒非 teams 路径 + 不跟�
             pfs.close(fd);
         }
     }
-    // 护栏:非 teams 路径拒删(home 本身不含 /.metacodes/teams/)。
-    removeTeamDirTree(home);
+    // 护栏:非 teams 路径拒删(状态根本身、teams 根本身、别的状态根下的 teams 都不删)。
+    removeTeamDirTree(home, home);
+    var teams_root_buf: [512]u8 = undefined;
+    removeTeamDirTree(home, std.fmt.bufPrint(&teams_root_buf, "{s}/teams/", .{home}) catch unreachable);
+    removeTeamDirTree("/elsewhere", teamdir);
     var hz: [200:0]u8 = undefined;
     @memcpy(hz[0..home.len], home);
     hz[home.len] = 0;
     try std.testing.expect(pfs.exists(&hz)); // home 仍在(护栏生效)
 
     // 删 team 子树 → 目录没了。
-    removeTeamDirTree(teamdir);
     var tz: [512:0]u8 = undefined;
     @memcpy(tz[0..teamdir.len], teamdir);
     tz[teamdir.len] = 0;
+    try std.testing.expect(pfs.exists(&tz)); // 上面三次拒删后 team 目录仍在
+    removeTeamDirTree(home, teamdir);
     try std.testing.expect(!pfs.exists(&tz));
 
     // 收尾。
@@ -453,11 +461,25 @@ test "removeTeamDirTree: 删 teams 子树 + 护栏拒非 teams 路径 + 不跟�
 }
 
 test "removeTeamDirTree: `..` 穿越被拒" {
-    // 含 .. 的路径即便含 /.metacodes/teams/ 也拒(护栏②)。
-    removeTeamDirTree("/tmp/cc-zig-x/.metacodes/teams/../../../etc");
+    // 含 .. 的路径即便在 <state_root>/teams/ 前缀下也拒(护栏②)。
+    removeTeamDirTree("/tmp/cc-zig-x", "/tmp/cc-zig-x/teams/../../../etc");
     // 不崩即通过(无副作用);拿各平台必存在的目录做"世界还在"锚点(Windows 无 /etc)。
     const anchor = if (@import("builtin").os.tag == .windows) "C:\\Windows" else "/etc";
     try std.testing.expect(pfs.exists(anchor));
+}
+
+test "removeTeamDirTree: a `..` inside a name is not traversal" {
+    var hb: [256]u8 = undefined;
+    const base = testing.uniqueDir(&hb, "cc-zig-rmteam-dots");
+    defer testing.rmrfBestEffort(base);
+    var rb: [400]u8 = undefined;
+    const root = std.fmt.bufPrint(&rb, "{s}/a..b", .{base}) catch unreachable;
+    var tb: [512:0]u8 = undefined;
+    const teamdir = std.fmt.bufPrintZ(&tb, "{s}/teams/proj", .{root}) catch unreachable;
+    mkdirParents(teamdir) catch unreachable;
+    try std.testing.expect(pfs.exists(teamdir.ptr));
+    removeTeamDirTree(root, teamdir);
+    try std.testing.expect(!pfs.exists(teamdir.ptr));
 }
 
 test "mkdirParents creates nested dirs" {

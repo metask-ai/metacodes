@@ -32,25 +32,15 @@ pub const ModelContext = struct {
         self.entries.deinit(self.allocator);
     }
 
-    /// 加载 ~/.metacodes/models.toml;缺则写 bundled 默认 + 解析 embedded。
+    /// 加载 <state root>/models.toml;缺则写 bundled 默认 + 解析 embedded。
     /// best-effort:任何 IO 失败都退回解析 embedded(保证表非空)。用 std.c syscall(裁剪 std 无 std.fs.cwd)。
-    pub fn loadOrBundle(self: *ModelContext) void {
-        const home = @import("platform").paths.homeDir() orelse { // HOME / Windows USERPROFILE
+    pub fn loadOrBundle(self: *ModelContext, state_root: []const u8) void {
+        const dir = state_root;
+        if (dir.len == 0) {
             self.parse(BUNDLED);
             return;
-        };
-        const dir = std.fmt.allocPrint(self.allocator, "{s}/.metacodes", .{home}) catch {
-            self.parse(BUNDLED);
-            return;
-        };
-        defer self.allocator.free(dir);
-        const path = std.fmt.allocPrint(self.allocator, "{s}/models.toml", .{home}) catch {
-            self.parse(BUNDLED);
-            return;
-        };
-        // 注意:path 用 .metacodes/models.toml,上面 allocPrint 漏了子目录,下面重算。
-        self.allocator.free(path);
-        const full = std.fmt.allocPrint(self.allocator, "{s}/.metacodes/models.toml", .{home}) catch {
+        }
+        const full = std.fmt.allocPrint(self.allocator, "{s}/models.toml", .{dir}) catch {
             self.parse(BUNDLED);
             return;
         };

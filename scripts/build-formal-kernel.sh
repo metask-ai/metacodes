@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+# A step that fails inside `$(...)` would otherwise end the script with its
+# output still captured: name the line and the command on the way out.
+trap 'status=$?; echo "build-formal-kernel: failed (exit $status) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 # Build the independently shipped Lean governance kernel and prove that the
 # artifact actually starts on the host.  A successful `lake build` is not a
@@ -45,6 +48,13 @@ case "$host_arch" in
     ;;
 esac
 
+# `--lake <path>` (the build graph) is an argument, not the LAKE variable: a
+# build step that sets one environment variable is keyed on the whole
+# environment, so every CI step rebuilt the kernel and its timestamped receipt.
+if [[ "${1:-}" == "--lake" ]]; then
+  LAKE=$2
+  shift 2
+fi
 output=${1:-"$repo_dir/zig-out/libexec/metacodes/metacodes-formal-kernel$executable_suffix"}
 manifest=${2:-"$output.provenance.json"}
 receipt=${3:-"$output.build-receipt.json"}
@@ -77,14 +87,19 @@ mkdir -p "$(dirname "$output")" "$(dirname "$manifest")" "$(dirname "$receipt")"
   else
     "$lake" build metacodes-formal-kernel
   fi
-)
+) >&2 # Lake reports compile errors on stdout; the build graph shows only stderr
 
 # Lean permits declarations containing `sorry` to compile by inserting
 # `sorryAx`.  Shipping a theorem-bearing checker therefore requires an axiom
 # audit, not merely a green `lake build`.  The current proof uses only Lean's
 # expected quotient/propositional extensionality axioms; any expansion of this
 # exact trust set is a release-blocking review event.
-axiom_audit=$(cd "$lean_dir" && "$lake" env lean FormalAxiomAudit.lean 2>&1)
+if ! axiom_audit=$(cd "$lean_dir" && "$lake" env lean FormalAxiomAudit.lean 2>&1); then
+  echo "build-formal-kernel: the axiom audit (FormalAxiomAudit.lean) did not run" >&2
+  printf '%s\n' "$axiom_audit" >&2
+  exit 1
+fi
+axiom_audit=${axiom_audit//$'\r'/} # Windows: Lean writes CRLF
 expected_axioms="'MetaCodesControl.FormalKernel.safeMigration_sound' depends on axioms: [propext, Quot.sound]"
 expected_axioms="$expected_axioms
 'MetaCodesControl.FormalKernel.taskAudit_verified_iff_safe' depends on axioms: [propext]
@@ -113,12 +128,10 @@ if [[ "$host_os" == "Darwin" ]]; then
     echo "build-formal-kernel: Darwin relink requires leanc and /usr/bin/clang" >&2
     exit 1
   fi
-  link_args=()
-  for library_dir in /opt/homebrew/lib /usr/local/lib; do
-    if [[ -d "$library_dir" ]]; then
-      link_args+=("-L$library_dir")
-    fi
-  done
+  # Link Lean's own static libgmp/libuv from the toolchain, never a host
+  # package manager's dylibs: the kernel ships in release archives and must
+  # start on a machine without Homebrew (scripts/check_kernel_self_contained.py).
+  link_args=("-L$lean_prefix/lib")
   # Apple's linker derives the ad-hoc code-sign identifier from the output
   # basename.  Passing mktemp's random basename here made otherwise identical
   # Lean IR produce a different LC_UUID and signature on every build.  Keep the
@@ -154,6 +167,20 @@ if [[ "$host_os" == "Darwin" ]]; then
 else
   install -m 0755 "$lean_dir/.lake/build/bin/metacodes-formal-kernel$executable_suffix" "$output"
 fi
+# Windows: `python3` may be the Microsoft Store stub; prefer the real `python`.
+if [[ "$host_os" == "Windows" ]]; then
+  python=$(command -v python || command -v python3 || true)
+else
+  python=$(command -v python3 || command -v python || true)
+fi
+if [[ -z "$python" ]]; then
+  echo "build-formal-kernel: python3 is required for the self-containment check" >&2
+  exit 1
+fi
+"$python" "$repo_dir/scripts/check_kernel_self_contained.py" "$output" || {
+  echo "build-formal-kernel: the kernel depends on a library a clean $host_os host may lack" >&2
+  exit 1
+}
 
 hex_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 hex_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -206,36 +233,39 @@ if [[ "$artifact_phase_block_verdict" != *'"decision":"block"'* || "$artifact_ph
   echo "build-formal-kernel: native artifact next-phase binding smoke failed" >&2
   exit 1
 fi
-set +e
-printf '%s\n' "$admit_request" | "$output" >/dev/null 2>&1
-trailing_status=$?
-set -e
+# The kernel must refuse a trailing newline (exit 64); `||` keeps that
+# expected failure out of errexit and the ERR trap.
+trailing_status=0
+printf '%s\n' "$admit_request" | "$output" >/dev/null 2>&1 || trailing_status=$?
 if [[ "$trailing_status" -ne 64 ]]; then
   echo "build-formal-kernel: canonical protocol accepted trailing newline" >&2
   exit 1
 fi
 
+# The file goes in on stdin: GNU sha256sum starts its line with `\` when the
+# name holds a backslash, and the build graph passes Windows paths here.
 if command -v shasum >/dev/null 2>&1; then
-  binary_sha256=$(shasum -a 256 "$output" | awk '{print $1}')
-  kernel_source_sha256=$(shasum -a 256 "$lean_dir/MetaCodesControl/FormalKernel.lean" | awk '{print $1}')
-  memory_kernel_source_sha256=$(shasum -a 256 "$lean_dir/MetaCodesControl/MemoryMigration.lean" | awk '{print $1}')
-  artifact_kernel_source_sha256=$(shasum -a 256 "$lean_dir/MetaCodesControl/ArtifactVerification.lean" | awk '{print $1}')
-  main_source_sha256=$(shasum -a 256 "$lean_dir/FormalMain.lean" | awk '{print $1}')
-  axiom_audit_source_sha256=$(shasum -a 256 "$lean_dir/FormalAxiomAudit.lean" | awk '{print $1}')
+  hash_file() { shasum -a 256 <"$1" | awk '{print $1}'; }
 else
-  binary_sha256=$(sha256sum "$output" | awk '{print $1}')
-  kernel_source_sha256=$(sha256sum "$lean_dir/MetaCodesControl/FormalKernel.lean" | awk '{print $1}')
-  memory_kernel_source_sha256=$(sha256sum "$lean_dir/MetaCodesControl/MemoryMigration.lean" | awk '{print $1}')
-  artifact_kernel_source_sha256=$(sha256sum "$lean_dir/MetaCodesControl/ArtifactVerification.lean" | awk '{print $1}')
-  main_source_sha256=$(sha256sum "$lean_dir/FormalMain.lean" | awk '{print $1}')
-  axiom_audit_source_sha256=$(sha256sum "$lean_dir/FormalAxiomAudit.lean" | awk '{print $1}')
+  hash_file() { sha256sum <"$1" | awk '{print $1}'; }
 fi
+binary_sha256=$(hash_file "$output")
+kernel_source_sha256=$(hash_file "$lean_dir/MetaCodesControl/FormalKernel.lean")
+memory_kernel_source_sha256=$(hash_file "$lean_dir/MetaCodesControl/MemoryMigration.lean")
+artifact_kernel_source_sha256=$(hash_file "$lean_dir/MetaCodesControl/ArtifactVerification.lean")
+main_source_sha256=$(hash_file "$lean_dir/FormalMain.lean")
+axiom_audit_source_sha256=$(hash_file "$lean_dir/FormalAxiomAudit.lean")
 if [[ "$host_os" == "Darwin" ]]; then
   binary_bytes=$(stat -f '%z' "$output")
 else
   binary_bytes=$(stat -c '%s' "$output")
 fi
-lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\r\n')
+if ! lean_version=$(cd "$lean_dir" && "$lake" env lean --version); then
+  echo "build-formal-kernel: \`lake env lean --version\` failed" >&2
+  exit 1
+fi
+lean_version=${lean_version//$'\r'/} # Windows: Lean writes CRLF
+lean_version=${lean_version//$'\n'/}
 built_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 # The artifact manifest is intentionally time-independent.  It is the stable
@@ -246,11 +276,7 @@ printf '%s\n' \
   "{\"schema_version\":\"metacodes-formal-artifact-v4\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"artifact_request_schema\":\"metacodes-artifact-verification-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"memory_kernel_source_sha256\":\"$memory_kernel_source_sha256\",\"artifact_kernel_source_sha256\":\"$artifact_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_audit_source_sha256\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\"}" \
   >"$manifest"
 
-if command -v shasum >/dev/null 2>&1; then
-  manifest_sha256=$(shasum -a 256 "$manifest" | awk '{print $1}')
-else
-  manifest_sha256=$(sha256sum "$manifest" | awk '{print $1}')
-fi
+manifest_sha256=$(hash_file "$manifest")
 printf '%s\n' \
   "{\"schema_version\":\"metacodes-formal-build-receipt-v1\",\"artifact_manifest_sha256\":\"$manifest_sha256\",\"binary_sha256\":\"$binary_sha256\",\"built_at_utc\":\"$built_at_utc\"}" \
   >"$receipt"

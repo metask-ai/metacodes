@@ -192,13 +192,15 @@ fn buildInfoOptions(
         .explicit => |input| input.sha256,
         .disabled, .unavailable => null,
     });
-    // The daemon digest is pinned only once the daemon is part of the install,
-    // exactly like the Lean kernels: doctor calls a pinned-but-unresolvable
-    // binary unhealthy, so pinning something the prefix does not carry would
-    // make `doctor --strict` fail on every release. Staging still compares the
-    // build table against the bundle manifest. The change that installs the
-    // daemon pins it here in the same commit.
-    options.addOption(?[]const u8, "tinykgd_expected_sha256", @as(?[]const u8, null));
+    // The daemon digest is pinned exactly where the daemon is part of the
+    // install: the release layout ships it (manifest v2), so doctor holds the
+    // shipped copy to the bundle table. A development install carries no
+    // daemon, and doctor calls a pinned-but-unresolvable binary unhealthy.
+    const daemon_pin: ?[]const u8 = if (release_layout and tinykg_input == .bundled)
+        if (bundledTinyKgForTarget(b, target, "daemon")) |daemon| daemon.sha256 else null
+    else
+        null;
+    options.addOption(?[]const u8, "tinykgd_expected_sha256", daemon_pin);
     options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
     options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
     return options;
@@ -303,6 +305,8 @@ const StagedTinyKg = struct {
 
 const StagedTinyKgd = struct {
     install_step: *std.Build.Step,
+    /// `vendor/tinykg/tinykgd.provenance.json`, which the release unit ships.
+    receipt_install_step: *std.Build.Step,
     artifact: std.Build.LazyPath,
     installed_path: []const u8,
     source_sha256: []const u8,
@@ -318,6 +322,218 @@ fn wireTinyKgdTestInput(run: *std.Build.Step.Run, staged: ?StagedTinyKgd) void {
     const daemon = staged orelse return;
     run.step.dependOn(daemon.install_step);
     run.setEnvironmentVariable("METACODES_TEST_TINYKGD_BIN", daemon.installed_path);
+}
+
+/// `-Dlean-kernels`: whether this build compiles the two Lean governance
+/// kernels from this checkout and installs them into `<prefix>/libexec/metacodes`.
+/// `auto` does so whenever a native Lean toolchain (`lake`) is found, so a
+/// machine with elan runs every kernel-gated test with no configuration; `on`
+/// fails the build instead of skipping when it is not; `off` never builds them.
+const LeanKernelsMode = enum { auto, on, off };
+
+const StagedLeanKernel = struct {
+    install_step: *std.Build.Step,
+    installed_path: []const u8,
+    /// The test-only variable that hands the kernel to the test process; the
+    /// digest comes from the provenance sidecar installed beside it
+    /// (src/formal/test_kernel.zig).
+    path_variable: []const u8,
+};
+
+const StagedLeanKernels = struct {
+    formal: ?StagedLeanKernel = null,
+    project: ?StagedLeanKernel = null,
+};
+
+fn wireLeanKernelTestInputs(run: *std.Build.Step.Run, staged: StagedLeanKernels) void {
+    for ([_]?StagedLeanKernel{ staged.formal, staged.project }) |maybe| {
+        const kernel = maybe orelse continue;
+        run.step.dependOn(kernel.install_step);
+        run.setEnvironmentVariable(kernel.path_variable, kernel.installed_path);
+    }
+}
+
+/// The `lake` the kernel scripts run: `$LAKE`, else PATH, else elan's default
+/// `~/.elan/bin` (`%USERPROFILE%\.elan\bin` on Windows, where cmd and
+/// PowerShell set no HOME). The toolchain is the only shared input; every
+/// kernel it builds lands in this build's own prefix.
+fn findLake(b: *std.Build) ?[]const u8 {
+    const env = &b.graph.environ_map;
+    if (env.get("LAKE")) |lake| if (lake.len != 0) return lake;
+    const home = env.get("HOME") orelse
+        (if (b.graph.host.result.os.tag == .windows) env.get("USERPROFILE") else null) orelse
+        return b.findProgram(&.{"lake"}, &.{}) catch null;
+    return b.findProgram(&.{"lake"}, &.{b.pathJoin(&.{ home, ".elan", "bin" })}) catch null;
+}
+
+/// The bash the kernel scripts run under. On Windows it must be Git Bash
+/// (MSYS2): the scripts take Windows paths and build a Windows kernel, but the
+/// `bash` cmd finds first is often WSL's launcher (System32\bash.exe or the
+/// WindowsApps alias), whose Linux shell can do neither. The first other
+/// bash.exe on PATH wins, else the one Git for Windows ships beside `git`.
+fn findBash(b: *std.Build) ?[]const u8 {
+    if (b.graph.host.result.os.tag != .windows) return "bash";
+    const io = b.graph.io;
+    if (b.graph.environ_map.get("PATH")) |path| {
+        var dirs = std.mem.tokenizeScalar(u8, path, ';');
+        while (dirs.next()) |raw_dir| {
+            const dir = std.mem.trimEnd(u8, raw_dir, "\\/");
+            const base = std.fs.path.basenameWindows(dir);
+            if (std.ascii.eqlIgnoreCase(base, "System32") or std.ascii.eqlIgnoreCase(base, "WindowsApps")) continue;
+            const candidate = b.pathJoin(&.{ dir, "bash.exe" });
+            std.Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
+            return candidate;
+        }
+    }
+    // Git for Windows: <root>\cmd\git.exe or <root>\mingw64\bin\git.exe, with
+    // the bash launcher at <root>\bin\bash.exe.
+    const git = b.findProgram(&.{"git"}, &.{}) catch return null;
+    var root = std.fs.path.dirnameWindows(git);
+    for (0..3) |_| {
+        const dir = root orelse return null;
+        const candidate = b.pathJoin(&.{ dir, "bin", "bash.exe" });
+        if (std.Io.Dir.accessAbsolute(io, candidate, .{})) |_| return candidate else |_| {}
+        root = std.fs.path.dirnameWindows(dir);
+    }
+    return null;
+}
+
+/// `<bash> <script> --lake <lake>`, with an empty pipe for stdin. A Run step
+/// with output-file arguments gets stdin and stdout "ignored", which Zig 0.16
+/// realises on Windows as one shared \Device\Null handle in both slots; the
+/// MSYS runtime behind Git Bash makes stderr distinct from stdout but not
+/// stdin. The first `$(...)` then closes the shared handle, and every native
+/// program started in a later command substitution inherits a dead or reused
+/// stdin: the elan `lake` proxy failed with "The handle is invalid (os error
+/// 6)" or "The request is not supported (os error 50)", and MSYS tools with
+/// EBADF (#180).
+fn addKernelScript(b: *std.Build, bash: []const u8, name: []const u8, script: []const u8, lake: []const u8) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{bash});
+    run.setName(name);
+    run.setStdIn(.{ .bytes = "" });
+    run.addFileArg(b.path(script));
+    // An argument, not setEnvironmentVariable: setting one variable copies the
+    // whole environment into the cache key, and the kernels (with their
+    // timestamped receipt) would rebuild whenever any variable changed.
+    run.addArgs(&.{ "--lake", lake });
+    return run;
+}
+
+/// Every source the kernels are built from, so the cached build reruns exactly
+/// when one of them changes. `.lake` holds Lake's own products and is skipped.
+fn addLeanSourceInputs(b: *std.Build, run: *std.Build.Step.Run) void {
+    run.addFileInput(b.path("scripts/check_kernel_self_contained.py"));
+    const root = "control-plane/lean";
+    var dir = b.build_root.handle.openDir(b.graph.io, root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| std.debug.panic("cannot scan {s}: {t}", .{ root, err });
+    defer dir.close(b.graph.io);
+    var walker = dir.walkSelectively(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(b.graph.io) catch |err|
+        std.debug.panic("cannot enumerate {s}: {t}", .{ root, err })) |entry|
+    {
+        switch (entry.kind) {
+            .directory => if (!std.mem.eql(u8, entry.basename, ".lake"))
+                walker.enter(b.graph.io, entry) catch |err|
+                    std.debug.panic("cannot enter {s}/{s}: {t}", .{ root, entry.path, err }),
+            .file => run.addFileInput(b.path(b.fmt("{s}/{s}", .{ root, entry.path }))),
+            else => {},
+        }
+    }
+}
+
+/// Builds both kernels with their own scripts (axiom audit + native smoke +
+/// provenance sidecar) into cached outputs and installs them, sidecars
+/// included, at `<prefix>/libexec/metacodes` — the layout the executable
+/// resolves adjacent kernels from. A kernel the operator already supplies via
+/// `METACODES_TEST_<KIND>_KERNEL_PATH` is left to that variable.
+fn stageLeanKernels(
+    b: *std.Build,
+    mode: LeanKernelsMode,
+    target: std.Build.ResolvedTarget,
+    stage_step: *std.Build.Step,
+) StagedLeanKernels {
+    if (mode == .off) {
+        stage_step.dependOn(&b.addFail("kernels:stage is disabled by -Dlean-kernels=off").step);
+        return .{};
+    }
+    const host = b.graph.host.result;
+    const unavailable: ?[]const u8 = if (target.result.os.tag != host.os.tag or target.result.cpu.arch != host.cpu.arch)
+        "Lean kernels are native host executables; this build targets another platform"
+    else if (findLake(b) == null)
+        "no Lean toolchain: set LAKE, put lake on PATH, or install elan (~/.elan/bin/lake)"
+    else if (findBash(b) == null)
+        "no Git Bash: the kernel scripts need Git for Windows' bash.exe on PATH or beside git (WSL's bash cannot build a Windows kernel)"
+    else
+        null;
+    if (unavailable) |reason| {
+        const fail = &b.addFail(b.fmt("kernels:stage: {s}", .{reason})).step;
+        stage_step.dependOn(fail);
+        if (mode == .auto) return .{};
+        // -Dlean-kernels=on: every wired test run that would have needed a
+        // staged kernel inherits the failure instead of skipping.
+        const env = &b.graph.environ_map;
+        return .{
+            .formal = if (env.get("METACODES_TEST_FORMAL_KERNEL_PATH") != null) null else .{
+                .install_step = fail,
+                .installed_path = "",
+                .path_variable = "METACODES_TEST_FORMAL_KERNEL_PATH",
+            },
+            .project = if (env.get("METACODES_TEST_PROJECT_KERNEL_PATH") != null) null else .{
+                .install_step = fail,
+                .installed_path = "",
+                .path_variable = "METACODES_TEST_PROJECT_KERNEL_PATH",
+            },
+        };
+    }
+    const lake = findLake(b).?;
+    const bash = findBash(b).?;
+    const dir: std.Build.InstallDir = .{ .custom = "libexec/metacodes" };
+    // The executable resolves `<prefix>/libexec/metacodes/<kernel>[.exe]`
+    // (src/util/toolchain.zig); the scripts run under Git Bash on Windows.
+    const exe_suffix = if (target.result.os.tag == .windows) ".exe" else "";
+    const formal_name = b.fmt("metacodes-formal-kernel{s}", .{exe_suffix});
+    const project_name = b.fmt("metacodes-project-kernel{s}", .{exe_suffix});
+
+    const formal = addKernelScript(b, bash, "build formal kernel", "scripts/build-formal-kernel.sh", lake);
+    const formal_bin = formal.addOutputFileArg(formal_name);
+    const formal_provenance = formal.addOutputFileArg(b.fmt("{s}.provenance.json", .{formal_name}));
+    const formal_receipt = formal.addOutputFileArg(b.fmt("{s}.build-receipt.json", .{formal_name}));
+    addLeanSourceInputs(b, formal);
+
+    const project = addKernelScript(b, bash, "build project kernel", "scripts/build-project-harness-kernel.sh", lake);
+    const project_bin = project.addOutputFileArg(project_name);
+    const project_provenance = project.addOutputFileArg(b.fmt("{s}.provenance.json", .{project_name}));
+    addLeanSourceInputs(b, project);
+    // Both scripts drive Lake in the same control-plane/lean/.lake.
+    project.step.dependOn(&formal.step);
+
+    const install_formal = b.addInstallFileWithDir(formal_bin, dir, formal_name);
+    const install_formal_provenance = b.addInstallFileWithDir(formal_provenance, dir, b.fmt("{s}.provenance.json", .{formal_name}));
+    const install_formal_receipt = b.addInstallFileWithDir(formal_receipt, dir, b.fmt("{s}.build-receipt.json", .{formal_name}));
+    install_formal.step.dependOn(&install_formal_provenance.step);
+    install_formal.step.dependOn(&install_formal_receipt.step);
+    const install_project = b.addInstallFileWithDir(project_bin, dir, project_name);
+    const install_project_provenance = b.addInstallFileWithDir(project_provenance, dir, b.fmt("{s}.provenance.json", .{project_name}));
+    install_project.step.dependOn(&install_project_provenance.step);
+    stage_step.dependOn(&install_formal.step);
+    stage_step.dependOn(&install_project.step);
+
+    const env = &b.graph.environ_map;
+    return .{
+        .formal = if (env.get("METACODES_TEST_FORMAL_KERNEL_PATH") != null) null else .{
+            .install_step = &install_formal.step,
+            .installed_path = b.getInstallPath(dir, formal_name),
+            .path_variable = "METACODES_TEST_FORMAL_KERNEL_PATH",
+        },
+        .project = if (env.get("METACODES_TEST_PROJECT_KERNEL_PATH") != null) null else .{
+            .install_step = &install_project.step,
+            .installed_path = b.getInstallPath(dir, project_name),
+            .path_variable = "METACODES_TEST_PROJECT_KERNEL_PATH",
+        },
+    };
 }
 
 const aggregate_test_exclusions = [_][]const u8{
@@ -508,6 +724,7 @@ fn addCoreSuiteRun(
     suite: *std.Build.Step.Compile,
     shards: u8,
     reporter: *std.Build.Step.Compile,
+    lean_kernels: StagedLeanKernels,
 ) *std.Build.Step {
     const reports = b.allocator.alloc(std.Build.LazyPath, shards) catch @panic("OOM");
     for (reports, 0..) |*report, shard_index| {
@@ -519,6 +736,7 @@ fn addCoreSuiteRun(
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{shards}));
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
         run_shard.expectExitCode(0);
+        wireLeanKernelTestInputs(run_shard, lean_kernels);
         report.* = run_shard.captureStdOut(.{
             .basename = b.fmt("{s}-shard-{}.txt", .{ suite.name, shard_index }),
         });
@@ -677,16 +895,12 @@ pub fn build(b: *std.Build) void {
                 const staged_daemon_receipt = daemon_stage.addOutputFileArg("tinykgd.provenance.json");
                 const install_daemon = b.addInstallFileWithDir(staged_daemon, .{ .custom = "vendor/tinykg" }, daemon_name);
                 const install_daemon_receipt = b.addInstallFileWithDir(staged_daemon_receipt, .{ .custom = "vendor/tinykg" }, "tinykgd.provenance.json");
-                // Deliberately NOT part of the default install step. Nothing
-                // starts the daemon yet, and the product install carries only
-                // what `release/manifest_contract.zig` declares and
-                // `scripts/verify_install_prefix.py` expects. `tinykg:stage`
-                // and the test wiring still stage it, so the bundle stays
-                // attested and the resolution path stays covered; the release
-                // layout gains it in the change that starts it.
+                // Not part of the default (development) install step; the
+                // release layout ships it (`release:stage`, manifest v2), and
+                // `tinykg:stage` plus the test wiring stage it everywhere else.
                 tinykg_stage_step.dependOn(&install_daemon.step);
                 tinykg_stage_step.dependOn(&install_daemon_receipt.step);
-                staged_tinykgd = .{ .install_step = &install_daemon.step, .artifact = staged_daemon, .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, daemon_name), .source_sha256 = daemon.sha256 };
+                staged_tinykgd = .{ .install_step = &install_daemon.step, .receipt_install_step = &install_daemon_receipt.step, .artifact = staged_daemon, .installed_path = b.getInstallPath(.{ .custom = "vendor/tinykg" }, daemon_name), .source_sha256 = daemon.sha256 };
             }
         },
         .explicit => |input| {
@@ -733,6 +947,22 @@ pub fn build(b: *std.Build) void {
         },
     }
 
+    // ── Lean governance kernels (scripts/install.sh, kernel-gated tests) ───
+    // Built from this checkout's own control-plane/lean, so an install and the
+    // kernels it runs are always the same version. The release layout still
+    // ships none (release/LAYOUT.md); `kernels:stage` is what scripts/install.sh
+    // and the test steps below use.
+    const lean_kernels_mode = b.option(
+        LeanKernelsMode,
+        "lean-kernels",
+        "Build and install the Lean governance kernels for tests and scripts/install.sh: auto (when lake is found, default), on (fail without lake), off",
+    ) orelse .auto;
+    const kernels_stage_step = b.step(
+        "kernels:stage",
+        "Build both Lean kernels from this checkout and install them into <prefix>/libexec/metacodes",
+    );
+    const staged_lean_kernels = stageLeanKernels(b, lean_kernels_mode, target, kernels_stage_step);
+
     // ── ripgrep for the product install (#79, #47 stage 4) ─────────────────
     // Glob/Grep need rg at run time. The default install and the release
     // layout stage the vendored, manifest-pinned binary beside the executable
@@ -745,7 +975,7 @@ pub fn build(b: *std.Build) void {
     const ripgrep_bundle = ripgrepBundleInfo(b, target.result);
     const release_stage_step = b.step(
         "release:stage",
-        "Install the release layout (bin/metacodes, bin/rg, vendor/tinykg, share/licenses); requires -Drelease-layout=true and fails closed for a target without vendored runtime assets",
+        "Install the release layout (bin/metacodes, bin/rg, libexec/metacodes kernels, vendor/tinykg CLI + daemon, share/licenses); requires -Drelease-layout=true, a Lean toolchain and pinned kernel digests, and fails closed for a target without vendored runtime assets",
     );
     release_stage_step.dependOn(b.getInstallStep());
     if (!release_layout) {
@@ -756,6 +986,23 @@ pub fn build(b: *std.Build) void {
     if (staged_tinykg == null) {
         release_stage_step.dependOn(&b.addFail(
             "release:stage needs the vendored TinyKG binary for this target (it is disabled or unavailable)",
+        ).step);
+    }
+    // A v2 release unit is complete on every platform (doc/INSTALL_DESIGN.md):
+    // the TinyKG daemon and both Lean kernels ship, the executable pins the
+    // kernels it ships, and the kernels' runtime licences come along.
+    if (staged_tinykgd) |daemon| {
+        release_stage_step.dependOn(daemon.install_step);
+        release_stage_step.dependOn(daemon.receipt_install_step);
+    } else {
+        release_stage_step.dependOn(&b.addFail(
+            "release:stage needs the vendored TinyKG daemon for this target (it is disabled or unavailable)",
+        ).step);
+    }
+    release_stage_step.dependOn(kernels_stage_step);
+    if (release_layout and (g_formal_kernel_sha256 == null or g_project_kernel_sha256 == null)) {
+        release_stage_step.dependOn(&b.addFail(
+            "release:stage pins the kernels it ships: build them first (`zig build kernels:stage --prefix <dir>`) and pass their digests, e.g. `$(python3 scripts/kernel_pins.py <dir>)`",
         ).step);
     }
     const target_family = b.fmt("{s}-{s}", .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) });
@@ -783,6 +1030,12 @@ pub fn build(b: *std.Build) void {
             .{ .source = "LICENSE", .dir = "share/licenses", .name = "metacodes-LICENSE" },
             .{ .source = "vendor/tinykg/LICENSE", .dir = "share/licenses", .name = "tinykg-LICENSE" },
             .{ .source = "THIRD_PARTY_NOTICES.md", .dir = "share/licenses", .name = "THIRD_PARTY_NOTICES.md" },
+            .{ .source = "vendor/lean-runtime/lean4-LICENSE", .dir = "share/licenses", .name = "lean4-LICENSE" },
+            .{ .source = "vendor/lean-runtime/gmp-COPYING.LESSERv3", .dir = "share/licenses", .name = "gmp-COPYING.LESSERv3" },
+            .{ .source = "vendor/lean-runtime/gmp-COPYINGv3", .dir = "share/licenses", .name = "gmp-COPYINGv3" },
+            .{ .source = "vendor/lean-runtime/gmp-COPYINGv2", .dir = "share/licenses", .name = "gmp-COPYINGv2" },
+            .{ .source = "vendor/lean-runtime/libuv-LICENSE", .dir = "share/licenses", .name = "libuv-LICENSE" },
+            .{ .source = "vendor/lean-runtime/libuv-LICENSE-extra", .dir = "share/licenses", .name = "libuv-LICENSE-extra" },
             .{ .source = "README.md", .dir = "share/doc", .name = "README.md" },
             .{ .source = "CHANGELOG.md", .dir = "share/doc", .name = b.fmt("CHANGELOG-{s}.md", .{manifest.version}) },
         };
@@ -1121,6 +1374,12 @@ pub fn build(b: *std.Build) void {
     });
     release_manifest_tool_mod.addImport("metask_agentcore_types", agentcore_manifest_types_mod);
     release_manifest_tool_mod.addImport("metacodes_release_contract", release_contract_mod);
+    // The generator writes exactly the files and schema the reader validates.
+    release_manifest_tool_mod.addImport("metacodes_manifest_contract", b.createModule(.{
+        .root_source_file = b.path("release/manifest_contract.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }));
     const release_manifest_tool = b.addExecutable(.{
         .name = "release-manifest",
         .root_module = release_manifest_tool_mod,
@@ -1758,11 +2017,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const core_test_step = b.step("test:lib", "Run the complete metacodes-core suite in checked deterministic shards");
-    core_test_step.dependOn(addCoreSuiteRun(b, core_test, lib_test_shards, core_shard_reporter));
+    core_test_step.dependOn(addCoreSuiteRun(b, core_test, lib_test_shards, core_shard_reporter, staged_lean_kernels));
 
     const core_monolithic_run = addTestRunArtifact(b, core_test);
     core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
+    wireLeanKernelTestInputs(core_monolithic_run, staged_lean_kernels);
     const core_test_monolithic_step = b.step("test:lib-monolithic", "Run the complete metacodes-core suite in one diagnostic process");
     core_test_monolithic_step.dependOn(&core_monolithic_run.step);
 
@@ -1797,7 +2057,9 @@ pub fn build(b: *std.Build) void {
         },
     });
     const core_test_times_step = b.step("test:lib-times", "Run metacodes-core tests with per-test timing diagnostics");
-    core_test_times_step.dependOn(&addTestRunArtifact(b, core_timed_test).step);
+    const core_timed_run = addTestRunArtifact(b, core_timed_test);
+    wireLeanKernelTestInputs(core_timed_run, staged_lean_kernels);
+    core_test_times_step.dependOn(&core_timed_run.step);
     core_test_step.dependOn(http_status_gate_step);
 
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
@@ -2058,6 +2320,7 @@ pub fn build(b: *std.Build) void {
         addCoreSuite(b, createCoreModule(b, target, .ReleaseSafe), tfilter),
         lib_test_shards,
         core_shard_reporter,
+        staged_lean_kernels,
     );
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
     gate_pr_step.dependOn(&gate_fmt.step);
@@ -2074,6 +2337,7 @@ pub fn build(b: *std.Build) void {
     const test_run = addTestRunArtifact(b, test_obj);
     wireTinyKgTestInput(test_run, staged_tinykg);
     wireTinyKgdTestInput(test_run, staged_tinykgd);
+    wireLeanKernelTestInputs(test_run, staged_lean_kernels);
     test_step.dependOn(&test_run.step);
 
     // Two independent Metacodes processes share one authenticated StoreActor.
@@ -2236,6 +2500,7 @@ pub fn build(b: *std.Build) void {
         run_shard.step.dependOn(&install_selfexe_probe.step);
         wireTinyKgTestInput(run_shard, staged_tinykg);
         wireTinyKgdTestInput(run_shard, staged_tinykgd);
+        wireLeanKernelTestInputs(run_shard, staged_lean_kernels);
         integration_reports[shard_index] = run_shard.captureStdOut(.{
             .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
         });
@@ -2251,6 +2516,7 @@ pub fn build(b: *std.Build) void {
     integration_monolithic_run.step.dependOn(&install_selfexe_probe.step);
     wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
     wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
+    wireLeanKernelTestInputs(integration_monolithic_run, staged_lean_kernels);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
     integration_monolithic_step.dependOn(&integration_monolithic_run.step);
 
@@ -2268,6 +2534,7 @@ pub fn build(b: *std.Build) void {
     integration_timed_run.step.dependOn(&install_selfexe_probe.step);
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
     wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
+    wireLeanKernelTestInputs(integration_timed_run, staged_lean_kernels);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
 

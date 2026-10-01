@@ -39,7 +39,7 @@ const Home = struct {
     fn init() !Home {
         var h = Home{ .tmp = std.testing.tmpDir(.{}) };
         errdefer h.tmp.cleanup();
-        try h.tmp.dir.createDirPath(std.testing.io, ".metacodes/kg");
+        try h.tmp.dir.createDirPath(std.testing.io, "kg"); // the temp dir is the state root
         h.root_len = try h.tmp.dir.realPath(std.testing.io, &h.root_buf);
         return h;
     }
@@ -49,9 +49,9 @@ const Home = struct {
     fn root(self: *const Home) []const u8 {
         return self.root_buf[0..self.root_len];
     }
-    /// Writes `<root>/.metacodes/kg/daemon.json` with the given mode and returns its path.
+    /// Writes `<root>/kg/daemon.json` (root = state root) with the given mode and returns its path.
     fn writeConfig(self: *const Home, allocator: std.mem.Allocator, content: []const u8, mode: u16) ![]u8 {
-        const path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/daemon.json", .{self.root()});
+        const path = try std.fmt.allocPrint(allocator, "{s}/kg/daemon.json", .{self.root()});
         errdefer allocator.free(path);
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
@@ -103,7 +103,7 @@ const ReadyResponder = struct {
 };
 
 fn initClient(allocator: std.mem.Allocator, home: []const u8) !KgClient {
-    return KgClient.init(allocator, .{ .home = home, .domain = "kgstate", .io = std.testing.io });
+    return KgClient.init(allocator, .{ .state_root = home, .domain = "kgstate", .io = std.testing.io });
 }
 
 test "KgState: no daemon.json is unconfigured with a hint" {
@@ -230,7 +230,7 @@ test "KgState: ensureReadyReadOnly never creates a CLI store" {
     const store = try std.fmt.allocPrint(a, "{s}/no-such-store", .{home.root()});
     defer a.free(store);
     var client = try KgClient.init(a, .{
-        .home = home.root(),
+        .state_root = home.root(),
         .domain = "kgstate",
         .exclusive_cli = true,
         .env_bin = bin,
@@ -437,7 +437,7 @@ test "KgState: doctor names the configuration source and shares the repair hint"
     defer plain.deinit();
     const plain_diag = (try cc.kgDiagnosis(a, &plain, home.root())).?;
     defer plain_diag.deinit(a);
-    const default_path = try std.fmt.allocPrint(a, "{s}/.metacodes/kg/daemon.json", .{home.root()});
+    const default_path = try std.fmt.allocPrint(a, "{s}/kg/daemon.json", .{home.root()});
     defer a.free(default_path);
     try std.testing.expectEqualStrings("unconfigured", plain_diag.state);
     try std.testing.expectEqualStrings(default_path, plain_diag.config);

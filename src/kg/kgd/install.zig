@@ -38,7 +38,7 @@ pub const Error = error{
 };
 
 pub const Options = struct {
-    /// Defaults to `<home>/.metacodes/kg/daemon.json`, or `METACODES_KG_CONFIG`
+    /// Defaults to `<state root>/kg/daemon.json`, or `METACODES_KG_CONFIG`
     /// when that is set, so install and the sessions always agree.
     config_path: ?[]const u8 = null,
     /// Defaults to the store beside the configuration.
@@ -65,20 +65,20 @@ pub const Outcome = struct {
     }
 };
 
-pub fn run(allocator: std.mem.Allocator, home: []const u8, options: Options) Error!Outcome {
-    if (home.len == 0 and options.config_path == null) return Error.NoHome;
+pub fn run(allocator: std.mem.Allocator, state_root: []const u8, options: Options) Error!Outcome {
+    if (state_root.len == 0 and options.config_path == null) return Error.NoHome;
 
-    var cli = (KgClient.resolveTinykgBinary(allocator, .{ .home = home, .domain = "" }) catch null) orelse
+    var cli = (KgClient.resolveTinykgBinary(allocator, .{ .state_root = state_root, .domain = "" }) catch null) orelse
         return Error.BinariesMissing;
     defer cli.deinit(allocator);
-    var daemon = (KgClient.resolveTinykgdBinary(allocator, .{ .home = home, .domain = "" }) catch null) orelse
+    var daemon = (KgClient.resolveTinykgdBinary(allocator, .{ .state_root = state_root, .domain = "" }) catch null) orelse
         return Error.BinariesMissing;
     defer daemon.deinit(allocator);
 
     const config_path = if (options.config_path) |given|
         allocator.dupe(u8, given) catch return Error.OutOfMemory
     else
-        KgClient.resolveDaemonConfigPath(allocator, home) catch return Error.OutOfMemory;
+        KgClient.resolveDaemonConfigPath(allocator, state_root) catch return Error.OutOfMemory;
     errdefer allocator.free(config_path);
     const config_dir = std.fs.path.dirname(config_path) orelse return Error.ConfigDirUnusable;
     const dir_existed = directoryExists(allocator, config_dir);

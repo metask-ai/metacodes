@@ -122,6 +122,8 @@ pub const kg_plan_commit = @import("kg/plan_commit.zig");
 pub const kg_plan_view = @import("kg/plan_view.zig");
 pub const kg_task_projection = @import("kg/task_projection.zig");
 pub const formal_runtime = @import("formal/runtime.zig");
+pub const formal_test_kernel = @import("formal/test_kernel.zig"); // test-only: staged Lean kernel resolution
+pub const util_state_root = @import("util/state_root.zig");
 pub const formal_artifact_store = @import("formal/artifact_store.zig");
 pub const formal_provenance = @import("formal/provenance.zig");
 pub const formal_task_audit = @import("formal/task_audit.zig");
@@ -162,6 +164,7 @@ pub const repl_headless = @import("repl/headless.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
 pub const app_route_strings = @import("app/route_strings.zig");
+pub const app_install = @import("app/install.zig");
 pub const tool_context = @import("tools/context.zig");
 pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
 pub const tool_error = @import("core/tool_error.zig");
@@ -351,14 +354,14 @@ fn applyProviderRoute(
 /// than the one the user chose, which is the exact substitution the offer model
 /// exists to prevent.
 pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.Allocator) bool {
-    var store = provider_config_store.Store.initHome(allocator) catch return false;
+    var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch return false;
     defer store.deinit();
 
     var document = store.load() catch |err| {
         // Unreadable is not "absent": say so rather than quietly ignoring a
         // selection that may well be in there.
         std.debug.print(
-            "warning: ~/.metacodes/config.json could not be read ({s}); " ++
+            "warning: <state root>/config.json could not be read ({s}); " ++
                 "any stored provider selection is being ignored\n",
             .{@errorName(err)},
         );
@@ -500,7 +503,12 @@ pub fn main(init: std.process.Init) !void {
     // included — can resolve it.
     @import("util/toolchain.zig").setLayout(if (build_options.release_layout) .release else .development);
 
-    if (try maybeRunAuthCommand(init, allocator)) |code| {
+    // `--state-dir` as argv[1] is a global option: it precedes, and applies
+    // to, every subcommand below (login, doctor, kg, ...).
+    const leading_state_dir = leadingStateDir(init, allocator);
+    if (leading_state_dir.value) |dir| applyStateDir(dir);
+
+    if (try maybeRunAuthCommand(init, allocator, leading_state_dir.consumed)) |code| {
         std.process.exit(code);
     }
 
@@ -510,6 +518,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: {s} (use --help to list supported flags)\n", .{parse_err});
         std.process.exit(2);
     }
+    if (leading_state_dir.value == null) if (config.state_dir) |dir| applyStateDir(dir);
 
     // Process-mode teammates must bind the complete App initialization to
     // their parent's session. Adopting only after App.init would seed KG,
@@ -555,6 +564,20 @@ pub fn main(init: std.process.Init) !void {
         };
         dumpWrite(out.written());
         return;
+    }
+
+    // The state root, after `--version` (which needs no state) and before
+    // anything that reads or writes some.
+    config.state_root = hostStateRoot() catch std.process.exit(2);
+    if (config.state_root.len > 0) {
+        // Every subsystem writes beneath the root; create it (and an install's
+        // `<prefix>/state` parent chain) once, owner-only, before any of them
+        // run. A root that cannot be created (read-only or missing home) is
+        // what a missing $HOME always was: each subsystem degrades on its own.
+        @import("util/fs.zig").mkdirParents(config.state_root) catch |err| {
+            std.debug.print("warning: cannot create the state root {s} ({s}); sessions, credentials and memory will not persist\n", .{ config.state_root, @errorName(err) });
+        };
+        @import("core/context_caps.zig").configureStateRoot(config.state_root);
     }
 
     // 初始化日志：读 METACODES_LOG / METACODES_LOG_FILE 环境变量
@@ -613,7 +636,7 @@ pub fn main(init: std.process.Init) !void {
                 gateway_override = gateway;
                 config.base_url = allocator.dupe(u8, gateway) catch null;
             }
-            var metask_session = provider_oauth_mod.Session.initHome(allocator, provider_ids_mod.Slug.lit("metask")) catch null;
+            var metask_session = provider_oauth_mod.Session.initHome(allocator, config.state_root, provider_ids_mod.Slug.lit("metask")) catch null;
             if (metask_session) |*session| {
                 defer session.deinit();
                 if (session.load() catch false) if (session.tokens) |tokens| {
@@ -759,7 +782,7 @@ pub fn main(init: std.process.Init) !void {
 
     var resolved_credential: ?auth.ResolvedCredential = null;
     if (!introspection_only and provider_secret == null) {
-        resolved_credential = auth.resolveRuntimeCredential(allocator, config.api_key, config.auth_precedence) catch |err| {
+        resolved_credential = auth.resolveRuntimeCredential(allocator, config.state_root, config.api_key, config.auth_precedence) catch |err| {
             @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
             std.debug.print(
                 \\Authentication required.
@@ -946,7 +969,7 @@ fn metaskUsesDeviceFlow(mode: LoginMode) bool {
 /// Builds the doctor's KG object with the read-only probe (a diagnosis command
 /// must never create or migrate a store). Owned strings only; any allocation
 /// failure leaves the report without a `kg` object instead of mixing in statics.
-pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").KgClient, home: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
+pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").KgClient, state_root: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
     const kclient = kg orelse return try kgDiagnosisOwned(allocator, "unconfigured", "unconfigured", "-", @import("kg/client.zig").KgClient.hintFor(.unconfigured));
     kclient.ensureReadyReadOnly();
     const state: []const u8 = if (kclient.ready) "ready" else @tagName(kclient.degradedKind() orelse .unconfigured);
@@ -958,12 +981,12 @@ pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").
     const env_config_path: ?[]const u8 = if (std.c.getenv("METACODES_KG_CONFIG")) |p| std.mem.span(p) else null;
     const env_triple = std.c.getenv("METACODES_KG_URL") != null or std.c.getenv("METACODES_KG_API_KEY") != null or
         std.c.getenv("METACODES_KG_EXPECTED_BUILD_ID") != null;
-    const default_path: ?[]u8 = if (!is_cli and !env_triple and env_config_path == null)
-        try std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/daemon.json", .{home})
+    const default_path: ?[]u8 = if (!is_cli and !env_triple and env_config_path == null and state_root.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}/kg/daemon.json", .{state_root})
     else
         null;
     defer if (default_path) |p| allocator.free(p);
-    const config: []const u8 = if (is_cli) "-" else if (env_triple) "env" else (env_config_path orelse default_path.?);
+    const config: []const u8 = if (is_cli) "-" else if (env_triple) "env" else (env_config_path orelse default_path orelse "-");
     const hint: []const u8 = if (kclient.ready) "-" else kclient.degradedHint();
     return try kgDiagnosisOwned(allocator, state, transport, config, hint);
 }
@@ -1018,8 +1041,7 @@ fn runKg(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
             return 2;
         }
     }
-    const home = @import("platform").paths.homeDir() orelse "";
-    var outcome = kgd_install.run(allocator, home, options) catch |err| {
+    var outcome = kgd_install.run(allocator, hostRoot(), options) catch |err| {
         std.debug.print("error: kg install failed ({s}){s}\n", .{ @errorName(err), kgInstallHint(err) });
         return 1;
     };
@@ -1075,8 +1097,7 @@ fn runKgd(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
             return 2;
         }
     }
-    const home = @import("platform").paths.homeDir() orelse "";
-    var config = kgd_runtime.loadConfig(allocator, home, options) catch |err| {
+    var config = kgd_runtime.loadConfig(allocator, hostRoot(), options) catch |err| {
         std.debug.print("error: cannot read the TinyKG configuration ({s}){s}\n", .{ @errorName(err), kgdConfigHint(err) });
         return 1;
     };
@@ -1116,17 +1137,21 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
         std.debug.print("error: doctor could not resolve the runtime binaries ({s})\n", .{@errorName(err)});
         return 1;
     };
-    const home = @import("platform").paths.homeDir() orelse "";
+    const state_dir = hostRoot();
+    report.state_root = if (@import("util/state_root.zig").resolve()) |resolved|
+        .{ .path = resolved.path, .source = resolved.source.label(), .err = null }
+    else |err|
+        .{ .path = null, .source = null, .err = @errorName(err) };
     const cwd = @import("util/fs.zig").getCwd(allocator) catch "";
     defer if (cwd.len > 0) allocator.free(cwd);
     const hash = @import("core/transcript.zig").hashCwd(cwd);
     const domain = std.fmt.allocPrint(allocator, "doctor-{s}", .{hash[0..8]}) catch "doctor";
     defer if (!std.mem.eql(u8, domain, "doctor")) allocator.free(domain);
-    var kg = @import("kg/client.zig").KgClient.init(allocator, .{ .home = home, .domain = domain, .io = io }) catch null;
+    var kg = @import("kg/client.zig").KgClient.init(allocator, .{ .state_root = state_dir, .domain = domain, .io = io }) catch null;
     defer if (kg) |*kclient| kclient.deinit();
     // KG diagnosis is all-or-nothing: KgDiagnosis.deinit frees every field, so
     // no static fallback string may ever be stored in it. OOM → no kg object.
-    report.kg = kgDiagnosis(allocator, if (kg) |*kclient| kclient else null, home) catch |err| blk: {
+    report.kg = kgDiagnosis(allocator, if (kg) |*kclient| kclient else null, state_dir) catch |err| blk: {
         @import("util/log.zig").warn("doctor", "unable to allocate KG diagnosis ({s}); omitting kg object", .{@errorName(err)});
         break :blk null;
     };
@@ -1143,12 +1168,194 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
     return if (strict and !report.healthy()) 1 else 0;
 }
 
-fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u8 {
+const LeadingStateDir = struct { consumed: u8 = 0, value: ?[]const u8 = null };
+
+/// `--state-dir <dir>` / `--state-dir=<dir>` in argv[1]. Exits 2 on a missing value.
+fn leadingStateDir(init: std.process.Init, allocator: std.mem.Allocator) LeadingStateDir {
+    var args = argsIter(init);
+    defer args.deinit();
+    _ = args.next();
+    const first = args.next() orelse return .{};
+    if (std.mem.startsWith(u8, first, "--state-dir=")) {
+        const value = first["--state-dir=".len..];
+        if (value.len == 0) stateDirUsage();
+        return .{ .consumed = 1, .value = allocator.dupe(u8, value) catch stateDirUsage() };
+    }
+    if (!std.mem.eql(u8, first, "--state-dir")) return .{};
+    const value = args.next() orelse stateDirUsage();
+    if (value.len == 0) stateDirUsage();
+    return .{ .consumed = 2, .value = allocator.dupe(u8, value) catch stateDirUsage() };
+}
+
+fn stateDirUsage() noreturn {
+    std.debug.print("error: --state-dir needs a directory (metacodes --state-dir <dir> [command ...])\n", .{});
+    std.process.exit(2);
+}
+
+/// Records `--state-dir`, made absolute against the cwd so a relative root
+/// cannot drift when a tool or teammate later changes directory.
+fn applyStateDir(dir: []const u8) void {
+    const state_root = @import("util/state_root.zig");
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var join_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute = if (std.fs.path.isAbsolute(dir)) dir else blk: {
+        const cwd = platform_fs.getCwd(&cwd_buf) orelse {
+            std.debug.print("error: --state-dir {s}: cannot read the current directory\n", .{dir});
+            std.process.exit(2);
+        };
+        var fba = std.heap.FixedBufferAllocator.init(&join_buf);
+        break :blk std.fs.path.join(fba.allocator(), &.{ cwd, dir }) catch {
+            std.debug.print("error: --state-dir {s}: path too long\n", .{dir});
+            std.process.exit(2);
+        };
+    };
+    state_root.setFlagOverride(absolute) catch |err| {
+        std.debug.print("error: --state-dir {s}: {s}\n", .{ dir, @errorName(err) });
+        std.process.exit(2);
+    };
+}
+
+/// The host's one resolution of the state root (util/state_root.zig), handed
+/// down explicitly from here. A configured root that does not resolve
+/// (relative METACODES_HOME, broken install.json) stops the process with the
+/// exit code 2 instead of falling back to another install's state; no
+/// root at all (no $HOME) is "" and subsystems degrade as before.
+fn hostStateRoot() error{StateRootRejected}![]const u8 {
+    const state_root = @import("util/state_root.zig");
+    const resolved = state_root.resolve() catch |err| {
+        switch (err) {
+            error.StateRootNotAbsolute => std.debug.print("error: the state root must be an absolute path (--state-dir / {s})\n", .{state_root.env_variable}),
+            error.InstallManifestInvalid, error.InstallManifestUnreadable => std.debug.print(
+                "error: this install's {s} is {s}; fix it, or override with --state-dir / {s}\n",
+                .{ state_root.manifest_relative_path, if (err == error.InstallManifestInvalid) "invalid" else "unreadable", state_root.env_variable },
+            ),
+            error.NoStateRoot => return "",
+            error.PathTooLong => std.debug.print("error: the state root path is too long\n", .{}),
+        }
+        return error.StateRootRejected;
+    };
+    return resolved.path;
+}
+
+/// The state root this host resolved at startup ("" when there is none).
+/// Host-only: src/main.zig hands it down; library code never reads it.
+fn hostRoot() []const u8 {
+    const resolved = @import("util/state_root.zig").resolve() catch return "";
+    return resolved.path;
+}
+
+const install_usage =
+    \\usage: metacodes install --prefix <dir> [--state-dir <dir>] [--sdk <agentcore-bundle-dir>]
+    \\                         [--link <bin-dir> [--link-name <name>]] [--force]
+    \\
+    \\Installs the release unit this executable belongs to at <dir> as one isolated
+    \\install: its own state root (default <dir>/state), kernels, TinyKG and, with
+    \\--sdk, the AgentCore SDK under <dir>/sdk/agentcore. --link writes a launcher
+    \\into a directory on PATH. Ends with the installed `doctor --strict`.
+    \\
+;
+
+fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: std.Io) u8 {
+    const install = @import("app/install.zig");
+    var options: install.Options = .{ .prefix = "" };
+    while (args.next()) |arg| {
+        const value_of = struct {
+            fn get(it: *std.process.Args.Iterator, name: []const u8) ?[]const u8 {
+                const value = it.next() orelse {
+                    std.debug.print("error: {s} needs a value\n{s}", .{ name, install_usage });
+                    return null;
+                };
+                return value;
+            }
+        };
+        if (std.mem.eql(u8, arg, "--prefix")) {
+            options.prefix = absolutePath(allocator, value_of.get(args, arg) orelse return 2) orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+            options.state_dir = absolutePath(allocator, value_of.get(args, arg) orelse return 2) orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--sdk")) {
+            options.sdk = absolutePath(allocator, value_of.get(args, arg) orelse return 2) orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--link")) {
+            options.link_dir = absolutePath(allocator, value_of.get(args, arg) orelse return 2) orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--link-name")) {
+            options.link_name = allocator.dupe(u8, value_of.get(args, arg) orelse return 2) catch return 1;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            options.force = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            std.debug.print("{s}", .{install_usage});
+            return 0;
+        } else {
+            std.debug.print("error: unknown install argument '{s}'\n{s}", .{ arg, install_usage });
+            return 2;
+        }
+    }
+    if (options.prefix.len == 0) {
+        std.debug.print("error: --prefix is required\n{s}", .{install_usage});
+        return 2;
+    }
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = @import("platform").paths.selfExeRealPath(&exe_buf) orelse {
+        std.debug.print("error: cannot locate this executable\n", .{});
+        return 1;
+    };
+    const source_root = @import("util/state_root.zig").prefixOf(exe) orelse {
+        std.debug.print("error: this executable is not inside a release unit (<root>/bin/metacodes)\n", .{});
+        return 1;
+    };
+    var log: std.Io.Writer.Allocating = .init(allocator);
+    defer log.deinit();
+    const outcome = install.run(allocator, io, source_root, options, &log.writer) catch |err| {
+        dumpWrite(log.written());
+        const hint: []const u8 = switch (err) {
+            error.NotAReleaseUnit => "run `metacodes install` from an unpacked release archive, or stage one from source: `zig build kernels:stage --prefix <u>` then `zig build release:verify -Drelease-layout=true --prefix <u> $(python3 scripts/kernel_pins.py <u>)`",
+            error.UnsupportedManifest => "the unit's manifest.json is not a metacodes-cli schema 2 release manifest",
+            error.PrefixOccupied => "the prefix holds files that are not a metacodes install; choose another or pass --force",
+            error.DifferentVersionInstalled => "another metacodes version is installed there; pass --force to replace it, or choose another prefix",
+            error.DigestMismatch => "a file does not match the release manifest; the unit is damaged",
+            error.InvalidSdkBundle => "--sdk must name an unpacked AgentCore bundle (its manifest.json says \"agentcore\")",
+            error.LinkOccupied => "the launcher name is taken by something else; pass --link-name or --force",
+            error.SelfCheckFailed => "the installed executable's `doctor --strict` failed (output above)",
+            else => "",
+        };
+        std.debug.print("error: install failed ({s}){s}{s}\n", .{ @errorName(err), if (hint.len > 0) ": " else "", hint });
+        return 1;
+    };
+    dumpWrite(log.written());
+    var summary: std.Io.Writer.Allocating = .init(allocator);
+    defer summary.deinit();
+    summary.writer.print("metacodes {s} is installed at {s}\n  run: {s}\n", .{ outcome.version, outcome.prefix, outcome.launcher orelse outcome.executable }) catch {};
+    if (outcome.launcher == null) summary.writer.print("  add {s}{c}bin to PATH, or reinstall with --link <dir on PATH>\n", .{ outcome.prefix, std.fs.path.sep }) catch {};
+    if (outcome.sdk) |sdk| summary.writer.print("  SDK: {s}\n", .{sdk}) catch {};
+    dumpWrite(summary.written());
+    return 0;
+}
+
+/// `path` made absolute against the cwd; null (after printing why) on failure.
+fn absolutePath(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path) catch null;
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = platform_fs.getCwd(&cwd_buf) orelse {
+        std.debug.print("error: cannot read the current directory to resolve {s}\n", .{path});
+        return null;
+    };
+    return std.fs.path.join(allocator, &.{ cwd, path }) catch null;
+}
+
+fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, leading: u8) !?u8 {
     var args = argsIter(init);
     defer args.deinit();
     _ = args.next(); // 跳过 argv[0](程序名)
+    for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
+    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login" };
+    for (subcommands) |name| {
+        if (std.mem.eql(u8, cmd, name)) break;
+    } else return null;
+    // `doctor` diagnoses a broken state root instead of refusing to start, and
+    // `install` creates one: neither needs this process's own.
     if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator, init.io);
+    if (std.mem.eql(u8, cmd, "install")) return runInstall(&args, allocator, init.io);
+    const state_dir = hostStateRoot() catch return 2;
+    if (state_dir.len > 0) @import("core/context_caps.zig").configureStateRoot(state_dir);
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "ledger")) {
@@ -1160,7 +1367,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
             std.debug.print("usage: metacodes ledger metask\n", .{});
             return 2;
         }
-        const bytes = @import("provider/metask_ledger.zig").read(allocator) catch |err| {
+        const bytes = @import("provider/metask_ledger.zig").read(allocator, state_dir) catch |err| {
             if (err == error.NotFound) return 0;
             std.debug.print("error: could not read Metask ledger ({s})\n", .{@errorName(err)});
             return 1;
@@ -1174,7 +1381,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
             std.debug.print("error: unknown logout argument '{s}'\n", .{extra});
             return 2;
         }
-        auth.clearDefault(allocator) catch |err| switch (err) {
+        auth.clearDefault(allocator, state_dir) catch |err| switch (err) {
             error.NoHome => {
                 std.debug.print("No HOME set; no credentials cleared.\n", .{});
                 return 1;
@@ -1305,7 +1512,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
                 return 1;
             };
             defer imported.deinit(allocator);
-            var stored = auth.loadDefault(allocator) catch |err| switch (err) {
+            var stored = auth.loadDefault(allocator, state_dir) catch |err| switch (err) {
                 error.NotFound, error.NoHome => auth.StoredCredentials{},
                 else => {
                     std.debug.print("Could not read existing credentials: {s}\n", .{@errorName(err)});
@@ -1323,7 +1530,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
                 std.debug.print("Login setup failed after OAuth: {s}\n", .{@errorName(err)});
                 return 1;
             };
-            try auth.saveDefault(allocator, stored);
+            try auth.saveDefault(allocator, state_dir, stored);
             std.debug.print("Successfully logged in with Metask OAuth. API key, model, and reasoning effort were selected. Secrets were not printed.\n", .{});
             return 0;
         },
@@ -1332,7 +1539,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
             return 0;
         },
         .status => {
-            try printLoginStatus(allocator);
+            try printLoginStatus(allocator, state_dir);
             return 0;
         },
         .api_key => {
@@ -1341,7 +1548,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
                 std.debug.print("Refusing to store an empty API key.\n", .{});
                 return 2;
             }
-            var stored = auth.loadDefault(allocator) catch |err| switch (err) {
+            var stored = auth.loadDefault(allocator, state_dir) catch |err| switch (err) {
                 error.NotFound, error.NoHome => auth.StoredCredentials{},
                 else => {
                     std.debug.print("Could not read existing credentials: {s}\n", .{@errorName(err)});
@@ -1359,7 +1566,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
                 std.debug.print("Login setup failed after API key import: {s}\n", .{@errorName(err)});
                 return 1;
             };
-            try auth.saveDefault(allocator, stored);
+            try auth.saveDefault(allocator, state_dir, stored);
             std.debug.print("Stored Metask API key. Model and reasoning effort were selected. Token value was not printed.\n", .{});
             return 0;
         },
@@ -1371,7 +1578,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
                 return 1;
             };
             defer imported.deinit(allocator);
-            var stored = auth.loadDefault(allocator) catch |err| switch (err) {
+            var stored = auth.loadDefault(allocator, state_dir) catch |err| switch (err) {
                 error.NotFound, error.NoHome => auth.StoredCredentials{},
                 else => {
                     std.debug.print("Could not read existing credentials: {s}\n", .{@errorName(err)});
@@ -1389,7 +1596,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
                 std.debug.print("Login setup failed after OAuth import: {s}\n", .{@errorName(err)});
                 return 1;
             };
-            try auth.saveDefault(allocator, stored);
+            try auth.saveDefault(allocator, state_dir, stored);
             std.debug.print("Stored Metask OAuth credentials. API key, model, and reasoning effort were selected. Secrets were not printed.\n", .{});
             return 0;
         },
@@ -1420,7 +1627,7 @@ fn printLoginHelp() void {
         \\OAuth token JSON must match the token endpoint response:
         \\access_token, refresh_token, token_type=Bearer, expires_in. It remains
         \\the non-interactive path for CI and recovery.
-        \\Secrets are stored in ~/.metacodes/auth.json with 0600 permissions.
+        \\Secrets are stored in <state root>/auth.json with 0600 permissions (see `metacodes doctor`).
         \\
     , .{});
 }
@@ -1537,8 +1744,8 @@ fn reasoningOptionsForMask(mask: u8, buf: *[5]types.ReasoningEffort) []const typ
     return buf[0..n];
 }
 
-fn printLoginStatus(allocator: std.mem.Allocator) !void {
-    const path = auth.authFilePath(allocator) catch |err| {
+fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
+    const path = auth.authFilePath(allocator, state_dir) catch |err| {
         std.debug.print("No credential file path: {s}\n", .{@errorName(err)});
         return;
     };
@@ -1593,7 +1800,7 @@ fn readFileArg(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn applyStoredLoginSelection(allocator: std.mem.Allocator, config: *types.Config) !void {
-    var stored = auth.loadDefault(allocator) catch |err| switch (err) {
+    var stored = auth.loadDefault(allocator, config.state_root) catch |err| switch (err) {
         error.NotFound, error.NoHome => return,
         else => return err,
     };
@@ -1629,7 +1836,7 @@ const MetaskSessionError = provider_oauth_mod.OAuthError || error{NoSession};
 /// Load and refresh the new Metask session. The returned token is an owned,
 /// scrubbed copy; the Session itself can be closed before App construction.
 fn resolveMetaskBearer(allocator: std.mem.Allocator, io: std.Io) MetaskSessionError![]u8 {
-    var session = try provider_oauth_mod.Session.initHome(allocator, provider_ids_mod.Slug.lit("metask"));
+    var session = try provider_oauth_mod.Session.initHome(allocator, hostRoot(), provider_ids_mod.Slug.lit("metask"));
     defer session.deinit();
     if (!(try session.load())) return error.NoSession;
     var site_buf: [1024]u8 = undefined;
@@ -1792,7 +1999,7 @@ fn runMetaskDeviceLogin(allocator: std.mem.Allocator, io: std.Io, open_browser: 
         return 1;
     }
     const provider_id = provider_ids_mod.Slug.lit("metask");
-    var session = provider_oauth_mod.Session.initHome(allocator, provider_id) catch |err| {
+    var session = provider_oauth_mod.Session.initHome(allocator, hostRoot(), provider_id) catch |err| {
         std.debug.print("error: could not open the Metask OAuth store ({s})\n", .{@errorName(err)});
         return 2;
     };
@@ -1837,6 +2044,7 @@ fn runProviderOAuthLogin(
         .method = options.method,
         .open_browser = options.open_browser,
         .client_id = options.client_id,
+        .state_root = hostRoot(),
     }, host.oauthClientIdFor(built.id)) catch |err| switch (err) {
         error.ProviderHasNoTokenEndpoint, error.ProviderAcceptsNoOAuthKind => {
             _ = requireOAuthCapableProvider(built);
@@ -1861,7 +2069,7 @@ fn runProviderOAuthLogin(
             std.debug.print(
                 "error: provider '{s}' declares no OAuth client id; " ++
                     "pass --client-id <client> or set providers.{s}.oauth_client_id " ++
-                    "in ~/.metacodes/config.json\n" ++
+                    "in <state root>/config.json\n" ++
                     "(a provider defined under custom_providers can declare " ++
                     "oauth.client_id instead; every one of these is used for refresh too)\n",
                 .{ built.id.slice(), built.id.slice() },
@@ -1903,7 +2111,7 @@ fn importProviderTokenResponse(
     client_id: ?[]const u8,
 ) u8 {
     var diagnostic: provider_login.ImportDiagnostic = .{};
-    provider_login.importTokenResponse(allocator, provider_id, token_json, client_id, &diagnostic) catch |err|
+    provider_login.importTokenResponse(allocator, hostRoot(), provider_id, token_json, client_id, &diagnostic) catch |err|
         return reportImportFailure(err, diagnostic);
     std.debug.print(
         "Stored an OAuth login for provider '{s}'. No secret was printed.\n",
@@ -1965,7 +2173,7 @@ var startup_warning_reported: bool = false;
 /// happily listed. The caller destroys it.
 fn buildProviderHost(allocator: std.mem.Allocator) ?*provider_host.Host {
     const host = provider_host.Host.create(allocator) catch return null;
-    var store = provider_config_store.Store.initHome(allocator) catch return host;
+    var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch return host;
     defer store.deinit();
     host.adoptDurableState(&store);
     if (host.startup_warning) |why| {
@@ -1978,7 +2186,7 @@ fn buildProviderHost(allocator: std.mem.Allocator) ?*provider_host.Host {
             // surfaces as `unknown provider 'my-relay'` with nothing connecting
             // the two — which is the report this warning exists to prevent.
             std.debug.print(
-                "warning: part of ~/.metacodes/config.json did not apply ({s}); " ++
+                "warning: part of <state root>/config.json did not apply ({s}); " ++
                     "run `metacodes --check-providers` for details\n",
                 .{why},
             );
@@ -2000,7 +2208,7 @@ pub fn checkProviders(allocator: std.mem.Allocator) u8 {
     defer host.destroy();
 
     var status: u8 = 0;
-    var store = provider_config_store.Store.initHome(allocator) catch null;
+    var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch null;
     defer if (store) |*value| value.deinit();
 
     if (store) |*value| {
@@ -2333,6 +2541,16 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             }
         } else if (std.mem.eql(u8, arg, "--record")) {
             if (args.next()) |s| config.record_dir = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--state-dir") or std.mem.startsWith(u8, arg, "--state-dir=")) {
+            const value = if (arg.len > "--state-dir".len) arg["--state-dir=".len..] else args.next() orelse {
+                setParseError(config, allocator, "missing value for --state-dir", .{});
+                return;
+            };
+            if (value.len == 0) {
+                setParseError(config, allocator, "empty value for --state-dir", .{});
+                return;
+            }
+            config.state_dir = allocator.dupe(u8, value) catch value;
         } else if (std.mem.eql(u8, arg, "--max-tokens")) {
             const s = args.next() orelse {
                 setParseError(config, allocator, "missing value for --max-tokens", .{});
@@ -2578,6 +2796,9 @@ fn printHelp() void {
         \\  --openai-protocol <p> OpenAI wire protocol: chat_completions (default; alias "chat") | responses (env METACODES_OPENAI_PROTOCOL)
         \\  --auth-precedence <p> api-key-first | oauth-first
         \\  --record <dir>        Record requests + SSE responses to dir (cassette)
+        \\  --state-dir <dir>     State root for config, credentials, KG store, sessions (first
+        \\                        argument to also apply to subcommands; else METACODES_HOME,
+        \\                        <prefix>/etc/metacodes/install.json, ~/.metacodes)
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output
         \\  --lsp                 Enable language server integration (default; overrides an earlier --no-lsp)
@@ -2644,6 +2865,7 @@ test {
     _ = &@import("core/memory/memory_section.zig");
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
+    _ = &@import("app/install.zig");
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("util/abort.zig");

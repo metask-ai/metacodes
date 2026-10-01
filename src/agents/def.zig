@@ -33,7 +33,7 @@ pub const Isolation = enum { none, worktree };
 
 pub const Origin = enum {
     builtin, // Explore/Plan/general-purpose
-    personal, // ~/.metacodes/agents 或 ~/.claude/agents
+    personal, // <state root>/agents 或 ~/.claude/agents
     project, // <repo>/.metacodes/agents 或 <repo>/.claude/agents
     plugin, // <plugin>/agents
     cli, // --agents JSON 临时定义

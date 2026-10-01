@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime.zig");
+const test_kernel = @import("test_kernel.zig");
 const artifact_store = @import("artifact_store.zig");
 const provenance = @import("provenance.zig");
 const projection = @import("../kg/task_projection.zig");
@@ -205,7 +206,7 @@ pub fn executeWithConfig(
     const args = try parseArgs(ctx.allocator, args_json);
     const started_wall_ns = time.nowWallNs();
     const started_monotonic_ns = time.nowNs();
-    const telemetry_path = try resolveTelemetryPath(ctx.allocator, ctx.home_dir, telemetry_override);
+    const telemetry_path = try resolveTelemetryPath(ctx.allocator, ctx.state_root, telemetry_override);
     defer if (telemetry_path) |path| ctx.allocator.free(path);
 
     const kg = ctx.kg orelse return finalizePreflight(ctx.allocator, .{
@@ -411,7 +412,7 @@ fn renderPreflight(
     source_error: ?[]const u8,
 ) anyerror![]u8 {
     _ = try parseArgs(ctx.allocator, args_json);
-    const path = try resolveTelemetryPath(ctx.allocator, ctx.home_dir, null);
+    const path = try resolveTelemetryPath(ctx.allocator, ctx.state_root, null);
     defer if (path) |owned| ctx.allocator.free(owned);
     const now = time.nowWallNs();
     const monotonic = time.nowNs();
@@ -752,7 +753,7 @@ fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
 
 fn resolveTelemetryPath(
     allocator: std.mem.Allocator,
-    home_dir: []const u8,
+    state_root: []const u8,
     override: ?[]const u8,
 ) !?[]u8 {
     if (override) |path| {
@@ -764,11 +765,11 @@ fn resolveTelemetryPath(
         if (!std.fs.path.isAbsolute(path) or path.len == 0) return null;
         return try allocator.dupe(u8, path);
     }
-    if (home_dir.len == 0) return null;
+    if (state_root.len == 0) return null;
     return try std.fmt.allocPrint(
         allocator,
-        "{s}/.metacodes/research/formal-control/events-v1.jsonl",
-        .{home_dir},
+        "{s}/research/formal-control/events-v1.jsonl",
+        .{state_root},
     );
 }
 
@@ -882,13 +883,9 @@ test "task audit facts require evidence for every terminal task" {
 }
 
 test "native formal task audit binds sidecar verdict and persists mechanism receipt" {
-    const raw_path = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_PATH") orelse return error.SkipZigTest;
-    const raw_hash = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_SHA256") orelse return error.SkipZigTest;
-    const checker_path = std.mem.span(raw_path);
-    const hash_text = std.mem.span(raw_hash);
-    if (hash_text.len != 64) return error.SkipZigTest;
-    var expected_sha256: [64]u8 = undefined;
-    @memcpy(&expected_sha256, hash_text);
+    const kernel = (try test_kernel.resolve(std.testing.io, .formal)) orelse return error.SkipZigTest;
+    const checker_path = kernel.path;
+    const expected_sha256 = kernel.expected_sha256;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

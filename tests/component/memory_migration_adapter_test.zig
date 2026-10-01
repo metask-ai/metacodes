@@ -99,18 +99,13 @@ const Fake = struct {
     }
 };
 
-fn checkerConfig() ?cc.formal_runtime.Config {
-    const raw_checker = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_PATH") orelse return null;
-    const raw_hash = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_SHA256") orelse return null;
-    const hash = std.mem.span(raw_hash);
-    if (hash.len != 64) return null;
-    var expected: [64]u8 = undefined;
-    @memcpy(&expected, hash);
-    return .{ .checker_path = std.mem.span(raw_checker), .expected_sha256 = expected };
+fn checkerConfig() !?cc.formal_runtime.Config {
+    const kernel = (try cc.formal_test_kernel.resolve(std.testing.io, .formal)) orelse return null;
+    return .{ .checker_path = kernel.path, .expected_sha256 = kernel.expected_sha256 };
 }
 
 test "L2 governed memory transaction crosses TinyKG sensor Lean checker CAS receipt and post-state" {
-    const config = checkerConfig() orelse return error.SkipZigTest;
+    const config = (try checkerConfig()) orelse return error.SkipZigTest;
     var fake = Fake{ .allocator = std.testing.allocator };
     defer fake.deinit();
     var result = try cc.kg_memory_migration_adapter.execute(
@@ -159,7 +154,7 @@ test "L2 governed memory transaction crosses TinyKG sensor Lean checker CAS rece
 }
 
 test "L2 governed memory transaction fails closed before CAS when capability or reobservation drifts" {
-    const config = checkerConfig() orelse return error.SkipZigTest;
+    const config = (try checkerConfig()) orelse return error.SkipZigTest;
     var unavailable = Fake{ .allocator = std.testing.allocator, .capabilities_ok = false };
     defer unavailable.deinit();
     try std.testing.expectError(
@@ -190,7 +185,7 @@ test "L2 governed memory transaction fails closed before CAS when capability or 
 }
 
 test "L2 prepared memory migration freezes exact host commit bytes before side effect" {
-    const config = checkerConfig() orelse return error.SkipZigTest;
+    const config = (try checkerConfig()) orelse return error.SkipZigTest;
     var fake = Fake{ .allocator = std.testing.allocator };
     defer fake.deinit();
     var prepared = try cc.kg_memory_migration_adapter.prepare(
@@ -216,7 +211,7 @@ test "L2 prepared memory migration freezes exact host commit bytes before side e
 }
 
 test "L2 prepared memory migration is single-attempt even after indeterminate commit" {
-    const config = checkerConfig() orelse return error.SkipZigTest;
+    const config = (try checkerConfig()) orelse return error.SkipZigTest;
     var fake = Fake{ .allocator = std.testing.allocator, .malformed_receipt = true };
     defer fake.deinit();
     var prepared = try cc.kg_memory_migration_adapter.prepare(
@@ -240,7 +235,7 @@ test "L2 prepared memory migration is single-attempt even after indeterminate co
 }
 
 test "L2 governed memory transaction rejects a sensor snapshot not bound to requested ids" {
-    const config = checkerConfig() orelse return error.SkipZigTest;
+    const config = (try checkerConfig()) orelse return error.SkipZigTest;
     var fake = Fake{ .allocator = std.testing.allocator, .mismatched_snapshot_ids = true };
     defer fake.deinit();
     try std.testing.expectError(
@@ -257,7 +252,7 @@ test "L2 governed memory transaction rejects a sensor snapshot not bound to requ
 }
 
 test "L2 governed memory transaction refuses forged receipt and invalid post-state" {
-    const config = checkerConfig() orelse return error.SkipZigTest;
+    const config = (try checkerConfig()) orelse return error.SkipZigTest;
     var forged = Fake{ .allocator = std.testing.allocator, .malformed_receipt = true };
     defer forged.deinit();
     try std.testing.expectError(

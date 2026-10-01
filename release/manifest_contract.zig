@@ -92,6 +92,20 @@ pub const Manifest = struct {
 
 pub const Channel = enum { stable, pre };
 
+/// v2 (doc/INSTALL_DESIGN.md §2): the unit also ships the TinyKG daemon and
+/// both Lean governance kernels, so a release is complete on every platform.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The runtime assets a v2 release cannot be complete without, and what the
+/// product does when one is missing (`compatibility.degraded_without`).
+pub const degraded_components = [_][]const u8{ "tinykg", "tinykgd", "formal_kernel", "project_kernel" };
+
+/// Kernel names as `components[].name`, file stems under `libexec/metacodes/`.
+pub const kernels = [_]struct { name: []const u8, stem: []const u8 }{
+    .{ .name = "formal_kernel", .stem = "metacodes-formal-kernel" },
+    .{ .name = "project_kernel", .stem = "metacodes-project-kernel" },
+};
+
 /// What the build that produced the prefix knows independently of the
 /// manifest; every field must be echoed exactly.
 pub const Expected = struct {
@@ -138,6 +152,8 @@ pub const Error = error{
     PrimaryExecutableInvalid,
     RipgrepComponentInvalid,
     TinykgComponentInvalid,
+    TinykgdComponentInvalid,
+    KernelComponentInvalid,
     UnknownComponent,
     ComponentDigestMismatch,
     RequiresMismatch,
@@ -155,7 +171,7 @@ pub fn validateManifest(manifest: Manifest, expected: Expected, expected_paths: 
 }
 
 pub fn validateIdentity(manifest: Manifest, expected: Expected) Error!void {
-    if (manifest.schema_version != 1) return error.UnsupportedSchemaVersion;
+    if (manifest.schema_version != SCHEMA_VERSION) return error.UnsupportedSchemaVersion;
     if (!std.mem.eql(u8, manifest.vendor, "metask")) return error.WrongVendor;
     if (!std.mem.eql(u8, manifest.name, "metacodes-cli")) return error.WrongName;
 
@@ -219,42 +235,67 @@ pub fn validateFiles(files: []const FileEntry, expected_paths: []const []const u
     for (expected_paths) |path| if (fileSha256(files, path) == null) return error.MissingFile;
 }
 
-/// Exactly the primary executable and the two runtime assets, each at its
+/// The longest path a component may name (a kernel's sidecar on Windows).
+pub const MAX_COMPONENT_PATH = 96;
+
+/// `libexec/metacodes/<stem>[.exe]`, formatted into `buffer`.
+pub fn kernelPath(os: []const u8, stem: []const u8, buffer: *[MAX_COMPONENT_PATH]u8) []const u8 {
+    const suffix: []const u8 = if (std.mem.eql(u8, os, "windows")) ".exe" else "";
+    return std.fmt.bufPrint(buffer, "libexec/metacodes/{s}{s}", .{ stem, suffix }) catch unreachable;
+}
+
+/// Exactly the primary executable and the five runtime assets, each at its
 /// place for the os, each digest equal to the files entry, each licence and
-/// receipt listed.
+/// receipt listed; the daemon comes from the same TinyKG bundle as the CLI.
 pub fn validateComponents(components: []const Component, files: []const FileEntry, os: []const u8, release_version: []const u8) Error!void {
     const is_windows = std.mem.eql(u8, os, "windows");
     const metacodes_path: []const u8 = if (is_windows) "bin/metacodes.exe" else "bin/metacodes";
     const ripgrep_path: []const u8 = if (is_windows) "bin/rg.exe" else "bin/rg";
     const tinykg_path: []const u8 = if (is_windows) "vendor/tinykg/tinykg.exe" else "vendor/tinykg/tinykg";
+    const tinykgd_path: []const u8 = if (is_windows) "vendor/tinykg/tinykgd.exe" else "vendor/tinykg/tinykgd";
 
     var primary_count: usize = 0;
     var ripgrep_count: usize = 0;
     var tinykg_count: usize = 0;
+    var tinykgd_count: usize = 0;
+    var kernel_counts = [_]usize{0} ** kernels.len;
     for (components) |component| {
         const listed = fileSha256(files, component.path) orelse return error.ComponentDigestMismatch;
         if (!std.mem.eql(u8, listed, component.sha256)) return error.ComponentDigestMismatch;
+        const runtime_asset = std.mem.eql(u8, component.role, "runtime_asset");
 
         if (std.mem.eql(u8, component.role, "primary_executable") and std.mem.eql(u8, component.name, "metacodes")) {
             primary_count += 1;
             if (!std.mem.eql(u8, component.path, metacodes_path)) return error.PrimaryExecutableInvalid;
             if (!std.mem.eql(u8, component.version, release_version)) return error.PrimaryExecutableInvalid;
-        } else if (std.mem.eql(u8, component.role, "runtime_asset") and std.mem.eql(u8, component.name, "ripgrep")) {
+        } else if (runtime_asset and std.mem.eql(u8, component.name, "ripgrep")) {
             ripgrep_count += 1;
             if (!std.mem.eql(u8, component.path, ripgrep_path)) return error.RipgrepComponentInvalid;
             if (component.revision == null or component.upstream == null or component.license == null) return error.RipgrepComponentInvalid;
             const license_path = component.license_path orelse return error.RipgrepComponentInvalid;
             if (fileSha256(files, license_path) == null) return error.RipgrepComponentInvalid;
-        } else if (std.mem.eql(u8, component.role, "runtime_asset") and std.mem.eql(u8, component.name, "tinykg")) {
+        } else if (runtime_asset and std.mem.eql(u8, component.name, "tinykg")) {
             tinykg_count += 1;
             if (!std.mem.eql(u8, component.path, tinykg_path)) return error.TinykgComponentInvalid;
-            const source_commit = component.source_commit orelse return error.TinykgComponentInvalid;
-            if (source_commit.len != 40 or !isLowerHex(source_commit)) return error.TinykgComponentInvalid;
-            const license_path = component.license_path orelse return error.TinykgComponentInvalid;
-            if (fileSha256(files, license_path) == null) return error.TinykgComponentInvalid;
-            const provenance_path = component.provenance_path orelse return error.TinykgComponentInvalid;
-            if (fileSha256(files, provenance_path) == null) return error.TinykgComponentInvalid;
-            if (component.compat == null or component.upstream == null or component.license == null) return error.TinykgComponentInvalid;
+            if (!tinykgBundleMember(component, files, "vendor/tinykg/tinykg.provenance.json")) return error.TinykgComponentInvalid;
+            if (component.compat == null) return error.TinykgComponentInvalid;
+        } else if (runtime_asset and std.mem.eql(u8, component.name, "tinykgd")) {
+            tinykgd_count += 1;
+            if (!std.mem.eql(u8, component.path, tinykgd_path)) return error.TinykgdComponentInvalid;
+            if (!tinykgBundleMember(component, files, "vendor/tinykg/tinykgd.provenance.json")) return error.TinykgdComponentInvalid;
+        } else if (runtime_asset and kernelIndex(component.name) != null) {
+            const index = kernelIndex(component.name).?;
+            kernel_counts[index] += 1;
+            var path_buffer: [MAX_COMPONENT_PATH]u8 = undefined;
+            if (!std.mem.eql(u8, component.path, kernelPath(os, kernels[index].stem, &path_buffer))) return error.KernelComponentInvalid;
+            if (component.version.len == 0 or component.license == null) return error.KernelComponentInvalid;
+            const license_path = component.license_path orelse return error.KernelComponentInvalid;
+            if (fileSha256(files, license_path) == null) return error.KernelComponentInvalid;
+            // The sidecar the kernel's own loader reads: `<path>.provenance.json`.
+            const provenance_path = component.provenance_path orelse return error.KernelComponentInvalid;
+            if (!std.mem.startsWith(u8, provenance_path, component.path) or
+                !std.mem.eql(u8, provenance_path[component.path.len..], ".provenance.json")) return error.KernelComponentInvalid;
+            if (fileSha256(files, provenance_path) == null) return error.KernelComponentInvalid;
         } else {
             return error.UnknownComponent;
         }
@@ -262,11 +303,35 @@ pub fn validateComponents(components: []const Component, files: []const FileEntr
     if (primary_count != 1) return error.PrimaryExecutableInvalid;
     if (ripgrep_count != 1) return error.RipgrepComponentInvalid;
     if (tinykg_count != 1) return error.TinykgComponentInvalid;
+    if (tinykgd_count != 1) return error.TinykgdComponentInvalid;
+    for (kernel_counts) |count| if (count != 1) return error.KernelComponentInvalid;
+    // One TinyKG bundle: the daemon is the CLI's own release and commit.
+    const cli = findComponent(components, "tinykg").?;
+    const daemon = findComponent(components, "tinykgd").?;
+    if (!std.mem.eql(u8, cli.version, daemon.version) or
+        !std.mem.eql(u8, cli.source_commit.?, daemon.source_commit.?)) return error.TinykgdComponentInvalid;
+}
+
+fn tinykgBundleMember(component: Component, files: []const FileEntry, receipt_path: []const u8) bool {
+    const source_commit = component.source_commit orelse return false;
+    if (source_commit.len != 40 or !isLowerHex(source_commit)) return false;
+    const license_path = component.license_path orelse return false;
+    if (fileSha256(files, license_path) == null) return false;
+    const provenance_path = component.provenance_path orelse return false;
+    if (!std.mem.eql(u8, provenance_path, receipt_path) or fileSha256(files, provenance_path) == null) return false;
+    return component.upstream != null and component.license != null;
+}
+
+fn kernelIndex(name: []const u8) ?usize {
+    for (kernels, 0..) |kernel, index| if (std.mem.eql(u8, kernel.name, name)) return index;
+    return null;
 }
 
 /// The behaviour without a component is part of the contract: TinyKG is
 /// required at its minor series with the probed store schemas, ripgrep's
-/// absence disables Grep/Glob, TinyKG's absence degrades memory only.
+/// absence disables Grep/Glob, and each of `degraded_components` degrades
+/// its own capability only (the agent loop keeps running; the kernels' gates
+/// fail closed).
 pub fn validateCompatibility(manifest: Manifest) Error!void {
     const compatibility = manifest.compatibility;
     for (compatibility.requires) |requirement| if (findComponent(manifest.components, requirement.component) == null) return error.CompatibilityUnknownComponent;
@@ -283,7 +348,14 @@ pub fn validateCompatibility(manifest: Manifest) Error!void {
     if (!isMinorSeriesOf(requirement.cli_version, tinykg.version)) return error.RequiresMismatch;
 
     if (compatibility.fails_without.len != 1 or !std.mem.eql(u8, compatibility.fails_without[0].component, "ripgrep")) return error.FailsWithoutMismatch;
-    if (compatibility.degraded_without.len != 1 or !std.mem.eql(u8, compatibility.degraded_without[0].component, "tinykg")) return error.DegradedWithoutMismatch;
+    if (compatibility.degraded_without.len != degraded_components.len) return error.DegradedWithoutMismatch;
+    for (degraded_components) |name| {
+        var count: usize = 0;
+        for (compatibility.degraded_without) |effect| {
+            if (std.mem.eql(u8, effect.component, name)) count += 1;
+        }
+        if (count != 1) return error.DegradedWithoutMismatch;
+    }
 }
 
 /// `0.2.x` is the series of `0.2.0`.
@@ -314,18 +386,46 @@ fn isLowerHex(bytes: []const u8) bool {
     return true;
 }
 
-pub const MAX_EXPECTED_FILES: usize = 10;
+/// Licence texts of the Lean runtime the kernels statically link
+/// (vendor/lean-runtime/manifest.json), shipped under `share/licenses/`.
+pub const lean_runtime_licenses = [_][]const u8{
+    "share/licenses/gmp-COPYING.LESSERv3",
+    "share/licenses/gmp-COPYINGv2",
+    "share/licenses/gmp-COPYINGv3",
+    "share/licenses/lean4-LICENSE",
+    "share/licenses/libuv-LICENSE",
+    "share/licenses/libuv-LICENSE-extra",
+};
+
+pub const MAX_EXPECTED_FILES: usize = 23;
 
 /// The whitelist for a target, sorted by path. `changelog_name` is
 /// `share/doc/CHANGELOG-<version>.md`, formatted by the caller into memory it
 /// owns; `include_license` is false only on the pre channel when the prefix
 /// carries no `share/licenses/metacodes-LICENSE` (the generator warned).
-pub fn expectedFiles(os: []const u8, changelog_name: []const u8, include_license: bool, buffer: *[MAX_EXPECTED_FILES][]const u8) []const []const u8 {
+/// `path_storage` holds the kernel paths the result points into.
+pub fn expectedFiles(
+    os: []const u8,
+    changelog_name: []const u8,
+    include_license: bool,
+    buffer: *[MAX_EXPECTED_FILES][]const u8,
+    path_storage: *[5][MAX_COMPONENT_PATH]u8,
+) []const []const u8 {
     const is_windows = std.mem.eql(u8, os, "windows");
+    const formal = kernelPath(os, kernels[0].stem, &path_storage[0]);
+    const project = kernelPath(os, kernels[1].stem, &path_storage[1]);
+    const formal_provenance = std.fmt.bufPrint(&path_storage[2], "{s}.provenance.json", .{formal}) catch unreachable;
+    const formal_receipt = std.fmt.bufPrint(&path_storage[3], "{s}.build-receipt.json", .{formal}) catch unreachable;
+    const project_provenance = std.fmt.bufPrint(&path_storage[4], "{s}.provenance.json", .{project}) catch unreachable;
     var count: usize = 0;
     const fixed = [_][]const u8{
         if (is_windows) "bin/metacodes.exe" else "bin/metacodes",
         if (is_windows) "bin/rg.exe" else "bin/rg",
+        formal,
+        formal_provenance,
+        formal_receipt,
+        project,
+        project_provenance,
         changelog_name,
         "share/doc/README.md",
         "share/licenses/THIRD_PARTY_NOTICES.md",
@@ -334,9 +434,15 @@ pub fn expectedFiles(os: []const u8, changelog_name: []const u8, include_license
         "share/licenses/tinykg-LICENSE",
         if (is_windows) "vendor/tinykg/tinykg.exe" else "vendor/tinykg/tinykg",
         "vendor/tinykg/tinykg.provenance.json",
+        if (is_windows) "vendor/tinykg/tinykgd.exe" else "vendor/tinykg/tinykgd",
+        "vendor/tinykg/tinykgd.provenance.json",
     };
     for (fixed) |path| {
         if (!include_license and std.mem.eql(u8, path, "share/licenses/metacodes-LICENSE")) continue;
+        buffer[count] = path;
+        count += 1;
+    }
+    for (lean_runtime_licenses) |path| {
         buffer[count] = path;
         count += 1;
     }
@@ -357,21 +463,39 @@ const digest_a = "a" ** 64;
 const digest_b = "b" ** 64;
 const digest_c = "c" ** 64;
 const digest_d = "d" ** 64;
+const digest_e = "e" ** 64;
+const digest_f = "f" ** 64;
+const digest_g = "0" ** 64;
 
 const linux_files = [_]FileEntry{
     .{ .path = "bin/metacodes", .sha256 = digest_a },
     .{ .path = "bin/rg", .sha256 = digest_b },
+    .{ .path = "libexec/metacodes/metacodes-formal-kernel", .sha256 = digest_e },
+    .{ .path = "libexec/metacodes/metacodes-formal-kernel.build-receipt.json", .sha256 = digest_d },
+    .{ .path = "libexec/metacodes/metacodes-formal-kernel.provenance.json", .sha256 = digest_d },
+    .{ .path = "libexec/metacodes/metacodes-project-kernel", .sha256 = digest_f },
+    .{ .path = "libexec/metacodes/metacodes-project-kernel.provenance.json", .sha256 = digest_d },
     .{ .path = "share/doc/CHANGELOG-0.1.0.md", .sha256 = digest_d },
     .{ .path = "share/doc/README.md", .sha256 = digest_d },
     .{ .path = "share/licenses/THIRD_PARTY_NOTICES.md", .sha256 = digest_d },
+    .{ .path = "share/licenses/gmp-COPYING.LESSERv3", .sha256 = digest_d },
+    .{ .path = "share/licenses/gmp-COPYINGv2", .sha256 = digest_d },
+    .{ .path = "share/licenses/gmp-COPYINGv3", .sha256 = digest_d },
+    .{ .path = "share/licenses/lean4-LICENSE", .sha256 = digest_d },
+    .{ .path = "share/licenses/libuv-LICENSE", .sha256 = digest_d },
+    .{ .path = "share/licenses/libuv-LICENSE-extra", .sha256 = digest_d },
     .{ .path = "share/licenses/metacodes-LICENSE", .sha256 = digest_d },
     .{ .path = "share/licenses/ripgrep-LICENSE-MIT", .sha256 = digest_d },
     .{ .path = "share/licenses/tinykg-LICENSE", .sha256 = digest_d },
     .{ .path = "vendor/tinykg/tinykg", .sha256 = digest_c },
     .{ .path = "vendor/tinykg/tinykg.provenance.json", .sha256 = digest_d },
+    .{ .path = "vendor/tinykg/tinykgd", .sha256 = digest_g },
+    .{ .path = "vendor/tinykg/tinykgd.provenance.json", .sha256 = digest_d },
 };
 
-fn linuxComponents(version: []const u8) [3]Component {
+const kernel_license = "MIT AND Apache-2.0 AND (LGPL-3.0-or-later OR GPL-2.0-or-later)";
+
+fn linuxComponents(version: []const u8) [6]Component {
     return .{
         .{ .role = "primary_executable", .name = "metacodes", .path = "bin/metacodes", .sha256 = digest_a, .version = version },
         .{
@@ -400,16 +524,56 @@ fn linuxComponents(version: []const u8) [3]Component {
             .compat = .{ .storage_format_version = "3", .store_schema_version = "3" },
             .purpose = "memory / task control plane",
         },
+        .{
+            .role = "runtime_asset",
+            .name = "tinykgd",
+            .path = "vendor/tinykg/tinykgd",
+            .sha256 = digest_g,
+            .version = "0.2.0",
+            .source_commit = test_commit,
+            .upstream = "https://github.com/metask-ai/tinykg",
+            .license = "Apache-2.0",
+            .license_path = "share/licenses/tinykg-LICENSE",
+            .provenance_path = "vendor/tinykg/tinykgd.provenance.json",
+            .purpose = "shared TinyKG store service",
+        },
+        .{
+            .role = "runtime_asset",
+            .name = "formal_kernel",
+            .path = "libexec/metacodes/metacodes-formal-kernel",
+            .sha256 = digest_e,
+            .version = "metacodes-formal-kernel-v2",
+            .license = kernel_license,
+            .license_path = "share/licenses/THIRD_PARTY_NOTICES.md",
+            .provenance_path = "libexec/metacodes/metacodes-formal-kernel.provenance.json",
+            .purpose = "Lean task-audit / memory-migration / artifact-verification checker",
+        },
+        .{
+            .role = "runtime_asset",
+            .name = "project_kernel",
+            .path = "libexec/metacodes/metacodes-project-kernel",
+            .sha256 = digest_f,
+            .version = "metacodes-project-harness-kernel-v3",
+            .license = kernel_license,
+            .license_path = "share/licenses/THIRD_PARTY_NOTICES.md",
+            .provenance_path = "libexec/metacodes/metacodes-project-kernel.provenance.json",
+            .purpose = "Lean project-rule gate",
+        },
     };
 }
 
 const requires = [_]Requirement{.{ .component = "tinykg", .cli_version = "0.2.x", .storage_format_version = "3", .store_schema_version = "3" }};
 const fails_without = [_]Effect{.{ .component = "ripgrep", .effect = "Grep / Glob unavailable" }};
-const degraded_without = [_]Effect{.{ .component = "tinykg", .effect = "KG memory/task degrade; agent loop unaffected" }};
+const degraded_without = [_]Effect{
+    .{ .component = "tinykg", .effect = "KG memory/task degrade; agent loop unaffected" },
+    .{ .component = "tinykgd", .effect = "no shared KG service; sessions use the exclusive TinyKG CLI store" },
+    .{ .component = "formal_kernel", .effect = "formal task audit and governed memory migration fail closed" },
+    .{ .component = "project_kernel", .effect = "promoted project rules fail closed before dispatch" },
+};
 
 fn validManifest(components: []const Component, files: []const FileEntry) Manifest {
     return .{
-        .schema_version = 1,
+        .schema_version = SCHEMA_VERSION,
         .vendor = "metask",
         .name = "metacodes-cli",
         .release = .{ .version = "0.1.0", .channel = "stable", .tag = "0.1.0" },
@@ -445,33 +609,52 @@ fn expectedStable() Expected {
     };
 }
 
-fn linuxExpectedPaths(buffer: *[MAX_EXPECTED_FILES][]const u8) []const []const u8 {
-    return expectedFiles("linux", "share/doc/CHANGELOG-0.1.0.md", true, buffer);
+const PathStorage = [5][MAX_COMPONENT_PATH]u8;
+
+fn linuxExpectedPaths(buffer: *[MAX_EXPECTED_FILES][]const u8, storage: *PathStorage) []const []const u8 {
+    return expectedFiles("linux", "share/doc/CHANGELOG-0.1.0.md", true, buffer, storage);
 }
 
 test "a valid stable manifest passes every validator" {
     const components = linuxComponents("0.1.0");
     var buffer: [MAX_EXPECTED_FILES][]const u8 = undefined;
-    try validateManifest(validManifest(&components, &linux_files), expectedStable(), linuxExpectedPaths(&buffer));
+    var storage: PathStorage = undefined;
+    try validateManifest(validManifest(&components, &linux_files), expectedStable(), linuxExpectedPaths(&buffer, &storage));
 }
 
-test "a valid Windows manifest names the .exe files" {
-    const files = [_]FileEntry{
-        .{ .path = "bin/metacodes.exe", .sha256 = digest_a },
-        .{ .path = "bin/rg.exe", .sha256 = digest_b },
-        .{ .path = "share/doc/CHANGELOG-0.1.0.md", .sha256 = digest_d },
-        .{ .path = "share/doc/README.md", .sha256 = digest_d },
-        .{ .path = "share/licenses/THIRD_PARTY_NOTICES.md", .sha256 = digest_d },
-        .{ .path = "share/licenses/metacodes-LICENSE", .sha256 = digest_d },
-        .{ .path = "share/licenses/ripgrep-LICENSE-MIT", .sha256 = digest_d },
-        .{ .path = "share/licenses/tinykg-LICENSE", .sha256 = digest_d },
-        .{ .path = "vendor/tinykg/tinykg.exe", .sha256 = digest_c },
-        .{ .path = "vendor/tinykg/tinykg.provenance.json", .sha256 = digest_d },
-    };
+test "a valid Windows manifest names the .exe files and their sidecars" {
+    var files: [linux_files.len]FileEntry = undefined;
+    for (linux_files, 0..) |file, index| {
+        files[index] = file;
+        const renames = [_][2][]const u8{
+            .{ "bin/metacodes", "bin/metacodes.exe" },
+            .{ "bin/rg", "bin/rg.exe" },
+            .{ "libexec/metacodes/metacodes-formal-kernel", "libexec/metacodes/metacodes-formal-kernel.exe" },
+            .{ "libexec/metacodes/metacodes-formal-kernel.build-receipt.json", "libexec/metacodes/metacodes-formal-kernel.exe.build-receipt.json" },
+            .{ "libexec/metacodes/metacodes-formal-kernel.provenance.json", "libexec/metacodes/metacodes-formal-kernel.exe.provenance.json" },
+            .{ "libexec/metacodes/metacodes-project-kernel", "libexec/metacodes/metacodes-project-kernel.exe" },
+            .{ "libexec/metacodes/metacodes-project-kernel.provenance.json", "libexec/metacodes/metacodes-project-kernel.exe.provenance.json" },
+            .{ "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.exe" },
+            .{ "vendor/tinykg/tinykgd", "vendor/tinykg/tinykgd.exe" },
+        };
+        for (renames) |rename| if (std.mem.eql(u8, file.path, rename[0])) {
+            files[index].path = rename[1];
+        };
+    }
+    std.mem.sort(FileEntry, &files, {}, struct {
+        fn less(_: void, lhs: FileEntry, rhs: FileEntry) bool {
+            return std.mem.order(u8, lhs.path, rhs.path) == .lt;
+        }
+    }.less);
     var components = linuxComponents("0.1.0");
     components[0].path = "bin/metacodes.exe";
     components[1].path = "bin/rg.exe";
     components[2].path = "vendor/tinykg/tinykg.exe";
+    components[3].path = "vendor/tinykg/tinykgd.exe";
+    components[4].path = "libexec/metacodes/metacodes-formal-kernel.exe";
+    components[4].provenance_path = "libexec/metacodes/metacodes-formal-kernel.exe.provenance.json";
+    components[5].path = "libexec/metacodes/metacodes-project-kernel.exe";
+    components[5].provenance_path = "libexec/metacodes/metacodes-project-kernel.exe.provenance.json";
     var manifest = validManifest(&components, &files);
     manifest.target = .{ .id = "x86_64-windows-gnu", .architecture = "x86_64", .os = "windows", .abi = "gnu", .zig_target = "x86_64-windows-gnu" };
     var expected = expectedStable();
@@ -479,7 +662,8 @@ test "a valid Windows manifest names the .exe files" {
     expected.os = "windows";
     expected.zig_target = "x86_64-windows-gnu";
     var buffer: [MAX_EXPECTED_FILES][]const u8 = undefined;
-    try validateManifest(manifest, expected, expectedFiles("windows", "share/doc/CHANGELOG-0.1.0.md", true, &buffer));
+    var storage: PathStorage = undefined;
+    try validateManifest(manifest, expected, expectedFiles("windows", "share/doc/CHANGELOG-0.1.0.md", true, &buffer, &storage));
 }
 
 test "a valid pre manifest carries the commit as build metadata and no tag" {
@@ -505,7 +689,7 @@ test "a valid pre manifest carries the commit as build metadata and no tag" {
 test "the schema example parses into Manifest" {
     const allocator = testing.allocator;
     const json =
-        \\{"schema_version":1,"vendor":"metask","name":"metacodes-cli",
+        \\{"schema_version":2,"vendor":"metask","name":"metacodes-cli",
         \\ "release":{"version":"0.1.0","channel":"stable","tag":"0.1.0"},
         \\ "source":{"commit":"0123456789abcdef0123456789abcdef01234567","dirty":false},
         \\ "toolchain":{"zig_version":"0.16.0"},
@@ -529,7 +713,7 @@ test "identity rules each have their own error" {
     const expected = expectedStable();
 
     var m = base;
-    m.schema_version = 2;
+    m.schema_version = 1;
     try testing.expectError(error.UnsupportedSchemaVersion, validateIdentity(m, expected));
     m = base;
     m.vendor = "someone";
@@ -604,7 +788,8 @@ test "identity rules each have their own error" {
 
 test "file rules each have their own error" {
     var buffer: [MAX_EXPECTED_FILES][]const u8 = undefined;
-    const paths = linuxExpectedPaths(&buffer);
+    var storage: PathStorage = undefined;
+    const paths = linuxExpectedPaths(&buffer, &storage);
     try validateFiles(&linux_files, paths);
 
     var files = linux_files;
@@ -622,16 +807,26 @@ test "file rules each have their own error" {
     try testing.expectError(error.FilesNotSorted, validateFiles(&files, paths));
 
     files = linux_files;
-    files[3].path = "share/doc/EXTRA.md";
+    files[8].path = "share/doc/EXTRA.md";
     try testing.expectError(error.UnexpectedFile, validateFiles(&files, paths));
 
-    try testing.expectError(error.MissingFile, validateFiles(linux_files[0..9], paths));
+    // Every v2 runtime asset is required: dropping the daemon is not a release.
+    try testing.expectError(error.MissingFile, validateFiles(linux_files[0 .. linux_files.len - 2], paths));
+    var without_kernel: [linux_files.len - 1]FileEntry = undefined;
+    var kept: usize = 0;
+    for (linux_files) |file| {
+        if (std.mem.eql(u8, file.path, "libexec/metacodes/metacodes-project-kernel")) continue;
+        without_kernel[kept] = file;
+        kept += 1;
+    }
+    try testing.expectError(error.MissingFile, validateFiles(&without_kernel, paths));
 
     // The pre channel may ship without the licence; stable never does.
     var pre_buffer: [MAX_EXPECTED_FILES][]const u8 = undefined;
-    const pre_paths = expectedFiles("linux", "share/doc/CHANGELOG-0.1.0.md", false, &pre_buffer);
-    try testing.expectEqual(@as(usize, 9), pre_paths.len);
-    var without_license: [9]FileEntry = undefined;
+    var pre_storage: PathStorage = undefined;
+    const pre_paths = expectedFiles("linux", "share/doc/CHANGELOG-0.1.0.md", false, &pre_buffer, &pre_storage);
+    try testing.expectEqual(@as(usize, MAX_EXPECTED_FILES - 1), pre_paths.len);
+    var without_license: [linux_files.len - 1]FileEntry = undefined;
     var count: usize = 0;
     for (linux_files) |file| {
         if (std.mem.eql(u8, file.path, "share/licenses/metacodes-LICENSE")) continue;
@@ -672,13 +867,38 @@ test "component rules each have their own error" {
     components[2].compat = null;
     try testing.expectError(error.TinykgComponentInvalid, validateComponents(&components, &linux_files, "linux", "0.1.0"));
 
+    // The daemon names its own receipt and comes from the CLI's bundle.
+    components = base;
+    components[3].provenance_path = "vendor/tinykg/tinykg.provenance.json";
+    try testing.expectError(error.TinykgdComponentInvalid, validateComponents(&components, &linux_files, "linux", "0.1.0"));
+    components = base;
+    components[3].version = "0.3.0";
+    try testing.expectError(error.TinykgdComponentInvalid, validateComponents(&components, &linux_files, "linux", "0.1.0"));
+    components = base;
+    components[3].source_commit = "ffffffffffffffffffffffffffffffffffffffff";
+    try testing.expectError(error.TinykgdComponentInvalid, validateComponents(&components, &linux_files, "linux", "0.1.0"));
+
+    // A kernel sits under libexec/metacodes with its loader's sidecar beside it.
+    components = base;
+    components[4].provenance_path = "libexec/metacodes/metacodes-formal-kernel.build-receipt.json";
+    try testing.expectError(error.KernelComponentInvalid, validateComponents(&components, &linux_files, "linux", "0.1.0"));
+    components = base;
+    components[5].path = "libexec/metacodes/metacodes-formal-kernel";
+    components[5].sha256 = digest_e;
+    try testing.expectError(error.KernelComponentInvalid, validateComponents(&components, &linux_files, "linux", "0.1.0"));
+    components = base;
+    components[5].license = null;
+    try testing.expectError(error.KernelComponentInvalid, validateComponents(&components, &linux_files, "linux", "0.1.0"));
+
     components = base;
     components[1].name = "fd";
     try testing.expectError(error.UnknownComponent, validateComponents(&components, &linux_files, "linux", "0.1.0"));
 
-    try testing.expectError(error.RipgrepComponentInvalid, validateComponents(&.{ base[0], base[2] }, &linux_files, "linux", "0.1.0"));
-    try testing.expectError(error.TinykgComponentInvalid, validateComponents(&.{ base[0], base[1] }, &linux_files, "linux", "0.1.0"));
-    try testing.expectError(error.PrimaryExecutableInvalid, validateComponents(&.{ base[1], base[2] }, &linux_files, "linux", "0.1.0"));
+    try testing.expectError(error.RipgrepComponentInvalid, validateComponents(&.{ base[0], base[2], base[3], base[4], base[5] }, &linux_files, "linux", "0.1.0"));
+    try testing.expectError(error.TinykgComponentInvalid, validateComponents(&.{ base[0], base[1], base[3], base[4], base[5] }, &linux_files, "linux", "0.1.0"));
+    try testing.expectError(error.TinykgdComponentInvalid, validateComponents(&.{ base[0], base[1], base[2], base[4], base[5] }, &linux_files, "linux", "0.1.0"));
+    try testing.expectError(error.KernelComponentInvalid, validateComponents(&.{ base[0], base[1], base[2], base[3], base[4] }, &linux_files, "linux", "0.1.0"));
+    try testing.expectError(error.PrimaryExecutableInvalid, validateComponents(base[1..], &linux_files, "linux", "0.1.0"));
 }
 
 test "compatibility rules each have their own error" {
@@ -707,8 +927,13 @@ test "compatibility rules each have their own error" {
     try testing.expectError(error.FailsWithoutMismatch, validateCompatibility(m));
 
     m = base;
-    const wrong_degraded = [_]Effect{.{ .component = "ripgrep", .effect = "x" }};
-    m.compatibility.degraded_without = &wrong_degraded;
+    const only_tinykg = [_]Effect{degraded_without[0]};
+    m.compatibility.degraded_without = &only_tinykg;
+    try testing.expectError(error.DegradedWithoutMismatch, validateCompatibility(m));
+
+    m = base;
+    const repeated = [_]Effect{ degraded_without[0], degraded_without[1], degraded_without[2], degraded_without[2] };
+    m.compatibility.degraded_without = &repeated;
     try testing.expectError(error.DegradedWithoutMismatch, validateCompatibility(m));
 
     m = base;
@@ -719,12 +944,17 @@ test "compatibility rules each have their own error" {
 
 test "the expected file list is sorted and target-specific" {
     var buffer: [MAX_EXPECTED_FILES][]const u8 = undefined;
-    const linux = expectedFiles("linux", "share/doc/CHANGELOG-0.1.0.md", true, &buffer);
-    try testing.expectEqual(@as(usize, 10), linux.len);
+    var storage: PathStorage = undefined;
+    const linux = expectedFiles("linux", "share/doc/CHANGELOG-0.1.0.md", true, &buffer, &storage);
+    try testing.expectEqual(MAX_EXPECTED_FILES, linux.len);
     for (linux[1..], 0..) |path, index| try testing.expect(std.mem.order(u8, linux[index], path) == .lt);
     try testing.expectEqualStrings("bin/metacodes", linux[0]);
+    for (linux, linux_files) |path, file| try testing.expectEqualStrings(file.path, path);
     var windows_buffer: [MAX_EXPECTED_FILES][]const u8 = undefined;
-    const windows = expectedFiles("windows", "share/doc/CHANGELOG-0.1.0.md", true, &windows_buffer);
+    var windows_storage: PathStorage = undefined;
+    const windows = expectedFiles("windows", "share/doc/CHANGELOG-0.1.0.md", true, &windows_buffer, &windows_storage);
     try testing.expectEqualStrings("bin/metacodes.exe", windows[0]);
-    try testing.expectEqualStrings("vendor/tinykg/tinykg.exe", windows[8]);
+    try testing.expectEqualStrings("libexec/metacodes/metacodes-formal-kernel.exe", windows[2]);
+    try testing.expectEqualStrings("libexec/metacodes/metacodes-formal-kernel.exe.build-receipt.json", windows[3]);
+    try testing.expectEqualStrings("vendor/tinykg/tinykgd.exe", windows[windows.len - 2]);
 }

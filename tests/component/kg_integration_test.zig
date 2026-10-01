@@ -54,7 +54,7 @@ fn renamePathForTest(from: []const u8, to: []const u8) !void {
 /// 建一个用临时 store + 指定 bin 的 KgClient(绕过 env,直接注入路径)。
 fn makeClient(a: std.mem.Allocator, bin: []const u8, store: []const u8, domain: []const u8) !KgClient {
     return KgClient.init(a, .{
-        .home = "/tmp",
+        .state_root = "/tmp",
         .domain = domain,
         .config_bin = bin,
         .config_store = store,
@@ -1218,7 +1218,7 @@ test "L2 KG: 版本门 — degraded 明示且不 spawn" {
     const a = std.testing.allocator;
     // 故意给不存在的二进制 → degraded,ensureReady 不崩,recall 返回 Degraded。
     var kg = try KgClient.init(a, .{
-        .home = "/tmp",
+        .state_root = "/tmp",
         .domain = "p",
         .config_bin = "/nonexistent/tinykg",
         .config_store = "/tmp/never.kg",

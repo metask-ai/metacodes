@@ -180,11 +180,9 @@ fn successfulOutcome(fixture: Fixture) cc.rule_impact_evidence.OutcomeInput {
     };
 }
 
-fn testKernel() ?cc.project_harness_runtime.Config {
-    return switch (cc.project_harness_runtime.loadConfigFromEnv()) {
-        .configured => |config| config,
-        .missing, .invalid => null,
-    };
+fn testKernel() !?cc.project_harness_runtime.Config {
+    const kernel = (try cc.formal_test_kernel.resolve(std.testing.io, .project)) orelse return null;
+    return .{ .checker_path = kernel.path, .expected_sha256 = kernel.expected_sha256 };
 }
 
 fn policy() cc.project_harness_runtime.ImpactPolicy {
@@ -371,7 +369,7 @@ test "RuleImpact evidence rejects laundering, identity drift, tamper, symlink, a
 }
 
 test "L2 completed journal receipt invokes fixed Lean RuleImpact governance" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -447,7 +445,7 @@ test "RuleImpact missing receipt fails before checker inspection" {
 }
 
 test "L2 drift blocks promotion and admits demotion" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -494,7 +492,7 @@ test "L2 drift blocks promotion and admits demotion" {
 }
 
 test "L2 formal fault admits quarantine" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -745,7 +743,7 @@ test "RuleImpact aggregate rejects checked-sum overflow from real receipts" {
 }
 
 test "L2 aggregate receipt invokes Lean and stale policy fails closed" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buffer: [std.fs.max_path_bytes]u8 = undefined;

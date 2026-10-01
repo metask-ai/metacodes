@@ -143,14 +143,17 @@ jobs:
           python3 scripts/verify_tinykg_binary.py
           python3 scripts/verify_ripgrep_binary.py
           zig build tinykg:stage
-      # Both vendored runtime assets stage for aarch64-linux, and the static
-      # release checks accept the cross-built unit (#86): the target's rg is
-      # the upstream aarch64 musl binary, first published with ripgrep 15.x.
+      # Both vendored runtime assets stage for aarch64-linux (#86): the
+      # target's rg is the upstream aarch64 musl binary, first published with
+      # ripgrep 15.x. A complete aarch64-linux release unit (manifest v2) also
+      # needs both Lean kernels, which only a native aarch64 runner can build,
+      # so this leg proves the cross-staged assets and the release unit waits
+      # for that runner (doc/INSTALL_DESIGN.md §5).
       - name: Verify Linux arm64 cross-stage contract
         if: runner.os == 'Linux'
         run: |
           zig build tinykg:stage -Dtarget=aarch64-linux-musl
-          zig build release:check -Dtarget=aarch64-linux-musl -Drelease-layout=true --prefix "$RUNNER_TEMP/release-aarch64-linux"
+          zig build install -Dtarget=aarch64-linux-musl -Drelease-layout=true --prefix "$RUNNER_TEMP/stage-aarch64-linux"
       - name: Native platform modules
         shell: bash
         env:
@@ -169,8 +172,10 @@ jobs:
         # --test-timeout 5m: the build runner watchdog between tests is
         # max(--test-timeout, 60s); same value as the Windows leg and the
         # AgentCore gate, so a wedged test on a loaded runner is reported
-        # instead of eating the job timeout.
-        run: zig build test --test-timeout 5m
+        # instead of eating the job timeout. -Dlean-kernels=on: the suite
+        # builds both kernels from this checkout and every kernel-gated test
+        # runs; a missing toolchain fails the build instead of skipping them.
+        run: zig build test --test-timeout 5m -Dlean-kernels=on
       - name: ReleaseSafe core gate
         if: runner.os == 'Linux'
         run: zig build test:lib -Doptimize=ReleaseSafe
@@ -188,16 +193,40 @@ jobs:
       # as nothing ran a real one through doctor, 2026-09-21).
       - name: Built project kernel provenance is accepted by doctor
         run: python3 scripts/verify_kernel_provenance.py "$RUNNER_TEMP/install-prefix/bin/metacodes" --project "$RUNNER_TEMP/metacodes-project-kernel"
+      # Manifest v2 ships both Lean kernels and pins them, so the release
+      # layout is two invocations (release/LAYOUT.md): stage the kernels, then
+      # build the executable with their digests. KERNEL_PINS carries them to
+      # the archive steps.
+      - name: Stage Lean kernels for the release layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build kernels:stage -Dlean-kernels=on --prefix "$RUNNER_TEMP/release-prefix"
+          pins=$(python3 scripts/kernel_pins.py "$RUNNER_TEMP/release-prefix")
+          echo "KERNEL_PINS=$pins" >> "$GITHUB_ENV"
       - name: Release layout prefix
-        run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
+        run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
+      # The installer, through the same script users run, on the verified
+      # unit: every file re-verified at the new prefix, an install record and
+      # state root of its own, and the installed executable's doctor --strict.
+      - name: Install the release unit with scripts/install.sh
+        run: sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed" "$RUNNER_TEMP/release-prefix" && "$RUNNER_TEMP/installed/bin/metacodes" doctor --strict
       - name: Release bundle verifier self-test
         run: python3 scripts/verify_release_bundle.py --self-test
       - name: Release archive is reproducible
         run: |
-          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
-          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" -Drelease-archive-dir="$RUNNER_TEMP/dist-2"
-          cmp "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz
-          zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
+          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
+          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-2"
+          if ! cmp "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz; then
+            # Evidence for the next mismatch: which members differ.
+            mkdir -p "$RUNNER_TEMP/unpacked-1" "$RUNNER_TEMP/unpacked-2"
+            tar -xzf "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz -C "$RUNNER_TEMP/unpacked-1"
+            tar -xzf "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz -C "$RUNNER_TEMP/unpacked-2"
+            diff -rq "$RUNNER_TEMP/unpacked-1" "$RUNNER_TEMP/unpacked-2" || true
+            cat "$RUNNER_TEMP"/unpacked-*/*/libexec/metacodes/*.build-receipt.json || true
+            exit 1
+          fi
+          zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           cat "$RUNNER_TEMP"/dist-1/metacodes-*-SHA256SUMS
       - name: Third-party notices check
         if: runner.os == 'Linux'
@@ -213,6 +242,8 @@ jobs:
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
       - name: Verify install prefix unit tests
         run: python3 -m unittest scripts.tests.test_verify_install_prefix -v
+      - name: Kernel self-containment and pin unit tests
+        run: python3 -m unittest scripts.tests.test_check_kernel_self_contained scripts.tests.test_kernel_pins -v
       - name: Kernel provenance verifier unit tests
         run: python3 -m unittest scripts.tests.test_verify_kernel_provenance -v
       - name: Python floor unit tests
@@ -291,35 +322,58 @@ jobs:
       - name: Verify native bundle and fresh-store contract
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage
+      # The Windows release unit ships both Lean kernels too (manifest v2), so
+      # this leg provisions the same pinned elan and Lean cache as `gates`;
+      # the kernel scripts run under Git Bash (kernels:stage invokes bash).
+      - name: Restore Lean toolchain and build products
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            control-plane/lean/.lake
+          key: lean-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('control-plane/lean/lean-toolchain', 'control-plane/lean/lakefile.toml', 'control-plane/lean/lake-manifest.json', 'control-plane/lean/**/*.lean') }}
+          restore-keys: |
+            lean-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install pinned elan
+        shell: bash
+        run: bash scripts/ci/install-elan.sh
+      - name: Stage Lean kernels for the release layout
+        shell: cmd
+        run: |
+          zig build kernels:stage -Dlean-kernels=on --prefix "%RUNNER_TEMP%\release-prefix" || exit /b 1
+          for /f "delims=" %%P in ('python scripts\kernel_pins.py "%RUNNER_TEMP%\release-prefix"') do echo KERNEL_PINS=%%P>> "%GITHUB_ENV%"
+          findstr /B KERNEL_PINS= "%GITHUB_ENV%" || exit /b 1
       - name: Default install prefix
         shell: cmd
         run: zig build --prefix "%RUNNER_TEMP%\install-prefix" && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\install-prefix" --doctor
       - name: Release layout prefix
         shell: cmd
-        run: zig build release:verify -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release-prefix" --release --doctor
+        run: zig build release:verify -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release-prefix" --release --doctor
+      - name: Install the release unit with scripts/install.ps1
+        shell: cmd
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 "%RUNNER_TEMP%\release-prefix" -Prefix "%RUNNER_TEMP%\installed" -NoPath && "%RUNNER_TEMP%\installed\bin\metacodes.exe" doctor --strict
       - name: Release bundle verifier self-test
         shell: cmd
         run: python scripts\verify_release_bundle.py --self-test
       - name: Release archive is reproducible
         shell: cmd
-        run: zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" -Drelease-archive-dir="%RUNNER_TEMP%\dist-1" && zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" -Drelease-archive-dir="%RUNNER_TEMP%\dist-2" && python scripts\release_sums.py --self-test && for %%F in ("%RUNNER_TEMP%\dist-1\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-2\%%~nxF" > nul && zig build release:sums -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" -Drelease-archive-dir="%RUNNER_TEMP%\dist-1"
+        run: zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-1" && zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-2" && python scripts\release_sums.py --self-test && for %%F in ("%RUNNER_TEMP%\dist-1\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-2\%%~nxF" > nul && zig build release:sums -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-1"
       - name: Verify install prefix unit tests
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_install_prefix -v
       - name: Kernel provenance verifier unit tests
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_kernel_provenance -v
-      # The repository-wide suite on the native Windows host (#53). No Lean
-      # step and no METACODES_TEST_REQUIRE_LEAN_SDK here: the kernel-gated
-      # tests take their checker from operator-provided
-      # METACODES_TEST_*_KERNEL_* variables that no job sets, and this leg does
-      # not provision elan; they skip exactly as documented in
-      # scripts/eval/tests/posix_only.py and the component tests.
+      # The repository-wide suite on the native Windows host (#53), with the
+      # kernels this leg built above (-Dlean-kernels=on). No
+      # METACODES_TEST_REQUIRE_LEAN_SDK here: the Python Lean-SDK suites stay
+      # POSIX-only (scripts/eval/tests/posix_only.py), and the component tests
+      # that drive a kernel through POSIX-only paths skip on Windows as before.
       # --test-timeout 5m: the build runner watchdog between tests is
       # max(--test-timeout, 60s), same as the AgentCore gate.
       - name: Full offline test suite
         shell: cmd
-        run: zig build test --test-timeout 5m
+        run: zig build test --test-timeout 5m -Dlean-kernels=on
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite

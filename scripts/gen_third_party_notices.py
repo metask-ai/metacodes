@@ -29,6 +29,7 @@ INPUT_FILES = (
     "lib/highlight-zig/SOURCE.txt",
     "control-plane/lean/lean-toolchain",
     "release/notices.static.md",
+    "vendor/lean-runtime/manifest.json",
 )
 
 OUTPUT_FILE = "THIRD_PARTY_NOTICES.md"
@@ -92,6 +93,36 @@ def lean_version(root: Path) -> str:
     return match.group(1)
 
 
+def lean_runtime(root: Path, lean: str) -> list:
+    """The libraries statically linked into the shipped Lean kernels, from
+    ``vendor/lean-runtime/manifest.json``; it must describe the pinned toolchain."""
+    manifest = _json(root, INPUT_FILES[6], "lean_toolchain")
+    if manifest["lean_toolchain"] != f"leanprover/lean4:v{lean}":
+        raise NoticesError(
+            f"{INPUT_FILES[6]} describes {manifest['lean_toolchain']!r} but the kernels build with "
+            f"leanprover/lean4:v{lean}; re-check the bundled GMP/libuv versions and their license texts"
+        )
+    components = manifest.get("components")
+    if not isinstance(components, list) or not components:
+        raise NoticesError(f"{INPUT_FILES[6]} lacks a components list")
+    rendered = []
+    for component in components:
+        for key in ("name", "version", "license", "source_repository"):
+            if not isinstance(component.get(key), str) or not component[key]:
+                raise NoticesError(f"{INPUT_FILES[6]} component lacks a string {key!r}")
+        files = component.get("license_files")
+        if not isinstance(files, list) or not files or not all(isinstance(f, dict) and f.get("path") for f in files):
+            raise NoticesError(f"{INPUT_FILES[6]} component {component['name']!r} lacks license_files")
+        texts = ", ".join(f"`vendor/lean-runtime/{f['path']}`" for f in files)
+        rendered.append(
+            f"| {component['name']} {component['version']} | statically linked into the shipped Lean governance kernels "
+            "(`libexec/metacodes/metacodes-formal-kernel[.exe]` and `metacodes-project-kernel[.exe]`), built from this repository's "
+            f"`control-plane/lean` sources and therefore relinkable by any recipient | {component['source_repository']} "
+            f"| {component['license']}; texts retained at {texts} and shipped under `share/licenses/` |"
+        )
+    return rendered
+
+
 def rows(root: Path) -> list:
     ripgrep = _json(root, INPUT_FILES[0], "upstream_release", "upstream_revision", "license", "source_repository")
     tinykg_bundle = _json(root, INPUT_FILES[1], "source_commit")
@@ -105,13 +136,14 @@ def rows(root: Path) -> list:
         "redistributed as the AgentCore bundle `bin/rg[.exe]` runtime asset | `vendor/ripgrep/manifest.json` "
         f"({ripgrep['source_repository']}, revision `{ripgrep['upstream_revision']}`) | {ripgrep['license']}; "
         "MIT text retained at `vendor/ripgrep/LICENSE-MIT` and shipped with the bundle notice |",
-        f"| TinyKG {tinykg['tinykg_version']} | checked-in target-specific CLI and daemon binaries | `vendor/tinykg/manifest.json` "
+        f"| TinyKG {tinykg['tinykg_version']} | checked-in target-specific CLI (`tinykg`) and daemon (`tinykgd`) binaries, "
+        "both shipped under `vendor/tinykg/` | `vendor/tinykg/manifest.json` "
         f"({tinykg['source_repository']}, source commit `{tinykg_bundle['source_commit'][:12]}`) | {tinykg['license']}; "
         "license retained at `vendor/tinykg/LICENSE` |",
         ZIG_ROW,
-        f"| Lean 4 toolchain (leanprover/lean4:v{lean}) | build toolchain for the release/formal gates; its runtime is "
-        "statically linked into locally built formal-kernel binaries (not checked in) | "
-        "`control-plane/lean/lean-toolchain` | Apache-2.0; review before distributing any built kernel binary |",
+        f"| Lean 4 toolchain (leanprover/lean4:v{lean}) | build toolchain for the Lean governance kernels; its runtime "
+        "libraries ship inside them (rows below) | `control-plane/lean/lean-toolchain` | Apache-2.0 |",
+        *lean_runtime(root, lean),
     ]
 
 

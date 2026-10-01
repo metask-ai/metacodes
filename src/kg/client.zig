@@ -259,7 +259,7 @@ pub const KgClient = struct {
     degraded_reason: ?[]u8 = null,
     degraded_kind: ?DegradedKind = null,
     /// Configuration inputs retained so a session can re-read a repaired daemon.json.
-    daemon_home: ?[]u8 = null,
+    daemon_state_root: ?[]u8 = null,
     daemon_io: ?std.Io = null,
     unconfigured_kind: DegradedKind = .unconfigured,
     last_probe_ms: i64 = 0,
@@ -327,7 +327,7 @@ pub const KgClient = struct {
         }
         self.allocator.free(self.domain);
         if (self.degraded_reason) |r| self.allocator.free(r);
-        if (self.daemon_home) |h| self.allocator.free(h);
+        if (self.daemon_state_root) |h| self.allocator.free(h);
         if (self.last_detail) |d| self.allocator.free(d);
         if (self.autosync_last_err) |e| self.allocator.free(e);
         var kit = self.scoped_types.keyIterator();
@@ -340,7 +340,10 @@ pub const KgClient = struct {
     // ── 路径解析(设计 §1 D2)─────────────────────────────────────────
 
     pub const ResolveOptions = struct {
-        home: []const u8,
+        /// This install's state root (util/state_root.zig): the default store
+        /// and daemon.json live under `<state_root>/kg`, and a relative store
+        /// path is completed against it.
+        state_root: []const u8,
         /// 项目 domain(调用方算好:git 根目录名+hash / cwd basename+hash)。
         domain: []const u8,
         /// config.json 的 kg_bin / kg_store(可空)。
@@ -406,15 +409,15 @@ pub const KgClient = struct {
             unconfigured_kind = configured.kind;
             break :daemon if (configured.transport) |value| .{ .daemon = value } else .unconfigured;
         };
-        const daemon_home = if (!use_cli) try allocator.dupe(u8, opts.home) else null;
-        errdefer if (daemon_home) |h| allocator.free(h);
+        const daemon_state_root = if (!use_cli) try allocator.dupe(u8, opts.state_root) else null;
+        errdefer if (daemon_state_root) |h| allocator.free(h);
         return .{
             .allocator = allocator,
             .transport = transport,
             .bin_path = bin,
             .store = store,
             .domain = domain,
-            .daemon_home = daemon_home,
+            .daemon_state_root = daemon_state_root,
             .daemon_io = if (!use_cli) opts.io else null,
             .unconfigured_kind = unconfigured_kind,
             .scoped_types = std.StringHashMap(void).init(allocator),
@@ -429,7 +432,7 @@ pub const KgClient = struct {
     /// 外锁)→ 堆损坏。每线程一个 c_allocator 客户端隔离 arena;tinykg 的 store-dir 锁仍串行化跨
     /// 客户端的执行,数据一致。self 的 store/domain/bin_path init 后不可变,并发读安全。
     /// 返回的 client 由调用线程 own(deinit 释放);未 ensureReady——调用方自行 ensureReady。
-    pub fn cloneForThread(self: *const KgClient, allocator: std.mem.Allocator, home: []const u8) !KgClient {
+    pub fn cloneForThread(self: *const KgClient, allocator: std.mem.Allocator, state_root: []const u8) !KgClient {
         if (self.transport == .daemon) {
             const domain = try allocator.dupe(u8, self.domain);
             errdefer allocator.free(domain);
@@ -448,7 +451,7 @@ pub const KgClient = struct {
                 // shared across the whole in-process client family. They still
                 // re-probe a transport they already hold; only the root client
                 // re-reads configuration and hands the shared fence to later clones.
-                .daemon_home = null,
+                .daemon_state_root = null,
                 .daemon_io = null,
                 .unconfigured_kind = self.unconfigured_kind,
             };
@@ -477,13 +480,13 @@ pub const KgClient = struct {
                 // shared across the whole in-process client family. They still
                 // re-probe a transport they already hold; only the root client
                 // re-reads configuration and hands the shared fence to later clones.
-                .daemon_home = null,
+                .daemon_state_root = null,
                 .daemon_io = null,
                 .unconfigured_kind = self.unconfigured_kind,
             };
         };
         return KgClient.init(allocator, .{
-            .home = home,
+            .state_root = state_root,
             .domain = self.domain,
             .config_bin = self.bin_path,
             .config_store = owned_store,
@@ -560,15 +563,15 @@ pub const KgClient = struct {
     /// lock/tmp 五个兄弟产物)落在**进程 cwd**——对一个会 chdir 或从任意目录启动的
     /// 进程来说,那是不可预测的位置。仓库在 workspace_policy / rule_evaluation /
     /// project_rule_bundle 等处都强制 isAbsolute,这里补齐同一条纪律。
-    /// 注:末尾的默认值由 `opts.home` 拼出,home 本身为相对时同样拒绝。
+    /// 注:末尾的默认值由 `opts.state_root` 拼出,state_root 本身为相对时同样拒绝。
     fn resolveStorePath(allocator: std.mem.Allocator, opts: ResolveOptions) ![]u8 {
         if (opts.env_store orelse envGet("METACODES_KG_STORE")) |v| {
-            if (v.len > 0) return absoluteStorePath(allocator, v, opts.home);
+            if (v.len > 0) return absoluteStorePath(allocator, v, opts.state_root);
         }
         if (opts.config_store) |v| {
-            if (v.len > 0) return absoluteStorePath(allocator, v, opts.home);
+            if (v.len > 0) return absoluteStorePath(allocator, v, opts.state_root);
         }
-        const derived = try std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/store.kg", .{opts.home});
+        const derived = try std.fmt.allocPrint(allocator, "{s}/kg/store.kg", .{opts.state_root});
         errdefer allocator.free(derived);
         if (!std.fs.path.isAbsolute(derived)) return error.RelativeStorePath;
         return derived;
@@ -583,14 +586,14 @@ pub const KgClient = struct {
     /// 但也不能原样采用:相对值会让 Store 以及由它派生的五个兄弟产物(backup /
     /// quarantine / auto-migrate marker / md-import tmp / daemon lock)全部落在
     /// **进程 cwd**——对一个会从任意目录启动的进程,那是不可预测的位置。所以在解析
-    /// 处就以 home 为基准补全,下游每一处使用都继承这个保证,无需各自再校验。
-    fn absoluteStorePath(allocator: std.mem.Allocator, path: []const u8, home: []const u8) ![]u8 {
+    /// 处就以状态根为基准补全,下游每一处使用都继承这个保证,无需各自再校验。
+    fn absoluteStorePath(allocator: std.mem.Allocator, path: []const u8, state_root: []const u8) ![]u8 {
         if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
-        const joined = try std.fs.path.join(allocator, &.{ home, path });
+        const joined = try std.fs.path.join(allocator, &.{ state_root, path });
         errdefer allocator.free(joined);
-        // home 自身是相对的话补全也救不回来(home 来自 OS,正常不会发生)。
+        // 状态根自身是相对的话补全也救不回来(util/state_root.zig 只产出绝对路径)。
         if (!std.fs.path.isAbsolute(joined)) return error.RelativeStorePath;
-        log.warn("kg", "relative store path {s} resolved against home: {s}", .{ path, joined });
+        log.warn("kg", "relative store path {s} resolved against the state root: {s}", .{ path, joined });
         return joined;
     }
 
@@ -751,7 +754,7 @@ pub const KgClient = struct {
         }
 
         const env_config_path = envGet("METACODES_KG_CONFIG");
-        const file_path = try daemonConfigPath(allocator, opts.home);
+        const file_path = try daemonConfigPath(allocator, opts.state_root);
         defer allocator.free(file_path);
         const file = readDaemonConfig(allocator, file_path) catch |err| {
             // A user-selected config is authoritative and must fail closed;
@@ -774,9 +777,9 @@ pub const KgClient = struct {
         }, .kind = .unconfigured };
     }
 
-    fn daemonConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    fn daemonConfigPath(allocator: std.mem.Allocator, state_root: []const u8) ![]u8 {
         if (envGet("METACODES_KG_CONFIG")) |path| return allocator.dupe(u8, path);
-        return std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/daemon.json", .{home});
+        return std.fmt.allocPrint(allocator, "{s}/kg/daemon.json", .{state_root});
     }
 
     pub const ParsedDaemonFile = std.json.Parsed(DaemonFile);
@@ -788,10 +791,10 @@ pub const KgClient = struct {
         return (try readDaemonConfig(allocator, path)) orelse error.FileNotFound;
     }
 
-    /// `METACODES_KG_CONFIG`, else the default under `home`. Shared so the
+    /// `METACODES_KG_CONFIG`, else the default under the state root. Shared so the
     /// service and its clients can never read different files.
-    pub fn resolveDaemonConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
-        return daemonConfigPath(allocator, home);
+    pub fn resolveDaemonConfigPath(allocator: std.mem.Allocator, state_root: []const u8) ![]u8 {
+        return daemonConfigPath(allocator, state_root);
     }
 
     fn readDaemonConfig(allocator: std.mem.Allocator, path: []const u8) !?ParsedDaemonFile {
@@ -1169,7 +1172,7 @@ pub const KgClient = struct {
     /// `/kg`, and `doctor`, including for a session that has no client at all.
     pub fn hintFor(kind: DegradedKind) []const u8 {
         return switch (kind) {
-            .unconfigured => "write ~/.metacodes/kg/daemon.json (url, api_key, expected_build_id; 0600) or set METACODES_KG_URL/_API_KEY/_EXPECTED_BUILD_ID",
+            .unconfigured => "write <state root>/kg/daemon.json (url, api_key, expected_build_id; 0600) or set METACODES_KG_URL/_API_KEY/_EXPECTED_BUILD_ID",
             .config_unsafe => "chmod 600 and make it a regular non-symlink file under 64 KB",
             .config_invalid => "fix url/api_key/expected_build_id JSON",
             .daemon_unreachable => "start tinykgd/tinykg-web at the configured url",
@@ -1208,8 +1211,8 @@ pub const KgClient = struct {
         const now = time.nowMs();
         if (now <= 0 or !probeDue(now, self.last_probe_ms, self.probe_backoff_ms)) return false;
         if (self.degraded_kind == .unconfigured or self.degraded_kind == .config_unsafe or self.degraded_kind == .config_invalid) {
-            if (self.daemon_io) |io| if (self.daemon_home) |home| {
-                const rebuilt = initDaemonTransport(self.allocator, io, .{ .home = home, .domain = self.domain, .io = io }) catch |err| blk: {
+            if (self.daemon_io) |io| if (self.daemon_state_root) |root| {
+                const rebuilt = initDaemonTransport(self.allocator, io, .{ .state_root = root, .domain = self.domain, .io = io }) catch |err| blk: {
                     self.unconfigured_kind = switch (err) {
                         error.ConfigUnsafe => .config_unsafe,
                         error.FileNotFound => if (envGet("METACODES_KG_CONFIG") != null) .config_invalid else .unconfigured,
@@ -3380,7 +3383,7 @@ test "MemoryKind parse 大小写不敏感 + 白名单外拒绝" {
 test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默回落" {
     const a = testing.allocator;
     var c1 = try KgClient.init(a, .{
-        .home = "/home/u",
+        .state_root = "/home/u",
         .domain = "proj-x",
         .env_store = "/env/store.kg",
         .env_bin = "/nonexistent/bin/tinykg",
@@ -3390,7 +3393,7 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
     try testing.expect(c1.bin_path == null); // 显式指定但不可执行 → null → degraded 明示
 
     var c2 = try KgClient.init(a, .{
-        .home = "/home/u",
+        .state_root = "/home/u",
         .domain = "proj-x",
         .env_store = "",
         .config_store = "/cfg/s.kg",
@@ -3399,7 +3402,7 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
     defer c2.deinit();
     try testing.expectEqualStrings("/cfg/s.kg", c2.store.fsPath().?);
 
-    var c3 = try KgClient.init(a, .{ .home = "/home/u", .domain = "p", .env_store = "", .env_bin = "" });
+    var c3 = try KgClient.init(a, .{ .state_root = "/home/u/.metacodes", .domain = "p", .env_store = "", .env_bin = "" });
     defer c3.deinit();
     try testing.expectEqualStrings("/home/u/.metacodes/kg/store.kg", c3.store.fsPath().?);
 }
@@ -3409,12 +3412,12 @@ test "resolveTinykgBinary: env and config sources, from an executable it did not
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe = @import("platform").paths.selfExePath(&exe_buf) orelse return error.SkipZigTest;
 
-    var from_env = (try KgClient.resolveTinykgBinary(a, .{ .home = "", .domain = "", .env_bin = exe })).?;
+    var from_env = (try KgClient.resolveTinykgBinary(a, .{ .state_root = "", .domain = "", .env_bin = exe })).?;
     defer from_env.deinit(a);
     try std.testing.expectEqual(KgClient.BinarySource.env, from_env.source);
     try std.testing.expectEqualStrings(exe, from_env.path);
 
-    var from_config = (try KgClient.resolveTinykgBinary(a, .{ .home = "", .domain = "", .env_bin = "", .config_bin = exe })).?;
+    var from_config = (try KgClient.resolveTinykgBinary(a, .{ .state_root = "", .domain = "", .env_bin = "", .config_bin = exe })).?;
     defer from_config.deinit(a);
     try std.testing.expectEqual(KgClient.BinarySource.config, from_config.source);
     try std.testing.expectEqualStrings(exe, from_config.path);
@@ -3425,7 +3428,7 @@ test "resolveTinykgBinary: an explicit but unusable env binary does not fall thr
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe = @import("platform").paths.selfExePath(&exe_buf) orelse return error.SkipZigTest;
     const result = try KgClient.resolveTinykgBinary(a, .{
-        .home = "",
+        .state_root = "",
         .domain = "",
         .env_bin = "/definitely/missing/tinykg",
         .config_bin = exe,
@@ -3456,7 +3459,7 @@ test "resolveTinykgBinary: the adjacent install layout resolves from the executa
     defer a.free(exe_dir);
     const before = try testCountEntries(a, root);
 
-    var found = (try KgClient.resolveTinykgBinary(a, .{ .home = root, .domain = "d", .env_bin = "", .exe_dir = exe_dir })).?;
+    var found = (try KgClient.resolveTinykgBinary(a, .{ .state_root = root, .domain = "d", .env_bin = "", .exe_dir = exe_dir })).?;
     defer found.deinit(a);
     try std.testing.expectEqual(KgClient.BinarySource.adjacent, found.source);
     try std.testing.expectEqualStrings(staged, found.path);
@@ -3478,11 +3481,11 @@ fn testCountEntries(allocator: std.mem.Allocator, directory: []const u8) !usize 
     return count;
 }
 
-test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
+test "issue #30: 相对 store 路径以状态根为基准补全,绝不落在 cwd" {
     const a = testing.allocator;
     // 相对配置**不报错**(init 的错误会被 app.zig `catch return` 静默吞掉),而是补全。
     var rel = try KgClient.init(a, .{
-        .home = "/home/u",
+        .state_root = "/home/u",
         .domain = "p",
         .env_store = "",
         .config_store = "relative/store.kg",
@@ -3497,7 +3500,7 @@ test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
 
     // 绝对路径原样保留。
     var abs = try KgClient.init(a, .{
-        .home = "/home/u",
+        .state_root = "/home/u",
         .domain = "p",
         .env_store = "",
         .config_store = "/abs/store.kg",
@@ -3510,7 +3513,7 @@ test "issue #30: 相对 store 路径以 home 为基准补全,绝不落在 cwd" {
 test "issue #30: cloneForThread 把父客户端拥有的 Store 原样传给克隆体" {
     const a = testing.allocator;
     var parent = try KgClient.init(a, .{
-        .home = "/home/u",
+        .state_root = "/home/u",
         .domain = "p",
         .env_store = "",
         .config_store = "/abs/store.kg",
@@ -3531,7 +3534,7 @@ test "issue #30: cloneForThread 不把未配置客户端提升成 CLI-exclusive"
     const a = testing.allocator;
     // env/config 一个都不传 → injected_cli 假、无 io → transport=.unconfigured,
     // store 被赋成哨兵 "daemon-owned"(不是路径),bin_path=null。
-    var parent = try KgClient.init(a, .{ .home = "/home/u", .domain = "p" });
+    var parent = try KgClient.init(a, .{ .state_root = "/home/u", .domain = "p" });
     defer parent.deinit();
     try testing.expect(parent.transport == .unconfigured);
     try testing.expect(parent.bin_path == null);
@@ -3559,7 +3562,7 @@ test "bin 解析:没有 staged artifact 时绝不回退 PATH 或开发 checkout"
     const a = testing.allocator;
     // 即便本机存在 TinyKG checkout，无显式路径或 staged artifact 也必须为 null。
     var c = try KgClient.init(a, .{
-        .home = "/home/u",
+        .state_root = "/home/u",
         .domain = "p",
         .env_bin = "",
         .env_store = "",

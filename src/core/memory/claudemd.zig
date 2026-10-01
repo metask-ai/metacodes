@@ -30,6 +30,8 @@ pub const LoadOptions = struct {
     cwd: []const u8 = "",
     /// HOME,用于 User 级 ~/.claude/CLAUDE.md 与 import 的 `~` 展开。
     home: []const u8 = "",
+    /// 状态根(util/state_root.zig):User 级 `<state_root>/AGENTS.md`。"" 跳过。
+    state_root: []const u8 = "",
 };
 
 /// 读文件全文(posix,仿 import.zig)。返回 owned;不存在/读失败返回对应 error。
@@ -99,7 +101,7 @@ fn ancestorDirs(allocator: std.mem.Allocator, cwd: []const u8) ![][]u8 {
 /// 加载完整 CLAUDE.md 链,返回拼接好的纯文本(owned)。无内容返回空串(owned)。
 ///
 /// 顺序(后者优先级高,放后面):
-///   User(~/.claude/CLAUDE.md, ~/.metacodes/AGENTS.md)
+///   User(~/.claude/CLAUDE.md, <state_root>/AGENTS.md)
 ///   → Project(根→cwd 每层 CLAUDE.md + .claude/CLAUDE.md)
 ///   → Local(根→cwd 每层 CLAUDE.local.md)
 pub fn load(allocator: std.mem.Allocator, opts: LoadOptions) ![]u8 {
@@ -111,10 +113,11 @@ pub fn load(allocator: std.mem.Allocator, opts: LoadOptions) ![]u8 {
         const user_path = try std.fmt.allocPrint(allocator, "{s}/.claude/CLAUDE.md", .{opts.home});
         defer allocator.free(user_path);
         try appendFile(allocator, &out, user_path, DESC_USER, opts.home);
-
-        // metacodes 原生用户级记忆(~/.metacodes/AGENTS.md,业界通用 AGENTS.md 约定),
+    }
+    if (opts.state_root.len > 0) {
+        // metacodes 原生用户级记忆(<state_root>/AGENTS.md,业界通用 AGENTS.md 约定),
         // 放最后 = 用户级最高优先。
-        const agent_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/AGENTS.md", .{opts.home});
+        const agent_path = try std.fmt.allocPrint(allocator, "{s}/AGENTS.md", .{opts.state_root});
         defer allocator.free(agent_path);
         try appendFile(allocator, &out, agent_path, DESC_USER, opts.home);
     }
@@ -255,7 +258,7 @@ test "load: 项目 AGENTS.md 与 CLAUDE.md 共存,AGENTS.md 优先;.metacodes/AG
     try testing.expect(std.mem.indexOf(u8, out, "META-AGENTS-CONTENT").? > std.mem.indexOf(u8, out, "AGENTS-CONTENT").?);
 }
 
-test "load: 用户级 ~/.metacodes/AGENTS.md 与 ~/.claude/CLAUDE.md 共存,原生最高优先" {
+test "load: 用户级 <state_root>/AGENTS.md 与 ~/.claude/CLAUDE.md 共存,原生最高优先" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -271,7 +274,7 @@ test "load: 用户级 ~/.metacodes/AGENTS.md 与 ~/.claude/CLAUDE.md 共存,原�
     const meta_dir = try std.fmt.bufPrint(&buf2, "{s}/.metacodes", .{home});
     try writeFileAt(meta_dir, "AGENTS.md", "USER-AGENT-NATIVE-RULES");
 
-    const out = try load(a, .{ .cwd = "", .home = home });
+    const out = try load(a, .{ .cwd = "", .home = home, .state_root = meta_dir });
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "USER-CLAUDE-RULES") != null);
     try testing.expect(std.mem.indexOf(u8, out, "USER-AGENT-NATIVE-RULES") != null);

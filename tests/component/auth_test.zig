@@ -92,7 +92,7 @@ test "L2 auth: stored OAuth resolves into Anthropic Authorization header" {
     defer creds.deinit(a);
     try cc.core_auth.saveToPath(a, auth_path, creds);
 
-    var resolved = try cc.core_auth.resolveCredential(a, null, .api_key_first);
+    var resolved = try cc.core_auth.resolveCredential(a, "", null, .api_key_first);
     defer resolved.deinit(a);
     try std.testing.expectEqual(cc.core_auth.CredentialSource.stored_oauth, resolved.source);
 
@@ -137,12 +137,12 @@ test "L2 auth: env API key wins by default, oauth-first is explicit override" {
     defer creds.deinit(a);
     try cc.core_auth.saveToPath(a, auth_path, creds);
 
-    var default_resolved = try cc.core_auth.resolveCredential(a, null, .api_key_first);
+    var default_resolved = try cc.core_auth.resolveCredential(a, "", null, .api_key_first);
     defer default_resolved.deinit(a);
     try std.testing.expectEqual(cc.core_auth.CredentialSource.env_api_key, default_resolved.source);
     try std.testing.expectEqualStrings("env-key-l2", default_resolved.bearer_token);
 
-    var oauth_resolved = try cc.core_auth.resolveCredential(a, null, .oauth_first);
+    var oauth_resolved = try cc.core_auth.resolveCredential(a, "", null, .oauth_first);
     defer oauth_resolved.deinit(a);
     try std.testing.expectEqual(cc.core_auth.CredentialSource.stored_oauth, oauth_resolved.source);
     try std.testing.expectEqualStrings("oauth-precedence-l2", oauth_resolved.bearer_token);
@@ -159,7 +159,7 @@ test "L2 auth: ordinary environment credential remains compatible with process t
     defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
     defer _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
 
-    var resolved = try cc.core_auth.resolveRuntimeCredential(a, null, .api_key_first);
+    var resolved = try cc.core_auth.resolveRuntimeCredential(a, "", null, .api_key_first);
     defer resolved.deinit(a);
     try std.testing.expectEqual(cc.core_auth.CredentialSource.env_api_key, resolved.source);
     try std.testing.expectEqualStrings(secret, resolved.bearer_token);
@@ -222,7 +222,7 @@ test "L2 auth: inherited credential FD authenticates without secret in initial e
 
     // The inherited FD is explicit runtime authority and must win even when
     // the general stored-credential policy says oauth_first.
-    var resolved = try cc.core_auth.resolveRuntimeCredential(a, null, .oauth_first);
+    var resolved = try cc.core_auth.resolveRuntimeCredential(a, "", null, .oauth_first);
     errdefer resolved.deinit(a);
     try std.testing.expectEqual(cc.core_auth.CredentialSource.fd_api_key, resolved.source);
     try std.testing.expectEqualStrings(secret, resolved.bearer_token);
@@ -280,7 +280,7 @@ test "L2 auth: runtime FD rejects an ambient second credential channel" {
 
     try std.testing.expectError(
         error.AmbiguousRuntimeCredentials,
-        cc.core_auth.resolveRuntimeCredential(std.testing.allocator, null, .api_key_first),
+        cc.core_auth.resolveRuntimeCredential(std.testing.allocator, "", null, .api_key_first),
     );
     try std.testing.expect(std.c.getenv(cc.core_auth.RUNTIME_API_KEY_FD_ENV) != null);
     try std.testing.expect(std.c.getenv(cc.core_auth.METASK_API_KEY_ENV) != null);
@@ -319,7 +319,7 @@ test "L2 auth: oversized runtime credential fails closed and closes inherited FD
 
     try std.testing.expectError(
         error.CredentialFdTooLarge,
-        cc.core_auth.resolveRuntimeCredential(a, null, .api_key_first),
+        cc.core_auth.resolveRuntimeCredential(a, "", null, .api_key_first),
     );
     try std.testing.expect(std.c.getenv(cc.core_auth.RUNTIME_API_KEY_FD_ENV) != null);
     try std.testing.expect(pfs.lseek(fd, 0, .set) < 0);
@@ -330,7 +330,7 @@ test "L2 auth: malformed runtime credential descriptor fails without mutating en
     defer _ = unsetenv(cc.core_auth.RUNTIME_API_KEY_FD_ENV);
     try std.testing.expectError(
         error.InvalidCredentialFd,
-        cc.core_auth.resolveRuntimeCredential(std.testing.allocator, null, .api_key_first),
+        cc.core_auth.resolveRuntimeCredential(std.testing.allocator, "", null, .api_key_first),
     );
     try std.testing.expect(std.c.getenv(cc.core_auth.RUNTIME_API_KEY_FD_ENV) != null);
 }
@@ -361,12 +361,12 @@ test "L2 auth: stored API key wins over OAuth unless oauth-first is explicit" {
     defer creds.deinit(a);
     try cc.core_auth.saveToPath(a, auth_path, creds);
 
-    var default_resolved = try cc.core_auth.resolveCredential(a, null, .api_key_first);
+    var default_resolved = try cc.core_auth.resolveCredential(a, "", null, .api_key_first);
     defer default_resolved.deinit(a);
     try std.testing.expectEqual(cc.core_auth.CredentialSource.stored_api_key, default_resolved.source);
     try std.testing.expectEqualStrings("stored-api-key-l2", default_resolved.bearer_token);
 
-    var oauth_resolved = try cc.core_auth.resolveCredential(a, null, .oauth_first);
+    var oauth_resolved = try cc.core_auth.resolveCredential(a, "", null, .oauth_first);
     defer oauth_resolved.deinit(a);
     try std.testing.expectEqual(cc.core_auth.CredentialSource.stored_oauth, oauth_resolved.source);
     try std.testing.expectEqualStrings("oauth-stored-precedence-l2", oauth_resolved.bearer_token);
@@ -406,7 +406,7 @@ test "L2 auth: expiring OAuth refreshes before request and persists replacement"
     _ = setenv(cc.core_auth.OAUTH_TOKEN_URL_ENV, token_url_z.ptr, 1);
     defer _ = unsetenv(cc.core_auth.OAUTH_TOKEN_URL_ENV);
 
-    var resolved = try cc.core_auth.resolveCredential(a, null, .oauth_first);
+    var resolved = try cc.core_auth.resolveCredential(a, "", null, .oauth_first);
     defer resolved.deinit(a);
     try std.testing.expectEqual(cc.core_auth.CredentialSource.stored_oauth, resolved.source);
     try std.testing.expectEqualStrings("new-access-l2", resolved.bearer_token);
@@ -473,7 +473,7 @@ test "L2 auth: invalid refresh grant surfaces login required without fallback" {
     _ = setenv(cc.core_auth.OAUTH_TOKEN_URL_ENV, token_url_z.ptr, 1);
     defer _ = unsetenv(cc.core_auth.OAUTH_TOKEN_URL_ENV);
 
-    try std.testing.expectError(error.OAuthLoginRequired, cc.core_auth.resolveCredential(a, null, .oauth_first));
+    try std.testing.expectError(error.OAuthLoginRequired, cc.core_auth.resolveCredential(a, "", null, .oauth_first));
 }
 
 const CallbackInput = struct {

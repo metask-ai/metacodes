@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "purpose": "License texts for the Lean runtime libraries statically linked into the shipped Lean governance kernels (libexec/metacodes). The kernels are built from this repository's control-plane/lean sources by scripts/build-formal-kernel.sh and scripts/build-project-harness-kernel.sh, so anyone can relink them against their own GMP.",
+  "lean_toolchain": "leanprover/lean4:v4.14.0",
+  "components": [
+    {
+      "name": "Lean 4 runtime",
+      "version": "4.14.0",
+      "license": "Apache-2.0",
+      "source_repository": "https://github.com/leanprover/lean4",
+      "license_files": [
+        {
+          "path": "lean4-LICENSE",
+          "origin": "LICENSE of the leanprover/lean4:v4.14.0 toolchain",
+          "sha256": "8b28515ffffc5c0fe2807d8ae3735b00b324d9b7ce807dd63ff6ac8922fbce7e"
+        }
+      ]
+    },
+    {
+      "name": "GMP",
+      "version": "6.3.0",
+      "license": "LGPL-3.0-or-later OR GPL-2.0-or-later",
+      "source_repository": "https://gmplib.org",
+      "license_files": [
+        {
+          "path": "gmp-COPYING.LESSERv3",
+          "origin": "https://www.gnu.org/licenses/lgpl-3.0.txt",
+          "sha256": "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118"
+        },
+        {
+          "path": "gmp-COPYINGv3",
+          "origin": "https://www.gnu.org/licenses/gpl-3.0.txt",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "path": "gmp-COPYINGv2",
+          "origin": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt",
+          "sha256": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6"
+        }
+      ]
+    },
+    {
+      "name": "libuv",
+      "version": "1.49.2",
+      "license": "MIT",
+      "source_repository": "https://github.com/libuv/libuv",
+      "license_files": [
+        {
+          "path": "libuv-LICENSE",
+          "origin": "https://raw.githubusercontent.com/libuv/libuv/v1.49.2/LICENSE",
+          "sha256": "16de0c32b265cb7d46a6d3bd614f259dd4d693a5e26b3407b04aae8d73041f0c"
+        },
+        {
+          "path": "libuv-LICENSE-extra",
+          "origin": "https://raw.githubusercontent.com/libuv/libuv/v1.49.2/LICENSE-extra",
+          "sha256": "262c44bd2cdba037e6d2a82fba15f5800d292bc993a6f5d6b6ea487744d02836"
+        }
+      ]
+    }
+  ]
+}

@@ -574,13 +574,14 @@ pub const ArtifactStoreConfig = union(enum) {
                 error.InvalidArtifactStoreConfig
             else
                 allocator.dupe(u8, root),
+            // `<state_root>/agentcore/sessions/<id>`; the default state root is
+            // `<home>/.metacodes` (WorkspacePolicy), the historical location.
             .session_under_workspace_home => blk: {
-                const base = if (workspace.home.len != 0) workspace.home else workspace.root;
-                if (base.len == 0) return error.InvalidArtifactStoreConfig;
+                if (workspace.state_root.len == 0) return error.InvalidArtifactStoreConfig;
                 break :blk std.fmt.allocPrint(
                     allocator,
-                    "{s}/.metacodes/agentcore/sessions/{s}",
-                    .{ base, session_id.asSlice() },
+                    "{s}/agentcore/sessions/{s}",
+                    .{ workspace.state_root, session_id.asSlice() },
                 );
             },
         };
@@ -611,13 +612,14 @@ pub const RunJournalConfig = union(enum) {
                 error.InvalidRunJournalConfig
             else
                 allocator.dupe(u8, root),
+            // `<state_root>/agentcore/sessions/<id>`; the default state root is
+            // `<home>/.metacodes` (WorkspacePolicy), the historical location.
             .session_under_workspace_home => blk: {
-                const base = if (workspace.home.len != 0) workspace.home else workspace.root;
-                if (base.len == 0) return error.InvalidRunJournalConfig;
+                if (workspace.state_root.len == 0) return error.InvalidRunJournalConfig;
                 break :blk std.fmt.allocPrint(
                     allocator,
-                    "{s}/.metacodes/agentcore/sessions/{s}",
-                    .{ base, session_id.asSlice() },
+                    "{s}/agentcore/sessions/{s}",
+                    .{ workspace.state_root, session_id.asSlice() },
                 );
             },
         };
@@ -1983,6 +1985,7 @@ pub const AgentSession = struct {
                 .cwd_abs = self.workspace.root,
                 .resolve_relative_paths = true,
                 .home_dir = self.workspace.home,
+                .state_root = self.workspace.state_root,
                 .artifact_root = self.artifact_root,
                 .tool_result_metrics = &self.tool_result_metrics,
                 .sandbox = self.workspace.sandbox(),

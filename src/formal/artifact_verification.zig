@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const runtime = @import("runtime.zig");
+const test_kernel = @import("test_kernel.zig");
 const provenance_mod = @import("provenance.zig");
 const artifact_store = @import("artifact_store.zig");
 const time = @import("../util/time.zig");
@@ -1273,7 +1274,7 @@ test "artifact host observes real regular bytes and rejects hardlinks" {
 }
 
 test "artifact host crosses canonical request pinned Lean verdict and reobserve gate" {
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     var evaluation = try evaluate(
         std.testing.allocator,
         fixture_snapshot,
@@ -1675,7 +1676,7 @@ test "authorized artifact repair fails closed on pathname swap after writing" {
 
 test "L2 authorized artifact repair crosses persisted evidence Lean verdict and source CAS" {
     if (!pfs.atomic_final_nofollow) return error.SkipZigTest;
-    const config = testKernel() orelse return error.SkipZigTest;
+    const config = (try testKernel()) orelse return error.SkipZigTest;
     var fixture = try TestRepairFixture.init("first,second\n1,2\n", "second,first\n2,1\n");
     defer fixture.deinit();
     const snapshot = try renderRepairTestSnapshot(std.testing.allocator, fixture.authority);
@@ -1899,14 +1900,10 @@ fn readTestFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return readOpenArtifact(allocator, fd, info.size, MAX_ARTIFACT_BYTES);
 }
 
-fn testKernel() ?runtime.Config {
+fn testKernel() !?runtime.Config {
     if (builtin.os.tag == .windows) return null;
-    const path_raw = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_PATH") orelse return null;
-    const hash_raw = std.c.getenv("METACODES_TEST_FORMAL_KERNEL_SHA256") orelse return null;
-    const path = std.mem.span(path_raw);
-    const hash = parseHash(std.mem.span(hash_raw)) orelse return null;
-    if (!std.fs.path.isAbsolute(path)) return null;
-    return .{ .checker_path = path, .expected_sha256 = hash };
+    const kernel = (try test_kernel.resolve(std.testing.io, .formal)) orelse return null;
+    return .{ .checker_path = kernel.path, .expected_sha256 = kernel.expected_sha256 };
 }
 
 fn writeTestFile(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !void {

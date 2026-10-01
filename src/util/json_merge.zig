@@ -1,6 +1,6 @@
 //! Order-preserving JSON object merge.
 //!
-//! Several independent writers own different parts of `~/.metacodes/config.json`
+//! Several independent writers own different parts of `<state root>/config.json`
 //! (theme, MCP servers, permission rules, model tiers, and now the provider
 //! control plane). A writer that serializes only the fields it knows about
 //! silently deletes every other writer's data. This helper exists so a writer

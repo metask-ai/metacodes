@@ -670,7 +670,7 @@ test "L2 real TinyKG scratch store snapshot binds through prepare persist and ru
     try runTinyKg(a, bin, &.{ "set-property", store, "node", "2", "ontology_provenance", provenance });
 
     var client = try cc.kg_client.KgClient.init(a, .{
-        .home = root,
+        .state_root = root,
         .domain = "ontology-scratch-l2",
         .config_bin = bin,
         .config_store = store,
@@ -808,7 +808,7 @@ test "L2 KgClient requires exactly one LF of CLI framing and rejects any other s
         defer a.free(script);
         try writeExecutable(a, wrapper, script);
         var client = try cc.kg_client.KgClient.init(a, .{
-            .home = root,
+            .state_root = root,
             .domain = "ontology-wire-l2",
             .config_bin = wrapper,
             .config_store = store,
