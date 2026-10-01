@@ -99,6 +99,19 @@ if ! axiom_audit=$(cd "$lean_dir" && "$lake" env lean FormalAxiomAudit.lean 2>&1
   printf '%s\n' "$axiom_audit" >&2
   exit 1
 fi
+# The provenance label, taken here, right after the audit's call through the
+# same Lake: on the Windows runner a later call through the elan proxy fails
+# to start the toolchain's lake.exe ("The handle is invalid", os error 6;
+# os error 50 through a pipe) once the native smokes below have run, while
+# this position works on every host.  The label is Lake's own version line
+# ("Lake version … (Lean version 4.14.0)"), so no Lean child is started.
+if ! lean_version=$(cd "$lean_dir" && "$lake" --version 2>&1); then
+  echo "build-formal-kernel: \`lake --version\` failed:" >&2
+  printf '%s\n' "$lean_version" >&2
+  exit 1
+fi
+lean_version=${lean_version//$'\r'/}
+lean_version=${lean_version//$'\n'/}
 axiom_audit=${axiom_audit//$'\r'/} # Windows: Lean writes CRLF
 expected_axioms="'MetaCodesControl.FormalKernel.safeMigration_sound' depends on axioms: [propext, Quot.sound]"
 expected_axioms="$expected_axioms
@@ -262,17 +275,6 @@ if [[ "$host_os" == "Darwin" ]]; then
 else
   binary_bytes=$(stat -c '%s' "$output")
 fi
-# The label comes from Lake itself ("Lake version … (Lean version 4.14.0)"),
-# the toolchain that just built the kernel.  `lake env lean --version` spawned
-# a `lean` that exits 1 on the Windows runner right after `lake env lean <file>`
-# succeeded there, so no Lean child is started for a label.
-if ! lean_version=$(cd "$lean_dir" && "$lake" --version 2>&1); then
-  echo "build-formal-kernel: \`lake --version\` failed:" >&2
-  printf '%s\n' "$lean_version" >&2
-  exit 1
-fi
-lean_version=${lean_version//$'\r'/}
-lean_version=${lean_version//$'\n'/}
 built_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 # The artifact manifest is intentionally time-independent.  It is the stable
