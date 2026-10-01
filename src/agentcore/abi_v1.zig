@@ -992,6 +992,13 @@ const AbiSession = struct {
             .bypass_permissions, .bypass => .allow,
             .default, .accept_edits, .auto, .prompt => .ask,
         };
+        var file_target = session_permission.deriveFileTarget(
+            allocator,
+            tool,
+            arguments_json,
+            self.fileTargetContext(),
+        ) catch return .deny;
+        defer if (file_target) |*target| target.deinit(allocator);
         var result = if (is_shared_ceiling)
             session_permission.DecisionResult{
                 .decision = switch (imported_decision.?) {
@@ -1004,7 +1011,10 @@ const AbiSession = struct {
         else
             self.permission_state.decide(
                 tool,
-                digest,
+                .{
+                    .arguments_digest = digest,
+                    .file_target = if (file_target) |target| target.digest else null,
+                },
                 explicit,
                 .{ .decision = external_fallback, .source = .mode_fallback },
             ) catch return .deny;
@@ -1041,6 +1051,17 @@ const AbiSession = struct {
             .deny => .deny,
             .ask => .ask,
             .allow => .allow,
+        };
+    }
+
+    /// The path context Write and Edit run with in this Session (the Core
+    /// tool context: Workspace root as cwd, relative paths resolved, Workspace
+    /// home for `~`), so a file-target grant names the file the tool opens.
+    fn fileTargetContext(self: *const AbiSession) core.tool_file_target.Context {
+        return .{
+            .home = self.core_session.workspace.home,
+            .base_dir = self.core_session.workspace.root,
+            .resolve_relative = true,
         };
     }
 
@@ -1632,10 +1653,25 @@ const AbiSession = struct {
             return error.ResourceLimit;
         }
         self.permission_request_sequence += 1;
-        const candidate = try session_permission.deriveRuleCandidate(
+        // Write/Edit with a nameable target get the per-file candidate; every
+        // other Session-eligible call keeps the exact-argument one.
+        var file_target = session_permission.deriveFileTarget(
+            response_allocator,
             tool,
-            digest,
-        );
+            arguments_json,
+            self.fileTargetContext(),
+        ) catch |err| {
+            self.recordCallbackStatus(if (err == error.OutOfMemory)
+                wire.STATUS_OUT_OF_MEMORY
+            else
+                wire.STATUS_CALLBACK_FAILED);
+            return err;
+        };
+        defer if (file_target) |*target| target.deinit(response_allocator);
+        const candidate = if (file_target) |*target|
+            try session_permission.deriveFileTargetCandidate(tool, target)
+        else
+            try session_permission.deriveRuleCandidate(tool, digest);
         const request_id = try session_permission.deriveRequestId(
             identity.session_id,
             identity.run_id,
@@ -7427,7 +7463,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 15), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 17), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 64), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
@@ -8658,6 +8694,166 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
     );
 }
 
+test "Revision 17 AgentCore allow_session on Write covers later writes to the same file" {
+    const Probe = struct {
+        var calls: usize = 0;
+        var response_buffer: [1024]u8 = undefined;
+        var last_request: [8192]u8 = undefined;
+        var last_request_len: usize = 0;
+
+        fn request(_: ?*anyopaque, _: ?*const wire.RunContextV1, request_view: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            calls += 1;
+            const result = out orelse return wire.UI_FATAL;
+            const request_len = std.math.cast(usize, request_view.len) orelse return wire.UI_FATAL;
+            const request_bytes = (request_view.ptr orelse return wire.UI_FATAL)[0..request_len];
+            if (request_bytes.len > last_request.len) return wire.UI_FATAL;
+            @memcpy(last_request[0..request_bytes.len], request_bytes);
+            last_request_len = request_bytes.len;
+            var parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, request_bytes, .{}) catch
+                return wire.UI_FATAL;
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            const candidate = root.get("candidate").?.object;
+            const encoded = std.fmt.bufPrint(
+                &response_buffer,
+                "{{\"permission\":\"allow_session\",\"request_id\":\"{s}\",\"policy_generation\":{d},\"rule_id\":\"{s}\"}}",
+                .{ root.get("request_id").?.string, root.get("policy_generation").?.integer, candidate.get("rule_id").?.string },
+            ) catch return wire.UI_FATAL;
+            result.* = .{ .ptr = encoded.ptr, .len = encoded.len };
+            return wire.UI_ANSWERED;
+        }
+
+        fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {}
+
+        fn lastRequest() []const u8 {
+            return last_request[0..last_request_len];
+        }
+    };
+    const ToolCall = struct {
+        fn append(session: *core.agent_session.AgentSession, id: []const u8, name: []const u8, input: []const u8) !void {
+            const a = session.allocator;
+            const id_owned = try a.dupe(u8, id);
+            errdefer a.free(id_owned);
+            const name_owned = try a.dupe(u8, name);
+            errdefer a.free(name_owned);
+            const input_owned = try a.dupe(u8, input);
+            errdefer a.free(input_owned);
+            const blocks = try a.alloc(core.message.Block, 1);
+            errdefer a.free(blocks);
+            blocks[0] = .{ .tool_use = .{ .id = id_owned, .name = name_owned, .input = input_owned } };
+            try session.conversation.append(.{ .role = .assistant, .blocks = blocks });
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{ "Write", "Edit" } },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = root_buffer[0..root_len], .shell = .unrestricted },
+        .allowed_tools = &.{ "Write", "Edit" },
+    });
+    defer native_session.destroy() catch unreachable;
+    var fake = AbiSession{
+        .callbacks = .{
+            .struct_size = @sizeOf(wire.SessionCallbacksV1),
+            .reserved0 = 0,
+            .ctx = null,
+            .on_event = null,
+            .on_ui_request = Probe.request,
+            .release_response = Probe.release,
+            .reserved = [_]u64{0} ** 4,
+        },
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+    };
+    defer fake.permission_state.deinit();
+    Probe.calls = 0;
+
+    const first = "{\"file_path\":\"notes.txt\",\"content\":\"one\"}";
+    try ToolCall.append(native_session, "write-1", "Write", first);
+    try std.testing.expect(AbiSession.permissionDecisionOverride(&fake, "Write", first, .undecided) == null);
+    var response: ui_request.UiResponse = undefined;
+    const first_request = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = first } };
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&fake, .{ .session_id = native_session.session_id, .run_id = 1 }, std.testing.allocator, &first_request, &response),
+    );
+    try std.testing.expect(response == .permission and response.permission == .allow_once);
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+
+    // The Host was told which file the answer covers: the path Write opens.
+    const expected_target = (try core.tool_file_target.resolve(
+        std.testing.allocator,
+        .write,
+        first,
+        fake.fileTargetContext(),
+    )).?;
+    defer std.testing.allocator.free(expected_target);
+    const expected_object = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        .{ .scope = "file_target", .target = expected_target },
+        .{},
+    );
+    defer std.testing.allocator.free(expected_object);
+    const fragment = expected_object[1 .. expected_object.len - 1];
+    try std.testing.expect(std.mem.indexOf(u8, Probe.lastRequest(), fragment) != null);
+
+    // The next write to the same file, with new content and spelled through
+    // the Workspace root, is decided before the callback.
+    const later = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"content\":\"two\",\"file_path\":{f}}}",
+        .{std.json.fmt(expected_target, .{})},
+    );
+    defer std.testing.allocator.free(later);
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.allow,
+        AbiSession.permissionDecisionOverride(&fake, "Write", later, .undecided).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    // Another file, and the same file through Edit, still go to the Host.
+    try std.testing.expect(AbiSession.permissionDecisionOverride(
+        &fake,
+        "Write",
+        "{\"file_path\":\"other.txt\",\"content\":\"one\"}",
+        .undecided,
+    ) == null);
+    try std.testing.expect(AbiSession.permissionDecisionOverride(
+        &fake,
+        "Edit",
+        "{\"file_path\":\"notes.txt\",\"old_string\":\"one\",\"new_string\":\"two\"}",
+        .undecided,
+    ) == null);
+
+    // A call the tool and a JSON reader would resolve differently gets only
+    // the exact-argument candidate.
+    const ambiguous = "{\"a\\\"file_path\":\"elsewhere.txt\",\"file_path\":\"notes.txt\",\"content\":\"x\"}";
+    try ToolCall.append(native_session, "write-2", "Write", ambiguous);
+    try std.testing.expect(AbiSession.permissionDecisionOverride(&fake, "Write", ambiguous, .undecided) == null);
+    const ambiguous_request = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = ambiguous } };
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&fake, .{ .session_id = native_session.session_id, .run_id = 1 }, std.testing.allocator, &ambiguous_request, &response),
+    );
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expect(std.mem.indexOf(u8, Probe.lastRequest(), "\"scope\":\"exact_arguments\",\"target\":null") != null);
+    // That exact grant still covers only its identical call.
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.allow,
+        AbiSession.permissionDecisionOverride(&fake, "Write", ambiguous, .undecided).?,
+    );
+    try std.testing.expectEqual(@as(usize, 2), fake.permission_state.ruleCount());
+}
+
 test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
     const fixture = @import("mcp_test_support.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -9171,7 +9367,7 @@ test "checkpoint restores compatible MCP view and exact Session grant" {
         session_permission.Decision.allow,
         (try restored.session.permission_state.decide(
             restored.session.mcp_selection.?.entries[0].permissionIdentity(),
-            digest,
+            .{ .arguments_digest = digest },
             .undecided,
             .{ .decision = .ask, .source = .mode_fallback },
         )).decision,
@@ -10216,7 +10412,7 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
         session_permission.Decision.allow,
         (try restored.session.permission_state.decide(
             .{ .namespace = .builtin, .name = "Read" },
-            read_digest,
+            .{ .arguments_digest = read_digest },
             .undecided,
             .{ .decision = .ask, .source = .mode_fallback },
         )).decision,
@@ -11072,7 +11268,7 @@ test "Revision 6 AgentCore permission rule mutation is atomic and invalidates Se
         session_permission.Decision.deny,
         (try session.permission_state.decide(
             .{ .namespace = .builtin, .name = "Bash" },
-            arguments_digest,
+            .{ .arguments_digest = arguments_digest },
             .undecided,
             .{ .decision = .ask, .source = .mode_fallback },
         )).decision,

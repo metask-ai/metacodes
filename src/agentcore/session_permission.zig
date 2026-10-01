@@ -104,18 +104,47 @@ pub const ToolIdentity = struct {
     }
 };
 
+/// How far a Session answer reaches. Broader semantic candidates exist only
+/// where a Tool-specific canonicalizer derives them.
 pub const CandidateScope = enum(u8) {
-    /// The narrowest safe first implementation: the same stable Tool identity
-    /// and the same canonical argument value. Broader semantic candidates may
-    /// be added only by a Tool-specific canonicalizer.
-    exact_arguments,
+    /// The same stable Tool identity and the same canonical argument value.
+    /// Every Tool with a Session candidate has this one.
+    exact_arguments = 0,
+    /// Built-in Write and Edit: the same Tool identity and the same canonical
+    /// target file, whatever the content or edit strings. Offered only when
+    /// `deriveFileTarget` can name that file (see there).
+    file_target = 1,
 };
 
 pub const RuleCandidate = struct {
     rule_id: RuleId,
     tool: ToolIdentity,
-    arguments_digest: ArgumentsDigest,
     scope: CandidateScope = .exact_arguments,
+    /// What the rule matches: the canonical argument digest for
+    /// `exact_arguments`, `FileTarget.digest` for `file_target`.
+    key: ArgumentsDigest,
+    /// `file_target` only: the canonical path `key` digests, borrowed. The
+    /// Host shows it so a Session answer names the file it covers.
+    target_path: ?[]const u8 = null,
+};
+
+/// The file a built-in Write/Edit call acts on, as `deriveFileTarget` derives
+/// it. `path` is owned.
+pub const FileTarget = struct {
+    path: []u8,
+    digest: ArgumentsDigest,
+
+    pub fn deinit(self: *FileTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+/// The facts a tool call is matched on: always its canonical argument
+/// digest, and its target file when it has one.
+pub const MatchFacts = struct {
+    arguments_digest: ArgumentsDigest,
+    file_target: ?ArgumentsDigest = null,
 };
 
 pub const SessionRuleAction = enum(u8) {
@@ -199,7 +228,8 @@ const SessionRule = struct {
     namespace: ToolNamespace,
     tool_name: []u8,
     binding: [32]u8,
-    arguments_digest: ArgumentsDigest,
+    scope: CandidateScope,
+    key: ArgumentsDigest,
     policy_generation: u64,
 
     fn deinit(self: *SessionRule, allocator: std.mem.Allocator) void {
@@ -210,14 +240,21 @@ const SessionRule = struct {
     fn matches(
         self: *const SessionRule,
         tool: ToolIdentity,
-        arguments_digest: ArgumentsDigest,
+        facts: MatchFacts,
         policy_generation: u64,
     ) bool {
-        return self.policy_generation == policy_generation and
-            self.namespace == tool.namespace and
-            std.mem.eql(u8, self.tool_name, tool.name) and
-            std.mem.eql(u8, &self.binding, &tool.binding) and
-            std.mem.eql(u8, &self.arguments_digest, &arguments_digest);
+        if (self.policy_generation != policy_generation or
+            self.namespace != tool.namespace or
+            !std.mem.eql(u8, self.tool_name, tool.name) or
+            !std.mem.eql(u8, &self.binding, &tool.binding))
+            return false;
+        return switch (self.scope) {
+            .exact_arguments => std.mem.eql(u8, &self.key, &facts.arguments_digest),
+            .file_target => if (facts.file_target) |target|
+                std.mem.eql(u8, &self.key, &target)
+            else
+                false,
+        };
     }
 };
 
@@ -332,7 +369,9 @@ pub const State = struct {
             const entry = encoded[offset..][0..checkpoint_rule_bytes];
             entry[0] = @intFromEnum(rule.action);
             entry[1] = @intFromEnum(rule.namespace);
-            entry[2] = @intFromEnum(CandidateScope.exact_arguments);
+            // Exact-scope rules keep the byte older readers accept; a reader
+            // without `file_target` refuses the checkpoint that holds one.
+            entry[2] = @intFromEnum(rule.scope);
             std.mem.writeInt(
                 u32,
                 entry[4..8],
@@ -340,7 +379,7 @@ pub const State = struct {
                 .little,
             );
             @memcpy(entry[8..40], &rule.binding);
-            @memcpy(entry[40..72], &rule.arguments_digest);
+            @memcpy(entry[40..72], &rule.key);
             @memcpy(entry[72..104], &rule.rule_id);
             offset += checkpoint_rule_bytes;
             @memcpy(encoded[offset..][0..rule.tool_name.len], rule.tool_name);
@@ -362,6 +401,8 @@ pub const State = struct {
             .deny_once, .allow_once => return error.InvalidIdentity,
         };
         try candidate.tool.validate();
+        if (candidate.scope == .file_target and !supportsFileTarget(candidate.tool))
+            return error.InvalidIdentity;
         self.mutex.lock();
         defer self.mutex.unlock();
         if (expected_policy_generation != self.policy_generation)
@@ -382,7 +423,8 @@ pub const State = struct {
             .namespace = candidate.tool.namespace,
             .tool_name = name,
             .binding = candidate.tool.binding,
-            .arguments_digest = candidate.arguments_digest,
+            .scope = candidate.scope,
+            .key = candidate.key,
             .policy_generation = self.policy_generation,
         }) catch return error.OutOfMemory;
         return .added;
@@ -391,7 +433,7 @@ pub const State = struct {
     pub fn decide(
         self: *State,
         tool: ToolIdentity,
-        arguments_digest: ArgumentsDigest,
+        facts: MatchFacts,
         explicit: ExplicitAction,
         fallback: Fallback,
     ) Error!DecisionResult {
@@ -403,7 +445,7 @@ pub const State = struct {
             .decision = .deny,
             .source = .explicit_deny,
         };
-        if (self.matchingRule(.deny, tool, arguments_digest)) |rule| return .{
+        if (self.matchingRule(.deny, tool, facts)) |rule| return .{
             .decision = .deny,
             .source = .session_deny,
             .matched_rule_id = rule.rule_id,
@@ -417,7 +459,7 @@ pub const State = struct {
             .decision = .allow,
             .source = .explicit_allow,
         };
-        if (self.matchingRule(.allow, tool, arguments_digest)) |rule| return .{
+        if (self.matchingRule(.allow, tool, facts)) |rule| return .{
             .decision = .allow,
             .source = .session_allow,
             .matched_rule_id = rule.rule_id,
@@ -489,7 +531,8 @@ pub const State = struct {
                 .{
                     .rule_id = rule.rule_id,
                     .tool = tool,
-                    .arguments_digest = rule.arguments_digest,
+                    .scope = rule.scope,
+                    .key = rule.key,
                 },
                 self.policy_generation,
             );
@@ -515,12 +558,12 @@ pub const State = struct {
         self: *State,
         action: SessionRuleAction,
         tool: ToolIdentity,
-        arguments_digest: ArgumentsDigest,
+        facts: MatchFacts,
     ) ?*const SessionRule {
         for (self.rules.items) |*rule| {
             if (rule.action == action and rule.matches(
                 tool,
-                arguments_digest,
+                facts,
                 self.policy_generation,
             )) return rule;
         }
@@ -552,7 +595,8 @@ pub fn checkpointRuleDeltaBytes(tool: ToolIdentity) Error!u64 {
 pub const DurableRule = struct {
     action: SessionRuleAction,
     tool: ToolIdentity,
-    arguments_digest: ArgumentsDigest,
+    scope: CandidateScope,
+    key: ArgumentsDigest,
     rule_id: RuleId,
 
     fn deinit(self: *DurableRule, allocator: std.mem.Allocator) void {
@@ -649,8 +693,11 @@ pub fn decodeCheckpoint(
             2 => .mcp,
             else => return error.InvalidArguments,
         };
-        if (entry[2] != @intFromEnum(CandidateScope.exact_arguments))
-            return error.InvalidArguments;
+        const scope: CandidateScope = switch (entry[2]) {
+            0 => .exact_arguments,
+            1 => .file_target,
+            else => return error.InvalidArguments,
+        };
         const name_len: usize = @intCast(std.mem.readInt(
             u32,
             entry[4..8],
@@ -670,13 +717,16 @@ pub fn decodeCheckpoint(
             .binding = entry[8..40].*,
         };
         try tool.validate();
-        const arguments_digest: ArgumentsDigest = entry[40..72].*;
+        const key: ArgumentsDigest = entry[40..72].*;
         const rule_id: RuleId = entry[72..104].*;
-        const derived = (try deriveRuleCandidate(
-            tool,
-            arguments_digest,
-        )) orelse return error.InvalidArguments;
-        if (!std.mem.eql(u8, &derived.rule_id, &rule_id))
+        // The same eligibility the live derivation applies: a file-target
+        // rule exists only for built-in Write/Edit.
+        const eligible = switch (scope) {
+            .exact_arguments => supportsSessionCandidate(tool),
+            .file_target => supportsFileTarget(tool),
+        };
+        if (!eligible) return error.InvalidArguments;
+        if (!std.mem.eql(u8, &ruleIdFor(tool, scope, key), &rule_id))
             return error.InvalidArguments;
         for (rules[0..initialized]) |previous| {
             if (previous.action == action and
@@ -686,7 +736,8 @@ pub fn decodeCheckpoint(
         rules[initialized] = .{
             .action = action,
             .tool = tool,
-            .arguments_digest = arguments_digest,
+            .scope = scope,
+            .key = key,
             .rule_id = rule_id,
         };
     }
@@ -769,7 +820,8 @@ pub fn reconcileCheckpointWithResolver(
         const candidate = RuleCandidate{
             .rule_id = rule.rule_id,
             .tool = rule.tool,
-            .arguments_digest = rule.arguments_digest,
+            .scope = rule.scope,
+            .key = rule.key,
         };
         _ = try state.remember(
             if (rule.action == .allow) .allow_session else .deny_session,
@@ -984,6 +1036,9 @@ const CallbackToolDto = struct {
 const CallbackCandidateDto = struct {
     rule_id: []const u8,
     scope: []const u8,
+    /// `file_target`: the canonical file the Session answer covers; null for
+    /// `exact_arguments`.
+    target: ?[]const u8,
 };
 
 const CallbackRequestDto = struct {
@@ -1063,18 +1118,108 @@ pub fn deriveRuleCandidate(
 ) Error!?RuleCandidate {
     try tool.validate();
     if (!supportsSessionCandidate(tool)) return null;
+    return .{
+        .rule_id = ruleIdFor(tool, .exact_arguments, arguments_digest),
+        .tool = tool,
+        .key = arguments_digest,
+    };
+}
+
+/// The per-file candidate of a built-in Write/Edit call whose target
+/// `deriveFileTarget` named. `target` must outlive the candidate.
+pub fn deriveFileTargetCandidate(
+    tool: ToolIdentity,
+    target: *const FileTarget,
+) Error!?RuleCandidate {
+    try tool.validate();
+    if (!supportsFileTarget(tool)) return null;
+    return .{
+        .rule_id = ruleIdFor(tool, .file_target, target.digest),
+        .tool = tool,
+        .scope = .file_target,
+        .key = target.digest,
+        .target_path = target.path,
+    };
+}
+
+/// A rule's identity binds its Tool, scope and key. Exact-scope rules keep
+/// the identity they have always had.
+fn ruleIdFor(tool: ToolIdentity, scope: CandidateScope, key: ArgumentsDigest) RuleId {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("agentcore-r6-permission-rule\x00");
     hashToolIdentity(&hasher, tool);
-    hasher.update(&.{@intFromEnum(CandidateScope.exact_arguments)});
-    hasher.update(&arguments_digest);
+    hasher.update(&.{@intFromEnum(scope)});
+    hasher.update(&key);
     var rule_id: RuleId = undefined;
     hasher.final(&rule_id);
-    return .{
-        .rule_id = rule_id,
-        .tool = tool,
-        .arguments_digest = arguments_digest,
+    return rule_id;
+}
+
+fn supportsFileTarget(tool: ToolIdentity) bool {
+    return tool.namespace == .builtin and
+        core.tool_file_target.Tool.fromName(tool.name) != null;
+}
+
+/// The key of a `file_target` rule: a digest of the canonical target path.
+pub fn fileTargetDigest(path: []const u8) ArgumentsDigest {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("agentcore-r6-permission-file-target\x00");
+    hashBytes(&hasher, path);
+    var digest: ArgumentsDigest = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+/// The target file of a built-in Write/Edit call, or null when the call gets
+/// only the exact-argument candidate. The path is the one the tool itself
+/// would open (`core.tool_file_target.resolve`: Write's and Edit's own
+/// extraction and normalization). That extraction takes the first textual
+/// occurrence of the key, so a strict parse must agree with it first: the
+/// arguments are one JSON object whose top-level path argument is a string
+/// equal to what the tool reads. A nested or escaped-key spelling that makes
+/// the tool and a reader of `arguments_json` name different files never
+/// widens a grant.
+pub fn deriveFileTarget(
+    allocator: std.mem.Allocator,
+    tool: ToolIdentity,
+    arguments_json: []const u8,
+    context: core.tool_file_target.Context,
+) Error!?FileTarget {
+    try tool.validate();
+    if (tool.namespace != .builtin) return null;
+    const kind = core.tool_file_target.Tool.fromName(tool.name) orelse return null;
+    if (arguments_json.len == 0 or arguments_json.len > DEFAULT_MAX_ARGUMENT_BYTES)
+        return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{
+        .duplicate_field_behavior = .@"error",
+        .max_value_len = DEFAULT_MAX_ARGUMENT_BYTES,
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
     };
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const declared = switch (object.get(kind.pathKey(object.contains("file_path"))) orelse
+        return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    const read = (try core.tool_file_target.unescapedPath(allocator, kind, arguments_json)) orelse
+        return null;
+    defer allocator.free(read);
+    if (!std.mem.eql(u8, declared, read)) return null;
+    const path = (try core.tool_file_target.resolve(allocator, kind, arguments_json, context)) orelse
+        return null;
+    // The Host receives the path inside the callback JSON, under the same
+    // bound as the arguments it came from.
+    if (path.len > DEFAULT_MAX_ARGUMENT_BYTES or !std.unicode.utf8ValidateSlice(path)) {
+        allocator.free(path);
+        return null;
+    }
+    return .{ .path = path, .digest = fileTargetDigest(path) };
 }
 
 /// Until Host tool definitions can supply a canonical specifier builder,
@@ -1243,16 +1388,34 @@ pub fn encodeCallbackRequest(
     var rule_hex: [RULE_ID_BYTES * 2]u8 = undefined;
     var candidate_dto: ?CallbackCandidateDto = null;
     if (request.candidate) |candidate| {
-        if (!ToolIdentity.eql(candidate.tool, request.tool) or
-            !std.mem.eql(
+        if (!ToolIdentity.eql(candidate.tool, request.tool))
+            return error.InvalidIdentity;
+        switch (candidate.scope) {
+            .exact_arguments => if (candidate.target_path != null or !std.mem.eql(
                 u8,
-                &candidate.arguments_digest,
+                &candidate.key,
                 &request.arguments_digest,
-            )) return error.InvalidIdentity;
+            )) return error.InvalidIdentity,
+            .file_target => {
+                const path = candidate.target_path orelse return error.InvalidIdentity;
+                const key = fileTargetDigest(path);
+                if (!supportsFileTarget(candidate.tool) or path.len == 0 or
+                    path.len > DEFAULT_MAX_ARGUMENT_BYTES or
+                    !std.unicode.utf8ValidateSlice(path) or
+                    !std.mem.eql(u8, &candidate.key, &key))
+                    return error.InvalidIdentity;
+            },
+        }
+        if (!std.mem.eql(
+            u8,
+            &candidate.rule_id,
+            &ruleIdFor(candidate.tool, candidate.scope, candidate.key),
+        )) return error.InvalidIdentity;
         rule_hex = std.fmt.bytesToHex(candidate.rule_id, .lower);
         candidate_dto = .{
             .rule_id = &rule_hex,
-            .scope = "exact_arguments",
+            .scope = @tagName(candidate.scope),
+            .target = candidate.target_path,
         };
     }
 
@@ -1797,14 +1960,14 @@ test "Revision 6 Permission Session state implements fixed action priority" {
     const candidate = (try deriveRuleCandidate(tool, digest)).?;
     _ = try state.remember(.allow_session, candidate, 3);
 
-    var result = try state.decide(tool, digest, .ask, .{
+    var result = try state.decide(tool, .{ .arguments_digest = digest }, .ask, .{
         .decision = .deny,
         .source = .mode_fallback,
     });
     try std.testing.expectEqual(Decision.ask, result.decision);
     try std.testing.expectEqual(DecisionSource.explicit_ask, result.source);
 
-    result = try state.decide(tool, digest, .undecided, .{
+    result = try state.decide(tool, .{ .arguments_digest = digest }, .undecided, .{
         .decision = .ask,
         .source = .mode_fallback,
     });
@@ -1813,7 +1976,7 @@ test "Revision 6 Permission Session state implements fixed action priority" {
     try std.testing.expect(result.used_session_rule);
 
     _ = try state.remember(.deny_session, candidate, 3);
-    result = try state.decide(tool, digest, .allow, .{
+    result = try state.decide(tool, .{ .arguments_digest = digest }, .allow, .{
         .decision = .allow,
         .source = .mode_fallback,
     });
@@ -1822,7 +1985,7 @@ test "Revision 6 Permission Session state implements fixed action priority" {
     try std.testing.expectEqual(@as(usize, 2), state.ruleCount());
 
     const other_digest = [_]u8{0x45} ** ARGUMENT_DIGEST_BYTES;
-    result = try state.decide(tool, other_digest, .undecided, .{
+    result = try state.decide(tool, .{ .arguments_digest = other_digest }, .undecided, .{
         .decision = .ask,
         .source = .mode_fallback,
     });
@@ -1872,7 +2035,7 @@ test "Revision 6 Permission concurrent Sessions isolate grants" {
             while (iteration < 2_000) : (iteration += 1) {
                 const result = self.state.decide(
                     self.tool,
-                    self.digest,
+                    .{ .arguments_digest = self.digest },
                     .undecided,
                     .{ .decision = .ask, .source = .mode_fallback },
                 ) catch {
@@ -2001,21 +2164,21 @@ test "Revision 6 Permission checkpoint restores compatible rules or starts a new
     try std.testing.expectEqual(@as(u32, 2), compatible.restored);
     var decision = try compatible.state.?.decide(
         bash,
-        bash_digest,
+        .{ .arguments_digest = bash_digest },
         .undecided,
         .{ .decision = .ask, .source = .mode_fallback },
     );
     try std.testing.expectEqual(Decision.allow, decision.decision);
     decision = try compatible.state.?.decide(
         write,
-        write_digest,
+        .{ .arguments_digest = write_digest },
         .allow,
         .{ .decision = .allow, .source = .mode_fallback },
     );
     try std.testing.expectEqual(Decision.deny, decision.decision);
     decision = try compatible.state.?.decide(
         .{ .namespace = .builtin, .name = "Edit" },
-        [_]u8{0x73} ** ARGUMENT_DIGEST_BYTES,
+        .{ .arguments_digest = [_]u8{0x73} ** ARGUMENT_DIGEST_BYTES },
         .undecided,
         .{ .decision = .ask, .source = .mode_fallback },
     );
@@ -2064,4 +2227,257 @@ test "Revision 6 Permission successful policy replacement clears Session grants"
         error.InvalidIdentity,
         state.replaceGeneration(5),
     );
+}
+
+const test_file_context = core.tool_file_target.Context{
+    .home = "/home/u",
+    .base_dir = "/w",
+    .resolve_relative = true,
+};
+
+fn testFacts(
+    allocator: std.mem.Allocator,
+    tool: ToolIdentity,
+    arguments: []const u8,
+) !MatchFacts {
+    var target = try deriveFileTarget(allocator, tool, arguments, test_file_context);
+    defer if (target) |*value| value.deinit(allocator);
+    return .{
+        .arguments_digest = try digestCanonicalArguments(allocator, arguments, .{}),
+        .file_target = if (target) |value| value.digest else null,
+    };
+}
+
+test "Revision 17 Permission file_target covers later edits of the same file and nothing else" {
+    const allocator = std.testing.allocator;
+    const write = ToolIdentity{ .namespace = .builtin, .name = "Write" };
+    const edit = ToolIdentity{ .namespace = .builtin, .name = "Edit" };
+    const fallback = Fallback{ .decision = .ask, .source = .mode_fallback };
+
+    var granted = (try deriveFileTarget(
+        allocator,
+        write,
+        "{\"file_path\":\"/w/src/a.txt\",\"content\":\"one\"}",
+        test_file_context,
+    )).?;
+    defer granted.deinit(allocator);
+    try std.testing.expectEqualStrings("/w/src/a.txt", granted.path);
+    const candidate = (try deriveFileTargetCandidate(write, &granted)).?;
+    try std.testing.expectEqual(CandidateScope.file_target, candidate.scope);
+    try std.testing.expectEqualStrings("/w/src/a.txt", candidate.target_path.?);
+
+    var state = try State.init(allocator, 1);
+    defer state.deinit();
+    try std.testing.expectEqual(RememberResult.added, try state.remember(.allow_session, candidate, 1));
+
+    // New content, a relative spelling and another key order: the same file.
+    for ([_][]const u8{
+        "{\"file_path\":\"/w/src/a.txt\",\"content\":\"two\"}",
+        "{\"content\":\"three\",\"file_path\":\"src/./a.txt\"}",
+    }) |arguments| {
+        const result = try state.decide(write, try testFacts(allocator, write, arguments), .undecided, fallback);
+        try std.testing.expectEqual(Decision.allow, result.decision);
+        try std.testing.expectEqual(DecisionSource.session_allow, result.source);
+        try std.testing.expectEqualSlices(u8, &candidate.rule_id, &result.matched_rule_id.?);
+    }
+
+    const later = try testFacts(allocator, write, "{\"file_path\":\"/w/src/a.txt\",\"content\":\"four\"}");
+    // Explicit ask and deny stay stronger than the Session grant.
+    try std.testing.expectEqual(DecisionSource.explicit_ask, (try state.decide(write, later, .ask, fallback)).source);
+    try std.testing.expectEqual(Decision.deny, (try state.decide(write, later, .deny, fallback)).decision);
+    // A call whose target could not be named never matches a file rule.
+    try std.testing.expectEqual(
+        Decision.ask,
+        (try state.decide(write, .{ .arguments_digest = later.arguments_digest }, .undecided, fallback)).decision,
+    );
+    // Another file still asks.
+    try std.testing.expectEqual(Decision.ask, (try state.decide(
+        write,
+        try testFacts(allocator, write, "{\"file_path\":\"/w/src/b.txt\",\"content\":\"one\"}"),
+        .undecided,
+        fallback,
+    )).decision);
+    // The same file through Edit is the same target but another Tool.
+    const same_file_edit = try testFacts(
+        allocator,
+        edit,
+        "{\"file_path\":\"/w/src/a.txt\",\"old_string\":\"a\",\"new_string\":\"b\"}",
+    );
+    try std.testing.expectEqualSlices(u8, &granted.digest, &same_file_edit.file_target.?);
+    try std.testing.expectEqual(Decision.ask, (try state.decide(edit, same_file_edit, .undecided, fallback)).decision);
+
+    // deny_session reaches the same span.
+    var denied = try State.init(allocator, 1);
+    defer denied.deinit();
+    _ = try denied.remember(.deny_session, candidate, 1);
+    const result = try denied.decide(write, later, .allow, fallback);
+    try std.testing.expectEqual(Decision.deny, result.decision);
+    try std.testing.expectEqual(DecisionSource.session_deny, result.source);
+}
+
+test "Revision 17 Permission file_target refuses readings the tool would not share" {
+    const allocator = std.testing.allocator;
+    const write = ToolIdentity{ .namespace = .builtin, .name = "Write" };
+    const edit = ToolIdentity{ .namespace = .builtin, .name = "Edit" };
+
+    // The tools take the first textual `"file_path":`, which an escaped key
+    // supplies here; a JSON reader sees /w/a.txt. Such a call keeps only the
+    // exact-argument candidate.
+    const escaped_key = "{\"a\\\"file_path\":\"/etc/x\",\"file_path\":\"/w/a.txt\",\"content\":\"x\"}";
+    try std.testing.expectEqualStrings("/etc/x", core.tool_file_target.rawPath(.write, escaped_key).?);
+    const refused = [_]struct { tool: ToolIdentity, arguments: []const u8 }{
+        .{ .tool = write, .arguments = escaped_key },
+        .{ .tool = write, .arguments = "{\"meta\":{\"file_path\":\"/etc/x\"},\"file_path\":\"/w/a.txt\",\"content\":\"x\"}" },
+        .{ .tool = write, .arguments = "{\"file_path\":7,\"content\":\"x\"}" },
+        .{ .tool = write, .arguments = "{\"file_path\":\"/w/a.txt\",\"file_path\":\"/w/b.txt\",\"content\":\"x\"}" },
+        .{ .tool = write, .arguments = "{\"file_path\":\"\",\"content\":\"x\"}" },
+        .{ .tool = write, .arguments = "{\"file_path\":\"/w/a\\u0000b\",\"content\":\"x\"}" },
+        .{ .tool = write, .arguments = "[\"/w/a.txt\"]" },
+        .{ .tool = edit, .arguments = "{\"path\":\"/w/a.txt\",\"old_string\":\"a\",\"new_string\":\"b\"}" },
+        .{ .tool = .{ .namespace = .builtin, .name = "Bash" }, .arguments = "{\"file_path\":\"/w/a.txt\"}" },
+        .{ .tool = .{ .namespace = .mcp, .name = "Write", .binding = [_]u8{1} ** 32 }, .arguments = "{\"file_path\":\"/w/a.txt\",\"content\":\"x\"}" },
+    };
+    for (refused) |case| {
+        var target = try deriveFileTarget(allocator, case.tool, case.arguments, test_file_context);
+        defer if (target) |*value| value.deinit(allocator);
+        try std.testing.expect(target == null);
+    }
+    // `~` needs a home, exactly as the tool requires one.
+    try std.testing.expect((try deriveFileTarget(
+        allocator,
+        write,
+        "{\"file_path\":\"~/a.txt\",\"content\":\"x\"}",
+        .{ .home = "", .base_dir = "/w", .resolve_relative = true },
+    )) == null);
+
+    // Write keeps its historical `path` argument; the target is the same file.
+    var by_path = (try deriveFileTarget(allocator, write, "{\"path\":\"/w/a.txt\",\"content\":\"x\"}", test_file_context)).?;
+    defer by_path.deinit(allocator);
+    var by_file_path = (try deriveFileTarget(allocator, write, "{\"file_path\":\"/w/a.txt\",\"content\":\"y\"}", test_file_context)).?;
+    defer by_file_path.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &by_file_path.digest, &by_path.digest);
+}
+
+test "Revision 17 Permission file_target rules survive a checkpoint and stay Write/Edit-only" {
+    const allocator = std.testing.allocator;
+    const write = ToolIdentity{ .namespace = .builtin, .name = "Write" };
+    const bash = ToolIdentity{ .namespace = .builtin, .name = "Bash" };
+    var target = (try deriveFileTarget(
+        allocator,
+        write,
+        "{\"file_path\":\"/w/a.txt\",\"content\":\"x\"}",
+        test_file_context,
+    )).?;
+    defer target.deinit(allocator);
+    const file_rule = (try deriveFileTargetCandidate(write, &target)).?;
+    const bash_digest = try digestCanonicalArguments(allocator, "{\"command\":\"ls\"}", .{});
+    const exact_rule = (try deriveRuleCandidate(bash, bash_digest)).?;
+
+    var state = try State.init(allocator, 4);
+    defer state.deinit();
+    _ = try state.remember(.allow_session, file_rule, 4);
+    _ = try state.remember(.deny_session, exact_rule, 4);
+    const fingerprint = [_]u8{0x42} ** 32;
+    const encoded = try state.encodeCheckpoint(allocator, .default, fingerprint);
+    defer allocator.free(encoded);
+    // Scope byte per rule: file_target, then the byte older readers accept.
+    const first_entry = checkpoint_header_bytes;
+    const second_entry = first_entry + checkpoint_rule_bytes + write.name.len;
+    try std.testing.expectEqual(@as(u8, 1), encoded[first_entry + 2]);
+    try std.testing.expectEqual(@as(u8, 0), encoded[second_entry + 2]);
+
+    var decoded = try decodeCheckpoint(allocator, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(CandidateScope.file_target, decoded.rules[0].scope);
+    try std.testing.expectEqual(CandidateScope.exact_arguments, decoded.rules[1].scope);
+    var reconciled = try reconcileCheckpoint(allocator, &decoded, .default, fingerprint, &.{ "Write", "Bash" });
+    defer reconciled.deinit();
+    try std.testing.expectEqual(@as(u32, 2), reconciled.restored);
+    const result = try reconciled.state.?.decide(
+        write,
+        try testFacts(allocator, write, "{\"file_path\":\"/w/a.txt\",\"content\":\"later\"}"),
+        .undecided,
+        .{ .decision = .ask, .source = .mode_fallback },
+    );
+    try std.testing.expectEqual(DecisionSource.session_allow, result.source);
+
+    // A self-consistent file_target rule for a Tool without one is refused.
+    const tampered = try allocator.dupe(u8, encoded);
+    defer allocator.free(tampered);
+    const bash_entry = tampered[second_entry..][0..checkpoint_rule_bytes];
+    bash_entry[2] = @intFromEnum(CandidateScope.file_target);
+    @memcpy(bash_entry[72..104], &ruleIdFor(bash, .file_target, bash_digest));
+    try std.testing.expectError(error.InvalidArguments, decodeCheckpoint(allocator, tampered));
+    // And a Session refuses to remember one.
+    var refusing = try State.init(allocator, 1);
+    defer refusing.deinit();
+    try std.testing.expectError(error.InvalidIdentity, refusing.remember(.allow_session, .{
+        .rule_id = ruleIdFor(bash, .file_target, bash_digest),
+        .tool = bash,
+        .scope = .file_target,
+        .key = bash_digest,
+    }, 1));
+}
+
+test "Revision 17 Permission callback names the file a file_target answer covers" {
+    const allocator = std.testing.allocator;
+    const session_id = core.session_id.SessionId.fromSlice("0000000000000000000000cd").?;
+    const write = ToolIdentity{ .namespace = .builtin, .name = "Write" };
+    const arguments = "{\"file_path\":\"src/a.txt\",\"content\":\"x\"}";
+    const digest = try digestCanonicalArguments(allocator, arguments, .{});
+    var target = (try deriveFileTarget(allocator, write, arguments, test_file_context)).?;
+    defer target.deinit(allocator);
+    const candidate = (try deriveFileTargetCandidate(write, &target)).?;
+    const request_id = try deriveRequestId(session_id, 2, "write-1", write, digest, 5, 1);
+    var request = PermissionRequest{
+        .session_id = session_id,
+        .run_id = 2,
+        .tool_call_id = "write-1",
+        .model_tool_name = "Write",
+        .request_id = request_id,
+        .tool = write,
+        .arguments_digest = digest,
+        .policy_generation = 5,
+        .candidate = candidate,
+    };
+    const encoded = try encodeCallbackRequest(allocator, request, arguments, .{});
+    defer allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"scope\":\"file_target\",\"target\":\"/w/src/a.txt\"") != null);
+
+    const request_hex = std.fmt.bytesToHex(request_id, .lower);
+    const rule_hex = std.fmt.bytesToHex(candidate.rule_id, .lower);
+    const response_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"permission\":\"allow_session\",\"request_id\":\"{s}\",\"policy_generation\":5,\"rule_id\":\"{s}\"}}",
+        .{ request_hex, rule_hex },
+    );
+    defer allocator.free(response_json);
+    try std.testing.expectEqual(Response.allow_session, try decodeCallbackResponse(allocator, response_json, request, .{}));
+
+    // An exact candidate says so and names no file.
+    var exact_request = request;
+    exact_request.candidate = (try deriveRuleCandidate(write, digest)).?;
+    const exact_encoded = try encodeCallbackRequest(allocator, exact_request, arguments, .{});
+    defer allocator.free(exact_encoded);
+    try std.testing.expect(std.mem.indexOf(u8, exact_encoded, "\"scope\":\"exact_arguments\",\"target\":null") != null);
+
+    // A candidate whose path, identity or Tool does not fit is never sent.
+    var other_path = candidate;
+    other_path.target_path = "/w/src/b.txt";
+    request.candidate = other_path;
+    try std.testing.expectError(error.InvalidIdentity, encodeCallbackRequest(allocator, request, arguments, .{}));
+    var other_rule = candidate;
+    other_rule.rule_id[0] ^= 1;
+    request.candidate = other_rule;
+    try std.testing.expectError(error.InvalidIdentity, encodeCallbackRequest(allocator, request, arguments, .{}));
+    const bash = ToolIdentity{ .namespace = .builtin, .name = "Bash" };
+    request.tool = bash;
+    request.candidate = .{
+        .rule_id = ruleIdFor(bash, .file_target, target.digest),
+        .tool = bash,
+        .scope = .file_target,
+        .key = target.digest,
+        .target_path = target.path,
+    };
+    try std.testing.expectError(error.InvalidIdentity, encodeCallbackRequest(allocator, request, arguments, .{}));
 }

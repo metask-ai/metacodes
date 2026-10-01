@@ -52,16 +52,23 @@ pub const PermissionTool = struct {
     binding: []const u8,
 };
 
+/// How far a Session answer reaches. `exact_arguments`: the same Tool and the
+/// same canonical arguments. `file_target`: built-in Write or Edit on the
+/// same canonical file, whatever the content or edit strings.
 pub const PermissionCandidateScope = enum {
     exact_arguments,
+    file_target,
 };
 
 pub const PermissionCandidate = struct {
     rule_id: []const u8,
     scope: PermissionCandidateScope,
+    /// `file_target`: the canonical file the Session answer covers, to show
+    /// the user. Always present on the wire; null for `exact_arguments`.
+    target: ?[]const u8,
 };
 
-/// Exact Revision 15 Permission callback request. Unlike AskUserQuestion this
+/// Exact Revision 17 Permission callback request. Unlike AskUserQuestion this
 /// is a flat typed object, identified by `type == "permission"`.
 pub const PermissionRequest = struct {
     type: []const u8,
@@ -1000,8 +1007,18 @@ fn validatePermissionRequest(
     if (arguments != .object) return error.InvalidPayload;
 
     if (request.candidate) |candidate| {
-        if (!lowerHex64(candidate.rule_id) or candidate.scope != .exact_arguments)
-            return error.InvalidPayload;
+        if (!lowerHex64(candidate.rule_id)) return error.InvalidPayload;
+        switch (candidate.scope) {
+            .exact_arguments => if (candidate.target != null) return error.InvalidPayload,
+            .file_target => {
+                const target = candidate.target orelse return error.InvalidPayload;
+                if (!validBoundedText(target, MAX_PERMISSION_ARGUMENT_JSON_BYTES_V1) or
+                    request.tool.namespace != .builtin or
+                    !(std.mem.eql(u8, request.tool.name, "Write") or
+                        std.mem.eql(u8, request.tool.name, "Edit")))
+                    return error.InvalidPayload;
+            },
+        }
         if (request.responses.len != 3 and request.responses.len != 4)
             return error.InvalidPayload;
         if (request.responses[0] != .deny_once or
@@ -1304,6 +1321,7 @@ fn testPermissionRequest() PermissionRequest {
         .candidate = .{
             .rule_id = "2222222222222222222222222222222222222222222222222222222222222222",
             .scope = .exact_arguments,
+            .target = null,
         },
     };
 }
@@ -1355,9 +1373,52 @@ test "known payloads accept additive fields" {
         .unknown => return error.UnexpectedUnknownEvent,
     }
 
-    var ui = try decodeUiRequest(std.testing.allocator, "{\"type\":\"permission\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"session_id\":\"000000000000000000000001\",\"run_id\":9,\"tool_call_id\":\"tool-9\",\"tool\":{\"namespace\":\"builtin\",\"name\":\"Bash\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"policy_generation\":7,\"arguments_json\":\"{\\\"command\\\":\\\"git status\\\"}\",\"responses\":[\"deny_once\",\"deny_session\",\"allow_once\",\"allow_session\"],\"candidate\":{\"rule_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"scope\":\"exact_arguments\"},\"future_hint\":true}");
+    var ui = try decodeUiRequest(std.testing.allocator, "{\"type\":\"permission\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"session_id\":\"000000000000000000000001\",\"run_id\":9,\"tool_call_id\":\"tool-9\",\"tool\":{\"namespace\":\"builtin\",\"name\":\"Bash\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"policy_generation\":7,\"arguments_json\":\"{\\\"command\\\":\\\"git status\\\"}\",\"responses\":[\"deny_once\",\"deny_session\",\"allow_once\",\"allow_session\"],\"candidate\":{\"rule_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"scope\":\"exact_arguments\",\"target\":null},\"future_hint\":true}");
     defer ui.deinit();
     try std.testing.expectEqualStrings("Bash", ui.value.permission.tool.name);
+}
+
+test "permission candidates name their scope and only file_target names a file" {
+    const a = std.testing.allocator;
+    const prefix = "{\"type\":\"permission\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"session_id\":\"000000000000000000000001\",\"run_id\":9,\"tool_call_id\":\"tool-9\",\"tool\":{\"namespace\":\"builtin\",\"name\":\"";
+    const middle = "\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"policy_generation\":7,\"arguments_json\":\"{\\\"file_path\\\":\\\"a.txt\\\",\\\"content\\\":\\\"x\\\"}\",\"responses\":[\"deny_once\",\"deny_session\",\"allow_once\",\"allow_session\"],\"candidate\":{\"rule_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",";
+    const Case = struct { tool: []const u8, candidate: []const u8 };
+    const accepted = [_]Case{
+        .{ .tool = "Write", .candidate = "\"scope\":\"file_target\",\"target\":\"/w/a.txt\"}}" },
+        .{ .tool = "Edit", .candidate = "\"scope\":\"file_target\",\"target\":\"/w/a.txt\"}}" },
+        .{ .tool = "Write", .candidate = "\"scope\":\"exact_arguments\",\"target\":null}}" },
+    };
+    for (accepted) |case| {
+        const encoded = try std.mem.concat(a, u8, &.{ prefix, case.tool, middle, case.candidate });
+        defer a.free(encoded);
+        var parsed = try decodeUiRequest(a, encoded);
+        defer parsed.deinit();
+        const candidate = parsed.value.permission.candidate.?;
+        if (candidate.scope == .file_target)
+            try std.testing.expectEqualStrings("/w/a.txt", candidate.target.?)
+        else
+            try std.testing.expect(candidate.target == null);
+    }
+    const refused = [_]Case{
+        // Only built-in Write and Edit have a file scope.
+        .{ .tool = "Bash", .candidate = "\"scope\":\"file_target\",\"target\":\"/w/a.txt\"}}" },
+        // A file scope names its file; an exact one names none.
+        .{ .tool = "Write", .candidate = "\"scope\":\"file_target\",\"target\":null}}" },
+        .{ .tool = "Write", .candidate = "\"scope\":\"file_target\",\"target\":\"\"}}" },
+        .{ .tool = "Write", .candidate = "\"scope\":\"exact_arguments\",\"target\":\"/w/a.txt\"}}" },
+        // The field is part of the exact wire shape.
+        .{ .tool = "Write", .candidate = "\"scope\":\"exact_arguments\"}}" },
+        .{ .tool = "Write", .candidate = "\"scope\":\"directory\",\"target\":\"/w\"}}" },
+    };
+    for (refused) |case| {
+        const encoded = try std.mem.concat(a, u8, &.{ prefix, case.tool, middle, case.candidate });
+        defer a.free(encoded);
+        if (decodeUiRequest(a, encoded)) |parsed| {
+            var owned = parsed;
+            owned.deinit();
+            return error.TestExpectedError;
+        } else |_| {}
+    }
 }
 
 test "wire integers accept full u32 and u64 ranges" {
@@ -1472,7 +1533,7 @@ test "UiRequest decoder covers every tag and response encoder enforces pairing" 
     const a = std.testing.allocator;
     const requests = [_][]const u8{
         "{\"ask_question\":[{\"question\":\"Continue?\",\"header\":\"Choice\",\"multi\":false,\"options\":[{\"label\":\"Yes\",\"description\":\"Proceed\",\"preview\":\"\"}]}]}",
-        "{\"type\":\"permission\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"session_id\":\"000000000000000000000001\",\"run_id\":9,\"tool_call_id\":\"tool-9\",\"tool\":{\"namespace\":\"builtin\",\"name\":\"Bash\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"policy_generation\":7,\"arguments_json\":\"{\\\"command\\\":\\\"git status\\\"}\",\"responses\":[\"deny_once\",\"deny_session\",\"allow_once\",\"allow_session\"],\"candidate\":{\"rule_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"scope\":\"exact_arguments\"}}",
+        "{\"type\":\"permission\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"session_id\":\"000000000000000000000001\",\"run_id\":9,\"tool_call_id\":\"tool-9\",\"tool\":{\"namespace\":\"builtin\",\"name\":\"Bash\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"policy_generation\":7,\"arguments_json\":\"{\\\"command\\\":\\\"git status\\\"}\",\"responses\":[\"deny_once\",\"deny_session\",\"allow_once\",\"allow_session\"],\"candidate\":{\"rule_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"scope\":\"exact_arguments\",\"target\":null}}",
     };
     try std.testing.expectEqual(std.meta.fields(std.meta.Tag(UiRequest)).len, requests.len);
     try std.testing.expectEqual(@as(usize, 2), std.meta.fields(std.meta.Tag(UiResponse)).len);

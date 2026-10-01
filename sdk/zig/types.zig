@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 15;
+pub const ABI_REVISION: u32 = 17;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 15 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 17 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -1006,7 +1006,7 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 15 accepts
+/// Runs the canonical default best-effort compact policy. Revision 17 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1231,9 +1231,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 15 keeps MCP wire codes stable" {
+test "Revision 17 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 15), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 17), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

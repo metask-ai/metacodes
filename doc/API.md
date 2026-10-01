@@ -11,7 +11,7 @@ artifact store, and TinyKG admission are not replaceable extensions.
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
 | Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 15 | exact root/child layouts and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 17 | exact root/child layouts and bundle manifest |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
 | Plugin inventory | `--dump-plugins`, Zig, Web state | versioned v1 | additive observation fields only where specified |
 | TinyKG executable distribution | `vendor/tinykg/manifest.json` | bundle v1 | exact target, format, source commit, and SHA-256 pinning |
@@ -263,7 +263,7 @@ Embedders reach the same capability three ways: source-level hosts build
 ordered `message.UserContentPart` slices and call `AgentSession.runUserParts`
 (or `AdmittedRun.runUserParts`); AgentCore binary consumers submit
 `RUN_INPUT_MULTIMODAL` with a `RunInputPartV1` array through
-`session_run_input` (ABI revision 15, capability preflight status 28 — see
+`session_run_input` (capability preflight status 28 — see
 [doc/AGENTCORE_BINARY_ABI.md](AGENTCORE_BINARY_ABI.md)); the headless CLI
 keeps `--image`.
 
@@ -542,7 +542,7 @@ The source-free bundle is one coordinate root: `sdk/metask/agentcore.h`
 (C11/C++17), the `sdk/zig` and `sdk/rust` bindings, one target-specific static
 library, the manifest-pinned ripgrep runtime asset, and a manifest whose file
 allow-list and SHA-256 values are mandatory. Consumers call only
-`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 15,
+`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 17,
 the exact 64-byte root, all five mandatory typed tables, reserved zeros, function
 slots, and the schema-1 bundle manifest. The ABI is experimental, with no
 compatibility shim between revisions: pin a bundle, not only a semantic version.

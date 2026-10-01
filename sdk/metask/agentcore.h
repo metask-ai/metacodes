@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 15 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 17 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 15 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 17 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 15u
+#define METASK_AGENTCORE_ABI_REVISION 17u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -774,7 +774,7 @@ typedef uint32_t (*metask_agentcore_session_export_checkpoint_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 15. No earlier revision layout
+/* Function-table order is fixed within Revision 17. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -951,8 +951,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 15u,
-                               "AgentCore revision 15");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 17u,
+                               "AgentCore revision 17");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,

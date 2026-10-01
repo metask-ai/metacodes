@@ -6,10 +6,10 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 15 must not retain historical callback aliases"
+#error "revision 17 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 15u || \
+#if METASK_AGENTCORE_ABI_REVISION != 17u || \
     METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE != 27u || \
     METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED != 28u || \
     METASK_AGENTCORE_RUN_INPUT_MULTIMODAL != 3u || \
@@ -29,7 +29,7 @@
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
     METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 15 codes must match the public contract"
+#error "source-free Revision 17 codes must match the public contract"
 #endif
 
 #ifdef _WIN32

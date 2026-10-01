@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 15 root plus mandatory domain tables. Discovery rejects
+/// Validated Revision 17 root plus mandatory domain tables. Discovery rejects
 /// every other layout; there is no legacy probe or alternate dispatch.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 15);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 17);
         assert_eq!(raw::METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE, 27);
         assert_eq!(raw::METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED, 28);
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_MULTIMODAL, 3);

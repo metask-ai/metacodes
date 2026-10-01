@@ -1546,6 +1546,7 @@ test {
     _ = &read_tool;
     _ = &write_tool;
     _ = &edit_tool;
+    _ = &@import("tools/file_target.zig");
     _ = &glob_tool;
     _ = &bash_tool;
     _ = &grep_tool;

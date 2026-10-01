@@ -38,6 +38,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- AgentCore ABI v1 moves to **revision 17** (#173): `allow_session` on a
+  built-in `Write` or `Edit` now covers later calls of the same Tool on the
+  same file, whatever their content or edit strings, instead of only an
+  identical call. The Permission callback's `candidate` gains the scope
+  `file_target` and a `target` field naming the canonical file (null for
+  `exact_arguments`, which every other eligible Tool keeps). The target is
+  derived exactly as the tool derives the file it opens, and only when a
+  strict JSON parse agrees with the tool's own argument reading; a grant is
+  bound to its Tool and Session and ranks where Session grants always ranked.
+  Checkpoints record the scope: an older AgentCore refuses one that holds a
+  file grant, and checkpoints without one are unchanged. Layouts, tables and
+  status codes are unchanged. Revision 16 is skipped because it named the
+  withdrawn PDF input; SDK package version `0.4.0-dev`.
 - User state lives under a state root instead of a hard-coded
   `~/.metacodes`: `--state-dir` (first argument to cover subcommands), then
   `METACODES_HOME`, then the install record beside the executable, then
