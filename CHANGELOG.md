@@ -10,6 +10,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- A release PR could fail its own CI. The version state gate recognises the
+  release PR by its title and its `release` label, and `ci.yml` took the
+  labels from the `opened` event. `gh pr create --label` adds the label after
+  it creates the PR, so that event can be recorded without it: 0.2.1's was,
+  and the PR had to be closed and reopened to get a new event. The gate now
+  reads the PR's labels when it runs.
+
 ## 0.2.1 — 2026-09-30
 
 ### Fixed

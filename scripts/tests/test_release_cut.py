@@ -513,5 +513,54 @@ class ReleaseTagStepTest(unittest.TestCase):
         self.assertEqual(writes, [])
 
 
+@unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+class VersionGateStepTest(unittest.TestCase):
+    """ci.yml's version state gate, in both jobs, run by bash with `gh` and
+    python replaced. `gh pr create --label` labels the PR after creating it,
+    and the `opened` payload of release: 0.2.1 (#176) carried no label, so
+    the gate refused its own release PR; the step reads the labels itself."""
+
+    STEP = "Version state gate and release rehearsal"
+    ECHO = '#!/bin/sh\necho "labels=[${RELEASE_PR_LABELS-unset}] argv=$*"\n'
+    GH = '#!/bin/sh\necho "$*" >> "$FAKE_GH_LOG"\necho "bug,release"\n'
+
+    def run_step(self, job: str, pr_number: str):
+        try:
+            import yaml
+        except ImportError:  # requirements-dev.txt
+            self.skipTest("PyYAML is not installed")
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        step = next(s for s in workflow["jobs"][job]["steps"] if s.get("name") == self.STEP)
+        self.assertNotIn("RELEASE_PR_LABELS", step["env"])  # never the event's snapshot
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            for name, text in (("gh", self.GH), ("python3", self.ECHO), ("python", self.ECHO)):
+                (bindir / name).write_text(text, encoding="utf-8")
+                (bindir / name).chmod(0o755)
+            log = Path(tmp) / "gh.log"
+            env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}", FAKE_GH_LOG=str(log),
+                       GITHUB_REPOSITORY="o/r", RELEASE_PR_NUMBER=pr_number, RELEASE_PR_TITLE="release: 0.2.1")
+            env.pop("RELEASE_PR_LABELS", None)
+            proc = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+            calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        return proc, calls
+
+    def test_a_pull_request_run_reads_the_labels_the_pr_has_now(self):
+        for job in ("gates", "windows-gates"):
+            proc, calls = self.run_step(job, "176")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("labels=[bug,release] argv=scripts/check_version_state.py --rehearse", proc.stdout, job)
+            self.assertEqual(len(calls), 1, job)
+            self.assertTrue(calls[0].startswith("api repos/o/r/issues/176/labels "), calls[0])
+
+    def test_a_push_run_asks_for_no_labels(self):
+        for job in ("gates", "windows-gates"):
+            proc, calls = self.run_step(job, "")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("labels=[unset] argv=scripts/check_version_state.py --rehearse", proc.stdout, job)
+            self.assertEqual(calls, [], job)
+
+
 if __name__ == "__main__":
     unittest.main()

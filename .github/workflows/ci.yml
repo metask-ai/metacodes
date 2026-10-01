@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read # the version state gate reads the PR's current labels
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -115,11 +116,21 @@ jobs:
       # PR, or main's run of the release merge commit; in the latter two the
       # gate tags HEAD locally so the release-layout steps below can run the
       # stable channel on the candidate (doc/RELEASE_AUTOMATION_DESIGN.md §3).
+      # The labels are read now, not taken from the event: `gh pr create
+      # --label` adds the label after it creates the PR, and the `opened`
+      # payload of release: 0.2.1 (#176) carried none, so the gate refused
+      # its own release PR.
       - name: Version state gate and release rehearsal
         env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PR_NUMBER: ${{ github.event.pull_request.number }}
           RELEASE_PR_TITLE: ${{ github.event.pull_request.title }}
-          RELEASE_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-        run: python3 scripts/check_version_state.py --rehearse
+        run: |
+          if [ -n "$RELEASE_PR_NUMBER" ]; then
+            RELEASE_PR_LABELS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels" --jq '[.[].name] | join(",")')
+            export RELEASE_PR_LABELS
+          fi
+          python3 scripts/check_version_state.py --rehearse
       - name: TinyKG binary-contract unit tests
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
       - name: ripgrep binary-contract unit tests
@@ -264,12 +275,19 @@ jobs:
           zig test src/platform/net.zig -lc &&
           zig test src/platform/dir.zig -lc &&
           zig test src/platform/exe_lookup.zig -lc
+      # Current labels, as in the `gates` job; bash for the same script.
       - name: Version state gate and release rehearsal
-        shell: cmd
+        shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PR_NUMBER: ${{ github.event.pull_request.number }}
           RELEASE_PR_TITLE: ${{ github.event.pull_request.title }}
-          RELEASE_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-        run: python scripts\check_version_state.py --rehearse
+        run: |
+          if [ -n "$RELEASE_PR_NUMBER" ]; then
+            RELEASE_PR_LABELS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels" --jq '[.[].name] | join(",")')
+            export RELEASE_PR_LABELS
+          fi
+          python scripts/check_version_state.py --rehearse
       - name: Verify native bundle and fresh-store contract
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage
