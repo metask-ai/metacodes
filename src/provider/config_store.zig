@@ -511,7 +511,7 @@ test "the home store resolves either the override or <state_root>/config.json" {
     }
     var store = try Store.initHome(a, "/state");
     defer store.deinit();
-    try std.testing.expectEqualStrings("/state/config.json", store.path);
+    try std.testing.expectEqualStrings("/state" ++ std.fs.path.sep_str ++ "config.json", store.path);
     try std.testing.expectError(StoreError.NoHome, Store.initHome(a, ""));
 }
 
