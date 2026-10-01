@@ -217,7 +217,15 @@ jobs:
         run: |
           zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-2"
-          cmp "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz
+          if ! cmp "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz; then
+            # Evidence for the next mismatch: which members differ.
+            mkdir -p "$RUNNER_TEMP/unpacked-1" "$RUNNER_TEMP/unpacked-2"
+            tar -xzf "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz -C "$RUNNER_TEMP/unpacked-1"
+            tar -xzf "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz -C "$RUNNER_TEMP/unpacked-2"
+            diff -rq "$RUNNER_TEMP/unpacked-1" "$RUNNER_TEMP/unpacked-2" || true
+            cat "$RUNNER_TEMP"/unpacked-*/*/libexec/metacodes/*.build-receipt.json || true
+            exit 1
+          fi
           zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           cat "$RUNNER_TEMP"/dist-1/metacodes-*-SHA256SUMS
       - name: Third-party notices check

@@ -45,6 +45,13 @@ case "$host_arch" in
     ;;
 esac
 
+# `--lake <path>` (the build graph) is an argument, not the LAKE variable: a
+# build step that sets one environment variable is keyed on the whole
+# environment, so every CI step rebuilt the kernel and its timestamped receipt.
+if [[ "${1:-}" == "--lake" ]]; then
+  LAKE=$2
+  shift 2
+fi
 output=${1:-"$repo_dir/zig-out/libexec/metacodes/metacodes-formal-kernel$executable_suffix"}
 manifest=${2:-"$output.provenance.json"}
 receipt=${3:-"$output.build-receipt.json"}
@@ -77,7 +84,7 @@ mkdir -p "$(dirname "$output")" "$(dirname "$manifest")" "$(dirname "$receipt")"
   else
     "$lake" build metacodes-formal-kernel
   fi
-)
+) >&2 # Lake reports compile errors on stdout; the build graph shows only stderr
 
 # Lean permits declarations containing `sorry` to compile by inserting
 # `sorryAx`.  Shipping a theorem-bearing checker therefore requires an axiom

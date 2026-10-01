@@ -440,18 +440,21 @@ fn stageLeanKernels(
     const formal = b.addSystemCommand(&.{"bash"});
     formal.setName("build formal kernel");
     formal.addFileArg(b.path("scripts/build-formal-kernel.sh"));
+    // An argument, not setEnvironmentVariable: setting one variable copies the
+    // whole environment into the cache key, and the kernels (with their
+    // timestamped receipt) would rebuild whenever any variable changed.
+    formal.addArgs(&.{ "--lake", lake });
     const formal_bin = formal.addOutputFileArg(formal_name);
     const formal_provenance = formal.addOutputFileArg(b.fmt("{s}.provenance.json", .{formal_name}));
     const formal_receipt = formal.addOutputFileArg(b.fmt("{s}.build-receipt.json", .{formal_name}));
-    formal.setEnvironmentVariable("LAKE", lake);
     addLeanSourceInputs(b, formal);
 
     const project = b.addSystemCommand(&.{"bash"});
     project.setName("build project kernel");
     project.addFileArg(b.path("scripts/build-project-harness-kernel.sh"));
+    project.addArgs(&.{ "--lake", lake });
     const project_bin = project.addOutputFileArg(project_name);
     const project_provenance = project.addOutputFileArg(b.fmt("{s}.provenance.json", .{project_name}));
-    project.setEnvironmentVariable("LAKE", lake);
     addLeanSourceInputs(b, project);
     // Both scripts drive Lake in the same control-plane/lean/.lake.
     project.step.dependOn(&formal.step);

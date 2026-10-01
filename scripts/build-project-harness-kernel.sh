@@ -14,6 +14,11 @@ case "$(uname -s)" in
   *) echo "build-project-harness-kernel: unsupported native host: $(uname -s)" >&2; exit 1 ;;
 esac
 
+# `--lake <path>`: see build-formal-kernel.sh.
+if [[ "${1:-}" == "--lake" ]]; then
+  LAKE=$2
+  shift 2
+fi
 output=${1:-"$repo_dir/zig-out/libexec/metacodes/metacodes-project-kernel$executable_suffix"}
 manifest=${2:-"$output.provenance.json"}
 if [[ -n "${LAKE:-}" ]]; then
@@ -46,7 +51,7 @@ mkdir -p "$(dirname "$output")" "$(dirname "$manifest")"
   else
     "$lake" build metacodes-project-kernel
   fi
-)
+) >&2 # Lake reports compile errors on stdout; the build graph shows only stderr
 
 axiom_audit=$(cd "$lean_dir" && "$lake" env lean ProjectHarnessAxiomAudit.lean 2>&1)
 expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends on axioms: [propext]
