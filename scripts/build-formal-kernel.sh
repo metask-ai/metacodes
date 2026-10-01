@@ -262,7 +262,12 @@ if [[ "$host_os" == "Darwin" ]]; then
 else
   binary_bytes=$(stat -c '%s' "$output")
 fi
-lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\r\n')
+# No pipe from lake: on Windows the elan proxy cannot write into an MSYS pipe
+# to another process ("The request is not supported", os error 50), while a
+# command substitution (as the axiom audit uses) works on every host.
+lean_version=$(cd "$lean_dir" && "$lake" env lean --version 2>&1)
+lean_version=${lean_version//$'\r'/}
+lean_version=${lean_version//$'\n'/}
 built_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 # The artifact manifest is intentionally time-independent.  It is the stable

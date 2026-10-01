@@ -337,7 +337,12 @@ else
   binary_bytes=$(stat -c '%s' "$output")
 fi
 host_arch=$(uname -m)
-lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\r\n')
+# No pipe from lake: on Windows the elan proxy cannot write into an MSYS pipe
+# to another process ("The request is not supported", os error 50), while a
+# command substitution (as the axiom audit uses) works on every host.
+lean_version=$(cd "$lean_dir" && "$lake" env lean --version 2>&1)
+lean_version=${lean_version//$'\r'/}
+lean_version=${lean_version//$'\n'/}
 printf '%s\n' \
   "{\"schema_version\":\"metacodes-project-kernel-artifact-v6\",\"checker_version\":\"metacodes-project-harness-kernel-v3\",\"request_schema\":\"metacodes-project-harness-request-v3\",\"verdict_schema\":\"metacodes-project-harness-verdict-v3\",\"batch_request_schema\":\"metacodes-project-harness-batch-request-v3\",\"batch_verdict_schema\":\"metacodes-project-harness-batch-verdict-v3\",\"impact_request_schema\":\"metacodes-rule-impact-governance-request-v1\",\"impact_verdict_schema\":\"metacodes-rule-impact-governance-verdict-v1\",\"impact_aggregate_request_schema\":\"metacodes-rule-impact-aggregate-governance-request-v1\",\"impact_aggregate_verdict_schema\":\"metacodes-rule-impact-aggregate-governance-verdict-v1\",\"max_batch_requests\":1024,\"max_impact_aggregate_members\":64,\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"rule_source_sha256\":\"$rule_source_sha256\",\"impact_source_sha256\":\"$impact_source_sha256\",\"impact_aggregate_source_sha256\":\"$impact_aggregate_source_sha256\",\"formal_kernel_source_sha256\":\"$formal_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_source_sha256\",\"axiom_policy\":\"propext\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"native_rule_author_promotion_smoke\":\"passed\",\"native_batch_smoke\":\"passed\",\"native_recovery_smoke\":\"passed\",\"native_impact_smoke\":\"passed\",\"native_impact_aggregate_smoke\":\"passed\"}" >"$manifest"
 
