@@ -3467,12 +3467,7 @@ test "L2 multi-rule recovery follows the first blocking Lean verdict only" {
     }
 }
 
-const BatchRuntimeStats = struct {
-    elapsed_ns: u64,
-    checker_elapsed_ns: u64,
-};
-
-fn runBatchRuntimeFixture(rule_count: usize) !BatchRuntimeStats {
+fn runBatchRuntimeFixture(rule_count: usize) !void {
     const config = (try testKernel()) orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3571,26 +3566,22 @@ fn runBatchRuntimeFixture(rule_count: usize) !BatchRuntimeStats {
     try std.testing.expectEqual(rule_count, pre_count);
     try std.testing.expectEqual(rule_count, post_count);
     try std.testing.expect(!std.mem.eql(u8, &(pre_call orelse unreachable), &(post_call orelse unreachable)));
-    const stats = BatchRuntimeStats{
-        .elapsed_ns = @intCast(@max(elapsed, 0)),
-        .checker_elapsed_ns = pre_elapsed + post_elapsed,
-    };
+    // Wall time is reported, never asserted (see the 64-rule test).
     if (std.c.getenv("METACODES_BENCH_REPORT") != null) {
         std.debug.print("batch-runtime-metric rules={d} execute_ms={d:.3} checker_ms={d:.3}\n", .{
             rule_count,
-            @as(f64, @floatFromInt(stats.elapsed_ns)) / std.time.ns_per_ms,
-            @as(f64, @floatFromInt(stats.checker_elapsed_ns)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(@max(elapsed, 0))) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(pre_elapsed + post_elapsed)) / std.time.ns_per_ms,
         });
     }
-    return stats;
 }
 
 test "L2 project rule batch runtime uses two checker calls for 1 rule" {
-    _ = try runBatchRuntimeFixture(1);
+    try runBatchRuntimeFixture(1);
 }
 
 test "L2 project rule batch runtime uses two checker calls for 4 rules" {
-    _ = try runBatchRuntimeFixture(4);
+    try runBatchRuntimeFixture(4);
 }
 
 test "L2 target mismatch skips checker while retaining auditable dispatch filters" {
@@ -3881,17 +3872,19 @@ test "L2 repeated identical signals retain distinct physical checker calls" {
 }
 
 test "L2 project rule batch runtime uses two checker calls for 16 rules" {
-    _ = try runBatchRuntimeFixture(16);
+    try runBatchRuntimeFixture(16);
 }
 
 test "L2 project rule batch runtime uses two checker calls for 64 rules" {
-    // The fixture proves the batching itself: all 64 pre decisions share one
-    // checker call identity and all 64 post decisions another, each with batch
-    // size 64, so 128 per-rule spawns cannot pass. A wall-clock ceiling on top
-    // only measured the runner: 750 ms failed on a hosted Linux runner with
-    // eight shards in parallel once CI ran the real kernel. Timings stay
-    // available through METACODES_BENCH_REPORT.
-    _ = try runBatchRuntimeFixture(64);
+    // The fixture proves the two calls from the journal, not the clock: every
+    // decision must carry checker_batch_size == 64 and share its phase's one
+    // checker call identity. A gate back on one kernel process per rule
+    // records batch size 1 and per-request identities and fails there on any
+    // machine. A wall-clock ceiling measured something else: the runtime
+    // hashes the whole kernel before each spawn, which in this Debug test
+    // binary is ~0.55 s per call on Linux against ~10 ms for the two checker
+    // runs, whatever the rule count.
+    try runBatchRuntimeFixture(64);
 }
 
 test "L2 malformed Lean batch verdict fails before the real dispatcher" {
