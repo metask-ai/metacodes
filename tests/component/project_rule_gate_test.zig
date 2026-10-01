@@ -3885,10 +3885,13 @@ test "L2 project rule batch runtime uses two checker calls for 16 rules" {
 }
 
 test "L2 project rule batch runtime uses two checker calls for 64 rules" {
-    const stats = try runBatchRuntimeFixture(64);
-    // A generous regression ceiling catches accidental reintroduction of 128
-    // process spawns without turning a correctness test into a microbenchmark.
-    try std.testing.expect(stats.elapsed_ns < 750 * std.time.ns_per_ms);
+    // The fixture proves the batching itself: all 64 pre decisions share one
+    // checker call identity and all 64 post decisions another, each with batch
+    // size 64, so 128 per-rule spawns cannot pass. A wall-clock ceiling on top
+    // only measured the runner: 750 ms failed on a hosted Linux runner with
+    // eight shards in parallel once CI ran the real kernel. Timings stay
+    // available through METACODES_BENCH_REPORT.
+    _ = try runBatchRuntimeFixture(64);
 }
 
 test "L2 malformed Lean batch verdict fails before the real dispatcher" {
