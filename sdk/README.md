@@ -19,6 +19,11 @@ base64 image parts, preflighted against the Session model's image capability.
 provider default, while OpenAI may explicitly select
 `OPENAI_PROTOCOL_RESPONSES`. Pair it with `provider_kind_code`, the full endpoint
 override in `base_url`, and the Session model; no URL/model inference occurs.
+Hosts that load a library at run time (Python `ctypes`, Node FFI, JNA, .NET
+P/Invoke) use the bundle's shared library (`lib/libmetask_agentcore.so`,
+`.dylib`, or `metask_agentcore.dll`) and resolve `metask_agentcore_get_api`;
+`shared_library` in `manifest.json` records its digest-pinned path, load name
+and needed system libraries.
 Build and exercise a native bundle with:
 
 ```sh

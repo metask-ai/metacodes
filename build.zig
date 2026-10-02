@@ -1559,6 +1559,29 @@ pub fn build(b: *std.Build) void {
     const agentcore_symbol_gate_cmd = b.addRunArtifact(agentcore_symbol_gate_tool);
     agentcore_symbol_gate_cmd.addFileArg(agentcore_lib.getEmittedBin());
     agentcore_test_step.dependOn(&agentcore_symbol_gate_cmd.step);
+    // The same module as a shared library for Hosts that can only load one
+    // (ctypes, Node FFI, JNA, P/Invoke; #182). It exports only the discovery
+    // entry point: ELF through a version script, Mach-O and PE because only
+    // Zig `export` declarations are exported there. macOS keeps Zig's
+    // default install name, @rpath/libmetask_agentcore.dylib.
+    const agentcore_shared_lib = b.addLibrary(.{
+        .name = "metask_agentcore",
+        .linkage = .dynamic,
+        .root_module = agentcore_abi_bundle_mod,
+        // The self-hosted x86_64 ELF linker (Debug) ignores the version
+        // script and exported the UBSan runtime; LLD honors it in every
+        // mode. LLD does not link Mach-O, where Zig's own linker is used.
+        .use_llvm = true,
+        .use_lld = target.result.ofmt != .macho,
+    });
+    if (target.result.ofmt == .elf)
+        agentcore_shared_lib.setVersionScript(b.path("src/agentcore/shared_exports.map"));
+    const agentcore_shared_gate_cmd = b.addRunArtifact(agentcore_symbol_gate_tool);
+    agentcore_shared_gate_cmd.addArg("--shared");
+    agentcore_shared_gate_cmd.addFileArg(agentcore_shared_lib.getEmittedBin());
+    if (target.result.os.tag == .windows and target.result.abi == .msvc)
+        agentcore_shared_gate_cmd.addArg("--msvc-runtime");
+    agentcore_test_step.dependOn(&agentcore_shared_gate_cmd.step);
     const resolved_agentcore_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
     const agentcore_architecture = @tagName(target.result.cpu.arch);
     const agentcore_os = @tagName(target.result.os.tag);
@@ -1595,6 +1618,18 @@ pub fn build(b: *std.Build) void {
             installed_agentcore_lib_ready = &installed_symbol_gate.step;
         }
     }
+    // lib/libmetask_agentcore.{so,dylib} or lib/metask_agentcore.dll. No
+    // import library (on MSVC it would collide with the static
+    // metask_agentcore.lib), PDB, header or version symlinks: an FFI Host
+    // loads this one file.
+    const agentcore_shared_file = agentcore_shared_lib.out_filename;
+    const install_agentcore_shared = b.addInstallArtifact(agentcore_shared_lib, .{
+        .dest_dir = .{ .override = .{ .custom = agentcore_lib_rel } },
+        .pdb_dir = .disabled,
+        .h_dir = .disabled,
+        .implib_dir = .disabled,
+        .dylib_symlinks = false,
+    });
     const install_agentcore_header = b.addInstallFileWithDir(
         b.path("sdk/metask/agentcore.h"),
         .prefix,
@@ -1673,11 +1708,14 @@ pub fn build(b: *std.Build) void {
         @tagName(optimize),
         if (agentcore_strip) "true" else "false",
         agentcore_library_file,
+        agentcore_shared_file,
     });
     manifest_cmd.setCwd(b.path("."));
     if (missing_agentcore_target) |failure| manifest_cmd.step.dependOn(&failure.step);
     manifest_cmd.step.dependOn(&agentcore_symbol_gate_cmd.step);
+    manifest_cmd.step.dependOn(&agentcore_shared_gate_cmd.step);
     manifest_cmd.step.dependOn(installed_agentcore_lib_ready);
+    manifest_cmd.step.dependOn(&install_agentcore_shared.step);
     manifest_cmd.step.dependOn(&install_agentcore_header.step);
     manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
     manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
@@ -1699,6 +1737,7 @@ pub fn build(b: *std.Build) void {
         b.fmt("-Dtarget={s}", .{resolved_agentcore_target}),
         b.fmt("-Dbundle-root={s}", .{agentcore_install_root}),
         b.fmt("-Dlibrary-file={s}", .{agentcore_library_file}),
+        b.fmt("-Dshared-library-file={s}", .{agentcore_shared_file}),
         b.fmt("-Dexpected-strip={s}", .{if (agentcore_strip) "true" else "false"}),
     });
     consumer_link_cmd.setCwd(b.path("."));
@@ -1748,7 +1787,7 @@ pub fn build(b: *std.Build) void {
     rust_bindgen_cmd.setCwd(b.path("."));
     const agentcore_rust_bindgen_step = b.step("agentcore:rust-bindgen-check", "Regenerate Rust raw bindings with bindgen 0.72.1 and require no diff");
     agentcore_rust_bindgen_step.dependOn(&rust_bindgen_cmd.step);
-    const agentcore_bundle_step = b.step("agentcore:bundle", "Build and link-check an AgentCore static bundle for an explicit target");
+    const agentcore_bundle_step = b.step("agentcore:bundle", "Build and link-check an AgentCore bundle (static and shared library) for an explicit target");
     agentcore_bundle_step.dependOn(&consumer_link_cmd.step);
     agentcore_bundle_step.dependOn(&zig_package_check_cmd.step);
 
@@ -1787,6 +1826,7 @@ pub fn build(b: *std.Build) void {
         b.fmt("-Dtarget={s}", .{resolved_agentcore_target}),
         b.fmt("-Dbundle-root={s}", .{agentcore_install_root}),
         b.fmt("-Dlibrary-file={s}", .{agentcore_library_file}),
+        b.fmt("-Dshared-library-file={s}", .{agentcore_shared_file}),
         b.fmt("-Dexpected-strip={s}", .{if (agentcore_strip) "true" else "false"}),
     });
     consumer_cmd.setCwd(b.path("."));
