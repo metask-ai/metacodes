@@ -265,14 +265,22 @@ main() {
   fi
   if [ -n "$link" ]; then
     case ":${PATH}:" in
-      *":${link}:"*)
-        resolved=$(command -v "$link_name" 2>/dev/null || true)
-        if [ -n "$resolved" ] && [ "$resolved" != "$link/$link_name" ]; then
-          note "\`$link_name\` on your PATH is $resolved, which comes before $link/$link_name"
-        fi
-        ;;
+      *":${link}:"*) ;;
       *) note "$link is not on PATH; add it to run \`$link_name\` directly" ;;
     esac
+    # Another command of the same name on PATH shadows this launcher or is
+    # shadowed by it; either way the user should know which one runs.
+    resolved=$(command -v "$link_name" 2>/dev/null || true)
+    if [ -n "$resolved" ] && [ "$resolved" != "$link/$link_name" ]; then
+      note "\`$link_name\` runs $resolved, which comes before $link on PATH"
+    fi
+    old_ifs=$IFS; IFS=:; set -f
+    for entry in $PATH; do
+      [ -n "$entry" ] && [ "$entry" != "$link" ] && [ "$entry/$link_name" != "$resolved" ] &&
+        [ -x "$entry/$link_name" ] || continue
+      note "$entry/$link_name is also on PATH; \`$link_name\` does not run it"
+    done
+    set +f; IFS=$old_ifs
   fi
 }
 
