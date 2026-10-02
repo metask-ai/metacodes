@@ -1202,6 +1202,129 @@ on their spelling or use them to broaden Tool authority. The current uncertain
 delivery code is `indeterminate`. Stabilizing this vocabulary requires a later
 explicit contract decision rather than treating leaked enum names as wire API.
 
+### Permission rules
+
+A Host states standing policy as three lists of rule strings,
+`permission_rule_set_v1.allow`, `.ask` and `.deny`: at Session creation
+(`permission_rules` in the Session configuration) and later through
+`session_control.update_permission_rules`. An update replaces the whole set
+atomically at the idle boundary (`BUSY` while any facade call or Run is
+active, `INVALID_STATE` on a poisoned Session), starts a new policy generation
+and so clears every Session grant. A set holds at most 1024 rules, each 1 to
+65,536 bytes of UTF-8 and 1 MiB in total; exceeding a limit returns
+`RESOURCE_LIMIT` and any rule that does not parse returns `INVALID_ARGUMENT`,
+in both cases with nothing published. AgentCore reads no settings file: these
+lists are the only Host-imported rules.
+
+**Syntax.** Tool names are exact and case-sensitive, and a rule names one Tool:
+`Edit(...)` does not cover `Write`, so a Host that means both writes both.
+
+| Rule | Matches |
+|---|---|
+| `Tool`, `Tool(*)`, `Tool()` | every call of that Tool |
+| `Bash(pattern)` | the shell command (below) |
+| `Read(path)`, `Edit(path)`, `Write(path)` | that Tool's target path (below), read from `file_path`, else `notebook_path`, else `path` |
+| `WebFetch(domain:example.com)` | a `url` whose host is exactly `example.com`; `domain:*.example.com` matches its subdomains only |
+| `Skill(name)`, `Skill(prefix *)` | the Skill tool's `name` argument, exactly or by prefix |
+| `mcp__server`, `mcp__server__*`, `mcp__server__tool` | MCP Tools of that server, or one Tool (below) |
+
+Every other Tool takes only the bare form. A specifier on any other name parses
+but is read as a Bash pattern over a `command` argument, which no other
+built-in has, so such a rule never matches (and on a Host Tool it would match
+an unrelated `command` argument). `Glob` and `Grep` in particular take no path
+specifier. `WebFetch(...)` without `domain:` and an opening `(` without a final
+`)` do not parse.
+
+**Bash patterns** describe one command. `git status` matches exactly;
+`npm run *` and `npm run:*` match `npm run` or anything starting with
+`npm run ` (a word boundary); `*` anywhere else matches any characters,
+spaces included. Compound commands (`&&`, `||`, `;`, `|`, `|&`, `&`, newline)
+are split: an allow rule must match every segment, a deny or ask rule any
+segment, so `Bash(git *)` does not allow `git status && rm x` and `Bash(rm *)`
+denies it. Benign wrappers (`timeout`, `nice`, `nohup`, ...) are seen through
+by every rule; other wrappers (`env`, `xargs`, ...) only by deny and ask rules.
+
+**Path patterns** start with an anchor:
+
+| Prefix | Base in AgentCore |
+|---|---|
+| `//` | the filesystem root; on Windows, the root of the target path's own drive, written without the drive letter (`//Users/me/out/**`) |
+| `~/` | the Workspace home |
+| `/` | the **Workspace root**, not the filesystem root |
+| `./` or none | the Workspace root as well: a Session has no process cwd, so both "project root" and "cwd" are `workspace_root` |
+
+After the anchor, `*` matches within one path segment and `**` across
+segments (`**/` also matches zero segments); a pattern without `/` matches a
+basename at any depth below the base. There is no `?` or character class. The
+target is first made what the tool will open: JSON-unescaped, relative paths
+joined to the Workspace root, `~/` to the Workspace home, `.`/`..` folded. On
+POSIX an existing path is also resolved through symlinks: an allow rule must
+match both the written path and its target, a deny or ask rule either. On
+Windows comparison is case-insensitive, `\` equals `/`, and symlinks are not
+resolved.
+
+**MCP and Host Tool names.** An MCP rule uses the server's namespace and the
+MCP tool name the server reports: `mcp__weather__get_forecast`. It never uses
+the opaque model-facing alias (`mcp__weather__` plus a digest) that appears in
+Tool events. A Host Tool (`host_tool_v1` or a stream tool) is named exactly as
+registered, with nothing added (`open_tab`, not `host__open_tab`); a
+process-package contribution is named by its namespaced global tool name, the
+name the model sees.
+
+**Evaluation order.** For each call the first step that decides wins; the
+`permission_provenance.source` it records is shown in parentheses.
+
+1. An active Skill's tool policy (`active_skill`): a call outside it is denied.
+   A Skill only narrows; it never allows.
+2. Any matching **deny** rule (`explicit_deny`).
+3. Core safety (`core_safety`): a `Write` or `Edit` of a protected path
+   (`.git/`, `.ssh/`, `.aws/`, `.gnupg/`, `.env`, shell profiles, ...) asks, and
+   MCP arguments that fail the tool's schema deny. Such a prompt never offers
+   `allow_session`.
+4. A matching Session deny grant (`session_deny`).
+5. Any matching **ask** rule (`explicit_ask`).
+6. Any matching **allow** rule (`explicit_allow`).
+7. A matching Session allow grant (`session_allow`).
+8. The permission mode. Built-ins use Core's classification
+   (`builtin_classification`): `Write` and `Edit` edit, `Bash` executes, and
+   every other built-in reads. `full_access` allows everything and `dont_ask`
+   denies everything. `default` and `auto` allow reads and ask the rest;
+   `accept_edits` also allows `Write` and `Edit` inside the Workspace root and
+   asks for them outside it. In those three modes a read-only Bash command (or
+   one the Workspace sandbox really confines, when it is set to auto-allow
+   them) is allowed. Host, process and MCP Tools (`mode_fallback`) ask, except
+   that `dont_ask` denies them and `full_access` allows them.
+
+Under `dont_ask` a call that would ask is denied without calling the Host. A
+call that does ask calls the Host and records `callback` with its response.
+
+The lists are not ranked by specificity: any matching deny beats every allow,
+and any matching ask beats every allow. A bare `ask: ["Write"]` therefore
+overrides `allow: ["Write(/outputs/**)"]`. To allow one directory and ask for
+everything else, write only the allow rule and let step 8 ask.
+
+**Example.** Workspace root `/Users/me/MetaBrowser`, mode `default`. Writes and
+edits under `/Users/me/MetaBrowser/outputs` need no prompt, every other write
+still asks, and the Read tool may not open anything under `secrets`:
+
+```json
+{
+  "allow": ["Write(//Users/me/MetaBrowser/outputs/**)",
+            "Edit(//Users/me/MetaBrowser/outputs/**)"],
+  "ask": [],
+  "deny": ["Read(//Users/me/MetaBrowser/secrets/**)"]
+}
+```
+
+Because both directories are inside the Workspace, `Write(/outputs/**)`,
+`Edit(/outputs/**)` and `Read(/secrets/**)` are equivalent. Writing
+`Write(/Users/me/MetaBrowser/outputs/**)` is a valid rule that never matches:
+it names `<workspace_root>/Users/me/...`. Path rules govern only the named file
+Tool: `Glob` and `Grep` still list `secrets`, and Bash reads whatever its own
+rules allow, so a Host that must keep a directory unreadable also denies
+`Glob`, `Grep` and the Bash commands concerned, or keeps the directory outside
+the Workspace.
+
 ### Permission authority and provenance
 
 A Permission callback request carries a `candidate`

@@ -12,7 +12,7 @@
 //!   - PowerShell(pattern)   同 Bash(cc-zig 短期不实现,占位)
 //!   - Read(path)            gitignore 风格,4 路径前缀(//, ~/, /, ./)
 //!   - Edit(path)            同 Read
-//!   - Write(path)           等价 Edit(覆盖共用)
+//!   - Write(path)           路径语法同 Edit;规则只匹配它点名的工具(Edit 规则不覆盖 Write)
 //!   - WebFetch(domain:x)    域名匹配
 //!   - Skill(name) / Skill(name *)
 //!   - Agent(name)           subagent type 精确名

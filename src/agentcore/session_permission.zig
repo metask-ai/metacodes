@@ -2481,3 +2481,134 @@ test "Revision 17 Permission callback names the file a file_target answer covers
     };
     try std.testing.expectError(error.InvalidIdentity, encodeCallbackRequest(allocator, request, arguments, .{}));
 }
+
+/// The "Permission rules" section of doc/AGENTCORE_BINARY_ABI.md, executed:
+/// its example and each pitfall it names, with the rule strings exactly as
+/// written there and the match context an AgentCore Session uses (cwd and
+/// project root are both the Workspace root).
+fn expectDocumentedRules(
+    rules: core.permission_settings.RuleSetInput,
+    cases: []const struct { tool: []const u8, path: []const u8, expected: ExplicitAction },
+) !void {
+    const allocator = std.testing.allocator;
+    const windows = @import("builtin").os.tag == .windows;
+    const root = if (windows) "C:/Users/me/MetaBrowser" else "/Users/me/MetaBrowser";
+    var settings = try core.permission_settings.buildRuleSet(allocator, rules, .{});
+    defer settings.deinit();
+    const context = core.permission_rule_spec.MatchContext{
+        .cwd = root,
+        .project_root = root,
+        .home = if (windows) "C:/Users/me" else "/Users/me",
+        .alloc = allocator,
+    };
+    for (cases) |case| {
+        // A leading `@/` stands for the Workspace root; anything else is
+        // passed through as the tool's relative path.
+        const path = if (std.mem.startsWith(u8, case.path, "@/"))
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, case.path[2..] })
+        else
+            try allocator.dupe(u8, case.path);
+        defer allocator.free(path);
+        const key = if (std.mem.eql(u8, case.tool, "Grep")) "path" else "file_path";
+        const arguments = try std.fmt.allocPrint(allocator, "{{\"{s}\":\"{s}\"}}", .{ key, path });
+        defer allocator.free(arguments);
+        std.testing.expectEqual(
+            case.expected,
+            evaluateExplicit(&settings, &context, case.tool, arguments),
+        ) catch |err| {
+            std.debug.print("{s} {s}\n", .{ case.tool, arguments });
+            return err;
+        };
+    }
+}
+
+test "Permission rule documentation example decides as documented" {
+    const example = core.permission_settings.RuleSetInput{
+        .allow = &.{
+            "Write(//Users/me/MetaBrowser/outputs/**)",
+            "Edit(//Users/me/MetaBrowser/outputs/**)",
+        },
+        .deny = &.{"Read(//Users/me/MetaBrowser/secrets/**)"},
+    };
+    try expectDocumentedRules(example, &.{
+        .{ .tool = "Write", .path = "@/outputs/report.csv", .expected = .allow },
+        .{ .tool = "Edit", .path = "@/outputs/2026/a.txt", .expected = .allow },
+        .{ .tool = "Write", .path = "outputs/relative.txt", .expected = .allow },
+        // Every other write reaches the permission mode, which asks.
+        .{ .tool = "Write", .path = "@/notes.txt", .expected = .undecided },
+        .{ .tool = "Write", .path = "@/outputs/../escape.txt", .expected = .undecided },
+        .{ .tool = "Read", .path = "@/secrets/key.pem", .expected = .deny },
+        .{ .tool = "Read", .path = "secrets/nested/key.pem", .expected = .deny },
+        .{ .tool = "Read", .path = "@/README.md", .expected = .undecided },
+        // Path rules govern only the Tool they name.
+        .{ .tool = "Grep", .path = "@/secrets", .expected = .undecided },
+    });
+
+    // The Workspace-root-relative spelling the document calls equivalent.
+    try expectDocumentedRules(.{
+        .allow = &.{ "Write(/outputs/**)", "Edit(/outputs/**)" },
+        .deny = &.{"Read(/secrets/**)"},
+    }, &.{
+        .{ .tool = "Write", .path = "@/outputs/report.csv", .expected = .allow },
+        .{ .tool = "Edit", .path = "@/outputs/2026/a.txt", .expected = .allow },
+        .{ .tool = "Read", .path = "@/secrets/key.pem", .expected = .deny },
+        .{ .tool = "Write", .path = "@/notes.txt", .expected = .undecided },
+    });
+}
+
+test "Permission rule documentation pitfalls behave as documented" {
+    // A single `/` is the Workspace root: this valid rule never matches.
+    try expectDocumentedRules(.{
+        .allow = &.{"Write(/Users/me/MetaBrowser/outputs/**)"},
+    }, &.{
+        .{ .tool = "Write", .path = "@/outputs/report.csv", .expected = .undecided },
+    });
+    // Lists are not ranked by specificity: a bare ask beats a narrower allow,
+    // and a deny beats every allow.
+    try expectDocumentedRules(.{
+        .allow = &.{"Write(/outputs/**)"},
+        .ask = &.{"Write"},
+    }, &.{
+        .{ .tool = "Write", .path = "@/outputs/report.csv", .expected = .ask },
+    });
+    try expectDocumentedRules(.{
+        .allow = &.{"Write(/outputs/**)"},
+        .deny = &.{"Write(*.csv)"},
+    }, &.{
+        .{ .tool = "Write", .path = "@/outputs/report.csv", .expected = .deny },
+        .{ .tool = "Write", .path = "@/outputs/report.txt", .expected = .allow },
+    });
+    // A rule names one Tool, and only the documented Tools take a path.
+    try expectDocumentedRules(.{
+        .allow = &.{ "Edit(/outputs/**)", "Grep(/secrets/**)" },
+    }, &.{
+        .{ .tool = "Write", .path = "@/outputs/report.csv", .expected = .undecided },
+        .{ .tool = "Grep", .path = "@/secrets", .expected = .undecided },
+    });
+    // A pattern without `/` matches a basename at any depth.
+    try expectDocumentedRules(.{
+        .deny = &.{"Read(*.pem)"},
+    }, &.{
+        .{ .tool = "Read", .path = "@/a/b/c/key.pem", .expected = .deny },
+        .{ .tool = "Read", .path = "@/a/b/c/key.txt", .expected = .undecided },
+    });
+}
+
+test "Permission rule documentation syntax limits refuse the whole set" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "WebFetch(example.com)", "Write(/outputs/**", "", "  " }) |bad| {
+        try std.testing.expectError(error.InvalidRule, core.permission_settings.buildRuleSet(
+            allocator,
+            .{ .allow = &.{ "Read", bad } },
+            .{},
+        ));
+    }
+    const too_many = try allocator.alloc([]const u8, 1025);
+    defer allocator.free(too_many);
+    @memset(too_many, "Read");
+    try std.testing.expectError(error.ResourceLimit, core.permission_settings.buildRuleSet(
+        allocator,
+        .{ .allow = too_many },
+        .{},
+    ));
+}
