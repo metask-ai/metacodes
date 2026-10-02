@@ -14,7 +14,10 @@
 //! Writes happen only under `--prefix`, the state root, and the `--link`
 //! directory. A prefix that holds anything but this product's own install is
 //! refused unless `--force`; reinstalling the same version over itself is
-//! allowed. Install logic lives here, once, for every platform:
+//! allowed, and `--upgrade` replaces another version of this product's install
+//! (and nothing else). Replacing a version removes the files the previous
+//! unit's manifest listed and the new one does not; the state root is never
+//! touched. Install logic lives here, once, for every platform:
 //! scripts/install.sh and scripts/install.ps1 only unpack an archive and call
 //! this.
 
@@ -31,6 +34,10 @@ pub const Options = struct {
     state_dir: ?[]const u8 = null,
     /// Replace a prefix holding a different version or foreign files.
     force: bool = false,
+    /// Replace another version of this product's install. Unlike `force` it
+    /// never overrides foreign files or someone else's launcher, so an
+    /// unattended installer (`curl … | sh`) can pass it on every run.
+    upgrade: bool = false,
     /// An unpacked AgentCore SDK bundle (its `manifest.json` names `agentcore`).
     sdk: ?[]const u8 = null,
     /// Directory on PATH that receives a launcher for this install.
@@ -105,7 +112,9 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
 
     const cwd = std.Io.Dir.cwd();
     const in_place = samePath(io, source_root, options.prefix);
-    if (!in_place) try checkPrefix(arena, io, options.prefix, version, options.force);
+    if (!in_place) try checkPrefix(arena, io, options.prefix, version, options.force or options.upgrade, options.force);
+    // What the install being replaced shipped, to remove what this one drops.
+    const previous: ?UnitManifest = if (in_place) null else readUnitManifest(arena, io, options.prefix) catch null;
     // Refuse a bad SDK before anything is written.
     const sdk_manifest: ?SdkManifest = if (options.sdk) |sdk| try readSdkManifest(arena, io, sdk) else null;
 
@@ -114,14 +123,29 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
     // macOS is `/private/tmp/x` to it, and its doctor must report the same root.
     // An existing prefix may itself be a symlink to a directory, which
     // createDirPath refuses; open it first (following links).
+    var created_prefix = false;
     if (cwd.openDir(io, options.prefix, .{})) |opened| {
         var dir = opened;
         dir.close(io);
     } else |err| switch (err) {
-        error.FileNotFound => try cwd.createDirPath(io, options.prefix),
+        error.FileNotFound => {
+            try cwd.createDirPath(io, options.prefix);
+            created_prefix = true;
+        },
         else => return err,
     }
     const prefix = try realPathAlloc(arena, io, options.prefix);
+    const executable = try std.fs.path.join(arena, &.{ prefix, "bin", if (is_windows) "metacodes.exe" else "metacodes" });
+
+    // A launcher name that is taken is refused before any file is written,
+    // like a bad SDK: a refusal must not leave a half-replaced install.
+    const launcher: ?Launcher = if (options.link_dir) |dir|
+        planLauncher(arena, io, dir, options.link_name, executable, options.force) catch |err| {
+            if (created_prefix) cwd.deleteDir(io, prefix) catch {};
+            return err;
+        }
+    else
+        null;
 
     // The record first: a copy that fails half way leaves a prefix that the
     // same version may retry without --force.
@@ -158,20 +182,21 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
             .{},
         );
     }
+    if (previous) |old| try removeDropped(arena, io, prefix, old, manifest, log);
     try log.print("installed metacodes {s}: {d} files verified under {s}\n", .{ version, manifest.files.len, prefix });
     try log.print("state root: {s}\n", .{resolved_root});
 
     var outcome: Outcome = .{
         .version = version,
         .prefix = prefix,
-        .executable = try std.fs.path.join(arena, &.{ prefix, "bin", if (is_windows) "metacodes.exe" else "metacodes" }),
+        .executable = executable,
         .state_root = resolved_root,
         .files = manifest.files.len,
         .in_place = in_place,
     };
 
     if (sdk_manifest) |sdk| outcome.sdk = try installSdk(arena, io, options.sdk.?, sdk, prefix, log);
-    if (options.link_dir) |dir| outcome.launcher = try writeLauncher(arena, io, dir, options.link_name, outcome.executable, options.force, log);
+    if (launcher) |plan| outcome.launcher = try writeLauncher(arena, io, plan, log);
     if (options.self_check) try selfCheck(arena, outcome, log);
     return outcome;
 }
@@ -186,8 +211,9 @@ fn readUnitManifest(arena: std.mem.Allocator, io: std.Io, root: []const u8) !Uni
 }
 
 /// A destination is empty, absent, or this product's install of the same
-/// version; anything else needs `--force`.
-fn checkPrefix(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, version: []const u8, force: bool) !void {
+/// version; another version needs `--upgrade` (or `--force`), anything else
+/// `--force`.
+fn checkPrefix(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, version: []const u8, replace_version: bool, force: bool) !void {
     const cwd = std.Io.Dir.cwd();
     var dir = cwd.openDir(io, prefix, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -205,7 +231,24 @@ fn checkPrefix(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, version
     const record = std.json.parseFromSliceLeaky(InstallRecord, arena, bytes, .{ .ignore_unknown_fields = true }) catch
         return if (force) {} else error.PrefixOccupied;
     if (!std.mem.eql(u8, record.schema_version, state_root.manifest_schema)) return if (force) {} else error.PrefixOccupied;
-    if (!std.mem.eql(u8, record.version, version) and !force) return error.DifferentVersionInstalled;
+    if (!std.mem.eql(u8, record.version, version) and !replace_version) return error.DifferentVersionInstalled;
+}
+
+/// Files the replaced unit listed and this one does not: a renamed or dropped
+/// asset must not linger beside the new executable. Only manifest paths, each
+/// held inside the prefix, are ever removed.
+fn removeDropped(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, old: UnitManifest, new: UnitManifest, log: *std.Io.Writer) !void {
+    const cwd = std.Io.Dir.cwd();
+    outer: for (old.files) |file| {
+        checkRelative(file.path) catch continue;
+        for (new.files) |kept| if (std.mem.eql(u8, kept.path, file.path)) continue :outer;
+        const path = try std.fs.path.join(arena, &.{ prefix, file.path });
+        cwd.deleteFile(io, path) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        try log.print("removed {s} (not part of this version)\n", .{file.path});
+    }
 }
 
 fn readSdkManifest(arena: std.mem.Allocator, io: std.Io, bundle: []const u8) !SdkManifest {
@@ -240,23 +283,32 @@ fn installSdk(arena: std.mem.Allocator, io: std.Io, bundle: []const u8, manifest
     return destination_root;
 }
 
+const Launcher = struct {
+    dir: []const u8,
+    path: []const u8,
+    body: []const u8,
+    /// A symlink sits at `path` and `--force` allows replacing it.
+    replace_symlink: bool,
+};
+
 /// A launcher, not a symlink: the executable finds its kernels, TinyKG and
 /// install.json beside its own physical path either way, but a script keeps
-/// working when the directory it sits in is copied or synced.
-fn writeLauncher(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, executable: []const u8, force: bool, log: *std.Io.Writer) ![]const u8 {
+/// working when the directory it sits in is copied or synced. Decides without
+/// writing whether the name is free: absent, or this install's own launcher.
+fn planLauncher(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, executable: []const u8, force: bool) !Launcher {
     if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\") != null) return error.LinkOccupied;
     const file_name = if (is_windows) try std.fmt.allocPrint(arena, "{s}.cmd", .{name}) else name;
     const path = try std.fs.path.join(arena, &.{ dir, file_name });
     const body = try launcherBody(arena, executable);
-    const cwd = std.Io.Dir.cwd();
     const pfs = @import("platform").fs;
     const path_z = try arena.dupeZ(u8, path);
     // Never write through a symlink: `~/.local/bin/metacodes -> <a build>` is
     // common, and following it would overwrite that binary with this script.
     if (pfs.isSymlink(path_z.ptr)) {
         if (!force) return error.LinkOccupied;
-        pfs.unlinkPath(path_z.ptr) catch return error.LinkOccupied;
-    } else if (cwd.readFileAlloc(io, path, arena, .limited(64 << 10))) |existing| {
+        return .{ .dir = dir, .path = path, .body = body, .replace_symlink = true };
+    }
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 10))) |existing| {
         if (!std.mem.eql(u8, existing, body) and !force) return error.LinkOccupied;
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -264,11 +316,19 @@ fn writeLauncher(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []
         error.StreamTooLong => if (!force) return error.LinkOccupied,
         else => return err,
     }
-    try cwd.createDirPath(io, dir);
-    try cwd.writeFile(io, .{ .sub_path = path, .data = body });
+    return .{ .dir = dir, .path = path, .body = body, .replace_symlink = false };
+}
+
+fn writeLauncher(arena: std.mem.Allocator, io: std.Io, plan: Launcher, log: *std.Io.Writer) ![]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    const pfs = @import("platform").fs;
+    const path_z = try arena.dupeZ(u8, plan.path);
+    if (plan.replace_symlink) pfs.unlinkPath(path_z.ptr) catch return error.LinkOccupied;
+    try cwd.createDirPath(io, plan.dir);
+    try cwd.writeFile(io, .{ .sub_path = plan.path, .data = plan.body });
     if (!is_windows) _ = pfs.chmod(path_z.ptr, 0o755);
-    try log.print("launcher: {s}\n", .{path});
-    return path;
+    try log.print("launcher: {s}\n", .{plan.path});
+    return plan.path;
 }
 
 /// The launcher script for `executable`, quoted so that no character of the
@@ -494,6 +554,10 @@ test "install refuses a foreign or differently versioned prefix unless forced" {
     const newer = try fixture.unit(arena, "0.4.0", &unit_files);
     try testing.expectError(error.DifferentVersionInstalled, run(arena, testing.io, newer, .{ .prefix = prefix, .self_check = false }, &log.writer));
     _ = try run(arena, testing.io, newer, .{ .prefix = prefix, .force = true, .self_check = false }, &log.writer);
+    // --upgrade replaces another version but never foreign files.
+    try fixture.tmp.dir.createDirPath(testing.io, "home-dir2");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "home-dir2/notes.txt", .data = "mine" });
+    try testing.expectError(error.PrefixOccupied, run(arena, testing.io, newer, .{ .prefix = try fixture.path(arena, "home-dir2"), .upgrade = true, .self_check = false }, &log.writer));
 
     try testing.expectError(error.PrefixNotAbsolute, run(arena, testing.io, newer, .{ .prefix = "relative/prefix", .self_check = false }, &log.writer));
     try testing.expectError(error.StateDirNotAbsolute, run(arena, testing.io, newer, .{ .prefix = prefix, .state_dir = "state", .force = true, .self_check = false }, &log.writer));
@@ -624,11 +688,47 @@ test "the launcher never writes through a symlink and quotes its path" {
     const prefix = try fixture.path(arena, "it's $HOME `x`");
 
     try testing.expectError(error.LinkOccupied, run(arena, testing.io, source, .{ .prefix = prefix, .link_dir = bin_dir, .self_check = false }, &log.writer));
+    // Refused before anything is written: not even the prefix it created.
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "it's $HOME `x`", .{}));
     const outcome = try run(arena, testing.io, source, .{ .prefix = prefix, .link_dir = bin_dir, .force = true, .self_check = false }, &log.writer);
+    // A taken launcher name stops an upgrade before it replaces a single file.
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "local/bin/other", .data = "#!/bin/sh\necho other\n" });
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    const newer = try fixture.unit(arena, "0.4.0", &.{.{ "bin/metacodes", "exe 0.4" }});
+    try testing.expectError(error.LinkOccupied, run(arena, testing.io, newer, .{ .prefix = prefix, .link_dir = bin_dir, .link_name = "other", .upgrade = true, .self_check = false }, &log.writer));
+    try testing.expectEqualStrings("exe", try read(arena, try std.fs.path.join(arena, &.{ prefix, "bin", "metacodes" })));
     try testing.expectEqualStrings("developer build", try read(arena, target)); // untouched
     const launcher = try read(arena, outcome.launcher.?);
     const expected_exec = try std.fmt.allocPrint(arena, "exec '{s}/it'\\''s $HOME `x`/bin/metacodes' \"$@\"\n", .{fixture.root});
     try testing.expect(std.mem.endsWith(u8, launcher, expected_exec));
+}
+
+test "upgrade replaces another version, drops its retired files and keeps the state root" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+
+    const old_files = unit_files ++ [_][2][]const u8{.{ "share/doc/OLD.md", "retired" }};
+    const prefix = try fixture.path(arena, "opt/mc");
+    _ = try run(arena, testing.io, try fixture.unit(arena, "0.3.0", &old_files), .{ .prefix = prefix, .self_check = false }, &log.writer);
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "opt/mc/state/config.json", .data = "{}" });
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+
+    const newer = try fixture.unit(arena, "0.4.0", &unit_files);
+    const outcome = try run(arena, testing.io, newer, .{ .prefix = prefix, .upgrade = true, .self_check = false }, &log.writer);
+    try testing.expectEqualStrings("0.4.0", outcome.version);
+    try testing.expect(std.mem.indexOf(u8, try read(arena, try fixture.path(arena, "opt/mc/etc/metacodes/install.json")), "0.4.0") != null);
+    try testing.expectError(error.FileNotFound, read(arena, try fixture.path(arena, "opt/mc/share/doc/OLD.md")));
+    try testing.expectEqualStrings("daemon", try read(arena, try fixture.path(arena, "opt/mc/vendor/tinykg/tinykgd")));
+    try testing.expectEqualStrings("{}", try read(arena, try fixture.path(arena, "opt/mc/state/config.json")));
+    // Reinstalling the same version removes nothing.
+    _ = try run(arena, testing.io, newer, .{ .prefix = prefix, .upgrade = true, .self_check = false }, &log.writer);
+    try testing.expectEqualStrings("exe", try read(arena, try fixture.path(arena, "opt/mc/bin/metacodes")));
 }
 
 test "the doctor state_root line parses paths with spaces" {

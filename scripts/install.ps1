@@ -71,7 +71,8 @@ try {
     $exe = Join-Path $root 'bin\metacodes.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "install.ps1: $exe is missing; is this a metacodes release unit?" }
 
-    $installArgs = @('install', '--prefix', $Prefix)
+    # --upgrade: rerunning replaces this product's other version, never foreign files.
+    $installArgs = @('install', '--prefix', $Prefix, '--upgrade')
     if ($StateDir) { $installArgs += @('--state-dir', $StateDir) }
     if ($Sdk) { $installArgs += @('--sdk', (Expand-Unit $Sdk 'sdk' $work)) }
     if ($LinkDir) { $installArgs += @('--link', $LinkDir, '--link-name', $LinkName) }
