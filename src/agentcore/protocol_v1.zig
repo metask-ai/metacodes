@@ -200,6 +200,7 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
         .tasks_changed,
         .ui_request_pending,
         .ui_request_resolved,
+        .prompt_manifest,
         => null,
     };
 }

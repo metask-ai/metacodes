@@ -31,6 +31,7 @@ const output_semantics = @import("../output_semantics.zig");
 const file_change = @import("../file_change.zig");
 const abort = @import("../../util/abort.zig");
 const types = @import("../../types.zig"); // UI-free 核心类型(PermissionMode/ReasoningEffort)
+const prompt_sections = @import("../prompt_sections.zig");
 
 /// **跨 UI session 配置变更**(U4)。多 UI 附着同一 session 时的状态广播源。
 /// 只含**跨 UI 关心的 session 级配置**——model/mode/dirs/reasoning;theme/vim 是
@@ -348,6 +349,11 @@ pub const CoreEvent = union(enum) {
     /// Internal synchronous-UI lifecycle edge. It is consumed by the
     /// AgentCore RunState projector and remains hidden from the public ABI.
     ui_request_resolved,
+
+    /// #184:本 Run 发出的系统提示词与上次投递的不同(Session 的首个 Run、提示词档案
+    /// 变更、模型或工具面变化)——Run 开始时、首个 provider 请求之前发一次,
+    /// 内容即 durable journal `run_started.prompt` 记下的同一份 manifest。借用,回调返回即失效。
+    prompt_manifest: prompt_sections.Manifest,
 
     // ── L4 诊断变体(可观测性)──────────────────────────────────────────────
     // agent_loop 在现有 log 点旁 emit;渲染 backend(TUI/Writer/JobEntry)一律 no-op,

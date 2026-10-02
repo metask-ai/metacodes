@@ -323,6 +323,8 @@ pub const TuiBackend = struct {
                 // TUI 是同步前端(走阻塞 requestUi,恒 .answered,从不挂起)→ 此事件不会发给它,no-op。
             },
             .ui_request_resolved => {},
+            // 提示词 manifest 只在 AgentSession 的 Run 里发,TUI 不渲染。
+            .prompt_manifest => {},
             // 文件修改契约:TUI 的 diff 工具卡走既有 tool_result 渲染路径(见 tool_card),
             // 这条是给进程外/程序化消费者的证据流,TUI no-op。
             .file_changes => {},

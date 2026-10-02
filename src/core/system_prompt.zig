@@ -50,9 +50,19 @@ const SYSTEM_SECTION =
 
 /// getSimpleDoingTasksSection（默认 USER_TYPE!=ant 分支，所以不包含 ant-only
 /// 的那些额外 bullet）。/help 指向 MetaCode 自己的命令。
-const DOING_TASKS_SECTION =
-    \\# Doing tasks
+///
+/// #184:软件工程定位那条与 /help 反馈两条属于 MetaCode 身份——宿主替换
+/// `metacodes:identity` 后它们随身份一起退出(DOING_TASKS_WITHOUT_IDENTITY),
+/// 其余工作纪律保留。拼接结果与旧的整段常量逐字节相同。
+const DOING_TASKS_HEADER = "# Doing tasks";
+
+const DOING_TASKS_IDENTITY_FRAMING =
+    \\
     \\ - The user will primarily request you to perform software engineering tasks. These may include solving bugs, adding new functionality, refactoring code, explaining code, and more. When given an unclear or generic instruction, consider it in the context of these software engineering tasks and the current working directory. For example, if the user asks you to change "methodName" to snake case, do not reply with just "method_name", instead find the method in the code and modify the code.
+;
+
+const DOING_TASKS_PRACTICES =
+    \\
     \\ - You are highly capable and often allow users to complete ambitious tasks that would otherwise be too complex or take too long. You should defer to user judgement about whether a task is too large to attempt.
     \\ - In general, do not propose changes to code you haven't read. If a user asks about or wants you to modify a file, read it first. Understand existing code before suggesting modifications.
     \\ - Do not create files unless they're absolutely necessary for achieving your goal. Generally prefer editing an existing file to creating a new one, as this prevents file bloat and builds on existing work more effectively.
@@ -63,10 +73,17 @@ const DOING_TASKS_SECTION =
     \\ - Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Only validate at system boundaries (user input, external APIs). Don't use feature flags or backwards-compatibility shims when you can just change the code.
     \\ - Don't create helpers, utilities, or abstractions for one-time operations. Don't design for hypothetical future requirements. The right amount of complexity is what the task actually requires—no speculative abstractions, but no half-finished implementations either. Three similar lines of code is better than a premature abstraction.
     \\ - Avoid backwards-compatibility hacks like renaming unused _vars, re-exporting types, adding // removed comments for removed code, etc. If you are certain that something is unused, you can delete it completely.
+;
+
+const DOING_TASKS_IDENTITY_HELP =
+    \\
     \\ - If the user asks for help or wants to give feedback inform them of the following:
     \\  - /help: Get help with using MetaCode
     \\  - To give feedback, users should open an issue with their feedback to the project maintainer
 ;
+
+const DOING_TASKS_SECTION = DOING_TASKS_HEADER ++ DOING_TASKS_IDENTITY_FRAMING ++ DOING_TASKS_PRACTICES ++ DOING_TASKS_IDENTITY_HELP;
+const DOING_TASKS_WITHOUT_IDENTITY = DOING_TASKS_HEADER ++ DOING_TASKS_PRACTICES;
 
 /// getActionsSection。逐字复制，不改动。
 /// v39 G3+G5(codex 基础面对照取证):验证 gate 收尾 + 持续性。终局 sealed
@@ -211,7 +228,8 @@ const PLATFORM: []const u8 = switch (@import("builtin").os.tag) {
 
 /// 拼 # Environment 段，返回 allocator-owned string。
 /// cwd 由调用方提供(CLI 传进程 cwd,Session 传 workspace.root)——库不预设 cwd 来源。
-fn buildEnvSection(allocator: std.mem.Allocator, model_identity: []const u8, cwd: []const u8) ![]u8 {
+/// kernel_identity=false(宿主替换了 `metacodes:identity`)时不写 MetaCode 身份行。
+fn buildEnvSection(allocator: std.mem.Allocator, model_identity: []const u8, cwd: []const u8, kernel_identity: bool) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
@@ -266,8 +284,9 @@ fn buildEnvSection(allocator: std.mem.Allocator, model_identity: []const u8, cwd
     }
 
     // MetaCode 身份行（对应 TS 里那句 "Claude Code is available as a CLI..."）。
-    // 不伪装成 Claude 的产品矩阵，也不瞎编模型 ID 表。
-    try buf.appendSlice(allocator, " - MetaCode is a local, single-binary CLI agent for software engineering built in Zig.\n");
+    // 不伪装成 Claude 的产品矩阵，也不瞎编模型 ID 表。它属于 `metacodes:identity`。
+    if (kernel_identity)
+        try buf.appendSlice(allocator, " - MetaCode is a local, single-binary CLI agent for software engineering built in Zig.\n");
 
     return try buf.toOwnedSlice(allocator);
 }
@@ -282,17 +301,101 @@ pub fn build(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) !
     return buildWithSkills(allocator, model, null, cwd);
 }
 
-/// 子 Agent 系统提示静态段(缺陷 A)。两处 fallback 共用(Linus R11 常量化)。
-pub const SUBAGENT_LITERAL = "You are a subagent. Complete the task and return a concise final answer.\n";
+/// 子 Agent 系统提示静态段(缺陷 A),#184 起是可替换段 `metacodes:subagent`。
+const SUBAGENT_SECTION = "You are a subagent. Complete the task and return a concise final answer.";
 
-/// 子 Agent 系统提示:静态字面量 + 环境段(缺陷 A 修复)。
-/// 两处启动点(abi_v1 / model_skill_tool)共用此函数,确保环境段一致。
+/// 子 Agent 系统提示:`metacodes:subagent` + 环境段(缺陷 A 修复),两段以单个换行相接
+/// (历史字节)。两处启动点(abi_v1 / model_skill_tool)经 AgentSession 共用此函数,
+/// 子 Agent 继承父 Session 的提示词档案:宿主段照加,只对主提示词存在的段的编辑不生效。
 /// cwd 用 workspace.root(非进程 cwd——子 Agent 继承父 Session 的 workspace 隔离)。
 /// 不含工具段——子 Agent 工具描述经 tool_defs 透传,无需在 system_prompt 重复。
-pub fn buildSubagentSystemPrompt(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
-    const env = try buildEnvSection(allocator, model, cwd);
+pub fn renderSubagentPrompt(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    cwd: []const u8,
+    profile: prompt_sections.Profile,
+) !prompt_sections.Rendered {
+    const env = try buildEnvSection(allocator, model, cwd, !profile.replaces(KernelSection.identity.spec().id));
     defer allocator.free(env);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ SUBAGENT_LITERAL, env });
+    var kernel = [_]prompt_sections.Section{
+        kernelSection(.subagent, SUBAGENT_SECTION),
+        kernelSection(.env, env),
+    };
+    return renderProfile(allocator, &kernel, profile, model, cwd, "\n");
+}
+
+pub fn buildSubagentSystemPrompt(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
+    var rendered = try renderSubagentPrompt(allocator, model, cwd, .{});
+    rendered.manifest.deinit(allocator);
+    return rendered.text;
+}
+
+/// The AgentSession prompt (#184): the kernel sections built from the Run's
+/// tool surface, edited by the Session's prompt profile. Skills, subagents,
+/// memory and TinyKG sections are CLI-only and stay empty here.
+pub const SessionPromptInput = struct {
+    model: []const u8,
+    cwd: []const u8,
+    enabled_tool_names: []const []const u8,
+    tool_defs: []const @import("../json.zig").ToolDefinition,
+    profile: prompt_sections.Profile = .{},
+};
+
+pub fn renderSessionPrompt(allocator: std.mem.Allocator, input: SessionPromptInput) !prompt_sections.Rendered {
+    const kernel_identity = !input.profile.replaces(KernelSection.identity.spec().id);
+    var generated = try GeneratedSections.init(
+        allocator,
+        input.model,
+        null,
+        null,
+        input.enabled_tool_names,
+        "",
+        false,
+        input.cwd,
+        input.tool_defs,
+        kernel_identity,
+    );
+    defer generated.deinit(allocator);
+    var kernel = kernelSections(&generated, kernel_identity);
+    return renderProfile(allocator, &kernel, input.profile, input.model, input.cwd, prompt_sections.separator);
+}
+
+fn renderProfile(
+    allocator: std.mem.Allocator,
+    kernel: []prompt_sections.Section,
+    profile: prompt_sections.Profile,
+    model: []const u8,
+    cwd: []const u8,
+    joiner: []const u8,
+) !prompt_sections.Rendered {
+    if (profile.isEmpty()) return prompt_sections.renderWithManifest(allocator, kernel, joiner);
+    // Interpolated texts and the edited list live only until the join copies
+    // them; manifest ids borrow the kernel's static ids and the profile.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const sections = try prompt_sections.apply(arena.allocator(), kernel, profile, .{
+        .model = model,
+        .workspace_root = cwd,
+        .platform = PLATFORM,
+    });
+    return prompt_sections.renderWithManifest(allocator, sections, joiner);
+}
+
+/// Every kernel section a profile may name, with its class.
+pub const kernel_infos = blk: {
+    const fields = std.meta.fields(KernelSection);
+    var infos: [fields.len]prompt_sections.KernelInfo = undefined;
+    for (fields, &infos) |field, *info| {
+        const s = @as(KernelSection, @enumFromInt(field.value)).spec();
+        info.* = .{ .id = s.id, .class = s.class };
+    }
+    const result = infos;
+    break :blk result;
+};
+
+/// Refuse a profile the kernel cannot apply, naming the first broken rule.
+pub fn validateProfile(profile: prompt_sections.Profile) ?prompt_sections.Diagnostic {
+    return prompt_sections.validate(profile, &kernel_infos, .{});
 }
 
 /// 同 build，外加 skills section（让模型知道有哪些 Skill 可激活、何时激活）。
@@ -472,7 +575,7 @@ pub fn buildFullWithDefs(
     cwd: []const u8,
     tool_defs: ?[]const @import("../json.zig").ToolDefinition,
 ) ![]u8 {
-    var generated = try GeneratedSections.init(allocator, model, skills, agents, enabled_tool_names, memdir_abs, kg_ready, cwd, tool_defs);
+    var generated = try GeneratedSections.init(allocator, model, skills, agents, enabled_tool_names, memdir_abs, kg_ready, cwd, tool_defs, true);
     defer generated.deinit(allocator);
     return renderKernel(allocator, &generated);
 }
@@ -498,8 +601,9 @@ const GeneratedSections = struct {
         kg_ready: bool,
         cwd: []const u8,
         tool_defs: ?[]const @import("../json.zig").ToolDefinition,
+        kernel_identity: bool,
     ) !GeneratedSections {
-        const env_section = try buildEnvSection(allocator, model, cwd);
+        const env_section = try buildEnvSection(allocator, model, cwd, kernel_identity);
         errdefer allocator.free(env_section);
 
         const skills_section = if (toolNameEnabled(enabled_tool_names, "Skill"))
@@ -556,11 +660,20 @@ const GeneratedSections = struct {
 };
 
 fn renderKernel(allocator: std.mem.Allocator, generated: *const GeneratedSections) ![]u8 {
-    var sections = [_]prompt_sections.Section{
+    var sections = kernelSections(generated, true);
+    return prompt_sections.render(allocator, &sections);
+}
+
+/// The main prompt's kernel sections. Without the kernel identity (a Host
+/// replaced `metacodes:identity`), the sentences that belong to it leave too:
+/// the doing-tasks framing and help bullets here, the env product line in
+/// `GeneratedSections`.
+fn kernelSections(generated: *const GeneratedSections, kernel_identity: bool) [16]prompt_sections.Section {
+    return .{
         kernelSection(.identity, IDENTITY_SECTION),
         kernelSection(.safety_policy, SAFETY_POLICY_SECTION),
         kernelSection(.system, SYSTEM_SECTION),
-        kernelSection(.doing_tasks, DOING_TASKS_SECTION),
+        kernelSection(.doing_tasks, if (kernel_identity) DOING_TASKS_SECTION else DOING_TASKS_WITHOUT_IDENTITY),
         kernelSection(.validation, VALIDATION_SECTION),
         kernelSection(.actions, ACTIONS_SECTION),
         kernelSection(.using_tools, generated.using_tools),
@@ -574,14 +687,16 @@ fn renderKernel(allocator: std.mem.Allocator, generated: *const GeneratedSection
         kernelSection(.agents, generated.agents),
         kernelSection(.kg, generated.kg),
     };
-    return prompt_sections.render(allocator, &sections);
 }
 
 /// The kernel's prompt sections (#184): stable ids, sparse orders that leave
 /// room for Host sections between them, and what a Host may do with each.
 /// Volatile generated facts sit last so the cacheable prefix stays stable.
+/// `subagent` takes identity's place in the subagent prompt, which has only
+/// it and `env`.
 pub const KernelSection = enum {
     identity,
+    subagent,
     safety_policy,
     system,
     doing_tasks,
@@ -608,6 +723,7 @@ pub const KernelSection = enum {
     pub fn spec(self: KernelSection) Spec {
         return switch (self) {
             .identity => .{ .id = "metacodes:identity", .order = -1000, .class = .replaceable, .join = .always },
+            .subagent => .{ .id = "metacodes:subagent", .order = -1000, .class = .replaceable, .join = .always },
             .safety_policy => .{ .id = "metacodes:safety-policy", .order = -900, .class = .locked, .join = .always },
             .system => .{ .id = "metacodes:system", .order = 100, .class = .locked, .join = .always },
             .doing_tasks => .{ .id = "metacodes:doing-tasks", .order = 200, .class = .replaceable, .join = .always },
@@ -668,13 +784,17 @@ fn buildDeferredToolsSection(
     return try buf.toOwnedSlice(allocator);
 }
 
+/// The generated `# Deferred tools` heading and sentence, also its projection
+/// signature. The tool list follows after one blank line.
+const DEFERRED_TOOLS_HEADER =
+    \\# Deferred tools
+    \\The tools below are available but their parameter schemas are not loaded yet, so you cannot call them directly. To use one, first call ToolSearch with `select:<name>` (or keywords) to fetch its schema; after that it is callable like any other tool.
+    \\
+;
+
 fn appendDeferredLine(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), any: *bool, name: []const u8, description: []const u8) !void {
     if (!any.*) {
-        try buf.appendSlice(allocator,
-            \\# Deferred tools
-            \\The tools below are available but their parameter schemas are not loaded yet, so you cannot call them directly. To use one, first call ToolSearch with `select:<name>` (or keywords) to fetch its schema; after that it is callable like any other tool.
-            \\
-        );
+        try buf.appendSlice(allocator, DEFERRED_TOOLS_HEADER);
         any.* = true;
     }
     try buf.print(allocator, "\n- {s} — {s}", .{ name, description });
@@ -717,8 +837,10 @@ fn deferredDescriptionSummary(allocator: std.mem.Allocator, description: []const
 /// prefixes regardless of registration order or generation id.
 ///
 /// Prompt overrides are intentionally opaque: only a section carrying our
-/// generated signature is projected. An A/B override that owns the
-/// `# Using your tools` section remains untouched.
+/// generated signature is projected. An A/B override, or a Host profile, that
+/// owns the `# Using your tools` section remains untouched. The generated
+/// section has no blank line, so it ends at the first one: a Host section
+/// joined after it is never part of the projection, heading or not.
 pub fn projectUsingToolsForExecution(
     allocator: std.mem.Allocator,
     prompt: []const u8,
@@ -729,7 +851,7 @@ pub fn projectUsingToolsForExecution(
     const generated_signature = " - Use only tools present in the current API tool list.";
     const signature_start = section_start + marker.len;
     if (!std.mem.startsWith(u8, prompt[signature_start..], generated_signature)) return null;
-    const section_end = if (std.mem.indexOf(u8, prompt[signature_start..], "\n\n# ")) |rel|
+    const section_end = if (std.mem.indexOf(u8, prompt[signature_start..], prompt_sections.separator)) |rel|
         signature_start + rel
     else
         prompt.len;
@@ -763,17 +885,22 @@ pub fn projectUsingToolsForExecution(
 /// Returns an owned replacement only when the prompt must change. The common
 /// path returns null so the stable prompt bytes (and provider cache prefix) stay
 /// untouched.
+///
+/// As with `# Using your tools`, only the generated section is projected: its
+/// header sentence is the signature, and its tool list ends at the first blank
+/// line after it, so neither a Host's replacement text nor a Host section
+/// joined after the list is rewritten.
 pub fn projectDeferredToolsForExecution(
     allocator: std.mem.Allocator,
     prompt: []const u8,
     catalog_defs: []const @import("../json.zig").ToolDefinition,
     visible_defs: []const @import("../json.zig").ToolDefinition,
 ) !?[]u8 {
-    const marker = "# Deferred tools\n";
-    const section_start = std.mem.indexOf(u8, prompt, marker) orelse return null;
-    const after_marker = section_start + marker.len;
-    const section_end = if (std.mem.indexOf(u8, prompt[after_marker..], "\n\n# ")) |rel|
-        after_marker + rel
+    const header = DEFERRED_TOOLS_HEADER ++ "\n";
+    const section_start = std.mem.indexOf(u8, prompt, header) orelse return null;
+    const list_start = section_start + header.len;
+    const section_end = if (std.mem.indexOf(u8, prompt[list_start..], prompt_sections.separator)) |rel|
+        list_start + rel
     else
         prompt.len;
 
@@ -1064,18 +1191,7 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
 
 test "deferred prompt projection follows runtime catalog without changing stable common path" {
     const ToolDefinition = @import("../json.zig").ToolDefinition;
-    const prompt =
-        \\# Before
-        \\stable
-        \\
-        \\# Deferred tools
-        \\Activate one.
-        \\- Alpha — first
-        \\- Beta — second
-        \\
-        \\# After
-        \\stable
-    ;
+    const prompt = "# Before\nstable\n\n" ++ DEFERRED_TOOLS_HEADER ++ "\n- Alpha — first\n- Beta — second\n\n# After\nstable";
     const catalog = [_]ToolDefinition{
         .{ .name = "ToolSearch", .description = "search", .input_schema = .{} },
         .{ .name = "Alpha", .description = "first", .input_schema = .{}, .deferred = true },
@@ -1102,6 +1218,10 @@ test "deferred prompt projection follows runtime catalog without changing stable
     defer testing.allocator.free(removed);
     try testing.expect(std.mem.indexOf(u8, removed, "# Deferred tools") == null);
     try testing.expect(std.mem.indexOf(u8, removed, "# Before\nstable\n\n# After") != null);
+
+    // A deferred section without the generated header is someone else's text.
+    const custom = "# Before\nstable\n\n# Deferred tools\nActivate one.\n- Alpha — first\n- Beta — second\n\n# After\nstable";
+    try testing.expect((try projectDeferredToolsForExecution(testing.allocator, custom, &no_search, &no_search)) == null);
 }
 
 test "knowledge cutoff maps opus-4-7" {
@@ -1111,7 +1231,7 @@ test "knowledge cutoff maps opus-4-7" {
 }
 
 test "env section includes model id" {
-    const s = try buildEnvSection(testing.allocator, "claude-opus-4-7", "/tmp");
+    const s = try buildEnvSection(testing.allocator, "claude-opus-4-7", "/tmp", true);
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "claude-opus-4-7") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Environment") != null);
@@ -1387,6 +1507,7 @@ test "the section registry renders the pre-#184 prompt byte for byte" {
                                 kg_ready,
                                 "/tmp",
                                 defs,
+                                true,
                             );
                             defer generated.deinit(a);
                             const expected = try legacyRender(a, &generated);
@@ -1403,7 +1524,7 @@ test "the section registry renders the pre-#184 prompt byte for byte" {
     }
     try testing.expectEqual(@as(usize, 2 * 5 * 2 * 2 * 2 * 2), cases);
     // The empty tool set really exercises the empty fixed `# Using your tools`.
-    var empty_tools = try GeneratedSections.init(a, "m", null, null, &none, "", false, "/tmp", null);
+    var empty_tools = try GeneratedSections.init(a, "m", null, null, &none, "", false, "/tmp", null, true);
     defer empty_tools.deinit(a);
     try testing.expectEqualStrings("", empty_tools.using_tools);
 }
@@ -1412,17 +1533,261 @@ test {
     _ = prompt_sections;
 }
 
-test "kernel section ids are unique and sorted by their orders" {
+test "kernel section ids are unique and the main prompt's orders strictly increase" {
     const fields = std.meta.fields(KernelSection);
-    var previous: ?i64 = null;
     inline for (fields, 0..) |field, index| {
         const spec = @as(KernelSection, @enumFromInt(field.value)).spec();
-        try testing.expect(std.mem.startsWith(u8, spec.id, "metacodes:"));
-        if (previous) |order| try testing.expect(order < spec.order);
-        previous = spec.order;
+        try testing.expect(std.mem.startsWith(u8, spec.id, prompt_sections.kernel_prefix));
         inline for (fields[0..index]) |earlier| {
             const other = @as(KernelSection, @enumFromInt(earlier.value)).spec();
             try testing.expect(!std.mem.eql(u8, other.id, spec.id));
         }
     }
+    var generated = try GeneratedSections.init(testing.allocator, "m", null, null, null, "", false, "/tmp", null, true);
+    defer generated.deinit(testing.allocator);
+    const main = kernelSections(&generated, true);
+    for (main[1..], main[0 .. main.len - 1]) |section, previous| try testing.expect(previous.order < section.order);
+    try testing.expectEqual(fields.len, main.len + 1); // every kernel section but `subagent`
+}
+
+/// The full built-in tool set plus one dynamic deferred (MCP) tool, so every
+/// tool-derived section renders, for prompt tests.
+fn allToolDefinitions(allocator: std.mem.Allocator) ![]@import("../json.zig").ToolDefinition {
+    const tools = @import("../tools.zig");
+    const defs = try allocator.alloc(@import("../json.zig").ToolDefinition, tools.registry.len + 1);
+    for (tools.registry, defs[0..tools.registry.len]) |*tool, *def| def.* = .{
+        .name = tool.name,
+        .description = tool.description,
+        .input_schema = .{},
+        .deferred = tool.deferred,
+    };
+    defs[tools.registry.len] = .{
+        .name = "weather__forecast",
+        .description = "Forecast for a city.",
+        .input_schema = .{},
+        .deferred = true,
+    };
+    return defs;
+}
+
+fn toolNames(allocator: std.mem.Allocator, defs: []const @import("../json.zig").ToolDefinition) ![]const []const u8 {
+    const names = try allocator.alloc([]const u8, defs.len);
+    for (defs, names) |def, *name| name.* = def.name;
+    return names;
+}
+
+test "without a profile the Session prompt is the historical build" {
+    const a = testing.allocator;
+    const defs = try allToolDefinitions(a);
+    defer a.free(defs);
+    const names = try toolNames(a, defs);
+    defer a.free(names);
+    const empty_names = [_][]const u8{};
+    const cases = [_]struct { []const []const u8, []const @import("../json.zig").ToolDefinition }{
+        .{ names, defs },
+        .{ names[0..3], defs[0..3] },
+        .{ &empty_names, &.{} },
+    };
+    for (cases) |case| {
+        const expected = try buildFullWithDefs(a, "claude-opus-4-7", null, null, case[0], "", false, "/tmp", case[1]);
+        defer a.free(expected);
+        var rendered = try renderSessionPrompt(a, .{
+            .model = "claude-opus-4-7",
+            .cwd = "/tmp",
+            .enabled_tool_names = case[0],
+            .tool_defs = case[1],
+        });
+        defer rendered.deinit(a);
+        try testing.expectEqualStrings(expected, rendered.text);
+        for (rendered.manifest.entries) |entry| try testing.expectEqual(prompt_sections.Origin.kernel, entry.origin);
+        try testing.expectEqualSlices(u8, &prompt_sections.sha256(expected), &rendered.manifest.sha256);
+    }
+}
+
+test "doing-tasks keeps its pre-#184 bytes" {
+    const hex = std.fmt.bytesToHex(prompt_sections.sha256(DOING_TASKS_SECTION), .lower);
+    try testing.expectEqualStrings("fe009891060c381ac18090a141778318abf6326cb3207cb69315ca93fdaf513b", &hex);
+    try testing.expect(std.mem.indexOf(u8, DOING_TASKS_WITHOUT_IDENTITY, "MetaCode") == null);
+    try testing.expect(std.mem.indexOf(u8, DOING_TASKS_WITHOUT_IDENTITY, "software engineering") == null);
+}
+
+fn expectAbsentIgnoreCase(haystack: []const u8, needle: []const u8) !void {
+    if (std.ascii.indexOfIgnoreCase(haystack, needle)) |at| {
+        std.debug.print("unexpected \"{s}\" at {d}: ...{s}...\n", .{ needle, at, haystack[at -| 80..@min(haystack.len, at + 80)] });
+        return error.TestUnexpectedText;
+    }
+}
+
+test "replacing identity removes MetaCode and software engineering and keeps the locked sections" {
+    const a = testing.allocator;
+    const defs = try allToolDefinitions(a);
+    defer a.free(defs);
+    const names = try toolNames(a, defs);
+    defer a.free(names);
+    const profile: prompt_sections.Profile = .{ .sections = &.{
+        .{ .op = .replace, .id = "metacodes:identity", .text = "You are Shopkeeper, a browser agent that operates store back offices." },
+        .{ .op = .add, .id = "host:browser-rules", .order = 500, .text = "Read the page before acting on it." },
+    } };
+    try testing.expectEqual(@as(?prompt_sections.Diagnostic, null), validateProfile(profile));
+    var rendered = try renderSessionPrompt(a, .{
+        .model = "claude-opus-4-7",
+        .cwd = "/tmp",
+        .enabled_tool_names = names,
+        .tool_defs = defs,
+        .profile = profile,
+    });
+    defer rendered.deinit(a);
+    try expectAbsentIgnoreCase(rendered.text, "MetaCode");
+    try expectAbsentIgnoreCase(rendered.text, "software engineering");
+    try testing.expect(std.mem.startsWith(u8, rendered.text, "You are Shopkeeper, a browser agent that operates store back offices.\n\n" ++ SAFETY_POLICY_SECTION ++ "\n\n" ++ SYSTEM_SECTION ++ "\n\n"));
+    try testing.expect(std.mem.indexOf(u8, rendered.text, "\n\nRead the page before acting on it.\n\n# Using your tools\n") != null);
+
+    const expected_entries = [_]struct { []const u8, prompt_sections.Origin, prompt_sections.Class }{
+        .{ "metacodes:identity", .host, .replaceable },
+        .{ "metacodes:safety-policy", .kernel, .locked },
+        .{ "metacodes:system", .kernel, .locked },
+        .{ "metacodes:doing-tasks", .kernel, .replaceable },
+        .{ "metacodes:validation", .kernel, .replaceable },
+        .{ "metacodes:actions", .kernel, .replaceable },
+        .{ "host:browser-rules", .host, .removable },
+        .{ "metacodes:using-tools", .kernel, .replaceable },
+        .{ "metacodes:deferred-tools", .kernel, .replaceable },
+        .{ "metacodes:tone", .kernel, .removable },
+        .{ "metacodes:output-efficiency", .kernel, .removable },
+        .{ "metacodes:progress", .kernel, .removable },
+        .{ "metacodes:env", .kernel, .generated },
+    };
+    try testing.expectEqual(expected_entries.len, rendered.manifest.entries.len);
+    for (expected_entries, rendered.manifest.entries) |want, entry| {
+        try testing.expectEqualStrings(want[0], entry.id);
+        try testing.expectEqual(want[1], entry.origin);
+        try testing.expectEqual(want[2], entry.class);
+    }
+    try testing.expectEqualSlices(u8, &prompt_sections.sha256(SAFETY_POLICY_SECTION), &rendered.manifest.entries[1].sha256);
+    try testing.expectEqualSlices(u8, &prompt_sections.sha256(DOING_TASKS_WITHOUT_IDENTITY), &rendered.manifest.entries[3].sha256);
+
+    // The same profile renders the same bytes every time: a stable cache prefix.
+    var again = try renderSessionPrompt(a, .{
+        .model = "claude-opus-4-7",
+        .cwd = "/tmp",
+        .enabled_tool_names = names,
+        .tool_defs = defs,
+        .profile = profile,
+    });
+    defer again.deinit(a);
+    try testing.expectEqualStrings(rendered.text, again.text);
+    try testing.expectEqualSlices(u8, &rendered.manifest.fingerprint(), &again.manifest.fingerprint());
+}
+
+test "validateProfile applies the kernel classes" {
+    const refused = [_]struct { prompt_sections.ProfileSection, prompt_sections.Issue }{
+        .{ .{ .op = .replace, .id = "metacodes:system", .text = "x" }, .locked_section },
+        .{ .{ .op = .replace, .id = "metacodes:safety-policy", .text = "x" }, .locked_section },
+        .{ .{ .op = .remove, .id = "metacodes:actions" }, .not_removable },
+        .{ .{ .op = .remove, .id = "metacodes:identity" }, .not_removable },
+        .{ .{ .op = .remove, .id = "metacodes:subagent" }, .not_removable },
+        .{ .{ .op = .replace, .id = "metacodes:env", .text = "x" }, .generated_section },
+        .{ .{ .op = .remove, .id = "metacodes:kg" }, .generated_section },
+        .{ .{ .op = .add, .id = "host:a", .text = "{{cwd}}", .interpolate = true }, .unknown_variable },
+    };
+    for (refused) |case| {
+        const diagnostic = validateProfile(.{ .sections = &.{case[0]} }) orelse return error.TestExpectedRefusal;
+        try testing.expectEqual(case[1], diagnostic.issue);
+    }
+    for ([_][]const u8{ "metacodes:tone", "metacodes:output-efficiency", "metacodes:progress" }) |id| {
+        try testing.expectEqual(@as(?prompt_sections.Diagnostic, null), validateProfile(.{ .sections = &.{.{ .op = .remove, .id = id }} }));
+    }
+    for ([_][]const u8{ "metacodes:identity", "metacodes:subagent", "metacodes:doing-tasks", "metacodes:validation", "metacodes:actions", "metacodes:using-tools", "metacodes:deferred-tools" }) |id| {
+        try testing.expectEqual(@as(?prompt_sections.Diagnostic, null), validateProfile(.{ .sections = &.{.{ .op = .replace, .id = id, .text = "x" }} }));
+    }
+}
+
+test "the subagent prompt keeps its bytes and inherits the profile" {
+    const a = testing.allocator;
+    const env = try buildEnvSection(a, "m", "/w", true);
+    defer a.free(env);
+    const legacy = try std.mem.concat(a, u8, &.{ "You are a subagent. Complete the task and return a concise final answer.\n", env });
+    defer a.free(legacy);
+    const plain = try buildSubagentSystemPrompt(a, "m", "/w");
+    defer a.free(plain);
+    try testing.expectEqualStrings(legacy, plain);
+
+    var rendered = try renderSubagentPrompt(a, "m", "/w", .{ .sections = &.{
+        .{ .op = .replace, .id = "metacodes:identity", .text = "You are Shopkeeper." },
+        .{ .op = .replace, .id = "metacodes:subagent", .text = "You help Shopkeeper with one {{platform}} task.", .interpolate = true },
+        .{ .op = .add, .id = "host:browser-rules", .order = 500, .text = "Read the page before acting on it." },
+        .{ .op = .remove, .id = "metacodes:tone" },
+    } });
+    defer rendered.deinit(a);
+    const env_without_identity = try buildEnvSection(a, "m", "/w", false);
+    defer a.free(env_without_identity);
+    const expected = try std.mem.concat(a, u8, &.{
+        "You help Shopkeeper with one " ++ PLATFORM ++ " task.\nRead the page before acting on it.\n",
+        env_without_identity,
+    });
+    defer a.free(expected);
+    try testing.expectEqualStrings(expected, rendered.text);
+    try expectAbsentIgnoreCase(rendered.text, "MetaCode");
+    try testing.expectEqual(@as(usize, 3), rendered.manifest.entries.len);
+    try testing.expectEqualStrings("metacodes:subagent", rendered.manifest.entries[0].id);
+    try testing.expectEqual(prompt_sections.Origin.host, rendered.manifest.entries[0].origin);
+}
+
+test "per-turn projections leave Host sections joined after a projected section intact" {
+    const a = testing.allocator;
+    const ToolDefinition = @import("../json.zig").ToolDefinition;
+    const defs = [_]ToolDefinition{
+        .{ .name = "Read", .description = "read", .input_schema = .{} },
+        .{ .name = "Bash", .description = "bash", .input_schema = .{} },
+        .{ .name = "ToolSearch", .description = "search", .input_schema = .{} },
+        .{ .name = "weather__forecast", .description = "Forecast.", .input_schema = .{}, .deferred = true },
+        .{ .name = "maps__route", .description = "Route.", .input_schema = .{}, .deferred = true },
+    };
+    const names = try toolNames(a, &defs);
+    defer a.free(names);
+    const after_tools = "Store rules:\n- Never buy anything\n- Never delete orders";
+    const after_deferred = "Deferred notes:\n- Ask before using maps";
+    var rendered = try renderSessionPrompt(a, .{
+        .model = "m",
+        .cwd = "/tmp",
+        .enabled_tool_names = names,
+        .tool_defs = &defs,
+        .profile = .{ .sections = &.{
+            .{ .op = .add, .id = "host:after-tools", .order = 1050, .text = after_tools },
+            .{ .op = .add, .id = "host:after-deferred", .order = 1150, .text = after_deferred },
+        } },
+    });
+    defer rendered.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, rendered.text, "\n\n" ++ after_tools ++ "\n\n# Deferred tools\n") != null);
+
+    // Bash and the maps tool leave the visible surface for this turn.
+    const visible = [_]ToolDefinition{ defs[0], defs[2], defs[3] };
+    const guidance = (try projectUsingToolsForExecution(a, rendered.text, &visible)) orelse
+        return error.TestExpectedProjection;
+    defer a.free(guidance);
+    try testing.expect(std.mem.indexOf(u8, guidance, "Reserve Bash") == null);
+    try testing.expect(std.mem.indexOf(u8, guidance, "\n\n" ++ after_tools ++ "\n\n") != null);
+
+    const deferred = (try projectDeferredToolsForExecution(a, guidance, &visible, &visible)) orelse
+        return error.TestExpectedProjection;
+    defer a.free(deferred);
+    try testing.expect(std.mem.indexOf(u8, deferred, "- weather__forecast") != null);
+    try testing.expect(std.mem.indexOf(u8, deferred, "- maps__route") == null);
+    try testing.expect(std.mem.indexOf(u8, deferred, "\n\n" ++ after_tools ++ "\n\n") != null);
+    try testing.expect(std.mem.indexOf(u8, deferred, "\n\n" ++ after_deferred ++ "\n\n") != null);
+
+    // A Host's replacement of either section is opaque to both projections.
+    var replaced = try renderSessionPrompt(a, .{
+        .model = "m",
+        .cwd = "/tmp",
+        .enabled_tool_names = names,
+        .tool_defs = &defs,
+        .profile = .{ .sections = &.{
+            .{ .op = .replace, .id = "metacodes:using-tools", .text = "# Using your tools\nUse the browser tools.\n- Bash is for diagnostics" },
+            .{ .op = .replace, .id = "metacodes:deferred-tools", .text = "# Deferred tools\n- maps__route — ask first" },
+        } },
+    });
+    defer replaced.deinit(a);
+    try testing.expectEqual(@as(?[]u8, null), try projectUsingToolsForExecution(a, replaced.text, &visible));
+    try testing.expectEqual(@as(?[]u8, null), try projectDeferredToolsForExecution(a, replaced.text, &visible, &visible));
 }

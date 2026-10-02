@@ -3821,17 +3821,10 @@ const ForkExecutorContext = struct {
         self.facade.active_mcp_environment = if (mcp_environment) |*mcp_env| mcp_env else null;
         defer self.facade.active_mcp_environment = null;
 
-        // 缺陷 A 修复:子 Agent 系统提示 = 静态字面量 + 环境段(cwd=workspace.root)。
-        // 与 model_skill_tool.zig 共用 buildSubagentSystemPrompt,确保两路径一致。
-        const sp_mod = core.system_prompt;
-        const owned_subagent_system_prompt = sp_mod.buildSubagentSystemPrompt(
-            output_allocator,
-            self.session.model,
-            self.session.workspace.root,
-        ) catch null;
-        defer if (owned_subagent_system_prompt) |prompt| output_allocator.free(prompt);
-        const subagent_system_prompt = owned_subagent_system_prompt orelse
-            sp_mod.SUBAGENT_LITERAL;
+        // 缺陷 A 修复:子 Agent 系统提示 = `metacodes:subagent` + 环境段(cwd=workspace.root),
+        // 继承 Session 的提示词档案(#184)。runIsolated 已渲染、记入 journal 并投递 manifest,
+        // 这里逐字节发送同一份。
+        const subagent_system_prompt = evidence.system_prompt orelse return error.InvalidSessionState;
 
         const child = core.subagent.spawnAgentSink(
             output_allocator,
