@@ -81,31 +81,61 @@ process-global resolution.
 ## 4. Installer
 
 `bin/metacodes install --prefix <dir> [--state-dir <dir>] [--sdk <bundle>]
-[--link <dir> [--link-name <name>]] [--force]` (src/app/install.zig), run from
-an extracted release unit or one staged from source (`release:verify`):
+[--link <dir> [--link-name <name>]] [--upgrade] [--force]` (src/app/install.zig),
+run from an extracted release unit or one staged from source (`release:verify`):
 
-1. refuses a prefix that holds anything but this product's install of the
-   same version unless `--force`, and writes only under `<prefix>`, the state
-   root and the `--link` directory;
-2. copies every file the unit's `manifest.json` lists and re-hashes it at the
-   destination (a damaged unit fails on the first mismatch);
-3. writes `etc/metacodes/install.json` (`"state_root": "state"`, or the
-   absolute `--state-dir`) and creates the state root (0700);
+1. refuses a prefix that holds anything but this product's install unless
+   `--force`, and another version of it unless `--upgrade` (or `--force`);
+   refuses a bad `--sdk` bundle and a taken launcher name (step 5) before it
+   writes anything; writes only under `<prefix>`, the state root and the
+   `--link` directory;
+2. writes `etc/metacodes/install.json` (`"state_root": "state"`, or the
+   absolute `--state-dir`) and creates the state root (0700), first, so a copy
+   that fails half way can be retried without `--force`;
+3. copies every file the unit's `manifest.json` lists and re-hashes it at the
+   destination (a damaged unit fails on the first mismatch); when it replaces
+   another version, removes the files the old manifest listed and the new one
+   does not. The state root is never touched;
 4. with `--sdk`, replaces `<prefix>/sdk/agentcore/` with the AgentCore bundle,
-   each file verified against that bundle's manifest; with `--link`, writes a
-   launcher script (POSIX `sh`, Windows `.cmd`) that `exec`s the installed
-   executable, refusing a same-named launcher of another install unless
-   `--force`;
-5. runs the installed `bin/metacodes doctor --strict` in an empty environment
+   each file verified against that bundle's manifest;
+5. with `--link`, writes a launcher script (POSIX `sh`, Windows `.cmd`) that
+   `exec`s the installed executable. The name must be free or hold this
+   install's own launcher; a symlink is never written through, and anything
+   else needs `--force`;
+6. runs the installed `bin/metacodes doctor --strict` in an empty environment
    (POSIX) and requires every runtime asset adjacent and the state root to come
    from the install record.
 
 `scripts/install.sh` (macOS/Linux; default prefix `~/.local/opt/metacodes`,
 launcher in `~/.local/bin`) and `scripts/install.ps1` (Windows; default prefix
 `%LOCALAPPDATA%\Programs\metacodes`, `<prefix>\bin` added to the user PATH
-unless `-NoPath`) only check an archive's `.sha256`, unpack it, and call step
-1–5, so the install logic exists once, in Zig. CI runs both scripts on the
-verified release unit, and release.yml on the archives it publishes.
+unless `-NoPath`) only obtain a unit, check its digests, unpack it, and call
+steps 1–6 with `--upgrade`, so the install logic exists once, in Zig and a
+rerun upgrades. CI runs both scripts on the verified release unit, and
+release.yml on the archives it publishes.
+
+`install.sh` obtains the unit one of three ways:
+
+- **a published release** (no argument; `curl -fsSL
+  https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/install.sh | sh`):
+  the latest tag (the `/releases/latest` redirect, no API call) or
+  `--version`, the host's archive (`aarch64-macos`, `x86_64-linux-gnu`) and the
+  matching AgentCore SDK archive, each checked against the release's
+  `metacodes-<tag>-SHA256SUMS`. `--release-base` names a mirror with the same
+  `download/<tag>/<asset>` layout. A unit whose manifest is not schema 2 (a
+  release before the installer) is refused rather than executed: its
+  executable would read `install` as a prompt;
+- **a checkout** (`--dev`, or `--source <dir>` when piped): kernels,
+  `kernel_pins.py`, `release:verify` and `agentcore:archive`, ReleaseSafe as
+  release.yml builds them, into `<checkout>/zig-out/dev-unit`, installed by
+  default as `~/.local/opt/metacodes-dev` with a `metacodes-dev` launcher;
+- **an archive or unit directory** named on the command line.
+
+A released install and a development install therefore coexist by default,
+with separate prefixes, launchers and state roots. Neither imports an existing
+`~/.metacodes`; when one exists and the new root is empty, the script says how
+to reuse it (`--state-dir ~/.metacodes`, or copying `config.json`, `auth.json`
+and `models.toml`).
 
 ## 5. Kernels in release builds
 
