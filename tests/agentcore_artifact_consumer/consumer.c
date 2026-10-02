@@ -64,6 +64,51 @@ typedef pthread_t thread_handle;
 #endif
 #endif
 
+/* METASK_AGENTCORE_CONSUMER_DYNAMIC (#182): the same consumer, but the API
+ * comes from the bundle's shared library through the platform loader, as a
+ * ctypes or FFI Host obtains it, and nothing links the static library. */
+#if defined(METASK_AGENTCORE_CONSUMER_DYNAMIC)
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+typedef const void *(*agentcore_get_api_fn)(uint32_t);
+static agentcore_get_api_fn loaded_get_api = NULL;
+
+static int load_agentcore(const char *path) {
+#ifdef _WIN32
+    /* The altered search path resolves the DLL's own imports beside it. */
+    HMODULE module = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (module == NULL) {
+        fprintf(stderr, "LoadLibraryExA(%s) failed: %lu\n", path, (unsigned long)GetLastError());
+        return 0;
+    }
+    FARPROC symbol = GetProcAddress(module, "metask_agentcore_get_api");
+    if (symbol == NULL) return 0;
+    loaded_get_api = (agentcore_get_api_fn)(void (*)(void))symbol;
+#else
+    void *module = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (module == NULL) {
+        fprintf(stderr, "dlopen(%s) failed: %s\n", path, dlerror());
+        return 0;
+    }
+    void *symbol = dlsym(module, "metask_agentcore_get_api");
+    if (symbol == NULL) return 0;
+    /* ISO C has no object-to-function pointer conversion; POSIX guarantees
+       the representation, so copy the bytes. */
+    memcpy(&loaded_get_api, &symbol, sizeof(symbol));
+#endif
+    return 1;
+}
+
+static const void *agentcore_get_api(uint32_t requested_abi) {
+    return loaded_get_api(requested_abi);
+}
+#else
+static const void *agentcore_get_api(uint32_t requested_abi) {
+    return metask_agentcore_get_api(requested_abi);
+}
+#endif
+
 static const char RESPONSE_BODY[] =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"c1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
@@ -407,13 +452,25 @@ static void host_stream_release(void *ctx,
     if (detail != NULL) *detail = (metask_agentcore_owned_bytes_v1){0};
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+#if defined(METASK_AGENTCORE_CONSUMER_DYNAMIC)
+    if (argc != 2 || !load_agentcore(argv[1])) {
+        return 9;
+    }
+    const metask_agentcore_api_v1 *discovered =
+        (const metask_agentcore_api_v1 *)agentcore_get_api(METASK_AGENTCORE_ABI_V1);
+    const metask_agentcore_api_v1 *api =
+        metask_agentcore_api_v1_is_compatible(discovered) ? discovered : NULL;
+#else
+    (void)argc;
+    (void)argv;
     const metask_agentcore_api_v1 *api = metask_agentcore_api_v1_discover();
+#endif
     if (api == NULL) {
         return 10;
     }
     const metask_agentcore_api_v1 *raw_api =
-        (const metask_agentcore_api_v1 *)metask_agentcore_get_api(
+        (const metask_agentcore_api_v1 *)agentcore_get_api(
             METASK_AGENTCORE_ABI_V1);
     if (raw_api != api || api->buffer_release != raw_api->buffer_release ||
         api->runtime->create != raw_api->runtime->create ||
@@ -446,8 +503,8 @@ int main(void) {
     if (metask_agentcore_api_v1_is_compatible(&prior_revision)) {
         return 10;
     }
-    if (metask_agentcore_get_api(0) != NULL ||
-        metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1 + 1) != NULL) {
+    if (agentcore_get_api(0) != NULL ||
+        agentcore_get_api(METASK_AGENTCORE_ABI_V1 + 1) != NULL) {
         return 11;
     }
 

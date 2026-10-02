@@ -180,6 +180,7 @@ each other:
 ```text
 <prefix>/agentcore/<resolved-target>/
 ├── lib/<target static-library filename>
+├── lib/<target shared-library filename>
 ├── bin/rg[.exe]
 ├── bin/ripgrep-LICENSE-MIT
 ├── include/metask/agentcore.h
@@ -201,7 +202,8 @@ each other:
 The manifest records vendor/component identity, package and source identity,
 the package target plus producer Zig and Cargo targets, optimization and strip
 settings, binary ABI status/version/revision, system link requirements, the
-declared runtime assets, and SHA-256 for every shipped file. The source-free
+shared library record, the declared runtime assets, and SHA-256 for every
+shipped file. The source-free
 consumer validates those fields,
 the complete manifest file whitelist, and every declared payload hash, then
 applies the declared link inputs to every language probe. Bundles require an
@@ -233,6 +235,30 @@ not load an archive member for a weak definition, and MinGW's libraries do not
 provide it. These link-visible support symbols are not AgentCore ABI entry
 points and carry no consumer stability promise; consumers must not call or
 otherwise depend on them.
+
+Every bundle also carries the same library as a shared library for Hosts that
+can only load one at run time (Python `ctypes`, Node FFI/`koffi`, JNA, .NET
+P/Invoke): `lib/libmetask_agentcore.so`, `lib/libmetask_agentcore.dylib`, or
+`lib/metask_agentcore.dll`. A Host loads that file (on Windows with
+`LoadLibraryEx` and `LOAD_WITH_ALTERED_SEARCH_PATH`, or with the DLL's
+directory on the search path), resolves `metask_agentcore_get_api`, and from
+there uses exactly the C ABI above; the library must stay loaded while any
+Runtime it created exists. Its only ABI export is `metask_agentcore_get_api`
+(ELF hides everything else with a version script). Two toolchain names are
+also present and inert: Zig exports its DLL entry point `_DllMainCRTStartup`
+from a Windows DLL, and its Mach-O linker exports the synthesized
+`__mh_dylib_header` and `___dso_handle`; none is callable ABI. The macOS
+install name is `@rpath/libmetask_agentcore.dylib`, the ELF soname
+`libmetask_agentcore.so`. The manifest's `shared_library` records the path
+(also pinned in `files`), `entry_point`, that load name (`install_name`, null
+on Windows) and `needed`, the libraries the loader must find, read from the
+built image. Bundle assembly refuses a shared library that exports anything
+else or needs anything a clean installation of its OS lacks, with one
+exception: an MSVC-ABI DLL needs the Visual C++ runtime (`VCRUNTIME140.dll`),
+which its Host provides (Python ships it); the `x86_64-windows-gnu` release
+bundle needs only Windows system DLLs. The native gate runs the C consumer a
+second time against the shared library through `dlopen`/`LoadLibraryEx`, with
+no AgentCore link input, from discovery through a complete Run.
 `agentcore:consumer` additionally runs the resulting programs, while
 `agentcore:gate` combines that native consumer check with the ABI test suite
 and runs the Rust ABI link probe plus crate unit tests. macOS bundles are
