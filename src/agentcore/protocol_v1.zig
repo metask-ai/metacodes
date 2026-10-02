@@ -89,8 +89,10 @@ comptime {
 /// Map an internal event to the frozen ABI v1 event set. Returning null is an
 /// explicit decision that an internal-only event does not cross this ABI.
 /// The exhaustive switch makes future CoreEvent additions a compile failure
-/// here instead of an accidental public wire change.
-pub fn event(value: InternalEvent) ?public.CoreEvent {
+/// here instead of an accidental public wire change. Most events borrow the
+/// internal value; `arena` holds what a projection must build (the prompt
+/// manifest's hex digests) until the synchronous callback returns.
+pub fn event(arena: std.mem.Allocator, value: InternalEvent) error{OutOfMemory}!?public.CoreEvent {
     return switch (value) {
         .text_chunk => |v| .{ .text_chunk = v },
         .thinking_chunk => |v| .{ .thinking_chunk = v },
@@ -173,6 +175,7 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
             .bytes = v.bytes,
         } },
         .stream_done => .stream_done,
+        .prompt_manifest => |manifest| .{ .prompt_manifest = try promptManifest(arena, manifest) },
 
         // Presentation hints, diagnostics and App/daemon coordination remain
         // internal. Exporting them would freeze UI policy or implementation
@@ -200,8 +203,30 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
         .tasks_changed,
         .ui_request_pending,
         .ui_request_resolved,
-        .prompt_manifest,
         => null,
+    };
+}
+
+fn promptManifest(arena: std.mem.Allocator, manifest: core.prompt_sections.Manifest) error{OutOfMemory}!public.PromptManifest {
+    const sections = try arena.alloc(public.PromptManifestSection, manifest.entries.len);
+    for (manifest.entries, sections) |entry, *section| section.* = .{
+        .id = entry.id,
+        .order = entry.order,
+        .origin = switch (entry.origin) {
+            .kernel => .kernel,
+            .host => .host,
+        },
+        .class = switch (entry.class) {
+            .locked => .locked,
+            .replaceable => .replaceable,
+            .removable => .removable,
+            .generated => .generated,
+        },
+        .sha256 = try arena.dupe(u8, &std.fmt.bytesToHex(entry.sha256, .lower)),
+    };
+    return .{
+        .sha256 = try arena.dupe(u8, &std.fmt.bytesToHex(manifest.sha256, .lower)),
+        .sections = sections,
     };
 }
 
@@ -330,38 +355,38 @@ pub fn decodeUiResponse(
 }
 
 test "internal-only events are explicitly excluded from ABI v1" {
-    try std.testing.expect(event(.stream_begin) == null);
-    try std.testing.expect(event(.{ .set_current_tool = .{ .name = "Read" } }) == null);
-    try std.testing.expect(event(.clear_current_tool) == null);
+    try std.testing.expect((try event(std.testing.allocator, .stream_begin)) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .set_current_tool = .{ .name = "Read" } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .clear_current_tool)) == null);
     const trace_id = [_]u8{0} ** 12;
-    try std.testing.expect(event(.{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = 0, .turn = 1 } }) == null);
-    try std.testing.expect(event(.{ .diag_turn_end = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .tool_calls = 0 } }) == null);
-    try std.testing.expect(event(.{ .diag_model_request = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .attempt = 1, .elapsed_ms = 2, .outcome = "ok" } }) == null);
-    try std.testing.expect(event(.{ .diag_compact_request = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .elapsed_ms = 2, .outcome = "success", .cause = "threshold" } }) == null);
-    try std.testing.expect(event(.{ .diag_tool_stage = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .tool_calls = 2, .elapsed_ms = 3 } }) == null);
-    try std.testing.expect(event(.{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = 0, .same_err_count = 1 } }) == null);
-    try std.testing.expect(event(.{ .diag_cache_break = .{ .trace_id = trace_id, .depth = 0, .cache_read = 1, .cache_creation = 2 } }) == null);
-    try std.testing.expect(event(.{ .diag_continuation = .{ .trace_id = trace_id, .depth = 0, .n = 1, .max = 2 } }) == null);
-    try std.testing.expect(event(.{ .context_projection = .{
+    try std.testing.expect((try event(std.testing.allocator, .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = 0, .turn = 1 } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .tool_calls = 0 } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .diag_model_request = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .attempt = 1, .elapsed_ms = 2, .outcome = "ok" } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .diag_compact_request = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .elapsed_ms = 2, .outcome = "success", .cause = "threshold" } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .diag_tool_stage = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .tool_calls = 2, .elapsed_ms = 3 } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = 0, .same_err_count = 1 } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .diag_cache_break = .{ .trace_id = trace_id, .depth = 0, .cache_read = 1, .cache_creation = 2 } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = 0, .n = 1, .max = 2 } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .context_projection = .{
         .kind = "large_tool_result_truncation",
         .changed_items = 1,
         .bytes_before = 1024,
         .bytes_after = 512,
         .active_messages = 3,
         .cause = "threshold",
-    } }) == null);
-    try std.testing.expect(event(.{ .policy_decision = .{ .trace_id = trace_id, .depth = 0, .id = "tool-id", .tool = "Bash", .decision = "deny", .source = "settings", .allowed = false } }) == null);
-    try std.testing.expect(event(.{ .diag_run_end = .{ .trace_id = trace_id, .depth = 0, .turns = 1, .tool_calls = 0, .stop_reason_name = "end_turn" } }) == null);
-    try std.testing.expect(event(.{ .config_changed = .{ .model = "x" } }) == null);
-    try std.testing.expect(event(.{ .session_lifecycle = .{ .created = "s" } }) == null);
-    try std.testing.expect(event(.{ .agent_lifecycle = .{ .status = .{
+    } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .policy_decision = .{ .trace_id = trace_id, .depth = 0, .id = "tool-id", .tool = "Bash", .decision = "deny", .source = "settings", .allowed = false } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .diag_run_end = .{ .trace_id = trace_id, .depth = 0, .turns = 1, .tool_calls = 0, .stop_reason_name = "end_turn" } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .config_changed = .{ .model = "x" } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .session_lifecycle = .{ .created = "s" } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .agent_lifecycle = .{ .status = .{
         .id = "a",
         .state = "running",
         .turns = 1,
         .tool_calls = 2,
-    } } }) == null);
-    try std.testing.expect(event(.{ .tasks_changed = .{ .invalidated = {} } }) == null);
-    try std.testing.expect(event(.{ .ui_request_pending = .{ .tool_use_id = "t", .request_json = "{}" } }) == null);
+    } } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .tasks_changed = .{ .invalidated = {} } })) == null);
+    try std.testing.expect((try event(std.testing.allocator, .{ .ui_request_pending = .{ .tool_use_id = "t", .request_json = "{}" } })) == null);
 }
 
 test "plan and custom UI requests are not part of ABI v1" {

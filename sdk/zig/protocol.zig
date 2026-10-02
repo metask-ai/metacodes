@@ -68,7 +68,7 @@ pub const PermissionCandidate = struct {
     target: ?[]const u8,
 };
 
-/// Exact Revision 17 Permission callback request. Unlike AskUserQuestion this
+/// Exact Revision 18 Permission callback request. Unlike AskUserQuestion this
 /// is a flat typed object, identified by `type == "permission"`.
 pub const PermissionRequest = struct {
     type: []const u8,
@@ -222,6 +222,57 @@ pub const OutputSegmentDisposition = enum {
     discarded,
 };
 
+/// Where a section of the system prompt came from (#184).
+pub const PromptSectionOrigin = enum {
+    kernel,
+    host,
+};
+
+/// What a Host may do with a section: `locked` and `generated` never change;
+/// `replaceable` takes new text; `removable` takes new text or is removed.
+pub const PromptSectionClass = enum {
+    locked,
+    replaceable,
+    removable,
+    generated,
+};
+
+/// One section of a rendered system prompt, in render order.
+pub const PromptManifestSection = struct {
+    id: []const u8,
+    order: i64,
+    origin: PromptSectionOrigin,
+    class: PromptSectionClass,
+    /// Lowercase hex SHA-256 of the section text.
+    sha256: []const u8,
+};
+
+/// What a rendered system prompt is made of, and the lowercase hex SHA-256
+/// of the whole prompt.
+pub const PromptManifest = struct {
+    sha256: []const u8,
+    sections: []const PromptManifestSection,
+};
+
+pub const MAX_PROMPT_MANIFEST_SECTIONS_V1: usize = 128;
+
+pub const PromptSectionOp = enum {
+    add,
+    replace,
+    remove,
+};
+
+/// One entry of a Session prompt profile, as `describe` reports it.
+pub const PromptProfileSection = struct {
+    op: PromptSectionOp,
+    id: []const u8,
+    order: i64,
+    text: []const u8,
+    interpolate: bool,
+};
+
+pub const MAX_PROMPT_PROFILE_SECTIONS_V1: usize = 64;
+
 pub const CoreEvent = union(enum) {
     text_chunk: []const u8,
     thinking_chunk: []const u8,
@@ -290,6 +341,10 @@ pub const CoreEvent = union(enum) {
     },
     run_state: RunState,
     permission_provenance: PermissionProvenance,
+    /// The system prompt this Run sends differs from the previous Run's (the
+    /// Session's first Run, a profile change, a model or tool-surface change).
+    /// Delivered once, before the Run's first provider request.
+    prompt_manifest: PromptManifest,
     stream_done,
 };
 
@@ -547,6 +602,12 @@ pub const SessionDescription = struct {
         invalidated_mcp_bindings: u32,
         issues: []const AuthorityIssue,
     },
+    prompt: struct {
+        /// The profile every Run renders from; empty without one.
+        profile: []const PromptProfileSection,
+        /// The latest Run's system prompt; null before the first Run.
+        manifest: ?PromptManifest,
+    },
 };
 
 pub const SkillRestoreDisposition = enum {
@@ -660,6 +721,7 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
         }) catch |err| return normalizeDecodeError(err);
         switch (known) {
             .permission_provenance => |value| try validatePermissionProvenance(value),
+            .prompt_manifest => |value| try validatePromptManifest(value),
             .tool_result => |value| try validateFileReferences(value.file_refs),
             .file_changes => |value| try validateFileChanges(value.changes),
             else => {},
@@ -684,6 +746,47 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
             .payload_json = payload_json,
         } },
     };
+}
+
+fn validPromptSectionId(id: []const u8) bool {
+    const name = if (std.mem.startsWith(u8, id, "metacodes:"))
+        id["metacodes:".len..]
+    else if (std.mem.startsWith(u8, id, "host:"))
+        id["host:".len..]
+    else
+        return false;
+    if (name.len == 0 or name.len > 64 or
+        !(std.ascii.isLower(name[0]) or std.ascii.isDigit(name[0])))
+        return false;
+    for (name) |byte| {
+        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and
+            byte != '.' and byte != '_' and byte != '-')
+            return false;
+    }
+    return true;
+}
+
+fn validatePromptManifest(manifest: PromptManifest) DecodeError!void {
+    if (!lowerHex64(manifest.sha256) or manifest.sections.len > MAX_PROMPT_MANIFEST_SECTIONS_V1)
+        return error.InvalidPayload;
+    for (manifest.sections, 0..) |section, index| {
+        if (!validPromptSectionId(section.id) or !lowerHex64(section.sha256))
+            return error.InvalidPayload;
+        if (index != 0) {
+            const previous = manifest.sections[index - 1];
+            if (previous.order > section.order or (previous.order == section.order and
+                std.mem.order(u8, previous.id, section.id) != .lt))
+                return error.InvalidPayload;
+        }
+    }
+}
+
+fn validatePromptProfile(sections: []const PromptProfileSection) DecodeError!void {
+    if (sections.len > MAX_PROMPT_PROFILE_SECTIONS_V1) return error.InvalidPayload;
+    for (sections) |section| {
+        if (!validPromptSectionId(section.id) or !std.unicode.utf8ValidateSlice(section.text))
+            return error.InvalidPayload;
+    }
 }
 
 fn validateFileReferences(refs: ?[]const FileReference) DecodeError!void {
@@ -1166,6 +1269,8 @@ fn validateSessionDescription(description: SessionDescription) SkillCatalogDecod
         description.restore.invalidated_mcp_bindings,
         description.restore.issues,
     );
+    try validatePromptProfile(description.prompt.profile);
+    if (description.prompt.manifest) |manifest| try validatePromptManifest(manifest);
 }
 
 fn validateRestoreReport(report: RestoreReport) SkillCatalogDecodeError!void {
@@ -1343,6 +1448,7 @@ test "CoreEvent decoder covers every ABI v1 tag" {
         "{\"retry_notice\":{\"attempt\":1,\"max\":2,\"delay_ms\":3}}",
         "{\"run_state\":{\"run_id\":9,\"transition_seq\":1,\"phase\":\"starting\",\"turn\":0,\"tool_calls\":0,\"in_flight_tools\":[]}}",
         "{\"permission_provenance\":{\"decision\":\"allow\",\"source\":\"explicit_allow\",\"matched_rule_id\":null,\"session_id\":\"000000000000000000000001\",\"run_id\":1,\"tool_call_id\":\"tool-1\",\"request_id\":null,\"tool\":{\"namespace\":\"builtin\",\"name\":\"Read\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"policy_generation\":1,\"used_session_rule\":false,\"callback_outcome\":null,\"response\":null}}",
+        "{\"prompt_manifest\":{\"sha256\":\"" ++ "a" ** 64 ++ "\",\"sections\":[{\"id\":\"metacodes:identity\",\"order\":-1000,\"origin\":\"host\",\"class\":\"replaceable\",\"sha256\":\"" ++ "b" ** 64 ++ "\"},{\"id\":\"metacodes:safety-policy\",\"order\":-900,\"origin\":\"kernel\",\"class\":\"locked\",\"sha256\":\"" ++ "c" ** 64 ++ "\"}]}}",
         "{\"stream_done\":{}}",
     };
     try std.testing.expectEqual(std.meta.fields(std.meta.Tag(CoreEvent)).len, cases.len);

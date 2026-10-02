@@ -50,9 +50,13 @@ fn lessThan(_: void, a: Section, b: Section) bool {
     return std.mem.order(u8, a.id, b.id) == .lt;
 }
 
-fn rendered(section: Section) bool {
+/// Whether a section reaches the joined prompt: fixed sections always do,
+/// optional ones only with text.
+pub fn isRendered(section: Section) bool {
     return section.join == .always or section.text.len != 0;
 }
+
+const rendered = isRendered;
 
 /// Sort `sections` in place by `(order, id)` and join them with a blank
 /// line. Ids are unique, so the order is total.

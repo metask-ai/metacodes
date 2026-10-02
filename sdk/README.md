@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 17:
+C ABI v1 revision 18:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -10,8 +10,13 @@ C ABI v1 revision 17:
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 64-byte root, all
-five mandatory typed tables, function slots, and reserved fields. Revision 17 is
+five mandatory typed tables, function slots, and reserved fields. Revision 18 is
 the Agent Runtime surface; it does not expose an independent Completion client.
+`SessionCreateConfigV1.prompt_profile` edits the named system-prompt sections
+(replace the identity, add Host sections; governance sections stay locked) and
+is frozen into the Session and its checkpoints; `session_control->set_prompt_profile`
+replaces it while idle. `RunOptionsV1.context_blocks` adds volatile Host facts to
+one Run as user-role context instead of system-prompt text.
 `session_run_input` accepts text, typed Skill, and multimodal inputs; a
 `RUN_INPUT_MULTIMODAL` Run submits an ordered `RunInputPartV1` array of text and
 base64 image parts, preflighted against the Session model's image capability.

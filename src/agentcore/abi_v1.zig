@@ -13,6 +13,7 @@ pub const mcp_negotiation = @import("mcp_negotiation.zig");
 pub const mcp_session = @import("mcp_session.zig");
 pub const mcp_checkpoint = @import("mcp_checkpoint.zig");
 pub const mcp_canonical = @import("mcp_canonical.zig");
+pub const prompt_checkpoint = @import("prompt_checkpoint.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const process = @import("platform").process;
@@ -838,6 +839,10 @@ const AbiSession = struct {
     },
     last_terminal_kind: session_checkpoint.TerminalKind = .none,
     last_terminal_id: u64 = 0,
+    /// The Session's prompt profile as its checkpoint section (#184); empty
+    /// without a profile. Kept encoded so every durable-usage measurement
+    /// counts it without re-encoding.
+    prompt_checkpoint_section: []u8 = &.{},
 
     const PendingPermission = struct {
         tool_namespace: session_permission.ToolNamespace,
@@ -1560,7 +1565,12 @@ const AbiSession = struct {
         if (!self.observeRunState(session_id, run_id, event))
             return false;
         const callback = self.callbacks.on_event orelse return true;
-        const public_event = protocol_v1.event(event) orelse return true;
+        var event_arena = std.heap.ArenaAllocator.init(allocator);
+        defer event_arena.deinit();
+        const public_event = (protocol_v1.event(event_arena.allocator(), event) catch {
+            self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
+            return false;
+        }) orelse return true;
         const json = encodePublicEventJson(allocator, public_event) catch {
             self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
             return false;
@@ -2199,6 +2209,7 @@ const AbiSession = struct {
                 .permission = permission_state,
                 .mcp = mcp_state,
             },
+            .prompt_profile = self.prompt_checkpoint_section,
         }, self.budget_state.profile.checkpointLimits());
     }
 
@@ -2386,6 +2397,7 @@ const AbiSession = struct {
             skill_state: []const u8,
             permission_state: []const u8,
             mcp_state: []const u8,
+            prompt_profile: []const u8,
 
             fn allows(
                 raw: *anyopaque,
@@ -2409,6 +2421,7 @@ const AbiSession = struct {
                         .permission = guard.permission_state,
                         .mcp = guard.mcp_state,
                     },
+                    .prompt_profile = guard.prompt_profile,
                 }, guard.profile.checkpointLimits()) catch {
                     guard.controller.failReplacementBudget(
                         guard.profile.hard_bytes +| 1,
@@ -2435,6 +2448,7 @@ const AbiSession = struct {
             .skill_state = skill_state,
             .permission_state = permission_state,
             .mcp_state = mcp_state,
+            .prompt_profile = self.prompt_checkpoint_section,
         };
         const report = try self.core_session.compactUsingBorrowedProvider(
             operation_id,
@@ -2565,6 +2579,7 @@ const AbiSession = struct {
                 .permission = permission_state,
                 .mcp = mcp_state,
             },
+            .prompt_profile = self.prompt_checkpoint_section,
         }, bounded_limits, sink);
         self.commitCheckpointGeneration(next_generation);
         self.budget_state.commitVerifiedUsage(report.total_bytes);
@@ -2617,6 +2632,11 @@ const AbiSession = struct {
             a,
             if (self.authority_issues) |*issues| issues.items else &.{},
         );
+        const prompt_profile = try session_authority.cloneProfile(a, self.core_session.promptProfile());
+        const prompt_manifest = if (self.core_session.lastPromptManifest()) |manifest|
+            try session_authority.cloneManifest(a, manifest)
+        else
+            null;
         return .{
             .arena = description_arena,
             .session_id = lease.session_id,
@@ -2646,6 +2666,8 @@ const AbiSession = struct {
             .invalidated_skill_authority = self.invalidated_skill_authority,
             .invalidated_permission_rules = self.invalidated_permission_rules,
             .invalidated_mcp_bindings = self.invalidated_mcp_bindings,
+            .prompt_profile = prompt_profile,
+            .prompt_manifest = prompt_manifest,
         };
     }
 
@@ -2776,6 +2798,22 @@ const AbiSession = struct {
             model.len,
         );
         try self.core_session.setModel(model);
+        self.commitDurableReplacement(projected);
+    }
+
+    /// The profile is part of durable state: its checkpoint section is
+    /// admitted against the budget like any other replacement.
+    fn setPromptProfileAdmitted(self: *AbiSession, profile: core.prompt_sections.Profile) !void {
+        if (self.core_session.promptProfile().eql(profile)) return;
+        const replacement = try prompt_checkpoint.encode(allocator, profile);
+        errdefer allocator.free(replacement);
+        const projected = try self.admitDurableReplacement(
+            self.prompt_checkpoint_section.len,
+            replacement.len,
+        );
+        try self.core_session.setPromptProfile(profile);
+        allocator.free(self.prompt_checkpoint_section);
+        self.prompt_checkpoint_section = replacement;
         self.commitDurableReplacement(projected);
     }
 
@@ -4070,6 +4108,99 @@ fn parseMultimodalParts(
     return parsed;
 }
 
+/// Wire validation of a prompt profile: layouts, codes and limits, every
+/// length bounded before its pointer is read. The profile's own rules are
+/// `refusePromptProfile`'s. Slices borrow the Host's memory for the call.
+fn parsePromptProfile(
+    arena: std.mem.Allocator,
+    raw_ptr: ?*const wire.PromptProfileV1,
+) !core.prompt_sections.Profile {
+    const raw = raw_ptr orelse return .{};
+    if (raw.struct_size != @sizeOf(wire.PromptProfileV1) or raw.reserved0 != 0 or !allZero(raw.reserved))
+        return error.InvalidPromptProfile;
+    if (raw.section_count == 0) {
+        if (raw.sections != null) return error.InvalidPromptProfile;
+        return .{};
+    }
+    if (raw.section_count > wire.MAX_PROMPT_PROFILE_SECTIONS_V1) return error.ResourceLimit;
+    const count: usize = @intCast(raw.section_count);
+    const raw_sections = (raw.sections orelse return error.InvalidPromptProfile)[0..count];
+    var total: u64 = 0;
+    for (raw_sections) |section| {
+        if (section.struct_size != @sizeOf(wire.PromptSectionV1) or section.reserved0 != 0 or
+            !allZero(section.reserved) or section.interpolate > 1)
+            return error.InvalidPromptProfile;
+        if (section.id.len > core.prompt_sections.kernel_prefix.len + core.prompt_sections.max_id_name_bytes or
+            section.text.len > wire.MAX_PROMPT_SECTION_TEXT_BYTES_V1)
+            return error.ResourceLimit;
+        total += section.text.len;
+        if (total > wire.MAX_PROMPT_PROFILE_TEXT_BYTES_V1) return error.ResourceLimit;
+    }
+    const sections = try arena.alloc(core.prompt_sections.ProfileSection, count);
+    for (raw_sections, sections) |section, *out| {
+        // An empty view is canonical: the profile's rules then decide.
+        if ((section.id.len == 0 and section.id.ptr != null) or
+            (section.text.len == 0 and section.text.ptr != null))
+            return error.InvalidPromptProfile;
+        out.* = .{
+            .op = switch (section.op_code) {
+                wire.PROMPT_OP_ADD => .add,
+                wire.PROMPT_OP_REPLACE => .replace,
+                wire.PROMPT_OP_REMOVE => .remove,
+                else => return error.InvalidPromptProfile,
+            },
+            .id = try text(section.id),
+            .order = section.order,
+            .text = try text(section.text),
+            .interpolate = section.interpolate == 1,
+        };
+    }
+    return .{ .sections = sections };
+}
+
+/// INVALID_ARGUMENT naming the entry and the rule when the kernel refuses the
+/// profile, else null.
+fn refusePromptProfile(profile: core.prompt_sections.Profile, out_error: ?*wire.OwnedBytesV1) ?u32 {
+    const diagnostic = core.system_prompt.validateProfile(profile) orelse return null;
+    var buf: [512]u8 = undefined;
+    const message = std.fmt.bufPrint(&buf, "{f}", .{diagnostic}) catch "invalid prompt profile";
+    return fail(wire.STATUS_INVALID_ARGUMENT, message, out_error);
+}
+
+/// Wire validation of a Run's context blocks, bounded like the profile. The
+/// blocks' own rules are checked by `core.context_blocks.validate`.
+fn parseContextBlocks(
+    arena: std.mem.Allocator,
+    blocks_ptr: ?[*]const wire.ContextBlockV1,
+    block_count: u64,
+) ![]core.context_blocks.Block {
+    if (block_count == 0) {
+        if (blocks_ptr != null) return error.InvalidContextBlocks;
+        return &.{};
+    }
+    if (block_count > wire.MAX_CONTEXT_BLOCKS_V1) return error.ResourceLimit;
+    const count: usize = @intCast(block_count);
+    const raw_blocks = (blocks_ptr orelse return error.InvalidContextBlocks)[0..count];
+    var total: u64 = 0;
+    for (raw_blocks) |block| {
+        if (block.struct_size != @sizeOf(wire.ContextBlockV1) or block.reserved0 != 0 or !allZero(block.reserved))
+            return error.InvalidContextBlocks;
+        if (block.label.len > wire.MAX_CONTEXT_BLOCK_LABEL_BYTES_V1 or
+            block.text.len > wire.MAX_CONTEXT_BLOCK_TEXT_BYTES_V1)
+            return error.ResourceLimit;
+        total += block.label.len + block.text.len;
+        if (total > wire.MAX_CONTEXT_BLOCKS_TOTAL_BYTES_V1) return error.ResourceLimit;
+    }
+    const blocks = try arena.alloc(core.context_blocks.Block, count);
+    for (raw_blocks, blocks) |block, *out| {
+        if ((block.label.len == 0 and block.label.ptr != null) or
+            (block.text.len == 0 and block.text.ptr != null))
+            return error.InvalidContextBlocks;
+        out.* = .{ .label = try text(block.label), .text = try text(block.text) };
+    }
+    return blocks;
+}
+
 fn ownedSlice(v: wire.OwnedBytesV1) error{ InvalidArgument, Overflow }![]const u8 {
     return borrowed(.{ .ptr = v.ptr, .len = v.len });
 }
@@ -4224,6 +4355,7 @@ fn sessionMutationStatus(err: anyerror) u32 {
         error.InvalidSessionState, error.SkillCatalogNotBound, error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
         error.InvalidModel,
         error.InvalidRule,
+        error.InvalidPromptProfile,
         error.InvalidSkillId,
         error.DuplicateSkillId,
         error.ForeignSkillId,
@@ -5467,6 +5599,8 @@ const SessionBuildConfig = struct {
     authority_issue_seeds: []const session_authority.AuthorityIssueSeed = &.{},
     budget_profile: session_budget.Profile = .{},
     run_journal: core.agent_session.RunJournalConfig = .ephemeral,
+    /// Validated; borrowed for the call.
+    prompt_profile: core.prompt_sections.Profile = .{},
 };
 
 const RestoreHostConfig = struct {
@@ -5651,6 +5785,9 @@ fn buildAbiSession(
     );
     var keep_authority_issues = false;
     defer if (!keep_authority_issues) authority_issues.deinit();
+    const prompt_section = try prompt_checkpoint.encode(allocator, config.prompt_profile);
+    var keep_prompt_section = false;
+    defer if (!keep_prompt_section) allocator.free(prompt_section);
     const self = try allocator.create(AbiSession);
     errdefer allocator.destroy(self);
     self.* = .{
@@ -5702,16 +5839,19 @@ fn buildAbiSession(
             decoded.descriptor.terminal_id
         else
             0,
+        .prompt_checkpoint_section = prompt_section,
     };
     keep_permission_state = true;
     keep_permission_audit = true;
     keep_authority_issues = true;
     keep_mcp_selection = true;
+    keep_prompt_section = true;
     errdefer {
         if (self.mcp_selection) |*selection| selection.deinit();
         if (self.permission_audit) |*audit| audit.deinit();
         if (self.authority_issues) |*issues| issues.deinit();
         self.permission_state.deinit();
+        allocator.free(self.prompt_checkpoint_section);
     }
 
     const openai_protocol = coreOpenAiProtocol(
@@ -5735,6 +5875,7 @@ fn buildAbiSession(
         // process-stdin fallback or an answered deny.
         .run_ui_requester = .{ .ctx = self, .requestFn = AbiSession.requestUi },
         .host_identity_ctx = self,
+        .prompt_profile = config.prompt_profile,
     };
     self.core_session = if (config.restored) |decoded|
         try runtime.core_runtime.createRestoredSession(core_config, .{
@@ -5794,6 +5935,17 @@ fn restoreCheckpoint(
         limits,
     );
     defer decoded.deinit();
+    // The checkpoint's profile, not the Host's: a restored Session renders the
+    // system prompt it rendered before.
+    var restored_prompt_profile = prompt_checkpoint.decode(
+        allocator,
+        decoded.prompt_profile,
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Corrupt,
+        error.Unsupported => error.UnsupportedSchema,
+    };
+    defer restored_prompt_profile.deinit();
     var restored_permission = try session_authority.decodePermissionState(
         allocator,
         decoded.permission_state,
@@ -6043,6 +6195,7 @@ fn restoreCheckpoint(
         .authority_issue_seeds = authority_issue_seeds.items,
         .budget_profile = config.budget_profile,
         .run_journal = config.run_journal,
+        .prompt_profile = restored_prompt_profile.profile(),
     });
     keep_binding = true;
     return .{
@@ -6084,6 +6237,27 @@ const SessionMcpToolJson = struct {
     negotiated_protocol: []const u8,
 };
 
+const PromptProfileSectionJson = struct {
+    op: []const u8,
+    id: []const u8,
+    order: i64,
+    text: []const u8,
+    interpolate: bool,
+};
+
+const PromptManifestSectionJson = struct {
+    id: []const u8,
+    order: i64,
+    origin: []const u8,
+    class: []const u8,
+    sha256: []const u8,
+};
+
+const PromptManifestJson = struct {
+    sha256: []const u8,
+    sections: []const PromptManifestSectionJson,
+};
+
 const SessionDescriptionJson = struct {
     schema: []const u8 = "agentcore.session-description/v1",
     session_id: []const u8,
@@ -6122,6 +6296,10 @@ const SessionDescriptionJson = struct {
         invalidated_permission_rules: u32,
         invalidated_mcp_bindings: u32,
         issues: []const AuthorityIssueJson,
+    },
+    prompt: struct {
+        profile: []const PromptProfileSectionJson,
+        manifest: ?PromptManifestJson,
     },
 };
 
@@ -6199,6 +6377,14 @@ fn encodeSessionDescription(
         .permission_binding = try lowerHexAlloc(a, &tool.permission_binding),
         .negotiated_protocol = tool.era.version(),
     };
+    const profile = try a.alloc(PromptProfileSectionJson, description.prompt_profile.sections.len);
+    for (description.prompt_profile.sections, profile) |section, *dto| dto.* = .{
+        .op = @tagName(section.op),
+        .id = section.id,
+        .order = section.order,
+        .text = section.text,
+        .interpolate = section.interpolate,
+    };
     const dto = SessionDescriptionJson{
         .session_id = description.session_id.asSlice(),
         .origin = @tagName(description.origin),
@@ -6240,6 +6426,13 @@ fn encodeSessionDescription(
             .invalidated_mcp_bindings = description.invalidated_mcp_bindings,
             .issues = try encodeAuthorityIssues(a, description.authority_issues),
         },
+        .prompt = .{
+            .profile = profile,
+            .manifest = if (description.prompt_manifest) |manifest|
+                try encodePromptManifest(a, manifest)
+            else
+                null,
+        },
     };
     const encoded = stringifyJson(output_allocator, dto) catch
         return error.OutOfMemory;
@@ -6248,6 +6441,21 @@ fn encodeSessionDescription(
         return error.ResourceLimit;
     }
     return encoded;
+}
+
+fn encodePromptManifest(
+    a: std.mem.Allocator,
+    manifest: core.prompt_sections.Manifest,
+) !PromptManifestJson {
+    const sections = try a.alloc(PromptManifestSectionJson, manifest.entries.len);
+    for (manifest.entries, sections) |entry, *dto| dto.* = .{
+        .id = entry.id,
+        .order = entry.order,
+        .origin = @tagName(entry.origin),
+        .class = @tagName(entry.class),
+        .sha256 = try lowerHexAlloc(a, &entry.sha256),
+    };
+    return .{ .sha256 = try lowerHexAlloc(a, &manifest.sha256), .sections = sections };
 }
 
 fn encodeRestoreReport(
@@ -6390,6 +6598,9 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     ) catch |err| return failError(inputErrorStatus(err), err, out_error);
     const budget_profile = parseDurableBudget(host.durable_budget) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
+    const prompt_profile = parsePromptProfile(scratch.allocator(), config.prompt_profile) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    if (refusePromptProfile(prompt_profile, out_error)) |status| return status;
     if (shell == .sandboxed) {
         sandbox_admission.validate(allocator) catch |err| return failError(
             if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT,
@@ -6414,6 +6625,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .mcp_selectors = initial_mcp_selection,
         .budget_profile = budget_profile,
         .run_journal = run_journal,
+        .prompt_profile = prompt_profile,
     }) catch |err| {
         return failError(
             if (err == error.OutOfMemory)
@@ -6653,6 +6865,7 @@ fn deinitAbiSession(self: *AbiSession, runtime: *AbiRuntime) void {
     if (self.permission_audit) |*audit| audit.deinit();
     if (self.authority_issues) |*issues| issues.deinit();
     self.permission_state.deinit();
+    allocator.free(self.prompt_checkpoint_section);
     allocator.destroy(self);
 }
 
@@ -6702,6 +6915,29 @@ fn sessionSetModel(
     const model = text(model_view) catch |err|
         return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     self.setModelAdmitted(model) catch |err|
+        return failError(sessionMutationStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
+fn sessionSetPromptProfile(
+    handle: ?*wire.SessionHandle,
+    profile_ptr: ?*const wire.PromptProfileV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const profile = parsePromptProfile(scratch.allocator(), profile_ptr) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    if (refusePromptProfile(profile, out_error)) |status| return status;
+    self.setPromptProfileAdmitted(profile) catch |err|
         return failError(sessionMutationStatus(err), err, out_error);
     return wire.STATUS_OK;
 }
@@ -6854,6 +7090,28 @@ fn sessionRunInput(
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid run id, RunInputV1, or RunOptionsV1", out_error);
     if (options.max_turns > wire.MAX_TURNS_V1)
         return fail(wire.STATUS_RESOURCE_LIMIT, "max_turns exceeds AgentCore ABI v1 limit", out_error);
+    // Host context blocks become one <system-reminder> text part leading the
+    // Run's user record: conversation content, so later requests keep it in
+    // their cached prefix and checkpoints keep it byte for byte.
+    var context_scratch = std.heap.ArenaAllocator.init(allocator);
+    defer context_scratch.deinit();
+    const context_blocks = parseContextBlocks(
+        context_scratch.allocator(),
+        options.context_blocks,
+        options.context_block_count,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    if (core.context_blocks.validate(context_blocks, .{})) |diagnostic| {
+        var buf: [256]u8 = undefined;
+        return fail(
+            wire.STATUS_INVALID_ARGUMENT,
+            std.fmt.bufPrint(&buf, "{f}", .{diagnostic}) catch "invalid context block",
+            out_error,
+        );
+    }
+    const context_reminder = core.context_blocks.render(context_scratch.allocator(), context_blocks) catch
+        return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+    if (context_reminder != null and input.kind_code == wire.RUN_INPUT_SKILL)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "context blocks are not accepted with SkillInvocation input", out_error);
     const execution: SkillExecution = switch (input.kind_code) {
         wire.RUN_INPUT_TEXT => text_run: {
             if (!canonicalEmpty(input.skill_id) or !canonicalEmpty(input.catalog_revision) or
@@ -6865,12 +7123,24 @@ fn sessionRunInput(
                 return fail(wire.STATUS_RESOURCE_LIMIT, "prompt exceeds AgentCore ABI v1 limit", out_error);
             const prompt = text(input.text) catch |err|
                 return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-            const text_execution = self.runTextWithBoundSkills(
-                &runtime.materializations,
-                run_id,
-                prompt,
-                options.max_turns,
-            ) catch |err| {
+            const context_parts = [_]core.message.UserContentPart{
+                .{ .text = context_reminder orelse "" },
+                .{ .text = prompt },
+            };
+            const text_execution = (if (context_reminder == null)
+                self.runTextWithBoundSkills(
+                    &runtime.materializations,
+                    run_id,
+                    prompt,
+                    options.max_turns,
+                )
+            else
+                self.runMultimodalWithBoundSkills(
+                    &runtime.materializations,
+                    run_id,
+                    if (prompt.len == 0) context_parts[0..1] else &context_parts,
+                    options.max_turns,
+                )) catch |err| {
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
                 return self.reconcileRunFailure(
@@ -6936,6 +7206,13 @@ fn sessionRunInput(
                 input.part_count,
                 &has_image,
             ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+            const record_parts = if (context_reminder) |reminder| with_context: {
+                const all = scratch.allocator().alloc(core.message.UserContentPart, parts.len + 1) catch
+                    return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+                all[0] = .{ .text = reminder };
+                @memcpy(all[1..], parts);
+                break :with_context all;
+            } else parts;
             // Capability preflight (single truth: ModelProfile.supports_image_input).
             // Rejection happens before admission and before any Provider request,
             // so the Run ID stays reusable and Conversation is untouched.
@@ -6948,7 +7225,7 @@ fn sessionRunInput(
             const multimodal_execution = self.runMultimodalWithBoundSkills(
                 &runtime.materializations,
                 run_id,
-                parts,
+                record_parts,
                 options.max_turns,
             ) catch |err| {
                 if (err == error.CheckpointBudgetRequired)
@@ -7226,6 +7503,7 @@ const session_control_api_v1 = wire.SessionControlApiV1{
     .compact = sessionCompact,
     .abort_compact = sessionAbortCompact,
     .export_checkpoint = sessionExportCheckpoint,
+    .set_prompt_profile = sessionSetPromptProfile,
 };
 
 const skill_api_v1 = wire.SkillApiV1{
@@ -7456,7 +7734,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 17), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 18), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 64), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);

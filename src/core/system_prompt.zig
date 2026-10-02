@@ -580,6 +580,43 @@ pub fn buildFullWithDefs(
     return renderKernel(allocator, &generated);
 }
 
+/// The sections `buildFullWithDefs` joins, in render order, with the digest of
+/// the joined prompt: `metacodes --dump-prompt --sections` (#184).
+pub const SectionListing = struct {
+    arena: std.heap.ArenaAllocator,
+    sections: []const prompt_sections.Section,
+    sha256: [32]u8,
+
+    pub fn deinit(self: *SectionListing) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn listFullWithDefs(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    skills: ?*const @import("../skills/skill.zig").SkillSet,
+    agents: ?*const @import("../agents/set.zig").AgentSet,
+    enabled_tool_names: ?[]const []const u8,
+    memdir_abs: []const u8,
+    kg_ready: bool,
+    cwd: []const u8,
+    tool_defs: ?[]const @import("../json.zig").ToolDefinition,
+) !SectionListing {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const generated = try GeneratedSections.init(a, model, skills, agents, enabled_tool_names, memdir_abs, kg_ready, cwd, tool_defs, true);
+    var kernel = kernelSections(&generated, true);
+    const joined = try prompt_sections.renderWithManifest(a, &kernel, prompt_sections.separator);
+    var listed: std.ArrayList(prompt_sections.Section) = .empty;
+    for (kernel) |section| {
+        if (prompt_sections.isRendered(section)) try listed.append(a, section);
+    }
+    return .{ .arena = arena, .sections = listed.items, .sha256 = joined.manifest.sha256 };
+}
+
 /// The section texts a build derives from Session facts: tool set, Skills,
 /// subagents, memory, TinyKG readiness and the environment.
 const GeneratedSections = struct {
@@ -1602,6 +1639,28 @@ test "without a profile the Session prompt is the historical build" {
         for (rendered.manifest.entries) |entry| try testing.expectEqual(prompt_sections.Origin.kernel, entry.origin);
         try testing.expectEqualSlices(u8, &prompt_sections.sha256(expected), &rendered.manifest.sha256);
     }
+}
+
+test "the section listing joins to the built prompt" {
+    const a = testing.allocator;
+    const defs = try allToolDefinitions(a);
+    defer a.free(defs);
+    const names = try toolNames(a, defs);
+    defer a.free(names);
+    const built = try buildFullWithDefs(a, "claude-opus-4-7", null, null, names, "/tmp/metacodes-memdir", true, "/tmp", defs);
+    defer a.free(built);
+    var listing = try listFullWithDefs(a, "claude-opus-4-7", null, null, names, "/tmp/metacodes-memdir", true, "/tmp", defs);
+    defer listing.deinit();
+    try testing.expectEqualSlices(u8, &prompt_sections.sha256(built), &listing.sha256);
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(a);
+    for (listing.sections, 0..) |section, index| {
+        if (index != 0) try joined.appendSlice(a, prompt_sections.separator);
+        try joined.appendSlice(a, section.text);
+        if (index != 0) try testing.expect(listing.sections[index - 1].order < section.order);
+    }
+    try testing.expectEqualStrings(built, joined.items);
+    try testing.expectEqualStrings("metacodes:identity", listing.sections[0].id);
 }
 
 test "doing-tasks keeps its pre-#184 bytes" {

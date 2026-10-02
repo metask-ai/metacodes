@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 17;
+pub const ABI_REVISION: u32 = 18;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 17 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 18 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -235,6 +235,22 @@ pub const MAX_SKILL_SOURCES_V1: u64 = 64;
 pub const MAX_SKILL_SOURCE_ID_BYTES_V1: u64 = 128;
 pub const MAX_PROCESS_PLUGIN_SOURCES_V1: u64 = 64;
 pub const MAX_TURNS_V1: u32 = 1000;
+/// Prompt profile limits (#184): entries, one section's text, and every
+/// entry's text together. Ids are `metacodes:<name>` or `host:<name>` with a
+/// name of at most 64 bytes.
+pub const MAX_PROMPT_PROFILE_SECTIONS_V1: u64 = 64;
+pub const MAX_PROMPT_SECTION_TEXT_BYTES_V1: u64 = 64 * 1024;
+pub const MAX_PROMPT_PROFILE_TEXT_BYTES_V1: u64 = 256 * 1024;
+/// Per-Run context block limits: blocks, one label, one text, and every
+/// label and text together.
+pub const MAX_CONTEXT_BLOCKS_V1: u64 = 32;
+pub const MAX_CONTEXT_BLOCK_LABEL_BYTES_V1: u64 = 64;
+pub const MAX_CONTEXT_BLOCK_TEXT_BYTES_V1: u64 = 64 * 1024;
+pub const MAX_CONTEXT_BLOCKS_TOTAL_BYTES_V1: u64 = 256 * 1024;
+
+pub const PROMPT_OP_ADD: u32 = 1;
+pub const PROMPT_OP_REPLACE: u32 = 2;
+pub const PROMPT_OP_REMOVE: u32 = 3;
 
 pub const PLUGIN_LAYER_BUILTIN: u32 = 1;
 pub const PLUGIN_LAYER_PERSONAL: u32 = 2;
@@ -737,12 +753,56 @@ pub const SessionHostConfigV1 = extern struct {
     reserved: [3]u64,
 };
 
+/// One edit of the kernel system-prompt sections (#184).
+/// - PROMPT_OP_ADD: a `host:<name>` section with non-empty `text`, placed by
+///   `order` (ties broken by id).
+/// - PROMPT_OP_REPLACE: a replaceable or removable `metacodes:<name>` section
+///   takes non-empty `text`; `order` is zero.
+/// - PROMPT_OP_REMOVE: a removable `metacodes:<name>` section; `text` is
+///   canonical empty, `order` and `interpolate` zero.
+/// `interpolate` is 0 or 1; with 1, `{{model}}`, `{{workspace_root}}` and
+/// `{{platform}}` are substituted and any other `{{...}}` refuses the profile.
+pub const PromptSectionV1 = extern struct {
+    struct_size: u32,
+    op_code: u32,
+    id: BytesViewV1,
+    order: i64,
+    text: BytesViewV1,
+    interpolate: u32,
+    reserved0: u32,
+    reserved: [2]u64,
+};
+
+/// A Session prompt profile: edits applied in order to the kernel sections.
+/// Borrowed for the synchronous call. Null, or zero sections, is the kernel
+/// prompt byte for byte.
+pub const PromptProfileV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    sections: ?[*]const PromptSectionV1,
+    section_count: u64,
+    reserved: [4]u64,
+};
+
+/// One Host fact for a single Run (#184): rendered with the Run's other blocks
+/// into one `<system-reminder>` text that leads the Run's user record.
+pub const ContextBlockV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    label: BytesViewV1,
+    text: BytesViewV1,
+    reserved: [2]u64,
+};
+
 pub const SessionCreateConfigV1 = extern struct {
     struct_size: u32,
     reserved0: u32,
     host: ?*const SessionHostConfigV1,
     model: BytesViewV1,
-    reserved: [4]u64,
+    /// Optional. Frozen into the Session (and its checkpoints) at creation;
+    /// replaced only through `set_prompt_profile` while idle.
+    prompt_profile: ?*const PromptProfileV1,
+    reserved: [3]u64,
 };
 
 /// One additional directory using the canonical Agent Skill format. Registering
@@ -802,7 +862,12 @@ pub const RunInputV1 = extern struct {
 pub const RunOptionsV1 = extern struct {
     struct_size: u32,
     max_turns: u32,
-    reserved: [4]u64,
+    /// Optional per-Run Host context for RUN_INPUT_TEXT and
+    /// RUN_INPUT_MULTIMODAL, borrowed for the synchronous call. Null with
+    /// zero count adds nothing.
+    context_blocks: ?[*]const ContextBlockV1,
+    context_block_count: u64,
+    reserved: [2]u64,
 };
 
 /// Terminal Run summary. All fields are defined on STATUS_OK. On
@@ -1006,7 +1071,17 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 17 accepts
+/// Replaces the prompt profile while the Session is idle (#184). Null clears
+/// it. The next Run renders its system prompt from the new profile: one
+/// prompt-cache boundary, announced by that Run's `prompt_manifest` event.
+/// An invalid profile returns INVALID_ARGUMENT with a diagnostic naming the
+/// entry and the rule, and leaves the Session unchanged.
+pub const SessionSetPromptProfileFnV1 = *const fn (
+    session: ?*SessionHandle,
+    profile: ?*const PromptProfileV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+/// Runs the canonical default best-effort compact policy. Revision 18 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1055,6 +1130,7 @@ pub const SessionControlApiV1 = extern struct {
     compact: ?SessionCompactFnV1,
     abort_compact: ?SessionAbortCompactFnV1,
     export_checkpoint: ?SessionExportCheckpointFnV1,
+    set_prompt_profile: ?SessionSetPromptProfileFnV1,
 };
 
 pub const SkillApiV1 = extern struct {
@@ -1113,6 +1189,9 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(McpSelectionV1));
     try std.testing.expectEqual(@as(usize, 112), @sizeOf(DurableBudgetProfileV1));
     try std.testing.expectEqual(@as(usize, 168), @sizeOf(SessionHostConfigV1));
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(PromptSectionV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(PromptProfileV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(ContextBlockV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionCreateConfigV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SkillSourceV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(SkillCatalogQueryV1));
@@ -1129,7 +1208,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionRestoreConfigV1));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(RuntimeApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(SessionApiV1));
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionControlApiV1));
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionControlApiV1));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(SkillApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpApiV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(ApiV1));
@@ -1162,6 +1241,20 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 144), @offsetOf(SessionHostConfigV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SessionCreateConfigV1, "host"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionCreateConfigV1, "model"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(SessionCreateConfigV1, "prompt_profile"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(SessionCreateConfigV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(PromptSectionV1, "id"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(PromptSectionV1, "order"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(PromptSectionV1, "text"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(PromptSectionV1, "interpolate"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(PromptSectionV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(PromptProfileV1, "sections"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(PromptProfileV1, "section_count"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(ContextBlockV1, "label"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(ContextBlockV1, "text"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunOptionsV1, "context_blocks"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunOptionsV1, "context_block_count"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(SessionControlApiV1, "set_prompt_profile"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillPolicyV1, "granted_skill_ids"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(PermissionRuleSetV1, "allow"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(PermissionRuleSetV1, "ask"));
@@ -1231,9 +1324,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 17 keeps MCP wire codes stable" {
+test "Revision 18 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 17), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 18), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

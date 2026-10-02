@@ -117,7 +117,7 @@ dylib 加载，也不把活跃 Session 的 catalog 改写为新代。
 `Registrar.provide(T, local_name, pointer, cleanup)`，consumer 只有在 descriptor 的
 `requires` 明确包含 provider 时，才能用相同 `T` 与 key 调用 `require`。解析发生在
 依赖拓扑序 activation 中；consumer 把返回指针注入自己的 Host tool/context，commit
-之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 17 C ABI，也不暴露任何内核
+之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 18 C ABI，也不暴露任何内核
 service。
 
 `advisory_hook` capability 接受一个 `StaticPlugin.advisory_policy`。它是同步、借用、
@@ -255,6 +255,24 @@ result 的闭合对；fork Skill 也通过 `RunExecutionEvidence` 进入同一�
 原地恢复。journal、replay metadata 和 effect driver 都不进入 Conversation、system
 prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
 
+### System prompt profile
+
+`SessionConfig.prompt_profile`（`core.prompt_sections.Profile`）按 id 编辑内核的命名
+提示词段：`add` 一个 `host:*` 段、`replace` 一个可替换/可移除段的文本、`remove` 一个
+可移除段；安全策略与 system 段锁定，env 段由内核生成。`AgentSession.create` 先用
+`system_prompt.validateProfile` 校验（返回第一条违规的 `Diagnostic`），无效即
+`error.InvalidPromptProfile`，有效则复制一份冻结在 Session 里；`setPromptProfile`
+只在 idle 时替换，下一个 Run 恰好形成一次缓存边界。替换 `metacodes:identity` 时，
+属于内核身份的句子（env 的产品行、doing-tasks 的定位与帮助条目）一并退出。
+
+每个 Run 的提示词由 `system_prompt.renderSessionPrompt` 渲染，同时得到
+`prompt_sections.Manifest`（各段 id/order/origin/class/sha256 与整体 sha256）：durable
+journal 的 `run_started.prompt` 记下它；与上一个 Run 不同时，Run 开始、首个 provider
+请求之前发 `CoreEvent.prompt_manifest`。子 agent 与 fork Skill 经
+`AgentSession.renderSubagentPrompt` 继承档案（`metacodes:subagent` 可替换）。易变的
+Host 事实不写进档案：`core.context_blocks` 把它们渲染成一条 `<system-reminder>`，
+作为该 Run 用户记录的首段进入 Conversation。
+
 ## 2. 插件清单协议
 
 同一份只读 JSON 可从三种 Host 入口获取：
@@ -278,10 +296,10 @@ admission。
 AgentCore 面向不把 metacodes 源码加入构建图的原生 Host(C11 / C++17 / Zig /
 Rust:同一 C Header + 静态库 + bindings)。消费入口只有
 `metask_agentcore_get_api(uint32_t requested_abi)`。
-当前是实验性的 ABI v1 revision 17。Host 必须同时校验 abi version、精确
+当前是实验性的 ABI v1 revision 18。Host 必须同时校验 abi version、精确
 revision、64 字节根表、五张必选 typed 子表、reserved fields 和 manifest hash;
 不存在静默降级或旧 revision shim。
-revision 17 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
+revision 18 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
 工具、MCP 流式响应、journal profile,以及全部 ownership、回调重入、Session
 poison、并发与持久化语义,只以同 revision 的 Header 与
 [`AGENTCORE_BINARY_ABI.md`](AGENTCORE_BINARY_ABI.md)(Contract 一节及其子节)
@@ -304,7 +322,7 @@ agentcore:gate`)的命令、库文件名与按 target 的发布状态矩阵,见
 | 审计当前数据插件组合 | plugin inventory JSON |
 | 浏览器/桌面壳 | Web HTTP + SSE + typed request 回填 |
 | 不带源码的 C/C++/Zig/Rust 原生产品 | 精确 pinned AgentCore bundle |
-| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 17 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
+| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 18 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
 | 不可信/多租户可执行插件 | 暂不支持；process v1 是故障/资源边界，不是 OS sandbox |
 
 这些入口改变的是 Host 表达和扩展组合，不是 agent loop 的因果所有权。

@@ -3766,7 +3766,8 @@ test "AdmittedRun isolated executor shares identity and commits only final assis
         self.session_id.asSlice(),
         executor.seen_session.?.asSlice(),
     );
-    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    // The Session's prompt_manifest for the isolated Run, then the executor's two.
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
     try std.testing.expectEqual(@as(u64, 7), probe.run_id);
     try std.testing.expectEqual(@as(usize, 2), self.conversation.messages.items.len);
     try std.testing.expectEqualStrings(
