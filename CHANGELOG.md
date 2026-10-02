@@ -38,6 +38,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- The system prompt is assembled from named sections (#184, phase 1):
+  stable `metacodes:*` ids, sparse orders, and a class per section (identity
+  and the tool guidance replaceable, the safety policy and system rules
+  locked, tone/efficiency/progress removable, environment/memory/Skills/
+  subagents/TinyKG generated). The former intro is now `metacodes:identity`
+  plus `metacodes:safety-policy`. Prompts are byte-identical to before; a test
+  renders 160 tool-set/Skill/memory/TinyKG/deferred combinations against the
+  frozen previous concatenation.
 - AgentCore ABI v1 moves to **revision 17** (#173): `allow_session` on a
   built-in `Write` or `Edit` now covers later calls of the same Tool on the
   same file, whatever their content or edit strings, instead of only an
