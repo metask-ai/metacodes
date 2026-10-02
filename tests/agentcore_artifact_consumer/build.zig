@@ -89,10 +89,14 @@ pub fn build(b: *std.Build) void {
         @panic("-Dbundle-root is required");
     const library_file = b.option([]const u8, "library-file", "Target AgentCore static library filename") orelse
         @panic("-Dlibrary-file is required");
+    const shared_library_file = b.option([]const u8, "shared-library-file", "Target AgentCore shared library filename") orelse
+        @panic("-Dshared-library-file is required");
     const expected_strip = b.option(bool, "expected-strip", "Expected AgentCore strip setting") orelse
         @panic("-Dexpected-strip is required");
     const library_rel_path = b.fmt("lib/{s}", .{library_file});
     const lib_path = b.pathJoin(&.{ bundle_root, "lib", library_file });
+    const shared_library_rel_path = b.fmt("lib/{s}", .{shared_library_file});
+    const shared_library_path = b.pathJoin(&.{ bundle_root, "lib", shared_library_file });
     const header_path = b.pathJoin(&.{ bundle_root, "include", "metask", "agentcore.h" });
     const zig_build_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "build.zig" });
     const zig_zon_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "build.zig.zon" });
@@ -139,11 +143,16 @@ pub fn build(b: *std.Build) void {
     }) catch |err| std.debug.panic("invalid AgentCore manifest identity: {s}", .{@errorName(err)});
     const ripgrep_rel: []const u8 = if (target.result.os.tag == .windows) "bin/rg.exe" else "bin/rg";
     const ripgrep_path = b.pathJoin(&.{ bundle_root, "bin", if (target.result.os.tag == .windows) "rg.exe" else "rg" });
-    manifest_contract.validateManifestFiles(manifest.value.files, library_rel_path, ripgrep_rel) catch |err|
+    if (!std.mem.eql(u8, shared_library_file, manifest_contract.sharedLibraryFile(os)))
+        std.debug.panic("unexpected AgentCore shared library name {s}", .{shared_library_file});
+    manifest_contract.validateManifestFiles(manifest.value.files, library_rel_path, shared_library_rel_path, ripgrep_rel) catch |err|
         std.debug.panic("invalid AgentCore manifest file set: {s}", .{@errorName(err)});
+    manifest_contract.validateSharedLibrary(manifest.value.shared_library, shared_library_rel_path, os) catch |err|
+        std.debug.panic("invalid AgentCore manifest shared library: {s}", .{@errorName(err)});
     manifest_contract.validateRuntimeAssets(manifest.value.runtime_assets, ripgrep_rel) catch |err|
         std.debug.panic("invalid AgentCore manifest runtime assets: {s}", .{@errorName(err)});
     verifySha256(b, lib_path, manifest_contract.fileSha256(manifest.value.files, library_rel_path).?);
+    verifySha256(b, shared_library_path, manifest_contract.fileSha256(manifest.value.files, shared_library_rel_path).?);
     verifySha256(b, ripgrep_path, manifest_contract.fileSha256(manifest.value.files, ripgrep_rel).?);
     verifyTextArtifact(
         b,
@@ -247,13 +256,36 @@ pub fn build(b: *std.Build) void {
     const c_exe = b.addExecutable(.{ .name = "agentcore-artifact-c-consumer", .root_module = c_app });
     const c_run = b.addRunArtifact(c_exe);
 
+    // The same C consumer against the shared library (#182): no AgentCore
+    // link input at all; the API comes from dlopen/LoadLibrary of the pinned
+    // file, the way a ctypes or FFI Host obtains it.
+    const c_dynamic_app = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    c_dynamic_app.addCSourceFile(.{
+        .file = b.path("consumer.c"),
+        .flags = &.{ "-std=c11", "-DMETASK_AGENTCORE_CONSUMER_DYNAMIC=1" },
+    });
+    c_dynamic_app.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
+    if (target.result.os.tag == .windows)
+        c_dynamic_app.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
+    if (target.result.os.tag == .linux)
+        c_dynamic_app.linkSystemLibrary("dl", .{ .use_pkg_config = .no });
+    const c_dynamic_exe = b.addExecutable(.{ .name = "agentcore-artifact-c-dynamic-consumer", .root_module = c_dynamic_app });
+    const c_dynamic_run = b.addRunArtifact(c_dynamic_exe);
+    c_dynamic_run.addArg(shared_library_path);
+
     const link_step = b.step("link", "Link source-free Zig, C and C++ consumers");
     link_step.dependOn(&zig_link_exe.step);
     link_step.dependOn(&c_link_exe.step);
     link_step.dependOn(&cpp_link_exe.step);
+    link_step.dependOn(&c_dynamic_exe.step);
 
     const test_step = b.step("test", "Run consumers against the installed AgentCore bundle");
     test_step.dependOn(&run.step);
     test_step.dependOn(&c_run.step);
+    test_step.dependOn(&c_dynamic_run.step);
     test_step.dependOn(&cpp_run.step);
 }

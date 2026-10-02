@@ -15,6 +15,13 @@ pub const RuntimeAsset = struct {
     role: []const u8,
 };
 
+pub const SharedLibrary = struct {
+    path: []const u8,
+    entry_point: []const u8,
+    install_name: ?[]const u8,
+    needed: []const []const u8,
+};
+
 pub const Manifest = struct {
     schema_version: u32,
     vendor: []const u8,
@@ -48,6 +55,7 @@ pub const Manifest = struct {
         binary_abi_revision: u32,
         binary_abi_table_size: u32,
     },
+    shared_library: SharedLibrary,
     runtime_assets: []const RuntimeAsset,
     files: []const FileEntry,
 };
@@ -86,6 +94,7 @@ pub const Error = error{
     DuplicateFile,
     MissingFile,
     InvalidRuntimeAssets,
+    InvalidSharedLibrary,
 };
 
 pub const fixed_artifact_files = [_][]const u8{
@@ -158,11 +167,13 @@ fn isLowerHex(bytes: []const u8) bool {
 pub fn validateManifestFiles(
     files: []const FileEntry,
     library_path: []const u8,
+    shared_library_path: []const u8,
     ripgrep_path: []const u8,
 ) Error!void {
-    var seen = [_]bool{false} ** (fixed_artifact_files.len + 2);
+    var seen = [_]bool{false} ** (fixed_artifact_files.len + 3);
     for (files) |file| {
-        const index = artifactFileIndex(file.path, library_path, ripgrep_path) orelse return error.UnexpectedFile;
+        const index = artifactFileIndex(file.path, library_path, shared_library_path, ripgrep_path) orelse
+            return error.UnexpectedFile;
         if (seen[index]) return error.DuplicateFile;
         if (file.sha256.len != 64 or !isLowerHex(file.sha256)) return error.InvalidSha256;
         seen[index] = true;
@@ -183,6 +194,38 @@ pub fn validateRuntimeAssets(assets: []const RuntimeAsset, ripgrep_path: []const
         return error.InvalidRuntimeAssets;
 }
 
+/// The shared library file name each OS uses (#182).
+pub fn sharedLibraryFile(os: []const u8) []const u8 {
+    if (std.mem.eql(u8, os, "windows")) return "metask_agentcore.dll";
+    if (std.mem.eql(u8, os, "macos")) return "libmetask_agentcore.dylib";
+    return "libmetask_agentcore.so";
+}
+
+/// The shared library record names the pinned file, the single ABI export,
+/// the library's own load name (Mach-O install name, ELF soname, none on
+/// Windows) and a non-empty, duplicate-free list of needed system libraries.
+pub fn validateSharedLibrary(shared: SharedLibrary, shared_library_path: []const u8, os: []const u8) Error!void {
+    if (!std.mem.eql(u8, shared.path, shared_library_path) or
+        !std.mem.eql(u8, shared.entry_point, "metask_agentcore_get_api"))
+        return error.InvalidSharedLibrary;
+    const expected_name: ?[]const u8 = if (std.mem.eql(u8, os, "windows"))
+        null
+    else if (std.mem.eql(u8, os, "macos"))
+        "@rpath/libmetask_agentcore.dylib"
+    else
+        "libmetask_agentcore.so";
+    if (expected_name) |name| {
+        const actual = shared.install_name orelse return error.InvalidSharedLibrary;
+        if (!std.mem.eql(u8, actual, name)) return error.InvalidSharedLibrary;
+    } else if (shared.install_name != null) return error.InvalidSharedLibrary;
+    if (shared.needed.len == 0) return error.InvalidSharedLibrary;
+    for (shared.needed, 0..) |name, index| {
+        if (name.len == 0) return error.InvalidSharedLibrary;
+        for (shared.needed[0..index]) |earlier|
+            if (std.mem.eql(u8, earlier, name)) return error.InvalidSharedLibrary;
+    }
+}
+
 pub fn fileSha256(files: []const FileEntry, path: []const u8) ?[]const u8 {
     for (files) |file| {
         if (std.mem.eql(u8, file.path, path)) return file.sha256;
@@ -190,11 +233,17 @@ pub fn fileSha256(files: []const FileEntry, path: []const u8) ?[]const u8 {
     return null;
 }
 
-fn artifactFileIndex(path: []const u8, library_path: []const u8, ripgrep_path: []const u8) ?usize {
+fn artifactFileIndex(
+    path: []const u8,
+    library_path: []const u8,
+    shared_library_path: []const u8,
+    ripgrep_path: []const u8,
+) ?usize {
     if (std.mem.eql(u8, path, library_path)) return 0;
-    if (std.mem.eql(u8, path, ripgrep_path)) return 1;
+    if (std.mem.eql(u8, path, shared_library_path)) return 1;
+    if (std.mem.eql(u8, path, ripgrep_path)) return 2;
     const index = findFixed(&fixed_artifact_files, path) orelse return null;
-    return index + 2;
+    return index + 3;
 }
 
 fn findFixed(comptime expected: []const []const u8, actual: []const u8) ?usize {
@@ -206,6 +255,7 @@ fn findFixed(comptime expected: []const []const u8, actual: []const u8) ?usize {
 
 const hash = "0000000000000000000000000000000000000000000000000000000000000000";
 const macos_library_path = "lib/libmetask_agentcore.a";
+const macos_shared_path = "lib/libmetask_agentcore.dylib";
 const posix_ripgrep_path = "bin/rg";
 const windows_ripgrep_path = "bin/rg.exe";
 const valid_files = makeValidFiles();
@@ -219,14 +269,22 @@ const valid_runtime_assets = [_]RuntimeAsset{.{
     .role = "Glob/Grep execution dependency",
 }};
 
-fn makeValidFiles() [fixed_artifact_files.len + 2]FileEntry {
-    var files: [fixed_artifact_files.len + 2]FileEntry = undefined;
+fn makeValidFiles() [fixed_artifact_files.len + 3]FileEntry {
+    var files: [fixed_artifact_files.len + 3]FileEntry = undefined;
     files[0] = .{ .path = macos_library_path, .sha256 = hash };
-    files[1] = .{ .path = posix_ripgrep_path, .sha256 = hash };
+    files[1] = .{ .path = macos_shared_path, .sha256 = hash };
+    files[2] = .{ .path = posix_ripgrep_path, .sha256 = hash };
     for (fixed_artifact_files, 0..) |path, index|
-        files[index + 2] = .{ .path = path, .sha256 = hash };
+        files[index + 3] = .{ .path = path, .sha256 = hash };
     return files;
 }
+
+const valid_shared_library = SharedLibrary{
+    .path = macos_shared_path,
+    .entry_point = "metask_agentcore_get_api",
+    .install_name = "@rpath/libmetask_agentcore.dylib",
+    .needed = &.{"/usr/lib/libSystem.B.dylib"},
+};
 
 fn validManifest() Manifest {
     return .{
@@ -262,6 +320,7 @@ fn validManifest() Manifest {
             .binary_abi_revision = 17,
             .binary_abi_table_size = 64,
         },
+        .shared_library = valid_shared_library,
         .runtime_assets = &valid_runtime_assets,
         .files = &valid_files,
     };
@@ -423,28 +482,30 @@ test "manifest contract rejects toolchain target optimize and ABI drift" {
 }
 
 test "manifest file set validates dynamic library name hashes and exact entries" {
-    try validateManifestFiles(&valid_files, macos_library_path, posix_ripgrep_path);
+    try validateManifestFiles(&valid_files, macos_library_path, macos_shared_path, posix_ripgrep_path);
     var windows_files = valid_files;
     windows_files[0].path = "lib/metask_agentcore.lib";
-    windows_files[1].path = windows_ripgrep_path;
-    try validateManifestFiles(&windows_files, windows_files[0].path, windows_ripgrep_path);
+    windows_files[1].path = "lib/metask_agentcore.dll";
+    windows_files[2].path = windows_ripgrep_path;
+    try validateManifestFiles(&windows_files, windows_files[0].path, windows_files[1].path, windows_ripgrep_path);
     try std.testing.expectEqualStrings(hash, fileSha256(&valid_files, macos_library_path).?);
     try std.testing.expect(fileSha256(&valid_files, "lib/missing.lib") == null);
-    try std.testing.expectError(error.MissingFile, validateManifestFiles(valid_files[0 .. valid_files.len - 1], macos_library_path, posix_ripgrep_path));
+    try std.testing.expectError(error.MissingFile, validateManifestFiles(valid_files[0 .. valid_files.len - 1], macos_library_path, macos_shared_path, posix_ripgrep_path));
     const extra = valid_files ++ [_]FileEntry{.{ .path = "bindings/zig/src/unlisted.zig", .sha256 = hash }};
-    try std.testing.expectError(error.UnexpectedFile, validateManifestFiles(&extra, macos_library_path, posix_ripgrep_path));
+    try std.testing.expectError(error.UnexpectedFile, validateManifestFiles(&extra, macos_library_path, macos_shared_path, posix_ripgrep_path));
     var duplicate = valid_files;
     duplicate[4] = duplicate[0];
-    try std.testing.expectError(error.DuplicateFile, validateManifestFiles(&duplicate, macos_library_path, posix_ripgrep_path));
+    try std.testing.expectError(error.DuplicateFile, validateManifestFiles(&duplicate, macos_library_path, macos_shared_path, posix_ripgrep_path));
     var invalid_hash = valid_files;
     invalid_hash[0].sha256 = "ABCDEF";
-    try std.testing.expectError(error.InvalidSha256, validateManifestFiles(&invalid_hash, macos_library_path, posix_ripgrep_path));
+    try std.testing.expectError(error.InvalidSha256, validateManifestFiles(&invalid_hash, macos_library_path, macos_shared_path, posix_ripgrep_path));
     // 缺 rg 条目 = MissingFile:运行期资产是 files allowlist 的强制成员,
     // 不能退化回"环境里碰巧有 rg"的旧状态。
     var missing_rg: [valid_files.len - 1]FileEntry = undefined;
     missing_rg[0] = valid_files[0];
-    for (valid_files[2..], 0..) |entry, index| missing_rg[index + 1] = entry;
-    try std.testing.expectError(error.MissingFile, validateManifestFiles(&missing_rg, macos_library_path, posix_ripgrep_path));
+    missing_rg[1] = valid_files[1];
+    for (valid_files[3..], 0..) |entry, index| missing_rg[index + 2] = entry;
+    try std.testing.expectError(error.MissingFile, validateManifestFiles(&missing_rg, macos_library_path, macos_shared_path, posix_ripgrep_path));
 }
 
 test "runtime assets must pin exactly the staged ripgrep executable" {
@@ -460,4 +521,64 @@ test "runtime assets must pin exactly the staged ripgrep executable" {
     var empty_version = valid_runtime_assets;
     empty_version[0].version = "";
     try std.testing.expectError(error.InvalidRuntimeAssets, validateRuntimeAssets(&empty_version, posix_ripgrep_path));
+}
+
+test "manifest file set requires the shared library beside the static one" {
+    var missing_shared: [valid_files.len - 1]FileEntry = undefined;
+    missing_shared[0] = valid_files[0];
+    for (valid_files[2..], 0..) |entry, index| missing_shared[index + 1] = entry;
+    try std.testing.expectError(
+        error.MissingFile,
+        validateManifestFiles(&missing_shared, macos_library_path, macos_shared_path, posix_ripgrep_path),
+    );
+    // A shared library under another name is not the pinned file.
+    var renamed = valid_files;
+    renamed[1].path = "lib/libmetask_agentcore.1.dylib";
+    try std.testing.expectError(
+        error.UnexpectedFile,
+        validateManifestFiles(&renamed, macos_library_path, macos_shared_path, posix_ripgrep_path),
+    );
+}
+
+test "shared library record names the file, the entry point and the load name" {
+    try validateSharedLibrary(valid_shared_library, macos_shared_path, "macos");
+    try std.testing.expectEqualStrings("libmetask_agentcore.dylib", sharedLibraryFile("macos"));
+    try std.testing.expectEqualStrings("metask_agentcore.dll", sharedLibraryFile("windows"));
+    try std.testing.expectEqualStrings("libmetask_agentcore.so", sharedLibraryFile("linux"));
+
+    const linux = SharedLibrary{
+        .path = "lib/libmetask_agentcore.so",
+        .entry_point = "metask_agentcore_get_api",
+        .install_name = "libmetask_agentcore.so",
+        .needed = &.{ "libc.so.6", "libm.so.6" },
+    };
+    try validateSharedLibrary(linux, "lib/libmetask_agentcore.so", "linux");
+    const windows = SharedLibrary{
+        .path = "lib/metask_agentcore.dll",
+        .entry_point = "metask_agentcore_get_api",
+        .install_name = null,
+        .needed = &.{ "KERNEL32.dll", "ADVAPI32.dll" },
+    };
+    try validateSharedLibrary(windows, "lib/metask_agentcore.dll", "windows");
+
+    var wrong = valid_shared_library;
+    wrong.path = "lib/other.dylib";
+    try std.testing.expectError(error.InvalidSharedLibrary, validateSharedLibrary(wrong, macos_shared_path, "macos"));
+    wrong = valid_shared_library;
+    wrong.entry_point = "metacodes_agentcore_get_api";
+    try std.testing.expectError(error.InvalidSharedLibrary, validateSharedLibrary(wrong, macos_shared_path, "macos"));
+    wrong = valid_shared_library;
+    wrong.install_name = "/usr/local/lib/libmetask_agentcore.dylib";
+    try std.testing.expectError(error.InvalidSharedLibrary, validateSharedLibrary(wrong, macos_shared_path, "macos"));
+    wrong = valid_shared_library;
+    wrong.install_name = null;
+    try std.testing.expectError(error.InvalidSharedLibrary, validateSharedLibrary(wrong, macos_shared_path, "macos"));
+    var named_dll = windows;
+    named_dll.install_name = "metask_agentcore.dll";
+    try std.testing.expectError(error.InvalidSharedLibrary, validateSharedLibrary(named_dll, windows.path, "windows"));
+    wrong = valid_shared_library;
+    wrong.needed = &.{};
+    try std.testing.expectError(error.InvalidSharedLibrary, validateSharedLibrary(wrong, macos_shared_path, "macos"));
+    wrong.needed = &.{ "/usr/lib/libSystem.B.dylib", "/usr/lib/libSystem.B.dylib" };
+    try std.testing.expectError(error.InvalidSharedLibrary, validateSharedLibrary(wrong, macos_shared_path, "macos"));
 }
