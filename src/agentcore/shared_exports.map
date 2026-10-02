@@ -1,0 +1,10 @@
+/* ELF export surface of the AgentCore shared library (#182): the discovery
+ * entry point only. Everything else, including the C runtime's _init/_fini,
+ * stays local. scripts/agentcore_symbol_gate.zig --shared enforces the same
+ * set on every format. */
+{
+  global:
+    metask_agentcore_get_api;
+  local:
+    *;
+};

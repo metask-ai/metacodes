@@ -12,6 +12,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Every AgentCore bundle ships a shared library beside the static one
+  (#182): `lib/libmetask_agentcore.so`, `lib/libmetask_agentcore.dylib`, or
+  `lib/metask_agentcore.dll`, for Hosts that can only load a library at run
+  time (Python `ctypes`, Node FFI, JNA, .NET P/Invoke). It exports only
+  `metask_agentcore_get_api` (plus inert toolchain names on PE and Mach-O),
+  macOS uses `@rpath/libmetask_agentcore.dylib`, and the manifest pins its
+  SHA-256 and records `shared_library` (path, entry point, load name, needed
+  libraries read from the image). Bundle assembly refuses a shared library
+  with any other export or a dependency a clean OS installation lacks (an
+  MSVC DLL may need the Visual C++ runtime, which the manifest lists), and the
+  native gate runs the C consumer through `dlopen`/`LoadLibraryEx` with no
+  AgentCore link input.
+
 - Installation as isolated, coexisting installs (doc/INSTALL_DESIGN.md).
   `metacodes install --prefix <dir>` copies the release unit it belongs to,
   re-verifies every file against the release manifest, writes

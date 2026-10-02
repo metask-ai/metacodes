@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const abi_types = @import("metask_agentcore_types");
 const common = @import("manifest_common.zig");
+const binary = @import("agentcore_binary.zig");
 
 const FileEntry = struct {
     path: []const u8,
@@ -65,8 +66,19 @@ const Manifest = struct {
         binary_abi_revision: u32 = abi_types.ABI_REVISION,
         binary_abi_table_size: u32 = @sizeOf(abi_types.ApiV1),
     },
+    shared_library: SharedLibrary,
     runtime_assets: []const RuntimeAsset,
     files: []const FileEntry,
+};
+
+/// The bundle's shared library for Hosts that load one at run time (#182):
+/// the file (also pinned in `files`), its only ABI export, its own load name,
+/// and the system libraries the loader must find.
+const SharedLibrary = struct {
+    path: []const u8,
+    entry_point: []const u8 = "metask_agentcore_get_api",
+    install_name: ?[]const u8,
+    needed: []const []const u8,
 };
 
 const SourceIdentity = common.SourceIdentity;
@@ -86,10 +98,12 @@ pub fn main(init: std.process.Init) !void {
     const optimize = args.next() orelse return usage();
     const strip_text = args.next() orelse return usage();
     const library_file = args.next() orelse return usage();
+    const shared_file = args.next() orelse return usage();
     if (args.next() != null) return usage();
 
     if (bundle_root.len == 0 or resolved_target.len == 0 or architecture.len == 0 or
-        os.len == 0 or abi.len == 0 or optimize.len == 0 or library_file.len == 0)
+        os.len == 0 or abi.len == 0 or optimize.len == 0 or library_file.len == 0 or
+        shared_file.len == 0)
         return error.EmptyMetadata;
     const strip = parseBool(strip_text) orelse return error.InvalidBoolean;
 
@@ -123,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
         source.commit,
         ripgrep_rel,
         ripgrep_pin.upstream_release,
+        shared_file,
     );
     const zon = try renderZon(allocator, version);
     const cargo = try renderCargoToml(allocator, version);
@@ -135,8 +150,17 @@ pub fn main(init: std.process.Init) !void {
     try common.writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/link.cfg", rust_link_config);
 
     const library_rel = try std.fmt.allocPrint(allocator, "lib/{s}", .{library_file});
+    const shared_rel = try std.fmt.allocPrint(allocator, "lib/{s}", .{shared_file});
+    const shared_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        try std.fs.path.join(allocator, &.{ bundle_root, shared_rel }),
+        allocator,
+        .limited(1024 * 1024 * 1024),
+    );
+    const shared_image = try binary.read(allocator, shared_bytes);
     const relative_paths = [_][]const u8{
         library_rel,
+        shared_rel,
         ripgrep_rel,
         "bin/ripgrep-LICENSE-MIT",
         "include/metask/agentcore.h",
@@ -187,6 +211,11 @@ pub fn main(init: std.process.Init) !void {
             .system_frameworks = system_frameworks,
         },
         .contract = .{},
+        .shared_library = .{
+            .path = shared_rel,
+            .install_name = shared_image.install_name,
+            .needed = shared_image.needed,
+        },
         .runtime_assets = &.{.{
             .name = "ripgrep",
             .version = ripgrep_pin.upstream_release,
@@ -206,7 +235,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn usage() error{InvalidArguments} {
     std.debug.print(
-        "usage: agentcore-manifest <bundle-root> <target> <arch> <os> <abi> <optimize> <strip> <library-file>\n",
+        "usage: agentcore-manifest <bundle-root> <target> <arch> <os> <abi> <optimize> <strip> <library-file> <shared-library-file>\n",
         .{},
     );
     return error.InvalidArguments;
@@ -279,6 +308,7 @@ fn renderReadme(
     commit: []const u8,
     ripgrep_rel: []const u8,
     ripgrep_version: []const u8,
+    shared_file: []const u8,
 ) ![]const u8 {
     return std.fmt.allocPrint(allocator,
         \\# metask-agentcore {s}
@@ -291,6 +321,10 @@ fn renderReadme(
         \\C and C++ consumers include `<metask/agentcore.h>` and link the static library in `lib/`.
         \\Zig consumers use the package in `bindings/zig` and import `metask_agentcore`.
         \\Rust consumers use the raw `metask-agentcore-sys` crate in `bindings/rust`.
+        \\Hosts that load a library at run time (Python `ctypes`, Node FFI, JNA, .NET P/Invoke) load
+        \\`lib/{s}` and resolve `metask_agentcore_get_api`, its only ABI export.
+        \\`shared_library` in `manifest.json` records its path, load name and the system libraries it
+        \\needs; keep it loaded while any Runtime it created exists.
         \\
         \\`{s}` is the manifest-pinned ripgrep {s} runtime asset (upstream official release
         \\binary, MIT OR Unlicense; MIT text at `bin/ripgrep-LICENSE-MIT`, declaration in
@@ -310,7 +344,7 @@ fn renderReadme(
         \\256 MiB of retained catalog snapshots per Runtime. `invalid_resource` issues carry a typed
         \\reason; a single invalid Skill degrades the catalog without removing valid siblings.
         \\
-    , .{ version, target, zig_target, rust_target, commit, ripgrep_rel, ripgrep_version });
+    , .{ version, target, zig_target, rust_target, commit, shared_file, ripgrep_rel, ripgrep_version });
 }
 
 fn renderZon(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
