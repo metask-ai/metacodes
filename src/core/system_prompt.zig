@@ -14,20 +14,24 @@ const model_name = @import("../api/model_name.zig");
 const util_fs = @import("../util/fs.zig");
 const kg_retrieval = @import("../kg/retrieval_protocol.zig");
 const kg_tasks = @import("../kg/task_protocol.zig");
+const prompt_sections = @import("prompt_sections.zig");
 
 // ============================================================================
 // 静态 section（直译 TS prompts.ts 同名函数，仅把 "Claude Code" 改成 "MetaCode"）
 // ============================================================================
 
-/// getSimpleIntroSection + CYBER_RISK_INSTRUCTION。
-/// TS 里 intro 对应 outputStyleConfig=null + USER_TYPE!=ant 的默认分支。
-/// 开头加一句 "You are MetaCode ..." 作为身份锚（对应 TS 里
-/// `You are Claude Code, Anthropic's official CLI for Claude.`）。
-const INTRO_SECTION =
+/// getSimpleIntroSection 的身份部分(TS 里 intro 对应 outputStyleConfig=null +
+/// USER_TYPE!=ant 的默认分支)。开头一句 "You are MetaCode ..." 作为身份锚(对应 TS 里
+/// `You are Claude Code, Anthropic's official CLI for Claude.`)。#184:与下面的安全条款
+/// 分成两个命名段——身份将来可由宿主替换,安全条款锁定;两段按空行相接,与旧的单段逐字节相同。
+const IDENTITY_SECTION =
     \\You are MetaCode, a local CLI agent for software engineering.
     \\
     \\You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
-    \\
+;
+
+/// CYBER_RISK_INSTRUCTION 与 URL 条款(原 intro 的 IMPORTANT 两行)。
+const SAFETY_POLICY_SECTION =
     \\IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.
     \\IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
 ;
@@ -468,64 +472,164 @@ pub fn buildFullWithDefs(
     cwd: []const u8,
     tool_defs: ?[]const @import("../json.zig").ToolDefinition,
 ) ![]u8 {
-    const env_section = try buildEnvSection(allocator, model, cwd);
-    defer allocator.free(env_section);
+    var generated = try GeneratedSections.init(allocator, model, skills, agents, enabled_tool_names, memdir_abs, kg_ready, cwd, tool_defs);
+    defer generated.deinit(allocator);
+    return renderKernel(allocator, &generated);
+}
 
-    const skills_section = if (toolNameEnabled(enabled_tool_names, "Skill"))
-        if (skills) |s| try buildSkillsSection(allocator, s) else try allocator.dupe(u8, "")
-    else
-        try allocator.dupe(u8, "");
-    defer allocator.free(skills_section);
+/// The section texts a build derives from Session facts: tool set, Skills,
+/// subagents, memory, TinyKG readiness and the environment.
+const GeneratedSections = struct {
+    env: []u8,
+    skills: []u8,
+    agents: []u8,
+    memory: []u8,
+    using_tools: []u8,
+    deferred_tools: []u8,
+    kg: []u8,
 
-    const agents_section = if (toolNameEnabled(enabled_tool_names, "Task"))
-        if (agents) |a| try buildAgentsSection(allocator, a) else try allocator.dupe(u8, "")
-    else
-        try allocator.dupe(u8, "");
-    defer allocator.free(agents_section);
+    fn init(
+        allocator: std.mem.Allocator,
+        model: []const u8,
+        skills: ?*const @import("../skills/skill.zig").SkillSet,
+        agents: ?*const @import("../agents/set.zig").AgentSet,
+        enabled_tool_names: ?[]const []const u8,
+        memdir_abs: []const u8,
+        kg_ready: bool,
+        cwd: []const u8,
+        tool_defs: ?[]const @import("../json.zig").ToolDefinition,
+    ) !GeneratedSections {
+        const env_section = try buildEnvSection(allocator, model, cwd);
+        errdefer allocator.free(env_section);
 
-    // # Memory 段(通道 B):仅 memdir 启用(memdir_abs 非空)时拼。教模型管理自动记忆。
-    const memory_section = if (memdir_abs.len > 0)
-        try @import("memory/memory_section.zig").build(
-            allocator,
-            memdir_abs,
-            if (kg_ready) .tinykg_linked else .markdown_only,
-        )
-    else
-        try allocator.dupe(u8, "");
-    defer allocator.free(memory_section);
+        const skills_section = if (toolNameEnabled(enabled_tool_names, "Skill"))
+            if (skills) |set| try buildSkillsSection(allocator, set) else try allocator.dupe(u8, "")
+        else
+            try allocator.dupe(u8, "");
+        errdefer allocator.free(skills_section);
 
-    // # Using your tools 段:env override(slot "USING_TOOLS")优先,否则按工具集动态拼。
-    const using_tools_section = blk: {
-        if (@import("prompt_override.zig").lookup(allocator, "USING_TOOLS")) |ov| break :blk ov;
-        if (enabled_tool_names) |names| break :blk try buildUsingToolsSection(allocator, names);
-        break :blk try allocator.dupe(u8, USING_TOOLS_SECTION);
+        const agents_section = if (toolNameEnabled(enabled_tool_names, "Task"))
+            if (agents) |set| try buildAgentsSection(allocator, set) else try allocator.dupe(u8, "")
+        else
+            try allocator.dupe(u8, "");
+        errdefer allocator.free(agents_section);
+
+        // # Memory 段(通道 B):仅 memdir 启用(memdir_abs 非空)时拼。教模型管理自动记忆。
+        const memory_section = if (memdir_abs.len > 0)
+            try @import("memory/memory_section.zig").build(
+                allocator,
+                memdir_abs,
+                if (kg_ready) .tinykg_linked else .markdown_only,
+            )
+        else
+            try allocator.dupe(u8, "");
+        errdefer allocator.free(memory_section);
+
+        // # Using your tools 段:env override(slot "USING_TOOLS")优先,否则按工具集动态拼。
+        const using_tools_section = blk: {
+            if (@import("prompt_override.zig").lookup(allocator, "USING_TOOLS")) |ov| break :blk ov;
+            if (enabled_tool_names) |names| break :blk try buildUsingToolsSection(allocator, names);
+            break :blk try allocator.dupe(u8, USING_TOOLS_SECTION);
+        };
+        errdefer allocator.free(using_tools_section);
+
+        const deferred_section = try buildDeferredToolsSection(allocator, enabled_tool_names, kg_ready, tool_defs);
+        errdefer allocator.free(deferred_section);
+
+        const kg_section = try buildKnowledgeGraphSection(allocator, enabled_tool_names, kg_ready);
+
+        return .{
+            .env = env_section,
+            .skills = skills_section,
+            .agents = agents_section,
+            .memory = memory_section,
+            .using_tools = using_tools_section,
+            .deferred_tools = deferred_section,
+            .kg = kg_section,
+        };
+    }
+
+    fn deinit(self: *GeneratedSections, allocator: std.mem.Allocator) void {
+        inline for (std.meta.fields(GeneratedSections)) |field| allocator.free(@field(self, field.name));
+        self.* = undefined;
+    }
+};
+
+fn renderKernel(allocator: std.mem.Allocator, generated: *const GeneratedSections) ![]u8 {
+    var sections = [_]prompt_sections.Section{
+        kernelSection(.identity, IDENTITY_SECTION),
+        kernelSection(.safety_policy, SAFETY_POLICY_SECTION),
+        kernelSection(.system, SYSTEM_SECTION),
+        kernelSection(.doing_tasks, DOING_TASKS_SECTION),
+        kernelSection(.validation, VALIDATION_SECTION),
+        kernelSection(.actions, ACTIONS_SECTION),
+        kernelSection(.using_tools, generated.using_tools),
+        kernelSection(.deferred_tools, generated.deferred_tools),
+        kernelSection(.tone, TONE_SECTION),
+        kernelSection(.output_efficiency, OUTPUT_EFFICIENCY_SECTION),
+        kernelSection(.progress, PROGRESS_SECTION),
+        kernelSection(.env, generated.env),
+        kernelSection(.memory, generated.memory),
+        kernelSection(.skills, generated.skills),
+        kernelSection(.agents, generated.agents),
+        kernelSection(.kg, generated.kg),
     };
-    defer allocator.free(using_tools_section);
+    return prompt_sections.render(allocator, &sections);
+}
 
-    const deferred_section = try buildDeferredToolsSection(allocator, enabled_tool_names, kg_ready, tool_defs);
-    defer allocator.free(deferred_section);
+/// The kernel's prompt sections (#184): stable ids, sparse orders that leave
+/// room for Host sections between them, and what a Host may do with each.
+/// Volatile generated facts sit last so the cacheable prefix stays stable.
+pub const KernelSection = enum {
+    identity,
+    safety_policy,
+    system,
+    doing_tasks,
+    validation,
+    actions,
+    using_tools,
+    deferred_tools,
+    tone,
+    output_efficiency,
+    progress,
+    env,
+    memory,
+    skills,
+    agents,
+    kg,
 
-    const kg_section = try buildKnowledgeGraphSection(allocator, enabled_tool_names, kg_ready);
-    defer allocator.free(kg_section);
+    const Spec = struct {
+        id: []const u8,
+        order: i64,
+        class: prompt_sections.Class,
+        join: prompt_sections.Join,
+    };
 
-    const sep = "\n\n";
-    return try std.mem.concat(allocator, u8, &.{
-        INTRO_SECTION,             sep,
-        SYSTEM_SECTION,            sep,
-        DOING_TASKS_SECTION,       sep,
-        VALIDATION_SECTION,        sep,
-        ACTIONS_SECTION,           sep,
-        using_tools_section,       if (deferred_section.len > 0) sep else "",
-        deferred_section,          sep,
-        TONE_SECTION,              sep,
-        OUTPUT_EFFICIENCY_SECTION, sep,
-        PROGRESS_SECTION,          sep,
-        env_section,               if (memory_section.len > 0) sep else "",
-        memory_section,            if (skills_section.len > 0) sep else "",
-        skills_section,            if (agents_section.len > 0) sep else "",
-        agents_section,            if (kg_section.len > 0) sep else "",
-        kg_section,
-    });
+    pub fn spec(self: KernelSection) Spec {
+        return switch (self) {
+            .identity => .{ .id = "metacodes:identity", .order = -1000, .class = .replaceable, .join = .always },
+            .safety_policy => .{ .id = "metacodes:safety-policy", .order = -900, .class = .locked, .join = .always },
+            .system => .{ .id = "metacodes:system", .order = 100, .class = .locked, .join = .always },
+            .doing_tasks => .{ .id = "metacodes:doing-tasks", .order = 200, .class = .replaceable, .join = .always },
+            .validation => .{ .id = "metacodes:validation", .order = 300, .class = .replaceable, .join = .always },
+            .actions => .{ .id = "metacodes:actions", .order = 400, .class = .replaceable, .join = .always },
+            .using_tools => .{ .id = "metacodes:using-tools", .order = 1000, .class = .replaceable, .join = .always },
+            .deferred_tools => .{ .id = "metacodes:deferred-tools", .order = 1100, .class = .replaceable, .join = .when_nonempty },
+            .tone => .{ .id = "metacodes:tone", .order = 2000, .class = .removable, .join = .always },
+            .output_efficiency => .{ .id = "metacodes:output-efficiency", .order = 2100, .class = .removable, .join = .always },
+            .progress => .{ .id = "metacodes:progress", .order = 2200, .class = .removable, .join = .always },
+            .env => .{ .id = "metacodes:env", .order = 9000, .class = .generated, .join = .always },
+            .memory => .{ .id = "metacodes:memory", .order = 9100, .class = .generated, .join = .when_nonempty },
+            .skills => .{ .id = "metacodes:skills", .order = 9200, .class = .generated, .join = .when_nonempty },
+            .agents => .{ .id = "metacodes:agents", .order = 9300, .class = .generated, .join = .when_nonempty },
+            .kg => .{ .id = "metacodes:kg", .order = 9400, .class = .generated, .join = .when_nonempty },
+        };
+    }
+};
+
+fn kernelSection(which: KernelSection, text: []const u8) prompt_sections.Section {
+    const s = which.spec();
+    return .{ .id = s.id, .order = s.order, .class = s.class, .join = s.join, .text = text };
 }
 
 /// 列出 deferred 工具(name + 短描述),说明调 ToolSearch 取 schema 才能用(对齐 cc
@@ -1194,4 +1298,131 @@ test "deferredDescriptionSummary: empty and whitespace-only descriptions get a p
     const short = try deferredDescriptionSummary(a, "  a\n b  ");
     defer a.free(short);
     try std.testing.expectEqualStrings("a b", short);
+}
+
+/// The pre-#184 concatenation and its single intro, frozen: the oracle that
+/// the section registry renders the same bytes for every combination below.
+const LEGACY_INTRO_SECTION =
+    \\You are MetaCode, a local CLI agent for software engineering.
+    \\
+    \\You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
+    \\
+    \\IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.
+    \\IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
+;
+
+fn legacyRender(allocator: std.mem.Allocator, g: *const GeneratedSections) ![]u8 {
+    const sep = "\n\n";
+    return try std.mem.concat(allocator, u8, &.{
+        LEGACY_INTRO_SECTION,      sep,
+        SYSTEM_SECTION,            sep,
+        DOING_TASKS_SECTION,       sep,
+        VALIDATION_SECTION,        sep,
+        ACTIONS_SECTION,           sep,
+        g.using_tools,             if (g.deferred_tools.len > 0) sep else "",
+        g.deferred_tools,          sep,
+        TONE_SECTION,              sep,
+        OUTPUT_EFFICIENCY_SECTION, sep,
+        PROGRESS_SECTION,          sep,
+        g.env,                     if (g.memory.len > 0) sep else "",
+        g.memory,                  if (g.skills.len > 0) sep else "",
+        g.skills,                  if (g.agents.len > 0) sep else "",
+        g.agents,                  if (g.kg.len > 0) sep else "",
+        g.kg,
+    });
+}
+
+test "the section registry renders the pre-#184 prompt byte for byte" {
+    const a = testing.allocator;
+    const skill_mod = @import("../skills/skill.zig");
+    const agent_set_mod = @import("../agents/set.zig");
+    const agent_def_mod = @import("../agents/def.zig");
+    const ToolDefinition = @import("../json.zig").ToolDefinition;
+
+    var skill_set = skill_mod.SkillSet.init(a);
+    defer skill_set.deinit();
+    try skill_set.skills.append(a, try skill_mod.parseSkillMd(
+        a,
+        "---\nname: review\ndescription: Review code\n---\nReview carefully.\n",
+        "/fake/skill.md",
+    ));
+    var agent_set = agent_set_mod.AgentSet.init(a);
+    defer agent_set.deinit();
+    try agent_set.agents.append(a, try agent_def_mod.parseAgentMd(
+        a,
+        "---\nname: explore\ndescription: Explore code\n---\nExplore carefully.\n",
+        "/fake/agent.md",
+        .project,
+    ));
+
+    const none = [_][]const u8{};
+    const read_only = [_][]const u8{"Read"};
+    const full = [_][]const u8{
+        "Read",    "Write",      "Edit",       "Glob",     "Grep",      "Bash",       "CodeMap",
+        "Skill",   "Task",       "ToolSearch", "KgRecall", "KgContext", "KgRemember", "TaskList",
+        "TaskGet", "TaskUpdate", "TaskCreate",
+    };
+    const partial_kg = [_][]const u8{ "Read", "KgRecall", "TaskUpdate" };
+    const tool_sets = [_]?[]const []const u8{ null, &none, &read_only, &full, &partial_kg };
+    const deferred_defs = [_]ToolDefinition{
+        .{ .name = "ToolSearch", .description = "search", .input_schema = .{} },
+        .{ .name = "weather__forecast", .description = "Forecast for a city.\nMore.", .input_schema = .{}, .deferred = true },
+    };
+    const defs_cases = [_]?[]const ToolDefinition{ null, &deferred_defs };
+
+    var cases: usize = 0;
+    for ([_][]const u8{ "claude-opus-4-7", "gpt-5" }) |model| {
+        for (tool_sets) |names| {
+            for (defs_cases) |defs| {
+                for ([_][]const u8{ "", "/tmp/metacodes-memdir" }) |memdir| {
+                    for ([_]bool{ false, true }) |kg_ready| {
+                        for ([_]bool{ false, true }) |with_sets| {
+                            var generated = try GeneratedSections.init(
+                                a,
+                                model,
+                                if (with_sets) &skill_set else null,
+                                if (with_sets) &agent_set else null,
+                                names,
+                                memdir,
+                                kg_ready,
+                                "/tmp",
+                                defs,
+                            );
+                            defer generated.deinit(a);
+                            const expected = try legacyRender(a, &generated);
+                            defer a.free(expected);
+                            const actual = try renderKernel(a, &generated);
+                            defer a.free(actual);
+                            try testing.expectEqualStrings(expected, actual);
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 2 * 5 * 2 * 2 * 2 * 2), cases);
+    // The empty tool set really exercises the empty fixed `# Using your tools`.
+    var empty_tools = try GeneratedSections.init(a, "m", null, null, &none, "", false, "/tmp", null);
+    defer empty_tools.deinit(a);
+    try testing.expectEqualStrings("", empty_tools.using_tools);
+}
+
+test {
+    _ = prompt_sections;
+}
+
+test "kernel section ids are unique and sorted by their orders" {
+    const fields = std.meta.fields(KernelSection);
+    var previous: ?i64 = null;
+    inline for (fields, 0..) |field, index| {
+        const spec = @as(KernelSection, @enumFromInt(field.value)).spec();
+        try testing.expect(std.mem.startsWith(u8, spec.id, "metacodes:"));
+        if (previous) |order| try testing.expect(order < spec.order);
+        previous = spec.order;
+        inline for (fields[0..index]) |earlier| {
+            const other = @as(KernelSection, @enumFromInt(earlier.value)).spec();
+            try testing.expect(!std.mem.eql(u8, other.id, spec.id));
+        }
+    }
 }
