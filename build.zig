@@ -2517,7 +2517,14 @@ pub fn build(b: *std.Build) void {
         // skipped everywhere while the driver, a replay case and both
         // analyzers drifted from the product for weeks. POSIX only, like the
         // memory runtime smoke above: their fixtures use POSIX paths and modes.
-        if (@import("builtin").os.tag != .windows) if (staged_lean_kernels.project != null) {
+        // On Linux the rule builder isolates Lean in bubblewrap, so a host
+        // without bwrap leaves them to skip; CI installs it.
+        const rule_sandbox_available = switch (@import("builtin").os.tag) {
+            .windows => false,
+            .linux => if (b.findProgram(&.{"bwrap"}, &.{})) |_| true else |_| false,
+            else => true,
+        };
+        if (rule_sandbox_available) if (staged_lean_kernels.project != null) {
             wireLeanKernelTestInputs(eval_test_cmd, staged_lean_kernels);
             // The installed layout, not the cached artifact: the runner
             // resolves rg and the kernels beside the executable.
