@@ -177,6 +177,71 @@ test "Kgd: a write commits and the generation advances" {
     try std.testing.expectEqual(@as(i32, 0), found.exit_code);
 }
 
+test "Kgd: an agent retrieval after a write is served from a rebuilt index" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
+    defer harness.deinit();
+
+    var transport = try harness.connect(a, TEST_KEY);
+    defer transport.deinit();
+
+    // Every committed write leaves the engine's full-text index stale. On a
+    // stale index the JSON (agent retrieval) form of `search` plans over an
+    // in-memory scan of the whole store, and that scan refuses any node whose
+    // text has no tokens (TinyKG text/in_memory_index.zig `doc_len <= 0` ->
+    // Unsupported). One such node — punctuation, an empty placeholder — and
+    // KgRecall failed after every write until the service rebuilt the index
+    // itself. Twice, so a write after a rebuild is covered as well.
+    const tokenless = try transport.run("ensure-node", &.{ "observation", "---" }, true);
+    defer tokenless.deinit(a);
+    try std.testing.expectEqual(cc.kg_transport.Result.CommitState.committed, tokenless.commit_state);
+    for ([_][]const u8{ "kilo retrieval probe", "lima retrieval probe" }, [_][]const u8{ "kilo", "lima" }) |text, term| {
+        const created = try transport.run("ensure-node", &.{ "observation", text }, true);
+        defer created.deinit(a);
+        try std.testing.expectEqual(cc.kg_transport.Result.CommitState.committed, created.commit_state);
+
+        const found = try transport.run("search", &.{ term, "--profile", "agent-memory", "--format", "json", "--include-text", "--limit", "3" }, false);
+        defer found.deinit(a);
+        try std.testing.expectEqual(@as(i32, 0), found.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, found.stdout, "tinykg-agent-retrieval-v1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, found.stdout, text) != null);
+    }
+}
+
+test "Kgd: declaring a custom type's scope does not fence the session's later writes" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
+    defer harness.deinit();
+    const endpoint = try harness.url(a);
+    defer a.free(endpoint);
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try harness.tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var kg = try cc.kg_client.KgClient.init(a, .{
+        .state_root = root,
+        .domain = "scope-probe-project",
+        .io = harness.io_runtime.io(),
+        .daemon_url = endpoint,
+        .daemon_api_key = TEST_KEY,
+        .daemon_expected_build_id = harness.supervisor.identity.buildId(),
+    });
+    defer kg.deinit();
+    kg.ensureReady();
+    try std.testing.expect(kg.ready);
+
+    // A custom type in project scope makes the client declare that type's
+    // scope (`schema-scope --if-absent`). tinykgd answers it with no commit
+    // receipt even when it creates the scope node; sent as a fenced write,
+    // that read as "may have committed" and refused every later write of the
+    // session (`auto-scope custom type ... failed: AmbiguousCommit`).
+    _ = try kg.remember(.observation, "first note of a custom type", "scope_probe_type", false);
+    try std.testing.expect(kg.transport.daemon.ambiguousRequestId() == null);
+    _ = try kg.remember(.observation, "second note after the scope declaration", "scope_probe_type", false);
+    _ = try kg.remember(.observation, "a base-type note", "observation", false);
+}
+
 test "Kgd: the service refuses a wrong key and an undeclared capability" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;

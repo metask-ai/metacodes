@@ -1513,7 +1513,11 @@ pub const KgClient = struct {
         const pid = (try self.projectNodeId(false, true)) orelse return; // 无 project 无从 scope
         var pbuf: [24]u8 = undefined;
         const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{pid}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{
+        // Sent as an idempotent request, not a fenced write: `--if-absent` makes a
+        // repeat harmless, and tinykgd answers schema-scope with no commit receipt
+        // even when it creates the scope node, which the write path must read as
+        // "may have committed" and then refuse every later write of the session.
+        const out = try self.runChecked(&.{
             "schema-scope", self.store.argvSlot(), schema_type, "--project", p_str, "--if-absent", "--enforce", "block",
         });
         self.freeOut(out);
@@ -2967,8 +2971,13 @@ pub const KgClient = struct {
                     return KgError.Data;
                 },
                 .transient => {
+                    // The daemon answered: whatever went wrong, it is not
+                    // unreachable. Keep the engine's words for the log and the
+                    // model, and report it as the retryable failure it is.
+                    log.warn("kg", "tinykgd {s} exit={d} err={s}", .{ args[0], out.exit_code, err_name });
+                    self.setDetail("{s}", .{trimForLog(out.stderr)});
                     self.freeOut(out);
-                    return KgError.DaemonUnavailable;
+                    return KgError.Transient;
                 },
             }
         }
@@ -3006,12 +3015,17 @@ pub const KgClient = struct {
     const ErrClass = enum { transient, data };
 
     /// stderr `tinykg: error: <Name>` → Name;无匹配返回整段(截断)。
+    /// The engine's error name from its stderr. The CLI writes
+    /// `tinykg: error: <Name>`, the daemon `tinykgd: error: <Name>`; reading only
+    /// the first made every daemon-side refusal unclassifiable, and an
+    /// unclassified error was reported as an unreachable daemon.
     fn parseCliError(stderr: []const u8) []const u8 {
-        const marker = "tinykg: error: ";
-        if (std.mem.indexOf(u8, stderr, marker)) |i| {
-            const rest = stderr[i + marker.len ..];
-            const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-            return rest[0..end];
+        for ([_][]const u8{ "tinykg: error: ", "tinykgd: error: " }) |marker| {
+            if (std.mem.indexOf(u8, stderr, marker)) |i| {
+                const rest = stderr[i + marker.len ..];
+                const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+                return rest[0..end];
+            }
         }
         return trimForLog(stderr);
     }
@@ -3603,4 +3617,12 @@ test "classifyCliError 三类归一" {
 test "parseCliError 提取错误名" {
     try testing.expectEqualStrings("NotFound", KgClient.parseCliError("tinykg: error: NotFound\n"));
     try testing.expectEqualStrings("garbage", KgClient.parseCliError("garbage"));
+}
+
+test "parseCliError reads the daemon's prefix, so its refusals are classified" {
+    // `tinykgd: error: Unsupported` was unparseable, fell through to the
+    // transient default, and reached the model as "daemon unreachable".
+    try testing.expectEqualStrings("Unsupported", KgClient.parseCliError("tinykgd: error: Unsupported\n"));
+    try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError(KgClient.parseCliError("tinykgd: error: Unsupported\n")));
+    try testing.expectEqualStrings("Timeout", KgClient.parseCliError("tinykgd: error: Timeout"));
 }

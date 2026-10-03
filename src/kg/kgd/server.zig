@@ -86,6 +86,13 @@ pub const Supervisor = struct {
     response_deadline_ms: i64 = 0,
     /// Set by `stop`; the accept loop's only exit condition.
     stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The store's full-text index lags its contents. Every committed write
+    /// leaves it so, and the engine refuses the agent-retrieval (JSON) form of
+    /// `search` on a stale index (`Unsupported`), so this service rebuilds it
+    /// before serving a retrieval rather than letting every search after a
+    /// write fail. Read from `store-info` at start; only `handle*` touches it,
+    /// and the accept loop is single-threaded.
+    text_stale: bool = false,
 
     pub fn port(self: *const Supervisor) u16 {
         return self.listener.port;
@@ -123,6 +130,9 @@ pub const Supervisor = struct {
             .listener = undefined,
         };
         self.schema_digest = try self.readStoreContract();
+        // A store that was never indexed (an upgraded or imported one) gets its
+        // index before the first client can ask for it.
+        if (self.text_stale) self.refreshTextIndex();
 
         self.listener = net.listenLoopback(options.port, 16) catch return Error.ListenFailed;
         log.info("kgd", "serving http://127.0.0.1:{d} store={s} build={s}", .{
@@ -190,6 +200,7 @@ pub const Supervisor = struct {
         const stdout = response.string("stdout") orelse return Error.StoreContractUnreadable;
         const storage = infoField(stdout, "storage_format_version") orelse return Error.StoreContractUnreadable;
         const schema = infoField(stdout, "schema_version") orelse return Error.StoreContractUnreadable;
+        self.text_stale = std.mem.eql(u8, infoField(stdout, "text_stale") orelse "0", "1");
         return self.identity.schemaDigest(storage, schema);
     }
 
@@ -307,6 +318,7 @@ pub const Supervisor = struct {
         }
 
         const session_id = stringOf(root, "sessionId");
+        if (self.text_stale and readsTextIndex(command)) self.refreshTextIndex();
         var response = self.bridge.run(.{
             .request_id = request_id,
             .command = command,
@@ -318,7 +330,42 @@ pub const Supervisor = struct {
             return;
         };
         defer response.deinit();
+        self.noteCommit(&response);
         self.sendEnvelope(conn, allocator, request_id, session_id, &response);
+    }
+
+    /// The retrieval commands whose agent (JSON) form needs a current index.
+    fn readsTextIndex(command: []const u8) bool {
+        for ([_][]const u8{ "search", "context-plan", "context-packet" }) |name| {
+            if (std.mem.eql(u8, command, name)) return true;
+        }
+        return false;
+    }
+
+    /// A committed write may have changed text the index does not cover yet.
+    fn noteCommit(self: *Supervisor, response: *const bridge_mod.Response) void {
+        if (std.mem.eql(u8, commitStateOf(response), "committed")) self.text_stale = true;
+    }
+
+    /// `rebuild-text` through the daemon that owns the store. It is a derived
+    /// structure, so a failed rebuild only leaves the flag set: the retrieval
+    /// then returns the engine's own error, and the next one tries again.
+    fn refreshTextIndex(self: *Supervisor) void {
+        var request_id_buffer: [64]u8 = undefined;
+        var response = self.bridge.run(.{
+            .request_id = self.nextRequestId(&request_id_buffer),
+            .command = "rebuild-text",
+        }) catch |err| {
+            log.warn("kgd", "rebuild-text failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer response.deinit();
+        if (!response.boolean("ok")) {
+            log.warn("kgd", "rebuild-text: {s}", .{response.string("stderr") orelse "unknown error"});
+            return;
+        }
+        self.text_stale = false;
+        log.info("kgd", "full-text index rebuilt", .{});
     }
 
     /// One place decides what a bridge failure means to the client, so a new
@@ -406,6 +453,7 @@ pub const Supervisor = struct {
             return;
         };
         defer response.deinit();
+        self.noteCommit(&response);
         self.sendEnvelope(conn, allocator, request_id, null, &response);
     }
 
