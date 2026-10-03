@@ -6,10 +6,14 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 17 must not retain historical callback aliases"
+#error "revision 18 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 17u || \
+#if METASK_AGENTCORE_ABI_REVISION != 18u || \
+    METASK_AGENTCORE_PROMPT_OP_ADD != 1u || \
+    METASK_AGENTCORE_PROMPT_OP_REPLACE != 2u || \
+    METASK_AGENTCORE_PROMPT_OP_REMOVE != 3u || \
+    METASK_AGENTCORE_MAX_CONTEXT_BLOCKS_V1 != 32u || \
     METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE != 27u || \
     METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED != 28u || \
     METASK_AGENTCORE_RUN_INPUT_MULTIMODAL != 3u || \
@@ -29,7 +33,7 @@
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
     METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 17 codes must match the public contract"
+#error "source-free Revision 18 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -489,6 +493,8 @@ int main(int argc, char **argv) {
             raw_api->session_control->abort_compact ||
         api->session_control->export_checkpoint !=
             raw_api->session_control->export_checkpoint ||
+        api->session_control->set_prompt_profile !=
+            raw_api->session_control->set_prompt_profile ||
         api->skill->resolve_catalog != raw_api->skill->resolve_catalog ||
         api->skill->release_catalog != raw_api->skill->release_catalog ||
         api->skill->bind_policy != raw_api->skill->bind_policy ||
@@ -575,10 +581,28 @@ int main(int argc, char **argv) {
     metask_agentcore_bytes_view_v1 allowed_tools[] = {view("HostStreamC")};
     session_host.allowed_tools = allowed_tools;
     session_host.allowed_tool_count = 1;
+    /* A Host persona: replace the kernel identity, add one Host section. */
+    metask_agentcore_prompt_section_v1 prompt_sections[2];
+    memset(prompt_sections, 0, sizeof(prompt_sections));
+    prompt_sections[0].struct_size = (uint32_t)sizeof(prompt_sections[0]);
+    prompt_sections[0].op_code = METASK_AGENTCORE_PROMPT_OP_REPLACE;
+    prompt_sections[0].id = view("metacodes:identity");
+    prompt_sections[0].text = view("You are the C consumer probe.");
+    prompt_sections[1].struct_size = (uint32_t)sizeof(prompt_sections[1]);
+    prompt_sections[1].op_code = METASK_AGENTCORE_PROMPT_OP_ADD;
+    prompt_sections[1].id = view("host:c-consumer");
+    prompt_sections[1].order = 500;
+    prompt_sections[1].text = view("Platform: {{platform}}.");
+    prompt_sections[1].interpolate = 1;
+    metask_agentcore_prompt_profile_v1 prompt_profile = {0};
+    prompt_profile.struct_size = sizeof(prompt_profile);
+    prompt_profile.sections = prompt_sections;
+    prompt_profile.section_count = 2;
     metask_agentcore_session_create_config_v1 session_config = {0};
     session_config.struct_size = sizeof(session_config);
     session_config.host = &session_host;
     session_config.model = view("c-consumer-model");
+    session_config.prompt_profile = &prompt_profile;
 
     metask_agentcore_session *session = NULL;
     if (api->session->create(runtime, &session_config, &callbacks, &session,
@@ -606,6 +630,34 @@ int main(int argc, char **argv) {
         api->session->destroy(session, &diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 17);
+    }
+    /* A locked section is refused with a diagnostic and nothing changes; a
+     * valid replacement (drop the Host section) is accepted while idle. */
+    metask_agentcore_prompt_section_v1 locked_section = prompt_sections[0];
+    locked_section.id = view("metacodes:system");
+    metask_agentcore_prompt_profile_v1 locked_profile = prompt_profile;
+    locked_profile.sections = &locked_section;
+    locked_profile.section_count = 1;
+    if (api->session_control->set_prompt_profile(session, &locked_profile,
+                                                 &diagnostic) !=
+            METASK_AGENTCORE_STATUS_INVALID_ARGUMENT ||
+        diagnostic.ptr == NULL || diagnostic.len == 0) {
+        stop_server(&server);
+        api->buffer_release(&diagnostic);
+        api->session->destroy(session, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 60);
+    }
+    api->buffer_release(&diagnostic);
+    metask_agentcore_prompt_profile_v1 identity_only = prompt_profile;
+    identity_only.section_count = 1;
+    if (api->session_control->set_prompt_profile(session, &identity_only,
+                                                 &diagnostic) !=
+        METASK_AGENTCORE_STATUS_OK) {
+        stop_server(&server);
+        api->session->destroy(session, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 61);
     }
     metask_agentcore_compact_result_v1 compact_result = {0};
     if (api->session_control->compact(session, 1, &compact_result,
@@ -712,9 +764,18 @@ int main(int argc, char **argv) {
     input.struct_size = sizeof(input);
     input.kind_code = METASK_AGENTCORE_RUN_INPUT_TEXT;
     input.text = view("exercise C ABI");
+    /* A volatile Host fact for this Run only, as user-role context. */
+    metask_agentcore_context_block_v1 context_block = {0};
+    context_block.struct_size = sizeof(context_block);
+    context_block.label = view("currentDate");
+    context_block.text = view("Today's date is 2026/10/02.");
+    metask_agentcore_run_options_v1 context_options = options;
+    context_options.context_blocks = &context_block;
+    context_options.context_block_count = 1;
     active_run_id = 1;
-    uint32_t run_status = api->session->run_input(session, 1, &input, &options,
-                                                 &result, &diagnostic);
+    uint32_t run_status = api->session->run_input(session, 1, &input,
+                                                 &context_options, &result,
+                                                 &diagnostic);
     active_run_id = 0;
     if (run_status != METASK_AGENTCORE_STATUS_OK ||
         result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN) {

@@ -156,6 +156,30 @@ pub fn cloneIssues(
     return result;
 }
 
+/// Copy a prompt profile into `arena` (a describe arena: freed whole).
+pub fn cloneProfile(
+    arena: std.mem.Allocator,
+    source: core.prompt_sections.Profile,
+) error{OutOfMemory}!core.prompt_sections.Profile {
+    const sections = try arena.alloc(core.prompt_sections.ProfileSection, source.sections.len);
+    for (source.sections, sections) |section, *copy| {
+        copy.* = section;
+        copy.id = try arena.dupe(u8, section.id);
+        copy.text = try arena.dupe(u8, section.text);
+    }
+    return .{ .sections = sections };
+}
+
+/// Copy a prompt manifest into `arena` (a describe arena: freed whole).
+pub fn cloneManifest(
+    arena: std.mem.Allocator,
+    source: core.prompt_sections.Manifest,
+) error{OutOfMemory}!core.prompt_sections.Manifest {
+    const entries = try arena.dupe(core.prompt_sections.ManifestEntry, source.entries);
+    for (entries) |*entry| entry.id = try arena.dupe(u8, entry.id);
+    return .{ .entries = entries, .sha256 = source.sha256 };
+}
+
 pub const McpToolDescription = struct {
     model_name: []const u8,
     namespace: []const u8,
@@ -209,6 +233,10 @@ pub const SessionDescription = struct {
     invalidated_skill_authority: u32,
     invalidated_permission_rules: u32,
     invalidated_mcp_bindings: u32,
+    /// The profile Runs render from, and the manifest of the latest Run's
+    /// system prompt (null before the first Run). Both live in `arena`.
+    prompt_profile: core.prompt_sections.Profile = .{},
+    prompt_manifest: ?core.prompt_sections.Manifest = null,
 
     pub fn deinit(self: *SessionDescription) void {
         self.arena.deinit();

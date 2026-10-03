@@ -35,6 +35,12 @@ pub const SkillSourceProjection = protocol.SkillSourceProjection;
 pub const SkillSourceScope = protocol.SkillSourceScope;
 pub const McpCatalog = protocol.McpCatalog;
 pub const SessionDescription = protocol.SessionDescription;
+pub const PromptManifest = protocol.PromptManifest;
+pub const PromptManifestSection = protocol.PromptManifestSection;
+pub const PromptProfileSection = protocol.PromptProfileSection;
+pub const PromptSectionOp = protocol.PromptSectionOp;
+pub const PromptSectionOrigin = protocol.PromptSectionOrigin;
+pub const PromptSectionClass = protocol.PromptSectionClass;
 pub const RestoreReport = protocol.RestoreReport;
 pub const ParsedCoreEvent = protocol.ParsedCoreEvent;
 pub const ParsedUiRequest = protocol.ParsedUiRequest;
@@ -332,6 +338,10 @@ pub const SessionControlApi = struct {
     pub fn exportCheckpoint(self: SessionControlApi) types.SessionExportCheckpointFnV1 {
         return self.raw.export_checkpoint.?;
     }
+    /// Replaces the Session's prompt profile while idle; null clears it.
+    pub fn setPromptProfile(self: SessionControlApi) types.SessionSetPromptProfileFnV1 {
+        return self.raw.set_prompt_profile.?;
+    }
 };
 
 pub const SkillApi = struct {
@@ -387,7 +397,8 @@ fn validateSessionControlApi(raw: ?*const types.SessionControlApiV1) bool {
     return api.struct_size == @sizeOf(types.SessionControlApiV1) and api.reserved0 == 0 and
         api.restore != null and api.describe != null and api.set_model != null and
         api.update_permission_rules != null and api.compact != null and
-        api.abort_compact != null and api.export_checkpoint != null;
+        api.abort_compact != null and api.export_checkpoint != null and
+        api.set_prompt_profile != null;
 }
 
 fn validateSkillApi(raw: ?*const types.SkillApiV1) bool {
@@ -434,7 +445,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 17 SDK rejects Revision 13 through 16 and stale reference roots" {
+test "Revision 18 SDK rejects Revision 13 through 17 and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -450,9 +461,9 @@ test "Revision 17 SDK rejects Revision 13 through 16 and stale reference roots" 
     try std.testing.expectEqual(@as(usize, 280), @sizeOf(Revision13Api));
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision13));
 
-    // Revisions 14, 15 and the withdrawn 16 share the 64-byte shape; only the
+    // Revisions 14 through 17 (16 withdrawn) share the 64-byte root; only the
     // revision check rejects them, so each must fail exactly there.
-    for ([_]u32{ 14, 15, 16 }) |older| {
+    for ([_]u32{ 14, 15, 16, 17 }) |older| {
         var root: types.ApiV1 align(@alignOf(types.ApiV1)) =
             std.mem.zeroes(types.ApiV1);
         root.struct_size = @sizeOf(types.ApiV1);

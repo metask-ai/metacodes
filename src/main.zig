@@ -836,6 +836,7 @@ pub fn main(init: std.process.Init) !void {
     // --dump-prompt：打印组装好的 system prompt + 工具 defs(name + description)后退出。
     // 不发网络、不需有效 key。用于验证提示词×工具复刻(工具长描述 + 动态裁剪)。
     if (config.dump_prompt) {
+        if (config.dump_prompt_sections) dumpPromptSectionsAndExit(app);
         dumpPromptAndExit(app);
     }
     if (config.dump_plugins) {
@@ -945,6 +946,51 @@ fn dumpPromptAndExit(app: *app_mod.App) noreturn {
     }
     dumpWrite("\n");
     std.process.exit(0);
+}
+
+/// `--dump-prompt --sections` (#184): the named sections the system prompt joins,
+/// in render order, each with its id, order, class, origin, size and digest,
+/// then the prompt digest checked against the prompt App actually built.
+fn dumpPromptSectionsAndExit(app: *app_mod.App) noreturn {
+    const system_prompt_mod = @import("core/system_prompt.zig");
+    const cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
+    const listing = system_prompt_mod.listFullWithDefs(
+        app.allocator,
+        app.config.model_display_name orelse app.config.model,
+        &app.skills,
+        &app.agents,
+        app.enabled_tool_names,
+        app.memdir_abs,
+        app.kgReady(),
+        cwd,
+        app.tool_defs,
+    ) catch |err| {
+        var buf: [96]u8 = undefined;
+        dumpWrite(std.fmt.bufPrint(&buf, "prompt sections unavailable: {s}\n", .{@errorName(err)}) catch "prompt sections unavailable\n");
+        std.process.exit(1);
+    };
+    const prompt_sections = @import("core/prompt_sections.zig");
+    var line: [256]u8 = undefined;
+    dumpWrite("========== SYSTEM PROMPT SECTIONS ==========\n");
+    for (listing.sections) |section| {
+        dumpWrite(std.fmt.bufPrint(&line, "\n----- [{d}] {s} ({s}, {s}) {d} bytes sha256={s} -----\n", .{
+            section.order,
+            section.id,
+            @tagName(section.class),
+            @tagName(section.origin),
+            section.text.len,
+            &std.fmt.bytesToHex(prompt_sections.sha256(section.text), .lower),
+        }) catch "\n----- (section header too long) -----\n");
+        dumpWrite(if (section.text.len == 0) "(empty)" else section.text);
+        dumpWrite("\n");
+    }
+    const built = if (app.system_prompt) |text| prompt_sections.sha256(text) else null;
+    const matches = if (built) |digest| std.mem.eql(u8, &digest, &listing.sha256) else false;
+    dumpWrite(std.fmt.bufPrint(&line, "\n========== PROMPT sha256={s} ({s}) ==========\n", .{
+        &std.fmt.bytesToHex(listing.sha256, .lower),
+        if (matches) "matches the built prompt" else "differs from the built prompt",
+    }) catch "\n");
+    std.process.exit(if (matches) 0 else 1);
 }
 
 fn dumpPluginsAndExit(app: *app_mod.App) noreturn {
@@ -2661,6 +2707,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             }
         } else if (std.mem.eql(u8, arg, "--dump-prompt")) {
             config.dump_prompt = true;
+        } else if (std.mem.eql(u8, arg, "--sections")) {
+            config.dump_prompt_sections = true;
         } else if (std.mem.eql(u8, arg, "--dump-plugins")) {
             config.dump_plugins = true;
         } else if (std.mem.eql(u8, arg, "-")) {
@@ -2688,6 +2736,9 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
     // fail-closed 契约。统一在 parse 尾部拒绝(parseArgsForTest 可测)。
     if (config.images != null and config.prompt == null and config.parse_error == null) {
         setParseError(config, allocator, "--image requires -p/--print (headless prompt mode)", .{});
+    }
+    if (config.dump_prompt_sections and !config.dump_prompt and config.parse_error == null) {
+        setParseError(config, allocator, "--sections requires --dump-prompt", .{});
     }
 }
 
@@ -2780,6 +2831,7 @@ fn printHelp() void {
         \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
         \\  --image <path>        Headless: attach an image (png/jpg/jpeg/gif/webp) to the prompt (repeatable, order kept)
         \\  --dump-prompt         Print the assembled system prompt and exit
+        \\  --sections            With --dump-prompt: list the named prompt sections (id, order, class, digest)
         \\  --dump-plugins        Print the immutable plugin inventory JSON and exit
         \\  serve [port]          Daemon mode (HTTP; default port 7777)
         \\  --sessions <n>        Daemon: static session count (>1 enables multi-session)

@@ -4,7 +4,12 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 17 or
+    if (wire.ABI_REVISION != 18 or
+        wire.PROMPT_OP_ADD != 1 or
+        wire.PROMPT_OP_REPLACE != 2 or
+        wire.PROMPT_OP_REMOVE != 3 or
+        wire.MAX_PROMPT_PROFILE_SECTIONS_V1 != 64 or
+        wire.MAX_CONTEXT_BLOCKS_V1 != 32 or
         @intFromEnum(wire.Status.skill_catalog_incomplete) != 27 or
         @intFromEnum(wire.Status.image_input_unsupported) != 28 or
         wire.RUN_INPUT_MULTIMODAL != 3 or
@@ -24,10 +29,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 17 codes must match the public contract");
+        @compileError("source-free Revision 18 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 17 must not expose the removed catalog refresh entry");
+        @compileError("revision 18 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -128,6 +133,8 @@ const Probe = struct {
     saw_file_change: bool = false,
     saw_final_text: bool = false,
     saw_final_output_segment: bool = false,
+    /// A Run announced the manifest of the system prompt it sends.
+    saw_prompt_manifest: bool = false,
     output_segment_open: bool = false,
     output_segment_index: u32 = 0,
     output_segment_turn: u32 = 0,
@@ -250,6 +257,15 @@ const Probe = struct {
                     self.output_segment_open = false;
                     if (segment.disposition == .final and segment.bytes == "artifact done".len)
                         self.saw_final_output_segment = true;
+                },
+                .prompt_manifest => |manifest| {
+                    var host_section = false;
+                    for (manifest.sections) |section| {
+                        if (std.mem.eql(u8, section.id, "host:artifact-consumer") and section.origin == .host)
+                            host_section = true;
+                    }
+                    if (!host_section or manifest.sha256.len != 64) return wire.EVENT_FATAL;
+                    self.saw_prompt_manifest = true;
                 },
                 else => {},
             },
@@ -620,12 +636,32 @@ pub fn main(init: std.process.Init) !void {
         .protocol_kind_code = wire.PROTOCOL_DEFAULT,
         .reserved = [_]u64{0} ** 3,
     };
+    // A Host section the Session renders into every Run's system prompt and
+    // carries through its checkpoint.
+    const prompt_sections = [_]wire.PromptSectionV1{.{
+        .struct_size = @sizeOf(wire.PromptSectionV1),
+        .op_code = wire.PROMPT_OP_ADD,
+        .id = sdk.bytesView("host:artifact-consumer"),
+        .order = 500,
+        .text = sdk.bytesView("Answer as the artifact consumer."),
+        .interpolate = 0,
+        .reserved0 = 0,
+        .reserved = [_]u64{0} ** 2,
+    }};
+    const prompt_profile = wire.PromptProfileV1{
+        .struct_size = @sizeOf(wire.PromptProfileV1),
+        .reserved0 = 0,
+        .sections = &prompt_sections,
+        .section_count = prompt_sections.len,
+        .reserved = [_]u64{0} ** 4,
+    };
     var config = wire.SessionCreateConfigV1{
         .struct_size = @sizeOf(wire.SessionCreateConfigV1),
         .reserved0 = 0,
         .host = &session_host,
         .model = sdk.bytesView("artifact-model"),
-        .reserved = [_]u64{0} ** 4,
+        .prompt_profile = &prompt_profile,
+        .reserved = [_]u64{0} ** 3,
     };
     var callbacks = wire.SessionCallbacksV1{
         .struct_size = @sizeOf(wire.SessionCallbacksV1),
@@ -674,7 +710,7 @@ pub fn main(init: std.process.Init) !void {
         diagnostic,
     );
     api.bufferRelease()(&diagnostic);
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 7, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 7, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
     var result: wire.RunResultV1 = undefined;
     const encoded_arguments = try sdk.encodeSkillArguments(
         a,
@@ -847,6 +883,7 @@ pub fn main(init: std.process.Init) !void {
     try probe.endRun(4);
     if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn)
         return error.UnexpectedRunResult;
+    if (!probe.saw_prompt_manifest) return error.MissingPromptManifest;
 
     try probe.unregisterSession(session.?);
     try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
@@ -854,7 +891,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 17 Agent Runtime, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 18 Agent Runtime, prompt profile, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

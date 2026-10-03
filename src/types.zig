@@ -80,6 +80,8 @@ pub const Config = struct {
     /// `--dump-prompt`：构造完 system prompt + 工具 defs 后打印到 stdout 并退出，
     /// 不发网络、不需 API key。用于验证提示词×工具复刻。
     dump_prompt: bool = false,
+    /// `--dump-prompt --sections`:按命名段(id/order/class/origin/sha256)逐段打印(#184)。
+    dump_prompt_sections: bool = false,
     /// `--dump-plugins`:打印版本化 immutable plugin inventory JSON 后退出。
     dump_plugins: bool = false,
     /// `--check-providers`: validate the provider configuration and print every

@@ -579,3 +579,20 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(std.mem.indexOf(u8, second_tools, "knowforge__overview") == null);
     try std.testing.expect(std.mem.indexOf(u8, second_system, "- knowforge__overview") != null);
 }
+
+test "L2: --sections refines --dump-prompt and is refused on its own" {
+    const a = std.testing.allocator;
+    {
+        const argv = [_][*:0]const u8{ "metacodes", "--dump-prompt", "--sections" };
+        const config = cc.parseArgsForTest(&argv, a);
+        try std.testing.expect(config.dump_prompt and config.dump_prompt_sections);
+        try std.testing.expect(config.parse_error == null);
+    }
+    {
+        const argv = [_][*:0]const u8{ "metacodes", "--sections" };
+        const config = cc.parseArgsForTest(&argv, a);
+        const message = config.parse_error orelse return error.ExpectedParseError;
+        defer a.free(message);
+        try std.testing.expectEqualStrings("--sections requires --dump-prompt", message);
+    }
+}

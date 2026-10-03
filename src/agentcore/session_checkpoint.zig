@@ -13,6 +13,12 @@ pub const STATE_SCHEMA_REVISION: u32 = 1;
 /// Persisted compatibility marker for the current checkpoint envelope. This is
 /// intentionally independent from the public AgentCore API table revision.
 pub const CHECKPOINT_COMPATIBILITY_MARKER: u32 = 8;
+/// The envelope of a Session with a prompt profile (#184): the marker-8 layout
+/// plus a seventh section, the encoded profile, whose length is in header
+/// bytes 184..192. A Session without a profile keeps the marker-8 envelope
+/// byte for byte, so its checkpoints stay readable by earlier libraries; one
+/// with a profile is refused by them as incompatible, never misread.
+pub const PROMPT_PROFILE_COMPATIBILITY_MARKER: u32 = 9;
 pub const HEADER_BYTES: usize = 192;
 pub const DIGEST_BYTES: usize = 32;
 pub const MIN_CHECKPOINT_BUDGET: u64 = HEADER_BYTES + DIGEST_BYTES + 1;
@@ -26,6 +32,7 @@ pub const MAX_CHUNK_BYTES: u32 = 1024 * 1024;
 
 const magic = "METASK-R6-CKPT\x00\x00";
 const section_count: u32 = 6;
+const prompt_profile_section_count: u32 = 7;
 const flag_has_compact_summary: u32 = 1 << 0;
 
 pub const Error = error{
@@ -88,6 +95,9 @@ pub const Snapshot = struct {
     policy_generation: u64 = 0,
     catalog_generation: u64 = 0,
     authority: AuthoritySections = .{},
+    /// The encoded prompt profile section (`prompt_checkpoint`); empty when
+    /// the Session has no profile.
+    prompt_profile: []const u8 = "",
 };
 
 pub const Descriptor = struct {
@@ -110,6 +120,8 @@ pub const Decoded = struct {
     skill_state: []u8,
     permission_state: []u8,
     mcp_state: []u8,
+    /// Empty for a marker-8 checkpoint: the Session had no prompt profile.
+    prompt_profile: []u8,
 
     pub fn deinit(self: *Decoded) void {
         self.conversation.deinit();
@@ -117,6 +129,7 @@ pub const Decoded = struct {
         self.allocator.free(self.skill_state);
         self.allocator.free(self.permission_state);
         self.allocator.free(self.mcp_state);
+        self.allocator.free(self.prompt_profile);
         self.* = undefined;
     }
 };
@@ -153,6 +166,7 @@ const Measurement = struct {
     skill_bytes: u64,
     permission_bytes: u64,
     mcp_bytes: u64,
+    prompt_bytes: u64,
     flags: u32,
 };
 
@@ -168,6 +182,7 @@ pub fn exportToSink(snapshot: Snapshot, limits: Limits, sink: Sink) Error!Export
     try writer.writeHashed(snapshot.authority.skill);
     try writer.writeHashed(snapshot.authority.permission);
     try writer.writeHashed(snapshot.authority.mcp);
+    try writer.writeHashed(snapshot.prompt_profile);
     for (snapshot.conversation.activeMessages()) |item|
         try writeMessage(&writer, item);
     var digest: [DIGEST_BYTES]u8 = undefined;
@@ -277,6 +292,12 @@ pub fn decodeFromSource(
         parsed.payload_end,
     );
     errdefer allocator.free(mcp_state);
+    const prompt_profile = try reader.readOwned(
+        allocator,
+        parsed.measurement.prompt_bytes,
+        parsed.payload_end,
+    );
+    errdefer allocator.free(prompt_profile);
 
     var conversation = Conversation.init(allocator);
     errdefer conversation.deinit();
@@ -329,6 +350,7 @@ pub fn decodeFromSource(
         .skill_state = skill_state,
         .permission_state = permission_state,
         .mcp_state = mcp_state,
+        .prompt_profile = prompt_profile,
     };
 }
 
@@ -345,6 +367,7 @@ fn measure(snapshot: Snapshot, limits: Limits) Error!Measurement {
     const skill_bytes = try boundedSection(snapshot.authority.skill, limits);
     const permission_bytes = try boundedSection(snapshot.authority.permission, limits);
     const mcp_bytes = try boundedSection(snapshot.authority.mcp, limits);
+    const prompt_bytes = try boundedSection(snapshot.prompt_profile, limits);
     const active_messages = snapshot.conversation.activeMessages();
     const message_count: u64 = @intCast(active_messages.len);
     const restored_message_count = try checkedAdd(
@@ -364,6 +387,7 @@ fn measure(snapshot: Snapshot, limits: Limits) Error!Measurement {
     payload_bytes = try checkedAdd(payload_bytes, skill_bytes);
     payload_bytes = try checkedAdd(payload_bytes, permission_bytes);
     payload_bytes = try checkedAdd(payload_bytes, mcp_bytes);
+    payload_bytes = try checkedAdd(payload_bytes, prompt_bytes);
     payload_bytes = try checkedAdd(payload_bytes, message_bytes);
     var total_bytes = try checkedAdd(HEADER_BYTES, payload_bytes);
     total_bytes = try checkedAdd(total_bytes, DIGEST_BYTES);
@@ -380,6 +404,7 @@ fn measure(snapshot: Snapshot, limits: Limits) Error!Measurement {
         .skill_bytes = skill_bytes,
         .permission_bytes = permission_bytes,
         .mcp_bytes = mcp_bytes,
+        .prompt_bytes = prompt_bytes,
         .flags = if (snapshot.conversation.compact_summary != null)
             flag_has_compact_summary
         else
@@ -486,9 +511,13 @@ fn encodeHeader(snapshot: Snapshot, measured: Measurement) [HEADER_BYTES]u8 {
     var out = [_]u8{0} ** HEADER_BYTES;
     @memcpy(out[0..magic.len], magic);
     putInt(&out, 16, u32, STATE_SCHEMA_REVISION);
-    putInt(&out, 20, u32, CHECKPOINT_COMPATIBILITY_MARKER);
+    const has_prompt_profile = measured.prompt_bytes != 0;
+    putInt(&out, 20, u32, if (has_prompt_profile)
+        PROMPT_PROFILE_COMPATIBILITY_MARKER
+    else
+        CHECKPOINT_COMPATIBILITY_MARKER);
     putInt(&out, 24, u32, measured.flags);
-    putInt(&out, 28, u32, section_count);
+    putInt(&out, 28, u32, if (has_prompt_profile) prompt_profile_section_count else section_count);
     putInt(&out, 32, u64, snapshot.checkpoint_generation);
     putInt(&out, 40, u64, snapshot.last_run_id);
     putInt(&out, 48, u64, snapshot.last_compact_id);
@@ -506,6 +535,7 @@ fn encodeHeader(snapshot: Snapshot, measured: Measurement) [HEADER_BYTES]u8 {
     putInt(&out, 160, u32, @intFromEnum(snapshot.terminal_kind));
     putInt(&out, 168, u64, snapshot.policy_generation);
     putInt(&out, 176, u64, snapshot.catalog_generation);
+    putInt(&out, 184, u64, measured.prompt_bytes);
     return out;
 }
 
@@ -520,12 +550,18 @@ fn parseHeader(header: *const [HEADER_BYTES]u8, limits: Limits) Error!ParsedHead
     if (!std.mem.eql(u8, header[0..magic.len], magic)) return error.Corrupt;
     if (getInt(header, 16, u32) != STATE_SCHEMA_REVISION)
         return error.UnsupportedSchema;
-    if (getInt(header, 20, u32) != CHECKPOINT_COMPATIBILITY_MARKER)
-        return error.IncompatibleAbi;
+    const has_prompt_profile = switch (getInt(header, 20, u32)) {
+        CHECKPOINT_COMPATIBILITY_MARKER => false,
+        PROMPT_PROFILE_COMPATIBILITY_MARKER => true,
+        else => return error.IncompatibleAbi,
+    };
     const flags = getInt(header, 24, u32);
+    const prompt_bytes = getInt(header, 184, u64);
     if ((flags & ~flag_has_compact_summary) != 0 or
-        getInt(header, 28, u32) != section_count or
-        !allZero(header[164..168]) or !allZero(header[184..192]))
+        getInt(header, 28, u32) != (if (has_prompt_profile) prompt_profile_section_count else section_count) or
+        !allZero(header[164..168]) or
+        // A marker-9 envelope exists only to carry a non-empty profile.
+        (prompt_bytes != 0) != has_prompt_profile)
         return error.Corrupt;
     const total_bytes = getInt(header, 64, u64);
     const message_bytes = getInt(header, 72, u64);
@@ -552,12 +588,14 @@ fn parseHeader(header: *const [HEADER_BYTES]u8, limits: Limits) Error!ParsedHead
         summary_bytes > limits.max_string_bytes or
         skill_bytes > limits.max_section_bytes or
         permission_bytes > limits.max_section_bytes or
-        mcp_bytes > limits.max_section_bytes)
+        mcp_bytes > limits.max_section_bytes or
+        prompt_bytes > limits.max_section_bytes)
         return error.ResourceLimit;
     var payload_bytes = try checkedAdd(model_bytes, summary_bytes);
     payload_bytes = try checkedAdd(payload_bytes, skill_bytes);
     payload_bytes = try checkedAdd(payload_bytes, permission_bytes);
     payload_bytes = try checkedAdd(payload_bytes, mcp_bytes);
+    payload_bytes = try checkedAdd(payload_bytes, prompt_bytes);
     payload_bytes = try checkedAdd(payload_bytes, message_bytes);
     const expected_total = try checkedAdd(
         try checkedAdd(HEADER_BYTES, payload_bytes),
@@ -605,6 +643,7 @@ fn parseHeader(header: *const [HEADER_BYTES]u8, limits: Limits) Error!ParsedHead
             .skill_bytes = skill_bytes,
             .permission_bytes = permission_bytes,
             .mcp_bytes = mcp_bytes,
+            .prompt_bytes = prompt_bytes,
             .flags = flags,
         },
         .messages_end = messages_end,
@@ -1169,6 +1208,7 @@ test "Revision 6 checkpoint snapshot surface excludes runtime capabilities" {
         "policy_generation",
         "catalog_generation",
         "authority",
+        "prompt_profile",
     };
     const fields = @typeInfo(Snapshot).@"struct".fields;
     try std.testing.expectEqual(expected_fields.len, fields.len);

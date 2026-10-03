@@ -535,17 +535,15 @@ pub const Environment = struct {
         else
             child_environment.surface();
 
-        // 缺陷 A 修复:子 Agent 系统提示 = 静态字面量 + 环境段(cwd=workspace.root)。
-        // 与 abi_v1.zig 共用 buildSubagentSystemPrompt,确保两路径一致。
-        const sp_mod = core.system_prompt;
-        const owned_subagent_system_prompt = sp_mod.buildSubagentSystemPrompt(
-            self.allocator,
-            self.session.model,
-            self.session.workspace.root,
-        ) catch null;
-        defer if (owned_subagent_system_prompt) |prompt| self.allocator.free(prompt);
-        const subagent_system_prompt = owned_subagent_system_prompt orelse
-            sp_mod.SUBAGENT_LITERAL;
+        // 缺陷 A 修复:子 Agent 系统提示 = `metacodes:subagent` + 环境段(cwd=workspace.root),
+        // 继承 Session 的提示词档案(#184);与 Skill Run root(abi_v1 runIsolated)同一渲染器。
+        var subagent_prompt = self.session.renderSubagentPrompt(self.allocator) catch |err| {
+            child_environment.deinit() catch return error.CoreError;
+            activation.deinit() catch return error.CoreError;
+            return err;
+        };
+        defer subagent_prompt.deinit(self.allocator);
+        const subagent_system_prompt = subagent_prompt.text;
 
         const child = core.subagent.spawnAgentSink(
             self.allocator,

@@ -3956,7 +3956,9 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 17), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 18), wire.ABI_REVISION);
+    // A Session without a prompt profile keeps the marker-8 envelope across
+    // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
         @as(u32, 8),
         std.mem.readInt(u32, &abi_revision_bytes, .little),
@@ -6631,7 +6633,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     try std.testing.expectEqual(wire.STATUS_BUSY, api.runtime().destroy()(runtime, &diagnostic));
     api.bufferRelease()(&diagnostic);
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().abort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
@@ -6768,7 +6770,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
         diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
 
         fn run(self: *@This()) void {
-            var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .reserved = [_]u64{0} ** 4 };
+            var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
             self.status = self.api.session().runText(self.session, 1, sdk.bytesView("pause in facade epilogue"), &options, &self.result, &self.diagnostic);
         }
     };
@@ -6828,7 +6830,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     try std.testing.expectEqual(@as(u64, 1), barrier.seen_run_id.load(.acquire));
 
     var competing_result: wire.RunResultV1 = undefined;
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
         api.session().runText(session, 2, sdk.bytesView("must not enter during epilogue"), &options, &competing_result, &diagnostic),
@@ -6999,7 +7001,7 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("invoke failing host"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
@@ -7137,7 +7139,9 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
     var options = wire.RunOptionsV1{
         .struct_size = @sizeOf(wire.RunOptionsV1),
         .max_turns = 4,
-        .reserved = [_]u64{0} ** 4,
+        .context_blocks = null,
+        .context_block_count = 0,
+        .reserved = [_]u64{0} ** 2,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
@@ -7274,7 +7278,9 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
     var options = wire.RunOptionsV1{
         .struct_size = @sizeOf(wire.RunOptionsV1),
         .max_turns = 4,
-        .reserved = [_]u64{0} ** 4,
+        .context_blocks = null,
+        .context_block_count = 0,
+        .reserved = [_]u64{0} ** 2,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
@@ -7419,7 +7425,7 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_CALLBACK_FAILED,
@@ -7485,7 +7491,7 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
@@ -7564,7 +7570,7 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(expected_status, api.session().runText(session, 1, sdk.bytesView("ask through Host UI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
@@ -7615,7 +7621,7 @@ test "L2 Host UI callback may repeat abort while nested run and destroy stay bus
 }
 
 fn expectMappedEventEquals(event: core.protocol.ui_event.CoreEvent, expected: sdk.CoreEvent) !void {
-    const mapped = abi.protocol_v1.event(event) orelse return error.UnexpectedInternalOnlyEvent;
+    const mapped = (try abi.protocol_v1.event(std.testing.allocator, event)) orelse return error.UnexpectedInternalOnlyEvent;
     try std.testing.expectEqualDeep(expected, mapped);
     const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, mapped, .{});
     defer std.testing.allocator.free(encoded);
@@ -8910,7 +8916,7 @@ test "L2 RunState: an abort accepted from the finalizing callback yields one ter
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
@@ -8961,7 +8967,7 @@ test "L2 RunState: a Host rejecting the terminal snapshot fails the Run with CAL
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
     var result: wire.RunResultV1 = undefined;
     // 修复前:终态快照被拒绝的结果被丢弃,这里返回 STATUS_OK。
     try std.testing.expectEqual(
@@ -9345,4 +9351,332 @@ test "L2 an over-cap Provider response is delivered, then refused before Convers
     try std.testing.expect(probe.text_events > 0);
     try std.testing.expectEqual(@as(usize, 1), probe.discarded_segments);
     try std.testing.expectEqual(@as(usize, 0), probe.committed_segments);
+}
+
+/// Counts the public `prompt_manifest` events of every Session it serves.
+const PromptManifestProbe = struct {
+    manifests: u32 = 0,
+    last_sha256: [64]u8 = [_]u8{0} ** 64,
+    last_sections: usize = 0,
+
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .known => |known| switch (known) {
+                .prompt_manifest => |manifest| {
+                    self.manifests += 1;
+                    @memcpy(&self.last_sha256, manifest.sha256[0..64]);
+                    self.last_sections = manifest.sections.len;
+                },
+                else => {},
+            },
+            .unknown => return wire.EVENT_FATAL,
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+fn promptSection(op_code: u32, id: []const u8, order: i64, text: []const u8) wire.PromptSectionV1 {
+    var section = std.mem.zeroes(wire.PromptSectionV1);
+    section.struct_size = @sizeOf(wire.PromptSectionV1);
+    section.op_code = op_code;
+    section.id = sdk.bytesView(id);
+    section.order = order;
+    section.text = if (text.len == 0) .{ .ptr = null, .len = 0 } else sdk.bytesView(text);
+    return section;
+}
+
+fn promptProfile(sections: []const wire.PromptSectionV1) wire.PromptProfileV1 {
+    var profile = std.mem.zeroes(wire.PromptProfileV1);
+    profile.struct_size = @sizeOf(wire.PromptProfileV1);
+    profile.sections = sections.ptr;
+    profile.section_count = sections.len;
+    return profile;
+}
+
+fn decodeDescription(api: sdk.Api, session: ?*wire.SessionHandle) !sdk.ParsedSessionDescription {
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().describe()(session, &description, &diagnostic));
+    defer api.bufferRelease()(&description);
+    return sdk.decodeSessionDescription(std.testing.allocator, try sdk.borrowedBytes(.{
+        .ptr = description.ptr,
+        .len = description.len,
+    }));
+}
+
+test "L2 public prompt profile shapes the system prompt, survives restore, and changes once per set" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer _ = api.runtime().destroy()(runtime, &diagnostic);
+
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    const sections = [_]wire.PromptSectionV1{
+        promptSection(wire.PROMPT_OP_REPLACE, "metacodes:identity", 0, "You are Shopkeeper, a browser agent for store back offices."),
+        promptSection(wire.PROMPT_OP_ADD, "host:browser-rules", 500, "Read the page before acting on it."),
+    };
+    var profile = promptProfile(&sections);
+    var create_config = sessionCreateConfig(&host, "test-model");
+    create_config.prompt_profile = &profile;
+    var probe = PromptManifestProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = PromptManifestProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic));
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("check the orders page"), &options, &result, &diagnostic));
+    const first = server.requestAt(0) orelse return error.NoRequestCaptured;
+    const first_system = first.jsonField("system") orelse return error.MissingSystemPrompt;
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "You are Shopkeeper, a browser agent for store back offices.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "Read the page before acting on it.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "MetaCode") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "software engineering") == null);
+    // The locked governance sections stay.
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "IMPORTANT: Assist with authorized security testing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "# System") != null);
+    try std.testing.expectEqual(@as(u32, 1), probe.manifests);
+
+    // An unchanged prompt is the same cache prefix and announces nothing.
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 2, sdk.bytesView("and the refunds"), &options, &result, &diagnostic));
+    const second = server.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expectEqualStrings(first_system, second.jsonField("system").?);
+    try std.testing.expectEqual(@as(u32, 1), probe.manifests);
+
+    {
+        const described = try decodeDescription(api, session);
+        defer described.deinit();
+        const prompt = described.value.prompt;
+        try std.testing.expectEqual(@as(usize, 2), prompt.profile.len);
+        try std.testing.expectEqual(sdk.protocol.PromptSectionOp.replace, prompt.profile[0].op);
+        try std.testing.expectEqualStrings("metacodes:identity", prompt.profile[0].id);
+        try std.testing.expectEqualStrings("host:browser-rules", prompt.profile[1].id);
+        try std.testing.expectEqual(@as(i64, 500), prompt.profile[1].order);
+        const manifest = prompt.manifest orelse return error.MissingManifest;
+        try std.testing.expectEqualStrings(&probe.last_sha256, manifest.sha256);
+        try std.testing.expectEqual(probe.last_sections, manifest.sections.len);
+        try std.testing.expectEqual(sdk.protocol.PromptSectionOrigin.host, manifest.sections[0].origin);
+        try std.testing.expectEqual(sdk.protocol.PromptSectionClass.locked, manifest.sections[1].class);
+    }
+
+    // The checkpoint carries the profile (the marker-9 envelope), so the
+    // restored Session sends the same system prompt bytes.
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic));
+    try std.testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, checkpoint.bytes.items[20..24], .little));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().restore()(runtime, &restore_config, &callbacks, &session, &restore_report, &diagnostic));
+    api.bufferRelease()(&restore_report);
+    {
+        const described = try decodeDescription(api, session);
+        defer described.deinit();
+        try std.testing.expectEqual(@as(usize, 2), described.value.prompt.profile.len);
+        try std.testing.expectEqualStrings("Read the page before acting on it.", described.value.prompt.profile[1].text);
+        // No Run of the restored Session has rendered a prompt yet.
+        try std.testing.expect(described.value.prompt.manifest == null);
+    }
+    const announced_before_restore = probe.last_sha256;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 3, sdk.bytesView("resume"), &options, &result, &diagnostic));
+    const third = server.requestAt(2) orelse return error.NoRequestCaptured;
+    try std.testing.expectEqualStrings(first_system, third.jsonField("system").?);
+    try std.testing.expectEqual(@as(u32, 2), probe.manifests);
+    try std.testing.expectEqualSlices(u8, &announced_before_restore, &probe.last_sha256);
+
+    // Clearing the profile is exactly one boundary: the kernel prompt returns.
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().setPromptProfile()(session, null, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 4, sdk.bytesView("plain again"), &options, &result, &diagnostic));
+    const fourth = server.requestAt(3) orelse return error.NoRequestCaptured;
+    const fourth_system = fourth.jsonField("system").?;
+    try std.testing.expect(std.mem.indexOf(u8, fourth_system, "You are MetaCode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fourth_system, "Shopkeeper") == null);
+    try std.testing.expectEqual(@as(u32, 3), probe.manifests);
+
+    // A refused replacement names the entry and the rule and changes nothing.
+    const locked = [_]wire.PromptSectionV1{promptSection(wire.PROMPT_OP_REPLACE, "metacodes:system", 0, "x")};
+    var locked_profile = promptProfile(&locked);
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.sessionControl().setPromptProfile()(session, &locked_profile, &diagnostic));
+    {
+        defer api.bufferRelease()(&diagnostic);
+        const message = try sdk.borrowedBytes(.{ .ptr = diagnostic.ptr, .len = diagnostic.len });
+        try std.testing.expectEqualStrings("prompt profile section 0 (metacodes:system): the section is locked", message);
+    }
+    const described = try decodeDescription(api, session);
+    defer described.deinit();
+    try std.testing.expectEqual(@as(usize, 0), described.value.prompt.profile.len);
+}
+
+test "L2 public prompt profile refusals name the entry and the rule at create" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var fixture = try PublicSessionFixture.init(root, "http://127.0.0.1:9", "test-model");
+    defer fixture.deinit();
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+
+    const cases = [_]struct { []const wire.PromptSectionV1, u32, []const u8 }{
+        .{ &.{promptSection(wire.PROMPT_OP_REMOVE, "metacodes:safety-policy", 0, "")}, wire.STATUS_INVALID_ARGUMENT, "prompt profile section 0 (metacodes:safety-policy): the section is locked" },
+        .{ &.{
+            promptSection(wire.PROMPT_OP_ADD, "host:a", 1, "x"),
+            promptSection(wire.PROMPT_OP_ADD, "host:a", 2, "y"),
+        }, wire.STATUS_INVALID_ARGUMENT, "prompt profile section 1 (host:a): the id appears in more than one profile entry" },
+        .{ &.{promptSection(wire.PROMPT_OP_ADD, "host:a", 1, "{{cwd}}")}, wire.STATUS_OK, "" },
+        .{ &.{promptSection(wire.PROMPT_OP_ADD, "metacodes:mine", 1, "x")}, wire.STATUS_INVALID_ARGUMENT, "prompt profile section 0 (metacodes:mine): add takes a host: id; metacodes: ids are reserved for kernel sections" },
+        .{ &.{promptSection(9, "host:a", 1, "x")}, wire.STATUS_INVALID_ARGUMENT, "invalid argument: InvalidPromptProfile" },
+    };
+    for (cases) |case| {
+        var profile = promptProfile(case[0]);
+        var create_config = sessionCreateConfig(&host, "test-model");
+        create_config.prompt_profile = &profile;
+        var session: ?*wire.SessionHandle = null;
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        try std.testing.expectEqual(case[1], fixture.api.session().create()(fixture.runtime, &create_config, &callbacks, &session, &diagnostic));
+        defer fixture.api.bufferRelease()(&diagnostic);
+        if (case[1] == wire.STATUS_OK) {
+            // Without interpolation `{{cwd}}` is plain text.
+            try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().destroy()(session, &diagnostic));
+            continue;
+        }
+        try std.testing.expect(session == null);
+        const message = try sdk.borrowedBytes(.{ .ptr = diagnostic.ptr, .len = diagnostic.len });
+        try std.testing.expectEqualStrings(case[2], message);
+    }
+
+    var interpolated = [_]wire.PromptSectionV1{promptSection(wire.PROMPT_OP_ADD, "host:a", 1, "at {{cwd}}")};
+    interpolated[0].interpolate = 1;
+    var bad_variable = promptProfile(&interpolated);
+    var create_config = sessionCreateConfig(&host, "test-model");
+    create_config.prompt_profile = &bad_variable;
+    var session: ?*wire.SessionHandle = null;
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().create()(fixture.runtime, &create_config, &callbacks, &session, &diagnostic));
+    fixture.api.bufferRelease()(&diagnostic);
+
+    var too_many: [65]wire.PromptSectionV1 = undefined;
+    for (&too_many) |*section| section.* = promptSection(wire.PROMPT_OP_ADD, "host:a", 0, "x");
+    var oversized = promptProfile(&too_many);
+    create_config.prompt_profile = &oversized;
+    try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, fixture.api.session().create()(fixture.runtime, &create_config, &callbacks, &session, &diagnostic));
+    fixture.api.bufferRelease()(&diagnostic);
+}
+
+test "L2 public context blocks lead the Run's user record and stay in history" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    const blocks = [_]wire.ContextBlockV1{
+        .{ .struct_size = @sizeOf(wire.ContextBlockV1), .reserved0 = 0, .label = sdk.bytesView("currentDate"), .text = sdk.bytesView("Today's date is 2026/10/02."), .reserved = [_]u64{0} ** 2 },
+        .{ .struct_size = @sizeOf(wire.ContextBlockV1), .reserved0 = 0, .label = sdk.bytesView("host:page"), .text = sdk.bytesView("URL: https://shop.example/orders"), .reserved = [_]u64{0} ** 2 },
+    };
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    options.context_blocks = &blocks;
+    options.context_block_count = blocks.len;
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    // A Skill Run does not take context blocks; nothing is admitted.
+    var skill_input = std.mem.zeroes(wire.RunInputV1);
+    skill_input.struct_size = @sizeOf(wire.RunInputV1);
+    skill_input.kind_code = wire.RUN_INPUT_SKILL;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().runInput()(fixture.session, 1, &skill_input, &options, &result, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+
+    var bad_blocks = blocks;
+    bad_blocks[1].label = sdk.bytesView("bad\nlabel");
+    var bad_options = options;
+    bad_options.context_blocks = &bad_blocks;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("x"), &bad_options, &result, &fixture.diagnostic));
+    {
+        const message = try sdk.borrowedBytes(.{ .ptr = fixture.diagnostic.ptr, .len = fixture.diagnostic.len });
+        try std.testing.expect(std.mem.startsWith(u8, message, "context block 1: the label is not"));
+    }
+    fixture.releaseDiagnostic();
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("summarize the open orders"), &options, &result, &fixture.diagnostic));
+    const first = (server.requestAt(0) orelse return error.NoRequestCaptured).body();
+    const reminder = "<system-reminder>\\nThe host application provided the following context for this request:\\n# currentDate\\nToday's date is 2026/10/02.\\n# host:page\\nURL: https://shop.example/orders\\n";
+    const reminder_at = std.mem.indexOf(u8, first, reminder) orelse return error.MissingContextReminder;
+    const prompt_at = std.mem.indexOf(u8, first, "summarize the open orders") orelse return error.MissingPrompt;
+    try std.testing.expect(reminder_at < prompt_at);
+
+    // The next Run without blocks still carries the first Run's context in
+    // its history: the cached prefix only grows.
+    var plain = options;
+    plain.context_blocks = null;
+    plain.context_block_count = 0;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 2, sdk.bytesView("and the refunds"), &plain, &result, &fixture.diagnostic));
+    const second = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second, "<system-reminder>\\nThe host application"));
 }

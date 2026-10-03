@@ -15,6 +15,7 @@ const util_time = @import("../util/time.zig");
 const util_fs = @import("../util/fs.zig");
 const execution_effect = @import("execution_effect.zig");
 const run_recovery = @import("run_recovery.zig");
+const prompt_sections = @import("prompt_sections.zig");
 
 pub const SCHEMA_VERSION_V1 = "metacodes-tool-observation-journal-v1";
 pub const SCHEMA_VERSION = "metacodes-tool-observation-journal-v2";
@@ -27,10 +28,45 @@ pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// 8-way tool window without imposing that memory cost on ordinary sessions.
 pub const MAX_PENDING_EFFECTS: usize = 8192;
 
+/// One section of the system prompt a Run sends (#184), as in its manifest.
+pub const PromptSectionRecord = struct {
+    id: []const u8,
+    order: i64,
+    origin: prompt_sections.Origin,
+    class: prompt_sections.Class,
+    sha256: [64]u8,
+};
+
+/// The manifest of the system prompt a Run sends: its sections in order and
+/// the digest of the whole prompt.
+pub const PromptRecord = struct {
+    sha256: [64]u8,
+    sections: []const PromptSectionRecord,
+};
+
+pub const MAX_PROMPT_RECORD_SECTIONS: usize = 128;
+
+pub const RunStarted = struct {
+    started_wall_ns: i128,
+    /// Present when the Session rendered the Run's system prompt.
+    prompt: ?PromptRecord = null,
+
+    /// `prompt` is written only when present, so a Run without one keeps the
+    /// historical record bytes.
+    pub fn jsonStringify(self: RunStarted, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("started_wall_ns");
+        try jws.write(self.started_wall_ns);
+        if (self.prompt) |prompt| {
+            try jws.objectField("prompt");
+            try jws.write(prompt);
+        }
+        try jws.endObject();
+    }
+};
+
 pub const JournalEvent = union(enum) {
-    run_started: struct {
-        started_wall_ns: i128,
-    },
+    run_started: RunStarted,
     tool_observation: observation.Event,
     provider_attempt: execution_effect.ProviderAttemptEvent,
     run_finished: struct {
@@ -202,6 +238,16 @@ pub const Journal = struct {
         session_dir: []const u8,
         session_id: session_id_mod.SessionId,
     ) !Journal {
+        return initWithPrompt(session_dir, session_id, null);
+    }
+
+    /// `init`, recording in `run_started` the manifest of the system prompt
+    /// the Run sends (#184).
+    pub fn initWithPrompt(
+        session_dir: []const u8,
+        session_id: session_id_mod.SessionId,
+        prompt: ?prompt_sections.Manifest,
+    ) !Journal {
         var lock_path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const lock_path = try std.fmt.bufPrint(
             &lock_path_buf,
@@ -254,8 +300,24 @@ pub const Journal = struct {
             .recovery = run_recovery.Reducer.init(std.heap.c_allocator, MAX_PENDING_EFFECTS),
         };
         errdefer journal.recovery.deinit();
+        var prompt_sections_buf: [MAX_PROMPT_RECORD_SECTIONS]PromptSectionRecord = undefined;
+        const prompt_record: ?PromptRecord = if (prompt) |manifest| blk: {
+            if (manifest.entries.len > MAX_PROMPT_RECORD_SECTIONS) return error.PromptRecordTooLarge;
+            for (manifest.entries, prompt_sections_buf[0..manifest.entries.len]) |entry, *record| record.* = .{
+                .id = entry.id,
+                .order = entry.order,
+                .origin = entry.origin,
+                .class = entry.class,
+                .sha256 = std.fmt.bytesToHex(entry.sha256, .lower),
+            };
+            break :blk .{
+                .sha256 = std.fmt.bytesToHex(manifest.sha256, .lower),
+                .sections = prompt_sections_buf[0..manifest.entries.len],
+            };
+        } else null;
         try journal.appendEvent(.{ .run_started = .{
             .started_wall_ns = util_time.nowWallNs(),
+            .prompt = prompt_record,
         } });
         try fsyncDirectory(session_dir);
         return journal;
@@ -860,11 +922,14 @@ fn validateFd(
         applyRecoveryEvent(&recovery, run_id, envelope.event) catch
             return error.InvalidRecord;
         switch (envelope.event) {
-            .run_started => {
+            .run_started => |started| {
                 if (active_run != null or open_dispatches.count() != 0 or
                     open_provider_attempts.count() != 0 or
                     pending_rule_filters.count() != 0)
                     return error.InvalidRecord;
+                if (started.prompt) |prompt| {
+                    if (!validPromptRecord(prompt)) return error.InvalidRecord;
+                }
                 active_run = run_id;
                 active_elapsed_ns = envelope.monotonic_elapsed_ns;
                 if (expected_binding) |binding| {
@@ -1228,6 +1293,23 @@ fn validateRuleFilter(
 fn validHex(value: [64]u8) bool {
     for (value) |byte| {
         if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
+fn validPromptRecord(prompt: PromptRecord) bool {
+    if (!validHex(prompt.sha256) or prompt.sections.len > MAX_PROMPT_RECORD_SECTIONS) return false;
+    for (prompt.sections, 0..) |section, index| {
+        if (!validHex(section.sha256) or
+            !(std.mem.startsWith(u8, section.id, prompt_sections.kernel_prefix) or
+                std.mem.startsWith(u8, section.id, prompt_sections.host_prefix)))
+            return false;
+        if (index != 0) {
+            const previous = prompt.sections[index - 1];
+            if (previous.order > section.order or
+                (previous.order == section.order and std.mem.order(u8, previous.id, section.id) != .lt))
+                return false;
+        }
     }
     return true;
 }
@@ -2834,6 +2916,67 @@ test "sealed run retains crash marker until derived publication releases it" {
     defer next.deinit();
     try next.finishRun("end_turn");
     journal.deinit();
+}
+
+test "run_started records the Run's prompt manifest only when there is one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    var entries = [_]prompt_sections.ManifestEntry{
+        .{ .id = "metacodes:identity", .order = -1000, .origin = .host, .class = .replaceable, .sha256 = prompt_sections.sha256("I") },
+        .{ .id = "host:rules", .order = 500, .origin = .host, .class = .removable, .sha256 = prompt_sections.sha256("R") },
+    };
+    const manifest: prompt_sections.Manifest = .{ .entries = &entries, .sha256 = prompt_sections.sha256("I\n\nR") };
+    var with_prompt = try Journal.initWithPrompt(root, sid, manifest);
+    try with_prompt.finishRun("end_turn");
+    with_prompt.deinit();
+    var without_prompt = try Journal.init(root, sid);
+    try without_prompt.finishRun("end_turn");
+    without_prompt.deinit();
+    try std.testing.expect((try validate(root, sid)).complete);
+
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, FILE_NAME, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    const first = lines.next().?;
+    const expected_prompt = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"prompt\":{{\"sha256\":\"{s}\",\"sections\":[" ++
+            "{{\"id\":\"metacodes:identity\",\"order\":-1000,\"origin\":\"host\",\"class\":\"replaceable\",\"sha256\":\"{s}\"}}," ++
+            "{{\"id\":\"host:rules\",\"order\":500,\"origin\":\"host\",\"class\":\"removable\",\"sha256\":\"{s}\"}}]}}}}}}}}",
+        .{
+            &std.fmt.bytesToHex(prompt_sections.sha256("I\n\nR"), .lower),
+            &std.fmt.bytesToHex(prompt_sections.sha256("I"), .lower),
+            &std.fmt.bytesToHex(prompt_sections.sha256("R"), .lower),
+        },
+    );
+    defer std.testing.allocator.free(expected_prompt);
+    try std.testing.expect(std.mem.endsWith(u8, first, expected_prompt));
+    _ = lines.next().?; // run_finished
+    const third = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, third, "\"run_started\":{\"started_wall_ns\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, third, "prompt") == null);
+}
+
+test "a recorded prompt manifest must be well formed" {
+    const digest = std.fmt.bytesToHex(prompt_sections.sha256("x"), .lower);
+    var sections = [_]PromptSectionRecord{
+        .{ .id = "metacodes:identity", .order = -1000, .origin = .kernel, .class = .replaceable, .sha256 = digest },
+        .{ .id = "host:rules", .order = 500, .origin = .host, .class = .removable, .sha256 = digest },
+    };
+    try std.testing.expect(validPromptRecord(.{ .sha256 = digest, .sections = &sections }));
+    var upper = digest;
+    upper[0] = 'F';
+    try std.testing.expect(!validPromptRecord(.{ .sha256 = upper, .sections = &sections }));
+    sections[1].id = "other:rules";
+    try std.testing.expect(!validPromptRecord(.{ .sha256 = digest, .sections = &sections }));
+    sections[1].id = "host:rules";
+    sections[1].order = -2000;
+    try std.testing.expect(!validPromptRecord(.{ .sha256 = digest, .sections = &sections }));
 }
 
 test "tool observation journal rejects a partial existing record" {
