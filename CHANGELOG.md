@@ -12,6 +12,38 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Hosts customize the system prompt per Session (#184, phase 2). AgentCore
+  ABI v1 moves to **revision 18**: `SessionCreateConfigV1.prompt_profile`
+  edits the kernel's named prompt sections — replace `metacodes:identity`,
+  add `host:*` sections at any order, replace or remove optional guidance —
+  while the safety policy and system rules stay locked and the environment
+  facts stay kernel-generated. Replacing the identity also drops the
+  sentences that belong to it (the environment product line, the doing-tasks
+  framing and help bullets), so the prompt names neither MetaCode nor
+  software engineering. An invalid profile is refused whole with a diagnostic
+  naming the entry and the rule (locked/generated targets, duplicate or
+  malformed ids, limits, strict `{{model}}`/`{{workspace_root}}`/`{{platform}}`
+  interpolation). The profile is frozen into the Session and its checkpoints;
+  the new `session_control->set_prompt_profile` replaces it while idle, one
+  prompt-cache boundary per effective change. Subagent and fork-Skill prompts
+  inherit it through the replaceable `metacodes:subagent`. Each Run reports
+  its prompt — section ids, orders, origins, classes and digests, and the
+  prompt digest — in the journal's `run_started` record, in a new
+  `prompt_manifest` observation event when it differs from the previous Run's,
+  and in `describe` (`prompt.profile`, `prompt.manifest`).
+  `RunOptionsV1.context_blocks` gives one text or multimodal Run volatile Host
+  facts as a leading `<system-reminder>` text part of its user record, so they
+  extend the cached history instead of moving the system prompt. The Session
+  Control table grows to 72 bytes; `SessionCreateConfigV1` and `RunOptionsV1`
+  keep their sizes. A checkpoint without a profile keeps the marker-8 envelope
+  byte for byte; one with a profile is marker 9 and older libraries refuse it
+  as incompatible. Without a profile every prompt is byte-identical to before.
+  The source-level Zig API offers the same through
+  `SessionConfig.prompt_profile` and `AgentSession.setPromptProfile`. SDK
+  package version `0.5.0-dev`.
+- `metacodes --dump-prompt --sections` lists the CLI's system prompt section
+  by section (id, order, class, origin, size, digest) and checks the joined
+  digest against the prompt it built.
 - Every AgentCore bundle ships a shared library beside the static one
   (#182): `lib/libmetask_agentcore.so`, `lib/libmetask_agentcore.dylib`, or
   `lib/metask_agentcore.dll`, for Hosts that can only load a library at run

@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 17 root plus mandatory domain tables. Discovery rejects
+/// Validated Revision 18 root plus mandatory domain tables. Discovery rejects
 /// every other layout; there is no legacy probe or alternate dispatch.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -190,6 +190,10 @@ impl SessionControlApi {
     pub fn export_checkpoint(self) -> raw::metask_agentcore_session_export_checkpoint_fn_v1 {
         self.table().export_checkpoint
     }
+    /// Replaces the Session's prompt profile while idle; null clears it.
+    pub fn set_prompt_profile(self) -> raw::metask_agentcore_session_set_prompt_profile_fn_v1 {
+        self.table().set_prompt_profile
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -286,6 +290,7 @@ unsafe fn validate_session_control_api(
         && table.compact.is_some()
         && table.abort_compact.is_some()
         && table.export_checkpoint.is_some()
+        && table.set_prompt_profile.is_some()
 }
 
 unsafe fn validate_skill_api(ptr: *const raw::metask_agentcore_skill_api_v1) -> bool {
@@ -599,7 +604,20 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 17);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 18);
+        assert_eq!(raw::METASK_AGENTCORE_PROMPT_OP_ADD, 1);
+        assert_eq!(raw::METASK_AGENTCORE_PROMPT_OP_REPLACE, 2);
+        assert_eq!(raw::METASK_AGENTCORE_PROMPT_OP_REMOVE, 3);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_PROMPT_PROFILE_SECTIONS_V1, 64);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_CONTEXT_BLOCKS_V1, 32);
+        assert_eq!(size_of::<raw::metask_agentcore_prompt_section_v1>(), 72);
+        assert_eq!(size_of::<raw::metask_agentcore_prompt_profile_v1>(), 56);
+        assert_eq!(size_of::<raw::metask_agentcore_context_block_v1>(), 56);
+        assert_eq!(size_of::<raw::metask_agentcore_run_options_v1>(), 40);
+        assert_eq!(
+            size_of::<raw::metask_agentcore_session_create_config_v1>(),
+            64
+        );
         assert_eq!(raw::METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE, 27);
         assert_eq!(raw::METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED, 28);
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_MULTIMODAL, 3);
@@ -628,7 +646,7 @@ mod tests {
         assert_eq!(size_of::<raw::metask_agentcore_session_api_v1>(), 40);
         assert_eq!(
             size_of::<raw::metask_agentcore_session_control_api_v1>(),
-            64
+            72
         );
         assert_eq!(size_of::<raw::metask_agentcore_skill_api_v1>(), 32);
         assert_eq!(size_of::<raw::metask_agentcore_mcp_api_v1>(), 40);

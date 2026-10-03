@@ -1,19 +1,24 @@
-//! Named system-prompt sections (#184).
+//! Named system-prompt sections and Session prompt profiles (#184).
 //!
 //! The system prompt is an ordered set of sections, each with a stable id
 //! (`metacodes:*` for the kernel's own), an order, a class that says what a
-//! Host may later do with it, and a join mode. Rendering sorts by
-//! `(order, id)` and joins with a blank line.
+//! Host may do with it, and a join mode. Rendering sorts by `(order, id)` and
+//! joins with a blank line.
 //!
 //! The join modes reproduce the historical layout byte for byte: the fixed
 //! kernel sections (`always`) contribute their separator even when empty, as
 //! the old concatenation did (an empty `# Using your tools` left a doubled
 //! blank line), while the optional ones (`when_nonempty`) appear only with
 //! text.
+//!
+//! A profile edits the kernel sections by id: `add` a Host section, `replace`
+//! a kernel section's text, or `remove` one. The class of the target decides
+//! what is allowed, and an invalid profile is refused whole, with the first
+//! broken rule as its diagnostic, before any prompt is rendered from it.
 
 const std = @import("std");
 
-/// What a Host may do with a section once Session prompt profiles exist.
+/// What a Host may do with a section.
 pub const Class = enum {
     /// Governance text: never replaced or removed.
     locked,
@@ -45,20 +50,456 @@ fn lessThan(_: void, a: Section, b: Section) bool {
     return std.mem.order(u8, a.id, b.id) == .lt;
 }
 
-/// Sort `sections` in place by `(order, id)` and join them. Ids are unique,
-/// so the order is total.
+/// Whether a section reaches the joined prompt: fixed sections always do,
+/// optional ones only with text.
+pub fn isRendered(section: Section) bool {
+    return section.join == .always or section.text.len != 0;
+}
+
+const rendered = isRendered;
+
+/// Sort `sections` in place by `(order, id)` and join them with a blank
+/// line. Ids are unique, so the order is total.
 pub fn render(allocator: std.mem.Allocator, sections: []Section) ![]u8 {
+    return renderJoined(allocator, sections, separator);
+}
+
+/// `render` with another joiner: the subagent prompt has always joined its
+/// two parts with a single newline.
+pub fn renderJoined(allocator: std.mem.Allocator, sections: []Section, joiner: []const u8) ![]u8 {
     std.mem.sort(Section, sections, {}, lessThan);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var first = true;
     for (sections) |section| {
-        if (section.join == .when_nonempty and section.text.len == 0) continue;
-        if (!first) try out.appendSlice(allocator, separator);
+        if (!rendered(section)) continue;
+        if (!first) try out.appendSlice(allocator, joiner);
         try out.appendSlice(allocator, section.text);
         first = false;
     }
     return out.toOwnedSlice(allocator);
+}
+
+// ---------------------------------------------------------------- profiles
+
+pub const Op = enum { add, replace, remove };
+
+pub const ProfileSection = struct {
+    op: Op,
+    /// `host:*` for `add`; a kernel `metacodes:*` id for `replace`/`remove`.
+    id: []const u8,
+    /// `add` only; ties are broken by id.
+    order: i64 = 0,
+    /// `add` and `replace`: non-empty text. `remove`: empty.
+    text: []const u8 = "",
+    /// Substitute `{{model}}`, `{{workspace_root}}` and `{{platform}}` in
+    /// `text`. Any other `{{...}}` refuses the profile.
+    interpolate: bool = false,
+};
+
+pub const Profile = struct {
+    sections: []const ProfileSection = &.{},
+
+    pub fn isEmpty(self: Profile) bool {
+        return self.sections.len == 0;
+    }
+
+    pub fn replaces(self: Profile, id: []const u8) bool {
+        for (self.sections) |section| {
+            if (section.op == .replace and std.mem.eql(u8, section.id, id)) return true;
+        }
+        return false;
+    }
+
+    pub fn eql(a: Profile, b: Profile) bool {
+        if (a.sections.len != b.sections.len) return false;
+        for (a.sections, b.sections) |x, y| {
+            if (x.op != y.op or x.order != y.order or x.interpolate != y.interpolate or
+                !std.mem.eql(u8, x.id, y.id) or !std.mem.eql(u8, x.text, y.text))
+                return false;
+        }
+        return true;
+    }
+};
+
+/// A Session-owned deep copy of a validated profile.
+pub const OwnedProfile = struct {
+    arena: ?std.heap.ArenaAllocator = null,
+    sections: []const ProfileSection = &.{},
+
+    pub fn clone(allocator: std.mem.Allocator, source: Profile) !OwnedProfile {
+        if (source.isEmpty()) return .{};
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const sections = try a.alloc(ProfileSection, source.sections.len);
+        for (source.sections, sections) |section, *copy| {
+            copy.* = section;
+            copy.id = try a.dupe(u8, section.id);
+            copy.text = try a.dupe(u8, section.text);
+        }
+        return .{ .arena = arena, .sections = sections };
+    }
+
+    pub fn profile(self: *const OwnedProfile) Profile {
+        return .{ .sections = self.sections };
+    }
+
+    pub fn deinit(self: *OwnedProfile) void {
+        if (self.arena) |*arena| arena.deinit();
+        self.* = .{};
+    }
+};
+
+pub const Limits = struct {
+    max_sections: usize = 64,
+    max_text_bytes: usize = 64 * 1024,
+    max_total_bytes: usize = 256 * 1024,
+};
+
+pub const max_id_name_bytes = 64;
+pub const kernel_prefix = "metacodes:";
+pub const host_prefix = "host:";
+
+/// The values a profile may interpolate, taken when the prompt is rendered.
+pub const Variables = struct {
+    model: []const u8,
+    workspace_root: []const u8,
+    platform: []const u8,
+
+    fn get(self: Variables, name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "model")) return self.model;
+        if (std.mem.eql(u8, name, "workspace_root")) return self.workspace_root;
+        if (std.mem.eql(u8, name, "platform")) return self.platform;
+        return null;
+    }
+};
+
+/// A kernel section a profile may name.
+pub const KernelInfo = struct { id: []const u8, class: Class };
+
+pub const Issue = enum {
+    too_many_sections,
+    text_too_large,
+    total_too_large,
+    invalid_id,
+    invalid_utf8,
+    duplicate_id,
+    add_needs_host_id,
+    unknown_section,
+    locked_section,
+    generated_section,
+    not_removable,
+    empty_text,
+    remove_takes_no_text,
+    order_needs_add,
+    unknown_variable,
+    malformed_variable,
+
+    pub fn describe(self: Issue) []const u8 {
+        return switch (self) {
+            .too_many_sections => "the profile has more sections than allowed",
+            .text_too_large => "the section text is larger than allowed",
+            .total_too_large => "the profile's texts together are larger than allowed",
+            .invalid_id => "the id is not metacodes:<name> or host:<name> with a [a-z0-9][a-z0-9._-]* name of at most 64 bytes",
+            .invalid_utf8 => "the section text is not valid UTF-8",
+            .duplicate_id => "the id appears in more than one profile entry",
+            .add_needs_host_id => "add takes a host: id; metacodes: ids are reserved for kernel sections",
+            .unknown_section => "replace and remove name a kernel section, and no kernel section has this id",
+            .locked_section => "the section is locked",
+            .generated_section => "the section is generated by the kernel from Session facts",
+            .not_removable => "the section may be replaced but not removed",
+            .empty_text => "add and replace need non-empty text",
+            .remove_takes_no_text => "remove takes no text and no interpolation",
+            .order_needs_add => "only add takes an order",
+            .unknown_variable => "the text names a variable other than {{model}}, {{workspace_root}} or {{platform}}",
+            .malformed_variable => "the text has a {{ that does not open a {{name}} variable",
+        };
+    }
+};
+
+/// The first rule a refused profile broke: its entry, id and issue. `id`
+/// borrows the profile.
+pub const Diagnostic = struct {
+    index: usize,
+    id: []const u8,
+    issue: Issue,
+
+    pub fn format(self: Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("prompt profile section {d}", .{self.index});
+        if (self.id.len != 0) try writer.print(" ({s})", .{self.id});
+        try writer.print(": {s}", .{self.issue.describe()});
+    }
+};
+
+fn validId(id: []const u8) bool {
+    const name = if (std.mem.startsWith(u8, id, kernel_prefix))
+        id[kernel_prefix.len..]
+    else if (std.mem.startsWith(u8, id, host_prefix))
+        id[host_prefix.len..]
+    else
+        return false;
+    if (name.len == 0 or name.len > max_id_name_bytes) return false;
+    if (!std.ascii.isLower(name[0]) and !std.ascii.isDigit(name[0])) return false;
+    for (name) |byte| {
+        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and byte != '.' and byte != '_' and byte != '-')
+            return false;
+    }
+    return true;
+}
+
+fn findKernel(kernel: []const KernelInfo, id: []const u8) ?KernelInfo {
+    for (kernel) |info| if (std.mem.eql(u8, info.id, id)) return info;
+    return null;
+}
+
+const Variable = struct { start: usize, end: usize, name: []const u8 };
+
+/// The next `{{name}}` at or after `cursor`, or the issue with the first `{{`
+/// that does not open one. A `}}` outside a variable is plain text.
+fn nextVariable(text: []const u8, cursor: usize) union(enum) { none, found: Variable, bad: Issue } {
+    const open = std.mem.indexOfPos(u8, text, cursor, "{{") orelse return .none;
+    const close = std.mem.indexOfPos(u8, text, open + 2, "}}") orelse return .{ .bad = .malformed_variable };
+    const name = text[open + 2 .. close];
+    if (name.len == 0) return .{ .bad = .malformed_variable };
+    for (name) |byte| {
+        if (!std.ascii.isLower(byte) and byte != '_') return .{ .bad = .malformed_variable };
+    }
+    return .{ .found = .{ .start = open, .end = close + 2, .name = name } };
+}
+
+fn checkVariables(text: []const u8) ?Issue {
+    const known: Variables = .{ .model = "", .workspace_root = "", .platform = "" };
+    var cursor: usize = 0;
+    while (true) {
+        switch (nextVariable(text, cursor)) {
+            .none => return null,
+            .bad => |issue| return issue,
+            .found => |variable| {
+                if (known.get(variable.name) == null) return .unknown_variable;
+                cursor = variable.end;
+            },
+        }
+    }
+}
+
+/// Refuse a profile that breaks any rule, naming the first broken one; null
+/// when every entry is valid against `kernel`, the sections a profile may
+/// name.
+pub fn validate(profile: Profile, kernel: []const KernelInfo, limits: Limits) ?Diagnostic {
+    if (profile.sections.len > limits.max_sections)
+        return .{ .index = limits.max_sections, .id = "", .issue = .too_many_sections };
+    var total: usize = 0;
+    for (profile.sections, 0..) |section, index| {
+        if (check(profile, section, index, kernel, limits, &total)) |issue|
+            return .{ .index = index, .id = section.id, .issue = issue };
+    }
+    return null;
+}
+
+fn check(
+    profile: Profile,
+    section: ProfileSection,
+    index: usize,
+    kernel: []const KernelInfo,
+    limits: Limits,
+    total: *usize,
+) ?Issue {
+    if (!validId(section.id)) return .invalid_id;
+    for (profile.sections[0..index]) |earlier| {
+        if (std.mem.eql(u8, earlier.id, section.id)) return .duplicate_id;
+    }
+    if (section.text.len > limits.max_text_bytes) return .text_too_large;
+    total.* += section.text.len;
+    if (total.* > limits.max_total_bytes) return .total_too_large;
+    if (!std.unicode.utf8ValidateSlice(section.text)) return .invalid_utf8;
+    switch (section.op) {
+        .add => {
+            if (!std.mem.startsWith(u8, section.id, host_prefix)) return .add_needs_host_id;
+            if (section.text.len == 0) return .empty_text;
+        },
+        .replace, .remove => {
+            if (section.order != 0) return .order_needs_add;
+            const info = findKernel(kernel, section.id) orelse return .unknown_section;
+            switch (info.class) {
+                .locked => return .locked_section,
+                .generated => return .generated_section,
+                .replaceable => if (section.op == .remove) return .not_removable,
+                .removable => {},
+            }
+            if (section.op == .replace and section.text.len == 0) return .empty_text;
+            if (section.op == .remove and (section.text.len != 0 or section.interpolate))
+                return .remove_takes_no_text;
+        },
+    }
+    if (section.interpolate) return checkVariables(section.text);
+    return null;
+}
+
+fn interpolate(allocator: std.mem.Allocator, text: []const u8, variables: Variables) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    while (true) {
+        switch (nextVariable(text, cursor)) {
+            .none => break,
+            // `validate` refused a malformed or unknown variable before a
+            // profile reaches rendering.
+            .bad => unreachable,
+            .found => |variable| {
+                try out.appendSlice(allocator, text[cursor..variable.start]);
+                try out.appendSlice(allocator, variables.get(variable.name).?);
+                cursor = variable.end;
+            },
+        }
+    }
+    try out.appendSlice(allocator, text[cursor..]);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Apply a validated profile to `kernel`, returning the edited section list.
+///
+/// `replace` substitutes the text of a section that renders: a conditional
+/// (`when_nonempty`) kernel section whose condition is off stays absent. An
+/// op naming a kernel section missing from `kernel` (the subagent prompt has
+/// fewer) does nothing. Interpolated texts come from `allocator`, so pass an
+/// arena that outlives the rendered prompt.
+pub fn apply(
+    allocator: std.mem.Allocator,
+    kernel: []const Section,
+    profile: Profile,
+    variables: Variables,
+) ![]Section {
+    var sections: std.ArrayList(Section) = .empty;
+    errdefer sections.deinit(allocator);
+    try sections.appendSlice(allocator, kernel);
+    for (profile.sections) |entry| {
+        const text = if (entry.interpolate) try interpolate(allocator, entry.text, variables) else entry.text;
+        switch (entry.op) {
+            .add => try sections.append(allocator, .{
+                .id = entry.id,
+                .order = entry.order,
+                .class = .removable,
+                .join = .when_nonempty,
+                .origin = .host,
+                .text = text,
+            }),
+            .replace => for (sections.items) |*section| {
+                if (!std.mem.eql(u8, section.id, entry.id)) continue;
+                if (rendered(section.*)) {
+                    section.text = text;
+                    section.origin = .host;
+                }
+                break;
+            },
+            .remove => for (sections.items, 0..) |section, index| {
+                if (!std.mem.eql(u8, section.id, entry.id)) continue;
+                _ = sections.orderedRemove(index);
+                break;
+            },
+        }
+    }
+    return sections.toOwnedSlice(allocator);
+}
+
+// ---------------------------------------------------------------- manifest
+
+pub const ManifestEntry = struct {
+    id: []const u8,
+    order: i64,
+    origin: Origin,
+    class: Class,
+    sha256: [32]u8,
+};
+
+/// What a rendered prompt is made of: each section that reached it, in
+/// order, with the digest of its text, and the digest of the whole prompt.
+pub const Manifest = struct {
+    entries: []ManifestEntry,
+    sha256: [32]u8,
+
+    pub fn deinit(self: *Manifest, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+        self.* = undefined;
+    }
+
+    /// One digest over every field, to tell two manifests apart: two prompts
+    /// with the same bytes but differently attributed sections differ.
+    pub fn fingerprint(self: Manifest) [32]u8 {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(&self.sha256);
+        for (self.entries) |entry| {
+            var header: [8 + 8 + 2]u8 = undefined;
+            std.mem.writeInt(u64, header[0..8], entry.id.len, .little);
+            std.mem.writeInt(i64, header[8..16], entry.order, .little);
+            header[16] = @intFromEnum(entry.origin);
+            header[17] = @intFromEnum(entry.class);
+            hasher.update(&header);
+            hasher.update(entry.id);
+            hasher.update(&entry.sha256);
+        }
+        return hasher.finalResult();
+    }
+};
+
+/// A manifest that owns its entry ids.
+pub const OwnedManifest = struct {
+    arena: std.heap.ArenaAllocator,
+    manifest: Manifest,
+
+    pub fn clone(allocator: std.mem.Allocator, source: Manifest) !OwnedManifest {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const entries = try a.dupe(ManifestEntry, source.entries);
+        for (entries) |*entry| entry.id = try a.dupe(u8, entry.id);
+        return .{ .arena = arena, .manifest = .{ .entries = entries, .sha256 = source.sha256 } };
+    }
+
+    pub fn deinit(self: *OwnedManifest) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn sha256(bytes: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
+pub const Rendered = struct {
+    text: []u8,
+    manifest: Manifest,
+
+    pub fn deinit(self: *Rendered, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.manifest.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Render `sections` (sorted in place) and describe the result. Entry ids
+/// borrow the sections.
+pub fn renderWithManifest(allocator: std.mem.Allocator, sections: []Section, joiner: []const u8) !Rendered {
+    const text = try renderJoined(allocator, sections, joiner);
+    errdefer allocator.free(text);
+    var entries: std.ArrayList(ManifestEntry) = .empty;
+    errdefer entries.deinit(allocator);
+    for (sections) |section| {
+        if (!rendered(section)) continue;
+        try entries.append(allocator, .{
+            .id = section.id,
+            .order = section.order,
+            .origin = section.origin,
+            .class = section.class,
+            .sha256 = sha256(section.text),
+        });
+    }
+    return .{
+        .text = text,
+        .manifest = .{ .entries = try entries.toOwnedSlice(allocator), .sha256 = sha256(text) },
+    };
 }
 
 const testing = std.testing;
@@ -71,8 +512,175 @@ test "render orders by order then id and honours both join modes" {
         .{ .id = "a1", .order = 10, .class = .locked, .join = .always, .text = "A" },
         .{ .id = "d", .order = 40, .class = .generated, .join = .when_nonempty, .text = "D" },
     };
-    const rendered = try render(testing.allocator, &sections);
-    defer testing.allocator.free(rendered);
+    const text = try render(testing.allocator, &sections);
+    defer testing.allocator.free(text);
     // a1, then the empty fixed a2 still joined, b skipped, c, d.
-    try testing.expectEqualStrings("A\n\n\n\nC\n\nD", rendered);
+    try testing.expectEqualStrings("A\n\n\n\nC\n\nD", text);
+}
+
+const test_kernel = [_]KernelInfo{
+    .{ .id = "metacodes:identity", .class = .replaceable },
+    .{ .id = "metacodes:safety-policy", .class = .locked },
+    .{ .id = "metacodes:tone", .class = .removable },
+    .{ .id = "metacodes:env", .class = .generated },
+};
+
+fn expectIssue(expected: Issue, expected_index: usize, sections: []const ProfileSection) !void {
+    const diagnostic = validate(.{ .sections = sections }, &test_kernel, .{}) orelse
+        return error.TestExpectedRefusal;
+    try testing.expectEqual(expected, diagnostic.issue);
+    try testing.expectEqual(expected_index, diagnostic.index);
+}
+
+test "validate accepts each op on the classes that allow it" {
+    try testing.expectEqual(@as(?Diagnostic, null), validate(.{}, &test_kernel, .{}));
+    try testing.expectEqual(@as(?Diagnostic, null), validate(.{ .sections = &.{
+        .{ .op = .replace, .id = "metacodes:identity", .text = "You are Shopkeeper on {{platform}}.", .interpolate = true },
+        .{ .op = .replace, .id = "metacodes:tone", .text = "Be warm." },
+        .{ .op = .add, .id = "host:browser.rules-1", .order = 500, .text = "Use the page, not guesses. }} stays text." },
+    } }, &test_kernel, .{}));
+    try testing.expectEqual(@as(?Diagnostic, null), validate(.{ .sections = &.{
+        .{ .op = .remove, .id = "metacodes:tone" },
+    } }, &test_kernel, .{}));
+}
+
+test "validate names the first broken rule" {
+    try expectIssue(.locked_section, 0, &.{.{ .op = .replace, .id = "metacodes:safety-policy", .text = "x" }});
+    try expectIssue(.locked_section, 0, &.{.{ .op = .remove, .id = "metacodes:safety-policy" }});
+    try expectIssue(.generated_section, 0, &.{.{ .op = .replace, .id = "metacodes:env", .text = "x" }});
+    try expectIssue(.not_removable, 0, &.{.{ .op = .remove, .id = "metacodes:identity" }});
+    try expectIssue(.unknown_section, 0, &.{.{ .op = .replace, .id = "metacodes:nope", .text = "x" }});
+    try expectIssue(.unknown_section, 0, &.{.{ .op = .remove, .id = "host:mine" }});
+    try expectIssue(.add_needs_host_id, 0, &.{.{ .op = .add, .id = "metacodes:extra", .text = "x" }});
+    try expectIssue(.empty_text, 0, &.{.{ .op = .add, .id = "host:a" }});
+    try expectIssue(.empty_text, 0, &.{.{ .op = .replace, .id = "metacodes:tone" }});
+    try expectIssue(.remove_takes_no_text, 0, &.{.{ .op = .remove, .id = "metacodes:tone", .text = "x" }});
+    try expectIssue(.remove_takes_no_text, 0, &.{.{ .op = .remove, .id = "metacodes:tone", .interpolate = true }});
+    try expectIssue(.order_needs_add, 0, &.{.{ .op = .replace, .id = "metacodes:tone", .order = 5, .text = "x" }});
+    try expectIssue(.duplicate_id, 1, &.{
+        .{ .op = .add, .id = "host:a", .text = "x" },
+        .{ .op = .add, .id = "host:a", .text = "y" },
+    });
+    try expectIssue(.invalid_utf8, 0, &.{.{ .op = .add, .id = "host:a", .text = "\xff" }});
+    for ([_][]const u8{ "host:", "host:Upper", "host:-lead", "host:a b", "other:a", "metacodes", "" }) |id| {
+        try expectIssue(.invalid_id, 0, &.{.{ .op = .add, .id = id, .text = "x" }});
+    }
+    try expectIssue(.invalid_id, 0, &.{.{ .op = .add, .id = "host:" ++ "a" ** 65, .text = "x" }});
+    try testing.expectEqual(@as(?Diagnostic, null), validate(.{ .sections = &.{
+        .{ .op = .add, .id = "host:" ++ "a" ** 64, .text = "x" },
+    } }, &test_kernel, .{}));
+}
+
+test "validate checks interpolated variables strictly" {
+    try expectIssue(.unknown_variable, 0, &.{.{ .op = .add, .id = "host:a", .text = "at {{cwd}}", .interpolate = true }});
+    for ([_][]const u8{ "{{", "a {{model", "{{}}", "{{Model}}", "{{ model }}", "{{{model}}}" }) |text| {
+        try expectIssue(.malformed_variable, 0, &.{.{ .op = .add, .id = "host:a", .text = text, .interpolate = true }});
+    }
+    // Without interpolation the same text is literal.
+    try testing.expectEqual(@as(?Diagnostic, null), validate(.{ .sections = &.{
+        .{ .op = .add, .id = "host:a", .text = "at {{cwd}} {{" },
+    } }, &test_kernel, .{}));
+}
+
+test "validate enforces the size limits" {
+    const limits: Limits = .{ .max_sections = 2, .max_text_bytes = 4, .max_total_bytes = 6 };
+    const too_many = [_]ProfileSection{
+        .{ .op = .add, .id = "host:a", .text = "x" },
+        .{ .op = .add, .id = "host:b", .text = "x" },
+        .{ .op = .add, .id = "host:c", .text = "x" },
+    };
+    try testing.expectEqual(Issue.too_many_sections, validate(.{ .sections = &too_many }, &test_kernel, limits).?.issue);
+    try testing.expectEqual(Issue.text_too_large, validate(.{ .sections = &.{
+        .{ .op = .add, .id = "host:a", .text = "12345" },
+    } }, &test_kernel, limits).?.issue);
+    const total = validate(.{ .sections = &.{
+        .{ .op = .add, .id = "host:a", .text = "1234" },
+        .{ .op = .add, .id = "host:b", .text = "123" },
+    } }, &test_kernel, limits).?;
+    try testing.expectEqual(Issue.total_too_large, total.issue);
+    try testing.expectEqual(@as(usize, 1), total.index);
+}
+
+test "a diagnostic names the entry, the id and the rule" {
+    const diagnostic: Diagnostic = .{ .index = 2, .id = "metacodes:system", .issue = .locked_section };
+    var buf: [128]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{f}", .{diagnostic});
+    try testing.expectEqualStrings("prompt profile section 2 (metacodes:system): the section is locked", text);
+}
+
+test "apply adds, replaces, removes and interpolates" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kernel = [_]Section{
+        .{ .id = "metacodes:identity", .order = -1000, .class = .replaceable, .join = .always, .text = "I am the kernel." },
+        .{ .id = "metacodes:safety-policy", .order = -900, .class = .locked, .join = .always, .text = "Be safe." },
+        .{ .id = "metacodes:tone", .order = 2000, .class = .removable, .join = .always, .text = "Be brief." },
+        .{ .id = "metacodes:deferred", .order = 1100, .class = .replaceable, .join = .when_nonempty, .text = "" },
+        .{ .id = "metacodes:env", .order = 9000, .class = .generated, .join = .always, .text = "env" },
+    };
+    const profile: Profile = .{ .sections = &.{
+        .{ .op = .replace, .id = "metacodes:identity", .text = "I am {{model}} in {{workspace_root}} on {{platform}}.", .interpolate = true },
+        .{ .op = .remove, .id = "metacodes:tone" },
+        .{ .op = .replace, .id = "metacodes:deferred", .text = "never rendered: its condition is off" },
+        .{ .op = .add, .id = "host:rules", .order = 500, .text = "Follow the shop rules." },
+        .{ .op = .replace, .id = "metacodes:subagent", .text = "not in this prompt" },
+    } };
+    const sections = try apply(a, &kernel, profile, .{ .model = "m1", .workspace_root = "/w", .platform = "linux" });
+    var result = try renderWithManifest(a, sections, separator);
+    try testing.expectEqualStrings("I am m1 in /w on linux.\n\nBe safe.\n\nFollow the shop rules.\n\nenv", result.text);
+    try testing.expectEqual(@as(usize, 4), result.manifest.entries.len);
+    const expected = [_]struct { []const u8, Origin, Class }{
+        .{ "metacodes:identity", .host, .replaceable },
+        .{ "metacodes:safety-policy", .kernel, .locked },
+        .{ "host:rules", .host, .removable },
+        .{ "metacodes:env", .kernel, .generated },
+    };
+    for (expected, result.manifest.entries) |want, entry| {
+        try testing.expectEqualStrings(want[0], entry.id);
+        try testing.expectEqual(want[1], entry.origin);
+        try testing.expectEqual(want[2], entry.class);
+    }
+    try testing.expectEqualSlices(u8, &sha256("Be safe."), &result.manifest.entries[1].sha256);
+    try testing.expectEqualSlices(u8, &sha256(result.text), &result.manifest.sha256);
+}
+
+test "the manifest fingerprint tells attribution apart from bytes" {
+    const digest = sha256("x");
+    var one = [_]ManifestEntry{.{ .id = "metacodes:tone", .order = 1, .origin = .kernel, .class = .removable, .sha256 = digest }};
+    var two = one;
+    two[0].origin = .host;
+    const a: Manifest = .{ .entries = &one, .sha256 = digest };
+    const b: Manifest = .{ .entries = &two, .sha256 = digest };
+    try testing.expect(!std.mem.eql(u8, &a.fingerprint(), &b.fingerprint()));
+    try testing.expectEqualSlices(u8, &a.fingerprint(), &a.fingerprint());
+}
+
+test "an owned manifest outlives its source" {
+    var id_buf = "host:rules".*;
+    var entries = [_]ManifestEntry{.{ .id = &id_buf, .order = 500, .origin = .host, .class = .removable, .sha256 = sha256("x") }};
+    var owned = try OwnedManifest.clone(testing.allocator, .{ .entries = &entries, .sha256 = sha256("prompt") });
+    defer owned.deinit();
+    @memset(&id_buf, 'x');
+    try testing.expectEqualStrings("host:rules", owned.manifest.entries[0].id);
+    try testing.expectEqualSlices(u8, &sha256("prompt"), &owned.manifest.sha256);
+    entries[0].id = "host:rules";
+    try testing.expectEqualSlices(u8, &(Manifest{ .entries = &entries, .sha256 = sha256("prompt") }).fingerprint(), &owned.manifest.fingerprint());
+}
+
+test "an owned profile outlives its source" {
+    var id_buf = "host:rules".*;
+    var text_buf = "Follow the rules.".*;
+    const source = [_]ProfileSection{.{ .op = .add, .id = &id_buf, .order = 7, .text = &text_buf }};
+    var owned = try OwnedProfile.clone(testing.allocator, .{ .sections = &source });
+    defer owned.deinit();
+    @memset(&id_buf, 'x');
+    @memset(&text_buf, 'x');
+    const copy = owned.profile().sections[0];
+    try testing.expectEqualStrings("host:rules", copy.id);
+    try testing.expectEqualStrings("Follow the rules.", copy.text);
+    try testing.expectEqual(@as(i64, 7), copy.order);
+    var empty = try OwnedProfile.clone(testing.allocator, .{});
+    defer empty.deinit();
+    try testing.expect(empty.profile().isEmpty());
 }

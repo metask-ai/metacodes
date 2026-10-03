@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 17 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 18 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 17 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 18 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 17u
+#define METASK_AGENTCORE_ABI_REVISION 18u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -132,6 +132,17 @@ extern "C" {
 #define METASK_AGENTCORE_MAX_SKILL_SOURCE_ID_BYTES_V1 128ULL
 #define METASK_AGENTCORE_MAX_PROCESS_PLUGIN_SOURCES_V1 64ULL
 #define METASK_AGENTCORE_MAX_TURNS_V1 1000u
+/* Prompt profile limits: entries, one section's text, and every entry's text
+ * together. Ids are metacodes:<name> or host:<name>, name at most 64 bytes. */
+#define METASK_AGENTCORE_MAX_PROMPT_PROFILE_SECTIONS_V1 64ULL
+#define METASK_AGENTCORE_MAX_PROMPT_SECTION_TEXT_BYTES_V1 65536ULL
+#define METASK_AGENTCORE_MAX_PROMPT_PROFILE_TEXT_BYTES_V1 262144ULL
+/* Per-Run context block limits: blocks, one label, one text, and every label
+ * and text together. */
+#define METASK_AGENTCORE_MAX_CONTEXT_BLOCKS_V1 32ULL
+#define METASK_AGENTCORE_MAX_CONTEXT_BLOCK_LABEL_BYTES_V1 64ULL
+#define METASK_AGENTCORE_MAX_CONTEXT_BLOCK_TEXT_BYTES_V1 65536ULL
+#define METASK_AGENTCORE_MAX_CONTEXT_BLOCKS_TOTAL_BYTES_V1 262144ULL
 
 #define METASK_AGENTCORE_PLUGIN_LAYER_BUILTIN 1u
 #define METASK_AGENTCORE_PLUGIN_LAYER_PERSONAL 2u
@@ -144,6 +155,9 @@ extern "C" {
 #define METASK_AGENTCORE_RUN_INPUT_MULTIMODAL 3u
 #define METASK_AGENTCORE_RUN_INPUT_PART_TEXT 1u
 #define METASK_AGENTCORE_RUN_INPUT_PART_IMAGE 2u
+#define METASK_AGENTCORE_PROMPT_OP_ADD 1u
+#define METASK_AGENTCORE_PROMPT_OP_REPLACE 2u
+#define METASK_AGENTCORE_PROMPT_OP_REMOVE 3u
 #define METASK_AGENTCORE_SKILL_SOURCE_USER 1u
 #define METASK_AGENTCORE_SKILL_SOURCE_WORKSPACE 2u
 #define METASK_AGENTCORE_COMPACT_COMPACTED 1u
@@ -561,12 +575,53 @@ typedef struct {
     uint64_t reserved[3];
 } metask_agentcore_session_host_config_v1;
 
+/* One edit of the kernel system-prompt sections. PROMPT_OP_ADD adds a
+ * host:<name> section with non-empty text at `order` (ties broken by id).
+ * PROMPT_OP_REPLACE gives a replaceable or removable metacodes:<name> section
+ * non-empty text; `order` is zero. PROMPT_OP_REMOVE drops a removable
+ * metacodes:<name> section; text is canonical empty, order and interpolate
+ * zero. With interpolate == 1, {{model}}, {{workspace_root}} and {{platform}}
+ * are substituted and any other {{...}} refuses the profile. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t op_code;
+    metask_agentcore_bytes_view_v1 id;
+    int64_t order;
+    metask_agentcore_bytes_view_v1 text;
+    uint32_t interpolate;
+    uint32_t reserved0;
+    uint64_t reserved[2];
+} metask_agentcore_prompt_section_v1;
+
+/* Edits applied in order to the kernel sections; borrowed for the call. Null,
+ * or zero sections, is the kernel prompt byte for byte. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    const metask_agentcore_prompt_section_v1 *sections;
+    uint64_t section_count;
+    uint64_t reserved[4];
+} metask_agentcore_prompt_profile_v1;
+
+/* One Host fact for a single Run, rendered with the Run's other blocks into one
+ * <system-reminder> text that leads the Run's user record. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    metask_agentcore_bytes_view_v1 label;
+    metask_agentcore_bytes_view_v1 text;
+    uint64_t reserved[2];
+} metask_agentcore_context_block_v1;
+
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;
     const metask_agentcore_session_host_config_v1 *host;
     metask_agentcore_bytes_view_v1 model;
-    uint64_t reserved[4];
+    /* Optional. Frozen into the Session and its checkpoints at creation and
+     * replaced only through session_control->set_prompt_profile while idle. */
+    const metask_agentcore_prompt_profile_v1 *prompt_profile;
+    uint64_t reserved[3];
 } metask_agentcore_session_create_config_v1;
 
 typedef struct {
@@ -622,7 +677,11 @@ typedef struct {
 typedef struct {
     uint32_t struct_size;
     uint32_t max_turns;
-    uint64_t reserved[4];
+    /* Optional per-Run Host context for RUN_INPUT_TEXT and RUN_INPUT_MULTIMODAL,
+     * borrowed for the call. Null with zero count adds nothing. */
+    const metask_agentcore_context_block_v1 *context_blocks;
+    uint64_t context_block_count;
+    uint64_t reserved[2];
 } metask_agentcore_run_options_v1;
 
 typedef struct {
@@ -771,10 +830,15 @@ typedef uint32_t (*metask_agentcore_session_abort_compact_fn_v1)(
 typedef uint32_t (*metask_agentcore_session_export_checkpoint_fn_v1)(
     metask_agentcore_session *, const metask_agentcore_checkpoint_export_config_v1 *,
     metask_agentcore_checkpoint_export_result_v1 *, metask_agentcore_owned_bytes_v1 *);
+/* Replaces the prompt profile while idle; null clears it. The next Run renders
+ * from it: one prompt-cache boundary, announced by its prompt_manifest event. */
+typedef uint32_t (*metask_agentcore_session_set_prompt_profile_fn_v1)(
+    metask_agentcore_session *, const metask_agentcore_prompt_profile_v1 *,
+    metask_agentcore_owned_bytes_v1 *);
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 17. No earlier revision layout
+/* Function-table order is fixed within Revision 18. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -802,6 +866,7 @@ typedef struct metask_agentcore_session_control_api_v1 {
     metask_agentcore_session_compact_fn_v1 compact;
     metask_agentcore_session_abort_compact_fn_v1 abort_compact;
     metask_agentcore_session_export_checkpoint_fn_v1 export_checkpoint;
+    metask_agentcore_session_set_prompt_profile_fn_v1 set_prompt_profile;
 } metask_agentcore_session_control_api_v1;
 
 typedef struct metask_agentcore_skill_api_v1 {
@@ -897,6 +962,8 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
                (metask_agentcore_session_abort_compact_fn_v1)0 &&
            api->session_control->export_checkpoint !=
                (metask_agentcore_session_export_checkpoint_fn_v1)0 &&
+           api->session_control->set_prompt_profile !=
+               (metask_agentcore_session_set_prompt_profile_fn_v1)0 &&
            api->skill != (const metask_agentcore_skill_api_v1 *)0 &&
            ((uintptr_t)api->skill % sizeof(void *)) == 0 &&
            api->skill->struct_size == sizeof(*api->skill) &&
@@ -951,8 +1018,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 17u,
-                               "AgentCore revision 17");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 18u,
+                               "AgentCore revision 18");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -994,6 +1061,9 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_selector_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_selection_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_durable_budget_profile_v1, 112);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_host_config_v1, 168);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_prompt_section_v1, 72);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_prompt_profile_v1, 56);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_context_block_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_create_config_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_source_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_catalog_query_v1, 80);
@@ -1010,7 +1080,7 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_checkpoint_export_result_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_restore_config_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_runtime_api_v1, 24);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_api_v1, 40);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 64);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 72);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_api_v1, 32);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_api_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_api_v1, 64);
@@ -1044,6 +1114,17 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, protocol
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved, 144);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, host, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, model, 16);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, prompt_profile, 32);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, reserved, 40);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_prompt_section_v1, id, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_prompt_section_v1, order, 24);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_prompt_section_v1, text, 32);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_prompt_section_v1, interpolate, 48);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_prompt_section_v1, reserved, 56);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_prompt_profile_v1, sections, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_prompt_profile_v1, section_count, 16);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_context_block_v1, label, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_context_block_v1, text, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_sources, 56);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_source_count, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_selector_v1, tool_name, 40);
@@ -1055,6 +1136,9 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, arguments_json, 56
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, parts, 72);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, part_count, 80);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, reserved, 88);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_blocks, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_block_count, 16);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, set_prompt_profile, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, durable_usage_bytes, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, required_checkpoint_bytes, 32);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_checkpoint_export_result_v1, digest, 32);

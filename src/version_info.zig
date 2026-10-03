@@ -157,7 +157,7 @@ const test_info: BuildInfo = .{
     .optimize = "ReleaseSafe",
     .release_layout = true,
     .abi_version = 1,
-    .abi_revision = 17,
+    .abi_revision = 18,
     .ripgrep_version = "15.2.0",
     .ripgrep_revision = "e89fff89ac",
     .ripgrep_sha256 = null,
@@ -174,7 +174,7 @@ test "version text keeps the documented first line and names every source" {
     try std.testing.expect(std.mem.startsWith(u8, text, "metacodes 1.2.3\n"));
     try std.testing.expect(std.mem.indexOf(u8, text, "\ncommit 0123456789abcdef0123456789abcdef01234567 (dirty)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\ntarget x86_64-linux-gnu ReleaseSafe\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\nagentcore-abi v1 revision 17\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\nagentcore-abi v1 revision 18\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\nripgrep 15.2.0 (e89fff89ac) not bundled for this target\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "expected sha256 5288e81890f23abc12b796abf7188202c369c9e4be66df30d3509f740a8424ba\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "\nlayout release\n"));
@@ -198,7 +198,7 @@ test "version json has the documented shape" {
     try std.testing.expectEqualStrings("x86_64-linux-gnu", root.get("target").?.string);
     const contract = root.get("contract").?.object;
     try std.testing.expectEqual(@as(i64, 1), contract.get("binary_abi_version").?.integer);
-    try std.testing.expectEqual(@as(i64, 17), contract.get("binary_abi_revision").?.integer);
+    try std.testing.expectEqual(@as(i64, 18), contract.get("binary_abi_revision").?.integer);
     try std.testing.expectEqual(@as(i64, config.SCHEMA_VERSION), contract.get("config_schema_version").?.integer);
     const assets = root.get("expected_runtime_assets").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), assets.len);

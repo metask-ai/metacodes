@@ -37,6 +37,8 @@ const ToolDispatcher = @import("../tools.zig").ToolDispatcher;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
 const tool_observation_journal = @import("tool_observation_journal.zig");
 const util_fs = @import("../util/fs.zig");
+const prompt_sections = @import("prompt_sections.zig");
+const system_prompt_mod = @import("system_prompt.zig");
 
 pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_party_plugins.ARTIFACT_TOOLS;
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
@@ -661,6 +663,11 @@ pub const SessionConfig = struct {
     /// (admission 校验,不留"理论上不可能"的运行期空态)。owner 为创建方,须活到
     /// destroy 成功。
     host_identity_ctx: ?*anyopaque = null,
+    /// Session prompt profile (#184): Host edits of the kernel prompt sections.
+    /// Borrowed for `create`, which refuses an invalid profile
+    /// (`system_prompt.validateProfile` names the broken rule) and keeps a copy
+    /// until `setPromptProfile`. Empty renders the kernel prompt byte for byte.
+    prompt_profile: prompt_sections.Profile = .{},
 };
 
 pub const Config = SessionConfig;
@@ -727,6 +734,13 @@ pub const PermissionRuleMutationError = error{
     OutOfMemory,
     ResourceLimit,
     InvalidRule,
+};
+
+pub const PromptProfileMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    InvalidPromptProfile,
+    OutOfMemory,
 };
 
 pub const CompactError = error{
@@ -846,6 +860,10 @@ pub const IsolatedRunExecutor = struct {
 pub const RunExecutionEvidence = struct {
     tool_observer: ?@import("../tools/context.zig").ToolObservationSink = null,
     execution_boundary: ?@import("execution_effect.zig").Boundary = null,
+    /// The system prompt the Session rendered, recorded and announced for an
+    /// isolated Run (#184): the subagent prompt under the Session's profile.
+    /// The executor sends exactly these bytes.
+    system_prompt: ?[]const u8 = null,
 };
 
 /// Exactly-once capability returned after Run admission but before any
@@ -1087,20 +1105,32 @@ pub const AdmittedRun = struct {
             .emit = AgentSession.backendEmit,
             .poll = AgentSession.backendPoll,
         };
+        var rendered_prompt = self.session.renderSubagentPrompt(self.session.allocator) catch |err| {
+            _ = self.session.poisonRun();
+            return err;
+        };
+        defer rendered_prompt.deinit(self.session.allocator);
         var run_journal: ?tool_observation_journal.Journal = if (self.session.run_journal_root.len == 0)
             null
         else
-            tool_observation_journal.Journal.init(
+            tool_observation_journal.Journal.initWithPrompt(
                 self.session.run_journal_root,
                 self.identity_value.session_id,
+                rendered_prompt.manifest,
             ) catch |err| {
                 _ = self.session.poisonRun();
                 return err;
             };
         defer if (run_journal) |*journal| journal.deinit();
+        self.session.announcePromptManifest(rendered_prompt.manifest) catch |err| {
+            if (run_journal) |*journal| journal.finishRun(@errorName(err)) catch {};
+            _ = self.session.poisonRun();
+            return err;
+        };
         const evidence = RunExecutionEvidence{
             .tool_observer = if (run_journal) |*journal| journal.sink() else null,
             .execution_boundary = if (run_journal) |*journal| journal.executionBoundary() else null,
+            .system_prompt = rendered_prompt.text,
         };
         var native_result = executor.execute(
             self.session.allocator,
@@ -1174,6 +1204,12 @@ pub const AgentSession = struct {
     host_run_ui_requester: ?AgentSessionUiRequester,
     /// Host tool 身份锚点(SessionConfig.host_identity_ctx,core 只透传)。
     host_identity_ctx: ?*anyopaque = null,
+    /// The validated prompt profile every Run renders from (#184). Replaced
+    /// only by `setPromptProfile` while idle.
+    prompt_profile: prompt_sections.OwnedProfile = .{},
+    /// Manifest of the system prompt the latest Run sent; a Run whose prompt
+    /// differs delivers its manifest as a `prompt_manifest` event.
+    last_prompt_manifest: ?prompt_sections.OwnedManifest = null,
     abort_signal: AbortSignal,
     compact_abort_signal: AbortSignal,
     active_sink: ?EventSink = null,
@@ -1248,6 +1284,7 @@ pub const AgentSession = struct {
     }
 
     fn createWithHooks(runtime: *AgentRuntime, config: SessionConfig, hooks: SessionCreateHooks) !*AgentSession {
+        if (system_prompt_mod.validateProfile(config.prompt_profile) != null) return error.InvalidPromptProfile;
         try runtime.retainSession();
         errdefer runtime.releaseSession();
         const allocator = runtime.allocator;
@@ -1293,6 +1330,8 @@ pub const AgentSession = struct {
         errdefer allocator.free(model);
         const base_url = if (config.base_url) |url| try allocator.dupe(u8, url) else null;
         errdefer if (base_url) |url| allocator.free(url);
+        var prompt_profile = try prompt_sections.OwnedProfile.clone(allocator, config.prompt_profile);
+        errdefer prompt_profile.deinit();
 
         var conversation = if (hooks.restored) |restored|
             try restored.conversation.cloneInto(allocator)
@@ -1359,6 +1398,7 @@ pub const AgentSession = struct {
             .host_ui_requester = config.ui_requester,
             .host_run_ui_requester = config.run_ui_requester,
             .host_identity_ctx = config.host_identity_ctx,
+            .prompt_profile = prompt_profile,
             .abort_signal = AbortSignal.init(),
             .compact_abort_signal = AbortSignal.init(),
             .last_run_id = if (hooks.restored) |restored|
@@ -1430,6 +1470,8 @@ pub const AgentSession = struct {
         self.read_state.deinit();
         self.tools.deinit();
         self.workspace.deinit();
+        self.prompt_profile.deinit();
+        if (self.last_prompt_manifest) |*manifest| manifest.deinit();
         allocator.free(self.artifact_root);
         allocator.free(self.run_journal_root);
         if (self.base_url) |url| allocator.free(url);
@@ -1641,6 +1683,79 @@ pub const AgentSession = struct {
         std.debug.assert(self.state == .mutating);
         self.state = .idle;
         self.mutex.unlock();
+    }
+
+    /// Replace the prompt profile while idle (#184). The next Run renders its
+    /// system prompt from the new profile: exactly one prompt-cache boundary,
+    /// announced by that Run's `prompt_manifest` event. An equal profile
+    /// changes nothing. An invalid one is refused before the Session is
+    /// touched; `system_prompt.validateProfile` names the broken rule.
+    pub fn setPromptProfile(
+        self: *AgentSession,
+        profile: prompt_sections.Profile,
+    ) PromptProfileMutationError!void {
+        if (system_prompt_mod.validateProfile(profile) != null) return error.InvalidPromptProfile;
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+        defer {
+            self.mutex.lock();
+            std.debug.assert(self.state == .mutating);
+            self.state = .idle;
+            self.mutex.unlock();
+        }
+
+        if (self.prompt_profile.profile().eql(profile)) return;
+        const replacement = try prompt_sections.OwnedProfile.clone(self.allocator, profile);
+        var previous = self.prompt_profile;
+        self.prompt_profile = replacement;
+        previous.deinit();
+    }
+
+    /// The prompt profile Runs render from. Valid while the caller keeps the
+    /// Session from mutating: during its own Run, compact or checkpoint lease.
+    pub fn promptProfile(self: *const AgentSession) prompt_sections.Profile {
+        return self.prompt_profile.profile();
+    }
+
+    /// Manifest of the system prompt the latest Run sent, or null before the
+    /// first Run. Same validity as `promptProfile`.
+    pub fn lastPromptManifest(self: *const AgentSession) ?prompt_sections.Manifest {
+        return if (self.last_prompt_manifest) |*owned| owned.manifest else null;
+    }
+
+    /// Render this Session's subagent system prompt: `metacodes:subagent` and
+    /// the environment, with the Session's prompt profile inherited.
+    pub fn renderSubagentPrompt(self: *const AgentSession, allocator: std.mem.Allocator) !prompt_sections.Rendered {
+        return system_prompt_mod.renderSubagentPrompt(allocator, self.model, self.workspace.root, self.promptProfile());
+    }
+
+    /// Record the manifest of the prompt this Run sends and, when it differs
+    /// from the latest Run's, deliver it to the Host before the first provider
+    /// request.
+    fn announcePromptManifest(self: *AgentSession, manifest: prompt_sections.Manifest) !void {
+        if (self.last_prompt_manifest) |*last| {
+            if (std.mem.eql(u8, &last.manifest.fingerprint(), &manifest.fingerprint())) return;
+        }
+        var owned = try prompt_sections.OwnedManifest.clone(self.allocator, manifest);
+        errdefer owned.deinit();
+        backendEmit(@ptrCast(self), self.session_id, .{ .prompt_manifest = manifest });
+        if (self.last_prompt_manifest) |*last| last.deinit();
+        self.last_prompt_manifest = owned;
     }
 
     pub fn compact(
@@ -1923,36 +2038,44 @@ pub const AgentSession = struct {
 
         // 缺陷 A 修复:主 Agent 注入环境段 + 工具段 system_prompt。
         // 环境段 cwd 用 workspace.root(非进程 cwd——Session 隔离);工具段按 enabled_tool_names 裁剪。
-        // skills/agents/kg/memory 传 null/空(Session 当前无这些配置,传 null 等价不追加)。
-        // runLoop 内分配,run 结束 free。
-        const sp_mod = @import("system_prompt.zig");
-        const sp_names = try self.allocator.alloc([]const u8, tool_definitions.len);
+        // skills/agents/kg/memory 为 CLI 专属,Session 不渲染。#184:按 Session 的提示词档案编辑
+        // 内核段;渲染失败即 poison——不能退回无 system prompt 的请求(锁定段随之丢失)。
+        const sp_names = self.allocator.alloc([]const u8, tool_definitions.len) catch |err| {
+            _ = self.poisonRun();
+            return err;
+        };
         defer self.allocator.free(sp_names);
         for (tool_definitions, 0..) |d, i| sp_names[i] = d.name;
-        const system_prompt = sp_mod.buildFullWithDefs(
-            self.allocator,
-            self.model,
-            null,
-            null,
-            sp_names,
-            "",
-            false,
-            self.workspace.root,
-            tool_definitions,
-        ) catch null;
-        defer if (system_prompt) |sp| self.allocator.free(sp);
+        var rendered_prompt = system_prompt_mod.renderSessionPrompt(self.allocator, .{
+            .model = self.model,
+            .cwd = self.workspace.root,
+            .enabled_tool_names = sp_names,
+            .tool_defs = tool_definitions,
+            .profile = self.promptProfile(),
+        }) catch |err| {
+            _ = self.poisonRun();
+            return err;
+        };
+        defer rendered_prompt.deinit(self.allocator);
+        const system_prompt: ?[]const u8 = rendered_prompt.text;
 
         var run_journal: ?tool_observation_journal.Journal = if (self.run_journal_root.len == 0)
             null
         else
-            tool_observation_journal.Journal.init(
+            tool_observation_journal.Journal.initWithPrompt(
                 self.run_journal_root,
                 identity.session_id,
+                rendered_prompt.manifest,
             ) catch |err| {
                 _ = self.poisonRun();
                 return err;
             };
         defer if (run_journal) |*journal| journal.deinit();
+        self.announcePromptManifest(rendered_prompt.manifest) catch |err| {
+            if (run_journal) |*journal| journal.finishRun(@errorName(err)) catch {};
+            _ = self.poisonRun();
+            return err;
+        };
 
         var native_result = agent_loop.run(
             &self.conversation,
@@ -2822,6 +2945,8 @@ const RunOverrideTestProvider = struct {
     allocator: std.mem.Allocator,
     calls: u32 = 0,
     stage: u8 = 0,
+    /// Digest of the system prompt of the latest request.
+    last_system_sha256: ?[32]u8 = null,
 
     fn provider(self: *@This()) provider_mod.Provider {
         return .{
@@ -2848,7 +2973,7 @@ const RunOverrideTestProvider = struct {
     fn sendStream(
         raw: *anyopaque,
         _: []const types.ApiMessage,
-        _: ?[]const u8,
+        system: ?[]const u8,
         _: ?[]const @import("../json.zig").ToolDefinition,
         _: ?*const AbortSignal,
         _: ?[]const u8,
@@ -2858,6 +2983,7 @@ const RunOverrideTestProvider = struct {
         const self = cast(raw);
         self.calls += 1;
         self.stage = 0;
+        self.last_system_sha256 = if (system) |text| prompt_sections.sha256(text) else null;
         return .{
             .ctx = raw,
             .nextFn = next,
@@ -3005,11 +3131,178 @@ test "AgentSession durable profile wires provider effects into unified run journ
     try std.testing.expectEqual(@as(u64, 4), summary.records);
 }
 
+/// Counts `prompt_manifest` events and keeps the latest one's prompt digest.
+const ManifestProbe = struct {
+    manifests: usize = 0,
+    last_sha256: ?[32]u8 = null,
+    last_entries: usize = 0,
+
+    fn emit(ctx: *anyopaque, _: SessionId, _: u64, event: CoreEvent) bool {
+        const self: *ManifestProbe = @ptrCast(@alignCast(ctx));
+        switch (event) {
+            .prompt_manifest => |manifest| {
+                self.manifests += 1;
+                self.last_sha256 = manifest.sha256;
+                self.last_entries = manifest.entries.len;
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    fn sink(self: *ManifestProbe) EventSink {
+        return .{ .ctx = self, .emit = emit };
+    }
+};
+
+fn expectSessionPrompt(
+    self: *AgentSession,
+    profile: prompt_sections.Profile,
+    provider: *const RunOverrideTestProvider,
+) !prompt_sections.Rendered {
+    const names = try std.testing.allocator.alloc([]const u8, self.tools.definitions.len);
+    defer std.testing.allocator.free(names);
+    for (self.tools.definitions, names) |definition, *name| name.* = definition.name;
+    var expected = try system_prompt_mod.renderSessionPrompt(std.testing.allocator, .{
+        .model = self.model,
+        .cwd = self.workspace.root,
+        .enabled_tool_names = names,
+        .tool_defs = self.tools.definitions,
+        .profile = profile,
+    });
+    errdefer expected.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &prompt_sections.sha256(expected.text), &provider.last_system_sha256.?);
+    return expected;
+}
+
+test "AgentSession renders, records and announces its prompt profile" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    // Borrowed by create only: the Session keeps its own copy.
+    var identity_text = "You are Shopkeeper, a browser agent.".*;
+    const profile_sections = [_]prompt_sections.ProfileSection{
+        .{ .op = .replace, .id = "metacodes:identity", .text = &identity_text },
+        .{ .op = .add, .id = "host:rules", .order = 500, .text = "Read the page before acting on it." },
+    };
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .permission_mode = .default,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"Read"},
+        .run_journal = .{ .exact_root = root },
+        .prompt_profile = .{ .sections = &profile_sections },
+    });
+    defer self.destroy() catch unreachable;
+    @memset(&identity_text, 'x');
+    var identity_copy = "You are Shopkeeper, a browser agent.".*;
+    const profile: prompt_sections.Profile = .{ .sections = &.{
+        .{ .op = .replace, .id = "metacodes:identity", .text = &identity_copy },
+        profile_sections[1],
+    } };
+    try std.testing.expect(self.promptProfile().eql(profile));
+    try std.testing.expectEqual(@as(?prompt_sections.Manifest, null), self.lastPromptManifest());
+
+    var sink = ManifestProbe{};
+    var provider = RunOverrideTestProvider{ .allocator = std.testing.allocator };
+    var run_id: u64 = 0;
+    const runOnce = struct {
+        fn f(session: *AgentSession, id: *u64, probe: *ManifestProbe, p: *RunOverrideTestProvider) !void {
+            id.* += 1;
+            var admitted = try session.admitRun(id.*, probe.sink());
+            const result = try admitted.runUserMessagesWithToolSurfaceUsingProvider(&.{"hello"}, 1, null, null, p.provider());
+            try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+        }
+    }.f;
+
+    // The first Run announces its prompt; an unchanged second Run does not.
+    try runOnce(self, &run_id, &sink, &provider);
+    var with_profile = try expectSessionPrompt(self, profile, &provider);
+    defer with_profile.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, with_profile.text, "You are Shopkeeper, a browser agent.\n\n"));
+    try std.testing.expectEqual(@as(usize, 1), sink.manifests);
+    try std.testing.expectEqualSlices(u8, &with_profile.manifest.sha256, &sink.last_sha256.?);
+    try std.testing.expectEqual(with_profile.manifest.entries.len, sink.last_entries);
+    try std.testing.expectEqualSlices(u8, &with_profile.manifest.fingerprint(), &self.lastPromptManifest().?.fingerprint());
+    try runOnce(self, &run_id, &sink, &provider);
+    try std.testing.expectEqual(@as(usize, 1), sink.manifests);
+    try std.testing.expectEqualSlices(u8, &prompt_sections.sha256(with_profile.text), &provider.last_system_sha256.?);
+
+    // Setting an equal profile is no boundary; a different one is exactly one.
+    try self.setPromptProfile(profile);
+    try runOnce(self, &run_id, &sink, &provider);
+    try std.testing.expectEqual(@as(usize, 1), sink.manifests);
+    try self.setPromptProfile(.{});
+    try runOnce(self, &run_id, &sink, &provider);
+    var kernel = try expectSessionPrompt(self, .{}, &provider);
+    defer kernel.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), sink.manifests);
+    try std.testing.expectEqualSlices(u8, &kernel.manifest.sha256, &sink.last_sha256.?);
+    try runOnce(self, &run_id, &sink, &provider);
+    try std.testing.expectEqual(@as(usize, 2), sink.manifests);
+
+    // Every Run's run_started records the manifest of the prompt it sent.
+    const summary = try tool_observation_journal.validate(root, self.session_id);
+    try std.testing.expect(summary.complete);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, tool_observation_journal.FILE_NAME, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    for ([_]struct { [32]u8, usize }{
+        .{ with_profile.manifest.sha256, 3 },
+        .{ kernel.manifest.sha256, 2 },
+    }) |case| {
+        const needle = try std.mem.concat(std.testing.allocator, u8, &.{
+            "\"prompt\":{\"sha256\":\"",
+            &std.fmt.bytesToHex(case[0], .lower),
+        });
+        defer std.testing.allocator.free(needle);
+        try std.testing.expectEqual(case[1], std.mem.count(u8, bytes, needle));
+    }
+}
+
+test "AgentSession refuses an invalid prompt profile at create and at set" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expectError(error.InvalidPromptProfile, runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+        .prompt_profile = .{ .sections = &.{.{ .op = .replace, .id = "metacodes:system", .text = "x" }} },
+    }));
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    const kept: prompt_sections.Profile = .{ .sections = &.{.{ .op = .remove, .id = "metacodes:tone" }} };
+    try self.setPromptProfile(kept);
+    for ([_]prompt_sections.ProfileSection{
+        .{ .op = .remove, .id = "metacodes:safety-policy" },
+        .{ .op = .add, .id = "host:a", .text = "{{cwd}}", .interpolate = true },
+        .{ .op = .remove, .id = "metacodes:identity" },
+    }) |section| {
+        try std.testing.expectError(error.InvalidPromptProfile, self.setPromptProfile(.{ .sections = &.{section} }));
+        try std.testing.expect(self.promptProfile().eql(kept));
+    }
+    try std.testing.expectError(error.InvalidPromptProfile, self.setPromptProfile(.{ .sections = &.{
+        .{ .op = .add, .id = "host:a", .text = "a" },
+        .{ .op = .add, .id = "host:a", .text = "b" },
+    } }));
+    try std.testing.expect(!self.isPoisoned());
+}
+
 test "AgentSession durable profile crosses isolated executor boundary" {
     const execution_effect = @import("execution_effect.zig");
     const Executor = struct {
         saw_observer: bool = false,
         saw_boundary: bool = false,
+        system_prompt_sha256: ?[32]u8 = null,
 
         fn run(
             raw: *anyopaque,
@@ -3022,6 +3315,7 @@ test "AgentSession durable profile crosses isolated executor boundary" {
         ) anyerror!agent_loop.RunResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.saw_observer = evidence.tool_observer != null;
+            if (evidence.system_prompt) |prompt| self.system_prompt_sha256 = prompt_sections.sha256(prompt);
             const boundary = evidence.execution_boundary orelse
                 return error.MissingExecutionBoundary;
             self.saw_boundary = true;
@@ -3087,6 +3381,11 @@ test "AgentSession durable profile crosses isolated executor boundary" {
     const summary = try tool_observation_journal.validate(root, self.session_id);
     try std.testing.expect(summary.complete);
     try std.testing.expectEqual(@as(u64, 4), summary.records);
+    // The executor receives the subagent prompt the Session recorded.
+    const subagent_prompt = try system_prompt_mod.buildSubagentSystemPrompt(std.testing.allocator, "test-model", root);
+    defer std.testing.allocator.free(subagent_prompt);
+    try std.testing.expectEqualSlices(u8, &prompt_sections.sha256(subagent_prompt), &executor.system_prompt_sha256.?);
+    try std.testing.expectEqualSlices(u8, &prompt_sections.sha256(subagent_prompt), &self.lastPromptManifest().?.sha256);
 }
 
 test "AgentSession compact admission consumes only admitted operation ids" {
@@ -3467,7 +3766,8 @@ test "AdmittedRun isolated executor shares identity and commits only final assis
         self.session_id.asSlice(),
         executor.seen_session.?.asSlice(),
     );
-    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    // The Session's prompt_manifest for the isolated Run, then the executor's two.
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
     try std.testing.expectEqual(@as(u64, 7), probe.run_id);
     try std.testing.expectEqual(@as(usize, 2), self.conversation.messages.items.len);
     try std.testing.expectEqualStrings(
