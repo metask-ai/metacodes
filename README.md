@@ -47,7 +47,9 @@ from source and installs it beside the released one: the main checkout as
 `metacodes-dev` (`~/.local/opt/metacodes-dev`), a linked worktree as
 `metacodes-dev-<worktree directory>`, each with a state root of its own. An
 install is a copy, so rebuilding or removing the checkout leaves it running;
-`--dev --uninstall` removes it again. A downloaded archive installs the same way:
+`--dev --uninstall` removes it again. Nothing needs starting by hand: the first
+session of an install sets up and starts its TinyKG service in the background.
+A downloaded archive installs the same way:
 
 ```sh
 sh scripts/install.sh metacodes-<version>-<target>.tar.gz

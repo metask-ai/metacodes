@@ -225,6 +225,58 @@ pub fn spawnDetached(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureErr
     if (awaitChildReport(report, pid)) |failure| return spawnFailureError(failure);
 }
 
+/// Start a long-lived background service: no controlling terminal, its own
+/// session, stdin from the null device, stdout and stderr appended to
+/// `log_fd` (opened by the caller, inheritable; the caller closes it after).
+/// The service is not this process's child, so it outlives it and is never
+/// left as a zombie: POSIX forks an intermediate that calls `setsid`, forks
+/// the service and exits at once, and is reaped here. The report pipe still
+/// tells an exec failure of the service apart from a successful start.
+/// Windows: a windowless process whose handle is released immediately.
+pub fn spawnService(argv: []const ?[*:0]const u8, log_fd: c_int) CaptureError!void {
+    last_spawn_failure = null;
+    if (is_windows) {
+        const handle = try spawnToFilesWithEnv(argv, log_fd, log_fd, null, true);
+        win.CloseHandle(handle);
+        return;
+    }
+    g_fork_serial.lock();
+    const report = ReportPipe.open() orelse {
+        g_fork_serial.unlock();
+        return error.PipeFailed;
+    };
+    const pid = std.c.fork();
+    if (pid < 0) {
+        report.closeBoth();
+        g_fork_serial.unlock();
+        return error.SpawnFailed;
+    }
+    if (pid == 0) {
+        // Intermediate: between fork and exec only async-signal-safe calls.
+        _ = std.c.setsid();
+        const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (null_fd < 0 or std.c.dup2(null_fd, 0) < 0 or std.c.dup2(log_fd, 1) < 0 or std.c.dup2(log_fd, 2) < 0) {
+            reportChildFailure(report.wr, .exec, currentErrno());
+            std.c._exit(127);
+        }
+        if (null_fd > 2) _ = std.c.close(null_fd);
+        if (log_fd > 2) _ = std.c.close(log_fd);
+        const service = std.c.fork();
+        if (service < 0) {
+            reportChildFailure(report.wr, .exec, currentErrno());
+            std.c._exit(127);
+        }
+        if (service == 0) execChild(argv, true, null, report.wr);
+        std.c._exit(0);
+    }
+    _ = std.c.close(report.wr);
+    g_fork_serial.unlock();
+    // EOF arrives once the service has exec'd (close-on-exec) and the
+    // intermediate has exited; a failure record means it never started.
+    if (awaitChildReport(report, pid)) |failure| return spawnFailureError(failure);
+    _ = waitpidRetry(pid);
+}
+
 // ============================================================================
 // 长连接双向 pipe 子进程（MCP/LSP stdio transport：spawn + 持久 stdin/stdout + terminate）
 // ============================================================================
@@ -1776,6 +1828,40 @@ test "spawnDetached 不阻塞不报错" {
     else
         &.{ "/bin/sh", "-c", "true", null };
     try spawnDetached(argv, true);
+}
+
+test "spawnService: the service writes to the log, has no terminal, outlives the call; a missing program is reported" {
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const log_path = try testScratchPath(a, &path_buf, "service.log");
+    _ = std.c.unlink(log_path.ptr);
+    defer _ = std.c.unlink(log_path.ptr);
+    const log_fd = std.c.open(log_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o600));
+    try std.testing.expect(log_fd >= 0);
+    // The service reads stdin (null device: immediate EOF), reports whether it
+    // still has a controlling terminal, and is still running when we return.
+    const argv: []const ?[*:0]const u8 = &.{ "/bin/sh", "-c", "read x; echo stdin=$?; (exec 3</dev/tty) 2>/dev/null && echo tty=yes || echo tty=no; sleep 0.3; echo done", null };
+    try spawnService(argv, log_fd);
+    _ = std.c.close(log_fd);
+    var waited: u32 = 0;
+    var contents: []u8 = &.{};
+    defer a.free(contents);
+    while (waited < 50) : (waited += 1) {
+        a.free(contents);
+        contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, log_path, a, .limited(4096));
+        if (std.mem.indexOf(u8, contents, "done") != null) break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+    }
+    try std.testing.expect(std.mem.indexOf(u8, contents, "stdin=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "tty=no") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "done") != null);
+
+    const bad: []const ?[*:0]const u8 = &.{ "/metacodes-no-such-program", null };
+    const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    defer _ = std.c.close(null_fd);
+    try std.testing.expectError(error.ChildExecFailed, spawnService(bad, null_fd));
+    try std.testing.expectEqual(SpawnStep.exec, (takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure).step);
 }
 
 test "buildWindowsCmdline quoting" {

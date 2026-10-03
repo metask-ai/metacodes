@@ -449,6 +449,9 @@ pub const App = struct {
     /// TinyKG 客户端(记忆/计划/DAG;设计 KG_DESIGN v3-final)。null = 未初始化
     /// (缺 home 等);non-null 但 !ready = degraded。工具经 ctx.kg 拿指针。
     kg: ?@import("kg/client.zig").KgClient = null,
+    /// Starts this install's TinyKG service when a session needs it; owned
+    /// here, shared by `kg` and every clone of it (address-stable).
+    kg_autostart: ?*@import("app/kg_autostart.zig").Autostart = null,
     /// per-project 指针目录 `{home}/.metacodes/projects/<hash>`(kg_root/kg_inbox 落此)。owned。
     kg_projects_dir: []u8 = &.{},
     /// KG 启动注入快照(kg/inject.zig;owned)。空串=空态(不注入)。
@@ -1037,6 +1040,7 @@ pub const App = struct {
         app.file_change_journal.deinit();
         app.conversation.deinit();
         if (app.kg) |*k| k.deinit();
+        if (app.kg_autostart) |starter| starter.destroy();
         if (app.kg_projects_dir.len > 0) app.allocator.free(app.kg_projects_dir);
         if (app.kg_summary.len > 0) app.allocator.free(app.kg_summary);
         if (app.jev) |runtime| runtime.destroy(app.allocator);
@@ -2377,6 +2381,9 @@ pub const App = struct {
         };
         defer app.allocator.free(domain);
 
+        // Nobody should have to remember `metacodes kgd`: the client asks this
+        // host to provision and start the install's service when it needs it.
+        if (app.kg_autostart == null) app.kg_autostart = @import("app/kg_autostart.zig").Autostart.create(app.allocator, state_dir);
         var client = @import("kg/client.zig").KgClient.init(app.allocator, .{
             .state_root = state_dir,
             .domain = domain,
@@ -2385,6 +2392,7 @@ pub const App = struct {
             // exe_dir 不传:与 rg / kernel 同走 platform.paths.selfExeRealPath(OS 级 self-exe +
             // realpath),不再从 argv[0] 推导;字段只留给测试注入。
             .io = app.api_client.http_client.io,
+            .autostart = if (app.kg_autostart) |starter| starter.hook() else null,
         }) catch return;
         client.ensureReady();
         app.kg = client;

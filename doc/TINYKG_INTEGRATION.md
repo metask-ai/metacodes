@@ -163,7 +163,8 @@ for the local service described below.
 ## The local service: `kg install` and `kgd`
 
 A shared deployment runs TinyKG Web in front of one `tinykgd`. A single machine
-runs the same contract from the product binary instead:
+runs the same contract from the product binary instead, and a session sets it
+up by itself (see "Autostart" below). By hand:
 
 ```sh
 metacodes kg install     # create the store, the key and daemon.json
@@ -202,8 +203,16 @@ Properties worth knowing:
 - A `tinykgd` that accepts a request and stops answering desynchronizes the
   pipe. The service reports 503, stops, and says to start it again rather than
   queueing every later request behind a read that will not return.
-- Nothing starts the daemon automatically yet and there is no idle exit: run
-  `metacodes kgd` (one per install; give each install its own `--port`).
+- The service keeps the store's full-text index current for retrieval. Every
+  committed write leaves the engine's index stale, and on a stale index the
+  agent-retrieval (`--format json`) form of `search` plans over an in-memory
+  scan that refuses any node whose text has no tokens (TinyKG
+  `text/in_memory_index.zig`: `doc_len <= 0` → `Unsupported`). One
+  punctuation-only node made every KgRecall after a write fail. The service
+  reads `text_stale` from `store-info` at start, marks the index stale after
+  every committed write or import, and runs `rebuild-text` before serving
+  `search`, `context-plan` or `context-packet`.
+- SIGTERM and SIGHUP stop it like Ctrl+C: `tinykgd` is taken down with it.
 - Markdown import stages the document where the engine can read it back by
   pathname, always at `<state root>/kg/import`. The location is derived from the
   install's state root alone, never from `--config` or `--store`: both can point
@@ -245,10 +254,10 @@ fixed repair hint:
 
 | Kind | Hint |
 |---|---|
-| `unconfigured` | write `<state root>/kg/daemon.json` (0600) or set the KG URL/key/build-id variables |
+| `unconfigured` | a CLI session provisions and starts it by itself (`METACODES_KG_AUTOSTART=0` turns that off); `metacodes kg install` does it by hand, or set the KG URL/key/build-id variables |
 | `config_unsafe` | make the file regular, non-symlink, under 64 KB, and mode 0600 |
 | `config_invalid` | fix the URL, API key, and expected build-id JSON |
-| `daemon_unreachable` | start tinykgd/tinykg-web at the configured URL |
+| `daemon_unreachable` | a CLI session starts it when it begins (`METACODES_KG_AUTOSTART=0` turns that off); `metacodes kgd` starts it now |
 | `auth_failed` | match the daemon's `TINYKG_WEB_API_KEY` |
 | `pin_mismatch` | use the running daemon's catalog build/schema values |
 | `store_contract_mismatch` | migrate storage and schema to 3/3 |
@@ -269,6 +278,41 @@ client family. Clones created after the root re-read inherit its binding. The
 state appears in the startup line, `/kg`, and `metacodes doctor`, whose `kg`
 object names the configuration source (`METACODES_KG_CONFIG`, `env` for the
 `METACODES_KG_*` triple, or the default `daemon.json` path).
+
+### Autostart
+
+A CLI session needs no `metacodes kgd`. When its readiness probe finds the
+install's service unconfigured or not listening, the host
+(`src/app/kg_autostart.zig`, through `KgClient.Autostart`) does, under one
+cross-process lock per state root (`<state root>/kg/kgd.autostart.lock`):
+
+1. provision it like `kg install` when the default `<state root>/kg/daemon.json`
+   does not exist, on the default port 8799 when it is free and on a free port
+   otherwise, so installs on one machine do not collide;
+2. start `<this executable> --state-dir <state root> kgd` as a background
+   service (own session, no terminal, output appended to
+   `<state root>/kg/kgd.log`) unless something already listens on the port;
+3. wait up to 20 s for the port to accept connections, then probe again.
+
+A host start is attempted at most once per client per 30 s. It does not apply
+to an explicit `METACODES_KG_URL`/`_API_KEY`/`_EXPECTED_BUILD_ID` service, a
+non-loopback URL, or a `METACODES_KG_CONFIG` file that does not exist (that
+fails closed). `METACODES_KG_AUTOSTART=0` (or `false`/`off`) turns it off. The
+`unconfigured` and `daemon_unreachable` repair hints (shared by the tools,
+`/kg` and `doctor`) say so. The core never spawns the service itself:
+an SDK embedder passes its own hook, or none.
+
+The started service stays up until it is stopped or the machine restarts;
+there is no idle exit. A write that met a service which had just exited would
+have to be treated as possibly committed, and the transport fences every later
+write of the session after such an outcome.
+
+Known limitation: only a readiness probe starts the service. If it goes away
+under a session that already used it, that session reports it unreachable and
+the next session starts it again. A new service instance starts a new
+generation sequence, which a transport pinned to the old instance rejects by
+design (`IncompatibleDaemon`); reconnecting a live session to a new instance
+needs epoch handling in the transaction controller.
 
 ## Ownership and prompt-cache boundary
 

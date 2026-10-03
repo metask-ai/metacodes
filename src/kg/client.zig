@@ -309,6 +309,49 @@ pub const KgClient = struct {
     /// abort 信号(M1:ESC 中断——穿进 spawn,避免锁竞争时最坏 13 分钟不可中断)。
     /// 借用,不拥有;工具/​/kg 调用前 setAbort。
     abort: ?*const AbortSignal = null,
+    /// The host's way to bring the local service up (`Autostart`); null for
+    /// an embedder that runs its own service or none. Clones share it.
+    autostart: ?Autostart = null,
+    /// When this client last asked the host to start the service.
+    autostart_last_ms: i64 = 0,
+
+    /// How a host brings up the local TinyKG service on demand. The core never
+    /// spawns processes or picks executables: it only says when the service is
+    /// needed and not there — unconfigured, or refusing connections when the
+    /// client probes readiness — and the host decides whether and how to start
+    /// one. `start` returns true when a service should now answer at the
+    /// configured address; it is called with no client lock held, from any
+    /// thread that owns a client of this family, so the host makes it
+    /// thread-safe.
+    ///
+    /// Only a readiness probe asks. A service that goes away under a ready
+    /// client is not restarted for it: a new service instance starts a new
+    /// generation sequence, which the transport rejects by design (it pins the
+    /// monotonic generation of the instance it first saw), so the session
+    /// reports it unreachable and the next session's probe starts it.
+    pub const Autostart = struct {
+        ctx: *anyopaque,
+        start: *const fn (ctx: *anyopaque) bool,
+    };
+
+    /// One host start per client per window: a service that cannot come up
+    /// must not cost a start attempt on every KG call.
+    pub const AUTOSTART_RETRY_MS: i64 = 30_000;
+
+    fn tryAutostart(self: *KgClient) bool {
+        const hook = self.autostart orelse return false;
+        const now = time.nowMs();
+        if (self.autostart_last_ms != 0 and now - self.autostart_last_ms < AUTOSTART_RETRY_MS) return false;
+        self.autostart_last_ms = if (now > 0) now else 1;
+        const started = hook.start(hook.ctx);
+        log.info("kg", "local TinyKG service autostart: {s}", .{if (started) "up" else "not started"});
+        return started;
+    }
+
+    /// A connection the service never accepted: nothing is listening.
+    fn serviceNotRunning(err: transport_mod.Error) bool {
+        return err == transport_mod.Error.RequestFailed or err == transport_mod.Error.DaemonUnavailable;
+    }
 
     /// 设 abort 信号(工具执行前调;领域方法内的 spawn 据此可中断)。
     pub fn setAbort(self: *KgClient, abort: ?*const AbortSignal) void {
@@ -365,6 +408,8 @@ pub const KgClient = struct {
         daemon_expected_schema_digest: ?[]const u8 = null,
         /// Explicit compatibility escape hatch. It must own an isolated Store.
         exclusive_cli: bool = false,
+        /// Host hook that starts the local service on demand (see `Autostart`).
+        autostart: ?Autostart = null,
     };
 
     /// 解析 bin/store 路径并构造(不做 IO 探测;ensureReady 才探)。
@@ -420,6 +465,7 @@ pub const KgClient = struct {
             .daemon_state_root = daemon_state_root,
             .daemon_io = if (!use_cli) opts.io else null,
             .unconfigured_kind = unconfigured_kind,
+            .autostart = if (!use_cli) opts.autostart else null,
             .scoped_types = std.StringHashMap(void).init(allocator),
             .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
             .execution_ledger = execution_knowledge.Ledger.init(allocator),
@@ -454,6 +500,8 @@ pub const KgClient = struct {
                 .daemon_state_root = null,
                 .daemon_io = null,
                 .unconfigured_kind = self.unconfigured_kind,
+                // A clone's first probe may find the service not started yet.
+                .autostart = self.autostart,
             };
         }
         // issue #30:此前这里只判 `.daemon`,于是 `.unconfigured` 客户端落到下面的
@@ -846,14 +894,26 @@ pub const KgClient = struct {
     /// 任何失败 → degraded(reason 含修复提示),**绝不 throw**——KG 是增强非依赖。
     pub fn ensureReady(self: *KgClient) void {
         if (self.ready) return;
+        // Not configured yet: the host may provision and start the local
+        // service, after which the configuration it wrote is read here.
+        if (self.transport == .unconfigured and self.unconfigured_kind == .unconfigured and self.tryAutostart()) {
+            self.reloadDaemonConfig();
+        }
         switch (self.transport) {
             .unconfigured => {
                 self.setDegraded(self.unconfigured_kind, "Metacodes 本地 TinyKG daemon 未配置或配置不可用", .{});
                 return;
             },
             .daemon => |*daemon| {
-                const result = daemon.run("store-info", &.{}, false) catch |err| {
-                    self.setDegraded(classifyDaemonError(err), "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(err)});
+                const result = daemon.run("store-info", &.{}, false) catch |first| retry: {
+                    // Configured but not listening: the host may start it.
+                    if (serviceNotRunning(first) and self.tryAutostart()) {
+                        break :retry daemon.run("store-info", &.{}, false) catch |err| {
+                            self.setDegraded(classifyDaemonError(err), "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(err)});
+                            return;
+                        };
+                    }
+                    self.setDegraded(classifyDaemonError(first), "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(first)});
                     return;
                 };
                 defer result.deinit(self.allocator);
@@ -1172,10 +1232,10 @@ pub const KgClient = struct {
     /// `/kg`, and `doctor`, including for a session that has no client at all.
     pub fn hintFor(kind: DegradedKind) []const u8 {
         return switch (kind) {
-            .unconfigured => "write <state root>/kg/daemon.json (url, api_key, expected_build_id; 0600) or set METACODES_KG_URL/_API_KEY/_EXPECTED_BUILD_ID",
+            .unconfigured => "a CLI session provisions and starts it by itself (METACODES_KG_AUTOSTART=0 turns that off); `metacodes kg install` does it by hand, or set METACODES_KG_URL/_API_KEY/_EXPECTED_BUILD_ID",
             .config_unsafe => "chmod 600 and make it a regular non-symlink file under 64 KB",
             .config_invalid => "fix url/api_key/expected_build_id JSON",
-            .daemon_unreachable => "start tinykgd/tinykg-web at the configured url",
+            .daemon_unreachable => "a CLI session starts it when it begins (METACODES_KG_AUTOSTART=0 turns that off); `metacodes kgd` starts it now",
             .auth_failed => "api_key must match the daemon's TINYKG_WEB_API_KEY",
             .pin_mismatch => "set expected_build_id/schema digest to the running daemon's /api/catalog values",
             .store_contract_mismatch => "migrate the store to storage 3 / schema 3",
@@ -1192,6 +1252,30 @@ pub const KgClient = struct {
     pub fn nextBackoff(current_ms: i64) i64 {
         if (current_ms <= 0) return 5_000;
         return @min(current_ms * 2, 300_000);
+    }
+
+    /// Re-read daemon.json (root client only: clones hold no configuration
+    /// inputs). A repaired or newly written file replaces the transport.
+    fn reloadDaemonConfig(self: *KgClient) void {
+        const io = self.daemon_io orelse return;
+        const root = self.daemon_state_root orelse return;
+        const rebuilt = initDaemonTransport(self.allocator, io, .{ .state_root = root, .domain = self.domain, .io = io }) catch |err| blk: {
+            self.unconfigured_kind = switch (err) {
+                error.ConfigUnsafe => .config_unsafe,
+                error.FileNotFound => if (envGet("METACODES_KG_CONFIG") != null) .config_invalid else .unconfigured,
+                error.InvalidRemoteConfiguration, error.ConfigInvalid => .config_invalid,
+                else => .unconfigured,
+            };
+            break :blk null;
+        };
+        if (rebuilt) |state| {
+            switch (self.transport) {
+                .daemon => |*daemon| daemon.deinit(),
+                else => {},
+            }
+            self.transport = if (state.transport) |daemon| .{ .daemon = daemon } else .unconfigured;
+            self.unconfigured_kind = state.kind;
+        }
     }
 
     /// `/kg` and other explicit user requests: probe now regardless of the
@@ -1211,25 +1295,7 @@ pub const KgClient = struct {
         const now = time.nowMs();
         if (now <= 0 or !probeDue(now, self.last_probe_ms, self.probe_backoff_ms)) return false;
         if (self.degraded_kind == .unconfigured or self.degraded_kind == .config_unsafe or self.degraded_kind == .config_invalid) {
-            if (self.daemon_io) |io| if (self.daemon_state_root) |root| {
-                const rebuilt = initDaemonTransport(self.allocator, io, .{ .state_root = root, .domain = self.domain, .io = io }) catch |err| blk: {
-                    self.unconfigured_kind = switch (err) {
-                        error.ConfigUnsafe => .config_unsafe,
-                        error.FileNotFound => if (envGet("METACODES_KG_CONFIG") != null) .config_invalid else .unconfigured,
-                        error.InvalidRemoteConfiguration, error.ConfigInvalid => .config_invalid,
-                        else => .unconfigured,
-                    };
-                    break :blk null;
-                };
-                if (rebuilt) |state| {
-                    switch (self.transport) {
-                        .daemon => |*daemon| daemon.deinit(),
-                        else => {},
-                    }
-                    self.transport = if (state.transport) |daemon| .{ .daemon = daemon } else .unconfigured;
-                    self.unconfigured_kind = state.kind;
-                }
-            };
+            self.reloadDaemonConfig();
         }
         self.ready = false;
         if (self.degraded_reason) |old| {
@@ -1513,7 +1579,11 @@ pub const KgClient = struct {
         const pid = (try self.projectNodeId(false, true)) orelse return; // 无 project 无从 scope
         var pbuf: [24]u8 = undefined;
         const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{pid}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{
+        // Sent as an idempotent request, not a fenced write: `--if-absent` makes a
+        // repeat harmless, and tinykgd answers schema-scope with no commit receipt
+        // even when it creates the scope node, which the write path must read as
+        // "may have committed" and then refuse every later write of the session.
+        const out = try self.runChecked(&.{
             "schema-scope", self.store.argvSlot(), schema_type, "--project", p_str, "--if-absent", "--enforce", "block",
         });
         self.freeOut(out);
@@ -2967,8 +3037,13 @@ pub const KgClient = struct {
                     return KgError.Data;
                 },
                 .transient => {
+                    // The daemon answered: whatever went wrong, it is not
+                    // unreachable. Keep the engine's words for the log and the
+                    // model, and report it as the retryable failure it is.
+                    log.warn("kg", "tinykgd {s} exit={d} err={s}", .{ args[0], out.exit_code, err_name });
+                    self.setDetail("{s}", .{trimForLog(out.stderr)});
                     self.freeOut(out);
-                    return KgError.DaemonUnavailable;
+                    return KgError.Transient;
                 },
             }
         }
@@ -3006,12 +3081,17 @@ pub const KgClient = struct {
     const ErrClass = enum { transient, data };
 
     /// stderr `tinykg: error: <Name>` → Name;无匹配返回整段(截断)。
+    /// The engine's error name from its stderr. The CLI writes
+    /// `tinykg: error: <Name>`, the daemon `tinykgd: error: <Name>`; reading only
+    /// the first made every daemon-side refusal unclassifiable, and an
+    /// unclassified error was reported as an unreachable daemon.
     fn parseCliError(stderr: []const u8) []const u8 {
-        const marker = "tinykg: error: ";
-        if (std.mem.indexOf(u8, stderr, marker)) |i| {
-            const rest = stderr[i + marker.len ..];
-            const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-            return rest[0..end];
+        for ([_][]const u8{ "tinykg: error: ", "tinykgd: error: " }) |marker| {
+            if (std.mem.indexOf(u8, stderr, marker)) |i| {
+                const rest = stderr[i + marker.len ..];
+                const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+                return rest[0..end];
+            }
         }
         return trimForLog(stderr);
     }
@@ -3603,4 +3683,12 @@ test "classifyCliError 三类归一" {
 test "parseCliError 提取错误名" {
     try testing.expectEqualStrings("NotFound", KgClient.parseCliError("tinykg: error: NotFound\n"));
     try testing.expectEqualStrings("garbage", KgClient.parseCliError("garbage"));
+}
+
+test "parseCliError reads the daemon's prefix, so its refusals are classified" {
+    // `tinykgd: error: Unsupported` was unparseable, fell through to the
+    // transient default, and reached the model as "daemon unreachable".
+    try testing.expectEqualStrings("Unsupported", KgClient.parseCliError("tinykgd: error: Unsupported\n"));
+    try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError(KgClient.parseCliError("tinykgd: error: Unsupported\n")));
+    try testing.expectEqualStrings("Timeout", KgClient.parseCliError("tinykgd: error: Timeout"));
 }

@@ -2922,6 +2922,7 @@ test {
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
     _ = &@import("app/install.zig");
+    _ = &@import("app/kg_autostart.zig");
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("util/abort.zig");
