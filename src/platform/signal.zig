@@ -65,6 +65,38 @@ pub fn installInterrupt(comptime callback: fn () void) void {
     }
 }
 
+/// 安装终止回调：POSIX=SIGTERM + SIGHUP（后台服务被 kill、登出、所在会话结束），
+/// Windows=控制台关闭/注销/关机事件。与 `installInterrupt` 同一纪律：`callback`
+/// 必须 async-signal-safe，只置标志让主循环自己收尾，不在信号上下文里做清理。
+pub fn installTerminate(comptime callback: fn () void) void {
+    if (is_windows) {
+        const W = struct {
+            fn ctrl(ctrl_type: win.DWORD) callconv(.winapi) win.BOOL {
+                // CTRL_CLOSE_EVENT=2, CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6
+                if (ctrl_type == 2 or ctrl_type == 5 or ctrl_type == 6) {
+                    callback();
+                    return .TRUE;
+                }
+                return .FALSE;
+            }
+        };
+        _ = SetConsoleCtrlHandler(W.ctrl, .TRUE);
+    } else {
+        const P = struct {
+            fn h(_: std.posix.SIG) callconv(.c) void {
+                callback();
+            }
+        };
+        var act: std.posix.Sigaction = .{
+            .handler = .{ .handler = P.h },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+        std.posix.sigaction(std.posix.SIG.HUP, &act, null);
+    }
+}
+
 /// 安装窗口 resize 回调。POSIX=SIGWINCH sigaction；Windows no-op（resize 归 W4 终端 ConsoleInput）。
 pub fn installResize(comptime callback: fn () void) void {
     if (is_windows) return; // TODO(W4)：WINDOW_BUFFER_SIZE_EVENT via ReadConsoleInput

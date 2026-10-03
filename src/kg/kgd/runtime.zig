@@ -174,6 +174,10 @@ pub fn serve(allocator: std.mem.Allocator, config: Config) u8 {
         supervisor.deinit();
     }
     platform_signal.installInterrupt(onInterrupt);
+    // Started in the background by a session, the service is stopped by
+    // SIGTERM/SIGHUP rather than Ctrl+C; either way it takes tinykgd down
+    // through `deinit` instead of dying with the child still holding the store.
+    platform_signal.installTerminate(onInterrupt);
     std.debug.print("TinyKG service on http://127.0.0.1:{d}\n  store:  {s}\n  config: {s}\nCtrl+C to stop.\n", .{
         supervisor.port(),
         config.store_path,

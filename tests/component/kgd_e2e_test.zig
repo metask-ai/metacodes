@@ -25,6 +25,8 @@ const Harness = struct {
     supervisor: *Supervisor,
     thread: std.Thread,
     io_runtime: *std.Io.Threaded,
+    /// The service was stopped by the test and not started again.
+    stopped: bool = false,
 
     /// Null when the staged TinyKG bundle is absent: a developer checkout
     /// without `zig build tinykg:stage` skips instead of failing.
@@ -80,10 +82,20 @@ const Harness = struct {
         };
     }
 
-    fn deinit(self: *Harness) void {
+    /// Take the service down, as a crash or reboot would.
+    fn stopService(self: *Harness) void {
         self.supervisor.stop();
         self.thread.join();
         self.supervisor.deinit();
+        self.stopped = true;
+    }
+
+    fn deinit(self: *Harness) void {
+        if (!self.stopped) {
+            self.supervisor.stop();
+            self.thread.join();
+            self.supervisor.deinit();
+        }
         self.io_runtime.deinit();
         self.allocator.destroy(self.io_runtime);
         self.allocator.free(self.cli);
@@ -240,6 +252,88 @@ test "Kgd: declaring a custom type's scope does not fence the session's later wr
     try std.testing.expect(kg.transport.daemon.ambiguousRequestId() == null);
     _ = try kg.remember(.observation, "second note after the scope declaration", "scope_probe_type", false);
     _ = try kg.remember(.observation, "a base-type note", "observation", false);
+}
+
+/// Test stand-in for the host's `KgClient.Autostart`: brings the harness's
+/// service back on the port the client is configured with.
+const Restarter = struct {
+    harness: *Harness,
+    port: u16,
+    calls: u32 = 0,
+
+    fn hook(self: *Restarter) cc.kg_client.KgClient.Autostart {
+        return .{ .ctx = self, .start = start };
+    }
+
+    fn start(ctx: *anyopaque) bool {
+        const self: *Restarter = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const h = self.harness;
+        const supervisor = Supervisor.start(h.allocator, .{
+            .store_path = h.store,
+            .cli_path = h.cli,
+            .daemon_path = h.daemon,
+            .api_key = TEST_KEY,
+            .port = self.port,
+            .staging_dir = h.staging,
+        }) catch return false;
+        const thread = std.Thread.spawn(.{}, Supervisor.serveForever, .{supervisor}) catch {
+            supervisor.deinit();
+            return false;
+        };
+        h.supervisor = supervisor;
+        h.thread = thread;
+        h.stopped = false;
+        return true;
+    }
+};
+
+test "Kgd: a session that finds its service down has the host start it, then works" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
+    defer harness.deinit();
+    const endpoint = try harness.url(a);
+    defer a.free(endpoint);
+    var build_id_buf: [80]u8 = undefined;
+    const build_id = try std.fmt.bufPrint(&build_id_buf, "{s}", .{harness.supervisor.identity.buildId()});
+    const port = harness.supervisor.port();
+    // Configured, but nothing listens: a reboot, or a first session.
+    harness.stopService();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try harness.tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var restarter = Restarter{ .harness = &harness, .port = port };
+    var kg = try cc.kg_client.KgClient.init(a, .{
+        .state_root = root,
+        .domain = "autostart-probe-project",
+        .io = harness.io_runtime.io(),
+        .daemon_url = endpoint,
+        .daemon_api_key = TEST_KEY,
+        .daemon_expected_build_id = build_id,
+        .autostart = restarter.hook(),
+    });
+    defer kg.deinit();
+    kg.ensureReady();
+    try std.testing.expectEqual(@as(u32, 1), restarter.calls);
+    try std.testing.expect(kg.ready);
+    const task = try kg.createTask("autostart probe task", "task");
+    _ = try kg.taskStatus(task);
+    try std.testing.expectEqual(@as(u32, 1), restarter.calls); // up: no second start
+
+    // Without a host hook the same situation degrades, as before.
+    var bare = try cc.kg_client.KgClient.init(a, .{
+        .state_root = root,
+        .domain = "autostart-probe-project",
+        .io = harness.io_runtime.io(),
+        .daemon_url = "http://127.0.0.1:1",
+        .daemon_api_key = TEST_KEY,
+        .daemon_expected_build_id = build_id,
+    });
+    defer bare.deinit();
+    bare.ensureReady();
+    try std.testing.expect(!bare.ready);
+    try std.testing.expectEqual(cc.kg_client.DegradedKind.daemon_unreachable, bare.degradedKind().?);
 }
 
 test "Kgd: the service refuses a wrong key and an undeclared capability" {

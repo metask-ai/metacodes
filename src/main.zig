@@ -1033,7 +1033,9 @@ pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").
         null;
     defer if (default_path) |p| allocator.free(p);
     const config: []const u8 = if (is_cli) "-" else if (env_triple) "env" else (env_config_path orelse default_path orelse "-");
-    const hint: []const u8 = if (kclient.ready) "-" else kclient.degradedHint();
+    const kg_autostart = @import("app/kg_autostart.zig");
+    const stopped_but_autostarts = !kclient.ready and !is_cli and kg_autostart.wouldStart(kclient.degradedKind() orelse .unconfigured);
+    const hint: []const u8 = if (kclient.ready) "-" else if (stopped_but_autostarts) kg_autostart.STOPPED_HINT else kclient.degradedHint();
     return try kgDiagnosisOwned(allocator, state, transport, config, hint);
 }
 
@@ -2922,6 +2924,7 @@ test {
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
     _ = &@import("app/install.zig");
+    _ = &@import("app/kg_autostart.zig");
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("util/abort.zig");

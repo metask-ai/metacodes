@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- The TinyKG service starts by itself. A CLI session whose readiness probe
+  finds the install's service unconfigured or not listening provisions it
+  (as `kg install`, on 8799 or a free port when that is taken) and starts
+  `metacodes kgd` in the background (own session, log in
+  `<state root>/kg/kgd.log`), under a cross-process lock per state root.
+  `METACODES_KG_AUTOSTART=0` turns it off; explicit `METACODES_KG_URL`
+  services and missing `METACODES_KG_CONFIG` files are left alone; `doctor`
+  reports a stopped service as starting with the next session. The core
+  only exposes `KgClient.Autostart`; the host decides how to start it.
+  `kgd` now stops cleanly on SIGTERM/SIGHUP as well.
 - Hosts customize the system prompt per Session (#184, phase 2). AgentCore
   ABI v1 moves to **revision 18**: `SessionCreateConfigV1.prompt_profile`
   edits the kernel's named prompt sections — replace `metacodes:identity`,
@@ -150,6 +160,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- KgRecall failed after any write in a store holding one node whose text has
+  no tokens, and reported "TinyKG daemon 不可达" while the daemon was up. On a
+  stale full-text index TinyKG's JSON search refuses such a node
+  (`Unsupported`); `kgd` now rebuilds the index before serving a retrieval.
+  The daemon's `tinykgd: error: <Name>` stderr is now parsed, so its refusals
+  are classified and shown instead of being reported as an unreachable
+  daemon, and auto-scoping a custom type (`schema-scope --if-absent`, which
+  tinykgd answers without a commit receipt) no longer fences every later
+  write of the session as an ambiguous commit.
 - The macOS Lean kernels linked Homebrew's `libgmp` and `libuv`, so they ran
   only where Homebrew had installed them. Both kernel scripts now link the
   static libraries of the Lean toolchain, and every kernel build ends in
