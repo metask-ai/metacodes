@@ -41,7 +41,7 @@ def release_report(root, **overrides):
     checks = []
     for name, path in shipped.items():
         check = {"name": name, "resolved_path": str(root / path), "sha256": "ab" * 32, "expected_sha256": "ab" * 32,
-                 "match": True, "source": "adjacent", "provenance": True if name.endswith("_kernel") else None}
+                 "match": True, "source": "adjacent", "provenance": None if name == "ripgrep" else True}
         check.update(overrides.get(name, {}))
         checks.append(check)
     return {"checks": checks}
@@ -89,7 +89,7 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         report = {
             "checks": [
                 {"name": "ripgrep", "resolved_path": "/usr/bin/rg", "sha256": "ab", "expected_sha256": None, "match": None, "source": "path"},
-                {"name": "tinykg", "resolved_path": str(root / "vendor" / "tinykg" / "tinykg"), "sha256": "cd", "expected_sha256": "cd", "match": True, "source": "adjacent"},
+                {"name": "tinykg", "resolved_path": str(root / "vendor" / "tinykg" / "tinykg"), "sha256": "cd", "expected_sha256": "cd", "match": True, "source": "adjacent", "provenance": True},
                 *KERNELS_ABSENT,
             ]
         }
@@ -114,7 +114,8 @@ class VerifyInstallPrefixTest(unittest.TestCase):
             ]
         }
         findings = evaluate_doctor(report, root)
-        self.assertEqual(len(findings), 7)
+        self.assertEqual(len(findings), 8)
+        self.assertTrue(any("tinykg provenance is None" in finding for finding in findings))
         self.assertTrue(any("no ripgrep check" in finding for finding in findings))
         self.assertTrue(any("no formal_kernel check" in finding for finding in findings))
         self.assertTrue(any("no project_kernel check" in finding for finding in findings))
@@ -156,7 +157,7 @@ class VerifyInstallPrefixTest(unittest.TestCase):
     def _kernel_report(self, root, **kernel):
         base = [
             {"name": "ripgrep", "resolved_path": str(root / "bin/rg"), "match": True, "source": "adjacent"},
-            {"name": "tinykg", "resolved_path": str(root / "vendor/tinykg/tinykg"), "match": True, "source": "adjacent"},
+            {"name": "tinykg", "resolved_path": str(root / "vendor/tinykg/tinykg"), "match": True, "source": "adjacent", "provenance": True},
         ]
         entry = {"name": "project_kernel", "resolved_path": None, "sha256": None, "expected_sha256": None, "match": None, "source": None, "provenance": None}
         entry.update(kernel)
@@ -214,7 +215,12 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         findings = evaluate_daemon({"tinykgd": pinned_absent}, root)
         self.assertEqual(len(findings), 1)
         self.assertIn("tinykgd is pinned", findings[0])
-        shipped = {"name": "tinykgd", "resolved_path": str(root / "vendor/tinykg/tinykgd"), "sha256": "ab" * 32, "expected_sha256": "ab" * 32, "match": True, "source": "adjacent", "provenance": None}
+        shipped = {"name": "tinykgd", "resolved_path": str(root / "vendor/tinykg/tinykgd"), "sha256": "ab" * 32, "expected_sha256": "ab" * 32, "match": True, "source": "adjacent", "provenance": True}
         self.assertEqual(evaluate_daemon({"tinykgd": shipped}, root), [])
+        # A shipped daemon whose staging receipt is missing or does not describe it.
+        for verdict in (None, False):
+            findings = evaluate_daemon({"tinykgd": dict(shipped, provenance=verdict)}, root)
+            self.assertEqual(len(findings), 1)
+            self.assertIn("staging receipt must describe this binary", findings[0])
         findings = evaluate_daemon({"tinykgd": dict(shipped, resolved_path="/elsewhere/tinykgd", source="env", match=False)}, root)
         self.assertEqual(len(findings), 3)

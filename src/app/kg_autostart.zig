@@ -137,6 +137,18 @@ pub const Autostart = struct {
     }
 };
 
+/// Whether a CLI session would start the service for a client degraded this
+/// way: `doctor` then shows a stopped service as normal rather than a fault.
+pub fn wouldStart(kind: @import("../kg/client.zig").DegradedKind) bool {
+    if (!enabled()) return false;
+    if (envSet("METACODES_KG_URL") or envSet("METACODES_KG_API_KEY") or envSet("METACODES_KG_EXPECTED_BUILD_ID")) return false;
+    return switch (kind) {
+        .daemon_unreachable => true,
+        .unconfigured => std.c.getenv("METACODES_KG_CONFIG") == null,
+        else => false,
+    };
+}
+
 fn enabled() bool {
     const raw = std.c.getenv(ENV_DISABLE) orelse return true;
     return !disables(std.mem.span(raw));

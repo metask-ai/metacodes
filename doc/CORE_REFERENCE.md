@@ -43,7 +43,7 @@ Lean 治理 kernel 是这个边界的固定外部裁决面：发布时放在 `bi
 `libexec/metacodes/`，运行时先看环境变量路径与摘要配对，再看相邻文件及编译进二进制的摘要；
 `metacodes doctor` 会同时报告 formal kernel 与 project kernel 的路径、摘要和 provenance，两者的
 provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest + build receipt 走
-`formal/provenance.zig`，project v6 manifest 走 `formal/project_provenance.zig`），拿错 loader 即 `provenance=false`。
+`formal/provenance.zig`，project v6 manifest 走 `formal/project_provenance.zig`），拿错 loader 即 `provenance=false`。tinykg/tinykgd 旁的打包回执（`<name>.provenance.json`）同样被核对：记录的摘要、角色、版本行和存储契约必须对得上这个文件，否则 `provenance=false`，`--strict` 失败。
 
 ---
 

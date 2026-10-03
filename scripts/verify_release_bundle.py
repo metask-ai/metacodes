@@ -284,6 +284,8 @@ def check_tinykg(prefix: Path, manifest: dict, cwd: Path) -> None:
 
 
 KERNEL_CHECKS = ("formal_kernel", "project_kernel")
+# The TinyKG pair ships with its staging receipts, which doctor validates.
+RECEIPT_CHECKS = ("tinykg", "tinykgd")
 # Every runtime asset of a v2 unit, by its doctor check name (= component name).
 RUNTIME_ASSET_CHECKS = ("ripgrep", "tinykg", "tinykgd") + KERNEL_CHECKS
 
@@ -332,6 +334,8 @@ def evaluate_doctor_report(report: object, prefix: Path, manifest: dict) -> None
             raise BundleError(f"doctor sees {name} digest {check.get('sha256')!r}, manifest ships {component['sha256']}")
         if name in KERNEL_CHECKS and check.get("provenance") is not True:
             raise BundleError(f"doctor rejects the {name} provenance sidecar (provenance={check.get('provenance')!r}); it must satisfy the {name} loader")
+        if name in RECEIPT_CHECKS and check.get("provenance") is not True:
+            raise BundleError(f"doctor does not accept the {name} staging receipt (provenance={check.get('provenance')!r}); the bundle ships one that must describe this binary")
 
 
 def verify(prefix: Path, native: bool) -> list[str]:
@@ -484,7 +488,7 @@ def _doctor_report(root: Path, manifest: dict) -> dict:
         checks.append({
             "name": name, "resolved_path": str(root / component["path"]), "sha256": component["sha256"],
             "expected_sha256": component["sha256"], "match": True, "source": "adjacent",
-            "provenance": True if name in KERNEL_CHECKS else None,
+            "provenance": True if name in KERNEL_CHECKS or name in RECEIPT_CHECKS else None,
         })
     return {"checks": checks}
 
@@ -567,6 +571,8 @@ def self_test() -> int:
         _expect_bundle_error(lambda: evaluate_doctor_report(_with(healthy, "project_kernel", resolved_path=None), root, manifest), "did not resolve project_kernel")
         _expect_bundle_error(lambda: evaluate_doctor_report(_with(healthy, "project_kernel", resolved_path="/elsewhere/metacodes-project-kernel"), root, manifest), "outside the bundle")
         _expect_bundle_error(lambda: evaluate_doctor_report(_with(healthy, "project_kernel", provenance=False), root, manifest), "rejects the project_kernel provenance sidecar")
+        _expect_bundle_error(lambda: evaluate_doctor_report(_with(healthy, "tinykgd", provenance=False), root, manifest), "does not accept the tinykgd staging receipt")
+        _expect_bundle_error(lambda: evaluate_doctor_report(_with(healthy, "tinykg", provenance=None), root, manifest), "does not accept the tinykg staging receipt")
         _expect_bundle_error(lambda: evaluate_doctor_report(_with(healthy, "formal_kernel", match=False), root, manifest), "doctor sees formal_kernel digest")
         _expect_bundle_error(lambda: evaluate_doctor_report(_with(healthy, "tinykgd", expected_sha256=None), root, manifest), "the executable pins tinykgd None")
         _expect_bundle_error(lambda: evaluate_doctor_report(_with(healthy, "tinykgd", source="env"), root, manifest), "expected the adjacent bundle copy")
