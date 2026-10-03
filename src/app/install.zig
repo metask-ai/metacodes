@@ -96,6 +96,7 @@ const SdkManifest = struct {
 const InstallRecord = struct {
     schema_version: []const u8,
     version: []const u8 = "",
+    state_root: []const u8 = "",
 };
 
 /// `source_root` is the unit the running executable belongs to. `arena`
@@ -149,8 +150,12 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
 
     // The record first: a copy that fails half way leaves a prefix that the
     // same version may retry without --force.
-    const recorded_root = options.state_dir orelse "state";
-    const resolved_root = if (options.state_dir) |dir| dir else try std.fs.path.join(arena, &.{ prefix, "state" });
+    // A reinstall or upgrade keeps the root the install already records unless
+    // --state-dir names another: rerunning the installer must never re-point
+    // an install at an empty state root.
+    const kept_root: ?[]const u8 = if (options.state_dir == null) try previousStateRoot(arena, io, prefix) else null;
+    const recorded_root = options.state_dir orelse kept_root orelse "state";
+    const resolved_root = if (std.fs.path.isAbsolute(recorded_root)) recorded_root else try std.fs.path.join(arena, &.{ prefix, recorded_root });
     try util_fs.mkdirParents(resolved_root);
     const record = try std.json.Stringify.valueAlloc(arena, .{
         .schema_version = state_root.manifest_schema,
@@ -184,7 +189,7 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
     }
     if (previous) |old| try removeDropped(arena, io, prefix, old, manifest, log);
     try log.print("installed metacodes {s}: {d} files verified under {s}\n", .{ version, manifest.files.len, prefix });
-    try log.print("state root: {s}\n", .{resolved_root});
+    try log.print("state root: {s}{s}\n", .{ resolved_root, if (kept_root != null) " (kept from the install record)" else "" });
 
     var outcome: Outcome = .{
         .version = version,
@@ -232,6 +237,19 @@ fn checkPrefix(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, version
         return if (force) {} else error.PrefixOccupied;
     if (!std.mem.eql(u8, record.schema_version, state_root.manifest_schema)) return if (force) {} else error.PrefixOccupied;
     if (!std.mem.eql(u8, record.version, version) and !replace_version) return error.DifferentVersionInstalled;
+}
+
+/// The state root this prefix's install record names, when it holds a valid
+/// record of this product: absolute, or a relative path that stays inside the
+/// prefix. Anything else is no root to keep.
+fn previousStateRoot(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) !?[]const u8 {
+    const record_path = try std.fs.path.join(arena, &.{ prefix, install_manifest_rel });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, record_path, arena, .limited(64 << 10)) catch return null;
+    const record = std.json.parseFromSliceLeaky(InstallRecord, arena, bytes, .{ .ignore_unknown_fields = true }) catch return null;
+    if (!std.mem.eql(u8, record.schema_version, state_root.manifest_schema) or record.state_root.len == 0) return null;
+    if (std.fs.path.isAbsolute(record.state_root)) return record.state_root;
+    checkRelative(record.state_root) catch return null;
+    return record.state_root;
 }
 
 /// Files the replaced unit listed and this one does not: a renamed or dropped
@@ -729,6 +747,41 @@ test "upgrade replaces another version, drops its retired files and keeps the st
     // Reinstalling the same version removes nothing.
     _ = try run(arena, testing.io, newer, .{ .prefix = prefix, .upgrade = true, .self_check = false }, &log.writer);
     try testing.expectEqualStrings("exe", try read(arena, try fixture.path(arena, "opt/mc/bin/metacodes")));
+}
+
+test "a reinstall or upgrade keeps the recorded state root unless --state-dir names another" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+
+    const prefix = try fixture.path(arena, "opt/mc");
+    const shared = try fixture.path(arena, "home/.metacodes");
+    const record_path = try fixture.path(arena, "opt/mc/etc/metacodes/install.json");
+    _ = try run(arena, testing.io, try fixture.unit(arena, "0.3.0", &unit_files), .{ .prefix = prefix, .state_dir = shared, .self_check = false }, &log.writer);
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    const newer = try fixture.unit(arena, "0.4.0", &unit_files);
+
+    // No --state-dir on the upgrade: the absolute root stays.
+    const upgraded = try run(arena, testing.io, newer, .{ .prefix = prefix, .upgrade = true, .self_check = false }, &log.writer);
+    try testing.expectEqualStrings(shared, upgraded.state_root);
+    try testing.expect(std.mem.indexOf(u8, try read(arena, record_path), shared) != null);
+    // Same version again, still no --state-dir: unchanged.
+    try testing.expectEqualStrings(shared, (try run(arena, testing.io, newer, .{ .prefix = prefix, .self_check = false }, &log.writer)).state_root);
+
+    // An explicit --state-dir re-points it.
+    const other = try fixture.path(arena, "elsewhere");
+    try testing.expectEqualStrings(other, (try run(arena, testing.io, newer, .{ .prefix = prefix, .state_dir = other, .self_check = false }, &log.writer)).state_root);
+
+    // A fresh install defaults to <prefix>/state, and keeps it relative.
+    const fresh = try fixture.path(arena, "opt/fresh");
+    const first = try run(arena, testing.io, newer, .{ .prefix = fresh, .self_check = false }, &log.writer);
+    try testing.expectEqualStrings(try std.fs.path.join(arena, &.{ fresh, "state" }), first.state_root);
+    try testing.expect(std.mem.indexOf(u8, try read(arena, try fixture.path(arena, "opt/fresh/etc/metacodes/install.json")), "\"state_root\": \"state\"") != null);
 }
 
 test "the doctor state_root line parses paths with spaces" {

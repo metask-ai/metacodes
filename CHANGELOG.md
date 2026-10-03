@@ -91,7 +91,11 @@ status, compatibility boundaries, and entry points are defined by
   replaces the main checkout's install. `--uninstall` removes an install
   (never one a process still runs from, never a launcher it did not write).
   A release that predates `metacodes install` (manifest v1) is refused
-  instead of run.
+  instead of run. A rerun needs none of the first run's options: the
+  installer keeps the state root the install record names unless
+  `--state-dir` is given, the script keeps the launcher name that already
+  points at the install, and a development install's prefix follows its
+  checkout rather than its launcher name.
 - The release unit is complete on every platform (manifest schema 2): it
   ships the TinyKG daemon and both Lean governance kernels, built natively on
   each release runner and pinned into the executable, with the licence texts
@@ -169,6 +173,11 @@ status, compatibility boundaries, and entry points are defined by
   daemon, and auto-scoping a custom type (`schema-scope --if-absent`, which
   tinykgd answers without a commit receipt) no longer fences every later
   write of the session as an ambiguous commit.
+- `--version` and the release manifest disagreed on whether a tree with an
+  untracked file is dirty (the executable ignored untracked files, the
+  manifest counted them), so `release:verify`, and with it
+  `install.sh --dev`, failed on any checkout holding one. Both now count
+  untracked files and ignore ignored ones.
 - The macOS Lean kernels linked Homebrew's `libgmp` and `libuv`, so they ran
   only where Homebrew had installed them. Both kernel scripts now link the
   static libraries of the Lean toolchain, and every kernel build ends in

@@ -220,7 +220,10 @@ fn gitIdentity(b: *std.Build) GitIdentity {
     const commit = gitStdout(b, &.{ "git", "-C", root, "rev-parse", "HEAD" }) orelse
         return .{ .commit = "unknown", .dirty = false };
     if (!isLowerHex(commit, 40)) return .{ .commit = "unknown", .dirty = false };
-    const status = gitStdout(b, &.{ "git", "-C", root, "status", "--porcelain", "--untracked-files=no" }) orelse
+    // The same question scripts/manifest_common.zig asks for the release
+    // manifest (untracked files count; ignored ones do not): `--version` and
+    // the manifest must agree, or release:verify rejects the unit.
+    const status = gitStdout(b, &.{ "git", "-C", root, "status", "--porcelain", "--untracked-files=normal" }) orelse
         return .{ .commit = commit, .dirty = false };
     return .{ .commit = commit, .dirty = status.len != 0 };
 }
