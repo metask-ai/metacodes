@@ -52,7 +52,9 @@ pub fn main(init: std.process.Init) !void {
         index += 1;
     }
     const input = try std.Io.Dir.cwd().readFileAlloc(init.io, input_path orelse return error.MissingInput, arena, .limited(1024 * 1024 * 1024));
-    const runtime = cc.jev_runtime.fromEnv(init.gpa, init.io, "") orelse return error.JudgeNotConfigured;
+    // The judge comes from METACODES_JEV_* alone: no state root, no default,
+    // so a run always names the service it measured.
+    const runtime = cc.jev_runtime.load(init.gpa, init.io, "", "", false) orelse return error.JudgeNotConfigured;
     defer runtime.destroy(init.gpa);
 
     var out: std.ArrayList(u8) = .empty;

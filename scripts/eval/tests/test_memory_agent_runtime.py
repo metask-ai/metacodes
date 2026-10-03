@@ -39,6 +39,7 @@ from scripts.eval.memory_agent_runtime import (
     _sanitized_environment,
     ARM_TO_RUNTIME,
     SYSTEM_ONE_ARMS,
+    SYSTEM_ONE_OFF_ENVIRONMENT,
     SystemOneJudgeProxy,
     _system_one_environment,
     _verify_scoped_recall_activation,
@@ -2992,6 +2993,14 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             }
         )
         self.assertEqual(clean, {"PATH": "/operator/bin"})
+
+    def test_every_arm_starts_with_the_builtin_advisor_off(self):
+        # Stripping the variables is not enough: the CLI would fall back to
+        # its built-in service. `off` is the switch, and a System-One arm's
+        # own settings replace it.
+        self.assertEqual(dict(SYSTEM_ONE_OFF_ENVIRONMENT), {"METACODES_JEV_URL": "off"})
+        judged = {**SYSTEM_ONE_OFF_ENVIRONMENT, **_system_one_environment("tinykg_jev", "http://127.0.0.1:9", "m")}
+        self.assertEqual(judged["METACODES_JEV_URL"], "http://127.0.0.1:9")
 
     def test_production_auth_rejects_parent_environment_and_reads_private_file(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1236,6 +1236,12 @@ class _ScriptedPlanner:
         return _text_sse("runtime-smoke", request_id)
 
 
+# The CLI falls back to a built-in System-One service when nothing configures
+# one, so an arm without the variables is not an arm without the advisor.
+# Every child starts from this; System-One arms replace it with their judge.
+SYSTEM_ONE_OFF_ENVIRONMENT: Mapping[str, str] = {"METACODES_JEV_URL": "off"}
+
+
 def _system_one_environment(arm_id: str, origin: str, model: str) -> Dict[str, str]:
     """The METACODES_JEV_* variables a System-One arm's child receives."""
 
@@ -1891,9 +1897,9 @@ def _sanitized_environment(base: Mapping[str, str]) -> Dict[str, str]:
         "METACODES_RECALL_FLOOR",
         "METASK_API_KEY",
     }
-    # METACODES_JEV_* would silently install a System-One advisor in every arm
-    # (including the no-memory baseline); treatment settings are added only
-    # explicitly by the caller.
+    # An operator's METACODES_JEV_* would silently install a System-One
+    # advisor in every arm (including the no-memory baseline); the caller sets
+    # SYSTEM_ONE_OFF_ENVIRONMENT, and treatment settings, explicitly.
     return {
         key: value
         for key, value in base.items()
@@ -3549,6 +3555,7 @@ def run_memory_agent_schedule(
                 "METACODES_NO_PROBE": "1",
                 "METACODES_PROVIDER": "anthropic",
                 "METACODES_LONG_HORIZON_ARM": runtime_arm,
+                **SYSTEM_ONE_OFF_ENVIRONMENT,
                 "METACODES_RECORD_DIR": str(cassette),
                 "METACODES_EVAL_METADATA_FD": str(metadata_fd),
                 "METACODES_EVAL_FD": str(events_file.fileno()),

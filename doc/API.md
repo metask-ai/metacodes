@@ -185,14 +185,23 @@ A self-hosted Jev System-One judge can advise four memory decisions (scoped
 recall injection, `KgRecall` evidence, `KgRemember` relations, enumeration
 intent). It is configured by the `jev` object of the install's
 `<state root>/config.json`, each field overridable by its `METACODES_JEV_*`
-variable, and it is off unless a `url` comes from either; it is evidence only:
-it never gates a tool, a permission, a budget, or a TinyKG write. Design,
-failure semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_ONE.md).
+variable. A host that sets `Config.jev_builtin_default` (the CLI does) falls
+back to the built-in service — `metask-jev-4b` at `http://58.211.6.133:10420`
+in `advisory` mode, plain HTTP over the public network — when neither names
+a `url`; an embedder that leaves it off has no advisor unless one of them
+does. The default applies as a whole: a layer that names its own `url` starts
+from the plain defaults (`shadow`, no model pin), while one that only sets
+`mode` or `timeout_ms` tunes the default service. An `off` or empty `url`
+from any layer (`"jev": false`, `"jev": {"url": "off"}`,
+`METACODES_JEV_URL=off`) turns it off; the build exports
+`METACODES_JEV_URL=off` to every step it runs. It is evidence only: it never
+gates a tool, a permission, a budget, or a TinyKG write. Design, failure
+semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_ONE.md).
 
 | `jev` field | Override | Contract |
 |---|---|---|
-| `url` | `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); absent or blank in both disables the advisor |
-| `mode` | `METACODES_JEV_MODE` | `shadow` (default: consult and journal, provider-visible bytes unchanged) or `advisory` (judgments change injections and annotate tool results) |
+| `url` | `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); absent everywhere means the built-in default (CLI) or no advisor (embedders); `off` or blank disables the advisor |
+| `mode` | `METACODES_JEV_MODE` | `shadow` (when unset: consult and journal, provider-visible bytes unchanged) or `advisory` (the built-in default; judgments change injections and annotate tool results) |
 | `timeout_ms` (integer) | `METACODES_JEV_TIMEOUT_MS` | per-consultation deadline, default 2500, 100–30000; a miss falls back to the unadvised path with no retry |
 | `model` | `METACODES_JEV_MODEL` | expected model id; a response from any other model, or one that reports a priced tariff, is refused |
 | `decisions` (array of names, or a comma-separated string) | `METACODES_JEV_DECISIONS` (comma-separated) | subset of `scoped_recall`, `recall_evidence`, `memory_relation`, `enumeration_intent` (default: all); a surface left out behaves exactly as with no advisor, and an unknown or empty list disables the advisor |
@@ -200,7 +209,7 @@ failure semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_ONE.md).
 An unknown key in the `jev` object, a value of the wrong type, or an invalid
 value disables the advisor with a warning rather than falling back to a
 default. `metacodes doctor` reports the effective state, URL and source
-(`jev_advisor <off|shadow|advisory|invalid> url=… source=<none|file|env|file_and_env> error=…`;
+(`jev_advisor <off|shadow|advisory|invalid> url=… source=<none|default|file|env|file_and_env> error=…`;
 `"jev"` in `--json`); it never affects `--strict`.
 
 Every consultation emits a `system_one_decision` event

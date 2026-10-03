@@ -836,10 +836,10 @@ pub const App = struct {
         // 注入段不出现；允许 TinyKG 的 treatment 仍广告工具并显式返回 kg_unavailable。
         app.initKg();
 
-        // System-One advisor (Jev): `jev` in <state root>/config.json, each
-        // METACODES_JEV_* overriding its field. Off without a url, shadow
-        // unless mode=advisory. Never fatal.
-        app.jev = @import("jev/runtime.zig").load(app.allocator, app.api_client.http_client.io, app.homeDir(), app.stateRoot());
+        // System-One advisor (Jev): METACODES_JEV_* over `jev` in
+        // <state root>/config.json over the built-in default (CLI only).
+        // Off with an empty url. Never fatal.
+        app.jev = @import("jev/runtime.zig").load(app.allocator, app.api_client.http_client.io, app.homeDir(), app.stateRoot(), app.config.jev_builtin_default);
 
         // 从 config.json 加载 permission_rules（旧 schema，向后兼容）
         app.loadPermissionRules() catch |err| {

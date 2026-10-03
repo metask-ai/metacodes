@@ -1,20 +1,27 @@
 //! Host wiring for the System-One advisor: configuration and an
 //! address-stable client/advisor pair.
 //!
-//! Configured in the install's `<state root>/config.json`, under `jev`:
+//! Three layers, each field taken from the highest one that sets it:
 //!
-//!     "jev": { "url": "http://host:10420", "mode": "shadow", "timeout_ms": 2500,
-//!              "model": "metask-jev-4b", "decisions": ["scoped_recall"] }
+//! 1. The built-in default (`BUILTIN_DEFAULT`), when the host asks for it.
+//!    The CLI does; library embedders and in-process tests do not, so a host
+//!    that never opted in never sends a session's state anywhere.
+//! 2. The install's `<state root>/config.json`, under `jev`:
 //!
-//! Each `METACODES_JEV_*` variable overrides its field (the env-over-file rule
-//! of the rest of the configuration; evaluation harnesses inject them per arm).
-//! Off by default: no `url` from either source means no advisor. A `url`
-//! installs it in `shadow` mode — the judge is asked and journaled while every
-//! host decision keeps its deterministic baseline; `mode: "advisory"` lets the
-//! documented consumer policies use the answers; `decisions` narrows it to a
-//! subset of its surfaces (default: all). A malformed setting, from either
-//! source, disables the advisor with a warning instead of guessing: an advisor
-//! is never worth failing a session over.
+//!        "jev": { "url": "http://host:10420", "mode": "shadow", "timeout_ms": 2500,
+//!                 "model": "metask-jev-4b", "decisions": ["scoped_recall"] }
+//!
+//! 3. Each `METACODES_JEV_*` variable (the env-over-file rule of the rest of
+//!    the configuration; evaluation harnesses inject them per arm).
+//!
+//! An empty or `off` `url` from any layer means no advisor: `"jev": false`,
+//! `"jev": {"url": "off"}` or `METACODES_JEV_URL=off` turn the default off. A `url`
+//! installs it in `shadow` mode unless the layers say otherwise — the judge is
+//! asked and journaled while every host decision keeps its deterministic
+//! baseline; `mode: "advisory"` lets the documented consumer policies use the
+//! answers; `decisions` narrows it to a subset of its surfaces (default: all).
+//! A malformed setting, from any source, disables the advisor with a warning
+//! instead of guessing: an advisor is never worth failing a session over.
 
 const std = @import("std");
 const client_mod = @import("client.zig");
@@ -37,8 +44,9 @@ pub const Settings = struct {
 
 pub const SettingsError = error{ InvalidMode, InvalidTimeout, InvalidDecisions };
 
-/// Pure interpretation of the five variables; a null or blank URL means the
-/// advisor is not configured. Borrowed slices stay borrowed.
+/// Pure interpretation of the five variables; a null, blank or `off` URL means
+/// the advisor is not configured (`off` because an empty variable cannot be
+/// set everywhere: PowerShell deletes it). Borrowed slices stay borrowed.
 pub fn parseSettings(
     url: ?[]const u8,
     mode: ?[]const u8,
@@ -47,7 +55,7 @@ pub fn parseSettings(
     decisions: ?[]const u8,
 ) SettingsError!?Settings {
     const origin = std.mem.trim(u8, url orelse return null, " \t\r\n");
-    if (origin.len == 0) return null;
+    if (origin.len == 0 or std.ascii.eqlIgnoreCase(origin, "off")) return null;
     var settings: Settings = .{ .origin = origin };
     if (mode) |raw| {
         const value = std.mem.trim(u8, raw, " \t\r\n");
@@ -108,6 +116,17 @@ pub const Raw = struct {
     }
 };
 
+/// The service the CLI uses when neither config.json nor the environment
+/// names one: the team's metask-jev-4b on the Kunshan GPU host. Plain HTTP
+/// over the public network — the state it judges (a redacted window of the
+/// session) travels unencrypted; point `url` elsewhere, or empty it, to stop
+/// that.
+pub const BUILTIN_DEFAULT: Raw = .{
+    .url = "http://58.211.6.133:10420",
+    .mode = "advisory",
+    .model = "metask-jev-4b",
+};
+
 pub const CONFIG_KEY = "jev";
 const MAX_CONFIG_BYTES: usize = 1 << 20;
 
@@ -136,8 +155,13 @@ pub fn rawFromJson(arena: std.mem.Allocator, bytes: []const u8) FileError!Raw {
     };
     if (parsed != .object) return error.ConfigNotJson;
     const section = parsed.object.get(CONFIG_KEY) orelse return .{};
-    if (section == .null) return .{};
-    if (section != .object) return error.InvalidJevSection;
+    switch (section) {
+        .null => return .{},
+        // `false` is the short form of `{"url": "off"}`: no advisor, default or not.
+        .bool => |on| return if (on) error.InvalidJevSection else .{ .url = "" },
+        .object => {},
+        else => return error.InvalidJevSection,
+    }
     var raw: Raw = .{};
     var it = section.object.iterator();
     while (it.next()) |entry| {
@@ -193,14 +217,45 @@ pub fn rawFromEnv() Raw {
     };
 }
 
-/// Where the effective configuration came from, for `doctor` and the log.
-pub const Source = enum { none, file, env, file_and_env };
+/// Where the effective configuration came from, for `doctor` and the log:
+/// the layers above the built-in default that set anything, or `default`
+/// when only it applies.
+pub const Source = enum { none, default, file, env, file_and_env };
 
-pub fn sourceOf(file: Raw, env: Raw) Source {
+pub fn sourceOf(builtin: Raw, file: Raw, env: Raw) Source {
     if (file.any() and env.any()) return .file_and_env;
     if (env.any()) return .env;
     if (file.any()) return .file;
+    if (builtin.any()) return .default;
     return .none;
+}
+
+/// The effective configuration, judged without contacting the service.
+pub const Resolution = union(enum) {
+    /// No url from any layer.
+    off: Source,
+    on: struct { settings: Settings, source: Source },
+    /// config.json unreadable or malformed, or a value refused.
+    invalid: struct { err: ResolveError, source: Source },
+};
+
+pub const ResolveError = FileError || SettingsError;
+
+/// Layer `env` over the state root's config.json over the built-in default
+/// (when `builtin_default`). The default is one service — its mode and model
+/// pin describe that service — so it applies only while no layer names a
+/// `url`: a url of one's own starts from the plain defaults (shadow, no model
+/// pin), while a layer that only tunes the mode or timeout tunes the
+/// default's. Pure apart from reading the file; strings borrow from `arena`
+/// and `env`.
+pub fn resolve(arena: std.mem.Allocator, io: std.Io, state_root: []const u8, builtin_default: bool, env: Raw) Resolution {
+    const file = rawFromFile(arena, io, state_root) catch |err| return .{ .invalid = .{ .err = err, .source = .file } };
+    const upper = file.overlay(env);
+    const builtin: Raw = if (builtin_default and upper.url == null) BUILTIN_DEFAULT else .{};
+    const source = sourceOf(builtin, file, env);
+    const settings = (parseRaw(builtin.overlay(upper)) catch |err|
+        return .{ .invalid = .{ .err = err, .source = source } }) orelse return .{ .off = source };
+    return .{ .on = .{ .settings = settings, .source = source } };
 }
 
 pub fn parseRaw(raw: Raw) SettingsError!?Settings {
@@ -249,27 +304,25 @@ pub const Runtime = struct {
     }
 };
 
-/// Build the configured runtime from `<state root>/config.json` with the
-/// `METACODES_JEV_*` overrides, or null when unconfigured or invalid. Every
-/// refusal is logged once with its reason; none is fatal.
-pub fn load(allocator: std.mem.Allocator, io: std.Io, home: []const u8, state_root: []const u8) ?*Runtime {
+/// Build the configured runtime (see the module comment for the layers), or
+/// null when unconfigured or invalid. Every refusal is logged once with its
+/// reason; none is fatal.
+pub fn load(allocator: std.mem.Allocator, io: std.Io, home: []const u8, state_root: []const u8, builtin_default: bool) ?*Runtime {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit(); // the client copies what it keeps
-    const file = rawFromFile(arena_state.allocator(), io, state_root) catch |err| {
-        log.warn("jev", "System-One advisor disabled: {s} in {s}/config.json (\"{s}\")", .{ @errorName(err), state_root, CONFIG_KEY });
+    const resolved = switch (resolve(arena_state.allocator(), io, state_root, builtin_default, rawFromEnv())) {
+        .off => return null,
+        .invalid => |invalid| {
+            log.warn("jev", "System-One advisor disabled: {s} (source={s}; {s}/config.json \"{s}\" or METACODES_JEV_*)", .{ @errorName(invalid.err), @tagName(invalid.source), state_root, CONFIG_KEY });
+            return null;
+        },
+        .on => |on| on,
+    };
+    const runtime = Runtime.create(allocator, io, resolved.settings, home) catch |err| {
+        log.warn("jev", "System-One advisor disabled: {s} for url {s}", .{ @errorName(err), resolved.settings.origin });
         return null;
     };
-    const env = rawFromEnv();
-    const source = sourceOf(file, env);
-    const settings = (parseRaw(file.overlay(env)) catch |err| {
-        log.warn("jev", "System-One advisor disabled: {s} (config.json \"{s}\" or METACODES_JEV_*)", .{ @errorName(err), CONFIG_KEY });
-        return null;
-    }) orelse return null;
-    const runtime = Runtime.create(allocator, io, settings, home) catch |err| {
-        log.warn("jev", "System-One advisor disabled: {s} for url {s}", .{ @errorName(err), settings.origin });
-        return null;
-    };
-    log.info("jev", "System-One advisor enabled mode={s} timeout_ms={d} source={s}", .{ @tagName(settings.mode), settings.timeout_ms, @tagName(source) });
+    log.info("jev", "System-One advisor enabled mode={s} timeout_ms={d} source={s}", .{ @tagName(resolved.settings.mode), resolved.settings.timeout_ms, @tagName(resolved.source) });
     return runtime;
 }
 
@@ -282,6 +335,7 @@ const testing = std.testing;
 test "parseSettings: unset or blank URL means no advisor" {
     try testing.expect((try parseSettings(null, "advisory", null, null, null)) == null);
     try testing.expect((try parseSettings("  ", null, null, null, null)) == null);
+    try testing.expect((try parseSettings(" OFF ", "advisory", null, null, null)) == null);
 }
 
 test "parseSettings: shadow is the default mode and every field is honored" {
@@ -353,12 +407,93 @@ test "config file: each METACODES_JEV_* overrides its own field only" {
     try testing.expectEqualStrings("1200", merged.timeout_ms.?);
     try testing.expectEqualStrings("file-model", merged.model.?);
     try testing.expectEqualStrings("scoped_recall", merged.decisions.?);
-    try testing.expectEqual(Source.file_and_env, sourceOf(file, env));
-    try testing.expectEqual(Source.file, sourceOf(file, .{}));
-    try testing.expectEqual(Source.env, sourceOf(.{}, env));
-    try testing.expectEqual(Source.none, sourceOf(.{}, .{}));
+    try testing.expectEqual(Source.file_and_env, sourceOf(.{}, file, env));
+    try testing.expectEqual(Source.file, sourceOf(.{}, file, .{}));
+    try testing.expectEqual(Source.env, sourceOf(.{}, .{}, env));
+    try testing.expectEqual(Source.none, sourceOf(.{}, .{}, .{}));
     // The env alone still configures it, as before.
     try testing.expectEqualStrings("http://env:2", (try parseRaw((Raw{}).overlay(.{ .url = "http://env:2" }))).?.origin);
+}
+
+fn resolveWith(arena: std.mem.Allocator, config_json: ?[]const u8, builtin_default: bool, env: Raw) !Resolution {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (config_json) |bytes| try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = bytes });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+    return resolve(arena, testing.io, root, builtin_default, env);
+}
+
+test "resolve: the built-in default applies only when the host asks, beneath file and env" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Nothing configured: the CLI gets the default, an embedder gets nothing.
+    const cli = (try resolveWith(a, null, true, .{})).on;
+    try testing.expectEqualStrings(BUILTIN_DEFAULT.url.?, cli.settings.origin);
+    try testing.expectEqual(advisor_mod.Mode.advisory, cli.settings.mode);
+    try testing.expectEqualStrings("metask-jev-4b", cli.settings.expected_model.?);
+    try testing.expectEqual(client_mod.DEFAULT_TIMEOUT_MS, cli.settings.timeout_ms);
+    try testing.expectEqual(Source.default, cli.source);
+    try testing.expectEqual(Source.none, (try resolveWith(a, null, false, .{})).off);
+    // A config.json without the section, or with a null one, keeps the default.
+    try testing.expectEqual(Source.default, (try resolveWith(a, "{\"mcp_servers\":{}}", true, .{})).on.source);
+    try testing.expectEqual(Source.default, (try resolveWith(a, "{\"jev\":null}", true, .{})).on.source);
+
+    // A field the file sets replaces the default's; the others stay.
+    const shadow = (try resolveWith(a, "{\"jev\":{\"mode\":\"shadow\",\"timeout_ms\":4000}}", true, .{})).on;
+    try testing.expectEqualStrings(BUILTIN_DEFAULT.url.?, shadow.settings.origin);
+    try testing.expectEqual(advisor_mod.Mode.shadow, shadow.settings.mode);
+    try testing.expectEqual(@as(u32, 4000), shadow.settings.timeout_ms);
+    try testing.expectEqual(Source.file, shadow.source);
+    // ...and the env's replace both.
+    const env_url = (try resolveWith(a, "{\"jev\":{\"url\":\"http://file:1\"}}", true, .{ .url = "http://env:2" })).on;
+    try testing.expectEqualStrings("http://env:2", env_url.settings.origin);
+    try testing.expectEqual(Source.file_and_env, env_url.source);
+    // A url of one's own does not inherit the default service's mode or model
+    // pin: a different model would be refused on every consultation.
+    for ([_]Resolution{
+        try resolveWith(a, "{\"jev\":{\"url\":\"http://mine:1\"}}", true, .{}),
+        try resolveWith(a, null, true, .{ .url = "http://mine:1" }),
+    }) |own| {
+        try testing.expectEqualStrings("http://mine:1", own.on.settings.origin);
+        try testing.expectEqual(advisor_mod.Mode.shadow, own.on.settings.mode);
+        try testing.expect(own.on.settings.expected_model == null);
+    }
+    // The file alone configures an embedder, as before.
+    try testing.expectEqualStrings("http://file:1", (try resolveWith(a, "{\"jev\":{\"url\":\"http://file:1\"}}", false, .{})).on.settings.origin);
+}
+
+test "resolve: an empty url from any layer turns the default off" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqual(Source.file, (try resolveWith(a, "{\"jev\":false}", true, .{})).off);
+    try testing.expectEqual(Source.file, (try resolveWith(a, "{\"jev\":{\"url\":\"\"}}", true, .{})).off);
+    try testing.expectEqual(Source.file, (try resolveWith(a, "{\"jev\":{\"url\":\"off\"}}", true, .{})).off);
+    // `METACODES_JEV_URL=off` is what the build's steps export; an empty
+    // value, where the shell can set one, means the same.
+    try testing.expectEqual(Source.env, (try resolveWith(a, null, true, .{ .url = "off" })).off);
+    try testing.expectEqual(Source.env, (try resolveWith(a, null, true, .{ .url = "" })).off);
+    // ...and the env can turn it back on over a file that turned it off.
+    try testing.expectEqualStrings("http://env:2", (try resolveWith(a, "{\"jev\":false}", true, .{ .url = "http://env:2" })).on.settings.origin);
+    // `true` is not a configuration.
+    try testing.expectEqual(error.InvalidJevSection, (try resolveWith(a, "{\"jev\":true}", true, .{})).invalid.err);
+}
+
+test "resolve: a broken file or value is refused, not replaced by the default" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const not_json = (try resolveWith(a, "{", true, .{})).invalid;
+    try testing.expectEqual(error.ConfigNotJson, not_json.err);
+    try testing.expectEqual(Source.file, not_json.source);
+    const misspelt = (try resolveWith(a, "{\"jev\":{\"timeout\":800}}", true, .{})).invalid;
+    try testing.expectEqual(error.InvalidJevSection, misspelt.err);
+    const bad_mode = (try resolveWith(a, null, true, .{ .mode = "enforced" })).invalid;
+    try testing.expectEqual(error.InvalidMode, bad_mode.err);
+    try testing.expectEqual(Source.env, bad_mode.source);
 }
 
 test "Runtime pins the advisor to its own client, home copy and surfaces" {

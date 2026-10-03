@@ -751,6 +751,15 @@ fn addCoreSuiteRun(
 
 pub fn build(b: *std.Build) void {
     validateAggregateTestInventory(b);
+    // The CLI consults the built-in System-One advisor service when nothing
+    // configures one. Every step this build runs — test binaries, the
+    // product they spawn, the Python suites — must not: its answers would
+    // steer recall from a machine outside the test, and the test's state would
+    // leave it. Run steps without their own environment use this map, and
+    // setEnvironmentVariable starts from a copy of it, so one entry covers
+    // all; set before any step copies it.
+    // `off`, not an empty value: Windows cannot be relied on to pass one.
+    b.graph.environ_map.put("METACODES_JEV_URL", "off") catch @panic("OOM");
     const target = b.standardTargetOptions(.{});
     const target_was_explicit = b.user_input_options.contains("target");
     const optimize = b.standardOptimizeOption(.{});
@@ -2240,6 +2249,9 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run tests");
+    // Built by nothing else in the suite; compiling it here keeps it in step
+    // with the runtime API it calls.
+    test_step.dependOn(&jev_recall_eval_driver.step);
     test_step.dependOn(release_test_step);
     test_step.dependOn(http_status_gate_step);
     test_step.dependOn(subsystem_boundary_step);

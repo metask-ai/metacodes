@@ -236,7 +236,7 @@ pub const JevDiagnosis = struct {
     /// `off`, `shadow`, `advisory` or `invalid`.
     state: []const u8,
     url: ?[]const u8 = null,
-    /// `none`, `file`, `env` or `file_and_env`.
+    /// `none`, `default`, `file`, `env` or `file_and_env`.
     source: []const u8,
     err: ?[]const u8 = null,
 };
@@ -761,7 +761,7 @@ pub fn writeHuman(w: *std.Io.Writer, report: *const Report, options: HumanOption
         const where = jevSourceNote(jev.source);
         if (std.mem.eql(u8, jev.state, "off")) {
             try writeMark(w, style, .skip);
-            try w.print("off  {s}(set \"jev\": {{\"url\": ...}} in config.json to enable){s}\n", .{ style.on(DIM), style.off() });
+            try w.print("off  {s}{s}{s}\n", .{ style.on(DIM), jevOffNote(jev.source), style.off() });
         } else if (std.mem.eql(u8, jev.state, "invalid")) {
             warns += 1;
             try writeMark(w, style, .warn);
@@ -784,6 +784,7 @@ pub fn writeHuman(w: *std.Io.Writer, report: *const Report, options: HumanOption
 }
 
 fn jevSourceNote(source: []const u8) []const u8 {
+    if (std.mem.eql(u8, source, "default")) return "(built-in default)";
     if (std.mem.eql(u8, source, "file")) return "(from config.json)";
     if (std.mem.eql(u8, source, "env")) return "(from METACODES_JEV_*)";
     if (std.mem.eql(u8, source, "file_and_env")) return "(config.json, overridden by METACODES_JEV_*)";
@@ -1050,6 +1051,14 @@ test "doctor human report: a stopped service a session will start is not a warni
     try std.testing.expect(std.mem.endsWith(u8, off.written(), "1 warning. `metacodes doctor --plain` shows full digests and sources.\n"));
 }
 
+/// Why the advisor is off: never configured, or an empty/`off` url from a layer.
+fn jevOffNote(source: []const u8) []const u8 {
+    if (std.mem.eql(u8, source, "file")) return "(turned off in config.json)";
+    if (std.mem.eql(u8, source, "env")) return "(turned off by METACODES_JEV_URL)";
+    if (std.mem.eql(u8, source, "file_and_env")) return "(turned off in config.json or by METACODES_JEV_URL)";
+    return "(set \"jev\": {\"url\": ...} in config.json to enable)";
+}
+
 test "doctor reports the System-One advisor in every format, and never in --strict" {
     const allocator = std.testing.allocator;
     var report = try testInstalledReport(allocator);
@@ -1057,6 +1066,8 @@ test "doctor reports the System-One advisor in every format, and never in --stri
     const Case = struct { jev: JevDiagnosis, human: []const u8, plain: []const u8, warns: bool };
     const cases = [_]Case{
         .{ .jev = .{ .state = "off", .source = "none" }, .human = "  - off  (set \"jev\": {\"url\": ...} in config.json to enable)\n", .plain = "jev_advisor off url=- source=none error=-\n", .warns = false },
+        .{ .jev = .{ .state = "off", .source = "file" }, .human = "  - off  (turned off in config.json)\n", .plain = "jev_advisor off url=- source=file error=-\n", .warns = false },
+        .{ .jev = .{ .state = "advisory", .url = "http://58.211.6.133:10420", .source = "default" }, .human = "  \u{2713} advisory  http://58.211.6.133:10420  (built-in default)\n", .plain = "jev_advisor advisory url=http://58.211.6.133:10420 source=default error=-\n", .warns = false },
         .{ .jev = .{ .state = "shadow", .url = "http://127.0.0.1:10420", .source = "file" }, .human = "  \u{2713} shadow  http://127.0.0.1:10420  (from config.json)\n", .plain = "jev_advisor shadow url=http://127.0.0.1:10420 source=file error=-\n", .warns = false },
         .{ .jev = .{ .state = "advisory", .url = "http://h:1", .source = "file_and_env" }, .human = "  \u{2713} advisory  http://h:1  (config.json, overridden by METACODES_JEV_*)\n", .plain = "jev_advisor advisory url=http://h:1 source=file_and_env error=-\n", .warns = false },
         .{ .jev = .{ .state = "invalid", .source = "file", .err = "InvalidJevSection" }, .human = "  ! invalid (InvalidJevSection), advisor disabled  (from config.json)\n", .plain = "jev_advisor invalid url=- source=file error=InvalidJevSection\n", .warns = true },
