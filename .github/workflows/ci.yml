@@ -121,9 +121,9 @@ jobs:
           if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          bwrap --unshare-all --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp \
-            --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
-            /bin/true
+          sandbox=(--unshare-all --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp)
+          runtime=(--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64)
+          bwrap "${sandbox[@]}" "${runtime[@]}" /bin/true
       # PyYAML for scripts/eval/workbuddy and its tests (requirements-dev.txt).
       # --break-system-packages: the hosted images' system Python is PEP 668
       # "externally managed"; the runner is ephemeral so there is nothing to
