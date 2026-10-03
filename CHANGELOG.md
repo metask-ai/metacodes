@@ -140,6 +140,14 @@ status, compatibility boundaries, and entry points are defined by
   every step, and the memory-agent evaluation harness starts every arm with
   it, so tests and unadvised arms never reach the service. `doctor` reports
   `source=default`.
+- The built-in Jev default advises `scoped_recall` only, the configuration
+  doc/JEV_SYSTEM_ONE.md §7 recommends: in the paired pilots the `KgRecall`
+  annotation cancelled the recall gate's gain in verified evidence (34/60 vs
+  42/60), the relation judge was never consulted in any pilot, and the
+  enumeration judge never crossed its threshold in 55 consultations while
+  each consultation is a synchronous round trip. `"decisions"` in config.json
+  (or `METACODES_JEV_DECISIONS`) still selects any subset; a `url` of one's
+  own still starts from every surface in `shadow`.
 - The system prompt is assembled from named sections (#184, phase 1):
   stable `metacodes:*` ids, sparse orders, and a class per section (identity
   and the tool guidance replaceable, the safety policy and system rules
