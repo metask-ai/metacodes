@@ -192,6 +192,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- The native project-Harness suites (E3 runtime and templates, E2 evolution,
+  the calibration matrix) run in `zig build test` whenever the project kernel
+  is built (POSIX); they had skipped everywhere, and three regressions had
+  piled up behind them. The lifecycle driver wrote its correction session
+  under `<home>` instead of the state root since the per-install state root
+  (finalize refused every prepare); its static replay still expected an
+  oversized verify-only Write to be blocked, although bounds have been an
+  envelope rather than a verdict since August; and both project-Harness
+  analyzers stood at formal batch schema v5 while the product emits v6, so
+  every real rollout failed as "schema drift" or "mixed legacy/current".
+  Both analyzers now keep v5 bindings checked, require v6's `within_root`,
+  and are pinned to the Zig emitter by a test.
 - `zig build eval:jev-recall-driver` compiles again (it still called the
   runtime's removed `fromEnv`); `zig build test` now compiles it.
 - The Jev relation judge for `KgRemember` broke whenever a new memory had two

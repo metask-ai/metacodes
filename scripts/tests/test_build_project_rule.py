@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 from scripts import build_project_rule
 
@@ -110,6 +111,45 @@ def isolation_available() -> bool:
 
 
 class ProjectRuleBuildTests(unittest.TestCase):
+    def test_linux_task_bound_applies_inside_the_sandbox(self) -> None:
+        # Set before bwrap creates its user namespace, RLIMIT_NPROC became the
+        # namespace's ceiling and was checked against every task the user ran
+        # on the host: on a busy CI runner Lean could not create a thread.
+        # The bound must wrap the build inside bwrap, after the namespace.
+        lake = Path("/opt/toolchain/bin/lake")
+        tools = {"bwrap": "/usr/bin/bwrap", "prlimit": "/usr/bin/prlimit"}
+        with mock.patch.object(build_project_rule.sys, "platform", "linux"), mock.patch.object(
+            build_project_rule.shutil, "which", side_effect=tools.get
+        ):
+            command, backend = build_project_rule.sandbox_command(
+                Path("/repo"), Path("/work"), lake, [str(lake), "build"]
+            )
+            self.assertEqual("linux-bwrap-v1", backend)
+            self.assertEqual("/usr/bin/bwrap", command[0])
+            bound = command.index("/usr/bin/prlimit")
+            self.assertGreater(bound, command.index("--chdir"))
+            self.assertEqual(
+                [f"--nproc={build_project_rule.MAX_SANDBOX_TASKS}", "--", str(lake), "build"],
+                command[bound + 1 :],
+            )
+            del tools["prlimit"]
+            with self.assertRaisesRegex(build_project_rule.BuildError, "prlimit"):
+                build_project_rule.sandbox_command(Path("/repo"), Path("/work"), lake, [str(lake)])
+
+    def test_pre_exec_limits_leave_the_task_count_alone(self) -> None:
+        resource = getattr(build_project_rule, "resource", None)
+        if resource is None or not hasattr(resource, "RLIMIT_NPROC"):
+            self.skipTest("no RLIMIT_NPROC on this platform")
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                with mock.patch.object(build_project_rule.sys, "platform", platform), mock.patch.object(
+                    resource, "setrlimit"
+                ) as setrlimit:
+                    build_project_rule.resource_limits()
+                limited = {call.args[0] for call in setrlimit.call_args_list}
+                self.assertNotIn(resource.RLIMIT_NPROC, limited)
+                self.assertIn(resource.RLIMIT_CPU, limited)
+
     def test_v3_rejects_rule_author_source(self) -> None:
         identity, raw = candidate(
             GOOD_SOURCE,

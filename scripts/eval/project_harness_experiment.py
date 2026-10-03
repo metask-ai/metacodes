@@ -46,11 +46,18 @@ SAFE_CASES = frozenset(("new_file", "edit_existing"))
 HAZARD_CASES = frozenset(("existing_overwrite", "existing_recovery", "directory_target"))
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
-CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v5"
+CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v6"
+# Every batch schema of the rule-filter era (v5 on) binds a formal batch to
+# its rule filter; v6 adds the batch's `within_root` (RRP-001). A v5-era
+# journal keeps its bindings checked under a v6-era analyzer.
+FILTER_BINDING_BATCH_SCHEMAS = frozenset(
+    {"metacodes-project-formal-decision-batch-v5", CURRENT_FORMAL_BATCH_SCHEMA}
+)
 LEGACY_FORMAL_BATCH_SCHEMAS = frozenset(
     f"metacodes-project-formal-decision-batch-v{version}"
     for version in range(2, 5)
 )
+KNOWN_FORMAL_BATCH_SCHEMAS = LEGACY_FORMAL_BATCH_SCHEMAS | FILTER_BINDING_BATCH_SCHEMAS
 RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
 RULE_FILTER_PROOF = "MetaCodesControl.ProjectRule.target_mismatch_admits_both"
 
@@ -431,12 +438,14 @@ def analyze_rollout(
         batch = payload.get("formal_decision_batch")
         if isinstance(batch, dict):
             schema = batch.get("schema_version")
-            if schema not in LEGACY_FORMAL_BATCH_SCHEMAS | {CURRENT_FORMAL_BATCH_SCHEMA}:
+            if schema not in KNOWN_FORMAL_BATCH_SCHEMAS:
                 raise CalibrationError("formal decision batch schema drift")
+            if schema == CURRENT_FORMAL_BATCH_SCHEMA and not isinstance(batch.get("within_root"), bool):
+                raise CalibrationError("formal decision batch lacks within_root")
             decisions = batch.get("decisions")
             if not isinstance(decisions, list) or not decisions:
                 raise CalibrationError("empty formal batch")
-            if schema == CURRENT_FORMAL_BATCH_SCHEMA:
+            if schema in FILTER_BINDING_BATCH_SCHEMAS:
                 current_batches += 1
                 key = (str(batch.get("dispatch_id")), str(batch.get("phase")))
                 filter_item = filters.get(key)
@@ -529,7 +538,7 @@ def analyze_rollout(
             decision = item["decision"]
             if (
                 item.get("schema_version")
-                not in LEGACY_FORMAL_BATCH_SCHEMAS | {CURRENT_FORMAL_BATCH_SCHEMA}
+                not in KNOWN_FORMAL_BATCH_SCHEMAS
                 or item.get("project_sha256") != project_sha
                 or item.get("kernel_sha256") != kernel_sha
                 or decision.get("candidate_id") != candidate_sha

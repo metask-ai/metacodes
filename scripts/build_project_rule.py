@@ -33,6 +33,7 @@ MAX_CANDIDATE_BYTES = 128 * 1024
 MAX_SOURCE_BYTES = 32 * 1024
 MAX_LOG_BYTES = 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+MAX_SANDBOX_TASKS = 64
 TIMEOUT_SECONDS = 90
 FORBIDDEN = {
     "admit",
@@ -430,7 +431,27 @@ def sandbox_command(repo: Path, work: Path, lake: Path, argv: Sequence[str]) -> 
                 command.extend(["--ro-bind", root, root])
         for root in (repo, toolchain_root):
             command.extend(["--ro-bind", str(root), str(root)])
-        command.extend(["--bind", str(work), str(work), "--chdir", str(repo / "control-plane" / "lean"), *argv])
+        # The task bound is set inside the sandbox's own user namespace.
+        # Set before bwrap creates it, the namespace inherits it as its
+        # ceiling and the kernel checks that ceiling against every task the
+        # user already runs on the host (ucounts walk the namespace chain):
+        # on a busy host Lean could not create its first thread.
+        prlimit = shutil.which("prlimit")
+        if not prlimit:
+            raise BuildError("Linux prlimit is unavailable")
+        command.extend(
+            [
+                "--bind",
+                str(work),
+                str(work),
+                "--chdir",
+                str(repo / "control-plane" / "lean"),
+                prlimit,
+                f"--nproc={MAX_SANDBOX_TASKS}",
+                "--",
+                *argv,
+            ]
+        )
         return command, "linux-bwrap-v1"
     raise BuildError("project-rule build isolation is unsupported on this OS")
 
@@ -439,13 +460,10 @@ def resource_limits() -> None:
     resource.setrlimit(resource.RLIMIT_CPU, (60, 60))
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_ARTIFACT_BYTES, MAX_ARTIFACT_BYTES))
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-    # Darwin accounts RLIMIT_NPROC against every process owned by the user,
-    # not just this sandbox.  Lowering it below an already-running desktop
-    # session makes Lean unable to create even its first worker thread.  Linux
-    # runs inside a fresh bubblewrap PID namespace, where the bound is local
-    # enough to be useful.
-    if sys.platform.startswith("linux") and hasattr(resource, "RLIMIT_NPROC"):
-        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+    # RLIMIT_NPROC is not set here. It counts every task the user owns, and
+    # set before the sandbox exists it bounds the host, not the build: Darwin
+    # has no narrower scope, so it goes without; Linux applies
+    # MAX_SANDBOX_TASKS inside bubblewrap's user namespace (sandbox_command).
 
 
 def run_isolated(
