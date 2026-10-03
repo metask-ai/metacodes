@@ -64,9 +64,24 @@ status, compatibility boundaries, and entry points are defined by
   (`<dir>/state`, or `--state-dir`), optionally places the AgentCore SDK under
   `<dir>/sdk/agentcore/` (`--sdk`) and a launcher on PATH (`--link`,
   `--link-name`), and ends with the installed `doctor --strict`. It refuses a
-  prefix holding foreign files or another version unless `--force`.
+  prefix holding foreign files unless `--force`, and another version unless
+  `--upgrade` (or `--force`); replacing a version removes the files the old
+  manifest listed and the new one does not, and keeps the state root. A taken
+  launcher name is refused before any file is written.
   `scripts/install.sh` (macOS/Linux) and `scripts/install.ps1` (Windows)
   unpack an archive, check its `.sha256`, and call it.
+- One-line install and a side-by-side development install:
+  `curl -fsSL …/scripts/install.sh | sh` downloads the latest release for the
+  host (or `--version`), checks it against the release's SHA256SUMS, installs
+  it with its AgentCore SDK, and upgrades in place when rerun.
+  `scripts/install.sh --dev` builds the checkout's release unit (kernels,
+  pins, `release:verify`, SDK) and installs it with its own state root: the
+  main checkout as `metacodes-dev`, a linked worktree as
+  `metacodes-dev-<worktree directory>`, so a worktree under test never
+  replaces the main checkout's install. `--uninstall` removes an install
+  (never one a process still runs from, never a launcher it did not write).
+  A release that predates `metacodes install` (manifest v1) is refused
+  instead of run.
 - The release unit is complete on every platform (manifest schema 2): it
   ships the TinyKG daemon and both Lean governance kernels, built natively on
   each release runner and pinned into the executable, with the licence texts

@@ -33,7 +33,21 @@ digest, and `metacodes doctor` reports every runtime asset and the state root.
 
 ## Install
 
-From a release archive (macOS / Linux, then Windows):
+macOS (aarch64) and Linux (x86_64), the latest release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/install.sh | sh
+```
+
+This installs into `~/.local/opt/metacodes` with a `metacodes` launcher in
+`~/.local/bin`, the AgentCore SDK included; rerunning it upgrades in place and
+keeps the state. `| sh -s -- --version X.Y.Z` picks a release, `--help` lists
+the rest. From a checkout, `scripts/install.sh --dev` builds the release unit
+from source and installs it beside the released one: the main checkout as
+`metacodes-dev` (`~/.local/opt/metacodes-dev`), a linked worktree as
+`metacodes-dev-<worktree directory>`, each with a state root of its own. An
+install is a copy, so rebuilding or removing the checkout leaves it running;
+`--dev --uninstall` removes it again. A downloaded archive installs the same way:
 
 ```sh
 sh scripts/install.sh metacodes-<version>-<target>.tar.gz
@@ -51,7 +65,9 @@ give each its own `--prefix` and launcher name (`--link-name`). `--sdk` adds the
 AgentCore SDK under `<prefix>/sdk/agentcore/` (`include/metask/agentcore.h`,
 `lib/`, Zig and Rust bindings). The scripts only unpack; the install is
 `bin/metacodes install` (`--help` lists its options), which ends with the
-installed `doctor --strict`. A process picks its state root from `--state-dir`,
+installed `doctor --strict`; `--upgrade` replaces another version of the same
+product (the scripts always pass it), `--force` also foreign files and another
+launcher. A process picks its state root from `--state-dir`,
 then `METACODES_HOME`, then the install record, then `~/.metacodes`
 ([doc/INSTALL_DESIGN.md](doc/INSTALL_DESIGN.md)).
 
@@ -88,7 +104,7 @@ the kernel scripts run under Git for Windows' bash, never WSL's. A release
 unit from source is `zig build kernels:stage --prefix <u>` followed by
 `zig build release:verify -Drelease-layout=true --prefix <u> $(python3
 scripts/kernel_pins.py <u>)`; `<u>/bin/metacodes install --prefix <dir>` then
-installs it.
+installs it. `scripts/install.sh --dev` does all three, plus the AgentCore SDK.
 
 The AgentCore bundle and its native consumption gates (`agentcore:test`,
 `agentcore:bundle`, `agentcore:gate`) are documented once, in
