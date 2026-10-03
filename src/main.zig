@@ -569,6 +569,9 @@ pub fn main(init: std.process.Init) !void {
     // The state root, after `--version` (which needs no state) and before
     // anything that reads or writes some.
     config.state_root = hostStateRoot() catch std.process.exit(2);
+    // The CLI is the host that opts into the built-in System-One advisor
+    // service; config.json and METACODES_JEV_* still override or empty it.
+    config.jev_builtin_default = true;
     if (config.state_root.len > 0) {
         // Every subsystem writes beneath the root; create it (and an install's
         // `<prefix>/state` parent chain) once, owner-only, before any of them
@@ -1040,21 +1043,19 @@ pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").
     return diagnosis;
 }
 
-/// The System-One advisor as `App.init` would configure it (config.json
-/// `jev` overlaid by METACODES_JEV_*), judged without contacting the service.
-/// Strings live in `arena`.
+/// The System-One advisor as a CLI session's `App.init` would configure it
+/// (METACODES_JEV_* over config.json `jev` over the built-in default), judged
+/// without contacting the service. Strings live in `arena`.
 fn jevDiagnosis(arena: std.mem.Allocator, io: std.Io, state_root: []const u8) doctor.JevDiagnosis {
     const jev = @import("jev/runtime.zig");
-    const env = jev.rawFromEnv();
-    const file = jev.rawFromFile(arena, io, state_root) catch |err|
-        return .{ .state = "invalid", .source = "file", .err = @errorName(err) };
-    const source = @tagName(jev.sourceOf(file, env));
-    const settings = (jev.parseRaw(file.overlay(env)) catch |err|
-        return .{ .state = "invalid", .source = source, .err = @errorName(err) }) orelse
-        return .{ .state = "off", .source = source };
-    if (!@import("jev/client.zig").validOrigin(std.mem.trimEnd(u8, settings.origin, "/")))
-        return .{ .state = "invalid", .url = settings.origin, .source = source, .err = "InvalidOrigin" };
-    return .{ .state = @tagName(settings.mode), .url = settings.origin, .source = source };
+    return switch (jev.resolve(arena, io, state_root, true, jev.rawFromEnv())) {
+        .off => |source| .{ .state = "off", .source = @tagName(source) },
+        .invalid => |invalid| .{ .state = "invalid", .source = @tagName(invalid.source), .err = @errorName(invalid.err) },
+        .on => |on| if (!@import("jev/client.zig").validOrigin(std.mem.trimEnd(u8, on.settings.origin, "/")))
+            .{ .state = "invalid", .url = on.settings.origin, .source = @tagName(on.source), .err = "InvalidOrigin" }
+        else
+            .{ .state = @tagName(on.settings.mode), .url = on.settings.origin, .source = @tagName(on.source) },
+    };
 }
 
 fn kgDiagnosisOwned(allocator: std.mem.Allocator, state: []const u8, transport: []const u8, config: []const u8, hint: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {

@@ -116,6 +116,7 @@ test {
     _ = @import("component/job_notification_test.zig");
     _ = @import("component/kg_state_test.zig");
     _ = @import("component/jev_client_test.zig");
+    _ = @import("component/jev_default_test.zig");
     _ = @import("component/jev_memory_plane_test.zig");
     _ = @import("component/tinykgd_resolution_test.zig");
     _ = @import("component/adjacent_symlink_test.zig");

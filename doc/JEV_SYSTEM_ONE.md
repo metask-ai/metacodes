@@ -1,8 +1,11 @@
 # Jev System-One 记忆面顾问（Memory-plane advisor）
 
-> 状态：已实现，**默认关闭**。在安装的 `<state root>/config.json` 里写 `jev.url` 后默认
-> `shadow`（只记录不改行为），`jev.mode: "advisory"` 才让判断影响注入；同名
-> `METACODES_JEV_*` 环境变量逐字段覆盖配置文件。实现：`src/jev/`；消费方：
+> 状态：已实现。**CLI 默认开启**：什么都不配时用内置默认——昆山 GPU 机上的
+> `metask-jev-4b`（`http://58.211.6.133:10420`，`advisory`）；SDK 嵌入方不打开
+> `Config.jev_builtin_default` 就没有默认，仍是显式开启。安装的 `<state root>/config.json`
+> 的 `jev` 段逐字段覆盖默认，同名 `METACODES_JEV_*` 环境变量再逐字段覆盖配置文件；任一层给出
+> `off` 或空 `url`（`"jev": false`、`"jev": {"url": "off"}`、`METACODES_JEV_URL=off`）即关闭。只写 `url`
+> 不写 `mode` 时是 `shadow`（只记录不改行为），`advisory` 才让判断影响注入。实现：`src/jev/`；消费方：
 > `src/kg/scoped_recall.zig`、`src/tools/kg_tools.zig`、`src/core/agent_loop.zig`。
 > 评估复现：`zig build eval:jev-recall-driver`（零 provider 驱动）+ 本文 §6。
 
@@ -27,7 +30,7 @@ Jev-Mem（arXiv 2609.23986）把这种 System-One 判断放进记忆控制：写
 
 | 原则 | 落点 |
 |---|---|
-| 默认关闭，显式开启 | 配置文件 `jev.url` 与 `METACODES_JEV_URL` 都没有时 `App.jev == null`，所有消费方走原路径 |
+| CLI 默认开启，嵌入方显式开启，测试与评估永远关闭 | CLI 宿主设 `Config.jev_builtin_default`，三层都没有 `url` 时用内置默认；嵌入方不设时与以前一样，配置文件和环境变量都没有 `url` 就 `App.jev == null`，所有消费方走原路径。`build.zig` 给它运行的每一步导出 `METACODES_JEV_URL=off`，评估 harness 给每个臂先设同样的值、System-One 臂再换成自己的判官——否则没有顾问的对照臂会悄悄用上默认服务 |
 | shadow → advisory 渐进 | `shadow`：照常请求并写 `system_one_decision` 事件，注入/工具结果字节与无顾问时**逐字节相同**；`advisory`：判断才生效 |
 | 证据，永不是权威 | 判断只能改变“注入哪几条记忆”、“是否附上相关度注释”、“是否给软提醒”；从不拒绝工具、不改权限/沙箱/预算、不写 TinyKG、不参与 formal verdict |
 | 宿主枚举候选 | 候选全部来自 TinyKG BM25（宿主确定性枚举），Jev 只回答关于它们的封闭问题；问题目录是 comptime 校验的常量 |
@@ -66,13 +69,27 @@ KgRemember、枚举）的决定进会话的 tool-observation journal（`tool-obs
 rollout 产物摘要同样覆盖它）。
 
 配置：安装的 `<state root>/config.json`（默认安装即 `~/.metacodes/config.json`）里的 `jev`
-对象；每个字段可以被同名环境变量覆盖（与其余配置一致：环境变量 > 配置文件 > 默认值；评估脚本
-按臂注入的就是这些变量）。`metacodes doctor` 报告生效的状态、地址和来源（文件 / 环境变量 / 两者）。
+对象；每个字段可以被同名环境变量覆盖（与其余配置一致：环境变量 > 配置文件 > 内置默认；评估脚本
+按臂注入的就是这些变量）。`metacodes doctor` 报告生效的状态、地址和来源（内置默认 / 文件 /
+环境变量 / 两者）。
+
+内置默认（`src/jev/runtime.zig` `BUILTIN_DEFAULT`，仅 CLI）：`url`
+`http://58.211.6.133:10420`、`mode` `advisory`、`model` `metask-jev-4b`，其余取下表默认。
+默认是一个整体：只要任一层给了自己的 `url`，默认的 `mode`/`model` 就不再继承（回到
+`shadow`、不钉模型——否则换成别的模型的服务每次咨询都会因 `ModelMismatch` 被拒）；只调
+`mode`/`timeout_ms` 而不给 `url` 的层则调的是默认服务。
+这是公网上的明文 HTTP、无认证：判官看的状态（会话的一段窗口，家目录已替换）不加密地经过公网。
+不想发出去就在配置文件里写 `"jev": false`，或指向自己的服务。
+
+关闭：任一层的 `off` 或空 `url`——`"jev": false`（`{"url": "off"}` 的简写）、
+`"jev": {"url": "off"}`、`METACODES_JEV_URL=off`（能设空值的 shell 里 `METACODES_JEV_URL=` 也行；
+PowerShell 给环境变量赋空串等于删除它，所以统一用 `off`）。`"jev": null` 等于没写这一段，
+默认照常生效。
 
 | `jev` 字段 | 覆盖变量 | 含义 |
 |---|---|---|
-| `url` | `METACODES_JEV_URL` | 服务 origin（如 `http://host:10420`）；两处都没有即关闭 |
-| `mode` | `METACODES_JEV_MODE` | `shadow`（默认）或 `advisory` |
+| `url` | `METACODES_JEV_URL` | 服务 origin（如 `http://host:10420`）；CLI 三层都没有时用内置默认，嵌入方两处都没有即关闭；`off` 或空字符串即关闭 |
+| `mode` | `METACODES_JEV_MODE` | `shadow`（未指定时）或 `advisory`（内置默认） |
 | `timeout_ms`（整数） | `METACODES_JEV_TIMEOUT_MS` | 单次截止，默认 2500，范围 100–30000（8 候选判断单客户端 p50 0.91 s / p99 1.06 s，三个客户端共享服务时 p50 2.4 s；超时会退回基线并开熔断，所以给共享服务留余量） |
 | `model` | `METACODES_JEV_MODEL` | 期望的模型名（钉死）；不设则接受服务报告的任何模型 |
 | `decisions`（名字数组，或逗号分隔字符串） | `METACODES_JEV_DECISIONS`（逗号分隔） | 决策面子集：`scoped_recall`、`recall_evidence`、`memory_relation`、`enumeration_intent`（默认全部）；没列出的面行为与没有顾问完全相同；未知名或空列表会让顾问整体关闭并告警 |

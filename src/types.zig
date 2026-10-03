@@ -172,6 +172,12 @@ pub const Config = struct {
     /// The resolved state root the host hands to every subsystem ("" = none,
     /// as with a missing $HOME). Set by src/main.zig, never by core code.
     state_root: []const u8 = "",
+    /// Fall back to the built-in System-One advisor service
+    /// (`jev/runtime.zig` `BUILTIN_DEFAULT`) when neither the state root's
+    /// config.json nor `METACODES_JEV_*` names one. The CLI sets it; an
+    /// embedder that leaves it off sends no session state anywhere unless it
+    /// configures the advisor itself.
+    jev_builtin_default: bool = false,
     /// LLM 后端协议选择。默认 anthropic;`METACODES_PROVIDER=openai` 或 model 前缀
     /// gpt*/o1*/o3* → openai(讲 chat/completions 协议)。**只在 App 组装层据此选 Client,
     /// core/UI 零感知**(多 Provider 重构 P3)。

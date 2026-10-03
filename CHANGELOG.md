@@ -131,6 +131,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- The CLI consults the Jev System-One advisor by default: with nothing in
+  config.json or the environment it uses the team's `metask-jev-4b` at
+  `http://58.211.6.133:10420` in `advisory` mode (plain HTTP over the public
+  network). `"jev": false` in config.json, or `METACODES_JEV_URL=off`, turns
+  it off; library embedders get the default only by setting
+  `Config.jev_builtin_default`. The build exports `METACODES_JEV_URL=off` to
+  every step, and the memory-agent evaluation harness starts every arm with
+  it, so tests and unadvised arms never reach the service. `doctor` reports
+  `source=default`.
 - The system prompt is assembled from named sections (#184, phase 1):
   stable `metacodes:*` ids, sparse orders, and a class per section (identity
   and the tool guidance replaceable, the safety policy and system rules
@@ -183,6 +192,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `zig build eval:jev-recall-driver` compiles again (it still called the
+  runtime's removed `fromEnv`); `zig build test` now compiles it.
 - The Jev relation judge for `KgRemember` broke whenever a new memory had two
   or three related ones: `n = @min(len, 3)` was inferred as `u2`, so `2 * n`
   overflowed — a panic in Debug builds, and in the ReleaseSmall executable a
