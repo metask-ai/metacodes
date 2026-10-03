@@ -71,6 +71,19 @@ pub const Check = struct {
     /// Kernel-only, not rendered: the byte count of the file `sha256` was
     /// computed over, taken on the same descriptor, for the sidecar binding.
     kernel_bytes: ?u64 = null,
+    /// A short account of a valid provenance (`tinykg 0.3.0 @0b04014`), shown
+    /// by the human report; empty when there is nothing to say.
+    note_buf: [64]u8 = undefined,
+    note_len: u8 = 0,
+
+    pub fn note(self: *const Check) []const u8 {
+        return self.note_buf[0..self.note_len];
+    }
+
+    fn setNote(self: *Check, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.bufPrint(&self.note_buf, fmt, args) catch self.note_buf[0..0];
+        self.note_len = @intCast(text.len);
+    }
 
     pub fn deinit(self: *Check, allocator: std.mem.Allocator) void {
         if (self.resolved_path) |path| allocator.free(path);
@@ -164,6 +177,10 @@ pub const Report = struct {
     checks: [5]Check,
     kg: ?KgDiagnosis = null,
     state_root: ?StateRootDiagnosis = null,
+    /// Borrowed, for the human report only: this build's full version and
+    /// the install prefix around the executable.
+    version: ?[]const u8 = null,
+    install_prefix: ?[]const u8 = null,
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
         for (&self.checks) |*check| check.deinit(allocator);
@@ -179,30 +196,44 @@ pub const Report = struct {
             if (!std.mem.eql(u8, name, "NoStateRoot")) return false;
         };
         for (&self.checks) |*check| {
-            if (check.resolved_path == null) {
-                // An override that resolved nothing is a configuration the
-                // runtime rejects, whatever the build pinned.
-                if (check.source != null) return false;
-                // A binary this build never pinned may legitimately be absent
-                // (kernels are built by the release, the daemon ships with a v2
-                // bundle). A pinned one that cannot be found is unhealthy.
-                if (!optionalWhenUnpinned(check.name) or check.expected_sha256 != null) return false;
-                continue;
-            }
-            if (check.match) |matched| if (!matched) return false;
-            // Only the Lean kernels carry provenance sidecars; a resolved
-            // kernel without a verdict of `true` is not trusted.
-            if (isKernel(check.name) and check.provenance != true) return false;
+            if (checkStatus(check) == .fail) return false;
         }
         return true;
     }
 };
+
+/// One verdict per check, shared by `healthy` (and so `--strict`) and the
+/// human report, so the two can never disagree.
+pub const CheckStatus = enum { ok, skipped, fail };
+
+pub fn checkStatus(check: *const Check) CheckStatus {
+    if (check.resolved_path == null) {
+        // An override that resolved nothing is a configuration the runtime
+        // rejects, whatever the build pinned.
+        if (check.source != null) return .fail;
+        // A binary this build never pinned may legitimately be absent
+        // (kernels are built by the release, the daemon ships with a v2
+        // bundle). A pinned one that cannot be found is unhealthy.
+        if (!optionalWhenUnpinned(check.name) or check.expected_sha256 != null) return .fail;
+        return .skipped;
+    }
+    if (check.match) |matched| if (!matched) return .fail;
+    // A receipt or sidecar that is present but does not vouch for this file.
+    if (check.provenance) |valid| if (!valid) return .fail;
+    // The Lean kernels must carry a valid sidecar; without one a resolved
+    // kernel is not trusted.
+    if (isKernel(check.name) and check.provenance != true) return .fail;
+    return .ok;
+}
 
 pub const KgDiagnosis = struct {
     state: []u8,
     transport: []u8,
     config: []u8,
     hint: []u8,
+    /// Set by the host when a session would start the service itself, so
+    /// the human report shows a stopped service as the normal state it is.
+    autostarts: bool = false,
 
     pub fn deinit(self: KgDiagnosis, allocator: std.mem.Allocator) void {
         allocator.free(self.state);
@@ -254,6 +285,7 @@ pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
     } else null;
     checks[1] = try Check.init(allocator, "tinykg", tinykg_resolved, try pinDigest(expected.tinykg_sha256));
     errdefer checks[1].deinit(allocator);
+    checks[1].provenance = try receiptProvenance(allocator, &checks[1], .cli);
 
     var formal_override_buf: [std.fs.max_path_bytes]u8 = undefined;
     const formal = resolveKernel(.formal, expected.formal_kernel_sha256, expected.exe_path_override, &formal_override_buf);
@@ -279,6 +311,8 @@ pub fn run(allocator: std.mem.Allocator, expected: Expectations) !Report {
         },
     } else null;
     checks[4] = try Check.init(allocator, "tinykgd", tinykgd_resolved, try pinDigest(expected.tinykgd_sha256));
+    errdefer checks[4].deinit(allocator);
+    checks[4].provenance = try receiptProvenance(allocator, &checks[4], .daemon);
     return .{ .checks = checks, .kg = null };
 }
 
@@ -327,6 +361,109 @@ fn resolveKernel(name: toolchain.KernelName, expected: ?[]const u8, exe_override
     };
     if (!timeout_ok) return .invalid_env;
     return .{ .found = .{ .path = path, .source = .adjacent, .kernel = name } };
+}
+
+pub const RECEIPT_SCHEMA = "metacodes.tinykg-binary-receipt/v2";
+pub const TINYKG_CONTRACT_SCHEMA = "metacodes.tinykg-binary/v1";
+const MAX_RECEIPT_BYTES: usize = 64 * 1024;
+
+const ReceiptRole = enum { cli, daemon };
+
+/// The staging receipt beside a TinyKG binary (`tinykg.provenance.json`,
+/// written by scripts/stage_tinykg_binary.py) must describe that very file:
+/// receipt and contract schema, role, a version line of the right program,
+/// the storage contract this client speaks, and the recorded digest equal to
+/// the file's. A bundled binary also names its bundle key and source commit.
+/// No receipt is `null` (nothing to judge, as for a developer's own binary);
+/// a receipt that does not vouch for the file is `false`.
+fn receiptProvenance(allocator: std.mem.Allocator, check: *Check, role: ReceiptRole) error{OutOfMemory}!?bool {
+    const path = check.resolved_path orelse return null;
+    const receipt_path = try receiptPathFor(allocator, path);
+    defer allocator.free(receipt_path);
+    const bytes = readBounded(allocator, receipt_path, MAX_RECEIPT_BYTES) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileNotFound => return null,
+        else => return false,
+    };
+    defer allocator.free(bytes);
+    const actual = check.sha256 orelse return false;
+    const Receipt = struct {
+        receipt_schema: []const u8,
+        contract_schema: []const u8,
+        binary_sha256: []const u8,
+        binary_version: []const u8,
+        distribution: []const u8,
+        source_repository: []const u8,
+        storage_format_version: []const u8,
+        store_schema_version: []const u8,
+        role: ?[]const u8 = null,
+        source_commit: ?[]const u8 = null,
+        bundle_key: ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(Receipt, allocator, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer parsed.deinit();
+    const receipt = parsed.value;
+    if (!std.mem.eql(u8, receipt.receipt_schema, RECEIPT_SCHEMA)) return false;
+    if (!std.mem.eql(u8, receipt.contract_schema, TINYKG_CONTRACT_SCHEMA)) return false;
+    if (!std.mem.eql(u8, receipt.binary_sha256, &actual)) return false;
+    const program = switch (role) {
+        .cli => "tinykg ",
+        .daemon => "tinykgd ",
+    };
+    if (!std.mem.startsWith(u8, receipt.binary_version, program)) return false;
+    switch (role) {
+        .daemon => if (receipt.role == null or !std.mem.eql(u8, receipt.role.?, "daemon")) return false,
+        .cli => if (receipt.role) |declared| if (!std.mem.eql(u8, declared, "cli")) return false,
+    }
+    if (!std.mem.eql(u8, receipt.storage_format_version, kg_client.EXPECTED_STORAGE_FORMAT_VERSION) or
+        !std.mem.eql(u8, receipt.store_schema_version, kg_client.EXPECTED_SCHEMA_VERSION)) return false;
+    if (receipt.source_repository.len == 0) return false;
+    if (std.mem.eql(u8, receipt.distribution, "bundled")) {
+        const commit = receipt.source_commit orelse return false;
+        if (commit.len != 40 or !isLowerHex(commit)) return false;
+        const bundle_key = receipt.bundle_key orelse return false;
+        if (bundle_key.len == 0) return false;
+        check.setNote("{s} @{s}", .{ receipt.binary_version, commit[0..7] });
+    } else if (std.mem.eql(u8, receipt.distribution, "explicit")) {
+        check.setNote("{s}, explicitly staged", .{receipt.binary_version});
+    } else return false;
+    return true;
+}
+
+/// `vendor/tinykg/tinykg[.exe]` → `vendor/tinykg/tinykg.provenance.json`.
+fn receiptPathFor(allocator: std.mem.Allocator, binary: []const u8) error{OutOfMemory}![]u8 {
+    const dir = std.fs.path.dirname(binary) orelse ".";
+    var base = std.fs.path.basename(binary);
+    if (std.ascii.endsWithIgnoreCase(base, ".exe")) base = base[0 .. base.len - 4];
+    return std.fmt.allocPrint(allocator, "{s}{c}{s}.provenance.json", .{ dir, std.fs.path.sep, base });
+}
+
+fn isLowerHex(text: []const u8) bool {
+    for (text) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    return true;
+}
+
+/// A small file read whole, refusing anything over `max` bytes.
+fn readBounded(allocator: std.mem.Allocator, path: []const u8, max: usize) error{ OutOfMemory, FileNotFound, Unreadable, TooLarge }![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return if (pfs.lastErrnoIs(.NOENT)) error.FileNotFound else error.Unreadable;
+    defer _ = pfs.close(fd);
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const n = pfs.read(fd, &buffer);
+        if (n < 0) return error.Unreadable;
+        if (n == 0) break;
+        if (list.items.len + @as(usize, @intCast(n)) > max) return error.TooLarge;
+        try list.appendSlice(allocator, buffer[0..@intCast(n)]);
+    }
+    return list.toOwnedSlice(allocator);
 }
 
 /// Validates the provenance sidecar beside a resolved kernel with the loader
@@ -444,6 +581,226 @@ pub fn writeText(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
     });
 }
 
+pub const HumanOptions = struct {
+    /// ANSI colour (a terminal without NO_COLOR).
+    color: bool = false,
+    /// `$HOME`, shown as `~`.
+    home: ?[]const u8 = null,
+};
+
+const Style = struct {
+    color: bool,
+    fn on(self: Style, code: []const u8) []const u8 {
+        return if (self.color) code else "";
+    }
+    fn off(self: Style) []const u8 {
+        return if (self.color) "\x1b[0m" else "";
+    }
+};
+
+const GREEN = "\x1b[32m";
+const RED = "\x1b[31m";
+const YELLOW = "\x1b[33m";
+const DIM = "\x1b[2m";
+const BOLD = "\x1b[1m";
+
+const Mark = enum {
+    ok,
+    warn,
+    fail,
+    skip,
+    fn glyph(self: Mark) []const u8 {
+        return switch (self) {
+            .ok => "\u{2713}",
+            .warn => "!",
+            .fail => "\u{2717}",
+            .skip => "-",
+        };
+    }
+    fn colour(self: Mark) []const u8 {
+        return switch (self) {
+            .ok => GREEN,
+            .warn => YELLOW,
+            .fail => RED,
+            .skip => DIM,
+        };
+    }
+};
+
+fn writeMark(w: *std.Io.Writer, style: Style, mark: Mark) std.Io.Writer.Error!void {
+    try w.print("  {s}{s}{s} ", .{ style.on(mark.colour()), mark.glyph(), style.off() });
+}
+
+fn writePadded(w: *std.Io.Writer, text: []const u8, width: usize) std.Io.Writer.Error!void {
+    try w.writeAll(text);
+    var n = std.unicode.utf8CountCodepoints(text) catch text.len;
+    while (n < width) : (n += 1) try w.writeByte(' ');
+}
+
+/// `path` as a reader wants it: relative to the install prefix when inside
+/// it, else with the home directory as `~`.
+fn displayPath(path: []const u8, prefix: ?[]const u8, home: ?[]const u8, buf: []u8) []const u8 {
+    if (prefix) |root| if (root.len > 0 and path.len > root.len + 1 and std.mem.startsWith(u8, path, root) and
+        (path[root.len] == '/' or path[root.len] == '\\'))
+    {
+        return path[root.len + 1 ..];
+    };
+    return homeRelative(path, home, buf);
+}
+
+fn homeRelative(path: []const u8, home: ?[]const u8, buf: []u8) []const u8 {
+    const h = home orelse return path;
+    if (h.len == 0 or !std.mem.startsWith(u8, path, h)) return path;
+    if (path.len != h.len and path[h.len] != '/' and path[h.len] != '\\') return path;
+    return std.fmt.bufPrint(buf, "~{s}", .{path[h.len..]}) catch path;
+}
+
+fn componentLabel(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "formal_kernel")) return "formal kernel";
+    if (std.mem.eql(u8, name, "project_kernel")) return "project kernel";
+    return name;
+}
+
+fn sourceNote(source: ?Source) ?[]const u8 {
+    const value = source orelse return null;
+    return switch (value) {
+        .adjacent => null,
+        .env => "from the environment",
+        .config => "from config.json",
+        .path => "from PATH",
+        .fallback => "fallback location",
+    };
+}
+
+/// The report for a person at a terminal: what is installed where, whether
+/// each runtime component is the one this build expects, and what to do about
+/// anything that is not. `--plain` and any non-terminal output keep the
+/// one-line-per-check form (`writeText`), which scripts parse.
+pub fn writeHuman(w: *std.Io.Writer, report: *const Report, options: HumanOptions) std.Io.Writer.Error!void {
+    const style = Style{ .color = options.color };
+    var buf: [std.fs.max_path_bytes + 2]u8 = undefined;
+    var fails: usize = 0;
+    var warns: usize = 0;
+
+    try w.print("{s}metacodes {s}{s}\n", .{ style.on(BOLD), report.version orelse "(unknown version)", style.off() });
+    if (report.install_prefix) |prefix| try w.print("  install     {s}\n", .{homeRelative(prefix, options.home, &buf)});
+    if (report.state_root) |root| {
+        if (root.path) |path| {
+            const how = if (root.source) |source| stateSourceNote(source) else "";
+            try w.print("  state root  {s}{s}{s}{s}\n", .{ homeRelative(path, options.home, &buf), style.on(DIM), how, style.off() });
+        } else {
+            const no_root = std.mem.eql(u8, root.err orelse "", "NoStateRoot");
+            if (no_root) warns += 1 else fails += 1;
+            try w.print("  state root  {s}unresolved ({s}){s}\n", .{ style.on(if (no_root) YELLOW else RED), root.err orelse "unknown", style.off() });
+        }
+    }
+
+    // Order a reader expects: tools, then the KG pair, then the kernels.
+    const order = [_]usize{ 0, 1, 4, 2, 3 };
+    var path_width: usize = 0;
+    for (order) |index| {
+        const check = &report.checks[index];
+        const shown = if (check.resolved_path) |path| displayPath(path, report.install_prefix, options.home, &buf) else "not found";
+        path_width = @max(path_width, @min(std.unicode.utf8CountCodepoints(shown) catch shown.len, 48));
+    }
+
+    try w.print("\n{s}Runtime components{s}\n", .{ style.on(BOLD), style.off() });
+    for (order) |index| {
+        const check = &report.checks[index];
+        const status = checkStatus(check);
+        const mark: Mark = switch (status) {
+            .ok => .ok,
+            .skipped => .skip,
+            .fail => .fail,
+        };
+        if (status == .fail) fails += 1;
+        try writeMark(w, style, mark);
+        try writePadded(w, componentLabel(check.name), 15);
+        const shown = if (check.resolved_path) |path| displayPath(path, report.install_prefix, options.home, &buf) else "not found";
+        try w.print("{s}", .{style.on(DIM)});
+        try writePadded(w, shown, path_width);
+        try w.print("{s}  ", .{style.off()});
+        try writeCheckDetail(w, style, check, status);
+        try w.writeByte('\n');
+    }
+
+    if (report.kg) |kg| {
+        try w.print("\n{s}TinyKG service{s}\n", .{ style.on(BOLD), style.off() });
+        const ready = std.mem.eql(u8, kg.state, "ready");
+        if (ready) {
+            try writeMark(w, style, .ok);
+            try w.print("ready  {s}({s}, config {s}){s}\n", .{ style.on(DIM), kg.transport, homeRelative(kg.config, options.home, &buf), style.off() });
+        } else if (kg.autostarts) {
+            try writeMark(w, style, .skip);
+            try w.print("not running {s}\u{00b7} starts with the next session (`metacodes kgd` starts it now){s}\n", .{ style.on(DIM), style.off() });
+        } else {
+            warns += 1;
+            try writeMark(w, style, .warn);
+            try w.print("{s}  {s}{s}{s}\n", .{ kg.state, style.on(DIM), kg.hint, style.off() });
+        }
+    }
+
+    try w.writeByte('\n');
+    if (fails == 0 and warns == 0) {
+        try w.print("{s}All checks passed.{s}\n", .{ style.on(GREEN), style.off() });
+    } else {
+        if (fails > 0) try w.print("{s}{d} problem{s}{s}", .{ style.on(RED), fails, if (fails == 1) "" else "s", style.off() });
+        if (fails > 0 and warns > 0) try w.writeAll(", ");
+        if (warns > 0) try w.print("{s}{d} warning{s}{s}", .{ style.on(YELLOW), warns, if (warns == 1) "" else "s", style.off() });
+        try w.writeAll(". `metacodes doctor --plain` shows full digests and sources.\n");
+    }
+}
+
+fn stateSourceNote(source: []const u8) []const u8 {
+    if (std.mem.eql(u8, source, "install")) return "  (from the install record)";
+    if (std.mem.eql(u8, source, "flag")) return "  (from --state-dir)";
+    if (std.mem.eql(u8, source, "env")) return "  (from METACODES_HOME)";
+    if (std.mem.eql(u8, source, "home")) return "  (default)";
+    return "";
+}
+
+fn writeCheckDetail(w: *std.Io.Writer, style: Style, check: *const Check, status: CheckStatus) std.Io.Writer.Error!void {
+    if (check.resolved_path == null) {
+        if (check.source != null) {
+            try w.print("{s}configured by the environment, but unusable{s}", .{ style.on(RED), style.off() });
+        } else if (status == .fail) {
+            try w.print("{s}missing (this build expects it){s}", .{ style.on(RED), style.off() });
+        } else {
+            try w.print("{s}not built (optional in a development build){s}", .{ style.on(DIM), style.off() });
+        }
+        return;
+    }
+    if (check.match) |matched| {
+        if (matched) {
+            try w.writeAll("digest ok");
+        } else if (check.sha256) |*found| {
+            const want: []const u8 = if (check.expected_sha256) |*e| e[0..12] else "-";
+            try w.print("{s}digest MISMATCH (expected {s}, found {s}){s}", .{ style.on(RED), want, found[0..12], style.off() });
+        } else {
+            try w.print("{s}unreadable{s}", .{ style.on(RED), style.off() });
+        }
+    } else {
+        try w.writeAll("digest not pinned by this build");
+    }
+    const kernel = isKernel(check.name);
+    if (check.provenance) |valid| {
+        if (valid) {
+            if (kernel) {
+                try w.writeAll(" \u{00b7} provenance verified");
+            } else if (check.note().len > 0) {
+                try w.print(" \u{00b7} receipt ok {s}({s}){s}", .{ style.on(DIM), check.note(), style.off() });
+            } else {
+                try w.writeAll(" \u{00b7} receipt ok");
+            }
+        } else {
+            try w.print(" \u{00b7} {s}{s} INVALID{s}", .{ style.on(RED), if (kernel) "provenance" else "receipt", style.off() });
+        }
+    } else if (kernel) {
+        try w.print(" \u{00b7} {s}provenance missing{s}", .{ style.on(RED), style.off() });
+    }
+    if (sourceNote(check.source)) |where| try w.print(" {s}[{s}]{s}", .{ style.on(DIM), where, style.off() });
+}
+
 /// The `doctor --json` document: `{"checks":[{name, resolved_path, sha256,
 /// expected_sha256, match, source, provenance}, ...]}`, nulls where a value is absent.
 pub fn writeJson(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!void {
@@ -514,6 +871,208 @@ fn testReport(allocator: std.mem.Allocator) !Report {
         .{ .name = "project_kernel", .resolved_path = null, .sha256 = null, .expected_sha256 = null, .match = null, .source = null, .provenance = null },
         .{ .name = "tinykgd", .resolved_path = null, .sha256 = null, .expected_sha256 = null, .match = null, .source = null, .provenance = null },
     } };
+}
+
+/// A release-shaped report: every component adjacent under `/opt/mc`.
+fn testInstalledReport(allocator: std.mem.Allocator) !Report {
+    const names = [_][]const u8{ "ripgrep", "tinykg", "formal_kernel", "project_kernel", "tinykgd" };
+    const paths = [_][]const u8{
+        "/opt/mc/bin/rg",
+        "/opt/mc/vendor/tinykg/tinykg",
+        "/opt/mc/libexec/metacodes/metacodes-formal-kernel",
+        "/opt/mc/libexec/metacodes/metacodes-project-kernel",
+        "/opt/mc/vendor/tinykg/tinykgd",
+    };
+    var report: Report = .{ .checks = undefined };
+    for (&report.checks, names, paths, 0..) |*check, name, path, i| {
+        check.* = .{
+            .name = name,
+            .resolved_path = try allocator.dupe(u8, path),
+            .sha256 = test_digest,
+            .expected_sha256 = test_digest,
+            .match = true,
+            .source = .adjacent,
+            .provenance = if (i == 0) null else true,
+        };
+    }
+    report.checks[1].setNote("tinykg 0.3.0 @0b04014", .{});
+    report.checks[4].setNote("tinykgd 0.3.0 @0b04014", .{});
+    report.version = "0.3.0";
+    report.install_prefix = "/opt/mc";
+    report.state_root = .{ .path = "/home/u/.metacodes", .source = "install", .err = null };
+    return report;
+}
+
+test "doctor human report: a healthy install reads as one line per component" {
+    const allocator = std.testing.allocator;
+    var report = try testInstalledReport(allocator);
+    defer report.deinit(allocator);
+    report.kg = .{
+        .state = try allocator.dupe(u8, "ready"),
+        .transport = try allocator.dupe(u8, "daemon"),
+        .config = try allocator.dupe(u8, "/home/u/.metacodes/kg/daemon.json"),
+        .hint = try allocator.dupe(u8, "-"),
+    };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeHuman(&out.writer, &report, .{ .home = "/home/u" });
+    try std.testing.expectEqualStrings(
+        "metacodes 0.3.0\n" ++
+            "  install     /opt/mc\n" ++
+            "  state root  ~/.metacodes  (from the install record)\n" ++
+            "\n" ++
+            "Runtime components\n" ++
+            "  \u{2713} ripgrep        bin/rg                                      digest ok\n" ++
+            "  \u{2713} tinykg         vendor/tinykg/tinykg                        digest ok \u{00b7} receipt ok (tinykg 0.3.0 @0b04014)\n" ++
+            "  \u{2713} tinykgd        vendor/tinykg/tinykgd                       digest ok \u{00b7} receipt ok (tinykgd 0.3.0 @0b04014)\n" ++
+            "  \u{2713} formal kernel  libexec/metacodes/metacodes-formal-kernel   digest ok \u{00b7} provenance verified\n" ++
+            "  \u{2713} project kernel libexec/metacodes/metacodes-project-kernel  digest ok \u{00b7} provenance verified\n" ++
+            "\n" ++
+            "TinyKG service\n" ++
+            "  \u{2713} ready  (daemon, config ~/.metacodes/kg/daemon.json)\n" ++
+            "\n" ++
+            "All checks passed.\n",
+        out.written(),
+    );
+    try std.testing.expect(report.healthy());
+}
+
+test "doctor human report: problems name the cause and agree with --strict" {
+    const allocator = std.testing.allocator;
+    var report = try testInstalledReport(allocator);
+    defer report.deinit(allocator);
+    var other = test_digest;
+    other[0] = 'f';
+    report.checks[1].sha256 = other; // tinykg replaced
+    report.checks[1].match = false;
+    report.checks[4].provenance = false; // tinykgd receipt does not vouch for it
+    allocator.free(report.checks[3].resolved_path.?); // pinned project kernel gone
+    report.checks[3].resolved_path = null;
+    report.checks[3].source = null;
+    report.checks[3].provenance = null;
+    report.kg = .{
+        .state = try allocator.dupe(u8, "daemon_unreachable"),
+        .transport = try allocator.dupe(u8, "daemon"),
+        .config = try allocator.dupe(u8, "/home/u/.metacodes/kg/daemon.json"),
+        .hint = try allocator.dupe(u8, "a CLI session starts it when it begins"),
+    };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeHuman(&out.writer, &report, .{ .home = "/home/u" });
+    const text = out.written();
+    const line = struct {
+        fn of(haystack: []const u8, start: []const u8) ![]const u8 {
+            var lines = std.mem.splitScalar(u8, haystack, '\n');
+            while (lines.next()) |l| if (std.mem.startsWith(u8, l, start)) return l;
+            return error.TestLineMissing;
+        }
+    }.of;
+    try std.testing.expect(std.mem.indexOf(u8, try line(text, "  \u{2717} tinykg "), "digest MISMATCH (expected 0123456789ab, found f123456789ab)") != null);
+    try std.testing.expect(std.mem.endsWith(u8, try line(text, "  \u{2717} tinykgd "), "digest ok \u{00b7} receipt INVALID"));
+    try std.testing.expect(std.mem.endsWith(u8, try line(text, "  \u{2717} project kernel not found "), "missing (this build expects it)"));
+    try std.testing.expectEqualStrings("  ! daemon_unreachable  a CLI session starts it when it begins", try line(text, "  ! "));
+    try std.testing.expect(std.mem.endsWith(u8, text, "3 problems, 1 warning. `metacodes doctor --plain` shows full digests and sources.\n"));
+    // Every ✗ above is a failure of the health verdict too.
+    try std.testing.expect(!report.healthy());
+    try std.testing.expectEqual(CheckStatus.fail, checkStatus(&report.checks[1]));
+    try std.testing.expectEqual(CheckStatus.fail, checkStatus(&report.checks[4]));
+    try std.testing.expectEqual(CheckStatus.fail, checkStatus(&report.checks[3]));
+}
+
+test "doctor human report: a stopped service a session will start is not a warning" {
+    const allocator = std.testing.allocator;
+    var report = try testInstalledReport(allocator);
+    defer report.deinit(allocator);
+    report.kg = .{
+        .state = try allocator.dupe(u8, "unconfigured"),
+        .transport = try allocator.dupe(u8, "unconfigured"),
+        .config = try allocator.dupe(u8, "/home/u/.metacodes/kg/daemon.json"),
+        .hint = try allocator.dupe(u8, "a CLI session provisions and starts it by itself"),
+        .autostarts = true,
+    };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeHuman(&out.writer, &report, .{ .home = "/home/u" });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "  - not running \u{00b7} starts with the next session (`metacodes kgd` starts it now)\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out.written(), "All checks passed.\n"));
+
+    // Without autostart (METACODES_KG_AUTOSTART=0, a remote service) it is one.
+    report.kg.?.autostarts = false;
+    var off: std.Io.Writer.Allocating = .init(allocator);
+    defer off.deinit();
+    try writeHuman(&off.writer, &report, .{ .home = "/home/u" });
+    try std.testing.expect(std.mem.indexOf(u8, off.written(), "  ! unconfigured  a CLI session provisions and starts it by itself\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, off.written(), "1 warning. `metacodes doctor --plain` shows full digests and sources.\n"));
+}
+
+test "doctor human report: colour only when asked" {
+    const allocator = std.testing.allocator;
+    var report = try testInstalledReport(allocator);
+    defer report.deinit(allocator);
+    var plain: std.Io.Writer.Allocating = .init(allocator);
+    defer plain.deinit();
+    try writeHuman(&plain.writer, &report, .{});
+    try std.testing.expect(std.mem.indexOfScalar(u8, plain.written(), 0x1b) == null);
+    var coloured: std.Io.Writer.Allocating = .init(allocator);
+    defer coloured.deinit();
+    try writeHuman(&coloured.writer, &report, .{ .color = true });
+    try std.testing.expect(std.mem.indexOf(u8, coloured.written(), "\x1b[32m\u{2713}\x1b[0m") != null);
+}
+
+test "doctor receipt path drops .exe and sits beside the binary" {
+    const allocator = std.testing.allocator;
+    const posix = try receiptPathFor(allocator, "/opt/mc/vendor/tinykg/tinykgd");
+    defer allocator.free(posix);
+    try std.testing.expect(std.mem.endsWith(u8, posix, "tinykg" ++ [_]u8{std.fs.path.sep} ++ "tinykgd.provenance.json"));
+    const windows = try receiptPathFor(allocator, "/opt/mc/vendor/tinykg/tinykg.exe");
+    defer allocator.free(windows);
+    try std.testing.expect(std.mem.endsWith(u8, windows, "tinykg.provenance.json"));
+}
+
+test "doctor receipt: vouches only for the file it describes" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tinykgd", .data = "daemon bytes" });
+    const binary = try std.fmt.allocPrint(allocator, "{s}/tinykgd", .{root});
+    defer allocator.free(binary);
+    const digest = try hashFile(binary);
+
+    const Case = struct { receipt: ?[]const u8, want: ?bool };
+    const good_fmt = "{{\"receipt_schema\":\"{s}\",\"contract_schema\":\"{s}\",\"binary_sha256\":\"{s}\",\"binary_version\":\"tinykgd 0.3.0\",\"distribution\":\"bundled\",\"source_repository\":\"https://github.com/metask-ai/tinykg\",\"storage_format_version\":\"3\",\"store_schema_version\":\"3\",\"role\":\"{s}\",\"source_commit\":\"{s}\",\"bundle_key\":\"macos-universal-daemon\",\"license\":\"Apache-2.0\",\"target\":\"aarch64-macos\"}}";
+    const commit = "0b04014ba8d0bcb1f9f73c63c12e49f3c2ee1ece";
+    const good = try std.fmt.allocPrint(allocator, good_fmt, .{ RECEIPT_SCHEMA, TINYKG_CONTRACT_SCHEMA, digest, "daemon", commit });
+    defer allocator.free(good);
+    const other_binary = try std.fmt.allocPrint(allocator, good_fmt, .{ RECEIPT_SCHEMA, TINYKG_CONTRACT_SCHEMA, "f" ** 64, "daemon", commit });
+    defer allocator.free(other_binary);
+    const cli_role = try std.fmt.allocPrint(allocator, good_fmt, .{ RECEIPT_SCHEMA, TINYKG_CONTRACT_SCHEMA, digest, "cli", commit });
+    defer allocator.free(cli_role);
+    const old_schema = try std.fmt.allocPrint(allocator, good_fmt, .{ "metacodes.tinykg-binary-receipt/v1", TINYKG_CONTRACT_SCHEMA, digest, "daemon", commit });
+    defer allocator.free(old_schema);
+    const short_commit = try std.fmt.allocPrint(allocator, good_fmt, .{ RECEIPT_SCHEMA, TINYKG_CONTRACT_SCHEMA, digest, "daemon", "0b04014" });
+    defer allocator.free(short_commit);
+    const cases = [_]Case{
+        .{ .receipt = null, .want = null }, // no receipt: nothing to judge
+        .{ .receipt = good, .want = true },
+        .{ .receipt = other_binary, .want = false }, // a receipt for another build (the cross-build case)
+        .{ .receipt = cli_role, .want = false },
+        .{ .receipt = old_schema, .want = false },
+        .{ .receipt = short_commit, .want = false },
+        .{ .receipt = "not json", .want = false },
+    };
+    for (cases) |case| {
+        tmp.dir.deleteFile(std.testing.io, "tinykgd.provenance.json") catch {};
+        if (case.receipt) |body| try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tinykgd.provenance.json", .data = body });
+        var check = try Check.init(allocator, "tinykgd", .{ .path = binary, .source = .adjacent }, null);
+        defer check.deinit(allocator);
+        try std.testing.expectEqual(case.want, try receiptProvenance(allocator, &check, .daemon));
+        if (case.want == true) try std.testing.expectEqualStrings("tinykgd 0.3.0 @0b04014", check.note());
+        check.provenance = case.want;
+        try std.testing.expectEqual(case.want != false, checkStatus(&check) != .fail);
+    }
 }
 
 test "doctor json names every field and uses null for what is absent" {

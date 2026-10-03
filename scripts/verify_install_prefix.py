@@ -152,6 +152,8 @@ def evaluate_doctor(report: object, prefix: Path, release: bool = False) -> list
         findings.append(f"doctor: tinykg source is {tinykg.get('source')!r}, expected 'adjacent'")
     if tinykg.get("match") is not True:
         findings.append(f"doctor: tinykg match is {tinykg.get('match')!r}, expected true")
+    if tinykg.get("provenance") is not True:
+        findings.append(f"doctor: tinykg provenance is {tinykg.get('provenance')!r}, expected true (its staging receipt must describe this binary)")
     findings.extend(evaluate_kernels(by_name, prefix, release))
     findings.extend(evaluate_daemon(by_name, prefix, release))
     return findings
@@ -184,6 +186,8 @@ def evaluate_daemon(by_name: dict, prefix: Path, release: bool = False) -> list[
         findings.append(f"doctor: tinykgd resolved to {resolved!r}, not under {vendored_dir}")
     if daemon.get("match") is not True:
         findings.append(f"doctor: tinykgd match is {daemon.get('match')!r}, expected true")
+    if daemon.get("provenance") is not True:
+        findings.append(f"doctor: tinykgd provenance is {daemon.get('provenance')!r}, expected true (its staging receipt must describe this binary)")
     return findings
 
 

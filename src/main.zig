@@ -1034,7 +1034,10 @@ pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").
     defer if (default_path) |p| allocator.free(p);
     const config: []const u8 = if (is_cli) "-" else if (env_triple) "env" else (env_config_path orelse default_path orelse "-");
     const hint: []const u8 = if (kclient.ready) "-" else kclient.degradedHint();
-    return try kgDiagnosisOwned(allocator, state, transport, config, hint);
+    var diagnosis = try kgDiagnosisOwned(allocator, state, transport, config, hint);
+    if (diagnosis) |*d| d.autostarts = !kclient.ready and !is_cli and
+        @import("app/kg_autostart.zig").wouldStart(kclient.degradedKind() orelse .unconfigured);
+    return diagnosis;
 }
 
 fn kgDiagnosisOwned(allocator: std.mem.Allocator, state: []const u8, transport: []const u8, config: []const u8, hint: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
@@ -1163,13 +1166,16 @@ fn kgdConfigHint(err: anyerror) []const u8 {
 fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: std.Io) u8 {
     var json = false;
     var strict = false;
+    var plain = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
             json = true;
         } else if (std.mem.eql(u8, arg, "--strict")) {
             strict = true;
+        } else if (std.mem.eql(u8, arg, "--plain")) {
+            plain = true;
         } else {
-            std.debug.print("usage: metacodes doctor [--json] [--strict]\n", .{});
+            std.debug.print("usage: metacodes doctor [--json | --plain] [--strict]\n", .{});
             return 2;
         }
     }
@@ -1202,11 +1208,25 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
         break :blk null;
     };
     defer report.deinit(allocator);
+    var version_buf: [version_info.MAX_VERSION_LEN]u8 = undefined;
+    report.version = version_info.fullVersion(&version_buf, VERSION, version_info.BuildInfo.fromOptions(build_options));
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (@import("platform").paths.selfExeRealPath(&exe_buf)) |exe| report.install_prefix = @import("util/state_root.zig").prefixOf(exe);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    const render: *const fn (*std.Io.Writer, *const doctor.Report) std.Io.Writer.Error!void =
-        if (json) doctor.writeJson else doctor.writeText;
-    render(&out.writer, &report) catch |err| {
+    // A person at a terminal gets the readable report; a pipe, a script and
+    // `--plain` keep one line per check, which callers parse.
+    const human = !json and !plain and @import("platform").terminal.isatty(1);
+    const rendered = if (json)
+        doctor.writeJson(&out.writer, &report)
+    else if (human)
+        doctor.writeHuman(&out.writer, &report, .{
+            .color = std.c.getenv("NO_COLOR") == null and !std.mem.eql(u8, if (std.c.getenv("TERM")) |t| std.mem.span(t) else "", "dumb"),
+            .home = if (std.c.getenv("HOME")) |h| std.mem.span(h) else null,
+        })
+    else
+        doctor.writeText(&out.writer, &report);
+    rendered catch |err| {
         std.debug.print("error: cannot render the doctor report ({s})\n", .{@errorName(err)});
         return 1;
     };
@@ -2799,7 +2819,7 @@ fn printHelp() void {
         \\metacodes — embeddable agent core and coding CLI
         \\Usage: metacodes [options]
         \\  --version             Print version and build identity and exit (--json: one JSON document)
-        \\  doctor [--json] [--strict]
+        \\  doctor [--json | --plain] [--strict]
         \\                        Report where ripgrep and TinyKG resolve from and whether they match this build
         \\  -p, --print <prompt>  Headless: run one prompt and exit (no REPL)
         \\  -                     Headless: read prompt from stdin

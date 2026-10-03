@@ -12,6 +12,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- `metacodes doctor` reads like a report at a terminal: the version, install
+  prefix and state root, one line per runtime component (paths relative to
+  the install, a digest only when it does not match), the TinyKG service, and
+  a closing verdict, in colour unless `NO_COLOR`. A service that a session
+  would start shows as not running rather than as a warning. `--plain`, and
+  any output that is not a terminal, keep the one-line-per-check form
+  scripts parse; `--json` is unchanged. `doctor` now also validates the
+  TinyKG staging receipts (`tinykg.provenance.json`, `tinykgd.provenance.json`)
+  against the binaries beside them, and a receipt that does not describe its
+  binary fails `--strict`; release and install-prefix verification require
+  both receipts to be accepted.
 - The TinyKG service starts by itself. A CLI session whose readiness probe
   finds the install's service unconfigured or not listening provisions it
   (as `kg install`, on 8799 or a free port when that is taken) and starts

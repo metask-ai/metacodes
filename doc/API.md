@@ -142,14 +142,22 @@ versions with the digests the vendored manifests pin for the target, layout).
 contract: {binary_abi_version, binary_abi_revision, config_schema_version},
 expected_runtime_assets: [{name, version, sha256}]}`, where `sha256` is null
 when the vendored bundle has no artifact for the target. `metacodes doctor
-[--json] [--strict]` reports where ripgrep, TinyKG (CLI and daemon) and the two
+[--json | --plain] [--strict]` reports where ripgrep, TinyKG (CLI and daemon) and the two
 Lean governance kernels resolve from (`source`: `env`, `config`, `adjacent`,
 `path`, `fallback`), the SHA-256 of each resolved file, the digest the file is
 held to (the build's pin, or the environment pair's digest for a kernel named by
-`METACODES_<FORMAL|PROJECT>_KERNEL_PATH`/`_SHA256`), `match`, and for the
-kernels `provenance`: whether the sidecar beside the kernel is a valid manifest
-for *that* kernel (`formal_kernel`: the v4 manifest plus build receipt;
-`project_kernel`: the v6 manifest), null for the other checks; `--json` emits
+`METACODES_<FORMAL|PROJECT>_KERNEL_PATH`/`_SHA256`), `match`, and
+`provenance`: for the kernels, whether the sidecar beside the kernel is a valid
+manifest for *that* kernel (`formal_kernel`: the v4 manifest plus build
+receipt; `project_kernel`: the v6 manifest); for `tinykg`/`tinykgd`, whether
+the staging receipt beside the binary (`<name>.provenance.json`,
+`metacodes.tinykg-binary-receipt/v2`) describes that file (recorded digest,
+role, version line, storage contract, and for a bundled binary its bundle key
+and source commit), null when there is no receipt; null for ripgrep. A
+`provenance` of false fails `--strict`. At a terminal the report is a readable
+summary (one line per component, digests shown only on a mismatch, a closing
+verdict; colour unless `NO_COLOR`); `--plain`, and any output that is not a
+terminal, keep one `key=value` line per check, which scripts parse; `--json` emits
 `{checks: [{name, resolved_path, sha256, expected_sha256, match, source,
 provenance}]}` with `name` in `ripgrep`, `tinykg`, `formal_kernel`,
 `project_kernel`, `tinykgd`, plus a `kg` object when the TinyKG diagnosis could
