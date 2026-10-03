@@ -254,10 +254,10 @@ fixed repair hint:
 
 | Kind | Hint |
 |---|---|
-| `unconfigured` | write `<state root>/kg/daemon.json` (0600) or set the KG URL/key/build-id variables |
+| `unconfigured` | a CLI session provisions and starts it by itself (`METACODES_KG_AUTOSTART=0` turns that off); `metacodes kg install` does it by hand, or set the KG URL/key/build-id variables |
 | `config_unsafe` | make the file regular, non-symlink, under 64 KB, and mode 0600 |
 | `config_invalid` | fix the URL, API key, and expected build-id JSON |
-| `daemon_unreachable` | start tinykgd/tinykg-web at the configured URL |
+| `daemon_unreachable` | a CLI session starts it when it begins (`METACODES_KG_AUTOSTART=0` turns that off); `metacodes kgd` starts it now |
 | `auth_failed` | match the daemon's `TINYKG_WEB_API_KEY` |
 | `pin_mismatch` | use the running daemon's catalog build/schema values |
 | `store_contract_mismatch` | migrate storage and schema to 3/3 |
@@ -297,9 +297,9 @@ cross-process lock per state root (`<state root>/kg/kgd.autostart.lock`):
 A host start is attempted at most once per client per 30 s. It does not apply
 to an explicit `METACODES_KG_URL`/`_API_KEY`/`_EXPECTED_BUILD_ID` service, a
 non-loopback URL, or a `METACODES_KG_CONFIG` file that does not exist (that
-fails closed). `METACODES_KG_AUTOSTART=0` (or `false`/`off`) turns it off.
-`doctor` reports a stopped service that a session would start as such, with the
-hint "starts with the next session". The core never spawns the service itself:
+fails closed). `METACODES_KG_AUTOSTART=0` (or `false`/`off`) turns it off. The
+`unconfigured` and `daemon_unreachable` repair hints (shared by the tools,
+`/kg` and `doctor`) say so. The core never spawns the service itself:
 an SDK embedder passes its own hook, or none.
 
 The started service stays up until it is stopped or the machine restarts;

@@ -1232,10 +1232,10 @@ pub const KgClient = struct {
     /// `/kg`, and `doctor`, including for a session that has no client at all.
     pub fn hintFor(kind: DegradedKind) []const u8 {
         return switch (kind) {
-            .unconfigured => "write <state root>/kg/daemon.json (url, api_key, expected_build_id; 0600) or set METACODES_KG_URL/_API_KEY/_EXPECTED_BUILD_ID",
+            .unconfigured => "a CLI session provisions and starts it by itself (METACODES_KG_AUTOSTART=0 turns that off); `metacodes kg install` does it by hand, or set METACODES_KG_URL/_API_KEY/_EXPECTED_BUILD_ID",
             .config_unsafe => "chmod 600 and make it a regular non-symlink file under 64 KB",
             .config_invalid => "fix url/api_key/expected_build_id JSON",
-            .daemon_unreachable => "start tinykgd/tinykg-web at the configured url",
+            .daemon_unreachable => "a CLI session starts it when it begins (METACODES_KG_AUTOSTART=0 turns that off); `metacodes kgd` starts it now",
             .auth_failed => "api_key must match the daemon's TINYKG_WEB_API_KEY",
             .pin_mismatch => "set expected_build_id/schema digest to the running daemon's /api/catalog values",
             .store_contract_mismatch => "migrate the store to storage 3 / schema 3",

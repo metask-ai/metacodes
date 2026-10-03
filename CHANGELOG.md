@@ -18,8 +18,8 @@ status, compatibility boundaries, and entry points are defined by
   `metacodes kgd` in the background (own session, log in
   `<state root>/kg/kgd.log`), under a cross-process lock per state root.
   `METACODES_KG_AUTOSTART=0` turns it off; explicit `METACODES_KG_URL`
-  services and missing `METACODES_KG_CONFIG` files are left alone; `doctor`
-  reports a stopped service as starting with the next session. The core
+  services and missing `METACODES_KG_CONFIG` files are left alone; the
+  shared `unconfigured`/`daemon_unreachable` repair hints say so. The core
   only exposes `KgClient.Autostart`; the host decides how to start it.
   `kgd` now stops cleanly on SIGTERM/SIGHUP as well.
 - Hosts customize the system prompt per Session (#184, phase 2). AgentCore

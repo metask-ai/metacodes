@@ -137,20 +137,6 @@ pub const Autostart = struct {
     }
 };
 
-/// Whether a session would start the service for a client degraded this way,
-/// so `doctor` reports a stopped service as the normal state it now is.
-pub fn wouldStart(kind: @import("../kg/client.zig").DegradedKind) bool {
-    if (!enabled()) return false;
-    if (envSet("METACODES_KG_URL") or envSet("METACODES_KG_API_KEY") or envSet("METACODES_KG_EXPECTED_BUILD_ID")) return false;
-    return switch (kind) {
-        .daemon_unreachable => true,
-        .unconfigured => std.c.getenv("METACODES_KG_CONFIG") == null,
-        else => false,
-    };
-}
-
-pub const STOPPED_HINT = "starts with the next session (`metacodes kgd` starts it now; METACODES_KG_AUTOSTART=0 turns this off)";
-
 fn enabled() bool {
     const raw = std.c.getenv(ENV_DISABLE) orelse return true;
     return !disables(std.mem.span(raw));
