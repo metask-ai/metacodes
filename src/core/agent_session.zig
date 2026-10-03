@@ -4032,10 +4032,20 @@ test "restored AgentSession preserves logical identity and operation continuity"
         .last_compact_id = 4,
         .conversation = &source,
     });
+    // A failed check below must still release the Session before the deferred
+    // runtime.destroy, which otherwise reports RuntimeBusy and panics.
+    var restored_live = true;
+    defer if (restored_live) restored.destroy() catch {};
+    // The default state root is `<home>/.metacodes`, joined with the platform
+    // separator (`\` on Windows); the artifact store appends
+    // `/agentcore/sessions/<id>` to it.
+    const state_root = try std.fs.path.join(std.testing.allocator, &.{ cwd, ".metacodes" });
+    defer std.testing.allocator.free(state_root);
+    try std.testing.expectEqualStrings(state_root, restored.workspace.state_root);
     const expected_artifact_root = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{s}/.metacodes/agentcore/sessions/{s}",
-        .{ cwd, logical_id.asSlice() },
+        "{s}/agentcore/sessions/{s}",
+        .{ state_root, logical_id.asSlice() },
     );
     defer std.testing.allocator.free(expected_artifact_root);
     try std.testing.expectEqualStrings(expected_artifact_root, restored.artifact_root);
@@ -4052,17 +4062,21 @@ test "restored AgentSession preserves logical identity and operation continuity"
     var sink_probe = SinkProbe{};
     try std.testing.expectError(error.StaleRun, restored.admitRun(11, sink_probe.sink()));
 
-    var lease = try restored.snapshotCommitted();
-    try std.testing.expectEqualSlices(u8, logical_id.asSlice(), lease.session_id.asSlice());
-    try std.testing.expectEqual(@as(u64, 11), lease.last_run_id);
-    try std.testing.expectEqual(@as(u64, 4), lease.last_compact_id);
-    try std.testing.expectEqual(@as(usize, 1), lease.conversation.compact_boundary);
-    try std.testing.expectEqualStrings("restored summary", lease.conversation.compact_summary.?);
-    lease.deinit();
+    {
+        // Released on every path: a held lease keeps the Session busy.
+        var lease = try restored.snapshotCommitted();
+        defer lease.deinit();
+        try std.testing.expectEqualSlices(u8, logical_id.asSlice(), lease.session_id.asSlice());
+        try std.testing.expectEqual(@as(u64, 11), lease.last_run_id);
+        try std.testing.expectEqual(@as(u64, 4), lease.last_compact_id);
+        try std.testing.expectEqual(@as(usize, 1), lease.conversation.compact_boundary);
+        try std.testing.expectEqualStrings("restored summary", lease.conversation.compact_summary.?);
+    }
 
     var admitted = try restored.admitRun(12, sink_probe.sink());
     _ = try admitted.finishWithoutConversation();
     try restored.destroy();
+    restored_live = false;
 
     const reopened = try runtime.createRestoredSession(config, .{
         .session_id = logical_id,
@@ -4070,9 +4084,12 @@ test "restored AgentSession preserves logical identity and operation continuity"
         .last_compact_id = 4,
         .conversation = &source,
     });
+    var reopened_live = true;
+    defer if (reopened_live) reopened.destroy() catch {};
     try std.testing.expectEqualStrings(expected_artifact_root, reopened.artifact_root);
     try std.testing.expect(reopened.tools.contains("ReadArtifact"));
     try reopened.destroy();
+    reopened_live = false;
 }
 
 test "AgentRuntime rejects process-only built-ins that AgentSession cannot wire" {
