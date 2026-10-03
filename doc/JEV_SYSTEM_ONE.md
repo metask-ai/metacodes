@@ -1,7 +1,8 @@
 # Jev System-One 记忆面顾问（Memory-plane advisor）
 
-> 状态：已实现，**默认关闭**。设 `METACODES_JEV_URL` 后默认 `shadow`（只记录不改行为），
-> `METACODES_JEV_MODE=advisory` 才让判断影响注入。实现：`src/jev/`；消费方：
+> 状态：已实现，**默认关闭**。在安装的 `<state root>/config.json` 里写 `jev.url` 后默认
+> `shadow`（只记录不改行为），`jev.mode: "advisory"` 才让判断影响注入；同名
+> `METACODES_JEV_*` 环境变量逐字段覆盖配置文件。实现：`src/jev/`；消费方：
 > `src/kg/scoped_recall.zig`、`src/tools/kg_tools.zig`、`src/core/agent_loop.zig`。
 > 评估复现：`zig build eval:jev-recall-driver`（零 provider 驱动）+ 本文 §6。
 
@@ -26,14 +27,14 @@ Jev-Mem（arXiv 2609.23986）把这种 System-One 判断放进记忆控制：写
 
 | 原则 | 落点 |
 |---|---|
-| 默认关闭，显式开启 | 未设 `METACODES_JEV_URL` 时 `App.jev == null`，所有消费方走原路径 |
+| 默认关闭，显式开启 | 配置文件 `jev.url` 与 `METACODES_JEV_URL` 都没有时 `App.jev == null`，所有消费方走原路径 |
 | shadow → advisory 渐进 | `shadow`：照常请求并写 `system_one_decision` 事件，注入/工具结果字节与无顾问时**逐字节相同**；`advisory`：判断才生效 |
 | 证据，永不是权威 | 判断只能改变“注入哪几条记忆”、“是否附上相关度注释”、“是否给软提醒”；从不拒绝工具、不改权限/沙箱/预算、不写 TinyKG、不参与 formal verdict |
 | 宿主枚举候选 | 候选全部来自 TinyKG BM25（宿主确定性枚举），Jev 只回答关于它们的封闭问题；问题目录是 comptime 校验的常量 |
 | 失败语义二分 | 服务故障（超时/5xx/畸形/模型不符/计费）→ 退回基线；**用户中断**→ `error.Aborted` 原样上抛，不被“降级”吞掉 |
 | 最小脱敏状态 | 请求 ≤ 400 B，候选窗口 480 B；`$HOME` → `~`，`sk-`/`ghp_`/`AKIA` 等密钥前缀 → `[redacted]`；不发送 transcript、时间戳、路径、插件代次 |
 | 零重试 + 熔断 | 不重试（2.5 s 截止内没有退避空间）；故障后熔断 30 s，指数加倍到 5 min |
-| 模型钉死 | `METACODES_JEV_MODEL` 钉住模型名，响应模型不符即拒收（`ModelMismatch`） |
+| 模型钉死 | `jev.model`（或 `METACODES_JEV_MODEL`）钉住模型名，响应模型不符即拒收（`ModelMismatch`） |
 | 计费服务拒收 | 响应 `tariff != "none"` 即拒收（`PricedService`），直到内核有独立的花费记账 |
 | 缓存契约不破 | 判断只影响已有的追加面（scoped recall 的 `<system-reminder>`、工具结果）；不进 system prompt、不引入时间/代次字节 |
 
@@ -44,7 +45,7 @@ src/jev/question.zig   封闭问题类型、comptime 校验、请求序列化、
 src/jev/client.zig     HTTP 客户端：Io.Select 竞速(响应/截止/中断)、熔断、模型钉、计费拒收
 src/jev/advisor.zig    问题目录(版本化) + 判断入口 + Audit(→ system_one_decision 事件)
 src/jev/excerpt.zig    判断窗口：候选全文中与请求词最密的 480 B
-src/jev/runtime.zig    METACODES_JEV_* 解析、堆上固定的 Runtime(App 持有生命周期)
+src/jev/runtime.zig    config.json `jev` 段与 METACODES_JEV_* 覆盖的解析、堆上固定的 Runtime(App 持有生命周期)
 ```
 
 四个消费点（全部是记忆面上已经存在的决策）：
@@ -64,15 +65,20 @@ question_count、state_bytes、judged、positive、changed。召回门的决定�
 KgRemember、枚举）的决定进会话的 tool-observation journal（`tool-observations.jsonl`，
 rollout 产物摘要同样覆盖它）。
 
-配置（环境变量）：
+配置：安装的 `<state root>/config.json`（默认安装即 `~/.metacodes/config.json`）里的 `jev`
+对象；每个字段可以被同名环境变量覆盖（与其余配置一致：环境变量 > 配置文件 > 默认值；评估脚本
+按臂注入的就是这些变量）。`metacodes doctor` 报告生效的状态、地址和来源（文件 / 环境变量 / 两者）。
 
-| 变量 | 含义 |
-|---|---|
-| `METACODES_JEV_URL` | 服务 origin（如 `http://host:10420`）；未设即关闭 |
-| `METACODES_JEV_MODE` | `shadow`（默认）或 `advisory` |
-| `METACODES_JEV_TIMEOUT_MS` | 单次截止，默认 2500（8 候选判断单客户端 p50 0.91 s / p99 1.06 s，三个客户端共享服务时 p50 2.4 s；超时会退回基线并开熔断，所以给共享服务留余量） |
-| `METACODES_JEV_MODEL` | 期望的模型名（钉死）；不设则接受服务报告的任何模型 |
-| `METACODES_JEV_DECISIONS` | 逗号分隔的决策面子集：`scoped_recall`、`recall_evidence`、`memory_relation`、`enumeration_intent`（默认全部）；没列出的面行为与没有顾问完全相同；未知名或空列表会让顾问整体关闭并告警 |
+| `jev` 字段 | 覆盖变量 | 含义 |
+|---|---|---|
+| `url` | `METACODES_JEV_URL` | 服务 origin（如 `http://host:10420`）；两处都没有即关闭 |
+| `mode` | `METACODES_JEV_MODE` | `shadow`（默认）或 `advisory` |
+| `timeout_ms`（整数） | `METACODES_JEV_TIMEOUT_MS` | 单次截止，默认 2500，范围 100–30000（8 候选判断单客户端 p50 0.91 s / p99 1.06 s，三个客户端共享服务时 p50 2.4 s；超时会退回基线并开熔断，所以给共享服务留余量） |
+| `model` | `METACODES_JEV_MODEL` | 期望的模型名（钉死）；不设则接受服务报告的任何模型 |
+| `decisions`（名字数组，或逗号分隔字符串） | `METACODES_JEV_DECISIONS`（逗号分隔） | 决策面子集：`scoped_recall`、`recall_evidence`、`memory_relation`、`enumeration_intent`（默认全部）；没列出的面行为与没有顾问完全相同；未知名或空列表会让顾问整体关闭并告警 |
+
+`jev` 段里出现未知字段（例如把 `timeout_ms` 写成 `timeout`）、字段类型不对、或任一值不合法，
+顾问都整体关闭并告警，而不是按默认值猜。
 
 ## 4. 召回门：最终方案
 
@@ -117,7 +123,7 @@ Codex 的《Jev × metacodes Harness 接入方案》目标是用 Jev（+ JevTree
 | 候选只来自宿主确定性枚举，Jev 不生成命令/路径 | **采纳** | 候选 = BM25 命中；问题目录 comptime 校验 |
 | 最小脱敏 state；不发 transcript/秘密/路径/时间戳 | **采纳** | `appendRedacted` + 字节预算 |
 | 算术/计数/日期/权限由内核定，不交给 Jev | **采纳** | 计数、阈值、选择都在 Zig 里 |
-| 钉死具体模型，避免别名漂移 | **采纳** | `METACODES_JEV_MODEL` + `ModelMismatch` |
+| 钉死具体模型，避免别名漂移 | **采纳** | `jev.model` / `METACODES_JEV_MODEL` + `ModelMismatch` |
 | shadow / advisory / enforced-safe 三档 | **采纳前两档，拒绝 enforced-safe** | 记忆面没有需要“强制路由”的动作；而且判断是传感器，按 sensor/policy 分离原则“错判只能静音一个门，不能触发一个门” |
 | 重试须为零或逐次入预算 journal | **采纳零重试**；拒绝“截止内有限退避” | 2.5 s 截止里没有退避空间；用熔断代替 |
 | 内核 BudgetAccount/ProviderCharge，Jev 与主 provider 共享总上限 | **推迟，改为拒收计费服务** | 自建服务 `tariff: none`；在没有花费记账前，任何计费响应直接拒收，比“先建一个空转的账户”更诚实。延迟成本（elapsed_ms）逐次入事件：shadow 不是零成本 |
@@ -324,13 +330,15 @@ scoped_recall`）。合计 $9.44。
 | `memory_relation` 写路径关系 | 所有付费试点里一次都没被咨询（没有写入与已有记忆冲突） | 暂不启用；需要有冲突写入的评测 |
 | `enumeration_intent` 枚举意图 | 付费试点里咨询 55 次，一次都没越过 80% 阈值、从未武装软提醒 | 暂不启用 |
 
-对应的配置：
+对应的配置（`~/.metacodes/config.json`）：
 
-```sh
-export METACODES_JEV_URL=http://<host>:10420
-export METACODES_JEV_MODE=advisory
-export METACODES_JEV_DECISIONS=scoped_recall
-export METACODES_JEV_MODEL=metask-jev-4b
+```json
+"jev": {
+  "url": "http://<host>:10420",
+  "mode": "advisory",
+  "decisions": ["scoped_recall"],
+  "model": "metask-jev-4b"
+}
 ```
 
 默认值保持保守：不设 URL 即关闭；设了 URL 默认 `shadow`、四个面全开（只记账不改行为，

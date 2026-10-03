@@ -320,7 +320,7 @@ pub const Client = struct {
     }
 };
 
-fn validOrigin(origin: []const u8) bool {
+pub fn validOrigin(origin: []const u8) bool {
     const uri = std.Uri.parse(origin) catch return false;
     if (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) return false;
     if (uri.host == null) return false;

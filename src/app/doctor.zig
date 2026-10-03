@@ -177,6 +177,8 @@ pub const Report = struct {
     checks: [5]Check,
     kg: ?KgDiagnosis = null,
     state_root: ?StateRootDiagnosis = null,
+    /// The System-One advisor's effective configuration; null when not diagnosed.
+    jev: ?JevDiagnosis = null,
     /// Borrowed, for the human report only: this build's full version and
     /// the install prefix around the executable.
     version: ?[]const u8 = null,
@@ -225,6 +227,19 @@ pub fn checkStatus(check: *const Check) CheckStatus {
     if (isKernel(check.name) and check.provenance != true) return .fail;
     return .ok;
 }
+
+/// What the System-One advisor (Jev) would run with, read without contacting
+/// it: `jev` in `<state root>/config.json` with the `METACODES_JEV_*`
+/// overrides. Borrowed strings. Optional by design, so never part of
+/// `healthy()`: an invalid configuration disables the advisor, nothing else.
+pub const JevDiagnosis = struct {
+    /// `off`, `shadow`, `advisory` or `invalid`.
+    state: []const u8,
+    url: ?[]const u8 = null,
+    /// `none`, `file`, `env` or `file_and_env`.
+    source: []const u8,
+    err: ?[]const u8 = null,
+};
 
 pub const KgDiagnosis = struct {
     state: []u8,
@@ -574,6 +589,7 @@ pub fn writeText(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
         });
     }
     if (report.kg) |kg| try w.print("tinykg_daemon {s} transport={s} config={s} hint={s}\n", .{ kg.state, kg.transport, kg.config, kg.hint });
+    if (report.jev) |jev| try w.print("jev_advisor {s} url={s} source={s} error={s}\n", .{ jev.state, jev.url orelse "-", jev.source, jev.err orelse "-" });
     if (report.state_root) |root| try w.print("state_root {s} source={s} error={s}\n", .{
         root.path orelse "unresolved",
         root.source orelse "-",
@@ -740,6 +756,22 @@ pub fn writeHuman(w: *std.Io.Writer, report: *const Report, options: HumanOption
         }
     }
 
+    if (report.jev) |jev| {
+        try w.print("\n{s}System-One advisor (Jev){s}\n", .{ style.on(BOLD), style.off() });
+        const where = jevSourceNote(jev.source);
+        if (std.mem.eql(u8, jev.state, "off")) {
+            try writeMark(w, style, .skip);
+            try w.print("off  {s}(set \"jev\": {{\"url\": ...}} in config.json to enable){s}\n", .{ style.on(DIM), style.off() });
+        } else if (std.mem.eql(u8, jev.state, "invalid")) {
+            warns += 1;
+            try writeMark(w, style, .warn);
+            try w.print("invalid ({s}), advisor disabled  {s}{s}{s}\n", .{ jev.err orelse "unknown", style.on(DIM), where, style.off() });
+        } else {
+            try writeMark(w, style, .ok);
+            try w.print("{s}  {s}  {s}{s}{s}\n", .{ jev.state, jev.url orelse "-", style.on(DIM), where, style.off() });
+        }
+    }
+
     try w.writeByte('\n');
     if (fails == 0 and warns == 0) {
         try w.print("{s}All checks passed.{s}\n", .{ style.on(GREEN), style.off() });
@@ -749,6 +781,13 @@ pub fn writeHuman(w: *std.Io.Writer, report: *const Report, options: HumanOption
         if (warns > 0) try w.print("{s}{d} warning{s}{s}", .{ style.on(YELLOW), warns, if (warns == 1) "" else "s", style.off() });
         try w.writeAll(". `metacodes doctor --plain` shows full digests and sources.\n");
     }
+}
+
+fn jevSourceNote(source: []const u8) []const u8 {
+    if (std.mem.eql(u8, source, "file")) return "(from config.json)";
+    if (std.mem.eql(u8, source, "env")) return "(from METACODES_JEV_*)";
+    if (std.mem.eql(u8, source, "file_and_env")) return "(config.json, overridden by METACODES_JEV_*)";
+    return "";
 }
 
 fn stateSourceNote(source: []const u8) []const u8 {
@@ -831,6 +870,8 @@ pub fn writeJson(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
     const StateRootJson = struct { path: ?[]const u8, source: ?[]const u8, @"error": ?[]const u8 };
     const kg: ?KgJson = if (report.kg) |d| .{ .state = d.state, .transport = d.transport, .config = d.config, .hint = d.hint } else null;
     const state_root: ?StateRootJson = if (report.state_root) |root| .{ .path = root.path, .source = root.source, .@"error" = root.err } else null;
+    const JevJson = struct { state: []const u8, url: ?[]const u8, source: []const u8, @"error": ?[]const u8 };
+    const jev: ?JevJson = if (report.jev) |d| .{ .state = d.state, .url = d.url, .source = d.source, .@"error" = d.err } else null;
     try w.writeAll("{\"checks\":");
     try std.json.Stringify.value(entries, .{}, w);
     if (kg) |value| {
@@ -839,6 +880,10 @@ pub fn writeJson(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
     }
     if (state_root) |value| {
         try w.writeAll(",\"state_root\":");
+        try std.json.Stringify.value(value, .{}, w);
+    }
+    if (jev) |value| {
+        try w.writeAll(",\"jev\":");
         try std.json.Stringify.value(value, .{}, w);
     }
     try w.writeByte('}');
@@ -1003,6 +1048,36 @@ test "doctor human report: a stopped service a session will start is not a warni
     try writeHuman(&off.writer, &report, .{ .home = "/home/u" });
     try std.testing.expect(std.mem.indexOf(u8, off.written(), "  ! unconfigured  a CLI session provisions and starts it by itself\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, off.written(), "1 warning. `metacodes doctor --plain` shows full digests and sources.\n"));
+}
+
+test "doctor reports the System-One advisor in every format, and never in --strict" {
+    const allocator = std.testing.allocator;
+    var report = try testInstalledReport(allocator);
+    defer report.deinit(allocator);
+    const Case = struct { jev: JevDiagnosis, human: []const u8, plain: []const u8, warns: bool };
+    const cases = [_]Case{
+        .{ .jev = .{ .state = "off", .source = "none" }, .human = "  - off  (set \"jev\": {\"url\": ...} in config.json to enable)\n", .plain = "jev_advisor off url=- source=none error=-\n", .warns = false },
+        .{ .jev = .{ .state = "shadow", .url = "http://127.0.0.1:10420", .source = "file" }, .human = "  \u{2713} shadow  http://127.0.0.1:10420  (from config.json)\n", .plain = "jev_advisor shadow url=http://127.0.0.1:10420 source=file error=-\n", .warns = false },
+        .{ .jev = .{ .state = "advisory", .url = "http://h:1", .source = "file_and_env" }, .human = "  \u{2713} advisory  http://h:1  (config.json, overridden by METACODES_JEV_*)\n", .plain = "jev_advisor advisory url=http://h:1 source=file_and_env error=-\n", .warns = false },
+        .{ .jev = .{ .state = "invalid", .source = "file", .err = "InvalidJevSection" }, .human = "  ! invalid (InvalidJevSection), advisor disabled  (from config.json)\n", .plain = "jev_advisor invalid url=- source=file error=InvalidJevSection\n", .warns = true },
+    };
+    for (cases) |case| {
+        report.jev = case.jev;
+        var human: std.Io.Writer.Allocating = .init(allocator);
+        defer human.deinit();
+        try writeHuman(&human.writer, &report, .{});
+        try std.testing.expect(std.mem.indexOf(u8, human.written(), case.human) != null);
+        try std.testing.expectEqual(case.warns, std.mem.endsWith(u8, human.written(), "1 warning. `metacodes doctor --plain` shows full digests and sources.\n"));
+        var plain: std.Io.Writer.Allocating = .init(allocator);
+        defer plain.deinit();
+        try writeText(&plain.writer, &report);
+        try std.testing.expect(std.mem.indexOf(u8, plain.written(), case.plain) != null);
+        try std.testing.expect(report.healthy()); // optional: never fails --strict
+    }
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    try writeJson(&json.writer, &report);
+    try std.testing.expect(std.mem.indexOf(u8, json.written(), "\"jev\":{\"state\":\"invalid\",\"url\":null,\"source\":\"file\",\"error\":\"InvalidJevSection\"}") != null);
 }
 
 test "doctor human report: colour only when asked" {

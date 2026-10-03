@@ -12,6 +12,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- The Jev System-One advisor is configured in the install's
+  `<state root>/config.json` (`"jev": {"url", "mode", "timeout_ms", "model",
+  "decisions"}`) instead of only the environment; each `METACODES_JEV_*`
+  variable still overrides its field, so evaluation harnesses that inject them
+  per arm are unchanged. An unknown key, a mistyped value or an invalid
+  setting disables the advisor with a warning. `metacodes doctor` reports the
+  advisor's state, URL and whether it came from the file, the environment or
+  both (never part of `--strict`).
 - `metacodes doctor` reads like a report at a terminal: the version, install
   prefix and state root, one line per runtime component (paths relative to
   the install, a digest only when it does not match), the TinyKG service, and
@@ -175,6 +183,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- The Jev relation judge for `KgRemember` broke whenever a new memory had two
+  or three related ones: `n = @min(len, 3)` was inferred as `u2`, so `2 * n`
+  overflowed — a panic in Debug builds, and in the ReleaseSmall executable a
+  request with no questions. Only the one-related-memory case worked, which
+  may have skewed any evidence gathered on the `memory_relation` surface.
 - KgRecall failed after any write in a store holding one node whose text has
   no tokens, and reported "TinyKG daemon 不可达" while the daemon was up. On a
   stale full-text index TinyKG's JSON search refuses such a node
