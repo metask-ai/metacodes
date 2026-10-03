@@ -768,22 +768,35 @@ const KernelStage = struct {
     }
 };
 
+/// Paths name the same file when they differ only in separators on Windows,
+/// which accepts both: the adjacent-kernel probe joins `<prefix>`, the literal
+/// `libexec/metacodes` and the file name with `\` there.
+fn expectSamePath(expected: []const u8, actual: []const u8) !void {
+    const same = expected.len == actual.len and for (expected, actual) |e, a| {
+        if (e != a and !(@import("builtin").os.tag == .windows and
+            std.fs.path.isSep(e) and std.fs.path.isSep(a))) break false;
+    } else true;
+    if (!same) try std.testing.expectEqualStrings(expected, actual);
+}
+
 test "doctor Kernel accepts bound provenance sidecars" {
     const allocator = std.testing.allocator;
     var stage = try KernelStage.init(allocator, .formal);
     defer stage.deinit(allocator);
 
-    var without = try stage.report(allocator, .formal);
-    try std.testing.expectEqualStrings(stage.kernel_path, without.checks[2].resolved_path.?);
-    try std.testing.expectEqual(@as(?bool, true), without.checks[2].match);
-    try std.testing.expectEqual(@as(?bool, false), without.checks[2].provenance);
-    try std.testing.expect(!without.healthy());
-    without.deinit(allocator);
+    {
+        var without = try stage.report(allocator, .formal);
+        defer without.deinit(allocator);
+        try expectSamePath(stage.kernel_path, without.checks[2].resolved_path.?);
+        try std.testing.expectEqual(@as(?bool, true), without.checks[2].match);
+        try std.testing.expectEqual(@as(?bool, false), without.checks[2].provenance);
+        try std.testing.expect(!without.healthy());
+    }
 
     try stage.writeFormalSidecars(allocator);
     var with = try stage.report(allocator, .formal);
     defer with.deinit(allocator);
-    try std.testing.expectEqualStrings(stage.kernel_path, with.checks[2].resolved_path.?);
+    try expectSamePath(stage.kernel_path, with.checks[2].resolved_path.?);
     try std.testing.expectEqual(@as(?bool, true), with.checks[2].match);
     try std.testing.expectEqual(@as(?bool, true), with.checks[2].provenance);
     try std.testing.expect(with.healthy());
@@ -794,13 +807,15 @@ test "doctor project Kernel accepts its v6 provenance sidecar" {
     var stage = try KernelStage.init(allocator, .project);
     defer stage.deinit(allocator);
 
-    var without = try stage.report(allocator, .project);
-    try std.testing.expectEqualStrings(stage.kernel_path, without.checks[3].resolved_path.?);
-    try std.testing.expectEqual(Source.adjacent, without.checks[3].source.?);
-    try std.testing.expectEqual(@as(?bool, true), without.checks[3].match);
-    try std.testing.expectEqual(@as(?bool, false), without.checks[3].provenance);
-    try std.testing.expect(!without.healthy());
-    without.deinit(allocator);
+    {
+        var without = try stage.report(allocator, .project);
+        defer without.deinit(allocator);
+        try expectSamePath(stage.kernel_path, without.checks[3].resolved_path.?);
+        try std.testing.expectEqual(Source.adjacent, without.checks[3].source.?);
+        try std.testing.expectEqual(@as(?bool, true), without.checks[3].match);
+        try std.testing.expectEqual(@as(?bool, false), without.checks[3].provenance);
+        try std.testing.expect(!without.healthy());
+    }
 
     try stage.writeProjectSidecar(allocator);
     var with = try stage.report(allocator, .project);
