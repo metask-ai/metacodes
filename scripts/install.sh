@@ -7,15 +7,19 @@
 #   curl -fsSL https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/install.sh | sh -s -- --version 0.3.0
 #   scripts/install.sh --dev                   # build this checkout, install it as `metacodes-dev`
 #   scripts/install.sh metacodes-<version>-<target>.tar.gz
+#   scripts/install.sh --dev --uninstall       # remove what --dev installed from this checkout
 #
 # The install itself is `bin/metacodes install` inside the release unit
 # (src/app/install.zig), the same code on every platform; this script only
 # obtains a unit — a published release, an archive or directory you name, or
 # one built from a checkout — and calls it (doc/INSTALL_DESIGN.md §4).
 #
-# Two installs side by side, one released and one from your checkout, are the
-# default: they differ in prefix, launcher name and state root, so neither can
-# see the other's config, credentials, KG store or sessions.
+# Installs side by side are the default: the release is `metacodes`, the main
+# checkout's build `metacodes-dev`, and a linked worktree's build
+# `metacodes-dev-<worktree directory>`. They differ in prefix, launcher name and
+# state root, so none sees another's config, credentials, KG store or sessions.
+# An install is a copy: rebuilding, switching branches or deleting a worktree
+# leaves it running until the next --dev replaces it.
 set -eu
 
 repo="metask-ai/metacodes"
@@ -29,14 +33,19 @@ Where the release unit comes from (one of):
   --version X.Y.Z     that published release instead of the latest
   --dev               build the checkout this script belongs to (needs zig, elan, python3)
   --source DIR        build the checkout at DIR (implies --dev; use it with curl | sh)
+
+What to do:
+  (default)           install, or upgrade the install at the prefix in place
+  --uninstall         remove the install at the prefix (with the state root inside
+                      it) and its launcher; an outside --state-dir root is kept
   ARCHIVE|UNIT-DIR    a downloaded release archive (.tar.gz) or an unpacked unit
 
 Where it goes:
-  --prefix DIR        install directory (default ~/.local/opt/metacodes,
-                      ~/.local/opt/metacodes-dev with --dev)
+  --prefix DIR        install directory (default ~/.local/opt/<launcher name>)
   --state-dir DIR     state root (default <prefix>/state)
   --link DIR          directory for the launcher (default ~/.local/bin)
-  --link-name NAME    launcher name (default metacodes, metacodes-dev with --dev)
+  --link-name NAME    launcher name (default metacodes; with --dev metacodes-dev
+                      from the main checkout, metacodes-dev-<dir> from a worktree)
   --no-link           do not write a launcher
   --sdk ARCHIVE|DIR   use this AgentCore SDK instead of the matching one
   --no-sdk            do not install the AgentCore SDK
@@ -150,6 +159,49 @@ build_from_source() { # <checkout> <unit-dir> <target>
   fi
 }
 
+# The install a --dev from <checkout> produces is named after the checkout:
+# the main checkout is `metacodes-dev`, a linked worktree adds its directory
+# name, so testing a worktree never replaces the main checkout's install.
+dev_name() { # <checkout>
+  gitdir=$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null) || { echo "metacodes-dev"; return; }
+  common=$( (cd "$1" && cd "$(git rev-parse --git-common-dir)" && pwd -P) 2>/dev/null) || { echo "metacodes-dev"; return; }
+  if [ "$(cd "$gitdir" && pwd -P)" = "$common" ]; then echo "metacodes-dev"; return; fi
+  echo "metacodes-dev-$(basename "$1" | tr -c 'A-Za-z0-9._\n-' '-')"
+}
+
+# Remove the install at $prefix: only one that carries this product's install
+# record, never while a process runs from it, and only a launcher this
+# install wrote. A state root outside the prefix (--state-dir) is left alone.
+uninstall() {
+  [ -d "$prefix" ] || die "nothing is installed at $prefix"
+  record="$prefix/etc/metacodes/install.json"
+  grep -q '"schema_version": *"metacodes-install-v1"' "$record" 2>/dev/null ||
+    die "$prefix holds no metacodes install record ($record); not removing it"
+  phys=$(cd "$prefix" && pwd -P)
+  # The path goes to awk through its environment (exported in the
+  # substitution's subshell), so awk's own command line cannot match it.
+  running=$(P="$phys/"; export P; ps -A -o pid= -o command= 2>/dev/null |
+    awk 'ENVIRON["P"] != "" && index($0, ENVIRON["P"]) {print $1}' | tr '\n' ' ')
+  [ -z "$running" ] || die "processes still run from $phys (pids: $running); stop them first (its \`kgd\`, open sessions)"
+  recorded=$(sed -n 's/.*"state_root": *"\([^"]*\)".*/\1/p' "$record" | head -n 1)
+  if [ -n "$link" ]; then
+    launcher="$link/$link_name"
+    if [ -f "$launcher" ] && [ ! -L "$launcher" ] &&
+       grep -qF '# metacodes launcher written by `metacodes install`' "$launcher" &&
+       grep -qF "$phys/bin/metacodes" "$launcher"; then
+      rm -f "$launcher"
+      note "removed the launcher $launcher"
+    elif [ -e "$launcher" ]; then
+      note "left $launcher alone: it is not this install's launcher"
+    fi
+  fi
+  rm -rf "$phys"
+  case "$recorded" in
+    /*) note "removed $phys; its state root $recorded is outside it and kept" ;;
+    *) note "removed $phys, including its state root" ;;
+  esac
+}
+
 main() {
   prefix=""
   link="${HOME}/.local/bin"
@@ -161,6 +213,7 @@ main() {
   unit=""
   version=""
   dev=0
+  uninstall=0
   source_dir=""
   base="https://github.com/$repo/releases"
 
@@ -176,6 +229,7 @@ main() {
       --force) force="--force"; shift ;;
       --version) [ $# -ge 2 ] || die "--version needs X.Y.Z"; version=$2; shift 2 ;;
       --dev) dev=1; shift ;;
+      --uninstall) uninstall=1; shift ;;
       --source) [ $# -ge 2 ] || die "--source needs a checkout"; source_dir=$2; dev=1; shift 2 ;;
       --release-base) [ $# -ge 2 ] || die "--release-base needs a URL"; base=${2%/}; shift 2 ;;
       -h|--help) usage; exit 0 ;;
@@ -185,12 +239,27 @@ main() {
   done
   [ "$dev" = 0 ] || [ -z "$unit$version" ] || die "--dev builds from source; it takes no archive and no --version"
   [ -z "$unit" ] || [ -z "$version" ] || die "name an archive or a --version, not both"
+  [ "$uninstall" = 0 ] || [ -z "$unit$version$sdk" ] || die "--uninstall takes no archive, --version or --sdk"
   if [ "$dev" = 1 ]; then
-    : "${prefix:=${HOME}/.local/opt/metacodes-dev}"
-    : "${link_name:=metacodes-dev}"
+    if [ -z "$source_dir" ]; then
+      case "$0" in
+        */*) source_dir=$(cd "$(dirname "$0")/.." && pwd) ;;
+        *) die "--dev from a pipe needs --source <checkout>" ;;
+      esac
+    fi
+    source_dir=$(cd "$source_dir" && pwd)
+    [ -f "$source_dir/build.zig" ] && [ -f "$source_dir/release/manifest_contract.zig" ] || die "$source_dir is not a metacodes checkout"
+    [ -f "$source_dir/scripts/kernel_pins.py" ] || die "$source_dir predates install.sh --dev (no scripts/kernel_pins.py); update it first"
+    default_name=$(dev_name "$source_dir")
   else
-    : "${prefix:=${HOME}/.local/opt/metacodes}"
-    : "${link_name:=metacodes}"
+    default_name="metacodes"
+  fi
+  : "${link_name:=$default_name}"
+  : "${prefix:=${HOME}/.local/opt/$link_name}"
+
+  if [ "$uninstall" = 1 ]; then
+    uninstall
+    return
   fi
 
   work=$(mktemp -d "${TMPDIR:-/tmp}/metacodes-install.XXXXXX")
@@ -200,14 +269,6 @@ main() {
   # Plain assignments throughout: `set -e` stops on a failed command
   # substitution only there, not inside the arguments of another command.
   if [ "$dev" = 1 ]; then
-    if [ -z "$source_dir" ]; then
-      case "$0" in
-        */*) source_dir=$(cd "$(dirname "$0")/.." && pwd) ;;
-        *) die "--dev from a pipe needs --source <checkout>" ;;
-      esac
-    fi
-    source_dir=$(cd "$source_dir" && pwd)
-    [ -f "$source_dir/build.zig" ] && [ -f "$source_dir/scripts/kernel_pins.py" ] || die "$source_dir is not a metacodes checkout"
     target=$(host_target)
     unit="$source_dir/zig-out/dev-unit"
     build_from_source "$source_dir" "$unit" "$target"

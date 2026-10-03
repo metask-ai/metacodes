@@ -43,9 +43,11 @@ This installs into `~/.local/opt/metacodes` with a `metacodes` launcher in
 `~/.local/bin`, the AgentCore SDK included; rerunning it upgrades in place and
 keeps the state. `| sh -s -- --version X.Y.Z` picks a release, `--help` lists
 the rest. From a checkout, `scripts/install.sh --dev` builds the release unit
-from source and installs it beside the released one, as
-`~/.local/opt/metacodes-dev` with a `metacodes-dev` launcher and a state root
-of its own. A downloaded archive installs the same way:
+from source and installs it beside the released one: the main checkout as
+`metacodes-dev` (`~/.local/opt/metacodes-dev`), a linked worktree as
+`metacodes-dev-<worktree directory>`, each with a state root of its own. An
+install is a copy, so rebuilding or removing the checkout leaves it running;
+`--dev --uninstall` removes it again. A downloaded archive installs the same way:
 
 ```sh
 sh scripts/install.sh metacodes-<version>-<target>.tar.gz

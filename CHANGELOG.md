@@ -75,9 +75,13 @@ status, compatibility boundaries, and entry points are defined by
   host (or `--version`), checks it against the release's SHA256SUMS, installs
   it with its AgentCore SDK, and upgrades in place when rerun.
   `scripts/install.sh --dev` builds the checkout's release unit (kernels,
-  pins, `release:verify`, SDK) and installs it as `metacodes-dev` in
-  `~/.local/opt/metacodes-dev` with its own state root. A release that
-  predates `metacodes install` (manifest v1) is refused instead of run.
+  pins, `release:verify`, SDK) and installs it with its own state root: the
+  main checkout as `metacodes-dev`, a linked worktree as
+  `metacodes-dev-<worktree directory>`, so a worktree under test never
+  replaces the main checkout's install. `--uninstall` removes an install
+  (never one a process still runs from, never a launcher it did not write).
+  A release that predates `metacodes install` (manifest v1) is refused
+  instead of run.
 - The release unit is complete on every platform (manifest schema 2): it
   ships the TinyKG daemon and both Lean governance kernels, built natively on
   each release runner and pinned into the executable, with the licence texts

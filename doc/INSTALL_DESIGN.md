@@ -127,12 +127,24 @@ release.yml on the archives it publishes.
   executable would read `install` as a prompt;
 - **a checkout** (`--dev`, or `--source <dir>` when piped): kernels,
   `kernel_pins.py`, `release:verify` and `agentcore:archive`, ReleaseSafe as
-  release.yml builds them, into `<checkout>/zig-out/dev-unit`, installed by
-  default as `~/.local/opt/metacodes-dev` with a `metacodes-dev` launcher;
+  release.yml builds them, into `<checkout>/zig-out/dev-unit`. The install is
+  named after the checkout: the main checkout is `metacodes-dev`, a linked
+  git worktree `metacodes-dev-<worktree directory>`, so testing a worktree
+  never replaces the main checkout's install. The default prefix is
+  `~/.local/opt/<launcher name>` in every mode;
 - **an archive or unit directory** named on the command line.
 
-A released install and a development install therefore coexist by default,
-with separate prefixes, launchers and state roots. Neither imports an existing
+A released install and development installs therefore coexist by default,
+with separate prefixes, launchers and state roots. An install is a copy of the
+unit, each file replaced atomically, so rebuilding, switching branches or
+removing a worktree never disturbs a running install, and an upgrade does not
+break a session that is still running the old executable.
+
+`install.sh --uninstall` (with the same `--dev`/`--prefix`/`--link-name`
+selection) removes an install: only a prefix holding this product's install
+record, never while a process runs from it, together with its launcher when
+that launcher is this install's own. A state root inside the prefix goes with
+it; an outside `--state-dir` root is kept. Neither imports an existing
 `~/.metacodes`; when one exists and the new root is empty, the script says how
 to reuse it (`--state-dir ~/.metacodes`, or copying `config.json`, `auth.json`
 and `models.toml`).
