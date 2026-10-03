@@ -674,3 +674,36 @@ test "L2 jev memory plane: KgRecall evidence annotation is advisory-only and jou
         try std.testing.expectEqual(@as(usize, 0), srv.requestCount());
     }
 }
+
+test "L2 jev memory plane: the relation judge asks two questions per existing memory, up to three" {
+    const a = std.testing.allocator;
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    // `n` was inferred as `u2` from `@min(len, 3)`, so `2 * n` overflowed for
+    // two or more memories: Debug panicked, ReleaseSmall sent no questions.
+    const memories = [_]cc.jev_advisor.ExistingMemory{ .{ .text = "first existing" }, .{ .text = "second existing" }, .{ .text = "third existing" }, .{ .text = "fourth, beyond the cap" } };
+    for ([_]usize{ 1, 2, 3, 4 }) |count| {
+        const asked: usize = @min(count, cc.jev_advisor.MAX_RELATION_CANDIDATES);
+        var body_list: std.ArrayList(u8) = .empty;
+        defer body_list.deinit(a);
+        try body_list.appendSlice(a, "{\"answers\":{");
+        for (0..asked) |index| {
+            if (index > 0) try body_list.append(a, ',');
+            try body_list.print(a, "\"same{d}\":{{\"probabilities\":{{\"false\":0.9,\"true\":0.1}},\"type\":\"boolean\"}}," ++
+                "\"contradicts{d}\":{{\"probabilities\":{{\"false\":0.9,\"true\":0.1}},\"type\":\"boolean\"}}", .{ index, index });
+        }
+        try body_list.appendSlice(a, "},\"model\":\"metask-jev-4b\",\"usage\":{\"provider\":\"self-hosted\",\"tariff\":\"none\"}}");
+        const body = body_list.items;
+        var srv = try harness.MockServer.start(body, 0);
+        defer srv.stop();
+        const runtime = try startRuntime(a, io_runtime.io(), srv, .shadow);
+        defer runtime.destroy(a);
+        const judgment = try runtime.advisor.judgeMemoryRelations(a, null, "new memory text", memories[0..count]);
+        try std.testing.expectEqual(cc.jev_advisor.Outcome.answered, judgment.audit.outcome);
+        try std.testing.expectEqual(@as(u32, @intCast(2 * asked)), judgment.audit.question_count);
+        const sent = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
+        var last_buf: [16]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(u8, sent, try std.fmt.bufPrint(&last_buf, "\"contradicts{d}\"", .{asked - 1})) != null);
+        try std.testing.expect(std.mem.indexOf(u8, sent, try std.fmt.bufPrint(&last_buf, "\"same{d}\"", .{asked})) == null);
+    }
+}

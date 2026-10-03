@@ -1040,6 +1040,23 @@ pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").
     return diagnosis;
 }
 
+/// The System-One advisor as `App.init` would configure it (config.json
+/// `jev` overlaid by METACODES_JEV_*), judged without contacting the service.
+/// Strings live in `arena`.
+fn jevDiagnosis(arena: std.mem.Allocator, io: std.Io, state_root: []const u8) doctor.JevDiagnosis {
+    const jev = @import("jev/runtime.zig");
+    const env = jev.rawFromEnv();
+    const file = jev.rawFromFile(arena, io, state_root) catch |err|
+        return .{ .state = "invalid", .source = "file", .err = @errorName(err) };
+    const source = @tagName(jev.sourceOf(file, env));
+    const settings = (jev.parseRaw(file.overlay(env)) catch |err|
+        return .{ .state = "invalid", .source = source, .err = @errorName(err) }) orelse
+        return .{ .state = "off", .source = source };
+    if (!@import("jev/client.zig").validOrigin(std.mem.trimEnd(u8, settings.origin, "/")))
+        return .{ .state = "invalid", .url = settings.origin, .source = source, .err = "InvalidOrigin" };
+    return .{ .state = @tagName(settings.mode), .url = settings.origin, .source = source };
+}
+
 fn kgDiagnosisOwned(allocator: std.mem.Allocator, state: []const u8, transport: []const u8, config: []const u8, hint: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
     const s = try allocator.dupe(u8, state);
     errdefer allocator.free(s);
@@ -1208,6 +1225,9 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
         break :blk null;
     };
     defer report.deinit(allocator);
+    var jev_arena = std.heap.ArenaAllocator.init(allocator);
+    defer jev_arena.deinit();
+    report.jev = jevDiagnosis(jev_arena.allocator(), io, state_dir);
     var version_buf: [version_info.MAX_VERSION_LEN]u8 = undefined;
     report.version = version_info.fullVersion(&version_buf, VERSION, version_info.BuildInfo.fromOptions(build_options));
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;

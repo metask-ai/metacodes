@@ -269,7 +269,7 @@ pub const Advisor = struct {
         request: []const u8,
         candidates: []const RecallCandidate,
     ) ConsultError!Judgment(MAX_RECALL_CANDIDATES) {
-        const n = @min(candidates.len, MAX_RECALL_CANDIDATES);
+        const n: usize = @min(candidates.len, MAX_RECALL_CANDIDATES);
         std.debug.assert(n > 0);
         var state: std.ArrayList(u8) = .empty;
         defer state.deinit(allocator);
@@ -286,7 +286,7 @@ pub const Advisor = struct {
         request: []const u8,
         candidates: []const RecallCandidate,
     ) ConsultError!Judgment(MAX_RECALL_CANDIDATES + 1) {
-        const n = @min(candidates.len, MAX_RECALL_CANDIDATES);
+        const n: usize = @min(candidates.len, MAX_RECALL_CANDIDATES);
         std.debug.assert(n > 0);
         var state: std.ArrayList(u8) = .empty;
         defer state.deinit(allocator);
@@ -336,7 +336,10 @@ pub const Advisor = struct {
         new_text: []const u8,
         existing: []const ExistingMemory,
     ) ConsultError!Judgment(2 * MAX_RELATION_CANDIDATES) {
-        const n = @min(existing.len, MAX_RELATION_CANDIDATES);
+        // `usize`, not the inferred type: `@min` against the comptime bound 3
+        // is a `u2`, and `2 * n` then overflowed for two or more memories —
+        // a panic in Debug, and in ReleaseSmall a request with no questions.
+        const n: usize = @min(existing.len, MAX_RELATION_CANDIDATES);
         std.debug.assert(n > 0);
         var state: std.ArrayList(u8) = .empty;
         defer state.deinit(allocator);
