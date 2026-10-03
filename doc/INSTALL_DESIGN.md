@@ -91,7 +91,9 @@ run from an extracted release unit or one staged from source (`release:verify`):
    `--link` directory;
 2. writes `etc/metacodes/install.json` (`"state_root": "state"`, or the
    absolute `--state-dir`) and creates the state root (0700), first, so a copy
-   that fails half way can be retried without `--force`;
+   that fails half way can be retried without `--force`. A reinstall or
+   upgrade without `--state-dir` keeps the root the existing record names:
+   rerunning the installer never re-points an install at an empty root;
 3. copies every file the unit's `manifest.json` lists and re-hashes it at the
    destination (a damaged unit fails on the first mismatch); when it replaces
    another version, removes the files the old manifest listed and the new one
@@ -130,8 +132,11 @@ release.yml on the archives it publishes.
   release.yml builds them, into `<checkout>/zig-out/dev-unit`. The install is
   named after the checkout: the main checkout is `metacodes-dev`, a linked
   git worktree `metacodes-dev-<worktree directory>`, so testing a worktree
-  never replaces the main checkout's install. The default prefix is
-  `~/.local/opt/<launcher name>` in every mode;
+  never replaces the main checkout's install. Its default prefix follows the
+  checkout (`~/.local/opt/metacodes-dev[-<worktree>]`) whatever the launcher
+  is called, so a rerun finds it again; a release's is
+  `~/.local/opt/<launcher name>`. Without `--link-name`, a rerun or
+  `--uninstall` uses the name of the launcher that already execs the install;
 - **an archive or unit directory** named on the command line.
 
 A released install and development installs therefore coexist by default,

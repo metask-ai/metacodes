@@ -41,10 +41,13 @@ What to do:
   ARCHIVE|UNIT-DIR    a downloaded release archive (.tar.gz) or an unpacked unit
 
 Where it goes:
-  --prefix DIR        install directory (default ~/.local/opt/<launcher name>)
-  --state-dir DIR     state root (default <prefix>/state)
+  --prefix DIR        install directory (default ~/.local/opt/<launcher name>; with
+                      --dev ~/.local/opt/metacodes-dev[-<worktree directory>])
+  --state-dir DIR     state root (default: the one the install already records,
+                      else <prefix>/state)
   --link DIR          directory for the launcher (default ~/.local/bin)
-  --link-name NAME    launcher name (default metacodes; with --dev metacodes-dev
+  --link-name NAME    launcher name (default: the name this install's launcher
+                      already has; else metacodes, and with --dev metacodes-dev
                       from the main checkout, metacodes-dev-<dir> from a worktree)
   --no-link           do not write a launcher
   --sdk ARCHIVE|DIR   use this AgentCore SDK instead of the matching one
@@ -169,6 +172,23 @@ dev_name() { # <checkout>
   echo "metacodes-dev-$(basename "$1" | tr -c 'A-Za-z0-9._\n-' '-')"
 }
 
+# The name of the one launcher in <dir> that execs <prefix>'s executable, so a
+# rerun without --link-name keeps the name the install was given (and
+# --uninstall removes that launcher, not a default name that never existed).
+existing_launcher() { # <prefix> <dir>
+  [ -f "$1/etc/metacodes/install.json" ] && [ -d "$2" ] || return 0
+  target="$(cd "$1" && pwd -P)/bin/metacodes"
+  found=""
+  for candidate in "$2"/*; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    grep -qF '# metacodes launcher written by `metacodes install`' "$candidate" 2>/dev/null || continue
+    grep -qF "'$target'" "$candidate" || continue
+    [ -z "$found" ] || return 0 # several: let the default stand
+    found=$(basename "$candidate")
+  done
+  echo "$found"
+}
+
 # Remove the install at $prefix: only one that carries this product's install
 # record, never while a process runs from it, and only a launcher this
 # install wrote. A state root outside the prefix (--state-dir) is left alone.
@@ -254,8 +274,23 @@ main() {
   else
     default_name="metacodes"
   fi
+  link_name_given=${link_name:+1}
   : "${link_name:=$default_name}"
-  : "${prefix:=${HOME}/.local/opt/$link_name}"
+  # A development install is the checkout's: its prefix follows the checkout,
+  # whatever the launcher is called, so a rerun finds it again. Side-by-side
+  # releases are told apart by their launcher names instead.
+  if [ "$dev" = 1 ]; then
+    : "${prefix:=${HOME}/.local/opt/$default_name}"
+  else
+    : "${prefix:=${HOME}/.local/opt/$link_name}"
+  fi
+  if [ -z "$link_name_given" ] && [ -n "$link" ]; then
+    kept_name=$(existing_launcher "$prefix" "$link")
+    if [ -n "$kept_name" ] && [ "$kept_name" != "$link_name" ]; then
+      [ "$uninstall" = 1 ] || note "keeping this install's launcher name \`$kept_name\` (--link-name to change it)"
+      link_name=$kept_name
+    fi
+  fi
 
   if [ "$uninstall" = 1 ]; then
     uninstall
@@ -317,7 +352,11 @@ main() {
   # An existing default state (from a development build or an older install)
   # is never merged in silently; say how to reuse it.
   if [ -z "$state_dir" ] && [ -f "$HOME/.metacodes/auth.json" ]; then
-    installed_root=$(cd "$prefix" && pwd -P)/state
+    installed_root=$(sed -n 's/.*"state_root": *"\([^"]*\)".*/\1/p' "$prefix/etc/metacodes/install.json" | head -n 1)
+    case "$installed_root" in
+      /*) ;;
+      *) installed_root="$(cd "$prefix" && pwd -P)/${installed_root:-state}" ;;
+    esac
     if [ ! -f "$installed_root/auth.json" ] && [ ! -f "$installed_root/config.json" ]; then
       note "this install keeps its own state in $installed_root (empty, so sign in once)."
       note "to reuse ~/.metacodes instead, rerun with --state-dir ~/.metacodes, or copy"
