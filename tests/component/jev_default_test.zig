@@ -1,6 +1,7 @@
 //! L2 component test: the built-in System-One advisor default reaches
 //! `App.init` exactly when the host opts in (`Config.jev_builtin_default`,
-//! which the CLI sets), and config.json turns it off.
+//! which the CLI sets), advises only `scoped_recall`, and config.json narrows,
+//! widens or turns it off.
 //!
 //! The build exports `METACODES_JEV_URL=off` to every step, so each case clears
 //! the METACODES_JEV_* variables first and restores them afterwards.
@@ -91,6 +92,20 @@ fn expectBuiltinAdvisor(app: *cc.app_module.App) anyerror!void {
     try std.testing.expectEqualStrings(expected_url, runtime.client.url);
     try std.testing.expectEqual(cc.jev_advisor.Mode.advisory, runtime.advisor.mode);
     try std.testing.expect(runtime.advisor.actuates());
+    // Only the recall gate is advised; the other surfaces run as with no
+    // advisor (the narrowing itself is proven in jev_memory_plane_test.zig).
+    try std.testing.expect(runtime.advisor.advises(.scoped_recall));
+    try std.testing.expect(!runtime.advisor.advises(.recall_evidence));
+    try std.testing.expect(!runtime.advisor.advises(.memory_relation));
+    try std.testing.expect(!runtime.advisor.advises(.enumeration_intent));
+}
+
+fn expectBuiltinAdvisorAllSurfaces(app: *cc.app_module.App) anyerror!void {
+    const runtime = app.jev orelse return error.TestExpectedAdvisor;
+    const expected_url = jev.BUILTIN_DEFAULT.url.? ++ "/v1/systemone";
+    try std.testing.expectEqualStrings(expected_url, runtime.client.url);
+    try std.testing.expectEqual(cc.jev_advisor.Mode.advisory, runtime.advisor.mode);
+    try std.testing.expect(runtime.advisor.surfaces.eql(.initFull()));
 }
 
 fn expectNoAdvisor(app: *cc.app_module.App) anyerror!void {
@@ -134,4 +149,11 @@ test "L2 jev default: config.json overrides or turns off the built-in advisor" {
     try withApp(root, "{\"jev\":false}", true, expectNoAdvisor);
     try withApp(root, "{\"jev\":{\"url\":\"\"}}", true, expectNoAdvisor);
     try withApp(root, "{\"jev\":{\"url\":\"http://127.0.0.1:9\",\"mode\":\"shadow\"}}", true, expectFileAdvisor);
+    // `decisions` alone replaces the default's surface list and keeps its service.
+    try withApp(
+        root,
+        "{\"jev\":{\"decisions\":[\"scoped_recall\",\"recall_evidence\",\"memory_relation\",\"enumeration_intent\"]}}",
+        true,
+        expectBuiltinAdvisorAllSurfaces,
+    );
 }

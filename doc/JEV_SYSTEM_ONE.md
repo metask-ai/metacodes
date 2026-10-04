@@ -1,7 +1,7 @@
 # Jev System-One 记忆面顾问（Memory-plane advisor）
 
 > 状态：已实现。**CLI 默认开启**：什么都不配时用内置默认——昆山 GPU 机上的
-> `metask-jev-4b`（`http://58.211.6.133:10420`，`advisory`）；SDK 嵌入方不打开
+> `metask-jev-4b`（`http://58.211.6.133:10420`，`advisory`，只开 `scoped_recall`，依据见 §7）；SDK 嵌入方不打开
 > `Config.jev_builtin_default` 就没有默认，仍是显式开启。安装的 `<state root>/config.json`
 > 的 `jev` 段逐字段覆盖默认，同名 `METACODES_JEV_*` 环境变量再逐字段覆盖配置文件；任一层给出
 > `off` 或空 `url`（`"jev": false`、`"jev": {"url": "off"}`、`METACODES_JEV_URL=off`）即关闭。只写 `url`
@@ -74,10 +74,13 @@ rollout 产物摘要同样覆盖它）。
 环境变量 / 两者）。
 
 内置默认（`src/jev/runtime.zig` `BUILTIN_DEFAULT`，仅 CLI）：`url`
-`http://58.211.6.133:10420`、`mode` `advisory`、`model` `metask-jev-4b`，其余取下表默认。
-默认是一个整体：只要任一层给了自己的 `url`，默认的 `mode`/`model` 就不再继承（回到
-`shadow`、不钉模型——否则换成别的模型的服务每次咨询都会因 `ModelMismatch` 被拒）；只调
-`mode`/`timeout_ms` 而不给 `url` 的层则调的是默认服务。
+`http://58.211.6.133:10420`、`mode` `advisory`、`model` `metask-jev-4b`、`decisions`
+`["scoped_recall"]`（§7 的推荐配置：付费试点里 `recall_evidence` 抵消了召回门的增益，
+`memory_relation` 从未被咨询，`enumeration_intent` 从未越过阈值），其余取下表默认。
+默认是一个整体：只要任一层给了自己的 `url`，默认的 `mode`/`model`/`decisions` 就不再继承（回到
+`shadow`、不钉模型、四个面全开——否则换成别的模型的服务每次咨询都会因 `ModelMismatch` 被拒）；只调
+`mode`/`timeout_ms`/`decisions` 而不给 `url` 的层则调的是默认服务（例如只写
+`"decisions": ["scoped_recall", "recall_evidence"]` 就在默认服务上多开一个面）。
 这是公网上的明文 HTTP、无认证：判官看的状态（会话的一段窗口，家目录已替换）不加密地经过公网。
 不想发出去就在配置文件里写 `"jev": false`，或指向自己的服务。
 
@@ -92,7 +95,7 @@ PowerShell 给环境变量赋空串等于删除它，所以统一用 `off`）。
 | `mode` | `METACODES_JEV_MODE` | `shadow`（未指定时）或 `advisory`（内置默认） |
 | `timeout_ms`（整数） | `METACODES_JEV_TIMEOUT_MS` | 单次截止，默认 2500，范围 100–30000（8 候选判断单客户端 p50 0.91 s / p99 1.06 s，三个客户端共享服务时 p50 2.4 s；超时会退回基线并开熔断，所以给共享服务留余量） |
 | `model` | `METACODES_JEV_MODEL` | 期望的模型名（钉死）；不设则接受服务报告的任何模型 |
-| `decisions`（名字数组，或逗号分隔字符串） | `METACODES_JEV_DECISIONS`（逗号分隔） | 决策面子集：`scoped_recall`、`recall_evidence`、`memory_relation`、`enumeration_intent`（默认全部）；没列出的面行为与没有顾问完全相同；未知名或空列表会让顾问整体关闭并告警 |
+| `decisions`（名字数组，或逗号分隔字符串） | `METACODES_JEV_DECISIONS`（逗号分隔） | 决策面子集：`scoped_recall`、`recall_evidence`、`memory_relation`、`enumeration_intent`（内置默认只有 `scoped_recall`；自己给了 `url` 时默认全部）；没列出的面行为与没有顾问完全相同；未知名或空列表会让顾问整体关闭并告警 |
 
 `jev` 段里出现未知字段（例如把 `timeout_ms` 写成 `timeout`）、字段类型不对、或任一值不合法，
 顾问都整体关闭并告警，而不是按默认值猜。
@@ -358,7 +361,8 @@ scoped_recall`）。合计 $9.44。
 }
 ```
 
-默认值保持保守：不设 URL 即关闭；设了 URL 默认 `shadow`、四个面全开（只记账不改行为，
+CLI 的内置默认就是这份配置（不必再写进 config.json）。嵌入方不设 `Config.jev_builtin_default`
+时不设 URL 即关闭；任何宿主设了自己的 URL 时默认 `shadow`、四个面全开（只记账不改行为，
 用来积累后续评估数据）。
 
 后续：

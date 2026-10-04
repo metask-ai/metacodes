@@ -19,7 +19,8 @@
 //! installs it in `shadow` mode unless the layers say otherwise — the judge is
 //! asked and journaled while every host decision keeps its deterministic
 //! baseline; `mode: "advisory"` lets the documented consumer policies use the
-//! answers; `decisions` narrows it to a subset of its surfaces (default: all).
+//! answers; `decisions` narrows it to a subset of its surfaces (default: all,
+//! except that the built-in default advises `scoped_recall` only).
 //! A malformed setting, from any source, disables the advisor with a warning
 //! instead of guessing: an advisor is never worth failing a session over.
 
@@ -121,10 +122,18 @@ pub const Raw = struct {
 /// over the public network — the state it judges (a redacted window of the
 /// session) travels unencrypted; point `url` elsewhere, or empty it, to stop
 /// that.
+///
+/// Only `scoped_recall` is advised: it is the one surface the paired pilots
+/// found worth having (doc/JEV_SYSTEM_ONE.md §7). The `KgRecall` annotation
+/// cancelled the recall gate's gain in verified evidence, the relation judge
+/// was never consulted, and the enumeration judge never crossed its threshold,
+/// while each consultation is a synchronous round trip. `decisions` from
+/// config.json or the environment still replaces this list.
 pub const BUILTIN_DEFAULT: Raw = .{
     .url = "http://58.211.6.133:10420",
     .mode = "advisory",
     .model = "metask-jev-4b",
+    .decisions = "scoped_recall",
 };
 
 pub const CONFIG_KEY = "jev";
@@ -435,6 +444,7 @@ test "resolve: the built-in default applies only when the host asks, beneath fil
     try testing.expectEqual(advisor_mod.Mode.advisory, cli.settings.mode);
     try testing.expectEqualStrings("metask-jev-4b", cli.settings.expected_model.?);
     try testing.expectEqual(client_mod.DEFAULT_TIMEOUT_MS, cli.settings.timeout_ms);
+    try testing.expect(cli.settings.surfaces.eql(.initOne(.scoped_recall)));
     try testing.expectEqual(Source.default, cli.source);
     try testing.expectEqual(Source.none, (try resolveWith(a, null, false, .{})).off);
     // A config.json without the section, or with a null one, keeps the default.
@@ -446,7 +456,16 @@ test "resolve: the built-in default applies only when the host asks, beneath fil
     try testing.expectEqualStrings(BUILTIN_DEFAULT.url.?, shadow.settings.origin);
     try testing.expectEqual(advisor_mod.Mode.shadow, shadow.settings.mode);
     try testing.expectEqual(@as(u32, 4000), shadow.settings.timeout_ms);
+    try testing.expect(shadow.settings.surfaces.eql(.initOne(.scoped_recall)));
     try testing.expectEqual(Source.file, shadow.source);
+    // `decisions` from either layer replaces the default's list.
+    const file_surfaces = (try resolveWith(a, "{\"jev\":{\"decisions\":[\"scoped_recall\",\"memory_relation\"]}}", true, .{})).on;
+    try testing.expectEqualStrings(BUILTIN_DEFAULT.url.?, file_surfaces.settings.origin);
+    var scoped_and_relation: advisor_mod.Surfaces = .initOne(.scoped_recall);
+    scoped_and_relation.insert(.memory_relation);
+    try testing.expect(file_surfaces.settings.surfaces.eql(scoped_and_relation));
+    const env_surfaces = (try resolveWith(a, null, true, .{ .decisions = "recall_evidence" })).on;
+    try testing.expect(env_surfaces.settings.surfaces.eql(.initOne(.recall_evidence)));
     // ...and the env's replace both.
     const env_url = (try resolveWith(a, "{\"jev\":{\"url\":\"http://file:1\"}}", true, .{ .url = "http://env:2" })).on;
     try testing.expectEqualStrings("http://env:2", env_url.settings.origin);
@@ -460,6 +479,7 @@ test "resolve: the built-in default applies only when the host asks, beneath fil
         try testing.expectEqualStrings("http://mine:1", own.on.settings.origin);
         try testing.expectEqual(advisor_mod.Mode.shadow, own.on.settings.mode);
         try testing.expect(own.on.settings.expected_model == null);
+        try testing.expect(own.on.settings.surfaces.eql(.initFull()));
     }
     // The file alone configures an embedder, as before.
     try testing.expectEqualStrings("http://file:1", (try resolveWith(a, "{\"jev\":{\"url\":\"http://file:1\"}}", false, .{})).on.settings.origin);
