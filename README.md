@@ -245,4 +245,4 @@ metacodes 是一个可嵌入、极低资源占用、内置 coding agent loop 的
 插件可以扩展工具、MCP、provider 方言和宿主形态，但不能绕过权限、预算、形式化判定、
 TinyKG 治理与因果边界。TinyKG 采用独立维护、跨平台、哈希锁定的二进制 bundle，
 不再把源码复制进本仓库，也不会在构建时下载或隐式寻找开发目录。
-项目目前处于开源发布前准备阶段；在许可证由项目所有者明确选定前，仓库应保持私有。
+项目目前处于 public review、pre-1.0 阶段；仓库已包含 MIT 许可证，但开源发布门禁仍未全部完成，详见 [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md)。
