@@ -1,6 +1,6 @@
 # Open-source readiness
 
-The repository is prepared for review but is **not approved for public visibility**.
+The repository is currently public for review, but release readiness is **not yet complete**.
 
 ## Completed
 
@@ -18,8 +18,9 @@ The repository is prepared for review but is **not approved for public visibilit
 
 ## Blocking owner decisions
 
-- [ ] Select and add the metacodes project license. TinyKG's Apache-2.0 dependency
-      declaration does not license metacodes.
+- [x] Select and add the metacodes project license: the repository currently
+      ships an MIT license. TinyKG's Apache-2.0 dependency declaration does not
+      license metacodes.
 - [ ] Confirm organization/repository ownership and public naming.
 - [ ] Publish private security and conduct-reporting contacts.
 - [ ] Decide whether the complete extracted history is public. It has been scrubbed
@@ -62,5 +63,5 @@ The repository is prepared for review but is **not approved for public visibilit
       `metacodes-<version>-SHA256SUMS`). SBOM/provenance attestations remain
       a separate item.
 
-Removing this warning or making the repository public requires all blocking owner
+Treating the public repository as release-approved requires all blocking owner
 decisions, not merely a green build.
