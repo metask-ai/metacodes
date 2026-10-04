@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
 const psync = @import("sync.zig");
+const pfs = @import("fs.zig");
 
 // Windows spawn 串行锁。bInheritHandles=TRUE 的 CreateProcessW 会把**并发线程**同窗口期
 // 创建的全部可继承句柄(别人的管道写端/落盘句柄)一并塞给本次子进程。长命子进程(MCP
@@ -459,8 +460,16 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8, cwd: ?[]const u8) CaptureErro
     si.hStdError = null;
     var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
     const cwd_ptr: ?[*:0]u16 = if (cwd_w) |w| w.ptr else null;
-    const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, cwd_ptr, &si, &pi);
-    const create_error: u32 = if (created == .FALSE) GetLastError() else 0; // 任何后续 Win32 调用都会覆盖它
+    const inherit_handles = [_]win.HANDLE{ in_rd, out_wr };
+    const process_result = createProcessWithHandleList(cmdline.ptr, .{}, cwd_ptr, &si, &pi, &inherit_handles) catch {
+        win.CloseHandle(in_rd);
+        win.CloseHandle(in_wr);
+        win.CloseHandle(out_rd);
+        win.CloseHandle(out_wr);
+        return error.SpawnFailed;
+    };
+    const created = process_result.created;
+    const create_error = process_result.error_code;
     win.CloseHandle(in_rd); // 父端关子进程侧
     win.CloseHandle(out_wr);
     g_spawn_serial.unlock(); // 可继承句柄的父端副本已全关
@@ -482,6 +491,7 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8, cwd: ?[]const u8) CaptureErro
 pub const ProcHandle = if (is_windows) win.HANDLE else std.c.pid_t;
 
 extern "c" fn _get_osfhandle(fd: c_int) callconv(.c) usize; // MSVCRT fd → HANDLE（intptr）
+extern "c" fn _wopen(path: [*:0]const u16, oflag: c_int, ...) callconv(.c) c_int;
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) win.DWORD;
 
 /// 当前进程 pid。POSIX=getpid；Windows=GetCurrentProcessId(避开 std.c.getpid 在 windows
@@ -537,16 +547,39 @@ pub fn spawnToFilesWithEnv(
             g_spawn_serial.unlock();
             return error.SpawnFailed;
         }
+        // Give the child an explicit NUL stdin and include it in the
+        // inheritance allow-list.  A null hStdInput combined with
+        // bInheritHandles=TRUE leaves the child vulnerable to inheriting an
+        // unrelated caller pipe.
+        const nul_r = openNulRead() catch {
+            _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, 0);
+            _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
+            g_spawn_serial.unlock();
+            return error.PipeFailed;
+        };
         var si = std.mem.zeroes(win.STARTUPINFOW);
         si.cb = @sizeOf(win.STARTUPINFOW);
         si.dwFlags = win.STARTF_USESTDHANDLES;
         si.hStdOutput = out_h;
         si.hStdError = err_h;
-        si.hStdInput = null;
+        si.hStdInput = nul_r;
+        var inherit_handles: [4]win.HANDLE = undefined;
+        var inherit_count: usize = 0;
+        appendUniqueHandle(&inherit_handles, &inherit_count, out_h);
+        appendUniqueHandle(&inherit_handles, &inherit_count, err_h);
+        appendUniqueHandle(&inherit_handles, &inherit_count, nul_r);
         var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
         const cwd_ptr: ?win.LPCWSTR = if (cwd_w) |w| w.ptr else null;
-        const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{ .create_no_window = true }, null, cwd_ptr, &si, &pi);
-        const create_error: u32 = if (created == .FALSE) GetLastError() else 0; // 任何后续 Win32 调用都会覆盖它
+        const process_result = createProcessWithHandleList(cmdline.ptr, .{ .create_no_window = true }, cwd_ptr, &si, &pi, inherit_handles[0..inherit_count]) catch {
+            win.CloseHandle(nul_r);
+            _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, 0);
+            _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
+            g_spawn_serial.unlock();
+            return error.SpawnFailed;
+        };
+        const created = process_result.created;
+        const create_error = process_result.error_code;
+        win.CloseHandle(nul_r);
         _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, 0);
         _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
         g_spawn_serial.unlock();
@@ -1073,6 +1106,12 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
 const win = std.os.windows;
 
 const HANDLE_FLAG_INHERIT: win.DWORD = 0x00000001;
+// PROC_THREAD_ATTRIBUTE_HANDLE_LIST.  Passing this attribute together with
+// EXTENDED_STARTUPINFO_PRESENT makes CreateProcess inherit exactly the handles
+// listed by the caller, even when bInheritHandles is TRUE.  In particular it
+// prevents a long-lived service from retaining an unrelated caller stdout
+// pipe (which would keep that pipe from ever reaching EOF).
+const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: win.DWORD_PTR = 0x0002_0002;
 const INFINITE: win.DWORD = 0xFFFFFFFF;
 const WAIT_TIMEOUT_: win.DWORD = 0x00000102;
 
@@ -1080,6 +1119,22 @@ extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "kernel32" fn CreatePipe(hReadPipe: *win.HANDLE, hWritePipe: *win.HANDLE, lpPipeAttributes: ?*win.SECURITY_ATTRIBUTES, nSize: win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: win.DWORD, dwShareMode: win.DWORD, lpSecurityAttributes: ?*win.SECURITY_ATTRIBUTES, dwCreationDisposition: win.DWORD, dwFlagsAndAttributes: win.DWORD, hTemplateFile: ?win.HANDLE) callconv(.winapi) win.HANDLE;
 extern "kernel32" fn SetHandleInformation(hObject: win.HANDLE, dwMask: win.DWORD, dwFlags: win.DWORD) callconv(.winapi) c_int;
+extern "kernel32" fn InitializeProcThreadAttributeList(
+    lpAttributeList: ?*anyopaque,
+    dwAttributeCount: win.DWORD,
+    dwFlags: win.DWORD,
+    lpSize: *win.SIZE_T,
+) callconv(.winapi) win.BOOL;
+extern "kernel32" fn UpdateProcThreadAttribute(
+    lpAttributeList: *anyopaque,
+    dwFlags: win.DWORD,
+    attribute: win.DWORD_PTR,
+    lpValue: *const anyopaque,
+    cbSize: win.SIZE_T,
+    lpPreviousValue: ?*anyopaque,
+    lpReturnSize: ?*win.SIZE_T,
+) callconv(.winapi) win.BOOL;
+extern "kernel32" fn DeleteProcThreadAttributeList(lpAttributeList: *anyopaque) callconv(.winapi) void;
 extern "kernel32" fn ReadFile(hFile: win.HANDLE, lpBuffer: [*]u8, nToRead: win.DWORD, lpRead: *win.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
 extern "kernel32" fn WriteFile(hFile: win.HANDLE, lpBuffer: [*]const u8, nToWrite: win.DWORD, lpWritten: *win.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
 extern "kernel32" fn WaitForSingleObject(hHandle: win.HANDLE, dwMilliseconds: win.DWORD) callconv(.winapi) win.DWORD;
@@ -1089,6 +1144,89 @@ extern "kernel32" fn PeekNamedPipe(hNamedPipe: win.HANDLE, lpBuffer: ?[*]u8, nBu
 extern "kernel32" fn Sleep(dwMilliseconds: win.DWORD) callconv(.winapi) void;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
+
+const StartupInfoExW = extern struct {
+    startup_info: win.STARTUPINFOW,
+    attribute_list: ?*anyopaque,
+};
+
+const CreateProcessResult = struct {
+    created: win.BOOL,
+    error_code: u32,
+};
+
+/// Create a process with a strict inherited-handle allow-list.
+///
+/// The attribute-list storage only has to live through CreateProcessW.  Keep
+/// this helper small and synchronous so no caller can accidentally release
+/// the list while the kernel is consuming it.  The handles themselves must be
+/// inheritable; CreateProcess still enforces that requirement for entries in
+/// PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+fn createProcessWithHandleList(
+    cmdline: win.LPWSTR,
+    flags: win.CreateProcessFlags,
+    cwd: ?win.LPCWSTR,
+    startup_info: *const win.STARTUPINFOW,
+    process_info: *win.PROCESS.INFORMATION,
+    handles: []const win.HANDLE,
+) CaptureError!CreateProcessResult {
+    if (handles.len == 0) return error.SpawnFailed;
+
+    var attribute_size: win.SIZE_T = 0;
+    // The first call is expected to fail with ERROR_INSUFFICIENT_BUFFER and
+    // reports the required opaque structure size in attribute_size.
+    _ = InitializeProcThreadAttributeList(null, 1, 0, &attribute_size);
+    if (attribute_size == 0) return error.SpawnFailed;
+
+    const allocator = std.heap.page_allocator;
+    const storage = allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(@alignOf(usize)), attribute_size) catch return error.SpawnFailed;
+    defer allocator.free(storage);
+
+    const attribute_list: *anyopaque = @ptrCast(storage.ptr);
+    if (InitializeProcThreadAttributeList(attribute_list, 1, 0, &attribute_size) == .FALSE) return error.SpawnFailed;
+    defer DeleteProcThreadAttributeList(attribute_list);
+
+    const handle_bytes = handles.len * @sizeOf(win.HANDLE);
+    if (UpdateProcThreadAttribute(
+        attribute_list,
+        0,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        @ptrCast(handles.ptr),
+        handle_bytes,
+        null,
+        null,
+    ) == .FALSE) return error.SpawnFailed;
+
+    var startup_ex = StartupInfoExW{
+        .startup_info = startup_info.*,
+        .attribute_list = attribute_list,
+    };
+    // CreateProcessW interprets lpStartupInfo as STARTUPINFOEXW when
+    // EXTENDED_STARTUPINFO_PRESENT is set; the embedded STARTUPINFO.cb must
+    // therefore advertise the larger structure, per the Win32 contract.
+    startup_ex.startup_info.cb = @sizeOf(StartupInfoExW);
+    var process_flags = flags;
+    process_flags.extended_startupinfo_present = true;
+    const created = win.kernel32.CreateProcessW(
+        null,
+        cmdline,
+        null,
+        null,
+        @enumFromInt(1),
+        process_flags,
+        null,
+        cwd,
+        @ptrCast(&startup_ex),
+        process_info,
+    );
+    // Preserve the failure code before the deferred attribute-list cleanup
+    // runs; callers need the exact CreateProcessW error for cwd/exec
+    // classification.
+    return .{
+        .created = created,
+        .error_code = if (created == .FALSE) GetLastError() else 0,
+    };
+}
 
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
@@ -1184,6 +1322,27 @@ fn openNulWrite() CaptureError!win.HANDLE {
     return h;
 }
 
+/// Open an inheritable read handle for NUL (the Windows equivalent of the
+/// POSIX /dev/null stdin used by detached/background children).
+fn openNulRead() CaptureError!win.HANDLE {
+    const GENERIC_READ: win.DWORD = 0x8000_0000;
+    const FILE_SHARE_RW: win.DWORD = 0x1 | 0x2;
+    const OPEN_EXISTING: win.DWORD = 3;
+    var sa = win.SECURITY_ATTRIBUTES{ .nLength = @sizeOf(win.SECURITY_ATTRIBUTES), .lpSecurityDescriptor = null, .bInheritHandle = @enumFromInt(1) };
+    const nul_r = std.unicode.utf8ToUtf16LeStringLiteral("NUL");
+    const h = CreateFileW(nul_r, GENERIC_READ, FILE_SHARE_RW, &sa, OPEN_EXISTING, 0, null);
+    if (h == win.INVALID_HANDLE_VALUE) return error.PipeFailed;
+    return h;
+}
+
+fn appendUniqueHandle(handles: *[4]win.HANDLE, len: *usize, handle: win.HANDLE) void {
+    for (handles[0..len.*]) |existing| {
+        if (existing == handle) return;
+    }
+    handles[len.*] = handle;
+    len.* += 1;
+}
+
 fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
     // cmdline 在建任何可继承句柄之前构造(review-2 F1):可失败(argv 非法 UTF-8/OOM),
     // 若在句柄之后 early-return 会把可继承写端永久泄漏 → 后续任意 capture 永不 EOF。
@@ -1242,22 +1401,48 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
         in_rd = rd;
         in_wr = wr;
     }
+    var stdin_nul: ?win.HANDLE = null;
+    if (in_rd == null) {
+        stdin_nul = openNulRead() catch {
+            win.CloseHandle(out_rd);
+            win.CloseHandle(out_wr);
+            if (err_rd) |h| win.CloseHandle(h);
+            win.CloseHandle(err_wr);
+            return error.PipeFailed;
+        };
+    }
 
     var si = std.mem.zeroes(win.STARTUPINFOW);
     si.cb = @sizeOf(win.STARTUPINFOW);
     si.dwFlags = win.STARTF_USESTDHANDLES;
     si.hStdOutput = out_wr;
     si.hStdError = err_wr;
-    si.hStdInput = in_rd; // null → 子进程无 stdin（inherit_env 在 Windows 恒继承 env，此为 stdin）
+    si.hStdInput = if (in_rd) |h| h else stdin_nul; // 无输入时接 NUL，禁止继承调用方 stdin
+    var inherit_handles: [4]win.HANDLE = undefined;
+    var inherit_count: usize = 0;
+    appendUniqueHandle(&inherit_handles, &inherit_count, out_wr);
+    appendUniqueHandle(&inherit_handles, &inherit_count, err_wr);
+    appendUniqueHandle(&inherit_handles, &inherit_count, si.hStdInput.?);
 
     var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
     const cwd_ptr: ?win.LPCWSTR = if (cwd_w) |w| w.ptr else null;
-    const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, cwd_ptr, &si, &pi);
-    const create_error: u32 = if (created == .FALSE) GetLastError() else 0; // 任何后续 Win32 调用都会覆盖它
+    const process_result = createProcessWithHandleList(cmdline.ptr, .{}, cwd_ptr, &si, &pi, inherit_handles[0..inherit_count]) catch {
+        win.CloseHandle(out_rd);
+        win.CloseHandle(out_wr);
+        if (err_rd) |h| win.CloseHandle(h);
+        win.CloseHandle(err_wr);
+        if (in_rd) |h| win.CloseHandle(h);
+        if (in_rd != null) win.CloseHandle(in_wr);
+        if (stdin_nul) |h| win.CloseHandle(h);
+        return error.SpawnFailed;
+    };
+    const created = process_result.created;
+    const create_error = process_result.error_code;
     // 父端**先**关掉全部可继承句柄副本(out_wr/in_rd/err_wr)再解串行锁——锁窗口 = 可继承
     // 句柄存活期。stdin 写(in_wr 不可继承)移到锁外,大输入阻塞不占全局锁。
     win.CloseHandle(out_wr);
     if (in_rd) |h| win.CloseHandle(h); // 父端关 stdin read 端（子已继承副本）
+    if (stdin_nul) |h| win.CloseHandle(h);
     win.CloseHandle(err_wr); // err_wr 恒有效(pipe wr 或 NUL),父端副本总要关
     g_spawn_serial.unlock();
     spawn_locked = false;
@@ -1862,6 +2047,36 @@ test "spawnService: the service writes to the log, has no terminal, outlives the
     defer _ = std.c.close(null_fd);
     try std.testing.expectError(error.ChildExecFailed, spawnService(bad, null_fd));
     try std.testing.expectEqual(SpawnStep.exec, (takeLastSpawnFailure() orelse return error.TestExpectedSpawnFailure).step);
+}
+
+test "spawnService Windows allow-list does not retain caller pipe handles" {
+    if (!is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+
+    // Keep an unrelated inheritable write end open while spawnService creates
+    // a long-lived child.  Before PROC_THREAD_ATTRIBUTE_HANDLE_LIST was used,
+    // that child retained the write end and the parent could not observe EOF.
+    var probe_rd: win.HANDLE = undefined;
+    var probe_wr: win.HANDLE = undefined;
+    var sa = win.SECURITY_ATTRIBUTES{ .nLength = @sizeOf(win.SECURITY_ATTRIBUTES), .lpSecurityDescriptor = null, .bInheritHandle = @enumFromInt(1) };
+    try std.testing.expect(CreatePipe(&probe_rd, &probe_wr, &sa, 0) != 0);
+    defer win.CloseHandle(probe_rd);
+    try std.testing.expect(SetHandleInformation(probe_rd, HANDLE_FLAG_INHERIT, 0) != 0);
+
+    // NUL is a fixed ASCII device path and is safe to open through the CRT;
+    // spawnService consumes the fd through _get_osfhandle on Windows.
+    const nul_path = std.unicode.utf8ToUtf16LeStringLiteral("NUL");
+    const log_fd = _wopen(nul_path, 0x0001);
+    try std.testing.expect(log_fd >= 0);
+    defer pfs.close(log_fd);
+    const argv: []const ?[*:0]const u8 = &.{ "cmd.exe", "/c", "ping -n 10 127.0.0.1 >NUL", null };
+    try spawnService(argv, log_fd);
+
+    // Closing our copy should immediately break the read side while the
+    // service remains alive.  PeekNamedPipe reports failure for a broken pipe;
+    // success with zero bytes means another process still owns the write end.
+    win.CloseHandle(probe_wr);
+    var available: win.DWORD = 0;
+    try std.testing.expect(PeekNamedPipe(probe_rd, null, 0, null, &available, null) == 0);
 }
 
 test "buildWindowsCmdline quoting" {
