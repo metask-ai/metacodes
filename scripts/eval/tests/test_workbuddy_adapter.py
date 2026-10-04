@@ -3894,8 +3894,12 @@ with tempfile.TemporaryDirectory() as directory:
     def exec_for(logs):
         async def fake_exec(environment, command, env, cwd):
             captured["command"] = command
-            # The container-side export lands on the bind mount.
+            # The container-side export lands on the bind mount, with the
+            # in-container deep probe's verdict beside it (the v42 export
+            # gate advances the chain only on rc 0; the failing probe has its
+            # own test below).
             (logs / "kg-export.tar").write_bytes(exports[logs])
+            (logs / "kg-export-probe.rc").write_text("0", encoding="utf-8")
         return fake_exec
     agent1 = make_agent(logs1)
     exports[logs1] = export1

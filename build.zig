@@ -2510,6 +2510,14 @@ pub fn build(b: *std.Build) void {
                 test_step.dependOn(&memory_runtime_smoke.step);
             }
         }
+        // The native REPL smoke (scripts/eval/tests/test_native_runtime.py)
+        // drives the installed product against a loopback provider; it hands
+        // the evaluation metadata over inherited descriptors (pass_fds), so
+        // it is POSIX-only like the memory runtime smoke.
+        if (@import("builtin").os.tag != .windows) {
+            eval_test_cmd.step.dependOn(b.getInstallStep());
+            eval_test_cmd.setEnvironmentVariable("METACODES_NATIVE_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
+        }
         // The native project-Harness suites (E3 runtime and templates, the
         // E2 evolution lifecycle, the calibration matrix) run the installed
         // product, both zero-provider drivers, the project kernel and the

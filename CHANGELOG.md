@@ -200,6 +200,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- The WorkBuddy installed-adapter suites run in CI: the Linux and macOS gates
+  provision the pinned WorkBuddy-Bench checkout
+  (`scripts/eval/workbuddy/provision_checkout.sh`: pinned commit, this
+  repository's overlay, `uv sync --frozen`) and `zig build test` inherits
+  `METACODES_WORKBUDDY_CHECKOUT`. They had always skipped, and the memory
+  continuity test had gone stale behind them: its stub container never wrote
+  the export probe verdict the v42 export gate requires, so every trial
+  degraded. The native REPL smoke (`test_native_runtime.py`) now gets the
+  installed product on POSIX instead of skipping.
 - The native project-Harness suites (E3 runtime and templates, E2 evolution,
   the calibration matrix) run in `zig build test` whenever the project kernel
   is built (POSIX); they had skipped everywhere, and three regressions had
