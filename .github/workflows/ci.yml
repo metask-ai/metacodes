@@ -181,6 +181,21 @@ jobs:
           for module in sync fs rng paths signal process net dir exe_lookup; do
             zig test "src/platform/${module}.zig" -lc
           done
+      # The installed-adapter WorkBuddy suites (scripts/eval/tests/
+      # test_workbuddy_adapter.py) run the overlay inside the real pinned
+      # WorkBuddy-Bench, against its locked environment; without a checkout
+      # they skip. provision_checkout.sh fetches the pinned commit, installs
+      # this repository's overlay and `uv sync`s it; the suite below inherits
+      # METACODES_WORKBUDDY_CHECKOUT through zig build.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.19"
+      - name: Provision the pinned WorkBuddy-Bench checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          checkout=$(scripts/eval/workbuddy/provision_checkout.sh "$RUNNER_TEMP/workbuddy-bench")
+          echo "METACODES_WORKBUDDY_CHECKOUT=$checkout" >> "$GITHUB_ENV"
       - name: Full offline test suite
         env:
           # Both legs build control-plane/lean above, so a missing/mislocated

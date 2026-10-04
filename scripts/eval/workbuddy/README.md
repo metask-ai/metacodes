@@ -10,6 +10,18 @@ Install the idempotent overlay:
 python3 -m scripts.eval.workbuddy.install_overlay /path/to/workbuddy-bench
 ```
 
+The installed-adapter tests (`scripts/eval/tests/test_workbuddy_adapter.py`)
+run the overlay inside a real pinned checkout and skip without one. Provision
+one (git, python3 and uv; it fetches the commit and the packages `uv.lock` pins)
+and point the suite at it; CI does the same before `zig build test`:
+
+```bash
+export METACODES_WORKBUDDY_CHECKOUT=$(scripts/eval/workbuddy/provision_checkout.sh /tmp/workbuddy-bench)
+```
+
+`--source <git url or path>` fetches the pinned commit from a local mirror
+instead of GitHub.
+
 Stage production `linux/amd64` artifacts with explicit source and license
 provenance. The stager parses every ELF header and rejects ARM64 or mixed-arch
 inputs before creating the output directory:
