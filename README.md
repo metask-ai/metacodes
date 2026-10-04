@@ -11,11 +11,10 @@ pinned into the executable (`release/LAYOUT.md`). Runtime resolution checks the
 environment-variable pair first, then the adjacent file with its compiled-in
 digest, and `metacodes doctor` reports every runtime asset and the state root.
 
-> Repository status: pre-publication, pre-1.0 (version declared in
-> `build.zig.zon`). The history has been extracted from the original monorepo,
-> but the project license is still an owner decision. Keep the repository
-> private until [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md) is
-> cleared. Project status is tracked as milestones in [ROADMAP.md](ROADMAP.md).
+> Repository status: public review, pre-1.0 (version declared in
+> `build.zig.zon`). The repository currently includes an MIT license. Release
+> readiness is still tracked as milestones and remaining owner decisions in
+> [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md) and [ROADMAP.md](ROADMAP.md).
 
 ## Why metacodes
 
