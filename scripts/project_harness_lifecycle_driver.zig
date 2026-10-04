@@ -184,6 +184,10 @@ fn prepare(init: std.process.Init, allocator: std.mem.Allocator, options: Option
     const correction = correctionFor(options.rule_flavor);
     try cc.util_fs.mkdirParents(project_root);
     try cc.util_fs.mkdirParents(home_root);
+    // The product's state root for this home: what a binary with no install
+    // record and no override resolves to, and what the runtime phase and
+    // loadPrepare expect the candidate session under.
+    const state_root = try cc.util_state_root.legacyDefault(allocator, home_root);
     const sid = cc.session_id.SessionId.fromSlice(CORRECTION_SID).?;
     var conversation = cc.conversation.Conversation.init(allocator);
     defer conversation.deinit();
@@ -191,7 +195,7 @@ fn prepare(init: std.process.Init, allocator: std.mem.Allocator, options: Option
     var writer = try cc.transcript.Writer.init(
         allocator,
         project_root,
-        home_root,
+        state_root,
         if (options.rule_flavor == .evolved) "e2-zero-provider" else "e3-static-template",
         sid,
     );
@@ -231,6 +235,7 @@ fn prepare(init: std.process.Init, allocator: std.mem.Allocator, options: Option
     var ctx = cc.tool_context.ToolContext.simple(allocator);
     ctx.cwd_abs = project_root;
     ctx.home_dir = home_root;
+    ctx.state_root = state_root;
     ctx.tool_observer = journal.sink();
     const read_outcome = try cc.tool_exec.executeOne(
         &ctx,
@@ -251,8 +256,8 @@ fn prepare(init: std.process.Init, allocator: std.mem.Allocator, options: Option
     var candidate_name: [96]u8 = undefined;
     const file_name = try cc.rule_candidate.fileName(candidate.candidate_id, &candidate_name);
     const candidate_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ writer.dir, file_name });
-    const state_root = std.fs.path.dirname(writer.dir) orelse return error.InvalidSessionDirectory;
-    const rules_dir = try std.fmt.allocPrint(allocator, "{s}/project-rules", .{state_root});
+    const project_dir = std.fs.path.dirname(writer.dir) orelse return error.InvalidSessionDirectory;
+    const rules_dir = try std.fmt.allocPrint(allocator, "{s}/project-rules", .{project_dir});
     const result = PrepareResult{
         .rule_flavor = @tagName(options.rule_flavor),
         .project_root = project_root,
@@ -364,8 +369,8 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
 
     const protected_path = try std.fmt.allocPrint(allocator, "{s}/protected.txt", .{prepared.project_root});
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = protected_path, .data = "old" });
-    const state_root = std.fs.path.dirname(prepared.session_dir) orelse return error.InvalidSessionDirectory;
-    const runtime_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ state_root, RUNTIME_SID });
+    const project_dir = std.fs.path.dirname(prepared.session_dir) orelse return error.InvalidSessionDirectory;
+    const runtime_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ project_dir, RUNTIME_SID });
     try cc.util_fs.mkdirParents(runtime_dir);
     const runtime_sid = cc.session_id.SessionId.fromSlice(RUNTIME_SID).?;
     const control = try cc.project_rule_activation.RunControl.init(
@@ -380,6 +385,7 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
     var ctx = cc.tool_context.ToolContext.simple(allocator);
     ctx.cwd_abs = prepared.project_root;
     ctx.home_dir = prepared.home_root;
+    ctx.state_root = try cc.util_state_root.legacyDefault(allocator, prepared.home_root);
     ctx.tool_observer = control.observer();
     ctx.project_rule_gate = control.formalGate();
     const write_input = try std.json.Stringify.valueAlloc(allocator, .{
@@ -717,7 +723,9 @@ fn replayCases(flavor: RuleFlavor) [5]cc.rule_evaluation.ReplayCase {
                 .agent_depth = 0,
                 .authoritative = true,
             } } },
-            .{ .case_id = "oversized-write-blocked", .expected_admit = false, .signal = .{ .pre = .{
+            // A verify-only rule's bounds are an envelope, not a verdict
+            // (45201f9e): exceeding them is observed, never blocked.
+            .{ .case_id = "oversized-write-admitted-overflow-observed", .expected_admit = true, .signal = .{ .pre = .{
                 .tool = "Write",
                 .input_bytes = 8193,
                 .agent_depth = 0,
@@ -893,20 +901,20 @@ fn loadPrepare(
         try std.fmt.allocPrint(allocator, "{s}/home", .{options.root});
     const expected_project_sha256 = cc.project_rule_bundle.projectIdentity(expected_project);
     const cwd_hash = cc.transcript.hashCwd(expected_project);
-    const expected_state_root = try std.fmt.allocPrint(
+    const expected_project_dir = try std.fmt.allocPrint(
         allocator,
-        "{s}/.metacodes/projects/{s}",
-        .{ expected_home, cwd_hash[0..] },
+        "{s}/projects/{s}",
+        .{ try cc.util_state_root.legacyDefault(allocator, expected_home), cwd_hash[0..] },
     );
     const expected_session = try std.fmt.allocPrint(
         allocator,
         "{s}/{s}",
-        .{ expected_state_root, CORRECTION_SID },
+        .{ expected_project_dir, CORRECTION_SID },
     );
     const expected_rules = try std.fmt.allocPrint(
         allocator,
         "{s}/project-rules",
-        .{expected_state_root},
+        .{expected_project_dir},
     );
     const candidate_id = parseHex(parsed.candidate_id) orelse return error.InvalidPrepareResult;
     _ = parseHex(parsed.source_receipt_id) orelse return error.InvalidPrepareResult;

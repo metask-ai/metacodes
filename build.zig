@@ -369,6 +369,27 @@ fn findLake(b: *std.Build) ?[]const u8 {
     return b.findProgram(&.{"lake"}, &.{b.pathJoin(&.{ home, ".elan", "bin" })}) catch null;
 }
 
+/// The pinned toolchain's own `lake` behind elan's proxy: `elan which lake`
+/// inside control-plane/lean resolves its lean-toolchain pin. The native
+/// project-Harness suites pin every artifact they run by digest and refuse a
+/// multi-link file, which the proxy is. Null when `lake` is not elan's (a
+/// `$LAKE` or PATH lake is used as found) or elan cannot answer.
+fn toolchainLake(b: *std.Build, lake: []const u8) ?[]const u8 {
+    const dir = std.fs.path.dirname(lake) orelse return null;
+    const elan_name = if (b.graph.host.result.os.tag == .windows) "elan.exe" else "elan";
+    const elan = b.pathJoin(&.{ dir, elan_name });
+    const result = std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ elan, "which", "lake" },
+        .cwd = .{ .path = b.pathFromRoot("control-plane/lean") },
+    }) catch return null;
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    const path = std.mem.trim(u8, result.stdout, " \t\r\n");
+    return if (path.len == 0) null else path;
+}
+
 /// The bash the kernel scripts run under. On Windows it must be Git Bash
 /// (MSYS2): the scripts take Windows paths and build a Windows kernel, but the
 /// `bash` cmd finds first is often WSL's launcher (System32\bash.exe or the
@@ -2489,6 +2510,47 @@ pub fn build(b: *std.Build) void {
                 test_step.dependOn(&memory_runtime_smoke.step);
             }
         }
+        // The native project-Harness suites (E3 runtime and templates, the
+        // E2 evolution lifecycle, the calibration matrix) run the installed
+        // product, both zero-provider drivers, the project kernel and the
+        // toolchain's own lake against loopback providers. Unwired, they
+        // skipped everywhere while the driver, a replay case and both
+        // analyzers drifted from the product for weeks. POSIX only, like the
+        // memory runtime smoke above: their fixtures use POSIX paths and modes.
+        // On Linux the rule builder isolates Lean in bubblewrap, so a host
+        // without bwrap leaves them to skip; CI installs it.
+        const rule_sandbox_available = switch (@import("builtin").os.tag) {
+            .windows => false,
+            .linux => if (b.findProgram(&.{"bwrap"}, &.{})) |_| true else |_| false,
+            else => true,
+        };
+        if (rule_sandbox_available) if (staged_lean_kernels.project != null) {
+            wireLeanKernelTestInputs(eval_test_cmd, staged_lean_kernels);
+            // The installed layout, not the cached artifact: the runner
+            // resolves rg and the kernels beside the executable.
+            eval_test_cmd.step.dependOn(b.getInstallStep());
+            eval_test_cmd.step.dependOn(&install_project_harness_eval_driver.step);
+            eval_test_cmd.step.dependOn(&install_project_harness_lifecycle_driver.step);
+            eval_test_cmd.setEnvironmentVariable(
+                "METACODES_TEST_PROJECT_HARNESS_PRODUCTION_BIN",
+                b.getInstallPath(.bin, exe.out_filename),
+            );
+            eval_test_cmd.setEnvironmentVariable(
+                "METACODES_TEST_PROJECT_HARNESS_DRIVER",
+                b.getInstallPath(.bin, project_harness_eval_driver.out_filename),
+            );
+            eval_test_cmd.setEnvironmentVariable(
+                "METACODES_TEST_PROJECT_HARNESS_LIFECYCLE_DRIVER",
+                b.getInstallPath(.bin, project_harness_lifecycle_driver.out_filename),
+            );
+            // A staged project kernel means a lake built control-plane/lean,
+            // so the compiled SDK is there: its absence is a failure, not a
+            // reason to skip. With -Dlean-kernels=on and no toolchain the
+            // kernel is a failing step this run already depends on.
+            if (findLake(b)) |lake|
+                eval_test_cmd.setEnvironmentVariable("METACODES_TEST_PROJECT_LAKE_PATH", toolchainLake(b, lake) orelse lake);
+            eval_test_cmd.setEnvironmentVariable("METACODES_TEST_REQUIRE_LEAN_SDK", "1");
+        };
     }
 
     // ------------------------------------------------------------------

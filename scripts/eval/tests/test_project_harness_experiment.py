@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts.eval import project_harness_e3_experiment
+from scripts.eval import project_harness_experiment
 from scripts.eval.project_harness_experiment import (
     ARMS,
     CASES,
@@ -16,6 +18,93 @@ from scripts.eval.project_harness_experiment import (
     freeze_manifest,
     run_calibration,
 )
+
+
+def _zig_formal_batch_schema() -> str:
+    zig = (Path(__file__).resolve().parents[3] / "src" / "tools" / "observation.zig").read_text(
+        encoding="utf-8"
+    )
+    for line in zig.splitlines():
+        if line.startswith("pub const FORMAL_BATCH_SCHEMA_VERSION ="):
+            return line.split('"')[1]
+    raise AssertionError("observation.zig declares no FORMAL_BATCH_SCHEMA_VERSION")
+
+
+def _write_signal_rollout(root: Path, extra_events=()) -> Path:
+    """A bound signal-only rollout; `extra_events` are tool observations
+    inserted after the dispatch. Returns the driver-result path."""
+    run = root / "run"
+    session = run / "0123456789abcdef01234567"
+    session.mkdir(parents=True)
+    journal = session / "tool-observations.jsonl"
+    events = [
+        {"run_started": {"started_wall_ns": 1}},
+        {"tool_observation": {"dispatch_started": {
+            "id": "attempt-1",
+            "requested_name": "Write",
+            "dispatched_name": "Write",
+            "origin": "authoritative",
+            "agent_depth": 0,
+        }}},
+        {"tool_observation": {"dispatch_finished": {
+            "id": "attempt-1",
+            "requested_name": "Write",
+            "dispatched_name": "Write",
+            "origin": "authoritative",
+            "agent_depth": 0,
+            "outcome": "tool_error",
+            "effect": None,
+            "effect_valid": True,
+        }}},
+        *({"tool_observation": event} for event in extra_events),
+        {"run_finished": {"stop_reason": "end_turn", "finished_wall_ns": 2}},
+    ]
+    records = [
+        {
+            "schema_version": "metacodes-tool-observation-journal-v1",
+            "sequence": sequence,
+            "monotonic_elapsed_ns": sequence,
+            "session_id": "0123456789abcdef01234567",
+            "run_id": "fedcba9876543210fedcba98",
+            "event": event,
+        }
+        for sequence, event in enumerate(events)
+    ]
+    journal.write_bytes(
+        b"".join(
+            json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+            for record in records
+        )
+    )
+    result_path = run / "driver-result.json"
+    project_sha = hashlib.sha256(
+        b"metacodes-project-identity-v1\x00" + os.fsencode(str(run))
+    ).hexdigest()
+    result_path.write_text(json.dumps({
+        "schema_version": "metacodes-project-harness-zero-paid-rollout-v2",
+        "quality_evidence": False,
+        "provider_requests": 0,
+        "paid_cost_usd": 0,
+        "arm": "signal_only",
+        "case": "existing_overwrite",
+        "oracle_class": "hazard",
+        "project_sha256": project_sha,
+        "candidate_sha256": None,
+        "rule_spec_sha256": None,
+        "bundle_sha256": None,
+        "kernel_sha256": "b" * 64,
+        "session_id": "0123456789abcdef01234567",
+        "run_id": "fedcba9876543210fedcba98",
+        "first_sequence": 0,
+        "last_sequence": len(records) - 1,
+        "journal_sha256": hashlib.sha256(journal.read_bytes()).hexdigest(),
+        "first_tool_error": True,
+        "host_fatal": False,
+        "task_success": False,
+        "recovery_attempted": False,
+        "artifact_paths": {"journal": str(journal), "result": str(result_path)},
+    }), encoding="utf-8")
+    return result_path
 
 
 class ProjectHarnessExperimentTest(unittest.TestCase):
@@ -36,6 +125,50 @@ class ProjectHarnessExperimentTest(unittest.TestCase):
                     kernel,
                     arms=ARMS[:-1],
                 )
+
+    def test_current_batch_schema_matches_zig_emitter(self) -> None:
+        # Both analyzers stood at v5 for seven weeks after the emitter moved
+        # to v6 (RRP-001): every real rollout failed with "schema drift" or
+        # "mixed legacy/current formal authority" while the fixture tests,
+        # which spell the schema themselves, stayed green.
+        emitted = _zig_formal_batch_schema()
+        for module in (project_harness_experiment, project_harness_e3_experiment):
+            with self.subTest(module=module.__name__):
+                self.assertEqual(emitted, module.CURRENT_FORMAL_BATCH_SCHEMA)
+                self.assertIn(emitted, module.FILTER_BINDING_BATCH_SCHEMAS)
+                self.assertIn(
+                    "metacodes-project-formal-decision-batch-v5",
+                    module.FILTER_BINDING_BATCH_SCHEMAS,
+                )
+
+    def test_formal_batch_schema_is_checked_before_it_is_trusted(self) -> None:
+        batch = {
+            "dispatch_id": "attempt-1",
+            "phase": "pre",
+            "decisions": [{"result": "admit"}],
+        }
+        cases = (
+            ({**batch, "schema_version": "metacodes-project-formal-decision-batch-v7"}, "schema drift"),
+            (
+                {**batch, "schema_version": project_harness_experiment.CURRENT_FORMAL_BATCH_SCHEMA},
+                "lacks within_root",
+            ),
+            (
+                {
+                    **batch,
+                    "schema_version": project_harness_experiment.CURRENT_FORMAL_BATCH_SCHEMA,
+                    "within_root": "yes",
+                },
+                "lacks within_root",
+            ),
+        )
+        for event, message in cases:
+            with self.subTest(message=message, schema=event["schema_version"]):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    result_path = _write_signal_rollout(root, [{"formal_decision_batch": event}])
+                    with self.assertRaisesRegex(CalibrationError, message):
+                        analyze_rollout(root, result_path)
 
     def test_signal_only_rollout_is_derived_from_bound_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

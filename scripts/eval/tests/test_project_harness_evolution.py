@@ -24,8 +24,8 @@ class ProjectHarnessEvolutionTest(unittest.TestCase):
     def _require_built_lean_sdk(self) -> None:
         # freeze_manifest 冻结的是 checked-in 源加上已编译 SDK olean;干净 checkout
         # 未构建 control-plane/lean 时按环境缺失显式 skip,与本文件其它 native 门一致。
-        # CI 在运行本套件前用 leanprover/lean-action 构建,并设
-        # METACODES_TEST_REQUIRE_LEAN_SDK=1 把缺失升级为失败,防止路径漂移把
+        # `zig build test` 构建了 project 内核时(其 lake build 同时产出 SDK)
+        # 设 METACODES_TEST_REQUIRE_LEAN_SDK=1,把缺失升级为失败,防止路径漂移把
         # 这两个测试永久变成 skip 却仍显示绿色。
         if not _SDK_OLEAN.is_file():
             message = (

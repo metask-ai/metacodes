@@ -108,7 +108,12 @@ MAX_KERNEL_RUNTIME_DEPENDENCIES = 64
 E3_MIN_ROLLOUT_COST_USD = 0.90
 E3_MIN_ROLLOUT_METERED_TOKENS = 300_000
 E3_ROLLOUT_TIMEOUT_SECONDS = 300
-CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v5"
+CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v6"
+# The rule-filter era (v5 on): a batch binds to its rule filter. v6 adds the
+# batch's `within_root` (RRP-001) and changes nothing the analysis reads.
+FILTER_BINDING_BATCH_SCHEMAS = frozenset(
+    {"metacodes-project-formal-decision-batch-v5", CURRENT_FORMAL_BATCH_SCHEMA}
+)
 RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
 RULE_FILTER_PROOF = "MetaCodesControl.ProjectRule.target_mismatch_admits_both"
 COMMITTED_BUDGET_RECEIPT_FIELDS = frozenset(
@@ -1689,7 +1694,7 @@ def analyze_journal(
                 )
                 normalized_batch.append(normalized)
                 formal.append(normalized)
-            if batch.get("schema_version") == CURRENT_FORMAL_BATCH_SCHEMA:
+            if batch.get("schema_version") in FILTER_BINDING_BATCH_SCHEMAS:
                 filter_operations = {
                     "exact_edit_recovery"
                     if str(item.get("operation", "")).startswith("recovery_")
@@ -1797,14 +1802,14 @@ def analyze_journal(
             by_dispatch.setdefault(dispatch_id, []).append(decision)
 
         modern_filter_contract = bool(filters) or any(
-            call.get("schema_version") == CURRENT_FORMAL_BATCH_SCHEMA
+            call.get("schema_version") in FILTER_BINDING_BATCH_SCHEMAS
             for call in checker_calls
         )
         if modern_filter_contract:
-            if any(
-                call.get("schema_version") != CURRENT_FORMAL_BATCH_SCHEMA
-                for call in checker_calls
-            ):
+            # One binary writes one schema: every call is of the filter era,
+            # and all of them of the same version.
+            call_schemas = {call.get("schema_version") for call in checker_calls}
+            if not call_schemas <= FILTER_BINDING_BATCH_SCHEMAS or len(call_schemas) > 1:
                 raise E3Error("project-Harness mixed legacy/current formal authority")
             for key, item in filters.items():
                 checker_count = int(item["checker_rule_count"])

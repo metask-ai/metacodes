@@ -106,6 +106,24 @@ jobs:
               sudo apt-get install -y ripgrep
             fi
           fi
+      # scripts/build_project_rule.py isolates a candidate rule's Lean build in
+      # bubblewrap on Linux (sandbox-exec on macOS); the native project-Harness
+      # suites `zig build test` wires when bwrap is present exercise it.
+      # Ubuntu 24.04 confines unprivileged user namespaces through AppArmor,
+      # so bwrap needs that lifted; the smoke runs the builder's own flags so
+      # a broken sandbox fails here instead of deep in the suite.
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sandbox=(--unshare-all --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp)
+          runtime=(--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64)
+          bwrap "${sandbox[@]}" "${runtime[@]}" /bin/true
       # PyYAML for scripts/eval/workbuddy and its tests (requirements-dev.txt).
       # --break-system-packages: the hosted images' system Python is PEP 668
       # "externally managed"; the runner is ephemeral so there is nothing to
