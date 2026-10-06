@@ -129,13 +129,7 @@ pub const StateSource = struct {
         // 锁内 dup 值语义)。attach 客户端由此见 attach 前 mid-session 已有 task,不再只靠 tasks_changed 增量。
         const TaskView = struct { id: []const u8, subject: []const u8, state: []const u8 };
         const raw_tasks = self.app.tasks.snapshotTasks(allocator) catch &.{};
-        defer {
-            for (raw_tasks) |t| {
-                allocator.free(t.id);
-                allocator.free(t.subject);
-            }
-            if (raw_tasks.len > 0) allocator.free(raw_tasks);
-        }
+        defer @import("../core/task_store.zig").TaskStore.freeTaskViews(allocator, raw_tasks);
         var task_views: []TaskView = &.{};
         if (raw_tasks.len > 0) task_views = allocator.alloc(TaskView, raw_tasks.len) catch &.{};
         defer if (task_views.len > 0) allocator.free(task_views);

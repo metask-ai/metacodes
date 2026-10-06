@@ -16,6 +16,7 @@ const provider_mod = @import("../api/provider.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const UsageDelta = @import("../api/stream.zig").UsageDelta;
 const utf8 = @import("../util/utf8.zig");
+const task_store = @import("task_store.zig");
 
 const DEFAULT_COMPACT_SYSTEM = @embedFile("templates/compact/prompt.md");
 const DEFAULT_SUMMARY_PREFIX = @embedFile("templates/compact/summary_prefix.md");
@@ -234,29 +235,59 @@ pub fn applySummaryPrefix(allocator: std.mem.Allocator, summary_suffix: []const 
     return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ trimRightAscii(prefix, " \t\r\n"), summary_suffix });
 }
 
+/// 锚里点名续做的进行中任务上限(锚要小)。
+const ANCHOR_MAX_ACTIVE: usize = 3;
+/// 更早仍进行中的任务只列 id,最多列这么多个。
+const ANCHOR_MAX_OLDER_IDS: usize = 10;
+
 /// 任务锚:把本 session 进行中的任务确定性写进 compact 摘要(不依赖模型自觉保留)。
 /// compact 最容易丢的就是"我正在做哪个任务、做完要闭合"的闭环纪律——摘要有损,
-/// 锚是硬保底。无 in_progress 任务 → null。返回 owned。
-pub fn buildTaskAnchor(allocator: std.mem.Allocator, tasks: *@import("task_store.zig").TaskStore) ?[]u8 {
-    var out = std.ArrayList(u8).empty;
-    var count: usize = 0;
-    for (tasks.tasks.items) |t| {
-        if (t.status != .in_progress) continue;
-        if (count >= 3) break; // 锚要小:最多 3 条
-        count += 1;
-        out.appendSlice(allocator, "- ") catch break;
-        out.appendSlice(allocator, t.id) catch break;
-        out.appendSlice(allocator, " ") catch break;
-        out.appendSlice(allocator, t.subject) catch break;
-        out.append(allocator, '\n') catch break;
-    }
+/// 锚是硬保底。点名续做的是**最近认领**的 ANCHOR_MAX_ACTIVE 个:开了没关的旧任务总在
+/// 清单最前,按清单顺序取会把它们当"继续推进"的对象复活(2026-10-06 sanmou-engine
+/// 会话:锚里是三个早被取代的任务,当前任务不在其中)。更早的只列 id 并给闭合指引,
+/// 最老的先列(最可能已被取代)。只看本 agent 认领的行:降级镜像按仓库共享,别的会话或
+/// 队友认领的行不能被点名续做或建议关闭。无 in_progress 任务 → null。返回 owned。
+pub fn buildTaskAnchor(allocator: std.mem.Allocator, tasks: *task_store.TaskStore) ?[]u8 {
+    // 自己的在前(最近认领在前),之后是别人租约已过期的:后者单独列出、只提示先重新认领,
+    // 绝不点名续做或建议直接关闭——那可能是别人还在做、只是没续租的工作。
+    const active = tasks.snapshotOwnInProgress(allocator) catch return null;
+    defer task_store.TaskStore.freeTaskViews(allocator, active);
+    if (active.len == 0) return null;
+
+    var own: usize = 0;
+    while (own < active.len and !active[own].expired_claim) own += 1;
+    const named = @min(own, ANCHOR_MAX_ACTIVE);
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    if (count == 0) return null;
-    return std.fmt.allocPrint(
-        allocator,
-        "\n\n## Active tasks(compact 任务锚)\n{s}继续推进以上进行中的任务;完成后用 TaskUpdate(status=completed)闭合,不要遗忘。",
-        .{out.items},
-    ) catch null;
+    out.appendSlice(allocator, "\n\n## Active tasks(compact 任务锚)") catch return null;
+    if (named > 0) {
+        out.append(allocator, '\n') catch return null;
+        for (active[0..named]) |v| {
+            out.print(allocator, "- {s} {s}\n", .{ v.id, v.subject }) catch return null;
+        }
+        out.appendSlice(allocator, "继续推进以上进行中的任务;完成后用 TaskUpdate(status=completed)闭合,不要遗忘。") catch return null;
+    }
+    if (own > named) {
+        out.appendSlice(allocator, "\n更早置为进行中、仍未闭合的任务:") catch return null;
+        appendIdsOldestFirst(&out, allocator, active[named..own]) catch return null;
+        out.appendSlice(allocator, "。" ++ task_store.STALE_TASK_GUIDANCE) catch return null;
+    }
+    if (active.len > own) {
+        out.appendSlice(allocator, "\n其它会话或队友认领、已过租约期的任务:") catch return null;
+        appendIdsOldestFirst(&out, allocator, active[own..]) catch return null;
+        out.appendSlice(allocator, "。" ++ task_store.EXPIRED_CLAIM_GUIDANCE) catch return null;
+    }
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+/// 按认领从旧到新列 id(views 是新 → 旧;最老的最可能已过时),最多 ANCHOR_MAX_OLDER_IDS 个。
+fn appendIdsOldestFirst(out: *std.ArrayList(u8), allocator: std.mem.Allocator, newest_first: []const task_store.TaskStore.TaskView) !void {
+    const listed = @min(newest_first.len, ANCHOR_MAX_OLDER_IDS);
+    for (0..listed) |n| {
+        if (n > 0) try out.appendSlice(allocator, "、");
+        try out.appendSlice(allocator, newest_first[newest_first.len - 1 - n].id);
+    }
+    if (newest_first.len > listed) try out.print(allocator, "(另有 {d} 个较新的未列出)", .{newest_first.len - listed});
 }
 
 /// 把任务锚拼到摘要尾部(summary owned 被消费,返回新 owned)。anchor null → 原样返回。
@@ -594,4 +625,106 @@ test "user prompts: nothing to preserve leaves the summary untouched; fallback t
     try std.testing.expect(std.mem.indexOf(u8, only, "compacted without a model summary") != null);
     try std.testing.expect(std.mem.indexOf(u8, only, "[1] keep me") != null);
     try std.testing.expect(std.mem.indexOf(u8, only, "…[truncated]") != null);
+}
+
+test "task anchor: 点名最近认领的任务续做,更早未闭合的只列 id 并要求闭合" {
+    const a = std.testing.allocator;
+    var store = task_store.TaskStore.init(a);
+    defer store.deinit();
+    try std.testing.expect(buildTaskAnchor(a, &store) == null);
+
+    const subjects = [_][]const u8{ "v189 旧", "v215 旧", "v220 旧", "v239 中", "v262 中", "v277 当前" };
+    for (subjects) |subject| {
+        const t = try store.create(subject, "", null);
+        try store.updateStatus(t.id, .in_progress);
+    }
+    _ = try store.create("pending 不进锚", "", null);
+    {
+        const anchor = buildTaskAnchor(a, &store) orelse return error.TestUnexpectedResult;
+        defer a.free(anchor);
+        const p6 = std.mem.indexOf(u8, anchor, "- 6 v277 当前\n") orelse return error.TestUnexpectedResult;
+        const p5 = std.mem.indexOf(u8, anchor, "- 5 v262 中\n") orelse return error.TestUnexpectedResult;
+        const p4 = std.mem.indexOf(u8, anchor, "- 4 v239 中\n") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(p6 < p5 and p5 < p4);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "- 1 ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "更早置为进行中、仍未闭合的任务:1、2、3。") != null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, task_store.STALE_TASK_GUIDANCE) != null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "pending") == null);
+    }
+
+    // 重新认领最老的任务 → 它回到点名续做之列。
+    try store.updateStatus("1", .in_progress);
+    {
+        const anchor = buildTaskAnchor(a, &store) orelse return error.TestUnexpectedResult;
+        defer a.free(anchor);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "- 1 v189 旧\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "仍未闭合的任务:2、3、4。") != null);
+    }
+}
+
+test "task anchor: 只看本 agent 认领的行,共享镜像里别的会话/队友的任务不被点名或建议关闭" {
+    const a = std.testing.allocator;
+    var store = task_store.TaskStore.init(a);
+    defer store.deinit();
+    try store.setClaimer("lead");
+    _ = try store.create("lead 的旧任务", "", null);
+    try store.updateStatus("1", .in_progress);
+    // 队友在共享镜像里的认领比 lead 的更新(序号更大)。
+    for ([_][]const u8{ "w1", "w2", "w3", "w4" }) |id| {
+        try store.createWithIdHeldBy(id, "队友的任务", "", .in_progress, "worker@team");
+    }
+    {
+        const anchor = buildTaskAnchor(a, &store) orelse return error.TestUnexpectedResult;
+        defer a.free(anchor);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "- 1 lead 的旧任务\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "队友") == null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "更早") == null);
+    }
+
+    // 队友的 w4 租约过期:单独列出、只提示先重新认领——不点名续做(即使它比 lead 的认领更新),
+    // 也不混进"已被取代的标 deleted"的自己的旧任务里。
+    store.get("w4").?.claimed_at_ms -= task_store.CLAIM_LEASE_MS;
+    {
+        const anchor = buildTaskAnchor(a, &store) orelse return error.TestUnexpectedResult;
+        defer a.free(anchor);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "- 1 lead 的旧任务\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "- w4") == null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "更早置为进行中") == null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "\n其它会话或队友认领、已过租约期的任务:w4。" ++ task_store.EXPIRED_CLAIM_GUIDANCE) != null);
+    }
+
+    // 只剩过期的别人认领:不点名续做,只列可重新认领的。
+    try store.updateStatus("1", .completed);
+    {
+        const anchor = buildTaskAnchor(a, &store) orelse return error.TestUnexpectedResult;
+        defer a.free(anchor);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "继续推进") == null);
+        try std.testing.expect(std.mem.startsWith(u8, anchor, "\n\n## Active tasks(compact 任务锚)\n其它会话或队友认领、已过租约期的任务:w4。"));
+    }
+
+    // 只剩别人仍持有的认领:不写锚。
+    try store.updateStatus("w4", .completed);
+    try std.testing.expect(buildTaskAnchor(a, &store) == null);
+}
+
+test "task anchor: 不超过 3 个进行中时没有'更早'段,超过上限的 id 只计数" {
+    const a = std.testing.allocator;
+    var store = task_store.TaskStore.init(a);
+    defer store.deinit();
+    const only = try store.create("唯一任务", "", null);
+    try store.updateStatus(only.id, .in_progress);
+    {
+        const anchor = buildTaskAnchor(a, &store) orelse return error.TestUnexpectedResult;
+        defer a.free(anchor);
+        try std.testing.expect(std.mem.endsWith(u8, anchor, "闭合,不要遗忘。"));
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "更早") == null);
+    }
+    var i: usize = 0;
+    while (i < ANCHOR_MAX_ACTIVE + ANCHOR_MAX_OLDER_IDS + 2) : (i += 1) {
+        const t = try store.create("x", "", null);
+        try store.updateStatus(t.id, .in_progress);
+    }
+    const anchor = buildTaskAnchor(a, &store) orelse return error.TestUnexpectedResult;
+    defer a.free(anchor);
+    try std.testing.expect(std.mem.indexOf(u8, anchor, "(另有 3 个较新的未列出)") != null);
 }

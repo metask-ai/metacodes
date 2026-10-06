@@ -971,6 +971,12 @@ pub fn run(
 ) !RunResult {
     // 本次 run 归属的会话(emit/poll 路由用)。N=1/TUI 默认 .single;M6 由 SessionContext 传。
     const sess = opts.session;
+    // 声明本 run 认领任务的身份,与工具 kgAgentIdent 同源(kg_agent_ident orelse agent_ident):
+    // 认领记进任务行,任务锚/关闭提示/溯源据此只看本 agent 的行。失败只是少了过滤(旧行为)。
+    if (opts.tasks) |store| {
+        const claim_session = opts.agent_ident orelse sess;
+        store.setClaimer(opts.kg_agent_ident orelse claim_session.asSlice()) catch {};
+    }
     // L4:run 级 trace_id(整个 run 一个,跨所有 turn);诊断事件内联携带,DiagnosticsBackend
     // 据 trace_id+depth 重建 span 树。depth = agent 嵌套深度(父 0 子 1)。
     const trace_id = log.genRequestId().bytes;

@@ -2433,9 +2433,18 @@ pub const App = struct {
 
     /// 从 kg_inbox frontier 重建内存 store 镜像(启动一次)。best-effort。
     fn rebuildInboxMirror(app: *App) void {
+        mirrorInboxFrontier(app.allocator, &app.kg.?, app.kg_projects_dir, &app.tasks);
+    }
+
+    /// rebuildInboxMirror 的本体,入参显式(组件测试用真 TinyKG 直接驱动)。
+    pub fn mirrorInboxFrontier(
+        allocator: std.mem.Allocator,
+        kg: *@import("kg/client.zig").KgClient,
+        kg_projects_dir: []const u8,
+        tasks: *@import("core/task_store.zig").TaskStore,
+    ) void {
         const inject = @import("kg/inject.zig");
-        const inbox = inject.readIdPointer(app.allocator, app.kg_projects_dir, "kg_inbox") orelse return;
-        const kg = &app.kg.?;
+        const inbox = inject.readIdPointer(allocator, kg_projects_dir, "kg_inbox") orelse return;
         const rows = kg.frontier(inbox, 50) catch return;
         defer {
             // kg 内存契约:kg.allocator 释放(见 KgClient 顶注)。
@@ -2450,7 +2459,9 @@ pub const App = struct {
             const nl = std.mem.indexOfScalar(u8, r.text, '\n');
             const subject = if (nl) |i| r.text[0..i] else r.text;
             const status: @import("core/task_store.zig").TaskStatus = if (r.status == .claimed) .in_progress else .pending;
-            app.tasks.createWithId(kg_id, subject, r.text, status) catch {};
+            // 记下真实的租约持有者:它可能是别的会话或队友,任务锚/关闭提示/溯源据此
+            // 只看本 agent 认领的行(本进程的身份要到 agent_loop.run 才声明)。
+            tasks.createWithIdHeldBy(kg_id, subject, r.text, status, r.claimed_by) catch {};
         }
     }
 

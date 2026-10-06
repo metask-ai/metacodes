@@ -283,3 +283,131 @@ test "kg mirror closure keeps the lifetime ledger total" {
         state.decide(counts.open, counts.total, true),
     );
 }
+
+/// 跑一次只认领任务 1 的 loop,返回任务行记下的认领者(owned)。
+fn claimantRecordedByLoop(
+    a: std.mem.Allocator,
+    root: []const u8,
+    session: cc.session_id.SessionId,
+    agent_ident: ?cc.session_id.SessionId,
+) ![]u8 {
+    const create = try createTaskSse(a, "c1", "work");
+    defer a.free(create);
+    const claim = try toolSse(a, "c2", "TaskUpdate", "{\"taskId\":\"1\",\"status\":\"in_progress\"}");
+    defer a.free(claim);
+    var server = try harness.MockServer.startCassette(&.{ create, claim, END_TURN }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "do the work");
+    var permission = cc.permission.createContext(.bypass_permissions, a);
+    permission.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    var store = cc.task_store.TaskStore.init(a);
+    defer store.deinit();
+    const result = try cc.agent_loop.run(&conversation, client.provider(), defs, &permission, .{
+        .max_turns = 6,
+        .system_prompt = "STABLE-PREFIX",
+        .tasks = &store,
+        .session = session,
+        .agent_ident = agent_ident,
+        .cwd_abs = root,
+        .home_dir = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &backend, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    return a.dupe(u8, store.get("1").?.claimed_by orelse return error.ClaimNotRecorded);
+}
+
+// 主会话没有 kg_agent_ident:认领身份退到 agent_ident,再退到 session——与工具 kgAgentIdent 同源。
+test "L2 without a KG identity the loop claims as its agent identity, else as its session" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
+    const session = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
+    const subagent = cc.session_id.SessionId.fromSlice("fedcba9876543210fedcba98").?;
+
+    const as_session = try claimantRecordedByLoop(a, root, session, null);
+    defer a.free(as_session);
+    try std.testing.expectEqualStrings("0123456789abcdef01234567", as_session);
+
+    const as_agent = try claimantRecordedByLoop(a, root, session, subagent);
+    defer a.free(as_agent);
+    try std.testing.expectEqualStrings("fedcba9876543210fedcba98", as_agent);
+}
+
+// agent_loop.run 声明的认领身份 = 工具认领 KG 租约的身份(kg_agent_ident orelse agent_ident):
+// 认领记进任务行,关闭提示只列本 agent 的其它进行中任务——同一清单里队友认领的行不出现。
+test "L2 the loop claims under its KG identity and a close lists only its own other claims" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
+
+    var store = cc.task_store.TaskStore.init(a);
+    defer store.deinit();
+    // 队友在同一清单(降级共享镜像)里的活认领。
+    try store.createWithIdHeldBy("teammate-1", "TEAMMATE-ROW", "claimed by someone else", .in_progress, "teammate@team");
+
+    const create_old = try createTaskSse(a, "t1", "own old");
+    defer a.free(create_old);
+    const create_cur = try createTaskSse(a, "t2", "own current");
+    defer a.free(create_cur);
+    const claim_old = try toolSse(a, "t3", "TaskUpdate", "{\"taskId\":\"1\",\"status\":\"in_progress\"}");
+    defer a.free(claim_old);
+    const claim_cur = try toolSse(a, "t4", "TaskUpdate", "{\"taskId\":\"2\",\"status\":\"in_progress\"}");
+    defer a.free(claim_cur);
+    const close_cur = try toolSse(a, "t5", "TaskUpdate", "{\"taskId\":\"2\",\"status\":\"completed\"}");
+    defer a.free(close_cur);
+
+    var server = try harness.MockServer.startCassette(&.{ create_old, create_cur, claim_old, claim_cur, close_cur, END_TURN }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "do the work");
+    var permission = cc.permission.createContext(.bypass_permissions, a);
+    permission.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const result = try cc.agent_loop.run(&conversation, client.provider(), defs, &permission, .{
+        .max_turns = 10,
+        .system_prompt = "STABLE-PREFIX",
+        .tasks = &store,
+        .kg_agent_ident = "worker@team",
+        .cwd_abs = root,
+        .home_dir = root,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &backend, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    try std.testing.expectEqualStrings("worker@team", store.get("1").?.claimed_by.?);
+    try std.testing.expectEqualStrings("teammate@team", store.get("teammate-1").?.claimed_by.?);
+
+    // 关闭 2 之后的那次请求带着它的工具结果:只列本 agent 的 1,不列队友的行。
+    try std.testing.expectEqual(@as(usize, 6), server.requestCount());
+    const after_close = server.requestAt(5).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, after_close, "still_in_progress\\\":{\\\"tasks\\\":[{\\\"id\\\":\\\"1\\\",\\\"subject\\\":\\\"own old\\\"}]") != null);
+    for (0..server.requestCount()) |index| {
+        try std.testing.expect(std.mem.indexOf(u8, server.requestAt(index).?.body(), "TEAMMATE-ROW") == null);
+    }
+}

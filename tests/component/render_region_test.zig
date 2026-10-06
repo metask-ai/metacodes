@@ -45,7 +45,7 @@ test "L2 TUI: spinner frames unicode/ascii 不越界" {
 
 // ---- TaskTab(阶段 4)纯函数核心 ----
 
-test "L2 TUI TaskTab: 选首个 in_progress 的 active_form(无则 subject)" {
+test "L2 TUI TaskTab: 选 in_progress 的 active_form(无则 subject)" {
     const a = std.testing.allocator;
     var store = cc.core_task_store.TaskStore.init(a);
     defer store.deinit();
@@ -61,6 +61,50 @@ test "L2 TUI TaskTab: 选首个 in_progress 的 active_form(无则 subject)" {
     try store.updateStatus(t2.id, .in_progress);
     const label = cc.tui_render_region.taskTabLabel(&store) orelse return error.NoLabel;
     try std.testing.expectEqualStrings("running second", label); // active_form 优先
+}
+
+test "L2 TUI TaskTab: 多个 in_progress 时显示最近认领的,不是最早开的僵尸任务" {
+    const a = std.testing.allocator;
+    var store = cc.core_task_store.TaskStore.init(a);
+    defer store.deinit();
+    const zombie = try store.create("v189 旧思路", "d", null);
+    const current = try store.create("v277 当前", "d", null);
+    try store.updateStatus(zombie.id, .in_progress);
+    try store.updateStatus(current.id, .in_progress);
+    try std.testing.expectEqualStrings("v277 当前", cc.tui_render_region.taskTabLabel(&store) orelse return error.NoLabel);
+    try store.updateStatus(zombie.id, .in_progress); // 重新认领旧任务 → 它才是当前任务
+    try std.testing.expectEqualStrings("v189 旧思路", cc.tui_render_region.taskTabLabel(&store) orelse return error.NoLabel);
+}
+
+test "L2 TUI 任务清单:放不下时保留最近认领的进行中任务,其余按 待办>刚完成 补位,按清单序画" {
+    const a = std.testing.allocator;
+    const rr = cc.tui_render_region;
+    var store = cc.core_task_store.TaskStore.init(a);
+    defer store.deinit();
+    // 1..5 是开了没关的旧任务,6 是待办,7 刚完成,8 是当前任务(最后认领)。
+    for (0..8) |_| _ = try store.create("t", "", null);
+    for ([_][]const u8{ "1", "2", "3", "4", "5", "8" }) |id| try store.updateStatus(id, .in_progress);
+    try store.updateStatus("7", .completed);
+    const now = store.get("7").?.completed_ms;
+
+    var buf: [16]usize = undefined;
+    // 全部放得下:清单序原样。
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, rr.pickTaskRows(store.tasks.items, now, 8, &buf));
+    // 只放 3 行:当前任务 8 与次新的 5、4,不是最早的 1、2、3。
+    try std.testing.expectEqualSlices(usize, &.{ 3, 4, 7 }, rr.pickTaskRows(store.tasks.items, now, 3, &buf));
+    // 进行中都放下后,待办先于刚完成。
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4, 5, 7 }, rr.pickTaskRows(store.tasks.items, now, 7, &buf));
+    // 输出缓冲是硬上限。
+    try std.testing.expectEqual(@as(usize, 2), rr.pickTaskRows(store.tasks.items, now, 8, buf[0..2]).len);
+}
+
+test "L2 TUI 任务清单:完成时戳比 now 大(上一次开机写入镜像)不算刚完成" {
+    const ttl = cc.tui_render_region.completedWithinTtl;
+    try std.testing.expect(ttl(1_000, 1_000));
+    try std.testing.expect(ttl(1_000, 31_000));
+    try std.testing.expect(!ttl(1_000, 31_001));
+    try std.testing.expect(!ttl(0, 5)); // 未记录
+    try std.testing.expect(!ttl(9_000_000, 5_000)); // 重启后时钟从小值重新开始
 }
 
 test "L2 TUI TaskTab: 无 active_form 回退 subject" {
