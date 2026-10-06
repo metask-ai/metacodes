@@ -219,12 +219,14 @@ status, compatibility boundaries, and entry points are defined by
   degraded-mode mirror is shared by every session in the repository and by
   swarm teammates, and the startup rebuild of persistent tasks keeps each
   lease's real holder. In the degraded mirror another agent's claim expires
-  after two hours (TinyKG's default lease); an expired claim is then offered
-  for closing but never named as work to continue. Persistent `kg-*` tasks
-  follow TinyKG's own lease instead. Claims made under an identity this agent
-  used earlier (before `/clear`, `/resume` or sending work to the background)
-  stay its own, and rows whose claimer is unknown (written before this change)
-  are treated as the agent's own, as before. When
+  after two hours (TinyKG's default lease). Like an expired TinyKG lease, it
+  can then be claimed again, and both the anchor and the closing list say so
+  separately: they never name it as work to continue or suggest closing it
+  directly. TaskUpdate and TaskStop refuse to change a local task another
+  agent holds; once the claim has expired, the task must be re-claimed
+  before it is closed or deleted. Persistent `kg-*` tasks follow TinyKG's
+  own lease. Rows whose claimer is unknown (written before this change) are
+  treated as the agent's own, as before. When
   the task panel overflows it keeps the most recently claimed tasks instead of
   the oldest, and a completed task reloaded from the mirror after a reboot no
   longer stays on the panel indefinitely (its timestamp is from the previous

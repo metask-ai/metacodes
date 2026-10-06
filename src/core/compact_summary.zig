@@ -248,39 +248,46 @@ const ANCHOR_MAX_OLDER_IDS: usize = 10;
 /// 最老的先列(最可能已被取代)。只看本 agent 认领的行:降级镜像按仓库共享,别的会话或
 /// 队友认领的行不能被点名续做或建议关闭。无 in_progress 任务 → null。返回 owned。
 pub fn buildTaskAnchor(allocator: std.mem.Allocator, tasks: *task_store.TaskStore) ?[]u8 {
-    // 自己的在前(最近认领在前),之后是别人租约已过期的:后者只进"更早"段等待关闭,
-    // 绝不点名续做——那可能是别人还在做、只是没续租的工作。
+    // 自己的在前(最近认领在前),之后是别人租约已过期的:后者单独列出、只提示先重新认领,
+    // 绝不点名续做或建议直接关闭——那可能是别人还在做、只是没续租的工作。
     const active = tasks.snapshotOwnInProgress(allocator) catch return null;
     defer task_store.TaskStore.freeTaskViews(allocator, active);
     if (active.len == 0) return null;
 
     var own: usize = 0;
-    for (active) |v| {
-        if (!v.expired_claim) own += 1;
-    }
+    while (own < active.len and !active[own].expired_claim) own += 1;
     const named = @min(own, ANCHOR_MAX_ACTIVE);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    out.appendSlice(allocator, "\n\n## Active tasks(compact 任务锚)\n") catch return null;
+    out.appendSlice(allocator, "\n\n## Active tasks(compact 任务锚)") catch return null;
     if (named > 0) {
+        out.append(allocator, '\n') catch return null;
         for (active[0..named]) |v| {
             out.print(allocator, "- {s} {s}\n", .{ v.id, v.subject }) catch return null;
         }
         out.appendSlice(allocator, "继续推进以上进行中的任务;完成后用 TaskUpdate(status=completed)闭合,不要遗忘。") catch return null;
     }
-    const older = active[named..]; // 自己更早的(新 → 旧),再是别人过期的(新 → 旧)
-    if (older.len > 0) {
-        if (named > 0) out.append(allocator, '\n') catch return null;
-        out.appendSlice(allocator, "更早置为进行中、仍未闭合的任务:") catch return null;
-        const listed = @min(older.len, ANCHOR_MAX_OLDER_IDS);
-        for (0..listed) |n| {
-            if (n > 0) out.appendSlice(allocator, "、") catch return null;
-            out.appendSlice(allocator, older[older.len - 1 - n].id) catch return null;
-        }
-        if (older.len > listed) out.print(allocator, "(另有 {d} 个较新的未列出)", .{older.len - listed}) catch return null;
+    if (own > named) {
+        out.appendSlice(allocator, "\n更早置为进行中、仍未闭合的任务:") catch return null;
+        appendIdsOldestFirst(&out, allocator, active[named..own]) catch return null;
         out.appendSlice(allocator, "。" ++ task_store.STALE_TASK_GUIDANCE) catch return null;
     }
+    if (active.len > own) {
+        out.appendSlice(allocator, "\n其它会话或队友认领、已过租约期的任务:") catch return null;
+        appendIdsOldestFirst(&out, allocator, active[own..]) catch return null;
+        out.appendSlice(allocator, "。" ++ task_store.EXPIRED_CLAIM_GUIDANCE) catch return null;
+    }
     return out.toOwnedSlice(allocator) catch null;
+}
+
+/// 按认领从旧到新列 id(views 是新 → 旧;最老的最可能已过时),最多 ANCHOR_MAX_OLDER_IDS 个。
+fn appendIdsOldestFirst(out: *std.ArrayList(u8), allocator: std.mem.Allocator, newest_first: []const task_store.TaskStore.TaskView) !void {
+    const listed = @min(newest_first.len, ANCHOR_MAX_OLDER_IDS);
+    for (0..listed) |n| {
+        if (n > 0) try out.appendSlice(allocator, "、");
+        try out.appendSlice(allocator, newest_first[newest_first.len - 1 - n].id);
+    }
+    if (newest_first.len > listed) try out.print(allocator, "(另有 {d} 个较新的未列出)", .{newest_first.len - listed});
 }
 
 /// 把任务锚拼到摘要尾部(summary owned 被消费,返回新 owned)。anchor null → 原样返回。
@@ -674,23 +681,25 @@ test "task anchor: 只看本 agent 认领的行,共享镜像里别的会话/队�
         try std.testing.expect(std.mem.indexOf(u8, anchor, "更早") == null);
     }
 
-    // 队友的 w4 租约过期:只作为待关闭的旧任务列出,不点名续做——即使它比 lead 的认领更新。
+    // 队友的 w4 租约过期:单独列出、只提示先重新认领——不点名续做(即使它比 lead 的认领更新),
+    // 也不混进"已被取代的标 deleted"的自己的旧任务里。
     store.get("w4").?.claimed_at_ms -= task_store.CLAIM_LEASE_MS;
     {
         const anchor = buildTaskAnchor(a, &store) orelse return error.TestUnexpectedResult;
         defer a.free(anchor);
         try std.testing.expect(std.mem.indexOf(u8, anchor, "- 1 lead 的旧任务\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, anchor, "- w4") == null);
-        try std.testing.expect(std.mem.indexOf(u8, anchor, "仍未闭合的任务:w4。") != null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "更早置为进行中") == null);
+        try std.testing.expect(std.mem.indexOf(u8, anchor, "\n其它会话或队友认领、已过租约期的任务:w4。" ++ task_store.EXPIRED_CLAIM_GUIDANCE) != null);
     }
 
-    // 只剩过期的别人认领:不点名续做,只列待关闭。
+    // 只剩过期的别人认领:不点名续做,只列可重新认领的。
     try store.updateStatus("1", .completed);
     {
         const anchor = buildTaskAnchor(a, &store) orelse return error.TestUnexpectedResult;
         defer a.free(anchor);
         try std.testing.expect(std.mem.indexOf(u8, anchor, "继续推进") == null);
-        try std.testing.expect(std.mem.indexOf(u8, anchor, "## Active tasks(compact 任务锚)\n更早置为进行中、仍未闭合的任务:w4。") != null);
+        try std.testing.expect(std.mem.startsWith(u8, anchor, "\n\n## Active tasks(compact 任务锚)\n其它会话或队友认领、已过租约期的任务:w4。"));
     }
 
     // 只剩别人仍持有的认领:不写锚。

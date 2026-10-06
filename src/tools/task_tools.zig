@@ -707,9 +707,10 @@ pub const STILL_IN_PROGRESS_NOTE = "这些任务仍标为进行中。" ++ task_s
 
 /// 结束一个任务时,在结果里附上其它仍为 in_progress 的任务(僵尸任务的确定性防线)。
 /// 模型常为每个新思路开一个任务却不关上一个;关闭时刻是复查它们的自然节点。
-/// 最可能已过时的在前:别人租约已过期的认领,再是自己最早认领的。别人仍持有的认领不列
+/// `tasks`:本 agent 自己的,最早认领的在前(最可能已被取代)。`expired_claims`:别人认领、
+/// 租约已过期的,只提示先重新认领再处理(和 TinyKG 一样不能直接关)。别人仍持有的认领不列
 /// (snapshotOwnInProgress 按认领者与租约过滤):KG 降级的镜像按仓库共享,并发会话和
-/// swarm 队友在做的事不能建议本 agent 去关。没有这样的任务 → 一个字节都不加。
+/// swarm 队友在做的事不能建议本 agent 去动。没有这样的任务 → 一个字节都不加。
 /// 尽力而为:调用时状态已提交,失败只回退本段,绝不让已生效的关闭报错或产出半截 JSON。
 fn appendStillInProgress(ctx: *const ToolContext, out: *std.ArrayList(u8)) void {
     const mark = out.items.len;
@@ -718,11 +719,34 @@ fn appendStillInProgress(ctx: *const ToolContext, out: *std.ArrayList(u8)) void 
 
 fn writeStillInProgress(ctx: *const ToolContext, out: *std.ArrayList(u8)) !void {
     const store = ctx.tasks orelse return;
-    const newest_first = try store.snapshotOwnInProgress(ctx.allocator);
-    defer task_store.TaskStore.freeTaskViews(ctx.allocator, newest_first);
-    if (newest_first.len == 0) return;
+    // 自己的(最近认领在前)在前,别人租约已过期的在后。
+    const views = try store.snapshotOwnInProgress(ctx.allocator);
+    defer task_store.TaskStore.freeTaskViews(ctx.allocator, views);
+    if (views.len == 0) return;
+    var own: usize = 0;
+    while (own < views.len and !views[own].expired_claim) own += 1;
+    try out.appendSlice(ctx.allocator, ",\"still_in_progress\":{");
+    if (own > 0) {
+        try out.appendSlice(ctx.allocator, "\"tasks\":");
+        try writeTaskRows(ctx, out, views[0..own]);
+        try out.appendSlice(ctx.allocator, ",\"note\":");
+        try writeString(out, ctx.allocator, STILL_IN_PROGRESS_NOTE);
+    }
+    if (views.len > own) {
+        if (own > 0) try out.append(ctx.allocator, ',');
+        try out.appendSlice(ctx.allocator, "\"expired_claims\":");
+        try writeTaskRows(ctx, out, views[own..]);
+        try out.appendSlice(ctx.allocator, ",\"expired_note\":");
+        try writeString(out, ctx.allocator, task_store.EXPIRED_CLAIM_GUIDANCE);
+    }
+    try out.append(ctx.allocator, '}');
+}
+
+/// `[{"id","subject"}...]`,按认领从旧到新(rows 是新 → 旧),最多 STILL_IN_PROGRESS_MAX 条,
+/// 多出的写进紧随其后的 `"omitted"`。
+fn writeTaskRows(ctx: *const ToolContext, out: *std.ArrayList(u8), newest_first: []const task_store.TaskStore.TaskView) !void {
     const listed = @min(newest_first.len, STILL_IN_PROGRESS_MAX);
-    try out.appendSlice(ctx.allocator, ",\"still_in_progress\":{\"tasks\":[");
+    try out.append(ctx.allocator, '[');
     for (0..listed) |n| {
         const v = newest_first[newest_first.len - 1 - n];
         if (n > 0) try out.append(ctx.allocator, ',');
@@ -734,9 +758,6 @@ fn writeStillInProgress(ctx: *const ToolContext, out: *std.ArrayList(u8)) !void 
     }
     try out.append(ctx.allocator, ']');
     if (newest_first.len > listed) try out.print(ctx.allocator, ",\"omitted\":{d}", .{newest_first.len - listed});
-    try out.appendSlice(ctx.allocator, ",\"note\":");
-    try writeString(out, ctx.allocator, STILL_IN_PROGRESS_NOTE);
-    try out.append(ctx.allocator, '}');
 }
 
 /// KG 计划步骤更新(TaskUpdate 的 kg-<node> 路由)。completed/failed 走 canonical
@@ -885,6 +906,7 @@ pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var closed = false;
     if (try extractString(args, "status")) |status_str| {
         const st = TaskStatus.fromString(status_str) orelse return error.InvalidStatus;
+        try refuseClaimedByOther(ctx, store, id, st);
         try store.updateStatus(id, st);
         if (st == .deleted) {
             // 删除后不能再拿 id 查找；提前返回避免后续字段更新。
@@ -1011,9 +1033,23 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return out.toOwnedSlice(ctx.allocator);
     }
     const store = try requireStore(ctx);
+    try refuseClaimedByOther(ctx, store, id, .completed);
     try store.updateStatus(id, .completed);
     noteTasksChanged(ctx); // U6:TaskStop 闭合 → frontier 变
     return closedResult(ctx, "{\"ok\":true,\"status\":\"completed\"");
+}
+
+/// 本地任务被别的会话/队友认领时,拒绝本 agent 改它的状态(KG 降级共享镜像;与 kg-* 任务
+/// 的 TinyKG 租约同一语义):租约期内谁也不能动;过期后只能先重新认领(in_progress)。
+fn refuseClaimedByOther(ctx: *const ToolContext, store: *task_store.TaskStore, id: []const u8, to: TaskStatus) !void {
+    const block = (try store.claimBlockingStatusChange(ctx.allocator, id, to)) orelse return;
+    defer ctx.allocator.free(block.holder);
+    if (block.expired) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "任务 {s} 由 {s} 认领,已超过租约期。如确认已无人在做,先用 TaskUpdate(status=in_progress)重新认领,再关闭或删除。", .{ id, block.holder });
+    } else {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "任务 {s} 由 {s} 认领,仍在租约期内,不能改动它的状态。请选择其它任务。", .{ id, block.holder });
+    }
+    return error.TaskClaimedByOther;
 }
 
 /// 本地清单关闭的结果:`head` 是未闭合的 JSON 对象前缀,补上其它进行中任务的提示后闭合。
@@ -1451,6 +1487,60 @@ test "关闭提示只列本 agent 认领的行:同一降级镜像里别的会话
     const last = try executeUpdate(&ctx, "{\"taskId\":\"2\",\"status\":\"completed\"}");
     defer testing.allocator.free(last);
     try testing.expectEqualStrings("{\"ok\":true}", last);
+}
+
+test "别人认领的本地任务:过期的单列并只提示重新认领,工具拒绝未认领就关闭或接手活认领" {
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try store.setClaimer("me");
+    try store.createWithIdHeldBy("live", "队友在做", "", .in_progress, "worker@team");
+    try store.createWithIdHeldBy("stale", "没人续租", "", .in_progress, "gone-session");
+    store.get("stale").?.claimed_at_ms -= task_store.CLAIM_LEASE_MS;
+    var ctx = testCtx(&store);
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| testing.allocator.free(d);
+    ctx.error_detail = &detail;
+    const Detail = struct {
+        fn take(slot: *?[]const u8) void {
+            if (slot.*) |d| testing.allocator.free(d);
+            slot.* = null;
+        }
+    };
+    testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"mine old\",\"description\":\"\"}"));
+    testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"mine cur\",\"description\":\"\"}"));
+    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"1\",\"status\":\"in_progress\"}"));
+    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"2\",\"status\":\"in_progress\"}"));
+
+    const done = try executeUpdate(&ctx, "{\"taskId\":\"2\",\"status\":\"completed\"}");
+    defer testing.allocator.free(done);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, done, .{});
+    defer parsed.deinit();
+    const hint = parsed.value.object.get("still_in_progress").?.object;
+    try testing.expectEqualStrings("1", hint.get("tasks").?.array.items[0].object.get("id").?.string);
+    try testing.expectEqual(@as(usize, 1), hint.get("tasks").?.array.items.len);
+    const expired = hint.get("expired_claims").?.array.items;
+    try testing.expectEqual(@as(usize, 1), expired.len);
+    try testing.expectEqualStrings("stale", expired[0].object.get("id").?.string);
+    try testing.expectEqualStrings(task_store.EXPIRED_CLAIM_GUIDANCE, hint.get("expired_note").?.string);
+    try testing.expect(std.mem.indexOf(u8, done, "队友在做") == null);
+
+    // 过期的:不能直接关或删,也不能由 TaskStop 关;重新认领后可以。
+    try testing.expectError(error.TaskClaimedByOther, executeUpdate(&ctx, "{\"taskId\":\"stale\",\"status\":\"deleted\"}"));
+    try testing.expect(std.mem.indexOf(u8, detail.?, "gone-session") != null);
+    Detail.take(&detail);
+    try testing.expectError(error.TaskClaimedByOther, executeStop(&ctx, "{\"taskId\":\"stale\"}"));
+    Detail.take(&detail);
+    try testing.expect(store.get("stale") != null);
+    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"stale\",\"status\":\"in_progress\"}"));
+    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"stale\",\"status\":\"deleted\"}"));
+    try testing.expect(store.get("stale") == null);
+
+    // 仍在租约期的:谁也不能接手或关闭。
+    try testing.expectError(error.TaskClaimedByOther, executeUpdate(&ctx, "{\"taskId\":\"live\",\"status\":\"in_progress\"}"));
+    try testing.expect(std.mem.indexOf(u8, detail.?, "worker@team") != null);
+    Detail.take(&detail);
+    try testing.expectError(error.TaskClaimedByOther, executeUpdate(&ctx, "{\"taskId\":\"live\",\"status\":\"completed\"}"));
+    try testing.expectEqualStrings("worker@team", store.get("live").?.claimed_by.?);
 }
 
 test "Task* without store returns TaskStoreUnavailable" {
