@@ -220,15 +220,11 @@ fn judgeMemoryRelations(
 }
 
 /// 本 session 进行中的 kg 任务(store 镜像里 status=in_progress 且 id 形如 kg-<n>)。
-/// 溯源锚:记忆/文档产物 derived_from 它。多个 in_progress 取第一个(主任务惯例)。
+/// 溯源锚:记忆/文档产物 derived_from 它。多个 in_progress 取最近认领的那个——
+/// 最早认领的往往是开了没关的旧任务;父任务经 task-ancestry 仍可从叶子导航到。
 fn activeKgTaskId(ctx: *const ToolContext) ?u64 {
     const store = ctx.tasks orelse return null;
-    for (store.tasks.items) |t| {
-        if (t.status != .in_progress) continue;
-        if (!std.mem.startsWith(u8, t.id, "kg-")) continue;
-        return std.fmt.parseInt(u64, t.id["kg-".len..], 10) catch continue;
-    }
-    return null;
+    return store.latestInProgressKgTaskId();
 }
 
 pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {

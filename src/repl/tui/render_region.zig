@@ -27,6 +27,7 @@ const model_command = @import("../model_command.zig");
 const msg_queue = @import("../msg_queue.zig");
 const agent_tree = @import("widget/agent_tree.zig");
 const agent_job_registry = @import("../../core/agent_job_registry.zig");
+const task_store = @import("../../core/task_store.zig");
 const ui_mod = @import("ui.zig");
 const model_picker_view = @import("../model_picker_view.zig");
 const event_mod = @import("event.zig");
@@ -295,10 +296,8 @@ pub const RenderRegion = struct {
     /// 【仅输入期】重画输入框:上边框 + ❯content(多行)+ 下边框 + [slash 菜单] + footer。
     /// 输入期无 print(text) 滚动,故可安全用 input_cursor_row(光标实际所在区内行)回顶。
     /// 末尾把光标停在 content 供编辑,并记 input_cursor_row。
-    /// TaskTab:输入框上方显示首个 in_progress 任务的 active_form(无则 subject)。
-    /// 无 in_progress 任务 → 不画,返回 0 行。画一行返回 1。`◐ <text>`(截断到 cols)。
-    /// 另:有运行中后台 subagent 时,即便无 todo 也画一行
-    /// `◐ N subagents running`(用户曾反馈看不到并发 subagent 进度)。
+    /// TaskTab:输入框上方的面板(drawPanel):后台 subagent 进度树 + Task 清单。
+    /// 无内容 → 不画,返回 0 行。
     fn drawTaskTab(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
         return self.drawPanel(w, app);
     }
@@ -378,22 +377,16 @@ pub const RenderRegion = struct {
     }
 
     /// Task 清单(◼ in_progress / ◻ pending / ✓ completed,completed 过 TTL 不显)。
-    /// 超预算折叠为 `… +N more`。返回行数。
+    /// 超预算折叠为 `… +N more`,折叠时按 pickTaskRows 的优先级挑行。返回行数。
     fn drawTaskList(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, max_lines: u16) u16 {
         if (max_lines == 0) return 0;
         if (!self.ui.panel.task_list_visible) return 0; // Ctrl+T 隐藏:不画 task 清单
         const tasks = app.tasks.tasks.items;
         const now = util_time.nowMs();
-        const TTL_MS: i64 = 30_000;
 
-        // 先数可显条目(active + TTL 内 completed)。
         var visible: usize = 0;
         for (tasks) |t| {
-            if (t.status == .completed) {
-                if (t.completed_ms != 0 and now - t.completed_ms <= TTL_MS) visible += 1;
-            } else if (t.status == .pending or t.status == .in_progress) {
-                visible += 1;
-            }
+            if (taskRowVisible(t, now)) visible += 1;
         }
         if (visible == 0) return 0;
 
@@ -402,48 +395,45 @@ pub const RenderRegion = struct {
         // 却 0 任务是信息量为零的退化,不可取)。
         const overflow = visible > max_lines;
         const cap: usize = if (!overflow) visible else if (max_lines >= 2) max_lines - 1 else 1;
+        var pick_buf: [PANEL_TASK_ROWS_MAX]usize = undefined;
+        const rows = pickTaskRows(tasks, now, cap, &pick_buf);
 
         var n: u16 = 0;
-        var shown: usize = 0;
         const max_w: usize = if (self.cols > 6) self.cols - 6 else 8;
-        for (tasks) |t| {
-            const show = switch (t.status) {
-                .completed => t.completed_ms != 0 and now - t.completed_ms <= TTL_MS,
-                .pending, .in_progress => true,
-                .deleted => false,
-            };
-            if (!show) continue;
-            if (shown >= cap) break;
-            const icon: []const u8 = switch (t.status) {
-                .in_progress => if (self.use_unicode) "◼" else "[*]",
-                .pending => if (self.use_unicode) "◻" else "[ ]",
-                .completed => if (self.use_unicode) "✓" else "[x]", // 勾:完成(对齐用户预期/真 cc todo done)
-                .deleted => "",
-            };
-            const color: []const u8 = switch (t.status) {
-                .in_progress => self.theme.warn,
-                .pending => self.theme.dim,
-                .completed => self.theme.success,
-                .deleted => self.theme.dim,
-            };
-            const label = t.active_form orelse t.subject;
-            const end = truncateToWidth(label, max_w);
-            w.writeAll(ansi.clear.line) catch {};
-            w.print("  {s}{s}{s} {s}", .{ color, icon, self.theme.reset, label[0..end] }) catch {};
-            if (end < label.len) w.writeAll("…") catch {};
-            w.writeAll("\r\n") catch {};
+        for (rows) |index| {
+            self.drawTaskRow(w, tasks[index], max_w);
             n += 1;
-            shown += 1;
         }
         // 折叠提示:仅当还有预算行(n < max_lines)且确有未显条目时才画,
         // 否则会超预算(max_lines==1 时已显 1 条真任务,不再挤省略号行)。
-        if (visible > shown and n < max_lines) {
+        if (visible > rows.len and n < max_lines) {
             w.writeAll(ansi.clear.line) catch {};
-            w.print("  {s}… +{d} more{s}", .{ self.theme.dim, visible - shown, self.theme.reset }) catch {};
+            w.print("  {s}… +{d} more{s}", .{ self.theme.dim, visible - rows.len, self.theme.reset }) catch {};
             w.writeAll("\r\n") catch {};
             n += 1;
         }
         return n;
+    }
+
+    fn drawTaskRow(self: *RenderRegion, w: *std.Io.Writer, t: *const task_store.Task, max_w: usize) void {
+        const icon: []const u8 = switch (t.status) {
+            .in_progress => if (self.use_unicode) "◼" else "[*]",
+            .pending => if (self.use_unicode) "◻" else "[ ]",
+            .completed => if (self.use_unicode) "✓" else "[x]", // 勾:完成(对齐用户预期/真 cc todo done)
+            .deleted => "",
+        };
+        const color: []const u8 = switch (t.status) {
+            .in_progress => self.theme.warn,
+            .pending => self.theme.dim,
+            .completed => self.theme.success,
+            .deleted => self.theme.dim,
+        };
+        const label = t.active_form orelse t.subject;
+        const end = truncateToWidth(label, max_w);
+        w.writeAll(ansi.clear.line) catch {};
+        w.print("  {s}{s}{s} {s}", .{ color, icon, self.theme.reset, label[0..end] }) catch {};
+        if (end < label.len) w.writeAll("…") catch {};
+        w.writeAll("\r\n") catch {};
     }
 
     fn renderFrameInner(self: *RenderRegion, app: *const app_mod.App, content: []const u8, cursor: usize) void {
@@ -2143,13 +2133,72 @@ fn drawOutputWindow(w: *std.Io.Writer, buf: []const u8, top: usize, view_rows: u
     return drawn;
 }
 
-/// TaskTab 文本选择(纯函数,可单测):首个 in_progress 任务的 active_form(无则 subject)。
-/// 无 in_progress → null。
-pub fn taskTabLabel(tasks: *const @import("../../core/task_store.zig").TaskStore) ?[]const u8 {
-    for (tasks.tasks.items) |t| {
-        if (t.status == .in_progress) return t.active_form orelse t.subject;
+/// 任务清单面板一次最多画的任务行(drawPanel 的总预算 ≤ 12 行)。
+const PANEL_TASK_ROWS_MAX: usize = 16;
+/// 完成的任务在面板停留的时长。
+const TASK_DONE_TTL_MS: i64 = 30_000;
+
+/// 完成时戳是否仍在停留期内。completed_ms 是开机相对时钟,又随降级镜像跨会话落盘:
+/// 上一次开机写下的值可能比 now 大,差值为负——不能当成"刚完成",否则这些行永不淡出。
+pub fn completedWithinTtl(completed_ms: i64, now: i64) bool {
+    return completed_ms != 0 and now >= completed_ms and now - completed_ms <= TASK_DONE_TTL_MS;
+}
+
+fn taskRowVisible(t: *const task_store.Task, now: i64) bool {
+    return switch (t.status) {
+        .pending, .in_progress => true,
+        .completed => completedWithinTtl(t.completed_ms, now),
+        .deleted => false,
+    };
+}
+
+/// 挑出要画的任务行,写入 out 并返回(清单下标升序 = 清单顺序;最多 min(cap, out.len) 行)。
+/// 放不下时按优先级挑:进行中(最近认领优先)> 待办(清单序)> 刚完成(最近优先)——
+/// 当前在做的任务不能被折进 "+N more",却让开了没关的旧任务占着位置。纯函数,可单测。
+pub fn pickTaskRows(tasks: []const *task_store.Task, now: i64, cap: usize, out: []usize) []usize {
+    const limit = @min(cap, out.len);
+    var n: usize = 0;
+    while (n < limit) : (n += 1) {
+        var best: ?usize = null;
+        for (tasks, 0..) |t, i| {
+            if (t.status != .in_progress or isPicked(out[0..n], i)) continue;
+            if (best) |b| {
+                if (!task_store.claimedMoreRecently(t.claim_seq, i, tasks[b].claim_seq, b)) continue;
+            }
+            best = i;
+        }
+        out[n] = best orelse break;
     }
-    return null;
+    for (tasks, 0..) |t, i| {
+        if (n == limit) break;
+        if (t.status != .pending) continue;
+        out[n] = i;
+        n += 1;
+    }
+    while (n < limit) : (n += 1) {
+        var best: ?usize = null;
+        for (tasks, 0..) |t, i| {
+            if (t.status != .completed or !completedWithinTtl(t.completed_ms, now) or isPicked(out[0..n], i)) continue;
+            if (best) |b| {
+                if (t.completed_ms <= tasks[b].completed_ms) continue;
+            }
+            best = i;
+        }
+        out[n] = best orelse break;
+    }
+    std.mem.sort(usize, out[0..n], {}, std.sort.asc(usize));
+    return out[0..n];
+}
+
+fn isPicked(picked: []const usize, index: usize) bool {
+    return std.mem.indexOfScalar(usize, picked, index) != null;
+}
+
+/// TaskTab 文本选择(纯函数,可单测):最近认领的 in_progress 任务的 active_form(无则 subject)。
+/// 不取首个:开了没关的旧任务总在清单最前。无 in_progress → null。
+pub fn taskTabLabel(tasks: *const task_store.TaskStore) ?[]const u8 {
+    const t = tasks.latestInProgress() orelse return null;
+    return t.active_form orelse t.subject;
 }
 
 /// 把 text 截断到不超过 max_w 显示列(CJK=2),为省略号留 1 列。返回 byte 终点。

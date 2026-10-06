@@ -1935,6 +1935,55 @@ test "L2 KG: legacy kg_inbox lease survives fresh-process startup recovery" {
     try std.testing.expect(std.mem.indexOfPos(u8, list, id_pos + id_needle.len, id_needle) == null);
 }
 
+test "L2 KG: 启动重建镜像记下真实租约持有者,别人的认领不算本 agent 的进行中任务" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kg-rebuild-holder.kg", .{proj_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-rebuild-holder");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const inbox = try kg.createTask("inbox", "todo_root");
+    try cc.kg_inject.writeIdPointer(a, proj_dir, "kg_inbox", inbox);
+    const mine = try kg.createChildTask(inbox, "本 agent 的任务", "todo");
+    const theirs = try kg.createChildTask(inbox, "队友的任务", "todo");
+    const open = try kg.createChildTask(inbox, "没人认领", "todo");
+    try kg.claimTask(mine, "worker@team");
+    try kg.claimTask(theirs, "lead-session");
+
+    var tasks = cc.core_task_store.TaskStore.init(a);
+    defer tasks.deinit();
+    cc.app_module.App.mirrorInboxFrontier(a, &kg, proj_dir, &tasks);
+
+    var idbuf: [3][24]u8 = undefined;
+    const mine_id = try std.fmt.bufPrint(&idbuf[0], "kg-{d}", .{mine});
+    const theirs_id = try std.fmt.bufPrint(&idbuf[1], "kg-{d}", .{theirs});
+    const open_id = try std.fmt.bufPrint(&idbuf[2], "kg-{d}", .{open});
+    try std.testing.expectEqualStrings("worker@team", tasks.get(mine_id).?.claimed_by.?);
+    try std.testing.expectEqualStrings("lead-session", tasks.get(theirs_id).?.claimed_by.?);
+    try std.testing.expect(tasks.get(theirs_id).?.status == .in_progress);
+    try std.testing.expect(tasks.get(open_id).?.status == .pending);
+    try std.testing.expect(tasks.get(open_id).?.claimed_by == null);
+
+    // 以 teammate 身份运行:只有自己的租约算进行中任务(锚/关闭提示/溯源)。
+    try tasks.setClaimer("worker@team");
+    const own = try tasks.snapshotOwnInProgress(a);
+    defer cc.core_task_store.TaskStore.freeTaskViews(a, own);
+    try std.testing.expectEqual(@as(usize, 1), own.len);
+    try std.testing.expectEqualStrings(mine_id, own[0].id);
+    try std.testing.expectEqual(@as(?u64, mine), tasks.latestInProgressKgTaskId());
+}
+
 test "L2 KG: stale task anchor falls back to legacy root in the same startup" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
@@ -2270,6 +2319,134 @@ test "L2 KG: derived_from 溯源 — 认领计划步骤后 KgRemember 的记忆�
     var expect_buf: [48]u8 = undefined;
     const needle = try std.fmt.bufPrint(&expect_buf, "derived_from\t{d}", .{step_id});
     try std.testing.expect(std.mem.indexOf(u8, nb, needle) != null);
+}
+
+fn createdKgId(result: []const u8) ![]const u8 {
+    const start = std.mem.indexOf(u8, result, "\"id\":\"kg-") orelse return error.NotPersisted;
+    const id_start = start + "\"id\":\"".len;
+    const id_end = std.mem.indexOfScalarPos(u8, result, id_start, '"') orelse return error.NotPersisted;
+    return result[id_start..id_end];
+}
+
+test "L2 KG: 多个进行中任务 — derived_from 挂最近认领的,各关闭路径都列出其余进行中任务" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    _ = harness.normalizeSlashes(pbuf[0..dir_len]); // Windows: JSON 字面量里的反斜杠会被当转义
+    const proj_dir = pbuf[0..dir_len];
+    const store_path = try std.fmt.allocPrint(a, "{s}/kgzombie.kg", .{proj_dir});
+    defer a.free(store_path);
+
+    var kg = try makeClient(a, bin, store_path, "proj-zombie");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const task_tools = @import("cc").task_tools;
+    const kg_tools_mod = @import("cc").kg_tools;
+    const TaskStore = @import("cc").core_task_store.TaskStore;
+    var tstore = TaskStore.init(a);
+    defer tstore.deinit();
+    const ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tstore,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+
+    const old_resp = try task_tools.executeCreate(&ctx, "{\"subject\":\"v189 旧思路\",\"description\":\"已被取代\"}");
+    defer a.free(old_resp);
+    const mid_resp = try task_tools.executeCreate(&ctx, "{\"subject\":\"v215 中间思路\",\"description\":\"走不通\"}");
+    defer a.free(mid_resp);
+    const new_resp = try task_tools.executeCreate(&ctx, "{\"subject\":\"v277 当前思路\",\"description\":\"正在做\"}");
+    defer a.free(new_resp);
+    const old_id = try createdKgId(old_resp);
+    const mid_id = try createdKgId(mid_resp);
+    const new_id = try createdKgId(new_resp);
+
+    for ([_][]const u8{ old_id, mid_id, new_id }) |id| {
+        const claim = try std.fmt.allocPrint(a, "{{\"taskId\":\"{s}\",\"status\":\"in_progress\"}}", .{id});
+        defer a.free(claim);
+        const resp = try task_tools.executeUpdate(&ctx, claim);
+        defer a.free(resp);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "\"claimed\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "still_in_progress") == null); // 认领不是结束
+    }
+
+    // 记忆回链当前(最近认领的)任务,而不是最早开的那个。
+    const mem_resp = try kg_tools_mod.executeRemember(&ctx, "{\"text\":\"条目边界由差分确定\",\"kind\":\"observation\"}");
+    defer a.free(mem_resp);
+    const marker = "\"node_id\":";
+    const mpos = std.mem.indexOf(u8, mem_resp, marker).?;
+    const mem_id = blk: {
+        var end = mpos + marker.len;
+        while (end < mem_resp.len and mem_resp[end] >= '0' and mem_resp[end] <= '9') end += 1;
+        break :blk try std.fmt.parseInt(u64, mem_resp[mpos + marker.len .. end], 10);
+    };
+    const nb = try kg.neighborsJson(mem_id, 20);
+    defer kg.allocator.free(nb);
+    const Edge = struct { rel: []const u8, dst: u64 };
+    const Envelope = struct { edges: []const Edge };
+    const graph = try std.json.parseFromSlice(Envelope, a, nb, .{ .ignore_unknown_fields = true });
+    defer graph.deinit();
+    var derived: std.ArrayList(u64) = .empty;
+    defer derived.deinit(a);
+    for (graph.value.edges) |edge| {
+        if (std.mem.eql(u8, edge.rel, "derived_from")) try derived.append(a, edge.dst);
+    }
+    const new_node = try std.fmt.parseInt(u64, new_id["kg-".len..], 10);
+    try std.testing.expectEqualSlices(u64, &.{new_node}, derived.items);
+
+    // 三条 kg 关闭路径都要点名仍在进行中的任务,最早认领的在前。
+    const stop_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"{s}\",\"conclusion\":\"差分定位完成\"}}", .{new_id});
+    defer a.free(stop_args);
+    const stopped = try task_tools.executeStop(&ctx, stop_args);
+    defer a.free(stopped);
+    try expectStillInProgress(a, stopped, &.{ old_id, mid_id });
+
+    const fail_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"{s}\",\"status\":\"failed\",\"conclusion\":\"走不通\"}}", .{mid_id});
+    defer a.free(fail_args);
+    const failed = try task_tools.executeUpdate(&ctx, fail_args);
+    defer a.free(failed);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"failed\":true") != null);
+    try expectStillInProgress(a, failed, &.{old_id});
+
+    // 最后一个按提示关闭(取代 → deleted 别名转 failed):再无进行中任务,不附提示。
+    const close_old = try std.fmt.allocPrint(a, "{{\"taskId\":\"{s}\",\"status\":\"deleted\",\"conclusion\":\"被 v277 取代\"}}", .{old_id});
+    defer a.free(close_old);
+    const closed_old = try task_tools.executeUpdate(&ctx, close_old);
+    defer a.free(closed_old);
+    try std.testing.expect(std.mem.indexOf(u8, closed_old, "\"failed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, closed_old, "still_in_progress") == null);
+
+    // 关闭当前任务走 TaskUpdate completed 的那条路径:单独再开两个验证。
+    const c1 = try task_tools.executeCreate(&ctx, "{\"subject\":\"旁支\",\"description\":\"\"}");
+    defer a.free(c1);
+    const c2 = try task_tools.executeCreate(&ctx, "{\"subject\":\"主线\",\"description\":\"\"}");
+    defer a.free(c2);
+    for ([_][]const u8{ try createdKgId(c1), try createdKgId(c2) }) |id| {
+        const claim = try std.fmt.allocPrint(a, "{{\"taskId\":\"{s}\",\"status\":\"in_progress\"}}", .{id});
+        defer a.free(claim);
+        a.free(try task_tools.executeUpdate(&ctx, claim));
+    }
+    const done_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"{s}\",\"status\":\"completed\",\"conclusion\":\"ok\"}}", .{try createdKgId(c2)});
+    defer a.free(done_args);
+    const done = try task_tools.executeUpdate(&ctx, done_args);
+    defer a.free(done);
+    try std.testing.expect(std.mem.indexOf(u8, done, "\"closed\":true") != null);
+    try expectStillInProgress(a, done, &.{try createdKgId(c1)});
+}
+
+fn expectStillInProgress(a: std.mem.Allocator, result: []const u8, ids: []const []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result, .{});
+    defer parsed.deinit();
+    const listed = parsed.value.object.get("still_in_progress").?.object.get("tasks").?.array.items;
+    try std.testing.expectEqual(ids.len, listed.len);
+    for (ids, listed) |id, row| try std.testing.expectEqualStrings(id, row.object.get("id").?.string);
 }
 
 test "L2 KG: TaskCreate write-through — ad-hoc todo 落图 inbox,TaskList 呈现,TaskGet/Stop 走 kg-" {
