@@ -200,6 +200,35 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Tasks left `in_progress` no longer crowd out the current one. A model that
+  opens a task per attempt and never closes the last one piled up stale
+  in-progress tasks, and the code took the *first* in-progress task as the
+  current one: the compaction task anchor named the oldest three with
+  "continue the tasks above" (a long session's anchor revived three
+  superseded attempts and left out the one in progress), and `KgRemember`
+  attached `derived_from` provenance to the oldest. Both now follow the most
+  recently claimed task (a claim sequence kept in the degraded-mode task
+  mirror, not a clock: the monotonic clock restarts at boot); the anchor names
+  the three most recent and lists older open ids with a request to close the
+  ones later work finished or replaced. Closing a task (TaskUpdate completed,
+  deleted or failed, TaskStop) now lists the other tasks still in progress in
+  its result, oldest claim first, so they are reviewed at the moment one ends.
+  Each claim now records who made it and when (the same identity the agent
+  uses for TinyKG leases, declared by the agent loop), and the anchor, the
+  closing list and provenance leave out work another agent still holds: the
+  degraded-mode mirror is shared by every session in the repository and by
+  swarm teammates, and the startup rebuild of persistent tasks keeps each
+  lease's real holder. In the degraded mirror another agent's claim expires
+  after two hours (TinyKG's default lease); an expired claim is then offered
+  for closing but never named as work to continue. Persistent `kg-*` tasks
+  follow TinyKG's own lease instead. Claims made under an identity this agent
+  used earlier (before `/clear`, `/resume` or sending work to the background)
+  stay its own, and rows whose claimer is unknown (written before this change)
+  are treated as the agent's own, as before. When
+  the task panel overflows it keeps the most recently claimed tasks instead of
+  the oldest, and a completed task reloaded from the mirror after a reboot no
+  longer stays on the panel indefinitely (its timestamp is from the previous
+  boot's clock).
 - The WorkBuddy installed-adapter suites run in CI: the Linux and macOS gates
   provision the pinned WorkBuddy-Bench checkout
   (`scripts/eval/workbuddy/provision_checkout.sh`: pinned commit, this

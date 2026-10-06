@@ -5,6 +5,7 @@
 //! - TaskGet(taskId) → 完整 Task JSON
 //! - TaskList() → `[{id,subject,status,owner?,blockedBy}]`
 //! - TaskUpdate(taskId, status?|subject?|description?|active_form?|owner?|addBlocks?|addBlockedBy?) → `{ok:true}`
+//!   (关闭任务时另附 `still_in_progress`:其它仍为进行中的任务,见 appendStillInProgress)
 //! - TaskStop(taskId) → 等价于 TaskUpdate(taskId, status=completed)
 //!
 //! 所有工具都需要 ctx.tasks 非空；未挂载返 error.TaskStoreUnavailable。
@@ -15,6 +16,7 @@ const task_store = @import("../core/task_store.zig");
 const TaskStatus = task_store.TaskStatus;
 const Task = task_store.Task;
 const util_json = @import("../util/json.zig");
+const utf8 = @import("../util/utf8.zig");
 const common = @import("common.zig");
 const log = @import("../util/log.zig");
 const KgClient = @import("../kg/client.zig").KgClient;
@@ -692,8 +694,49 @@ fn failKgTask(
     errdefer out.deinit(ctx.allocator);
     try out.appendSlice(ctx.allocator, "{\"ok\":true,\"failed\":true,\"kg_status\":\"failed\",\"preserved\":true");
     try appendProjectionReport(ctx, &out, projection);
+    appendStillInProgress(ctx, &out);
     try out.append(ctx.allocator, '}');
     return out.toOwnedSlice(ctx.allocator);
+}
+
+/// 关闭提示最多列出的其它进行中任务数。
+const STILL_IN_PROGRESS_MAX: usize = 8;
+/// 提示里每个任务标题的字节上限(UTF-8 边界截断)。
+const STILL_IN_PROGRESS_SUBJECT_BYTES: usize = 120;
+pub const STILL_IN_PROGRESS_NOTE = "这些任务仍标为进行中。" ++ task_store.STALE_TASK_GUIDANCE;
+
+/// 结束一个任务时,在结果里附上其它仍为 in_progress 的任务(僵尸任务的确定性防线)。
+/// 模型常为每个新思路开一个任务却不关上一个;关闭时刻是复查它们的自然节点。
+/// 最可能已过时的在前:别人租约已过期的认领,再是自己最早认领的。别人仍持有的认领不列
+/// (snapshotOwnInProgress 按认领者与租约过滤):KG 降级的镜像按仓库共享,并发会话和
+/// swarm 队友在做的事不能建议本 agent 去关。没有这样的任务 → 一个字节都不加。
+/// 尽力而为:调用时状态已提交,失败只回退本段,绝不让已生效的关闭报错或产出半截 JSON。
+fn appendStillInProgress(ctx: *const ToolContext, out: *std.ArrayList(u8)) void {
+    const mark = out.items.len;
+    writeStillInProgress(ctx, out) catch out.shrinkRetainingCapacity(mark);
+}
+
+fn writeStillInProgress(ctx: *const ToolContext, out: *std.ArrayList(u8)) !void {
+    const store = ctx.tasks orelse return;
+    const newest_first = try store.snapshotOwnInProgress(ctx.allocator);
+    defer task_store.TaskStore.freeTaskViews(ctx.allocator, newest_first);
+    if (newest_first.len == 0) return;
+    const listed = @min(newest_first.len, STILL_IN_PROGRESS_MAX);
+    try out.appendSlice(ctx.allocator, ",\"still_in_progress\":{\"tasks\":[");
+    for (0..listed) |n| {
+        const v = newest_first[newest_first.len - 1 - n];
+        if (n > 0) try out.append(ctx.allocator, ',');
+        try out.appendSlice(ctx.allocator, "{\"id\":");
+        try writeString(out, ctx.allocator, v.id);
+        try out.appendSlice(ctx.allocator, ",\"subject\":");
+        try writeString(out, ctx.allocator, v.subject[0..utf8.prefixEnd(v.subject, STILL_IN_PROGRESS_SUBJECT_BYTES)]);
+        try out.append(ctx.allocator, '}');
+    }
+    try out.append(ctx.allocator, ']');
+    if (newest_first.len > listed) try out.print(ctx.allocator, ",\"omitted\":{d}", .{newest_first.len - listed});
+    try out.appendSlice(ctx.allocator, ",\"note\":");
+    try writeString(out, ctx.allocator, STILL_IN_PROGRESS_NOTE);
+    try out.append(ctx.allocator, '}');
 }
 
 /// KG 计划步骤更新(TaskUpdate 的 kg-<node> 路由)。completed/failed 走 canonical
@@ -737,6 +780,7 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
             appendParallelHint(ctx, &out, &first, parallel_ready) catch {};
             try out.append(ctx.allocator, ']');
             try appendProjectionReport(ctx, &out, projection);
+            appendStillInProgress(ctx, &out);
             try out.appendSlice(ctx.allocator, "}");
             noteTasksChanged(ctx); // U6:闭合 → frontier 变(解锁下游)
             return out.toOwnedSlice(ctx.allocator);
@@ -838,14 +882,16 @@ pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     const store = try requireStore(ctx);
+    var closed = false;
     if (try extractString(args, "status")) |status_str| {
         const st = TaskStatus.fromString(status_str) orelse return error.InvalidStatus;
         try store.updateStatus(id, st);
         if (st == .deleted) {
             // 删除后不能再拿 id 查找；提前返回避免后续字段更新。
             noteTasksChanged(ctx); // U6:frontier 变
-            return try ctx.allocator.dupe(u8, "{\"ok\":true,\"deleted\":true}");
+            return closedResult(ctx, "{\"ok\":true,\"deleted\":true");
         }
+        closed = st == .completed;
     }
 
     // 字段更新（模型可能写 \n \" 等 JSON 转义，必须 unescape 后再存）
@@ -903,6 +949,7 @@ pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     noteTasksChanged(ctx); // U6:status/字段/blocks 任一变 → frontier 信号
+    if (closed) return closedResult(ctx, "{\"ok\":true");
     return try ctx.allocator.dupe(u8, "{\"ok\":true}");
 }
 
@@ -959,13 +1006,24 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         errdefer out.deinit(ctx.allocator);
         try out.appendSlice(ctx.allocator, "{\"ok\":true,\"status\":\"completed\"");
         try appendProjectionReport(ctx, &out, projection);
+        appendStillInProgress(ctx, &out);
         try out.append(ctx.allocator, '}');
         return out.toOwnedSlice(ctx.allocator);
     }
     const store = try requireStore(ctx);
     try store.updateStatus(id, .completed);
     noteTasksChanged(ctx); // U6:TaskStop 闭合 → frontier 变
-    return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
+    return closedResult(ctx, "{\"ok\":true,\"status\":\"completed\"");
+}
+
+/// 本地清单关闭的结果:`head` 是未闭合的 JSON 对象前缀,补上其它进行中任务的提示后闭合。
+fn closedResult(ctx: *const ToolContext, head: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    try out.appendSlice(ctx.allocator, head);
+    appendStillInProgress(ctx, &out);
+    try out.append(ctx.allocator, '}');
+    return out.toOwnedSlice(ctx.allocator);
 }
 
 // ============================================================================
@@ -1282,6 +1340,117 @@ test "TaskStop marks completed" {
     const r = try executeStop(&ctx, "{\"taskId\":\"1\"}");
     defer testing.allocator.free(r);
     try testing.expect(store.get("1").?.status == .completed);
+}
+
+fn expectStillInProgressIds(result: []const u8, expected: []const []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
+    defer parsed.deinit();
+    const hint = parsed.value.object.get("still_in_progress") orelse return error.MissingHint;
+    const listed = hint.object.get("tasks").?.array.items;
+    try testing.expectEqual(expected.len, listed.len);
+    for (expected, listed) |id, row| try testing.expectEqualStrings(id, row.object.get("id").?.string);
+    try testing.expectEqualStrings(STILL_IN_PROGRESS_NOTE, hint.object.get("note").?.string);
+}
+
+test "关闭任务时列出其它仍进行中的任务(最早认领的在前,不是最早创建的),不列 pending 与刚关的" {
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const ctx = testCtx(&store);
+    for ([_][]const u8{ "v189", "v215", "backlog", "v277" }) |subject| {
+        const args = try std.fmt.allocPrint(testing.allocator, "{{\"subject\":\"{s}\",\"description\":\"\"}}", .{subject});
+        defer testing.allocator.free(args);
+        testing.allocator.free(try executeCreate(&ctx, args));
+    }
+    for ([_][]const u8{ "2", "1", "4" }) |id| { // 认领顺序与创建顺序不同
+        const args = try std.fmt.allocPrint(testing.allocator, "{{\"taskId\":\"{s}\",\"status\":\"in_progress\"}}", .{id});
+        defer testing.allocator.free(args);
+        const claimed = try executeUpdate(&ctx, args);
+        defer testing.allocator.free(claimed);
+        // 认领不是结束:不加提示。
+        try testing.expectEqualStrings("{\"ok\":true}", claimed);
+    }
+
+    const done = try executeUpdate(&ctx, "{\"taskId\":\"4\",\"status\":\"completed\"}");
+    defer testing.allocator.free(done);
+    try expectStillInProgressIds(done, &.{ "2", "1" });
+    try testing.expect(std.mem.indexOf(u8, done, "\"subject\":\"v189\"") != null);
+    try testing.expect(std.mem.indexOf(u8, done, "backlog") == null);
+    try testing.expect(std.mem.indexOf(u8, done, "omitted") == null);
+
+    const deleted = try executeUpdate(&ctx, "{\"taskId\":\"1\",\"status\":\"deleted\"}");
+    defer testing.allocator.free(deleted);
+    try testing.expect(std.mem.indexOf(u8, deleted, "\"deleted\":true") != null);
+    try expectStillInProgressIds(deleted, &.{"2"});
+
+    // 最后一个进行中的任务关掉后,结果与原来逐字节相同。
+    const stopped = try executeStop(&ctx, "{\"taskId\":\"2\"}");
+    defer testing.allocator.free(stopped);
+    try testing.expectEqualStrings("{\"ok\":true,\"status\":\"completed\"}", stopped);
+    const last = try executeUpdate(&ctx, "{\"taskId\":\"3\",\"status\":\"completed\"}");
+    defer testing.allocator.free(last);
+    try testing.expectEqualStrings("{\"ok\":true}", last);
+}
+
+test "关闭提示:TaskStop 同样附带;超上限只计数,标题按 UTF-8 边界截断" {
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const ctx = testCtx(&store);
+    const long_subject = "解" ** 60; // 180 字节,截到 120 = 40 个完整字符
+    var i: usize = 0;
+    while (i < STILL_IN_PROGRESS_MAX + 3) : (i += 1) {
+        const t = try store.create(long_subject, "", null);
+        try store.updateStatus(t.id, .in_progress);
+    }
+    const r = try executeStop(&ctx, "{\"taskId\":\"1\"}");
+    defer testing.allocator.free(r);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, r, .{});
+    defer parsed.deinit();
+    const hint = parsed.value.object.get("still_in_progress").?.object;
+    try testing.expectEqual(STILL_IN_PROGRESS_MAX, hint.get("tasks").?.array.items.len);
+    try testing.expectEqual(@as(i64, 2), hint.get("omitted").?.integer);
+    const first = hint.get("tasks").?.array.items[0].object;
+    try testing.expectEqualStrings("2", first.get("id").?.string);
+    try testing.expectEqualStrings("解" ** 40, first.get("subject").?.string);
+}
+
+test "关闭提示只列本 agent 认领的行:同一降级镜像里别的会话/队友认领的不列" {
+    const test_fs = @import("../util/fs.zig");
+    var dbuf: [256]u8 = undefined;
+    const dir_path = test_fs.testing.uniqueDir(&dbuf, "cc-zig-task-close-shared");
+    try test_fs.mkdirParents(dir_path);
+    defer test_fs.testing.rmrfBestEffort(dir_path);
+    var pbuf: [192]u8 = undefined;
+    const mirror = try std.fmt.bufPrint(&pbuf, "{s}/tasks.json", .{dir_path});
+
+    // 会话 B(同一仓库的另一个降级进程)在共享镜像里认领了自己的任务。
+    var other = task_store.TaskStore.init(testing.allocator);
+    defer other.deinit();
+    try other.setMirror(mirror);
+    try other.setClaimer("session-b");
+    const other_ctx = testCtx(&other);
+    testing.allocator.free(try executeCreate(&other_ctx, "{\"subject\":\"B 的任务\",\"description\":\"\"}"));
+    testing.allocator.free(try executeUpdate(&other_ctx, "{\"taskId\":\"1\",\"status\":\"in_progress\"}"));
+
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try store.setMirror(mirror);
+    try store.setClaimer("session-a");
+    try store.loadFromMirror();
+    const ctx = testCtx(&store);
+    testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"A 的旧任务\",\"description\":\"\"}"));
+    testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"A 的当前任务\",\"description\":\"\"}"));
+    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"2\",\"status\":\"in_progress\"}"));
+    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"3\",\"status\":\"in_progress\"}"));
+
+    const done = try executeUpdate(&ctx, "{\"taskId\":\"3\",\"status\":\"completed\"}");
+    defer testing.allocator.free(done);
+    try expectStillInProgressIds(done, &.{"2"});
+    try testing.expect(std.mem.indexOf(u8, done, "B 的任务") == null);
+
+    // 本 agent 已无进行中任务:B 的任务仍在进行,但结果逐字节不变。
+    const last = try executeUpdate(&ctx, "{\"taskId\":\"2\",\"status\":\"completed\"}");
+    defer testing.allocator.free(last);
+    try testing.expectEqualStrings("{\"ok\":true}", last);
 }
 
 test "Task* without store returns TaskStoreUnavailable" {

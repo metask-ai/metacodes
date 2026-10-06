@@ -74,6 +74,19 @@ pub const Task = struct {
     /// 转为 completed 的时戳(ms);供 TUI 清单 TTL(完成 ~30s 后从清单淡出)。
     /// 0 = 未完成或未记录。
     completed_ms: i64 = 0,
+    /// 认领序号:每次置为 in_progress 取 清单内最大值 + 1,离开 in_progress 清零。
+    /// 挑"当前任务"取序号最大的:开了不关的旧任务序号总是最小,不能冒充当前工作。
+    /// 用序号不用时钟:它随镜像落盘、跨进程跨重启共享,而 nowMs 是开机相对时钟,
+    /// 重启后变小,会让上一次开机留下的旧任务排在新认领之前。
+    /// 0 = 不在进行中,或旧镜像文件未记录(排序时视为最老)。
+    claim_seq: u64 = 0,
+    /// 认领者身份(owned):认领时取清单声明的身份(TaskStore.setClaimer),离开 in_progress
+    /// 清零。KG 降级的镜像按仓库共享(并发会话、swarm 队友都写同一个文件),任务锚、关闭
+    /// 提示和记忆溯源据它只看本 agent 认领的行。null = 未知(旧镜像、未声明身份)。
+    claimed_by: ?[]const u8 = null,
+    /// 认领时刻(墙钟 unix ms;与 claimed_by 同生同灭)。别人的认领只在租约期
+    /// (CLAIM_LEASE_MS)内算别人的;过期后谁都可以把它当僵尸处理。
+    claimed_at_ms: i64 = 0,
     blocks: std.ArrayList([]const u8) = .empty, // elements owned
     blocked_by: std.ArrayList([]const u8) = .empty, // elements owned
 
@@ -83,12 +96,34 @@ pub const Task = struct {
         allocator.free(self.description);
         if (self.active_form) |s| allocator.free(s);
         if (self.owner) |s| allocator.free(s);
+        if (self.claimed_by) |s| allocator.free(s);
         for (self.blocks.items) |s| allocator.free(s);
         self.blocks.deinit(allocator);
         for (self.blocked_by.items) |s| allocator.free(s);
         self.blocked_by.deinit(allocator);
     }
 };
+
+/// 处置"仍标为进行中、可能已过时"的任务的指引,compact 任务锚与关闭提示共用。
+/// kg-* 任务的生命周期没有 deleted(只是 failed 的兼容别名),故单独点名 failed。
+pub const STALE_TASK_GUIDANCE =
+    "已被后续工作完成的用 TaskUpdate 标 completed;被取代或放弃的标 deleted(kg-* 任务标 failed 并写明原因);仍需继续的保留。";
+
+/// 别人的认领在多久内仍算别人的,与 TinyKG task-claim 默认租约(7200s)一致:KG 模式
+/// 靠它让崩掉/退出的会话不永久占坑,降级镜像没有租约服务,用认领时刻在读侧同样判过期——
+/// 否则昨天进程留下的僵尸任务对之后所有会话都算"别人的",再也不会被提醒关闭。
+pub const CLAIM_LEASE_MS: i64 = 7200 * std.time.ms_per_s;
+
+fn wallNowMs() i64 {
+    return @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
+}
+
+/// 任务 a(清单下标 a_index)是否比 b 更近被认领。序号只在旧镜像缺序号(都为 0)时
+/// 相同,此时清单中靠后者更近。全序:挑"当前任务"与排序共用这一条规则。
+pub fn claimedMoreRecently(a_seq: u64, a_index: usize, b_seq: u64, b_index: usize) bool {
+    if (a_seq != b_seq) return a_seq > b_seq;
+    return a_index > b_index;
+}
 
 pub const TaskStore = struct {
     allocator: std.mem.Allocator,
@@ -105,6 +140,14 @@ pub const TaskStore = struct {
     /// `mutex -> file_lock -> reload -> mutate -> fsync+rename`，因此 stale writer 不会抹掉
     /// 其它 teammate 的任务；文件损坏或锁失败会在 mutation 前 fail closed。
     mirror_path: ?[]u8 = null,
+    /// 使用本清单的 agent 以什么身份认领任务(owned;null = 未声明,不按认领者过滤)。
+    claimer: ?[]u8 = null,
+    /// 本清单先前声明过的身份(owned,最多 MAX_PAST_CLAIMERS 个)。一个清单实例只服务一个
+    /// agent(serve_multi 每会话一个 App,子 agent/队友各有自己的清单),所以 /clear、/resume、
+    /// 转后台轮换出的旧身份认领的本地行仍是本 agent 的。
+    past_claimers: std.ArrayList([]u8) = .empty,
+
+    const MAX_PAST_CLAIMERS: usize = 16;
 
     pub fn init(allocator: std.mem.Allocator) TaskStore {
         return .{ .allocator = allocator, .tasks = .empty };
@@ -125,26 +168,148 @@ pub const TaskStore = struct {
         self.mirror_path = replacement;
     }
 
-    /// **task#19 跨线程读**:锁内把当前任务快照成 owned 值(id/subject/status),供 attach 快照。
-    /// caller free 每个 .id/.subject + 外层 slice。
-    pub const TaskView = struct { id: []u8, subject: []u8, status: TaskStatus };
+    /// 声明使用本清单的 agent 以什么身份认领任务。必须与工具认领 KG 租约的身份同源
+    /// (ToolContext.kg_agent_ident orelse agent_ident);agent_loop.run 每次进入时设置,
+    /// 会话轮换后自然跟上。之后的认领把它记进任务行(Task.claimed_by)。
+    /// 复制失败时身份清空(不按认领者过滤、认领不记身份),而不是留着可能已轮换掉的旧身份。
+    pub fn setClaimer(self: *TaskStore, ident: ?[]const u8) !void {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        if (ident) |new| {
+            if (self.claimer) |current| {
+                if (std.mem.eql(u8, current, new)) return;
+            }
+        }
+        const replacement: ?[]u8 = if (ident) |new| self.allocator.dupe(u8, new) catch |err| {
+            self.retireClaimerLocked();
+            return err;
+        } else null;
+        self.retireClaimerLocked();
+        self.claimer = replacement;
+    }
+
+    /// 把当前身份移进 past_claimers(满了丢最老的;记不下就只释放)。调用方持有 mutex。
+    fn retireClaimerLocked(self: *TaskStore) void {
+        const current = self.claimer orelse return;
+        self.claimer = null;
+        for (self.past_claimers.items) |past| {
+            if (std.mem.eql(u8, past, current)) {
+                self.allocator.free(current);
+                return;
+            }
+        }
+        if (self.past_claimers.items.len == MAX_PAST_CLAIMERS) {
+            self.allocator.free(self.past_claimers.orderedRemove(0));
+        }
+        self.past_claimers.append(self.allocator, current) catch self.allocator.free(current);
+    }
+
+    /// 一条进行中认领对本 agent 的归属。
+    const Attribution = enum {
+        /// 本 agent 的(或认领者未知):可点名续做、提示关闭、作溯源。
+        own,
+        /// 别人的本地认领,租约已过期:没人在做了,只作为待关闭的僵尸出现。
+        expired_foreign,
+        /// 别人仍持有的认领:不点名、不建议关闭、不作溯源。
+        foreign,
+    };
+
+    fn attribution(self: *const TaskStore, t: *const Task, now_ms: i64) Attribution {
+        const me = self.claimer orelse return .own;
+        const holder = t.claimed_by orelse return .own;
+        if (std.mem.eql(u8, holder, me)) return .own;
+        // kg-* 行的租约归 TinyKG 管:镜像只是启动时的快照,本地不判过期(TinyKG 让租约过期后,
+        // TaskList 的实时 frontier 和下次启动的重建都会把它放回任务池)。旧身份的 KG 租约也
+        // 不算自己的:关它需要原持有者。
+        if (std.mem.startsWith(u8, t.id, "kg-")) return .foreign;
+        for (self.past_claimers.items) |past| {
+            if (std.mem.eql(u8, holder, past)) return .own;
+        }
+        // 时刻未知(0)或比"现在 + 一个租约"还晚(时钟错乱/被改过)都不信;略早于认领时刻
+        // (时钟小幅回拨)按未过期处理。
+        if (t.claimed_at_ms == 0 or t.claimed_at_ms > now_ms +| CLAIM_LEASE_MS) return .expired_foreign;
+        return if (now_ms - t.claimed_at_ms >= CLAIM_LEASE_MS) .expired_foreign else .foreign;
+    }
+
+    /// **task#19 跨线程读**:锁内把任务快照成 owned 值(id/subject/status),供 attach 快照
+    /// 等跨线程读者。用完交给 `freeTaskViews`。
+    pub const TaskView = struct {
+        id: []u8,
+        subject: []u8,
+        status: TaskStatus,
+        /// snapshotOwnInProgress 专用:别人的认领、租约已过期(只该作为僵尸被关闭)。
+        expired_claim: bool = false,
+    };
+
+    /// 全部任务,清单顺序。
     pub fn snapshotTasks(self: *TaskStore, allocator: std.mem.Allocator) ![]TaskView {
         _ = self.mutex.lock();
         defer _ = self.mutex.unlock();
-        const out = try allocator.alloc(TaskView, self.tasks.items.len);
-        errdefer allocator.free(out);
-        var n: usize = 0;
-        errdefer for (out[0..n]) |v| {
+        return dupeViews(allocator, self.tasks.items, null);
+    }
+
+    /// 本 agent 该处理的进行中任务:先是自己的(最近认领在前,与 latestInProgress 同一
+    /// 规则),再是别人租约已过期的(expired_claim = true,同样最近在前);别人仍持有的不含。
+    /// 共享镜像先重放磁盘:队友/别的会话刚接手或关闭的行不能按陈旧的本地副本被点名。
+    pub fn snapshotOwnInProgress(self: *TaskStore, allocator: std.mem.Allocator) ![]TaskView {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        var mirror_txn = try self.beginMirrorTxnLocked();
+        defer if (mirror_txn) |*lock| lock.release();
+        const Row = struct { index: usize, expired: bool };
+        var rows: std.ArrayList(Row) = .empty;
+        defer rows.deinit(allocator);
+        const now_ms = wallNowMs();
+        for (self.tasks.items, 0..) |t, i| {
+            if (t.status != .in_progress) continue;
+            switch (self.attribution(t, now_ms)) {
+                .own => try rows.append(allocator, .{ .index = i, .expired = false }),
+                .expired_foreign => try rows.append(allocator, .{ .index = i, .expired = true }),
+                .foreign => {},
+            }
+        }
+        const Order = struct {
+            tasks: []const *Task,
+            fn before(ctx: @This(), a: Row, b: Row) bool {
+                if (a.expired != b.expired) return !a.expired;
+                return claimedMoreRecently(ctx.tasks[a.index].claim_seq, a.index, ctx.tasks[b.index].claim_seq, b.index);
+            }
+        };
+        std.mem.sort(Row, rows.items, Order{ .tasks = self.tasks.items }, Order.before);
+        const picks = try allocator.alloc(usize, rows.items.len);
+        defer allocator.free(picks);
+        for (rows.items, picks) |row, *pick| pick.* = row.index;
+        const views = try dupeViews(allocator, self.tasks.items, picks);
+        for (rows.items, views) |row, *view| view.expired_claim = row.expired;
+        return views;
+    }
+
+    /// 释放快照;空切片(含 `catch &.{}` 的静态空值)是 no-op。
+    pub fn freeTaskViews(allocator: std.mem.Allocator, views: []const TaskView) void {
+        for (views) |v| {
             allocator.free(v.id);
             allocator.free(v.subject);
-        };
-        for (self.tasks.items) |t| {
-            out[n] = .{
-                .id = try allocator.dupe(u8, t.id),
-                .subject = try allocator.dupe(u8, t.subject),
-                .status = t.status,
-            };
-            n += 1;
+        }
+        allocator.free(views);
+    }
+
+    /// 复制 `pick` 选中的行(null = 全部),按 pick 顺序。失败时已复制的全部释放。
+    fn dupeViews(allocator: std.mem.Allocator, tasks: []const *Task, pick: ?[]const usize) ![]TaskView {
+        const len = if (pick) |p| p.len else tasks.len;
+        const out = try allocator.alloc(TaskView, len);
+        var n: usize = 0;
+        errdefer {
+            for (out[0..n]) |v| {
+                allocator.free(v.id);
+                allocator.free(v.subject);
+            }
+            allocator.free(out);
+        }
+        while (n < len) : (n += 1) {
+            const t = tasks[if (pick) |p| p[n] else n];
+            const id = try allocator.dupe(u8, t.id);
+            errdefer allocator.free(id);
+            out[n] = .{ .id = id, .subject = try allocator.dupe(u8, t.subject), .status = t.status };
         }
         return out;
     }
@@ -156,6 +321,9 @@ pub const TaskStore = struct {
         }
         self.tasks.deinit(self.allocator);
         if (self.mirror_path) |p| self.allocator.free(p);
+        if (self.claimer) |c| self.allocator.free(c);
+        for (self.past_claimers.items) |past| self.allocator.free(past);
+        self.past_claimers.deinit(self.allocator);
     }
 
     /// 调用方已持有 `mutex`；若启用 mirror，同时获取跨进程锁并重放磁盘最新值。
@@ -238,6 +406,14 @@ pub const TaskStore = struct {
         }
         if (t.completed_ms != 0) {
             try w.writer.print(",\"completed_ms\":{d}", .{t.completed_ms});
+        }
+        if (t.claim_seq != 0) {
+            try w.writer.print(",\"claim_seq\":{d}", .{t.claim_seq});
+        }
+        if (t.claimed_by) |holder| {
+            try w.writer.writeAll(",\"claimed_by\":");
+            try util_json.writeJsonString(&w.writer, holder);
+            try w.writer.print(",\"claimed_at_ms\":{d}", .{t.claimed_at_ms});
         }
         if (t.blocks.items.len > 0) {
             try w.writer.writeAll(",\"blocks\":[");
@@ -341,6 +517,8 @@ pub const TaskStore = struct {
         errdefer if (!task_owns_fields) if (active_form) |value| self.allocator.free(value);
         const owner = try jsonOptionalString(self.allocator, obj, "owner");
         errdefer if (!task_owns_fields) if (owner) |value| self.allocator.free(value);
+        const claimed_by = try jsonOptionalString(self.allocator, obj, "claimed_by");
+        errdefer if (!task_owns_fields) if (claimed_by) |value| self.allocator.free(value);
         const status = if (obj.get("status")) |value| switch (value) {
             .string => |raw| TaskStatus.fromString(raw) orelse return error.MirrorCorrupt,
             else => return error.MirrorCorrupt,
@@ -351,6 +529,17 @@ pub const TaskStore = struct {
             else => return error.MirrorCorrupt,
         } else 0;
         if (completed_ms < 0 or (status != .completed and completed_ms != 0)) return error.MirrorCorrupt;
+        // 旧镜像没有该字段:in_progress 行读作 0(排序视为最老),不算损坏。
+        const claim_seq: u64 = if (obj.get("claim_seq")) |value| switch (value) {
+            .integer => |raw| std.math.cast(u64, raw) orelse return error.MirrorCorrupt,
+            else => return error.MirrorCorrupt,
+        } else 0;
+        if (status != .in_progress and (claim_seq != 0 or claimed_by != null)) return error.MirrorCorrupt;
+        const claimed_at_ms: i64 = if (obj.get("claimed_at_ms")) |value| switch (value) {
+            .integer => |raw| raw,
+            else => return error.MirrorCorrupt,
+        } else 0;
+        if (claimed_at_ms < 0 or (claimed_by == null and claimed_at_ms != 0)) return error.MirrorCorrupt;
 
         const t = try self.allocator.create(Task);
         t.* = .{
@@ -361,6 +550,9 @@ pub const TaskStore = struct {
             .owner = owner,
             .status = status,
             .completed_ms = completed_ms,
+            .claim_seq = claim_seq,
+            .claimed_by = claimed_by,
+            .claimed_at_ms = claimed_at_ms,
         };
         task_owns_fields = true;
         errdefer {
@@ -455,6 +647,7 @@ pub const TaskStore = struct {
     /// 用**显式 id** 插入(KG write-through 镜像:图为持久真相,store 为 TaskTab/TaskList 的
     /// 同步显示缓存;id 用 "kg-<node>" 与图对齐)。已存在同 id → 幂等跳过(供启动重建)。
     /// status 可指定(计划步骤 blocked 等)。绝不动 next_id(kg- 不占数字命名空间)。
+    /// in_progress 行记为本清单声明的身份认领(本 agent 刚认领的 KG 任务)。
     pub fn createWithId(
         self: *TaskStore,
         id: []const u8,
@@ -462,12 +655,42 @@ pub const TaskStore = struct {
         description: []const u8,
         status: TaskStatus,
     ) !void {
+        return self.createWithIdClaimed(id, subject, description, status, .current);
+    }
+
+    /// 同 createWithId,但 in_progress 行的认领者是给定的租约持有者(启动时按 KG frontier
+    /// 重建镜像:租约可能属于别的会话或队友;null = 租约已过期,持有者未知)。
+    pub fn createWithIdHeldBy(
+        self: *TaskStore,
+        id: []const u8,
+        subject: []const u8,
+        description: []const u8,
+        status: TaskStatus,
+        holder: ?[]const u8,
+    ) !void {
+        return self.createWithIdClaimed(id, subject, description, status, .{ .holder = holder });
+    }
+
+    const Claimant = union(enum) { current, holder: ?[]const u8 };
+
+    fn createWithIdClaimed(
+        self: *TaskStore,
+        id: []const u8,
+        subject: []const u8,
+        description: []const u8,
+        status: TaskStatus,
+        claimant: Claimant,
+    ) !void {
         _ = self.mutex.lock(); // task#19
         defer _ = self.mutex.unlock();
         var mirror_txn = try self.beginMirrorTxnLocked();
         defer if (mirror_txn) |*lock| lock.release();
         errdefer if (mirror_txn != null) self.reloadMirrorLocked() catch {};
         if (self.get(id) != null) return; // 幂等(get 无锁,不重入)
+        const holder: ?[]const u8 = if (status != .in_progress) null else switch (claimant) {
+            .current => self.claimer,
+            .holder => |value| value,
+        };
         var task_owned_by_store = false;
         const t = try self.allocator.create(Task);
         errdefer if (!task_owned_by_store) self.allocator.destroy(t);
@@ -477,7 +700,18 @@ pub const TaskStore = struct {
         errdefer if (!task_owned_by_store) self.allocator.free(subj);
         const desc = try self.allocator.dupe(u8, description);
         errdefer if (!task_owned_by_store) self.allocator.free(desc);
-        t.* = .{ .id = id_owned, .subject = subj, .description = desc, .active_form = null, .status = status };
+        const claimed_by: ?[]const u8 = if (holder) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (!task_owned_by_store) if (claimed_by) |value| self.allocator.free(value);
+        t.* = .{
+            .id = id_owned,
+            .subject = subj,
+            .description = desc,
+            .active_form = null,
+            .status = status,
+            .claim_seq = if (status == .in_progress) self.nextClaimSeqLocked() else 0,
+            .claimed_by = claimed_by,
+            .claimed_at_ms = if (claimed_by != null) wallNowMs() else 0,
+        };
         try self.tasks.append(self.allocator, t);
         task_owned_by_store = true;
         try self.mirrorToFileLocked();
@@ -494,18 +728,68 @@ pub const TaskStore = struct {
     /// Return the one persistent KG task currently owned by this agent loop.
     /// Zero, multiple, or malformed `kg-*` mirrors are deliberately
     /// indistinguishable: execution-grounded knowledge must fail safe instead
-    /// of guessing which task should receive a fact.
+    /// of guessing which task should receive a fact. Rows another agent
+    /// claimed (a teammate's, or another session's live lease mirrored at
+    /// startup) are not this loop's and are not counted.
     pub fn uniqueActiveKgTaskId(self: *TaskStore) ?u64 {
         _ = self.mutex.lock();
         defer _ = self.mutex.unlock();
+        const now_ms = wallNowMs();
         var active: ?u64 = null;
         for (self.tasks.items) |task| {
             if (task.status != .in_progress or !std.mem.startsWith(u8, task.id, "kg-")) continue;
+            if (self.attribution(task, now_ms) != .own) continue;
             const node_id = std.fmt.parseInt(u64, task.id["kg-".len..], 10) catch return null;
             if (node_id == 0 or active != null) return null;
             active = node_id;
         }
         return active;
+    }
+
+    /// 最近认领的进行中任务;无则 null。无锁,与 `get` 同约定(driver/渲染侧读)。
+    pub fn latestInProgress(self: *const TaskStore) ?*Task {
+        return self.tasks.items[self.latestInProgressIndex(false) orelse return null];
+    }
+
+    /// 最近认领的 `kg-*` 进行中任务的节点 id;畸形 id 跳过,无则 null。
+    /// 记忆溯源锚用:多个进行中时取最新的,而不是最老的(开了没关的那个)。
+    pub fn latestInProgressKgTaskId(self: *TaskStore) ?u64 {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        const index = self.latestInProgressIndex(true) orelse return null;
+        return kgNodeId(self.tasks.items[index].id);
+    }
+
+    fn latestInProgressIndex(self: *const TaskStore, kg_only: bool) ?usize {
+        const now_ms = wallNowMs();
+        var best: ?usize = null;
+        for (self.tasks.items, 0..) |t, i| {
+            if (t.status != .in_progress) continue;
+            if (kg_only and kgNodeId(t.id) == null) continue;
+            if (self.attribution(t, now_ms) != .own) continue;
+            if (best) |b| {
+                if (!claimedMoreRecently(t.claim_seq, i, self.tasks.items[b].claim_seq, b)) continue;
+            }
+            best = i;
+        }
+        return best;
+    }
+
+    /// `kg-<节点号>` 的节点号;非 kg 行、畸形号与 0(不是有效节点)→ null。
+    fn kgNodeId(id: []const u8) ?u64 {
+        if (!std.mem.startsWith(u8, id, "kg-")) return null;
+        const node_id = std.fmt.parseInt(u64, id["kg-".len..], 10) catch return null;
+        return if (node_id == 0) null else node_id;
+    }
+
+    /// 下一个认领序号:清单内最大值 + 1。调用方持有 mutex;镜像开启时已在事务里重放过
+    /// 磁盘,别的进程刚写下的认领也算在内。封顶在 i64 上限:镜像 JSON 只读得回这么大的
+    /// 整数,越过它的序号写得出去、读回来却判损坏(之后所有 Task* 都会失败)。
+    fn nextClaimSeqLocked(self: *const TaskStore) u64 {
+        const ceiling: u64 = std.math.maxInt(i64);
+        var max: u64 = 0;
+        for (self.tasks.items) |t| max = @max(max, t.claim_seq);
+        return if (max >= ceiling) ceiling else max + 1;
     }
 
     /// 更新 status。若 deleted 则实际从列表删除并释放。
@@ -540,6 +824,9 @@ pub const TaskStore = struct {
         // reload 后它就是悬垂指针,查找失配 → TaskNotFound 被调用方吞掉,更新静默失效。
         const id_copy = try self.allocator.dupe(u8, id);
         defer self.allocator.free(id_copy);
+        // 认领者先复制好(唯一可能失败的分配),之后的状态改写不会半途失败。
+        var claimed_by: ?[]const u8 = if (status != .in_progress) null else if (self.claimer) |me| try self.allocator.dupe(u8, me) else null;
+        defer if (claimed_by) |value| self.allocator.free(value);
         var mirror_txn = try self.beginMirrorTxnLocked();
         defer if (mirror_txn) |*lock| lock.release();
         errdefer if (mirror_txn != null) self.reloadMirrorLocked() catch {};
@@ -559,6 +846,13 @@ pub const TaskStore = struct {
             } else {
                 t.completed_ms = 0;
             }
+            // 每次置 in_progress 都取新序号并记认领者(重新认领 = 此刻由本 agent 在做),
+            // 离开即清零。
+            t.claim_seq = if (status == .in_progress) self.nextClaimSeqLocked() else 0;
+            if (t.claimed_by) |old| self.allocator.free(old);
+            t.claimed_at_ms = if (claimed_by != null) wallNowMs() else 0;
+            t.claimed_by = claimed_by;
+            claimed_by = null;
             try self.mirrorToFileLocked();
             return;
         }
@@ -760,6 +1054,330 @@ test "TaskStore: completed 记 completed_ms,转出 completed 清零" {
     // 转回 in_progress(返工)→ 时戳清零,TTL 重置。
     try store.updateStatus(t.id, .in_progress);
     try testing.expectEqual(@as(i64, 0), t.completed_ms);
+}
+
+test "TaskStore: claim_seq 只在 in_progress 期间非零,每次认领取更大的序号" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const a = try store.create("A", "", null);
+    const b = try store.create("B", "", null);
+    try testing.expectEqual(@as(u64, 0), a.claim_seq);
+
+    try store.updateStatus(a.id, .in_progress);
+    try store.updateStatus(b.id, .in_progress);
+    try testing.expect(b.claim_seq > a.claim_seq);
+    try store.updateStatus(a.id, .in_progress); // 重新认领
+    try testing.expect(a.claim_seq > b.claim_seq);
+
+    try store.updateStatus(a.id, .pending);
+    try testing.expectEqual(@as(u64, 0), a.claim_seq);
+    try store.updateStatus(b.id, .completed);
+    try testing.expectEqual(@as(u64, 0), b.claim_seq);
+
+    try store.createWithId("kg-7", "claimed", "", .in_progress);
+    try testing.expect(store.get("kg-7").?.claim_seq != 0);
+    try store.createWithId("kg-8", "open", "", .pending);
+    try testing.expectEqual(@as(u64, 0), store.get("kg-8").?.claim_seq);
+}
+
+test "TaskStore: latestInProgress 取最近认领的,而不是最早开的那个" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(store.latestInProgress() == null);
+
+    const old = try store.create("v189 旧思路", "", null);
+    const mid = try store.create("v215 中间", "", null);
+    const cur = try store.create("v277 当前", "", null);
+    try store.updateStatus(old.id, .in_progress);
+    try store.updateStatus(mid.id, .in_progress);
+    try store.updateStatus(cur.id, .in_progress);
+    try testing.expectEqualStrings("3", store.latestInProgress().?.id);
+
+    // 重新认领最老的那个 → 它才是当前任务。
+    try store.updateStatus(old.id, .in_progress);
+    try testing.expectEqualStrings("1", store.latestInProgress().?.id);
+    try store.updateStatus(old.id, .completed);
+    try testing.expectEqualStrings("3", store.latestInProgress().?.id);
+
+    // 旧镜像缺序号(都为 0)时按清单位置,靠后者更近。
+    mid.claim_seq = 0;
+    cur.claim_seq = 0;
+    try testing.expectEqualStrings("3", store.latestInProgress().?.id);
+
+    const views = try store.snapshotOwnInProgress(testing.allocator);
+    defer TaskStore.freeTaskViews(testing.allocator, views);
+    try testing.expectEqual(@as(usize, 2), views.len);
+    try testing.expectEqualStrings("3", views[0].id);
+    try testing.expectEqualStrings("2", views[1].id);
+}
+
+test "TaskStore: latestInProgressKgTaskId 取最新 kg-* 认领,跳过非 kg 与畸形 id" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(store.latestInProgressKgTaskId() == null);
+
+    try store.createWithId("kg-41", "old", "", .in_progress);
+    try store.createWithId("kg-42", "new", "", .in_progress);
+    try store.createWithId("session-only", "local", "", .in_progress);
+    try store.createWithId("kg-bad", "malformed", "", .in_progress);
+    try store.createWithId("kg-0", "not a node", "", .in_progress);
+    try testing.expectEqual(@as(?u64, 42), store.latestInProgressKgTaskId());
+
+    try store.updateStatus("kg-41", .in_progress);
+    try testing.expectEqual(@as(?u64, 41), store.latestInProgressKgTaskId());
+    try store.updateStatus("kg-41", .pending);
+    try testing.expectEqual(@as(?u64, 42), store.latestInProgressKgTaskId());
+}
+
+test "TaskStore: 认领记下声明的身份,离开 in_progress 清掉;别人仍持有的行不算自己的" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    for (0..3) |_| _ = try store.create("t", "", null);
+    try store.setClaimer("me");
+    try store.setClaimer("me"); // 同值重复声明是 no-op
+    // 另一个会话在共享镜像里的活认领(本地行):别人的。
+    try store.createWithIdHeldBy("x1", "其它会话在做", "", .in_progress, "other-session");
+    try store.updateStatus("1", .in_progress);
+    try store.updateStatus("3", .in_progress);
+    try testing.expectEqualStrings("me", store.get("1").?.claimed_by.?);
+    try testing.expectEqualStrings("other-session", store.get("x1").?.claimed_by.?);
+    // 墙钟时刻,不是开机相对时钟(后者在镜像里跨重启就错)。
+    try testing.expect(store.get("1").?.claimed_at_ms > 1_577_836_800_000); // 2020-01-01
+
+    {
+        const own = try store.snapshotOwnInProgress(testing.allocator);
+        defer TaskStore.freeTaskViews(testing.allocator, own);
+        try testing.expectEqual(@as(usize, 2), own.len);
+        try testing.expectEqualStrings("3", own[0].id);
+        try testing.expectEqualStrings("1", own[1].id);
+        try testing.expect(!own[0].expired_claim and !own[1].expired_claim);
+    }
+    try testing.expectEqualStrings("3", store.latestInProgress().?.id);
+
+    // 本 agent 接手 x1:认领者换成自己,它成了当前任务。
+    try store.updateStatus("x1", .in_progress);
+    try testing.expectEqualStrings("me", store.get("x1").?.claimed_by.?);
+    try testing.expectEqualStrings("x1", store.latestInProgress().?.id);
+    try store.updateStatus("x1", .completed);
+    try testing.expect(store.get("x1").?.claimed_by == null);
+    try testing.expectEqual(@as(i64, 0), store.get("x1").?.claimed_at_ms);
+
+    // 不声明身份时不过滤(子 agent / 单机清单),认领也不记身份。
+    try store.setClaimer(null);
+    try store.updateStatus("2", .in_progress);
+    try testing.expect(store.get("2").?.claimed_by == null);
+    const all = try store.snapshotOwnInProgress(testing.allocator);
+    defer TaskStore.freeTaskViews(testing.allocator, all);
+    try testing.expectEqual(@as(usize, 3), all.len);
+}
+
+test "TaskStore: 身份轮换(/clear、/resume、转后台)后,旧身份认领的本地行仍是本 agent 的,kg 行不是" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.create("before clear", "", null);
+    try store.setClaimer("session-1");
+    try store.updateStatus("1", .in_progress);
+    try store.createWithId("kg-5", "lease held by session-1", "", .in_progress);
+    try store.setClaimer("session-2");
+
+    // 本地行:同一个 agent 的旧身份,照样点名(会被提示关闭的僵尸)。
+    try testing.expectEqualStrings("1", store.latestInProgress().?.id);
+    // kg 行:租约仍在旧身份名下,新身份关不了,不点名也不作溯源。
+    try testing.expect(store.latestInProgressKgTaskId() == null);
+
+    // 旧身份只记最近 MAX_PAST_CLAIMERS 个。
+    var buf: [32]u8 = undefined;
+    for (0..TaskStore.MAX_PAST_CLAIMERS + 4) |i| try store.setClaimer(try std.fmt.bufPrint(&buf, "rotated-{d}", .{i}));
+    try testing.expectEqual(TaskStore.MAX_PAST_CLAIMERS, store.past_claimers.items.len);
+    try testing.expect(store.latestInProgress() == null); // session-1 已被挤出:它的认领在租约期内算别人的
+}
+
+test "TaskStore: 别人的认领只在租约期内算别人的——过期后作为僵尸排在自己的之后" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try store.setClaimer("today-session");
+    try store.createWithIdHeldBy("y1", "昨天的 A", "", .in_progress, "yesterday-session");
+    try store.createWithIdHeldBy("y2", "昨天的 B", "", .in_progress, "yesterday-session");
+    _ = try store.create("今天的", "", null);
+    try store.updateStatus("1", .in_progress);
+
+    // 租约期内:昨天的两行不是本 agent 的。
+    {
+        const own = try store.snapshotOwnInProgress(testing.allocator);
+        defer TaskStore.freeTaskViews(testing.allocator, own);
+        try testing.expectEqual(@as(usize, 1), own.len);
+    }
+    // y1 的租约到期、y2 的认领时刻未知:作为过期的别人认领排在自己的之后,但不是当前任务。
+    store.get("y1").?.claimed_at_ms -= CLAIM_LEASE_MS;
+    store.get("y2").?.claimed_at_ms = 0;
+    {
+        const own = try store.snapshotOwnInProgress(testing.allocator);
+        defer TaskStore.freeTaskViews(testing.allocator, own);
+        try testing.expectEqual(@as(usize, 3), own.len);
+        try testing.expectEqualStrings("1", own[0].id);
+        try testing.expect(!own[0].expired_claim);
+        try testing.expectEqualStrings("y2", own[1].id);
+        try testing.expectEqualStrings("y1", own[2].id);
+        try testing.expect(own[1].expired_claim and own[2].expired_claim);
+    }
+    try testing.expectEqualStrings("1", store.latestInProgress().?.id);
+
+    // 认领时刻略晚于现在(时钟小幅回拨):仍在租约期;远超"现在 + 一个租约"(时钟错乱或被改):不信。
+    const now = wallNowMs();
+    store.get("y1").?.claimed_at_ms = now + 60_000;
+    store.get("y2").?.claimed_at_ms = now + 2 * CLAIM_LEASE_MS;
+    {
+        const own = try store.snapshotOwnInProgress(testing.allocator);
+        defer TaskStore.freeTaskViews(testing.allocator, own);
+        try testing.expectEqual(@as(usize, 2), own.len);
+        try testing.expectEqualStrings("y2", own[1].id);
+    }
+}
+
+test "TaskStore: uniqueActiveKgTaskId 不把别人的 kg 认领算作本 loop 的" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try store.createWithIdHeldBy("kg-40", "previous session's live lease", "", .in_progress, "old-session");
+    try store.setClaimer("me");
+    try testing.expect(store.uniqueActiveKgTaskId() == null); // 只有别人的行:不挂执行事实
+    try store.createWithId("kg-41", "mine", "", .in_progress);
+    try testing.expectEqual(@as(?u64, 41), store.uniqueActiveKgTaskId());
+}
+
+test "TaskStore: setClaimer 复制失败时清空身份,不留可能已轮换掉的旧身份" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try store.setClaimer("old-session");
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    store.allocator = failing.allocator();
+    try testing.expectError(error.OutOfMemory, store.setClaimer("new-session"));
+    store.allocator = testing.allocator;
+    try testing.expect(store.claimer == null);
+}
+
+test "TaskStore: 显式 id 插入的认领者——本 agent 认领记当前身份,重建镜像记租约持有者" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try store.setClaimer("lead-session");
+    try store.createWithId("kg-10", "mine", "", .in_progress);
+    try store.createWithIdHeldBy("kg-11", "teammate's", "", .in_progress, "worker@team");
+    try store.createWithIdHeldBy("kg-12", "lease expired", "", .in_progress, null);
+    try store.createWithIdHeldBy("kg-13", "open", "", .pending, "worker@team");
+    try testing.expectEqualStrings("lead-session", store.get("kg-10").?.claimed_by.?);
+    try testing.expectEqualStrings("worker@team", store.get("kg-11").?.claimed_by.?);
+    try testing.expect(store.get("kg-12").?.claimed_by == null);
+    try testing.expect(store.get("kg-13").?.claimed_by == null); // 非进行中不记认领者
+
+    // 溯源不挂到队友的任务上:最近插入的 kg-11/kg-12 里只有持有者未知的 12 算自己的。
+    try testing.expectEqual(@as(?u64, 12), store.latestInProgressKgTaskId());
+    try store.updateStatus("kg-12", .pending);
+    try testing.expectEqual(@as(?u64, 10), store.latestInProgressKgTaskId());
+}
+
+test "TaskStore: 快照在中途分配失败时不泄漏" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    for (0..3) |_| {
+        const t = try store.create("subject", "", null);
+        try store.updateStatus(t.id, .in_progress);
+    }
+    // 每次分配都可能失败:失败点落在 id 与 subject 之间时,id 必须被释放。
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        if (store.snapshotTasks(failing.allocator())) |views| {
+            TaskStore.freeTaskViews(failing.allocator(), views);
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+        var failing_ip = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        if (store.snapshotOwnInProgress(failing_ip.allocator())) |views| {
+            TaskStore.freeTaskViews(failing_ip.allocator(), views);
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+}
+
+fn writeMirrorFixture(path: []const u8, bytes: []const u8) !void {
+    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+    const f = pfs.fopen(z.ptr, "wb") orelse return error.TestWriteFailed;
+    defer _ = std.c.fclose(f);
+    if (std.c.fwrite(bytes.ptr, 1, bytes.len, f) != bytes.len) return error.TestWriteFailed;
+}
+
+test "TaskStore: claim_seq 经镜像往返并跨进程递增;旧镜像缺字段可读,非进行中带序号判损坏" {
+    const test_fs = @import("../util/fs.zig");
+    var dbuf: [256]u8 = undefined;
+    const dir_path = test_fs.testing.uniqueDir(&dbuf, "cc-zig-taskstore-claimseq");
+    try test_fs.mkdirParents(dir_path);
+    defer test_fs.testing.rmrfBestEffort(dir_path);
+    var pbuf: [192]u8 = undefined;
+    const mirror = try std.fmt.bufPrint(&pbuf, "{s}/tasks.json", .{dir_path});
+
+    {
+        var writer = TaskStore.init(testing.allocator);
+        defer writer.deinit();
+        try writer.setMirror(mirror);
+        _ = try writer.create("first", "d", null);
+        _ = try writer.create("second", "d", null);
+        try writer.setClaimer("writer-session");
+        try writer.updateStatus("1", .in_progress);
+        const seq = writer.get("1").?.claim_seq;
+        try testing.expect(seq != 0);
+
+        // 另一个进程(同一镜像)后认领的任务序号更大:序号在事务内重放磁盘后才分配。
+        var other = TaskStore.init(testing.allocator);
+        defer other.deinit();
+        try other.setMirror(mirror);
+        try other.loadFromMirror();
+        try testing.expectEqual(seq, other.get("1").?.claim_seq);
+        try testing.expectEqualStrings("writer-session", other.get("1").?.claimed_by.?);
+        try testing.expectEqual(writer.get("1").?.claimed_at_ms, other.get("1").?.claimed_at_ms);
+        try other.updateStatus("2", .in_progress);
+        try testing.expect(other.get("2").?.claim_seq > seq);
+        try writer.loadFromMirror();
+        try testing.expectEqualStrings("2", writer.latestInProgress().?.id);
+    }
+
+    try writeMirrorFixture(mirror, "[{\"id\":\"1\",\"subject\":\"s\",\"description\":\"d\",\"status\":\"in_progress\"}]");
+    {
+        var legacy = TaskStore.init(testing.allocator);
+        defer legacy.deinit();
+        try legacy.setMirror(mirror);
+        try legacy.loadFromMirror();
+        try testing.expectEqual(@as(u64, 0), legacy.get("1").?.claim_seq);
+        try testing.expectEqualStrings("1", legacy.latestInProgress().?.id);
+    }
+
+    // 序号到了镜像能读回的上限(i64 最大值)就停在那里,新认领与之并列(按清单位置排),
+    // 文件仍然读得回来。
+    try writeMirrorFixture(mirror, "[{\"id\":\"1\",\"subject\":\"s\",\"description\":\"d\",\"status\":\"in_progress\",\"claim_seq\":9223372036854775807},{\"id\":\"2\",\"subject\":\"s\",\"description\":\"d\"}]");
+    {
+        var saturated = TaskStore.init(testing.allocator);
+        defer saturated.deinit();
+        try saturated.setMirror(mirror);
+        try saturated.loadFromMirror();
+        try saturated.updateStatus("2", .in_progress);
+        try testing.expectEqual(@as(u64, std.math.maxInt(i64)), saturated.get("2").?.claim_seq);
+        var reread = TaskStore.init(testing.allocator);
+        defer reread.deinit();
+        try reread.setMirror(mirror);
+        try reread.loadFromMirror();
+        try testing.expectEqualStrings("2", reread.latestInProgress().?.id);
+    }
+
+    for ([_][]const u8{
+        "[{\"id\":\"1\",\"subject\":\"s\",\"description\":\"d\",\"status\":\"pending\",\"claim_seq\":5}]",
+        "[{\"id\":\"1\",\"subject\":\"s\",\"description\":\"d\",\"status\":\"in_progress\",\"claim_seq\":-1}]",
+        "[{\"id\":\"1\",\"subject\":\"s\",\"description\":\"d\",\"status\":\"completed\",\"claimed_by\":\"x\"}]",
+        "[{\"id\":\"1\",\"subject\":\"s\",\"description\":\"d\",\"status\":\"in_progress\",\"claimed_by\":7}]",
+        "[{\"id\":\"1\",\"subject\":\"s\",\"description\":\"d\",\"status\":\"in_progress\",\"claimed_at_ms\":5}]",
+        "[{\"id\":\"1\",\"subject\":\"s\",\"description\":\"d\",\"status\":\"in_progress\",\"claimed_by\":\"x\",\"claimed_at_ms\":-5}]",
+    }) |bad| {
+        try writeMirrorFixture(mirror, bad);
+        var corrupt = TaskStore.init(testing.allocator);
+        defer corrupt.deinit();
+        try corrupt.setMirror(mirror);
+        try testing.expectError(error.MirrorCorrupt, corrupt.loadFromMirror());
+    }
 }
 
 test "TaskStore: mirror 开启时 updateStatus(t.id) 不悬垂(reload 释放旧 task)" {
