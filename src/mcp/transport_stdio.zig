@@ -63,12 +63,19 @@ pub const StdioTransport = struct {
         var total: usize = 0;
         while (total < json.len) {
             try self.awaitWritable();
-            const n = self.child.write(json[total..]);
-            if (n <= 0) return error.WriteFailed;
-            total += @as(usize, @intCast(n));
+            const n = self.child.writeWithDeadline(json[total..], self.deadline_ms) catch |err| return switch (err) {
+                error.Timeout => error.Timeout,
+                error.WriteFailed => error.WriteFailed,
+            };
+            if (n == 0) return error.WriteFailed;
+            total += n;
         }
         try self.awaitWritable();
-        if (self.child.write("\n") <= 0) return error.WriteFailed;
+        const newline_n = self.child.writeWithDeadline("\n", self.deadline_ms) catch |err| return switch (err) {
+            error.Timeout => error.Timeout,
+            error.WriteFailed => error.WriteFailed,
+        };
+        if (newline_n == 0) return error.WriteFailed;
     }
 
     fn awaitWritable(self: *StdioTransport) !void {
@@ -241,4 +248,20 @@ test "StdioTransport: EOF after close returns error" {
     // 子进程立即退出，EOF
     const result = t.recvLine();
     try testing.expectError(error.Eof, result);
+}
+
+test "StdioTransport: Windows blocked stdin write honors deadline" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    // A long built-in cmd loop keeps cmd.exe alive without reading stdin.  It
+    // has no child process for PipeChild.terminate to orphan. A payload larger
+    // than the named-pipe buffer forces a pending overlapped WriteFile, which
+    // must be cancelled at the transport deadline rather than parking the
+    // daemon.
+    const allocator = testing.allocator;
+    const argv = [_]?[*:0]const u8{ "cmd.exe", "/c", "for /L %i in (1,1,10000000) do @rem", null };
+    var t = try StdioTransport.spawn(allocator, argv[0..]);
+    defer t.close();
+    t.deadline_ms = util_time.nowMs() + 250;
+    const payload = "x" ** (2 * 1024 * 1024);
+    try testing.expectError(error.Timeout, t.send(payload));
 }

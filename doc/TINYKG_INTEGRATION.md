@@ -234,12 +234,12 @@ Properties worth knowing:
   validate and no portable owner or ACL check; the exclusive temporary file
   still applies, but a Windows staging chain is trusted rather than proven
   private.
-- Known limitation on Windows: the bridge's response deadline cannot interrupt
-  a write that is already blocked, because anonymous pipes have no portable
-  writability query (`PipeChild.pollWritable` returns true there). A request is
-  capped at the daemon's own 1 MB ceiling and the child is the `tinykgd` this
-  product ships, so the exposure is a misbehaving child rather than a hostile
-  one; making it interruptible needs overlapped I/O.
+- On Windows the bridge uses an overlapped named-pipe write endpoint. If
+  `tinykgd` stops draining stdin, the pending write is cancelled at the
+  response deadline, the bridge marks itself broken, and the daemon returns a
+  503 rather than wedging the process. The stream is intentionally not reused
+  after cancellation: a late child response could otherwise be mistaken for a
+  later request.
 
 The release unit ships `tinykgd` beside `tinykg` (`vendor/tinykg/`, digest pinned
 by the executable under the release layout, release/LAYOUT.md), so an installed
