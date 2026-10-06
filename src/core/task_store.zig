@@ -85,7 +85,7 @@ pub const Task = struct {
     /// 提示和记忆溯源据它只看本 agent 认领的行。null = 未知(旧镜像、未声明身份)。
     claimed_by: ?[]const u8 = null,
     /// 认领时刻(墙钟 unix ms;与 claimed_by 同生同灭)。别人的认领只在租约期
-    /// (CLAIM_LEASE_MS)内算别人的;过期后谁都可以把它当僵尸处理。
+    /// (CLAIM_LEASE_MS)内算别人的;过期后可以被重新认领。
     claimed_at_ms: i64 = 0,
     blocks: std.ArrayList([]const u8) = .empty, // elements owned
     blocked_by: std.ArrayList([]const u8) = .empty, // elements owned
@@ -116,7 +116,7 @@ pub const EXPIRED_CLAIM_GUIDANCE =
 
 /// 别人的认领在多久内仍算别人的,与 TinyKG task-claim 默认租约(7200s)一致:KG 模式
 /// 靠它让崩掉/退出的会话不永久占坑,降级镜像没有租约服务,用认领时刻在读侧同样判过期——
-/// 否则昨天进程留下的僵尸任务对之后所有会话都算"别人的",再也不会被提醒关闭。
+/// 否则昨天进程留下的僵尸任务对之后所有会话都算"别人的",再也不会被提醒处理。
 pub const CLAIM_LEASE_MS: i64 = 7200 * std.time.ms_per_s;
 
 fn wallNowMs() i64 {
@@ -190,13 +190,13 @@ pub const TaskStore = struct {
     }
 
     /// 一条进行中认领对本 agent 的归属。
-    pub const Attribution = enum {
+    const Attribution = enum {
         /// 本 agent 的(或认领者未知):可点名续做、提示关闭、作溯源。
         own,
-        /// 别人的本地认领,租约已过期:可能已没人在做,但和 TinyKG 一样只能先重新认领再处理,
-        /// 不能直接关闭或删除(对方也许只是没续租)。
+        /// 别人的本地认领,租约已过期:可能已没人在做。提示里单独列出,和 TinyKG 一样只建议
+        /// 先重新认领再处理,不建议直接关闭或删除(对方也许只是没续租)。
         expired_foreign,
-        /// 别人仍持有的认领:不点名、不建议处理、不作溯源,也不能接手。
+        /// 别人仍持有的认领:不点名、不建议处理、不作溯源。
         foreign,
     };
 
@@ -219,7 +219,7 @@ pub const TaskStore = struct {
         id: []u8,
         subject: []u8,
         status: TaskStatus,
-        /// snapshotOwnInProgress 专用:别人的认领、租约已过期(只该作为僵尸被关闭)。
+        /// snapshotOwnInProgress 专用:别人的认领、租约已过期(只该提示先重新认领再处理)。
         expired_claim: bool = false,
     };
 
@@ -265,28 +265,6 @@ pub const TaskStore = struct {
         const views = try dupeViews(allocator, self.tasks.items, picks);
         for (rows.items, views) |row, *view| view.expired_claim = row.expired;
         return views;
-    }
-
-    /// 挡住本 agent 把本地任务 `id` 改成 `to` 的认领(holder owned,调用方释放);null = 可以改。
-    /// 与 TinyKG 租约同一语义:别人仍持有的认领谁也不能动;过期的只能先重新认领(to =
-    /// in_progress),不能直接关闭或删除——对方也许只是没续租,降级镜像里 deleted 是物理删行。
-    pub const ClaimBlock = struct { holder: []u8, expired: bool };
-    pub fn claimBlockingStatusChange(self: *TaskStore, allocator: std.mem.Allocator, id: []const u8, to: TaskStatus) !?ClaimBlock {
-        _ = self.mutex.lock();
-        defer _ = self.mutex.unlock();
-        // id 可能借自 store 内 task,重放镜像会释放它——先拷贝(见 updateStatus)。
-        const id_copy = try allocator.dupe(u8, id);
-        defer allocator.free(id_copy);
-        var mirror_txn = self.beginMirrorTxnLocked() catch null; // 看到别的写入方最新的认领
-        defer if (mirror_txn) |*lock| lock.release();
-        const t = self.get(id_copy) orelse return null; // 不存在由 updateStatus 报
-        if (t.status != .in_progress) return null;
-        const expired = switch (self.attribution(t, wallNowMs())) {
-            .own => return null,
-            .expired_foreign => if (to == .in_progress) return null else true,
-            .foreign => false,
-        };
-        return .{ .holder = try allocator.dupe(u8, t.claimed_by.?), .expired = expired };
     }
 
     /// 释放快照;空切片(含 `catch &.{}` 的静态空值)是 no-op。
@@ -1197,37 +1175,27 @@ test "TaskStore: 身份轮换(转后台)后,旧身份的认领交给后台那条
     try testing.expect(views[0].expired_claim);
 }
 
-test "TaskStore: 别人的认领挡住状态改动——租约期内谁也不能动,过期后只能先重新认领" {
+test "TaskStore: 共享镜像读不了时,快照退回内存副本而不是报错" {
+    const test_fs = @import("../util/fs.zig");
+    var dbuf: [256]u8 = undefined;
+    const dir_path = test_fs.testing.uniqueDir(&dbuf, "cc-zig-taskstore-snapshot-fallback");
+    try test_fs.mkdirParents(dir_path);
+    defer test_fs.testing.rmrfBestEffort(dir_path);
+    var pbuf: [192]u8 = undefined;
+    const mirror = try std.fmt.bufPrint(&pbuf, "{s}/tasks.json", .{dir_path});
+
     var store = TaskStore.init(testing.allocator);
     defer store.deinit();
-    const a = testing.allocator;
+    try store.setMirror(mirror);
     try store.setClaimer("me");
-    try store.createWithIdHeldBy("live", "队友在做", "", .in_progress, "worker@team");
-    try store.createWithIdHeldBy("stale", "过期的", "", .in_progress, "gone-session");
-    store.get("stale").?.claimed_at_ms -= CLAIM_LEASE_MS;
     _ = try store.create("mine", "", null);
     try store.updateStatus("1", .in_progress);
+    try writeMirrorFixture(mirror, "{truncated");
 
-    for ([_]TaskStatus{ .in_progress, .pending, .completed, .deleted }) |to| {
-        const block = (try store.claimBlockingStatusChange(a, "live", to)) orelse return error.TestExpectedBlock;
-        defer a.free(block.holder);
-        try testing.expectEqualStrings("worker@team", block.holder);
-        try testing.expect(!block.expired);
-    }
-    for ([_]TaskStatus{ .completed, .deleted, .pending }) |to| {
-        const block = (try store.claimBlockingStatusChange(a, "stale", to)) orelse return error.TestExpectedBlock;
-        defer a.free(block.holder);
-        try testing.expect(block.expired);
-    }
-    // 过期的可以重新认领;之后它就是自己的,可以关。
-    try testing.expect((try store.claimBlockingStatusChange(a, "stale", .in_progress)) == null);
-    try store.updateStatus("stale", .in_progress);
-    try testing.expect((try store.claimBlockingStatusChange(a, "stale", .completed)) == null);
-    // 自己的、不存在的、不在进行中的、没声明身份的清单:都不挡。
-    try testing.expect((try store.claimBlockingStatusChange(a, "1", .completed)) == null);
-    try testing.expect((try store.claimBlockingStatusChange(a, "nope", .completed)) == null);
-    try store.setClaimer(null);
-    try testing.expect((try store.claimBlockingStatusChange(a, "live", .completed)) == null);
+    const views = try store.snapshotOwnInProgress(testing.allocator);
+    defer TaskStore.freeTaskViews(testing.allocator, views);
+    try testing.expectEqual(@as(usize, 1), views.len);
+    try testing.expectEqualStrings("1", views[0].id);
 }
 
 test "TaskStore: 重新认领刷新认领时刻(续租)" {

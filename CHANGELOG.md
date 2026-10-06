@@ -222,15 +222,12 @@ status, compatibility boundaries, and entry points are defined by
   after two hours (TinyKG's default lease). Like an expired TinyKG lease, it
   can then be claimed again, and both the anchor and the closing list say so
   separately: they never name it as work to continue or suggest closing it
-  directly. TaskUpdate and TaskStop refuse to change a local task another
-  agent holds; once the claim has expired, the task must be re-claimed
-  before it is closed or deleted. Persistent `kg-*` tasks follow TinyKG's
-  own lease. Rows whose claimer is unknown (written before this change) are
-  treated as the agent's own, as before. When
-  the task panel overflows it keeps the most recently claimed tasks instead of
-  the oldest, and a completed task reloaded from the mirror after a reboot no
-  longer stays on the panel indefinitely (its timestamp is from the previous
-  boot's clock).
+  directly. Persistent `kg-*` tasks follow TinyKG's own lease. Rows whose
+  claimer is unknown (written before this change) are treated as the
+  agent's own, as before. When the task panel overflows it keeps the most
+  recently claimed tasks instead of the oldest, and a completed task reloaded
+  from the mirror after a reboot no longer stays on the panel indefinitely
+  (its timestamp is from the previous boot's clock).
 - The WorkBuddy installed-adapter suites run in CI: the Linux and macOS gates
   provision the pinned WorkBuddy-Bench checkout
   (`scripts/eval/workbuddy/provision_checkout.sh`: pinned commit, this

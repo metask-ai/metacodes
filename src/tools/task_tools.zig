@@ -906,7 +906,6 @@ pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var closed = false;
     if (try extractString(args, "status")) |status_str| {
         const st = TaskStatus.fromString(status_str) orelse return error.InvalidStatus;
-        try refuseClaimedByOther(ctx, store, id, st);
         try store.updateStatus(id, st);
         if (st == .deleted) {
             // 删除后不能再拿 id 查找；提前返回避免后续字段更新。
@@ -1033,23 +1032,9 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return out.toOwnedSlice(ctx.allocator);
     }
     const store = try requireStore(ctx);
-    try refuseClaimedByOther(ctx, store, id, .completed);
     try store.updateStatus(id, .completed);
     noteTasksChanged(ctx); // U6:TaskStop 闭合 → frontier 变
     return closedResult(ctx, "{\"ok\":true,\"status\":\"completed\"");
-}
-
-/// 本地任务被别的会话/队友认领时,拒绝本 agent 改它的状态(KG 降级共享镜像;与 kg-* 任务
-/// 的 TinyKG 租约同一语义):租约期内谁也不能动;过期后只能先重新认领(in_progress)。
-fn refuseClaimedByOther(ctx: *const ToolContext, store: *task_store.TaskStore, id: []const u8, to: TaskStatus) !void {
-    const block = (try store.claimBlockingStatusChange(ctx.allocator, id, to)) orelse return;
-    defer ctx.allocator.free(block.holder);
-    if (block.expired) {
-        common.setErrorDetail(ctx.error_detail, ctx.allocator, "任务 {s} 由 {s} 认领,已超过租约期。如确认已无人在做,先用 TaskUpdate(status=in_progress)重新认领,再关闭或删除。", .{ id, block.holder });
-    } else {
-        common.setErrorDetail(ctx.error_detail, ctx.allocator, "任务 {s} 由 {s} 认领,仍在租约期内,不能改动它的状态。请选择其它任务。", .{ id, block.holder });
-    }
-    return error.TaskClaimedByOther;
 }
 
 /// 本地清单关闭的结果:`head` 是未闭合的 JSON 对象前缀,补上其它进行中任务的提示后闭合。
@@ -1489,23 +1474,14 @@ test "关闭提示只列本 agent 认领的行:同一降级镜像里别的会话
     try testing.expectEqualStrings("{\"ok\":true}", last);
 }
 
-test "别人认领的本地任务:过期的单列并只提示重新认领,工具拒绝未认领就关闭或接手活认领" {
+test "别人认领的本地任务:租约期内的不列,过期的单列并只提示先重新认领" {
     var store = task_store.TaskStore.init(testing.allocator);
     defer store.deinit();
     try store.setClaimer("me");
     try store.createWithIdHeldBy("live", "队友在做", "", .in_progress, "worker@team");
     try store.createWithIdHeldBy("stale", "没人续租", "", .in_progress, "gone-session");
     store.get("stale").?.claimed_at_ms -= task_store.CLAIM_LEASE_MS;
-    var ctx = testCtx(&store);
-    var detail: ?[]const u8 = null;
-    defer if (detail) |d| testing.allocator.free(d);
-    ctx.error_detail = &detail;
-    const Detail = struct {
-        fn take(slot: *?[]const u8) void {
-            if (slot.*) |d| testing.allocator.free(d);
-            slot.* = null;
-        }
-    };
+    const ctx = testCtx(&store);
     testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"mine old\",\"description\":\"\"}"));
     testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"mine cur\",\"description\":\"\"}"));
     testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"1\",\"status\":\"in_progress\"}"));
@@ -1523,24 +1499,6 @@ test "别人认领的本地任务:过期的单列并只提示重新认领,工具
     try testing.expectEqualStrings("stale", expired[0].object.get("id").?.string);
     try testing.expectEqualStrings(task_store.EXPIRED_CLAIM_GUIDANCE, hint.get("expired_note").?.string);
     try testing.expect(std.mem.indexOf(u8, done, "队友在做") == null);
-
-    // 过期的:不能直接关或删,也不能由 TaskStop 关;重新认领后可以。
-    try testing.expectError(error.TaskClaimedByOther, executeUpdate(&ctx, "{\"taskId\":\"stale\",\"status\":\"deleted\"}"));
-    try testing.expect(std.mem.indexOf(u8, detail.?, "gone-session") != null);
-    Detail.take(&detail);
-    try testing.expectError(error.TaskClaimedByOther, executeStop(&ctx, "{\"taskId\":\"stale\"}"));
-    Detail.take(&detail);
-    try testing.expect(store.get("stale") != null);
-    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"stale\",\"status\":\"in_progress\"}"));
-    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"stale\",\"status\":\"deleted\"}"));
-    try testing.expect(store.get("stale") == null);
-
-    // 仍在租约期的:谁也不能接手或关闭。
-    try testing.expectError(error.TaskClaimedByOther, executeUpdate(&ctx, "{\"taskId\":\"live\",\"status\":\"in_progress\"}"));
-    try testing.expect(std.mem.indexOf(u8, detail.?, "worker@team") != null);
-    Detail.take(&detail);
-    try testing.expectError(error.TaskClaimedByOther, executeUpdate(&ctx, "{\"taskId\":\"live\",\"status\":\"completed\"}"));
-    try testing.expectEqualStrings("worker@team", store.get("live").?.claimed_by.?);
 }
 
 test "关闭提示:自己的和过期的两个列表都超上限时,各自的省略计数用不同的键" {
