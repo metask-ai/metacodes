@@ -728,14 +728,14 @@ fn writeStillInProgress(ctx: *const ToolContext, out: *std.ArrayList(u8)) !void 
     try out.appendSlice(ctx.allocator, ",\"still_in_progress\":{");
     if (own > 0) {
         try out.appendSlice(ctx.allocator, "\"tasks\":");
-        try writeTaskRows(ctx, out, views[0..own]);
+        try writeTaskRows(ctx, out, views[0..own], "omitted");
         try out.appendSlice(ctx.allocator, ",\"note\":");
         try writeString(out, ctx.allocator, STILL_IN_PROGRESS_NOTE);
     }
     if (views.len > own) {
         if (own > 0) try out.append(ctx.allocator, ',');
         try out.appendSlice(ctx.allocator, "\"expired_claims\":");
-        try writeTaskRows(ctx, out, views[own..]);
+        try writeTaskRows(ctx, out, views[own..], "expired_omitted");
         try out.appendSlice(ctx.allocator, ",\"expired_note\":");
         try writeString(out, ctx.allocator, task_store.EXPIRED_CLAIM_GUIDANCE);
     }
@@ -743,8 +743,8 @@ fn writeStillInProgress(ctx: *const ToolContext, out: *std.ArrayList(u8)) !void 
 }
 
 /// `[{"id","subject"}...]`,按认领从旧到新(rows 是新 → 旧),最多 STILL_IN_PROGRESS_MAX 条,
-/// 多出的写进紧随其后的 `"omitted"`。
-fn writeTaskRows(ctx: *const ToolContext, out: *std.ArrayList(u8), newest_first: []const task_store.TaskStore.TaskView) !void {
+/// 多出的条数写进紧随其后的 `omitted_key`(两个列表在同一对象里,键名必须不同)。
+fn writeTaskRows(ctx: *const ToolContext, out: *std.ArrayList(u8), newest_first: []const task_store.TaskStore.TaskView, comptime omitted_key: []const u8) !void {
     const listed = @min(newest_first.len, STILL_IN_PROGRESS_MAX);
     try out.append(ctx.allocator, '[');
     for (0..listed) |n| {
@@ -757,7 +757,7 @@ fn writeTaskRows(ctx: *const ToolContext, out: *std.ArrayList(u8), newest_first:
         try out.append(ctx.allocator, '}');
     }
     try out.append(ctx.allocator, ']');
-    if (newest_first.len > listed) try out.print(ctx.allocator, ",\"omitted\":{d}", .{newest_first.len - listed});
+    if (newest_first.len > listed) try out.print(ctx.allocator, ",\"" ++ omitted_key ++ "\":{d}", .{newest_first.len - listed});
 }
 
 /// KG 计划步骤更新(TaskUpdate 的 kg-<node> 路由)。completed/failed 走 canonical
@@ -1541,6 +1541,33 @@ test "别人认领的本地任务:过期的单列并只提示重新认领,工具
     Detail.take(&detail);
     try testing.expectError(error.TaskClaimedByOther, executeUpdate(&ctx, "{\"taskId\":\"live\",\"status\":\"completed\"}"));
     try testing.expectEqualStrings("worker@team", store.get("live").?.claimed_by.?);
+}
+
+test "关闭提示:自己的和过期的两个列表都超上限时,各自的省略计数用不同的键" {
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try store.setClaimer("me");
+    var buf: [16]u8 = undefined;
+    for (0..STILL_IN_PROGRESS_MAX + 1) |i| {
+        const id = try std.fmt.bufPrint(&buf, "x{d}", .{i});
+        try store.createWithIdHeldBy(id, "stale", "", .in_progress, "gone-session");
+        store.get(id).?.claimed_at_ms -= task_store.CLAIM_LEASE_MS;
+    }
+    for (0..STILL_IN_PROGRESS_MAX + 2) |_| {
+        const t = try store.create("mine", "", null);
+        try store.updateStatus(t.id, .in_progress);
+    }
+    const ctx = testCtx(&store);
+    const r = try executeStop(&ctx, "{\"taskId\":\"1\"}");
+    defer testing.allocator.free(r);
+    // std.json 默认拒绝重复键:两个列表共用 "omitted" 时这里就解析失败。
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, r, .{});
+    defer parsed.deinit();
+    const hint = parsed.value.object.get("still_in_progress").?.object;
+    try testing.expectEqual(@as(i64, 1), hint.get("omitted").?.integer);
+    try testing.expectEqual(@as(i64, 1), hint.get("expired_omitted").?.integer);
+    try testing.expectEqual(STILL_IN_PROGRESS_MAX, hint.get("tasks").?.array.items.len);
+    try testing.expectEqual(STILL_IN_PROGRESS_MAX, hint.get("expired_claims").?.array.items.len);
 }
 
 test "Task* without store returns TaskStoreUnavailable" {
