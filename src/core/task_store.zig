@@ -727,7 +727,8 @@ pub const TaskStore = struct {
         return active;
     }
 
-    /// 最近认领的进行中任务;无则 null。无锁,与 `get` 同约定(driver/渲染侧读)。
+    /// 本 agent 最近认领的进行中任务;无则 null。不加锁,与 `get` 同约定:只能在改动本清单的
+    /// agent 线程调用(它读 `claimer`,setClaimer 换身份时会释放旧值),跨线程读要用快照。
     pub fn latestInProgress(self: *const TaskStore) ?*Task {
         return self.tasks.items[self.latestInProgressIndex(false) orelse return null];
     }
@@ -1152,7 +1153,10 @@ test "TaskStore: 认领记下声明的身份,离开 in_progress 清掉;别人仍
     try testing.expectEqual(@as(usize, 3), all.len);
 }
 
-test "TaskStore: 身份轮换(转后台)后,旧身份的认领交给后台那条对话,前台不当成自己的" {
+// 不记旧身份:身份轮换后(Ctrl+B 转后台、切换会话)旧身份认领的行算别人的,租约期内不点名,
+// 过期后只提示先重新认领。转到后台的那条对话用的是全新的空清单,接不走这些行;
+// 它们靠租约过期回到可认领状态。
+test "TaskStore: 身份轮换后,旧身份的认领不当成新身份自己的" {
     var store = TaskStore.init(testing.allocator);
     defer store.deinit();
     _ = try store.create("moved to background", "", null);
@@ -1378,21 +1382,24 @@ test "TaskStore: claim_seq 经镜像往返并跨进程递增;旧镜像缺字段�
         try writer.setMirror(mirror);
         _ = try writer.create("first", "d", null);
         _ = try writer.create("second", "d", null);
+        // 另一个进程(同一镜像)在 writer 认领**之前**就读过镜像:它内存里没有这次认领。
+        var other = TaskStore.init(testing.allocator);
+        defer other.deinit();
+        try other.setMirror(mirror);
+        try other.loadFromMirror();
+
         try writer.setClaimer("writer-session");
         try writer.updateStatus("1", .in_progress);
         const seq = writer.get("1").?.claim_seq;
         try testing.expect(seq != 0);
 
-        // 另一个进程(同一镜像)后认领的任务序号更大:序号在事务内重放磁盘后才分配。
-        var other = TaskStore.init(testing.allocator);
-        defer other.deinit();
-        try other.setMirror(mirror);
-        try other.loadFromMirror();
+        // other 后认领的任务序号必须更大:序号在事务内重放磁盘之后才分配,陈旧的内存副本
+        // 会算出与 writer 相同的序号。
+        try other.updateStatus("2", .in_progress);
+        try testing.expect(other.get("2").?.claim_seq > seq);
         try testing.expectEqual(seq, other.get("1").?.claim_seq);
         try testing.expectEqualStrings("writer-session", other.get("1").?.claimed_by.?);
         try testing.expectEqual(writer.get("1").?.claimed_at_ms, other.get("1").?.claimed_at_ms);
-        try other.updateStatus("2", .in_progress);
-        try testing.expect(other.get("2").?.claim_seq > seq);
         try writer.loadFromMirror();
         try testing.expectEqualStrings("2", writer.latestInProgress().?.id);
     }

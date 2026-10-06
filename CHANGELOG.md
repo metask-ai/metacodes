@@ -222,7 +222,10 @@ status, compatibility boundaries, and entry points are defined by
   after two hours (TinyKG's default lease). Like an expired TinyKG lease, it
   can then be claimed again, and both the anchor and the closing list say so
   separately: they never name it as work to continue or suggest closing it
-  directly. Persistent `kg-*` tasks follow TinyKG's own lease. Rows whose
+  directly. Persistent `kg-*` tasks follow TinyKG's own lease. A new process
+  gets a new identity unless it resumes the session, so after a plain
+  restart (or Ctrl+B) the previous process's claims count as another
+  agent's until their lease lapses, just as with TinyKG leases. Rows whose
   claimer is unknown (written before this change) are treated as the
   agent's own, as before. When the task panel overflows it keeps the most
   recently claimed tasks instead of the oldest, and a completed task reloaded
