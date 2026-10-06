@@ -28,6 +28,11 @@ const pfs = @import("fs.zig");
 // 正解是 PROC_THREAD_ATTRIBUTE_HANDLE_LIST 白名单(roadmap);串行化是小而正确的第一刀。
 var g_spawn_serial: psync.Mutex = .{};
 
+// Names for the overlapped stdin named pipes.  The process id plus a
+// monotonic counter keeps concurrent spawns from colliding without exposing
+// any caller-controlled path.
+var g_stdio_pipe_nonce = std.atomic.Value(u32).init(0);
+
 pub const CaptureError = error{ SpawnFailed, PipeFailed, ReadError, OutOfMemory, Aborted, Timeout, ChildChdirFailed, ChildExecFailed };
 
 /// The step at which a child gave up before it ran anything of the caller's.
@@ -287,15 +292,72 @@ pub const PipeChild = struct {
     proc: if (is_windows) win.HANDLE else std.c.pid_t,
     stdin_h: if (is_windows) win.HANDLE else std.c.fd_t,
     stdout_h: if (is_windows) win.HANDLE else std.c.fd_t,
+    /// Windows anonymous pipes are synchronous handles, so WriteFile can
+    /// block forever when the child stops draining stdin.  The long-lived
+    /// stdio transport uses a named pipe with an overlapped parent write end
+    /// instead.  Keep this bit on the handle so callers that do not need a
+    /// deadline (LSP, for example) still use the same safe write path.
+    stdin_overlapped: bool = false,
 
     /// 写子进程 stdin。返回写出字节数（<0=错误）。
     pub fn write(self: *const PipeChild, data: []const u8) isize {
         if (is_windows) {
+            if (self.stdin_overlapped) {
+                return @intCast(self.writeWithDeadlineWindows(data, null) catch return -1);
+            }
             var wrote: win.DWORD = 0;
             if (WriteFile(self.stdin_h, data.ptr, @intCast(@min(data.len, std.math.maxInt(win.DWORD))), &wrote, null) == 0) return -1;
             return @intCast(wrote);
         }
         return std.c.write(self.stdin_h, data.ptr, data.len);
+    }
+
+    pub const WriteError = error{ Timeout, WriteFailed };
+
+    /// Write one chunk, honoring an absolute monotonic deadline when the
+    /// Windows stdin endpoint is overlapped.  Anonymous pipes cannot be made
+    /// overlapped, hence spawnPipesWindows uses a named pipe for this endpoint.
+    /// The operation is always completed (or cancelled and drained) before
+    /// returning, so closing/terminating a child cannot leave a worker or an
+    /// in-flight OVERLAPPED touching freed memory.
+    pub fn writeWithDeadline(self: *const PipeChild, data: []const u8, deadline_ms: ?i64) WriteError!usize {
+        if (is_windows and self.stdin_overlapped) return self.writeWithDeadlineWindows(data, deadline_ms);
+        const n = self.write(data);
+        if (n <= 0) return error.WriteFailed;
+        return @intCast(n);
+    }
+
+    fn writeWithDeadlineWindows(self: *const PipeChild, data: []const u8, deadline_ms: ?i64) WriteError!usize {
+        const event = CreateEventW(null, 1, 0, null);
+        if (event == win.INVALID_HANDLE_VALUE or event == null) return error.WriteFailed;
+        defer win.CloseHandle(event.?);
+
+        var overlapped = std.mem.zeroes(WIN_OVERLAPPED);
+        overlapped.hEvent = event.?;
+        var wrote: win.DWORD = 0;
+        const count: win.DWORD = @intCast(@min(data.len, std.math.maxInt(win.DWORD)));
+        if (WriteFile(self.stdin_h, data.ptr, count, &wrote, @ptrCast(&overlapped)) == 0) {
+            const code = GetLastError();
+            if (code != ERROR_IO_PENDING) return error.WriteFailed;
+        } else {
+            return @intCast(wrote);
+        }
+
+        const wait_ms: win.DWORD = if (deadline_ms) |deadline| blk: {
+            const now = nowMs();
+            if (now >= deadline) break :blk 0;
+            break :blk @intCast(@min(deadline - now, std.math.maxInt(win.DWORD)));
+        } else INFINITE;
+        const wait_result = WaitForSingleObject(event.?, wait_ms);
+        if (wait_result != 0) {
+            _ = CancelIoEx(self.stdin_h, @ptrCast(&overlapped));
+            // Cancellation is asynchronous.  Drain the completion before
+            // releasing the event/OVERLAPPED storage.
+            _ = WaitForSingleObject(event.?, INFINITE);
+            return if (wait_result == WAIT_TIMEOUT_) error.Timeout else error.WriteFailed;
+        }
+        if (GetOverlappedResult(self.stdin_h, @ptrCast(&overlapped), &wrote, 0) == 0) return error.WriteFailed;
+        return @intCast(wrote);
     }
 
     /// 读子进程 stdout。返回读到字节数（0=EOF，<0=错误）。
@@ -314,10 +376,10 @@ pub const PipeChild = struct {
     /// stdin 是否在 timeout_ms 内可写。子进程停止排空 stdin 时,写会在管道满后
     /// 阻塞;调用方据此在 deadline 内放弃,而不是无限期挂住。
     ///
-    /// **Windows 例外**:匿名管道没有可移植的"可写"查询,这里恒返 true,于是
-    /// 调用方的 deadline **不能**打断一个已经阻塞的 `WriteFile`。要真正可中断
-    /// 需要 overlapped I/O。当前唯一的写方是 `kg/kgd`,它的子进程是本产品自己
-    /// 分发的 tinykgd,且请求上限 1MB;真正修复登记在 doc/TINYKG_INTEGRATION.md。
+    /// **Windows 例外**:匿名管道没有可移植的"可写"查询,这里恒返 true.
+    /// Deadline-aware callers must use `writeWithDeadline`; the stdio bridge's
+    /// Windows endpoint is an overlapped named pipe, so that write path can
+    /// cancel a pending operation even though readiness itself is unavailable.
     pub fn pollWritable(self: *const PipeChild, timeout_ms: u32) bool {
         if (is_windows) {
             return true;
@@ -440,14 +502,122 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8, cwd: ?[]const u8) CaptureErro
     g_spawn_serial.lock();
     var spawn_locked = true;
     defer if (spawn_locked) g_spawn_serial.unlock();
-    // stdin：read 端可继承（子读）、write 端父写；stdout：write 端可继承（子写）、read 端父读。
-    var in_rd: win.HANDLE = undefined;
+    // stdin uses a named pipe because anonymous CreatePipe handles do not
+    // support overlapped I/O.  The parent keeps the overlapped server/write
+    // endpoint; the child receives only the synchronous client/read endpoint.
+    // This makes a blocked WriteFile cancellable at the transport deadline.
     var in_wr: win.HANDLE = undefined;
+    var in_rd: win.HANDLE = undefined;
+    var stdin_pipe_name_buf: [128]u8 = undefined;
+    const stdin_pipe_name = std.fmt.bufPrintZ(
+        &stdin_pipe_name_buf,
+        "\\\\.\\pipe\\metacodes-stdin-{d}-{d}",
+        .{ GetCurrentProcessId(), g_stdio_pipe_nonce.fetchAdd(1, .monotonic) },
+    ) catch return error.PipeFailed;
+    const stdin_pipe_name_w = std.unicode.utf8ToUtf16LeAllocZ(a, stdin_pipe_name) catch return error.PipeFailed;
+    defer a.free(stdin_pipe_name_w);
     var sa = win.SECURITY_ATTRIBUTES{ .nLength = @sizeOf(win.SECURITY_ATTRIBUTES), .lpSecurityDescriptor = null, .bInheritHandle = @enumFromInt(1) };
-    if (CreatePipe(&in_rd, &in_wr, &sa, 0) == 0 or SetHandleInformation(in_wr, HANDLE_FLAG_INHERIT, 0) == 0) return error.PipeFailed;
+    in_wr = CreateNamedPipeW(
+        stdin_pipe_name_w.ptr,
+        PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1,
+        64 * 1024,
+        64 * 1024,
+        0,
+        null,
+    );
+    if (in_wr == win.INVALID_HANDLE_VALUE) return error.PipeFailed;
+    // The server endpoint is overlapped, so ConnectNamedPipe also receives an
+    // OVERLAPPED record (passing null is invalid for FILE_FLAG_OVERLAPPED).
+    // Start listening before CreateFile: a synchronous client waits for the
+    // server's ConnectNamedPipe call rather than establishing a connection on
+    // its own.
+    const connect_event = CreateEventW(null, 1, 0, null) orelse {
+        win.CloseHandle(in_wr);
+        return error.PipeFailed;
+    };
+    defer win.CloseHandle(connect_event);
+    var connect_overlapped = std.mem.zeroes(WIN_OVERLAPPED);
+    connect_overlapped.hEvent = connect_event;
+    var connect_pending = false;
+    const connect_ok = ConnectNamedPipe(in_wr, @ptrCast(&connect_overlapped));
+    if (connect_ok != 0) {
+        // A successful immediate connect would likewise indicate a client
+        // that raced us before our own child endpoint existed.
+        win.CloseHandle(in_wr);
+        return error.PipeFailed;
+    }
+    {
+        const code = GetLastError();
+        // No client should be connected yet: this process has not called
+        // CreateFile.  Treat an already-connected instance as a race with a
+        // foreign process rather than handing that process's endpoint to the
+        // child below (or blocking forever on a second CreateFile).
+        if (code == ERROR_PIPE_CONNECTED) {
+            win.CloseHandle(in_wr);
+            return error.PipeFailed;
+        }
+        if (code != ERROR_IO_PENDING) {
+            win.CloseHandle(in_wr);
+            return error.PipeFailed;
+        }
+        connect_pending = code == ERROR_IO_PENDING;
+    }
+    // The client endpoint is the only stdin handle allowed into the child.
+    in_rd = CreateFileW(
+        stdin_pipe_name_w.ptr,
+        0x80000000,
+        0x00000001 | 0x00000002,
+        &sa,
+        3,
+        0,
+        null,
+    );
+    if (in_rd == win.INVALID_HANDLE_VALUE) {
+        if (connect_pending) {
+            _ = CancelIoEx(in_wr, @ptrCast(&connect_overlapped));
+            _ = WaitForSingleObject(connect_event, INFINITE);
+        }
+        win.CloseHandle(in_wr);
+        return error.PipeFailed;
+    }
+    if (connect_pending) {
+        const connect_wait = WaitForSingleObject(connect_event, INFINITE);
+        if (connect_wait != 0) {
+            _ = CancelIoEx(in_wr, @ptrCast(&connect_overlapped));
+            _ = WaitForSingleObject(connect_event, INFINITE);
+            win.CloseHandle(in_rd);
+            win.CloseHandle(in_wr);
+            return error.PipeFailed;
+        }
+    }
+    if (connect_pending) {
+        var connected_bytes: win.DWORD = 0;
+        if (GetOverlappedResult(in_wr, @ptrCast(&connect_overlapped), &connected_bytes, 0) == 0) {
+            win.CloseHandle(in_rd);
+            win.CloseHandle(in_wr);
+            return error.PipeFailed;
+        }
+    }
+    // CreateFile inherited the bit from SECURITY_ATTRIBUTES; set it
+    // explicitly so the handle-list contract remains true if that default
+    // changes in a future Windows CRT.
+    if (SetHandleInformation(in_rd, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0) {
+        win.CloseHandle(in_rd);
+        win.CloseHandle(in_wr);
+        return error.PipeFailed;
+    }
     var out_rd: win.HANDLE = undefined;
     var out_wr: win.HANDLE = undefined;
-    if (CreatePipe(&out_rd, &out_wr, &sa, 0) == 0 or SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0) == 0) {
+    if (CreatePipe(&out_rd, &out_wr, &sa, 0) == 0) {
+        win.CloseHandle(in_rd);
+        win.CloseHandle(in_wr);
+        return error.PipeFailed;
+    }
+    if (SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0) == 0) {
+        win.CloseHandle(out_rd);
+        win.CloseHandle(out_wr);
         win.CloseHandle(in_rd);
         win.CloseHandle(in_wr);
         return error.PipeFailed;
@@ -480,7 +650,7 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8, cwd: ?[]const u8) CaptureErro
         return windowsSpawnFailure(create_error, cwd);
     }
     win.CloseHandle(pi.hThread);
-    return .{ .proc = pi.hProcess, .stdin_h = in_wr, .stdout_h = out_rd };
+    return .{ .proc = pi.hProcess, .stdin_h = in_wr, .stdout_h = out_rd, .stdin_overlapped = true };
 }
 
 // ============================================================================
@@ -678,7 +848,15 @@ fn nowMs() i64 {
     // 显式 if/else(非 if-return 落穿):后者在 refAllDecls(zig test)下 POSIX 分支仍被分析,
     // std.c.clock_gettime 的 clockid_t=void 在 windows winapi 报错。else 块保证 comptime 死分支。
     if (is_windows) {
-        return @intCast(GetTickCount64()); // 单调 ms（自开机），0.16 无 std.time.milliTimestamp
+        // Match util/time.nowMs(), which supplies StdioTransport deadlines on
+        // Windows. Mixing QPC with GetTickCount64 would make an absolute
+        // deadline meaningless because the clocks have unrelated epochs.
+        var frequency: i64 = 0;
+        var counter: i64 = 0;
+        if (QueryPerformanceFrequency(&frequency) != 0 and frequency > 0 and QueryPerformanceCounter(&counter) != 0) {
+            return @intCast(@divTrunc(@as(i128, counter) * 1000, @as(i128, frequency)));
+        }
+        return @intCast(GetTickCount64()); // fallback if QPC is unavailable
     } else {
         var ts: std.c.timespec = undefined;
         _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
@@ -1106,6 +1284,13 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
 const win = std.os.windows;
 
 const HANDLE_FLAG_INHERIT: win.DWORD = 0x00000001;
+const FILE_FLAG_OVERLAPPED: win.DWORD = 0x40000000;
+const PIPE_ACCESS_OUTBOUND: win.DWORD = 0x00000002;
+const PIPE_TYPE_BYTE: win.DWORD = 0x00000000;
+const PIPE_READMODE_BYTE: win.DWORD = 0x00000000;
+const PIPE_WAIT: win.DWORD = 0x00000000;
+const ERROR_PIPE_CONNECTED: u32 = 535;
+const ERROR_IO_PENDING: u32 = 997;
 // PROC_THREAD_ATTRIBUTE_HANDLE_LIST.  Passing this attribute together with
 // EXTENDED_STARTUPINFO_PRESENT makes CreateProcess inherit exactly the handles
 // listed by the caller, even when bInheritHandles is TRUE.  In particular it
@@ -1116,7 +1301,20 @@ const INFINITE: win.DWORD = 0xFFFFFFFF;
 const WAIT_TIMEOUT_: win.DWORD = 0x00000102;
 
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.winapi) c_int;
+extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.winapi) c_int;
 extern "kernel32" fn CreatePipe(hReadPipe: *win.HANDLE, hWritePipe: *win.HANDLE, lpPipeAttributes: ?*win.SECURITY_ATTRIBUTES, nSize: win.DWORD) callconv(.winapi) c_int;
+extern "kernel32" fn CreateNamedPipeW(
+    lpName: [*:0]const u16,
+    dwOpenMode: win.DWORD,
+    dwPipeMode: win.DWORD,
+    nMaxInstances: win.DWORD,
+    nOutBufferSize: win.DWORD,
+    nInBufferSize: win.DWORD,
+    nDefaultTimeOut: win.DWORD,
+    lpSecurityAttributes: ?*win.SECURITY_ATTRIBUTES,
+) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn ConnectNamedPipe(hNamedPipe: win.HANDLE, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
 extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: win.DWORD, dwShareMode: win.DWORD, lpSecurityAttributes: ?*win.SECURITY_ATTRIBUTES, dwCreationDisposition: win.DWORD, dwFlagsAndAttributes: win.DWORD, hTemplateFile: ?win.HANDLE) callconv(.winapi) win.HANDLE;
 extern "kernel32" fn SetHandleInformation(hObject: win.HANDLE, dwMask: win.DWORD, dwFlags: win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn InitializeProcThreadAttributeList(
@@ -1137,6 +1335,9 @@ extern "kernel32" fn UpdateProcThreadAttribute(
 extern "kernel32" fn DeleteProcThreadAttributeList(lpAttributeList: *anyopaque) callconv(.winapi) void;
 extern "kernel32" fn ReadFile(hFile: win.HANDLE, lpBuffer: [*]u8, nToRead: win.DWORD, lpRead: *win.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
 extern "kernel32" fn WriteFile(hFile: win.HANDLE, lpBuffer: [*]const u8, nToWrite: win.DWORD, lpWritten: *win.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
+extern "kernel32" fn CreateEventW(lpEventAttributes: ?*win.SECURITY_ATTRIBUTES, bManualReset: c_int, bInitialState: c_int, lpName: ?[*:0]const u16) callconv(.winapi) ?win.HANDLE;
+extern "kernel32" fn GetOverlappedResult(hFile: win.HANDLE, lpOverlapped: *anyopaque, lpNumberOfBytesTransferred: *win.DWORD, bWait: c_int) callconv(.winapi) c_int;
+extern "kernel32" fn CancelIoEx(hFile: win.HANDLE, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
 extern "kernel32" fn WaitForSingleObject(hHandle: win.HANDLE, dwMilliseconds: win.DWORD) callconv(.winapi) win.DWORD;
 extern "kernel32" fn GetExitCodeProcess(hProcess: win.HANDLE, lpExitCode: *win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn TerminateProcess(hProcess: win.HANDLE, uExitCode: win.UINT) callconv(.winapi) c_int;
@@ -1144,6 +1345,16 @@ extern "kernel32" fn PeekNamedPipe(hNamedPipe: win.HANDLE, lpBuffer: ?[*]u8, nBu
 extern "kernel32" fn Sleep(dwMilliseconds: win.DWORD) callconv(.winapi) void;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
+
+/// The Win32 OVERLAPPED layout is stable and is not exposed by the trimmed
+/// std.os.windows bindings used by this project.
+const WIN_OVERLAPPED = extern struct {
+    internal: usize = 0,
+    internal_high: usize = 0,
+    offset: win.DWORD = 0,
+    offset_high: win.DWORD = 0,
+    hEvent: win.HANDLE = undefined,
+};
 
 const StartupInfoExW = extern struct {
     startup_info: win.STARTUPINFOW,
