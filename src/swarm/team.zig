@@ -36,10 +36,14 @@ const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 
 const is_windows = builtin.os.tag == .windows;
-// Windows can keep a target in delete-pending state while MoveFileExW and CRT
-// readers contend.  32 attempts × 5 ms = 160 ms per operation: bounded in the
-// low hundreds of milliseconds. A genuinely absent path gets only the short
-// not-found budget below; its preflight can itself hit delete-pending.
+// Readers open with pfs.openReadShared (FILE_SHARE_DELETE) and the writer
+// replaces with a POSIX-semantics rename, so on NTFS a reader and a replace no
+// longer refuse each other. These retries remain for the MoveFileExW fallback
+// (older Windows, non-NTFS), where a replace and an open can still collide or
+// leave the target delete-pending. 32 attempts × 5 ms = 160 ms per operation:
+// bounded in the low hundreds of milliseconds. A genuinely absent path gets
+// only the short not-found budget below; its preflight can itself hit
+// delete-pending.
 const WINDOWS_FILE_RETRY_LIMIT: usize = 32;
 const WINDOWS_FILE_RETRY_SLEEP_MS: u64 = 5;
 const WINDOWS_ABSENT_FILE_RETRY_LIMIT: usize = 4;
@@ -477,7 +481,8 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
         // retries (20 ms total); a known-present file gets the full 160 ms.
         was_present = pfs.exists(@ptrCast(&pbuf));
     }
-    var fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    // openReadShared:Windows 上以 FILE_SHARE_DELETE 打开,不撞 atomicWrite 改名期间的句柄。
+    var fd = pfs.openReadShared(@ptrCast(&pbuf));
     if (is_windows and fd < 0) {
         var retryable = pfs.isWindowsTransientFileError(true);
         var retries: usize = 0;
@@ -487,7 +492,7 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
             retries += 1;
             retried = true;
             util_time.sleepMs(WINDOWS_FILE_RETRY_SLEEP_MS);
-            fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+            fd = pfs.openReadShared(@ptrCast(&pbuf));
             if (fd >= 0) break;
             retryable = pfs.isWindowsTransientFileError(true);
         }

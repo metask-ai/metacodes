@@ -76,6 +76,7 @@ extern "c" fn _fullpath(absPath: ?[*]u8, relPath: [*:0]const u8, maxLength: usiz
 // 在 CP936 下变成 `娴嬭瘯.txt`——而 exists/statPath/unlinkPath 早已走 UTF-16,同一个路径字符串会被
 // 两条路指到两个不同的文件系统对象。本模块所有接路径的 CRT 调用一律先转 UTF-16。
 extern "c" fn _wopen(path: [*:0]const u16, oflag: c_int, ...) c_int;
+extern "c" fn _open_osfhandle(osfhandle: isize, flags: c_int) c_int;
 extern "c" fn _wmkdir(path: [*:0]const u16) c_int;
 extern "c" fn _wrmdir(path: [*:0]const u16) c_int;
 extern "c" fn _wchdir(path: [*:0]const u16) c_int;
@@ -171,6 +172,41 @@ fn windowsOflag(flags: WindowsO) c_int {
 // ============================================================================
 // 中立文件 fd API
 // ============================================================================
+
+/// 只读打开一个可能正被别的线程/进程**原子替换**(写临时文件 + renameReplace)的文件,返回 CRT fd
+/// (失败 -1,errno 已按本次失败设置)。POSIX = `open(O_RDONLY)`(rename 对读者本就原子)。
+///
+/// Windows 必须用它而不是 `open`:UCRT `_wopen` 的共享模式没有 `FILE_SHARE_DELETE`,而替换方
+/// 在改名期间持有带 DELETE 访问权的句柄——共享检查是双向的,读者一开就撞
+/// ERROR_SHARING_VIOLATION(32);写方连续替换时读者的重试会被一直挡住(swarm config 竞态测试在
+/// 负载下实测 32 次、160 ms 重试全部落空)。这里以 READ|WRITE|DELETE 全共享打开:读者不被改名中
+/// 的句柄挡;`renameReplace` 的 POSIX 语义改名也能在读者打开期间替换文件(读者继续读旧内容)。
+pub fn openReadShared(path: [*:0]const u8) c_int {
+    if (is_windows) {
+        const win = std.os.windows;
+        var wbuf: [win.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wide = toWide(std.mem.span(path), &wbuf) catch return -1;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+        const handle = CreateFileW(wide.ptr, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+        if (handle == win.INVALID_HANDLE_VALUE) {
+            // CreateFileW 不写 CRT errno:按本次 Win32 错误补上,调用方(isWindowsTransientFileError、
+            // lastErrnoIs)读到的不能是上一次调用的残留值。
+            setErrno(switch (GetLastError()) {
+                2, 3 => .NOENT,
+                5, 32, 33 => .ACCES,
+                else => .IO,
+            });
+            return -1;
+        }
+        // fd 接管句柄:之后由 close(fd) 一并关闭。
+        const fd = _open_osfhandle(@bitCast(@intFromPtr(handle)), _O_RDONLY | _O_BINARY);
+        if (fd < 0) win.CloseHandle(handle);
+        return fd;
+    } else {
+        return std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    }
+}
 
 /// 打开文件，返回 fd（失败返 -1，errno 语义同各平台 CRT）。mode 为 CREAT 时的权限位。
 pub fn open(path: [*:0]const u8, flags: O, mode: c_uint) c_int {
@@ -571,15 +607,26 @@ const OPEN_EXISTING: u32 = 3;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
-/// 原子重命名(**替换**已存在目标)。POSIX rename(本就替换)/ Windows MoveFileExW +
-/// MOVEFILE_REPLACE_EXISTING(裸 rename 在 Windows 遇目标已存在会失败,非替换语义)。
-/// 返回 0 成功、非 0 失败。
+/// 原子重命名(**替换**已存在目标)。返回 0 成功、非 0 失败(Windows 失败原因在 GetLastError)。
+///
+/// POSIX = rename(2):本就原子替换,已打开旧文件的读者继续读旧内容。
+/// Windows 先用 POSIX 语义的改名(SetFileInformationByHandle + FileRenameInfoEx,
+/// REPLACE_IF_EXISTS | POSIX_SEMANTICS,Windows 10 1607+ 的 NTFS):目标名始终指向旧文件或新文件,
+/// 不出现 delete-pending/找不到的窗口,目标被 `openReadShared` 读者(共享 DELETE)打开着也能替换。
+/// 系统或文件系统不支持时退回 MoveFileExW + MOVEFILE_REPLACE_EXISTING——它在目标有任何打开句柄时
+/// 都会失败(实测:即使读者共享 DELETE),调用方需按 isWindowsTransientFileError 重试。
 pub fn renameReplace(from: [*:0]const u8, to: [*:0]const u8) c_int {
     if (is_windows) {
         var fbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
-        var tbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
         const from_w = toWide(std.mem.span(from), &fbuf) catch return -1;
-        const to_w = toWide(std.mem.span(to), &tbuf) catch return -1;
+        // 目标名直接转进 FILE_RENAME_INFO 的 FileName 位置,回退路径也用这同一份 UTF-16。
+        var rename_buf: WindowsRenameBuffer = undefined;
+        const to_w = toWide(std.mem.span(to), rename_buf.nameBuffer()) catch return -1;
+        switch (windowsPosixRenameReplace(from_w, &rename_buf, to_w.len)) {
+            .replaced => return 0,
+            .failed => return -1,
+            .unsupported => {},
+        }
         const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
         const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
         return if (MoveFileExW(from_w.ptr, to_w.ptr, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) 0 else -1;
@@ -587,6 +634,51 @@ pub fn renameReplace(from: [*:0]const u8, to: [*:0]const u8) c_int {
     return std.c.rename(from, to);
 }
 extern "kernel32" fn MoveFileExW(lpExistingFileName: [*:0]const u16, lpNewFileName: [*:0]const u16, dwFlags: u32) callconv(.winapi) c_int;
+extern "kernel32" fn SetFileInformationByHandle(hFile: std.os.windows.HANDLE, FileInformationClass: u32, lpFileInformation: *anyopaque, dwBufferSize: u32) callconv(.winapi) c_int;
+
+/// Win32 FILE_RENAME_INFO(Flags 与 ReplaceIfExists 共用的联合按 DWORD 取),后接最长的宽路径。
+const WindowsRenameBuffer = extern struct {
+    flags: u32,
+    root_directory: ?std.os.windows.HANDLE,
+    file_name_length: u32,
+    file_name: [std.os.windows.PATH_MAX_WIDE + 1]u16,
+
+    fn nameBuffer(self: *WindowsRenameBuffer) *[std.os.windows.PATH_MAX_WIDE + 1]u16 {
+        return &self.file_name;
+    }
+};
+
+const WindowsRenameResult = enum { replaced, failed, unsupported };
+
+/// POSIX 语义改名(见 renameReplace)。`.unsupported` = 本系统/文件系统没有这个能力,调用方应退回
+/// MoveFileExW;`.failed` 的原因留在 GetLastError(MoveFileExW 遇到同样情形也会失败,不再重试一遍)。
+fn windowsPosixRenameReplace(from_w: [:0]const u16, rename_buf: *WindowsRenameBuffer, to_len: usize) WindowsRenameResult {
+    const win = std.os.windows;
+    const DELETE: u32 = 0x0001_0000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    // 与 MoveFileExW 一致:改名的是链接本身而不是它指向的目标;BACKUP_SEMANTICS 才能打开目录。
+    const handle = CreateFileW(from_w.ptr, DELETE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, null);
+    if (handle == win.INVALID_HANDLE_VALUE) return .failed;
+    defer win.CloseHandle(handle);
+
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+    const FileRenameInfoEx: u32 = 22;
+    rename_buf.flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+    rename_buf.root_directory = null;
+    rename_buf.file_name_length = @intCast(to_len * @sizeOf(u16));
+    const size: u32 = @intCast(@offsetOf(WindowsRenameBuffer, "file_name") + (to_len + 1) * @sizeOf(u16));
+    if (SetFileInformationByHandle(handle, FileRenameInfoEx, rename_buf, size) != 0) return .replaced;
+    const ERROR_INVALID_FUNCTION: u32 = 1;
+    const ERROR_NOT_SUPPORTED: u32 = 50;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
+    return switch (GetLastError()) {
+        ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER, ERROR_CALL_NOT_IMPLEMENTED => .unsupported,
+        else => .failed,
+    };
+}
 
 /// Whether the last Windows file operation failed transiently because another
 /// handle is replacing/holding the path.  The CRT normally reports these as
@@ -654,6 +746,76 @@ pub fn installNoReplace(
 const posix_install = struct {
     extern "c" fn link(from: [*:0]const u8, to: [*:0]const u8) c_int;
 };
+
+fn writeWholeFile(path: [:0]const u8, bytes: []const u8) !void {
+    const fd = open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (fd < 0) return error.TestOpenFailed;
+    defer close(fd);
+    if (write(fd, bytes) != @as(isize, @intCast(bytes.len))) return error.TestWriteFailed;
+}
+
+test "openReadShared: a reader holding the file does not block renameReplace and keeps the old bytes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const target = try std.fmt.allocPrintSentinel(allocator, "{s}/config.json", .{root}, 0);
+    defer allocator.free(target);
+    const staged = try std.fmt.allocPrintSentinel(allocator, "{s}/config.json.tmp", .{root}, 0);
+    defer allocator.free(staged);
+
+    try writeWholeFile(target, "old-bytes");
+    const reader = openReadShared(target.ptr);
+    try std.testing.expect(reader >= 0);
+    defer close(reader);
+
+    // The writer replaces the file while the reader still holds it (the swarm
+    // atomicWrite pattern); the open reader keeps the bytes it opened.
+    try writeWholeFile(staged, "new-bytes");
+    try std.testing.expectEqual(@as(c_int, 0), renameReplace(staged.ptr, target.ptr));
+    var buf: [32]u8 = undefined;
+    const n = read(reader, buf[0..]);
+    try std.testing.expectEqualStrings("old-bytes", buf[0..@intCast(n)]);
+
+    const fresh = openReadShared(target.ptr);
+    try std.testing.expect(fresh >= 0);
+    defer close(fresh);
+    const m = read(fresh, buf[0..]);
+    try std.testing.expectEqualStrings("new-bytes", buf[0..@intCast(m)]);
+
+    // Missing paths fail with this call's errno, not a stale one.
+    setErrno(.ACCES);
+    const missing = try std.fmt.allocPrintSentinel(allocator, "{s}/absent.json", .{root}, 0);
+    defer allocator.free(missing);
+    try std.testing.expectEqual(@as(c_int, -1), openReadShared(missing.ptr));
+    try std.testing.expect(lastErrnoIs(.NOENT));
+}
+
+test "Windows: a plain open reader (no FILE_SHARE_DELETE) does block renameReplace" {
+    // The control for the test above: this is the sharing conflict that made
+    // swarm config readers starve while a writer replaced the file repeatedly.
+    if (!is_windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const target = try std.fmt.allocPrintSentinel(allocator, "{s}/config.json", .{root}, 0);
+    defer allocator.free(target);
+    const staged = try std.fmt.allocPrintSentinel(allocator, "{s}/config.json.tmp", .{root}, 0);
+    defer allocator.free(staged);
+
+    try writeWholeFile(target, "old-bytes");
+    const reader = open(target.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    try std.testing.expect(reader >= 0);
+    try writeWholeFile(staged, "new-bytes");
+    try std.testing.expect(renameReplace(staged.ptr, target.ptr) != 0);
+    close(reader);
+    try std.testing.expectEqual(@as(c_int, 0), renameReplace(staged.ptr, target.ptr));
+}
 
 test "installNoReplace preserves an existing destination and installs only when absent" {
     const allocator = std.testing.allocator;
