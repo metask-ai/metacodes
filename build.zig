@@ -2485,6 +2485,21 @@ pub fn build(b: *std.Build) void {
             eval_test_step.dependOn(&arm_smoke.step);
             test_step.dependOn(&arm_smoke.step);
 
+            // A session must not keep what it frees: memory growth over a
+            // scripted tool session stays below the bytes it sent, and the
+            // REPL exits cleanly (paid=0, loopback only). The release binary
+            // is what users run; the Debug one adds DebugAllocator's leak and
+            // invalid-free checks at exit.
+            for ([_]*std.Build.Step.Compile{ exe, debug_exe }) |binary| {
+                const session_memory_smoke = b.addSystemCommand(&.{
+                    eval_python_exe,
+                    "scripts/session_memory_smoke.py",
+                    "--binary",
+                });
+                session_memory_smoke.addArtifactArg(binary);
+                test_step.dependOn(&session_memory_smoke.step);
+            }
+
             // A replay fixture cannot prove that memory adapters cross the
             // real agent-loop/tool/runtime boundary.  Run all three adapters
             // against the native binary and hash-pinned local TinyKG with a

@@ -829,7 +829,15 @@ pub fn main(init: std.process.Init) !void {
         return error.IncompleteLoginSelection;
     };
 
-    const app = try app_mod.App.init(allocator, init.io, config, api_key);
+    // The session runs on the general-purpose allocator, never on the process
+    // arena `allocator` above: an arena frees nothing, and a session allocates
+    // per request, per streamed response and per tool result for hours or
+    // days, so on the arena every turn's buffers (and every ArrayList growth
+    // step) stayed committed until exit — tens of GB in a multi-day session.
+    // Argument and configuration strings stay in the arena; the session reads
+    // them and never frees them.
+    const gpa = init.gpa;
+    const app = try app_mod.App.init(gpa, init.io, config, api_key);
     defer app.deinit();
 
     try app.installSigintHandler();
@@ -849,7 +857,7 @@ pub fn main(init: std.process.Init) !void {
     // SW6 进程外 teammate 模式:`--teammate --agent-name X --team-name Y` → 跑 mailbox 消息循环,
     // 不进 TUI REPL。身份经 CLI args 注入,可 chdir 进 worktree(cwd 隔离)。
     if (config.teammate_name.len > 0) {
-        const code = @import("swarm/teammate_process.zig").run(app, allocator, .{
+        const code = @import("swarm/teammate_process.zig").run(app, gpa, .{
             .name = config.teammate_name,
             .team = config.teammate_team,
             .parent_session = config.teammate_parent_session,
@@ -870,13 +878,13 @@ pub fn main(init: std.process.Init) !void {
     if (config.serve_port) |port| {
         // serve-multi 路径:N>1(多 session)或设了 --uds(附加 UDS 绑定,即便 N=1)。
         if (config.serve_sessions > 1 or config.uds_path != null) {
-            const code = @import("daemon/serve_multi.zig").serveMulti(app, allocator, config, api_key, port, config.serve_sessions, config.uds_path) catch |err| blk: {
+            const code = @import("daemon/serve_multi.zig").serveMulti(app, gpa, config, api_key, port, config.serve_sessions, config.uds_path) catch |err| blk: {
                 log.err("daemon", "serve-multi failed: {s}", .{@errorName(err)});
                 break :blk @as(u8, 1);
             };
             std.process.exit(code);
         }
-        const code = @import("daemon/serve.zig").serve(app, allocator, port) catch |err| blk: {
+        const code = @import("daemon/serve.zig").serve(app, gpa, port) catch |err| blk: {
             log.err("daemon", "serve failed: {s}", .{@errorName(err)});
             break :blk 1;
         };
@@ -888,7 +896,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Web 模式:`--web [port]` → 起 HTTP+SSE 服务器驱动 agent loop,不进 TUI REPL。
     if (config.web_port) |port| {
-        const code = @import("web/session.zig").run(app, allocator, port) catch |err| blk: {
+        const code = @import("web/session.zig").run(app, gpa, port) catch |err| blk: {
             log.err("web", "web session failed: {s}", .{@errorName(err)});
             break :blk 1;
         };
@@ -899,7 +907,7 @@ pub fn main(init: std.process.Init) !void {
 
     // U8:`--resume-response <json>` → 恢复挂起的 session(read suspend.json→resumeRun),不进 REPL。
     if (config.resume_response) |resp| {
-        const code = @import("repl/headless.zig").resumeSuspended(app, allocator, resp, config.json_output) catch |err| blk: {
+        const code = @import("repl/headless.zig").resumeSuspended(app, gpa, resp, config.json_output) catch |err| blk: {
             std.debug.print("error: headless resume setup failed: {s}\n", .{@errorName(err)});
             break :blk 1;
         };
@@ -909,7 +917,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
     if (config.prompt) |p| {
-        const code = @import("repl/headless.zig").run(app, allocator, p, config.images, config.json_output) catch |err| blk: {
+        const code = @import("repl/headless.zig").run(app, gpa, p, config.images, config.json_output) catch |err| blk: {
             std.debug.print("error: headless setup failed: {s}\n", .{@errorName(err)});
             break :blk 1;
         };
@@ -918,7 +926,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // (stderr 日志 gate 已提前到 App.init 之前——见 interactive_tui;init 期日志同样不得上屏。)
-    try repl.run(app, allocator);
+    try repl.run(app, gpa);
 }
 
 /// 打印组装好的 system prompt + 工具 defs(name + 完整 description),然后退出。

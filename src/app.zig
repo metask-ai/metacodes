@@ -351,9 +351,15 @@ pub const App = struct {
     openai_client: ?openai_mod.OpenAIClient = null,
     /// Gemini 后端(config.provider_kind==.gemini 时非 null)。持有状态缓存句柄表(C3)。
     gemini_client: ?gemini_mod.GeminiClient = null,
+    /// Built once in `init` and kept for the whole session, so the slices,
+    /// the dynamic descriptions (`describe_fn`, env overrides) and
+    /// `enabled_tool_names` live in `tool_defs_arena`, released in `deinit`.
+    /// A description may also be a static string, so the defs are never freed
+    /// one by one.
     tool_defs: []json_mod.ToolDefinition,
+    tool_defs_arena: std.heap.ArenaAllocator,
     /// 当前启用的工具名（含动态 Skill/MCP）。用于 system prompt 的 # Using your tools
-    /// 段按工具集裁剪 + 构造 PromptContext。生命周期随 arena。
+    /// 段按工具集裁剪 + 构造 PromptContext。在 `tool_defs_arena` 里。
     enabled_tool_names: []const []const u8 = &.{},
     permission_ctx: permission_mod.PermissionContext,
     /// Session 级权限记忆(always-allow / session-deny)。挂到 permission_ctx.session_rules。
@@ -525,6 +531,7 @@ pub const App = struct {
             .io = io,
             .api_client = client_mod.Client.initWithBaseUrl(allocator, io, api_key, config.model, config.base_url),
             .tool_defs = &.{}, // 占位，下面重建
+            .tool_defs_arena = std.heap.ArenaAllocator.init(allocator),
             .permission_ctx = permission_mod.createContext(config.permission_mode, allocator),
             .abort = AbortSignal.init(),
             .skills = SkillSet.init(allocator),
@@ -550,6 +557,7 @@ pub const App = struct {
             app.config.state_root = app.state_root_default.?;
         };
         errdefer if (app.state_root_default) |owned| allocator.free(owned);
+        errdefer app.tool_defs_arena.deinit();
 
         // OpenAI 后端:仅当 provider_kind==.openai 才建(chat/completions 或 Responses,
         // 按 config.openai_protocol 显式选择)。base_url 复用 config.base_url(record/replay
@@ -713,15 +721,16 @@ pub const App = struct {
         // 现在构造完整的 tool_defs：静态 + 动态（Skill / MCP）+ web_search。
         // 先构造一次拿到全部工具名（含动态），据此建 PromptContext，再带 context 重建——
         // 让核心工具拿到动态长描述（对应 cc tool.prompt(ctx)）。
-        // arena allocator：第一次的临时 defs 随 session 释放，不单独 free。
+        // 两次都在 tool_defs_arena 里:第一次的临时 defs 随 App 一起释放。
         // probe pass 用 teams-aware bootstrap ctx,让 enabled_names 与最终 tool_defs 的
         // swarm 门控一致(否则 --agent-teams 开时 "Using your tools" 段漏列 swarm 工具)。
+        const defs_allocator = app.tool_defs_arena.allocator();
         const probe_ctx = tools_mod.PromptContext{
             .agent_teams = config.agent_teams,
             .tinykg_enabled = config.long_horizon_arm.usesTinyKg(),
         };
-        const probe_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &probe_ctx);
-        const enabled_names = try allocator.alloc([]const u8, probe_defs.len);
+        const probe_defs = try tools_mod.toToolDefinitionsFull(defs_allocator, &app.dyn_registry, &probe_ctx);
+        const enabled_names = try defs_allocator.alloc([]const u8, probe_defs.len);
         for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
         app.enabled_tool_names = enabled_names;
 
@@ -733,9 +742,8 @@ pub const App = struct {
             .agent_teams = config.agent_teams, // F5:门控 swarm 工具进 tool_defs
             .tinykg_enabled = config.long_horizon_arm.usesTinyKg(),
         };
-        app.tool_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &prompt_ctx);
+        app.tool_defs = try tools_mod.toToolDefinitionsFull(defs_allocator, &app.dyn_registry, &prompt_ctx);
         _ = app.skill_runtime.applyModelToolSchema(app.tool_defs);
-        errdefer allocator.free(app.tool_defs);
 
         // 加载模型上下文窗口表(~/.metacode/models.toml)并挂到 client。
         // precedence 高于 probe → auto-compact 阈值优先用此表(offline 可靠 + 用户可编辑)。
@@ -1005,7 +1013,11 @@ pub const App = struct {
     }
 
     pub fn deinit(app: *App) void {
-        defer if (app.state_root_default) |owned| app.allocator.free(owned);
+        // `config.state_root` may borrow this buffer, so it goes last, after
+        // `app` itself is destroyed: read both fields now, not from the freed App.
+        const allocator = app.allocator;
+        const state_root_default = app.state_root_default;
+        defer if (state_root_default) |owned| allocator.free(owned);
         // 最先 drain 后台 subagent：abort 全部 running → join 全部线程 → free。
         // 必须早于任何共享资源（agents/dyn_registry/skills/allocator）释放，
         // 否则在跑的后台线程会触碰已释放内存（UAF）。job 用专属 Client，不依赖 api_client。
@@ -1045,7 +1057,7 @@ pub const App = struct {
         if (app.kg_projects_dir.len > 0) app.allocator.free(app.kg_projects_dir);
         if (app.kg_summary.len > 0) app.allocator.free(app.kg_summary);
         if (app.jev) |runtime| runtime.destroy(app.allocator);
-        app.allocator.free(app.tool_defs);
+        app.tool_defs_arena.deinit();
         if (app.active_skill) |*active| {
             active.deinit();
             app.active_skill = null;

@@ -200,6 +200,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- A long session no longer keeps every buffer it ever allocated. The
+  interactive REPL, headless, web, `serve` and teammate modes ran on the
+  process arena, which frees nothing: each request body, streamed response,
+  tool result and every growth step of a growing buffer stayed committed
+  until exit, about six times the bytes sent to the provider. Multi-day
+  sessions reached 14 and 31 GB of committed memory and exhausted the
+  system commit limit. Sessions now use the general-purpose allocator
+  (`serve --sessions N` included); on a scripted 30-turn session, growth fell
+  from 40 MiB to 1.9 MiB. Running on a real allocator surfaced a
+  use-after-free in `App.deinit` (it read the freed `App` after destroying
+  it), now fixed. `zig build test` runs `scripts/session_memory_smoke.py`
+  against both binaries: memory growth must stay below the bytes sent, and
+  the Debug binary must exit the REPL with no allocator report.
 - Tasks left `in_progress` no longer crowd out the current one. A model that
   opens a task per attempt and never closes the last one piled up stale
   in-progress tasks, and the code took the *first* in-progress task as the
