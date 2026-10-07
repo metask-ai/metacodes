@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.3.1 — 2026-10-07
+
 ### Fixed
 
 - The macOS release build passes the AgentCore gate again. Since bundles ship
