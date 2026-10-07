@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.3.0 — 2026-10-07
+
 ### Added
 
 - The Jev System-One advisor is configured in the install's
