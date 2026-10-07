@@ -195,18 +195,43 @@ test "Subagents E2E: buildSubagentContext for general-purpose includes git statu
     defer set.deinit();
     try set.loadFromStandardPaths("");
 
+    // A repository of its own, not the checkout: `git status` over the whole
+    // working tree can outrun the snapshot's 5 s deadline on a loaded CI
+    // runner, and the section is then left out by design.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    if (!runGit(a, repo, &.{ "init", "-q" })) return error.SkipZigTest;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "untracked-note.txt", .data = "note\n" });
+
     const gp = set.find("general-purpose").?;
     const preload = @import("cc").agents_preload;
-    const project_dir = try currentProjectRoot(a);
-    defer a.free(project_dir);
     const sys = try preload.buildSubagentContext(a, gp, .{
-        .project_dir = project_dir,
+        .project_dir = repo,
         .parent_model = "claude-opus-4-7",
         .skip_codebase_context = preload.shouldSkipCodebaseContext(gp.name),
     });
     defer a.free(sys);
-    // git status section 应出现(repo 状态可能 clean 或 dirty,都行)
     try std.testing.expect(std.mem.indexOf(u8, sys, "# Git status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "?? untracked-note.txt") != null);
+}
+
+fn runGit(a: std.mem.Allocator, cwd: []const u8, args: []const []const u8) bool {
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    defer {
+        for (argv.items) |item| if (item) |z| a.free(std.mem.span(z));
+        argv.deinit(a);
+    }
+    for ([_][]const u8{ "/usr/bin/env", "git", "-C", cwd }) |arg| {
+        argv.append(a, (a.dupeZ(u8, arg) catch return false).ptr) catch return false;
+    }
+    for (args) |arg| argv.append(a, (a.dupeZ(u8, arg) catch return false).ptr) catch return false;
+    argv.append(a, null) catch return false;
+    const out = cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 15_000, null, cc.tools_common.MAX_SPAWN_CAPTURE_BYTES, null) catch return false;
+    defer a.free(out.stdout);
+    defer a.free(out.stderr);
+    return out.exit_code == 0;
 }
 
 test "Subagents E2E: subagents section in system prompt" {
