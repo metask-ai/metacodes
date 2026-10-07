@@ -31,10 +31,28 @@ fn configure() -> Result<(), String> {
     if !library_path.is_file() {
         return Err(format!("missing static library {}", library_path.display()));
     }
-    println!(
-        "cargo:rustc-link-search=native={}",
-        library_path.parent().unwrap().display()
-    );
+    println!("cargo:rerun-if-changed={}", library_path.display());
+    // The bundle's lib/ also ships the shared library for FFI Hosts. Given
+    // `-lmetask_agentcore`, Apple ld picks the .dylib over the .a in the same
+    // directory, so this crate's own unit-test binary linked it dynamically
+    // and failed to load it at run time (dependents were unaffected: rustc
+    // bundles the archive into the rlib). Search a directory that holds only
+    // the archive. Windows links the exact `.lib` filename and needs no copy.
+    let search_dir = if cargo_target.contains("windows") {
+        library_path.parent().unwrap().to_path_buf()
+    } else {
+        let out_dir = PathBuf::from(required_env("OUT_DIR")?);
+        let archive = out_dir.join(library_file);
+        fs::copy(&library_path, &archive).map_err(|error| {
+            format!(
+                "cannot copy {} to {}: {error}",
+                library_path.display(),
+                archive.display()
+            )
+        })?;
+        out_dir
+    };
+    println!("cargo:rustc-link-search=native={}", search_dir.display());
     // Unix bundles already use the conventional `lib<name>.a` spelling, so
     // pass the logical library name. Using `+verbatim` there makes the crate's
     // own unit-test link emit `-llibmetask_agentcore.a` on Apple ld. Windows

@@ -10,6 +10,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- The macOS release build passes the AgentCore gate again. Since bundles ship
+  a shared library next to the static archive, Apple ld resolved
+  `metask-agentcore-sys`'s `-lmetask_agentcore` to the `.dylib`, so the
+  crate's own unit tests linked it dynamically and failed to load it
+  (`Library not loaded: @rpath/libmetask_agentcore.dylib`); 0.3.0 was tagged
+  but never published because of it. The build script now links the archive
+  from a directory that holds only it. Crates depending on the SDK were not
+  affected: rustc bundles the archive into their rlib.
+
 ## 0.3.0 — 2026-10-07
 
 ### Added
