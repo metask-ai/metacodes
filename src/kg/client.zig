@@ -296,7 +296,7 @@ pub const KgClient = struct {
     pending_ref_tasks: std.AutoHashMap(u64, void) = undefined,
     /// 宿主观测的成功执行事实。只保存 bounded task/relation/sanitized-label，
     /// 不保存命令、query、工具正文或结果；与其它 session 缓存共用 cache_mu，
-    /// 因为主 loop 的 arena allocator 本身不保证多线程安全。
+    /// 因为主 loop 与后台线程会同时读写这些缓存。
     execution_ledger: execution_knowledge.Ledger = undefined,
     /// project 三锚 id 缓存(乙方案):[scope_global 0/1][AnchorKind]。写路径 lazy ensure;
     /// 失效纪律同 project 缓存:挂接失败清对应槽,下次写重新 ensure(stale 自愈)。

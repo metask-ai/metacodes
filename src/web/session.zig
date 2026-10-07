@@ -282,8 +282,8 @@ pub fn buildWebOptions(app: *app_mod.App, wb: *WebBackend, scoped_recall: ?[]con
 
 /// 跑 web 会话直到退出(空闲期 SIGINT)。返回进程退出码。
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
-    // web 侧资源统一 c_allocator:emit/journal/HTTP 连接线程并发分配,必须线程安全
-    // (App 的 arena allocator 不是)。生命周期 = 本函数,deinit 成对。
+    // web 侧资源统一 c_allocator:emit/journal/HTTP 连接线程并发分配,必须线程安全,
+    // 不依赖调用方传入的 allocator 是否线程安全。生命周期 = 本函数,deinit 成对。
     const web_alloc = std.heap.c_allocator;
 
     var journal = EventJournal.init(web_alloc);
