@@ -1239,6 +1239,9 @@ pub const AgentSession = struct {
     /// BUSY until these borrows drain, so model replacement/destroy cannot free
     /// a provider still used by a cross-thread abort.
     in_flight_provider_cancels: usize = 0,
+    /// Broadcast under `mutex` when `in_flight_provider_cancels` reaches zero
+    /// (`awaitProviderCancelsDrained`).
+    provider_cancels_drained: sync.Condition = .{},
     last_admitted_compact_id: u64 = 0,
     last_terminal_compact_id: u64 = 0,
     callback_failed: bool = false,
@@ -1950,6 +1953,21 @@ pub const AgentSession = struct {
         defer self.mutex.unlock();
         std.debug.assert(self.in_flight_provider_cancels > 0);
         self.in_flight_provider_cancels -= 1;
+        if (self.in_flight_provider_cancels == 0) self.provider_cancels_drained.broadcast();
+    }
+
+    /// Block until every abort that borrowed a provider has returned from
+    /// `Provider.cancel`. A Run or compact can return (aborted) while the
+    /// cross-thread abort that stopped it is still inside `cancel`. A caller
+    /// that lent the provider (`compactUsingBorrowedProvider`) must keep it
+    /// alive until then, and terminal bookkeeping must wait too: the session
+    /// still answers BUSY to every admission and snapshot meanwhile. The wait is
+    /// bounded by `Provider.cancel`, which never waits on the activity it
+    /// cancels.
+    pub fn awaitProviderCancelsDrained(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.in_flight_provider_cancels != 0) self.provider_cancels_drained.wait(&self.mutex);
     }
 
     fn cancelMutation(self: *AgentSession) void {
@@ -3588,11 +3606,33 @@ test "AgentSession keeps every activity busy until compact provider cancel retur
     );
     try std.testing.expectEqual(@as(u64, 3), self.last_admitted_compact_id);
     try std.testing.expectError(error.SessionBusy, self.destroy());
+    // The terminal measurement an embedding layer takes after compact returns
+    // is refused too, so it has to wait for the borrow (AgentCore once
+    // poisoned its facade when it measured inside this window).
+    try std.testing.expectError(error.SessionBusy, self.snapshotCommittedForRunMeasurement());
+    const Waiter = struct {
+        session: *AgentSession,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(ctx: *@This()) void {
+            ctx.session.awaitProviderCancelsDrained();
+            ctx.done.store(true, .release);
+        }
+    };
+    var waiter = Waiter{ .session = self };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    sync.sleepMs(20);
+    try std.testing.expect(!waiter.done.load(.acquire));
 
     fake.release_cancel.store(true, .release);
     abort_thread.join();
+    waiter_thread.join();
+    try std.testing.expect(waiter.done.load(.acquire));
     try std.testing.expect(abort_worker.failure == null);
     try std.testing.expectEqual(@as(usize, 0), self.in_flight_provider_cancels);
+    var lease = try self.snapshotCommittedForRunMeasurement();
+    lease.deinit();
+    self.awaitProviderCancelsDrained(); // nothing borrowed: returns at once
     try self.setModel("model-after-cancel-returned");
 }
 

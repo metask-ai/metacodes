@@ -10,6 +10,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- An AgentCore session no longer poisons itself when a compact or Run is
+  aborted from another thread. The aborted operation could return while the
+  abort was still inside `Provider.cancel`; Core answers BUSY to everything
+  until that call returns, so the facade's terminal usage measurement failed
+  and poisoned the session (the Linux 0.3.1 release job hit it in
+  `agentcore_abi_test`). A compact's borrowed provider, which lives on the
+  facade's stack, could also go out of scope while `cancel` still used it.
+  The facade now waits for in-flight cancels to drain before terminal
+  bookkeeping and before returning from a compact.
+
 ## 0.3.1 — 2026-10-07
 
 ### Fixed
