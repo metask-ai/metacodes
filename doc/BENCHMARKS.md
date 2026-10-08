@@ -74,6 +74,12 @@ the full validator and 6/6 finishing with the pinned check passing, so the
 hazard the gate targets never occurred and the preregistered stopping rule
 skipped the paired stage (US$3.01 nominal spent). The gate ran its check once
 per rollout and never continued. H1 is untested on this cohort, not refuted.
+v2 (multi-file feature requests with regression traps, 5 tasks × 1 pair;
+[check-gate-v2.md](../evals/experiments/check-gate-v2.md)) stopped the same
+way (0/5 finished red, 4/5 validator in both arms, US$3.60): the model ran the
+tests in every rollout. Both textkit runs instead rewrote an existing test to
+match a changed shared tokenizer, which the gate recorded as a pass; a pass
+after modifying an existing test is now tainted.
 
 **Three-arm long-horizon PK v2** (`codex_style` vs `claude_style` vs `tinykg`,
 [evals/README.md §5.1](../evals/README.md)): three calibration attempts all
