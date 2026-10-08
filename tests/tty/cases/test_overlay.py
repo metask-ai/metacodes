@@ -336,13 +336,18 @@ def test_ctrlb_backgrounds_main_session_deterministic(bin_path):
     原会话,新前台须把它算进自己的视图);③ turn2 的哨兵 "SHOULD_NOT_REACH" 不出现(turn2 起点
     确实被拦,没继续跑)。
     """
+    import json
     import re
+    from tty_driver import case_tmpdir
     # 准备工具要读的文件(turn1 末尾的 Read 在转后台前可能已被调度,文件存在避免噪声)。
-    with open("/tmp/bgtest_file.txt", "w") as f:
+    # 放在用例自己的临时目录:Windows 上没有 /tmp。
+    target = os.path.join(case_tmpdir("cc-tty-ctrlb-"), "bgtest_file.txt")
+    with open(target, "w") as f:
         f.write("hi\n")
     from slow_mock_server import SlowMockServer, slow_text_then_tooluse, simple_text
     turns = [
-        slow_text_then_tooluse(n_chunks=15, delay=0.5),  # turn1:宽窗口 + tool_use 收尾
+        # turn1:宽窗口 + tool_use 收尾
+        slow_text_then_tooluse(n_chunks=15, delay=0.5, tool_input=json.dumps({"file_path": target})),
         simple_text("SHOULD_NOT_REACH"),                  # turn2:不该到达(被转后台拦截)
     ]
     with SlowMockServer(turns) as srv:
