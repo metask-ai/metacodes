@@ -3,7 +3,10 @@
 //! `--record <dir>` 录出 `<dir>/sse-001.txt`, `sse-002.txt`, ... (每轮一个 SSE 响应)。
 //! 本模块把它们按序读回 `[]const []const u8`,喂给 MockServer.startCassette 回放。
 //!
-//! 注意:本仓库的 std 是裁剪版(无 std.fs.cwd),全程用 libc(opendir/readdir/open)。
+//! 目录遍历走 `platform.dir`,读文件走 `platform.fs`。这里曾手写 macOS 布局的 libc
+//! `dirent`(`d_seekoff`/`d_namlen`/`d_name[1024]`):Linux 上文件名偏移错位,一个
+//! `sse-*.txt` 都认不出,replay_server 在 Linux 上从未工作过——依赖它的 TTY 用例
+//! 只因"未就绪就 return"才显得通过(#222)。
 //!
 //! 用法:
 //!   var cas = try Cassette.load(allocator, "runs/<ts>/<场景>/cassette");
@@ -12,21 +15,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
-
-// libc dirent(macOS/Linux 通用最小声明)。
-const DIR = opaque {};
-extern "c" fn opendir(name: [*:0]const u8) ?*DIR;
-extern "c" fn readdir(dirp: *DIR) ?*dirent;
-extern "c" fn closedir(dirp: *DIR) c_int;
-
-const dirent = extern struct {
-    d_ino: u64,
-    d_seekoff: u64,
-    d_reclen: u16,
-    d_namlen: u16,
-    d_type: u8,
-    d_name: [1024]u8,
-};
+const pdir = @import("platform").dir;
 
 pub const Cassette = struct {
     allocator: std.mem.Allocator,
@@ -41,16 +30,16 @@ pub const Cassette = struct {
         @memcpy(pbuf[0..dir_path.len], dir_path);
         pbuf[dir_path.len] = 0;
 
-        const dp = opendir(@ptrCast(&pbuf)) orelse return error.OpenDirFailed;
-        defer _ = closedir(dp);
+        var it = pdir.open(@ptrCast(&pbuf)) orelse return error.OpenDirFailed;
+        defer pdir.close(&it);
 
         var names: std.ArrayList([]u8) = .empty;
         defer {
             for (names.items) |n| allocator.free(n);
             names.deinit(allocator);
         }
-        while (readdir(dp)) |ent| {
-            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.d_name)), 0);
+        while (pdir.next(&it)) |ent| {
+            const name = ent.name;
             if (!std.mem.startsWith(u8, name, "sse-")) continue;
             if (!std.mem.endsWith(u8, name, ".txt")) continue;
             try names.append(allocator, try allocator.dupe(u8, name));
