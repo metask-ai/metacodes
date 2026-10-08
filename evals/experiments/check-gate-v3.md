@@ -131,3 +131,9 @@ US$30).
    here every validator failure came with a green pinned check. Whether to run
    stage B as registered or stop with a documented deviation is left to the
    owner (decision recorded below).
+
+**Stage B decision (owner, 2026-10-08):** run stage B as registered. Sizing
+rule: 3 × US$5.61 × 1.25 = US$21.0 exceeds the remaining US$17.78, 2 ×
+US$5.61 × 1.25 = US$14.0 fits, so 2 trials per task per arm (16 rollouts),
+with stage A's US$5.609415 as the budget-used offset under the US$23.39 v3
+cap. Same binary and harness revision (c9f14ae3) as stage A.
