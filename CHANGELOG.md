@@ -20,9 +20,9 @@ status, compatibility boundaries, and entry points are defined by
   connection until its 30 s request deadline. A fresh install's first
   session, or the first one after a reboot, took over 30 s to show its
   prompt; it now takes a few seconds. The readiness check now treats a hang-up
-  or error as readable, as the writability check already did. The offline
-  TTY harness also no longer starts a TinyKG service in each throwaway
-  home. Each one outlived its test, and on Windows the leftover service
+  or error as readable, as the writability check already did. The TTY
+  harness also no longer starts a TinyKG service in the temporary home of
+  each case. Each one outlived its case, and on Windows the leftover service
   kept the home from being deleted.
 - An AgentCore session no longer poisons itself when a compact or Run is
   aborted from another thread. The aborted operation could return while the
