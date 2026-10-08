@@ -81,5 +81,9 @@ kernel fingerprint.
 
 ## Authorization
 
-Pending: no paid rollout has run. The owner's dollar cap and the date are
-recorded here before stage A starts.
+Authorized by the owner on 2026-10-08, before any paid rollout: cumulative
+cap US$30 nominal at the guardrail rates, covering stage A and stage B
+together (stage B passes stage A's spend as the budget-used offset).
+Per-rollout runaway cap 2,500,000 metered tokens / US$9, the same as the
+delivery-cadence run. Both arms run one ReleaseSafe binary built from the
+recorded harness revision through `#!/bin/sh` wrappers.
