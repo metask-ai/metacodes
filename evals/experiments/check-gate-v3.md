@@ -93,3 +93,41 @@ Within the owner's 2026-10-08 authorization of US$30 nominal across the
 check-gate experiments: v1 spent US$3.01 and v2 US$3.60, leaving US$23.39 for
 v3. Stage B passes stage A's spend as the budget-used offset. Per-rollout
 runaway cap 2,500,000 metered tokens / US$9.
+
+---
+
+## Results — stage A (run 2026-10-08, harness c9f14ae3, model glm-5.3-flash via metask)
+
+Receipt-bound summary of `evals/runs/cg-v3/stageA/`. One ReleaseSafe binary
+(`metacodes 0.3.2-dev+c9f14ae3497d`, clean tree) through both wrappers. 8
+rollouts, all valid, nominal cost US$5.61 (check-gate total US$12.22 of
+US$30).
+
+| task | arm | validator | partial credit | final pinned check | checks | continuations | model ran the tests | turns | cost |
+|---|---|---|---:|---|---:|---:|---:|---:|---:|
+| d1_cg3_cron | observe | pass | 1.000 | passed | 1 | 0 | 6 | 13 | 0.452 |
+| d1_cg3_cron | enforce | pass | 1.000 | passed | 1 | 0 | 12 | 17 | 0.565 |
+| d2_cg3_sheet | observe | fail | 0.986 | passed | 1 | 0 | 8 | 11 | 0.639 |
+| d2_cg3_sheet | enforce | pass | 1.000 | passed | 1 | 0 | 16 | 22 | 1.136 |
+| d3_cg3_calc | observe | pass | 1.000 | passed | 1 | 0 | 10 | 12 | 0.479 |
+| d3_cg3_calc | enforce | pass | 1.000 | passed | 1 | 0 | 4 | 8 | 0.421 |
+| d4_cg3_ranges | observe | fail | 0.969 | passed | 1 | 0 | 14 | 25 | 1.049 |
+| d4_cg3_ranges | enforce | fail | 0.984 | passed | 1 | 0 | 10 | 18 | 0.870 |
+
+### Reading
+
+1. **The hazard did not occur and the gate never acted.** Every rollout in
+   both arms finished with the visible suite green (0/8 red); the candidate
+   made no continuation. The model ran the tests 4–16 times per rollout and
+   stopped only on green — the same behaviour as v1 and v2 (0/15 baseline
+   rollouts finished red across the three cohorts).
+2. **The remaining failures are hidden cases the pinned check cannot see** (one
+   sheet case in the baseline, two and one ranges cases), so the gate had no
+   signal to act on. The candidate's +0.007 mean partial credit (2 up, 2 tied)
+   is run-to-run variance with the mechanism idle, not a treatment effect.
+3. **Stopping rule:** the baseline failed the full validator twice, which by
+   the preregistered rule ("≥1 finished red, or ≥2 failing the validator")
+   opens stage B. That second clause was meant as a proxy for finishing red;
+   here every validator failure came with a green pinned check. Whether to run
+   stage B as registered or stop with a documented deviation is left to the
+   owner (decision recorded below).
