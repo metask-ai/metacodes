@@ -89,3 +89,20 @@ mechanism readout (H2) and the harm readout (H3) are reported per rollout.
 Owner authorization 2026-10-08: US$8 nominal for this evaluation, separate
 from the US$30 check-gate authorization. Per-rollout runaway cap US$2 and
 2,500,000 metered tokens (check-gate v2 rollouts cost US$0.29–0.46).
+
+### Amendment 1 (2026-10-08, before any outcome data)
+
+The first stage A invocation stopped fail-closed on its first rollout with
+US$0 spent: the runtime reserves, before every request, the request's input
+estimate plus the model's whole output allowance at guardrail rates, and
+glm-5.3-flash's default allowance (131,072 tokens × US$15/M = US$1.97) left no
+room under a US$2 per-rollout cap. No rollout produced data. Amended before
+the rerun:
+
+- both wrappers add `--max-tokens 32768` (identical in both arms; responses in
+  these tasks stay far below it), which lowers the output reservation to
+  US$0.49;
+- the per-rollout runaway cap is US$2.50. The runner also reserves the whole
+  per-rollout cap from the US$8 cumulative cap before each rollout, so about
+  US$5.5–6 of the authorization is usable; stage B is sized under that
+  constraint.
