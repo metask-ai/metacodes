@@ -19,9 +19,8 @@ status, compatibility boundaries, and entry points are defined by
   failed, tainted (the run changed the program the check executes or a test
   file a result names, or the check passed after the run modified an existing
   test file) or unavailable (spawn failure, 180 s timeout, or exit 126/127).
-  In
-  enforce mode a clean failure continues the same conversation with the
-  verdict — failing names and reasons from the JUnit/pytest codecs, or the
+  In enforce mode a clean failure continues the same conversation with the
+  verdict — failing names and reasons from the JUnit/pytest codecs, and the
   output tail — plus an escalating reading from the cognitive-mode schedule,
   until the check passes or the budget is spent; a turn with no new change is
   never checked, so a question-and-answer turn never runs the suite. Observe
@@ -46,6 +45,24 @@ status, compatibility boundaries, and entry points are defined by
   Claude Code leaves it to the script. Any hook command can now set
   `"timeout": <seconds>` (capped at 600), and the event budget widens to the
   sum of its commands' timeouts, so a Stop hook can run a test suite.
+
+### Fixed
+
+- An AgentCore session no longer poisons itself when a compact or Run is
+  aborted from another thread. The aborted operation could return while the
+  abort was still inside `Provider.cancel`; Core answers BUSY to everything
+  until that call returns, so the facade's terminal usage measurement failed
+  and poisoned the session (the Linux 0.3.1 release job hit it in
+  `agentcore_abi_test`). A compact's borrowed provider, which lives on the
+  facade's stack, could also go out of scope while `cancel` still used it.
+  The facade now waits for in-flight cancels to drain before terminal
+  bookkeeping and before returning from a compact.
+- The end-of-run host check no longer downgrades verdicts to
+  `host_run_tainted` when the run only changed the module under test:
+  `verdict.taintedByWorkspaceEdits` matched paths as substrings, so editing
+  `semver.py` tainted every result naming `tests/test_semver.py`. Paths now
+  match by component (equal, or one ends with `/` plus the other), and
+  untracked directories, both ends of a rename and quoted paths count.
 
 ## 0.3.1 — 2026-10-07
 
