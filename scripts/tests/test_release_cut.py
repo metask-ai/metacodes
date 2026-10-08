@@ -355,6 +355,59 @@ class ThrowawayRepoTest(unittest.TestCase):
         self.assertEqual(rc.first_parent_is_conventional(self.root, "0.1.0"), ["fix: squashed onto main"])
 
 
+class Utf8OutputTest(unittest.TestCase):
+    """git and gh write UTF-8 whatever the locale. On a Chinese Windows the cut
+    decoded it as GBK (stdout came back None) and its own GBK pipe could not
+    print µ or ✓; the dry run below runs on such a pipe on every platform."""
+
+    SUBJECT = "fix: 1.9 µs, ✓ ↔ ✗ — 中文"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.origin = base / "origin.git"
+        self.root = base / "clone"
+        _git("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=base)
+        _git("init", "-q", "-b", "main", str(self.root), cwd=base)
+        (self.root / rc.ZON).write_text('.{ .version = "0.2.0-dev" }\n', encoding="utf-8")
+        (self.root / rc.VERSION_ZIG).parent.mkdir(parents=True)
+        (self.root / rc.VERSION_ZIG).write_text('pub const semver = "0.2.0-dev";\n', encoding="utf-8")
+        changelog = CHANGELOG_FIXTURE.replace("- one fix.", "- one fix: 1.9 µs ↔ ✓.")
+        (self.root / rc.CHANGELOG).write_text(changelog, encoding="utf-8")
+        _git("add", "-A", cwd=self.root)
+        _git("commit", "-q", "-m", "chore: init", cwd=self.root)
+        _git("tag", "0.1.0", cwd=self.root)
+        _commit(self.root, self.SUBJECT)
+        _git("remote", "add", "origin", str(self.origin), cwd=self.root)
+        _git("push", "-q", "--tags", "origin", "main", cwd=self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_non_ascii_commit_messages_round_trip(self):
+        messages = rc.commit_messages_since(self.root, "0.1.0")
+        self.assertEqual([m.splitlines()[0] for m in messages], [self.SUBJECT])
+        self.assertEqual(check_version_state.git("log", "-1", "--format=%s", "HEAD", root=self.root), self.SUBJECT)
+
+    def test_output_that_is_not_utf8_is_refused_and_a_failure_keeps_its_message(self):
+        with self.assertRaisesRegex(rc.CutError, "not UTF-8"):
+            rc.run([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'\\xff')"], self.root)
+        # A Python child writes UTF-8 too, so its message survives intact.
+        with self.assertRaises(rc.CutError) as caught:
+            rc.run([sys.executable, "-c", "import sys; print('refused ✓', file=sys.stderr); sys.exit(3)"], self.root)
+        self.assertIn("failed (3): refused ✓", str(caught.exception))
+
+    def test_a_dry_run_on_a_gbk_pipe_escapes_what_it_cannot_encode(self):
+        script = str(ROOT / "scripts" / "release_cut.py")
+        env = dict(os.environ, PYTHONIOENCODING="gbk")
+        proc = subprocess.run([sys.executable, script, "--dry-run", "--repo-root", str(self.root)], capture_output=True, env=env, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("gbk", errors="replace"))
+        out = proc.stdout.decode("gbk")
+        self.assertIn("cutting 0.2.0", out)
+        self.assertIn("- one fix: 1.9 \\xb5s \\u2194 \\u2713.", out)
+        self.assertIn("[dry-run] no files written", out)
+
+
 class OpenPrFailureTest(unittest.TestCase):
     """open_pr against a local bare `origin`, with `gh` replaced: whatever
     fails, the checkout ends on main, and the error says whether the branch

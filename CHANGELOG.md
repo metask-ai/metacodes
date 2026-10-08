@@ -48,6 +48,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- On Windows, a session that has to start the TinyKG service no longer waits
+  30 s before it renders. Autostart checks that the service is up by
+  connecting and closing at once. WSAPoll reports that close as POLLHUP
+  without POLLRDNORM, and the socket readiness check looked only at
+  POLLRDNORM, so the single-threaded service kept polling the closed
+  connection until its 30 s request deadline. A fresh install's first
+  session, or the first one after a reboot, took over 30 s to show its
+  prompt; it now takes a few seconds. The readiness check now treats a hang-up
+  or error as readable, as the writability check already did. The TTY
+  harness also no longer starts a TinyKG service in the temporary home of
+  each case. Each one outlived its case, and on Windows the leftover service
+  kept the home from being deleted.
 - An AgentCore session no longer poisons itself when a compact or Run is
   aborted from another thread. The aborted operation could return while the
   abort was still inside `Provider.cancel`; Core answers BUSY to everything
@@ -57,6 +69,14 @@ status, compatibility boundaries, and entry points are defined by
   facade's stack, could also go out of scope while `cancel` still used it.
   The facade now waits for in-flight cancels to drain before terminal
   bookkeeping and before returning from a compact.
+- The release cut (`scripts/release_cut.py`) runs on a Chinese Windows
+  without `PYTHONUTF8=1`. It decoded git's UTF-8 output with the locale's
+  GBK codec. On Windows the decode error is raised in subprocess's reader
+  thread and only printed, so the commit list came back `None` and the cut
+  crashed. It now decodes git, gh and Python children as UTF-8. Characters
+  its own output pipe cannot encode, such as `µ` and `✓`, are escaped instead
+  of failing the dry run. `scripts/check_version_state.py` read HEAD's commit
+  subject the same way and is fixed too.
 - The end-of-run host check no longer downgrades verdicts to
   `host_run_tainted` when the run only changed the module under test:
   `verdict.taintedByWorkspaceEdits` matched paths as substrings, so editing
