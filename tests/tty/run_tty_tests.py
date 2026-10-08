@@ -27,6 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)  # 让 cases 能 import screen/asserts/tty_driver
 
 from asserts import AssertError  # noqa: E402
+from tty_driver import release_case_dirs  # noqa: E402
 try:
     from e2e_helpers import SkipTest  # noqa: E402
 except Exception:  # noqa: BLE001
@@ -119,6 +120,8 @@ def main():
             # 在 3.9 会自身抛 TypeError 把整个 runner 带崩。
             _emit("    " + traceback.format_exc().replace("\n", "\n    "))
             failed.append(name)
+        finally:
+            release_case_dirs()  # 用例自建的临时目录(tty_driver.case_tmpdir),失败也删
 
     suite_dt = time.monotonic() - suite_t0
     skip_note = f" / {len(skipped)} skipped" if skipped else ""

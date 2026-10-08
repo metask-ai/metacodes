@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from e2e_helpers import SKIP, SkipTest  # noqa: E402
+from e2e_helpers import SkipTest, require_model  # noqa: E402
 from tty_driver import run  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -155,8 +155,7 @@ def _ledger(home):
 
 
 def test_e2e_metask_device_flow_and_reconcile(bin_path):
-    if SKIP:
-        return
+    require_model()
     web_token = os.environ.get("METASK_WEB_SESSION_TOKEN")
     if not web_token:
         raise SkipTest("需要 METASK_WEB_SESSION_TOKEN(用户网页会话)来程序化确认设备码")

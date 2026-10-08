@@ -9,8 +9,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run
 from screen import Screen
 
-SKIP = os.environ.get("TTY_SKIP_MODEL") == "1"
-
 
 def _cap(bin_path, events, rows=24, cols=80):
     raw = run(bin_path, ["sleep:0.8"] + events, per_key_drain=0.07)
@@ -75,9 +73,8 @@ def test_shell_delete_bang_exits(bin_path):
 
 
 def test_shell_submit_executes(bin_path):
-    # `!echo MARKER` 回车 → 执行 shell 命令,输出含 MARKER。
-    if SKIP:
-        return
+    # `!echo MARKER` 回车 → 执行 shell 命令,输出含 MARKER。不打模型,离线也跑
+    # (曾被 TTY_SKIP_MODEL 门住,离线时直接 return 计为通过,#222)。
     import re
     # !cmd 纯本地执行、零模型调用 → 走默认死端口 base_url(离线确定性,不依赖凭证)。
     raw = run(bin_path, ["sleep:0.8", "type:!echo SHELLMODEMARK", "key:enter", "sleep:1.5"],

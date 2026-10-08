@@ -1,5 +1,9 @@
 //! L2: the Metacodes-owned TinyKG service is reachable by the Metacodes client.
 //!
+//! Every test runs on Windows too, except where a test says why not (#222:
+//! these were skipped there wholesale, and a Windows-only service stall hid in
+//! that gap).
+//!
 //! The two halves are written against the same contract but never met until
 //! here: `src/kg/kgd/` synthesizes the envelope and `src/kg/transport.zig`
 //! validates it field by field. This drives a real `tinykgd`, over a real
@@ -142,7 +146,6 @@ fn initStore(allocator: std.mem.Allocator, cli: []const u8, store: []const u8) !
 const TEST_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 test "Kgd: the Metacodes client reaches the Metacodes service and reads the store" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
     defer harness.deinit();
@@ -163,7 +166,6 @@ test "Kgd: the Metacodes client reaches the Metacodes service and reads the stor
 }
 
 test "Kgd: a write commits and the generation advances" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
     defer harness.deinit();
@@ -190,7 +192,6 @@ test "Kgd: a write commits and the generation advances" {
 }
 
 test "Kgd: an agent retrieval after a write is served from a rebuilt index" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
     defer harness.deinit();
@@ -222,7 +223,6 @@ test "Kgd: an agent retrieval after a write is served from a rebuilt index" {
 }
 
 test "Kgd: declaring a custom type's scope does not fence the session's later writes" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
     defer harness.deinit();
@@ -289,7 +289,6 @@ const Restarter = struct {
 };
 
 test "Kgd: a session that finds its service down has the host start it, then works" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
     defer harness.deinit();
@@ -337,7 +336,6 @@ test "Kgd: a session that finds its service down has the host start it, then wor
 }
 
 test "Kgd: the service refuses a wrong key and an undeclared capability" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
     defer harness.deinit();
@@ -355,6 +353,9 @@ test "Kgd: the service refuses a wrong key and an undeclared capability" {
 }
 
 test "Kgd: a planted symlink cannot capture a markdown import" {
+    // The attack plants a POSIX symlink (`std.c.symlink`); Windows has no such
+    // call, and creating a symbolic link there needs a privilege a test runner
+    // cannot assume.
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
@@ -393,7 +394,6 @@ test "Kgd: a planted symlink cannot capture a markdown import" {
 }
 
 test "Kgd: install writes a configuration this service can be started from" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const cli = tinykg_binary.find(a) orelse return error.SkipZigTest;
     defer a.free(cli);
@@ -439,7 +439,6 @@ test "Kgd: install writes a configuration this service can be started from" {
 }
 
 test "Kgd: what install wrote is what the service starts from" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const cli = tinykg_binary.find(a) orelse return error.SkipZigTest;
     defer a.free(cli);
@@ -539,6 +538,9 @@ test "Kgd: what install wrote is what the service starts from" {
     try std.testing.expect(std.mem.indexOf(u8, info.stdout, "storage_format_version=3") != null);
 
     // A configuration the client would refuse must not start a service either.
+    // Group/other mode bits are what make it unsafe, and the client checks them
+    // on POSIX only (`KgClient.readDaemonConfig`): Windows files have none.
+    if (@import("builtin").os.tag == .windows) return;
     const config_c = try a.dupeZ(u8, config_path);
     defer a.free(config_c);
     try std.testing.expectEqual(@as(c_int, 0), pfs.chmod(config_c.ptr, 0o644));

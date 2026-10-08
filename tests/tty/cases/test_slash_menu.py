@@ -7,9 +7,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run
 from asserts import TTYAssert
-from e2e_helpers import run_live_fresh  # 真模型用例:播种凭证隔离 HOME + 凭证回传 + 失效跳过
-
-SKIP = os.environ.get("TTY_SKIP_MODEL") == "1"
+from e2e_helpers import run_live_fresh, require_model  # 真模型用例:播种凭证隔离 HOME + 凭证回传 + 失效跳过
 
 
 def test_T18_slash_menu_appears(bin_path):
@@ -63,8 +61,7 @@ def test_T18c_space_dismisses_menu(bin_path):
 
 def test_T19_multiline_reply_complete(bin_path):
     # 根因回归:模型多行回复(逐行数字)应完整流入 scrollback,不被固定区覆盖成 1 行。
-    if SKIP:
-        return
+    require_model()
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请逐行输出 1 2 3 4 5 6 每个数字单独占一行", "key:enter", "sleep:8"],
               per_key_drain=0.05)
     a = TTYAssert(raw)
@@ -77,8 +74,7 @@ def test_T19_multiline_reply_complete(bin_path):
 
 def test_T17_help_then_question_no_corruption(bin_path):
     # 根因回归:/help(十几行命令输出)后提问 → 模型多行回复,排版不交错重叠。
-    if SKIP:
-        return
+    require_model()
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:/help", "key:enter", "sleep:0.6",
                          "type:用一句话回答你是谁", "key:enter", "sleep:10"],
               per_key_drain=0.05)

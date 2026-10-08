@@ -18,8 +18,8 @@ import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run  # noqa: E402
 from e2e_helpers import (  # noqa: E402
-    SKIP, SkipTest, RETRIES, fresh_home, run_live,
-    read_tool_uses, read_tool_results_with_error, tool_called,
+    SkipTest, RETRIES, fresh_home, run_live,
+    read_tool_uses, read_tool_results_with_error, tool_called, require_model,
 )
 
 
@@ -68,8 +68,7 @@ def test_e2e_plan_approve_proceed(bin_path):
       ③ 屏幕出现审批框标题 "Ready to code?"。
     任一 attempt 满足即过;全 attempt 模型都没调 ExitPlanMode → SkipTest(漂移)。
     """
-    if SKIP:
-        return
+    require_model()
     # 提示词明确要求 <proposed_plan> 块 + ExitPlanMode(对齐每轮注入的协议指令)。
     # wait_s 必须给足:plan 模式模型要 explore 多轮 + 写计划,实测需 ~45-50s,短窗口会在
     # 模型写完前截断(早期"模型不产 XML"的误判正源于 wait 太短,非后端漂移)。
@@ -121,8 +120,7 @@ def test_e2e_plan_mode_readonly_tool_works(bin_path):
     plan 工作流。主要守:① plan 模式没把读类工具误锁死;② 多轮跑不 panic(parseApiResponse
     OOB 回归)。模型偶发不调 Read → 漂移跳过;调了但崩 → 硬失败。
     """
-    if SKIP:
-        return
+    require_model()
     prompt = "Read the file src/main.zig and summarize what it does."
     homes = []
     last = None
