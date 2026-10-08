@@ -174,9 +174,20 @@ pub const State = struct {
             const realized = verification_progress.isRealizedMutation(slot.effect, slot.effect_valid) or
                 delivery_cadence.State.fileChangesRealized(slot);
             if (slot.content == null and !realized) continue;
-            if (realized) self.recordChangedFiles(allocator, slot);
-            if (realized or delivery_cadence.classify(allocator, slot.name, slot.input) == .mutation)
+            if (realized) {
+                self.recordChangedFiles(allocator, slot);
                 self.dirty = true;
+                continue;
+            }
+            if (delivery_cadence.classify(allocator, slot.name, slot.input) != .mutation) continue;
+            // No realized change on record. A file tool reports every change
+            // it makes, so a failed one changed nothing (a Write refused for
+            // an unread file must not re-run the same check). Bash cannot
+            // report what it touched, and a failing command may still have
+            // written files, so it stays dirty either way; so does any other
+            // delivery-capable tool that succeeded.
+            if (slot.is_error and !std.mem.eql(u8, slot.name, "Bash")) continue;
+            self.dirty = true;
         }
     }
 

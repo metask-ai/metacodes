@@ -395,19 +395,43 @@ pub fn composeOutcomesJson(gpa: std.mem.Allocator, parsed: *const ParseOutcome, 
 
 /// 检查涉及的文件在本次运行中被改动过 → 结果降级 host_run_tainted。
 /// porcelain = `git status --porcelain` 输出;结果名的文件部分(`::` 前)
-/// 出现在改动清单里即污染。纯函数,机械,无语义判断。
+/// 与改动清单里的某条路径是同一个文件即污染。纯函数,机械,无语义判断。
+///
+/// "同一个文件"按路径分量比:相等,或一方以 `/` + 另一方结尾(porcelain 相对仓库根、
+/// 结果名可能相对 cwd 或为绝对路径)。旧实现用子串匹配,`semver.py` 被改就会污染
+/// `tests/test_semver.py` 的裁决——改被测模块是任务本身,不是篡改裁判。
+/// 未跟踪目录(`?? tests/`)覆盖其下所有结果文件;改名行(`R  old -> new`)两端都算。
 pub fn taintedByWorkspaceEdits(parsed: *const ParseOutcome, porcelain: []const u8) bool {
     var it = std.mem.splitScalar(u8, porcelain, '\n');
     while (it.next()) |line| {
         if (line.len < 4) continue;
-        const path = std.mem.trim(u8, line[3..], " \r");
-        if (path.len < 4) continue;
-        for (parsed.results) |r| {
-            const file_part = if (std.mem.indexOf(u8, r.name, "::")) |cut| r.name[0..cut] else r.name;
-            if (file_part.len >= 4 and std.mem.indexOf(u8, path, file_part) != null) return true;
-            if (std.mem.indexOf(u8, file_part, path) != null) return true;
+        const entry = std.mem.trim(u8, line[3..], " \r");
+        var paths = std.mem.splitSequence(u8, entry, " -> ");
+        while (paths.next()) |raw| {
+            const path = std.mem.trim(u8, raw, "\"");
+            if (path.len == 0) continue;
+            for (parsed.results) |r| {
+                const file_part = if (std.mem.indexOf(u8, r.name, "::")) |cut| r.name[0..cut] else r.name;
+                if (samePathFile(path, file_part)) return true;
+            }
         }
     }
+    return false;
+}
+
+/// 两个路径是否指同一文件(分量边界上的后缀相等),或 `changed` 是覆盖 `file` 的目录。
+fn samePathFile(changed: []const u8, file: []const u8) bool {
+    if (changed.len == 0 or file.len == 0) return false;
+    if (changed[changed.len - 1] == '/') {
+        if (std.mem.startsWith(u8, file, changed)) return true;
+        const at = std.mem.indexOf(u8, file, changed) orelse return false;
+        return at > 0 and file[at - 1] == '/';
+    }
+    if (std.mem.eql(u8, changed, file)) return true;
+    if (changed.len > file.len)
+        return std.mem.endsWith(u8, changed, file) and changed[changed.len - file.len - 1] == '/';
+    if (file.len > changed.len)
+        return std.mem.endsWith(u8, file, changed) and file[file.len - changed.len - 1] == '/';
     return false;
 }
 
@@ -516,6 +540,25 @@ test "tainted: edited check file downgrades" {
     defer parsed.deinit();
     try std.testing.expect(taintedByWorkspaceEdits(&parsed, " M tests/t.py\n"));
     try std.testing.expect(!taintedByWorkspaceEdits(&parsed, " M src/app.py\n?? notes.md\n"));
+}
+
+test "tainted: the module under test is not its test file" {
+    const a = std.testing.allocator;
+    var parsed = try parsePytestLines(a, "FAILED tests/test_semver.py::CompareTest::test_one - boom\n");
+    defer parsed.deinit();
+    // Editing semver.py is the task; it must not taint tests/test_semver.py.
+    try std.testing.expect(!taintedByWorkspaceEdits(&parsed, " M semver.py\n"));
+    try std.testing.expect(!taintedByWorkspaceEdits(&parsed, " M other/test_semver.py\n"));
+    // The same file seen from the repository root (cwd one level down).
+    try std.testing.expect(taintedByWorkspaceEdits(&parsed, " M pkg/tests/test_semver.py\n"));
+    // A new untracked test directory, a rename into the test file, a quoted path.
+    try std.testing.expect(taintedByWorkspaceEdits(&parsed, "?? tests/\n"));
+    try std.testing.expect(taintedByWorkspaceEdits(&parsed, "R  tests/old.py -> tests/test_semver.py\n"));
+    try std.testing.expect(taintedByWorkspaceEdits(&parsed, " M \"tests/test_semver.py\"\n"));
+    // The raw fallback names no file.
+    var raw = try parseAuto(a, "boom\n", 1);
+    defer raw.deinit();
+    try std.testing.expect(!taintedByWorkspaceEdits(&raw, " M semver.py\n?? tests/\n"));
 }
 
 test "artifact extraction: new non-test files, quota marked" {

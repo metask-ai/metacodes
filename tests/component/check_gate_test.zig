@@ -127,6 +127,9 @@ const GateRun = struct {
 const RunConfig = struct {
     gate: ?gate_mod.Options = null,
     hookset: ?*const hooks.HookSet = null,
+    /// Attach a read-state table, so Write enforces must-read-first like the
+    /// REPL and headless hosts do.
+    read_state: bool = false,
 };
 
 fn runGate(
@@ -154,6 +157,8 @@ fn runGate(
     var writer = cc.writer_backend.WriterBackend.initNull();
     const backend = writer.backend();
     var record = RecordSink{};
+    var read_state = cc.core_read_state.ReadState.init(allocator);
+    defer read_state.deinit();
     const result = try cc.agent_loop.run(
         &conversation,
         client.provider(),
@@ -163,6 +168,7 @@ fn runGate(
             .max_turns = 16,
             .system_prompt = "STABLE-PREFIX",
             .check_gate = config.gate,
+            .read_state = if (config.read_state) &read_state else null,
             .tool_observer = record.sink(),
             .cwd_abs = root,
             .home_dir = root,
@@ -316,6 +322,31 @@ test "L2 check gate: a turn without new work is never checked" {
         try std.testing.expectEqual(@as(u8, 1), run.record.continuations);
         try std.testing.expectEqual(cc.tools.tool_observation.CheckGateVerdict.failed, run.record.final_verdict);
     }
+}
+
+test "L2 check gate: a refused file write is no new work" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // POSIX shell check
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &buf);
+    // result.txt exists but was never read in this run, so Write refuses it
+    // (must-read-first) and nothing on disk changes.
+    const existing = try std.fmt.allocPrint(a, "{s}/result.txt", .{root});
+    defer a.free(existing);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = existing, .data = "TOTAL=0\n" });
+    const refused = try writeSse(a, "write_1", root, "result.txt", "TOTAL=42\n");
+    defer a.free(refused);
+    const done = try endTurn(a, "done", "done");
+    defer a.free(done);
+    const responses = [_][]const u8{ refused, done };
+    var run = try runGate(a, root, .{ .gate = .{ .command = CHECK, .mode = .enforce }, .read_state = true }, &responses);
+    defer run.deinit(a);
+    try run.expectMarkers(&.{ 0, 0 });
+    try std.testing.expect(!try fileExists(a, root, "check-runs.log"));
+    try std.testing.expectEqual(@as(u8, 0), run.record.checks);
+    try std.testing.expectEqual(cc.tools.tool_observation.CheckGateVerdict.not_run, run.record.final_verdict);
 }
 
 test "L2 check gate: editing the check makes the verdict tainted and ends the run" {
