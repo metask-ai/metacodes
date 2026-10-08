@@ -12,6 +12,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- On Windows, a session that has to start the TinyKG service no longer waits
+  30 s before it renders. Autostart checks that the service is up by
+  connecting and closing at once. WSAPoll reports that close as POLLHUP
+  without POLLRDNORM, and the socket readiness check looked only at
+  POLLRDNORM, so the single-threaded service kept polling the closed
+  connection until its 30 s request deadline. A fresh install's first
+  session, or the first one after a reboot, took over 30 s to show its
+  prompt; it now takes a few seconds. The readiness check now treats a hang-up
+  or error as readable, as the writability check already did. The offline
+  TTY harness also no longer starts a TinyKG service in each throwaway
+  home. Each one outlived its test, and on Windows the leftover service
+  kept the home from being deleted.
 - An AgentCore session no longer poisons itself when a compact or Run is
   aborted from another thread. The aborted operation could return while the
   abort was still inside `Provider.cancel`; Core answers BUSY to everything

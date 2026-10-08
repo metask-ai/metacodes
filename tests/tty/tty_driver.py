@@ -206,6 +206,10 @@ def _build_env(base_url, env):
     if not (env and env.get("HOME")):
         ephemeral_home = tempfile.mkdtemp(prefix="cc-tty-home-")
         full_env["HOME"] = ephemeral_home
+        # 全新 HOME 里会话会自建并拉起 TinyKG 服务(kgd + tinykgd),它按设计常驻、不随会话
+        # 退出:每个用例都留一对孤儿进程占着 HOME(Windows 上因此删不掉)。离线 UI 用例不测
+        # KG;真要测 KG 的用例经 env 参数传 METACODES_KG_AUTOSTART 覆盖。
+        full_env["METACODES_KG_AUTOSTART"] = "0"
     if env:
         for k, v in env.items():
             if v is None:
