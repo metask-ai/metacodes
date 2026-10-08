@@ -27,6 +27,7 @@ pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-o
 pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v3";
 pub const DELIVERY_CADENCE_SCHEMA_VERSION = "metacodes-delivery-cadence-v1";
 pub const PROGRESS_UPDATES_SCHEMA_VERSION = "metacodes-progress-updates-v1";
+pub const CHECK_GATE_SCHEMA_VERSION = "metacodes-check-gate-v1";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
 pub const TEST_WEAKENING_SCHEMA_VERSION = "metacodes-test-weakening-candidate-v1";
 pub const SYSTEM_ONE_DECISION_SCHEMA_VERSION = "metacodes-system-one-decision-v1";
@@ -52,6 +53,10 @@ pub const SystemOneOutcome = enum {
     model_mismatch,
     invalid_request,
 };
+
+/// The last verdict the host check gate obtained in a run (`not_run` when
+/// the run never reached a dirty end-of-turn boundary).
+pub const CheckGateVerdict = enum { not_run, passed, failed, tainted, unavailable };
 
 pub const Origin = enum {
     authoritative,
@@ -311,6 +316,29 @@ pub const Event = union(enum) {
         decisions: u8,
         nudges: u8,
         max_nudges: u8,
+    },
+    /// Terminal record of the host check gate (CheckGate.lean): emitted once
+    /// per run whenever the gate was armed (enforced or observed). `checks`
+    /// counts host runs of the pinned command, `continuations` the runs that
+    /// were sent back to work (always 0 in observe mode, never above
+    /// `max_continuations`); the final verdict is the last one obtained.
+    /// `unchecked_changes` = a delivery-capable action happened after the last
+    /// check, so the final workspace was never checked (e.g. the run ended on
+    /// its turn cap). `stop_hook_blocks` counts Stop-hook continuations.
+    check_gate: struct {
+        schema_version: []const u8 = CHECK_GATE_SCHEMA_VERSION,
+        /// Treatment-actuation witness: true when continuations were possible.
+        enforced: bool,
+        /// SHA-256 of the pinned command bytes; the command itself stays out.
+        command_sha256: [64]u8,
+        checks: u8,
+        continuations: u8,
+        max_continuations: u8,
+        final_verdict: CheckGateVerdict,
+        final_passed: u32,
+        final_total: u32,
+        unchecked_changes: bool,
+        stop_hook_blocks: u8,
     },
     verification_final_gate: struct {
         schema_version: []const u8 = VERIFICATION_FINAL_GATE_SCHEMA_VERSION,

@@ -1,0 +1,1 @@
+Implement `satisfies(version, range_text)` and `max_satisfying(versions, range_text)` in `ranges.py` so that it follows the specification in `README.md`.

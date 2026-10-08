@@ -77,6 +77,7 @@ pub const task_store = @import("core/task_store.zig"); // L2 requirement-ledger 
 pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 ledger decide tests
 pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 delivery-cadence tests
 pub const progress_updates = @import("core/progress_updates.zig"); // L2 progress-update tests (#114)
+pub const check_gate = @import("core/check_gate.zig"); // L2 host check gate / Stop hook block tests
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
@@ -2560,6 +2561,31 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.progress_updates = false;
         } else if (std.mem.eql(u8, arg, "--progress-updates-observe")) {
             config.progress_updates_observe = true;
+        } else if (std.mem.eql(u8, arg, "--host-check")) {
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --host-check", .{});
+                return;
+            };
+            if (std.mem.trim(u8, s, " \t\r\n").len == 0 or s.len > check_gate.MAX_COMMAND_BYTES) {
+                setParseError(config, allocator, "invalid value for --host-check (need a non-empty command of at most {d} bytes)", .{check_gate.MAX_COMMAND_BYTES});
+                return;
+            }
+            config.host_check_command = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--check-gate")) {
+            config.check_gate = true;
+        } else if (std.mem.eql(u8, arg, "--check-gate-observe")) {
+            config.check_gate_observe = true;
+        } else if (std.mem.eql(u8, arg, "--check-gate-max")) {
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --check-gate-max", .{});
+                return;
+            };
+            const n = std.fmt.parseInt(u8, s, 10) catch 0;
+            if (n == 0 or n > check_gate.HARD_MAX_CONTINUATIONS) {
+                setParseError(config, allocator, "invalid value '{s}' for --check-gate-max (expected 1..{d})", .{ s, check_gate.HARD_MAX_CONTINUATIONS });
+                return;
+            }
+            config.check_gate_max = n;
         } else if (std.mem.eql(u8, arg, "--delivery-cadence-thresholds")) {
             const s = args.next() orelse {
                 setParseError(config, allocator, "missing value for --delivery-cadence-thresholds", .{});
@@ -2793,6 +2819,14 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
     if (config.dump_prompt_sections and !config.dump_prompt and config.parse_error == null) {
         setParseError(config, allocator, "--sections requires --dump-prompt", .{});
     }
+    // The gate without a command would arm a no-op; a lone command would run
+    // nothing. Either half alone is a mistyped treatment, so fail closed.
+    if ((config.check_gate or config.check_gate_observe) and config.host_check_command == null and config.parse_error == null) {
+        setParseError(config, allocator, "--check-gate / --check-gate-observe requires --host-check <cmd>", .{});
+    }
+    if (config.check_gate_max != null and !config.check_gate and !config.check_gate_observe and config.parse_error == null) {
+        setParseError(config, allocator, "--check-gate-max requires --check-gate or --check-gate-observe", .{});
+    }
 }
 
 /// 读 stdin 全部内容（headless `-` 模式）。EOF 即停;读错误显式报错(不把
@@ -2877,6 +2911,10 @@ fn printHelp() void {
         \\  --delivery-cadence    Nudge a run that keeps exploring without writing any deliverable
         \\  --delivery-cadence-observe  Record (not enforce) the delivery-cadence obligation
         \\  --delivery-cadence-thresholds <a>,<b>  Exploration-call counts for the two nudges (default 40,80)
+        \\  --host-check <cmd>    Check command the host runs itself for the check gate (pinned for the process)
+        \\  --check-gate          After the model changes files and stops, run --host-check; continue on a clean failure
+        \\  --check-gate-observe  Run --host-check at the same points and only record the verdict
+        \\  --check-gate-max <n>  Continuations the check gate may grant per run (1..8, default 3)
         \\  --no-progress-updates  Do not ask the model for a progress note after silent tool rounds
         \\  --progress-updates-observe  Record (not enforce) the progress-update obligation
         \\  --max-tokens <n>      Override max output tokens per request
@@ -2955,6 +2993,7 @@ test {
     _ = &@import("repl/stream_json_backend.zig");
     _ = &@import("core/verdict.zig");
     _ = &@import("core/host_check.zig");
+    _ = &@import("core/check_gate.zig");
     _ = &@import("core/proposed_plan.zig");
     _ = &@import("core/plan_file.zig");
     _ = &@import("swarm/team.zig");

@@ -1,0 +1,385 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-check-gate-v1",
+  "description": "Host check gate evaluation cohort (evals/experiments/check-gate-v1.md). Six self-authored specification tasks over a frozen snapshot: a stub module, the full specification in README.md, visible unittest tests and `sh run_tests`, the command both arms pin with --host-check. The validator grades the visible cases plus hidden edge cases derived from the README; it never reads the workspace's tests. The scenario prompt names only the README. The hazard is finishing with the pinned check still failing.",
+  "tasks": [
+    {
+      "id": "93_cg_semver",
+      "scenario": "tests/e2e/scenarios/93_cg_semver.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2183730d818d04456979d8bf08a9c014df227e1c",
+          "prefix": "tests/e2e/fixtures/check_gate/semver",
+          "paths": [
+            "README.md",
+            "semver.py",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_semver.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 900,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/93_check_gate_semver.py",
+            "timeout_seconds": 60,
+            "description": "Semantic-version precedence with pre-release and validation rules: visible cases plus hidden edge cases from the README"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 60,
+        "max_tool_calls": 120,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a one-module implementation plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a README, writing one module and running its tests a few times needs far fewer; the runtime allowance is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v1"
+      }
+    },
+    {
+      "id": "94_cg_duration",
+      "scenario": "tests/e2e/scenarios/94_cg_duration.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2183730d818d04456979d8bf08a9c014df227e1c",
+          "prefix": "tests/e2e/fixtures/check_gate/duration",
+          "paths": [
+            "README.md",
+            "duration.py",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_duration.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 900,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/94_check_gate_duration.py",
+            "timeout_seconds": 60,
+            "description": "Compact duration parsing with exact decimal arithmetic: visible cases plus hidden edge cases from the README"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 60,
+        "max_tool_calls": 120,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a one-module implementation plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a README, writing one module and running its tests a few times needs far fewer; the runtime allowance is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v1"
+      }
+    },
+    {
+      "id": "95_cg_csvline",
+      "scenario": "tests/e2e/scenarios/95_cg_csvline.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2183730d818d04456979d8bf08a9c014df227e1c",
+          "prefix": "tests/e2e/fixtures/check_gate/csvline",
+          "paths": [
+            "README.md",
+            "csvline.py",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_csvline.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 900,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/95_check_gate_csvline.py",
+            "timeout_seconds": 60,
+            "description": "One-line CSV splitting with quoting rules: visible cases plus hidden edge cases from the README"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 60,
+        "max_tool_calls": 120,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a one-module implementation plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a README, writing one module and running its tests a few times needs far fewer; the runtime allowance is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v1"
+      }
+    },
+    {
+      "id": "96_cg_roman",
+      "scenario": "tests/e2e/scenarios/96_cg_roman.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2183730d818d04456979d8bf08a9c014df227e1c",
+          "prefix": "tests/e2e/fixtures/check_gate/roman",
+          "paths": [
+            "README.md",
+            "roman.py",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_roman.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 900,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/96_check_gate_roman.py",
+            "timeout_seconds": 60,
+            "description": "Strict canonical roman numerals both ways: visible cases plus hidden edge cases from the README"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 60,
+        "max_tool_calls": 120,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a one-module implementation plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a README, writing one module and running its tests a few times needs far fewer; the runtime allowance is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v1"
+      }
+    },
+    {
+      "id": "97_cg_intervals",
+      "scenario": "tests/e2e/scenarios/97_cg_intervals.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2183730d818d04456979d8bf08a9c014df227e1c",
+          "prefix": "tests/e2e/fixtures/check_gate/intervals",
+          "paths": [
+            "README.md",
+            "intervals.py",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_intervals.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 900,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/97_check_gate_intervals.py",
+            "timeout_seconds": 60,
+            "description": "Half-open interval merging: visible cases plus hidden edge cases from the README"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 60,
+        "max_tool_calls": 120,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a one-module implementation plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a README, writing one module and running its tests a few times needs far fewer; the runtime allowance is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v1"
+      }
+    },
+    {
+      "id": "98_cg_wrap",
+      "scenario": "tests/e2e/scenarios/98_cg_wrap.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2183730d818d04456979d8bf08a9c014df227e1c",
+          "prefix": "tests/e2e/fixtures/check_gate/wrap",
+          "paths": [
+            "README.md",
+            "wrap.py",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_wrap.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 900,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/98_check_gate_wrap.py",
+            "timeout_seconds": 60,
+            "description": "Paragraph-aware greedy wrapping with hard splits: visible cases plus hidden edge cases from the README"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 60,
+        "max_tool_calls": 120,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a one-module implementation plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a README, writing one module and running its tests a few times needs far fewer; the runtime allowance is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v1"
+      }
+    }
+  ]
+}

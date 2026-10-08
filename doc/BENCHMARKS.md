@@ -68,6 +68,24 @@ the same magnitude as the treatment effects. These are directional
 instrument-development results on the dev cohort only — one model, no causal
 effect sizes, never a held-out claim.
 
+**Host check gate v1, stage A** (2026-10-08, glm-5.3-flash, 6 tasks × 1 pair;
+[check-gate-v1.md](../evals/experiments/check-gate-v1.md)): both arms 6/6 on
+the full validator and 6/6 finishing with the pinned check passing, so the
+hazard the gate targets never occurred and the preregistered stopping rule
+skipped the paired stage (US$3.01 nominal spent). The gate ran its check once
+per rollout and never continued. H1 is untested on this cohort, not refuted.
+v2 (multi-file feature requests with regression traps, 5 tasks × 1 pair;
+[check-gate-v2.md](../evals/experiments/check-gate-v2.md)) stopped the same
+way (0/5 finished red, 4/5 validator in both arms, US$3.60): the model ran the
+tests in every rollout. Both textkit runs instead rewrote an existing test to
+match a changed shared tokenizer, which the gate recorded as a pass; a pass
+after modifying an existing test is now tainted. v3 (four hard
+specifications, 243 graded tests; [check-gate-v3.md](../evals/experiments/check-gate-v3.md))
+ran its paired stage (8 pairs, US$15.75 with stage A): partial credit +0.003
+(sign test p = 1.0), full pass 62.5% → 75.0% (McNemar p = 1.0), and again 0/12
+baseline rollouts finished red and 0 continuations — across v1–v3 the gate never
+had a failing check to act on for this model (0/23).
+
 **Three-arm long-horizon PK v2** (`codex_style` vs `claude_style` vs `tinykg`,
 [evals/README.md §5.1](../evals/README.md)): three calibration attempts all
 ended fail-closed (grader defect, budget-reserve defect, treatment-attestation

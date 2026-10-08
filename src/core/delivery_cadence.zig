@@ -128,7 +128,7 @@ pub const State = struct {
 
     /// File-change evidence that says the disk changed: any applied/partial
     /// record, or an overflow/lost marker (more changed than was reported).
-    fn fileChangesRealized(slot: tool_exec.Slot) bool {
+    pub fn fileChangesRealized(slot: tool_exec.Slot) bool {
         if (slot.file_changes_overflow or slot.file_changes_lost) return true;
         const changes = slot.file_changes orelse return false;
         for (changes) |rec| {

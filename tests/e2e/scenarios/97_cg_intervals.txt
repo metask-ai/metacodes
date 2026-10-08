@@ -1,0 +1,1 @@
+Implement `merge(intervals)` in `intervals.py` so that it follows the specification in `README.md`.
