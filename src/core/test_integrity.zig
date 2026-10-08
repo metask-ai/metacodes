@@ -639,7 +639,9 @@ pub const State = struct {
     /// tools and Bash included); the scan itself decides what changed. The
     /// file tools' own records also name the suite files they changed, for
     /// the files the baseline cannot see.
-    pub fn observeSlots(self: *State, allocator: std.mem.Allocator, slots: []const tool_exec.Slot) error{OutOfMemory}!void {
+    /// Never fails: a path it cannot keep (out of memory) widens the overflow
+    /// flag, which taints a check-gate pass rather than vouching for it.
+    pub fn observeSlots(self: *State, allocator: std.mem.Allocator, slots: []const tool_exec.Slot) void {
         for (slots) |slot| {
             if (slot.decision != .run or slot.pending) continue;
             self.touched = true;
@@ -649,8 +651,12 @@ pub const State = struct {
                 if (!record.status.changedDisk()) continue;
                 // The first record of a path decides whether it existed
                 // before the run: a file this run created is the model's own.
-                try self.notePath(allocator, record.locator, record.kind != .created);
-                if (record.from_locator) |from| try self.notePath(allocator, from, true);
+                self.notePath(allocator, record.locator, record.kind != .created) catch {
+                    self.tool_paths_overflow = true;
+                };
+                if (record.from_locator) |from| self.notePath(allocator, from, true) catch {
+                    self.tool_paths_overflow = true;
+                };
             }
         }
     }

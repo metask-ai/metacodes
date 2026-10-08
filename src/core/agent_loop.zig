@@ -3259,7 +3259,7 @@ pub fn run(
         // Host-check-gate sensor, same placement and reason: a delivery-capable
         // action must mark the run dirty before any early return.
         if (opts.check_gate != null) check_gate_state.observeSlots(allocator, slots.items);
-        if (test_integrity_state.armed) try test_integrity_state.observeSlots(allocator, slots.items);
+        if (test_integrity_state.armed) test_integrity_state.observeSlots(allocator, slots.items);
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
         try exec_outcome;
