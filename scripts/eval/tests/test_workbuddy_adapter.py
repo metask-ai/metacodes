@@ -4218,6 +4218,109 @@ class WorkBuddyRequirementLedgerRecordTest(unittest.TestCase):
             self._metrics(bad)
 
 
+class WorkBuddyCheckGateRecordTest(unittest.TestCase):
+    """Field-level contract for the host check gate journal record (the
+    union-roster probe only proves the KIND is known)."""
+
+    def _rows(self, *records):
+        rows = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+        ]
+        for index, record in enumerate(records, start=1):
+            rows.append(
+                {"schema_version": "metacodes-tool-observation-journal-v1",
+                 "sequence": index, "monotonic_elapsed_ns": index + 1,
+                 "session_id": "s" * 24, "run_id": "r" * 24,
+                 "event": {"tool_observation": {"check_gate": record}}})
+        rows.append(
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": len(records) + 1, "monotonic_elapsed_ns": len(records) + 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}})
+        return rows
+
+    def _metrics(self, *records):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "t.jsonl"
+            observation = root / "o.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            observation.write_text(
+                "".join(json.dumps(r) + "\n" for r in self._rows(*records)),
+                encoding="utf-8",
+            )
+            return load_control_metrics(transcript, observation)
+
+    def _valid(self):
+        return {
+            "schema_version": "metacodes-check-gate-v1",
+            "enforced": True, "command_sha256": "a" * 64,
+            "checks": 3, "continuations": 2, "max_continuations": 3,
+            "final_verdict": "passed", "final_passed": 12, "final_total": 12,
+            "unchecked_changes": False, "stop_hook_blocks": 0,
+        }
+
+    def test_valid_record_exports_counters(self):
+        lean = self._metrics(self._valid())["lean"]
+        self.assertEqual(lean["check_gate_records"], 1)
+        self.assertEqual(lean["check_gate_enforced"], 1)
+        self.assertEqual(lean["check_gate_checks"], 3)
+        self.assertEqual(lean["check_gate_continuations"], 2)
+        self.assertEqual(lean["check_gate_max_continuations"], 3)
+        self.assertEqual(lean["check_gate_final_verdict"], "passed")
+        self.assertEqual(lean["check_gate_unchecked_changes"], 0)
+
+    def test_observe_record_and_unrun_gate_are_valid(self):
+        observe = self._valid()
+        observe.update({"enforced": False, "checks": 1, "continuations": 0, "final_verdict": "failed",
+                        "final_passed": 9})
+        self.assertEqual(self._metrics(observe)["lean"]["check_gate_enforced"], 0)
+        unrun = self._valid()
+        unrun.update({"checks": 0, "continuations": 0, "final_verdict": "not_run",
+                      "final_passed": 0, "final_total": 0})
+        self.assertEqual(self._metrics(unrun)["lean"]["check_gate_final_verdict"], "not_run")
+        # A Stop hook that sent the run back after the check ended earns one
+        # more check per block.
+        blocked = self._valid()
+        blocked.update({"checks": 5, "stop_hook_blocks": 2})
+        self.assertEqual(self._metrics(blocked)["lean"]["check_gate_checks"], 5)
+
+    def test_malformed_fields_fail_loudly(self):
+        for key, value, message in (
+            ("schema_version", "metacodes-check-gate-v0", "check gate record is invalid"),
+            ("final_verdict", "maybe", "check gate record is invalid"),
+            ("command_sha256", "make check", "check gate record is invalid"),
+            ("checks", "three", "check gate checks is invalid"),
+        ):
+            bad = self._valid()
+            bad[key] = value
+            with self.assertRaisesRegex(TraceError, message):
+                self._metrics(bad)
+
+    def test_policy_relationships_are_enforced(self):
+        for mutate in (
+            {"continuations": 4},  # over budget
+            {"checks": 4, "continuations": 2},  # more checks than continuations + 1
+            {"enforced": False},  # observe mode with continuations
+            {"checks": 0},  # a verdict without a check
+            {"final_verdict": "not_run"},  # checks without a verdict
+            {"final_passed": 13},
+            {"max_continuations": 9},
+            {"stop_hook_blocks": 6},
+        ):
+            bad = self._valid()
+            bad.update(mutate)
+            with self.assertRaisesRegex(TraceError, "violates the gate policy"):
+                self._metrics(bad)
+
+    def test_duplicate_record_fails_loudly(self):
+        with self.assertRaisesRegex(TraceError, "duplicate check gate record"):
+            self._metrics(self._valid(), self._valid())
+
+
 class WorkBuddyDeliveryCadenceRecordTest(unittest.TestCase):
     """Field-level contract for the delivery-cadence journal record (the
     union-roster probe only proves the KIND is known)."""

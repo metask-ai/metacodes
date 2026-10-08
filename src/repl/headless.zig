@@ -15,6 +15,7 @@ const pfs = @import("platform").fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
+const check_gate_mod = @import("../core/check_gate.zig");
 const output_semantics = @import("../core/output_semantics.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const permission_mod = @import("../permission.zig");
@@ -526,6 +527,7 @@ fn buildOptions(
         // there would cost tokens for nobody (and every eval rollout runs here).
         .progress_updates = app.config.progress_updates and app.config.stream_json,
         .progress_updates_observe = app.config.progress_updates_observe,
+        .check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max),
         .delivery_cadence_thresholds = .{
             .first = app.config.delivery_cadence_first orelse delivery_cadence_mod.DEFAULT_FIRST_THRESHOLD,
             .second = app.config.delivery_cadence_second orelse delivery_cadence_mod.DEFAULT_SECOND_THRESHOLD,

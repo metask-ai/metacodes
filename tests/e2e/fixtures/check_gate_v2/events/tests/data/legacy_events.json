@@ -1,0 +1,4 @@
+[
+  {"name": "Standup", "start": "2026-01-05T09:00:00", "minutes": 15, "repeat": "daily"},
+  {"name": "Review", "start": "2026-03-02T14:30:00", "minutes": 60, "repeat": null}
+]
