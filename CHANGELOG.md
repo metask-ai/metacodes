@@ -69,6 +69,14 @@ status, compatibility boundaries, and entry points are defined by
   facade's stack, could also go out of scope while `cancel` still used it.
   The facade now waits for in-flight cancels to drain before terminal
   bookkeeping and before returning from a compact.
+- The release cut (`scripts/release_cut.py`) runs on a Chinese Windows
+  without `PYTHONUTF8=1`. It decoded git's UTF-8 output with the locale's
+  GBK codec. On Windows the decode error is raised in subprocess's reader
+  thread and only printed, so the commit list came back `None` and the cut
+  crashed. It now decodes git, gh and Python children as UTF-8. Characters
+  its own output pipe cannot encode, such as `µ` and `✓`, are escaped instead
+  of failing the dry run. `scripts/check_version_state.py` read HEAD's commit
+  subject the same way and is fixed too.
 - The end-of-run host check no longer downgrades verdicts to
   `host_run_tainted` when the run only changed the module under test:
   `verdict.taintedByWorkspaceEdits` matched paths as substrings, so editing
