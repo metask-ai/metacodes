@@ -99,6 +99,15 @@ session/agent identity, and snapshots, output, abort, notification, and UI
 events filter by that scope. `/resume` changes the foreground session only and
 never rebinds existing jobs.
 
+Ctrl+B is the one case where the foreground must keep seeing a job of another
+session: the job continues the conversation the foreground just handed off,
+and a fresh foreground session replaces the old one. The job still keeps its
+session; instead, the App records the handed-off session, and the TUI's agent
+tree, footer and switcher filter by a `SessionScope` of the current session
+plus the ones it handed off (`App.agentJobScope`). `/resume` clears that list.
+Model-facing routing (TaskOutput, TaskStop, notifications) keeps the
+one-session scope `SessionScope.only`.
+
 Process-mode teammate startup binds `--parent-session-id` before `App.init`, so
 KG identity, provider-visible context, plan paths, permissions, and transcript
 all use the same parent session from the first request. Team names are

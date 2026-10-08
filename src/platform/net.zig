@@ -161,19 +161,27 @@ pub fn acceptConn(listener: Socket) ?Socket {
     }
 }
 
-/// True when `s` has a pending connection (listening socket) or readable
-/// bytes within `timeout_ms`; false on timeout or error. Lets a blocking
-/// accept loop check an AbortSignal between waits without non-blocking sockets.
+/// True when `s` has a pending connection (listening socket), readable bytes,
+/// or a peer that closed or failed within `timeout_ms`; false on timeout or
+/// poll error. Lets a blocking accept loop check an AbortSignal between waits
+/// without non-blocking sockets. A closed peer counts so that the caller's
+/// `recv` returns 0 or fails at once: WSAPoll reports a graceful close as
+/// POLLHUP alone, so checking only POLLRDNORM left a server polling a peer
+/// that connected and closed without a byte until its deadline.
 pub fn pollReadable(s: Socket, timeout_ms: u32) bool {
     if (is_windows) {
         const POLLRDNORM: i16 = 0x0100; // ws2_32 does not export constants in this std
+        const POLLERR: i16 = 0x0001;
+        const POLLHUP: i16 = 0x0002;
         var pfd = WSAPOLLFD{ .fd = s, .events = POLLRDNORM, .revents = 0 };
         const fds: [*]WSAPOLLFD = @ptrCast(&pfd);
-        return sys.WSAPoll(fds, 1, @intCast(timeout_ms)) > 0 and (pfd.revents & POLLRDNORM) != 0;
+        if (sys.WSAPoll(fds, 1, @intCast(timeout_ms)) <= 0) return false;
+        return (pfd.revents & (POLLRDNORM | POLLERR | POLLHUP)) != 0;
     } else {
         var pfd = std.c.pollfd{ .fd = s, .events = std.c.POLL.IN, .revents = 0 };
         const fds: [*]std.c.pollfd = @ptrCast(&pfd);
-        return std.c.poll(fds, 1, @intCast(timeout_ms)) > 0 and (pfd.revents & std.c.POLL.IN) != 0;
+        if (std.c.poll(fds, 1, @intCast(timeout_ms)) <= 0) return false;
+        return (pfd.revents & (std.c.POLL.IN | std.c.POLL.ERR | std.c.POLL.HUP)) != 0;
     }
 }
 
@@ -431,6 +439,24 @@ test "pollReadable tracks pending loopback connection" {
     try testing.expect(pollReadable(listener.sock, 1000));
     const conn = acceptConn(listener.sock) orelse return error.AcceptFailed;
     closeSocket(conn);
+}
+
+test "pollReadable reports a peer that closed without sending" {
+    // A port probe (connect, then close) must not look like a silent peer:
+    // the TinyKG service once spent its whole 30 s request deadline on one.
+    const listener = try listenLoopback(0, 4);
+    defer closeSocket(listener.sock);
+    const client = try connectLoopback(listener.port);
+    const conn = acceptConn(listener.sock) orelse {
+        closeSocket(client);
+        return error.AcceptFailed;
+    };
+    defer closeSocket(conn);
+    try testing.expect(!pollReadable(conn, 50));
+    closeSocket(client);
+    try testing.expect(pollReadable(conn, 2000));
+    var buf: [8]u8 = undefined;
+    try testing.expect(recv(conn, &buf) <= 0);
 }
 
 test "shutdownSocket wakes a blocked accept before close" {

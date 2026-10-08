@@ -46,6 +46,40 @@ const OUTPUT_CAP: usize = 512 * 1024;
 
 pub const JobStatus = enum { running, done, failed, killed };
 
+/// The sessions whose jobs a caller may see and manage. A job's `session`
+/// never changes (doc/UTF8_AND_SESSION_BOUNDARY_DESIGN.md, invariant 8), so a
+/// foreground that handed its conversation to the background with Ctrl+B
+/// widens what it looks at instead: its own session plus every session it
+/// handed off. Model-facing routing (TaskOutput, TaskStop) stays on one
+/// session through `only`.
+pub const SessionScope = struct {
+    current: SessionId,
+    /// Sessions the foreground handed to the background, oldest first.
+    /// Borrowed; the scope lives no longer than one registry call.
+    handed_off: []const SessionId = &.{},
+
+    pub fn only(session: SessionId) SessionScope {
+        return .{ .current = session };
+    }
+
+    pub fn contains(self: SessionScope, session: SessionId) bool {
+        if (std.mem.eql(u8, &session.bytes, &self.current.bytes)) return true;
+        for (self.handed_off) |s| {
+            if (std.mem.eql(u8, &session.bytes, &s.bytes)) return true;
+        }
+        return false;
+    }
+
+    fn admits(scope: ?SessionScope, session: SessionId) bool {
+        const wanted = scope orelse return true;
+        return wanted.contains(session);
+    }
+
+    fn fromOptional(session: ?SessionId) ?SessionScope {
+        return if (session) |s| only(s) else null;
+    }
+};
+
 /// 后台 subagent 的一个作业。堆分配,地址稳定(线程与主线程共享 *JobEntry)。
 pub const JobEntry = struct {
     id: [16]u8 = undefined, // "agent_" + 8 hex + NUL pad
@@ -653,12 +687,16 @@ pub const AgentJobRegistry = struct {
     }
 
     pub fn runningCountForSession(self: *AgentJobRegistry, session: SessionId) usize {
+        return self.runningCountInScope(.only(session));
+    }
+
+    pub fn runningCountInScope(self: *AgentJobRegistry, scope: SessionScope) usize {
         self.listLock();
         defer self.listUnlock();
         var n: usize = 0;
         for (self.entries.items) |e| {
             e.lock();
-            const owned_running = std.mem.eql(u8, e.session.asSlice(), session.asSlice()) and e.status == .running;
+            const owned_running = scope.contains(e.session) and e.status == .running;
             e.unlock();
             if (owned_running) n += 1;
         }
@@ -666,12 +704,16 @@ pub const AgentJobRegistry = struct {
     }
 
     pub fn totalCountForSession(self: *AgentJobRegistry, session: SessionId) usize {
+        return self.totalCountInScope(.only(session));
+    }
+
+    pub fn totalCountInScope(self: *AgentJobRegistry, scope: SessionScope) usize {
         self.listLock();
         defer self.listUnlock();
         var n: usize = 0;
         for (self.entries.items) |e| {
             e.lock();
-            const owned = std.mem.eql(u8, e.session.asSlice(), session.asSlice());
+            const owned = scope.contains(e.session);
             e.unlock();
             if (owned) n += 1;
         }
@@ -962,8 +1004,11 @@ pub const AgentJobRegistry = struct {
     /// 测试专用:注册一个**无线程**的假 entry(供离线 TTY 验证 agent 进度树/switcher)。
     /// 不 spawn 线程、不开网络。entry 由 registry deinit 时统一释放(无 thread → join 跳过)。
     /// 全参数版:type/desc/tool_calls/tokens/status/current_tool 全可控,驱动新树格式。
+    /// `session` 是条目的归属会话:TUI 只显示 `app.session_id` 范围内的条目(#129),
+    /// 没有默认值,免得测试命令造出谁也看不见的 agent(#218)。
     pub fn pushTestEntryFull(
         self: *AgentJobRegistry,
+        session: SessionId,
         agent_type: []const u8,
         desc: []const u8,
         tool_calls: u32,
@@ -974,7 +1019,7 @@ pub const AgentJobRegistry = struct {
     ) !void {
         const a = self.allocator;
         const entry = try a.create(JobEntry);
-        entry.* = .{ .allocator = a };
+        entry.* = .{ .allocator = a, .session = session };
         // One cleanup owner for every failure before publication.  In
         // particular, do not call freeEntry in an append/index catch while a
         // separate destroy/desc errdefer is still armed (that used to
@@ -1023,8 +1068,8 @@ pub const AgentJobRegistry = struct {
 
     /// 旧签名 wrapper(back-compat):默认 type="Explore",running。turn 映射 current_turn
     /// (旧语义),tool_calls/tokens 保持 0(测试校验初值为 0)。
-    pub fn pushTestEntry(self: *AgentJobRegistry, desc: []const u8, turn: u32, tool: []const u8, tool_input: []const u8) !void {
-        try self.pushTestEntryFull("Explore", desc, 0, 0, tool, tool_input, .running);
+    pub fn pushTestEntry(self: *AgentJobRegistry, session: SessionId, desc: []const u8, turn: u32, tool: []const u8, tool_input: []const u8) !void {
+        try self.pushTestEntryFull(session, "Explore", desc, 0, 0, tool, tool_input, .running);
         // 旧测试用 turn 作 current_turn 语义,覆盖之(Full 固定设 1)。
         const e = self.entries.items[self.entries.items.len - 1];
         e.current_turn = turn;
@@ -1080,6 +1125,10 @@ pub const AgentJobRegistry = struct {
     }
 
     pub fn acquireBackgroundForSession(self: *AgentJobRegistry, id: []const u8, session: SessionId) ?*JobEntry {
+        return self.acquireBackgroundInScope(id, .only(session));
+    }
+
+    pub fn acquireBackgroundInScope(self: *AgentJobRegistry, id: []const u8, scope: SessionScope) ?*JobEntry {
         if (id.len > 16) return null;
         var key: [16]u8 = undefined;
         @memcpy(key[0..id.len], id);
@@ -1089,7 +1138,7 @@ pub const AgentJobRegistry = struct {
         const entry = self.index.get(key) orelse return null;
         if (entry.foreground) return null;
         entry.lock();
-        const owned = std.mem.eql(u8, entry.session.asSlice(), session.asSlice());
+        const owned = scope.contains(entry.session);
         entry.unlock();
         if (!owned) return null;
         entry.readers += 1;
@@ -1133,6 +1182,11 @@ pub const AgentJobRegistry = struct {
     /// can drain them all, but UI/state projections must never expose a job
     /// created by a different resumed session.
     pub fn snapshotJobsForSession(self: *AgentJobRegistry, allocator: std.mem.Allocator, session: ?SessionId) ![]JobSnapshot {
+        return self.snapshotJobsInScope(allocator, SessionScope.fromOptional(session));
+    }
+
+    /// Roster snapshot for a scope; null means every job (shutdown/admin).
+    pub fn snapshotJobsInScope(self: *AgentJobRegistry, allocator: std.mem.Allocator, scope: ?SessionScope) ![]JobSnapshot {
         self.listLock();
         defer self.listUnlock();
         var out: std.ArrayList(JobSnapshot) = .empty;
@@ -1149,9 +1203,7 @@ pub const AgentJobRegistry = struct {
         for (self.entries.items) |e| {
             e.lock();
             defer e.unlock();
-            if (session) |wanted| {
-                if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) continue;
-            }
+            if (!SessionScope.admits(scope, e.session)) continue;
             var snapshot = JobSnapshot{
                 .id = &.{},
                 .status = e.status,
@@ -1254,7 +1306,11 @@ pub const AgentJobRegistry = struct {
     /// primitive for shutdown/admin paths, but never let a resumed session
     /// cancel a job owned by another session by guessing its id.
     pub fn killForSession(self: *AgentJobRegistry, id: []const u8, session: SessionId) error{JobNotFound}!void {
-        const e = self.acquireBackgroundForSession(id, session) orelse return error.JobNotFound;
+        return self.killInScope(id, .only(session));
+    }
+
+    pub fn killInScope(self: *AgentJobRegistry, id: []const u8, scope: SessionScope) error{JobNotFound}!void {
+        const e = self.acquireBackgroundInScope(id, scope) orelse return error.JobNotFound;
         defer self.releaseBackground(e);
         e.abort.abort(.user_ctrl_c);
     }
@@ -1264,6 +1320,10 @@ pub const AgentJobRegistry = struct {
     /// reader lease there would report success while leaving the visible task
     /// running.
     pub fn abortForSession(self: *AgentJobRegistry, id: []const u8, session: SessionId) error{JobNotFound}!void {
+        return self.abortInScope(id, .only(session));
+    }
+
+    pub fn abortInScope(self: *AgentJobRegistry, id: []const u8, scope: SessionScope) error{JobNotFound}!void {
         if (id.len > 16) return error.JobNotFound;
         var key: [16]u8 = undefined;
         @memcpy(key[0..id.len], id);
@@ -1273,7 +1333,7 @@ pub const AgentJobRegistry = struct {
         const e = self.index.get(key) orelse return error.JobNotFound;
         e.lock();
         defer e.unlock();
-        if (!std.mem.eql(u8, e.session.asSlice(), session.asSlice())) return error.JobNotFound;
+        if (!scope.contains(e.session)) return error.JobNotFound;
         e.abort.abort(.user_ctrl_c);
         if (e.cancel_provider) |p| p.cancel(&e.abort);
     }
@@ -1497,6 +1557,10 @@ pub const AgentJobRegistry = struct {
     /// Session-scoped output copy with the same list+entry lock ordering as
     /// `copyTranscriptForSession`.
     pub fn copyOutputBufForSession(self: *AgentJobRegistry, id: []const u8, allocator: std.mem.Allocator, session: ?SessionId) !?[]u8 {
+        return self.copyOutputBufInScope(id, allocator, SessionScope.fromOptional(session));
+    }
+
+    pub fn copyOutputBufInScope(self: *AgentJobRegistry, id: []const u8, allocator: std.mem.Allocator, scope: ?SessionScope) !?[]u8 {
         if (id.len > 16) return null;
         var key: [16]u8 = undefined;
         @memcpy(key[0..id.len], id);
@@ -1506,9 +1570,7 @@ pub const AgentJobRegistry = struct {
         const e = self.index.get(key) orelse return null;
         e.lock();
         defer e.unlock();
-        if (session) |wanted| {
-            if (!std.mem.eql(u8, e.session.asSlice(), wanted.asSlice())) return null;
-        }
+        if (!SessionScope.admits(scope, e.session)) return null;
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         if (e.prompt_preview.len > 0) {
@@ -1732,7 +1794,7 @@ test "AgentJobRegistry mutators reject a closing registry" {
 test "clearTestEntries removes index keys before freeing entries" {
     var reg = try AgentJobRegistry.init(testing.allocator, "test-key", null, "test-model", .anthropic);
     defer reg.deinit();
-    try reg.pushTestEntry("stale", 1, "", "");
+    try reg.pushTestEntry(.single, "stale", 1, "", "");
     var id: [16]u8 = undefined;
     const entry = reg.entries.items[0];
     @memcpy(&id, &entry.id);
@@ -1747,7 +1809,7 @@ test "JobEntry backend 消费 CoreEvent.progress 实时回写 tool_calls(L1:#6 �
     var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
     defer reg.deinit();
 
-    try reg.pushTestEntry("count files", 1, "", "");
+    try reg.pushTestEntry(.single, "count files", 1, "", "");
     const entry = reg.entries.items[0];
     try testing.expectEqual(@as(u32, 0), entry.tool_calls);
 
@@ -1789,12 +1851,11 @@ test "TaskOutput lookup is scoped to the job's origin session" {
     var reg = try AgentJobRegistry.init(a, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
     defer reg.deinit();
 
-    try reg.pushTestEntry("session scoped", 1, "", "");
-    const entry = reg.entries.items[0];
-    entry.foreground = false;
     const owner = @import("session_id.zig").gen();
     const other = @import("session_id.zig").gen();
-    entry.session = owner;
+    try reg.pushTestEntry(owner, "session scoped", 1, "", "");
+    const entry = reg.entries.items[0];
+    entry.foreground = false;
     try testing.expect(reg.getBackgroundForSession(entry.idSlice(), owner) != null);
     try testing.expect(reg.getBackgroundForSession(entry.idSlice(), other) == null);
     try testing.expectError(error.JobNotFound, reg.killForSession(entry.idSlice(), other));
@@ -1849,7 +1910,7 @@ test "spawnBackground prebuilt_conversation consume-on-call:失败路径不泄�
 
     var i: usize = 0;
     while (i < MAX_BG_JOBS) : (i += 1) {
-        try reg.pushTestEntry("filler", 1, "", "");
+        try reg.pushTestEntry(.single, "filler", 1, "", "");
         reg.entries.items[reg.entries.items.len - 1].foreground = false;
     }
 
@@ -1876,8 +1937,8 @@ test "abortAllRunning:esc 中断 abort 所有 running agent job(非阻塞)" {
     var reg = try AgentJobRegistry.init(a, "k", "http://127.0.0.1:1", "m", .anthropic);
     defer reg.deinit();
     // pushTestEntry 造无线程的 running entry(状态 .running)。
-    try reg.pushTestEntry("agent A", 1, "", "");
-    try reg.pushTestEntry("agent B", 1, "", "");
+    try reg.pushTestEntry(.single, "agent A", 1, "", "");
+    try reg.pushTestEntry(.single, "agent B", 1, "", "");
     // 验证初始未 abort。
     try testing.expect(!reg.entries.items[0].abort.isAborted());
     try testing.expect(!reg.entries.items[1].abort.isAborted());
@@ -1948,7 +2009,7 @@ test "spawnBackground committed-flag:input.* 建好后失败也无泄漏(Failing
 test "copyOutputBuf: prompt_preview + output_buf 完整流;缺 id 返 null" {
     var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
     defer reg.deinit();
-    try reg.pushTestEntry("inspect repo", 1, "", "");
+    try reg.pushTestEntry(.single, "inspect repo", 1, "", "");
     const entry = reg.entries.items[0];
     // 模拟 subagent 输出流写进 output_buf。
     entry.appendOutput("⏺ 探索 backend\n");
@@ -1965,14 +2026,55 @@ test "copyOutputBuf: prompt_preview + output_buf 完整流;缺 id 返 null" {
     try testing.expect((try reg.copyOutputBuf("agent_deadbeef", testing.allocator)) == null);
 }
 
+test "#218: a test entry belongs to the session that pushed it" {
+    const a = testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
+    defer reg.deinit();
+    const mine = @import("session_id.zig").gen();
+    const other = @import("session_id.zig").gen();
+    try reg.pushTestEntryFull(mine, "Explore", "inspect repo", 1, 17300, "Read", "{}", .running);
+    try testing.expectEqual(@as(usize, 1), reg.totalCountForSession(mine));
+    try testing.expectEqual(@as(usize, 1), reg.runningCountForSession(mine));
+    try testing.expectEqual(@as(usize, 0), reg.totalCountForSession(other));
+}
+
+test "#219: a scope sees its own and its handed-off sessions, nothing else" {
+    const a = testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
+    defer reg.deinit();
+    const gen = @import("session_id.zig").gen;
+    const handed = gen();
+    const current = gen();
+    const stranger = gen();
+    try reg.pushTestEntryFull(handed, "main", "handed off", 1, 10, "", "", .running);
+    try reg.pushTestEntryFull(current, "Explore", "own", 1, 10, "", "", .done);
+    try reg.pushTestEntryFull(stranger, "Explore", "someone else's", 1, 10, "", "", .running);
+
+    const handed_off = [_]SessionId{handed};
+    const scope = SessionScope{ .current = current, .handed_off = &handed_off };
+    try testing.expect(scope.contains(handed) and scope.contains(current) and !scope.contains(stranger));
+    try testing.expectEqual(@as(usize, 2), reg.totalCountInScope(scope));
+    try testing.expectEqual(@as(usize, 1), reg.runningCountInScope(scope));
+    const snaps = try reg.snapshotJobsInScope(a, scope);
+    defer AgentJobRegistry.freeSnapshots(a, snaps);
+    try testing.expectEqual(@as(usize, 2), snaps.len);
+    for (snaps) |snap| try testing.expect(!std.mem.eql(u8, snap.desc, "someone else's"));
+
+    const stranger_id = reg.entries.items[2].idSlice();
+    try testing.expectError(error.JobNotFound, reg.abortInScope(stranger_id, scope));
+    try testing.expect((try reg.copyOutputBufInScope(stranger_id, a, scope)) == null);
+    // `only` is the one-session scope model-facing routing keeps.
+    try testing.expectEqual(@as(usize, 1), reg.totalCountInScope(.only(current)));
+}
+
 test "task#18: drainNewlyDone 排终态 job 一次(done_emitted 防重复)+ 跳 running" {
     const a = std.testing.allocator;
     var reg = try AgentJobRegistry.init(a, "k", null, "m", .anthropic);
     defer reg.deinit();
     // 一个 running + 两个终态(done/failed)。
-    try reg.pushTestEntryFull("Explore", "r", 2, 50, "Grep", "{}", .running);
-    try reg.pushTestEntryFull("Plan", "d1", 3, 100, "Read", "{}", .done);
-    try reg.pushTestEntryFull("Task", "d2", 1, 20, "Bash", "{}", .failed);
+    try reg.pushTestEntryFull(.single, "Explore", "r", 2, 50, "Grep", "{}", .running);
+    try reg.pushTestEntryFull(.single, "Plan", "d1", 3, 100, "Read", "{}", .done);
+    try reg.pushTestEntryFull(.single, "Task", "d2", 1, 20, "Bash", "{}", .failed);
 
     // 首次 drain:返回 2 个终态(done+failed),不含 running。
     const first = try reg.drainNewlyDone(a);

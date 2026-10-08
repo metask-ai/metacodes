@@ -11,8 +11,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from screen import Screen  # noqa: E402
-from tty_driver import run  # noqa: E402
-import tempfile  # noqa: E402
+from tty_driver import run, case_tmpdir  # noqa: E402
 
 
 def test_strict_autowrap_primitive_diverges(_bin_path=None):
@@ -47,7 +46,7 @@ def test_cczig_output_no_autowrap_divergence(bin_path):
     raw = run(
         bin_path,
         ["sleep:0.7", "type:hello world", "sleep:0.25"],
-        env={"TERM_PROGRAM": "Apple_Terminal", "TERM": "xterm-256color", "HOME": tempfile.mkdtemp()},
+        env={"TERM_PROGRAM": "Apple_Terminal", "TERM": "xterm-256color", "HOME": case_tmpdir("cc-tty-autowrap-")},
         term_size=(24, 80),
     )
     ideal = Screen(24, 80, autowrap=False)

@@ -8,16 +8,14 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run
 from asserts import TTYAssert
-from e2e_helpers import run_live_fresh  # 真模型用例:播种凭证隔离 HOME + 凭证回传 + 失效跳过
+from e2e_helpers import run_live_fresh, require_model  # 真模型用例:播种凭证隔离 HOME + 凭证回传 + 失效跳过
 
 # 这套用例打真实模型，需要 metacodes login 或 METASK_API_KEY；
-# 若想跳过(离线/CI),设 TTY_SKIP_MODEL=1。
-SKIP = os.environ.get("TTY_SKIP_MODEL") == "1"
+# 离线/CI 设 TTY_SKIP_MODEL=1,每个用例经 require_model() 报 skip。
 
 
 def test_T14_generating_keeps_input_box(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 提交一句会产生输出的查询 → 生成期应有【多帧持续】同时有 spinner + 完整输入框 + footer
     # (不是"某一帧有",而是 spinner+框+❯+footer 共存于生成窗口的多个帧 → 区持续可见、不闪没)。
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:慢慢数到十五,每行一个数字", "key:enter", "sleep:4"],
@@ -38,8 +36,7 @@ def test_T14_generating_keeps_input_box(bin_path):
 
 
 def test_T15_type_into_queued_during_gen(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 对齐 cc:生成期打 HELLO(不回车)→ 只停在输入框 ❯ 行,**不提交、不进 scrollback**。
     raw = run_live_fresh(bin_path, ["sleep:0.8",
                          "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
@@ -65,8 +62,7 @@ def test_T15_type_into_queued_during_gen(bin_path):
 
 
 def test_T16_queued_autosubmits_after_gen(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 生成期打第二句 + 回车入队;第一轮自然结束 → 队列自动续发跑第二轮。
     # 第一句须生成够久(长查询),保证 DONE2 在生成窗口内入队(否则被 drainStdin 丢弃,属正确行为)。
     # 尾窗须容纳完整两轮(数到 60 慢模型一轮即 >10s);settle 下 cap 放宽零成本。
@@ -80,8 +76,7 @@ def test_T16_queued_autosubmits_after_gen(bin_path):
 
 def test_T20_enter_enqueues_clears_box(bin_path):
     # 生成期打字 + 回车 → 输入框清空 + 队列预览出现(dim ⏳ QMSG),且未即时提交进 scrollback。
-    if SKIP:
-        return
+    require_model()
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独一行", "key:enter",
                          "sleep:0.6", "type:QUEUEDMSG", "key:enter", "sleep:2.0"],
               per_key_drain=0.05)
@@ -104,8 +99,7 @@ def test_T20_enter_enqueues_clears_box(bin_path):
 def test_T21_multiple_queued_autosubmit(bin_path):
     # 生成期入队 2 条 → 一轮结束后**一次性合并提交**(对齐 cc 同模式批量,loop.zig popAllJoined("\n\n"))
     # → 合并成一条 user 消息(BATCHA\n\nBATCHB),而非各自独立一轮。
-    if SKIP:
-        return
+    require_model()
     import glob
     import json
     import shutil
@@ -152,8 +146,7 @@ def test_T21_multiple_queued_autosubmit(bin_path):
 
 def test_T22_esc_interrupts(bin_path):
     # 单 esc 直接中断当前任务(对齐 CC,不再两档)。框里已打的字先入队续发,再中断。
-    if SKIP:
-        return
+    require_model()
     import re
     from asserts import split_frames
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60 每行一个数字", "key:enter",
@@ -177,8 +170,7 @@ def test_T22_esc_interrupts(bin_path):
 
 def test_T23_cjk_ime_in_box(bin_path):
     # 中文(多字节)在生成期输入框完整显示;模拟 IME committed 文本逐字节到达。
-    if SKIP:
-        return
+    require_model()
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60 每行一个数字", "key:enter",
                          "sleep:0.6", "type:你好世界", "sleep:1.5"],
               per_key_drain=0.05)
@@ -196,8 +188,7 @@ def test_T23_cjk_ime_in_box(bin_path):
 def test_T24_esc_interrupts_then_resends_queue(bin_path):
     # 用户报的 bug:生成期入队消息后按 Esc → 应中断当前推理并自动续发队列消息。
     # 数到 60 的较长查询确保 Esc 时生成仍在进行;短超时下 Esc 经 flushEsc 兑现为中断。
-    if SKIP:
-        return
+    require_model()
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.8", "type:打断后请回答你是谁", "key:enter",
                          "sleep:0.4", "key:esc", "sleep:8"],
@@ -250,6 +241,19 @@ def test_completion_spinner_never_commits_to_history(bin_path):
     # 兜底:连"for Ns"裸形态也不该在历史区(mock 助手文本不含 for,故任何命中即 bug)。
     assert not re.search(r"\bfor \d+s\b", prose), \
         "历史区出现 'for Ns'(完成态行残留):\n" + prose[-1200:]
+
+
+def test_refused_endpoint_retries_without_system_error_noise(bin_path):
+    # #221:模型端点拒绝连接(默认 base_url 是死端口 127.0.0.1:1)时,每个平台都按连接失败
+    # 退避重试并在 TUI 里说明。Windows 上 Zig 0.16 把被拒的连接报成 error.Unexpected:
+    # 以前一次就放弃,debug 构建还把 std 的 `error.Unexpected NTSTATUS=…` 和栈回溯
+    # 直接打进 TUI。离线、不打模型。
+    import re
+    raw = run(bin_path, ["sleep:0.8", "type:hello", "key:enter", "wait:Retrying in:40"])
+    text = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw).decode("utf-8", "replace")
+    assert "Retrying in" in text, "被拒的连接没有退避重试:\n" + text[-1500:]
+    for noise in ("error.Unexpected", "NTSTATUS"):
+        assert noise not in text, f"系统错误的诊断输出打进了 TUI({noise}):\n" + text[-1500:]
 
 
 def test_logs_never_leak_into_tui_render_stream(bin_path):
@@ -318,8 +322,7 @@ def test_logs_never_leak_into_tui_render_stream(bin_path):
 def test_A6_narrow_terminal_no_wrap(bin_path):
     # 窄终端 cols=40:生成期 spinner 行被截断到 cols-1,不触发 DECAWM 折行 →
     # 区实际行数 = R,底部框/footer 不错位。断言:生成期共存帧的可见行宽不超 cols。
-    if SKIP:
-        return
+    require_model()
     from screen import str_width
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:数到八每行一个", "key:enter", "sleep:3"],
               term_size=(24, 40), per_key_drain=0.05)
@@ -350,8 +353,7 @@ def _gen_frames(a):
 def test_T30_gen_help_nonmodal(bin_path):
     # 生成期按 ? → footer 区原地展开快捷键(非模态:输入框 ❯/╭ 仍在)。早期 bug:? 被当
     # 字面字符塞进输入框,生成期完全不响应。长查询保证 ? 落在生成窗口。
-    if SKIP:
-        return
+    require_model()
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请用中文从 1 数到 200,每个数字单独占一行,不要省略任何数字", "key:enter",
                          "sleep:0.6", "type:?", "sleep:0.5"],
               per_key_drain=0.05)
@@ -375,8 +377,7 @@ def test_T30_gen_help_nonmodal(bin_path):
 def test_T31_gen_help_esc_only_closes(bin_path):
     # 生成期 ? 开 help 后按 esc → 只关 help、不中断生成(先关弹层再中断)。
     # esc 为末键,sleep 足够长靠 flushEsc 兑现;之后生成应继续(spinner 帧仍在)。
-    if SKIP:
-        return
+    require_model()
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.6", "type:?", "sleep:0.4", "key:esc", "sleep:3"],
               per_key_drain=0.05)
@@ -395,8 +396,7 @@ def test_T31_gen_help_esc_only_closes(bin_path):
 def test_T32_gen_ctrl_o_transcript(bin_path):
     # 生成期按 Ctrl+O → 全屏 transcript viewer(alt-screen)。持渲染锁,emit 线程阻塞不抢 stdout;
     # 先 sleep 让首轮 append 进 conversation,transcript 有内容。alt-screen 独立缓冲根治多 agent 显两份。
-    if SKIP:
-        return
+    require_model()
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:1.5", "key:ctrl_x", "key:ctrl_o", "sleep:0.8"],
               per_key_drain=0.05)
@@ -406,8 +406,7 @@ def test_T32_gen_ctrl_o_transcript(bin_path):
 
 def test_T33_gen_ctrl_o_toggle_close(bin_path):
     # 生成期 Ctrl+O 开全屏(alt-screen)→ 再 Ctrl+O 关(viewer 认 0x0f/CSI-u 退出)→ 终端自动恢复回生成区。
-    if SKIP:
-        return
+    require_model()
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:1.5", "key:ctrl_x", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:1"],
               per_key_drain=0.05)
@@ -425,8 +424,7 @@ def test_T34_gen_shift_tab_cycles_mode(bin_path):
     # 两期一致(对齐 cc Shift+Tab 在 isLoading 仍激活)。早期 bug:生成期 watcher 丢弃 action。
     # 注:mode part 替换 footer 的 "esc to interrupt" 段(同一行),故不能用它筛生成帧——
     # 直接在所有帧找 mode 切换标志。短查询 + shift_tab 早按,确保落在生成窗口。
-    if SKIP:
-        return
+    require_model()
     # 用 default 模式启动(tty_driver 默认 bypassPermissions,其 cycle 是 bypass→default
     # 看不到 accept edits)。default 下 Shift+Tab → accept edits,可断言。
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:数到30每行一个数字", "key:enter",

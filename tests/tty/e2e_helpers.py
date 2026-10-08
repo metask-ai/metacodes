@@ -37,6 +37,13 @@ class SkipTest(Exception):
     runner 识别本异常计入 skipped。"""
 
 
+def require_model():
+    """真模型用例的入口:TTY_SKIP_MODEL=1 时报 skip。用例曾在这里直接 return,
+    离线跑时被计为通过,通过数虚高(#222)。"""
+    if SKIP:
+        raise SkipTest("TTY_SKIP_MODEL=1:真模型用例离线不跑")
+
+
 # OAuth 迁移后凭证在 ~/.metacodes/auth.json(env token fallback 已删)。HOME 隔离会把它
 # 挡在门外 → 二进制启动即退(无凭证),真模型 attempt 秒失败且 transcript 全空。
 REAL_AUTH = os.path.expanduser("~/.metacodes/auth.json")

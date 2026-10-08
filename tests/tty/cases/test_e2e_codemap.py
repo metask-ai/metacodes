@@ -23,8 +23,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from e2e_helpers import (  # noqa: E402
-    SKIP, SkipTest, assert_tool_e2e, run_e2e_tool,
-    tool_called, any_tool_called, RETRIES,
+    SkipTest, assert_tool_e2e, run_e2e_tool,
+    tool_called, any_tool_called, RETRIES, require_model,
 )
 
 # 一个有明确结构的 Zig 源文件,给 CodeMap 真东西可映射。
@@ -64,8 +64,7 @@ def _sample_cwd():
 
 def test_e2e_codemap_explicit(bin_path):
     """点名 CodeMap:验 schema(path 参数)在真模型下可用。"""
-    if SKIP:
-        return
+    require_model()
     cwd = _sample_cwd()
     assert_tool_e2e(
         bin_path,
@@ -86,8 +85,7 @@ def test_e2e_codemap_spontaneous(bin_path):
       - 命中 CodeMap → PASS(引导生效)。
       - 仍退回 Read/Grep(全 attempt)→ SkipTest(引导未命中,非代码 regression)。
     """
-    if SKIP:
-        return
+    require_model()
     cwd = _sample_cwd()
     prompt = ("I'm new to sample.zig. Without dumping the whole file, "
               "show me what functions and types it defines and where.")

@@ -27,7 +27,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from e2e_helpers import RETRIES, SKIP, SkipTest, fresh_home, keep_home, read_tool_uses, run_live  # noqa: E402
+from e2e_helpers import RETRIES, SkipTest, fresh_home, keep_home, read_tool_uses, run_live, require_model  # noqa: E402
 from tty_driver import run as _run  # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # tests/tty
@@ -131,8 +131,7 @@ def _seed_plan(home, bin_path, proj):
 
 
 def test_e2e_dag_closed_loop(bin_path):
-    if SKIP:
-        return
+    require_model()
     if not os.path.exists(REAL_AUTH):
         raise SkipTest("无 ~/.metacodes/auth.json,真模型凭证不可得")
     if not os.path.exists(TINYKG):

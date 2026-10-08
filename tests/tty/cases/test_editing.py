@@ -1,5 +1,5 @@
 """T04/T05/T09:退格左右 / Shift+Enter 多行 / Ctrl+U 清行。"""
-from tty_driver import run
+from tty_driver import run, case_tmpdir
 from asserts import TTYAssert
 
 
@@ -140,8 +140,7 @@ def test_vmove_down_roundtrip(bin_path):
 def test_vmove_first_row_up_no_history_noop(bin_path):
     # 首可视行 up:无历史时回退 history 是 no-op(光标不动,缓冲不变)。
     # 必须用全新空 HOME 隔离(共享 /tmp/cc-tty-home 会累积历史 → up 拉历史污染断言)。
-    import tempfile
-    home = tempfile.mkdtemp(prefix="cc-tty-vmove-")
+    home = case_tmpdir("cc-tty-vmove-")
     raw = run(bin_path, [
         "sleep:0.8", "type:onlyline", "key:up", "type:X", "sleep:0.2",
     ], env={"HOME": home})
@@ -154,8 +153,7 @@ def test_paste_placeholder_footer(bin_path):
     # 粘贴 ≥4 行 → 缓冲转占位符 `[Pasted text #1 +3 lines]`,footer 显 `paste again to expand`
     # (对齐真 cc v2.1.172)。用 bracketed paste(raw ESC[200~ … ESC[201~)一次性送 4 行。
     from screen import Screen
-    import tempfile
-    home = tempfile.mkdtemp(prefix="cc-tty-paste-")
+    home = case_tmpdir("cc-tty-paste-")
     paste = "\\x1b[200~L0\\x0aL1\\x0aL2\\x0aL3\\x1b[201~"
     raw = run(bin_path, ["sleep:0.8", f"raw:{paste}", "sleep:0.4"], env={"HOME": home})
     sc = Screen(24, 80); sc.feed(raw)

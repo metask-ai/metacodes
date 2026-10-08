@@ -69,17 +69,54 @@ def test_picker_tab_cycles_scope_and_shows_it(bin_path):
 
 def test_picker_opens_during_generation_without_alt_screen(bin_path):
     # 要求:picker 在流式回复期间可用。它画在固定区里,回复继续往 scrollback 走,
-    # 不进 alt-screen(那是 transcript viewer 的行为)。
+    # 不进 alt-screen(那是 transcript viewer 的行为)。回复结束后 picker 仍开着(#220:
+    # 生成期与输入期各有一个固定区,开着的状态曾随生成期的那个一起被丢掉)。
+    # 断言时刻由事件写明,不交给后端收尾:先等 picker 出现,再等回复结束后流静默。
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
     with SlowMockServer([slow_text_then_end(n_chunks=14, delay=0.4)]) as srv:
         raw = run(
             bin_path,
-            ["sleep:0.8", "type:go", "key:enter", "sleep:1.5", "key:ctrl_o", "sleep:1.0"],
+            ["sleep:0.8", "type:go", "key:enter", "sleep:1.5", "key:ctrl_o",
+             "wait:Provider:3", "sleep:10"],
             base_url=srv.url,
             startup_drain=0.8,
             per_key_drain=0.08,
         )
-    _, text = _screen(raw)
-    assert "Provider" in text, "生成期 Ctrl+O 未打开 picker:\n" + text
+    a, text = _screen(raw)
+
+    def screen_text(sc):
+        return "\n".join(sc.line_text(r) for r in range(sc.rows))
+
+    during = [sc for sc in a.frame_screens
+              if "Provider" in screen_text(sc) and "esc to interrupt" in screen_text(sc)]
+    assert during, "生成期 Ctrl+O 未打开 picker:\n" + text
+    assert "tok13" in text and "esc to interrupt" not in text, "回复尚未结束,断言时刻不对:\n" + text
+    assert "Provider" in text, "回复结束时 picker 被丢掉了(#220):\n" + text
     assert b"\x1b[?1049h" not in raw, "picker 不应进 alt-screen(那是 transcript viewer)"
+
+
+def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
+    # #220:生成期里筛到一半的浏览状态(过滤词)在回复结束后原样还在,而且 picker
+    # 仍接收按键:回复结束后按 Esc 清掉过滤,列表回到全量,picker 仍开着。
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+
+    with SlowMockServer([slow_text_then_end(n_chunks=10, delay=0.4)]) as srv:
+        raw = run(
+            bin_path,
+            ["sleep:0.8", "type:go", "key:enter", "sleep:1.0", "key:ctrl_o",
+             "wait:Provider:3", "type:zai", "sleep:10", "key:esc", "sleep:0.6"],
+            base_url=srv.url,
+            startup_drain=0.8,
+            per_key_drain=0.08,
+        )
+    a, text = _screen(raw)
+
+    def screen_text(sc):
+        return "\n".join(sc.line_text(r) for r in range(sc.rows))
+
+    kept = [sc for sc in a.frame_screens
+            if "tok9" in screen_text(sc) and "esc to interrupt" not in screen_text(sc)
+            and "zai-coding-plan" in screen_text(sc) and "metask" not in screen_text(sc)]
+    assert kept, "回复结束后过滤状态丢了(#220):\n" + text
+    assert "Provider" in text and "metask" in text, "回复结束后 picker 不再接收按键:\n" + text

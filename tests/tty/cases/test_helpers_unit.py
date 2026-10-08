@@ -152,3 +152,43 @@ def test_sync_corrupt_seeded_json_is_noop(bin_path):
     finally:
         shutil.rmtree(home, ignore_errors=True)
         os.unlink(real)
+
+
+def test_offline_real_model_case_reports_skip(bin_path):
+    # #222:TTY_SKIP_MODEL=1 下真模型用例要报 skip,不能 return 后被计为通过。
+    import e2e_helpers
+    saved = e2e_helpers.SKIP
+    e2e_helpers.SKIP = True
+    try:
+        try:
+            e2e_helpers.require_model()
+        except e2e_helpers.SkipTest:
+            pass
+        else:
+            raise AssertionError("require_model() 在 SKIP 下没有报 skip")
+    finally:
+        e2e_helpers.SKIP = saved
+
+
+def test_no_case_turns_an_offline_skip_into_a_pass(bin_path):
+    # 同一个缺陷的静态形态:用例自己读 TTY_SKIP_MODEL,或 `if SKIP:` 后直接 return。
+    import re
+    cases = os.path.dirname(os.path.abspath(__file__))
+    offenders = []
+    for fn in sorted(os.listdir(cases)):
+        if not fn.endswith(".py"):
+            continue
+        with open(os.path.join(cases, fn), encoding="utf-8") as f:
+            src = f.read()
+        if re.search(r"if\s+SKIP\s*:\s*\n?\s*return\b", src) or "TTY_SKIP_MODEL\")" in src:
+            offenders.append(fn)
+    assert not offenders, "这些用例离线时把 skip 计成了通过,改用 require_model():" + ", ".join(offenders)
+
+
+def test_case_tmpdirs_are_released(bin_path):
+    # #222:用例自建的临时目录由 runner 在每个用例结束后删(失败也删)。
+    from tty_driver import case_tmpdir, release_case_dirs
+    made = [case_tmpdir("unit-case-dir-") for _ in range(2)]
+    assert all(os.path.isdir(p) for p in made)
+    release_case_dirs()
+    assert not any(os.path.exists(p) for p in made), made

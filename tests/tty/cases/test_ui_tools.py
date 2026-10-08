@@ -15,12 +15,12 @@ binary 执行 Write(--permission bypassPermissions,无弹窗)→ tool_result 进
 import os
 import sys
 import subprocess
-import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import run
+from tty_driver import run, case_tmpdir
 from asserts import TTYAssert
+from e2e_helpers import SkipTest  # noqa: E402
 
 # __file__ = cc-zig/tests/tty/cases/test_ui_tools.py → 上溯 3 级到 cc-zig。
 # (此前误写 "..","..",落到 cc-zig/tests,REPLAY_BIN 永不存在 → T35-T38 静默 skip。)
@@ -88,7 +88,7 @@ def replay_run(cdir, key_events, term_size=(40, 100), bin_path="zig-out/bin/meta
     before_each: 每次 attempt 前调(重置有状态场景,如 Edit 改文件的测试)。
     success(raw)->bool: 可选成功判据;给定时,未成功(且非最后一次)就重跑(覆盖 stream 错误外的瞬态,
       如 mock server 半截响应致工具未执行)。不给时只按 _stream_errored 判。
-    返回 raw(最后一次);replay 未就绪返回 None(skip)。"""
+    返回 raw(最后一次);replay 未就绪报 SkipTest(环境问题,不能计为通过)。"""
     for attempt in range(tries):
         if before_each is not None:
             before_each()  # 重置状态(文件/读态),使每次重跑都从干净起点
@@ -96,7 +96,7 @@ def replay_run(cdir, key_events, term_size=(40, 100), bin_path="zig-out/bin/meta
         if not base_url:
             proc.kill()
             if attempt == tries - 1:
-                return None
+                raise SkipTest("replay_server 未就绪")
             time.sleep(0.3)
             continue
         time.sleep(0.15)  # base_url 已打印(listen 成功);给 serveLoop 线程进 accept 的余量(防首连竞态)
@@ -110,9 +110,9 @@ def replay_run(cdir, key_events, term_size=(40, 100), bin_path="zig-out/bin/meta
             return raw
         if last:
             # 重试耗尽仍失败:若是 mock server 的 stream 错误(takeLine/ReadFailed/RequestFailed),
-            # 是 harness 瞬态非产品 bug → 返 None 让调用方 skip;否则返 raw 交断言(真失败)。
+            # 是 harness 瞬态非产品 bug → skip;否则返 raw 交断言(真失败)。
             if _stream_errored(raw):
-                return None
+                raise SkipTest("replay_server 流反复中断(harness 瞬态)")
             return raw
         time.sleep(0.3)  # 瞬态:歇一下重起 fresh server 重跑
     return raw
@@ -121,8 +121,8 @@ def replay_run(cdir, key_events, term_size=(40, 100), bin_path="zig-out/bin/meta
 
 def test_T35_write_diff_in_transcript(bin_path):
     if not os.path.isfile(REPLAY_BIN):
-        return  # 无 replay_server → skip
-    tmp = tempfile.mkdtemp(prefix="cc-tty-uitool-")
+        raise SkipTest("无 replay_server(先 zig build test:harness)")
+    tmp = case_tmpdir("cc-tty-uitool-")
     cdir = os.path.join(tmp, "cassette")
     os.makedirs(cdir, exist_ok=True)
     target = os.path.join(tmp, "out.txt")
@@ -146,8 +146,6 @@ def test_T35_write_diff_in_transcript(bin_path):
          "key:ctrl_x", "key:ctrl_o", "sleep:1.0", "type:q"],
         term_size=(40, 100), bin_path=bin_path, before_each=_reset35, success=_ok35,
     )
-    if raw is None:
-        return  # replay 未就绪 → skip(环境问题)
 
     a = TTYAssert(raw)
     # transcript 视图里应出现 Write 结果的 diff 内容行(gitDiff → +绿 着色的新增行)。
@@ -175,8 +173,8 @@ def test_T36_edit_diff_live_inline(bin_path):
     实时渲染到 stdout。先 Read 再 Edit(满足 must-read-first)。
     """
     if not os.path.isfile(REPLAY_BIN):
-        return
-    tmp = tempfile.mkdtemp(prefix="cc-tty-livediff-")
+        raise SkipTest("无 replay_server(先 zig build test:harness)")
+    tmp = case_tmpdir("cc-tty-livediff-")
     cdir = os.path.join(tmp, "cassette")
     os.makedirs(cdir, exist_ok=True)
     tf = os.path.join(tmp, "f.txt")
@@ -218,8 +216,6 @@ def test_T36_edit_diff_live_inline(bin_path):
 
     raw = replay_run(cdir, ["sleep:0.8", "type:edit it", "key:enter", "sleep:2.5"],
                      term_size=(40, 100), bin_path=bin_path, before_each=_reset_file, success=_ok)
-    if raw is None:
-        return  # replay 未就绪 → skip
 
     # 文件真被改
     if open(tf).read() != "BAR\nbaz\n":
@@ -238,8 +234,8 @@ def test_T36_edit_diff_live_inline(bin_path):
 def _run_cassette(steps_files, key_events, term_size=(30, 90), env=None):
     """通用:写 cassette(steps_files=[(name,sse_text)...]),起 replay(带瞬态重试),跑,返回 raw。"""
     if not os.path.isfile(REPLAY_BIN):
-        return None
-    tmp = tempfile.mkdtemp(prefix="cc-tty-iface-")
+        raise SkipTest("无 replay_server(先 zig build test:harness)")
+    tmp = case_tmpdir("cc-tty-iface-")
     cdir = os.path.join(tmp, "cassette")
     os.makedirs(cdir, exist_ok=True)
     for i, (_, txt) in enumerate(steps_files, start=1):
@@ -286,8 +282,6 @@ def test_T37_taskcreate_shows_tasktab(bin_path):
         term_size=(40, 100),
         env={"METACODES_KG_BIN": "/nonexistent/kg-disabled-for-test"},
     )
-    if raw is None:
-        return
     a = TTYAssert(raw)
     top = a.box_top_row()
     if top is None or top == 0:
@@ -305,8 +299,6 @@ def test_T38_enterplanmode_updates_footer(bin_path):
          ("b", _sse_text("in plan"))],
         ["sleep:0.8", "type:plan it", "key:enter", "sleep:2.0"],
     )
-    if raw is None:
-        return
     a = TTYAssert(raw)
     foot = None
     for r in range(a.final.rows):
@@ -331,8 +323,6 @@ def test_T39_plan_mode_reflects_during_generation(bin_path):
          ("b", _sse_text("now in plan mode generating some text"))],
         ["sleep:0.8", "type:plan it", "key:enter", "sleep:2.0"],
     )
-    if raw is None:
-        return
     a = TTYAssert(raw)
     # 扫所有捕获帧(含生成期),只要有一帧 footer 含 plan mode 即证生成期已联动。
     found = False
@@ -360,8 +350,6 @@ def test_T40_assistant_markdown_render(bin_path):
     md = "## Heading\\n\\nSome **bold** text.\\n\\n- one\\n- two\\n\\n```py\\nprint('x')\\n```"
     raw = _run_cassette([("a", _sse_text(md))],
                         ["sleep:0.8", "type:show md", "key:enter", "sleep:2.5"])
-    if raw is None:
-        return
     a = TTYAssert(raw)
     screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
     # 标题渲染:去 ## + ⏺ 段首(整屏应有 "⏺ Heading",且无裸 "## Heading")。
@@ -391,8 +379,6 @@ def test_T41_webfetch_output_reasonable(bin_path):
          ("b", _sse_text("done"))],
         ["sleep:0.8", "type:fetch it", "key:enter", "sleep:4.0"],
     )
-    if raw is None:
-        return
     a = TTYAssert(raw)
     screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
     # 工具卡标题:⏺ WebFetch(url)。
@@ -421,8 +407,6 @@ def test_T42_transcript_close_reanchors_box_to_bottom(bin_path):
          "key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
         term_size=(16, 80),
     )
-    if raw is None:
-        return
     a = TTYAssert(raw, rows=16, cols=80)  # PTY 是 16 行;TTYAssert 默认 24 → top>=rows//2 用错分母
     a.assert_box_present()
     top = a.box_top_row()

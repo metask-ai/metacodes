@@ -12,11 +12,18 @@
 # 先编译,再跑(独立 runner,不经 zig build —— PTY 在 build-runner 下时序不稳)
 zig build dev
 zig build test:harness  # e2e cases that need mock_mcp_server/replay_server
-python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug
-# 单跑某用例 + dump:
+TTY_SKIP_MODEL=1 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug
+# 单跑某用例 + dump(-k 是纯子串过滤,匹配 `文件名.函数名`):
 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
 ```
 退出码:0 全过 / 1 有失败(打印期望 vs 实际屏幕 diff)/ 2 环境错误。
+
+`TTY_SKIP_MODEL=1` 是离线跑法:打真实模型的用例(`test_e2e_*`、`test_generating`、
+`test_slash_menu` 的 T17/T19)经 `e2e_helpers.require_model()` 报 skip,不计为通过。
+
+**CI**:`.github/workflows/ci.yml` 的 `TTY (Linux)` 按上面的命令跑离线全套;`TTY (Windows)`
+跑 `zig build windows:tty -Dtarget=x86_64-windows-gnu`(ConPTY,需 `pip install pywinpty`)。
+在此之前套件不在任何 workflow 里,12 个 agent 树用例挂了几周没人发现(#218、#222)。
 
 ## 结构
 
@@ -30,9 +37,15 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
   逐帧时序断言、"N 秒内不出现 X"类否定窗口必须用 `strictsleep:N`(睡满);已知等待内容时用
   `wait:PATTERN:N`(等屏幕出现 PATTERN,命中后短 settle 防半帧)。两后端(POSIX pty/ConPTY)
   共享同一份 `_Capture` 实现,平台差异只在"读一片字节"原语内。
+  **收尾**也只有一份(`_Capture.finish`):最后一个事件之后收到输出静默 0.6s 为止(上限 6s),
+  只为收齐已在路上的字节。断言哪一刻的画面由用例的事件写明——#220 之前 POSIX 固定收 0.5s、
+  ConPTY 等静默,同一用例在两个平台上断言的是不同时刻。POSIX 关掉终端后至多等子进程 15s,
+  不退出就 SIGKILL 并判该用例失败(以前无超时 `waitpid`,会挂死整个 runner)。
 - `asserts.py` —— 切帧(`ESC[?25l`..`ESC[?25h` 光标对)+ `TTYAssert`
   (box_at_bottom/no_jitter/input_echo/border_class/footer_mode/box_height/clean_exit/...)。
-- `cases/*.py` —— T01-T13 用例(每个 `def test_*(bin_path)`)。
+- `cases/*.py` —— T01-T13 用例(每个 `def test_*(bin_path)`)。用例自建的临时目录(工作目录、
+  指定的 HOME)用 `tty_driver.case_tmpdir(prefix)`,runner 在每个用例结束后删,失败也删;
+  缺依赖(replay_server、mock_mcp_server)时 `raise SkipTest`,不要 `return`。
 - `run_tty_tests.py` —— 收集 cases、跑、屏幕 diff、汇总。
 
 ## 用例(对齐 Claude Code 布局/交互)

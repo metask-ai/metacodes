@@ -16,12 +16,11 @@ import tempfile
 import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from e2e_helpers import SKIP, assert_tool_e2e  # noqa: E402
+from e2e_helpers import SkipTest, assert_tool_e2e, require_model  # noqa: E402
 
 
 def test_e2e_webfetch(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 真联网抓 example.com(稳定测试域名)。
     assert_tool_e2e(
         bin_path,
@@ -35,8 +34,7 @@ def test_e2e_webfetch(bin_path):
 
 
 def test_e2e_croncreate(bin_path):
-    if SKIP:
-        return
+    require_model()
     # CronCreate 排的是 session 内存级任务,进程退出即清,无持久副作用。
     assert_tool_e2e(
         bin_path,
@@ -50,8 +48,7 @@ def test_e2e_croncreate(bin_path):
 
 
 def test_e2e_pushnotification(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 会真发系统通知(用户已确认可接受)。
     assert_tool_e2e(
         bin_path,
@@ -65,8 +62,7 @@ def test_e2e_pushnotification(bin_path):
 
 
 def test_e2e_monitor(bin_path):
-    if SKIP:
-        return
+    require_model()
     # Monitor 用瞬时命令(立即结束),避免长驻。接受 Monitor 或 Bash(后台)。
     assert_tool_e2e(
         bin_path,
@@ -80,8 +76,7 @@ def test_e2e_monitor(bin_path):
 
 
 def test_e2e_askuserquestion(bin_path):
-    if SKIP:
-        return
+    require_model()
     # AskUserQuestion 走 TUI 可交互对话框(dialog/ask_question.zig,drawBox + ↑↓/数字 + enter)。
     # TuiBackend.askQuestion 停 watcher + 持渲染锁 + 主线程独占 fd0 渲染(对齐 cc)。
     # 这里喂数字 "1" 选第一项;expect_tool_ok=True 硬校验 execute 成功(无 is_error)——
@@ -100,8 +95,7 @@ def test_e2e_askuserquestion(bin_path):
 
 
 def test_e2e_askuserquestion_arrow_nav(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 方向键导航变体(新交互层独有,旧裸 read 行无法测):喂 ↓ 移到第二项 + enter 确认。
     # 验证 drawBox 对话框 + ↑↓ 高亮选择端到端工作(用户原报"看不到可交互层"的核心修复)。
     # 真模型对选项命名有漂移,故只硬校验 tool_ok + 工具被调,不断言具体 answer 文本。
@@ -119,8 +113,7 @@ def test_e2e_askuserquestion_arrow_nav(bin_path):
 
 
 def test_e2e_enterworktree(bin_path):
-    if SKIP:
-        return
+    require_model()
     # EnterWorktree 真改 git(用户决策)。在临时隔离 git repo 里跑,测后整目录删除。
     repo = tempfile.mkdtemp(prefix="cc-e2e-wt-")
     try:
@@ -147,10 +140,9 @@ _MOCK_MCP = os.path.join(_ZIG_ROOT, "zig-out", "bin", "mock_mcp_server")
 
 
 def test_e2e_mcp_list_resources(bin_path):
-    if SKIP:
-        return
+    require_model()
     if not os.access(_MOCK_MCP, os.X_OK):
-        return  # 无 mock_mcp_server(未 build)→ 跳过
+        raise SkipTest("无 mock_mcp_server(先 zig build test:harness)")
     import json
     # 独立 HOME + config.json 声明 mock MCP server;模型应调 ListMcpResourcesTool。
     home = tempfile.mkdtemp(prefix="cc-e2e-mcp-home-")
