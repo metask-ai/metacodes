@@ -38,8 +38,10 @@ ZON_VERSION_RE = re.compile(r'\.version\s*=\s*"([^"]+)"')
 
 
 def git(*argv: str, root: Path) -> str:
-    proc = subprocess.run(["git", *argv], cwd=str(root), capture_output=True, text=True, check=False)
-    return proc.stdout.strip() if proc.returncode == 0 else ""
+    # git writes UTF-8 (a HEAD subject can carry any character); `text=True`
+    # would decode with the locale codec, GBK on a Chinese Windows.
+    proc = subprocess.run(["git", *argv], cwd=str(root), capture_output=True, check=False)
+    return proc.stdout.decode("utf-8").strip() if proc.returncode == 0 else ""
 
 
 def check(root: Path, head_ref: str, env: Optional[Dict[str, str]] = None) -> str:
@@ -99,7 +101,7 @@ def rehearse(root: Path, head_ref: str, env: Optional[Dict[str, str]] = None) ->
         return f"HEAD already carries tag {version}"
     if not rehearsable(root, version, head_ref, env):
         return ""
-    proc = subprocess.run(["git", "tag", version, "HEAD"], cwd=str(root), capture_output=True, text=True, check=False)
+    proc = subprocess.run(["git", "tag", version, "HEAD"], cwd=str(root), capture_output=True, check=False)
     if proc.returncode != 0:
         return ""
     return f"rehearsal: tagged HEAD as {version} locally (not pushed)"

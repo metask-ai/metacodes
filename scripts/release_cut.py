@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import os
 import re
 import subprocess
 import sys
@@ -272,10 +273,19 @@ def _pr_body(level: str, section: str, drivers: Dict[str, List[str]], unknown: L
 
 
 def run(argv: Sequence[str], cwd: Path, check: bool = True) -> str:
-    proc = subprocess.run(list(argv), cwd=str(cwd), capture_output=True, text=True, check=False)
+    # git and gh write UTF-8 whatever the locale, and PYTHONIOENCODING makes a
+    # Python child do the same. `text=True` would decode with the locale codec
+    # instead (GBK on a Chinese Windows), and there a decode error is raised in
+    # subprocess's reader thread and only printed: stdout came back None.
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.run(list(argv), cwd=str(cwd), capture_output=True, check=False, env=env)
     if check and proc.returncode != 0:
-        raise CutError(f"{' '.join(argv)} failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}")
-    return proc.stdout
+        stderr, stdout = (out.decode("utf-8", errors="replace").strip() for out in (proc.stderr, proc.stdout))
+        raise CutError(f"{' '.join(argv)} failed ({proc.returncode}): {stderr or stdout}")
+    try:
+        return proc.stdout.decode("utf-8").replace("\r\n", "\n")
+    except UnicodeDecodeError as exc:
+        raise CutError(f"{' '.join(argv)} wrote output that is not UTF-8: {exc}") from None
 
 
 def require_clean_main(root: Path) -> None:
@@ -500,6 +510,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--repo-root", default=str(ROOT))
     args = parser.parse_args(argv)
     root = Path(args.repo_root)
+    # Commit subjects and the changelog carry characters such as µ, ✓ and ↔
+    # that GBK, the pipe encoding on a Chinese Windows, cannot encode; escape
+    # them instead of failing.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     try:
         if args.reopen:
             return cmd_reopen(root, args.reopen_level, args.dry_run)
