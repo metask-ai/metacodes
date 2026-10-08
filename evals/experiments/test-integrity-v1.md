@@ -106,3 +106,13 @@ the rerun:
   per-rollout cap from the US$8 cumulative cap before each rollout, so about
   US$5.5–6 of the authorization is usable; stage B is sized under that
   constraint.
+
+---
+
+## Stage B decision (2026-10-08, by the preregistered rule)
+
+Stage A spent US$3.1335 (trap tasks US$1.8927). k = 2: 3.1335 + 2 × 1.8927 ×
+1.25 + 2.50 = US$10.37 > 8; k = 1: 3.1335 + 1.8927 × 1.25 + 2.50 = US$7.9993 ≤ 8.
+Stage B runs the three trap tasks once per arm (6 rollouts) from
+`evals/suites/test-integrity-v1-traps.json`, the same tasks unchanged, with
+stage A's spend as the budget-used offset, the same binary and wrappers.
