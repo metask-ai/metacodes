@@ -28,6 +28,7 @@ pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final
 pub const DELIVERY_CADENCE_SCHEMA_VERSION = "metacodes-delivery-cadence-v1";
 pub const PROGRESS_UPDATES_SCHEMA_VERSION = "metacodes-progress-updates-v1";
 pub const CHECK_GATE_SCHEMA_VERSION = "metacodes-check-gate-v1";
+pub const TEST_INTEGRITY_SCHEMA_VERSION = "metacodes-test-integrity-v1";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
 pub const TEST_WEAKENING_SCHEMA_VERSION = "metacodes-test-weakening-candidate-v1";
 pub const SYSTEM_ONE_DECISION_SCHEMA_VERSION = "metacodes-system-one-decision-v1";
@@ -57,6 +58,8 @@ pub const SystemOneOutcome = enum {
 /// The last verdict the host check gate obtained in a run (`not_run` when
 /// the run never reached a dirty end-of-turn boundary).
 pub const CheckGateVerdict = enum { not_run, passed, failed, tainted, unavailable };
+pub const TestIntegrityCoverage = enum { git, no_git, git_failed };
+pub const TestIntegrityOutcome = enum { clean, restored, kept_cited, kept_silent, observed };
 
 pub const Origin = enum {
     authoritative,
@@ -339,6 +342,35 @@ pub const Event = union(enum) {
         final_total: u32,
         unchecked_changes: bool,
         stop_hook_blocks: u8,
+    },
+    /// Terminal record of the test integrity obligation (TestIntegrity.lean):
+    /// the suite as it was at run start compared with the end state. Counts
+    /// only; paths stay out (the user-facing report carries them).
+    test_integrity: struct {
+        schema_version: []const u8 = TEST_INTEGRITY_SCHEMA_VERSION,
+        /// Treatment-actuation witness: true when a message was possible.
+        enforced: bool,
+        coverage: TestIntegrityCoverage,
+        scans: u32,
+        nudges: u8,
+        max_nudges: u8,
+        outcome: TestIntegrityOutcome,
+        /// Weakened files at the final scan, and the most at any scan.
+        files_weakened: u32,
+        files_weakened_peak: u32,
+        removed_lines: u32,
+        removed_assert_lines: u32,
+        skip_markers_added: u32,
+        deleted_files: u32,
+        support_files_changed: u32,
+        /// Most weakened files at a scan after the message that it did not name.
+        post_nudge_new_files: u32,
+        /// Existing test files a file tool changed that had no baseline (git
+        /// ignores them, or they lie outside the repository): never messaged,
+        /// but they taint a check-gate pass.
+        unverified_files: u32,
+        /// Some suite files were not compared (too many, too large).
+        overflow: bool,
     },
     verification_final_gate: struct {
         schema_version: []const u8 = VERIFICATION_FINAL_GATE_SCHEMA_VERSION,

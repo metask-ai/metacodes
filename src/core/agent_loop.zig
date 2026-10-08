@@ -39,6 +39,7 @@ const requirement_ledger_mod = @import("requirement_ledger.zig");
 const delivery_cadence_mod = @import("delivery_cadence.zig");
 const progress_updates_mod = @import("progress_updates.zig");
 const check_gate_mod = @import("check_gate.zig");
+const test_integrity_mod = @import("test_integrity.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
@@ -536,6 +537,16 @@ pub const Options = struct {
     /// so macro runs and embedders never run a check; the terminal
     /// `check_gate` observation record is emitted once per run when armed.
     check_gate: ?check_gate_mod.Options = null,
+    /// Test integrity obligation (TestIntegrity.lean): tests that existed when
+    /// the run started are compared with that baseline at end-of-turn
+    /// boundaries; enforce mode sends one message when the model stops with
+    /// them rewritten, deleted or disabled (restore, or quote the request),
+    /// observe mode only records. Budget 1, outside the host-injection meter.
+    /// The final state goes to `report` for the user either way, and one
+    /// terminal `test_integrity` observation record is emitted per run. Host-
+    /// contract field like `check_gate`: canonical buildRunOptions leaves it
+    /// null. The check gate reads the same sensor whenever it is armed.
+    test_integrity: ?test_integrity_mod.Options = null,
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
@@ -1048,15 +1059,53 @@ pub fn run(
     // 宿主检查门 + Stop hook 拦截(CheckGate.lean):各自有界的续跑预算,不走注入计量器
     // (续跑由外部裁决驱动,不是咨询性 nudge)。终局记录只在检查门武装时落一条。
     var check_gate_state = check_gate_mod.State{};
-    // Which test files are already modified before this run touches anything,
-    // so a later pass is called tainted only for edits made during the run.
-    if (opts.check_gate != null and depth == 0) {
-        check_gate_state.snapshotBaseline(allocator, if (opts.cwd_abs.len > 0) opts.cwd_abs else null, opts.abort) catch |err| switch (err) {
-            // The loop's own abort check ends the run at the first boundary.
-            error.Aborted => {},
-            error.OutOfMemory => return error.OutOfMemory,
-        };
+    // Test-integrity sensor (TestIntegrity.lean): the suite as it was when the
+    // run started. The check gate reads it too, to taint a pass over weakened
+    // tests; only an armed obligation messages, records and reports.
+    var test_integrity_state = test_integrity_mod.State{};
+    defer test_integrity_state.deinit(allocator);
+    if ((opts.test_integrity != null or opts.check_gate != null) and depth == 0) {
+        try test_integrity_state.arm(allocator, if (opts.cwd_abs.len > 0) opts.cwd_abs else null, opts.abort);
     }
+    defer if (opts.test_integrity) |integrity| if (depth == 0) {
+        // A run that ended without a scan after its last tool (turn cap,
+        // abort, error) is scanned once more so the report shows the end state.
+        test_integrity_state.settle(allocator);
+        const totals = test_integrity_state.totals();
+        if (opts.tool_observer) |observer| {
+            _ = observer.emit(.{ .test_integrity = .{
+                .enforced = integrity.mode == .enforce,
+                .coverage = switch (test_integrity_state.baseline.coverage) {
+                    .git => .git,
+                    .no_git => .no_git,
+                    .git_failed => .git_failed,
+                },
+                .scans = test_integrity_state.scans,
+                .nudges = test_integrity_state.nudges,
+                .max_nudges = test_integrity_mod.MAX_NUDGES,
+                .outcome = switch (test_integrity_state.outcome(integrity.mode)) {
+                    .clean => .clean,
+                    .restored => .restored,
+                    .kept_cited => .kept_cited,
+                    .kept_silent => .kept_silent,
+                    .observed => .observed,
+                },
+                .files_weakened = test_integrity_state.weakenedNow(),
+                .files_weakened_peak = test_integrity_state.peak,
+                .removed_lines = totals.removed_lines,
+                .removed_assert_lines = totals.removed_assert_lines,
+                .skip_markers_added = totals.skip_markers_added,
+                .deleted_files = totals.deleted_files,
+                .support_files_changed = totals.support_files_changed,
+                .post_nudge_new_files = test_integrity_state.post_nudge_new_files,
+                .unverified_files = test_integrity_state.unverified,
+                .overflow = test_integrity_state.overflow(),
+            } });
+        }
+        if (integrity.report) |report| test_integrity_state.fillReport(report, integrity.mode) catch |err| {
+            log.warn("agent", "test integrity report not filled: {s}", .{@errorName(err)});
+        };
+    };
     var stop_hook_active = false;
     defer if (opts.check_gate) |gate| {
         if (opts.tool_observer) |observer| {
@@ -2717,11 +2766,39 @@ pub fn run(
                     if (opts.job_wait.poll_slice_ms > 0) util_time.sleepMs(opts.job_wait.poll_slice_ms);
                 }
             }
+            // Test integrity (TestIntegrity.lean): before any check, compare
+            // the suite with the run-start baseline. Weakened tests in enforce
+            // mode earn one message (restore, or quote the request); the check
+            // gate below then judges against the restored tests.
+            if (depth == 0 and test_integrity_state.armed and test_integrity_state.touched) {
+                test_integrity_state.rescan(allocator, opts.abort) catch |err| switch (err) {
+                    error.Aborted => {
+                        output_channel.close(.final, assistant_text.items);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                if (opts.test_integrity) |integrity| {
+                    const weakened = test_integrity_state.weakenedNow();
+                    const decision = test_integrity_mod.policy(integrity.mode, test_integrity_state.nudges, weakened > 0);
+                    log.infoId("agent", rid, "test integrity weakened={d} decision={s} nudges={d}/{d}", .{ weakened, @tagName(decision), test_integrity_state.nudges, test_integrity_mod.MAX_NUDGES });
+                    if (decision == .nudge) {
+                        const text = try test_integrity_mod.renderNudge(allocator, &test_integrity_state.last.?);
+                        defer allocator.free(text);
+                        test_integrity_state.noteNudged();
+                        // The host found weakened tests: this answer is not final.
+                        output_channel.close(.commentary, assistant_text.items);
+                        try conversation.appendText(.user, text);
+                        continue :outer_turn;
+                    }
+                }
+            }
             // Host check gate (CheckGate.lean): the model stopped after a
             // delivery-capable action, so the host runs the pinned check itself.
             // A clean failure in enforce mode continues this conversation with
             // the verdict; every other outcome ends the run as it stands.
             if (opts.check_gate) |gate| if (depth == 0 and check_gate_state.shouldCheck()) {
+                check_gate_state.tests_weakened = if (test_integrity_state.scan_fresh) test_integrity_state.testsWeakened() else null;
                 backend.emitEvent(sess, .{ .set_current_tool = .{ .name = "running the pinned host check" } });
                 const cwd: ?[]const u8 = if (opts.cwd_abs.len > 0) opts.cwd_abs else null;
                 var outcome = check_gate_mod.runCheck(allocator, gate, cwd, opts.abort, &check_gate_state) catch |err| {
@@ -2777,6 +2854,7 @@ pub fn run(
                 if (stop.blocked) log.warnId("agent", rid, "Stop hook asked to continue again; block budget {d} spent, finishing", .{check_gate_mod.MAX_STOP_HOOK_BLOCKS});
             };
             // 自然 end_turn 且无任何主机异议 → 这一段(连同同 group 的续写段)就是最终结果。
+            if (test_integrity_state.armed) test_integrity_state.noteFinalAnswer(assistant_text.items);
             output_channel.close(.final, assistant_text.items);
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
@@ -3181,6 +3259,7 @@ pub fn run(
         // Host-check-gate sensor, same placement and reason: a delivery-capable
         // action must mark the run dirty before any early return.
         if (opts.check_gate != null) check_gate_state.observeSlots(allocator, slots.items);
+        if (test_integrity_state.armed) try test_integrity_state.observeSlots(allocator, slots.items);
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
         try exec_outcome;

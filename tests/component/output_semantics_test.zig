@@ -412,6 +412,7 @@ test "L2 输出语义:headless 结果行按 core 的定性给 text_kind" {
         final.text.?,
         final.kind,
         null,
+        null,
         .{ .stop_reason = .end_turn, .turns = 2, .tool_calls = 0 },
         &usage,
         "m",

@@ -1675,6 +1675,71 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     or formal["check_gate_stop_hook_blocks"] > 5  # CheckGate.lean maxStopBlocks
                 ):
                     raise TraceError("check gate record violates the gate policy")
+            elif observation_kind == "test_integrity":
+                # Terminal record of the test integrity obligation
+                # (TestIntegrity.lean): the tests that existed when the run
+                # started, compared with the end state; enforce mode sends at
+                # most one message. At most one record per run.
+                if (
+                    observation.get("schema_version") != "metacodes-test-integrity-v1"
+                    or not isinstance(observation.get("enforced"), bool)
+                    or not isinstance(observation.get("overflow"), bool)
+                    or observation.get("coverage") not in {"git", "no_git", "git_failed"}
+                    or observation.get("outcome")
+                    not in {"clean", "restored", "kept_cited", "kept_silent", "observed"}
+                ):
+                    raise TraceError("test integrity record is invalid")
+                if formal.get("test_integrity_records"):
+                    raise TraceError("duplicate test integrity record")
+                formal["test_integrity_records"] = 1
+                formal["test_integrity_enforced"] = int(observation["enforced"])
+                formal["test_integrity_overflow"] = int(observation["overflow"])
+                formal["test_integrity_coverage"] = observation["coverage"]
+                formal["test_integrity_outcome"] = observation["outcome"]
+                for key in (
+                    "scans",
+                    "nudges",
+                    "max_nudges",
+                    "files_weakened",
+                    "files_weakened_peak",
+                    "removed_lines",
+                    "removed_assert_lines",
+                    "skip_markers_added",
+                    "deleted_files",
+                    "support_files_changed",
+                    "post_nudge_new_files",
+                    "unverified_files",
+                ):
+                    value = observation.get(key)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        raise TraceError(f"test integrity {key} is invalid")
+                    formal["test_integrity_" + key] = value
+                # Policy relationships the Zig obligation proves
+                # (TestIntegrity.lean): at most max_nudges messages, none in
+                # observe mode, a message only after a scan found weakened
+                # tests, findings only with a git baseline, and an outcome that
+                # matches the end state.
+                weakened = formal["test_integrity_files_weakened"]
+                nudges = formal["test_integrity_nudges"]
+                outcome = observation["outcome"]
+                if (
+                    formal["test_integrity_max_nudges"] != 1  # TestIntegrity.lean maxNudges
+                    or nudges > formal["test_integrity_max_nudges"]
+                    or (not observation["enforced"] and nudges != 0)
+                    or nudges > formal["test_integrity_scans"]
+                    or weakened > formal["test_integrity_files_weakened_peak"]
+                    or (nudges > 0 and formal["test_integrity_files_weakened_peak"] == 0)
+                    or (formal["test_integrity_files_weakened_peak"] > 0 and formal["test_integrity_scans"] == 0)
+                    or (observation["coverage"] != "git" and formal["test_integrity_files_weakened_peak"] != 0)
+                    or formal["test_integrity_removed_assert_lines"] > formal["test_integrity_removed_lines"]
+                    or formal["test_integrity_deleted_files"] + formal["test_integrity_support_files_changed"] > weakened
+                    or formal["test_integrity_post_nudge_new_files"] > formal["test_integrity_files_weakened_peak"]
+                    or (outcome == "clean" and (weakened != 0 or nudges != 0))
+                    or (outcome == "restored" and (weakened != 0 or nudges == 0))
+                    or (outcome in {"kept_cited", "kept_silent"} and (weakened == 0 or not observation["enforced"]))
+                    or (outcome == "observed" and (weakened == 0 or observation["enforced"]))
+                ):
+                    raise TraceError("test integrity record violates the obligation policy")
             elif observation_kind == "test_weakening_candidate":
                 # PO-V2 M2 observe-only candidate: a realized edit to a
                 # test-classified file. Schema pinned; counters split by the

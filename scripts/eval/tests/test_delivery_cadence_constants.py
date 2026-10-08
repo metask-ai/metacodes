@@ -46,6 +46,16 @@ class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
         trace_hard = int(re.search(r'not 1 <= formal\["check_gate_max_continuations"\] <= (\d+)', trace).group(1))
         self.assertEqual(zig_hard, trace_hard)
 
+    def test_test_integrity_budget_is_identical_in_lean_zig_and_trace(self):
+        lean = (ROOT / "control-plane/lean/MetaCodesControl/TestIntegrity.lean").read_text(encoding="utf-8")
+        zig = (ROOT / "src/core/test_integrity.zig").read_text(encoding="utf-8")
+        trace = (ROOT / "scripts/eval/workbuddy/trace.py").read_text(encoding="utf-8")
+        lean_bound = int(re.search(r"^def maxNudges : Nat := (\d+)", lean, re.M).group(1))
+        zig_bound = int(re.search(r"pub const MAX_NUDGES: u8 = (\d+);", zig).group(1))
+        trace_bound = int(re.search(r'formal\["test_integrity_max_nudges"\] != (\d+)', trace).group(1))
+        self.assertEqual(lean_bound, zig_bound)
+        self.assertEqual(zig_bound, trace_bound)
+
     def test_meter_cap_is_identical_in_lean_and_zig(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean").read_text(encoding="utf-8")
         zig = (ROOT / "src/core/host_injection_meter.zig").read_text(encoding="utf-8")

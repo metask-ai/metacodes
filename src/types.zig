@@ -154,6 +154,13 @@ pub const Config = struct {
     check_gate_observe: bool = false,
     /// `--check-gate-max <n>`: continuation budget (1..8). null = default 3.
     check_gate_max: ?u8 = null,
+    /// `--test-integrity` / `--test-integrity-observe`: compare the tests that
+    /// existed when a run started with the end state; enforce sends one
+    /// message when the model stops with them rewritten, deleted or disabled,
+    /// observe only records. Either mode reports the end state to the user
+    /// (TestIntegrity.lean).
+    test_integrity: bool = false,
+    test_integrity_observe: bool = false,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,

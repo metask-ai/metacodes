@@ -635,7 +635,7 @@ pub fn loadRunDispatches(
                 // Diagnostic-only: a coverage gap binds no rule identity and
                 // no checker call, so replay has nothing to validate. It must
                 // still never be silently dropped from the hashed interval.
-                .rule_coverage_gap, .rule_bounds_overflow, .requirement_ledger, .delivery_cadence, .progress_updates, .check_gate, .system_one_decision => {},
+                .rule_coverage_gap, .rule_bounds_overflow, .requirement_ledger, .delivery_cadence, .progress_updates, .check_gate, .test_integrity, .system_one_decision => {},
                 .test_weakening_candidate => |weakening| {
                     process_signals.test_weakening_candidates += 1;
                     if (weakening.last_verification_failed)
@@ -987,7 +987,7 @@ fn validateFd(
                     }
                 }
                 switch (tool_event) {
-                    .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .check_gate, .test_weakening_candidate, .system_one_decision => {},
+                    .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .check_gate, .test_integrity, .test_weakening_candidate, .system_one_decision => {},
                     .rule_filter => |filter| {
                         try validateRuleFilter(&rule_filter_identities, filter);
                         const key = ruleFilterKey(filter.dispatch_id, filter.phase);
