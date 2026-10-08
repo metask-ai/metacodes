@@ -2263,6 +2263,10 @@ const AbiSession = struct {
         run_id: u64,
         controller: *session_budget.Controller,
     ) !session_budget.Outcome {
+        // The Run can return (aborted) while the abort that stopped it is
+        // still inside `Provider.cancel`; until that drains, Core answers BUSY
+        // to the measurement below, which would poison the facade.
+        self.core_session.awaitProviderCancelsDrained();
         const outcome = controller.outcome();
         const required = controller.requiredBytes();
         const terminal = switch (outcome) {
@@ -2305,6 +2309,7 @@ const AbiSession = struct {
         controller: *session_budget.Controller,
     ) void {
         if (self.core_session.isPoisoned()) return;
+        self.core_session.awaitProviderCancelsDrained();
         var lease = self.core_session.snapshotCommittedForRunMeasurement() catch return;
         const run_was_consumed = lease.last_run_id == run_id;
         lease.deinit();
@@ -2450,14 +2455,22 @@ const AbiSession = struct {
             .mcp_state = mcp_state,
             .prompt_profile = self.prompt_checkpoint_section,
         };
-        const report = try self.core_session.compactUsingBorrowedProvider(
+        // A concurrent abortCompact may still be inside `cancel` on
+        // `budget_provider` when Core returns. Wait for it on every exit:
+        // the provider lives in this frame, and until it drains Core answers
+        // BUSY to the measurement below, which would poison the facade.
+        const report = self.core_session.compactUsingBorrowedProvider(
             operation_id,
             .{ .commit_guard = .{
                 .ctx = &compact_guard,
                 .allowFn = CompactGuard.allows,
             } },
             budget_provider.provider(),
-        );
+        ) catch |err| {
+            self.core_session.awaitProviderCancelsDrained();
+            return err;
+        };
+        self.core_session.awaitProviderCancelsDrained();
         self.recordTerminal(.compact, operation_id);
         const usage = self.measureDurableUsage() catch |err| {
             self.facade_poisoned.store(true, .release);
