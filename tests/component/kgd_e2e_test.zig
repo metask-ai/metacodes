@@ -336,6 +336,23 @@ test "Kgd: a session that finds its service down has the host start it, then wor
     try std.testing.expectEqual(cc.kg_client.DegradedKind.daemon_unreachable, bare.degradedKind().?);
 }
 
+test "Kgd: a client that connects and closes without a request does not stall the next" {
+    // Autostart's readiness probe does exactly this. On Windows the service
+    // missed that close and held its single thread for the whole 30 s request
+    // deadline, so a session that started the service waited that long for its
+    // first answer. `ready` gives up after 2 s.
+    const a = std.testing.allocator;
+    var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
+    defer harness.deinit();
+    const probe = try platform.net.connectLoopback(harness.supervisor.port());
+    platform.net.closeSocket(probe);
+
+    var transport = try harness.connect(a, TEST_KEY);
+    defer transport.deinit();
+    const readiness = try transport.ready();
+    try std.testing.expect(readiness.ready);
+}
+
 test "Kgd: the service refuses a wrong key and an undeclared capability" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
