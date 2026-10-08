@@ -332,8 +332,9 @@ def test_ctrlb_backgrounds_main_session_deterministic(bin_path):
 
     机制:慢 mock turn1 慢吐 ~7.5s text 后以 tool_use 收尾 → 必有 turn2。在 turn1 执行期间注入
     Ctrl+B(0x02)→ 信号置位 → turn2 **开头**被拦截,run 返回 .backgrounded → loop 深拷贝转后台。
-    断言:① 前台打出 "已转后台续跑";② agent tree 出现转后台的 main agent;③ turn2 的哨兵
-    "SHOULD_NOT_REACH" 不出现(turn2 起点确实被拦,没继续跑)。
+    断言:① 前台打出 "已转后台续跑";② 新前台的 agent tree 仍列出转后台的主会话(#219:job 留在
+    原会话,新前台须把它算进自己的视图);③ turn2 的哨兵 "SHOULD_NOT_REACH" 不出现(turn2 起点
+    确实被拦,没继续跑)。
     """
     import re
     # 准备工具要读的文件(turn1 末尾的 Read 在转后台前可能已被调度,文件存在避免噪声)。
@@ -353,8 +354,15 @@ def test_ctrlb_backgrounds_main_session_deterministic(bin_path):
     txt = re.compile(rb"\x1b\[[0-9;?>]*[A-Za-z]").sub(b"", raw).decode("utf-8", "replace")
     assert "已转后台续跑" in txt, "Ctrl+B 未触发转后台(无 '已转后台续跑' 提示):\n" + txt[-1500:]
     assert "SHOULD_NOT_REACH" not in txt, "turn2 被执行了(转后台未在 turn 边界拦截):\n" + txt[-1500:]
-    # agent tree 出现转后台的 main agent(loop 打 "Running 1 main agent" 或树里含 main)。
-    assert ("main agent" in txt) or ("main" in txt), "agent tree 未显示转后台的 main agent:\n" + txt[-1500:]
+    # 最终屏(新前台空闲期):进度树标题 + 以首句 "do it" 命名的那一行 + footer 入口。
+    # 后台 job 可能还在跑(Running 1 main agent…)或已跑完(1 subagent finished)。
+    a = TTYAssert(raw, rows=24, cols=80)
+    final = "\n".join(a.final.line_text(r) for r in range(24))
+    assert ("Running 1 main agent" in final) or ("1 subagent finished" in final), \
+        "新前台的 agent tree 未显示转后台的主会话(#219):\n" + final
+    assert any(line.lstrip().startswith(("├", "└")) and "do it" in line for line in final.splitlines()), \
+        "agent tree 缺少转后台主会话那一行(desc=首句 do it):\n" + final
+    assert "← for agents" in final, "footer 缺少 agent 入口,switcher 找不回转后台的主会话:\n" + final
 
 
 def test_ctrl_o_multiagent_no_scroll_garbage(bin_path):
