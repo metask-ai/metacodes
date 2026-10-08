@@ -11,7 +11,8 @@
 //!   * tainted     — the run changed a file the check runs or names (the
 //!                   model edited its own judge, so the verdict stops
 //!                   counting);
-//!   * unavailable — no verdict at all (spawn failure, timeout).
+//!   * unavailable — no verdict at all (spawn failure, timeout, or the shell
+//!                   could not find or execute the command: exit 126/127).
 //!
 //! In enforce mode a clean failure continues the same conversation with the
 //! verdict — failing names, reasons, and an escalating reading from the
@@ -220,7 +221,7 @@ pub const State = struct {
     }
 };
 
-pub const Unavailable = enum { spawn_failed, timed_out, empty_command };
+pub const Unavailable = enum { spawn_failed, timed_out, empty_command, not_runnable };
 
 /// One check run turned into a verdict. Owns `output` and `parsed`.
 pub const Outcome = struct {
@@ -289,6 +290,11 @@ pub fn runCheck(
         .unavailable => |reason| return .{ .verdict = .unavailable, .unavailable = reason },
         .done => |done| done,
     };
+    // 126/127: the shell could not execute or find the command. That is the
+    // check's own failure, not the workspace's — asking the model to "fix the
+    // cause in your changes" would send it after a missing script.
+    if (captured.exit_code == 126 or captured.exit_code == 127)
+        return .{ .verdict = .unavailable, .unavailable = .not_runnable, .exit_code = captured.exit_code, .output = captured.output };
     var outcome = Outcome{ .verdict = .failed, .exit_code = captured.exit_code, .output = captured.output };
     errdefer outcome.deinit(allocator);
     const parsed = try verdict.parseAuto(allocator, captured.output, captured.exit_code);
@@ -625,6 +631,10 @@ test "runCheck classifies pass, failure and spawn failure" {
     var empty = try runCheck(testing.allocator, .{ .command = "  ", .mode = .enforce }, null, null, &state);
     defer empty.deinit(testing.allocator);
     try testing.expectEqual(Verdict.unavailable, empty.verdict);
+    var missing = try runCheck(testing.allocator, .{ .command = "no-such-check-command-zz9", .mode = .enforce }, null, null, &state);
+    defer missing.deinit(testing.allocator);
+    try testing.expectEqual(Verdict.unavailable, missing.verdict);
+    try testing.expectEqual(Unavailable.not_runnable, missing.unavailable.?);
 }
 
 test "runCheck: a timeout is unavailable, not a failure" {
