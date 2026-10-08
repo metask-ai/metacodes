@@ -137,3 +137,53 @@ rule: 3 × US$5.61 × 1.25 = US$21.0 exceeds the remaining US$17.78, 2 ×
 US$5.61 × 1.25 = US$14.0 fits, so 2 trials per task per arm (16 rollouts),
 with stage A's US$5.609415 as the budget-used offset under the US$23.39 v3
 cap. Same binary and harness revision (c9f14ae3) as stage A.
+
+## Results — stage B (run 2026-10-08, same binary and revision as stage A)
+
+Receipt-bound summary of `evals/runs/cg-v3/stageB/` (`compare.md` / `compare.json`
+there). 16 rollouts, all valid, nominal cost US$10.14 (v3 total US$15.75;
+check-gate total US$22.36 of US$30).
+
+**Run note.** The first invocation stopped fail-closed after 14 rollouts: the
+runner reserves the full per-rollout cap (US$9) before each rollout, and
+US$14.60 used + US$9 exceeded the US$23.39 cap. The sizing rule above priced
+stage A's actual cost, not that reservation. The two missing baseline rollouts
+(calc and ranges, trial 1) were run by resuming the same command with the
+per-rollout runaway cap lowered to US$8 — a guard far above any rollout's
+actual cost (max US$1.14); the treatment, binary, model and every other
+parameter were unchanged, and the cap is not part of the comparison identity.
+
+| task | trial | observe: validator / credit | enforce: validator / credit | enforce continuations |
+|---|---:|---|---|---:|
+| d1_cg3_cron | 0 | fail / 0.982 | pass / 1.000 | 0 |
+| d1_cg3_cron | 1 | pass / 1.000 | pass / 1.000 | 0 |
+| d2_cg3_sheet | 0 | pass / 1.000 | fail / 0.986 | 0 |
+| d2_cg3_sheet | 1 | pass / 1.000 | pass / 1.000 | 0 |
+| d3_cg3_calc | 0 | pass / 1.000 | pass / 1.000 | 0 |
+| d3_cg3_calc | 1 | fail / 0.980 | pass / 1.000 | 0 |
+| d4_cg3_ranges | 0 | fail / 0.969 | fail / 0.969 | 0 |
+| d4_cg3_ranges | 1 | pass / 1.000 | pass / 1.000 | 0 |
+
+- **Primary (partial credit):** mean paired difference +0.003; 2 pairs up, 1
+  down, 5 tied; exact sign test p = 1.0.
+- **Secondary (full validator):** 62.5% → 75.0%, discordant pairs 1 regression
+  / 2 improvements, exact McNemar p = 1.0.
+- **Mechanism:** every rollout in both arms finished with the pinned check
+  passing (0/8 baseline finished red); the candidate made no continuation. The
+  arms differ only by the run-to-run variance of a model that ends every run on
+  a green visible suite.
+- **Cost:** +US$0.05 per pair (95% CI −0.09 to +0.19), +1.6 tool calls, wall
+  time within noise.
+
+### Conclusion (v1–v3)
+
+H1 is not supported, and could not be: across all three cohorts the baseline
+finished with the pinned check failing in **0 of 23** rollouts (v1 0/6, v2 0/5,
+v3 0/12), and the enforced gate made **0** continuations in 23 rollouts. For
+glm-5.3-flash, whenever a runnable visible suite exists, the model iterates on
+it until it is green before stopping, so a gate that acts on "finished red" has
+nothing to act on; its residual failures are behaviours the visible check does
+not cover (hidden cases) or that make it pass dishonestly (v2: rewriting an
+existing test). The gate costs nothing measurable when idle. Evidence for its
+value would need a regime where runs end red — a weaker model, longer horizons,
+or checks the model cannot run itself — and is not established here.

@@ -79,7 +79,12 @@ v2 (multi-file feature requests with regression traps, 5 tasks × 1 pair;
 way (0/5 finished red, 4/5 validator in both arms, US$3.60): the model ran the
 tests in every rollout. Both textkit runs instead rewrote an existing test to
 match a changed shared tokenizer, which the gate recorded as a pass; a pass
-after modifying an existing test is now tainted.
+after modifying an existing test is now tainted. v3 (four hard
+specifications, 243 graded tests; [check-gate-v3.md](../evals/experiments/check-gate-v3.md))
+ran its paired stage (8 pairs, US$15.75 with stage A): partial credit +0.003
+(sign test p = 1.0), full pass 62.5% → 75.0% (McNemar p = 1.0), and again 0/12
+baseline rollouts finished red and 0 continuations — across v1–v3 the gate never
+had a failing check to act on for this model (0/23).
 
 **Three-arm long-horizon PK v2** (`codex_style` vs `claude_style` vs `tinykg`,
 [evals/README.md §5.1](../evals/README.md)): three calibration attempts all
