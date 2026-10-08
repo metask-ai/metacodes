@@ -109,7 +109,9 @@ status, compatibility boundaries, and entry points are defined by
   The two TTY backends now end a case the same way, a real-model case skipped
   offline reports a skip instead of a pass, cases delete the directories they
   create, and a binary that does not exit after its terminal closes fails the
-  case instead of hanging the run. The TinyKG service end-to-end tests run on
+  case instead of hanging the run. The replay server those cases use read
+  directory entries with the macOS `dirent` layout and found no cassette on
+  Linux; it now lists them portably. The TinyKG service end-to-end tests run on
   Windows except the one that needs a POSIX symlink.
 
 ## 0.3.1 — 2026-10-07
