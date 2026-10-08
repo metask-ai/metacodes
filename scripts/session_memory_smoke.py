@@ -7,10 +7,13 @@ stayed committed until exit, and multi-day sessions reached tens of GB. This
 drives the real binary with a scripted loopback provider and checks two things:
 
 1. growth: over a headless session of READ_TURNS tool turns whose conversation
-   grows by FILE_BYTES per turn, the child's memory grows (after WARMUP_TURNS)
-   by less than the total size of the request bodies it sent meanwhile. On the
-   arena it grew by about six times that; on the general-purpose allocator by
-   about a third.
+   grows by FILE_BYTES per turn, the child's memory grows (from the warmed-up
+   window to the final one) by less than the request bytes it sent meanwhile.
+   On the arena it grew by about four times that; on the general-purpose
+   allocator by a tenth or less. Each end of the measurement is the minimum
+   of WINDOW samples, so a transient (a worker thread whose stack is committed
+   at the moment of one sample) cannot pass for growth, while a leak, which
+   only grows, still shows.
 2. hygiene: a REPL session with tool turns, a forced auto-compaction and slash
    commands exits 0 with no panic and, on a Debug binary, no DebugAllocator
    leak or invalid-free report (the REPL path returns from `main`, so the
@@ -43,9 +46,10 @@ from scripts.eval.workbuddy.mock_provider import (  # noqa: E402
     _tool_sse,
 )
 
-READ_TURNS = 40
+READ_TURNS = 60
 WARMUP_TURNS = 10
-FILE_BYTES = 6000
+WINDOW = 5
+FILE_BYTES = 12000
 CRASH = re.compile(r"panic|Segmentation fault|reached unreachable|error\(DebugAllocator\)|Invalid free|Double free")
 
 
@@ -176,14 +180,19 @@ def growth_check(binary: Path) -> List[str]:
     problems = []
     if completed.returncode != 0 or provider.error or provider.requests != READ_TURNS + 1:
         return [f"growth session did not complete: exit {completed.returncode}, {provider.requests} requests, {provider.error}, stderr {completed.stderr[-400:]!r}"]
-    if any(value is None for value in provider.memory):
-        return ["growth session: could not sample the child's memory on this platform"]
-    # Measure from a warmed-up turn: one-time startup work (background threads,
-    # lazily built tables) lands at a variable point in the first requests.
-    base = WARMUP_TURNS
-    turns = len(provider.memory) - 1 - base
-    growth = provider.memory[-1] - provider.memory[base]
-    sent = sum(provider.body_bytes[base:])
+    # Measure from a warmed-up window: one-time startup work (background
+    # threads, lazily built tables) lands at a variable point in the first
+    # requests. A sample can be missing (the probe raced the child or `ps`);
+    # each window needs most of its samples.
+    start = provider.memory[WARMUP_TURNS : WARMUP_TURNS + WINDOW]
+    end = provider.memory[-WINDOW:]
+    start_known = [value for value in start if value is not None]
+    end_known = [value for value in end if value is not None]
+    if len(start_known) < WINDOW - 2 or len(end_known) < WINDOW - 2:
+        return [f"growth session: could not sample the child's memory on this platform ({provider.memory})"]
+    turns = len(provider.memory) - WINDOW - WARMUP_TURNS
+    growth = min(end_known) - min(start_known)
+    sent = sum(provider.body_bytes[WARMUP_TURNS:])
     print(f"growth: {growth / 2**20:.1f} MiB over {turns} turns; request bodies sent: {sent / 2**20:.1f} MiB")
     if growth > sent:
         problems.append(
