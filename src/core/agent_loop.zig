@@ -38,6 +38,7 @@ const verification_progress_mod = @import("verification_progress.zig");
 const requirement_ledger_mod = @import("requirement_ledger.zig");
 const delivery_cadence_mod = @import("delivery_cadence.zig");
 const progress_updates_mod = @import("progress_updates.zig");
+const check_gate_mod = @import("check_gate.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
@@ -525,6 +526,16 @@ pub const Options = struct {
     /// Silent tool rounds and wall-clock silence both required before a nudge
     /// (the stretch restarts after each decision and on any visible text).
     progress_update_thresholds: progress_updates_mod.Thresholds = .{},
+    /// Host check gate (outcome-guided continuation, CheckGate.lean): when the
+    /// model ends its turn after a delivery-capable action, the host runs the
+    /// pinned check command itself. Enforce mode continues the run with the
+    /// verdict on a clean failure, at most `max_continuations` times; observe
+    /// mode runs the same checks and only records them. Its budget is separate
+    /// from the host-injection meter (a verdict, not advice). Host-contract
+    /// field like the process gates: canonical buildRunOptions leaves it null,
+    /// so macro runs and embedders never run a check; the terminal
+    /// `check_gate` observation record is emitted once per run when armed.
+    check_gate: ?check_gate_mod.Options = null,
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
@@ -1031,6 +1042,31 @@ pub fn run(
                 .max_nudges = delivery_cadence_mod.MAX_CADENCE_NUDGES,
                 .first_threshold = opts.delivery_cadence_thresholds.first,
                 .second_threshold = opts.delivery_cadence_thresholds.second,
+            } });
+        }
+    };
+    // 宿主检查门 + Stop hook 拦截(CheckGate.lean):各自有界的续跑预算,不走注入计量器
+    // (续跑由外部裁决驱动,不是咨询性 nudge)。终局记录只在检查门武装时落一条。
+    var check_gate_state = check_gate_mod.State{};
+    var stop_hook_active = false;
+    defer if (opts.check_gate) |gate| {
+        if (opts.tool_observer) |observer| {
+            _ = observer.emit(.{ .check_gate = .{
+                .enforced = gate.mode == .enforce,
+                .command_sha256 = tools_mod.tool_observation.sha256Hex(gate.command),
+                .checks = check_gate_state.checks,
+                .continuations = check_gate_state.continuations,
+                .max_continuations = gate.max_continuations,
+                .final_verdict = if (check_gate_state.last_verdict) |v| switch (v) {
+                    .passed => .passed,
+                    .failed => .failed,
+                    .tainted => .tainted,
+                    .unavailable => .unavailable,
+                } else .not_run,
+                .final_passed = check_gate_state.last_passed,
+                .final_total = check_gate_state.last_total,
+                .unchecked_changes = check_gate_state.dirty,
+                .stop_hook_blocks = check_gate_state.stop_hook_blocks,
             } });
         }
     };
@@ -2672,10 +2708,67 @@ pub fn run(
                     if (opts.job_wait.poll_slice_ms > 0) util_time.sleepMs(opts.job_wait.poll_slice_ms);
                 }
             }
+            // Host check gate (CheckGate.lean): the model stopped after a
+            // delivery-capable action, so the host runs the pinned check itself.
+            // A clean failure in enforce mode continues this conversation with
+            // the verdict; every other outcome ends the run as it stands.
+            if (opts.check_gate) |gate| if (depth == 0 and check_gate_state.shouldCheck()) {
+                backend.emitEvent(sess, .{ .set_current_tool = .{ .name = "running the pinned host check" } });
+                const cwd: ?[]const u8 = if (opts.cwd_abs.len > 0) opts.cwd_abs else null;
+                var outcome = check_gate_mod.runCheck(allocator, gate, cwd, opts.abort, &check_gate_state) catch |err| {
+                    backend.emitEvent(sess, .clear_current_tool);
+                    switch (err) {
+                        // Ctrl+C while the check ran: the answer before it stays final.
+                        error.Aborted => {
+                            output_channel.close(.final, assistant_text.items);
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        },
+                        error.OutOfMemory => return error.OutOfMemory,
+                    }
+                };
+                backend.emitEvent(sess, .clear_current_tool);
+                defer outcome.deinit(allocator);
+                check_gate_state.noteVerdict(&outcome);
+                const decision = check_gate_mod.decide(gate.mode, gate.max_continuations, check_gate_state.continuations, outcome.verdict);
+                log.infoId("agent", rid, "host check verdict={s} passed={d}/{d} exit={d} decision={s} continuations={d}/{d}", .{
+                    @tagName(outcome.verdict), outcome.passed, outcome.total, outcome.exit_code, @tagName(decision), check_gate_state.continuations, gate.max_continuations,
+                });
+                check_gate_state.noteDecision(decision);
+                if (decision == .continue_run) {
+                    const text = try check_gate_mod.renderContinuation(allocator, gate, &outcome, &check_gate_state);
+                    defer allocator.free(text);
+                    // 主机裁决没过 → 这段"结论"是过程信息,不是最终答案。
+                    output_channel.close(.commentary, assistant_text.items);
+                    try conversation.appendText(.user, text);
+                    continue :outer_turn;
+                }
+            };
+            // Stop hook (Claude Code semantics): every configured hook runs here
+            // (memory extraction and other side effects included); a blocking
+            // hook continues the run with its reason, within its own bound.
+            if (depth == 0) if (permission_ctx.hooks) |hs| if (hs.hasStop()) {
+                const stdin_json = try stopHookStdin(allocator, conversation, "end_turn", stop_hook_active);
+                defer allocator.free(stdin_json);
+                var stop = hooks_mod.runStopHooks(hs.stop, allocator, stdin_json, opts.abort);
+                defer stop.deinit(allocator);
+                if (opts.abort) |a| if (a.isAborted()) {
+                    output_channel.close(.final, assistant_text.items);
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                };
+                if (check_gate_mod.stopContinues(stop.blocked, check_gate_state.stop_hook_blocks)) {
+                    check_gate_state.stop_hook_blocks += 1;
+                    stop_hook_active = true;
+                    log.infoId("agent", rid, "Stop hook block {d}/{d}", .{ check_gate_state.stop_hook_blocks, check_gate_mod.MAX_STOP_HOOK_BLOCKS });
+                    const text = try check_gate_mod.renderStopFeedback(allocator, stop.reason);
+                    defer allocator.free(text);
+                    output_channel.close(.commentary, assistant_text.items);
+                    try conversation.appendText(.user, text);
+                    continue :outer_turn;
+                }
+                if (stop.blocked) log.warnId("agent", rid, "Stop hook asked to continue again; block budget {d} spent, finishing", .{check_gate_mod.MAX_STOP_HOOK_BLOCKS});
+            };
             // 自然 end_turn 且无任何主机异议 → 这一段(连同同 group 的续写段)就是最终结果。
             output_channel.close(.final, assistant_text.items);
-            // Stop hook:顶层 agent 自然结束 → 触发(记忆提取挂载点)。
-            fireStopHook(permission_ctx.hooks, allocator, conversation, "end_turn", depth);
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
@@ -3076,6 +3169,9 @@ pub fn run(
         // leave the terminal record at zero).
         if (opts.delivery_cadence or opts.delivery_cadence_observe)
             delivery_cadence_state.observeSlots(allocator, slots.items);
+        // Host-check-gate sensor, same placement and reason: a delivery-capable
+        // action must mark the run dirty before any early return.
+        if (opts.check_gate != null) check_gate_state.observeSlots(allocator, slots.items);
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
         try exec_outcome;
@@ -4167,23 +4263,21 @@ fn emitContextProjection(
 }
 
 /// 构造 Stop hook 的 stdin JSON(last_message 自由文本须转义)。供记忆提取等 side-effect hook 用。
-fn buildStopStdin(allocator: std.mem.Allocator, stop_reason: []const u8, last_message: []const u8, num_messages: usize) ![]u8 {
+fn buildStopStdin(allocator: std.mem.Allocator, stop_reason: []const u8, last_message: []const u8, num_messages: usize, stop_hook_active: bool) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"hook_event_name\":\"Stop\",\"stop_reason\":");
     try util_json.writeJsonString(&aw.writer, stop_reason);
     try aw.writer.writeAll(",\"last_message\":");
     try util_json.writeJsonString(&aw.writer, last_message);
-    try aw.writer.print(",\"num_messages\":{d}}}", .{num_messages});
+    try aw.writer.print(",\"num_messages\":{d},\"stop_hook_active\":{}}}", .{ num_messages, stop_hook_active });
     return try aw.toOwnedSlice();
 }
 
-/// Stop hook(顶层 agent 自然结束时触发):喂最后一条 assistant 文本(截断)+ 消息数,供
-/// 记忆提取等 side-effect hook 用。depth!=0(subagent)不触发;无 Stop hook 直接返回。非阻塞。
-fn fireStopHook(hookset: ?*const hooks_mod.HookSet, allocator: std.mem.Allocator, conversation: *const Conversation, stop_reason: []const u8, depth: u8) void {
-    if (depth != 0) return;
-    const hs = hookset orelse return;
-    if (!hs.hasStop()) return;
+/// Stop hook stdin: the last assistant text (bounded) and the message count,
+/// plus `stop_hook_active` — true once a Stop hook has already sent this run
+/// back to work, so a script can tell a repeat stop from the first one.
+fn stopHookStdin(allocator: std.mem.Allocator, conversation: *const Conversation, stop_reason: []const u8, stop_hook_active: bool) ![]u8 {
     var last_text: []const u8 = "";
     var i = conversation.messages.items.len;
     while (i > 0) : (i -= 1) {
@@ -4200,7 +4294,18 @@ fn fireStopHook(hookset: ?*const hooks_mod.HookSet, allocator: std.mem.Allocator
     }
     const MAX_STOP_TEXT = 4000;
     const trimmed = if (last_text.len > MAX_STOP_TEXT) last_text[0..MAX_STOP_TEXT] else last_text;
-    const stdin_json = buildStopStdin(allocator, stop_reason, trimmed, conversation.messages.items.len) catch return;
+    return buildStopStdin(allocator, stop_reason, trimmed, conversation.messages.items.len, stop_hook_active);
+}
+
+/// Stop hook on a terminal stop that cannot continue (the controlled
+/// `tool_loop` finish): side effects only, a block is ignored. The natural
+/// end_turn path runs the hooks through `runStopHooks` and honours a block.
+/// depth!=0(subagent)不触发;无 Stop hook 直接返回。
+fn fireStopHook(hookset: ?*const hooks_mod.HookSet, allocator: std.mem.Allocator, conversation: *const Conversation, stop_reason: []const u8, depth: u8) void {
+    if (depth != 0) return;
+    const hs = hookset orelse return;
+    if (!hs.hasStop()) return;
+    const stdin_json = stopHookStdin(allocator, conversation, stop_reason, false) catch return;
     defer allocator.free(stdin_json);
     if (hooks_mod.runLifecycleHooks(hs.stop, allocator, "Stop", stdin_json)) |ac| allocator.free(ac);
 }

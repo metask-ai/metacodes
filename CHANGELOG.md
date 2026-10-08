@@ -10,6 +10,41 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- Host check gate (`--host-check <cmd>` with `--check-gate` or
+  `--check-gate-observe`, budget `--check-gate-max <n>`, 1–8, default 3). When
+  the model ends its turn after changing the workspace, the host runs the
+  pinned check command itself and turns the result into a verdict: passed,
+  failed, tainted (the run changed the program the check executes or a test
+  file a result names) or unavailable (spawn failure, 180 s timeout). In
+  enforce mode a clean failure continues the same conversation with the
+  verdict — failing names and reasons from the JUnit/pytest codecs, or the
+  output tail — plus an escalating reading from the cognitive-mode schedule,
+  until the check passes or the budget is spent; a turn with no new change is
+  never checked, so a question-and-answer turn never runs the suite. Observe
+  mode runs the same checks and only records them. Each run with the gate
+  armed writes one `check_gate` tool-observation record
+  (`metacodes-check-gate-v1`: checks, continuations, final verdict, whether
+  changes after the last check went unchecked, the command's SHA-256). The
+  policy — clean boundaries never checked, only a clean failure continues,
+  observe never continues, continuations within budget, Stop-hook blocks
+  within theirs, and at most one check per continuation of either kind plus
+  one over any trace — is proven in
+  `control-plane/lean/MetaCodesControl/CheckGate.lean` (propext only). The
+  continuation budget is separate from the host-injection meter: it is driven
+  by a verdict, not advice. Headless and the primary REPL run honour the
+  flags; macro runs and embedders do not.
+- Stop hooks can keep the run going, with Claude Code semantics: exit code 2
+  or stdout `{"decision":"block","reason":…}` appends
+  `Stop hook feedback:\n<reason>` (the reason defaults to the exit-2 stderr)
+  and continues instead of finishing; the hook's stdin carries
+  `stop_hook_active`, true once a Stop hook has already sent this run back.
+  The host caps this at 5 continuations per run (`stop_blocks_bounded`), where
+  Claude Code leaves it to the script. Any hook command can now set
+  `"timeout": <seconds>` (capped at 600), and the event budget widens to the
+  sum of its commands' timeouts, so a Stop hook can run a test suite.
+
 ## 0.3.1 — 2026-10-07
 
 ### Fixed

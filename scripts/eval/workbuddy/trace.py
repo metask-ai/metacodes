@@ -1626,6 +1626,55 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     or (not observation["enforced"] and formal["progress_updates_nudges"] != 0)
                 ):
                     raise TraceError("progress updates record violates the gate policy")
+            elif observation_kind == "check_gate":
+                # Terminal record of the host check gate (CheckGate.lean): the
+                # host runs the pinned check when the model stops after a
+                # delivery-capable action; enforce mode continues on a clean
+                # failure within its budget. At most one per run.
+                if (
+                    observation.get("schema_version") != "metacodes-check-gate-v1"
+                    or not isinstance(observation.get("enforced"), bool)
+                    or not isinstance(observation.get("unchecked_changes"), bool)
+                    or observation.get("final_verdict")
+                    not in {"not_run", "passed", "failed", "tainted", "unavailable"}
+                    or not isinstance(observation.get("command_sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", observation["command_sha256"])
+                ):
+                    raise TraceError("check gate record is invalid")
+                if formal.get("check_gate_records"):
+                    raise TraceError("duplicate check gate record")
+                formal["check_gate_records"] = 1
+                formal["check_gate_enforced"] = int(observation["enforced"])
+                formal["check_gate_unchecked_changes"] = int(observation["unchecked_changes"])
+                formal["check_gate_final_verdict"] = observation["final_verdict"]
+                for key, where in (
+                    ("checks", "checks"),
+                    ("continuations", "continuations"),
+                    ("max_continuations", "continuation budget"),
+                    ("final_passed", "final passed count"),
+                    ("final_total", "final total count"),
+                    ("stop_hook_blocks", "stop hook blocks"),
+                ):
+                    value = observation.get(key)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        raise TraceError(f"check gate {where} is invalid")
+                    formal["check_gate_" + key] = value
+                # Policy relationships the Zig gate proves (CheckGate.lean):
+                # continuations within budget, Stop-hook blocks within their own
+                # bound, at most one check per continuation of either kind plus
+                # one, none in observe mode, a verdict exactly when a check ran.
+                if (
+                    not 1 <= formal["check_gate_max_continuations"] <= 8  # --check-gate-max range (HARD_MAX_CONTINUATIONS)
+                    or formal["check_gate_continuations"] > formal["check_gate_max_continuations"]
+                    or formal["check_gate_checks"]
+                    > formal["check_gate_continuations"] + formal["check_gate_stop_hook_blocks"] + 1
+                    or formal["check_gate_continuations"] > formal["check_gate_checks"]
+                    or (not observation["enforced"] and formal["check_gate_continuations"] != 0)
+                    or ((formal["check_gate_checks"] == 0) != (observation["final_verdict"] == "not_run"))
+                    or formal["check_gate_final_passed"] > formal["check_gate_final_total"]
+                    or formal["check_gate_stop_hook_blocks"] > 5  # CheckGate.lean maxStopBlocks
+                ):
+                    raise TraceError("check gate record violates the gate policy")
             elif observation_kind == "test_weakening_candidate":
                 # PO-V2 M2 observe-only candidate: a realized edit to a
                 # test-classified file. Schema pinned; counters split by the

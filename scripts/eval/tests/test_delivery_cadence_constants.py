@@ -33,6 +33,19 @@ class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
         self.assertEqual(lean_bound, zig_bound)
         self.assertEqual(zig_bound, trace_bound)
 
+    def test_check_gate_bounds_are_identical_in_lean_zig_and_trace(self):
+        lean = (ROOT / "control-plane/lean/MetaCodesControl/CheckGate.lean").read_text(encoding="utf-8")
+        zig = (ROOT / "src/core/check_gate.zig").read_text(encoding="utf-8")
+        trace = (ROOT / "scripts/eval/workbuddy/trace.py").read_text(encoding="utf-8")
+        lean_stop = int(re.search(r"^def maxStopBlocks : Nat := (\d+)", lean, re.M).group(1))
+        zig_stop = int(re.search(r"pub const MAX_STOP_HOOK_BLOCKS: u8 = (\d+);", zig).group(1))
+        trace_stop = int(re.search(r'formal\["check_gate_stop_hook_blocks"\] > (\d+)', trace).group(1))
+        self.assertEqual(lean_stop, zig_stop)
+        self.assertEqual(zig_stop, trace_stop)
+        zig_hard = int(re.search(r"pub const HARD_MAX_CONTINUATIONS: u8 = (\d+);", zig).group(1))
+        trace_hard = int(re.search(r'not 1 <= formal\["check_gate_max_continuations"\] <= (\d+)', trace).group(1))
+        self.assertEqual(zig_hard, trace_hard)
+
     def test_meter_cap_is_identical_in_lean_and_zig(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean").read_text(encoding="utf-8")
         zig = (ROOT / "src/core/host_injection_meter.zig").read_text(encoding="utf-8")

@@ -229,6 +229,11 @@ test "U11 parity: 过程义务门是宿主契约字段,canonical 不带(delivery
     try std.testing.expect(std.meta.eql(defaults.delivery_cadence_thresholds, canonical.delivery_cadence_thresholds));
     try std.testing.expect(!canonical.verification_final_gate);
     try std.testing.expect(!canonical.requirement_ledger);
+    // 宿主检查门同属宿主契约字段:canonical 不带,宏 run / skill run 不会跑检查命令。
+    app.config.host_check_command = "make check";
+    app.config.check_gate = true;
+    app.config.check_gate_observe = true;
+    try std.testing.expect(session_service.buildRunOptions(app, null).check_gate == null);
     // #114:进度更新门同样不进 canonical——即便 config 默认开着,宏 run / skill run 也不被提醒。
     app.config.progress_updates = true;
     app.config.progress_updates_observe = true;

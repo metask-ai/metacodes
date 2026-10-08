@@ -2,6 +2,7 @@ import MetaCodesControl.VerificationGate
 import MetaCodesControl.RequirementLedger
 import MetaCodesControl.DeliveryCadence
 import MetaCodesControl.ProgressUpdates
+import MetaCodesControl.CheckGate
 import MetaCodesControl.RuleMetaGovernance
 
 -- Build automation treats this output as part of the shipped trust boundary:
@@ -30,6 +31,15 @@ import MetaCodesControl.RuleMetaGovernance
 #print axioms MetaCodesControl.ProgressUpdates.quick_rounds_never_fire
 #print axioms MetaCodesControl.ProgressUpdates.decisions_bounded
 #print axioms MetaCodesControl.ProgressUpdates.fresh_run_bounded
+#print axioms MetaCodesControl.CheckGate.clean_boundary_never_checked
+#print axioms MetaCodesControl.CheckGate.only_failure_continues
+#print axioms MetaCodesControl.CheckGate.observe_never_continues
+#print axioms MetaCodesControl.CheckGate.continue_needs_budget
+#print axioms MetaCodesControl.CheckGate.continuations_bounded
+#print axioms MetaCodesControl.CheckGate.checks_bounded
+#print axioms MetaCodesControl.CheckGate.unblocked_never_continues
+#print axioms MetaCodesControl.CheckGate.stop_continue_needs_budget
+#print axioms MetaCodesControl.CheckGate.stop_blocks_bounded
 #print axioms MetaCodesControl.RuleMetaGovernance.llm_cannot_promote_deny
 #print axioms MetaCodesControl.RuleMetaGovernance.unanchored_cannot_promote
 #print axioms MetaCodesControl.RuleMetaGovernance.evidence_unanchored_cannot_promote
