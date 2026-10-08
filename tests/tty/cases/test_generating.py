@@ -252,6 +252,19 @@ def test_completion_spinner_never_commits_to_history(bin_path):
         "历史区出现 'for Ns'(完成态行残留):\n" + prose[-1200:]
 
 
+def test_refused_endpoint_retries_without_system_error_noise(bin_path):
+    # #221:模型端点拒绝连接(默认 base_url 是死端口 127.0.0.1:1)时,每个平台都按连接失败
+    # 退避重试并在 TUI 里说明。Windows 上 Zig 0.16 把被拒的连接报成 error.Unexpected:
+    # 以前一次就放弃,debug 构建还把 std 的 `error.Unexpected NTSTATUS=…` 和栈回溯
+    # 直接打进 TUI。离线、不打模型。
+    import re
+    raw = run(bin_path, ["sleep:0.8", "type:hello", "key:enter", "wait:Retrying in:40"])
+    text = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw).decode("utf-8", "replace")
+    assert "Retrying in" in text, "被拒的连接没有退避重试:\n" + text[-1500:]
+    for noise in ("error.Unexpected", "NTSTATUS"):
+        assert noise not in text, f"系统错误的诊断输出打进了 TUI({noise}):\n" + text[-1500:]
+
+
 def test_logs_never_leak_into_tui_render_stream(bin_path):
     # 用户实测(Warp):web 搜索时 spinner 在 input 上方留**残影**堆叠。根因(offline 复现坐实):
     #   日志默认级别 .err → err/warn 写 **stderr(fd 2)**,而交互式 TUI 渲染走 fd 1——同一终端。

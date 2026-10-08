@@ -27,6 +27,15 @@ const build_options = @import("build_info");
 
 pub const VERSION = @import("version.zig").semver;
 
+/// Debug builds of Zig 0.16.0 print `error.Unexpected NTSTATUS=…` and a stack
+/// trace to stderr for every status the Windows network layer does not map.
+/// Esc aborts the reply's socket (CONNECTION_ABORTED on the next read) and the
+/// trace landed on top of the TUI (#221). The error itself still propagates
+/// and is logged where it is handled; only the unconditional print goes.
+/// A test binary's root is the test runner, so the evidence is the TTY case
+/// `test_refused_endpoint_retries_without_system_error_noise`.
+pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
+
 // Public re-exports for tests and future consumers.
 pub const api_stream = @import("api/stream.zig");
 pub const api_provider = @import("api/provider.zig");
