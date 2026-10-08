@@ -650,8 +650,21 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1))
         else
             null;
-        defer if (gen_region) |*r| r.deinit();
-        if (gen_region) |*r| r.enterGenerating(app, &msg_queue);
+        defer if (gen_region) |*r| {
+            // #220: a picker opened during the reply stays open after it.
+            // Every exit path passes here after the watcher has stopped.
+            if (r.ui.picker_open) app.pending_overlay = .model_picker_kept;
+            r.deinit();
+        };
+        if (gen_region) |*r| {
+            r.enterGenerating(app, &msg_queue);
+            // A queued message starts this reply without an input phase in
+            // between, so the picker the last reply left open comes here.
+            if (app.pending_overlay == .model_picker_kept) {
+                app.pending_overlay = .none;
+                picker_host.keep(app, &r.ui);
+            }
+        }
         if (tty) terminal_title.setFromApp(app, .working); // tab:生成中
 
         var region_writer: ?render_region_mod.RegionWriter =
@@ -1212,6 +1225,10 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
         .model_picker => {
             app.pending_overlay = .none;
             picker_host.open(app, &region.ui);
+        },
+        .model_picker_kept => {
+            app.pending_overlay = .none;
+            picker_host.keep(app, &region.ui);
         },
         .transcript => {
             app.pending_overlay = .none;

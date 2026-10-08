@@ -250,7 +250,16 @@ fn installCliProcessError(
 /// session 内的 binding 指针指向同一个 client；client 必须比 session 活得久。
 pub const McpSessionEntry = @import("core/mcp_session.zig").McpSessionEntry;
 
-pub const PendingOverlay = enum { none, model_picker, transcript };
+pub const PendingOverlay = enum {
+    none,
+    /// `/model` asked for the picker: open it fresh.
+    model_picker,
+    /// A reply ended while the picker was on screen (#220). Each phase draws
+    /// its own region, so the next one shows the picker again as it was left:
+    /// same stage, filter and cursor, sign-in still running.
+    model_picker_kept,
+    transcript,
+};
 
 pub const App = struct {
     allocator: std.mem.Allocator,
