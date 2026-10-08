@@ -68,6 +68,13 @@ the same magnitude as the treatment effects. These are directional
 instrument-development results on the dev cohort only — one model, no causal
 effect sizes, never a held-out claim.
 
+**Host check gate v1, stage A** (2026-10-08, glm-5.3-flash, 6 tasks × 1 pair;
+[check-gate-v1.md](../evals/experiments/check-gate-v1.md)): both arms 6/6 on
+the full validator and 6/6 finishing with the pinned check passing, so the
+hazard the gate targets never occurred and the preregistered stopping rule
+skipped the paired stage (US$3.01 nominal spent). The gate ran its check once
+per rollout and never continued. H1 is untested on this cohort, not refuted.
+
 **Three-arm long-horizon PK v2** (`codex_style` vs `claude_style` vs `tinykg`,
 [evals/README.md §5.1](../evals/README.md)): three calibration attempts all
 ended fail-closed (grader defect, budget-reserve defect, treatment-attestation
