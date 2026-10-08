@@ -144,6 +144,16 @@ pub const Config = struct {
     /// `--progress-updates-observe` records decisions without injecting.
     progress_updates: bool = true,
     progress_updates_observe: bool = false,
+    /// `--host-check <cmd>`: the check command the host runs itself for the
+    /// host check gate. Pinned for the process; the model cannot change it.
+    host_check_command: ?[]const u8 = null,
+    /// `--check-gate` / `--check-gate-observe`: run the pinned check when the
+    /// model ends its turn after changing the workspace; enforce continues the
+    /// run on a clean failure, observe only records (CheckGate.lean).
+    check_gate: bool = false,
+    check_gate_observe: bool = false,
+    /// `--check-gate-max <n>`: continuation budget (1..8). null = default 3.
+    check_gate_max: ?u8 = null,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,

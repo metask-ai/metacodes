@@ -1,0 +1,375 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-check-gate-v2",
+  "description": "Host check gate evaluation cohort v2 (evals/experiments/check-gate-v2.md). Five self-authored multi-module feature requests over a frozen snapshot: ISSUE.md, the package, its existing unit tests plus one acceptance test, and `sh run_tests`, the command both arms pin with --host-check. The natural implementation of each issue breaks an existing test in another module. The validator runs the pristine visible tests plus hidden tests derived from ISSUE.md over a copy of the workspace with its own tests replaced. The scenario prompt names only ISSUE.md.",
+  "tasks": [
+    {
+      "id": "c1_cg2_receipts",
+      "scenario": "tests/e2e/scenarios/c1_cg2_receipts.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2958e6efaaa301b4e6032350fad311fd29f48cf0",
+          "prefix": "tests/e2e/fixtures/check_gate_v2/receipts",
+          "paths": [
+            "ISSUE.md",
+            "README.md",
+            "run_tests",
+            "shop/__init__.py",
+            "shop/cart.py",
+            "shop/catalog.py",
+            "shop/export.py",
+            "shop/money.py",
+            "shop/receipt.py",
+            "shop/refunds.py",
+            "shop/tax.py",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_cart.py",
+            "tests/test_discount.py",
+            "tests/test_export.py",
+            "tests/test_money.py",
+            "tests/test_receipt.py",
+            "tests/test_refunds.py",
+            "tests/test_tax.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 1200,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/c1_check_gate_v2_receipts.py",
+            "timeout_seconds": 120,
+            "description": "Discount codes on receipts (shared money formatter): pristine visible tests plus hidden tests from ISSUE.md"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 80,
+        "max_tool_calls": 160,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a multi-module change plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a handful of modules, editing a few and running the tests needs far fewer; the turn cap is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v2"
+      }
+    },
+    {
+      "id": "c2_cg2_todo",
+      "scenario": "tests/e2e/scenarios/c2_cg2_todo.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2958e6efaaa301b4e6032350fad311fd29f48cf0",
+          "prefix": "tests/e2e/fixtures/check_gate_v2/todo",
+          "paths": [
+            "ISSUE.md",
+            "README.md",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_cli.py",
+            "tests/test_export.py",
+            "tests/test_model.py",
+            "tests/test_store.py",
+            "tests/test_urgency.py",
+            "todo/__init__.py",
+            "todo/cli.py",
+            "todo/export.py",
+            "todo/model.py",
+            "todo/ordering.py",
+            "todo/store.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 1200,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/c2_check_gate_v2_todo.py",
+            "timeout_seconds": 120,
+            "description": "Urgency ordering for `todo list` (shared sort): pristine visible tests plus hidden tests from ISSUE.md"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 80,
+        "max_tool_calls": 160,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a multi-module change plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a handful of modules, editing a few and running the tests needs far fewer; the turn cap is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v2"
+      }
+    },
+    {
+      "id": "c3_cg2_textkit",
+      "scenario": "tests/e2e/scenarios/c3_cg2_textkit.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2958e6efaaa301b4e6032350fad311fd29f48cf0",
+          "prefix": "tests/e2e/fixtures/check_gate_v2/textkit",
+          "paths": [
+            "ISSUE.md",
+            "README.md",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_compounds.py",
+            "tests/test_readability.py",
+            "tests/test_search.py",
+            "tests/test_stats.py",
+            "tests/test_tokenize.py",
+            "textkit/__init__.py",
+            "textkit/readability.py",
+            "textkit/search.py",
+            "textkit/stats.py",
+            "textkit/tokenize.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 1200,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/c3_check_gate_v2_textkit.py",
+            "timeout_seconds": 120,
+            "description": "Contractions and compounds in word statistics (shared tokenizer): pristine visible tests plus hidden tests from ISSUE.md"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 80,
+        "max_tool_calls": 160,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a multi-module change plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a handful of modules, editing a few and running the tests needs far fewer; the turn cap is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v2"
+      }
+    },
+    {
+      "id": "c4_cg2_events",
+      "scenario": "tests/e2e/scenarios/c4_cg2_events.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2958e6efaaa301b4e6032350fad311fd29f48cf0",
+          "prefix": "tests/e2e/fixtures/check_gate_v2/events",
+          "paths": [
+            "ISSUE.md",
+            "README.md",
+            "events/__init__.py",
+            "events/ics.py",
+            "events/model.py",
+            "events/recur.py",
+            "events/store.py",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/data/legacy_events.json",
+            "tests/run.py",
+            "tests/test_ics.py",
+            "tests/test_model.py",
+            "tests/test_recur.py",
+            "tests/test_store.py",
+            "tests/test_timezones.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 1200,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/c4_check_gate_v2_events.py",
+            "timeout_seconds": 120,
+            "description": "Time zones for calendar events (legacy storage, UTC ICS form): pristine visible tests plus hidden tests from ISSUE.md"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 80,
+        "max_tool_calls": 160,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a multi-module change plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a handful of modules, editing a few and running the tests needs far fewer; the turn cap is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v2"
+      }
+    },
+    {
+      "id": "c5_cg2_library",
+      "scenario": "tests/e2e/scenarios/c5_cg2_library.txt",
+      "layers": [
+        "E",
+        "T",
+        "C",
+        "L",
+        "O",
+        "V"
+      ],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "repository_snapshot": {
+          "revision": "2958e6efaaa301b4e6032350fad311fd29f48cf0",
+          "prefix": "tests/e2e/fixtures/check_gate_v2/library",
+          "paths": [
+            "ISSUE.md",
+            "README.md",
+            "library/__init__.py",
+            "library/books.py",
+            "library/fees.py",
+            "library/loans.py",
+            "library/members.py",
+            "library/notices.py",
+            "run_tests",
+            "tests/__init__.py",
+            "tests/run.py",
+            "tests/test_fees.py",
+            "tests/test_loans.py",
+            "tests/test_members.py",
+            "tests/test_notices.py",
+            "tests/test_premium.py"
+          ]
+        }
+      },
+      "tools": {
+        "profile": "metacodes-runtime-default-v1",
+        "required": [
+          "Read",
+          "Write"
+        ]
+      },
+      "constraints": {
+        "timeout_seconds": 1200,
+        "permission_mode": "bypassPermissions"
+      },
+      "success": {
+        "checks": [
+          {
+            "type": "validator",
+            "validator": "evals/validators/c5_check_gate_v2_library.py",
+            "timeout_seconds": 120,
+            "description": "Premium library membership (widened call sites): pristine visible tests plus hidden tests from ISSUE.md"
+          }
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 80,
+        "max_tool_calls": 160,
+        "max_harness_tool_errors": 2
+      },
+      "trajectory_rationale": {
+        "max_turns": "a multi-module change plus up to three host-check continuations; more turns than this is looping",
+        "max_tool_calls": "reading a handful of modules, editing a few and running the tests needs far fewer; the turn cap is the kill, this is the violation flag",
+        "max_harness_tool_errors": "a couple of tool-runtime errors are tolerated; more means the environment, not the agent"
+      },
+      "grader": {
+        "kind": "deterministic_workspace",
+        "version": "check-gate-v2"
+      }
+    }
+  ]
+}

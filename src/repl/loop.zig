@@ -19,6 +19,7 @@ const Conversation = @import("../core/conversation.zig").Conversation;
 const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
+const check_gate_mod = @import("../core/check_gate.zig");
 const host_injection_meter = @import("../core/host_injection_meter.zig");
 const input = @import("input.zig");
 const complete = @import("complete.zig");
@@ -811,6 +812,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // host-contract shape as the cadence gate: primary run only.
         run_opts.progress_updates = app.config.progress_updates;
         run_opts.progress_updates_observe = app.config.progress_updates_observe;
+        // Host check gate: primary run only, same host-contract shape (a macro
+        // run must not trigger a check or emit a second terminal record).
+        run_opts.check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max);
         run_opts.ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null;
         run_opts.spawn_tick_fn = spawn_tick;
         // issue #16:turn 边界刷新 OAuth access token。commit 时拷的是当时有效的

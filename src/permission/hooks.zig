@@ -10,8 +10,12 @@
 //!   }
 //!
 //! **生命周期 hook**(无 tool matcher,全触发,非阻塞——block 仅 advisory):
-//!   - **Stop**(顶层 agent 自然 end_turn 结束):stdin `{hook_event_name,stop_reason,last_message,num_messages}`——
-//!     记忆提取挂载点(hook 自行读 last_message/transcript 写 KG)。subagent(depth!=0)不触发。
+//!   - **Stop**(顶层 agent 自然 end_turn 结束):stdin `{hook_event_name,stop_reason,last_message,num_messages,
+//!     stop_hook_active}`——记忆提取挂载点(hook 自行读 last_message/transcript 写 KG)。subagent(depth!=0)不触发。
+//!     **唯一能 gate 控制流的生命周期 hook**(对齐 Claude Code):exit 2 或 stdout `{"decision":"block","reason":…}`
+//!     → 不停,把 `Stop hook feedback:\n<reason>`(reason 缺省取 exit 2 的 stderr)追加为 user 消息续跑;
+//!     `stop_hook_active=true` 告诉脚本"这次停止是被你拦回来后的"。Claude Code 宿主侧不设上限,metacodes
+//!     每 run 至多 `check_gate.MAX_STOP_HOOK_BLOCKS` 次(CheckGate.lean stop_blocks_bounded)。
 //!   - **PreCompact**(自动压缩前):stdin `{hook_event_name,trigger,active_messages,tokens}`——side-effect(存盘/快照)。
 //!   - **PostCompact**(压缩成功后):stdin `{hook_event_name,trigger,summary}`;stdout `additionalContext` 拼进
 //!     投影摘要 → 模型下轮读得到(条目 I 挂载点:重注入 active skill/plan/MCP)。
@@ -31,11 +35,12 @@
 //!
 //! 安全:hook 是用户配置的本地命令,运行时信任(同 settings)。
 //! **超时**:每个 hook stdout 读 poll 有界 HOOK_TIMEOUT_MS(5s),超时 killpg 整组 + 当非阻塞错误放行。
+//! 单条命令可写 `"timeout": <秒>`(对齐 Claude Code,上限 MAX_HOOK_TIMEOUT_S)覆盖 5s;事件总预算随之放宽为
+//! max(HOOK_TOTAL_BUDGET_MS, Σ 本事件各命令超时)——跑测试套件的 Stop hook 才跑得完。
 //!
 //! **诚实登记——未做**:①PreToolUse 不支持 `permissionDecision:"allow"` 覆盖放行(只能 block 或落后续链);
 //! ②PostToolUse block 不回喂模型 blocking error(只 advisory additionalContext);③`continue:false` 停整轮未建模;
-//! ④Stop hook 不支持 `decision:"block"` 阻止停止/续跑(仅 side-effect,不 gate 控制流);UserPromptSubmit/
-//!   SessionStart/SubagentStop/Notification 等事件仍未做(cc 有 ~30);⑤配置加载见 app.loadHooks。
+//! ④UserPromptSubmit/SessionStart/SubagentStop/Notification 等事件仍未做(cc 有 ~30);⑤配置加载见 app.loadHooks。
 
 const std = @import("std");
 const process = @import("platform").process;
@@ -51,6 +56,12 @@ const HOOK_TIMEOUT_MS: i64 = 5000;
 /// 最坏 5N 秒钉死 agent_loop 主线程。预算耗尽 → 剩余 hook 跳过 + warn(与单 hook 超时同款
 /// fail-open 语义;已产出的 block/updatedInput 保留)。
 const HOOK_TOTAL_BUDGET_MS: i64 = 15_000;
+
+/// 单条命令 `"timeout"`(秒)的上限:再长的 hook 应改成异步/后台,而不是钉住 agent loop。
+pub const MAX_HOOK_TIMEOUT_S: u32 = 600;
+
+/// Stop hook block 理由的字节上限(拼进模型可见的 feedback 消息)。
+const MAX_REASON_BYTES: usize = 4096;
 
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
@@ -68,10 +79,20 @@ const Budget = struct {
     fn start() Budget {
         return .{ .deadline_ms = util_time.nowMs() + HOOK_TOTAL_BUDGET_MS };
     }
-    /// 单 hook 可用超时 = min(单 hook 上限, 预算余量)。<=0 = 预算耗尽。
-    fn perHookTimeoutMs(self: *const Budget) i64 {
+    /// 显式 `timeout` 放宽总预算:max(默认总预算, Σ 将要运行的命令各自超时)。
+    /// `tool_name` = null 表示生命周期事件(全部 entry 都跑)。
+    fn startFor(entries: []const HookEntry, tool_name: ?[]const u8) Budget {
+        var total: i64 = 0;
+        for (entries) |entry| {
+            if (tool_name) |name| if (!matcherMatches(entry.matcher, name)) continue;
+            for (0..entry.commands.len) |i| total += entry.timeoutMs(i);
+        }
+        return .{ .deadline_ms = util_time.nowMs() + @max(HOOK_TOTAL_BUDGET_MS, total) };
+    }
+    /// 单 hook 可用超时 = min(该命令上限, 预算余量)。<=0 = 预算耗尽。
+    fn perHookTimeoutMs(self: *const Budget, command_timeout_ms: i64) i64 {
         const remaining = self.deadline_ms - util_time.nowMs();
-        return @min(HOOK_TIMEOUT_MS, remaining);
+        return @min(command_timeout_ms, remaining);
     }
 };
 
@@ -87,6 +108,14 @@ pub const HookEntry = struct {
     matcher: []const u8,
     /// 该 matcher 下的 command 列表
     commands: []const []const u8,
+    /// 与 `commands` 平行:每条命令的显式超时(ms),0 = 默认 HOOK_TIMEOUT_MS。可短于 commands
+    /// (缺的按默认),手写字面量可省略。
+    timeouts_ms: []const u32 = &.{},
+
+    pub fn timeoutMs(self: HookEntry, index: usize) i64 {
+        if (index < self.timeouts_ms.len and self.timeouts_ms[index] > 0) return self.timeouts_ms[index];
+        return HOOK_TIMEOUT_MS;
+    }
 };
 
 pub const HookSet = struct {
@@ -129,11 +158,7 @@ pub const HookSet = struct {
 };
 
 fn freeEntries(alloc: std.mem.Allocator, entries: []const HookEntry) void {
-    for (entries) |e| {
-        alloc.free(e.matcher);
-        for (e.commands) |c| alloc.free(c);
-        alloc.free(e.commands);
-    }
+    for (entries) |e| freeOneEntry(alloc, e);
     alloc.free(entries);
 }
 
@@ -246,17 +271,14 @@ fn freeOneEntry(alloc: std.mem.Allocator, e: HookEntry) void {
     alloc.free(e.matcher);
     for (e.commands) |c| alloc.free(c);
     alloc.free(e.commands);
+    alloc.free(e.timeouts_ms);
 }
 
 /// 解析一个 hook 事件数组([{matcher, hooks:[{command}]}])为 HookEntry 切片。null/非数组 → 空。
 fn parseEventArray(alloc: std.mem.Allocator, arr_v: ?std.json.Value) ![]const HookEntry {
     var entries: std.ArrayList(HookEntry) = .empty;
     errdefer {
-        for (entries.items) |e| {
-            alloc.free(e.matcher);
-            for (e.commands) |c| alloc.free(c);
-            alloc.free(e.commands);
-        }
+        for (entries.items) |e| freeOneEntry(alloc, e);
         entries.deinit(alloc);
     }
     const arr = arr_v orelse return entries.toOwnedSlice(alloc);
@@ -275,19 +297,46 @@ fn parseEventArray(alloc: std.mem.Allocator, arr_v: ?std.json.Value) ![]const Ho
             for (cmds.items) |c| alloc.free(c);
             cmds.deinit(alloc);
         }
+        var timeouts: std.ArrayList(u32) = .empty;
+        defer timeouts.deinit(alloc);
         if (item.object.get("hooks")) |hk| {
             if (hk == .array) {
                 for (hk.array.items) |h| {
                     if (h != .object) continue;
                     const cmd_v = h.object.get("command") orelse continue;
                     if (cmd_v != .string) continue;
-                    try cmds.append(alloc, try alloc.dupe(u8, cmd_v.string));
+                    try timeouts.append(alloc, parseTimeoutMs(h.object.get("timeout")));
+                    const cmd = try alloc.dupe(u8, cmd_v.string);
+                    cmds.append(alloc, cmd) catch |err| {
+                        alloc.free(cmd);
+                        return err;
+                    };
                 }
             }
         }
-        try entries.append(alloc, .{ .matcher = matcher, .commands = try cmds.toOwnedSlice(alloc) });
+        const owned_timeouts = try timeouts.toOwnedSlice(alloc);
+        errdefer alloc.free(owned_timeouts);
+        const owned_cmds = try cmds.toOwnedSlice(alloc);
+        entries.append(alloc, .{ .matcher = matcher, .commands = owned_cmds, .timeouts_ms = owned_timeouts }) catch |err| {
+            for (owned_cmds) |c| alloc.free(c);
+            alloc.free(owned_cmds);
+            return err;
+        };
     }
     return entries.toOwnedSlice(alloc);
+}
+
+/// `"timeout"`(秒,Claude Code 语义):正数 → ms,封顶 MAX_HOOK_TIMEOUT_S;缺省/非法 → 0(默认)。
+fn parseTimeoutMs(value: ?std.json.Value) u32 {
+    const v = value orelse return 0;
+    const seconds: f64 = switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => return 0,
+    };
+    if (!(seconds > 0)) return 0;
+    const capped = @min(seconds, @as(f64, @floatFromInt(MAX_HOOK_TIMEOUT_S)));
+    return @intFromFloat(capped * 1000.0);
 }
 
 /// matcher 是否匹配 tool_name。"" / "*" = 所有;"A|B" = A 或 B;否则精确。
@@ -318,7 +367,7 @@ pub fn runPreToolUseFull(
     args: []const u8,
     abort: ?*const AbortSignal,
 ) PreHookResult {
-    return runPreToolUseFullWithBudget(set, alloc, tool_name, args, abort, Budget.start());
+    return runPreToolUseFullWithBudget(set, alloc, tool_name, args, abort, Budget.startFor(set.pre_tool_use, tool_name));
 }
 
 /// 内部实现,budget 可注入(测试用过期 deadline 断言跳过语义,免真 sleep)。
@@ -345,13 +394,13 @@ fn runPreToolUseFullWithBudget(
 
     for (set.pre_tool_use) |entry| {
         if (!matcherMatches(entry.matcher, tool_name)) continue;
-        for (entry.commands) |cmd| {
-            const per_timeout = budget.perHookTimeoutMs();
+        for (entry.commands, 0..) |cmd, ci| {
+            const per_timeout = budget.perHookTimeoutMs(entry.timeoutMs(ci));
             if (per_timeout <= 0) {
                 log.warn("hook", "PreToolUse total budget exhausted, skipping remaining hooks (tool={s})", .{tool_name});
                 return out;
             }
-            var r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, abort);
+            var r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, abort, false);
             // 链式改写:新 updatedInput 覆盖旧的(释放旧)。
             if (r.updated_input) |ui| {
                 if (out.modified_input) |old| alloc.free(old);
@@ -406,18 +455,18 @@ pub fn runPostToolUse(
     const stdin_json = stdin_builder.toOwnedSlice() catch return null;
     defer alloc.free(stdin_json);
 
-    const budget = Budget.start();
+    const budget = Budget.startFor(set.post_tool_use, tool_name);
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(alloc);
     outer: for (set.post_tool_use) |entry| {
         if (!matcherMatches(entry.matcher, tool_name)) continue;
-        for (entry.commands) |cmd| {
-            const per_timeout = budget.perHookTimeoutMs();
+        for (entry.commands, 0..) |cmd, ci| {
+            const per_timeout = budget.perHookTimeoutMs(entry.timeoutMs(ci));
             if (per_timeout <= 0) {
                 log.warn("hook", "PostToolUse total budget exhausted, skipping remaining hooks (tool={s})", .{tool_name});
                 break :outer;
             }
-            const r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, abort);
+            const r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, abort, false);
             defer if (r.updated_input) |ui| alloc.free(ui); // PostToolUse 不消费 updatedInput
             if (r.additional_context) |ac| {
                 defer alloc.free(ac);
@@ -445,17 +494,17 @@ pub fn runLifecycleHooks(
     stdin_json: []const u8,
 ) ?[]u8 {
     if (entries.len == 0) return null;
-    const budget = Budget.start();
+    const budget = Budget.startFor(entries, null);
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(alloc);
     outer: for (entries) |entry| {
-        for (entry.commands) |cmd| {
-            const per_timeout = budget.perHookTimeoutMs();
+        for (entry.commands, 0..) |cmd, ci| {
+            const per_timeout = budget.perHookTimeoutMs(entry.timeoutMs(ci));
             if (per_timeout <= 0) {
                 log.warn("hook", "{s} total budget exhausted, skipping remaining hooks", .{event_name});
                 break :outer;
             }
-            const r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, null);
+            const r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, null, false);
             defer if (r.updated_input) |ui| alloc.free(ui); // 生命周期 hook 不消费 updatedInput
             if (r.additional_context) |ac| {
                 defer alloc.free(ac);
@@ -476,12 +525,72 @@ const OneHookResult = struct {
     decision: HookDecision = .proceed,
     updated_input: ?[]u8 = null,
     additional_context: ?[]u8 = null,
+    /// 仅 `capture_reason` 时填:block 的理由(stdout `reason` 字段,缺省取 exit 2 的 stderr)。owned。
+    reason: ?[]u8 = null,
 };
+
+/// Stop hook 的合成结果:任一 hook block → blocked;各 block 的理由按序换行拼接(owned)。
+pub const StopResult = struct {
+    blocked: bool = false,
+    reason: ?[]u8 = null,
+
+    pub fn deinit(self: *StopResult, alloc: std.mem.Allocator) void {
+        if (self.reason) |r| alloc.free(r);
+        self.* = .{};
+    }
+};
+
+/// Stop 事件 runner(唯一 gate 控制流的生命周期事件,语义对齐 Claude Code):所有 entry 的所有命令都跑
+/// (side-effect hook 照常生效),收集 block 决策与理由。是否据此续跑、续几次由调用方的预算决定
+/// (`check_gate.stopContinues`)。abort 可中断正在跑的 hook。
+pub fn runStopHooks(
+    entries: []const HookEntry,
+    alloc: std.mem.Allocator,
+    stdin_json: []const u8,
+    abort: ?*const AbortSignal,
+) StopResult {
+    var out = StopResult{};
+    if (entries.len == 0) return out;
+    const budget = Budget.startFor(entries, null);
+    var reasons: std.ArrayList(u8) = .empty;
+    defer reasons.deinit(alloc);
+    outer: for (entries) |entry| {
+        for (entry.commands, 0..) |cmd, ci| {
+            const per_timeout = budget.perHookTimeoutMs(entry.timeoutMs(ci));
+            if (per_timeout <= 0) {
+                log.warn("hook", "Stop total budget exhausted, skipping remaining hooks", .{});
+                break :outer;
+            }
+            const r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, abort, true);
+            defer if (r.updated_input) |ui| alloc.free(ui);
+            defer if (r.additional_context) |ac| alloc.free(ac);
+            defer if (r.reason) |reason| alloc.free(reason);
+            if (r.decision != .block) continue;
+            out.blocked = true;
+            log.info("hook", "Stop hook blocked the stop: {s}", .{cmd});
+            if (r.reason) |reason| {
+                if (reasons.items.len > 0) reasons.append(alloc, '\n') catch {};
+                const room = MAX_REASON_BYTES -| reasons.items.len;
+                reasons.appendSlice(alloc, utf8Prefix(reason, room)) catch {};
+            }
+        }
+    }
+    if (reasons.items.len > 0) out.reason = reasons.toOwnedSlice(alloc) catch null;
+    return out;
+}
+
+/// `text` 的前 `cap` 字节,截在 UTF-8 码点边界上。
+fn utf8Prefix(text: []const u8, cap: usize) []const u8 {
+    if (text.len <= cap) return text;
+    var end = cap;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
+}
 
 /// 跑单个 hook:`/bin/sh -c <cmd>`,把 stdin_json 写进它 stdin,读 exit code + stdout。
 /// exit 2 → block;exit 0 → 看 stdout decision;其它 → proceed(非阻塞错误)。
 /// stdout JSON 可含 updatedInput(改写工具输入)/ additionalContext(注入模型的补充上下文)。
-fn runOneHookFull(alloc: std.mem.Allocator, cmd: []const u8, stdin_json: []const u8, timeout_ms: i64, abort: ?*const AbortSignal) OneHookResult {
+fn runOneHookFull(alloc: std.mem.Allocator, cmd: []const u8, stdin_json: []const u8, timeout_ms: i64, abort: ?*const AbortSignal, capture_reason: bool) OneHookResult {
     // 可移植 shell(与 Bash 工具同款 core/shell 检测:POSIX sh -c / Windows PowerShell/cmd)。
     // 硬编码 /bin/sh 在 Windows 无此文件 → 所有 hook 静默 fail-open(实测 openai P0.2 红)。
     const sys_shell = shell_mod.detectDefault();
@@ -495,7 +604,8 @@ fn runOneHookFull(alloc: std.mem.Allocator, cmd: []const u8, stdin_json: []const
     // 返部分。spawn/pipe/fork 失败 → fail-open(proceed)但记 warn(坏 hook 与"没 hook"须可区分)。
     const r = process.capture(argv[0..], alloc, .{
         .stdin_data = stdin_json,
-        .want_stderr = false,
+        // Stop 的 exit-2 理由走 stderr(Claude Code 语义);其它事件不需要,保持丢弃。
+        .want_stderr = capture_reason,
         .inherit_env = true,
         .timeout_ms = @intCast(timeout_ms), // 事件级预算裁剪(≤ HOOK_TIMEOUT_MS)
         .max_bytes = 4096,
@@ -539,6 +649,15 @@ fn runOneHookFull(alloc: std.mem.Allocator, cmd: []const u8, stdin_json: []const
     // additionalContext:注入模型的补充文本(字符串值,反转义)。
     if (util_json.extractStringField(stdout, "additionalContext")) |raw| {
         result.additional_context = util_json.unescapeString(raw, alloc) catch null;
+    }
+    if (capture_reason and result.decision == .block) {
+        if (util_json.extractStringField(stdout, "reason")) |raw| {
+            result.reason = util_json.unescapeString(raw, alloc) catch null;
+        }
+        if (result.reason == null and exit_code == 2) {
+            const trimmed = std.mem.trim(u8, r.stderr, " \t\r\n");
+            if (trimmed.len > 0) result.reason = alloc.dupe(u8, trimmed) catch null;
+        }
     }
     return result;
 }
@@ -712,10 +831,10 @@ test "runPreToolUseFull: updatedInput 改写工具输入" {
 
 test "Budget: perHookTimeoutMs = min(单hook上限, 余量);过期 deadline → <=0" {
     const fresh = Budget.start();
-    const t = fresh.perHookTimeoutMs();
+    const t = fresh.perHookTimeoutMs(HOOK_TIMEOUT_MS);
     try testing.expect(t > 0 and t <= HOOK_TIMEOUT_MS);
     const expired = Budget{ .deadline_ms = 0 }; // 单调钟远过去
-    try testing.expect(expired.perHookTimeoutMs() <= 0);
+    try testing.expect(expired.perHookTimeoutMs(HOOK_TIMEOUT_MS) <= 0);
 }
 
 test "runPreToolUseFull: 总预算耗尽 → 跳过剩余 hook(fail-open,不 spawn)" {
@@ -840,4 +959,75 @@ test "parseAndMerge: 跨层合并 5 类事件不丢生命周期 hook(loadHooks �
     try testing.expectEqualStrings("mem.sh", set.stop[0].commands[0]);
     try testing.expectEqualStrings("snap.sh", set.pre_compact[0].commands[0]);
     try testing.expectEqualStrings("reinject.sh", set.post_compact[0].commands[0]);
+}
+
+test "parse: per-command timeout (seconds, capped) widens the event budget" {
+    const src =
+        \\{"hooks":{"Stop":[{"hooks":[
+        \\  {"type":"command","command":"./slow-check.sh","timeout":120},
+        \\  {"type":"command","command":"./mem.sh"},
+        \\  {"type":"command","command":"./huge.sh","timeout":99999},
+        \\  {"type":"command","command":"./bad.sh","timeout":"soon"}
+        \\]}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, src, .{});
+    defer parsed.deinit();
+    var set = try parse(testing.allocator, parsed.value);
+    defer set.deinit();
+    const entry = set.stop[0];
+    try testing.expectEqual(@as(usize, 4), entry.commands.len);
+    try testing.expectEqual(@as(i64, 120_000), entry.timeoutMs(0));
+    try testing.expectEqual(HOOK_TIMEOUT_MS, entry.timeoutMs(1));
+    try testing.expectEqual(@as(i64, MAX_HOOK_TIMEOUT_S) * 1000, entry.timeoutMs(2));
+    try testing.expectEqual(HOOK_TIMEOUT_MS, entry.timeoutMs(3));
+    // Σ = 120s + 5s + 600s + 5s > the 15s default event budget.
+    const budget = Budget.startFor(set.stop, null);
+    try testing.expect(budget.deadline_ms - util_time.nowMs() > 700_000);
+    // A literal entry without timeouts keeps the 15s default budget.
+    const cmds = [_][]const u8{"true"};
+    const plain = [_]HookEntry{.{ .matcher = "*", .commands = &cmds }};
+    try testing.expect(Budget.startFor(&plain, null).deadline_ms - util_time.nowMs() <= HOOK_TOTAL_BUDGET_MS);
+}
+
+test "runStopHooks: JSON decision block carries its reason" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX shell hook
+    const alloc = testing.allocator;
+    const cmds = [_][]const u8{"cat >/dev/null; printf '{\"decision\":\"block\",\"reason\":\"2 tests failing\\\\nfix them\"}'"};
+    const entries = [_]HookEntry{.{ .matcher = "*", .commands = &cmds }};
+    var r = runStopHooks(&entries, alloc, "{\"hook_event_name\":\"Stop\"}", null);
+    defer r.deinit(alloc);
+    try testing.expect(r.blocked);
+    try testing.expectEqualStrings("2 tests failing\nfix them", r.reason.?);
+}
+
+test "runStopHooks: exit 2 uses stderr as the reason; exit 0 does not block" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX shell hook
+    const alloc = testing.allocator;
+    const blocking = [_][]const u8{"cat >/dev/null; echo 'lint failed' >&2; exit 2"};
+    const entries = [_]HookEntry{.{ .matcher = "*", .commands = &blocking }};
+    var r = runStopHooks(&entries, alloc, "{}", null);
+    defer r.deinit(alloc);
+    try testing.expect(r.blocked);
+    try testing.expectEqualStrings("lint failed", r.reason.?);
+
+    const quiet = [_][]const u8{"cat >/dev/null; echo 'side effect only'; exit 0"};
+    const quiet_entries = [_]HookEntry{.{ .matcher = "*", .commands = &quiet }};
+    var q = runStopHooks(&quiet_entries, alloc, "{}", null);
+    defer q.deinit(alloc);
+    try testing.expect(!q.blocked);
+    try testing.expect(q.reason == null);
+}
+
+test "runStopHooks: every hook runs; a block without a reason has none" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX shell hook
+    const alloc = testing.allocator;
+    const cmds = [_][]const u8{
+        "cat >/dev/null; exit 2",
+        "cat >/dev/null; printf '{\"decision\":\"approve\",\"reason\":\"do not block\"}'",
+    };
+    const entries = [_]HookEntry{.{ .matcher = "*", .commands = &cmds }};
+    var r = runStopHooks(&entries, alloc, "{}", null);
+    defer r.deinit(alloc);
+    try testing.expect(r.blocked);
+    try testing.expect(r.reason == null);
 }
