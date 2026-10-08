@@ -250,7 +250,16 @@ fn installCliProcessError(
 /// session 内的 binding 指针指向同一个 client；client 必须比 session 活得久。
 pub const McpSessionEntry = @import("core/mcp_session.zig").McpSessionEntry;
 
-pub const PendingOverlay = enum { none, model_picker, transcript };
+pub const PendingOverlay = enum {
+    none,
+    /// `/model` asked for the picker: open it fresh.
+    model_picker,
+    /// A reply ended while the picker was on screen (#220). Each phase draws
+    /// its own region, so the next one shows the picker again as it was left:
+    /// same stage, filter and cursor, sign-in still running.
+    model_picker_kept,
+    transcript,
+};
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -323,6 +332,13 @@ pub const App = struct {
     /// session_id 用于把本会话的 emit/UiRequest 路由到对应 UI 视图。init 时 gen() 一个。
     /// **TODO**:本 id 与 transcript 目录名 id 是两个独立 gen(),将来应统一(App 生成、transcript 复用)。
     session_id: @import("core/session_id.zig").SessionId = @import("core/session_id.zig").SessionId.single,
+    /// Sessions this foreground handed to the background with Ctrl+B, oldest
+    /// first. A background job keeps its origin session for routing, so the
+    /// foreground that rotated away from it would otherwise lose sight of it
+    /// (#219); the agent tree and switcher show `agentJobScope()`, which adds
+    /// these. `/resume` clears the list: the resumed conversation is not their
+    /// successor. Owned by `allocator`.
+    handed_off_sessions: std.ArrayList(@import("core/session_id.zig").SessionId) = .empty,
 
     // ── ProcessContainer 区(进程级,逻辑上只读)──────────────────────────────
     // config / api_key / api_client / tool_defs / enabled_tool_names / skills / agents /
@@ -1025,6 +1041,7 @@ pub const App = struct {
         // Swarm:abort+join 全 teammate → free（必须早于共享资源释放，同 agent_jobs 理由）。
         app.swarm.deinit();
         if (app.transcript_writer) |*w| w.deinit();
+        app.handed_off_sessions.deinit(app.allocator);
         app.api_client.deinit();
         if (app.oauth_token_for_catalog) |tok| {
             @memset(tok, 0);
@@ -1904,6 +1921,23 @@ pub const App = struct {
         app.goal_state.clearInMemory();
     }
 
+    /// Ctrl+B, before the background job is spawned: make room to record the
+    /// hand-off, so `completeHandOff` cannot fail once a job owns the
+    /// conversation (#219).
+    pub fn prepareHandOff(app: *App) !void {
+        try app.handed_off_sessions.ensureUnusedCapacity(app.allocator, 1);
+    }
+
+    /// Ctrl+B, after a background job took the conversation in the current
+    /// session: start a fresh foreground session. The job keeps its session
+    /// (invariant 8 of doc/UTF8_AND_SESSION_BOUNDARY_DESIGN.md); the new
+    /// foreground keeps that session in `agentJobScope()`, so the agent tree
+    /// and switcher still show it and can stop it. Requires `prepareHandOff`.
+    pub fn completeHandOff(app: *App) void {
+        app.handed_off_sessions.appendAssumeCapacity(app.session_id);
+        app.rotateSessionIdentity();
+    }
+
     /// Rebind a process-mode teammate to its explicitly inherited parent
     /// session. App.init creates a writer before command-line teammate mode is
     /// known, so close that writer and reopen the exact parent directory before
@@ -2672,6 +2706,13 @@ pub const App = struct {
     pub fn agentJobsPtr(app: *const App) ?*@import("core/agent_job_registry.zig").AgentJobRegistry {
         if (app.agent_jobs) |*aj| return @constCast(aj);
         return null;
+    }
+
+    /// The agent jobs this foreground shows and lets the user stop: its own
+    /// plus those of the sessions it handed off with Ctrl+B. Borrows
+    /// `handed_off_sessions`; use it within one registry call.
+    pub fn agentJobScope(app: *const App) @import("core/agent_job_registry.zig").SessionScope {
+        return .{ .current = app.session_id, .handed_off = app.handed_off_sessions.items };
     }
 
     /// cwd 绝对路径(sandbox profile 工作目录),空串 = 未知(用 process cwd)。

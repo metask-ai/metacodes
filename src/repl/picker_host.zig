@@ -36,6 +36,14 @@ pub fn open(app: *app_mod.App, ui: *ui_state.UiState) void {
     ui.picker_open = true;
 }
 
+/// Show a picker the previous phase left open (#220). Unlike `open` it keeps
+/// the snapshot and the half-finished browse; only the page height, which
+/// belongs to the new region, is recomputed.
+pub fn keep(app: *app_mod.App, ui: *ui_state.UiState) void {
+    app.model_picker.page_rows = pageRowsFor(ui.rows);
+    ui.picker_open = true;
+}
+
 pub fn close(app: *app_mod.App, ui: *ui_state.UiState) void {
     // A picker that closes mid sign-in must not leave a thread waiting on
     // a socket.

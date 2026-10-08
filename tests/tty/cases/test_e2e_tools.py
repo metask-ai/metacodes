@@ -12,12 +12,11 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from e2e_helpers import SKIP, assert_tool_e2e, read_tool_uses, tool_called, run_live, keep_home as _keep_home  # noqa: E402
+from e2e_helpers import assert_tool_e2e, read_tool_uses, tool_called, run_live, keep_home as _keep_home, require_model  # noqa: E402
 
 
 def test_e2e_write(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 自然提示词。写文件意图:Write 首选;模型偶尔用 Bash(echo>)也算意图满足。
     assert_tool_e2e(
         bin_path,
@@ -31,8 +30,7 @@ def test_e2e_write(bin_path):
 
 
 def test_e2e_read(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 先放一个文件,让模型有东西可读。
     with open("/tmp/cc_e2e_read_src.txt", "w") as f:
         f.write("READ_ME_E2E_MARKER\n")
@@ -48,8 +46,7 @@ def test_e2e_read(bin_path):
 
 
 def test_e2e_bash(bin_path):
-    if SKIP:
-        return
+    require_model()
     # Bash 是无可替代工具(运行命令),保持首选断言 + schema。
     assert_tool_e2e(
         bin_path,
@@ -63,8 +60,7 @@ def test_e2e_bash(bin_path):
 
 
 def test_e2e_edit(bin_path):
-    if SKIP:
-        return
+    require_model()
     with open("/tmp/cc_e2e_edit.txt", "w") as f:
         f.write("alpha_before beta\n")
     # 自然提示词。Edit 是两步(Read→Edit must-read-first),给足等待。
@@ -81,8 +77,7 @@ def test_e2e_edit(bin_path):
 
 
 def test_e2e_grep(bin_path):
-    if SKIP:
-        return
+    require_model()
     with open("/tmp/cc_e2e_grep.txt", "w") as f:
         f.write("noise\nGREP_E2E_NEEDLE\nmore\n")
     # 自然提示词。MiniMax 在满工具集下选搜索工具高度不确定(实测同 prompt 多次在
@@ -100,8 +95,7 @@ def test_e2e_grep(bin_path):
 
 
 def test_e2e_glob(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 同 Grep:接受 Glob 或 Bash(ls/find)完成查找。
     assert_tool_e2e(
         bin_path,
@@ -115,8 +109,7 @@ def test_e2e_glob(bin_path):
 
 
 def test_e2e_taskcreate(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 当事工具(本次 bug 主角):验证模型能拿到 subject+description schema 并传齐
     # (旧 bug:properties 空 → 模型漏 description → MissingRequiredField)。
     # 保持严格断言 TaskCreate + 两个 required 字段——这正是真模型 e2e 唯一能"无中生有"
@@ -144,8 +137,7 @@ def test_e2e_task_update_numeric_id(bin_path):
     **断言走 transcript 权威层**(对齐本仓"断言权威工件非屏幕态"):看 TaskUpdate 的 tool_result——
     任一条含 MissingTaskId = regression;至少一条 {"ok":true} = update 路径真通。
     """
-    if SKIP:
-        return
+    require_model()
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from e2e_helpers import RETRIES, fresh_home, read_tool_uses, read_tool_results_with_error  # noqa: E402
@@ -205,8 +197,7 @@ def test_e2e_task_update_numeric_id(bin_path):
 
 
 def test_e2e_task_subagent(bin_path):
-    if SKIP:
-        return
+    require_model()
     # 强断言 subagent **出口**(不只是主 agent 发起了 Task)。这是之前漏掉熔断 bug 的根因:
     # 旧断言只验"主 agent 调了 Task",subagent 内部第一轮熔断也照样绿;且 accept_tools 的
     # Bash/Glob 兜底把"Task 子系统坏了"直接吞掉。现在:让主 agent 起后台 subagent + 轮询到
@@ -273,8 +264,7 @@ def test_e2e_agent_tree_onscreen(bin_path):
     扫所有帧:任一帧出现树标题即通过(轮询窗口短,树只在 running 期可见)。
     真模型不确定 → 重试 RETRIES 次。term 开大(rows=40)给面板留空间。
     """
-    if SKIP:
-        return
+    require_model()
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from e2e_helpers import RETRIES, fresh_home  # noqa: E402

@@ -83,6 +83,36 @@ status, compatibility boundaries, and entry points are defined by
   `semver.py` tainted every result naming `tests/test_semver.py`. Paths now
   match by component (equal, or one ends with `/` plus the other), and
   untracked directories, both ends of a rename and quoted paths count.
+- After Ctrl+B the agent tree and the switcher list the main session that
+  moved to the background again, and the switcher can stop it (#219). The job
+  keeps the session it left, as the session boundary requires, and since
+  0.2.0 the tree showed only jobs of the current session, which Ctrl+B had
+  just replaced; the prompt promised a tree that could not show the job. The
+  new foreground now also shows the sessions it handed off; `/resume` drops
+  them, because the resumed conversation is not their successor. Model-facing
+  routing (TaskOutput, TaskStop) still sees one session only.
+- A model picker opened while a reply streams stays open when the reply ends,
+  with its filter, stage, cursor and any sign-in in progress (#220). Each
+  phase draws its own region, and the open state went away with the
+  generation one. A queued message that starts the next reply keeps it open
+  too.
+- On Windows, a refused, unreachable or timed-out connection to the model
+  endpoint is retried like on the other platforms, and the error says what
+  happened (#221). Zig 0.16.0 reports those connect failures on Windows as
+  `error.Unexpected`, which ended the request after one attempt as
+  `RequestFailed`; request setup now names it `ConnectFailed`. Debug builds no
+  longer print std's stack trace for unmapped system errors, which Esc during
+  a reply drew over the TUI.
+- The offline TTY suite runs in CI on Linux and Windows (#222). It ran
+  nowhere, so twelve agent-tree cases had failed since 0.2.0 unnoticed: the
+  `/agent-test*` commands created agents that belonged to no session (#218).
+  The two TTY backends now end a case the same way, a real-model case skipped
+  offline reports a skip instead of a pass, cases delete the directories they
+  create, and a binary that does not exit after its terminal closes fails the
+  case instead of hanging the run. The replay server those cases use read
+  directory entries with the macOS `dirent` layout and found no cassette on
+  Linux; it now lists them portably. The TinyKG service end-to-end tests run on
+  Windows except the one that needs a POSIX symlink.
 
 ## 0.3.1 — 2026-10-07
 

@@ -298,7 +298,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/agent-test") or std.mem.startsWith(u8, trimmed, "/agent-test:")) {
             const desc = if (trimmed.len > 12) trimmed[12..] else "inspect repo";
             if (app.agent_jobs) |*aj| {
-                aj.pushTestEntryFull("Explore", desc, 1, 17300, "Read", "{\"file_path\":\"/Users/x/mod0.py\"}", .running) catch {
+                aj.pushTestEntryFull(app.session_id, "Explore", desc, 1, 17300, "Read", "{\"file_path\":\"/Users/x/mod0.py\"}", .running) catch {
                     std.debug.print("[agent-test] push failed\n", .{});
                 };
             }
@@ -308,9 +308,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 三态 + 标题分组 + switcher)。① mid-tool(有 tokens) ② Initializing(0 tool) ③ Done。
         if (std.mem.eql(u8, trimmed, "/agent-test-multi")) {
             if (app.agent_jobs) |*aj| {
-                aj.pushTestEntryFull("Explore", "Summarize mod0.py", 1, 17300, "Read", "{\"file_path\":\"/Users/x/mod0.py\"}", .running) catch {};
-                aj.pushTestEntryFull("Explore", "Summarize mod1.py", 0, 0, "", "", .running) catch {};
-                aj.pushTestEntryFull("Explore", "Summarize mod2.py", 3, 17700, "", "", .done) catch {};
+                aj.pushTestEntryFull(app.session_id, "Explore", "Summarize mod0.py", 1, 17300, "Read", "{\"file_path\":\"/Users/x/mod0.py\"}", .running) catch {};
+                aj.pushTestEntryFull(app.session_id, "Explore", "Summarize mod1.py", 0, 0, "", "", .running) catch {};
+                aj.pushTestEntryFull(app.session_id, "Explore", "Summarize mod2.py", 3, 17700, "", "", .done) catch {};
                 // 给首个 agent 填假 output_buf,使 viewing 它时能看到对话视口(离线 tty 测试用)。
                 if (aj.entries.items.len > 0) {
                     const e0 = aj.entries.items[0];
@@ -342,7 +342,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                     if (i % 3 == 0 and aj.entries.items.len < 4) {
                         var nbuf: [32]u8 = undefined;
                         const desc = std.fmt.bufPrint(&nbuf, "subagent task {d}", .{aj.entries.items.len}) catch "task";
-                        aj.pushTestEntryFull("Explore", desc, @intCast(i), @intCast(i * 100), "Bash", "{\"command\":\"x\"}", .running) catch {};
+                        aj.pushTestEntryFull(app.session_id, "Explore", desc, @intCast(i), @intCast(i * 100), "Bash", "{\"command\":\"x\"}", .running) catch {};
                     }
                     creg.tickSpinner(app); // 重画固定区(spinner + 当前高度的进度树)
                     // 偶尔 emit 一行进 scrollback(模拟主 agent 产文本/工具卡)。
@@ -650,8 +650,21 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1))
         else
             null;
-        defer if (gen_region) |*r| r.deinit();
-        if (gen_region) |*r| r.enterGenerating(app, &msg_queue);
+        defer if (gen_region) |*r| {
+            // #220: a picker opened during the reply stays open after it.
+            // Every exit path passes here after the watcher has stopped.
+            if (r.ui.picker_open) app.pending_overlay = .model_picker_kept;
+            r.deinit();
+        };
+        if (gen_region) |*r| {
+            r.enterGenerating(app, &msg_queue);
+            // A queued message starts this reply without an input phase in
+            // between, so the picker the last reply left open comes here.
+            if (app.pending_overlay == .model_picker_kept) {
+                app.pending_overlay = .none;
+                picker_host.keep(app, &r.ui);
+            }
+        }
         if (tty) terminal_title.setFromApp(app, .working); // tab:生成中
 
         var region_writer: ?render_region_mod.RegionWriter =
@@ -964,6 +977,11 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
     const reg = if (app.agent_jobs) |*aj| aj else return error.NoBackgroundRegistry;
     if (app.conversation.len() == 0) return; // 空对话无意义,静默忽略
 
+    // Before the job exists: once it is spawned, failing to record the
+    // hand-off would leave a running conversation the new foreground cannot
+    // see or stop (#219).
+    try app.prepareHandOff();
+
     // ① 深拷贝到 registry allocator(后台线程独立持有,与前台 0 共享)。
     const copy = try app.conversation.cloneInto(reg.allocator);
     // 注:spawnBackground 是 consume-on-call —— 成败都接管 copy 所有权,故此处**不**加 errdefer,
@@ -1005,7 +1023,9 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
     app.conversation = Conversation.init(app.allocator);
     // R3-1:前台同步换会话身份 + transcript writer——旧 writer 复用会让下一次 flush
     // 把旧历史的 transcript 毁掉重写成新会话(见 App.rotateSessionIdentity doc)。
-    app.rotateSessionIdentity();
+    // The job stays in the old session; the new foreground keeps it in its
+    // agent scope (App.completeHandOff, #219).
+    app.completeHandOff();
     std.debug.print("\x1b[36m⤳ 已转后台续跑(agent tree 可见进度);前台开新会话\x1b[0m\n", .{});
 }
 
@@ -1205,6 +1225,10 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
         .model_picker => {
             app.pending_overlay = .none;
             picker_host.open(app, &region.ui);
+        },
+        .model_picker_kept => {
+            app.pending_overlay = .none;
+            picker_host.keep(app, &region.ui);
         },
         .transcript => {
             app.pending_overlay = .none;
@@ -3992,13 +4016,16 @@ fn stopSelectedAgent(app: *app_mod.App, region: *render_region_mod.RenderRegion)
     const sel = region.ui.agents.sel;
     if (sel == 0) return;
     const allocator = app.allocator;
-    const snaps = reg.snapshotJobsForSession(allocator, app.session_id) catch return;
+    // The switcher lists `agentJobScope()`, so stopping by its index must use
+    // the same scope: a main session handed off with Ctrl+B is stoppable here.
+    const scope = app.agentJobScope();
+    const snaps = reg.snapshotJobsInScope(allocator, scope) catch return;
     defer agent_job_registry_mod.AgentJobRegistry.freeSnapshots(allocator, snaps);
     if (sel - 1 >= snaps.len) return;
     if (snaps[sel - 1].foreground) {
-        reg.abortForSession(snaps[sel - 1].id, app.session_id) catch {};
+        reg.abortInScope(snaps[sel - 1].id, scope) catch {};
     } else {
-        reg.killForSession(snaps[sel - 1].id, app.session_id) catch {};
+        reg.killInScope(snaps[sel - 1].id, scope) catch {};
     }
     std.debug.print("\r\x1b[2K\x1b[33m[stopped agent {s}]\x1b[0m\n", .{snaps[sel - 1].desc});
 }
@@ -4030,7 +4057,7 @@ fn printTaskList(app: *app_mod.App) void {
 
     // 后台 subagent jobs(独立于 todo 任务):running/done/failed/killed。
     if (app.agent_jobs) |*reg| {
-        const snaps = reg.snapshotJobsForSession(app.allocator, app.session_id) catch return;
+        const snaps = reg.snapshotJobsInScope(app.allocator, app.agentJobScope()) catch return;
         defer @import("../core/agent_job_registry.zig").AgentJobRegistry.freeSnapshots(app.allocator, snaps);
         if (snaps.len == 0) return;
         std.debug.print("\x1b[1mSubagents ({d}):\x1b[0m\n", .{snaps.len});
@@ -4264,6 +4291,9 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     app.session_id = target_sid;
     app.permission_ctx.session = target_sid; // 权限对话框路由到本会话视图(M5/M6)
     app.swarm.session = target_sid;
+    // The resumed conversation did not hand anything to the background; the
+    // jobs earlier foregrounds handed off keep their own sessions (#219).
+    app.handed_off_sessions.clearRetainingCapacity();
 
     // issue #16:恢复本 session 自己的路由选择。它比 global 窄,所以赢——resume
     // 回来的会话应该继续用它当时那条路由,而不是这期间变成 global 的那条。
@@ -4429,6 +4459,12 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     w.flush(&conv);
     w.deinit();
 
+    // #219: a Ctrl+B hand-off before the resume. The resumed conversation is
+    // not the successor of the handed-off one, so it must not show its job.
+    try app.prepareHandOff();
+    app.completeHandOff();
+    try std.testing.expect(app.agentJobScope().contains(old_id));
+
     // resume by id → 修复前 app.session_id 仍是 old_id(漂移);修复后切到 sid。
     // 传 app.allocator(生产同款:staged conversation 用 app.allocator,loadTranscript 须同源,否则
     // conversation 消息块 alloc/free 跨 allocator 泄漏)。
@@ -4437,6 +4473,7 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     try std.testing.expectEqualStrings(sid.asSlice(), app.session_id.asSlice()); // 切到 resumed
     try std.testing.expectEqualStrings(sid.asSlice(), app.permission_ctx.session.asSlice()); // 路由键同步
     try std.testing.expectEqualStrings(app.activeModel(), app.transcript_writer.?.model);
+    try std.testing.expect(!app.agentJobScope().contains(old_id));
 }
 
 test "/goal accounting delta charges only input plus output usage" {

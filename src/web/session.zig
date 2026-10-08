@@ -553,7 +553,7 @@ test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
     // agent_jobs:直接赋值(勿经 copied local——registry 含 mutex/ArrayList,值拷会双释)。
     app.agent_jobs = try RegT.init(a, "k", null, "m", .anthropic);
     defer app.agent_jobs.?.deinit();
-    try app.agent_jobs.?.pushTestEntryFull("Explore", "scan files", 3, 100, "Grep", "{}", .running);
+    try app.agent_jobs.?.pushTestEntryFull(app.session_id, "Explore", "scan files", 3, 100, "Grep", "{}", .running);
     // tasks 必须真 init:snapshot() 走 snapshotTasks 要拿 mutex。undefined 的 mutex 在
     // POSIX 侥幸不崩(pthread 返回错误码被吞),Windows SRW 顺垃圾指针走 → 段错误。
     app.tasks = @import("../core/task_store.zig").TaskStore.init(a);

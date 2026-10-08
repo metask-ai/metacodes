@@ -2965,7 +2965,8 @@ pub fn build(b: *std.Build) void {
     // PTY(pty.fork)在 zig build-runner 的进程/stdio 监管下时序不稳(直接跑 12/12 全过,
     // 经 build SystemCommand 跑会大面积假失败)。跑法:
     //   zig build && python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug
-    // 这与 e2e(走 shell 而非 zig build)同理。
+    // 这与 e2e(走 shell 而非 zig build)同理。CI 的 `TTY (Linux)` job 就是这样跑的
+    // (ci.yml);Windows 走下面的 windows:tty。
 
     // test:e2e-tty —— tty 真模型工具 e2e(cases/test_e2e_*.py)。与渲染测试不同:这些用例
     // 自建 PTY、断言靠落盘的 transcript.jsonl(非 build-runner 捕获的屏幕字节),所以经

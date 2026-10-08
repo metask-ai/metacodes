@@ -20,8 +20,8 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run  # noqa: E402
 from e2e_helpers import (  # noqa: E402
-    SKIP, SkipTest, RETRIES, fresh_home, run_live,
-    read_tool_uses, tool_called,
+    SkipTest, RETRIES, fresh_home, run_live,
+    read_tool_uses, tool_called, require_model,
 )
 
 
@@ -59,8 +59,7 @@ def test_e2e_claudemd_reaches_model(bin_path):
     硬断言(真 regression):模型回复含密令 token。
     漂移(SkipTest):模型没答出(弱模型不遵守指令/答非所问)——非 bug,跳过。
     """
-    if SKIP:
-        return
+    require_model()
     secret = "BANANA-7723-XYZQ"
     claudemd = (
         "# Project rules\n\n"
@@ -119,8 +118,7 @@ def test_e2e_claudemd_disabled_env(bin_path):
     硬断言(真 regression):disabled 的 body_bytes < enabled(注入确实被 env 移除)。
     用死端口 base_url(连接立即 refused)——只需请求**发出前**拼好的 body,不需真模型。
     """
-    if SKIP:
-        return
+    require_model()
     # CLAUDE.md 放一段够大的内容,让注入与否的 body 差异明显(超过测量噪声)。
     big_rule = "# Project rules\n\n" + ("Follow this important guideline carefully. " * 80)
     proj = _make_project_with_claudemd(big_rule)
@@ -178,8 +176,7 @@ def test_e2e_memdir_write_carveout(bin_path):
     漂移(SkipTest):模型没调 Write 写记忆(不理解/不配合)——非 bug。
     用 --permission default(非 bypass):证明豁免在**默认会拦写**的模式下仍放行 memdir。
     """
-    if SKIP:
-        return
+    require_model()
     # 提示词明确给出 memdir 路径占位,让模型知道往哪写;但不给绝对路径(它该用系统提示里的)。
     prompt = ("Remember this fact in your memory directory: the project mascot is a "
               "purple otter named Zibble. Create a memory file for it.")
@@ -221,8 +218,7 @@ def test_e2e_init_writes_claudemd(bin_path):
     漂移(SkipTest):模型只探索没写 / 没调 Write(弱模型常见)——非 bug。
     在临时空项目里跑(避免污染真实 repo 的 CLAUDE.md)。
     """
-    if SKIP:
-        return
+    require_model()
     homes = []
     projs = []
     last = None

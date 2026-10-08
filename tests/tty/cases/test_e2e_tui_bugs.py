@@ -17,8 +17,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from e2e_helpers import (  # noqa: E402
-    SKIP, RETRIES, SkipTest, fresh_home, run_e2e_tool, run_live, read_tool_uses,
-    tool_called, any_tool_called,
+    RETRIES, SkipTest, fresh_home, run_e2e_tool, run_live, read_tool_uses,
+    tool_called, any_tool_called, require_model,
 )
 from tty_driver import run  # noqa: E402
 from asserts import split_frames, TTYAssert  # noqa: E402
@@ -67,8 +67,7 @@ def test_e2e_bug3_bash_nonzero_exit_icon(bin_path):
     cc-zig renderLiveDone 同此(⏺ + body)。✗ 降级仅在 Ctrl+O transcript 详细视图(headerIcon),
     不在正常 scrollback。故本测试改为验证:Bash 调用了 + committed 卡是中性 ⏺ 标题(不崩、不误显 ✗)。
     """
-    if SKIP:
-        return
+    require_model()
     ever_called = False
     for _ in range(RETRIES):
         raw, home, uses = run_e2e_tool(
@@ -105,8 +104,7 @@ def test_e2e_bug4_auto_background_neutral_icon(bin_path):
       ② 渲染判据 = scrollback prose(整条字节流的 committed 部分,卡滚走仍在)含 ▶ 转后台提示行,
          且 prose 不裸吐 auto_backgrounded JSON。
     """
-    if SKIP:
-        return
+    require_model()
     from e2e_helpers import read_tool_results  # 权威层:transcript tool_result content
     triggered = False  # auto-background 真触发(transcript 出现 auto_backgrounded 结果)
     for _ in range(RETRIES):
@@ -155,8 +153,7 @@ def test_e2e_bug6_subagent_tool_count_accumulates(bin_path):
     断言走 frame(agent 树是底部 in-frame 面板,非 scrollback):某 running 帧
     (含 "Running ... subagent")出现 '· N tool'(N>=1)。
     """
-    if SKIP:
-        return
+    require_model()
     pat = re.compile(r"·\s*([1-9]\d*)\s*tool")
     tree_seen = False  # subagent 树是否真出现过(被测路径触发)
     for _ in range(RETRIES):
@@ -186,8 +183,7 @@ def test_e2e_bug8_task_start_card_visible(bin_path):
     → 连起始卡(renderStart)都被跳过,用户对 Task 启动毫无感知。
     修复:showStartCard 分离起始卡/结果 — Task/Agent 起始卡可见,结果仍 hidden。
     """
-    if SKIP:
-        return
+    require_model()
     ever_called = False  # Task/Agent 是否真被调用
     for _ in range(RETRIES):
         raw, home, uses = run_e2e_tool(

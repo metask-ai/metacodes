@@ -8,6 +8,8 @@
 //!   ⑤ 重试耗尽:永远断 → max_retries 次后返 TransientNetwork,不无限循环
 //!   ⑥ Retry-After 响应头覆盖本地退避
 //!   ⑦ TLS request-setup 具体错误穿透分类并被真实 retry wrapper 重试
+//!   ⑧ #221:被拒的连接被重试且现场写明原因;Windows 上 Zig 0.16 报的 error.Unexpected
+//!     按连接失败处理(ConnectFailed),不再一次就放弃成 RequestFailed
 //!
 //! 测试策略:MockServer.startFlaky(断连模拟) + Client.initWithBaseUrl + 短退避(base_ms=1)。
 
@@ -323,6 +325,82 @@ test "L2 #7: persistent TLS setup failure preserves concrete error and stops at 
     try std.testing.expectError(error.TlsInitializationFailed, result);
     try std.testing.expectEqual(@as(u32, 96), injector.remaining); // exactly three attempts
     try std.testing.expectEqual(@as(usize, 0), srv.requestCount()); // failed before network I/O
+}
+
+// ⑧ #221: Windows request setup reports a refused connect as error.Unexpected.
+test "L2 #221: Windows request-setup Unexpected is a retried, named connect failure" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(OK_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+    var injector = cc.client_mod.RequestSetupFailureInjector{
+        .remaining = 99,
+        .failure = error.Unexpected,
+        .os_tag = .windows,
+    };
+    client.request_setup_failure_injector = &injector;
+
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    _ = cc.api_last_error.take(&buf);
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    const result = client.sendMessageStreamFullRetry(empty, null, null, null, null, null, 3, 1, null);
+    try std.testing.expectError(error.ConnectFailed, result);
+    try std.testing.expectEqual(@as(u32, 96), injector.remaining); // retried up to the bound
+    try std.testing.expectEqual(@as(usize, 0), srv.requestCount());
+    const summary = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
+    try std.testing.expect(std.mem.indexOf(u8, summary, "重试 3 次") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "ConnectFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "连接被拒绝") != null);
+}
+
+test "L2 #221: request-setup Unexpected elsewhere is not a connect failure" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(OK_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+    var injector = cc.client_mod.RequestSetupFailureInjector{
+        .remaining = 99,
+        .failure = error.Unexpected,
+        .os_tag = .linux,
+    };
+    client.request_setup_failure_injector = &injector;
+
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    const result = client.sendMessageStreamFullRetry(empty, null, null, null, null, null, 3, 1, null);
+    try std.testing.expectError(error.RequestFailed, result);
+    try std.testing.expectEqual(@as(u32, 98), injector.remaining); // one attempt
+}
+
+test "L2 #221: a refused connection is retried and the summary names the cause" {
+    const a = std.testing.allocator;
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    // Nothing listens on port 1: the connect is refused on every platform.
+    var client = mkClient(a, io_runtime.io(), "http://127.0.0.1:1");
+    defer client.deinit();
+
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    _ = cc.api_last_error.take(&buf);
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    const result = client.sendMessageStreamFullRetry(empty, null, null, null, null, null, 2, 1, null);
+    // Zig 0.16.0 names the refusal on POSIX only; Windows gets ConnectFailed.
+    const expected: anyerror = if (@import("builtin").os.tag == .windows) error.ConnectFailed else error.ConnectionRefused;
+    try std.testing.expectError(expected, result);
+    const summary = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
+    try std.testing.expect(std.mem.indexOf(u8, summary, "重试 2 次") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, @errorName(expected)) != null);
 }
 
 // ④ 不可重试不重试:401 → Unauthorized 立即返回(retry 包装不重试 4xx)。

@@ -20,7 +20,7 @@ import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run  # noqa: E402
-from e2e_helpers import SKIP, SkipTest, fresh_home, run_live  # noqa: E402
+from e2e_helpers import SkipTest, fresh_home, run_live, require_model  # noqa: E402
 
 WAIT = 42
 
@@ -69,8 +69,7 @@ def _all_tool_results(home):
 
 def test_e2e_ask_single_select(bin_path):
     """单选:模型调 AskUserQuestion → 对话框像素元素齐 → ↓↓+enter 选第 3 项 → 答案正确 + 不崩。"""
-    if SKIP:
-        return
+    require_model()
     prompt = ('Use the AskUserQuestion tool now: ONE single-select question header "Color" '
               '"Which color?" options Red/Green/Blue, each with a short description. Call immediately.')
     home = fresh_home()
@@ -98,8 +97,7 @@ def test_e2e_ask_single_select(bin_path):
 
 def test_e2e_ask_multi_question_nav(bin_path):
     """多问:导航条 ←  chip  ✔ Submit  → 出现 + → 切到第 2 问 + 不崩(用户点名的左右键交互)。"""
-    if SKIP:
-        return
+    require_model()
     prompt = ('Use AskUserQuestion now with TWO single-select questions in one call: '
               'Q1 header "Color" "Favorite color?" options Red/Blue; '
               'Q2 header "Size" "Preferred size?" options Small/Large. Call immediately.')
@@ -126,8 +124,7 @@ def test_e2e_ask_preview_note_vim(bin_path):
     用 fake $EDITOR(写固定串)验证 ctrl+g 唤起编辑器 + raw/cooked termios 往返 + 回填全链。
     模型要带 preview 字段调 AskUserQuestion;漂移(不带 preview/不调)→ skip。
     """
-    if SKIP:
-        return
+    require_model()
     import stat
     ed = os.path.join(fresh_home(), "fake_editor.sh")
     os.makedirs(os.path.dirname(ed), exist_ok=True)
@@ -156,8 +153,7 @@ def test_e2e_ask_other_input_focus(bin_path):
 
     真 tty 实测旧版:选 Other 无任何输入焦点视觉,用户不知能打字。修后:选中即显光标块+输入态提示行。
     """
-    if SKIP:
-        return
+    require_model()
     prompt = ('Use the AskUserQuestion tool now: ONE single-select question header "Color" '
               '"Which color?" options Red/Green, each with a short description. Call immediately.')
     home = fresh_home()
@@ -183,8 +179,7 @@ def test_e2e_ask_chat_about_free_response(bin_path):
 
     真 tty 实测旧版:选 Chat 把 'Chat about this' 当答案塞模型。修后:返回 user_chose_free_response 哨兵结果。
     """
-    if SKIP:
-        return
+    require_model()
     prompt = ('Use the AskUserQuestion tool now: ONE single-select question header "Color" '
               '"Which color?" options Red/Green, each with a short description. Call immediately.')
     home = fresh_home()
@@ -215,8 +210,7 @@ def test_e2e_ask_max_questions_boundary(bin_path):
     满额边界(9 问)是更有价值且能真触发的正向路径:验证"恰好到上限的合法请求不被错拒"。
     多问导航/切换由 test_e2e_ask_multi_question_nav 覆盖,此处只钉满额合法 + 无超限误报 + 无崩。
     """
-    if SKIP:
-        return
+    require_model()
     days = "; ".join('Q%d header "D%d" "Pick meal %d?" options Rice/Noodles' % (i, i, i)
                      for i in range(1, 10))  # 9 个单选问题
     prompt = ('Use the AskUserQuestion tool NOW with these NINE single-select questions in ONE call: '

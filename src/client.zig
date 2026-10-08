@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const time = @import("util/time.zig");
 const log = @import("util/log.zig");
 const http = std.http;
@@ -66,6 +67,7 @@ pub fn isTransientNetworkError(err: anyerror) bool {
         error.UnexpectedWriteFailure,
         error.NetworkUnreachable,
         error.ConnectionRefused,
+        error.ConnectFailed,
         error.TemporaryNameServerFailure,
         // std.http folds TLS certificate loading/handshake setup resource failures into this
         // concrete error. At request-setup time no response body has been consumed, so a bounded
@@ -82,6 +84,27 @@ pub fn isTransientNetworkError(err: anyerror) bool {
         error.ReadFailed,
         => true,
         else => false,
+    };
+}
+
+/// Zig 0.16.0's Windows network layer maps no AFD connect status except
+/// INSUFFICIENT_RESOURCES (`netConnectIpWindows` in lib/std/Io/Threaded.zig),
+/// so a refused, unreachable or timed-out connect reaches request setup as
+/// `error.Unexpected` and used to end the request after one attempt (#221).
+/// Nothing has been sent at that point, so on Windows it is named the connect
+/// failure it is and retried like `ConnectionRefused`. Upstream master maps
+/// CONNECTION_REFUSED; drop this once the pinned Zig does.
+pub fn requestSetupError(err: anyerror, os_tag: std.Target.Os.Tag) anyerror {
+    if (os_tag == .windows and err == error.Unexpected) return error.ConnectFailed;
+    return err;
+}
+
+/// The last_error detail for a connect-stage error. `ConnectFailed` stands for
+/// several causes Windows does not tell apart; say which ones.
+pub fn connectErrorDetail(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ConnectFailed => "ConnectFailed(连接被拒绝、不可达或超时;Zig 0.16 在 Windows 上不区分)",
+        else => @errorName(err),
     };
 }
 
@@ -203,6 +226,9 @@ const RetryHint = struct { delay_ms: ?u64 = null };
 pub const RequestSetupFailureInjector = struct {
     remaining: u32,
     failure: anyerror,
+    /// The platform whose request setup the failure stands for, so the
+    /// Windows mapping of `error.Unexpected` is provable on every host.
+    os_tag: std.Target.Os.Tag = builtin.os.tag,
 
     fn take(self: *RequestSetupFailureInjector) ?anyerror {
         if (self.remaining == 0) return null;
@@ -858,7 +884,7 @@ pub const Client = struct {
                             // doRequest 已记录具体底层错误（例如 TlsInitializationFailed）；
                             // TransientNetwork 是对 send/receive 错误的分类壳，不能在这里覆盖现场。
                             if (err != error.TransientNetwork)
-                                last_error.recordNamed("连接初始化失败", @errorName(err));
+                                last_error.recordNamed("连接初始化失败", connectErrorDetail(err));
                             last_error.noteAttempts(attempt);
                         },
                     }
@@ -932,10 +958,11 @@ pub const Client = struct {
         defer connection_lease.release();
 
         if (client.request_setup_failure_injector) |injector| {
-            if (injector.take()) |err| {
+            if (injector.take()) |injected| {
+                const err = requestSetupError(injected, injector.os_tag);
                 log.errId("client", rid, "request setup injected failure: {s}", .{@errorName(err)});
                 if (isTransientNetworkError(err)) {
-                    last_error.recordNamed("连接初始化失败", @errorName(err));
+                    last_error.recordNamed("连接初始化失败", connectErrorDetail(err));
                     return err;
                 }
                 return error.RequestFailed;
@@ -952,10 +979,11 @@ pub const Client = struct {
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = auth.name, .value = auth.value },
             },
-        }) catch |err| {
+        }) catch |raw_err| {
+            const err = requestSetupError(raw_err, builtin.os.tag);
             log.errId("client", rid, "request setup failed: {s}", .{@errorName(err)});
             if (isTransientNetworkError(err)) {
-                last_error.recordNamed("连接初始化失败", @errorName(err));
+                last_error.recordNamed("连接初始化失败", connectErrorDetail(err));
                 return err;
             }
             return error.RequestFailed;

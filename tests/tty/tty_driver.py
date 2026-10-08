@@ -19,6 +19,7 @@
     防抓半帧。超时不抛错(交给用例自身断言给出屏幕 diff)。
   两后端共享同一份实现(_Capture),只有"读一片字节"原语按平台实现——语义永不分叉。
 """
+import atexit
 import os
 import shutil
 import subprocess
@@ -43,6 +44,15 @@ QUIET_SLEEP = 0.8
 QUIET_KEY = 0.2
 # wait: 命中后的短 settle,防止断言抓到重画中途的半帧。
 SETTLE_AFTER_HIT = 0.3
+# 收尾(两后端同一份,_Capture.finish):最后一个事件之后,收到输出静默 TAIL_QUIET 秒为止,
+# 至多 TAIL_MAX 秒。只为收齐"已在路上"的字节(POSIX pty 几乎即时,ConPTY 重合成有延迟);
+# 断言哪一刻的画面由用例的事件写明(wait:/sleep:/strictsleep:)。#220 之前 POSIX 固定收
+# 0.5s、ConPTY 等静默,同一用例在两个平台上断言的是不同时刻的画面。
+TAIL_QUIET = 0.6
+TAIL_MAX = 6.0
+# 关掉终端后等子进程退出的上限。以前是无超时 waitpid:一个不退出的子进程会把整个 runner
+# 挂死,在 CI 上吃满 job 超时(#222)。超时即 SIGKILL 并让该用例失败——不退出本身就是 bug。
+EXIT_GRACE = 15.0
 
 # 高层键名 → 字节
 SPECIAL = {
@@ -152,6 +162,10 @@ class _Capture:
             if self._pump(0.05):
                 last = time.time()
 
+    def finish(self):
+        """收尾:两后端共用,见 TAIL_QUIET/TAIL_MAX。"""
+        self.drain_settle(TAIL_MAX, TAIL_QUIET)
+
     def screen_has(self, pattern):
         """渲染后的屏幕任一行含 pattern(增量喂持久 Screen;feed 自带跨块残留缓冲)。"""
         if self._screen is None:
@@ -173,6 +187,26 @@ class _Capture:
             if time.time() >= end or self.eof:
                 return False
             self._pump(0.1)
+
+
+# 用例自建的临时目录(工作目录、指定的 HOME)。runner 每个用例结束后删(release_case_dirs),
+# 失败的用例也删;进程退出再兜一次。run() 自己的 ephemeral HOME 由 run() 删。以前这类目录
+# 用完不删,全量跑一次留下约 11 个(#222)。
+_CASE_DIRS = []
+
+
+def case_tmpdir(prefix):
+    path = tempfile.mkdtemp(prefix=prefix)
+    _CASE_DIRS.append(path)
+    return path
+
+
+def release_case_dirs():
+    while _CASE_DIRS:
+        shutil.rmtree(_CASE_DIRS.pop(), ignore_errors=True)
+
+
+atexit.register(release_case_dirs)
 
 
 def _set_winsize(fd, rows, cols):
@@ -343,16 +377,35 @@ def _run_posix(bin_path, key_events, term_size, full_env,
     cap.drain(startup_drain)
     _drive(key_events, write, cap, set_size, per_key_drain)
 
-    cap.drain(0.5)
+    cap.finish()
     try:
         os.close(fd)
     except OSError:
         pass
-    try:
-        os.waitpid(pid, 0)
-    except OSError:
-        pass
+    if not _reap(pid, EXIT_GRACE):
+        raise RuntimeError(f"终端关闭后 {EXIT_GRACE:.0f}s 子进程仍未退出(已 SIGKILL)")
     return bytes(cap.out)
+
+
+def _reap(pid, timeout):
+    """等子进程退出,至多 timeout 秒。超时 SIGKILL 回收并返回 False。"""
+    import signal
+    end = time.time() + timeout
+    while True:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if done:
+            return True
+        if time.time() >= end:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            return False
+        time.sleep(0.05)
 
 
 def _run_windows(bin_path, key_events, term_size, full_env,
@@ -416,8 +469,7 @@ def _run_windows(bin_path, key_events, term_size, full_env,
     # 键间 drain 同理放宽下限(0.25s 在 ConPTY 下常抓不到该键引发的重画)。
     _drive(key_events, write, cap, set_size, max(per_key_drain, 0.4))
 
-    # 收尾:静默检测——持续有新字节就继续收(如 /help 输出、退出清理帧),0.6s 无新字节才停,上限 6s。
-    cap.drain_settle(6.0, 0.6)
+    cap.finish()
     cap.out.extend(kfilter.flush())
     try:
         proc.terminate(force=True)

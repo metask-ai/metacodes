@@ -267,3 +267,41 @@ test "R3-1回归: Ctrl+B 身份轮换 —— 新 session_id + 新 transcript 目
         try std.testing.expect(!std.mem.eql(u8, d, app.transcript_writer.?.dir));
     }
 }
+
+test "#219: a main session handed off with Ctrl+B stays in the new foreground's agent view" {
+    var fx: AppFixture = undefined;
+    try fx.setup();
+    defer fx.deinit();
+    const app = fx.app;
+    const a = std.testing.allocator;
+    const reg = app.agentJobsPtr() orelse return error.TestExpectedAgentRegistry;
+    const Registry = @TypeOf(reg.*);
+
+    const old_id = app.session_id;
+    // Stands in for the job Ctrl+B spawns: it runs in the session it left.
+    try reg.pushTestEntryFull(old_id, "main", "long refactor", 2, 300, "Bash", "{}", .running);
+    try app.prepareHandOff();
+    app.completeHandOff();
+    try std.testing.expect(!std.meta.eql(old_id, app.session_id));
+
+    // What the agent tree, footer and switcher read.
+    const shown = try reg.snapshotJobsInScope(a, app.agentJobScope());
+    defer Registry.freeSnapshots(a, shown);
+    try std.testing.expectEqual(@as(usize, 1), shown.len);
+    try std.testing.expectEqualStrings("long refactor", shown[0].desc);
+    try std.testing.expectEqual(@as(usize, 1), reg.runningCountInScope(app.agentJobScope()));
+    try std.testing.expectEqual(@as(usize, 1), reg.totalCountInScope(app.agentJobScope()));
+    const out = (try reg.copyOutputBufInScope(shown[0].id, a, app.agentJobScope())) orelse return error.TestExpectedOutput;
+    a.free(out);
+
+    // Routing does not follow the foreground: the job is not the new
+    // session's, and the new session's own projections do not see it.
+    const routed = try reg.snapshotJobsForSession(a, app.session_id);
+    defer Registry.freeSnapshots(a, routed);
+    try std.testing.expectEqual(@as(usize, 0), routed.len);
+    try std.testing.expectError(error.JobNotFound, reg.abortForSession(shown[0].id, app.session_id));
+
+    // The switcher's stop reaches it through the same scope.
+    try reg.abortInScope(shown[0].id, app.agentJobScope());
+    try std.testing.expect(reg.entries.items[0].abort.isAborted());
+}

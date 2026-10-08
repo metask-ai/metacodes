@@ -82,20 +82,21 @@ def test_at_menu_down_moves_highlight(bin_path):
         sc = Screen(24, 80)
         sc.feed(raw)
 
-        # 目录枚举顺序平台相关(POSIX=创建序 README 在前;Windows FindFirstFile=字母序
-        # main.py 在前)——不硬编码文件名,按**屏幕行序**断言:Down 后高亮在第 2 项,非第 1 项。
+        # 目录枚举顺序平台相关(macOS 多为创建序;Windows FindFirstFile=字母序;Linux ext4
+        # 是哈希序,src/ 可能排在中间)——不硬编码名字,按**屏幕行序**取全部三项候选,
+        # 断言:Down 后高亮在第 2 项,非第 1 项。
         items = []  # (row, name, class) 按行序
         for r in range(sc.rows):
-            t = sc.line_text(r)
-            for name in ("main.py", "README.md"):
-                if "+ " + name in t:
-                    cls = None
-                    for cell in sc.grid[r]:
-                        if cell.ch and not cell.ch.isspace():
-                            cls = cell.border_class
-                            break
-                    items.append((r, name, cls))
-        assert len(items) == 2, f"应列出两个候选,实得 {items}"
+            t = sc.line_text(r).strip()
+            if not t.startswith("+ "):
+                continue
+            cls = None
+            for cell in sc.grid[r]:
+                if cell.ch and not cell.ch.isspace():
+                    cls = cell.border_class
+                    break
+            items.append((r, t[2:].strip(), cls))
+        assert len(items) == 3, f"应列出三个候选(README.md、main.py、src/),实得 {items}"
         assert items[1][2] == "accent", f"Down 后第 2 项应高亮(accent),实得 {items}"
         assert items[0][2] != "accent", f"第 1 项不应仍是 accent,实得 {items}"
     finally:
