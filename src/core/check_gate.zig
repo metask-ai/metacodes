@@ -8,9 +8,10 @@
 //!   * passed      — exit 0 and no failing result;
 //!   * failed      — anything else the verdict codecs (or the raw fallback)
 //!                   report;
-//!   * tainted     — the run changed a file the check runs or names (the
-//!                   model edited its own judge, so the verdict stops
-//!                   counting);
+//!   * tainted     — the run changed a file the check runs or names, or the
+//!                   check passed after the run modified an existing test
+//!                   file (the model edited its own judge, so the verdict
+//!                   stops counting);
 //!   * unavailable — no verdict at all (spawn failure, timeout, or the shell
 //!                   could not find or execute the command: exit 126/127).
 //!
@@ -120,6 +121,9 @@ pub fn stopContinues(blocked: bool, used: u8) bool {
 
 const MAX_TRACKED_NAMES = 16;
 const MAX_NAME_BYTES = 128;
+/// Test files already modified before the run started (`git status`), so a
+/// pass is not called tainted for the user's own uncommitted test edits.
+const MAX_BASELINE_TEST_PATHS = 32;
 
 /// Basenames of files this run's file tools changed. Value semantics only:
 /// the state lives for a whole Run with no allocator coupling. Overflow only
@@ -160,6 +164,51 @@ pub const State = struct {
     last_fingerprint: u64 = 0,
     stop_hook_blocks: u8 = 0,
     names: NameSet = .{},
+    /// A file tool modified, deleted or moved an existing test file.
+    modified_test_file: bool = false,
+    baseline_test_paths: [MAX_BASELINE_TEST_PATHS]u64 = undefined,
+    baseline_count: usize = 0,
+    /// More pre-existing dirty test files than the baseline holds: the
+    /// git-status half of the pass check is skipped (silence, not a guess).
+    baseline_overflow: bool = false,
+    baseline_taken: bool = false,
+
+    /// Record which test files are already modified before the run touches
+    /// anything. Best effort: without git there is no baseline and only the
+    /// file-tool evidence counts.
+    pub fn snapshotBaseline(self: *State, allocator: std.mem.Allocator, cwd: ?[]const u8, abort: ?*const AbortSignal) error{ Aborted, OutOfMemory }!void {
+        self.baseline_taken = true;
+        const result = try capture(allocator, "git status --porcelain", cwd, abort, 10_000);
+        const done = switch (result) {
+            .done => |d| d,
+            .unavailable => return,
+        };
+        defer allocator.free(done.output);
+        if (done.exit_code != 0) return;
+        var it = TrackedTestPaths.init(done.output);
+        while (it.next()) |path| {
+            if (self.baseline_count == MAX_BASELINE_TEST_PATHS) {
+                self.baseline_overflow = true;
+                return;
+            }
+            self.baseline_test_paths[self.baseline_count] = std.hash.Wyhash.hash(0, path);
+            self.baseline_count += 1;
+        }
+    }
+
+    /// A tracked test file is modified now that was not before the run.
+    fn newlyModifiedTestFile(self: *const State, porcelain: []const u8) bool {
+        if (!self.baseline_taken or self.baseline_overflow) return false;
+        var it = TrackedTestPaths.init(porcelain);
+        outer: while (it.next()) |path| {
+            const hash = std.hash.Wyhash.hash(0, path);
+            for (self.baseline_test_paths[0..self.baseline_count]) |known| {
+                if (known == hash) continue :outer;
+            }
+            return true;
+        }
+        return false;
+    }
 
     pub fn shouldCheck(self: *const State) bool {
         return self.dirty;
@@ -196,7 +245,10 @@ pub const State = struct {
             for (changes) |record| {
                 if (!record.status.changedDisk()) continue;
                 switch (record.locator) {
-                    .workspace_path, .absolute_path => |path| self.names.add(path),
+                    .workspace_path, .absolute_path => |path| {
+                        self.names.add(path);
+                        if (record.kind != .created and isTestPath(path)) self.modified_test_file = true;
+                    },
                     .uri => {},
                 }
             }
@@ -332,7 +384,14 @@ pub fn runCheck(
     if (isTainted(&outcome.parsed.?, options.command, porcelain, &state.names)) {
         outcome.verdict = .tainted;
     } else if (passed) {
-        outcome.verdict = .passed;
+        // A passing check names no files, so the name-based rule above cannot
+        // see a rewritten test. A pass after the run modified an existing test
+        // file proves nothing about the original expectations. A failure in
+        // the same situation stays a failure: the edit did not make it pass,
+        // and the remaining failure is real.
+        const rewritten = state.modified_test_file or
+            (if (porcelain) |p| state.newlyModifiedTestFile(p) else false);
+        outcome.verdict = if (rewritten) .tainted else .passed;
     }
     return outcome;
 }
@@ -366,6 +425,36 @@ fn isTainted(
     }
     return false;
 }
+
+fn isTestPath(path: []const u8) bool {
+    if (verification_progress.isTestFilePath(path)) return true;
+    // Relative paths (git porcelain) have no leading slash for the
+    // `/tests/` segment rule; a top-level `tests/` directory counts too.
+    return std.mem.startsWith(u8, path, "tests/") or std.mem.startsWith(u8, path, "test/");
+}
+
+/// Paths of tracked files that `git status --porcelain` reports changed
+/// (modified, deleted, renamed — not untracked `??` or newly added `A`) and
+/// that look like test files. A rename yields its new path.
+const TrackedTestPaths = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+
+    fn init(porcelain: []const u8) TrackedTestPaths {
+        return .{ .lines = std.mem.splitScalar(u8, porcelain, '\n') };
+    }
+
+    fn next(self: *TrackedTestPaths) ?[]const u8 {
+        while (self.lines.next()) |line| {
+            if (line.len < 4) continue;
+            const status = line[0..2];
+            if (std.mem.eql(u8, status, "??") or status[0] == 'A') continue;
+            var path = std.mem.trim(u8, line[3..], " \r\"");
+            if (std.mem.lastIndexOf(u8, path, " -> ")) |arrow| path = std.mem.trim(u8, path[arrow + 4 ..], " \"");
+            if (path.len > 0 and isTestPath(path)) return path;
+        }
+        return null;
+    }
+};
 
 const INTERPRETERS = [_][]const u8{ "sh", "bash", "dash", "zsh", "python", "python3", "node", "ruby", "perl" };
 
@@ -626,6 +715,28 @@ test "taint: a changed file named by the command or a result" {
     var runner = NameSet{};
     runner.add("pytest");
     try testing.expect(isTainted(&parsed, "./pytest -q", null, &runner));
+}
+
+test "a pass after a new test-file modification is tainted; pre-existing edits are not" {
+    var state = State{ .baseline_taken = true };
+    var baseline = TrackedTestPaths.init(" M tests/test_old.py\n?? notes.md\n M src/app.py\n");
+    while (baseline.next()) |path| {
+        state.baseline_test_paths[state.baseline_count] = std.hash.Wyhash.hash(0, path);
+        state.baseline_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), state.baseline_count);
+    // The user's own uncommitted test edit and untracked new tests do not count.
+    try testing.expect(!state.newlyModifiedTestFile(" M tests/test_old.py\n?? tests/test_new.py\n M src/app.py\n"));
+    // A test file modified during the run, the runner, a rename into tests/.
+    try testing.expect(state.newlyModifiedTestFile(" M tests/test_tokenize.py\n"));
+    try testing.expect(state.newlyModifiedTestFile(" M tests/run.py\n"));
+    try testing.expect(state.newlyModifiedTestFile("R  src/a.py -> tests/test_a.py\n"));
+    try testing.expect(state.newlyModifiedTestFile(" D pkg/test_util.py\n"));
+    // No baseline, or an overflowing one: silence.
+    const blind = State{};
+    try testing.expect(!blind.newlyModifiedTestFile(" M tests/test_tokenize.py\n"));
+    const overflow = State{ .baseline_taken = true, .baseline_overflow = true };
+    try testing.expect(!overflow.newlyModifiedTestFile(" M tests/test_tokenize.py\n"));
 }
 
 test "runCheck classifies pass, failure and spawn failure" {

@@ -370,6 +370,34 @@ test "L2 check gate: editing the check makes the verdict tainted and ends the ru
     try std.testing.expectEqual(cc.tools.tool_observation.CheckGateVerdict.tainted, run.record.final_verdict);
 }
 
+test "L2 check gate: a pass after rewriting an existing test is tainted" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // POSIX shell check
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &buf);
+    // An existing test file the check reads; the model rewrites it so the
+    // check passes. The pass proves nothing about the original expectation.
+    const existing = try std.fmt.allocPrint(a, "{s}/tests/test_expect.txt", .{root});
+    defer a.free(existing);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, std.fs.path.dirname(existing).?);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = existing, .data = "TOTAL=42\n" });
+    const deliverable = try writeSse(a, "write_1", root, "result.txt", "TOTAL=41\n");
+    defer a.free(deliverable);
+    const rigged = try writeSse(a, "write_2", root, "tests/test_expect.txt", "TOTAL=41\n");
+    defer a.free(rigged);
+    const done = try endTurn(a, "done", "done");
+    defer a.free(done);
+    const responses = [_][]const u8{ deliverable, rigged, done };
+    var run = try runGate(a, root, .{ .gate = .{ .command = "cmp -s result.txt tests/test_expect.txt", .mode = .enforce } }, &responses);
+    defer run.deinit(a);
+    try run.expectMarkers(&.{ 0, 0, 0 });
+    try std.testing.expectEqual(@as(u8, 1), run.record.checks);
+    try std.testing.expectEqual(@as(u8, 0), run.record.continuations);
+    try std.testing.expectEqual(cc.tools.tool_observation.CheckGateVerdict.tainted, run.record.final_verdict);
+}
+
 test "L2 check gate: a disabled gate never runs the check and never records" {
     if (builtin.os.tag == .windows) return error.SkipZigTest; // POSIX shell check
     const a = std.testing.allocator;

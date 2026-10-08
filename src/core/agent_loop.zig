@@ -1048,6 +1048,15 @@ pub fn run(
     // 宿主检查门 + Stop hook 拦截(CheckGate.lean):各自有界的续跑预算,不走注入计量器
     // (续跑由外部裁决驱动,不是咨询性 nudge)。终局记录只在检查门武装时落一条。
     var check_gate_state = check_gate_mod.State{};
+    // Which test files are already modified before this run touches anything,
+    // so a later pass is called tainted only for edits made during the run.
+    if (opts.check_gate != null and depth == 0) {
+        check_gate_state.snapshotBaseline(allocator, if (opts.cwd_abs.len > 0) opts.cwd_abs else null, opts.abort) catch |err| switch (err) {
+            // The loop's own abort check ends the run at the first boundary.
+            error.Aborted => {},
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
     var stop_hook_active = false;
     defer if (opts.check_gate) |gate| {
         if (opts.tool_observer) |observer| {

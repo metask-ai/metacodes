@@ -17,7 +17,9 @@ status, compatibility boundaries, and entry points are defined by
   the model ends its turn after changing the workspace, the host runs the
   pinned check command itself and turns the result into a verdict: passed,
   failed, tainted (the run changed the program the check executes or a test
-  file a result names) or unavailable (spawn failure, 180 s timeout). In
+  file a result names, or the check passed after the run modified an existing
+  test file) or unavailable (spawn failure, 180 s timeout, or exit 126/127).
+  In
   enforce mode a clean failure continues the same conversation with the
   verdict — failing names and reasons from the JUnit/pytest codecs, or the
   output tail — plus an escalating reading from the cognitive-mode schedule,
