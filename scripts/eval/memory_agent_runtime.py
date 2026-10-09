@@ -1343,8 +1343,14 @@ class SystemOneJudgeProxy:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        # Connect directly, as the CLI does: its HTTP client never reads
+        # HTTP(S)_PROXY. Honouring an ambient proxy (environment or macOS
+        # system settings) would measure a network path the product never
+        # takes, and a proxy that cannot reach the judge would turn
+        # "unavailable" (502) into whatever error the proxy relays.
+        opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
         try:
-            with urllib_request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with opener.open(request, timeout=self.timeout_seconds) as response:
                 return int(response.status), response.read(SYSTEM_ONE_MAX_REQUEST_BYTES + 1)
         except urllib_error.HTTPError as exc:
             return int(exc.code), exc.read(SYSTEM_ONE_MAX_REQUEST_BYTES + 1)
