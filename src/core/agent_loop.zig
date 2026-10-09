@@ -40,6 +40,7 @@ const delivery_cadence_mod = @import("delivery_cadence.zig");
 const progress_updates_mod = @import("progress_updates.zig");
 const check_gate_mod = @import("check_gate.zig");
 const test_integrity_mod = @import("test_integrity.zig");
+const stall_gate_mod = @import("stall_gate.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
@@ -52,7 +53,10 @@ const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
 const job_notification_mod = @import("job_notification.zig");
 
-pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget, max_tokens_exhausted };
+/// `stalled`: the stall gate stopped a run whose tool rounds kept returning
+/// nothing new (stall_gate.zig). A controlled stop like `tool_loop`, with its
+/// own cause so the host can say what happened and how to continue.
+pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget, max_tokens_exhausted, stalled };
 
 /// 环境故障熔断阈值:一个 run 内累计 N 条 `system_error` + `recoverable:false` 的工具结果后
 /// 以 `.tool_loop` 收口。这类故障(工作目录没了、shell 起不来)换命令重试不可能修好——
@@ -271,6 +275,10 @@ pub const RunResult = struct {
     /// L3:仅 stop_reason==.suspended 时非空。调用方据此落盘 suspend.json + 投递 UI 请求,
     /// 响应到达后 resumeRun 注入。用后 deinit。
     suspend_info: ?SuspendInfo = null,
+    /// Non-null exactly when stop_reason == .stalled: what the stall gate saw
+    /// (value type, nothing to free). Hosts render it with
+    /// `stall_gate.renderStopNotice`.
+    stall: ?stall_gate_mod.Report = null,
 };
 
 /// Probe supplied by an interactive host so a queued user message can end the
@@ -547,6 +555,19 @@ pub const Options = struct {
     /// contract field like `check_gate`: canonical buildRunOptions leaves it
     /// null. The check gate reads the same sensor whenever it is armed.
     test_integrity: ?test_integrity_mod.Options = null,
+    /// Stall gate (StallGate.lean, doc/STALL_GATE_DESIGN.md): tool rounds that
+    /// keep returning nothing new — the same call answered with the same
+    /// bytes, or only answers the model has already seen — end the run with
+    /// `.stalled` (enforce) or are only recorded (observe). Stronger than a
+    /// nudge on purpose: soft reminders go unanswered in exactly this regime.
+    /// At most one decision per run, no host injection (outside the meter),
+    /// provider-visible bytes unchanged. Host-contract field like the sibling
+    /// gates: canonical buildRunOptions leaves it null, interactive hosts
+    /// enforce by default (a person resumes with one message), headless only
+    /// on request. One terminal `stall_gate` observation record per run when
+    /// armed.
+    stall_gate: ?stall_gate_mod.Mode = null,
+    stall_gate_thresholds: stall_gate_mod.Thresholds = .{},
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
@@ -1040,6 +1061,39 @@ pub fn run(
         }
         if (progress_state.decisions > 0) {
             log.info("agent", "progress update decisions={d} nudges={d} max_silent_rounds={d}", .{ progress_state.decisions, progress_state.nudges, progress_state.max_silent_rounds });
+        }
+    };
+    // Stall gate: allocated only when armed (the novelty memory is tens of KB,
+    // too much for this frame on every run). Destroyed after the record below.
+    const stall_state: ?*stall_gate_mod.State = if (opts.stall_gate != null) blk: {
+        const state = try allocator.create(stall_gate_mod.State);
+        state.* = .{};
+        break :blk state;
+    } else null;
+    defer if (stall_state) |state| allocator.destroy(state);
+    defer if (opts.stall_gate) |mode| if (stall_state) |state| {
+        if (opts.tool_observer) |observer| {
+            _ = observer.emit(.{ .stall_gate = .{
+                .enforced = mode == .enforce,
+                .repeat_rounds_threshold = opts.stall_gate_thresholds.repeat_rounds,
+                .repeat_calls_threshold = opts.stall_gate_thresholds.repeat_calls,
+                .stale_rounds_threshold = opts.stall_gate_thresholds.stale_rounds,
+                .rounds = state.rounds,
+                .progress_rounds = state.progress_rounds,
+                .max_stale_rounds = state.max_stale_rounds,
+                .max_repeats = state.max_repeats,
+                .forgotten = state.forgotten,
+                .decisions = state.decisions,
+                .max_decisions = stall_gate_mod.MAX_STALL_DECISIONS,
+                .cause = if (state.decided) |report| switch (report.cause) {
+                    .repeating => .repeating,
+                    .stale => .stale,
+                } else .none,
+                .decided_round = if (state.decided) |report| report.round else 0,
+            } });
+        }
+        if (state.decisions > 0) {
+            log.info("agent", "stall gate decisions={d} rounds={d} max_stale_rounds={d} max_repeats={d}", .{ state.decisions, state.rounds, state.max_stale_rounds, state.max_repeats });
         }
     };
     defer if (opts.delivery_cadence or opts.delivery_cadence_observe) {
@@ -3260,6 +3314,14 @@ pub fn run(
         // action must mark the run dirty before any early return.
         if (opts.check_gate != null) check_gate_state.observeSlots(allocator, slots.items);
         if (test_integrity_state.armed) test_integrity_state.observeSlots(allocator, slots.items);
+        // Stall-gate sensor, same placement: the content is still on the slots
+        // (it moves into result_blocks below). First forget what the model can
+        // no longer see — compaction or microcompaction since the last round —
+        // so a re-read of a cleared result counts as news.
+        if (stall_state) |state| {
+            state.forgetInvisible(conversation.messages.items, conversation.activeStart());
+            _ = state.observeSlots(slots.items);
+        }
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
         try exec_outcome;
@@ -3581,6 +3643,9 @@ pub fn run(
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
+        // The round's results are now the last message, one block per slot:
+        // the stall gate anchors each key to the block the model will see.
+        if (stall_state) |state| state.anchorRound(conversation.messages.items);
 
         // 环境故障熔断:第 MAX_ENVIRONMENT_FAULTS 次之后停。放在结果提交进对话**之后**,
         // 续接时模型看得到全部证据;用 .tool_loop 收口(ABI 里保留的熔断停止原因),并发
@@ -3591,6 +3656,20 @@ pub fn run(
             fireStopHook(permission_ctx.hooks, allocator, conversation, "tool_loop", depth);
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
+
+        // Stall gate (StallGate.lean): decided after the results are committed,
+        // so a resumed run sees all the evidence; the environment-fault breaker
+        // above is the more specific cause and goes first. Enforce ends the run
+        // without injecting anything; observe only records the decision.
+        if (opts.stall_gate) |mode| if (stall_state) |state| if (state.decide(opts.stall_gate_thresholds)) |cause| {
+            const report = state.noteDecided(cause);
+            log.warn("agent", "stall gate {s}: cause={s} stale_rounds={d} repeats={d} tool={s} round={d}", .{ @tagName(mode), @tagName(cause), report.stale_rounds, report.repeats, report.tool.slice(), report.round });
+            if (mode == .enforce) {
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                fireStopHook(permission_ctx.hooks, allocator, conversation, "stalled", depth);
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .stalled, .turns = turns + 1, .tool_calls = total_tool_calls, .stall = report });
+            }
+        };
 
         // Mid-turn follow-up compact: after tool_result blocks are appended and
         // before the next sampling request, re-check the actual pending request.

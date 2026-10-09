@@ -166,7 +166,7 @@ fn recordResult(job: *BatchJob, r: subagent.SubagentResult) void {
 fn isFailureStop(sr: @import("../core/agent_loop.zig").StopReason) bool {
     return switch (sr) {
         .api_error, .aborted, .tool_error, .suspended, .max_tokens_exhausted => true, // 出错/中断/挂起/续写耗尽未完成 → 失败
-        .end_turn, .max_turns, .tool_loop, .backgrounded, .budget => false, // 跑到终止,有产出 → 完成
+        .end_turn, .max_turns, .tool_loop, .stalled, .backgrounded, .budget => false, // 跑到终止,有产出 → 完成
     };
 }
 

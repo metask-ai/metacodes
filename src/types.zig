@@ -161,6 +161,12 @@ pub const Config = struct {
     /// (TestIntegrity.lean).
     test_integrity: bool = false,
     test_integrity_observe: bool = false,
+    /// Stall gate (StallGate.lean): end a run whose tool rounds keep returning
+    /// nothing new. `host_default` enforces where a person can resume (REPL,
+    /// web) and is off headless; `--stall-gate` enforces everywhere,
+    /// `--stall-gate-observe` only records, `--no-stall-gate` turns it off.
+    /// The last of these flags wins.
+    stall_gate: @import("core/stall_gate.zig").Setting = .host_default,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,

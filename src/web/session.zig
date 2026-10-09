@@ -277,6 +277,9 @@ pub fn buildWebOptions(app: *app_mod.App, wb: *WebBackend, scoped_recall: ?[]con
     // 进度更新义务(#114):web 会话有人在看,与 REPL 主 run 同样接上(宿主契约字段,canonical 不带)。
     options.progress_updates = app.config.progress_updates;
     options.progress_updates_observe = app.config.progress_updates_observe;
+    // Stall gate: a person resumes the web session with one message, so a run
+    // that keeps getting nothing new back is stopped like in the REPL.
+    options.stall_gate = @import("../core/stall_gate.zig").modeFor(app.config.stall_gate, .interactive);
     return options;
 }
 
