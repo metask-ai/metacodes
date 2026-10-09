@@ -10,7 +10,11 @@
 //!     派生(200K window 为 24488,预算下限为 7680);硬上限 262144。读到的内容还会
 //!     按同一预算裁剪,余量走 `*_next_offset`。registry 里那份 property description
 //!     由 `tests/component/tool_schema_coverage_test.zig` 绑回这些常量,不会再分叉。
-//!   - `wait_ms`：无新内容时等待新字节或作业结束。省略默认 30 秒，0 为快照，最大 600 秒。
+//!   - `wait_ms`：等待上限。省略默认 30 秒，0 为快照，最大 600 秒。期间到达的输出攒起来
+//!     一并返回，不会因第一个新字节就返回(见 `decideWake`):作业退出、`wait_for` 出现、
+//!     未读输出超过一次结果能显示的量,或到点,才返回。
+//!   - `wait_for`：可选,1..256 字节的文本;它出现在尚未返回的输出里就立刻返回
+//!     (等服务就绪、等某个阶段标记)。
 //!
 //! output:两条通道对称,各带同样的四个字段(此前这里只列了 stdout 的
 //! encoding/next_offset,stderr 的两个实际会发却没写——见 `writeChannel` 调用处)。
@@ -20,7 +24,7 @@
 //!     "stdout_total_bytes":N,"stdout_next_offset":N,"stdout_truncated":bool,
 //!     "stderr":"...","stderr_encoding":"utf-8"|"base64",
 //!     "stderr_total_bytes":N,"stderr_next_offset":N,"stderr_truncated":bool,
-//!     "waited_ms":N
+//!     "wake":"exited|matched|full|timeout|snapshot","waited_ms":N
 //!   }
 //!
 //! 续读只认 `*_next_offset`:下一次传 `stdout_since_byte = 上次 stdout_next_offset`。
@@ -49,11 +53,131 @@ pub const MAX_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_WAIT_MS: usize = 30_000;
 pub const MAX_WAIT_MS: usize = 600_000;
 const WAIT_POLL_SLICE_MS: u64 = 200;
+/// Longest `wait_for` text. A readiness marker ("Listening on", "BUILD
+/// SUCCESSFUL") is short; the bound keeps the incremental scan's overlap small.
+pub const MAX_WAIT_FOR_BYTES: usize = 256;
 
 // 2026-09-19 incident (session 000001a0b86114522f8eb6a0): 375 one-round-trip
 // polls kept returning identical running snapshots. Long-polling plus remembered
 // cursors makes one visible call wait for progress instead of replaying the spool.
 // 2026-09-19 事故:375 次轮询反复返回相同 running 快照;长轮询与记忆游标合并修复。
+//
+// 2026-10-10 analysis of 13.5K turns (glm-5.3-flash, 400K–850K context): 17% of
+// all turns were BashOutput polls. The long-poll above woke on the first new
+// byte, and a call made while unread bytes existed returned at once. So a
+// script printing a progress line every 10 s cost one model turn per line: one
+// 300 s job took 32 turns, each re-sending the whole context. A poll now
+// collects output and returns only for a reason worth a turn (`decideWake`).
+
+/// Why a poll returned. It is part of the result and carries no timing, so
+/// two polls of a job that printed nothing are byte-identical apart from
+/// `waited_ms`.
+pub const Wake = enum {
+    /// The job is no longer running: everything it will ever print is there.
+    exited,
+    /// `wait_for` appeared in output not yet returned.
+    matched,
+    /// More output is waiting than one result can show; waiting longer would
+    /// only make the next page wait.
+    full,
+    /// `wait_ms` elapsed. Whatever arrived meanwhile is returned together.
+    timeout,
+    /// `wait_ms` was 0.
+    snapshot,
+};
+
+pub const Limits = struct {
+    wait_ms: u64,
+    /// A requested channel with this many unread bytes fills its page.
+    channel_bytes: u64,
+    /// Both channels together fill the result at this many unread bytes.
+    total_bytes: u64,
+};
+
+/// What one check of the job sees. Unread counts cover requested channels
+/// only (0 for a channel not asked for).
+pub const Poll = struct {
+    running: bool,
+    matched: bool,
+    unread_stdout: u64,
+    unread_stderr: u64,
+    elapsed_ms: u64,
+};
+
+/// Return now, and why; null keeps waiting. Order is information first: an
+/// exit says the most, a match is what the caller asked for, a full page
+/// cannot grow, and the deadline ends everything else. New bytes alone are
+/// never a reason: a progress line per second would otherwise cost one model
+/// turn per second.
+pub fn decideWake(limits: Limits, poll: Poll) ?Wake {
+    if (!poll.running) return .exited;
+    if (poll.matched) return .matched;
+    if (poll.unread_stdout >= limits.channel_bytes or
+        poll.unread_stderr >= limits.channel_bytes or
+        poll.unread_stdout +| poll.unread_stderr >= limits.total_bytes) return .full;
+    if (limits.wait_ms == 0) return .snapshot;
+    if (poll.elapsed_ms >= limits.wait_ms) return .timeout;
+    return null;
+}
+
+/// Finds `wait_for` in output not yet returned, scanning only bytes it has
+/// not seen in earlier checks of the same call. A window starts `needle.len -
+/// 1` bytes back, so a marker split across two writes is still found.
+const Matcher = struct {
+    needle: []const u8,
+    /// Per channel: the call's cursor. Output before it was already returned,
+    /// so a marker there (or straddling it) does not count.
+    floor: [2]u64,
+    /// Per channel: every byte before this offset has been searched.
+    scanned: [2]u64,
+
+    const Channel = enum(u1) { stdout, stderr };
+
+    fn init(needle: []const u8, stdout_since: u64, stderr_since: u64) Matcher {
+        return .{ .needle = needle, .floor = .{ stdout_since, stderr_since }, .scanned = .{ stdout_since, stderr_since } };
+    }
+
+    fn advance(self: *Matcher, channel: Channel, path: []const u8, size: u64) bool {
+        const index = @intFromEnum(channel);
+        const done = self.scanned[index];
+        if (size <= done) return false;
+        const from = @max(self.floor[index], done -| (self.needle.len - 1));
+        // A failed read searched nothing: leave the bytes for the next check.
+        const found = spoolContains(path, from, size, self.needle) catch return false;
+        self.scanned[index] = size;
+        return found;
+    }
+};
+
+/// Whether `needle` occurs in `path`'s bytes [from, to). Reads in fixed
+/// windows that overlap by `needle.len - 1`, so nothing is allocated.
+fn spoolContains(path: []const u8, from: u64, to: u64, needle: []const u8) !bool {
+    std.debug.assert(needle.len > 0 and needle.len <= MAX_WAIT_FOR_BYTES);
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= pbuf.len) return error.PathTooLong;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+
+    var window: [16 * 1024]u8 = undefined;
+    var pos = from;
+    while (pos < to and to - pos >= needle.len) {
+        if (pfs.lseek(fd, @intCast(pos), .set) < 0) return error.SeekFailed;
+        const want: usize = @intCast(@min(@as(u64, window.len), to - pos));
+        var filled: usize = 0;
+        while (filled < want) {
+            const n = pfs.read(fd, window[filled..want]);
+            if (n <= 0) break;
+            filled += @intCast(n);
+        }
+        if (std.mem.indexOf(u8, window[0..filled], needle) != null) return true;
+        if (filled < want or pos + filled >= to) return false;
+        pos += filled - (needle.len - 1);
+    }
+    return false;
+}
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -126,33 +250,56 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return err;
     };
 
-    // A BashOutput poll is deliberately demand-driven. It waits only when a
-    // running job has no unread bytes on any requested channel; this keeps the
-    // wait visible to the model instead of hiding it in speculative prefetch.
-    var waited_ms: u64 = 0;
-    if (wait_ms_limit > 0 and job.status == .running and (want_stdout or want_stderr)) {
-        const stdout_has_unread = if (want_stdout) (fileSize(job.stdout_path) catch 0) > @as(u64, @intCast(stdout_since)) else false;
-        const stderr_has_unread = if (want_stderr) (fileSize(job.stderr_path) catch 0) > @as(u64, @intCast(stderr_since)) else false;
-        if (!stdout_has_unread and !stderr_has_unread) {
-            const started = time.nowMs();
-            const deadline = started + @as(i64, @intCast(wait_ms_limit));
-            while (true) {
-                try ctx.throwIfAborted();
-                registry.reapExited();
-                job = registry.getForOwner(job_id, ctx.session) orelse return error.JobNotFound;
-                if (job.status != .running) break;
-                const stdout_ready = if (want_stdout) (fileSize(job.stdout_path) catch 0) > @as(u64, @intCast(stdout_since)) else false;
-                const stderr_ready = if (want_stderr) (fileSize(job.stderr_path) catch 0) > @as(u64, @intCast(stderr_since)) else false;
-                if (stdout_ready or stderr_ready) break;
-                const now = time.nowMs();
-                if (now >= deadline) break;
-                const remaining: u64 = @intCast(deadline - now);
-                time.sleepMs(@min(remaining, WAIT_POLL_SLICE_MS));
-            }
-            const elapsed = time.nowMs() - started;
-            waited_ms = if (elapsed > 0) @intCast(elapsed) else 0;
+    const wait_for: ?[]u8 = if (common.extractJsonArg(args, "wait_for") == null) null else blk: {
+        const value = (try util_json.extractAndUnescapeStringField(args, "wait_for", allocator)) orelse {
+            common.setErrorDetail(ctx.error_detail, allocator, "BashOutput wait_for must be a string", .{});
+            return error.InvalidWaitFor;
+        };
+        if (value.len == 0 or value.len > MAX_WAIT_FOR_BYTES) {
+            allocator.free(value);
+            common.setErrorDetail(ctx.error_detail, allocator, "BashOutput wait_for must be 1..{d} bytes", .{MAX_WAIT_FOR_BYTES});
+            return error.InvalidWaitFor;
         }
-    }
+        break :blk value;
+    };
+    defer if (wait_for) |text| allocator.free(text);
+
+    // A poll collects output instead of returning at its first new byte (see
+    // `decideWake`). It sleeps in slices so an abort or the job's exit is seen
+    // within one slice; the wait stays inside this visible call.
+    const limits = Limits{
+        .wait_ms = wait_ms_limit,
+        .channel_bytes = max_bytes,
+        .total_bytes = @max(1, allowance.raw()),
+    };
+    var matcher = if (wait_for) |text| Matcher.init(text, stdout_since, stderr_since) else null;
+    const started = time.nowMs();
+    var slept = false;
+    var elapsed_ms: u64 = 0;
+    const wake: Wake = while (true) {
+        const stdout_size: u64 = if (want_stdout) fileSize(job.stdout_path) catch stdout_since else stdout_since;
+        const stderr_size: u64 = if (want_stderr) fileSize(job.stderr_path) catch stderr_since else stderr_since;
+        var matched = false;
+        if (matcher) |*m| {
+            if (want_stdout and m.advance(.stdout, job.stdout_path, stdout_size)) matched = true;
+            if (!matched and want_stderr and m.advance(.stderr, job.stderr_path, stderr_size)) matched = true;
+        }
+        const now = time.nowMs();
+        elapsed_ms = if (slept and now > started) @intCast(now - started) else 0;
+        if (decideWake(limits, .{
+            .running = job.status == .running,
+            .matched = matched,
+            .unread_stdout = stdout_size -| stdout_since,
+            .unread_stderr = stderr_size -| stderr_since,
+            .elapsed_ms = elapsed_ms,
+        })) |reason| break reason;
+        try ctx.throwIfAborted();
+        time.sleepMs(@min(wait_ms_limit -| elapsed_ms, WAIT_POLL_SLICE_MS));
+        slept = true;
+        registry.reapExited();
+        job = registry.getForOwner(job_id, ctx.session) orelse return error.JobNotFound;
+    };
+    const waited_ms = elapsed_ms;
 
     var stdout_chunk: Chunk = .{};
     var stderr_chunk: Chunk = .{};
@@ -212,7 +359,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             if (stderr_chunk.truncated or stderr_shown.raw() < stderr_chunk.data.len) "true" else "false",
         });
     }
-    try aw.writer.print(",\"waited_ms\":{d}", .{waited_ms});
+    try aw.writer.print(",\"wake\":\"{s}\",\"waited_ms\":{d}", .{ @tagName(wake), waited_ms });
     try aw.writer.writeAll("}");
     // Only advance after the bytes are owned by the caller; an OOM before
     // toOwnedSlice must leave the model's unread output available next time.
@@ -496,8 +643,11 @@ test "BashOutput waits for delayed output" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"waited_ms\":") != null);
 }
 
-test "BashOutput returns immediately when unread bytes exist" {
+test "BashOutput collects unread bytes below a page instead of returning at once" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // Unread output alone is not a reason to return: a call made while a
+    // progress line is waiting used to come back with that line immediately,
+    // one model turn per line.
     const a = std.testing.allocator;
     var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer registry.deinit();
@@ -509,9 +659,179 @@ test "BashOutput returns immediately when unread bytes exist" {
     defer a.free(args);
     const result = try execute(&ctx, args);
     defer a.free(result);
-    try std.testing.expect(time.nowMs() - start < 2000);
+    const elapsed = time.nowMs() - start;
+    try std.testing.expect(elapsed >= 450 and elapsed < 2000);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout\":\"ready\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"waited_ms\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"wake\":\"timeout\"") != null);
+}
+
+test "BashOutput collects a progress-printing job's lines into one result" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // Five progress lines 0.2 s apart, then the job keeps running: one call
+    // with a 1.5 s wait returns all five at the deadline (the old wake-on-byte
+    // poll returned after the first, costing five turns).
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const job = try registry.spawnBackground("for i in 1 2 3 4 5; do echo step$i; sleep 0.2; done; sleep 5", null);
+    const ctx = ToolContext{ .allocator = a, .jobs = &registry };
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\",\"wait_ms\":1500}}", .{job.idSlice()});
+    defer a.free(args);
+    const start = time.nowMs();
+    const result = try execute(&ctx, args);
+    defer a.free(result);
+    try std.testing.expect(time.nowMs() - start >= 1400);
+    var parsed = try parseEnvelope(a, result);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("step1\nstep2\nstep3\nstep4\nstep5\n", parsed.value.object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("timeout", parsed.value.object.get("wake").?.string);
+    try std.testing.expectEqualStrings("running", parsed.value.object.get("status").?.string);
+}
+
+test "BashOutput returns at exit with everything printed during the wait" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const job = try registry.spawnBackground("for i in 1 2 3; do echo l$i; sleep 0.2; done", null);
+    const ctx = ToolContext{ .allocator = a, .jobs = &registry };
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\"}}", .{job.idSlice()});
+    defer a.free(args);
+    const start = time.nowMs();
+    const result = try execute(&ctx, args);
+    defer a.free(result);
+    try std.testing.expect(time.nowMs() - start < 5000);
+    var parsed = try parseEnvelope(a, result);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("l1\nl2\nl3\n", parsed.value.object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("exited", parsed.value.object.get("wake").?.string);
+}
+
+test "BashOutput wait_for returns when the marker appears, not at earlier output" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const job = try registry.spawnBackground("echo booting; sleep 0.4; echo 'Listening on :8080'; sleep 5", null);
+    const ctx = ToolContext{ .allocator = a, .jobs = &registry };
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\",\"wait_ms\":5000,\"wait_for\":\"Listening on\"}}", .{job.idSlice()});
+    defer a.free(args);
+    const start = time.nowMs();
+    const result = try execute(&ctx, args);
+    defer a.free(result);
+    const elapsed = time.nowMs() - start;
+    try std.testing.expect(elapsed >= 300 and elapsed < 3000);
+    var parsed = try parseEnvelope(a, result);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("booting\nListening on :8080\n", parsed.value.object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("matched", parsed.value.object.get("wake").?.string);
+
+    // The marker is now behind the cursor: a second wait for it does not
+    // match what was already returned, it waits out its deadline.
+    const again_args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\",\"wait_ms\":300,\"wait_for\":\"Listening on\"}}", .{job.idSlice()});
+    defer a.free(again_args);
+    const again = try execute(&ctx, again_args);
+    defer a.free(again);
+    try std.testing.expect(std.mem.indexOf(u8, again, "\"wake\":\"timeout\"") != null);
+}
+
+test "BashOutput returns as soon as a page is full" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const job = try registry.spawnBackground("awk 'BEGIN { for(i=0;i<100;i++) printf \"x\" }'; sleep 5", null);
+    try waitForSpoolBytes(&registry, job.idSlice(), 100);
+    const ctx = ToolContext{ .allocator = a, .jobs = &registry };
+    const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\",\"max_bytes\":50,\"wait_ms\":5000}}", .{job.idSlice()});
+    defer a.free(args);
+    const start = time.nowMs();
+    const result = try execute(&ctx, args);
+    defer a.free(result);
+    try std.testing.expect(time.nowMs() - start < 2000);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"wake\":\"full\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_next_offset\":50") != null);
+}
+
+test "BashOutput rejects a wait_for that is empty, too long or not a string" {
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const job = try registry.spawnBackground("sleep 1", null);
+    const ctx = ToolContext{ .allocator = a, .jobs = &registry };
+    const long = [_]u8{'x'} ** (MAX_WAIT_FOR_BYTES + 1);
+    for ([_][]const u8{ "\"\"", "\"" ++ long ++ "\"", "42" }) |value| {
+        const args = try std.fmt.allocPrint(a, "{{\"job_id\":\"{s}\",\"wait_ms\":0,\"wait_for\":{s}}}", .{ job.idSlice(), value });
+        defer a.free(args);
+        try std.testing.expectError(error.InvalidWaitFor, execute(&ctx, args));
+    }
+}
+
+test "decideWake: exit, match, full page and deadline end a wait; new bytes alone never do" {
+    const limits = Limits{ .wait_ms = 1000, .channel_bytes = 100, .total_bytes = 150 };
+    const quiet = Poll{ .running = true, .matched = false, .unread_stdout = 0, .unread_stderr = 0, .elapsed_ms = 0 };
+    try std.testing.expectEqual(@as(?Wake, null), decideWake(limits, quiet));
+    // Fresh output below a page keeps the wait going, however much time is left.
+    var progressing = quiet;
+    progressing.unread_stdout = 99;
+    progressing.unread_stderr = 50;
+    progressing.elapsed_ms = 999;
+    try std.testing.expectEqual(@as(?Wake, null), decideWake(limits, progressing));
+    // Each reason on its own.
+    var p = quiet;
+    p.running = false;
+    try std.testing.expectEqual(@as(?Wake, .exited), decideWake(limits, p));
+    p = quiet;
+    p.matched = true;
+    try std.testing.expectEqual(@as(?Wake, .matched), decideWake(limits, p));
+    p = quiet;
+    p.unread_stderr = 100;
+    try std.testing.expectEqual(@as(?Wake, .full), decideWake(limits, p));
+    p = quiet;
+    p.unread_stdout = 75;
+    p.unread_stderr = 75;
+    try std.testing.expectEqual(@as(?Wake, .full), decideWake(limits, p));
+    p = quiet;
+    p.elapsed_ms = 1000;
+    try std.testing.expectEqual(@as(?Wake, .timeout), decideWake(limits, p));
+    try std.testing.expectEqual(@as(?Wake, .snapshot), decideWake(.{ .wait_ms = 0, .channel_bytes = 100, .total_bytes = 150 }, quiet));
+    // Precedence: an exit says the most, then the marker, then a full page.
+    p = .{ .running = false, .matched = true, .unread_stdout = 500, .unread_stderr = 0, .elapsed_ms = 5000 };
+    try std.testing.expectEqual(@as(?Wake, .exited), decideWake(limits, p));
+    p.running = true;
+    try std.testing.expectEqual(@as(?Wake, .matched), decideWake(limits, p));
+    p.matched = false;
+    try std.testing.expectEqual(@as(?Wake, .full), decideWake(limits, p));
+}
+
+test "Matcher finds a marker split across writes and windows, only past the cursor" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const path = try std.fs.path.join(a, &.{ root, "spool" });
+    defer a.free(path);
+
+    // A marker that straddles two spool windows (16 KiB each) is found.
+    const filler = try a.alloc(u8, 16 * 1024 - 3);
+    defer a.free(filler);
+    @memset(filler, '.');
+    const body = try std.mem.concat(a, u8, &.{ filler, "READY\n" });
+    defer a.free(body);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "spool", .data = body });
+    try std.testing.expect(try spoolContains(path, 0, body.len, "READY"));
+    try std.testing.expect(!try spoolContains(path, 0, body.len, "STEADY"));
+
+    // Incremental: the first check sees "REA", the second the rest; together
+    // they match. Bytes before the call's cursor never count.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "spool", .data = "old READY\nnew REA" });
+    var m = Matcher.init("READY", 10, 0);
+    try std.testing.expect(!m.advance(.stdout, path, 17));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "spool", .data = "old READY\nnew READY\n" });
+    try std.testing.expect(m.advance(.stdout, path, 20));
+    var before_cursor = Matcher.init("READY", 10, 0);
+    try std.testing.expect(!before_cursor.advance(.stdout, path, 14));
 }
 
 test "BashOutput returns immediately when the job exited" {

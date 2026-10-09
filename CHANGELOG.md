@@ -12,6 +12,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- BashOutput collects output instead of returning at the first new byte. A
+  call now returns only when one of these happens:
+  - the job exits;
+  - the new `wait_for` text (1–256 bytes) appears in output not yet returned;
+  - more output is waiting than one result can show;
+  - `wait_ms` elapses (default still 30 s).
+
+  The new `wake` field (`exited`, `matched`, `full`, `timeout` or
+  `snapshot`) says which one ended the wait. Before this, a call also
+  returned at once whenever unread bytes existed. A script that printed a
+  progress line every 10 s therefore cost one model turn per line: in an
+  analysis of 13.5K turns, 17% were BashOutput polls, and one 300 s job took
+  32 turns. A readiness wait such as a server's "Listening on" now takes one
+  call with `wait_for` instead of a polling loop. `wait_ms: 0` is still an
+  immediate snapshot.
 - Host check gate (`--host-check <cmd>` with `--check-gate` or
   `--check-gate-observe`, budget `--check-gate-max <n>`, 1–8, default 3). When
   the model ends its turn after changing the workspace, the host runs the

@@ -205,3 +205,11 @@ test "L2 守卫: BashOutput wait_ms 的 schema 描述绑定等待常量" {
     try std.testing.expect(std.mem.indexOf(u8, desc, "0 for an immediate snapshot") != null);
     try std.testing.expect(std.mem.indexOf(u8, desc, max_text) != null);
 }
+
+test "L2 守卫: BashOutput wait_for 的 schema 描述绑定长度上限" {
+    const desc = propDescription("BashOutput", "wait_for") orelse
+        return error.BashOutputWaitForSpecMissing;
+    var bound_buf: [32]u8 = undefined;
+    const bound_text = try std.fmt.bufPrint(&bound_buf, "1..{d} bytes", .{cc.tools_bash_output.MAX_WAIT_FOR_BYTES});
+    try std.testing.expect(std.mem.indexOf(u8, desc, bound_text) != null);
+}
