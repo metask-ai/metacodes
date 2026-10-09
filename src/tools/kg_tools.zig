@@ -357,12 +357,12 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall returned more hits than the governed 32-node ledger can represent", .{});
         return error.InvalidLexicalPlanState;
     }
-    var evidence: EvidenceCandidates = .{};
-    defer evidence.deinit(ctx.allocator);
-    try out.appendSlice(ctx.allocator, "{\"hits\":[");
+    // Ledger bookkeeping, receipts and row shapes follow TinyKG's BM25 rank
+    // order; a judge may change only the order the rows are shown in.
+    var seen_flags: [lexical_query_plan.MAX_SEEN_NODE_IDS]bool = undefined;
+    var compact_flags: [lexical_query_plan.MAX_SEEN_NODE_IDS]bool = undefined;
     for (hits, 0..) |h, i| {
         hit_ids[i] = h.node_id;
-        if (i > 0) try out.appendSlice(ctx.allocator, ",");
         var seen_before = false;
         if (ledger_guard) |*guard| {
             seen_before = guard.wasSeen(h.node_id);
@@ -375,18 +375,36 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 }
             }
         }
-        const compact_repeat = if (plan) |value|
+        seen_flags[i] = seen_before;
+        compact_flags[i] = if (plan) |value|
             (value.schema_version == .host_managed_v2 or value.isSeedShapeRewrite()) and seen_before
         else
             false;
-        if (compact_repeat) {
+    }
+    var display: scoped_recall_mod.Order = .{ .len = hits.len };
+    for (0..hits.len) |index| display.indices[index] = @intCast(index);
+    if (orderAdvisor(ctx) != null and hits.len > 0) {
+        // recallTyped is asked for exactly MAX_RECALL_CANDIDATES hits.
+        std.debug.assert(hits.len <= jev_advisor.MAX_RECALL_CANDIDATES);
+        var entries: [jev_advisor.MAX_RECALL_CANDIDATES]OrderEntry = undefined;
+        for (hits, compact_flags[0..hits.len], 0..) |h, compact, index| {
+            const label = if (h.schema_type.len > 0) h.schema_type else h.kind;
+            const judged = !compact and !hitSupersededByArtifact(superseded_symbols, h.text, label);
+            entries[index] = .{ .score = h.score, .judged = judged, .label = label, .text = if (h.focus_text.len > 0) h.focus_text else h.text };
+        }
+        display = try recallDisplayOrder(ctx, entries[0..hits.len], effective_query);
+    }
+    try out.appendSlice(ctx.allocator, "{\"hits\":[");
+    for (display.slice(), 0..) |i, position| {
+        const h = hits[i];
+        if (position > 0) try out.appendSlice(ctx.allocator, ",");
+        if (compact_flags[i]) {
             const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"seen_before\":true,\"content_ref\":\"exposed_elsewhere_in_run\"}}", .{h.node_id});
             defer ctx.allocator.free(row);
             try out.appendSlice(ctx.allocator, row);
             continue;
         }
-        try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES, superseded_symbols);
-        if (evidenceAdvisor(ctx) != null) try evidence.add(ctx.allocator, h, superseded_symbols);
+        try appendRecallHitRow(&out, ctx.allocator, h, seen_flags[i], ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES, superseded_symbols);
     }
     // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
@@ -431,7 +449,6 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try appendRecallEnvelope(&out, ctx.allocator);
     try out.appendSlice(ctx.allocator, ",\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
-    try appendEvidenceJudgment(ctx, &out, &evidence, effective_query);
     const tail = "}";
     try out.appendSlice(ctx.allocator, tail);
     const owned = try out.toOwnedSlice(ctx.allocator);
@@ -510,10 +527,22 @@ fn executeRecallBatch(
     var probe_repeated_count: usize = 0;
     var first_new_node_id: u64 = 0;
     var first_new_evidence_node_id: u64 = 0;
-    var evidence: EvidenceCandidates = .{};
-    defer evidence.deinit(ctx.allocator);
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
     var facet_counts = [_]usize{0} ** known_types.len;
+    // Rows are kept apart (end offsets into hit_rows) so a judge can change
+    // the order they are shown in. Only a one-variant plan is judged: the
+    // rows of a multi-variant batch come from several queries whose BM25
+    // scores are not comparable. Hit memory is released per probe, so the
+    // judge's inputs are copied.
+    var row_ends: [lexical_query_plan.MAX_SEEN_NODE_IDS]usize = undefined;
+    const judge_rows = plan.variants.len == 1 and orderAdvisor(ctx) != null;
+    var judge_entries: [jev_advisor.MAX_RECALL_CANDIDATES]OrderEntry = undefined;
+    defer if (judge_rows) {
+        for (judge_entries[0..merged_count]) |entry| {
+            ctx.allocator.free(entry.label);
+            ctx.allocator.free(entry.text);
+        }
+    };
 
     for (plan.variants, 0..) |variant, variant_index| {
         const hits = kg.recallTyped(variant.text, 8, false, type_canon) catch |e| {
@@ -547,9 +576,19 @@ fn executeRecallBatch(
                 common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall batch exceeded the governed 32-node merged-result bound", .{});
                 return error.InvalidLexicalPlanState;
             }
-            if (merged_count > 0) try hit_rows.append(ctx.allocator, ',');
+            if (judge_rows) {
+                // One query returns at most eight hits.
+                std.debug.assert(merged_count < judge_entries.len);
+                const label = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
+                const judged = !seen_before_run and !hitSupersededByArtifact(superseded_symbols, hit.text, label);
+                const label_copy = try ctx.allocator.dupe(u8, label);
+                errdefer ctx.allocator.free(label_copy);
+                const text_copy = try ctx.allocator.dupe(u8, if (!judged) "" else if (hit.focus_text.len > 0) hit.focus_text else hit.text);
+                judge_entries[merged_count] = .{ .score = hit.score, .judged = judged, .label = label_copy, .text = text_copy };
+            }
             merged_ids[merged_count] = hit.node_id;
             merged_count += 1;
+            defer row_ends[merged_count - 1] = hit_rows.items.len;
             if (seen_before_run) {
                 merged_previously_seen_count += 1;
                 const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"seen_before\":true,\"content_ref\":\"exposed_elsewhere_in_run\"}}", .{hit.node_id});
@@ -563,7 +602,6 @@ fn executeRecallBatch(
                     first_new_evidence_node_id = hit.node_id;
                 }
                 try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true, batchHitTextBytes(merged_count - 1), superseded_symbols);
-                if (evidenceAdvisor(ctx) != null) try evidence.add(ctx.allocator, hit, superseded_symbols);
             }
             const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
             for (known_types, 0..) |type_name, facet_index| {
@@ -572,10 +610,19 @@ fn executeRecallBatch(
         }
     }
 
+    const display: ?scoped_recall_mod.Order = if (judge_rows and merged_count > 0)
+        try recallDisplayOrder(ctx, judge_entries[0..merged_count], plan.variants[0].text)
+    else
+        null;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
     try out.appendSlice(ctx.allocator, "{\"hits\":[");
-    try out.appendSlice(ctx.allocator, hit_rows.items);
+    for (0..merged_count) |position| {
+        const row = if (display) |order| order.indices[position] else position;
+        if (position > 0) try out.append(ctx.allocator, ',');
+        const start = if (row == 0) 0 else row_ends[row - 1];
+        try out.appendSlice(ctx.allocator, hit_rows.items[start..row_ends[row]]);
+    }
     try out.appendSlice(ctx.allocator, "],\"count\":");
     try out.print(ctx.allocator, "{d},\"types_in_results\":{{", .{merged_count});
     var facet_first = true;
@@ -643,13 +690,6 @@ fn executeRecallBatch(
         try out.append(ctx.allocator, '}');
         auto_context_node_id = context_observation.observed_node_id;
     }
-    var variants_query: std.ArrayList(u8) = .empty;
-    defer variants_query.deinit(ctx.allocator);
-    for (plan.variants, 0..) |variant, variant_index| {
-        if (variant_index > 0) try variants_query.appendSlice(ctx.allocator, " | ");
-        try variants_query.appendSlice(ctx.allocator, variant.text);
-    }
-    try appendEvidenceJudgment(ctx, &out, &evidence, variants_query.items);
     try out.append(ctx.allocator, '}');
 
     const owned = try out.toOwnedSlice(ctx.allocator);
@@ -754,108 +794,76 @@ pub fn appendRecallHitRow(
     try out.append(allocator, '}');
 }
 
-/// Recall hits whose bodies this result exposes, in rank order, captured for
-/// the System-One evidence judgment (hit memory is released per probe).
-const EvidenceCandidates = struct {
-    node_ids: [jev_advisor.MAX_RECALL_CANDIDATES]u64 = undefined,
-    labels: [jev_advisor.MAX_RECALL_CANDIDATES][]u8 = undefined,
-    texts: [jev_advisor.MAX_RECALL_CANDIDATES][]u8 = undefined,
-    len: usize = 0,
-
-    fn add(self: *EvidenceCandidates, allocator: std.mem.Allocator, hit: kg_mod.RecallHit, superseded_symbols: []const []const u8) !void {
-        if (self.len == jev_advisor.MAX_RECALL_CANDIDATES) return;
-        const label = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
-        // A withdrawn body is not evidence the model can see; do not score it.
-        if (hitSupersededByArtifact(superseded_symbols, hit.text, label)) return;
-        const label_copy = try allocator.dupe(u8, label);
-        errdefer allocator.free(label_copy);
-        // The judge reads the query-focused window when the hit carries one.
-        const text_copy = try allocator.dupe(u8, if (hit.focus_text.len > 0) hit.focus_text else hit.text);
-        self.node_ids[self.len] = hit.node_id;
-        self.labels[self.len] = label_copy;
-        self.texts[self.len] = text_copy;
-        self.len += 1;
-    }
-
-    fn deinit(self: *EvidenceCandidates, allocator: std.mem.Allocator) void {
-        for (self.labels[0..self.len], self.texts[0..self.len]) |label, text| {
-            allocator.free(label);
-            allocator.free(text);
-        }
-        self.len = 0;
-    }
-};
-
-pub const EVIDENCE_GUIDANCE =
-    "Calibrated probabilities from a fast System-One judge, not verified facts. Read the most relevant node_ids first (KgContext) " ++
-    "before trusting them. A high `sufficient` means these candidates likely already cover the answer, so another recall round is " ++
-    "unlikely to help; a low one means the needed fact is probably not among them.";
-
-/// Jev-Mem read path on the tool surface: per-hit relevance plus evidence
-/// sufficiency for the bodies this result exposes. Advisory mode appends it
-/// to the envelope (never past the byte contract); shadow mode journals only.
-/// The advisor consulted on KgRecall evidence, or null when none advises it.
-fn evidenceAdvisor(ctx: *const ToolContext) ?*jev_advisor.Advisor {
+/// The advisor consulted on KgRecall row order, or null when none advises it.
+/// The surface keeps its configuration name, `recall_evidence`.
+fn orderAdvisor(ctx: *const ToolContext) ?*jev_advisor.Advisor {
     const advisor = ctx.jev orelse return null;
     return if (advisor.advises(.recall_evidence)) advisor else null;
 }
 
-fn appendEvidenceJudgment(
-    ctx: *const ToolContext,
-    out: *std.ArrayList(u8),
-    evidence: *const EvidenceCandidates,
-    query: []const u8,
-) !void {
-    const advisor = evidenceAdvisor(ctx) orelse return;
-    if (evidence.len == 0) return;
-    var request: std.ArrayList(u8) = .empty;
-    defer request.deinit(ctx.allocator);
-    try request.appendSlice(ctx.allocator, "recall query: ");
-    try request.appendSlice(ctx.allocator, query);
-    if (ctx.jev_request.len > 0) {
-        try request.appendSlice(ctx.allocator, "\nuser request: ");
-        try request.appendSlice(ctx.allocator, ctx.jev_request);
+/// One KgRecall row as the order judge sees it.
+const OrderEntry = struct {
+    score: f64,
+    /// False for a compact repeat (its body was exposed earlier in the run)
+    /// and for a body withheld as superseded: the model cannot read either
+    /// here, so neither is judged and each ranks as percent 0.
+    judged: bool,
+    label: []const u8,
+    /// The query-focused window of the body (`RecallHit.focus_text`).
+    text: []const u8,
+};
+
+/// The order a KgRecall shows its rows in: BM25 rank order unless an advisory
+/// judge answered, then `scoped_recall.judgedOrder`. Nothing else about the
+/// result changes: no row is added, dropped or rewritten, and no score,
+/// percent or guidance is added, so an advised result is the plain one with
+/// its rows permuted. Shadow mode judges and journals only.
+fn recallDisplayOrder(ctx: *const ToolContext, entries: []const OrderEntry, query: []const u8) !scoped_recall_mod.Order {
+    const capacity = jev_advisor.MAX_RECALL_CANDIDATES;
+    std.debug.assert(entries.len <= capacity);
+    var rank_order: scoped_recall_mod.Order = .{ .len = entries.len };
+    for (0..entries.len) |index| rank_order.indices[index] = @intCast(index);
+    const advisor = orderAdvisor(ctx) orelse return rank_order;
+
+    var candidates: [capacity]jev_advisor.RecallCandidate = undefined;
+    var row_of: [capacity]u8 = undefined;
+    var judged_count: usize = 0;
+    for (entries, 0..) |entry, index| {
+        if (!entry.judged) continue;
+        candidates[judged_count] = .{ .type_label = entry.label, .text = entry.text };
+        row_of[judged_count] = @intCast(index);
+        judged_count += 1;
     }
-    var candidates: [jev_advisor.MAX_RECALL_CANDIDATES]jev_advisor.RecallCandidate = undefined;
-    for (0..evidence.len) |index| candidates[index] = .{ .type_label = evidence.labels[index], .text = evidence.texts[index] };
-    const judgment = advisor.judgeRecallEvidence(ctx.allocator, ctx.abort, request.items, candidates[0..evidence.len]) catch |err| switch (err) {
+    if (judged_count == 0) return rank_order;
+
+    const request = try jev_advisor.recallToolRequest(ctx.allocator, query, ctx.jev_request);
+    defer ctx.allocator.free(request);
+    const judgment = advisor.judgeRecallOrder(ctx.allocator, ctx.abort, request, candidates[0..judged_count]) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Aborted => return error.Aborted,
     };
-    const n = evidence.len;
     const answered = judgment.answered();
+    var percents = [_]u8{0} ** capacity;
+    var scores: [capacity]f64 = undefined;
+    for (entries, 0..) |entry, index| scores[index] = entry.score;
     var positive: u32 = 0;
     if (answered) {
-        for (judgment.percents[0..n]) |percent| {
+        for (row_of[0..judged_count], judgment.percents[0..judged_count]) |index, percent| {
+            percents[index] = percent;
             if (percent >= scoped_recall_mod.RELEVANCE_THRESHOLD_PERCENT) positive += 1;
         }
     }
-    var rendered = false;
-    if (answered and advisor.actuates()) {
-        var block: std.ArrayList(u8) = .empty;
-        defer block.deinit(ctx.allocator);
-        try block.print(ctx.allocator, ",\"system_one\":{{\"judge\":\"system_one\",\"question_set\":\"{s}\",\"relevance\":[", .{jev_advisor.RECALL_EVIDENCE_SET});
-        for (0..n) |index| {
-            if (index > 0) try block.append(ctx.allocator, ',');
-            try block.print(ctx.allocator, "{{\"node_id\":{d},\"percent\":{d}}}", .{ evidence.node_ids[index], judgment.percents[index] });
-        }
-        try block.print(ctx.allocator, "],\"sufficient\":{d},\"guidance\":", .{judgment.percents[n]});
-        try appendJsonString(&block, ctx.allocator, EVIDENCE_GUIDANCE);
-        try block.append(ctx.allocator, '}');
-        // The closing brace still follows; stay inside the byte contract or
-        // leave the baseline envelope untouched.
-        if (out.items.len + block.items.len + 1 <= MAX_RECALL_RESULT_BYTES) {
-            try out.appendSlice(ctx.allocator, block.items);
-            rendered = true;
-        }
-    }
-    const judged: u32 = if (answered) @intCast(n) else 0;
+    const judged_order = if (answered) scoped_recall_mod.judgedOrder(percents[0..entries.len], scores[0..entries.len]) else rank_order;
+    const moved = judged_order.moved();
+    const applies = answered and advisor.actuates();
+    const judged: u32 = if (answered) @intCast(judged_count) else 0;
     if (ctx.tool_observer) |observer| {
-        _ = observer.emit(judgment.audit.event(rendered, judged, positive, judged));
+        _ = observer.emit(judgment.audit.event(applies and moved > 0, judged, positive, moved));
     }
-    log.info("kg", "kg_recall evidence judge mode={s} outcome={s} judged={d} relevant={d} sufficient={d} rendered={}", .{
-        @tagName(judgment.audit.mode), @tagName(judgment.audit.outcome), judged, positive, if (answered) judgment.percents[n] else 0, rendered,
+    log.info("kg", "kg_recall order judge mode={s} outcome={s} judged={d} relevant={d} moved={d} applied={}", .{
+        @tagName(judgment.audit.mode), @tagName(judgment.audit.outcome), judged, positive, moved, applies,
     });
+    return if (applies) judged_order else rank_order;
 }
 
 fn appendRecallEnvelope(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {

@@ -73,19 +73,24 @@ pub const recall_relevance_questions: [MAX_RECALL_CANDIDATES]question.Named = bl
     break :blk out;
 };
 
-/// Tool-path variant of the relevance catalog (KgRecall): the same per-candidate
-/// questions followed by Jev-Mem's evidence-sufficiency Noul, answered in one
-/// request so the stop signal costs no extra round trip.
-pub const RECALL_EVIDENCE_SET = "metacodes.jev.recall-evidence.v2";
+/// Tool-path use of the relevance catalog (KgRecall): the same per-candidate
+/// questions, asked about the hits of a model-issued recall so the host can
+/// order them (`scoped_recall.judgedOrder`). Its own id keeps tool-path
+/// consultations apart from the injection gate's in the journals.
+///
+/// It replaces `metacodes.jev.recall-evidence.v2`, which added Jev-Mem's
+/// evidence-sufficiency Noul and showed the model every percent with usage
+/// guidance. In the paid LongMemEval-S attribution pilot that annotation
+/// cancelled the recall gate's gain in gold evidence the model opened and
+/// verified (34/60 with it, 42/60 with the gate alone, 33/60 for lexical).
+pub const RECALL_ORDER_SET = "metacodes.jev.recall-order.v1";
 
-pub const recall_sufficiency_question = question.Named{
-    .name = "sufficient",
-    .question = .{ .boolean = .{
-        .description = "Do the candidates together contain support for every factual part of an answer to the request?",
-        .when_true = "A grounded answer can be given from these candidates without inventing missing facts.",
-        .when_false = "Some required fact or link is missing; candidates about related topics are not enough.",
-    } },
-};
+/// The judge's request for a KgRecall: the model's recall query, then the
+/// user request it serves when the host knows it. Caller owns the result.
+pub fn recallToolRequest(allocator: std.mem.Allocator, query: []const u8, user_request: []const u8) error{OutOfMemory}![]u8 {
+    if (user_request.len == 0) return std.fmt.allocPrint(allocator, "recall query: {s}", .{query});
+    return std.fmt.allocPrint(allocator, "recall query: {s}\nuser request: {s}", .{ query, user_request });
+}
 
 pub const ENUMERATION_INTENT_SET = "metacodes.jev.enumeration-intent.v1";
 
@@ -134,7 +139,6 @@ pub const memory_relation_questions: [2 * MAX_RELATION_CANDIDATES]question.Named
 
 comptime {
     question.validate(&enumeration_questions) catch unreachable;
-    question.validate(&(recall_relevance_questions ++ [_]question.Named{recall_sufficiency_question})) catch unreachable;
 }
 
 // ---------------------------------------------------------------------------
@@ -277,24 +281,22 @@ pub const Advisor = struct {
         return self.judge(MAX_RECALL_CANDIDATES, allocator, abort, .recall_relevance, RECALL_RELEVANCE_SET, state.items, recall_relevance_questions[0..n]);
     }
 
-    /// P(relevant) for each candidate followed by P(sufficient) for the set:
-    /// `percents[0..n]` are the candidates, `percents[n]` the sufficiency.
-    pub fn judgeRecallEvidence(
+    /// P(relevant) for each hit of a KgRecall, asked with the relevance
+    /// catalog under `RECALL_ORDER_SET`; `request` comes from
+    /// `recallToolRequest`.
+    pub fn judgeRecallOrder(
         self: *Advisor,
         allocator: std.mem.Allocator,
         abort: ?*const AbortSignal,
         request: []const u8,
         candidates: []const RecallCandidate,
-    ) ConsultError!Judgment(MAX_RECALL_CANDIDATES + 1) {
+    ) ConsultError!Judgment(MAX_RECALL_CANDIDATES) {
         const n: usize = @min(candidates.len, MAX_RECALL_CANDIDATES);
         std.debug.assert(n > 0);
         var state: std.ArrayList(u8) = .empty;
         defer state.deinit(allocator);
         try self.writeRecallState(&state, allocator, request, candidates[0..n]);
-        var questions: [MAX_RECALL_CANDIDATES + 1]question.Named = undefined;
-        @memcpy(questions[0..n], recall_relevance_questions[0..n]);
-        questions[n] = recall_sufficiency_question;
-        return self.judge(MAX_RECALL_CANDIDATES + 1, allocator, abort, .recall_relevance, RECALL_EVIDENCE_SET, state.items, questions[0 .. n + 1]);
+        return self.judge(MAX_RECALL_CANDIDATES, allocator, abort, .recall_relevance, RECALL_ORDER_SET, state.items, recall_relevance_questions[0..n]);
     }
 
     fn writeRecallState(

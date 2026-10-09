@@ -77,6 +77,28 @@ status, compatibility boundaries, and entry points are defined by
   `"timeout": <seconds>` (capped at 600), and the event budget widens to the
   sum of its commands' timeouts, so a Stop hook can run a test suite.
 
+### Changed
+
+- The Jev `recall_evidence` surface now only reorders `KgRecall` rows. It used
+  to append each hit's relevance percent, an evidence-sufficiency score and
+  usage guidance, and in the paid attribution pilot that annotation cancelled
+  the recall gate's gain in gold evidence the model opened (34/60 against
+  42/60 for the gate alone). The judge now answers the gate's own relevance
+  questions (question set `metacodes.jev.recall-order.v1`), and inside the
+  same BM25 band as the gate the rows are ranked by judgment plus BM25; rows
+  outside the band keep their place. Nothing is added, dropped or rewritten,
+  so an advised result is the plain one with its rows permuted, and shadow
+  mode leaves it byte for byte. A one-variant lexical plan (a v3 seed) is
+  judged; a multi-variant batch is not, since its queries' BM25 scores are
+  not comparable. Offline on LongMemEval-S holdout, turn-level memories got
+  the gold row first in 272 of 288 cases against 258 for BM25 order
+  (p = 0.0005); whole-session memories were even at the first row and
+  better within the first three. The surface stays out of the built-in
+  default until a paid paired run shows it adds to the gate. The driver
+  `metacodes-jev-recall-eval` gained `--surface kgrecall`, and
+  `scripts/eval/jev_recall_pools.py` builds and scores its LongMemEval-S
+  pools.
+
 ### Fixed
 
 - On Windows, a session that has to start the TinyKG service no longer waits

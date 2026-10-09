@@ -56,7 +56,7 @@ src/jev/runtime.zig    config.json `jev` 段与 METACODES_JEV_* 覆盖的解析�
 | 决策 | 问题目录 | 基线（无顾问） | advisory 下的变化 |
 |---|---|---|---|
 | 自动召回注入（scoped recall） | `metacodes.jev.recall-relevance.v2` | BM25 top-3，绝对地板 3.0 + 相对衰减 0.5 | 见 §4：地板通过后，在 BM25 带内按“判断概率 + BM25”重排 8 个候选 |
-| `KgRecall` 结果 | `metacodes.jev.recall-evidence.v2` | 原结果 | 追加 `system_one` 块：每条相关度 + 证据充分性 + 使用说明 |
+| `KgRecall` 结果的顺序 | `metacodes.jev.recall-order.v1`（问题与召回门相同） | TinyKG 的 BM25 名次 | 单查询的召回（v3 seed、query-only、v1/v2）：在 BM25 带内按“判断概率 + BM25”重排各行，带外照旧；不加任何数字或说明，结果字节只是原结果换了行序（§6.4）。多变体的语义批次不咨询 |
 | `KgRemember` 写入 | `metacodes.jev.memory-relation.v1` | 前缀近重复检测 | 追加 `relations` 块：同义/矛盾的已有记忆（写入照常发生） |
 | 枚举意图 | `metacodes.jev.enumeration-intent.v1` | 确定性关键词提示 | 只武装**软提醒**；拒绝型修复仍只绑定确定性提示 |
 
@@ -75,8 +75,9 @@ rollout 产物摘要同样覆盖它）。
 
 内置默认（`src/jev/runtime.zig` `BUILTIN_DEFAULT`，仅 CLI）：`url`
 `http://58.211.6.133:10420`、`mode` `advisory`、`model` `metask-jev-4b`、`decisions`
-`["scoped_recall"]`（§7 的推荐配置：付费试点里 `recall_evidence` 抵消了召回门的增益，
-`memory_relation` 从未被咨询，`enumeration_intent` 从未越过阈值），其余取下表默认。
+`["scoped_recall"]`（§7 的推荐配置：付费试点里旧的 `recall_evidence` 注释抵消了召回门的增益，
+现已改为只重排、付费验证还没做；`memory_relation` 从未被咨询，`enumeration_intent` 从未越过阈值），
+其余取下表默认。
 默认是一个整体：只要任一层给了自己的 `url`，默认的 `mode`/`model`/`decisions` 就不再继承（回到
 `shadow`、不钉模型、四个面全开——否则换成别的模型的服务每次咨询都会因 `ModelMismatch` 被拒）；只调
 `mode`/`timeout_ms`/`decisions` 而不给 `url` 的层则调的是默认服务（例如只写
@@ -339,6 +340,47 @@ scoped_recall`）。合计 $9.44。
 | 只靠自动注入（两次 schema 校验中止 + 四份分片） | 193 例全部完成 | $5.180 | $0.30 |
 | **合计** | | **$41.22** | 保守 **$43.72**（授权 $200） |
 
+### 6.4 KgRecall 重排（零 provider，2026-10-09）
+
+旧的 `recall_evidence`（`metacodes.jev.recall-evidence.v2`）在 KgRecall 结果末尾追加每条的相关度百分比、
+证据充分性和一段使用说明。§6.3 的归因试点里它没有增益，反而抵消了召回门带来的核实提升
+（34/60 对只开召回门的 42/60）。重做后的面只改**行序**：判断器回答与召回门相同的逐条相关度问题
+（问题集 `metacodes.jev.recall-order.v1`），`scoped_recall.judgedOrder` 用召回门同一个 BM25 带和融合分
+在带内重排，带外保持 BM25 名次；不删行、不改行、不加数字或说明，所以 advisory 下的结果字节就是原结果
+换了行序，shadow 下逐字节相同。模型已在本次运行里看过正文的紧凑重复行和被取代而扣下正文的行不判断
+（按概率 0 参与排序）。v3 协议的每次 KgRecall 都走宿主批次：只有一个变体的 seed 判断并重排；
+2–4 个变体的语义批次合并了多个查询，BM25 分数不可比，不咨询。
+
+方法：`scripts/eval/jev_recall_pools.py build` 用付费 runner 自己的建库代码（`build_case_batch` +
+`_agent_batch`；turn 库再经 `_atomic_memory_batch`）给每个案例建隔离 TinyKG 库，按
+`KgClient.searchSubtreeInto` 的方式检索（`--project` 根、`--limit 20`、`agent-memory`、同样的类型过滤、
+稳定降序取前 8）。检索词用题目本身，代表模型写的紧凑查询；判断器的请求用
+`recallToolRequest(题目, 完整提示)`，与 KgRecall 相同。`metacodes-jev-recall-eval --surface kgrecall`
+直接调用 `Advisor.judgeRecallOrder` 与 `judgedOrder`；`jev_recall_pools.py report` 比较首个金标行在
+BM25 序与判断序中的名次。没有任何一个参数是为本节新调的：带宽、融合权重都沿用召回门。
+
+输入：LongMemEval-S cleaned（上游 sha256 `d6f21ea9…c442`）经当前 `adapt-longmem-memory --limit 500
+--split-seed 20260806`，源切片 `4f55699d…bbeb641e`、manifest `37aa6899…178e0379`（与 2026-08 的 pin
+不同：适配器之后改过输出格式，案例集合与顺序由 split seed 决定）；TinyKG `dd53db2a…`（vendor）；
+判断器昆山 `metask-jev-4b`，截止 8 s。两库各 500 次咨询全部应答，p50 0.92–0.94 s。dev = 案例 0–199，
+holdout = 200–499；只统计金标在 8 条候选内的案例（turn 缺 21 例、mixed 缺 13 例）。
+
+| 库 | 切分 | 案例 | 金标排第一：BM25 → 判断序 | 配对分歧 | exact p | 金标在前三 | MRR |
+|---|---|---|---|---|---|---|---|
+| turn | dev | 191 | 165 → 180 | 15:0 | 0.0001 | 181 → 187 | 0.909 → 0.963 |
+| turn | **holdout** | 288 | 258 → **272** | 15:1 | **0.0005** | 278 → 282 | 0.933 → 0.963 |
+| mixed | dev | 195 | 163 → 174 | 14:3 | 0.013 | 183 → 189 | 0.893 → 0.931 |
+| mixed | **holdout** | 292 | 255 → 258 | 14:11 | 0.69 | 278 → **285**（8:1，p = 0.039） | 0.916 → 0.932 |
+
+- 原子记忆（turn，形状接近用户经 `KgRemember` 存下的事实）上，判断序把金标排到第一的案例 holdout 多
+  14 例，显著。
+- 整段会话记忆（mixed，付费 TinyKG 臂实际用的库）上排第一持平（14:11），排进前三显著增加。与召回门
+  §6.2 的结论一致：判断器只读 480 B 窗口，BM25 读全文，记忆越长判断的优势越小。
+- holdout 分类别：两库上 single-session-preference 都提升最多（turn 7 → 11，mixed 6 → 11）；mixed 上
+  knowledge-update（43 → 41）与 single-session-user（41 → 39）略降。
+- 这是“排在前面的是不是金标”，不是端到端准确率：模型是否因此先打开金标、答得更准，要付费配对验证
+  （§7）。
+
 ## 7. 结论与推荐配置
 
 按决策面汇总证据（全部是本项目评估）：
@@ -346,7 +388,7 @@ scoped_recall`）。合计 $9.44。
 | 决策面 | 证据 | 推荐 |
 |---|---|---|
 | `scoped_recall` 召回门 | 离线：原子记忆 holdout 命中 0.633 → 0.703（p = 0.0019），注入少 43%、噪声少 71%；整段会话记忆命中持平、噪声少 76%；程序性池与基线逐一相同（BM25 带）。付费：**只靠自动注入时答对率 8.8% → 14.0%（193 例配对 14:4，p = 0.031），注入 token 少 14%**；模型可以自己检索时 LongMemEval 准确率不变、已核实金标证据 33/60 → 42/60（p = 0.049）；程序性迁移离线 27/30 对 lexical 27/30（未设带的 v22 是 15/18 对 18/18） | **advisory** |
-| `recall_evidence` KgRecall 注释 | 付费归因：没有增益，且抵消了召回门带来的核实提升（34/60 对 42/60） | 关闭（待重新设计） |
+| `recall_evidence` KgRecall 行序 | 旧注释（v2）付费归因：没有增益，且抵消了召回门带来的核实提升（34/60 对 42/60）。重做为只重排后离线（§6.4）：原子记忆 holdout 金标排第一 258 → 272（p = 0.0005），整段会话记忆持平、前三 278 → 285 | 暂不默认开启；付费配对验证后再定 |
 | `memory_relation` 写路径关系 | 所有付费试点里一次都没被咨询（没有写入与已有记忆冲突） | 暂不启用；需要有冲突写入的评测 |
 | `enumeration_intent` 枚举意图 | 付费试点里咨询 55 次，一次都没越过 80% 阈值、从未武装软提醒 | 暂不启用 |
 
@@ -367,8 +409,9 @@ CLI 的内置默认就是这份配置（不必再写进 config.json）。嵌入�
 
 后续：
 
-1. **KgRecall 注释重做**：去掉数字与指导语，只按“判断 + BM25 带”重排命中顺序，再用同一个归因臂
-   验证；不能再抵消召回门。
+1. **KgRecall 行序的付费验证**：注释已重做为只重排（§6.4，离线原子记忆显著、整段会话记忆持平）。
+   还差付费配对：召回门 + 行序对只开召回门，主指标仍是“模型打开核实到的金标证据”，看它是否在召回门
+   之上再加分、至少不再抵消；通过后再考虑并入内置默认。
 2. **写路径与枚举**：先造有冲突写入、需要枚举多项的评测，再决定 `memory_relation` /
    `enumeration_intent` 是否启用。
 3. **缓存**：判断是确定性的，可按请求 SHA-256 在会话内缓存，重复查询零延迟。
