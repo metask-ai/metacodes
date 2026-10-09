@@ -357,12 +357,10 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall returned more hits than the governed 32-node ledger can represent", .{});
         return error.InvalidLexicalPlanState;
     }
-    // Ledger bookkeeping, receipts and row shapes follow TinyKG's BM25 rank
-    // order; a judge may change only the order the rows are shown in.
-    var seen_flags: [lexical_query_plan.MAX_SEEN_NODE_IDS]bool = undefined;
-    var compact_flags: [lexical_query_plan.MAX_SEEN_NODE_IDS]bool = undefined;
+    try out.appendSlice(ctx.allocator, "{\"hits\":[");
     for (hits, 0..) |h, i| {
         hit_ids[i] = h.node_id;
+        if (i > 0) try out.appendSlice(ctx.allocator, ",");
         var seen_before = false;
         if (ledger_guard) |*guard| {
             seen_before = guard.wasSeen(h.node_id);
@@ -375,36 +373,17 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 }
             }
         }
-        seen_flags[i] = seen_before;
-        compact_flags[i] = if (plan) |value|
+        const compact_repeat = if (plan) |value|
             (value.schema_version == .host_managed_v2 or value.isSeedShapeRewrite()) and seen_before
         else
             false;
-    }
-    var display: scoped_recall_mod.Order = .{ .len = hits.len };
-    for (0..hits.len) |index| display.indices[index] = @intCast(index);
-    if (orderAdvisor(ctx) != null and hits.len > 0) {
-        // recallTyped is asked for exactly MAX_RECALL_CANDIDATES hits.
-        std.debug.assert(hits.len <= jev_advisor.MAX_RECALL_CANDIDATES);
-        var entries: [jev_advisor.MAX_RECALL_CANDIDATES]OrderEntry = undefined;
-        for (hits, compact_flags[0..hits.len], 0..) |h, compact, index| {
-            const label = if (h.schema_type.len > 0) h.schema_type else h.kind;
-            const judged = !compact and !hitSupersededByArtifact(superseded_symbols, h.text, label);
-            entries[index] = .{ .score = h.score, .judged = judged, .label = label, .text = if (h.focus_text.len > 0) h.focus_text else h.text };
-        }
-        display = try recallDisplayOrder(ctx, entries[0..hits.len], effective_query);
-    }
-    try out.appendSlice(ctx.allocator, "{\"hits\":[");
-    for (display.slice(), 0..) |i, position| {
-        const h = hits[i];
-        if (position > 0) try out.appendSlice(ctx.allocator, ",");
-        if (compact_flags[i]) {
+        if (compact_repeat) {
             const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"seen_before\":true,\"content_ref\":\"exposed_elsewhere_in_run\"}}", .{h.node_id});
             defer ctx.allocator.free(row);
             try out.appendSlice(ctx.allocator, row);
             continue;
         }
-        try appendRecallHitRow(&out, ctx.allocator, h, seen_flags[i], ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES, superseded_symbols);
+        try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES, superseded_symbols);
     }
     // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
@@ -529,20 +508,6 @@ fn executeRecallBatch(
     var first_new_evidence_node_id: u64 = 0;
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
     var facet_counts = [_]usize{0} ** known_types.len;
-    // Rows are kept apart (end offsets into hit_rows) so a judge can change
-    // the order they are shown in. Only a one-variant plan is judged: the
-    // rows of a multi-variant batch come from several queries whose BM25
-    // scores are not comparable. Hit memory is released per probe, so the
-    // judge's inputs are copied.
-    var row_ends: [lexical_query_plan.MAX_SEEN_NODE_IDS]usize = undefined;
-    const judge_rows = plan.variants.len == 1 and orderAdvisor(ctx) != null;
-    var judge_entries: [jev_advisor.MAX_RECALL_CANDIDATES]OrderEntry = undefined;
-    defer if (judge_rows) {
-        for (judge_entries[0..merged_count]) |entry| {
-            ctx.allocator.free(entry.label);
-            ctx.allocator.free(entry.text);
-        }
-    };
 
     for (plan.variants, 0..) |variant, variant_index| {
         const hits = kg.recallTyped(variant.text, 8, false, type_canon) catch |e| {
@@ -576,19 +541,9 @@ fn executeRecallBatch(
                 common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall batch exceeded the governed 32-node merged-result bound", .{});
                 return error.InvalidLexicalPlanState;
             }
-            if (judge_rows) {
-                // One query returns at most eight hits.
-                std.debug.assert(merged_count < judge_entries.len);
-                const label = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
-                const judged = !seen_before_run and !hitSupersededByArtifact(superseded_symbols, hit.text, label);
-                const label_copy = try ctx.allocator.dupe(u8, label);
-                errdefer ctx.allocator.free(label_copy);
-                const text_copy = try ctx.allocator.dupe(u8, if (!judged) "" else if (hit.focus_text.len > 0) hit.focus_text else hit.text);
-                judge_entries[merged_count] = .{ .score = hit.score, .judged = judged, .label = label_copy, .text = text_copy };
-            }
+            if (merged_count > 0) try hit_rows.append(ctx.allocator, ',');
             merged_ids[merged_count] = hit.node_id;
             merged_count += 1;
-            defer row_ends[merged_count - 1] = hit_rows.items.len;
             if (seen_before_run) {
                 merged_previously_seen_count += 1;
                 const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"seen_before\":true,\"content_ref\":\"exposed_elsewhere_in_run\"}}", .{hit.node_id});
@@ -610,19 +565,10 @@ fn executeRecallBatch(
         }
     }
 
-    const display: ?scoped_recall_mod.Order = if (judge_rows and merged_count > 0)
-        try recallDisplayOrder(ctx, judge_entries[0..merged_count], plan.variants[0].text)
-    else
-        null;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
     try out.appendSlice(ctx.allocator, "{\"hits\":[");
-    for (0..merged_count) |position| {
-        const row = if (display) |order| order.indices[position] else position;
-        if (position > 0) try out.append(ctx.allocator, ',');
-        const start = if (row == 0) 0 else row_ends[row - 1];
-        try out.appendSlice(ctx.allocator, hit_rows.items[start..row_ends[row]]);
-    }
+    try out.appendSlice(ctx.allocator, hit_rows.items);
     try out.appendSlice(ctx.allocator, "],\"count\":");
     try out.print(ctx.allocator, "{d},\"types_in_results\":{{", .{merged_count});
     var facet_first = true;
@@ -792,78 +738,6 @@ pub fn appendRecallHitRow(
         try out.appendSlice(allocator, ",\"body_withheld\":true");
     }
     try out.append(allocator, '}');
-}
-
-/// The advisor consulted on KgRecall row order, or null when none advises it.
-/// The surface keeps its configuration name, `recall_evidence`.
-fn orderAdvisor(ctx: *const ToolContext) ?*jev_advisor.Advisor {
-    const advisor = ctx.jev orelse return null;
-    return if (advisor.advises(.recall_evidence)) advisor else null;
-}
-
-/// One KgRecall row as the order judge sees it.
-const OrderEntry = struct {
-    score: f64,
-    /// False for a compact repeat (its body was exposed earlier in the run)
-    /// and for a body withheld as superseded: the model cannot read either
-    /// here, so neither is judged and each ranks as percent 0.
-    judged: bool,
-    label: []const u8,
-    /// The query-focused window of the body (`RecallHit.focus_text`).
-    text: []const u8,
-};
-
-/// The order a KgRecall shows its rows in: BM25 rank order unless an advisory
-/// judge answered, then `scoped_recall.judgedOrder`. Nothing else about the
-/// result changes: no row is added, dropped or rewritten, and no score,
-/// percent or guidance is added, so an advised result is the plain one with
-/// its rows permuted. Shadow mode judges and journals only.
-fn recallDisplayOrder(ctx: *const ToolContext, entries: []const OrderEntry, query: []const u8) !scoped_recall_mod.Order {
-    const capacity = jev_advisor.MAX_RECALL_CANDIDATES;
-    std.debug.assert(entries.len <= capacity);
-    var rank_order: scoped_recall_mod.Order = .{ .len = entries.len };
-    for (0..entries.len) |index| rank_order.indices[index] = @intCast(index);
-    const advisor = orderAdvisor(ctx) orelse return rank_order;
-
-    var candidates: [capacity]jev_advisor.RecallCandidate = undefined;
-    var row_of: [capacity]u8 = undefined;
-    var judged_count: usize = 0;
-    for (entries, 0..) |entry, index| {
-        if (!entry.judged) continue;
-        candidates[judged_count] = .{ .type_label = entry.label, .text = entry.text };
-        row_of[judged_count] = @intCast(index);
-        judged_count += 1;
-    }
-    if (judged_count == 0) return rank_order;
-
-    const request = try jev_advisor.recallToolRequest(ctx.allocator, query, ctx.jev_request);
-    defer ctx.allocator.free(request);
-    const judgment = advisor.judgeRecallOrder(ctx.allocator, ctx.abort, request, candidates[0..judged_count]) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Aborted => return error.Aborted,
-    };
-    const answered = judgment.answered();
-    var percents = [_]u8{0} ** capacity;
-    var scores: [capacity]f64 = undefined;
-    for (entries, 0..) |entry, index| scores[index] = entry.score;
-    var positive: u32 = 0;
-    if (answered) {
-        for (row_of[0..judged_count], judgment.percents[0..judged_count]) |index, percent| {
-            percents[index] = percent;
-            if (percent >= scoped_recall_mod.RELEVANCE_THRESHOLD_PERCENT) positive += 1;
-        }
-    }
-    const judged_order = if (answered) scoped_recall_mod.judgedOrder(percents[0..entries.len], scores[0..entries.len]) else rank_order;
-    const moved = judged_order.moved();
-    const applies = answered and advisor.actuates();
-    const judged: u32 = if (answered) @intCast(judged_count) else 0;
-    if (ctx.tool_observer) |observer| {
-        _ = observer.emit(judgment.audit.event(applies and moved > 0, judged, positive, moved));
-    }
-    log.info("kg", "kg_recall order judge mode={s} outcome={s} judged={d} relevant={d} moved={d} applied={}", .{
-        @tagName(judgment.audit.mode), @tagName(judgment.audit.outcome), judged, positive, moved, applies,
-    });
-    return if (applies) judged_order else rank_order;
 }
 
 fn appendRecallEnvelope(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {

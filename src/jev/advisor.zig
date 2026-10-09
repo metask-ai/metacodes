@@ -73,25 +73,6 @@ pub const recall_relevance_questions: [MAX_RECALL_CANDIDATES]question.Named = bl
     break :blk out;
 };
 
-/// Tool-path use of the relevance catalog (KgRecall): the same per-candidate
-/// questions, asked about the hits of a model-issued recall so the host can
-/// order them (`scoped_recall.judgedOrder`). Its own id keeps tool-path
-/// consultations apart from the injection gate's in the journals.
-///
-/// It replaces `metacodes.jev.recall-evidence.v2`, which added Jev-Mem's
-/// evidence-sufficiency Noul and showed the model every percent with usage
-/// guidance. In the paid LongMemEval-S attribution pilot that annotation
-/// cancelled the recall gate's gain in gold evidence the model opened and
-/// verified (34/60 with it, 42/60 with the gate alone, 33/60 for lexical).
-pub const RECALL_ORDER_SET = "metacodes.jev.recall-order.v1";
-
-/// The judge's request for a KgRecall: the model's recall query, then the
-/// user request it serves when the host knows it. Caller owns the result.
-pub fn recallToolRequest(allocator: std.mem.Allocator, query: []const u8, user_request: []const u8) error{OutOfMemory}![]u8 {
-    if (user_request.len == 0) return std.fmt.allocPrint(allocator, "recall query: {s}", .{query});
-    return std.fmt.allocPrint(allocator, "recall query: {s}\nuser request: {s}", .{ query, user_request });
-}
-
 pub const ENUMERATION_INTENT_SET = "metacodes.jev.enumeration-intent.v1";
 
 pub const enumeration_questions = [_]question.Named{.{
@@ -246,7 +227,15 @@ pub const ConsultError = error{ OutOfMemory, Aborted };
 /// The memory decisions an advisor can be consulted on. Each one is a separate
 /// operator choice (`METACODES_JEV_DECISIONS`); a surface the advisor does not
 /// advise behaves exactly as if no advisor were installed.
-pub const Surface = enum { scoped_recall, recall_evidence, memory_relation, enumeration_intent };
+pub const Surface = enum { scoped_recall, memory_relation, enumeration_intent };
+
+/// Surface names that once existed and are accepted, with a warning, but
+/// advise nothing. `recall_evidence` annotated KgRecall results; in the paid
+/// LongMemEval-S attribution pilot the annotation cancelled the recall gate's
+/// gain in gold evidence the model opened (34/60 against 42/60 for the gate
+/// alone), and its order-only redesign showed no gain (56 against 53 of 125,
+/// p = 0.72; doc/JEV_SYSTEM_ONE.md §6.5). KgRecall never consults the judge.
+pub const RETIRED_SURFACES = [_][]const u8{"recall_evidence"};
 pub const Surfaces = std.EnumSet(Surface);
 
 pub const Advisor = struct {
@@ -279,24 +268,6 @@ pub const Advisor = struct {
         defer state.deinit(allocator);
         try self.writeRecallState(&state, allocator, request, candidates[0..n]);
         return self.judge(MAX_RECALL_CANDIDATES, allocator, abort, .recall_relevance, RECALL_RELEVANCE_SET, state.items, recall_relevance_questions[0..n]);
-    }
-
-    /// P(relevant) for each hit of a KgRecall, asked with the relevance
-    /// catalog under `RECALL_ORDER_SET`; `request` comes from
-    /// `recallToolRequest`.
-    pub fn judgeRecallOrder(
-        self: *Advisor,
-        allocator: std.mem.Allocator,
-        abort: ?*const AbortSignal,
-        request: []const u8,
-        candidates: []const RecallCandidate,
-    ) ConsultError!Judgment(MAX_RECALL_CANDIDATES) {
-        const n: usize = @min(candidates.len, MAX_RECALL_CANDIDATES);
-        std.debug.assert(n > 0);
-        var state: std.ArrayList(u8) = .empty;
-        defer state.deinit(allocator);
-        try self.writeRecallState(&state, allocator, request, candidates[0..n]);
-        return self.judge(MAX_RECALL_CANDIDATES, allocator, abort, .recall_relevance, RECALL_ORDER_SET, state.items, recall_relevance_questions[0..n]);
     }
 
     fn writeRecallState(

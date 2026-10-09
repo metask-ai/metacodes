@@ -135,12 +135,6 @@ PRODUCTION_DISALLOWED_PROVIDER_TOOLS = (
 # TinyKG tools are withheld from the provider schema and an episodic store
 # holds atomic (turn-level) memories, the granularity metacodes itself writes.
 INJECTION_ONLY_ARMS = frozenset({"tinykg_inject", "tinykg_jev_inject"})
-# Arms whose episodic store holds atomic (turn-level) memories only. The
-# injection-only arms are among them; the *_atomic arms keep the TinyKG tools,
-# so a model can recall, and open, the same atomic memories itself.
-ATOMIC_STORE_ARMS = INJECTION_ONLY_ARMS | frozenset(
-    {"tinykg_jev_recall_atomic", "tinykg_jev_order_atomic"}
-)
 INJECTION_ONLY_WITHHELD_TOOLS = ("KgRecall", "KgContext", "KgRemember")
 PRODUCTION_ALLOWED_PROVIDER_TOOLS = (
     "Read",
@@ -1484,7 +1478,7 @@ def _production_runtime_arm(arm_id: str) -> str:
         return "codex_style"
     if arm_id in {"markdown_memory", "claude_style"}:
         return "claude_style"
-    if arm_id in {"tinykg_lexical", "tinykg", "tinykg_jev", "tinykg_jev_recall", *ATOMIC_STORE_ARMS}:
+    if arm_id in {"tinykg_lexical", "tinykg", "tinykg_jev", "tinykg_jev_recall", *INJECTION_ONLY_ARMS}:
         return "tinykg"
     _fail("production runtime arm", f"unsupported arm {arm_id!r}")
     raise AssertionError("unreachable")
@@ -2928,7 +2922,7 @@ def validate_runtime_receipt(
             "tinykg_lexical",
             "tinykg_jev",
             "tinykg_jev_recall",
-            *ATOMIC_STORE_ARMS,
+            *INJECTION_ONLY_ARMS,
         }
         observed_tinykg = rollout["tinykg_binary_sha256"]
         if tinykg_enabled:

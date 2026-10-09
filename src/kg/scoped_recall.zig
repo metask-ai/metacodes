@@ -145,61 +145,6 @@ fn fusedDescending(fused: []const f64, a: u8, b: u8) bool {
     return fused[a] > fused[b];
 }
 
-/// A permutation of rank-ordered recall hits: `indices[i]` is the BM25 rank
-/// of the hit shown at position i.
-pub const Order = struct {
-    indices: [JUDGED_CANDIDATES]u8 = undefined,
-    len: usize = 0,
-
-    pub fn slice(self: *const Order) []const u8 {
-        return self.indices[0..self.len];
-    }
-
-    /// Positions that show a different hit than BM25 rank order would.
-    pub fn moved(self: *const Order) u32 {
-        var n: u32 = 0;
-        for (self.slice(), 0..) |index, position| {
-            if (index != position) n += 1;
-        }
-        return n;
-    }
-};
-
-/// The judged policy on the KgRecall surface. The model sees every hit, so
-/// the judge only reorders, with the same band and fused rank as
-/// `judgedSelection`: hits inside the BM25 band (score >= top * REL_RATIO)
-/// come first, ranked by `percent / 100 + BM25_FUSION_WEIGHT * score / top`
-/// (BM25 rank breaks ties); hits outside the band follow in BM25 order. A
-/// hit the judge did not score is passed as percent 0.
-///
-/// This replaces a per-hit relevance/sufficiency annotation with usage
-/// guidance. In the paid LongMemEval-S attribution pilot that annotation
-/// cancelled the recall gate's gain in gold evidence the model opened and
-/// verified (34/60 with it, 42/60 with the gate alone, 33/60 for lexical).
-pub fn judgedOrder(percents: []const u8, scores: []const f64) Order {
-    std.debug.assert(percents.len == scores.len and percents.len <= JUDGED_CANDIDATES);
-    var order: Order = .{};
-    var top: f64 = 0;
-    for (scores) |score| top = @max(top, score);
-    var fused: [JUDGED_CANDIDATES]f64 = undefined;
-    for (percents, scores, 0..) |percent, score, index| {
-        if (score < top * REL_RATIO) continue;
-        const bm25 = if (top > 0) BM25_FUSION_WEIGHT * score / top else 0;
-        fused[index] = @as(f64, @floatFromInt(percent)) / 100.0 + bm25;
-        order.indices[order.len] = @intCast(index);
-        order.len += 1;
-    }
-    // Stable, so equal fused scores keep BM25 rank order.
-    std.sort.insertion(u8, order.indices[0..order.len], @as([]const f64, &fused), fusedDescending);
-    for (scores, 0..) |score, index| {
-        if (score >= top * REL_RATIO) continue;
-        order.indices[order.len] = @intCast(index);
-        order.len += 1;
-    }
-    std.debug.assert(order.len == scores.len);
-    return order;
-}
-
 /// Candidates one policy injects and the other does not.
 pub fn selectionDelta(a: Selection, b: Selection) u32 {
     var delta: u32 = 0;
@@ -1166,33 +1111,6 @@ test "judgedSelection ranks by judge and BM25 together and keeps candidates that
     try std.testing.expectEqualSlices(u8, &.{0}, bm25_top.slice());
     // The BM25 floor still decides that the answer is absent.
     try std.testing.expectEqual(@as(usize, 0), judgedSelection(&.{ 99, 99 }, &.{ 1.0, 1.0 }, .{}).len);
-}
-
-test "judgedOrder reorders inside the BM25 band and keeps every hit" {
-    // The procedural-transfer pool: the judge prefers a sibling's diff that
-    // BM25 scores at 1/9 of the protocol memory. Outside the band, so the
-    // order is exactly BM25 rank order.
-    const banded = judgedOrder(&.{ 27, 68, 19, 32, 19 }, &.{ 9.0, 1.0, 0.6, 0.6, 0.5 });
-    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4 }, banded.slice());
-    try std.testing.expectEqual(@as(u32, 0), banded.moved());
-    // Inside the band the judge reorders; the out-of-band tail keeps BM25 order.
-    const inside = judgedOrder(&.{ 20, 90, 95, 99, 99 }, &.{ 9.0, 5.0, 4.6, 4.0, 1.0 });
-    try std.testing.expectEqualSlices(u8, &.{ 2, 1, 0, 3, 4 }, inside.slice());
-    try std.testing.expectEqual(@as(u32, 2), inside.moved());
-    // Equal fused scores keep BM25 rank order.
-    const tie = judgedOrder(&.{ 70, 70, 70 }, &.{ 5.0, 5.0, 5.0 });
-    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2 }, tie.slice());
-    // BM25 separates hits the judge scores alike: 0.60 + 0.50 beats 0.65 + 0.30.
-    const fused = judgedOrder(&.{ 60, 65 }, &.{ 10.0, 6.0 });
-    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, fused.slice());
-    // A hit the judge did not score (percent 0) sinks within the band only.
-    const unscored = judgedOrder(&.{ 0, 50, 40 }, &.{ 8.0, 7.0, 3.0 });
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 2 }, unscored.slice());
-    // Unlike judgedSelection there is no floor: no BM25 score clears 3.0 here
-    // and the order is still produced in full.
-    const flat = judgedOrder(&.{ 10, 90 }, &.{ 1.0, 1.0 });
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, flat.slice());
-    try std.testing.expectEqual(@as(usize, 0), judgedOrder(&.{}, &.{}).len);
 }
 
 test "selectionDelta counts candidates only one policy injects" {

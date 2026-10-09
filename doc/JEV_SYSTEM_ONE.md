@@ -32,7 +32,7 @@ Jev-Mem（arXiv 2609.23986）把这种 System-One 判断放进记忆控制：写
 |---|---|
 | CLI 默认开启，嵌入方显式开启，测试与评估永远关闭 | CLI 宿主设 `Config.jev_builtin_default`，三层都没有 `url` 时用内置默认；嵌入方不设时与以前一样，配置文件和环境变量都没有 `url` 就 `App.jev == null`，所有消费方走原路径。`build.zig` 给它运行的每一步导出 `METACODES_JEV_URL=off`，评估 harness 给每个臂先设同样的值、System-One 臂再换成自己的判官——否则没有顾问的对照臂会悄悄用上默认服务 |
 | shadow → advisory 渐进 | `shadow`：照常请求并写 `system_one_decision` 事件，注入/工具结果字节与无顾问时**逐字节相同**；`advisory`：判断才生效 |
-| 证据，永不是权威 | 判断只能改变“注入哪几条记忆”、“是否附上相关度注释”、“是否给软提醒”；从不拒绝工具、不改权限/沙箱/预算、不写 TinyKG、不参与 formal verdict |
+| 证据，永不是权威 | 判断只能改变“注入哪几条记忆”、“KgRemember 结果是否附上关系块”、“是否给软提醒”；从不拒绝工具、不改权限/沙箱/预算、不写 TinyKG、不参与 formal verdict |
 | 宿主枚举候选 | 候选全部来自 TinyKG BM25（宿主确定性枚举），Jev 只回答关于它们的封闭问题；问题目录是 comptime 校验的常量 |
 | 失败语义二分 | 服务故障（超时/5xx/畸形/模型不符/计费）→ 退回基线；**用户中断**→ `error.Aborted` 原样上抛，不被“降级”吞掉 |
 | 最小脱敏状态 | 请求 ≤ 400 B，候选窗口 480 B；`$HOME` → `~`，`sk-`/`ghp_`/`AKIA` 等密钥前缀 → `[redacted]`；不发送 transcript、时间戳、路径、插件代次 |
@@ -51,12 +51,12 @@ src/jev/excerpt.zig    判断窗口：候选全文中与请求词最密的 480 B
 src/jev/runtime.zig    config.json `jev` 段与 METACODES_JEV_* 覆盖的解析、堆上固定的 Runtime(App 持有生命周期)
 ```
 
-四个消费点（全部是记忆面上已经存在的决策）：
+三个消费点（全部是记忆面上已经存在的决策），外加一个已退役的面：
 
 | 决策 | 问题目录 | 基线（无顾问） | advisory 下的变化 |
 |---|---|---|---|
 | 自动召回注入（scoped recall） | `metacodes.jev.recall-relevance.v2` | BM25 top-3，绝对地板 3.0 + 相对衰减 0.5 | 见 §4：地板通过后，在 BM25 带内按“判断概率 + BM25”重排 8 个候选 |
-| `KgRecall` 结果的顺序 | `metacodes.jev.recall-order.v1`（问题与召回门相同） | TinyKG 的 BM25 名次 | 单查询的召回（v3 seed、query-only、v1/v2）：在 BM25 带内按“判断概率 + BM25”重排各行，带外照旧；不加任何数字或说明，结果字节只是原结果换了行序（§6.4）。多变体的语义批次不咨询 |
+| ~~`KgRecall` 结果~~（`recall_evidence`，已退役） | — | 原结果 | 不咨询。先后试过的相关度/充分性注释（§6.3）与只重排（§6.4、§6.5）都没有收益；名字仍被接受、跳过并告警 |
 | `KgRemember` 写入 | `metacodes.jev.memory-relation.v1` | 前缀近重复检测 | 追加 `relations` 块：同义/矛盾的已有记忆（写入照常发生） |
 | 枚举意图 | `metacodes.jev.enumeration-intent.v1` | 确定性关键词提示 | 只武装**软提醒**；拒绝型修复仍只绑定确定性提示 |
 
@@ -75,13 +75,12 @@ rollout 产物摘要同样覆盖它）。
 
 内置默认（`src/jev/runtime.zig` `BUILTIN_DEFAULT`，仅 CLI）：`url`
 `http://58.211.6.133:10420`、`mode` `advisory`、`model` `metask-jev-4b`、`decisions`
-`["scoped_recall"]`（§7 的推荐配置：付费试点里旧的 `recall_evidence` 注释抵消了召回门的增益，
-现已改为只重排、付费验证还没做；`memory_relation` 从未被咨询，`enumeration_intent` 从未越过阈值），
-其余取下表默认。
+`["scoped_recall"]`（§7 的推荐配置：`memory_relation` 从未被咨询，`enumeration_intent` 从未越过阈值；
+KgRecall 那个面已退役），其余取下表默认。
 默认是一个整体：只要任一层给了自己的 `url`，默认的 `mode`/`model`/`decisions` 就不再继承（回到
-`shadow`、不钉模型、四个面全开——否则换成别的模型的服务每次咨询都会因 `ModelMismatch` 被拒）；只调
+`shadow`、不钉模型、三个面全开——否则换成别的模型的服务每次咨询都会因 `ModelMismatch` 被拒）；只调
 `mode`/`timeout_ms`/`decisions` 而不给 `url` 的层则调的是默认服务（例如只写
-`"decisions": ["scoped_recall", "recall_evidence"]` 就在默认服务上多开一个面）。
+`"decisions": ["scoped_recall", "memory_relation"]` 就在默认服务上多开一个面）。
 这是公网上的明文 HTTP、无认证：判官看的状态（会话的一段窗口，家目录已替换）不加密地经过公网。
 不想发出去就在配置文件里写 `"jev": false`，或指向自己的服务。
 
@@ -96,7 +95,7 @@ PowerShell 给环境变量赋空串等于删除它，所以统一用 `off`）。
 | `mode` | `METACODES_JEV_MODE` | `shadow`（未指定时）或 `advisory`（内置默认） |
 | `timeout_ms`（整数） | `METACODES_JEV_TIMEOUT_MS` | 单次截止，默认 2500，范围 100–30000（8 候选判断单客户端 p50 0.91 s / p99 1.06 s，三个客户端共享服务时 p50 2.4 s；超时会退回基线并开熔断，所以给共享服务留余量） |
 | `model` | `METACODES_JEV_MODEL` | 期望的模型名（钉死）；不设则接受服务报告的任何模型 |
-| `decisions`（名字数组，或逗号分隔字符串） | `METACODES_JEV_DECISIONS`（逗号分隔） | 决策面子集：`scoped_recall`、`recall_evidence`、`memory_relation`、`enumeration_intent`（内置默认只有 `scoped_recall`；自己给了 `url` 时默认全部）；没列出的面行为与没有顾问完全相同；未知名或空列表会让顾问整体关闭并告警 |
+| `decisions`（名字数组，或逗号分隔字符串） | `METACODES_JEV_DECISIONS`（逗号分隔） | 决策面子集：`scoped_recall`、`memory_relation`、`enumeration_intent`（内置默认只有 `scoped_recall`；自己给了 `url` 时默认全部）；没列出的面行为与没有顾问完全相同；未知名或空列表会让顾问整体关闭并告警。已退役的 `recall_evidence` 照样接受：跳过并告警，其余的面照常；只列它等于空列表 |
 
 `jev` 段里出现未知字段（例如把 `timeout_ms` 写成 `timeout`）、字段类型不对、或任一值不合法，
 顾问都整体关闭并告警，而不是按默认值猜。
@@ -342,6 +341,10 @@ scoped_recall`）。合计 $9.44。
 
 ### 6.4 KgRecall 重排（零 provider，2026-10-09）
 
+> 这个面已于 2026-10-09 退役（§6.5 之后）。本节与 §6.5 的工具——驱动的 `--surface kgrecall`、
+> `scripts/eval/jev_recall_pools.py`、`scripts/eval/jev_recall_order_pilot.py`、runner 的原子库 Jev 臂——随之删除，
+> 复现用分支提交 `8685a666`。
+
 旧的 `recall_evidence`（`metacodes.jev.recall-evidence.v2`）在 KgRecall 结果末尾追加每条的相关度百分比、
 证据充分性和一段使用说明。§6.3 的归因试点里它没有增益，反而抵消了召回门带来的核实提升
 （34/60 对只开召回门的 42/60）。重做后的面只改**行序**：判断器回答与召回门相同的逐条相关度问题
@@ -419,7 +422,7 @@ A/A 比较。按预注册规则，差异性无效即不推广。
 | 决策面 | 证据 | 推荐 |
 |---|---|---|
 | `scoped_recall` 召回门 | 离线：原子记忆 holdout 命中 0.633 → 0.703（p = 0.0019），注入少 43%、噪声少 71%；整段会话记忆命中持平、噪声少 76%；程序性池与基线逐一相同（BM25 带）。付费：**只靠自动注入时答对率 8.8% → 14.0%（193 例配对 14:4，p = 0.031），注入 token 少 14%**；模型可以自己检索时 LongMemEval 准确率不变、已核实金标证据 33/60 → 42/60（p = 0.049）；程序性迁移离线 27/30 对 lexical 27/30（未设带的 v22 是 15/18 对 18/18） | **advisory** |
-| `recall_evidence` KgRecall 行序 | 旧注释（v2）付费归因：没有增益，且抵消了召回门带来的核实提升（34/60 对 42/60）。重做为只重排后离线（§6.4）：原子记忆 holdout 金标排第一 258 → 272（p = 0.0005），整段会话记忆持平、前三 278 → 285 | 不默认开启：付费配对（§6.5）预注册分析因评估的顺序校验不可解释，事后重评没有增益（金标核实 53 → 56，p = 0.72） |
+| `recall_evidence`（KgRecall） | 注释版（v2）付费归因：没有增益，且抵消了召回门带来的核实提升（34/60 对 42/60）。只重排版离线（§6.4）金标排第一显著提前，付费配对（§6.5）事后重评没有增益（金标核实 53 → 56，p = 0.72） | **已退役**：KgRecall 不咨询判断器 |
 | `memory_relation` 写路径关系 | 所有付费试点里一次都没被咨询（没有写入与已有记忆冲突） | 暂不启用；需要有冲突写入的评测 |
 | `enumeration_intent` 枚举意图 | 付费试点里咨询 55 次，一次都没越过 80% 阈值、从未武装软提醒 | 暂不启用 |
 
@@ -440,11 +443,8 @@ CLI 的内置默认就是这份配置（不必再写进 config.json）。嵌入�
 
 后续：
 
-1. **KgRecall 行序与回执的一致性**：开启 `recall_evidence` 时结果的命中顺序与各变体回执不一致，评估的
-   查询计划校验会把这一行判无效（§6.5）。要么在回执里声明判断序、校验器据此只核对节点集合，要么放弃这个面；
-   付费配对没有看到增益，暂不值得再花一次付费验证。
-2. **写路径与枚举**：先造有冲突写入、需要枚举多项的评测，再决定 `memory_relation` /
+1. **写路径与枚举**：先造有冲突写入、需要枚举多项的评测，再决定 `memory_relation` /
    `enumeration_intent` 是否启用。
-3. **缓存**：判断是确定性的，可按请求 SHA-256 在会话内缓存，重复查询零延迟。
-4. **动作面（Codex Stage 2/3）**：先建设“下一步动作”的离线金标（DecisionFixture），再做
+2. **缓存**：判断是确定性的，可按请求 SHA-256 在会话内缓存，重复查询零延迟。
+3. **动作面（Codex Stage 2/3）**：先建设“下一步动作”的离线金标（DecisionFixture），再做
    只读动作族的 shadow 评分；在拿到配对证据之前不进入 provider 可见字节。

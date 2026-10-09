@@ -201,10 +201,10 @@ write. Design, failure semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_
 | `jev` field | Override | Contract |
 |---|---|---|
 | `url` | `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); absent everywhere means the built-in default (CLI) or no advisor (embedders); `off` or blank disables the advisor |
-| `mode` | `METACODES_JEV_MODE` | `shadow` (when unset: consult and journal, provider-visible bytes unchanged) or `advisory` (the built-in default; judgments change injections and the order of `KgRecall` rows, and annotate `KgRemember` results) |
+| `mode` | `METACODES_JEV_MODE` | `shadow` (when unset: consult and journal, provider-visible bytes unchanged) or `advisory` (the built-in default; judgments change injections and annotate `KgRemember` results) |
 | `timeout_ms` (integer) | `METACODES_JEV_TIMEOUT_MS` | per-consultation deadline, default 2500, 100–30000; a miss falls back to the unadvised path with no retry |
 | `model` | `METACODES_JEV_MODEL` | expected model id; a response from any other model, or one that reports a priced tariff, is refused |
-| `decisions` (array of names, or a comma-separated string) | `METACODES_JEV_DECISIONS` (comma-separated) | subset of `scoped_recall`, `recall_evidence` (the order of `KgRecall` rows), `memory_relation`, `enumeration_intent` (default: all, except `scoped_recall` alone for the built-in default); a surface left out behaves exactly as with no advisor, and an unknown or empty list disables the advisor |
+| `decisions` (array of names, or a comma-separated string) | `METACODES_JEV_DECISIONS` (comma-separated) | subset of `scoped_recall`, `memory_relation`, `enumeration_intent` (default: all, except `scoped_recall` alone for the built-in default); a surface left out behaves exactly as with no advisor, and an unknown or empty list disables the advisor; the retired `recall_evidence` is skipped with a warning, so a list naming only it is empty |
 
 An unknown key in the `jev` object, a value of the wrong type, or an invalid
 value disables the advisor with a warning rather than falling back to a

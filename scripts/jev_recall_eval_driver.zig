@@ -1,27 +1,18 @@
-//! Zero-provider evaluation driver for the System-One recall policies.
+//! Zero-provider evaluation driver for the System-One scoped-recall gate.
 //!
 //! Replays rank-ordered TinyKG BM25 candidate pools through the production
 //! policies of `src/kg/scoped_recall.zig`: the BM25 floor baseline
-//! (`baselineSelection`), the judged gate (`Advisor.judgeRecallRelevance`
-//! followed by `judgedSelection`) and, from the same judgment, the judged
-//! KgRecall order (`judgedOrder`). Every candidate is cut with the same
+//! (`baselineSelection`) and the judged policy (`Advisor.judgeRecallRelevance`
+//! followed by `judgedSelection`). Every candidate is cut with the same
 //! query-focused window KgClient hands the judge, so the judge sees the bytes
 //! a live recall would show it.
 //! No provider is contacted; the only network peer is the METACODES_JEV_URL
 //! judge (mode is irrelevant here: both policies are computed on every case).
 //!
-//! usage: metacodes-jev-recall-eval --input cases.jsonl --output results.jsonl [--surface gate|kgrecall]
-//!   input:  {"case_id":s,"query":s,"user_request":s?,"candidates":[{"node_id":u,"kind":s,"schema_type":s,"score":f,"text":s}]}
+//! usage: metacodes-jev-recall-eval --input cases.jsonl --output results.jsonl
+//!   input:  {"case_id":s,"query":s,"candidates":[{"node_id":u,"kind":s,"schema_type":s,"score":f,"text":s}]}
 //!           candidates rank-ordered by BM25 score, already filtered to recallable kinds
-//!   --surface gate (default): the injection gate. The judge reads `query` as
-//!           the request (`judgeRecallRelevance`); output carries baseline,
-//!           judged and order.
-//!   --surface kgrecall: a model-issued KgRecall. `query` is the recall query
-//!           and `user_request` the request it serves; the judge reads
-//!           `recallToolRequest(query, user_request)` (`judgeRecallOrder`),
-//!           as `KgRecall` does. Output carries order only (baseline and
-//!           judged are gate policies and stay empty).
-//!   output: {"case_id":s,"status":s,"baseline":[u],"judged":[u],"order":[u],"percents":[u],"outcome":s,
+//!   output: {"case_id":s,"status":s,"baseline":[u],"judged":[u],"percents":[u],"outcome":s,
 //!            "elapsed_ms":u,"model":s,"question_set":s,"request_sha256":s}
 
 const std = @import("std");
@@ -41,18 +32,14 @@ const Candidate = struct {
 const Case = struct {
     case_id: []const u8,
     query: []const u8,
-    user_request: []const u8 = "",
     candidates: []const Candidate,
 };
-
-const Surface = enum { gate, kgrecall };
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
-    var surface: Surface = .gate;
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const flag = args[index];
@@ -61,8 +48,6 @@ pub fn main(init: std.process.Init) !void {
             input_path = args[index + 1];
         } else if (std.mem.eql(u8, flag, "--output")) {
             output_path = args[index + 1];
-        } else if (std.mem.eql(u8, flag, "--surface")) {
-            surface = std.meta.stringToEnum(Surface, args[index + 1]) orelse return error.UnknownSurface;
         } else return error.UnknownFlag;
         index += 1;
     }
@@ -80,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
         defer case_arena.deinit();
         const a = case_arena.allocator();
         const case = try std.json.parseFromSliceLeaky(Case, a, line, .{ .allocate = .alloc_always });
-        try evaluateCase(a, &runtime.advisor, surface, case, &out, arena);
+        try evaluateCase(a, &runtime.advisor, case, &out, arena);
     }
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output_path orelse return error.MissingOutput, .data = out.items });
 }
@@ -88,22 +73,20 @@ pub fn main(init: std.process.Init) !void {
 fn evaluateCase(
     a: std.mem.Allocator,
     advisor: *advisor_mod.Advisor,
-    surface: Surface,
     case: Case,
     out: *std.ArrayList(u8),
     out_allocator: std.mem.Allocator,
 ) !void {
     const query = case.query[0..@min(case.query.len, scoped_recall.MAX_QUERY_LEN)];
     const n = @min(case.candidates.len, advisor_mod.MAX_RECALL_CANDIDATES);
-    // The gate skips trivial turns; KgRecall judges any valid recall query.
-    const status: []const u8 = if (surface == .gate and query.len < scoped_recall.MIN_QUERY_LEN)
+    const status: []const u8 = if (query.len < scoped_recall.MIN_QUERY_LEN)
         "query_too_short"
     else if (n == 0)
         "no_hits"
     else
         "judged";
     if (!std.mem.eql(u8, status, "judged")) {
-        try out.print(out_allocator, "{{\"case_id\":{f},\"status\":\"{s}\",\"baseline\":[],\"judged\":[],\"order\":[],\"percents\":[],\"outcome\":\"skipped\",\"elapsed_ms\":0,\"model\":\"\",\"question_set\":\"\",\"request_sha256\":\"\"}}\n", .{ std.json.fmt(case.case_id, .{}), status });
+        try out.print(out_allocator, "{{\"case_id\":{f},\"status\":\"{s}\",\"baseline\":[],\"judged\":[],\"percents\":[],\"outcome\":\"skipped\",\"elapsed_ms\":0,\"model\":\"\",\"question_set\":\"\",\"request_sha256\":\"\"}}\n", .{ std.json.fmt(case.case_id, .{}), status });
         return;
     }
 
@@ -117,23 +100,14 @@ fn evaluateCase(
             .text = cc.jev_excerpt.focusedWindow(candidate.text, query, cc.jev_excerpt.JUDGE_WINDOW_BYTES),
         };
     }
-    const judgment = switch (surface) {
-        .gate => try advisor.judgeRecallRelevance(a, null, query, candidates[0..n]),
-        .kgrecall => try advisor.judgeRecallOrder(a, null, try advisor_mod.recallToolRequest(a, query, case.user_request), candidates[0..n]),
-    };
-    const baseline = switch (surface) {
-        .gate => scoped_recall.baselineSelection(scores[0..n], scoped_recall.DEFAULT_ABS_FLOOR),
-        .kgrecall => scoped_recall.Selection{},
-    };
-    const judged = if (surface == .gate and judgment.answered()) scoped_recall.judgedSelection(judgment.percents[0..judgment.count], scores[0..judgment.count], baseline) else scoped_recall.Selection{};
-    const order = if (judgment.answered()) scoped_recall.judgedOrder(judgment.percents[0..judgment.count], scores[0..judgment.count]) else scoped_recall.Order{};
+    const baseline = scoped_recall.baselineSelection(scores[0..n], scoped_recall.DEFAULT_ABS_FLOOR);
+    const judgment = try advisor.judgeRecallRelevance(a, null, query, candidates[0..n]);
+    const judged = if (judgment.answered()) scoped_recall.judgedSelection(judgment.percents[0..judgment.count], scores[0..judgment.count], baseline) else scoped_recall.Selection{};
 
     try out.print(out_allocator, "{{\"case_id\":{f},\"status\":\"judged\",\"baseline\":[", .{std.json.fmt(case.case_id, .{})});
-    try appendNodeIds(out, out_allocator, case.candidates, baseline.slice());
+    try appendNodeIds(out, out_allocator, case.candidates, baseline);
     try out.appendSlice(out_allocator, "],\"judged\":[");
-    try appendNodeIds(out, out_allocator, case.candidates, judged.slice());
-    try out.appendSlice(out_allocator, "],\"order\":[");
-    try appendNodeIds(out, out_allocator, case.candidates, order.slice());
+    try appendNodeIds(out, out_allocator, case.candidates, judged);
     try out.appendSlice(out_allocator, "],\"percents\":[");
     for (judgment.percents[0..judgment.count], 0..) |percent, position| {
         if (position > 0) try out.append(out_allocator, ',');
@@ -152,9 +126,9 @@ fn appendNodeIds(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     candidates: []const Candidate,
-    positions: []const u8,
+    selection: scoped_recall.Selection,
 ) !void {
-    for (positions, 0..) |position, emitted| {
+    for (selection.slice(), 0..) |position, emitted| {
         if (emitted > 0) try out.append(allocator, ',');
         try out.print(allocator, "{d}", .{candidates[position].node_id});
     }

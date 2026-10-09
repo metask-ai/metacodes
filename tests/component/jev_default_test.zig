@@ -95,7 +95,6 @@ fn expectBuiltinAdvisor(app: *cc.app_module.App) anyerror!void {
     // Only the recall gate is advised; the other surfaces run as with no
     // advisor (the narrowing itself is proven in jev_memory_plane_test.zig).
     try std.testing.expect(runtime.advisor.advises(.scoped_recall));
-    try std.testing.expect(!runtime.advisor.advises(.recall_evidence));
     try std.testing.expect(!runtime.advisor.advises(.memory_relation));
     try std.testing.expect(!runtime.advisor.advises(.enumeration_intent));
 }
@@ -150,6 +149,8 @@ test "L2 jev default: config.json overrides or turns off the built-in advisor" {
     try withApp(root, "{\"jev\":{\"url\":\"\"}}", true, expectNoAdvisor);
     try withApp(root, "{\"jev\":{\"url\":\"http://127.0.0.1:9\",\"mode\":\"shadow\"}}", true, expectFileAdvisor);
     // `decisions` alone replaces the default's surface list and keeps its service.
+    // The list still names the retired recall_evidence: it is skipped, and the
+    // advisor keeps every surface that exists.
     try withApp(
         root,
         "{\"jev\":{\"decisions\":[\"scoped_recall\",\"recall_evidence\",\"memory_relation\",\"enumeration_intent\"]}}",

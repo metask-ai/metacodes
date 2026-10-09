@@ -18,7 +18,6 @@ from unittest import mock
 
 from scripts.eval.memory_agent_runtime import (
     _agent_batch,
-    _arm_case_batch,
     _atomic_memory_batch,
     _disallowed_provider_tools,
     _query_plan_evaluator_invalid_reason,
@@ -68,7 +67,6 @@ from scripts.eval.memory_replay import (
     PRODUCTION_PRICING_PROVENANCE,
     PRODUCTION_AUTO_COMPACT_POLICY,
     PRODUCTION_CHILD_PATH,
-    INJECTION_ONLY_ARMS,
     PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
     PRODUCTION_FILESYSTEM_ISOLATION,
     LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,
@@ -740,51 +738,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 _cassette_treatment_activation(cassette(directory, *exposed), "tinykg", "glm-5.2", injection_only=True)
             full = _cassette_treatment_activation(cassette(directory, *exposed), "tinykg", "glm-5.2")
             self.assertEqual(full["tinykg_tools_active"], ["KgContext", "KgRecall", "KgRemember"])
-
-    def test_atomic_store_arms_keep_the_tinykg_tools_and_advise_their_own_surfaces(self):
-        from scripts.eval.memory_replay import ATOMIC_STORE_ARMS, _production_runtime_arm
-
-        self.assertTrue(INJECTION_ONLY_ARMS < ATOMIC_STORE_ARMS)
-        environments = {}
-        for arm in ("tinykg_jev_recall_atomic", "tinykg_jev_order_atomic"):
-            self.assertEqual(ARM_TO_RUNTIME[arm], "tinykg")
-            self.assertEqual(_production_runtime_arm(arm), "tinykg")
-            self.assertIn(arm, ATOMIC_STORE_ARMS)
-            self.assertIn(arm, SYSTEM_ONE_ARMS)
-            self.assertNotIn(arm, INJECTION_ONLY_ARMS)
-            # The model can still recall and open memories itself.
-            self.assertEqual(_disallowed_provider_tools(arm), PRODUCTION_DISALLOWED_PROVIDER_TOOLS)
-            environments[arm] = _system_one_environment(arm, "http://127.0.0.1:9", "m")
-        self.assertEqual(environments["tinykg_jev_recall_atomic"]["METACODES_JEV_DECISIONS"], "scoped_recall")
-        self.assertEqual(
-            environments["tinykg_jev_order_atomic"]["METACODES_JEV_DECISIONS"],
-            "scoped_recall,recall_evidence",
-        )
-        # The pair differs in the advised surfaces and nothing else.
-        self.assertEqual(
-            {key: value for key, value in environments["tinykg_jev_order_atomic"].items() if key != "METACODES_JEV_DECISIONS"},
-            {key: value for key, value in environments["tinykg_jev_recall_atomic"].items() if key != "METACODES_JEV_DECISIONS"},
-        )
-
-    def test_atomic_store_arms_build_their_store_from_turn_level_memories(self):
-        from scripts.eval.memory_tinykg_local import _batch_bytes
-
-        raw = _batch_bytes(
-            [
-                {"op": "node", "id": 1, "kind": "concept", "name": "Session 2023/05/01\nuser: hi"},
-                {"op": "node", "id": 2, "kind": "evidence", "name": "Session 2023/05/01 user: hi"},
-            ],
-            [{"op": "edge", "id": 1, "src": 1, "rel": "based_on", "dst": 2}],
-        )
-        logical = {1: "s1", 2: "s1"}
-        for arm in ("tinykg_jev_recall_atomic", "tinykg_jev_order_atomic", "tinykg_jev_inject"):
-            batch, kept, root = _arm_case_batch(arm, "episodic_recall", raw, logical, 1)
-            kinds = [json.loads(line).get("kind") for line in batch.decode("utf-8").split("\n") if line][1:]
-            self.assertEqual((kinds, dict(kept), root), (["evidence"], {2: "s1"}, 2))
-        for arm in ("tinykg_jev", "tinykg_jev_recall", "tinykg_lexical"):
-            self.assertEqual(_arm_case_batch(arm, "episodic_recall", raw, logical, 1), (raw, logical, 1))
-        with self.assertRaisesRegex(ValidationError, "episodic recall stores only"):
-            _arm_case_batch("tinykg_jev_order_atomic", "procedural_transfer", raw, logical, 1)
 
     def test_atomic_memory_batch_keeps_only_turn_level_memories(self):
         from scripts.eval.memory_tinykg_local import _batch_bytes
@@ -5613,18 +5566,7 @@ class SystemOneJudgeProxyTests(unittest.TestCase):
     def test_jev_arm_is_the_tinykg_runtime_plus_the_judge(self):
         self.assertEqual(ARM_TO_RUNTIME["tinykg_jev"], "tinykg")
         self.assertEqual(ARM_TO_RUNTIME["tinykg_jev_recall"], "tinykg")
-        self.assertEqual(
-            SYSTEM_ONE_ARMS,
-            frozenset(
-                {
-                    "tinykg_jev",
-                    "tinykg_jev_recall",
-                    "tinykg_jev_inject",
-                    "tinykg_jev_recall_atomic",
-                    "tinykg_jev_order_atomic",
-                }
-            ),
-        )
+        self.assertEqual(SYSTEM_ONE_ARMS, frozenset({"tinykg_jev", "tinykg_jev_recall", "tinykg_jev_inject"}))
 
     def test_attribution_arm_narrows_the_child_advisor_to_the_recall_gate(self):
         full = _system_one_environment("tinykg_jev", "http://127.0.0.1:9", "m")

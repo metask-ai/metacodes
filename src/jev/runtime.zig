@@ -41,6 +41,9 @@ pub const Settings = struct {
     timeout_ms: u32 = client_mod.DEFAULT_TIMEOUT_MS,
     expected_model: ?[]const u8 = null,
     surfaces: advisor_mod.Surfaces = .initFull(),
+    /// `decisions` named a retired surface (`advisor.RETIRED_SURFACES`); it
+    /// advises nothing and `load` says so.
+    names_retired_surface: bool = false,
 };
 
 pub const SettingsError = error{ InvalidMode, InvalidTimeout, InvalidDecisions };
@@ -71,22 +74,36 @@ pub fn parseSettings(
         const value = std.mem.trim(u8, raw, " \t\r\n");
         if (value.len > 0) settings.expected_model = value;
     }
-    if (decisions) |raw| settings.surfaces = try parseSurfaces(raw);
+    if (decisions) |raw| {
+        const parsed = try parseSurfaces(raw);
+        settings.surfaces = parsed.surfaces;
+        settings.names_retired_surface = parsed.names_retired;
+    }
     return settings;
 }
 
-/// A comma-separated, non-empty subset of `advisor.Surface` names. An empty
-/// list is refused rather than read as "none": that is what leaving
-/// METACODES_JEV_URL unset means.
-fn parseSurfaces(raw: []const u8) SettingsError!advisor_mod.Surfaces {
-    var surfaces: advisor_mod.Surfaces = .initEmpty();
+const ParsedSurfaces = struct { surfaces: advisor_mod.Surfaces, names_retired: bool };
+
+/// A comma-separated, non-empty subset of `advisor.Surface` names. A retired
+/// name is accepted and skipped, so an old configuration keeps its other
+/// surfaces instead of losing the advisor. A list left empty, or naming only
+/// retired surfaces, is refused rather than read as "none": that is what
+/// leaving METACODES_JEV_URL unset means.
+fn parseSurfaces(raw: []const u8) SettingsError!ParsedSurfaces {
+    var parsed: ParsedSurfaces = .{ .surfaces = .initEmpty(), .names_retired = false };
     var names = std.mem.splitScalar(u8, raw, ',');
-    while (names.next()) |name| {
+    next: while (names.next()) |name| {
         const value = std.mem.trim(u8, name, " \t\r\n");
-        surfaces.insert(std.meta.stringToEnum(advisor_mod.Surface, value) orelse return error.InvalidDecisions);
+        for (advisor_mod.RETIRED_SURFACES) |retired| {
+            if (std.mem.eql(u8, value, retired)) {
+                parsed.names_retired = true;
+                continue :next;
+            }
+        }
+        parsed.surfaces.insert(std.meta.stringToEnum(advisor_mod.Surface, value) orelse return error.InvalidDecisions);
     }
-    if (surfaces.count() == 0) return error.InvalidDecisions;
-    return surfaces;
+    if (parsed.surfaces.count() == 0) return error.InvalidDecisions;
+    return parsed;
 }
 
 pub fn settingsFromEnv() SettingsError!?Settings {
@@ -332,6 +349,8 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, home: []const u8, state_ro
         return null;
     };
     log.info("jev", "System-One advisor enabled mode={s} timeout_ms={d} source={s}", .{ @tagName(resolved.settings.mode), resolved.settings.timeout_ms, @tagName(resolved.source) });
+    if (resolved.settings.names_retired_surface)
+        log.warn("jev", "decisions names a retired surface (recall_evidence): it advises nothing; KgRecall no longer consults the judge", .{});
     return runtime;
 }
 
@@ -352,7 +371,8 @@ test "parseSettings: shadow is the default mode and every field is honored" {
     try testing.expectEqual(advisor_mod.Mode.shadow, defaults.mode);
     try testing.expectEqual(client_mod.DEFAULT_TIMEOUT_MS, defaults.timeout_ms);
     try testing.expect(defaults.expected_model == null);
-    try testing.expectEqual(@as(usize, 4), defaults.surfaces.count());
+    try testing.expectEqual(@as(usize, 3), defaults.surfaces.count());
+    try testing.expect(defaults.surfaces.eql(.initFull()));
 
     const explicit = (try parseSettings(" http://h:1 ", "advisory", "800", "metask-jev-4b", " scoped_recall ,memory_relation")).?;
     try testing.expectEqualStrings("http://h:1", explicit.origin);
@@ -361,8 +381,19 @@ test "parseSettings: shadow is the default mode and every field is honored" {
     try testing.expectEqualStrings("metask-jev-4b", explicit.expected_model.?);
     try testing.expect(explicit.surfaces.contains(.scoped_recall));
     try testing.expect(explicit.surfaces.contains(.memory_relation));
-    try testing.expect(!explicit.surfaces.contains(.recall_evidence));
     try testing.expect(!explicit.surfaces.contains(.enumeration_intent));
+    try testing.expect(!explicit.names_retired_surface);
+}
+
+test "parseSettings: a retired surface name is skipped, never the whole advisor" {
+    // An old configuration keeps the surfaces that still exist...
+    const old = (try parseSettings("http://h:1", "advisory", null, null, "scoped_recall,recall_evidence")).?;
+    try testing.expect(old.surfaces.eql(.initOne(.scoped_recall)));
+    try testing.expect(old.names_retired_surface);
+    // ...and one that named only retired surfaces advises nothing, so it is
+    // refused like an empty list instead of quietly running no surface.
+    try testing.expectError(error.InvalidDecisions, parseSettings("http://h", null, null, null, "recall_evidence"));
+    try testing.expectError(error.InvalidDecisions, parseSettings("http://h", null, null, null, " recall_evidence , "));
 }
 
 test "parseSettings: malformed mode, timeout or decisions are refused, not guessed" {
@@ -464,8 +495,8 @@ test "resolve: the built-in default applies only when the host asks, beneath fil
     var scoped_and_relation: advisor_mod.Surfaces = .initOne(.scoped_recall);
     scoped_and_relation.insert(.memory_relation);
     try testing.expect(file_surfaces.settings.surfaces.eql(scoped_and_relation));
-    const env_surfaces = (try resolveWith(a, null, true, .{ .decisions = "recall_evidence" })).on;
-    try testing.expect(env_surfaces.settings.surfaces.eql(.initOne(.recall_evidence)));
+    const env_surfaces = (try resolveWith(a, null, true, .{ .decisions = "enumeration_intent" })).on;
+    try testing.expect(env_surfaces.settings.surfaces.eql(.initOne(.enumeration_intent)));
     // ...and the env's replace both.
     const env_url = (try resolveWith(a, "{\"jev\":{\"url\":\"http://file:1\"}}", true, .{ .url = "http://env:2" })).on;
     try testing.expectEqualStrings("http://env:2", env_url.settings.origin);
@@ -523,5 +554,5 @@ test "Runtime pins the advisor to its own client, home copy and surfaces" {
     try testing.expect(runtime.advisor.actuates());
     try testing.expectEqualStrings("/Users/alice", runtime.advisor.home);
     try testing.expect(runtime.advisor.advises(.scoped_recall));
-    try testing.expect(!runtime.advisor.advises(.recall_evidence));
+    try testing.expect(!runtime.advisor.advises(.memory_relation));
 }
