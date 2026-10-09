@@ -144,6 +144,11 @@ status, compatibility boundaries, and entry points are defined by
   directory entries with the macOS `dirent` layout and found no cassette on
   Linux; it now lists them portably. The TinyKG service end-to-end tests run on
   Windows except the one that needs a POSIX symlink.
+- Paid memory evaluations: the runner's loopback proxy for a Jev arm's judge
+  now reaches the judge directly, as the CLI does. It honoured `HTTP(S)_PROXY`
+  and the macOS system proxy, so behind a proxy that could not reach the judge
+  an unreachable judge was recorded as the proxy's 503 instead of 502, and a
+  proxy that could reach it measured a path the CLI never takes.
 
 ## 0.3.1 — 2026-10-07
 

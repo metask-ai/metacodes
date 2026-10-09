@@ -1,6 +1,7 @@
 import copy
 import contextlib
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -8,6 +9,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 import urllib.request
@@ -5506,15 +5508,60 @@ class SystemOneJudgeProxyTests(unittest.TestCase):
     ).encode("utf-8")
 
     def _post(self, origin: str, body: bytes):
+        # The child reaches the loopback judge directly, never through an
+        # ambient proxy; the test client must not either.
         request = urllib.request.Request(
             origin + "/v1/systemone", data=body, headers={"Content-Type": "application/json"}, method="POST"
         )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with opener.open(request, timeout=5) as response:
                 return response.status, json.loads(response.read())
         except urllib.error.HTTPError as exc:
             with exc:
                 return exc.code, None
+
+    @contextlib.contextmanager
+    def _ambient_proxy(self):
+        """An HTTP(S)_PROXY that answers 503 to everything and counts its hits."""
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):  # noqa: N802 - stdlib hook name
+                hits.append(self.path)
+                self.rfile.read(int(self.headers.get("content-length") or "0"))
+                self.send_response(503)
+                self.send_header("content-length", "0")
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        address = f"http://127.0.0.1:{server.server_address[1]}"
+        # A non-empty no_proxy that covers nothing, so loopback is not exempt.
+        environment = {
+            name: value
+            for upper, value in (
+                ("HTTP_PROXY", address),
+                ("HTTPS_PROXY", address),
+                ("NO_PROXY", "example.invalid"),
+            )
+            for name in (upper, upper.lower())
+        }
+        # urlopen() caches its opener, and with it the proxies, on first use;
+        # drop the cache so a regression to urlopen() sees this proxy no
+        # matter which test called urlopen() first.
+        try:
+            with mock.patch.dict(os.environ, environment), mock.patch.object(urllib.request, "_opener", None):
+                yield hits
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_jev_arm_is_the_tinykg_runtime_plus_the_judge(self):
         self.assertEqual(ARM_TO_RUNTIME["tinykg_jev"], "tinykg")
@@ -5564,6 +5611,24 @@ class SystemOneJudgeProxyTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("sufficient", payload["answers"])
         self.assertEqual(proxy.summary()["answered"], 1)
+        self.assertEqual(upstream.summary()["requests"], 1)
+
+    def test_forwarding_ignores_an_ambient_proxy_that_cannot_reach_the_upstream(self):
+        with self._ambient_proxy() as hits:
+            with SystemOneJudgeProxy("http://127.0.0.1:9", timeout_seconds=1.0) as proxy:
+                status, _ = self._post(proxy.origin, self.REQUEST)
+        self.assertEqual(status, 502)
+        self.assertEqual(hits, [])
+        self.assertEqual(proxy.summary()["answered"], 0)
+
+    def test_forwarding_reaches_the_upstream_past_an_ambient_proxy(self):
+        with self._ambient_proxy() as hits:
+            with SystemOneJudgeProxy(None) as upstream:
+                with SystemOneJudgeProxy(upstream.origin) as proxy:
+                    status, payload = self._post(proxy.origin, self.REQUEST)
+        self.assertEqual(status, 200)
+        self.assertIn("sufficient", payload["answers"])
+        self.assertEqual(hits, [])
         self.assertEqual(upstream.summary()["requests"], 1)
 
     def test_upstream_must_be_a_bare_origin(self):
