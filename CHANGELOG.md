@@ -93,11 +93,15 @@ status, compatibility boundaries, and entry points are defined by
   not comparable. Offline on LongMemEval-S holdout, turn-level memories got
   the gold row first in 272 of 288 cases against 258 for BM25 order
   (p = 0.0005); whole-session memories were even at the first row and
-  better within the first three. The surface stays out of the built-in
-  default until a paid paired run shows it adds to the gate. The driver
-  `metacodes-jev-recall-eval` gained `--surface kgrecall`, and
+  better within the first three. A paid paired pilot on turn-level memories
+  (139 cases) found no gain: gold memory opened 56 against 53 with the gate
+  alone (p = 0.72) after a post hoc re-validation, because its pre-registered
+  analysis was voided by the evaluator's merge-order check, which rejects
+  every reordered batch. The surface stays out of the built-in default. The
+  driver `metacodes-jev-recall-eval` gained `--surface kgrecall`,
   `scripts/eval/jev_recall_pools.py` builds and scores its LongMemEval-S
-  pools.
+  pools, and the paid memory runner gained atomic-store Jev arms that keep
+  the TinyKG tools (`tinykg_jev_recall_atomic`, `tinykg_jev_order_atomic`).
 
 ### Fixed
 
