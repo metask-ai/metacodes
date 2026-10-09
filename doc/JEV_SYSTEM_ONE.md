@@ -132,7 +132,7 @@ BM25 取 8 个候选 → 地板：top 分 < 3.0 ⇒ 判定答案缺席，不注�
 
 ## 5. 与 Codex 方案的融合
 
-Codex 的《Jev × metacodes Harness 接入方案》目标是用 Jev（+ JevTree 图搜索）改进长任务的
+Codex 的[《Jev × metacodes Harness 接入方案》](JEV_HARNESS_INTEGRATION_DESIGN.md)目标是用 Jev（+ JevTree 图搜索）改进长任务的
 **下一步动作选择**。逐条取舍如下：
 
 | Codex 主张 | 处理 | 理由 |
@@ -151,6 +151,19 @@ Codex 的《Jev × metacodes Harness 接入方案》目标是用 Jev（+ JevTree
 | 动作族评分（Read/Grep/RunTests/Write…）与 bounded nudge | **推迟** | nudge 每轮进入 provider 可见字节，与缓存契约冲突，需先设计追加面；也缺少把“更好的下一步”变成分数的评估 |
 | Stage 0 离线回放 | **采纳为零 provider 驱动** | `scripts/jev_recall_eval_driver.zig` 直接调用生产策略函数回放候选池，见 §6 |
 | “JevTree README 的数字不是 metacodes 的 SLA，以本项目冻结配对评估为准” | **采纳** | §6 全部是本项目评估 |
+
+JevTree 推迟的另一条依据来自本项目对它自带数字的消融（2026-10-03，jev-tree commit
+`c129b4d`，ToT Game24 第 901–1000 题、MiniGrid-DoorKey-5x5 种子 1000–1099；消融脚本没有入库）：
+
+- **Game24**：把 Jev 换成均匀、随机、甚至偏好远离 24 的对抗打分，`enumerate_probability_tree`
+  配 `downstream_success` 仍然 100/100。每题完整树约 3,859 个叶子，成败直接读精确验证器，
+  Jev 的概率不改变解出数。README 里“局部贪心 7/100 → JevTree 100/100”比较的是不搜索与穷举搜索。
+- **MiniGrid**（自适应图，深度 40）：可达状态只有约 100 个，预算 ≥100 时均匀先验也是 100/100。
+  唯一的真实 Jev 效应出现在预算 50：均匀 30/100，`metask-jev-4b` 51/100（z≈3.0），代价是
+  1,149 次请求、439 s，均匀只用 8 s。Jev 闭环贪心是 0/100（拾放循环、无钥匙开锁门）。
+
+结论：JevTree 的收益来自可枚举动作、廉价确定性的 `apply` 和精确验证器，这三样编码任务的下一步
+选择都没有。评估任何“判断模型带来的提升”时先加一个空判断臂（均匀或随机）。
 
 ## 6. 评估
 
