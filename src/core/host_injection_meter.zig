@@ -14,10 +14,13 @@ const std = @import("std");
 /// 每 run **咨询性 nudge** 总上限 = 各门预算之和:required-first 修复(2)+ 验证终局闸(2)
 /// + 需求账本(2)+ 任务义务(3)+ 交付节奏(2)+ 进度更新(2)。cap=Σ ⇒ 计量器零行为变化,
 /// 只把隐式合成上界变成显式受执行的不变量;agent_loop.zig 里的 comptime 断言让 Σ 与 cap
-/// 分不开——加门或改某门预算而不改 cap 编译不过。收紧 cap(< Σ)是显式政策决定。两类注入**有意排除**:①一次性协议注入(账本 prompt、
+/// 分不开——加门或改某门预算而不改 cap 编译不过。收紧 cap(< Σ)是显式政策决定。三类注入**有意排除**:①一次性协议注入(账本 prompt、
 /// 结局 note、截断续写)——无条件、按构造各至多 1 次;②完整性修复
 /// (KG 枚举修复)——其语义是"修复或 fail-closed",不可静默放弃,进表
-/// 会把"额度尽"误判成完整性违规(review 抓到的 tool_loop 误杀地雷)。
+/// 会把"额度尽"误判成完整性违规(review 抓到的 tool_loop 误杀地雷);③由宿主
+/// 外部裁决驱动、自带上界的续跑——检查门(CheckGate.lean)与测试完整性义务
+/// (TestIntegrity.lean,每 run 1 次):排在咨询类门之后,进表会让进度/节奏类
+/// nudge 用光的额度把完整性信号静默吞掉。
 // 账目:required-first provider repair 2 + verification 2 +
 // requirement-ledger 2 + task-obligation 3 + delivery-cadence 2 +
 // progress-update 2 = 13。
@@ -33,6 +36,7 @@ pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = 13;
 pub const HOST_TEXT_MARKERS = [_][]const u8{
     @import("progress_updates.zig").MARKER,
     @import("delivery_cadence.zig").MARKER,
+    @import("test_integrity.zig").MARKER,
 };
 
 pub fn isHostInjectedText(text: []const u8) bool {
@@ -45,6 +49,7 @@ pub fn isHostInjectedText(text: []const u8) bool {
 test "isHostInjectedText: gate markers, not user prose" {
     try std.testing.expect(isHostInjectedText("[progress update]\nplease"));
     try std.testing.expect(isHostInjectedText("[delivery cadence]\nplease"));
+    try std.testing.expect(isHostInjectedText("[test integrity]\nThis run changed tests"));
     try std.testing.expect(!isHostInjectedText("[progress] is my own bracket"));
     try std.testing.expect(!isHostInjectedText("fix the bug"));
 }

@@ -20,6 +20,7 @@ const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const check_gate_mod = @import("../core/check_gate.zig");
+const test_integrity_mod = @import("../core/test_integrity.zig");
 const host_injection_meter = @import("../core/host_injection_meter.zig");
 const input = @import("input.zig");
 const complete = @import("complete.zig");
@@ -828,6 +829,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // Host check gate: primary run only, same host-contract shape (a macro
         // run must not trigger a check or emit a second terminal record).
         run_opts.check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max);
+        // Test integrity: primary run only, same host-contract shape. The end
+        // state is printed after the run whatever the model did.
+        var integrity_report = test_integrity_mod.Report.init(allocator);
+        defer integrity_report.deinit();
+        run_opts.test_integrity = test_integrity_mod.optionsFromFlags(app.config.test_integrity, app.config.test_integrity_observe);
+        if (run_opts.test_integrity) |*integrity| integrity.report = &integrity_report;
         run_opts.ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null;
         run_opts.spawn_tick_fn = spawn_tick;
         // issue #16:turn 边界刷新 OAuth access token。commit 时拷的是当时有效的
@@ -882,6 +889,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
         // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
         app.persistTranscript();
+
+        // Test integrity: tests that existed before the run were rewritten,
+        // deleted or disabled — the user hears it from the host, not only
+        // from the model's own account.
+        if (integrity_report.renderNotice(allocator) catch null) |notice| {
+            defer allocator.free(notice);
+            std.debug.print("\x1b[33m{s}\x1b[0m\n", .{notice});
+        }
 
         // issue #16:把本轮新增的控制面**决策**投影进 TinyKG 审计面。turn 边界,
         // 不在请求路径上;审计面不可用只记账,不影响路由。

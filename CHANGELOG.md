@@ -17,8 +17,11 @@ status, compatibility boundaries, and entry points are defined by
   the model ends its turn after changing the workspace, the host runs the
   pinned check command itself and turns the result into a verdict: passed,
   failed, tainted (the run changed the program the check executes or a test
-  file a result names, or the check passed after the run modified an existing
-  test file) or unavailable (spawn failure, 180 s timeout, or exit 126/127).
+  file a result names, or the check passed while tests that existed before the
+  run are weakened — read from the test-integrity sensor below, so appending
+  tests no longer taints a pass — or a file tool changed an existing test file
+  that git ignores) or unavailable (spawn failure, 180 s timeout, or exit
+  126/127).
   In enforce mode a clean failure continues the same conversation with the
   verdict — failing names and reasons from the JUnit/pytest codecs, and the
   output tail — plus an escalating reading from the cognitive-mode schedule,
@@ -36,6 +39,34 @@ status, compatibility boundaries, and entry points are defined by
   continuation budget is separate from the host-injection meter: it is driven
   by a verdict, not advice. Headless and the primary REPL run honour the
   flags; macro runs and embedders do not.
+- Test integrity obligation (`--test-integrity`, or `--test-integrity-observe`
+  to record only). Tests that existed when a run started are the user's
+  record of behavior that callers rely on. At run start the host records the
+  commit `HEAD` and the content of every test-suite file that is already
+  modified or untracked (it writes nothing to the repository); when the model
+  ends its turn after using a tool, it compares every suite file below the
+  working directory with that baseline, ignoring whitespace and line order. A
+  test case file is weakened when an existing non-blank, non-import,
+  non-comment line is gone or a skip/xfail/only marker was added — appending
+  tests is fine; any change to another suite file (`conftest.py`, runners,
+  data under `tests/`) and any deletion is weakening. The sensor reads the
+  workspace, not tool events, so Bash edits, subagents and commits are all
+  seen, and restoring the lines disarms it. In enforce mode the first stop
+  with weakened tests earns one message that names the files and the removed
+  lines and asks the model to restore them unless the request explicitly
+  requires the change, in which case it must quote that sentence in its final
+  answer. Either way the host reports the end state to the user: a `⚠` line
+  after the REPL run, a stderr line in headless text mode, a `test_integrity`
+  object in `--json` output. Each armed run writes one `test_integrity`
+  tool-observation record (`metacodes-test-integrity-v1`: outcome
+  `clean`/`restored`/`kept_cited`/`kept_silent`/`observed`, counts only, no
+  paths). The policy — pristine tests never messaged, observe never messages,
+  at most one message per run, and composed with the check gate the check
+  still runs at most budget + 5 + 1 times — is proven in
+  `control-plane/lean/MetaCodesControl/TestIntegrity.lean` (propext only).
+  The budget sits outside the host-injection meter, so advisory nudges cannot
+  use it up. Headless and the primary REPL run honour the flags; macro runs
+  and embedders do not.
 - Stop hooks can keep the run going, with Claude Code semantics: exit code 2
   or stdout `{"decision":"block","reason":…}` appends
   `Stop hook feedback:\n<reason>` (the reason defaults to the exit-2 stderr)

@@ -316,6 +316,7 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
         final_text,
         "final",
         null,
+        null,
         result,
         &cc.app_module.UsageTotals{},
         "fixture-model",

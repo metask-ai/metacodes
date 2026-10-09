@@ -16,6 +16,7 @@ const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const check_gate_mod = @import("../core/check_gate.zig");
+const test_integrity_mod = @import("../core/test_integrity.zig");
 const output_semantics = @import("../core/output_semantics.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const permission_mod = @import("../permission.zig");
@@ -340,6 +341,11 @@ pub fn run(
     var output_ledger = output_semantics.Ledger.init(allocator);
     defer output_ledger.deinit();
     run_options.output_ledger = &output_ledger;
+    // Test integrity: the end state of the suite, for the user (JSON field or
+    // a stderr notice), whether or not the model was asked to restore it.
+    var integrity_report = test_integrity_mod.Report.init(allocator);
+    defer integrity_report.deinit();
+    if (run_options.test_integrity) |*integrity| integrity.report = &integrity_report;
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
@@ -462,11 +468,12 @@ pub fn run(
     defer if (final_text_owned and final_text.len > 0) allocator.free(final_text);
 
     if (json_output) {
-        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, result, &app.usage, app.activeModel());
+        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, &integrity_report, result, &app.usage, app.activeModel());
     } else {
         // 纯文本：直接打模型最终回复 + 结尾换行
         writeStdout(final_text);
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
+        printIntegrityNotice(allocator, &integrity_report);
     }
 
     return exitCodeFor(result.stop_reason);
@@ -528,6 +535,7 @@ fn buildOptions(
         .progress_updates = app.config.progress_updates and app.config.stream_json,
         .progress_updates_observe = app.config.progress_updates_observe,
         .check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max),
+        .test_integrity = test_integrity_mod.optionsFromFlags(app.config.test_integrity, app.config.test_integrity_observe),
         .delivery_cadence_thresholds = .{
             .first = app.config.delivery_cadence_first orelse delivery_cadence_mod.DEFAULT_FIRST_THRESHOLD,
             .second = app.config.delivery_cadence_second orelse delivery_cadence_mod.DEFAULT_SECOND_THRESHOLD,
@@ -678,6 +686,9 @@ pub fn resumeSuspended(
         run_control.formalGate(),
     );
     resume_options.output_ledger = &output_ledger;
+    var integrity_report = test_integrity_mod.Report.init(allocator);
+    defer integrity_report.deinit();
+    if (resume_options.test_integrity) |*integrity| integrity.report = &integrity_report;
     const result = agent_loop.resumeRun(
         &app.conversation,
         app.provider(),
@@ -715,10 +726,11 @@ pub fn resumeSuspended(
     const text_kind = if (projected.text != null) projected.kind else fallbackTextKind(final_text);
     defer if (final_text_owned and final_text.len > 0) allocator.free(final_text);
     if (json_output) {
-        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, result, &app.usage, app.activeModel());
+        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, &integrity_report, result, &app.usage, app.activeModel());
     } else {
         writeStdout(final_text);
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
+        printIntegrityNotice(allocator, &integrity_report);
     }
     return exitCodeFor(result.stop_reason);
 }
@@ -827,11 +839,12 @@ fn emitJson(
     final_text: []const u8,
     text_kind: []const u8,
     changes: ?*@import("../core/file_change.zig").Journal,
+    integrity: ?*const test_integrity_mod.Report,
     result: agent_loop.RunResult,
     usage: *const app_mod.UsageTotals,
     model: []const u8,
 ) !void {
-    const line = try buildResultLine(allocator, final_text, text_kind, changes, result, usage, model);
+    const line = try buildResultLine(allocator, final_text, text_kind, changes, integrity, result, usage, model);
     defer allocator.free(line);
     writeStdout(line);
 }
@@ -847,6 +860,9 @@ pub fn buildResultLine(
     /// 信封(`{schema_version, truncated, changes[]}`,由该模块自己拼,不在这里散装),
     /// 消费者拿实际改动不解析 tool_result 里的工具私有 gitDiff。
     changes: ?*@import("../core/file_change.zig").Journal,
+    /// Test-integrity end state (core/test_integrity.zig). Filled → the line
+    /// carries a `test_integrity` object; unfilled or null → no field.
+    integrity: ?*const test_integrity_mod.Report,
     result: agent_loop.RunResult,
     usage: *const app_mod.UsageTotals,
     model: []const u8,
@@ -893,8 +909,20 @@ pub fn buildResultLine(
         try aw.writer.writeAll(",\"file_changes\":");
         try file_change.writeJsonEnvelope(&aw.writer, records, journal.truncated);
     }
+    if (integrity) |report| if (report.filled) {
+        try aw.writer.writeAll(",\"test_integrity\":");
+        try report.writeJson(&aw.writer);
+    };
     try aw.writer.writeAll("}\n");
     return try aw.toOwnedSlice();
+}
+
+/// Plain-text mode keeps stdout for the answer; the integrity notice goes to
+/// stderr, where a person running the command still sees it.
+fn printIntegrityNotice(allocator: std.mem.Allocator, report: *const test_integrity_mod.Report) void {
+    const notice = (report.renderNotice(allocator) catch return) orelse return;
+    defer allocator.free(notice);
+    std.debug.print("{s}\n", .{notice});
 }
 
 /// 退出码逻辑(提 pub 供 L2):受控停止 → 0;suspended → 2(挂起待恢复,非失败);

@@ -4218,6 +4218,112 @@ class WorkBuddyRequirementLedgerRecordTest(unittest.TestCase):
             self._metrics(bad)
 
 
+class WorkBuddyTestIntegrityRecordTest(unittest.TestCase):
+    """Field-level contract for the test integrity journal record (the
+    union-roster probe only proves the KIND is known)."""
+
+    def _rows(self, *records):
+        rows = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+        ]
+        for index, record in enumerate(records, start=1):
+            rows.append(
+                {"schema_version": "metacodes-tool-observation-journal-v1",
+                 "sequence": index, "monotonic_elapsed_ns": index + 1,
+                 "session_id": "s" * 24, "run_id": "r" * 24,
+                 "event": {"tool_observation": {"test_integrity": record}}})
+        rows.append(
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": len(records) + 1, "monotonic_elapsed_ns": len(records) + 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}})
+        return rows
+
+    def _metrics(self, *records):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "t.jsonl"
+            observation = root / "o.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            observation.write_text(
+                "".join(json.dumps(r) + "\n" for r in self._rows(*records)),
+                encoding="utf-8",
+            )
+            return load_control_metrics(transcript, observation)
+
+    def _restored(self):
+        return {
+            "schema_version": "metacodes-test-integrity-v1",
+            "enforced": True, "coverage": "git", "scans": 2, "nudges": 1, "max_nudges": 1,
+            "outcome": "restored", "files_weakened": 0, "files_weakened_peak": 1,
+            "removed_lines": 0, "removed_assert_lines": 0, "skip_markers_added": 0,
+            "deleted_files": 0, "support_files_changed": 0, "post_nudge_new_files": 0,
+            "unverified_files": 0, "overflow": False,
+        }
+
+    def test_valid_record_exports_counters(self):
+        lean = self._metrics(self._restored())["lean"]
+        self.assertEqual(lean["test_integrity_records"], 1)
+        self.assertEqual(lean["test_integrity_enforced"], 1)
+        self.assertEqual(lean["test_integrity_nudges"], 1)
+        self.assertEqual(lean["test_integrity_outcome"], "restored")
+        self.assertEqual(lean["test_integrity_files_weakened_peak"], 1)
+
+    def test_observed_kept_and_clean_records_are_valid(self):
+        observed = self._restored()
+        observed.update({"enforced": False, "nudges": 0, "outcome": "observed", "files_weakened": 1,
+                         "removed_lines": 3, "removed_assert_lines": 2})
+        self.assertEqual(self._metrics(observed)["lean"]["test_integrity_outcome"], "observed")
+        kept = self._restored()
+        kept.update({"outcome": "kept_cited", "files_weakened": 1, "removed_lines": 2})
+        self.assertEqual(self._metrics(kept)["lean"]["test_integrity_outcome"], "kept_cited")
+        clean = self._restored()
+        clean.update({"nudges": 0, "outcome": "clean", "files_weakened_peak": 0})
+        self.assertEqual(self._metrics(clean)["lean"]["test_integrity_outcome"], "clean")
+        no_git = self._restored()
+        no_git.update({"coverage": "no_git", "scans": 0, "nudges": 0, "outcome": "clean",
+                       "files_weakened_peak": 0})
+        self.assertEqual(self._metrics(no_git)["lean"]["test_integrity_coverage"], "no_git")
+
+    def test_policy_violations_fail_loudly(self):
+        for patch in (
+            {"nudges": 2},                                    # beyond maxNudges
+            {"max_nudges": 2},                                # a different policy
+            {"enforced": False},                              # observe mode messaged
+            {"files_weakened_peak": 0},                       # message without findings
+            {"outcome": "restored", "files_weakened": 1},     # restored but still weakened
+            {"outcome": "clean"},                             # clean after a message
+            {"outcome": "observed"},                          # observed in enforce mode
+            {"outcome": "kept_silent"},                       # kept with nothing weakened
+            {"coverage": "no_git"},                           # findings without a baseline
+            {"removed_assert_lines": 1},                      # more assertions than lines
+            {"post_nudge_new_files": 2},                      # beyond the peak
+        ):
+            record = self._restored()
+            record.update(patch)
+            with self.subTest(patch=patch), self.assertRaises(TraceError):
+                self._metrics(record)
+
+    def test_malformed_and_duplicate_records_fail_loudly(self):
+        for patch in (
+            {"schema_version": "metacodes-test-integrity-v0"},
+            {"coverage": "svn"},
+            {"outcome": "fixed"},
+            {"scans": -1},
+            {"nudges": True},
+            {"overflow": 0},
+        ):
+            record = self._restored()
+            record.update(patch)
+            with self.subTest(patch=patch), self.assertRaises(TraceError):
+                self._metrics(record)
+        with self.assertRaises(TraceError):
+            self._metrics(self._restored(), self._restored())
+
+
 class WorkBuddyCheckGateRecordTest(unittest.TestCase):
     """Field-level contract for the host check gate journal record (the
     union-roster probe only proves the KIND is known)."""
