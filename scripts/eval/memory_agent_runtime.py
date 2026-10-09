@@ -69,6 +69,7 @@ from .memory_replay import (
     PRODUCTION_PROVIDER_ID,
     PRODUCTION_ALLOWED_PROVIDER_TOOLS,
     PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
+    ATOMIC_STORE_ARMS,
     INJECTION_ONLY_ARMS,
     INJECTION_ONLY_WITHHELD_TOOLS,
     PRODUCTION_AUTO_COMPACT_POLICY,
@@ -159,10 +160,27 @@ ARM_TO_RUNTIME = {
     # reaches the model only through the scoped recall gate, BM25 or Jev.
     "tinykg_inject": "tinykg",
     "tinykg_jev_inject": "tinykg",
+    # Atomic-store arms (ATOMIC_STORE_ARMS) with the TinyKG tools kept: the
+    # recall gate alone, and the gate plus the judged KgRecall row order.
+    "tinykg_jev_recall_atomic": "tinykg",
+    "tinykg_jev_order_atomic": "tinykg",
 }
-SYSTEM_ONE_ARMS = frozenset({"tinykg_jev", "tinykg_jev_recall", "tinykg_jev_inject"})
+SYSTEM_ONE_ARMS = frozenset(
+    {
+        "tinykg_jev",
+        "tinykg_jev_recall",
+        "tinykg_jev_inject",
+        "tinykg_jev_recall_atomic",
+        "tinykg_jev_order_atomic",
+    }
+)
 # METACODES_JEV_DECISIONS for arms that advise a subset of the surfaces.
-SYSTEM_ONE_ARM_DECISIONS = {"tinykg_jev_recall": "scoped_recall", "tinykg_jev_inject": "scoped_recall"}
+SYSTEM_ONE_ARM_DECISIONS = {
+    "tinykg_jev_recall": "scoped_recall",
+    "tinykg_jev_inject": "scoped_recall",
+    "tinykg_jev_recall_atomic": "scoped_recall",
+    "tinykg_jev_order_atomic": "scoped_recall,recall_evidence",
+}
 SYSTEM_ONE_LOG_NAME = "system-one-judge.jsonl"
 SYSTEM_ONE_SCRIPTED_MODEL = "scripted-system-one"
 SYSTEM_ONE_TIMEOUT_MS = "10000"
@@ -386,6 +404,22 @@ def _atomic_memory_batch(
         _fail("atomic memory batch", "episodic case has no turn-level memories")
     logical = {node_id: logical_ids[node_id] for node_id in kept_ids}
     return ("\n".join(kept) + "\n").encode("utf-8"), logical, kept_ids[0]
+
+
+def _arm_case_batch(
+    arm_id: str,
+    benchmark: str,
+    raw_batch: bytes,
+    raw_logical: Mapping[int, str],
+    root_id: int,
+) -> Tuple[bytes, Mapping[int, str], int]:
+    """The case batch an arm's store is built from: atomic arms keep turns only."""
+
+    if arm_id not in ATOMIC_STORE_ARMS:
+        return raw_batch, raw_logical, root_id
+    if benchmark != "episodic_recall":
+        _fail("atomic-store arm", "is defined for episodic recall stores only")
+    return _atomic_memory_batch(raw_batch, raw_logical)
 
 
 def _query_plan_evaluator_invalid_reason(
@@ -3331,15 +3365,11 @@ def run_memory_agent_schedule(
                     batch = _empty_project_batch(domain)
                     counts = {"nodes": 1, "edges": 0, "abstraction_nodes": 0}
                 else:
-                    raw_batch, raw_logical, root_id, _query_case = build_case_batch(
-                        source,
-                        manifest,
-                        case["id"],
+                    raw_batch, raw_logical, root_id = _arm_case_batch(
+                        arm_id,
+                        case["benchmark"],
+                        *build_case_batch(source, manifest, case["id"])[:3],
                     )
-                    if arm_id in INJECTION_ONLY_ARMS:
-                        if case["benchmark"] != "episodic_recall":
-                            _fail("injection-only arm", "is defined for episodic recall stores only")
-                        raw_batch, raw_logical, root_id = _atomic_memory_batch(raw_batch, raw_logical)
                     batch, logical_ids, _root_id, counts = _agent_batch(
                         raw_batch,
                         raw_logical,
