@@ -31,6 +31,9 @@ from .model import ValidationError, stable_json
 
 CONTROL_ARM = "tinykg_jev_recall_atomic"
 TREATMENT_ARM = "tinykg_jev_order_atomic"
+# The protocol's cold-start control: reported, never part of a test.
+BASELINE_ARM = "no_memory"
+ARMS = (BASELINE_ARM, CONTROL_ARM, TREATMENT_ARM)
 HOLDOUT_START = 200
 EXCLUDED_TYPES = frozenset({"single-session-preference"})
 MAX_GOLD_WORDS = 4
@@ -134,13 +137,13 @@ def _paired(rows: Sequence[Mapping[str, Any]]) -> Tuple[Dict[str, Dict[str, Mapp
     by_case: Dict[str, Dict[str, Mapping[str, Any]]] = {}
     for row in rows:
         arm = row["arm"]
-        if arm not in {CONTROL_ARM, TREATMENT_ARM}:
+        if arm not in ARMS:
             raise ValidationError(f"unexpected arm {arm!r}")
         slot = by_case.setdefault(row["case_id"], {})
         if arm in slot:
             raise ValidationError(f"duplicate row for {row['case_id']} {arm}")
         slot[arm] = row
-    invalid = {CONTROL_ARM: 0, TREATMENT_ARM: 0}
+    invalid = {arm: 0 for arm in ARMS}
     for slot in by_case.values():
         for arm, row in slot.items():
             if not _valid(row):
@@ -181,13 +184,15 @@ def analyze(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "secondary_exact_match": paired_binary(lambda row: bool(row["outcome"]["success"])),
         "diagnostics": {
             arm: {
+                "rows": sum(1 for row in every if row["arm"] == arm),
+                "exact_match": sum(1 for row in every if row["arm"] == arm and row["outcome"]["success"]),
                 "mean_cost_usd": mean([float(row["cost"]["cost_usd"]) for row in every if row["arm"] == arm]),
                 "max_cost_usd": max((float(row["cost"]["cost_usd"]) for row in every if row["arm"] == arm), default=None),
                 "mean_exposed_memory_tokens": mean(
                     [float(row["memory"]["exposed_tokens"]) for row in every if row["arm"] == arm]
                 ),
             }
-            for arm in (CONTROL_ARM, TREATMENT_ARM)
+            for arm in ARMS
         },
     }
 

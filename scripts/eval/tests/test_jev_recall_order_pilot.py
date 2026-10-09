@@ -91,16 +91,20 @@ class AnalyzeTest(unittest.TestCase):
             _row("c", TREATMENT_ARM),
             # unmatched
             _row("d", TREATMENT_ARM, cost=0.2),
+            # the cold-start control is reported, never tested
+            _row("a", "no_memory", success=False, verified=()),
         ]
         summary = analyze(rows)
         self.assertEqual((summary["cases"], summary["valid_pairs"]), (4, 2))
-        self.assertEqual(summary["invalid_rows"], {CONTROL_ARM: 1, TREATMENT_ARM: 0})
+        self.assertEqual(summary["invalid_rows"], {"no_memory": 0, CONTROL_ARM: 1, TREATMENT_ARM: 0})
         primary = summary["primary_verified_gold_evidence"]
         self.assertEqual((primary["control"], primary["treatment"]), (1, 2))
         self.assertEqual((primary["only_treatment"], primary["only_control"]), (1, 0))
         secondary = summary["secondary_exact_match"]
         self.assertEqual((secondary["only_treatment"], secondary["only_control"]), (0, 1))
         self.assertEqual(summary["diagnostics"][TREATMENT_ARM]["max_cost_usd"], 0.2)
+        self.assertEqual(summary["diagnostics"]["no_memory"]["rows"], 1)
+        self.assertEqual(summary["diagnostics"]["no_memory"]["exact_match"], 0)
 
     def test_rejects_foreign_arms_and_duplicate_rows(self):
         with self.assertRaises(ValidationError):
