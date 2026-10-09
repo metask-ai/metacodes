@@ -194,7 +194,16 @@ fn choosePort() u16 {
     return kgd_install.DEFAULT_PORT;
 }
 
+/// Whether the service listens on `port`. Where the listener table answers
+/// (Windows) nothing connects: a refused loopback connect costs ~2 s there,
+/// and a connect-and-close probe hands the single-threaded service an empty
+/// connection to retire.
 fn accepting(port: u16) bool {
+    switch (net.loopbackListenState(port)) {
+        .listening => return true,
+        .not_listening => return false,
+        .unknown => {},
+    }
     const sock = net.connectLoopback(port) catch return false;
     net.closeSocket(sock);
     return true;
@@ -259,6 +268,23 @@ const testing = std.testing;
 test "kg autostart: METACODES_KG_AUTOSTART=0/false/off disables, anything else does not" {
     for ([_][]const u8{ "0", "false", "OFF", "Off" }) |value| try testing.expect(disables(value));
     for ([_][]const u8{ "1", "", "true", "on", "yes" }) |value| try testing.expect(!disables(value));
+}
+
+test "kg autostart: readiness costs no refused connect and hands the service no empty connection" {
+    const listener = try net.listenLoopback(0, 4);
+    var open = true;
+    defer if (open) net.closeSocket(listener.sock);
+    try testing.expect(accepting(listener.port));
+    // Windows reads the listener table; POSIX still connects (and a refused
+    // connect costs nothing there).
+    if (builtin.os.tag == .windows) try testing.expect(!net.pollReadable(listener.sock, 0));
+
+    net.closeSocket(listener.sock);
+    open = false;
+    const started_ms = time.nowMs();
+    try testing.expect(!accepting(listener.port));
+    // One refused loopback connect alone takes ~2 s on Windows.
+    try testing.expect(time.nowMs() - started_ms < 1_000);
 }
 
 test "kg autostart: only a loopback daemon.json names a port this host may start" {

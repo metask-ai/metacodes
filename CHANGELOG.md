@@ -91,6 +91,18 @@ status, compatibility boundaries, and entry points are defined by
   harness also no longer starts a TinyKG service in the temporary home of
   each case. Each one outlived its case, and on Windows the leftover service
   kept the home from being deleted.
+- On Windows, a session that has to start the TinyKG service now shows its
+  prompt in about 0.35 s instead of about 6.7 s. Windows does not refuse a
+  connection to a loopback port nobody listens on at once: it resends the SYN
+  and gives up after about 2 s. The session paid that three times before it
+  started the service: twice for the `store-info` read, which is retried,
+  and once more for the autostart check. Both now read the kernel's TCP
+  listener table instead of connecting, so when nothing listens the service
+  is started right away, and the readiness checks while it comes up cost
+  nothing. A running service is never handed an empty probe connection,
+  including a service left running by an older release. On other platforms a
+  refused connection already returns at once, and the checks still connect
+  there.
 - An AgentCore session no longer poisons itself when a compact or Run is
   aborted from another thread. The aborted operation could return while the
   abort was still inside `Provider.cancel`; Core answers BUSY to everything
