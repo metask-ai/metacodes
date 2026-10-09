@@ -64,6 +64,12 @@ class ShardTest(unittest.TestCase):
             self.assertEqual([record["question_id"] for record in kept], ["q1", "q2"])
             with self.assertRaises(ValidationError):
                 main([*args, "--start", "3", "--count", "2", "--output", str(root / "past-end.json")])
+            main([*args, "--indices", "3,0", "--output", str(root / "rerun.json")])
+            rerun = json.loads((root / "rerun.json").read_text(encoding="utf-8"))
+            self.assertEqual(sorted(record["question_id"] for record in rerun), ["q0", "q3"])
+            for bad in (["--indices", "1,1"], ["--indices", "4"], ["--indices", "1", "--start", "0"]):
+                with self.assertRaises(ValidationError):
+                    main([*args, *bad, "--output", str(root / "bad.json")])
 
 
 def _row(case_id, arm, *, success=True, verified=("s1",), cost=0.05):

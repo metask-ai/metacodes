@@ -92,9 +92,19 @@ def cmd_shard(args: argparse.Namespace) -> int:
     document = json.loads(Path(args.cases).read_text(encoding="utf-8"))
     if document.get("schema_version") != CASES_SCHEMA_VERSION:
         raise ValidationError("unsupported case list")
-    chosen = document["cases"][args.start : args.start + args.count]
-    if len(chosen) != args.count:
-        raise ValidationError("shard runs past the end of the case list")
+    if args.indices is not None:
+        if args.start is not None or args.count is not None:
+            raise ValidationError("--indices excludes --start/--count")
+        positions = [int(value) for value in args.indices.split(",")]
+        if len(set(positions)) != len(positions) or not all(0 <= value < len(document["cases"]) for value in positions):
+            raise ValidationError("--indices must be distinct positions in the case list")
+        chosen = [document["cases"][value] for value in positions]
+    else:
+        if args.start is None or args.count is None:
+            raise ValidationError("a shard is --start and --count, or --indices")
+        chosen = document["cases"][args.start : args.start + args.count]
+        if len(chosen) != args.count:
+            raise ValidationError("shard runs past the end of the case list")
     wanted = {case["source_id_sha256"] for case in chosen}
     upstream = json.loads(Path(args.upstream).read_text(encoding="utf-8"))
     records = [
@@ -107,7 +117,7 @@ def cmd_shard(args: argparse.Namespace) -> int:
     with Path(args.output).open("x", encoding="utf-8") as handle:
         json.dump(records, handle, ensure_ascii=False)
     print(
-        f"shard start={args.start} count={args.count} "
+        f"shard start={args.start} count={args.count} indices={args.indices} "
         f"sha256={hashlib.sha256(Path(args.output).read_bytes()).hexdigest()}",
         file=sys.stderr,
     )
@@ -218,8 +228,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     shard = commands.add_parser("shard", help="filter the upstream file to one run of the case list")
     shard.add_argument("--cases", required=True)
     shard.add_argument("--upstream", required=True, help="longmemeval_s_cleaned.json")
-    shard.add_argument("--start", type=int, required=True)
-    shard.add_argument("--count", type=int, required=True)
+    shard.add_argument("--start", type=int)
+    shard.add_argument("--count", type=int)
+    shard.add_argument("--indices", help="comma-separated case-list positions, for re-runs")
     shard.add_argument("--output", required=True)
     shard.set_defaults(func=cmd_shard)
     analyze_parser = commands.add_parser("analyze", help="paired analysis over replay-memory rows")
