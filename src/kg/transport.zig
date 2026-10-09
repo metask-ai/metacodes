@@ -233,6 +233,13 @@ pub const WebTransport = struct {
         return cloned;
     }
 
+    /// The port of a service reached at `http://127.0.0.1:<port>`, the only
+    /// address a local host starts one on. Null for any other scheme or host,
+    /// and for a URL without an explicit port.
+    pub fn loopbackPort(self: *const WebTransport) ?u16 {
+        return loopbackPortOf(self.run_url[0 .. self.run_url.len - "/api/run".len]);
+    }
+
     /// Authenticated, configuration-pinned TinyKG build identity.  This is
     /// the daemon-mode equivalent of hashing the exclusive local executable;
     /// callers still validate every response against the same build id.
@@ -694,6 +701,17 @@ fn containsControl(value: []const u8) bool {
     return false;
 }
 
+fn loopbackPortOf(base_url: []const u8) ?u16 {
+    const uri = std.Uri.parse(base_url) catch return null;
+    if (!std.mem.eql(u8, uri.scheme, "http")) return null;
+    const host = switch (uri.host orelse return null) {
+        .raw, .percent_encoded => |text| text,
+    };
+    if (!std.mem.eql(u8, host, "127.0.0.1")) return null;
+    const port = uri.port orelse return null;
+    return if (port == 0) null else port;
+}
+
 /// Which service implementations this client will talk to. `tinykg-web` is the
 /// upstream service shared deployments run; `metacodes-kgd` is the local
 /// supervisor in this binary (`src/kg/kgd/`). Both serve this exact envelope,
@@ -769,6 +787,17 @@ test "transport command policies bind sessions and task capabilities" {
     try std.testing.expect(provesNoCommit(Error.AuthenticationFailed));
     try std.testing.expect(provesNoCommit(Error.Backpressure));
     try std.testing.expect(!provesNoCommit(Error.RequestTimedOut));
+}
+
+test "only an explicit http://127.0.0.1 port is a loopback service port" {
+    try std.testing.expectEqual(@as(?u16, 8799), loopbackPortOf("http://127.0.0.1:8799"));
+    try std.testing.expectEqual(@as(?u16, 8799), loopbackPortOf("http://127.0.0.1:8799/prefix"));
+    try std.testing.expectEqual(@as(?u16, null), loopbackPortOf("https://127.0.0.1:8799"));
+    try std.testing.expectEqual(@as(?u16, null), loopbackPortOf("http://localhost:8799"));
+    try std.testing.expectEqual(@as(?u16, null), loopbackPortOf("http://127.0.0.2:8799"));
+    try std.testing.expectEqual(@as(?u16, null), loopbackPortOf("http://kg.example.com:8799"));
+    try std.testing.expectEqual(@as(?u16, null), loopbackPortOf("http://127.0.0.1"));
+    try std.testing.expectEqual(@as(?u16, null), loopbackPortOf("http://127.0.0.1:0"));
 }
 
 const TickServicedClock = @import("platform").test_support.TickServicedClock;

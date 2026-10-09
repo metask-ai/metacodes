@@ -260,6 +260,8 @@ const Restarter = struct {
     harness: *Harness,
     port: u16,
     calls: u32 = 0,
+    /// `util_time.nowMs()` when the client first asked.
+    first_call_ms: i64 = 0,
 
     fn hook(self: *Restarter) cc.kg_client.KgClient.Autostart {
         return .{ .ctx = self, .start = start };
@@ -268,6 +270,7 @@ const Restarter = struct {
     fn start(ctx: *anyopaque) bool {
         const self: *Restarter = @ptrCast(@alignCast(ctx));
         self.calls += 1;
+        if (self.first_call_ms == 0) self.first_call_ms = cc.util_time.nowMs();
         const h = self.harness;
         const supervisor = Supervisor.start(h.allocator, .{
             .store_path = h.store,
@@ -313,8 +316,13 @@ test "Kgd: a session that finds its service down has the host start it, then wor
         .autostart = restarter.hook(),
     });
     defer kg.deinit();
+    const began_ms = cc.util_time.nowMs();
     kg.ensureReady();
     try std.testing.expectEqual(@as(u32, 1), restarter.calls);
+    // The host is asked before the client spends anything on a service that
+    // is not there. On Windows a refused loopback connect takes ~2 s and a
+    // read is tried twice, so asking only after store-info failed cost 4 s.
+    try std.testing.expect(restarter.first_call_ms - began_ms < 1_000);
     try std.testing.expect(kg.ready);
     const task = try kg.createTask("autostart probe task", "task");
     _ = try kg.taskStatus(task);

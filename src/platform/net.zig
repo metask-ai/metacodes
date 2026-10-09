@@ -253,6 +253,138 @@ pub fn connectLoopback(port: u16) Error!Socket {
 }
 
 // ============================================================================
+// Listener lookup: is anything listening on 127.0.0.1:port, without connecting.
+// ============================================================================
+
+pub const ListenState = enum {
+    /// A TCP socket listens on 127.0.0.1:port or on the IPv4 wildcard.
+    listening,
+    /// Nothing listens there: a connect would be refused.
+    not_listening,
+    /// This platform cannot tell without connecting, or the lookup failed.
+    unknown,
+};
+
+/// Whether TCP 127.0.0.1:`port` has a listener, answered without connecting.
+///
+/// Windows answers from the kernel's IPv4 listener table. There, a connect to
+/// a loopback port nobody listens on is not refused at once: the stack resends
+/// the SYN after each RST and gives up after about 2 s. Probing by connecting
+/// also hands a single-threaded server an empty connection it has to retire.
+/// POSIX refuses such a connect immediately and has no portable listener
+/// table, so it answers `.unknown` and callers connect as before.
+pub fn loopbackListenState(port: u16) ListenState {
+    if (!is_windows) return .unknown;
+    const get_table = tcp_table.resolve() orelse return .unknown;
+    var stack_buffer: [16 * 1024]u8 align(@alignOf(MibTcpRow)) = undefined;
+    var heap_buffer: ?[]align(@alignOf(MibTcpRow)) u8 = null;
+    defer if (heap_buffer) |buffer| std.heap.page_allocator.free(buffer);
+    var buffer: []align(@alignOf(MibTcpRow)) u8 = &stack_buffer;
+    // The table can grow between the call that sizes it and the one that
+    // fills it, so a too-small answer is retried a few times.
+    var attempt: u8 = 0;
+    while (attempt < 4) : (attempt += 1) {
+        var size: u32 = @intCast(buffer.len);
+        const status = get_table(@ptrCast(buffer.ptr), &size, 0, AF_INET_TABLE, TCP_TABLE_BASIC_LISTENER, 0);
+        if (status == NO_ERROR) {
+            const listening = listenerTableHas(buffer, port) orelse return .unknown;
+            return if (listening) .listening else .not_listening;
+        }
+        if (status != ERROR_INSUFFICIENT_BUFFER) return .unknown;
+        if (heap_buffer) |old| std.heap.page_allocator.free(old);
+        heap_buffer = null;
+        const grown = std.heap.page_allocator.alignedAlloc(
+            u8,
+            comptime .fromByteUnits(@alignOf(MibTcpRow)),
+            @as(usize, size) + 64 * @sizeOf(MibTcpRow),
+        ) catch return .unknown;
+        heap_buffer = grown;
+        buffer = grown;
+    }
+    return .unknown;
+}
+
+/// `MIB_TCPROW`: every field a DWORD; addresses and ports in network order,
+/// and only the low 16 bits of a port are defined.
+const MibTcpRow = extern struct {
+    state: u32,
+    local_addr: u32,
+    local_port: u32,
+    remote_addr: u32,
+    remote_port: u32,
+};
+const MIB_TCP_STATE_LISTEN: u32 = 2;
+const TCP_TABLE_BASIC_LISTENER: i32 = 0;
+const AF_INET_TABLE: u32 = 2;
+const NO_ERROR: u32 = 0;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+/// 127.0.0.1 as the table stores it (network order, read as a native DWORD).
+const LOOPBACK_ADDR: u32 = 0x0100007f;
+
+/// Scan a `MIB_TCPTABLE` (a DWORD row count, then the rows) for a listener on
+/// 127.0.0.1:`port` or the wildcard. Null when the count does not fit the
+/// bytes, which is a table this code does not understand.
+fn listenerTableHas(table: []align(@alignOf(MibTcpRow)) const u8, port: u16) ?bool {
+    const header = @sizeOf(u32);
+    if (table.len < header) return null;
+    const count = std.mem.readInt(u32, table[0..header], .little);
+    if (count > (table.len - header) / @sizeOf(MibTcpRow)) return null;
+    const rows: [*]const MibTcpRow = @ptrCast(@alignCast(table.ptr + header));
+    const wanted_port: u16 = std.mem.nativeToBig(u16, port);
+    for (rows[0..count]) |row| {
+        if (row.state != MIB_TCP_STATE_LISTEN) continue;
+        if (@as(u16, @truncate(row.local_port)) != wanted_port) continue;
+        if (row.local_addr == LOOPBACK_ADDR or row.local_addr == 0) return true;
+    }
+    return false;
+}
+
+/// `GetExtendedTcpTable`, resolved from iphlpapi.dll at first use rather than
+/// imported: the import would become a link input of every static consumer of
+/// the core library, for one optional lookup.
+const tcp_table = struct {
+    const GetExtendedTcpTable = *const fn (
+        table: ?*anyopaque,
+        size: *u32,
+        order: i32,
+        address_family: u32,
+        table_class: i32,
+        reserved: u32,
+    ) callconv(.winapi) u32;
+
+    extern "kernel32" fn LoadLibraryExW(name: [*:0]const u16, file: ?*anyopaque, flags: u32) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+
+    /// Only the system directory: a DLL beside the executable or in the
+    /// working directory must never be picked up under a system DLL's name.
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x00000800;
+    const unresolved: usize = 0;
+    const unavailable: usize = 1;
+
+    /// The function's address once resolved; `unavailable` when it cannot be.
+    /// Two threads resolving at once both load the same module (reference
+    /// counted, never freed) and store the same address.
+    var address = std.atomic.Value(usize).init(unresolved);
+
+    fn resolve() ?GetExtendedTcpTable {
+        var current = address.load(.acquire);
+        if (current == unresolved) {
+            current = lookup();
+            address.store(current, .release);
+        }
+        if (current == unavailable) return null;
+        return @ptrFromInt(current);
+    }
+
+    fn lookup() usize {
+        const module = LoadLibraryExW(std.unicode.utf8ToUtf16LeStringLiteral("iphlpapi.dll"), null, LOAD_LIBRARY_SEARCH_SYSTEM32) orelse
+            return unavailable;
+        const function = GetProcAddress(module, "GetExtendedTcpTable") orelse return unavailable;
+        return @intFromPtr(function);
+    }
+};
+
+// ============================================================================
 // UDS(Unix domain socket)—— **POSIX only**(U10-B 本地绑定;设计:Windows 走 web 绑定)。
 // 复用 acceptConn/recv/send/closeSocket/set*Timeout(POSIX 下 UDS fd 与 TCP fd 同接口)。
 // ============================================================================
@@ -532,4 +664,54 @@ test "setRecvTimeout makes blocking recv return on idle" {
     var buf: [8]u8 = undefined;
     const n = recv(conn, &buf); // 对端不发,应超时
     try testing.expect(n < 0);
+}
+
+test "loopbackListenState sees a listener come and go without connecting to it" {
+    const listener = try listenLoopback(0, 4);
+    var open = true;
+    defer if (open) closeSocket(listener.sock);
+    const expect_open: ListenState = if (is_windows) .listening else .unknown;
+    try testing.expectEqual(expect_open, loopbackListenState(listener.port));
+    // Nothing reached the listener: an empty probe connection is what held
+    // the single-threaded TinyKG service for its whole request deadline.
+    try testing.expect(!pollReadable(listener.sock, 0));
+
+    closeSocket(listener.sock);
+    open = false;
+    const expect_closed: ListenState = if (is_windows) .not_listening else .unknown;
+    try testing.expectEqual(expect_closed, loopbackListenState(listener.port));
+}
+
+test "listenerTableHas matches a listener on 127.0.0.1 or the wildcard at the port" {
+    const port: u16 = 8799;
+    const wire_port: u32 = std.mem.nativeToBig(u16, port);
+    const Row = MibTcpRow;
+    const rows = [_]Row{
+        // Another interface, another port, and a connection (not a listener).
+        .{ .state = MIB_TCP_STATE_LISTEN, .local_addr = 0x0201a8c0, .local_port = wire_port, .remote_addr = 0, .remote_port = 0 },
+        .{ .state = MIB_TCP_STATE_LISTEN, .local_addr = LOOPBACK_ADDR, .local_port = std.mem.nativeToBig(u16, port + 1), .remote_addr = 0, .remote_port = 0 },
+        .{ .state = 5, .local_addr = LOOPBACK_ADDR, .local_port = wire_port, .remote_addr = LOOPBACK_ADDR, .remote_port = 1234 },
+        // The upper 16 bits of a port are undefined in the real table.
+        .{ .state = MIB_TCP_STATE_LISTEN, .local_addr = LOOPBACK_ADDR, .local_port = 0xabcd_0000 | wire_port, .remote_addr = 0, .remote_port = 0 },
+        .{ .state = MIB_TCP_STATE_LISTEN, .local_addr = 0, .local_port = wire_port, .remote_addr = 0, .remote_port = 0 },
+    };
+    var words: [1 + rows.len * (@sizeOf(Row) / @sizeOf(u32))]u32 = undefined;
+    const bytes: []align(@alignOf(Row)) u8 = std.mem.sliceAsBytes(&words);
+    @memcpy(bytes[@sizeOf(u32)..], std.mem.sliceAsBytes(&rows));
+
+    const Case = struct { count: u32, expected: ?bool };
+    for ([_]Case{
+        .{ .count = 3, .expected = false },
+        .{ .count = 4, .expected = true },
+        .{ .count = 0, .expected = false },
+        .{ .count = rows.len + 1, .expected = null }, // more rows than bytes
+    }) |case| {
+        std.mem.writeInt(u32, bytes[0..4], case.count, .little);
+        try testing.expectEqual(case.expected, listenerTableHas(bytes, port));
+    }
+    // Only the wildcard row listens on the port.
+    std.mem.writeInt(u32, bytes[0..4], 1, .little);
+    @memcpy(bytes[4..][0..@sizeOf(Row)], std.mem.asBytes(&rows[4]));
+    try testing.expectEqual(@as(?bool, true), listenerTableHas(bytes, port));
+    try testing.expectEqual(@as(?bool, null), listenerTableHas(bytes[0..2], port));
 }

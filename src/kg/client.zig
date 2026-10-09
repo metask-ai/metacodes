@@ -22,6 +22,7 @@
 const std = @import("std");
 const jev_excerpt = @import("../jev/excerpt.zig");
 const pfs = @import("platform").fs;
+const net = @import("platform").net;
 const time = @import("../util/time.zig");
 const sync = @import("platform").sync;
 const common = @import("../tools/common.zig");
@@ -317,8 +318,9 @@ pub const KgClient = struct {
 
     /// How a host brings up the local TinyKG service on demand. The core never
     /// spawns processes or picks executables: it only says when the service is
-    /// needed and not there — unconfigured, or refusing connections when the
-    /// client probes readiness — and the host decides whether and how to start
+    /// needed and not there — unconfigured, or not listening (by the platform's
+    /// listener table, or a refused connection) when the client probes
+    /// readiness — and the host decides whether and how to start
     /// one. `start` returns true when a service should now answer at the
     /// configured address; it is called with no client lock held, from any
     /// thread that owns a client of this family, so the host makes it
@@ -905,6 +907,15 @@ pub const KgClient = struct {
                 return;
             },
             .daemon => |*daemon| {
+                // A service that is simply not running (a reboot, a first
+                // session) is the usual reason it does not answer. On Windows
+                // the read below learns that only after two refused connects
+                // of ~2 s each, so when the listener table already says
+                // nothing listens, the host is asked first. The verdict still
+                // comes from store-info; this only moves the start earlier.
+                if (daemon.loopbackPort()) |port| {
+                    if (net.loopbackListenState(port) == .not_listening) _ = self.tryAutostart();
+                }
                 const result = daemon.run("store-info", &.{}, false) catch |first| retry: {
                     // Configured but not listening: the host may start it.
                     if (serviceNotRunning(first) and self.tryAutostart()) {
