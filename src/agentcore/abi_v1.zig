@@ -10006,7 +10006,7 @@ test "non-poisoning Run failure after `starting` closes RunState as failed; term
     // reports it as tool_loop, with tool_loop's phase, and the facade stays
     // usable for the next Run.
     try std.testing.expectEqual(terminalPhaseForStopReason(.tool_loop), terminalPhaseForStopReason(.stalled));
-    try std.testing.expectEqual(wire.STOP_TOOL_LOOP, try fake.stopReason(.stalled));
+    try std.testing.expectEqual(wire.STOP_TOOL_LOOP, try stopReason(&fake, .stalled));
     try std.testing.expect(!fake.facade_poisoned.load(.acquire));
 }
 
