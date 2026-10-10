@@ -4427,6 +4427,101 @@ class WorkBuddyCheckGateRecordTest(unittest.TestCase):
             self._metrics(self._valid(), self._valid())
 
 
+class WorkBuddyStallGateRecordTest(unittest.TestCase):
+    """Field-level contract for the stall gate journal record (the
+    union-roster probe only proves the KIND is known)."""
+
+    def _metrics(self, *records):
+        rows = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+        ]
+        for index, record in enumerate(records, start=1):
+            rows.append(
+                {"schema_version": "metacodes-tool-observation-journal-v1",
+                 "sequence": index, "monotonic_elapsed_ns": index + 1,
+                 "session_id": "s" * 24, "run_id": "r" * 24,
+                 "event": {"tool_observation": {"stall_gate": record}}})
+        rows.append(
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": len(records) + 1, "monotonic_elapsed_ns": len(records) + 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "t.jsonl"
+            observation = root / "o.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            observation.write_text(
+                "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+            )
+            return load_control_metrics(transcript, observation)
+
+    def _stopped(self):
+        # An enforced run stopped on the repeat tier at round 5.
+        return {
+            "schema_version": "metacodes-stall-gate-v1",
+            "enforced": True,
+            "repeat_rounds_threshold": 4, "repeat_calls_threshold": 4,
+            "stale_rounds_threshold": 8,
+            "rounds": 5, "progress_rounds": 1, "max_stale_rounds": 4,
+            "max_repeats": 4, "forgotten": 0,
+            "decisions": 1, "max_decisions": 1,
+            "cause": "repeating", "decided_round": 5,
+        }
+
+    def test_valid_records_export_counters(self):
+        lean = self._metrics(self._stopped())["lean"]
+        self.assertEqual(lean["stall_gate_records"], 1)
+        self.assertEqual(lean["stall_gate_enforced"], 1)
+        self.assertEqual(lean["stall_gate_cause"], "repeating")
+        self.assertEqual(lean["stall_gate_decided_round"], 5)
+        self.assertEqual(lean["stall_gate_max_decisions"], 1)
+        # A run that kept making progress: no decision, no cause.
+        quiet = self._stopped()
+        quiet.update({"enforced": False, "rounds": 12, "progress_rounds": 12,
+                      "max_stale_rounds": 0, "max_repeats": 0, "decisions": 0,
+                      "cause": "none", "decided_round": 0})
+        lean = self._metrics(quiet)["lean"]
+        self.assertEqual(lean["stall_gate_enforced"], 0)
+        self.assertEqual(lean["stall_gate_cause"], "none")
+
+    def test_malformed_fields_fail_loudly(self):
+        for key, value, message in (
+            ("schema_version", "metacodes-stall-gate-v0", "stall gate record is invalid"),
+            ("cause", "bored", "stall gate record is invalid"),
+            ("enforced", 1, "stall gate record is invalid"),
+            ("rounds", -1, "stall gate rounds is invalid"),
+            ("decisions", True, "stall gate decisions is invalid"),
+        ):
+            bad = self._stopped()
+            bad[key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(TraceError, message):
+                self._metrics(bad)
+
+    def test_policy_relationships_are_enforced(self):
+        for mutate in (
+            {"decisions": 2},                      # over the budget
+            {"max_decisions": 2},                  # not the v1 bound
+            {"cause": "none"},                     # a decision without a cause
+            {"decided_round": 0},                  # a decision without a round
+            {"decided_round": 6},                  # after the last counted round
+            {"progress_rounds": 6},                # more progress than rounds
+            {"max_stale_rounds": 0},               # a decision with no stale round
+            {"decisions": 0, "decided_round": 0},  # a cause without a decision
+        ):
+            bad = self._stopped()
+            bad.update(mutate)
+            with self.subTest(mutate=mutate), self.assertRaisesRegex(TraceError, "violates the gate policy"):
+                self._metrics(bad)
+
+    def test_duplicate_record_fails_loudly(self):
+        with self.assertRaisesRegex(TraceError, "duplicate stall gate record"):
+            self._metrics(self._stopped(), self._stopped())
+
+
 class WorkBuddyDeliveryCadenceRecordTest(unittest.TestCase):
     """Field-level contract for the delivery-cadence journal record (the
     union-roster probe only proves the KIND is known)."""

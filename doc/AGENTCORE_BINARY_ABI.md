@@ -595,7 +595,9 @@ the public durable-budget terminals
 `METASK_AGENTCORE_STOP_CHECKPOINT_BUDGET_EXHAUSTED` and
 `METASK_AGENTCORE_STOP_CHECKPOINT_RESOURCE_LIMIT`; their detailed outcome is
 also reported through `RunResultV1.checkpoint_outcome_code` and result flags.
-Internal `suspended`, `backgrounded`, and a raw unprojected Core `budget` stop
+The Core `stalled` stop (the stall gate ended a run whose tool rounds kept
+returning nothing new) is a controlled breaker stop and is reported as
+`tool_loop`. Internal `suspended`, `backgrounded`, and a raw unprojected Core `budget` stop
 remain unrepresentable in v1. If one of those internal states reaches the
 facade it is a contract failure, not an additional public stop code. Because
 the stateful Run may already have committed Conversation changes, that failure

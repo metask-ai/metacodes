@@ -194,6 +194,31 @@ web_search 显示 query、transcript 回放与 `/recap` 把它们与用户输入
 任意轨迹下决策数有界)。默认系统提示同时新增 "Progress updates on longer tasks" 段,定义多阶段
 任务的进度沟通预期(单步任务不要求)。
 
+**停滞闸门(stall gate,`core/stall_gate.zig`,设计说明 [STALL_GATE_DESIGN.md](STALL_GATE_DESIGN.md))**:
+进度更新义务管"用户看不到在干什么",管不了"每一步都没带回新东西"。在长上下文、flash 级模型上,
+循环不是畸形调用,而是零信息增益的步骤:轮询不出字节的作业、同一命令反复得到同一输出、重读没变的
+东西。软提醒在这个区间基本被忽略,所以这道闸门不提醒,而是停。
+- **传感**:每个执行过的工具轮次观察一次。真正跑过的 slot 产出调用键 `H(tool,input)`,失败之外还产出
+  证据键:落盘的文件改动按动作 `H(tool,input)`,其余按结果 `H(tool,result)`,剔除宿主自己的
+  记账数字:BashOutput 的 `waited_ms`,以及轮询守卫每次轮询都会变的 `low_yield_polls` 和
+  `min_wait_ms`(字段名保留)。有证据键不在记忆里的轮次是 progress;跑了东西但没新东西的是 stale;
+  什么都没跑(拒绝 / 延后 / 挂起)的是 neutral。
+- **记忆跟随模型的视野**:每个键锚定到承载它的最新 tool_result 块。块离开视野(压缩移动窗口、
+  microcompact 或截断就地改写)即遗忘,重读被清掉的结果算新信息。
+- **策略**:连续 `stale_rounds`(默认 8)个 stale 轮,或连续 `repeat_rounds`(默认 4)个 stale 轮且
+  其中同一调用出现 `repeat_calls`(默认 4)次,即决策。`stale_rounds == 0` 对任何阈值都不触发,
+  每 Run 至多 `MAX_STALL_DECISIONS`(1)次。
+- **执行**:enforce 在本轮结果提交进对话之后以 `StopReason.stalled` 结束 Run,不注入任何文本
+  (provider 可见字节不变,不走 host 注入计量器)。`RunResult.stall` 带出证据,REPL 打印
+  `stall_gate.renderStopNotice`(原因、最常重复的调用、怎么续接)。observe 只记录本该停下的轮次。
+- **宿主契约字段**:`Options.stall_gate: ?stall_gate.Mode`,canonical `buildRunOptions` 不带。REPL 主
+  run 与 web 会话默认 enforce(有人能一句话续接),headless 默认关(`--stall-gate` /
+  `--stall-gate-observe` 开启),`--no-stall-gate` 关闭。
+- **记录与证明**:武装时 Run 结束发一条 `stall_gate` 终局记录(`metacodes-stall-gate-v1`)。
+  `control-plane/lean/MetaCodesControl/StallGate.lean` 证明任意轮次与遗忘轨迹下决策有界、有新键
+  的轮次之后不决策、每轮都带回从未见过的键时永不决策,以及正向:足够长的 stale 段必然恰好决策一次
+  (只依赖 propext)。
+
 #### 3.2.1.1 候选响应边界:这条响应能不能进 Conversation(`core/response_candidate.zig`)
 
 段的定性回答"这段文本算什么";候选响应边界回答的是上一个问题——**这条 provider 响应最终
@@ -313,10 +338,11 @@ pub const RunResult = struct {
     turns: u32,
     tool_calls: u32,
     suspend_info: ?SuspendInfo = null,
+    stall: ?stall_gate.Report = null, // 非空 ⇔ stop_reason == .stalled
 };
 pub const StopReason = enum {
     end_turn, max_turns, aborted, tool_error, api_error, tool_loop,
-    suspended, backgrounded, budget,
+    suspended, backgrounded, budget, max_tokens_exhausted, stalled,
 };
 ```
 
@@ -330,7 +356,9 @@ pub const StopReason = enum {
 **一回合做什么**:流式发当前 conversation → 收集 assistant 文本 + tool_use blocks(经 backend
 emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工具(`tool_exec.executeSlots`)→
 tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)/ 达 max_turns / abort /
-挂起(`suspended`,见 §5)。`tool_loop` 枚举值保留为 ABI 兼容(无生产者,对齐 codex 无主动熔断)。
+挂起(`suspended`,见 §5)。`tool_loop` 是受控熔断:环境故障累计达 `MAX_ENVIRONMENT_FAULTS`,
+或插件契约 / KG 枚举修复 fail-closed。`stalled` 是停滞闸门(见 §3.2.1 末"停滞闸门")停下的 run;
+AgentCore v1 把它投影为 `tool_loop`(冻结的线上枚举不增值)。
 
 ### 4.1 工具结果如何进入上下文
 

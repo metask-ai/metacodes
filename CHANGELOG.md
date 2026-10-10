@@ -12,6 +12,30 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Stall gate: a run whose tool rounds keep returning nothing new is stopped
+  with the new stop reason `stalled` and handed back to the person, instead
+  of looping until `max_turns`. A round is stale when every slot that ran
+  either failed or returned an answer the model has already seen. Answers are
+  keyed by tool and result bytes, without the host's own counters
+  (BashOutput's `waited_ms`, and the poll guard's `low_yield_polls` and
+  `min_wait_ms`, which change on every guarded poll of a silent job); a
+  realized file change is keyed by its action. Remembered answers follow the
+  model's view, so a result cleared by compaction or microcompaction counts as
+  new when fetched again. The run stops after 8 consecutive stale rounds, or
+  after 4 stale rounds in which one identical call was made 4 times. A round
+  that brings anything new resets the stretch. The round's results are
+  committed first, and nothing is injected into the conversation. The REPL
+  names the cause, the repeated call and how to continue. Headless reports
+  `"stop_reason":"stalled"` (exit 0) and prints the same notice on stderr.
+  AgentCore v1 reports it as `tool_loop`. The REPL and web sessions enforce
+  it by default (`--no-stall-gate` turns it off); print mode only with
+  `--stall-gate`; `--stall-gate-observe` only records. Each armed run writes
+  one `stall_gate` tool-observation record (`metacodes-stall-gate-v1`). The
+  policy is proven in `control-plane/lean/MetaCodesControl/StallGate.lean`
+  (propext only): decisions bounded over any trace, no decision after a
+  round with a new answer or when every round brings a never-seen one, and
+  a long enough stale stretch always decides exactly once. Design note:
+  [doc/STALL_GATE_DESIGN.md](doc/STALL_GATE_DESIGN.md).
 - Host check gate (`--host-check <cmd>` with `--check-gate` or
   `--check-gate-observe`, budget `--check-gate-max <n>`, 1–8, default 3). When
   the model ends its turn after changing the workspace, the host runs the

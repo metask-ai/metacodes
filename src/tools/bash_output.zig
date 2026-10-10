@@ -2622,3 +2622,48 @@ test "BashOutput 二进制通道走 base64,结果仍是合法 UTF-8 JSON" {
         }
     }
 }
+
+/// One guarded poll result of a running job, rendered by the writers the tool
+/// uses. Feeds the stall-gate key test below.
+fn renderGuardedPoll(a: std.mem.Allocator, stdout: []const u8, wait: Wait, streak: u8, until: Until) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"job_id\":\"0123456789ab\",\"status\":\"running\"");
+    try writeChannel(&out.writer, a, "stdout", stdout, false);
+    try writeChannelCursor(&out.writer, .stdout, 64 + stdout.len, 64 + stdout.len, false);
+    try writeWaitFields(&out.writer, wait);
+    try writeGuardFields(&out.writer, .{ .streak = streak, .min_wait_ms = guardWaitMs(streak) }, until, true);
+    try out.writer.writeAll("}");
+    return out.toOwnedSlice();
+}
+
+test "stall gate: guarded polls of a silent job are the same answer; anything about the job is not" {
+    // The poll guard counts low-yield polls and doubles its minimum wait, and
+    // the long-poll reports how long it waited. Those numbers change on every
+    // poll of a job that prints nothing, so the stall gate leaves them out of
+    // its key (stall_gate.HOST_BOOKKEEPING_FIELDS); otherwise it could never
+    // see a stuck job polled under the guard.
+    const a = std.testing.allocator;
+    const key = @import("../core/stall_gate.zig").observationKey;
+    const first = try renderGuardedPoll(a, "", .{ .returned_on = .deadline, .waited_ms = 30_004 }, POLL_GUARD_STREAK, .exit);
+    defer a.free(first);
+    const later = try renderGuardedPoll(a, "", .{ .returned_on = .deadline, .waited_ms = 240_017 }, POLL_GUARD_STREAK + 3, .exit);
+    defer a.free(later);
+    try std.testing.expect(!std.mem.eql(u8, first, later));
+    try std.testing.expectEqual(key("BashOutput", first), key("BashOutput", later));
+
+    // Information about the job still changes the key: new output, a
+    // different reason to return, how far a pattern search got.
+    const printed = try renderGuardedPoll(a, "step 7\n", .{ .returned_on = .deadline, .waited_ms = 30_004 }, POLL_GUARD_STREAK, .exit);
+    defer a.free(printed);
+    const exited = try renderGuardedPoll(a, "", .{ .returned_on = .exit, .waited_ms = 30_004 }, POLL_GUARD_STREAK, .exit);
+    defer a.free(exited);
+    const searched = try renderGuardedPoll(a, "", .{ .returned_on = .deadline, .waited_ms = 30_004, .pattern = .{ .searched_to = .{ .stdout = 64, .stderr = null } } }, POLL_GUARD_STREAK, .{ .pattern = "READY" });
+    defer a.free(searched);
+    const searched_further = try renderGuardedPoll(a, "", .{ .returned_on = .deadline, .waited_ms = 30_004, .pattern = .{ .searched_to = .{ .stdout = 4160, .stderr = null } } }, POLL_GUARD_STREAK, .{ .pattern = "READY" });
+    defer a.free(searched_further);
+    for ([_][]const u8{ printed, exited, searched }) |other| {
+        try std.testing.expect(key("BashOutput", first) != key("BashOutput", other));
+    }
+    try std.testing.expect(key("BashOutput", searched) != key("BashOutput", searched_further));
+}
