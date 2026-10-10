@@ -87,7 +87,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try aw.writer.writeAll(",\"status\":\"running\",\"description\":");
     try util_json.writeJsonString(&aw.writer, description);
     try aw.writer.writeAll(",\"hint\":");
-    try util_json.writeJsonString(&aw.writer, "Its exit is announced to you automatically. Use BashOutput(job_id) to read streamed lines (it waits for new lines if none are unread); KillShell(job_id) to stop.");
+    try util_json.writeJsonString(&aw.writer, "Its exit is announced to you automatically. Use BashOutput(job_id, until=\"output\") to read streamed lines as they arrive (by default BashOutput waits up to wait_ms for the job to exit), or until=\"pattern\" to wait for a specific line; polls that keep getting only a few lines are batched by poll_guard. KillShell(job_id) to stop.");
     try aw.writer.writeAll("}");
     return try aw.toOwnedSlice();
 }
