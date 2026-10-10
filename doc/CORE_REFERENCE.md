@@ -199,8 +199,9 @@ web_search 显示 query、transcript 回放与 `/recap` 把它们与用户输入
 循环不是畸形调用,而是零信息增益的步骤:轮询不出字节的作业、同一命令反复得到同一输出、重读没变的
 东西。软提醒在这个区间基本被忽略,所以这道闸门不提醒,而是停。
 - **传感**:每个执行过的工具轮次观察一次。真正跑过的 slot 产出调用键 `H(tool,input)`,失败之外还产出
-  证据键:落盘的文件改动按动作 `H(tool,input)`,其余按结果 `H(tool,result)`,剔除 BashOutput 的
-  `waited_ms` 这类宿主计时字段。有证据键不在记忆里的轮次是 progress;跑了东西但没新东西的是 stale;
+  证据键:落盘的文件改动按动作 `H(tool,input)`,其余按结果 `H(tool,result)`,剔除宿主自己的
+  记账数字:BashOutput 的 `waited_ms`,以及轮询守卫每次轮询都会变的 `low_yield_polls` 和
+  `min_wait_ms`(字段名保留)。有证据键不在记忆里的轮次是 progress;跑了东西但没新东西的是 stale;
   什么都没跑(拒绝 / 延后 / 挂起)的是 neutral。
 - **记忆跟随模型的视野**:每个键锚定到承载它的最新 tool_result 块。块离开视野(压缩移动窗口、
   microcompact 或截断就地改写)即遗忘,重读被清掉的结果算新信息。

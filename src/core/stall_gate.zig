@@ -13,8 +13,9 @@
 //!   * sensor: once per executed tool round. Every slot that ran yields a call
 //!     key `H(tool, input)` and, unless it failed, an evidence key. A realized
 //!     file change is keyed by its action, `H(tool, input)`. Anything else is
-//!     keyed by what came back, `H(tool, result)`, with host-timing fields
-//!     such as BashOutput's `waited_ms` left out. The round is *progress* when
+//!     keyed by what came back, `H(tool, result)`, with the host's own
+//!     bookkeeping left out: BashOutput's `waited_ms` and its poll guard's
+//!     `low_yield_polls` and `min_wait_ms`. The round is *progress* when
 //!     some evidence key is not in the gate's memory, *stale* when something
 //!     ran but nothing is new, and *neutral* when nothing ran (denied,
 //!     deferred, suspended). The memory follows what the model can still see.
@@ -119,11 +120,19 @@ const CALL_DOMAIN = "C";
 const ACTION_DOMAIN = "A";
 const OBSERVATION_DOMAIN = "O";
 
-/// Result fields that report the host's own timing rather than anything about
-/// the world. BashOutput's long-poll reports how long it waited, so without
-/// this every poll of a silent job would hash differently and the gate could
-/// never see a stuck poll.
-const HOST_TIMING_FIELDS = [_][]const u8{"\"waited_ms\":"};
+/// Numeric result fields that describe the host's own handling of a call
+/// rather than anything about the world. Their digits are left out of the key;
+/// the field names stay in. Without this, every poll of a job that printed
+/// nothing would hash differently and the gate could never see a stuck poll:
+///   * `waited_ms`: how long BashOutput's long-poll waited;
+///   * `low_yield_polls`, `min_wait_ms`: BashOutput's poll guard (#235)
+///     counts consecutive low-yield polls and doubles the minimum wait, so
+///     both change on every guarded poll even when the job is silent.
+/// Everything else BashOutput reports is information about the job, and is
+/// the same across polls of a silent job: `returned_on`, `poll_guard.until`,
+/// the guard `note` (fixed per mode), byte counters, and
+/// `pattern_searched_to` (a byte offset into the output).
+const HOST_BOOKKEEPING_FIELDS = [_][]const u8{ "\"waited_ms\":", "\"low_yield_polls\":", "\"min_wait_ms\":" };
 
 fn keyed(domain: []const u8, name: []const u8) std.hash.Wyhash {
     var h = std.hash.Wyhash.init(0);
@@ -154,7 +163,7 @@ pub fn observationKey(name: []const u8, content: []const u8) Key {
     while (rest.len > 0) {
         var at: ?usize = null;
         var field_len: usize = 0;
-        for (HOST_TIMING_FIELDS) |field| {
+        for (HOST_BOOKKEEPING_FIELDS) |field| {
             const found = std.mem.indexOf(u8, rest, field) orelse continue;
             if (at == null or found < at.?) {
                 at = found;
@@ -553,11 +562,50 @@ test "repeating trace: the same poll returning the same snapshot fires the repea
     try testing.expectEqual(MAX_STALL_DECISIONS, s.decisions);
 }
 
-test "host timing is not information: polls differing only in waited_ms are the same answer" {
+/// A guarded BashOutput poll of a running job that printed nothing, in the
+/// shape BashOutput renders it (#235). The real writers are pinned against
+/// these keys by a test in tools/bash_output.zig.
+fn guardedPoll(buf: []u8, waited_ms: u64, low_yield_polls: u8, min_wait_ms: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{{\"job_id\":\"0123456789ab\",\"status\":\"running\",\"stdout\":\"\",\"stdout_encoding\":\"utf-8\"," ++
+        "\"stdout_total_bytes\":64,\"stdout_next_offset\":64,\"stdout_truncated\":false,\"waited_ms\":{d},\"returned_on\":\"deadline\"," ++
+        "\"poll_guard\":{{\"low_yield_polls\":{d},\"until\":\"exit\",\"min_wait_ms\":{d}}},\"note\":\"Several polls in a row returned only a few bytes.\"}}", .{ waited_ms, low_yield_polls, min_wait_ms });
+}
+
+test "repeating trace: a silent job polled under BashOutput's poll guard still fires the repeat tier" {
+    // The guard raises low_yield_polls and doubles min_wait_ms on every poll,
+    // and each poll waits a little differently: every result differs as
+    // bytes, none carries anything new about the job.
+    var s = State{};
+    var first: ?usize = null;
+    var bufs: [12][512]u8 = undefined;
+    for (0..12) |i| {
+        const n: u8 = @intCast(3 + i);
+        const min_wait = @min(@as(u64, 30_000) << @intCast(@min(i, 4)), 300_000);
+        const result = try guardedPoll(&bufs[i], min_wait + i, n, min_wait);
+        _ = s.observeReadings(&.{obs("BashOutput", "{\"job_id\":\"0123456789ab\"}", result)});
+        if (s.decide(.{})) |cause| {
+            _ = s.noteDecided(cause);
+            if (first == null) first = i + 1;
+        }
+    }
+    try testing.expectEqual(@as(?usize, 5), first);
+    try testing.expectEqual(Cause.repeating, s.decided.?.cause);
+}
+
+test "host bookkeeping is not information: polls differing only in waited_ms or poll-guard counters are the same answer" {
     try testing.expectEqual(
         observationKey("BashOutput", "{\"status\":\"running\",\"waited_ms\":30001,\"x\":1}"),
         observationKey("BashOutput", "{\"status\":\"running\",\"waited_ms\":29998,\"x\":1}"),
     );
+    var a_buf: [512]u8 = undefined;
+    var b_buf: [512]u8 = undefined;
+    try testing.expectEqual(
+        observationKey("BashOutput", try guardedPoll(&a_buf, 30_002, 3, 30_000)),
+        observationKey("BashOutput", try guardedPoll(&b_buf, 299_998, 9, 300_000)),
+    );
+    // The field names stay in the key: a guarded poll is not an unguarded one.
+    try testing.expect(observationKey("BashOutput", "{\"status\":\"running\",\"waited_ms\":1}") !=
+        observationKey("BashOutput", "{\"status\":\"running\",\"waited_ms\":1,\"poll_guard\":{\"low_yield_polls\":3,\"until\":\"exit\",\"min_wait_ms\":30000}}"));
     // Anything else that changes is information.
     try testing.expect(observationKey("BashOutput", "{\"status\":\"running\",\"waited_ms\":1}") !=
         observationKey("BashOutput", "{\"status\":\"exited\",\"waited_ms\":1}"));

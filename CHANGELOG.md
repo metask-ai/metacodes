@@ -16,7 +16,9 @@ status, compatibility boundaries, and entry points are defined by
   with the new stop reason `stalled` and handed back to the person, instead
   of looping until `max_turns`. A round is stale when every slot that ran
   either failed or returned an answer the model has already seen. Answers are
-  keyed by tool and result bytes, with BashOutput's `waited_ms` left out; a
+  keyed by tool and result bytes, without the host's own counters
+  (BashOutput's `waited_ms`, and the poll guard's `low_yield_polls` and
+  `min_wait_ms`, which change on every guarded poll of a silent job); a
   realized file change is keyed by its action. Remembered answers follow the
   model's view, so a result cleared by compaction or microcompaction counts as
   new when fetched again. The run stops after 8 consecutive stale rounds, or

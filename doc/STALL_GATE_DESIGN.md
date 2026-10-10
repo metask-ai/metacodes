@@ -54,9 +54,19 @@ Each counted slot yields:
     choose, and two different edits can return byte-identical
     acknowledgements, which would wrongly look like a repeat.
   * Any other result gets `H('O' ‖ tool ‖ 0 ‖ normalize(content))`.
-    `normalize` drops host-timing fields, currently only BashOutput's
-    `"waited_ms":N`. Without that, every poll of a silent job would hash
-    differently and the gate could never see a stuck poll.
+    `normalize` drops the digits of numeric fields that are the host's own
+    bookkeeping, not facts about the job; the field names stay in the key.
+    These are BashOutput's `waited_ms` and its poll guard's
+    `low_yield_polls` and `min_wait_ms`. Since #235 the guard raises the
+    first and doubles the second on every low-yield poll, so all three change
+    on every poll of a job that prints nothing. Without the normalization,
+    each such poll would hash as new and the gate could never see a stuck
+    one, guarded or not. The rest of the result is about the job and stays in
+    the key: `returned_on`, `poll_guard.until`, the guard `note` (fixed per
+    mode), the byte counters, and `pattern_searched_to`. A test in
+    `tools/bash_output.zig` renders guarded polls with the tool's own writers
+    and pins this split, so a new counter there cannot silently blind the
+    gate.
 
 A round is classified as:
 
@@ -200,9 +210,12 @@ lockstep-checked against the Zig source and the trace parser by
 * **Hash novelty is syntactic.** Near-identical experiment scripts whose
   outputs differ by a timestamp, or a job that prints a progress byte per
   poll, are new results to this gate.
-* **BashOutput's any-byte wake-up.** A job printing progress every 10 s
-  becomes a stream of novel polls. That is a wait-semantics fix in the tool,
-  not something this gate can see.
+* **Progress output is fixed in the tool, not here.** #235 removed
+  BashOutput's any-byte wake-up: it waits for the exit by default, and its
+  poll guard stops progress bytes from waking low-yield polls. A job that
+  prints something new on every poll is still new to this gate. That is
+  correct, because it is information, and the tool now makes such polls
+  rare.
 * **Semantic stagnation** (different edits, same failure) needs the TinyKG
   hypothesis ledger and JEV relation judging, which come later.
 * **Deliberate repetition** (running a flaky test eight times, one call per
