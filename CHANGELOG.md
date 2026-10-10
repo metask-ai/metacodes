@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.4.0 — 2026-10-10
+
 ### Added
 
 - Stall gate: a run whose tool rounds keep returning nothing new is stopped
