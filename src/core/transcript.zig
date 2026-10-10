@@ -612,6 +612,14 @@ fn loadCompactStateFromMeta(conversation: *Conversation, session_dir: []const u8
 }
 
 /// 解析一行 JSONL 为 Message。字符串字段 dupe 成 owned。
+///
+/// 分发契约:wire `"type"` 串与 Block tag 名一一对应(与 writeMessage 对称),
+/// stringToEnum + 穷尽 switch 让新增 Block variant 漏加解析臂直接编译错,不再
+/// 可能重演"写侧会写、读侧不认"的运行期漂移(thinking 臂曾缺失,带思考块的会话
+/// 整体无法 resume)。未知串/字段缺失/类型错硬错 InvalidTranscript——静默丢块或
+/// 压默认值的"恢复"会在下次 rewriteAll 时把缺损永久写回盘。唯一例外:布尔字段
+/// (消息级 delivered、tool_result 的 is_error/delivered)键缺失取默认 false
+/// (旧文件兼容,保守方向);键在但非 bool 仍是损坏,硬错。
 fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Message {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
@@ -627,7 +635,10 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
     else
         return error.InvalidTranscript;
 
-    const msg_delivered = if (root.object.get("delivered")) |dv| (dv == .bool and dv.bool) else false;
+    const msg_delivered = if (root.object.get("delivered")) |dv|
+        (if (dv == .bool) dv.bool else return error.InvalidTranscript)
+    else
+        false;
     const blocks_v = root.object.get("blocks") orelse return error.InvalidTranscript;
     if (blocks_v != .array) return error.InvalidTranscript;
 
@@ -644,75 +655,92 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
         const tv = bv.object.get("type") orelse return error.InvalidTranscript;
         if (tv != .string) return error.InvalidTranscript;
 
-        if (std.mem.eql(u8, tv.string, "text")) {
-            const t = bv.object.get("text") orelse return error.InvalidTranscript;
-            if (t != .string) return error.InvalidTranscript;
-            blocks[idx] = .{ .text = try allocator.dupe(u8, t.string) };
-        } else if (std.mem.eql(u8, tv.string, "tool_use")) {
-            const id = bv.object.get("id") orelse return error.InvalidTranscript;
-            const name = bv.object.get("name") orelse return error.InvalidTranscript;
-            const input = bv.object.get("input") orelse return error.InvalidTranscript;
-            if (id != .string or name != .string or input != .string) return error.InvalidTranscript;
-            // 逐字段 errdefer:第 2/3 个 dupe OOM 时,已 dupe 的前串未进 blocks
-            // (constructed 尚未 +1),函数级清理够不到——必须在此释放。
-            const id_owned = try allocator.dupe(u8, id.string);
-            errdefer allocator.free(id_owned);
-            const name_owned = try allocator.dupe(u8, name.string);
-            errdefer allocator.free(name_owned);
-            blocks[idx] = .{ .tool_use = .{
-                .id = id_owned,
-                .name = name_owned,
-                .input = try allocator.dupe(u8, input.string),
-            } };
-        } else if (std.mem.eql(u8, tv.string, "tool_result")) {
-            const tuid = bv.object.get("tool_use_id") orelse return error.InvalidTranscript;
-            const c = bv.object.get("content") orelse return error.InvalidTranscript;
-            const is_err = bv.object.get("is_error") orelse std.json.Value{ .bool = false };
-            const delivered_v = bv.object.get("delivered") orelse std.json.Value{ .bool = false };
-            if (tuid != .string or c != .string) return error.InvalidTranscript;
-            const tuid_owned = try allocator.dupe(u8, tuid.string);
-            errdefer allocator.free(tuid_owned);
-            blocks[idx] = .{ .tool_result = .{
-                .tool_use_id = tuid_owned,
-                .content = try allocator.dupe(u8, c.string),
-                .is_error = if (is_err == .bool) is_err.bool else false,
-                .delivered = if (delivered_v == .bool) delivered_v.bool else false,
-            } };
-        } else if (std.mem.eql(u8, tv.string, "thinking")) {
-            // 写侧一直会写 thinking 块,读侧此前缺此分支 → 任何带 thinking 的会话
-            // resume 整体 InvalidTranscript(roundtrip bug,随 image 支持一并修复)。
-            const t = bv.object.get("thinking") orelse return error.InvalidTranscript;
-            if (t != .string) return error.InvalidTranscript;
-            blocks[idx] = .{ .thinking = try allocator.dupe(u8, t.string) };
-        } else if (std.mem.eql(u8, tv.string, "reasoning_item")) {
-            const model = bv.object.get("model") orelse return error.InvalidTranscript;
-            const item = bv.object.get("item") orelse return error.InvalidTranscript;
-            if (model != .string or item != .string) return error.InvalidTranscript;
-            const model_owned = try allocator.dupe(u8, model.string);
-            errdefer allocator.free(model_owned);
-            blocks[idx] = .{ .reasoning_item = .{
-                .model = model_owned,
-                .json = try allocator.dupe(u8, item.string),
-            } };
-        } else if (std.mem.eql(u8, tv.string, "image")) {
-            const mt = bv.object.get("media_type") orelse return error.InvalidTranscript;
-            const data = bv.object.get("data") orelse return error.InvalidTranscript;
-            if (mt != .string or data != .string) return error.InvalidTranscript;
-            const mt_owned = try allocator.dupe(u8, mt.string);
-            errdefer allocator.free(mt_owned);
-            blocks[idx] = .{ .image = .{
-                .media_type = mt_owned,
-                .data = try allocator.dupe(u8, data.string),
-            } };
-        } else if (std.mem.eql(u8, tv.string, "document")) {
+        if (std.mem.eql(u8, tv.string, "document")) {
             // 撤回的一等 PDF 文档输入(见 issue #25 的复盘)。这类会话的语义
             // 本进程已经无法忠实重建——**明确拒绝**,而不是丢块继续:少一个
             // 文档的"恢复"是在悄悄改写用户看过的历史。与通用 InvalidTranscript
             // 分开,好让上层给出可行动的提示而不是"文件坏了"。
+            // ("document" 已不是 Block tag,故在 tag 分发之前单列。)
             return error.WithdrawnDocumentBlock;
-        } else {
-            return error.InvalidTranscript;
         }
+
+        const tag = std.meta.stringToEnum(std.meta.Tag(msg_mod.Block), tv.string) orelse
+            return error.InvalidTranscript;
+
+        blocks[idx] = switch (tag) {
+            .text => blk: {
+                const t = bv.object.get("text") orelse return error.InvalidTranscript;
+                if (t != .string) return error.InvalidTranscript;
+                break :blk .{ .text = try allocator.dupe(u8, t.string) };
+            },
+            .tool_use => blk: {
+                const id = bv.object.get("id") orelse return error.InvalidTranscript;
+                const name = bv.object.get("name") orelse return error.InvalidTranscript;
+                const input = bv.object.get("input") orelse return error.InvalidTranscript;
+                if (id != .string or name != .string or input != .string) return error.InvalidTranscript;
+                // 逐字段 errdefer:第 2/3 个 dupe OOM 时,已 dupe 的前串未进 blocks
+                // (constructed 尚未 +1),函数级清理够不到——必须在此释放。
+                const id_owned = try allocator.dupe(u8, id.string);
+                errdefer allocator.free(id_owned);
+                const name_owned = try allocator.dupe(u8, name.string);
+                errdefer allocator.free(name_owned);
+                break :blk .{ .tool_use = .{
+                    .id = id_owned,
+                    .name = name_owned,
+                    .input = try allocator.dupe(u8, input.string),
+                } };
+            },
+            .tool_result => blk: {
+                const tuid = bv.object.get("tool_use_id") orelse return error.InvalidTranscript;
+                const c = bv.object.get("content") orelse return error.InvalidTranscript;
+                if (tuid != .string or c != .string) return error.InvalidTranscript;
+                const is_error = if (bv.object.get("is_error")) |ev|
+                    (if (ev == .bool) ev.bool else return error.InvalidTranscript)
+                else
+                    false;
+                const delivered = if (bv.object.get("delivered")) |ev|
+                    (if (ev == .bool) ev.bool else return error.InvalidTranscript)
+                else
+                    false;
+                const tuid_owned = try allocator.dupe(u8, tuid.string);
+                errdefer allocator.free(tuid_owned);
+                break :blk .{ .tool_result = .{
+                    .tool_use_id = tuid_owned,
+                    .content = try allocator.dupe(u8, c.string),
+                    .is_error = is_error,
+                    .delivered = delivered,
+                } };
+            },
+            .thinking => blk: {
+                // 写侧一直会写 thinking 块,读侧此前缺此分支 → 任何带 thinking 的会话
+                // resume 整体 InvalidTranscript(roundtrip bug,随 image 支持一并修复)。
+                const t = bv.object.get("thinking") orelse return error.InvalidTranscript;
+                if (t != .string) return error.InvalidTranscript;
+                break :blk .{ .thinking = try allocator.dupe(u8, t.string) };
+            },
+            .image => blk: {
+                const mt = bv.object.get("media_type") orelse return error.InvalidTranscript;
+                const data = bv.object.get("data") orelse return error.InvalidTranscript;
+                if (mt != .string or data != .string) return error.InvalidTranscript;
+                const mt_owned = try allocator.dupe(u8, mt.string);
+                errdefer allocator.free(mt_owned);
+                break :blk .{ .image = .{
+                    .media_type = mt_owned,
+                    .data = try allocator.dupe(u8, data.string),
+                } };
+            },
+            .reasoning_item => blk: {
+                const model = bv.object.get("model") orelse return error.InvalidTranscript;
+                const item = bv.object.get("item") orelse return error.InvalidTranscript;
+                if (model != .string or item != .string) return error.InvalidTranscript;
+                const model_owned = try allocator.dupe(u8, model.string);
+                errdefer allocator.free(model_owned);
+                break :blk .{ .reasoning_item = .{
+                    .model = model_owned,
+                    .json = try allocator.dupe(u8, item.string),
+                } };
+            },
+        };
         constructed += 1;
     }
 
@@ -979,6 +1007,30 @@ test "delivery watermark round-trip:消息级与块级 delivered 随 transcript 
     defer legacy.deinit(a);
     try std.testing.expect(!legacy.delivered);
     try std.testing.expect(!legacy.blocks[0].tool_result.delivered);
+}
+
+test "parseMessageLine: 未知 type 与非 bool 布尔字段硬错拒载" {
+    const a = std.testing.allocator;
+    // 未知 type = 版本偏差或损坏:整行拒载。静默丢块的"恢复"会在下次
+    // rewriteAll(/retry、compact 全量重写)把缺损永久写回盘。
+    try std.testing.expectError(error.InvalidTranscript, parseMessageLine(
+        "{\"role\":\"assistant\",\"blocks\":[{\"type\":\"citation\",\"source\":\"x\"}]}",
+        a,
+    ));
+    // 布尔字段键在但非 bool:缺省走 false 是旧文件兼容,非 bool 是损坏——
+    // 把 "true"(字符串)静默压成 false 等于翻转结果语义后固化进盘。
+    try std.testing.expectError(error.InvalidTranscript, parseMessageLine(
+        "{\"role\":\"user\",\"blocks\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"c\",\"is_error\":\"true\"}]}",
+        a,
+    ));
+    try std.testing.expectError(error.InvalidTranscript, parseMessageLine(
+        "{\"role\":\"user\",\"blocks\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"c\",\"delivered\":1}]}",
+        a,
+    ));
+    try std.testing.expectError(error.InvalidTranscript, parseMessageLine(
+        "{\"role\":\"user\",\"delivered\":\"yes\",\"blocks\":[{\"type\":\"text\",\"text\":\"hi\"}]}",
+        a,
+    ));
 }
 
 test "A:compact 投影状态 round-trip(flush 存 meta → load 恢复 boundary/summary)" {
