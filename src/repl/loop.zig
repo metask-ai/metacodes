@@ -21,6 +21,7 @@ const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const check_gate_mod = @import("../core/check_gate.zig");
 const test_integrity_mod = @import("../core/test_integrity.zig");
+const stall_gate_mod = @import("../core/stall_gate.zig");
 const host_injection_meter = @import("../core/host_injection_meter.zig");
 const input = @import("input.zig");
 const complete = @import("complete.zig");
@@ -826,6 +827,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // host-contract shape as the cadence gate: primary run only.
         run_opts.progress_updates = app.config.progress_updates;
         run_opts.progress_updates_observe = app.config.progress_updates_observe;
+        // Stall gate: a person is here to resume, so a run that keeps getting
+        // nothing new back is stopped and handed over. Primary run only, same
+        // host-contract shape as the gates above.
+        run_opts.stall_gate = stall_gate_mod.modeFor(app.config.stall_gate, .interactive);
         // Host check gate: primary run only, same host-contract shape (a macro
         // run must not trigger a check or emit a second terminal record).
         run_opts.check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max);
@@ -940,6 +945,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 上方逐条打印,这里只说明"为什么停、怎么续",不再复述。
         if (result.stop_reason == .tool_loop) {
             std.debug.print("\x1b[33m运行已被熔断停止(tool_loop):原因见上方各条提示。处理好之后直接输入下一步续接。\x1b[0m\n", .{});
+        }
+        // 无进展停止(stall gate):连续几轮工具调用没带回任何新结果。说清证据和续接方式;
+        // 对话完整保留,下一句输入即续接。
+        if (result.stall) |report| {
+            if (stall_gate_mod.renderStopNotice(allocator, report)) |notice| {
+                defer allocator.free(notice);
+                std.debug.print("\x1b[33m{s}\x1b[0m\n", .{notice});
+            } else |_| std.debug.print("\x1b[33m运行已停止(stalled):连续多轮工具调用没有带回任何新结果。直接输入下一步续接。\x1b[0m\n", .{});
         }
         // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
         // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。

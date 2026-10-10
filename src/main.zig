@@ -88,6 +88,7 @@ pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 deliver
 pub const progress_updates = @import("core/progress_updates.zig"); // L2 progress-update tests (#114)
 pub const check_gate = @import("core/check_gate.zig"); // L2 host check gate / Stop hook block tests
 pub const test_integrity = @import("core/test_integrity.zig"); // L2 test-integrity obligation tests
+pub const stall_gate = @import("core/stall_gate.zig"); // L2 stall-gate tests
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
@@ -2589,6 +2590,12 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.test_integrity = true;
         } else if (std.mem.eql(u8, arg, "--test-integrity-observe")) {
             config.test_integrity_observe = true;
+        } else if (std.mem.eql(u8, arg, "--stall-gate")) {
+            config.stall_gate = .enforce;
+        } else if (std.mem.eql(u8, arg, "--stall-gate-observe")) {
+            config.stall_gate = .observe;
+        } else if (std.mem.eql(u8, arg, "--no-stall-gate")) {
+            config.stall_gate = .off;
         } else if (std.mem.eql(u8, arg, "--check-gate-max")) {
             const s = args.next() orelse {
                 setParseError(config, allocator, "missing value for --check-gate-max", .{});
@@ -2932,6 +2939,10 @@ fn printHelp() void {
         \\  --test-integrity      When the model stops with tests that existed before the run rewritten,
         \\                        deleted or disabled, ask once to restore them or quote the request
         \\  --test-integrity-observe  Only record and report changes to tests that existed before the run
+        \\  --stall-gate          Stop a run whose tool rounds keep returning nothing new (default in
+        \\                        the REPL and web sessions; off in print mode unless given)
+        \\  --stall-gate-observe  Only record where the stall gate would have stopped the run
+        \\  --no-stall-gate       Never stop a run for returning nothing new
         \\  --no-progress-updates  Do not ask the model for a progress note after silent tool rounds
         \\  --progress-updates-observe  Record (not enforce) the progress-update obligation
         \\  --max-tokens <n>      Override max output tokens per request

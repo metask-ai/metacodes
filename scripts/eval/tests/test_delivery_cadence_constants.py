@@ -56,6 +56,27 @@ class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
         self.assertEqual(lean_bound, zig_bound)
         self.assertEqual(zig_bound, trace_bound)
 
+    def test_stall_gate_constants_are_identical_in_lean_zig_and_trace(self):
+        lean = (ROOT / "control-plane/lean/MetaCodesControl/StallGate.lean").read_text(encoding="utf-8")
+        zig = (ROOT / "src/core/stall_gate.zig").read_text(encoding="utf-8")
+        trace = (ROOT / "scripts/eval/workbuddy/trace.py").read_text(encoding="utf-8")
+        lean_bound = int(re.search(r"^def maxDecisions : Nat := (\d+)", lean, re.M).group(1))
+        zig_bound = int(re.search(r"pub const MAX_STALL_DECISIONS: u8 = (\d+);", zig).group(1))
+        trace_bound = int(re.search(r'formal\["stall_gate_max_decisions"\] != (\d+)', trace).group(1))
+        self.assertEqual(lean_bound, zig_bound)
+        self.assertEqual(zig_bound, trace_bound)
+        # The shipped thresholds and the call window: the theorems hold for
+        # every value, but the Lean file names the ones the runtime ships.
+        for lean_name, zig_name in (
+            ("defaultRepeatRounds", "DEFAULT_REPEAT_ROUNDS: u32"),
+            ("defaultRepeatCalls", "DEFAULT_REPEAT_CALLS: u32"),
+            ("defaultStaleRounds", "DEFAULT_STALE_ROUNDS: u32"),
+            ("stretchCap", "STRETCH_CAPACITY: usize"),
+        ):
+            lean_value = int(re.search(rf"^def {lean_name} : Nat := (\d+)", lean, re.M).group(1))
+            zig_value = int(re.search(rf"pub const {zig_name} = (\d+);", zig).group(1))
+            self.assertEqual(lean_value, zig_value, lean_name)
+
     def test_meter_cap_is_identical_in_lean_and_zig(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean").read_text(encoding="utf-8")
         zig = (ROOT / "src/core/host_injection_meter.zig").read_text(encoding="utf-8")

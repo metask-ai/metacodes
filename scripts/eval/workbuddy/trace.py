@@ -1626,6 +1626,59 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     or (not observation["enforced"] and formal["progress_updates_nudges"] != 0)
                 ):
                     raise TraceError("progress updates record violates the gate policy")
+            elif observation_kind == "stall_gate":
+                # Terminal record of the stall gate (StallGate.lean: tool
+                # rounds that keep returning nothing new end the run, or are
+                # only recorded in observe mode). At most one per run,
+                # emitted whenever the gate was armed. Counters only.
+                if (
+                    observation.get("schema_version") != "metacodes-stall-gate-v1"
+                    or not isinstance(observation.get("enforced"), bool)
+                    or observation.get("cause") not in {"none", "repeating", "stale"}
+                ):
+                    raise TraceError("stall gate record is invalid")
+                if formal.get("stall_gate_records"):
+                    raise TraceError("duplicate stall gate record")
+                formal["stall_gate_records"] = 1
+                formal["stall_gate_enforced"] = int(bool(observation.get("enforced")))
+                formal["stall_gate_cause"] = observation["cause"]
+                for key, where in (
+                    ("repeat_rounds_threshold", "repeat rounds threshold"),
+                    ("repeat_calls_threshold", "repeat calls threshold"),
+                    ("stale_rounds_threshold", "stale rounds threshold"),
+                    ("rounds", "rounds"),
+                    ("progress_rounds", "progress rounds"),
+                    ("max_stale_rounds", "longest stale stretch"),
+                    ("max_repeats", "most repeated call"),
+                    ("forgotten", "forgotten answers"),
+                    ("decisions", "decisions"),
+                    ("max_decisions", "decision budget"),
+                    ("decided_round", "decided round"),
+                ):
+                    value = observation.get(key)
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                    ):
+                        raise TraceError(f"stall gate {where} is invalid")
+                    formal["stall_gate_" + key] = value
+                # Policy relationships the Zig gate proves (StallGate.lean):
+                # at most max_decisions decisions, a decision exactly when a
+                # cause is named, made at a counted round after a stale one,
+                # and progress and stale stretches inside the counted rounds.
+                decided = formal["stall_gate_decisions"] > 0
+                if (
+                    formal["stall_gate_max_decisions"] != 1  # v1 policy bound (StallGate.lean maxDecisions)
+                    or formal["stall_gate_decisions"] > formal["stall_gate_max_decisions"]
+                    or decided != (observation["cause"] != "none")
+                    or decided != (formal["stall_gate_decided_round"] > 0)
+                    or formal["stall_gate_decided_round"] > formal["stall_gate_rounds"]
+                    or formal["stall_gate_progress_rounds"] > formal["stall_gate_rounds"]
+                    or formal["stall_gate_max_stale_rounds"] > formal["stall_gate_rounds"]
+                    or (decided and formal["stall_gate_max_stale_rounds"] == 0)
+                ):
+                    raise TraceError("stall gate record violates the gate policy")
             elif observation_kind == "check_gate":
                 # Terminal record of the host check gate (CheckGate.lean): the
                 # host runs the pinned check when the model stops after a

@@ -13,6 +13,7 @@ import MetaCodesControl.RequirementLedger
 import MetaCodesControl.ObligationGate
 import MetaCodesControl.DeliveryCadence
 import MetaCodesControl.ProgressUpdates
+import MetaCodesControl.StallGate
 import MetaCodesControl.CheckGate
 import MetaCodesControl.TestIntegrity
 import MetaCodesControl.ContinuityGate

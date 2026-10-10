@@ -4506,7 +4506,9 @@ fn stopReason(self: *AbiSession, reason: core.agent_loop.StopReason) error{Unsup
         .aborted => wire.STOP_ABORTED,
         .tool_error => wire.STOP_TOOL_ERROR,
         .api_error => wire.STOP_API_ERROR,
-        .tool_loop => wire.STOP_TOOL_LOOP,
+        // The stall gate is a controlled breaker stop; the frozen v1 wire
+        // enum does not grow, so it projects onto the breaker code.
+        .tool_loop, .stalled => wire.STOP_TOOL_LOOP,
         .suspended, .backgrounded, .budget, .max_tokens_exhausted => {
             // The stateful Run has already committed Conversation changes.
             // Returning an error while leaving the facade reusable would make
@@ -7320,7 +7322,7 @@ fn terminalPhaseForStopReason(stop_reason: core.agent_loop.StopReason) public_pr
     return switch (stop_reason) {
         .aborted => .aborted,
         .end_turn, .max_turns => .completed,
-        .tool_error, .api_error, .tool_loop, .suspended, .backgrounded, .budget, .max_tokens_exhausted => .failed,
+        .tool_error, .api_error, .tool_loop, .stalled, .suspended, .backgrounded, .budget, .max_tokens_exhausted => .failed,
     };
 }
 
@@ -10000,6 +10002,12 @@ test "non-poisoning Run failure after `starting` closes RunState as failed; term
     try std.testing.expectEqual(public_protocol.RunStatePhase.completed, terminalPhaseForStopReason(.end_turn));
     try std.testing.expectEqual(public_protocol.RunStatePhase.completed, terminalPhaseForStopReason(.max_turns));
     try std.testing.expectEqual(public_protocol.RunStatePhase.aborted, terminalPhaseForStopReason(.aborted));
+    // The stall gate's stop is a controlled breaker stop: the frozen v1 wire
+    // reports it as tool_loop, with tool_loop's phase, and the facade stays
+    // usable for the next Run.
+    try std.testing.expectEqual(terminalPhaseForStopReason(.tool_loop), terminalPhaseForStopReason(.stalled));
+    try std.testing.expectEqual(wire.STOP_TOOL_LOOP, try stopReason(&fake, .stalled));
+    try std.testing.expect(!fake.facade_poisoned.load(.acquire));
 }
 
 test "run_done only reaches finalizing; the terminal follows the returned result and survives degraded observation" {

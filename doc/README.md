@@ -17,6 +17,8 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 ## Kernel design
 
 - [Core reference](CORE_REFERENCE.md)
+- [Stall gate](STALL_GATE_DESIGN.md) — the in-run breaker for tool rounds that
+  keep returning nothing new.
 - [Memory system](MEMORY_SYSTEM_DESIGN.md)
 - [Jev System-One memory advisor](JEV_SYSTEM_ONE.md) — optional judge for
   recall injection, recall evidence, memory relations and enumeration intent.
