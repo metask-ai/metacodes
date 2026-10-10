@@ -1,6 +1,6 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 18,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 19,
                "AgentCore revision changed");
 _Static_assert(sizeof(metask_agentcore_api_v1) == 64,
                "AgentCore root layout changed");
@@ -8,7 +8,7 @@ _Static_assert(sizeof(metask_agentcore_runtime_api_v1) == 24,
                "Runtime table layout changed");
 _Static_assert(sizeof(metask_agentcore_session_api_v1) == 40,
                "Session table layout changed");
-_Static_assert(sizeof(metask_agentcore_session_control_api_v1) == 72,
+_Static_assert(sizeof(metask_agentcore_session_control_api_v1) == 80,
                "Session Control table layout changed");
 _Static_assert(sizeof(metask_agentcore_skill_api_v1) == 32,
                "Skill table layout changed");

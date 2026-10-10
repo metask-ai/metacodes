@@ -3956,7 +3956,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 18), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 19), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -9679,4 +9679,295 @@ test "L2 public context blocks lead the Run's user record and stay in history" {
     try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 2, sdk.bytesView("and the refunds"), &plain, &result, &fixture.diagnostic));
     const second = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second, "<system-reminder>\\nThe host application"));
+}
+
+/// Answers each Permission request with `allow_session` and, while the Run is
+/// suspended in that callback, tries to change the permission mode (#236).
+const PublicModeUpdateProbe = struct {
+    api: sdk.Api,
+    session: ?*wire.SessionHandle = null,
+    expected_run_id: u64 = 0,
+    ui_calls: u32 = 0,
+    ui_releases: u32 = 0,
+    request_generation: u64 = 0,
+    nested_update_status: u32 = wire.STATUS_OK,
+    write_decisions: u32 = 0,
+    last_decision: ?sdk.protocol.PermissionDecision = null,
+    last_used_session_rule: bool = false,
+    last_policy_generation: u64 = 0,
+
+    fn validRun(self: *@This(), run_ptr: ?*const wire.RunContextV1) bool {
+        const run = sdk.validateRunContext(run_ptr) catch return false;
+        return run.session == self.session and run.run_id == self.expected_run_id;
+    }
+
+    fn event(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        if (!self.validRun(run_ptr)) return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const known = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        switch (known) {
+            .permission_provenance => |provenance| {
+                if (!std.mem.eql(u8, provenance.tool.name, "Write")) return wire.EVENT_CONTINUE;
+                self.write_decisions += 1;
+                self.last_decision = provenance.decision;
+                self.last_used_session_rule = provenance.used_session_rule;
+                self.last_policy_generation = provenance.policy_generation;
+            },
+            else => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn ui(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        request_json: wire.BytesViewV1,
+        out_response: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        if (!self.validRun(run_ptr)) return wire.UI_FATAL;
+        const encoded = sdk.borrowedBytes(request_json) catch return wire.UI_FATAL;
+        const parsed = sdk.decodeUiRequest(std.heap.c_allocator, encoded) catch return wire.UI_FATAL;
+        defer parsed.deinit();
+        const request = switch (parsed.value) {
+            .permission => |value| value,
+            else => return wire.UI_FATAL,
+        };
+        const candidate = request.candidate orelse return wire.UI_FATAL;
+        if (!std.mem.eql(u8, request.tool.name, "Write")) return wire.UI_FATAL;
+        // The Run is suspended here: the facade is busy, so the mode update
+        // is refused and must change nothing.
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        self.nested_update_status = self.api.sessionControl().updatePermissionMode()(
+            self.session,
+            wire.PERMISSION_DONT_ASK,
+            &diagnostic,
+        );
+        self.api.bufferRelease()(&diagnostic);
+        self.request_generation = request.policy_generation;
+        const response_json = sdk.encodeUiResponse(
+            std.heap.c_allocator,
+            parsed.value,
+            .{ .permission = .{
+                .permission = .allow_session,
+                .request_id = request.request_id,
+                .policy_generation = request.policy_generation,
+                .rule_id = candidate.rule_id,
+            } },
+        ) catch return wire.UI_FATAL;
+        const out = out_response orelse {
+            std.heap.c_allocator.free(response_json);
+            return wire.UI_FATAL;
+        };
+        out.* = .{ .ptr = response_json.ptr, .len = response_json.len };
+        self.ui_calls += 1;
+        return wire.UI_ANSWERED;
+    }
+
+    fn releaseUi(raw: ?*anyopaque, response: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        const out = response orelse return;
+        if (out.ptr) |ptr| {
+            const len = std.math.cast(usize, out.len) orelse return;
+            std.heap.c_allocator.free(ptr[0..len]);
+            self.ui_releases += 1;
+        }
+        out.* = .{ .ptr = null, .len = 0 };
+    }
+};
+
+fn expectDescribedPermission(
+    api: sdk.Api,
+    session: ?*wire.SessionHandle,
+    mode: sdk.protocol.PermissionMode,
+    generation: u64,
+) !void {
+    const described = try decodeDescription(api, session);
+    defer described.deinit();
+    try std.testing.expectEqual(mode, described.value.permission_mode);
+    try std.testing.expectEqual(generation, described.value.policy_generation);
+}
+
+test "L2 Revision 19 permission mode update governs the next Run in place and revokes Session grants (#236)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ WRITE_SSE, FINAL_SSE } ** 4;
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    const builtins = [_]wire.BytesViewV1{sdk.bytesView("Write")};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.builtin_tools = &builtins;
+    runtime_config.builtin_tool_count = builtins.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &builtins;
+    host_config.allowed_tool_count = builtins.len;
+    var config = sessionCreateConfig(&host_config, "test-model");
+    var probe = PublicModeUpdateProbe{ .api = api };
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = PublicModeUpdateProbe.event;
+    callbacks.on_ui_request = PublicModeUpdateProbe.ui;
+    callbacks.release_response = PublicModeUpdateProbe.releaseUi;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
+    );
+    probe.session = session;
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+    const created_handle = session;
+    const written_path = try std.fs.path.join(a, &.{ root, "blocked.txt" });
+    defer a.free(written_path);
+    const cwd = std.Io.Dir.cwd();
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 3;
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    // full_access: the write runs and nobody is asked.
+    try expectDescribedPermission(api, session, .full_access, 1);
+    probe.expected_run_id = 1;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("write it"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(@as(u32, 0), probe.ui_calls);
+    try cwd.access(std.testing.io, written_path, .{});
+    try cwd.deleteFile(std.testing.io, written_path);
+
+    // The same handle and Conversation move to `default`: the next Run asks.
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().updatePermissionMode()(session, wire.PERMISSION_DEFAULT, &diagnostic),
+    );
+    try expectDescribedPermission(api, session, .default, 2);
+    probe.expected_run_id = 2;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 2, sdk.bytesView("write it again"), &options, &result, &diagnostic));
+    try std.testing.expect(session == created_handle);
+    try std.testing.expectEqual(@as(u32, 1), probe.ui_calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.ui_releases);
+    try std.testing.expectEqual(@as(u64, 2), probe.request_generation);
+    // Asked from inside the suspended Run, the update was refused and
+    // changed nothing.
+    try std.testing.expectEqual(wire.STATUS_BUSY, probe.nested_update_status);
+    try expectDescribedPermission(api, session, .default, 2);
+    try cwd.access(std.testing.io, written_path, .{});
+    try cwd.deleteFile(std.testing.io, written_path);
+
+    // The allow_session answer covers the next identical write.
+    probe.expected_run_id = 3;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 3, sdk.bytesView("and again"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(@as(u32, 1), probe.ui_calls);
+    try std.testing.expect(probe.last_used_session_rule);
+    try std.testing.expectEqual(sdk.protocol.PermissionDecision.allow, probe.last_decision.?);
+    try cwd.access(std.testing.io, written_path, .{});
+    try cwd.deleteFile(std.testing.io, written_path);
+
+    // Leaving the mode revokes that grant. With it, dont_ask would still
+    // allow the write; without it, dont_ask denies without asking.
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().updatePermissionMode()(session, wire.PERMISSION_DONT_ASK, &diagnostic),
+    );
+    try expectDescribedPermission(api, session, .dont_ask, 3);
+    probe.expected_run_id = 4;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 4, sdk.bytesView("one more"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(@as(u32, 1), probe.ui_calls);
+    try std.testing.expectEqual(sdk.protocol.PermissionDecision.deny, probe.last_decision.?);
+    try std.testing.expect(!probe.last_used_session_rule);
+    try std.testing.expectEqual(@as(u64, 3), probe.last_policy_generation);
+    try std.testing.expectError(error.FileNotFound, cwd.access(std.testing.io, written_path, .{}));
+
+    // An unknown code is refused and changes nothing; the current mode is a
+    // no-op that keeps the generation.
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.sessionControl().updatePermissionMode()(session, 99, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().updatePermissionMode()(session, wire.PERMISSION_DONT_ASK, &diagnostic),
+    );
+    try expectDescribedPermission(api, session, .dont_ask, 3);
+
+    // The checkpoint holds the new mode and generation and no grant: a
+    // restore under the same mode keeps the generation and restores nothing.
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+    probe.session = null;
+
+    host_config.permission_mode_code = wire.PERMISSION_DONT_ASK;
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &host_config;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&restore_report);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().restore()(runtime, &restore_config, &callbacks, &session, &restore_report, &diagnostic));
+    probe.session = session;
+    {
+        const decoded = try sdk.decodeRestoreReport(a, try sdk.borrowedBytes(.{
+            .ptr = restore_report.ptr,
+            .len = restore_report.len,
+        }));
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(u64, 3), decoded.value.policy_generation);
+        try std.testing.expectEqual(@as(u32, 0), decoded.value.permission.restored_rules);
+        try std.testing.expectEqual(@as(u32, 0), decoded.value.permission.invalidated_rules);
+    }
+    try expectDescribedPermission(api, session, .dont_ask, 3);
 }

@@ -419,7 +419,7 @@ def _fixture(root: Path) -> dict:
         "toolchain": {"zig_version": "0.16.0"},
         "target": {"id": "x86_64-linux-gnu", "architecture": "x86_64", "os": "linux", "abi": "gnu", "zig_target": "x86_64-linux-gnu"},
         "build": {"optimize": "ReleaseSafe", "strip": True},
-        "contract": {"cli_surface_version": 1, "binary_abi_status": "experimental", "binary_abi_version": 1, "binary_abi_revision": 18, "config_schema_version": 1},
+        "contract": {"cli_surface_version": 1, "binary_abi_status": "experimental", "binary_abi_version": 1, "binary_abi_revision": 19, "config_schema_version": 1},
         "components": [
             {"role": "primary_executable", "name": "metacodes", "path": "bin/metacodes", "sha256": digests["bin/metacodes"], "version": "0.1.0"},
             {
