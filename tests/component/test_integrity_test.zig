@@ -253,6 +253,11 @@ fn seedRepo(a: std.mem.Allocator, root: []const u8) !void {
     if (!runGit(a, root, &.{ "init", "-q" })) return error.SkipZigTest;
     _ = runGit(a, root, &.{ "config", "user.email", "test@metacodes.local" });
     _ = runGit(a, root, &.{ "config", "user.name", "metacodes-test" });
+    // Newer git follows a commit with a detached `git maintenance run --auto`
+    // that holds `.git/objects/maintenance.lock` for a moment; counted by
+    // `countObjects`, it made "the sensor never writes" fail at random.
+    _ = runGit(a, root, &.{ "config", "maintenance.auto", "false" });
+    _ = runGit(a, root, &.{ "config", "gc.auto", "0" });
     _ = runGit(a, root, &.{ "add", "-A" });
     if (!runGit(a, root, &.{ "commit", "-q", "-m", "seed" })) return error.SkipZigTest;
 }
@@ -266,7 +271,11 @@ fn countObjects(a: std.mem.Allocator, root: []const u8) !usize {
     defer walker.deinit();
     var count: usize = 0;
     while (try walker.next(std.testing.io)) |entry| {
-        if (entry.kind == .file) count += 1;
+        // Objects only: lock and temporary files come and go with whatever
+        // git process happens to be running.
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.basename, ".lock") or std.mem.startsWith(u8, entry.basename, "tmp_")) continue;
+        count += 1;
     }
     return count;
 }

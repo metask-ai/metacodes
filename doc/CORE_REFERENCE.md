@@ -678,7 +678,7 @@ JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次�
 path + 随机 id,两条都踩)。恢复面只有内容寻址的 `<channel>_artifact_id`(配 `Grep(artifact_id)`
 就地搜索);捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时就是**真的不可恢复**,由
 `<channel>_storage_error` 如实命名原因,而不是靠一条违约的句柄把它装成可恢复。后台作业则用
-稳定的 `job_id` + `BashOutput`(`*_next_offset` 是续读游标;无新请求字节时默认等待 30 秒直到新输出或退出,`wait_ms=0` 为快照)。MCP stdio、AgentCore MCP
+稳定的 `job_id` + `BashOutput`(`*_next_offset` 是续读游标;运行中的作业默认最多等 30 秒直到退出,未读输出按渲染成本已填满一页时立即返回(`returned_on: backlog`);`until` 可改为任一未读字节 `output`、有输出后停顿 `quiet`(`quiet_ms`)或出现字面子串 `pattern`(`pattern_match` 给出通道与偏移,快照与已退出作业同样报告;在时限内搜不完时给出 `pattern_searched_to` 供续搜;命中 pattern 不计入轮询守卫),`wait_ms=0` 为快照;同一作业背靠背的等待调用连续只拿到零星进度字节时,轮询守卫 `poll_guard` 让后续等待忽略进度输出,等待上限取 `wait_ms` 与守卫下限(30 秒起逐次倍增,下限封顶 300 秒)中的较大者,作业结束或命中 pattern 仍立即返回,非 pattern 等待遇到整页输出也立即返回;守卫生效时小于 256 字节的页(很小的 `max_bytes`)不算整页,翻积压请用 `wait_ms=0`)。MCP stdio、AgentCore MCP
 connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt/`ReadArtifact`
 恢复面。
 
