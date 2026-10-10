@@ -180,6 +180,18 @@ status, compatibility boundaries, and entry points are defined by
   directory entries with the macOS `dirent` layout and found no cassette on
   Linux; it now lists them portably. The TinyKG service end-to-end tests run on
   Windows except the one that needs a POSIX symlink.
+- The transcript parser can no longer silently drift from the writer or
+  quietly flip persisted flags. `parseMessageLine` now dispatches on the
+  `Block` tag (`stringToEnum` + exhaustive `switch`), so adding a block
+  variant without a parse arm is a compile error instead of the runtime
+  asymmetry that once made every extended-thinking session unresumable
+  (`"document"` keeps its distinct `WithdrawnDocumentBlock` rejection). The
+  boolean transcript fields — message-level `delivered`, `tool_result`'s
+  `is_error`/`delivered` — now reject a present-but-non-boolean value as
+  `InvalidTranscript` instead of silently reading it as `false`: a coerced
+  flag survives into memory and the next `/retry`/compact full rewrite would
+  persist the flipped semantics to disk. An absent field still defaults to
+  `false` for older transcripts.
 
 ## 0.3.1 — 2026-10-07
 
@@ -1857,18 +1869,6 @@ status, compatibility boundaries, and entry points are defined by
   that side reachable on any machine, replacing the
   `if (which("zls") == null) return error.SkipZigTest` pattern that had
   skipped exactly the half where the defect lived.
-- The transcript parser can no longer silently drift from the writer or
-  quietly flip persisted flags. `parseMessageLine` now dispatches on the
-  `Block` tag (`stringToEnum` + exhaustive `switch`), so adding a block
-  variant without a parse arm is a compile error instead of the runtime
-  asymmetry that once made every extended-thinking session unresumable
-  (`"document"` keeps its distinct `WithdrawnDocumentBlock` rejection). The
-  boolean transcript fields — message-level `delivered`, `tool_result`'s
-  `is_error`/`delivered` — now reject a present-but-non-boolean value as
-  `InvalidTranscript` instead of silently reading it as `false`: a coerced
-  flag survives into memory and the next `/retry`/compact full rewrite would
-  persist the flipped semantics to disk. An absent field still defaults to
-  `false` for older transcripts.
 
 ## 0.1.0 — 2026-08-29
 
