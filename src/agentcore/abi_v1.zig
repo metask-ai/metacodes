@@ -2660,6 +2660,7 @@ const AbiSession = struct {
             .last_compact_id = lease.last_compact_id,
             .checkpoint_generation = self.checkpoint_generation,
             .policy_generation = self.policy_generation,
+            .permission_mode = self.core_session.permission_ctx.modeValue(),
             .catalog_generation = self.catalog_generation,
             .model = model,
             .conversation_messages = @intCast(lease.conversation.messages.items.len),
@@ -2897,6 +2898,109 @@ const AbiSession = struct {
         self.policy_generation = next_generation;
         self.policy_fingerprint = next_fingerprint;
         self.pending_permission = null;
+        self.commitDurableReplacement(projected);
+    }
+
+    fn updatePermissionMode(
+        self: *AbiSession,
+        mode: core.types.PermissionMode,
+    ) !void {
+        if (self.facade_poisoned.load(.acquire))
+            return error.InvalidSessionState;
+        if (!self.tryBeginMutation()) return error.SessionBusy;
+        defer self.finishMutation();
+        try self.updatePermissionModeAdmitted(mode);
+    }
+
+    /// A mode change is a policy change (#236). Like a rule update it starts a
+    /// new policy generation and revokes every Session grant: an
+    /// allow_session or deny_session answer was given under the old mode and
+    /// is not carried into another one. The fingerprint is the one a Session
+    /// created with the new mode and the same Host authority would have, so
+    /// export and a matching restore agree on it. Setting the current mode is
+    /// a no-op that keeps the generation and the grants. Everything fallible
+    /// runs before publication; a failure leaves mode, generation, grants and
+    /// policy frame unchanged.
+    fn updatePermissionModeAdmitted(
+        self: *AbiSession,
+        mode: core.types.PermissionMode,
+    ) !void {
+        const current_mode = self.core_session.permission_ctx.modeValue();
+        if (current_mode == mode) return;
+        const next_generation = std.math.add(
+            u64,
+            self.policy_generation,
+            1,
+        ) catch return error.ResourceLimit;
+        const rules = try self.core_session.importedPermissionRuleInput(allocator);
+        defer {
+            allocator.free(rules.allow);
+            allocator.free(rules.ask);
+            allocator.free(rules.deny);
+        }
+        const definitions = self.core_session.tools.definitions;
+        const tool_names = try allocator.alloc([]const u8, definitions.len);
+        defer allocator.free(tool_names);
+        for (definitions, tool_names) |definition, *name|
+            name.* = definition.name;
+        const next_fingerprint = try session_permission.computePolicyFingerprint(
+            allocator,
+            mode,
+            rules,
+            .{
+                .root = self.core_session.workspace.root,
+                .home = self.core_session.workspace.home,
+                .shell = self.core_session.workspace.shell,
+            },
+            tool_names,
+        );
+        const current_state = try session_authority.encodePermissionState(
+            allocator,
+            current_mode,
+            &self.permission_state,
+            self.policy_fingerprint,
+        );
+        defer allocator.free(current_state);
+        var replacement_permission = try session_permission.State.init(
+            allocator,
+            next_generation,
+        );
+        defer replacement_permission.deinit();
+        const replacement_state = try session_authority.encodePermissionState(
+            allocator,
+            mode,
+            &replacement_permission,
+            next_fingerprint,
+        );
+        defer allocator.free(replacement_state);
+        // The root frame records the mode as well; replace it so the frame
+        // never disagrees with the Session.
+        const previous_root = self.policy_root;
+        const next_root: ?*policy_frame.PolicyFrame = if (previous_root) |root|
+            try policy_frame.PolicyFrame.createRoot(
+                allocator,
+                root.effectiveTools(),
+                root.shellPolicy(),
+                mode,
+                root.match_context,
+            )
+        else
+            null;
+        var next_root_live = next_root != null;
+        defer if (next_root_live) next_root.?.release();
+        const projected = try self.admitDurableReplacement(
+            current_state.len,
+            replacement_state.len,
+        );
+        try self.core_session.setPermissionMode(mode);
+        self.permission_state.replaceGeneration(next_generation) catch
+            unreachable;
+        self.policy_generation = next_generation;
+        self.policy_fingerprint = next_fingerprint;
+        self.pending_permission = null;
+        self.policy_root = next_root;
+        next_root_live = false;
+        if (previous_root) |root| root.release();
         self.commitDurableReplacement(projected);
     }
 
@@ -4479,6 +4583,21 @@ fn permissionMode(code: u32) ?core.types.PermissionMode {
         wire.PERMISSION_DONT_ASK => .dont_ask,
         wire.PERMISSION_FULL_ACCESS => .bypass_permissions,
         else => null,
+    };
+}
+
+/// The public name of a mode, matching its PERMISSION_* constant. Create,
+/// restore and the mode update admit only the five public codes and ABI v1
+/// selects no plan-mode tool, so the deprecated aliases and `plan` are only
+/// a total fallback, never a public value.
+fn permissionModeName(mode: core.types.PermissionMode) []const u8 {
+    return switch (mode) {
+        .default, .prompt => "default",
+        .accept_edits => "accept_edits",
+        .auto => "auto",
+        .dont_ask => "dont_ask",
+        .bypass_permissions, .bypass => "full_access",
+        .plan => "plan",
     };
 }
 
@@ -6283,6 +6402,7 @@ const SessionDescriptionJson = struct {
     last_compact_id: u64,
     checkpoint_generation: u64,
     policy_generation: u64,
+    permission_mode: []const u8,
     catalog_generation: u64,
     model: []const u8,
     conversation: struct {
@@ -6409,6 +6529,7 @@ fn encodeSessionDescription(
         .last_compact_id = description.last_compact_id,
         .checkpoint_generation = description.checkpoint_generation,
         .policy_generation = description.policy_generation,
+        .permission_mode = permissionModeName(description.permission_mode),
         .catalog_generation = description.catalog_generation,
         .model = description.model,
         .conversation = .{
@@ -7029,6 +7150,26 @@ fn sessionUpdatePermissionRules(
     return wire.STATUS_OK;
 }
 
+fn sessionUpdatePermissionMode(
+    handle: ?*wire.SessionHandle,
+    permission_mode_code: u32,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    const mode = permissionMode(permission_mode_code) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
+    self.updatePermissionModeAdmitted(mode) catch |err|
+        return failError(sessionMutationStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
 fn sessionUpdateMcp(
     handle: ?*wire.SessionHandle,
     selection_ptr: ?*const wire.McpSelectionV1,
@@ -7519,6 +7660,7 @@ const session_control_api_v1 = wire.SessionControlApiV1{
     .abort_compact = sessionAbortCompact,
     .export_checkpoint = sessionExportCheckpoint,
     .set_prompt_profile = sessionSetPromptProfile,
+    .update_permission_mode = sessionUpdatePermissionMode,
 };
 
 const skill_api_v1 = wire.SkillApiV1{
@@ -7749,7 +7891,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 18), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 19), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 64), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
@@ -11619,6 +11761,132 @@ test "Revision 6 AgentCore permission rule mutation is atomic and invalidates Se
         session.updatePermissionRules(.{}),
     );
     try std.testing.expect(native_session.permission_ctx.settings == published);
+}
+
+test "permission mode update starts a generation, revokes Session grants and fails atomically (#236)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = root_buffer[0..root_len] },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    const workspace: core.agent_session.WorkspaceConfig = .{
+        .root = native_session.workspace.root,
+        .home = native_session.workspace.home,
+        .shell = native_session.workspace.shell,
+    };
+
+    var session = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .permission_state = try session_permission.State.init(std.testing.allocator, 1),
+    };
+    defer session.permission_state.deinit();
+    session.policy_root = try policy_frame.PolicyFrame.createRoot(
+        std.testing.allocator,
+        &.{"Bash"},
+        native_session.workspace.shell,
+        .default,
+        native_session.permission_ctx.match_ctx,
+    );
+    defer if (session.policy_root) |root| root.release();
+    const rules = core.permission_settings.RuleSetInput{ .deny = &.{"Bash(rm *)"} };
+    try session.updatePermissionRules(rules);
+    try std.testing.expectEqual(@as(u64, 2), session.policy_generation);
+
+    const arguments_digest = try session_permission.digestCanonicalArguments(
+        std.testing.allocator,
+        "{\"command\":\"echo ok\"}",
+        .{},
+    );
+    const bash: session_permission.ToolIdentity = .{ .namespace = .builtin, .name = "Bash" };
+    const candidate = (try session_permission.deriveRuleCandidate(bash, arguments_digest)).?;
+    _ = try session.permission_state.remember(.allow_session, candidate, 2);
+    try std.testing.expectEqual(@as(usize, 1), session.permission_state.ruleCount());
+    const write_args = "{\"file_path\":\"ordinary.txt\",\"content\":\"x\"}";
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.ask,
+        core.permission.checkPermission(&native_session.permission_ctx, "Write", write_args),
+    );
+
+    // A change: new generation, no grants, the fingerprint a fresh Session
+    // with this mode and these rules would have, and a frame that agrees.
+    try session.updatePermissionMode(.accept_edits);
+    try std.testing.expectEqual(core.types.PermissionMode.accept_edits, native_session.permission_ctx.modeValue());
+    try std.testing.expectEqual(@as(u64, 3), session.policy_generation);
+    try std.testing.expectEqual(@as(u64, 3), session.permission_state.generation());
+    try std.testing.expectEqual(@as(usize, 0), session.permission_state.ruleCount());
+    const expected_fingerprint = try session_permission.computePolicyFingerprint(
+        std.testing.allocator,
+        .accept_edits,
+        rules,
+        workspace,
+        &.{},
+    );
+    try std.testing.expectEqualSlices(u8, &expected_fingerprint, &session.policy_fingerprint);
+    try std.testing.expectEqual(core.types.PermissionMode.accept_edits, session.policy_root.?.permissionMode());
+    try std.testing.expectEqual(@as(usize, 1), session.policy_root.?.effectiveTools().len);
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.allow,
+        core.permission.checkPermission(&native_session.permission_ctx, "Write", write_args),
+    );
+    // Explicit rules are their own layer and still apply.
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.deny,
+        core.permission.checkPermission(&native_session.permission_ctx, "Bash", "{\"command\":\"rm -rf x\"}"),
+    );
+    try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
+
+    // The current mode changes nothing: same generation, grants kept.
+    _ = try session.permission_state.remember(.deny_session, candidate, 3);
+    const published_fingerprint = session.policy_fingerprint;
+    const published_root = session.policy_root;
+    try session.updatePermissionMode(.accept_edits);
+    try std.testing.expectEqual(@as(u64, 3), session.policy_generation);
+    try std.testing.expectEqual(@as(usize, 1), session.permission_state.ruleCount());
+    try std.testing.expect(session.policy_root == published_root);
+
+    // Core refuses at the last step (a Provider cancel is still draining):
+    // the budget, generation, grants, fingerprint and frame stay as published.
+    const usage_before = session.budget_state.durable_usage_bytes;
+    native_session.in_flight_provider_cancels = 1;
+    try std.testing.expectError(error.SessionBusy, session.updatePermissionMode(.dont_ask));
+    native_session.in_flight_provider_cancels = 0;
+    session.call_state = .running;
+    try std.testing.expectError(error.SessionBusy, session.updatePermissionMode(.dont_ask));
+    session.call_state = .idle;
+    session.facade_poisoned.store(true, .release);
+    try std.testing.expectError(error.InvalidSessionState, session.updatePermissionMode(.dont_ask));
+    session.facade_poisoned.store(false, .release);
+    try std.testing.expectEqual(core.types.PermissionMode.accept_edits, native_session.permission_ctx.modeValue());
+    try std.testing.expectEqual(@as(u64, 3), session.policy_generation);
+    try std.testing.expectEqual(@as(u64, 3), session.permission_state.generation());
+    try std.testing.expectEqual(@as(usize, 1), session.permission_state.ruleCount());
+    try std.testing.expectEqualSlices(u8, &published_fingerprint, &session.policy_fingerprint);
+    try std.testing.expect(session.policy_root == published_root);
+    try std.testing.expectEqual(usage_before, session.budget_state.durable_usage_bytes);
+    try std.testing.expectEqual(
+        session_permission.Decision.deny,
+        (try session.permission_state.decide(
+            bash,
+            .{ .arguments_digest = arguments_digest },
+            .undecided,
+            .{ .decision = .ask, .source = .mode_fallback },
+        )).decision,
+    );
 }
 
 test "Session Skill selection update is explicit atomic and selection-only" {

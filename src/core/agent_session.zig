@@ -736,6 +736,11 @@ pub const PermissionRuleMutationError = error{
     InvalidRule,
 };
 
+pub const PermissionModeMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+};
+
 pub const PromptProfileMutationError = error{
     SessionBusy,
     InvalidSessionState,
@@ -1686,6 +1691,67 @@ pub const AgentSession = struct {
         std.debug.assert(self.state == .mutating);
         self.state = .idle;
         self.mutex.unlock();
+    }
+
+    /// Replace the Session's permission mode at the idle mutation boundary.
+    /// The next permission decision uses it. Imported rules and Session-local
+    /// allow/deny memory are separate layers and are left as they are.
+    pub fn setPermissionMode(
+        self: *AgentSession,
+        mode: types.PermissionMode,
+    ) PermissionModeMutationError!void {
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+
+        // The mode sink, when one is attached, runs outside the Session lock.
+        self.permission_ctx.setMode(mode);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    /// The Host rule set as it was imported, rule for rule and in order.
+    /// The returned lists are owned by `allocator`; the rule strings borrow
+    /// the Session and stay valid until the next rule update.
+    pub fn importedPermissionRuleInput(
+        self: *const AgentSession,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}!permission_settings.RuleSetInput {
+        const rules = if (self.imported_permission_rules) |*value| value else return .{};
+        std.debug.assert(rules.layers.len == 1);
+        const layer = rules.layers[0];
+        const allow = try rawRules(allocator, layer.allow);
+        errdefer allocator.free(allow);
+        const ask = try rawRules(allocator, layer.ask);
+        errdefer allocator.free(ask);
+        const deny = try rawRules(allocator, layer.deny);
+        return .{ .allow = allow, .ask = ask, .deny = deny };
+    }
+
+    fn rawRules(
+        allocator: std.mem.Allocator,
+        rules: []const permission_settings.Rule,
+    ) error{OutOfMemory}![]const []const u8 {
+        const raw = try allocator.alloc([]const u8, rules.len);
+        for (rules, raw) |rule, *value| value.* = rule.raw;
+        return raw;
     }
 
     /// Replace the prompt profile while idle (#184). The next Run renders its
@@ -2844,6 +2910,55 @@ test "AgentSession permission rule update is idle-only atomic and preserves memo
     try std.testing.expect(self.permission_ctx.settings == null);
     try std.testing.expect(self.session_rules.isAllowed("Bash"));
     try std.testing.expect(self.session_rules.isDenied("Write"));
+}
+
+test "AgentSession permission mode update is idle-only and keeps the imported rules" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.updatePermissionRules(.{ .allow = &.{ "Read", "Glob" }, .deny = &.{"Bash(rm *)"} });
+    const write_args = "{\"file_path\":\"ordinary.txt\",\"content\":\"x\"}";
+    try std.testing.expectEqual(
+        permission.PermissionResult.ask,
+        permission.checkPermission(&self.permission_ctx, "Write", write_args),
+    );
+
+    try self.setPermissionMode(.accept_edits);
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, self.permission_ctx.modeValue());
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(
+        permission.PermissionResult.allow,
+        permission.checkPermission(&self.permission_ctx, "Write", write_args),
+    );
+    try std.testing.expectEqual(
+        permission.PermissionResult.deny,
+        permission.checkPermission(&self.permission_ctx, "Bash", "{\"command\":\"rm -rf x\"}"),
+    );
+
+    const input = try self.importedPermissionRuleInput(std.testing.allocator);
+    defer {
+        std.testing.allocator.free(input.allow);
+        std.testing.allocator.free(input.ask);
+        std.testing.allocator.free(input.deny);
+    }
+    try std.testing.expectEqual(@as(usize, 2), input.allow.len);
+    try std.testing.expectEqualStrings("Read", input.allow[0]);
+    try std.testing.expectEqualStrings("Glob", input.allow[1]);
+    try std.testing.expectEqual(@as(usize, 0), input.ask.len);
+    try std.testing.expectEqualStrings("Bash(rm *)", input.deny[0]);
+
+    var probe = SinkProbe{};
+    _ = try self.beginRun(41, probe.sink());
+    try std.testing.expectError(error.SessionBusy, self.setPermissionMode(.default));
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, self.permission_ctx.modeValue());
+    _ = self.finishRunLifecycle();
+
+    try self.updatePermissionRules(.{});
+    const empty = try self.importedPermissionRuleInput(std.testing.allocator);
+    try std.testing.expect(empty.isEmpty());
 }
 
 const CompactTestProvider = struct {

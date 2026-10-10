@@ -10,6 +10,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- AgentCore ABI v1 revision 19 (#236): `session_control->update_permission_mode`
+  changes an existing Session's permission mode in place while it is idle.
+  The handle, logical Session ID and Conversation stay; there is no export,
+  destroy and restore. The first permission decision after the call uses the
+  new mode. A change starts a new policy generation and revokes every Session
+  grant (`allow_session` and `deny_session`), as a rule update does; setting
+  the current mode changes nothing. A Run (including one suspended in a
+  Permission callback), compaction, checkpoint export, another mutation or a
+  draining Provider cancel makes it return `BUSY`; a poisoned Session returns
+  `INVALID_STATE` and an unknown code `INVALID_ARGUMENT`; none of them changes
+  mode, generation or grants. `describe` reports `permission_mode` beside
+  `policy_generation`, and the policy fingerprint after a change is the one a
+  Session created with the new mode would have, so an export holds no revoked
+  grant and a restore under the same mode keeps the generation. The Session
+  Control table grows by one slot to 80 bytes; the header, Zig and Rust SDKs
+  (`raw.rs` regenerated), both source-free consumers, the bundle manifest
+  and the docs move to revision 19, SDK package `0.6.0-dev`.
+
 ## 0.4.0 — 2026-10-10
 
 ### Added

@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 18 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 19 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 18 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 19 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 18u
+#define METASK_AGENTCORE_ABI_REVISION 19u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -835,10 +835,16 @@ typedef uint32_t (*metask_agentcore_session_export_checkpoint_fn_v1)(
 typedef uint32_t (*metask_agentcore_session_set_prompt_profile_fn_v1)(
     metask_agentcore_session *, const metask_agentcore_prompt_profile_v1 *,
     metask_agentcore_owned_bytes_v1 *);
+/* Replaces the permission mode (one METASK_AGENTCORE_PERMISSION_* code) while
+ * idle. A change starts a new policy generation and revokes every Session
+ * grant; the next permission decision uses the new mode. The current mode is
+ * a no-op. Any failure leaves mode, generation and grants unchanged. */
+typedef uint32_t (*metask_agentcore_session_update_permission_mode_fn_v1)(
+    metask_agentcore_session *, uint32_t, metask_agentcore_owned_bytes_v1 *);
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 18. No earlier revision layout
+/* Function-table order is fixed within Revision 19. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -867,6 +873,7 @@ typedef struct metask_agentcore_session_control_api_v1 {
     metask_agentcore_session_abort_compact_fn_v1 abort_compact;
     metask_agentcore_session_export_checkpoint_fn_v1 export_checkpoint;
     metask_agentcore_session_set_prompt_profile_fn_v1 set_prompt_profile;
+    metask_agentcore_session_update_permission_mode_fn_v1 update_permission_mode;
 } metask_agentcore_session_control_api_v1;
 
 typedef struct metask_agentcore_skill_api_v1 {
@@ -964,6 +971,8 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
                (metask_agentcore_session_export_checkpoint_fn_v1)0 &&
            api->session_control->set_prompt_profile !=
                (metask_agentcore_session_set_prompt_profile_fn_v1)0 &&
+           api->session_control->update_permission_mode !=
+               (metask_agentcore_session_update_permission_mode_fn_v1)0 &&
            api->skill != (const metask_agentcore_skill_api_v1 *)0 &&
            ((uintptr_t)api->skill % sizeof(void *)) == 0 &&
            api->skill->struct_size == sizeof(*api->skill) &&
@@ -1018,8 +1027,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 18u,
-                               "AgentCore revision 18");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 19u,
+                               "AgentCore revision 19");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1080,7 +1089,7 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_checkpoint_export_result_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_restore_config_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_runtime_api_v1, 24);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_api_v1, 40);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 72);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_api_v1, 32);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_api_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_api_v1, 64);
@@ -1139,6 +1148,7 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, reserved, 88);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_blocks, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_block_count, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, set_prompt_profile, 64);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, update_permission_mode, 72);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, durable_usage_bytes, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, required_checkpoint_bytes, 32);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_checkpoint_export_result_v1, digest, 32);
