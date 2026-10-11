@@ -174,9 +174,13 @@ metacodes kgd            # serve it in the foreground until Ctrl+C
 `kg install` resolves the staged executables, creates the Store when it is
 absent, generates a 256-bit API key, computes the build id from the two TinyKG
 executables and the metadata the CLI declares, and writes `daemon.json` (0600)
-in a 0700 directory. It starts nothing. Re-running it keeps the existing key,
-port and Store, so reconfiguring never locks out a session that already read
-them; `--port` and `--store` change them deliberately.
+in a 0700 directory. It starts nothing. Without `--port` a new configuration
+takes the port it prefers — derived from its own path, in 20000-32767, below
+every platform's ephemeral range — or a free one when that is taken, so two
+state roots on one machine do not reach for the same port (it used to be 8799
+for all of them). Re-running it keeps the existing key, port and Store, so
+reconfiguring never locks out a session that already read them; `--port` and
+`--store` change them deliberately.
 
 `kgd` owns one `tinykgd` child and serves `POST /api/run`,
 `POST /api/import-markdown` and `GET /api/ready` on loopback, authenticated by
@@ -287,19 +291,38 @@ install's service unconfigured or not listening, the host
 cross-process lock per state root (`<state root>/kg/kgd.autostart.lock`):
 
 1. provision it like `kg install` when the default `<state root>/kg/daemon.json`
-   does not exist, on the default port 8799 when it is free and on a free port
-   otherwise, so installs on one machine do not collide;
-2. start `<this executable> --state-dir <state root> kgd` as a background
+   does not exist, on that configuration's preferred port when it is free and
+   on a free port otherwise, so installs on one machine do not collide;
+2. ask whatever listens on the configured port for `GET /api/ready` with this
+   configuration's key. This install's service answers (200, or 503 when
+   degraded). A service that refuses the key with 401 — another state root's,
+   or one started with an older key — or a listener that is not HTTP is never
+   taken for it: the default configuration is rewritten to a free port with a
+   new key (the old one has just been presented to that service) and the same
+   Store, and a `METACODES_KG_CONFIG` file is left as written and reported in
+   the log. A listener that does not answer within 2 s is assumed
+   to be this install's service, busy, and is left alone;
+3. start `<this executable> --state-dir <state root> kgd` as a background
    service (own session, no terminal, output appended to
-   `<state root>/kg/kgd.log`) unless something already listens on the port;
-3. wait up to 20 s for the port to accept connections, then probe again.
+   `<state root>/kg/kgd.log`) when nothing listens on the port;
+4. wait up to 20 s for the port to accept connections, then probe again.
+
+Besides a service that is not configured or not listening, a session asks the
+host when its readiness probe meets a loopback service that refuses its key,
+then reads `daemon.json` again and probes once more. Before this, a test run in
+a temporary home that provisioned and bound 8799 while the real install's
+service was down left that install with `auth_failed` until the test's
+service was killed. A second session that finds the start lock held waits for
+the lock to go and judges the port the configuration names by then, since the
+first may have moved it.
 
 A host start is attempted at most once per client per 30 s. It does not apply
 to an explicit `METACODES_KG_URL`/`_API_KEY`/`_EXPECTED_BUILD_ID` service, a
 non-loopback URL, or a `METACODES_KG_CONFIG` file that does not exist (that
 fails closed). `METACODES_KG_AUTOSTART=0` (or `false`/`off`) turns it off. The
 `unconfigured` and `daemon_unreachable` repair hints (shared by the tools,
-`/kg` and `doctor`) say so. The core never spawns the service itself:
+`/kg` and `doctor`) say so, and the `auth_failed` hint names the squatting
+case. The core never spawns the service itself:
 an SDK embedder passes its own hook, or none.
 
 The started service stays up until it is stopped or the machine restarts;

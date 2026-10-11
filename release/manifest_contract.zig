@@ -581,7 +581,7 @@ fn validManifest(components: []const Component, files: []const FileEntry) Manife
         .toolchain = .{ .zig_version = "0.16.0" },
         .target = .{ .id = "x86_64-linux-gnu", .architecture = "x86_64", .os = "linux", .abi = "gnu", .zig_target = "x86_64-linux-gnu" },
         .build = .{ .optimize = "ReleaseSafe", .strip = true },
-        .contract = .{ .cli_surface_version = 1, .binary_abi_status = "experimental", .binary_abi_version = 1, .binary_abi_revision = 18, .config_schema_version = 1 },
+        .contract = .{ .cli_surface_version = 1, .binary_abi_status = "experimental", .binary_abi_version = 1, .binary_abi_revision = 19, .config_schema_version = 1 },
         .components = components,
         .compatibility = .{ .requires = &requires, .fails_without = &fails_without, .degraded_without = &degraded_without },
         .files = files,
@@ -604,7 +604,7 @@ fn expectedStable() Expected {
         .strip = true,
         .cli_surface_version = 1,
         .binary_abi_version = 1,
-        .binary_abi_revision = 18,
+        .binary_abi_revision = 19,
         .config_schema_version = 1,
     };
 }
@@ -695,7 +695,7 @@ test "the schema example parses into Manifest" {
         \\ "toolchain":{"zig_version":"0.16.0"},
         \\ "target":{"id":"x86_64-linux-gnu","architecture":"x86_64","os":"linux","abi":"gnu","zig_target":"x86_64-linux-gnu"},
         \\ "build":{"optimize":"ReleaseSafe","strip":true},
-        \\ "contract":{"cli_surface_version":1,"binary_abi_status":"experimental","binary_abi_version":1,"binary_abi_revision":18,"config_schema_version":1},
+        \\ "contract":{"cli_surface_version":1,"binary_abi_status":"experimental","binary_abi_version":1,"binary_abi_revision":19,"config_schema_version":1},
         \\ "components":[{"role":"primary_executable","name":"metacodes","path":"bin/metacodes","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"0.1.0"}],
         \\ "compatibility":{"requires":[],"fails_without":[],"degraded_without":[]},
         \\ "files":[{"path":"bin/metacodes","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}

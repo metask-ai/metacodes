@@ -220,6 +220,8 @@ pub const SessionDescription = struct {
     last_compact_id: u64,
     checkpoint_generation: u64,
     policy_generation: u64,
+    /// The mode the next permission decision uses (#236).
+    permission_mode: core.types.PermissionMode,
     catalog_generation: u64,
     model: []u8,
     conversation_messages: u64,

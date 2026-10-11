@@ -4,7 +4,7 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 18 or
+    if (wire.ABI_REVISION != 19 or
         wire.PROMPT_OP_ADD != 1 or
         wire.PROMPT_OP_REPLACE != 2 or
         wire.PROMPT_OP_REMOVE != 3 or
@@ -29,10 +29,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 18 codes must match the public contract");
+        @compileError("source-free Revision 19 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 18 must not expose the removed catalog refresh entry");
+        @compileError("revision 19 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -695,6 +695,39 @@ pub fn main(init: std.process.Init) !void {
         api.sessionControl().updatePermissionRules()(session, &initial_rules, &diagnostic),
         diagnostic,
     );
+    // The mode changes in place: same handle, a new policy generation, and
+    // describe names the mode. An unknown code and a repeat change nothing.
+    const full_access = try describePermission(a, api, session);
+    if (full_access.mode != .full_access) return error.InvalidPermissionMode;
+    try expectStatus(
+        .ok,
+        api.sessionControl().updatePermissionMode()(session, wire.PERMISSION_DEFAULT, &diagnostic),
+        diagnostic,
+    );
+    const default_mode = try describePermission(a, api, session);
+    if (default_mode.mode != .default or default_mode.generation != full_access.generation + 1)
+        return error.InvalidPermissionMode;
+    try expectStatus(
+        .invalid_argument,
+        api.sessionControl().updatePermissionMode()(session, 99, &diagnostic),
+        diagnostic,
+    );
+    api.bufferRelease()(&diagnostic);
+    try expectStatus(
+        .ok,
+        api.sessionControl().updatePermissionMode()(session, wire.PERMISSION_DEFAULT, &diagnostic),
+        diagnostic,
+    );
+    if ((try describePermission(a, api, session)).generation != default_mode.generation)
+        return error.InvalidPermissionMode;
+    try expectStatus(
+        .ok,
+        api.sessionControl().updatePermissionMode()(session, wire.PERMISSION_FULL_ACCESS, &diagnostic),
+        diagnostic,
+    );
+    const restored_mode = try describePermission(a, api, session);
+    if (restored_mode.mode != .full_access or restored_mode.generation != default_mode.generation + 1)
+        return error.InvalidPermissionMode;
     var compact_result = std.mem.zeroes(wire.CompactResultV1);
     try expectStatus(
         .ok,
@@ -891,7 +924,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 18 Agent Runtime, prompt profile, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 19 Agent Runtime, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {
@@ -935,6 +968,25 @@ fn readToolSse(a: std.mem.Allocator, path: []const u8) ![]u8 {
         "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
         "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
         "data: {{\"type\":\"message_stop\"}}\n\n", .{path});
+}
+
+const DescribedPermission = struct {
+    mode: sdk.protocol.PermissionMode,
+    generation: u64,
+};
+
+fn describePermission(a: std.mem.Allocator, api: sdk.Api, session: ?*wire.SessionHandle) !DescribedPermission {
+    var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&diagnostic);
+    var description = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&description);
+    try expectStatus(.ok, api.sessionControl().describe()(session, &description, &diagnostic), diagnostic);
+    const decoded = try sdk.decodeSessionDescription(a, try sdk.borrowedBytes(.{
+        .ptr = description.ptr,
+        .len = description.len,
+    }));
+    defer decoded.deinit();
+    return .{ .mode = decoded.value.permission_mode, .generation = decoded.value.policy_generation };
 }
 
 fn expectStatus(expected: sdk.Status, actual_code: u32, diagnostic: wire.OwnedBytesV1) !void {

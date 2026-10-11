@@ -68,7 +68,7 @@ pub const PermissionCandidate = struct {
     target: ?[]const u8,
 };
 
-/// Exact Revision 18 Permission callback request. Unlike AskUserQuestion this
+/// Exact Revision 19 Permission callback request. Unlike AskUserQuestion this
 /// is a flat typed object, identified by `type == "permission"`.
 pub const PermissionRequest = struct {
     type: []const u8,
@@ -556,6 +556,15 @@ pub const RestoreHealth = enum {
     degraded,
 };
 
+/// A Session's permission mode, named as its PERMISSION_* constant.
+pub const PermissionMode = enum {
+    default,
+    accept_edits,
+    auto,
+    dont_ask,
+    full_access,
+};
+
 pub const DurableBudgetOutcome = enum {
     none,
     budget_required,
@@ -573,6 +582,9 @@ pub const SessionDescription = struct {
     last_compact_id: u64,
     checkpoint_generation: u64,
     policy_generation: u64,
+    /// The mode the next permission decision uses; `policy_generation` is
+    /// the generation it belongs to.
+    permission_mode: PermissionMode,
     catalog_generation: u64,
     model: []const u8,
     conversation: struct {

@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 18 root plus mandatory domain tables. Discovery rejects
+/// Validated Revision 19 root plus mandatory domain tables. Discovery rejects
 /// every other layout; there is no legacy probe or alternate dispatch.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -194,6 +194,13 @@ impl SessionControlApi {
     pub fn set_prompt_profile(self) -> raw::metask_agentcore_session_set_prompt_profile_fn_v1 {
         self.table().set_prompt_profile
     }
+    /// Replaces the Session's permission mode while idle; a change revokes
+    /// every Session grant.
+    pub fn update_permission_mode(
+        self,
+    ) -> raw::metask_agentcore_session_update_permission_mode_fn_v1 {
+        self.table().update_permission_mode
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -291,6 +298,7 @@ unsafe fn validate_session_control_api(
         && table.abort_compact.is_some()
         && table.export_checkpoint.is_some()
         && table.set_prompt_profile.is_some()
+        && table.update_permission_mode.is_some()
 }
 
 unsafe fn validate_skill_api(ptr: *const raw::metask_agentcore_skill_api_v1) -> bool {
@@ -604,7 +612,7 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 18);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 19);
         assert_eq!(raw::METASK_AGENTCORE_PROMPT_OP_ADD, 1);
         assert_eq!(raw::METASK_AGENTCORE_PROMPT_OP_REPLACE, 2);
         assert_eq!(raw::METASK_AGENTCORE_PROMPT_OP_REMOVE, 3);
@@ -646,7 +654,7 @@ mod tests {
         assert_eq!(size_of::<raw::metask_agentcore_session_api_v1>(), 40);
         assert_eq!(
             size_of::<raw::metask_agentcore_session_control_api_v1>(),
-            72
+            80
         );
         assert_eq!(size_of::<raw::metask_agentcore_skill_api_v1>(), 32);
         assert_eq!(size_of::<raw::metask_agentcore_mcp_api_v1>(), 40);

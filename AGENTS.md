@@ -56,7 +56,10 @@ git diff --check
 full suite at `-Doptimize` (Debug by default). CI runs the same commands (the
 full suite in Debug, the core suite in ReleaseSafe;
 `scripts/tests/test_gate_manifest.py` asserts every command above has a CI
-step), so this block is the single source. Run the full suite with
+step), so this block is the single source. The one exception is a release or
+reopen PR that adds only `scripts/release_cut.py`'s generated bump to a base
+whose full CI passed: it takes the CI fast path
+(`doc/RELEASE_AUTOMATION_DESIGN.md` §3). Run the full suite with
 `-Doptimize=ReleaseSafe` as well when a change touches unsafe code or an ABI.
 
 The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`).

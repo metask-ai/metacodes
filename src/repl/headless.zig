@@ -17,6 +17,7 @@ const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const check_gate_mod = @import("../core/check_gate.zig");
 const test_integrity_mod = @import("../core/test_integrity.zig");
+const stall_gate_mod = @import("../core/stall_gate.zig");
 const output_semantics = @import("../core/output_semantics.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const permission_mod = @import("../permission.zig");
@@ -475,6 +476,9 @@ pub fn run(
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
         printIntegrityNotice(allocator, &integrity_report);
     }
+    // stdout carries the answer (or the result line); the stall notice goes to
+    // stderr, where a person running the command still sees it.
+    if (result.stall) |report| printStallNotice(allocator, report);
 
     return exitCodeFor(result.stop_reason);
 }
@@ -534,6 +538,9 @@ fn buildOptions(
         // there would cost tokens for nobody (and every eval rollout runs here).
         .progress_updates = app.config.progress_updates and app.config.stream_json,
         .progress_updates_observe = app.config.progress_updates_observe,
+        // Print mode carries evaluation rollouts whose stop-reason sets are
+        // fixed: the stall gate runs here only when asked for.
+        .stall_gate = stall_gate_mod.modeFor(app.config.stall_gate, .headless),
         .check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max),
         .test_integrity = test_integrity_mod.optionsFromFlags(app.config.test_integrity, app.config.test_integrity_observe),
         .delivery_cadence_thresholds = .{
@@ -880,6 +887,9 @@ pub fn buildResultLine(
         // 被 token 上限截断且续写预算耗尽、该轮无可用产出(见 agent_loop
         // MAX_CONTINUATIONS):一个显式的失败终态,不能当作 end_turn。
         .max_tokens_exhausted => "max_tokens_exhausted",
+        // The stall gate stopped a run that kept returning nothing new: a
+        // controlled stop (exit 0), distinct from the environment breaker.
+        .stalled => "stalled",
     };
     const cost = usage.costUsd(model);
 
@@ -917,6 +927,12 @@ pub fn buildResultLine(
     return try aw.toOwnedSlice();
 }
 
+fn printStallNotice(allocator: std.mem.Allocator, report: stall_gate_mod.Report) void {
+    const notice = stall_gate_mod.renderStopNotice(allocator, report) catch return;
+    defer allocator.free(notice);
+    std.debug.print("{s}\n", .{notice});
+}
+
 /// Plain-text mode keeps stdout for the answer; the integrity notice goes to
 /// stderr, where a person running the command still sees it.
 fn printIntegrityNotice(allocator: std.mem.Allocator, report: *const test_integrity_mod.Report) void {
@@ -929,7 +945,7 @@ fn printIntegrityNotice(allocator: std.mem.Allocator, report: *const test_integr
 /// 其它(api/tool error 或 aborted)→ 1。
 pub fn exitCodeFor(stop_reason: agent_loop.StopReason) u8 {
     return switch (stop_reason) {
-        .end_turn, .max_turns, .budget, .tool_loop => 0,
+        .end_turn, .max_turns, .budget, .tool_loop, .stalled => 0,
         .suspended => 2, // 挂起待恢复:区别于完成(0)与失败(1)
         else => 1,
     };

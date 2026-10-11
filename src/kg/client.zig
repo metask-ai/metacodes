@@ -22,6 +22,7 @@
 const std = @import("std");
 const jev_excerpt = @import("../jev/excerpt.zig");
 const pfs = @import("platform").fs;
+const net = @import("platform").net;
 const time = @import("../util/time.zig");
 const sync = @import("platform").sync;
 const common = @import("../tools/common.zig");
@@ -317,8 +318,9 @@ pub const KgClient = struct {
 
     /// How a host brings up the local TinyKG service on demand. The core never
     /// spawns processes or picks executables: it only says when the service is
-    /// needed and not there — unconfigured, or refusing connections when the
-    /// client probes readiness — and the host decides whether and how to start
+    /// needed and not there — unconfigured, or not listening (by the platform's
+    /// listener table, or a refused connection) when the client probes
+    /// readiness — and the host decides whether and how to start
     /// one. `start` returns true when a service should now answer at the
     /// configured address; it is called with no client lock held, from any
     /// thread that owns a client of this family, so the host makes it
@@ -905,6 +907,15 @@ pub const KgClient = struct {
                 return;
             },
             .daemon => |*daemon| {
+                // A service that is simply not running (a reboot, a first
+                // session) is the usual reason it does not answer. On Windows
+                // the read below learns that only after two refused connects
+                // of ~2 s each, so when the listener table already says
+                // nothing listens, the host is asked first. The verdict still
+                // comes from store-info; this only moves the start earlier.
+                if (daemon.loopbackPort()) |port| {
+                    if (net.loopbackListenState(port) == .not_listening) _ = self.tryAutostart();
+                }
                 const result = daemon.run("store-info", &.{}, false) catch |first| retry: {
                     // Configured but not listening: the host may start it.
                     if (serviceNotRunning(first) and self.tryAutostart()) {
@@ -912,6 +923,16 @@ pub const KgClient = struct {
                             self.setDegraded(classifyDaemonError(err), "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(err)});
                             return;
                         };
+                    }
+                    // A local service that refuses this configuration's key may
+                    // be another state root's, holding the port this install
+                    // pinned. The host can move this install to a free port and
+                    // start its own service there; read what it wrote and probe
+                    // once more (tryAutostart allows one start per window, so
+                    // this does not recurse further).
+                    if (first == transport_mod.Error.AuthenticationFailed and daemon.loopbackPort() != null and self.tryAutostart()) {
+                        self.reloadDaemonConfig();
+                        return self.ensureReady();
                     }
                     self.setDegraded(classifyDaemonError(first), "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(first)});
                     return;
@@ -1236,7 +1257,7 @@ pub const KgClient = struct {
             .config_unsafe => "chmod 600 and make it a regular non-symlink file under 64 KB",
             .config_invalid => "fix url/api_key/expected_build_id JSON",
             .daemon_unreachable => "a CLI session starts it when it begins (METACODES_KG_AUTOSTART=0 turns that off); `metacodes kgd` starts it now",
-            .auth_failed => "api_key must match the daemon's TINYKG_WEB_API_KEY",
+            .auth_failed => "the service on this port refused this configuration's key: another state root's service (or one started with an older key) holds it; with the default daemon.json the next session moves this install to a free port, otherwise stop that service or fix the configured key or port",
             .pin_mismatch => "set expected_build_id/schema digest to the running daemon's /api/catalog values",
             .store_contract_mismatch => "migrate the store to storage 3 / schema 3",
             .server_degraded => "the daemon is up but reports a degraded store, check its logs",

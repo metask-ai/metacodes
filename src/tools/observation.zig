@@ -27,6 +27,7 @@ pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-o
 pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v3";
 pub const DELIVERY_CADENCE_SCHEMA_VERSION = "metacodes-delivery-cadence-v1";
 pub const PROGRESS_UPDATES_SCHEMA_VERSION = "metacodes-progress-updates-v1";
+pub const STALL_GATE_SCHEMA_VERSION = "metacodes-stall-gate-v1";
 pub const CHECK_GATE_SCHEMA_VERSION = "metacodes-check-gate-v1";
 pub const TEST_INTEGRITY_SCHEMA_VERSION = "metacodes-test-integrity-v1";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
@@ -58,6 +59,8 @@ pub const SystemOneOutcome = enum {
 /// The last verdict the host check gate obtained in a run (`not_run` when
 /// the run never reached a dirty end-of-turn boundary).
 pub const CheckGateVerdict = enum { not_run, passed, failed, tainted, unavailable };
+/// Why the stall gate decided (`none`: it never did).
+pub const StallCause = enum { none, repeating, stale };
 pub const TestIntegrityCoverage = enum { git, no_git, git_failed };
 pub const TestIntegrityOutcome = enum { clean, restored, kept_cited, kept_silent, observed };
 
@@ -319,6 +322,31 @@ pub const Event = union(enum) {
         decisions: u8,
         nudges: u8,
         max_nudges: u8,
+    },
+    /// Terminal record of the stall gate (StallGate.lean): at most one per
+    /// run, emitted whenever the gate was armed (enforced or observed).
+    /// Counters only, no keys or tool names. `rounds` counts tool rounds in
+    /// which something ran, of which `progress_rounds` returned something new.
+    /// `decided_round` is the round of the decision (0 when `cause` is
+    /// `none`). An enforced decision ended the run there. An observed one
+    /// marks where it would have ended. `forgotten` counts remembered answers
+    /// dropped because the model could no longer see them.
+    stall_gate: struct {
+        schema_version: []const u8 = STALL_GATE_SCHEMA_VERSION,
+        /// Treatment-actuation witness: true when a decision ends the run.
+        enforced: bool,
+        repeat_rounds_threshold: u32,
+        repeat_calls_threshold: u32,
+        stale_rounds_threshold: u32,
+        rounds: u32,
+        progress_rounds: u32,
+        max_stale_rounds: u32,
+        max_repeats: u32,
+        forgotten: u32,
+        decisions: u8,
+        max_decisions: u8,
+        cause: StallCause,
+        decided_round: u32,
     },
     /// Terminal record of the host check gate (CheckGate.lean): emitted once
     /// per run whenever the gate was armed (enforced or observed). `checks`

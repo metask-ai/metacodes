@@ -44,10 +44,10 @@ test "L2 headless --json: result 行字段完整 + 合法 JSON + text 转义" {
     try std.testing.expectEqual(@as(i64, 3), obj.get("turns").?.integer);
 }
 
-test "L2 headless --json: stop_reason 各值都能序列化(含 tool_loop)" {
+test "L2 headless --json: stop_reason 各值都能序列化(含 tool_loop、stalled)" {
     const a = std.testing.allocator;
     const usage = UsageTotals{};
-    for ([_]cc.agent_loop.StopReason{ .end_turn, .max_turns, .aborted, .api_error, .tool_error, .tool_loop }) |sr| {
+    for ([_]cc.agent_loop.StopReason{ .end_turn, .max_turns, .aborted, .api_error, .tool_error, .tool_loop, .stalled }) |sr| {
         const line = try headless.buildResultLine(a, "", "none", null, null, .{ .stop_reason = sr, .turns = 1, .tool_calls = 0 }, &usage, "m");
         defer a.free(line);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
@@ -61,6 +61,8 @@ test "L2 headless 退出码:受控停止含 tool_loop → 0,硬错误 → 1" {
     try std.testing.expectEqual(@as(u8, 0), headless.exitCodeFor(.max_turns));
     try std.testing.expectEqual(@as(u8, 0), headless.exitCodeFor(.budget));
     try std.testing.expectEqual(@as(u8, 0), headless.exitCodeFor(.tool_loop));
+    // 停滞闸门停下的 run 同样是受控停止(对话完整,可续接),不是失败。
+    try std.testing.expectEqual(@as(u8, 0), headless.exitCodeFor(.stalled));
     try std.testing.expectEqual(@as(u8, 1), headless.exitCodeFor(.tool_error));
     try std.testing.expectEqual(@as(u8, 1), headless.exitCodeFor(.aborted));
     try std.testing.expectEqual(@as(u8, 1), headless.exitCodeFor(.api_error));

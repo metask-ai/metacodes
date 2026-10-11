@@ -4638,7 +4638,10 @@ def run_feedback(
     child_env["METACODES_RULE_CONTROL"] = "1"
     for raw in commands:
         command = normalize_command(raw)
-        started_ns = time.monotonic_ns()
+        # perf_counter, not monotonic: on Windows time.monotonic is
+        # GetTickCount64 (15.6 ms ticks), so a command that exits within one
+        # tick measured elapsed_ns == 0. perf_counter is QueryPerformanceCounter.
+        started_ns = time.perf_counter_ns()
         try:
             result = subprocess.run(
                 command,
@@ -4650,7 +4653,7 @@ def run_feedback(
                 timeout=timeout,
             )
             output = result.stdout or ""
-            elapsed_ns = time.monotonic_ns() - started_ns
+            elapsed_ns = time.perf_counter_ns() - started_ns
             skipped = sum(int(value) for value in NONZERO_SKIP_RE.findall(output))
             skipped += sum(int(value) for value in UNITTEST_SKIP_RE.findall(output))
             passed = result.returncode == 0 and skipped == 0
@@ -4665,7 +4668,7 @@ def run_feedback(
                 }
             )
         except subprocess.TimeoutExpired as exc:
-            elapsed_ns = time.monotonic_ns() - started_ns
+            elapsed_ns = time.perf_counter_ns() - started_ns
             passed = False
             results.append(
                 {

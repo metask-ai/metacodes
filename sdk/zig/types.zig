@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 18;
+pub const ABI_REVISION: u32 = 19;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 18 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 19 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -1081,7 +1081,18 @@ pub const SessionSetPromptProfileFnV1 = *const fn (
     profile: ?*const PromptProfileV1,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 18 accepts
+/// Replaces the Session's permission mode while idle (#236). The code is one
+/// PERMISSION_* value. A change starts a new policy generation and revokes
+/// every Session grant (`allow_session` and `deny_session`); the first
+/// permission decision after the call returns uses the new mode. Setting the
+/// current mode changes nothing. BUSY, INVALID_STATE and every other failure
+/// leave mode, generation and grants unchanged.
+pub const SessionUpdatePermissionModeFnV1 = *const fn (
+    session: ?*SessionHandle,
+    permission_mode_code: u32,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+/// Runs the canonical default best-effort compact policy. Revision 19 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1131,6 +1142,7 @@ pub const SessionControlApiV1 = extern struct {
     abort_compact: ?SessionAbortCompactFnV1,
     export_checkpoint: ?SessionExportCheckpointFnV1,
     set_prompt_profile: ?SessionSetPromptProfileFnV1,
+    update_permission_mode: ?SessionUpdatePermissionModeFnV1,
 };
 
 pub const SkillApiV1 = extern struct {
@@ -1208,7 +1220,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionRestoreConfigV1));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(RuntimeApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(SessionApiV1));
-    try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionControlApiV1));
+    try std.testing.expectEqual(@as(usize, 80), @sizeOf(SessionControlApiV1));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(SkillApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpApiV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(ApiV1));
@@ -1255,6 +1267,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunOptionsV1, "context_blocks"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunOptionsV1, "context_block_count"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(SessionControlApiV1, "set_prompt_profile"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(SessionControlApiV1, "update_permission_mode"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillPolicyV1, "granted_skill_ids"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(PermissionRuleSetV1, "allow"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(PermissionRuleSetV1, "ask"));
@@ -1324,9 +1337,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 18 keeps MCP wire codes stable" {
+test "Revision 19 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 18), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 19), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

@@ -159,3 +159,66 @@ test "BashOutput L2 wait_ms schema drives a visible wait and waited_ms" {
     try std.testing.expectEqual(@as(i64, 0), snapshot_body.value.object.get("waited_ms").?.integer);
     try std.testing.expectEqualStrings("running", snapshot_body.value.object.get("status").?.string);
 }
+
+/// One dispatch through the real registry; returns the parsed envelope.
+fn dispatchBashOutput(ctx: *const cc.tools.ToolContext, input: []const u8) !std.json.Parsed(std.json.Value) {
+    var outcome = try cc.tools.dispatch(ctx, "BashOutput", input);
+    defer outcome.deinit(ctx.allocator);
+    return std.json.parseFromSlice(std.json.Value, ctx.allocator, try inlineBytes(&outcome), .{ .allocate = .alloc_always });
+}
+
+test "BashOutput L2 until schema decides whether progress output ends the wait" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // The 2026-10 trajectory shape: a job printing a progress line every
+    // 100 ms. Through the dispatcher, the default call waits out the job and
+    // until=output returns on the first line; the field changes the real
+    // return condition, not just the envelope.
+    const allocator = std.testing.allocator;
+    var jobs = try cc.job_registry.JobRegistry.init(allocator);
+    defer jobs.deinit();
+    const ctx = cc.tools.ToolContext{ .allocator = allocator, .jobs = &jobs };
+    const ticker = "i=0; while [ $i -lt 10 ]; do printf 'tick\\n'; sleep 0.1; i=$((i+1)); done; printf done";
+
+    var input: [256]u8 = undefined;
+    const waited_job = try jobs.spawnBackground(ticker, null);
+    var waited = try dispatchBashOutput(&ctx, try std.fmt.bufPrint(&input, "{{\"job_id\":\"{s}\",\"wait_ms\":10000}}", .{waited_job.idSlice()}));
+    defer waited.deinit();
+    try std.testing.expectEqualStrings("exit", waited.value.object.get("returned_on").?.string);
+    try std.testing.expectEqualStrings("exited", waited.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, waited.value.object.get("stdout").?.string, "tick"));
+
+    const streamed_job = try jobs.spawnBackground(ticker, null);
+    var streamed = try dispatchBashOutput(&ctx, try std.fmt.bufPrint(&input, "{{\"job_id\":\"{s}\",\"wait_ms\":10000,\"until\":\"output\"}}", .{streamed_job.idSlice()}));
+    defer streamed.deinit();
+    try std.testing.expectEqualStrings("output", streamed.value.object.get("returned_on").?.string);
+    try std.testing.expectEqualStrings("running", streamed.value.object.get("status").?.string);
+
+    const pattern_job = try jobs.spawnBackground("printf 'warming\\n'; sleep 0.2; printf 'READY\\n'; sleep 5", null);
+    var matched = try dispatchBashOutput(&ctx, try std.fmt.bufPrint(&input, "{{\"job_id\":\"{s}\",\"wait_ms\":10000,\"pattern\":\"READY\"}}", .{pattern_job.idSlice()}));
+    defer matched.deinit();
+    try std.testing.expectEqualStrings("pattern", matched.value.object.get("returned_on").?.string);
+    try std.testing.expectEqualStrings("running", matched.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, "warming\n".len), matched.value.object.get("pattern_match").?.object.get("offset").?.integer);
+
+    // quiet_ms reaches the wait: 800 ms of silence after the output ends it
+    // well before the 2 s default would. Timing starts once the output exists
+    // so shell start-up is not part of the margin.
+    const settling_job = try jobs.spawnBackground("printf 'up\\n'; sleep 5", null);
+    while (jobs.get(settling_job.idSlice())) |entry| {
+        const spool = try std.Io.Dir.cwd().statFile(std.testing.io, entry.stdout_path, .{});
+        if (spool.size > 0) break;
+        cc.util_time.sleepMs(10);
+    }
+    var settle_input: [256]u8 = undefined;
+    const quiet_started = cc.util_time.nowMs();
+    var settled = try dispatchBashOutput(&ctx, try std.fmt.bufPrint(&settle_input, "{{\"job_id\":\"{s}\",\"wait_ms\":10000,\"quiet_ms\":800}}", .{settling_job.idSlice()}));
+    defer settled.deinit();
+    try std.testing.expectEqualStrings("quiet", settled.value.object.get("returned_on").?.string);
+    try std.testing.expect(cc.util_time.nowMs() - quiet_started >= 800);
+    try std.testing.expect(cc.util_time.nowMs() - quiet_started < @as(i64, @intCast(cc.tools_bash_output.DEFAULT_QUIET_MS)));
+
+    try std.testing.expectError(
+        error.InvalidPattern,
+        cc.tools.dispatch(&ctx, "BashOutput", try std.fmt.bufPrint(&input, "{{\"job_id\":\"{s}\",\"until\":\"exit\",\"pattern\":\"READY\"}}", .{pattern_job.idSlice()})),
+    );
+}

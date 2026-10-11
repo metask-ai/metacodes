@@ -10,8 +10,107 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- Release and reopen PRs no longer re-run the full CI. A `Release fast path`
+  job (`scripts/release_fast_path.py`) checks that the PR's merge commit adds
+  only what `scripts/release_cut.py` generates from its base, regenerated in a
+  scratch worktree and compared byte for byte, and that the base's push run of
+  CI on `main` succeeded (waiting up to 45 minutes for one still in progress).
+  Then the four required checks report success without the suites; the
+  version state gate still runs. Any other change, a red or missing base run,
+  or an error in the check itself takes the full path.
+- The Jev `recall_evidence` surface is retired: `KgRecall` no longer consults
+  the System-One judge. It appended each hit's relevance percent, an
+  evidence-sufficiency score and usage guidance, which in the paid
+  attribution pilot cancelled the recall gate's gain in gold evidence the
+  model opened (34/60 against 42/60 for the gate alone). A redesign that
+  only reordered rows inside the gate's BM25 band put gold first more often
+  offline (LongMemEval-S turn-level holdout 272 of 288 against 258,
+  p = 0.0005) but showed no gain in a paid paired pilot on 139 cases (gold
+  memory opened 56 against 53 of 125 pairs, p = 0.72, after a post hoc
+  re-validation; the pre-registered analysis was voided because reordering
+  breaks the merge order the evaluator checks), so it was removed too.
+  Configuration that still names `recall_evidence` keeps working: the name is
+  skipped with a warning and the other surfaces stay advised; a list naming
+  only it is refused like an empty list. Records:
+  `evals/memory/pilots/longmem-recall-order-glm52-v1` and
+  doc/JEV_SYSTEM_ONE.md §6.4-§6.5.
+
+### Fixed
+
+- A TinyKG service of another state root no longer locks an install out of
+  its own. Every state root used to provision port 8799, so while one
+  install's service was down a test run in a temporary home could provision
+  and bind the very port that install's `daemon.json` pins, and its sessions
+  then met a service that refused their key: `auth_failed` until that service
+  was killed (seen for two days on a developer machine). A new configuration
+  now prefers a port derived from its own path (20000-32767) and takes a free
+  one when that is held. Autostart asks the configured port for readiness
+  with the install's key and never takes a service that refuses it for the
+  install's own: the default configuration moves to a free port with a new
+  key (the old one was presented to that service; any local user can bind a
+  loopback port) and the same store, and starts its service there, while a
+  `METACODES_KG_CONFIG`
+  file is left as written and the conflict is logged. A session whose
+  readiness probe meets such a service now asks the host to do that, and the
+  `auth_failed` hint in `doctor` names the cause.
+- Paid memory evaluations: the runner's loopback proxy for a Jev arm's judge
+  now reaches the judge directly, as the CLI does. It honoured `HTTP(S)_PROXY`
+  and the macOS system proxy, so behind a proxy that could not reach the judge
+  an unreachable judge was recorded as the proxy's 503 instead of 502, and a
+  proxy that could reach it measured a path the CLI never takes.
+
+## 0.5.0 — 2026-10-11
+
 ### Added
 
+- AgentCore ABI v1 revision 19 (#236): `session_control->update_permission_mode`
+  changes an existing Session's permission mode in place while it is idle.
+  The handle, logical Session ID and Conversation stay; there is no export,
+  destroy and restore. The first permission decision after the call uses the
+  new mode. A change starts a new policy generation and revokes every Session
+  grant (`allow_session` and `deny_session`), as a rule update does; setting
+  the current mode changes nothing. A Run (including one suspended in a
+  Permission callback), compaction, checkpoint export, another mutation or a
+  draining Provider cancel makes it return `BUSY`; a poisoned Session returns
+  `INVALID_STATE` and an unknown code `INVALID_ARGUMENT`; none of them changes
+  mode, generation or grants. `describe` reports `permission_mode` beside
+  `policy_generation`, and the policy fingerprint after a change is the one a
+  Session created with the new mode would have, so an export holds no revoked
+  grant and a restore under the same mode keeps the generation. The Session
+  Control table grows by one slot to 80 bytes; the header, Zig and Rust SDKs
+  (`raw.rs` regenerated), both source-free consumers, the bundle manifest
+  and the docs move to revision 19, SDK package `0.6.0-dev`.
+
+## 0.4.0 — 2026-10-10
+
+### Added
+
+- Stall gate: a run whose tool rounds keep returning nothing new is stopped
+  with the new stop reason `stalled` and handed back to the person, instead
+  of looping until `max_turns`. A round is stale when every slot that ran
+  either failed or returned an answer the model has already seen. Answers are
+  keyed by tool and result bytes, without the host's own counters
+  (BashOutput's `waited_ms`, and the poll guard's `low_yield_polls` and
+  `min_wait_ms`, which change on every guarded poll of a silent job); a
+  realized file change is keyed by its action. Remembered answers follow the
+  model's view, so a result cleared by compaction or microcompaction counts as
+  new when fetched again. The run stops after 8 consecutive stale rounds, or
+  after 4 stale rounds in which one identical call was made 4 times. A round
+  that brings anything new resets the stretch. The round's results are
+  committed first, and nothing is injected into the conversation. The REPL
+  names the cause, the repeated call and how to continue. Headless reports
+  `"stop_reason":"stalled"` (exit 0) and prints the same notice on stderr.
+  AgentCore v1 reports it as `tool_loop`. The REPL and web sessions enforce
+  it by default (`--no-stall-gate` turns it off); print mode only with
+  `--stall-gate`; `--stall-gate-observe` only records. Each armed run writes
+  one `stall_gate` tool-observation record (`metacodes-stall-gate-v1`). The
+  policy is proven in `control-plane/lean/MetaCodesControl/StallGate.lean`
+  (propext only): decisions bounded over any trace, no decision after a
+  round with a new answer or when every round brings a never-seen one, and
+  a long enough stale stretch always decides exactly once. Design note:
+  [doc/STALL_GATE_DESIGN.md](doc/STALL_GATE_DESIGN.md).
 - Host check gate (`--host-check <cmd>` with `--check-gate` or
   `--check-gate-observe`, budget `--check-gate-max <n>`, 1–8, default 3). When
   the model ends its turn after changing the workspace, the host runs the
@@ -77,25 +176,6 @@ status, compatibility boundaries, and entry points are defined by
   `"timeout": <seconds>` (capped at 600), and the event budget widens to the
   sum of its commands' timeouts, so a Stop hook can run a test suite.
 
-### Changed
-
-- The Jev `recall_evidence` surface is retired: `KgRecall` no longer consults
-  the System-One judge. It appended each hit's relevance percent, an
-  evidence-sufficiency score and usage guidance, which in the paid
-  attribution pilot cancelled the recall gate's gain in gold evidence the
-  model opened (34/60 against 42/60 for the gate alone). A redesign that
-  only reordered rows inside the gate's BM25 band put gold first more often
-  offline (LongMemEval-S turn-level holdout 272 of 288 against 258,
-  p = 0.0005) but showed no gain in a paid paired pilot on 139 cases (gold
-  memory opened 56 against 53 of 125 pairs, p = 0.72, after a post hoc
-  re-validation; the pre-registered analysis was voided because reordering
-  breaks the merge order the evaluator checks), so it was removed too.
-  Configuration that still names `recall_evidence` keeps working: the name is
-  skipped with a warning and the other surfaces stay advised; a list naming
-  only it is refused like an empty list. Records:
-  `evals/memory/pilots/longmem-recall-order-glm52-v1` and
-  doc/JEV_SYSTEM_ONE.md §6.4-§6.5.
-
 ### Fixed
 
 - On Windows, a session that has to start the TinyKG service no longer waits
@@ -110,6 +190,18 @@ status, compatibility boundaries, and entry points are defined by
   harness also no longer starts a TinyKG service in the temporary home of
   each case. Each one outlived its case, and on Windows the leftover service
   kept the home from being deleted.
+- On Windows, a session that has to start the TinyKG service now shows its
+  prompt in about 0.35 s instead of about 6.7 s. Windows does not refuse a
+  connection to a loopback port nobody listens on at once: it resends the SYN
+  and gives up after about 2 s. The session paid that three times before it
+  started the service: twice for the `store-info` read, which is retried,
+  and once more for the autostart check. Both now read the kernel's TCP
+  listener table instead of connecting, so when nothing listens the service
+  is started right away, and the readiness checks while it comes up cost
+  nothing. A running service is never handed an empty probe connection,
+  including a service left running by an older release. On other platforms a
+  refused connection already returns at once, and the checks still connect
+  there.
 - An AgentCore session no longer poisons itself when a compact or Run is
   aborted from another thread. The aborted operation could return while the
   abort was still inside `Provider.cancel`; Core answers BUSY to everything
@@ -163,11 +255,18 @@ status, compatibility boundaries, and entry points are defined by
   directory entries with the macOS `dirent` layout and found no cassette on
   Linux; it now lists them portably. The TinyKG service end-to-end tests run on
   Windows except the one that needs a POSIX symlink.
-- Paid memory evaluations: the runner's loopback proxy for a Jev arm's judge
-  now reaches the judge directly, as the CLI does. It honoured `HTTP(S)_PROXY`
-  and the macOS system proxy, so behind a proxy that could not reach the judge
-  an unreachable judge was recorded as the proxy's 503 instead of 502, and a
-  proxy that could reach it measured a path the CLI never takes.
+- The transcript parser can no longer silently drift from the writer or
+  quietly flip persisted flags. `parseMessageLine` now dispatches on the
+  `Block` tag (`stringToEnum` + exhaustive `switch`), so adding a block
+  variant without a parse arm is a compile error instead of the runtime
+  asymmetry that once made every extended-thinking session unresumable
+  (`"document"` keeps its distinct `WithdrawnDocumentBlock` rejection). The
+  boolean transcript fields — message-level `delivered`, `tool_result`'s
+  `is_error`/`delivered` — now reject a present-but-non-boolean value as
+  `InvalidTranscript` instead of silently reading it as `false`: a coerced
+  flag survives into memory and the next `/retry`/compact full rewrite would
+  persist the flipped semantics to disk. An absent field still defaults to
+  `false` for older transcripts.
 
 ## 0.3.1 — 2026-10-07
 

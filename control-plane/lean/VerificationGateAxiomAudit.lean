@@ -2,6 +2,7 @@ import MetaCodesControl.VerificationGate
 import MetaCodesControl.RequirementLedger
 import MetaCodesControl.DeliveryCadence
 import MetaCodesControl.ProgressUpdates
+import MetaCodesControl.StallGate
 import MetaCodesControl.CheckGate
 import MetaCodesControl.TestIntegrity
 import MetaCodesControl.RuleMetaGovernance
@@ -32,6 +33,15 @@ import MetaCodesControl.RuleMetaGovernance
 #print axioms MetaCodesControl.ProgressUpdates.quick_rounds_never_fire
 #print axioms MetaCodesControl.ProgressUpdates.decisions_bounded
 #print axioms MetaCodesControl.ProgressUpdates.fresh_run_bounded
+#print axioms MetaCodesControl.StallGate.progress_never_fires
+#print axioms MetaCodesControl.StallGate.below_thresholds_never_fire
+#print axioms MetaCodesControl.StallGate.stale_threshold_fires
+#print axioms MetaCodesControl.StallGate.decisions_bounded
+#print axioms MetaCodesControl.StallGate.fresh_run_bounded
+#print axioms MetaCodesControl.StallGate.fresh_rounds_never_fire
+#print axioms MetaCodesControl.StallGate.new_rounds_never_fire
+#print axioms MetaCodesControl.StallGate.fresh_start_new_rounds_never_fire
+#print axioms MetaCodesControl.StallGate.stale_stretch_fires
 #print axioms MetaCodesControl.CheckGate.clean_boundary_never_checked
 #print axioms MetaCodesControl.CheckGate.only_failure_continues
 #print axioms MetaCodesControl.CheckGate.observe_never_continues

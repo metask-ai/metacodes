@@ -260,6 +260,8 @@ const Restarter = struct {
     harness: *Harness,
     port: u16,
     calls: u32 = 0,
+    /// `util_time.nowMs()` when the client first asked.
+    first_call_ms: i64 = 0,
 
     fn hook(self: *Restarter) cc.kg_client.KgClient.Autostart {
         return .{ .ctx = self, .start = start };
@@ -268,6 +270,7 @@ const Restarter = struct {
     fn start(ctx: *anyopaque) bool {
         const self: *Restarter = @ptrCast(@alignCast(ctx));
         self.calls += 1;
+        if (self.first_call_ms == 0) self.first_call_ms = cc.util_time.nowMs();
         const h = self.harness;
         const supervisor = Supervisor.start(h.allocator, .{
             .store_path = h.store,
@@ -313,8 +316,13 @@ test "Kgd: a session that finds its service down has the host start it, then wor
         .autostart = restarter.hook(),
     });
     defer kg.deinit();
+    const began_ms = cc.util_time.nowMs();
     kg.ensureReady();
     try std.testing.expectEqual(@as(u32, 1), restarter.calls);
+    // The host is asked before the client spends anything on a service that
+    // is not there. On Windows a refused loopback connect takes ~2 s and a
+    // read is tried twice, so asking only after store-info failed cost 4 s.
+    try std.testing.expect(restarter.first_call_ms - began_ms < 1_000);
     try std.testing.expect(kg.ready);
     const task = try kg.createTask("autostart probe task", "task");
     _ = try kg.taskStatus(task);
@@ -333,6 +341,162 @@ test "Kgd: a session that finds its service down has the host start it, then wor
     bare.ensureReady();
     try std.testing.expect(!bare.ready);
     try std.testing.expectEqual(cc.kg_client.DegradedKind.daemon_unreachable, bare.degradedKind().?);
+}
+
+/// `metacodes kgd` run in-process: the same configuration load and supervisor
+/// the CLI uses, stopped by the test so that no service outlives it.
+const InProcessService = struct {
+    allocator: std.mem.Allocator,
+    config: ?cc.kgd_runtime_exports.Config = null,
+    staging: ?[]u8 = null,
+    supervisor: ?*Supervisor = null,
+    thread: ?std.Thread = null,
+    launches: u32 = 0,
+
+    fn launcher(self: *InProcessService) cc.kg_autostart.Autostart.Launcher {
+        return .{ .ctx = self, .launch = launch };
+    }
+
+    fn launch(ctx: *anyopaque, state_root: []const u8, config_path: ?[]const u8) anyerror!void {
+        const self: *InProcessService = @ptrCast(@alignCast(ctx));
+        self.launches += 1;
+        var config = try cc.kgd_runtime_exports.loadConfig(self.allocator, state_root, .{ .config_path = config_path });
+        errdefer config.deinit(self.allocator);
+        const staging = try cc.kgd_runtime_exports.stagingDir(self.allocator, state_root);
+        errdefer self.allocator.free(staging);
+        const supervisor = try Supervisor.start(self.allocator, .{
+            .store_path = config.store_path,
+            .cli_path = config.cli_path,
+            .daemon_path = config.daemon_path,
+            .api_key = config.api_key,
+            .port = config.port,
+            .staging_dir = staging,
+        });
+        errdefer supervisor.deinit();
+        self.thread = try std.Thread.spawn(.{}, Supervisor.serveForever, .{supervisor});
+        self.supervisor = supervisor;
+        self.config = config;
+        self.staging = staging;
+    }
+
+    fn deinit(self: *InProcessService) void {
+        if (self.supervisor) |supervisor| {
+            supervisor.stop();
+            self.thread.?.join();
+            supervisor.deinit();
+        }
+        if (self.config) |*config| config.deinit(self.allocator);
+        if (self.staging) |staging| self.allocator.free(staging);
+    }
+};
+
+/// Sets an environment variable for the test and puts the old value back.
+const EnvRestore = struct {
+    name: [*:0]const u8,
+    old: ?[]u8,
+
+    fn set(allocator: std.mem.Allocator, name: [*:0]const u8, value: ?[*:0]const u8) !EnvRestore {
+        const old = if (std.c.getenv(name)) |raw| try allocator.dupe(u8, std.mem.span(raw)) else null;
+        if (value) |v| platform.paths.setEnv(name, v) else platform.paths.unsetEnv(name);
+        return .{ .name = name, .old = old };
+    }
+
+    fn restore(self: *EnvRestore, allocator: std.mem.Allocator) void {
+        if (self.old) |old| {
+            const z = allocator.dupeZ(u8, old) catch return;
+            defer allocator.free(z);
+            platform.paths.setEnv(self.name, z.ptr);
+            allocator.free(old);
+        } else platform.paths.unsetEnv(self.name);
+    }
+};
+
+test "Kgd: a service of another state root on this install's port is never taken for ours" {
+    const a = std.testing.allocator;
+    // Another state root's service, on a port this install's configuration
+    // also pins: what two state roots provisioned while both services were
+    // down used to get, both on 8799.
+    var other = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
+    defer other.deinit();
+    const squatted = other.supervisor.port();
+
+    const cli_z = try a.dupeZ(u8, other.cli);
+    defer a.free(cli_z);
+    const daemon_z = try a.dupeZ(u8, other.daemon);
+    defer a.free(daemon_z);
+    var env = [_]EnvRestore{
+        try EnvRestore.set(a, "METACODES_KG_BIN", cli_z.ptr),
+        try EnvRestore.set(a, "METACODES_KGD_BIN", daemon_z.ptr),
+        try EnvRestore.set(a, "METACODES_KG_AUTOSTART", null),
+        try EnvRestore.set(a, "METACODES_KG_CONFIG", null),
+    };
+    defer for (&env) |*entry| entry.restore(a);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var installed = try cc.kgd_install.run(a, root, .{ .port = squatted });
+    defer installed.deinit(a);
+    var before = try cc.kg_client.KgClient.loadDaemonConfig(a, installed.config_path);
+    defer before.deinit();
+
+    // Without a host, the session meets the other service and stops at its key.
+    {
+        var bare = try cc.kg_client.KgClient.init(a, .{ .state_root = root, .domain = "squat-probe", .io = other.io_runtime.io() });
+        defer bare.deinit();
+        bare.ensureReady();
+        try std.testing.expect(!bare.ready);
+        try std.testing.expectEqual(cc.kg_client.DegradedKind.auth_failed, bare.degradedKind().?);
+    }
+
+    // With it, this install moves to a free port with a new key (the old one
+    // was presented to the other service) and the same store, and starts its
+    // own service there.
+    var service = InProcessService{ .allocator = a };
+    defer service.deinit();
+    const autostart = cc.kg_autostart.Autostart.create(a, root) orelse return error.SkipZigTest;
+    defer autostart.destroy();
+    autostart.launcher = service.launcher();
+    var kg = try cc.kg_client.KgClient.init(a, .{
+        .state_root = root,
+        .domain = "squat-probe",
+        .io = other.io_runtime.io(),
+        .autostart = autostart.hook(),
+    });
+    defer kg.deinit();
+    kg.ensureReady();
+    try std.testing.expect(kg.ready);
+    try std.testing.expectEqual(@as(u32, 1), service.launches);
+
+    var after = try cc.kg_client.KgClient.loadDaemonConfig(a, installed.config_path);
+    defer after.deinit();
+    const moved = cc.kgd_install.portOfUrl(after.value.url) orelse return error.TestExpectedPort;
+    try std.testing.expect(moved != squatted);
+    try std.testing.expectEqual(moved, service.supervisor.?.port());
+    try std.testing.expect(!std.mem.eql(u8, before.value.api_key, after.value.api_key));
+    try std.testing.expectEqualStrings(before.value.store.?, after.value.store.?);
+    try std.testing.expectEqualStrings(before.value.expected_build_id.?, after.value.expected_build_id.?);
+
+    // This install's writes reach its own store; the other service still
+    // serves its own key on its own port.
+    const task = try kg.createTask("squat probe task", "task");
+    _ = try kg.taskStatus(task);
+    var other_transport = try other.connect(a, TEST_KEY);
+    defer other_transport.deinit();
+    try std.testing.expect((try other_transport.ready()).ready);
+    // The key the other service saw does not open this install's service.
+    const moved_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{moved});
+    defer a.free(moved_url);
+    var stale = try WebTransport.init(a, .{
+        .io = other.io_runtime.io(),
+        .url = moved_url,
+        .api_key = before.value.api_key,
+        .expected_build_id = after.value.expected_build_id.?,
+        .expected_schema_digest = "",
+    });
+    defer stale.deinit();
+    try std.testing.expectError(error.AuthenticationFailed, stale.run("store-info", &.{}, false));
 }
 
 test "Kgd: a client that connects and closes without a request does not stall the next" {
@@ -433,8 +597,18 @@ test "Kgd: install writes a configuration this service can be started from" {
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const home = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
 
-    var outcome = try cc.kgd_install.run(a, home, .{ .port = 8799 });
+    // No --port: the configuration's own preferred port when it is free, not
+    // one fixed default every state root on the machine would reach for.
+    const config_path = try cc.kg_client.KgClient.resolveDaemonConfigPath(a, home);
+    defer a.free(config_path);
+    const preferred = cc.kgd_install.preferredPort(config_path);
+    const preferred_free = if (platform.net.listenLoopback(preferred, 1)) |probe| blk: {
+        platform.net.closeSocket(probe.sock);
+        break :blk true;
+    } else |_| false;
+    var outcome = try cc.kgd_install.run(a, home, .{});
     defer outcome.deinit(a);
+    if (preferred_free) try std.testing.expectEqual(preferred, cc.kgd_install.portOfUrl(outcome.url).?);
     try std.testing.expect(outcome.created_store);
     try std.testing.expect(!outcome.reused_api_key);
     try std.testing.expect(std.mem.startsWith(u8, &outcome.build_id, "sha256:"));

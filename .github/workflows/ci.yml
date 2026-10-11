@@ -21,6 +21,43 @@ concurrency:
 # cheapest-first for fail-fast. Every runner is ephemeral: nothing persists
 # between runs except what actions/cache and setup-zig restore explicitly.
 jobs:
+  # A release or reopen PR adds only what scripts/release_cut.py generates.
+  # When that is proven against the merge commit, and the base commit already
+  # passed this workflow's full run on main, the three required jobs below
+  # report success without running the suites again: their steps check
+  # FAST_PATH, except the checkout and the version state gate in `gates`.
+  # Every other PR, every push, and every doubt (the script never fails the
+  # job; an error decides the full path) runs everything.
+  # doc/RELEASE_AUTOMATION_DESIGN.md §3, "CI fast path".
+  release-fast-path:
+    name: Release fast path
+    # 50 minutes: a reopen PR is opened while main's run of the release merge
+    # commit is still going; the script waits up to 45 minutes for it.
+    timeout-minutes: 50
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the base commit's push run of this workflow
+    outputs:
+      fast: ${{ steps.decide.outputs.fast }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      # Depth 2: the merge commit and both parents; HEAD^1 is the base.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            printf 'fast=false\nreason=full path: %s run\n' "$GITHUB_EVENT_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 scripts/release_fast_path.py --base HEAD^1 --candidate HEAD --repository "$GITHUB_REPOSITORY" --github-output "$GITHUB_OUTPUT" --wait-seconds 2700
+
   gates:
     name: Gates (${{ matrix.os }})
     # This job's steps are a superset of the AGENTS.md "Before submitting"
@@ -38,7 +75,16 @@ jobs:
           - os: macOS
             runner: macos-latest
     runs-on: ${{ matrix.runner }}
+    needs: release-fast-path
+    # A failed decision leaves FAST_PATH empty: run in full rather than skip.
+    if: ${{ !cancelled() }}
+    env:
+      FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
     steps:
+      - name: Release fast path
+        env:
+          REASON: ${{ needs.release-fast-path.outputs.reason }}
+        run: echo "$REASON"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
@@ -51,18 +97,20 @@ jobs:
       # saved once it exceeds this many MiB (the default 2 GiB is below what
       # one full run of these gates produces).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: env.FAST_PATH != 'true'
         with:
           version: 0.16.0
           use-cache: true
           cache-size-limit: 4096
       - name: Zig format check
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: zig fmt --check build.zig src tests
       # Lean toolchain and build products. Key: the pinned toolchain plus every
       # Lean source, so a source change rebuilds from the previous products
       # (restore-keys) and Lake hash-verifies what it restores; a stale or
       # torn copy self-heals into a rebuild rather than wrong results.
       - name: Restore Lean toolchain and build products
+        if: env.FAST_PATH != 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -78,8 +126,10 @@ jobs:
       # through elan's own resolver into ~/.elan, which the cache above
       # persists.
       - name: Install pinned elan
+        if: env.FAST_PATH != 'true'
         run: bash scripts/ci/install-elan.sh
       - name: Build pinned Lean kernel
+        if: env.FAST_PATH != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -95,6 +145,7 @@ jobs:
           # line of this block on its own.
           LAKE="$(command -v lake)" bash scripts/build-project-harness-kernel.sh "$RUNNER_TEMP/metacodes-project-kernel"
       - name: Install ripgrep
+        if: env.FAST_PATH != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -113,7 +164,7 @@ jobs:
       # so bwrap needs that lifted; the smoke runs the builder's own flags so
       # a broken sandbox fails here instead of deep in the suite.
       - name: Install bubblewrap
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -129,6 +180,7 @@ jobs:
       # "externally managed"; the runner is ephemeral so there is nothing to
       # protect.
       - name: Install Python development dependencies
+        if: env.FAST_PATH != 'true'
         run: python3 -m pip install --break-system-packages -r requirements-dev.txt
       # A version without -dev is legal only on its tagged commit, the release
       # PR, or main's run of the release merge commit; in the latter two the
@@ -137,7 +189,8 @@ jobs:
       # The labels are read now, not taken from the event: `gh pr create
       # --label` adds the label after it creates the PR, and the `opened`
       # payload of release: 0.2.1 (#176) carried none, so the gate refused
-      # its own release PR.
+      # its own release PR. On the release fast path this and the checkout are
+      # the only steps that run, so the gate skips the rehearsal tag.
       - name: Version state gate and release rehearsal
         env:
           GH_TOKEN: ${{ github.token }}
@@ -148,14 +201,22 @@ jobs:
             RELEASE_PR_LABELS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels" --jq '[.[].name] | join(",")')
             export RELEASE_PR_LABELS
           fi
-          python3 scripts/check_version_state.py --rehearse
+          if [ "$FAST_PATH" = "true" ]; then
+            python3 scripts/check_version_state.py
+          else
+            python3 scripts/check_version_state.py --rehearse
+          fi
       - name: TinyKG binary-contract unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
       - name: ripgrep binary-contract unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_stage_ripgrep_binary -v
       - name: Trajectory audit unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_audit_trajectories -v
       - name: Verify native bundle and fresh-store contract
+        if: env.FAST_PATH != 'true'
         shell: bash
         run: |
           python3 scripts/verify_tinykg_binary.py
@@ -168,11 +229,12 @@ jobs:
       # so this leg proves the cross-staged assets and the release unit waits
       # for that runner (doc/INSTALL_DESIGN.md §5).
       - name: Verify Linux arm64 cross-stage contract
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: |
           zig build tinykg:stage -Dtarget=aarch64-linux-musl
           zig build install -Dtarget=aarch64-linux-musl -Drelease-layout=true --prefix "$RUNNER_TEMP/stage-aarch64-linux"
       - name: Native platform modules
+        if: env.FAST_PATH != 'true'
         shell: bash
         env:
           METACODES_PROC_TEST: "1"
@@ -188,15 +250,18 @@ jobs:
       # this repository's overlay and `uv sync`s it; the suite below inherits
       # METACODES_WORKBUDDY_CHECKOUT through zig build.
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        if: env.FAST_PATH != 'true'
         with:
           version: "0.11.19"
       - name: Provision the pinned WorkBuddy-Bench checkout
+        if: env.FAST_PATH != 'true'
         shell: bash
         run: |
           set -euo pipefail
           checkout=$(scripts/eval/workbuddy/provision_checkout.sh "$RUNNER_TEMP/workbuddy-bench")
           echo "METACODES_WORKBUDDY_CHECKOUT=$checkout" >> "$GITHUB_ENV"
       - name: Full offline test suite
+        if: env.FAST_PATH != 'true'
         env:
           # Both legs build control-plane/lean above, so a missing/mislocated
           # ProjectRule.olean is a regression, not an environment gap: fail
@@ -210,27 +275,30 @@ jobs:
         # runs; a missing toolchain fails the build instead of skipping them.
         run: zig build test --test-timeout 5m -Dlean-kernels=on
       - name: ReleaseSafe core gate
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: zig build test:lib -Doptimize=ReleaseSafe
       - name: Repository coverage audit
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: scripts/test_coverage_audit.sh
       - name: Documentation link check
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 scripts/check_doc_links.py
       - name: Default install prefix
+        if: env.FAST_PATH != 'true'
         run: zig build --prefix "$RUNNER_TEMP/install-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/install-prefix" --doctor
       # The sidecar the kernel build script wrote, read by the installed
       # product's own loader: the pairing no unit test can cover (the project
       # kernel's v6 sidecar was validated with the formal v4 loader for as long
       # as nothing ran a real one through doctor, 2026-09-21).
       - name: Built project kernel provenance is accepted by doctor
+        if: env.FAST_PATH != 'true'
         run: python3 scripts/verify_kernel_provenance.py "$RUNNER_TEMP/install-prefix/bin/metacodes" --project "$RUNNER_TEMP/metacodes-project-kernel"
       # Manifest v2 ships both Lean kernels and pins them, so the release
       # layout is two invocations (release/LAYOUT.md): stage the kernels, then
       # build the executable with their digests. KERNEL_PINS carries them to
       # the archive steps.
       - name: Stage Lean kernels for the release layout
+        if: env.FAST_PATH != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -238,15 +306,19 @@ jobs:
           pins=$(python3 scripts/kernel_pins.py "$RUNNER_TEMP/release-prefix")
           echo "KERNEL_PINS=$pins" >> "$GITHUB_ENV"
       - name: Release layout prefix
+        if: env.FAST_PATH != 'true'
         run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
       # The installer, through the same script users run, on the verified
       # unit: every file re-verified at the new prefix, an install record and
       # state root of its own, and the installed executable's doctor --strict.
       - name: Install the release unit with scripts/install.sh
+        if: env.FAST_PATH != 'true'
         run: sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed" "$RUNNER_TEMP/release-prefix" && "$RUNNER_TEMP/installed/bin/metacodes" doctor --strict
       - name: Release bundle verifier self-test
+        if: env.FAST_PATH != 'true'
         run: python3 scripts/verify_release_bundle.py --self-test
       - name: Release archive is reproducible
+        if: env.FAST_PATH != 'true'
         run: |
           zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-2"
@@ -262,28 +334,40 @@ jobs:
           zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           cat "$RUNNER_TEMP"/dist-1/metacodes-*-SHA256SUMS
       - name: Third-party notices check
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 scripts/gen_third_party_notices.py --check
       - name: Documentation fact check
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 scripts/check_doc_facts.py
       - name: Documentation fact-check unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_check_doc_facts -v
       - name: Third-party notices unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_gen_third_party_notices -v
       - name: Gate manifest unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
       - name: Verify install prefix unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_verify_install_prefix -v
       - name: Kernel self-containment and pin unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_check_kernel_self_contained scripts.tests.test_kernel_pins -v
       - name: Kernel provenance verifier unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_verify_kernel_provenance -v
       - name: Python floor unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_python_floor -v
       - name: Release cut unit tests
+        if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_release_cut -v
+      - name: Release fast path unit tests
+        if: env.FAST_PATH != 'true'
+        run: python3 -m unittest scripts.tests.test_release_fast_path -v
       - name: Diff whitespace check
+        if: env.FAST_PATH != 'true'
         run: git diff --check
 
   # The offline TTY suite (tests/tty) drives the debug binary in a pseudo
@@ -306,11 +390,21 @@ jobs:
           - os: Windows
             runner: windows-latest
     runs-on: ${{ matrix.runner }}
+    needs: release-fast-path
+    # A failed decision leaves FAST_PATH empty: run in full rather than skip.
+    if: ${{ !cancelled() }}
+    env:
+      FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
     steps:
+      - name: Release fast path
+        env:
+          REASON: ${{ needs.release-fast-path.outputs.reason }}
+        run: echo "$REASON"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: env.FAST_PATH != 'true'
       # The binary embeds files byte for byte; see `windows-gates`.
       - name: Normalize line endings of the checkout
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && env.FAST_PATH != 'true'
         shell: cmd
         run: |
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
@@ -318,12 +412,13 @@ jobs:
           exit /b 0
       # See the `gates` job for the cache semantics.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: env.FAST_PATH != 'true'
         with:
           version: 0.16.0
           use-cache: true
           cache-size-limit: 4096
       - name: Offline TTY suite (POSIX pty)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && env.FAST_PATH != 'true'
         env:
           TTY_SKIP_MODEL: "1"
         run: |
@@ -332,7 +427,7 @@ jobs:
       # pywinpty provides the ConPTY backend of tests/tty/tty_driver.py; the
       # version the Windows failures of #218-#220 were measured with.
       - name: Offline TTY suite (ConPTY)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && env.FAST_PATH != 'true'
         shell: cmd
         run: |
           python -m pip install pywinpty==3.0.5 || exit /b 1
@@ -344,8 +439,18 @@ jobs:
     # has 4 cores and a cold Zig cache compiles the whole tree.
     timeout-minutes: 45
     runs-on: windows-latest
+    needs: release-fast-path
+    # A failed decision leaves FAST_PATH empty: run in full rather than skip.
+    if: ${{ !cancelled() }}
+    env:
+      FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
     steps:
+      - name: Release fast path
+        env:
+          REASON: ${{ needs.release-fast-path.outputs.reason }}
+        run: echo "$REASON"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: env.FAST_PATH != 'true'
         with:
           # Same as the `gates` job: the repository-snapshot and grounding
           # fingerprint tests resolve historical commits with `git rev-parse`,
@@ -353,6 +458,7 @@ jobs:
           fetch-depth: 0
       # See the `gates` job for the cache semantics.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: env.FAST_PATH != 'true'
         with:
           version: 0.16.0
           use-cache: true
@@ -365,6 +471,7 @@ jobs:
       # Git-Bash $HOME would be a POSIX-style path that native zig.exe cannot
       # use.
       - name: Normalize line endings of the checkout
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: |
           git config --show-origin --get-all core.autocrlf & echo (core.autocrlf origins above, if any)
@@ -375,9 +482,11 @@ jobs:
       # PyYAML for the Python suites that `zig build test` runs; see the
       # `gates` job.
       - name: Install Python development dependencies
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: python -m pip install -r requirements-dev.txt
       - name: Native platform modules
+        if: env.FAST_PATH != 'true'
         shell: cmd
         env:
           METACODES_PROC_TEST: "1"
@@ -393,6 +502,7 @@ jobs:
           zig test src/platform/exe_lookup.zig -lc
       # Current labels, as in the `gates` job; bash for the same script.
       - name: Version state gate and release rehearsal
+        if: env.FAST_PATH != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -405,12 +515,14 @@ jobs:
           fi
           python scripts/check_version_state.py --rehearse
       - name: Verify native bundle and fresh-store contract
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage
       # The Windows release unit ships both Lean kernels too (manifest v2), so
       # this leg provisions the same pinned elan and Lean cache as `gates`;
       # the kernel scripts run under Git Bash (kernels:stage invokes bash).
       - name: Restore Lean toolchain and build products
+        if: env.FAST_PATH != 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -420,33 +532,42 @@ jobs:
           restore-keys: |
             lean-${{ runner.os }}-${{ runner.arch }}-
       - name: Install pinned elan
+        if: env.FAST_PATH != 'true'
         shell: bash
         run: bash scripts/ci/install-elan.sh
       - name: Stage Lean kernels for the release layout
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: |
           zig build kernels:stage -Dlean-kernels=on --prefix "%RUNNER_TEMP%\release-prefix" || exit /b 1
           for /f "delims=" %%P in ('python scripts\kernel_pins.py "%RUNNER_TEMP%\release-prefix"') do echo KERNEL_PINS=%%P>> "%GITHUB_ENV%"
           findstr /B KERNEL_PINS= "%GITHUB_ENV%" || exit /b 1
       - name: Default install prefix
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: zig build --prefix "%RUNNER_TEMP%\install-prefix" && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\install-prefix" --doctor
       - name: Release layout prefix
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: zig build release:verify -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release-prefix" --release --doctor
       - name: Install the release unit with scripts/install.ps1
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 "%RUNNER_TEMP%\release-prefix" -Prefix "%RUNNER_TEMP%\installed" -NoPath && "%RUNNER_TEMP%\installed\bin\metacodes.exe" doctor --strict
       - name: Release bundle verifier self-test
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: python scripts\verify_release_bundle.py --self-test
       - name: Release archive is reproducible
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-1" && zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-2" && python scripts\release_sums.py --self-test && for %%F in ("%RUNNER_TEMP%\dist-1\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-2\%%~nxF" > nul && zig build release:sums -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-1"
       - name: Verify install prefix unit tests
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_install_prefix -v
       - name: Kernel provenance verifier unit tests
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_kernel_provenance -v
       # The repository-wide suite on the native Windows host (#53), with the
@@ -457,12 +578,13 @@ jobs:
       # --test-timeout 5m: the build runner watchdog between tests is
       # max(--test-timeout, 60s), same as the AgentCore gate.
       - name: Full offline test suite
+        if: env.FAST_PATH != 'true'
         shell: cmd
         run: zig build test --test-timeout 5m -Dlean-kernels=on
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite
-        if: always()
+        if: always() && env.FAST_PATH != 'true'
         shell: cmd
         run: |
           git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files after the suite above, if any)

@@ -205,3 +205,33 @@ test "L2 守卫: BashOutput wait_ms 的 schema 描述绑定等待常量" {
     try std.testing.expect(std.mem.indexOf(u8, desc, "0 for an immediate snapshot") != null);
     try std.testing.expect(std.mem.indexOf(u8, desc, max_text) != null);
 }
+
+test "L2 守卫: BashOutput until/quiet_ms/pattern 的 schema 绑定实现" {
+    const bash_output = cc.tools_bash_output;
+    // until 的枚举就是实现的 UntilKind,描述逐个点名每种模式,并点明默认值。
+    const until_spec = found: for (tools.registry) |entry| {
+        if (!std.mem.eql(u8, entry.name, "BashOutput")) continue;
+        for (entry.input_schema.prop_specs.?) |spec| {
+            if (std.mem.eql(u8, spec.name, "until")) break :found spec;
+        }
+        return error.BashOutputUntilSpecMissing;
+    } else return error.BashOutputMissing;
+    const values = until_spec.enum_values orelse return error.BashOutputUntilEnumMissing;
+    const kinds = @typeInfo(bash_output.UntilKind).@"enum".fields;
+    try std.testing.expectEqual(kinds.len, values.len);
+    inline for (kinds, 0..) |kind, i| {
+        try std.testing.expectEqualStrings(kind.name, values[i]);
+        try std.testing.expect(std.mem.indexOf(u8, until_spec.description, kind.name) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, until_spec.description, "exit (default)") != null);
+
+    const quiet = propDescription("BashOutput", "quiet_ms") orelse return error.BashOutputQuietMsSpecMissing;
+    var buf: [48]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, quiet, try std.fmt.bufPrint(&buf, "default {d} ms", .{bash_output.DEFAULT_QUIET_MS})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, try std.fmt.bufPrint(&buf, "maximum {d} ms", .{bash_output.MAX_WAIT_MS})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, try std.fmt.bufPrint(&buf, "minimum {d} ms", .{bash_output.MIN_QUIET_MS})) != null);
+
+    const pattern = propDescription("BashOutput", "pattern") orelse return error.BashOutputPatternSpecMissing;
+    try std.testing.expect(std.mem.indexOf(u8, pattern, try std.fmt.bufPrint(&buf, "at most {d} bytes", .{bash_output.MAX_PATTERN_BYTES})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, pattern, "not a regex") != null);
+}

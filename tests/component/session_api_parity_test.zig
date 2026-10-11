@@ -206,6 +206,9 @@ test "U11 parity: run Options 装配单源(web 只比 canonical 多 ui_requester
     try std.testing.expect(web_opts.progress_updates);
     web_opts.progress_updates = canonical.progress_updates;
     web_opts.progress_updates_observe = canonical.progress_updates_observe;
+    // 停滞闸门(stall gate)同属宿主契约字段:web 有人能一句话续接,默认 enforce;canonical 不带。
+    try std.testing.expectEqual(@as(?cc.stall_gate.Mode, .enforce), web_opts.stall_gate);
+    web_opts.stall_gate = canonical.stall_gate;
     try std.testing.expect(std.meta.eql(canonical, web_opts));
 }
 
@@ -244,6 +247,9 @@ test "U11 parity: 过程义务门是宿主契约字段,canonical 不带(delivery
     const again = session_service.buildRunOptions(app, null);
     try std.testing.expect(!again.progress_updates);
     try std.testing.expect(!again.progress_updates_observe);
+    // 停滞闸门同样不进 canonical:宏 run / skill run 不会因"无新结果"被停。
+    app.config.stall_gate = .enforce;
+    try std.testing.expect(session_service.buildRunOptions(app, null).stall_gate == null);
 }
 
 test "R3-1回归: Ctrl+B 身份轮换 —— 新 session_id + 新 transcript 目录,权限路由同步" {

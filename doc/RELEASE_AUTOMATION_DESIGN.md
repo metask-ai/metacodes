@@ -138,7 +138,9 @@ tag build will. Re-running the cut updates the open release PR in place; a
 second, different release PR is refused (one cut in flight), and a branch that
 already went through a merged PR is refused (a version is released once). The
 script also requires `main` to equal freshly fetched `origin/main`. Merging
-the PR is the human decision that a release happens.
+the PR is the human decision that a release happens. A release PR that adds
+nothing but the generated bump to a base whose full CI passed takes the CI
+fast path below instead of the suites.
 
 ### Stage B — tag (`release-tag.yml`)
 
@@ -228,6 +230,45 @@ HEAD is exactly the tag of that version or the PR head branch is
 red until the reopen PR lands; the cut itself (stage A) also refuses without
 `-dev`, see step 1.
 
+### CI fast path for release and reopen PRs
+
+The cut and the reopen PR carry no code: they change the two version files,
+the changelog heading and the fingerprint pin, and `main`'s full CI already
+ran on the commit they branch from. Running the suites again (about 25
+minutes, and the reopen PR after every release) proves nothing new, so
+`ci.yml` starts with a `Release fast path` job that decides per PR, with
+`scripts/release_fast_path.py`, whether the required jobs may skip them.
+Two facts must both hold:
+
+1. **Content.** The paths that differ between the merge commit's base
+   (`HEAD^1`) and the merge commit are among `build.zig.zon`,
+   `src/version.zig`, `CHANGELOG.md` and `evals/plugin-v1/protocol.json`, and
+   regenerating those files from the base in a scratch worktree with
+   `release_cut.py`'s own functions reproduces them byte for byte: a bare
+   version over a `-dev` base is checked as a cut (with the date in its
+   heading), a `-dev` version over a bare base as a reopen, and the
+   fingerprint is recomputed, not trusted. A reworded changelog line, a
+   hand-edited pin or any other file is the full path.
+2. **Base.** The `CI` workflow's push run for that base commit concluded
+   `success`. A run still in progress is waited for, up to 45 minutes: the
+   reopen PR is opened while `main`'s run of the release merge commit is
+   going. A failed, cancelled or missing run is the full path.
+
+On the fast path the required `Gates (Linux|macOS|Windows)` and `TTY (Linux)`
+checks still run and report: every step checks `FAST_PATH`, except the
+checkout and the version state gate in `Gates`, which runs without
+`--rehearse`. The script never fails its job (an error decides the full
+path), and the required jobs run in full when the decision job itself fails,
+so a doubt costs time, never coverage. Pushes to `main` always run in full,
+including the release merge commit's run.
+
+What the fast path gives up is the pre-tag rehearsal of the stable-channel
+release layout on the candidate (`check_version_state.py --rehearse` followed
+by `release:verify` / `release:archive`). Stage C builds and verifies the
+same layout from the tag on all three platforms, and the draft is published
+only after that passes; when a change touches the release path, rehearse it
+first with `release.yml` `dry_run` on `main`.
+
 ## 4. Hotfixes and maintenance lines
 
 Not needed before 1.0 and not automated: a hotfix is a normal fix on `main`
@@ -278,6 +319,10 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
   the checkout still ends on `main`, and the error says the branch is already
   pushed; re-running the same command regenerates it, pushes it with a lease
   and opens or updates the PR.
+- **Fast path on a bad base**: the release PR's base must have a successful
+  `CI` push run; a red, cancelled or still-missing run after the 45-minute wait
+  sends the PR through the full suites, and a merge that moves `main` makes the
+  PR behind, so its re-run decides again against the new base.
 - **Stale clone**: the cut and the reopen refuse unless `main` equals freshly
   fetched `origin/main`; the reopen also requires the tag to exist on origin
   and to point at a commit `main` contains.

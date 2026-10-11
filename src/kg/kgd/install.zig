@@ -14,13 +14,18 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const net = @import("platform").net;
 const rng = @import("platform").rng;
 const util_fs = @import("../../util/fs.zig");
 const common = @import("../../tools/common.zig");
 const identity_mod = @import("identity.zig");
 const KgClient = @import("../client.zig").KgClient;
 
-pub const DEFAULT_PORT: u16 = 8799;
+/// The range a new configuration's preferred port is drawn from: below the
+/// ephemeral ranges of Linux (32768+), macOS and Windows (49152+), so the
+/// kernel does not hand it to outgoing connections.
+pub const PREFERRED_PORT_FIRST: u16 = 20000;
+pub const PREFERRED_PORT_LAST: u16 = 32767;
 pub const STORE_NAME = "store.kg.v2";
 const STORE_INIT_TIMEOUT_MS = 60_000;
 const API_KEY_BYTES = 32;
@@ -46,6 +51,10 @@ pub const Options = struct {
     /// Null keeps the port an existing configuration already uses, so a
     /// reinstall does not silently move the service away from its clients.
     port: ?u16 = null,
+    /// Generate a new key even when the existing configuration has a usable
+    /// one: autostart moving off a port another service held has presented
+    /// the old key to that service.
+    rotate_api_key: bool = false,
 };
 
 pub const Outcome = struct {
@@ -108,10 +117,10 @@ pub fn run(allocator: std.mem.Allocator, state_root: []const u8, options: Option
     defer identity.deinit();
 
     var key_buffer: [API_KEY_BYTES * 2]u8 = undefined;
-    const reused = reuseApiKey(existing, &key_buffer);
+    const reused = !options.rotate_api_key and reuseApiKey(existing, &key_buffer);
     if (!reused) try generateApiKey(&key_buffer);
 
-    const port = options.port orelse portOfExisting(existing) orelse DEFAULT_PORT;
+    const port = options.port orelse portOfExisting(existing) orelse choosePort(config_path, null);
     const url = std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port}) catch
         return Error.OutOfMemory;
     errdefer allocator.free(url);
@@ -175,6 +184,38 @@ fn directoryExists(allocator: std.mem.Allocator, path: []const u8) bool {
     const path_z = allocator.dupeZ(u8, path) catch return true; // fail safe: do not chmod
     defer allocator.free(path_z);
     return pfs.exists(path_z.ptr);
+}
+
+/// The first port a new configuration at `config_path` tries, derived from the
+/// path. It used to be 8799 for every state root, so while one install's
+/// service was down a test in a temporary home provisioned and bound the very
+/// port that install had pinned, and its sessions then met a service that
+/// refused their key. Two state roots now collide only by hash, and a
+/// collision is handled where it shows (`kg_autostart`).
+pub fn preferredPort(config_path: []const u8) u16 {
+    const span: u64 = @as(u64, PREFERRED_PORT_LAST - PREFERRED_PORT_FIRST) + 1;
+    return PREFERRED_PORT_FIRST + @as(u16, @intCast(std.hash.Fnv1a_64.hash(config_path) % span));
+}
+
+/// `preferredPort` when nothing holds it and it is not `avoid`, else a port
+/// the kernel hands out (never `avoid`), else the preferred port.
+pub fn choosePort(config_path: []const u8, avoid: ?u16) u16 {
+    const preferred = preferredPort(config_path);
+    if (preferred != (avoid orelse 0) and portFree(preferred)) return preferred;
+    var attempt: u8 = 0;
+    while (attempt < 4) : (attempt += 1) {
+        const listener = net.listenLoopback(0, 1) catch break;
+        const port = listener.port;
+        net.closeSocket(listener.sock);
+        if (port != (avoid orelse 0)) return port;
+    }
+    return preferred;
+}
+
+fn portFree(port: u16) bool {
+    const listener = net.listenLoopback(port, 1) catch return false;
+    net.closeSocket(listener.sock);
+    return true;
 }
 
 fn portOfExisting(existing: ?KgClient.ParsedDaemonFile) ?u16 {
@@ -484,4 +525,37 @@ fn writeRaw(allocator: std.mem.Allocator, path: []const u8, body: []const u8, mo
     }
     _ = pfs.close(fd);
     if (pfs.chmod(path_z.ptr, mode) != 0) return error.ChmodFailed;
+}
+
+test "KgdInstall: each configuration prefers its own port, below the ephemeral ranges" {
+    const a = preferredPort("/Users/a/.metacodes/kg/daemon.json");
+    try testing.expectEqual(a, preferredPort("/Users/a/.metacodes/kg/daemon.json"));
+    try testing.expect(a >= PREFERRED_PORT_FIRST and a <= PREFERRED_PORT_LAST);
+    // Two state roots do not share one default: a test home and the real
+    // install no longer reach for the same port.
+    try testing.expect(a != preferredPort("/var/folders/x/T/tmp1234/.home/.metacodes/kg/daemon.json"));
+    var seen = std.AutoHashMap(u16, void).init(testing.allocator);
+    defer seen.deinit();
+    var buf: [64]u8 = undefined;
+    for (0..32) |index| {
+        const port = preferredPort(try std.fmt.bufPrint(&buf, "/tmp/root-{d}/kg/daemon.json", .{index}));
+        try testing.expect(port >= PREFERRED_PORT_FIRST and port <= PREFERRED_PORT_LAST);
+        try seen.put(port, {});
+    }
+    try testing.expect(seen.count() >= 30);
+}
+
+test "KgdInstall: a held or avoided preferred port is replaced by a free one" {
+    const path = "/tmp/kg-port-choice/kg/daemon.json";
+    const preferred = preferredPort(path);
+    const held = net.listenLoopback(preferred, 1) catch return error.SkipZigTest; // taken by something else already
+    var open = true;
+    defer if (open) net.closeSocket(held.sock);
+    const instead = choosePort(path, null);
+    try testing.expect(instead != preferred and instead != 0);
+    net.closeSocket(held.sock);
+    open = false;
+    try testing.expectEqual(preferred, choosePort(path, null));
+    // The port another service holds is never chosen again, even when free.
+    try testing.expect(choosePort(path, preferred) != preferred);
 }

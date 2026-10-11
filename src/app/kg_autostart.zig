@@ -6,13 +6,21 @@
 //! root:
 //!
 //! 1. provisions the service the way `metacodes kg install` does when the
-//!    default `<state root>/kg/daemon.json` does not exist yet, choosing the
-//!    default port when it is free and a free one otherwise (several installs
-//!    on one machine must not collide);
-//! 2. starts `<this executable> --state-dir <root> kgd` as a background
+//!    default `<state root>/kg/daemon.json` does not exist yet, on the port
+//!    that configuration prefers (`kgd_install.preferredPort`) when it is free
+//!    and a free one otherwise (several installs on one machine must not
+//!    collide);
+//! 2. asks whatever listens on the configured port for readiness with this
+//!    configuration's key. This install's service answers; one that refuses
+//!    the key belongs to another state root (or an older key) and is never
+//!    taken for ours: the default configuration then moves to a free port
+//!    with a new key (the old one was just presented to that service) and
+//!    the same store, while a `METACODES_KG_CONFIG` file is left as the user
+//!    wrote it and reported;
+//! 3. starts `<this executable> --state-dir <root> kgd` as a background
 //!    service (own session, no terminal, output appended to
-//!    `<state root>/kg/kgd.log`), unless something already listens there;
-//! 3. waits until the configured port accepts connections.
+//!    `<state root>/kg/kgd.log`) when nothing listens there;
+//! 4. waits until the configured port accepts connections.
 //!
 //! It stays out of the way of everything it does not own: an explicit
 //! `METACODES_KG_URL`/`_API_KEY`/`_EXPECTED_BUILD_ID` service, a non-loopback
@@ -40,12 +48,24 @@ pub const ENV_DISABLE = "METACODES_KG_AUTOSTART";
 const READY_WAIT_MS: u64 = 20_000;
 /// A lock older than this belongs to a start that died with it held.
 const LOCK_STALE_S: i64 = 60;
+/// How long the ownership probe waits for a listener to answer.
+const PROBE_TIMEOUT_MS: u32 = 2_000;
 
 pub const Autostart = struct {
     allocator: std.mem.Allocator,
     state_root: []u8,
     executable: []u8,
     mutex: platform.sync.Mutex = .{},
+    /// How the service is brought up; null spawns `<executable> kgd` as a
+    /// background process. Component tests run the same service in-process so
+    /// that nothing outlives them.
+    launcher: ?Launcher = null,
+
+    pub const Launcher = struct {
+        ctx: *anyopaque,
+        /// `config_path` is null for the state root's default configuration.
+        launch: *const fn (ctx: *anyopaque, state_root: []const u8, config_path: ?[]const u8) anyerror!void,
+    };
 
     /// Null when this process cannot name its own executable.
     pub fn create(allocator: std.mem.Allocator, state_root: []const u8) ?*Autostart {
@@ -95,9 +115,16 @@ pub const Autostart = struct {
         const config_dir = std.fs.path.dirname(config_path) orelse return false;
 
         var lock = (try Lock.acquire(a, config_dir)) orelse {
-            // Another session is starting it: wait for the same port.
-            const port = configuredPort(a, config_path) orelse return false;
-            return waitAccepting(port);
+            // Another session is starting it, and may be moving it to another
+            // port: wait for it to finish, then judge what the configuration
+            // names by then.
+            if (!waitUnlocked(a, config_dir)) return false;
+            var target = configuredTarget(a, config_path) orelse return false;
+            defer target.deinit(a);
+            return switch (occupant(target.port, target.api_key)) {
+                .ours, .unknown => true,
+                .none, .foreign => false,
+            };
         };
         defer lock.release();
 
@@ -105,7 +132,7 @@ pub const Autostart = struct {
             // A configuration the user named must exist; only the default is
             // ours to create.
             if (custom_config) return false;
-            var outcome = kgd_install.run(a, self.state_root, .{ .port = choosePort() }) catch |err| {
+            var outcome = kgd_install.run(a, self.state_root, .{ .port = kgd_install.choosePort(config_path, null) }) catch |err| {
                 log.warn("kg", "TinyKG service provisioning failed: {s}", .{@errorName(err)});
                 return false;
             };
@@ -113,8 +140,33 @@ pub const Autostart = struct {
             log.info("kg", "TinyKG service provisioned: {s} at {s}", .{ outcome.config_path, outcome.url });
         }
 
-        const port = configuredPort(a, config_path) orelse return false;
-        if (accepting(port)) return true;
+        var target = configuredTarget(a, config_path) orelse return false;
+        defer target.deinit(a);
+        var port = target.port;
+        switch (occupant(port, target.api_key)) {
+            // A listener that does not answer within the probe is most likely
+            // this install's service busy with a request: never start a
+            // second service over it.
+            .ours, .unknown => return true,
+            .none => {},
+            .foreign => {
+                if (custom_config) {
+                    log.warn("kg", "TinyKG port {d} named by {s} is held by a service that refuses its key; stop that service or give the configuration a free port (`metacodes kg install --config <path> --port <port>`)", .{ port, config_path });
+                    return false;
+                }
+                const moved = kgd_install.choosePort(config_path, port);
+                // The probe, like every request a session made, presented the
+                // key to that service: move with a new one.
+                var outcome = kgd_install.run(a, self.state_root, .{ .port = moved, .rotate_api_key = true }) catch |err| {
+                    log.warn("kg", "TinyKG port {d} is held by another service and moving off it failed: {s}", .{ port, @errorName(err) });
+                    return false;
+                };
+                defer outcome.deinit(a);
+                log.warn("kg", "TinyKG port {d} is held by a service that refuses this install's key (another state root's, or one started with an older key); moved this install to {s} with a new key ({s})", .{ port, outcome.url, outcome.config_path });
+                port = kgd_install.portOfUrl(outcome.url) orelse return false;
+                if (accepting(port)) return false; // taken between the choice and now
+            },
+        }
 
         const log_path = try std.fs.path.joinZ(a, &.{ config_dir, "kgd.log" });
         defer a.free(log_path);
@@ -122,16 +174,20 @@ pub const Autostart = struct {
         if (log_fd < 0) return error.LogUnavailable;
         defer pfs.close(log_fd);
 
-        const exe_z = try a.dupeZ(u8, self.executable);
-        defer a.free(exe_z);
-        const root_z = try a.dupeZ(u8, self.state_root);
-        defer a.free(root_z);
-        const config_z = try a.dupeZ(u8, config_path);
-        defer a.free(config_z);
-        const argv_default = [_]?[*:0]const u8{ exe_z.ptr, "--state-dir", root_z.ptr, "kgd", null };
-        const argv_custom = [_]?[*:0]const u8{ exe_z.ptr, "--state-dir", root_z.ptr, "kgd", "--config", config_z.ptr, null };
-        const argv: []const ?[*:0]const u8 = if (custom_config) &argv_custom else &argv_default;
-        try platform.process.spawnService(argv, log_fd);
+        if (self.launcher) |launcher| {
+            try launcher.launch(launcher.ctx, self.state_root, if (custom_config) config_path else null);
+        } else {
+            const exe_z = try a.dupeZ(u8, self.executable);
+            defer a.free(exe_z);
+            const root_z = try a.dupeZ(u8, self.state_root);
+            defer a.free(root_z);
+            const config_z = try a.dupeZ(u8, config_path);
+            defer a.free(config_z);
+            const argv_default = [_]?[*:0]const u8{ exe_z.ptr, "--state-dir", root_z.ptr, "kgd", null };
+            const argv_custom = [_]?[*:0]const u8{ exe_z.ptr, "--state-dir", root_z.ptr, "kgd", "--config", config_z.ptr, null };
+            const argv: []const ?[*:0]const u8 = if (custom_config) &argv_custom else &argv_default;
+            try platform.process.spawnService(argv, log_fd);
+        }
         log.info("kg", "TinyKG service started on port {d} (log {s})", .{ port, log_path });
         return waitAccepting(port);
     }
@@ -169,32 +225,103 @@ fn fileExists(a: std.mem.Allocator, path: []const u8) bool {
     return pfs.exists(z.ptr);
 }
 
-/// The loopback port the configuration names; null for anything else, which
-/// is not a service this host may start.
-fn configuredPort(a: std.mem.Allocator, config_path: []const u8) ?u16 {
+/// The loopback port a configuration names and the key its service accepts.
+const Target = struct {
+    port: u16,
+    api_key: []u8,
+
+    fn deinit(self: *Target, a: std.mem.Allocator) void {
+        a.free(self.api_key);
+    }
+};
+
+/// What the configuration names; null for a non-loopback URL, which is not a
+/// service this host may start.
+fn configuredTarget(a: std.mem.Allocator, config_path: []const u8) ?Target {
     var parsed = KgClient.loadDaemonConfig(a, config_path) catch return null;
     defer parsed.deinit();
     const url = parsed.value.url;
     if (!std.mem.startsWith(u8, url, "http://127.0.0.1:")) return null;
     const port = kgd_install.portOfUrl(url) orelse return null;
-    return if (port == 0) null else port;
+    if (port == 0) return null;
+    return .{ .port = port, .api_key = a.dupe(u8, parsed.value.api_key) catch return null };
 }
 
-/// The default port when nothing holds it, else one the kernel hands out.
-fn choosePort() u16 {
-    if (net.listenLoopback(kgd_install.DEFAULT_PORT, 1)) |listener| {
-        net.closeSocket(listener.sock);
-        return kgd_install.DEFAULT_PORT;
-    } else |_| {}
-    if (net.listenLoopback(0, 1)) |listener| {
-        const port = listener.port;
-        net.closeSocket(listener.sock);
-        return port;
-    } else |_| {}
-    return kgd_install.DEFAULT_PORT;
+/// Who answers on a port, as judged with this configuration's key.
+const Occupant = enum {
+    /// Nothing listens.
+    none,
+    /// A service that accepts the key: this install's.
+    ours,
+    /// A service that refuses the key with 401, or a listener that does not
+    /// speak HTTP: never this install's service.
+    foreign,
+    /// It accepted the connection but did not answer in time.
+    unknown,
+};
+
+/// An authenticated readiness request, read only to its status line. The
+/// service checks the key before it reads any body, so a foreign service does
+/// no work for it, and this install's own answers 200, or 503 when degraded.
+fn occupant(port: u16, api_key: []const u8) Occupant {
+    if (!accepting(port)) return .none;
+    for (api_key) |byte| if (byte < 0x21 or byte == 0x7f) return .unknown; // never a header injection
+    const sock = net.connectLoopback(port) catch return .none;
+    defer net.closeSocket(sock);
+    net.setSendTimeoutMs(sock, PROBE_TIMEOUT_MS);
+    net.setRecvTimeoutMs(sock, PROBE_TIMEOUT_MS);
+    var request_buf: [384]u8 = undefined;
+    const request = std.fmt.bufPrint(
+        &request_buf,
+        "GET /api/ready HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nx-api-key: {s}\r\nConnection: close\r\n\r\n",
+        .{ port, api_key },
+    ) catch return .unknown;
+    var sent: usize = 0;
+    while (sent < request.len) {
+        const n = net.send(sock, request[sent..]);
+        if (n <= 0) return .unknown;
+        sent += @intCast(n);
+    }
+    var reply: [16]u8 = undefined;
+    var got: usize = 0;
+    while (got < reply.len) {
+        const n = net.recv(sock, reply[got..]);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    return classifyReply(reply[0..got]);
 }
 
+fn classifyReply(reply: []const u8) Occupant {
+    if (reply.len == 0) return .unknown;
+    // "HTTP/1.1 401 ..." — a status line needs 12 bytes.
+    if (reply.len < 12 or !std.mem.startsWith(u8, reply, "HTTP/1.") or reply[8] != ' ') return .foreign;
+    const status = std.fmt.parseInt(u16, reply[9..12], 10) catch return .foreign;
+    return if (status == 401) .foreign else .ours;
+}
+
+/// Until another session's start lock is gone, or the time a start may take.
+fn waitUnlocked(a: std.mem.Allocator, dir: []const u8) bool {
+    const path = std.fs.path.join(a, &.{ dir, "kgd.autostart.lock" }) catch return false;
+    defer a.free(path);
+    var waited: u64 = 0;
+    while (waited < READY_WAIT_MS + 10_000) : (waited += 100) {
+        if (!fileExists(a, path)) return true;
+        time.sleepMs(100);
+    }
+    return false;
+}
+
+/// Whether the service listens on `port`. Where the listener table answers
+/// (Windows) nothing connects: a refused loopback connect costs ~2 s there,
+/// and a connect-and-close probe hands the single-threaded service an empty
+/// connection to retire.
 fn accepting(port: u16) bool {
+    switch (net.loopbackListenState(port)) {
+        .listening => return true,
+        .not_listening => return false,
+        .unknown => {},
+    }
     const sock = net.connectLoopback(port) catch return false;
     net.closeSocket(sock);
     return true;
@@ -261,6 +388,23 @@ test "kg autostart: METACODES_KG_AUTOSTART=0/false/off disables, anything else d
     for ([_][]const u8{ "1", "", "true", "on", "yes" }) |value| try testing.expect(!disables(value));
 }
 
+test "kg autostart: readiness costs no refused connect and hands the service no empty connection" {
+    const listener = try net.listenLoopback(0, 4);
+    var open = true;
+    defer if (open) net.closeSocket(listener.sock);
+    try testing.expect(accepting(listener.port));
+    // Windows reads the listener table; POSIX still connects (and a refused
+    // connect costs nothing there).
+    if (builtin.os.tag == .windows) try testing.expect(!net.pollReadable(listener.sock, 0));
+
+    net.closeSocket(listener.sock);
+    open = false;
+    const started_ms = time.nowMs();
+    try testing.expect(!accepting(listener.port));
+    // One refused loopback connect alone takes ~2 s on Windows.
+    try testing.expect(time.nowMs() - started_ms < 1_000);
+}
+
 test "kg autostart: only a loopback daemon.json names a port this host may start" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
@@ -279,10 +423,13 @@ test "kg autostart: only a loopback daemon.json names a port this host may start
     defer a.free(path);
     try write.config(tmp.dir, "http://127.0.0.1:8811");
     _ = pfs.chmod(path.ptr, 0o600);
-    try testing.expectEqual(@as(?u16, 8811), configuredPort(a, path));
+    var target = configuredTarget(a, path) orelse return error.TestExpectedTarget;
+    defer target.deinit(a);
+    try testing.expectEqual(@as(u16, 8811), target.port);
+    try testing.expectEqualStrings("k" ** 64, target.api_key);
     try write.config(tmp.dir, "http://10.0.0.5:8811");
     _ = pfs.chmod(path.ptr, 0o600);
-    try testing.expectEqual(@as(?u16, null), configuredPort(a, path));
+    try testing.expect(configuredTarget(a, path) == null);
 }
 
 test "kg autostart: the start lock is exclusive and a stale one is taken over" {
@@ -303,4 +450,85 @@ test "kg autostart: the start lock is exclusive and a stale one is taken over" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "kgd.autostart.lock", .data = "1000\n" });
     var taken = (try Lock.acquire(a, root)) orelse return error.TestExpectedStaleTakeover;
     taken.release();
+}
+
+test "kg autostart: a reply is judged by its status line, and only 401 or non-HTTP is foreign" {
+    try testing.expectEqual(Occupant.ours, classifyReply("HTTP/1.1 200 OK\r\n"));
+    try testing.expectEqual(Occupant.ours, classifyReply("HTTP/1.1 503 Service Unavailable\r\n"));
+    try testing.expectEqual(Occupant.foreign, classifyReply("HTTP/1.1 401 Unauthorized\r\n"));
+    try testing.expectEqual(Occupant.foreign, classifyReply("SSH-2.0-OpenSSH_9.6\r\n"));
+    try testing.expectEqual(Occupant.foreign, classifyReply("HTTP/1.1 4"));
+    try testing.expectEqual(Occupant.unknown, classifyReply(""));
+}
+
+/// One canned reply to the first connection that sends a request; empty
+/// connections (the readiness check's connect-and-close) are skipped.
+const FakeService = struct {
+    listener: net.Listener,
+    reply: []const u8,
+    seen_key: [80]u8 = undefined,
+    seen_key_len: usize = 0,
+
+    fn serve(self: *FakeService) void {
+        var connections: u8 = 0;
+        while (connections < 4) : (connections += 1) {
+            const conn = net.acceptConn(self.listener.sock) orelse return;
+            defer net.closeSocket(conn);
+            net.setRecvTimeoutMs(conn, 3_000);
+            var buf: [1024]u8 = undefined;
+            var got: usize = 0;
+            while (got < buf.len) {
+                const n = net.recv(conn, buf[got..]);
+                if (n <= 0) break;
+                got += @intCast(n);
+                if (std.mem.indexOf(u8, buf[0..got], "\r\n\r\n") != null) break;
+            }
+            if (got == 0) continue;
+            if (std.mem.indexOf(u8, buf[0..got], "x-api-key: ")) |at| {
+                const rest = buf[at + "x-api-key: ".len .. got];
+                const key = rest[0 .. std.mem.indexOf(u8, rest, "\r\n") orelse rest.len];
+                self.seen_key_len = @min(key.len, self.seen_key.len);
+                @memcpy(self.seen_key[0..self.seen_key_len], key[0..self.seen_key_len]);
+            }
+            if (self.reply.len > 0) {
+                _ = net.send(conn, self.reply);
+            } else {
+                time.sleepMs(PROBE_TIMEOUT_MS + 500); // never answers within the probe
+            }
+            return;
+        }
+    }
+};
+
+fn probeFake(reply: []const u8) !struct { occupant: Occupant, key: [80]u8, key_len: usize } {
+    const listener = try net.listenLoopback(0, 4);
+    var fake = FakeService{ .listener = listener, .reply = reply };
+    const thread = try std.Thread.spawn(.{}, FakeService.serve, .{&fake});
+    const verdict = occupant(listener.port, "k" ** 64);
+    thread.join();
+    net.closeSocket(listener.sock);
+    return .{ .occupant = verdict, .key = fake.seen_key, .key_len = fake.seen_key_len };
+}
+
+test "kg autostart: the ownership probe asks with this configuration's key" {
+    const refused = try probeFake("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+    try testing.expectEqual(Occupant.foreign, refused.occupant);
+    try testing.expectEqualStrings("k" ** 64, refused.key[0..refused.key_len]);
+    const accepted = try probeFake("HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n{\"ok\":true,\"ready\":true,\"degraded\":false}");
+    try testing.expectEqual(Occupant.ours, accepted.occupant);
+    const other_program = try probeFake("SSH-2.0-OpenSSH_9.6\r\n");
+    try testing.expectEqual(Occupant.foreign, other_program.occupant);
+    // A listener that does not answer is not declared foreign: it may be this
+    // install's own service, busy.
+    const silent = try probeFake("");
+    try testing.expectEqual(Occupant.unknown, silent.occupant);
+
+    const closed = try net.listenLoopback(0, 1);
+    const port = closed.port;
+    net.closeSocket(closed.sock);
+    try testing.expectEqual(Occupant.none, occupant(port, "k" ** 64));
+    // A key that could smuggle a header is never sent.
+    const listener = try net.listenLoopback(0, 1);
+    defer net.closeSocket(listener.sock);
+    try testing.expectEqual(Occupant.unknown, occupant(listener.port, "k\r\nx-evil: 1"));
 }

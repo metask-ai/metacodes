@@ -6,10 +6,10 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 18 must not retain historical callback aliases"
+#error "revision 19 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 18u || \
+#if METASK_AGENTCORE_ABI_REVISION != 19u || \
     METASK_AGENTCORE_PROMPT_OP_ADD != 1u || \
     METASK_AGENTCORE_PROMPT_OP_REPLACE != 2u || \
     METASK_AGENTCORE_PROMPT_OP_REMOVE != 3u || \
@@ -33,7 +33,7 @@
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
     METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 18 codes must match the public contract"
+#error "source-free Revision 19 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -427,6 +427,25 @@ static int release_error(const metask_agentcore_api_v1 *api,
     return code;
 }
 
+/* 1 when the Session description contains `needle`. */
+static int description_contains(const metask_agentcore_api_v1 *api,
+                                metask_agentcore_session *session,
+                                const char *needle) {
+    metask_agentcore_owned_bytes_v1 description = {0};
+    metask_agentcore_owned_bytes_v1 diagnostic = {0};
+    struct needle_scan scan = {0};
+    if (api->session_control->describe(session, &description, &diagnostic) !=
+        METASK_AGENTCORE_STATUS_OK) {
+        api->buffer_release(&diagnostic);
+        return 0;
+    }
+    scan.needle = needle;
+    scan.needle_len = strlen(needle);
+    scan_feed(&scan, (const char *)description.ptr, (size_t)description.len);
+    api->buffer_release(&description);
+    return scan.found;
+}
+
 static uint32_t host_stream(
     void *ctx, const metask_agentcore_run_context_v1 *run,
     metask_agentcore_bytes_view_v1 arguments,
@@ -495,6 +514,8 @@ int main(int argc, char **argv) {
             raw_api->session_control->export_checkpoint ||
         api->session_control->set_prompt_profile !=
             raw_api->session_control->set_prompt_profile ||
+        api->session_control->update_permission_mode !=
+            raw_api->session_control->update_permission_mode ||
         api->skill->resolve_catalog != raw_api->skill->resolve_catalog ||
         api->skill->release_catalog != raw_api->skill->release_catalog ||
         api->skill->bind_policy != raw_api->skill->bind_policy ||
@@ -630,6 +651,37 @@ int main(int argc, char **argv) {
         api->session->destroy(session, &diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 17);
+    }
+    /* The permission mode changes in place and describe names it; an unknown
+     * code is refused with a diagnostic and changes nothing. */
+    if (api->session_control->update_permission_mode(
+            session, METASK_AGENTCORE_PERMISSION_DEFAULT, &diagnostic) !=
+            METASK_AGENTCORE_STATUS_OK ||
+        !description_contains(api, session, "\"permission_mode\":\"default\"")) {
+        stop_server(&server);
+        api->session->destroy(session, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 62);
+    }
+    if (api->session_control->update_permission_mode(session, 99u, &diagnostic) !=
+            METASK_AGENTCORE_STATUS_INVALID_ARGUMENT ||
+        diagnostic.ptr == NULL || diagnostic.len == 0 ||
+        !description_contains(api, session, "\"permission_mode\":\"default\"")) {
+        stop_server(&server);
+        api->buffer_release(&diagnostic);
+        api->session->destroy(session, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 63);
+    }
+    api->buffer_release(&diagnostic);
+    if (api->session_control->update_permission_mode(
+            session, METASK_AGENTCORE_PERMISSION_FULL_ACCESS, &diagnostic) !=
+            METASK_AGENTCORE_STATUS_OK ||
+        !description_contains(api, session, "\"permission_mode\":\"full_access\"")) {
+        stop_server(&server);
+        api->session->destroy(session, &diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 64);
     }
     /* A locked section is refused with a diagnostic and nothing changes; a
      * valid replacement (drop the Host section) is accepted while idle. */

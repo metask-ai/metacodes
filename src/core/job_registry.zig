@@ -48,6 +48,14 @@ pub const Retention = enum {
     synchronous,
 };
 
+/// BashOutput's poll-guard state for one job: how many waiting polls in a row
+/// found it still running with only a few new bytes, and when the last of
+/// them returned. The registry only stores it; BashOutput owns the policy.
+pub const PollStreak = struct {
+    low_yield: u8 = 0,
+    last_ms: util_time.Millis = 0,
+};
+
 pub const JobEntry = struct {
     id: [12]u8,
     /// 进程句柄（POSIX=pid，Windows=HANDLE）。走可移植 platform/process。
@@ -73,6 +81,7 @@ pub const JobEntry = struct {
     /// previous result stopped.
     stdout_read_offset: u64 = 0,
     stderr_read_offset: u64 = 0,
+    poll_streak: PollStreak = .{},
     /// Set once the spool files have been unlinked. The path strings stay
     /// valid (they are freed at teardown) so an outstanding value snapshot
     /// never dangles; only the directory entries are gone.
@@ -438,6 +447,31 @@ pub const JobRegistry = struct {
         if (stderr_next) |next| entry.stderr_read_offset = next;
     }
 
+    /// Extend the job's poll streak by one for a poll that started at
+    /// `started_ms` and returned at `returned_ms`, starting over if that poll
+    /// began more than `idle_reset_ms` after the previous one returned (the
+    /// gap is the caller's own time, not the poll's wait). Read-modify-write
+    /// under the lock, so concurrent polls of one job do not lose updates.
+    pub fn extendPollStreak(
+        self: *JobRegistry,
+        id: []const u8,
+        started_ms: util_time.Millis,
+        returned_ms: util_time.Millis,
+        idle_reset_ms: util_time.Millis,
+    ) void {
+        self.lock();
+        defer self.unlock();
+        const entry = self.getPtrLocked(id) orelse return;
+        const carried: u8 = if (started_ms - entry.poll_streak.last_ms > idle_reset_ms) 0 else entry.poll_streak.low_yield;
+        entry.poll_streak = .{ .low_yield = carried +| 1, .last_ms = returned_ms };
+    }
+
+    pub fn resetPollStreak(self: *JobRegistry, id: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        if (self.getPtrLocked(id)) |entry| entry.poll_streak = .{};
+    }
+
     pub fn markExitObserved(self: *JobRegistry, id: []const u8) void {
         self.lock();
         defer self.unlock();
@@ -674,6 +708,36 @@ test "kill running job" {
     try r.kill(j.idSlice());
     const j2 = r.get(j.idSlice()).?;
     try std.testing.expect(j2.status == .killed);
+}
+
+test "poll streak extends, lapses after an idle gap, saturates and resets" {
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const j = try r.spawnBackground("sleep 2", null);
+    defer r.kill(j.idSlice()) catch {};
+    const id = j.idSlice();
+    try std.testing.expectEqual(PollStreak{}, r.get(id).?.poll_streak);
+    r.extendPollStreak(id, 900, 1_000, 100);
+    // A long wait of its own does not break the streak: the gap is measured
+    // from the previous return to this poll's start.
+    r.extendPollStreak(id, 1_050, 9_000, 100);
+    try std.testing.expectEqual(PollStreak{ .low_yield = 2, .last_ms = 9_000 }, r.get(id).?.poll_streak);
+    // Starting more than idle_reset_ms after the last return starts over.
+    r.extendPollStreak(id, 9_101, 9_200, 100);
+    try std.testing.expectEqual(PollStreak{ .low_yield = 1, .last_ms = 9_200 }, r.get(id).?.poll_streak);
+    var now: util_time.Millis = 9_200;
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        now += 1;
+        r.extendPollStreak(id, now, now, 100);
+    }
+    try std.testing.expectEqual(std.math.maxInt(u8), r.get(id).?.poll_streak.low_yield);
+    r.resetPollStreak(id);
+    try std.testing.expectEqual(PollStreak{}, r.get(id).?.poll_streak);
+    // Unknown ids are ignored, like the other cursor updates.
+    r.extendPollStreak("000000000000", now, now, 100);
+    r.resetPollStreak("000000000000");
 }
 
 test "activeCount" {

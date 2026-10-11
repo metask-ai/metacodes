@@ -914,7 +914,7 @@ fn formatAutoBackgroundedAndRemember(
     try util_json.writeJsonString(&aw.writer, out_trunc);
     try aw.writer.writeAll(",\"partial_stderr\":");
     try util_json.writeJsonString(&aw.writer, err_trunc);
-    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. You will be notified automatically when it exits; do not poll or sleep-wait. Use BashOutput with this job_id to read its output (it waits for new lines if the job is still running).\"}");
+    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. You will be notified automatically when it exits; do not poll or sleep-wait. Use BashOutput with this job_id to read its output (it waits for the job to exit, up to wait_ms).\"}");
     return try aw.toOwnedSlice();
 }
 
