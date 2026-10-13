@@ -351,6 +351,9 @@ jobs:
       - name: Verify install prefix unit tests
         if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_verify_install_prefix -v
+      - name: Install script unit tests
+        if: env.FAST_PATH != 'true'
+        run: python3 -m unittest scripts.tests.test_install_scripts -v
       - name: Kernel self-containment and pin unit tests
         if: env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_check_kernel_self_contained scripts.tests.test_kernel_pins -v
@@ -566,6 +569,10 @@ jobs:
         if: env.FAST_PATH != 'true'
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_install_prefix -v
+      - name: Install script unit tests
+        if: env.FAST_PATH != 'true'
+        shell: cmd
+        run: python -m unittest scripts.tests.test_install_scripts -v
       - name: Kernel provenance verifier unit tests
         if: env.FAST_PATH != 'true'
         shell: cmd

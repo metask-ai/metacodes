@@ -53,22 +53,103 @@ Where it goes:
   --sdk ARCHIVE|DIR   use this AgentCore SDK instead of the matching one
   --no-sdk            do not install the AgentCore SDK
   --allow-downgrade   let a rerun replace a newer install with an older version
-                      (without it, such a unit refuses; releases up to 0.5.0
-                      predate the check: they downgrade without asking and
-                      reject this option)
+                      (without it that is refused: by the unit itself, or by
+                      this script for releases up to 0.5.0, which predate the
+                      check)
   --force             also replace foreign files at --prefix or another launcher
   --release-base URL  mirror of https://github.com/metask-ai/metacodes/releases
   -h, --help          this text
 
 Rerunning over an install of this product replaces its version and keeps its
-state root, but never with an older version unless --allow-downgrade (the unit
-being installed makes that check); foreign files and other launchers are never
-replaced without --force.
+state root, but never with an older version unless --allow-downgrade; foreign
+files and other launchers are never replaced without --force.
 EOF
 }
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 note() { echo "install.sh: $*" >&2; }
+
+# The "version" of a release manifest's release object or of an install
+# record, or nothing: both are written two-space indented, one key a line.
+json_version() { # <json file>
+  sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+# BEGIN version order
+# Whether version $1 precedes $2 in semantic-version order, as the installer
+# itself orders them (src/app/install.zig isOlder over std.SemanticVersion):
+# pre-releases before their release, build metadata ignored, and a version
+# that does not parse is never older. install.ps1 Test-OlderVersion mirrors
+# it; scripts/tests/test_install_scripts.py checks both against one table.
+version_older() { # <candidate> <installed>
+  LC_ALL=C awk -v a="$1" -v b="$2" '
+    # A numeric identifier: no leading zero, and it fits in 64 bits.
+    function number(s) {
+      if (s !~ /^(0|[1-9][0-9]*)$/) return 0
+      return length(s) < 20 || (length(s) == 20 && s "" <= "18446744073709551615")
+    }
+    # Without leading zeros, numbers order by length, then digit by digit
+    # (awk would compare long ones as inexact doubles).
+    function cmpnum(x, y) {
+      if (length(x) != length(y)) return length(x) < length(y) ? -1 : 1
+      return cmpstr(x, y)
+    }
+    function cmpstr(x, y) {
+      x = x ""; y = y ""
+      return x < y ? -1 : (x > y ? 1 : 0)
+    }
+    # Dot-separated identifiers of [0-9A-Za-z-], none empty.
+    function idents(s,   n, i, part) {
+      n = split(s, part, ".")
+      if (n == 0 || s ~ /^\./ || s ~ /\.$/) return 0
+      for (i = 1; i <= n; i++) if (part[i] !~ /^[0-9A-Za-z-]+$/) return 0
+      return 1
+    }
+    # Fills CORE[k, 1..3], PRE[k] and HASPRE[k]; 0 when v does not parse.
+    function parse(v, k,   cut, dash, plus, core, rest, n, i, part) {
+      dash = index(v, "-"); plus = index(v, "+")
+      cut = (dash && (!plus || dash < plus)) ? dash : plus
+      core = cut ? substr(v, 1, cut - 1) : v
+      HASPRE[k] = 0; PRE[k] = ""
+      if (cut && substr(v, cut, 1) == "-") {
+        rest = substr(v, cut + 1); plus = index(rest, "+")
+        PRE[k] = plus ? substr(rest, 1, plus - 1) : rest
+        HASPRE[k] = 1
+        if (!idents(PRE[k])) return 0
+        n = split(PRE[k], part, ".")
+        for (i = 1; i <= n; i++) if (part[i] ~ /^[0-9]+$/ && !number(part[i])) return 0
+        if (plus && !idents(substr(rest, plus + 1))) return 0
+      } else if (cut && !idents(substr(v, cut + 1))) {
+        return 0
+      }
+      if (split(core, part, ".") != 3 || core ~ /\.$/) return 0
+      for (i = 1; i <= 3; i++) {
+        if (!number(part[i])) return 0
+        CORE[k, i] = part[i]
+      }
+      return 1
+    }
+    BEGIN {
+      if (!parse(a, "a") || !parse(b, "b")) exit 1
+      for (i = 1; i <= 3; i++) {
+        d = cmpnum(CORE["a", i], CORE["b", i])
+        if (d) exit (d < 0 ? 0 : 1)
+      }
+      if (HASPRE["a"] && !HASPRE["b"]) exit 0
+      if (!HASPRE["a"]) exit 1
+      na = split(PRE["a"], pa, "."); nb = split(PRE["b"], pb, ".")
+      for (i = 1; i <= na && i <= nb; i++) {
+        xn = pa[i] ~ /^[0-9]+$/; yn = pb[i] ~ /^[0-9]+$/
+        # Numeric identifiers come before alphanumeric ones.
+        if (xn != yn) exit (xn ? 0 : 1)
+        d = xn ? cmpnum(pa[i], pb[i]) : cmpstr(pa[i], pb[i])
+        if (d) exit (d < 0 ? 0 : 1)
+      }
+      # A shorter list of otherwise equal identifiers comes first.
+      exit (na < nb ? 0 : 1)
+    }'
+}
+# END version order
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
@@ -347,6 +428,25 @@ main() {
     sdk_root=$(unpack "$sdk" sdk)
   fi
 
+  # A unit refuses to replace a newer install with an older version, but only
+  # units released after 0.5.0 carry that check (their `install --help` names
+  # --allow-downgrade). For an earlier unit this script makes the same check;
+  # a unit that carries it decides for itself.
+  unit_guards=0
+  if "$root/bin/metacodes" install --help 2>&1 </dev/null | grep -q -e '--allow-downgrade'; then
+    unit_guards=1
+  fi
+  if [ "$unit_guards" = 0 ] && [ -f "$prefix/etc/metacodes/install.json" ]; then
+    unit_version=$(json_version "$root/manifest.json")
+    installed_version=$(json_version "$prefix/etc/metacodes/install.json")
+    if [ -n "$unit_version" ] && [ -n "$installed_version" ] &&
+       version_older "$unit_version" "$installed_version"; then
+      [ -n "$allow_downgrade" ] || [ -n "$force" ] ||
+        die "$prefix holds metacodes $installed_version, newer than $unit_version; pass --allow-downgrade to replace it with this older one, or choose another --prefix"
+      note "replacing metacodes $installed_version with the older $unit_version"
+    fi
+  fi
+
   set -- install --prefix "$prefix" --upgrade
   [ -n "$state_dir" ] && set -- "$@" --state-dir "$state_dir"
   [ -n "$sdk_root" ] && set -- "$@" --sdk "$sdk_root"
@@ -354,9 +454,9 @@ main() {
     set -- "$@" --link "$link" --link-name "$link_name"
   fi
   [ -n "$force" ] && set -- "$@" --force
-  # Passed only when asked: units older than the downgrade guard do not know
-  # the option (and never refuse a downgrade, so they never need it).
-  [ -n "$allow_downgrade" ] && set -- "$@" --allow-downgrade
+  # Only a unit that knows the option gets it; an earlier one rejects it as
+  # unknown (and was already checked above).
+  [ -n "$allow_downgrade" ] && [ "$unit_guards" = 1 ] && set -- "$@" --allow-downgrade
 
   "$root/bin/metacodes" "$@" </dev/null
 

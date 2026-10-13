@@ -46,9 +46,11 @@ status, compatibility boundaries, and entry points are defined by
   version. An older unit now replaces a newer install only with
   `--allow-downgrade` (`install.sh --allow-downgrade`, `install.ps1
   -AllowDowngrade`) or `--force`, and an allowed downgrade says so. The unit
-  being installed makes the check, so it protects against units from the next
-  release on: releases up to 0.5.0 still replace a newer install without
-  asking, and do not know `--allow-downgrade`.
+  being installed makes the check; for a release up to 0.5.0, which predates
+  it, `install.sh` and `install.ps1` make the same check before running the
+  unit, in the same version order, and pass `--allow-downgrade` only to a unit
+  that knows it. Only running such an older unit's `bin/metacodes install
+  --upgrade` by hand still replaces a newer install.
 - A launcher name held by another metacodes install is reported as such:
   `install failed (LinkOwnedByAnotherInstall)` names that launcher's install
   prefix and version, and says how to update it, install side by side or take
