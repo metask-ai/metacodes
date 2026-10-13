@@ -5,12 +5,14 @@
 //! 阻塞等浏览器 POST /respond 回填 UiResponse。agent_loop/core 零改动——协议合不合理,
 //! 这个文件写不写得顺就是答案。
 //!
-//! journal 行信封(浏览器按顶层唯一 key 分发):
-//!   {"core_event":   {<CoreEvent tagged union>}}         — emit
-//!   {"ui_request":   {"id":N,"request":{<UiRequest>}}}   — requester 发起
-//!   {"ui_request_done":      {"id":N}}                   — 已回答(重放时关对话框)
-//!   {"ui_request_cancelled": {"id":N}}                   — 中断取消(同上)
-//!   {"user_message": "..."} / {"run_done":{...}}         — session driver(session.zig)
+//! journal 行:内核事件与 UI 请求一律是 core/protocol/wire.zig 的 v1 行(带 "v" 与 "type"),
+//! 与任何进程外 Host 收到的完全相同:
+//!   {"v":1,"type":"<CoreEvent tag>","data":...}                    — emit
+//!   {"v":1,"type":"ui_request","id":N,"kind":"...","request":{...}} — requester 发起
+//!   {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered"|"cancelled"}
+//!                                                                  — 回答/中断(重放时关对话框)
+//! session driver(session.zig)的 {"user_message": "..."} / {"run_done":{...}} 仍是本 web
+//! 宿主自己的信封。浏览器回填的 JSON 由 wire.parseResponse 解析。
 //!
 //! 线程性:emit 可能在 agent_loop 线程或工具线程被调(协议契约)——allocator **必须
 //! 线程安全**(production 传 std.heap.c_allocator;单测 std.testing.allocator 自带锁)。
@@ -29,7 +31,7 @@ const abort_mod = @import("../util/abort.zig");
 const usage_mod = @import("../core/usage.zig");
 const journal_mod = @import("journal.zig");
 const log = @import("../util/log.zig");
-const util_json = @import("../util/json.zig");
+const wire = @import("../core/protocol/wire.zig");
 
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
@@ -40,7 +42,6 @@ const UiResponse = ui_request.UiResponse;
 const RequestOutcome = ui_request.RequestOutcome;
 const UiRequester = ui_request.UiRequester;
 const PermissionChoice = @import("../core/protocol/permission_choice.zig").PermissionChoice;
-const PlanApproval = @import("../tools/context.zig").ToolContext.PlanApproval;
 const EventJournal = journal_mod.EventJournal;
 
 pub const WebBackend = struct {
@@ -104,13 +105,8 @@ pub const WebBackend = struct {
             if (self.usage_totals) |u| u.apply(ev.usage);
         }
         // borrow slice 契约:序列化即拷贝,返回前完成消费。
-        const raw = std.json.Stringify.valueAlloc(self.allocator, .{ .core_event = ev }, .{}) catch {
+        const line = wire.writeEvent(self.allocator, ev) catch {
             log.warn("web", "dropped CoreEvent .{s} (serialize OOM)", .{@tagName(ev)});
-            return;
-        };
-        defer self.allocator.free(raw);
-        const line = util_json.repairJsonUtf8(self.allocator, raw) catch {
-            log.warn("web", "dropped CoreEvent .{s} (repair OOM)", .{@tagName(ev)});
             return;
         };
         defer self.allocator.free(line);
@@ -132,9 +128,6 @@ pub const WebBackend = struct {
     ) anyerror!RequestOutcome {
         const self: *WebBackend = @ptrCast(@alignCast(state));
 
-        const req_json = try ui_request.serializeUiRequest(self.allocator, req);
-        defer self.allocator.free(req_json);
-
         // 注册挂起槽(先注册再 append:浏览器看到 ui_request 时 respond 一定有槽可回填)
         self.lock();
         const id = self.next_req_id;
@@ -146,7 +139,12 @@ pub const WebBackend = struct {
         }
         self.unlock();
 
-        const announce = try std.fmt.allocPrint(self.allocator, "{{\"ui_request\":{{\"id\":{d},\"request\":{s}}}}}", .{ id, req_json });
+        const announce = wire.writeRequest(self.allocator, id, req) catch |err| {
+            self.lock();
+            self.pending_id = 0;
+            self.unlock();
+            return err;
+        };
         defer self.allocator.free(announce);
         self.journal.append(announce);
 
@@ -156,8 +154,8 @@ pub const WebBackend = struct {
             if (self.abort) |a| if (a.isAborted()) {
                 self.pending_id = 0;
                 self.unlock();
-                self.announceDone("ui_request_cancelled", id);
-                return cancelOutcome(req, out);
+                self.announceClosed(id, .cancelled);
+                return wire.cancelResponse(req, out);
             };
             _ = self.cond.timedWait(&self.mutex, 200 * std.time.ns_per_ms);
         }
@@ -167,12 +165,12 @@ pub const WebBackend = struct {
         self.unlock();
         defer self.allocator.free(resp_json);
 
-        self.announceDone("ui_request_done", id);
-        return parseResponse(req, resp_json, allocator, out);
+        self.announceClosed(id, .answered);
+        return wire.parseResponse(req, resp_json, allocator, out);
     }
 
-    fn announceDone(self: *WebBackend, comptime kind: []const u8, id: u64) void {
-        const line = std.fmt.allocPrint(self.allocator, "{{\"" ++ kind ++ "\":{{\"id\":{d}}}}}", .{id}) catch return;
+    fn announceClosed(self: *WebBackend, id: u64, outcome: wire.RequestClosed) void {
+        const line = wire.writeRequestClosed(self.allocator, id, outcome) catch return;
         defer self.allocator.free(line);
         self.journal.append(line);
     }
@@ -192,86 +190,6 @@ pub const WebBackend = struct {
         return true;
     }
 };
-
-/// 中断取消时的安全兜底:permission/plan 用显式拒绝(绝不静默放行、绝不落回 fd 0
-/// 文字 prompt——那属于另一个 UI 世界);ask/custom 报 InputAborted(对齐 TUI Esc 语义)。
-fn cancelOutcome(req: *const UiRequest, out: *UiResponse) anyerror!RequestOutcome {
-    switch (req.*) {
-        .permission => {
-            out.* = .{ .permission = .deny_once };
-            return .answered;
-        },
-        .plan_approval => {
-            out.* = .{ .plan_approval = .reject };
-            return .answered;
-        },
-        else => return error.InputAborted,
-    }
-}
-
-/// 按请求 tag 解析浏览器回填的 JSON → UiResponse。
-/// 响应格式(与 index.html 约定):
-///   permission:    {"choice":"allow_once"|"allow_always"|"deny_once"|"deny_tool_session"}
-///   plan_approval: {"choice":"approve_default"|"approve_accept_edits"|"reject"}
-///   ask_question:  {"answers":["label", ...]}(每问一条,多选已 ", " 拼接)
-///   custom:        {"result":<任意 JSON>}
-/// 解析失败走 cancelOutcome 同款安全兜底(坏响应≠放行)。
-fn parseResponse(req: *const UiRequest, resp_json: []const u8, allocator: std.mem.Allocator, out: *UiResponse) anyerror!RequestOutcome {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), resp_json, .{}) catch {
-        log.warn("web", "ui response parse failed, safe-deny", .{});
-        return cancelOutcome(req, out);
-    };
-    if (parsed != .object) return cancelOutcome(req, out);
-    const obj = parsed.object;
-
-    switch (req.*) {
-        .permission => {
-            const c = choiceField(obj, PermissionChoice) orelse return cancelOutcome(req, out);
-            out.* = .{ .permission = c };
-            return .answered;
-        },
-        .plan_approval => {
-            const c = choiceField(obj, PlanApproval) orelse return cancelOutcome(req, out);
-            out.* = .{ .plan_approval = c };
-            return .answered;
-        },
-        .ask_question => |questions| {
-            const answers_v = obj.get("answers") orelse return cancelOutcome(req, out);
-            if (answers_v != .array) return cancelOutcome(req, out);
-            if (answers_v.array.items.len != questions.len) return cancelOutcome(req, out);
-            const answers = try allocator.alloc([]const u8, answers_v.array.items.len);
-            var filled: usize = 0;
-            errdefer {
-                for (answers[0..filled]) |a| allocator.free(a);
-                allocator.free(answers);
-            }
-            for (answers_v.array.items, 0..) |a, i| {
-                if (a != .string) return error.InvalidUiResponse;
-                answers[i] = try allocator.dupe(u8, a.string);
-                filled += 1;
-            }
-            out.* = .{ .answers = answers };
-            return .answered;
-        },
-        .custom => {
-            const result_v = obj.get("result") orelse return cancelOutcome(req, out);
-            // 原样回传结构化结果(重新序列化 value → owned by allocator)
-            const raw_result = try std.json.Stringify.valueAlloc(allocator, result_v, .{});
-            defer allocator.free(raw_result);
-            const result_json = try util_json.repairJsonUtf8(allocator, raw_result);
-            out.* = .{ .custom = result_json };
-            return .answered;
-        },
-    }
-}
-
-fn choiceField(obj: std.json.ObjectMap, comptime E: type) ?E {
-    const v = obj.get("choice") orelse return null;
-    if (v != .string) return null;
-    return std.meta.stringToEnum(E, v.string);
-}
 
 // ============================================================================
 // Tests
@@ -293,8 +211,7 @@ test "emit 把 CoreEvent 以 core_event 信封落 journal" {
         testing.allocator.free(batch);
     }
     try testing.expectEqual(@as(usize, 2), batch.len);
-    try testing.expect(std.mem.indexOf(u8, batch[0], "\"core_event\"") != null);
-    try testing.expect(std.mem.indexOf(u8, batch[0], "text_chunk") != null);
+    try testing.expect(std.mem.indexOf(u8, batch[0], "\"type\":\"text_chunk\"") != null);
     try testing.expect(std.mem.indexOf(u8, batch[0], "hello web") != null);
     try testing.expect(std.mem.indexOf(u8, batch[1], "stream_done") != null);
 }
@@ -314,7 +231,7 @@ test "requester: permission 请求经 journal 通告,respond 回填 → answered
                 std.testing.allocator.free(batch);
             }
             // 从通告行解析 id(测试里恒 1)
-            if (std.mem.indexOf(u8, batch[0], "\"ui_request\"") == null) return;
+            if (std.mem.indexOf(u8, batch[0], "\"type\":\"ui_request\"") == null) return;
             _ = b.respond(1, "{\"choice\":\"allow_always\"}");
         }
     };
@@ -329,13 +246,13 @@ test "requester: permission 请求经 journal 通告,respond 回填 → answered
     try testing.expectEqual(PermissionChoice.allow_always, resp.permission);
     try testing.expectEqual(@as(u64, 0), wb.pendingId()); // 槽已清
 
-    // journal 尾部应有 ui_request_done
+    // journal 尾部应有 ui_request_closed(answered)
     const all = (try j.waitSince(testing.allocator, 0, 10)).?;
     defer {
         for (all) |l| testing.allocator.free(l);
         testing.allocator.free(all);
     }
-    try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "ui_request_done") != null);
+    try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "\"outcome\":\"answered\"") != null);
 }
 
 test "requester: abort 中断等待 → permission 安全 deny + cancelled 事件" {
@@ -359,7 +276,7 @@ test "requester: abort 中断等待 → permission 安全 deny + cancelled 事�
         for (all) |l| testing.allocator.free(l);
         testing.allocator.free(all);
     }
-    try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "ui_request_cancelled") != null);
+    try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "\"outcome\":\"cancelled\"") != null);
 }
 
 test "requester: ask_question 答案数须与问题数一致;abort 时报 InputAborted" {
@@ -384,41 +301,4 @@ test "respond: id 不匹配拒绝(stale 对话框防回填)" {
     var wb = WebBackend.init(testing.allocator, &j);
     defer wb.deinit();
     try testing.expect(!wb.respond(1, "{\"choice\":\"allow_once\"}")); // 无挂起
-}
-
-test "parseResponse: ask_question 答案 dupe 到调用方 allocator" {
-    const qs = [_]ui_request.AskQuestion{
-        .{ .question = "a?", .header = "A", .multi = false, .options = &.{} },
-        .{ .question = "b?", .header = "B", .multi = true, .options = &.{} },
-    };
-    const req = UiRequest{ .ask_question = &qs };
-    var resp: UiResponse = undefined;
-    const outcome = try parseResponse(&req, "{\"answers\":[\"x\",\"y, z\"]}", testing.allocator, &resp);
-    try testing.expectEqual(RequestOutcome.answered, outcome);
-    defer {
-        for (resp.answers) |a| testing.allocator.free(a);
-        testing.allocator.free(resp.answers);
-    }
-    try testing.expectEqual(@as(usize, 2), resp.answers.len);
-    try testing.expectEqualStrings("x", resp.answers[0]);
-    try testing.expectEqualStrings("y, z", resp.answers[1]);
-}
-
-test "parseResponse: 坏 JSON / 未知 choice → permission 安全 deny" {
-    const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
-    var resp: UiResponse = undefined;
-    try testing.expectEqual(RequestOutcome.answered, try parseResponse(&req, "not json", testing.allocator, &resp));
-    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
-    try testing.expectEqual(RequestOutcome.answered, try parseResponse(&req, "{\"choice\":\"pretty_please\"}", testing.allocator, &resp));
-    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
-}
-
-test "parseResponse: custom result 原样(重序列化)回传" {
-    const req = UiRequest{ .custom = .{ .kind = "video_timeline", .payload_json = "{}" } };
-    var resp: UiResponse = undefined;
-    const outcome = try parseResponse(&req, "{\"result\":{\"in\":3,\"out\":42}}", testing.allocator, &resp);
-    try testing.expectEqual(RequestOutcome.answered, outcome);
-    defer testing.allocator.free(resp.custom);
-    try testing.expect(std.mem.indexOf(u8, resp.custom, "\"in\"") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.custom, "42") != null);
 }

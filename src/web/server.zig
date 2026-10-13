@@ -718,7 +718,7 @@ test "loopback: /interrupt 打 abort;/respond 无挂起 409" {
 test "loopback: SSE 重放已有事件(带 id 帧)" {
     var j = EventJournal.init(testing.allocator);
     defer j.deinit();
-    j.append("{\"core_event\":{\"text_chunk\":\"hey\"}}");
+    j.append("{\"v\":1,\"type\":\"text_chunk\",\"data\":\"hey\"}");
     var wb = WebBackend.init(testing.allocator, &j);
     defer wb.deinit();
     var inbox = MsgQueue.init(testing.allocator);
@@ -744,7 +744,7 @@ test "loopback: SSE 重放已有事件(带 id 帧)" {
     defer j.close();
     const resp = try httpRoundtripPartial(testing.allocator, srv.port, "GET /events HTTP/1.1\r\n\r\n", "text_chunk");
     defer testing.allocator.free(resp);
-    try testing.expect(std.mem.indexOf(u8, resp, "id: 0\ndata: {\"core_event\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "id: 0\ndata: {\"v\":1,\"type\":\"text_chunk\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp, "hey") != null);
 }
 

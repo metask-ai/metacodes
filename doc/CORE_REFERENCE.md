@@ -317,6 +317,12 @@ pub fn serializeUiRequest(allocator, req) ![]u8; // 给异步前端投递用
 
 `RequestOutcome` 三态是同步/异步前端的分水岭(见 §5)。
 
+跨进程或网络投递(SSE、WebSocket、队列)用 `protocol.wire`:带版本号的事件行、请求行、
+请求关闭行，以及把前端应答解析回 `UiResponse` 的 `parseResponse`(坏应答一律按取消处理，
+绝不放行)。格式见 [API.md](API.md#wire-lines-for-out-of-process-hosts)，逐行钉在
+`tests/fixtures/wire/v1`。`serializeUiRequest` 只是内部 struct 的直译，供挂起持久化使用，
+不是对外契约。
+
 ---
 
 ## 4. 主循环契约:agent_loop.run()

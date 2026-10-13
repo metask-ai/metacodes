@@ -120,7 +120,7 @@ test "L2 web ①: agent_loop 文本流经 WebBackend 落 journal,SSE 读回带 i
     const resp = try httpGetUntil(a, fx.srv.port, "/events", "stream_done");
     defer a.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "id: 0\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"text_chunk\":\"hello web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"type\":\"text_chunk\",\"data\":\"hello web\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "stream_begin") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "stream_done") != null);
 }
@@ -149,10 +149,10 @@ test "L2 web ②: AskUserQuestion 经 HTTP /respond 回填 → 工具拿到答�
     // 模拟浏览器:HTTP 轮询 /events 等 ui_request 出现 → POST /respond 选 Red。
     const Browser = struct {
         fn run(port: u16, alloc: std.mem.Allocator) void {
-            const events = httpGetUntil(alloc, port, "/events", "\"ui_request\"") catch return;
+            const events = httpGetUntil(alloc, port, "/events", "\"type\":\"ui_request\"") catch return;
             defer alloc.free(events);
             // 从事件流抠 id(测试内恒 1;稳妥起见仍解析)
-            const key = "{\"ui_request\":{\"id\":";
+            const key = "\"type\":\"ui_request\",\"id\":";
             const at = std.mem.indexOf(u8, events, key) orelse return;
             const rest = events[at + key.len ..];
             const end = std.mem.indexOfScalar(u8, rest, ',') orelse return;
@@ -193,7 +193,7 @@ test "L2 web ②: AskUserQuestion 经 HTTP /respond 回填 → 工具拿到答�
     }
     try std.testing.expect(saw_red_result);
 
-    // journal 里有完整生命周期:ui_request → ui_request_done
+    // journal 里有完整生命周期:wire 的 ui_request → ui_request_closed(answered),问题字段是 v1 拼写
     const all = (try fx.journal.waitSince(a, 0, 100)).?;
     defer {
         for (all) |l| a.free(l);
@@ -202,8 +202,10 @@ test "L2 web ②: AskUserQuestion 经 HTTP /respond 回填 → 工具拿到答�
     var saw_req = false;
     var saw_done = false;
     for (all) |l| {
-        if (std.mem.indexOf(u8, l, "\"ui_request\"") != null) saw_req = true;
-        if (std.mem.indexOf(u8, l, "\"ui_request_done\"") != null) saw_done = true;
+        if (std.mem.indexOf(u8, l, "\"type\":\"ui_request\"") != null and
+            std.mem.indexOf(u8, l, "\"multi_select\":false") != null) saw_req = true;
+        if (std.mem.indexOf(u8, l, "\"type\":\"ui_request_closed\"") != null and
+            std.mem.indexOf(u8, l, "\"outcome\":\"answered\"") != null) saw_done = true;
     }
     try std.testing.expect(saw_req);
     try std.testing.expect(saw_done);

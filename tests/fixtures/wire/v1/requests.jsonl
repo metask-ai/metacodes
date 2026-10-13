@@ -1,0 +1,6 @@
+{"v":1,"type":"ui_request","id":1,"kind":"permission","request":{"tool":"Bash","args":"{\"command\":\"rm -r build\"}"}}
+{"v":1,"type":"ui_request","id":2,"kind":"plan_approval","request":{"plan_md":"# Plan\n1. do it","kg_step_count":2}}
+{"v":1,"type":"ui_request","id":3,"kind":"ask_question","request":{"questions":[{"question":"Ship now?","header":"Decision","multi_select":false,"options":[{"label":"Ship","description":"Release now","preview":""},{"label":"Wait","description":"Hold the release","preview":"## Plan\n- wait"}]},{"question":"Which targets?","header":"Targets","multi_select":true,"options":[{"label":"Ship","description":"Release now","preview":""},{"label":"Wait","description":"Hold the release","preview":"## Plan\n- wait"}]}]}}
+{"v":1,"type":"ui_request","id":4,"kind":"custom","request":{"kind":"video_timeline","payload_json":"{\"clips\":[]}"}}
+{"v":1,"type":"ui_request_closed","id":1,"outcome":"answered"}
+{"v":1,"type":"ui_request_closed","id":2,"outcome":"cancelled"}

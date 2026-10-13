@@ -22,9 +22,24 @@ status, compatibility boundaries, and entry points are defined by
   as for the workspace root. A replacement is validated before the Session
   changes. doc/API.md now tabulates which settings are idle-mutable, which
   need a new Runtime generation, and which are fixed at create.
+- `protocol.wire`: versioned JSON lines for Hosts that carry a Session across
+  a process or network boundary. `writeEvent`, `writeRequest` and
+  `writeRequestClosed` produce `{"v":1,"type":...}` lines; `parseResponse`
+  reads a client's answer back and treats anything malformed as a
+  cancellation. Hosts previously ran `std.json` over kernel structs, so a
+  renamed field changed their clients silently. One pinned line per event
+  tag and request kind lives in `tests/fixtures/wire/v1`.
 
 ### Changed
 
+- The `--web` event stream sends the `protocol.wire` v1 lines. Kernel events
+  were `{"core_event":{"<tag>":...}}` and UI requests
+  `{"ui_request":{"id":N,"request":{"<kind>":...}}}`; they are now
+  `{"v":1,"type":"<tag>","data":...}` and
+  `{"v":1,"type":"ui_request","id":N,"kind":"<kind>","request":...}`, with
+  `ui_request_closed` replacing `ui_request_done`/`ui_request_cancelled` and
+  `multi_select` replacing `multi` in questions. The bundled page follows;
+  a client reading the stream directly must follow too.
 - Breaking for source-level embedders: `transcript.Writer.init` and
   `transcript.listSessions` take the state root as a `StateRoot`
   (`util/state_root.zig`) instead of a `[]const u8`. On 2026-10-01 the third

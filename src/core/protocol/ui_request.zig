@@ -14,6 +14,7 @@ const context = @import("../../tools/context.zig");
 const util_json = @import("../../util/json.zig");
 
 pub const AskQuestion = context.AskQuestion;
+pub const AskOption = context.AskOption;
 pub const PermissionChoice = @import("permission_choice.zig").PermissionChoice;
 pub const PlanApproval = context.ToolContext.PlanApproval;
 

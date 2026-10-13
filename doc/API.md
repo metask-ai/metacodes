@@ -573,6 +573,27 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 writes. It is not named in the system prompt. These two are source-level only;
 AgentCore revision 19 does not carry them.
 
+### Wire lines for out-of-process Hosts
+
+A Host that carries a Session over SSE, a WebSocket or a queue serializes
+events and UI requests with `mc.protocol.wire` rather than `std.json` over the
+kernel structs, so a field renamed inside the kernel shows up as a contract
+change instead of silently reaching every client. Each line is one JSON object
+with the schema version `v` (currently 1) and a `type`:
+
+```text
+{"v":1,"type":"<CoreEvent tag>","data":<payload or null>}
+{"v":1,"type":"ui_request","id":N,"kind":"permission|plan_approval|ask_question|custom","request":{...}}
+{"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled"}
+```
+
+`wire.parseResponse` turns the client's answer (`{"choice":...}`,
+`{"answers":[...]}` or `{"result":...}`) back into a `UiResponse`; anything
+malformed or of another version is answered as a cancellation, never as a
+grant. `tests/fixtures/wire/v1` pins one line for every event tag and request
+kind and doubles as conformance vectors for Hosts in other languages. The
+bundled `--web` UI consumes exactly these lines.
+
 Static trusted plugins can contribute typed tools, streaming tools, services,
 advisory policies, and deterministic provider dialects. Process plugins can only
 contribute isolated tools through the versioned wire protocol. Neither receives a

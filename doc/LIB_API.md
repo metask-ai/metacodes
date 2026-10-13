@@ -360,7 +360,7 @@ agentcore:gate`)的命令、库文件名与按 target 的发布状态矩阵,见
 |---|---|
 | metacodes 同仓/同工具链的 Zig 产品 | `metacodes-core` + `AgentRuntime` |
 | 审计当前数据插件组合 | plugin inventory JSON |
-| 浏览器/桌面壳 | Web HTTP + SSE + typed request 回填 |
+| 浏览器/桌面壳 | Web HTTP + SSE + typed request 回填；跨进程的行格式用 `protocol.wire` |
 | 不带源码的 C/C++/Zig/Rust 原生产品 | 精确 pinned AgentCore bundle |
 | 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 19 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
 | 不可信/多租户可执行插件 | 暂不支持；process v1 是故障/资源边界，不是 OS sandbox |

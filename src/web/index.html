@@ -152,18 +152,20 @@ function connect() {
 
 // ── 顶层信封分发:处理每一种响应 ─────────────────────────────────────────────
 function dispatch(ev) {
-  if ("core_event" in ev) return coreEvent(ev.core_event);
+  // Kernel events and UI requests arrive as versioned wire lines (core/protocol/wire.zig).
+  if (ev.v === 1) {
+    if (ev.type === "ui_request") return showDialog(ev.id, ev.kind, ev.request);
+    if (ev.type === "ui_request_closed") return hideDialog();
+    return coreEvent(ev.type, ev.data);
+  }
   if ("user_message" in ev) { endAssistant(); scroll.appendChild(el("msg-user", ev.user_message)); return; }
   if ("run_done" in ev) { endAssistant(); setGenerating(false);
     const sr = ev.run_done.stop_reason || "done";
     if (sr !== "end_turn") sysline("· " + sr + (ev.run_done.err ? ": " + ev.run_done.err : "")); return; }
-  if ("ui_request" in ev) return showDialog(ev.ui_request.id, ev.ui_request.request);
-  if ("ui_request_done" in ev || "ui_request_cancelled" in ev) return hideDialog();
   if ("command_result" in ev) { const r = ev.command_result; sysline((r.ok ? "· " : "⚠ ") + (r.message || ""), !r.ok); if (r.ok) refreshState(); return; }
 }
 
-function coreEvent(ce) {
-  const tag = Object.keys(ce)[0], p = ce[tag];
+function coreEvent(tag, p) {
   switch (tag) {
     case "text_chunk": appendAssistant(p); break;
     case "thinking_chunk": appendAssistant(p); break; // 暂与 text 同渲染(后续可折叠)
@@ -193,7 +195,7 @@ function coreEvent(ce) {
     // 诊断事件:顶层页面不渲染(turn 计数已由 progress 提供)
     case "diag_turn_begin": case "diag_turn_end": case "diag_run_end":
     case "diag_breaker_tripped": case "diag_cache_break": case "diag_continuation": break;
-    default: console.warn("unhandled core_event:", tag, p); break;
+    default: console.warn("unhandled event:", tag, p); break;
   }
 }
 
@@ -453,9 +455,8 @@ function renderGeneric(body, name, content) {
 
 // ── UI 请求对话框(permission / ask_question / plan_approval / custom)──────────
 let pendingReqId = 0;
-function showDialog(id, req) {
+function showDialog(id, tag, p) {
   pendingReqId = id; dialog.innerHTML = "";
-  const tag = Object.keys(req)[0], p = req[tag];
   if (tag === "permission") {
     dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: "Permission: " + p.tool }));
     const pre = document.createElement("pre"); pre.textContent = trunc(p.args, 1200); dialog.appendChild(pre);
@@ -470,7 +471,7 @@ function showDialog(id, req) {
       ["Yes, proceed", "approve_default"], ["Yes, and auto-accept edits", "approve_accept_edits"],
       ["No, keep planning", "reject"],
     ], (c) => respond({ id, choice: c }));
-  } else if (tag === "ask_question") { renderAsk(id, p); }
+  } else if (tag === "ask_question") { renderAsk(id, p.questions); }
   else { dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: "Unsupported UI request: " + tag }));
     choiceButtons([["Dismiss", "x"]], () => respond({ id, result: null })); }
   overlay.style.display = "flex";
@@ -481,7 +482,7 @@ function renderAsk(id, questions) {
   const step = () => {
     dialog.innerHTML = ""; const q = questions[idx];
     dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: (questions.length > 1 ? (idx + 1) + "/" + questions.length + " · " : "") + (q.header ? q.header + " · " : "") + q.question }));
-    if (q.multi) {
+    if (q.multi_select) {
       const boxes = [];
       for (const o of q.options) { const lab = document.createElement("label"); const cb = document.createElement("input"); cb.type = "checkbox"; cb.value = o.label; lab.appendChild(cb); lab.appendChild(document.createTextNode(" " + o.label + (o.description ? " — " + o.description : ""))); dialog.appendChild(lab); boxes.push(cb); }
       const done = document.createElement("button"); done.textContent = "Submit"; done.onclick = () => { answers[idx] = boxes.filter(b => b.checked).map(b => b.value).join(", "); next(); }; dialog.appendChild(done);

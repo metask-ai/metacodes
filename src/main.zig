@@ -218,6 +218,7 @@ pub const agents_preload = @import("agents/preload.zig");
 pub const tools_dynamic = @import("tools/dynamic.zig");
 pub const tools_task_batch = @import("tools/task_batch.zig");
 pub const system_prompt = @import("core/system_prompt.zig");
+pub const prompt_sections = @import("core/prompt_sections.zig");
 pub const user_context = @import("core/memory/user_context.zig");
 pub const memdir = @import("core/memory/memdir.zig");
 pub const util_log = @import("util/log.zig");
@@ -225,6 +226,7 @@ pub const tui_render_region = @import("repl/tui/render_region.zig");
 pub const ui_event = @import("core/protocol/ui_event.zig");
 pub const ui_backend = @import("core/protocol/ui_backend.zig");
 pub const ui_request = @import("core/protocol/ui_request.zig");
+pub const wire = @import("core/protocol/wire.zig");
 pub const session_id = @import("core/session_id.zig");
 pub const tui_backend = @import("repl/tui/tui_backend.zig");
 pub const writer_backend = @import("core/writer_backend.zig");
@@ -993,7 +995,6 @@ fn dumpPromptSectionsAndExit(app: *app_mod.App) noreturn {
         dumpWrite(std.fmt.bufPrint(&buf, "prompt sections unavailable: {s}\n", .{@errorName(err)}) catch "prompt sections unavailable\n");
         std.process.exit(1);
     };
-    const prompt_sections = @import("core/prompt_sections.zig");
     var line: [256]u8 = undefined;
     dumpWrite("========== SYSTEM PROMPT SECTIONS ==========\n");
     for (listing.sections) |section| {
