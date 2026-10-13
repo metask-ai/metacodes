@@ -23,6 +23,13 @@ pub const Config = struct {
     /// layout every host had before the state root existed.
     state_root: []const u8 = "",
     shell: ShellPolicy = .disabled,
+    /// Further absolute directories the Session works in beside `root` (the
+    /// CLI's `/add-dir` set). Each must exist; the policy keeps real paths.
+    /// They widen exactly what `root` grants: `accept_edits` auto-approval of
+    /// Write/Edit/NotebookEdit and sandboxed shell writes. They are not named
+    /// in the system prompt; a Host that wants the model to know says so in a
+    /// context block or its prompt profile.
+    additional_dirs: []const []const u8 = &.{},
 };
 
 pub const WorkspacePolicy = struct {
@@ -32,6 +39,9 @@ pub const WorkspacePolicy = struct {
     state_root: []u8,
     shell: ShellPolicy,
     sandbox_settings: sandbox_config.SandboxSettings,
+    /// Real paths of `Config.additional_dirs`, deduplicated, `root` excluded.
+    /// The list and every entry are owned by `allocator`.
+    additional_dirs: []const []const u8,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !WorkspacePolicy {
         if (config.root.len == 0 or !std.fs.path.isAbsolute(config.root)) return error.InvalidWorkspaceRoot;
@@ -48,6 +58,8 @@ pub const WorkspacePolicy = struct {
         else
             try @import("../util/state_root.zig").legacyDefault(allocator, home);
         errdefer allocator.free(state_root);
+        const additional_dirs = try resolveAdditionalDirs(allocator, root, config.additional_dirs);
+        errdefer freeDirs(allocator, additional_dirs);
 
         return .{
             .allocator = allocator,
@@ -61,10 +73,12 @@ pub const WorkspacePolicy = struct {
                 .allow_unsandboxed_commands = false,
                 .auto_allow_bash_if_sandboxed = true,
             },
+            .additional_dirs = additional_dirs,
         };
     }
 
     pub fn deinit(self: *WorkspacePolicy) void {
+        freeDirs(self.allocator, self.additional_dirs);
         self.allocator.free(self.state_root);
         self.allocator.free(self.home);
         self.allocator.free(self.root);
@@ -96,6 +110,44 @@ pub fn isShellTool(name: []const u8) bool {
         std.mem.eql(u8, name, "KillShell");
 }
 
+/// Validates and resolves every directory before returning; on any error
+/// nothing is retained. Entries equal to `root` or to an earlier entry are
+/// dropped, so the result is the set the Host meant.
+pub fn resolveAdditionalDirs(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    dirs: []const []const u8,
+) error{ InvalidAdditionalDirectory, OutOfMemory }![]const []const u8 {
+    var resolved: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (resolved.items) |dir| allocator.free(dir);
+        resolved.deinit(allocator);
+    }
+    for (dirs) |dir| {
+        if (dir.len == 0 or !std.fs.path.isAbsolute(dir)) return error.InvalidAdditionalDirectory;
+        const real = realpathAlloc(allocator, dir) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidAdditionalDirectory,
+        };
+        var duplicate = std.mem.eql(u8, real, root);
+        for (resolved.items) |kept| duplicate = duplicate or std.mem.eql(u8, real, kept);
+        if (duplicate) {
+            allocator.free(real);
+            continue;
+        }
+        resolved.append(allocator, real) catch |err| {
+            allocator.free(real);
+            return err;
+        };
+    }
+    return resolved.toOwnedSlice(allocator);
+}
+
+pub fn freeDirs(allocator: std.mem.Allocator, dirs: []const []const u8) void {
+    for (dirs) |dir| allocator.free(dir);
+    allocator.free(dirs);
+}
+
 fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len >= std.fs.max_path_bytes) return error.InvalidWorkspaceRoot;
     var path_z: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -115,4 +167,31 @@ test "WorkspacePolicy requires an existing absolute root and fails shell closed"
     try std.testing.expect(policy.allowsTool("Read"));
     try std.testing.expect(!policy.allowsTool("Bash"));
     try std.testing.expect(policy.sandbox() == null);
+}
+
+test "WorkspacePolicy keeps the real paths of distinct additional directories and refuses invalid ones" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.createDirPath(std.testing.io, "extra");
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(std.testing.io, &base_buf)];
+    const root = try std.fs.path.join(a, &.{ base, "root" });
+    defer a.free(root);
+    const extra = try std.fs.path.join(a, &.{ base, "extra" });
+    defer a.free(extra);
+    // `extra/../extra` names the same directory as `extra`.
+    const extra_again = try std.fs.path.join(a, &.{ base, "extra", "..", "extra" });
+    defer a.free(extra_again);
+
+    var policy = try WorkspacePolicy.init(a, .{ .root = root, .additional_dirs = &.{ extra, root, extra_again } });
+    defer policy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), policy.additional_dirs.len);
+    try std.testing.expectEqualStrings(extra, policy.additional_dirs[0]);
+
+    const missing = try std.fs.path.join(a, &.{ base, "missing" });
+    defer a.free(missing);
+    try std.testing.expectError(error.InvalidAdditionalDirectory, WorkspacePolicy.init(a, .{ .root = root, .additional_dirs = &.{ extra, missing } }));
+    try std.testing.expectError(error.InvalidAdditionalDirectory, WorkspacePolicy.init(a, .{ .root = root, .additional_dirs = &.{"relative/dir"} }));
 }

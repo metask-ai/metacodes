@@ -279,8 +279,10 @@ Host 事实不写进档案：`core.context_blocks` 把它们渲染成一条 `<sy
 shell）、`permission_mode`、`permission_rules`（Host 导入的规则层）和
 `ui_requester` 都是每个 Session 一份；"本会话总是允许/拒绝"记在 Session 内存的
 `session_rules` 里。`AgentSession` 不读任何 settings 文件。运行中只在 idle 边界修改：
-`setPermissionMode`、`updatePermissionRules`、`setPromptProfile`，忙时返回
-`SessionBusy`。
+`setModel`、`setPermissionMode`、`updatePermissionRules`、`setPromptProfile`、
+`setReasoningEffort`、`setAdditionalDirectories`，忙时返回 `SessionBusy`。哪些设置
+idle 可改、哪些要换 Runtime 代际、哪些只能新建 Session，见
+[API.md 的配置分类表](API.md#session-configuration-classes)。
 
 用户在 Host 的权限框里选 `allow_always`，库路径只把该工具记进这个 Session 的
 `session_rules`：同一 Runtime、同一工作区的另一个 Session 仍会询问，磁盘上什么也不写。

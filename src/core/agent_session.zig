@@ -668,6 +668,11 @@ pub const SessionConfig = struct {
     /// (`system_prompt.validateProfile` names the broken rule) and keeps a copy
     /// until `setPromptProfile`. Empty renders the kernel prompt byte for byte.
     prompt_profile: prompt_sections.Profile = .{},
+    /// Reasoning effort for this Session's provider, kept across `setModel`
+    /// and changed at idle by `setReasoningEffort`. Null leaves the provider
+    /// default. A provider without an effort control refuses a non-null value
+    /// at create with `error.AgentEffortUnsupportedProvider`.
+    reasoning_effort: ?types.ReasoningEffort = null,
 };
 
 pub const Config = SessionConfig;
@@ -739,6 +744,19 @@ pub const PermissionRuleMutationError = error{
 pub const PermissionModeMutationError = error{
     SessionBusy,
     InvalidSessionState,
+};
+
+pub const AdditionalDirectoriesMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    InvalidAdditionalDirectory,
+    OutOfMemory,
+};
+
+pub const ReasoningEffortMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    AgentEffortUnsupportedProvider,
 };
 
 pub const PromptProfileMutationError = error{
@@ -1194,6 +1212,9 @@ pub const AgentSession = struct {
     /// the right key and the wrong header.
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
     provider: provider_factory.OwnedProvider,
+    /// The effort last applied to `provider`; reapplied to a replacement
+    /// provider by `setModel`.
+    reasoning_effort: ?types.ReasoningEffort = null,
     conversation: Conversation,
     workspace: workspace_mod.WorkspacePolicy,
     artifact_root: []u8,
@@ -1347,7 +1368,7 @@ pub const AgentSession = struct {
             Conversation.init(allocator);
         errdefer conversation.deinit();
 
-        const owned_provider = try provider_factory.makeProviderWithOptions(
+        var owned_provider = try provider_factory.makeProviderWithOptions(
             allocator,
             config.provider_kind,
             api_key,
@@ -1358,6 +1379,7 @@ pub const AgentSession = struct {
             .{ .auth_scheme = config.auth_scheme, .limits = null },
         );
         errdefer owned_provider.deinit();
+        if (config.reasoning_effort) |effort| try owned_provider.provider().setReasoningEffort(effort);
 
         // collision detection:锁下原子注册,冲突则重新生成;重试超限 = 生成器故障,
         // 报不可达级错误而非无限循环。创建失败由 errdefer 回滚注册。
@@ -1393,6 +1415,7 @@ pub const AgentSession = struct {
             .openai_protocol = config.openai_protocol,
             .auth_scheme = config.auth_scheme,
             .provider = owned_provider,
+            .reasoning_effort = config.reasoning_effort,
             .conversation = conversation,
             .workspace = workspace,
             .artifact_root = artifact_root,
@@ -1438,6 +1461,7 @@ pub const AgentSession = struct {
             .cwd = self.workspace.root,
             .project_root = self.workspace.root,
             .home = self.workspace.home,
+            .additional_dirs = self.workspace.additional_dirs,
         };
         // The same settings the Bash tool wraps with (`.sandbox` in run
         // options): autoAllowBashIfSandboxed allows only a call they really
@@ -1613,6 +1637,11 @@ pub const AgentSession = struct {
             return err;
         };
         errdefer replacement_provider.deinit();
+        // A fresh client starts at the provider default; carry the Session's
+        // effort over. The replacement has the same provider kind, whose
+        // client accepted this effort when it was set, so it has the setter.
+        if (self.reasoning_effort) |effort|
+            replacement_provider.provider().setReasoningEffort(effort) catch unreachable;
 
         self.mutex.lock();
         std.debug.assert(self.state == .mutating);
@@ -1725,6 +1754,66 @@ pub const AgentSession = struct {
         std.debug.assert(self.state == .mutating);
         self.state = .idle;
         self.mutex.unlock();
+    }
+
+    /// Replace the Session's additional working directories at the idle
+    /// mutation boundary. Every directory is validated and resolved before
+    /// the Session changes; on error the previous set stays in force. The
+    /// next permission decision and Run use the new set.
+    pub fn setAdditionalDirectories(
+        self: *AgentSession,
+        dirs: []const []const u8,
+    ) AdditionalDirectoriesMutationError!void {
+        // `workspace.root` is fixed at create, so resolving outside the gate
+        // reads nothing a mutation could change.
+        const replacement = try workspace_mod.resolveAdditionalDirs(self.allocator, self.workspace.root, dirs);
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            workspace_mod.freeDirs(self.allocator, replacement);
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                workspace_mod.freeDirs(self.allocator, replacement);
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                workspace_mod.freeDirs(self.allocator, replacement);
+                return error.InvalidSessionState;
+            },
+        }
+        // Idle under the lock: no Run, compact or checkpoint borrows the set.
+        const previous = self.workspace.additional_dirs;
+        self.workspace.additional_dirs = replacement;
+        self.permission_ctx.match_ctx.additional_dirs = replacement;
+        self.mutex.unlock();
+        workspace_mod.freeDirs(self.allocator, previous);
+    }
+
+    /// Replace the Session's reasoning effort at the idle mutation boundary;
+    /// null returns the provider to its default. The next provider request
+    /// carries it, and `setModel` keeps it.
+    pub fn setReasoningEffort(
+        self: *AgentSession,
+        effort: ?types.ReasoningEffort,
+    ) ReasoningEffortMutationError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.in_flight_provider_cancels != 0) return error.SessionBusy;
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => return error.SessionBusy,
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+        // Idle under the lock: the setter only stores a field on a provider
+        // no Run is reading.
+        if (effort == null and self.reasoning_effort == null) return;
+        try self.provider.provider().setReasoningEffort(effort);
+        self.reasoning_effort = effort;
     }
 
     /// The Host rule set as it was imported, rule for rule and in order.
@@ -2190,6 +2279,7 @@ pub const AgentSession = struct {
                 .emit_tool_cards = true,
                 .project_dir = self.workspace.root,
                 .cwd_abs = self.workspace.root,
+                .additional_dirs = self.workspace.additional_dirs,
                 .resolve_relative_paths = true,
                 .home_dir = self.workspace.home,
                 .state_root = self.workspace.state_root,

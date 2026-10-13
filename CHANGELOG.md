@@ -10,6 +10,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- Two more Session settings a source-level Host can change while idle.
+  `SessionConfig.reasoning_effort` and `AgentSession.setReasoningEffort` set
+  the effort every provider request carries; `setModel` keeps it, and a
+  provider without an effort control refuses a non-null value at create.
+  `WorkspaceConfig.additional_dirs` and `AgentSession.setAdditionalDirectories`
+  give a Session further working directories: `accept_edits` approves
+  Write/Edit/NotebookEdit there and a sandboxed shell may write there, exactly
+  as for the workspace root. A replacement is validated before the Session
+  changes. doc/API.md now tabulates which settings are idle-mutable, which
+  need a new Runtime generation, and which are fixed at create.
+
 ### Changed
 
 - Breaking for source-level embedders: `transcript.Writer.init` and

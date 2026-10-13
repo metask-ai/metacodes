@@ -553,6 +553,26 @@ its context, the provider credentials, and `workspace_root` alive until the Sess
 is destroyed. Use `RuntimeHost.replace` for a staged generation change; do not
 mutate a live Session's tool catalog directly.
 
+### Session configuration classes
+
+Each setting belongs to the Session that was configured with it, and changes
+in one of four ways:
+
+| Class | Settings | How it changes |
+|---|---|---|
+| Idle-mutable | model, permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value. |
+| Runtime generation | built-in tool set, static and process plugins, provider dialects | `RuntimeHost.replace`. Sessions created afterwards use the new generation; existing Sessions stay on theirs. To move a Session, persist it and restore it with `createRestoredSession` on the new generation. |
+| Fixed at create | provider kind, OpenAI protocol, auth scheme, API key, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
+| Identity | Session ID | Never; a restore reuses it. |
+
+`SessionConfig.reasoning_effort` is carried by every provider request and kept
+across `setModel`; a provider without an effort control (Gemini) refuses a
+non-null value with `error.AgentEffortUnsupportedProvider`.
+`WorkspaceConfig.additional_dirs` widens exactly what the workspace root grants:
+`accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
+writes. It is not named in the system prompt. These two are source-level only;
+AgentCore revision 19 does not carry them.
+
 Static trusted plugins can contribute typed tools, streaming tools, services,
 advisory policies, and deterministic provider dialects. Process plugins can only
 contribute isolated tools through the versioned wire protocol. Neither receives a
