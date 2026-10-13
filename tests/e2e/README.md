@@ -5,14 +5,17 @@
 > ⚠️ 这不是单元/L2 测试。它需要**真网络 + 真 token**、消耗真实 model 用量,**不进默认 CI**。
 > 单元/L2 测试仍走 `zig build test`。
 
-TinyKG 另有一个不调用模型的真进程启动恢复烟测：
+TinyKG 另有一个不调用模型的真进程启动恢复烟测(`zig build test` 在 POSIX 上自动跑):
 
 ```bash
-tests/e2e/process_dag_resume_smoke.sh
+zig build tinykg:stage && tests/e2e/process_dag_resume_smoke.sh
 ```
 
-它用两个全新的 metacodes 进程和同一个宿主注入 session id，断言第二个进程在
-`--dump-prompt` 阶段已从持久 store 恢复当前租约的 bounded task packet。
+它先按 doc/TINYKG_INTEGRATION.md 的手动方式为临时 HOME 起本地服务(`kg install` +
+`kgd`),经服务的 `/api/run`(`tests/e2e/kgd_api.py`)写入一个以宿主注入 session id 认领的
+任务,再用全新的 metacodes 进程断言它发出的第一个 API 请求带着该任务的 bounded
+"Active task recovery packet"。会话关掉 autostart、清掉所有 `METACODES_KG_*` 覆盖,只走
+这个服务;退出时停掉服务,并在有 TinyKG 进程残留时失败。
 
 ## 它怎么工作
 

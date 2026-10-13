@@ -2523,6 +2523,21 @@ pub fn build(b: *std.Build) void {
                 memory_runtime_smoke.addFileArg(tinykg.artifact);
                 eval_test_step.dependOn(&memory_runtime_smoke.step);
                 test_step.dependOn(&memory_runtime_smoke.step);
+
+                // Startup/resume over a persistent store: two fresh processes and
+                // the state root's local service (`kg install` + `kgd`), which
+                // resolves the TinyKG bundle beside the installed executable, so
+                // the smoke runs the installed layout. It stops what it starts.
+                // Unwired, it rotted for weeks: it kept writing the store the
+                // sessions had stopped reading once the service became the path.
+                if (staged_tinykgd) |daemon| {
+                    const process_resume_smoke = b.addSystemCommand(&.{ "bash", "tests/e2e/process_dag_resume_smoke.sh" });
+                    process_resume_smoke.step.dependOn(b.getInstallStep());
+                    process_resume_smoke.step.dependOn(tinykg.install_step);
+                    process_resume_smoke.step.dependOn(daemon.install_step);
+                    process_resume_smoke.setEnvironmentVariable("METACODES_PROCESS_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
+                    test_step.dependOn(&process_resume_smoke.step);
+                }
             }
         }
         // The native REPL smoke (scripts/eval/tests/test_native_runtime.py)

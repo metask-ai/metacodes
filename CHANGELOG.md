@@ -98,6 +98,15 @@ status, compatibility boundaries, and entry points are defined by
   no longer opens and closes a connection before the request. A TinyKG
   service that fails to start after `tinykgd` has answered no longer leaks
   the bridge's read buffer: the supervisor stopped the copy it moved from.
+- The TinyKG startup/resume smoke (`tests/e2e/process_dag_resume_smoke.sh`)
+  works again and runs in `zig build test` on POSIX hosts. It still seeded
+  tasks into the store the command-line transport uses, which sessions stopped
+  reading when the local service became their path, so it failed before its
+  check on every run and left a `kgd` behind. It now starts the state root's
+  service itself (`kg install` + `kgd`), seeds through the service's
+  `/api/run` (`tests/e2e/kgd_api.py`), runs the sessions with autostart off and
+  every `METACODES_KG_*` override removed, stops the service on exit and fails
+  if any TinyKG process is left.
 
 ## 0.5.0 — 2026-10-11
 
