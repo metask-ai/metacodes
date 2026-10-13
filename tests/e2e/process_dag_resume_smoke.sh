@@ -83,7 +83,7 @@ HOME="$home" "$BIN" --state-dir "$state" kg install >"$tmp/kg-install.out" 2>&1 
   { cat "$tmp/kg-install.out" >&2; exit 3; }
 HOME="$home" "$BIN" --state-dir "$state" kgd >"$tmp/kgd.log" 2>&1 &
 kgd_pid=$!
-"${KGD_API[@]}" ready "$state" --wait 30 || { cat "$tmp/kgd.log" >&2; exit 3; }
+"${KGD_API[@]}" ready "$state" --wait 60 || { cat "$tmp/kgd.log" >&2; exit 3; }
 
 # A first process creates the per-project pointer directory (and, with a ready
 # service, its task anchor).
@@ -117,13 +117,25 @@ fi
 kg task-claim "$child" --by "$session_id" >/dev/null
 
 # A genuinely fresh process must inject the bounded packet into its first API request.
-python3 "$ROOT/tests/e2e/capture_sse_once.py" "$tmp/request.json" "$tmp/base-url" &
+python3 "$ROOT/tests/e2e/capture_sse_once.py" "$tmp/request.json" "$tmp/base-url" 2>"$tmp/capture.err" &
 server_pid=$!
-for _ in {1..250}; do
-  [[ -s "$tmp/base-url" ]] && break
-  sleep 0.02
+# A loaded host (`zig build test` runs this beside the whole suite) can take
+# seconds to start an interpreter: give up only when the server has died or
+# after a minute, and wait for the whole URL line, not just a first byte.
+deadline=$((SECONDS + 60))
+until grep -qs '/v1/messages$' "$tmp/base-url"; do
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    echo "capture server exited before it listened:" >&2
+    cat "$tmp/capture.err" >&2
+    exit 5
+  fi
+  if ((SECONDS >= deadline)); then
+    echo "capture server did not listen within 60 s" >&2
+    cat "$tmp/capture.err" >&2
+    exit 5
+  fi
+  sleep 0.05
 done
-[[ -s "$tmp/base-url" ]] || { echo "capture server did not start" >&2; exit 5; }
 base_url="$(tr -d '[:space:]' <"$tmp/base-url")"
 session --base-url "$base_url" --permission bypassPermissions \
   -p "continue the claimed task" >"$tmp/resumed.out" 2>"$tmp/resumed.err" || true
