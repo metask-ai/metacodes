@@ -635,6 +635,11 @@ leaving every Host to rebuild them:
 
 Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`.
 Authentication, tenancy, idempotency and the transport stay with the Host.
+To stream a Session's journal over SSE, parse the client's position with
+`event_journal.Cursor.fromLastEventId` / `fromSince`, start from
+`EventJournal.planResume(cursor)` (send `resync` when it reports a restart),
+and label lines with `EventJournal.eventId` — the rule the bundled `--web`
+server uses.
 
 Static trusted plugins can contribute typed tools, streaming tools, services,
 advisory policies, and deterministic provider dialects. Process plugins can only

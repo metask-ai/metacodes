@@ -46,6 +46,66 @@ fn newEpoch() u64 {
 }
 var epoch_counter = std.atomic.Value(u64).init(0);
 
+/// Where a reader resumes, as its client named it: the first seq it has not
+/// seen, and the journal epoch that seq belongs to.
+pub const Cursor = struct {
+    next: usize = 0,
+    epoch: Epoch = .unnamed,
+
+    pub const Epoch = union(enum) {
+        /// A client predating epochs, or one starting fresh.
+        unnamed,
+        named: u64,
+        /// Named, but not 16 hex digits: it cannot be this journal's.
+        unreadable,
+    };
+
+    /// An SSE `Last-Event-ID`: `<epoch hex>-<seq>`, or a bare `<seq>` from a
+    /// client predating epochs. Resumes after it. Anything unparseable starts
+    /// over. **saturating +1**:id 来自客户端(可伪造 usize max),`+|` 饱和到 max
+    /// → 超出 journal 末尾,按 cursor_ahead 整体重放,坏输入不崩进程。
+    pub fn fromLastEventId(raw: []const u8) Cursor {
+        const id = std.mem.trim(u8, raw, " ");
+        if (std.mem.indexOfScalar(u8, id, '-')) |dash| {
+            const last = std.fmt.parseInt(usize, id[dash + 1 ..], 10) catch return .{};
+            return .{ .next = last +| 1, .epoch = parseEpoch(id[0..dash]) };
+        }
+        const last = std.fmt.parseInt(usize, id, 10) catch return .{};
+        return .{ .next = last +| 1 };
+    }
+
+    /// `since` is the next seq (e.g. `?since=N&epoch=E`). An unparseable
+    /// `since` starts over.
+    pub fn fromSince(since: []const u8, epoch: ?[]const u8) Cursor {
+        return .{
+            .next = std.fmt.parseInt(usize, since, 10) catch 0,
+            .epoch = if (epoch) |text| parseEpoch(text) else .unnamed,
+        };
+    }
+
+    fn parseEpoch(text: []const u8) Epoch {
+        if (text.len != 16) return .unreadable;
+        return .{ .named = std.fmt.parseInt(u64, text, 16) catch return .unreadable };
+    }
+};
+
+/// Why a reader's cursor could not be continued.
+pub const RestartReason = enum {
+    /// The cursor belongs to another journal: the host restarted or the
+    /// session was rebuilt.
+    epoch_changed,
+    /// The cursor lies past this journal's end, which no client of this
+    /// journal can have seen.
+    cursor_ahead,
+};
+
+pub const ResumePlan = struct {
+    /// First seq to send.
+    from: usize,
+    /// Set when the client must start its view over.
+    restart: ?RestartReason,
+};
+
 pub const EventJournal = struct {
     allocator: std.mem.Allocator,
     /// Fixed at init; see the module comment.
@@ -135,6 +195,27 @@ pub const EventJournal = struct {
         var out: [16]u8 = undefined;
         _ = std.fmt.bufPrint(&out, "{x:0>16}", .{self.epoch}) catch unreachable;
         return out;
+    }
+
+    /// The SSE id of line `seq`: `<epoch hex>-<seq>`, what `Cursor.fromLastEventId` reads back.
+    pub fn eventId(self: *const EventJournal, buffer: *[40]u8, seq: usize) []const u8 {
+        return std.fmt.bufPrint(buffer, "{x:0>16}-{d}", .{ self.epoch, seq }) catch unreachable;
+    }
+
+    /// Where a reader with `cursor` resumes. A cursor from another journal
+    /// (another or an unreadable epoch) or past this journal's end cannot be
+    /// continued: it restarts from the oldest kept line, and the reason tells
+    /// the client to start its view over. Lines evicted under a cursor that
+    /// can be continued show up later, as `waitSinceFrom`'s effective start.
+    pub fn planResume(self: *EventJournal, cursor: Cursor) ResumePlan {
+        const restart: ?RestartReason = switch (cursor.epoch) {
+            .named => |named| if (named != self.epoch) .epoch_changed else null,
+            .unreadable => .epoch_changed,
+            .unnamed => null,
+        };
+        if (restart orelse (if (cursor.next > self.count()) RestartReason.cursor_ahead else null)) |reason|
+            return .{ .from = self.firstSeq(), .restart = reason };
+        return .{ .from = cursor.next, .restart = null };
     }
 
     /// 关闭(session 结束):唤醒所有 waitSince,让 SSE 连接收尾退出。
@@ -414,4 +495,30 @@ test "epoch: two journals of one process differ; hex form is 16 lowercase digits
     const hex = first.epochHex();
     for (hex) |c| try testing.expect(std.ascii.isDigit(c) or (c >= 'a' and c <= 'f'));
     try testing.expectEqual(first.epoch, try std.fmt.parseInt(u64, &hex, 16));
+}
+
+test "Cursor: Last-Event-ID 与 since 两种来源;epoch 解析;恶意 usize max 饱和不溢出" {
+    try testing.expectEqualDeep(Cursor{ .next = 10 }, Cursor.fromLastEventId("9"));
+    try testing.expectEqualDeep(Cursor{ .next = 10, .epoch = .{ .named = 0xff } }, Cursor.fromLastEventId("00000000000000ff-9"));
+    try testing.expectEqualDeep(Cursor{ .next = 10, .epoch = .unreadable }, Cursor.fromLastEventId("ff-9"));
+    try testing.expectEqualDeep(Cursor{}, Cursor.fromLastEventId("junk"));
+    try testing.expectEqual(std.math.maxInt(usize), Cursor.fromLastEventId("18446744073709551615").next);
+    try testing.expectEqualDeep(Cursor{ .next = 42 }, Cursor.fromSince("42", null));
+    try testing.expectEqualDeep(Cursor{ .next = 42, .epoch = .{ .named = 0xabc } }, Cursor.fromSince("42", "0000000000000abc"));
+    try testing.expectEqualDeep(Cursor{ .next = 0, .epoch = .unreadable }, Cursor.fromSince("abc", "nope"));
+}
+
+test "planResume: 本 journal 游标续接;他 epoch / 不可读 epoch / 超出末尾 → 从最老保留行重来;eventId 往返" {
+    var j = EventJournal.initWithLimits(testing.allocator, 3, 1 << 20);
+    defer j.deinit();
+    for (0..5) |_| j.append("x"); // seq 0..4,保留 2..4
+    try testing.expectEqualDeep(ResumePlan{ .from = 3, .restart = null }, j.planResume(.{ .next = 3, .epoch = .{ .named = j.epoch } }));
+    try testing.expectEqualDeep(ResumePlan{ .from = 2, .restart = .epoch_changed }, j.planResume(.{ .next = 3, .epoch = .{ .named = j.epoch +% 1 } }));
+    try testing.expectEqualDeep(ResumePlan{ .from = 2, .restart = .epoch_changed }, j.planResume(.{ .next = 3, .epoch = .unreadable }));
+    try testing.expectEqualDeep(ResumePlan{ .from = 2, .restart = .cursor_ahead }, j.planResume(.{ .next = 6 }));
+    // 淘汰(cursor 落后保留窗)不是 restart:waitSinceFrom 之后报 effective start。
+    try testing.expectEqualDeep(ResumePlan{ .from = 0, .restart = null }, j.planResume(.{}));
+    var buffer: [40]u8 = undefined;
+    const id = j.eventId(&buffer, 4);
+    try testing.expectEqualDeep(Cursor{ .next = 5, .epoch = .{ .named = j.epoch } }, Cursor.fromLastEventId(id));
 }
