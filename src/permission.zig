@@ -29,6 +29,16 @@ pub const Rule = rule_matcher_mod.Rule;
 pub const MergedSettings = settings_mod.MergedSettings;
 pub const MatchContext = rule_spec_mod.MatchContext;
 
+/// How far an "allow always" answer reaches.
+pub const AlwaysAllowScope = enum {
+    /// This Session's `session_rules` only. Nothing is written to disk.
+    session,
+    /// Also appended to `<project>/.claude/settings.local.json` (or
+    /// `<home>/.claude/settings.json` outside a project), which the App's
+    /// settings loader reads on its next start.
+    settings_file,
+};
+
 /// 旧版 PermissionContext。新 decision.Context 更简洁，但此处保留字段兼容 agent_loop。
 pub const PermissionContext = struct {
     /// 权限模式。跨线程读写(主线程 agent_loop 读 / plan_mode 工具写 / 生成期 watcher
@@ -56,6 +66,13 @@ pub const PermissionContext = struct {
     /// Session 级权限记忆(always-allow / session-deny)。指针:*const ctx 仍可经它 remember。
     /// null = 无记忆(单测/库消费者不接)→ 每次都问。每 session 一个实例(多 Session 不串台)。
     session_rules: ?*@import("permission/session_rules.zig").SessionRules = null,
+    /// Where an "allow always" answer is remembered beyond `session_rules`.
+    /// The default keeps it in the Session: an embedding Host owns its
+    /// permission store and imports rules through
+    /// `AgentSession.updatePermissionRules`. Only a product that reads the
+    /// settings files back (App, via permission/loader.zig) opts into
+    /// `settings_file`.
+    always_allow: AlwaysAllowScope = .session,
     /// Optional consumer-owned decision seam. AgentCore uses it; CLI/App leave
     /// it null so their existing Permission behavior is unchanged.
     decision_override: ?PermissionDecisionOverride = null,

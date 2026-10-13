@@ -56,6 +56,18 @@ pub const Source = enum {
     }
 };
 
+/// A state root, as a type of its own. A home directory and the state root
+/// below it are both absolute paths, so the functions that lay files out under
+/// the root (`transcript.sessionDir`, `transcript.Writer.init`,
+/// `transcript.listSessions`) take this rather than a bare `[]const u8`:
+/// handing them `$HOME` is then a compile error instead of a directory one
+/// level off. An embedding Host gets it from `WorkspacePolicy.stateRoot()`,
+/// the CLI from `resolve()`.
+pub const StateRoot = struct {
+    /// Absolute path, borrowed from whoever resolved it.
+    path: []const u8,
+};
+
 pub const Resolved = struct {
     path: []const u8,
     source: Source,

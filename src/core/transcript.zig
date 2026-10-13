@@ -37,6 +37,7 @@ const sync = @import("platform").sync;
 
 const session_id_mod = @import("session_id.zig");
 pub const SessionId = session_id_mod.SessionId;
+pub const StateRoot = @import("../util/state_root.zig").StateRoot;
 
 /// Recovery must remain bounded even when a hand-edited or corrupted session
 /// contains an unbounded line. Normal sessions are far smaller; this is a
@@ -56,6 +57,27 @@ pub fn hashCwd(cwd: []const u8) [16]u8 {
     var out: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&out, "{x:0>16}", .{h}) catch unreachable;
     return out;
+}
+
+/// `<state root>/projects/<hashCwd(cwd)>`, caller-owned: the sessions of one
+/// working directory.
+pub fn projectDir(allocator: std.mem.Allocator, state_root: StateRoot, cwd: []const u8) error{OutOfMemory}![]u8 {
+    const cwd_hash = hashCwd(cwd);
+    return std.fmt.allocPrint(allocator, "{s}/projects/{s}", .{ state_root.path, cwd_hash[0..] });
+}
+
+/// `<state root>/projects/<hashCwd(cwd)>/<sid>`, caller-owned: the directory
+/// `loadTranscript` reads and `Writer` appends to. The one definition of the
+/// layout; a Host resuming a Session derives the path here instead of
+/// spelling it out, so both sides cannot drift apart.
+pub fn sessionDir(
+    allocator: std.mem.Allocator,
+    state_root: StateRoot,
+    cwd: []const u8,
+    sid: SessionId,
+) error{OutOfMemory}![]u8 {
+    const cwd_hash = hashCwd(cwd);
+    return std.fmt.allocPrint(allocator, "{s}/projects/{s}/{s}", .{ state_root.path, cwd_hash[0..], sid.bytes[0..] });
 }
 
 pub const Metadata = struct {
@@ -87,16 +109,13 @@ pub const Writer = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         cwd: []const u8,
-        /// The host's state root (util/state_root.zig).
-        state_root: []const u8,
+        /// The host's state root (util/state_root.zig), not its home.
+        state_root: StateRoot,
         model: []const u8,
         /// 会话 id(由 App 传入,统一 App.session_id 与 transcript 目录名)。
         sid: SessionId,
     ) !Writer {
-        const cwd_hash = hashCwd(cwd);
-
-        // 构造路径 <state_root>/projects/<cwd_hash>/<session_id>/
-        const dir = try std.fmt.allocPrint(allocator, "{s}/projects/{s}/{s}", .{ state_root, cwd_hash[0..], sid.bytes[0..] });
+        const dir = try sessionDir(allocator, state_root, cwd, sid);
         errdefer allocator.free(dir);
 
         // mkdir -p 递归
@@ -762,10 +781,11 @@ pub const SessionListEntry = struct {
 
 /// 扫项目目录下所有 session，返回按 last_modified 降序的数组。
 /// 调用方负责 free 每个 entry 的各字段和 slice。
-pub fn listSessions(cwd: []const u8, state_root: []const u8, allocator: std.mem.Allocator) ![]SessionListEntry {
-    const cwd_hash = hashCwd(cwd);
-    var root_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const root_path = try std.fmt.bufPrint(&root_buf, "{s}/projects/{s}\x00", .{ state_root, cwd_hash[0..] });
+pub fn listSessions(cwd: []const u8, state_root: StateRoot, allocator: std.mem.Allocator) ![]SessionListEntry {
+    const project_dir = try projectDir(allocator, state_root, cwd);
+    defer allocator.free(project_dir);
+    const root_path = try allocator.dupeZ(u8, project_dir);
+    defer allocator.free(root_path);
 
     // 打开目录(可移植遍历)
     var it = pdir.open(@ptrCast(root_path.ptr)) orelse {
@@ -795,7 +815,7 @@ pub fn listSessions(cwd: []const u8, state_root: []const u8, allocator: std.mem.
         if (std.mem.eql(u8, &parsed_id.bytes, &SessionId.single.bytes)) continue;
         // 不判断 is_dir 兼容性——后面 readMeta 失败会跳过
 
-        const full_path = try std.fmt.allocPrint(allocator, "{s}/projects/{s}/{s}", .{ state_root, cwd_hash[0..], name });
+        const full_path = try sessionDir(allocator, state_root, cwd, parsed_id);
         errdefer allocator.free(full_path);
 
         // 读 meta.json
@@ -948,7 +968,7 @@ test "write then load roundtrip" {
         a.free(tmp_home);
     }
 
-    var writer = try Writer.init(a, "/dummy/cwd", tmp_home, "claude-sonnet-4-20250514", genSessionId());
+    var writer = try Writer.init(a, "/dummy/cwd", .{ .path = tmp_home }, "claude-sonnet-4-20250514", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -979,7 +999,7 @@ test "delivery watermark round-trip:消息级与块级 delivered 随 transcript 
     const tmp_home = util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-delivered-rt");
     @import("../util/fs.zig").testing.rmrfBestEffort(tmp_home);
     defer @import("../util/fs.zig").testing.rmrfBestEffort(tmp_home);
-    var writer = try Writer.init(a, "/dummy", tmp_home, "m", genSessionId());
+    var writer = try Writer.init(a, "/dummy", .{ .path = tmp_home }, "m", genSessionId());
     defer writer.deinit();
     {
         var conv = Conversation.init(a);
@@ -1043,7 +1063,7 @@ test "A:compact 投影状态 round-trip(flush 存 meta → load 恢复 boundary/
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
     }
-    var writer = try Writer.init(a, "/dummy/cwd", tmp_home, "claude-sonnet", genSessionId());
+    var writer = try Writer.init(a, "/dummy/cwd", .{ .path = tmp_home }, "claude-sonnet", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -1078,7 +1098,7 @@ test "A:未压缩 session 兼容(meta 无投影字段 → boundary=0/summary=nul
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
     }
-    var writer = try Writer.init(a, "/dummy/cwd", tmp_home, "claude-sonnet", genSessionId());
+    var writer = try Writer.init(a, "/dummy/cwd", .{ .path = tmp_home }, "claude-sonnet", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -1107,7 +1127,7 @@ test "write tool_use and tool_result roundtrip" {
         a.free(tmp_home);
     }
 
-    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet", genSessionId());
+    var writer = try Writer.init(a, "/dummy", .{ .path = tmp_home }, "claude-sonnet", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -1153,7 +1173,7 @@ test "listSessions orders by last_modified desc" {
     // 写三个 session
     var i: usize = 0;
     while (i < 3) : (i += 1) {
-        var w = try Writer.init(a, "/project-X", tmp_home, "m", genSessionId());
+        var w = try Writer.init(a, "/project-X", .{ .path = tmp_home }, "m", genSessionId());
         defer w.deinit();
         var conv = Conversation.init(a);
         defer conv.deinit();
@@ -1165,7 +1185,7 @@ test "listSessions orders by last_modified desc" {
         util_time.sleepMs(2);
     }
 
-    const list = try listSessions("/project-X", tmp_home, a);
+    const list = try listSessions("/project-X", .{ .path = tmp_home }, a);
     defer freeSessionList(list, a);
 
     try std.testing.expect(list.len == 3);
@@ -1187,7 +1207,7 @@ test "image + thinking 块 transcript roundtrip(issue #10 会话恢复语义)" {
         a.free(tmp_home);
     }
 
-    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet", genSessionId());
+    var writer = try Writer.init(a, "/dummy", .{ .path = tmp_home }, "claude-sonnet", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -1240,7 +1260,7 @@ test "reasoning_item 块 transcript roundtrip(issue #23 跨 resume 的推理续�
         a.free(tmp_home);
     }
 
-    var writer = try Writer.init(a, "/dummy", tmp_home, "gpt-5.2", genSessionId());
+    var writer = try Writer.init(a, "/dummy", .{ .path = tmp_home }, "gpt-5.2", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -1284,7 +1304,7 @@ test "title_guess: 纯图首条不锁死标题,后续 user text 胜出;全程无
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
     }
-    var writer = try Writer.init(a, "/dummy", tmp_home, "m", genSessionId());
+    var writer = try Writer.init(a, "/dummy", .{ .path = tmp_home }, "m", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -1339,7 +1359,7 @@ test "旧的含 PDF 会话:明确拒绝,且绝不半读(撤回兼容策略)" {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
     }
-    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4", genSessionId());
+    var writer = try Writer.init(a, "/dummy", .{ .path = tmp_home }, "claude-sonnet-4", genSessionId());
     defer writer.deinit();
 
     // 手写一份 revision-16 时代写下的 transcript:两条正常消息 + 一条 document 块。
@@ -1373,7 +1393,7 @@ test "回退边界:thinking round-trip 与 [image] 标题兜底必须完好" {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
     }
-    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4", genSessionId());
+    var writer = try Writer.init(a, "/dummy", .{ .path = tmp_home }, "claude-sonnet-4", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -1442,7 +1462,7 @@ test "原子提交:任意分配点失败都不留半填充、不二次释放(Fai
         util_fs.testing.rmrfBestEffort(tmp_home);
         base.free(tmp_home);
     }
-    var writer = try Writer.init(base, "/dummy", tmp_home, "claude-sonnet-4", genSessionId());
+    var writer = try Writer.init(base, "/dummy", .{ .path = tmp_home }, "claude-sonnet-4", genSessionId());
     defer writer.deinit();
     {
         var conv = Conversation.init(base);

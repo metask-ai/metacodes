@@ -117,7 +117,7 @@ test "issue#10 e2e: transcript resume 后图像仍到达请求(恢复语义活�
     const tmp_home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-mm-resume-l2");
     cc.util_fs.testing.rmrfBestEffort(tmp_home);
     defer cc.util_fs.testing.rmrfBestEffort(tmp_home);
-    var writer = try cc.transcript.Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4-20250514", cc.transcript.genSessionId());
+    var writer = try cc.transcript.Writer.init(a, "/dummy", .{ .path = tmp_home }, "claude-sonnet-4-20250514", cc.transcript.genSessionId());
     defer writer.deinit();
 
     {

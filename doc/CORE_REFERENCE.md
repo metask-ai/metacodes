@@ -79,7 +79,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 | `tool_exec` | 工具批量执行(按并发安全分批;每 job 独立 arena + per-worker 值拷贝 ctx) | `executeSlots`, `Slot` |
 | `tools` | 工具注册表 + dispatch(静态 + 动态 Skill/MCP) | `dispatch`, `registry`, `isConcurrencySafe(Input)` |
 | `tools/context` | `ToolContext`——工具执行时拿到的全部依赖 + 接口回调 | `ToolContext`, `SkillActivator`, `ToolActivator`, `WorktreeHook`, `ToolProgressReporter` |
-| `transcript` | 对话持久化(JSONL per-turn)+ 重建 | `Writer`, `loadTranscript` |
+| `transcript` | 对话持久化(JSONL per-turn)+ 重建 | `Writer`, `loadTranscript`, `sessionDir` |
 | `session_id` | session 身份值类型(多 session 基石) | `SessionId`, `.single`, `gen()` |
 | `permission*` | 权限决策链(模式 + 规则 + 沙箱 + UI 请求) | `PermissionContext`, decision/settings/session_rules |
 | `agents` / `skills` / `mcp` / `sandbox` | subagent 定义 / Skill / MCP 客户端 / Seatbelt 沙箱 | `AgentSet`, `SkillSet`, `mcp_client`, `sandbox_config` |

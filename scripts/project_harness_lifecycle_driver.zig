@@ -195,7 +195,7 @@ fn prepare(init: std.process.Init, allocator: std.mem.Allocator, options: Option
     var writer = try cc.transcript.Writer.init(
         allocator,
         project_root,
-        state_root,
+        .{ .path = state_root },
         if (options.rule_flavor == .evolved) "e2-zero-provider" else "e3-static-template",
         sid,
     );

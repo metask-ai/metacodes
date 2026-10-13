@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- Breaking for source-level embedders: `transcript.Writer.init` and
+  `transcript.listSessions` take the state root as a `StateRoot`
+  (`util/state_root.zig`) instead of a `[]const u8`. On 2026-10-01 the third
+  `Writer.init` parameter changed meaning from home to state root while keeping
+  its type, so a Host that still passed `$HOME` compiled and wrote transcripts
+  one level off from where it resumed them. New `transcript.sessionDir` and
+  `transcript.projectDir` are the only definitions of the layout, and
+  `WorkspacePolicy.stateRoot()` returns the root an `AgentSession` resolved;
+  doc/LIB_API.md shows the write and resume paths.
+
 - Release and reopen PRs no longer re-run the full CI. A `Release fast path`
   job (`scripts/release_fast_path.py`) checks that the PR's merge commit adds
   only what `scripts/release_cut.py` generates from its base, regenerated in a
@@ -39,6 +49,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- An embedded `AgentSession` keeps "allow always" in the Session. Answering
+  a Host permission prompt with `allow_always` also appended a whole-tool
+  grant to `<workspace>/.claude/settings.local.json`, a file no AgentSession
+  reads but the next CLI started in that workspace does, so one click in a
+  web or cloud UI became a lasting grant for every later CLI session there.
+  `PermissionContext.always_allow` now defaults to `session`; only the App
+  (CLI, TUI, `--web`) opts into `settings_file`.
 - The installer no longer downgrades an install silently. `scripts/install.sh`
   passes `--upgrade` on every run and fetches whatever GitHub labels the latest
   release, and `metacodes install --upgrade` replaced any other version, so a

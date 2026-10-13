@@ -742,7 +742,7 @@ test "L2 ㉓: transcript resume 后(送达标记随 transcript 持久化)请求�
     const tmp_home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-image-cap-resume-l2");
     cc.util_fs.testing.rmrfBestEffort(tmp_home);
     defer cc.util_fs.testing.rmrfBestEffort(tmp_home);
-    var writer = try cc.transcript.Writer.init(a, "/dummy", tmp_home, "claude-sonnet-4-20250514", cc.transcript.genSessionId());
+    var writer = try cc.transcript.Writer.init(a, "/dummy", .{ .path = tmp_home }, "claude-sonnet-4-20250514", cc.transcript.genSessionId());
     defer writer.deinit();
     {
         // 会话 A:两轮已被回复的图片 + 新的 user 提问,落盘。

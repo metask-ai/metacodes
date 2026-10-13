@@ -704,6 +704,9 @@ pub const App = struct {
         // Session 级权限记忆挂到 permission_ctx(persist 路径复用 match_ctx.home/project_root,
         // 在 settings 加载处统一设,无需独立 persist context)。
         app.permission_ctx.session_rules = &app.session_rules;
+        // The App's settings loader reads `.claude/settings*.json` back on the
+        // next start, so here an "allow always" answer may outlive the Session.
+        app.permission_ctx.always_allow = .settings_file;
         app.permission_ctx.session = app.session_id; // 权限对话框路由到本会话视图(M5/M6)
 
         // Model-facing Skill is present only when the canonical snapshot has
@@ -1967,7 +1970,7 @@ pub const App = struct {
         defer app.allocator.free(cwd);
 
         // session_id 传入,使 transcript 目录名 == App.session_id(统一,不再两个独立 gen)。
-        const w = try transcript.Writer.init(app.allocator, cwd, state_dir, app.activeModel(), app.session_id);
+        const w = try transcript.Writer.init(app.allocator, cwd, .{ .path = state_dir }, app.activeModel(), app.session_id);
         app.transcript_writer = w;
     }
 

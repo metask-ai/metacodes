@@ -36,7 +36,7 @@ test "L2 transcript: 写 → loadTranscript 往返,消息数/角色/text 一致"
     try conv.appendText(.user, "second user msg");
 
     // 2) 写盘
-    var writer = try transcript.Writer.init(a, "/some/cwd", home, "claude-sonnet-4-20250514", transcript.genSessionId());
+    var writer = try transcript.Writer.init(a, "/some/cwd", .{ .path = home }, "claude-sonnet-4-20250514", transcript.genSessionId());
     const session_dir = try a.dupe(u8, writer.dir);
     defer a.free(session_dir);
     writer.flush(&conv);
@@ -76,7 +76,7 @@ test "L2 transcript: openExisting resume 续写不重复已刷盘消息" {
     defer conv.deinit();
     try conv.appendText(.user, "msg A");
     try conv.appendText(.assistant, "reply A");
-    var w1 = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
+    var w1 = try transcript.Writer.init(a, "/cwd", .{ .path = home }, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, w1.dir);
     defer a.free(dir);
     w1.flush(&conv);
@@ -112,7 +112,7 @@ test "L2 transcript: arbitrary tool bytes cannot poison the JSONL resume path" {
     const dirty = [_]u8{ 'p', 'r', 'e', 'v', 0xe4, '`' };
     try conv.appendText(.user, &dirty);
 
-    var writer = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
+    var writer = try transcript.Writer.init(a, "/cwd", .{ .path = home }, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
     defer a.free(dir);
     writer.flush(&conv);
@@ -134,7 +134,7 @@ test "L2 transcript: legacy invalid UTF-8 JSONL is repaired before resume" {
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-legacy-repair");
     _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
-    var writer = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
+    var writer = try transcript.Writer.init(a, "/cwd", .{ .path = home }, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
     defer a.free(dir);
 
@@ -170,7 +170,7 @@ test "L2 transcript: invalid UTF-8 in meta is repaired and remains listable" {
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-meta-repair");
     _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
-    var writer = try transcript.Writer.init(a, "/meta-repair-cwd", home, "m", transcript.genSessionId());
+    var writer = try transcript.Writer.init(a, "/meta-repair-cwd", .{ .path = home }, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
     defer a.free(dir);
     writer.deinit();
@@ -183,7 +183,7 @@ test "L2 transcript: invalid UTF-8 in meta is repaired and remains listable" {
     try std.testing.expectEqual(@as(isize, raw.len), pfs.write(fd, raw));
     _ = pfs.close(fd);
 
-    const list = try transcript.listSessions("/meta-repair-cwd", home, a);
+    const list = try transcript.listSessions("/meta-repair-cwd", .{ .path = home }, a);
     defer transcript.freeSessionList(list, a);
     try std.testing.expectEqual(@as(usize, 1), list.len);
     try std.testing.expectEqualStrings("bad�`", list[0].title);
@@ -200,7 +200,7 @@ test "L2 transcript: torn final JSONL record is atomically discarded" {
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-torn-tail");
     _ = pfs.mkdir(home.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(home);
-    var writer = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
+    var writer = try transcript.Writer.init(a, "/cwd", .{ .path = home }, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
     defer a.free(dir);
 
@@ -260,7 +260,7 @@ test "L2 transcript R2/F1回归: /retry 回卷后 flush 全量重写,resume 不�
     try conv.appendText(.user, "q2");
     try conv.appendText(.assistant, "a2-stale"); // 将被 /retry 丢弃的旧回合
 
-    var writer = try transcript.Writer.init(a, "/some/cwd", home, "claude-sonnet-4-20250514", transcript.genSessionId());
+    var writer = try transcript.Writer.init(a, "/some/cwd", .{ .path = home }, "claude-sonnet-4-20250514", transcript.genSessionId());
     const dir = try a.dupe(u8, writer.dir);
     defer a.free(dir);
     writer.flush(&conv); // 盘上 4 条(含 a2-stale)

@@ -65,6 +65,11 @@ pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bo
                 .allow_once => return true,
                 .allow_always => {
                     if (ctx.session_rules) |sr| sr.rememberAllow(tool_name);
+                    // A Session-scoped context never writes: no loader of an
+                    // embedding Host reads the file back, so the write would
+                    // only leave a whole-tool grant in the user's workspace
+                    // for the next CLI started there.
+                    if (ctx.always_allow == .session) return true;
                     // 持久化:写到 settings.local.json(project)或 ~/.claude/settings.json。
                     // 路径上下文复用 ctx.match_ctx(project_root / home)——App init 在 ask 之前填好。
                     const home = ctx.match_ctx.home;
@@ -184,4 +189,63 @@ test "no_interactive_prompt: requester non-answer never falls back to process an
     try testing.expectEqual(@as(usize, 1), unavailable.calls);
     // The process-global answer was not consumed by the embedded Session.
     try testing.expectEqualStrings("y", answer_queue.pop().?);
+}
+
+const AllowAlwaysAnswer = struct {
+    calls: usize = 0,
+
+    fn request(
+        raw: *anyopaque,
+        _: ui_request.SessionId,
+        _: std.mem.Allocator,
+        _: *const ui_request.UiRequest,
+        out: *ui_request.UiResponse,
+    ) anyerror!ui_request.RequestOutcome {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        out.* = .{ .permission = .allow_always };
+        return .answered;
+    }
+};
+
+/// Answers "allow always" for `Bash` with `root` as both project root and
+/// home, and reports whether either settings file appeared below `root`.
+fn allowAlwaysWrites(scope: @import("../permission.zig").AlwaysAllowScope, root: []const u8) !bool {
+    const testing = std.testing;
+    var rules: @import("session_rules.zig").SessionRules = .{};
+    var answer = AllowAlwaysAnswer{};
+    var ctx = PermissionContext{
+        .allocator = testing.allocator,
+        .no_interactive_prompt = true,
+        .session_rules = &rules,
+        .always_allow = scope,
+        .ui_requester = .{ .ctx = &answer, .requestFn = AllowAlwaysAnswer.request },
+        .match_ctx = .{ .cwd = root, .project_root = root, .home = root },
+    };
+    ctx.setMode(.default);
+    try testing.expect(try ask(&ctx, "Bash", "{\"command\":\"touch x\"}"));
+    try testing.expectEqual(@as(usize, 1), answer.calls);
+    try testing.expect(rules.isAllowed("Bash"));
+
+    var local_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const local = try std.fmt.bufPrintZ(&local_buf, "{s}/.claude/settings.local.json", .{root});
+    var user_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const user = try std.fmt.bufPrintZ(&user_buf, "{s}/.claude/settings.json", .{root});
+    return pfs.exists(local.ptr) or pfs.exists(user.ptr);
+}
+
+test "allow_always: a Session-scoped context remembers the tool and writes no settings file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    try std.testing.expect(!try allowAlwaysWrites(.session, root_buf[0..len]));
+}
+
+test "allow_always: a settings_file context also writes the project settings file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    try std.testing.expect(try allowAlwaysWrites(.settings_file, root_buf[0..len]));
 }

@@ -23,6 +23,8 @@ test {
     _ = @import("component/plugin_runtime_test.zig");
     _ = @import("component/plugin_process_test.zig");
     _ = @import("component/agent_session_ui_test.zig");
+    _ = @import("component/agent_session_permission_scope_test.zig");
+    _ = @import("component/agent_session_transcript_resume_test.zig");
     _ = @import("component/skill_fork_test.zig");
     _ = @import("component/prompt_tool_coupling_test.zig");
     _ = @import("component/http_error_test.zig");

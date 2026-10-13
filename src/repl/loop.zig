@@ -4194,7 +4194,7 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     defer allocator.free(cwd);
 
     if (rest.len == 0) {
-        const list = transcript_mod.listSessions(cwd, state_dir, allocator) catch |err| {
+        const list = transcript_mod.listSessions(cwd, .{ .path = state_dir }, allocator) catch |err| {
             std.debug.print("listSessions failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -4216,7 +4216,7 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     }
 
     // rest 是 session id 或纯数字（对应列表位置 1..N）
-    const list = transcript_mod.listSessions(cwd, state_dir, allocator) catch |err| {
+    const list = transcript_mod.listSessions(cwd, .{ .path = state_dir }, allocator) catch |err| {
         std.debug.print("listSessions failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -4483,7 +4483,7 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     defer conv.deinit();
     try conv.appendText(.user, "resume me");
     const sid = transcript_mod.genSessionId();
-    var w = try transcript_mod.Writer.init(a, cwd, app.stateRoot(), "claude-sonnet-4-20250514", sid);
+    var w = try transcript_mod.Writer.init(a, cwd, .{ .path = app.stateRoot() }, "claude-sonnet-4-20250514", sid);
     w.flush(&conv);
     w.deinit();
 

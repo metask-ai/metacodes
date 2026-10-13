@@ -7,6 +7,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const sandbox_config = @import("../sandbox/config.zig");
+const StateRoot = @import("../util/state_root.zig").StateRoot;
 
 pub const ShellPolicy = enum {
     disabled,
@@ -68,6 +69,15 @@ pub const WorkspacePolicy = struct {
         self.allocator.free(self.home);
         self.allocator.free(self.root);
         self.* = undefined;
+    }
+
+    /// The state root this workspace resolved: `Config.state_root`, or
+    /// `<home>/.metacodes` when none was given. Borrowed from the policy.
+    /// A Host persisting transcripts passes it with `root` to
+    /// `transcript.sessionDir` / `transcript.Writer.init`; resolving a policy
+    /// from the same `Config` before a restore yields the same path.
+    pub fn stateRoot(self: *const WorkspacePolicy) StateRoot {
+        return .{ .path = self.state_root };
     }
 
     pub fn sandbox(self: *const WorkspacePolicy) ?*const sandbox_config.SandboxSettings {

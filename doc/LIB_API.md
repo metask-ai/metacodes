@@ -273,6 +273,44 @@ journal 的 `run_started.prompt` 记下它；与上一个 Run 不同时，Run �
 Host 事实不写进档案：`core.context_blocks` 把它们渲染成一条 `<system-reminder>`，
 作为该 Run 用户记录的首段进入 Conversation。
 
+### Session 范围的权限与 transcript 持久化
+
+权限与工作区跟着 Session 走：`SessionConfig` 的 `workspace`（root/home/state_root/
+shell）、`permission_mode`、`permission_rules`（Host 导入的规则层）和
+`ui_requester` 都是每个 Session 一份；"本会话总是允许/拒绝"记在 Session 内存的
+`session_rules` 里。`AgentSession` 不读任何 settings 文件。运行中只在 idle 边界修改：
+`setPermissionMode`、`updatePermissionRules`、`setPromptProfile`，忙时返回
+`SessionBusy`。
+
+用户在 Host 的权限框里选 `allow_always`，库路径只把该工具记进这个 Session 的
+`session_rules`：同一 Runtime、同一工作区的另一个 Session 仍会询问，磁盘上什么也不写。
+需要跨 Session 记住的 Host 在自己的 requester 里已经看到了这个选择和工具名，由它
+存进自己的权限存储，下次用 `permission_rules` 创建或用 `updatePermissionRules` 导入。
+只有 CLI/TUI/Web 这类 App 产品（`permission.AlwaysAllowScope.settings_file`）会追加
+`.claude/settings.local.json`，因为它的 settings loader 会在下次启动时读回。
+
+Host 自己持久化 transcript 时，路径只从一处推导，不要手写布局：
+
+```zig
+// 运行中：用 Session 自己解析出的 root 与 state root。
+var writer = try mc.transcript.Writer.init(gpa, session.workspace.root,
+    session.workspace.stateRoot(), model, session.session_id);
+var lease = try session.snapshotCommitted();
+defer lease.deinit();
+writer.flush(lease.conversation);
+
+// 重启后恢复：同一份 WorkspaceConfig 解析出同一个目录。
+var policy = try mc.workspace_policy.WorkspacePolicy.init(gpa, config.workspace);
+defer policy.deinit();
+const dir = try mc.transcript.sessionDir(gpa, policy.stateRoot(), policy.root, sid);
+try mc.transcript.loadTranscript(&conversation, dir, gpa);
+```
+
+`Writer.init`、`sessionDir`、`listSessions` 的状态根参数是 `util_state_root.StateRoot`，
+不是 `[]const u8`：home 和它下面的 state root 都是绝对路径，传错了以前只是悄悄错一层目录，
+现在是编译错误。`WorkspaceConfig.state_root` 为空时 state root 是 `<home>/.metacodes`，
+与旧布局一致。
+
 ## 2. 插件清单协议
 
 同一份只读 JSON 可从三种 Host 入口获取：
