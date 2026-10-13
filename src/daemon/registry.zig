@@ -30,7 +30,7 @@ const sync = @import("platform").sync;
 const time = @import("../util/time.zig");
 const abort = @import("../util/abort.zig");
 const SessionId = @import("../core/session_id.zig").SessionId;
-const EventJournal = @import("../web/journal.zig").EventJournal;
+const EventJournal = @import("../core/event_journal.zig").EventJournal;
 const MsgQueue = @import("../repl/msg_queue.zig").MsgQueue;
 
 /// 一个 session 的运行时宿主单元。堆分配,registry 持 *SessionHost。

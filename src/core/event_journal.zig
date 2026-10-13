@@ -1,4 +1,5 @@
-//! EventJournal —— web 会话的事件日志(内存,append-only,seq = 下标)。
+//! EventJournal —— 会话的事件日志(内存,append-only,seq = 下标)。web 宿主与
+//! session_host 共用;UI 无关,故在 core。
 //!
 //! 解决 CoreEvent fire-and-forget 与浏览器断线重连的矛盾:emit 落 journal,
 //! SSE 连接从任意 seq 起重放 + condvar 低延迟推送新事件。一份 journal 就是

@@ -61,7 +61,7 @@ const PosixCondition = struct {
 };
 
 /// 现在 + timeout_ns 的绝对时刻（pthread_cond_timedwait 需 CLOCK_REALTIME 绝对时间）。
-/// 逻辑对齐原 web/journal.zig::absDeadline（已验证），改为 ns 输入。
+/// 逻辑对齐原 web/journal.zig(现 core/event_journal.zig)::absDeadline（已验证），改为 ns 输入。
 fn posixAbsDeadline(timeout_ns: u64) std.c.timespec {
     var now: std.c.timeval = undefined;
     _ = std.c.gettimeofday(&now, null);

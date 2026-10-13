@@ -10,7 +10,7 @@
 //!
 //! Regenerating after a deliberate change:
 //!   METACODES_WIRE_FIXTURE_DUMP=<dir> zig build test:integration-times -Dtfilter=wire_contract
-//! writes events.jsonl/requests.jsonl to <dir> instead of comparing.
+//! writes events.jsonl/requests.jsonl/host_events.jsonl to <dir> instead of comparing.
 
 const std = @import("std");
 const cc = @import("cc");
@@ -20,6 +20,7 @@ const UiRequest = cc.ui_request.UiRequest;
 
 const EVENTS_FIXTURE = @embedFile("../fixtures/wire/v1/events.jsonl");
 const REQUESTS_FIXTURE = @embedFile("../fixtures/wire/v1/requests.jsonl");
+const HOST_FIXTURE = @embedFile("../fixtures/wire/v1/host_events.jsonl");
 
 const trace: [12]u8 = "0123456789ab".*;
 
@@ -192,6 +193,39 @@ test "wire_contract: every UiRequest kind and close outcome has a pinned v1 line
     lines[requests.len + 1] = try cc.wire.writeRequestClosed(a, 2, .cancelled);
     written += 1;
     try compareOrDump(a, &lines, REQUESTS_FIXTURE, "requests.jsonl");
+}
+
+const host_events = [_]cc.wire.HostEvent{
+    .{ .user_message = .{ .run_id = 3, .trace_id = "trace-1", .text = "fix the build" } },
+    .{ .run_done = .{ .run_id = 3, .trace_id = "trace-1", .stop_reason = "end_turn" } },
+    .{ .run_done = .{ .run_id = 4, .error_name = "ProviderUnavailable" } },
+    .{ .command_result = .{ .command = "set_model", .ok = true } },
+    .{ .command_result = .{ .command = "set_reasoning_effort", .ok = false, .error_name = "AgentEffortUnsupportedProvider" } },
+    .{ .session_poisoned = .{ .error_name = "CallbackFailed", .dropped = 2 } },
+};
+
+test "wire_contract: every HostEvent tag and the Run context form have a pinned v1 line" {
+    const a = std.testing.allocator;
+    inline for (std.meta.fields(cc.wire.HostEvent)) |field| {
+        var sampled = false;
+        for (host_events) |event| sampled = sampled or std.mem.eql(u8, @tagName(event), field.name);
+        if (!sampled) {
+            std.debug.print("wire fixture has no sample of HostEvent.{s}\n", .{field.name});
+            return error.MissingWireSample;
+        }
+    }
+    var lines: [host_events.len + 2][]u8 = undefined;
+    var written: usize = 0;
+    defer for (lines[0..written]) |line| a.free(line);
+    for (host_events, 0..) |event, index| {
+        lines[index] = try cc.wire.writeHostEvent(a, event);
+        written += 1;
+    }
+    lines[host_events.len] = try cc.wire.writeRunEvent(a, .{ .run_id = 3, .trace_id = "trace-1" }, .{ .text_chunk = "on it" });
+    written += 1;
+    lines[host_events.len + 1] = try cc.wire.writeRunEvent(a, .{ .run_id = 4 }, .stream_done);
+    written += 1;
+    try compareOrDump(a, &lines, HOST_FIXTURE, "host_events.jsonl");
 }
 
 test "wire_contract: every v1 request line parses as JSON and names its kind" {

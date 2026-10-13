@@ -603,6 +603,39 @@ the journal's end, the server sends `event: resync` with
 from the oldest event it kept; when old events were evicted under the cursor,
 the reason is `evicted`. Deduplicate on `(session, epoch, seq)`.
 
+### SessionHost: a multi-session service for network Hosts
+
+`mc.session_host.SessionHost` is what a Host puts behind its own transport
+when Sessions are opened and closed by id at runtime (one container serving
+many users, a GUI with many tabs). It composes the pieces above instead of
+leaving every Host to rebuild them:
+
+- `open(.{ .config, .id, .mode = .fresh | .resume })` creates a Session, or
+  restores one from its transcript (`transcript.sessionDir` under the
+  Session's state root). A fresh open under an id that has a transcript
+  replaces that transcript at once. `open` and `acquire` return a counted
+  reference; `release` gives it back.
+- `HostedSession.submit` and `command` (`set_model`, `set_permission_mode`,
+  `set_reasoning_effort`, `set_additional_directories`, `set_prompt_profile`,
+  `update_permission_rules`, `compact`) share one FIFO run by the Session's
+  driver thread, so configuration changes apply between Runs in the order
+  they were queued.
+- Every kernel event, host event (`user_message`, `run_done`,
+  `command_result`, `session_poisoned`) and UI request lands in the
+  Session's `journal` as a wire line; CoreEvents carry `run_id` and the
+  submission's `trace_id`. `respond(id, json)` answers a UI request;
+  anything but the pending id is `error.NoSuchRequest`.
+- `interrupt` aborts the Run (or the one being admitted) and answers a
+  pending UI request as cancelled. A Session the kernel poisoned reports
+  `session_poisoned`, drops its queue and refuses further work; close and
+  reopen it.
+- `close` stops the driver, closes the journal (waking readers), waits for
+  every reference and destroys the Session; afterwards the id can be opened
+  again. Release your own reference before closing.
+
+Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`.
+Authentication, tenancy, idempotency and the transport stay with the Host.
+
 Static trusted plugins can contribute typed tools, streaming tools, services,
 advisory policies, and deterministic provider dialects. Process plugins can only
 contribute isolated tools through the versioned wire protocol. Neither receives a

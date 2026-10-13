@@ -29,6 +29,17 @@ status, compatibility boundaries, and entry points are defined by
   cancellation. Hosts previously ran `std.json` over kernel structs, so a
   renamed field changed their clients silently. One pinned line per event
   tag and request kind lives in `tests/fixtures/wire/v1`.
+- `session_host.SessionHost`: the multi-session service a network Host puts
+  behind its own transport. Sessions open and close by id (fresh, or resumed
+  from their transcript), submissions and configuration commands run in one
+  FIFO per Session on its driver thread, every event lands in a replayable
+  journal as wire lines with `run_id`/`trace_id`, UI requests are answered by
+  id, `interrupt` also releases a pending prompt, a poisoned Session is
+  reported and refuses work, and `close` waits for every reference. A cloud
+  Host had rebuilt this by hand with a 5-minute watchdog, an interrupt that
+  could not reach a pending prompt and a fresh session that resumed the old
+  transcript; this is the kernel-side version. `EventJournal` moved from
+  `web/` to `core/event_journal.zig` and is exported.
 
 ### Changed
 

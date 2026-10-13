@@ -191,7 +191,7 @@ test "U11 parity: run Options 装配单源(web 只比 canonical 多 ui_requester
     defer fx.deinit();
     const app = fx.app;
 
-    var journal = cc.web_journal.EventJournal.init(std.testing.allocator);
+    var journal = cc.event_journal.EventJournal.init(std.testing.allocator);
     defer journal.deinit();
     var wb = cc.web_backend.WebBackend.init(std.testing.allocator, &journal);
     defer wb.deinit();

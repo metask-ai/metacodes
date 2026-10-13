@@ -7,8 +7,15 @@
 //! Every line is one JSON object carrying the schema version `v` and a `type`:
 //!
 //!   {"v":1,"type":"<CoreEvent tag>","data":<payload or null>}
+//!   {"v":1,"type":"<CoreEvent tag>","run_id":N,"trace_id":"...","data":...}   (writeRunEvent)
+//!   {"v":1,"type":"<HostEvent tag>","data":{...}}                              (writeHostEvent)
 //!   {"v":1,"type":"ui_request","id":N,"kind":"<UiRequest tag>","request":{...}}
 //!   {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered"|"cancelled"}
+//!
+//! Host events are what a session service adds around the kernel's events
+//! (core/session_host.zig): the submitted text, the end of a Run, the result
+//! of a configuration command, a poisoned Session. Their tags never collide
+//! with CoreEvent tags (checked at compile time).
 //!
 //! `data` is the CoreEvent payload with the field names of
 //! core/protocol/ui_event.zig, except `prompt_manifest`, whose digests are
@@ -55,6 +62,37 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// How a UI request ended, as `ui_request_closed.outcome` reports it.
 pub const RequestClosed = enum { answered, cancelled };
 
+/// The Run a CoreEvent belongs to, as the EventSink reported it, and the
+/// opaque trace ID the Host's caller attached to the submission.
+pub const RunContext = struct {
+    run_id: u64,
+    trace_id: ?[]const u8 = null,
+};
+
+/// Events a session service emits around the kernel's. Borrowed slices.
+pub const HostEvent = union(enum) {
+    /// A queued submission became the input of Run `run_id`.
+    user_message: struct { run_id: u64, trace_id: ?[]const u8 = null, text: []const u8 },
+    /// Run `run_id` ended: `stop_reason` when it returned, `error_name` when
+    /// it failed.
+    run_done: struct { run_id: u64, trace_id: ?[]const u8 = null, stop_reason: ?[]const u8 = null, error_name: ?[]const u8 = null },
+    /// A configuration command was applied (`ok`) or refused.
+    command_result: struct { command: []const u8, ok: bool, error_name: ?[]const u8 = null },
+    /// The Session can no longer run; the Host must close it. Work still
+    /// queued was dropped and is counted.
+    session_poisoned: struct { error_name: []const u8, dropped: usize },
+};
+
+comptime {
+    for (std.meta.fields(HostEvent)) |host| {
+        for (std.meta.fields(CoreEvent)) |core| {
+            if (std.mem.eql(u8, host.name, core.name)) @compileError("HostEvent tag collides with CoreEvent: " ++ host.name);
+        }
+        if (std.mem.eql(u8, host.name, "ui_request") or std.mem.eql(u8, host.name, "ui_request_closed"))
+            @compileError("HostEvent tag collides with a UI request line: " ++ host.name);
+    }
+}
+
 /// One CoreEvent as a wire line, caller-owned. The event's borrowed slices
 /// are copied before return, so this is safe inside a synchronous emit.
 pub fn writeEvent(allocator: std.mem.Allocator, event: CoreEvent) error{OutOfMemory}![]u8 {
@@ -65,12 +103,56 @@ pub fn writeEvent(allocator: std.mem.Allocator, event: CoreEvent) error{OutOfMem
     return finish(allocator, &out);
 }
 
-fn writeEventTo(json: *std.json.Stringify, event: CoreEvent) std.json.Stringify.Error!void {
+/// `writeEvent` with the Run's `run_id` and, when set, `trace_id` after
+/// `type`.
+pub fn writeRunEvent(allocator: std.mem.Allocator, context: RunContext, event: CoreEvent) error{OutOfMemory}![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+    writeEventToWith(&json, context, event) catch return error.OutOfMemory;
+    return finish(allocator, &out);
+}
+
+/// One HostEvent as a wire line, caller-owned.
+pub fn writeHostEvent(allocator: std.mem.Allocator, event: HostEvent) error{OutOfMemory}![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+    writeHostEventTo(&json, event) catch return error.OutOfMemory;
+    return finish(allocator, &out);
+}
+
+fn writeHostEventTo(json: *std.json.Stringify, event: HostEvent) std.json.Stringify.Error!void {
     try json.beginObject();
     try json.objectField("v");
     try json.write(SCHEMA_VERSION);
     try json.objectField("type");
     try json.write(@tagName(event));
+    try json.objectField("data");
+    switch (event) {
+        inline else => |payload| try json.write(payload),
+    }
+    try json.endObject();
+}
+
+fn writeEventTo(json: *std.json.Stringify, event: CoreEvent) std.json.Stringify.Error!void {
+    return writeEventToWith(json, null, event);
+}
+
+fn writeEventToWith(json: *std.json.Stringify, context: ?RunContext, event: CoreEvent) std.json.Stringify.Error!void {
+    try json.beginObject();
+    try json.objectField("v");
+    try json.write(SCHEMA_VERSION);
+    try json.objectField("type");
+    try json.write(@tagName(event));
+    if (context) |run| {
+        try json.objectField("run_id");
+        try json.write(run.run_id);
+        if (run.trace_id) |trace_id| {
+            try json.objectField("trace_id");
+            try json.write(trace_id);
+        }
+    }
     try json.objectField("data");
     switch (event) {
         .prompt_manifest => |manifest| try writeManifest(json, manifest),

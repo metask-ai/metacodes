@@ -1,0 +1,8 @@
+{"v":1,"type":"user_message","data":{"run_id":3,"trace_id":"trace-1","text":"fix the build"}}
+{"v":1,"type":"run_done","data":{"run_id":3,"trace_id":"trace-1","stop_reason":"end_turn","error_name":null}}
+{"v":1,"type":"run_done","data":{"run_id":4,"trace_id":null,"stop_reason":null,"error_name":"ProviderUnavailable"}}
+{"v":1,"type":"command_result","data":{"command":"set_model","ok":true,"error_name":null}}
+{"v":1,"type":"command_result","data":{"command":"set_reasoning_effort","ok":false,"error_name":"AgentEffortUnsupportedProvider"}}
+{"v":1,"type":"session_poisoned","data":{"error_name":"CallbackFailed","dropped":2}}
+{"v":1,"type":"text_chunk","run_id":3,"trace_id":"trace-1","data":"on it"}
+{"v":1,"type":"stream_done","run_id":4,"data":null}

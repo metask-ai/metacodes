@@ -154,6 +154,15 @@ pub const Writer = struct {
         self.allocator.free(self.dir);
     }
 
+    /// The Conversation this Writer follows was replaced wholesale (a Session
+    /// started over under the same ID): the next flush rewrites the file from
+    /// it instead of appending after records that no longer belong to it.
+    pub fn rewriteOnNextFlush(self: *Writer) void {
+        self.flush_mutex.lock();
+        defer self.flush_mutex.unlock();
+        self.needs_repair = true;
+    }
+
     /// 把 conversation 里从 flushed_count 起的所有 message 追加到 transcript。
     /// 同时覆盖写 meta.json。失败不 panic——记录 warn 就行（不影响 session 继续）。
     pub fn flush(self: *Writer, conversation: *const Conversation) void {

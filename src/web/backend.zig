@@ -29,7 +29,7 @@ const ui_event = @import("../core/protocol/ui_event.zig");
 const ui_request = @import("../core/protocol/ui_request.zig");
 const abort_mod = @import("../util/abort.zig");
 const usage_mod = @import("../core/usage.zig");
-const journal_mod = @import("journal.zig");
+const journal_mod = @import("../core/event_journal.zig");
 const log = @import("../util/log.zig");
 const wire = @import("../core/protocol/wire.zig");
 

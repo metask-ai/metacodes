@@ -14,7 +14,7 @@ const harness = @import("harness");
 const cc = @import("cc");
 
 const agent_loop = cc.agent_loop;
-const EventJournal = cc.web_journal.EventJournal;
+const EventJournal = cc.event_journal.EventJournal;
 const WebBackend = cc.web_backend.WebBackend;
 const WebServer = cc.web_server.WebServer;
 const MsgQueue = cc.repl_msg_queue.MsgQueue;

@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const time = @import("../util/time.zig");
-const journal_mod = @import("journal.zig");
+const journal_mod = @import("../core/event_journal.zig");
 const backend_mod = @import("backend.zig");
 const msg_queue_mod = @import("../repl/msg_queue.zig");
 const abort_mod = @import("../util/abort.zig");
