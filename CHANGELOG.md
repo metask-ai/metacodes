@@ -77,6 +77,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- A `--web` client that reconnects after the host restarted gets the new
+  session's events instead of silence. Event sequence numbers restart at 0
+  with every journal, and a cursor from the previous one (`since=41`) made the
+  server wait until the new journal reached 41, dropping everything before.
+  Each journal now has an epoch: SSE ids are `<epoch>-<seq>`, `/state`
+  reports `epoch` next to `seq`, and a cursor from another epoch, or one past
+  the journal's end, is answered with `event: resync`
+  (`{"reason":"epoch_changed"|"cursor_ahead","epoch","from"}`) and a replay
+  from the oldest kept event. Evictions report `"reason":"evicted"`. The
+  bundled page reconnects with `?since=&epoch=` and starts its view over on a
+  resync.
 - An embedded `AgentSession` keeps "allow always" in the Session. Answering
   a Host permission prompt with `allow_always` also appended a whole-tool
   grant to `<workspace>/.claude/settings.local.json`, a file no AgentSession

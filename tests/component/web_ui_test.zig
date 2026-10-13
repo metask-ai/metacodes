@@ -119,7 +119,9 @@ test "L2 web ①: agent_loop 文本流经 WebBackend 落 journal,SSE 读回带 i
     // 经真 HTTP 从 /events 读回(重放语义:事件先发生,连接后至)
     const resp = try httpGetUntil(a, fx.srv.port, "/events", "stream_done");
     defer a.free(resp);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "id: 0\n") != null);
+    var first_id_buf: [32]u8 = undefined;
+    const first_id = try std.fmt.bufPrint(&first_id_buf, "id: {s}-0\n", .{&fx.journal.epochHex()});
+    try std.testing.expect(std.mem.indexOf(u8, resp, first_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"type\":\"text_chunk\",\"data\":\"hello web\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "stream_begin") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "stream_done") != null);
@@ -454,6 +456,67 @@ test "L2 web:MAX_CONNS 连接上限——第 N+1 条被立即拒绝(close),存�
 }
 
 // ── 极简 HTTP 客户端(raw socket;哑读到含 needle / EOF)───────────────────────
+
+/// SSE request with a raw header block (e.g. Last-Event-ID).
+fn sseWithHeaders(a: std.mem.Allocator, port: u16, path: []const u8, headers: []const u8, needle: []const u8) ![]u8 {
+    var req_buf: [512]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: l\r\n{s}\r\n", .{ path, headers });
+    return roundtrip(a, port, req, needle);
+}
+
+// 事故形态(云端宿主同款):宿主重启后 journal 换了一份、seq 从 0 重来,浏览器带着旧游标
+// (seq 41)重连。没有 epoch 时服务端只会等 seq 追到 42,其间事件全部漏掉。现在游标带
+// epoch:不是本 journal 的游标 → resync(epoch_changed)+ 从最老保留行整体重放。
+test "L2 web: 另一份 journal 的游标 → resync epoch_changed + 从头重放,帧 id 带本 journal epoch" {
+    const a = std.testing.allocator;
+    var fx = Fixture.init(a);
+    defer fx.deinit();
+    try fx.start(a);
+    const be = fx.wb.backend();
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "first after restart" });
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "second after restart" });
+
+    // The old cursor (seq 0 of the previous journal) is behind this journal's
+    // end, so only the epoch tells it apart: without it the server would
+    // continue from seq 1 and the first event would never arrive.
+    const resp = try sseWithHeaders(a, fx.srv.port, "/events", "Last-Event-ID: 0123456789abcdef-0\r\n", "second after restart");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "event: resync\ndata: {\"reason\":\"epoch_changed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "first after restart") != null);
+    var frame_buf: [64]u8 = undefined;
+    const frame = try std.fmt.bufPrint(&frame_buf, "id: {s}-0\n", .{&fx.journal.epochHex()});
+    try std.testing.expect(std.mem.indexOf(u8, resp, frame) != null);
+}
+
+test "L2 web: 无 epoch 的旧式游标超出 journal 末尾 → resync cursor_ahead + 从头重放" {
+    const a = std.testing.allocator;
+    var fx = Fixture.init(a);
+    defer fx.deinit();
+    try fx.start(a);
+    const be = fx.wb.backend();
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "fresh journal" });
+
+    const resp = try httpGetUntil(a, fx.srv.port, "/events?since=99", "fresh journal");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"reason\":\"cursor_ahead\"") != null);
+}
+
+test "L2 web: 本 journal 的游标照常续接,不 resync、不重放已见事件" {
+    const a = std.testing.allocator;
+    var fx = Fixture.init(a);
+    defer fx.deinit();
+    try fx.start(a);
+    const be = fx.wb.backend();
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "seen before" });
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "not seen yet" });
+
+    var header_buf: [64]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "Last-Event-ID: {s}-0\r\n", .{&fx.journal.epochHex()});
+    const resp = try sseWithHeaders(a, fx.srv.port, "/events", header, "not seen yet");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "resync") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "seen before") == null);
+}
 
 fn httpGetUntil(a: std.mem.Allocator, port: u16, path: []const u8, needle: []const u8) ![]u8 {
     var req_buf: [256]u8 = undefined;

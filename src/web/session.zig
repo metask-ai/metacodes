@@ -83,6 +83,7 @@ pub const StateSource = struct {
     pub fn snapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
         const self: *StateSource = @ptrCast(@alignCast(ctx));
         const seq = self.journal.count(); // 锁内取（Linus ①：seq 定序 + 跨线程可见性）
+        const epoch = self.journal.epochHex(); // seq 所属的 journal(重连游标 ?since=seq&epoch=epoch)
         // slice-safe 读（cache mutex 内 dup）：model + dirs。
         const slices = try self.app.snapshotSlices(allocator);
         defer {
@@ -151,6 +152,7 @@ pub const StateSource = struct {
         const u = &self.app.usage; // u64 无锁读，良性 skew（poll-based）
         return stringifyJson(allocator, .{
             .seq = seq,
+            .epoch = @as([]const u8, &epoch),
             .session_id = self.app.session_id.asSlice(),
             .model = slices.model,
             .additional_dirs = slices.dirs,
@@ -575,8 +577,11 @@ test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"agent_type\":\"Explore\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"state\":\"running\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_calls\":3") != null);
-    // seq 也在(附着握手)。
+    // seq 与它所属的 journal epoch 也在(附着握手:?since=seq&epoch=epoch)。
     try std.testing.expect(std.mem.indexOf(u8, json, "\"seq\":") != null);
+    var epoch_buf: [40]u8 = undefined;
+    const epoch_field = try std.fmt.bufPrint(&epoch_buf, "\"epoch\":\"{s}\"", .{&journal.epochHex()});
+    try std.testing.expect(std.mem.indexOf(u8, json, epoch_field) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plugin_inventory\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "metacodes.plugin-inventory/v1") != null);
 }

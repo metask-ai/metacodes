@@ -594,6 +594,15 @@ grant. `tests/fixtures/wire/v1` pins one line for every event tag and request
 kind and doubles as conformance vectors for Hosts in other languages. The
 bundled `--web` UI consumes exactly these lines.
 
+The `--web` server streams these lines over SSE with ids `<epoch>-<seq>`. The
+epoch names the event journal; a restarted host or a rebuilt session has a new
+one. A client resumes with `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`
+(`/state` reports both). When the cursor belongs to another epoch or lies past
+the journal's end, the server sends `event: resync` with
+`{"reason":"epoch_changed"|"cursor_ahead","epoch":...,"from":N}` and replays
+from the oldest event it kept; when old events were evicted under the cursor,
+the reason is `evicted`. Deduplicate on `(session, epoch, seq)`.
+
 Static trusted plugins can contribute typed tools, streaming tools, services,
 advisory policies, and deterministic provider dialects. Process plugins can only
 contribute isolated tools through the versioned wire protocol. Neither receives a

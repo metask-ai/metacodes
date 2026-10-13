@@ -121,7 +121,8 @@ const input = document.getElementById("input");
 const overlay = document.getElementById("dialog-overlay");
 const dialog = document.getElementById("dialog");
 
-let lastSeq = -1;          // 已消费的最大 SSE id
+let lastSeq = -1;          // 已消费的最大 SSE seq
+let lastEpoch = "";        // lastSeq 所属 journal 的 epoch(SSE id = "<epoch>-<seq>")
 let curText = null;        // 正在流式追加的 assistant 文本(累积原始 markdown 源)
 let curTextRaw = "";       // 当前 assistant 段的 markdown 源
 let toolCards = {};        // tool_use id → {el, bodyEl}
@@ -136,14 +137,23 @@ function jparse(s) { try { return JSON.parse(s); } catch { return null; } }
 
 // ── SSE ─────────────────────────────────────────────────────────────────────
 function connect() {
-  const es = new EventSource("/events?since=" + (lastSeq + 1));
+  const es = new EventSource("/events?since=" + (lastSeq + 1) + (lastEpoch ? "&epoch=" + lastEpoch : ""));
   document.getElementById("st-conn").textContent = "";
   es.onmessage = (m) => {
-    lastSeq = parseInt(m.lastEventId, 10);
+    const dash = m.lastEventId.lastIndexOf("-");
+    lastEpoch = m.lastEventId.slice(0, dash); lastSeq = parseInt(m.lastEventId.slice(dash + 1), 10);
     const ev = jparse(m.data); if (!ev) return;
     stick(() => dispatch(ev));
   };
   es.addEventListener("session_closed", () => { es.close(); sysline("· session closed"); });
+  // The server could not continue the cursor: another journal (the host restarted or the
+  // session was rebuilt) or one past its end. It replays from the oldest event it kept, so
+  // start the view over. "evicted" only means old events fell out of the window.
+  es.addEventListener("resync", (m) => {
+    const r = jparse(m.data) || {};
+    if (r.reason && r.reason !== "evicted") { scroll.innerHTML = ""; lastEpoch = r.epoch || ""; lastSeq = (r.from || 0) - 1; }
+    refreshState();
+  });
   es.onerror = () => {
     document.getElementById("st-conn").textContent = "reconnecting…";
     es.close(); setTimeout(connect, 1000);

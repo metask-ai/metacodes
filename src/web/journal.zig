@@ -14,6 +14,11 @@
 //! 落后于保留窗口的 SSE 客户端(其游标 seq < base_seq)靠 `waitSinceFrom` 报出 effective start
 //! → SSE 层发 `resync` 事件让客户端重拉 /state(config/roster 幂等可重建,被淘汰的只是瞬态渲染
 //! 事件 text_chunk/进度,不影响附着态)。协议见 U5/U6 附着设计。
+//!
+//! **epoch**:seq 只在一份 journal 内有意义。宿主重启或会话重建会换一份新 journal,seq 从 0
+//! 重来;客户端拿旧游标续接,要么静默等到新 seq 追上(漏掉之间的全部事件),要么错位。每份
+//! journal 生成时取一个 64 位 epoch,SSE 帧 id 写成 `<epoch hex>-<seq>`,游标带回 epoch,
+//! 不一致即整体重放(见 web/server.zig serveSse)。
 
 const std = @import("std");
 const time = @import("../util/time.zig");
@@ -25,8 +30,25 @@ const log = @import("../util/log.zig");
 pub const DEFAULT_MAX_LINES: usize = 20_000;
 pub const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+/// Distinct per journal: wall-clock, monotonic clock and a process counter
+/// mixed, so two journals of one process and journals of successive
+/// processes differ. An identity, not a secret.
+fn newEpoch() u64 {
+    const counter = epoch_counter.fetchAdd(1, .monotonic);
+    const wall = time.nowWallNs();
+    const mono = time.nowNs();
+    var hasher = std.hash.XxHash64.init(0x6d657461636f6465);
+    hasher.update(std.mem.asBytes(&wall));
+    hasher.update(std.mem.asBytes(&mono));
+    hasher.update(std.mem.asBytes(&counter));
+    return hasher.final();
+}
+var epoch_counter = std.atomic.Value(u64).init(0);
+
 pub const EventJournal = struct {
     allocator: std.mem.Allocator,
+    /// Fixed at init; see the module comment.
+    epoch: u64,
     lines: std.ArrayList([]u8) = .empty,
     mutex: sync.Mutex = .{},
     cond: sync.Condition = .{},
@@ -40,12 +62,12 @@ pub const EventJournal = struct {
     max_bytes: usize = DEFAULT_MAX_BYTES,
 
     pub fn init(allocator: std.mem.Allocator) EventJournal {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .epoch = newEpoch() };
     }
 
     /// U7:自定义上限(测试强制小窗触发淘汰;daemon 可按内存预算调)。
     pub fn initWithLimits(allocator: std.mem.Allocator, max_lines: usize, max_bytes: usize) EventJournal {
-        return .{ .allocator = allocator, .max_lines = max_lines, .max_bytes = max_bytes };
+        return .{ .allocator = allocator, .epoch = newEpoch(), .max_lines = max_lines, .max_bytes = max_bytes };
     }
 
     pub fn deinit(self: *EventJournal) void {
@@ -105,6 +127,13 @@ pub const EventJournal = struct {
         self.lock();
         defer self.unlock();
         return self.base_seq;
+    }
+
+    /// The epoch as 16 lowercase hex digits, the form SSE ids and /state carry.
+    pub fn epochHex(self: *const EventJournal) [16]u8 {
+        var out: [16]u8 = undefined;
+        _ = std.fmt.bufPrint(&out, "{x:0>16}", .{self.epoch}) catch unreachable;
+        return out;
     }
 
     /// 关闭(session 结束):唤醒所有 waitSince,让 SSE 连接收尾退出。
@@ -373,4 +402,15 @@ test "跨线程 append/waitSince 数据完整(生产者-消费者)" {
     }
     t.join();
     try testing.expectEqual(@as(usize, N), j.count());
+}
+
+test "epoch: two journals of one process differ; hex form is 16 lowercase digits" {
+    var first = EventJournal.init(testing.allocator);
+    defer first.deinit();
+    var second = EventJournal.init(testing.allocator);
+    defer second.deinit();
+    try testing.expect(first.epoch != second.epoch);
+    const hex = first.epochHex();
+    for (hex) |c| try testing.expect(std.ascii.isDigit(c) or (c >= 'a' and c <= 'f'));
+    try testing.expectEqual(first.epoch, try std.fmt.parseInt(u64, &hex, 16));
 }
