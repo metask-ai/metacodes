@@ -418,7 +418,7 @@ test "L2 SessionHost reports a poisoned Session, drops its queue and refuses mor
     try host.close(id);
 }
 
-test "L2 SessionHost close wakes journal readers and waits for their references" {
+test "L2 SessionHost close never waits on references: readers wake, the id reopens, the shell stays readable" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -431,7 +431,8 @@ test "L2 SessionHost close wakes journal readers and waits for their references"
     defer runtime.destroy() catch unreachable;
     var host = SessionHost.init(a, runtime, .{ .transcripts = false });
     defer host.deinit();
-    const hosted = try host.open(.{ .config = baseConfig("http://127.0.0.1:9", workspace, home, &.{}) });
+    const config = baseConfig("http://127.0.0.1:9", workspace, home, &.{});
+    const hosted = try host.open(.{ .config = config, .id = cc.session_id.gen() });
     const id = hosted.id;
 
     // A reader thread, the way an SSE handler holds the Session.
@@ -439,7 +440,7 @@ test "L2 SessionHost close wakes journal readers and waits for their references"
         saw_close: std.atomic.Value(bool) = .init(false),
         fn run(self: *@This(), session_host: *SessionHost, session_id: cc.session_id.SessionId) void {
             const lease = session_host.acquire(session_id) orelse return;
-            defer session_host.release(lease);
+            defer lease.release();
             while (!lease.journal.isClosed()) {
                 const lines = lease.journal.waitSince(std.testing.allocator, lease.journal.count(), 50) catch return;
                 if (lines) |batch| {
@@ -452,7 +453,8 @@ test "L2 SessionHost close wakes journal readers and waits for their references"
     };
     var reader = Reader{};
     const thread = try std.Thread.spawn(.{}, Reader.run, .{ &reader, &host, id });
-    // Let the reader take its reference before closing.
+    var joined = false;
+    defer if (!joined) thread.join();
     var waited: u32 = 0;
     while (waited < 200) : (waited += 1) {
         hosted.mutex.lock();
@@ -461,12 +463,25 @@ test "L2 SessionHost close wakes journal readers and waits for their references"
         if (held > 1) break;
         std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
     }
-    host.release(hosted);
+
+    // This thread still holds the reference from `open` while it closes.
     try host.close(id);
-    // close returned only after the reader saw the journal close and let go.
-    try std.testing.expect(reader.saw_close.load(.acquire));
-    thread.join();
     try std.testing.expectError(error.SessionNotFound, host.close(id));
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqual(cc.session_host.Phase.closing, snapshot.phase);
+    try std.testing.expect(hosted.journal.isClosed());
+    try std.testing.expectError(error.SessionClosed, hosted.submit(.{ .text = "too late" }));
+    try std.testing.expectEqual(cc.session_host.InterruptOutcome.no_run, hosted.interrupt());
+
+    // The kernel Session is gone, so the id opens again while the old shell
+    // is still held.
+    const reopened = try host.open(.{ .config = config, .id = id });
+    reopened.release();
+    hosted.release();
+    thread.join();
+    joined = true;
+    try std.testing.expect(reader.saw_close.load(.acquire));
 }
 
 test "L2 SessionHost options: UI timeout, queue bound, turn limit, no transcripts" {

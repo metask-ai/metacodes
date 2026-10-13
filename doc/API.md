@@ -629,9 +629,11 @@ leaving every Host to rebuild them:
   pending UI request as cancelled. A Session the kernel poisoned reports
   `session_poisoned`, drops its queue and refuses further work; close and
   reopen it.
-- `close` stops the driver, closes the journal (waking readers), waits for
-  every reference and destroys the Session; afterwards the id can be opened
-  again. Release your own reference before closing.
+- `close` stops the driver, closes the journal (waking readers), waits only
+  for an in-flight `interrupt` to leave the kernel and destroys the Session,
+  so the id can be opened again as soon as it returns. It never waits for
+  references: a holder keeps a closed `HostedSession` readable (journal,
+  `snapshot`) until its own `release`, which frees it last.
 
 Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`.
 Authentication, tenancy, idempotency and the transport stay with the Host.

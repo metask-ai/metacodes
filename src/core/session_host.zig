@@ -20,12 +20,13 @@
 //!
 //! Lifetimes: `open` and `acquire` return a counted reference that `release`
 //! gives back; no pointer escapes without one. `close` takes the Session out
-//! of the table, releases its pending prompt, aborts its Run, joins the
-//! driver, closes the journal (waking every reader), waits until every
-//! reference is released and only then destroys the AgentSession — so a
-//! thread must release its own reference before it closes. Once `close`
-//! returns, the id can be opened again. `gpa` must be thread-safe: the driver,
-//! journal readers and Host threads all allocate from it.
+//! of the table, answers its pending prompt as cancelled, aborts its Run,
+//! joins the driver, closes the journal (waking every reader), waits for any
+//! in-flight `interrupt` to leave the kernel and destroys the AgentSession,
+//! so the id can be opened again as soon as `close` returns. It never waits
+//! for references: a holder keeps a closed `HostedSession` readable (journal,
+//! `snapshot`) and the last `release` frees it. `gpa` must be thread-safe: the
+//! driver, journal readers and Host threads all allocate from it.
 
 const std = @import("std");
 const sync = @import("platform").sync;
@@ -148,6 +149,8 @@ pub const SessionHost = struct {
     }
 
     /// Closes every Session (see `close`) and refuses further `open`s.
+    /// References still held stay readable shells; their holders release
+    /// them with `HostedSession.release`.
     pub fn deinit(self: *SessionHost) void {
         self.mutex.lock();
         self.closed = true;
@@ -163,7 +166,8 @@ pub const SessionHost = struct {
             const key = entry.key_ptr.*;
             _ = self.sessions.remove(key);
             self.mutex.unlock();
-            hosted.teardown();
+            hosted.shutdown();
+            hosted.retire();
         }
         self.sessions.deinit(self.gpa);
     }
@@ -185,6 +189,7 @@ pub const SessionHost = struct {
         errdefer self.gpa.free(model);
         hosted.* = .{
             .host = self,
+            .gpa = self.gpa,
             .id = undefined,
             .session = undefined,
             .journal = EventJournal.init(self.gpa),
@@ -271,21 +276,19 @@ pub const SessionHost = struct {
         return hosted;
     }
 
+    /// Same as `HostedSession.release`.
     pub fn release(_: *SessionHost, hosted: *HostedSession) void {
-        hosted.mutex.lock();
-        defer hosted.mutex.unlock();
-        std.debug.assert(hosted.references > 0);
-        hosted.references -= 1;
-        if (hosted.references == 0) hosted.released.broadcast();
+        hosted.release();
     }
 
-    /// See the module comment. Returns after the Session is gone.
+    /// See the module comment. Returns once the kernel Session is destroyed.
     pub fn close(self: *SessionHost, id: SessionId) error{SessionNotFound}!void {
         self.mutex.lock();
         const removed = self.sessions.fetchRemove(id.bytes);
         self.mutex.unlock();
         const entry = removed orelse return error.SessionNotFound;
-        entry.value.teardown();
+        entry.value.shutdown();
+        entry.value.retire();
     }
 
     /// Ids of the open Sessions, owned by `allocator`.
@@ -309,7 +312,11 @@ const Work = struct {
 };
 
 pub const HostedSession = struct {
+    /// Borrowed from the SessionHost; read only while the Session is open.
     host: *SessionHost,
+    /// The host's allocator, kept here so a closed shell can free itself
+    /// after the SessionHost is gone.
+    gpa: std.mem.Allocator,
     id: SessionId,
     session: *AgentSession,
     /// Wire lines of this Session: the kernel's events of every Run (with
@@ -321,12 +328,19 @@ pub const HostedSession = struct {
 
     mutex: sync.Mutex = .{},
     work_ready: sync.Condition = .{},
-    released: sync.Condition = .{},
+    kernel_idle: sync.Condition = .{},
     ui_ready: sync.Condition = .{},
     queue: std.ArrayList(*Work) = .empty,
     phase: Phase = .idle,
     closing: bool = false,
+    /// Out of the table and shut down; the last reference frees the shell.
+    retired: bool = false,
     references: usize = 0,
+    /// Host threads inside a kernel call (`interrupt`'s abort); shutdown
+    /// waits for them before destroying the AgentSession.
+    kernel_users: usize = 0,
+    /// The permission mode as of shutdown; live Sessions are read directly.
+    final_permission_mode: types.PermissionMode = .default,
     /// The admitted Run, 0 between Runs.
     current_run_id: u64 = 0,
     /// Set by `interrupt` for the Run being started or running; cleared when
@@ -348,6 +362,17 @@ pub const HostedSession = struct {
     last_run_id: u64 = 0,
     last_compact_id: u64 = 0,
 
+    /// Gives back a reference from `open` or `acquire`; the last one of a
+    /// closed Session frees it. Valid after `SessionHost.deinit`.
+    pub fn release(self: *HostedSession) void {
+        self.mutex.lock();
+        std.debug.assert(self.references > 0);
+        self.references -= 1;
+        const free_now = self.references == 0 and self.retired;
+        self.mutex.unlock();
+        if (free_now) self.destroyShell();
+    }
+
     pub fn submit(self: *HostedSession, submission: Submission) EnqueueError!void {
         const work = try self.newWork();
         errdefer self.freeWork(work);
@@ -367,8 +392,8 @@ pub const HostedSession = struct {
     }
 
     fn newWork(self: *HostedSession) error{OutOfMemory}!*Work {
-        const work = try self.host.gpa.create(Work);
-        work.* = .{ .arena = std.heap.ArenaAllocator.init(self.host.gpa), .item = .{ .command = .compact } };
+        const work = try self.gpa.create(Work);
+        work.* = .{ .arena = std.heap.ArenaAllocator.init(self.gpa), .item = .{ .command = .compact } };
         return work;
     }
 
@@ -379,7 +404,7 @@ pub const HostedSession = struct {
         if (self.closing) return error.SessionClosed;
         if (self.phase == .poisoned) return error.SessionPoisoned;
         if (self.queue.items.len >= self.host.options.max_queued) return error.QueueFull;
-        try self.queue.append(self.host.gpa, work);
+        try self.queue.append(self.gpa, work);
         self.work_ready.signal();
     }
 
@@ -387,25 +412,38 @@ pub const HostedSession = struct {
     /// pending UI request as cancelled. Queued work still runs afterwards.
     pub fn interrupt(self: *HostedSession) InterruptOutcome {
         self.mutex.lock();
+        if (self.closing) {
+            self.mutex.unlock();
+            return .no_run;
+        }
         const run_id = self.current_run_id;
         const starting = self.phase == .running;
         if (starting) self.run_interrupted = true;
         self.ui_ready.broadcast();
+        if (run_id != 0) self.kernel_users += 1;
         self.mutex.unlock();
         if (run_id == 0) return if (starting) .requested else .no_run;
+        defer self.leaveKernel();
         self.session.abort(run_id, .user_interrupt) catch return .too_late;
         return .requested;
+    }
+
+    fn leaveKernel(self: *HostedSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.kernel_users -= 1;
+        if (self.kernel_users == 0) self.kernel_idle.broadcast();
     }
 
     /// Answers UI request `request_id` with a `protocol.wire` response. A
     /// request that is not the pending one (answered, cancelled, stale) is
     /// `error.NoSuchRequest`.
     pub fn respond(self: *HostedSession, request_id: u64, response_json: []const u8) RespondError!void {
-        const owned = try self.host.gpa.dupe(u8, response_json);
+        const owned = try self.gpa.dupe(u8, response_json);
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.pending_request_id == 0 or self.pending_request_id != request_id or self.response != null) {
-            self.host.gpa.free(owned);
+            self.gpa.free(owned);
             return error.NoSuchRequest;
         }
         self.response = owned;
@@ -419,7 +457,9 @@ pub const HostedSession = struct {
             .id = self.id,
             .phase = self.phase,
             .model = try allocator.dupe(u8, self.model),
-            .permission_mode = self.session.permission_ctx.modeValue(),
+            // `closing` is set under this lock before the kernel Session is
+            // destroyed, so a live read here cannot race the destroy.
+            .permission_mode = if (self.closing) self.final_permission_mode else self.session.permission_ctx.modeValue(),
             .reasoning_effort = self.reasoning_effort,
             .queued = self.queue.items.len,
             .seq = self.journal.count(),
@@ -460,7 +500,7 @@ pub const HostedSession = struct {
 
     fn freeWork(self: *HostedSession, work: *Work) void {
         work.arena.deinit();
-        self.host.gpa.destroy(work);
+        self.gpa.destroy(work);
     }
 
     const RunScope = struct {
@@ -473,11 +513,11 @@ pub const HostedSession = struct {
 
         fn emit(ctx: *anyopaque, _: SessionId, _: u64, event: ui_event.CoreEvent) bool {
             const self: *RunScope = @ptrCast(@alignCast(ctx));
-            const line = wire.writeRunEvent(self.hosted.host.gpa, self.context, event) catch {
+            const line = wire.writeRunEvent(self.hosted.gpa, self.context, event) catch {
                 log.warn("session_host", "dropped CoreEvent .{s} (OOM)", .{@tagName(event)});
                 return true;
             };
-            defer self.hosted.host.gpa.free(line);
+            defer self.hosted.gpa.free(line);
             self.hosted.journal.append(line);
             return true;
         }
@@ -521,7 +561,7 @@ pub const HostedSession = struct {
         self.persist();
         const poisoned = self.session.isPoisoned();
         var dropped: std.ArrayList(*Work) = .empty;
-        defer dropped.deinit(self.host.gpa);
+        defer dropped.deinit(self.gpa);
         self.mutex.lock();
         if (poisoned) {
             self.phase = .poisoned;
@@ -573,9 +613,9 @@ pub const HostedSession = struct {
     }
 
     fn applyModel(self: *HostedSession, model: []const u8) ?anyerror {
-        const copy = self.host.gpa.dupe(u8, model) catch |err| return err;
+        const copy = self.gpa.dupe(u8, model) catch |err| return err;
         self.session.setModel(model) catch |err| {
-            self.host.gpa.free(copy);
+            self.gpa.free(copy);
             return err;
         };
         self.mutex.lock();
@@ -584,7 +624,7 @@ pub const HostedSession = struct {
         self.mutex.unlock();
         // The transcript's meta names the model; the writer borrows this copy.
         if (self.writer) |*writer| writer.model = self.model;
-        self.host.gpa.free(previous);
+        self.gpa.free(previous);
         return null;
     }
 
@@ -601,17 +641,17 @@ pub const HostedSession = struct {
     }
 
     fn emitHost(self: *HostedSession, event: wire.HostEvent) void {
-        const line = wire.writeHostEvent(self.host.gpa, event) catch {
+        const line = wire.writeHostEvent(self.gpa, event) catch {
             log.warn("session_host", "dropped host event .{s} (OOM)", .{@tagName(event)});
             return;
         };
-        defer self.host.gpa.free(line);
+        defer self.gpa.free(line);
         self.journal.append(line);
     }
 
     fn appendLine(self: *HostedSession, line: error{OutOfMemory}![]u8) void {
         const owned = line catch return;
-        defer self.host.gpa.free(owned);
+        defer self.gpa.free(owned);
         self.journal.append(owned);
     }
 
@@ -638,13 +678,13 @@ pub const HostedSession = struct {
         self.pending_request_id = request_id;
         self.mutex.unlock();
 
-        const announce = wire.writeRequest(self.host.gpa, request_id, req) catch |err| {
+        const announce = wire.writeRequest(self.gpa, request_id, req) catch |err| {
             self.mutex.lock();
             self.pending_request_id = 0;
             self.mutex.unlock();
             return err;
         };
-        defer self.host.gpa.free(announce);
+        defer self.gpa.free(announce);
         self.journal.append(announce);
 
         const deadline: ?i128 = if (self.host.options.ui_request_timeout_ms) |ms|
@@ -667,11 +707,11 @@ pub const HostedSession = struct {
         self.mutex.unlock();
 
         if (response) |json| {
-            defer self.host.gpa.free(json);
-            self.appendLine(wire.writeRequestClosed(self.host.gpa, request_id, .answered));
+            defer self.gpa.free(json);
+            self.appendLine(wire.writeRequestClosed(self.gpa, request_id, .answered));
             return wire.parseResponse(req, json, allocator, out);
         }
-        self.appendLine(wire.writeRequestClosed(self.host.gpa, request_id, .cancelled));
+        self.appendLine(wire.writeRequestClosed(self.gpa, request_id, .cancelled));
         return wire.cancelResponse(req, out);
     }
 
@@ -683,6 +723,7 @@ pub const HostedSession = struct {
         self.mutex.lock();
         self.closing = true;
         self.phase = .closing;
+        self.final_permission_mode = self.session.permission_ctx.modeValue();
         const run_id = self.current_run_id;
         self.work_ready.broadcast();
         self.ui_ready.broadcast();
@@ -691,25 +732,40 @@ pub const HostedSession = struct {
         self.driver.join();
     }
 
-    fn teardown(self: *HostedSession) void {
+    /// Everything that needs the kernel: after this the AgentSession is gone
+    /// and the id is free; the shell (journal, snapshot) stays for holders.
+    fn shutdown(self: *HostedSession) void {
         self.stopDriver();
-
         self.journal.close();
         self.mutex.lock();
-        while (self.references > 0) self.released.wait(&self.mutex);
-        const queued = self.queue;
+        while (self.kernel_users > 0) self.kernel_idle.wait(&self.mutex);
+        var queue = self.queue;
         self.queue = .empty;
+        const response = self.response;
+        self.response = null;
         self.mutex.unlock();
-        for (queued.items) |work| self.freeWork(work);
-        var queue = queued;
-        queue.deinit(self.host.gpa);
+        for (queue.items) |work| self.freeWork(work);
+        queue.deinit(self.gpa);
+        if (response) |json| self.gpa.free(json);
 
         self.session.destroy() catch |err| log.err("session_host", "destroy {s}: {s}", .{ self.id.asSlice(), @errorName(err) });
         if (self.writer) |*writer| writer.deinit();
-        if (self.response) |json| self.host.gpa.free(json);
+        self.writer = null;
+    }
+
+    /// Marks a shut-down Session retired; frees it now if nobody holds it.
+    fn retire(self: *HostedSession) void {
+        self.mutex.lock();
+        self.retired = true;
+        const free_now = self.references == 0;
+        self.mutex.unlock();
+        if (free_now) self.destroyShell();
+    }
+
+    fn destroyShell(self: *HostedSession) void {
         self.journal.deinit();
-        self.host.gpa.free(self.model);
-        self.host.gpa.destroy(self);
+        self.gpa.free(self.model);
+        self.gpa.destroy(self);
     }
 };
 
@@ -739,4 +795,75 @@ fn copyStrings(a: std.mem.Allocator, strings: []const []const u8) error{OutOfMem
     const copy = try a.alloc([]const u8, strings.len);
     for (strings, copy) |string, *slot| slot.* = try a.dupe(u8, string);
     return copy;
+}
+
+// ============================================================================
+// Tests (offline; the provider-backed paths are L2 in
+// tests/component/session_host_test.zig)
+// ============================================================================
+
+fn waitForLine(journal: *EventJournal, needle: []const u8) !void {
+    const a = std.testing.allocator;
+    var waited: u32 = 0;
+    while (waited < 1000) : (waited += 1) {
+        if (try journal.waitSince(a, 0, 10)) |lines| {
+            defer {
+                for (lines) |line| a.free(line);
+                a.free(lines);
+            }
+            for (lines) |line| if (std.mem.indexOf(u8, line, needle) != null) return;
+        }
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    return error.JournalTimeout;
+}
+
+test "SessionHost offline: open, queue, snapshot, interrupt, respond, close" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+
+    const runtime = try AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    const config = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        // Nothing listens on the discard port: a Run fails fast, offline.
+        .base_url = "http://127.0.0.1:9",
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{},
+    };
+    try std.testing.expectError(error.IdRequiredForResume, host.open(.{ .config = config, .mode = .@"resume" }));
+    var with_requester = config;
+    with_requester.ui_requester = .{ .ctx = &host, .requestFn = HostedSession.requestUi };
+    try std.testing.expectError(error.UiRequesterNotAllowed, host.open(.{ .config = with_requester }));
+
+    const hosted = try host.open(.{ .config = config });
+    const id = hosted.id;
+    try std.testing.expectError(error.SessionAlreadyOpen, host.open(.{ .config = config, .id = id }));
+    try std.testing.expectEqual(InterruptOutcome.no_run, hosted.interrupt());
+    try std.testing.expectError(error.NoSuchRequest, hosted.respond(1, "{}"));
+
+    try hosted.command(.{ .set_model = "other-model" });
+    try waitForLine(&hosted.journal, "\"type\":\"command_result\"");
+    try hosted.submit(.{ .text = "unreachable provider", .trace_id = "t" });
+    try waitForLine(&hosted.journal, "\"type\":\"user_message\"");
+    _ = hosted.interrupt();
+    try waitForLine(&hosted.journal, "\"type\":\"run_done\"");
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("other-model", snapshot.model);
+    try std.testing.expect(snapshot.seq >= 3);
+
+    const ids = try host.list(a);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    host.release(hosted);
+    try host.close(id);
+    try std.testing.expectError(error.SessionNotFound, host.close(id));
 }

@@ -35,7 +35,8 @@ status, compatibility boundaries, and entry points are defined by
   FIFO per Session on its driver thread, every event lands in a replayable
   journal as wire lines with `run_id`/`trace_id`, UI requests are answered by
   id, `interrupt` also releases a pending prompt, a poisoned Session is
-  reported and refuses work, and `close` waits for every reference. A cloud
+  reported and refuses work, and `close` frees the id at once while holders
+  keep a readable shell until they release it. A cloud
   Host had rebuilt this by hand with a 5-minute watchdog, an interrupt that
   could not reach a pending prompt and a fresh session that resumed the old
   transcript; this is the kernel-side version. `EventJournal` moved from
