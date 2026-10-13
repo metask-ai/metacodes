@@ -676,10 +676,15 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
         if (!sb.enabled) break :blk raw_command;
         const sandbox_exec = @import("../sandbox/exec.zig");
         const cwd = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else ".";
+        // In a linked git worktree, `git commit` writes the main repository's
+        // .git, outside the worktree: allow it, as the profile intends.
+        const main_git_dir = if (ctx.cwd_abs.len > 0) sandbox_exec.linkedWorktreeGitDir(allocator, ctx.cwd_abs) else null;
+        defer if (main_git_dir) |g| allocator.free(g);
         const maybe = sandbox_exec.wrapAsShellString(allocator, raw_command, .{
             .cwd = cwd,
             .home = ctx.home_dir,
             .sandbox = sb,
+            .main_git_dir = main_git_dir,
             .additional_dirs = ctx.additional_dirs,
             .disable_for_this_command = sandbox_exec.escapeHatchHonored(sb, args),
         }) catch |e| {

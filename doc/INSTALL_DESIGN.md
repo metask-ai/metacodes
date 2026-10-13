@@ -91,10 +91,13 @@ run from an extracted release unit or one staged from source (`release:verify`):
    version order, pre-releases before their release, build metadata ignored)
    unless `--allow-downgrade` (or `--force`), so the installer's "latest
    release" path cannot move an install backwards when GitHub's Latest label
-   points at an older version. The unit being installed makes this check, so
-   it holds for units that carry it: releases up to 0.5.0 predate it, replace
-   a newer install as before and reject `--allow-downgrade` as an unknown
-   option;
+   points at an older version. The unit being installed makes this check.
+   Releases up to 0.5.0 predate it (their `install --help` does not name
+   `--allow-downgrade`, which they reject as unknown); for those,
+   `scripts/install.sh` and `scripts/install.ps1` compare the unit's
+   `manifest.json` version with the prefix's install record themselves, in
+   the same order (one table, `version_order_cases`, holds all three
+   implementations), and pass `--allow-downgrade` only to a unit that knows it;
    refuses a bad `--sdk` bundle and a taken launcher name (step 5) before it
    writes anything; writes only under `<prefix>`, the state root and the
    `--link` directory;

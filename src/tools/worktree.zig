@@ -5,7 +5,8 @@
 //!     - 若提供 path:切换到该已存在的 worktree(必须在 `git worktree list` 中)
 //!     - 否则:在 .metacodes/worktrees/<name|random>/ 创建新 worktree,基于 base 分支
 //!       (base 缺省 = 当前 default branch,简化为 HEAD)
-//!     - 进入 = chdir + 在 ToolContext 上把 worktree 状态推到一个栈
+//!     - 进入 = chdir + 经 HostServices 压栈;宿主同时把会话工作根切到该 worktree,之后每次
+//!       工具调用(本 Run 余下的与以后的 Run)都从它开始(Bash 的子进程 cwd 等)
 //!     - 返回 JSON: {"worktree":"...","branch":"...","entered":true}
 //!
 //!   ExitWorktree(action, discard_changes?)
@@ -14,8 +15,9 @@
 //!     - discard_changes=true → 即使有未提交也强制 remove(否则 git 拒绝)
 //!     - 返回 JSON: {"left":"...","removed":bool,"original_cwd":"..."}
 //!
-//! 状态:App.worktree_stack:[]struct{worktree, original_cwd}
-//!       Enter 时 push,Exit 时 pop。
+//! 状态:App.worktree_stack:[]struct{worktree, original_cwd}(App 自己的内存)
+//!       Enter 时 push,Exit 时 pop。进程 cwd、栈与会话工作根三者一起动:宿主不支持
+//!       就先拒绝,任何一步失败都退回原状,不留下"进程在 worktree、会话不知道"的状态。
 
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -43,14 +45,15 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const path = try path_mod.normalizeChecked(a, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
         defer a.free(path);
         if (!worktreeExists(a, path)) return error.WorktreePathNotFound;
+        try requireWorktreeHooks(ctx);
         const old_cwd = try getCwd(a);
-        try chdir(path);
-        try pushWorktree(ctx, path, old_cwd);
-        a.free(old_cwd);
+        defer a.free(old_cwd);
+        const entered = try enter(ctx, path, old_cwd);
+        defer a.free(entered);
         var reply: std.Io.Writer.Allocating = .init(a);
         defer reply.deinit();
         try reply.writer.writeAll("{\"worktree\":");
-        try util_json.writeJsonString(&reply.writer, path);
+        try util_json.writeJsonString(&reply.writer, entered);
         try reply.writer.writeAll(",\"entered\":true,\"created\":false}");
         return reply.toOwnedSlice();
     }
@@ -66,6 +69,7 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer if (name_opt == null) a.free(name);
 
     const base = common.extractJsonArg(args, "base") orelse "HEAD";
+    try requireWorktreeHooks(ctx);
 
     // 路径:<cwd>/.metacodes/worktrees/<name>
     const cwd = try getCwd(a);
@@ -113,13 +117,13 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return reply.toOwnedSlice();
     }
 
-    try chdir(wt_path);
-    try pushWorktree(ctx, wt_path, cwd);
+    const entered = try enter(ctx, wt_path, cwd);
+    defer a.free(entered);
 
     var reply: std.Io.Writer.Allocating = .init(a);
     defer reply.deinit();
     try reply.writer.writeAll("{\"worktree\":");
-    try util_json.writeJsonString(&reply.writer, wt_path);
+    try util_json.writeJsonString(&reply.writer, entered);
     try reply.writer.writeAll(",\"branch\":");
     try util_json.writeJsonString(&reply.writer, name);
     try reply.writer.writeAll(",\"entered\":true,\"created\":true}");
@@ -137,14 +141,18 @@ pub fn exitExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         break :blk std.mem.eql(u8, v, "true");
     };
 
+    try requireWorktreeHooks(ctx);
+    // The host has already made the original directory the working root again;
+    // if the process cannot follow, the entry (and that root) go back.
     const entry = try popWorktree(ctx) orelse return error.NotInWorktree;
     defer {
         a.free(entry.worktree_path);
         a.free(entry.original_cwd);
     }
-
-    // 先切回去
-    try chdir(entry.original_cwd);
+    chdir(entry.original_cwd) catch |err| {
+        pushWorktree(ctx, entry.worktree_path, entry.original_cwd) catch {};
+        return err;
+    };
 
     var removed = false;
     if (std.mem.eql(u8, action, "remove")) {
@@ -182,10 +190,30 @@ pub fn exitExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 // Worktree 栈管理 — 通过 ToolContext 上的 callback 回到 App
 // ============================================================================
 
+/// Checked after the arguments, before git or chdir: a host without the hooks
+/// (a subagent, a backgrounded session) must not end up in a worktree it does
+/// not know about.
+fn requireWorktreeHooks(ctx: *const ToolContext) !void {
+    const hs = ctx.host_services orelse return error.WorktreeStateUnavailable;
+    if (!hs.canSwitchWorktree()) return error.WorktreeStateUnavailable;
+}
+
+/// chdir into `target` and register it with the host as the working root, by
+/// its physical path (the one getcwd and every later tool call see). Any
+/// failure puts the process back in `from`. Returns that path (caller frees).
+fn enter(ctx: *const ToolContext, target: []const u8, from: []const u8) ![]u8 {
+    try chdir(target);
+    errdefer chdir(from) catch {};
+    const physical = try getCwd(ctx.allocator);
+    errdefer ctx.allocator.free(physical);
+    try pushWorktree(ctx, physical, from);
+    return physical;
+}
+
 fn pushWorktree(ctx: *const ToolContext, wt_path: []const u8, cwd: []const u8) !void {
     const hs = ctx.host_services orelse return error.WorktreeStateUnavailable;
     // 单一失败点:能力缺失映射成 WorktreeStateUnavailable;真实 push 错误(如 OOM)照常上抛。
-    hs.worktreePush(ctx.allocator, wt_path, cwd) catch |e| switch (e) {
+    hs.worktreePush(wt_path, cwd) catch |e| switch (e) {
         error.HostCapabilityUnavailable => return error.WorktreeStateUnavailable,
         else => return e,
     };
@@ -219,12 +247,14 @@ fn mkdirP(path: []const u8) !void {
 }
 
 fn worktreeExists(allocator: std.mem.Allocator, path: []const u8) bool {
-    // 简单 stat:目录存在即认为是 worktree(更严格的方法是 git worktree list 然后匹配)
+    // 目录存在即认为是 worktree(更严格的方法是 git worktree list 然后匹配)。按目录打开:
+    // 以文件方式 open 一个目录在 Windows 上总是失败(EnterWorktree path= 在那里从来进不去),
+    // 而一个普通文件也不是 worktree。
     const path_z = allocator.dupeZ(u8, path) catch return false;
     defer allocator.free(path_z);
-    const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return false;
-    _ = pfs.close(fd);
+    const pdir = @import("platform").dir;
+    var iterator = pdir.open(path_z.ptr) orelse return false;
+    pdir.close(&iterator);
     return true;
 }
 
@@ -259,9 +289,8 @@ test "ExitWorktree: not in worktree errors" {
     defer state.deinit(testing.allocator);
     var ctx = ToolContext.simple(testing.allocator);
     const Hook = struct {
-        fn push(s: *anyopaque, a: std.mem.Allocator, wt: []const u8, cwd: []const u8) anyerror!void {
+        fn push(s: *anyopaque, wt: []const u8, cwd: []const u8) anyerror!void {
             _ = s;
-            _ = a;
             _ = wt;
             _ = cwd;
         }
@@ -274,4 +303,39 @@ test "ExitWorktree: not in worktree errors" {
     };
     ctx.host_services = .{ .ctx = @ptrCast(&state), .worktreePushFn = &Hook.push, .worktreePopFn = &Hook.pop };
     try testing.expectError(error.NotInWorktree, exitExecute(&ctx, "{\"action\":\"keep\"}"));
+}
+
+test "EnterWorktree: a host without the hooks is refused before the process moves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buf);
+    const before = try getCwd(testing.allocator);
+    defer testing.allocator.free(before);
+    var ctx = ToolContext.simple(testing.allocator);
+    const args = try std.fmt.allocPrint(testing.allocator, "{f}", .{std.json.fmt(.{ .path = buf[0..len] }, .{})});
+    defer testing.allocator.free(args);
+    // No host at all, and a host that can activate skills but not switch worktrees.
+    try testing.expectError(error.WorktreeStateUnavailable, enterExecute(&ctx, args));
+    const Skill = struct {
+        fn activate(_: *anyopaque, _: []const u8, _: []const []const u8, _: []const []const u8) anyerror!void {}
+    };
+    var unused: u8 = 0;
+    ctx.host_services = (@import("context.zig").HostServices{ .ctx = @ptrCast(&unused), .activateSkillFn = &Skill.activate }).skillOnly();
+    try testing.expectError(error.WorktreeStateUnavailable, enterExecute(&ctx, args));
+    const after = try getCwd(testing.allocator);
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "EnterWorktree: an existing directory is found on every platform, a file is not a worktree" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buf);
+    try testing.expect(worktreeExists(testing.allocator, buf[0..len]));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "plain.txt", .data = "x" });
+    const file = try std.fs.path.join(testing.allocator, &.{ buf[0..len], "plain.txt" });
+    defer testing.allocator.free(file);
+    try testing.expect(!worktreeExists(testing.allocator, file));
 }

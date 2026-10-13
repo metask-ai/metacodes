@@ -268,6 +268,65 @@ fn writeTempProfile(alloc: std.mem.Allocator, content: []const u8) ![]u8 {
 // Tests
 // ============================================================================
 
+/// The common `.git` directory of the linked git worktree that `dir` lies in,
+/// or null when `dir` is not inside one (a main checkout, no repository, a
+/// submodule). A command in a linked worktree writes there for `git commit`
+/// (objects, refs, `worktrees/<name>/`), and that directory is outside the
+/// worktree, so the sandbox has to allow it (`WrapOptions.main_git_dir`). Read
+/// from git's own layout, no git process: the worktree's `.git` file names its
+/// gitdir, whose `commondir` names the common directory relative to it.
+/// Physical path (owned by `alloc`), as the profile's other roots.
+pub fn linkedWorktreeGitDir(alloc: std.mem.Allocator, dir: []const u8) ?[]u8 {
+    if (!std.fs.path.isAbsolute(dir)) return null;
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var current: []const u8 = dir;
+    while (true) {
+        const dot_git = std.fmt.bufPrintZ(&buf, "{s}{s}.git", .{ current, if (std.mem.endsWith(u8, current, "/")) "" else "/" }) catch return null;
+        if (pfs.statMode(dot_git.ptr, false)) |mode| {
+            // A `.git` directory is a main checkout; only a file points elsewhere.
+            if (mode & 0o170000 != 0o100000) return null;
+            var line_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+            const line = readSmall(dot_git, &line_buf) orelse return null;
+            const prefix = "gitdir:";
+            if (!std.mem.startsWith(u8, line, prefix)) return null;
+            const gitdir_raw = std.mem.trim(u8, line[prefix.len..], " \t");
+            var gitdir_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+            const gitdir = (if (std.fs.path.isAbsolute(gitdir_raw))
+                std.fmt.bufPrint(&gitdir_buf, "{s}", .{gitdir_raw})
+            else
+                std.fmt.bufPrint(&gitdir_buf, "{s}/{s}", .{ current, gitdir_raw })) catch return null;
+            const commondir_path = std.fmt.bufPrintZ(&buf, "{s}/commondir", .{gitdir}) catch return null;
+            var common_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+            const common_raw = readSmall(commondir_path, &common_buf) orelse return null;
+            const common = (if (std.fs.path.isAbsolute(common_raw))
+                std.fmt.bufPrintZ(&buf, "{s}", .{common_raw})
+            else
+                std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ gitdir, common_raw })) catch return null;
+            var real_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+            const real = pfs.realpath(common.ptr, &real_buf) orelse return null;
+            return alloc.dupe(u8, std.mem.span(real)) catch null;
+        }
+        const parent = std.fs.path.dirname(current) orelse return null;
+        if (parent.len == current.len) return null;
+        current = parent;
+    }
+}
+
+/// The first line of a small file, trimmed; null when it cannot be read.
+fn readSmall(path: [:0]const u8, buf: []u8) ?[]const u8 {
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer pfs.close(fd);
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = pfs.readZ(fd, buf[len..]) catch return null;
+        if (n == 0) break;
+        len += n;
+    }
+    const first = std.mem.sliceTo(buf[0..len], '\n');
+    const line = std.mem.trim(u8, first, " \t\r");
+    return if (line.len > 0) line else null;
+}
+
 const testing = std.testing;
 
 test "wrapCommand: disabled → passthrough" {
@@ -388,4 +447,89 @@ fn runShell(alloc: std.mem.Allocator, cmd: []const u8) ![]u8 {
     const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], alloc, null, 10_000, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
     alloc.free(out.stderr);
     return out.stdout;
+}
+
+test "linkedWorktreeGitDir: a linked worktree names its common .git, a main checkout nothing" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+    // main/.git is a directory with a linked worktree's private gitdir in it;
+    // wt/.git is the file git writes there (absolute), rel/.git the relative form.
+    try tmp.dir.createDirPath(testing.io, "main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(testing.io, "main/sub");
+    try tmp.dir.createDirPath(testing.io, "wt/deep/er");
+    try tmp.dir.createDirPath(testing.io, "rel");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "main/.git/worktrees/wt/commondir", .data = "../..\n" });
+    const pointer = try std.fmt.allocPrint(alloc, "gitdir: {s}/main/.git/worktrees/wt\n", .{root});
+    defer alloc.free(pointer);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "wt/.git", .data = pointer });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "rel/.git", .data = "gitdir: ../main/.git/worktrees/wt\n" });
+    const expected = try std.fmt.allocPrint(alloc, "{s}/main/.git", .{root});
+    defer alloc.free(expected);
+
+    for ([_][]const u8{ "wt", "wt/deep/er", "rel" }) |inside| {
+        const dir = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, inside });
+        defer alloc.free(dir);
+        const got = linkedWorktreeGitDir(alloc, dir) orelse return error.TestExpectedGitDir;
+        defer alloc.free(got);
+        try testing.expectEqualStrings(expected, got);
+    }
+    for ([_][]const u8{ "main", "main/sub" }) |checkout| {
+        const dir = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, checkout });
+        defer alloc.free(dir);
+        try testing.expect(linkedWorktreeGitDir(alloc, dir) == null);
+    }
+    // A `.git` file without a commondir (a submodule's) is no linked worktree.
+    try tmp.dir.createDirPath(testing.io, "modules/sm");
+    try tmp.dir.createDirPath(testing.io, "sm");
+    const sm_pointer = try std.fmt.allocPrint(alloc, "gitdir: {s}/modules/sm\n", .{root});
+    defer alloc.free(sm_pointer);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sm/.git", .data = sm_pointer });
+    const sm = try std.fmt.allocPrint(alloc, "{s}/sm", .{root});
+    defer alloc.free(sm);
+    try testing.expect(linkedWorktreeGitDir(alloc, sm) == null);
+}
+
+test "e2e: git commit in a linked worktree needs its common .git writable, and gets it" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!sandboxExecAvailable()) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    // Not under /tmp or $TMPDIR: the profile lets every command write there,
+    // which would hide the main repository's .git being outside the worktree.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+    const setup = try std.fmt.allocPrint(alloc, "set -e; cd {s}; git init -q main; cd main; " ++
+        "git -c user.email=t@t -c user.name=t commit -q --allow-empty -m seed; git worktree add -q ../wt -b wt; echo READY", .{root});
+    defer alloc.free(setup);
+    const ready = try runShell(alloc, setup);
+    defer alloc.free(ready);
+    if (std.mem.indexOf(u8, ready, "READY") == null) return error.SkipZigTest; // no git here
+    const wt = try std.fmt.allocPrint(alloc, "{s}/wt", .{root});
+    defer alloc.free(wt);
+    const git_dir = linkedWorktreeGitDir(alloc, wt) orelse return error.TestExpectedGitDir;
+    defer alloc.free(git_dir);
+    try testing.expect(std.mem.endsWith(u8, git_dir, "/main/.git"));
+
+    const sb = config_mod.SandboxSettings{ .enabled = true };
+    const commit = try std.fmt.allocPrint(alloc, "cd {s} && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m in-sandbox 2>&1 && echo COMMITTED || echo REFUSED", .{wt});
+    defer alloc.free(commit);
+    // Without the common directory the commit cannot write its objects...
+    {
+        var w = (try wrapAsShellString(alloc, commit, .{ .cwd = wt, .home = "/Users/x", .sandbox = &sb })).?;
+        defer w.deinit();
+        const out = try runShell(alloc, w.command);
+        defer alloc.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "REFUSED") != null);
+    }
+    // ...with it, it can.
+    var w = (try wrapAsShellString(alloc, commit, .{ .cwd = wt, .home = "/Users/x", .sandbox = &sb, .main_git_dir = git_dir })).?;
+    defer w.deinit();
+    const out = try runShell(alloc, w.command);
+    defer alloc.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "COMMITTED") != null);
 }

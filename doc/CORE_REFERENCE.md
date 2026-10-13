@@ -722,7 +722,7 @@ connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt
 | `EventSink` | `agent_session` | Session 级 `CoreEvent` 消费（文本、工具、usage、progress、诊断） |
 | `UiBackend` | `protocol/ui_backend` | 低层 `agent_loop.run` 的 emit/poll 事件面 |
 | `UiRequester` | `protocol/ui_request` | 交互式 UI 请求(§3.4)，可返回 answered/pending/unavailable |
-| `HostServices` | `tools/context` | Skill/ToolSearch 激活与 Worktree push/pop 的宿主 RPC |
+| `HostServices` | `tools/context` | Skill/ToolSearch 激活、Worktree push/pop 与当前工作根(`workingRoot`)的宿主 RPC;工具每次调用从 `workingRoot` 开始,EnterWorktree/ExitWorktree 中途切换它 |
 | `ToolProgressReporter` | `tools/context` | 工具执行内进度(id, phase, text, count;WebSearch 用) |
 | `ToolObservationSink` | `tools/observation` | UI-independent 的实际 dispatch 观察 |
 

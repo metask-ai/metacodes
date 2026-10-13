@@ -73,8 +73,15 @@ pub const HostServices = struct {
     ctx: *anyopaque,
     activateSkillFn: ?*const fn (ctx: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void = null,
     activateToolFn: ?*const fn (ctx: *anyopaque, tool_name: []const u8) anyerror!void = null,
-    worktreePushFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, wt_path: []const u8, original_cwd: []const u8) anyerror!void = null,
+    /// The host copies both paths into memory of its own (the caller's are per-call)
+    /// and makes `wt_path` the session's working root.
+    worktreePushFn: ?*const fn (ctx: *anyopaque, wt_path: []const u8, original_cwd: []const u8) anyerror!void = null,
+    /// The host drops the top entry, makes its `original_cwd` the working root again
+    /// and returns a copy in `allocator` (the caller's to free); null when empty.
     worktreePopFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?@import("worktree.zig").WorktreeEntry = null,
+    /// The session's working root now (absolute; may move mid-Run with the
+    /// worktree hooks above). Borrowed: the host never frees a root it gave out.
+    workingRootFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
 
     pub const Error = error{HostCapabilityUnavailable};
 
@@ -88,15 +95,28 @@ pub const HostServices = struct {
         const f = self.activateToolFn orelse return Error.HostCapabilityUnavailable;
         return f(self.ctx, tool_name);
     }
-    /// EnterWorktree 压栈。无 fn → HostCapabilityUnavailable(工具映射成 WorktreeStateUnavailable)。
-    pub fn worktreePush(self: HostServices, allocator: std.mem.Allocator, wt_path: []const u8, original_cwd: []const u8) anyerror!void {
+    /// EnterWorktree 压栈并切换工作根。无 fn → HostCapabilityUnavailable(工具映射成 WorktreeStateUnavailable)。
+    pub fn worktreePush(self: HostServices, wt_path: []const u8, original_cwd: []const u8) anyerror!void {
         const f = self.worktreePushFn orelse return Error.HostCapabilityUnavailable;
-        return f(self.ctx, allocator, wt_path, original_cwd);
+        return f(self.ctx, wt_path, original_cwd);
     }
-    /// ExitWorktree 弹栈。无 fn → HostCapabilityUnavailable。
+    /// ExitWorktree 弹栈并切回工作根。无 fn → HostCapabilityUnavailable。
     pub fn worktreePop(self: HostServices, allocator: std.mem.Allocator) anyerror!?@import("worktree.zig").WorktreeEntry {
         const f = self.worktreePopFn orelse return Error.HostCapabilityUnavailable;
         return f(self.ctx, allocator);
+    }
+    /// Whether EnterWorktree / ExitWorktree can work here at all: checked before
+    /// they touch the process cwd or git, so a host without the hooks never ends
+    /// up in a worktree it does not know about.
+    pub fn canSwitchWorktree(self: HostServices) bool {
+        return self.worktreePushFn != null and self.worktreePopFn != null;
+    }
+    /// The session's current working root, or null when the host does not track
+    /// one (each tool call then keeps the root its Run started with).
+    pub fn workingRoot(self: HostServices) ?[]const u8 {
+        const f = self.workingRootFn orelse return null;
+        const root = f(self.ctx);
+        return if (root.len > 0) root else null;
     }
 
     /// 投影成"只保留 skill 激活"的子集(其余能力清空)。subagent 用:它能激活 skill,但
@@ -104,6 +124,14 @@ pub const HostServices = struct {
     /// 或父的 ToolSearch activated 集(隔离)。对齐 L5 前 subagent 只接 skill_activator 的语义。
     pub fn skillOnly(self: HostServices) HostServices {
         return .{ .ctx = self.ctx, .activateSkillFn = self.activateSkillFn };
+    }
+
+    /// Everything but the worktree hooks and the working root. For a main session
+    /// moved to the background (Ctrl+B): it shares the App with the foreground,
+    /// and EnterWorktree would chdir the whole process under it. It keeps the root
+    /// it was handed and cannot switch worktrees.
+    pub fn withoutWorktree(self: HostServices) HostServices {
+        return .{ .ctx = self.ctx, .activateSkillFn = self.activateSkillFn, .activateToolFn = self.activateToolFn };
     }
 };
 

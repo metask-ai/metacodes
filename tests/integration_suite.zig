@@ -114,6 +114,7 @@ test {
     _ = @import("component/add_dir_test.zig");
     _ = @import("component/session_api_parity_test.zig");
     _ = @import("component/workspace_root_refresh_test.zig");
+    _ = @import("component/worktree_root_test.zig");
     _ = @import("component/environment_fault_stop_test.zig");
     _ = @import("component/permission_name_normalization_test.zig");
     _ = @import("component/dialect_matrix_test.zig");

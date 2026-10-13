@@ -676,6 +676,12 @@ pub fn executeOne(
     defer arena.deinit();
     var job_ctx = base_ctx.*;
     job_ctx.allocator = arena.allocator();
+    // The working root can move mid-Run (EnterWorktree / ExitWorktree): each call
+    // starts from the host's current root, not the one the Run began with. The
+    // host never frees a root it handed out, so the borrow outlives the call.
+    if (base_ctx.host_services) |hs| if (hs.workingRoot()) |root| {
+        job_ctx.cwd_abs = root;
+    };
     // per-toolUse 进度路由:盖上本 tool_use id,reportProgress 据此找对应卡。
     job_ctx.progress_tool_id = id;
     // 富错误 detail 槽:工具可在抛错前写入,替代通用 "X failed with Y"。

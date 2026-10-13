@@ -50,10 +50,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (!sb.enabled) break :blk command;
         const sandbox_exec = @import("../sandbox/exec.zig");
         const cwd = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else ".";
+        // In a linked git worktree, `git commit` writes the main repository's
+        // .git, outside the worktree: allow it, as the profile intends.
+        const main_git_dir = if (ctx.cwd_abs.len > 0) sandbox_exec.linkedWorktreeGitDir(ctx.allocator, ctx.cwd_abs) else null;
+        defer if (main_git_dir) |g| ctx.allocator.free(g);
         const maybe = sandbox_exec.wrapAsShellString(ctx.allocator, command, .{
             .cwd = cwd,
             .home = ctx.home_dir,
             .sandbox = sb,
+            .main_git_dir = main_git_dir,
             .additional_dirs = ctx.additional_dirs,
             .disable_for_this_command = false, // Monitor 无 dangerouslyDisableSandbox 参数
         }) catch |e| {

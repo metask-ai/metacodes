@@ -64,7 +64,8 @@ credentials, TinyKG store, sessions, plans, Lean rules) in its own state root,
 `<prefix>/etc/metacodes/install.json`. Several installs coexist on one machine;
 give each its own `--prefix` and launcher name (`--link-name`). `--sdk` adds the
 AgentCore SDK under `<prefix>/sdk/agentcore/` (`include/metask/agentcore.h`,
-`lib/`, Zig and Rust bindings). The scripts only unpack; the install is
+`lib/`, Zig and Rust bindings). The scripts only unpack (and refuse a
+downgrade for a release up to 0.5.0, whose own install does not); the install is
 `bin/metacodes install` (`--help` lists its options), which ends with the
 installed `doctor --strict`; `--upgrade` replaces another version of the same
 product (the scripts always pass it) but not a newer one with an older one

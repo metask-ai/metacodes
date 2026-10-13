@@ -107,6 +107,25 @@ status, compatibility boundaries, and entry points are defined by
   web or cloud UI became a lasting grant for every later CLI session there.
   `PermissionContext.always_allow` now defaults to `session`; only the App
   (CLI, TUI, `--web`) opts into `settings_file`.
+- EnterWorktree moves the session into the worktree, not just the process.
+  It used to chdir and record the entry while the session's working root
+  stayed put, so Bash (and every tool working from that root) kept running
+  in the original checkout for the rest of the session while relative file
+  paths followed the process: two trees at once. Now the root moves with it:
+  every later tool call in the same Run starts from the worktree, the next
+  Run's options and system prompt name it, the permission working-directory
+  check covers it, and ExitWorktree brings all of it back. A tool call after
+  EnterWorktree or ExitWorktree in the same response is no longer started
+  ahead of it by the stream prefetch. The worktree stack lived in the
+  EnterWorktree call's scratch memory, so ExitWorktree read freed memory and
+  quitting freed it a second time (a crash in debug builds); it is the
+  session's own now. EnterWorktree and ExitWorktree refuse before touching
+  git or the directory when the host cannot track a worktree (a subagent, or
+  a session moved to the background with Ctrl+B, which shares the process
+  with the foreground), and a failed step puts the directory back. With the
+  sandbox on, a command in a linked worktree may write the main repository's
+  `.git`, so `git commit` works there. Project settings are not reloaded
+  from the worktree.
 - The installer no longer downgrades an install silently. `scripts/install.sh`
   passes `--upgrade` on every run and fetches whatever GitHub labels the latest
   release, and `metacodes install --upgrade` replaced any other version, so a
@@ -114,9 +133,11 @@ status, compatibility boundaries, and entry points are defined by
   version. An older unit now replaces a newer install only with
   `--allow-downgrade` (`install.sh --allow-downgrade`, `install.ps1
   -AllowDowngrade`) or `--force`, and an allowed downgrade says so. The unit
-  being installed makes the check, so it protects against units from the next
-  release on: releases up to 0.5.0 still replace a newer install without
-  asking, and do not know `--allow-downgrade`.
+  being installed makes the check; for a release up to 0.5.0, which predates
+  it, `install.sh` and `install.ps1` make the same check before running the
+  unit, in the same version order, and pass `--allow-downgrade` only to a unit
+  that knows it. Only running such an older unit's `bin/metacodes install
+  --upgrade` by hand still replaces a newer install.
 - A launcher name held by another metacodes install is reported as such:
   `install failed (LinkOwnedByAnotherInstall)` names that launcher's install
   prefix and version, and says how to update it, install side by side or take
@@ -166,6 +187,15 @@ status, compatibility boundaries, and entry points are defined by
   no longer opens and closes a connection before the request. A TinyKG
   service that fails to start after `tinykgd` has answered no longer leaks
   the bridge's read buffer: the supervisor stopped the copy it moved from.
+- The TinyKG startup/resume smoke (`tests/e2e/process_dag_resume_smoke.sh`)
+  works again and runs in `zig build test` on POSIX hosts. It still seeded
+  tasks into the store the command-line transport uses, which sessions stopped
+  reading when the local service became their path, so it failed before its
+  check on every run and left a `kgd` behind. It now starts the state root's
+  service itself (`kg install` + `kgd`), seeds through the service's
+  `/api/run` (`tests/e2e/kgd_api.py`), runs the sessions with autostart off and
+  every `METACODES_KG_*` override removed, stops the service on exit and fails
+  if any TinyKG process is left.
 
 ## 0.5.0 — 2026-10-11
 

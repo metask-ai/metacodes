@@ -55,13 +55,18 @@ The repository is currently public for review, but release readiness is **not ye
       and the `rule-control` gate run on ephemeral hosted runners too; the
       dedicated `metacodes-release` pool is no longer planned
       (`doc/RELEASE_RUNNER.md`).
-- [ ] Tag an immutable pre-release and publish its checksums: run
-      `.github/workflows/release.yml` (`workflow_dispatch`, `dry_run: false`)
-      for a `0.x.y-dev` commit, verify one unpacked
-      archive per platform with `scripts/verify_release_bundle.py --native`,
-      then publish the draft it created (archives, `.sha256` sidecars and
-      `metacodes-<version>-SHA256SUMS`). SBOM/provenance attestations remain
-      a separate item.
+- [x] Tag an immutable release and publish its checksums (2026-10-11, 0.5.0;
+      0.1.0–0.4.0 before it). Planned as a `0.x.y-dev` pre-release; the
+      release automation (`doc/RELEASE_AUTOMATION_DESIGN.md`) shipped stable
+      releases instead. For 0.5.0, `release.yml` run 38111469169 succeeded on
+      Linux, macOS and Windows: each staged the release unit and verified it
+      natively (`zig build release:verify`, i.e.
+      `scripts/verify_release_bundle.py --native`), ran the AgentCore gate and
+      rebuilt the archive byte for byte. The published release carries the
+      archives, `.sha256` sidecars and `metacodes-0.5.0-SHA256SUMS`, and
+      GitHub reports it `immutable`. No unpacked *downloaded* archive was
+      re-verified per platform. SBOM/provenance attestations remain a separate
+      item.
 
 Treating the public repository as release-approved requires all blocking owner
 decisions, not merely a green build.

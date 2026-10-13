@@ -426,8 +426,10 @@ pub const App = struct {
     hooks: ?@import("permission/hooks.zig").HookSet = null,
     /// 会话根目录:启动时对进程 cwd 拍的字符串快照。读它的有七处(Bash 子进程 chdir、
     /// Read/Write/Edit/Glob 的 base_dir、权限 match_ctx.cwd、沙箱 profile、系统提示词、
-    /// project_dir、KG 项目目录),而 agent 的工作本身就会改名/搬走目录。它的唯一 owner 是
-    /// `refreshWorkspaceRoot`:每轮 run 装配前校验一次,改名了就整体跟过去。
+    /// project_dir、KG 项目目录),而 agent 的工作本身就会改名/搬走目录。写它的只有两条路:
+    /// `refreshWorkspaceRoot`(每轮 run 装配前校验一次,改名了就整体跟过去)与
+    /// `switchWorkingRoot`(EnterWorktree / ExitWorktree,run 中途也会发生;工具每次调用经
+    /// HostServices.workingRoot 读当前值)。旧串一律退役,不释放。
     cwd_abs: ?[]u8 = null,
     /// `refreshWorkspaceRoot` 已就"目录不存在"提醒过(每个状态只提醒一次,不刷屏)。
     root_missing_warned: bool = false,
@@ -2817,31 +2819,78 @@ pub const App = struct {
         return &runtime.advisor;
     }
 
-    /// EnterWorktree 工具用:把新 worktree 入栈。
-    pub fn worktreePushTrampoline(
-        state: *anyopaque,
-        allocator: std.mem.Allocator,
-        wt_path: []const u8,
-        original_cwd: []const u8,
-    ) anyerror!void {
+    /// EnterWorktree: the tool has moved the process into `wt_path` (absolute);
+    /// record where it came from and make the worktree the session's working
+    /// root. The stack is the App's: the paths the tool passes live in its
+    /// per-call arena, gone when the call returns.
+    pub fn worktreePushTrampoline(state: *anyopaque, wt_path: []const u8, original_cwd: []const u8) anyerror!void {
         const app: *App = @ptrCast(@alignCast(state));
-        const entry = WorktreeEntry{
-            .worktree_path = try allocator.dupe(u8, wt_path),
-            .original_cwd = try allocator.dupe(u8, original_cwd),
-        };
-        try app.worktree_stack.append(allocator, entry);
+        const worktree_path = try app.allocator.dupe(u8, wt_path);
+        errdefer app.allocator.free(worktree_path);
+        const original = try app.allocator.dupe(u8, original_cwd);
+        errdefer app.allocator.free(original);
+        try app.worktree_stack.append(app.allocator, .{ .worktree_path = worktree_path, .original_cwd = original });
+        errdefer _ = app.worktree_stack.pop();
+        try app.switchWorkingRoot(worktree_path, true);
     }
 
-    /// ExitWorktree 工具用:从栈顶弹出。返 null 表示当前不在任何 worktree。
+    /// ExitWorktree: make the top entry's original directory the working root
+    /// again and hand the caller a copy of the entry in `allocator`. Nothing
+    /// changes unless all of that succeeds. Null when not in a worktree.
     pub fn worktreePopTrampoline(state: *anyopaque, allocator: std.mem.Allocator) anyerror!?WorktreeEntry {
-        _ = allocator;
         const app: *App = @ptrCast(@alignCast(state));
-        if (app.worktree_stack.items.len == 0) return null;
-        return app.worktree_stack.pop();
+        const top = if (app.worktree_stack.items.len > 0) app.worktree_stack.items[app.worktree_stack.items.len - 1] else return null;
+        const copy = WorktreeEntry{
+            .worktree_path = try allocator.dupe(u8, top.worktree_path),
+            .original_cwd = try allocator.dupe(u8, top.original_cwd),
+        };
+        errdefer {
+            allocator.free(copy.worktree_path);
+            allocator.free(copy.original_cwd);
+        }
+        try app.switchWorkingRoot(top.original_cwd, app.worktree_stack.items.len > 1);
+        _ = app.worktree_stack.pop();
+        app.allocator.free(top.worktree_path);
+        app.allocator.free(top.original_cwd);
+        return copy;
     }
 
-    /// L5:把 App 提供给工具的三类宿主能力(Skill 激活 / ToolSearch 激活 / Worktree push-pop)
-    /// 聚合成一个 HostServices——一个 ctx(=app)+ 四个 trampoline,取代散落的四个裸字段。
+    /// The working root tools start each call from (`HostServices.workingRoot`).
+    fn workingRootTrampoline(state: *anyopaque) []const u8 {
+        const app: *App = @ptrCast(@alignCast(state));
+        return app.cwdAbs();
+    }
+
+    /// Moves the session's working root to `path` (absolute) for EnterWorktree /
+    /// ExitWorktree. Like `adoptWorkspaceRoot`, the old strings are retired, never
+    /// freed: the running Run and other threads may still hold them. Unlike it,
+    /// settings are not reloaded: a Run in flight borrows them (reloading frees
+    /// what it holds), and a worktree branch's own `.metacodes/settings.json`
+    /// must not widen the session's permissions behind its back. The session
+    /// identity (transcript, KG project, memory) stays where the session began.
+    fn switchWorkingRoot(app: *App, path: []const u8, in_worktree: bool) !void {
+        const owned = try app.allocator.dupe(u8, path);
+        const old_root = app.cwd_abs;
+        app.cwd_abs = owned;
+        app.permission_ctx.match_ctx.cwd = owned;
+        // A worktree is a checkout of its own: edits anywhere in it are in the
+        // working directory. Back home, the repository root applies again.
+        app.permission_ctx.match_ctx.project_root = if (in_worktree) owned else app.project_dir orelse owned;
+        // The prompt's environment names the working directory; the next Run
+        // sees the new one (this Run keeps the prompt it was sent with).
+        const sp_mod = @import("core/system_prompt.zig");
+        if (sp_mod.buildFullWithDefs(app.allocator, app.config.model_display_name orelse app.activeModel(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), owned, app.tool_defs)) |sp| {
+            if (app.system_prompt) |old| app.retireWorkspaceString(old);
+            app.system_prompt = sp;
+        } else |err| {
+            @import("util/log.zig").warn("workspace", "system prompt rebuild after a worktree switch failed: {s}", .{@errorName(err)});
+        }
+        if (old_root) |old| app.retireWorkspaceString(old);
+        app.root_missing_warned = false;
+    }
+
+    /// L5:把 App 提供给工具的宿主能力(Skill 激活 / ToolSearch 激活 / Worktree push-pop 与
+    /// 当前工作根)聚合成一个 HostServices——一个 ctx(=app)+ 若干 trampoline。
     pub fn hostServices(app: *App) tools_mod.HostServices {
         return .{
             .ctx = @ptrCast(app),
@@ -2849,6 +2898,7 @@ pub const App = struct {
             .activateToolFn = &activateToolTrampoline,
             .worktreePushFn = &worktreePushTrampoline,
             .worktreePopFn = &worktreePopTrampoline,
+            .workingRootFn = &workingRootTrampoline,
         };
     }
 

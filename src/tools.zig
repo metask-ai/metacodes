@@ -1253,6 +1253,13 @@ pub fn isConcurrencySafe(name: []const u8) bool {
 }
 
 /// per-input 并发安全判定（对齐 cc isConcurrencySafe(input)，toolOrchestration.ts）。
+/// Tools that move the session's working root (src/tools/worktree.zig). A tool
+/// call after one of them in the same response must not be started ahead of
+/// it by the stream prefetch: it would run in the directory being left.
+pub fn movesWorkingRoot(name: []const u8) bool {
+    return std.mem.eql(u8, name, "EnterWorktree") or std.mem.eql(u8, name, "ExitWorktree");
+}
+
 /// 非 Bash 工具沿用 per-tool 名单（isConcurrencySafe）；Bash 与权限链免询问共用
 /// permission/bash_readonly 的严格只读判定（完整词法、每段只读、无写重定向/替换/写选项）。
 /// fail-closed：无法完整判定 → unsafe（串行）。

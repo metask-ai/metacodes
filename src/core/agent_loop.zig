@@ -2159,7 +2159,12 @@ pub fn run(
                                 dialect_mod.matchesRequiredFirst(route, tu.name, tu.input_json)
                             else
                                 true;
-                        if (prefetch_enabled and not_aborted and activation_allows_prefetch and sp.isStreamable(tu.name) and
+                        // A call after EnterWorktree / ExitWorktree waits for it: started
+                        // now it would run in the directory being left.
+                        const after_root_move = for (tool_uses.items[0 .. tool_uses.items.len - 1]) |previous| {
+                            if (tools_mod.movesWorkingRoot(previous.name)) break true;
+                        } else false;
+                        if (prefetch_enabled and not_aborted and activation_allows_prefetch and !after_root_move and sp.isStreamable(tu.name) and
                             prefetch_ctx.isPrefetchSafe(tu.name) and
                             tools_mod.isConcurrencySafeInput(tu.name, tu.input_json) and
                             permission_mod.checkPermission(&pc_prefetch, tu.name, tu.input_json) == .allow)
@@ -2854,7 +2859,9 @@ pub fn run(
             if (opts.check_gate) |gate| if (depth == 0 and check_gate_state.shouldCheck()) {
                 check_gate_state.tests_weakened = if (test_integrity_state.scan_fresh) test_integrity_state.testsWeakened() else null;
                 backend.emitEvent(sess, .{ .set_current_tool = .{ .name = "running the pinned host check" } });
-                const cwd: ?[]const u8 = if (opts.cwd_abs.len > 0) opts.cwd_abs else null;
+                // Where the work is now: a Run may have moved into a worktree.
+                const root = if (opts.host_services) |hs| hs.workingRoot() orelse opts.cwd_abs else opts.cwd_abs;
+                const cwd: ?[]const u8 = if (root.len > 0) root else null;
                 var outcome = check_gate_mod.runCheck(allocator, gate, cwd, opts.abort, &check_gate_state) catch |err| {
                     backend.emitEvent(sess, .clear_current_tool);
                     switch (err) {

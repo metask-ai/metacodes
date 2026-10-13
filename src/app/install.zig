@@ -917,18 +917,74 @@ test "upgrade never moves an install to an older version unless asked" {
     _ = try run(arena, testing.io, try fixture.unit(arena, "0.3.9", &unit_files), .{ .prefix = prefix, .force = true, .self_check = false }, &log.writer);
 }
 
+/// `isOlder` over one table: install.sh `version_older` and install.ps1
+/// `Test-OlderVersion` copy the order, and scripts/tests/test_install_scripts.py
+/// holds both to these rows (it reads them between the markers).
+/// { candidate, installed, candidate precedes installed }
+const version_order_cases = [_]struct { []const u8, []const u8, bool }{
+    // BEGIN version order cases
+    // The project's own versions: a release, the development builds around it, build metadata.
+    .{ "0.3.1", "0.3.2-dev+5d9bef266f95", true },
+    .{ "0.3.2-dev+5d9bef266f95", "0.3.2", true },
+    .{ "0.2.2-dev+210d57de39ab.dirty", "0.3.1", true },
+    .{ "0.3.2-dev+aaaa", "0.2.2-dev+210d57de39ab.dirty", false },
+    .{ "0.5.0", "0.5.1-dev+fde6a685bb3d", true },
+    // Builds of one version differ only in metadata: no order, no downgrade.
+    .{ "0.3.2-dev+aaaa", "0.3.2-dev+bbbb.dirty", false },
+    .{ "0.3.1", "0.3.1", false },
+    .{ "1.0.0+build.1", "1.0.0", false },
+    // Numbers compare as numbers at any length, past a double's precision too.
+    .{ "0.9.0", "0.10.0", true },
+    .{ "2.0.0", "10.0.0", true },
+    .{ "9007199254740993.0.0", "9007199254740994.0.0", true },
+    .{ "18446744073709551614.0.0", "18446744073709551615.0.0", true },
+    // Pre-release identifiers: numbers numerically, before alphanumerics, which compare in ASCII order.
+    .{ "1.0.0-2", "1.0.0-10", true },
+    .{ "1.0.0-10", "1.0.0-2", false },
+    .{ "1.0.0-1", "1.0.0-a", true },
+    .{ "1.0.0-a", "1.0.0-1", false },
+    .{ "1.0.0-B", "1.0.0-a", true },
+    .{ "1.0.0-a", "1.0.0-B", false },
+    .{ "1.0.0-alpha-1", "1.0.0-alpha-2", true },
+    // The semver.org precedence chain, each neighbour both ways.
+    .{ "1.0.0-alpha", "1.0.0-alpha.1", true },
+    .{ "1.0.0-alpha.1", "1.0.0-alpha", false },
+    .{ "1.0.0-alpha.1", "1.0.0-alpha.beta", true },
+    .{ "1.0.0-alpha.beta", "1.0.0-alpha.1", false },
+    .{ "1.0.0-alpha.beta", "1.0.0-beta", true },
+    .{ "1.0.0-beta", "1.0.0-alpha.beta", false },
+    .{ "1.0.0-beta", "1.0.0-beta.2", true },
+    .{ "1.0.0-beta.2", "1.0.0-beta", false },
+    .{ "1.0.0-beta.2", "1.0.0-beta.11", true },
+    .{ "1.0.0-beta.11", "1.0.0-beta.2", false },
+    .{ "1.0.0-beta.11", "1.0.0-rc.1", true },
+    .{ "1.0.0-rc.1", "1.0.0-beta.11", false },
+    .{ "1.0.0-rc.1", "1.0.0", true },
+    .{ "1.0.0", "1.0.0-rc.1", false },
+    // A version that does not parse is never older, on either side.
+    .{ "nightly", "0.3.1", false },
+    .{ "0.3.1", "nightly", false },
+    .{ "01.0.0", "2.0.0", false },
+    .{ "1.0", "2.0.0", false },
+    .{ "1.0.0.0", "2.0.0", false },
+    .{ "1.0.0-", "2.0.0", false },
+    .{ "1.0.0+", "2.0.0", false },
+    .{ "1.0.0-a..b", "2.0.0", false },
+    .{ "1.0.0-a.", "2.0.0", false },
+    .{ "1.0.0-01", "2.0.0", false },
+    .{ "1.0.0-a_b", "2.0.0", false },
+    .{ "1.0.0+a_b", "2.0.0", false },
+    .{ "1.0.0", "18446744073709551616.0.0", false },
+    // END version order cases
+};
+
 test "version order: pre-releases, build metadata and unparseable versions" {
-    // The release is newer than the development builds before it, older than those after.
-    try testing.expect(isOlder("0.3.1", "0.3.2-dev+5d9bef266f95"));
-    try testing.expect(isOlder("0.3.2-dev+5d9bef266f95", "0.3.2"));
-    try testing.expect(isOlder("0.2.2-dev+210d57de39ab.dirty", "0.3.1"));
-    try testing.expect(!isOlder("0.3.2-dev+aaaa", "0.2.2-dev+210d57de39ab.dirty"));
-    // Builds of the same version differ only in metadata: no order, no downgrade.
-    try testing.expect(!isOlder("0.3.2-dev+aaaa", "0.3.2-dev+bbbb.dirty"));
-    try testing.expect(!isOlder("0.3.1", "0.3.1"));
-    // A version that does not parse is never called older (old behavior).
-    try testing.expect(!isOlder("nightly", "0.3.1"));
-    try testing.expect(!isOlder("0.3.1", "nightly"));
+    for (version_order_cases) |case| {
+        if (isOlder(case[0], case[1]) != case[2]) {
+            std.debug.print("isOlder(\"{s}\", \"{s}\") != {}\n", .{ case[0], case[1], case[2] });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "launcherTarget reads back what launcherBody writes, and nothing else" {

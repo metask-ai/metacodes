@@ -1032,7 +1032,9 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
         .parent_model = app.activeModel(),
         .desc = desc,
         .agent_type = "main",
-        .host_services = app.hostServices(),
+        // It shares the App with the foreground, and EnterWorktree would chdir the
+        // whole process under it: it keeps the root it was handed.
+        .host_services = app.hostServices().withoutWorktree(),
         // task#12(Linus review 第四处):Ctrl+B 转后台的是**主会话**(全权限+Bash),更不能丢 sandbox。
         // 前台 agent_loop 有 sandbox,转后台若不透传则主会话 Bash 突然脱离 sandbox。
         .sandbox = app.sandboxPtr(),
