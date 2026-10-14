@@ -53,7 +53,8 @@ pub const Cursor = struct {
     epoch: Epoch = .unnamed,
 
     pub const Epoch = union(enum) {
-        /// A client predating epochs, or one starting fresh.
+        /// No epoch given: a fresh client (`next == 0`) or one predating
+        /// epochs, whose cursor cannot be tied to this journal.
         unnamed,
         named: u64,
         /// Named, but not 16 hex digits: it cannot be this journal's.
@@ -65,7 +66,7 @@ pub const Cursor = struct {
     /// over. **saturating +1**:id 来自客户端(可伪造 usize max),`+|` 饱和到 max
     /// → 超出 journal 末尾,按 cursor_ahead 整体重放,坏输入不崩进程。
     pub fn fromLastEventId(raw: []const u8) Cursor {
-        const id = std.mem.trim(u8, raw, " ");
+        const id = std.mem.trim(u8, raw, " \t\r\n");
         if (std.mem.indexOfScalar(u8, id, '-')) |dash| {
             const last = std.fmt.parseInt(usize, id[dash + 1 ..], 10) catch return .{};
             return .{ .next = last +| 1, .epoch = parseEpoch(id[0..dash]) };
@@ -94,6 +95,9 @@ pub const RestartReason = enum {
     /// The cursor belongs to another journal: the host restarted or the
     /// session was rebuilt.
     epoch_changed,
+    /// The cursor names a position but no epoch, so it may come from an
+    /// earlier journal; continuing could skip that journal's first events.
+    epoch_unknown,
     /// The cursor lies past this journal's end, which no client of this
     /// journal can have seen.
     cursor_ahead,
@@ -211,7 +215,7 @@ pub const EventJournal = struct {
         const restart: ?RestartReason = switch (cursor.epoch) {
             .named => |named| if (named != self.epoch) .epoch_changed else null,
             .unreadable => .epoch_changed,
-            .unnamed => null,
+            .unnamed => if (cursor.next > 0) .epoch_unknown else null,
         };
         if (restart orelse (if (cursor.next > self.count()) RestartReason.cursor_ahead else null)) |reason|
             return .{ .from = self.firstSeq(), .restart = reason };
@@ -501,6 +505,7 @@ test "Cursor: Last-Event-ID 与 since 两种来源;epoch 解析;恶意 usize max
     try testing.expectEqualDeep(Cursor{ .next = 10 }, Cursor.fromLastEventId("9"));
     try testing.expectEqualDeep(Cursor{ .next = 10, .epoch = .{ .named = 0xff } }, Cursor.fromLastEventId("00000000000000ff-9"));
     try testing.expectEqualDeep(Cursor{ .next = 10, .epoch = .unreadable }, Cursor.fromLastEventId("ff-9"));
+    try testing.expectEqualDeep(Cursor{ .next = 10, .epoch = .{ .named = 0xff } }, Cursor.fromLastEventId("\t00000000000000ff-9\r\n"));
     try testing.expectEqualDeep(Cursor{}, Cursor.fromLastEventId("junk"));
     try testing.expectEqual(std.math.maxInt(usize), Cursor.fromLastEventId("18446744073709551615").next);
     try testing.expectEqualDeep(Cursor{ .next = 42 }, Cursor.fromSince("42", null));
@@ -515,8 +520,11 @@ test "planResume: 本 journal 游标续接;他 epoch / 不可读 epoch / 超出�
     try testing.expectEqualDeep(ResumePlan{ .from = 3, .restart = null }, j.planResume(.{ .next = 3, .epoch = .{ .named = j.epoch } }));
     try testing.expectEqualDeep(ResumePlan{ .from = 2, .restart = .epoch_changed }, j.planResume(.{ .next = 3, .epoch = .{ .named = j.epoch +% 1 } }));
     try testing.expectEqualDeep(ResumePlan{ .from = 2, .restart = .epoch_changed }, j.planResume(.{ .next = 3, .epoch = .unreadable }));
-    try testing.expectEqualDeep(ResumePlan{ .from = 2, .restart = .cursor_ahead }, j.planResume(.{ .next = 6 }));
-    // 淘汰(cursor 落后保留窗)不是 restart:waitSinceFrom 之后报 effective start。
+    try testing.expectEqualDeep(ResumePlan{ .from = 2, .restart = .cursor_ahead }, j.planResume(.{ .next = 6, .epoch = .{ .named = j.epoch } }));
+    // A position without an epoch may be another journal's: never continue it.
+    try testing.expectEqualDeep(ResumePlan{ .from = 2, .restart = .epoch_unknown }, j.planResume(.{ .next = 1 }));
+    // 淘汰(本 journal 的 cursor 落后保留窗)不是 restart:waitSinceFrom 之后报 effective start。
+    try testing.expectEqualDeep(ResumePlan{ .from = 1, .restart = null }, j.planResume(.{ .next = 1, .epoch = .{ .named = j.epoch } }));
     try testing.expectEqualDeep(ResumePlan{ .from = 0, .restart = null }, j.planResume(.{}));
     var buffer: [40]u8 = undefined;
     const id = j.eventId(&buffer, 4);

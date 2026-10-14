@@ -171,7 +171,7 @@ test "wire_contract: every CoreEvent tag has a pinned v1 line" {
 
 test "wire_contract: every UiRequest kind and close outcome has a pinned v1 line" {
     const a = std.testing.allocator;
-    var lines: [requests.len + 2][]u8 = undefined;
+    var lines: [requests.len + std.meta.fields(cc.wire.RequestClosed).len][]u8 = undefined;
     var written: usize = 0;
     defer for (lines[0..written]) |line| a.free(line);
 
@@ -188,10 +188,10 @@ test "wire_contract: every UiRequest kind and close outcome has a pinned v1 line
         lines[index] = try cc.wire.writeRequest(a, index + 1, request);
         written += 1;
     }
-    lines[requests.len] = try cc.wire.writeRequestClosed(a, 1, .answered);
-    written += 1;
-    lines[requests.len + 1] = try cc.wire.writeRequestClosed(a, 2, .cancelled);
-    written += 1;
+    inline for (std.meta.fields(cc.wire.RequestClosed), 0..) |field, index| {
+        lines[requests.len + index] = try cc.wire.writeRequestClosed(a, index + 1, @enumFromInt(field.value));
+        written += 1;
+    }
     try compareOrDump(a, &lines, REQUESTS_FIXTURE, "requests.jsonl");
 }
 

@@ -309,9 +309,10 @@ try mc.transcript.loadTranscript(&conversation, dir, gpa);
 ```
 
 `Writer.init`、`sessionDir`、`listSessions` 的状态根参数是 `util_state_root.StateRoot`，
-不是 `[]const u8`：home 和它下面的 state root 都是绝对路径，传错了以前只是悄悄错一层目录，
-现在是编译错误。`WorkspaceConfig.state_root` 为空时 state root 是 `<home>/.metacodes`，
-与旧布局一致。
+不是 `[]const u8`：home 和它下面的 state root 都是绝对路径，以前把 home 直接传进去会悄悄
+错一层目录，现在裸路径编译不过。但手写 `.{ .path = home }` 仍能编译、仍是错的——类型只让
+这一步显式，管不了它对不对，所以一律从 `WorkspacePolicy.stateRoot()` 取。
+`WorkspaceConfig.state_root` 为空时 state root 是 `<home>/.metacodes`，与旧布局一致。
 
 ## 2. 插件清单协议
 

@@ -488,7 +488,24 @@ test "L2 web: 另一份 journal 的游标 → resync epoch_changed + 从头重�
     try std.testing.expect(std.mem.indexOf(u8, resp, frame) != null);
 }
 
-test "L2 web: 无 epoch 的旧式游标超出 journal 末尾 → resync cursor_ahead + 从头重放" {
+// 旧式游标(只有 seq,没有 epoch)无法判断属于哪份 journal:宿主重启后的 since=1 会让新
+// journal 的第 0 条事件静默丢失。一律按 epoch_unknown 从最老保留行重放。
+test "L2 web: 无 epoch 的旧式游标 → resync epoch_unknown + 从头重放,不丢第 0 条" {
+    const a = std.testing.allocator;
+    var fx = Fixture.init(a);
+    defer fx.deinit();
+    try fx.start(a);
+    const be = fx.wb.backend();
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "event zero" });
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "event one" });
+
+    const resp = try httpGetUntil(a, fx.srv.port, "/events?since=1", "event one");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"reason\":\"epoch_unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "event zero") != null);
+}
+
+test "L2 web: 本 journal 的游标超出末尾 → resync cursor_ahead + 从头重放" {
     const a = std.testing.allocator;
     var fx = Fixture.init(a);
     defer fx.deinit();
@@ -496,7 +513,9 @@ test "L2 web: 无 epoch 的旧式游标超出 journal 末尾 → resync cursor_a
     const be = fx.wb.backend();
     be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "fresh journal" });
 
-    const resp = try httpGetUntil(a, fx.srv.port, "/events?since=99", "fresh journal");
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/events?since=99&epoch={s}", .{&fx.journal.epochHex()});
+    const resp = try httpGetUntil(a, fx.srv.port, path, "fresh journal");
     defer a.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"reason\":\"cursor_ahead\"") != null);
 }

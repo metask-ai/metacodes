@@ -17,7 +17,8 @@ status, compatibility boundaries, and entry points are defined by
   the effort every provider request carries; `setModel` keeps it, and a
   provider without an effort control refuses a non-null value at create.
   `WorkspaceConfig.additional_dirs` and `AgentSession.setAdditionalDirectories`
-  give a Session further working directories: `accept_edits` approves
+  give a Session further working directories (existing directories only):
+  `accept_edits` approves
   Write/Edit/NotebookEdit there and a sandboxed shell may write there, exactly
   as for the workspace root. A replacement is validated before the Session
   changes. doc/API.md now tabulates which settings are idle-mutable, which
@@ -25,8 +26,9 @@ status, compatibility boundaries, and entry points are defined by
 - `protocol.wire`: versioned JSON lines for Hosts that carry a Session across
   a process or network boundary. `writeEvent`, `writeRequest` and
   `writeRequestClosed` produce `{"v":1,"type":...}` lines; `parseResponse`
-  reads a client's answer back and treats anything malformed as a
-  cancellation. Hosts previously ran `std.json` over kernel structs, so a
+  reads a client's answer back, treating anything malformed as a cancellation
+  (closed as `malformed`) and an answer that races an interrupt as cancelled
+  (also in `--web`). Hosts previously ran `std.json` over kernel structs, so a
   renamed field changed their clients silently. One pinned line per event
   tag and request kind lives in `tests/fixtures/wire/v1`.
 - `session_host.SessionHost`: the multi-session service a network Host puts
@@ -54,7 +56,8 @@ status, compatibility boundaries, and entry points are defined by
   a client reading the stream directly must follow too.
 - Breaking for source-level embedders: `transcript.Writer.init` and
   `transcript.listSessions` take the state root as a `StateRoot`
-  (`util/state_root.zig`) instead of a `[]const u8`. On 2026-10-01 the third
+  (`util/state_root.zig`) instead of a `[]const u8`, so a bare path no longer
+  compiles there; take the value from `WorkspacePolicy.stateRoot()`. On 2026-10-01 the third
   `Writer.init` parameter changed meaning from home to state root while keeping
   its type, so a Host that still passed `$HOME` compiled and wrote transcripts
   one level off from where it resumed them. New `transcript.sessionDir` and
@@ -94,12 +97,14 @@ status, compatibility boundaries, and entry points are defined by
   with every journal, and a cursor from the previous one (`since=41`) made the
   server wait until the new journal reached 41, dropping everything before.
   Each journal now has an epoch: SSE ids are `<epoch>-<seq>`, `/state`
-  reports `epoch` next to `seq`, and a cursor from another epoch, or one past
-  the journal's end, is answered with `event: resync`
-  (`{"reason":"epoch_changed"|"cursor_ahead","epoch","from"}`) and a replay
-  from the oldest kept event. Evictions report `"reason":"evicted"`. The
-  bundled page reconnects with `?since=&epoch=` and starts its view over on a
-  resync.
+  reports `epoch` next to `seq`, and a cursor from another epoch, one naming
+  a position without an epoch, or one past the journal's end is answered with
+  `event: resync`
+  (`{"reason":"epoch_changed"|"epoch_unknown"|"cursor_ahead","epoch","from"}`)
+  and a replay from the oldest kept event. Evictions report
+  `"reason":"evicted"`. The bundled page reconnects with `?since=&epoch=` and
+  starts its view over (DOM and render state) on a resync. Clients that send
+  `?since=N` without the epoch now get a replay instead of a continuation.
 - An embedded `AgentSession` keeps "allow always" in the Session. Answering
   a Host permission prompt with `allow_always` also appended a whole-tool
   grant to `<workspace>/.claude/settings.local.json`, a file no AgentSession

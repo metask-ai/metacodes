@@ -1764,34 +1764,42 @@ pub const AgentSession = struct {
         self: *AgentSession,
         dirs: []const []const u8,
     ) AdditionalDirectoriesMutationError!void {
-        // `workspace.root` is fixed at create, so resolving outside the gate
-        // reads nothing a mutation could change.
-        const replacement = try workspace_mod.resolveAdditionalDirs(self.allocator, self.workspace.root, dirs);
         self.mutex.lock();
         if (self.in_flight_provider_cancels != 0) {
             self.mutex.unlock();
-            workspace_mod.freeDirs(self.allocator, replacement);
             return error.SessionBusy;
         }
         switch (self.state) {
-            .idle => {},
+            .idle => self.state = .mutating,
             .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
                 self.mutex.unlock();
-                workspace_mod.freeDirs(self.allocator, replacement);
                 return error.SessionBusy;
             },
             .poisoned, .destroying => {
                 self.mutex.unlock();
-                workspace_mod.freeDirs(self.allocator, replacement);
                 return error.InvalidSessionState;
             },
         }
-        // Idle under the lock: no Run, compact or checkpoint borrows the set.
+        self.mutex.unlock();
+
+        // `.mutating` keeps destroy and every other activity out until the
+        // old set is freed, so nothing below races a teardown of `self`.
+        const replacement = workspace_mod.resolveAdditionalDirs(self.allocator, self.workspace.root, dirs) catch |err| {
+            self.cancelMutation();
+            return err;
+        };
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
         const previous = self.workspace.additional_dirs;
         self.workspace.additional_dirs = replacement;
         self.permission_ctx.match_ctx.additional_dirs = replacement;
         self.mutex.unlock();
         workspace_mod.freeDirs(self.allocator, previous);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
     }
 
     /// Replace the Session's reasoning effort at the idle mutation boundary;

@@ -128,6 +128,12 @@ let curTextRaw = "";       // 当前 assistant 段的 markdown 源
 let toolCards = {};        // tool_use id → {el, bodyEl}
 let curTurn = 0, curToolCalls = 0;
 
+// Start the view over: the DOM and every reference into it (a streaming text block or a
+// tool card left over would receive replayed events on a detached node and lose them).
+function resetView() {
+  scroll.innerHTML = ""; curText = null; curTextRaw = ""; toolCards = {};
+  curTurn = 0; curToolCalls = 0; hideDialog();
+}
 function atBottom() { return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80; }
 function stick(fn) { const b = atBottom(); fn(); if (b) scroll.scrollTop = scroll.scrollHeight; }
 function el(cls, text) { const d = document.createElement("div"); if (cls) d.className = cls; if (text != null) d.textContent = text; return d; }
@@ -151,7 +157,7 @@ function connect() {
   // start the view over. "evicted" only means old events fell out of the window.
   es.addEventListener("resync", (m) => {
     const r = jparse(m.data) || {};
-    if (r.reason && r.reason !== "evicted") { scroll.innerHTML = ""; lastEpoch = r.epoch || ""; lastSeq = (r.from || 0) - 1; }
+    if (r.reason && r.reason !== "evicted") { resetView(); lastEpoch = r.epoch || ""; lastSeq = (r.from || 0) - 1; }
     refreshState();
   });
   es.onerror = () => {
@@ -560,7 +566,7 @@ function runCommand(text) {
   const name = text.split(" ")[0];
   const spec = COMMANDS.find(c => c.name === name);
   if (spec && spec.kind === "client") {
-    if (name === "/clear") { scroll.innerHTML = ""; return; }
+    if (name === "/clear") { resetView(); return; }
     if (name === "/help") { const d = el("md"); d.innerHTML = renderMarkdown("**Commands**\n" + COMMANDS.map(c => "- `" + c.name + "` — " + c.desc).join("\n") + "\n- `!<cmd>` — run a shell command (output joins the conversation context)"); scroll.appendChild(d); return; }
     if (name === "/cost") { fetch("/state").then(r => r.json()).then(s => sysline("tokens: " + (s.input_tokens || 0) + " in / " + (s.output_tokens || 0) + " out · $" + Number(s.cost_usd || 0).toFixed(4))); return; }
   }

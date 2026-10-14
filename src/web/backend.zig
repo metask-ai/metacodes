@@ -159,14 +159,25 @@ pub const WebBackend = struct {
             };
             _ = self.cond.timedWait(&self.mutex, 200 * std.time.ns_per_ms);
         }
+        // An answer that raced the user's interrupt loses: the interrupt is
+        // already in force, so a late "allow" must not run the stopped tool.
+        const cancelled = if (self.abort) |a| a.isAborted() else false;
         const resp_json = self.response_json.?;
         self.response_json = null;
         self.pending_id = 0;
         self.unlock();
         defer self.allocator.free(resp_json);
 
-        self.announceClosed(id, .answered);
-        return wire.parseResponse(req, resp_json, allocator, out);
+        if (cancelled) {
+            self.announceClosed(id, .cancelled);
+            return wire.cancelResponse(req, out);
+        }
+        const reading = wire.parseResponse(req, resp_json, allocator, out) catch |err| {
+            self.announceClosed(id, if (err == error.InputAborted) .malformed else .cancelled);
+            return err;
+        };
+        self.announceClosed(id, reading.closed());
+        return .answered;
     }
 
     fn announceClosed(self: *WebBackend, id: u64, outcome: wire.RequestClosed) void {
@@ -176,12 +187,13 @@ pub const WebBackend = struct {
     }
 
     /// HTTP 线程:回填响应。id 必须匹配当前挂起(防 stale 对话框回填新请求)。
-    /// 返回 false = 无此挂起请求(过期/重复提交),HTTP 层回 409。
+    /// 返回 false = 无此挂起请求(过期/重复提交/已被中断取消),HTTP 层回 409。
     pub fn respond(self: *WebBackend, id: u64, resp_json: []const u8) bool {
         const owned = self.allocator.dupe(u8, resp_json) catch return false;
         self.lock();
         defer self.unlock();
-        if (self.pending_id != id or self.response_json != null) {
+        const interrupted = if (self.abort) |a| a.isAborted() else false;
+        if (self.pending_id != id or self.response_json != null or interrupted) {
             self.allocator.free(owned);
             return false;
         }
@@ -301,4 +313,81 @@ test "respond: id 不匹配拒绝(stale 对话框防回填)" {
     var wb = WebBackend.init(testing.allocator, &j);
     defer wb.deinit();
     try testing.expect(!wb.respond(1, "{\"choice\":\"allow_once\"}")); // 无挂起
+}
+
+test "respond: 中断已生效时拒绝回填(迟到的允许不能放行被停止的工具)" {
+    var j = EventJournal.init(testing.allocator);
+    defer j.deinit();
+    var wb = WebBackend.init(testing.allocator, &j);
+    defer wb.deinit();
+    var sig = abort_mod.AbortSignal.init();
+    wb.abort = &sig;
+    wb.lock();
+    wb.pending_id = 7;
+    wb.unlock();
+    sig.abort(.user_ctrl_c);
+    try testing.expect(!wb.respond(7, "{\"choice\":\"allow_once\"}"));
+}
+
+test "requester: 与中断赛跑的应答作废,按取消处理并记 cancelled" {
+    var j = EventJournal.init(testing.allocator);
+    defer j.deinit();
+    var wb = WebBackend.init(testing.allocator, &j);
+    defer wb.deinit();
+    var sig = abort_mod.AbortSignal.init();
+    wb.abort = &sig;
+
+    // The browser answers "allow", then the interrupt lands before the
+    // requester wakes up: the answer must not be used.
+    const Racer = struct {
+        fn run(b: *WebBackend, jj: *EventJournal, s: *abort_mod.AbortSignal) void {
+            const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
+            for (batch) |l| std.testing.allocator.free(l);
+            std.testing.allocator.free(batch);
+            b.lock();
+            b.response_json = b.allocator.dupe(u8, "{\"choice\":\"allow_once\"}") catch null;
+            s.abort(.user_ctrl_c);
+            _ = b.cond.broadcast();
+            b.unlock();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Racer.run, .{ &wb, &j, &sig });
+    defer t.join();
+    const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    var resp: UiResponse = undefined;
+    try testing.expectEqual(RequestOutcome.answered, try wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
+    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
+    const all = (try j.waitSince(testing.allocator, 0, 10)).?;
+    defer {
+        for (all) |l| testing.allocator.free(l);
+        testing.allocator.free(all);
+    }
+    try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "\"outcome\":\"cancelled\"") != null);
+}
+
+test "requester: 读不懂的应答按取消处理,记 malformed 而非 answered" {
+    var j = EventJournal.init(testing.allocator);
+    defer j.deinit();
+    var wb = WebBackend.init(testing.allocator, &j);
+    defer wb.deinit();
+    const Responder = struct {
+        fn run(b: *WebBackend, jj: *EventJournal) void {
+            const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
+            for (batch) |l| std.testing.allocator.free(l);
+            std.testing.allocator.free(batch);
+            _ = b.respond(1, "{\"choice\":\"pretty_please\"}");
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Responder.run, .{ &wb, &j });
+    defer t.join();
+    const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    var resp: UiResponse = undefined;
+    try testing.expectEqual(RequestOutcome.answered, try wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
+    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
+    const all = (try j.waitSince(testing.allocator, 0, 10)).?;
+    defer {
+        for (all) |l| testing.allocator.free(l);
+        testing.allocator.free(all);
+    }
+    try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "\"outcome\":\"malformed\"") != null);
 }

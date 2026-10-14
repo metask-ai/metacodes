@@ -346,6 +346,42 @@ test "L2 SessionHost interrupt releases a pending prompt and stops the Run" {
     try std.testing.expectEqual(cc.session_host.InterruptOutcome.no_run, hosted.interrupt());
 }
 
+test "L2 SessionHost an unreadable answer denies the prompt and closes it as malformed" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const path = try std.fmt.allocPrint(a, "{s}/garbled.txt", .{workspace});
+    defer a.free(path);
+    const write = try writeToolSse(a, path);
+    defer a.free(write);
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ write, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{"Write"}) });
+    defer host.release(hosted);
+
+    try hosted.submit(.{ .text = "write it" });
+    try waitFor(&hosted.journal, "\"type\":\"ui_request\"", 1);
+    try hosted.respond(try pendingRequestId(&hosted.journal), "{\"choice\":\"allow_everything\"}");
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"malformed\""));
+    try std.testing.expect(!try exists(workspace, "garbled.txt"));
+}
+
 const FatalTool = struct {
     calls: usize = 0,
 
@@ -435,11 +471,12 @@ test "L2 SessionHost close never waits on references: readers wake, the id reope
     const hosted = try host.open(.{ .config = config, .id = cc.session_id.gen() });
     const id = hosted.id;
 
-    // A reader thread, the way an SSE handler holds the Session.
+    // A reader thread, the way an SSE handler holds the Session. Its
+    // reference is taken here, so the close below cannot overtake it however
+    // late the thread is scheduled.
     const Reader = struct {
         saw_close: std.atomic.Value(bool) = .init(false),
-        fn run(self: *@This(), session_host: *SessionHost, session_id: cc.session_id.SessionId) void {
-            const lease = session_host.acquire(session_id) orelse return;
+        fn run(self: *@This(), lease: *HostedSession) void {
             defer lease.release();
             while (!lease.journal.isClosed()) {
                 const lines = lease.journal.waitSince(std.testing.allocator, lease.journal.count(), 50) catch return;
@@ -452,17 +489,13 @@ test "L2 SessionHost close never waits on references: readers wake, the id reope
         }
     };
     var reader = Reader{};
-    const thread = try std.Thread.spawn(.{}, Reader.run, .{ &reader, &host, id });
+    const reader_lease = host.acquire(id) orelse return error.TestSessionMissing;
+    const thread = std.Thread.spawn(.{}, Reader.run, .{ &reader, reader_lease }) catch |err| {
+        reader_lease.release();
+        return err;
+    };
     var joined = false;
     defer if (!joined) thread.join();
-    var waited: u32 = 0;
-    while (waited < 200) : (waited += 1) {
-        hosted.mutex.lock();
-        const held = hosted.references;
-        hosted.mutex.unlock();
-        if (held > 1) break;
-        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
-    }
 
     // This thread still holds the reference from `open` while it closes.
     try host.close(id);

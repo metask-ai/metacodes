@@ -346,6 +346,9 @@ pub const HostedSession = struct {
     /// Set by `interrupt` for the Run being started or running; cleared when
     /// the next submission is taken.
     run_interrupted: bool = false,
+    /// The current submission's Run has returned; `finishRun` is reporting
+    /// it. An interrupt now is too late.
+    run_returned: bool = false,
     /// Copies the driver keeps current for `snapshot`, which cannot read the
     /// AgentSession's own fields while the driver changes them.
     model: []u8,
@@ -416,6 +419,10 @@ pub const HostedSession = struct {
             self.mutex.unlock();
             return .no_run;
         }
+        if (self.phase == .running and self.run_returned) {
+            self.mutex.unlock();
+            return .too_late;
+        }
         const run_id = self.current_run_id;
         const starting = self.phase == .running;
         if (starting) self.run_interrupted = true;
@@ -436,13 +443,16 @@ pub const HostedSession = struct {
     }
 
     /// Answers UI request `request_id` with a `protocol.wire` response. A
-    /// request that is not the pending one (answered, cancelled, stale) is
+    /// request that is not the pending one (answered, cancelled, stale), or
+    /// one an interrupt or close has already cancelled, is
     /// `error.NoSuchRequest`.
     pub fn respond(self: *HostedSession, request_id: u64, response_json: []const u8) RespondError!void {
         const owned = try self.gpa.dupe(u8, response_json);
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.pending_request_id == 0 or self.pending_request_id != request_id or self.response != null) {
+        if (self.pending_request_id == 0 or self.pending_request_id != request_id or self.response != null or
+            self.run_interrupted or self.closing)
+        {
             self.gpa.free(owned);
             return error.NoSuchRequest;
         }
@@ -491,6 +501,7 @@ pub const HostedSession = struct {
                 if (work.item == .submission) {
                     self.phase = .running;
                     self.run_interrupted = false;
+                    self.run_returned = false;
                 }
                 return work;
             }
@@ -548,6 +559,7 @@ pub const HostedSession = struct {
         const outcome = admitted.runText(submission.text, self.host.options.max_turns);
         self.mutex.lock();
         self.current_run_id = 0;
+        self.run_returned = true;
         self.mutex.unlock();
         if (outcome) |result| {
             if (result.suspend_info) |info| info.deinit();
@@ -701,18 +713,35 @@ pub const HostedSession = struct {
                 self.ui_ready.wait(&self.mutex);
             }
         }
-        const response = self.response;
-        self.response = null;
+        const response = self.takeResponseLocked();
         self.pending_request_id = 0;
         self.mutex.unlock();
 
         if (response) |json| {
             defer self.gpa.free(json);
-            self.appendLine(wire.writeRequestClosed(self.gpa, request_id, .answered));
-            return wire.parseResponse(req, json, allocator, out);
+            const reading = wire.parseResponse(req, json, allocator, out) catch |err| {
+                self.appendLine(wire.writeRequestClosed(self.gpa, request_id, if (err == error.InputAborted) .malformed else .cancelled));
+                return err;
+            };
+            self.appendLine(wire.writeRequestClosed(self.gpa, request_id, reading.closed()));
+            return .answered;
         }
         self.appendLine(wire.writeRequestClosed(self.gpa, request_id, .cancelled));
         return wire.cancelResponse(req, out);
+    }
+
+    /// The stored answer to the pending request, unless cancellation won: an
+    /// interrupt or close already in force discards a response that raced
+    /// it, so a late "allow" cannot run a tool the user stopped. Caller holds
+    /// `mutex`; the returned slice is the caller's.
+    fn takeResponseLocked(self: *HostedSession) ?[]u8 {
+        const response = self.response orelse return null;
+        self.response = null;
+        if (self.run_interrupted or self.closing) {
+            self.gpa.free(response);
+            return null;
+        }
+        return response;
     }
 
     // ── teardown ──────────────────────────────────────────────────────────
@@ -866,4 +895,57 @@ test "SessionHost offline: open, queue, snapshot, interrupt, respond, close" {
     host.release(hosted);
     try host.close(id);
     try std.testing.expectError(error.SessionNotFound, host.close(id));
+}
+
+test "SessionHost: cancellation wins over a racing answer; an interrupt after the Run returned is too late" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const runtime = try AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = .{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = "http://127.0.0.1:9",
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{},
+    } });
+    defer hosted.release();
+    const allow = "{\"choice\":\"allow_once\"}";
+
+    // The driver is idle; stand in for a pending permission prompt.
+    hosted.mutex.lock();
+    hosted.pending_request_id = 7;
+    hosted.run_interrupted = true;
+    hosted.mutex.unlock();
+    // Interrupt already in force: the answer is refused...
+    try std.testing.expectError(error.NoSuchRequest, hosted.respond(7, allow));
+    // ...and one stored just before the interrupt is discarded when taken.
+    hosted.mutex.lock();
+    hosted.run_interrupted = false;
+    hosted.mutex.unlock();
+    try hosted.respond(7, allow);
+    hosted.mutex.lock();
+    hosted.run_interrupted = true;
+    const taken = hosted.takeResponseLocked();
+    hosted.pending_request_id = 0;
+    hosted.run_interrupted = false;
+    hosted.mutex.unlock();
+    try std.testing.expect(taken == null);
+
+    // The Run has returned and finishRun is still reporting it.
+    hosted.mutex.lock();
+    hosted.phase = .running;
+    hosted.run_returned = true;
+    hosted.mutex.unlock();
+    try std.testing.expectEqual(InterruptOutcome.too_late, hosted.interrupt());
+    hosted.mutex.lock();
+    hosted.phase = .idle;
+    hosted.run_returned = false;
+    hosted.mutex.unlock();
 }

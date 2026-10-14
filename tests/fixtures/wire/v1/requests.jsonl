@@ -4,3 +4,4 @@
 {"v":1,"type":"ui_request","id":4,"kind":"custom","request":{"kind":"video_timeline","payload_json":"{\"clips\":[]}"}}
 {"v":1,"type":"ui_request_closed","id":1,"outcome":"answered"}
 {"v":1,"type":"ui_request_closed","id":2,"outcome":"cancelled"}
+{"v":1,"type":"ui_request_closed","id":3,"outcome":"malformed"}

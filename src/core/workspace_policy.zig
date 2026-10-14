@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const pdir = @import("platform").dir;
 const sandbox_config = @import("../sandbox/config.zig");
 const StateRoot = @import("../util/state_root.zig").StateRoot;
 
@@ -129,6 +130,12 @@ pub fn resolveAdditionalDirs(
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidAdditionalDirectory,
         };
+        // A directory that exists now: a file would widen the working set to
+        // that one path, and Windows' lexical realpath accepts missing paths.
+        if (!isDirectory(real)) {
+            allocator.free(real);
+            return error.InvalidAdditionalDirectory;
+        }
         var duplicate = std.mem.eql(u8, real, root);
         for (resolved.items) |kept| duplicate = duplicate or std.mem.eql(u8, real, kept);
         if (duplicate) {
@@ -141,6 +148,16 @@ pub fn resolveAdditionalDirs(
         };
     }
     return resolved.toOwnedSlice(allocator);
+}
+
+fn isDirectory(path: []const u8) bool {
+    var path_z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= path_z.len) return false;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    var it = pdir.open(@ptrCast(&path_z)) orelse return false;
+    pdir.close(&it);
+    return true;
 }
 
 pub fn freeDirs(allocator: std.mem.Allocator, dirs: []const []const u8) void {
@@ -194,4 +211,9 @@ test "WorkspacePolicy keeps the real paths of distinct additional directories an
     defer a.free(missing);
     try std.testing.expectError(error.InvalidAdditionalDirectory, WorkspacePolicy.init(a, .{ .root = root, .additional_dirs = &.{ extra, missing } }));
     try std.testing.expectError(error.InvalidAdditionalDirectory, WorkspacePolicy.init(a, .{ .root = root, .additional_dirs = &.{"relative/dir"} }));
+    // An existing file is not a working directory.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "extra/notes.txt", .data = "x" });
+    const file = try std.fs.path.join(a, &.{ extra, "notes.txt" });
+    defer a.free(file);
+    try std.testing.expectError(error.InvalidAdditionalDirectory, WorkspacePolicy.init(a, .{ .root = root, .additional_dirs = &.{file} }));
 }

@@ -584,24 +584,26 @@ with the schema version `v` (currently 1) and a `type`:
 ```text
 {"v":1,"type":"<CoreEvent tag>","data":<payload or null>}
 {"v":1,"type":"ui_request","id":N,"kind":"permission|plan_approval|ask_question|custom","request":{...}}
-{"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled"}
+{"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled|malformed"}
 ```
 
 `wire.parseResponse` turns the client's answer (`{"choice":...}`,
 `{"answers":[...]}` or `{"result":...}`) back into a `UiResponse`; anything
 malformed or of another version is answered as a cancellation, never as a
-grant. `tests/fixtures/wire/v1` pins one line for every event tag and request
+grant, and closes as `malformed`. An answer that races an interrupt or close
+loses: it is refused or discarded and the request closes as `cancelled`. `tests/fixtures/wire/v1` pins one line for every event tag and request
 kind and doubles as conformance vectors for Hosts in other languages. The
 bundled `--web` UI consumes exactly these lines.
 
 The `--web` server streams these lines over SSE with ids `<epoch>-<seq>`. The
 epoch names the event journal; a restarted host or a rebuilt session has a new
 one. A client resumes with `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`
-(`/state` reports both). When the cursor belongs to another epoch or lies past
-the journal's end, the server sends `event: resync` with
-`{"reason":"epoch_changed"|"cursor_ahead","epoch":...,"from":N}` and replays
-from the oldest event it kept; when old events were evicted under the cursor,
-the reason is `evicted`. Deduplicate on `(session, epoch, seq)`.
+(`/state` reports both). When the cursor belongs to another epoch, names a
+position without an epoch, or lies past the journal's end, the server sends
+`event: resync` with
+`{"reason":"epoch_changed"|"epoch_unknown"|"cursor_ahead","epoch":...,"from":N}`
+and replays from the oldest event it kept; when old events were evicted under
+the cursor, the reason is `evicted`. Deduplicate on `(session, epoch, seq)`.
 
 ### SessionHost: a multi-session service for network Hosts
 

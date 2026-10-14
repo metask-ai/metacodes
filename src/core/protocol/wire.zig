@@ -10,7 +10,7 @@
 //!   {"v":1,"type":"<CoreEvent tag>","run_id":N,"trace_id":"...","data":...}   (writeRunEvent)
 //!   {"v":1,"type":"<HostEvent tag>","data":{...}}                              (writeHostEvent)
 //!   {"v":1,"type":"ui_request","id":N,"kind":"<UiRequest tag>","request":{...}}
-//!   {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered"|"cancelled"}
+//!   {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered"|"cancelled"|"malformed"}
 //!
 //! Host events are what a session service adds around the kernel's events
 //! (core/session_host.zig): the submitted text, the end of a Run, the result
@@ -39,7 +39,8 @@
 //!   custom         {"result":<any JSON>}
 //!
 //! A malformed answer is never a grant: `parseResponse` answers it the way a
-//! cancelled request is answered (`cancelResponse`).
+//! cancelled request is answered (`cancelResponse`) and reports it as
+//! `.malformed`, so the request closes as `"malformed"`, not `"answered"`.
 //!
 //! tests/fixtures/wire/v1 pins one line per event and request kind. A change
 //! that alters any of them either bumps `SCHEMA_VERSION` or is refused.
@@ -60,7 +61,31 @@ const PlanApproval = ui_request.PlanApproval;
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// How a UI request ended, as `ui_request_closed.outcome` reports it.
-pub const RequestClosed = enum { answered, cancelled };
+pub const RequestClosed = enum {
+    /// The client's well-formed answer was used.
+    answered,
+    /// Interrupt, close or timeout won; the safe answer was used.
+    cancelled,
+    /// The client's answer could not be read; the safe answer was used.
+    malformed,
+};
+
+/// How `parseResponse` read a client's answer.
+pub const Reading = enum {
+    /// Well-formed: `out` holds the client's answer.
+    answer,
+    /// Malformed or of another version: `out` holds `cancelResponse`'s safe
+    /// answer.
+    malformed,
+
+    /// The `ui_request_closed` outcome to journal for this reading.
+    pub fn closed(self: Reading) RequestClosed {
+        return switch (self) {
+            .answer => .answered,
+            .malformed => .malformed,
+        };
+    }
+};
 
 /// The Run a CoreEvent belongs to, as the EventSink reported it, and the
 /// opaque trace ID the Host's caller attached to the submission.
@@ -292,39 +317,40 @@ pub fn cancelResponse(request: *const UiRequest, out: *UiResponse) error{InputAb
 
 /// Parses the Host's answer `json` to `request` into `out`. Answer slices
 /// (`answers`, `custom`) are owned by `allocator`. Anything malformed takes
-/// `cancelResponse`'s safe answer.
+/// `cancelResponse`'s safe answer and reads as `.malformed`; for a question or
+/// a custom UI that safe answer is `error.InputAborted`.
 pub fn parseResponse(
     request: *const UiRequest,
     json: []const u8,
     allocator: std.mem.Allocator,
     out: *UiResponse,
-) error{ InputAborted, OutOfMemory }!RequestOutcome {
+) error{ InputAborted, OutOfMemory }!Reading {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch
-        return cancelResponse(request, out);
-    if (parsed != .object) return cancelResponse(request, out);
+        return malformed(request, out);
+    if (parsed != .object) return malformed(request, out);
     const object = parsed.object;
     if (object.get("v")) |version| {
-        if (version != .integer or version.integer != SCHEMA_VERSION) return cancelResponse(request, out);
+        if (version != .integer or version.integer != SCHEMA_VERSION) return malformed(request, out);
     }
 
     switch (request.*) {
         .permission => {
-            const choice = choiceField(object, PermissionChoice) orelse return cancelResponse(request, out);
+            const choice = choiceField(object, PermissionChoice) orelse return malformed(request, out);
             out.* = .{ .permission = choice };
-            return .answered;
+            return .answer;
         },
         .plan_approval => {
-            const choice = choiceField(object, PlanApproval) orelse return cancelResponse(request, out);
+            const choice = choiceField(object, PlanApproval) orelse return malformed(request, out);
             out.* = .{ .plan_approval = choice };
-            return .answered;
+            return .answer;
         },
         .ask_question => |questions| {
-            const value = object.get("answers") orelse return cancelResponse(request, out);
-            if (value != .array or value.array.items.len != questions.len) return cancelResponse(request, out);
+            const value = object.get("answers") orelse return malformed(request, out);
+            if (value != .array or value.array.items.len != questions.len) return malformed(request, out);
             for (value.array.items) |item| {
-                if (item != .string) return cancelResponse(request, out);
+                if (item != .string) return malformed(request, out);
             }
             const answers = try allocator.alloc([]const u8, questions.len);
             var filled: usize = 0;
@@ -337,16 +363,21 @@ pub fn parseResponse(
                 filled += 1;
             }
             out.* = .{ .answers = answers };
-            return .answered;
+            return .answer;
         },
         .custom => {
-            const result = object.get("result") orelse return cancelResponse(request, out);
+            const result = object.get("result") orelse return malformed(request, out);
             const raw = try std.json.Stringify.valueAlloc(allocator, result, .{});
             defer allocator.free(raw);
             out.* = .{ .custom = try util_json.repairJsonUtf8(allocator, raw) };
-            return .answered;
+            return .answer;
         },
     }
+}
+
+fn malformed(request: *const UiRequest, out: *UiResponse) error{InputAborted}!Reading {
+    _ = try cancelResponse(request, out);
+    return .malformed;
 }
 
 fn choiceField(object: std.json.ObjectMap, comptime E: type) ?E {
@@ -382,11 +413,11 @@ test "parseResponse: a malformed or wrong-version answer never grants a permissi
     };
     for (bad) |json| {
         var out: UiResponse = undefined;
-        try testing.expectEqual(RequestOutcome.answered, try parseResponse(&request, json, testing.allocator, &out));
+        try testing.expectEqual(Reading.malformed, try parseResponse(&request, json, testing.allocator, &out));
         try testing.expectEqual(PermissionChoice.deny_once, out.permission);
     }
     var out: UiResponse = undefined;
-    _ = try parseResponse(&request, "{\"v\":1,\"choice\":\"allow_always\"}", testing.allocator, &out);
+    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"v\":1,\"choice\":\"allow_always\"}", testing.allocator, &out));
     try testing.expectEqual(PermissionChoice.allow_always, out.permission);
 }
 
@@ -400,7 +431,7 @@ test "parseResponse: ask_question needs one string per question" {
     var out: UiResponse = undefined;
     try testing.expectError(error.InputAborted, parseResponse(&request, "{\"answers\":[\"Yes\"]}", testing.allocator, &out));
     try testing.expectError(error.InputAborted, parseResponse(&request, "{\"answers\":[\"Yes\",2]}", testing.allocator, &out));
-    try testing.expectEqual(RequestOutcome.answered, try parseResponse(&request, "{\"answers\":[\"Yes\",\"Yes, No\"]}", testing.allocator, &out));
+    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"answers\":[\"Yes\",\"Yes, No\"]}", testing.allocator, &out));
     defer {
         for (out.answers) |answer| testing.allocator.free(answer);
         testing.allocator.free(out.answers);
@@ -411,7 +442,7 @@ test "parseResponse: ask_question needs one string per question" {
 test "parseResponse: a custom result reaches the tool as JSON text" {
     const request = UiRequest{ .custom = .{ .kind = "video_timeline", .payload_json = "{}" } };
     var out: UiResponse = undefined;
-    try testing.expectEqual(RequestOutcome.answered, try parseResponse(&request, "{\"result\":{\"in\":3,\"out\":42}}", testing.allocator, &out));
+    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"result\":{\"in\":3,\"out\":42}}", testing.allocator, &out));
     defer testing.allocator.free(out.custom);
     try testing.expectEqualStrings("{\"in\":3,\"out\":42}", out.custom);
     try testing.expectError(error.InputAborted, parseResponse(&request, "{\"output\":1}", testing.allocator, &out));
