@@ -949,3 +949,47 @@ test "SessionHost: cancellation wins over a racing answer; an interrupt after th
     hosted.run_returned = false;
     hosted.mutex.unlock();
 }
+
+test "SessionHost: a pending prompt answered and interrupted at once is cancelled through requestUi" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const runtime = try AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = .{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = "http://127.0.0.1:9",
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{},
+    } });
+    defer hosted.release();
+
+    // Once the prompt is announced, an "allow" and an interrupt arrive
+    // together, before the requester wakes up.
+    const Racer = struct {
+        fn run(session: *HostedSession) void {
+            waitForLine(&session.journal, "\"type\":\"ui_request\"") catch return;
+            session.mutex.lock();
+            defer session.mutex.unlock();
+            session.response = session.gpa.dupe(u8, "{\"choice\":\"allow_once\"}") catch null;
+            session.run_interrupted = true;
+            session.ui_ready.broadcast();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Racer.run, .{hosted});
+    defer thread.join();
+    const request = ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+    try std.testing.expectEqual(ui_request.RequestOutcome.answered, try HostedSession.requestUi(hosted, hosted.id, a, &request, &response));
+    try std.testing.expectEqual(ui_request.PermissionChoice.deny_once, response.permission);
+    try waitForLine(&hosted.journal, "\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"cancelled\"");
+    hosted.mutex.lock();
+    hosted.run_interrupted = false;
+    hosted.mutex.unlock();
+}
