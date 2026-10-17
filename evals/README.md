@@ -184,6 +184,35 @@ paired delta 的均值、样本方差、Student-t 95% CI、P50/P95、exact McNem
 quality–cost–latency frontier（dominates / dominated / tradeoff / equivalent）。cost 或 wall-clock
 任一侧缺失时比较 fail closed。
 
+### 5.0.1 链式尝试（跨尝试记忆）
+
+`run-paired` 的每个 rollout 都从全新 fake HOME 和空 TinyKG store 开始，测不到"上一次尝试留下的
+记忆是否帮到下一次"。`run-chained` 把同一任务、同一臂、同一 replicate 的 K 次尝试串成一条链：
+第 1 次从空 store 开始；每次尝试后 runner 把场景的 store（`.home/.metacodes/kg/store.kg[.v2]`）
+导出成自己保管的 tar，同链下一次尝试在会话开始前由 `tests/e2e/lib.sh` 的 `import_kg_store`
+导入恰好这一份（校验 sha256，并在工作区外写导入见证）。每次尝试带 `METACODES_TASK_HINT=<task id>`；
+工作区每次都回到冻结快照，store 不跨链、不跨 replicate、不跨臂。
+
+```bash
+python3 scripts/eval/cli.py run-chained \
+  --suite evals/suites/check-gate-v3.json \
+  --baseline-binary /path/to/observe-wrapper \
+  --candidate-binary /path/to/enforce-wrapper \
+  --baseline-revision <sha> --candidate-revision <sha> \
+  --replicates 2 --attempts 3 \
+  --chain-dir runs/chains \
+  --baseline-output baseline.jsonl --candidate-output candidate.jsonl
+```
+
+rollout 仍是 `run-paired` 的计分行，`trial = replicate × attempts + (attempt − 1)`，所以
+`compare` 按（replicate, attempt）跨臂配对。溯源是每臂一份哈希链账本
+`<chain-dir>/<arm>/ledger.jsonl`（`metacodes-chain-ledger-v1`）：第 k 次的导入 sha 必须等于第
+k−1 次的导出 sha，每个 tar 仍要哈希到它的行，导入见证必须吻合（第 1 次必须没有），账本与
+checkpoint 必须列出同一组尝试；任何断裂都在下一个付费 rollout 之前 fail closed。store 在
+`import_run` 之前导出，所以离线评分（任务自己的 success check）碰不到 store 和任何 prompt。
+账本行先于 checkpoint 写入：尝试跑完但 rollout 没记下（中途崩溃、证据无法导入）时，恢复会拒绝
+并交给操作者决定，而不是重跑一次付费尝试。预算参数与 `run-paired` 相同。
+
 ### 5.1 三臂长程机制实验（分级合同 v2）
 
 两个 manifest 共享 `metacodes-long-horizon-pk-v2`、同一 `glm-5.2`、同一二进制和三种

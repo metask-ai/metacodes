@@ -113,6 +113,21 @@ status, compatibility boundaries, and entry points are defined by
   preregisters the paired evaluation (development configuration with the
   validator pinned, held-out configuration with the visible suite pinned,
   stopping rules); nothing has been run.
+- Chained-attempt evaluation runner: `scripts/eval/cli.py run-chained` runs
+  K sequential attempts per task, per arm and per replicate on one TinyKG
+  store that starts empty and is carried from attempt to attempt
+  (`tests/e2e/lib.sh` `import_kg_store` extracts the previous attempt's
+  exported store into the fresh fake HOME before the session and writes an
+  import witness outside the workspace), with `METACODES_TASK_HINT` set to
+  the task id. Rollouts keep the `run-paired` format
+  (`trial = replicate × attempts + attempt − 1`); a per-arm hash-chained
+  ledger (`metacodes-chain-ledger-v1`) links each attempt's import to the
+  previous export and fails closed on any break, changed archive, missing
+  witness or ledger/checkpoint disagreement. The store is exported before the
+  offline grade runs. `learning-turn-v1.md` records its launch prerequisites
+  as met except a pinned full-validator command for configuration D, and an
+  amendment: the REPL harness files no outcome rows, so the baseline is the
+  accumulating store without lessons.
 - Sealed Skills: the §8.5 disclosure screen keeps two corpora under their
   own policies — the Skill's instructions and its `sealed/` references —
   so `egress.disclosure` is one word for both or

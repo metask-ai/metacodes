@@ -155,6 +155,7 @@ else:
         summarize_runtime_query_plans,
     )
     from .memory_tinykg_local import run_local_tinykg_smoke
+    from .chained_runner import run_chained
     from .paired_runner import run_multi_arm, run_paired
     from .promotion import (
         build_promotion_receipt,
@@ -664,6 +665,39 @@ def cmd_run_paired(args: argparse.Namespace) -> int:
     print(
         f"paired E2E complete: baseline={len(baseline)} candidate={len(candidate)} "
         f"trials={args.trials}"
+    )
+    return 0
+
+
+def cmd_run_chained(args: argparse.Namespace) -> int:
+    suite = load_json(Path(args.suite))
+    validate_suite(suite, REPO_ROOT)
+    baseline, candidate = run_chained(
+        suite,
+        REPO_ROOT,
+        Path(args.baseline_binary),
+        Path(args.candidate_binary),
+        replicates=args.replicates,
+        attempts=args.attempts,
+        scenario_glob=args.scenarios,
+        model_provider=args.model_provider,
+        model_id=args.model_id,
+        baseline_output=Path(args.baseline_output),
+        candidate_output=Path(args.candidate_output),
+        baseline_revision=args.baseline_revision,
+        candidate_revision=args.candidate_revision,
+        chain_dir=Path(args.chain_dir),
+        suite_path=Path(args.suite),
+        budget_used_cost_usd=args.budget_used_cost_usd,
+        budget_used_tokens=args.budget_used_tokens,
+        max_cumulative_cost_usd=args.max_cumulative_cost_usd,
+        max_cumulative_tokens=args.max_cumulative_tokens,
+        max_rollout_cost_usd=args.max_rollout_cost_usd,
+        max_rollout_metered_tokens=args.max_rollout_metered_tokens,
+    )
+    print(
+        f"chained E2E complete: baseline={len(baseline)} candidate={len(candidate)} "
+        f"replicates={args.replicates} attempts={args.attempts}"
     )
     return 0
 
@@ -1340,6 +1374,35 @@ def parser() -> argparse.ArgumentParser:
     )
     paired_parser.add_argument("--max-rollout-metered-tokens", type=int)
     paired_parser.set_defaults(func=cmd_run_paired)
+
+    chained_parser = commands.add_parser(
+        "run-chained",
+        help="run K sequential attempts per task on one carried TinyKG store, two arms",
+    )
+    chained_parser.add_argument("--suite", default="evals/suites/core-e2e.json")
+    chained_parser.add_argument("--baseline-binary", required=True)
+    chained_parser.add_argument("--candidate-binary", required=True)
+    chained_parser.add_argument("--baseline-revision", required=True)
+    chained_parser.add_argument("--candidate-revision", required=True)
+    chained_parser.add_argument("--replicates", type=int, required=True)
+    chained_parser.add_argument("--attempts", type=int, required=True, help="attempts per chain (K)")
+    chained_parser.add_argument(
+        "--chain-dir",
+        required=True,
+        help="store archives and the per-arm hash-chained ledgers (kept outside every workspace)",
+    )
+    chained_parser.add_argument("--scenarios", default="*")
+    chained_parser.add_argument("--model-provider", default="anthropic")
+    chained_parser.add_argument("--model-id", default="claude-sonnet-4-20250514")
+    chained_parser.add_argument("--baseline-output", required=True)
+    chained_parser.add_argument("--candidate-output", required=True)
+    chained_parser.add_argument("--budget-used-cost-usd", type=float, default=0.0)
+    chained_parser.add_argument("--budget-used-tokens", type=int, default=0)
+    chained_parser.add_argument("--max-cumulative-cost-usd", type=float)
+    chained_parser.add_argument("--max-cumulative-tokens", type=int)
+    chained_parser.add_argument("--max-rollout-cost-usd", type=float)
+    chained_parser.add_argument("--max-rollout-metered-tokens", type=int)
+    chained_parser.set_defaults(func=cmd_run_chained)
 
     multi_parser = commands.add_parser(
         "run-multi",

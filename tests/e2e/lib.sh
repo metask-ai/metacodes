@@ -110,6 +110,31 @@ setup_fake_home() {
 }
 
 # ============================================================================
+# Chained attempts (scripts/eval/chained_runner.py): carry one TinyKG store
+# across sequential attempts at a task. When E2E_KG_STORE_IMPORT names a tar
+# the runner exported from the previous attempt, check it against
+# E2E_KG_STORE_IMPORT_SHA256, extract it into <home>/.metacodes/kg and write
+# the hash to <witness> (outside the workspace) so the runner can prove the
+# import happened. Without the variable it does nothing. Both variables are
+# unset either way: the model's process never sees runner control state.
+# Returns non-zero on any mismatch; the caller fails the scenario closed.
+# ============================================================================
+import_kg_store() {
+  local home="$1" witness="$2"
+  local archive="${E2E_KG_STORE_IMPORT:-}" expected="${E2E_KG_STORE_IMPORT_SHA256:-}"
+  unset E2E_KG_STORE_IMPORT E2E_KG_STORE_IMPORT_SHA256
+  [[ -n "$archive" ]] || return 0
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo "KG store import: invalid sha256" >&2; return 1; }
+  [[ -f "$archive" && ! -L "$archive" ]] || { echo "KG store import: archive missing: $archive" >&2; return 1; }
+  local observed
+  observed="$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$archive")" || return 1
+  [[ "$observed" == "$expected" ]] || { echo "KG store import: sha256 mismatch" >&2; return 1; }
+  mkdir -p "$home/.metacodes/kg" || return 1
+  tar -xf "$archive" -C "$home/.metacodes/kg" || { echo "KG store import: extraction failed" >&2; return 1; }
+  printf '%s\n' "$observed" > "$witness" || return 1
+}
+
+# ============================================================================
 # Stop the TinyKG services (`metacodes --state-dir <dir> kgd [--config <path>]`)
 # whose state root lies under <home>: SIGTERM, then SIGKILL after five
 # seconds. Reports on stdout what it stopped (callers redirect it). Needs `ps`;
@@ -184,6 +209,18 @@ run_session() {
   # --- HOME 隔离:每场景独立 fake HOME,隔离一切 HOME 级副作用 ---
   local fake_home="$workdir/.home"
   setup_fake_home "$fake_home"
+
+  # --- Chained attempts: the previous attempt's store, never with a fixture. ---
+  if [[ -n "${E2E_KG_STORE_IMPORT:-}" && -n "$CONF_KG_SEED" ]]; then
+    echo "KG store import and KG_SEED fixture are exclusive" >&2
+    unset E2E_KG_STORE_IMPORT E2E_KG_STORE_IMPORT_SHA256
+    echo 89
+    return 0
+  fi
+  import_kg_store "$fake_home" "${workdir}.kg-import.sha256" || {
+    echo 89
+    return 0
+  }
 
   # --- TinyKG 夹具:只向本场景 fake HOME 的全新 store 写入,以 global project 供任意
   # workdir domain 只读召回。fixture 路径同时在 eval suite environment.fixtures 中冻结。---

@@ -122,7 +122,7 @@
     "interpretation": "The 18 paired observations are a development gate. They may reject the plugin candidate but cannot establish a general coding-benchmark advantage or a public leaderboard claim. Promotion still requires the repository release contract and then an external WorkBuddy development cohort."
   },
   "pinned_evaluator_files": {
-    "scripts/eval/paired_runner.py": "a1bba668ecfe82d90774bfb9b1ecfba14c1ee7f99c2a9d0360fbf3edad55e802",
+    "scripts/eval/paired_runner.py": "11f950d59bf88064e98b948fd382ce6bffcbc8c36b5be45be872fb73bc541cc2",
     "scripts/eval/analysis.py": "4d93d9fc83a38804dd41e587178fff299cff911b584d9a46dad021c9e9a08516",
     "scripts/eval/e2e_adapter.py": "23adcf9e0747ce122926bb501676d53810825bb1440d0c750620b72246a73e9c",
     "scripts/eval/model.py": "657169419417082e55e560c68d71e1e92dea9d73a37cc2619499de34efb10b7c",
@@ -132,12 +132,12 @@
     "scripts/eval/memory_agent_runtime_pilot.py": "4c52eeb01dce1d0e8adccbbc844cb6c6b120441db0c2d0b7aeb72eeff6caa97b",
     "scripts/eval/promotion.py": "65f566244d3880b367a0c9adee858b2160ed63d5b1644ea38202e79a34fb79f3",
     "scripts/eval/treatment_activation.py": "28b976feaf8caab1d03a42d58794b067b9ca892de248e72a2f4ab22eebe769b0",
-    "scripts/eval/cli.py": "63e0e7f19b51074d31c1ffd6399f0a8f1dc6cda607f280c30c0ae00e793606d8",
+    "scripts/eval/cli.py": "57e15e7825db4e7b689c9e689e93244cb03018ca2c5d534511653011093063cd",
     "scripts/eval/plugin_release_gate.py": "9c1d0330e229c4faf47d6bd2e2d58e4432b738dbf77b422946db9a659573299a",
     "scripts/eval/plugin_pair_runner.py": "29cc5efe070936610e52bfa7f5200f75e9959f1cde0428780fa4c59e03b86930",
     "scripts/eval/plugin_pair_analysis.py": "1cf181442e0c59f5452adfc8aea2c755941f875545b9200ed07589f96606d0f4",
     "tests/e2e/run_e2e.sh": "38b21bdc939682e870846cc57731c90b2a114aec285b8df6d8019ba7a59314f3",
-    "tests/e2e/lib.sh": "f89b1221c89b70ed43f4bf63ec656c9f88be5c67a3b8a6999f09121445e121e5",
+    "tests/e2e/lib.sh": "e3f94a9ba894b52330f70323062c063b596e32ccaf61d2d645866601e932c971",
     "evals/gates/default.json": "3ed5b48edd98c73ac5106db76bc0489900a7b1abf0469ccfcf3e2b3188dc0157",
     "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean": "9ac5611a40f49bbf029162b863a216198bc70e34cf4ac1efbaf13b6271e7447a",
     "control-plane/lean/MetaCodesControl/ObligationGate.lean": "c07307865b182cdebc73c72ed007bb6ae0514833b1247b86fcccb770503e426c"

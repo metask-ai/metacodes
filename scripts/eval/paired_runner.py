@@ -829,7 +829,16 @@ def _run_once(
     max_metered_tokens: int | None = None,
     max_cost_usd: float | None = None,
     runtime_api_key: str | None = None,
+    task_hint: str | None = None,
+    store_import: Tuple[Path, str] | None = None,
 ) -> Path:
+    """Run one native E2E invocation and return its new run directory.
+
+    `task_hint` becomes the session's METACODES_TASK_HINT (chained attempts
+    name the task their lessons and outcome rows belong to). `store_import`
+    is a (tar, sha256) pair `tests/e2e/lib.sh` extracts into the scenario's
+    fresh TinyKG state before the session starts (`import_kg_store`).
+    """
     runs_dir = repo_root / "tests/e2e/runs"
     before = (
         {path.resolve() for path in runs_dir.iterdir() if path.is_dir()}
@@ -879,6 +888,16 @@ def _run_once(
     }
     if runtime_env is not None:
         env.update(runtime_env)
+    if task_hint is not None:
+        if not task_hint or len(task_hint) > 200 or not all("!" <= c <= "~" for c in task_hint):
+            raise ValidationError("task hint must be 1-200 printable ASCII bytes without spaces")
+        env["METACODES_TASK_HINT"] = task_hint
+    if store_import is not None:
+        archive, archive_sha256 = store_import
+        if not Path(archive).is_file() or len(archive_sha256) != 64:
+            raise ValidationError("store import requires an existing archive and its sha256")
+        env["E2E_KG_STORE_IMPORT"] = str(Path(archive).resolve())
+        env["E2E_KG_STORE_IMPORT_SHA256"] = archive_sha256
     if timeout_seconds is not None:
         env["E2E_TIMEOUT"] = str(timeout_seconds)
     if max_metered_tokens is not None:
