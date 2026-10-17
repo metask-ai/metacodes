@@ -48,6 +48,19 @@ def test_T18b_slash_prefix_filters(bin_path):
         a._fail(f"`/co` 菜单应含 /commit /compact:\n{menu}")
 
 
+def test_T18_skills_command_is_the_candidate(bin_path):
+    """Claude Code exposes `/skills` when the user types the `/skill` prefix."""
+    raw = run(bin_path, ["sleep:0.8", "type:/skill"], per_key_drain=0.05)
+    a = TTYAssert(raw)
+    bot = a.box_bottom_row()
+    foot = a.footer_row()
+    if bot is None or foot is None:
+        a._fail("缺边框/footer(输入框未渲染)")
+    menu = "\n".join(a.final.line_text(r) for r in range(bot + 1, foot) if a.final.line_text(r).strip())
+    if "/skills" not in menu:
+        a._fail(f"`/skill` 前缀应显示 /skills 候选:\n{menu}")
+
+
 def test_T18c_space_dismisses_menu(bin_path):
     # 打 `/help ` (带空格)→ 已带参数,菜单消失;框内容行回显 `/help `。
     raw = run(bin_path, ["sleep:0.8", "type:/help x"], per_key_drain=0.05)

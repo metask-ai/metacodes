@@ -87,3 +87,15 @@ def test_newline_hint_per_terminal(bin_path):
     assert "shift + " in warp and "for newline" in warp, \
         f"Warp(白名单)应显 shift+⏎ 换行提示,实际:{warp!r}"
 
+
+
+def test_colorless_conpty_keeps_unicode_frame(bin_path):
+    """PowerShell often has no TERM; color fallback must keep the rounded TUI."""
+    raw = run(
+        bin_path,
+        ["sleep:0.8"],
+        env={"FORCE_COLOR": None, "TERM": None, "COLORTERM": None, "NO_COLOR": None},
+    )
+    assert "╭".encode("utf-8") in raw, "no-color TTY must keep the rounded top border"
+    assert "╰".encode("utf-8") in raw, "no-color TTY must keep the rounded bottom border"
+    assert b"+-" not in raw, "ASCII box is reserved for explicit /theme mono"

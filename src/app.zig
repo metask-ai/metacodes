@@ -513,6 +513,10 @@ pub const App = struct {
     /// Owns the resolved MCP configuration and `mcp_report` (child of
     /// `allocator`, released in deinit). Null until MCP servers are loaded.
     mcp_arena: ?*std.heap.ArenaAllocator = null,
+    /// MCP discovery runs after the TUI has started. The worker only owns the
+    /// network wait; the main loop joins it before executing the first turn.
+    mcp_startup_thread: ?std.Thread = null,
+    mcp_startup_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 当前激活的 skill 状态(allowed/disallowed 临时白黑名单)。
     /// 激活 Skill 工具时设;loop.zig 处理下条 user message 前清。
     active_skill: ?ActiveSkillState = null,
@@ -751,9 +755,8 @@ pub const App = struct {
         }
 
         // 启动时尝试连接 config.json 里声明的 MCP servers。失败逐个 log，不影响启动。
-        app.connectMcpServers() catch |err| {
-            @import("util/log.zig").debug("mcp", "no servers connected: {s}", .{@errorName(err)});
-        };
+        // MCP servers are discovered asynchronously once the interactive TUI
+        // is ready. A broken HTTP server must never delay the first frame.
 
         // 现在构造完整的 tool_defs：静态 + 动态（Skill / MCP）+ web_search。
         // 先构造一次拿到全部工具名（含动态），据此建 PromptContext，再带 context 重建——
@@ -1120,6 +1123,10 @@ pub const App = struct {
         if (app.lsp_service) |svc| svc.shutdown(); // 关所有 language server + reaper 线程
         app.tasks.deinit();
         app.goal_state.deinit();
+        if (app.mcp_startup_thread) |thread| {
+            thread.join();
+            app.mcp_startup_thread = null;
+        }
         // MCP：先 session（释放 binding 内存）再 client（关 transport + reap 子进程）
         for (app.mcp_sessions.items) |*entry| {
             entry.session.deinit();
@@ -3405,6 +3412,92 @@ pub const App = struct {
             .disabled = resolved.disabled,
             .problems = resolved.problems,
         };
+    }
+
+    /// Start MCP discovery without holding up the interactive TUI. The worker
+    /// is joined at a completed-startup turn boundary (and during deinit), so
+    /// dynamic tools are published only after their network setup is done.
+    pub fn startMcpStartup(app: *App) !void {
+        if (app.mcp_startup_thread != null) return;
+        app.mcp_startup_done.store(false, .release);
+        app.mcp_startup_thread = try std.Thread.spawn(.{}, mcpStartupMain, .{app});
+    }
+
+    /// True when MCP startup has either not been started or has finished. The
+    /// REPL uses this as a non-blocking hand-off point: a pending worker must
+    /// never delay the first provider request or swallow Esc/Ctrl+C.
+    pub fn mcpStartupReady(app: *const App) bool {
+        return app.mcp_startup_thread == null or app.mcp_startup_done.load(.acquire);
+    }
+
+    fn mcpStartupMain(app: *App) void {
+        app.connectMcpServers() catch |err| {
+            @import("util/log.zig").debug("mcp", "no servers connected: {s}", .{@errorName(err)});
+        };
+        app.mcp_startup_done.store(true, .release);
+    }
+
+    /// Join the startup worker once it is safe to publish the dynamic tool
+    /// registry. Callers should first check mcpStartupReady(); this method is
+    /// intentionally blocking for explicit commands such as `/tools`.
+    pub fn waitForMcpStartup(app: *App) void {
+        if (app.mcp_startup_thread) |thread| {
+            thread.join();
+            app.mcp_startup_thread = null;
+            app.refreshMcpToolDefinitions();
+        }
+    }
+
+    /// MCP tools are added after the initial static tool snapshot. Rebuild the
+    /// schema and system-prompt projection once the worker has been joined so
+    /// the first model turn sees the same definitions as `/tools`.
+    fn refreshMcpToolDefinitions(app: *App) void {
+        const defs_allocator = app.tool_defs_arena.allocator();
+        const probe_ctx = tools_mod.PromptContext{
+            .agent_teams = app.config.agent_teams,
+            .tinykg_enabled = app.config.long_horizon_arm.usesTinyKg(),
+        };
+        const probe_defs = tools_mod.toToolDefinitionsFull(defs_allocator, &app.dyn_registry, &probe_ctx) catch |err| {
+            @import("util/log.zig").warn("mcp", "tool schema refresh failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const enabled_names = defs_allocator.alloc([]const u8, probe_defs.len) catch |err| {
+            @import("util/log.zig").warn("mcp", "tool name refresh failed: {s}", .{@errorName(err)});
+            return;
+        };
+        for (probe_defs, 0..) |definition, i| enabled_names[i] = definition.name;
+        app.enabled_tool_names = enabled_names;
+        const prompt_ctx = tools_mod.PromptContext{
+            .permission_mode = app.config.permission_mode,
+            .enabled_tool_names = enabled_names,
+            .agent_type = "",
+            .include_git = true,
+            .agent_teams = app.config.agent_teams,
+            .tinykg_enabled = app.config.long_horizon_arm.usesTinyKg(),
+        };
+        app.tool_defs = tools_mod.toToolDefinitionsFull(defs_allocator, &app.dyn_registry, &prompt_ctx) catch |err| {
+            @import("util/log.zig").warn("mcp", "tool definition refresh failed: {s}", .{@errorName(err)});
+            return;
+        };
+        _ = app.skill_runtime.applyModelToolSchema(app.tool_defs);
+        const cli_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
+        defer if (cli_cwd.len > 0) app.allocator.free(cli_cwd);
+        const refreshed_prompt = system_prompt_mod.buildFullWithDefs(
+            app.allocator,
+            app.config.model_display_name orelse app.activeModel(),
+            &app.skills,
+            &app.agents,
+            app.enabled_tool_names,
+            app.memdir_abs,
+            app.kgReady(),
+            cli_cwd,
+            app.tool_defs,
+        ) catch |err| {
+            @import("util/log.zig").warn("mcp", "system prompt refresh failed: {s}", .{@errorName(err)});
+            return;
+        };
+        if (app.system_prompt) |old| app.allocator.free(old);
+        app.system_prompt = refreshed_prompt;
     }
 
     /// Move a connected client into App ownership and publish its tools.

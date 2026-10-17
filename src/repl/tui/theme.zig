@@ -4,7 +4,7 @@
 //! ANSI 字节。这样改主题不用 grep 整个项目。
 //!
 //! 选择策略:
-//!   detectColor() == .none → monochrome(全部空字符串 + ASCII 符号)
+//!   detectColor() == .none → no_color(无 ANSI，但保留 Unicode TUI 字形)
 //!   其它 → 看 settings 的 theme 字段;default = dark
 //!
 //! 设计参考 TUI_COMPONENTS.md §三。
@@ -193,14 +193,41 @@ pub const monochrome: Theme = .{
 // 选择
 // ============================================================================
 
+/// ANSI disabled, while keeping the Unicode glyphs used by the regular TUI.
+/// Windows PowerShell often has no TERM/COLORTERM even though ConPTY renders
+/// UTF-8 correctly. Keeping this separate from `monochrome` avoids turning a
+/// normal input frame into `+---+` merely because color detection is limited.
+fn withoutAnsi(base: Theme) Theme {
+    var th = base;
+    th.primary = "";
+    th.dim = "";
+    th.accent = "";
+    th.success = "";
+    th.warn = "";
+    th.danger = "";
+    th.info = "";
+    th.mode_accept = "";
+    th.role_user = "";
+    th.role_assistant = "";
+    th.role_tool = "";
+    th.role_thinking = "";
+    th.diff_add_bg = "";
+    th.diff_del_bg = "";
+    th.syntax = .{};
+    th.reset = "";
+    return th;
+}
+
+pub const no_color: Theme = withoutAnsi(dark);
+
 pub const Variant = enum { auto, dark, light, monochrome };
 
 /// 根据用户偏好 + 终端能力选主题。
-/// - variant=.auto:能力 .none → monochrome;否则 dark(默认)
+/// - variant=.auto:能力 .none → no_color;否则 dark(默认)
 /// - variant=.dark/light/monochrome:用户显式指定
-/// 即便用户选 dark,能力是 .none 时也强制降级到 monochrome(否则 ANSI 在管道里乱码)。
+/// 能力为 none 时仅关闭 ANSI；只有显式 monochrome 才使用 ASCII 字形。
 pub fn select(variant: Variant, cap: term.ColorCapability) Theme {
-    if (cap == .none) return monochrome;
+    if (cap == .none) return if (variant == .monochrome) monochrome else no_color;
     const is_light = (variant == .light);
     var th: Theme = switch (variant) {
         .auto, .dark => dark,
@@ -266,9 +293,16 @@ test "三套预设字段非空(除 monochrome 颜色字段)" {
     try testing.expectEqualStrings("+", monochrome.box_tl);
 }
 
-test "select: ColorCapability.none 强制 monochrome" {
+test "select: ColorCapability.none keeps Unicode without ANSI" {
     const t = select(.dark, .none);
-    try testing.expect(t.dim.len == 0); // 验证是 monochrome
+    try testing.expect(t.dim.len == 0); // no ANSI colors
+    try testing.expectEqualStrings("╭", t.box_tl); // 无颜色仍保留 Unicode 边框
+}
+
+test "select: explicit monochrome remains ASCII" {
+    const t = select(.monochrome, .none);
+    try testing.expectEqualStrings("+", t.box_tl);
+    try testing.expectEqualStrings("-", t.box_h);
 }
 
 test "select: auto + basic_16 → dark" {

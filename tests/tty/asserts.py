@@ -91,10 +91,13 @@ class TTYAssert:
             )
 
     def _is_rule_row(self, sc, r):
-        """该行是否为输入框横线边框(全 ─,对齐 cc 2.1.x 三横线)。
-        要求整行去空白后非空且只由 ─ 组成(banner 分隔线同形,但不在框紧邻位置)。"""
+        """该行是否为输入框边框(圆角 Unicode 或 ASCII 横线)。"""
         t = sc.line_text(r).strip()
-        return len(t) > 0 and set(t) == {"─"}
+        if not t:
+            return False
+        if len(t) >= 2 and t[0] in ("╭", "╰") and t[-1] in ("╮", "╯"):
+            return all(ch == "─" for ch in t[1:-1])
+        return set(t) == {"─"}
 
     def box_top_row(self, screen=None):
         # 2026-06-06 对齐 cc 2.1.x:输入框边框从圆角 ╭╰ 改为三横线(全宽 ─)。

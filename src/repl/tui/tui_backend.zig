@@ -117,7 +117,8 @@ pub const TuiBackend = struct {
 
     // ── 生成期输入子系统(阶段 C:watcher 归属 backend)──────────────────────
     // 旧 loop.zig 硬编码的 stdinAbortWatcher 线程移到这里。TuiBackend owns 键盘输入:
-    // 生成期边等边打字 / 回车入队(queue) / esc 中断(直戳 AbortSignal)/ 超时 tickSpinner。
+    // 生成期边等边打字 / 回车入队(queue) / draft Esc 入队清框、空框 Esc 中断 /
+    // 超时 tickSpinner。
     // AbortSignal 机制不变(SIGINT handler 仍直戳;stream.next 仍 throwIfAborted)。
     //
     // 阶段 D(定期激活归 UI 后端)由此**一并满足**:spinner tick 在 watcherMain 的 poll
@@ -396,8 +397,8 @@ pub const TuiBackend = struct {
         // 规矩派发——Core 不认识 REPL 命令,直接喂给模型会把 `/model x` 变成一句聊天(#115 review)。
         // 队首是命令时后面的普通消息也一起等:FIFO 不重排,用户敲的顺序就是生效顺序。
         const msg = q.popFrontIf(isSteerable) orelse return null;
-        // 取出后再看一次中断:Esc 处理是"先把草稿入队、再 abort",若 abort 恰好落在上面的检查与
-        // popFront 之间,这条本该"中断后自动续发"的草稿会被当成本 Run 的转向。放回队首,按中断处理。
+        // 取出后再看一次中断:空框 Esc/Ctrl+C 可能恰好落在上面的检查与
+        // popFront 之间;这条消息不应在已中断的 run 中被消费。放回队首,按中断处理。
         if (self.abort_signal) |sig| if (sig.isAborted()) {
             if (!q.pushFront(msg)) q.allocator.free(msg);
             return .{ .interrupt = sig.reason() };
@@ -571,7 +572,7 @@ pub const TuiBackend = struct {
     }
 
     /// 生成期 stdin 监听主循环(从旧 loop.zig stdinAbortWatcher 原样搬入)。
-    /// 行为不变:回车→入队(queue);esc→已打字先入队再 abort(直戳 AbortSignal);
+    /// 行为:回车→入队(queue);有 draft 的 Esc→入队并清框;空框 Esc→abort;
     /// 超时→孤立 ESC 兑现 or tickSpinner。AbortSignal 机制完全不动。
     fn watcherMain(self: *TuiBackend) void {
         // 入口快照一次:三字段在 watcher 生命周期内 immutable(仅 startInput 写,且仅在无 watcher 时调
@@ -655,11 +656,23 @@ pub const TuiBackend = struct {
     ///   · action != .pass_to_editor → dispatch 已消费(开关 help/overlay/滚动),内部已重画,不动 editor;
     ///   · action == .pass_to_editor → dispatch 未消费,按键类型决定生成期独有语义:
     ///       - enter 系 → 入待发送队列 + clear(dispatch 无"入队"概念,故落 pass_to_editor 由此接);
-    ///       - esc     → 无弹层,中断推理(入队已打的字 + abort);
+    ///       - esc     → 有 draft 入队并清框;空框中断推理;
     ///       - 其余     → 普通编辑键喂 LineEditor。
     /// 关键:enter/esc 也经 dispatch 先过一遍 → overlay/help 开着时它们被 dispatch 路由消费
     /// (transcript 期 enter 被 dispatchTranscriptKey 忽略,不会误入队;help 期 esc 只关 help)。
-    /// esc 优先级:overlay 开→关 overlay;help 开→关 help;都关→中断(先关弹层再中断)。
+    /// esc 优先级:overlay 开→关 overlay;help 开→关 help;都关→按 draft/空框分流。
+    fn interruptCurrentRun(self: *TuiBackend, app: *app_mod.App) void {
+        if (self.input_abort) |ab| {
+            ab.abort(.user_interrupt);
+            // The flag alone cannot wake a provider blocked in network I/O.
+            app.provider().cancel(ab);
+            self.cancel_sent = true;
+        }
+        if (app.agent_jobs) |*reg| {
+            _ = reg.abortAllRunningForSession(app.session_id);
+        }
+    }
+
     fn handleKey(self: *TuiBackend, snap: InputCtx.Snapshot, key: input.Key, ed: *input.LineEditor) void {
         const app = snap.app orelse return;
         const eff = self.region.applyGenKey(app, &app.conversation, key, ed.view(), ed.cursor);
@@ -753,26 +766,23 @@ pub const TuiBackend = struct {
             // Ctrl+Enter:真 cc 实测无效键(不换行/不提交)→ 生成期同样 no-op,不入队不重画。
             .ctrl_enter => return,
             .esc => {
-                // 无弹层的 esc → 中断推理。框里已打的字先入队(不丢,中断后自动续发),再 abort。
+                // 生成期 Esc 带文字时是 steer；空框时才中断当前推理。
                 const v = ed.view();
                 const trimmed = std.mem.trim(u8, v, " \t\r\n");
                 if (trimmed.len > 0) {
                     if (self.queue) |qq| _ = qq.push(v);
+                    ed.clear();
+                    self.region.setGenInput(ed.view(), ed.cursor);
+                    self.region.redrawGen(app);
+                    return;
                 }
+                self.interruptCurrentRun(app);
+                return;
+            },
+            .ctrl_c => {
                 ed.clear();
-                if (self.input_abort) |ab| {
-                    ab.abort(.user_ctrl_c);
-                    // 标志之外还要真的 shutdown 连接:对端沉默时主线程卡在 readv,标志永远没人看。
-                    app.provider().cancel(ab);
-                    self.cancel_sent = true;
-                }
-                // 多 agent:esc 还要 abort 所有 running agent job——前台 Task 的 subagent 走 app.abort
-                // 已被打断,但**后台/嵌套** agent job 持自己的 entry.abort,app.abort 不触达,否则 esc 后
-                // 它们继续跑(用户实测 bug:启动多 agent 后 esc 不终止)。非阻塞 abort,不 join。
-                if (app.agent_jobs) |*reg| {
-                    _ = reg.abortAllRunningForSession(app.session_id);
-                }
-                return; // 中断不重画(主线程很快收尾)
+                self.interruptCurrentRun(app);
+                return;
             },
             else => {
                 // 普通编辑键 → 喂 LineEditor,重画生成区输入框。

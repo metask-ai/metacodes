@@ -431,7 +431,7 @@ pub const Action = enum {
     exit_repl,
     /// 空输入 Ctrl+D → 主动退出 REPL；非空输入 Ctrl+D → 丢弃
     eof,
-    /// Esc Esc(空 buffer 二次):清 draft + 保存到历史
+    /// Esc(非空 draft):清 draft + 保存到历史
     clear_draft,
     /// 无语义变化（如 unknown 键）
     none,
@@ -450,7 +450,6 @@ pub const LineEditor = struct {
     /// 上一次按键是否是 Ctrl+C（用于"双击退出"语义）。任何其他按键重置为 false。
     ctrl_c_armed: bool = false,
     /// 上一次按键是否是 Esc(用于 Esc Esc 双击清 draft)。
-    esc_armed: bool = false,
     /// yank ring:Ctrl+W/K/U 删除的内容存这,Ctrl+Y 粘回。
     yank_buf: std.ArrayList(u8),
     /// undo 栈:破坏性编辑前快照 buf+cursor。深度上限 undo_max_depth,超了丢最旧。
@@ -483,10 +482,6 @@ pub const LineEditor = struct {
         const was_armed = self.ctrl_c_armed;
         if (@as(std.meta.Tag(Key), key) != .ctrl_c) {
             self.ctrl_c_armed = false;
-        }
-        const was_esc_armed = self.esc_armed;
-        if (@as(std.meta.Tag(Key), key) != .esc) {
-            self.esc_armed = false;
         }
 
         // undo 去抖:破坏性编辑前 push 当前状态。char 连打只在段首压一次(last_op != char);
@@ -666,12 +661,12 @@ pub const LineEditor = struct {
             // paste_begin/end 由驱动循环（loop.zig）直接处理，编辑器层忽略
             .paste_begin, .paste_end => return .none,
             .esc => {
-                // Esc Esc:非空 buffer 二次按 → 清 draft(保存到历史让 Up 可恢复)
-                if (was_esc_armed and self.buf.items.len > 0) {
-                    self.esc_armed = false;
-                    return .clear_draft;
-                }
-                self.esc_armed = true;
+                // Idle input follows Claude Code's draft behavior: one Esc
+                // clears a non-empty draft; an empty editor has nothing to
+                // cancel and is left alone. The generating-phase watcher
+                // handles Esc separately because it owns the session abort
+                // state machine.
+                if (self.buf.items.len > 0) return .clear_draft;
                 return .none;
             },
             // 全局快捷键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/X/L)由 dispatch(ui.zig)拦截,
@@ -1213,24 +1208,21 @@ test "LineEditor: alt_b / alt_f word navigation" {
     try testing.expectEqual(@as(usize, 7), ed.cursor);
 }
 
-test "LineEditor: Esc Esc on non-empty buffer clears draft" {
+test "LineEditor: single Esc on non-empty buffer clears draft" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
     try typeStr(&ed, "hello");
-    // 第一次 esc:none + arm
-    try testing.expect((try ed.handle(.esc)) == .none);
-    // 第二次 esc(非空 buffer):clear_draft
     try testing.expect((try ed.handle(.esc)) == .clear_draft);
 }
 
-test "LineEditor: single Esc is none (not clear)" {
+test "LineEditor: Esc after clear is harmless" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
     try typeStr(&ed, "x");
-    try testing.expect((try ed.handle(.esc)) == .none);
-    // 中间插入字符 → 重置 esc_armed
+    try testing.expect((try ed.handle(.esc)) == .clear_draft);
+    ed.clear();
     _ = try ed.handle(Key{ .char = 'y' });
-    try testing.expect((try ed.handle(.esc)) == .none); // 又是第一次
+    try testing.expect((try ed.handle(.esc)) == .clear_draft);
 }
 
 test "LineEditor: Esc Esc on empty buffer does not clear" {

@@ -535,10 +535,14 @@ def _run_windows(bin_path, key_events, term_size, full_env,
 
     cap.drain(startup_drain)
     # ConPTY + debug 二进制启动明显慢于 POSIX(实测首帧 ~2-3s):固定 startup_drain 会
-    # 抓到 0 字节假失败。自适应:未见首个完整帧(show-cursor 标记)就继续等,上限 10s。
+    # 抓到 0 字节假失败。自适应:等待真实输入提示符,不要用 show-cursor 标记——
+    # metacodes 只在退出时恢复光标,用 ESC[?25h 会把每个用例白等满 10s。
     deadline = time.time() + 10.0
-    while b"\x1b[?25h" not in cap.out and time.time() < deadline:
+    first_frame = ("╭".encode("utf-8"), "❯".encode("utf-8"))
+    while not any(marker in cap.out for marker in first_frame) and time.time() < deadline:
         cap.drain(0.3)
+    if not any(marker in cap.out for marker in first_frame):
+        raise AssertionError("TUI 首帧在 10s 内未出现(可能被网络/MCP/KG 初始化阻塞)")
     # 键间 drain 同理放宽下限(0.25s 在 ConPTY 下常抓不到该键引发的重画)。
     _drive(key_events, write, cap, set_size, max(per_key_drain, 0.4))
 

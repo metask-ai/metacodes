@@ -69,7 +69,7 @@ pub const StatusBar = struct {
     /// **2s 门控**——前 2 秒只显 `{char} {verb}…`(无计时/token);≥2s 才显
     /// `{char} {verb}… ({Ns} · ↓ {N} tokens)`(token>0 才含 token 段)。旧"30s 门控"认知被实拍推翻。
     /// `esc to interrupt` 在 footer(drawFooter 生成期),非此行。
-    /// 留 current_tool/tool_ms 形参不读(调用方签名稳定,工具进度走下方 per-toolUse 卡)。
+    /// current_tool 在主状态行中显示；详细参数仍由下方 per-toolUse 卡承载。
     /// max_w = 最大显示宽(= inner_w);超宽按显示宽截断(跳过 ANSI SGR 不计宽)。
     pub fn renderGenerating(
         writer: anytype,
@@ -83,15 +83,22 @@ pub const StatusBar = struct {
         tool_ms: u64,
         max_w: usize,
     ) !usize {
-        _ = current_tool;
         _ = tool_ms;
         const fr = verbs.frame(frame_idx, use_unicode);
+        // Keep the state machine visible while a tool is active. Claude Code
+        // replaces the generic thinking label with the current operation;
+        // retaining the verb as a prefix makes the transition readable.
+        var state_buf: [160]u8 = undefined;
+        const state_label: []const u8 = if (current_tool.len > 0)
+            (std.fmt.bufPrint(&state_buf, "{s} · {s}", .{ verb, current_tool }) catch verb)
+        else
+            verb;
 
         var line_buf: [256]u8 = undefined;
         // 计时/token 门控(2s,对齐 napicc v2.1.170 实拍):未到阈值 → 极简 `{char} {verb}…`。
         if (elapsed_ms < SHOW_TOKENS_AFTER_MS) {
             const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}{s}…{s}", .{
-                theme.accent, fr, theme.reset, verb, theme.reset,
+                theme.accent, fr, theme.reset, state_label, theme.reset,
             }) catch {
                 try writer.print("{s}{s}{s}", .{ theme.accent, fr, theme.reset });
                 return 1;
@@ -111,7 +118,7 @@ pub const StatusBar = struct {
         else
             (std.fmt.bufPrint(&meta_buf, " ({d:.0}s)", .{secs}) catch "");
         const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}{s}…{s}{s}{s}{s}", .{
-            theme.accent, fr, theme.reset, verb, theme.reset, theme.dim, meta, theme.reset,
+            theme.accent, fr, theme.reset, state_label, theme.reset, theme.dim, meta, theme.reset,
         }) catch {
             try writer.print("{s}{s}{s}", .{ theme.accent, fr, theme.reset });
             return 1;

@@ -57,5 +57,7 @@ def test_cczig_output_no_autowrap_divergence(bin_path):
     b = [strict.line_text(r).rstrip() for r in range(24)]
     diff = [r for r in range(24) if a[r] != b[r]]
     assert not diff, f"cc-zig 输出在 strict autowrap 下不应错位(差异行 {diff});若此断言失败说明发现了 autowrap 真因"
-    # cc-zig 当前无同步输出 → strict 终端不应记到 2026 配对。
-    assert strict.max_sync_depth == 0, "阶段1 前 cc-zig 不应发同步输出序列"
+    # 输入框的清除/重绘也用 DEC 2026 包裹，确保 ConPTY 不会呈现半帧；
+    # 每个同步帧都必须闭合。
+    assert strict.max_sync_depth >= 1, "输入框重绘应产生至少一个同步帧"
+    assert strict.sync_depth == 0, "同步输出序列必须成对闭合"

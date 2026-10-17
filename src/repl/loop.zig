@@ -109,6 +109,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     const stdin_fd: c_int = 0;
     const tty = platform_term.isatty(stdin_fd);
 
+    // TTY 会话只拥有一个 Renderer。输入期、生成期和队列续发共享同一份终端锚点。
+    var tui_region: ?render_region_mod.RenderRegion = if (tty)
+        render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1))
+    else
+        null;
+    defer if (tui_region) |*r| r.deinit();
+
     // 终端 tab 标题反映 session 状态(idle/working/需要输入)。仅 tty;退出时清空。
     if (tty) terminal_title.setFromApp(app, .idle);
     defer if (tty) terminal_title.clear();
@@ -122,7 +129,18 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     var msg_queue = msg_queue_mod.MsgQueue.init(allocator);
     defer msg_queue.deinit();
 
+    // MCP discovery is deliberately detached from App.init. The prompt is
+    // usable immediately; we only join before the first command can execute
+    // against the dynamic tool registry.
+    app.startMcpStartup() catch |err| {
+        @import("../util/log.zig").debug("mcp", "startup worker unavailable: {s}", .{@errorName(err)});
+    };
+
     while (true) {
+        // Publish completed MCP discovery only at a turn boundary. A pending
+        // network worker must not delay the prompt or make Esc/Ctrl+C inert.
+        if (app.mcpStartupReady()) app.waitForMcpStartup();
+
         // 检查到期的 cron 任务 —— 把它们的 prompt 作为 user message 注入并跑一轮
         try fireDueCrons(app, allocator, &aux_be);
 
@@ -149,10 +167,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         const line = if (msg_queue.popAllJoined("\n\n")) |q| blk: {
             // 待发送队列消费:上一轮生成期入队的(可能多条)消息一次性合并 → 本轮 input,
             // 回显 ❯ <内容> 到 scrollback。多条用空行分隔合成一次提交(对齐 cc 同模式批量)。
-            echoUserSubmission(app, q);
+            echoUserSubmission(app, q, if (tui_region) |*r| r else null);
             break :blk q; // q owned,与 readLine 返回所有权一致
         } else if (tty)
-            readLineRaw(stdin_fd, allocator, &history, app) catch |err| switch (err) {
+            readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?) catch |err| switch (err) {
                 error.Eof => {
                     std.debug.print("Goodbye!\n", .{});
                     break;
@@ -194,7 +212,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /help            Show this help
                 \\  /clear           Clear screen
                 \\  /tools           List available tools
-                \\  /skills          List installed skills
+                \\  /skills          List available skills
                 \\  /history         Show recent commands
                 \\  /model [name]    Show or switch the active model
                 \\  /login <id>      Sign in to a provider with OAuth (flags: /login)
@@ -268,6 +286,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/tools")) {
+            app.waitForMcpStartup();
             for (tools.registry) |*t| std.debug.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
             // 动态工具（Skill / MCP）
             for (app.dyn_registry.entries.items) |e| {
@@ -516,6 +535,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/mcp")) {
+            app.waitForMcpStartup();
             try handleMcp(app);
             continue;
         }
@@ -642,17 +662,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 生成期间底部状态栏(spinner + 实时 token/cost)。仅 tty。
         // RenderRegion 在生成期维护一个底部 spinner 行;agent_loop 的文本输出经
         // RegionWriter 与 spinner 协调(文本来时擦 spinner,tick 在文本下方重画)。
-        var gen_region: ?render_region_mod.RenderRegion = if (tty)
-            render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1))
-        else
-            null;
-        defer if (gen_region) |*r| {
-            // #220: a picker opened during the reply stays open after it.
-            // Every exit path passes here after the watcher has stopped.
-            if (r.ui.picker_open) app.pending_overlay = .model_picker_kept;
-            r.deinit();
-        };
-        if (gen_region) |*r| {
+        const gen_region: ?*render_region_mod.RenderRegion = if (tui_region) |*r| r else null;
+        if (gen_region) |r| {
             r.enterGenerating(app, &msg_queue);
             // A queued message starts this reply without an input phase in
             // between, so the picker the last reply left open comes here.
@@ -664,7 +675,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (tty) terminal_title.setFromApp(app, .working); // tab:生成中
 
         var region_writer: ?render_region_mod.RegionWriter =
-            if (gen_region) |*r| .{ .region = r } else null;
+            if (gen_region) |r| .{ .region = r } else null;
 
         // 生成期间也要 raw mode:readLineRaw 返回时已 restoreMode(回 cooked),
         // cooked 下内核按行缓冲,未按 Enter 的键不会被 watcher 的 read 读到 → 边等边打字被吞。
@@ -790,7 +801,17 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         // U11:App 可导出字段统一走 canonical buildRunOptions(五处前端装配漂移的收敛点);
         // 宿主专属字段(eval gate/policy、run_control 三件套、预算、UI requester、心跳)在此补。
+        const mcp_startup_pending = !app.mcpStartupReady();
+        if (!mcp_startup_pending) app.waitForMcpStartup();
         var run_opts = session_service.buildRunOptions(app, scoped_recall);
+        // connectMcpServers publishes dyn_registry/mcp_sessions when its
+        // worker finishes. Keep those pointers out of an in-flight run while
+        // startup is pending; the next turn boundary joins and refreshes the
+        // immutable tool snapshot before exposing them.
+        if (mcp_startup_pending) {
+            run_opts.dyn_registry = null;
+            run_opts.mcp_sessions = null;
+        }
         run_opts.pending_input = .{ .ctx = @ptrCast(&msg_queue), .hasPendingFn = &hasPendingRunInput };
         // 宿主契约:主 REPL 是唯一消化 .backgrounded(下方尾声)并复位 flag 的宿主,
         // 故 background_request 在此接——canonical 不带(见 buildRunOptions 注)。
@@ -877,7 +898,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             if (run_control) |control| try control.finishRun(@errorName(err));
             // 停 watcher + 清 stdin 缓冲
             if (tui_be) |*tb| tb.stopInput();
-            if (gen_region) |*r| r.leaveGenerating(app);
+            if (gen_region) |r| {
+                if (r.ui.picker_open) app.pending_overlay = .model_picker_kept;
+                r.leaveGenerating(app);
+            }
             if (tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
             if (tty) drainStdin(stdin_fd);
             app.clearPendingModelSwitchCompact();
@@ -889,7 +913,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         stopLoopIfGoalLimited(app);
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
         if (tui_be) |*tb| tb.stopInput();
-        if (gen_region) |*r| r.leaveGenerating(app);
+        if (gen_region) |r| {
+            if (r.ui.picker_open) app.pending_overlay = .model_picker_kept;
+            r.leaveGenerating(app);
+        }
         if (tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
         if (tty) drainStdin(stdin_fd);
 
@@ -1207,20 +1234,28 @@ fn installSigwinch() void {
 
 /// 把提交的输入回显到 scrollback(复刻 Claude Code:提交后历史里留 "❯ <内容>")。
 /// 多行内容续行对齐 2 空格;空输入只打一个换行。commit 路径 + carryover 自动提交共用。
-fn echoUserSubmission(app: *app_mod.App, submitted: []const u8) void {
+fn echoUserSubmission(app: *app_mod.App, submitted: []const u8, region: ?*render_region_mod.RenderRegion) void {
     // 排版(软折 + 2 列悬挂缩进)在 user_echo.zig,与 TuiBackend 在 turn 边界消费队列时的回显同源。
     const th = app.theme;
     const cols: usize = if (tui_term_root.getSize(1)) |s| s.cols else 80;
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.heap.c_allocator);
     user_echo.render(&out, std.heap.c_allocator, th.accent, th.reset, cols, submitted) catch {
-        std.debug.print("{s}❯{s} {s}\n", .{ th.accent, th.reset, submitted });
+        const fallback = std.fmt.allocPrint(std.heap.c_allocator, "{s}❯{s} {s}\n", .{ th.accent, th.reset, submitted }) catch return;
+        defer std.heap.c_allocator.free(fallback);
+        if (region) |r| r.emitScrollback(fallback) else std.debug.print("{s}", .{fallback});
         return;
     };
-    std.debug.print("{s}", .{out.items});
+    if (region) |r| r.emitScrollback(out.items) else std.debug.print("{s}", .{out.items});
 }
 
-fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.History, app: *app_mod.App) ![]u8 {
+fn readLineRaw(
+    fd: c_int,
+    allocator: std.mem.Allocator,
+    history: *history_mod.History,
+    app: *app_mod.App,
+    region: *render_region_mod.RenderRegion,
+) ![]u8 {
     const orig = input.enterRawMode(fd) orelse {
         // 无法进 raw mode：退化
         return readLineBuffered(allocator);
@@ -1237,9 +1272,6 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
     var vim_state = vim.VimState.init(allocator);
     defer vim_state.deinit();
 
-    // 输入期固定底部区(复刻 Claude Code:圆角输入框 + ❯ + footer + 钉底)。
-    var region = render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1));
-    defer region.deinit();
     // `/` 菜单命令源:内建命令 + 本 session 可由用户调用的 skill(对齐 cc:输入 `/` 即联想
     // 出命令与 skill)。每次读取重建:skill catalog 可能已重载,构建成本只是几十个借用切片。
     var slash_arena = std.heap.ArenaAllocator.init(allocator);
@@ -1248,11 +1280,13 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
     // 终端 resize 监听:SIGWINCH → 下次 poll 超时时重画自适应。
     g_winch.store(false, .release);
     installSigwinch();
-    // 退出 readLineRaw 前擦掉输入框,光标回干净行(覆盖所有 return 路径)。
+    // slash_catalog 借用本次读取的 arena；共享 Renderer 会跨越 input/generation
+    // 生命周期，不能把已经释放的 skill 切片留在 UiState 里。
     defer {
+        region.ui.slash_catalog = .builtin;
         region.setInput("", 0);
         region.clear();
-        std.debug.print("\x1b[?25h", .{}); // 确保光标可见
+        region.emitTerminal("\x1b[?25h"); // 确保光标可见
     }
     // issue #16:`/model`、`/models`、`/transcript` 在命令层被处理,那时输入读取
     // 已经返回、固定区不存在。请求停在 app.pending_overlay,由下一次读取兑现。
@@ -1302,7 +1336,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
         // 输入框自适应新宽度(否则要等下次按键才更新,真机 resize 卡旧宽)。
         if (synthetic_key == null) while (true) {
             if (g_winch.swap(false, .acquire)) {
-                redraw(&region, &editor, app); // resize → 重测宽度重画
+                redraw(region, &editor, app); // resize → 重测宽度重画
             }
             const rc = platform_term.waitReadable(fd, 200); // 可移植:200ms 超时等可读
             // 一个周期没有输入 = 输入静默过:此后的 Ctrl+O 不再算上一串的连发(Ctrl+O 去抖)。
@@ -1331,10 +1365,10 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                 if (region.ui.picker_open) switch (picker_host.poll(app, &region.ui)) {
                     .committed => {
                         region.clear();
-                        std.debug.print("{s}\n", .{picker_host.lastNotice(app)});
-                        redraw(&region, &editor, app);
+                        region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
+                        redraw(region, &editor, app);
                     },
-                    .redraw => redraw(&region, &editor, app),
+                    .redraw => redraw(region, &editor, app),
                     .ignored => {},
                 };
                 continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
@@ -1354,11 +1388,11 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                 if (b[0] == '\r' or b[0] == '\n') {
                     region.setInput("", 0);
                     region.clear();
-                    std.debug.print("\n", .{});
+                    region.emitTerminal("\n");
                     return try allocator.dupe(u8, editor.view());
                 }
                 const changed = vim.handleNormal(&vim_state, &editor.buf, &editor.cursor, allocator, b[0]) catch false;
-                if (changed) redraw(&region, &editor, app);
+                if (changed) redraw(region, &editor, app);
                 continue;
             }
 
@@ -1369,14 +1403,14 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
         if (app.config.vim_mode and key == .esc) {
             vim_state.mode = .normal;
             if (editor.cursor > 0) editor.cursor -= 1; // vim 习惯:Esc 后光标左移一格
-            redraw(&region, &editor, app);
+            redraw(region, &editor, app);
             continue;
         }
 
         // 括号粘贴：收集到 paste_end，决定内联还是外部存储 + 占位符
         if (key == .paste_begin) {
             try handlePaste(fd, &editor, &parser, allocator, app.stateRoot());
-            redraw(&region, &editor, app);
+            redraw(region, &editor, app);
             continue;
         }
 
@@ -1397,18 +1431,18 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     if (r.moved) {
                         editor.cursor = r.cursor;
                         editor.goal_vcol = r.goal_vcol;
-                        redraw(&region, &editor, app);
+                        redraw(region, &editor, app);
                     } else {
                         editor.goal_vcol = null;
                         if (down) {
                             if (history.next()) |nxt| {
                                 try editor.setLine(nxt);
-                                redraw(&region, &editor, app);
+                                redraw(region, &editor, app);
                             }
                         } else {
                             if (try history.prev(editor.view())) |prev| {
                                 try editor.setLine(prev);
-                                redraw(&region, &editor, app);
+                                redraw(region, &editor, app);
                             }
                         }
                     }
@@ -1419,21 +1453,21 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                 .history_prev => {
                     if (try history.prev(editor.view())) |prev| {
                         try editor.setLine(prev);
-                        redraw(&region, &editor, app);
+                        redraw(region, &editor, app);
                     }
                     continue;
                 },
                 .history_next => {
                     if (history.next()) |nxt| {
                         try editor.setLine(nxt);
-                        redraw(&region, &editor, app);
+                        redraw(region, &editor, app);
                     }
                     continue;
                 },
                 .complete => {
                     region.clear();
-                    try handleCompletion(&editor, allocator, region.ui.slash_catalog);
-                    redraw(&region, &editor, app);
+                    try handleCompletion(&editor, allocator, region.ui.slash_catalog, region);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .slash_complete => {
@@ -1441,7 +1475,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     if (complete.slashNthMatch(region.ui.slash_catalog, editor.view(), region.ui.slash_sel)) |cmd| {
                         try setSlashLine(&editor, cmd);
                     }
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .slash_select => {
@@ -1452,7 +1486,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                             // 带参数的 skill:Enter 只填 `/name ` 留给用户输入参数(对齐 cc),不提交。
                             try setSlashLine(&editor, cmd);
                             region.ui.slash_sel = 0;
-                            redraw(&region, &editor, app);
+                            redraw(region, &editor, app);
                             continue;
                         }
                         try editor.setLine(cmd.name);
@@ -1460,7 +1494,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     region.ui.slash_sel = 0;
                     region.setInput("", 0);
                     region.clear();
-                    echoUserSubmission(app, editor.view());
+                    echoUserSubmission(app, editor.view(), region);
                     return try allocator.dupe(u8, editor.view());
                 },
                 .model_nav => {
@@ -1474,14 +1508,14 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                             region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
                         }
                     }
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .model_complete, .model_select => {
                     // Tab 填入 `/model use <id>` 继续编辑;Enter 直接提交同一条命令。
                     const entries = app.api_client.catalog.entries.items;
                     if (entries.len == 0) {
-                        redraw(&region, &editor, app);
+                        redraw(region, &editor, app);
                         continue;
                     }
                     const visible_n = @min(entries.len, complete.MODEL_MENU_MAX_ROWS);
@@ -1491,12 +1525,12 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     try editor.setLine(line);
                     region.ui.slash_sel = 0;
                     if (eff.action == .model_complete) {
-                        redraw(&region, &editor, app);
+                        redraw(region, &editor, app);
                         continue;
                     }
                     region.setInput("", 0);
                     region.clear();
-                    echoUserSubmission(app, editor.view());
+                    echoUserSubmission(app, editor.view(), region);
                     return try allocator.dupe(u8, editor.view());
                 },
                 .models_nav => {
@@ -1514,46 +1548,46 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                             region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
                         }
                     }
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .models_select => {
                     if (app.models_picker_key_index == null) {
                         const keys = app.api_key_catalog.entries.items;
                         if (keys.len == 0) {
-                            redraw(&region, &editor, app);
+                            redraw(region, &editor, app);
                             continue;
                         }
                         const visible_n = @min(keys.len, complete.MODEL_MENU_MAX_ROWS);
                         const idx = @min(region.ui.slash_sel, visible_n - 1);
                         app.selectApiKeyForModels(idx) catch |err| {
                             region.clear();
-                            std.debug.print("\x1b[31m/model key selection failed: {s}\x1b[0m\n", .{@errorName(err)});
+                            region.emitTerminalFmt("\x1b[31m/model key selection failed: {s}\x1b[0m\n", .{@errorName(err)});
                         };
                         app.models_picker_model_index = null;
                         region.ui.slash_sel = 0;
-                        redraw(&region, &editor, app);
+                        redraw(region, &editor, app);
                         continue;
                     }
 
                     if (app.models_picker_model_index == null) {
                         const entries = app.api_client.catalog.entries.items;
                         if (entries.len == 0) {
-                            redraw(&region, &editor, app);
+                            redraw(region, &editor, app);
                             continue;
                         }
                         const visible_n = @min(entries.len, complete.MODEL_MENU_MAX_ROWS);
                         const idx = @min(region.ui.slash_sel, visible_n - 1);
                         app.models_picker_model_index = idx;
                         region.ui.slash_sel = 0;
-                        redraw(&region, &editor, app);
+                        redraw(region, &editor, app);
                         continue;
                     }
 
                     const entries = app.api_client.catalog.entries.items;
                     const model_idx = app.models_picker_model_index.?;
                     if (entries.len == 0 or model_idx >= entries.len) {
-                        redraw(&region, &editor, app);
+                        redraw(region, &editor, app);
                         continue;
                     }
                     var efforts_buf: [5]types_mod.ReasoningEffort = undefined;
@@ -1568,7 +1602,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     app.models_picker_model_index = null;
                     region.setInput("", 0);
                     region.clear();
-                    echoUserSubmission(app, editor.view());
+                    echoUserSubmission(app, editor.view(), region);
                     return try allocator.dupe(u8, editor.view());
                 },
                 .at_nav => {
@@ -1586,7 +1620,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                             region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
                         }
                     }
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .at_select => {
@@ -1603,13 +1637,13 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                         try applyCompletion(&editor, allocator, r.replace_start, old_len, cand);
                     }
                     region.ui.slash_sel = 0;
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .reverse_search => {
                     region.clear();
-                    try handleReverseSearch(fd, &editor, &parser, history, allocator);
-                    redraw(&region, &editor, app);
+                    try handleReverseSearch(fd, &editor, &parser, history, allocator, region);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .open_transcript => {
@@ -1626,12 +1660,12 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     region.clear();
                     transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows, region.theme) catch {};
                     region.noteOverlayClosed();
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .open_model_picker => {
                     picker_host.open(app, &region.ui);
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .picker_key => {
@@ -1639,20 +1673,20 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                         // The overlay is gone; the confirmation has to survive
                         // it or the user cannot tell which route was chosen.
                         region.clear();
-                        std.debug.print("{s}\n", .{picker_host.lastNotice(app)});
+                        region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
                     }
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .cycle_perm_mode => {
                     app.cyclePermMode();
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .redraw_screen => {
                     region.clear();
-                    std.debug.print("\x1b[2J\x1b[H", .{});
-                    redraw(&region, &editor, app);
+                    region.emitTerminal("\x1b[2J\x1b[H");
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .external_edit => {
@@ -1663,28 +1697,28 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                         editor.setLine(edited) catch {};
                     } else |_| {}
                     _ = input.enterRawMode(fd);
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .kill_background => {
                     region.clear();
                     const killed = app.killAllBackground();
-                    std.debug.print("\x1b[33m[killed {d} background task(s)]\x1b[0m\n", .{killed});
-                    redraw(&region, &editor, app);
+                    region.emitTerminalFmt("\x1b[33m[killed {d} background task(s)]\x1b[0m\n", .{killed});
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .background_main => {}, // 输入期 Ctrl+B 无意义(无正在跑的 run);dispatch 已 gate,这里兜底
                 .agents_view => {
                     // 持久 viewing 现在纯靠 dispatch 设 view=.viewing + render_region.drawAgentViewing
                     // 帧渲染(非 print)。dispatch 不再上抛此 action;保留防御性 redraw。
-                    redraw(&region, &editor, app);
+                    redraw(region, &editor, app);
                     continue;
                 },
                 .agents_stop => {
                     // 停止选中 agent(registry.kill)。
                     region.clear();
-                    stopSelectedAgent(app, &region) catch {};
-                    redraw(&region, &editor, app);
+                    stopSelectedAgent(app, region) catch {};
+                    redraw(region, &editor, app);
                     continue;
                 },
             }
@@ -1705,20 +1739,20 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
             else => {},
         }
         switch (action) {
-            .redraw => redraw(&region, &editor, app),
+            .redraw => redraw(region, &editor, app),
             .commit => {
                 region.setInput("", 0);
                 region.clear();
                 // 提交回显 ❯ <内容> 到 scrollback(否则提交后输入凭空消失)。
-                echoUserSubmission(app, editor.view());
+                echoUserSubmission(app, editor.view(), region);
                 return try allocator.dupe(u8, editor.view());
             },
             .cancel => return error.Cancelled,
             .cancel_hint => {
                 // 第一次 Ctrl+C 且 buffer 空 — 提示再按一次退出(打到 scrollback,夹在 clear/render 间)
                 region.clear();
-                std.debug.print("\x1b[2m(再次按 Ctrl+C 退出 REPL)\x1b[0m\n", .{});
-                redraw(&region, &editor, app);
+                region.emitTerminal("\x1b[2m(再次按 Ctrl+C 退出 REPL)\x1b[0m\n");
+                redraw(region, &editor, app);
             },
             .exit_repl => return error.ExitRequested,
             .eof => return error.Eof,
@@ -1728,7 +1762,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     history.append(editor.view()) catch {};
                 }
                 editor.reset();
-                redraw(&region, &editor, app);
+                redraw(region, &editor, app);
             },
             .none => {},
         }
@@ -1746,7 +1780,12 @@ fn setSlashLine(editor: *input.LineEditor, cmd: complete.SlashCmd) !void {
     try editor.setLine(buffer[0 .. cmd.name.len + 1]);
 }
 
-fn handleCompletion(editor: *input.LineEditor, allocator: std.mem.Allocator, slash_catalog: complete.SlashCatalog) !void {
+fn handleCompletion(
+    editor: *input.LineEditor,
+    allocator: std.mem.Allocator,
+    slash_catalog: complete.SlashCatalog,
+    region: *render_region_mod.RenderRegion,
+) !void {
     var r = complete.compute(allocator, slash_catalog, editor.view(), editor.cursor) catch return;
     defer r.deinit(allocator);
     if (r.candidates.len == 0) return;
@@ -1766,9 +1805,9 @@ fn handleCompletion(editor: *input.LineEditor, allocator: std.mem.Allocator, sla
         try applyCompletion(editor, allocator, r.replace_start, replaced_len, pfx);
     }
     // 列出候选
-    std.debug.print("\n", .{});
-    for (r.candidates) |c| std.debug.print("  {s}", .{c});
-    std.debug.print("\n", .{});
+    region.emitTerminal("\n");
+    for (r.candidates) |c| region.emitTerminalFmt("  {s}", .{c});
+    region.emitTerminal("\n");
     _ = line;
 }
 
@@ -1792,6 +1831,7 @@ fn handleReverseSearch(
     parser: *input.KeyParser,
     history: *history_mod.History,
     allocator: std.mem.Allocator,
+    region: *render_region_mod.RenderRegion,
 ) !void {
     _ = parser;
     var query = std.ArrayList(u8).empty;
@@ -1800,7 +1840,7 @@ fn handleReverseSearch(
 
     while (true) {
         // 渲染搜索提示
-        std.debug.print("\r\x1b[2K(reverse-search)`{s}': {s}", .{ query.items, match orelse "" });
+        region.emitTerminalFmt("\r\x1b[2K(reverse-search)`{s}': {s}", .{ query.items, match orelse "" });
 
         var b: [1]u8 = undefined;
         const n = platform_term.readInput(fd, &b);
@@ -1816,7 +1856,7 @@ fn handleReverseSearch(
             if (nn_i <= 0) return;
             const nn: usize = @intCast(nn_i);
             if (nn == 0 or nb[0] != '[') {
-                std.debug.print("\r\x1b[2K", .{}); // 裸 Esc → 取消
+                region.emitTerminal("\r\x1b[2K"); // 裸 Esc → 取消
                 return;
             }
             // 读 CSI 序列到终止字母,解析首段 codepoint。
@@ -1837,18 +1877,18 @@ fn handleReverseSearch(
             }
             if (cp == 13) {
                 if (match) |m| try editor.setLine(m); // Kitty Enter → 接受
-                std.debug.print("\r\x1b[2K", .{});
+                region.emitTerminal("\r\x1b[2K");
                 return;
             }
             if (cp == 27 or cp == 0) { // CSI-u Esc(27)或裸 ESC[(无 codepoint)→ 取消
-                std.debug.print("\r\x1b[2K", .{});
+                region.emitTerminal("\r\x1b[2K");
                 return;
             }
             continue; // 其余 CSI(方向键等)忽略,继续搜索
         }
         if (c == 0x03) {
             // Ctrl+C:取消,保留原 buffer
-            std.debug.print("\r\x1b[2K", .{});
+            region.emitTerminal("\r\x1b[2K");
             return;
         }
         if (c == '\r' or c == '\n') {
@@ -1856,7 +1896,7 @@ fn handleReverseSearch(
             if (match) |m| {
                 try editor.setLine(m);
             }
-            std.debug.print("\r\x1b[2K", .{});
+            region.emitTerminal("\r\x1b[2K");
             return;
         }
         if (c == 0x7f or c == 0x08) {
@@ -3527,6 +3567,7 @@ fn shouldRunLoopContinuation(app: *const app_mod.App, queued_count: usize) bool 
 }
 
 fn runLoopContinuation(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
+    app.waitForMcpStartup();
     const g = if (app.goal_state.current) |*g| g else return;
     if (app.loop_remaining > 0) app.loop_remaining -= 1;
     const prompt = try goal_mod.continuationPrompt(allocator, g);
@@ -4286,6 +4327,7 @@ fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const
 
 /// 把预置 prompt 注入为 user message 后触发一次 agent_loop 执行。
 fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
+    app.waitForMcpStartup();
     return runInjectedAgentWithSynthetic(app, allocator, backend, null);
 }
 
