@@ -17,6 +17,8 @@
     X")必须用它——settle 提前退出会把这类窗口静默削短。
   - `wait:PATTERN:N` = 等渲染后的屏幕任一行含 PATTERN(至多 N 秒),命中后短 settle
     防抓半帧。超时不抛错(交给用例自身断言给出屏幕 diff)。
+  - `waitbytes:ESCAPED:N` = 等原始字节流出现某序列(\\xNN 转义,至多 N 秒),命中即返回、
+    不 settle;等不到抛 AssertionError。给"动画进行中"这类没有稳定屏幕文本可等的时刻用。
   两后端共享同一份实现(_Capture),只有"读一片字节"原语按平台实现——语义永不分叉。
 
 空闲期(不在生成)按 Enter 提交命令之后,**不要用 sleep: 等结果**,用 wait_for()/submit():
@@ -239,6 +241,16 @@ class _Capture:
                 return False
             self._pump(0.1)
 
+    def wait_bytes(self, needle, timeout):
+        """等原始输出流出现 needle(字节子串),至多 timeout 秒;命中即返回,不 settle。"""
+        end = time.time() + timeout
+        while True:
+            if needle in self.out:
+                return True
+            if time.time() >= end or self.eof:
+                return False
+            self._pump(0.02)
+
     def wait_pattern(self, pattern, timeout):
         """等屏幕出现 pattern,至多 timeout 秒;命中后短 settle。超时静默返回 False。"""
         end = time.time() + timeout
@@ -283,6 +295,9 @@ def _build_env(base_url, env):
     # 离线:跳过启动期 probeModels 网络调用——它在无网/沙箱里会 hang,导致 REPL 永不渲染
     # (实测根因:pty 下 0 字节 = 卡在 probeModels,非 drain 时序)。
     full_env["METACODES_NO_PROBE"] = "1"
+    # 启动动画(tui/splash.zig)会在 banner 前占 ~1.5s 并原地重绘数十帧;布局类用例断言的是
+    # 它之后的画面。默认关,test_startup_splash 经 env 参数传 None 打开。
+    full_env["METACODES_NO_STARTUP_ANIMATION"] = "1"
     # Offline UI tests use a dead base_url and never send a real model request.
     # OAuth removed the old built-in token fallback, so provide a dummy bearer
     # only for that offline path. Live model tests pass base_url=None and must
@@ -338,6 +353,11 @@ def _drive(key_events, write, cap, set_size, per_key_drain):
             cap.drain(float(ev[12:]))
         elif ev.startswith("sleep:"):
             cap.drain_settle(float(ev[6:]), QUIET_SLEEP)
+        elif ev.startswith("waitbytes:"):
+            spec, _, t = ev[10:].rpartition(":")
+            needle = spec.encode("latin-1", "ignore").decode("unicode_escape").encode("latin-1")
+            if not cap.wait_bytes(needle, float(t)):
+                raise AssertionError(f"waitbytes: {spec!r} not in the output within {t}s")
         elif ev.startswith("wait:"):
             pattern, _, t = ev[5:].rpartition(":")
             cap.wait_pattern(pattern, float(t))
@@ -374,6 +394,8 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
       "sleep:N"          settle 睡眠:至多 N 秒,输出静默 QUIET_SLEEP 秒即提前返回
       "strictsleep:N"    睡满 N 秒(时序断言/否定断言窗口专用)
       "wait:PATTERN:N"   等屏幕出现 PATTERN,至多 N 秒(命中后短 settle;超时静默继续)
+      "waitbytes:ESC:N"  等原始输出出现 ESC(\\xNN 转义)这段字节,至多 N 秒;命中即返回,超时抛
+                         AssertionError(动画进行中按键等没有稳定屏幕文本的时刻)
       "waitline:TEXT:N"  等屏幕某一整行(去首尾空白)等于 TEXT,至多 N 秒;超时抛 AssertionError
                          (等命令输出用:回显行 `❯ !echo X` 含 X 但整行不等于 X)
       "resize:RxC"       运行中改窗口(触 SIGWINCH / ConPTY resize)

@@ -1,9 +1,10 @@
 //! <state_root>/config.json 的 TUI 相关读写。
 //!
-//! 现在管 1 个字段:`theme`("auto"/"dark"/"light"/"mono")。
-//!
-//! 读:启动时 App 调 loadTheme(state_root),返回 ?Variant。null = 文件不存在/无 theme 字段。
-//! 写:/theme 命令调 saveTheme(state_root, variant),原子读改写(保留其他字段)。
+//! 现在管 2 个字段:
+//! - `theme`("auto"/"dark"/"light"/"mono"):启动时 App 调 loadTheme(state_root),返回 ?Variant,
+//!   null = 文件不存在/无 theme 字段;/theme 命令调 saveTheme(state_root, variant),原子读改写
+//!   (保留其他字段)。
+//! - `startupAnimation`(bool,缺省开):REPL 启动 banner 前读 loadStartupAnimation,只读不写。
 //!
 //! 容错:文件不存在 → 写时自建;JSON 解析失败 → 读返 null / 写直接覆盖为 {"theme":"X"}。
 
@@ -14,6 +15,23 @@ const theme_mod = @import("theme.zig");
 /// 读取 state_root 目录下 <state_root>/config.json 的 theme 字段。
 /// 返回:成功且字段存在合法 → Variant;否则 null。
 pub fn loadTheme(alloc: std.mem.Allocator, state_root: []const u8) ?theme_mod.Variant {
+    var parsed = loadObject(alloc, state_root) orelse return null;
+    defer parsed.deinit();
+    const t = parsed.value.object.get("theme") orelse return null;
+    if (t != .string) return null;
+    return theme_mod.parseVariant(t.string);
+}
+
+/// 读 `startupAnimation`。null = 文件/字段不存在或不是 bool(调用方按默认开处理)。
+pub fn loadStartupAnimation(alloc: std.mem.Allocator, state_root: []const u8) ?bool {
+    var parsed = loadObject(alloc, state_root) orelse return null;
+    defer parsed.deinit();
+    const v = parsed.value.object.get("startupAnimation") orelse return null;
+    return if (v == .bool) v.bool else null;
+}
+
+/// 读并解析 <state_root>/config.json;顶层不是 object → null。调用方 deinit。
+fn loadObject(alloc: std.mem.Allocator, state_root: []const u8) ?std.json.Parsed(std.json.Value) {
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path_z = std.fmt.bufPrint(&path_buf, "{s}/config.json\x00", .{state_root}) catch return null;
     const path = path_z[0 .. path_z.len - 1];
@@ -22,12 +40,11 @@ pub fn loadTheme(alloc: std.mem.Allocator, state_root: []const u8) ?theme_mod.Va
     defer alloc.free(content);
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch return null;
-    defer parsed.deinit();
-
-    if (parsed.value != .object) return null;
-    const t = parsed.value.object.get("theme") orelse return null;
-    if (t != .string) return null;
-    return theme_mod.parseVariant(t.string);
+    if (parsed.value != .object) {
+        parsed.deinit();
+        return null;
+    }
+    return parsed;
 }
 
 /// 写入 theme 字段。原子读改写:读 → 改/插 → 写回。
@@ -254,4 +271,34 @@ test "loadTheme + saveTheme 往返(临时 state_root)" {
     try saveTheme(testing.allocator, dir, .dark);
     const got2 = loadTheme(testing.allocator, dir).?;
     try testing.expectEqual(theme_mod.Variant.dark, got2);
+}
+
+test "loadStartupAnimation: 缺省 null、读 bool、非 bool 视为未设、/theme 写回不丢字段" {
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("../../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-anim");
+    _ = pfs.mkdir(dir.ptr, 0o755);
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/config.json", .{dir}) catch unreachable;
+    defer {
+        var p1_buf: [256]u8 = undefined;
+        const p1 = std.fmt.bufPrint(&p1_buf, "{s}\x00", .{path}) catch unreachable;
+        pfs.unlinkPath(@ptrCast(p1.ptr)) catch {};
+        _ = pfs.rmdir(dir.ptr);
+    }
+
+    try testing.expect(loadStartupAnimation(testing.allocator, dir) == null);
+
+    try writeFile(path, "{\"startupAnimation\":false}");
+    try testing.expectEqual(@as(?bool, false), loadStartupAnimation(testing.allocator, dir));
+
+    // /theme rewrites the file; the animation choice must survive it.
+    try saveTheme(testing.allocator, dir, .light);
+    try testing.expectEqual(@as(?bool, false), loadStartupAnimation(testing.allocator, dir));
+    try testing.expectEqual(theme_mod.Variant.light, loadTheme(testing.allocator, dir).?);
+
+    try writeFile(path, "{\"startupAnimation\":\"no\"}");
+    try testing.expect(loadStartupAnimation(testing.allocator, dir) == null);
+
+    try writeFile(path, "[true]");
+    try testing.expect(loadStartupAnimation(testing.allocator, dir) == null);
 }

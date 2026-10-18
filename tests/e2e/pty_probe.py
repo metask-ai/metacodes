@@ -12,6 +12,7 @@ def main():
     if pid == 0:
         # 子进程:exec 二进制(继承 pty 作为 stdin/stdout/stderr → isatty 真)
         os.environ["METACODES_LOG"] = "*:warn"
+        os.environ["METACODES_NO_STARTUP_ANIMATION"] = "1"  # 只测输入框,跳过启动动画
         os.execv(BIN, [BIN, "--permission", "bypassPermissions"])
         os._exit(127)
 

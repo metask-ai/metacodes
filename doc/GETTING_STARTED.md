@@ -117,6 +117,11 @@ metacodes serve --sessions 4                # HTTP daemon with create/destroy se
 metacodes doctor                            # where every runtime asset resolves from
 ```
 
+The interactive TUI opens with a short animation of the "Metask Lab" wordmark;
+any key skips it. Set `METACODES_NO_STARTUP_ANIMATION=1`, or put
+`"startupAnimation": false` in `<state root>/config.json` (`metacodes doctor`
+shows where the state root is), to start straight at the prompt.
+
 `metacodes --help` lists every flag. Embedding the runtime in your own process
 (Zig module or the AgentCore C ABI) starts at [API.md](API.md).
 

@@ -85,7 +85,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     else
         null;
 
-    printStartupBanner(app);
+    printStartupBanner(app, allocator);
 
     // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)
     printStartupSuggestion(allocator);
@@ -4109,12 +4109,14 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// 启动 banner:圆角 box(对齐 cc 2.1.x)。版本 + 模型 + cwd 三行。
 /// 非 TTY 退化为纯文本两行(pipe 友好)。box 内宽固定取 min(cols-2, 64)。
-fn printStartupBanner(app: *const app_mod.App) void {
+/// TTY 下先播启动动画(tui/splash.zig),定格的 "Metask Lab" 字标留在 box 上方。
+fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) void {
     const th = app.theme;
     if (!platform_term.isatty(1)) {
         std.debug.print("metacodes\nType your message or /help for commands\n\n", .{});
         return;
     }
+    playStartupSplash(app, allocator);
     const cols: usize = blk: {
         if (platform_term.windowSize(1)) |sz| {
             if (sz.cols > 0) break :blk sz.cols;
@@ -4148,6 +4150,26 @@ fn printStartupBanner(app: *const app_mod.App) void {
     var k: usize = 0;
     while (k < inner) : (k += 1) std.debug.print("{s}", .{th.box_h});
     std.debug.print("{s}{s}\n\n", .{ th.box_br, th.reset });
+}
+
+/// 启动动画:门控(TTY 两端/METACODES_NO_STARTUP_ANIMATION/config.json startupAnimation/
+/// TERM=dumb/终端太小)由 splash_player.decide 判定;任意键跳到定格帧。结果只进 debug 日志。
+fn playStartupSplash(app: *const app_mod.App, allocator: std.mem.Allocator) void {
+    const splash_player = @import("tui/splash_player.zig");
+    const log = @import("../util/log.zig");
+    const config = if (app.stateRoot().len > 0)
+        @import("tui/config.zig").loadStartupAnimation(allocator, app.stateRoot())
+    else
+        null;
+    switch (splash_player.decide(splash_player.gateFromEnv(config))) {
+        .skip => |why| log.debug("splash", "skipped: {s}", .{@tagName(why)}),
+        .play => |plan| {
+            const style = splash_player.styleFor(app.theme_variant, tui_term_root.detectFromEnv(1));
+            const seed: u64 = @truncate(@as(u128, @bitCast(util_time.nowNs())));
+            const outcome = splash_player.play(allocator, plan, style, seed);
+            log.debug("splash", "{s} ({d}x{d}, {s})", .{ @tagName(outcome), plan.layout.cols, plan.layout.rows, @tagName(style.mode) });
+        },
+    }
 }
 
 /// banner 一行内容:│ + inner 列(2 空格缩进 + text + 右补空格)+ │。

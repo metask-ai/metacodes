@@ -3334,6 +3334,8 @@ test {
     _ = &@import("repl/tui/overlay.zig");
     _ = &@import("repl/tui/theme.zig");
     _ = &@import("repl/tui/bg_probe.zig");
+    _ = &@import("repl/tui/splash.zig");
+    _ = &@import("repl/tui/splash_player.zig");
     _ = &@import("repl/tui/layout.zig");
     _ = &@import("repl/tui/test_capture.zig");
     _ = &@import("repl/tui/render_region.zig");
