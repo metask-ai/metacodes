@@ -624,15 +624,15 @@ def _check_wheel(path: Path, entry: contract.Release, libraries: Dict[str, str])
     tag = path.name[len(prefix) : -len(".whl")]
     members = read_archive(path)
     findings = []
-    metadata = members.get(f"metacodes-{expected}.dist-info/METADATA", b"").decode("utf-8")
+    metadata = contract.text_of(members.get(f"metacodes-{expected}.dist-info/METADATA", b""))
     if f"\nVersion: {expected}\n" not in metadata:
         findings.append(f"{path.name}: METADATA does not say Version: {expected}")
-    if f"\nTag: py3-none-{tag}\n" not in members.get(f"metacodes-{expected}.dist-info/WHEEL", b"").decode("utf-8"):
+    if f"\nTag: py3-none-{tag}\n" not in contract.text_of(members.get(f"metacodes-{expected}.dist-info/WHEEL", b"")):
         findings.append(f"{path.name}: WHEEL does not carry its tag {tag}")
-    init = contract.PY_INIT_VERSION_RE.findall(members.get("metacodes/__init__.py", b"").decode("utf-8"))
+    init = contract.PY_INIT_VERSION_RE.findall(contract.text_of(members.get("metacodes/__init__.py", b"")))
     if [item[1] for item in init] != [expected]:
         findings.append(f"{path.name}: metacodes.__version__ is not {expected}")
-    native = contract.ABI_MIRRORS["sdk/python/src/metacodes/_native.py"].findall(members.get("metacodes/_native.py", b"").decode("utf-8"))
+    native = contract.ABI_MIRRORS["sdk/python/src/metacodes/_native.py"].findall(contract.text_of(members.get("metacodes/_native.py", b"")))
     if native != [str(entry.abi_revision)]:
         findings.append(f"{path.name}: the binding speaks ABI revision {native}, but AgentCore {entry.version} is {entry.abi_revision}")
     findings.extend(_check_packaged_library(path.name, members, "metacodes/_lib/", libraries.get(tag), f"platform tag {tag}"))
@@ -652,7 +652,7 @@ def _check_node(path: Path, entry: contract.Release, libraries: Dict[str, str]) 
         return [f"{path.name}: no package version ({exc})"]
     if declared != contract.node_version(entry.version):
         findings.append(f"{path.name}: package.json says {declared}, but AgentCore is {entry.version}")
-    binding = contract.ABI_MIRRORS["sdk/node/index.js"].findall(members.get("package/index.js", b"").decode("utf-8"))
+    binding = contract.ABI_MIRRORS["sdk/node/index.js"].findall(contract.text_of(members.get("package/index.js", b"")))
     if binding != [str(entry.abi_revision)]:
         findings.append(f"{path.name}: the binding speaks ABI revision {binding}, but AgentCore {entry.version} is {entry.abi_revision}")
     findings.extend(_check_packaged_library(path.name, members, "package/prebuilds/", libraries.get(target_id), f"target {target_id}"))

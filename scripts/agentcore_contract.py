@@ -316,6 +316,12 @@ def is_prefix_of(older: Ledger, newer: Ledger) -> Optional[str]:
 Reader = Callable[[str], bytes]
 
 
+def text_of(data: bytes) -> str:
+    """A packaged text file. A Windows checkout installs the SDK files with CRLF,
+    and the declarations are matched line by line."""
+    return data.decode("utf-8").replace("\r\n", "\n")
+
+
 def _single(pattern: "re.Pattern[str]", text: str, label: str) -> str:
     found = pattern.findall(text)
     if len(found) != 1:
@@ -353,7 +359,7 @@ def check_bundle_contents(manifest: dict, reader: Reader) -> None:
     def text(rel: str) -> str:
         if rel not in listed:
             raise CutError(f"bundle manifest does not list {rel}")
-        return reader(rel).decode("utf-8")
+        return text_of(reader(rel))
 
     for rel, pattern in (
         ("include/metask/agentcore.h", ABI_MIRRORS["sdk/metask/agentcore.h"]),

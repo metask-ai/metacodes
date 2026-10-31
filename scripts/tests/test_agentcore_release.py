@@ -481,6 +481,9 @@ class BundleContentsTest(unittest.TestCase):
             with self.subTest(rel=rel, message=message), self.assertRaisesRegex(common.CutError, message):
                 self.check(overrides={rel: text})
 
+    def test_crlf_members_from_a_windows_checkout_pass(self) -> None:
+        self.check(overrides={"include/metask/agentcore.h": "// header\r\n#define METASK_AGENTCORE_ABI_REVISION 26u\r\n"})
+
     def test_a_bad_version_shape_is_refused(self) -> None:
         with self.assertRaisesRegex(common.CutError, "neither a final"):
             self.check(version="0.13.0-rc.1")

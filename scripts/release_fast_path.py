@@ -84,8 +84,8 @@ def changelog_date(text: str, version: str) -> str:
 
 
 def sdk_changelog_date(root: Path, candidate: str, version: str) -> str:
-    """The date of AgentCore's section when the candidate releases it; a reuse
-    has none and does not ask for one, so an empty date cannot enter a heading."""
+    """The date of AgentCore's section in the candidate. A reuse does not use it,
+    and a built release without the section regenerates to different bytes."""
     text = show(root, candidate, agentcore_contract.SDK_CHANGELOG).decode("utf-8")
     for line in text.splitlines():
         match = release_cut.RELEASE_HEADING_RE.match(line)
