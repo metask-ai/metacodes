@@ -12,6 +12,9 @@ Paths select the server:
   /keepalive  a Classic server that answers initialize and tools/list over
             chunked SSE on a kept-alive connection and, like a Vercel edge,
             drops a request that asks for `Connection: close` unanswered.
+  /noisy      /keepalive whose tools/call "noise" sends a tools/list_changed
+              notification and a late answer to another request before its
+              own, and whose "toolerror" answers with isError.
   /dropcall   /keepalive that reads a tools/call and closes the connection
               without answering: the call executed, and nothing says so.
   /idleclose  /keepalive whose connections close 50 ms after each response,
@@ -82,7 +85,9 @@ class Handler(BaseHTTPRequestHandler):
         if mode == "dropcall" and method == "tools/call":
             self.close_connection = True
             return
-        if mode in ("keepalive", "idleclose", "dropcall"):
+        if mode == "noisy" and method == "tools/call":
+            return self.noisy(rid, params)
+        if mode in ("keepalive", "idleclose", "dropcall", "noisy"):
             return self.keepalive(mode, method, rid)
         if mode == "auth":
             return self.reply(401, {"error": "unauthorized"})
@@ -128,6 +133,23 @@ class Handler(BaseHTTPRequestHandler):
             text = "classic:" + params.get("name", "")
             return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
         return self.reply(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
+
+    def noisy(self, rid, params):
+        if params.get("name") == "toolerror":
+            return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "tool said no"}], "isError": True}})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        messages = [
+            {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"},
+            {"jsonrpc": "2.0", "id": 999999, "result": {"content": [{"type": "text", "text": "stale"}]}},
+            {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "noise-done"}]}},
+        ]
+        data = b"".join(b"event: message\ndata: " + json.dumps(message).encode() + b"\n\n" for message in messages)
+        self.wfile.write(b"%x\r\n%s\r\n0\r\n\r\n" % (len(data), data))
+        self.wfile.flush()
 
     def sse_chunked(self, message):
         """One `message` event as a chunked SSE body that ends at once, so

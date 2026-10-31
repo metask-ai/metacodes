@@ -40,7 +40,7 @@ machine. Each row is pinned by the named test.
 | Catalog bound | 2048 tools, 100 pages, truncates | `max_tools`, fails the server | Admission is all-or-nothing under the ABI | conformance: "profiles differ: the catalog bound…" |
 | Catalog admission | Lenient: a malformed tool is skipped with a warning | Canonical: projected, fingerprinted, issue reported | The CLI registers what a server lists; AgentCore binds permission to a schema fingerprint | registry_bridge tests; catalog: "Catalog excludes broken Provider projections…" |
 | Model-facing name | Readable `mcp__<server>__<tool>` | Opaque hashed alias | Provider-visible bytes are a cache contract, on both sides | mcp_session: "the same server through the product registry and the AgentCore overlay…" |
-| Catalog lifetime | Published once at startup; `tools_changed` recorded for `/mcp` | Refresh, expiry, immutable generations, apply | CLI startup policy is the App's. The manager is shared and available to it | catalog tests; mcp_protocol_test: "a stale answer is skipped…" |
+| Catalog lifetime | Published once at startup; `tools_changed` recorded for `/mcp` | Refresh, expiry, immutable generations, apply | CLI startup policy is the App's. The manager is shared and available to it | catalog tests; mcp_http_test: "a stale answer is skipped…" |
 | Failure presentation | Remote error is a tool error carrying its frame; a failure of the request is the transport's error plus "may have executed" | `host_failed` JSON (`code`, `phase`, `rpc_code`) | The diagnostics are documented public output | tool_invocation test; agentcore_abi_test: "L2 public MCP wire failures…" |
 | Failed-publication ceiling | Up to 1 MiB for a frame already in memory | `PER_RESULT_MAX_BYTES` | Existing commitment on each side | conformance: "profiles differ: the failed-publication ceiling…" |
 | Cancellation | stdio, HTTP+SSE: `notifications/cancelled`. Streamable HTTP closes the stream | The connector polls the cancellation it holds | A property of the transport (`Transport.cancelsItself`) | mcp_protocol_test: "a timed-out call is cancelled…"; conformance: "cancellation before the send…" |
@@ -79,7 +79,7 @@ above), **corrected** (see "Behaviour changes"), **evolve** (out of scope, separ
 | Response parsing | Hand-written field scanners (`protocol.parseResponse`) | `wire.parseEnvelope` | | wire tests | One `wire.parseResponseEnvelopeWith`. Scanners deleted. **corrected** |
 | Correlation, stale answers | Skip by id | One exchange per request | | mcp_protocol_test | `exchangeEncoded`, `Transport.singleResponse`. **kept** |
 | Server requests: ping, elicitation | `handleServerRequest` | None (no such frames) | Stream transports | mcp_e2e_test, mcp_http_test | **kept** |
-| `tools/list_changed` | Recorded | None | `/mcp` | New: mcp_protocol_test | **kept**, now tested |
+| `tools/list_changed` | Recorded | None | `/mcp` | New: mcp_http_test | **kept**, now tested |
 | Pagination | Bounded, truncates | Bounded, fails | | mcp_http_test; runtime tests | One `paginateTools` with a page consumer. **policy** |
 | Tool call (materialized) | `callToolAbortable` | `Client.callTool` | Source-level | mcp_e2e_test; runtime tests | One `exchange`. **kept** |
 | Tool call (byte zero) | `requestBody` | `Client.callToolBody` | Registry; `Environment.dispatch` | mcp_e2e_test, ABI 17 MiB L2 | One `invokeTool`. **corrected** |
