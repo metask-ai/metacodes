@@ -236,6 +236,16 @@ project layer is read only when `$CODEX_HOME/config.toml` marks the project
       "url": "https://example.com/mcp",
       "headers": {"X-Team": "core"},
       "bearerTokenEnvVar": "DOCS_TOKEN"
+    },
+    "linear": {
+      "type": "sse",
+      "url": "https://mcp.linear.app/sse"
+    },
+    "tracker": {
+      "type": "http",
+      "url": "https://tracker.example.com/mcp",
+      "oauth": {"clientId": "metacodes-cli", "callbackPort": 8765},
+      "scopes": ["issues:read"]
     }
   }
 }
@@ -245,7 +255,13 @@ Codex's snake_case spellings (`env_vars`, `startup_timeout_sec`,
 `tool_timeout_sec`, `enabled_tools`, `disabled_tools`, `bearer_token_env_var`,
 `http_headers`, `env_http_headers`) are accepted in JSON as well, and Claude
 Code's per-call `timeout` (milliseconds). `type` may be `stdio` (or absent with
-`command`), `http` / `streamable-http`, or `sse`.
+`command`), `http` / `streamable-http`, or `sse` (the 2024-11-05 HTTP+SSE
+transport, below). `oauth` is Claude Code's object — `clientId`,
+`callbackPort`, `authServerMetadataUrl` — and `scopes` (an array, Codex's key,
+also accepted inside `oauth`) names the scopes to request; all of them are
+optional (see [Authorization](#authorization-oauth)). `oauth.clientSecret` is
+refused with a configuration problem: a secret does not belong in a file a
+repository may carry, and the flow is PKCE for a public client.
 
 - **Environment.** The allowlist is Codex's `DEFAULT_ENV_VARS` (`HOME`,
   `LOGNAME`, `PATH`, `SHELL`, `USER`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ`,
@@ -307,8 +323,28 @@ revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
   is answered on its own POST), keeps the handshake's `MCP-Session-Id` and
   `MCP-Protocol-Version` (DELETE on close), and sends `Mcp-Method`, `Mcp-Name`
   and `Mcp-Param-*` (from `x-mcp-header`; a tool with an invalid annotation is
-  dropped) on 2026-07-28. OAuth login is not implemented: authenticate with
-  `bearerTokenEnvVar` or headers.
+  dropped) on 2026-07-28. An SSE response that ends before its answer is
+  resumed when the server numbered its events: after the stream's `retry`
+  delay (1 s by default, 10 s at most), a GET with `Last-Event-ID` (the id of
+  the last event received whole) and the session headers reopens it and the server replays the rest (2025-03-26
+  through 2025-11-25; at most 3 attempts that bring nothing new). On
+  2026-07-28 the request is lost instead and the caller re-issues it.
+- **HTTP+SSE** (`type: "sse"`, revision 2024-11-05, which many hosted
+  servers still offer at an `/sse` URL): a long-lived `GET <url>`
+  (`Accept: text/event-stream`, the configured headers) whose first event,
+  `endpoint`, names the URI each message is POSTed to (202 Accepted); every
+  answer, server request and notification arrives as a `message` event on
+  the stream. A relative endpoint resolves against the stream URL; one on
+  another origin is refused, because every POST carries the configured
+  headers, and a later `endpoint` event is ignored. When the server ends the
+  stream, the session's calls fail with "closed its SSE event stream"; a new
+  session reconnects. A reader thread owns the stream, so a call that is interrupted or
+  times out leaves the session intact: the client sends
+  `notifications/cancelled`, as over stdio, and the late answer is discarded
+  by id. The handshake is `initialize` (the transport predates
+  `server/discover`); the stream must open and name its endpoint within the
+  startup timeout. A URL that answers with anything but an event stream is
+  reported as such (`type: "http"` is probably meant).
 - A server's requests share one kept-alive connection while they come in quick
   succession (the handshake, a burst of tool calls), so startup costs one TLS
   handshake rather than one per message, and `Connection: close` is never
@@ -319,11 +355,68 @@ revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
   that finds a reused connection already closed by the server, before any
   response byte, is sent again on a new connection.
 
+### Authorization (OAuth)
+
+An HTTP or SSE server that answers 401 is `needs authentication` in `/mcp`
+and the footer. `metacodes mcp login <server>` logs in once; every session
+after that sends the token and keeps it fresh. The flow is the MCP
+authorization specification's (2025-06-18 / 2025-11-25, with the 2025-03-26
+fallback), in `src/mcp/oauth.zig`:
+
+1. **Discovery.** An unauthenticated request in the server's own transport
+   (a POST of `initialize`, or the SSE stream's GET) earns a 401 whose
+   `WWW-Authenticate: Bearer resource_metadata="…", scope="…"` names the
+   protected resource metadata (RFC 9728); without one, the well-known
+   locations are tried (`/.well-known/oauth-protected-resource<path>`, then
+   the root). Its `resource` must cover the server URL, and its first
+   `authorization_servers` entry is the issuer whose RFC 8414 / OpenID
+   Connect metadata gives the endpoints (path-inserted locations first).
+   `oauth.authServerMetadataUrl` overrides that lookup. A server that
+   publishes no resource metadata is a 2025-03-26 server: its origin is the
+   authorization server, with `/authorize`, `/token` and `/register` as
+   defaults when it has no metadata either. Metadata that does not list
+   `S256` in `code_challenge_methods_supported` is refused, and every
+   endpoint must be HTTPS (plain HTTP on loopback only).
+2. **Client.** `oauth.clientId` when configured; otherwise RFC 7591 dynamic
+   registration of a public client (`token_endpoint_auth_method: none`) for
+   this login's redirect. A server with neither fails with a message naming
+   `oauth.clientId`.
+3. **Authorization.** The browser opens the authorization endpoint
+   (`--no-browser` only prints the URL) with PKCE S256, a random `state`,
+   the scopes — `scopes` from the configuration, else the challenge's
+   `scope`, else every `scopes_supported` of the resource — and the RFC 8707
+   `resource` (the canonical server URL). The redirect is
+   `http://localhost:<port>/callback`, Claude Code's path, on a
+   kernel-chosen port, or `oauth.callbackPort` for a client whose redirect is
+   registered in advance.
+4. **Token.** The code is exchanged with its verifier and the same
+   `resource`; the answer is stored in
+   `<state root>/mcp-oauth/<server>-<hash>.json` (mode 0600, written
+   atomically), keyed to the server name and URL so a token never reaches
+   another URL.
+
+A session's HTTP and SSE transports attach `Authorization: Bearer` from the
+stored login, refresh it (`refresh_token` grant, with `resource`) a minute
+before it expires, and after a 401 refresh once and retry the request; a
+rotated refresh token is saved before it is used. Concurrent requests that
+see one 401 perform one refresh, and the store is re-read first: a session
+whose token another session already refreshed adopts the stored one instead
+of spending a refresh token that rotation has revoked. A refresh that fails
+for want of a network is not retried for 30 s; it runs within the request's
+own interrupt and deadline. A refused refresh token, or a 401 that survives
+the retry, is `needs authentication` again. Configuration wins: a
+server whose `headers` or `bearerTokenEnvVar` set `Authorization` never uses
+a stored login (`mcp login` refuses it). `metacodes mcp logout <server>`
+forgets the login; `metacodes mcp list` shows each server's transport and how
+it authenticates. Not implemented yet: client ID metadata documents
+(2025-11-25), step-up authorization on `403 insufficient_scope` (reported as
+needing authentication), and logging in from inside the TUI.
+
 ### `/mcp`
 
 `/mcp` lists every configured server with its source, state (connected and
-the negotiated revision, needs authentication, or why it failed), tool count
-and log, followed by project servers awaiting approval, disabled names and
+the negotiated revision, needs authentication — with the `metacodes mcp login`
+command that fixes it — or why it failed), tool count and log, followed by project servers awaiting approval, disabled names and
 configuration problems. While servers are still connecting it shows each one's
 state so far (`connecting… 3s`), without waiting for them.
 The tool list is fixed for a session (it is part of the cached prompt); when a

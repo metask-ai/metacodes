@@ -3982,7 +3982,10 @@ pub const App = struct {
                 .pending => unreachable, // joined: every job has settled
                 .failed => |err| {
                     status.detail = mcp_startup.failureDetail(err, job);
-                    if (err == error.McpAuthRequired) status.state = .needs_auth;
+                    if (err == error.McpAuthRequired) {
+                        status.state = .needs_auth;
+                        status.detail = std.fmt.allocPrint(a, "the server requires authorization (401/403); run `metacodes mcp login {s}`, or configure a bearer token or headers", .{job.server.name}) catch status.detail;
+                    }
                     log.warn("mcp", "server '{s}' ({s}) failed: {s}", .{ job.server.name, job.server.origin.label(), status.detail });
                 },
                 .connected => |connected| {

@@ -16,10 +16,18 @@
 //! - Classic: `MCP-Protocol-Version` after the handshake and the
 //!   `MCP-Session-Id` the `initialize` response assigned; DELETE on close.
 //!
-//! 401/403 are `error.McpAuthRequired` (OAuth login is not implemented; a
-//! static bearer token or headers authenticate). Cancellation and deadlines
-//! shut the connection down through the provider client's request registry,
-//! which also wakes a read blocked in the kernel.
+//! Authentication: configured headers, or a stored OAuth login
+//! (`metacodes mcp login`, mcp/oauth.zig) whose bearer is refreshed before
+//! it expires and once after a 401 before the request is retried. A 401
+//! that survives that, and any 403, is `error.McpAuthRequired`.
+//! Cancellation and deadlines shut the connection down through the provider
+//! client's request registry, which also wakes a read blocked in the kernel.
+//!
+//! An SSE response that ends before the awaited answer is resumed (2025-03-26
+//! through 2025-11-25 "Resumability and Redelivery"): when the stream carried
+//! event ids, a GET with `Last-Event-ID` reopens it after the server's
+//! `retry` delay, and the server replays what followed. 2026-07-28 drops
+//! resumption: there the request is lost and the caller re-issues it.
 //!
 //! Connections are kept alive and reused while requests come in quick
 //! succession (the handshake, a burst of tool calls): one TLS handshake
@@ -38,6 +46,7 @@ const http_status = @import("../api/http_status.zig");
 const http_connection = @import("../api/http_connection.zig");
 const util_time = @import("../util/time.zig");
 const Capture = @import("../core/tool_result_artifact.zig").Capture;
+const oauth = @import("oauth.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -63,6 +72,12 @@ pub const REUSE_IDLE_MS: i64 = 4_000;
 const SETTLE_IDLE_MS: u64 = 250;
 /// Fresh attempts after a reused connection turned out closed.
 const MAX_STALE_RETRIES: usize = 3;
+/// Consecutive resumptions of one response that bring no new event.
+const MAX_RESUME_ATTEMPTS: usize = 3;
+/// The reconnection delay when the server sets none, and the longest one
+/// honored (a `retry:` field is the server's request, not a contract).
+const DEFAULT_RETRY_MS: u64 = 1_000;
+const MAX_RETRY_MS: u64 = 10_000;
 
 pub const HttpTransport = struct {
     allocator: std.mem.Allocator,
@@ -71,6 +86,8 @@ pub const HttpTransport = struct {
     uri: std.Uri,
     /// Configured headers plus Authorization, owned.
     headers: []Header,
+    /// A stored OAuth login's bearer (none when headers authenticate).
+    bearer: oauth.Bearer = .{},
     /// Negotiated revision for `MCP-Protocol-Version` (null before a Classic
     /// handshake completes). Static string.
     protocol_version: ?[]const u8 = null,
@@ -90,6 +107,10 @@ pub const HttpTransport = struct {
     /// been idle since.
     last_used_ms: i64 = 0,
     reuse_idle_ms: i64 = REUSE_IDLE_MS,
+    /// The last SSE event id seen on the open response, for `Last-Event-ID`.
+    last_event_id: ?[]u8 = null,
+    /// The server's `retry:` delay for that stream (ms).
+    retry_ms: ?u64 = null,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -97,6 +118,20 @@ pub const HttpTransport = struct {
         url: []const u8,
         headers: []const Header,
     ) !*HttpTransport {
+        return createWithAuth(allocator, io, url, headers, null);
+    }
+
+    /// `create` with a stored OAuth login, consumed (destroyed with the
+    /// transport, or here on failure).
+    pub fn createWithAuth(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        url: []const u8,
+        headers: []const Header,
+        auth: ?*oauth.TokenSource,
+    ) !*HttpTransport {
+        var bearer: oauth.Bearer = .{ .source = auth };
+        errdefer bearer.deinit(allocator);
         const self = try allocator.create(HttpTransport);
         errdefer allocator.destroy(self);
         const owned_url = try allocator.dupe(u8, url);
@@ -125,7 +160,9 @@ pub const HttpTransport = struct {
             .url = owned_url,
             .uri = uri,
             .headers = owned_headers,
+            .bearer = bearer,
         };
+        bearer = .{};
         return self;
     }
 
@@ -138,6 +175,8 @@ pub const HttpTransport = struct {
         for (self.queue.items) |message| self.allocator.free(message);
         self.queue.deinit(self.allocator);
         if (self.session_id) |id| self.allocator.free(id);
+        self.forgetEventId();
+        self.bearer.deinit(self.allocator);
         for (self.headers) |header| {
             self.allocator.free(header.name);
             self.allocator.free(header.value);
@@ -178,6 +217,8 @@ pub const HttpTransport = struct {
                 try self.queue.append(self.allocator, body);
             },
             .sse => {
+                self.forgetEventId();
+                self.retry_ms = null;
                 if (self.stream) |previous| {
                     // Only one request is in flight per client (request
                     // mutex), so an older stream has nothing left we need.
@@ -218,17 +259,96 @@ pub const HttpTransport = struct {
 
     pub fn recvLine(self: *HttpTransport) ![]u8 {
         if (self.queue.items.len != 0) return self.queue.orderedRemove(0);
-        const exchange = self.stream orelse return error.Eof;
-        const message = exchange.nextEvent(self, MAX_MESSAGE_BYTES) catch |err| {
+        var resumes: usize = 0;
+        while (true) {
+            const exchange = self.stream orelse return error.Eof;
+            const failure: anyerror = blk: {
+                const maybe = exchange.nextEvent(self, MAX_MESSAGE_BYTES) catch |err| break :blk err;
+                if (maybe) |message| return message;
+                break :blk error.Eof;
+            };
             self.closeStream();
-            return err;
-        } orelse {
-            self.closeStream();
-            // The stream ended without the awaited response: in 2026-07-28 the
-            // request is lost and must be re-issued by the caller.
-            return error.Eof;
-        };
-        return message;
+            // Interrupted, or not a dropped connection: nothing to resume.
+            if (failure != error.Eof and failure != error.McpConnectFailed) return failure;
+            // The stream ended without the awaited response. Classic servers
+            // that numbered their events replay the rest on a GET with
+            // `Last-Event-ID`; in 2026-07-28 the request is lost and must be
+            // re-issued by the caller.
+            if (self.modern or self.last_event_id == null or resumes >= MAX_RESUME_ATTEMPTS) return failure;
+            resumes += 1;
+            const delay = @min(self.retry_ms orelse DEFAULT_RETRY_MS, MAX_RETRY_MS);
+            try self.sleepInterruptible(delay);
+            const resumed = self.resume_() catch |err| retry: switch (err) {
+                error.McpUnauthorized => {
+                    if (!self.bearer.recover(self.allocator, self.interruptOf())) return error.McpAuthRequired;
+                    break :retry self.resume_() catch |again| switch (again) {
+                        error.McpUnauthorized => return error.McpAuthRequired,
+                        error.Aborted, error.Timeout, error.McpAuthRequired => return again,
+                        else => return failure,
+                    };
+                },
+                error.Aborted, error.Timeout, error.McpAuthRequired => return err,
+                else => return failure,
+            };
+            self.stream = resumed;
+            self.stream_answered = false;
+        }
+    }
+
+    /// GET the stream again from the last event id (the server replays
+    /// what followed it on this stream only).
+    fn resume_(self: *HttpTransport) !*Exchange {
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        var extra: std.ArrayList(std.http.Header) = .empty;
+        try extra.append(scratch.allocator(), .{ .name = "Accept", .value = "text/event-stream" });
+        try extra.append(scratch.allocator(), .{ .name = "Last-Event-ID", .value = self.last_event_id.? });
+        {
+            var common: std.ArrayList(std.http.Header) = .empty;
+            defer common.deinit(self.allocator);
+            try self.appendCommonHeaders(&common, .{});
+            try extra.appendSlice(scratch.allocator(), common.items);
+        }
+        const exchange = try self.openMethod(.GET, extra.items);
+        errdefer exchange.destroy(self);
+        http_connection.sendBodiless(&exchange.request) catch return self.transportError();
+        var redirect: [1024]u8 = undefined;
+        exchange.response = exchange.request.receiveHead(&redirect) catch return self.transportError();
+        exchange.has_response = true;
+        const status = http_status.ResponseStatus.capture(&exchange.response).code;
+        exchange.status = status;
+        const content_type = exchange.response.head.content_type orelse "";
+        switch (status) {
+            200 => if (!std.mem.startsWith(u8, content_type, "text/event-stream")) return error.McpConnectFailed,
+            401 => return error.McpUnauthorized,
+            403 => return error.McpAuthRequired,
+            else => return error.McpConnectFailed,
+        }
+        exchange.kind = .sse;
+        return exchange;
+    }
+
+    fn sleepInterruptible(self: *HttpTransport, delay_ms: u64) !void {
+        const until = util_time.nowMs() + @as(i64, @intCast(delay_ms));
+        while (util_time.nowMs() < until) {
+            if (self.abort) |abort| if (abort.isAborted()) return error.Aborted;
+            if (self.deadline_ms) |deadline| if (util_time.nowMs() >= deadline) return error.Timeout;
+            util_time.sleepMs(@min(50, delay_ms));
+        }
+    }
+
+    fn noteEventId(self: *HttpTransport, id: []const u8) void {
+        if (self.last_event_id) |old| {
+            if (std.mem.eql(u8, old, id)) return;
+        }
+        const owned = self.allocator.dupe(u8, id) catch return;
+        self.forgetEventId();
+        self.last_event_id = owned;
+    }
+
+    fn forgetEventId(self: *HttpTransport) void {
+        if (self.last_event_id) |old| self.allocator.free(old);
+        self.last_event_id = null;
     }
 
     pub fn recvLineCapture(self: *HttpTransport, capture: *Capture) !void {
@@ -281,6 +401,7 @@ pub const HttpTransport = struct {
 
     fn appendCommonHeaders(self: *HttpTransport, list: *std.ArrayList(std.http.Header), meta: SendMeta) !void {
         for (self.headers) |header| try list.append(self.allocator, .{ .name = header.name, .value = header.value });
+        if (self.bearer.header()) |header| try list.append(self.allocator, header);
         if (self.protocol_version) |version| try list.append(self.allocator, .{ .name = "MCP-Protocol-Version", .value = version });
         if (self.session_id) |id| try list.append(self.allocator, .{ .name = "MCP-Session-Id", .value = id });
         if (self.modern and meta.method.len != 0) {
@@ -290,7 +411,19 @@ pub const HttpTransport = struct {
         }
     }
 
+    /// POST, retried once with a refreshed token when a stored OAuth login's
+    /// bearer is refused with 401.
     fn post(self: *HttpTransport, json: []const u8, meta: SendMeta) !*Exchange {
+        self.bearer.sync(self.allocator, self.interruptOf());
+        return self.postOnce(json, meta) catch |err| {
+            if (err != error.McpUnauthorized) return err;
+            if (!self.bearer.recover(self.allocator, self.interruptOf())) return error.McpAuthRequired;
+            return self.postOnce(json, meta) catch |retry_err|
+                if (retry_err == error.McpUnauthorized) error.McpAuthRequired else retry_err;
+        };
+    }
+
+    fn postOnce(self: *HttpTransport, json: []const u8, meta: SendMeta) !*Exchange {
         if (self.abort) |abort| if (abort.isAborted()) return error.Aborted;
         if (self.deadline_ms) |deadline| if (util_time.nowMs() >= deadline) return error.Timeout;
 
@@ -354,7 +487,8 @@ pub const HttpTransport = struct {
         switch (status) {
             200...201 => exchange.kind = if (is_sse) .sse else .json,
             202, 204 => exchange.kind = .empty,
-            401, 403 => return error.McpAuthRequired,
+            401 => return error.McpUnauthorized,
+            403 => return error.McpAuthRequired,
             404 => {
                 // A Classic session the server no longer knows (404 with a
                 // session id) must be re-initialized. A JSON-RPC body (e.g.
@@ -375,13 +509,17 @@ pub const HttpTransport = struct {
     /// A POST exchange on a pooled or new connection, registered for abort
     /// and deadline.
     fn open(self: *HttpTransport, extra_headers: []const std.http.Header) !*Exchange {
+        return self.openMethod(.POST, extra_headers);
+    }
+
+    fn openMethod(self: *HttpTransport, method: std.http.Method, extra_headers: []const std.http.Header) !*Exchange {
         const exchange = try self.allocator.create(Exchange);
         errdefer self.allocator.destroy(exchange);
         exchange.* = .{ .request = undefined };
-        exchange.request = self.client.request(.POST, self.uri, .{
+        exchange.request = self.client.request(method, self.uri, .{
             .headers = .{
                 .accept_encoding = .omit,
-                .content_type = .{ .override = "application/json" },
+                .content_type = if (method == .POST) .{ .override = "application/json" } else .default,
             },
             // The configured headers (often an Authorization) go wherever a
             // redirect points; a 3xx is the server's answer.
@@ -393,6 +531,10 @@ pub const HttpTransport = struct {
         try self.registry.registerMonitored(self.allocator, self.abort, @ptrCast(&exchange.request), shutdownRequest, remaining);
         exchange.registered = true;
         return exchange;
+    }
+
+    fn interruptOf(self: *const HttpTransport) oauth.Interrupt {
+        return .{ .abort = self.abort, .deadline_ms = self.deadline_ms };
     }
 
     fn interrupted(self: *const HttpTransport) bool {
@@ -479,6 +621,12 @@ const Exchange = struct {
         var data: std.ArrayList(u8) = .empty;
         errdefer data.deinit(allocator);
         var has_data = false;
+        // WHATWG: an event's `id` becomes the last event id only when the
+        // event is dispatched (its blank line), so a stream cut inside an
+        // event resumes from the event before it.
+        var event_id: std.ArrayList(u8) = .empty;
+        defer event_id.deinit(allocator);
+        var has_id = false;
         const input = self.reader();
         while (true) {
             const line = readLine(input, allocator, &self.pending, limit) catch |err| switch (err) {
@@ -494,6 +642,10 @@ const Exchange = struct {
             };
             defer allocator.free(line);
             if (line.len == 0) {
+                if (has_id) {
+                    if (event_id.items.len == 0) transport.forgetEventId() else transport.noteEventId(event_id.items);
+                    has_id = false;
+                }
                 if (has_data and data.items.len != 0) return try data.toOwnedSlice(allocator);
                 data.clearRetainingCapacity();
                 has_data = false;
@@ -504,6 +656,19 @@ const Exchange = struct {
             const field = line[0..colon];
             var value = if (colon < line.len) line[colon + 1 ..] else "";
             if (value.len != 0 and value[0] == ' ') value = value[1..];
+            if (std.mem.eql(u8, field, "id")) {
+                // WHATWG: an id containing NUL is ignored.
+                if (std.mem.indexOfScalar(u8, value, 0) == null) {
+                    event_id.clearRetainingCapacity();
+                    try event_id.appendSlice(allocator, value);
+                    has_id = true;
+                }
+                continue;
+            }
+            if (std.mem.eql(u8, field, "retry")) {
+                if (std.fmt.parseInt(u64, value, 10)) |ms| transport.retry_ms = ms else |_| {}
+                continue;
+            }
             if (!std.mem.eql(u8, field, "data")) continue;
             if (has_data) try data.append(allocator, '\n');
             try data.appendSlice(allocator, value);
@@ -515,7 +680,7 @@ const Exchange = struct {
 
 /// One line (without its CR/LF) from `input`, accumulating partial bytes in
 /// `pending` across calls.
-fn readLine(input: *std.Io.Reader, allocator: std.mem.Allocator, pending: *std.ArrayList(u8), limit: usize) ![]u8 {
+pub fn readLine(input: *std.Io.Reader, allocator: std.mem.Allocator, pending: *std.ArrayList(u8), limit: usize) ![]u8 {
     while (true) {
         if (std.mem.indexOfScalar(u8, pending.items, '\n')) |newline| {
             const line = try allocator.dupe(u8, std.mem.trimEnd(u8, pending.items[0..newline], "\r"));

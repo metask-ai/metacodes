@@ -120,8 +120,38 @@ pub const Http = struct {
     bearer_token_env_var: ?[]const u8,
     /// Codex `env_http_headers`: header name → environment variable.
     env_headers: []const KeyValue,
-    /// Claude Code `type: "sse"`: the deprecated HTTP+SSE transport.
-    legacy_sse: bool,
+    wire: HttpWire,
+    /// OAuth client settings (Claude Code `oauth`, Codex `scopes`). Used
+    /// by `metacodes mcp login` and the token refresh; an entry without
+    /// them still logs in through dynamic client registration.
+    oauth: OAuthSettings = .{},
+};
+
+/// Which HTTP transport a URL server speaks.
+pub const HttpWire = enum {
+    /// Streamable HTTP (2025-03-26 and later): one endpoint, a POST per
+    /// message, JSON or SSE answers.
+    streamable,
+    /// Claude Code `type: "sse"`: the 2024-11-05 HTTP+SSE transport — a
+    /// long-lived GET event stream that names a POST endpoint and carries
+    /// every server message.
+    legacy_sse,
+};
+
+/// Claude Code's `oauth` object (`clientId`, `callbackPort`,
+/// `authServerMetadataUrl`) plus Codex's `scopes`. Every field is optional:
+/// the default is discovery (RFC 9728 / RFC 8414) and dynamic client
+/// registration (RFC 7591) on a kernel-chosen loopback port.
+pub const OAuthSettings = struct {
+    /// A pre-registered public client; skips dynamic registration.
+    client_id: ?[]const u8 = null,
+    /// Fixed loopback port for the redirect (`http://localhost:<port>/callback`),
+    /// for a client whose redirect URI is registered in advance.
+    callback_port: ?u16 = null,
+    /// Space-separated scopes requested when the server's challenge names none.
+    scopes: ?[]const u8 = null,
+    /// Authorization server metadata URL, overriding discovery.
+    auth_server_metadata_url: ?[]const u8 = null,
 };
 
 pub const Transport = union(enum) {
@@ -471,14 +501,13 @@ fn parseJsonServer(
             };
             if (jsonString(object, &.{ "headersHelper", "http_headers_helper" }) != null)
                 try builder.problem(origin, path, name, "headersHelper is not supported; static headers are sent", .{});
-            if (object.get("oauth") != null)
-                try builder.problem(origin, path, name, "OAuth login is not supported; provide a bearer token through headers", .{});
             break :blk .{ .http = .{
                 .url = try expandValue(builder, origin, path, name, raw_url, expand),
                 .headers = try jsonPairs(builder, origin, path, name, object, &.{ "headers", "http_headers" }, expand),
                 .bearer_token_env_var = jsonString(object, &.{ "bearerTokenEnvVar", "bearer_token_env_var" }),
                 .env_headers = try jsonPairs(builder, origin, path, name, object, &.{ "envHttpHeaders", "env_http_headers" }, false),
-                .legacy_sse = is_sse,
+                .wire = if (is_sse) .legacy_sse else .streamable,
+                .oauth = try jsonOAuth(builder, origin, path, name, object, expand),
             } };
         }
         if (type_name.len != 0 and !std.mem.eql(u8, type_name, "stdio")) {
@@ -619,6 +648,53 @@ fn jsonMillis(object: std.json.ObjectMap, ms_keys: []const []const u8, sec_keys:
 fn clampMillis(millis: f64) ?u32 {
     if (!std.math.isFinite(millis) or millis < 1000) return null;
     return @intFromFloat(@min(millis, @as(f64, @floatFromInt(std.math.maxInt(u32)))));
+}
+
+/// Claude Code's `oauth` object plus a top-level `scopes` (Codex's key, in
+/// JSON too). A malformed field is a problem and is left unset, never
+/// guessed.
+fn jsonOAuth(
+    builder: *Builder,
+    origin: Origin,
+    path: []const u8,
+    name: []const u8,
+    object: std.json.ObjectMap,
+    expand: bool,
+) Error!OAuthSettings {
+    var settings: OAuthSettings = .{};
+    if (object.get("scopes")) |_|
+        settings.scopes = try joinScopes(builder, try jsonStrings(builder, origin, path, name, object, &.{"scopes"}, false));
+    const value = object.get("oauth") orelse return settings;
+    if (value != .object) {
+        try builder.problem(origin, path, name, "oauth must be an object", .{});
+        return settings;
+    }
+    const oauth = value.object;
+    if (jsonString(oauth, &.{ "clientId", "client_id" })) |client_id|
+        settings.client_id = try expandValue(builder, origin, path, name, client_id, expand);
+    if (oauth.get("clientSecret") != null or oauth.get("client_secret") != null)
+        try builder.problem(origin, path, name, "oauth.clientSecret is not read from configuration; register a public client (PKCE)", .{});
+    if (oauth.get("callbackPort") orelse oauth.get("callback_port")) |port| {
+        const number = jsonNumber(port) orelse -1;
+        if (number >= 1 and number <= 65535 and @floor(number) == number) {
+            settings.callback_port = @intFromFloat(number);
+        } else {
+            try builder.problem(origin, path, name, "oauth.callbackPort must be a port number (1-65535)", .{});
+        }
+    }
+    if (jsonString(oauth, &.{ "authServerMetadataUrl", "auth_server_metadata_url" })) |url|
+        settings.auth_server_metadata_url = try expandValue(builder, origin, path, name, url, expand);
+    if (oauth.get("scopes")) |scopes| switch (scopes) {
+        .string => |text| settings.scopes = text,
+        else => settings.scopes = try joinScopes(builder, try jsonStrings(builder, origin, path, name, oauth, &.{"scopes"}, false)),
+    };
+    return settings;
+}
+
+/// `["a", "b"]` → `"a b"` (the OAuth `scope` parameter); null when empty.
+fn joinScopes(builder: *Builder, scopes: []const []const u8) Error!?[]const u8 {
+    if (scopes.len == 0) return null;
+    return try std.mem.join(builder.arena, " ", scopes);
 }
 
 fn jsonStrings(
@@ -871,13 +947,20 @@ fn parseTomlServer(builder: *Builder, origin: Origin, path: []const u8, name: []
         .env_vars = try tomlStrings(builder, origin, path, name, value, "env_vars"),
         .cwd = tomlString(value, "cwd"),
         .env_policy = .allowlist,
-    } } else if (tomlString(value, "url")) |url| .{ .http = .{
-        .url = url,
-        .headers = try tomlPairs(builder, origin, path, name, value, "http_headers"),
-        .bearer_token_env_var = tomlString(value, "bearer_token_env_var"),
-        .env_headers = try tomlPairs(builder, origin, path, name, value, "env_http_headers"),
-        .legacy_sse = false,
-    } } else {
+    } } else if (tomlString(value, "url")) |url| .{
+        .http = .{
+            .url = url,
+            .headers = try tomlPairs(builder, origin, path, name, value, "http_headers"),
+            .bearer_token_env_var = tomlString(value, "bearer_token_env_var"),
+            .env_headers = try tomlPairs(builder, origin, path, name, value, "env_http_headers"),
+            .wire = .streamable,
+            .oauth = .{
+                // Codex `scopes = ["a", "b"]`; its callback port is a global
+                // setting (`mcp_oauth_callback_port`), not a server's.
+                .scopes = try joinScopes(builder, try tomlStrings(builder, origin, path, name, value, "scopes")),
+            },
+        },
+    } else {
         try builder.problem(origin, path, name, "invalid transport: set command (stdio) or url (streamable HTTP)", .{});
         return null;
     };
@@ -1220,6 +1303,42 @@ test "malformed sources and entries are reported, never silently dropped" {
     }, testContext());
     try testing.expectEqual(@as(usize, 1), resolved.servers.len);
     try testing.expect(resolved.problems.len >= 5);
+}
+
+test "type sse selects the HTTP+SSE wire and oauth settings are read" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const resolved = try resolve(arena.allocator(), .{
+        .metacodes_config = .{ .path = "/state/config.json", .bytes =
+        \\{"mcpServers":{
+        \\  "linear":{"type":"sse","url":"https://mcp.example/sse"},
+        \\  "docs":{"type":"http","url":"https://docs.example/mcp","scopes":["read","write"],
+        \\          "oauth":{"clientId":"${TOKEN}","callbackPort":8123,"authServerMetadataUrl":"https://as.example/.well-known/oauth-authorization-server"}},
+        \\  "badport":{"url":"https://b.example/mcp","oauth":{"callbackPort":70000,"clientSecret":"s"}}}}
+        },
+        .codex_user_config = .{ .path = "/home/.codex/config.toml", .bytes =
+        \\[mcp_servers.cx]
+        \\url = "https://cx.example/mcp"
+        \\scopes = ["a", "b"]
+        },
+    }, testContext());
+    const linear = findServer(resolved, "linear").?.transport.http;
+    try testing.expectEqual(HttpWire.legacy_sse, linear.wire);
+    try testing.expect(linear.oauth.client_id == null);
+
+    const docs = findServer(resolved, "docs").?.transport.http;
+    try testing.expectEqual(HttpWire.streamable, docs.wire);
+    try testing.expectEqualStrings("tok", docs.oauth.client_id.?);
+    try testing.expectEqual(@as(?u16, 8123), docs.oauth.callback_port);
+    try testing.expectEqualStrings("read write", docs.oauth.scopes.?);
+    try testing.expectEqualStrings("https://as.example/.well-known/oauth-authorization-server", docs.oauth.auth_server_metadata_url.?);
+
+    // A bad port and a configured secret are reported, not guessed at.
+    const badport = findServer(resolved, "badport").?.transport.http;
+    try testing.expect(badport.oauth.callback_port == null);
+    try testing.expectEqual(@as(usize, 2), resolved.problems.len);
+
+    try testing.expectEqualStrings("a b", findServer(resolved, "cx").?.transport.http.oauth.scopes.?);
 }
 
 test "server names follow Codex's grammar" {

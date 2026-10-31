@@ -25,6 +25,9 @@ const StdioTransport = @import("transport_stdio.zig").StdioTransport;
 const transport_mod = @import("transport.zig");
 const Transport = transport_mod.Transport;
 const HttpTransport = transport_mod.HttpTransport;
+const SseTransport = transport_mod.SseTransport;
+const HttpWire = @import("config.zig").HttpWire;
+const TokenSource = @import("oauth.zig").TokenSource;
 const platform = @import("platform");
 const sync = platform.sync;
 const process = platform.process;
@@ -195,20 +198,42 @@ pub const McpClient = struct {
         url: []const u8,
         /// Configured headers, `Authorization` included.
         headers: []const transport_mod.Header = &.{},
+        wire: HttpWire = .streamable,
+        /// A stored OAuth login, consumed: the transport owns it from here,
+        /// and it is destroyed here when the transport cannot be created.
+        auth: ?*TokenSource = null,
     };
 
     /// Streamable HTTP. The probe falls back to the handshake only on a
     /// completed non-Modern answer; a timeout, a network failure or 401/403
     /// is an error, never evidence of an older server.
+    ///
+    /// HTTP+SSE (`wire = .legacy_sse`): the stream is opened and its
+    /// `endpoint` awaited within the startup timeout, then the Classic
+    /// handshake runs (that transport predates `server/discover`).
     pub fn connectHttp(allocator: std.mem.Allocator, spec: HttpSpec, options: ConnectOptions) !McpClient {
+        const started = util_time.nowMs();
+        const startup_deadline: ?i64 = if (options.startup_timeout_ms) |ms| started + ms else null;
+        const transport: Transport = switch (spec.wire) {
+            .streamable => .{ .http = try HttpTransport.createWithAuth(allocator, spec.io, spec.url, spec.headers, spec.auth) },
+            .legacy_sse => .{ .sse = try SseTransport.create(allocator, spec.io, spec.url, spec.headers, .{
+                .deadline_ms = startup_deadline,
+                .abort = options.abort,
+                .auth = spec.auth,
+            }) },
+        };
         var client = McpClient{
             .allocator = allocator,
-            .transport = .{ .http = try HttpTransport.create(allocator, spec.io, spec.url, spec.headers) },
+            .transport = transport,
             .request_timeout_ms = options.request_timeout_ms,
         };
         errdefer client.transport.close();
-        const started = util_time.nowMs();
-        const startup_deadline: ?i64 = if (options.startup_timeout_ms) |ms| started + ms else null;
+        if (spec.wire == .legacy_sse) {
+            client.transport.setDeadline(startup_deadline);
+            try client.initializeClassic(options.abort);
+            client.transport.setDeadline(null);
+            return client;
+        }
         if (options.protocol != .classic_only) {
             switch (try client.probeModern(minDeadline(startup_deadline, started + options.probe_timeout_ms), options.abort)) {
                 .modern => {
@@ -328,7 +353,7 @@ pub const McpClient = struct {
         self.capabilities = parseCapabilities(parsed.value.object.get("capabilities"));
 
         // HTTP: later requests carry the negotiated revision.
-        if (self.transport == .http) self.transport.http.protocol_version = self.protocol_version;
+        self.transport.setProtocolVersion(self.protocol_version);
         const notif = try protocol.serializeNotification(self.allocator, "notifications/initialized", "{}");
         defer self.allocator.free(notif);
         try self.transport.send(notif, .{ .method = "notifications/initialized" });
@@ -461,7 +486,7 @@ pub const McpClient = struct {
                 self.transport.send(note, .{ .method = "notifications/cancelled" }) catch {};
                 return if (err == error.Timeout) error.McpRequestTimeout else err;
             },
-            error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpRedirected, error.McpConnectFailed, error.McpLineTooLarge => return err,
+            error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpRedirected, error.McpConnectFailed, error.McpLineTooLarge, error.McpStreamClosed => return err,
             else => return error.McpServerCrashed,
         }
     }
@@ -956,7 +981,7 @@ fn sendMeta(arena: std.mem.Allocator, method: []const u8, params_json: []const u
 fn sendFailure(err: anyerror) anyerror {
     return switch (err) {
         error.Timeout => error.McpRequestTimeout,
-        error.Aborted, error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpRedirected, error.McpConnectFailed => err,
+        error.Aborted, error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpRedirected, error.McpConnectFailed, error.McpStreamClosed => err,
         else => error.McpServerCrashed,
     };
 }

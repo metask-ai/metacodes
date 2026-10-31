@@ -183,6 +183,13 @@ an unpinned kernel or daemon may be absent. `metacodes terminal-setup
 or a VS Code build's `keybindings.json` after a backup, and `--restore` undoes
 it; it exits 0 when the terminal is set up or needs nothing, 1 when it left the
 terminal alone or the change failed ([TERMINAL_SETUP.md](TERMINAL_SETUP.md)).
+`metacodes mcp login <server> [--no-browser]` runs the MCP OAuth flow for a
+configured HTTP or SSE server and stores the token that later sessions send and
+refresh; `metacodes mcp logout <server>` forgets it and `metacodes mcp list`
+prints each configured server's transport and how it authenticates; they exit
+0 on success, 1 when the server is unknown, is not a URL server, already sends
+a configured `Authorization`, or the login fails, and 2 for a usage error
+([SKILLS_AND_MCP.md](SKILLS_AND_MCP.md#authorization-oauth)).
 The flag surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
 harnesses pass treatment configuration through this surface. Headless

@@ -668,7 +668,12 @@ pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         if (n == 0) break;
         filled += n;
     }
-    return buffer[0..filled];
+    // A file that shrank since `fileInfo`: hand back an allocation of the
+    // returned length, so the caller's free matches it.
+    if (filled == buffer.len) return buffer;
+    const exact = try allocator.dupe(u8, buffer[0..filled]);
+    secureFree(allocator, buffer);
+    return exact;
 }
 
 fn writeJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {

@@ -16,6 +16,7 @@ const mcp_config = @import("../mcp/config.zig");
 const mcp_launch = @import("../mcp/launch.zig");
 const mcp_transport = @import("../mcp/transport.zig");
 const McpClient = @import("../mcp/client.zig").McpClient;
+const mcp_oauth = @import("../mcp/oauth.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const util_time = @import("../util/time.zig");
 
@@ -94,6 +95,9 @@ pub const Job = struct {
     io: std.Io,
     launch: ?mcp_launch.Launch = null,
     http_headers: []const mcp_transport.Header = &.{},
+    /// Where a stored OAuth login is looked up (`metacodes mcp login`);
+    /// empty when the configuration authenticates the server itself.
+    oauth_state_root: []const u8 = "",
     log_fd: ?c_int = null,
     log_path: []const u8 = "",
     /// Written by the worker before `state` turns `.settled`; read by the
@@ -142,11 +146,24 @@ pub const Job = struct {
                 };
                 break :blk McpClient.connectWith(std.heap.c_allocator, stdio_options);
             },
-            .http => |http| McpClient.connectHttp(std.heap.c_allocator, .{
-                .io = job.io,
-                .url = http.url,
-                .headers = job.http_headers,
-            }, options),
+            .http => |http| blk: {
+                // A stored login is read on this worker: it may be refreshed
+                // (a network round trip) before the first request.
+                const auth = if (job.oauth_state_root.len != 0)
+                    mcp_oauth.TokenSource.load(std.heap.c_allocator, job.io, job.oauth_state_root, job.server.name, http.url) catch |err| no_login: {
+                        @import("../util/log.zig").warn("mcp", "server '{s}': stored OAuth login unreadable ({s}); connecting without it", .{ job.server.name, @errorName(err) });
+                        break :no_login null;
+                    }
+                else
+                    null;
+                break :blk McpClient.connectHttp(std.heap.c_allocator, .{
+                    .io = job.io,
+                    .url = http.url,
+                    .headers = job.http_headers,
+                    .wire = http.wire,
+                    .auth = auth,
+                }, options);
+            },
         } catch |err| {
             job.result = .{ .failed = err };
             return;
@@ -255,6 +272,8 @@ pub const Startup = struct {
                         job.result = .{ .failed = err };
                         continue;
                     };
+                    // Configured credentials win over a stored login.
+                    if (!hasAuthorization(job.http_headers)) job.oauth_state_root = try arena.dupe(u8, inputs.state_root);
                 },
             }
         }
@@ -316,7 +335,11 @@ pub fn failureDetail(err: anyerror, job: *const Job) []const u8 {
         error.Timeout, error.McpRequestTimeout => "no response before the startup timeout",
         error.McpServerCrashed, error.Eof => if (job.log_path.len != 0) "server exited; see its log" else "server exited",
         error.UnsupportedProtocolVersion => "server speaks no supported MCP revision",
-        error.McpAuthRequired => "the server requires authentication (401/403); OAuth login is not supported, configure a bearer token or headers",
+        error.McpAuthRequired => "the server requires authorization (401/403); run `metacodes mcp login <server>`, or configure a bearer token or headers",
+        error.McpNotEventStream => "the URL did not answer with an event stream (is it a Streamable HTTP server? use type \"http\")",
+        error.McpEndpointOriginMismatch => "the SSE endpoint event names another origin; refused",
+        error.McpSessionExpired => "the server no longer knows this session",
+        error.McpStreamClosed => "the server closed its SSE event stream; a new session reconnects",
         error.McpBearerTokenUnset => "bearer_token_env_var is not set",
         error.McpConnectFailed => "could not connect to the server URL",
         error.McpInvalidUrl => "invalid server URL",
@@ -327,10 +350,17 @@ pub fn failureDetail(err: anyerror, job: *const Job) []const u8 {
     };
 }
 
+pub fn hasAuthorization(headers: []const mcp_transport.Header) bool {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "authorization")) return true;
+    }
+    return false;
+}
+
 /// Static headers, `Authorization: Bearer $bearer_token_env_var` and
 /// `env_http_headers` for an HTTP server. A missing bearer variable is an
 /// error (Codex); a missing header variable drops that header.
-fn httpHeaders(
+pub fn httpHeaders(
     arena: std.mem.Allocator,
     http: mcp_config.Http,
     environment: mcp_config.Environment,

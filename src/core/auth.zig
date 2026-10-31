@@ -457,6 +457,9 @@ pub fn buildAuthorizeUrl(
 pub const CallbackServer = struct {
     sock: net.Socket,
     port: u16,
+    /// The redirect URI's path. MCP logins use Claude Code's `/callback`,
+    /// so a client registered for Claude Code's redirect works here too.
+    path: []const u8 = "/auth/callback",
 
     /// Bound on each accepted connection's reads and writes: a client that
     /// connects and then stalls must not pin the wait (and with it Esc in the
@@ -495,7 +498,7 @@ pub const CallbackServer = struct {
                 continue;
             };
             defer allocator.free(req);
-            const parsed = parseCallbackRequest(allocator, req, expected_state) catch |err| {
+            const parsed = parseCallbackRequestAt(allocator, req, self.path, expected_state) catch |err| {
                 const body = switch (err) {
                     error.NotCallback => "Not Found",
                     error.StateMismatch => "State mismatch",
@@ -544,13 +547,17 @@ pub fn parseCallbackRequestForTest(allocator: std.mem.Allocator, req: []const u8
 }
 
 fn parseCallbackRequest(allocator: std.mem.Allocator, req: []const u8, expected_state: []const u8) ![]u8 {
+    return parseCallbackRequestAt(allocator, req, "/auth/callback", expected_state);
+}
+
+fn parseCallbackRequestAt(allocator: std.mem.Allocator, req: []const u8, path: []const u8, expected_state: []const u8) ![]u8 {
     const line_end = std.mem.indexOf(u8, req, "\r\n") orelse return error.BadRequest;
     const line = req[0..line_end];
     if (!std.mem.startsWith(u8, line, "GET ")) return error.BadRequest;
     const rest = line[4..];
     const target_end = std.mem.indexOfScalar(u8, rest, ' ') orelse return error.BadRequest;
     const target = rest[0..target_end];
-    if (!std.mem.startsWith(u8, target, "/auth/callback")) return error.NotCallback;
+    if (!std.mem.startsWith(u8, target, path)) return error.NotCallback;
     const query_pos = std.mem.indexOfScalar(u8, target, '?') orelse return error.MissingCode;
     const query = target[query_pos + 1 ..];
     const state_raw = findQueryParam(query, "state") orelse return error.StateMismatch;

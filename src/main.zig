@@ -243,6 +243,10 @@ pub const write_tool = @import("tools/write.zig");
 pub const edit_tool = @import("tools/edit.zig");
 pub const mcp_client = @import("mcp/client.zig");
 pub const mcp_transport_http = @import("mcp/transport_http.zig");
+pub const mcp_transport_sse = @import("mcp/transport_sse.zig");
+pub const mcp_transport = @import("mcp/transport.zig");
+pub const mcp_oauth = @import("mcp/oauth.zig");
+pub const mcp_url = @import("mcp/url.zig");
 pub const mcp_protocol = @import("mcp/protocol.zig");
 pub const mcp_config = @import("mcp/config.zig");
 pub const mcp_launch = @import("mcp/launch.zig");
@@ -1824,7 +1828,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     _ = args.next(); // 跳过 argv[0](程序名)
     for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
-    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "sealed", "terminal-setup", "update" };
+    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "mcp", "sealed", "terminal-setup", "update" };
     for (subcommands) |name| {
         if (std.mem.eql(u8, cmd, name)) break;
     } else return null;
@@ -1840,6 +1844,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "sealed")) return @import("app/sealed_cli.zig").run(&args, allocator, init.io, state_dir);
+    if (std.mem.eql(u8, cmd, "mcp")) return @import("app/mcp_cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "terminal-setup")) return @import("app/terminal_setup/cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "ledger")) {
         const provider = args.next() orelse {
@@ -3763,6 +3768,8 @@ fn printHelp() void {
         \\  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]
         \\                        Bind Shift+Enter to a newline in Apple Terminal or VS Code (and forks),
         \\                        after a backup; --restore undoes it (terminal-setup --help for more)
+        \\  mcp login <server> [--no-browser] | mcp logout <server> | mcp list
+        \\                        OAuth login for an HTTP or SSE MCP server (stored, refreshed per session)
         \\  update [--check] [--version X.Y.Z] [--release-base <url>] [--pull] [--allow-downgrade]
         \\         [--no-sdk] [--ignore-running] [--json]
         \\                        Bring this install up to date: the latest release (from its recorded
@@ -4055,6 +4062,10 @@ test {
     _ = &@import("mcp/param_headers.zig");
     _ = &@import("mcp/transport.zig");
     _ = &@import("mcp/transport_http.zig");
+    _ = &@import("mcp/transport_sse.zig");
+    _ = &@import("mcp/oauth.zig");
+    _ = &@import("mcp/url.zig");
+    _ = &@import("app/mcp_cli.zig");
     _ = &@import("util/toml.zig");
     _ = &@import("skills/runtime/frontmatter.zig");
     _ = &@import("tools/dynamic.zig");
