@@ -47,6 +47,7 @@ const util_json = @import("../util/json.zig");
 const api_stream = @import("stream.zig");
 const provider_mod = @import("provider.zig");
 const client_mod = @import("../client.zig");
+const model_error = @import("model_error.zig");
 const liveness_reader = @import("liveness_reader.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
@@ -401,7 +402,7 @@ pub const GeminiClient = struct {
         if (!status.isOk()) {
             var location_buf: [http_status.REDIRECT_LOCATION_BYTES]u8 = undefined;
             if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
-                client_mod.reportRedirect("gemini", rid, status, location);
+                client_mod.reportRedirect("gemini", rid, status, location, auth.value);
                 return error.RequestFailed;
             }
             var err_body: [4096]u8 = undefined;
@@ -412,8 +413,7 @@ pub const GeminiClient = struct {
             );
             const n = body_reader.readSliceShort(err_body[0..]) catch 0;
             const preview = err_body[0..@min(n, err_body.len)];
-            log.errId("gemini", rid, "HTTP {d} {s}: body={s}", .{ status.code, status.name, preview });
-            client_mod.reportHttpFailure(status.code, preview);
+            client_mod.reportHttpFailure("gemini", rid, status, preview, err_body.len, auth.value);
             return error.RequestFailed;
         }
         client_mod.noteRequestAccepted();
@@ -433,6 +433,7 @@ pub const GeminiClient = struct {
             .abort = abort,
             .abort_registry = &self.abort_registry,
             .id = rid,
+            .credential = client_mod.credentialPrint(auth.value),
             .signatures = &self.thought_signatures,
         };
         return heap.handle();
@@ -452,6 +453,8 @@ const GeminiStream = struct {
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
+    /// What an error frame in this stream must not repeat.
+    credential: ?model_error.SecretPrint,
     /// 序列化时走占位的图像 tool_result id(owned),随 StreamHandle 回传。
     image_placeholder_ids: []const []const u8 = &.{},
     done: bool = false,
@@ -600,7 +603,7 @@ const GeminiStream = struct {
         // 旧实现当空 chunk 跳过,随后没收尾就结束 → StreamIncomplete,答复被当成断流。
         if (util_json.topLevelObjectField(data, "error")) |err_obj| {
             self.done = true;
-            client_mod.reportServerError("gemini", self.id, err_obj);
+            client_mod.reportServerError("gemini", self.id, err_obj, self.credential);
             return error.ApiError;
         }
         const report = stopReport(data);
@@ -1586,6 +1589,7 @@ fn replayGemini(a: std.mem.Allocator, sse: []const u8, stop: *StopReason) ![]u8 
         .request = undefined,
         .response = undefined,
         .id = .{ .bytes = .{0} ** 12 },
+        .credential = null,
     };
     defer {
         for (stream.fc_queue.items[stream.fc_pos..]) |ev| freeToolUseStart(a, ev);

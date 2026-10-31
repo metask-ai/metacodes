@@ -4,6 +4,7 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 const error_class = @import("error_class.zig");
+const model_error = @import("model_error.zig");
 
 /// Maximum accepted SSE line size. Tool input deltas can legitimately be much
 /// larger than the transport reader buffer, but a peer-controlled line must
@@ -970,6 +971,9 @@ pub const EventIterator = struct {
     /// 本次 SSE 流对应的 request_id（client 层设置）。用来把 stream 事件日志和
     /// 更上游的 HTTP 请求/下游 agent turn 串起来。未设置时日志无 id 上下文。
     req_id: ?log.RequestId = null,
+    /// What an error frame must not repeat (set by the client layer). Null = the
+    /// iterator is only parsing, with no request behind it.
+    credential: ?model_error.SecretPrint = null,
     /// 最后一次 message_delta 报告的 stop_reason(枚举化,避免 owned 字符串)。
     /// agent_loop drain 完后读它判断是否 max_tokens 续写。
     last_stop_reason: StopReason = .unknown,
@@ -1023,6 +1027,11 @@ pub const EventIterator = struct {
     /// 绑定 request_id，让后续所有 event 日志带上同一 id。
     pub fn setRequestId(self: *EventIterator, id: log.RequestId) void {
         self.req_id = id;
+    }
+
+    /// 绑定本次请求携带的凭据指纹,错误帧写日志和现场前按它掩码。
+    pub fn setCredential(self: *EventIterator, credential: ?model_error.SecretPrint) void {
+        self.credential = credential;
     }
 
     /// 注入本轮用户原始输入(borrowed),供 web_search 显示真实 query(对齐 mecode)。
@@ -1330,10 +1339,12 @@ pub const EventIterator = struct {
                     // 不再静默归 .unknown 跳过——打 err 日志并上抛明确 error,让上游区分
                     // "API 主动报错" vs "网络/解析失败"(避免三类错误塌缩成 RequestFailed)。
                     const err_obj = findTopLevelObjectField(data, "error") orelse data;
-                    self.logWarn("API error event: {s}", .{err_obj});
-                    @import("last_error.zig").recordNamed("API 错误帧", err_obj);
+                    var masked: model_error.MaskedFailure = .{};
+                    const shown = model_error.maskFailure(&masked, err_obj, self.credential);
+                    self.logWarn("API error event: {s}", .{shown});
+                    @import("last_error.zig").recordNamed("API 错误帧", shown);
                     // The whole frame: its top-level `request_id` is outside `error`.
-                    @import("model_error.zig").noteStreamError(data);
+                    model_error.noteStreamError(data);
                     self.done_flag = true;
                     if (error_class.isContextWindowExceeded(err_obj)) {
                         self.context_window_numbers = error_class.parseContextWindowNumbers(err_obj);

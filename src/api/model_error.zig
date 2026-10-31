@@ -75,11 +75,12 @@ fn Text(comptime cap: usize) type {
 
         fn set(self: *Self, raw: []const u8, secret: ?SecretPrint) void {
             // Flatten first: a control byte inside a key must not hide it from
-            // the masking below. The scratch bound is the longest input any
-            // caller can have read (client error bodies are at most 4 KiB).
+            // the masking below. Client error bodies fit the scratch (at most
+            // 4 KiB); a stream frame can outgrow it and be cut here.
             var clean_buf: [8 * 1024]u8 = undefined;
             const clean = clean_buf[0..last_error.copySanitized(&clean_buf, raw)];
-            const written = redactInto(&self.buf, clean, secret);
+            const kept = if (raw.len > clean_buf.len) withoutCutCredential(clean, secret) else clean;
+            const written = redactInto(&self.buf, kept, secret);
             self.len = written.len;
             self.truncated = written.truncated or clean.len < raw.len;
         }
@@ -268,14 +269,52 @@ pub fn noteRedirect(status: u16, location: []const u8) void {
     detail.http_status = status;
     detail.category = .invalid_request;
     detail.retry = .not_retryable;
-    // A Location at the clients' bound may have been cut, and a credential cut
-    // in two no longer matches its print. Naming no URL is the safe answer.
     var buf: [512]u8 = undefined;
-    const message = if (location.len >= http_status.REDIRECT_LOCATION_BYTES)
+    const message = if (locationMayBeCut(location))
         std.fmt.bufPrint(&buf, "The endpoint redirected (HTTP {d}) to a URL too long to report; requests that carry a key do not follow redirects, so use that URL as the endpoint.", .{status})
     else
         std.fmt.bufPrint(&buf, "The endpoint redirected (HTTP {d}) to {s}; requests that carry a key do not follow redirects, so use that URL as the endpoint.", .{ status, location });
     detail.message.set(message catch "The endpoint redirected; use the target URL as the endpoint.", capture.credential);
+}
+
+/// A Location at the clients' bound may have been cut, and a credential cut in
+/// two no longer matches its print. Naming no URL is the safe answer.
+fn locationMayBeCut(location: []const u8) bool {
+    return location.len >= http_status.REDIRECT_LOCATION_BYTES;
+}
+
+/// Room for any Location the clients keep, masked. The densest input is `key=a&`
+/// repeated, where 6 bytes become 15.
+pub const MaskedLocation = Text(http_status.REDIRECT_LOCATION_BYTES * 3);
+
+/// A Location for the text outside this module (the log, the TUI's summary):
+/// control bytes flattened, the credential and secret shapes masked, borrowing
+/// `out`. Null when it may have been cut, so that it cannot be quoted safely.
+pub fn maskLocation(out: *MaskedLocation, location: []const u8, credential: []const u8) ?[]const u8 {
+    if (locationMayBeCut(location)) return null;
+    out.set(location, SecretPrint.of(credential));
+    return out.slice();
+}
+
+/// A server's failure text for the sinks outside this module (the log, the
+/// TUI's summary). What does not fit is dropped after masking, so nothing is cut
+/// in two here.
+pub const MaskedFailure = Text(8 * 1024);
+
+/// `raw` with control bytes flattened, the credential and secret shapes masked,
+/// borrowing `out`. A request outside any Run has no Capture, so the caller
+/// brings the print of what its request carried.
+pub fn maskFailure(out: *MaskedFailure, raw: []const u8, credential: ?SecretPrint) []const u8 {
+    out.set(raw, credential);
+    return out.slice();
+}
+
+/// Text cut at a bound can end in part of the credential, which no longer
+/// matches its print. Such a part is shorter than the credential, so dropping
+/// that many bytes from the end removes it, whatever the text was.
+pub fn withoutCutCredential(text: []const u8, credential: ?SecretPrint) []const u8 {
+    const print = credential orelse return text;
+    return text[0..text.len -| (print.len - 1)];
 }
 
 /// A failure declared inside an accepted stream: an Anthropic error frame, a
@@ -564,12 +603,12 @@ fn numberField(a: std.mem.Allocator, object: std.json.ObjectMap, name: []const u
 const Written = struct { len: usize, truncated: bool };
 
 /// A credential's length and hash: enough to recognize it, not to recover it.
-const SecretPrint = struct {
+pub const SecretPrint = struct {
     len: usize,
     hash: u64,
 
     /// Null below the length where a match could be an ordinary word.
-    fn of(secret: []const u8) ?SecretPrint {
+    pub fn of(secret: []const u8) ?SecretPrint {
         if (secret.len < SECRET_MIN_BYTES) return null;
         return .{ .len = secret.len, .hash = std.hash.Wyhash.hash(0, secret) };
     }
@@ -840,6 +879,52 @@ test "the credential is masked in caller-supplied failure text and the request i
     try testing.expectEqualStrings("dial http://h/[REDACTED]/x failed", capture.failure.message.slice());
     noteStreamFailure(.timeout, .retryable, "read http://h/plainsecretvalue/x failed");
     try testing.expectEqualStrings("read http://h/[REDACTED]/x failed", capture.failure.message.slice());
+}
+
+test "maskLocation masks the credential, fits the densest Location and refuses one that may be cut" {
+    var masked: MaskedLocation = .{};
+    try testing.expectEqualStrings(
+        "http://h/[REDACTED]/x?ref=[REDACTED]",
+        maskLocation(&masked, "http://h/plainsecretvalue/x?ref=plainsecretvalue", "plainsecretvalue").?,
+    );
+
+    // A known shape is masked with no credential to match, and control bytes
+    // cannot hide it.
+    try testing.expectEqualStrings("http://h/?x= [REDACTED]", maskLocation(&masked, "http://h/?x=\x01sk-abcdefgh1234", "").?);
+
+    const dense = "key=a&" ** ((http_status.REDIRECT_LOCATION_BYTES - 1) / "key=a&".len);
+    _ = maskLocation(&masked, dense, "").?;
+    try testing.expect(!masked.truncated);
+    try testing.expectEqual(dense.len / "key=a&".len * "key=[REDACTED]&".len, masked.len);
+
+    const at_bound = "p" ** http_status.REDIRECT_LOCATION_BYTES;
+    try testing.expect(maskLocation(&masked, at_bound, "plainsecretvalue") == null);
+    try testing.expect(maskLocation(&masked, at_bound[1..], "plainsecretvalue") != null);
+}
+
+test "maskFailure masks what it is given, and needs no Run to do it" {
+    var masked: MaskedFailure = .{};
+    try testing.expectEqualStrings(
+        "bad [REDACTED] key: [REDACTED] [REDACTED]",
+        maskFailure(&masked, "bad plainsecretvalue key: abc sk-abcdefgh1234", SecretPrint.of("plainsecretvalue")),
+    );
+}
+
+test "a credential cut at a bound leaves nothing behind" {
+    const print = SecretPrint.of("plainsecretvalue");
+    const cut = "body plainsec";
+    try testing.expectEqualStrings("", withoutCutCredential(cut, print));
+    try testing.expectEqualStrings("body plainsec", withoutCutCredential(cut, null));
+    const longer = "0123456789012345" ++ "body plainsec";
+    try testing.expectEqualStrings("0123456789012345"[0..14], withoutCutCredential(longer, print));
+
+    // A frame longer than the scratch is cut there, inside the credential.
+    var masked: MaskedFailure = .{};
+    const frame = "x" ** (8 * 1024 - 8) ++ "plainsecretvalue";
+    const shown = maskFailure(&masked, frame, print);
+    try testing.expect(std.mem.indexOf(u8, shown, "plainsec") == null);
+    try testing.expect(masked.truncated);
+    try testing.expect(shown.len > 8000);
 }
 
 test "control bytes are flattened and fields are bounded without splitting UTF-8" {

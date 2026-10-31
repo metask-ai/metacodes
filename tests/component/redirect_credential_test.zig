@@ -10,10 +10,16 @@
 //! Every case answers the first request with a redirect to a second server on
 //! another host name (`localhost` is not `127.0.0.1` to std) and checks that
 //! the second server never hears from the client.
+//!
+//! The "L2 echoed credential" cases are the same concern on the way back: a
+//! server that repeats the key in an error answer does not get it into the log
+//! or onto the screen.
 
 const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
+const pfs = @import("platform").fs;
+const ppaths = @import("platform").paths;
 
 const SECRET = "redirect-test-secret-7f3a";
 
@@ -152,6 +158,224 @@ test "L2 redirect: the OpenAI and Gemini clients name the redirect and keep thei
         try expectRefused(client.provider().sendStream(&MESSAGES, null, null, null, null, null, ""));
         try hop.expectHeld();
         try std.testing.expect(std.mem.indexOf(u8, takeLastError(&summary), "端点重定向") != null);
+    }
+}
+
+const Provider = enum { messages, openai, gemini };
+
+/// Sends one request with `SECRET` to the redirecting `server` and expects it
+/// refused.
+fn sendRefused(provider: Provider, io: std.Io, server: *harness.MockServer, arena: std.mem.Allocator) !void {
+    const url = try server.urlOwned(arena);
+    switch (provider) {
+        .messages => {
+            var client = cc.client_mod.Client.initWithBaseUrl(std.testing.allocator, io, SECRET, "claude-sonnet-4-20250514", url);
+            defer client.deinit();
+            if (client.sendMessageStream(&MESSAGES, null, null)) |response| {
+                var followed = response;
+                followed.deinit();
+                return error.RedirectFollowed;
+            } else |err| try std.testing.expectEqual(error.HttpError, err);
+        },
+        .openai => {
+            var client = cc.api_openai.OpenAIClient.init(std.testing.allocator, io, SECRET, "gpt-4o", url);
+            defer client.deinit();
+            try expectRefused(client.provider().sendStream(&MESSAGES, null, null, null, null, null, ""));
+        },
+        .gemini => {
+            const base = url[0 .. url.len - "/v1/messages".len];
+            var client = cc.api_gemini.GeminiClient.init(std.testing.allocator, io, SECRET, "gemini-2.5-flash", base);
+            defer client.deinit();
+            try expectRefused(client.provider().sendStream(&MESSAGES, null, null, null, null, null, ""));
+        },
+    }
+}
+
+/// Reads a stream that must end in a failure, as the agent loop would.
+fn drainToFailure(provider: anytype) !void {
+    var handle = try provider.sendStream(&MESSAGES, null, null, null, null, null, "");
+    defer handle.deinit();
+    while (true) {
+        const event = handle.next() catch return;
+        if (event == null) return error.StreamFailureMissed;
+    }
+}
+
+/// Sends one request with `SECRET` to `server`, outside any Run, and reads the
+/// accepted stream to the failure it declares.
+fn sendDrained(provider: Provider, io: std.Io, server: *harness.MockServer, arena: std.mem.Allocator) !void {
+    const url = try server.urlOwned(arena);
+    switch (provider) {
+        .messages => {
+            var client = cc.client_mod.Client.initWithBaseUrl(std.testing.allocator, io, SECRET, "claude-sonnet-4-20250514", url);
+            defer client.deinit();
+            try drainToFailure(client.provider());
+        },
+        .openai => {
+            var client = cc.api_openai.OpenAIClient.init(std.testing.allocator, io, SECRET, "gpt-4o", url);
+            defer client.deinit();
+            try drainToFailure(client.provider());
+        },
+        .gemini => {
+            var client = cc.api_gemini.GeminiClient.init(std.testing.allocator, io, SECRET, "gemini-2.5-flash", url[0 .. url.len - "/v1/messages".len]);
+            defer client.deinit();
+            try drainToFailure(client.provider());
+        },
+    }
+}
+
+/// What one refused request left in the log file and in the TUI's error text.
+const Reported = struct {
+    log_buf: [8192]u8 = undefined,
+    log_len: usize = 0,
+    summary_buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined,
+    summary_len: usize = 0,
+
+    fn logged(self: *const Reported) []const u8 {
+        return self.log_buf[0..self.log_len];
+    }
+
+    fn summary(self: *const Reported) []const u8 {
+        return self.summary_buf[0..self.summary_len];
+    }
+
+    fn collect(self: *Reported, provider: Provider, status_line: []const u8, headers: []const u8, body: []const u8) !void {
+        return self.collectFrom(sendRefused, provider, status_line, headers, body);
+    }
+
+    fn collectFrom(self: *Reported, comptime send: anytype, provider: Provider, status_line: []const u8, headers: []const u8, body: []const u8) !void {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        var io_runtime = @import("platform").signal.threadedIo(arena_state.allocator(), .{});
+        defer io_runtime.deinit();
+
+        var path_buf: [512]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buf, "{s}/cc-zig-redirect-credential-test.log", .{ppaths.tempDir()});
+        const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o644);
+        try std.testing.expect(fd >= 0);
+        defer pfs.close(fd);
+        defer pfs.unlinkPath(path.ptr) catch {};
+        const previous_log_state = cc.util_log.setLogFileFdForTest(fd);
+        defer cc.util_log.restoreForTest(previous_log_state);
+        // A failing run must not print the secret to the test output either.
+        cc.util_log.setStderrEnabled(false);
+        // Stream error frames are logged at warn.
+        cc.util_log.setLevel(.warn);
+
+        var server = try harness.MockServer.startRepeatingStatus(body, status_line, headers);
+        defer server.stop();
+        _ = cc.api_last_error.take(&self.summary_buf);
+        try send(provider, io_runtime.io(), server, arena_state.allocator());
+        // The request did carry the secret: there was something to echo.
+        const first = server.lastRequest() orelse return error.NoRequestCaptured;
+        try std.testing.expect(std.mem.indexOf(u8, first.raw, SECRET) != null);
+
+        self.summary_len = takeLastError(&self.summary_buf).len;
+        _ = pfs.lseek(fd, 0, .set);
+        const n = pfs.read(fd, &self.log_buf);
+        try std.testing.expect(n > 0);
+        self.log_len = @intCast(n);
+    }
+};
+
+fn expectAbsent(where: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, where, needle) == null) return;
+    std.debug.print("found {s} in: {s}\n", .{ needle, where });
+    return error.SecretLeaked;
+}
+
+fn expectPresent(where: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, where, needle) != null) return;
+    std.debug.print("missing {s} in: {s}\n", .{ needle, where });
+    return error.ReportIncomplete;
+}
+
+test "L2 redirect: a Location that echoes the credential reaches neither the log nor the error text" {
+    // SECRET has no known prefix, and neither a path segment nor the query name
+    // `tenant_ref` is a pattern the masking knows: only the credential itself
+    // can catch it. A 3xx body usually repeats the URL, so this one does too.
+    const location = "http://gateway.example/tenant/" ++ SECRET ++ "/v1?tenant_ref=" ++ SECRET ++ "&x=1";
+    const masked = "http://gateway.example/tenant/[REDACTED]/v1?tenant_ref=[REDACTED]&x=1";
+    for (std.enums.values(Provider)) |provider| {
+        var reported: Reported = .{};
+        try reported.collect(provider, "HTTP/1.1 302 Found", "location: " ++ location ++ "\r\n", "<a href=\"" ++ location ++ "\">Found</a>");
+        try expectAbsent(reported.logged(), SECRET);
+        try expectAbsent(reported.summary(), SECRET);
+        // The URL is still there to act on.
+        try expectPresent(reported.logged(), "redirect to " ++ masked ++ " not followed");
+        try expectPresent(reported.summary(), masked);
+    }
+}
+
+test "L2 redirect: a Location cut at the bound is quoted in neither the log nor the error text" {
+    // Placed across the bound the clients keep, the credential arrives cut, and
+    // a cut credential no longer matches.
+    const lead = "http://gateway.example/";
+    const padding = "p" ** (256 - lead.len - 10);
+    comptime std.debug.assert(lead.len + padding.len + 1 + 9 == 256);
+    const location = lead ++ padding ++ "/" ++ SECRET ++ "/x";
+    for (std.enums.values(Provider)) |provider| {
+        var reported: Reported = .{};
+        try reported.collect(provider, "HTTP/1.1 302 Found", "location: " ++ location ++ "\r\n", "");
+        const fragment = SECRET[0..9];
+        try expectAbsent(reported.logged(), fragment);
+        try expectAbsent(reported.summary(), fragment);
+        try expectAbsent(reported.logged(), lead);
+        try expectAbsent(reported.summary(), lead);
+        try expectPresent(reported.logged(), "too long to report");
+        try expectPresent(reported.summary(), "地址过长");
+    }
+}
+
+test "L2 echoed credential: an error frame reaches neither the log nor the error text" {
+    // No Run is active here, so the structured detail's Capture cannot be what
+    // knows the credential: the stream itself has to.
+    const said = "bad tenant " ++ SECRET ++ " rejected";
+    const frames = [_]struct { Provider, []const u8 }{
+        .{ .messages, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ said ++ "\"}}\n\n" },
+        .{ .openai, "data: {\"error\":{\"message\":\"" ++ said ++ "\",\"code\":401}}\n\n" },
+        .{ .gemini, "data: {\"error\":{\"code\":401,\"message\":\"" ++ said ++ "\",\"status\":\"UNAUTHENTICATED\"}}\n\n" },
+    };
+    for (frames) |frame| {
+        var reported: Reported = .{};
+        try reported.collectFrom(sendDrained, frame[0], "HTTP/1.1 200 OK", "", frame[1]);
+        try expectAbsent(reported.logged(), SECRET);
+        try expectAbsent(reported.summary(), SECRET);
+        // The rest of what the server said is still there to act on.
+        try expectPresent(reported.logged(), "bad tenant [REDACTED] rejected");
+        try expectPresent(reported.summary(), "API 错误帧");
+        try expectPresent(reported.summary(), "bad tenant [REDACTED] rejected");
+    }
+}
+
+test "L2 echoed credential: an HTTP error body reaches neither the log nor the error text" {
+    const body = "{\"error\":{\"message\":\"bad tenant " ++ SECRET ++ " rejected\"}}";
+    for (std.enums.values(Provider)) |provider| {
+        var reported: Reported = .{};
+        try reported.collect(provider, "HTTP/1.1 400 Bad Request", "", body);
+        try expectAbsent(reported.logged(), SECRET);
+        try expectAbsent(reported.summary(), SECRET);
+        try expectPresent(reported.logged(), "bad tenant [REDACTED] rejected");
+        try expectPresent(reported.summary(), "HTTP 400: ");
+        try expectPresent(reported.summary(), "bad tenant [REDACTED] rejected");
+    }
+}
+
+test "L2 echoed credential: a body cut at the read bound does not leave part of it in the log" {
+    // Across the bound of the buffer each client reads an error body into, the
+    // credential arrives cut, and a cut credential no longer matches.
+    const fragment = SECRET[0..9];
+    const bounds = [_]struct { Provider, []const u8 }{
+        .{ .messages, "x" ** (2048 - fragment.len) ++ SECRET },
+        .{ .openai, "x" ** (4096 - fragment.len) ++ SECRET },
+        .{ .gemini, "x" ** (4096 - fragment.len) ++ SECRET },
+    };
+    for (bounds) |bound| {
+        var reported: Reported = .{};
+        try reported.collect(bound[0], "HTTP/1.1 400 Bad Request", "", bound[1]);
+        try expectPresent(reported.logged(), "xxxx");
+        try expectAbsent(reported.logged(), fragment);
+        try expectAbsent(reported.summary(), fragment);
     }
 }
 
