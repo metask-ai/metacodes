@@ -399,7 +399,7 @@ pub const GeminiClient = struct {
         client_mod.noteResponseHead(status.code, response.head, auth.value);
         connection_lease.release();
         if (!status.isOk()) {
-            var location_buf: [256]u8 = undefined;
+            var location_buf: [http_status.REDIRECT_LOCATION_BYTES]u8 = undefined;
             if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
                 client_mod.reportRedirect("gemini", rid, status, location);
                 return error.RequestFailed;

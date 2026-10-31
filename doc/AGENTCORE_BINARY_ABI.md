@@ -846,7 +846,9 @@ identifiers are recognized and `unknown` otherwise.
 All strings are bounded and sanitized before they reach the event: `code` and
 `type` and `request_id` at 128 bytes, `message` at 1024, cut on a UTF-8 boundary
 and flagged by `truncated`; control bytes, C1 codes and invalid UTF-8 are
-flattened to spaces. The credential the request carried is masked, as are values
+flattened to spaces. The credential the request carried is masked wherever it
+appears in `code`, `type`, `message` or `request_id`, including a redirect's URL
+(a URL too long to keep whole is not reported at all), as are values
 of recognizable shape (`sk-`, `AIza`, `eyJ`, `Bearer …`, and `api_key=`,
 `token:`, `password=` and similar pairs), each replaced by `[REDACTED]`.
 The patterns are defence in depth, not a proof that a provider's free text holds

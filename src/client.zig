@@ -1210,7 +1210,7 @@ pub const Client = struct {
             },
             .failure => |failure| {
                 // The head's bytes are reused by the body read below.
-                var location_buf: [256]u8 = undefined;
+                var location_buf: [@import("api/http_status.zig").REDIRECT_LOCATION_BYTES]u8 = undefined;
                 const redirected_to = copyRedirectLocation(&http_response, &location_buf);
                 // Read every error body exactly once while the request reader is alive. Cleanup
                 // remains with the surrounding errdefers; do not deinit/destroy here.

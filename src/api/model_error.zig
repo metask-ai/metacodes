@@ -30,6 +30,7 @@
 const std = @import("std");
 const error_class = @import("error_class.zig");
 const last_error = @import("last_error.zig");
+const http_status = @import("http_status.zig");
 const util_json = @import("../util/json.zig");
 
 /// What kind of failure this was, from transport facts (HTTP status, stream
@@ -221,7 +222,7 @@ pub fn noteResponseHead(status: u16, request_id: ?[]const u8, retry_after_ms: ?u
     const capture = active orelse return;
     capture.head = .{ .status_code = status, .retry_after_ms = retry_after_ms };
     capture.credential = SecretPrint.of(credential);
-    if (request_id) |id| capture.head.request_id.set(id, null);
+    if (request_id) |id| capture.head.request_id.set(id, capture.credential);
 }
 
 /// The provider accepted the request: earlier attempts' failures are over.
@@ -267,8 +268,14 @@ pub fn noteRedirect(status: u16, location: []const u8) void {
     detail.http_status = status;
     detail.category = .invalid_request;
     detail.retry = .not_retryable;
+    // A Location at the clients' bound may have been cut, and a credential cut
+    // in two no longer matches its print. Naming no URL is the safe answer.
     var buf: [512]u8 = undefined;
-    detail.message.set(std.fmt.bufPrint(&buf, "The endpoint redirected (HTTP {d}) to {s}; requests that carry a key do not follow redirects, so use that URL as the endpoint.", .{ status, location }) catch "The endpoint redirected; use the target URL as the endpoint.", null);
+    const message = if (location.len >= http_status.REDIRECT_LOCATION_BYTES)
+        std.fmt.bufPrint(&buf, "The endpoint redirected (HTTP {d}) to a URL too long to report; requests that carry a key do not follow redirects, so use that URL as the endpoint.", .{status})
+    else
+        std.fmt.bufPrint(&buf, "The endpoint redirected (HTTP {d}) to {s}; requests that carry a key do not follow redirects, so use that URL as the endpoint.", .{ status, location });
+    detail.message.set(message catch "The endpoint redirected; use the target URL as the endpoint.", capture.credential);
 }
 
 /// A failure declared inside an accepted stream: an Anthropic error frame, a
@@ -298,7 +305,7 @@ pub fn noteTransportFailure(category: Category, retry: Retry, message: []const u
     const detail = capture.fresh();
     detail.category = category;
     detail.retry = retry;
-    detail.message.set(message, null);
+    detail.message.set(message, capture.credential);
 }
 
 /// A failure after the response head that is not the server's own statement:
@@ -309,7 +316,7 @@ pub fn noteStreamFailure(category: Category, retry: Retry, message: []const u8) 
     capture.withHead(detail);
     detail.category = category;
     detail.retry = retry;
-    detail.message.set(message, null);
+    detail.message.set(message, capture.credential);
 }
 
 /// `agent_loop`'s net under the clients: a failed send nobody described.
@@ -821,6 +828,18 @@ test "the credential is masked in a stream frame too, from its print alone" {
     noteResponseHead(200, null, null, "plainsecretvalue");
     noteStreamError("{\"type\":\"x\",\"message\":\"bad key plainsecretvalue here\"}");
     try testing.expectEqualStrings("bad key [REDACTED] here", capture.failure.message.slice());
+}
+
+test "the credential is masked in caller-supplied failure text and the request id" {
+    var capture = Capture{};
+    const scope = Scope.enter(&capture);
+    defer scope.exit();
+    noteResponseHead(200, "rid-plainsecretvalue", null, "plainsecretvalue");
+    try testing.expectEqualStrings("rid-[REDACTED]", capture.head.request_id.slice());
+    noteTransportFailure(.connection, .retryable, "dial http://h/plainsecretvalue/x failed");
+    try testing.expectEqualStrings("dial http://h/[REDACTED]/x failed", capture.failure.message.slice());
+    noteStreamFailure(.timeout, .retryable, "read http://h/plainsecretvalue/x failed");
+    try testing.expectEqualStrings("read http://h/[REDACTED]/x failed", capture.failure.message.slice());
 }
 
 test "control bytes are flattened and fields are bounded without splitting UTF-8" {

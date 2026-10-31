@@ -5595,6 +5595,82 @@ test "L2 #408 a stream frame that echoes the credential does not carry it to the
     } });
 }
 
+test "L2 #408 a redirect's Location does not carry the credential to the Host, on any provider" {
+    // "test-key" has no secret prefix, and neither a path segment nor the query
+    // name `k` is a pattern the masking knows: only the credential's print
+    // can catch it.
+    for ([_]u32{ wire.PROVIDER_ANTHROPIC, wire.PROVIDER_OPENAI, wire.PROVIDER_GEMINI }) |provider| {
+        var server = try harness.MockServer.startRepeatingStatus(
+            "",
+            "HTTP/1.1 302 Found",
+            "location: http://gateway.example/v1/test-key/x?k=test-key\r\n",
+        );
+        defer server.stop();
+        try expectModelFailure(server, .{ .provider = provider, .expected = .{
+            .category = .invalid_request,
+            .message = "The endpoint redirected (HTTP 302) to http://gateway.example/v1/[REDACTED]/x?k=[REDACTED]; requests that carry a key do not follow redirects, so use that URL as the endpoint.",
+            .http_status = 302,
+            .retry = .not_retryable,
+        } });
+    }
+}
+
+test "L2 #408 a Location too long to report whole cannot leak a cut credential" {
+    // The clients keep 256 bytes of Location. Placed across that bound, the
+    // credential arrives cut, and a cut credential no longer matches its print.
+    const location = "location: http://gateway.example/" ++ ("p" ** (256 - "http://gateway.example/".len - 4)) ++ "/test-key/x\r\n";
+    for ([_]u32{ wire.PROVIDER_ANTHROPIC, wire.PROVIDER_OPENAI, wire.PROVIDER_GEMINI }) |provider| {
+        var server = try harness.MockServer.startRepeatingStatus("", "HTTP/1.1 302 Found", location);
+        defer server.stop();
+        try expectModelFailure(server, .{ .provider = provider, .expected = .{
+            .category = .invalid_request,
+            .message = "The endpoint redirected (HTTP 302) to a URL too long to report; requests that carry a key do not follow redirects, so use that URL as the endpoint.",
+            .http_status = 302,
+            .retry = .not_retryable,
+        } });
+    }
+}
+
+test "L2 #408 a request-id header that echoes the credential does not carry it to the Host" {
+    {
+        var server = try harness.MockServer.startRepeatingStatus(
+            "{\"error\":{\"code\":\"nope\",\"message\":\"refused\"}}",
+            "HTTP/1.1 400 Bad Request",
+            "x-request-id: rid-test-key-1\r\n",
+        );
+        defer server.stop();
+        try expectModelFailure(server, .{ .expected = .{
+            .category = .invalid_request,
+            .code = "nope",
+            .message = "refused",
+            .http_status = 400,
+            .request_id = "rid-[REDACTED]-1",
+            .retry = .not_retryable,
+        } });
+    }
+    {
+        // The same header on an accepted stream that then fails.
+        var server = try harness.MockServer.startCassetteMidStreamCut(&[_][]const u8{CUT_AFTER_TEXT_SSE}, 0);
+        defer server.stop();
+        server.extra_response_headers = "x-request-id: rid-test-key-2\r\n";
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = try rootPath(&tmp, &root_buf);
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var probe = ModelErrorProbe{};
+        var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+        defer fixture.deinit();
+        _ = try fixture.runTextTurns(1, "cut me off", 2);
+        try std.testing.expectEqual(@as(usize, 1), probe.count);
+        const parsed = try sdk.decodeCoreEvent(a, probe.json_buf[0..probe.json_len]);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("rid-[REDACTED]-2", parsed.value.known.model_error.request_id.?);
+    }
+}
+
 test "L2 #408 a retry that succeeds leaves no error: HTTP failure, then stream cut" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

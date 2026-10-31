@@ -39,6 +39,10 @@ pub const ResponseStatus = struct {
 /// received the grant is not a token response.
 pub const no_redirects: std.http.Client.Request.RedirectBehavior = .unhandled;
 
+/// How much of a Location the provider clients keep. One at this length may
+/// have been cut.
+pub const REDIRECT_LOCATION_BYTES = 256;
+
 /// Where a 3xx answer points, copied into `buffer` (cut to its length), or
 /// null for any other status. Call it before reading the body: the head's
 /// bytes live in the connection buffer the body overwrites.
