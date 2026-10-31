@@ -14,6 +14,8 @@ empty `### Migration`.
 
 ## Unreleased
 
+## 0.13.0 — 2026-10-31
+
 ### Added
 
 - First formal AgentCore release. The Python and Node packages, the native

@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.10.0 — 2026-10-31
+
 ### Changed
 
 - **One MCP client.** The CLI, source-level consumers and AgentCore now run one

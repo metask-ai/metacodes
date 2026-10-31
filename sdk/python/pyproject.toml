@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metacodes"
-version = "0.13.0.dev0"
+version = "0.13.0"
 description = "Embed the metacodes agent runtime (AgentCore C ABI) in Python"
 readme = "README.md"
 requires-python = ">=3.9"
