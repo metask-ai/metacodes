@@ -1,4 +1,14 @@
 {
   "schema": "metacodes.agentcore-releases/v1",
-  "releases": []
+  "releases": [
+    {
+      "version": "0.13.0",
+      "abi_version": 1,
+      "abi_revision": 26,
+      "input_digest": "ec42b1f7b276f67966f37a276b7bdd1d13d41fbdba08d8e6d43553a8130c44e4",
+      "main_releases": [
+        "0.10.0"
+      ]
+    }
+  ]
 }
