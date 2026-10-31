@@ -1,6 +1,6 @@
 {
   "name": "metacodes",
-  "version": "0.13.0",
+  "version": "0.13.1-dev.0",
   "description": "Embed the metacodes agent runtime (AgentCore C ABI) in Node.js",
   "main": "index.js",
   "types": "index.d.ts",
