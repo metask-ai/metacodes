@@ -1,98 +1,18 @@
-//! MCP 2026-07-28 adapter for AgentCore Revision 7.
+//! MCP 2026-07-28 era adapter: discovery and the strict response parsers.
 
 const std = @import("std");
-const canonical = @import("mcp_canonical.zig");
-const wire = @import("mcp_wire.zig");
-
-const EmptyCapabilities = struct {};
-const ImplementationDto = struct {
-    name: []const u8,
-    version: []const u8,
-};
-const RequestMetaDto = struct {
-    @"io.modelcontextprotocol/protocolVersion": []const u8,
-    @"io.modelcontextprotocol/clientInfo": ImplementationDto,
-    @"io.modelcontextprotocol/clientCapabilities": EmptyCapabilities = .{},
-};
-const BaseParamsDto = struct {
-    _meta: RequestMetaDto,
-};
-const CursorParamsDto = struct {
-    _meta: RequestMetaDto,
-    cursor: []const u8,
-};
-const CallParamsDto = struct {
-    _meta: RequestMetaDto,
-    name: []const u8,
-    arguments: std.json.Value,
-};
+const canonical = @import("canonical.zig");
+const wire = @import("wire.zig");
 
 pub fn encodeDiscoverRequest(
     allocator: std.mem.Allocator,
     id: u64,
     client: wire.ClientInfo,
+    capabilities: wire.ClientCapabilities,
     limits: canonical.Limits,
 ) canonical.Error![]u8 {
     try client.validate(limits);
-    return stringify(allocator, .{
-        .jsonrpc = wire.JSON_RPC_VERSION,
-        .id = id,
-        .method = "server/discover",
-        .params = BaseParamsDto{ ._meta = requestMeta(client) },
-    });
-}
-
-pub fn encodeListToolsRequest(
-    allocator: std.mem.Allocator,
-    id: u64,
-    client: wire.ClientInfo,
-    cursor: ?[]const u8,
-    limits: canonical.Limits,
-) canonical.Error![]u8 {
-    try client.validate(limits);
-    if (cursor) |value| {
-        try canonical.validateText(value, limits.max_cursor_bytes);
-        return stringify(allocator, .{
-            .jsonrpc = wire.JSON_RPC_VERSION,
-            .id = id,
-            .method = "tools/list",
-            .params = CursorParamsDto{
-                ._meta = requestMeta(client),
-                .cursor = value,
-            },
-        });
-    }
-    return stringify(allocator, .{
-        .jsonrpc = wire.JSON_RPC_VERSION,
-        .id = id,
-        .method = "tools/list",
-        .params = BaseParamsDto{ ._meta = requestMeta(client) },
-    });
-}
-
-pub fn encodeCallToolRequest(
-    allocator: std.mem.Allocator,
-    id: u64,
-    client: wire.ClientInfo,
-    name: []const u8,
-    arguments_json: []const u8,
-    limits: canonical.Limits,
-) canonical.Error![]u8 {
-    try client.validate(limits);
-    try canonical.validateToolName(name, limits);
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    const arguments = try wire.parseArguments(scratch.allocator(), arguments_json, limits);
-    return stringify(allocator, .{
-        .jsonrpc = wire.JSON_RPC_VERSION,
-        .id = id,
-        .method = "tools/call",
-        .params = CallParamsDto{
-            ._meta = requestMeta(client),
-            .name = name,
-            .arguments = arguments,
-        },
-    });
+    return wire.encodeRequest(allocator, id, .modern_2026_07_28, client, capabilities, "server/discover", "{}", limits);
 }
 
 pub fn parseDiscoverResponse(
@@ -173,6 +93,8 @@ pub fn parseDiscoverResponse(
     // Modern discovery itself authorizes the standard tools/list operation;
     // its capability object is not the Classic initialize capability map.
     owned.capabilities.tool_catalog_available = true;
+    owned.capabilities.resources_available = capabilities.object.get("resources") != null;
+    owned.capabilities.prompts_available = capabilities.object.get("prompts") != null;
     owned.instructions = canonical.optionalText(result.object, "instructions", limits.max_text_bytes) catch {
         owned.deinit();
         return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .discovery) };
@@ -473,16 +395,6 @@ pub fn parseCallToolResponse(
     return .{ .value = owned };
 }
 
-fn requestMeta(client: wire.ClientInfo) RequestMetaDto {
-    return .{
-        .@"io.modelcontextprotocol/protocolVersion" = canonical.MODERN_VERSION,
-        .@"io.modelcontextprotocol/clientInfo" = .{
-            .name = client.name,
-            .version = client.version,
-        },
-    };
-}
-
 fn parseExecutionMode(tool: std.json.Value) canonical.Error!canonical.ExecutionMode {
     const execution = tool.object.get("execution") orelse return .ordinary;
     if (execution != .object) return error.InvalidValue;
@@ -492,11 +404,6 @@ fn parseExecutionMode(tool: std.json.Value) canonical.Error!canonical.ExecutionM
     if (std.mem.eql(u8, support.string, "optional")) return .task_optional;
     if (std.mem.eql(u8, support.string, "required")) return .task_required;
     return error.InvalidValue;
-}
-
-fn stringify(allocator: std.mem.Allocator, value: anytype) canonical.Error![]u8 {
-    return std.json.Stringify.valueAlloc(allocator, value, .{}) catch
-        return error.OutOfMemory;
 }
 
 fn parseCache(result: std.json.Value, out: *canonical.CachePolicy) canonical.Error!void {
@@ -531,7 +438,7 @@ fn mapCanonical(err: canonical.Error, phase: canonical.Phase) canonical.Diagnost
 test "modern requests carry required per-request metadata" {
     const allocator = std.testing.allocator;
     const client = wire.ClientInfo{ .name = "agentcore", .version = "6" };
-    const request = try encodeCallToolRequest(allocator, 4, client, "weather", "{\"city\":\"Paris\"}", .{});
+    const request = try wire.encodeRequest(allocator, 4, .modern_2026_07_28, client, .{}, "tools/call", "{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}", .{});
     defer allocator.free(request);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
     defer parsed.deinit();
@@ -549,12 +456,14 @@ test "tools call preserves high precision numeric arguments" {
     const allocator = std.testing.allocator;
     const arguments =
         "{\"precise\":0.123456789012345678901234567890,\"tiny\":1e-30}";
-    const request = try encodeCallToolRequest(
+    const request = try wire.encodeRequest(
         allocator,
         5,
+        .modern_2026_07_28,
         .{ .name = "agentcore", .version = "6" },
-        "calculate",
-        arguments,
+        .{},
+        "tools/call",
+        "{\"name\":\"calculate\",\"arguments\":" ++ arguments ++ "}",
         .{},
     );
     defer allocator.free(request);

@@ -1,246 +1,39 @@
-//! AgentCore-owned MCP transport lifecycle and exact-era client.
+//! A connected MCP server as a catalog holds it: the shared client plus the
+//! canonical tool catalog read from it.
 //!
-//! Host code supplies an opaque connector (and therefore owns credentials).
-//! AgentCore owns disposable negotiation probes, the real connection,
-//! request ordering, protocol state and canonical catalog. `tools/call` is
-//! issued exactly once: an indeterminate transport outcome is never replayed.
+//! Host code supplies an opaque connector (and therefore owns credentials); the
+//! shared client (`client.zig`) owns disposable negotiation probes, the real
+//! connection, request ordering and protocol state. `tools/call` is issued
+//! exactly once: an indeterminate transport outcome is never replayed.
 
 const std = @import("std");
-const core = @import("metacodes-core");
-const sync = @import("platform").sync;
-const canonical = @import("mcp_canonical.zig");
-const modern = @import("mcp_modern.zig");
-const classic = @import("mcp_classic.zig");
-const negotiation = @import("mcp_negotiation.zig");
-const wire = @import("mcp_wire.zig");
-const schema = @import("mcp_schema.zig");
-const result_stream = core.mcp_result_stream;
+const canonical = @import("canonical.zig");
+const modern = @import("era_modern.zig");
+const classic = @import("era_classic.zig");
+const negotiation = @import("negotiation.zig");
+const wire = @import("wire.zig");
+const schema = @import("schema.zig");
+const mcp_client = @import("client.zig");
+const host = @import("host_transport.zig");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const result_budget = @import("../core/result_budget.zig");
+const ToolResultBody = @import("../core/tool_result.zig").ToolResultBody;
 
-pub const ConnectionPurpose = enum(u8) { disposable_probe, actual };
-
-pub const Cancellation = struct {
-    ctx: ?*const anyopaque = null,
-    is_cancelled_fn: *const fn (?*const anyopaque) bool = neverCancelled,
-
-    pub fn isCancelled(self: Cancellation) bool {
-        return self.is_cancelled_fn(self.ctx);
-    }
-
-    fn neverCancelled(_: ?*const anyopaque) bool {
-        return false;
-    }
-};
-
-pub const ExchangeResponse = struct {
-    http_status: u32,
-    body: []u8,
-};
-
-pub const ExchangeOutcome = union(enum) {
-    /// Allocated by the allocator passed to `Connection.request`.
-    response: ExchangeResponse,
-    timeout,
-    network_error,
-    auth_error,
-    server_error,
-    child_exit,
-    cancelled,
-    /// The request may have reached the server. Callers must not replay it.
-    indeterminate,
-    /// The Host callback contract failed. The connection must never be reused.
-    fatal,
-};
-
-pub const ToolResponseSinkError = error{
-    Cancelled,
-    ResourceLimit,
-    IoFailure,
-    Closed,
-};
-
-/// Borrowed response-frame sink. The kernel creates the private capture before
-/// invoking a streaming connector, so the first Host-produced byte is already
-/// subject to Session quota, cancellation and rollback.
-pub const ToolResponseSink = struct {
-    ctx: *anyopaque,
-    write_fn: *const fn (*anyopaque, []const u8) ToolResponseSinkError!void,
-
-    pub fn write(self: ToolResponseSink, chunk: []const u8) ToolResponseSinkError!void {
-        return self.write_fn(self.ctx, chunk);
-    }
-};
-
-pub const ToolStreamExchangeOutcome = enum {
-    response,
-    timeout,
-    network_error,
-    auth_error,
-    server_error,
-    child_exit,
-    cancelled,
-    indeterminate,
-    /// The connector contract failed. The connection must never be reused.
-    fatal,
-};
-
-pub const ToolRequestExecutor = union(enum) {
-    /// Source-only compatibility/testing adapter. Production public AgentCore
-    /// connectors are admitted only through the streaming branch.
-    completed: *const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        request: []const u8,
-        timeout_ms: u32,
-        cancellation: Cancellation,
-    ) anyerror!ExchangeOutcome,
-    streaming: *const fn (
-        ctx: *anyopaque,
-        request: []const u8,
-        timeout_ms: u32,
-        cancellation: Cancellation,
-        sink: ToolResponseSink,
-    ) anyerror!ToolStreamExchangeOutcome,
-};
-
-pub const Connection = struct {
-    ctx: *anyopaque,
-    request_fn: *const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        request: []const u8,
-        timeout_ms: u32,
-        cancellation: Cancellation,
-    ) anyerror!ExchangeOutcome,
-    tool_request: ToolRequestExecutor,
-    notify_fn: *const fn (
-        ctx: *anyopaque,
-        notification: []const u8,
-        timeout_ms: u32,
-        cancellation: Cancellation,
-    ) anyerror!void,
-    close_fn: *const fn (ctx: *anyopaque) void,
-
-    pub fn request(
-        self: Connection,
-        allocator: std.mem.Allocator,
-        encoded: []const u8,
-        timeout_ms: u32,
-        cancellation: Cancellation,
-    ) anyerror!ExchangeOutcome {
-        return self.request_fn(self.ctx, allocator, encoded, timeout_ms, cancellation);
-    }
-
-    pub fn notify(
-        self: Connection,
-        encoded: []const u8,
-        timeout_ms: u32,
-        cancellation: Cancellation,
-    ) anyerror!void {
-        return self.notify_fn(self.ctx, encoded, timeout_ms, cancellation);
-    }
-
-    pub fn requestTool(
-        self: Connection,
-        allocator: std.mem.Allocator,
-        encoded: []const u8,
-        timeout_ms: u32,
-        cancellation: Cancellation,
-        sink: ToolResponseSink,
-    ) anyerror!ToolRequestOutcome {
-        return switch (self.tool_request) {
-            .completed => |callback| switch (try callback(
-                self.ctx,
-                allocator,
-                encoded,
-                timeout_ms,
-                cancellation,
-            )) {
-                .response => |bytes| .{ .completed_response = bytes },
-                .timeout => .timeout,
-                .network_error => .network_error,
-                .auth_error => .auth_error,
-                .server_error => .server_error,
-                .child_exit => .child_exit,
-                .cancelled => .cancelled,
-                .indeterminate => .indeterminate,
-                .fatal => .fatal,
-            },
-            .streaming => |callback| switch (try callback(
-                self.ctx,
-                encoded,
-                timeout_ms,
-                cancellation,
-                sink,
-            )) {
-                .response => .streamed_response,
-                .timeout => .timeout,
-                .network_error => .network_error,
-                .auth_error => .auth_error,
-                .server_error => .server_error,
-                .child_exit => .child_exit,
-                .cancelled => .cancelled,
-                .indeterminate => .indeterminate,
-                .fatal => .fatal,
-            },
-        };
-    }
-
-    pub fn close(self: Connection) void {
-        self.close_fn(self.ctx);
-    }
-};
-
-pub const ToolRequestOutcome = union(enum) {
-    completed_response: ExchangeResponse,
-    streamed_response,
-    timeout,
-    network_error,
-    auth_error,
-    server_error,
-    child_exit,
-    cancelled,
-    indeterminate,
-    fatal,
-};
-
-pub const OpenOutcome = union(enum) {
-    connection: Connection,
-    timeout,
-    network_error,
-    auth_error,
-    server_error,
-    child_exit,
-};
-
-pub const Connector = struct {
-    ctx: *anyopaque,
-    open_fn: *const fn (
-        ctx: *anyopaque,
-        purpose: ConnectionPurpose,
-        requested_era: canonical.Era,
-    ) anyerror!OpenOutcome,
-    retain_fn: *const fn (ctx: *anyopaque) anyerror!void = retainNoop,
-    release_fn: *const fn (ctx: *anyopaque) void = releaseNoop,
-
-    pub fn open(
-        self: Connector,
-        purpose: ConnectionPurpose,
-        era: canonical.Era,
-    ) anyerror!OpenOutcome {
-        return self.open_fn(self.ctx, purpose, era);
-    }
-
-    pub fn retain(self: Connector) anyerror!void {
-        return self.retain_fn(self.ctx);
-    }
-
-    pub fn release(self: Connector) void {
-        self.release_fn(self.ctx);
-    }
-
-    fn retainNoop(_: *anyopaque) anyerror!void {}
-    fn releaseNoop(_: *anyopaque) void {}
-};
+pub const McpClient = mcp_client.McpClient;
+pub const ConnectionPurpose = host.ConnectionPurpose;
+pub const Cancellation = host.Cancellation;
+pub const ExchangeResponse = host.ExchangeResponse;
+pub const ExchangeOutcome = host.ExchangeOutcome;
+pub const ToolResponseSinkError = host.ToolResponseSinkError;
+pub const ToolResponseSink = host.ToolResponseSink;
+pub const ToolStreamExchangeOutcome = host.ToolStreamExchangeOutcome;
+pub const ToolRequestExecutor = host.ToolRequestExecutor;
+pub const Connection = host.Connection;
+pub const ToolRequestOutcome = host.ToolRequestOutcome;
+pub const OpenOutcome = host.OpenOutcome;
+pub const Connector = host.Connector;
+pub const ConnectFailure = mcp_client.ConnectFailure;
+pub const CallFailure = mcp_client.CallFailure;
 
 pub const Config = struct {
     connector: Connector,
@@ -251,39 +44,14 @@ pub const Config = struct {
     timeout_ms: u32 = 30_000,
     limits: canonical.Limits = .{},
     max_catalog_bytes: usize = 64 * 1024 * 1024,
-};
-
-pub const ConnectFailure = union(enum) {
-    diagnostic: canonical.Diagnostic,
-    timeout,
-    network_error,
-    auth_error,
-    server_error,
-    child_exit,
-    cancelled,
-    indeterminate,
-    fatal,
-    resource_limit,
-    out_of_memory,
+    /// Everything a Host's connection may differ in from the strict contract
+    /// is here; the default is what the public ABI promises.
+    input_continuation: bool = false,
 };
 
 pub const ConnectOutcome = union(enum) {
     client: *Client,
     failed: ConnectFailure,
-};
-
-pub const CallFailure = union(enum) {
-    diagnostic: canonical.Diagnostic,
-    timeout,
-    network_error,
-    auth_error,
-    server_error,
-    child_exit,
-    cancelled,
-    indeterminate,
-    instance_unavailable,
-    resource_limit,
-    out_of_memory,
 };
 
 pub const CallOutcome = union(enum) {
@@ -292,7 +60,7 @@ pub const CallOutcome = union(enum) {
 };
 
 pub const BodyCallOutcome = union(enum) {
-    result: core.tool_result.ToolResultBody,
+    result: ToolResultBody,
     failed: CallFailure,
 };
 
@@ -301,129 +69,86 @@ pub const Client = struct {
     // catalog-owner and dispatch lease has been released.
     backing: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    connection: Connection,
-    connection_live: bool = true,
-    transport: negotiation.Transport,
-    mutex: sync.Mutex = .{},
-    usable: std.atomic.Value(bool) = .init(true),
+    mcp: McpClient,
     era: canonical.Era,
     capabilities: canonical.CanonicalCapabilities,
     binding: [32]u8,
-    client_info: wire.ClientInfo,
-    timeout_ms: u32,
     limits: canonical.Limits,
-    next_request_id: u64,
     catalog: canonical.OwnedCatalog,
 
     pub fn deinit(self: *Client) void {
         const backing = self.backing;
-        if (self.connection_live) self.connection.close();
+        self.mcp.close();
         self.catalog.deinit();
         self.arena.deinit();
         backing.destroy(self);
     }
 
     pub fn isUsable(self: *const Client) bool {
-        return self.usable.load(.acquire);
+        return self.mcp.isUsable();
     }
 
-    fn retireConnection(self: *Client) void {
-        if (!self.usable.swap(false, .acq_rel)) return;
-        self.connection.close();
-        self.connection_live = false;
+    /// Admission every entry into a Tool shares: the Tool is this server's, and
+    /// its arguments are one bounded JSON object.
+    fn admitCall(
+        self: *const Client,
+        scratch: std.mem.Allocator,
+        tool: *const canonical.Tool,
+        arguments_json: []const u8,
+    ) ?CallFailure {
+        if (!std.mem.eql(u8, &tool.identity.server_binding_identity, &self.binding))
+            return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) };
+        return switch (schema.validateArguments(
+            scratch,
+            arguments_json,
+            schema.Limits.fromProtocol(self.limits),
+        )) {
+            .valid => null,
+            .invalid => |issue| switch (issue) {
+                .resource_limit => .resource_limit,
+                .invalid_json, .not_object => .{
+                    .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call),
+                },
+            },
+            .out_of_memory => .out_of_memory,
+        };
     }
 
+    /// Source-level canonical call: a completed response, parsed by its era's
+    /// strict parser. Agent execution uses `callToolBody`.
     pub fn callTool(
         self: *Client,
         result_allocator: std.mem.Allocator,
         tool: *const canonical.Tool,
         arguments_json: []const u8,
-        cancellation: Cancellation,
+        abort: ?*const AbortSignal,
     ) CallOutcome {
-        if (!std.mem.eql(u8, &tool.identity.server_binding_identity, &self.binding))
-            return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
-        switch (schema.validateArguments(
-            result_allocator,
-            arguments_json,
-            schema.Limits.fromProtocol(self.limits),
-        )) {
-            .valid => {},
-            .invalid => |issue| return .{ .failed = switch (issue) {
-                .resource_limit => .resource_limit,
-                .invalid_json, .not_object => .{
-                    .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call),
-                },
-            } },
-            .out_of_memory => return .{ .failed = .out_of_memory },
-        }
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (!self.usable.load(.acquire)) return .{ .failed = .instance_unavailable };
-        if (cancellation.isCancelled()) return .{ .failed = .cancelled };
-        const request_id = self.takeRequestId() orelse return .{ .failed = .resource_limit };
-        var exchange_arena = std.heap.ArenaAllocator.init(self.backing);
-        defer exchange_arena.deinit();
-        const request = switch (self.era) {
-            .modern_2026_07_28 => modern.encodeCallToolRequest(
-                exchange_arena.allocator(),
-                request_id,
-                self.client_info,
-                tool.identity.name,
-                arguments_json,
-                self.limits,
-            ),
-            .classic_2025_11_25, .classic_2025_06_18 => classic.encodeCallToolRequest(
-                exchange_arena.allocator(),
-                request_id,
-                tool.identity.name,
-                arguments_json,
-                self.limits,
-            ),
-        } catch |err| return .{ .failed = if (err == error.OutOfMemory)
-            .out_of_memory
-        else
-            .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
-        const exchange = self.connection.request(
-            exchange_arena.allocator(),
-            request,
-            self.timeout_ms,
-            cancellation,
-        ) catch |err| {
-            if (err == error.OutOfMemory) return .{ .failed = .out_of_memory };
-            self.retireConnection();
-            return .{ .failed = .indeterminate };
+        if (self.admitCall(result_allocator, tool, arguments_json)) |failure|
+            return .{ .failed = failure };
+        self.mcp.request_mutex.lock();
+        defer self.mcp.request_mutex.unlock();
+        if (!self.mcp.isUsable()) return .{ .failed = .instance_unavailable };
+        if (abort) |signal| if (signal.isAborted()) return .{ .failed = .cancelled };
+        const params = mcp_client.toolCallParams(self.backing, tool.identity.name, arguments_json) catch
+            return .{ .failed = .out_of_memory };
+        defer self.backing.free(params);
+        const answer = self.mcp.exchange("tools/call", params, abort) catch |err| {
+            if (err == error.McpConnectionFatal) self.mcp.retire();
+            return .{ .failed = mcp_client.callFailureOf(err) };
         };
-        const response = switch (exchange) {
-            .response => |value| switch (classifyActualResponse(self.transport, value)) {
-                .body => |body| body,
-                .auth_error => return .{ .failed = .auth_error },
-                .server_error => return .{ .failed = .server_error },
-            },
-            .timeout => return .{ .failed = .timeout },
-            .network_error => return .{ .failed = .network_error },
-            .auth_error => return .{ .failed = .auth_error },
-            .server_error => return .{ .failed = .server_error },
-            .child_exit => return .{ .failed = .child_exit },
-            .cancelled => return .{ .failed = .cancelled },
-            .indeterminate => return .{ .failed = .indeterminate },
-            .fatal => {
-                self.retireConnection();
-                return .{ .failed = .indeterminate };
-            },
-        };
+        defer self.backing.free(answer.frame);
         const parsed = switch (self.era) {
             .modern_2026_07_28 => modern.parseCallToolResponse(
                 result_allocator,
-                response,
-                request_id,
+                answer.frame,
+                answer.id,
                 self.limits,
             ),
-            .classic_2025_11_25, .classic_2025_06_18 => classic.parseCallToolResponse(
+            else => |era| classic.parseCallToolResponse(
                 result_allocator,
-                response,
-                request_id,
-                classic.ClassicProfile.forEra(self.era).?,
+                answer.frame,
+                answer.id,
+                classic.ClassicProfile.forEra(era).?,
                 self.limits,
             ),
         } catch return .{ .failed = .out_of_memory };
@@ -447,642 +172,176 @@ pub const Client = struct {
         self: *Client,
         result_allocator: std.mem.Allocator,
         artifact_root: []const u8,
-        budget: core.result_budget.Budget,
+        budget: result_budget.Budget,
         tool: *const canonical.Tool,
         arguments_json: []const u8,
-        cancellation: Cancellation,
+        abort: ?*const AbortSignal,
     ) BodyCallOutcome {
         if (artifact_root.len == 0) return .{ .failed = .resource_limit };
-        if (!std.mem.eql(u8, &tool.identity.server_binding_identity, &self.binding))
-            return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
-        if (schema.validateArguments(result_allocator, arguments_json, .{}) != .valid)
-            return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (cancellation.isCancelled()) return .{ .failed = .cancelled };
-        const request_id = self.takeRequestId() orelse return .{ .failed = .resource_limit };
-        var exchange_arena = std.heap.ArenaAllocator.init(self.backing);
-        defer exchange_arena.deinit();
-        const request = switch (self.era) {
-            .modern_2026_07_28 => modern.encodeCallToolRequest(
-                exchange_arena.allocator(),
-                request_id,
-                self.client_info,
-                tool.identity.name,
-                arguments_json,
-                self.limits,
-            ),
-            .classic_2025_11_25, .classic_2025_06_18 => classic.encodeCallToolRequest(
-                exchange_arena.allocator(),
-                request_id,
-                tool.identity.name,
-                arguments_json,
-                self.limits,
-            ),
-        } catch |err| return .{ .failed = if (err == error.OutOfMemory)
-            .out_of_memory
-        else
-            .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
-
-        var capture = core.tool_result_artifact.Capture.begin(
-            result_allocator,
-            artifact_root,
-            result_stream.MAX_RESPONSE_BYTES,
-        ) catch |err| return .{ .failed = if (err == error.OutOfMemory)
-            .out_of_memory
-        else
-            .resource_limit };
-        defer capture.deinit();
-        var capture_sink = CaptureSink{
-            .capture = &capture,
-            .cancellation = cancellation,
-        };
-        const exchange = self.connection.requestTool(
-            exchange_arena.allocator(),
-            request,
-            self.timeout_ms,
-            cancellation,
-            capture_sink.interface(),
-        ) catch {
-            self.retireConnection();
-            return .{ .failed = .indeterminate };
-        };
-        switch (exchange) {
-            .completed_response => |response| {
-                const bytes = switch (classifyActualResponse(self.transport, response)) {
-                    .body => |body| body,
-                    .auth_error => return .{ .failed = .auth_error },
-                    .server_error => return .{ .failed = .server_error },
-                };
-                capture_sink.write(bytes) catch
-                    return .{ .failed = capture_sink.failureOutcome() };
-            },
-            .streamed_response => {},
-            .timeout => return .{ .failed = .timeout },
-            .network_error => return .{ .failed = .network_error },
-            .auth_error => return .{ .failed = .auth_error },
-            .server_error => return .{ .failed = .server_error },
-            .child_exit => return .{ .failed = .child_exit },
-            .cancelled => return .{ .failed = .cancelled },
-            .indeterminate => return .{ .failed = .indeterminate },
-            .fatal => {
-                self.retireConnection();
-                return .{ .failed = .indeterminate };
-            },
-        }
-        capture_sink.closed = true;
-        if (capture_sink.failure != null)
-            return .{ .failed = capture_sink.failureOutcome() };
-        capture.seal() catch |err| return .{ .failed = if (err == error.OutOfMemory)
-            .out_of_memory
-        else
-            .resource_limit };
-        const projected = result_stream.project(
-            result_allocator,
-            &capture,
-            artifact_root,
-            request_id,
-            switch (self.era) {
-                .modern_2026_07_28 => .modern_2026_07_28,
-                .classic_2025_11_25 => .classic_2025_11_25,
-                .classic_2025_06_18 => .classic_2025_06_18,
-            },
-            .{
-                .max_text_bytes = self.limits.max_text_bytes,
-                .max_json_depth = self.limits.max_json_depth,
-                .max_json_nodes = self.limits.max_json_nodes,
-            },
-            budget,
-            tool.output_schema_json != null,
-            true,
-        ) catch return .{ .failed = .out_of_memory };
-        return switch (projected) {
+        if (self.admitCall(result_allocator, tool, arguments_json)) |failure|
+            return .{ .failed = failure };
+        return switch (self.mcp.invokeTool(result_allocator, .{
+            .name = tool.identity.name,
+            .arguments_json = arguments_json,
+            .artifact_root = artifact_root,
+            .budget = budget,
+            .abort = abort,
+            .has_output_schema = tool.output_schema_json != null,
+        })) {
             .result => |body| .{ .result = body },
-            .diagnostic => |diagnostic| .{ .failed = .{ .diagnostic = .{
-                .code = switch (diagnostic.code) {
-                    .invalid_json => .invalid_json,
-                    .invalid_envelope => .invalid_envelope,
-                    .response_id_mismatch => .response_id_mismatch,
-                    .remote_error => .remote_error,
-                    .method_not_found => .method_not_found,
-                    .missing_required_field => .missing_required_field,
-                    .invalid_field => .invalid_field,
-                    .resource_limit => .resource_limit,
-                    .missing_result_type => .missing_result_type,
-                    .unsupported_result_type => .unsupported_result_type,
-                    .input_required_unsupported => .input_required_unsupported,
-                },
-                .phase = .tools_call,
-                .rpc_code = diagnostic.rpc_code,
-            } } },
-        };
-    }
-
-    fn takeRequestId(self: *Client) ?u64 {
-        if (self.next_request_id == std.math.maxInt(u64)) return null;
-        const value = self.next_request_id;
-        self.next_request_id += 1;
-        return value;
-    }
-};
-
-const CaptureSink = struct {
-    capture: *core.tool_result_artifact.Capture,
-    cancellation: Cancellation,
-    failure: ?ToolResponseSinkError = null,
-    closed: bool = false,
-
-    fn interface(self: *CaptureSink) ToolResponseSink {
-        return .{ .ctx = self, .write_fn = writeAdapter };
-    }
-
-    fn writeAdapter(raw: *anyopaque, chunk: []const u8) ToolResponseSinkError!void {
-        const self: *CaptureSink = @ptrCast(@alignCast(raw));
-        return self.write(chunk);
-    }
-
-    fn write(self: *CaptureSink, chunk: []const u8) ToolResponseSinkError!void {
-        if (self.failure) |failure| return failure;
-        if (self.closed) return self.latch(error.Closed);
-        if (self.cancellation.isCancelled()) return self.latch(error.Cancelled);
-        self.capture.write(chunk) catch |err| return self.latch(switch (err) {
-            error.ArtifactTooLarge => error.ResourceLimit,
-            else => error.IoFailure,
-        });
-    }
-
-    fn latch(self: *CaptureSink, failure: ToolResponseSinkError) ToolResponseSinkError {
-        if (self.failure == null) self.failure = failure;
-        return self.failure.?;
-    }
-
-    fn failureOutcome(self: *const CaptureSink) CallFailure {
-        return switch (self.failure orelse error.IoFailure) {
-            error.Cancelled => .cancelled,
-            error.ResourceLimit, error.IoFailure, error.Closed => .resource_limit,
+            .failed => |failed| .{ .failed = failed.failure },
         };
     }
 };
 
-const DriverState = struct {
-    backing: std.mem.Allocator,
-    config: Config,
-    probe_connection: ?Connection = null,
-    actual_connection: ?Connection = null,
-    probe_observation: ?negotiation.ProbeObservation = null,
-    probe_handshake: ?canonical.OwnedHandshake = null,
-    final_capabilities: ?canonical.CanonicalCapabilities = null,
-    actual_failure: ?ConnectFailure = null,
-    next_request_id: u64 = 1,
+pub const HostOpener = struct {
+    gpa: std.mem.Allocator,
+    connector: Connector,
+    transport: negotiation.Transport,
+    timeout_ms: u32,
 
-    fn driver(self: *DriverState) negotiation.Driver {
-        return .{
-            .ctx = self,
-            .start_probe_fn = startProbe,
-            .observe_probe_fn = observeProbe,
-            .finish_probe_fn = finishProbe,
-            .connect_fn = connectActual,
-            .revalidate_fn = revalidateActual,
-            .disconnect_fn = disconnectActual,
+    pub fn interface(self: *HostOpener) mcp_client.Opener {
+        return .{ .ctx = self, .open_fn = open };
+    }
+
+    fn open(raw: *anyopaque, purpose: ConnectionPurpose, era: canonical.Era) anyerror!mcp_client.Transport {
+        const self: *HostOpener = @ptrCast(@alignCast(raw));
+        const opened = self.connector.open(purpose, era) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.McpConnectionFatal;
         };
-    }
-
-    fn cast(raw: ?*anyopaque) *DriverState {
-        return @ptrCast(@alignCast(raw.?));
-    }
-
-    fn startProbe(raw: ?*anyopaque, _: negotiation.Transport) negotiation.DriverError!void {
-        const self = cast(raw);
-        if (self.probe_connection != null or self.probe_observation != null)
-            return error.TransportFailure;
-        const opened = self.config.connector.open(.disposable_probe, .modern_2026_07_28) catch |err|
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.TransportFailure;
-        switch (opened) {
-            .connection => |connection| self.probe_connection = connection,
-            .timeout => self.probe_observation = .timeout,
-            .network_error => self.probe_observation = .network_error,
-            .auth_error => self.probe_observation = .auth_error,
-            .server_error => self.probe_observation = .server_error,
-            .child_exit => self.probe_observation = .child_exit,
-        }
-    }
-
-    fn observeProbe(raw: ?*anyopaque) negotiation.DriverError!negotiation.ProbeObservation {
-        const self = cast(raw);
-        if (self.probe_observation) |observation| return observation;
-        const connection = self.probe_connection orelse return error.TransportFailure;
-        var arena = std.heap.ArenaAllocator.init(self.backing);
-        defer arena.deinit();
-        const request = modern.encodeDiscoverRequest(
-            arena.allocator(),
-            1,
-            self.config.client,
-            self.config.limits,
-        ) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.InvalidValue, error.ResourceLimit => error.ResourceLimit,
-        };
-        const exchange = connection.request(
-            arena.allocator(),
-            request,
-            self.config.timeout_ms,
-            .{},
-        ) catch |err| return if (err == error.OutOfMemory)
-            error.OutOfMemory
-        else
-            error.TransportFailure;
-        const response = switch (exchange) {
-            .response => |value| value,
-            .timeout => return .timeout,
-            .network_error => return .network_error,
-            .auth_error => return .auth_error,
-            .server_error => return .server_error,
-            .child_exit => return .child_exit,
-            .cancelled => return .cancelled,
-            .indeterminate => return .malformed_response,
-            .fatal => return error.TransportFailure,
-        };
-        switch (self.config.transport) {
-            .stdio => if (response.http_status != 0) return .malformed_response,
-            .streamable_http => switch (response.http_status) {
-                200...299, 400 => {},
-                401, 403 => return .auth_error,
-                else => return .server_error,
-            },
-        }
-        if (self.config.transport == .streamable_http and
-            response.http_status == 400 and response.body.len == 0)
-            return .legacy_http_400;
-        const parsed = modern.parseDiscoverProbeResponse(
-            self.backing,
-            response.body,
-            1,
-            self.config.limits,
-        ) catch return error.OutOfMemory;
-        return switch (parsed) {
-            .value => |handshake| blk: {
-                self.probe_handshake = handshake;
-                break :blk .{ .discovered_versions = self.probe_handshake.?.supported_versions };
-            },
-            .diagnostic => |diagnostic| if (diagnostic.code == .method_not_found)
-                .method_not_found
-            else if (self.config.transport == .streamable_http and
-                response.http_status == 400 and
-                isLegacyBare400Diagnostic(diagnostic) and
-                diagnostic.rpc_code != wire.UNSUPPORTED_PROTOCOL_VERSION)
-                .legacy_http_400
-            else
-                .malformed_response,
-        };
-    }
-
-    fn finishProbe(raw: ?*anyopaque) void {
-        const self = cast(raw);
-        if (self.probe_handshake) |*handshake| handshake.deinit();
-        self.probe_handshake = null;
-        if (self.probe_connection) |connection| connection.close();
-        self.probe_connection = null;
-        self.probe_observation = null;
-    }
-
-    fn connectActual(raw: ?*anyopaque, era: canonical.Era) negotiation.DriverError!void {
-        const self = cast(raw);
-        if (self.actual_connection != null) return error.TransportFailure;
-        self.actual_failure = null;
-        const opened = self.config.connector.open(.actual, era) catch |err|
-            return if (err == error.OutOfMemory) error.OutOfMemory else self.failActual(.fatal);
-        self.actual_connection = switch (opened) {
+        const connection = switch (opened) {
             .connection => |connection| connection,
-            .timeout => return self.failActual(.timeout),
-            .network_error => return self.failActual(.network_error),
-            .auth_error => return self.failActual(.auth_error),
-            .server_error => return self.failActual(.server_error),
-            .child_exit => return self.failActual(.child_exit),
+            .timeout => return error.Timeout,
+            .network_error => return error.McpConnectFailed,
+            .auth_error => return error.McpAuthRequired,
+            .server_error => return error.McpServerError,
+            .child_exit => return error.McpServerCrashed,
         };
-    }
-
-    fn revalidateActual(
-        raw: ?*anyopaque,
-        era: canonical.Era,
-    ) negotiation.DriverError!negotiation.RevalidatedProtocol {
-        const self = cast(raw);
-        const connection = self.actual_connection orelse return error.TransportFailure;
-        var arena = std.heap.ArenaAllocator.init(self.backing);
-        defer arena.deinit();
-        const id = self.next_request_id;
-        if (id == std.math.maxInt(u64)) return error.ResourceLimit;
-        self.next_request_id += 1;
-        const request = switch (era) {
-            .modern_2026_07_28 => modern.encodeDiscoverRequest(
-                arena.allocator(),
-                id,
-                self.config.client,
-                self.config.limits,
-            ),
-            .classic_2025_11_25, .classic_2025_06_18 => classic.encodeInitializeRequest(
-                arena.allocator(),
-                id,
-                classic.ClassicProfile.forEra(era).?,
-                self.config.client,
-                self.config.limits,
-            ),
-        } catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.InvalidValue, error.ResourceLimit => error.ResourceLimit,
+        const adapter = host.HostTransport.create(self.gpa, connection, self.transport, self.timeout_ms) catch |err| {
+            connection.close();
+            return err;
         };
-        const exchange = connection.request(
-            arena.allocator(),
-            request,
-            self.config.timeout_ms,
-            .{},
-        ) catch |err| return if (err == error.OutOfMemory)
-            error.OutOfMemory
-        else
-            self.failActual(.fatal);
-        const response = switch (exchange) {
-            .response => |value| switch (classifyActualResponse(self.config.transport, value)) {
-                .body => |body| body,
-                .auth_error => return self.failActual(.auth_error),
-                .server_error => return self.failActual(.server_error),
-            },
-            .timeout => return self.failActual(.timeout),
-            .network_error => return self.failActual(.network_error),
-            .auth_error => return self.failActual(.auth_error),
-            .server_error => return self.failActual(.server_error),
-            .child_exit => return self.failActual(.child_exit),
-            .cancelled => return self.failActual(.cancelled),
-            .indeterminate => return self.failActual(.indeterminate),
-            .fatal => return self.failActual(.fatal),
-        };
-        var handshake = switch (era) {
-            .modern_2026_07_28 => switch (modern.parseDiscoverResponse(
-                self.backing,
-                response,
-                id,
-                self.config.limits,
-            ) catch return error.OutOfMemory) {
-                .value => |value| value,
-                .diagnostic => |diagnostic| return if (isUnsupportedRevision(diagnostic))
-                    .unsupported_revision
-                else
-                    error.TransportFailure,
-            },
-            .classic_2025_11_25, .classic_2025_06_18 => switch (classic.parseInitializeResponse(
-                self.backing,
-                response,
-                id,
-                classic.ClassicProfile.forEra(era).?,
-                self.config.limits,
-            ) catch return error.OutOfMemory) {
-                .value => |value| value,
-                .diagnostic => |diagnostic| return if (isUnsupportedRevision(diagnostic))
-                    .unsupported_revision
-                else
-                    error.TransportFailure,
-            },
-        };
-        defer handshake.deinit();
-        const selected: canonical.Era = if (era == .modern_2026_07_28) blk: {
-            var matched = false;
-            for (handshake.supported_versions) |version| {
-                if (canonical.Era.parseExact(version)) |candidate| {
-                    if (candidate == era) matched = true;
-                }
-            }
-            if (!matched) return .unsupported_revision;
-            break :blk era;
-        } else handshake.era;
-        if (selected != era) return .{ .known = selected };
-        if (era != .modern_2026_07_28) {
-            const notification = try classic.encodeInitializedNotification(arena.allocator());
-            connection.notify(notification, self.config.timeout_ms, .{}) catch
-                return error.TransportFailure;
-        }
-        self.final_capabilities = handshake.capabilities;
-        return .{ .known = selected };
-    }
-
-    fn failActual(self: *DriverState, failure: ConnectFailure) negotiation.DriverError {
-        self.actual_failure = failure;
-        return error.TransportFailure;
-    }
-
-    fn disconnectActual(raw: ?*anyopaque) void {
-        const self = cast(raw);
-        if (self.actual_connection) |connection| connection.close();
-        self.actual_connection = null;
-        self.final_capabilities = null;
+        return .{ .host = adapter };
     }
 };
-
-fn isUnsupportedRevision(diagnostic: canonical.Diagnostic) bool {
-    return diagnostic.code == .unsupported_protocol_version or
-        diagnostic.code == .method_not_found;
-}
-
-fn isLegacyBare400Diagnostic(diagnostic: canonical.Diagnostic) bool {
-    return switch (diagnostic.code) {
-        .invalid_json, .invalid_envelope, .response_id_mismatch => true,
-        else => false,
-    };
-}
 
 pub fn connectServer(backing: std.mem.Allocator, config: Config) ConnectOutcome {
     config.limits.validate() catch return .{ .failed = .resource_limit };
     if (allZero(&config.server_binding_identity) or config.timeout_ms == 0 or
         config.max_catalog_bytes == 0)
         return .{ .failed = .resource_limit };
-    var state = DriverState{ .backing = backing, .config = config };
-    const selected = negotiation.negotiate(
-        state.driver(),
-        config.policy,
-        config.transport,
-    ) catch return .{ .failed = .out_of_memory };
-    const era = switch (selected) {
-        .diagnostic => |diagnostic| return .{ .failed = state.actual_failure orelse
-            .{ .diagnostic = diagnostic } },
-        .value => |value| value,
+
+    const client = backing.create(Client) catch return .{ .failed = .out_of_memory };
+    var arena = std.heap.ArenaAllocator.init(backing);
+    const client_info = wire.ClientInfo{
+        .name = arena.allocator().dupe(u8, config.client.name) catch {
+            arena.deinit();
+            backing.destroy(client);
+            return .{ .failed = .out_of_memory };
+        },
+        .version = arena.allocator().dupe(u8, config.client.version) catch {
+            arena.deinit();
+            backing.destroy(client);
+            return .{ .failed = .out_of_memory };
+        },
     };
-    const connection = state.actual_connection orelse
-        return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .negotiation) } };
-    state.actual_connection = null;
-    const capabilities = state.final_capabilities orelse {
-        connection.close();
-        return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.era_revalidation_mismatch, .revalidation) } };
+    var opener = HostOpener{
+        .gpa = backing,
+        .connector = config.connector,
+        .transport = config.transport,
+        .timeout_ms = config.timeout_ms,
     };
-    var catalog = if (capabilities.tool_catalog_available)
-        listAllTools(backing, connection, &state, era) catch |err| {
-            connection.close();
+    var profile = mcp_client.Profile.hostContract(config.limits);
+    profile.input_continuation = config.input_continuation;
+    var mcp = switch (mcp_client.establish(backing, .{
+        .opener = opener.interface(),
+        .transport_kind = config.transport,
+        .policy = config.policy,
+        .profile = profile,
+        .client = client_info,
+    })) {
+        .connected => |connected| connected,
+        .failed => |failed| {
+            arena.deinit();
+            backing.destroy(client);
+            return .{ .failed = failed.failure };
+        },
+    };
+    const capabilities = canonical.CanonicalCapabilities{
+        .tool_catalog_available = mcp.tool_catalog_available,
+        .resources_available = mcp.capabilities.resources,
+        .prompts_available = mcp.capabilities.prompts,
+    };
+    const catalog = if (mcp.tool_catalog_available)
+        listAllTools(backing, &mcp, config) catch |err| {
+            mcp.close();
+            arena.deinit();
+            backing.destroy(client);
             return .{ .failed = switch (err) {
                 error.OutOfMemory => .out_of_memory,
-                error.ResourceLimit => .resource_limit,
-                error.ProtocolFailure => .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_list) },
-                error.TransportFailure => state.actual_failure orelse
-                    .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .tools_list) },
+                error.ResourceLimit, error.McpResourceLimit => .resource_limit,
+                error.ProtocolFailure, error.McpRepeatedCursor => .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_list) },
+                else => mcp_client.connectFailureOf(err),
             } };
         }
     else
-        canonical.OwnedCatalog.init(backing, era);
-    const client = backing.create(Client) catch {
-        catalog.deinit();
-        connection.close();
-        return .{ .failed = .out_of_memory };
-    };
-    var arena = std.heap.ArenaAllocator.init(backing);
-    const name = arena.allocator().dupe(u8, config.client.name) catch {
-        arena.deinit();
-        catalog.deinit();
-        connection.close();
-        backing.destroy(client);
-        return .{ .failed = .out_of_memory };
-    };
-    const version = arena.allocator().dupe(u8, config.client.version) catch {
-        arena.deinit();
-        catalog.deinit();
-        connection.close();
-        backing.destroy(client);
-        return .{ .failed = .out_of_memory };
-    };
+        canonical.OwnedCatalog.init(backing, mcp.era);
     client.* = .{
         .backing = backing,
         .arena = arena,
-        .connection = connection,
-        .transport = config.transport,
-        .era = era,
+        .mcp = mcp,
+        .era = mcp.era,
         .capabilities = capabilities,
         .binding = config.server_binding_identity,
-        .client_info = .{ .name = name, .version = version },
-        .timeout_ms = config.timeout_ms,
         .limits = config.limits,
-        .next_request_id = state.next_request_id,
         .catalog = catalog,
     };
     return .{ .client = client };
 }
 
-fn listAllTools(
+/// Reads each page with its era's strict parser and admits it into one catalog.
+const CatalogPages = struct {
     backing: std.mem.Allocator,
-    connection: Connection,
-    state: *DriverState,
+    config: Config,
     era: canonical.Era,
-) error{ OutOfMemory, ResourceLimit, ProtocolFailure, TransportFailure }!canonical.OwnedCatalog {
-    var combined = canonical.OwnedCatalog.init(backing, era);
-    errdefer combined.deinit();
-    const a = combined.allocator();
-    var tools: std.ArrayList(canonical.Tool) = .empty;
-    defer tools.deinit(a);
-    var cursor: ?[]const u8 = null;
-    var pages: usize = 0;
-    var retained_bytes: usize = @sizeOf(canonical.OwnedCatalog);
-    while (true) {
-        if (pages > state.config.limits.max_tools or pages == std.math.maxInt(usize))
-            return error.ResourceLimit;
-        pages += 1;
-        const id = state.next_request_id;
-        if (id == std.math.maxInt(u64)) return error.ResourceLimit;
-        state.next_request_id += 1;
-        var exchange_arena = std.heap.ArenaAllocator.init(backing);
-        defer exchange_arena.deinit();
-        const request = switch (era) {
-            .modern_2026_07_28 => modern.encodeListToolsRequest(
-                exchange_arena.allocator(),
+    combined: *canonical.OwnedCatalog,
+    tools: *std.ArrayList(canonical.Tool),
+    pages: usize = 0,
+    retained_bytes: usize = @sizeOf(canonical.OwnedCatalog),
+
+    pub fn page(self: *CatalogPages, frame: []const u8, id: u64) !?[]const u8 {
+        const a = self.combined.allocator();
+        const limits = self.config.limits;
+        self.pages += 1;
+        var parsed = switch (self.era) {
+            .modern_2026_07_28 => switch (try modern.parseListToolsResponse(
+                self.backing,
+                frame,
                 id,
-                state.config.client,
-                cursor,
-                state.config.limits,
-            ),
-            .classic_2025_11_25, .classic_2025_06_18 => classic.encodeListToolsRequest(
-                exchange_arena.allocator(),
-                id,
-                cursor,
-                state.config.limits,
-            ),
-        } catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.ResourceLimit;
-        const exchange = connection.request(
-            exchange_arena.allocator(),
-            request,
-            state.config.timeout_ms,
-            .{},
-        ) catch |err| return if (err == error.OutOfMemory)
-            error.OutOfMemory
-        else blk: {
-            state.actual_failure = .fatal;
-            break :blk error.TransportFailure;
-        };
-        const response = switch (exchange) {
-            .response => |value| switch (classifyActualResponse(state.config.transport, value)) {
-                .body => |body| body,
-                .auth_error => {
-                    state.actual_failure = .auth_error;
-                    return error.TransportFailure;
-                },
-                .server_error => {
-                    state.actual_failure = .server_error;
-                    return error.TransportFailure;
-                },
-            },
-            .timeout => {
-                state.actual_failure = .timeout;
-                return error.TransportFailure;
-            },
-            .network_error => {
-                state.actual_failure = .network_error;
-                return error.TransportFailure;
-            },
-            .auth_error => {
-                state.actual_failure = .auth_error;
-                return error.TransportFailure;
-            },
-            .server_error => {
-                state.actual_failure = .server_error;
-                return error.TransportFailure;
-            },
-            .child_exit => {
-                state.actual_failure = .child_exit;
-                return error.TransportFailure;
-            },
-            .cancelled => {
-                state.actual_failure = .cancelled;
-                return error.TransportFailure;
-            },
-            .indeterminate => {
-                state.actual_failure = .indeterminate;
-                return error.TransportFailure;
-            },
-            .fatal => {
-                state.actual_failure = .fatal;
-                return error.TransportFailure;
-            },
-        };
-        var page = switch (era) {
-            .modern_2026_07_28 => switch (modern.parseListToolsResponse(
-                backing,
-                response,
-                id,
-                state.config.server_binding_identity,
-                state.config.limits,
-            ) catch return error.OutOfMemory) {
+                self.config.server_binding_identity,
+                limits,
+            )) {
                 .value => |value| value,
                 .diagnostic => return error.ProtocolFailure,
             },
-            .classic_2025_11_25, .classic_2025_06_18 => switch (classic.parseListToolsResponse(
-                backing,
-                response,
+            else => |era| switch (try classic.parseListToolsResponse(
+                self.backing,
+                frame,
                 id,
                 classic.ClassicProfile.forEra(era).?,
-                state.config.server_binding_identity,
-                state.config.limits,
-            ) catch return error.OutOfMemory) {
+                self.config.server_binding_identity,
+                limits,
+            )) {
                 .value => |value| value,
                 .diagnostic => return error.ProtocolFailure,
             },
         };
-        defer page.deinit();
-        if (tools.items.len + page.tools.len > state.config.limits.max_tools)
+        defer parsed.deinit();
+        if (self.tools.items.len + parsed.tools.len > limits.max_tools)
             return error.ResourceLimit;
-        for (page.tools) |tool| {
-            for (tools.items) |existing| if (std.mem.eql(u8, existing.identity.name, tool.identity.name))
+        for (parsed.tools) |tool| {
+            for (self.tools.items) |existing| if (std.mem.eql(u8, existing.identity.name, tool.identity.name))
                 return error.ProtocolFailure;
             const value = std.json.parseFromSliceLeaky(std.json.Value, a, tool.raw_json, .{
                 .allocate = .alloc_always,
@@ -1091,42 +350,54 @@ fn listAllTools(
             var copied = canonical.projectTool(
                 a,
                 value,
-                era,
-                state.config.server_binding_identity,
-                state.config.limits,
+                self.era,
+                self.config.server_binding_identity,
+                limits,
             ) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.ResourceLimit => error.ResourceLimit,
                 error.InvalidValue => error.ProtocolFailure,
             };
             copied.execution_mode = tool.execution_mode;
-            retained_bytes = std.math.add(
-                usize,
-                retained_bytes,
-                toolLogicalBytes(copied),
-            ) catch return error.ResourceLimit;
-            if (retained_bytes > state.config.max_catalog_bytes)
-                return error.ResourceLimit;
-            tools.append(a, copied) catch return error.OutOfMemory;
+            try self.charge(toolLogicalBytes(copied));
+            try self.tools.append(a, copied);
         }
-        combined.cache = conservativeCache(combined.cache, page.cache, pages == 1);
-        if (page.meta_json) |meta| {
-            retained_bytes = std.math.add(usize, retained_bytes, meta.len) catch
-                return error.ResourceLimit;
-            if (retained_bytes > state.config.max_catalog_bytes)
-                return error.ResourceLimit;
-            combined.meta_json = a.dupe(u8, meta) catch return error.OutOfMemory;
+        self.combined.cache = conservativeCache(self.combined.cache, parsed.cache, self.pages == 1);
+        if (parsed.meta_json) |meta| {
+            try self.charge(meta.len);
+            self.combined.meta_json = try a.dupe(u8, meta);
         }
-        cursor = if (page.next_cursor) |next| cursor: {
-            retained_bytes = std.math.add(usize, retained_bytes, next.len) catch
-                return error.ResourceLimit;
-            if (retained_bytes > state.config.max_catalog_bytes)
-                return error.ResourceLimit;
-            break :cursor a.dupe(u8, next) catch return error.OutOfMemory;
-        } else null;
-        if (cursor == null) break;
+        const next = parsed.next_cursor orelse return null;
+        try self.charge(next.len);
+        return try a.dupe(u8, next);
     }
-    combined.tools = tools.toOwnedSlice(a) catch return error.OutOfMemory;
+
+    fn charge(self: *CatalogPages, bytes: usize) error{ResourceLimit}!void {
+        self.retained_bytes = std.math.add(usize, self.retained_bytes, bytes) catch
+            return error.ResourceLimit;
+        if (self.retained_bytes > self.config.max_catalog_bytes)
+            return error.ResourceLimit;
+    }
+};
+
+fn listAllTools(
+    backing: std.mem.Allocator,
+    mcp: *McpClient,
+    config: Config,
+) anyerror!canonical.OwnedCatalog {
+    var combined = canonical.OwnedCatalog.init(backing, mcp.era);
+    errdefer combined.deinit();
+    var tools: std.ArrayList(canonical.Tool) = .empty;
+    defer tools.deinit(combined.allocator());
+    var pages = CatalogPages{
+        .backing = backing,
+        .config = config,
+        .era = mcp.era,
+        .combined = &combined,
+        .tools = &tools,
+    };
+    try mcp.paginateTools(null, &pages);
+    combined.tools = try tools.toOwnedSlice(combined.allocator());
     return combined;
 }
 
@@ -1166,29 +437,6 @@ fn conservativeCache(
 fn allZero(value: []const u8) bool {
     for (value) |byte| if (byte != 0) return false;
     return true;
-}
-
-const ActualResponseDisposition = union(enum) {
-    body: []u8,
-    auth_error,
-    server_error,
-};
-
-fn classifyActualResponse(
-    transport: negotiation.Transport,
-    response: ExchangeResponse,
-) ActualResponseDisposition {
-    return switch (transport) {
-        .stdio => if (response.http_status == 0)
-            .{ .body = response.body }
-        else
-            .server_error,
-        .streamable_http => switch (response.http_status) {
-            200...299 => .{ .body = response.body },
-            401, 403 => .auth_error,
-            else => .server_error,
-        },
-    };
 }
 
 const FakeConnector = struct {
@@ -1380,6 +628,7 @@ const FakeConnector = struct {
             .modern_2026_07_28 => self.advertise_tools,
             .classic_2025_11_25 => self.advertise_tools_2025_11 orelse self.advertise_tools,
             .classic_2025_06_18 => self.advertise_tools_2025_06 orelse self.advertise_tools,
+            .classic_2025_03_26, .classic_2024_11_05 => self.advertise_tools,
         };
     }
 
@@ -1557,7 +806,7 @@ test "Streamable HTTP actual request maps status before protocol parsing without
             std.testing.allocator,
             &client.catalog.tools[0],
             "{\"city\":\"Paris\"}",
-            .{},
+            null,
         );
         try std.testing.expect(called == .failed);
         if (case.auth)
@@ -1613,7 +862,7 @@ test "modern client owns disposable probe actual lifecycle catalog and call" {
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"city\":\"Paris\"}",
-        .{},
+        null,
     );
     defer if (called == .result) called.result.deinit();
     try std.testing.expect(called == .result);
@@ -1666,7 +915,7 @@ test "Classic client performs initialized notification and indeterminate call is
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"city\":\"Paris\"}",
-        .{},
+        null,
     );
     try std.testing.expect(called == .failed and called.failed == .indeterminate);
     try std.testing.expectEqual(before + 1, fake.requests);
@@ -1692,7 +941,7 @@ test "fatal tools call retires the connection and the instance cannot be reused"
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"city\":\"Paris\"}",
-        .{},
+        null,
     );
     try std.testing.expect(first == .failed and first.failed == .indeterminate);
     try std.testing.expect(!client.isUsable());
@@ -1701,7 +950,7 @@ test "fatal tools call retires the connection and the instance cannot be reused"
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"city\":\"Paris\"}",
-        .{},
+        null,
     );
     try std.testing.expect(second == .failed and second.failed == .instance_unavailable);
     try std.testing.expectEqual(before + 1, fake.requests);
@@ -1727,7 +976,7 @@ test "tools call uses the configured protocol limits and preserves resource clas
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":0}}}}}}}}}}}}}",
-        .{},
+        null,
     );
     try std.testing.expect(called == .failed and called.failed == .resource_limit);
     try std.testing.expectEqual(before, fake.requests);
@@ -1760,7 +1009,7 @@ test "Classic optional task metadata keeps ordinary tools call semantics" {
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"city\":\"Paris\"}",
-        .{},
+        null,
     );
     defer if (called == .result) called.result.deinit();
     try std.testing.expect(called == .result);
@@ -1894,7 +1143,7 @@ test "server remains schema authority and its Tool error is preserved" {
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"city\":7}",
-        .{},
+        null,
     );
     defer if (called == .result) called.result.deinit();
     try std.testing.expect(called == .result);
@@ -1929,7 +1178,7 @@ test "input_required is terminal for one call without retrying or poisoning the 
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"city\":\"Paris\"}",
-        .{},
+        null,
     );
     try std.testing.expect(unsupported == .failed);
     try std.testing.expectEqual(
@@ -1943,7 +1192,7 @@ test "input_required is terminal for one call without retrying or poisoning the 
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"city\":\"Paris\"}",
-        .{},
+        null,
     );
     defer if (completed == .result) completed.result.deinit();
     try std.testing.expect(completed == .result);
@@ -1971,7 +1220,7 @@ test "modern typed content remains lossless in the canonical result" {
         std.testing.allocator,
         &client.catalog.tools[0],
         "{\"city\":\"Paris\"}",
-        .{},
+        null,
     );
     defer if (called == .result) called.result.deinit();
     try std.testing.expect(called == .result);

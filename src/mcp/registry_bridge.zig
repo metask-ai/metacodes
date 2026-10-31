@@ -14,6 +14,8 @@ const std = @import("std");
 const McpClient = @import("client.zig").McpClient;
 const naming = @import("naming.zig");
 const param_headers = @import("param_headers.zig");
+const tool_invocation = @import("tool_invocation.zig");
+const schema = @import("schema.zig");
 const DynRegistry = @import("../tools/dynamic.zig").DynRegistry;
 const ToolContext = @import("../tools/context.zig").ToolContext;
 const ToolResultBody = @import("../tools/context.zig").ToolResultBody;
@@ -136,7 +138,7 @@ pub const McpSession = struct {
                 }
             else
                 &.{};
-            const input_schema = try projectInputSchema(a, tool_v.object.get("inputSchema"));
+            const input_schema = try schema.projectInputLenient(a, tool_v.object.get("inputSchema"));
 
             const binding = try self.allocator.create(McpToolBinding);
             errdefer self.allocator.destroy(binding);
@@ -256,14 +258,13 @@ fn executeMcpToolBody(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyo
     var scratch = std.heap.ArenaAllocator.init(ctx.allocator);
     defer scratch.deinit();
     const headers = try param_headers.headersForCall(scratch.allocator(), binding.param_headers, args);
-    return binding.client.callToolBodyWithHeaders(
-        binding.mcp_tool_name,
-        args,
-        ctx.artifact_root,
-        ctx.result_budget,
-        ctx.abort,
-        headers,
-    );
+    var body: ToolResultBody = undefined;
+    try tool_invocation.execute(&body, binding.client, ctx, .{
+        .name = binding.mcp_tool_name,
+        .arguments_json = args,
+        .headers = headers,
+    });
+    return body;
 }
 
 fn executeListResources(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
@@ -295,34 +296,6 @@ fn jsonString(value: ?std.json.Value) ?[]const u8 {
     return switch (value orelse return null) {
         .string => |text| text,
         else => null,
-    };
-}
-
-/// MCP `inputSchema` → provider 可见的 InputSchema 投影(与 agentcore/mcp_schema 同一
-/// 形状:根 `type` 固定 object,`properties` 原样借用,`required` 只收字符串,
-/// `additionalProperties` 只收布尔)。缺失/不是对象 → 空 object schema。所有借用内存
-/// 来自 `arena`(session 的 schema_arena)。
-fn projectInputSchema(arena: std.mem.Allocator, value: ?std.json.Value) !@import("../json.zig").InputSchema {
-    const schema_v = value orelse return .{ .type = "object" };
-    if (schema_v != .object) return .{ .type = "object" };
-    const obj = schema_v.object;
-    const properties: ?std.json.ObjectMap = if (obj.get("properties")) |pv| (if (pv == .object) pv.object else null) else null;
-    var required: []const []const u8 = &.{};
-    if (obj.get("required")) |rv| if (rv == .array) {
-        var names = try arena.alloc([]const u8, rv.array.items.len);
-        var n: usize = 0;
-        for (rv.array.items) |item| if (item == .string) {
-            names[n] = item.string;
-            n += 1;
-        };
-        required = names[0..n];
-    };
-    const additional: ?bool = if (obj.get("additionalProperties")) |av| (if (av == .bool) av.bool else null) else null;
-    return .{
-        .type = "object",
-        .properties = properties,
-        .required = required,
-        .additional_properties = additional,
     };
 }
 
@@ -414,10 +387,10 @@ test "registerToolsFromJson: Python 风格带空格的 tools/list 全部注册,i
     try testing.expectEqualStrings("智能搜索(向量+关键字+图扩展)。", search.description);
     try testing.expectEqual(@as(usize, 1), search.required_fields.len);
     try testing.expectEqualStrings("query", search.required_fields[0]);
-    const schema = search.borrowed_input_schema orelse return error.TestExpectedSchema;
-    try testing.expect(schema.properties.?.get("query") != null);
-    try testing.expect(schema.properties.?.get("topk") != null);
-    try testing.expectEqual(@as(?bool, false), schema.additional_properties);
+    const projected = search.borrowed_input_schema orelse return error.TestExpectedSchema;
+    try testing.expect(projected.properties.?.get("query") != null);
+    try testing.expect(projected.properties.?.get("topk") != null);
+    try testing.expectEqual(@as(?bool, false), projected.additional_properties);
     // binding 指回 server 侧的裸工具名。
     try testing.expectEqualStrings("search", session.bindings.items[1].mcp_tool_name);
 

@@ -1,8 +1,9 @@
 //! MCP client protocol behaviour against the mock server's modes
 //! (tests/_harness/mock_mcp_server.zig): revision negotiation (2026-07-28
 //! discovery, Classic handshake fallback, restart after a fatal probe),
-//! server pings, pagination, MRTR, cancellation, and configuration reaching
-//! the child process.
+//! server pings, stale answers, pagination, MRTR, cancellation, and
+//! configuration reaching the child process. The same client's behaviour with
+//! no process in the way, under both entry-point profiles, is src/mcp/conformance.zig.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -145,6 +146,50 @@ test "MCP: a timed-out call is cancelled with notifications/cancelled" {
     defer std.testing.allocator.free(report);
     try std.testing.expect(std.mem.indexOf(u8, report, "cancelled:0") == null);
     try std.testing.expect(std.mem.indexOf(u8, report, "cancelled:") != null);
+}
+
+test "MCP: a stale answer is skipped and tools/list_changed is recorded, on both call paths" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var client = try connectMock(&.{}, .{ .spawn = undefined });
+    defer client.close();
+    try std.testing.expect(!client.tools_changed.load(.acquire));
+    const called = try client.callTool("noise", "{}");
+    defer std.testing.allocator.free(called);
+    try std.testing.expect(std.mem.indexOf(u8, called, "noise-done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, called, "stale") == null);
+    try std.testing.expect(client.tools_changed.load(.acquire));
+
+    client.tools_changed.store(false, .release);
+    var body = try client.callToolBodyAbortable("noise", "{}", root, .{}, null);
+    defer body.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, body.@"inline".bytes, "noise-done") != null);
+    try std.testing.expect(client.tools_changed.load(.acquire));
+}
+
+test "MCP: a tool's isError reaches the model as a tool error through the registry" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var client = try connectMock(&.{}, .{ .spawn = undefined });
+    defer client.close();
+    var registry = cc.tools_dynamic.DynRegistry.init(a);
+    defer registry.deinit();
+    var session = cc.mcp_registry_bridge.McpSession.init(a, &client);
+    defer session.deinit();
+    try session.registerToolsFromJson(&registry, "m", "{\"tools\":[{\"name\":\"toolerror\"}]}");
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.artifact_root = root;
+    var body = try registry.find("mcp__m__toolerror").?.execute(&ctx, "{}");
+    defer body.deinit(a);
+    try std.testing.expect(body == .structured_error);
+    try std.testing.expect(std.mem.indexOf(u8, body.structured_error.encoded, "tool said no") != null);
 }
 
 test "L2 MCP config: env, env_vars, the allowlist, cwd and enabled_tools reach the server" {

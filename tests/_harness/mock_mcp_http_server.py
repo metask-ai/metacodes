@@ -12,6 +12,8 @@ Paths select the server:
   /keepalive  a Classic server that answers initialize and tools/list over
             chunked SSE on a kept-alive connection and, like a Vercel edge,
             drops a request that asks for `Connection: close` unanswered.
+  /dropcall   /keepalive that reads a tools/call and closes the connection
+              without answering: the call executed, and nothing says so.
   /idleclose  /keepalive whose connections close 50 ms after each response,
             the way a server ends an idle keep-alive connection.
 Every observation records the client port (`conn`: one TCP connection each)
@@ -77,7 +79,10 @@ class Handler(BaseHTTPRequestHandler):
         params = message.get("params") or {}
         record(path=self.path, method=method, id=rid, headers=headers, has_meta="_meta" in params,
                conn=self.client_address[1], connection=headers.get("connection"))
-        if mode in ("keepalive", "idleclose"):
+        if mode == "dropcall" and method == "tools/call":
+            self.close_connection = True
+            return
+        if mode in ("keepalive", "idleclose", "dropcall"):
             return self.keepalive(mode, method, rid)
         if mode == "auth":
             return self.reply(401, {"error": "unauthorized"})

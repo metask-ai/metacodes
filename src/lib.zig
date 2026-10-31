@@ -191,7 +191,20 @@ pub const mcp_launch = @import("mcp/launch.zig");
 pub const mcp_naming = @import("mcp/naming.zig");
 pub const mcp_oauth = @import("mcp/oauth.zig");
 pub const mcp_url = @import("mcp/url.zig");
-pub const mcp_result_stream = @import("agentcore/mcp_result_stream.zig");
+pub const mcp_result_stream = @import("mcp/result_stream.zig");
+pub const mcp_canonical = @import("mcp/canonical.zig");
+pub const mcp_wire = @import("mcp/wire.zig");
+pub const mcp_negotiation = @import("mcp/negotiation.zig");
+pub const mcp_schema = @import("mcp/schema.zig");
+pub const mcp_host_transport = @import("mcp/host_transport.zig");
+pub const mcp_runtime = @import("mcp/runtime.zig");
+pub const mcp_instance_pool = @import("mcp/instance_pool.zig");
+pub const mcp_catalog = @import("mcp/catalog.zig");
+pub const mcp_test_support = @import("mcp/test_support.zig");
+pub const mcp_conformance = @import("mcp/conformance.zig");
+pub const mcp_tool_invocation = @import("mcp/tool_invocation.zig");
+pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
+pub const mcp_result_commit_test = @import("mcp/result_commit_test.zig");
 pub const sandbox_config = @import("sandbox/config.zig");
 
 // ── 协议(core ↔ UI 契约;实现自定义前端只需这几个)────────────────────────

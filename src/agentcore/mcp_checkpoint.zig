@@ -1,7 +1,7 @@
 //! Value-only MCP authority section stored inside a Session checkpoint.
 
 const std = @import("std");
-const canonical = @import("mcp_canonical.zig");
+const canonical = @import("metacodes-core").mcp_canonical;
 const mcp_session = @import("mcp_session.zig");
 
 pub const MAX_ENTRIES: usize = (canonical.Limits{}).max_tools;

@@ -192,6 +192,18 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
             hang_id = id;
             return;
         }
+        if (std.mem.eql(u8, tool, "noise")) {
+            // What a stream may carry before an answer: a notification, a
+            // late answer to another request, a non-JSON log line.
+            try writeStdoutAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n");
+            try writeStdoutAll("{\"jsonrpc\":\"2.0\",\"id\":999999,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"stale\"}]}}\n");
+            try writeResponse(alloc, id, "{\"content\":[{\"type\":\"text\",\"text\":\"noise-done\"}]}");
+            return;
+        }
+        if (std.mem.eql(u8, tool, "toolerror")) {
+            try writeResponse(alloc, id, "{\"content\":[{\"type\":\"text\",\"text\":\"tool said no\"}],\"isError\":true}");
+            return;
+        }
         if (std.mem.eql(u8, tool, "cancelled")) {
             const payload = try std.fmt.allocPrint(alloc,
                 \\{{"content":[{{"type":"text","text":"cancelled:{d}"}}]}}

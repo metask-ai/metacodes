@@ -183,6 +183,9 @@ const ERROR_MAP = [_]ErrorSpec{
     // MCP:本 session 一个 server 都没连 → 换参数无用;server 名不存在 → 换名可成功。
     .{ .name = "NoMcpSessions", .code = .capability_unsupported, .category = .system_error, .recoverable = false },
     .{ .name = "McpServerNotFound", .code = .invalid_args, .category = .user_error, .recoverable = true },
+    // The call left and no answer came: it may have executed, so repeating it
+    // blindly is not the safe default (doc/MCP_ARCHITECTURE.md, "Replay").
+    .{ .name = "McpOutcomeIndeterminate", .code = .io_error, .category = .system_error, .recoverable = false },
     // 连着的前端声明了渲染不了这类 UI 请求(doc/WIRE_PROTOCOL.md §2.2):同一调用在本
     // session 重试无用;它不是用户的拒绝,所以不归 permission_denied。
     .{ .name = "FrontendCannotRender", .code = .capability_unsupported, .category = .system_error, .recoverable = false },
