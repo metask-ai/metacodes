@@ -131,6 +131,7 @@ const SUBSYSTEMS = [_]Subsystem{
             "src/api/image_capability.zig",
             "src/api/last_error.zig",
             "src/api/model_adapter.zig",
+            "src/api/model_error.zig",
             "src/api/model_name.zig",
             "src/api/provider.zig",
             "src/api/request.zig",
