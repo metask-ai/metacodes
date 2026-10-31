@@ -1769,7 +1769,8 @@ than 2xx/400, and transport failures do not downgrade. No body-shape or string
 heuristic is used. Classic starts with an exact 2025-11 request. If that response
 selects 2025-06, Runtime closes the connection and reopens exact 2025-06 once.
 Only the final exact-era handshake may publish capabilities or create the
-operational client.
+operational client. The client is the repository's one MCP implementation
+([MCP_ARCHITECTURE.md](MCP_ARCHITECTURE.md)); these rules are its strict profile.
 
 The Host-owned Connector is also the MCP transport compliance boundary. Every
 successful `open` must create a connection context permanently bound to the

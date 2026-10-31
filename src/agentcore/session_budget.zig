@@ -2184,8 +2184,8 @@ test "bounded replacement allocation failure does not double-free the settled To
 }
 
 test "MCP reservation failure occurs before connector invocation" {
-    const fixture = @import("mcp_test_support.zig");
-    const mcp_catalog = @import("mcp_catalog.zig");
+    const fixture = core.mcp_test_support;
+    const mcp_catalog = core.mcp_catalog;
     var server = fixture.Server{};
     const binding = [_]u8{0x94} ** 32;
     const specs = [_]mcp_catalog.ServerSpec{.{
@@ -2248,8 +2248,8 @@ test "MCP reservation failure occurs before connector invocation" {
 
 test "oversized MCP success is promoted to the shared recoverable artifact plane" {
     const allocator = std.testing.allocator;
-    const fixture = @import("mcp_test_support.zig");
-    const mcp_catalog = @import("mcp_catalog.zig");
+    const fixture = core.mcp_test_support;
+    const mcp_catalog = core.mcp_catalog;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;

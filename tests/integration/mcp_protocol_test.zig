@@ -1,8 +1,9 @@
 //! MCP client protocol behaviour against the mock server's modes
 //! (tests/_harness/mock_mcp_server.zig): revision negotiation (2026-07-28
 //! discovery, Classic handshake fallback, restart after a fatal probe),
-//! server pings, pagination, MRTR, cancellation, and configuration reaching
-//! the child process.
+//! server pings, stale answers, pagination, MRTR, cancellation, and
+//! configuration reaching the child process. The same client's behaviour with
+//! no process in the way, under both entry-point profiles, is src/mcp/conformance.zig.
 
 const std = @import("std");
 const builtin = @import("builtin");

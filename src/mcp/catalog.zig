@@ -1,4 +1,5 @@
-//! Immutable Runtime MCP catalog generations for AgentCore Revision 7.
+//! Immutable MCP catalog generations: the shareable catalog and connection
+//! control plane (AgentCore's Runtime is its production consumer).
 //!
 //! A refresh builds a complete candidate snapshot off to the side and only
 //! then publishes one new generation. Sessions and Runs retain old snapshots,
@@ -6,11 +7,11 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
-const canonical = @import("mcp_canonical.zig");
-const runtime = @import("mcp_runtime.zig");
-const instance_pool = @import("mcp_instance_pool.zig");
-const schema = @import("mcp_schema.zig");
-const util_time = @import("metacodes-core").util_time;
+const canonical = @import("canonical.zig");
+const runtime = @import("runtime.zig");
+const instance_pool = @import("instance_pool.zig");
+const schema = @import("schema.zig");
+const util_time = @import("../util/time.zig");
 
 pub const Clock = struct {
     ctx: ?*const anyopaque = null,
@@ -43,9 +44,9 @@ pub const ServerSpec = struct {
     namespace: []const u8,
     configuration_fingerprint: [32]u8 = [_]u8{0} ** 32,
     connector: runtime.Connector,
-    transport: @import("mcp_negotiation.zig").Transport,
-    policy: @import("mcp_negotiation.zig").Policy = .auto,
-    client: @import("mcp_wire.zig").ClientInfo,
+    transport: @import("negotiation.zig").Transport,
+    policy: @import("negotiation.zig").Policy = .auto,
+    client: @import("wire.zig").ClientInfo,
     timeout_ms: u32 = 30_000,
     protocol_limits: canonical.Limits = .{},
 };
@@ -351,9 +352,9 @@ const OwnedSpec = struct {
     namespace: []const u8,
     configuration_fingerprint: [32]u8,
     connector: runtime.Connector,
-    transport: @import("mcp_negotiation.zig").Transport,
-    policy: @import("mcp_negotiation.zig").Policy,
-    client: @import("mcp_wire.zig").ClientInfo,
+    transport: @import("negotiation.zig").Transport,
+    policy: @import("negotiation.zig").Policy,
+    client: @import("wire.zig").ClientInfo,
     timeout_ms: u32,
     protocol_limits: canonical.Limits,
 
@@ -1290,7 +1291,7 @@ fn allZero(value: []const u8) bool {
     return true;
 }
 
-const test_support = @import("mcp_test_support.zig");
+const test_support = @import("test_support.zig");
 
 const Fake = struct {
     server: test_support.Server = .{},
@@ -2096,4 +2097,123 @@ test "catalog configuration rejects duplicate identity and unsafe namespace" {
         ),
     );
     try std.testing.expectEqual(@as(u32, 0), fake.server.opens);
+}
+
+test "a configuration update during an active invocation leaves that call on its own connection" {
+    const fixture = @import("test_support.zig");
+    const allocator = std.testing.allocator;
+    var old_server = fixture.Server{ .tool_name = "weather" };
+    var new_server = fixture.Server{ .tool_name = "weather" };
+    const binding = [_]u8{0x7a} ** 32;
+    const spec = struct {
+        fn make(server: *fixture.Server, fingerprint: u8) ServerSpec {
+            return .{
+                .binding = binding,
+                .namespace = "weather",
+                .configuration_fingerprint = [_]u8{fingerprint} ** 32,
+                .connector = server.connector(),
+                .transport = .stdio,
+                .client = .{ .name = "catalog-test", .version = "1" },
+            };
+        }
+    }.make;
+    var manager = try Manager.init(allocator, &.{spec(&old_server, 1)}, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+
+    const Update = struct {
+        manager: *Manager,
+        replacement: ServerSpec,
+        report: ?ApplyReport = null,
+
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.report = self.manager.apply(1, &.{self.replacement}) catch null;
+        }
+    };
+    var update = Update{ .manager = &manager, .replacement = spec(&new_server, 2) };
+    old_server.during_call = .{ .ctx = &update, .run = Update.run };
+
+    const old_snapshot = try manager.retainCurrent();
+    var lease = try old_snapshot.retainInstance(old_snapshot.servers[0].instance_id);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const tool = &old_snapshot.servers[0].admitted_tools[0].canonical;
+
+    var result = lease.client().callToolBody(
+        allocator,
+        root,
+        .{},
+        tool,
+        "{\"city\":\"Paris\"}",
+        null,
+    );
+    defer if (result == .result) result.result.deinit(allocator);
+    // The update happened while the call was in flight, and took effect.
+    try std.testing.expectEqual(ApplyDisposition.applied, update.report.?.disposition);
+    try std.testing.expect(result == .result);
+    try std.testing.expectEqual(@as(u32, 1), old_server.calls);
+    try std.testing.expectEqual(@as(u32, 0), new_server.calls);
+    // The replaced connection outlives what still uses it, and no longer.
+    try std.testing.expect(old_server.opens > old_server.closes);
+    lease.deinit();
+    old_snapshot.release();
+    try std.testing.expectEqual(old_server.opens, old_server.closes);
+
+    // A new Run reaches the new connection, under a new permission identity.
+    const current = try manager.retainCurrent();
+    defer current.release();
+    var new_lease = try current.retainInstance(current.servers[0].instance_id);
+    defer new_lease.deinit();
+    old_server.during_call = null;
+    var next = new_lease.client().callToolBody(
+        allocator,
+        root,
+        .{},
+        &current.servers[0].admitted_tools[0].canonical,
+        "{\"city\":\"Paris\"}",
+        null,
+    );
+    defer if (next == .result) next.result.deinit(allocator);
+    try std.testing.expect(next == .result);
+    try std.testing.expectEqual(@as(u32, 1), new_server.calls);
+    try std.testing.expectEqual(@as(u32, 1), old_server.calls);
+}
+
+test "two servers keep separate connections, credentials and failures" {
+    const fixture = @import("test_support.zig");
+    const allocator = std.testing.allocator;
+    var healthy = fixture.Server{ .tool_name = "weather" };
+    var down = fixture.Server{ .tool_name = "calendar", .available = false };
+    const specs = [_]ServerSpec{
+        .{
+            .binding = [_]u8{0x7b} ** 32,
+            .namespace = "weather",
+            .connector = healthy.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "catalog-test", .version = "1" },
+        },
+        .{
+            .binding = [_]u8{0x7c} ** 32,
+            .namespace = "calendar",
+            .connector = down.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "catalog-test", .version = "1" },
+        },
+    };
+    var manager = try Manager.init(allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+    // The failure is the one server's issue, and the other's catalog is whole.
+    try std.testing.expectEqual(@as(usize, 1), snapshot.servers.len);
+    try std.testing.expectEqualStrings("weather", snapshot.servers[0].namespace);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.issues.len);
+    try std.testing.expectEqualSlices(u8, &specs[1].binding, &snapshot.issues[0].server_binding_identity);
+    // A connector only ever opens for its own server.
+    try std.testing.expectEqual(@as(u32, 0), down.opens);
+    try std.testing.expect(healthy.opens > 0);
 }

@@ -35,6 +35,8 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 - [Core hot-swap](CORE_PLUGIN_HOTSWAP.md) — first-party profiles and cache rules.
 - [Skills and MCP servers](SKILLS_AND_MCP.md) — Skill and MCP discovery from
   metacodes, Claude Code and Codex directories; MCP 2026-07-28 client.
+- [MCP architecture](MCP_ARCHITECTURE.md) — the one protocol client behind the
+  CLI, library consumers and AgentCore; retained differences, replay rules.
 - [Sealed Skill Protocol](SEALED_SKILL_PROTOCOL.md) — SSP/1: a Skill that
   runs on a gateway with its tool calls executed, approved and paid for on
   the client; `metacodes sealed install|list|bind|unbind|ledger|serve`.

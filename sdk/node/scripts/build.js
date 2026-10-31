@@ -9,7 +9,9 @@
 // libmetask_agentcore.*, rg, ripgrep-LICENSE-MIT}.
 // The addon is compiled with `zig cc` against this Node's own Node-API headers
 // (<node prefix>/include/node, or NODE_INCLUDE_DIR) and the repository's
-// sdk/metask/agentcore.h. Without --bundle only the addon is built.
+// sdk/metask/agentcore.h. Without --bundle only the addon is built. A bundle must
+// be the AgentCore release this package declares (scripts/verify_bundle.js), and
+// --release refuses a development one, before anything is compiled.
 
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
@@ -29,6 +31,15 @@ if (process.platform === 'win32') {
 }
 
 const bundle = argument('--bundle');
+if (bundle) {
+  const { verifyBundle } = require('./verify_bundle.js');
+  try {
+    verifyBundle(bundle, { release: process.argv.includes('--release') });
+  } catch (error) {
+    console.error(`metacodes: cannot package ${bundle}: ${error.message}`);
+    process.exit(1);
+  }
+}
 const out = path.resolve(argument('--out') || path.join(here, 'prebuilds', `${process.platform}-${process.arch}`));
 const zig = process.env.ZIG || 'zig';
 const nodeInclude = process.env.NODE_INCLUDE_DIR || path.join(path.dirname(process.execPath), '..', 'include', 'node');

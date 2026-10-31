@@ -203,6 +203,8 @@ receipt 或 bounded structured error。两种 executor 不能同时存在，也�
 `mcp_result_stream.project` 与 `mcp_runtime.Client.callToolBody` 现在都把调用方的
 `result_budget.Budget` 列为必填参数,嵌入者须逐字传 `ctx.result_budget`。这是自
 `010e0f9` / `7311295` 起的 breaking signature change。
+所有入口共用同一个 MCP client;`mcp_runtime.Client` 的中断参数是 `?*const AbortSignal`,
+模块布局与保留差异见 [MCP_ARCHITECTURE.md](MCP_ARCHITECTURE.md)。
 
 首方 byte-zero 工具为 `Glob`、`Grep`、`CodeMap`、`FindSymbol`、`Bash`、
 `ListMcpResourcesTool`、`ReadMcpResourceTool` 和 `WebFetch`。Bash 的 JobRegistry、

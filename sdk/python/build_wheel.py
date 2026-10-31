@@ -8,6 +8,11 @@ The wheel carries the package sources plus, under ``metacodes/_lib/``, the
 bundle's shared library, its ripgrep and their licenses. It is built with the
 standard library only (no setuptools/wheel), deterministically: fixed
 timestamps, sorted entries, so the same inputs give the same bytes.
+
+The package sources and metadata come from this checkout and the library from
+the bundle, so the build refuses unless both are one AgentCore release
+(`agentcore_release.verify_package_inputs`). The wheel takes its version from the
+bundle's manifest, and `--release` also refuses a development bundle.
 """
 
 from __future__ import annotations
@@ -15,7 +20,6 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import json
 import re
 import sys
 import zipfile
@@ -24,8 +28,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 PACKAGE = "metacodes"
-SOURCE = HERE / "src" / PACKAGE
 EPOCH = (2026, 1, 1, 0, 0, 0)
+
+sys.path.insert(0, str(REPO / "scripts"))
+import agentcore_contract  # noqa: E402  (repository tooling; the wheel does not ship it)
+import agentcore_release  # noqa: E402
 
 SUMMARY = "Embed the metacodes agent runtime (AgentCore C ABI) in Python"
 
@@ -64,18 +71,20 @@ def record_hash(data: bytes) -> str:
     return "sha256=" + digest.decode("ascii")
 
 
-def build(bundle: Path, out_dir: Path, tag_override: str = "") -> Path:
-    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
-    shared = manifest.get("shared_library") or {}
-    library = bundle / shared.get("path", "")
-    if not shared or not library.is_file():
-        raise SystemExit("bundle has no shared library: %s" % bundle)
-    version = python_version((REPO / "sdk" / "VERSION").read_text(encoding="utf-8"))
+def build(bundle: Path, out_dir: Path, tag_override: str = "", formal: bool = False, root: Path = REPO) -> Path:
+    try:
+        manifest = agentcore_release.verify_package_inputs(bundle, root, formal)
+    except ValueError as error:
+        raise SystemExit("cannot package %s: %s" % (bundle, error))
+    library = bundle / manifest["shared_library"]["path"]
+    base, development = agentcore_contract.base_of_built(manifest["version"])
+    version = python_version(base + ("-dev" if development else ""))
     tag = tag_override or platform_tag(manifest["target"])
+    source = root / "sdk" / "python" / "src" / PACKAGE
 
     files = {}
-    for path in sorted(SOURCE.rglob("*.py")):
-        files["%s/%s" % (PACKAGE, path.relative_to(SOURCE).as_posix())] = (path.read_bytes(), 0o644)
+    for path in sorted(source.rglob("*.py")):
+        files["%s/%s" % (PACKAGE, path.relative_to(source).as_posix())] = (path.read_bytes(), 0o644)
     files["%s/_lib/%s" % (PACKAGE, library.name)] = (library.read_bytes(), 0o755)
     for asset in sorted((bundle / "bin").glob("*")):
         if asset.is_file():
@@ -83,8 +92,8 @@ def build(bundle: Path, out_dir: Path, tag_override: str = "") -> Path:
             files["%s/_lib/%s" % (PACKAGE, asset.name)] = (asset.read_bytes(), mode)
 
     dist_info = "%s-%s.dist-info" % (PACKAGE, version)
-    files["%s/licenses/LICENSE" % dist_info] = ((REPO / "LICENSE").read_bytes(), 0o644)
-    readme = (HERE / "README.md").read_text(encoding="utf-8")
+    files["%s/licenses/LICENSE" % dist_info] = ((root / "LICENSE").read_bytes(), 0o644)
+    readme = (root / "sdk" / "python" / "README.md").read_text(encoding="utf-8")
     metadata = "\n".join(
         [
             "Metadata-Version: 2.1",
@@ -128,8 +137,9 @@ def main(argv=None) -> int:
     parser.add_argument("--bundle", required=True, type=Path, help="AgentCore bundle directory (holds manifest.json)")
     parser.add_argument("--out", required=True, type=Path, help="output directory for the wheel")
     parser.add_argument("--platform-tag", default="", help="override the wheel platform tag")
+    parser.add_argument("--release", action="store_true", help="formal release: refuse a development bundle")
     args = parser.parse_args(argv)
-    print(build(args.bundle.resolve(), args.out, args.platform_tag))
+    print(build(args.bundle.resolve(), args.out, args.platform_tag, args.release))
     return 0
 
 

@@ -38,6 +38,12 @@
 //! `reuse_idle_ms` of its last use (servers close idle ones; Node's default
 //! is 5 s), and a request that finds the reused connection already closed,
 //! before a single response byte, is sent again on a new one.
+//!
+//! That retry is a replay when the body went out: the server may have read it
+//! and acted before the connection died, and nothing on the wire tells those
+//! cases apart. So `tools/call` is retried only when its body was never fully
+//! written, and otherwise reports `request_written`; to keep that rare it does
+//! not reuse a connection idle longer than `TOOL_CALL_REUSE_IDLE_MS`.
 
 const std = @import("std");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
@@ -60,13 +66,26 @@ pub const SendMeta = struct {
     name: ?[]const u8 = null,
     /// `Mcp-Param-*` headers mirrored from `x-mcp-header` tool arguments.
     param_headers: []const Header = &.{},
+    kind: Kind = .request,
+
+    pub const Kind = enum { request, notification, response };
 };
+
+/// A `tools/call` may have effects, so it is never sent twice: a POST that
+/// failed after its body went out may have executed. Every other method this
+/// client sends is safe to repeat.
+fn repeatable(meta: SendMeta) bool {
+    return !std.mem.eql(u8, meta.method, "tools/call");
+}
 
 const MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024 + 1024 * 1024;
 
 /// How long an idle pooled connection stays reusable (below Node's 5 s
 /// keep-alive default).
 pub const REUSE_IDLE_MS: i64 = 4_000;
+/// The same window for a `tools/call`, which cannot be retried once its body
+/// is out: a fresh connection costs less than a lost answer.
+pub const TOOL_CALL_REUSE_IDLE_MS: i64 = 1_000;
 /// How long the next request waits, in silence, for an answered SSE stream
 /// to end so its connection can be reused (the monitor ticks every 250 ms).
 const SETTLE_IDLE_MS: u64 = 250;
@@ -111,6 +130,8 @@ pub const HttpTransport = struct {
     last_event_id: ?[]u8 = null,
     /// The server's `retry:` delay for that stream (ms).
     retry_ms: ?u64 = null,
+    /// The last POST's body went out whole, so the server may have acted on it.
+    request_written: bool = false,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -272,8 +293,8 @@ pub const HttpTransport = struct {
             if (failure != error.Eof and failure != error.McpConnectFailed) return failure;
             // The stream ended without the awaited response. Classic servers
             // that numbered their events replay the rest on a GET with
-            // `Last-Event-ID`; in 2026-07-28 the request is lost and must be
-            // re-issued by the caller.
+            // `Last-Event-ID`; in 2026-07-28 the answer is lost, and whether
+            // the request executed is unknown to anyone here.
             if (self.modern or self.last_event_id == null or resumes >= MAX_RESUME_ATTEMPTS) return failure;
             resumes += 1;
             const delay = @min(self.retry_ms orelse DEFAULT_RETRY_MS, MAX_RETRY_MS);
@@ -424,6 +445,7 @@ pub const HttpTransport = struct {
     }
 
     fn postOnce(self: *HttpTransport, json: []const u8, meta: SendMeta) !*Exchange {
+        self.request_written = false;
         if (self.abort) |abort| if (abort.isAborted()) return error.Aborted;
         if (self.deadline_ms) |deadline| if (util_time.nowMs() >= deadline) return error.Timeout;
 
@@ -446,7 +468,8 @@ pub const HttpTransport = struct {
             try extra.appendSlice(scratch.allocator(), common.items);
         }
 
-        if (util_time.nowMs() - self.last_used_ms > self.reuse_idle_ms and self.idleConnections() != 0)
+        const idle_limit = if (repeatable(meta)) self.reuse_idle_ms else @min(self.reuse_idle_ms, TOOL_CALL_REUSE_IDLE_MS);
+        if (util_time.nowMs() - self.last_used_ms > idle_limit and self.idleConnections() != 0)
             self.dropIdleConnections();
 
         var redirect: [4096]u8 = undefined;
@@ -455,20 +478,25 @@ pub const HttpTransport = struct {
             const reusing = self.idleConnections() != 0;
             const exchange = try self.open(extra.items);
             if (exchange.exchangeHead(json, &redirect)) |_| break exchange else |err| {
+                const written = exchange.body_written;
                 // This connection cannot carry another request either.
                 if (exchange.request.connection) |connection| connection.closing = true;
                 exchange.destroy(self);
-                // Closed before a single response byte: the server dropped an
-                // idle connection we reused and never read this request.
+                // Closed before a single response byte: most likely the server
+                // dropped an idle connection we reused and never read this
+                // request. Most likely is enough only for what may be repeated.
                 const stale = err == error.HttpConnectionClosing or err == error.WriteFailed;
-                if (reusing and stale and stale_retries < MAX_STALE_RETRIES and !self.interrupted()) {
+                const safe = !written or repeatable(meta);
+                if (reusing and stale and safe and stale_retries < MAX_STALE_RETRIES and !self.interrupted()) {
                     stale_retries += 1;
                     continue;
                 }
+                self.request_written = written;
                 return self.transportError();
             }
         };
         errdefer exchange.destroy(self);
+        self.request_written = true;
         const status = http_status.ResponseStatus.capture(&exchange.response).code;
         exchange.status = status;
         const head = exchange.response.head;
@@ -559,6 +587,8 @@ const Exchange = struct {
     request: std.http.Client.Request,
     response: std.http.Client.Response = undefined,
     has_response: bool = false,
+    /// The request body went out whole: the server may have acted on it.
+    body_written: bool = false,
     /// The captured HTTP status (`http_status.ResponseStatus`), 0 before.
     status: u16 = 0,
     registered: bool = false,
@@ -584,6 +614,7 @@ const Exchange = struct {
     /// Send `json` and read the response head.
     fn exchangeHead(self: *Exchange, json: []const u8, redirect: []u8) !void {
         try http_connection.sendBodyComplete(&self.request, @constCast(json));
+        self.body_written = true;
         self.response = try self.request.receiveHead(redirect);
         self.has_response = true;
     }

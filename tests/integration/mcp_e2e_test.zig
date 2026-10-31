@@ -329,7 +329,7 @@ test "MCP unhinted read clears stale detail after Zig error" {
     const last_err = parsed.value.object.get("last_err") orelse
         return error.MissingLastResourceError;
     try std.testing.expect(last_err == .string);
-    try std.testing.expectEqualStrings("McpServerCrashed", last_err.string);
+    try std.testing.expectEqualStrings("McpInstanceUnavailable", last_err.string);
     try std.testing.expect(parsed.value.object.get("last_error_detail") == null);
 }
 

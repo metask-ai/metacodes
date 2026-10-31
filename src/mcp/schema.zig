@@ -1,7 +1,7 @@
 //! MCP schema envelope admission and provider projection.
 //!
 //! Canonical MCP catalogs retain the complete wire schema in
-//! `mcp_canonical.Tool`. AgentCore deliberately does not implement a local
+//! `canonical.Tool`. AgentCore deliberately does not implement a local
 //! multi-dialect JSON Schema validator: `$schema` is retained as provenance,
 //! but never decides Tool availability. This module enforces bounded JSON
 //! structure, the MCP input-object envelope, and the common provider
@@ -9,9 +9,10 @@
 //! authority for JSON Schema semantics.
 
 const std = @import("std");
-const core = @import("metacodes-core");
-const canonical = @import("mcp_canonical.zig");
-const json = @import("mcp_json.zig");
+const ToolDefinition = @import("../json.zig").ToolDefinition;
+const InputSchema = @import("../json.zig").InputSchema;
+const canonical = @import("canonical.zig");
+const json = @import("json_admission.zig");
 
 pub const Limits = struct {
     max_schema_bytes: usize = (canonical.Limits{}).max_schema_bytes,
@@ -53,7 +54,7 @@ pub const Admission = union(enum) {
 
 pub const PreparedTool = struct {
     arena: std.heap.ArenaAllocator,
-    definition: core.json.ToolDefinition,
+    definition: ToolDefinition,
 
     pub fn deinit(self: *PreparedTool) void {
         self.arena.deinit();
@@ -89,6 +90,41 @@ fn admitJsonStructure(
         .max_container_entries = limits.max_container_entries,
         .max_work_units = limits.max_work_units,
     });
+}
+
+/// The same provider projection for a catalog that admits tools leniently (the
+/// product CLI, which registers what a real server lists): root `type` fixed to
+/// object, `properties` borrowed as they are, `required` keeping only strings,
+/// `additionalProperties` only a boolean. A missing or non-object schema is an
+/// empty object schema. Everything borrowed lives in `arena`.
+pub fn projectInputLenient(arena: std.mem.Allocator, value: ?std.json.Value) error{OutOfMemory}!InputSchema {
+    const schema_value = value orelse return .{ .type = "object" };
+    if (schema_value != .object) return .{ .type = "object" };
+    const object = schema_value.object;
+    const properties: ?std.json.ObjectMap = if (object.get("properties")) |found|
+        (if (found == .object) found.object else null)
+    else
+        null;
+    var required: []const []const u8 = &.{};
+    if (object.get("required")) |found| if (found == .array) {
+        const names = try arena.alloc([]const u8, found.array.items.len);
+        var count: usize = 0;
+        for (found.array.items) |item| if (item == .string) {
+            names[count] = item.string;
+            count += 1;
+        };
+        required = names[0..count];
+    };
+    const additional: ?bool = if (object.get("additionalProperties")) |found|
+        (if (found == .bool) found.bool else null)
+    else
+        null;
+    return .{
+        .type = "object",
+        .properties = properties,
+        .required = required,
+        .additional_properties = additional,
+    };
 }
 
 /// Build the provider-visible Tool definition from the canonical schema.

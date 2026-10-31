@@ -2247,6 +2247,24 @@ pub fn build(b: *std.Build) void {
     const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
     lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test).step);
 
+    // test:mcp —— #405: the shared MCP client alone, with no CLI, AgentCore or
+    // AgentLoop in its graph. Same shape and reason as test:provider below; its
+    // tests also run in the main suites, this is the proof of independence.
+    const mcp_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/mcp_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, mcp_test_mod);
+    const mcp_test = b.addTest(.{
+        .name = "mcp-test",
+        .root_module = mcp_test_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
+    const mcp_test_step = b.step("test:mcp", "Test the shared MCP client in isolation (#405)");
+    mcp_test_step.dependOn(&addTestRunArtifact(b, mcp_test).step);
+
     // test:provider —— issue #16 provider offer kernel, in isolation.
     // Compiles the subsystem from a narrow root, which proves it *builds*
     // standalone. It does not enforce the import boundary — the module root is
@@ -2289,7 +2307,7 @@ pub fn build(b: *std.Build) void {
     });
     const subsystem_boundary_step = b.step(
         "subsystem:boundary",
-        "Enforce the provider and picker import boundaries (issue #16)",
+        "Enforce the provider, picker and MCP client import boundaries (#16, #405)",
     );
     subsystem_boundary_step.dependOn(&subsystem_boundary_run.step);
     subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit).step);
@@ -2435,6 +2453,7 @@ pub fn build(b: *std.Build) void {
     units_test_step.dependOn(http_status_gate_step);
     units_test_step.dependOn(subsystem_boundary_step);
     units_test_step.dependOn(provider_test_step);
+    units_test_step.dependOn(mcp_test_step);
     units_test_step.dependOn(picker_test_step);
     units_test_step.dependOn(lsp_test_step);
     units_test_step.dependOn(platform_test_step);
