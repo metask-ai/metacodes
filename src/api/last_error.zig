@@ -17,6 +17,9 @@
 //!       client.reportServerError(OpenAI chat / Responses / Gemini 流内的服务端报错,与 Anthropic
 //!       错误帧同名"API 错误帧")。
 //!
+//! 写入前调用方已按本次请求的凭据掩码(client.reportHttpFailure / reportServerError /
+//! reportRedirect、stream error_event):这里只洗控制字节,不认识密钥。
+//!
 //! 已知缺口(记录缺失时 UI 回退通用文案,不会错报):
 //! - mid-stream 读错误(200 后半途断连,ReadFailed 类,**非** stall)不经此处,现场只在日志;
 //! - 进程级单例:并发 subagent 的错误可能相互覆盖——此摘要是"进程最近一次 API 错误",

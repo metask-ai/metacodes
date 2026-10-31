@@ -47,6 +47,7 @@ const util_json = @import("../util/json.zig");
 const api_stream = @import("stream.zig");
 const provider_mod = @import("provider.zig");
 const client_mod = @import("../client.zig");
+const model_error = @import("model_error.zig");
 const liveness_reader = @import("liveness_reader.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
@@ -451,7 +452,7 @@ pub const OpenAIClient = struct {
         if (!status.isOk()) {
             var location_buf: [http_status.REDIRECT_LOCATION_BYTES]u8 = undefined;
             if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
-                client_mod.reportRedirect("openai", rid, status, location);
+                client_mod.reportRedirect("openai", rid, status, location, auth.value);
                 return error.RequestFailed;
             }
             var err_body: [4096]u8 = undefined;
@@ -462,8 +463,7 @@ pub const OpenAIClient = struct {
             );
             const n = body_reader.readSliceShort(err_body[0..]) catch 0;
             const preview = err_body[0..@min(n, err_body.len)];
-            log.errId("openai", rid, "HTTP {d} {s}: body={s}", .{ status.code, status.name, preview });
-            client_mod.reportHttpFailure(status.code, preview);
+            client_mod.reportHttpFailure("openai", rid, status, preview, err_body.len, auth.value);
             if (status.code == 401 and containsMetaskTokenExpired(preview)) {
                 preserve_placeholder_ids = true;
                 return error.TokenExpired;
@@ -486,6 +486,7 @@ pub const OpenAIClient = struct {
             .abort = abort,
             .abort_registry = &self.abort_registry,
             .id = rid,
+            .credential = client_mod.credentialPrint(auth.value),
             .http_status = status.code,
             .retry_attempt = retry_attempt,
             .server_request_id = self.server_request_id,
@@ -565,6 +566,8 @@ const OpenAIStream = struct {
     abort: ?*const AbortSignal = null,
     abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
+    /// What an error frame in this stream must not repeat.
+    credential: ?model_error.SecretPrint,
     http_status: u16 = 0,
     retry_attempt: u32 = 0,
     server_request_id: [256]u8 = undefined,
@@ -827,7 +830,7 @@ const OpenAIStream = struct {
         // 答复被当成断流。现在按服务端声明的失败上抛。
         if (util_json.topLevelObjectField(data, "error")) |err_obj| {
             self.done = true;
-            client_mod.reportServerError("openai", self.id, err_obj);
+            client_mod.reportServerError("openai", self.id, err_obj, self.credential);
             return error.ApiError;
         }
         // usage 只在**值为 object** 时存在(见 chatUsageObject)。include_usage 下每个普通
@@ -985,7 +988,7 @@ const OpenAIStream = struct {
             const err_obj = util_json.topLevelObjectField(response, "error") orelse
                 util_json.topLevelObjectField(data, "error") orelse data;
             self.done = true;
-            client_mod.reportServerError("openai", self.id, err_obj);
+            client_mod.reportServerError("openai", self.id, err_obj, self.credential);
             return error.ApiError;
         }
         return null; // 其它 typed 事件(created/in_progress/output_text.done 等):忽略
@@ -2606,6 +2609,7 @@ fn replaySse(a: std.mem.Allocator, model: []const u8, protocol: types.OpenAIProt
         .request = undefined, // 固定 reader 直驱:不建 HTTP 请求,releaseParseState 不碰它
         .response = undefined,
         .id = .{ .bytes = .{0} ** 12 },
+        .credential = null,
     };
     defer stream.releaseParseState();
     var body = std.Io.Reader.fixed(sse);
@@ -2944,6 +2948,7 @@ fn replayUntilError(a: std.mem.Allocator, protocol: types.OpenAIProtocol, sse: [
         .request = undefined,
         .response = undefined,
         .id = .{ .bytes = .{0} ** 12 },
+        .credential = null,
     };
     defer stream.releaseParseState();
     var body = std.Io.Reader.fixed(sse);
@@ -3098,6 +3103,7 @@ test "issue #269 chat: a cancelled stream's leftover [DONE] is Aborted, not Stre
         .request = undefined,
         .response = undefined,
         .id = .{ .bytes = .{0} ** 12 },
+        .credential = null,
         .abort = &signal,
     };
     defer stream.releaseParseState();

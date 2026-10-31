@@ -58,6 +58,8 @@ pub const StreamResult = struct {
     server_request_id_len: usize = 0,
     http_status: u16 = 0,
     retry_attempt: u32 = 0,
+    /// What an error frame in this stream must not repeat.
+    credential: ?model_error.SecretPrint,
 };
 
 /// 网络瞬态错误判定:服务端关连接(keep-alive 回收/LB 断连)、连接重置、读到 EOF 等。
@@ -364,12 +366,20 @@ pub fn reportHeadStall(comptime module: []const u8, rid: log.RequestId, stall: p
 /// A 3xx to a request that carries a key is the answer, not a hop
 /// (`http_status.no_redirects`). Say where it points: the fix is to use that
 /// URL as the endpoint, and "HTTP 302" alone does not say so. Shared by the
-/// three provider clients; overwrites the generic HTTP record.
-pub fn reportRedirect(comptime module: []const u8, rid: log.RequestId, status: ResponseStatus, location: []const u8) void {
-    log.errId(module, rid, "HTTP {d} {s}: redirect to {s} not followed: the request carries a credential", .{ status.code, status.name, location });
-    var buf: [400]u8 = undefined;
-    const detail = std.fmt.bufPrint(&buf, "HTTP {d} → {s};带凭据的请求不跟随重定向,请把端点(--base-url)改成重定向后的地址", .{ status.code, location }) catch "带凭据的请求不跟随重定向";
-    last_error.recordNamed("端点重定向", detail);
+/// three provider clients; overwrites the generic HTTP record. `credential` is
+/// the auth header value the request carried: a server that echoes it in the
+/// URL does not get it into the log or onto the screen.
+pub fn reportRedirect(comptime module: []const u8, rid: log.RequestId, status: ResponseStatus, location: []const u8, credential: []const u8) void {
+    var masked: model_error.MaskedLocation = .{};
+    var buf: [@sizeOf(model_error.MaskedLocation) + 256]u8 = undefined;
+    const detail = if (model_error.maskLocation(&masked, location, credentialSecret(credential))) |target| blk: {
+        log.errId(module, rid, "HTTP {d} {s}: redirect to {s} not followed: the request carries a credential", .{ status.code, status.name, target });
+        break :blk std.fmt.bufPrint(&buf, "HTTP {d} → {s};带凭据的请求不跟随重定向,请把端点(--base-url)改成重定向后的地址", .{ status.code, target });
+    } else blk: {
+        log.errId(module, rid, "HTTP {d} {s}: redirect to a URL too long to report not followed: the request carries a credential", .{ status.code, status.name });
+        break :blk std.fmt.bufPrint(&buf, "HTTP {d} → 地址过长,未显示;带凭据的请求不跟随重定向,请把端点(--base-url)改成重定向后的地址", .{status.code});
+    };
+    last_error.recordNamed("端点重定向", detail catch "带凭据的请求不跟随重定向");
     model_error.noteRedirect(status.code, location);
 }
 
@@ -415,23 +425,41 @@ pub fn noteConnectFailure(err: anyerror) void {
 /// `response.failed` / `error` 事件)的统一交代:日志 + last_error 现场,与 Anthropic 错误帧
 /// (stream.zig `.error_event`)同一个名字。调用方随后返回 `error.ApiError`——它是服务端的答复,
 /// 不是断连(`RequestFailed`),agent_loop 不会为它兜底重发。
-pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_obj: []const u8) void {
-    log.warnId(module, rid, "API error in stream: {s}", .{err_obj});
-    last_error.recordNamed("API 错误帧", err_obj);
+///
+/// `credential` is what the stream's request carried: a server that echoes it in
+/// the frame does not get it into the log or onto the screen.
+pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_obj: []const u8, credential: ?model_error.SecretPrint) void {
+    var masked: model_error.MaskedFailure = .{};
+    const shown = model_error.maskFailure(&masked, err_obj, credential);
+    log.warnId(module, rid, "API error in stream: {s}", .{shown});
+    last_error.recordNamed("API 错误帧", shown);
     model_error.noteStreamError(err_obj);
 }
 
 /// A non-2xx answer the provider client has read the body of, for every sink
-/// that wants it.
-pub fn reportHttpFailure(status: u16, body: []const u8) void {
-    last_error.recordHttp(status, body);
-    model_error.noteHttpFailure(status, body);
+/// that wants it. `read_bound` is the size of the buffer it was read into: a
+/// body that filled it may end in part of the credential. `credential` is the
+/// auth header value the request carried.
+pub fn reportHttpFailure(comptime module: []const u8, rid: log.RequestId, status: ResponseStatus, body: []const u8, read_bound: usize, credential: []const u8) void {
+    const print = credentialPrint(credential);
+    const kept = if (body.len >= read_bound) model_error.withoutCutCredential(body, print) else body;
+    var masked: model_error.MaskedFailure = .{};
+    const shown = model_error.maskFailure(&masked, kept, print);
+    log.errId(module, rid, "HTTP {d} {s}: body={s}", .{ status.code, status.name, shown });
+    last_error.recordHttp(status.code, shown);
+    model_error.noteHttpFailure(status.code, kept);
 }
 
 /// The secret part of an auth header value: `Bearer <key>` or the bare key.
 fn credentialSecret(header_value: []const u8) []const u8 {
     const space = std.mem.lastIndexOfScalar(u8, header_value, ' ') orelse return header_value;
     return header_value[space + 1 ..];
+}
+
+/// What a stream keeps of the credential its request carried, to recognize it in
+/// a later error frame: never its bytes, which a key update must not leave behind.
+pub fn credentialPrint(header_value: []const u8) ?model_error.SecretPrint {
+    return model_error.SecretPrint.of(credentialSecret(header_value));
 }
 
 /// The response head of a provider request, while its bytes are still valid.
@@ -1211,11 +1239,16 @@ pub const Client = struct {
             .failure => |failure| {
                 // The head's bytes are reused by the body read below.
                 var location_buf: [@import("api/http_status.zig").REDIRECT_LOCATION_BYTES]u8 = undefined;
-                const redirected_to = copyRedirectLocation(&http_response, &location_buf);
-                // Read every error body exactly once while the request reader is alive. Cleanup
-                // remains with the surrounding errdefers; do not deinit/destroy here.
-                const body_info = logErrorBody(req_ptr, rid, status, http_response);
-                if (redirected_to) |location| reportRedirect("client", rid, status, location);
+                if (copyRedirectLocation(&http_response, &location_buf)) |location| {
+                    // Unread, as in the other two clients: the report says where it
+                    // points, and a 3xx body only repeats that.
+                    reportRedirect("client", rid, status, location, auth.value);
+                    client.last_context_window_numbers = .{};
+                    return resolveHttpFailure(failure, .{});
+                }
+                // Read every other error body exactly once while the request reader is alive.
+                // Cleanup remains with the surrounding errdefers; do not deinit/destroy here.
+                const body_info = logErrorBody(req_ptr, rid, status, http_response, auth.value);
                 client.last_context_window_numbers = body_info.context_window_numbers;
                 return resolveHttpFailure(failure, body_info);
             },
@@ -1239,6 +1272,7 @@ pub const Client = struct {
                     .server_request_id = client.server_request_id,
                     .server_request_id_len = client.server_request_id_len,
                     .http_status = status.code,
+                    .credential = credentialPrint(auth.value),
                 },
             };
             return;
@@ -1471,6 +1505,7 @@ fn logErrorBody(
     rid: log.RequestId,
     status: ResponseStatus,
     http_response: http.Client.Response,
+    credential: []const u8,
 ) ErrorBodyInfo {
     var err_body: [2048]u8 = undefined;
     const body_reader_tmp = req_ptr.reader.bodyReader(
@@ -1480,10 +1515,7 @@ fn logErrorBody(
     );
     const n = body_reader_tmp.readSliceShort(err_body[0..]) catch 0;
     const preview = err_body[0..@min(n, err_body.len)];
-    log.errId("client", rid, "HTTP {d} {s}: body={s}", .{
-        status.code, status.name, preview,
-    });
-    reportHttpFailure(status.code, preview);
+    reportHttpFailure("client", rid, status, preview, err_body.len, credential);
     const context_window_exceeded = error_class.isContextWindowExceeded(preview);
     return .{
         .context_window_exceeded = context_window_exceeded,
@@ -1708,6 +1740,7 @@ pub const StreamResponse = struct {
             else
                 api_stream.EventIterator.init(reader);
             self.event_iter.setRequestId(self.id);
+            self.event_iter.setCredential(self.stream_result.credential);
             if (self.stream_result.abort_registry != null)
                 self.event_iter.setProgressHook(.{ .ctx = @ptrCast(self), .call = progressThunk, .keepalive = keepaliveThunk });
             if (self.user_query.len > 0) self.event_iter.setUserQuery(self.user_query);
