@@ -15,6 +15,13 @@ console.log(result.text, result.stopReason, result.usage);
 runtime.close();
 ```
 
+A Run that stops on the model resolves normally with `stopReason === 'api_error'`,
+and `result.modelError` says why: `category`, `code` and `type` (the provider's,
+verbatim), `message` (safe to display), `http_status`, `request_id`, `retry`
+(`'retryable'`, `'not_retryable'` or `'unknown'`), `retry_after_ms` and
+`attempts`. It is `null` on any other stop. The SDK attaches no meaning to
+`code`; whether it means "add funds" is yours to decide.
+
 The API key comes from `apiKey`, else the provider's usual variable
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`), else
 `METACODES_API_KEY`. `baseUrl` is the full endpoint; empty means the

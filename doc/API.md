@@ -875,6 +875,21 @@ message reads, with nothing from the driver in between:
 {"run_done":{"stop_reason":"end_turn","err":null}}
 ```
 
+A turn that stops on the model (`api_error`, `max_tokens_exhausted`) says why,
+on the same line: `err` is the displayable message and `model_error` the
+structured detail. Every other stop writes the line above, byte for byte, with
+no `model_error` key.
+
+```text
+{"run_done":{"stop_reason":"api_error","err":"Balance too low","model_error":{"category":"payment_required","code":"insufficient_balance","type":null,"message":"Balance too low","http_status":402,"request_id":"req_1","retry":"not_retryable","retry_after_ms":null,"attempts":1,"truncated":false}}}
+```
+
+The fields, what is redacted and how `retry` is decided are specified in
+[AGENTCORE_BINARY_ABI.md](AGENTCORE_BINARY_ABI.md#model-failure-detail).
+`code` passes through whatever the provider sent: metacodes attaches no billing
+or quota meaning to it. The `SessionHost` wire `run_done` carries the same object
+as `model_error` (null when there is none).
+
 If either field is refused, neither is applied, the text stays out of the
 conversation, no turn runs, and this line takes the place of `user_message`:
 
@@ -978,7 +993,8 @@ compatibility shim between revisions: pin a bundle, not only a semantic version.
 What the seven tables cover, provider protocol selection, the `on_event`
 observation stream and its visible-output tags, input submitted to an active
 Run (`session->submit_input`, the `input_adopted` event and the `RunResultV1`
-input counts), the in-place credential update (`session->update_credential`), the Session goal (the `goal` table, goal-continuation Runs, the
+input counts), the structured reason a Run stopped with `STOP_API_ERROR` (the
+`model_error` event), the in-place credential update (`session->update_credential`), the Session goal (the `goal` table, goal-continuation Runs, the
 `goal_updated` event), the host-scheduled team (`enable_teams`, the `team`
 config, and the `team` table's `describe` and `poll`), the Workspace Skill
 catalog and its source priorities (`SkillSourceV1.priority` and the query's

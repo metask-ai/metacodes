@@ -1,5 +1,6 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
+const ppaths = @import("platform").paths;
 const harness = @import("harness");
 const abi = @import("agentcore-abi");
 const sdk = @import("agentcore-sdk");
@@ -5163,6 +5164,679 @@ test "L2 unnamed Provider HTTP 529 crosses AgentCore ABI without killing the Hos
     fixture.session = null;
     fixture.releaseDiagnostic();
     try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
+// --- issue #408: why a Run stopped with STOP_API_ERROR -----------------------
+
+/// Records a Run's `model_error` events as the Host received them, after full
+/// typed decoding, and where they fell relative to the terminal `run_state`.
+const ModelErrorProbe = struct {
+    count: usize = 0,
+    after_terminal: bool = false,
+    terminal: bool = false,
+    wrong_run: bool = false,
+    json_buf: [8 * 1024]u8 = undefined,
+    json_len: usize = 0,
+
+    fn reset(self: *ModelErrorProbe) void {
+        self.* = .{};
+    }
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *ModelErrorProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const known = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        switch (known) {
+            .model_error => |detail| {
+                if (detail.run_id != run.run_id) self.wrong_run = true;
+                if (self.terminal) self.after_terminal = true;
+                self.count += 1;
+                if (encoded.len > self.json_buf.len) return wire.EVENT_FATAL;
+                @memcpy(self.json_buf[0..encoded.len], encoded);
+                self.json_len = encoded.len;
+            },
+            .run_state => |state| switch (state.phase) {
+                .completed, .failed, .aborted, .poisoned => self.terminal = true,
+                else => {},
+            },
+            else => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+
+    const Expected = struct {
+        category: sdk.protocol.ModelErrorCategory,
+        code: ?[]const u8 = null,
+        type: ?[]const u8 = null,
+        message: []const u8,
+        http_status: ?u16 = null,
+        request_id: ?[]const u8 = null,
+        retry: sdk.protocol.ModelErrorRetry,
+        retry_after_ms: ?u64 = null,
+        attempts: u32 = 1,
+    };
+
+    /// Exactly one, before the terminal run_state, and it says this.
+    fn expect(self: *const ModelErrorProbe, run_id: u64, want: Expected) !void {
+        try std.testing.expectEqual(@as(usize, 1), self.count);
+        try std.testing.expect(!self.after_terminal);
+        try std.testing.expect(!self.wrong_run);
+        const parsed = try sdk.decodeCoreEvent(std.testing.allocator, self.json_buf[0..self.json_len]);
+        defer parsed.deinit();
+        const got = parsed.value.known.model_error;
+        try std.testing.expectEqual(run_id, got.run_id);
+        try std.testing.expectEqual(want.category, got.category);
+        try expectOptionalString(want.code, got.code);
+        try expectOptionalString(want.type, got.type);
+        try std.testing.expectEqualStrings(want.message, got.message);
+        try std.testing.expectEqual(want.http_status, got.http_status);
+        try expectOptionalString(want.request_id, got.request_id);
+        try std.testing.expectEqual(want.retry, got.retry);
+        try std.testing.expectEqual(want.retry_after_ms, got.retry_after_ms);
+        try std.testing.expectEqual(want.attempts, got.attempts);
+    }
+};
+
+fn expectOptionalString(want: ?[]const u8, got: ?[]const u8) !void {
+    if (want) |value| {
+        try std.testing.expectEqualStrings(value, got orelse return error.MissingField);
+    } else {
+        try std.testing.expectEqual(@as(?[]const u8, null), got);
+    }
+}
+
+const ModelFailureCase = struct {
+    provider: u32 = wire.PROVIDER_ANTHROPIC,
+    expected: ModelErrorProbe.Expected,
+};
+
+/// One Run against `server` over the public ABI: STATUS_OK, STOP_API_ERROR and
+/// an empty diagnostic, exactly as before #408, plus the detail.
+fn expectModelFailure(server: *harness.MockServer, case: ModelFailureCase) !void {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ModelErrorProbe{};
+    var fixture = try PublicSessionFixture.initObservedProviderConfigured(
+        root,
+        url,
+        "test-model",
+        null,
+        wire.RUN_JOURNAL_EPHEMERAL,
+        case.provider,
+        wire.PROTOCOL_DEFAULT,
+        &.{},
+        &probe,
+        ModelErrorProbe.event,
+    );
+    defer fixture.deinit();
+    const result = try fixture.runTextTurns(1, "exercise the failure", 2);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u64, 0), fixture.diagnostic.len);
+    try probe.expect(1, case.expected);
+}
+
+test "L2 #408 authentication failure: status, code, message and request id reach the Host" {
+    var server = try harness.MockServer.startRepeatingStatus(
+        "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key value\"}}",
+        "HTTP/1.1 401 Unauthorized",
+        "x-request-id: req-auth-1\r\n",
+    );
+    defer server.stop();
+    try expectModelFailure(server, .{ .expected = .{
+        .category = .authentication,
+        .code = "authentication_error",
+        .type = "authentication_error",
+        .message = "invalid x-api-key value",
+        .http_status = 401,
+        .request_id = "req-auth-1",
+        .retry = .not_retryable,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
+test "L2 #408 rate limit: retry-after and the attempts spent reach the Host" {
+    var server = try harness.MockServer.startRepeatingStatus(
+        "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+        "HTTP/1.1 429 Too Many Requests",
+        "retry-after: 0\r\nrequest-id: req-rate-1\r\n",
+    );
+    defer server.stop();
+    var attempts = try EnvOverride.set("CLAUDE_CODE_MAX_RETRIES", "3");
+    defer attempts.restore();
+    try expectModelFailure(server, .{ .expected = .{
+        .category = .rate_limited,
+        .code = "rate_limit_error",
+        .type = "rate_limit_error",
+        .message = "slow down",
+        .http_status = 429,
+        .request_id = "req-rate-1",
+        .retry = .retryable,
+        .retry_after_ms = 0,
+        .attempts = 3,
+    } });
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+}
+
+test "L2 #408 service overload: an unnamed status keeps its meaning" {
+    var server = try harness.MockServer.startWithStatus(
+        "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider overloaded\"}}",
+        0,
+        "HTTP/1.1 529 Site Overloaded",
+    );
+    defer server.stop();
+    try expectModelFailure(server, .{ .expected = .{
+        .category = .overloaded,
+        .code = "overloaded_error",
+        .type = "overloaded_error",
+        .message = "provider overloaded",
+        .http_status = 529,
+        .retry = .retryable,
+    } });
+}
+
+/// Set for one test and restored; the Session reads these when it is created.
+const EnvOverride = struct {
+    name: [*:0]const u8,
+    previous: ?[:0]u8,
+
+    fn set(name: [*:0]const u8, value: [*:0]const u8) !EnvOverride {
+        const previous = if (std.c.getenv(name)) |raw| try std.testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+        ppaths.setEnv(name, value);
+        return .{ .name = name, .previous = previous };
+    }
+
+    fn restore(self: *EnvOverride) void {
+        if (self.previous) |previous| {
+            ppaths.setEnv(self.name, previous.ptr);
+            std.testing.allocator.free(previous);
+        } else {
+            ppaths.unsetEnv(self.name);
+        }
+    }
+};
+
+test "L2 #408 timeout waiting for the response head names the timeout" {
+    var head_limit = try EnvOverride.set("METACODES_STREAM_IDLE_TIMEOUT_MS", "150");
+    defer head_limit.restore();
+    var attempts = try EnvOverride.set("CLAUDE_CODE_MAX_RETRIES", "1");
+    defer attempts.restore();
+    var server = try harness.MockServer.startCassetteSilent(&[_][]const u8{FINAL_SSE}, 0, 0);
+    defer server.stop();
+
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ModelErrorProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+    defer fixture.deinit();
+    const result = try fixture.runTextTurns(1, "wait forever", 2);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    const parsed = try sdk.decodeCoreEvent(a, probe.json_buf[0..probe.json_len]);
+    defer parsed.deinit();
+    const got = parsed.value.known.model_error;
+    try std.testing.expectEqual(sdk.protocol.ModelErrorCategory.timeout, got.category);
+    try std.testing.expectEqual(sdk.protocol.ModelErrorRetry.retryable, got.retry);
+    try std.testing.expectEqual(@as(?u16, null), got.http_status);
+    try std.testing.expect(std.mem.startsWith(u8, got.message, "No response head within "));
+}
+
+test "L2 #408 timeout in the body of an accepted stream carries that response's status and id" {
+    var body_limit = try EnvOverride.set("METACODES_STREAM_BODY_IDLE_TIMEOUT_MS", "150");
+    defer body_limit.restore();
+    const first = std.mem.indexOf(u8, FINAL_SSE, "\n\n").? + 2;
+    const second = std.mem.indexOfPos(u8, FINAL_SSE, first, "\n\n").? + 2;
+    const with_text = std.mem.indexOfPos(u8, FINAL_SSE, second, "\n\n").? + 2;
+    var server = try harness.MockServer.startCassetteSilent(&[_][]const u8{FINAL_SSE}, 0, with_text);
+    defer server.stop();
+    server.extra_response_headers = "x-request-id: req-stall-1\r\n";
+
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ModelErrorProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+    defer fixture.deinit();
+    const result = try fixture.runTextTurns(1, "stall after some text", 2);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    const parsed = try sdk.decodeCoreEvent(a, probe.json_buf[0..probe.json_len]);
+    defer parsed.deinit();
+    const got = parsed.value.known.model_error;
+    try std.testing.expectEqual(sdk.protocol.ModelErrorCategory.timeout, got.category);
+    try std.testing.expectEqual(@as(?u16, 200), got.http_status);
+    try std.testing.expectEqualStrings("req-stall-1", got.request_id.?);
+    try std.testing.expect(std.mem.startsWith(u8, got.message, "No model output for "));
+}
+
+/// Text reaches the Host in the half that is sent, so the loop does not resend.
+const CUT_AFTER_TEXT_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"cut\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n" ++
+    ("data: {\"type\":\"ping\"}\n\n" ** 40);
+
+/// No visible output in the half that is sent, so the loop resends once.
+const CUT_BEFORE_TEXT_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"cut\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    ("data: {\"type\":\"ping\"}\n\n" ** 40);
+
+test "L2 #408 stream interruption reaches the Host as such, with the stream's request id" {
+    var server = try harness.MockServer.startCassetteMidStreamCut(&[_][]const u8{CUT_AFTER_TEXT_SSE}, 0);
+    defer server.stop();
+    server.extra_response_headers = "x-request-id: req-cut-1\r\n";
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ModelErrorProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+    defer fixture.deinit();
+    const result = try fixture.runTextTurns(1, "cut me off", 2);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    const parsed = try sdk.decodeCoreEvent(a, probe.json_buf[0..probe.json_len]);
+    defer parsed.deinit();
+    const got = parsed.value.known.model_error;
+    try std.testing.expectEqual(sdk.protocol.ModelErrorCategory.stream_interrupted, got.category);
+    try std.testing.expectEqual(sdk.protocol.ModelErrorRetry.retryable, got.retry);
+    try std.testing.expectEqual(@as(?u16, 200), got.http_status);
+    try std.testing.expectEqualStrings("req-cut-1", got.request_id.?);
+}
+
+test "L2 #408 insufficient balance: the upstream code and message pass through uninterpreted" {
+    var server = try harness.MockServer.startRepeatingStatus(
+        "{\"error\":{\"code\":\"insufficient_balance\",\"message\":\"Account balance is below the minimum, please top up\"}}",
+        "HTTP/1.1 402 Payment Required",
+        "x-metask-request-id: req-bal-1\r\nx-request-id: req-vendor-1\r\n",
+    );
+    defer server.stop();
+    try expectModelFailure(server, .{ .expected = .{
+        .category = .payment_required,
+        .code = "insufficient_balance",
+        .message = "Account balance is below the minimum, please top up",
+        .http_status = 402,
+        .request_id = "req-bal-1",
+        .retry = .not_retryable,
+    } });
+}
+
+test "L2 #408 quota exhaustion on OpenAI's 429 keeps its code and leaves retry guidance unknown" {
+    var server = try harness.MockServer.startRepeatingStatus(
+        "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"param\":null,\"code\":\"insufficient_quota\"}}",
+        "HTTP/1.1 429 Too Many Requests",
+        "x-request-id: req-quota-1\r\n",
+    );
+    defer server.stop();
+    try expectModelFailure(server, .{ .provider = wire.PROVIDER_OPENAI, .expected = .{
+        .category = .rate_limited,
+        .code = "insufficient_quota",
+        .type = "insufficient_quota",
+        .message = "You exceeded your current quota",
+        .http_status = 429,
+        .request_id = "req-quota-1",
+        .retry = .unknown,
+    } });
+}
+
+test "L2 #408 quota exhaustion on Gemini: its body is read and its canonical status is the code" {
+    var server = try harness.MockServer.startRepeatingStatus(
+        "[{\"error\":{\"code\":429,\"message\":\"Quota exceeded for metric\",\"status\":\"RESOURCE_EXHAUSTED\"}}]",
+        "HTTP/1.1 429 Too Many Requests",
+        "",
+    );
+    defer server.stop();
+    try expectModelFailure(server, .{ .provider = wire.PROVIDER_GEMINI, .expected = .{
+        .category = .rate_limited,
+        .code = "RESOURCE_EXHAUSTED",
+        .message = "Quota exceeded for metric",
+        .http_status = 429,
+        .retry = .unknown,
+    } });
+}
+
+test "L2 #408 an unknown business code passes through, over HTTP and inside a stream" {
+    {
+        var server = try harness.MockServer.startRepeatingStatus(
+            "{\"code\":90210,\"msg\":\"合约未生效\"}",
+            "HTTP/1.1 400 Bad Request",
+            "",
+        );
+        defer server.stop();
+        try expectModelFailure(server, .{ .expected = .{
+            .category = .invalid_request,
+            .code = "90210",
+            .message = "合约未生效",
+            .http_status = 400,
+            .retry = .not_retryable,
+        } });
+    }
+    {
+        const frame = "data: {\"type\":\"error\",\"error\":{\"type\":\"acme_contract_error\",\"code\":\"ACME_42\",\"message\":\"contract lapsed\"},\"request_id\":\"req-frame-1\"}\n\n";
+        var server = try harness.MockServer.startCassette(&[_][]const u8{frame}, 0);
+        defer server.stop();
+        try expectModelFailure(server, .{ .expected = .{
+            .category = .unknown,
+            .code = "ACME_42",
+            .type = "acme_contract_error",
+            .message = "contract lapsed",
+            .http_status = 200,
+            .request_id = "req-frame-1",
+            .retry = .unknown,
+        } });
+    }
+}
+
+test "L2 #408 the credential and secret shapes never reach the Host, and fields are bounded" {
+    const a = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, "{\"error\":{\"code\":\"bad_key\",\"message\":\"Key test-key rejected; also sk-live-abcdef1234 and api_key=hunter2hunter2 ");
+    try body.appendNTimes(a, 'x', 1500);
+    try body.appendSlice(a, "\"}}");
+    var server = try harness.MockServer.startRepeatingStatus(body.items, "HTTP/1.1 401 Unauthorized", "");
+    defer server.stop();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ModelErrorProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+    defer fixture.deinit();
+    _ = try fixture.runTextTurns(1, "leak the key", 2);
+    const json = probe.json_buf[0..probe.json_len];
+    for ([_][]const u8{ "test-key", "sk-live-abcdef1234", "hunter2hunter2" }) |secret| {
+        try std.testing.expect(std.mem.indexOf(u8, json, secret) == null);
+    }
+    const parsed = try sdk.decodeCoreEvent(a, json);
+    defer parsed.deinit();
+    const got = parsed.value.known.model_error;
+    try std.testing.expectEqualStrings("bad_key", got.code.?);
+    try std.testing.expect(std.mem.indexOf(u8, got.message, "[REDACTED]") != null);
+    try std.testing.expect(got.message.len <= 1024);
+    try std.testing.expect(got.truncated);
+}
+
+test "L2 #408 a stream frame that echoes the credential does not carry it to the Host" {
+    const frame = "data: {\"type\":\"error\",\"error\":{\"code\":\"bad_key\",\"message\":\"key test-key refused\"}}\n\n";
+    var server = try harness.MockServer.startCassette(&[_][]const u8{frame}, 0);
+    defer server.stop();
+    try expectModelFailure(server, .{ .expected = .{
+        .category = .unknown,
+        .code = "bad_key",
+        .message = "key [REDACTED] refused",
+        .http_status = 200,
+        .retry = .unknown,
+    } });
+}
+
+test "L2 #408 a retry that succeeds leaves no error: HTTP failure, then stream cut" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    {
+        var server = try harness.MockServer.startHttpCassette(
+            &.{ "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"stale overload\"}}", FINAL_SSE },
+            &.{ "HTTP/1.1 503 Service Unavailable", "HTTP/1.1 200 OK" },
+        );
+        defer server.stop();
+        server.extra_response_headers = "retry-after: 0\r\n";
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var probe = ModelErrorProbe{};
+        var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+        defer fixture.deinit();
+        const result = try fixture.runTextTurns(1, "recover", 2);
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+        try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+        try std.testing.expectEqual(@as(usize, 0), probe.count);
+    }
+    {
+        var server = try harness.MockServer.startCassetteMidStreamCut(&[_][]const u8{ CUT_BEFORE_TEXT_SSE, FINAL_SSE }, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var probe = ModelErrorProbe{};
+        var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+        defer fixture.deinit();
+        const result = try fixture.runTextTurns(1, "recover", 2);
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+        try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+        try std.testing.expectEqual(@as(usize, 0), probe.count);
+    }
+}
+
+test "L2 #408 each Run on a Session reports its own failure and a success in between none" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var server = try harness.MockServer.startHttpCassette(
+        &.{
+            "{\"error\":{\"code\":\"first_failure\",\"message\":\"first\"}}",
+            FINAL_SSE,
+            "{\"error\":{\"code\":\"second_failure\",\"message\":\"second\"}}",
+        },
+        &.{ "HTTP/1.1 402 Payment Required", "HTTP/1.1 200 OK", "HTTP/1.1 403 Forbidden" },
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ModelErrorProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+    defer fixture.deinit();
+
+    var result = try fixture.runTextTurns(1, "one", 2);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try probe.expect(1, .{ .category = .payment_required, .code = "first_failure", .message = "first", .http_status = 402, .retry = .not_retryable });
+
+    probe.reset();
+    result = try fixture.runTextTurns(2, "two", 2);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 0), probe.count);
+
+    probe.reset();
+    result = try fixture.runTextTurns(3, "three", 2);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try probe.expect(3, .{ .category = .permission, .code = "second_failure", .message = "second", .http_status = 403, .retry = .not_retryable });
+}
+
+const ConcurrentRun = struct {
+    fixture: *PublicSessionFixture,
+    stop_code: u32 = 0,
+    failed: bool = false,
+
+    fn main(self: *ConcurrentRun) void {
+        const result = self.fixture.runTextTurns(1, "concurrent", 2) catch {
+            self.failed = true;
+            return;
+        };
+        self.stop_code = result.stop_reason_code;
+    }
+};
+
+test "L2 #408 concurrent Runs do not overwrite or mix error details" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+
+    var failing_a = try harness.MockServer.startHttpCassette(
+        &.{"{\"error\":{\"code\":\"tenant_a_code\",\"message\":\"tenant a message\"}}"},
+        &.{"HTTP/1.1 402 Payment Required"},
+    );
+    defer failing_a.stop();
+    failing_a.extra_response_headers = "x-request-id: req-tenant-a\r\n";
+    var failing_b = try harness.MockServer.startHttpCassette(
+        &.{"{\"error\":{\"code\":\"tenant_b_code\",\"message\":\"tenant b message\"}}"},
+        &.{"HTTP/1.1 403 Forbidden"},
+    );
+    defer failing_b.stop();
+    failing_b.extra_response_headers = "x-request-id: req-tenant-b\r\n";
+    var succeeding = try harness.MockServer.startCassette(&[_][]const u8{FINAL_SSE}, 0);
+    defer succeeding.stop();
+
+    // All three requests are in flight together before any answer is released.
+    const servers = [_]*harness.MockServer{ failing_a, failing_b, succeeding };
+    for (servers) |server| server.gateResponseAt(0);
+
+    var probes = [_]ModelErrorProbe{.{}} ** 3;
+    var urls: [3][]u8 = undefined;
+    var url_count: usize = 0;
+    defer for (urls[0..url_count]) |url| a.free(url);
+    var fixtures: [3]PublicSessionFixture = undefined;
+    var fixture_count: usize = 0;
+    defer for (fixtures[0..fixture_count]) |*fixture| fixture.deinit();
+    for (servers, 0..) |server, index| {
+        urls[index] = try server.urlOwned(a);
+        url_count += 1;
+        fixtures[index] = try PublicSessionFixture.initObserved(root, urls[index], "test-model", null, &probes[index], ModelErrorProbe.event);
+        fixture_count += 1;
+    }
+
+    var runs: [3]ConcurrentRun = undefined;
+    var threads: [3]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer {
+        for (servers) |server| server.releaseGatedResponse();
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&runs, &fixtures, 0..) |*run, *fixture, index| {
+        run.* = .{ .fixture = fixture };
+        threads[index] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, ConcurrentRun.main, .{run});
+        spawned += 1;
+    }
+    for (servers) |server| try server.waitUntilResponseGated();
+    for (servers) |server| server.releaseGatedResponse();
+    for (threads) |thread| thread.join();
+    spawned = 0;
+
+    for (runs) |run| try std.testing.expect(!run.failed);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, runs[0].stop_code);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, runs[1].stop_code);
+    try std.testing.expectEqual(wire.STOP_END_TURN, runs[2].stop_code);
+    try probes[0].expect(1, .{ .category = .payment_required, .code = "tenant_a_code", .message = "tenant a message", .http_status = 402, .request_id = "req-tenant-a", .retry = .not_retryable });
+    try probes[1].expect(1, .{ .category = .permission, .code = "tenant_b_code", .message = "tenant b message", .http_status = 403, .request_id = "req-tenant-b", .retry = .not_retryable });
+    try std.testing.expectEqual(@as(usize, 0), probes[2].count);
+}
+
+test "L2 #408 output-limit exhaustion is STOP_API_ERROR too, so it says what it was" {
+    const cut = comptime maxTokensCutSse("cut ");
+    var server = try harness.MockServer.startCassette(&[_][]const u8{ cut, cut, cut, cut }, 0);
+    defer server.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ModelErrorProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+    defer fixture.deinit();
+    const result = try fixture.runTextTurns(1, "write the report", 8);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try probe.expect(1, .{
+        .category = .output_limit,
+        .message = "The model kept reaching its output token limit without completing an answer.",
+        .retry = .not_retryable,
+    });
+}
+
+test "L2 #408 a Skill invocation Run in its own context reports its child's failure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    try writeSkillFixture(
+        a,
+        root,
+        "forked",
+        "---\nname: Forked\ndescription: Runs in a fresh child Conversation\ncontext: fork\n---\nFORKED_SKILL_SENTINEL",
+    );
+    var server = try harness.MockServer.startRepeatingStatus(
+        "{\"error\":{\"code\":\"fork_code\",\"message\":\"fork failed\"}}",
+        "HTTP/1.1 402 Payment Required",
+        "",
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ModelErrorProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+    defer fixture.deinit();
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("model-error-fork-epoch"),
+        .additional_sources = null,
+        .additional_source_count = 0,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer fixture.api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().resolveCatalog()(fixture.runtime, &query, &catalog, &descriptor, &fixture.diagnostic));
+    defer if (catalog) |handle| {
+        _ = fixture.api.skill().releaseCatalog()(handle, &fixture.diagnostic);
+    };
+    const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    var policy = try DecodedSkillPolicy.init(a, descriptor_bytes);
+    defer policy.deinit();
+    const ids = try extractCatalogIdentities(a, descriptor_bytes, "forked");
+    defer a.free(ids.revision);
+    defer a.free(ids.skill_id);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().bindPolicy()(fixture.session, catalog, &policy.policy, &fixture.diagnostic));
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runSkill(
+        fixture.session,
+        1,
+        sdk.bytesView(ids.skill_id),
+        sdk.bytesView(ids.revision),
+        sdk.bytesView(""),
+        &options,
+        &result,
+        &fixture.diagnostic,
+    ));
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try probe.expect(1, .{ .category = .payment_required, .code = "fork_code", .message = "fork failed", .http_status = 402, .retry = .not_retryable });
 }
 
 test "L2 public compact commits a summary and reports COMPACT_COMPACTED" {

@@ -12,6 +12,7 @@ const pfs = @import("platform").fs;
 const types = @import("../types.zig");
 const client_mod = @import("../client.zig");
 const provider_mod = @import("../api/provider.zig");
+const model_error = @import("../api/model_error.zig");
 const dialect_mod = @import("../api/dialect.zig");
 const request_gate_mod = @import("request_gate.zig");
 const execution_effect = @import("execution_effect.zig");
@@ -355,6 +356,13 @@ pub const JobWaitOptions = struct {
 };
 
 pub const Options = struct {
+    /// Where to leave the structured detail of this Run's model failure (issue
+    /// #408), owned by the caller. Set to a value exactly when the Run stops
+    /// with `api_error` or `max_tokens_exhausted`, and to null otherwise, so a
+    /// failure that a retry recovered from leaves nothing here. Children do not
+    /// inherit it: a subagent's failure is the parent's tool result, not the
+    /// parent's own.
+    model_error_out: ?*?model_error.Detail = null,
     /// **唯一兜底 backstop**(对齐 codex:无主动熔断,只靠 max_turns + 用户中断)。
     /// 轮数不度量任何真实风险,只防真失控。长任务靠 pre-sampling auto-compact 压缩续接。
     max_turns: u32 = 400,
@@ -1208,6 +1216,37 @@ pub fn run(
     backend: *const UiBackend,
     allocator: std.mem.Allocator,
 ) !RunResult {
+    // This Run's failure detail is this Run's alone: its provider calls write
+    // here through a thread-local scope (see api/model_error.zig). It is read
+    // only below, and only for a stop that is a model failure.
+    var failure_capture: model_error.Capture = .{};
+    const failure_scope = model_error.Scope.enter(&failure_capture);
+    defer failure_scope.exit();
+    if (opts.model_error_out) |out| out.* = null;
+    const result = try runCaptured(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator);
+    if (opts.model_error_out) |out| switch (result.stop_reason) {
+        .api_error => {
+            out.* = model_error.Detail{};
+            failure_capture.finish(&out.*.?);
+        },
+        .max_tokens_exhausted => {
+            out.* = model_error.Detail{};
+            model_error.Detail.outputLimit(&out.*.?);
+        },
+        else => {},
+    };
+    return result;
+}
+
+fn runCaptured(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    opts: Options,
+    backend: *const UiBackend,
+    allocator: std.mem.Allocator,
+) !RunResult {
     // Provider server tools (`server_type`, e.g. Anthropic web_search) are not
     // representable in this loop: their server_tool_use / result blocks are
     // not kept in the Conversation, and a turn the server pauses (`pause_turn`)
@@ -2028,6 +2067,7 @@ fn runCounted(
 
             fn startAttempt(self: *@This(), physical_attempt: u32) bool {
                 if (physical_attempt == 0 or physical_attempt > self.max_attempts) return false;
+                model_error.noteAttempt();
                 const boundary = self.boundary orelse {
                     self.active_attempt = physical_attempt;
                     return true;
@@ -2091,6 +2131,7 @@ fn runCounted(
         // 明确报 context-window-exceeded,按 Rust compact recovery 路径逐步删最老
         // history 后重试。同一 turn 内重试,不把恢复尝试计成新 turn。
         var context_recovery = ContextRecoveryState{ .cap = @max(conversation.len(), 1) };
+        model_error.beginRequest();
         var turn_stop_reason: api_stream.StopReason = .unknown;
         var rid_for_turn: log.RequestId = undefined;
         // Re-issue counter for this turn. A context recovery or a mid-stream
@@ -2388,6 +2429,7 @@ fn runCounted(
                     },
                     else => |e| {
                         log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(e) });
+                        if (e != error.Aborted) model_error.noteRequestError(e);
                         const stop_reason = if (e == error.Aborted)
                             stopReasonForAbort(opts.abort)
                         else
@@ -2407,6 +2449,9 @@ fn runCounted(
             // runtime dialect override or a concurrent model change.
             conversation.markDelivered(.{ .image_placeholder_ids = stream.image_placeholder_ids });
             defer stream.deinit();
+            // Every provider, not only the HTTP clients: an accepted request
+            // ends what the attempts before it failed with.
+            model_error.clearFailure();
 
             rid_for_turn = stream.requestId();
             const rid = rid_for_turn;
@@ -2484,6 +2529,7 @@ fn runCounted(
                         };
                         stream_error = true;
                         stream_failure = e;
+                        model_error.noteStreamReadError(e);
                         log.errId("agent", rid, "stream returned error {s} at turn {d}", .{ @errorName(e), turns + 1 });
                         break;
                     },

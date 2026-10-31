@@ -11,6 +11,7 @@ const no_redirects = @import("api/http_status.zig").no_redirects;
 const copyRedirectLocation = @import("api/http_status.zig").copyRedirectLocation;
 const error_class = @import("api/error_class.zig");
 const last_error = @import("api/last_error.zig");
+const model_error = @import("api/model_error.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
 const image_capability = @import("api/image_capability.zig");
 const AbortSignal = @import("util/abort.zig").AbortSignal;
@@ -356,6 +357,8 @@ pub fn reportHeadStall(comptime module: []const u8, rid: log.RequestId, stall: p
     var buf: [128]u8 = undefined;
     const detail = std.fmt.bufPrint(&buf, "{d} ms 内无响应头(上限 {d} ms),连接已由客户端关闭", .{ stall.idle_ms, stall.limit_ms }) catch "StreamStalled";
     last_error.recordNamed("响应头空闲超时", detail);
+    var message_buf: [128]u8 = undefined;
+    model_error.noteTransportFailure(.timeout, .retryable, std.fmt.bufPrint(&message_buf, "No response head within {d} ms (limit {d} ms); the client closed the connection.", .{ stall.idle_ms, stall.limit_ms }) catch "No response head in time; the client closed the connection.");
 }
 
 /// A 3xx to a request that carries a key is the answer, not a hop
@@ -367,6 +370,7 @@ pub fn reportRedirect(comptime module: []const u8, rid: log.RequestId, status: R
     var buf: [400]u8 = undefined;
     const detail = std.fmt.bufPrint(&buf, "HTTP {d} → {s};带凭据的请求不跟随重定向,请把端点(--base-url)改成重定向后的地址", .{ status.code, location }) catch "带凭据的请求不跟随重定向";
     last_error.recordNamed("端点重定向", detail);
+    model_error.noteRedirect(status.code, location);
 }
 
 /// 正文阶段 stall 的统一交代:日志 + last_error 现场。此前 mid-stream 的 StreamStalled 不写
@@ -385,6 +389,8 @@ pub fn reportBodyStall(comptime module: []const u8, rid: log.RequestId, stall: p
         log.warnId(module, rid, "no byte for {d}ms, keepalives included (endpoint had pinged at least every {d}ms mid-stream, dead limit {d}ms): connection judged dead and shut down", .{ stall.transport_idle_ms, stall.keepalive_gap_ms, stall.limit_ms });
         const detail = std.fmt.bufPrint(&buf, "{d} ms 内无任何字节,连 keepalive 也没有(该端点流中途此前每 ≤{d} ms 必发一次,上限 {d} ms),判定连接已断,客户端已关闭", .{ stall.transport_idle_ms, stall.keepalive_gap_ms, stall.limit_ms }) catch "StreamStalled";
         last_error.recordNamed("连接已断", detail);
+        var dead_buf: [160]u8 = undefined;
+        model_error.noteStreamFailure(.stream_interrupted, .retryable, std.fmt.bufPrint(&dead_buf, "The connection went silent for {d} ms, keepalives included (limit {d} ms), and was judged dead.", .{ stall.transport_idle_ms, stall.limit_ms }) catch "The connection went silent and was judged dead.");
         return;
     }
     const keepalive_only = stall.transport_idle_ms * 2 < stall.idle_ms;
@@ -394,6 +400,15 @@ pub fn reportBodyStall(comptime module: []const u8, rid: log.RequestId, stall: p
     else
         std.fmt.bufPrint(&buf, "{d} ms 内无任何字节(上限 {d} ms),连接已由客户端关闭", .{ stall.idle_ms, stall.limit_ms }) catch "StreamStalled";
     last_error.recordNamed("正文空闲超时", detail);
+    var message_buf: [160]u8 = undefined;
+    model_error.noteStreamFailure(.timeout, .retryable, std.fmt.bufPrint(&message_buf, "No model output for {d} ms (limit {d} ms); the client closed the connection.", .{ stall.idle_ms, stall.limit_ms }) catch "No model output in time; the client closed the connection.");
+}
+
+/// A connection-level failure before any response head, for the structured
+/// detail. Shared by the three provider clients.
+pub fn noteConnectFailure(err: anyerror) void {
+    var buf: [96]u8 = undefined;
+    model_error.noteTransportFailure(.connection, .retryable, std.fmt.bufPrint(&buf, "Could not reach the model endpoint: {s}.", .{@errorName(err)}) catch "Could not reach the model endpoint.");
 }
 
 /// 服务端在流里**主动声明**的失败(OpenAI chat 兼容端 / Gemini 的顶层 `error` 对象、Responses 的
@@ -403,6 +418,47 @@ pub fn reportBodyStall(comptime module: []const u8, rid: log.RequestId, stall: p
 pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_obj: []const u8) void {
     log.warnId(module, rid, "API error in stream: {s}", .{err_obj});
     last_error.recordNamed("API 错误帧", err_obj);
+    model_error.noteStreamError(err_obj);
+}
+
+/// A non-2xx answer the provider client has read the body of, for every sink
+/// that wants it.
+pub fn reportHttpFailure(status: u16, body: []const u8) void {
+    last_error.recordHttp(status, body);
+    model_error.noteHttpFailure(status, body);
+}
+
+/// The secret part of an auth header value: `Bearer <key>` or the bare key.
+fn credentialSecret(header_value: []const u8) []const u8 {
+    const space = std.mem.lastIndexOfScalar(u8, header_value, ' ') orelse return header_value;
+    return header_value[space + 1 ..];
+}
+
+/// The response head of a provider request, while its bytes are still valid.
+/// Shared by the three provider clients so all report the same request id.
+/// `credential` is the auth header value the request carried: a server that
+/// echoes it does not get it past the structured detail.
+pub fn noteResponseHead(status: u16, head: http.Client.Response.Head, credential: []const u8) void {
+    model_error.noteResponseHead(status, upstreamRequestId(head), retryAfterFromHead(head), credentialSecret(credential));
+}
+
+/// The request id a support desk can look up. Gateways usually set their own
+/// header beside the vendor's, and theirs is the one the user's account sees.
+fn upstreamRequestId(head: http.Client.Response.Head) ?[]const u8 {
+    const names = [_][]const u8{ "x-metask-request-id", "request-id", "x-request-id", "x-goog-request-id", "x-amzn-requestid", "x-ms-request-id" };
+    for (names) |name| {
+        var it = head.iterateHeaders();
+        while (it.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, name) and header.value.len > 0) return header.value;
+        }
+    }
+    return null;
+}
+
+/// The provider accepted the request: a failure before this one is over.
+pub fn noteRequestAccepted() void {
+    last_error.clear();
+    model_error.clearFailure();
 }
 
 /// 流在报告"怎么停的"之前就结束(干净 EOF / 只有 `[DONE]`,却没有 stop_reason、
@@ -961,8 +1017,10 @@ pub const Client = struct {
                         else => {
                             // doRequest 已记录具体底层错误（例如 TlsInitializationFailed）；
                             // TransientNetwork 是对 send/receive 错误的分类壳，不能在这里覆盖现场。
-                            if (err != error.TransientNetwork)
+                            if (err != error.TransientNetwork) {
                                 last_error.recordNamed("连接初始化失败", connectErrorDetail(err));
+                                model_error.noteRequestError(err);
+                            }
                             last_error.noteAttempts(attempt);
                         },
                     }
@@ -1040,6 +1098,7 @@ pub const Client = struct {
                 log.errId("client", rid, "request setup injected failure: {s}", .{@errorName(err)});
                 if (isTransientNetworkError(err)) {
                     last_error.recordNamed("连接初始化失败", connectErrorDetail(err));
+                    noteConnectFailure(err);
                     return err;
                 }
                 return error.RequestFailed;
@@ -1076,6 +1135,7 @@ pub const Client = struct {
             log.errId("client", rid, "request setup failed: {s}", .{@errorName(err)});
             if (isTransientNetworkError(err)) {
                 last_error.recordNamed("连接初始化失败", connectErrorDetail(err));
+                noteConnectFailure(err);
                 return err;
             }
             return error.RequestFailed;
@@ -1099,6 +1159,7 @@ pub const Client = struct {
             log.errId("client", rid, "sendBody failed: {s}", .{@errorName(err)});
             if (isTransientNetworkError(err)) {
                 last_error.recordNamed("连接失败", @errorName(err));
+                noteConnectFailure(err);
                 if (err == error.TlsInitializationFailed) return err;
                 return error.TransientNetwork;
             }
@@ -1117,6 +1178,7 @@ pub const Client = struct {
             // 网络瞬态错误(服务端关连接等)上抛区分性 error,让重试层识别;非瞬态塌缩 RequestFailed。
             if (isTransientNetworkError(err)) {
                 last_error.recordNamed("连接失败", @errorName(err));
+                noteConnectFailure(err);
                 if (err == error.TlsInitializationFailed) return err;
                 return error.TransientNetwork;
             }
@@ -1126,6 +1188,7 @@ pub const Client = struct {
         client.last_http_status = status.code;
         const server_request_id_len = copyMetaskRequestId(&client.server_request_id, http_response.head.bytes);
         client.server_request_id_len = server_request_id_len;
+        noteResponseHead(status.code, http_response.head, auth.value);
         // DNS/TCP/TLS + request-head phase is complete; active streaming must not consume a slot.
         connection_lease.release();
 
@@ -1142,7 +1205,7 @@ pub const Client = struct {
             // 成功即清陈旧错误现场——否则后续无记录的失败路径(如 mid-stream 断连)
             // 会把几轮前的无关错误当死因端给用户。
             .ok => {
-                last_error.clear();
+                noteRequestAccepted();
                 client.last_context_window_numbers = .{};
             },
             .failure => |failure| {
@@ -1420,7 +1483,7 @@ fn logErrorBody(
     log.errId("client", rid, "HTTP {d} {s}: body={s}", .{
         status.code, status.name, preview,
     });
-    last_error.recordHttp(status.code, preview);
+    reportHttpFailure(status.code, preview);
     const context_window_exceeded = error_class.isContextWindowExceeded(preview);
     return .{
         .context_window_exceeded = context_window_exceeded,

@@ -383,6 +383,7 @@ pub const GeminiClient = struct {
         req_ptr.transfer_encoding = .{ .content_length = body.len };
         http_connection.sendBodyComplete(req_ptr, @constCast(body)) catch |err| {
             log.errId("gemini", rid, "send body failed: {s}", .{@errorName(err)});
+            client_mod.noteConnectFailure(err);
             return error.RequestFailed;
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
@@ -391,9 +392,11 @@ pub const GeminiClient = struct {
                 return error.TransientNetwork;
             }
             log.errId("gemini", rid, "receiveHead failed: {s}", .{@errorName(err)});
+            client_mod.noteConnectFailure(err);
             return err;
         };
         const status = ResponseStatus.capture(&response);
+        client_mod.noteResponseHead(status.code, response.head, auth.value);
         connection_lease.release();
         if (!status.isOk()) {
             var location_buf: [256]u8 = undefined;
@@ -401,9 +404,19 @@ pub const GeminiClient = struct {
                 client_mod.reportRedirect("gemini", rid, status, location);
                 return error.RequestFailed;
             }
-            log.errId("gemini", rid, "HTTP {d} {s}", .{ status.code, status.name });
+            var err_body: [4096]u8 = undefined;
+            const body_reader = req_ptr.reader.bodyReader(
+                err_body[0..],
+                response.head.transfer_encoding,
+                response.head.content_length,
+            );
+            const n = body_reader.readSliceShort(err_body[0..]) catch 0;
+            const preview = err_body[0..@min(n, err_body.len)];
+            log.errId("gemini", rid, "HTTP {d} {s}: body={s}", .{ status.code, status.name, preview });
+            client_mod.reportHttpFailure(status.code, preview);
             return error.RequestFailed;
         }
+        client_mod.noteRequestAccepted();
         // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
         self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens), .sse);
         // receiveHead 成功后,req_ptr.* 是个开着连接的完整 Request。到 heap 转移所有权之前若出错

@@ -147,6 +147,51 @@ pub const RunState = struct {
     in_flight_tools: []const RunStateTool,
 };
 
+/// What kind of model failure this was: transport facts and the provider's
+/// technical error types, never billing. `payment_required` is HTTP 402.
+pub const ModelErrorCategory = enum {
+    authentication,
+    permission,
+    payment_required,
+    not_found,
+    invalid_request,
+    context_window,
+    rate_limited,
+    overloaded,
+    server_error,
+    timeout,
+    connection,
+    stream_interrupted,
+    output_limit,
+    unknown,
+};
+
+/// Whether sending the same request again can be expected to help. `unknown`
+/// when an upstream code AgentCore does not recognize qualifies the answer.
+pub const ModelErrorRetry = enum { retryable, not_retryable, unknown };
+
+/// Why a Run stopped with `STOP_API_ERROR`. Exactly one per such Run, before
+/// its terminal `run_state`. Status and stop reason are unchanged by it.
+pub const ModelError = struct {
+    run_id: u64,
+    category: ModelErrorCategory,
+    /// The upstream's most specific identifier, as sent: never interpreted, so
+    /// a code no version of this SDK has heard of still arrives. Null if none.
+    code: ?[]const u8 = null,
+    /// The upstream's `type`, when it sent one.
+    type: ?[]const u8 = null,
+    /// Safe to display: redacted, bounded, free of control bytes. Never empty.
+    message: []const u8,
+    http_status: ?u16 = null,
+    request_id: ?[]const u8 = null,
+    retry: ModelErrorRetry,
+    retry_after_ms: ?u64 = null,
+    /// Physical attempts of the request that failed.
+    attempts: u32,
+    /// A string field above was cut at its size limit.
+    truncated: bool = false,
+};
+
 pub const FileReferenceLocator = union(enum) {
     workspace_path: []const u8,
     absolute_path: []const u8,
@@ -373,6 +418,8 @@ pub const CoreEvent = union(enum) {
         turn: u32,
     },
     run_state: RunState,
+    /// The structured reason a Run stopped with `STOP_API_ERROR`.
+    model_error: ModelError,
     permission_provenance: PermissionProvenance,
     /// The system prompt this Run sends differs from the previous Run's (the
     /// Session's first Run, a profile change, a model or tool-surface change).
@@ -785,6 +832,8 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
             .tool_result => |value| try validateFileReferences(value.file_refs),
             .file_changes => |value| try validateFileChanges(value.changes),
             .input_adopted => |value| if (value.input_id == 0 or value.sequence == 0 or value.turn == 0)
+                return error.InvalidPayload,
+            .model_error => |value| if (value.run_id == 0 or value.message.len == 0 or value.attempts == 0)
                 return error.InvalidPayload,
             else => {},
         }
@@ -1741,6 +1790,20 @@ test "CoreEvent decoder normalizes malformed and invalid inputs" {
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"retry_notice\":{\"attempt\":1,\"max\":2}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"retry_notice\":{\"attempt\":-1,\"max\":2,\"delay_ms\":3}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"retry_notice\":{\"attempt\":1,\"max\":2,\"delay_ms\":18446744073709551616}}"));
+    {
+        const decoded = try decodeCoreEvent(a, "{\"model_error\":{\"run_id\":7,\"category\":\"payment_required\",\"code\":\"never_heard_of_it\",\"type\":null,\"message\":\"Top up\",\"http_status\":402,\"request_id\":\"req-1\",\"retry\":\"not_retryable\",\"retry_after_ms\":null,\"attempts\":2,\"truncated\":false,\"added_later\":true}}");
+        defer decoded.deinit();
+        const detail = decoded.value.known.model_error;
+        try std.testing.expectEqual(@as(u64, 7), detail.run_id);
+        try std.testing.expectEqual(ModelErrorCategory.payment_required, detail.category);
+        try std.testing.expectEqualStrings("never_heard_of_it", detail.code.?);
+        try std.testing.expectEqual(@as(?u16, 402), detail.http_status);
+        try std.testing.expectEqual(@as(u32, 2), detail.attempts);
+    }
+    // A model_error always says which Run, something to show, and how many tries.
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"model_error\":{\"run_id\":0,\"category\":\"unknown\",\"message\":\"m\",\"retry\":\"unknown\",\"attempts\":1}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"model_error\":{\"run_id\":1,\"category\":\"unknown\",\"message\":\"\",\"retry\":\"unknown\",\"attempts\":1}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"model_error\":{\"run_id\":1,\"category\":\"unknown\",\"message\":\"m\",\"retry\":\"unknown\",\"attempts\":0}}"));
     // input_adopted names an accepted input: id, sequence and turn are never zero.
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"input_adopted\":{\"input_id\":0,\"sequence\":1,\"turn\":1}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"input_adopted\":{\"input_id\":1,\"sequence\":0,\"turn\":1}}"));

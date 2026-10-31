@@ -17,6 +17,13 @@ with metacodes.Runtime(tools=["Read", "Glob", "Grep"]) as runtime:
     print(result.text, result.stop_reason, result.usage)
 ```
 
+A Run that stops on the model returns normally with `stop_reason == "api_error"`,
+and `result.model_error` says why: `category`, `code` and `type` (the provider's,
+verbatim), `message` (safe to display), `http_status`, `request_id`, `retry`
+(`"retryable"`, `"not_retryable"` or `"unknown"`), `retry_after_ms` and
+`attempts`. It is `None` on any other stop. The SDK attaches no meaning to
+`code`; whether it means "add funds" is yours to decide.
+
 The API key comes from `api_key=`, else the provider's usual variable
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`), else
 `METACODES_API_KEY`. `base_url=` is the full endpoint; empty means the

@@ -559,7 +559,7 @@ test "L2 SessionHost reports a poisoned Session, drops its queue and refuses mor
     try waitFor(&hosted.journal, "\"type\":\"session_poisoned\"", 1);
 
     try std.testing.expectEqual(@as(usize, 1), fatal.calls);
-    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"run_done\",\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":null,\"error_name\":\"CallbackFailed\"}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"run_done\",\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":null,\"error_name\":\"CallbackFailed\",\"model_error\":null}"));
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"session_poisoned\",\"data\":{\"error_name\":\"CallbackFailed\",\"dropped\":1}"));
     // The queued submission never ran.
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"user_message\""));
@@ -699,4 +699,37 @@ test "L2 SessionHost options: UI timeout, queue bound, turn limit, no transcript
     var projects_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const projects = try std.fmt.bufPrintZ(&projects_buf, "{s}/projects", .{legacy});
     try std.testing.expect(!pfs.exists(projects.ptr));
+}
+
+test "L2 #408 a hosted Run's run_done carries its model failure, and the next Run's does not" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var workspace_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &workspace_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    const ok = try textSse(a, "fine now");
+    defer a.free(ok);
+    var server = try harness.MockServer.startHttpCassette(
+        &.{ "{\"error\":{\"code\":\"insufficient_balance\",\"message\":\"Top up\"}}", ok },
+        &.{ "HTTP/1.1 402 Payment Required", "HTTP/1.1 200 OK" },
+    );
+    defer server.stop();
+    server.extra_response_headers = "x-request-id: req-hosted-1\r\n";
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{}) });
+    defer host.release(hosted);
+    try hosted.submit(.{ .text = "fails" });
+    try hosted.submit(.{ .text = "succeeds" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"api_error\",\"error_name\":null,\"model_error\":{\"category\":\"payment_required\",\"code\":\"insufficient_balance\",\"type\":null,\"message\":\"Top up\",\"http_status\":402,\"request_id\":\"req-hosted-1\",\"retry\":\"not_retryable\",\"retry_after_ms\":null,\"attempts\":1,\"truncated\":false}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"data\":{\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\",\"error_name\":null,\"model_error\":null}"));
 }

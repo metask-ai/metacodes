@@ -34,6 +34,11 @@ scheme, `base_url` and model stay; refusals keep the previous credential.
 callback; the Run appends it at its next turn boundary and reports each
 adoption as `input_adopted`, and `RunResultV1.input_accepted_count` /
 `input_adopted_count` reconcile every submitted input on every return.
+A Run that stops with `STOP_API_ERROR` delivers one `model_error` event before
+its terminal `run_state`: category, the upstream's code and type passed through
+verbatim, a redacted displayable message, HTTP status, request id and retry
+guidance (`unknown` when it cannot be determined). The SDKs do not interpret the
+code; deciding "ask for funds" or "reauthenticate" from it is the Host's.
 `skill->resolve_catalog` merges the default `.agents/skills` sources with up to
 64 Host-registered sources. Their source priorities (`SkillSourceV1.priority`,
 `SkillCatalogQueryV1.default_user_source_priority` and

@@ -29,6 +29,7 @@ const submission_mod = @import("submission.zig");
 const log = @import("../util/log.zig");
 const util_json = @import("../util/json.zig");
 const wire = @import("../core/protocol/wire.zig");
+const model_error = @import("../api/model_error.zig");
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
@@ -541,6 +542,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         options.tool_observer = if (run_control) |control| control.observer() else null;
         options.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
         options.project_rule_gate = if (run_control) |control| control.formalGate() else null;
+        var model_failure: ?model_error.Detail = null;
+        options.model_error_out = &model_failure;
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),
@@ -566,7 +569,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         };
 
         app.persistTranscript();
-        announceRunDone(&journal, web_alloc, @tagName(result.stop_reason), null);
+        announceRunFinished(&journal, web_alloc, @tagName(result.stop_reason), if (model_failure) |*detail| detail else null);
 
         // run 因 abort 结束:据 reason 决定退出还是继续(复位供下一轮)。
         // user_ctrl_c=生成期真 SIGINT → 退出;user_interrupt=浏览器 Stop → 继续。
@@ -584,6 +587,23 @@ pub fn announceRunDone(journal: *EventJournal, allocator: std.mem.Allocator, sto
     const line = stringifyJson(allocator, .{
         .run_done = .{ .stop_reason = stop_reason, .err = err_name },
     }) catch return;
+    defer allocator.free(line);
+    journal.append(line);
+}
+
+/// A Run that returned. On a model failure `err` is the displayable message and
+/// `model_error` the structured detail (issue #408); any other stop writes
+/// exactly what `announceRunDone` does.
+pub fn announceRunFinished(journal: *EventJournal, allocator: std.mem.Allocator, stop_reason: []const u8, failure: ?*const model_error.Detail) void {
+    const detail = failure orelse return announceRunDone(journal, allocator, stop_reason, null);
+    const view = detail.view();
+    const line = stringifyJson(allocator, .{
+        .run_done = .{ .stop_reason = stop_reason, .err = view.message, .model_error = view },
+    }) catch {
+        // The notification matters more than its detail.
+        announceRunDone(journal, allocator, stop_reason, null);
+        return;
+    };
     defer allocator.free(line);
     journal.append(line);
 }

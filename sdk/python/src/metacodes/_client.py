@@ -224,6 +224,27 @@ class UiRequest:
 
 
 @dataclass
+class ModelError:
+    """Why a Run stopped with ``stop_reason == "api_error"``.
+
+    ``code`` is the upstream's identifier exactly as sent; the SDK attaches no
+    meaning to it. ``message`` is safe to display: redacted and bounded.
+    ``retry`` is ``"retryable"``, ``"not_retryable"`` or ``"unknown"``.
+    """
+
+    category: str
+    message: str
+    retry: str
+    attempts: int
+    code: Optional[str] = None
+    type: Optional[str] = None
+    http_status: Optional[int] = None
+    request_id: Optional[str] = None
+    retry_after_ms: Optional[int] = None
+    truncated: bool = False
+
+
+@dataclass
 class RunResult:
     text: str
     stop_reason: str
@@ -233,6 +254,7 @@ class RunResult:
     segments: List[Dict[str, Any]]
     input_accepted: int = 0
     input_adopted: int = 0
+    model_error: Optional[ModelError] = None
 
 
 class _RunState:
@@ -245,6 +267,7 @@ class _RunState:
         self.pending: Dict[int, List[str]] = {}
         self.final_text = ""
         self.segments: List[Dict[str, Any]] = []
+        self.model_error: Optional[ModelError] = None
         self.usage = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -267,6 +290,19 @@ class _RunState:
                 self.pending.setdefault(group, []).append(text)
             elif disposition == "final":
                 self.final_text = "".join(self.pending.pop(group, [])) + text
+        elif tag == "model_error" and isinstance(payload, dict):
+            self.model_error = ModelError(
+                category=payload["category"],
+                message=payload["message"],
+                retry=payload["retry"],
+                attempts=payload["attempts"],
+                code=payload.get("code"),
+                type=payload.get("type"),
+                http_status=payload.get("http_status"),
+                request_id=payload.get("request_id"),
+                retry_after_ms=payload.get("retry_after_ms"),
+                truncated=bool(payload.get("truncated", False)),
+            )
         elif tag == "usage" and isinstance(payload, dict):
             for key in self.usage:
                 self.usage[key] += int(payload.get(key, 0) or 0)
@@ -679,6 +715,7 @@ class Session:
             segments=state.segments,
             input_accepted=result.input_accepted_count,
             input_adopted=result.input_adopted_count,
+            model_error=state.model_error,
         )
 
     def stream(self, prompt: str, *, max_turns: Optional[int] = None) -> "EventStream":

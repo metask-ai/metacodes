@@ -158,6 +158,8 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         options.tool_observer = if (run_control) |control| control.observer() else null;
         options.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
         options.project_rule_gate = if (run_control) |control| control.formalGate() else null;
+        var model_failure: ?@import("../api/model_error.zig").Detail = null;
+        options.model_error_out = &model_failure;
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),
@@ -181,7 +183,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         };
 
         app.persistTranscript();
-        web_session.announceRunDone(&host.journal, infra, @tagName(result.stop_reason), null);
+        web_session.announceRunFinished(&host.journal, infra, @tagName(result.stop_reason), if (model_failure) |*detail| detail else null);
         reapAgentDone(app, &be, host.id, infra); // 本轮内完成的后台 job → 发 done
 
         // abort 复位:user_interrupt(前端 Stop)复位继续下一条;user_ctrl_c(host 停)由循环条件
