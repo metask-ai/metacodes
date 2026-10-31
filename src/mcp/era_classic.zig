@@ -1,13 +1,14 @@
-//! MCP Classic adapter for 2025-11-25 and 2025-06-18 in Revision 7.
+//! MCP Classic (`initialize` handshake) era adapter.
 //!
-//! This is external protocol interoperability only. It does not expose or
-//! restore any older AgentCore ABI revision.
+//! This is external protocol interoperability only: it does not expose or
+//! restore any older AgentCore ABI revision. The strict window is 2025-11-25
+//! and 2025-06-18; `wire.Conformance.interop` also accepts 2025-03-26 and
+//! 2024-11-05, which a server may select from the 2025-11-25 request.
 
 const std = @import("std");
-const canonical = @import("mcp_canonical.zig");
-const wire = @import("mcp_wire.zig");
+const canonical = @import("canonical.zig");
+const wire = @import("wire.zig");
 
-const EmptyCapabilities = struct {};
 const EmptyParamsDto = struct {};
 const ImplementationDto = struct {
     name: []const u8,
@@ -15,15 +16,8 @@ const ImplementationDto = struct {
 };
 const InitializeParamsDto = struct {
     protocolVersion: []const u8,
-    capabilities: EmptyCapabilities = .{},
+    capabilities: wire.ClientCapabilities,
     clientInfo: ImplementationDto,
-};
-const CursorParamsDto = struct {
-    cursor: []const u8,
-};
-const CallParamsDto = struct {
-    name: []const u8,
-    arguments: std.json.Value,
 };
 
 pub const ClassicProfile = struct {
@@ -44,6 +38,16 @@ pub const ClassicProfile = struct {
                 .protocol_version = canonical.CLASSIC_2025_06_VERSION,
                 .supports_task_metadata = false,
             },
+            .classic_2025_03_26 => .{
+                .era = era,
+                .protocol_version = canonical.CLASSIC_2025_03_VERSION,
+                .supports_task_metadata = false,
+            },
+            .classic_2024_11_05 => .{
+                .era = era,
+                .protocol_version = canonical.CLASSIC_2024_11_VERSION,
+                .supports_task_metadata = false,
+            },
         };
     }
 };
@@ -53,6 +57,7 @@ pub fn encodeInitializeRequest(
     id: u64,
     profile: ClassicProfile,
     client: wire.ClientInfo,
+    capabilities: wire.ClientCapabilities,
     limits: canonical.Limits,
 ) canonical.Error![]u8 {
     try client.validate(limits);
@@ -62,6 +67,7 @@ pub fn encodeInitializeRequest(
         .method = "initialize",
         .params = InitializeParamsDto{
             .protocolVersion = profile.protocol_version,
+            .capabilities = capabilities,
             .clientInfo = .{ .name = client.name, .version = client.version },
         },
     });
@@ -75,48 +81,6 @@ pub fn encodeInitializedNotification(allocator: std.mem.Allocator) error{OutOfMe
     }, .{}) catch return error.OutOfMemory;
 }
 
-pub fn encodeListToolsRequest(
-    allocator: std.mem.Allocator,
-    id: u64,
-    cursor: ?[]const u8,
-    limits: canonical.Limits,
-) canonical.Error![]u8 {
-    if (cursor) |value| {
-        try canonical.validateText(value, limits.max_cursor_bytes);
-        return stringify(allocator, .{
-            .jsonrpc = wire.JSON_RPC_VERSION,
-            .id = id,
-            .method = "tools/list",
-            .params = CursorParamsDto{ .cursor = value },
-        });
-    }
-    return stringify(allocator, .{
-        .jsonrpc = wire.JSON_RPC_VERSION,
-        .id = id,
-        .method = "tools/list",
-        .params = EmptyParamsDto{},
-    });
-}
-
-pub fn encodeCallToolRequest(
-    allocator: std.mem.Allocator,
-    id: u64,
-    name: []const u8,
-    arguments_json: []const u8,
-    limits: canonical.Limits,
-) canonical.Error![]u8 {
-    try canonical.validateToolName(name, limits);
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    const arguments = try wire.parseArguments(scratch.allocator(), arguments_json, limits);
-    return stringify(allocator, .{
-        .jsonrpc = wire.JSON_RPC_VERSION,
-        .id = id,
-        .method = "tools/call",
-        .params = CallParamsDto{ .name = name, .arguments = arguments },
-    });
-}
-
 pub fn parseInitializeResponse(
     backing: std.mem.Allocator,
     encoded: []const u8,
@@ -124,14 +88,30 @@ pub fn parseInitializeResponse(
     requested_profile: ClassicProfile,
     limits: canonical.Limits,
 ) error{OutOfMemory}!canonical.Outcome(canonical.OwnedHandshake) {
+    return parseInitializeResponseWith(backing, encoded, expected_id, requested_profile, limits, .strict);
+}
+
+/// `interop` differs from `strict` in three places: `serverInfo` and
+/// `capabilities` may be absent, a present capability of any shape counts as
+/// declared, and the two older revisions are accepted.
+pub fn parseInitializeResponseWith(
+    backing: std.mem.Allocator,
+    encoded: []const u8,
+    expected_id: u64,
+    requested_profile: ClassicProfile,
+    limits: canonical.Limits,
+    conformance: wire.Conformance,
+) error{OutOfMemory}!canonical.Outcome(canonical.OwnedHandshake) {
+    const strict = conformance == .strict;
     var owned = canonical.OwnedHandshake.init(backing, requested_profile.era);
     const allocator = owned.allocator();
-    const envelope = wire.parseEnvelope(
+    const envelope = wire.parseEnvelopeWith(
         allocator,
         encoded,
         expected_id,
         .initialize,
         limits,
+        conformance,
     ) catch |err| {
         owned.deinit();
         return err;
@@ -151,16 +131,15 @@ pub fn parseInitializeResponse(
         owned.deinit();
         return .{ .diagnostic = canonical.Diagnostic.init(.missing_required_field, .initialize) };
     };
-    const capabilities = result.object.get("capabilities") orelse {
+    const capabilities = result.object.get("capabilities");
+    const server_info = result.object.get("serverInfo");
+    if (strict and (capabilities == null or server_info == null)) {
         owned.deinit();
         return .{ .diagnostic = canonical.Diagnostic.init(.missing_required_field, .initialize) };
-    };
-    const server_info = result.object.get("serverInfo") orelse {
-        owned.deinit();
-        return .{ .diagnostic = canonical.Diagnostic.init(.missing_required_field, .initialize) };
-    };
-    if (version != .string or capabilities != .object or server_info != .object or
-        !validImplementation(server_info, limits))
+    }
+    if (version != .string or
+        (strict and (capabilities.? != .object or server_info.? != .object or
+            !validImplementation(server_info.?, limits))))
     {
         owned.deinit();
         return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .initialize) };
@@ -169,7 +148,7 @@ pub fn parseInitializeResponse(
         owned.deinit();
         return .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .initialize) };
     };
-    if (selected_era == .modern_2026_07_28) {
+    if (selected_era.isModern() or (strict and !selected_era.inStrictWindow())) {
         owned.deinit();
         return .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .initialize) };
     }
@@ -180,23 +159,29 @@ pub fn parseInitializeResponse(
     };
     versions[0] = version.string;
     owned.supported_versions = versions;
-    owned.capabilities_json = canonical.encodeValue(allocator, capabilities, limits.max_text_bytes) catch |err| {
-        owned.deinit();
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .diagnostic = mapCanonical(err, .initialize) };
-    };
-    if (capabilities.object.get("tools")) |tools| {
-        if (tools != .object) {
+    if (capabilities) |declared| if (declared == .object) {
+        owned.capabilities_json = canonical.encodeValue(allocator, declared, limits.max_text_bytes) catch |err| {
             owned.deinit();
-            return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .initialize) };
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .diagnostic = mapCanonical(err, .initialize) };
+        };
+        if (declared.object.get("tools")) |tools| {
+            if (strict and tools != .object) {
+                owned.deinit();
+                return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .initialize) };
+            }
+            owned.capabilities.tool_catalog_available = true;
         }
-        owned.capabilities.tool_catalog_available = true;
-    }
-    owned.server_info_json = canonical.encodeValue(allocator, server_info, limits.max_text_bytes) catch |err| {
-        owned.deinit();
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .diagnostic = mapCanonical(err, .initialize) };
+        owned.capabilities.resources_available = declared.object.get("resources") != null;
+        owned.capabilities.prompts_available = declared.object.get("prompts") != null;
     };
+    if (server_info) |info| {
+        owned.server_info_json = canonical.encodeValue(allocator, info, limits.max_text_bytes) catch |err| {
+            owned.deinit();
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .diagnostic = mapCanonical(err, .initialize) };
+        };
+    }
     owned.instructions = canonical.optionalText(result.object, "instructions", limits.max_text_bytes) catch {
         owned.deinit();
         return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .initialize) };
@@ -404,6 +389,7 @@ test "Classic lifecycle encodes the selected exact initialize then initialized" 
         ClassicProfile.forEra(.classic_2025_11_25).?,
         .{ .name = "agentcore", .version = "6" },
         .{},
+        .{},
     );
     defer allocator.free(request);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
@@ -432,7 +418,7 @@ test "Classic tools list shared by both supported eras encodes empty params as a
     }) |era|
         try std.testing.expect(ClassicProfile.forEra(era) != null);
 
-    const request = try encodeListToolsRequest(std.testing.allocator, 3, null, .{});
+    const request = try wire.encodeRequest(std.testing.allocator, 3, .classic_2025_11_25, .{ .name = "c", .version = "1" }, .{}, "tools/list", "{}", .{});
     defer std.testing.allocator.free(request);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request, .{});
     defer parsed.deinit();

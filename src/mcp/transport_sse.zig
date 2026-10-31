@@ -47,6 +47,8 @@ pub const SseTransport = struct {
     protocol_version: ?[]const u8 = null,
     deadline_ms: ?i64 = null,
     abort: ?*const AbortSignal = null,
+    /// The last POST's body went out whole, so the server may have acted on it.
+    request_written: bool = false,
 
     /// POSTs; the stream has a client of its own, used only by the reader.
     post_client: std.http.Client,
@@ -329,6 +331,7 @@ pub const SseTransport = struct {
     }
 
     fn post(self: *SseTransport, endpoint_uri: std.Uri, json: []const u8) !u16 {
+        self.request_written = false;
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         var extra: std.ArrayList(std.http.Header) = .empty;
@@ -347,6 +350,7 @@ pub const SseTransport = struct {
         try self.registry.registerMonitored(self.allocator, self.abort, ctx, shutdownRequest, self.remainingMs());
         defer self.registry.unregister(ctx);
         http_connection.sendBodyComplete(&request, @constCast(json)) catch return self.transportError();
+        self.request_written = true;
         var redirect: [1024]u8 = undefined;
         var response = request.receiveHead(&redirect) catch return self.transportError();
         const status = http_status.ResponseStatus.capture(&response).code;

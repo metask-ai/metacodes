@@ -5,14 +5,13 @@ pub const session_checkpoint = @import("session_checkpoint.zig");
 pub const session_budget = @import("session_budget.zig");
 pub const session_authority = @import("session_authority.zig");
 pub const session_permission = @import("session_permission.zig");
-pub const mcp_protocol = @import("mcp_protocol.zig");
-pub const mcp_catalog = @import("mcp_catalog.zig");
-pub const mcp_runtime = @import("mcp_runtime.zig");
-pub const mcp_instance_pool = @import("mcp_instance_pool.zig");
-pub const mcp_negotiation = @import("mcp_negotiation.zig");
+pub const mcp_catalog = core.mcp_catalog;
+pub const mcp_runtime = core.mcp_runtime;
+pub const mcp_instance_pool = core.mcp_instance_pool;
+pub const mcp_negotiation = core.mcp_negotiation;
 pub const mcp_session = @import("mcp_session.zig");
 pub const mcp_checkpoint = @import("mcp_checkpoint.zig");
-pub const mcp_canonical = @import("mcp_canonical.zig");
+pub const mcp_canonical = core.mcp_canonical;
 pub const prompt_checkpoint = @import("prompt_checkpoint.zig");
 pub const goal_checkpoint = @import("goal_checkpoint.zig");
 const builtin = @import("builtin");
@@ -397,6 +396,8 @@ const AbiMcpConnector = struct {
                 .modern_2026_07_28 => wire.MCP_ERA_2026_07_28,
                 .classic_2025_11_25 => wire.MCP_ERA_2025_11_25,
                 .classic_2025_06_18 => wire.MCP_ERA_2025_06_18,
+                // The ABI names three eras, and its strict client asks for no other.
+                .classic_2025_03_26, .classic_2024_11_05 => return error.InvalidConnector,
             },
             self.timeout_ms,
             &connection_ctx,
@@ -10143,7 +10144,7 @@ test "Revision 17 AgentCore allow_session on Write covers later writes to the sa
 }
 
 test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -10342,7 +10343,7 @@ test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
 }
 
 test "Revision 6 MCP view update is idle atomic and invalidates schema-bound grants" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     const Cleanup = struct {
         fn session(value: *AbiSession) void {
             var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
@@ -10511,7 +10512,7 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
 }
 
 test "checkpoint restores compatible MCP view and exact Session grant" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     const Cleanup = struct {
         fn session(value: *AbiSession) void {
             var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
@@ -10757,7 +10758,7 @@ test "checkpoint restores compatible MCP view and exact Session grant" {
 
 /// #389 fixture: one server binding whose configuration the tests replace.
 const EndpointSwapFixture = struct {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     const binding = [_]u8{0x7a} ** 32;
     const fingerprint_a = [_]u8{0xa0} ** 32;
     const fingerprint_b = [_]u8{0xb0} ** 32;

@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
-const runtime = @import("mcp_runtime.zig");
+const runtime = @import("runtime.zig");
 
 pub const InstanceId = enum(u64) { _ };
 
@@ -172,7 +172,7 @@ fn testClient(server: anytype, binding_byte: u8) !*runtime.Client {
 }
 
 test "InstanceId is never reused and stale ids fail cleanly" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = @import("test_support.zig");
     var server = fixture.Server{};
     var pool = Pool.init(std.testing.allocator);
     defer pool.deinit();
@@ -188,7 +188,7 @@ test "InstanceId is never reused and stale ids fail cleanly" {
 }
 
 test "dispatch lease keeps Client alive after catalog owner releases" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = @import("test_support.zig");
     var server = fixture.Server{};
     var pool = Pool.init(std.testing.allocator);
     defer pool.deinit();

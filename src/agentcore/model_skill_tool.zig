@@ -810,8 +810,8 @@ test "Skill execution policy cannot re-authorize a denied MCP base tool" {
 }
 
 test "Skill execution policy matches MCP metadata against canonical tool identity" {
-    const fixture = @import("mcp_test_support.zig");
-    const mcp_catalog = @import("mcp_catalog.zig");
+    const fixture = core.mcp_test_support;
+    const mcp_catalog = core.mcp_catalog;
     var server = fixture.Server{};
     const binding = [_]u8{0x65} ** 32;
     const specs = [_]mcp_catalog.ServerSpec{.{

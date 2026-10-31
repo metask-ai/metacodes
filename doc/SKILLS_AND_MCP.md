@@ -302,8 +302,9 @@ same tool in those lists and rules. Resources are read through
 
 ### Protocol
 
-The client (`src/mcp/client.zig`) speaks MCP 2026-07-28 and the handshake
-revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
+The client (`src/mcp/client.zig`, the one implementation every entry point
+runs; see [MCP_ARCHITECTURE.md](MCP_ARCHITECTURE.md)) speaks MCP 2026-07-28 and
+the handshake revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
 
 - It first sends `server/discover`. A 2026-07-28 answer selects the stateless
   protocol: every request carries `_meta` (protocol version, client
@@ -328,7 +329,14 @@ revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
   delay (1 s by default, 10 s at most), a GET with `Last-Event-ID` (the id of
   the last event received whole) and the session headers reopens it and the server replays the rest (2025-03-26
   through 2025-11-25; at most 3 attempts that bring nothing new). On
-  2026-07-28 the request is lost instead and the caller re-issues it.
+  2026-07-28 the answer is lost instead, and the client reports the call as
+  indeterminate rather than sending it again.
+- A `tools/call` is sent once. A failure after the request left (a timeout, a
+  dropped connection, a server exit) tells the model that the call may have
+  executed and to check its effect before repeating it. A POST whose body was
+  never fully written, or that a 401 refused, is known not to have run and is
+  retried. A `tools/call` does not reuse an HTTP connection idle for more than
+  a second, since the race with a server closing it could not be retried.
 - **HTTP+SSE** (`type: "sse"`, revision 2024-11-05, which many hosted
   servers still offer at an `/sse` URL): a long-lived `GET <url>`
   (`Accept: text/event-stream`, the configured headers) whose first event,

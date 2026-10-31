@@ -187,7 +187,7 @@ pub const McpToolDescription = struct {
     server_binding_identity: [32]u8,
     schema_fingerprint: [32]u8,
     permission_binding: [32]u8,
-    era: @import("mcp_canonical.zig").Era,
+    era: @import("metacodes-core").mcp_canonical.Era,
 };
 
 /// Internal canonical restore result. Exact C/Rust/Zig DTOs are deliberately

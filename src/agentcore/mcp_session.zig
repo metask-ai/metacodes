@@ -2,10 +2,10 @@
 
 const std = @import("std");
 const core = @import("metacodes-core");
-const catalog = @import("mcp_catalog.zig");
-const canonical = @import("mcp_canonical.zig");
-const runtime = @import("mcp_runtime.zig");
-const schema = @import("mcp_schema.zig");
+const catalog = core.mcp_catalog;
+const canonical = core.mcp_canonical;
+const runtime = core.mcp_runtime;
+const schema = core.mcp_schema;
 const session_permission = @import("session_permission.zig");
 
 pub const MAX_MODEL_TOOL_NAME_BYTES: usize = catalog.MAX_MODEL_TOOL_NAME_BYTES;
@@ -511,10 +511,6 @@ pub const Environment = struct {
             },
             .out_of_memory => return error.OutOfMemory,
         }
-        const cancellation = runtime.Cancellation{
-            .ctx = if (tool_ctx.abort) |abort| abort else null,
-            .is_cancelled_fn = abortAdapter,
-        };
         var instance = self.view.snapshot.retainInstance(
             entry.server.instance_id,
         ) catch |err| return .{ .host_failed = try encodeFailure(
@@ -532,7 +528,7 @@ pub const Environment = struct {
             tool_ctx.result_budget,
             entry.tool,
             arguments_json,
-            cancellation,
+            tool_ctx.abort,
         );
         return switch (outcome) {
             .result => |body| .{ .ok = body },
@@ -639,11 +635,6 @@ fn selectionFingerprint(
     return result;
 }
 
-fn abortAdapter(raw: ?*const anyopaque) bool {
-    const abort: *const core.util_abort.AbortSignal = @ptrCast(@alignCast(raw orelse return false));
-    return abort.isAborted();
-}
-
 fn encodeFailure(
     allocator: std.mem.Allocator,
     failure: runtime.CallFailure,
@@ -705,7 +696,7 @@ test "model-facing MCP name is stable bounded and does not expose raw tool name"
 }
 
 test "Skill MCP rules resolve opaque aliases through canonical identity" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     var server = fixture.Server{};
     const binding = [_]u8{0x64} ** 32;
     const specs = [_]catalog.ServerSpec{.{
@@ -749,7 +740,7 @@ test "Skill MCP rules resolve opaque aliases through canonical identity" {
 }
 
 test "Session MCP view never auto-selects wider Runtime authority" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     var weather = fixture.Server{ .tool_name = "weather" };
     var calendar = fixture.Server{ .tool_name = "events" };
     const weather_binding = [_]u8{0x65} ** 32;
@@ -788,7 +779,7 @@ test "Session MCP view never auto-selects wider Runtime authority" {
 }
 
 test "Session cannot select a Tool with a broken Provider projection" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     var server = fixture.Server{
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
     };
@@ -816,7 +807,7 @@ test "Session cannot select a Tool with a broken Provider projection" {
 }
 
 test "Session MCP view binds identity validates argument envelope and retains generation" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     const Base = struct {
         fn dispatch(
             _: *const anyopaque,
@@ -986,7 +977,7 @@ test "Session MCP view binds identity validates argument envelope and retains ge
 }
 
 test "Session MCP budget drives the streaming projector threshold" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     const Base = struct {
         fn dispatch(
             _: *const anyopaque,
@@ -1096,7 +1087,7 @@ test "Session MCP budget drives the streaming projector threshold" {
 }
 
 test "MCP expiry excludes new Runs without mutating an admitted Run environment" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     const FakeClock = struct {
         now_ns: core.util_time.Nanos,
 
@@ -1208,7 +1199,7 @@ test "MCP expiry excludes new Runs without mutating an admitted Run environment"
 }
 
 test "Run materialization tolerates a selected server removed by Apply" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     var server = fixture.Server{};
     const binding = [_]u8{0x73} ** 32;
     const specs = [_]catalog.ServerSpec{.{
@@ -1240,7 +1231,7 @@ test "Run materialization tolerates a selected server removed by Apply" {
 }
 
 test "Run materialization invalidates a selected tool after schema drift" {
-    const fixture = @import("mcp_test_support.zig");
+    const fixture = core.mcp_test_support;
     var server = fixture.Server{};
     const binding = [_]u8{0x74} ** 32;
     const specs = [_]catalog.ServerSpec{.{
@@ -1274,8 +1265,8 @@ test "Run materialization invalidates a selected tool after schema drift" {
 }
 
 test "all three protocol eras enter the same Session identity and dispatch seam" {
-    const fixture = @import("mcp_test_support.zig");
-    const negotiation = @import("mcp_negotiation.zig");
+    const fixture = core.mcp_test_support;
+    const negotiation = core.mcp_negotiation;
     const Exercise = struct {
         const Result = struct {
             model_name: [MAX_MODEL_TOOL_NAME_BYTES]u8,
@@ -1398,4 +1389,94 @@ test "all three protocol eras enter the same Session identity and dispatch seam"
     try std.testing.expectEqual(@as(u32, 1), modern_result.calls);
     try std.testing.expectEqual(@as(u32, 1), legacy_result.calls);
     try std.testing.expectEqual(@as(u32, 1), classic_06_result.calls);
+}
+
+test "the same server through the product registry and the AgentCore overlay gives the same result" {
+    const fixture = core.mcp_test_support;
+    const Base = struct {
+        fn dispatch(
+            _: *const anyopaque,
+            _: *const core.tool_context.ToolContext,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!core.tools.ToolDispatchOutcome {
+            return .host_fatal;
+        }
+        fn name(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn noMeta(_: *const anyopaque, _: []const u8) ?core.tools.ToolMeta {
+            return null;
+        }
+        const unit: u8 = 0;
+        fn dispatcher() core.tools.ToolDispatcher {
+            return .{ .ctx = &unit, .dispatchFn = dispatch, .metadataFn = noMeta, .nameAtFn = name };
+        }
+    };
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var tool_context = core.tool_context.ToolContext{ .allocator = allocator, .artifact_root = root };
+    const arguments = "{\"city\":\"Paris\"}";
+
+    // AgentCore: Runtime catalog, Session view, Run environment.
+    var overlay_server = fixture.Server{};
+    const binding = [_]u8{0x7d} ** 32;
+    const specs = [_]catalog.ServerSpec{.{
+        .binding = binding,
+        .namespace = "weather",
+        .connector = overlay_server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "parity", .version = "1" },
+    }};
+    var manager = try catalog.Manager.init(allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+    var view = try View.init(allocator, snapshot, &.{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather",
+    }}, .fresh);
+    defer view.deinit();
+    var environment = try Environment.init(allocator, &view, &.{}, Base.dispatcher(), null);
+    defer environment.deinit();
+    var overlay = try environment.surface().dispatcher.dispatch(&tool_context, view.entries[0].model_name, arguments);
+    defer overlay.deinit(allocator);
+
+    // The product: the client under its own profile, the dynamic registry.
+    var product_server = fixture.Server{};
+    var opener = runtime.HostOpener{
+        .gpa = allocator,
+        .connector = product_server.connector(),
+        .transport = .stdio,
+        .timeout_ms = 1000,
+    };
+    var client = switch (core.mcp_client.establish(allocator, .{
+        .opener = opener.interface(),
+        .transport_kind = .stdio,
+        .policy = .auto,
+        .profile = core.mcp_client.Profile.product,
+        .client = .{ .name = "parity", .version = "1" },
+    })) {
+        .connected => |connected| connected,
+        .failed => return error.TestUnexpectedResult,
+    };
+    defer client.close();
+    var registry = core.tools_dynamic.DynRegistry.init(allocator);
+    defer registry.deinit();
+    var session = core.mcp_registry_bridge.McpSession.init(allocator, &client);
+    defer session.deinit();
+    try session.registerTools(&registry, "weather");
+    var product = try registry.find("mcp__weather__weather").?.execute(&tool_context, arguments);
+    defer product.deinit(allocator);
+
+    try std.testing.expect(overlay == .ok);
+    try std.testing.expectEqualStrings(overlay.ok.@"inline".bytes, product.@"inline".bytes);
+    // Their aliases differ by contract; the server saw one call each.
+    try std.testing.expect(!std.mem.eql(u8, view.entries[0].model_name, "mcp__weather__weather"));
+    try std.testing.expectEqual(@as(u32, 1), overlay_server.calls);
+    try std.testing.expectEqual(@as(u32, 1), product_server.calls);
 }

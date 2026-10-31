@@ -344,6 +344,7 @@ pub fn failureDetail(err: anyerror, job: *const Job) []const u8 {
         error.McpConnectFailed => "could not connect to the server URL",
         error.McpInvalidUrl => "invalid server URL",
         error.McpServerError => "the server answered with an HTTP 5xx error",
+        error.McpOutcomeIndeterminate => "the connection closed before the server answered",
         error.McpRedirected => "the server URL redirects (3xx); requests carry the configured headers and do not follow redirects, so configure the URL it redirects to",
         error.Aborted => "connection canceled",
         else => @errorName(err),

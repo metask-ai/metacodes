@@ -17,12 +17,19 @@ const result_budget = @import("../core/result_budget.zig");
 const tool_result = @import("../core/tool_result.zig");
 const tool_error = @import("../core/tool_error.zig");
 
-pub const Era = enum { modern_2026_07_28, classic_2025_11_25, classic_2025_06_18 };
+pub const Era = enum { modern_2026_07_28, classic_2025_11_25, classic_2025_06_18, classic_2025_03_26, classic_2024_11_05 };
 
 pub const Limits = struct {
     max_text_bytes: usize = 64 * 1024,
     max_json_depth: u16 = 64,
     max_json_nodes: u32 = 131_072,
+    /// `wire.Conformance.interop` in this scanner: the frame was already
+    /// correlated by the client, so a missing `jsonrpc` or `id` is tolerated.
+    /// A present numeric `id` naming another request never is.
+    interop_envelope: bool = false,
+    /// How large a result may stay inline when publishing it fails. Null is
+    /// `result_budget.PER_RESULT_MAX_BYTES`.
+    retain_inline_ceiling: ?u64 = null,
 };
 
 pub const DiagnosticCode = enum {
@@ -208,7 +215,7 @@ const ParseState = struct {
         switch (role) {
             .root => switch (field) {
                 .jsonrpc => if (kind != .string) return error.InvalidEnvelope,
-                .id => if (kind != .number) return error.ResponseIdMismatch,
+                .id => if (kind != .number and !self.limits.interop_envelope) return error.ResponseIdMismatch,
                 .result => {
                     self.root_result_seen = true;
                     if (kind != .object) return error.InvalidEnvelope;
@@ -271,15 +278,20 @@ const ParseState = struct {
     }
 
     fn finishString(self: *ParseState) !void {
-        if (!self.string_active or self.string_invalid_text) return error.InvalidField;
+        if (!self.string_active) return error.InvalidField;
+        // Control characters are illegal in protocol text, not in the content
+        // a result carries: a tool may legally report `\u001b[31m`. This is
+        // the rule `canonical.validateJsonValue` applies to the same frames.
+        if (self.string_invalid_text and self.stringIsProtocolText()) return error.InvalidField;
         defer self.string_active = false;
         const complete = self.string_len == self.string_prefix_len;
         const value = self.string_prefix[0..self.string_prefix_len];
         if (self.string_is_key) {
             const frame = self.current() orelse return error.InvalidJson;
             if (frame.kind != .object or !frame.expects_key) return error.InvalidJson;
-            if (self.string_len == 0 or self.string_len > self.limits.max_text_bytes)
-                return error.ResourceLimit;
+            if (self.string_len > self.limits.max_text_bytes) return error.ResourceLimit;
+            // `""` is a legal key in the data a result carries, not in the envelope.
+            if (self.string_len == 0 and frame.role != .other) return error.ResourceLimit;
             var digest: [32]u8 = undefined;
             self.string_hash.final(&digest);
             const inserted = try frame.keys.getOrPut(self.allocator, digest);
@@ -319,6 +331,17 @@ const ParseState = struct {
             },
             else => {},
         }
+    }
+
+    fn stringIsProtocolText(self: *ParseState) bool {
+        if (self.string_is_key) {
+            const frame = self.current() orelse return true;
+            return frame.role != .other;
+        }
+        return switch (self.string_field) {
+            .jsonrpc, .result_type, .error_message => true,
+            else => false,
+        };
     }
 
     fn startNumber(self: *ParseState) !void {
@@ -380,10 +403,14 @@ const ParseState = struct {
     }
 
     fn finish(self: *ParseState) ParsedOutcome(struct { start: u64, end: u64, is_error: bool }) {
-        if (self.root_values != 1 or self.frames.items.len != 0 or
-            !self.root_jsonrpc_seen or !self.root_jsonrpc_ok)
+        if (self.root_values != 1 or self.frames.items.len != 0)
             return .{ .diagnostic = Diagnostic.init(.invalid_envelope) };
-        if (!self.root_id_seen or !self.root_id_ok)
+        const interop = self.limits.interop_envelope;
+        if (!interop and (!self.root_jsonrpc_seen or !self.root_jsonrpc_ok))
+            return .{ .diagnostic = Diagnostic.init(.invalid_envelope) };
+        if (self.root_id_seen and !self.root_id_ok)
+            return .{ .diagnostic = Diagnostic.init(.response_id_mismatch) };
+        if (!interop and !self.root_id_seen)
             return .{ .diagnostic = Diagnostic.init(.response_id_mismatch) };
         if (self.root_result_seen == self.root_error_seen)
             return .{ .diagnostic = Diagnostic.init(.invalid_envelope) };
@@ -467,6 +494,7 @@ fn publishRange(
     capture: *artifact_store.Capture,
     start: u64,
     length: u64,
+    retain_inline_ceiling: u64,
 ) !tool_result.ToolResultBody {
     var spool = try artifact_store.Spool.begin(allocator, artifact_root);
     defer spool.deinit(); // a no-op once `seal` has taken the buffers
@@ -475,7 +503,12 @@ fn publishRange(
     // known here, the blob is installed at the batch commit boundary, so a
     // fatal sibling in the same batch leaves nothing in the CAS. A publication
     // that fails there is a bounded tool error, as it was a structured error here.
-    return .{ .sealed = .{ .spool = try spool.seal(), .media_type = .json, .capture_complete = true } };
+    return .{ .sealed = .{
+        .spool = try spool.seal(),
+        .media_type = .json,
+        .capture_complete = true,
+        .retain_inline_ceiling = retain_inline_ceiling,
+    } };
 }
 
 pub fn project(
@@ -621,13 +654,14 @@ pub fn project(
     }
     if (length_u64 > artifact_store.MAX_ARTIFACT_BYTES)
         return .{ .diagnostic = Diagnostic.init(.resource_limit) };
-    const body = publishRange(allocator, artifact_root, capture, range.start, length_u64) catch |err| {
+    const retain_ceiling: u64 = limits.retain_inline_ceiling orelse result_budget.PER_RESULT_MAX_BYTES;
+    const body = publishRange(allocator, artifact_root, capture, range.start, length_u64, retain_ceiling) catch |err| {
         // Keep a complete bounded result renderable when CAS publication fails.
         if (!result_budget.retainInlineAfterFailedPublish(
             err,
             length_u64,
             true,
-            result_budget.PER_RESULT_MAX_BYTES,
+            retain_ceiling,
         )) {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .diagnostic = Diagnostic.init(.resource_limit) };
@@ -641,7 +675,7 @@ pub fn project(
     return .{ .result = body };
 }
 
-fn writeSuccessfulResultOfSize(
+pub fn writeSuccessfulResultOfSize(
     capture: *artifact_store.Capture,
     result_bytes: usize,
 ) !void {
@@ -665,7 +699,7 @@ fn writeSuccessfulResultOfSize(
     try capture.write("}");
 }
 
-fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) !void {
+pub fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) !void {
     const seed = try artifact_store.persist(allocator, root, "seed");
     _ = seed;
     const filler = try std.fmt.allocPrintSentinel(
@@ -744,115 +778,6 @@ test "stream projector inlines at caller per-result budget" {
     try std.testing.expect(outcome == .result);
     try std.testing.expect(outcome.result == .@"inline");
     try std.testing.expectEqual(@as(usize, 25_000), outcome.result.@"inline".bytes.len);
-}
-
-test "stream projector retains bounded result inline when publication fails" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
-    try fillSessionArtifactQuota(allocator, root);
-    var capture = try artifact_store.Capture.begin(allocator, root, MAX_RESPONSE_BYTES);
-    defer capture.deinit();
-    try writeSuccessfulResultOfSize(&capture, 30_000);
-    try capture.seal();
-
-    const budget = result_budget.Budget.fromModel(200_000);
-    var outcome = try project(
-        allocator,
-        &capture,
-        root,
-        7,
-        .modern_2026_07_28,
-        .{},
-        budget,
-        true,
-        true,
-    );
-    defer if (outcome == .result) outcome.result.deinit(allocator);
-    try std.testing.expect(outcome == .result);
-    // Sealed regardless of the full quota (#73): the failure surfaces at the
-    // batch commit boundary, where the loop's policy keeps a result within the
-    // inline-retention ceiling as bytes.
-    try std.testing.expect(outcome.result == .sealed);
-    var committed = try testCommitSealed(allocator, &outcome.result);
-    defer committed.deinit(allocator);
-    try std.testing.expect(!committed.is_error);
-    try std.testing.expectEqual(@as(usize, 30_000), committed.content.len);
-}
-
-/// What `tool_exec.publishSealedResults` does with a sealed body at the batch
-/// commit boundary; the failure-policy tests drive it directly.
-const TestCommitted = struct {
-    content: []u8,
-    is_error: bool,
-    fn deinit(self: *TestCommitted, allocator: std.mem.Allocator) void {
-        allocator.free(self.content);
-    }
-};
-
-fn testCommitSealed(allocator: std.mem.Allocator, body: *tool_result.ToolResultBody) !TestCommitted {
-    const tool_exec = @import("../core/tool_exec.zig");
-    var rendered = try body.render(allocator);
-    defer rendered.deinit(allocator);
-    var slots = [_]tool_exec.Slot{.{
-        .decision = .run,
-        .name = "mock__tool",
-        .id = "sid",
-        .input = "{}",
-        .content = try allocator.dupe(u8, rendered.bytes),
-        .sealed = body.takeSealedHandles(),
-    }};
-    errdefer for (&slots) |*slot| slot.deinit(allocator);
-    try tool_exec.publishSealedResults(&slots, allocator, .{ .bytes = [_]u8{'0'} ** 12 });
-    const content = slots[0].content.?;
-    slots[0].content = null;
-    const is_error = slots[0].is_error;
-    for (&slots) |*slot| slot.deinit(allocator);
-    return .{ .content = content, .is_error = is_error };
-}
-
-test "stream projector rejects over-ceiling result when publication fails" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
-    try fillSessionArtifactQuota(allocator, root);
-    var capture = try artifact_store.Capture.begin(allocator, root, MAX_RESPONSE_BYTES);
-    defer capture.deinit();
-    try writeSuccessfulResultOfSize(&capture, 96 * 1024);
-    try capture.seal();
-
-    const budget = result_budget.Budget.fromModel(1_000_000);
-    try std.testing.expectEqual(result_budget.PER_RESULT_MAX_BYTES, budget.per_result_bytes);
-    var outcome = try project(
-        allocator,
-        &capture,
-        root,
-        7,
-        .modern_2026_07_28,
-        .{},
-        budget,
-        true,
-        true,
-    );
-    defer if (outcome == .result) outcome.result.deinit(allocator);
-    // Above the ceiling the commit boundary cannot keep the bytes inline: the
-    // slot becomes the bounded ArtifactPublishFailed tool error — fail closed,
-    // as the projector's resource_limit diagnostic was at call time.
-    try std.testing.expect(outcome == .result);
-    try std.testing.expect(outcome.result == .sealed);
-    var committed = try testCommitSealed(allocator, &outcome.result);
-    defer committed.deinit(allocator);
-    try std.testing.expect(committed.is_error);
-    // `ArtifactPublishFailed` renders as the `io_error` tool error whose detail
-    // names the boundary.
-    try std.testing.expect(std.mem.indexOf(u8, committed.content, "\"io_error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, committed.content, "failed at the batch commit boundary") != null);
 }
 
 test "stream projector publishes only a large successful result range" {

@@ -256,3 +256,135 @@ test "MCP HTTP: a connection idle past the reuse window is not reused" {
     try std.testing.expectEqualStrings("tools/call", seen[seen.len - 1].method);
     try std.testing.expect(seen[seen.len - 2].conn != seen[seen.len - 1].conn);
 }
+
+test "MCP HTTP: a tools/call whose connection dies unanswered is indeterminate, and never sent twice" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "dropcall"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000 });
+        defer client.close();
+        const tools = try client.listTools();
+        defer a.free(tools);
+
+        // On the connection the handshake kept alive: the same failure a dead
+        // pooled connection gives a repeatable method, which is retried.
+        try std.testing.expectError(error.McpOutcomeIndeterminate, client.callTool("kept", "{}"));
+
+        // Through the registry, as the model reaches it: the failure says the
+        // call may have run. The next call is the model's decision.
+        var registry = cc.tools_dynamic.DynRegistry.init(a);
+        defer registry.deinit();
+        var session = cc.mcp_registry_bridge.McpSession.init(a, &client);
+        defer session.deinit();
+        try session.registerToolsFiltered(&registry, "d", .{ .http_param_headers = true });
+        var detail: ?[]const u8 = null;
+        defer if (detail) |text| a.free(text);
+        var ctx = cc.tools.ToolContext.simple(a);
+        ctx.artifact_root = root;
+        ctx.error_detail = &detail;
+        try std.testing.expectError(
+            error.McpOutcomeIndeterminate,
+            registry.find("mcp__d__kept").?.execute(&ctx, "{}"),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, detail.?, "may have executed") != null);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try seenOn(arena.allocator(), log, "/dropcall");
+    var calls: usize = 0;
+    for (seen) |request| calls += @intFromBool(std.mem.eql(u8, request.method, "tools/call"));
+    // One each from the two attempts this test made, and no more.
+    try std.testing.expectEqual(@as(usize, 2), calls);
+}
+
+test "MCP HTTP: a tools/call does not reuse a connection idle past its shorter window" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "keepalive"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000 });
+        defer client.close();
+        const tools = try client.listTools();
+        defer a.free(tools);
+        cc.util_time.sleepMs(cc.mcp_transport_http.TOOL_CALL_REUSE_IDLE_MS + 200);
+        const called = try client.callTool("kept", "{}");
+        defer a.free(called);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try seenOn(arena.allocator(), log, "/keepalive");
+    try std.testing.expectEqualStrings("tools/call", seen[seen.len - 1].method);
+    try std.testing.expect(seen[seen.len - 2].conn != seen[seen.len - 1].conn);
+}
+
+test "MCP HTTP: a stale answer is skipped and tools/list_changed is recorded, on both call paths" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var buffer: [128]u8 = undefined;
+    var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+        .io = std.testing.io,
+        .url = try mock.url(&buffer, "noisy"),
+    }, .{ .spawn = undefined, .startup_timeout_ms = 10_000 });
+    defer client.close();
+    try std.testing.expect(!client.tools_changed.load(.acquire));
+    const called = try client.callTool("noise", "{}");
+    defer a.free(called);
+    try std.testing.expect(std.mem.indexOf(u8, called, "noise-done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, called, "stale") == null);
+    try std.testing.expect(client.tools_changed.load(.acquire));
+
+    client.tools_changed.store(false, .release);
+    var body = try client.callToolBodyAbortable("noise", "{}", root, .{}, null);
+    defer body.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, body.@"inline".bytes, "noise-done") != null);
+    try std.testing.expect(client.tools_changed.load(.acquire));
+}
+
+test "MCP HTTP: a tool's isError reaches the model as a tool error through the registry" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var buffer: [128]u8 = undefined;
+    var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+        .io = std.testing.io,
+        .url = try mock.url(&buffer, "noisy"),
+    }, .{ .spawn = undefined, .startup_timeout_ms = 10_000 });
+    defer client.close();
+    var registry = cc.tools_dynamic.DynRegistry.init(a);
+    defer registry.deinit();
+    var session = cc.mcp_registry_bridge.McpSession.init(a, &client);
+    defer session.deinit();
+    try session.registerToolsFromJson(&registry, "m", "{\"tools\":[{\"name\":\"toolerror\"}]}");
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.artifact_root = root;
+    var body = try registry.find("mcp__m__toolerror").?.execute(&ctx, "{}");
+    defer body.deinit(a);
+    try std.testing.expect(body == .structured_error);
+    try std.testing.expect(std.mem.indexOf(u8, body.structured_error.encoded, "tool said no") != null);
+}

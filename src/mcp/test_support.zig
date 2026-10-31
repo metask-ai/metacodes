@@ -1,8 +1,8 @@
 //! Test-only in-memory MCP peer shared by AgentCore conformance tests.
 
 const std = @import("std");
-const canonical = @import("mcp_canonical.zig");
-const runtime = @import("mcp_runtime.zig");
+const canonical = @import("canonical.zig");
+const runtime = @import("runtime.zig");
 
 pub const Server = struct {
     era: canonical.Era = .modern_2026_07_28,
@@ -19,6 +19,13 @@ pub const Server = struct {
     opens: u32 = 0,
     closes: u32 = 0,
     calls: u32 = 0,
+    /// Runs inside a `tools/call`, while the connection is serving it.
+    during_call: ?DuringCall = null,
+
+    pub const DuringCall = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque) void,
+    };
 
     const Connection = struct { owner: *Server };
 
@@ -91,7 +98,7 @@ pub const Server = struct {
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"{s}\",\"inputSchema\":{s},\"outputSchema\":{s}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
                     .{ id, self.tool_name, self.input_schema_json, self.output_schema_json, self.ttl_ms },
                 ),
-                .classic_2025_11_25, .classic_2025_06_18 => try std.fmt.allocPrint(
+                else => try std.fmt.allocPrint(
                     allocator,
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"tools\":[{{\"name\":\"{s}\",\"inputSchema\":{s},\"outputSchema\":{s}}}]}}}}",
                     .{ id, self.tool_name, self.input_schema_json, self.output_schema_json },
@@ -99,6 +106,7 @@ pub const Server = struct {
             };
         } else if (std.mem.indexOf(u8, encoded, "tools/call") != null) blk: {
             self.calls += 1;
+            if (self.during_call) |hook| hook.run(hook.ctx);
             const padding = try allocator.alloc(u8, self.result_padding_bytes);
             defer allocator.free(padding);
             @memset(padding, 'm');
@@ -108,7 +116,7 @@ pub const Server = struct {
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":{{\"ok\":true,\"padding\":\"{s}\"}}}}}}",
                     .{ id, padding },
                 ),
-                .classic_2025_11_25, .classic_2025_06_18 => try std.fmt.allocPrint(
+                else => try std.fmt.allocPrint(
                     allocator,
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"content\":[],\"structuredContent\":{{\"ok\":true,\"padding\":\"{s}\"}}}}}}",
                     .{ id, padding },

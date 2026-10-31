@@ -12,6 +12,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **One MCP client.** The CLI, source-level consumers and AgentCore now run one
+  protocol implementation (`src/mcp/client.zig`); AgentCore's separate client,
+  negotiation driver and the CLI's hand-written frame parser are gone. What
+  separates the entry points is an explicit, tested profile
+  ([doc/MCP_ARCHITECTURE.md](doc/MCP_ARCHITECTURE.md)). No ABI or supported-version
+  change.
+  - **CLI:** a tool's `isError` is a tool error at every size, and a `tools/call`
+    without `content` is accepted at every size. Both used to depend on whether the
+    frame was over 1 MiB.
+  - **CLI:** a `tools/call` is never sent twice once its body went out, including on
+    a reused HTTP connection that closes unanswered. The model is told the call may
+    have executed. Such a call does not reuse a connection idle for over a second.
+  - **AgentCore:** the byte-zero path accepts escaped control characters in a
+    result's content, as its materialized path did.
+
 - AgentCore now ships with every release under its own final version, with its
   Python wheel and Node package, instead of a `-dev+<commit>` archive. The cut
   selects and finalizes the version, and an unchanged AgentCore keeps its version

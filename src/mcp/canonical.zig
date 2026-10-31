@@ -1,14 +1,16 @@
-//! AgentCore-owned canonical MCP protocol model for Revision 7.
+//! Canonical MCP protocol model, shared by every entry point.
 //!
-//! The model is deliberately independent from the product `src/mcp` stack.
-//! Protocol-era adapters own wire differences; Runtime, Session, Permission
-//! and checkpoint code consume only the bounded values defined here.
+//! Protocol-era adapters (`era_modern`, `era_classic`) own wire differences;
+//! the client, catalog, Session, Permission and checkpoint code consume only
+//! the bounded values defined here.
 
 const std = @import("std");
 
 pub const MODERN_VERSION = "2026-07-28";
 pub const CLASSIC_2025_11_VERSION = "2025-11-25";
 pub const CLASSIC_2025_06_VERSION = "2025-06-18";
+pub const CLASSIC_2025_03_VERSION = "2025-03-26";
+pub const CLASSIC_2024_11_VERSION = "2024-11-05";
 
 pub const Limits = struct {
     max_frame_bytes: usize = 8 * 1024 * 1024,
@@ -40,12 +42,30 @@ pub const Era = enum(u8) {
     modern_2026_07_28 = 0,
     classic_2025_11_25 = 1,
     classic_2025_06_18 = 2,
+    /// Reached only under `wire.Conformance.interop`. The AgentCore public
+    /// contract names the three eras above; a strict client refuses these.
+    classic_2025_03_26 = 3,
+    classic_2024_11_05 = 4,
 
     pub fn version(self: Era) []const u8 {
         return switch (self) {
             .modern_2026_07_28 => MODERN_VERSION,
             .classic_2025_11_25 => CLASSIC_2025_11_VERSION,
             .classic_2025_06_18 => CLASSIC_2025_06_VERSION,
+            .classic_2025_03_26 => CLASSIC_2025_03_VERSION,
+            .classic_2024_11_05 => CLASSIC_2024_11_VERSION,
+        };
+    }
+
+    pub fn isModern(self: Era) bool {
+        return self == .modern_2026_07_28;
+    }
+
+    /// The eras the strict (AgentCore public) contract speaks.
+    pub fn inStrictWindow(self: Era) bool {
+        return switch (self) {
+            .modern_2026_07_28, .classic_2025_11_25, .classic_2025_06_18 => true,
+            .classic_2025_03_26, .classic_2024_11_05 => false,
         };
     }
 
@@ -56,6 +76,10 @@ pub const Era = enum(u8) {
             return .classic_2025_11_25;
         if (std.mem.eql(u8, version_value, CLASSIC_2025_06_VERSION))
             return .classic_2025_06_18;
+        if (std.mem.eql(u8, version_value, CLASSIC_2025_03_VERSION))
+            return .classic_2025_03_26;
+        if (std.mem.eql(u8, version_value, CLASSIC_2024_11_VERSION))
+            return .classic_2024_11_05;
         return null;
     }
 };
@@ -69,6 +93,8 @@ pub const Phase = enum(u8) {
     tools_call,
     negotiation,
     revalidation,
+    resources_list,
+    resources_read,
 };
 
 /// Stable semantic diagnostics. Human-readable server text is deliberately
@@ -128,10 +154,28 @@ pub const CachePolicy = struct {
     scope: CacheScope,
 };
 
-/// Era adapters reduce wire capability shapes to state that AgentCore
-/// actually uses. Raw capability JSON is retained only for diagnostics.
+/// Era adapters reduce wire capability shapes to state the client actually
+/// uses. Raw capability JSON is retained only for diagnostics.
 pub const CanonicalCapabilities = struct {
     tool_catalog_available: bool,
+    resources_available: bool = false,
+    prompts_available: bool = false,
+};
+
+/// What a failed request may have done on the server. It decides whether the
+/// request may be sent again, so it is not a property of the error's name:
+/// the same timeout is `not_delivered` before the write and `indeterminate`
+/// after it. A valid protocol continuation (an MRTR round, SSE resumption, a
+/// retried 401) is a different thing again: it completes the same logical
+/// request and never reaches a caller as a failure.
+pub const Disposition = enum(u8) {
+    /// The server answered. The answer is the outcome.
+    answered,
+    /// The request is known not to have been processed: it was never written,
+    /// or the server refused it at authentication. Sending it again is safe.
+    not_delivered,
+    /// The request may have executed. It must not be replayed automatically.
+    indeterminate,
 };
 
 /// AgentCore does not implement MCP Tasks in Revision 7. Optional task
@@ -615,11 +659,15 @@ fn allZero(value: []const u8) bool {
     return true;
 }
 
-test "canonical era accepts the three Revision 7 protocol versions" {
+test "canonical era names five revisions; the strict window holds the three of the public contract" {
     try std.testing.expectEqual(Era.modern_2026_07_28, Era.parseExact(MODERN_VERSION).?);
     try std.testing.expectEqual(Era.classic_2025_11_25, Era.parseExact(CLASSIC_2025_11_VERSION).?);
     try std.testing.expectEqual(Era.classic_2025_06_18, Era.parseExact(CLASSIC_2025_06_VERSION).?);
-    try std.testing.expect(Era.parseExact("2024-11-05") == null);
+    try std.testing.expect(Era.parseExact("1999-01-01") == null);
+    try std.testing.expect(Era.modern_2026_07_28.inStrictWindow());
+    try std.testing.expect(Era.classic_2025_06_18.inStrictWindow());
+    try std.testing.expect(!Era.parseExact("2025-03-26").?.inStrictWindow());
+    try std.testing.expect(!Era.parseExact("2024-11-05").?.inStrictWindow());
 }
 
 test "schema fingerprint ignores object key order but covers output schema" {

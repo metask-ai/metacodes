@@ -1,11 +1,9 @@
-//! Revision 7 MCP protocol-era negotiation and disposable-probe ownership.
-//!
-//! Transport implementations live in the later Runtime integration task.
-//! This module freezes the policy and lifecycle contract without importing the
-//! product MCP transport or process code.
+//! MCP protocol-era negotiation and probe ownership: the one decision procedure
+//! every entry point runs. The driver (`client.Negotiator`) owns the transports.
 
 const std = @import("std");
-const canonical = @import("mcp_canonical.zig");
+const canonical = @import("canonical.zig");
+const Conformance = @import("wire.zig").Conformance;
 
 pub const Policy = enum(u8) {
     auto,
@@ -104,6 +102,31 @@ pub fn selectFromProbe(
     };
 }
 
+/// `selectFromProbe` under a conformance. `interop` falls back to the handshake
+/// on every completed answer that does not select Modern (the 2026-07-28
+/// stdio transport says so: never keyed to one error code). A failure that is
+/// not an answer (a timeout or a network error over HTTP, an authentication
+/// refusal) is still no evidence of an older server under either.
+pub fn selectFromProbeWith(
+    policy: Policy,
+    transport: Transport,
+    observation: ProbeObservation,
+    conformance: Conformance,
+) canonical.Outcome(canonical.Era) {
+    if (conformance == .interop and policy == .auto) switch (observation) {
+        .discovered_versions => |versions| {
+            for (versions) |version| {
+                if (canonical.Era.parseExact(version) == .modern_2026_07_28)
+                    return .{ .value = .modern_2026_07_28 };
+            }
+            return .{ .value = .classic_2025_11_25 };
+        },
+        .malformed_response => return .{ .value = .classic_2025_11_25 },
+        else => {},
+    };
+    return selectFromProbe(policy, transport, observation);
+}
+
 pub fn selectFromVersions(
     policy: Policy,
     versions: []const []const u8,
@@ -116,6 +139,8 @@ pub fn selectFromVersions(
             .modern_2026_07_28 => has_modern = true,
             .classic_2025_11_25 => has_classic_11 = true,
             .classic_2025_06_18 => has_classic_06 = true,
+            // Outside the strict window; only an interop handshake adopts them.
+            .classic_2025_03_26, .classic_2024_11_05 => {},
         }
     }
     return switch (policy) {
@@ -147,6 +172,19 @@ pub fn negotiate(
     policy: Policy,
     transport: Transport,
 ) error{OutOfMemory}!canonical.Outcome(canonical.Era) {
+    return negotiateWith(driver, policy, transport, .strict);
+}
+
+/// `interop` differs in two steps, both named below: the probe's fallback
+/// (`selectFromProbeWith`), and adopting the Classic revision the server
+/// selected from the `initialize` it was offered, which the strict contract
+/// accepts only from an exact second handshake.
+pub fn negotiateWith(
+    driver: Driver,
+    policy: Policy,
+    transport: Transport,
+    conformance: Conformance,
+) error{OutOfMemory}!canonical.Outcome(canonical.Era) {
     const selected: canonical.Era = switch (policy) {
         .modern_only => .modern_2026_07_28,
         .legacy_only => .classic_2025_11_25,
@@ -164,7 +202,7 @@ pub fn negotiate(
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 return .{ .diagnostic = canonical.Diagnostic.init(.probe_failed, .negotiation) };
             };
-            const selection = selectFromProbe(.auto, transport, observation);
+            const selection = selectFromProbeWith(.auto, transport, observation, conformance);
             // The disposable stdio child (or bounded HTTP probe context) is
             // always gone before the real connection starts.
             driver.finish_probe_fn(driver.ctx);
@@ -193,6 +231,8 @@ pub fn negotiate(
         },
     };
     if (actual_era == selected) return .{ .value = selected };
+    if (conformance == .interop and !selected.isModern() and !actual_era.isModern())
+        return .{ .value = actual_era };
 
     // AUTO's Classic probe starts with the newest Classic era. A server may
     // legally select 2025-06-18 from that initialize request. The first
@@ -486,6 +526,57 @@ test "stdio child exit may select legacy and always closes the disposable probe"
     try std.testing.expectEqual(@as(u8, 1), fake.probe_finishes);
     try std.testing.expectEqual(@as(u8, 1), fake.connects);
     try std.testing.expect(!fake.connect_saw_probe_open);
+}
+
+test "interop falls back to the handshake on any completed non-Modern answer" {
+    const none = [_][]const u8{"2025-03-26"};
+    try std.testing.expectEqual(
+        canonical.Era.classic_2025_11_25,
+        selectFromProbeWith(.auto, .stdio, .{ .discovered_versions = &none }, .interop).value,
+    );
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.unsupported_protocol_version,
+        selectFromProbeWith(.auto, .stdio, .{ .discovered_versions = &none }, .strict).diagnostic.code,
+    );
+    try std.testing.expectEqual(
+        canonical.Era.classic_2025_11_25,
+        selectFromProbeWith(.auto, .streamable_http, .malformed_response, .interop).value,
+    );
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.probe_failed,
+        selectFromProbeWith(.auto, .streamable_http, .malformed_response, .strict).diagnostic.code,
+    );
+    // Not an answer: no evidence of an older server under either conformance.
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.downgrade_refused,
+        selectFromProbeWith(.auto, .streamable_http, .auth_error, .interop).diagnostic.code,
+    );
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.downgrade_refused,
+        selectFromProbeWith(.auto, .streamable_http, .timeout, .interop).diagnostic.code,
+    );
+}
+
+test "interop adopts the Classic revision the server selected; strict reopens exact" {
+    var interop = FakeDriver{
+        .observation = .method_not_found,
+        .actual = .{ .known = .classic_2024_11_05 },
+    };
+    const adopted = try negotiateWith(interop.interface(), .auto, .stdio, .interop);
+    try std.testing.expectEqual(canonical.Era.classic_2024_11_05, adopted.value);
+    try std.testing.expectEqual(@as(u8, 1), interop.connects);
+    try std.testing.expectEqual(@as(u8, 0), interop.disconnects);
+
+    var strict = FakeDriver{
+        .observation = .method_not_found,
+        .actual = .{ .known = .classic_2024_11_05 },
+    };
+    const refused = try negotiate(strict.interface(), .auto, .stdio);
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.era_revalidation_mismatch,
+        refused.diagnostic.code,
+    );
+    try std.testing.expect(!strict.actual_open);
 }
 
 test "probe allocation failure is not mislabeled as a transport failure" {
