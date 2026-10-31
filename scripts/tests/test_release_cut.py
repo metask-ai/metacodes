@@ -15,9 +15,11 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
+import agentcore_contract  # noqa: E402
 import check_version_state  # noqa: E402
 import release_cut as rc  # noqa: E402
 import release_notes  # noqa: E402
+from scripts.tests.test_agentcore_release import write_tree  # noqa: E402
 
 CHANGELOG_FIXTURE = """# Changelog
 
@@ -369,9 +371,7 @@ class Utf8OutputTest(unittest.TestCase):
         self.root = base / "clone"
         _git("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=base)
         _git("init", "-q", "-b", "main", str(self.root), cwd=base)
-        (self.root / rc.ZON).write_text('.{ .version = "0.2.0-dev" }\n', encoding="utf-8")
-        (self.root / rc.VERSION_ZIG).parent.mkdir(parents=True)
-        (self.root / rc.VERSION_ZIG).write_text('pub const semver = "0.2.0-dev";\n', encoding="utf-8")
+        write_tree(self.root, main_version="0.2.0-dev")
         changelog = CHANGELOG_FIXTURE.replace("- one fix.", "- one fix: 1.9 µs ↔ ✓.")
         (self.root / rc.CHANGELOG).write_text(changelog, encoding="utf-8")
         _git("add", "-A", cwd=self.root)
@@ -422,7 +422,7 @@ class OpenPrFailureTest(unittest.TestCase):
         _git("init", "-q", "-b", "main", str(self.root), cwd=base)
         _git("config", "user.name", "t", cwd=self.root)
         _git("config", "user.email", "t@x", cwd=self.root)
-        for rel in (rc.ZON, rc.VERSION_ZIG, rc.CHANGELOG, rc.PROTOCOL):
+        for rel in (rc.ZON, rc.VERSION_ZIG, rc.CHANGELOG, rc.PROTOCOL, *agentcore_contract.GENERATED):
             (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.root / rel).write_text("0.2.0-dev\n", encoding="utf-8")
         _git("add", "-A", cwd=self.root)

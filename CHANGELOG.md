@@ -10,6 +10,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- AgentCore now ships with every release under its own final version, with its
+  Python wheel and Node package, instead of a `-dev+<commit>` archive. The cut
+  selects and finalizes the version, and an unchanged AgentCore keeps its version
+  and artifacts. Release notes name it. `sdk/agentcore-releases.json` maps each
+  version to its ABI revision, and the release workflow refuses development
+  versions, version or ABI mismatches, and any artifact that differs from a
+  published one of the same name
+  ([doc/RELEASE_AUTOMATION_DESIGN.md](doc/RELEASE_AUTOMATION_DESIGN.md) §2a). (#404)
+
+### Fixed
+
+- The AgentCore bundle README stated ABI revision 18 and a 64-byte root. It now
+  takes the revision, root size and tables from the ABI types. (#404)
+
 ### Added
 
 - **OpenTelemetry tracing and a web trace view.** Every Run is recorded as a

@@ -21,7 +21,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ARCHIVE_SUFFIXES = (".tar.gz", ".zip")
+ARCHIVE_SUFFIXES = (".tar.gz", ".zip", ".whl", ".tgz")
 SIDECAR_LINE = re.compile(r"^([0-9a-f]{64})  (\S+)\n$")
 SAFE_VERSION = re.compile(r"^[0-9A-Za-z._+-]+$")
 

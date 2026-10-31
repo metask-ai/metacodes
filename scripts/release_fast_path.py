@@ -3,7 +3,8 @@
 
 Design: doc/RELEASE_AUTOMATION_DESIGN.md §3, "CI fast path". A release or
 reopen PR adds only what `scripts/release_cut.py` generates: the two version
-files, the changelog heading and the fingerprint repin. When its merge commit
+files, the changelog heading, AgentCore's version files, ledger and changelog,
+and the fingerprint repin. When its merge commit
 adds nothing else to a base commit whose full CI already passed on `main`,
 running the suites again proves nothing new, so ci.yml lets the required jobs
 report success without running them. Every other PR, and every doubt, takes
@@ -12,9 +13,10 @@ the full path.
 Two facts decide it, both checked here:
 
 1. Content. The paths that differ between the base and the candidate (the
-   merge commit) are among the four generated files, and regenerating those
+   merge commit) are among the generated files, and regenerating those
    files from the base with release_cut's own functions (`apply_version`,
-   `rewrite_changelog` or `ensure_unreleased`, `repin_fingerprint`)
+   `rewrite_changelog` or `ensure_unreleased`, `agentcore_release.apply_cut` or
+   `apply_reopen`, `repin_fingerprint`)
    reproduces the candidate byte for byte. A bare version over a `-dev` base
    is a cut; a `-dev` version over a bare base is a reopen.
 2. Base. The `CI` workflow's push run for the base commit concluded
@@ -41,10 +43,12 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import release_cut  # noqa: E402  (same directory, stdlib only)
+import agentcore_contract  # noqa: E402  (same directory, stdlib only)
+import agentcore_release  # noqa: E402
+import release_cut  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-GENERATED = (release_cut.ZON, release_cut.VERSION_ZIG, release_cut.CHANGELOG, release_cut.PROTOCOL)
+GENERATED = (release_cut.ZON, release_cut.VERSION_ZIG, release_cut.CHANGELOG, release_cut.PROTOCOL, *agentcore_contract.GENERATED)
 CI_WORKFLOW = "ci.yml"
 POLL_SECONDS = 30
 
@@ -79,6 +83,17 @@ def changelog_date(text: str, version: str) -> str:
     raise NotABump(f"{release_cut.CHANGELOG}: no '## {version} — <date>' heading")
 
 
+def sdk_changelog_date(root: Path, candidate: str, version: str) -> str:
+    """The date of AgentCore's section when the candidate releases it; a reuse
+    has none and does not ask for one, so an empty date cannot enter a heading."""
+    text = show(root, candidate, agentcore_contract.SDK_CHANGELOG).decode("utf-8")
+    for line in text.splitlines():
+        match = release_cut.RELEASE_HEADING_RE.match(line)
+        if match and match.group(1) == version:
+            return match.group(2)
+    return ""
+
+
 def verify_bump(
     root: Path,
     base: str,
@@ -105,6 +120,7 @@ def verify_bump(
     else:
         raise NotABump(f"{base_version} -> {version} is neither a cut nor a reopen")
 
+    sdk_version = show(root, candidate, agentcore_contract.SDK_VERSION).decode("utf-8").strip()
     with tempfile.TemporaryDirectory() as scratch:
         tree = Path(scratch) / "base"
         git(root, "worktree", "add", "--detach", "--quiet", str(tree), base)
@@ -117,6 +133,10 @@ def verify_bump(
                 else:
                     text = release_cut.ensure_unreleased(text)
                 release_cut.write(tree, release_cut.CHANGELOG, text)
+                if kind == "cut":
+                    agentcore_release.apply_cut(tree, sdk_version, version, sdk_changelog_date(root, candidate, sdk_version))
+                else:
+                    agentcore_release.apply_reopen(tree, sdk_version)
                 repin(tree)
             except release_cut.CutError as exc:
                 raise NotABump(f"release_cut cannot generate it from the base: {exc}") from None

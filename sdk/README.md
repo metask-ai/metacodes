@@ -11,7 +11,12 @@ C ABI v1 revision 26:
   permission handling ([python/README.md](python/README.md));
 - `node/` — the `metacodes` Node package: a Node-API addon over the shared
   library with the same API shape for JavaScript ([node/README.md](node/README.md));
-- `VERSION` — SDK package version, distinct from ABI revision.
+- `VERSION` — AgentCore's own SemVer version, distinct from the main project's
+  and from the ABI revision. Every package carries it; `agentcore-releases.json`
+  maps each release to its ABI revision and to the metacodes releases that ship it
+  ([doc/RELEASE_AUTOMATION_DESIGN.md](../doc/RELEASE_AUTOMATION_DESIGN.md) §2a);
+- `CHANGELOG.md` — AgentCore's changes and migration steps. A change a Host can
+  see gets an entry here.
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 80-byte root, all
