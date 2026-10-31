@@ -87,6 +87,17 @@ pub const StateSource = struct {
     /// - **seq = journal.count()（锁内，Linus ① 定死）**：语义=下界，客户端订阅 `?since=seq` 严格续接。
     /// - **slice 字段(model/dirs) 经 app.snapshotSlices 锁内 dup 读**：避免撞 driver free 的 UAF(§1.4)。
     /// - 标量(mode/usage/generating)直读(值语义良性 skew)。
+    /// `GET /spans` (HTTP thread): the session's span store as an OTLP/JSON
+    /// request. The directory is copied from the App's published cell, never
+    /// borrowed (the driver replaces it on `/clear`).
+    pub fn spans(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+        const self: *StateSource = @ptrCast(@alignCast(ctx));
+        const store = @import("../telemetry/store.zig");
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = self.app.session_dir_cell.copy(&dir_buf) orelse "";
+        return store.readAsRequest(allocator, dir, @import("../version.zig").semver);
+    }
+
     pub fn snapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
         const self: *StateSource = @ptrCast(@alignCast(ctx));
         const seq = self.journal.count(); // 锁内取（Linus ①：seq 定序 + 跨线程可见性）
@@ -422,6 +433,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         .state_ctx = @ptrCast(&state_src),
         .state_fn = &StateSource.snapshot,
         .command_fn = &StateSource.command,
+        .spans_fn = &StateSource.spans,
     });
     // 关停顺序契约(见 WebServer.stop doc):先 close journal 唤醒 SSE,再 stop。
     defer srv.stop();

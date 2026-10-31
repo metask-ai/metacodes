@@ -47,6 +47,7 @@ const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
 const output_semantics = @import("output_semantics.zig");
+const telemetry = @import("../telemetry/telemetry.zig");
 const file_change_mod = @import("file_change.zig");
 const tool_exec_mod = @import("tool_exec.zig");
 const ui_backend = @import("protocol/ui_backend.zig");
@@ -686,6 +687,12 @@ pub const Options = struct {
     /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
     /// 会混入 \x1b[32m 等控制码。
     colorize: bool = true,
+    /// OpenTelemetry span recording (`telemetry/telemetry.zig`). Non-null:
+    /// this Run's events are recorded as a GenAI span tree into the session
+    /// store and/or the process OTLP exporter. Recording observes only: it
+    /// never changes a provider request and never fails the Run. Canonical
+    /// `buildRunOptions` sets it from the session; null records nothing.
+    telemetry: ?telemetry.RunTelemetry = null,
 };
 
 pub const ModelSwitchCompact = struct {
@@ -1214,7 +1221,32 @@ pub fn run(
     var counters: RunCounters = .{};
     if (opts.goal_meter) |meter| meter.beginRun();
     defer if (opts.goal_meter) |meter| if (meter.endRun()) |settled| backend.emitEvent(opts.session, .{ .goal_updated = settled });
-    var result = try runCounted(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator, &counters);
+    // Span recording: the recorder sees every event the frontend sees (tee),
+    // plus the tool lifecycle events a frontend opted out of (`span_sink`).
+    var tracing: telemetry.RunTracing = undefined;
+    var tee: @import("tee_backend.zig").TeeBackend = undefined;
+    var traced_be: UiBackend = undefined;
+    var span_sink_be: UiBackend = undefined;
+    var effective_be = backend;
+    var span_sink: ?*const UiBackend = null;
+    if (opts.telemetry) |t| {
+        tracing.start(allocator, t, .{
+            .session_id = opts.session.asSlice(),
+            .model = opts.model_override orelse provider.model(),
+            .provider = if (provider.route()) |r| @tagName(r.kind) else "",
+            .input = latestUserText(conversation),
+        });
+        span_sink_be = tracing.recorder.backend();
+        tee = .{ .primary = backend, .secondary = &span_sink_be };
+        traced_be = tee.backend();
+        effective_be = &traced_be;
+        span_sink = &span_sink_be;
+    }
+    defer if (opts.telemetry != null) tracing.deinit();
+    var result = runCounted(conversation, provider, tool_defs, permission_ctx, opts, effective_be, span_sink, allocator, &counters) catch |err| {
+        if (opts.telemetry != null) tracing.recorder.finish(.{ .failed = err });
+        return err;
+    };
     result.continuations = counters.continuations;
     result.learning = counters.learning;
     result.usage_status = if (counters.saw_successful_provider_response and !counters.usage_unknown)
@@ -1468,6 +1500,9 @@ fn runCounted(
     permission_ctx: *const permission_mod.PermissionContext,
     opts: Options,
     backend: *const UiBackend,
+    /// The span recorder alone (already inside `backend` through a tee), for
+    /// events the frontend did not ask for but a trace needs. Null: no recording.
+    span_sink: ?*const UiBackend,
     allocator: std.mem.Allocator,
     counters: *RunCounters,
 ) !RunResult {
@@ -3738,12 +3773,13 @@ fn runCounted(
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop
         // 不再 import tool_card UI widget(层泄漏修复)。headless/subagent(depth>0)/无 theme
         // 时 tool_render_theme=null → 不 emit(那些场景 WriterBackend 也 no-op)。
-        if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) {
+        const tool_start_be: ?*const UiBackend = if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) backend else span_sink;
+        if (tool_start_be) |start_be| {
             for (slots.items) |*s| {
                 // Lifecycle represents the model's tool attempt, not proof of
                 // dispatch. Denied attempts still receive a paired result and
                 // must therefore receive a start event as well.
-                backend.emitEvent(sess, .{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
+                start_be.emitEvent(sess, .{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
             }
         }
         // 进度事件:本轮第一个 run slot 的工具名 + 原始 input(subagent agent 树显示当前动作)。
@@ -4039,8 +4075,9 @@ fn runCounted(
             // 实时工具卡渲染(REPL):把结果经 backend 渲染到屏幕——Edit/Write diff 着色、
             // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过(emit 仍发,
             // 但那些场景用 WriterBackend,tool_result no-op)。渲染移入 backend(renderResult)。
-            if (opts.event_projection.emitToolResult(opts.emit_tool_cards)) {
-                backend.emitEvent(sess, .{ .tool_result = .{
+            const tool_result_be: ?*const UiBackend = if (opts.event_projection.emitToolResult(opts.emit_tool_cards)) backend else span_sink;
+            if (tool_result_be) |result_be| {
+                result_be.emitEvent(sess, .{ .tool_result = .{
                     .id = s.id,
                     .name = s.name,
                     .input = s.input,
@@ -7820,6 +7857,90 @@ test "max_tokens_exhausted preserves a complete tool_use instead of failing" {
     try std.testing.expectEqual(@as(u32, 4), fake.sends);
     try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
     try std.testing.expect(result.stop_reason != .max_tokens_exhausted);
+}
+
+test "Options.telemetry records the Run as a span tree in the session store, tool calls included" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(std.testing.io, &dir_buf)];
+
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "trace me");
+    var fake = MaxTokensFake{ .allocator = a, .include_final_tool = true };
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    // emit_tool_cards stays false: the frontend never sees tool events, the
+    // recorder still does.
+    const result = try run(&conversation, fake.provider(), &.{}, &perm, .{
+        .max_turns = 4,
+        .colorize = false,
+        .telemetry = .{ .session_dir = dir },
+    }, &backend, a);
+    try std.testing.expectEqual(StopReason.max_turns, result.stop_reason);
+
+    const body = try telemetry.store.readAsRequest(a, dir, "test");
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const spans = parsed.value.object.get("resourceSpans").?.array.items[0].object.get("scopeSpans").?.array.items[0].object.get("spans").?.array.items;
+
+    var chats: u32 = 0;
+    var turns: u32 = 0;
+    var root_id: ?[]const u8 = null;
+    var tool_parent: ?[]const u8 = null;
+    var turn_ids: std.ArrayList([]const u8) = .empty;
+    defer turn_ids.deinit(a);
+    const trace_id = spans[0].object.get("traceId").?.string;
+    for (spans) |span| {
+        const name = span.object.get("name").?.string;
+        try std.testing.expectEqualStrings(trace_id, span.object.get("traceId").?.string);
+        if (std.mem.eql(u8, name, "chat max-tokens-fake")) chats += 1;
+        if (std.mem.startsWith(u8, name, "turn ")) {
+            turns += 1;
+            try turn_ids.append(a, span.object.get("spanId").?.string);
+        }
+        if (std.mem.eql(u8, name, "execute_tool DefinitelyUnknown")) tool_parent = span.object.get("parentSpanId").?.string;
+        if (std.mem.eql(u8, name, "invoke_agent metacodes")) {
+            root_id = span.object.get("spanId").?.string;
+            try std.testing.expect(span.object.get("parentSpanId") == null);
+            const attrs = try std.json.Stringify.valueAlloc(a, span.object.get("attributes").?, .{});
+            defer a.free(attrs);
+            try std.testing.expect(std.mem.indexOf(u8, attrs, "\"stringValue\":\"max_turns\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, attrs, "trace me") != null);
+        }
+    }
+    try std.testing.expectEqual(fake.sends, chats);
+    try std.testing.expectEqual(result.turns, turns);
+    try std.testing.expect(root_id != null);
+    var tool_under_turn = false;
+    for (turn_ids.items) |id| if (std.mem.eql(u8, id, tool_parent.?)) {
+        tool_under_turn = true;
+    };
+    try std.testing.expect(tool_under_turn);
+    // The root ends last.
+    try std.testing.expectEqualStrings("invoke_agent metacodes", spans[spans.len - 1].object.get("name").?.string);
+}
+
+test "without Options.telemetry a Run writes no span store" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+    var fake = MaxTokensFake{ .allocator = a };
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    _ = try run(&conversation, fake.provider(), &.{}, &perm, .{ .max_turns = 1, .colorize = false }, &backend, a);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, telemetry.store.FILE_NAME, .{}));
 }
 
 test "a stream error settles the candidate as discarded and commits nothing" {

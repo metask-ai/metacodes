@@ -542,6 +542,8 @@ pub fn buildOptions(
         // transcript 用真 id 而 agent_loop 内 KG 任务 claim/lease 归属却是 single,
         // 并发 headless 进程共享 KG store 时租约互相碰撞)。
         .session = app.session_id,
+        // Span recording, as session_service.buildRunOptions does for the other frontends.
+        .telemetry = @import("../telemetry/telemetry.zig").forSession(app.sessionDir()),
         // task#20:--suspendable 时装恒 .pending requester → headless 遇 UI 工具挂起而非 NotATty。
         .ui_requester = if (app.config.suspendable)
             .{ .ctx = @ptrCast(&pending_requester_dummy), .requestFn = &pendingRequestFn }

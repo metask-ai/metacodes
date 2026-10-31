@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>metacodes trace</title>
+<style>
+  :root {
+    --bg: #1e1e1e; --fg: #d4d4d4; --dim: #808080; --accent: #4ec9b0; --card: #252526;
+    --border: #3c3c3c; --hover: #2a2d2e; --sel: #04395e; --err: #f48771; --code-bg: #2d2d2d;
+    --c-agent: #c586c0; --c-turn: #6e7681; --c-chat: #569cd6; --c-tool: #6a9955;
+    --c-compact: #d7ba7d; --c-other: #9cdcfe;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); display: flex; flex-direction: column;
+         font: 13px/1.5 "SF Mono", Menlo, Consolas, monospace; }
+  a { color: var(--accent); }
+  #top { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; padding: 8px 14px;
+         background: var(--card); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  #top h1 { font-size: 14px; margin: 0; color: var(--accent); font-weight: bold; }
+  #top .stat { color: var(--dim); } #top .stat b { color: var(--fg); font-weight: normal; }
+  #top .stat.err b { color: var(--err); }
+  #top .spacer { flex: 1; }
+  #top input[type=text] { background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+         border-radius: 4px; padding: 3px 8px; font: inherit; width: 200px; }
+  #top button, #top label { background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+         border-radius: 4px; padding: 3px 9px; font: inherit; cursor: pointer; }
+  #top label { display: inline-flex; gap: 5px; align-items: center; }
+  #overview { position: relative; height: 26px; margin: 8px 14px 0; background: var(--card);
+              border: 1px solid var(--border); border-radius: 4px; flex-shrink: 0; cursor: pointer; }
+  #overview .ob { position: absolute; top: 5px; height: 14px; border-radius: 2px; background: var(--c-agent);
+                  opacity: .8; min-width: 2px; }
+  #overview .ob.error { background: var(--err); }
+  #overview .ob:hover { opacity: 1; outline: 1px solid var(--fg); }
+  #main { flex: 1; display: flex; min-height: 0; }
+  #runs { flex: 1; overflow: auto; padding: 8px 14px 40px; min-width: 0; }
+  #detail { width: 42%; max-width: 760px; min-width: 320px; border-left: 1px solid var(--border);
+            background: var(--card); overflow: auto; padding: 12px 14px; display: none; }
+  #detail.open { display: block; }
+  .empty { color: var(--dim); padding: 40px 0; text-align: center; }
+  .run { border: 1px solid var(--border); border-radius: 6px; margin: 10px 0; overflow: hidden; }
+  .run-head { display: flex; gap: 12px; align-items: baseline; padding: 7px 10px; background: var(--card);
+              cursor: pointer; flex-wrap: wrap; }
+  .run-head .rn { color: var(--c-agent); font-weight: bold; }
+  .run-head .rinput { color: #9cdcfe; flex: 1; min-width: 200px; overflow: hidden; text-overflow: ellipsis;
+                      white-space: nowrap; }
+  .run-head .rmeta { color: var(--dim); font-size: 12px; white-space: nowrap; }
+  .run-head .rmeta.err { color: var(--err); }
+  .run.collapsed .wf { display: none; }
+  .wf-axis { display: flex; font-size: 11px; color: var(--dim); border-bottom: 1px solid var(--border); }
+  .wf-axis .lcol { padding: 2px 8px; }
+  .wf-axis .tcol { position: relative; height: 18px; }
+  .wf-axis .tick { position: absolute; top: 2px; transform: translateX(-50%); white-space: nowrap; }
+  .row { display: flex; align-items: center; height: 24px; cursor: pointer; border-bottom: 1px solid #262626; }
+  .row:hover { background: var(--hover); }
+  .row.sel { background: var(--sel); }
+  .row.hidden { display: none; }
+  .lcol { width: 38%; min-width: 260px; flex-shrink: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+          padding-right: 8px; border-right: 1px solid var(--border); height: 100%; display: flex; align-items: center; }
+  .tcol { flex: 1; position: relative; height: 100%; }
+  .tog { width: 16px; display: inline-block; text-align: center; color: var(--dim); flex-shrink: 0; }
+  .dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 6px; flex-shrink: 0; }
+  .sname { overflow: hidden; text-overflow: ellipsis; }
+  .sname .sub { color: var(--dim); margin-left: 6px; }
+  .bar { position: absolute; top: 6px; height: 12px; border-radius: 2px; min-width: 2px; }
+  .bar-label { position: absolute; top: 4px; font-size: 11px; color: var(--dim); white-space: nowrap; }
+  .bar-label.inside { color: #111; font-weight: bold; }
+  .k-agent { background: var(--c-agent); } .k-turn { background: var(--c-turn); } .k-chat { background: var(--c-chat); }
+  .k-tool { background: var(--c-tool); } .k-compact { background: var(--c-compact); } .k-other { background: var(--c-other); }
+  .bar.error, .dot.error { background: var(--err) !important; }
+  .evt { position: absolute; top: 4px; width: 2px; height: 16px; background: #e5c07b; }
+  #detail h2 { font-size: 14px; margin: 0 0 4px; word-break: break-all; }
+  #detail .close { float: right; cursor: pointer; color: var(--dim); }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 10px; }
+  .badge { border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; font-size: 11px; color: var(--dim); }
+  .badge.err { color: var(--err); border-color: var(--err); }
+  #detail h3 { font-size: 12px; color: var(--accent); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .05em; }
+  .msg { border-left: 3px solid var(--border); padding: 4px 10px; margin: 6px 0; background: var(--bg); border-radius: 0 4px 4px 0; }
+  .msg .role { color: var(--dim); font-size: 11px; text-transform: uppercase; }
+  .msg.user { border-left-color: #569cd6; } .msg.assistant { border-left-color: var(--c-agent); }
+  .part-reasoning { color: var(--dim); font-style: italic; }
+  pre.content { white-space: pre-wrap; word-break: break-word; margin: 4px 0; background: var(--bg);
+                padding: 6px 8px; border-radius: 4px; max-height: 40vh; overflow: auto; }
+  table.attrs { border-collapse: collapse; width: 100%; font-size: 12px; }
+  table.attrs td { border-bottom: 1px solid var(--border); padding: 3px 6px; vertical-align: top; word-break: break-all; }
+  table.attrs td.k { color: var(--dim); width: 40%; }
+  .event { margin: 4px 0; padding: 4px 8px; background: var(--bg); border-radius: 4px; }
+  .event .en { color: #e5c07b; } .event .et { color: var(--dim); font-size: 11px; margin-left: 6px; }
+  .legend { display: flex; gap: 10px; color: var(--dim); font-size: 11px; }
+  .legend span { display: inline-flex; align-items: center; }
+</style>
+</head>
+<body>
+<div id="top">
+  <h1>metacodes · trace</h1>
+  <span class="stat">session <b id="s-session">—</b></span>
+  <span class="stat">runs <b id="s-runs">0</b></span>
+  <span class="stat">spans <b id="s-spans">0</b></span>
+  <span class="stat">wall <b id="s-wall">—</b></span>
+  <span class="stat">tokens <b id="s-tokens">—</b></span>
+  <span class="stat">tools <b id="s-tools">0</b></span>
+  <span class="stat err" id="s-errors-wrap">errors <b id="s-errors">0</b></span>
+  <span class="spacer"></span>
+  <span class="legend">
+    <span><i class="dot k-agent"></i>agent</span><span><i class="dot k-turn"></i>turn</span>
+    <span><i class="dot k-chat"></i>chat</span><span><i class="dot k-tool"></i>tool</span>
+    <span><i class="dot k-compact"></i>compact</span>
+  </span>
+  <input type="text" id="filter" placeholder="filter spans…">
+  <label><input type="checkbox" id="live" checked> live</label>
+  <button id="expand">expand all</button>
+  <button id="download">OTLP JSON</button>
+  <a id="back" href=".">← chat</a>
+</div>
+<div id="overview" title="Runs on the conversation's time axis"></div>
+<div id="main">
+  <div id="runs"><div class="empty">Loading spans…</div></div>
+  <div id="detail"></div>
+</div>
+<script>
+"use strict";
+// Same token rule as the chat page: opened as trace?token=<t>; the token is
+// then sent as a Bearer header and dropped from the address bar.
+const TOKEN = (() => {
+  const m = /(?:^|[?&])token=([^&#]*)/.exec(location.search);
+  if (!m) return "";
+  history.replaceState(null, "", location.pathname);
+  try { return decodeURIComponent(m[1]); } catch { return ""; }
+})();
+if (TOKEN) document.getElementById("back").href = ".?token=" + encodeURIComponent(TOKEN);
+
+// Relative: /trace reads /spans, /s/<id>/trace reads /s/<id>/spans.
+function api(path) {
+  const init = {};
+  if (TOKEN) init.headers = { Authorization: "Bearer " + TOKEN };
+  return fetch(path, init);
+}
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const NS_MS = 1e6;
+function fmtDur(ns) {
+  const ms = ns / NS_MS;
+  if (ms < 1) return (ms * 1000).toFixed(0) + "µs";
+  if (ms < 1000) return ms.toFixed(ms < 10 ? 1 : 0) + "ms";
+  const s = ms / 1000;
+  if (s < 60) return s.toFixed(s < 10 ? 2 : 1) + "s";
+  return Math.floor(s / 60) + "m" + Math.round(s % 60) + "s";
+}
+function fmtTok(n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n); }
+function fmtTime(ns) { const d = new Date(ns / NS_MS); return d.toLocaleTimeString(); }
+
+// ── OTLP/JSON → span objects ─────────────────────────────────────────────
+function anyValue(v) {
+  if (!v) return null;
+  if ("stringValue" in v) return v.stringValue;
+  if ("intValue" in v) return Number(v.intValue);
+  if ("doubleValue" in v) return v.doubleValue;
+  if ("boolValue" in v) return v.boolValue;
+  return JSON.stringify(v);
+}
+function attrMap(list) { const m = {}; for (const a of list || []) m[a.key] = anyValue(a.value); return m; }
+
+function parse(req) {
+  const spans = [];
+  for (const rs of req.resourceSpans || []) for (const ss of rs.scopeSpans || []) for (const s of ss.spans || []) {
+    spans.push({
+      traceId: s.traceId, id: s.spanId, parent: s.parentSpanId || null, name: s.name, kind: s.kind,
+      start: Number(s.startTimeUnixNano), end: Number(s.endTimeUnixNano),
+      attrs: attrMap(s.attributes), events: (s.events || []).map(e => ({ name: e.name, time: Number(e.timeUnixNano), attrs: attrMap(e.attributes) })),
+      status: s.status || {}, children: [],
+    });
+  }
+  return spans;
+}
+
+function kindOf(s) {
+  const op = s.attrs["gen_ai.operation.name"];
+  if (op === "invoke_agent") return "agent";
+  if (op === "chat") return "chat";
+  if (op === "execute_tool") return "tool";
+  if (s.name === "compact") return "compact";
+  if (/^turn /.test(s.name)) return "turn";
+  return "other";
+}
+const isErr = s => s.status.code === 2;
+
+// One entry per trace (= one Run), oldest first. A Run still in progress has
+// no root span yet: its finished children hang under a synthetic one.
+function buildRuns(spans) {
+  const byTrace = new Map();
+  for (const s of spans) {
+    if (!byTrace.has(s.traceId)) byTrace.set(s.traceId, []);
+    byTrace.get(s.traceId).push(s);
+  }
+  const runs = [];
+  for (const [traceId, list] of byTrace) {
+    const byId = new Map(list.map(s => [s.id, s]));
+    for (const s of list) s.children = [];
+    const roots = [];
+    for (const s of list) {
+      const p = s.parent && byId.get(s.parent);
+      if (p) p.children.push(s); else roots.push(s);
+    }
+    let root = roots.find(s => kindOf(s) === "agent" && !s.parent);
+    if (!root || roots.length > 1) {
+      const all = list;
+      const synthetic = {
+        traceId, id: "running-" + traceId, parent: null, name: root ? root.name : "invoke_agent (running…)", kind: 1,
+        start: Math.min(...all.map(s => s.start)), end: Math.max(...all.map(s => s.end)),
+        attrs: root ? root.attrs : { "gen_ai.operation.name": "invoke_agent" }, events: [], status: {}, children: [], running: !root,
+      };
+      for (const r of roots) if (r !== root) synthetic.children.push(r);
+      if (root) synthetic.children.push(...root.children);
+      root = synthetic;
+    }
+    const sortRec = n => { n.children.sort((a, b) => a.start - b.start || a.end - b.end); n.children.forEach(sortRec); };
+    sortRec(root);
+    runs.push({ traceId, root, spans: list });
+  }
+  runs.sort((a, b) => a.root.start - b.root.start);
+  return runs;
+}
+
+// ── Rendering ────────────────────────────────────────────────────────────
+let state = { runs: [], selected: null, collapsed: new Set(), collapsedRuns: new Set(), raw: null, sig: "" };
+const runsEl = document.getElementById("runs");
+const detailEl = document.getElementById("detail");
+
+function inputOf(run) {
+  const raw = run.root.attrs["gen_ai.input.messages"];
+  if (!raw) return "";
+  try { const m = JSON.parse(raw); return m.map(x => (x.parts || []).map(p => p.content).join(" ")).join(" "); } catch { return raw; }
+}
+
+function renderStats() {
+  const runs = state.runs;
+  let spans = 0, tin = 0, tout = 0, tcache = 0, tools = 0, errors = 0, wall = 0, session = "";
+  for (const r of runs) {
+    spans += r.spans.length;
+    wall += r.root.end - r.root.start;
+    for (const s of r.spans) {
+      if (kindOf(s) === "chat") { tin += s.attrs["gen_ai.usage.input_tokens"] || 0; tout += s.attrs["gen_ai.usage.output_tokens"] || 0; tcache += s.attrs["gen_ai.usage.cache_read.input_tokens"] || 0; }
+      if (kindOf(s) === "tool") tools++;
+      if (isErr(s)) errors++;
+      if (!session && s.attrs["gen_ai.conversation.id"]) session = s.attrs["gen_ai.conversation.id"];
+    }
+  }
+  document.getElementById("s-session").textContent = session || "—";
+  document.getElementById("s-runs").textContent = runs.length;
+  document.getElementById("s-spans").textContent = spans;
+  document.getElementById("s-wall").textContent = runs.length ? fmtDur(wall) : "—";
+  document.getElementById("s-tokens").textContent = runs.length ? fmtTok(tin) + " in · " + fmtTok(tout) + " out · " + fmtTok(tcache) + " cached" : "—";
+  document.getElementById("s-tools").textContent = tools;
+  document.getElementById("s-errors").textContent = errors;
+  document.getElementById("s-errors-wrap").style.display = errors ? "" : "none";
+}
+
+function renderOverview() {
+  const el = document.getElementById("overview");
+  el.innerHTML = "";
+  if (!state.runs.length) return;
+  const t0 = state.runs[0].root.start, t1 = Math.max(...state.runs.map(r => r.root.end));
+  const span = Math.max(1, t1 - t0);
+  state.runs.forEach((r, i) => {
+    const b = document.createElement("div");
+    b.className = "ob" + (isErr(r.root) ? " error" : "");
+    b.style.left = ((r.root.start - t0) / span * 100) + "%";
+    b.style.width = ((r.root.end - r.root.start) / span * 100) + "%";
+    b.title = "Run " + (i + 1) + " · " + fmtDur(r.root.end - r.root.start) + " · " + inputOf(r).slice(0, 80);
+    b.onclick = ev => { ev.stopPropagation(); document.getElementById("run-" + i).scrollIntoView({ behavior: "smooth", block: "start" }); };
+    el.appendChild(b);
+  });
+}
+
+function subtitle(s) {
+  const k = kindOf(s), a = s.attrs;
+  if (k === "chat") {
+    const parts = [];
+    if (a["gen_ai.usage.input_tokens"] != null) parts.push(fmtTok(a["gen_ai.usage.input_tokens"]) + "→" + fmtTok(a["gen_ai.usage.output_tokens"] || 0) + " tok");
+    if (a["metacodes.request.purpose"]) parts.push(a["metacodes.request.purpose"]);
+    if (a["metacodes.request.outcome"] && a["metacodes.request.outcome"] !== "success") parts.push(a["metacodes.request.outcome"]);
+    return parts.join(" · ");
+  }
+  if (k === "tool") {
+    let arg = a["gen_ai.tool.call.arguments"] || "";
+    try { const j = JSON.parse(arg); arg = j.command || j.file_path || j.path || j.pattern || j.url || j.query || j.description || arg; } catch {}
+    return String(arg).replace(/\s+/g, " ").slice(0, 80);
+  }
+  if (k === "turn" && a["metacodes.turn.tool_calls_total"] != null) return "";
+  return "";
+}
+
+function matchesFilter(s, f) {
+  if (!f) return true;
+  if (s.name.toLowerCase().includes(f)) return true;
+  for (const v of Object.values(s.attrs)) if (String(v).toLowerCase().includes(f)) return true;
+  return false;
+}
+
+function renderRuns() {
+  const f = document.getElementById("filter").value.trim().toLowerCase();
+  if (!state.runs.length) { runsEl.innerHTML = '<div class="empty">No spans recorded for this session yet. Send a message in the chat; each Run appears here as it runs.</div>'; return; }
+  const frag = document.createDocumentFragment();
+  state.runs.forEach((run, i) => {
+    const root = run.root, total = Math.max(1, root.end - root.start);
+    const box = document.createElement("div");
+    box.className = "run" + (state.collapsedRuns.has(run.traceId) ? " collapsed" : "");
+    box.id = "run-" + i;
+    const a = root.attrs;
+    const stop = a["metacodes.run.stop_reason"] || (root.running ? "running" : "");
+    const tin = a["gen_ai.usage.input_tokens"], tout = a["gen_ai.usage.output_tokens"];
+    const head = document.createElement("div");
+    head.className = "run-head";
+    head.innerHTML = '<span class="rn">Run ' + (i + 1) + '</span>' +
+      '<span class="rinput" title="' + esc(inputOf(run)) + '">' + esc(inputOf(run) || "(no input recorded)") + '</span>' +
+      '<span class="rmeta">' + esc(fmtTime(root.start)) + '</span>' +
+      '<span class="rmeta">' + esc(fmtDur(root.end - root.start)) + '</span>' +
+      (a["gen_ai.request.model"] ? '<span class="rmeta">' + esc(a["gen_ai.request.model"]) + '</span>' : "") +
+      (tin != null ? '<span class="rmeta">' + fmtTok(tin) + ' in · ' + fmtTok(tout || 0) + ' out</span>' : "") +
+      (stop ? '<span class="rmeta' + (isErr(root) ? " err" : "") + '">' + esc(stop) + '</span>' : "");
+    head.onclick = () => { state.collapsedRuns.has(run.traceId) ? state.collapsedRuns.delete(run.traceId) : state.collapsedRuns.add(run.traceId); render(); };
+    box.appendChild(head);
+
+    const wf = document.createElement("div");
+    wf.className = "wf";
+    // axis
+    const axis = document.createElement("div");
+    axis.className = "wf-axis";
+    let ticks = "";
+    for (let t = 0; t <= 4; t++) ticks += '<span class="tick" style="left:' + (t * 25) + '%' + (t === 0 ? ';transform:none' : t === 4 ? ';transform:translateX(-100%)' : '') + '">' + fmtDur(total * t / 4) + '</span>';
+    axis.innerHTML = '<div class="lcol">span</div><div class="tcol">' + ticks + '</div>';
+    wf.appendChild(axis);
+
+    const walk = (s, depth) => {
+      const k = kindOf(s);
+      const hasKids = s.children.length > 0;
+      const collapsed = state.collapsed.has(s.id);
+      const row = document.createElement("div");
+      row.className = "row" + (state.selected === s.id ? " sel" : "") + (matchesFilter(s, f) ? "" : " hidden");
+      const left = ((s.start - root.start) / total) * 100, width = ((s.end - s.start) / total) * 100;
+      let evts = "";
+      for (const e of s.events) evts += '<span class="evt" title="' + esc(e.name) + '" style="left:' + (((e.time - root.start) / total) * 100) + '%"></span>';
+      const sub = subtitle(s);
+      row.innerHTML =
+        '<div class="lcol" style="padding-left:' + (6 + depth * 14) + 'px">' +
+          '<span class="tog">' + (hasKids ? (collapsed ? "▸" : "▾") : "") + '</span>' +
+          '<i class="dot k-' + k + (isErr(s) ? " error" : "") + '"></i>' +
+          '<span class="sname">' + esc(s.name) + (sub ? '<span class="sub">' + esc(sub) + '</span>' : "") + '</span>' +
+        '</div>' +
+        '<div class="tcol">' +
+          '<div class="bar k-' + k + (isErr(s) ? " error" : "") + '" style="left:' + left + '%;width:' + width + '%"></div>' + evts +
+          (left + width > 88
+            ? '<span class="bar-label inside" style="right:calc(' + Math.max(0, 100 - left - width) + '% + 4px)">' + fmtDur(s.end - s.start) + '</span>'
+            : '<span class="bar-label" style="left:calc(' + (left + width) + '% + 4px)">' + fmtDur(s.end - s.start) + '</span>') +
+        '</div>';
+      row.querySelector(".tog").onclick = ev => { ev.stopPropagation(); collapsed ? state.collapsed.delete(s.id) : state.collapsed.add(s.id); render(); };
+      row.onclick = () => select(s.id);
+      wf.appendChild(row);
+      if (!collapsed) for (const c of s.children) walk(c, depth + 1);
+    };
+    walk(root, 0);
+    box.appendChild(wf);
+    frag.appendChild(box);
+  });
+  runsEl.innerHTML = "";
+  runsEl.appendChild(frag);
+}
+
+function findSpan(id) {
+  for (const r of state.runs) {
+    if (r.root.id === id) return r.root;
+    const s = r.spans.find(x => x.id === id);
+    if (s) return s;
+  }
+  return null;
+}
+
+function renderMessages(raw) {
+  let msgs;
+  try { msgs = JSON.parse(raw); } catch { return '<pre class="content">' + esc(raw) + '</pre>'; }
+  const part = p => {
+    if (p.type === "tool_call")
+      return '<div class="role">tool call · ' + esc(p.name || "") + ' · ' + esc(p.id || "") + '</div>' +
+             '<pre class="content">' + esc(pretty(p.arguments != null ? (typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments)) : "")) + '</pre>';
+    return '<pre class="content' + (p.type === "reasoning" ? " part-reasoning" : "") + '">' + esc(p.content != null ? p.content : JSON.stringify(p)) + '</pre>';
+  };
+  return msgs.map(m => '<div class="msg ' + esc(m.role || "") + '"><div class="role">' + esc(m.role || "") + '</div>' +
+    (m.parts || []).map(part).join("") + '</div>').join("");
+}
+function pretty(raw) {
+  try { return JSON.stringify(JSON.parse(raw), null, 2); } catch { return raw; }
+}
+
+const CONTENT_KEYS = ["gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.tool.call.arguments", "gen_ai.tool.call.result"];
+function renderDetail() {
+  const s = state.selected && findSpan(state.selected);
+  if (!s) { detailEl.className = ""; detailEl.innerHTML = ""; return; }
+  detailEl.className = "open";
+  const a = s.attrs, k = kindOf(s);
+  let h = '<span class="close" id="dclose">✕</span><h2>' + esc(s.name) + '</h2>';
+  h += '<div class="badges"><span class="badge">' + k + '</span><span class="badge">' + fmtDur(s.end - s.start) + '</span>' +
+       '<span class="badge">' + esc(fmtTime(s.start)) + '</span>' +
+       (isErr(s) ? '<span class="badge err">ERROR ' + esc(s.status.message || "") + '</span>' : "") +
+       (s.running ? '<span class="badge">running</span>' : "") + '</div>';
+  if (a["gen_ai.input.messages"]) h += '<h3>Input</h3>' + renderMessages(a["gen_ai.input.messages"]);
+  if (a["gen_ai.output.messages"]) h += '<h3>Output</h3>' + renderMessages(a["gen_ai.output.messages"]);
+  if (a["gen_ai.tool.call.arguments"] != null) h += '<h3>Arguments</h3><pre class="content">' + esc(pretty(a["gen_ai.tool.call.arguments"])) + '</pre>';
+  if (a["gen_ai.tool.call.result"] != null) h += '<h3>Result</h3><pre class="content">' + esc(a["gen_ai.tool.call.result"]) + '</pre>';
+  h += '<h3>Attributes</h3><table class="attrs">';
+  h += '<tr><td class="k">trace_id</td><td>' + esc(s.traceId) + '</td></tr><tr><td class="k">span_id</td><td>' + esc(s.id) + '</td></tr>';
+  if (s.parent) h += '<tr><td class="k">parent_span_id</td><td>' + esc(s.parent) + '</td></tr>';
+  for (const key of Object.keys(a).sort()) if (!CONTENT_KEYS.includes(key)) h += '<tr><td class="k">' + esc(key) + '</td><td>' + esc(a[key]) + '</td></tr>';
+  h += '</table>';
+  if (s.events.length) {
+    h += '<h3>Events</h3>';
+    for (const e of s.events) {
+      h += '<div class="event"><span class="en">' + esc(e.name) + '</span><span class="et">+' + fmtDur(e.time - s.start) + '</span>';
+      const keys = Object.keys(e.attrs);
+      if (keys.length) h += '<table class="attrs">' + keys.map(k2 => '<tr><td class="k">' + esc(k2) + '</td><td>' + esc(e.attrs[k2]) + '</td></tr>').join("") + '</table>';
+      h += '</div>';
+    }
+  }
+  detailEl.innerHTML = h;
+  document.getElementById("dclose").onclick = () => { state.selected = null; render(); };
+}
+
+function select(id) { state.selected = state.selected === id ? null : id; render(); }
+
+function render() { renderStats(); renderOverview(); renderRuns(); renderDetail(); }
+
+async function load() {
+  try {
+    const r = await api("spans");
+    if (r.status === 401) { runsEl.innerHTML = '<div class="empty">Unauthorized: open this page as trace?token=&lt;token&gt;.</div>'; return; }
+    if (!r.ok) { runsEl.innerHTML = '<div class="empty">Span recording is not available (' + r.status + ').</div>'; return; }
+    const text = await r.text();
+    if (text === state.sig) return; // nothing new
+    state.sig = text;
+    state.raw = text;
+    state.runs = buildRuns(parse(JSON.parse(text)));
+    const atBottom = runsEl.scrollTop + runsEl.clientHeight >= runsEl.scrollHeight - 30;
+    render();
+    if (atBottom) runsEl.scrollTop = runsEl.scrollHeight;
+  } catch (e) {
+    runsEl.innerHTML = '<div class="empty">Could not load spans: ' + esc(e.message || e) + '</div>';
+  }
+}
+
+document.getElementById("filter").oninput = () => renderRuns();
+document.getElementById("expand").onclick = () => { state.collapsed.clear(); state.collapsedRuns.clear(); render(); };
+document.getElementById("download").onclick = () => {
+  if (!state.raw) return;
+  const url = URL.createObjectURL(new Blob([state.raw], { type: "application/json" }));
+  const a = document.createElement("a"); a.href = url; a.download = "metacodes-spans.json"; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+document.addEventListener("keydown", e => { if (e.key === "Escape") { state.selected = null; render(); } });
+load();
+setInterval(() => { if (document.getElementById("live").checked && !document.hidden) load(); }, 2000);
+</script>
+</body>
+</html>

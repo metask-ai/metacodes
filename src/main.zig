@@ -4042,6 +4042,7 @@ test {
     _ = &@import("core/headless_backend.zig");
     _ = &@import("core/tee_backend.zig");
     _ = &@import("core/diagnostics_backend.zig");
+    _ = &@import("telemetry/telemetry.zig");
     _ = &@import("core/suspend_state.zig");
     _ = &@import("repl/tui/ui_state.zig");
     _ = &@import("repl/tui/ui.zig");

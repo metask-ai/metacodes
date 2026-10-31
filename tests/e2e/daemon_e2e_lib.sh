@@ -37,7 +37,7 @@ daemon_e2e_cleanup() {
   local status=$?
   # Reaped here, quietly: bash would otherwise report each killed job.
   local pid
-  for pid in "$DAEMON_PID" "$MOCK_PID"; do
+  for pid in "$DAEMON_PID" "$MOCK_PID" "$COLLECTOR_PID"; do
     [[ -n "$pid" ]] || continue
     { kill -KILL "$pid" && wait "$pid"; } 2>/dev/null || true
   done
@@ -80,6 +80,17 @@ wait_for_line() {
   done
 }
 
+COLLECTOR_PID=""
+COLLECTOR_URL=""
+
+# A loopback OTLP/HTTP receiver; requests land in $TMP/otlp.jsonl.
+start_collector() {
+  python3 "$E2E_DIR/otlp_mock_collector.py" "$TMP/collector.url" "$TMP/otlp.jsonl" >"$TMP/collector.out" 2>&1 &
+  COLLECTOR_PID=$!
+  wait_for_line "$TMP/collector.url" "$COLLECTOR_PID" '^http://' || fail "OTLP collector did not start"
+  COLLECTOR_URL="$(tr -d '[:space:]' <"$TMP/collector.url")"
+}
+
 start_mock() {
   python3 "$E2E_DIR/daemon_mock_provider.py" "$TMP/mock.url" >"$TMP/mock.out" 2>&1 &
   MOCK_PID=$!
@@ -95,6 +106,11 @@ start_daemon() {
     -u METACODES_KG_BIN -u METACODES_KG_STORE -u METACODES_KG_TRANSPORT \
     -u METACODES_KG_CONFIG -u METACODES_KG_URL -u METACODES_KG_API_KEY \
     -u METACODES_KG_EXPECTED_BUILD_ID -u METACODES_KG_EXPECTED_SCHEMA_DIGEST \
+    -u OTEL_SDK_DISABLED -u OTEL_TRACES_EXPORTER -u OTEL_EXPORTER_OTLP_ENDPOINT \
+    -u OTEL_EXPORTER_OTLP_TRACES_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
+    -u OTEL_EXPORTER_OTLP_TRACES_PROTOCOL -u OTEL_EXPORTER_OTLP_HEADERS \
+    -u OTEL_EXPORTER_OTLP_TRACES_HEADERS -u OTEL_SERVICE_NAME -u OTEL_RESOURCE_ATTRIBUTES \
+    -u OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT -u METACODES_SPANS \
     HOME="$TMP/home" METACODES_HOME="$TMP/state" METACODES_NO_PROBE=1 \
     METACODES_KG_AUTOSTART=0 METACODES_JEV_URL=off \
     "$@" >"$log" 2>&1 &

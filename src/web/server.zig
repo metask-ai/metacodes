@@ -81,6 +81,15 @@ pub const StateFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) an
 /// **线程**:在 HTTP 连接线程调——session 实现自行判 generating 拒绝会撞 driver 的操作。
 pub const CommandFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, cmd: []const u8) anyerror![]u8;
 
+/// `GET /spans`: the session's recorded spans as one OTLP/JSON
+/// `ExportTraceServiceRequest` (owned, caller frees). ctx = `state_ctx`.
+/// Called on the HTTP connection thread: the implementation must not borrow
+/// driver-owned state.
+pub const SpansFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8;
+
+/// The trace waterfall page served at `GET /trace` (reads `GET /spans`).
+pub const TRACE_HTML: []const u8 = @embedFile("trace.html");
+
 /// Longest bearer token accepted (#252). A token travels in a header and, on
 /// a GET, in the query; 4 KiB leaves room for a JWT.
 pub const MAX_TOKEN_LEN: usize = 4096;
@@ -162,6 +171,7 @@ pub const SessionView = struct {
     state_ctx: *anyopaque,
     state_fn: StateFn,
     command_fn: ?CommandFn = null,
+    spans_fn: ?SpansFn = null,
 };
 
 /// One resolved session, held for one request — for `GET /events` the whole
@@ -269,6 +279,8 @@ pub const Deps = struct {
     state_fn: StateFn,
     /// 斜杠命令处理(可空:单测不接)。ctx 复用 state_ctx。
     command_fn: ?CommandFn = null,
+    /// `GET /spans` (null: 404). ctx reuses state_ctx.
+    spans_fn: ?SpansFn = null,
     /// **U10-C:多 session 解析器**。非 null 时,路径 `/s/<id>/rest` 按 id 租用 session(`Lease`,未知
     /// 或正在销毁→404);无 /s/ 前缀的非 `/`、非 `/health`、非 `/sessions` 路径→404。null=单 session
     /// 模式(--web,直用上面字段)。
@@ -645,6 +657,23 @@ pub const WebServer = struct {
             writeSimple(fd, "200 OK", "application/json", "{\"ok\":true}");
             return;
         }
+        if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, eff_path, "/trace")) {
+            writeResponse(fd, "200 OK", "text/html; charset=utf-8", "Cache-Control: no-store\r\n", TRACE_HTML);
+            return;
+        }
+        if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, eff_path, "/spans")) {
+            const sf = sv.spans_fn orelse {
+                writeSimple(fd, "404 Not Found", "application/json", "{\"error\":\"span recording unavailable\"}");
+                return;
+            };
+            const json = sf(sv.state_ctx, self.allocator) catch {
+                writeSimple(fd, "500 Internal Server Error", "application/json", "{\"error\":\"span read failed\"}");
+                return;
+            };
+            defer self.allocator.free(json);
+            writeResponse(fd, "200 OK", "application/json", "Cache-Control: no-store\r\n", json);
+            return;
+        }
         if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, eff_path, "/state")) {
             const json = sv.state_fn(sv.state_ctx, self.allocator) catch {
                 writeSimple(fd, "500 Internal Server Error", "application/json", "{\"error\":\"state snapshot failed\"}");
@@ -670,6 +699,7 @@ pub const WebServer = struct {
             .state_ctx = self.deps.state_ctx,
             .state_fn = self.deps.state_fn,
             .command_fn = self.deps.command_fn,
+            .spans_fn = self.deps.spans_fn,
         };
     }
 
@@ -1374,6 +1404,77 @@ test "loopback: /message 入队(不回显), /state 快照, 404" {
         const resp = try httpRoundtrip(testing.allocator, srv.port, "GET / HTTP/1.1\r\n\r\n");
         defer testing.allocator.free(resp);
         try testing.expect(std.mem.indexOf(u8, resp, "text/html") != null);
+    }
+}
+
+test "loopback: /spans serves the session span store as OTLP/JSON, /trace serves the viewer" {
+    const telemetry = @import("../telemetry/telemetry.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    {
+        var store = try telemetry.store.SessionStore.init(testing.allocator, dir);
+        defer store.deinit();
+        const s: telemetry.span.Span = .{
+            .trace_id = telemetry.span.TraceId.random(),
+            .span_id = telemetry.span.SpanId.random(),
+            .name = "invoke_agent metacodes",
+            .start_unix_nano = 1,
+            .end_unix_nano = 2,
+        };
+        try store.append(&s);
+    }
+
+    var j = EventJournal.init(testing.allocator);
+    defer j.deinit();
+    var wb = WebBackend.init(testing.allocator, &j);
+    defer wb.deinit();
+    var inbox = SubmissionQueue.init(testing.allocator);
+    defer inbox.deinit();
+    var sig = abort_mod.AbortSignal.init();
+    const S = struct {
+        fn state(_: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+            return allocator.dupe(u8, "{}");
+        }
+        fn spans(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+            const d: *[]const u8 = @ptrCast(@alignCast(ctx));
+            return telemetry.store.readAsRequest(allocator, d.*, "test");
+        }
+    };
+    var dir_ref: []const u8 = dir;
+    const base: Deps = .{
+        .journal = &j,
+        .web_backend = &wb,
+        .inbox = &inbox,
+        .abort = &sig,
+        .state_ctx = @ptrCast(&dir_ref),
+        .state_fn = &S.state,
+    };
+    {
+        var deps = base;
+        deps.spans_fn = &S.spans;
+        const srv = try WebServer.start(testing.allocator, .{ .version = TEST_VERSION }, deps);
+        defer srv.stop();
+        const resp = try httpRoundtrip(testing.allocator, srv.port, "GET /spans HTTP/1.1\r\n\r\n");
+        defer testing.allocator.free(resp);
+        try testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
+        try testing.expect(std.mem.indexOf(u8, resp, "application/json") != null);
+        try testing.expect(std.mem.indexOf(u8, resp, "\"resourceSpans\"") != null);
+        try testing.expect(std.mem.indexOf(u8, resp, "\"name\":\"invoke_agent metacodes\"") != null);
+
+        const page = try httpRoundtrip(testing.allocator, srv.port, "GET /trace HTTP/1.1\r\n\r\n");
+        defer testing.allocator.free(page);
+        try testing.expect(std.mem.indexOf(u8, page, "text/html") != null);
+        try testing.expect(std.mem.indexOf(u8, page, "metacodes · trace") != null);
+    }
+    {
+        // A host without span recording answers 404, not an empty trace.
+        const srv = try WebServer.start(testing.allocator, .{ .version = TEST_VERSION }, base);
+        defer srv.stop();
+        const resp = try httpRoundtrip(testing.allocator, srv.port, "GET /spans HTTP/1.1\r\n\r\n");
+        defer testing.allocator.free(resp);
+        try testing.expect(std.mem.indexOf(u8, resp, "404 Not Found") != null);
     }
 }
 

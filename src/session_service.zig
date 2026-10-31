@@ -540,6 +540,8 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
     _ = app.refreshWorkspaceRoot();
     return .{
         .session = app.session_id,
+        // Span recording into the session store and the OTLP exporter (observer only).
+        .telemetry = @import("telemetry/telemetry.zig").forSession(app.sessionDir()),
         .verbose = app.config.verbose,
         .abort = &app.abort,
         // background_request 是**宿主契约字段**(.backgrounded 停由宿主尾声消化 + 复位,

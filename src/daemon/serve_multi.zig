@@ -143,6 +143,7 @@ const SessionSlot = struct {
             .state_ctx = @ptrCast(&slot.state_src),
             .state_fn = &web_session.StateSource.snapshot,
             .command_fn = &web_session.StateSource.command,
+            .spans_fn = &web_session.StateSource.spans,
         };
     }
 };
@@ -802,7 +803,10 @@ fn rootPage(ctx: *anyopaque, allocator: std.mem.Allocator) ?[]u8 {
     for (ids) |id| {
         buf.appendSlice(allocator, "<li><code>") catch return null;
         buf.appendSlice(allocator, id.asSlice()) catch return null; // 24 hex,无需转义
-        buf.appendSlice(allocator, "</code></li>") catch return null;
+        // The trace view works per session under /s/<id>/ (it reads ./spans).
+        buf.appendSlice(allocator, "</code> · <a href=\"/s/") catch return null;
+        buf.appendSlice(allocator, id.asSlice()) catch return null;
+        buf.appendSlice(allocator, "/trace\">trace</a></li>") catch return null;
     }
     if (ids.len == 0) buf.appendSlice(allocator, "<li>(none; create one with POST /sessions/create)</li>") catch return null;
     buf.appendSlice(allocator, "</ul><h2>API</h2><pre>" ++
@@ -817,6 +821,8 @@ fn rootPage(ctx: *anyopaque, allocator: std.mem.Allocator) ?[]u8 {
         "POST /s/&lt;id&gt;/command       {\"cmd\":\"/verb ...\"}\n" ++
         "POST /s/&lt;id&gt;/interrupt\n" ++
         "GET  /s/&lt;id&gt;/state\n" ++
+        "GET  /s/&lt;id&gt;/spans         (OTLP/JSON of the session's spans)\n" ++
+        "GET  /s/&lt;id&gt;/trace         (the session's trace view)\n" ++
         "</pre></body>") catch return null;
     return buf.toOwnedSlice(allocator) catch null;
 }

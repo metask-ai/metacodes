@@ -87,6 +87,7 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mo
         .state_ctx = @ptrCast(&state_src),
         .state_fn = &web_session.StateSource.snapshot,
         .command_fn = &web_session.StateSource.command,
+        .spans_fn = &web_session.StateSource.spans,
     });
 
     srv.announce("metacodes daemon (1 session)");

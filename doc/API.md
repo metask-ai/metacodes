@@ -604,6 +604,8 @@ unless noted.
 | `POST /command` | `{"cmd":"/verb ..."}`: queue a [service verb](#session-command-surface-ui-neutral); the result arrives as `command_result`. |
 | `POST /interrupt` | Interrupt the running generation; 409 when idle. |
 | `GET /state` | Session snapshot (model, mode, usage, journal epoch and seq, ...). |
+| `GET /spans` | The session's recorded spans as one OTLP/JSON `ExportTraceServiceRequest` ([Observability](OBSERVABILITY.md#the-web-trace-view)): every Run of the conversation, in the order its spans ended. `404` when the host records no spans. |
+| `GET /trace` | The trace view: the conversation's spans as a waterfall, read from `GET /spans`. |
 
 **Session lifecycle (multi-session daemon only, #254).** These routes sit at
 the top level, never under `/s/<id>/`, and go through the same admission

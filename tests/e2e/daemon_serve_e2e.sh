@@ -11,6 +11,10 @@
 #      the query, the token is never printed.
 #   3. A non-loopback bind without a token is refused (exit 2) before anything
 #      starts, from the flag and from METACODES_WEB_BIND.
+#   4. Tracing: every run is recorded as an OpenTelemetry span tree. GET /spans
+#      serves the session's spans as OTLP/JSON, GET /trace the viewer, and the
+#      standard OTEL_* variables export the same spans to an OTLP/HTTP
+#      collector (tests/e2e/otlp_mock_collector.py), flushed at shutdown.
 #
 # Run by `zig build test` on POSIX hosts (build.zig sets
 # METACODES_DAEMON_E2E_BIN); by hand: `zig build && bash tests/e2e/daemon_serve_e2e.sh`.
@@ -57,6 +61,26 @@ events_until 'WIRE_SHELL_OK' "$url/events" >/dev/null || fail "shell output not 
 # DNS rebinding: a foreign Host name is refused without a token.
 [[ "$(http_code -H "Host: rebound.example:${url##*:}" "$url/state")" == 403 ]] || fail "rebound Host not refused"
 
+# The run above is in the session's span store (OTLP/JSON), and the viewer is served.
+spans="$("${CURL[@]}" -f "$url/spans")" || fail "GET /spans failed"
+python3 - "$spans" "$state" <<'PY' || fail "unexpected /spans body: $spans"
+import json, sys
+doc = json.loads(sys.argv[1])
+session = json.loads(sys.argv[2])["session_id"]
+spans = doc["resourceSpans"][0]["scopeSpans"][0]["spans"]
+names = [s["name"] for s in spans]
+roots = [s for s in spans if s["name"] == "invoke_agent metacodes"]
+assert roots, names
+root = roots[0]
+attrs = {a["key"]: a["value"] for a in root["attributes"]}
+assert attrs["gen_ai.conversation.id"]["stringValue"] == session, attrs
+assert attrs["metacodes.run.stop_reason"]["stringValue"] == "end_turn", attrs
+chats = [s for s in spans if s["name"].startswith("chat ") and s["traceId"] == root["traceId"]]
+assert chats and all(s.get("parentSpanId") for s in chats), names
+PY
+page="$("${CURL[@]}" -f "$url/trace")" || fail "GET /trace failed"
+grep -q "metacodes · trace" <<<"$page" || fail "/trace is not the trace viewer"
+
 stop_daemon "$TMP/plain.out"
 
 # ── 2. bearer token (environment) on an IPv6 loopback bind ──────────────────
@@ -95,10 +119,50 @@ grep -q '"ok":true' <<<"$ack" || fail "/message with the token not accepted: $ac
 events="$(events_until '"run_done".*end_turn' "$url/events?token=$token")" || fail "SSE with ?token= did not stream: $events"
 grep -q '"user_message":"with token"' <<<"$events" || fail "the authenticated message is missing from the stream"
 if grep -q '"user_message":"query"' <<<"$events"; then fail "the query-authenticated POST had an effect"; fi
+# The trace surface sits behind the same token.
+[[ "$(http_code "$url/spans")" == 401 ]] || fail "/spans without a token is not 401"
+[[ "$(http_code "$url/trace")" == 401 ]] || fail "/trace without a token is not 401"
+[[ "$(http_code "$url/trace?token=$token")" == 200 ]] || fail "/trace?token= is not served"
+spans="$("${CURL[@]}" "${auth[@]}" "$url/spans")" || fail "GET /spans with the token failed"
+grep -q '"name":"invoke_agent metacodes"' <<<"$spans" || fail "/spans with the token has no run span"
 stop_daemon "$TMP/token.out"
 
 # ── 3. non-loopback bind without authentication: refused before startup ────
 expect_refusal "$TMP/refuse-flag.out" "$BIN" serve 0 --web-bind 0.0.0.0 --api-key test --base-url "$BASE_URL"
 expect_refusal "$TMP/refuse-env.out" METACODES_WEB_BIND=:: "$BIN" serve 0 --api-key test --base-url "$BASE_URL"
 
-echo "PASS: daemon e2e — /health, message→agent_loop→journal→SSE, /state·/command, bearer token, bind $bind, non-loopback refusal, SIGINT shutdown"
+# ── 4. OTLP export from the standard OTEL_* variables ───────────────────────
+start_collector
+start_daemon "$TMP/otel.out" OTEL_EXPORTER_OTLP_ENDPOINT="$COLLECTOR_URL" OTEL_EXPORTER_OTLP_PROTOCOL=http/json \
+  OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer%20otel-e2e" OTEL_SERVICE_NAME=metacodes-e2e \
+  "$BIN" serve 0 --api-key test --base-url "$BASE_URL"
+wait_listening "$TMP/otel.out"
+url="$DAEMON_URL"
+ack="$("${CURL[@]}" -X POST "$url/message" -H "Origin: $url" -d '{"text":"traced OTEL_PROMPT_MARKER"}')"
+grep -q '"ok":true' <<<"$ack" || fail "/message not accepted: $ack"
+events_until '"run_done".*end_turn' "$url/events" >/dev/null || fail "traced run did not finish"
+# SIGINT: the last App release flushes the exporter before the process exits.
+stop_daemon "$TMP/otel.out"
+[[ -s "$TMP/otlp.jsonl" ]] || fail "the collector received nothing"
+python3 - "$TMP/otlp.jsonl" <<'PY' || fail "unexpected OTLP export: $(head -c 2000 "$TMP/otlp.jsonl")"
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+assert all(r["content_type"] == "application/json" for r in records), records
+assert all(r["authorization"] == "Bearer otel-e2e" for r in records), records
+spans, services = [], set()
+for r in records:
+    doc = json.loads(r["body"])
+    for rs in doc["resourceSpans"]:
+        for a in rs["resource"]["attributes"]:
+            if a["key"] == "service.name":
+                services.add(a["value"]["stringValue"])
+        for ss in rs["scopeSpans"]:
+            spans.extend(ss["spans"])
+assert services == {"metacodes-e2e"}, services
+names = {s["name"] for s in spans}
+assert "invoke_agent metacodes" in names and any(n.startswith("chat ") for n in names), names
+# Message content is not exported unless OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true.
+assert "OTEL_PROMPT_MARKER" not in "".join(r["body"] for r in records)
+PY
+
+echo "PASS: daemon e2e — /health, message→agent_loop→journal→SSE, /state·/command, bearer token, bind $bind, non-loopback refusal, /spans·/trace, OTLP export, SIGINT shutdown"

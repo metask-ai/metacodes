@@ -545,6 +545,9 @@ pub const App = struct {
     lsp_service: ?*@import("lsp/service.zig").Service = null,
     /// Session transcript writer；失败初始化则保持 null（日志落盘 fallback）
     transcript_writer: ?transcript.Writer = null,
+    /// `sessionDir()` published for other threads (web `GET /spans`); kept in
+    /// step with `transcript_writer` by `publishSessionDir`.
+    session_dir_cell: @import("telemetry/store.zig").DirCell = .{},
     /// 本 session 累计用量（跨多 turn）
     usage: UsageTotals = .{},
     /// Internal-only large-result projection/recovery counters. Evaluation
@@ -1144,6 +1147,9 @@ pub const App = struct {
             break :blk null;
         };
 
+        // The process OTLP exporter lives while any App does; the last
+        // `deinit` flushes it (telemetry.zig). Nothing fails after this point.
+        @import("telemetry/telemetry.zig").acquire(@import("version.zig").semver);
         return app;
     }
 
@@ -1314,6 +1320,8 @@ pub const App = struct {
         if (app.system_prompt) |s| app.allocator.free(s);
         if (app.user_context) |u| app.allocator.free(u);
         app.allocator.destroy(app);
+        // Every Run of this App has ended: send what is queued (last App only).
+        @import("telemetry/telemetry.zig").release();
     }
 
     /// Fill `api_key_catalog` for the `/models` key menu, once, the first time
@@ -2423,6 +2431,7 @@ pub const App = struct {
         app.swarm.session = app.session_id;
         if (app.transcript_writer) |*w| w.deinit();
         app.transcript_writer = null;
+        app.publishSessionDir();
         app.initTranscriptWriter() catch |err| {
             @import("util/log.zig").warn("transcript", "rotate writer failed: {s}", .{@errorName(err)});
         };
@@ -2500,6 +2509,7 @@ pub const App = struct {
         if (std.mem.eql(u8, app.session_id.asSlice(), session.asSlice())) return;
         if (app.transcript_writer) |*w| w.deinit();
         app.transcript_writer = null;
+        app.publishSessionDir();
         app.session_id = session;
         app.permission_ctx.session = session;
         app.swarm.session = session;
@@ -2519,6 +2529,13 @@ pub const App = struct {
         // session_id 传入,使 transcript 目录名 == App.session_id(统一,不再两个独立 gen)。
         const w = try transcript.Writer.init(app.allocator, cwd, .{ .path = state_dir }, app.activeModel(), app.session_id);
         app.transcript_writer = w;
+        app.publishSessionDir();
+    }
+
+    /// Copy `sessionDir()` into `session_dir_cell`. Call after every change
+    /// of `transcript_writer`.
+    pub fn publishSessionDir(app: *App) void {
+        app.session_dir_cell.set(app.sessionDir());
     }
 
     /// Agent loop 每轮结束后调用一次，把 conversation 新增的 message 刷到 transcript。

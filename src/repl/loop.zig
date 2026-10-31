@@ -5412,6 +5412,7 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     staged_owned_here = false; // ownership 已转移给 app.conversation
     if (app.transcript_writer) |*w| w.deinit();
     app.transcript_writer = new_writer;
+    app.publishSessionDir();
     app.loadGoalFromSessionDir(path);
     // 账本是**本 session 的**文件修改记录。会话身份在下面被切走,留着被放弃会话的条目
     // 会把它们误报成 resumed session 的改动。

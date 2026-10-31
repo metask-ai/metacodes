@@ -10,6 +10,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **OpenTelemetry tracing and a web trace view.** Every Run is recorded as a
+  span tree following the GenAI semantic conventions (`invoke_agent` →
+  `turn` → `chat <model>` / `execute_tool <name>` / `compact`), with token
+  usage, permission decisions, cache breaks and compaction on it
+  ([doc/OBSERVABILITY.md](doc/OBSERVABILITY.md)).
+  - **Export:** the standard `OTEL_*` variables send the spans to any
+    OTLP/HTTP collector, `http/protobuf` (default) or `http/json`, from a
+    batching exporter thread that is flushed at exit. Message content is
+    exported only with `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`.
+  - **Session store and web view:** the spans are also appended to the
+    session's `spans.jsonl`; `--web` and `serve` serve them as OTLP/JSON at
+    `GET /spans` and as a waterfall of the whole conversation at `GET /trace`
+    (linked from the chat page). `METACODES_SPANS=off` turns the store off.
+  - Tool spans are recorded for every frontend, including those that do not
+    render tool cards (headless).
+
 ## 0.9.0 — 2026-10-29
 
 ### Added
