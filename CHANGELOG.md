@@ -40,6 +40,14 @@ status, compatibility boundaries, and entry points are defined by
 
 - The AgentCore bundle README stated ABI revision 18 and a 64-byte root. It now
   takes the revision, root size and tables from the ABI types. (#404)
+- **A server that repeats your key no longer gets it into the log or onto the
+  screen (#408).** The credential a request carried, and known secret shapes, are
+  now masked in the log and the TUI's error line for redirect URLs, error frames
+  inside a stream and HTTP error bodies, on all three provider clients and outside
+  a Run too; the structured detail already masked them. Part of a credential cut
+  by a read limit is dropped, and a redirect URL at the limit is not quoted. The
+  `body=` log line now has control bytes flattened, secret shapes masked and a
+  limit of 8 KiB. Debug logging of full responses is unchanged.
 
 ### Added
 
