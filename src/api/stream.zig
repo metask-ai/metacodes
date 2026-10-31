@@ -1332,6 +1332,8 @@ pub const EventIterator = struct {
                     const err_obj = findTopLevelObjectField(data, "error") orelse data;
                     self.logWarn("API error event: {s}", .{err_obj});
                     @import("last_error.zig").recordNamed("API 错误帧", err_obj);
+                    // The whole frame: its top-level `request_id` is outside `error`.
+                    @import("model_error.zig").noteStreamError(data);
                     self.done_flag = true;
                     if (error_class.isContextWindowExceeded(err_obj)) {
                         self.context_window_numbers = error_class.parseContextWindowNumbers(err_obj);

@@ -5,7 +5,8 @@ Each request pops the next step of the script:
 * ``("text", "...")`` answers with one text block and ``end_turn``;
 * ``("tool", name, input_dict)`` answers with one ``tool_use`` block;
 * ``("echo",)`` answers with the text of the last tool_result it received,
-  prefixed by ``"saw: "``, so a test can prove the result reached the model.
+  prefixed by ``"saw: "``, so a test can prove the result reached the model;
+* ``("status", code, headers_dict, body_dict)`` answers with that non-2xx JSON.
 
 Every request body is kept in ``requests`` for assertions, and the
 ``authorization`` header each one carried in ``authorizations``.
@@ -147,6 +148,16 @@ class MockProvider:
                     provider.authorizations.append(self.headers.get("authorization", ""))
                     index = len(provider.requests)
                     step = provider.script.pop(0) if provider.script else ("text", "script exhausted")
+                if step[0] == "status":
+                    failure = json.dumps(step[3]).encode("utf-8")
+                    self.send_response(step[1])
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(failure)))
+                    for name, value in step[2].items():
+                        self.send_header(name, value)
+                    self.end_headers()
+                    self.wfile.write(failure)
+                    return
                 if self.path.endswith("/chat/completions"):
                     # OpenAI protocol: text steps only.
                     payload = openai_text_response(step[1] if step[0] == "text" else "unsupported step")

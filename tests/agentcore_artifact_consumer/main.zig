@@ -169,6 +169,9 @@ const Probe = struct {
     submit_during_ui: bool = false,
     submitted_sequence: u32 = 0,
     saw_input_adopted: bool = false,
+    /// Issue #408: the one `model_error` of the Run expected to fail on the model.
+    model_errors: u32 = 0,
+    model_error_matches: bool = false,
     session: ?*wire.SessionHandle = null,
     active_run_id: u64 = 0,
     bound_session_id_len: u8 = 0,
@@ -318,6 +321,15 @@ const Probe = struct {
                     self.output_segment_open = false;
                     if (segment.disposition == .final and segment.bytes == "artifact done".len)
                         self.saw_final_output_segment = true;
+                },
+                .model_error => |detail| {
+                    self.model_errors += 1;
+                    self.model_error_matches = detail.run_id == 3 and detail.category == .unknown and
+                        detail.retry == .unknown and detail.http_status == 200 and
+                        std.mem.eql(u8, detail.code orelse "", "insufficient_balance") and
+                        std.mem.eql(u8, detail.type orelse "", "billing_error") and
+                        std.mem.eql(u8, detail.message, "Balance too low") and
+                        std.mem.eql(u8, detail.request_id orelse "", "req-consumer-1");
                 },
                 .input_adopted => |adopted| {
                     // Submitted during the AskUserQuestion callback of turn 1,
@@ -1182,6 +1194,11 @@ pub fn main(init: std.process.Init) !void {
 /// refusals keep the key; describe never names a key. The Session carries the
 /// consumer's prompt profile, whose Host section the Probe requires in every
 /// `prompt_manifest`.
+/// A provider's answer inside an accepted stream, in a vocabulary AgentCore has
+/// no opinion about.
+const MODEL_ERROR_SSE =
+    "data: {\"type\":\"error\",\"error\":{\"type\":\"billing_error\",\"code\":\"insufficient_balance\",\"message\":\"Balance too low\"},\"request_id\":\"req-consumer-1\"}\n\n";
+
 fn credentialRotation(
     a: std.mem.Allocator,
     io: std.Io,
@@ -1192,7 +1209,7 @@ fn credentialRotation(
     workspace: []const u8,
     prompt_profile: *const wire.PromptProfileV1,
 ) !void {
-    const server = try Server.start(io, &.{ HOST_SSE, FINAL_SSE, FINAL_SSE });
+    const server = try Server.start(io, &.{ HOST_SSE, FINAL_SSE, FINAL_SSE, MODEL_ERROR_SSE });
     defer server.destroy();
     var joined = false;
     defer if (!joined) server.join();
@@ -1256,6 +1273,16 @@ fn credentialRotation(
     try probe.beginRun(2);
     try expectStatus(.ok, api.session().runText(session, 2, sdk.bytesView("once more"), &options, &result, &diagnostic), diagnostic);
     try probe.endRun(2);
+    if (probe.model_errors != 0) return error.UnexpectedModelError;
+
+    // Issue #408: the ABI call succeeds, the stop reason says the model failed
+    // and the diagnostic stays empty, and the typed event says why.
+    try probe.beginRun(3);
+    try expectStatus(.ok, api.session().runText(session, 3, sdk.bytesView("fail on the model"), &options, &result, &diagnostic), diagnostic);
+    try probe.endRun(3);
+    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .api_error or diagnostic.len != 0)
+        return error.ModelFailureRunResult;
+    if (probe.model_errors != 1 or !probe.model_error_matches) return error.ModelErrorNotReceived;
 
     var description = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&description);

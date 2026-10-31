@@ -70,6 +70,37 @@ class PythonSdkTest(unittest.TestCase):
         # The prompt reached the provider as the user's message.
         self.assertIn("say hello", str(provider.requests[0]["messages"]))
 
+    def test_a_model_failure_reaches_the_result_and_a_later_success_clears_it(self) -> None:
+        events = []
+        failure = (
+            "status",
+            402,
+            {"x-request-id": "req-py-1"},
+            {"error": {"code": "insufficient_balance", "message": "Balance too low"}},
+        )
+        with MockProvider([failure, ("text", "fine now")]) as provider:
+            with metacodes.Runtime(tools=()) as runtime:
+                session = self.session(runtime, provider)
+                failed = session.run("fails", on_event=events.append)
+                recovered = session.run("succeeds")
+        self.assertEqual(failed.stop_reason, "api_error")
+        detail = failed.model_error
+        self.assertIsInstance(detail, metacodes.ModelError)
+        self.assertEqual(detail.category, "payment_required")
+        self.assertEqual(detail.code, "insufficient_balance")
+        self.assertEqual(detail.message, "Balance too low")
+        self.assertEqual(detail.http_status, 402)
+        self.assertEqual(detail.request_id, "req-py-1")
+        self.assertEqual(detail.retry, "not_retryable")
+        self.assertEqual(detail.attempts, 1)
+        # It is an ordinary event too, before the terminal run_state.
+        tags = [next(iter(event)) for event in events]
+        self.assertEqual(tags.count("model_error"), 1)
+        self.assertEqual(tags[-1], "run_state")
+        self.assertLess(tags.index("model_error"), len(tags) - 1)
+        self.assertEqual(recovered.stop_reason, "end_turn")
+        self.assertIsNone(recovered.model_error)
+
     def test_python_tool_result_reaches_the_model(self) -> None:
         calls = []
 

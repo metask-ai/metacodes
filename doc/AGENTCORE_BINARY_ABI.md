@@ -461,6 +461,7 @@ The v1 observation set is:
 | Permission-decision evidence | `permission_provenance` | Final Permission decision, canonical source, request binding, generation, and typed callback outcome |
 | System prompt audit | `prompt_manifest` | The sections of the system prompt this Run sends (id, order, origin, class, SHA-256) and the prompt's SHA-256, when it differs from the previous Run's |
 | Goal accounting | `goal_updated` | The Session's goal changed during this Run: its budget ran out (`budget_limited`), or the Run ended and its usage and time are on the goal; carries the whole goal as `goal->get` writes it (see "Goals") |
+| Model failure detail | `model_error` | Why this Run stopped with `STOP_API_ERROR`: category, upstream code and type, displayable message, HTTP status, request id and retry guidance; exactly one, before the terminal `run_state` (see "Model failure detail") |
 | Host input adoption | `input_adopted` | An input accepted by `submit_input` was appended to the Conversation before request `turn`; carries its `input_id` and receipt `sequence` (see "Active-Run input") |
 
 Events describe observations, not commands. A Host may render, aggregate,
@@ -779,6 +780,85 @@ requests cooperative abort and any other value returns
 `run_id` returns `METASK_AGENTCORE_STATUS_TOO_LATE` and any other value returns
 `METASK_AGENTCORE_STATUS_STALE_RUN`. A poisoned Session returns
 `METASK_AGENTCORE_STATUS_INVALID_STATE` regardless of the supplied ID.
+
+### Model failure detail
+
+`STATUS_OK`, `STOP_API_ERROR` and an empty diagnostic keep their meaning: the
+call succeeded and the Run failed on the model. Every Run whose
+`RunResultV1.stop_reason_code` is `STOP_API_ERROR` also delivers exactly one
+`model_error` observation event, through its own `on_event` call and before its
+terminal `run_state`, so a Host that has the result has the reason. No other Run
+delivers one: a failed attempt that a retry recovered from reports nothing, and
+a budget stop that outranks the loop's stop reports `STOP_CHECKPOINT_*` as
+before. A Host that rejects the event fails the Run with `CALLBACK_FAILED`, like
+any other observation.
+
+`model_error` is an additive observation tag. It adds no C layout, function
+slot or revision, and an older Host decodes it through the `unknown` path.
+
+```json
+{"model_error":{"run_id":7,"category":"rate_limited","code":"insufficient_quota",
+ "type":"insufficient_quota","message":"You exceeded your current quota",
+ "http_status":429,"request_id":"req_1","retry":"unknown","retry_after_ms":null,
+ "attempts":1,"truncated":false}}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `run_id` | The Run, equal to the callback's `RunContextV1.run_id` |
+| `category` | One of the closed set below |
+| `code` | The upstream's most specific identifier, verbatim up to the limit: `error.code`, else Gemini's `error.status`, else a numeric code in decimal, else `error.type`. Null if it sent none |
+| `type` | The upstream's `error.type`, or null |
+| `message` | Safe to display (see below). Never empty |
+| `http_status` | The final response's status: the failing one, or 200 for a failure inside an accepted stream. Null when no response head arrived |
+| `request_id` | From `x-metask-request-id`, `request-id`, `x-request-id`, `x-goog-request-id`, `x-amzn-requestid` or `x-ms-request-id`, in that order, else the error body's `request_id`. Null if none |
+| `retry` | `retryable`, `not_retryable` or `unknown` |
+| `retry_after_ms` | The failing response's `Retry-After`, when it sent one |
+| `attempts` | Physical attempts of the request that failed, AgentCore's own retries included |
+| `truncated` | A string above was cut at its size limit |
+
+`category` describes the failure, from transport facts and the provider's
+technical error types: `authentication` (401), `permission` (403),
+`payment_required` (402), `not_found` (404), `invalid_request` (other 4xx and
+3xx), `context_window`, `rate_limited` (429), `overloaded` (503, 529),
+`server_error` (other 5xx), `timeout` (408, 504, and AgentCore's own head and
+body idle limits), `connection` (no response head), `stream_interrupted` (an
+accepted stream dropped, died or ended without saying how it stopped),
+`output_limit` (`max_tokens_exhausted`, the one `STOP_API_ERROR` that is not a
+failed request) and `unknown`.
+
+AgentCore implements no billing, balance, quota or access rules. It does not
+read meaning into `code`: the business answer is the Host's to draw from `code`
+and `message`, and a code no release has seen passes through unchanged. Do not
+branch on `category` for those decisions. An insufficient balance arrives as
+402 on one provider, 429 on a second, and 400 or a stream frame on others, and
+the category follows the status while `code` carries the fact.
+
+`retry` is what AgentCore can stand behind for sending the same request again. A
+server-sent `Retry-After` makes it `retryable`. A 408, 429 or 5xx is `retryable`
+only when the upstream's code and type are absent or name a technical condition
+(`rate_limit_error`, `overloaded_error`, `server_error` and the like); any other
+code makes it `unknown`, because a 429 can be a burst limit or an exhausted
+quota and only that code tells them apart. Other 4xx and 3xx are
+`not_retryable`. An error frame is `retryable` or `not_retryable` when both its
+identifiers are recognized and `unknown` otherwise.
+
+All strings are bounded and sanitized before they reach the event: `code` and
+`type` and `request_id` at 128 bytes, `message` at 1024, cut on a UTF-8 boundary
+and flagged by `truncated`; control bytes, C1 codes and invalid UTF-8 are
+flattened to spaces. The credential the request carried is masked wherever it
+appears in `code`, `type`, `message` or `request_id`, including a redirect's URL
+(a URL too long to keep whole is not reported at all), as are values
+of recognizable shape (`sk-`, `AIza`, `eyJ`, `Bearer …`, and `api_key=`,
+`token:`, `password=` and similar pairs), each replaced by `[REDACTED]`.
+The patterns are defence in depth, not a proof that a provider's free text holds
+no sensitive data. AgentCore keeps only the credential's length and hash for this
+comparison, never a copy, so `update_credential`'s erasure guarantee holds.
+
+The detail belongs to the Run that recorded it. Concurrent Runs on other
+Sessions, other threads' subagents, and a subagent nested in this Run's tool call
+each write their own, and a model-invoked fork's failure stays that tool's
+result. A Skill invocation in its own context is the Run, so its failure is.
 
 ### Manual compact
 

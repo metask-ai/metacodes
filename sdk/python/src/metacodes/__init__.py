@@ -15,6 +15,7 @@ lookup order, events, Python tools and permission requests.
 from ._client import (
     DEFAULT_TOOLS,
     EventStream,
+    ModelError,
     RunResult,
     Runtime,
     Session,
@@ -32,6 +33,7 @@ __all__ = [
     "BUILTIN_TOOLS",
     "DEFAULT_TOOLS",
     "EventStream",
+    "ModelError",
     "RunResult",
     "Runtime",
     "Session",

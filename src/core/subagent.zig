@@ -42,6 +42,9 @@ pub const SubagentResult = struct {
 
 pub const SpawnOptions = struct {
     max_turns: u32 = 20,
+    /// `agent_loop.Options.model_error_out` of the child, for a child that is
+    /// itself the Run (an AgentCore Skill invocation in its own context).
+    model_error_out: ?*?@import("../api/model_error.zig").Detail = null,
     system_prompt: ?[]const u8 = null,
     /// Per-run cost cap in USD (agent_loop `cost_budget_usd`): the child stops
     /// with `.budget` once its own usage estimate reaches it. A sealed Skill
@@ -233,6 +236,7 @@ pub fn spawnAgentSink(
         ctx_to_use,
         .{
             .max_turns = opts.max_turns,
+            .model_error_out = opts.model_error_out,
             .cost_budget_usd = opts.cost_budget_usd,
             .goal_meter = opts.goal_meter,
             .system_prompt = opts.system_prompt,

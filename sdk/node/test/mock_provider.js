@@ -4,6 +4,7 @@
 //   ['text', '...']            one text block, end_turn
 //   ['tool', name, inputObject] one tool_use block
 //   ['echo']                   "saw: " + the last tool_result text it received
+//   ['status', code, headers, bodyObject]  that non-2xx JSON
 
 const http = require('node:http');
 
@@ -85,6 +86,12 @@ async function startMockProvider(script) {
       authorizations.push(request.headers.authorization || '');
       const index = requests.length;
       const step = steps.shift() || ['text', 'script exhausted'];
+      if (step[0] === 'status') {
+        const failure = JSON.stringify(step[3]);
+        response.writeHead(step[1], { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(failure), ...step[2] });
+        response.end(failure);
+        return;
+      }
       let payload;
       if (request.url.endsWith('/chat/completions')) payload = openaiTextResponse(step[0] === 'text' ? step[1] : 'unsupported step');
       else if (step[0] === 'tool') payload = toolResponse(index, step[1], step[2]);

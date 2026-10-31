@@ -434,6 +434,47 @@ test "L2 web: message model/permission_mode apply before the turn, in order, wit
     try std.testing.expect(fx.conversationHas("turn three"));
 }
 
+/// A stream frame carrying a business code this codebase has never heard of.
+const BUSINESS_ERROR_SSE = "data: {\"type\":\"error\",\"error\":{\"type\":\"billing_error\",\"code\":\"insufficient_balance\",\"message\":\"Balance too low\"},\"request_id\":\"req-web-1\"}\n\n";
+
+/// The completion notification of issue #408: a failed turn says why in the
+/// journal line a frontend already reads, and the next turn's line is clean.
+fn expectModelFailureOnRunDone(a: std.mem.Allocator, port: u16) !void {
+    var before = try getState(a, port);
+    defer before.deinit();
+    const ack = try postMessage(a, port, "{\"text\":\"fails\"}");
+    defer a.free(ack);
+    const failed = try eventsFrom(a, port, &before, "\"run_done\"");
+    defer a.free(failed);
+    const failed_lines = try dataLines(a, failed);
+    defer a.free(failed_lines);
+    _ = try expectLine(failed_lines, "{\"run_done\":{\"stop_reason\":\"api_error\",\"err\":\"Balance too low\",\"model_error\":{\"category\":\"unknown\",\"code\":\"insufficient_balance\",\"type\":\"billing_error\",\"message\":\"Balance too low\",\"http_status\":200,\"request_id\":\"req-web-1\",\"retry\":\"unknown\",\"retry_after_ms\":null,\"attempts\":1,\"truncated\":false}}}");
+
+    var after = try getState(a, port);
+    defer after.deinit();
+    const ack2 = try postMessage(a, port, "{\"text\":\"succeeds\"}");
+    defer a.free(ack2);
+    const clean = try eventsFrom(a, port, &after, "\"run_done\"");
+    defer a.free(clean);
+    const clean_lines = try dataLines(a, clean);
+    defer a.free(clean_lines);
+    _ = try expectLine(clean_lines, "{\"run_done\":{\"stop_reason\":\"end_turn\",\"err\":null}}");
+}
+
+test "L2 web: run_done carries the model failure's detail and a later success carries none (#408)" {
+    const a = std.testing.allocator;
+    var fx: AppFixture = undefined;
+    try fx.setup(&.{ BUSINESS_ERROR_SSE, TEXT_SSE });
+    defer fx.deinit();
+    var web = WebRun{ .app = fx.app, .port = try freePort() };
+    try web.start();
+    var stopped = false;
+    defer if (!stopped) web.stop() catch {};
+    try expectModelFailureOnRunDone(a, web.port);
+    try web.stop();
+    stopped = true;
+}
+
 test "L2 web: a refused field queues nothing; an unusable model applies neither field and runs no turn" {
     const a = std.testing.allocator;
     var fx: AppFixture = undefined;
@@ -813,6 +854,17 @@ test "L2 serve: the daemon driver applies message configuration the same way (HT
     defer daemon.stop();
 
     try expectAppliedBeforeTurn(a, &fx, daemon.srv.port);
+}
+
+test "L2 serve: the daemon driver's run_done carries the model failure's detail too (#408)" {
+    const a = std.testing.allocator;
+    var fx: AppFixture = undefined;
+    try fx.setup(&.{ BUSINESS_ERROR_SSE, TEXT_SSE });
+    defer fx.deinit();
+    var daemon: DaemonHost = undefined;
+    try daemon.start(fx.app);
+    defer daemon.stop();
+    try expectModelFailureOnRunDone(a, daemon.srv.port);
 }
 
 test "L2 serve: the UDS message op carries the same fields, checks and order" {

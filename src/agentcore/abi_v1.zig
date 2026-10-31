@@ -1389,6 +1389,36 @@ const AbiSession = struct {
         return true;
     }
 
+    /// The Run's one `model_error` (issue #408), from the failure it recorded,
+    /// before its terminal `run_state`. A Run that reached STOP_API_ERROR
+    /// without entering the loop (a refused generated prompt) recorded none and
+    /// says that it does not know. A Host rejecting it is a callback failure,
+    /// like any snapshot.
+    fn emitModelError(self: *AbiSession, session_id: core.session_id.SessionId, run_id: u64) bool {
+        const callback = self.callbacks.on_event orelse return true;
+        var fallback: core.api_model_error.Detail = undefined;
+        const detail: *const core.api_model_error.Detail = if (self.core_session.last_model_error) |*recorded| recorded else blk: {
+            core.api_model_error.Detail.unknownFailure(&fallback);
+            break :blk &fallback;
+        };
+        const json = stringifyJson(
+            allocator,
+            public_protocol.CoreEvent{ .model_error = publicModelError(run_id, detail.view()) },
+        ) catch {
+            self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
+            return false;
+        };
+        defer allocator.free(json);
+        const identity = core.agent_session.RunIdentity{ .session_id = session_id, .run_id = run_id };
+        const run = self.runContext(&identity);
+        if (callback(self.callbacks.ctx, &run, view(json)) != wire.EVENT_CONTINUE) {
+            self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+            self.core_session.noteCallbackFailure();
+            return false;
+        }
+        return true;
+    }
+
     fn observeRunState(self: *AbiSession, session_id: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
         if (self.run_state_projector.run_id != run_id) {
             self.run_state_observation_disabled = false;
@@ -4171,6 +4201,13 @@ const ForkExecutorContext = struct {
             self.activation.rendered_body,
             .{
                 .max_turns = self.max_turns,
+                // A Skill invocation Run ends with its child's stop reason, so
+                // the child's failure is the Run's. A model-invoked fork's is a
+                // tool result the parent model can react to.
+                .model_error_out = switch (mode) {
+                    .external_run_root => &self.session.last_model_error,
+                    .model_tool => null,
+                },
                 .system_prompt = subagent_system_prompt,
                 .session = identity.session_id,
                 .agent_depth = child_depth,
@@ -7738,6 +7775,37 @@ fn sessionUpdateMcp(
     return wire.STATUS_OK;
 }
 
+/// The core failure in the public protocol's vocabulary. The tag switches make
+/// a new core category a compile error here, not a silent wire value.
+fn publicModelError(run_id: u64, detail: core.api_model_error.Detail.View) public_protocol.ModelError {
+    return .{
+        .run_id = run_id,
+        .category = switch (detail.category) {
+            inline else => |tag| @field(public_protocol.ModelErrorCategory, @tagName(tag)),
+        },
+        .code = detail.code,
+        .type = detail.type,
+        .message = detail.message,
+        .http_status = detail.http_status,
+        .request_id = detail.request_id,
+        .retry = switch (detail.retry) {
+            inline else => |tag| @field(public_protocol.ModelErrorRetry, @tagName(tag)),
+        },
+        .retry_after_ms = detail.retry_after_ms,
+        .attempts = detail.attempts,
+        .truncated = detail.truncated,
+    };
+}
+
+/// Whether this Run's public stop reason is STOP_API_ERROR. A budget outcome
+/// outranks the loop's stop, exactly as the result's stop code does below.
+fn stopsOnModelFailure(self: *const AbiSession, reason: core.agent_loop.StopReason) bool {
+    return switch (self.budget_state.last_outcome) {
+        .budget_exhausted, .resource_limit => false,
+        .none, .budget_required => reason == .api_error or reason == .max_tokens_exhausted,
+    };
+}
+
 fn sessionRunInput(
     handle: ?*wire.SessionHandle,
     run_id: u64,
@@ -7756,6 +7824,7 @@ fn sessionRunInput(
         return failError(catalogLifecycleStatus(err), err, out_error);
     defer runtime_call.deinit();
     if (!self.tryBeginRun()) return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    self.core_session.last_model_error = null;
     self.pending_permission = null;
     self.clearStagedPermission();
     // This defer is the facade completion linearization point. Everything that
@@ -8021,6 +8090,9 @@ fn sessionRunInput(
     };
     defer if (result.suspend_info) |suspend_info| suspend_info.deinit();
     invokeTestEpilogueHook(run_id);
+    if (stopsOnModelFailure(self, result.stop_reason) and
+        !self.emitModelError(self.core_session.session_id, run_id))
+        return self.failOnRecordedCallbackFailure(out_error);
     if (!self.emitTerminalRunStateIfOpen(
         self.core_session.session_id,
         run_id,

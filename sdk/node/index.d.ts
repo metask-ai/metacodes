@@ -31,6 +31,28 @@ export class UiRequest {
   answer(...values: string[][]): object;
 }
 
+/**
+ * Why a Run stopped with `stopReason === 'api_error'`. `code` is the upstream's
+ * identifier exactly as sent; the SDK attaches no meaning to it. `message` is
+ * safe to display: redacted and bounded.
+ */
+export interface ModelError {
+  run_id: number;
+  category:
+    | 'authentication' | 'permission' | 'payment_required' | 'not_found' | 'invalid_request'
+    | 'context_window' | 'rate_limited' | 'overloaded' | 'server_error' | 'timeout'
+    | 'connection' | 'stream_interrupted' | 'output_limit' | 'unknown';
+  code: string | null;
+  type: string | null;
+  message: string;
+  http_status: number | null;
+  request_id: string | null;
+  retry: 'retryable' | 'not_retryable' | 'unknown';
+  retry_after_ms: number | null;
+  attempts: number;
+  truncated: boolean;
+}
+
 export interface RunResult {
   text: string;
   stopReason: string;
@@ -45,6 +67,8 @@ export interface RunResult {
   segments: { disposition: string; group: number; text: string }[];
   inputAccepted: number;
   inputAdopted: number;
+  /** Set exactly when the Run stopped on the model; null otherwise. */
+  modelError: ModelError | null;
 }
 
 export class AgentCoreError extends Error {

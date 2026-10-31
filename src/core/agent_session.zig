@@ -8,6 +8,7 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const types = @import("../types.zig");
 const provider_factory = @import("../api/provider_factory.zig");
+const model_error = @import("../api/model_error.zig");
 const credential_cell = @import("../api/credential_cell.zig");
 const image_capability = @import("../api/image_capability.zig");
 const provider_mod = @import("../api/provider.zig");
@@ -1422,6 +1423,10 @@ pub const AgentSession = struct {
     goal_state: goal_mod.State,
     /// Charges `goal_state` for each Run; points into this Session.
     goal_meter: goal_mod.Meter = undefined,
+    /// What the Run that just returned failed on, when it stopped on the model
+    /// (issue #408). Written by that Run on its own thread and read by whoever
+    /// made the run call, before the next one.
+    last_model_error: ?model_error.Detail = null,
     /// Issue #277: this Session's team membership, when `SessionConfig.team`
     /// was set. Host-scheduled: the lead's `SpawnTeammate` records requests
     /// the embedding Host fulfils; the runtime never starts a teammate. Null
@@ -2694,6 +2699,7 @@ pub const AgentSession = struct {
             &self.permission_ctx,
             .{
                 .max_turns = max_turns,
+                .model_error_out = &self.last_model_error,
                 .session = identity.session_id,
                 .session_id = identity.session_id.asSlice(),
                 .abort = &self.abort_signal,

@@ -53,6 +53,28 @@ test('a text run returns the final answer, events and usage', { skip }, async (t
   assert.match(JSON.stringify(provider.requests[0].messages), /say hello/);
 });
 
+test('a model failure reaches the result and a later success clears it', { skip }, async (t) => {
+  const provider = await withProvider(t, [
+    ['status', 402, { 'x-request-id': 'req-node-1' }, { error: { code: 'insufficient_balance', message: 'Balance too low' } }],
+    ['text', 'fine now'],
+  ]);
+  const { session } = open(t, { tools: [] }, provider, workspace(t));
+  const tags = [];
+  const failed = await session.run('fails', { onEvent: (event) => tags.push(Object.keys(event)[0]) });
+  assert.equal(failed.stopReason, 'api_error');
+  assert.equal(failed.modelError.category, 'payment_required');
+  assert.equal(failed.modelError.code, 'insufficient_balance');
+  assert.equal(failed.modelError.message, 'Balance too low');
+  assert.equal(failed.modelError.http_status, 402);
+  assert.equal(failed.modelError.request_id, 'req-node-1');
+  assert.equal(failed.modelError.retry, 'not_retryable');
+  assert.equal(tags.filter((tag) => tag === 'model_error').length, 1);
+  assert.equal(tags[tags.length - 1], 'run_state');
+  const recovered = await session.run('succeeds');
+  assert.equal(recovered.stopReason, 'end_turn');
+  assert.equal(recovered.modelError, null);
+});
+
 test('every event of a Run arrives before its Promise settles', { skip }, async (t) => {
   const provider = await withProvider(t, [['text', 'ordered']]);
   const { session } = open(t, { tools: [] }, provider, workspace(t));
