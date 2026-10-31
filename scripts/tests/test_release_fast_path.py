@@ -12,8 +12,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
+import agentcore_contract as ac  # noqa: E402
+import agentcore_release  # noqa: E402
 import release_cut as rc  # noqa: E402
 import release_fast_path as fp  # noqa: E402
+from scripts.tests.test_agentcore_release import write_tree  # noqa: E402
 
 CHANGELOG = """# Changelog
 
@@ -57,7 +60,7 @@ class Repo:
         git(tmp, "init", "-q", "-b", "main")
         git(tmp, "config", "user.email", "test@metacodes.local")
         git(tmp, "config", "user.name", "metacodes-test")
-        (tmp / "src").mkdir()
+        write_tree(tmp)
         (tmp / "evals" / "plugin-v1").mkdir(parents=True)
         (tmp / rc.ZON).write_text(f'.{{\n    .name = .metacodes,\n    .version = "{version}",\n}}\n', encoding="utf-8")
         (tmp / rc.VERSION_ZIG).write_text(f'pub const semver = "{version}";\n', encoding="utf-8")
@@ -72,10 +75,17 @@ class Repo:
         git(self.root, "commit", "-q", "-m", message)
         return git(self.root, "rev-parse", "HEAD")
 
-    def cut(self, version: str = "0.5.0", date: str = "2026-10-11") -> None:
+    def cut(self, version: str = "0.5.0", date: str = "2026-10-11", agentcore: str = "0.13.0") -> None:
         rc.apply_version(self.root, version)
         text = rc.read(self.root, rc.CHANGELOG)
         rc.write(self.root, rc.CHANGELOG, rc.rewrite_changelog(text, version, date)[0])
+        agentcore_release.apply_cut(self.root, agentcore, version, date)
+        fake_repin(self.root)
+
+    def reopen(self, version: str = "0.5.1-dev", agentcore: str = "0.13.1-dev") -> None:
+        rc.apply_version(self.root, version)
+        rc.write(self.root, rc.CHANGELOG, rc.ensure_unreleased(rc.read(self.root, rc.CHANGELOG)))
+        agentcore_release.apply_reopen(self.root, agentcore)
         fake_repin(self.root)
 
 
@@ -100,11 +110,63 @@ class VerifyBumpTest(unittest.TestCase):
     def test_a_generated_reopen_is_a_bump(self) -> None:
         self.repo.cut()
         released = self.repo.commit("release: 0.5.0")
-        rc.apply_version(self.repo.root, "0.5.1-dev")
-        rc.write(self.repo.root, rc.CHANGELOG, rc.ensure_unreleased(rc.read(self.repo.root, rc.CHANGELOG)))
-        fake_repin(self.repo.root)
+        self.repo.reopen()
         reopen = self.repo.commit("chore: reopen 0.5.1-dev")
         self.assertEqual(("reopen", "0.5.1-dev"), fp.verify_bump(self.repo.root, released, reopen, fake_repin))
+
+    def test_a_cut_that_reuses_agentcore_is_a_bump(self) -> None:
+        self.repo.cut()
+        self.repo.commit("release: 0.5.0")
+        self.repo.reopen()
+        base = self.repo.commit("chore: reopen 0.5.1-dev")
+        text = rc.read(self.repo.root, rc.CHANGELOG).replace("## Unreleased\n", "## Unreleased\n\n### Fixed\n\n- a main fix.\n", 1)
+        rc.write(self.repo.root, rc.CHANGELOG, text)
+        fake_repin(self.repo.root)
+        base = self.repo.commit("fix: a main fix")
+        self.repo.cut("0.5.1", "2026-10-12")
+        self.assertEqual(ac.sdk_version(self.repo.root), "0.13.0")
+        candidate = self.repo.commit("release: 0.5.1")
+        self.assertEqual(("cut", "0.5.1"), fp.verify_bump(self.repo.root, base, candidate, fake_repin))
+
+    def test_an_edited_agentcore_file_takes_the_full_path(self) -> None:
+        cases = (
+            (ac.LEDGER, lambda text: text.replace('"abi_revision": 26', '"abi_revision": 25')),
+            (ac.SDK_CHANGELOG, lambda text: text.replace("a Host-visible feature", "another feature")),
+            (ac.NODE_PACKAGE, lambda text: text.replace('"0.13.0"', '"0.13.0-dev.0"')),
+            (ac.PY_PROJECT, lambda text: text.replace('"0.13.0"', '"0.12.0"')),
+            (ac.PY_INIT, lambda text: text.replace('"0.13.0"', '"0.12.0"')),
+        )
+        self.repo.cut()
+        self.repo.commit("release: 0.5.0")
+        for rel, forge in cases:
+            with self.subTest(rel):
+                original = rc.read(self.repo.root, rel)
+                rc.write(self.repo.root, rel, forge(original))
+                self.assertNotEqual(original, rc.read(self.repo.root, rel))
+                candidate = self.repo.commit(f"release: 0.5.0 with an edited {rel}")
+                with self.assertRaisesRegex(fp.NotABump, "differs from what release_cut generates"):
+                    self.verify(candidate)
+                rc.write(self.repo.root, rel, original)
+                self.repo.commit("restore")
+
+    def test_a_cut_without_agentcore_takes_the_full_path(self) -> None:
+        rc.apply_version(self.repo.root, "0.5.0")
+        text = rc.read(self.repo.root, rc.CHANGELOG)
+        rc.write(self.repo.root, rc.CHANGELOG, rc.rewrite_changelog(text, "0.5.0", "2026-10-11")[0])
+        fake_repin(self.repo.root)
+        candidate = self.repo.commit("release: 0.5.0 still carrying a development AgentCore")
+        with self.assertRaisesRegex(fp.NotABump, "cannot generate it"):
+            self.verify(candidate)
+
+    def test_an_agentcore_version_the_rules_refuse_takes_the_full_path(self) -> None:
+        self.repo.cut(agentcore="0.14.0")
+        candidate = self.repo.commit("release: 0.5.0 with a jumped AgentCore")
+        self.assertEqual(("cut", "0.5.0"), self.verify(candidate))  # a raised first version is legal
+        self.repo.reopen(agentcore="0.14.1-dev")
+        rc.write(self.repo.root, ac.SDK_VERSION, "0.20.0-dev\n")
+        reopen = self.repo.commit("chore: reopen 0.5.1-dev at a jumped floor")
+        with self.assertRaisesRegex(fp.NotABump, "cannot generate it"):
+            fp.verify_bump(self.repo.root, candidate, reopen, fake_repin)
 
     def test_any_other_file_takes_the_full_path(self) -> None:
         self.repo.cut()

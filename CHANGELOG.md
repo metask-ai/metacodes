@@ -27,8 +27,34 @@ status, compatibility boundaries, and entry points are defined by
   - **AgentCore:** the byte-zero path accepts escaped control characters in a
     result's content, as its materialized path did.
 
+- AgentCore now ships with every release under its own final version, with its
+  Python wheel and Node package, instead of a `-dev+<commit>` archive. The cut
+  selects and finalizes the version, and an unchanged AgentCore keeps its version
+  and artifacts. Release notes name it. `sdk/agentcore-releases.json` maps each
+  version to its ABI revision, and the release workflow refuses development
+  versions, version or ABI mismatches, and any artifact that differs from a
+  published one of the same name
+  ([doc/RELEASE_AUTOMATION_DESIGN.md](doc/RELEASE_AUTOMATION_DESIGN.md) §2a). (#404)
+
+### Fixed
+
+- The AgentCore bundle README stated ABI revision 18 and a 64-byte root. It now
+  takes the revision, root size and tables from the ABI types. (#404)
+
 ### Added
 
+- **Model failures say why (#408).** A Run that stops with `api_error` now
+  reports structured detail for that Run: a general category, the upstream's
+  code and type passed through verbatim, a redacted, size-limited displayable
+  message, HTTP status, request id and retry guidance, with `unknown` when it
+  cannot be determined. AgentCore delivers it as a `model_error` event before
+  the terminal `run_state` (additive: Revision 26, `STATUS_OK` and
+  `STOP_API_ERROR` are unchanged), the Python and Node SDKs as
+  `result.model_error` / `result.modelError`, the web and daemon completion
+  line as `run_done.err` and `run_done.model_error`, and `SessionHost` on its
+  `run_done`. The OpenAI and Gemini clients now keep the error body they used to
+  drop. No billing or quota logic was added: an unrecognized code is passed
+  through and makes retry guidance `unknown`.
 - **OpenTelemetry tracing and a web trace view.** Every Run is recorded as a
   span tree following the GenAI semantic conventions (`invoke_agent` →
   `turn` → `chat <model>` / `execute_tool <name>` / `compact`), with token

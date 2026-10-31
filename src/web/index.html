@@ -232,7 +232,9 @@ function dispatch(ev) {
     sysline("⚠ message not run: " + (r.message || "rejected") + " · " + trunc(r.text, 80), true); return; }
   if ("run_done" in ev) { endAssistant(); setGenerating(false);
     const sr = ev.run_done.stop_reason || "done";
-    if (sr !== "end_turn") sysline("· " + sr + (ev.run_done.err ? ": " + ev.run_done.err : "")); return; }
+    const me = ev.run_done.model_error;
+    const tail = me ? [me.code, me.request_id && "request " + me.request_id].filter(Boolean).join(" · ") : "";
+    if (sr !== "end_turn") sysline("· " + sr + (ev.run_done.err ? ": " + ev.run_done.err : "") + (tail ? " (" + tail + ")" : ""), !!me); return; }
   if ("command_result" in ev) { const r = ev.command_result; sysline((r.ok ? "· " : "⚠ ") + (r.message || ""), !r.ok); if (r.ok) refreshState(); return; }
 }
 

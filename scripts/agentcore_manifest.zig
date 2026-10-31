@@ -271,6 +271,9 @@ fn packageVersion(allocator: std.mem.Allocator, sdk_version: []const u8, source:
     if (sdk_version.len == 0) return error.InvalidSdkVersion;
     const parsed = std.SemanticVersion.parse(sdk_version) catch return error.InvalidSdkVersion;
     if (parsed.build != null) return error.InvalidSdkVersion;
+    // Between releases `-dev`, and a release is final: scripts/agentcore_contract.py
+    // accepts these two shapes and nothing else.
+    if (parsed.pre) |pre| if (!std.mem.eql(u8, pre, "dev")) return error.InvalidSdkVersion;
 
     if (parsed.pre == null) return allocator.dupe(u8, sdk_version);
 
@@ -338,8 +341,8 @@ fn renderReadme(
         \\
         \\The ABI is experimental and requires an exact revision match. Ownership, lifetime, concurrency,
         \\and failure contracts are defined by `doc/AGENTCORE_BINARY_ABI.md` at the source commit above.
-        \\Revision 18 exposes one 64-byte root plus mandatory Runtime, Session, Session Control, Skill,
-        \\and MCP tables. It has no capability negotiation and no independent public Completion client.
+        \\Revision {d} of ABI v{d} exposes one {d}-byte root plus {d} mandatory tables ({s}).
+        \\It has no capability negotiation and no independent public Completion client.
         \\A Session may carry a prompt profile (Host edits of the named system-prompt sections, with
         \\governance sections locked) and per-Run context blocks; see the ABI document.
         \\The public header and bindings expose the complete Skill catalog resource contract: 16 MiB per
@@ -348,8 +351,37 @@ fn renderReadme(
         \\256 MiB of retained catalog snapshots per Runtime. `invalid_resource` issues carry a typed
         \\reason; a single invalid Skill degrades the catalog without removing valid siblings.
         \\
-    , .{ version, target, zig_target, rust_target, commit, shared_file, ripgrep_rel, ripgrep_version });
+    , .{
+        version,
+        target,
+        zig_target,
+        rust_target,
+        commit,
+        shared_file,
+        ripgrep_rel,
+        ripgrep_version,
+        abi_types.ABI_REVISION,
+        abi_types.ABI_VERSION_V1,
+        @sizeOf(abi_types.ApiV1),
+        abi_tables.count,
+        abi_tables.names,
+    });
 }
+
+/// The root's mandatory table pointers, read from the type the library exports
+/// so the bundle README cannot fall behind a new table or a new revision.
+const abi_tables = blk: {
+    var count: usize = 0;
+    var names: []const u8 = "";
+    for (@typeInfo(abi_types.ApiV1).@"struct".fields) |field| {
+        if (@typeInfo(field.type) != .optional) continue;
+        const child = @typeInfo(@typeInfo(field.type).optional.child);
+        if (child != .pointer or @typeInfo(child.pointer.child) != .@"struct") continue;
+        names = names ++ (if (count == 0) "`" else ", `") ++ field.name ++ "`";
+        count += 1;
+    }
+    break :blk .{ .count = count, .names = names };
+};
 
 fn renderZon(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator,
@@ -427,6 +459,22 @@ test "ripgrep pin parses the vendor manifest identity and rejects empty fields" 
     ));
 }
 
+test "the bundle README states the current ABI revision, root size and tables" {
+    const allocator = std.testing.allocator;
+    const readme = try renderReadme(allocator, "1.2.3", "t", "zt", "rt", "c", "bin/rg", "15", "lib.so");
+    defer allocator.free(readme);
+    const revision_line = try std.fmt.allocPrint(allocator, "Revision {d} of ABI v{d} exposes one {d}-byte root plus {d} mandatory tables", .{
+        abi_types.ABI_REVISION,
+        abi_types.ABI_VERSION_V1,
+        @sizeOf(abi_types.ApiV1),
+        @typeInfo(abi_types.ApiV1).@"struct".fields.len - 5,
+    });
+    defer allocator.free(revision_line);
+    try std.testing.expect(std.mem.indexOf(u8, readme, revision_line) != null);
+    for ([_][]const u8{ "`runtime`", "`session`", "`session_control`", "`skill`", "`mcp`", "`goal`", "`team`" }) |table|
+        try std.testing.expect(std.mem.indexOf(u8, readme, table) != null);
+}
+
 test "strict boolean parser" {
     try std.testing.expectEqual(true, parseBool("true").?);
     try std.testing.expectEqual(false, parseBool("false").?);
@@ -456,6 +504,7 @@ test "package version is derived from sdk version and source identity" {
     defer allocator.free(dirty_stable_version);
     try std.testing.expectEqualStrings("0.1.0", dirty_stable_version);
     try std.testing.expectError(error.InvalidSdkVersion, packageVersion(allocator, "0.1.0+local", clean));
+    try std.testing.expectError(error.InvalidSdkVersion, packageVersion(allocator, "0.1.0-rc.1", clean));
 }
 
 test "generated development versions fit the Zig package limit" {

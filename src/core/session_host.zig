@@ -606,7 +606,7 @@ pub const HostedSession = struct {
         // cancel; admission would report SessionBusy until it returns.
         self.session.awaitProviderCancelsDrained();
         var admitted = self.session.admitRun(context.run_id, scope.sink()) catch |err| {
-            self.finishRun(context, null, err);
+            self.finishRun(context, null, err, null);
             return;
         };
         // An interrupt or close that arrived between taking the submission
@@ -628,13 +628,21 @@ pub const HostedSession = struct {
         self.mutex.unlock();
         if (outcome) |result| {
             if (result.suspend_info) |info| info.deinit();
-            self.finishRun(context, @tagName(result.stop_reason), null);
+            const failed_on_model = result.stop_reason == .api_error or result.stop_reason == .max_tokens_exhausted;
+            const model_failure = if (failed_on_model) &self.session.last_model_error else null;
+            self.finishRun(context, @tagName(result.stop_reason), null, model_failure);
         } else |err| {
-            self.finishRun(context, null, err);
+            self.finishRun(context, null, err, null);
         }
     }
 
-    fn finishRun(self: *HostedSession, context: wire.RunContext, stop_reason: ?[]const u8, failure: ?anyerror) void {
+    fn finishRun(
+        self: *HostedSession,
+        context: wire.RunContext,
+        stop_reason: ?[]const u8,
+        failure: ?anyerror,
+        model_failure: ?*const ?@import("../api/model_error.zig").Detail,
+    ) void {
         self.persist();
         const poisoned = self.session.isPoisoned();
         var dropped: std.ArrayList(*Work) = .empty;
@@ -654,6 +662,7 @@ pub const HostedSession = struct {
             .trace_id = context.trace_id,
             .stop_reason = stop_reason,
             .error_name = if (failure) |err| @errorName(err) else null,
+            .model_error = if (model_failure) |slot| (if (slot.*) |*detail| detail.view() else null) else null,
         } });
         if (poisoned) self.emitHost(.{ .session_poisoned = .{
             .error_name = if (failure) |err| @errorName(err) else "SessionPoisoned",

@@ -76,6 +76,10 @@ METACODES_API_KEY=sk-... zig build example
    发 `CoreEvent.input_adopted`；Run 结束后 `runInputReconciliation(run_id)` 给出
    accepted / adopted 两个计数（采纳总是接受顺序的前缀），语义与 AgentCore 的
    "Active-Run input" 一节相同，只是没有耐久预算（`setRunInputAdmission` 可接入）；
+   Run 以 `api_error` / `max_tokens_exhausted` 结束时，`session.last_model_error` 在下一次
+   run 之前保存该 Run 自己的结构化失败明细（`api_model_error.Detail`，字段与脱敏规则见
+   AgentCore 的 "Model failure detail" 一节，#408）；直接调 `agent_loop.run` 的宿主传
+   `Options.model_error_out`；
    任何线程（包括 Run 自己的回调里）也可以随时用 `updateCredential(bytes)` 原地替换
    provider 凭据（#336）：调用返回后才构造认证头的请求（下一回合、重试、compaction、
    Skill、工具自建的 provider）都用新凭据，已发出的请求不受影响；语义见 AgentCore 的

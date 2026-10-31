@@ -114,9 +114,11 @@ The channel gate applies at archive time too (#47 Q1/Q3): a stable version
 archives only from a clean tree whose HEAD carries the bare `X.Y.Z` tag; a
 pre-release (`0.x.y-dev+<commit12>`) archives from any commit but is published
 only through `workflow_dispatch`, never attached to a Release automatically.
-The AgentCore SDK packager (`scripts/package_agentcore.py`) shares the same
-core (`scripts/release_archive.py --kind agentcore`) and keeps its historical
-refusal of untagged stable versions.
+The AgentCore SDK has its own version and release rules
+([doc/RELEASE_AUTOMATION_DESIGN.md](../doc/RELEASE_AUTOMATION_DESIGN.md) §2a). Its
+packager (`scripts/package_agentcore.py`) shares the same
+core (`scripts/release_archive.py --kind agentcore`) and archives a stable version
+only from the main-project release its ledger entry names.
 
 ## Publishing
 

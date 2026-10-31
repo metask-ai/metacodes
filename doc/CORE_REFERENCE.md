@@ -952,7 +952,8 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   的 `message_delta.stop_reason`、OpenAI chat 的非 null `finish_reason`、Responses 的
   `response.completed` / `response.incomplete`、Gemini 的 `finishReason`(或整条 prompt 被拒的
   `promptFeedback.blockReason`)。干净 EOF 或只有 `[DONE]` 而没有它,解析器抛
-  `error.StreamIncomplete`(经 `client.reportStreamIncomplete` 写 last_error);agent_loop 把它当
+  `error.StreamIncomplete`(经 `client.reportStreamIncomplete` 写 last_error 与 Run 级的
+  `api/model_error.zig`,后者经线程局部 Scope 归属到具体 Run,`Options.model_error_out` 取走,#408);agent_loop 把它当
   流内失败:丢弃残片,按 `Options.max_stream_turn_retries` 同轮重发,额度用尽 `stop_reason=api_error`。
   此前它被归一成 `end_turn`——丢的字节恰好是 `max_tokens` / `length` 时,截断的回答读起来是完整的,
   续写安全网不开火。报告过停止原因、只丢了帧尾(`message_stop`、`[DONE]`、其后的 usage 块)的流

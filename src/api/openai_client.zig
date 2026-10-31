@@ -431,6 +431,7 @@ pub const OpenAIClient = struct {
         req_ptr.transfer_encoding = .{ .content_length = body.len };
         http_connection.sendBodyComplete(req_ptr, @constCast(body)) catch |err| {
             log.errId("openai", rid, "send body failed: {s}", .{@errorName(err)});
+            client_mod.noteConnectFailure(err);
             return error.RequestFailed;
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
@@ -439,14 +440,16 @@ pub const OpenAIClient = struct {
                 return error.TransientNetwork;
             }
             log.errId("openai", rid, "receiveHead failed: {s}", .{@errorName(err)});
+            client_mod.noteConnectFailure(err);
             return err;
         };
         const status = ResponseStatus.capture(&response);
         self.last_http_status = status.code;
         self.server_request_id_len = copyMetaskRequestId(&self.server_request_id, response.head.bytes);
+        client_mod.noteResponseHead(status.code, response.head, auth.value);
         connection_lease.release();
         if (!status.isOk()) {
-            var location_buf: [256]u8 = undefined;
+            var location_buf: [http_status.REDIRECT_LOCATION_BYTES]u8 = undefined;
             if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
                 client_mod.reportRedirect("openai", rid, status, location);
                 return error.RequestFailed;
@@ -460,12 +463,14 @@ pub const OpenAIClient = struct {
             const n = body_reader.readSliceShort(err_body[0..]) catch 0;
             const preview = err_body[0..@min(n, err_body.len)];
             log.errId("openai", rid, "HTTP {d} {s}: body={s}", .{ status.code, status.name, preview });
+            client_mod.reportHttpFailure(status.code, preview);
             if (status.code == 401 and containsMetaskTokenExpired(preview)) {
                 preserve_placeholder_ids = true;
                 return error.TokenExpired;
             }
             return error.RequestFailed;
         }
+        client_mod.noteRequestAccepted();
         // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
         self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens), .sse);
 

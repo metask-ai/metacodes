@@ -22,6 +22,8 @@
 //! - 进程级单例:并发 subagent 的错误可能相互覆盖——此摘要是"进程最近一次 API 错误",
 //!   不保证归属某个具体 run。
 //!
+//! Run 级、结构化的失败明细不在这里:见 `model_error.zig`(issue #408)。
+//!
 //! web 模式多线程(HTTP 线程 + agent 线程)→ mutex 保护;buf 定长静态,零分配。
 
 const std = @import("std");
@@ -113,7 +115,7 @@ pub fn take(out: *[SUMMARY_BUF_LEN]u8) ?[]const u8 {
 /// 拷贝并清洗:C0 控制字节/DEL/C1 码点(U+0080-U+009F)/非法 UTF-8 → 空格。
 /// 摘要要打上终端——server 控制的 body 是注入面,0x9B(8-bit CSI)这类字节
 /// 原样输出等于把终端交给对端;合法多字节 UTF-8(中文报错)原样保留。
-fn copySanitized(dst: []u8, src: []const u8) usize {
+pub fn copySanitized(dst: []u8, src: []const u8) usize {
     var out: usize = 0;
     var i: usize = 0;
     while (i < src.len and out < dst.len) {

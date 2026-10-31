@@ -538,6 +538,9 @@ jobs:
       - name: SDK package version unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_sdk_package_versions -v
+      - name: AgentCore release unit tests
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m unittest scripts.tests.test_agentcore_release -v
       - name: Diff whitespace check
         if: matrix.checks && env.FAST_PATH != 'true'
         run: git diff --check
@@ -650,6 +653,12 @@ jobs:
         env:
           METACODES_NODE_SDK_REQUIRE_LIB: "1"
         run: node --test sdk/node/test/metacodes.test.js
+      # The formal path on the real build, which no real run reaches between
+      # releases: a final version through agentcore:archive, the wheel, the Node
+      # package and the door, in a scratch worktree, tagged locally, never pushed.
+      - name: Rehearse a formal AgentCore release
+        if: env.SDK != 'false'
+        run: python3 scripts/agentcore_release.py rehearse --target ${{ matrix.target }} --work "$RUNNER_TEMP/rehearsal"
 
   # The offline TTY suite (tests/tty) drives the debug binary in a pseudo
   # terminal and asserts the screen a person would see. No workflow ran it

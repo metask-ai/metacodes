@@ -12,13 +12,15 @@ Cut (`release_cut.py [--level auto|patch|minor|major] [--force-level]`):
      types of every non-merge commit since it (unknown types count nothing);
   3. version = max(bump(last tag), dev floor), strictly greater than the tag;
   4. rewrite build.zig.zon, src/version.zig and CHANGELOG.md (`## Unreleased`
-     -> `## <version> — <date>`, empty `## Unreleased` reinserted), repin the
+     -> `## <version> — <date>`, empty `## Unreleased` reinserted), finalize
+     AgentCore with its own version (agentcore_release.py: built when its inputs
+     changed, reused when not; `--agentcore-level` to raise it), repin the
      implementation fingerprint last;
   5. commit on `release/<version>`, push `--force-with-lease`, `gh pr create`
      with title `release: <version>` and the `release` label.
 
 Reopen (`release_cut.py --reopen [--reopen-level patch|minor]`): the mirror
-image after the release PR merged and stage B tagged it.
+image after the release PR merged and stage B tagged it, for AgentCore too.
 
 Every external command is an argv list (no shell); the PR body goes through
 `--body-file`. Python 3.9, stdlib only. Pure functions are tested in
@@ -28,96 +30,51 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
-import os
-import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-ROOT = Path(__file__).resolve().parents[1]
-ZON = "build.zig.zon"
-VERSION_ZIG = "src/version.zig"
-CHANGELOG = "CHANGELOG.md"
-PROTOCOL = "evals/plugin-v1/protocol.json"
-
-VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-dev)?$")
-ZON_VERSION_RE = re.compile(r'(\.version\s*=\s*")([^"]+)(")')
-ZIG_VERSION_RE = re.compile(r'(pub const semver = ")([^"]+)(";)')
-TAG_RE = re.compile(r"^\d+\.\d+\.\d+$")
-SUBJECT_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)(\([^)]*\))?(!)?:\s")
-UNRELEASED = "## Unreleased"
-RELEASE_HEADING_RE = re.compile(r"^## (\d+\.\d+\.\d+) — (\d{4}-\d{2}-\d{2})$")
-SUBSECTIONS = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
-
-LEVELS = ("none", "patch", "minor", "major")
-MINOR_TYPES = {"feat"}
-PATCH_TYPES = {"fix", "perf"}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agentcore_contract  # noqa: E402  (same directory, stdlib only)
+import agentcore_release  # noqa: E402
+from release_common import (  # noqa: E402,F401  (same directory, stdlib only; re-exported for the scripts and tests that use them from here)
+    CHANGELOG,
+    LEVELS,
+    MINOR_TYPES,
+    PATCH_TYPES,
+    PROTOCOL,
+    RELEASE_HEADING_RE,
+    ROOT,
+    SUBJECT_RE,
+    SUBSECTIONS,
+    TAG_RE,
+    UNRELEASED,
+    VERSION_RE,
+    VERSION_ZIG,
+    ZIG_VERSION_RE,
+    ZON,
+    ZON_VERSION_RE,
+    CutError,
+    bump,
+    classify_subject,
+    derive_level,
+    ensure_unreleased,
+    fmt,
+    parse_version,
+    read,
+    release_section,
+    rewrite_changelog,
+    run,
+    set_version_text,
+    write,
+)
 
 # GitHub refuses a longer pull request body ("Body is too long (maximum is
 # 65536 characters)"). Sizes are counted in UTF-8 bytes, which never undercount
 # GitHub's character count, so a body that fits here fits there.
 PR_BODY_LIMIT = 65536
-
-
-class CutError(Exception):
-    """A refusal with a message for the maintainer; nothing was written."""
-
-
-# ---------------------------------------------------------------- versions
-
-
-def parse_version(text: str) -> Tuple[int, int, int, bool]:
-    match = VERSION_RE.match(text.strip())
-    if match is None:
-        raise CutError(f"not a version this script understands: {text!r} (want X.Y.Z or X.Y.Z-dev)")
-    return int(match.group(1)), int(match.group(2)), int(match.group(3)), text.strip().endswith("-dev")
-
-
-def bump(version: Tuple[int, int, int], level: str, pre_1: bool = True) -> Tuple[int, int, int]:
-    major, minor, patch = version
-    if level == "major" and pre_1 and major == 0:
-        level = "minor"  # SemVer 0.x: breaking changes bump MINOR before 1.0.0
-    if level == "major":
-        return major + 1, 0, 0
-    if level == "minor":
-        return major, minor + 1, 0
-    if level == "patch":
-        return major, minor, patch + 1
-    raise CutError(f"cannot bump with level {level!r}")
-
-
-def classify_subject(subject: str) -> Tuple[str, str]:
-    """(type, level) for one commit subject. Unknown shapes are ('?', 'none')."""
-    match = SUBJECT_RE.match(subject)
-    if match is None:
-        return "?", "none"
-    kind = match.group(1).lower()
-    if match.group(3) == "!":
-        return kind, "major"
-    if kind in MINOR_TYPES:
-        return kind, "minor"
-    if kind in PATCH_TYPES:
-        return kind, "patch"
-    return kind, "none"
-
-
-def derive_level(messages: Sequence[str]) -> Tuple[str, List[str]]:
-    """Level from commit messages (subject + body) and the subjects that did
-    not parse or are not in the table, for the reviewer."""
-    level = "none"
-    unknown: List[str] = []
-    for message in messages:
-        subject = message.splitlines()[0] if message else ""
-        kind, commit_level = classify_subject(subject)
-        if "BREAKING CHANGE:" in message:
-            commit_level = "major"
-        if kind == "?":
-            unknown.append(subject)
-        if LEVELS.index(commit_level) > LEVELS.index(level):
-            level = commit_level
-    return level, unknown
 
 
 def compute_version(last_tag: str, dev_version: str, level: str) -> str:
@@ -137,10 +94,6 @@ def compute_version(last_tag: str, dev_version: str, level: str) -> str:
     return fmt(candidate)
 
 
-def fmt(version: Tuple[int, int, int]) -> str:
-    return "%d.%d.%d" % version
-
-
 def next_dev(version: str, level: str) -> str:
     if level not in ("patch", "minor"):
         raise CutError(f"--reopen-level must be patch or minor, not {level!r}")
@@ -150,61 +103,17 @@ def next_dev(version: str, level: str) -> str:
 # ---------------------------------------------------------------- files
 
 
-def set_version_text(text: str, pattern: re.Pattern, version: str, label: str) -> str:
-    new, count = pattern.subn(lambda m: m.group(1) + version + m.group(3), text)
-    if count != 1:
-        raise CutError(f"{label}: expected exactly one version declaration, found {count}")
-    return new
-
-
-def rewrite_changelog(text: str, version: str, date: str) -> Tuple[str, str]:
-    """Turn `## Unreleased` into `## <version> — <date>` and reinsert an empty
-    Unreleased block. Returns (new text, the released section). Fails closed."""
-    lines = text.splitlines()
-    heads = [i for i, line in enumerate(lines) if line == UNRELEASED]
-    if len(heads) != 1:
-        raise CutError(f"{CHANGELOG}: expected exactly one '{UNRELEASED}' heading, found {len(heads)}")
-    for line in lines:
-        m = RELEASE_HEADING_RE.match(line)
-        if m and m.group(1) == version:
-            raise CutError(f"{CHANGELOG}: '## {version}' already exists")
-    start = heads[0]
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
-    block = lines[start + 1:end]
-    for line in block:
-        if line.startswith("### ") and line[4:] not in SUBSECTIONS:
-            raise CutError(f"{CHANGELOG}: subsection '{line}' is not one of {', '.join(SUBSECTIONS)}")
-    if not any(line.startswith("- ") for line in block):
-        raise CutError(f"{CHANGELOG}: the '{UNRELEASED}' block has no '- ' entry; a release needs release notes")
-    heading = f"## {version} — {date}"
-    section = "\n".join([heading] + block).rstrip("\n") + "\n"
-    new_lines = lines[:start] + [UNRELEASED, "", heading] + block + lines[end:]
-    return "\n".join(new_lines).rstrip("\n") + "\n", section
-
-
-def ensure_unreleased(text: str) -> str:
-    """Reopen: make sure an (empty) `## Unreleased` block precedes the first release."""
-    lines = text.splitlines()
-    if UNRELEASED in lines:
-        return text
-    first = next((i for i, line in enumerate(lines) if RELEASE_HEADING_RE.match(line)), None)
-    if first is None:
-        raise CutError(f"{CHANGELOG}: no release heading to insert '{UNRELEASED}' before")
-    new_lines = lines[:first] + [UNRELEASED, ""] + lines[first:]
-    return "\n".join(new_lines).rstrip("\n") + "\n"
-
-
-def release_section(text: str, version: str) -> str:
-    lines = text.splitlines()
-    start = next((i for i, line in enumerate(lines) if RELEASE_HEADING_RE.match(line) and RELEASE_HEADING_RE.match(line).group(1) == version), None)
-    if start is None:
-        raise CutError(f"{CHANGELOG}: no '## {version} — <date>' section")
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
-    return "\n".join(lines[start:end]).rstrip("\n") + "\n"
-
-
 def body_size(text: str) -> int:
     return len(text.encode("utf-8"))
+
+
+def agentcore_summary(plan: agentcore_release.CutPlan) -> str:
+    """The AgentCore half of the release PR, so a reviewer can dispute it too."""
+    if plan.kind == "reused":
+        what = f"AgentCore **{plan.version}** is reused: {plan.reason}, so this release delivers the artifacts of the main release that built it."
+    else:
+        what = f"AgentCore **{plan.version}** is built by this release ({plan.reason}; level {plan.level})."
+    return f"{what} It implements ABI revision {plan.abi_revision}.\n\n"
 
 
 def pr_body(version: str, level: str, section: str, drivers: Dict[str, List[str]], unknown: List[str], squashed: Optional[List[str]] = None, limit: int = PR_BODY_LIMIT) -> str:
@@ -272,22 +181,6 @@ def _pr_body(level: str, section: str, drivers: Dict[str, List[str]], unknown: L
 # ---------------------------------------------------------------- git / gh
 
 
-def run(argv: Sequence[str], cwd: Path, check: bool = True) -> str:
-    # git and gh write UTF-8 whatever the locale, and PYTHONIOENCODING makes a
-    # Python child do the same. `text=True` would decode with the locale codec
-    # instead (GBK on a Chinese Windows), and there a decode error is raised in
-    # subprocess's reader thread and only printed: stdout came back None.
-    env = dict(os.environ, PYTHONIOENCODING="utf-8")
-    proc = subprocess.run(list(argv), cwd=str(cwd), capture_output=True, check=False, env=env)
-    if check and proc.returncode != 0:
-        stderr, stdout = (out.decode("utf-8", errors="replace").strip() for out in (proc.stderr, proc.stdout))
-        raise CutError(f"{' '.join(argv)} failed ({proc.returncode}): {stderr or stdout}")
-    try:
-        return proc.stdout.decode("utf-8").replace("\r\n", "\n")
-    except UnicodeDecodeError as exc:
-        raise CutError(f"{' '.join(argv)} wrote output that is not UTF-8: {exc}") from None
-
-
 def require_clean_main(root: Path) -> None:
     """Clean tree, on main, and main == freshly fetched origin/main: the cut
     must classify the commits that are actually on the remote, and the reopen
@@ -328,17 +221,14 @@ def first_parent_is_conventional(root: Path, tag: str) -> List[str]:
     return offenders
 
 
+def agentcore_messages(root: Path, tag: str) -> List[str]:
+    """Commits since `tag` that touched what AgentCore is built from."""
+    out = run(["git", "log", f"{tag}..HEAD", "--no-merges", "--format=%s%n%b%x00", "--", *agentcore_release.input_paths(root)], root)
+    return [m.strip() for m in out.split("\x00") if m.strip()]
+
+
 def repin_fingerprint(root: Path) -> None:
     run([sys.executable, "scripts/eval/plugin_release_gate.py", "--refresh-implementation-fingerprint"], root)
-
-
-def read(root: Path, rel: str) -> str:
-    return (root / rel).read_text(encoding="utf-8")
-
-
-def write(root: Path, rel: str, text: str) -> None:
-    with open(root / rel, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
 
 
 def current_versions(root: Path) -> Tuple[str, str]:
@@ -379,7 +269,7 @@ def open_pr(root: Path, branch: str, title: str, body: str, label: Optional[str]
     name already went through a merged PR (a version is released once), or
     when the body is over GitHub's limit (before anything is pushed). Ends on
     `main` whether or not a step failed."""
-    files = [ZON, VERSION_ZIG, CHANGELOG, PROTOCOL]
+    files = [ZON, VERSION_ZIG, CHANGELOG, PROTOCOL, *agentcore_contract.GENERATED]
     if body_size(body) > PR_BODY_LIMIT:
         raise CutError(f"the PR body is {body_size(body):,} bytes, over GitHub's {PR_BODY_LIMIT:,}; nothing was pushed")
     existing = None
@@ -428,7 +318,7 @@ def open_pr(root: Path, branch: str, title: str, body: str, label: Optional[str]
 # ---------------------------------------------------------------- commands
 
 
-def cmd_cut(root: Path, level_arg: str, force: bool, dry_run: bool) -> int:
+def cmd_cut(root: Path, level_arg: str, force: bool, dry_run: bool, agentcore_level: str = "auto") -> int:
     require_clean_main(root)
     dev_version, _ = current_versions(root)
     tag = last_tag(root)
@@ -451,27 +341,31 @@ def cmd_cut(root: Path, level_arg: str, force: bool, dry_run: bool) -> int:
             drivers.setdefault(commit_level, []).append(subject)
     date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
     new_changelog, section = rewrite_changelog(read(root, CHANGELOG), version, date)
-    body = pr_body(version, level, section, drivers, unknown, squashed)
+    plan = agentcore_release.plan_cut(root, agentcore_level, force, lambda since: agentcore_messages(root, since))
+    summary = agentcore_summary(plan)
+    body = summary + pr_body(version, level, section, drivers, unknown, squashed, PR_BODY_LIMIT - body_size(summary))
     print(f"last tag {tag}, derived level {derived}, cutting {version}")
+    print(f"AgentCore: {plan.kind} {plan.version} ({plan.reason}), ABI revision {plan.abi_revision}")
     if squashed:
         print(f"{len(squashed)} first-parent commit(s) are not merge commits (squash/rebase merges); their PR-internal commit types are not visible, only their subjects counted")
     if unknown:
         print(f"{len(unknown)} commit(s) with a non-conventional subject contributed nothing (listed in the PR body)")
-    if not body.startswith(section):
+    if not body.startswith(summary + section):
         print(f"the changelog section ({body_size(section):,} bytes) is too long for a PR body; the PR points to its {CHANGELOG} diff instead")
     if dry_run:
         print(section)
-        print(f"[dry-run] no files written")
+        print("[dry-run] no files written")
         return 0
     apply_version(root, version)
     write(root, CHANGELOG, new_changelog)
+    agentcore_release.apply_cut(root, plan.version, version, date)
     repin_fingerprint(root)
     open_pr(root, f"release/{version}", f"release: {version}", body, "release", dry_run=False)
     print(f"after the PR merges and release-tag.yml has tagged {version}: python3 scripts/release_cut.py --reopen")
     return 0
 
 
-def cmd_reopen(root: Path, reopen_level: str, dry_run: bool) -> int:
+def cmd_reopen(root: Path, reopen_level: str, dry_run: bool, agentcore_reopen_level: str = "patch") -> int:
     require_clean_main(root)
     released, _ = current_versions(root)
     if released.endswith("-dev"):
@@ -488,14 +382,16 @@ def cmd_reopen(root: Path, reopen_level: str, dry_run: bool) -> int:
     if ancestor.returncode != 0:
         raise CutError(f"tag {released} on origin points at {peeled[:8]}, which is not on this main")
     target = next_dev(released, reopen_level)
-    print(f"reopening development at {target}")
+    agentcore_target = agentcore_release.reopen_target(root, agentcore_reopen_level)
+    print(f"reopening development at {target}, AgentCore at {agentcore_target}")
     if dry_run:
         print("[dry-run] no files written")
         return 0
     apply_version(root, target)
     write(root, CHANGELOG, ensure_unreleased(read(root, CHANGELOG)))
+    agentcore_release.apply_reopen(root, agentcore_target)
     repin_fingerprint(root)
-    body = f"Reopen development after {released}: version files to `{target}`, `{UNRELEASED}` restored, fingerprint repinned.\n"
+    body = f"Reopen development after {released}: version files to `{target}`, AgentCore to `{agentcore_target}`, `{UNRELEASED}` restored, fingerprint repinned.\n"
     open_pr(root, f"chore/reopen-{target}", f"chore: reopen {target}", body, None, dry_run=False)
     return 0
 
@@ -506,6 +402,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--force-level", action="store_true", help="release even without feat/fix/perf commits, or below the derived level")
     parser.add_argument("--reopen", action="store_true", help="stage D: bump to the next -dev after a release was tagged")
     parser.add_argument("--reopen-level", choices=("patch", "minor"), default="patch")
+    parser.add_argument("--agentcore-level", choices=("auto", "patch", "minor", "major"), default="auto", help="raise AgentCore's derived level; refused when it is unchanged")
+    parser.add_argument("--agentcore-reopen-level", choices=("patch", "minor"), default="patch")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--repo-root", default=str(ROOT))
     args = parser.parse_args(argv)
@@ -518,9 +416,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             stream.reconfigure(errors="backslashreplace")
     try:
         if args.reopen:
-            return cmd_reopen(root, args.reopen_level, args.dry_run)
-        return cmd_cut(root, args.level, args.force_level, args.dry_run)
-    except CutError as exc:
+            return cmd_reopen(root, args.reopen_level, args.dry_run, args.agentcore_reopen_level)
+        return cmd_cut(root, args.level, args.force_level, args.dry_run, args.agentcore_level)
+    except (CutError, OSError) as exc:
         print(f"release_cut: {exc}", file=sys.stderr)
         return 2
 

@@ -122,6 +122,7 @@ pub const client = @import("client.zig");
 pub const api_stream = @import("api/stream.zig");
 pub const api_http_status = @import("api/http_status.zig");
 pub const api_error_class = @import("api/error_class.zig");
+pub const api_model_error = @import("api/model_error.zig"); // per-Run structured detail of a model failure (#408)
 pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_credential_cell = @import("api/credential_cell.zig"); // a Session's replaceable provider credential (#336)

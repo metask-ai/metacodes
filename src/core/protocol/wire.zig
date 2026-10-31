@@ -117,8 +117,8 @@ pub const HostEvent = union(enum) {
     /// A queued submission became the input of Run `run_id`.
     user_message: struct { run_id: u64, trace_id: ?[]const u8 = null, text: []const u8 },
     /// Run `run_id` ended: `stop_reason` when it returned, `error_name` when
-    /// it failed.
-    run_done: struct { run_id: u64, trace_id: ?[]const u8 = null, stop_reason: ?[]const u8 = null, error_name: ?[]const u8 = null },
+    /// it failed. `model_error` says why, when the stop was a model failure.
+    run_done: struct { run_id: u64, trace_id: ?[]const u8 = null, stop_reason: ?[]const u8 = null, error_name: ?[]const u8 = null, model_error: ?@import("../../api/model_error.zig").Detail.View = null },
     /// A configuration command was applied (`ok`) or refused.
     command_result: struct { command: []const u8, ok: bool, error_name: ?[]const u8 = null },
     /// The Session can no longer run; the Host must close it. Work still

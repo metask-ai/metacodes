@@ -11,7 +11,12 @@ C ABI v1 revision 26:
   permission handling ([python/README.md](python/README.md));
 - `node/` — the `metacodes` Node package: a Node-API addon over the shared
   library with the same API shape for JavaScript ([node/README.md](node/README.md));
-- `VERSION` — SDK package version, distinct from ABI revision.
+- `VERSION` — AgentCore's own SemVer version, distinct from the main project's
+  and from the ABI revision. Every package carries it; `agentcore-releases.json`
+  maps each release to its ABI revision and to the metacodes releases that ship it
+  ([doc/RELEASE_AUTOMATION_DESIGN.md](../doc/RELEASE_AUTOMATION_DESIGN.md) §2a);
+- `CHANGELOG.md` — AgentCore's changes and migration steps. A change a Host can
+  see gets an entry here.
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 80-byte root, all
@@ -34,6 +39,11 @@ scheme, `base_url` and model stay; refusals keep the previous credential.
 callback; the Run appends it at its next turn boundary and reports each
 adoption as `input_adopted`, and `RunResultV1.input_accepted_count` /
 `input_adopted_count` reconcile every submitted input on every return.
+A Run that stops with `STOP_API_ERROR` delivers one `model_error` event before
+its terminal `run_state`: category, the upstream's code and type passed through
+verbatim, a redacted displayable message, HTTP status, request id and retry
+guidance (`unknown` when it cannot be determined). The SDKs do not interpret the
+code; deciding "ask for funds" or "reauthenticate" from it is the Host's.
 `skill->resolve_catalog` merges the default `.agents/skills` sources with up to
 64 Host-registered sources. Their source priorities (`SkillSourceV1.priority`,
 `SkillCatalogQueryV1.default_user_source_priority` and

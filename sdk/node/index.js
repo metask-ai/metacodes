@@ -179,6 +179,7 @@ class RunState {
     this.pending = new Map();
     this.finalText = '';
     this.segments = [];
+    this.modelError = null;
     this.usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
   }
 
@@ -199,6 +200,8 @@ class RunState {
         this.finalText = (this.pending.get(group) || []).join('') + text;
         this.pending.delete(group);
       }
+    } else if (tag === 'model_error' && payload && typeof payload === 'object') {
+      this.modelError = payload;
     } else if (tag === 'usage' && payload && typeof payload === 'object') {
       for (const key of Object.keys(this.usage)) this.usage[key] += Number(payload[key] || 0);
     }
@@ -413,6 +416,7 @@ class Session {
       segments: active.state.segments,
       inputAccepted: outcome.inputAccepted,
       inputAdopted: outcome.inputAdopted,
+      modelError: active.state.modelError,
     });
   }
 

@@ -183,8 +183,22 @@ jobs:
           set -euo pipefail
           sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed" "$RUNNER_TEMP"/dist/metacodes-*-${{ matrix.zig_target }}.tar.gz
           "$RUNNER_TEMP/installed/bin/metacodes" doctor --strict
+      # AgentCore ships with every release under its own version
+      # (doc/RELEASE_AUTOMATION_DESIGN.md §2a): this release builds it, or, when
+      # its inputs are unchanged, delivers the artifacts of the release that did.
+      - name: AgentCore release mode
+        run: python3 scripts/agentcore_release.py release-mode --github-env "$GITHUB_ENV"
       - name: Archive (AgentCore SDK)
-        run: zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
+        if: env.AGENTCORE_REUSE_FROM == ''
+        run: zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/sdk" -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
+      - name: Language packages (Python wheel, Node package)
+        if: env.AGENTCORE_REUSE_FROM == ''
+        run: python3 scripts/agentcore_release.py package-languages --sdk-prefix "$RUNNER_TEMP/sdk" --dist "$RUNNER_TEMP/dist" --node
+      - name: Reuse the AgentCore artifacts
+        if: env.AGENTCORE_REUSE_FROM != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/agentcore_release.py fetch-reused --target ${{ matrix.zig_target }} --dist "$RUNNER_TEMP/dist"
       # The unit's archive and, on Linux, its symbols archive.
       - name: Archives are reproducible
         shell: bash
@@ -287,9 +301,24 @@ jobs:
       - name: The archive installs
         shell: cmd
         run: for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 "%%F" -Prefix "%RUNNER_TEMP%\installed" -NoPath && "%RUNNER_TEMP%\installed\bin\metacodes.exe" doctor --strict
-      - name: Archive (AgentCore SDK)
+      # See build-posix. The Node addon does not support Windows yet.
+      - name: AgentCore release mode
         shell: cmd
-        run: zig build agentcore:archive -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -Dagentcore-archive-dir="%RUNNER_TEMP%\dist"
+        run: python scripts\agentcore_release.py release-mode --github-env "%GITHUB_ENV%"
+      - name: Archive (AgentCore SDK)
+        if: env.AGENTCORE_REUSE_FROM == ''
+        shell: cmd
+        run: zig build agentcore:archive -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\sdk" -Dagentcore-archive-dir="%RUNNER_TEMP%\dist"
+      - name: Language packages (Python wheel)
+        if: env.AGENTCORE_REUSE_FROM == ''
+        shell: cmd
+        run: python scripts\agentcore_release.py package-languages --sdk-prefix "%RUNNER_TEMP%\sdk" --dist "%RUNNER_TEMP%\dist"
+      - name: Reuse the AgentCore artifacts
+        if: env.AGENTCORE_REUSE_FROM != ''
+        shell: cmd
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts\agentcore_release.py fetch-reused --target x86_64-windows-gnu --dist "%RUNNER_TEMP%\dist"
       - name: Archives are reproducible
         shell: cmd
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Dtarget=x86_64-windows-gnu -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
@@ -331,6 +360,15 @@ jobs:
           fi
           test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
           python3 scripts/check_version_state.py
+      # Refuses a development version, a package around another library, a
+      # version or ABI that disagrees anywhere, and any asset whose name a
+      # published release already holds with other bytes.
+      - name: Checksums of the published releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/agentcore_release.py fetch-published-sums --out "$RUNNER_TEMP/published"
+      - name: The deliverables are one consistent release
+        run: python3 scripts/agentcore_release.py verify-dist --dist "$RUNNER_TEMP/dist" --published-sums "$RUNNER_TEMP/published"
       - name: SHA256SUMS over every archive
         run: python3 scripts/release_sums.py "$RUNNER_TEMP/dist" "$RELEASE_REF"
       - name: Release notes from CHANGELOG.md
