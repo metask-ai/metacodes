@@ -212,6 +212,7 @@ pub fn encodeRequest(
     // method fields, which the caller's own limits do not charge for.
     var params_limits = limits;
     params_limits.max_json_depth +|= 2;
+    params_limits.max_json_nodes +|= 8;
     params_limits.max_schema_bytes +|= limits.max_text_bytes;
     params_limits.max_frame_bytes = @max(params_limits.max_frame_bytes, params_limits.max_schema_bytes);
     const params = try parseArguments(scratch.allocator(), params_json, params_limits);

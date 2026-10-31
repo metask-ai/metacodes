@@ -1122,7 +1122,10 @@ pub const McpClient = struct {
     fn requestJson(self: *McpClient, method: []const u8, params_json: []const u8, abort: ?*const AbortSignal) ![]u8 {
         self.request_mutex.lock();
         defer self.request_mutex.unlock();
-        return self.requestLocked(method, params_json, abort);
+        return self.requestLocked(method, params_json, abort) catch |err| {
+            if (err == error.McpConnectionFatal) self.retire();
+            return err;
+        };
     }
 
     /// Interrupted or timed out: tell the server unless the transport already

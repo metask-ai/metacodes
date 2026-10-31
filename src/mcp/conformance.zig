@@ -28,6 +28,7 @@ const CallScript = enum {
     sampling_required,
     business_error,
     control_characters,
+    empty_key,
     null_id_error,
     malformed,
     no_jsonrpc,
@@ -157,6 +158,7 @@ const Peer = struct {
             .sampling_required => respond(a, try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"input_required\",\"inputRequests\":{{\"q\":{{\"method\":\"sampling/createMessage\",\"params\":{{}}}}}}}}}}", .{id})),
             .business_error => respond(a, try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"city unavailable\"}}],\"isError\":true}}}}", .{id})),
             .control_characters => respond(a, try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"\\u001b[31mred\"}}]}}}}", .{id})),
+            .empty_key => respond(a, try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"content\":[],\"structuredContent\":{{\"\":1}}}}}}", .{id})),
             .null_id_error => respond(a, try a.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Bad Request\"}}")),
             .malformed => respond(a, try a.dupe(u8, "not json")),
             .no_jsonrpc => respond(a, try std.fmt.allocPrint(a, "{{\"id\":{d},\"result\":{{\"content\":[]}}}}", .{id})),
@@ -292,6 +294,20 @@ test "both profiles: content may carry escaped control characters" {
         defer deinitOutcome(&outcome);
         try std.testing.expect(outcome == .result);
         try std.testing.expect(std.mem.indexOf(u8, outcome.result.@"inline".bytes, "\\u001b[31mred") != null);
+    }
+}
+
+test "both profiles: an empty key is legal in the data a result carries" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    for (profiles) |profile| {
+        var peer = Peer{ .call = .empty_key };
+        var client = try connect(&peer, profile, .auto);
+        defer client.close();
+        var outcome = fixture.call(&client, null);
+        defer deinitOutcome(&outcome);
+        try std.testing.expect(outcome == .result);
     }
 }
 
@@ -495,6 +511,8 @@ test "both profiles: a connector contract failure retires the connection" {
         try std.testing.expect(second.failed.failure == .instance_unavailable);
         try std.testing.expectEqual(canonical.Disposition.not_delivered, second.failed.disposition);
         try std.testing.expectEqual(@as(u32, 1), peer.calls);
+        try std.testing.expectError(error.McpInstanceUnavailable, client.callTool("weather", "{}"));
+        try std.testing.expectError(error.McpInstanceUnavailable, client.listTools());
     }
 }
 

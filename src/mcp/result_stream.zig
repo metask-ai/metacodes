@@ -289,8 +289,9 @@ const ParseState = struct {
         if (self.string_is_key) {
             const frame = self.current() orelse return error.InvalidJson;
             if (frame.kind != .object or !frame.expects_key) return error.InvalidJson;
-            if (self.string_len == 0 or self.string_len > self.limits.max_text_bytes)
-                return error.ResourceLimit;
+            if (self.string_len > self.limits.max_text_bytes) return error.ResourceLimit;
+            // `""` is a legal key in the data a result carries, not in the envelope.
+            if (self.string_len == 0 and frame.role != .other) return error.ResourceLimit;
             var digest: [32]u8 = undefined;
             self.string_hash.final(&digest);
             const inserted = try frame.keys.getOrPut(self.allocator, digest);
