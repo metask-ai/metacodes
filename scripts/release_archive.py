@@ -16,11 +16,15 @@ manifest identity:
              and CRC-32 match. The symbols are never part of the unit itself.
 
 Channels gate what may be archived (#47 Q1/Q3): a pre-release version
-(`X.Y.Z-<pre>+<commit12>`) archives from any commit; a stable version requires a
-clean source tree and a tag — for the CLI the bare `X.Y.Z` tag on HEAD, for the
-SDK a tag named after the version pointing at `manifest.source.commit`. A
-stable archive that fails the gate raises the same error the SDK packager
-always raised, so nothing downstream learns a new message.
+(`X.Y.Z-<pre>+<commit12>`) archives from any commit that is not itself a release;
+a stable version requires a clean source tree and a tag. For the CLI that is the
+bare `X.Y.Z` tag on HEAD. AgentCore has its own version and no tag of its own
+(`0.13.0` may one day name a main-project release): a stable SDK archive requires
+the main-project tag on HEAD, HEAD at `manifest.source.commit`, and the ledger
+(`sdk/agentcore-releases.json`) saying this main release is the one that builds
+this AgentCore version. A later main release reuses those artifacts instead, so
+it cannot produce a second, different archive under the same version.
+Every AgentCore archive also passes `agentcore_contract.check_bundle_contents`.
 
 Two runs over the same bundle produce byte-identical archives: no timestamps,
 owners or host names enter the members. Python 3.9, stdlib only; `--self-test`
@@ -43,14 +47,16 @@ import tempfile
 import unittest
 import zipfile
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 SAFE_COORDINATE = re.compile(r"^[0-9A-Za-z._+-]+$")
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 ZIP_COMPRESSION_LEVEL = 9
 KINDS = ("agentcore", "cli")
-STABLE_SDK_DISABLED = "stable AgentCore archives are disabled until the release process is established"
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agentcore_contract  # noqa: E402  (same directory, stdlib only)
 
 
 def sha256_file(path: Path) -> str:
@@ -88,10 +94,12 @@ class GitFacts:
     """What the channel gate asks of the repository; tests build it directly."""
 
     head_tag: str | None
-    tag_commits: dict[str, str] = field(default_factory=dict)
+    head_commit: str | None = None
+    # The main-project release the ledger says builds this AgentCore version.
+    agentcore_built_by: str | None = None
 
 
-def collect_git_facts(repo_root: Path, tags: tuple[str, ...]) -> GitFacts:
+def collect_git_facts(repo_root: Path, agentcore_version: str | None = None) -> GitFacts:
     def git(*argv: str) -> str | None:
         completed = subprocess.run(
             ["git", "-C", str(repo_root), *argv],
@@ -103,12 +111,15 @@ def collect_git_facts(repo_root: Path, tags: tuple[str, ...]) -> GitFacts:
             return None
         return completed.stdout.strip() or None
 
-    tag_commits = {}
-    for tag in tags:
-        commit = git("rev-list", "-n", "1", tag)
-        if commit is not None:
-            tag_commits[tag] = commit
-    return GitFacts(head_tag=git("describe", "--tags", "--exact-match", "HEAD"), tag_commits=tag_commits)
+    built_by = None
+    if agentcore_version is not None:
+        entry = agentcore_contract.load_ledger(repo_root).by_version(agentcore_version)
+        built_by = None if entry is None else entry.built_by
+    return GitFacts(
+        head_tag=git("describe", "--tags", "--exact-match", "HEAD"),
+        head_commit=git("rev-parse", "HEAD"),
+        agentcore_built_by=built_by,
+    )
 
 
 @dataclass(frozen=True)
@@ -214,19 +225,36 @@ def load_bundle(bundle_root: Path, kind: str) -> Bundle:
 
 
 def enforce_channel(bundle: Bundle, git_facts: GitFacts | None) -> None:
-    """A pre-release archives from any commit; a stable one only from a clean,
-    tagged tree. The SDK's historical refusal text is kept verbatim."""
+    """A pre-release archives from any commit but a release; a stable one only
+    from a clean, tagged tree."""
     if bundle.channel == "pre":
+        head_tag = None if git_facts is None else git_facts.head_tag
+        if bundle.kind == "agentcore" and head_tag is not None and agentcore_contract.BARE_RE.match(head_tag):
+            raise ValueError(
+                f"AgentCore development version {bundle.version} on release tag {head_tag}: "
+                "a formal release carries a final AgentCore version (scripts/release_cut.py finalizes it)"
+            )
         return
     source = bundle.manifest.get("source") or {}
     dirty = source.get("dirty")
     commit = source.get("commit")
-    if bundle.kind == "agentcore":
-        tag_commit = None if git_facts is None else git_facts.tag_commits.get(bundle.version)
-        if dirty is not False or not isinstance(commit, str) or tag_commit != commit:
-            raise ValueError(STABLE_SDK_DISABLED)
-        return
     head_tag = None if git_facts is None else git_facts.head_tag
+    if bundle.kind == "agentcore":
+        head_commit = None if git_facts is None else git_facts.head_commit
+        built_by = None if git_facts is None else git_facts.agentcore_built_by
+        if dirty is not False or not isinstance(commit, str) or commit != head_commit:
+            raise ValueError(
+                f"stable AgentCore archives require a clean source tree at the manifest's commit "
+                f"(tree dirty={dirty!r}, manifest commit={commit!r}, HEAD={head_commit!r})"
+            )
+        if head_tag is None or not agentcore_contract.BARE_RE.match(head_tag):
+            raise ValueError(f"stable AgentCore {bundle.version} archives only from a tagged main-project release (HEAD tag={head_tag!r})")
+        if built_by != head_tag:
+            raise ValueError(
+                f"AgentCore {bundle.version} is built by main-project release {built_by!r} according to "
+                f"{agentcore_contract.LEDGER}, not by {head_tag}: same version, same artifacts, so reuse them"
+            )
+        return
     if dirty is not False or head_tag != bundle.version:
         raise ValueError(
             f"stable metacodes archives require a clean source tree tagged {bundle.version} "
@@ -240,6 +268,11 @@ def write_archive(bundle_root: Path, output_dir: Path, kind: str, git_facts: Git
     if output_dir == bundle_root or bundle_root in output_dir.parents:
         raise ValueError("archive output directory must not be inside the bundle root")
     bundle = load_bundle(bundle_root, kind)
+    if kind == "agentcore":
+        agentcore_contract.check_bundle_contents(
+            bundle.manifest,
+            lambda relative: bundle_root.joinpath(*PurePosixPath(relative).parts).read_bytes(),
+        )
     enforce_channel(bundle, git_facts)
     members = [(bundle_root.joinpath(*PurePosixPath(relative).parts), relative) for relative in bundle.archive_paths]
     return write_immutable(output_dir, bundle.coordinate, members, as_zip=bundle.target_os == "windows")
@@ -378,19 +411,40 @@ def write_immutable(output_dir: Path, coordinate: str, members: list[tuple[Path,
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 
-def _sdk_fixture(root: Path, target_os: str, target_id: str, version: str = "0.1.0-dev+0123456789ab") -> Path:
+def _sdk_fixture(root: Path, target_os: str, target_id: str, version: str = "0.1.0-dev+0123456789ab", revision: int = 26,
+                 commit: str = COMMIT, overrides: dict[str, str] | None = None, architecture: str = "x86_64", abi: str = "gnu") -> Path:
+    """A bundle whose every member describes one release; `overrides` replaces a
+    member's text afterwards, with the manifest digest following it, so a test
+    states exactly which file disagrees."""
     bundle = root / "sdk-bundle"
-    payload = bundle / "include" / "metask" / "agentcore.h"
-    payload.parent.mkdir(parents=True)
-    payload.write_text("/* test */\n", encoding="utf-8")
+    library = "metask_agentcore.dll" if target_os == "windows" else "libmetask_agentcore.so"
+    members = {
+        "include/metask/agentcore.h": f"#define METASK_AGENTCORE_ABI_REVISION {revision}u\n",
+        "bindings/zig/src/types.zig": f"pub const ABI_REVISION: u32 = {revision};\n",
+        "bindings/rust/src/raw.rs": f"pub const METASK_AGENTCORE_ABI_REVISION: u32 = {revision};\n",
+        "bindings/zig/build.zig.zon": f'.{{\n    .version = "{version}",\n}}\n',
+        "bindings/rust/Cargo.toml": f'[package]\nversion = "{version}"\n',
+        "bindings/rust/Cargo.lock": f'version = 4\n\n[[package]]\nversion = "{version}"\n',
+        "README.md": f"# metask-agentcore {version}\n\nRevision {revision} exposes the tables.\n",
+        f"lib/{library}": f"library {version} {target_id}\n",
+    }
+    members.update(overrides or {})
+    files = []
+    for relative, text in members.items():
+        payload = bundle.joinpath(*PurePosixPath(relative).parts)
+        payload.parent.mkdir(parents=True, exist_ok=True)
+        payload.write_bytes(text.encode("utf-8"))
+        files.append({"path": relative, "sha256": sha256_file(payload)})
     manifest = {
         "schema_version": 1,
         "vendor": "metask",
         "name": "agentcore",
         "version": version,
-        "source": {"commit": COMMIT, "dirty": False},
-        "target": {"id": target_id, "os": target_os},
-        "files": [{"path": "include/metask/agentcore.h", "sha256": sha256_file(payload)}],
+        "source": {"commit": commit, "dirty": False},
+        "target": {"id": target_id, "os": target_os, "architecture": architecture, "abi": abi, "zig_target": target_id},
+        "contract": {"binary_abi_version": 1, "binary_abi_revision": revision},
+        "shared_library": {"path": f"lib/{library}"},
+        "files": files,
     }
     (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return bundle
@@ -528,11 +582,11 @@ class ArchiveTests(unittest.TestCase):
             # Re-running over the unchanged bundle is a no-op that proves the
             # bytes reproduce; a changed bundle may not replace the archive.
             self.assertEqual(write_archive(bundle, root / "out", "agentcore", None), (archive, checksum))
-            payload = bundle / "include" / "metask" / "agentcore.h"
+            payload = bundle / "lib" / "metask_agentcore.dll"
             payload.write_text("/* changed */\n", encoding="utf-8")
             manifest_path = bundle / "manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["files"][0]["sha256"] = sha256_file(payload)
+            next(entry for entry in manifest["files"] if entry["path"] == "lib/metask_agentcore.dll")["sha256"] = sha256_file(payload)
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(FileExistsError, "different bytes"):
                 write_archive(bundle, root / "out", "agentcore", None)
@@ -564,16 +618,29 @@ class ArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "dirty=True"):
                 write_archive(dirty, root / "out-dirty", "cli", GitFacts(head_tag="0.2.0"))
 
-    def test_stable_sdk_keeps_the_historical_refusal_unless_tagged(self) -> None:
+    def test_stable_sdk_archives_only_from_the_main_release_that_builds_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            bundle = _sdk_fixture(root, "linux", "x86_64-linux-gnu", version="0.1.0")
-            with self.assertRaisesRegex(ValueError, re.escape(STABLE_SDK_DISABLED)):
-                write_archive(bundle, root / "out", "agentcore", None)
-            with self.assertRaisesRegex(ValueError, re.escape(STABLE_SDK_DISABLED)):
-                write_archive(bundle, root / "out", "agentcore", GitFacts(head_tag=None, tag_commits={"0.1.0": "f" * 40}))
-            archive, _ = write_archive(bundle, root / "out", "agentcore", GitFacts(head_tag=None, tag_commits={"0.1.0": COMMIT}))
-            self.assertEqual(archive.name, "metask-agentcore-0.1.0-x86_64-linux-gnu.tar.gz")
+            bundle = _sdk_fixture(root, "linux", "x86_64-linux-gnu", version="0.13.0")
+            for facts, message in (
+                (None, "clean source tree"),
+                (GitFacts(head_tag="0.10.0", head_commit="f" * 40, agentcore_built_by="0.10.0"), "clean source tree"),
+                (GitFacts(head_tag=None, head_commit=COMMIT, agentcore_built_by="0.10.0"), "tagged main-project release"),
+                (GitFacts(head_tag="0.10.0", head_commit=COMMIT, agentcore_built_by=None), "reuse them"),
+                (GitFacts(head_tag="0.10.1", head_commit=COMMIT, agentcore_built_by="0.10.0"), "reuse them"),
+            ):
+                with self.assertRaisesRegex(ValueError, message):
+                    write_archive(bundle, root / "out", "agentcore", facts)
+            archive, _ = write_archive(bundle, root / "out", "agentcore", GitFacts(head_tag="0.10.0", head_commit=COMMIT, agentcore_built_by="0.10.0"))
+            self.assertEqual(archive.name, "metask-agentcore-0.13.0-x86_64-linux-gnu.tar.gz")
+
+    def test_a_development_sdk_refuses_a_release_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = _sdk_fixture(root, "linux", "x86_64-linux-gnu")
+            with self.assertRaisesRegex(ValueError, "development version"):
+                write_archive(bundle, root / "out", "agentcore", GitFacts(head_tag="0.10.0"))
+            write_archive(bundle, root / "out", "agentcore", GitFacts(head_tag=None))
 
     def test_rejects_payload_hash_mismatch_and_wrong_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -607,7 +674,7 @@ def main() -> int:
         parser.error("--debug-file goes with --kind symbols, and only with it")
     try:
         bundle = load_bundle(args.bundle_root.resolve(), "cli" if args.kind == "symbols" else args.kind)
-        git_facts = collect_git_facts(args.repo_root, (bundle.version,)) if bundle.channel == "stable" else None
+        git_facts = collect_git_facts(args.repo_root, bundle.version if args.kind == "agentcore" and bundle.channel == "stable" else None)
         if args.kind == "symbols":
             archive, checksum = write_symbols_archive(args.bundle_root.resolve(), args.debug_file.resolve(), args.output_dir.resolve(), git_facts)
         else:

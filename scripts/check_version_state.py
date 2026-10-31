@@ -27,6 +27,10 @@ fetch is needed here.
 `--rehearse` (CI only): on a release PR head or on main's run of the release
 merge commit, tag HEAD locally so `release:verify` / `release:archive` can run
 the stable channel on the candidate before the real tag exists (design §3 C).
+The AgentCore half (`agentcore_release.state_findings`) runs in the same gate:
+AgentCore is finalized and reopened with the main project, its packages agree
+with `sdk/VERSION`, every ABI revision mirror agrees, the ledger is valid and
+append-only, and a release commit is the release its ledger entry records.
 Python 3.9, stdlib only.
 """
 from __future__ import annotations
@@ -37,6 +41,9 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agentcore_release  # noqa: E402  (same directory, stdlib only)
 
 ROOT = Path(__file__).resolve().parents[1]
 ZON_VERSION_RE = re.compile(r'\.version\s*=\s*"([^"]+)"')
@@ -112,11 +119,22 @@ def rehearse(root: Path, head_ref: str, env: Optional[Dict[str, str]] = None) ->
     return f"rehearsal: tagged HEAD as {version} locally (not pushed)"
 
 
+def check_agentcore(root: Path) -> list:
+    match = ZON_VERSION_RE.search((root / "build.zig.zon").read_text(encoding="utf-8"))
+    last_tag = git("describe", "--tags", "--abbrev=0", "--match", "[0-9]*.[0-9]*.[0-9]*", root=root)
+    return agentcore_release.state_findings(root, match.group(1) if match else "", last_tag or None)
+
+
 def main() -> int:
     head_ref = os.environ.get("GITHUB_HEAD_REF") or git("rev-parse", "--abbrev-ref", "HEAD", root=ROOT)
     finding = check(ROOT, head_ref)
     if finding:
         print(f"check_version_state: {finding}", file=sys.stderr)
+        return 1
+    findings = check_agentcore(ROOT)
+    if findings:
+        for item in findings:
+            print(f"check_version_state: {item}", file=sys.stderr)
         return 1
     if "--rehearse" in sys.argv[1:]:
         done = rehearse(ROOT, head_ref)

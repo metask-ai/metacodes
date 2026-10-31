@@ -4,9 +4,9 @@
 Since #81 the archive core lives in `scripts/release_archive.py`, shared with
 the CLI release unit; this entry point keeps the SDK's command line
 (`package_agentcore.py <bundle_root> <output_dir>` and `--self-test`) and its
-identity (`--kind agentcore`). A stable SDK version still refuses to archive
-unless a tag named after the version points at the manifest's source commit —
-the same refusal text as before.
+identity (`--kind agentcore`). The channel gate is `release_archive.enforce_channel`:
+a stable SDK version archives only from the main-project release the ledger
+(`sdk/agentcore-releases.json`) names as the one that builds it.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def load_bundle(bundle_root: Path) -> tuple[dict, str, str, tuple[str, ...]]:
 
 def write_archive(bundle_root: Path, output_dir: Path) -> tuple[Path, Path]:
     bundle = release_archive.load_bundle(bundle_root.resolve(), "agentcore")
-    git_facts = release_archive.collect_git_facts(PROJECT_ROOT, (bundle.version,)) if bundle.channel == "stable" else None
+    git_facts = release_archive.collect_git_facts(PROJECT_ROOT, bundle.version if bundle.channel == "stable" else None)
     return release_archive.write_archive(bundle_root, output_dir, "agentcore", git_facts)
 
 
