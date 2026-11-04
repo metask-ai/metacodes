@@ -1687,6 +1687,21 @@ fn serializeOpenAIMessage(
         };
         try util_json.serializeString(text_buf.items, out, allocator);
     }
+    // 思考回传:声明了回传的方言(DeepSeek 在请求带 tools 时要求回传全部历史思考,
+    // 否则 400)把 assistant 消息的 thinking 块按序拼成 `reasoning_content`。其余方言
+    // 不发,请求字节与投影 thinking 之前相同。
+    if (m.role == .assistant and profile.echoes_reasoning_content) {
+        var reasoning: std.ArrayList(u8) = .empty;
+        defer reasoning.deinit(allocator);
+        for (m.content) |c| switch (c) {
+            .thinking => |t| try reasoning.appendSlice(allocator, t),
+            else => {},
+        };
+        if (reasoning.items.len > 0) {
+            try out.appendSlice(allocator, ",\"reasoning_content\":");
+            try util_json.serializeString(reasoning.items, out, allocator);
+        }
+    }
     // assistant tool_use → tool_calls
     if (has_tool_use) {
         try out.appendSlice(allocator, ",\"tool_calls\":[");

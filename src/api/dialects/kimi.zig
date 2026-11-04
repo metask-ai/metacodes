@@ -29,14 +29,15 @@
 //!
 //! ## 回传与缓存
 //!
-//! - 文档要求带 tool_calls 的 assistant 消息**原样带回 `reasoning_content`**。本仓库目前
-//!   不回传历史思考(`agent_loop.buildApiMessages` 不投影 thinking 块),见"已知差异"。
+//! - 文档要求带 tool_calls 的 assistant 消息**原样带回 `reasoning_content`**。本方言声明
+//!   `echoes_reasoning_content`,序列化器把 assistant 历史的 thinking 块作为
+//!   `reasoning_content` 发回(三代都发;K2.6 在 `keep` 为 null 时服务端忽略它)。
 //! - `prompt_cache_key`:profile 声明支持(`supports_prompt_cache_key`),请求覆盖里有 key
 //!   时才发;Kimi Code 订阅要求必发。
 //!
 //! ## 已知差异
 //!
-//! - 不回传 `reasoning_content`:多轮工具调用时服务端拿不到上一步的思考。
+//! - 回传的是会话里存的思考文本,换过模型的会话里也包括别的模型的思考。
 //! - 输出上限字段是 `max_completion_tokens`(`max_tokens` 已弃用);本仓库的 OpenAI
 //!   chat 序列化器两者都不发,用服务端默认。
 //! - 旧名推断里 `k2` 子串会认成 Kimi:那是没声明方言的路由的兼容行为,声明了方言的
@@ -95,6 +96,7 @@ pub fn openaiProfile(model: []const u8) ModelProfile {
             .effort_levels = .kimi_3,
             .supports_prompt_cache_key = true,
             .returns_reasoning_content = true,
+            .echoes_reasoning_content = true,
             .cannot_disable_thinking = true,
         },
         .k2_classic => .{
@@ -102,6 +104,7 @@ pub fn openaiProfile(model: []const u8) ModelProfile {
             .effort_levels = .kimi_k2_3,
             .supports_prompt_cache_key = true,
             .returns_reasoning_content = true,
+            .echoes_reasoning_content = true,
             .preserved_thinking_default = false, // keep="all"
         },
         .k2_always_on => .{
@@ -109,6 +112,7 @@ pub fn openaiProfile(model: []const u8) ModelProfile {
             .effort_levels = .none_,
             .supports_prompt_cache_key = true,
             .returns_reasoning_content = true,
+            .echoes_reasoning_content = true,
             .preserved_thinking_default = false,
             .cannot_disable_thinking = true,
         },
@@ -237,6 +241,12 @@ test "Kimi: reasoning_content 解析(含结尾转义反斜杠),prompt_cache_key 
     defer out.deinit(a);
     try std.testing.expect(try d.serializePromptCacheKey(d.profileFor(.openai, "kimi-k3"), "sess-1", &out, a));
     try std.testing.expectEqualStrings(",\"prompt_cache_key\":\"sess-1\"", out.items);
+}
+
+test "Kimi: 三代都回传 reasoning_content" {
+    for ([_][]const u8{ "kimi-k3", "kimi-k2.6", "kimi-k2.7-code" }) |model| {
+        try std.testing.expect(openaiProfile(model).echoes_reasoning_content);
+    }
 }
 
 test "Kimi 按名推断只在 OpenAI wire 上" {

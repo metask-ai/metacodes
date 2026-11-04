@@ -4539,7 +4539,9 @@ fn buildApiMessages(
     }
 
     for (conversation.activeMessages()) |m| {
-        // thinking block 不回 API(模型自己产);先算实际要回的 block 数
+        // thinking 块随消息投影,由方言决定是否上 wire(`ModelProfile.echoes_reasoning_content`):
+        // DeepSeek 要求回传历史思考,Claude 拒收无签名的 thinking 块,其余方言忽略它。
+        // 它和 reasoning_item 一样**不足以**撑起一条消息。
         var n_actual: usize = 0;
         // reasoning_item 是 provider 私有的续传状态,不是"内容":只有 OpenAI
         // Responses 序列化器会用它,别的方言整块跳过。它单独存在时**不足以**
@@ -4548,8 +4550,7 @@ fn buildApiMessages(
         // 这里是针对外部/未来版本 transcript 的防线,而不是热路径。
         var n_substantive: usize = 0;
         for (m.blocks) |b| switch (b) {
-            .thinking => {},
-            .reasoning_item => n_actual += 1,
+            .thinking, .reasoning_item => n_actual += 1,
             else => {
                 n_actual += 1;
                 n_substantive += 1;
@@ -4573,7 +4574,7 @@ fn buildApiMessages(
                 } },
                 .image => |img| .{ .image = .{ .media_type = img.media_type, .data = img.data } },
                 .reasoning_item => |item| .{ .reasoning_item = .{ .model = item.model, .json = item.json } },
-                .thinking => continue, // 不发回 API
+                .thinking => |t| .{ .thinking = t }, // 借用;是否上 wire 由方言决定
             };
             contents[idx] = c;
             idx += 1;

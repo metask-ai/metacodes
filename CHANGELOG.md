@@ -24,6 +24,17 @@ status, compatibility boundaries, and entry points are defined by
   whatever the upstream model is called. A `deepseek/...` model through OpenRouter
   no longer gets DeepSeek's native `thinking` fields.
 
+### Fixed
+
+- **DeepSeek and Kimi get their reasoning back.** DeepSeek answers 400 when a
+  request with tools lacks the `reasoning_content` of earlier turns, and Kimi's
+  documentation requires it with tool calls; neither was ever sent. The
+  conversation's thinking blocks now reach the dialect, and a dialect that
+  declares passback (`ModelProfile.echoes_reasoning_content`: DeepSeek, Kimi,
+  OpenRouter) sends them as `reasoning_content` on assistant history — or, on
+  DeepSeek's Anthropic endpoint, as thinking blocks. Every other dialect's request
+  bytes are unchanged; Claude never receives an unsigned thinking block.
+
 ### Changed
 
 - **One integration file per model vendor.** The OpenAI-compatible dialects that

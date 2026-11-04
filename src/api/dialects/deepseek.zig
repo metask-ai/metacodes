@@ -38,10 +38,11 @@
 //! ## 回传与缓存
 //!
 //! - **请求带 tools 时,历史各轮的 `reasoning_content` 必须全部回传,否则 400**(即使那一轮
-//!   没调工具)。本仓库目前不回传历史思考(`agent_loop.buildApiMessages` 不投影 thinking
-//!   块):这是已知缺口,开启思考的多轮工具调用会被拒。
-//! - Anthropic wire 上文档同样要求原样带回 thinking 块;服务端能从 tool-call id 恢复缺失的
-//!   思考,但恢复失败也是 400。
+//!   没调工具)。OpenAI chat wire 上本方言声明 `echoes_reasoning_content`,序列化器把
+//!   assistant 消息的 thinking 块作为 `reasoning_content` 发回。
+//! - Anthropic wire 上文档要求原样带回 thinking 块(DeepSeek 不校验签名);服务端能从
+//!   tool-call id 恢复缺失的思考,但恢复失败也是 400。本方言同样声明回传,序列化器把
+//!   thinking 块按 `{"type":"thinking","thinking":...}` 发回。
 //! - 缓存:服务端自动前缀缓存;Anthropic wire 上的 `cache_control` 被忽略。
 //!
 //! ## 已知差异
@@ -94,6 +95,7 @@ pub fn openaiProfile(model: []const u8) ModelProfile {
         .thinking_mode = .deepseek_top,
         .effort_levels = .deepseek_2,
         .returns_reasoning_content = true,
+        .echoes_reasoning_content = true,
     };
 }
 
@@ -145,9 +147,18 @@ const Messages = struct {
         try out.appendSlice(a, "},\"thinking\":{\"type\":\"enabled\"}");
     }
 
+    /// Anthropic wire 的 profile,加上 thinking 块回传(DeepSeek 收无签名的 thinking 块)。
+    fn messagesProfile(ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile {
+        _ = ctx;
+        var p = model_adapter.profileFor(kind, model);
+        p.echoes_reasoning_content = true;
+        return p;
+    }
+
     const dialect = blk: {
         var d = claude.wire;
         d.serializeThinkingFn = serializeThinking;
+        d.profileFn = messagesProfile;
         break :blk d;
     };
 };
@@ -195,10 +206,11 @@ test "DeepSeek Anthropic wire: output_config.effort 用 DeepSeek 词汇,不发 a
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
-test "DeepSeek: 声明的路由用 DeepSeek 家族 profile,解析 reasoning_content 增量" {
+test "DeepSeek: 回传 reasoning_content(profile 声明),解析 reasoning_content 增量" {
     const a = std.testing.allocator;
     const d = dialect(.openai, "deepseek-flash").?;
-    try std.testing.expect(d.profileFor(.openai, "my-relay-name").returns_reasoning_content);
+    try std.testing.expect(d.profileFor(.openai, "deepseek-flash").echoes_reasoning_content);
+    try std.testing.expect(d.profileFor(.openai, "my-relay-name").echoes_reasoning_content);
     const got = (try d.extractThinkingDelta("{\"delta\":{\"reasoning_content\":\"a\\nb\\t\\u4f60\"}}", a)).?;
     defer a.free(got);
     try std.testing.expectEqualStrings("a\nb\t你", got);

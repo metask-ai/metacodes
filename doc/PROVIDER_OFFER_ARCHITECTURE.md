@@ -125,6 +125,14 @@ from the model name — the behaviour before routes could say — so a custom
 provider written for that keeps working. A runtime plugin's dialect for a model
 still wins over the route's declaration.
 
+Reasoning passback is the dialect's decision too. `buildApiMessages` projects
+the conversation's thinking blocks; a dialect that declares
+`ModelProfile.echoes_reasoning_content` sends them back (DeepSeek, which
+returns 400 without them once tools are present; Kimi, whose documentation
+requires them with tool calls; and OpenRouter), and every
+other dialect leaves the request bytes exactly as before. Claude never receives
+an unsigned thinking block.
+
 ## Conservative metadata
 
 Every optional field means *unknown*, and unknown never resolves in the

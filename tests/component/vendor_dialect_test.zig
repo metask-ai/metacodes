@@ -4,6 +4,10 @@
 //! transport: the startup route through the client factory, a `/model` switch
 //! inside a running App, and the child-agent registry.
 //!
+//! Also: the DeepSeek dialect's reasoning passback reaches the wire as
+//! `reasoning_content` on assistant history, and a dialect that does not
+//! declare passback keeps the request bytes free of thinking.
+//!
 //! Mock transport only: no provider-backed calls.
 
 const std = @import("std");
@@ -221,4 +225,78 @@ test "L2 dialect: the startup route of a built-in vendor reaches the factory-bui
     // carries GLM's thinking switch, not the OpenAI-native top-level effort only.
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"},\"clear_thinking\":false,\"reasoning_effort\":\"high\"") != null);
+}
+
+fn historyWithThinking(conv: *cc.conversation.Conversation, a: std.mem.Allocator) !void {
+    try conv.appendText(.user, "list the files");
+    const assistant = try a.alloc(cc.core_message.Block, 2);
+    assistant[0] = .{ .thinking = try a.dupe(u8, "plan: call Glob first") };
+    assistant[1] = .{ .tool_use = .{ .id = try a.dupe(u8, "call_1"), .name = try a.dupe(u8, "Glob"), .input = try a.dupe(u8, "{\"pattern\":\"*\"}") } };
+    try conv.append(.{ .role = .assistant, .blocks = assistant });
+    const result = try a.alloc(cc.core_message.Block, 1);
+    result[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "call_1"), .content = try a.dupe(u8, "a.txt"), .is_error = false } };
+    try conv.append(.{ .role = .user, .blocks = result });
+}
+
+fn runOneTurn(conv: *cc.conversation.Conversation, provider: cc.api_provider.Provider, a: std.mem.Allocator) !void {
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try cc.agent_loop.run(conv, provider, &.{}, &perm, .{
+        .max_turns = 1,
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+}
+
+test "L2 dialect: DeepSeek gets the assistant's thinking back as reasoning_content, OpenAI does not" {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+
+    inline for (.{ .{ Vendor.deepseek, true }, .{ Vendor.openai, false } }) |case| {
+        var server = try harness.MockServer.startCassette(&.{OPENAI_END_TURN_SSE}, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "key", "house-model", url);
+        defer client.deinit();
+        client.dialect_vendor = case[0];
+
+        var conv = cc.conversation.Conversation.init(a);
+        defer conv.deinit();
+        try historyWithThinking(&conv, a);
+        try runOneTurn(&conv, client.provider(), a);
+
+        const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+        const echoed = std.mem.indexOf(u8, body, "\"reasoning_content\":\"plan: call Glob first\"") != null;
+        try std.testing.expectEqual(case[1], echoed);
+        // Whichever dialect, the thinking never leaks into visible content.
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"plan: call Glob first\"") == null);
+    }
+}
+
+test "L2 dialect: Claude never receives an unsigned thinking block; DeepSeek's Anthropic wire does" {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+
+    inline for (.{ .{ @as(?Vendor, null), "claude-sonnet-4-6", false }, .{ @as(?Vendor, .deepseek), "deepseek-v4-pro", true } }) |case| {
+        var server = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "key", case[1], url);
+        defer client.deinit();
+        client.dialect_vendor = case[0];
+
+        var conv = cc.conversation.Conversation.init(a);
+        defer conv.deinit();
+        try historyWithThinking(&conv, a);
+        try runOneTurn(&conv, client.provider(), a);
+
+        const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+        const echoed = std.mem.indexOf(u8, body, "{\"type\":\"thinking\",\"thinking\":\"plan: call Glob first\"}") != null;
+        try std.testing.expectEqual(case[2], echoed);
+    }
 }

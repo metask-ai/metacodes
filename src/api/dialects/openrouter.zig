@@ -27,8 +27,8 @@
 //! ## 回传与缓存
 //!
 //! - 文档建议工具调用时把推理回传(`message.reasoning`,`reasoning_content` 是别名)。
-//!   本仓库目前不回传历史思考;挂在 DeepSeek 这类"带工具时必须回传"的上游后面时,这是
-//!   已知缺口。
+//!   本方言声明 `echoes_reasoning_content`,以 `reasoning_content` 回传 thinking 块——
+//!   挂在 DeepSeek 这类"带工具时必须回传"的上游后面时,这是必要的。
 //! - 缓存:由上游决定;本方言不发 `prompt_cache_key`。
 //!
 //! ## 已知差异
@@ -76,6 +76,7 @@ pub fn openaiProfile(model: []const u8) ModelProfile {
         .thinking_mode = .openai_effort,
         .effort_levels = .full,
         .returns_reasoning_content = true,
+        .echoes_reasoning_content = true,
         .supports_image_input = family orelse false,
         .image_input_source = if (family != null) .model_family else .unknown,
     };
@@ -138,7 +139,8 @@ test "OpenRouter: 解析 delta.reasoning,不把 reasoning_details 当文本" {
     try std.testing.expectEqualStrings("r", legacy);
 }
 
-test "OpenRouter: 不参与按名推断,图像按家族表" {
+test "OpenRouter: 不参与按名推断,回传推理" {
     try std.testing.expect(!claims(.openai, "openrouter/auto"));
+    try std.testing.expect(openaiProfile("anthropic/claude-sonnet-4").echoes_reasoning_content);
     try std.testing.expect(openaiProfile("anthropic/claude-sonnet-4").supports_image_input);
 }

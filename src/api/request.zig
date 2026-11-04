@@ -330,6 +330,10 @@ fn serializeContent(
     var first = true;
     for (content) |block| {
         if (block == .reasoning_item) continue;
+        // thinking 块只回传给声明了回传的方言(DeepSeek 的 Anthropic 端点收无签名的
+        // thinking 块);Claude 拒收没有签名的 thinking 块,而签名没有保存。不回传时
+        // 请求字节与投影 thinking 之前逐字节相同。
+        if (block == .thinking and !profile.echoes_reasoning_content) continue;
         if (!first) try buf.append(allocator, ',');
         first = false;
         switch (block) {
@@ -341,8 +345,7 @@ fn serializeContent(
                 try buf.append(allocator, '}');
             },
             .thinking => |t| {
-                // preserved thinking 回传(Anthropic):thinking block 必须原样、按序回传。
-                // 对齐 Claude Opus 4.5+:保留 thinking 提升多轮推理质量。
+                // 只有声明了回传的方言走到这里(见上方 continue)。
                 try buf.append(allocator, '{');
                 try buf.appendSlice(allocator, "\"type\":\"thinking\",\"thinking\":");
                 try util_json.serializeString(t, buf, allocator);
