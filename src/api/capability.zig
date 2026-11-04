@@ -20,6 +20,7 @@ pub const ProviderKind = enum {
     anthropic,
     openai,
     gemini,
+    bedrock,
     other, // 尚未实现的 provider:能力保守 false(避免发它不认的请求)。
 };
 
@@ -30,7 +31,21 @@ pub fn supports(kind: ProviderKind, model: []const u8, cap: Capability) bool {
         .anthropic => anthropicSupports(model, cap),
         .openai => openaiSupports(model, cap),
         .gemini => geminiSupports(model, cap),
+        .bedrock => bedrockSupports(model, cap),
         .other => false,
+    };
+}
+
+/// Bedrock Converse: tools, structured output via tools, cache points on
+/// Claude, reasoning returned as `reasoningContent` blocks (not a peer field).
+fn bedrockSupports(model: []const u8, cap: Capability) bool {
+    return switch (cap) {
+        .prompt_cache => hasSubstr(model, "claude"),
+        .web_search, .server_tool => false,
+        .extended_thinking => hasSubstr(model, "claude"),
+        .structured_output => false,
+        .reasoning_content => false,
+        .image_input => model_adapter.profileFor(.bedrock, model).supports_image_input,
     };
 }
 

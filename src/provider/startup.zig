@@ -355,6 +355,7 @@ fn wireProtocol(wire: profile_mod.Protocol.Wire) profile_mod.Protocol {
         .openai_chat => .openai_chat,
         .openai_responses => .openai_responses,
         .gemini_generate_content => .gemini_generate_content,
+        .bedrock_converse => .bedrock_converse,
     };
 }
 

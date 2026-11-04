@@ -110,6 +110,7 @@ and `dialects/registry.zig` fails a test when one is missing.
 | MiniMax | `src/api/dialects/minimax.zig` | `minimax` |
 | Mistral | `src/api/dialects/mistral.zig` | — |
 | OpenRouter | `src/api/dialects/openrouter.zig` | catalog only |
+| Amazon Bedrock (Converse wire) | `src/api/dialects/bedrock.zig` | `bedrock`, and catalogs |
 
 The OpenAI chat building blocks every compatible vendor shares are
 `src/api/dialects/openai_compat.zig`.
@@ -131,7 +132,35 @@ the conversation's thinking blocks; a dialect that declares
 returns 400 without them once tools are present; Kimi, whose documentation
 requires them with tool calls; and OpenRouter), and every
 other dialect leaves the request bytes exactly as before. Claude never receives
-an unsigned thinking block.
+an unsigned thinking block. Bedrock keeps the *signed* reasoning of a tool turn
+in its client and puts it back in front of that turn.
+
+## Amazon Bedrock
+
+`bedrock_converse` is a wire of its own: Converse JSON requests, answered with
+the AWS event-stream binary framing (`src/api/aws_event_stream.zig`, both CRCs
+checked) instead of SSE. Like Gemini, the channel declares an origin and the
+transport appends `/model/{modelId}/converse-stream`. The built-in `bedrock`
+profile has one channel per region and authenticates with a Bedrock API key
+(`AWS_BEARER_TOKEN_BEDROCK`, sent as a bearer); SigV4 is not implemented.
+
+The authoritative model list of an account is its catalog, ingested the way
+OpenRouter's is: ListFoundationModels and ListInferenceProfiles documents
+become one channel whose every usable model and cross-region inference profile
+is an offer, each declaring its dialect from the catalog's `providerName`:
+
+```json
+"provider_catalogs": {
+  "bedrock-us": {"kind": "bedrock", "region": "us-east-1",
+                 "foundation_models_file": "…/foundation-models.json",
+                 "inference_profiles_file": "…/inference-profiles.json"}
+}
+```
+
+The documents are what
+`GET https://bedrock.<region>.amazonaws.com/foundation-models` and
+`GET https://bedrock.<region>.amazonaws.com/inference-profiles?type=SYSTEM_DEFINED&maxResults=1000`
+return with the same API key as a bearer.
 
 ## Conservative metadata
 
@@ -863,9 +892,12 @@ see *Stored API keys and the guided key login*).
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
+| `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
 | `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
 | `src/api/dialects/<vendor>.zig` | one vendor's dialect; its header is the integration document |
 | `src/api/dialects/registry.zig` | vendor → dialect file, name inference, the header contract test |
+| `src/api/bedrock_client.zig` | Bedrock Converse transport, signed-reasoning store |
+| `src/api/aws_event_stream.zig` | AWS event-stream framing (decode, CRC checks) |
 | `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
 | `src/provider/api_key_store.zig` | provider-scoped API keys at rest, one 0600 file per provider |
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
@@ -906,6 +938,17 @@ application.
 
 Listed rather than left silent. Each is a decision with a reason, not an
 omission — and none of them is an acceptance criterion of the issue.
+
+- **Bedrock SigV4 and AWS profiles.** The Bedrock transport authenticates with
+  a Bedrock API key only; access keys, session tokens and `~/.aws` profiles
+  need request signing, which is not written.
+- **Bedrock over the AgentCore C ABI and to sealed Skills.** ABI v1 has no
+  provider code for Bedrock (adding one is an ABI revision), and the sealed
+  gateway's route spec does not carry the declared dialect, so a sealed Skill
+  on a declared route falls back to model-name inference.
+- **Thinking fields for non-Claude models on Bedrock.** DeepSeek, Qwen, Kimi
+  and MiniMax on Bedrock think by their own defaults; only Claude and gpt-oss
+  get fields in `additionalModelRequestFields`.
 
 - **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
   signed adapter reference, which needs review and signing infrastructure. The

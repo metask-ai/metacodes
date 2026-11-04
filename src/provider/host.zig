@@ -19,6 +19,7 @@ const config_store = @import("config_store.zig");
 const custom_provider = @import("custom_provider.zig");
 const config_doc = @import("config_doc.zig");
 const openrouter = @import("openrouter.zig");
+const bedrock_catalog = @import("bedrock_catalog.zig");
 const offer_mod = @import("offer.zig");
 const profile_mod = @import("profile.zig");
 const metask_profile = @import("profiles/metask.zig");
@@ -163,7 +164,7 @@ pub const Host = struct {
         self.refresh() catch return error.OutOfMemory;
     }
 
-    pub const IngestError = openrouter.AdapterError || registry_mod.RegisterError;
+    pub const IngestError = openrouter.AdapterError || bedrock_catalog.AdapterError || registry_mod.RegisterError;
 
     /// Ingest a provider catalog: one `GET /models` document plus one
     /// `GET /models/{id}/endpoints` document per model the caller cares about.
@@ -371,6 +372,54 @@ pub const Host = struct {
         self.kernel.adoptCatalog(&self.catalog);
     }
 
+    /// Ingest one Bedrock region's catalog: a ListFoundationModels document
+    /// and a ListInferenceProfiles document (`bedrock_catalog.zig`).
+    ///
+    /// The provider is a configured instance (`provider_id`), never the
+    /// built-in `bedrock` profile: a runtime source may replace its own
+    /// registration, not a built-in one. Like `ingestOpenRouter`, the bytes come
+    /// from the caller; this kernel does not fetch.
+    pub fn ingestBedrock(
+        self: *Host,
+        provider_id: Slug,
+        region: []const u8,
+        foundation_models_json: []const u8,
+        inference_profiles_json: ?[]const u8,
+    ) IngestError!void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
+        const scratch = arena.allocator();
+
+        const models = try bedrock_catalog.parseFoundationModels(scratch, foundation_models_json);
+        const profiles = if (inference_profiles_json) |json| try bedrock_catalog.parseInferenceProfiles(scratch, json) else &.{};
+        const channels = try scratch.alloc(profile_mod.ChannelDescriptor, 1);
+        channels[0] = try bedrock_catalog.buildChannel(scratch, region, models, profiles);
+
+        const kinds = try scratch.alloc(profile_mod.CredentialKind, 1);
+        kinds[0] = .api_key;
+        const aliases = try scratch.alloc(profile_mod.EnvAlias, 1);
+        aliases[0] = .{ .name = "AWS_BEARER_TOKEN_BEDROCK", .kind = .api_key, .canonical = true };
+
+        const built = profile_mod.ProviderProfile{
+            .id = provider_id,
+            .implementation_id = Slug.lit("bedrock"),
+            .display_name = "Amazon Bedrock (catalog)",
+            .channels = channels,
+            .accepted_credential_kinds = kinds,
+            .env_aliases = aliases,
+            .auth = .bearer,
+            .default_channel = channels[0].id,
+        };
+        try self.registry.checkUpsert(built);
+        try self.registry.reserve(1);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
+        self.registry.upsertAssumeCapacity(built);
+        self.catalog_arenas.appendAssumeCapacity(arena);
+        moved = true;
+        self.refresh() catch return error.OutOfMemory;
+    }
+
     /// Ingest provider catalogs named by the configuration.
     ///
     /// The documents are read from disk rather than fetched, on purpose: this
@@ -379,11 +428,14 @@ pub const Host = struct {
     /// parsing, the offer construction, and the events are identical either
     /// way, so wiring a fetcher later changes only where the bytes come from.
     ///
-    /// Shape:
+    /// Shape (`kind` defaults to `openrouter`):
     /// ```json
     /// "provider_catalogs": {
     ///   "openrouter": {"models_file": "…/models.json",
-    ///                  "endpoint_files": ["…/deepseek.json"]}
+    ///                  "endpoint_files": ["…/deepseek.json"]},
+    ///   "bedrock-us": {"kind": "bedrock", "region": "us-east-1",
+    ///                  "foundation_models_file": "…/foundation-models.json",
+    ///                  "inference_profiles_file": "…/inference-profiles.json"}
     /// }
     /// ```
     pub fn ingestConfiguredCatalogs(self: *Host, text: []const u8) IngestError!void {
@@ -404,6 +456,19 @@ pub const Host = struct {
             const provider_id = Slug.parse(pair.key_ptr.*) catch return error.InvalidSlug;
             const entry = pair.value_ptr.*;
             if (entry != .object) return error.InvalidDocument;
+            const kind = stringField(entry.object.get("kind")) orelse "openrouter";
+            if (std.mem.eql(u8, kind, "bedrock")) {
+                const region = stringField(entry.object.get("region")) orelse return error.InvalidDocument;
+                const models_path = stringField(entry.object.get("foundation_models_file")) orelse return error.InvalidDocument;
+                const models_json = readFile(arena, models_path) catch return error.InvalidDocument;
+                const profiles_json: ?[]const u8 = if (stringField(entry.object.get("inference_profiles_file"))) |path|
+                    readFile(arena, path) catch return error.InvalidDocument
+                else
+                    null;
+                try self.ingestBedrock(provider_id, region, models_json, profiles_json);
+                continue;
+            }
+            if (!std.mem.eql(u8, kind, "openrouter")) return error.InvalidDocument;
             const models_path = stringField(entry.object.get("models_file")) orelse return error.InvalidDocument;
             const models_json = readFile(arena, models_path) catch return error.InvalidDocument;
 
@@ -755,6 +820,32 @@ test "an ingested catalog becomes offers, and its prices and health become event
     try std.testing.expect(saw_catalog);
     try std.testing.expect(saw_pricing);
     try std.testing.expect(saw_degraded);
+}
+
+test "a Bedrock catalog becomes Converse offers that declare each model's dialect" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestBedrock(
+        Slug.lit("bedrock-us"),
+        "us-east-1",
+        bedrock_catalog.SAMPLE_FOUNDATION_MODELS,
+        bedrock_catalog.SAMPLE_INFERENCE_PROFILES,
+    );
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("bedrock-us")) continue;
+        seen += 1;
+        try std.testing.expectEqual(profile_mod.Protocol.Wire.bedrock_converse, item.wire.?);
+        try std.testing.expectEqualStrings("https://bedrock-runtime.us-east-1.amazonaws.com", item.endpoint_ref);
+        if (std.mem.eql(u8, item.request_model_id, "us.anthropic.claude-sonnet-4-6"))
+            try std.testing.expectEqual(@import("vendor.zig").Vendor.claude, item.dialect.?);
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+    // A refresh replaces its own registration rather than failing on it.
+    try host.ingestBedrock(Slug.lit("bedrock-us"), "us-east-1", bedrock_catalog.SAMPLE_FOUNDATION_MODELS, null);
+    // The built-in profile's id cannot be taken over by a catalog.
+    try std.testing.expect(std.meta.isError(host.ingestBedrock(Slug.lit("bedrock"), "us-east-1", bedrock_catalog.SAMPLE_FOUNDATION_MODELS, null)));
 }
 
 test "a pinned offer survives an unrelated catalog ingest" {

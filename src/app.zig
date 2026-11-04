@@ -102,6 +102,7 @@ const api_keys_mod = @import("api/api_keys.zig");
 const models_cache_mod = @import("api/models_cache.zig");
 const openai_mod = @import("api/openai_client.zig");
 const gemini_mod = @import("api/gemini_client.zig");
+const bedrock_mod = @import("api/bedrock_client.zig");
 const provider_host_mod = @import("provider/host.zig");
 const provider_binding_mod = @import("provider/runtime_binding.zig");
 const provider_api_key_store = @import("provider/api_key_store.zig");
@@ -496,6 +497,8 @@ pub const App = struct {
     openai_client: ?openai_mod.OpenAIClient = null,
     /// Gemini 后端(config.provider_kind==.gemini 时非 null)。持有状态缓存句柄表(C3)。
     gemini_client: ?gemini_mod.GeminiClient = null,
+    /// Bedrock Converse backend (config.provider_kind==.bedrock 时非 null)。
+    bedrock_client: ?bedrock_mod.BedrockClient = null,
     /// Held while a route switch builds a transport client and while it moves
     /// `config.provider_kind`, and by `cancelInFlightRequest`: another thread
     /// calling `provider()` would otherwise read the new kind before the new
@@ -776,6 +779,12 @@ pub const App = struct {
             app.gemini_client = gemini_mod.GeminiClient.init(allocator, io, api_key, config.model, config.base_url);
             app.gemini_client.?.overrides = buildOverridesFromConfig(config);
         }
+        // Bedrock 后端:仅当 provider_kind==.bedrock 才建(Converse + AWS event stream)。
+        if (config.provider_kind == .bedrock) {
+            app.bedrock_client = bedrock_mod.BedrockClient.init(allocator, io, api_key, config.model, config.base_url);
+            app.bedrock_client.?.overrides = buildOverridesFromConfig(config);
+            app.bedrock_client.?.reasoning_effort = config.reasoning_effort;
+        }
 
         // A Metask login is process-scoped: retain the same Session object
         // used by turn-boundary refresh so a gateway 401 can force-refresh the
@@ -831,6 +840,11 @@ pub const App = struct {
         if (app.gemini_client) |*client| {
             client.dialect_resolver = app_dialect_resolver;
             client.dialect_vendor = config.dialect;
+        }
+        if (app.bedrock_client) |*client| {
+            client.dialect_resolver = app_dialect_resolver;
+            client.dialect_vendor = config.dialect;
+            client.auth_scheme = config.auth_scheme;
         }
         const plugin_skill_sources = if (app.plugin_snapshot) |snapshot| snapshot.skill_sources else &.{};
         const plugin_agent_sources = if (app.plugin_snapshot) |snapshot| snapshot.agent_sources else &.{};
@@ -943,6 +957,9 @@ pub const App = struct {
             client.model_context = &app.model_context;
         }
         if (app.gemini_client) |*client| {
+            client.model_context = &app.model_context;
+        }
+        if (app.bedrock_client) |*client| {
             client.model_context = &app.model_context;
         }
 
@@ -1186,6 +1203,7 @@ pub const App = struct {
             .anthropic => app.api_client.provider(),
             .openai => app.openai_client.?.provider(),
             .gemini => app.gemini_client.?.provider(),
+            .bedrock => app.bedrock_client.?.provider(),
         };
     }
 
@@ -1200,6 +1218,7 @@ pub const App = struct {
             .anthropic => app.api_client.model,
             .openai => app.openai_client.?.model,
             .gemini => app.gemini_client.?.model,
+            .bedrock => app.bedrock_client.?.model,
         };
     }
 
@@ -1266,6 +1285,7 @@ pub const App = struct {
         if (app.pending_previous_model_for_compact) |m| app.allocator.free(m);
         if (app.openai_client) |*oc| oc.deinit();
         if (app.gemini_client) |*gc| gc.deinit();
+        if (app.bedrock_client) |*bc| bc.deinit();
         app.file_change_journal.deinit();
         app.conversation.deinit();
         if (app.kg) |*k| k.deinit();
@@ -2099,6 +2119,19 @@ pub const App = struct {
                     app.gemini_client.?.dialect_resolver = app.api_client.dialect_resolver;
                     app.gemini_client.?.overrides = buildOverridesFromConfig(app.config);
                 },
+                .bedrock => if (app.bedrock_client == null) {
+                    app.bedrock_client = bedrock_mod.BedrockClient.init(
+                        app.allocator,
+                        io,
+                        secret,
+                        binding.request_model_id,
+                        endpoint,
+                    );
+                    app.bedrock_client.?.dialect_resolver = app.api_client.dialect_resolver;
+                    app.bedrock_client.?.overrides = buildOverridesFromConfig(app.config);
+                    app.bedrock_client.?.reasoning_effort = app.config.reasoning_effort;
+                    app.bedrock_client.?.model_context = &app.model_context;
+                },
             }
         }
 
@@ -2141,6 +2174,12 @@ pub const App = struct {
         if (app.gemini_client) |*client| {
             client.credential = .{ .fixed = secret };
             client.base_url = endpoint;
+            client.dialect_vendor = binding.dialect;
+        }
+        if (app.bedrock_client) |*client| {
+            client.credential = .{ .fixed = secret };
+            client.base_url = endpoint;
+            client.auth_scheme = binding.auth_scheme;
             client.dialect_vendor = binding.dialect;
         }
         // Every out-of-process UI learns the *route*, not just the model name: a
@@ -2191,6 +2230,7 @@ pub const App = struct {
         app.api_client.credential = .{ .fixed = owned };
         if (app.openai_client) |*oc| oc.credential = .{ .fixed = owned };
         if (app.gemini_client) |*gc| gc.credential = .{ .fixed = owned };
+        if (app.bedrock_client) |*bc| bc.credential = .{ .fixed = owned };
         if (app.agent_jobs) |*aj| try aj.setApiKey(owned);
 
         app.api_client.catalog.deinit();
@@ -2205,7 +2245,7 @@ pub const App = struct {
     /// answers as they reach the Anthropic client's (issue #273). A failed
     /// copy keeps the previous one: the family table still answers.
     fn syncClientCatalogs(app: *App) void {
-        inline for (.{ &app.openai_client, &app.gemini_client }) |slot| {
+        inline for (.{ &app.openai_client, &app.gemini_client, &app.bedrock_client }) |slot| {
             if (slot.*) |*client| sync: {
                 const copy = app.api_client.catalog.clone(app.allocator) catch |err| {
                     @import("util/log.zig").warn("catalog", "client catalog copy failed: {s}", .{@errorName(err)});
@@ -2235,7 +2275,7 @@ pub const App = struct {
     /// **U3 单一真理源写侧 seam**:把 model 同步到全部值镜像。抽成独立函数(不依赖 io/App
     /// 整体)以便 L2 锁"所有镜像同步"不变式——纯 grep 验证会漏(swarm.model 就漏过,Linus U3 抓)。
     /// 镜像清单(加/删 model 存储处必改此表 + 对应断言):
-    ///   api_client / openai_client / gemini_client —— 各 provider 的 client.model(请求真理源,借用)
+    ///   api_client / openai_client / gemini_client / bedrock_client —— 各 provider 的 client.model(请求真理源,借用)
     ///   transcript_writer.model —— meta.json 记 flush 时 model(借用)
     ///   agent_jobs —— subagent 用(内部 dupe 自持;OOM 可失败,故放最前)
     ///   swarm.model —— teammate spawn 无 override 时的 provider model(借用;U3 前漏同步→teammate 跑陈旧启动 model)
@@ -2246,6 +2286,7 @@ pub const App = struct {
         api_client: *client_mod.Client,
         openai_client: ?*openai_mod.OpenAIClient,
         gemini_client: ?*gemini_mod.GeminiClient,
+        bedrock_client: ?*bedrock_mod.BedrockClient,
         transcript_writer: ?*transcript.Writer,
         agent_jobs: ?*@import("core/agent_job_registry.zig").AgentJobRegistry,
         swarm: *@import("swarm/context.zig").SwarmContext,
@@ -2255,6 +2296,7 @@ pub const App = struct {
         api_client.setModel(model); // task#13:锁内写 {ptr,len},不与后台降级路径读撕裂
         if (openai_client) |oc| oc.model = model;
         if (gemini_client) |gc| gc.model = model;
+        if (bedrock_client) |bc| bc.model = model;
         if (transcript_writer) |w| w.model = model;
         swarm.model = model;
     }
@@ -2287,6 +2329,7 @@ pub const App = struct {
             &app.api_client,
             if (app.openai_client) |*oc| oc else null,
             if (app.gemini_client) |*gc| gc else null,
+            if (app.bedrock_client) |*bc| bc else null,
             if (app.transcript_writer) |*w| w else null,
             if (app.agent_jobs) |*aj| aj else null,
             &app.swarm,
@@ -2817,6 +2860,7 @@ pub const App = struct {
         app.api_client.credential = .{ .fixed = token };
         if (app.openai_client) |*client| client.credential = .{ .fixed = token };
         if (app.gemini_client) |*client| client.credential = .{ .fixed = token };
+        if (app.bedrock_client) |*client| client.credential = .{ .fixed = token };
         app.swarm.api_key = token;
         return true;
     }
@@ -4662,7 +4706,7 @@ test "U3 syncModelMirrors: 所有 model 镜像同步(含 swarm.model,Linus U3 �
     var swarm = @import("swarm/context.zig").SwarmContext{ .allocator = a, .model = "model-A" };
 
     // 切到 model-B:seam 必须把全部镜像刷成 B。
-    try App.syncModelMirrors("model-B", &client, null, null, null, &jobs, &swarm);
+    try App.syncModelMirrors("model-B", &client, null, null, null, null, &jobs, &swarm);
 
     try std.testing.expectEqualStrings("model-B", client.model);
     try std.testing.expectEqualStrings("model-B", jobs.model); // agent_jobs 内部 dupe

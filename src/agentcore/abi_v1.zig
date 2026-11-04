@@ -4933,6 +4933,9 @@ fn coreOpenAiProtocol(
             .chat_completions
         else
             null,
+        // Bedrock has no provider code on ABI v1 (`provider` never returns
+        // it); exposing it is an ABI revision.
+        .bedrock => null,
     };
 }
 

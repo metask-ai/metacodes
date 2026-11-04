@@ -142,6 +142,7 @@ pub fn bindOffer(
         .openai_chat => .openai_chat,
         .openai_responses => .openai_responses,
         .gemini_generate_content => .gemini_generate_content,
+        .bedrock_converse => .bedrock_converse,
     };
     const transport = try registry_mod.transportKindFor(protocol);
     const openai_protocol = switch (transport) {

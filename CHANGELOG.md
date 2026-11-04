@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Amazon Bedrock, native.** A `bedrock_converse` wire: Converse requests,
+  answered with the AWS event-stream binary framing (both CRCs checked) rather
+  than SSE. `--provider bedrock` has one channel per region and authenticates with
+  a Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`); SigV4 is not implemented. Claude
+  on Bedrock gets adaptive or budgeted thinking by model version, cache points,
+  and the signed reasoning of a tool turn back on the next request, which Bedrock
+  requires. An account's own catalog (ListFoundationModels and
+  ListInferenceProfiles) is ingested the way OpenRouter's is: `provider_catalogs`
+  with `"kind": "bedrock"`, one offer per usable model and inference profile,
+  each declaring its dialect from the catalog's `providerName`.
 - **Built-in DeepSeek, Kimi, Qwen and MiniMax providers.** `--provider deepseek |
   kimi | qwen | minimax` with the vendors' China and global channels on both the
   OpenAI and Anthropic wires, each route declaring the vendor's dialect, limits

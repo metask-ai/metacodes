@@ -108,7 +108,7 @@ install record, then `~/.metacodes` ([INSTALL_DESIGN.md](INSTALL_DESIGN.md)).
 
 metacodes is model-agnostic. `--provider` selects a provider profile
 (`metask`, `openai`, `gemini`, `zai-coding-plan`, `deepseek`, `kimi`, `qwen`,
-`minimax`, or one you define), `--channel` a route within it, and `--offer` pins one exact model route. `metacodes
+`minimax`, `bedrock`, or one you define), `--channel` a route within it, and `--offer` pins one exact model route. `metacodes
 --check-providers` validates the configuration and lists every route without
 touching the network. `--base-url`, `--api-key` and `--model` override the
 endpoint, key and model for a single run; `--openai-protocol responses`
@@ -117,8 +117,8 @@ channels, offers and typed credentials are specified in
 [PROVIDER_OFFER_ARCHITECTURE.md](PROVIDER_OFFER_ARCHITECTURE.md).
 
 Each built-in vendor reads its key from its own variable — `DEEPSEEK_API_KEY`,
-`MOONSHOT_API_KEY`, `DASHSCOPE_API_KEY`, `MINIMAX_API_KEY` — and its
-integration notes
+`MOONSHOT_API_KEY`, `DASHSCOPE_API_KEY`, `MINIMAX_API_KEY`,
+`AWS_BEARER_TOKEN_BEDROCK` (a Bedrock API key) — and its integration notes
 (endpoints, thinking parameters, known differences, sources) are the header of
 `src/api/dialects/<vendor>.zig`.
 

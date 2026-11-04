@@ -13,6 +13,7 @@ const std = @import("std");
 const client_mod = @import("../client.zig");
 const openai_mod = @import("openai_client.zig");
 const gemini_mod = @import("gemini_client.zig");
+const bedrock_mod = @import("bedrock_client.zig");
 const provider_mod = @import("provider.zig");
 const types = @import("../types.zig");
 const dialect_mod = @import("dialect.zig");
@@ -27,6 +28,7 @@ const OwnedClient = union(types.ProviderKind) {
     anthropic: *client_mod.Client,
     openai: *openai_mod.OpenAIClient,
     gemini: *gemini_mod.GeminiClient,
+    bedrock: *bedrock_mod.BedrockClient,
 };
 
 pub const OwnedProvider = struct {
@@ -45,6 +47,7 @@ pub const OwnedProvider = struct {
             .anthropic => |c| c.provider(),
             .openai => |c| c.provider(),
             .gemini => |c| c.provider(),
+            .bedrock => |c| c.provider(),
         };
     }
 
@@ -68,6 +71,10 @@ pub const OwnedProvider = struct {
                 a.destroy(c);
             },
             .gemini => |c| {
+                c.deinit();
+                a.destroy(c);
+            },
+            .bedrock => |c| {
                 c.deinit();
                 a.destroy(c);
             },
@@ -217,13 +224,32 @@ pub fn makeProviderWithOptions(
             c.host_capabilities = try options.capability_declarations.clone(a);
             break :blk .{ .gemini = c };
         },
+        .bedrock => blk: {
+            const c = try a.create(bedrock_mod.BedrockClient);
+            errdefer a.destroy(c);
+            c.* = bedrock_mod.BedrockClient.init(a, io_rt.io(), "", model, base_url);
+            c.credential = credential;
+            errdefer c.deinit();
+            c.dialect_resolver = dialect_resolver;
+            c.dialect_vendor = options.dialect;
+            c.auth_scheme = options.auth_scheme;
+            if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
+            if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
+            if (options.limits) |limits| {
+                if (limits.catalog) |catalog| c.catalog = try catalog.clone(a);
+                c.model_context = limits.model_context;
+                c.max_tokens_override = limits.max_tokens_override;
+            }
+            c.host_capabilities = try options.capability_declarations.clone(a);
+            break :blk .{ .bedrock = c };
+        },
     };
     return .{ .io = io_rt, .allocator = a, .client = owned };
 }
 
 test "makeProvider:三 kind 各造对应 client + provider() 出中立 vtable" {
     const a = std.testing.allocator;
-    inline for (.{ types.ProviderKind.anthropic, .openai, .gemini }) |k| {
+    inline for (.{ types.ProviderKind.anthropic, .openai, .gemini, .bedrock }) |k| {
         var op = try makeProvider(a, k, "test-key", "some-model", null);
         defer op.deinit();
         try std.testing.expectEqual(k, op.kind());

@@ -10,6 +10,7 @@
 //!   Anthropic messages)。环境变量 `METASK_API_KEY`。
 //! - 其它厂商的 Anthropic 兼容渠道(DeepSeek、Kimi、Qwen、MiniMax、Z.AI)在各自 profile 里;
 //!   没有专属 Anthropic 方言的厂商在这些渠道上用本方言。
+//! - Bedrock 上的 Claude 走 Converse wire,见 `bedrock.zig`。
 //!
 //! ## 协议
 //!

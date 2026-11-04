@@ -143,7 +143,15 @@ pub const ModelProfile = struct {
 };
 
 /// provider kind(与 capability.zig 对齐,但本模块独立持有以解耦)
-pub const ProviderKind = enum { anthropic, openai, gemini, other };
+pub const ProviderKind = enum {
+    anthropic,
+    openai,
+    gemini,
+    /// Amazon Bedrock Converse: one wire for every vendor Bedrock hosts; the
+    /// vendor-specific part travels in `additionalModelRequestFields`.
+    bedrock,
+    other,
+};
 
 /// 按 (provider_kind, model) 返回 profile。单一真相源。
 ///
@@ -154,6 +162,7 @@ pub fn profileFor(kind: ProviderKind, model: []const u8) ModelProfile {
         .anthropic => anthropicProfile(model),
         .openai => openaiProfile(model),
         .gemini => geminiProfile(model),
+        .bedrock => bedrockProfile(model),
         .other => .{},
     };
 }
@@ -190,6 +199,19 @@ fn openaiProfile(model: []const u8) ModelProfile {
         .thinking_mode = .openai_effort,
         .effort_levels = .full,
         .returns_reasoning_content = false, // OpenAI 不暴露 reasoning content
+    };
+    withFamilyImageInput(&p, familyImageInput(model));
+    return p;
+}
+
+/// Bedrock Converse: the vendor-specific knobs live in the Bedrock dialect
+/// (`dialects/bedrock.zig`); the profile only answers what the model family
+/// table knows. Claude keeps its Anthropic thinking mode, sent through
+/// `additionalModelRequestFields`.
+fn bedrockProfile(model: []const u8) ModelProfile {
+    var p = ModelProfile{
+        .thinking_mode = if (hasSubstr(model, "claude")) .anthropic_adaptive else .none,
+        .effort_levels = if (hasSubstr(model, "claude")) .full else .none_,
     };
     withFamilyImageInput(&p, familyImageInput(model));
     return p;
