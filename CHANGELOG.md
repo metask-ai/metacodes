@@ -10,6 +10,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- **One integration file per model vendor.** The OpenAI-compatible dialects that
+  shared `src/api/dialects/openai.zig` (GLM, Kimi, DeepSeek, Qwen, MiniMax,
+  Mistral) each have their own file, next to OpenAI, Claude and Gemini. The header
+  of each file is that vendor's integration document — endpoints, wires, thinking
+  parameters and the effort mapping, reasoning passback and caching, known
+  differences, and the dated vendor pages it was checked against — and a test fails
+  when a section is missing. Model-name recognition is unchanged.
+- **Thinking parameters re-checked against the vendors' current documentation**
+  (2026-11). MiniMax M3 now sends `thinking.type: adaptive` instead of `enabled`
+  (the API accepts only `disabled` / `adaptive`), M3.1 sends its `reasoning_effort`,
+  and every MiniMax model asks for `reasoning_split`. Kimi K2.6 no longer puts an
+  `effort` in its `thinking` object, and K2.7-code never sends `disabled`.
+  DeepSeek's `low` level is sent as `low` rather than `high`.
+
 ## 0.10.0 — 2026-10-31
 
 ### Changed

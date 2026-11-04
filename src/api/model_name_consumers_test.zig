@@ -12,8 +12,7 @@ const std = @import("std");
 const model_name = @import("model_name.zig");
 
 test "case-insensitive model routing, capability, pricing, catalog, and context" {
-    const claude = @import("dialects/claude.zig");
-    const openai = @import("dialects/openai.zig");
+    const dialects = @import("dialect.zig");
     const adapter = @import("model_adapter.zig");
     const capability = @import("capability.zig");
     const pricing = @import("../util/pricing.zig");
@@ -26,13 +25,13 @@ test "case-insensitive model routing, capability, pricing, catalog, and context"
     defer upper_buf.deinit(a);
     var lower_buf: std.ArrayList(u8) = .empty;
     defer lower_buf.deinit(a);
-    try claude.claudeDialectFor("GLM-5.2").serializeThinking(.{}, .high, &upper_buf, a);
-    try claude.claudeDialectFor("glm-5.2").serializeThinking(.{}, .high, &lower_buf, a);
+    try dialects.dialectFor(.anthropic, "GLM-5.2").serializeThinking(.{}, .high, &upper_buf, a);
+    try dialects.dialectFor(.anthropic, "glm-5.2").serializeThinking(.{}, .high, &lower_buf, a);
     try std.testing.expectEqualStrings(lower_buf.items, upper_buf.items);
     upper_buf.clearRetainingCapacity();
-    try openai.openaiDialectFor("GLM-5.2").serializeThinking(.{}, .high, &upper_buf, a);
+    try dialects.dialectFor(.openai, "GLM-5.2").serializeThinking(.{}, .high, &upper_buf, a);
     lower_buf.clearRetainingCapacity();
-    try openai.openaiDialectFor("glm-5.2").serializeThinking(.{}, .high, &lower_buf, a);
+    try dialects.dialectFor(.openai, "glm-5.2").serializeThinking(.{}, .high, &lower_buf, a);
     try std.testing.expectEqualStrings(lower_buf.items, upper_buf.items);
     try std.testing.expectEqual(adapter.profileFor(.openai, "GLM-5.2"), adapter.profileFor(.openai, "glm-5.2"));
     try std.testing.expectEqual(capability.supports(.anthropic, "GLM-5.2", .structured_output), capability.supports(.anthropic, "glm-5.2", .structured_output));
