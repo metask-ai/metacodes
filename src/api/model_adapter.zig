@@ -121,6 +121,16 @@ pub const ModelProfile = struct {
     supports_parallel_tool_calls: bool = false,
     /// 支持 reasoning_content 响应字段(DeepSeek/Kimi/Qwen/GLM;Claude 用 thinking block;OpenAI 不暴露)
     returns_reasoning_content: bool = false,
+    /// The model expects its earlier reasoning back on later requests (issue
+    /// #421). DeepSeek's thinking mode answers HTTP 400 to a tool turn whose
+    /// assistant history lacks it; Kimi asks for the assistant message back
+    /// unchanged, reasoning included. The protocol family fixes the wire
+    /// shape: OpenAI chat sends `reasoning_content` on the assistant message,
+    /// Anthropic Messages sends the `thinking` blocks. Every other model keeps
+    /// `false` and its request bytes do not change. Claude never sets it: a
+    /// thinking block sent back to Claude must carry the signature it was
+    /// issued with, and the neutral IR keeps none.
+    echoes_reasoning_content: bool = false,
     /// 不能关 thinking(Kimi K3 总是开;Gemini 3.x 系列不能关)。
     /// 若 effort=null 或 .none/.minimal,dialect 仍要发"最低档"而非不发。
     cannot_disable_thinking: bool = false,
@@ -181,6 +191,9 @@ fn anthropicProfile(model: []const u8) ModelProfile {
     // GLM 5.3+ behind an Anthropic-wire endpoint (Z.AI's default channel, the
     // Metask gateway) still takes only its own three levels.
     p.glm53_effort_vocabulary = glmAlwaysThinks(model);
+    // DeepSeek's Anthropic endpoint asks for the thinking blocks back (issue
+    // #421). Only DeepSeek: a Claude model must never get an unsigned one.
+    p.echoes_reasoning_content = hasSubstr(model, "deepseek") and !hasSubstr(model, "claude");
     return p;
 }
 
@@ -213,6 +226,7 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .effort_levels = .kimi_3,
             .supports_prompt_cache_key = true,
             .returns_reasoning_content = true,
+            .echoes_reasoning_content = true,
             .cannot_disable_thinking = true, // K3 总是开 thinking
             // preserved_thinking 默认 null(K3 文档未提 keep 字段,只 K2.6 用)
         };
@@ -224,6 +238,7 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .effort_levels = .kimi_k2_3,
             .supports_prompt_cache_key = true,
             .returns_reasoning_content = true,
+            .echoes_reasoning_content = true,
             .preserved_thinking_default = false, // keep="all" 等价
         };
     }
@@ -233,6 +248,7 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .thinking_mode = .deepseek_top,
             .effort_levels = .deepseek_2,
             .returns_reasoning_content = true,
+            .echoes_reasoning_content = true,
         };
     }
     // Qwen3
@@ -752,4 +768,38 @@ test "profileFor: multimodal functionResponse 仅 Gemini 3 系 true" {
     try std.testing.expect(!profileFor(.gemini, "gemini-2.5-pro").supports_multimodal_function_response);
     try std.testing.expect(!profileFor(.anthropic, "claude-sonnet-4-20250514").supports_multimodal_function_response);
     try std.testing.expect(!profileFor(.openai, "gpt-5.2").supports_multimodal_function_response);
+}
+
+test "profileFor: echoes_reasoning_content only for DeepSeek and Kimi (issue #421)" {
+    // OpenAI chat wire: DeepSeek and Kimi, including the vendor-prefixed ids
+    // OpenRouter routes them under.
+    inline for (.{
+        "deepseek-chat",
+        "deepseek-v4-pro",
+        "deepseek/deepseek-v4",
+        "kimi-k3",
+        "kimi-k2.6",
+        "moonshot-v1-8k",
+        "moonshotai/kimi-k2-thinking",
+    }) |model| try std.testing.expect(profileFor(.openai, model).echoes_reasoning_content);
+    // Anthropic Messages wire: DeepSeek's Anthropic endpoint only.
+    try std.testing.expect(profileFor(.anthropic, "deepseek-v4-pro").echoes_reasoning_content);
+    // Everything else keeps its request bytes, Claude above all.
+    inline for (.{
+        .{ ProviderKind.anthropic, "claude-opus-4-6" },
+        .{ ProviderKind.anthropic, "claude-sonnet-4-5" },
+        .{ ProviderKind.anthropic, "claude-haiku-4-5" },
+        .{ ProviderKind.anthropic, "claude-3-5-haiku-20241022" },
+        .{ ProviderKind.anthropic, "glm-5.2" },
+        .{ ProviderKind.anthropic, "kimi-k3" },
+        .{ ProviderKind.openai, "gpt-5.2" },
+        .{ ProviderKind.openai, "gpt-4o" },
+        .{ ProviderKind.openai, "glm-5.2" },
+        .{ ProviderKind.openai, "qwen3-235b" },
+        .{ ProviderKind.openai, "minimax-m3" },
+        .{ ProviderKind.openai, "minimax-m2.5" },
+        .{ ProviderKind.openai, "mistral-large" },
+        .{ ProviderKind.gemini, "gemini-3.1-pro" },
+        .{ ProviderKind.other, "deepseek-chat" },
+    }) |case| try std.testing.expect(!profileFor(case[0], case[1]).echoes_reasoning_content);
 }

@@ -327,13 +327,17 @@ fn serializeContent(
     // 留下多余的 `,`。无 reasoning_item 时输出与旧实现逐字节相同(prompt-cache
     // 前缀契约不变)。**不变式**(buildApiMessages 保证):含 reasoning_item 的
     // 消息一定还有别的 block,故这里不会产出空 `[]`。
+    //
+    // `.thinking` 同理只在 profile.echoes_reasoning_content(DeepSeek 的 Anthropic
+    // 端点,issue #421)时发:中立 IR 不带 signature,Claude 收到无签名 thinking
+    // block 会拒绝,故其它模型整块跳过,字节与此前相同。
     var first = true;
     for (content) |block| {
-        if (block == .reasoning_item) continue;
+        if (!emitsBlock(block, profile)) continue;
         if (!first) try buf.append(allocator, ',');
         first = false;
         switch (block) {
-            .reasoning_item => unreachable, // 上面已 continue
+            .reasoning_item => unreachable, // emitsBlock 已过滤
             .text => |t| {
                 try buf.append(allocator, '{');
                 try buf.appendSlice(allocator, "\"type\":\"text\",\"text\":");
@@ -341,8 +345,7 @@ fn serializeContent(
                 try buf.append(allocator, '}');
             },
             .thinking => |t| {
-                // preserved thinking 回传(Anthropic):thinking block 必须原样、按序回传。
-                // 对齐 Claude Opus 4.5+:保留 thinking 提升多轮推理质量。
+                // 推理回传(DeepSeek Anthropic 端点):thinking block 原样、按序回传。
                 try buf.append(allocator, '{');
                 try buf.appendSlice(allocator, "\"type\":\"thinking\",\"thinking\":");
                 try util_json.serializeString(t, buf, allocator);
@@ -400,6 +403,17 @@ fn serializeContent(
         }
     }
     try buf.append(allocator, ']');
+}
+
+/// Whether `block` reaches the Anthropic Messages wire. `reasoning_item` is
+/// OpenAI Responses state and never does; `thinking` does only for a model
+/// that expects its reasoning back (issue #421), never for Claude.
+fn emitsBlock(block: types.ApiContent, profile: @import("model_adapter.zig").ModelProfile) bool {
+    return switch (block) {
+        .reasoning_item => false,
+        .thinking => |t| profile.echoes_reasoning_content and t.len > 0,
+        else => true,
+    };
 }
 
 /// 图像形态 tool_result 的判定单一权威在 `dialect.extractImageResult`——线路层

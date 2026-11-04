@@ -549,6 +549,29 @@ Provider and differs from it only by `model_override`, so sizing a child's
 results — or its auto-compact thresholds — against the parent's window is how a
 200K parent hands a 32K child a history that endpoint rejects.
 
+### Provider reasoning continuity (DeepSeek, Kimi)
+
+Some models want their earlier reasoning back on later requests. DeepSeek's
+thinking mode answers HTTP 400 to a tool turn whose assistant history lacks
+`reasoning_content`; Kimi asks for the assistant message back unchanged,
+reasoning included. Core projects every `Block.thinking` into the request IR
+and lets the dialect decide (issue #421):
+
+- A model whose `ModelProfile.echoes_reasoning_content` is set — DeepSeek and
+  Kimi on the OpenAI chat wire, including the vendor-prefixed ids OpenRouter
+  routes them under, and DeepSeek on its Anthropic endpoint — gets it back.
+  OpenAI chat sends the message's thinking text as `reasoning_content` on the
+  assistant message (after `content`, before `tool_calls`); Anthropic Messages
+  sends the `thinking` blocks in their original position.
+- Every other model is sent exactly the bytes it was sent before: OpenAI
+  native and every other compatible dialect (GLM, Qwen, MiniMax, Mistral),
+  OpenAI Responses, Gemini, and Claude. Claude in particular never receives a
+  thinking block: one sent back must carry the signature it was issued with,
+  and the IR keeps none.
+
+An assistant message holding nothing but thinking (a reply cut off by
+`max_tokens` inside its reasoning) is still left out of the request.
+
 ### Provider reasoning continuity (OpenAI Responses)
 
 The Responses protocol is used with `store:false`: the server keeps no copy of
@@ -559,10 +582,10 @@ server emitted it (`id`, `summary`, `encrypted_content`), replayed byte for
 byte, and `model` is the model that produced it.
 
 This is not `Block.thinking`. A thinking block is readable assistant
-reasoning that the UI displays and the Anthropic dialect replays as a
-`thinking` block; a reasoning item is opaque provider state that is never
-displayed, never enters a compaction summary, and never becomes assistant
-text. Every dialect other than OpenAI Responses skips it.
+reasoning that the UI displays and that only a model asking for its reasoning
+back receives (see the next section); a reasoning item is opaque provider
+state that is never displayed, never enters a compaction summary, and never
+becomes assistant text. Every dialect other than OpenAI Responses skips it.
 
 Capture is event-independent: the same item may arrive in
 `response.output_item.done`, in the terminal `response.completed`'s

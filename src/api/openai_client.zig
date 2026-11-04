@@ -1684,6 +1684,22 @@ fn serializeOpenAIMessage(
         };
         try util_json.serializeString(text_buf.items, out, allocator);
     }
+    // Reasoning echo (issue #421): DeepSeek answers HTTP 400 to a tool turn
+    // whose assistant history lacks `reasoning_content`, and Kimi wants the
+    // assistant message back with it. Only a profile that asks gets the
+    // field; every other model's bytes are what they were.
+    if (m.role == .assistant and profile.echoes_reasoning_content) {
+        var reasoning: std.ArrayList(u8) = .empty;
+        defer reasoning.deinit(allocator);
+        for (m.content) |c| switch (c) {
+            .thinking => |t| try reasoning.appendSlice(allocator, t),
+            else => {},
+        };
+        if (reasoning.items.len > 0) {
+            try out.appendSlice(allocator, ",\"reasoning_content\":");
+            try util_json.serializeString(reasoning.items, out, allocator);
+        }
+    }
     // assistant tool_use → tool_calls
     if (has_tool_use) {
         try out.appendSlice(allocator, ",\"tool_calls\":[");
