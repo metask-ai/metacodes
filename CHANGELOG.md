@@ -10,6 +10,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- **DeepSeek and Kimi in thinking mode get their reasoning back (#421).** The
+  request after a tool call dropped every thinking block, so DeepSeek answered
+  HTTP 400 and Kimi lost its earlier reasoning. Thinking is now carried into the
+  request and the model profile decides: DeepSeek and Kimi on OpenAI chat get
+  `reasoning_content` on assistant messages, and DeepSeek on its Anthropic
+  endpoint gets its thinking blocks. Every other model's request bytes are
+  unchanged, and Claude never receives an unsigned thinking block.
+
 ## 0.10.0 — 2026-10-31
 
 ### Changed

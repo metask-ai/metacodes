@@ -14,6 +14,15 @@ empty `### Migration`.
 
 ## Unreleased
 
+### Fixed
+
+- A Run on DeepSeek or Kimi in thinking mode sends the model's earlier reasoning
+  back (#421). The request after a tool call used to drop it, so DeepSeek answered
+  HTTP 400 and Kimi lost its reasoning. DeepSeek and Kimi on OpenAI chat now get
+  `reasoning_content` on assistant messages, and DeepSeek on its Anthropic
+  endpoint gets its thinking blocks. Other models' requests are unchanged, and
+  Claude is never sent an unsigned thinking block. No ABI change.
+
 ## 0.13.0 — 2026-10-31
 
 ### Added
