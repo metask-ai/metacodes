@@ -4,12 +4,15 @@
 //!
 //! ## 接入点
 //!
-//! - 还没有内置 Provider:经 `custom_providers` 或 OpenRouter 接入。官方端点:
-//!   北京 `https://dashscope.aliyuncs.com/compatible-mode/v1`、
-//!   新加坡 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`,Anthropic 兼容面在
-//!   同一主机的 `/apps/anthropic`;另有工作空间专属端点
-//!   `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` 等。
-//! - 各地域的 key 互不通用。
+//! - Provider:`src/provider/profiles/qwen.zig`。渠道:
+//!   `cn-openai`(默认,北京)`https://dashscope.aliyuncs.com/compatible-mode/v1`、
+//!   `intl-openai`(新加坡)`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`、
+//!   `cn-anthropic` `https://dashscope.aliyuncs.com/apps/anthropic`、
+//!   `intl-anthropic` `https://dashscope-intl.aliyuncs.com/apps/anthropic`。
+//! - 新的工作空间专属端点(`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`
+//!   等)可以用 `--base-url` 覆盖:路由的端点策略只要求路径里有 `/compatible-mode/v1`
+//!   (或 `/apps/anthropic`)。
+//! - 环境变量:`DASHSCOPE_API_KEY`。各地域的 key 互不通用。
 //!
 //! ## 协议
 //!

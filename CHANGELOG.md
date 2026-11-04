@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Built-in DeepSeek, Kimi, Qwen and MiniMax providers.** `--provider deepseek |
+  kimi | qwen | minimax` with the vendors' China and global channels on both the
+  OpenAI and Anthropic wires, each route declaring the vendor's dialect, limits
+  from the vendors' own documentation, and reasoning controls in the vendors'
+  vocabularies. Keys come from `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
+  `DASHSCOPE_API_KEY` and `MINIMAX_API_KEY`. Quotes stay unknown (time-of-day,
+  regional and tiered prices).
 - **A route says which vendor dialect it speaks.** `ProtocolRoute.dialect` and
   `ModelEntry.dialect` (and `"dialect"` on a `custom_providers` channel or model)
   name the vendor whose parameters the request carries, the way an OpenRouter

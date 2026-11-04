@@ -4,16 +4,16 @@
 //!
 //! ## 接入点
 //!
-//! - 还没有内置 Provider:经 `custom_providers` 或 OpenRouter 接入。官方端点:
+//! - Provider:`src/provider/profiles/deepseek.zig`。渠道 `default` 同时暴露两条路由:
 //!   `https://api.deepseek.com`(OpenAI chat,`/chat/completions`)与
 //!   `https://api.deepseek.com/anthropic`(Anthropic messages,`/v1/messages`)。
 //! - 型号:`deepseek-v4-pro`、`deepseek-flash`(由 V4.1-Flash 提供;旧名 `deepseek-v4-flash`
 //!   仍可用,按 Flash 计费)。上下文 1,048,576 token。
+//! - 环境变量:`DEEPSEEK_API_KEY`。
 //!
 //! ## 协议
 //!
-//! - 两条 wire 都有本方言:OpenAI chat 上按模型名也能认出 DeepSeek,Anthropic wire 上只在
-//!   路由声明 `.deepseek` 时使用。鉴权:`Authorization: Bearer`。
+//! - 两条路由都声明本方言(`.deepseek`)。鉴权:`Authorization: Bearer`。
 //!
 //! ## 思考与推理
 //!

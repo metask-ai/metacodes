@@ -33,6 +33,10 @@ pub const metask = @import("profiles/metask.zig");
 pub const openai = @import("profiles/openai.zig");
 pub const gemini = @import("profiles/gemini.zig");
 pub const zai_coding_plan = @import("profiles/zai_coding_plan.zig");
+pub const deepseek = @import("profiles/deepseek.zig");
+pub const kimi = @import("profiles/kimi.zig");
+pub const qwen = @import("profiles/qwen.zig");
+pub const minimax = @import("profiles/minimax.zig");
 
 /// The built-in profile table. One line per provider — this is the extension
 /// point the requirement asks for. Each vendor's integration notes (dialect,
@@ -43,6 +47,10 @@ pub const BUILTIN_PROFILES = [_]ProviderProfile{
     openai.PROFILE,
     gemini.PROFILE,
     zai_coding_plan.PROFILE,
+    deepseek.PROFILE,
+    kimi.PROFILE,
+    qwen.PROFILE,
+    minimax.PROFILE,
 };
 
 // ── transport bridge ─────────────────────────────────────────────────────────

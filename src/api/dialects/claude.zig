@@ -8,7 +8,8 @@
 //!
 //! - Provider:`src/provider/profiles/metask.zig`(默认路径,`https://napi.metask-ai.com`,
 //!   Anthropic messages)。环境变量 `METASK_API_KEY`。
-//! - 没有专属 Anthropic 方言的厂商,在 Anthropic 兼容渠道上都用本方言。
+//! - 其它厂商的 Anthropic 兼容渠道(DeepSeek、Kimi、Qwen、MiniMax、Z.AI)在各自 profile 里;
+//!   没有专属 Anthropic 方言的厂商在这些渠道上用本方言。
 //!
 //! ## 协议
 //!

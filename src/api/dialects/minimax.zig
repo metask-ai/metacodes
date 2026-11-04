@@ -4,10 +4,11 @@
 //!
 //! ## 接入点
 //!
-//! - 还没有内置 Provider:经 `custom_providers` 或 OpenRouter 接入。官方端点:
-//!   中国 `https://api.minimax.cn/v1`、全球 `https://api.minimax.io/v1`(OpenAI chat),
-//!   Anthropic 兼容面在同一主机的 `/anthropic`。
+//! - Provider:`src/provider/profiles/minimax.zig`。渠道:
+//!   `cn-openai`(默认)`https://api.minimax.cn/v1`、`global-openai` `https://api.minimax.io/v1`、
+//!   `cn-anthropic` `https://api.minimax.cn/anthropic`、`global-anthropic` `https://api.minimax.io/anthropic`。
 //! - 型号:`MiniMax-M3.1-Flash`、`MiniMax-M3`、`MiniMax-M2.7`。
+//! - 环境变量:`MINIMAX_API_KEY`。
 //!
 //! ## 协议
 //!

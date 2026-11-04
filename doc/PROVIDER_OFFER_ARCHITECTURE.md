@@ -104,10 +104,10 @@ and `dialects/registry.zig` fails a test when one is missing.
 | Anthropic Claude | `src/api/dialects/claude.zig` | `metask` (Claude models) |
 | Google Gemini | `src/api/dialects/gemini.zig` | `gemini` |
 | Zhipu GLM | `src/api/dialects/glm.zig` | `zai-coding-plan` |
-| Moonshot Kimi | `src/api/dialects/kimi.zig` | — |
-| DeepSeek | `src/api/dialects/deepseek.zig` | — |
-| Alibaba Qwen | `src/api/dialects/qwen.zig` | — |
-| MiniMax | `src/api/dialects/minimax.zig` | — |
+| Moonshot Kimi | `src/api/dialects/kimi.zig` | `kimi` |
+| DeepSeek | `src/api/dialects/deepseek.zig` | `deepseek` |
+| Alibaba Qwen | `src/api/dialects/qwen.zig` | `qwen` |
+| MiniMax | `src/api/dialects/minimax.zig` | `minimax` |
 | Mistral | `src/api/dialects/mistral.zig` | — |
 | OpenRouter | `src/api/dialects/openrouter.zig` | catalog only |
 

@@ -4,10 +4,11 @@
 //!
 //! ## 接入点
 //!
-//! - 还没有内置 Provider:经 `custom_providers` 或 OpenRouter 接入。官方端点:
-//!   中国 `https://api.moonshot.cn/v1`、全球 `https://api.moonshot.ai/v1`(OpenAI chat),
-//!   Anthropic 兼容面在同一主机的 `/anthropic`。
-//! - Kimi Code 订阅(`https://api.kimi.com/coding/v1`)是另一种账号与配额。
+//! - Provider:`src/provider/profiles/kimi.zig`。渠道:
+//!   `cn-openai`(默认)`https://api.moonshot.cn/v1`、`global-openai` `https://api.moonshot.ai/v1`、
+//!   `cn-anthropic` `https://api.moonshot.cn/anthropic`、`global-anthropic` `https://api.moonshot.ai/anthropic`。
+//! - 环境变量:`MOONSHOT_API_KEY`(规范名)、`KIMI_API_KEY`。
+//! - Kimi Code 订阅(`https://api.kimi.com/coding/v1`)是另一种账号与配额,不在本 profile 里。
 //!
 //! ## 协议
 //!

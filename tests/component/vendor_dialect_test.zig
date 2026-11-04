@@ -192,6 +192,51 @@ test "L2 dialect: the startup route of a built-in vendor reaches the factory-bui
 
     var registry = try cc.provider_registry.ProviderRegistry.initWithBuiltins(a);
     defer registry.deinit();
+    // The mock stands in for the China channel; loopback plaintext passes the
+    // route policy, which still requires the `/v1` marker.
+    const base_url = try std.fmt.allocPrint(a, "{s}/v1", .{origin});
+    defer a.free(base_url);
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{
+        .provider = "kimi",
+        .model = "my-kimi-deployment",
+        .base_url = base_url,
+    });
+    try std.testing.expect(outcome == .route);
+    var route = outcome.route;
+    defer route.deinit();
+    try std.testing.expectEqual(Vendor.kimi, route.dialect.?);
+
+    var owned = try cc.api_provider_factory.makeProviderWithOptions(
+        a,
+        route.transport,
+        .{ .fixed = "kimi-key" },
+        route.request_model_id,
+        route.endpoint_url,
+        route.openai_protocol,
+        .builtin(),
+        .{ .auth_scheme = route.auth_scheme, .dialect = route.dialect },
+    );
+    defer owned.deinit();
+    try owned.provider().setReasoningEffort(.low);
+    try drain(a, owned.provider(), &HI);
+
+    // "my-kimi-deployment" is a K2.7-or-later name to the Kimi dialect: the
+    // always-on thinking object, never the OpenAI-native top-level effort.
+    const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\"") == null);
+}
+
+test "L2 dialect: a declared route reaches the factory-built client even for an unknown model name" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startCassette(&.{OPENAI_END_TURN_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const origin = url[0 .. url.len - "/v1/messages".len];
+
+    var registry = try cc.provider_registry.ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
     // The mock stands in for the Coding Plan's OpenAI channel; loopback
     // plaintext passes the route policy, which still requires `/coding/`.
     const base_url = try std.fmt.allocPrint(a, "{s}/api/coding/paas/v4", .{origin});
