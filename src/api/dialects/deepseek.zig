@@ -12,9 +12,8 @@
 //!
 //! ## 协议
 //!
-//! - 两条 wire 都有本方言。按模型名推断只在 OpenAI chat 上认 DeepSeek(与拆分前相同);
-//!   Anthropic wire 上的 DeepSeek 方言已写好并有测试,但还没有路由能选到它。
-//!   鉴权:`Authorization: Bearer`。
+//! - 两条 wire 都有本方言:OpenAI chat 上按模型名也能认出 DeepSeek,Anthropic wire 上只在
+//!   路由声明 `.deepseek` 时使用。鉴权:`Authorization: Bearer`。
 //!
 //! ## 思考与推理
 //!
@@ -196,7 +195,7 @@ test "DeepSeek Anthropic wire: output_config.effort 用 DeepSeek 词汇,不发 a
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
-test "DeepSeek: 家族 profile 不看名字,解析 reasoning_content 增量" {
+test "DeepSeek: 声明的路由用 DeepSeek 家族 profile,解析 reasoning_content 增量" {
     const a = std.testing.allocator;
     const d = dialect(.openai, "deepseek-flash").?;
     try std.testing.expect(d.profileFor(.openai, "my-relay-name").returns_reasoning_content);

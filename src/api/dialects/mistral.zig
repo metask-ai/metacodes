@@ -4,8 +4,8 @@
 //!
 //! ## 接入点
 //!
-//! - 没有内置 Provider。经 `custom_providers`(模型名含 mistral / magistral 时按名认出)
-//!   或 OpenRouter 接入。官方端点 `https://api.mistral.ai/v1`。
+//! - 没有内置 Provider。经 OpenRouter 目录、或 `custom_providers` 声明
+//!   `"dialect": "mistral"` 接入(官方端点 `https://api.mistral.ai/v1`)。
 //!
 //! ## 协议
 //!

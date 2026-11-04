@@ -11,12 +11,12 @@
 //!
 //! ## 协议
 //!
-//! - `openai_chat`(`/chat/completions`)上用本方言;`anthropic_messages` 上走 Claude 方言。
+//! - `openai_chat`(`/chat/completions`)声明本方言;`anthropic_messages` 路由走 Claude 方言。
 //! - 鉴权:`Authorization: Bearer $MOONSHOT_API_KEY`。
 //!
 //! ## 思考与推理
 //!
-//! 按型号分三种,型号从模型名判断:
+//! 按型号分三种,型号从模型名判断(路由已声明是 Kimi,不会和别家混):
 //! - **K3 / K3.1**(`kimi-k3*`,以及 Kimi Code 的 `k3*`):思考恒开,不接受 K2 的
 //!   `thinking` 对象;只发顶层 `reasoning_effort`,取值 low / high / max,默认 max。
 //!   none/minimal 也发 max(关不掉,取默认),low→low,medium/high→high,xhigh/max→max。
@@ -39,7 +39,8 @@
 //! - 不回传 `reasoning_content`:多轮工具调用时服务端拿不到上一步的思考。
 //! - 输出上限字段是 `max_completion_tokens`(`max_tokens` 已弃用);本仓库的 OpenAI
 //!   chat 序列化器两者都不发,用服务端默认。
-//! - 按名推断里 `k2` 子串会认成 Kimi:这是拆分前就有的行为,保留不变。
+//! - 旧名推断里 `k2` 子串会认成 Kimi:那是没声明方言的路由的兼容行为,声明了方言的
+//!   路由不受影响。
 //!
 //! ## 来源
 //!

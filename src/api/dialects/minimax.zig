@@ -11,7 +11,7 @@
 //!
 //! ## 协议
 //!
-//! - `openai_chat` 上用本方言;`anthropic_messages` 上走 Claude 方言。
+//! - `openai_chat` 路由声明本方言(`.minimax`);`anthropic_messages` 路由走 Claude 方言。
 //! - 鉴权:`Authorization: Bearer <API_key>`。
 //!
 //! ## 思考与推理

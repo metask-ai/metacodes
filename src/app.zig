@@ -822,8 +822,16 @@ pub const App = struct {
         // issue #16: the resolved offer's provider-declared auth scheme. Null
         // (no `--provider`) keeps the historical bearer header byte for byte.
         app.api_client.auth_scheme = config.auth_scheme;
-        if (app.openai_client) |*client| client.dialect_resolver = app_dialect_resolver;
-        if (app.gemini_client) |*client| client.dialect_resolver = app_dialect_resolver;
+        // The route's declared vendor dialect, like the auth scheme.
+        app.api_client.dialect_vendor = config.dialect;
+        if (app.openai_client) |*client| {
+            client.dialect_resolver = app_dialect_resolver;
+            client.dialect_vendor = config.dialect;
+        }
+        if (app.gemini_client) |*client| {
+            client.dialect_resolver = app_dialect_resolver;
+            client.dialect_vendor = config.dialect;
+        }
         const plugin_skill_sources = if (app.plugin_snapshot) |snapshot| snapshot.skill_sources else &.{};
         const plugin_agent_sources = if (app.plugin_snapshot) |snapshot| snapshot.agent_sources else &.{};
         if (cwd_for_skills) |cwd| {
@@ -1068,7 +1076,10 @@ pub const App = struct {
         };
         if (app.agent_jobs) |*jobs| try jobs.setLimits(model_limits);
         // Child agents authenticate the way the parent's resolved route does.
-        if (app.agent_jobs) |*jobs| jobs.auth_scheme = config.auth_scheme;
+        if (app.agent_jobs) |*jobs| {
+            jobs.auth_scheme = config.auth_scheme;
+            jobs.dialect = config.dialect;
+        }
 
         // Swarm 会话状态(lead 视角)。teammates registry 惰性(TeamCreate 才建);此处只装
         // 构造参数 + home。api_key/base_url/model 借 App 生命周期稳定内存(App 存活期不变)。
@@ -1082,6 +1093,7 @@ pub const App = struct {
             .provider_kind = app.config.provider_kind,
             .openai_protocol = app.config.openai_protocol,
             .auth_scheme = app.config.auth_scheme,
+            .dialect = app.config.dialect,
             .dialect_resolver = app_dialect_resolver,
             .limits = model_limits,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
@@ -2035,6 +2047,7 @@ pub const App = struct {
         const previous_kind = app.config.provider_kind;
         const previous_protocol = app.config.openai_protocol;
         const previous_scheme = app.config.auth_scheme;
+        const previous_dialect = app.config.dialect;
         var jobs_rerouted = false;
         // Function-scoped so it also covers a failure in `switchModel` below;
         // a block-scoped errdefer would have already gone out of scope by then,
@@ -2046,10 +2059,11 @@ pub const App = struct {
                 previous_kind,
                 previous_protocol,
                 previous_scheme,
+                previous_dialect,
             ) catch {};
         };
         if (app.agent_jobs) |*jobs| {
-            try jobs.setRoute(secret, endpoint, binding.transport, binding.openai_protocol, binding.auth_scheme);
+            try jobs.setRoute(secret, endpoint, binding.transport, binding.openai_protocol, binding.auth_scheme, binding.dialect);
             jobs_rerouted = true;
         }
 
@@ -2107,6 +2121,7 @@ pub const App = struct {
         }
         app.config.openai_protocol = binding.openai_protocol;
         app.config.auth_scheme = binding.auth_scheme;
+        app.config.dialect = binding.dialect;
         // `config` is the snapshot subagent and swarm workers are constructed
         // from, so it has to move with the route or a spawned worker would dial
         // the previous provider's endpoint.
@@ -2115,15 +2130,18 @@ pub const App = struct {
         app.api_client.credential = .{ .fixed = secret };
         app.api_client.base_url = endpoint;
         app.api_client.auth_scheme = binding.auth_scheme;
+        app.api_client.dialect_vendor = binding.dialect;
         if (app.openai_client) |*client| {
             client.credential = .{ .fixed = secret };
             client.base_url = endpoint;
             client.protocol = binding.openai_protocol;
             client.auth_scheme = binding.auth_scheme;
+            client.dialect_vendor = binding.dialect;
         }
         if (app.gemini_client) |*client| {
             client.credential = .{ .fixed = secret };
             client.base_url = endpoint;
+            client.dialect_vendor = binding.dialect;
         }
         // Every out-of-process UI learns the *route*, not just the model name: a
         // visible model name can come from several providers, channels,
@@ -2153,6 +2171,7 @@ pub const App = struct {
         app.swarm.provider_kind = binding.transport;
         app.swarm.openai_protocol = binding.openai_protocol;
         app.swarm.auth_scheme = binding.auth_scheme;
+        app.swarm.dialect = binding.dialect;
     }
 
     pub fn selectApiKeyForModels(app: *App, idx: usize) !void {
@@ -2784,6 +2803,7 @@ pub const App = struct {
                 app.config.provider_kind,
                 app.config.openai_protocol,
                 app.config.auth_scheme,
+                app.config.dialect,
             );
         }
 

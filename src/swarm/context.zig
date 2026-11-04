@@ -86,6 +86,9 @@ pub const SwarmContext = struct {
     /// `authorization: Bearer` 字节。teammate 必须继承——lead 换到用 `x-api-key`
     /// 的 provider 后,teammate 还发 bearer 就是拿对的密钥打错的头。
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
+    /// The vendor dialect of the lead's resolved route; teammates inherit it
+    /// with the auth scheme. Null infers it from the model name.
+    dialect: ?dialect_mod.Vendor = null,
     /// Immutable App/Runtime-scoped resolver; in-process teammates drain before
     /// the owning plugin Snapshot is destroyed.
     dialect_resolver: dialect_mod.Resolver = .builtin(),

@@ -1188,7 +1188,7 @@ test "SerializationReport: fail-closed 方言把图像结果计入占位,内建 
     try std.testing.expect(std.mem.indexOf(u8, body_closed, "was read successfully but omitted") != null);
     var native = SerializationReport{};
     defer native.deinit(a);
-    const body_native = try serializeMessagesRequestWithDialectReport(req, a, dialect_mod.Resolver.builtin().resolve(.anthropic, req.model), &native);
+    const body_native = try serializeMessagesRequestWithDialectReport(req, a, dialect_mod.Resolver.builtin().resolve(.anthropic, null, req.model), &native);
     defer a.free(body_native);
     try std.testing.expectEqual(@as(usize, 1), native.image_results);
     try std.testing.expectEqual(@as(usize, 0), native.image_placeholders);

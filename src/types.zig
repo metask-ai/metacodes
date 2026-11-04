@@ -260,6 +260,9 @@ pub const Config = struct {
     /// Provider-declared authentication for the resolved route. Null keeps the
     /// historical `authorization: Bearer <key>` transport behaviour.
     auth_scheme: ?@import("provider/credential.zig").AuthScheme = null,
+    /// The vendor dialect the resolved route declares (`ModelOffer.dialect`).
+    /// Null infers it from the model name, the historical behaviour.
+    dialect: ?@import("provider/vendor.zig").Vendor = null,
     /// True only when startup resolved the bearer from the Metask OAuth session;
     /// explicit legacy API-key mode must not load that session or hydrate it.
     metask_oauth_selected: bool = false,

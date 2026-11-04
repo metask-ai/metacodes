@@ -35,7 +35,9 @@ pub const gemini = @import("profiles/gemini.zig");
 pub const zai_coding_plan = @import("profiles/zai_coding_plan.zig");
 
 /// The built-in profile table. One line per provider — this is the extension
-/// point the requirement asks for.
+/// point the requirement asks for. Each vendor's integration notes (dialect,
+/// endpoints, thinking parameters, sources) are the header of
+/// `src/api/dialects/<vendor>.zig`.
 pub const BUILTIN_PROFILES = [_]ProviderProfile{
     metask.PROFILE,
     openai.PROFILE,
@@ -366,6 +368,7 @@ pub const OfferCatalog = struct {
                                 .upstream_model_id = entry.upstream_model_id,
                                 .protocol = route.protocol.id(),
                                 .wire = route.protocol.wire(),
+                                .dialect = entry.dialect orelse route.dialect,
                                 .endpoint_ref = endpoint,
                                 .credential_ref = bound_credential,
                                 .display_name = entry.display_name,

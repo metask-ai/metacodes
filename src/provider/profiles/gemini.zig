@@ -1,5 +1,8 @@
 //! Google Gemini provider profile.
 //!
+//! Integration notes live in `src/api/dialects/gemini.zig`; this file is the
+//! route data.
+//!
 //! Gemini is the reason `EndpointShape` exists: its transport receives an
 //! origin and appends `/v1beta/models/{model}:streamGenerateContent` itself.
 //! Declaring that shape keeps endpoint construction truthful instead of
@@ -72,7 +75,7 @@ const MODELS = [_]profile.ModelEntry{
     }),
 };
 
-const ROUTES = [_]profile.ProtocolRoute{.{ .protocol = .gemini_generate_content }};
+const ROUTES = [_]profile.ProtocolRoute{.{ .protocol = .gemini_generate_content, .dialect = .gemini }};
 
 const CHANNELS = [_]profile.ChannelDescriptor{.{
     .id = Slug.lit("default"),

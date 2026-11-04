@@ -725,6 +725,9 @@ test "an ingested catalog becomes offers, and its prices and health become event
     for (items) |item| {
         if (!item.provider_id.eqlText("openrouter")) continue;
         try std.testing.expectEqualStrings("deepseek/deepseek-v4", item.canonical_model_id.?);
+        // The route speaks OpenRouter's dialect, not DeepSeek's, although the
+        // name says deepseek: OpenRouter translates for its upstreams.
+        try std.testing.expectEqual(@import("vendor.zig").Vendor.openrouter, item.dialect.?);
         if (item.quote.priced()) |price| {
             priced += 1;
             if (price.provenance.freshness == .inherited) inherited += 1;

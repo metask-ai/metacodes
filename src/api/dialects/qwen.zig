@@ -13,7 +13,7 @@
 //!
 //! ## 协议
 //!
-//! - `openai_chat` 上用本方言;`anthropic_messages` 上走 Claude 方言。
+//! - `openai_chat` 路由声明本方言(`.qwen`);`anthropic_messages` 路由走 Claude 方言。
 //! - 鉴权:Bearer。
 //!
 //! ## 思考与推理
@@ -34,8 +34,8 @@
 //!
 //! ## 已知差异
 //!
-//! - 按名推断只认 `qwen3` / `qwen-3`:qwen-plus / qwen-flash 会被当成 OpenAI 原生
-//!   (发 `reasoning_effort`),与拆分前相同。
+//! - 按名推断只认 `qwen3` / `qwen-3`:qwen-plus / qwen-flash 在没声明方言的路由上会被当成
+//!   OpenAI 原生(发 `reasoning_effort`)。声明了 `.qwen` 的路由不受影响。
 //! - 部分开源型号(qwen3.5-122b-a10b 等)只接受流式请求;本仓库总是流式。
 //! - 视觉:名字含 `vl` 的是视觉变体;qwen3.8 系列原生多模态,但名字看不出来,由目录声明。
 //!
@@ -115,7 +115,7 @@ test "Qwen: enable_thinking 开关,none/minimal 关" {
     try std.testing.expectEqualStrings(",\"enable_thinking\":false", out.items);
 }
 
-test "Qwen: 本方言下 qwen-plus 也用开关,不发 reasoning_effort" {
+test "Qwen: 声明了方言的 qwen-plus 也用开关,不发 reasoning_effort" {
     const a = std.testing.allocator;
     const d = dialect(.openai, "qwen-plus").?;
     var out: std.ArrayList(u8) = .empty;

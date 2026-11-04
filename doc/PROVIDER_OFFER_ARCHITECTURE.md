@@ -64,8 +64,8 @@ it came from, and a slice into a list that later grows is a dangling pointer.
 1. Write `src/provider/profiles/<vendor>.zig` declaring a `ProviderProfile`.
 2. Add one line to `BUILTIN_PROFILES` in `src/provider/registry.zig`.
 3. If the vendor speaks its own dialect, write `src/api/dialects/<vendor>.zig`
-   (see *Vendor integrations* below) and add the vendor to `Vendor` in
-   `src/provider/vendor.zig`.
+   (see *Vendor integrations* below), add the vendor to `Vendor` in
+   `src/provider/vendor.zig`, and declare it on the profile's routes.
 
 A runtime source — the `custom_providers` section, a fetched catalog — registers
 through the same call, and may **replace its own** registrations: re-reading a
@@ -109,13 +109,21 @@ and `dialects/registry.zig` fails a test when one is missing.
 | Alibaba Qwen | `src/api/dialects/qwen.zig` | — |
 | MiniMax | `src/api/dialects/minimax.zig` | — |
 | Mistral | `src/api/dialects/mistral.zig` | — |
+| OpenRouter | `src/api/dialects/openrouter.zig` | catalog only |
 
 The OpenAI chat building blocks every compatible vendor shares are
 `src/api/dialects/openai_compat.zig`.
 
-Which dialect a request uses is recognised from the model name, in the order
-`dialects/registry.zig` fixes (GLM, Kimi, DeepSeek, Qwen, MiniMax, Mistral);
-a name no vendor claims gets the wire's own dialect.
+**Which dialect a request uses is a property of the route**, the way an
+OpenRouter endpoint names its upstream. `ProtocolRoute.dialect` declares it for
+a channel's route, `ModelEntry.dialect` overrides it for one model on a
+multi-vendor gateway, and the offer carries the result (`ModelOffer.dialect`,
+not part of the offer id). It travels with the auth scheme through the startup
+route, a `/model` switch, child agents, swarm teammates and `AgentSession`, to
+the client's `dialect_vendor`. A route that declares none infers the vendor
+from the model name — the behaviour before routes could say — so a custom
+provider written for that keeps working. A runtime plugin's dialect for a model
+still wins over the route's declaration.
 
 ## Conservative metadata
 
@@ -590,7 +598,8 @@ parsed into an arena that must outlive the registry borrowing its strings.
     "endpoint_policy": {"required_path_fragments": ["/relay"]},
     "channels": [{
       "id": "primary", "base_url": "https://relay.example.com/relay/v1", "region": "eu",
-      "protocol": {"wire": "openai_chat", "path_suffix": "/completions", "id": "relay_openai"}
+      "protocol": {"wire": "openai_chat", "path_suffix": "/completions", "id": "relay_openai"},
+      "dialect": "glm"
     }],
     "models": [{
       "request_model_id": "relay-glm-pro", "canonical_model_id": "zai/glm-4.6",
@@ -610,6 +619,11 @@ traffic — which the endpoint policy still constrains — but it cannot read
 prompts or reach a credential it was not given. `quote_hook` and
 `classify_error` stay at their defaults for configured providers; those are code
 and belong to a reviewed profile.
+
+`dialect` (on a channel, or on one model) names the vendor whose parameters the
+requests carry — a value of `Vendor` in `src/provider/vendor.zig`. Absent, the
+vendor is inferred from the model name; a value that names no vendor fails the
+definition (`UnknownDialect`) rather than being guessed.
 
 A protocol is a **wire**, optionally with a different request path. That is what
 relays, gateways, and self-hosted servers actually differ by, and it keeps them
@@ -841,7 +855,7 @@ see *Stored API keys and the guided key login*).
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
-| `src/provider/vendor.zig` | `Vendor`, the vendors with a dialect of their own |
+| `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
 | `src/api/dialects/<vendor>.zig` | one vendor's dialect; its header is the integration document |
 | `src/api/dialects/registry.zig` | vendor → dialect file, name inference, the header contract test |
 | `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |

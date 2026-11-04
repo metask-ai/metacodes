@@ -29,6 +29,7 @@ pub const Usage = offer_mod.Usage;
 pub const Availability = offer_mod.Availability;
 pub const ControlSpec = controls_mod.ControlSpec;
 pub const AuthScheme = credential.AuthScheme;
+pub const Vendor = @import("vendor.zig").Vendor;
 pub const CredentialKind = credential.CredentialKind;
 pub const EnvAlias = credential.EnvAlias;
 
@@ -247,6 +248,10 @@ pub const ProtocolRoute = struct {
     /// Overrides the protocol default for channels with a nonstandard path.
     path_suffix: ?[]const u8 = null,
     policy: EndpointPolicy = .{},
+    /// The vendor dialect this route speaks — what the vendor behind the wire
+    /// expects inside it (`vendor.zig`). Null infers it from the model name,
+    /// which is what every route did before routes could say.
+    dialect: ?Vendor = null,
 
     pub fn suffix(self: ProtocolRoute) []const u8 {
         return self.path_suffix orelse self.protocol.pathSuffix();
@@ -271,6 +276,10 @@ pub const ModelEntry = struct {
     /// Protocol subset this model is reachable through. Empty = every route the
     /// channel exposes.
     protocols: []const Protocol = &.{},
+    /// Overrides the route's dialect for this model, for a channel that serves
+    /// models of several vendors over one wire (a gateway). Null keeps the
+    /// route's.
+    dialect: ?Vendor = null,
 
     pub fn servesProtocol(self: ModelEntry, protocol: Protocol) bool {
         if (self.protocols.len == 0) return true;

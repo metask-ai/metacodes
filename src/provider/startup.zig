@@ -56,6 +56,9 @@ pub const StartupRoute = struct {
     region: ?[]u8,
     plan: ?[]u8,
     auth_scheme: credential.AuthScheme,
+    /// The vendor dialect the route declares; null infers it from the model
+    /// name at the transport.
+    dialect: ?profile_mod.Vendor,
     limits: offer_mod.EffectiveLimits,
     capabilities: offer_mod.CapabilityMatrix,
     /// True when the model was supplied by the user and is not in the
@@ -486,6 +489,7 @@ fn own(
         .region = region,
         .plan = plan,
         .auth_scheme = profile.auth,
+        .dialect = offer.dialect,
         .limits = offer.limits,
         .capabilities = offer.capabilities,
         .model_from_user = model_from_user,

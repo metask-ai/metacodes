@@ -10,6 +10,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **A route says which vendor dialect it speaks.** `ProtocolRoute.dialect` and
+  `ModelEntry.dialect` (and `"dialect"` on a `custom_providers` channel or model)
+  name the vendor whose parameters the request carries, the way an OpenRouter
+  endpoint names its upstream. The declaration travels with the route's auth
+  scheme to the session, a `/model` switch, child agents, swarm teammates and
+  `AgentSession`. A route that declares nothing keeps model-name inference, so
+  existing configurations behave as before; an unknown value fails the definition.
+- **OpenRouter's own request surface.** Offers ingested from an OpenRouter catalog
+  declare the new OpenRouter dialect: `reasoning: {effort}` and `delta.reasoning`,
+  whatever the upstream model is called. A `deepseek/...` model through OpenRouter
+  no longer gets DeepSeek's native `thinking` fields.
+
 ### Changed
 
 - **One integration file per model vendor.** The OpenAI-compatible dialects that

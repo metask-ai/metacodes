@@ -498,6 +498,7 @@ fn applyStartupOutcome(
             // must not overwrite it later in startup.
             config.model_explicit = true;
             config.auth_scheme = route.auth_scheme;
+            config.dialect = route.dialect;
             const rendered = route.offer_id.render();
             config.selected_offer_id = allocator.dupe(u8, &rendered) catch null;
             config.resolved_provider_id = allocator.dupe(u8, route.provider_id.slice()) catch null;

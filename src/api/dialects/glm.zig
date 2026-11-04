@@ -16,7 +16,7 @@
 //!
 //! ## 协议
 //!
-//! - `openai_chat` 与 `anthropic_messages` 两条 wire 上都按模型名认出 GLM。
+//! - `openai_chat` 路由与 `anthropic_messages` 路由都声明本方言(`.glm`)。
 //! - 鉴权:Bearer。
 //!
 //! ## 思考与推理

@@ -551,6 +551,9 @@ pub const Client = struct {
     /// Immutable Runtime-scoped model dialect lookup. Ordinary App/CLI clients
     /// use the built-in resolver; AgentRuntime injects its Snapshot resolver.
     dialect_resolver: dialect_mod.Resolver = .{},
+    /// The dialect the route declares (`ModelOffer.dialect`); null infers it
+    /// from the model name. Set with the route, like `auth_scheme`.
+    dialect_vendor: ?dialect_mod.Vendor = null,
     abort_registry: provider_mod.RequestAbortRegistry = .{},
     /// 收头阶段空闲上限,见 DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
     stream_idle_timeout_ms: u64 = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
@@ -744,7 +747,7 @@ pub const Client = struct {
     /// image_input 的声明(Host 优先)。**序列化守门与能力查询的唯一出口**——两条 send 路径和
     /// `supportsForModel` 都从这里拿 profile,声明不可能只影响其中一边。
     pub fn dialectFor(client: *const Client, model: []const u8) dialect_mod.Dialect {
-        var dialect = client.dialect_resolver.resolve(.anthropic, model);
+        var dialect = client.dialect_resolver.resolve(.anthropic, client.dialect_vendor, model);
         dialect.declareImageInput(client.host_capabilities.imageInputFor(model), client.catalog.imageInputFor(model));
         return dialect;
     }

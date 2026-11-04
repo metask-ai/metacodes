@@ -1,4 +1,4 @@
-//! The vendors that have a dialect of their own.
+//! Which vendor dialect a route speaks.
 //!
 //! A wire protocol (`Protocol.Wire`) says how the bytes are framed — OpenAI
 //! chat, Anthropic messages, Gemini. A *dialect* says what the vendor behind
@@ -7,9 +7,11 @@
 //! can need different dialects (DeepSeek's own endpoint versus the same model
 //! through OpenRouter), and one vendor can be reached over several wires.
 //!
-//! Today the vendor is recognised from the model name
-//! (`src/api/dialects/registry.zig`). The type lives in the provider kernel so
-//! that a route can name its vendor without reaching into the transport layer.
+//! Routes declare their dialect (`ProtocolRoute.dialect`, `ModelEntry.dialect`)
+//! the way an OpenRouter endpoint declares its upstream provider. A route that
+//! declares none falls back to guessing from the model name — the behaviour
+//! every route had before this type existed, kept so custom providers written
+//! for it keep working.
 //!
 //! Each value has one integration file, `src/api/dialects/<tag>.zig`, whose
 //! header is the integration document for that vendor; the registry
@@ -38,6 +40,8 @@ pub const Vendor = enum {
     minimax,
     /// Mistral.
     mistral,
+    /// OpenRouter's normalized request surface, whatever the upstream model.
+    openrouter,
 
     pub fn parse(text: []const u8) ?Vendor {
         inline for (@typeInfo(Vendor).@"enum".fields) |field| {
@@ -53,7 +57,7 @@ pub const Vendor = enum {
 
 test "Vendor.parse accepts exactly the tag names" {
     try std.testing.expectEqual(Vendor.deepseek, Vendor.parse("deepseek").?);
-    try std.testing.expectEqual(Vendor.mistral, Vendor.parse("mistral").?);
+    try std.testing.expectEqual(Vendor.openrouter, Vendor.parse("openrouter").?);
     try std.testing.expect(Vendor.parse("DeepSeek") == null);
     try std.testing.expect(Vendor.parse("") == null);
     inline for (@typeInfo(Vendor).@"enum".fields) |field| {

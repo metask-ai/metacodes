@@ -1,7 +1,7 @@
 //! # Anthropic Claude 接入
 //!
-//! Anthropic messages wire 上 Claude 的方言,也是这条 wire 的兜底方言:名字认不出厂商的
-//! Anthropic 兼容路由都用它。别家的 Anthropic 方言(GLM、DeepSeek)
+//! Anthropic messages wire 上 Claude 的方言,也是这条 wire 的兜底方言:没声明方言、
+//! 名字又认不出厂商的 Anthropic 兼容路由都用它。别家的 Anthropic 方言(GLM、DeepSeek)
 //! 以 `wire` 为基础只改不同的方法。
 //!
 //! ## 接入点

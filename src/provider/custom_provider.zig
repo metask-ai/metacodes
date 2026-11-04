@@ -33,6 +33,7 @@ pub const ProviderProfile = profile_mod.ProviderProfile;
 pub const ChannelDescriptor = profile_mod.ChannelDescriptor;
 pub const ModelEntry = profile_mod.ModelEntry;
 pub const Protocol = profile_mod.Protocol;
+pub const Vendor = profile_mod.Vendor;
 
 pub const SCHEMA_VERSION: u16 = 1;
 
@@ -55,6 +56,9 @@ pub const DefinitionError = error{
     /// The protocol names a wire no transport serves. A novel wire needs a
     /// reviewed adapter; guessing one would send bytes no server understands.
     UnknownWire,
+    /// A `dialect` that names no vendor (`vendor.zig`). Guessing one would
+    /// write another vendor's parameters into the request.
+    UnknownDialect,
     UnknownAuthScheme,
     UnknownCredentialKind,
     UnknownCapability,
@@ -415,7 +419,7 @@ fn parseChannels(
         // whose base_url passed the check above is rejected again by
         // `validateProfile` — making the documented `endpoint_policy` inert for
         // exactly the plaintext relay/proxy case it exists to express.
-        routes[0] = .{ .protocol = protocol, .policy = policy };
+        routes[0] = .{ .protocol = protocol, .policy = policy, .dialect = try parseDialect(item.object.get("dialect")) };
 
         out[index] = .{
             .id = channel_id,
@@ -450,9 +454,19 @@ fn parseModels(arena: std.mem.Allocator, value: ?std.json.Value) DefinitionError
             .capabilities = try parseCapabilities(item.object.get("capabilities")),
             .quote = try parseQuote(item.object.get("price")),
             .controls = try parseControls(arena, item.object.get("controls")),
+            .dialect = try parseDialect(item.object.get("dialect")),
         };
     }
     return out;
+}
+
+/// `"dialect": "<vendor>"` on a channel (its route) or a model. Absent keeps
+/// model-name inference; a value that names no vendor is an error.
+fn parseDialect(value: ?std.json.Value) DefinitionError!?Vendor {
+    const raw = value orelse return null;
+    if (raw == .null) return null;
+    const text = stringOf(raw) orelse return error.UnknownDialect;
+    return Vendor.parse(text) orelse error.UnknownDialect;
 }
 
 fn parseLimits(value: ?std.json.Value) DefinitionError!offer.EffectiveLimits {
@@ -753,6 +767,38 @@ test "a declarative protocol keeps its own path but reaches a real transport" {
     // The wire is what selects the transport, so a relay that only moved the
     // path does not need an adapter.
     try testing.expectEqual(profile_mod.Protocol.Wire.openai_chat, protocol.wire().?);
+}
+
+test "a declared dialect lands on the route and the model; an unknown one is an error" {
+    const a = testing.allocator;
+    var definitions = try parse(a,
+        \\{"custom_providers": {"x": {
+        \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat","dialect":"deepseek"}],
+        \\  "models": [{"request_model_id":"m"},{"request_model_id":"n","dialect":"openrouter"}]}}}
+    );
+    defer definitions.deinit();
+    const built = definitions.profiles()[0];
+    try testing.expectEqual(Vendor.deepseek, built.channels[0].routes[0].dialect.?);
+    try testing.expect(built.models[0].dialect == null);
+    try testing.expectEqual(Vendor.openrouter, built.models[1].dialect.?);
+
+    // A model's declaration outranks its route's in the offer.
+    var catalog = try @import("registry.zig").OfferCatalog.build(a, &.{built}, .{});
+    defer catalog.deinit();
+    for (catalog.items()) |item| {
+        const want: Vendor = if (std.mem.eql(u8, item.request_model_id, "n")) .openrouter else .deepseek;
+        try testing.expectEqual(want, item.dialect.?);
+    }
+
+    inline for (.{ "\"DeepSeek\"", "\"anthropic\"", "3" }) |bad| {
+        try testing.expectError(error.UnknownDialect, parse(a,
+            \\{"custom_providers": {"x": {
+            \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat","dialect":
+        ++ bad ++
+            \\}],
+            \\  "models": [{"request_model_id":"m"}]}}}
+        ));
+    }
 }
 
 test "a novel wire is rejected rather than guessed" {

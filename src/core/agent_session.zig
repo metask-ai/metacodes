@@ -755,6 +755,9 @@ pub const SessionConfig = struct {
     /// Null keeps the historical `authorization: Bearer` bytes, so an embedder
     /// that names no provider is byte-identical.
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
+    /// The vendor dialect the resolved route declares; null infers it from
+    /// the model name, which is what a Session did before routes could say.
+    dialect: ?@import("../provider/vendor.zig").Vendor = null,
     api_key: []const u8,
     model: []const u8,
     base_url: ?[]const u8 = null,
@@ -1390,6 +1393,8 @@ pub const AgentSession = struct {
     /// own route does; a subagent sending bearer at an `x-api-key` endpoint has
     /// the right key and the wrong header.
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
+    /// Carried with `auth_scheme`: a tool-scoped provider writes the route's dialect.
+    dialect: ?@import("../provider/vendor.zig").Vendor = null,
     /// Owned copy of `SessionConfig.model_capabilities`, handed to every
     /// provider this Session builds.
     model_capabilities: image_capability.Declarations = .{},
@@ -1491,7 +1496,7 @@ pub const AgentSession = struct {
             self.base_url,
             self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = self.auth_scheme, .limits = null, .capability_declarations = self.model_capabilities },
+            .{ .auth_scheme = self.auth_scheme, .dialect = self.dialect, .limits = null, .capability_declarations = self.model_capabilities },
         );
     }
 
@@ -1592,7 +1597,7 @@ pub const AgentSession = struct {
             base_url,
             config.openai_protocol,
             runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = config.auth_scheme, .limits = null, .capability_declarations = model_capabilities },
+            .{ .auth_scheme = config.auth_scheme, .dialect = config.dialect, .limits = null, .capability_declarations = model_capabilities },
         );
         errdefer owned_provider.deinit();
         if (config.reasoning_effort) |effort| try owned_provider.provider().setReasoningEffort(effort);
@@ -1641,6 +1646,7 @@ pub const AgentSession = struct {
             .base_url = base_url,
             .openai_protocol = config.openai_protocol,
             .auth_scheme = config.auth_scheme,
+            .dialect = config.dialect,
             .model_capabilities = model_capabilities,
             .provider = owned_provider,
             .reasoning_effort = config.reasoning_effort,
@@ -1875,7 +1881,7 @@ pub const AgentSession = struct {
             self.base_url,
             self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = self.auth_scheme, .limits = null, .capability_declarations = self.model_capabilities },
+            .{ .auth_scheme = self.auth_scheme, .dialect = self.dialect, .limits = null, .capability_declarations = self.model_capabilities },
         ) catch |err| {
             self.cancelMutation();
             return err;

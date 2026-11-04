@@ -234,7 +234,10 @@ pub fn buildChannels(
     endpoints: []const Endpoint,
 ) AdapterError![]const profile_mod.ChannelDescriptor {
     const routes = try arena.alloc(profile_mod.ProtocolRoute, 1);
-    routes[0] = .{ .protocol = .openai_chat };
+    // OpenRouter normalizes every upstream onto its own request surface, so the
+    // route speaks OpenRouter's dialect whoever serves it
+    // (`src/api/dialects/openrouter.zig`).
+    routes[0] = .{ .protocol = .openai_chat, .dialect = .openrouter };
 
     // Shared by every endpoint's entry: one copy per model, not per route.
     const display_name = try dupe(arena, model.display_name);
