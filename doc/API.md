@@ -993,8 +993,12 @@ compatibility shim between revisions: pin a bundle, not only a semantic version.
 What the seven tables cover, provider protocol selection, the `on_event`
 observation stream and its visible-output tags, input submitted to an active
 Run (`session->submit_input`, the `input_adopted` event and the `RunResultV1`
-input counts), the structured reason a Run stopped with `STOP_API_ERROR` (the
-`model_error` event), the in-place credential update (`session->update_credential`), the Session goal (the `goal` table, goal-continuation Runs, the
+input counts), automatic compaction inside a Run (the model window, a
+provider's context-window refusal and checkpoint capacity each compact the
+Conversation at a safe boundary and the same Run continues; the summary
+request is budgeted and the replacement commits only if the checkpoint fits —
+the `auto_compact` event and its `cause`), the structured reason a Run stopped
+with `STOP_API_ERROR` (the `model_error` event), the in-place credential update (`session->update_credential`), the Session goal (the `goal` table, goal-continuation Runs, the
 `goal_updated` event), the host-scheduled team (`enable_teams`, the `team`
 config, and the `team` table's `describe` and `poll`), the Workspace Skill
 catalog and its source priorities (`SkillSourceV1.priority` and the query's

@@ -1595,6 +1595,35 @@ test "CoreEvent decoder covers every ABI v1 tag" {
     }
 }
 
+test "auto_compact carries the cause of a compaction inside a Run (issue #430)" {
+    // A Run compacts at its own boundaries; `cause` says which pressure asked.
+    // The set is open (a Host must accept a cause it does not know), these
+    // are the ones a Revision 26 Run reports.
+    const causes = [_][]const u8{
+        "pre_sampling_pending_turn_threshold",
+        "post_tool_follow_up_threshold",
+        "context_window_exceeded_recovery",
+        "durable_capacity_threshold",
+        "durable_capacity_recovery",
+        "summary_fallback",
+        "tool_result_pressure",
+    };
+    for (causes) |cause| {
+        const encoded = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"auto_compact\":{{\"dropped\":4,\"kept\":10,\"before_tokens\":9000,\"after_tokens\":2000,\"cause\":\"{s}\"}}}}",
+            .{cause},
+        );
+        defer std.testing.allocator.free(encoded);
+        const parsed = try decodeCoreEvent(std.testing.allocator, encoded);
+        defer parsed.deinit();
+        const event = parsed.value.known.auto_compact;
+        try std.testing.expectEqualStrings(cause, event.cause);
+        try std.testing.expectEqual(@as(u32, 4), event.dropped);
+        try std.testing.expectEqual(@as(u64, 2000), event.after_tokens);
+    }
+}
+
 test "goal events and documents carry only goals the runtime could have written (Revision 23)" {
     const a = std.testing.allocator;
     const good = "{\"id\":\"0123456789abcdef01234567\",\"objective\":\"ship it\",\"status\":\"active\",\"token_budget\":null,\"tokens_used\":0,\"time_used_ms\":0,\"created_at_ms\":1,\"updated_at_ms\":1}";

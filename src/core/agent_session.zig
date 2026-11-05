@@ -1447,6 +1447,11 @@ pub const AgentSession = struct {
     /// finishes. Null is the ordinary path: the loop assembles and commits
     /// exactly as before, unobserved.
     response_observer: ?@import("response_candidate.zig").Observer = null,
+    /// Run-scoped durable-state compaction control (issue #430). Installed by
+    /// the embedding facade around one Run together with its budgeted
+    /// Provider, like `response_observer`; null leaves compaction to the
+    /// loop's own token-window policy.
+    compaction_control: ?@import("compaction_control.zig").Control = null,
     /// Host input submitted to the active Run (#270). Opened at admission,
     /// closed on every path that ends the Run; between Runs it keeps the
     /// counts of the last one (`runInputReconciliation`).
@@ -2482,6 +2487,16 @@ pub const AgentSession = struct {
         self.response_observer = observer;
     }
 
+    /// Install the durable-state compaction control for the Runs that follow,
+    /// or clear it with null (issue #430). Paired with the facade-owned
+    /// Provider override exactly like `setResponseObserver`.
+    pub fn setCompactionControl(
+        self: *AgentSession,
+        control: ?@import("compaction_control.zig").Control,
+    ) void {
+        self.compaction_control = control;
+    }
+
     /// Install the durable-state admission for the input window of the Runs
     /// admitted while it is set, or clear it with null. The facade installs
     /// its budget controller here before admission and clears it after the
@@ -2719,6 +2734,7 @@ pub const AgentSession = struct {
                 } else null,
                 .ui_requester = self.permission_ctx.ui_requester,
                 .response_observer = self.response_observer,
+                .compaction_control = self.compaction_control,
                 .run_inputs = &self.run_inputs,
                 .emit_tool_cards = true,
                 .project_dir = self.workspace.root,

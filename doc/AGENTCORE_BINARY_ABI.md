@@ -457,7 +457,7 @@ The v1 observation set is:
 | Run state and coarse progress | `progress` | Current 1-based turn and cumulative tool-call progress sample; not a lifecycle boundary |
 | Context management and accounting | `usage` | Token-usage delta |
 | Context management and accounting | `context_warning` | Context-pressure thresholds and level |
-| Context management and accounting | `auto_compact` | Conversation compaction summary |
+| Context management and accounting | `auto_compact` | A compaction inside this Run committed: messages dropped and kept, context estimate before and after, and the pressure that asked (see "Automatic compaction inside a Run") |
 | Permission-decision evidence | `permission_provenance` | Final Permission decision, canonical source, request binding, generation, and typed callback outcome |
 | System prompt audit | `prompt_manifest` | The sections of the system prompt this Run sends (id, order, origin, class, SHA-256) and the prompt's SHA-256, when it differs from the previous Run's |
 | Goal accounting | `goal_updated` | The Session's goal changed during this Run: its budget ran out (`budget_limited`), or the Run ended and its usage and time are on the goal; carries the whole goal as `goal->get` writes it (see "Goals") |
@@ -873,6 +873,67 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
 reason in Revision 26, and a Host must not infer one by parsing diagnostics.
+
+### Automatic compaction inside a Run
+
+A Run compacts its own Conversation when context pressure that compaction can
+relieve would otherwise stop it, and then continues: the same Run ID, the same
+turn, no Host replay of the instruction. It uses the same compact kernel as
+`session_compact`, at the shared loop's safe boundaries — before a sampling
+request and after a turn's tool results are committed — never in the middle
+of a tool batch. Three pressures start it:
+
+| Pressure | When | `auto_compact.cause` |
+|---|---|---|
+| Model window | The pending request reaches the auto-compact threshold derived from the model's real input window and output reservation | `pre_sampling_pending_turn_threshold`, `post_tool_follow_up_threshold` |
+| Provider refusal | The provider rejects the request as exceeding its context window | `context_window_exceeded_recovery` |
+| Checkpoint capacity | The durable estimate reaches `soft_bytes` (what `RUN_RESULT_COMPACTION_RECOMMENDED` reports), or the next sampling request would not fit under `hard_bytes` (or `provider_request_cap_bytes`) beside the durable state | `durable_capacity_threshold`, `durable_capacity_recovery` |
+
+`summary_fallback` and `tool_result_pressure` replace the cause when the
+summary request failed (the kernel's degraded replacement, which keeps the
+user's own requests) or oversized tool results had to be cut as well. The cause
+set is open; a Host must accept one it does not know. While a compaction runs,
+`run_state.phase` is `compacting`.
+
+Compaction answers to the Run's durable budget:
+
+- The summary request goes through the Run's budgeted Provider. Its request and
+  result caps, the audit reserve, every live reservation and the terminal
+  reserve apply, it is charged to usage accounting (`usage` events and the
+  Session goal) like any request, and it counts as a provider operation. It is
+  admitted as maintenance: against the caps and the live reservations, not
+  against the Conversation it may replace, so a near-hard Session can compact.
+  A capacity refusal is deferred before any network I/O; the request is
+  re-issued after the compaction.
+- The replacement commits only if its exact checkpoint, every live
+  reservation (unfinished operations, input accepted by `submit_input` and not
+  yet adopted) and the terminal reserve fit under `hard_bytes`. After the
+  commit the Run's durable estimate is re-measured from the resulting state;
+  reservations are untouched.
+- A summary that exceeds `provider_result_cap_bytes`, a request over a cap, or
+  a refused replacement ends the Run with the ordinary budget terminal
+  (`STOP_CHECKPOINT_RESOURCE_LIMIT` / `STOP_CHECKPOINT_BUDGET_EXHAUSTED` with
+  `required_checkpoint_bytes`); the Conversation is not replaced.
+
+Recovery is bounded and stops with an actionable reason:
+
+- A provider refusal is answered with at most one compaction per turn and one
+  re-issue of that turn. When nothing older than the retained suffix exists,
+  when the kernel's savings gate refuses (one oversized message, typically the
+  newest, dominates the request), or when the re-issued request is refused
+  again, the Run stops with `STOP_API_ERROR` and its `model_error` category is
+  `context_window`. AgentCore never trims history to make a request fit.
+- Checkpoint capacity starts at most three compactions per Run, and an attempt
+  that relieved nothing (or found nothing to compact) is not repeated until
+  the durable estimate has grown. When capacity is still short the Run stops
+  with `STOP_CHECKPOINT_BUDGET_EXHAUSTED` and the bytes it would have needed.
+
+`session_abort` during a compaction cancels its summary request. Nothing is
+replaced; tool calls already executed keep their committed results and are
+never re-executed; tool calls and results stay paired; Permission state is
+unchanged; input accepted during the compaction and not yet adopted is
+released and counted in `input_accepted_count` but not in
+`input_adopted_count`. The Run stops with `STOP_ABORTED`.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
