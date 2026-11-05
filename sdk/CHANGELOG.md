@@ -14,6 +14,14 @@ empty `### Migration`.
 
 ## Unreleased
 
+### Changed
+
+- The library is rebuilt from a kernel that can edit a user message and rerun
+  from it (#432): the shared Conversation gains a rewind that drops a user
+  message and everything after it. ABI revision 26 does not expose it, so no
+  Host-visible behaviour, layout or status changes; a Session's checkpoint and
+  Runs are as before.
+
 ## 0.13.0 — 2026-10-31
 
 ### Added
