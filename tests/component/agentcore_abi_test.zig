@@ -6139,7 +6139,7 @@ test "L2 issue #430: a compaction the budget refuses ends the public Run with th
     // The Host sees one consistent budget terminal: the stop code and the
     // checkpoint outcome name the resource limit, and the terminal RunState
     // is `failed` — never `aborted`, which only a cancellation produces.
-    if (server.requestAt(6)) |r| try std.testing.expectEqual(wire.STOP_CHECKPOINT_RESOURCE_LIMIT, result.stop_reason_code);
+    try std.testing.expectEqual(wire.STOP_CHECKPOINT_RESOURCE_LIMIT, result.stop_reason_code);
     try std.testing.expectEqual(wire.RUN_CHECKPOINT_RESOURCE_LIMIT, result.checkpoint_outcome_code);
     try std.testing.expectEqual(@as(?sdk.protocol.RunStatePhase, .failed), probe.last_phase);
     try std.testing.expectEqual(@as(usize, 0), probe.model_errors);
