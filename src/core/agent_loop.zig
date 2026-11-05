@@ -1985,11 +1985,8 @@ fn runCounted(
                     opts.compaction_control,
                     false,
                 );
-                if (previous_model_compact_outcome == .api_error) {
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
-                }
-                if (previous_model_compact_outcome == .aborted) {
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+                if (compactStopReason(previous_model_compact_outcome, opts.abort)) |stop_reason| {
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
                 }
             }
         }
@@ -2023,11 +2020,8 @@ fn runCounted(
                 opts.compaction_control,
                 false,
             );
-            if (pre_sampling_compact == .api_error) {
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
-            }
-            if (pre_sampling_compact == .aborted) {
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+            if (compactStopReason(pre_sampling_compact, opts.abort)) |stop_reason| {
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
             }
         }
 
@@ -2448,10 +2442,10 @@ fn runCounted(
                     })) {
                         .retry => continue :request_recovery,
                         .aborted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls }),
-                        .stop => {
-                            model_error.noteRequestError(err);
-                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
-                        },
+                        // The owner recorded its terminal (a refused
+                        // replacement, or the deferred request abandoned):
+                        // its outcome, not a model failure, explains the stop.
+                        .owner_terminal => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls }),
                     },
                     error.ContextWindowExceeded => {
                         if (!recoverContextWindowExceeded(.{
@@ -4373,11 +4367,8 @@ fn runCounted(
             opts.compaction_control,
             false,
         );
-        if (post_tool_compact == .api_error) {
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
-        }
-        if (post_tool_compact == .aborted) {
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+        if (compactStopReason(post_tool_compact, opts.abort)) |stop_reason| {
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
         // L4 诊断:turn span 终点(本轮有 tool_use、将进入下一轮的正常路径;无工具的
@@ -4898,7 +4889,31 @@ fn estimateNextRequestTokensOrFallback(
     };
 }
 
-const AutoCompactOutcome = enum { not_needed, compacted, skipped_no_savings, aborted, api_error };
+const AutoCompactOutcome = enum {
+    not_needed,
+    compacted,
+    skipped_no_savings,
+    /// The Run was cancelled while compacting.
+    aborted,
+    /// The durable-state owner refused the replacement at the commit point
+    /// (issue #430). It recorded its own terminal; the Run stops the way a
+    /// request the owner refused stops, never as a cancellation.
+    refused,
+    api_error,
+};
+
+/// The stop a compaction outcome imposes on the Run, or null when the Run
+/// continues. One mapping for every boundary, so a new outcome cannot be
+/// silently treated as "continue".
+fn compactStopReason(outcome: AutoCompactOutcome, abort: ?*const AbortSignal) ?StopReason {
+    return switch (outcome) {
+        .not_needed, .compacted, .skipped_no_savings => null,
+        .aborted => stopReasonForAbort(abort),
+        // A refused replacement ends where a refused owner admission ends: a
+        // failed request whose reason is the owner's recorded outcome.
+        .refused, .api_error => .api_error,
+    };
+}
 
 fn serializeToolSchemasForCache(
     allocator: std.mem.Allocator,
@@ -5086,7 +5101,9 @@ fn recoverContextWindowExceeded(args: RecoveryArgs) bool {
         };
         switch (outcome) {
             .compacted => return true,
-            .aborted => return false,
+            // Cancelled, or the durable-state owner refused the replacement
+            // and recorded its own terminal: not a context-window failure.
+            .aborted, .refused => return false,
             .api_error => {
                 noteUnrecoveredContextWindow(args.abort);
                 return false;
@@ -5140,18 +5157,35 @@ fn noteUnrecoveredContextWindow(abort: ?*const AbortSignal) void {
     );
 }
 
-const DurableRecovery = enum { retry, aborted, stop };
+const DurableRecovery = enum {
+    /// Re-issue the same turn.
+    retry,
+    /// The Run was cancelled.
+    aborted,
+    /// The owner recorded the Run's terminal: it refused the replacement, or
+    /// the loop gave up on the deferred request and told it so.
+    owner_terminal,
+};
 
 /// The durable-state owner deferred the pending request
 /// (`error.DurableCapacityExceeded`): compact once for its capacity, then
-/// re-issue the same turn whatever happened. A compaction that relieved
-/// nothing has told the owner so through `settle`, and the re-issued request
-/// then meets the owner's real refusal and its terminal outcome — the
-/// recovery cannot loop (issue #430).
+/// re-issue the same turn. A compaction that relieved nothing has told the
+/// owner so through `settle`, and the re-issued request then meets the
+/// owner's real refusal and its terminal outcome — the recovery cannot loop
+/// (issue #430). When the loop stops without re-issuing (the turn's recovery
+/// bound is spent, or the compaction itself failed) it abandons the deferred
+/// request to the owner, which records the same refusal, so the Run never
+/// ends as an unexplained provider failure.
 fn recoverDurableCapacity(args: RecoveryArgs) DurableRecovery {
+    // Only a durable-state owner defers; without one there is nobody to ask.
+    const control = args.control orelse unreachable;
     const st = args.state;
     st.attempts += 1;
-    if (st.attempts > st.cap or args.control == null) return .stop;
+    if (st.attempts > st.cap) {
+        log.err("agent", "durable-capacity recovery exhausted turn={d} attempts={d}", .{ args.turn_number, st.attempts });
+        control.abandonDeferred();
+        return .owner_terminal;
+    }
     const outcome = runAutoCompactControlled(
         args.conversation,
         args.provider,
@@ -5182,11 +5216,16 @@ fn recoverDurableCapacity(args: RecoveryArgs) DurableRecovery {
         true,
     ) catch |err| {
         log.err("agent", "durable-capacity compaction failed turn={d}: {s}", .{ args.turn_number, @errorName(err) });
-        return .stop;
+        control.abandonDeferred();
+        return .owner_terminal;
     };
     return switch (outcome) {
         .aborted => .aborted,
-        .api_error => .stop,
+        .refused => .owner_terminal,
+        .api_error => {
+            control.abandonDeferred();
+            return .owner_terminal;
+        },
         .compacted, .not_needed, .skipped_no_savings => .retry,
     };
 }
@@ -5345,7 +5384,7 @@ const ControlledCommit = struct {
     ) compact_kernel.CommitResult {
         const self: *ControlledCommit = @ptrCast(@alignCast(raw));
         if (signal.isAborted()) return .aborted;
-        if (!self.control.allowCommit(replacement)) return .aborted;
+        if (!self.control.allowCommit(replacement)) return .refused;
         return if (live.replaceWithOwnedIfSuffixUnchanged(suffix, replacement))
             .committed
         else
@@ -5409,7 +5448,12 @@ fn runAutoCompactControlled(
         @max(pressure.auto_compact_threshold, MIN_AUTO_COMPACT_THRESHOLD);
     const micro_threshold = forced_threshold orelse
         @max(@min(pressure.warning_threshold, auto_threshold), MIN_AUTO_COMPACT_THRESHOLD);
-    if (!forced and !durable_pressure and request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
+    // Both tool-result passes rewrite committed history in place. A
+    // durable-state owner admits durable changes only through the kernel's
+    // guarded commit, so with a control installed they do not run; the
+    // kernel's own reduction of its preview still does (issue #430).
+    const in_place_reduction = control == null;
+    if (in_place_reduction and !forced and !durable_pressure and request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
         var reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
         // Clearing deliberately preserves the most recent results, and skips
         // anything whose artifact envelope is its only recovery capability.
@@ -5545,7 +5589,7 @@ fn runAutoCompactControlled(
         // PostCompact hook below has extended the summary.
         defer if (control) |c| c.settle(trigger, switch (report.outcome) {
             .compacted, .degraded => .{ .committed = conversation },
-            .no_change, .aborted => .not_committed,
+            .no_change, .aborted, .refused => .not_committed,
         });
         // Persist metered usage before the diagnostic event. If the process is
         // hard-killed between the two complete NDJSON records, budget evidence
@@ -5569,6 +5613,10 @@ fn runAutoCompactControlled(
             .aborted => {
                 compact_lifecycle_outcome = "aborted";
                 return .aborted;
+            },
+            .refused => {
+                compact_lifecycle_outcome = "refused";
+                return .refused;
             },
             .no_change => {
                 if (compact_model_override == null and report.summary_request != null) {
@@ -5622,24 +5670,26 @@ fn runAutoCompactControlled(
     if (outcome == .skipped_no_savings) return outcome;
 
     if (pressure.isAtBlockingLimit()) {
-        var reduced = conversation.microcompactToolResultsByRecentResults(0);
-        // Same rationale as the stale-result valve above, and it matters more
-        // here: at the blocking limit the request is otherwise rejected, so a
-        // single unbounded surviving result is the difference between
-        // recovering and returning api_error.
-        reduced.merge(conversation.truncateLargeToolResults(
-            conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
-        ));
-        if (reduced.changed()) {
-            outcome = .compacted;
-            const before_block_tokens = request_tokens_before;
-            request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-            pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
-            log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
-            // This is the same lossy operation as the earlier stale-result
-            // pressure valve.  Keep the mechanism kind stable; the trigger
-            // cause already records that this happened at the blocking limit.
-            emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
+        if (in_place_reduction) {
+            var reduced = conversation.microcompactToolResultsByRecentResults(0);
+            // Same rationale as the stale-result valve above, and it matters more
+            // here: at the blocking limit the request is otherwise rejected, so a
+            // single unbounded surviving result is the difference between
+            // recovering and returning api_error.
+            reduced.merge(conversation.truncateLargeToolResults(
+                conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
+            ));
+            if (reduced.changed()) {
+                outcome = .compacted;
+                const before_block_tokens = request_tokens_before;
+                request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+                pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
+                log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
+                // This is the same lossy operation as the earlier stale-result
+                // pressure valve.  Keep the mechanism kind stable; the trigger
+                // cause already records that this happened at the blocking limit.
+                emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
+            }
         }
         if (pressure.isAtBlockingLimit()) {
             // A forced recovery already paid for its compaction; the retry the
@@ -6361,13 +6411,13 @@ test "auto-compact preflight never rewrites an already committed tool_result" {
     try std.testing.expectEqualStrings(body_before, body);
 }
 
-test "auto-compact emits stale tool-result projection from the real microcompact path" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    try c.appendText(.user, "inspect the accumulated results");
+/// One user prompt, then fourteen 12 KB tool results: enough stale results
+/// for the microcompact pass to clear all but the most recent.
+const STALE_TOOL_RESULT_COUNT = 14;
 
-    const result_count = 14;
+fn staleToolResultFixture(a: std.mem.Allocator, c: *Conversation) !void {
+    try c.appendText(.user, "inspect the accumulated results");
+    const result_count = STALE_TOOL_RESULT_COUNT;
     const tool_uses = try a.alloc(msg.Block, result_count);
     for (tool_uses, 0..) |*block, index| {
         var id_buf: [24]u8 = undefined;
@@ -6393,6 +6443,14 @@ test "auto-compact emits stale tool-result projection from the real microcompact
         } };
     }
     try c.append(.{ .role = .user, .blocks = tool_results });
+}
+
+test "auto-compact emits stale tool-result projection from the real microcompact path" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try staleToolResultFixture(a, &c);
+    const result_count = STALE_TOOL_RESULT_COUNT;
 
     var provider_state = TestProviderState{
         .allocator = a,
@@ -6474,6 +6532,56 @@ test "auto-compact emits stale tool-result projection from the real microcompact
         @as(u32, result_count - conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP),
         cap.changed_items,
     );
+}
+
+test "issue #430: with a compaction control no in-place tool-result reduction rewrites durable history" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try staleToolResultFixture(a, &c);
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .max_input_tokens = 100_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    // The same pending request the previous test clears stale results for:
+    // inside the microcompact band, below the auto-compact threshold.
+    const base_tokens = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    const target_tokens: usize = 51_000;
+    const padding_len = if (base_tokens < target_tokens) (target_tokens - base_tokens) * 4 else 0;
+    const system_prompt = try a.alloc(u8, padding_len);
+    defer a.free(system_prompt);
+    @memset(system_prompt, 's');
+    const before_tokens = try estimateNextRequestTokens(a, provider, &c, system_prompt, null, null, &.{}, null);
+    const pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), null, before_tokens);
+    try std.testing.expect(before_tokens > pressure.warning_threshold);
+    try std.testing.expect(before_tokens < pressure.auto_compact_threshold);
+
+    const Capture = struct {
+        projections: u32 = 0,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev == .context_projection) self.projections += 1;
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    const version = c.mutation_version;
+    var recorder = compaction_control.Recorder{};
+    const outcome = try runAutoCompactControlled(&c, provider, system_prompt, null, null, &.{}, null, null, null, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
+    // Nothing ran: no clearing, no truncation, no compaction attempt.
+    try std.testing.expectEqual(AutoCompactOutcome.not_needed, outcome);
+    try std.testing.expectEqual(@as(u32, 0), cap.projections);
+    try std.testing.expectEqual(version, c.mutation_version);
+    try std.testing.expectEqual(@as(u32, 0), recorder.begins);
+    for (c.messages.items[2].blocks) |block| switch (block) {
+        .tool_result => |result| try std.testing.expectEqual(@as(usize, 12 * 1024), result.content.len),
+        else => return error.TestUnexpectedResult,
+    };
 }
 
 test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool suffix" {
@@ -6972,7 +7080,7 @@ test "issue #430: a compaction control sees every attempt and its refusal keeps 
         try std.testing.expectEqual(compaction_control.Trigger.context_window, recorder.last_trigger.?);
         try std.testing.expect(c.compact_summary != null);
     }
-    // Refused at the commit point: aborted, nothing replaced.
+    // Refused at the commit point: refused, nothing replaced.
     {
         var c = Conversation.init(a);
         defer c.deinit();
@@ -6981,7 +7089,8 @@ test "issue #430: a compaction control sees every attempt and its refusal keeps 
         var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
         var recorder = compaction_control.Recorder{ .allow = false };
         const outcome = try runAutoCompactControlled(&c, testProvider(&provider_state), null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
-        try std.testing.expectEqual(AutoCompactOutcome.aborted, outcome);
+        // A refusal is the owner's terminal, never reported as a cancellation.
+        try std.testing.expectEqual(AutoCompactOutcome.refused, outcome);
         try std.testing.expectEqual(@as(u32, 1), recorder.not_committed);
         try std.testing.expectEqual(@as(u32, 0), recorder.committed);
         try std.testing.expect(c.compact_summary == null);
@@ -7009,6 +7118,86 @@ test "issue #430: a compaction control sees every attempt and its refusal keeps 
         try std.testing.expectEqual(AutoCompactOutcome.not_needed, none);
         try std.testing.expectEqual(@as(u32, 0), nothing.begins);
         try std.testing.expectEqual(@as(u32, 1), nothing.nothing);
+    }
+}
+
+test "issue #430: a refused replacement and an abandoned deferral end the Run as the owner's terminal" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = NullBackend.emit, .poll = NullBackend.poll };
+    // Every boundary maps a refusal to the failed-request stop, and only a
+    // cancellation to `aborted`.
+    try std.testing.expectEqual(@as(?StopReason, .api_error), compactStopReason(.refused, null));
+    try std.testing.expectEqual(@as(?StopReason, .api_error), compactStopReason(.api_error, null));
+    try std.testing.expectEqual(@as(?StopReason, .aborted), compactStopReason(.aborted, null));
+    try std.testing.expectEqual(@as(?StopReason, null), compactStopReason(.compacted, null));
+
+    var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
+    const Args = struct {
+        fn of(c: *Conversation, p: provider_mod.Provider, b: *const UiBackend, st: *ContextRecoveryState, alloc: std.mem.Allocator, control: compaction_control.Control) RecoveryArgs {
+            return .{
+                .conversation = c,
+                .provider = p,
+                .system_prompt = null,
+                .inject_user_context = null,
+                .synthetic_user_input = null,
+                .tool_defs = &.{},
+                .model_override = null,
+                .numbers = .{},
+                .keep_recent = 2,
+                .backend = b,
+                .sess = .single,
+                .trace_id = [_]u8{0} ** 12,
+                .depth = 0,
+                .state = st,
+                .turn_number = 1,
+                .context_warning_emitted = null,
+                .allocator = alloc,
+                .tasks = null,
+                .hookset = null,
+                .summary_reserve_tokens = null,
+                .request_gate = null,
+                .abort = null,
+                .goal_meter = null,
+                .control = control,
+            };
+        }
+    };
+    // The owner refuses the capacity compaction's replacement: its terminal,
+    // nothing to abandon.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var recorder = compaction_control.Recorder{ .allow = false };
+        var st = ContextRecoveryState{ .cap = 4 };
+        try std.testing.expectEqual(DurableRecovery.owner_terminal, recoverDurableCapacity(Args.of(&c, testProvider(&provider_state), &backend, &st, a, recorder.control())));
+        try std.testing.expectEqual(@as(u32, 1), recorder.allow_calls);
+        try std.testing.expectEqual(@as(u32, 0), recorder.abandoned);
+        try std.testing.expect(c.compact_summary == null);
+    }
+    // The turn's recovery bound is spent: the deferred request is abandoned
+    // to the owner without another compaction.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var recorder = compaction_control.Recorder{};
+        var st = ContextRecoveryState{ .cap = 1, .attempts = 1 };
+        try std.testing.expectEqual(DurableRecovery.owner_terminal, recoverDurableCapacity(Args.of(&c, testProvider(&provider_state), &backend, &st, a, recorder.control())));
+        try std.testing.expectEqual(@as(u32, 1), recorder.abandoned);
+        try std.testing.expectEqual(@as(u32, 0), recorder.begins);
+    }
+    // A compaction that relieved something re-issues the turn.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var recorder = compaction_control.Recorder{};
+        var st = ContextRecoveryState{ .cap = 4 };
+        try std.testing.expectEqual(DurableRecovery.retry, recoverDurableCapacity(Args.of(&c, testProvider(&provider_state), &backend, &st, a, recorder.control())));
+        try std.testing.expectEqual(@as(u32, 1), recorder.committed);
+        try std.testing.expectEqual(@as(u32, 0), recorder.abandoned);
     }
 }
 

@@ -2337,7 +2337,7 @@ pub const AgentSession = struct {
         std.debug.assert(self.state == .compacting);
         if (signal.isAborted()) return .aborted;
         if (context.guard) |guard| {
-            if (!guard.allows(replacement)) return .aborted;
+            if (!guard.allows(replacement)) return .refused;
         }
         if (!live.replaceWithOwnedIfSuffixUnchanged(suffix, replacement))
             return .concurrent_mutation;
@@ -4297,7 +4297,8 @@ test "AgentSession borrowed compact commit guard preserves Conversation on rejec
         },
         fake.provider(),
     );
-    try std.testing.expectEqual(compact_kernel.Outcome.aborted, report.outcome);
+    // A guard rejection is a refusal, reported apart from a cancellation.
+    try std.testing.expectEqual(compact_kernel.Outcome.refused, report.outcome);
     try std.testing.expectEqual(before_len, self.conversation.len());
     try std.testing.expectEqualStrings(
         "old user context",

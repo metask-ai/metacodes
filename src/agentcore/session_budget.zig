@@ -354,6 +354,12 @@ pub const Controller = struct {
     /// estimate has grown past it, so an attempt that did not help is never
     /// repeated against the same state.
     capacity_fruitless_at: ?u64 = null,
+    /// The bytes the last deferred root request needed (`CapacityDeferred`),
+    /// until a root request is admitted again. If the loop gives up on it
+    /// (`abandonDeferredCapacity`) this is the requirement the Run's budget
+    /// terminal reports — what the re-issued request would have been refused
+    /// with.
+    deferred_required_bytes: ?u64 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -420,7 +426,10 @@ pub const Controller = struct {
             // The request carries the Conversation, so compaction may shrink
             // it below the cap; an oversized single payload is what the
             // compaction then fails to relieve.
-            if (deferrable) return error.CapacityDeferred;
+            if (deferrable) {
+                self.deferred_required_bytes = request_bytes;
+                return error.CapacityDeferred;
+            }
             self.markOutcomeLocked(.budget_exhausted, request_bytes);
             return error.BudgetExhausted;
         }
@@ -458,7 +467,10 @@ pub const Controller = struct {
             return error.BudgetExhausted;
         };
         if (required > self.profile.hard_bytes) {
-            if (deferrable) return error.CapacityDeferred;
+            if (deferrable) {
+                self.deferred_required_bytes = required;
+                return error.CapacityDeferred;
+            }
             self.markOutcomeLocked(.budget_exhausted, required);
             return error.BudgetExhausted;
         }
@@ -470,6 +482,7 @@ pub const Controller = struct {
             .mcp => self.mcp_operations += 1,
         }
         if (maintenance) self.maintenance_operations += 1;
+        if (mode == .root_provider and !maintenance) self.deferred_required_bytes = null;
         return .{
             .controller = self,
             .reserved_bytes = reserved,
@@ -552,6 +565,19 @@ pub const Controller = struct {
         } else if (trigger == .durable_capacity) {
             self.capacity_fruitless_at = self.estimated_usage_bytes;
         }
+    }
+
+    /// The loop gave up on the deferred root request without re-issuing it
+    /// (issue #430): its recovery compaction failed, or the turn's recovery
+    /// bound is spent. Record the refusal the request would have met, with
+    /// the bytes it needed, so the Run ends with the budget terminal.
+    pub fn abandonDeferredCapacity(self: *Controller) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const required = self.deferred_required_bytes orelse
+            self.profile.hard_bytes +| 1;
+        self.deferred_required_bytes = null;
+        self.markOutcomeLocked(.budget_exhausted, required);
     }
 
     pub fn estimatedUsage(self: *Controller) u64 {
@@ -1550,10 +1576,15 @@ pub const RunCompaction = struct {
         .begin = beginFn,
         .allowCommit = allowFn,
         .settle = settleFn,
+        .abandonDeferred = abandonFn,
     };
 
     fn wantsFn(raw: *anyopaque) bool {
         return cast(raw).controller.wantsCapacityCompaction();
+    }
+
+    fn abandonFn(raw: *anyopaque) void {
+        cast(raw).controller.abandonDeferredCapacity();
     }
 
     fn beginFn(raw: *anyopaque, trigger: core.compaction_control.Trigger) void {
@@ -2907,6 +2938,37 @@ test "issue #430: a root request the checkpoint cannot hold is deferred without 
     var plain = projectedController(profile, 2600);
     try std.testing.expectError(error.BudgetExhausted, plain.beginOperation(.provider, 1000));
     try std.testing.expectEqual(Outcome.budget_exhausted, plain.outcome());
+}
+
+test "issue #430: an abandoned deferred request records the budget terminal with the bytes it needed" {
+    const profile = smallTestProfile();
+    // 2600 + terminal 128 + (1000 + 512 + 64) = 4304 > 4096: deferred.
+    var controller = projectedController(profile, 2600);
+    try std.testing.expectError(error.CapacityDeferred, controller.beginRootProviderOperation(1000));
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+    // The loop gives up without re-issuing: the refusal it would have met.
+    controller.abandonDeferredCapacity();
+    try std.testing.expectEqual(Outcome.budget_exhausted, controller.outcome());
+    try std.testing.expectEqual(@as(u64, 4304), controller.requiredBytes());
+    try std.testing.expectError(error.BudgetExhausted, controller.beginRootProviderOperation(1));
+
+    // An over-cap deferral reports the request's own size.
+    var over_cap = projectedController(profile, 0);
+    try std.testing.expectError(error.CapacityDeferred, over_cap.beginRootProviderOperation(profile.provider_request_cap_bytes + 1));
+    over_cap.abandonDeferredCapacity();
+    try std.testing.expectEqual(Outcome.budget_exhausted, over_cap.outcome());
+    try std.testing.expectEqual(profile.provider_request_cap_bytes + 1, over_cap.requiredBytes());
+
+    // A root request admitted after the deferral clears it; the terminal is
+    // still recorded, and its requirement is past hard.
+    var cleared = projectedController(profile, 2600);
+    try std.testing.expectError(error.CapacityDeferred, cleared.beginRootProviderOperation(1000));
+    var admitted = try cleared.beginRootProviderOperation(1);
+    admitted.release();
+    try std.testing.expect(cleared.deferred_required_bytes == null);
+    cleared.abandonDeferredCapacity();
+    try std.testing.expectEqual(Outcome.budget_exhausted, cleared.outcome());
+    try std.testing.expectEqual(profile.hard_bytes + 1, cleared.requiredBytes());
 }
 
 test "issue #430: a compaction summary is maintenance: admitted beside the replaced state, never charged as durable" {

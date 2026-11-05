@@ -23,7 +23,9 @@ empty `### Migration`.
   summary request is budgeted and accounted like any request; the replacement
   commits only if its checkpoint fits beside every live reservation. Recovery is
   bounded and stops with `STOP_API_ERROR` (`model_error` category
-  `context_window`) or the checkpoint budget terminal. `auto_compact` reports
+  `context_window`) or the checkpoint budget terminal, whose terminal
+  `run_state` phase is `failed` (only a cancellation is `aborted`). Committed
+  tool results are never cleared or truncated in place. `auto_compact` reports
   the new causes `durable_capacity_threshold` and `durable_capacity_recovery`.
 
 ### Migration

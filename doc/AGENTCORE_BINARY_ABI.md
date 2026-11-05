@@ -913,7 +913,10 @@ Compaction answers to the Run's durable budget:
 - A summary that exceeds `provider_result_cap_bytes`, a request over a cap, or
   a refused replacement ends the Run with the ordinary budget terminal
   (`STOP_CHECKPOINT_RESOURCE_LIMIT` / `STOP_CHECKPOINT_BUDGET_EXHAUSTED` with
-  `required_checkpoint_bytes`); the Conversation is not replaced.
+  `required_checkpoint_bytes`, and the matching `checkpoint_outcome_code`); the
+  Conversation is not replaced. The terminal `run_state.phase` is `failed`. A
+  refusal is never reported as `aborted`, which only a cancellation
+  (`session_abort`) produces.
 
 Recovery is bounded and stops with an actionable reason:
 
@@ -922,11 +925,18 @@ Recovery is bounded and stops with an actionable reason:
   when the kernel's savings gate refuses (one oversized message, typically the
   newest, dominates the request), or when the re-issued request is refused
   again, the Run stops with `STOP_API_ERROR` and its `model_error` category is
-  `context_window`. AgentCore never trims history to make a request fit.
+  `context_window`. AgentCore never trims history to make a request fit, and
+  never clears or truncates committed tool results in place (the stale
+  tool-result clearing a CLI Run applies below the compaction threshold does
+  not run). The only tool-result reduction is the compact kernel's own, applied
+  to the replacement before its guarded commit (`tool_result_pressure`).
 - Checkpoint capacity starts at most three compactions per Run, and an attempt
   that relieved nothing (or found nothing to compact) is not repeated until
   the durable estimate has grown. When capacity is still short the Run stops
-  with `STOP_CHECKPOINT_BUDGET_EXHAUSTED` and the bytes it would have needed.
+  with `STOP_CHECKPOINT_BUDGET_EXHAUSTED` and the bytes it would have needed:
+  whether the re-issued request is refused, or the recovery gives up without
+  re-issuing it (its compaction failed, or the turn's recovery bound is
+  spent), `required_checkpoint_bytes` is what the deferred request needed.
 
 `session_abort` during a compaction cancels its summary request. Nothing is
 replaced; tool calls already executed keep their committed results and are

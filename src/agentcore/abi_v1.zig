@@ -8454,7 +8454,9 @@ fn sessionCompact(
             .compacted => wire.COMPACT_COMPACTED,
             .no_change => wire.COMPACT_NO_CHANGE,
             .degraded => wire.COMPACT_DEGRADED,
-            .aborted => wire.COMPACT_ABORTED,
+            // A budget refusal of the replacement reports as the frozen v1
+            // ABORTED code; the budget outcome carries the reason.
+            .aborted, .refused => wire.COMPACT_ABORTED,
         },
         .before_context_tokens = @intCast(report.before_tokens),
         .after_context_tokens = @intCast(report.after_tokens),
@@ -14321,7 +14323,7 @@ test "compact bounds Provider payload and preserves checkpointability" {
     );
     try std.testing.expectEqual(@as(u32, 1), test_provider.calls);
     try std.testing.expectEqual(
-        core.compact_kernel.Outcome.aborted,
+        core.compact_kernel.Outcome.refused,
         report.outcome,
     );
     try std.testing.expectEqual(
@@ -14848,7 +14850,16 @@ const AutoCompactScriptProvider = struct {
     sampling_messages: [8]usize = [_]usize{0} ** 8,
     hook_failed: bool = false,
     estimate_checked: bool = false,
+    /// A copy of the live Conversation at the first sampling request after a
+    /// compaction, and what `measureRunCheckpoint` said it would export as.
+    mid_run_state: ?core.conversation.Conversation = null,
+    mid_run_measured: u64 = 0,
     stream: Stream = undefined,
+
+    fn releaseMidRunState(self: *@This()) void {
+        if (self.mid_run_state) |*state| state.deinit();
+        self.mid_run_state = null;
+    }
 
     fn provider(self: *@This()) core.api_provider.Provider {
         return .{
@@ -15288,6 +15299,44 @@ fn expectEstimateMatchesCheckpoint(script: *AutoCompactScriptProvider) void {
     };
     script.estimate_checked = true;
     if (controller.estimatedUsage() != measured.total_bytes) script.hook_failed = true;
+    if (script.mid_run_state == null) {
+        script.mid_run_state = facade.core_session.conversation.cloneInto(std.testing.allocator) catch {
+            script.hook_failed = true;
+            return;
+        };
+        script.mid_run_measured = measured.total_bytes;
+    }
+}
+
+/// The measurement the Run budgets against is the real export: put the
+/// Conversation captured mid-Run back in place of the live one, export the
+/// checkpoint through the ordinary idle path, and compare byte counts. The
+/// export is the independent oracle — `exportCheckpoint` builds its sections
+/// from a committed lease, not from `measureRunCheckpoint`.
+fn expectMidRunMeasureIsExport(fixture: *AutoCompactFixture, script: *AutoCompactScriptProvider) !void {
+    var captured = script.mid_run_state orelse return error.TestUnexpectedResult;
+    script.mid_run_state = null;
+    defer captured.deinit();
+    const live = &fixture.session.core_session.conversation;
+    std.mem.swap(core.conversation.Conversation, live, &captured);
+    const exported = fixture.exportedBytes();
+    std.mem.swap(core.conversation.Conversation, live, &captured);
+    try std.testing.expectEqual(script.mid_run_measured, try exported);
+    // Leave the Session's verified usage on its own state again.
+    _ = try fixture.exportedBytes();
+}
+
+/// Summary hook: the live Conversation changes while the summary is in
+/// flight, so the kernel's suffix check refuses the replacement
+/// (`error.ConcurrentMutation`): the recovery compaction itself fails.
+fn mutateDuringSummary(script: *AutoCompactScriptProvider) void {
+    const facade = script.facade orelse {
+        script.hook_failed = true;
+        return;
+    };
+    facade.core_session.conversation.appendText(.user, "appended during compaction") catch {
+        script.hook_failed = true;
+    };
 }
 
 /// Summary hook: one Host input submitted while the compaction is in flight.
@@ -15334,6 +15383,7 @@ test "issue #430: a Run that crosses the context threshold compacts and finishes
         },
         .on_sampling = expectEstimateMatchesCheckpoint,
     };
+    defer script.releaseMidRunState();
     const execution = try fixture.run(7, "continue the task", &script);
 
     try std.testing.expectEqual(core.agent_loop.StopReason.end_turn, try completedStop(execution));
@@ -15358,6 +15408,8 @@ test "issue #430: a Run that crosses the context threshold compacts and finishes
     try expectToolPairing(conversation);
     try std.testing.expectEqual(session_budget.Outcome.none, fixture.session.budget_state.last_outcome);
     try std.testing.expectEqual(try fixture.exportedBytes(), fixture.session.budget_state.durable_usage_bytes);
+    // The in-Run estimate was the real export of the state it measured.
+    try expectMidRunMeasureIsExport(&fixture, &script);
 }
 
 test "issue #430: a provider context-window rejection compacts once and retries the same turn" {
@@ -15495,6 +15547,7 @@ test "issue #430: checkpoint soft pressure compacts; usage is re-measured and pe
         .on_sampling = expectEstimateMatchesCheckpoint,
         .on_summary = submitInputDuringSummary,
     };
+    defer script.releaseMidRunState();
     const execution = try fixture.run(5, "work", &script);
     try std.testing.expectEqual(core.agent_loop.StopReason.end_turn, try completedStop(execution));
     try std.testing.expect(!script.hook_failed);
@@ -15511,6 +15564,9 @@ test "issue #430: checkpoint soft pressure compacts; usage is re-measured and pe
     try std.testing.expectEqual(session_budget.Outcome.none, budget.last_outcome);
     try std.testing.expect(budget.durable_usage_bytes < initial.total_bytes);
     try std.testing.expectEqual(try fixture.exportedBytes(), budget.durable_usage_bytes);
+    // Mid-Run, after the compaction and with the input still pending: the
+    // estimate the Run admitted against is what that state exports as.
+    try expectMidRunMeasureIsExport(&fixture, &script);
 }
 
 test "issue #430: a request the checkpoint cannot hold is deferred, compacted for, then sent" {
@@ -15578,12 +15634,54 @@ test "issue #430: a compaction summary is budgeted: over its result cap nothing 
         .sampling = &.{ .context_window_exceeded, .{ .text = "never" } },
     };
     const execution = try fixture.run(4, "go", &script);
-    _ = try completedStop(execution);
+    // The refused replacement is the budget terminal, not a cancellation: the
+    // Run stops as a failed request whose reason is the recorded outcome
+    // (the facade reports it as STOP_CHECKPOINT_RESOURCE_LIMIT, phase
+    // `failed`), and no model failure is reported for it.
+    try std.testing.expectEqual(core.agent_loop.StopReason.api_error, try completedStop(execution));
     try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
     try std.testing.expectEqual(@as(u32, 1), script.sampling_calls);
     try std.testing.expectEqual(session_budget.Outcome.resource_limit, fixture.session.budget_state.last_outcome);
     try std.testing.expect(fixture.session.core_session.conversation.compact_summary == null);
     try std.testing.expectEqual(@as(u32, 0), fixture.events.auto_compacts);
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.model_errors);
+    try std.testing.expect(!stopsOnModelFailure(fixture.session, .api_error));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.failed, terminalPhaseForStopReason(.api_error));
+    try std.testing.expect(!fixture.session.facade_poisoned.load(.acquire));
+}
+
+test "issue #430: a capacity recovery that gives up records the budget terminal with the bytes it needed" {
+    var fixture: AutoCompactFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    try fixture.seed(4, 96 * 1024, 10);
+    const initial = try fixture.session.measureDurableUsage();
+    // As in the deferral test: the first request cannot fit beside the
+    // durable state, and compaction could make it fit — but the compaction
+    // fails (the live Conversation changes under it), so the loop gives up
+    // on the deferred request instead of re-issuing it.
+    var profile = capacityTestProfile(2 * initial.total_bytes + 64 * 1024);
+    profile.soft_bytes = profile.hard_bytes - 1;
+    try fixture.setProfile(profile);
+    var script = AutoCompactScriptProvider{
+        .model_name = "issue430-give-up",
+        .sampling = &.{.{ .text = "never sent" }},
+        .on_summary = mutateDuringSummary,
+    };
+    const execution = try fixture.run(13, "go", &script);
+    try std.testing.expectEqual(core.agent_loop.StopReason.api_error, try completedStop(execution));
+    try std.testing.expect(!script.hook_failed);
+    try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+    try std.testing.expectEqual(@as(u32, 0), script.sampling_calls);
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.auto_compacts);
+    // The budget terminal, with the bytes the deferred request needed — not
+    // an unexplained provider failure.
+    const budget = fixture.session.budget_state.describe();
+    try std.testing.expectEqual(session_budget.Outcome.budget_exhausted, budget.last_outcome);
+    try std.testing.expect(budget.required_bytes > profile.hard_bytes);
+    try std.testing.expect(budget.required_bytes != profile.hard_bytes + 1);
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.model_errors);
+    try std.testing.expect(fixture.session.core_session.conversation.compact_summary == null);
 }
 
 test "issue #430: cancelling during compaction keeps tools, pairing, permission and input state" {
