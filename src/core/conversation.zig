@@ -42,6 +42,72 @@ pub fn toolResultContextBytes(max_input_tokens: usize) usize {
 }
 pub const DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP: usize = 2;
 
+/// Where a message sits in a Conversation's full history, counted from 1 the
+/// way a user counts ("edit the 6th message"). A position names the full
+/// history, the compacted prefix included: compaction is a projection that
+/// keeps every message (`compact_boundary`), so it never renumbers one.
+///
+/// The value is the 0-based index, so every value is a valid position; the
+/// only way in from a user's count is `fromOrdinal`, which refuses 0.
+pub const MessagePosition = enum(usize) {
+    _,
+
+    pub fn fromOrdinal(ordinal_value: usize) error{PositionOutOfRange}!MessagePosition {
+        if (ordinal_value == 0) return error.PositionOutOfRange;
+        return @enumFromInt(ordinal_value - 1);
+    }
+
+    /// The position of the message at 0-based `index_value`.
+    pub fn fromIndex(index_value: usize) MessagePosition {
+        return @enumFromInt(index_value);
+    }
+
+    /// Parses a decimal 1-based count ("6"). Anything else is refused.
+    pub fn parse(text: []const u8) error{ InvalidPosition, PositionOutOfRange }!MessagePosition {
+        const value = std.fmt.parseUnsigned(usize, text, 10) catch |err| switch (err) {
+            error.Overflow => return error.PositionOutOfRange,
+            error.InvalidCharacter => return error.InvalidPosition,
+        };
+        return fromOrdinal(value);
+    }
+
+    /// The 1-based count a user sees.
+    pub fn ordinal(self: MessagePosition) usize {
+        return @intFromEnum(self) + 1;
+    }
+
+    pub fn index(self: MessagePosition) usize {
+        return @intFromEnum(self);
+    }
+};
+
+/// Why a history position cannot be edited and rerun (issue #432). Each names
+/// a position whose preceding context cannot be reconstructed exactly as it
+/// stood, so the edit is refused and nothing changes.
+pub const RewindError = error{
+    /// No message at that position.
+    PositionOutOfRange,
+    /// The message there is not one the user wrote: an assistant reply, a
+    /// tool result, or text the runtime wrote itself (`Message.Origin.host`).
+    NotUserMessage,
+    /// The message lies behind the compact boundary. The active context holds
+    /// only a summary of it and of the messages before it, so the context that
+    /// preceded it no longer exists to rerun from.
+    PositionCompacted,
+};
+
+/// A message the user wrote: user role, participant origin, and only text and
+/// image content. A tool result travels in a user-role message but is the
+/// model's tool output, not the user's words.
+pub fn isUserPrompt(m: msg.Message) bool {
+    if (m.role != .user or m.origin != .participant or m.blocks.len == 0) return false;
+    for (m.blocks) |b| switch (b) {
+        .text, .image => {},
+        .tool_use, .tool_result, .thinking, .reasoning_item => return false,
+    };
+    return true;
+}
+
 pub const Conversation = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(msg.Message),
@@ -257,6 +323,73 @@ pub const Conversation = struct {
         self.mutation_version +%= 1;
         // 无 pop 且无 clamp(如中止 run 后立即 /retry)= 前缀未破坏,不触发全量重写(R3-3)。
         if (popped or clamped) self.shrink_epoch +%= 1;
+    }
+
+    /// The index of the user message at `position`, if the history before it
+    /// can be rerun: in range, a user prompt (`isUserPrompt`), and at or after
+    /// the compact boundary. Changes nothing.
+    pub fn rewindTarget(self: *Conversation, position: MessagePosition) RewindError!usize {
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
+        return self.rewindTargetLocked(position);
+    }
+
+    fn rewindTargetLocked(self: *const Conversation, position: MessagePosition) RewindError!usize {
+        const i = position.index();
+        if (i >= self.messages.items.len) return error.PositionOutOfRange;
+        if (!isUserPrompt(self.messages.items[i])) return error.NotUserMessage;
+        if (i < self.activeStart()) return error.PositionCompacted;
+        return i;
+    }
+
+    /// Edit-and-rerun's history change (issue #432), first half: drop the user
+    /// message at `position` and everything after it — later prompts, replies,
+    /// tool calls and tool results — so the next user message takes its place
+    /// after exactly the context that preceded it. The dropped continuation is
+    /// discarded, not kept as a branch. A refused position changes nothing.
+    ///
+    /// This is a prefix-destroying change (`shrink_epoch`): the transcript is
+    /// rewritten from the live Conversation at its next flush, so a resume
+    /// restores the rewound history, never the dropped one. Only Conversation
+    /// state changes; files and other effects of the dropped turns stay.
+    pub fn rewindTo(self: *Conversation, position: MessagePosition) RewindError!void {
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
+        const i = try self.rewindTargetLocked(position);
+        self.truncateLocked(i);
+    }
+
+    /// Edit-and-rerun in one step: `rewindTo(position)`, then the user message
+    /// built from `parts` in the dropped message's place, at the same
+    /// position. The replacement is built before anything changes, so an
+    /// allocation failure or a refused position leaves the Conversation as it
+    /// was; once the position is accepted the change cannot fail.
+    pub fn replaceUserMessage(
+        self: *Conversation,
+        position: MessagePosition,
+        parts: []const msg.UserContentPart,
+    ) (RewindError || error{ OutOfMemory, EmptyMessage })!void {
+        const replacement = try msg.userMessageFromParts(self.allocator, parts);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
+        const i = self.rewindTargetLocked(position) catch |err| {
+            replacement.deinit(self.allocator);
+            return err;
+        };
+        self.truncateLocked(i);
+        // At least the message at `i` was dropped, so the slot is reserved.
+        self.messages.appendAssumeCapacity(replacement);
+    }
+
+    fn truncateLocked(self: *Conversation, len_after: usize) void {
+        std.debug.assert(len_after >= self.activeStart());
+        while (self.messages.items.len > len_after) {
+            const m = self.messages.pop().?;
+            m.deinit(self.allocator);
+        }
+        self.noteShrinkAtLocked(len_after);
+        self.mutation_version +%= 1;
+        self.shrink_epoch +%= 1;
     }
 
     /// 深拷贝整个对话到 dst allocator(转后台续跑用)。返回的 Conversation 与源 **0 共享指针**
@@ -2103,4 +2236,111 @@ test "appendAllOwned:空批次不 bump mutation_version;重叠输入被拒绝且
     var other: [1]msg.Message = undefined;
     try std.testing.expect(!overlaps(&other, conv.messages.items));
     try std.testing.expect(!overlaps(&.{}, conv.messages.items));
+}
+
+/// Positions: 1 user, 2 assistant, 3 user, 4 assistant(tool_use),
+/// 5 user(tool_result), 6 assistant, 7 user, 8 assistant.
+fn appendEditFixture(a: std.mem.Allocator, conv: *Conversation) !void {
+    try conv.appendText(.user, "first prompt");
+    try conv.appendText(.assistant, "first reply");
+    try conv.appendText(.user, "second prompt");
+    const use_blocks = try a.alloc(msg.Block, 1);
+    use_blocks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "tu_1"),
+        .name = try a.dupe(u8, "Write"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try conv.append(.{ .role = .assistant, .blocks = use_blocks });
+    const result_blocks = try a.alloc(msg.Block, 1);
+    result_blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "tu_1"),
+        .content = try a.dupe(u8, "wrote"),
+    } };
+    try conv.append(.{ .role = .user, .blocks = result_blocks });
+    try conv.appendText(.assistant, "second reply");
+    try conv.appendText(.user, "third prompt");
+    try conv.appendText(.assistant, "third reply");
+}
+
+test "replaceUserMessage (issue #432): active context = messages before the position + the edited message" {
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try appendEditFixture(a, &conv);
+    conv.setUsageAnchor(1234);
+    const epoch_before = conv.shrink_epoch;
+
+    try conv.replaceUserMessage(try MessagePosition.fromOrdinal(3), &.{.{ .text = "second prompt, edited" }});
+
+    try std.testing.expectEqual(@as(usize, 3), conv.len());
+    try std.testing.expectEqualStrings("first prompt", conv.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("first reply", conv.messages.items[1].blocks[0].text);
+    try std.testing.expectEqualStrings("second prompt, edited", conv.messages.items[2].blocks[0].text);
+    try std.testing.expect(isUserPrompt(conv.messages.items[2]));
+    // A prefix-destroying change: the transcript rewrites at its next flush,
+    // and the usage anchor that counted the dropped messages is void.
+    try std.testing.expect(conv.shrink_epoch != epoch_before);
+    try std.testing.expect(conv.usageAnchor() == null);
+
+    // The first message is editable too: the context before it is empty.
+    try conv.replaceUserMessage(try MessagePosition.fromOrdinal(1), &.{.{ .text = "only prompt" }});
+    try std.testing.expectEqual(@as(usize, 1), conv.len());
+    try std.testing.expectEqualStrings("only prompt", conv.messages.items[0].blocks[0].text);
+}
+
+test "rewindTo (issue #432): drops the position and everything after it" {
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try appendEditFixture(a, &conv);
+    try conv.rewindTo(try MessagePosition.fromOrdinal(7));
+    try std.testing.expectEqual(@as(usize, 6), conv.len());
+    try std.testing.expectEqualStrings("second reply", conv.messages.items[5].blocks[0].text);
+}
+
+test "replaceUserMessage (issue #432): a position that cannot be rerun is refused and changes nothing" {
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try appendEditFixture(a, &conv);
+    try conv.appendHostText("[runtime notice]");
+    const version = conv.mutation_version;
+    const epoch = conv.shrink_epoch;
+    const edit: []const msg.UserContentPart = &.{.{ .text = "edited" }};
+
+    try std.testing.expectError(error.PositionOutOfRange, MessagePosition.fromOrdinal(0));
+    try std.testing.expectError(error.PositionOutOfRange, conv.replaceUserMessage(try MessagePosition.fromOrdinal(10), edit));
+    try std.testing.expectError(error.NotUserMessage, conv.replaceUserMessage(try MessagePosition.fromOrdinal(2), edit)); // assistant
+    try std.testing.expectError(error.NotUserMessage, conv.replaceUserMessage(try MessagePosition.fromOrdinal(5), edit)); // tool result
+    try std.testing.expectError(error.NotUserMessage, conv.replaceUserMessage(try MessagePosition.fromOrdinal(9), edit)); // runtime-written
+    try std.testing.expectError(error.NotUserMessage, conv.rewindTo(try MessagePosition.fromOrdinal(4)));
+
+    // Behind the compact boundary only a summary stands for the prefix.
+    try conv.restoreCompactState(4, "summary of 1-4");
+    const compacted_version = conv.mutation_version;
+    try std.testing.expectError(error.PositionCompacted, conv.replaceUserMessage(try MessagePosition.fromOrdinal(3), edit));
+    try std.testing.expectError(error.PositionCompacted, conv.rewindTo(try MessagePosition.fromOrdinal(1)));
+    try std.testing.expectEqual(compacted_version, conv.mutation_version);
+
+    try std.testing.expectEqual(version, compacted_version);
+    try std.testing.expectEqual(epoch, conv.shrink_epoch);
+    try std.testing.expectEqual(@as(usize, 9), conv.len());
+    try std.testing.expectEqualStrings("second prompt", conv.messages.items[2].blocks[0].text);
+
+    // At or after the boundary the summary is the preceding context, as in
+    // every request since the compaction.
+    try conv.replaceUserMessage(try MessagePosition.fromOrdinal(7), edit);
+    try std.testing.expectEqual(@as(usize, 7), conv.len());
+    try std.testing.expectEqual(@as(usize, 4), conv.activeStart());
+    try std.testing.expectEqualStrings("summary of 1-4", conv.compact_summary.?);
+}
+
+test "MessagePosition.parse: a 1-based decimal count" {
+    try std.testing.expectEqual(@as(usize, 6), (try MessagePosition.parse("6")).ordinal());
+    try std.testing.expectEqual(@as(usize, 5), (try MessagePosition.parse("6")).index());
+    try std.testing.expectError(error.PositionOutOfRange, MessagePosition.parse("0"));
+    try std.testing.expectError(error.InvalidPosition, MessagePosition.parse("-1"));
+    try std.testing.expectError(error.InvalidPosition, MessagePosition.parse("six"));
+    try std.testing.expectError(error.InvalidPosition, MessagePosition.parse(""));
+    try std.testing.expectError(error.PositionOutOfRange, MessagePosition.parse("99999999999999999999999"));
 }

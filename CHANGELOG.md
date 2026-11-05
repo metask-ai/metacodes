@@ -10,6 +10,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **Edit and rerun.** `/edit <n> <text>` edits message `n`, one you wrote,
+  and reruns from it: the conversation becomes messages `1..n-1` plus the new
+  text, and everything after the original message (later prompts, replies,
+  tool calls and results) is dropped. The transcript is rewritten, so a
+  resumed session restores the edited history. Only the conversation changes;
+  files and other effects stay. A message that is not yours, out of range, or
+  compacted into a summary is refused by name (`NotUserMessage`,
+  `PositionOutOfRange`, `PositionCompacted`) and nothing changes. `/edit`
+  alone lists the editable messages. Web and daemon take the line over
+  `POST /command`; Zig Hosts use `AgentSession.rewindToUserMessage` or
+  `SessionHost`'s `Submission.replaces`, and the wire `user_message` line
+  gains `replaces` ([doc/API.md](doc/API.md#edit-and-rerun)). (#432)
+
 ## 0.10.0 — 2026-10-31
 
 ### Changed
