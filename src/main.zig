@@ -72,6 +72,7 @@ fn panicAfterPendingOutput(msg: []const u8, first_trace_addr: ?usize) noreturn {
 pub const api_stream = @import("api/stream.zig");
 pub const api_provider = @import("api/provider.zig");
 pub const api_provider_factory = @import("api/provider_factory.zig");
+pub const api_model_error = @import("api/model_error.zig"); // L2: a Run's structured failure detail
 pub const api_auth_header = @import("api/auth_header.zig");
 pub const api_credential_cell = @import("api/credential_cell.zig");
 pub const api_connection_gate = @import("api/connection_gate.zig");
@@ -3081,8 +3082,9 @@ fn printProviderCredentialHelp(
                 "Authentication required for provider '{s}'.\n",
                 .{profile.id.slice()},
             );
-            if (profile.api_key_setup != null) {
+            if (profile.api_key_setup) |setup| {
                 std.debug.print("  metacodes login --provider {s}   (opens the page the key is created on, then stores it)\n", .{profile.id.slice()});
+                if (setup.note) |note| std.debug.print("  {s}\n", .{note});
             }
             for (profile.accepted_credential_kinds) |kind| {
                 if (profile.canonicalEnvAlias(kind)) |canonical| {
