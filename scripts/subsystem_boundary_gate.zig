@@ -122,6 +122,7 @@ const SUBSYSTEMS = [_]Subsystem{
             "src/api/auth_header.zig",
             "src/api/capability_activation.zig",
             "src/api/dialect.zig",
+            "src/api/dialects/bedrock.zig",
             "src/api/dialects/claude.zig",
             "src/api/dialects/deepseek.zig",
             "src/api/dialects/gemini.zig",

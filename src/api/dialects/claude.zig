@@ -11,6 +11,7 @@
 //! - 其它厂商的 Anthropic 兼容渠道(DeepSeek、Kimi、Qwen、MiniMax、Z.AI)在各自 profile 里,
 //!   路由声明各自的方言,这几家在 Anthropic wire 上都有专属方言;没声明方言、名字也认不出
 //!   厂商的 Anthropic 路由用本方言。
+//! - Bedrock 上的 Claude 走 Converse wire,见 `bedrock.zig`。
 //!
 //! ## 协议
 //!

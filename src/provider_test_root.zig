@@ -27,6 +27,7 @@ pub const config_store = @import("provider/config_store.zig");
 pub const host = @import("provider/host.zig");
 pub const custom_provider = @import("provider/custom_provider.zig");
 pub const openrouter = @import("provider/openrouter.zig");
+pub const bedrock_catalog = @import("provider/bedrock_catalog.zig");
 pub const vendor = @import("provider/vendor.zig");
 pub const oauth = @import("provider/oauth.zig");
 pub const api_key_store = @import("provider/api_key_store.zig");
@@ -47,4 +48,5 @@ test {
     std.testing.refAllDecls(registry.kimi);
     std.testing.refAllDecls(registry.qwen);
     std.testing.refAllDecls(registry.minimax);
+    std.testing.refAllDecls(registry.bedrock);
 }

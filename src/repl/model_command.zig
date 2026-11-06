@@ -195,6 +195,7 @@ pub fn supports(provider: types.ProviderKind, model: []const u8, cap: Capability
         .anthropic => .anthropic,
         .openai => .openai,
         .gemini => .gemini,
+        .bedrock => .bedrock,
     };
     return capability_mod.supports(kind, model, cap);
 }

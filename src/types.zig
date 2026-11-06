@@ -327,7 +327,7 @@ test "TinyKG arm respects an explicit auto-memory disable" {
 }
 
 /// LLM 后端协议种类(App 组装层据此选具体 Client;core 只见中立 Provider)。
-pub const ProviderKind = enum { anthropic, openai, gemini };
+pub const ProviderKind = enum { anthropic, openai, gemini, bedrock };
 
 /// OpenAI 后端的 wire 协议(仅 provider_kind==.openai 时生效):
 /// chat_completions = /v1/chat/completions(默认);responses = /v1/responses。

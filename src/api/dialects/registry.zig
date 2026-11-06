@@ -30,6 +30,9 @@ pub const qwen = @import("qwen.zig");
 pub const minimax = @import("minimax.zig");
 pub const mistral = @import("mistral.zig");
 pub const openrouter = @import("openrouter.zig");
+/// Not a vendor: the Bedrock Converse wire, whose dialect branches on the
+/// vendor of the hosted model.
+pub const bedrock = @import("bedrock.zig");
 
 /// 每个 `Vendor` 值的接入文件。
 pub fn module(comptime v: Vendor) type {
@@ -59,6 +62,11 @@ const SOURCES = [_]struct { vendor: Vendor, text: []const u8 }{
     .{ .vendor = .minimax, .text = @embedFile("minimax.zig") },
     .{ .vendor = .mistral, .text = @embedFile("mistral.zig") },
     .{ .vendor = .openrouter, .text = @embedFile("openrouter.zig") },
+};
+
+/// 不是厂商、但同样以文件头为接入文档的 wire 文件。
+const WIRE_SOURCES = [_]struct { name: []const u8, text: []const u8 }{
+    .{ .name = "bedrock", .text = @embedFile("bedrock.zig") },
 };
 
 /// 接入文件头必须有的段落,按顺序。
@@ -100,6 +108,8 @@ pub fn infer(kind: ProviderKind, model: []const u8) ?Vendor {
 
 /// 路由上的方言:声明优先,否则按名推断,再退到这条 wire 的基础方言。
 pub fn dialectFor(kind: ProviderKind, declared: ?Vendor, model: []const u8) ?Dialect {
+    // Bedrock Converse: one wire, the hosted model's vendor picks the fields.
+    if (kind == .bedrock) return bedrock.dialectFor(declared, model);
     if (declared orelse infer(kind, model)) |v| switch (v) {
         inline else => |tag| if (module(tag).dialect(kind, model)) |d| return d,
     };
@@ -107,6 +117,7 @@ pub fn dialectFor(kind: ProviderKind, declared: ?Vendor, model: []const u8) ?Dia
         .openai => openai.native(),
         .anthropic => claude.dialect(.anthropic, model).?,
         .gemini => gemini.dialect(.gemini, model).?,
+        .bedrock => unreachable, // handled above
         .other => null,
     };
 }
@@ -139,6 +150,7 @@ fn expectIntegrationHeader(name: []const u8, text: []const u8) !void {
 
 test "每个接入文件的文件头都按顺序写全了接入文档段落" {
     for (SOURCES) |source| try expectIntegrationHeader(source.vendor.name(), source.text);
+    for (WIRE_SOURCES) |source| try expectIntegrationHeader(source.name, source.text);
 }
 
 test "SOURCES 与 Vendor 一一对应" {

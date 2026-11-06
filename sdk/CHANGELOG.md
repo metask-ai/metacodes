@@ -34,6 +34,9 @@ empty `### Migration`.
   message and everything after it. ABI revision 26 does not expose it, so no
   Host-visible behaviour, layout or status changes; a Session's checkpoint and
   Runs are as before.
+- No change a Host can see. The inputs moved for the native Amazon Bedrock
+  transport (#423), which ABI revision 26 does not expose: `provider` never
+  reports it, and Runs on the exposed wires send the bytes they did.
 
 ### Fixed
 

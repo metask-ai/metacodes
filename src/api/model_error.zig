@@ -495,6 +495,23 @@ fn technicalCategory(name: ?[]const u8) ?Category {
         .{ "timeout_error", .timeout },
         .{ "request_timeout", .timeout },
         .{ "DEADLINE_EXCEEDED", .timeout },
+        // Amazon Bedrock: the event stream's `:exception-type` (lowerCamel,
+        // ConverseStreamOutput) and the HTTP error names (PascalCase).
+        .{ "throttlingException", .rate_limited },
+        .{ "ThrottlingException", .rate_limited },
+        .{ "serviceUnavailableException", .overloaded },
+        .{ "ServiceUnavailableException", .overloaded },
+        .{ "ModelNotReadyException", .overloaded },
+        .{ "internalServerException", .server_error },
+        .{ "InternalServerException", .server_error },
+        .{ "modelStreamErrorException", .server_error },
+        .{ "ModelStreamErrorException", .server_error },
+        .{ "ModelErrorException", .server_error },
+        .{ "validationException", .invalid_request },
+        .{ "ValidationException", .invalid_request },
+        .{ "AccessDeniedException", .permission },
+        .{ "ResourceNotFoundException", .not_found },
+        .{ "ModelTimeoutException", .timeout },
     };
     for (table) |entry| if (std.mem.eql(u8, entry[0], value)) return entry[1];
     return null;

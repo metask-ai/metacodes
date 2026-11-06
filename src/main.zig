@@ -111,6 +111,8 @@ pub const api_http_status = @import("api/http_status.zig");
 pub const api_http_connection = @import("api/http_connection.zig"); // L2 send-failure tests drive it on a raw std client
 pub const api_openai = @import("api/openai_client.zig");
 pub const api_gemini = @import("api/gemini_client.zig");
+pub const api_bedrock = @import("api/bedrock_client.zig"); // Bedrock Converse + AWS event stream
+pub const api_aws_event_stream = @import("api/aws_event_stream.zig");
 pub const api_dialect = @import("api/dialect.zig");
 pub const api_request = @import("api/request.zig");
 pub const api_request_overrides = @import("api/request_overrides.zig");
@@ -3081,8 +3083,9 @@ fn printProviderCredentialHelp(
                 "Authentication required for provider '{s}'.\n",
                 .{profile.id.slice()},
             );
-            if (profile.api_key_setup != null) {
+            if (profile.api_key_setup) |setup| {
                 std.debug.print("  metacodes login --provider {s}   (opens the page the key is created on, then stores it)\n", .{profile.id.slice()});
+                if (setup.note) |note| std.debug.print("  {s}\n", .{note});
             }
             for (profile.accepted_credential_kinds) |kind| {
                 if (profile.canonicalEnvAlias(kind)) |canonical| {

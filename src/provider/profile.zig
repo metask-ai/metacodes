@@ -51,6 +51,10 @@ pub const Protocol = union(enum) {
     openai_chat,
     openai_responses,
     gemini_generate_content,
+    /// Amazon Bedrock Converse (`/model/{modelId}/converse-stream`), framed as
+    /// an AWS event stream rather than SSE. Like Gemini, the transport puts
+    /// the model into the path itself, so the channel declares an origin.
+    bedrock_converse,
     custom: Custom,
 
     pub const Custom = struct {
@@ -67,12 +71,13 @@ pub const Protocol = union(enum) {
         wire: ?Wire = null,
     };
 
-    /// The four wire formats a transport exists for.
+    /// The wire formats a transport exists for.
     pub const Wire = enum {
         anthropic_messages,
         openai_chat,
         openai_responses,
         gemini_generate_content,
+        bedrock_converse,
 
         pub fn parse(text: []const u8) ?Wire {
             inline for (@typeInfo(Wire).@"enum".fields) |field| {
@@ -89,6 +94,7 @@ pub const Protocol = union(enum) {
             .openai_chat => .openai_chat,
             .openai_responses => .openai_responses,
             .gemini_generate_content => .gemini_generate_content,
+            .bedrock_converse => .bedrock_converse,
             .custom => |value| value.wire,
         };
     }
@@ -105,14 +111,14 @@ pub const Protocol = union(enum) {
             .anthropic_messages => "/v1/messages",
             .openai_chat => "/chat/completions",
             .openai_responses => "/responses",
-            .gemini_generate_content => "",
+            .gemini_generate_content, .bedrock_converse => "",
             .custom => |value| value.path_suffix,
         };
     }
 
     pub fn shape(self: Protocol) EndpointShape {
         return switch (self) {
-            .gemini_generate_content => .base_origin,
+            .gemini_generate_content, .bedrock_converse => .base_origin,
             .custom => |value| value.shape,
             else => .absolute_request_url,
         };
@@ -127,6 +133,7 @@ pub const Protocol = union(enum) {
         if (std.mem.eql(u8, text, "openai_chat")) return .openai_chat;
         if (std.mem.eql(u8, text, "openai_responses")) return .openai_responses;
         if (std.mem.eql(u8, text, "gemini_generate_content")) return .gemini_generate_content;
+        if (std.mem.eql(u8, text, "bedrock_converse")) return .bedrock_converse;
         return null;
     }
 };

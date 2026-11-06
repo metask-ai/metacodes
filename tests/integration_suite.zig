@@ -18,6 +18,7 @@ test {
     _ = @import("component/metask_api_key_picker_test.zig");
     _ = @import("component/provider_cli_key_scope_test.zig");
     _ = @import("component/vendor_dialect_test.zig");
+    _ = @import("component/bedrock_converse_test.zig");
     _ = @import("component/picker_reasoning_test.zig");
     _ = @import("component/gemini_thought_signature_test.zig");
     _ = @import("component/provider_oauth_login_test.zig");
