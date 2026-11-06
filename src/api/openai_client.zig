@@ -338,6 +338,8 @@ pub const OpenAIClient = struct {
         if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
         o.tool_choice = tool_choice;
         const dialect = self.dialectFor(model);
+        // 流按这次请求的型号读 list 型 content(子代理的 model_override 可与绑定型号不同)。
+        const content_chunks = dialect.profileFor(.openai, model).content_chunks;
         // 图像 tool_result 定案(原生块 / 占位)由序列化器实际报告,随流句柄回传。
         var report = json_mod.SerializationReport{};
         defer report.deinit(self.allocator);
@@ -353,7 +355,7 @@ pub const OpenAIClient = struct {
         errdefer self.allocator.free(placeholder_ids);
         while (true) {
             var retry_hint = client_mod.RetryHint{};
-            if (self.doStreamWithAuthReplay(body, abort, dialect, placeholder_ids, &retry_hint)) |handle| {
+            if (self.doStreamWithAuthReplay(body, abort, dialect, content_chunks, placeholder_ids, &retry_hint)) |handle| {
                 return handle;
             } else |err| {
                 const policy = retry orelse return err;
@@ -369,11 +371,12 @@ pub const OpenAIClient = struct {
         body: []const u8,
         abort: ?*const AbortSignal,
         dialect: dialect_mod.Dialect,
+        content_chunks: dialect_mod.ContentChunks,
         image_placeholder_ids: []const []const u8,
         retry_hint: *client_mod.RetryHint,
     ) !StreamHandle {
         self.last_retry_attempt = 0;
-        return self.doStream(body, abort, dialect, image_placeholder_ids, 0, retry_hint) catch |err| {
+        return self.doStream(body, abort, dialect, content_chunks, image_placeholder_ids, 0, retry_hint) catch |err| {
             if (err != error.TokenExpired) return err;
             // Refresh replaces fixed bytes the client owns; a Session's
             // replaceable credential is rotated by its Host instead.
@@ -389,14 +392,14 @@ pub const OpenAIClient = struct {
             retry_hint.* = .{};
             // No event has been delivered: the body is still the exact slice
             // produced by the serializer, so this is a byte-for-byte replay.
-            return self.doStream(body, abort, dialect, image_placeholder_ids, 1, retry_hint) catch |replay_err|
+            return self.doStream(body, abort, dialect, content_chunks, image_placeholder_ids, 1, retry_hint) catch |replay_err|
                 return if (replay_err == error.TokenExpired) error.Unauthorized else replay_err;
         };
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
     /// `image_placeholder_ids` 成功后归 OpenAIStream;失败时仍归调用方(下一次尝试还要用)。
-    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_placeholder_ids: []const []const u8, retry_attempt: u32, retry_hint: *client_mod.RetryHint) !StreamHandle {
+    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, content_chunks: dialect_mod.ContentChunks, image_placeholder_ids: []const []const u8, retry_attempt: u32, retry_hint: *client_mod.RetryHint) !StreamHandle {
         const rid = log.genRequestId();
         self.last_request_id = rid;
         log.infoId(
@@ -503,6 +506,7 @@ pub const OpenAIClient = struct {
             .image_placeholder_ids = image_placeholder_ids,
             .model = self.model,
             .dialect = dialect,
+            .content_chunks = content_chunks,
             .protocol = self.protocol,
             .request = req_ptr,
             .response = response,
@@ -592,6 +596,14 @@ const OpenAIStream = struct {
     /// 下一次 next() 经 takeQueued 紧接着吐出。单槽即可:每个 chunk 至多一个 usage
     /// 对象,且槽在读下一行之前必被 takeQueued 清空。
     pending_usage: ?UsageDelta = null,
+    /// chat 协议:这条路由的方言怎么读 list 型 `delta.content`(`ModelProfile.content_chunks`,
+    /// 建流时从方言 profile 取,没有默认值)。`.none` 时 list 整个忽略,与引入前相同。
+    content_chunks: dialect_mod.ContentChunks,
+    /// chat 协议:list 型 `delta.content`(Mistral 的 ThinkChunk / TextChunk,issue #437)
+    /// 一个 chunk 可产出多个内容事件——过渡块同时带收尾的思考和第一段正文。parseChatDelta
+    /// 返回第一个,其余按到达顺序留在这里(owned),takeQueued 最先吐出;读下一行之前必已排空。
+    content_q: std.ArrayList(StreamEvent) = .empty,
+    content_pos: usize = 0,
     /// Responses 协议:终止事件(completed/incomplete)已处理完(有 usage 对象则已发),
     /// flush 队列排空后补发一个 .done(Responses 无 [DONE] 哨兵行)。
     pending_done: bool = false,
@@ -668,6 +680,12 @@ const OpenAIStream = struct {
             else => {},
         };
         self.flush_q.deinit(self.allocator);
+        // 未 drain 的 list 型 content 事件持 owned 文本。
+        for (self.content_q.items[self.content_pos..]) |ev| switch (ev) {
+            .text, .thinking => |bytes| self.allocator.free(bytes),
+            else => {},
+        };
+        self.content_q.deinit(self.allocator);
         for (self.reasoning_keys.items) |key| self.allocator.free(key);
         self.reasoning_keys.deinit(self.allocator);
         self.line_overflow.deinit(self.allocator);
@@ -738,13 +756,15 @@ const OpenAIStream = struct {
     }
 
     /// 已排队事件的唯一出口;next() 每次读新行之前先走这里。出队顺序固定:
-    ///   1. pending_usage —— 与内容同 chunk 的 usage,紧跟在该 chunk 的内容事件之后;
-    ///   2. flush_q       —— 终止时 flush 的 reasoning_item / tool_use_start(按入队顺序);
-    ///   3. pending_done  —— Responses 终止后补发的 done。
-    /// 1 与 2 不会同时非空:pending_usage 只在 parseChunk 返回内容事件时写入,而下一次
-    /// next() 在读任何新行(含触发 flush 的 [DONE]/EOF/终止事件)之前就把它吐掉了。
-    /// 所以这个顺序就是 wire 上的到达顺序。
+    ///   1. content_q     —— 同一 list 型 content chunk 里第一个之后的内容事件;
+    ///   2. pending_usage —— 与内容同 chunk 的 usage,紧跟在该 chunk 的内容事件之后;
+    ///   3. flush_q       —— 终止时 flush 的 reasoning_item / tool_use_start(按入队顺序);
+    ///   4. pending_done  —— Responses 终止后补发的 done。
+    /// 1、2 与 3 不会同时非空:content_q 与 pending_usage 只在 parseChunk 处理一行时写入,
+    /// 而下一次 next() 在读任何新行(含触发 flush 的 [DONE]/EOF/终止事件)之前就把它们
+    /// 吐掉了。所以这个顺序就是 wire 上的到达顺序。
     fn takeQueued(self: *OpenAIStream) ?StreamEvent {
+        if (self.takeContent()) |ev| return ev;
         if (self.pending_usage) |u| {
             self.pending_usage = null;
             return StreamEvent{ .usage = u };
@@ -835,8 +855,9 @@ const OpenAIStream = struct {
     fn parseChunk(self: *OpenAIStream, data: []const u8) !?StreamEvent {
         // Responses API 走 typed 事件解析路径(chat/completions 的启发式对它不适用)。
         if (self.protocol == .responses) return self.parseResponsesChunk(data);
-        // takeQueued 在读本行之前已清空槽(见其注释);这里写入前它必为空。
+        // takeQueued 在读本行之前已清空槽(见其注释);这里写入前它们必为空。
         std.debug.assert(self.pending_usage == null);
+        std.debug.assert(self.content_q.items.len == 0);
         // OpenAI 兼容端(OpenRouter 等)在流中途报错的形状:`data: {"error":{...}}`,没有 choices。
         // 旧实现把它当空 chunk 跳过,流随后没报告停止原因就结束 → StreamIncomplete,服务端的
         // 答复被当成断流。现在按服务端声明的失败上抛。
@@ -877,6 +898,12 @@ const OpenAIStream = struct {
         // 否则转义序列以字面量进入 assistant 文本(issue #4)。空片段 free 不发事件。
         // 已知局限(review F3 登记):文本走逐片段解码,`\uXXXX` 代理对若被 chunk 边界
         // 拆开会变两个 U+FFFD——修复需跨 chunk 解码状态;arguments 有缓冲故已修,文本暂不。
+        // list 型 delta.content(Mistral,issue #437):思考装在 thinking chunk 里,过渡块
+        // 同时带收尾的思考和第一段正文,之后 content 又变回字符串。只有声明了
+        // `content_chunks` 的方言才读;其余方言照旧忽略 list(下方字符串提取对 list 返回 null)。
+        if (self.content_chunks != .none) {
+            if (deltaContentList(data)) |list| try self.queueContentChunks(list);
+        }
         if (try util_json.extractAndUnescapeStringField(data, "content", self.allocator)) |content| {
             if (content.len > 0) return StreamEvent{ .text = content };
             self.allocator.free(content);
@@ -915,7 +942,58 @@ const OpenAIStream = struct {
                 }
             }
         }
-        return null;
+        // list 型 content 排进队的第一个事件;其余由 takeQueued 在读下一行之前吐出。
+        return self.takeContent();
+    }
+
+    /// content_q 的出口:按到达顺序取下一个,取空后复位(owned 字节交给调用方)。
+    fn takeContent(self: *OpenAIStream) ?StreamEvent {
+        if (self.content_pos >= self.content_q.items.len) return null;
+        const ev = self.content_q.items[self.content_pos];
+        self.content_pos += 1;
+        if (self.content_pos == self.content_q.items.len) {
+            self.content_q.clearRetainingCapacity();
+            self.content_pos = 0;
+        }
+        return ev;
+    }
+
+    /// list 型 `delta.content` 的 chunk 按序排进 content_q:`text` chunk 的 `text` 是正文;
+    /// `thinking` chunk 的 `thinking` 是一列 chunk,其中 `text` 类的 `text` 是思考。其它
+    /// chunk 类型(引用等)既不是正文也不是思考,跳过;空串不产事件。
+    fn queueContentChunks(self: *OpenAIStream, list: []const u8) !void {
+        var chunks = ElemIter{ .s = list };
+        while (chunks.next()) |chunk| {
+            const kind = util_json.topLevelField(chunk, "type") orelse continue;
+            if (std.mem.eql(u8, kind, "\"text\"")) {
+                try self.queueContent(.text, util_json.topLevelField(chunk, "text"));
+            } else if (std.mem.eql(u8, kind, "\"thinking\"")) {
+                const parts = util_json.topLevelField(chunk, "thinking") orelse continue;
+                if (parts[0] != '[') continue;
+                var it = ElemIter{ .s = parts };
+                while (it.next()) |part| {
+                    const part_kind = util_json.topLevelField(part, "type") orelse continue;
+                    if (!std.mem.eql(u8, part_kind, "\"text\"")) continue;
+                    try self.queueContent(.thinking, util_json.topLevelField(part, "text"));
+                }
+            }
+        }
+    }
+
+    /// 一个 JSON string 原值(含两端引号)解码后排进 content_q。不是 string 或解码后为空 → 不排。
+    fn queueContent(self: *OpenAIStream, comptime kind: enum { text, thinking }, raw_value: ?[]const u8) !void {
+        const raw = raw_value orelse return;
+        if (raw.len < 2 or raw[0] != '"') return;
+        const decoded = try util_json.unescapeString(raw[1 .. raw.len - 1], self.allocator);
+        if (decoded.len == 0) {
+            self.allocator.free(decoded);
+            return;
+        }
+        errdefer self.allocator.free(decoded);
+        try self.content_q.append(self.allocator, switch (kind) {
+            .text => .{ .text = decoded },
+            .thinking => .{ .thinking = decoded },
+        });
     }
 
     /// 解析一个 Responses API SSE data chunk(typed 事件:`"type":"response.xxx"`)。
@@ -1295,6 +1373,19 @@ fn findObjectFieldSpan(data: []const u8, key: []const u8) ?ObjectSpan {
     return .{ .inner_start = obj_open + 1, .inner_end = data.len, .closed = false };
 }
 
+/// chat chunk 里 `choices[0].delta.content` 是 list 时的原值(含方括号,借用 data);
+/// 字符串、null、缺失或结构不全 → null。按结构逐层取顶层成员,不做子串匹配:
+/// list 里的 chunk 自己也有 `"text"` 等键。
+fn deltaContentList(data: []const u8) ?[]const u8 {
+    const choices = util_json.topLevelField(data, "choices") orelse return null;
+    if (choices[0] != '[') return null;
+    var it = ElemIter{ .s = choices };
+    const choice = it.next() orelse return null;
+    const delta = util_json.topLevelObjectField(choice, "delta") orelse return null;
+    const content = util_json.topLevelField(delta, "content") orelse return null;
+    return if (content[0] == '[') content else null;
+}
+
 /// 迭代 JSON array slice 里的顶层 `{...}` 对象(深度感知,跳字符串)。
 const ElemIter = struct {
     s: []const u8,
@@ -1662,8 +1753,13 @@ fn serializeOpenAIMessage(
         .image => has_image = true,
         else => {},
     };
+    // 思考以 thinking chunk 回传(Mistral,issue #437):带非空思考的 assistant 消息,
+    // content 换成 chunk 列表,thinking 与 text 保持原顺序。没有思考的消息、以及其余方言
+    // 仍走下方原来的形态,字节不变。
+    const echo_think_chunks = m.role == .assistant and
+        profile.content_chunks == .read_and_echo and hasThinking(m.content);
     try out.appendSlice(allocator, ",\"content\":");
-    if (has_image) {
+    if (has_image or echo_think_chunks) {
         // 一等图像内容(issue #10):content 切换为 parts 数组,text/image 按原始顺序
         // 交错输出。图像 wire 形态委托方言;方言返 false = 不支持 → 显式能力错误。
         // 纯文本消息仍走下方 string 形态——请求字节与图像特性引入前逐字节相同
@@ -1672,6 +1768,8 @@ fn serializeOpenAIMessage(
         var first_part = true;
         for (m.content) |c| switch (c) {
             .text => |t| {
+                // chunk 回传时空正文不成 chunk;图像路径保持原字节(空 text part 照发)。
+                if (echo_think_chunks and t.len == 0) continue;
                 if (!first_part) try out.append(allocator, ',');
                 first_part = false;
                 try out.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
@@ -1683,6 +1781,14 @@ fn serializeOpenAIMessage(
                 first_part = false;
                 const emitted = try dialect.serializeImagePart(profile, img, out, allocator);
                 if (!emitted) return error.ImageInputUnsupported;
+            },
+            .thinking => |t| {
+                if (!echo_think_chunks or t.len == 0) continue;
+                if (!first_part) try out.append(allocator, ',');
+                first_part = false;
+                try out.appendSlice(allocator, "{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":");
+                try util_json.serializeString(t, out, allocator);
+                try out.appendSlice(allocator, "}]}");
             },
             else => {},
         };
@@ -1700,7 +1806,7 @@ fn serializeOpenAIMessage(
     // 思考回传:声明了回传的方言(DeepSeek 在请求带 tools 时要求回传全部历史思考,
     // 否则 400)把 assistant 消息的 thinking 块按序拼成 `reasoning_content`。其余方言
     // 不发,请求字节与投影 thinking 之前相同。
-    if (m.role == .assistant and profile.echoes_reasoning_content) {
+    if (m.role == .assistant and profile.echoes_reasoning_content and !echo_think_chunks) {
         var reasoning: std.ArrayList(u8) = .empty;
         defer reasoning.deinit(allocator);
         for (m.content) |c| switch (c) {
@@ -1733,6 +1839,15 @@ fn serializeOpenAIMessage(
         try out.append(allocator, ']');
     }
     try out.append(allocator, '}');
+}
+
+/// 消息里有没有非空的思考块(空块不是推理,不回传)。
+fn hasThinking(content: []const types.ApiContent) bool {
+    for (content) |c| switch (c) {
+        .thinking => |t| if (t.len > 0) return true,
+        else => {},
+    };
+    return false;
 }
 
 fn serializeOpenAITool(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t: json_mod.ToolDefinition) !void {
@@ -2634,6 +2749,7 @@ fn replaySse(a: std.mem.Allocator, model: []const u8, protocol: types.OpenAIProt
         .allocator = a,
         .model = model,
         .dialect = dialect_mod.dialectFor(.openai, model),
+        .content_chunks = dialect_mod.dialectFor(.openai, model).profileFor(.openai, model).content_chunks,
         .protocol = protocol,
         .request = undefined, // 固定 reader 直驱:不建 HTTP 请求,releaseParseState 不碰它
         .response = undefined,
@@ -2973,6 +3089,7 @@ fn replayUntilError(a: std.mem.Allocator, protocol: types.OpenAIProtocol, sse: [
         .allocator = a,
         .model = "m",
         .dialect = dialect_mod.dialectFor(.openai, "m"),
+        .content_chunks = .none,
         .protocol = protocol,
         .request = undefined,
         .response = undefined,
@@ -3128,6 +3245,7 @@ test "issue #269 chat: a cancelled stream's leftover [DONE] is Aborted, not Stre
         .allocator = a,
         .model = "m",
         .dialect = dialect_mod.dialectFor(.openai, "m"),
+        .content_chunks = .none,
         .protocol = .chat_completions,
         .request = undefined,
         .response = undefined,
@@ -3180,4 +3298,177 @@ test "OpenAIClient: catalog then Host declarations answer image input, Host firs
     try std.testing.expectEqual(false, p.supports(.image_input));
     try std.testing.expectEqual(image_capability.Source.host, p.imageInput(null).source);
     try std.testing.expectEqual(image_capability.Source.unknown, p.imageInput("vendor-unlisted").source);
+}
+
+// ── Issue #437: list-typed delta.content (Mistral ThinkChunk / TextChunk) ────
+//
+// Mistral describes its reasoning stream in prose only: while the model thinks,
+// `delta.content` is a list holding a ThinkChunk; at the transition one list
+// holds the closing ThinkChunk and the first TextChunk; after that it is a plain
+// string. The chunk shapes are the openapi schema's (`ThinkChunk` carries
+// `signature` / `closed` too, and its `thinking` list may hold reference
+// chunks). No official raw stream exists, so these cassettes are built from
+// those shapes.
+
+const MISTRAL_REASONING_SSE =
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"need \\\"the\\\" \"}]}]},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"clock\"},{\"type\":\"reference\",\"reference_ids\":[1]},{\"type\":\"text\",\"text\":\"\\n\\u4f60\"}],\"closed\":false}]},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\" first\"}],\"signature\":null,\"closed\":true},{\"type\":\"text\",\"text\":\"It \"}]},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is \"},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"42.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":20,\"total_tokens\":29}}\n\n" ++
+    "data: [DONE]\n\n";
+
+/// MISTRAL_REASONING_SSE with every list-typed content taken out: what any
+/// stream that ignores lists has always yielded.
+const MISTRAL_REASONING_SSE_WITHOUT_LISTS =
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is \"},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"mistral-medium-3-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"42.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":20,\"total_tokens\":29}}\n\n" ++
+    "data: [DONE]\n\n";
+
+test "issue #437: Mistral list-typed content yields thinking then text, in wire order, split across events" {
+    const a = std.testing.allocator;
+    inline for (.{ "mistral-medium-3-5", "mistral-small-2603", "mistral-large-4-0", "magistral-medium-2509", "mistral-large-latest" }) |model| {
+        var got = try replaySse(a, model, .chat_completions, MISTRAL_REASONING_SSE);
+        defer got.deinit(a);
+        // One event per text part: the reference chunk inside `thinking` is
+        // neither reasoning nor answer. The transition list yields its closing
+        // thinking before its first text; usage follows the chunk's content.
+        try std.testing.expectEqualSlices(
+            std.meta.Tag(StreamEvent),
+            &.{ .thinking, .thinking, .thinking, .thinking, .text, .text, .text, .usage, .done },
+            got.kinds.items,
+        );
+        try std.testing.expectEqualStrings("need \"the\" clock\n你 first", got.thinking.items);
+        try std.testing.expectEqualStrings("It is 42.", got.text.items);
+        try std.testing.expectEqual(StopReason.end_turn, got.stop);
+        try std.testing.expectEqual(@as(u64, 9), got.usages.items[0].input_tokens);
+    }
+}
+
+test "issue #437: every other dialect's stream yields exactly what it did before (list content ignored)" {
+    const a = std.testing.allocator;
+    inline for (.{ "gpt-4o", "gpt-5.2", "some-unknown-model", "deepseek-chat", "kimi-k3", "glm-5.2", "qwen3-235b-a22b", "MiniMax-M3", "minimax-m2.5" }) |model| {
+        var got = try replaySse(a, model, .chat_completions, MISTRAL_REASONING_SSE);
+        defer got.deinit(a);
+        var want = try replaySse(a, model, .chat_completions, MISTRAL_REASONING_SSE_WITHOUT_LISTS);
+        defer want.deinit(a);
+        try Replay.expectSame(&want, &got);
+        try std.testing.expectEqualStrings("is 42.", got.text.items);
+        try std.testing.expectEqual(@as(usize, 0), got.thinking.items.len);
+    }
+}
+
+test "issue #437: a list chunk's content comes before its usage and before the tool calls it finishes" {
+    const a = std.testing.allocator;
+    const sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"t1\"}]},{\"type\":\"text\",\"text\":\"\"},{\"type\":\"text\",\"text\":\"a1\"},{\"type\":\"thinking\",\"thinking\":[]},{\"type\":\"text\",\"text\":\"a2\"}],\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\n" ++
+        "data: [DONE]\n\n";
+    var got = try replaySse(a, "mistral-large-4-0", .chat_completions, sse);
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(
+        std.meta.Tag(StreamEvent),
+        &.{ .thinking, .text, .text, .usage, .tool_use_start },
+        got.kinds.items,
+    );
+    try std.testing.expectEqualStrings("t1", got.thinking.items);
+    try std.testing.expectEqualStrings("a1a2", got.text.items);
+    try std.testing.expectEqual(@as(usize, 1), got.tools.items.len);
+    try std.testing.expectEqualStrings("get_time", got.tools.items[0].name);
+    try std.testing.expectEqual(StopReason.tool_use, got.stop);
+}
+
+test "issue #437: queued list events still owned at teardown are freed" {
+    const a = std.testing.allocator;
+    var stream = OpenAIStream{
+        .allocator = a,
+        .model = "mistral-medium-3-5",
+        .dialect = dialect_mod.dialectFor(.openai, "mistral-medium-3-5"),
+        .content_chunks = .read_and_echo,
+        .request = undefined,
+        .response = undefined,
+        .id = .{ .bytes = .{0} ** 12 },
+        .credential = null,
+    };
+    defer stream.releaseParseState();
+    var body = std.Io.Reader.fixed(MISTRAL_REASONING_SSE);
+    stream.reader = &body;
+    // Take the first chunk's event and the first of the second chunk's; the
+    // second chunk's other text part stays queued.
+    for (0..2) |_| {
+        const ev = (try stream.next()).?;
+        switch (ev) {
+            .text, .thinking => |t| a.free(t),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect(stream.content_q.items.len > stream.content_pos);
+}
+
+test "issue #437: Mistral reasoning models send thinking back as ThinkChunks, in order, only when there is some" {
+    const a = std.testing.allocator;
+    const with = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "what time" }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .thinking = "need \"the\" clock" },
+            .{ .text = "checking" },
+            .{ .tool_use = .{ .id = "call_1", .name = "get_time", .input = "{}" } },
+        } },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "call_1", .content = "42" } }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{ .{ .thinking = "" }, .{ .text = "it is 42" } } },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "thanks" }} },
+    };
+    inline for (.{ "mistral-medium-3-5", "mistral-small-2603", "mistral-large-4-0", "magistral-medium-2509" }) |model| {
+        const body = try serializeOpenAIRequest(a, model, &with, "sys", null, null, null);
+        defer a.free(body);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            body,
+            "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"need \\\"the\\\" clock\"}]},{\"type\":\"text\",\"text\":\"checking\"}],\"tool_calls\":[{\"id\":\"call_1\",",
+        ) != null);
+        // An empty thinking block is not reasoning: that message stays a string.
+        try std.testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":\"it is 42\"}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_content") == null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"type\":\"thinking\""));
+    }
+    // Thinking and a tool call with no answer text: the list holds the ThinkChunk alone.
+    const tool_only = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "what time" }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .thinking = "t" },
+            .{ .text = "" },
+            .{ .tool_use = .{ .id = "call_1", .name = "get_time", .input = "{}" } },
+        } },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "call_1", .content = "42" } }} },
+    };
+    const body = try serializeOpenAIRequest(a, "mistral-large-4-0", &tool_only, null, null, null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        body,
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"t\"}]}],\"tool_calls\":[",
+    ) != null);
+}
+
+test "issue #437: Mistral models without documented reasoning, and every other dialect, send no ThinkChunk" {
+    const a = std.testing.allocator;
+    const with = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{ .{ .thinking = "secret" }, .{ .text = "hello" } } },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "again" }} },
+    };
+    const without = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{.{ .text = "hello" }} },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "again" }} },
+    };
+    inline for (.{ "mistral-large-latest", "mistral-large", "open-mistral-nemo", "gpt-4o", "glm-5.2", "qwen3-235b-a22b", "minimax-m2.5" }) |model| {
+        const got = try serializeOpenAIRequest(a, model, &with, "sys", null, .high, null);
+        defer a.free(got);
+        const want = try serializeOpenAIRequest(a, model, &without, "sys", null, .high, null);
+        defer a.free(want);
+        try std.testing.expectEqualStrings(want, got);
+    }
 }
