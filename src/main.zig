@@ -120,6 +120,7 @@ pub const image_capability = @import("api/image_capability.zig");
 pub const model_tiers = @import("api/model_tiers.zig");
 pub const client_mod = client; // alias for L2 component tests
 pub const api_api_keys = api_keys_mod;
+pub const api_model_error = @import("api/model_error.zig"); // L2 provider lifecycle tests read the structured failure detail
 pub const api_last_error = @import("api/last_error.zig"); // L2 stream liveness tests read the TUI-facing error text
 pub const task_store = @import("core/task_store.zig"); // L2 requirement-ledger tests
 pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 ledger decide tests

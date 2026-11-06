@@ -23,7 +23,9 @@
 //!   - **并行 functionCall(P0.1 已实现)**:一个 chunk 的 parts 多个 functionCall 全部 emit
 //!     (首个返回、其余排队 drain);functionResponse.name 按 tool_use_id 从全量消息找回真实工具名
 //!     配对(Gemini 靠 name 配对)。见 parseChunk functionCall 循环 / serializeGeminiContent。
-//!   - **建连重试 / 非流式 / thinking(thought parts)**:未做。(多模态 inline_data 的
+//!   - **非流式 / thinking(thought parts)**:未做。(建连重试已做,issue #434:pSendStreamRetry
+//!     跑与 Anthropic 同一个 `client_mod.ConnectRetryFor`;非 200 按同一张 HTTP 分类表出错名;
+//!     等响应头时被取消是 error.Aborted。)(多模态 inline_data 的
 //!     图像**输入**已做——user 消息 image block 经 GeminiDialect.serializeImagePart 发
 //!     inline_data part,issue #10;图像 **tool_result**(Read 工具)也已做——Gemini 3 系发
 //!     官方 multimodal functionResponse,旧世代发同级 inline_data part,见
@@ -57,6 +59,7 @@ const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
 const gemini_signatures = @import("gemini_signatures.zig");
 const credential_mod = @import("credential_cell.zig");
+const error_class = @import("error_class.zig");
 const secure = @import("../util/secure.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("../app/model_context.zig");
@@ -127,6 +130,9 @@ pub const GeminiClient = struct {
     /// 有状态缓存句柄表(GeminiClient 私有,不上浮中立契约)。
     /// prepareCache 据 system+tools 的 prefix 哈希查表命中则引用,未命中/过期则(MVP)走隐式。
     cache_table: std.ArrayList(CacheEntry) = .empty,
+    /// Numbers the last head-phase overflow body carried (cleared on the next
+    /// accepted response), for the agent loop's context recovery.
+    last_context_window_numbers: error_class.ContextWindowNumbers = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) GeminiClient {
         return .{
@@ -204,7 +210,15 @@ pub const GeminiClient = struct {
             .imageInputFn = &pImageInput,
             .visionModelsFn = &pVisionModels,
             .routeFn = &pRoute,
+            .lastContextWindowNumbersFn = &pLastContextWindowNumbers,
+            .endpointIdFn = &pEndpointId,
         };
+    }
+    fn pLastContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
+        return cast(ctx).last_context_window_numbers;
+    }
+    fn pEndpointId(ctx: *anyopaque) []const u8 {
+        return cast(ctx).base_url;
     }
     inline fn cast(ctx: *anyopaque) *GeminiClient {
         return @ptrCast(@alignCast(ctx));
@@ -297,14 +311,23 @@ pub const GeminiClient = struct {
         cast(ctx).abort_registry.cancel(signal);
     }
     fn pSendStreamRetry(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, max_retries: u32, retry_base_ms: u64, reporter: ?provider_mod.RetryReporter, user_query: []const u8) anyerror!StreamHandle {
-        _ = max_retries;
-        _ = retry_base_ms;
-        _ = reporter;
-        return pSendStream(ctx, messages, system, tools, abort, model_override, tool_choice, user_query);
+        _ = user_query;
+        // The Messages client's connect retry (issue #434): the request is
+        // serialized once, so every attempt sends the same bytes to the same
+        // model's URL.
+        var retry = ConnectRetry.init(max_retries, retry_base_ms, reporter, abort);
+        return cast(ctx).sendStreamWith(messages, system, tools, abort, model_override, tool_choice, &retry);
     }
     fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!StreamHandle {
         _ = user_query;
-        const self = cast(ctx);
+        return cast(ctx).sendStreamWith(messages, system, tools, abort, model_override, tool_choice, null);
+    }
+
+    const ConnectRetry = client_mod.ConnectRetryFor("gemini");
+
+    /// Serializes the request once and sends it: one attempt when `retry` is
+    /// null, else as many as `retry` allows.
+    fn sendStreamWith(self: *GeminiClient, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, retry: ?*ConnectRetry) anyerror!StreamHandle {
         const model = model_override orelse self.model;
         // prepareCache(写侧):查句柄表,命中未过期则请求带 cachedContent 引用。
         // 哈希 key 含 model:Gemini 缓存对象 model-specific,不含 model 会让 model_override 路径
@@ -331,14 +354,24 @@ pub const GeminiClient = struct {
             &self.thought_signatures,
         );
         defer self.allocator.free(body);
+        // Owned here until a stream takes it: every failed attempt leaves it
+        // for the next one.
         const placeholder_ids = try report.placeholder_ids.toOwnedSlice(self.allocator);
-        return self.doStream(model, body, abort, placeholder_ids);
+        errdefer self.allocator.free(placeholder_ids);
+        while (true) {
+            var retry_hint = client_mod.RetryHint{};
+            if (self.doStream(model, body, abort, placeholder_ids, &retry_hint)) |handle| {
+                return handle;
+            } else |err| {
+                const policy = retry orelse return err;
+                try policy.afterFailure(err, retry_hint.delay_ms);
+            }
+        }
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle。URL 拼 model + :streamGenerateContent?alt=sse。
-    /// `image_placeholder_ids` 所有权转入本函数:失败路径释放,成功后归 GeminiStream。
-    fn doStream(self: *GeminiClient, model: []const u8, body: []const u8, abort: ?*const AbortSignal, image_placeholder_ids: []const []const u8) !StreamHandle {
-        errdefer self.allocator.free(image_placeholder_ids);
+    /// `image_placeholder_ids` 成功后归 GeminiStream;失败时仍归调用方(下一次尝试还要用)。
+    fn doStream(self: *GeminiClient, model: []const u8, body: []const u8, abort: ?*const AbortSignal, image_placeholder_ids: []const []const u8, retry_hint: *client_mod.RetryHint) !StreamHandle {
         const rid = log.genRequestId();
         // {base}/v1beta/models/{model}:streamGenerateContent?alt=sse
         const url = try std.fmt.allocPrint(self.allocator, "{s}/v1beta/models/{s}:streamGenerateContent?alt=sse", .{ self.base_url, model });
@@ -369,8 +402,8 @@ pub const GeminiClient = struct {
                 .{ .name = auth.name, .value = auth.value },
             },
         }) catch |err| {
-            log.errId("gemini", rid, "request init failed: {s}", .{@errorName(err)});
-            return error.RequestFailed; // errdefer destroy(req_ptr);req_ptr.* 未初始化, 无需 deinit
+            // errdefer destroy(req_ptr);req_ptr.* 未初始化, 无需 deinit
+            return client_mod.requestSetupFailure("gemini", rid, err);
         };
         var registered = false;
         errdefer {
@@ -388,27 +421,33 @@ pub const GeminiClient = struct {
         registered = true;
         req_ptr.transfer_encoding = .{ .content_length = body.len };
         http_connection.sendBodyComplete(req_ptr, @constCast(body)) catch |err| {
-            log.errId("gemini", rid, "send body failed: {s}", .{@errorName(err)});
-            client_mod.noteConnectFailure(err);
-            return error.RequestFailed;
+            // 取消优先于传输层错误分类:cancel 关闭了 socket,写才失败的。
+            if (client_mod.cancelled(abort)) return error.Aborted;
+            return client_mod.requestTransportFailure("gemini", rid, "sendBody", err);
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
+            // 等响应头时被取消:cancel 关闭了 socket,不是网络故障(issue #434)。
+            if (client_mod.cancelled(abort)) {
+                log.warnId("gemini", rid, "receiveHead failed after cancel ({s}) → Aborted", .{@errorName(err)});
+                return error.Aborted;
+            }
             if (self.abort_registry.stalled(req_ptr)) |stall| {
                 client_mod.reportHeadStall("gemini", rid, stall);
                 return error.TransientNetwork;
             }
-            log.errId("gemini", rid, "receiveHead failed: {s}", .{@errorName(err)});
-            client_mod.noteConnectFailure(err);
-            return err;
+            return client_mod.requestTransportFailure("gemini", rid, "receiveHead", err);
         };
         const status = ResponseStatus.capture(&response);
         client_mod.noteResponseHead(status.code, response.head, auth.value);
         connection_lease.release();
         if (!status.isOk()) {
+            // Read from the head before the body read below reuses its bytes.
+            retry_hint.delay_ms = client_mod.retryAfterFromHead(response.head);
             var location_buf: [http_status.REDIRECT_LOCATION_BYTES]u8 = undefined;
             if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
                 client_mod.reportRedirect("gemini", rid, status, location, auth.value);
-                return error.RequestFailed;
+                self.last_context_window_numbers = .{};
+                return error.HttpError;
             }
             var err_body: [4096]u8 = undefined;
             const body_reader = req_ptr.reader.bodyReader(
@@ -419,9 +458,16 @@ pub const GeminiClient = struct {
             const n = body_reader.readSliceShort(err_body[0..]) catch 0;
             const preview = err_body[0..@min(n, err_body.len)];
             client_mod.reportHttpFailure("gemini", rid, status, preview, err_body.len, auth.value);
-            return error.RequestFailed;
+            // The Messages client's classification (issue #434): 429 and 5xx are
+            // retried, an overflow is ContextWindowExceeded with its numbers kept.
+            // Gemini has no token refresh, so a token_expired 401 stays Unauthorized.
+            var info = client_mod.errorBodyInfo(status.code, preview);
+            info.token_expired = false;
+            self.last_context_window_numbers = info.context_window_numbers;
+            return client_mod.httpFailureError(status.code, info);
         }
         client_mod.noteRequestAccepted();
+        self.last_context_window_numbers = .{};
         // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
         self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens), .sse);
         // receiveHead 成功后,req_ptr.* 是个开着连接的完整 Request。到 heap 转移所有权之前若出错

@@ -119,6 +119,7 @@ test {
     _ = @import("component/picker_frame_race_test.zig");
     _ = @import("component/md_stream_convergence_test.zig");
     _ = @import("component/stream_retry_test.zig");
+    _ = @import("component/provider_lifecycle_test.zig");
     _ = @import("component/ui_state_test.zig");
     _ = @import("component/tui_clear_conversation_test.zig");
     _ = @import("component/skill_overrides_test.zig");
