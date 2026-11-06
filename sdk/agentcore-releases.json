@@ -9,6 +9,15 @@
       "main_releases": [
         "0.10.0"
       ]
+    },
+    {
+      "version": "0.14.0",
+      "abi_version": 1,
+      "abi_revision": 26,
+      "input_digest": "6484123a91266de2612e958f62cb9122d2fa571ec389ee4af5898f04387a202c",
+      "main_releases": [
+        "0.11.0"
+      ]
     }
   ]
 }

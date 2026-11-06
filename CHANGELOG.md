@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.11.0 — 2026-11-06
+
 ### Added
 
 - **Amazon Bedrock, native** (#423). A
