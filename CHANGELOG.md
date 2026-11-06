@@ -12,13 +12,6 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
-- **Plain headless says why a failed Run stopped (#417).** `-p` without `--json`
-  exited 1 with nothing on stderr when the reply was still cut off after the
-  three max-token continuations, and when the Run was interrupted by SIGINT or
-  SIGTERM. Those stops, and the same exit for a tool failure, now write one
-  `error: stopped (<stop_reason>): …` line to stderr, on `--resume-response`
-  too. Stdout (any partial text) and the exit code are unchanged, and so is
-  `--json`.
 - **The x86_64 macOS release unit no longer fails its CPU baseline check on a
   jump table.** This is why 0.10.0 was tagged but never published: release run
   41194755285 built every unit but stopped at `scripts/check_binary_baseline.py`
@@ -34,6 +27,13 @@ status, compatibility boundaries, and entry points are defined by
   no instruction starts inside one. The macOS `release` leg of `ci.yml` now
   builds both macOS units for their release targets and runs the check on
   every change, not first at release time.
+- **Plain headless says why a failed Run stopped (#417).** `-p` without `--json`
+  exited 1 with nothing on stderr when the reply was still cut off after the
+  three max-token continuations, and when the Run was interrupted by SIGINT or
+  SIGTERM. Those stops, and the same exit for a tool failure, now write one
+  `error: stopped (<stop_reason>): …` line to stderr, on `--resume-response`
+  too. Stdout (any partial text) and the exit code are unchanged, and so is
+  `--json`.
 
 ## 0.10.0 — 2026-10-31
 
