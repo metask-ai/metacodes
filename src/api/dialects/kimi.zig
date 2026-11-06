@@ -1,6 +1,7 @@
 //! # Moonshot Kimi 接入
 //!
-//! Kimi K2.x / K3.x 系列的方言(OpenAI chat/completions wire)。
+//! Kimi K2.x / K3.x 系列在 OpenAI chat/completions wire 上的方言,以及 K3 在 Anthropic
+//! messages wire 上的方言。
 //!
 //! ## 接入点
 //!
@@ -12,7 +13,9 @@
 //!
 //! ## 协议
 //!
-//! - `openai_chat`(`/chat/completions`)声明本方言;`anthropic_messages` 路由走 Claude 方言。
+//! - `openai_chat`(`/chat/completions`)与 `anthropic_messages`(`/anthropic/v1/messages`)
+//!   的路由都声明本方言(`.kimi`);Anthropic 面只服务 K3 系列(kimi-k3、kimi-k3.1-pro、
+//!   kimi-k3.1-pro-highspeed),profile 只在 OpenAI 渠道上提供 K2.7-code。
 //! - 鉴权:`Authorization: Bearer $MOONSHOT_API_KEY`。
 //!
 //! ## 思考与推理
@@ -27,6 +30,12 @@
 //! - **K2.7-code 与其它 Kimi 名字**:`thinking.type` 只认 `enabled`(发 `disabled` 报错),
 //!   恒发 `{"type":"enabled","keep":"all"}`。
 //! - 响应:`delta.reasoning_content`,先于 `delta.content`。
+//! - **Anthropic wire**:没有 `thinking` 请求参数(思考恒开);深度只有
+//!   `output_config.effort`,取值 low / high / max(没有 medium),默认 max。映射同 K3:
+//!   未指定不发,其余经 `k3Effort`。
+//! - 采样参数:K3 的 `temperature=1.0`、`top_p=0.95` 等固定,文档要求省略;K2.7-code 发别的
+//!   值会报错。这两代的 profile 声明 `fixed_sampling`,OpenAI chat 序列化器不发调用方的
+//!   `temperature` / `top_p` 覆盖。
 //!
 //! ## 回传与缓存
 //!
@@ -35,6 +44,8 @@
 //!   `reasoning_content` 发回(三代都发;K2.6 在 `keep` 为 null 时服务端忽略它)。
 //! - `prompt_cache_key`:profile 声明支持(`supports_prompt_cache_key`),请求覆盖里有 key
 //!   时才发;Kimi Code 订阅要求必发。
+//! - Anthropic wire 要求把响应里的 thinking 块(含 `signature`)原样带回;中立 IR 不保存
+//!   签名,本方言不回传 thinking 块(与 Claude 方言相同)。
 //!
 //! ## 已知差异
 //!
@@ -48,12 +59,19 @@
 //!
 //! - https://platform.kimi.ai/docs/api/chat(2026-11 核对:base URL、型号、思考参数、
 //!   reasoning_content 回传、prompt_cache_key、max_completion_tokens)
-//! - https://platform.kimi.ai/docs/guide/kimi-k3-quickstart(2026-08 核对)
+//! - https://platform.kimi.ai/docs/guide/kimi-k3-quickstart(2026-11 核对:固定采样参数、
+//!   `max_completion_tokens` 默认 131072)
+//! - https://platform.kimi.ai/docs/api/messages.md(2026-11 核对:Anthropic 面的型号、
+//!   `output_config.effort` 取值、thinking 块回传)
+//! - https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart(2026-11 核对:固定采样
+//!   参数,其它值报错;262,144 上下文见 pricing 页)
 
 const std = @import("std");
 const types = @import("../../types.zig");
 const model_adapter = @import("../model_adapter.zig");
 const model_name = @import("../model_name.zig");
+const util_json = @import("../../util/json.zig");
+const claude = @import("claude.zig");
 const dialect_mod = @import("../dialect.zig");
 const compat = @import("openai_compat.zig");
 const Vendor = @import("../../provider/vendor.zig").Vendor;
@@ -73,12 +91,15 @@ pub fn claims(kind: ProviderKind, model: []const u8) bool {
 }
 
 pub fn dialect(kind: ProviderKind, model: []const u8) ?Dialect {
-    if (kind != .openai) return null;
-    return compat.ready(switch (generation(model)) {
-        .k3 => K3.dialect,
-        .k2_classic => K2.dialect,
-        .k2_always_on => K27.dialect,
-    });
+    return switch (kind) {
+        .openai => compat.ready(switch (generation(model)) {
+            .k3 => K3.dialect,
+            .k2_classic => K2.dialect,
+            .k2_always_on => K27.dialect,
+        }),
+        .anthropic => compat.ready(Messages.dialect),
+        else => null,
+    };
 }
 
 const Generation = enum { k3, k2_classic, k2_always_on };
@@ -99,6 +120,7 @@ pub fn openaiProfile(model: []const u8) ModelProfile {
             .returns_reasoning_content = true,
             .echoes_reasoning_content = true,
             .cannot_disable_thinking = true,
+            .fixed_sampling = true,
         },
         .k2_classic => .{
             .thinking_mode = .kimi_extra_body,
@@ -116,6 +138,7 @@ pub fn openaiProfile(model: []const u8) ModelProfile {
             .echoes_reasoning_content = true,
             .preserved_thinking_default = false,
             .cannot_disable_thinking = true,
+            .fixed_sampling = true,
         },
     };
 }
@@ -185,6 +208,24 @@ const K27 = struct {
     };
 };
 
+/// Anthropic messages wire(K3):没有 thinking 对象,只发 `output_config.effort`。
+const Messages = struct {
+    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
+        _ = ctx;
+        _ = p;
+        const e = effort orelse return; // 未指定:服务端默认 max
+        try out.appendSlice(a, ",\"output_config\":{\"effort\":");
+        try util_json.serializeString(k3Effort(e), out, a);
+        try out.append(a, '}');
+    }
+
+    const dialect = blk: {
+        var d = claude.wire;
+        d.serializeThinkingFn = serializeThinking;
+        break :blk d;
+    };
+};
+
 // ── 测试 ─────────────────────────────────────────────────────────────────────
 
 fn bytes(model: []const u8, effort: ?ReasoningEffort, out: *std.ArrayList(u8)) !void {
@@ -250,9 +291,37 @@ test "Kimi: 三代都回传 reasoning_content" {
     }
 }
 
-test "Kimi 按名推断只在 OpenAI wire 上" {
+test "Kimi 按名推断只在 OpenAI wire 上;Anthropic wire 的方言只给声明了 Kimi 的路由" {
     try std.testing.expect(claims(.openai, "moonshot-v1-8k"));
     try std.testing.expect(claims(.openai, "Kimi-K3"));
     try std.testing.expect(!claims(.anthropic, "kimi-k3"));
-    try std.testing.expect(dialect(.anthropic, "kimi-k3") == null);
+    try std.testing.expect(dialect(.anthropic, "kimi-k3") != null);
+}
+
+test "Kimi Anthropic wire: 只发 output_config.effort(low/high/max),不发 thinking 对象" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const d = dialect(.anthropic, "kimi-k3.1-pro").?;
+    inline for (.{
+        .{ ReasoningEffort.low, ",\"output_config\":{\"effort\":\"low\"}" },
+        .{ ReasoningEffort.medium, ",\"output_config\":{\"effort\":\"high\"}" },
+        .{ ReasoningEffort.xhigh, ",\"output_config\":{\"effort\":\"max\"}" },
+        .{ ReasoningEffort.none, ",\"output_config\":{\"effort\":\"max\"}" },
+    }) |case| {
+        out.clearRetainingCapacity();
+        try d.serializeThinking(.{}, case[0], &out, a);
+        try std.testing.expectEqualStrings(case[1], out.items);
+    }
+    out.clearRetainingCapacity();
+    try d.serializeThinking(.{}, null, &out, a);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    // 不回传无签名的 thinking 块。
+    try std.testing.expect(!d.profileFor(.anthropic, "kimi-k3").echoes_reasoning_content);
+}
+
+test "Kimi: K3 与 K2.7 固定采样参数,K2.6 不固定" {
+    try std.testing.expect(openaiProfile("kimi-k3").fixed_sampling);
+    try std.testing.expect(openaiProfile("kimi-k2.7-code").fixed_sampling);
+    try std.testing.expect(!openaiProfile("kimi-k2.6").fixed_sampling);
 }

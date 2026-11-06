@@ -1462,15 +1462,16 @@ pub fn serializeOpenAIRequestWithOverridesAndDialectReport(
     try util_json.serializeString(model, &out, allocator);
     // thinking 控制:委托给 dialect(按 model 选 wire 格式)。
     try dialect.serializeThinking(profile, overrides.reasoning_effort, &out, allocator);
-    // 通用采样参数(不经 dialect,所有 OpenAI 协议都认)。
-    if (overrides.temperature) |t| {
+    // 通用采样参数(不经 dialect,所有 OpenAI 协议都认);厂商固定采样参数的型号
+    // (profile.fixed_sampling,Kimi K3 / K2.7-code)不发。
+    if (overrides.temperature) |t| if (!profile.fixed_sampling) {
         try out.appendSlice(allocator, ",\"temperature\":");
         try util_json.serializeNumber(t, &out, allocator);
-    }
-    if (overrides.top_p) |p| {
+    };
+    if (overrides.top_p) |p| if (!profile.fixed_sampling) {
         try out.appendSlice(allocator, ",\"top_p\":");
         try util_json.serializeNumber(p, &out, allocator);
-    }
+    };
     // stream_options.include_usage=true:OpenAI 默认流式不发 usage,显式要求才在末尾发一个
     // {choices:[],usage:{...}} chunk。缓存命中(cached_tokens)就在这个 usage 里。
     try out.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");

@@ -173,9 +173,14 @@ test "声明的厂商在这条 wire 上没有专属方言时用 wire 的基础�
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
-    // Kimi 的 Anthropic 渠道:Claude 方言。
-    try dialectFor(.anthropic, .kimi, "kimi-k3").?.serializeThinking(.{}, .high, &out, a);
+    // Mistral 在 Anthropic wire 上没有专属方言:Claude 方言。
+    try dialectFor(.anthropic, .mistral, "mistral-large").?.serializeThinking(.{}, .high, &out, a);
     try std.testing.expectEqualStrings(",\"output_config\":{\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\"}", out.items);
+    // Kimi 有:声明了 Kimi 的 Anthropic 渠道只发 K3 的 output_config.effort。
+    out.clearRetainingCapacity();
+    try dialectFor(.anthropic, .kimi, "kimi-k3").?.serializeThinking(.{}, .high, &out, a);
+    try std.testing.expectEqualStrings(",\"output_config\":{\"effort\":\"high\"}", out.items);
+    out.clearRetainingCapacity();
     // 名字认不出,但路由说是 DeepSeek:用 DeepSeek 的家族 profile。
     const d = dialectFor(.openai, .deepseek, "house-relay-model").?;
     try std.testing.expect(d.profileFor(.openai, "house-relay-model").returns_reasoning_content);

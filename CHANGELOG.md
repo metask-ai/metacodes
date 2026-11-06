@@ -18,7 +18,15 @@ status, compatibility boundaries, and entry points are defined by
   from the vendors' own documentation, and reasoning controls in the vendors'
   vocabularies. Keys come from `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
   `DASHSCOPE_API_KEY` and `MINIMAX_API_KEY`. Quotes stay unknown (time-of-day,
-  regional and tiered prices).
+  regional and tiered prices). On the Anthropic wire each vendor has its own
+  dialect rather than Claude's: Qwen sends `thinking` `enabled` / `disabled` and
+  its `low` / `medium` / `xhigh` effort, Kimi only `output_config.effort` in
+  `low` / `high` / `max`, MiniMax `adaptive` / `disabled` (M3 explicitly, since
+  it does not think on that wire unless asked) with an effort for M3.1. Kimi
+  K2.7-code is offered on the OpenAI channels only, and Kimi K3 and K2.7-code
+  leave a `temperature` / `top_p` override out, as their documentation asks.
+  Qwen 3.8's window and output limits are recorded as unverified: Model
+  Studio's own pages do not state them.
 - **A route says which vendor dialect it speaks.** `ProtocolRoute.dialect` and
   `ModelEntry.dialect` (and `"dialect"` on a `custom_providers` channel or model)
   name the vendor whose parameters the request carries, the way an OpenRouter

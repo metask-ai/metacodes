@@ -346,7 +346,7 @@ test "L2 dialect: the startup route of a built-in vendor reaches the factory-bui
     try std.testing.expect(outcome == .route);
     var route = outcome.route;
     defer route.deinit();
-    try std.testing.expectEqual(Vendor.kimi, route.dialect.?);
+    try std.testing.expectEqual(Vendor.kimi, route.dialect.route.?);
 
     var owned = try cc.api_provider_factory.makeProviderWithOptions(
         a,
@@ -412,6 +412,107 @@ test "L2 dialect: a declared route reaches the factory-built client even for an 
     // carries GLM's thinking switch, not the OpenAI-native top-level effort only.
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"},\"clear_thinking\":false,\"reasoning_effort\":\"high\"") != null);
+}
+
+/// One request on a built-in vendor's Anthropic channel, through the startup
+/// route and the factory-built client, with `effort` set; returns the body.
+fn anthropicChannelBody(a: std.mem.Allocator, server: *harness.MockServer, provider: []const u8, channel: []const u8, path: []const u8, model: []const u8, effort: cc.types_mod.ReasoningEffort) ![]u8 {
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const origin = url[0 .. url.len - "/v1/messages".len];
+    var registry = try cc.provider_registry.ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    // The mock stands in for the channel; loopback plaintext passes the route
+    // policy, which still requires the channel's path marker.
+    const base_url = try std.fmt.allocPrint(a, "{s}{s}", .{ origin, path });
+    defer a.free(base_url);
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{
+        .provider = provider,
+        .channel = channel,
+        .model = model,
+        .base_url = base_url,
+    });
+    try std.testing.expect(outcome == .route);
+    var route = outcome.route;
+    defer route.deinit();
+    try std.testing.expectEqual(cc.types_mod.ProviderKind.anthropic, route.transport);
+    var owned = try cc.api_provider_factory.makeProviderWithOptions(
+        a,
+        route.transport,
+        .{ .fixed = "vendor-key" },
+        route.request_model_id,
+        route.endpoint_url,
+        route.openai_protocol,
+        .builtin(),
+        .{ .auth_scheme = route.auth_scheme, .dialect = route.dialect },
+    );
+    defer owned.deinit();
+    try owned.provider().setReasoningEffort(effort);
+    try drain(a, owned.provider(), &HI);
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, captured.raw, path) != null);
+    return a.dupe(u8, captured.body());
+}
+
+test "L2 dialect: Qwen's Anthropic channel sends enabled/disabled and its own effort words, never adaptive" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startCassette(&.{ ANTHROPIC_END_TURN_SSE, ANTHROPIC_END_TURN_SSE }, 0);
+    defer server.stop();
+    const high = try anthropicChannelBody(a, server, "qwen", "cn-anthropic", "/apps/anthropic", "qwen3.8-max", .high);
+    defer a.free(high);
+    try std.testing.expect(std.mem.indexOf(u8, high, "\"output_config\":{\"effort\":\"xhigh\"},\"thinking\":{\"type\":\"enabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, high, "adaptive") == null);
+    const off = try anthropicChannelBody(a, server, "qwen", "intl-anthropic", "/apps/anthropic", "qwen3.8-flash", .none);
+    defer a.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "\"thinking\":{\"type\":\"disabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "output_config") == null);
+}
+
+test "L2 dialect: Kimi's Anthropic channel sends only output_config.effort in K3 words" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer server.stop();
+    // Neutral `medium` has no Kimi word on this wire: K3's `high`.
+    const body = try anthropicChannelBody(a, server, "kimi", "cn-anthropic", "/anthropic", "kimi-k3.1-pro", .medium);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"output_config\":{\"effort\":\"high\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "medium") == null);
+}
+
+test "L2 dialect: MiniMax's Anthropic channel keeps M3 thinking on by default and gives M3.1 its effort" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startCassette(&.{ ANTHROPIC_END_TURN_SSE, ANTHROPIC_END_TURN_SSE }, 0);
+    defer server.stop();
+    const m31 = try anthropicChannelBody(a, server, "minimax", "global-anthropic", "/anthropic", "MiniMax-M3.1-Flash", .xhigh);
+    defer a.free(m31);
+    try std.testing.expect(std.mem.indexOf(u8, m31, "\"output_config\":{\"effort\":\"xhigh\"},\"thinking\":{\"type\":\"adaptive\"}") != null);
+    // M3 does not think on this wire unless asked: `high` sends adaptive and no
+    // effort (M3 does not honour it).
+    const m3 = try anthropicChannelBody(a, server, "minimax", "cn-anthropic", "/anthropic", "MiniMax-M3", .high);
+    defer a.free(m3);
+    try std.testing.expect(std.mem.indexOf(u8, m3, "\"thinking\":{\"type\":\"adaptive\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m3, "output_config") == null);
+}
+
+test "L2 dialect: Kimi K3 and K2.7-code leave a temperature/top_p override out; other models still send it" {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    inline for (.{ .{ "kimi-k3", false }, .{ "kimi-k2.7-code", false }, .{ "kimi-k2.6", true }, .{ "gpt-4o", true } }) |case| {
+        var server = try harness.MockServer.startCassette(&.{OPENAI_END_TURN_SSE}, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "key", case[0], url);
+        defer client.deinit();
+        client.overrides.temperature = 0.2;
+        client.overrides.top_p = 0.5;
+        try drain(a, client.provider(), &HI);
+        const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+        try std.testing.expectEqual(case[1], std.mem.indexOf(u8, body, "\"temperature\":") != null);
+        try std.testing.expectEqual(case[1], std.mem.indexOf(u8, body, "\"top_p\":") != null);
+    }
 }
 
 fn historyWithThinking(conv: *cc.conversation.Conversation, a: std.mem.Allocator) !void {

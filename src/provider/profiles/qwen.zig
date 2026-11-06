@@ -36,13 +36,15 @@ const CONTROLS = [_]controls.ControlSpec{.{
     .allowed_values = &EFFORTS,
 }};
 
-/// 1,000,000-token window and 131,072 output tokens for the Qwen 3.8 line in
-/// both regions.
+/// 1,000,000-token window and 131,072 output tokens for the Qwen 3.8 line, as
+/// third-party listings report. Model Studio's own model pages do not state
+/// them (checked 2026-11), so the provenance records them as unverified
+/// (`freshness = .unknown`) until a catalog or the vendor confirms them.
 const LIMITS = offer.EffectiveLimits{
     .context_window = 1_000_000,
     .max_output_tokens = 131_072,
     .token_counting = .{ .mode = .provider_reported, .unit = .tokens },
-    .provenance = offer.Provenance.known(.builtin_profile, null),
+    .provenance = .{ .source = .builtin_profile },
 };
 
 const CAPABILITIES = (offer.CapabilityMatrix{
@@ -156,4 +158,6 @@ test "qwen profile: workspace endpoints pass, cross-protocol overrides do not" {
     for (CHANNELS) |channel| for (channel.routes) |route| {
         try std.testing.expectEqual(profile.Vendor.qwen, route.dialect.?);
     };
+    // The 3.8 limits are not on the vendor's own pages: recorded as unverified.
+    try std.testing.expectEqual(offer.Freshness.unknown, MODELS[0].limits.provenance.freshness);
 }

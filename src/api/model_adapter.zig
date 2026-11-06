@@ -116,6 +116,11 @@ pub const ModelProfile = struct {
     /// OpenAI chat wire 上,assistant 历史消息的 thinking 块以 `reasoning_content` 回传。
     /// DeepSeek 在请求带 tools 时要求回传全部历史思考,否则 400;只由厂商接入文件声明。
     echoes_reasoning_content: bool = false,
+    /// The vendor pins the sampling parameters (Kimi K3 says to omit
+    /// `temperature` / `top_p`; K2.7-code errors on any other value): the
+    /// OpenAI chat serializer leaves a caller's `temperature` / `top_p`
+    /// override out. Every other profile sends them as before.
+    fixed_sampling: bool = false,
     /// 不能关 thinking(Kimi K3 总是开;Gemini 3.x 系列不能关)。
     /// 若 effort=null 或 .none/.minimal,dialect 仍要发"最低档"而非不发。
     cannot_disable_thinking: bool = false,
