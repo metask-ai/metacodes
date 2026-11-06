@@ -14,6 +14,11 @@ empty `### Migration`.
 
 ## Unreleased
 
+### Changed
+
+- No change a Host can see. The inputs moved for a fix in the CLI's plain headless
+  output (#417), which AgentCore does not use.
+
 ## 0.13.0 — 2026-10-31
 
 ### Added
