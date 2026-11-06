@@ -792,7 +792,7 @@ test "an ingested catalog becomes offers, and its prices and health become event
         try std.testing.expectEqualStrings("deepseek/deepseek-v4", item.canonical_model_id.?);
         // The route speaks OpenRouter's dialect, not DeepSeek's, although the
         // name says deepseek: OpenRouter translates for its upstreams.
-        try std.testing.expectEqual(@import("vendor.zig").Vendor.openrouter, item.dialect.?);
+        try std.testing.expectEqual(@import("vendor.zig").Vendor.openrouter, item.dialect.route.?);
         if (item.quote.priced()) |price| {
             priced += 1;
             if (price.provenance.freshness == .inherited) inherited += 1;
@@ -839,7 +839,7 @@ test "a Bedrock catalog becomes Converse offers that declare each model's dialec
         try std.testing.expectEqual(profile_mod.Protocol.Wire.bedrock_converse, item.wire.?);
         try std.testing.expectEqualStrings("https://bedrock-runtime.us-east-1.amazonaws.com", item.endpoint_ref);
         if (std.mem.eql(u8, item.request_model_id, "us.anthropic.claude-sonnet-4-6"))
-            try std.testing.expectEqual(@import("vendor.zig").Vendor.claude, item.dialect.?);
+            try std.testing.expectEqual(@import("vendor.zig").Vendor.claude, item.dialect.model.?);
     }
     try std.testing.expectEqual(@as(usize, 3), seen);
     // A refresh replaces its own registration rather than failing on it.

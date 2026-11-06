@@ -245,7 +245,7 @@ test "L2 bedrock: the built-in profile's startup route drives an App to the Conv
     defer route.deinit();
     try std.testing.expectEqual(cc.types_mod.ProviderKind.bedrock, route.transport);
     try std.testing.expectEqualStrings(MODEL, route.request_model_id);
-    try std.testing.expectEqual(cc.api_dialect.Vendor.claude, route.dialect.?);
+    try std.testing.expectEqual(cc.api_dialect.Vendor.claude, route.dialect.bound().?);
 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

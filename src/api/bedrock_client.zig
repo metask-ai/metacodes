@@ -137,9 +137,9 @@ pub const BedrockClient = struct {
     overrides: request_overrides.RequestOverrides = .{},
     auth_scheme: ?auth_header_mod.AuthScheme = null,
     dialect_resolver: dialect_mod.Resolver = .{},
-    /// The vendor the route declares for the hosted model; null reads it from
-    /// the model id.
-    dialect_vendor: ?dialect_mod.Vendor = null,
+    /// The vendor the route (or the bound model's entry) declares for the
+    /// hosted model; neither reads it from the model id.
+    declared_dialect: dialect_mod.DialectDeclaration = .{},
     catalog: ?catalog_mod.Catalog = null,
     host_capabilities: image_capability.Declarations = .{},
     reasoning: ReasoningStore,
@@ -278,7 +278,7 @@ pub const BedrockClient = struct {
             .overrides = o,
             .max_tokens = self.maxTokensFor(model),
             .dialect = self.dialectFor(model),
-            .declared = self.dialect_vendor,
+            .declared = self.declared_dialect.vendorFor(self.model, model),
             .reasoning = &self.reasoning,
         }, &report);
         defer self.allocator.free(body);
@@ -294,7 +294,7 @@ pub const BedrockClient = struct {
     /// The dialect for `model`, with the Host's or the catalog's image-input
     /// declaration applied.
     pub fn dialectFor(self: *const BedrockClient, model: []const u8) dialect_mod.Dialect {
-        var dialect = self.dialect_resolver.resolve(.bedrock, self.dialect_vendor, model);
+        var dialect = self.dialect_resolver.resolve(.bedrock, self.declared_dialect.vendorFor(self.model, model), model);
         const from_catalog: ?bool = if (self.catalog) |*catalog| catalog.imageInputFor(model) else null;
         dialect.declareImageInput(self.host_capabilities.imageInputFor(model), from_catalog);
         return dialect;

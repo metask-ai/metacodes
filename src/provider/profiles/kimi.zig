@@ -6,8 +6,9 @@
 //!
 //! China (`api.moonshot.cn`) and global (`api.moonshot.ai`) are separate
 //! accounts with separate keys, each with an OpenAI-chat and an
-//! Anthropic-compatible surface. China on the OpenAI wire is the default: it is
-//! the surface the Kimi dialect is written for.
+//! Anthropic-compatible surface. China on the OpenAI wire is the default. The
+//! Anthropic surface serves the K3 series only, so K2.7-code is offered on the
+//! OpenAI channels alone.
 //!
 //! The Kimi Code subscription (`api.kimi.com/coding/v1`) is a different account
 //! and quota and is not part of this profile. Quotes stay `unknown` until a
@@ -56,7 +57,9 @@ const K3_LIMITS = offer.EffectiveLimits{
     .provenance = offer.Provenance.known(.builtin_profile, null),
 };
 
-/// K2.7-code: 262,144-token window.
+/// K2.7-code: 262,144-token window (pricing page: every K2 model). It is closed
+/// to accounts registered after 2026-11-01 and is expected to be retired in
+/// late December 2026.
 const K27_LIMITS = offer.EffectiveLimits{
     .context_window = 262_144,
     .token_counting = .{ .mode = .provider_reported, .unit = .tokens },
@@ -87,8 +90,12 @@ const MODELS = [_]profile.ModelEntry{
         .canonical_model_id = "moonshotai/kimi-k2.7-code",
         .limits = K27_LIMITS,
         .capabilities = CAPABILITIES,
+        // The Anthropic surface serves the K3 series only.
+        .protocols = &OPENAI_ONLY,
     },
 };
+
+const OPENAI_ONLY = [_]profile.Protocol{.openai_chat};
 
 const OPENAI_REQUIRED = [_][]const u8{"/v1"};
 const ANTHROPIC_REQUIRED = [_][]const u8{"/anthropic"};
@@ -176,4 +183,8 @@ test "kimi profile: four channels, every route declares the Kimi dialect" {
     for (CHANNELS) |channel| for (channel.routes) |route| {
         try std.testing.expectEqual(profile.Vendor.kimi, route.dialect.?);
     };
+    // K2.7-code is not offered where the Anthropic surface cannot serve it.
+    try std.testing.expect(MODELS[2].servesProtocol(.openai_chat));
+    try std.testing.expect(!MODELS[2].servesProtocol(.anthropic_messages));
+    try std.testing.expect(MODELS[0].servesProtocol(.anthropic_messages));
 }

@@ -56,9 +56,9 @@ pub const StartupRoute = struct {
     region: ?[]u8,
     plan: ?[]u8,
     auth_scheme: credential.AuthScheme,
-    /// The vendor dialect the route declares; null infers it from the model
-    /// name at the transport.
-    dialect: ?profile_mod.Vendor,
+    /// The vendor dialect the route and the bound model declare; empty infers
+    /// it from the model name at the transport.
+    dialect: profile_mod.DialectDeclaration,
     limits: offer_mod.EffectiveLimits,
     capabilities: offer_mod.CapabilityMatrix,
     /// True when the model was supplied by the user and is not in the

@@ -549,6 +549,36 @@ Provider and differs from it only by `model_override`, so sizing a child's
 results — or its auto-compact thresholds — against the parent's window is how a
 200K parent hands a 32K child a history that endpoint rejects.
 
+### Provider reasoning continuity (DeepSeek, Kimi, MiniMax)
+
+Some models want their earlier reasoning back on later requests. DeepSeek's
+thinking mode answers HTTP 400 to a tool turn whose assistant history lacks
+`reasoning_content`; Kimi asks for the assistant message back unchanged,
+reasoning included; MiniMax M3 and later ask for the full response back to keep
+the reasoning chain. Core projects every `Block.thinking` into the request IR
+and lets the dialect decide (issue #421):
+
+- A dialect whose profile sets `ModelProfile.echoes_reasoning_content` gets it
+  back: DeepSeek, Kimi and MiniMax M3 and later on the OpenAI chat wire,
+  OpenRouter routes, and a route declaring DeepSeek on the Anthropic Messages
+  wire. OpenAI chat sends the message's thinking text as `reasoning_content` on
+  the assistant message (after `content`, before `tool_calls`); Anthropic
+  Messages sends the non-empty `thinking` blocks in their original position.
+- Every other model is sent exactly the bytes it was sent before: OpenAI
+  native and every other compatible dialect (GLM, Qwen, MiniMax M2, Mistral),
+  OpenAI Responses, Gemini, and Claude. Claude in particular never receives a
+  thinking block: one sent back must carry the signature it was issued with,
+  and the IR keeps none.
+- The dialect follows the route's declaration
+  ([PROVIDER_OFFER_ARCHITECTURE.md](PROVIDER_OFFER_ARCHITECTURE.md)). On the
+  Anthropic wire a model name is never inferred as DeepSeek, so a DeepSeek
+  Anthropic endpoint configured as a custom provider gets its thinking back only
+  when it declares `"dialect": "deepseek"`; the built-in `deepseek` provider
+  declares it.
+
+An assistant message holding nothing but thinking (a reply cut off by
+`max_tokens` inside its reasoning) is still left out of the request.
+
 ### Provider reasoning continuity (OpenAI Responses)
 
 The Responses protocol is used with `store:false`: the server keeps no copy of
@@ -559,10 +589,10 @@ server emitted it (`id`, `summary`, `encrypted_content`), replayed byte for
 byte, and `model` is the model that produced it.
 
 This is not `Block.thinking`. A thinking block is readable assistant
-reasoning that the UI displays and the Anthropic dialect replays as a
-`thinking` block; a reasoning item is opaque provider state that is never
-displayed, never enters a compaction summary, and never becomes assistant
-text. Every dialect other than OpenAI Responses skips it.
+reasoning that the UI displays and that only a model asking for its reasoning
+back receives (see the previous section); a reasoning item is opaque provider
+state that is never displayed, never enters a compaction summary, and never
+becomes assistant text. Every dialect other than OpenAI Responses skips it.
 
 Capture is event-independent: the same item may arrive in
 `response.output_item.done`, in the terminal `response.completed`'s

@@ -28,7 +28,15 @@ status, compatibility boundaries, and entry points are defined by
   from the vendors' own documentation, and reasoning controls in the vendors'
   vocabularies. Keys come from `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
   `DASHSCOPE_API_KEY` and `MINIMAX_API_KEY`. Quotes stay unknown (time-of-day,
-  regional and tiered prices).
+  regional and tiered prices). On the Anthropic wire each vendor has its own
+  dialect rather than Claude's: Qwen sends `thinking` `enabled` / `disabled` and
+  its `low` / `medium` / `xhigh` effort, Kimi only `output_config.effort` in
+  `low` / `high` / `max`, MiniMax `adaptive` / `disabled` (M3 explicitly, since
+  it does not think on that wire unless asked) with an effort for M3.1. Kimi
+  K2.7-code is offered on the OpenAI channels only, and Kimi K3 and K2.7-code
+  leave a `temperature` / `top_p` override out, as their documentation asks.
+  Qwen 3.8's window and output limits are recorded as unverified: Model
+  Studio's own pages do not state them.
 - **A route says which vendor dialect it speaks.** `ProtocolRoute.dialect` and
   `ModelEntry.dialect` (and `"dialect"` on a `custom_providers` channel or model)
   name the vendor whose parameters the request carries, the way an OpenRouter
@@ -36,21 +44,15 @@ status, compatibility boundaries, and entry points are defined by
   scheme to the session, a `/model` switch, child agents, swarm teammates and
   `AgentSession`. A route that declares nothing keeps model-name inference, so
   existing configurations behave as before; an unknown value fails the definition.
+  A model's declaration covers that model only: a child agent, teammate or
+  Session model switch onto another model of the same route keeps the route's
+  declaration or infers from its own name.
 - **OpenRouter's own request surface.** Offers ingested from an OpenRouter catalog
   declare the new OpenRouter dialect: `reasoning: {effort}` and `delta.reasoning`,
   whatever the upstream model is called. A `deepseek/...` model through OpenRouter
-  no longer gets DeepSeek's native `thinking` fields.
-
-### Fixed
-
-- **DeepSeek and Kimi get their reasoning back.** DeepSeek answers 400 when a
-  request with tools lacks the `reasoning_content` of earlier turns, and Kimi's
-  documentation requires it with tool calls; neither was ever sent. The
-  conversation's thinking blocks now reach the dialect, and a dialect that
-  declares passback (`ModelProfile.echoes_reasoning_content`: DeepSeek, Kimi,
-  OpenRouter) sends them as `reasoning_content` on assistant history — or, on
-  DeepSeek's Anthropic endpoint, as thinking blocks. Every other dialect's request
-  bytes are unchanged; Claude never receives an unsigned thinking block.
+  no longer gets DeepSeek's native `thinking` fields. OpenRouter routes' request
+  bytes change once, so their provider-side prompt cache misses on the first
+  request after the upgrade.
 
 ### Changed
 
@@ -66,7 +68,34 @@ status, compatibility boundaries, and entry points are defined by
   (the API accepts only `disabled` / `adaptive`), M3.1 sends its `reasoning_effort`,
   and every MiniMax model asks for `reasoning_split`. Kimi K2.6 no longer puts an
   `effort` in its `thinking` object, and K2.7-code never sends `disabled`.
-  DeepSeek's `low` level is sent as `low` rather than `high`.
+  DeepSeek's `low` level is sent as `low` rather than `high`. A Kimi model id
+  that names no generation (`kimi-latest`, `kimi-for-coding`) is now treated as
+  K2.7 or later: thinking stays on, and `none` no longer sends `disabled`.
+
+### Fixed
+
+- **DeepSeek, Kimi and MiniMax get their reasoning back.** DeepSeek answers 400
+  when a request with tools lacks the `reasoning_content` of earlier turns, Kimi's
+  documentation requires it with tool calls, and MiniMax M3 and later ask for the
+  full response back to keep the reasoning chain; none was ever sent. The
+  conversation's thinking blocks now reach the dialect, and a dialect that
+  declares passback (`ModelProfile.echoes_reasoning_content`: DeepSeek, Kimi,
+  MiniMax M3+, OpenRouter) sends them as `reasoning_content` on assistant history
+  — or, on a route declaring DeepSeek on the Anthropic wire, as its non-empty
+  thinking blocks. Every other dialect's request bytes are unchanged; Claude
+  never receives an unsigned thinking block. A custom DeepSeek Anthropic endpoint
+  gets its thinking back only when it declares `"dialect": "deepseek"`.
+- **Kimi K2 with no reasoning effort set no longer crashes.** On the OpenAI chat
+  wire the K2.6 dialect unwrapped the unset effort while writing the `thinking`
+  object, which panicked in Debug and ReleaseSafe builds; it now sends
+  `{"type":"enabled","keep":"all"}`.
+- **Plain headless says why a failed Run stopped (#417).** `-p` without `--json`
+  exited 1 with nothing on stderr when the reply was still cut off after the
+  three max-token continuations, and when the Run was interrupted by SIGINT or
+  SIGTERM. Those stops, and the same exit for a tool failure, now write one
+  `error: stopped (<stop_reason>): …` line to stderr, on `--resume-response`
+  too. Stdout (any partial text) and the exit code are unchanged, and so is
+  `--json`.
 
 ## 0.10.0 — 2026-10-31
 

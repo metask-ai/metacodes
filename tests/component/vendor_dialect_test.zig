@@ -2,7 +2,9 @@
 //! `ModelEntry.dialect`, `custom_providers.*.dialect`) — not the model name —
 //! decides what the request body says, on every path a route reaches a
 //! transport: the startup route through the client factory, a `/model` switch
-//! inside a running App, and the child-agent registry.
+//! inside a running App, and the child-agent and teammate registries. A model
+//! entry's declaration covers that model only: a child or teammate on another
+//! model of the same route is written in that model's own dialect.
 //!
 //! Also: the DeepSeek dialect's reasoning passback reaches the wire as
 //! `reasoning_content` on assistant history, and a dialect that does not
@@ -40,7 +42,15 @@ fn originOf(allocator: std.mem.Allocator, server: *harness.MockServer) ![]u8 {
 }
 
 fn drain(allocator: std.mem.Allocator, provider: cc.api_provider.Provider, messages: []const cc.types_mod.ApiMessage) !void {
-    var handle = try provider.sendStream(messages, null, null, null, null, null, "");
+    return drainAs(allocator, provider, messages, null, null);
+}
+
+/// One request with a system prompt and a per-call model, the way a child
+/// agent whose definition names another model sends it. `allocator` is the
+/// provider's own: registry-built providers allocate events with
+/// `std.heap.c_allocator`.
+fn drainAs(allocator: std.mem.Allocator, provider: cc.api_provider.Provider, messages: []const cc.types_mod.ApiMessage, system: ?[]const u8, model_override: ?[]const u8) !void {
+    var handle = try provider.sendStream(messages, system, null, null, model_override, null, "");
     defer handle.deinit();
     while (try handle.next()) |event| switch (event) {
         .text, .thinking => |bytes| allocator.free(bytes),
@@ -80,9 +90,10 @@ const cleared_variables = [_][*:0]const u8{
     "DEEPSEEK_API_KEY",
 };
 
-/// A scratch HOME holding a `config.json` with two relays on the same mock
-/// server: `declared` says its route speaks DeepSeek, `plain` says nothing.
-/// Their model ids carry no vendor name, so only the declaration can matter.
+/// A scratch HOME holding a `config.json` with three relays on the same mock
+/// server: `declared` says its route speaks DeepSeek, `plain` says nothing,
+/// and `gateway` declares Kimi on one of its two models only. Their model ids
+/// carry no vendor name, so only the declarations can matter.
 const Case = struct {
     arena: std.heap.ArenaAllocator,
     tmp: std.testing.TmpDir,
@@ -111,8 +122,12 @@ const Case = struct {
             \\  "plain": {{
             \\    "env_aliases": [{{"name": "{s}", "kind": "api_key", "canonical": true}}],
             \\    "channels": [{{"id": "c", "base_url": "{s}/plain/v1", "protocol": "openai_chat"}}],
-            \\    "models": [{{"request_model_id": "house-model-b"}}]}}}}}}
-        , .{ RELAY_ENV, origin, RELAY_ENV, origin });
+            \\    "models": [{{"request_model_id": "house-model-b"}}]}},
+            \\  "gateway": {{
+            \\    "env_aliases": [{{"name": "{s}", "kind": "api_key", "canonical": true}}],
+            \\    "channels": [{{"id": "c", "base_url": "{s}/gateway/v1", "protocol": "openai_chat"}}],
+            \\    "models": [{{"request_model_id": "house-model-c", "dialect": "kimi"}}, {{"request_model_id": "house-model-d"}}]}}}}}}
+        , .{ RELAY_ENV, origin, RELAY_ENV, origin, RELAY_ENV, origin });
         try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = definition });
     }
 
@@ -142,7 +157,7 @@ const Case = struct {
 test "L2 dialect: a /model switch writes the request in the route's declared dialect, not the model name's" {
     var anthropic = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
     defer anthropic.stop();
-    var relay = try harness.MockServer.startCassette(&.{ OPENAI_END_TURN_SSE, OPENAI_END_TURN_SSE }, 0);
+    var relay = try harness.MockServer.startCassette(&.{ OPENAI_END_TURN_SSE, OPENAI_END_TURN_SSE, OPENAI_END_TURN_SSE, OPENAI_END_TURN_SSE }, 0);
     defer relay.stop();
 
     var case: Case = undefined;
@@ -167,9 +182,19 @@ test "L2 dialect: a /model switch writes the request in the route's declared dia
     const declared = relay.lastRequest() orelse return error.NoRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, declared.raw, "POST /declared/v1/chat/completions ") != null);
     try std.testing.expect(std.mem.indexOf(u8, declared.body(), "\"thinking\":{\"type\":\"enabled\"},\"reasoning_effort\":\"high\"") != null);
-    // A child agent spawned now inherits the declaration with the route.
-    try std.testing.expectEqual(Vendor.deepseek, app.agent_jobs.?.dialect.?);
-    try std.testing.expectEqual(Vendor.deepseek, app.swarm.dialect.?);
+    // A child agent spawned now inherits the declaration with the route, and
+    // the route's covers every model, including a child's own.
+    try std.testing.expectEqual(Vendor.deepseek, app.agent_jobs.?.dialect.route.?);
+    try std.testing.expectEqual(Vendor.deepseek, app.swarm.dialect.route.?);
+    {
+        var child = try app.agent_jobs.?.makeProvider();
+        defer child.deinit();
+        try drainAs(std.heap.c_allocator, child.provider(), &HI, null, "house-model-z");
+        const sent = relay.lastRequest() orelse return error.NoRequestCaptured;
+        try std.testing.expect(std.mem.indexOf(u8, sent.raw, "POST /declared/v1/chat/completions ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sent.body(), "\"model\":\"house-model-z\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sent.body(), "\"thinking\":{\"type\":\"enabled\"}") != null);
+    }
 
     // The plain relay: no declaration, an unrecognisable name — OpenAI native.
     try std.testing.expect(cc.repl_picker_host.useSelector(app, "house-model-b") == .switched);
@@ -179,7 +204,124 @@ test "L2 dialect: a /model switch writes the request in the route's declared dia
     try std.testing.expect(std.mem.indexOf(u8, plain.raw, "POST /plain/v1/chat/completions ") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain.body(), "\"reasoning_effort\":\"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain.body(), "\"thinking\"") == null);
-    try std.testing.expect(app.agent_jobs.?.dialect == null);
+    try std.testing.expect(app.agent_jobs.?.dialect.bound() == null);
+    {
+        var child = try app.agent_jobs.?.makeProvider();
+        defer child.deinit();
+        try drainAs(std.heap.c_allocator, child.provider(), &HI, null, null);
+        const sent = relay.lastRequest() orelse return error.NoRequestCaptured;
+        try std.testing.expect(std.mem.indexOf(u8, sent.raw, "POST /plain/v1/chat/completions ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sent.body(), "\"thinking\"") == null);
+    }
+}
+
+test "L2 dialect: a model entry's declaration writes that model's requests; its child on another model is not written in it" {
+    var anthropic = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer anthropic.stop();
+    var relay = try harness.MockServer.startCassette(&.{ OPENAI_END_TURN_SSE, OPENAI_END_TURN_SSE, OPENAI_END_TURN_SSE }, 0);
+    defer relay.stop();
+
+    var case: Case = undefined;
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    try case.init(try originOf(setup.allocator(), relay));
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+    const start_url = try allocator.dupeZ(u8, try anthropic.urlOwned(allocator));
+
+    const argv = [_][*:0]const u8{ "metacodes", "--api-key", "metask-key", "--base-url", start_url.ptr, "--model", "claude-sonnet-4-6" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, "metask-key");
+    defer app.deinit();
+
+    // house-model-c declares Kimi on its entry: Kimi's always-on thinking
+    // object, never the OpenAI-native top-level effort.
+    try std.testing.expect(cc.repl_picker_host.useSelector(app, "house-model-c") == .switched);
+    try app.provider().setReasoningEffort(.high);
+    try drain(app.allocator, app.provider(), &HI);
+    const declared = relay.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, declared.raw, "POST /gateway/v1/chat/completions ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, declared.body(), "\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, declared.body(), "\"reasoning_effort\"") == null);
+    try std.testing.expectEqual(Vendor.kimi, app.agent_jobs.?.dialect.model.?);
+    try std.testing.expect(app.agent_jobs.?.dialect.route == null);
+
+    var child = try app.agent_jobs.?.makeProvider();
+    defer child.deinit();
+    // A child on the parent's model keeps the entry's declaration.
+    try drainAs(std.heap.c_allocator, child.provider(), &HI, null, null);
+    const same = relay.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, same.body(), "\"model\":\"house-model-c\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, same.body(), "\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}") != null);
+    // A child naming the gateway's other model is not written in Kimi's
+    // dialect: the route declares nothing, so its name decides (OpenAI native).
+    try drainAs(std.heap.c_allocator, child.provider(), &HI, null, "house-model-d");
+    const other = relay.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, other.body(), "\"model\":\"house-model-d\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, other.body(), "\"thinking\"") == null);
+}
+
+const STRICT_SKILL = cc.api_capability_activation.STRICT_SKILL_SECTION_MARKER;
+const SKILLS_SYSTEM = "base\n\n" ++ cc.api_capability_activation.SKILLS_SECTION_MARKER ++ "\n- verify: bounded review";
+
+test "L2 dialect: on the Metask gateway a child or teammate on glm-5.2 keeps GLM's dialect, not the lead's Claude entry's" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startCassette(&.{ ANTHROPIC_END_TURN_SSE, ANTHROPIC_END_TURN_SSE, ANTHROPIC_END_TURN_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const origin = url[0 .. url.len - "/v1/messages".len];
+
+    var registry = try cc.provider_registry.ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{
+        .provider = "metask",
+        .model = "claude-sonnet-4-6",
+        .base_url = origin,
+    });
+    try std.testing.expect(outcome == .route);
+    var route = outcome.route;
+    defer route.deinit();
+    // Metask declares Claude on its Claude entries, not on the route: the
+    // gateway serves other vendors' models over the same wire.
+    try std.testing.expectEqual(Vendor.claude, route.dialect.model.?);
+    try std.testing.expect(route.dialect.route == null);
+
+    // Child agents: a provider bound to the lead's model, the child's model
+    // per call.
+    var jobs = try cc.agent_job_registry.AgentJobRegistry.init(a, "metask-key", route.endpoint_url, route.request_model_id, route.transport);
+    defer jobs.deinit();
+    try jobs.setRoute("metask-key", route.endpoint_url, route.transport, route.openai_protocol, route.auth_scheme, route.dialect);
+    var child = try jobs.makeProvider();
+    defer child.deinit();
+    try drainAs(std.heap.c_allocator, child.provider(), &HI, SKILLS_SYSTEM, null);
+    const lead_model = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, lead_model, "\"model\":\"claude-sonnet-4-6\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lead_model, STRICT_SKILL) == null);
+    // A child whose definition names glm-5.2: GLM's strict Skill section, as
+    // the name gave it before routes could declare.
+    try drainAs(std.heap.c_allocator, child.provider(), &HI, SKILLS_SYSTEM, "glm-5.2");
+    const child_glm = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, child_glm, "\"model\":\"glm-5.2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, child_glm, STRICT_SKILL) != null);
+
+    // A teammate: its provider is bound to the teammate's own model.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    var teammates = try cc.swarm_teammate.TeammateRegistry.initWithDialectResolver(a, "metask-key", route.endpoint_url, route.request_model_id, route.transport, route.openai_protocol, root, .builtin());
+    defer teammates.deinit();
+    teammates.auth_scheme = route.auth_scheme;
+    teammates.dialect = route.dialect;
+    var mate = try teammates.makeProvider("glm-5.2");
+    defer mate.deinit();
+    try drainAs(std.heap.c_allocator, mate.provider(), &HI, SKILLS_SYSTEM, null);
+    const mate_glm = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, mate_glm, "\"model\":\"glm-5.2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mate_glm, STRICT_SKILL) != null);
 }
 
 test "L2 dialect: the startup route of a built-in vendor reaches the factory-built client" {
@@ -204,7 +346,7 @@ test "L2 dialect: the startup route of a built-in vendor reaches the factory-bui
     try std.testing.expect(outcome == .route);
     var route = outcome.route;
     defer route.deinit();
-    try std.testing.expectEqual(Vendor.kimi, route.dialect.?);
+    try std.testing.expectEqual(Vendor.kimi, route.dialect.route.?);
 
     var owned = try cc.api_provider_factory.makeProviderWithOptions(
         a,
@@ -250,7 +392,7 @@ test "L2 dialect: a declared route reaches the factory-built client even for an 
     try std.testing.expect(outcome == .route);
     var route = outcome.route;
     defer route.deinit();
-    try std.testing.expectEqual(Vendor.glm, route.dialect.?);
+    try std.testing.expectEqual(Vendor.glm, route.dialect.route.?);
 
     var owned = try cc.api_provider_factory.makeProviderWithOptions(
         a,
@@ -270,6 +412,107 @@ test "L2 dialect: a declared route reaches the factory-built client even for an 
     // carries GLM's thinking switch, not the OpenAI-native top-level effort only.
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"},\"clear_thinking\":false,\"reasoning_effort\":\"high\"") != null);
+}
+
+/// One request on a built-in vendor's Anthropic channel, through the startup
+/// route and the factory-built client, with `effort` set; returns the body.
+fn anthropicChannelBody(a: std.mem.Allocator, server: *harness.MockServer, provider: []const u8, channel: []const u8, path: []const u8, model: []const u8, effort: cc.types_mod.ReasoningEffort) ![]u8 {
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const origin = url[0 .. url.len - "/v1/messages".len];
+    var registry = try cc.provider_registry.ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    // The mock stands in for the channel; loopback plaintext passes the route
+    // policy, which still requires the channel's path marker.
+    const base_url = try std.fmt.allocPrint(a, "{s}{s}", .{ origin, path });
+    defer a.free(base_url);
+    const outcome = try cc.provider_startup.resolve(a, &registry, .{
+        .provider = provider,
+        .channel = channel,
+        .model = model,
+        .base_url = base_url,
+    });
+    try std.testing.expect(outcome == .route);
+    var route = outcome.route;
+    defer route.deinit();
+    try std.testing.expectEqual(cc.types_mod.ProviderKind.anthropic, route.transport);
+    var owned = try cc.api_provider_factory.makeProviderWithOptions(
+        a,
+        route.transport,
+        .{ .fixed = "vendor-key" },
+        route.request_model_id,
+        route.endpoint_url,
+        route.openai_protocol,
+        .builtin(),
+        .{ .auth_scheme = route.auth_scheme, .dialect = route.dialect },
+    );
+    defer owned.deinit();
+    try owned.provider().setReasoningEffort(effort);
+    try drain(a, owned.provider(), &HI);
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, captured.raw, path) != null);
+    return a.dupe(u8, captured.body());
+}
+
+test "L2 dialect: Qwen's Anthropic channel sends enabled/disabled and its own effort words, never adaptive" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startCassette(&.{ ANTHROPIC_END_TURN_SSE, ANTHROPIC_END_TURN_SSE }, 0);
+    defer server.stop();
+    const high = try anthropicChannelBody(a, server, "qwen", "cn-anthropic", "/apps/anthropic", "qwen3.8-max", .high);
+    defer a.free(high);
+    try std.testing.expect(std.mem.indexOf(u8, high, "\"output_config\":{\"effort\":\"xhigh\"},\"thinking\":{\"type\":\"enabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, high, "adaptive") == null);
+    const off = try anthropicChannelBody(a, server, "qwen", "intl-anthropic", "/apps/anthropic", "qwen3.8-flash", .none);
+    defer a.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "\"thinking\":{\"type\":\"disabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "output_config") == null);
+}
+
+test "L2 dialect: Kimi's Anthropic channel sends only output_config.effort in K3 words" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer server.stop();
+    // Neutral `medium` has no Kimi word on this wire: K3's `high`.
+    const body = try anthropicChannelBody(a, server, "kimi", "cn-anthropic", "/anthropic", "kimi-k3.1-pro", .medium);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"output_config\":{\"effort\":\"high\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "medium") == null);
+}
+
+test "L2 dialect: MiniMax's Anthropic channel keeps M3 thinking on by default and gives M3.1 its effort" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.startCassette(&.{ ANTHROPIC_END_TURN_SSE, ANTHROPIC_END_TURN_SSE }, 0);
+    defer server.stop();
+    const m31 = try anthropicChannelBody(a, server, "minimax", "global-anthropic", "/anthropic", "MiniMax-M3.1-Flash", .xhigh);
+    defer a.free(m31);
+    try std.testing.expect(std.mem.indexOf(u8, m31, "\"output_config\":{\"effort\":\"xhigh\"},\"thinking\":{\"type\":\"adaptive\"}") != null);
+    // M3 does not think on this wire unless asked: `high` sends adaptive and no
+    // effort (M3 does not honour it).
+    const m3 = try anthropicChannelBody(a, server, "minimax", "cn-anthropic", "/anthropic", "MiniMax-M3", .high);
+    defer a.free(m3);
+    try std.testing.expect(std.mem.indexOf(u8, m3, "\"thinking\":{\"type\":\"adaptive\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m3, "output_config") == null);
+}
+
+test "L2 dialect: Kimi K3 and K2.7-code leave a temperature/top_p override out; other models still send it" {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    inline for (.{ .{ "kimi-k3", false }, .{ "kimi-k2.7-code", false }, .{ "kimi-k2.6", true }, .{ "gpt-4o", true } }) |case| {
+        var server = try harness.MockServer.startCassette(&.{OPENAI_END_TURN_SSE}, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "key", case[0], url);
+        defer client.deinit();
+        client.overrides.temperature = 0.2;
+        client.overrides.top_p = 0.5;
+        try drain(a, client.provider(), &HI);
+        const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+        try std.testing.expectEqual(case[1], std.mem.indexOf(u8, body, "\"temperature\":") != null);
+        try std.testing.expectEqual(case[1], std.mem.indexOf(u8, body, "\"top_p\":") != null);
+    }
 }
 
 fn historyWithThinking(conv: *cc.conversation.Conversation, a: std.mem.Allocator) !void {
@@ -306,7 +549,7 @@ test "L2 dialect: DeepSeek gets the assistant's thinking back as reasoning_conte
         defer a.free(url);
         var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "key", "house-model", url);
         defer client.deinit();
-        client.dialect_vendor = case[0];
+        client.declared_dialect = .{ .route = case[0] };
 
         var conv = cc.conversation.Conversation.init(a);
         defer conv.deinit();
@@ -333,7 +576,7 @@ test "L2 dialect: Claude never receives an unsigned thinking block; DeepSeek's A
         defer a.free(url);
         var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "key", case[1], url);
         defer client.deinit();
-        client.dialect_vendor = case[0];
+        client.declared_dialect = .{ .route = case[0] };
 
         var conv = cc.conversation.Conversation.init(a);
         defer conv.deinit();

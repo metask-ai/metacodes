@@ -489,9 +489,11 @@ pub const AgentJobRegistry = struct {
     /// (issue #16). Null keeps the historical bearer header, so a child agent
     /// authenticates exactly the way the parent does.
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
-    /// The vendor dialect the parent's route declares; a child agent writes
-    /// its requests in the same dialect. Null infers it from the model name.
-    dialect: ?dialect_mod.Vendor = null,
+    /// The vendor dialect the parent's route declares, for the parent's
+    /// `model`. A child provider is bound to that model, so a child's
+    /// `model_override` gets only the route's part (`Declaration.vendorFor`).
+    /// Empty infers it from the model name.
+    dialect: dialect_mod.DialectDeclaration = .{},
     /// Borrowed from the App/Runtime immutable plugin Snapshot. App drains all
     /// jobs before destroying that Snapshot.
     dialect_resolver: dialect_mod.Resolver = .builtin(),
@@ -620,7 +622,7 @@ pub const AgentJobRegistry = struct {
         provider_kind: types_mod.ProviderKind,
         openai_protocol: types_mod.OpenAIProtocol,
         auth_scheme: ?@import("../provider/credential.zig").AuthScheme,
-        dialect: ?dialect_mod.Vendor,
+        dialect: dialect_mod.DialectDeclaration,
     ) !void {
         const key_owned = try self.allocator.dupe(u8, api_key);
         errdefer {
@@ -1808,7 +1810,7 @@ test "AgentJobRegistry mutators reject a closing registry" {
 
     try testing.expectError(error.RegistryClosed, reg.setModel("new-model"));
     try testing.expectError(error.RegistryClosed, reg.setApiKey("new-key"));
-    try testing.expectError(error.RegistryClosed, reg.setRoute("new-key", null, .anthropic, .chat_completions, null, null));
+    try testing.expectError(error.RegistryClosed, reg.setRoute("new-key", null, .anthropic, .chat_completions, null, .{}));
     try testing.expectError(error.RegistryClosed, reg.setLimits(.{}));
     try testing.expectError(error.RegistryClosed, reg.makeProvider());
 }
@@ -2124,10 +2126,10 @@ test "issue #16: setRoute moves key, endpoint, and transport together" {
         .openai,
         .chat_completions,
         .{ .api_key_header = "x-api-key" },
-        .glm,
+        .{ .route = .glm },
     );
     try std.testing.expectEqualStrings("new-key", reg.api_key);
-    try std.testing.expectEqual(dialect_mod.Vendor.glm, reg.dialect.?);
+    try std.testing.expectEqual(dialect_mod.Vendor.glm, reg.dialect.route.?);
     try std.testing.expectEqualStrings("https://new.invalid/api/coding/paas/v4", reg.base_url.?);
     try std.testing.expectEqual(types_mod.ProviderKind.openai, reg.provider_kind);
     try std.testing.expect(reg.auth_scheme != null);
@@ -2153,14 +2155,14 @@ test "issue #16: a failed setRoute leaves the previous route completely intact" 
         .openai,
         .chat_completions,
         null,
-        .deepseek,
+        .{ .route = .deepseek },
     ));
     reg.allocator = a;
 
     try std.testing.expectEqualStrings("old-key", reg.api_key);
     try std.testing.expectEqualStrings("https://old.invalid", reg.base_url.?);
     try std.testing.expectEqual(types_mod.ProviderKind.anthropic, reg.provider_kind);
-    try std.testing.expect(reg.dialect == null);
+    try std.testing.expect(reg.dialect.bound() == null);
 }
 
 test "AgentJobRegistry provider inherits and defaults its model limits" {

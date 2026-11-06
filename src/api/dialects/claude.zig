@@ -8,8 +8,9 @@
 //!
 //! - Provider:`src/provider/profiles/metask.zig`(默认路径,`https://napi.metask-ai.com`,
 //!   Anthropic messages)。环境变量 `METASK_API_KEY`。
-//! - 其它厂商的 Anthropic 兼容渠道(DeepSeek、Kimi、Qwen、MiniMax、Z.AI)在各自 profile 里;
-//!   没有专属 Anthropic 方言的厂商在这些渠道上用本方言。
+//! - 其它厂商的 Anthropic 兼容渠道(DeepSeek、Kimi、Qwen、MiniMax、Z.AI)在各自 profile 里,
+//!   路由声明各自的方言,这几家在 Anthropic wire 上都有专属方言;没声明方言、名字也认不出
+//!   厂商的 Anthropic 路由用本方言。
 //! - Bedrock 上的 Claude 走 Converse wire,见 `bedrock.zig`。
 //!
 //! ## 协议

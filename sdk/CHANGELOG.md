@@ -14,6 +14,28 @@ empty `### Migration`.
 
 ## Unreleased
 
+### Changed
+
+- No change a Host can see. The inputs moved for a fix in the CLI's plain headless
+  output (#417), which AgentCore does not use.
+
+### Fixed
+
+- A Run on MiniMax, Kimi or DeepSeek over the OpenAI chat wire sends the thinking
+  parameters those vendors document today (2026-11): MiniMax M3 `thinking.type`
+  `adaptive` instead of `enabled`, M3.1 its `reasoning_effort`, every MiniMax
+  model `reasoning_split`; no `effort` inside Kimi K2.6's `thinking` object, and
+  never `disabled` to K2.7-code; DeepSeek `low` as `low`. A Run on Kimi K2 with no
+  reasoning effort set no longer crashes. Other models' requests are unchanged.
+  No ABI change.
+- A Run on DeepSeek, Kimi or MiniMax M3 and later sends the model's earlier
+  reasoning back (#421). The request after a tool call used to drop it, so
+  DeepSeek in thinking mode answered HTTP 400 and Kimi and MiniMax lost their
+  reasoning. On OpenAI chat they now get `reasoning_content` on assistant
+  messages; a route declaring DeepSeek on the Anthropic wire gets its thinking
+  blocks. Other models' requests are unchanged, and Claude is never sent an
+  unsigned thinking block. No ABI change.
+
 ## 0.13.0 — 2026-10-31
 
 ### Added
