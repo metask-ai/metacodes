@@ -13,9 +13,11 @@
 //! `function.arguments` 的每个 SSE 字符串片段按**原始转义字节**拼进 tool-call `index`
 //! 槽,flush 时一次解除外层 JSON 转义(decode-once,见 buildFlush)——被 chunk 边界
 //! 拆开的 `\uXXXX` 代理对因此无损,字符串字段和反斜杠以原始 JSON 字节进入工具层。
+//! **建连重试 / 429 退避 / 取消 / 上下文超限(issue #434)**:pSendStreamRetry 跑与 Anthropic
+//! 同一个 `client_mod.ConnectRetryFor`(瞬态网络、429、500/502/503 按 max_retries 指数退避,
+//! Retry-After 优先,reporter 照报);非 200 按同一张 HTTP 分类表出错名(ContextWindowExceeded
+//! 带数字,见 lastContextWindowNumbers);等响应头时被取消是 error.Aborted。
 //! **诚实登记——以下未做**:
-//!   - **建连重试 / 429 退避**:pSendStreamRetry 忽略 max_retries/reporter,直接发一次;doStream
-//!     遇非 200(含 429/500)直接 error.RequestFailed,无重试。Anthropic 路径有 withRetry,此处没有。
 //!   - **非流式 pSend**:返回 error.NotImplemented → auto-compact summary 在 OpenAI 路径退化成
 //!     纯丢老消息(compact_summary.summarize catch 兜底,不崩)。
 //!   - **max_tokens/context_window**:output 保持原生 4096 默认(序列化器不发送该字段,所以不接 `--max-tokens` override,否则本地预算与服务端脱节);context window 按 ModelContext 解析,未命中以 128000 兜底。
@@ -57,6 +59,7 @@ const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
 const auth_header_mod = @import("auth_header.zig");
 const credential_mod = @import("credential_cell.zig");
+const error_class = @import("error_class.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("../app/model_context.zig");
 
@@ -110,6 +113,9 @@ pub const OpenAIClient = struct {
     refresh_token_owned: ?[]u8 = null,
     refresh_token_history: std.ArrayList([]u8) = .empty,
     last_retry_attempt: u32 = 0,
+    /// Numbers the last head-phase overflow body carried (cleared on the next
+    /// accepted response), for the agent loop's context recovery.
+    last_context_window_numbers: error_class.ContextWindowNumbers = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) OpenAIClient {
         return .{
@@ -181,7 +187,15 @@ pub const OpenAIClient = struct {
             .serverRequestIdFn = &pServerRequestId,
             .httpStatusFn = &pHttpStatus,
             .retryAttemptFn = &pRetryAttempt,
+            .lastContextWindowNumbersFn = &pLastContextWindowNumbers,
+            .endpointIdFn = &pEndpointId,
         };
+    }
+    fn pLastContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
+        return cast(ctx).last_context_window_numbers;
+    }
+    fn pEndpointId(ctx: *anyopaque) []const u8 {
+        return cast(ctx).effectiveUrl();
     }
     inline fn cast(ctx: *anyopaque) *OpenAIClient {
         return @ptrCast(@alignCast(ctx));
@@ -295,15 +309,23 @@ pub const OpenAIClient = struct {
         cast(ctx).abort_registry.cancel(signal);
     }
     fn pSendStreamRetry(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, max_retries: u32, retry_base_ms: u64, reporter: ?provider_mod.RetryReporter, user_query: []const u8) anyerror!StreamHandle {
-        // P3 MVP:不做建连重试(直接发一次)。retry/reporter 忽略——证明架构不需要它先齐全。
-        _ = max_retries;
-        _ = retry_base_ms;
-        _ = reporter;
-        return pSendStream(ctx, messages, system, tools, abort, model_override, tool_choice, user_query);
+        _ = user_query; // OpenAI 无 server-tool web_search → 无需 query 透传
+        // The Messages client's connect retry (issue #434): the request is
+        // serialized once, so every attempt sends the same bytes for the same
+        // protocol and model.
+        var retry = ConnectRetry.init(max_retries, retry_base_ms, reporter, abort);
+        return cast(ctx).sendStreamWith(messages, system, tools, abort, model_override, tool_choice, &retry);
     }
     fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!StreamHandle {
         _ = user_query; // OpenAI 无 server-tool web_search → 无需 query 透传
-        const self = cast(ctx);
+        return cast(ctx).sendStreamWith(messages, system, tools, abort, model_override, tool_choice, null);
+    }
+
+    const ConnectRetry = client_mod.ConnectRetryFor("openai");
+
+    /// Serializes the request once and sends it: one attempt when `retry` is
+    /// null, else as many as `retry` allows.
+    fn sendStreamWith(self: *OpenAIClient, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, retry: ?*ConnectRetry) anyerror!StreamHandle {
         const model = model_override orelse self.model;
         // overrides 从 provider 状态读(reasoning_effort 走 legacy 兜底,tool_choice 走 per-call 参数)。
         // 这样 agent_loop 无需感知 overrides——provider 自己管方言字段。
@@ -320,67 +342,56 @@ pub const OpenAIClient = struct {
             .responses => try serializeOpenAIResponsesRequestReport(self.allocator, model, messages, system, tools, o, dialect, &report),
         };
         defer self.allocator.free(body);
+        // Owned here until a stream takes it: every failed attempt leaves it
+        // for the next one.
         const placeholder_ids = try report.placeholder_ids.toOwnedSlice(self.allocator);
-        return self.doStreamWithAuthReplay(body, abort, dialect, placeholder_ids);
+        errdefer self.allocator.free(placeholder_ids);
+        while (true) {
+            var retry_hint = client_mod.RetryHint{};
+            if (self.doStreamWithAuthReplay(body, abort, dialect, placeholder_ids, &retry_hint)) |handle| {
+                return handle;
+            } else |err| {
+                const policy = retry orelse return err;
+                try policy.afterFailure(err, retry_hint.delay_ms);
+            }
+        }
     }
 
+    /// One attempt, with the OAuth refresh replay. `image_placeholder_ids`
+    /// stays the caller's unless a stream is returned.
     fn doStreamWithAuthReplay(
         self: *OpenAIClient,
         body: []const u8,
         abort: ?*const AbortSignal,
         dialect: dialect_mod.Dialect,
         image_placeholder_ids: []const []const u8,
+        retry_hint: *client_mod.RetryHint,
     ) !StreamHandle {
         self.last_retry_attempt = 0;
-        const first = self.doStream(body, abort, dialect, image_placeholder_ids, 0) catch |err| {
+        return self.doStream(body, abort, dialect, image_placeholder_ids, 0, retry_hint) catch |err| {
             if (err != error.TokenExpired) return err;
-            // The first transport retained the placeholder slice so the
-            // replay can use the identical serialized request. If refresh is
-            // unavailable, this call owns the only remaining copy and must
-            // release it here.
-            const callback = self.refresh_fn orelse {
-                self.allocator.free(image_placeholder_ids);
-                return error.RequestFailed;
-            };
-            const ctx = self.refresh_ctx orelse {
-                self.allocator.free(image_placeholder_ids);
-                return error.RequestFailed;
-            };
             // Refresh replaces fixed bytes the client owns; a Session's
             // replaceable credential is rotated by its Host instead.
-            const stale = self.credential.lendable() orelse {
-                self.allocator.free(image_placeholder_ids);
-                return error.RequestFailed;
-            };
-            const token = callback(ctx, stale) catch {
-                self.allocator.free(image_placeholder_ids);
-                return error.RequestFailed;
-            };
+            const callback = self.refresh_fn orelse return error.Unauthorized;
+            const ctx = self.refresh_ctx orelse return error.Unauthorized;
+            const stale = self.credential.lendable() orelse return error.Unauthorized;
+            const token = callback(ctx, stale) catch return error.Unauthorized;
             self.replaceRefreshToken(token) catch {
                 secureFree(self.allocator, token);
-                self.allocator.free(image_placeholder_ids);
-                return error.RequestFailed;
+                return error.Unauthorized;
             };
             self.last_retry_attempt = 1;
-            return self.doStream(body, abort, dialect, image_placeholder_ids, 1) catch |replay_err| {
-                // A second token_expired response also retains the slice;
-                // every other failure has already released it through
-                // doStream's errdefer.
-                if (replay_err == error.TokenExpired) {
-                    self.allocator.free(image_placeholder_ids);
-                    return error.RequestFailed;
-                }
-                return replay_err;
-            };
+            retry_hint.* = .{};
+            // No event has been delivered: the body is still the exact slice
+            // produced by the serializer, so this is a byte-for-byte replay.
+            return self.doStream(body, abort, dialect, image_placeholder_ids, 1, retry_hint) catch |replay_err|
+                return if (replay_err == error.TokenExpired) error.Unauthorized else replay_err;
         };
-        return first;
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
-    /// `image_placeholder_ids` 所有权转入本函数:失败路径释放,成功后归 OpenAIStream。
-    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_placeholder_ids: []const []const u8, retry_attempt: u32) !StreamHandle {
-        var preserve_placeholder_ids = false;
-        errdefer if (!preserve_placeholder_ids) self.allocator.free(image_placeholder_ids);
+    /// `image_placeholder_ids` 成功后归 OpenAIStream;失败时仍归调用方(下一次尝试还要用)。
+    fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal, dialect: dialect_mod.Dialect, image_placeholder_ids: []const []const u8, retry_attempt: u32, retry_hint: *client_mod.RetryHint) !StreamHandle {
         const rid = log.genRequestId();
         self.last_request_id = rid;
         log.infoId(
@@ -412,8 +423,8 @@ pub const OpenAIClient = struct {
                 .{ .name = auth.name, .value = auth.value },
             },
         }) catch |err| {
-            log.errId("openai", rid, "request init failed: {s}", .{@errorName(err)});
-            return error.RequestFailed; // req_ptr.* 未初始化, errdefer destroy 即可
+            // req_ptr.* 未初始化, errdefer destroy 即可
+            return client_mod.requestSetupFailure("openai", rid, err);
         };
         var registered = false;
         errdefer {
@@ -431,18 +442,21 @@ pub const OpenAIClient = struct {
         registered = true;
         req_ptr.transfer_encoding = .{ .content_length = body.len };
         http_connection.sendBodyComplete(req_ptr, @constCast(body)) catch |err| {
-            log.errId("openai", rid, "send body failed: {s}", .{@errorName(err)});
-            client_mod.noteConnectFailure(err);
-            return error.RequestFailed;
+            // 取消优先于传输层错误分类:cancel 关闭了 socket,写才失败的。
+            if (client_mod.cancelled(abort)) return error.Aborted;
+            return client_mod.requestTransportFailure("openai", rid, "sendBody", err);
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
+            // 等响应头时被取消:cancel 关闭了 socket,不是网络故障(issue #434)。
+            if (client_mod.cancelled(abort)) {
+                log.warnId("openai", rid, "receiveHead failed after cancel ({s}) → Aborted", .{@errorName(err)});
+                return error.Aborted;
+            }
             if (self.abort_registry.stalled(req_ptr)) |stall| {
                 client_mod.reportHeadStall("openai", rid, stall);
                 return error.TransientNetwork;
             }
-            log.errId("openai", rid, "receiveHead failed: {s}", .{@errorName(err)});
-            client_mod.noteConnectFailure(err);
-            return err;
+            return client_mod.requestTransportFailure("openai", rid, "receiveHead", err);
         };
         const status = ResponseStatus.capture(&response);
         self.last_http_status = status.code;
@@ -450,10 +464,13 @@ pub const OpenAIClient = struct {
         client_mod.noteResponseHead(status.code, response.head, auth.value);
         connection_lease.release();
         if (!status.isOk()) {
+            // Read from the head before the body read below reuses its bytes.
+            retry_hint.delay_ms = client_mod.retryAfterFromHead(response.head);
             var location_buf: [http_status.REDIRECT_LOCATION_BYTES]u8 = undefined;
             if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
                 client_mod.reportRedirect("openai", rid, status, location, auth.value);
-                return error.RequestFailed;
+                self.last_context_window_numbers = .{};
+                return error.HttpError;
             }
             var err_body: [4096]u8 = undefined;
             const body_reader = req_ptr.reader.bodyReader(
@@ -464,13 +481,14 @@ pub const OpenAIClient = struct {
             const n = body_reader.readSliceShort(err_body[0..]) catch 0;
             const preview = err_body[0..@min(n, err_body.len)];
             client_mod.reportHttpFailure("openai", rid, status, preview, err_body.len, auth.value);
-            if (status.code == 401 and containsMetaskTokenExpired(preview)) {
-                preserve_placeholder_ids = true;
-                return error.TokenExpired;
-            }
-            return error.RequestFailed;
+            // The Messages client's classification (issue #434): 429 and 5xx are
+            // retried, an overflow is ContextWindowExceeded with its numbers kept.
+            const info = client_mod.errorBodyInfo(status.code, preview);
+            self.last_context_window_numbers = info.context_window_numbers;
+            return client_mod.httpFailureError(status.code, info);
         }
         client_mod.noteRequestAccepted();
+        self.last_context_window_numbers = .{};
         // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
         self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens), .sse);
 
@@ -514,31 +532,20 @@ fn copyMetaskRequestId(dst: *[256]u8, raw_head: []const u8) usize {
     return 0;
 }
 
-fn containsMetaskTokenExpired(body: []const u8) bool {
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, body, from, "\"code\"")) |key_pos| {
-        var i = key_pos + "\"code\"".len;
-        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
-        if (i >= body.len or body[i] != ':') {
-            from = i;
-            continue;
-        }
-        i += 1;
-        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
-        const value = "\"token_expired\"";
-        if (i + value.len <= body.len and std.mem.eql(u8, body[i .. i + value.len], value)) return true;
-        from = i + 1;
-    }
-    return false;
+/// The shared HTTP failure reading (`client_mod.errorBodyInfo`) is what the
+/// transport replays on: a 401 whose `code` is token_expired.
+fn tokenExpired(body: []const u8) bool {
+    return client_mod.errorBodyInfo(401, body).token_expired;
 }
 
 test "OpenAI transport captures Metask request id and recognizes only token_expired" {
     var out: [256]u8 = undefined;
     const n = copyMetaskRequestId(&out, "x-METASK-request-id:req-openai\r\n");
     try std.testing.expectEqualStrings("req-openai", out[0..n]);
-    try std.testing.expect(containsMetaskTokenExpired("{\"error\":{\"code\": \"token_expired\"}}"));
-    try std.testing.expect(!containsMetaskTokenExpired("{\"error\":{\"code\": \"invalid_token\"}}"));
-    try std.testing.expect(!containsMetaskTokenExpired("{\"error\":{\"code\": \"invalid_token\",\"message\":\"token_expired\"}}"));
+    try std.testing.expect(tokenExpired("{\"error\":{\"code\": \"token_expired\"}}"));
+    try std.testing.expect(!tokenExpired("{\"error\":{\"code\": \"invalid_token\"}}"));
+    try std.testing.expect(!tokenExpired("{\"error\":{\"code\": \"invalid_token\",\"message\":\"token_expired\"}}"));
+    try std.testing.expectEqual(error.TokenExpired, client_mod.httpFailureError(401, client_mod.errorBodyInfo(401, "{\"error\":{\"code\": \"token_expired\"}}")));
 }
 
 /// OpenAI 流式响应:持 Response + transfer buffer + 逐行 SSE 解析状态。包成中立 StreamHandle。

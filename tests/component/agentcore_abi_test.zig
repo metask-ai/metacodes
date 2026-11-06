@@ -5490,6 +5490,10 @@ test "L2 #408 quota exhaustion on OpenAI's 429 keeps its code and leaves retry g
         "x-request-id: req-quota-1\r\n",
     );
     defer server.stop();
+    // A 429 is retried on every wire, as on Messages (issue #434): two
+    // attempts keep the default backoff short and show both reached the server.
+    var attempts = try EnvOverride.set("CLAUDE_CODE_MAX_RETRIES", "2");
+    defer attempts.restore();
     try expectModelFailure(server, .{ .provider = wire.PROVIDER_OPENAI, .expected = .{
         .category = .rate_limited,
         .code = "insufficient_quota",
@@ -5498,7 +5502,9 @@ test "L2 #408 quota exhaustion on OpenAI's 429 keeps its code and leaves retry g
         .http_status = 429,
         .request_id = "req-quota-1",
         .retry = .unknown,
+        .attempts = 2,
     } });
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
 }
 
 test "L2 #408 quota exhaustion on Gemini: its body is read and its canonical status is the code" {
@@ -5508,13 +5514,18 @@ test "L2 #408 quota exhaustion on Gemini: its body is read and its canonical sta
         "",
     );
     defer server.stop();
+    // Retried as on every wire (issue #434); see the OpenAI case above.
+    var attempts = try EnvOverride.set("CLAUDE_CODE_MAX_RETRIES", "2");
+    defer attempts.restore();
     try expectModelFailure(server, .{ .provider = wire.PROVIDER_GEMINI, .expected = .{
         .category = .rate_limited,
         .code = "RESOURCE_EXHAUSTED",
         .message = "Quota exceeded for metric",
         .http_status = 429,
         .retry = .unknown,
+        .attempts = 2,
     } });
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
 }
 
 test "L2 #408 an unknown business code passes through, over HTTP and inside a stream" {

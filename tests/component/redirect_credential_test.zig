@@ -68,7 +68,7 @@ fn expectRefused(result: anyerror!cc.api_provider.StreamHandle) !void {
         var opened = handle;
         opened.deinit();
         return error.RedirectFollowed;
-    } else |err| try std.testing.expectEqual(error.RequestFailed, err);
+    } else |err| try std.testing.expectEqual(error.HttpError, err);
 }
 
 fn takeLastError(buffer: *[cc.api_last_error.SUMMARY_BUF_LEN]u8) []const u8 {
