@@ -4,7 +4,7 @@
 //! 积木:tool_choice / response_format / prompt_cache_key / parallel_tool_calls / 图像
 //! content part 的 wire 形态,以及 `reasoning_content` 流式增量的解码。各厂商文件
 //! (`openai.zig`、`glm.zig`、`kimi.zig`、`deepseek.zig`、`qwen.zig`、`minimax.zig`、
-//! `mistral.zig`)从 `base` 出发,只覆盖自己真正不同的那几个方法。
+//! `mistral.zig`、`openrouter.zig`)从 `base` 出发,只覆盖自己真正不同的那几个方法。
 //!
 //! 每个方法都按 `ModelProfile` 做能力守门:同一套 wire 形态,不同模型通过 profile 上的
 //! 能力位降级(例如 GLM-5 只认 `tool_choice:"auto"`)。

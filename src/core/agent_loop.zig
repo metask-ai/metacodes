@@ -4590,7 +4590,9 @@ fn buildApiMessages(
     }
 
     for (conversation.activeMessages()) |m| {
-        // thinking block 不回 API(模型自己产);先算实际要回的 block 数
+        // thinking 块随消息投影,由方言决定是否上 wire(`ModelProfile.echoes_reasoning_content`):
+        // DeepSeek 要求回传历史思考,Claude 拒收无签名的 thinking 块,其余方言忽略它。
+        // 它和 reasoning_item 一样**不足以**撑起一条消息。
         var n_actual: usize = 0;
         // reasoning_item 是 provider 私有的续传状态,不是"内容":只有 OpenAI
         // Responses 序列化器会用它,别的方言整块跳过。它单独存在时**不足以**
@@ -4599,8 +4601,7 @@ fn buildApiMessages(
         // 这里是针对外部/未来版本 transcript 的防线,而不是热路径。
         var n_substantive: usize = 0;
         for (m.blocks) |b| switch (b) {
-            .thinking => {},
-            .reasoning_item => n_actual += 1,
+            .thinking, .reasoning_item => n_actual += 1,
             else => {
                 n_actual += 1;
                 n_substantive += 1;
@@ -4624,7 +4625,7 @@ fn buildApiMessages(
                 } },
                 .image => |img| .{ .image = .{ .media_type = img.media_type, .data = img.data } },
                 .reasoning_item => |item| .{ .reasoning_item = .{ .model = item.model, .json = item.json } },
-                .thinking => continue, // 不发回 API
+                .thinking => |t| .{ .thinking = t }, // 借用;是否上 wire 由方言决定
             };
             contents[idx] = c;
             idx += 1;
@@ -5911,6 +5912,36 @@ test "buildApiMessages omits thinking-only assistant before continuation" {
     try std.testing.expectEqual(types.MessageRole.user, api.items[0].role);
     try std.testing.expect(api.items[0].content.len > 0);
     for (api.items) |message| try std.testing.expect(message.content.len > 0);
+}
+
+test "buildApiMessages projects thinking in order and borrows its bytes (issue #421)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    try c.appendText(.user, "what time is it");
+    const blocks = try a.alloc(msg.Block, 3);
+    blocks[0] = .{ .thinking = try a.dupe(u8, "need the clock") };
+    blocks[1] = .{ .text = try a.dupe(u8, "checking") };
+    blocks[2] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "get_time"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = blocks });
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+
+    // The trailing tool_use gets a stub result; the assistant message keeps
+    // every block, thinking first, so the dialect can decide.
+    try std.testing.expectEqual(types.MessageRole.assistant, api.items[1].role);
+    const content = api.items[1].content;
+    try std.testing.expectEqual(@as(usize, 3), content.len);
+    try std.testing.expectEqualStrings("need the clock", content[0].thinking);
+    try std.testing.expectEqual(c.messages.items[1].blocks[0].thinking.ptr, content[0].thinking.ptr);
+    try std.testing.expectEqualStrings("checking", content[1].text);
+    try std.testing.expectEqualStrings("get_time", content[2].tool_use.name);
 }
 
 test "buildApiMessages maps tool_use and tool_result" {

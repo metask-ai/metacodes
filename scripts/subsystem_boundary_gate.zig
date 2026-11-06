@@ -131,6 +131,7 @@ const SUBSYSTEMS = [_]Subsystem{
             "src/api/dialects/mistral.zig",
             "src/api/dialects/openai.zig",
             "src/api/dialects/openai_compat.zig",
+            "src/api/dialects/openrouter.zig",
             "src/api/dialects/qwen.zig",
             "src/api/dialects/registry.zig",
             "src/api/error_class.zig",

@@ -1,19 +1,23 @@
 //! # 阿里 Qwen(百炼 / Model Studio / DashScope)接入
 //!
-//! Qwen3 系列(qwen3.5 / 3.6 / 3.7 / 3.8、qwen-plus、qwen-flash)在 OpenAI 兼容模式下的方言。
+//! Qwen3 系列(qwen3.5 / 3.6 / 3.7 / 3.8、qwen-plus、qwen-flash)在 OpenAI 兼容模式下的方言,
+//! 以及 Anthropic 兼容面(`/apps/anthropic`)上的方言。
 //!
 //! ## 接入点
 //!
-//! - 还没有内置 Provider:经 `custom_providers` 或 OpenRouter 接入。官方端点:
-//!   北京 `https://dashscope.aliyuncs.com/compatible-mode/v1`、
-//!   新加坡 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`,Anthropic 兼容面在
-//!   同一主机的 `/apps/anthropic`;另有工作空间专属端点
-//!   `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` 等。
-//! - 各地域的 key 互不通用。
+//! - Provider:`src/provider/profiles/qwen.zig`。渠道:
+//!   `cn-openai`(默认,北京)`https://dashscope.aliyuncs.com/compatible-mode/v1`、
+//!   `intl-openai`(新加坡)`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`、
+//!   `cn-anthropic` `https://dashscope.aliyuncs.com/apps/anthropic`、
+//!   `intl-anthropic` `https://dashscope-intl.aliyuncs.com/apps/anthropic`。
+//! - 新的工作空间专属端点(`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`
+//!   等)可以用 `--base-url` 覆盖:路由的端点策略只要求路径里有 `/compatible-mode/v1`
+//!   (或 `/apps/anthropic`)。
+//! - 环境变量:`DASHSCOPE_API_KEY`。各地域的 key 互不通用。
 //!
 //! ## 协议
 //!
-//! - `openai_chat` 上用本方言;`anthropic_messages` 上走 Claude 方言。
+//! - `openai_chat` 与 `anthropic_messages` 路由都声明本方言(`.qwen`)。
 //! - 鉴权:Bearer。
 //!
 //! ## 思考与推理
@@ -26,16 +30,22 @@
 //!   档位时一律发 `true`,让行为不依赖型号默认值。
 //! - 只思考型号(如 qwen3.7-max-preview)忽略这个开关。
 //! - 响应:`delta.reasoning_content`。
+//! - **Anthropic wire**:`thinking.type` 只认 `enabled` / `disabled`(没有 `adaptive`,
+//!   `budget_tokens` 将废弃);深度是 `output_config.effort`,qwen3.8 认 low / medium /
+//!   xhigh(max / high 由服务端映射成 xhigh)。none / minimal → `disabled`,不发档位;
+//!   low → low,medium → medium,high / xhigh / max → xhigh,都带 `enabled`;未指定只发
+//!   `enabled`,与 OpenAI wire 一样不依赖型号默认值。
 //!
 //! ## 回传与缓存
 //!
 //! - 是否读历史 `reasoning_content` 由 `preserve_thinking` 控制,不是必需;本方言不回传。
+//!   Anthropic wire 的文档没要求回传 thinking 块,也不回传。
 //! - 缓存:服务端隐式缓存;显式缓存走 Anthropic 风格的 cache_control,本方言不用。
 //!
 //! ## 已知差异
 //!
-//! - 按名推断只认 `qwen3` / `qwen-3`:qwen-plus / qwen-flash 会被当成 OpenAI 原生
-//!   (发 `reasoning_effort`),与拆分前相同。
+//! - 按名推断只认 `qwen3` / `qwen-3`:qwen-plus / qwen-flash 在没声明方言的路由上会被当成
+//!   OpenAI 原生(发 `reasoning_effort`)。声明了 `.qwen` 的路由不受影响。
 //! - 部分开源型号(qwen3.5-122b-a10b 等)只接受流式请求;本仓库总是流式。
 //! - 视觉:名字含 `vl` 的是视觉变体;qwen3.8 系列原生多模态,但名字看不出来,由目录声明。
 //!
@@ -43,10 +53,14 @@
 //!
 //! - https://www.alibabacloud.com/help/en/model-studio/deep-thinking(2026-11 核对:
 //!   enable_thinking、thinking_budget、各型号默认、reasoning_content、地域端点)
+//! - https://www.alibabacloud.com/help/en/model-studio/anthropic-api-messages(2026-11 核对:
+//!   Anthropic 面的 thinking.type、output_config.effort 各型号取值)
 
 const std = @import("std");
 const types = @import("../../types.zig");
+const util_json = @import("../../util/json.zig");
 const model_adapter = @import("../model_adapter.zig");
+const claude = @import("claude.zig");
 const dialect_mod = @import("../dialect.zig");
 const compat = @import("openai_compat.zig");
 const Vendor = @import("../../provider/vendor.zig").Vendor;
@@ -65,7 +79,21 @@ pub fn claims(kind: ProviderKind, model: []const u8) bool {
 
 pub fn dialect(kind: ProviderKind, model: []const u8) ?Dialect {
     _ = model;
-    return if (kind == .openai) compat.ready(Chat.dialect) else null;
+    return switch (kind) {
+        .openai => compat.ready(Chat.dialect),
+        .anthropic => compat.ready(Messages.dialect),
+        else => null,
+    };
+}
+
+/// Anthropic wire 的档位:qwen3.8 认 low / medium / xhigh。null = 关思考。
+pub fn messagesEffort(effort: ReasoningEffort) ?[]const u8 {
+    return switch (effort) {
+        .none, .minimal => null,
+        .low => "low",
+        .medium => "medium",
+        .high, .xhigh, .max => "xhigh",
+    };
 }
 
 pub fn openaiProfile(model: []const u8) ModelProfile {
@@ -100,6 +128,31 @@ const Chat = struct {
     };
 };
 
+/// Anthropic messages wire:`thinking:{type:enabled|disabled}` + `output_config.effort`。
+const Messages = struct {
+    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
+        _ = ctx;
+        _ = p;
+        const e = effort orelse {
+            try out.appendSlice(a, ",\"thinking\":{\"type\":\"enabled\"}");
+            return;
+        };
+        const level = messagesEffort(e) orelse {
+            try out.appendSlice(a, ",\"thinking\":{\"type\":\"disabled\"}");
+            return;
+        };
+        try out.appendSlice(a, ",\"output_config\":{\"effort\":");
+        try util_json.serializeString(level, out, a);
+        try out.appendSlice(a, "},\"thinking\":{\"type\":\"enabled\"}");
+    }
+
+    const dialect = blk: {
+        var d = claude.wire;
+        d.serializeThinkingFn = serializeThinking;
+        break :blk d;
+    };
+};
+
 test "Qwen: enable_thinking 开关,none/minimal 关" {
     const a = std.testing.allocator;
     const d = dialect(.openai, "qwen3.8-max").?;
@@ -115,7 +168,7 @@ test "Qwen: enable_thinking 开关,none/minimal 关" {
     try std.testing.expectEqualStrings(",\"enable_thinking\":false", out.items);
 }
 
-test "Qwen: 本方言下 qwen-plus 也用开关,不发 reasoning_effort" {
+test "Qwen: 声明了方言的 qwen-plus 也用开关,不发 reasoning_effort" {
     const a = std.testing.allocator;
     const d = dialect(.openai, "qwen-plus").?;
     var out: std.ArrayList(u8) = .empty;
@@ -131,4 +184,24 @@ test "Qwen: vl 变体收图,其余来源 unknown" {
     const p = openaiProfile("qwen3.8-max");
     try std.testing.expect(!p.supports_image_input);
     try std.testing.expectEqual(@import("../image_capability.zig").Source.unknown, p.image_input_source);
+}
+
+test "Qwen Anthropic wire: enabled / disabled + output_config.effort(low/medium/xhigh),从不发 adaptive" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const d = dialect(.anthropic, "qwen3.8-max").?;
+    inline for (.{
+        .{ @as(?ReasoningEffort, .low), ",\"output_config\":{\"effort\":\"low\"},\"thinking\":{\"type\":\"enabled\"}" },
+        .{ @as(?ReasoningEffort, .medium), ",\"output_config\":{\"effort\":\"medium\"},\"thinking\":{\"type\":\"enabled\"}" },
+        .{ @as(?ReasoningEffort, .high), ",\"output_config\":{\"effort\":\"xhigh\"},\"thinking\":{\"type\":\"enabled\"}" },
+        .{ @as(?ReasoningEffort, .max), ",\"output_config\":{\"effort\":\"xhigh\"},\"thinking\":{\"type\":\"enabled\"}" },
+        .{ @as(?ReasoningEffort, .none), ",\"thinking\":{\"type\":\"disabled\"}" },
+        .{ @as(?ReasoningEffort, null), ",\"thinking\":{\"type\":\"enabled\"}" },
+    }) |case| {
+        out.clearRetainingCapacity();
+        try d.serializeThinking(.{}, case[0], &out, a);
+        try std.testing.expectEqualStrings(case[1], out.items);
+    }
+    try std.testing.expect(!claims(.anthropic, "qwen3.8-max"));
 }

@@ -98,6 +98,11 @@ pub const OpenAIClient = struct {
     /// Null keeps the historical `authorization: Bearer <key>` bytes exactly.
     auth_scheme: ?auth_header_mod.AuthScheme = null,
     dialect_resolver: dialect_mod.Resolver = .{},
+    /// The dialect the route declares (`ModelOffer.dialect`): the bound model's
+    /// entry declaration applies to `model` only, the route's to any model a
+    /// request names. Empty infers it from the model name. Set with the route,
+    /// like `auth_scheme`.
+    declared_dialect: dialect_mod.DialectDeclaration = .{},
     /// The provider's model catalog, when the caller has one (owned). Its
     /// image_input declarations override the family table (issue #273).
     catalog: ?catalog_mod.Catalog = null,
@@ -272,7 +277,7 @@ pub const OpenAIClient = struct {
     /// declaration applied (Host first) - the one profile the serializer's
     /// gate and every capability query read, as in the Anthropic client.
     pub fn dialectFor(self: *const OpenAIClient, model: []const u8) dialect_mod.Dialect {
-        var dialect = self.dialect_resolver.resolve(.openai, model);
+        var dialect = self.dialect_resolver.resolve(.openai, self.declared_dialect.vendorFor(self.model, model), model);
         const from_catalog: ?bool = if (self.catalog) |*catalog| catalog.imageInputFor(model) else null;
         dialect.declareImageInput(self.host_capabilities.imageInputFor(model), from_catalog);
         return dialect;
@@ -1464,15 +1469,16 @@ pub fn serializeOpenAIRequestWithOverridesAndDialectReport(
     try util_json.serializeString(model, &out, allocator);
     // thinking 控制:委托给 dialect(按 model 选 wire 格式)。
     try dialect.serializeThinking(profile, overrides.reasoning_effort, &out, allocator);
-    // 通用采样参数(不经 dialect,所有 OpenAI 协议都认)。
-    if (overrides.temperature) |t| {
+    // 通用采样参数(不经 dialect,所有 OpenAI 协议都认);厂商固定采样参数的型号
+    // (profile.fixed_sampling,Kimi K3 / K2.7-code)不发。
+    if (overrides.temperature) |t| if (!profile.fixed_sampling) {
         try out.appendSlice(allocator, ",\"temperature\":");
         try util_json.serializeNumber(t, &out, allocator);
-    }
-    if (overrides.top_p) |p| {
+    };
+    if (overrides.top_p) |p| if (!profile.fixed_sampling) {
         try out.appendSlice(allocator, ",\"top_p\":");
         try util_json.serializeNumber(p, &out, allocator);
-    }
+    };
     // stream_options.include_usage=true:OpenAI 默认流式不发 usage,显式要求才在末尾发一个
     // {choices:[],usage:{...}} chunk。缓存命中(cached_tokens)就在这个 usage 里。
     try out.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
@@ -1690,6 +1696,21 @@ fn serializeOpenAIMessage(
             else => {},
         };
         try util_json.serializeString(text_buf.items, out, allocator);
+    }
+    // 思考回传:声明了回传的方言(DeepSeek 在请求带 tools 时要求回传全部历史思考,
+    // 否则 400)把 assistant 消息的 thinking 块按序拼成 `reasoning_content`。其余方言
+    // 不发,请求字节与投影 thinking 之前相同。
+    if (m.role == .assistant and profile.echoes_reasoning_content) {
+        var reasoning: std.ArrayList(u8) = .empty;
+        defer reasoning.deinit(allocator);
+        for (m.content) |c| switch (c) {
+            .thinking => |t| try reasoning.appendSlice(allocator, t),
+            else => {},
+        };
+        if (reasoning.items.len > 0) {
+            try out.appendSlice(allocator, ",\"reasoning_content\":");
+            try util_json.serializeString(reasoning.items, out, allocator);
+        }
     }
     // assistant tool_use → tool_calls
     if (has_tool_use) {
@@ -2425,18 +2446,18 @@ test "SerializationReport(OpenAI): chat 走 fail-closed 方言计占位;Response
     // chat/completions + 内建方言:原生 image_url,不计占位。
     var chat_native = json_mod.SerializationReport{};
     defer chat_native.deinit(a);
-    const body_native = try serializeOpenAIRequestWithOverridesAndDialectReport(a, "gpt-4o", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-4o"), &chat_native);
+    const body_native = try serializeOpenAIRequestWithOverridesAndDialectReport(a, "gpt-4o", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, null, "gpt-4o"), &chat_native);
     defer a.free(body_native);
     try std.testing.expect(chat_native.imagesNative());
     // Responses:非 vision 模型计占位,vision 模型不计。
     var resp_closed = json_mod.SerializationReport{};
     defer resp_closed.deinit(a);
-    const body_resp_closed = try serializeOpenAIResponsesRequestReport(a, "deepseek-chat", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "deepseek-chat"), &resp_closed);
+    const body_resp_closed = try serializeOpenAIResponsesRequestReport(a, "deepseek-chat", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, null, "deepseek-chat"), &resp_closed);
     defer a.free(body_resp_closed);
     try std.testing.expectEqual(@as(usize, 1), resp_closed.image_placeholders);
     var resp_native = json_mod.SerializationReport{};
     defer resp_native.deinit(a);
-    const body_resp_native = try serializeOpenAIResponsesRequestReport(a, "gpt-5.2", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-5.2"), &resp_native);
+    const body_resp_native = try serializeOpenAIResponsesRequestReport(a, "gpt-5.2", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, null, "gpt-5.2"), &resp_native);
     defer a.free(body_resp_native);
     try std.testing.expect(resp_native.imagesNative());
 }
@@ -2449,7 +2470,7 @@ test "OpenAI chat: tool_result 消息里的同消息 text(hook 上下文/检查�
         .{ .text = "[PostToolUse hook]\npost-check ok" },
     };
     const msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &mixed } };
-    const body = try serializeOpenAIRequestWithOverridesAndDialect(a, "gpt-4o", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-4o"));
+    const body = try serializeOpenAIRequestWithOverridesAndDialect(a, "gpt-4o", &msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, null, "gpt-4o"));
     defer a.free(body);
     const tool_at = std.mem.indexOf(u8, body, "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"ok\"}").?;
     const text_at = std.mem.indexOf(u8, body, "{\"role\":\"user\",\"content\":\"[PostToolUse hook]\\npost-check ok\"}").?;
@@ -2460,7 +2481,7 @@ test "OpenAI chat: tool_result 消息里的同消息 text(hook 上下文/检查�
         .{ .text = "post-check ok" },
     };
     const img_msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &img_mixed } };
-    const img_body = try serializeOpenAIRequestWithOverridesAndDialect(a, "gpt-4o", &img_msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, "gpt-4o"));
+    const img_body = try serializeOpenAIRequestWithOverridesAndDialect(a, "gpt-4o", &img_msgs, null, null, .{}, dialect_mod.Resolver.builtin().resolve(.openai, null, "gpt-4o"));
     defer a.free(img_body);
     const image_at = std.mem.indexOf(u8, img_body, "{\"type\":\"image_url\"").?;
     const part_at = std.mem.indexOf(u8, img_body, ",{\"type\":\"text\",\"text\":\"post-check ok\"}]}").?;

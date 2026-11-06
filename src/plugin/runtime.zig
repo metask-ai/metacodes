@@ -515,14 +515,16 @@ pub const Snapshot = struct {
         return .{ .ctx = @ptrCast(self), .resolveFn = resolveDialectAdapter };
     }
 
-    fn resolveDialectAdapter(raw: *const anyopaque, kind: dialect_mod.ProviderKind, model: []const u8) dialect_mod.Dialect {
+    /// A plugin's dialect binding for the model wins over the route's declared
+    /// dialect: it is the more specific, user-installed answer.
+    fn resolveDialectAdapter(raw: *const anyopaque, kind: dialect_mod.ProviderKind, declared: ?dialect_mod.Vendor, model: []const u8) dialect_mod.Dialect {
         const self: *const Snapshot = @ptrCast(@alignCast(raw));
         var best: ?*const ProviderDialectBinding = null;
         for (self.provider_dialects) |*binding| {
             if (binding.provider_kind != kind or !model_name.startsWithIgnoreCase(model, binding.model_prefix)) continue;
             if (best == null or binding.model_prefix.len > best.?.model_prefix.len) best = binding;
         }
-        return if (best) |binding| binding.dialect else dialect_mod.dialectFor(kind, model);
+        return if (best) |binding| binding.dialect else dialect_mod.dialectForVendor(kind, declared, model);
     }
 
     fn allowsToolAdapter(raw: *const anyopaque, name: []const u8) bool {
@@ -1094,7 +1096,7 @@ test "provider dialect snapshot resolves longest prefix and rejects duplicate ke
         .static_plugins = &.{first},
     });
     defer snapshot.destroy();
-    const resolved = snapshot.dialectResolver().resolve(.openai, "acme-coder-v2");
+    const resolved = snapshot.dialectResolver().resolve(.openai, null, "acme-coder-v2");
     try std.testing.expectEqual(@as(usize, 0x22), @intFromPtr(resolved.ctx));
     try std.testing.expectEqual(@as(usize, 2), snapshot.provider_dialects.len);
 

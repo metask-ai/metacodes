@@ -43,4 +43,8 @@ test {
     std.testing.refAllDecls(registry.openai);
     std.testing.refAllDecls(registry.gemini);
     std.testing.refAllDecls(registry.zai_coding_plan);
+    std.testing.refAllDecls(registry.deepseek);
+    std.testing.refAllDecls(registry.kimi);
+    std.testing.refAllDecls(registry.qwen);
+    std.testing.refAllDecls(registry.minimax);
 }

@@ -1,14 +1,16 @@
 //! # Anthropic Claude 接入
 //!
-//! Anthropic messages wire 上 Claude 的方言,也是这条 wire 的兜底方言:名字认不出厂商的
-//! Anthropic 兼容路由都用它。别家的 Anthropic 方言(GLM、DeepSeek)
+//! Anthropic messages wire 上 Claude 的方言,也是这条 wire 的兜底方言:没声明方言、
+//! 名字又认不出厂商的 Anthropic 兼容路由都用它。别家的 Anthropic 方言(GLM、DeepSeek)
 //! 以 `wire` 为基础只改不同的方法。
 //!
 //! ## 接入点
 //!
 //! - Provider:`src/provider/profiles/metask.zig`(默认路径,`https://napi.metask-ai.com`,
 //!   Anthropic messages)。环境变量 `METASK_API_KEY`。
-//! - 没有专属 Anthropic 方言的厂商,在 Anthropic 兼容渠道上都用本方言。
+//! - 其它厂商的 Anthropic 兼容渠道(DeepSeek、Kimi、Qwen、MiniMax、Z.AI)在各自 profile 里,
+//!   路由声明各自的方言,这几家在 Anthropic wire 上都有专属方言;没声明方言、名字也认不出
+//!   厂商的 Anthropic 路由用本方言。
 //!
 //! ## 协议
 //!

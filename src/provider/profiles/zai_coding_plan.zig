@@ -1,5 +1,9 @@
 //! Z.AI / 智谱 GLM Coding Plan provider profile.
 //!
+//! Integration notes — the GLM dialect, thinking parameters per generation, and
+//! their sources — live in `src/api/dialects/glm.zig`; this file is the route
+//! data.
+//!
 //! The Coding Plan is a separate product surface from the general Z.AI API: it
 //! has its own credentials, quota, and billing, and its own endpoints. Four
 //! channels cover the documented region × protocol matrix:
@@ -104,14 +108,17 @@ const OPENAI_REQUIRED = [_][]const u8{"/coding/"};
 const ANTHROPIC_REQUIRED = [_][]const u8{"/anthropic"};
 const FORBIDDEN = [_][]const u8{GENERAL_SURFACE_FRAGMENT};
 
+// Both wires speak the GLM dialect (`src/api/dialects/glm.zig`).
 const OPENAI_ROUTES = [_]profile.ProtocolRoute{.{
     .protocol = .openai_chat,
     .policy = .{ .required_path_fragments = &OPENAI_REQUIRED },
+    .dialect = .glm,
 }};
 
 const ANTHROPIC_ROUTES = [_]profile.ProtocolRoute{.{
     .protocol = .anthropic_messages,
     .policy = .{ .required_path_fragments = &ANTHROPIC_REQUIRED },
+    .dialect = .glm,
 }};
 
 const CHANNELS = [_]profile.ChannelDescriptor{

@@ -106,6 +106,10 @@ pub fn makeProvider(
 /// child agents authenticate the same way the parent does.
 pub const Options = struct {
     auth_scheme: ?auth_header_mod.AuthScheme = null,
+    /// The vendor dialect the route declares, for the model the provider is
+    /// built for; empty infers it from the model name. Travels with
+    /// `auth_scheme`: both are properties of the route.
+    dialect: dialect_mod.DialectDeclaration = .{},
     limits: ?limits_mod.ModelLimitsSource = null,
     /// 收头阶段流空闲上限(毫秒;见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS)。null = 各 client 自己
     /// 从 env/默认取;测试用小值让"对端沉默"在秒级可复现。
@@ -166,6 +170,7 @@ pub fn makeProviderWithOptions(
             c.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), "", model, base_url);
             c.credential = credential;
             c.dialect_resolver = dialect_resolver;
+            c.declared_dialect = options.dialect;
             c.auth_scheme = options.auth_scheme;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
@@ -185,6 +190,7 @@ pub fn makeProviderWithOptions(
             errdefer c.deinit();
             c.protocol = openai_protocol;
             c.dialect_resolver = dialect_resolver;
+            c.declared_dialect = options.dialect;
             c.auth_scheme = options.auth_scheme;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
@@ -202,6 +208,7 @@ pub fn makeProviderWithOptions(
             c.credential = credential;
             errdefer c.deinit();
             c.dialect_resolver = dialect_resolver;
+            c.declared_dialect = options.dialect;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
             if (options.limits) |limits| {

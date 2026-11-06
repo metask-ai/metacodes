@@ -138,6 +138,7 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
         // issue #16:auth scheme 随 lead 已解析的路由走。少了它,teammate 会把正确
         // 的密钥发到错误的头上。
         sw.teammates.?.auth_scheme = sw.auth_scheme;
+        sw.teammates.?.dialect = sw.dialect;
     }
     errdefer if (sw.teammates) |*t| {
         t.deinit();

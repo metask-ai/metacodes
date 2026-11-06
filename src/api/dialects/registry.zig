@@ -5,10 +5,11 @@
 //! 漏了任何一步,编译期或本文件的测试会失败。
 //!
 //! 选择方言的规则(`dialectFor`):
-//! 1. 按模型名推断厂商(`INFERENCE_ORDER` 里各家的 `claims`,顺序与拆分前的
-//!    `openaiDialectFor` / `claudeDialectFor` 相同);
-//! 2. 那家在这条 wire 上没有专属方言(`dialect` 返回 null)或认不出厂商 → 用这条 wire 的
-//!    基础方言(OpenAI chat → OpenAI 原生,Anthropic → Claude,Gemini → Gemini)。
+//! 1. 路由声明了方言 → 用它;
+//! 2. 没声明 → 按模型名推断(`INFERENCE_ORDER` 里各家的 `claims`),这是方言声明出现之前
+//!    所有路由的行为,保留给没写 `dialect` 的自定义 provider;
+//! 3. 那家在这条 wire 上没有专属方言(`dialect` 返回 null)→ 用这条 wire 的基础方言
+//!    (OpenAI chat → OpenAI 原生,Anthropic → Claude,Gemini → Gemini)。
 
 const std = @import("std");
 const model_adapter = @import("../model_adapter.zig");
@@ -28,6 +29,7 @@ pub const deepseek = @import("deepseek.zig");
 pub const qwen = @import("qwen.zig");
 pub const minimax = @import("minimax.zig");
 pub const mistral = @import("mistral.zig");
+pub const openrouter = @import("openrouter.zig");
 
 /// 每个 `Vendor` 值的接入文件。
 pub fn module(comptime v: Vendor) type {
@@ -41,6 +43,7 @@ pub fn module(comptime v: Vendor) type {
         .qwen => qwen,
         .minimax => minimax,
         .mistral => mistral,
+        .openrouter => openrouter,
     };
 }
 
@@ -55,6 +58,7 @@ const SOURCES = [_]struct { vendor: Vendor, text: []const u8 }{
     .{ .vendor = .qwen, .text = @embedFile("qwen.zig") },
     .{ .vendor = .minimax, .text = @embedFile("minimax.zig") },
     .{ .vendor = .mistral, .text = @embedFile("mistral.zig") },
+    .{ .vendor = .openrouter, .text = @embedFile("openrouter.zig") },
 };
 
 /// 接入文件头必须有的段落,按顺序。
@@ -67,7 +71,8 @@ pub const REQUIRED_SECTIONS = [_][]const u8{
     "//! ## 来源",
 };
 
-/// 按名推断的顺序:先具体的家族;OpenAI / Claude / Gemini 是各自 wire 的兜底,不参与推断。
+/// 没声明方言时按名推断的顺序:先具体的家族,OpenAI / Claude / Gemini 是各自 wire 的
+/// 兜底,OpenRouter 只能声明,都不参与推断。
 const INFERENCE_ORDER = [_]Vendor{ .glm, .kimi, .deepseek, .qwen, .minimax, .mistral };
 
 comptime {
@@ -85,7 +90,7 @@ comptime {
     }
 }
 
-/// 按模型名推断厂商。
+/// 按模型名推断厂商(只用于没声明方言的路由)。
 pub fn infer(kind: ProviderKind, model: []const u8) ?Vendor {
     inline for (INFERENCE_ORDER) |v| {
         if (module(v).claims(kind, model)) return v;
@@ -93,9 +98,9 @@ pub fn infer(kind: ProviderKind, model: []const u8) ?Vendor {
     return null;
 }
 
-/// `model` 在 `kind` 这条 wire 上的方言:按名推断,再退到这条 wire 的基础方言。
-pub fn dialectFor(kind: ProviderKind, model: []const u8) ?Dialect {
-    if (infer(kind, model)) |v| switch (v) {
+/// 路由上的方言:声明优先,否则按名推断,再退到这条 wire 的基础方言。
+pub fn dialectFor(kind: ProviderKind, declared: ?Vendor, model: []const u8) ?Dialect {
+    if (declared orelse infer(kind, model)) |v| switch (v) {
         inline else => |tag| if (module(tag).dialect(kind, model)) |d| return d,
     };
     return switch (kind) {
@@ -153,14 +158,31 @@ test "按名推断保持旧顺序:GLM 先于 Kimi 的 k2 子串,OpenAI 兜底" {
     try std.testing.expect(infer(.gemini, "glm-5.2") == null);
 }
 
-test "认不出厂商时用这条 wire 的基础方言" {
+test "声明的方言胜过模型名:同一个名字在 OpenRouter 路由上发 reasoning 对象" {
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
-    try dialectFor(.openai, "house-relay-model").?.serializeThinking(.{}, .high, &out, a);
-    try std.testing.expectEqualStrings(",\"reasoning_effort\":\"high\"", out.items);
+    try dialectFor(.openai, null, "deepseek-v4-pro").?.serializeThinking(.{}, .high, &out, a);
+    try std.testing.expectEqualStrings(",\"thinking\":{\"type\":\"enabled\"},\"reasoning_effort\":\"high\"", out.items);
     out.clearRetainingCapacity();
-    try dialectFor(.anthropic, "kimi-k3").?.serializeThinking(.{}, .high, &out, a);
+    try dialectFor(.openai, .openrouter, "deepseek-v4-pro").?.serializeThinking(.{}, .high, &out, a);
+    try std.testing.expectEqualStrings(",\"reasoning\":{\"effort\":\"high\"}", out.items);
+}
+
+test "声明的厂商在这条 wire 上没有专属方言时用 wire 的基础方言" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    // Mistral 在 Anthropic wire 上没有专属方言:Claude 方言。
+    try dialectFor(.anthropic, .mistral, "mistral-large").?.serializeThinking(.{}, .high, &out, a);
     try std.testing.expectEqualStrings(",\"output_config\":{\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\"}", out.items);
-    try std.testing.expect(dialectFor(.other, "x") == null);
+    // Kimi 有:声明了 Kimi 的 Anthropic 渠道只发 K3 的 output_config.effort。
+    out.clearRetainingCapacity();
+    try dialectFor(.anthropic, .kimi, "kimi-k3").?.serializeThinking(.{}, .high, &out, a);
+    try std.testing.expectEqualStrings(",\"output_config\":{\"effort\":\"high\"}", out.items);
+    out.clearRetainingCapacity();
+    // 名字认不出,但路由说是 DeepSeek:用 DeepSeek 的家族 profile。
+    const d = dialectFor(.openai, .deepseek, "house-relay-model").?;
+    try std.testing.expect(d.profileFor(.openai, "house-relay-model").returns_reasoning_content);
+    try std.testing.expect(dialectFor(.other, null, "x") == null);
 }

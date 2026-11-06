@@ -1,5 +1,9 @@
 //! Metask provider profile — the historical default path.
 //!
+//! Integration notes for the Claude models it lists live in
+//! `src/api/dialects/claude.zig`; other models on the gateway keep model-name
+//! inference (see `ModelEntry.dialect` below).
+//!
 //! Preserves today's behaviour exactly: the Anthropic messages wire protocol
 //! against `napi.metask-ai.com`, `METASK_API_KEY` as the environment alias, and
 //! bearer authentication. Output limits reuse `util/model.zig` so the profile
@@ -72,6 +76,10 @@ fn claudeEntry(
             .with(.reasoning, .supported)
             .with(.vision, .supported),
         .quote = claudeQuote(request_model_id),
+        // The gateway also serves other vendors' models over the same wire,
+        // so the dialect is the model's, not the route's: a model the user
+        // names that is not listed here keeps model-name inference.
+        .dialect = .claude,
     };
 }
 
