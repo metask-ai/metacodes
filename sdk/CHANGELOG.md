@@ -40,15 +40,6 @@ empty `### Migration`.
 
 ### Fixed
 
-- OpenAI Chat Completions, OpenAI Responses and Gemini Runs now retry a
-  transient connect failure, a 429 or a 500/502/503 before the response head,
-  as Anthropic Messages Runs did: the same request, the same attempt limit and
-  backoff, and the same `retry_notice` events (#434).
-- A Run cancelled while the response head is awaited stops as cancelled on every
-  provider, and an HTTP context-limit rejection from OpenAI or Gemini goes
-  through the same context recovery as on Anthropic, so a Run that can shrink
-  its request continues instead of stopping with `model_error`
-  `context_window` (#434). No ABI or configuration change.
 - A Run on MiniMax, Kimi or DeepSeek over the OpenAI chat wire sends the thinking
   parameters those vendors document today (2026-11): MiniMax M3 `thinking.type`
   `adaptive` instead of `enabled`, M3.1 its `reasoning_effort`, every MiniMax
@@ -63,6 +54,15 @@ empty `### Migration`.
   messages; a route declaring DeepSeek on the Anthropic wire gets its thinking
   blocks. Other models' requests are unchanged, and Claude is never sent an
   unsigned thinking block. No ABI change.
+- OpenAI Chat Completions, OpenAI Responses and Gemini Runs now retry a
+  transient connect failure, a 429 or a 500/502/503 before the response head,
+  as Anthropic Messages Runs did: the same request, the same attempt limit and
+  backoff, and the same `retry_notice` events (#434).
+- A Run cancelled while the response head is awaited stops as cancelled on every
+  provider, and an HTTP context-limit rejection from OpenAI or Gemini goes
+  through the same context recovery as on Anthropic, so a Run that can shrink
+  its request continues instead of stopping with `model_error`
+  `context_window` (#434). No ABI or configuration change.
 
 ### Migration
 
