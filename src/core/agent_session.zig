@@ -12,7 +12,8 @@ const model_error = @import("../api/model_error.zig");
 const credential_cell = @import("../api/credential_cell.zig");
 const image_capability = @import("../api/image_capability.zig");
 const provider_mod = @import("../api/provider.zig");
-const Conversation = @import("conversation.zig").Conversation;
+const conversation_mod = @import("conversation.zig");
+const Conversation = conversation_mod.Conversation;
 const message_mod = @import("message.zig");
 const permission = @import("../permission.zig");
 const permission_settings = @import("../permission/settings.zig");
@@ -2199,6 +2200,25 @@ pub const AgentSession = struct {
         defer self.mutex.unlock();
         std.debug.assert(self.state == .mutating);
         self.state = .idle;
+    }
+
+    pub const RewindMutationError = conversation_mod.RewindError || error{ SessionBusy, InvalidSessionState };
+
+    /// Edit-and-rerun (issue #432): drop the user message at `position` and
+    /// everything after it, so the input of the next Run takes its place
+    /// after exactly the context that preceded it. Idle-only; a refused
+    /// position (`conversation.RewindError`) changes nothing.
+    ///
+    /// Only the Conversation changes: files written and other effects of the
+    /// dropped turns stay as they are. What the model read in them no longer
+    /// counts for the must-read-first check (as after `/clear`), since the
+    /// rerun's context no longer shows it. A checkpoint or transcript taken
+    /// afterwards holds the rewound history; the dropped one is discarded.
+    pub fn rewindToUserMessage(self: *AgentSession, position: conversation_mod.MessagePosition) RewindMutationError!void {
+        try self.beginGoalMutation();
+        defer self.endGoalMutation();
+        try self.conversation.rewindTo(position);
+        self.read_state.clearAll();
     }
 
     /// Manifest of the system prompt the latest Run sent, or null before the

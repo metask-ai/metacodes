@@ -40,6 +40,7 @@ const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
 const agent_session = @import("agent_session.zig");
 const Conversation = @import("conversation.zig").Conversation;
+const MessagePosition = @import("conversation.zig").MessagePosition;
 const transcript = @import("transcript.zig");
 const workspace_policy = @import("workspace_policy.zig");
 const EventJournal = @import("event_journal.zig").EventJournal;
@@ -97,6 +98,13 @@ pub const Submission = struct {
     text: []const u8,
     /// Opaque; echoed as `trace_id` on this Run's wire lines.
     trace_id: ?[]const u8 = null,
+    /// Edit-and-rerun (issue #432): `text` replaces the user message at this
+    /// position. Just before the Run, the driver drops that message and
+    /// everything after it (`AgentSession.rewindToUserMessage`), so the Run
+    /// sees exactly the context that preceded it plus `text`. A position that
+    /// cannot be rerun fails the Run with its `RewindError` name and changes
+    /// nothing. Null appends `text` after the whole conversation.
+    replaces: ?MessagePosition = null,
 };
 
 /// A configuration change applied by the driver between Runs, in queue
@@ -408,6 +416,7 @@ pub const HostedSession = struct {
         work.item = .{ .submission = .{
             .text = try a.dupe(u8, submission.text),
             .trace_id = if (submission.trace_id) |trace_id| try a.dupe(u8, trace_id) else null,
+            .replaces = submission.replaces,
         } };
         try self.enqueue(work);
     }
@@ -599,12 +608,23 @@ pub const HostedSession = struct {
     fn runSubmission(self: *HostedSession, submission: Submission) void {
         self.last_run_id += 1;
         const context = wire.RunContext{ .run_id = self.last_run_id, .trace_id = submission.trace_id };
-        self.emitHost(.{ .user_message = .{ .run_id = context.run_id, .trace_id = context.trace_id, .text = submission.text } });
+        self.emitHost(.{ .user_message = .{
+            .run_id = context.run_id,
+            .trace_id = context.trace_id,
+            .text = submission.text,
+            .replaces = if (submission.replaces) |position| position.ordinal() else null,
+        } });
 
         var scope = RunScope{ .hosted = self, .context = context };
         // An interrupt of the previous Run may still be inside the provider's
         // cancel; admission would report SessionBusy until it returns.
         self.session.awaitProviderCancelsDrained();
+        if (submission.replaces) |position| {
+            self.session.rewindToUserMessage(position) catch |err| {
+                self.finishRun(context, null, err, null);
+                return;
+            };
+        }
         var admitted = self.session.admitRun(context.run_id, scope.sink()) catch |err| {
             self.finishRun(context, null, err, null);
             return;
