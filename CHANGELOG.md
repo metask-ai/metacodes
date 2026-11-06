@@ -12,16 +12,28 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
-- **Amazon Bedrock, native.** A `bedrock_converse` wire: Converse requests,
-  answered with the AWS event-stream binary framing (both CRCs checked) rather
-  than SSE. `--provider bedrock` has one channel per region and authenticates with
-  a Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`); SigV4 is not implemented. Claude
-  on Bedrock gets adaptive or budgeted thinking by model version, cache points,
-  and the signed reasoning of a tool turn back on the next request, which Bedrock
-  requires. An account's own catalog (ListFoundationModels and
-  ListInferenceProfiles) is ingested the way OpenRouter's is: `provider_catalogs`
-  with `"kind": "bedrock"`, one offer per usable model and inference profile,
-  each declaring its dialect from the catalog's `providerName`.
+- **Amazon Bedrock, native** (#423). A
+  `bedrock_converse` wire: Converse requests, answered with the AWS event-stream
+  binary framing (both CRCs checked) rather than SSE. `--provider bedrock`
+  (alias `aws-bedrock`) has one channel per region, each naming the inference
+  profiles its region can call (Tokyo: `jp.` Sonnet 4.6, `global.` Opus 4.6),
+  and authenticates with a Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`); access
+  keys, SigV4 and AWS profiles are not supported, and the missing-key help says
+  so. Claude on Bedrock gets the thinking contract of its generation (Opus and
+  Sonnet 5.5, Fable and Mythos are never sent `disabled`; 3.7 and 4.0 – 4.5 get
+  a budget between 1,024 and `maxTokens`; Claude 3.5 gets none), never thinking
+  beside `temperature`, `topP` or a forced tool choice, and cache points after
+  the system prompt, the tools and the conversation. The signed reasoning of a
+  tool turn is kept in the conversation, so it goes back unchanged on the next
+  request, after a resume too. Requests share the other wires' lifecycle:
+  connect retry, 429/5xx retry, context-limit recovery, Aborted on cancel; an
+  exception frame carries its category and message, and a frame cut by a closed
+  connection is retried as an incomplete stream. An account's own catalog
+  (ListFoundationModels and ListInferenceProfiles) is ingested the way
+  OpenRouter's is: `provider_catalogs` with `"kind": "bedrock"`, one offer per
+  usable model and inference profile, each declaring its dialect from the
+  catalog's `providerName`. `model_tiers` takes a `bedrock` key. A Bedrock
+  session cannot run sealed Skills: SSP/1 has no provider kind for it.
 - **Built-in DeepSeek, Kimi, Qwen and MiniMax providers.** `--provider deepseek |
   kimi | qwen | minimax` with the vendors' China and global channels on both the
   OpenAI and Anthropic wires, each route declaring the vendor's dialect, limits

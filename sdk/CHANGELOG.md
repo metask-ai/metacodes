@@ -34,6 +34,9 @@ empty `### Migration`.
   message and everything after it. ABI revision 26 does not expose it, so no
   Host-visible behaviour, layout or status changes; a Session's checkpoint and
   Runs are as before.
+- No change a Host can see. The inputs moved for the native Amazon Bedrock
+  transport (#423), which ABI revision 26 does not expose: `provider` never
+  reports it, and Runs on the exposed wires send the bytes they did.
 
 ### Fixed
 
@@ -46,15 +49,6 @@ empty `### Migration`.
   through the same context recovery as on Anthropic, so a Run that can shrink
   its request continues instead of stopping with `model_error`
   `context_window` (#434). No ABI or configuration change.
-
-### Migration
-
-- A Host that compacted and replayed the instruction after a context-window
-  stop no longer needs to; it should accept `auto_compact` events (and the
-  `compacting` RunState phase) inside a Run and causes it does not know.
-
-### Fixed
-
 - A Run on MiniMax, Kimi or DeepSeek over the OpenAI chat wire sends the thinking
   parameters those vendors document today (2026-11): MiniMax M3 `thinking.type`
   `adaptive` instead of `enabled`, M3.1 its `reasoning_effort`, every MiniMax
@@ -69,6 +63,12 @@ empty `### Migration`.
   messages; a route declaring DeepSeek on the Anthropic wire gets its thinking
   blocks. Other models' requests are unchanged, and Claude is never sent an
   unsigned thinking block. No ABI change.
+
+### Migration
+
+- A Host that compacted and replayed the instruction after a context-window
+  stop no longer needs to; it should accept `auto_compact` events (and the
+  `compacting` RunState phase) inside a Run and causes it does not know.
 
 ## 0.13.0 — 2026-10-31
 
