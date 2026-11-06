@@ -107,9 +107,11 @@ pub const GeminiClient = struct {
     /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
     overrides: request_overrides.RequestOverrides = .{},
     dialect_resolver: dialect_mod.Resolver = .{},
-    /// The dialect the route declares (`ModelOffer.dialect`); null infers it
-    /// from the model name. Set with the route, like `auth_scheme`.
-    dialect_vendor: ?dialect_mod.Vendor = null,
+    /// The dialect the route declares (`ModelOffer.dialect`): the bound model's
+    /// entry declaration applies to `model` only, the route's to any model a
+    /// request names. Empty infers it from the model name. Set with the route,
+    /// like `auth_scheme`.
+    declared_dialect: dialect_mod.DialectDeclaration = .{},
     /// The provider's model catalog, when the caller has one (owned). Its
     /// image_input declarations override the family table (issue #273).
     catalog: ?catalog_mod.Catalog = null,
@@ -271,7 +273,7 @@ pub const GeminiClient = struct {
     /// declaration applied (Host first) - the one profile the serializer's
     /// gate and every capability query read, as in the Anthropic client.
     pub fn dialectFor(self: *const GeminiClient, model: []const u8) dialect_mod.Dialect {
-        var dialect = self.dialect_resolver.resolve(.gemini, self.dialect_vendor, model);
+        var dialect = self.dialect_resolver.resolve(.gemini, self.declared_dialect.vendorFor(self.model, model), model);
         const from_catalog: ?bool = if (self.catalog) |*catalog| catalog.imageInputFor(model) else null;
         dialect.declareImageInput(self.host_capabilities.imageInputFor(model), from_catalog);
         return dialect;

@@ -117,10 +117,15 @@ The OpenAI chat building blocks every compatible vendor shares are
 **Which dialect a request uses is a property of the route**, the way an
 OpenRouter endpoint names its upstream. `ProtocolRoute.dialect` declares it for
 a channel's route, `ModelEntry.dialect` overrides it for one model on a
-multi-vendor gateway, and the offer carries the result (`ModelOffer.dialect`,
-not part of the offer id). It travels with the auth scheme through the startup
-route, a `/model` switch, child agents, swarm teammates and `AgentSession`, to
-the client's `dialect_vendor`. A route that declares none infers the vendor
+multi-vendor gateway, and the offer carries both (`ModelOffer.dialect`, a
+`vendor.Declaration`, not part of the offer id). It travels with the auth scheme
+through the startup route, a `/model` switch, child agents, swarm teammates and
+`AgentSession`, to the client's `declared_dialect`. The entry's declaration
+covers its own model only: a child agent's `model_override`, a teammate or a
+Session's model switch on another model of the same route inherits the route's
+declaration alone, and with none infers from its own name, so a GLM child of a
+Claude lead on the Metask gateway is still written in GLM's dialect. A route
+that declares none infers the vendor
 from the model name — the behaviour before routes could say — so a custom
 provider written for that keeps working. A runtime plugin's dialect for a model
 still wins over the route's declaration.
@@ -621,7 +626,8 @@ prompts or reach a credential it was not given. `quote_hook` and
 and belong to a reviewed profile.
 
 `dialect` (on a channel, or on one model) names the vendor whose parameters the
-requests carry — a value of `Vendor` in `src/provider/vendor.zig`. Absent, the
+requests carry — a value of `Vendor` in `src/provider/vendor.zig`. On a channel
+it covers every model the channel serves; on a model, that model only. Absent, the
 vendor is inferred from the model name; a value that names no vendor fails the
 definition (`UnknownDialect`) rather than being guessed.
 

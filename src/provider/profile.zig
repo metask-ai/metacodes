@@ -30,6 +30,7 @@ pub const Availability = offer_mod.Availability;
 pub const ControlSpec = controls_mod.ControlSpec;
 pub const AuthScheme = credential.AuthScheme;
 pub const Vendor = @import("vendor.zig").Vendor;
+pub const DialectDeclaration = @import("vendor.zig").Declaration;
 pub const CredentialKind = credential.CredentialKind;
 pub const EnvAlias = credential.EnvAlias;
 

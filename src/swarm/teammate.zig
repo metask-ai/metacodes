@@ -364,8 +364,9 @@ pub const TeammateRegistry = struct {
     /// issue #16:lead 已解析路由的 provider-declared auth scheme。null = 历史
     /// bearer 字节。由 `SwarmContext` 在 spawn 时注入。
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
-    /// The lead route's vendor dialect (see `SwarmContext.dialect`).
-    dialect: ?dialect_mod.Vendor = null,
+    /// The lead route's vendor dialect, for the lead's `model` (see
+    /// `SwarmContext.dialect`).
+    dialect: dialect_mod.DialectDeclaration = .{},
     dialect_resolver: dialect_mod.Resolver = .builtin(),
     limits: ?@import("../api/model_limits.zig").ModelLimitsSource = null,
     catalog_snapshot: ?@import("../api/catalog.zig").Catalog = null,
@@ -453,7 +454,10 @@ pub const TeammateRegistry = struct {
         self.limits.?.catalog = null;
     }
 
-    fn makeProvider(self: *TeammateRegistry, model: []const u8) !pf.OwnedProvider {
+    /// The provider a teammate on `model` runs with: the lead's route, and the
+    /// route's dialect declaration rebound to `model`. Public so a test can
+    /// check the request a teammate sends without spawning one.
+    pub fn makeProvider(self: *TeammateRegistry, model: []const u8) !pf.OwnedProvider {
         self.listLock();
         defer self.listUnlock();
         if (self.closing) return error.RegistryClosed;
@@ -467,7 +471,8 @@ pub const TeammateRegistry = struct {
             self.base_url,
             self.openai_protocol,
             self.dialect_resolver,
-            .{ .auth_scheme = self.auth_scheme, .dialect = self.dialect, .limits = limits },
+            // A teammate on another model inherits only the route's declaration.
+            .{ .auth_scheme = self.auth_scheme, .dialect = self.dialect.rebind(self.model, model), .limits = limits },
         );
     }
 

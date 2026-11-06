@@ -574,11 +574,12 @@ pub const ModelOffer = struct {
     /// the id would lose that and report "no transport" for a route that has
     /// one. Null is a genuinely novel wire, which fails closed.
     wire: ?@import("profile.zig").Protocol.Wire = null,
-    /// The vendor dialect requests on this route are written in: the model
-    /// entry's declaration, else the route's. Null infers it from the model
-    /// name. Not part of the offer id — it is derived from the binding, not
-    /// a second identity.
-    dialect: ?@import("vendor.zig").Vendor = null,
+    /// The vendor dialect requests on this route are written in: the route's
+    /// declaration and the model entry's, kept apart because the entry's
+    /// covers this model only (`vendor.Declaration`). Empty infers it from the
+    /// model name. Not part of the offer id — it is derived from the binding,
+    /// not a second identity.
+    dialect: @import("vendor.zig").Declaration = .{},
     /// Fully constructed request endpoint for this protocol on this channel.
     endpoint_ref: []const u8,
     credential_ref: ?Slug = null,
