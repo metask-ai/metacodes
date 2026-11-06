@@ -63,6 +63,9 @@ it came from, and a slice into a list that later grows is a dangling pointer.
 
 1. Write `src/provider/profiles/<vendor>.zig` declaring a `ProviderProfile`.
 2. Add one line to `BUILTIN_PROFILES` in `src/provider/registry.zig`.
+3. If the vendor speaks its own dialect, write `src/api/dialects/<vendor>.zig`
+   (see *Vendor integrations* below) and add the vendor to `Vendor` in
+   `src/provider/vendor.zig`.
 
 A runtime source — the `custom_providers` section, a fetched catalog — registers
 through the same call, and may **replace its own** registrations: re-reading a
@@ -83,6 +86,36 @@ goes through the same `ProviderRegistry.register` call, including validation.
 client. It is keyed by protocol, not by vendor, which is what removes the
 model-name guessing: a GLM model reached over `anthropic_messages` uses the
 Anthropic transport, which is the opposite of what a name prefix would say.
+
+## Vendor integrations: the code is the document
+
+Each vendor's integration notes live in exactly one place: the header of its
+dialect file, `src/api/dialects/<vendor>.zig`. There is no separate
+integration document to drift from the code. Every header has the same
+sections, in order — 接入点 (endpoints and the profile that declares them),
+协议 (wires and auth), 思考与推理 (thinking parameters and the effort mapping),
+回传与缓存 (reasoning passback and prompt caching), 已知差异 (quirks and known
+gaps), 来源 (the vendor pages the facts were checked against, with dates) —
+and `dialects/registry.zig` fails a test when one is missing.
+
+| Vendor | Integration file | Built-in profile |
+|---|---|---|
+| OpenAI | `src/api/dialects/openai.zig` | `openai` |
+| Anthropic Claude | `src/api/dialects/claude.zig` | `metask` (Claude models) |
+| Google Gemini | `src/api/dialects/gemini.zig` | `gemini` |
+| Zhipu GLM | `src/api/dialects/glm.zig` | `zai-coding-plan` |
+| Moonshot Kimi | `src/api/dialects/kimi.zig` | — |
+| DeepSeek | `src/api/dialects/deepseek.zig` | — |
+| Alibaba Qwen | `src/api/dialects/qwen.zig` | — |
+| MiniMax | `src/api/dialects/minimax.zig` | — |
+| Mistral | `src/api/dialects/mistral.zig` | — |
+
+The OpenAI chat building blocks every compatible vendor shares are
+`src/api/dialects/openai_compat.zig`.
+
+Which dialect a request uses is recognised from the model name, in the order
+`dialects/registry.zig` fixes (GLM, Kimi, DeepSeek, Qwen, MiniMax, Mistral);
+a name no vendor claims gets the wire's own dialect.
 
 ## Conservative metadata
 
@@ -808,6 +841,9 @@ see *Stored API keys and the guided key login*).
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
+| `src/provider/vendor.zig` | `Vendor`, the vendors with a dialect of their own |
+| `src/api/dialects/<vendor>.zig` | one vendor's dialect; its header is the integration document |
+| `src/api/dialects/registry.zig` | vendor → dialect file, name inference, the header contract test |
 | `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
 | `src/provider/api_key_store.zig` | provider-scoped API keys at rest, one 0600 file per provider |
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |

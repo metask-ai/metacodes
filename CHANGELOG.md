@@ -25,8 +25,30 @@ status, compatibility boundaries, and entry points are defined by
   `SessionHost`'s `Submission.replaces`, and the wire `user_message` line
   gains `replaces` ([doc/API.md](doc/API.md#edit-and-rerun)). (#432)
 
+### Changed
+
+- **One integration file per model vendor.** The OpenAI-compatible dialects that
+  shared `src/api/dialects/openai.zig` (GLM, Kimi, DeepSeek, Qwen, MiniMax,
+  Mistral) each have their own file, next to OpenAI, Claude and Gemini. The header
+  of each file is that vendor's integration document — endpoints, wires, thinking
+  parameters and the effort mapping, reasoning passback and caching, known
+  differences, and the dated vendor pages it was checked against — and a test fails
+  when a section is missing. Model-name recognition is unchanged.
+- **Thinking parameters re-checked against the vendors' current documentation**
+  (2026-11). MiniMax M3 now sends `thinking.type: adaptive` instead of `enabled`
+  (the API accepts only `disabled` / `adaptive`), M3.1 sends its `reasoning_effort`,
+  and every MiniMax model asks for `reasoning_split`. Kimi K2.6 no longer puts an
+  `effort` in its `thinking` object, and K2.7-code never sends `disabled`.
+  DeepSeek's `low` level is sent as `low` rather than `high`. A Kimi model id
+  that names no generation (`kimi-latest`, `kimi-for-coding`) is now treated as
+  K2.7 or later: thinking stays on, and `none` no longer sends `disabled`.
+
 ### Fixed
 
+- **Kimi K2 with no reasoning effort set no longer crashes.** On the OpenAI chat
+  wire the K2.6 dialect unwrapped the unset effort while writing the `thinking`
+  object, which panicked in Debug and ReleaseSafe builds; it now sends
+  `{"type":"enabled","keep":"all"}`.
 - **The x86_64 macOS release unit no longer fails its CPU baseline check on a
   jump table.** This is why 0.10.0 was tagged but never published: release run
   41194755285 built every unit but stopped at `scripts/check_binary_baseline.py`

@@ -2121,8 +2121,9 @@ test "serializeOpenAIRequest: Kimi K2.6 effort=high 走 extra_body thinking" {
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
-    // K2.6 不发顶层 reasoning_effort(那是 K3 的)
+    // K2.6 的 thinking 对象只有 type / keep(platform.kimi.ai/docs/api/chat,2026-11),
+    // 也不发顶层 reasoning_effort(那是 K3 的)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":") == null);
 }
 

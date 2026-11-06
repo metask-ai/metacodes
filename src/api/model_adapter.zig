@@ -6,23 +6,15 @@
 //! 决定 wire 格式。agent_loop 不感知 adapter——它仍只传 reasoning_effort,翻译成各家 wire 格式
 //! 是 provider 实现的私事。
 //!
-//! 覆盖 8 家模型厂商(2025-08 调研):
-//! - Anthropic Claude: thinking.type=adaptive + output_config.effort
-//! - OpenAI GPT-5/o3: reasoning.effort 嵌套对象,7 档
-//! - Google Gemini: thinking_level in generation_config
-//! - GLM-5.2: <reasoning_effort> prompt 标签,7→2 effort 映射,XML 工具,clear_thinking
-//! - Kimi K3: thinking:{type,keep,effort} extra_body,3 档,prompt_cache_key
-//! - DeepSeek: thinking:{type} + reasoning_effort 顶层,1 档
-//! - Qwen3: enable_thinking + /think /no_think chat template
-//! - Mistral: reasoning_effort,parallel_tool_calls
-//! - MiniMax M3: thinking:{type: disabled|adaptive|enabled} 三态(effort 串仅兼容不调深度);
-//!   M2.x: thinking 常开不可关,reasoning_split 分离 reasoning_content(2026-08 调研)
-//!
-//! 调研来源:各厂商 chat_template.jinja / OpenAPI spec / 官方文档(2025-08 快照)。
+//! 每家厂商的参数怎么发、为什么这么发,写在那家的接入文件里(`dialects/<vendor>.zig`,
+//! 登记表 `dialects/registry.zig`)。本文件只保留跨厂商的部分:`ModelProfile` 的形状、
+//! 按 wire 的默认 profile(Anthropic / Gemini / OpenAI 原生兜底)、图像家族表,以及
+//! 按名推断时把 OpenAI chat wire 上的模型名交给对应厂商的 `openaiProfile`。
 
 const std = @import("std");
 const image_capability = @import("image_capability.zig");
 const model_name = @import("model_name.zig");
+const vendor_dialects = @import("dialects/registry.zig");
 
 /// thinking 控制模式:决定 reasoning_effort 如何翻译到 wire 格式。
 pub const ThinkingMode = enum {
@@ -185,103 +177,12 @@ fn anthropicProfile(model: []const u8) ModelProfile {
 }
 
 fn openaiProfile(model: []const u8) ModelProfile {
-    // GLM-5 系列(经 OpenAI-compatible 端点调用)
-    // 注:GLM 原生端点用 XML 工具格式 + defer_loading,但 metacodes 走 OpenAI-compatible
-    // 端点(标准 JSON function 调用),07-15 swarm e2e 真 GLM-5.2 + JSON 工具调用 PASS 证实。
-    // tool_format/supports_defer_loading 走默认(openai_json/false)——XML 格式留 ToolFormat.glm_xml
-    // 枚举供将来原生端点适配,OpenAI-compatible 端点不消费。
-    if (hasSubstr(model, "glm-5") or hasSubstr(model, "glm4") or hasSubstr(model, "glm-4")) {
-        return .{
-            .thinking_mode = .glm_prompt_tag,
-            .effort_levels = .glm_7to2,
-            .response_format_support = .json_object_only,
-            .tool_choice_support = .auto_only,
-            .returns_reasoning_content = true,
-            // GLM coding-plan 端点默认保留 thinking;标准 API 端点默认清除。
-            // harness 无法从 model 名区分端点,保守取 false(保留)——coding agent 场景更常见。
-            .preserved_thinking_default = false,
-            // GLM 文本系(glm-5.x/glm-4-plus)无 vision;视觉变体是 glm-4v / glm-4.1v / glm-4.5v
-            // 这种"版本号以 v 收尾"的名字。glm-5.3-flash 这类新号名字看不出来,靠目录声明。
-            .supports_image_input = glmVisionVariant(model),
-            .image_input_source = .model_family,
-        };
-    }
-    // Kimi K3(总是开 thinking,顶层 reasoning_effort,不发 thinking body,省略 temp/top_p/n)
-    if (hasSubstr(model, "kimi-k3") or hasSubstr(model, "kimi_k3")) {
-        return .{
-            .thinking_mode = .kimi_k3_top_level,
-            .effort_levels = .kimi_3,
-            .supports_prompt_cache_key = true,
-            .returns_reasoning_content = true,
-            .cannot_disable_thinking = true, // K3 总是开 thinking
-            // preserved_thinking 默认 null(K3 文档未提 keep 字段,只 K2.6 用)
-        };
-    }
-    // Kimi K2.6 及更早(thinking:{type,keep,effort} body,effort 3 档)
-    if (hasSubstr(model, "kimi") or hasSubstr(model, "k2") or hasSubstr(model, "moonshot")) {
-        return .{
-            .thinking_mode = .kimi_extra_body,
-            .effort_levels = .kimi_k2_3,
-            .supports_prompt_cache_key = true,
-            .returns_reasoning_content = true,
-            .preserved_thinking_default = false, // keep="all" 等价
-        };
-    }
-    // DeepSeek V4(thinking:{type} + reasoning_effort 顶层;V4 xhigh→max,V3 仅 high)
-    if (hasSubstr(model, "deepseek")) {
-        return .{
-            .thinking_mode = .deepseek_top,
-            .effort_levels = .deepseek_2,
-            .returns_reasoning_content = true,
-        };
-    }
-    // Qwen3
-    if (hasSubstr(model, "qwen3") or hasSubstr(model, "qwen-3")) {
-        return .{
-            .thinking_mode = .qwen_template,
-            .effort_levels = .none_, // Qwen3 无 effort 档位,只开关
-            .returns_reasoning_content = true,
-            // VL 变体(qwen3-vl-*)走 OpenAI image_url 格式;其余 Qwen3 名字(含 omni 一类)
-            // 表里不下结论,来源 unknown,由目录或 Host 声明。
-            .supports_image_input = hasSubstr(model, "vl"),
-            .image_input_source = if (hasSubstr(model, "vl")) .model_family else .unknown,
-        };
-    }
-    // MiniMax M3(三态 thinking;可关)
-    if (hasSubstr(model, "minimax-m3") or hasSubstr(model, "minimax_m3")) {
-        return .{
-            .thinking_mode = .minimax_m3_thinking,
-            .effort_levels = .minimax_3state,
-            .returns_reasoning_content = true,
-            // 原生多模态:官方 OpenAI 兼容 Chat Completions 文档把图像理解列为 M3 新能力,
-            // 走标准 image_url part(platform.minimax.io text-chat-openai,2026-10 核对;
-            // issue #273)。
-            .supports_image_input = true,
-            .image_input_source = .model_family,
-        };
-    }
-    // MiniMax M2.x(常开不可关;reasoning_split 平级返回思考)
-    if (hasSubstr(model, "minimax")) {
-        return .{
-            .thinking_mode = .minimax_m2_split,
-            .effort_levels = .none_,
-            .returns_reasoning_content = true,
-            .cannot_disable_thinking = true,
-        };
-    }
-    // Mistral
-    if (hasSubstr(model, "mistral") or hasSubstr(model, "magistral")) {
-        return .{
-            .thinking_mode = .none, // Mistral 用 reasoning_effort 但非 thinking block
-            .effort_levels = .full, // reasoning_effort: high/none
-            .supports_parallel_tool_calls = true,
-            .returns_reasoning_content = true, // ThinkChunk
-        };
-    }
-    // OpenAI 原生(GPT-4o/o1/o3/GPT-5)。注意本分支同时是**所有未匹配模型名的
-    // catch-all**(vLLM/自部署/新厂商)——vision 只对已验证 OpenAI 家族开 true,
-    // 未知模型保持保守 false(fail-closed:本地显式能力错误优于远端 400/静默忽略),
-    // 来源记为 unknown,与"已知纯文本"区分开(issue #273)。
+    // 认得出厂商的名字:家族 profile 在各家的接入文件里(`dialects/<vendor>.zig`)。
+    if (vendor_dialects.inferredOpenAIProfile(model)) |p| return p;
+    // OpenAI 原生(GPT-4o/o1/o3/GPT-5)。本分支同时是**所有未匹配模型名的 catch-all**
+    // (vLLM/自部署/新厂商)——vision 只对已验证 OpenAI 家族开 true,未知模型保持保守
+    // false(fail-closed:本地显式能力错误优于远端 400/静默忽略),来源记为 unknown,
+    // 与"已知纯文本"区分开(issue #273)。
     var p = ModelProfile{
         .thinking_mode = .openai_effort,
         .effort_levels = .full,
@@ -337,7 +238,7 @@ fn openaiKnownTextOnly(model: []const u8) bool {
 /// GLM 视觉变体:`glm-` 后的版本段以 `v` 收尾——glm-4v、glm-4.1v-thinking、glm-4.5v、
 /// glm-4.6v-flash 命中;glm-4-plus / glm-4-flash / glm-5.2 / glm-5.3-flash 不命中
 /// (它们的版本段是 "4" / "5.2" / "5.3")。
-fn glmVisionVariant(model: []const u8) bool {
+pub fn glmVisionVariant(model: []const u8) bool {
     const at = std.ascii.indexOfIgnoreCase(model, "glm-") orelse return false;
     const rest = model[at + "glm-".len ..];
     const seg_end = std.mem.indexOfScalar(u8, rest, '-') orelse rest.len;
@@ -386,51 +287,6 @@ fn geminiProfile(model: []const u8) ModelProfile {
         .returns_reasoning_content = false, // Gemini 用 thought_summary + signature,非平级字段
         .cannot_disable_thinking = is_gemini3_family,
         .requires_thought_signatures = is_gemini3_family,
-    };
-}
-
-/// Kimi K2.6 的 effort 映射:3 档(low/high/max)。
-pub fn kimiEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]const u8 {
-    return switch (effort) {
-        .none, .minimal => null, // 跳过
-        .low => "low",
-        .medium, .high => "high",
-        .xhigh, .max => "max",
-    };
-}
-
-/// Kimi K3 的 effort 映射:3 档(low/high/max,默认 max)。
-/// K3 总是开 thinking,effort=null 走默认 "max"(由调用方处理 null,本函数只接非 null)。
-pub fn kimiK3EffortMap(effort: @import("../types.zig").ReasoningEffort) []const u8 {
-    return switch (effort) {
-        .none, .minimal => "max", // K3 不能关,降级到默认 max
-        .low => "low",
-        .medium, .high => "high",
-        .xhigh, .max => "max",
-    };
-}
-
-/// DeepSeek 的 effort 映射:2 档(high/max)。
-/// V4 文档明确 xhigh → max(此前误为 high,2026-08 KnowForge 调研修正)。
-/// 来源:api-docs.deepseek.com/guides/thinking_mode。
-pub fn deepseekEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]const u8 {
-    return switch (effort) {
-        .none, .minimal => null, // 跳过
-        .low, .medium, .high => "high",
-        .xhigh, .max => "max",
-    };
-}
-
-/// MiniMax M3 的 thinking 三态映射:none→disabled,minimal/low→adaptive(模型自判),
-/// medium/high/xhigh→enabled(强制)。null(未指定)→ adaptive(官方默认,显式发送保证
-/// 请求字节确定性)。来源:platform.minimax.io responses-create + MiniMax-M3 model card
-/// (2026-08 调研):OpenAI-compat 的 reasoning.effort 串仅兼容接受、不调 M3 深度。
-pub fn minimaxM3ThinkingType(effort: ?@import("../types.zig").ReasoningEffort) []const u8 {
-    const e = effort orelse return "adaptive";
-    return switch (e) {
-        .none => "disabled",
-        .minimal, .low => "adaptive",
-        .medium, .high, .xhigh, .max => "enabled",
     };
 }
 
@@ -592,31 +448,6 @@ test "profileFor: Gemini" {
     try std.testing.expect(p.thinking_mode == .gemini_level);
 }
 
-test "kimiEffortMap 3 档(K2.6)" {
-    try std.testing.expect(kimiEffortMap(.none) == null);
-    try std.testing.expectEqualStrings("low", kimiEffortMap(.low).?);
-    try std.testing.expectEqualStrings("high", kimiEffortMap(.high).?);
-    try std.testing.expectEqualStrings("max", kimiEffortMap(.xhigh).?);
-}
-
-test "kimiK3EffortMap 3 档(K3,不能关)" {
-    // K3 不能关 thinking,none/minimal 降级到默认 max
-    try std.testing.expectEqualStrings("max", kimiK3EffortMap(.none));
-    try std.testing.expectEqualStrings("max", kimiK3EffortMap(.minimal));
-    try std.testing.expectEqualStrings("low", kimiK3EffortMap(.low));
-    try std.testing.expectEqualStrings("high", kimiK3EffortMap(.high));
-    try std.testing.expectEqualStrings("max", kimiK3EffortMap(.xhigh));
-}
-
-test "deepseekEffortMap 2 档(V4 xhigh→max)" {
-    try std.testing.expect(deepseekEffortMap(.none) == null);
-    try std.testing.expect(deepseekEffortMap(.minimal) == null);
-    try std.testing.expectEqualStrings("high", deepseekEffortMap(.low).?);
-    try std.testing.expectEqualStrings("high", deepseekEffortMap(.medium).?);
-    try std.testing.expectEqualStrings("high", deepseekEffortMap(.high).?);
-    try std.testing.expectEqualStrings("max", deepseekEffortMap(.xhigh).?);
-}
-
 test "profileFor: MiniMax M3(三态 thinking,可关)" {
     const p = profileFor(.openai, "minimax-m3");
     try std.testing.expect(p.thinking_mode == .minimax_m3_thinking);
@@ -631,16 +462,6 @@ test "profileFor: MiniMax M2.1(常开不可关)" {
     try std.testing.expect(p.effort_levels == .none_);
     try std.testing.expect(p.returns_reasoning_content);
     try std.testing.expect(p.cannot_disable_thinking);
-}
-
-test "minimaxM3ThinkingType 三态映射" {
-    try std.testing.expectEqualStrings("adaptive", minimaxM3ThinkingType(null));
-    try std.testing.expectEqualStrings("disabled", minimaxM3ThinkingType(.none));
-    try std.testing.expectEqualStrings("adaptive", minimaxM3ThinkingType(.minimal));
-    try std.testing.expectEqualStrings("adaptive", minimaxM3ThinkingType(.low));
-    try std.testing.expectEqualStrings("enabled", minimaxM3ThinkingType(.medium));
-    try std.testing.expectEqualStrings("enabled", minimaxM3ThinkingType(.high));
-    try std.testing.expectEqualStrings("enabled", minimaxM3ThinkingType(.xhigh));
 }
 
 test "profileFor: other 保守默认" {

@@ -50,6 +50,9 @@ test "model routing source guard rejects direct case-sensitive model matching" {
     const sources = [_][]const u8{
         @embedFile("model_adapter.zig"),         @embedFile("capability.zig"),            @embedFile("dialect.zig"),
         @embedFile("dialects/openai.zig"),       @embedFile("dialects/claude.zig"),       @embedFile("catalog.zig"),
+        @embedFile("dialects/glm.zig"),          @embedFile("dialects/kimi.zig"),         @embedFile("dialects/deepseek.zig"),
+        @embedFile("dialects/qwen.zig"),         @embedFile("dialects/minimax.zig"),      @embedFile("dialects/mistral.zig"),
+        @embedFile("dialects/gemini.zig"),       @embedFile("dialects/registry.zig"),     @embedFile("dialects/openai_compat.zig"),
         @embedFile("../app/model_context.zig"),  @embedFile("../util/pricing.zig"),       @embedFile("../util/model.zig"),
         @embedFile("../core/system_prompt.zig"), @embedFile("../repl/model_command.zig"), @embedFile("../main.zig"),
         @embedFile("../plugin/runtime.zig"),

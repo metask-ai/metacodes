@@ -179,18 +179,19 @@ test "原则2: kimi-k3 effort=null → reasoning_effort:\"max\"(K3 默认 max)" 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
 }
 
-test "原则2: kimi-k2 effort=high → thinking:{type,keep,effort}(K2.6 方言,与 K3 区分)" {
+test "原则2: kimi-k2 effort=high → thinking:{type,keep}(K2.6 方言,与 K3 区分)" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
     };
     const body = try openai.serializeOpenAIRequest(a, "kimi-k2", &msgs, "sys", null, .high, null);
     defer a.free(body);
-    // K2.6:thinking:{type,keep,effort} body(不是 K3 的顶层 reasoning_effort)
+    // K2.6:thinking:{type,keep} body(不是 K3 的顶层 reasoning_effort);K2.6 的 thinking
+    // 对象没有 effort(platform.kimi.ai/docs/api/chat,2026-11)。
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"enabled\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\"") == null);
     // K2.6 不该发顶层 reasoning_effort(那是 K3 的)
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":") == null);
 }
