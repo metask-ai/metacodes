@@ -19,6 +19,18 @@ empty `### Migration`.
 - No change a Host can see. The inputs moved for a fix in the CLI's plain headless
   output (#417), which AgentCore does not use.
 
+### Fixed
+
+- OpenAI Chat Completions, OpenAI Responses and Gemini Runs now retry a
+  transient connect failure, a 429 or a 500/502/503 before the response head,
+  as Anthropic Messages Runs did: the same request, the same attempt limit and
+  backoff, and the same `retry_notice` events (#434).
+- A Run cancelled while the response head is awaited stops as cancelled on every
+  provider, and an HTTP context-limit rejection from OpenAI or Gemini goes
+  through the same context recovery as on Anthropic, so a Run that can shrink
+  its request continues instead of stopping with `model_error`
+  `context_window` (#434). No ABI or configuration change.
+
 ## 0.13.0 — 2026-10-31
 
 ### Added

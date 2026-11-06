@@ -19,6 +19,12 @@ status, compatibility boundaries, and entry points are defined by
   `error: stopped (<stop_reason>): …` line to stderr, on `--resume-response`
   too. Stdout (any partial text) and the exit code are unchanged, and so is
   `--json`.
+- **One provider request lifecycle (#434).** OpenAI Chat Completions, OpenAI
+  Responses and Gemini retry a transient connect failure, a 429 or a 500/502/503
+  before the response head with the Anthropic client's policy (attempt limit,
+  backoff, Retry-After, retry notice). A cancel while the head is awaited is
+  `Aborted` on every provider, and an HTTP context-limit rejection is
+  `ContextWindowExceeded`, so the agent loop's context recovery runs.
 
 ## 0.10.0 — 2026-10-31
 
