@@ -403,7 +403,7 @@ test "L2 dialect: DeepSeek gets the assistant's thinking back as reasoning_conte
         defer a.free(url);
         var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "key", "house-model", url);
         defer client.deinit();
-        client.dialect_vendor = case[0];
+        client.declared_dialect = .{ .route = case[0] };
 
         var conv = cc.conversation.Conversation.init(a);
         defer conv.deinit();
@@ -430,7 +430,7 @@ test "L2 dialect: Claude never receives an unsigned thinking block; DeepSeek's A
         defer a.free(url);
         var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "key", case[1], url);
         defer client.deinit();
-        client.dialect_vendor = case[0];
+        client.declared_dialect = .{ .route = case[0] };
 
         var conv = cc.conversation.Conversation.init(a);
         defer conv.deinit();

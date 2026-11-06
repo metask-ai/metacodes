@@ -134,7 +134,8 @@ Reasoning passback is the dialect's decision too. `buildApiMessages` projects
 the conversation's thinking blocks; a dialect that declares
 `ModelProfile.echoes_reasoning_content` sends them back (DeepSeek, which
 returns 400 without them once tools are present; Kimi, whose documentation
-requires them with tool calls; and OpenRouter), and every
+requires them with tool calls; MiniMax M3 and later, which ask for the full
+response back; and OpenRouter), and every
 other dialect leaves the request bytes exactly as before. Claude never receives
 an unsigned thinking block.
 

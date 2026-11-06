@@ -5609,6 +5609,36 @@ test "buildApiMessages omits thinking-only assistant before continuation" {
     for (api.items) |message| try std.testing.expect(message.content.len > 0);
 }
 
+test "buildApiMessages projects thinking in order and borrows its bytes (issue #421)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    try c.appendText(.user, "what time is it");
+    const blocks = try a.alloc(msg.Block, 3);
+    blocks[0] = .{ .thinking = try a.dupe(u8, "need the clock") };
+    blocks[1] = .{ .text = try a.dupe(u8, "checking") };
+    blocks[2] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "get_time"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = blocks });
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+
+    // The trailing tool_use gets a stub result; the assistant message keeps
+    // every block, thinking first, so the dialect can decide.
+    try std.testing.expectEqual(types.MessageRole.assistant, api.items[1].role);
+    const content = api.items[1].content;
+    try std.testing.expectEqual(@as(usize, 3), content.len);
+    try std.testing.expectEqualStrings("need the clock", content[0].thinking);
+    try std.testing.expectEqual(c.messages.items[1].blocks[0].thinking.ptr, content[0].thinking.ptr);
+    try std.testing.expectEqualStrings("checking", content[1].text);
+    try std.testing.expectEqualStrings("get_time", content[2].tool_use.name);
+}
+
 test "buildApiMessages maps tool_use and tool_result" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);

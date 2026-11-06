@@ -30,7 +30,10 @@
 //!
 //! ## 回传与缓存
 //!
-//! - 文档只要求回传 tool_calls,未要求回传 `reasoning_content`;本方言不回传。
+//! - M3 / M3.1:文档要求把完整响应追加回历史,包括 `reasoning_split` 分出的
+//!   `reasoning_content`,以保持推理链连续;本方言声明 `echoes_reasoning_content`,
+//!   序列化器把 assistant 历史的 thinking 块作为 `reasoning_content` 发回。
+//! - M2.x:现行文档不再覆盖,不回传。
 //! - 缓存:服务端隐式缓存。
 //!
 //! ## 已知差异
@@ -47,6 +50,8 @@
 //!   thinking.type、reasoning_effort、reasoning_split、输出上限、型号)
 //! - https://platform.minimax.cn/docs/api-reference/text-chat-openai(2026-11 核对:
 //!   中国区 `https://api.minimax.cn`)
+//! - https://platform.minimax.io/docs/api-reference/text-openai-api(2026-11 核对:
+//!   多轮时把完整响应连同 `reasoning_content` 追加回历史)
 
 const std = @import("std");
 const types = @import("../../types.zig");
@@ -93,6 +98,7 @@ pub fn openaiProfile(model: []const u8) ModelProfile {
             .thinking_mode = .minimax_m3_thinking,
             .effort_levels = .full,
             .returns_reasoning_content = true,
+            .echoes_reasoning_content = true,
             .cannot_disable_thinking = true,
             .supports_image_input = true,
             .image_input_source = .model_family,
@@ -101,6 +107,7 @@ pub fn openaiProfile(model: []const u8) ModelProfile {
             .thinking_mode = .minimax_m3_thinking,
             .effort_levels = .minimax_3state,
             .returns_reasoning_content = true,
+            .echoes_reasoning_content = true,
             .supports_image_input = true,
             .image_input_source = .model_family,
         },
@@ -226,4 +233,11 @@ test "MiniMax M2.x: 只发 reasoning_split(常开不可关)" {
     try std.testing.expectEqualStrings(",\"reasoning_split\":true", out.items);
     try std.testing.expect(!openaiProfile("MiniMax-M2.7").supports_image_input);
     try std.testing.expect(openaiProfile("MiniMax-M3").supports_image_input);
+}
+
+test "MiniMax: M3 起回传 reasoning_content,M2.x 不回传" {
+    for ([_][]const u8{ "MiniMax-M3.1-Flash", "MiniMax-M3", "minimax_m3.2" }) |model| {
+        try std.testing.expect(openaiProfile(model).echoes_reasoning_content);
+    }
+    try std.testing.expect(!openaiProfile("MiniMax-M2.7").echoes_reasoning_content);
 }

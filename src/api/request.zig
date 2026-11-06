@@ -332,8 +332,8 @@ fn serializeContent(
         if (block == .reasoning_item) continue;
         // thinking 块只回传给声明了回传的方言(DeepSeek 的 Anthropic 端点收无签名的
         // thinking 块);Claude 拒收没有签名的 thinking 块,而签名没有保存。不回传时
-        // 请求字节与投影 thinking 之前逐字节相同。
-        if (block == .thinking and !profile.echoes_reasoning_content) continue;
+        // 请求字节与投影 thinking 之前逐字节相同。空的 thinking 块不是推理,不发。
+        if (block == .thinking and (!profile.echoes_reasoning_content or block.thinking.len == 0)) continue;
         if (!first) try buf.append(allocator, ',');
         first = false;
         switch (block) {

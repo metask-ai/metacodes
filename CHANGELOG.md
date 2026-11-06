@@ -29,17 +29,6 @@ status, compatibility boundaries, and entry points are defined by
   bytes change once, so their provider-side prompt cache misses on the first
   request after the upgrade.
 
-### Fixed
-
-- **DeepSeek and Kimi get their reasoning back.** DeepSeek answers 400 when a
-  request with tools lacks the `reasoning_content` of earlier turns, and Kimi's
-  documentation requires it with tool calls; neither was ever sent. The
-  conversation's thinking blocks now reach the dialect, and a dialect that
-  declares passback (`ModelProfile.echoes_reasoning_content`: DeepSeek, Kimi,
-  OpenRouter) sends them as `reasoning_content` on assistant history — or, on
-  DeepSeek's Anthropic endpoint, as thinking blocks. Every other dialect's request
-  bytes are unchanged; Claude never receives an unsigned thinking block.
-
 ### Changed
 
 - **One integration file per model vendor.** The OpenAI-compatible dialects that
@@ -60,6 +49,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **DeepSeek, Kimi and MiniMax get their reasoning back.** DeepSeek answers 400
+  when a request with tools lacks the `reasoning_content` of earlier turns, Kimi's
+  documentation requires it with tool calls, and MiniMax M3 and later ask for the
+  full response back to keep the reasoning chain; none was ever sent. The
+  conversation's thinking blocks now reach the dialect, and a dialect that
+  declares passback (`ModelProfile.echoes_reasoning_content`: DeepSeek, Kimi,
+  MiniMax M3+, OpenRouter) sends them as `reasoning_content` on assistant history
+  — or, on a route declaring DeepSeek on the Anthropic wire, as its non-empty
+  thinking blocks. Every other dialect's request bytes are unchanged; Claude
+  never receives an unsigned thinking block. A custom DeepSeek Anthropic endpoint
+  gets its thinking back only when it declares `"dialect": "deepseek"`.
 - **Kimi K2 with no reasoning effort set no longer crashes.** On the OpenAI chat
   wire the K2.6 dialect unwrapped the unset effort while writing the `thinking`
   object, which panicked in Debug and ReleaseSafe builds; it now sends

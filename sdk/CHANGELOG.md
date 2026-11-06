@@ -23,6 +23,13 @@ empty `### Migration`.
   never `disabled` to K2.7-code; DeepSeek `low` as `low`. A Run on Kimi K2 with no
   reasoning effort set no longer crashes. Other models' requests are unchanged.
   No ABI change.
+- A Run on DeepSeek, Kimi or MiniMax M3 and later sends the model's earlier
+  reasoning back (#421). The request after a tool call used to drop it, so
+  DeepSeek in thinking mode answered HTTP 400 and Kimi and MiniMax lost their
+  reasoning. On OpenAI chat they now get `reasoning_content` on assistant
+  messages; a route declaring DeepSeek on the Anthropic wire gets its thinking
+  blocks. Other models' requests are unchanged, and Claude is never sent an
+  unsigned thinking block. No ABI change.
 
 ## 0.13.0 — 2026-10-31
 
