@@ -71,6 +71,18 @@ status, compatibility boundaries, and entry points are defined by
   DeepSeek's `low` level is sent as `low` rather than `high`. A Kimi model id
   that names no generation (`kimi-latest`, `kimi-for-coding`) is now treated as
   K2.7 or later: thinking stays on, and `none` no longer sends `disabled`.
+- **Edit and rerun.** `/edit <n> <text>` edits message `n`, one you wrote,
+  and reruns from it: the conversation becomes messages `1..n-1` plus the new
+  text, and everything after the original message (later prompts, replies,
+  tool calls and results) is dropped. The transcript is rewritten, so a
+  resumed session restores the edited history. Only the conversation changes;
+  files and other effects stay. A message that is not yours, out of range, or
+  compacted into a summary is refused by name (`NotUserMessage`,
+  `PositionOutOfRange`, `PositionCompacted`) and nothing changes. `/edit`
+  alone lists the editable messages. Web and daemon take the line over
+  `POST /command`; Zig Hosts use `AgentSession.rewindToUserMessage` or
+  `SessionHost`'s `Submission.replaces`, and the wire `user_message` line
+  gains `replaces` ([doc/API.md](doc/API.md#edit-and-rerun)). (#432)
 
 ### Fixed
 
@@ -96,6 +108,12 @@ status, compatibility boundaries, and entry points are defined by
   `error: stopped (<stop_reason>): …` line to stderr, on `--resume-response`
   too. Stdout (any partial text) and the exit code are unchanged, and so is
   `--json`.
+- **One provider request lifecycle (#434).** OpenAI Chat Completions, OpenAI
+  Responses and Gemini retry a transient connect failure, a 429 or a 500/502/503
+  before the response head with the Anthropic client's policy (attempt limit,
+  backoff, Retry-After, retry notice). A cancel while the head is awaited is
+  `Aborted` on every provider, and an HTTP context-limit rejection is
+  `ContextWindowExceeded`, so the agent loop's context recovery runs.
 
 ## 0.10.0 — 2026-10-31
 

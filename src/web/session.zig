@@ -247,6 +247,17 @@ pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem
             journal.append(echo);
         }
     }
+    // `/edit <n> <text>` (issue #432): the edited text is the turn's input and
+    // `replaces` the position it took over; everything from there was dropped.
+    if (d.run != null and d.run.?.kind == .edited_prompt) {
+        if (session_service_mod.EditArgs.parse(intent.command.args)) |edit| {
+            if (stringifyJson(web_alloc, .{ .user_message = edit.text, .replaces = edit.position.ordinal() }) catch null) |echo| {
+                defer web_alloc.free(echo);
+                journal.append(echo);
+            }
+        } else |_| {} // not reached: the plan exists only for args that parsed
+
+    }
     var buf: [256]u8 = undefined;
     const msg: []const u8 = switch (d.outcome.kind) {
         .unhandled => std.fmt.bufPrint(&buf, "unsupported here: {s}", .{trimmed}) catch "unsupported command",

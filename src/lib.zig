@@ -26,6 +26,7 @@ pub const workspace_policy = @import("core/workspace_policy.zig");
 pub const conversation = @import("core/conversation.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
 pub const compact_kernel = @import("core/compact_kernel.zig");
+pub const compaction_control = @import("core/compaction_control.zig"); // durable-state owner seam into Run compaction (#430)
 pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");

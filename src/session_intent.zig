@@ -34,6 +34,7 @@ pub const BUILTIN_VERBS = [_]VerbSpec{
     .{ .name = "vim", .class = .service },
     .{ .name = "effort", .class = .service },
     .{ .name = "retry", .class = .service },
+    .{ .name = "edit", .class = .service }, // edit user message n and rerun from it (issue #432)
     .{ .name = "commit", .class = .service },
     .{ .name = "review", .class = .service },
     .{ .name = "init", .class = .service },

@@ -130,15 +130,48 @@ share one input pipeline (`src/session_intent.zig` + `src/session_service.zig`):
   commands themselves.
 - **Service verbs** (equivalent across hosts): `/model use <id>`, `/mode
   [name]`, `/effort <level>`, `/compact`, `/add-dir <path>`, `/theme <v>`,
-  `/vim`, `/retry`, `/commit`, `/review`, `/init`, plus prompt and `!cmd`
-  submission. Web/daemon reach them via `POST /command` (queued to the driver
-  thread; result arrives as a `command_result` journal event, run-producing
-  commands then execute a normal agent run). Display-only verbs (`/help`,
+  `/vim`, `/retry`, `/edit <n> <text>`, `/commit`, `/review`, `/init`, plus
+  prompt and `!cmd` submission. Web/daemon reach them via `POST /command`
+  (queued to the driver thread; result arrives as a `command_result` journal
+  event, run-producing commands then execute a normal agent run). Display-only verbs (`/help`,
   `/tools`, …) are terminal-rendered; web/daemon report them as unsupported.
 - **Run assembly.** `session_service.buildRunOptions` is the only place App
   state is projected into `agent_loop.Options`; hosts add only host-specific
   fields (UI requester, run-control observers, budgets).
 - Equivalence is locked by `tests/component/session_api_parity_test.zig`.
+
+### Edit and rerun
+
+`/edit <n> <text>` edits message `n` of the conversation, one the user wrote,
+and reruns from it (#432). Messages are numbered from 1 over the whole
+history, compacted ones included. The conversation becomes messages
+`1..n-1` followed by `text`, and a run answers it. The original message `n`
+and everything after it are dropped: later prompts, replies, tool calls and
+tool results. They are discarded, not kept as a branch. In the terminal,
+`/edit` alone lists the messages that can be edited with their numbers.
+
+- **Persistence.** Dropping messages rewrites the transcript from the live
+  conversation at its next flush (the rewrite `/retry` uses), so a resumed
+  session has the edited history, never the dropped one.
+- **Refusals** change nothing and run nothing. Each names its reason
+  (`conversation.RewindError`): `PositionOutOfRange` (no message `n`),
+  `NotUserMessage` (a reply, a tool result, or text the runtime wrote),
+  and `PositionCompacted` (the message is behind the compact boundary, so the
+  context before it exists only as a summary and cannot be rerun). A message
+  at or after the boundary can be edited; the summary stays its preceding
+  context, as in every request since the compaction. The command line also
+  refuses a number that is not a positive integer (`InvalidPosition`) and a
+  missing text.
+- **Context only.** Files written, commands run and other effects of the
+  dropped turns stay. The must-read-first record is cleared (as by `/clear`),
+  since the rerun's context no longer shows what was read.
+- **Hosts.** `POST /command` takes the same line; the turn's input is
+  journaled as `{"user_message":"<text>","replaces":n}`. A Zig Host calls
+  `AgentSession.rewindToUserMessage(position)` while idle and then runs the
+  edited text; `SessionHost` does both for a submission with `.replaces`
+  (see [SessionHost](#sessionhost-a-multi-session-service-for-network-hosts)).
+  AgentCore revision 26 has no edit-and-rerun entry; the
+  Conversation in its checkpoint is what an `AgentSession` holds.
 
 This is an internal-consistency contract, not yet a wire-protocol stability
 promise: the HTTP endpoint shapes remain pre-1.0.
@@ -941,7 +974,9 @@ queued: a message sent during a turn appears after that turn's `run_done`.
 tool), are wire v1 lines whose `data` holds one of `model`, `mode`, `dirs`,
 `reasoning` or `route`. The other host lines (`user_message`, `run_done`,
 `command_result`, `message_rejected`, `session_lifecycle`) keep their
-`{"<name>":...}` shape.
+`{"<name>":...}` shape. A `user_message` from `/edit <n> <text>` adds one
+sibling key, `{"user_message":"<text>","replaces":n}`: the conversation
+before the turn is messages `1..n-1` ([Edit and rerun](#edit-and-rerun)).
 
 `GET /state` (`/s/<id>/state`) is the snapshot a client reconciles with after
 connecting or reconnecting:
@@ -971,6 +1006,16 @@ leaving every Host to rebuild them:
   Session's state root). A fresh open under an id that has a transcript
   replaces that transcript at once. `open` and `acquire` return a counted
   reference; `release` gives it back.
+- `HostedSession.submit(.{ .text, .trace_id, .replaces })` queues a Run.
+  With `.replaces` (a `conversation.MessagePosition`, from
+  `MessagePosition.fromOrdinal(n)`), the text replaces user message `n`: just
+  before the Run the driver drops that message and everything after it
+  (`AgentSession.rewindToUserMessage`), so the Run sees messages `1..n-1`
+  plus the text, and the transcript and a later `open(.resume)` hold that
+  history ([Edit and rerun](#edit-and-rerun)). The `user_message` line
+  carries `"replaces":n`; a refused position ends the Run with `run_done`
+  naming it (`PositionOutOfRange`, `NotUserMessage`, `PositionCompacted`)
+  and changes nothing.
 - `HostedSession.submit` and `command` (`set_model`, `set_permission_mode`,
   `set_reasoning_effort`, `set_additional_directories`, `set_prompt_profile`,
   `update_permission_rules`, `compact`) share one FIFO run by the Session's
@@ -1026,8 +1071,12 @@ compatibility shim between revisions: pin a bundle, not only a semantic version.
 What the seven tables cover, provider protocol selection, the `on_event`
 observation stream and its visible-output tags, input submitted to an active
 Run (`session->submit_input`, the `input_adopted` event and the `RunResultV1`
-input counts), the structured reason a Run stopped with `STOP_API_ERROR` (the
-`model_error` event), the in-place credential update (`session->update_credential`), the Session goal (the `goal` table, goal-continuation Runs, the
+input counts), automatic compaction inside a Run (the model window, a
+provider's context-window refusal and checkpoint capacity each compact the
+Conversation at a safe boundary and the same Run continues; the summary
+request is budgeted and the replacement commits only if the checkpoint fits —
+the `auto_compact` event and its `cause`), the structured reason a Run stopped
+with `STOP_API_ERROR` (the `model_error` event), the in-place credential update (`session->update_credential`), the Session goal (the `goal` table, goal-continuation Runs, the
 `goal_updated` event), the host-scheduled team (`enable_teams`, the `team`
 config, and the `team` table's `describe` and `poll`), the Workspace Skill
 catalog and its source priorities (`SkillSourceV1.priority` and the query's

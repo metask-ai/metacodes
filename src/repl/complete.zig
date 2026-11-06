@@ -85,6 +85,7 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/config", .desc = "Show configuration" },
     .{ .name = "/cost", .desc = "Show token usage and cost" },
     .{ .name = "/doctor", .desc = "Diagnose the installation and configuration" },
+    .{ .name = "/edit", .desc = "Edit one of your messages and rerun from it", .hint = "<n> <text>", .takes_args = true },
     .{ .name = "/effort", .desc = "Show or set reasoning effort" },
     .{ .name = "/exit", .desc = "Exit metacodes" },
     .{ .name = "/goal", .desc = "View or manage the session goal" },

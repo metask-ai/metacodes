@@ -358,6 +358,20 @@ pub fn noteStreamFailure(category: Category, retry: Retry, message: []const u8) 
     detail.message.set(message, capture.credential);
 }
 
+/// The Run stops on a context-window rejection that automatic compaction could
+/// not recover from. The provider's own rejection stays the reported failure
+/// when it is still the latest one; when a later recovery request replaced or
+/// cleared it (a summary request that succeeded, or failed for another
+/// reason), the failure the Run stops on is recorded as what it is.
+pub fn noteContextWindowUnrecovered(message: []const u8) void {
+    const capture = active orelse return;
+    if (capture.has_failure and capture.failure.category == .context_window) return;
+    const detail = capture.fresh();
+    detail.category = .context_window;
+    detail.retry = .not_retryable;
+    detail.message.set(message, capture.credential);
+}
+
 /// `agent_loop`'s net under the clients: a failed send nobody described.
 pub fn noteRequestError(err: anyerror) void {
     const capture = active orelse return;
