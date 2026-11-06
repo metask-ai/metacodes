@@ -26,21 +26,15 @@ status, compatibility boundaries, and entry points are defined by
   scheme to the session, a `/model` switch, child agents, swarm teammates and
   `AgentSession`. A route that declares nothing keeps model-name inference, so
   existing configurations behave as before; an unknown value fails the definition.
+  A model's declaration covers that model only: a child agent, teammate or
+  Session model switch onto another model of the same route keeps the route's
+  declaration or infers from its own name.
 - **OpenRouter's own request surface.** Offers ingested from an OpenRouter catalog
   declare the new OpenRouter dialect: `reasoning: {effort}` and `delta.reasoning`,
   whatever the upstream model is called. A `deepseek/...` model through OpenRouter
-  no longer gets DeepSeek's native `thinking` fields.
-
-### Fixed
-
-- **DeepSeek and Kimi get their reasoning back.** DeepSeek answers 400 when a
-  request with tools lacks the `reasoning_content` of earlier turns, and Kimi's
-  documentation requires it with tool calls; neither was ever sent. The
-  conversation's thinking blocks now reach the dialect, and a dialect that
-  declares passback (`ModelProfile.echoes_reasoning_content`: DeepSeek, Kimi,
-  OpenRouter) sends them as `reasoning_content` on assistant history — or, on
-  DeepSeek's Anthropic endpoint, as thinking blocks. Every other dialect's request
-  bytes are unchanged; Claude never receives an unsigned thinking block.
+  no longer gets DeepSeek's native `thinking` fields. OpenRouter routes' request
+  bytes change once, so their provider-side prompt cache misses on the first
+  request after the upgrade.
 
 ### Changed
 
@@ -56,7 +50,27 @@ status, compatibility boundaries, and entry points are defined by
   (the API accepts only `disabled` / `adaptive`), M3.1 sends its `reasoning_effort`,
   and every MiniMax model asks for `reasoning_split`. Kimi K2.6 no longer puts an
   `effort` in its `thinking` object, and K2.7-code never sends `disabled`.
-  DeepSeek's `low` level is sent as `low` rather than `high`.
+  DeepSeek's `low` level is sent as `low` rather than `high`. A Kimi model id
+  that names no generation (`kimi-latest`, `kimi-for-coding`) is now treated as
+  K2.7 or later: thinking stays on, and `none` no longer sends `disabled`.
+
+### Fixed
+
+- **DeepSeek, Kimi and MiniMax get their reasoning back.** DeepSeek answers 400
+  when a request with tools lacks the `reasoning_content` of earlier turns, Kimi's
+  documentation requires it with tool calls, and MiniMax M3 and later ask for the
+  full response back to keep the reasoning chain; none was ever sent. The
+  conversation's thinking blocks now reach the dialect, and a dialect that
+  declares passback (`ModelProfile.echoes_reasoning_content`: DeepSeek, Kimi,
+  MiniMax M3+, OpenRouter) sends them as `reasoning_content` on assistant history
+  — or, on a route declaring DeepSeek on the Anthropic wire, as its non-empty
+  thinking blocks. Every other dialect's request bytes are unchanged; Claude
+  never receives an unsigned thinking block. A custom DeepSeek Anthropic endpoint
+  gets its thinking back only when it declares `"dialect": "deepseek"`.
+- **Kimi K2 with no reasoning effort set no longer crashes.** On the OpenAI chat
+  wire the K2.6 dialect unwrapped the unset effort while writing the `thinking`
+  object, which panicked in Debug and ReleaseSafe builds; it now sends
+  `{"type":"enabled","keep":"all"}`.
 
 ## 0.10.0 — 2026-10-31
 

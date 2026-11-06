@@ -782,12 +782,14 @@ test "a declared dialect lands on the route and the model; an unknown one is an 
     try testing.expect(built.models[0].dialect == null);
     try testing.expectEqual(Vendor.openrouter, built.models[1].dialect.?);
 
-    // A model's declaration outranks its route's in the offer.
+    // A model's declaration outranks its route's for that model.
     var catalog = try @import("registry.zig").OfferCatalog.build(a, &.{built}, .{});
     defer catalog.deinit();
     for (catalog.items()) |item| {
         const want: Vendor = if (std.mem.eql(u8, item.request_model_id, "n")) .openrouter else .deepseek;
-        try testing.expectEqual(want, item.dialect.?);
+        try testing.expectEqual(want, item.dialect.bound().?);
+        // The route's part stays apart: it is what another model inherits.
+        try testing.expectEqual(Vendor.deepseek, item.dialect.route.?);
     }
 
     inline for (.{ "\"DeepSeek\"", "\"anthropic\"", "3" }) |bad| {
