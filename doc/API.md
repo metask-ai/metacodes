@@ -297,7 +297,10 @@ resolve against the current provider's tier table in
 }
 ```
 
-The table is keyed by provider kind (`anthropic`/`openai`/`gemini`) so one
+The table is keyed by provider kind (`anthropic`/`openai`/`gemini`/`bedrock`;
+`bedrock` serves every route on the Bedrock Converse wire, whose tier models
+are Bedrock model or inference-profile ids such as
+`us.anthropic.claude-haiku-4-5-20251001-v1:0`) so one
 user-level file serves any `--provider` session without cross-provider model
 injection. An unconfigured tier inherits the session model and effort — there
 are no built-in per-provider model IDs. A tier's optional `effort` is the

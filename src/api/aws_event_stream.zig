@@ -172,6 +172,11 @@ pub fn decode(frame: []const u8, headers_buf: *[MAX_HEADERS]Header) DecodeError!
 
 pub const ReadError = DecodeError || std.Io.Reader.Error || std.mem.Allocator.Error || error{TruncatedFrame};
 
+/// How much of a frame is read (and buffered) at a time. The buffer grows
+/// with the bytes that actually arrive, not with the length the prelude
+/// declares: a prelude claiming 16 MiB costs nothing until 16 MiB come.
+pub const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Read the next whole frame from `reader` into memory owned by the caller
 /// (free with `allocator`). Null at a clean end of stream — no byte of a new
 /// frame arrived; a frame cut short is `TruncatedFrame`.
@@ -183,14 +188,22 @@ pub fn readFrame(reader: *std.Io.Reader, allocator: std.mem.Allocator) ReadError
     if (got == 0) return null;
     if (got < prelude.len) return error.TruncatedFrame;
     const total = try frameLength(&prelude);
-    const frame = try allocator.alloc(u8, total);
-    errdefer allocator.free(frame);
-    @memcpy(frame[0..12], &prelude);
-    reader.readSliceAll(frame[12..]) catch |err| switch (err) {
-        error.EndOfStream => return error.TruncatedFrame,
-        error.ReadFailed => return error.ReadFailed,
-    };
-    return frame;
+    var frame: std.ArrayList(u8) = .empty;
+    errdefer frame.deinit(allocator);
+    try frame.ensureTotalCapacityPrecise(allocator, @min(total, READ_CHUNK_BYTES));
+    frame.appendSliceAssumeCapacity(&prelude);
+    while (frame.items.len < total) {
+        if (frame.unusedCapacitySlice().len == 0)
+            try frame.ensureUnusedCapacity(allocator, @min(total - frame.items.len, READ_CHUNK_BYTES));
+        const free = frame.unusedCapacitySlice();
+        const want = @min(total - frame.items.len, free.len);
+        reader.readSliceAll(free[0..want]) catch |err| switch (err) {
+            error.EndOfStream => return error.TruncatedFrame,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        frame.items.len += want;
+    }
+    return try frame.toOwnedSlice(allocator);
 }
 
 /// Encode a frame with string headers. Test fixtures and mock servers use it;
@@ -293,6 +306,33 @@ test "readFrame splits a byte stream into frames and reports truncation" {
     const whole = (try readFrame(&cut, a)).?;
     a.free(whole);
     try std.testing.expectError(error.TruncatedFrame, readFrame(&cut, a));
+}
+
+test "readFrame buffers what arrives, not what the prelude declares" {
+    // A prelude declaring a 16 MiB frame followed by a few bytes: the read
+    // fails as truncated without ever holding 16 MiB.
+    var prelude: [12]u8 = undefined;
+    std.mem.writeInt(u32, prelude[0..4], MAX_FRAME_BYTES, .big);
+    std.mem.writeInt(u32, prelude[4..8], 0, .big);
+    std.mem.writeInt(u32, prelude[8..12], std.hash.Crc32.hash(prelude[0..8]), .big);
+    const bytes = prelude ++ [_]u8{0} ** 100;
+    var reader: std.Io.Reader = .fixed(&bytes);
+    // Counting every byte ever allocated proves nothing larger was asked for.
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try std.testing.expectError(error.TruncatedFrame, readFrame(&reader, counting.allocator()));
+    try std.testing.expect(counting.allocated_bytes <= READ_CHUNK_BYTES);
+
+    // A large frame that does arrive is read whole, across chunks.
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 3 * READ_CHUNK_BYTES + 7);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const big = try encode(a, &.{.{ ":event-type", "chunk" }}, payload);
+    defer a.free(big);
+    var big_reader: std.Io.Reader = .fixed(big);
+    const got = (try readFrame(&big_reader, a)).?;
+    defer a.free(got);
+    try std.testing.expectEqualSlices(u8, big, got);
 }
 
 test "a declared length beyond the cap is corruption, not an allocation" {

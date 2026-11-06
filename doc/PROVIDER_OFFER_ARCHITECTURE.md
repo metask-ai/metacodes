@@ -138,8 +138,12 @@ returns 400 without them once tools are present; Kimi, whose documentation
 requires them with tool calls; MiniMax M3 and later, which ask for the full
 response back; and OpenRouter), and every
 other dialect leaves the request bytes exactly as before. Claude never receives
-an unsigned thinking block. Bedrock keeps the *signed* reasoning of a tool turn
-in its client and puts it back in front of that turn.
+an unsigned thinking block. On Bedrock the stream hands each *signed* reasoning
+block to the conversation as a provider-private `reasoning_item` (its Converse
+JSON, verbatim, gated by model name), which the transcript and the AgentCore
+checkpoint keep; the next request for the same model writes the same bytes
+back at the head of their assistant message, so the signature survives a
+resume and the cached prefix stays byte-identical.
 
 ## Amazon Bedrock
 
@@ -149,6 +153,8 @@ checked) instead of SSE. Like Gemini, the channel declares an origin and the
 transport appends `/model/{modelId}/converse-stream`. The built-in `bedrock`
 profile has one channel per region and authenticates with a Bedrock API key
 (`AWS_BEARER_TOKEN_BEDROCK`, sent as a bearer); SigV4 is not implemented.
+Each channel names the inference profiles its Region can call (Tokyo:
+`jp.` for Sonnet 4.6, `global.` for Opus 4.6, which has no Japan profile).
 
 The authoritative model list of an account is its catalog, ingested the way
 OpenRouter's is: ListFoundationModels and ListInferenceProfiles documents
@@ -903,7 +909,7 @@ see *Stored API keys and the guided key login*).
 | `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
 | `src/api/dialects/<vendor>.zig` | one vendor's dialect; its header is the integration document |
 | `src/api/dialects/registry.zig` | vendor → dialect file, name inference, the header contract test |
-| `src/api/bedrock_client.zig` | Bedrock Converse transport, signed-reasoning store |
+| `src/api/bedrock_client.zig` | Bedrock Converse transport |
 | `src/api/aws_event_stream.zig` | AWS event-stream framing (decode, CRC checks) |
 | `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
 | `src/provider/api_key_store.zig` | provider-scoped API keys at rest, one 0600 file per provider |
@@ -950,9 +956,10 @@ omission — and none of them is an acceptance criterion of the issue.
   a Bedrock API key only; access keys, session tokens and `~/.aws` profiles
   need request signing, which is not written.
 - **Bedrock over the AgentCore C ABI and to sealed Skills.** ABI v1 has no
-  provider code for Bedrock (adding one is an ABI revision), and the sealed
-  gateway's route spec does not carry the declared dialect, so a sealed Skill
-  on a declared route falls back to model-name inference.
+  provider code for Bedrock (adding one is an ABI revision), and SSP/1's
+  `provider.kind` has no Bedrock value, so a Bedrock session cannot delegate
+  to a sealed Skill gateway: the client refuses it as an undelegable route
+  and the gateway refuses the kind (`doc/SEALED_SKILL_PROTOCOL.md` §3.4).
 - **Thinking fields for non-Claude models on Bedrock.** DeepSeek, Qwen, Kimi
   and MiniMax on Bedrock think by their own defaults; only Claude and gpt-oss
   get fields in `additionalModelRequestFields`.

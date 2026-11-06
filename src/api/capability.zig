@@ -38,11 +38,14 @@ pub fn supports(kind: ProviderKind, model: []const u8, cap: Capability) bool {
 
 /// Bedrock Converse: tools, structured output via tools, cache points on
 /// Claude, reasoning returned as `reasoningContent` blocks (not a peer field).
+/// The vendor is the one the dialect reads from the model id (a client with a
+/// declared vendor answers from the declaration, `BedrockClient.supportsForModel`).
 fn bedrockSupports(model: []const u8, cap: Capability) bool {
+    const bedrock = @import("dialects/bedrock.zig");
     return switch (cap) {
-        .prompt_cache => hasSubstr(model, "claude"),
+        .prompt_cache => bedrock.supportsCachePoints(null, model),
         .web_search, .server_tool => false,
-        .extended_thinking => hasSubstr(model, "claude"),
+        .extended_thinking => bedrock.supportsThinking(null, model),
         .structured_output => false,
         .reasoning_content => false,
         .image_input => model_adapter.profileFor(.bedrock, model).supports_image_input,

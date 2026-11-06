@@ -15,11 +15,12 @@
 //!   `:message-type exception` frames.
 //!
 //! Thinking passback: Claude on Bedrock requires the previous assistant turn's
-//! reasoning blocks, signatures intact, while a tool loop is in progress. The
-//! conversation keeps thinking text but not signatures, so this client keeps
-//! them itself (`ReasoningStore`): the reasoning of a response is stored under
-//! that response's first tool-use id and put back in front of the assistant
-//! message carrying that id.
+//! reasoning blocks, signatures intact and in order, while a tool loop is in
+//! progress. The stream hands each signed `reasoningContent` block to the
+//! agent loop as a `reasoning_item` (its Converse JSON, verbatim), which the
+//! conversation keeps — in the transcript and the AgentCore checkpoint too —
+//! at the head of its assistant message; the serializer writes the same bytes
+//! back for the same model. Nothing about a conversation lives in this client.
 
 const std = @import("std");
 const http = std.http;
@@ -49,6 +50,7 @@ const auth_header_mod = @import("auth_header.zig");
 const event_stream = @import("aws_event_stream.zig");
 const secure = @import("../util/secure.zig");
 const model_limits_table = @import("../util/model.zig");
+const error_class = @import("error_class.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("../app/model_context.zig");
 
@@ -59,65 +61,10 @@ const UsageDelta = api_stream.UsageDelta;
 
 pub const DEFAULT_BEDROCK_BASE = "https://bedrock-runtime.us-east-1.amazonaws.com";
 
-/// Reasoning blocks of one response, as Converse request JSON
-/// (`{"reasoningContent":{...}},...`), keyed by the response's first tool-use
-/// id. Owned; bounded so a long session cannot grow it without limit.
-pub const ReasoningStore = struct {
-    allocator: std.mem.Allocator,
-    mutex: sync.Mutex = .{},
-    entries: std.StringArrayHashMapUnmanaged([]u8) = .empty,
-
-    /// Only the turn in progress needs its reasoning back; a handful covers
-    /// parallel subagents sharing one client.
-    pub const MAX_ENTRIES: usize = 64;
-
-    pub fn init(allocator: std.mem.Allocator) ReasoningStore {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *ReasoningStore) void {
-        var it = self.entries.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.entries.deinit(self.allocator);
-    }
-
-    /// Takes ownership of neither argument; copies both.
-    pub fn put(self: *ReasoningStore, tool_use_id: []const u8, blocks_json: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.entries.count() >= MAX_ENTRIES) {
-            const oldest_key = self.entries.keys()[0];
-            const oldest_value = self.entries.values()[0];
-            self.entries.orderedRemoveAt(0);
-            self.allocator.free(oldest_key);
-            self.allocator.free(oldest_value);
-        }
-        const value = try self.allocator.dupe(u8, blocks_json);
-        errdefer self.allocator.free(value);
-        if (self.entries.getPtr(tool_use_id)) |existing| {
-            self.allocator.free(existing.*);
-            existing.* = value;
-            return;
-        }
-        const key = try self.allocator.dupe(u8, tool_use_id);
-        errdefer self.allocator.free(key);
-        try self.entries.put(self.allocator, key, value);
-    }
-
-    /// Appends the stored blocks for `tool_use_id` (followed by a comma) to
-    /// `out`; false when there are none.
-    pub fn appendFor(self: *ReasoningStore, tool_use_id: []const u8, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const blocks = self.entries.get(tool_use_id) orelse return false;
-        try out.appendSlice(a, blocks);
-        try out.append(a, ',');
-        return true;
-    }
-};
+/// How a replayable reasoning block starts: the Converse content block, as the
+/// stream wrote it into a `reasoning_item`. Anything else in a `reasoning_item`
+/// (an OpenAI Responses item, say) is not this wire's and is never sent.
+pub const REASONING_ITEM_PREFIX = "{\"reasoningContent\":";
 
 pub const BedrockClient = struct {
     allocator: std.mem.Allocator,
@@ -142,7 +89,6 @@ pub const BedrockClient = struct {
     declared_dialect: dialect_mod.DialectDeclaration = .{},
     catalog: ?catalog_mod.Catalog = null,
     host_capabilities: image_capability.Declarations = .{},
-    reasoning: ReasoningStore,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) BedrockClient {
         return .{
@@ -153,13 +99,11 @@ pub const BedrockClient = struct {
             .http_client = http.Client{ .allocator = allocator, .io = io },
             .stream_idle_timeout_ms = client_mod.streamIdleTimeoutMsFromEnv(),
             .stream_body_idle_timeout_ms = client_mod.streamBodyIdleTimeoutMsFromEnv(),
-            .reasoning = ReasoningStore.init(allocator),
         };
     }
 
     pub fn deinit(self: *BedrockClient) void {
         self.abort_registry.deinit(self.allocator);
-        self.reasoning.deinit();
         self.http_client.deinit();
         if (self.catalog) |*catalog| catalog.deinit();
         self.host_capabilities.deinit();
@@ -279,7 +223,6 @@ pub const BedrockClient = struct {
             .max_tokens = self.maxTokensFor(model),
             .dialect = self.dialectFor(model),
             .declared = self.declared_dialect.vendorFor(self.model, model),
-            .reasoning = &self.reasoning,
         }, &report);
         defer self.allocator.free(body);
         const placeholder_ids = try report.placeholder_ids.toOwnedSlice(self.allocator);
@@ -300,9 +243,14 @@ pub const BedrockClient = struct {
         return dialect;
     }
 
+    /// The route's declared vendor decides what the dialect sends; the
+    /// capability answers follow the same vendor, not a substring of the id.
     pub fn supportsForModel(self: *const BedrockClient, cap: provider_mod.Capability, model: []const u8) bool {
+        const declared = self.declared_dialect.vendorFor(self.model, model);
         return switch (cap) {
             .image_input => self.dialectFor(model).profileFor(.bedrock, model).supports_image_input,
+            .prompt_cache => bedrock_dialect.supportsCachePoints(declared, model),
+            .extended_thinking => bedrock_dialect.supportsThinking(declared, model),
             else => capability.supports(.bedrock, model, cap),
         };
     }
@@ -385,7 +333,6 @@ pub const BedrockClient = struct {
             .abort_registry = &self.abort_registry,
             .id = rid,
             .credential = client_mod.credentialPrint(auth.value),
-            .reasoning_store = &self.reasoning,
         };
         return heap.handle();
     }
@@ -421,34 +368,72 @@ pub const ConverseRequest = struct {
     max_tokens: u32,
     dialect: dialect_mod.Dialect,
     declared: ?dialect_mod.Vendor = null,
-    /// Reasoning to put back in front of assistant tool turns; null keeps none.
-    reasoning: ?*ReasoningStore = null,
 };
+
+const CACHE_POINT = "{\"cachePoint\":{\"type\":\"default\"}}";
 
 /// Neutral conversation → Converse request body. Caller frees.
 pub fn serializeConverseRequest(allocator: std.mem.Allocator, req: ConverseRequest, report: *json_mod.SerializationReport) ![]u8 {
     const profile = req.dialect.profileFor(.bedrock, req.model);
     const cache_points = bedrock_dialect.supportsCachePoints(req.declared, req.model);
+
+    // Tools with a Converse form, and whether the caller's toolChoice forces one.
+    var converse_tools: usize = 0;
+    if (req.tools) |tools| for (tools) |t| {
+        if (t.server_type == null) converse_tools += 1; // Anthropic server tools have no Converse form
+    };
+    const tool_choice: ?json_mod.ToolChoice = if (converse_tools > 0) req.overrides.tool_choice else null;
+
+    // The thinking fields first: what they may share the request with decides
+    // the members written before them.
+    var additional: std.ArrayList(u8) = .empty;
+    defer additional.deinit(allocator);
+    const plan = try bedrock_dialect.serializeAdditionalFields(req.dialect, req.declared, req.model, req.overrides.reasoning_effort, .{
+        .max_tokens = req.max_tokens,
+        .sampling = req.overrides.temperature != null or req.overrides.top_p != null,
+        .forced_tool = if (tool_choice) |tc| forcesTool(tc) else false,
+    }, &additional, allocator);
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     try out.appendSlice(allocator, "{\"messages\":[");
-    var first_message = true;
+    var last_role: ?types.MessageRole = null;
     for (req.messages) |m| {
         const mark = out.items.len;
-        if (!first_message) try out.append(allocator, ',');
-        try out.appendSlice(allocator, if (m.role == .user) "{\"role\":\"user\",\"content\":[" else "{\"role\":\"assistant\",\"content\":[");
+        // Two messages of one role in a row become one (a message in between
+        // had nothing this wire sends): reopen the previous message's list.
+        const merging = last_role == m.role;
+        if (merging) {
+            out.items.len -= 2; // `]}`
+            try out.append(allocator, ',');
+        } else {
+            if (last_role != null) try out.append(allocator, ',');
+            try out.appendSlice(allocator, if (m.role == .user) "{\"role\":\"user\",\"content\":[" else "{\"role\":\"assistant\",\"content\":[");
+        }
         const blocks_start = out.items.len;
         try serializeContent(allocator, &out, m, req, profile, report);
         if (out.items.len == blocks_start) {
             // Converse rejects a message with no blocks; such a message carried
             // only content this wire does not send (a lone thinking block).
-            out.shrinkRetainingCapacity(mark);
+            if (merging) {
+                out.shrinkRetainingCapacity(mark - 2);
+                try out.appendSlice(allocator, "]}");
+            } else {
+                out.shrinkRetainingCapacity(mark);
+            }
             continue;
         }
-        if (out.items[out.items.len - 1] == ',') out.items.len -= 1;
+        out.items.len -= 1; // the last block's `,`
         try out.appendSlice(allocator, "]}");
-        first_message = false;
+        last_role = m.role;
+    }
+    // The conversation's own cache point, at the end of the last message, so
+    // the next request of the loop reads the history back (the system and
+    // tools points below cover the rest: 3 of the 4 Bedrock allows).
+    if (cache_points and last_role != null) {
+        out.items.len -= 2;
+        try out.appendSlice(allocator, "," ++ CACHE_POINT ++ "]}");
     }
     try out.append(allocator, ']');
 
@@ -461,27 +446,30 @@ pub fn serializeConverseRequest(allocator: std.mem.Allocator, req: ConverseReque
         try out.appendSlice(allocator, ",\"system\":[{\"text\":");
         try util_json.serializeString(system_buf.items, &out, allocator);
         try out.append(allocator, '}');
-        if (cache_points) try out.appendSlice(allocator, ",{\"cachePoint\":{\"type\":\"default\"}}");
+        if (cache_points) try out.appendSlice(allocator, "," ++ CACHE_POINT);
         try out.append(allocator, ']');
     }
 
     try out.print(allocator, ",\"inferenceConfig\":{{\"maxTokens\":{d}", .{req.max_tokens});
-    if (req.overrides.temperature) |t| {
-        try out.appendSlice(allocator, ",\"temperature\":");
-        try util_json.serializeNumber(t, &out, allocator);
-    }
-    if (req.overrides.top_p) |p| {
-        try out.appendSlice(allocator, ",\"topP\":");
-        try util_json.serializeNumber(p, &out, allocator);
+    if (plan.sampling) {
+        if (req.overrides.temperature) |t| {
+            try out.appendSlice(allocator, ",\"temperature\":");
+            try util_json.serializeNumber(t, &out, allocator);
+        }
+        if (req.overrides.top_p) |p| {
+            try out.appendSlice(allocator, ",\"topP\":");
+            try util_json.serializeNumber(p, &out, allocator);
+        }
     }
     try out.append(allocator, '}');
 
-    if (req.tools) |tools| {
-        var any = false;
-        for (tools) |t| {
-            if (t.server_type != null) continue; // Anthropic server tools have no Converse form
-            try out.appendSlice(allocator, if (any) "," else ",\"toolConfig\":{\"tools\":[");
-            any = true;
+    if (converse_tools > 0) {
+        try out.appendSlice(allocator, ",\"toolConfig\":{\"tools\":[");
+        var first = true;
+        for (req.tools.?) |t| {
+            if (t.server_type != null) continue;
+            if (!first) try out.append(allocator, ',');
+            first = false;
             try out.appendSlice(allocator, "{\"toolSpec\":{\"name\":");
             try util_json.serializeString(t.name, &out, allocator);
             try out.appendSlice(allocator, ",\"description\":");
@@ -490,17 +478,14 @@ pub fn serializeConverseRequest(allocator: std.mem.Allocator, req: ConverseReque
             try @import("request.zig").serializeInputSchema(t.input_schema, &out, allocator);
             try out.appendSlice(allocator, "}}}");
         }
-        if (any) {
-            if (cache_points) try out.appendSlice(allocator, ",{\"cachePoint\":{\"type\":\"default\"}}");
-            try out.append(allocator, ']');
-            if (req.overrides.tool_choice) |tc| try serializeToolChoice(allocator, &out, tc);
-            try out.append(allocator, '}');
-        }
+        if (cache_points) try out.appendSlice(allocator, "," ++ CACHE_POINT);
+        try out.append(allocator, ']');
+        // A model that thinks whatever is sent cannot be forced to a tool
+        // (AWS: thinking supports auto and none only); it chooses itself.
+        if (tool_choice) |tc| if (plan.forced_tool or !forcesTool(tc)) try serializeToolChoice(allocator, &out, tc);
+        try out.append(allocator, '}');
     }
 
-    var additional: std.ArrayList(u8) = .empty;
-    defer additional.deinit(allocator);
-    try bedrock_dialect.serializeAdditionalFields(req.dialect, req.model, req.overrides.reasoning_effort, &additional, allocator);
     if (additional.items.len > 0) {
         try out.appendSlice(allocator, ",\"additionalModelRequestFields\":{");
         try out.appendSlice(allocator, additional.items);
@@ -508,6 +493,12 @@ pub fn serializeConverseRequest(allocator: std.mem.Allocator, req: ConverseReque
     }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
+}
+
+/// `any` / `required` / a named tool: the choices thinking cannot share a
+/// request with.
+fn forcesTool(tc: json_mod.ToolChoice) bool {
+    return std.mem.eql(u8, tc.type, "any") or std.mem.eql(u8, tc.type, "required") or std.mem.eql(u8, tc.type, "tool");
 }
 
 fn serializeToolChoice(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tc: json_mod.ToolChoice) !void {
@@ -534,16 +525,16 @@ fn serializeContent(
     profile: dialect_mod.ModelProfile,
     report: *json_mod.SerializationReport,
 ) !void {
-    if (m.role == .assistant) if (req.reasoning) |store| {
-        for (m.content) |c| switch (c) {
-            .tool_use => |tu| {
-                _ = try store.appendFor(tu.id, out, allocator);
-                break;
-            },
-            else => {},
-        };
-    };
     for (m.content) |c| switch (c) {
+        // Signed reasoning, verbatim, where the conversation keeps it (the
+        // head of its assistant message); only this model's, only this wire's.
+        .reasoning_item => |item| {
+            if (m.role != .assistant) continue;
+            if (!std.mem.eql(u8, item.model, req.model)) continue;
+            if (!std.mem.startsWith(u8, item.json, REASONING_ITEM_PREFIX)) continue;
+            try out.appendSlice(allocator, item.json);
+            try out.append(allocator, ',');
+        },
         .text => |t| {
             if (t.len == 0) continue; // Converse rejects a blank text block
             try out.appendSlice(allocator, "{\"text\":");
@@ -590,9 +581,9 @@ fn serializeContent(
             if (tr.is_error) try out.appendSlice(allocator, ",\"status\":\"error\"");
             try out.appendSlice(allocator, "}},");
         },
-        // Unsigned thinking cannot be replayed on Bedrock; the signed copy
-        // comes from the reasoning store above.
-        .thinking, .reasoning_item => {},
+        // Unsigned thinking text cannot be replayed on Bedrock; the signed
+        // block travels as the `reasoning_item` above.
+        .thinking => {},
     };
 }
 
@@ -625,18 +616,32 @@ const BedrockStream = struct {
     id: log.RequestId,
     credential: ?model_error.SecretPrint,
     image_placeholder_ids: []const []const u8 = &.{},
-    reasoning_store: ?*ReasoningStore = null,
     done: bool = false,
     last_stop: StopReason = .unknown,
     stop_reported: bool = false,
     tools: std.ArrayList(ToolBlock) = .empty,
     reasoning: std.ArrayList(ReasoningBlock) = .empty,
-    first_tool_id: ?[]u8 = null,
+    /// A text or tool-use block has started: reasoning after it is not at the
+    /// head of the message and is not handed on for replay (moving it there
+    /// would reorder the model's blocks; dropping trailing ones is allowed).
+    content_started: bool = false,
+    /// A reasoning block was withheld; every later one is withheld too, so
+    /// what is replayed is always a prefix of what the model produced.
+    reasoning_cut: bool = false,
+    context_window_numbers: error_class.ContextWindowNumbers = .{},
     queue: std.ArrayList(StreamEvent) = .empty,
     queue_pos: usize = 0,
 
     fn handle(self: *BedrockStream) StreamHandle {
-        return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
+        return .{
+            .ctx = @ptrCast(self),
+            .image_placeholder_ids = self.image_placeholder_ids,
+            .nextFn = &hNext,
+            .deinitFn = &hDeinit,
+            .stopReasonFn = &hStop,
+            .requestIdFn = &hRid,
+            .contextWindowNumbersFn = &hContextWindowNumbers,
+        };
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
         return @as(*BedrockStream, @ptrCast(@alignCast(ctx))).next();
@@ -653,6 +658,9 @@ const BedrockStream = struct {
     fn hRid(ctx: *anyopaque) log.RequestId {
         return @as(*BedrockStream, @ptrCast(@alignCast(ctx))).id;
     }
+    fn hContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
+        return @as(*BedrockStream, @ptrCast(@alignCast(ctx))).context_window_numbers;
+    }
 
     fn deinit(self: *BedrockStream) void {
         self.allocator.free(self.image_placeholder_ids);
@@ -664,26 +672,30 @@ const BedrockStream = struct {
             t.input.deinit(self.allocator);
         }
         self.tools.deinit(self.allocator);
-        self.freeReasoning();
-        if (self.first_tool_id) |id| self.allocator.free(id);
+        for (self.reasoning.items) |*r| freeReasoningBlock(self.allocator, r);
+        self.reasoning.deinit(self.allocator);
         if (self.abort_registry) |registry| registry.unregister(self.request);
         self.request.deinit();
         self.allocator.destroy(self.request);
     }
 
-    fn freeReasoning(self: *BedrockStream) void {
-        for (self.reasoning.items) |*r| {
-            r.text.deinit(self.allocator);
-            r.signature.deinit(self.allocator);
-            if (r.redacted) |bytes| self.allocator.free(bytes);
-        }
-        self.reasoning.deinit(self.allocator);
-        self.reasoning = .empty;
-    }
-
     fn stalledVerdict(self: *BedrockStream) ?provider_mod.RequestAbortRegistry.Stall {
         const registry = self.abort_registry orelse return null;
         return registry.stalled(self.request);
+    }
+
+    /// Queue an owned event; on failure the event is freed here, so no path
+    /// holds bytes nobody owns.
+    fn push(self: *BedrockStream, ev: StreamEvent) !void {
+        self.queue.append(self.allocator, ev) catch |err| {
+            freeEvent(self.allocator, ev);
+            return err;
+        };
+    }
+
+    fn pushCopy(self: *BedrockStream, comptime tag: std.meta.Tag(StreamEvent), bytes: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, bytes);
+        try self.push(@unionInit(StreamEvent, @tagName(tag), owned));
     }
 
     fn next(self: *BedrockStream) anyerror!?StreamEvent {
@@ -713,6 +725,12 @@ const BedrockStream = struct {
                     client_mod.reportBodyStall("bedrock", self.id, stall);
                     return error.StreamStalled;
                 }
+                // The connection closed inside a frame: the same failure as a
+                // stream that ends before its stop event, and retried the same way.
+                if (err == error.TruncatedFrame) {
+                    client_mod.reportStreamIncomplete("bedrock", self.id);
+                    return error.StreamIncomplete;
+                }
                 log.warnId("bedrock", self.id, "event stream read failed: {s}", .{@errorName(err)});
                 return api_stream.midStreamReadError(err);
             } orelse {
@@ -726,7 +744,8 @@ const BedrockStream = struct {
                     client_mod.reportStreamIncomplete("bedrock", self.id);
                     return error.StreamIncomplete;
                 }
-                try self.commitReasoning();
+                // Blocks the server never closed with contentBlockStop.
+                while (self.reasoning.items.len > 0) try self.finishReasoning(0);
                 continue; // drain anything queued, then null
             };
             defer self.allocator.free(frame);
@@ -741,11 +760,7 @@ const BedrockStream = struct {
         const message_type = message.header(":message-type") orelse "event";
         if (!std.mem.eql(u8, message_type, "event")) {
             self.done = true;
-            const kind = message.header(":exception-type") orelse message.header(":error-code") orelse "exception";
-            var buf: [1024]u8 = undefined;
-            const shown = std.fmt.bufPrint(&buf, "{{\"type\":\"{s}\",\"detail\":{s}}}", .{ kind, if (message.payload.len > 0 and message.payload.len < 900) message.payload else "null" }) catch kind;
-            client_mod.reportServerError("bedrock", self.id, shown, self.credential);
-            return error.ApiError;
+            return self.exceptionFailure(message);
         }
         const event_type = message.header(":event-type") orelse return;
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, message.payload, .{}) catch return error.InvalidResponse;
@@ -759,17 +774,18 @@ const BedrockStream = struct {
             const tool = objectField(start, "toolUse") orelse return;
             const id = stringField(tool, "toolUseId") orelse return;
             const name = stringField(tool, "name") orelse return;
+            self.content_started = true;
+            try self.tools.ensureUnusedCapacity(self.allocator, 1);
             const id_owned = try self.allocator.dupe(u8, id);
             errdefer self.allocator.free(id_owned);
             const name_owned = try self.allocator.dupe(u8, name);
-            errdefer self.allocator.free(name_owned);
-            try self.tools.append(self.allocator, .{ .index = index, .id = id_owned, .name = name_owned });
-            if (self.first_tool_id == null) self.first_tool_id = try self.allocator.dupe(u8, id);
+            self.tools.appendAssumeCapacity(.{ .index = index, .id = id_owned, .name = name_owned });
         } else if (std.mem.eql(u8, event_type, "contentBlockDelta")) {
             const index = intField(payload, "contentBlockIndex");
             const delta = objectField(payload, "delta") orelse return;
             if (stringField(delta, "text")) |text| {
-                if (text.len > 0) try self.queue.append(self.allocator, .{ .text = try self.allocator.dupe(u8, text) });
+                self.content_started = true;
+                if (text.len > 0) try self.pushCopy(.text, text);
             } else if (objectField(delta, "toolUse")) |tool| {
                 const fragment = stringField(tool, "input") orelse return;
                 for (self.tools.items) |*t| if (t.index == index) {
@@ -780,20 +796,27 @@ const BedrockStream = struct {
                 const block = try self.reasoningBlock(index);
                 if (stringField(reasoning, "text")) |text| {
                     try block.text.appendSlice(self.allocator, text);
-                    if (text.len > 0) try self.queue.append(self.allocator, .{ .thinking = try self.allocator.dupe(u8, text) });
+                    if (text.len > 0) try self.pushCopy(.thinking, text);
                 }
                 if (stringField(reasoning, "signature")) |signature| try block.signature.appendSlice(self.allocator, signature);
                 if (stringField(reasoning, "redactedContent")) |redacted| {
+                    // Copy first: a failed copy leaves the old bytes owned once.
+                    const owned = try self.allocator.dupe(u8, redacted);
                     if (block.redacted) |old| self.allocator.free(old);
-                    block.redacted = try self.allocator.dupe(u8, redacted);
+                    block.redacted = owned;
                 }
             }
         } else if (std.mem.eql(u8, event_type, "contentBlockStop")) {
             const index = intField(payload, "contentBlockIndex");
+            for (self.reasoning.items, 0..) |r, i| if (r.index == index) {
+                try self.finishReasoning(i);
+                return;
+            };
             for (self.tools.items, 0..) |*t, i| if (t.index == index) {
+                try self.queue.ensureUnusedCapacity(self.allocator, 1);
                 const input = if (t.input.items.len == 0) try self.allocator.dupe(u8, "{}") else try t.input.toOwnedSlice(self.allocator);
-                errdefer self.allocator.free(input);
-                try self.queue.append(self.allocator, .{ .tool_use_start = .{ .id = t.id, .name = t.name, .input_json = input } });
+                // From here the event owns id, name and input.
+                self.queue.appendAssumeCapacity(.{ .tool_use_start = .{ .id = t.id, .name = t.name, .input_json = input } });
                 t.input.deinit(self.allocator);
                 _ = self.tools.orderedRemove(i);
                 break;
@@ -814,37 +837,90 @@ const BedrockStream = struct {
 
     fn reasoningBlock(self: *BedrockStream, index: u64) !*ReasoningBlock {
         for (self.reasoning.items) |*r| if (r.index == index) return r;
+        // Reasoning that starts after the answer did is not at the head of
+        // the message: it, and everything after it, stays out of the replay.
+        if (self.content_started and !self.reasoning_cut) {
+            self.reasoning_cut = true;
+            log.warnId("bedrock", self.id, "reasoning block {d} follows text or a tool call: not replayed", .{index});
+        }
         try self.reasoning.append(self.allocator, .{ .index = index });
         return &self.reasoning.items[self.reasoning.items.len - 1];
     }
 
-    /// File this response's reasoning under its first tool-use id, so the next
-    /// request of the tool loop can put it back.
-    fn commitReasoning(self: *BedrockStream) !void {
-        defer self.freeReasoning();
-        const store = self.reasoning_store orelse return;
-        const tool_id = self.first_tool_id orelse return;
-        var blocks: std.ArrayList(u8) = .empty;
-        defer blocks.deinit(self.allocator);
-        for (self.reasoning.items) |r| {
-            if (r.redacted) |redacted| {
-                if (blocks.items.len > 0) try blocks.append(self.allocator, ',');
-                try blocks.appendSlice(self.allocator, "{\"reasoningContent\":{\"redactedContent\":");
-                try util_json.serializeString(redacted, &blocks, self.allocator);
-                try blocks.appendSlice(self.allocator, "}}");
-                continue;
-            }
-            if (r.signature.items.len == 0) continue; // unsigned reasoning is not replayable
-            if (blocks.items.len > 0) try blocks.append(self.allocator, ',');
-            try blocks.appendSlice(self.allocator, "{\"reasoningContent\":{\"reasoningText\":{\"text\":");
-            try util_json.serializeString(r.text.items, &blocks, self.allocator);
-            try blocks.appendSlice(self.allocator, ",\"signature\":");
-            try util_json.serializeString(r.signature.items, &blocks, self.allocator);
-            try blocks.appendSlice(self.allocator, "}}}");
+    /// A reasoning block is complete: hand it on as a `reasoning_item` — its
+    /// Converse request form, verbatim — when it is signed (or redacted) and
+    /// still at the head of the message; drop it otherwise.
+    fn finishReasoning(self: *BedrockStream, i: usize) !void {
+        var block = self.reasoning.orderedRemove(i);
+        defer freeReasoningBlock(self.allocator, &block);
+        if (self.reasoning_cut) return;
+        if (block.redacted == null and block.signature.items.len == 0) return; // unsigned reasoning is not replayable
+        var json: std.ArrayList(u8) = .empty;
+        errdefer json.deinit(self.allocator);
+        try json.appendSlice(self.allocator, REASONING_ITEM_PREFIX);
+        if (block.redacted) |redacted| {
+            try json.appendSlice(self.allocator, "{\"redactedContent\":");
+            try util_json.serializeString(redacted, &json, self.allocator);
+            try json.appendSlice(self.allocator, "}}");
+        } else {
+            try json.appendSlice(self.allocator, "{\"reasoningText\":{\"text\":");
+            try util_json.serializeString(block.text.items, &json, self.allocator);
+            try json.appendSlice(self.allocator, ",\"signature\":");
+            try util_json.serializeString(block.signature.items, &json, self.allocator);
+            try json.appendSlice(self.allocator, "}}}");
         }
-        if (blocks.items.len > 0) try store.put(tool_id, blocks.items);
+        try self.push(.{ .reasoning_item = try json.toOwnedSlice(self.allocator) });
+    }
+
+    /// An exception (or error) frame ends the stream with what it says, in
+    /// the shape `model_error` reads: `{"type":<exception type>,"message":…}`.
+    /// The type names the category (throttling, unavailable, validation, …;
+    /// `model_error.technicalCategory`); an overflow is ContextWindowExceeded.
+    fn exceptionFailure(self: *BedrockStream, message: event_stream.Message) anyerror {
+        const kind = message.header(":exception-type") orelse message.header(":error-code") orelse "exception";
+        var parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, self.allocator, message.payload, .{}) catch null;
+        defer if (parsed) |*p| p.deinit();
+        // AWS documents the exception members (ConverseStreamOutput) without
+        // their payload; the AWS SDKs read `message`. `:message-type error`
+        // frames carry it in the `:error-message` header instead.
+        const text: ?[]const u8 = blk: {
+            if (parsed) |p| if (p.value == .object) {
+                if (stringField(p.value.object, "message") orelse stringField(p.value.object, "Message")) |m| break :blk m;
+            };
+            if (message.header(":error-message")) |m| break :blk m;
+            if (message.payload.len > 0 and std.unicode.utf8ValidateSlice(message.payload))
+                break :blk message.payload[0..@min(message.payload.len, 2048)];
+            break :blk null;
+        };
+        var shown: std.ArrayList(u8) = .empty;
+        defer shown.deinit(self.allocator);
+        const written = blk: {
+            shown.appendSlice(self.allocator, "{\"type\":") catch break :blk false;
+            util_json.serializeString(kind, &shown, self.allocator) catch break :blk false;
+            if (text) |m| {
+                shown.appendSlice(self.allocator, ",\"message\":") catch break :blk false;
+                util_json.serializeString(m, &shown, self.allocator) catch break :blk false;
+            }
+            shown.append(self.allocator, '}') catch break :blk false;
+            break :blk true;
+        };
+        client_mod.reportServerError("bedrock", self.id, if (written) shown.items else "{\"type\":\"exception\"}", self.credential);
+        // AWS documents an overflow only as "a validation error"; the wording
+        // the shared classifier knows (Anthropic's "prompt is too long", …)
+        // is what decides here.
+        if (text) |m| if (error_class.isContextWindowExceeded(m)) {
+            self.context_window_numbers = error_class.parseContextWindowNumbers(m);
+            return error.ContextWindowExceeded;
+        };
+        return error.ApiError;
     }
 };
+
+fn freeReasoningBlock(allocator: std.mem.Allocator, r: *ReasoningBlock) void {
+    r.text.deinit(allocator);
+    r.signature.deinit(allocator);
+    if (r.redacted) |bytes| allocator.free(bytes);
+}
 
 fn objectField(object: std.json.ObjectMap, name: []const u8) ?std.json.ObjectMap {
     const value = object.get(name) orelse return null;
@@ -879,7 +955,7 @@ pub fn mapStopReason(reason: []const u8) StopReason {
 
 fn freeEvent(allocator: std.mem.Allocator, ev: StreamEvent) void {
     switch (ev) {
-        .text, .thinking => |bytes| allocator.free(bytes),
+        .text, .thinking, .reasoning_item => |bytes| allocator.free(bytes),
         .tool_use_start => |tu| {
             allocator.free(tu.id);
             allocator.free(tu.name);
@@ -898,7 +974,7 @@ fn shutdownRequest(raw: *anyopaque) void {
 
 const testing = std.testing;
 
-fn testRequest(model: []const u8, messages: []const types.ApiMessage, tools: ?[]const json_mod.ToolDefinition, overrides: request_overrides.RequestOverrides, store: ?*ReasoningStore) ConverseRequest {
+fn testRequest(model: []const u8, messages: []const types.ApiMessage, tools: ?[]const json_mod.ToolDefinition, overrides: request_overrides.RequestOverrides) ConverseRequest {
     return .{
         .model = model,
         .messages = messages,
@@ -907,8 +983,21 @@ fn testRequest(model: []const u8, messages: []const types.ApiMessage, tools: ?[]
         .overrides = overrides,
         .max_tokens = 32000,
         .dialect = dialect_mod.dialectForVendor(.bedrock, null, model),
-        .reasoning = store,
     };
+}
+
+fn testBody(a: std.mem.Allocator, req: ConverseRequest) ![]u8 {
+    var report = json_mod.SerializationReport{};
+    defer report.deinit(a);
+    const body = try serializeConverseRequest(a, req, &report);
+    errdefer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    parsed.deinit();
+    return body;
+}
+
+fn has(body: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, body, needle) != null;
 }
 
 test "Converse URL percent-encodes the model id" {
@@ -935,7 +1024,7 @@ test "Converse body: messages, system with a cache point, tools, thinking fields
     const tools = [_]json_mod.ToolDefinition{.{ .name = "Glob", .description = "find files", .input_schema = .{} }};
     var report = json_mod.SerializationReport{};
     defer report.deinit(a);
-    const body = try serializeConverseRequest(a, testRequest("us.anthropic.claude-sonnet-4-6", &messages, &tools, .{ .reasoning_effort = .high, .tool_choice = .{ .type = "auto" } }, null), &report);
+    const body = try serializeConverseRequest(a, testRequest("us.anthropic.claude-sonnet-4-6", &messages, &tools, .{ .reasoning_effort = .high, .tool_choice = .{ .type = "auto" } }), &report);
     defer a.free(body);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
@@ -943,6 +1032,9 @@ test "Converse body: messages, system with a cache point, tools, thinking fields
     try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"user\",\"content\":[{\"text\":\"list files\"}]}") != null);
     try testing.expect(std.mem.indexOf(u8, body, "{\"toolUse\":{\"toolUseId\":\"tu_1\",\"name\":\"Glob\",\"input\":{\"pattern\":\"*\"}}}") != null);
     try testing.expect(std.mem.indexOf(u8, body, "{\"toolResult\":{\"toolUseId\":\"tu_1\",\"content\":[{\"text\":\"a.txt\"}],\"status\":\"error\"}}") != null);
+    // The conversation's cache point closes the last message.
+    try testing.expect(std.mem.indexOf(u8, body, "\"status\":\"error\"}},{\"cachePoint\":{\"type\":\"default\"}}]}]") != null);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, body, "cachePoint"));
     try testing.expect(std.mem.indexOf(u8, body, "unsigned, never replayed") == null);
     try testing.expect(std.mem.indexOf(u8, body, "\"system\":[{\"text\":\"be brief\"},{\"cachePoint\":{\"type\":\"default\"}}]") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"inferenceConfig\":{\"maxTokens\":32000}") != null);
@@ -955,29 +1047,81 @@ test "Converse body: no cache points and no fields for a vendor without them" {
     const messages = [_]types.ApiMessage{.{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} }};
     var report = json_mod.SerializationReport{};
     defer report.deinit(a);
-    const body = try serializeConverseRequest(a, testRequest("deepseek.v3-v1:0", &messages, null, .{ .reasoning_effort = .high }, null), &report);
+    const body = try serializeConverseRequest(a, testRequest("deepseek.v3-v1:0", &messages, null, .{ .reasoning_effort = .high }), &report);
     defer a.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "cachePoint") == null);
     try testing.expect(std.mem.indexOf(u8, body, "additionalModelRequestFields") == null);
 }
 
-test "Converse body: stored signed reasoning goes back in front of its tool turn" {
+test "Converse body: signed reasoning in the conversation goes back verbatim, this model's and this wire's only" {
     const a = testing.allocator;
-    var store = ReasoningStore.init(a);
-    defer store.deinit();
-    try store.put("tu_1", "{\"reasoningContent\":{\"reasoningText\":{\"text\":\"t\",\"signature\":\"sig\"}}}");
+    const signed = "{\"reasoningContent\":{\"reasoningText\":{\"text\":\"t\",\"signature\":\"sig\"}}}";
     const messages = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
-        .{ .role = .assistant, .content = &[_]types.ApiContent{.{ .tool_use = .{ .id = "tu_1", .name = "Glob", .input = "{}" } }} },
+        .{
+            .role = .assistant,
+            .content = &[_]types.ApiContent{
+                .{ .reasoning_item = .{ .model = "us.anthropic.claude-sonnet-4-6", .json = signed } },
+                // Another model's signature, and another wire's item: never sent.
+                .{ .reasoning_item = .{ .model = "us.anthropic.claude-opus-4-6-v1", .json = "{\"reasoningContent\":{\"redactedContent\":\"b3RoZXI=\"}}" } },
+                .{ .reasoning_item = .{ .model = "us.anthropic.claude-sonnet-4-6", .json = "{\"type\":\"reasoning\",\"encrypted_content\":\"x\"}" } },
+                .{ .thinking = "t" },
+                .{ .tool_use = .{ .id = "tu_1", .name = "Glob", .input = "{}" } },
+            },
+        },
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "tu_1", .content = "x", .is_error = false } }} },
     };
-    var report = json_mod.SerializationReport{};
-    defer report.deinit(a);
-    const body = try serializeConverseRequest(a, testRequest("us.anthropic.claude-sonnet-4-6", &messages, null, .{}, &store), &report);
+    const body = try testBody(a, testRequest("us.anthropic.claude-sonnet-4-6", &messages, null, .{}));
     defer a.free(body);
-    try testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":[{\"reasoningContent\":{\"reasoningText\":{\"text\":\"t\",\"signature\":\"sig\"}}},{\"toolUse\":") != null);
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
-    parsed.deinit();
+    try testing.expect(has(body, "{\"role\":\"assistant\",\"content\":[" ++ signed ++ ",{\"toolUse\":"));
+    try testing.expect(!has(body, "b3RoZXI="));
+    try testing.expect(!has(body, "encrypted_content"));
+}
+
+test "Converse body: adjacent messages of one role become one" {
+    const a = testing.allocator;
+    const messages = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "first" }} },
+        // Nothing this wire sends: dropped, leaving two user messages in a row.
+        .{ .role = .assistant, .content = &[_]types.ApiContent{.{ .text = "" }} },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "second" }} },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "" }} },
+    };
+    const body = try testBody(a, testRequest("deepseek.v3-v1:0", &messages, null, .{}));
+    defer a.free(body);
+    try testing.expect(has(body, "{\"messages\":[{\"role\":\"user\",\"content\":[{\"text\":\"first\"},{\"text\":\"second\"}]}]"));
+
+    // With a cache point the merged message still closes with it.
+    const claude = try testBody(a, testRequest("us.anthropic.claude-sonnet-4-6", &messages, null, .{}));
+    defer a.free(claude);
+    try testing.expect(has(claude, "{\"messages\":[{\"role\":\"user\",\"content\":[{\"text\":\"first\"},{\"text\":\"second\"},{\"cachePoint\":{\"type\":\"default\"}}]}]"));
+}
+
+test "Converse body: sampling and a forced tool go out unless the model always thinks" {
+    const a = testing.allocator;
+    const messages = [_]types.ApiMessage{.{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} }};
+    const tools = [_]json_mod.ToolDefinition{.{ .name = "Glob", .description = "find files", .input_schema = .{} }};
+    const overrides: request_overrides.RequestOverrides = .{ .reasoning_effort = .high, .temperature = 0.25, .top_p = 0.5, .tool_choice = .{ .type = "tool", .name = "Glob" } };
+
+    // Sonnet 4.6: thinking is off when omitted, so the caller's members win.
+    const sonnet = try testBody(a, testRequest("us.anthropic.claude-sonnet-4-6", &messages, &tools, overrides));
+    defer a.free(sonnet);
+    try testing.expect(has(sonnet, "\"inferenceConfig\":{\"maxTokens\":32000,\"temperature\":0.25,\"topP\":0.5}"));
+    try testing.expect(has(sonnet, "\"toolChoice\":{\"tool\":{\"name\":\"Glob\"}}"));
+    try testing.expect(!has(sonnet, "additionalModelRequestFields"));
+
+    // Opus 5.5 always thinks: the conflicting members stay home.
+    const opus = try testBody(a, testRequest("us.anthropic.claude-opus-5-5", &messages, &tools, overrides));
+    defer a.free(opus);
+    try testing.expect(has(opus, "\"inferenceConfig\":{\"maxTokens\":32000}"));
+    try testing.expect(!has(opus, "toolChoice"));
+    try testing.expect(has(opus, "\"additionalModelRequestFields\":{\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"high\"}}"));
+
+    // A vendor without thinking fields sends both untouched.
+    const deepseek = try testBody(a, testRequest("deepseek.v3-v1:0", &messages, &tools, overrides));
+    defer a.free(deepseek);
+    try testing.expect(has(deepseek, "\"temperature\":0.25,\"topP\":0.5}"));
+    try testing.expect(has(deepseek, "\"toolChoice\":{\"tool\":{\"name\":\"Glob\"}}"));
 }
 
 test "Converse body: a non-vision tool image becomes a placeholder and is reported" {
@@ -989,14 +1133,14 @@ test "Converse body: a non-vision tool image becomes a placeholder and is report
     };
     var report = json_mod.SerializationReport{};
     defer report.deinit(a);
-    const body = try serializeConverseRequest(a, testRequest("deepseek.v3-v1:0", &messages, null, .{}, null), &report);
+    const body = try serializeConverseRequest(a, testRequest("deepseek.v3-v1:0", &messages, null, .{}), &report);
     defer a.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "QUJD") == null);
     try testing.expectEqual(@as(usize, 1), report.placeholder_ids.items.len);
 
     var vision_report = json_mod.SerializationReport{};
     defer vision_report.deinit(a);
-    const vision = try serializeConverseRequest(a, testRequest("us.anthropic.claude-sonnet-4-6", &messages, null, .{}, null), &vision_report);
+    const vision = try serializeConverseRequest(a, testRequest("us.anthropic.claude-sonnet-4-6", &messages, null, .{}), &vision_report);
     defer a.free(vision);
     try testing.expect(std.mem.indexOf(u8, vision, "{\"image\":{\"format\":\"png\",\"source\":{\"bytes\":\"QUJD\"}}}") != null);
 }
@@ -1006,17 +1150,4 @@ test "Converse stop reasons map onto the neutral set" {
     try testing.expectEqual(StopReason.refusal, mapStopReason("guardrail_intervened"));
     try testing.expectEqual(StopReason.max_tokens, mapStopReason("model_context_window_exceeded"));
     try testing.expectEqual(StopReason.unknown, mapStopReason("something_new"));
-}
-
-test "ReasoningStore keeps the newest entries within its bound" {
-    const a = testing.allocator;
-    var store = ReasoningStore.init(a);
-    defer store.deinit();
-    var buf: [16]u8 = undefined;
-    for (0..ReasoningStore.MAX_ENTRIES + 3) |i| try store.put(try std.fmt.bufPrint(&buf, "id{d}", .{i}), "{}");
-    try testing.expectEqual(ReasoningStore.MAX_ENTRIES, store.entries.count());
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try testing.expect(!try store.appendFor("id0", &out, a));
-    try testing.expect(try store.appendFor(try std.fmt.bufPrint(&buf, "id{d}", .{ReasoningStore.MAX_ENTRIES + 2}), &out, a));
 }
