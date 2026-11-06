@@ -44,6 +44,16 @@ mock provider 见到 `CAPS_ASK` / `CAPS_WRITE:<path>` 时让模型调 AskUserQue
 同样的请求被通告、作答、文件写入;用户真的拒绝时仍是 "user declined 'Write' via prompt"。
 `CAPS_E2E_DUMP=<file>` 把最终 journal 落盘供复核。
 
+plain headless 的失败说明(#417)同样纯 Python,mock provider 就在脚本进程内:
+
+```bash
+zig build && python3 tests/e2e/headless_stop_notice_e2e.py
+```
+
+断言真实的退出码、stdout、stderr:四种 wire 上每次响应都以 max-token 终止,带可见文本和不带各跑一遍,
+`-p` 退出 1、stdout 只有已有文本、stderr 一条耗尽说明,`--json` 的 stderr 仍为空;`--resume-response`
+走同一断言;SIGINT / SIGTERM 中断同样有说明(POSIX);正常收尾与 HTTP 402 不多这一行。
+
 ## 它怎么工作
 
 cc-zig 的 REPL 在**非 tty(stdin 是管道)** 下走 `readLineBuffered` 干净逐行读取,

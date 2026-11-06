@@ -25,6 +25,16 @@ status, compatibility boundaries, and entry points are defined by
   `SessionHost`'s `Submission.replaces`, and the wire `user_message` line
   gains `replaces` ([doc/API.md](doc/API.md#edit-and-rerun)). (#432)
 
+### Fixed
+
+- **Plain headless says why a failed Run stopped (#417).** `-p` without `--json`
+  exited 1 with nothing on stderr when the reply was still cut off after the
+  three max-token continuations, and when the Run was interrupted by SIGINT or
+  SIGTERM. Those stops, and the same exit for a tool failure, now write one
+  `error: stopped (<stop_reason>): …` line to stderr, on `--resume-response`
+  too. Stdout (any partial text) and the exit code are unchanged, and so is
+  `--json`.
+
 ## 0.10.0 — 2026-10-31
 
 ### Changed

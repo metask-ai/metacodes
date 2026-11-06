@@ -16,6 +16,8 @@ empty `### Migration`.
 
 ### Changed
 
+- No change a Host can see. The inputs moved for a fix in the CLI's plain headless
+  output (#417), which AgentCore does not use.
 - The library is rebuilt from a kernel that can edit a user message and rerun
   from it (#432): the shared Conversation gains a rewind that drops a user
   message and everything after it. ABI revision 26 does not expose it, so no
