@@ -500,6 +500,27 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             }
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/edit") or std.mem.startsWith(u8, trimmed, "/edit ")) {
+            // Issue #432: edit one of the user's messages and rerun from it.
+            // Rewinding the conversation is the service's; the run is ours.
+            const rest = std.mem.trim(u8, trimmed["/edit".len..], " \t");
+            if (rest.len == 0) {
+                var listing: std.Io.Writer.Allocating = .init(allocator);
+                defer listing.deinit();
+                session_service.writeEditableMessages(&listing.writer, &app.conversation) catch {};
+                cmd_output.print("{s}", .{listing.written()});
+                continue;
+            }
+            const d = svc.prepareEdit(rest);
+            if (d.run != null) {
+                cmd_output.print("\x1b[2mRewound to your message {s}; rerunning with the edited text.\x1b[0m\n", .{rest[0 .. std.mem.indexOfAny(u8, rest, " \t") orelse rest.len]});
+                try runTurn(&turn_host, .prompt, null);
+            } else {
+                var buf: [256]u8 = undefined;
+                cmd_output.print("\x1b[33m{s}\x1b[0m\n", .{d.outcome.render(&buf)});
+            }
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/kg") or std.mem.startsWith(u8, trimmed, "/kg ")) {
             const rest = std.mem.trim(u8, trimmed[3..], " \t");
             try handleKg(app, allocator, rest);

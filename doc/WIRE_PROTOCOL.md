@@ -40,6 +40,19 @@ malformed answer is never a grant) and the capability frame of §2. Payload
 shapes are spelled out in `wire.zig`'s module comment and pinned by the
 fixtures.
 
+The `user_message` host event carries `replaces`, appended under §4's
+additive rule 2: `null` when the Run's text was appended after the whole
+conversation, or the 1-based position `n` of the user message it replaced
+(edit-and-rerun, [API.md](API.md#edit-and-rerun)). With `n`, messages `n` and
+later left the conversation before the Run, which saw messages `1..n-1` and
+the text, unless that Run's `run_done` names the refusal in `error_name`
+(`PositionOutOfRange`, `NotUserMessage` or `PositionCompacted`), in which case
+nothing changed.
+
+```text
+{"v":1,"type":"user_message","data":{"run_id":6,"trace_id":null,"text":"...","replaces":6}}
+```
+
 ## 2. Capability exchange
 
 A frontend states what it can render with one **capability frame**, the first

@@ -186,6 +186,117 @@ test "L2 SessionHost runs queued work in order, journals wire lines and resumes 
     try std.testing.expect(std.mem.indexOf(u8, body, "pelican noted") != null);
 }
 
+test "L2 SessionHost edit-and-rerun (issue #432): the Run sees messages before the position + the edited text, the resumed Session too, files stay" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    const path = try std.fmt.allocPrint(a, "{s}/dropped.txt", .{workspace});
+    defer a.free(path);
+
+    const noted = try textSse(a, "pelican noted");
+    defer a.free(noted);
+    const write = try writeToolSse(a, path);
+    defer a.free(write);
+    const wrote = try textSse(a, "file written");
+    defer a.free(wrote);
+    const third = try textSse(a, "third answer");
+    defer a.free(third);
+    const edited = try textSse(a, "edited answer");
+    defer a.free(edited);
+    const resumed_reply = try textSse(a, "still the pelican");
+    defer a.free(resumed_reply);
+    const bodies = [_][]const u8{ noted, write, wrote, third, edited, resumed_reply };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{"Write"});
+    config.permission_mode = .accept_edits;
+
+    const hosted = try host.open(.{ .config = config });
+    const id = hosted.id;
+    // Messages: 1 user, 2 reply, 3 user, 4 tool_use, 5 tool_result,
+    // 6 reply, 7 user, 8 reply.
+    try hosted.submit(.{ .text = "remember the word pelican" });
+    try hosted.submit(.{ .text = "write the scratch file" });
+    try hosted.submit(.{ .text = "the third prompt" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 3);
+    try std.testing.expect(try exists(workspace, "dropped.txt"));
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 8), snapshot.messages);
+    }
+
+    // Positions that cannot be rerun fail the Run by name and change nothing.
+    const MessagePosition = cc.conversation.MessagePosition;
+    try hosted.submit(.{ .text = "not a reply", .replaces = try MessagePosition.fromOrdinal(2) });
+    try hosted.submit(.{ .text = "not a tool result", .replaces = try MessagePosition.fromOrdinal(5) });
+    try hosted.submit(.{ .text = "past the end", .replaces = try MessagePosition.fromOrdinal(9) });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 6);
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "\"error_name\":\"NotUserMessage\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"error_name\":\"PositionOutOfRange\""));
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 8), snapshot.messages);
+    }
+
+    // Edit message 3 and rerun from it.
+    try hosted.submit(.{ .text = "do not write anything", .trace_id = "edit", .replaces = try MessagePosition.fromOrdinal(3) });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\",\"data\":{\"run_id\":7,\"trace_id\":\"edit\",\"stop_reason\":\"end_turn\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":7,\"trace_id\":\"edit\",\"text\":\"do not write anything\",\"replaces\":3}}"));
+    {
+        const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+        try std.testing.expect(std.mem.indexOf(u8, body, "remember the word pelican") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "pelican noted") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "do not write anything") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "write the scratch file") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "tu_w") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "file written") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "the third prompt") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "third answer") == null);
+    }
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 4), snapshot.messages);
+    }
+    // Context only: what the dropped turns did to the workspace stays.
+    try std.testing.expect(try exists(workspace, "dropped.txt"));
+
+    // A restart restores the edited history, never the dropped one.
+    host.release(hosted);
+    try host.close(id);
+    const resumed = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+    defer host.release(resumed);
+    {
+        var snapshot = try resumed.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 4), snapshot.messages);
+    }
+    try resumed.submit(.{ .text = "which word was it" });
+    try waitFor(&resumed.journal, "\"type\":\"run_done\"", 1);
+    const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "remember the word pelican") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "do not write anything") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "edited answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "write the scratch file") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "file written") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "the third prompt") == null);
+    try std.testing.expect(try exists(workspace, "dropped.txt"));
+}
+
 test "L2 SessionHost opening an id fresh replaces its transcript instead of resuming it" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

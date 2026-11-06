@@ -16,8 +16,24 @@ empty `### Migration`.
 
 ### Changed
 
+- A Run now compacts its own Conversation and continues under the same Run ID
+  when context pressure would otherwise stop it (#430): the model's input
+  window, a provider's context-window refusal, and checkpoint capacity
+  (`soft_bytes`, or a request that would not fit under `hard_bytes`). The
+  summary request is budgeted and accounted like any request; the replacement
+  commits only if its checkpoint fits beside every live reservation. Recovery is
+  bounded and stops with `STOP_API_ERROR` (`model_error` category
+  `context_window`) or the checkpoint budget terminal, whose terminal
+  `run_state` phase is `failed` (only a cancellation is `aborted`). Committed
+  tool results are never cleared or truncated in place. `auto_compact` reports
+  the new causes `durable_capacity_threshold` and `durable_capacity_recovery`.
 - No change a Host can see. The inputs moved for a fix in the CLI's plain headless
   output (#417), which AgentCore does not use.
+- The library is rebuilt from a kernel that can edit a user message and rerun
+  from it (#432): the shared Conversation gains a rewind that drops a user
+  message and everything after it. ABI revision 26 does not expose it, so no
+  Host-visible behaviour, layout or status changes; a Session's checkpoint and
+  Runs are as before.
 
 ### Fixed
 
@@ -44,6 +60,12 @@ empty `### Migration`.
   through the same context recovery as on Anthropic, so a Run that can shrink
   its request continues instead of stopping with `model_error`
   `context_window` (#434). No ABI or configuration change.
+
+### Migration
+
+- A Host that compacted and replayed the instruction after a context-window
+  stop no longer needs to; it should accept `auto_compact` events (and the
+  `compacting` RunState phase) inside a Run and causes it does not know.
 
 ## 0.13.0 — 2026-10-31
 
