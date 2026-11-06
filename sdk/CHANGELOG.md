@@ -14,6 +14,11 @@ empty `### Migration`.
 
 ## Unreleased
 
+### Changed
+
+- No change a Host can see. The inputs moved for a fix in the CLI's plain headless
+  output (#417), which AgentCore does not use.
+
 ### Fixed
 
 - A Run on DeepSeek or Kimi in thinking mode sends the model's earlier reasoning
