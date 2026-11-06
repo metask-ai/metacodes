@@ -7,8 +7,9 @@
 //! - `--json`：改为 NDJSON 事件流（每行一个 JSON），便于 CI/脚本消费。
 //!
 //! 退出码：end_turn / max_turns / budget / tool_loop → 0；
-//! api_error / tool_error / aborted → 1。tool_loop 保留在 result.stop_reason
-//! 供上游区分，但它和其它受控软停一样不把已有产出判成进程失败。
+//! api_error / tool_error / aborted / max_tokens_exhausted → 1。tool_loop 保留在
+//! result.stop_reason 供上游区分，但它和其它受控软停一样不把已有产出判成进程失败。
+//! 不带 `--json` 时，失败原因写 stderr（`stopNotice`），stdout 只放模型文本。
 
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -501,6 +502,7 @@ pub fn run(
         writeStdout(final_text);
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
         printIntegrityNotice(allocator, &integrity_report);
+        printStopNotice(result);
     }
     // stdout carries the answer (or the result line); the stall notice goes to
     // stderr, where a person running the command still sees it.
@@ -770,6 +772,7 @@ pub fn resumeSuspended(
         writeStdout(final_text);
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
         printIntegrityNotice(allocator, &integrity_report);
+        printStopNotice(result);
     }
     return exitCodeFor(result.stop_reason);
 }
@@ -999,8 +1002,56 @@ fn printIntegrityNotice(allocator: std.mem.Allocator, report: *const test_integr
     std.debug.print("{s}\n", .{notice});
 }
 
+/// Why a failed Run stopped, for a plain-text caller, who has no result line to
+/// read it from. The exit code alone cannot tell these failures apart (#417).
+/// Every stop reason is decided here, so a new one has to choose.
+fn stopNotice(buf: []u8, stop_reason: agent_loop.StopReason, continuations: u32) ?[]const u8 {
+    return switch (stop_reason) {
+        .max_tokens_exhausted => std.fmt.bufPrint(
+            buf,
+            "error: stopped (max_tokens_exhausted): the reply was still cut off at the output token limit after {d} continuations, so any text on stdout is incomplete.",
+            .{continuations},
+        ) catch unreachable,
+        .aborted => "error: stopped (aborted): the run was interrupted, so any text on stdout is incomplete.",
+        .tool_error => "error: stopped (tool_error): a tool failed in a way that cannot be retried, so any text on stdout is incomplete.",
+        // The provider and agent logs have already said why on stderr.
+        .api_error => null,
+        // Announced by the suspend line and the stall notice.
+        .suspended, .stalled => null,
+        // Controlled stops exit 0, and headless never moves to the background.
+        .end_turn, .max_turns, .budget, .tool_loop, .backgrounded => null,
+    };
+}
+
+const STOP_NOTICE_BUF_LEN = 200;
+
+/// Plain-text mode only: `--json` reports the stop in its result line.
+fn printStopNotice(result: agent_loop.RunResult) void {
+    var buf: [STOP_NOTICE_BUF_LEN]u8 = undefined;
+    if (stopNotice(&buf, result.stop_reason, result.continuations)) |notice| std.debug.print("{s}\n", .{notice});
+}
+
+test "stopNotice speaks for each failure with no diagnostic of its own, and only those" {
+    var buf: [STOP_NOTICE_BUF_LEN]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "error: stopped (max_tokens_exhausted): the reply was still cut off at the output token limit after 4294967295 continuations, so any text on stdout is incomplete.",
+        stopNotice(&buf, .max_tokens_exhausted, std.math.maxInt(u32)).?,
+    );
+    for (std.enums.values(agent_loop.StopReason)) |stop_reason| {
+        const has_notice = stopNotice(&buf, stop_reason, 3) != null;
+        const expected = switch (stop_reason) {
+            .max_tokens_exhausted, .aborted, .tool_error => true,
+            else => false,
+        };
+        try std.testing.expectEqual(expected, has_notice);
+        // A controlled stop never reads as a failure.
+        if (exitCodeFor(stop_reason) == 0) try std.testing.expect(!has_notice);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, stopNotice(&buf, .tool_error, 0).?, "tool_error") != null);
+}
+
 /// 退出码逻辑(提 pub 供 L2):受控停止 → 0;suspended → 2(挂起待恢复,非失败);
-/// 其它(api/tool error 或 aborted)→ 1。
+/// 其它(api/tool error、max_tokens_exhausted 或 aborted)→ 1。
 pub fn exitCodeFor(stop_reason: agent_loop.StopReason) u8 {
     return switch (stop_reason) {
         .end_turn, .max_turns, .budget, .tool_loop, .stalled => 0,
