@@ -585,14 +585,15 @@ Provider and differs from it only by `model_override`, so sizing a child's
 results — or its auto-compact thresholds — against the parent's window is how a
 200K parent hands a 32K child a history that endpoint rejects.
 
-### Provider reasoning continuity (DeepSeek, Kimi, MiniMax)
+### Provider reasoning continuity (DeepSeek, Kimi, MiniMax, Mistral)
 
 Some models want their earlier reasoning back on later requests. DeepSeek's
 thinking mode answers HTTP 400 to a tool turn whose assistant history lacks
 `reasoning_content`; Kimi asks for the assistant message back unchanged,
 reasoning included; MiniMax M3 and later ask for the full response back to keep
-the reasoning chain. Core projects every `Block.thinking` into the request IR
-and lets the dialect decide (issue #421):
+the reasoning chain; Mistral asks for the full assistant message back,
+ThinkChunks included. Core projects every `Block.thinking` into the request IR
+and lets the dialect decide (issues #421, #437):
 
 - A dialect whose profile sets `ModelProfile.echoes_reasoning_content` gets it
   back: DeepSeek, Kimi and MiniMax M3 and later on the OpenAI chat wire,
@@ -600,9 +601,18 @@ and lets the dialect decide (issue #421):
   wire. OpenAI chat sends the message's thinking text as `reasoning_content` on
   the assistant message (after `content`, before `tool_calls`); Anthropic
   Messages sends the non-empty `thinking` blocks in their original position.
+- The Mistral dialect's reasoning models (Small 2603, Medium 3.5, Large 4,
+  Magistral; `ModelProfile.content_chunks = .read_and_echo`) get it back as
+  ThinkChunks on the OpenAI chat wire: an assistant message with non-empty
+  thinking is sent with a list-typed `content` holding
+  `{"type":"thinking","thinking":[{"type":"text","text":…}]}` and
+  `{"type":"text","text":…}` chunks in their original order, before
+  `tool_calls`. The same dialect reads a streamed list-typed `delta.content` the
+  same way. A route that declares another dialect for a Mistral-named model
+  does neither.
 - Every other model is sent exactly the bytes it was sent before: OpenAI
-  native and every other compatible dialect (GLM, Qwen, MiniMax M2, Mistral),
-  OpenAI Responses, Gemini, and Claude. Claude in particular never receives a
+  native and every other compatible dialect (GLM, Qwen, MiniMax M2, and Mistral
+  models without documented reasoning), OpenAI Responses, Gemini, and Claude. Claude in particular never receives a
   thinking block: one sent back must carry the signature it was issued with,
   and the IR keeps none.
 - The dialect follows the route's declaration

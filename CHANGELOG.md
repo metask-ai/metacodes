@@ -109,6 +109,23 @@ status, compatibility boundaries, and entry points are defined by
   thinking blocks. Every other dialect's request bytes are unchanged; Claude
   never receives an unsigned thinking block. A custom DeepSeek Anthropic endpoint
   gets its thinking back only when it declares `"dialect": "deepseek"`.
+- **Mistral reasoning is requested, read and sent back (#437).** The Mistral
+  dialect sent no reasoning control and looked for reasoning only in a flat
+  `reasoning_content`, which Mistral never returns. Mistral streams reasoning as
+  ThinkChunks inside a list-typed `delta.content`, and the list at the switch to
+  the answer also carries the first answer text, so both were lost. The dialect
+  now sends `reasoning_effort` in each model's documented vocabulary: Small 2603
+  and Medium 3.5 take `none` / `high`; Large 4 takes `low` / `medium` / `high`,
+  so a neutral `none` goes out as `low`. Magistral (always reasoning) and
+  models whose reasoning Mistral does not document (`mistral-large-latest` is
+  Large 3) get no effort field. On the Mistral dialect only, the OpenAI chat
+  stream parser reads a list-typed `content` in order: a text chunk is answer
+  text, a thinking chunk's text is reasoning. Assistant history with reasoning
+  goes back to Mistral's reasoning models as ThinkChunks in a list-typed
+  `content`, as Mistral asks. Those requests change bytes, so their
+  provider-side prompt cache misses once after the upgrade. Every other route's
+  request bytes and parsed streams are unchanged, including a route that
+  declares another dialect for a Mistral-named model.
 - **Kimi K2 with no reasoning effort set no longer crashes.** On the OpenAI chat
   wire the K2.6 dialect unwrapped the unset effort while writing the `thinking`
   object, which panicked in Debug and ReleaseSafe builds; it now sends

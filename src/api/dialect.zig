@@ -37,6 +37,7 @@ pub const ProviderKind = model_adapter.ProviderKind;
 pub const Vendor = @import("../provider/vendor.zig").Vendor;
 pub const DialectDeclaration = @import("../provider/vendor.zig").Declaration;
 pub const ModelProfile = model_adapter.ModelProfile;
+pub const ContentChunks = model_adapter.ContentChunks;
 pub const ImageInputSource = @import("image_capability.zig").Source;
 pub const ReasoningEffort = types.ReasoningEffort;
 

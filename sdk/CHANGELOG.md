@@ -54,6 +54,12 @@ empty `### Migration`.
   messages; a route declaring DeepSeek on the Anthropic wire gets its thinking
   blocks. Other models' requests are unchanged, and Claude is never sent an
   unsigned thinking block. No ABI change.
+- A Run on a Mistral model over the OpenAI chat wire asks for reasoning in the
+  model's `reasoning_effort` vocabulary (Small 2603 and Medium 3.5 `none` /
+  `high`, Large 4 `low` / `medium` / `high`), streams its ThinkChunks as thinking
+  instead of dropping them and the first answer text that arrives with them, and
+  sends earlier reasoning back as ThinkChunks (#437). Other models' requests are
+  unchanged. No ABI change.
 - OpenAI Chat Completions, OpenAI Responses and Gemini Runs now retry a
   transient connect failure, a 429 or a 500/502/503 before the response head,
   as Anthropic Messages Runs did: the same request, the same attempt limit and

@@ -43,6 +43,9 @@ pub const ThinkingMode = enum {
     /// MiniMax M2.x:thinking 常开且不可关(disabled 被接受但忽略);只发
     /// reasoning_split:true 让思考以 reasoning_content 平级字段返回。
     minimax_m2_split,
+    /// Mistral:顶层 `reasoning_effort`,每个型号自己的词汇(`effort_levels`);
+    /// 思考以 content 列表里的 thinking chunk 返回(`content_chunks`)。
+    mistral_effort,
 };
 
 /// 工具调用 wire 格式
@@ -67,8 +70,26 @@ pub const EffortLevels = enum {
     deepseek_2,
     /// MiniMax M3:三态(none→disabled,minimal/low→adaptive,medium+→enabled)。
     minimax_3state,
+    /// Mistral Small 2603 / Medium 3.5:none / high 两档。
+    mistral_none_high,
+    /// Mistral Large 4:low / medium / high 三档,不收 none(思考关不掉)。
+    mistral_low_medium_high,
     /// 不支持 effort
     none_,
+};
+
+/// OpenAI chat wire 上 list 型 `content`(typed chunk 列表)的读写范围。Mistral 用这种
+/// 形态返回推理:`{"type":"thinking","thinking":[{"type":"text","text":...}]}` 与
+/// `{"type":"text","text":...}` 并列(issue #437)。
+pub const ContentChunks = enum {
+    /// `content` 只按字符串读;list 型整个忽略。Mistral 以外的所有方言。
+    none,
+    /// list 型 `content` 按序读:text chunk → 正文,thinking chunk 的 text 部分 → 思考。
+    /// 历史仍按字符串发,不带思考。
+    read,
+    /// 同 `read`;另外,带思考的 assistant 历史消息以 list 发回:thinking chunk 与
+    /// text chunk 保持原顺序(Mistral 的推理模型要求整条消息原样回放)。
+    read_and_echo,
 };
 
 /// response_format 支持范围
@@ -116,6 +137,10 @@ pub const ModelProfile = struct {
     /// OpenAI chat wire 上,assistant 历史消息的 thinking 块以 `reasoning_content` 回传。
     /// DeepSeek 在请求带 tools 时要求回传全部历史思考,否则 400;只由厂商接入文件声明。
     echoes_reasoning_content: bool = false,
+    /// OpenAI chat wire 上 list 型 `content` 的读写(见 `ContentChunks`)。只由厂商接入
+    /// 文件声明(Mistral),其余方言的解析结果与请求字节不受影响。思考回传只走一条路:
+    /// `.read_and_echo` 发 thinking chunk 时不再看 `echoes_reasoning_content`。
+    content_chunks: ContentChunks = .none,
     /// The vendor pins the sampling parameters (Kimi K3 says to omit
     /// `temperature` / `top_p`; K2.7-code errors on any other value): the
     /// OpenAI chat serializer leaves a caller's `temperature` / `top_p`

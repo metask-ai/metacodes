@@ -665,3 +665,95 @@ test "issue #421 L2 (c): GLM and Qwen stream reasoning but never get it back" {
 test "issue #421 L2 (d): Claude's next request carries no thinking block" {
     try runToolTurn(.anthropic, "claude-sonnet-4-5", expectNoReasoning);
 }
+
+// ── Issue #437 L2: Mistral reasoning through agent_loop ─────────────────────
+//
+// Mistral asks for reasoning with a per-model `reasoning_effort`, streams it as
+// ThinkChunks inside a list-typed `delta.content` (a list while thinking, one
+// list holding the closing ThinkChunk and the first TextChunk at the
+// transition, a plain string after that), and asks for the full assistant
+// message back, ThinkChunks included. Mistral publishes no raw stream; this
+// cassette follows its prose and the openapi chunk schema.
+
+const MISTRAL_THINKING_TOOLCALL_SSE =
+    "data: {\"id\":\"m1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"need the \"}]}]},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"m1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"clock first\"}],\"closed\":true},{\"type\":\"text\",\"text\":\"Let me \"}]},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"m1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"check.\"},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"m1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"},\"index\":0}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":9,\"total_tokens\":21}}\n\n" ++
+    "data: [DONE]\n\n";
+
+fn runMistralToolTurn(model: []const u8, declared: ?dialect_mod.Vendor, effort: types.ReasoningEffort, want_effort: []const u8) !void {
+    const a = std.testing.allocator;
+    const cassette = [_][]const u8{ MISTRAL_THINKING_TOOLCALL_SSE, OPENAI_FINAL_SSE };
+    var srv = try harness.MockServer.startCassette(&cassette, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("get_time", "Get current time", &.{}, getTimeExec, null, false);
+    const tool_defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(tool_defs);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "what time is it");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+
+    var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", model, url);
+    defer client.deinit();
+    client.reasoning_effort = effort;
+    if (declared) |v| client.declared_dialect = .{ .route = v };
+    const result = try cc.agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+
+    // Request: the model's own effort word, right after the model name, on both turns.
+    var want_buf: [128]u8 = undefined;
+    const want_prefix = try std.fmt.bufPrint(&want_buf, "\"model\":\"{s}\",\"reasoning_effort\":\"{s}\",", .{ model, want_effort });
+    for (0..2) |i| {
+        const body = srv.requestAt(i).?.body();
+        try std.testing.expect(std.mem.startsWith(u8, body, "{"));
+        try std.testing.expect(std.mem.indexOf(u8, body, want_prefix) != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "reasoning_effort"));
+    }
+
+    // Response: the ThinkChunk text is the turn's thinking; the transition's
+    // TextChunk opens the answer text instead of being lost.
+    const first_reply = for (conv.messages.items) |m| {
+        if (m.role == .assistant) break m;
+    } else return error.TestUnexpectedResult;
+    var thinking: []const u8 = "";
+    var text: []const u8 = "";
+    for (first_reply.blocks) |b| switch (b) {
+        .thinking => |t| thinking = t,
+        .text => |t| text = t,
+        else => {},
+    };
+    try std.testing.expectEqualStrings(SECRET_REASONING, thinking);
+    try std.testing.expectEqualStrings("Let me check.", text);
+
+    // History: the whole assistant message comes back, ThinkChunk first, then
+    // the TextChunk, then the tool call; never as `reasoning_content`.
+    const second = srv.requestAt(1).?.body();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        second,
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"" ++ SECRET_REASONING ++ "\"}]},{\"type\":\"text\",\"text\":\"Let me check.\"}],\"tool_calls\":[{\"id\":\"call_1\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "reasoning_content") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second, SECRET_REASONING));
+}
+
+test "issue #437 L2: Mistral asks for reasoning in each model's vocabulary, parses ThinkChunks and sends them back" {
+    // Inferred from the name: Medium 3.5 takes none / high.
+    try runMistralToolTurn("mistral-medium-3-5", null, .medium, "high");
+    // A route declaring Mistral: Large 4 takes low / medium / high and no none.
+    try runMistralToolTurn("mistral-large-4-0", .mistral, .none, "low");
+}
