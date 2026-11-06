@@ -14,6 +14,8 @@ empty `### Migration`.
 
 ## Unreleased
 
+## 0.14.0 — 2026-11-06
+
 ### Changed
 
 - A Run now compacts its own Conversation and continues under the same Run ID
