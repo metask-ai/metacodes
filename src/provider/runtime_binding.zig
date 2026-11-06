@@ -83,9 +83,9 @@ pub const RuntimeBinding = struct {
     transport: types.ProviderKind,
     /// Only meaningful when `transport == .openai`; the route decides it.
     openai_protocol: types.OpenAIProtocol,
-    /// The vendor dialect the route declares; null infers it from the model
-    /// name at the transport.
-    dialect: ?profile_mod.Vendor,
+    /// The vendor dialect the route and the bound model declare; empty infers
+    /// it from the model name at the transport.
+    dialect: profile_mod.DialectDeclaration,
     endpoint_url: []const u8,
     /// The exact string the request body (or URL) must carry.
     request_model_id: []const u8,

@@ -19,10 +19,15 @@ status, compatibility boundaries, and entry points are defined by
   scheme to the session, a `/model` switch, child agents, swarm teammates and
   `AgentSession`. A route that declares nothing keeps model-name inference, so
   existing configurations behave as before; an unknown value fails the definition.
+  A model's declaration covers that model only: a child agent, teammate or
+  Session model switch onto another model of the same route keeps the route's
+  declaration or infers from its own name.
 - **OpenRouter's own request surface.** Offers ingested from an OpenRouter catalog
   declare the new OpenRouter dialect: `reasoning: {effort}` and `delta.reasoning`,
   whatever the upstream model is called. A `deepseek/...` model through OpenRouter
-  no longer gets DeepSeek's native `thinking` fields.
+  no longer gets DeepSeek's native `thinking` fields. OpenRouter routes' request
+  bytes change once, so their provider-side prompt cache misses on the first
+  request after the upgrade.
 
 ### Fixed
 
@@ -49,7 +54,16 @@ status, compatibility boundaries, and entry points are defined by
   (the API accepts only `disabled` / `adaptive`), M3.1 sends its `reasoning_effort`,
   and every MiniMax model asks for `reasoning_split`. Kimi K2.6 no longer puts an
   `effort` in its `thinking` object, and K2.7-code never sends `disabled`.
-  DeepSeek's `low` level is sent as `low` rather than `high`.
+  DeepSeek's `low` level is sent as `low` rather than `high`. A Kimi model id
+  that names no generation (`kimi-latest`, `kimi-for-coding`) is now treated as
+  K2.7 or later: thinking stays on, and `none` no longer sends `disabled`.
+
+### Fixed
+
+- **Kimi K2 with no reasoning effort set no longer crashes.** On the OpenAI chat
+  wire the K2.6 dialect unwrapped the unset effort while writing the `thinking`
+  object, which panicked in Debug and ReleaseSafe builds; it now sends
+  `{"type":"enabled","keep":"all"}`.
 
 ## 0.10.0 — 2026-10-31
 

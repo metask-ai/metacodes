@@ -14,6 +14,16 @@ empty `### Migration`.
 
 ## Unreleased
 
+### Fixed
+
+- A Run on MiniMax, Kimi or DeepSeek over the OpenAI chat wire sends the thinking
+  parameters those vendors document today (2026-11): MiniMax M3 `thinking.type`
+  `adaptive` instead of `enabled`, M3.1 its `reasoning_effort`, every MiniMax
+  model `reasoning_split`; no `effort` inside Kimi K2.6's `thinking` object, and
+  never `disabled` to K2.7-code; DeepSeek `low` as `low`. A Run on Kimi K2 with no
+  reasoning effort set no longer crashes. Other models' requests are unchanged.
+  No ABI change.
+
 ## 0.13.0 — 2026-10-31
 
 ### Added

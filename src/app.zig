@@ -823,14 +823,14 @@ pub const App = struct {
         // (no `--provider`) keeps the historical bearer header byte for byte.
         app.api_client.auth_scheme = config.auth_scheme;
         // The route's declared vendor dialect, like the auth scheme.
-        app.api_client.dialect_vendor = config.dialect;
+        app.api_client.declared_dialect = config.dialect;
         if (app.openai_client) |*client| {
             client.dialect_resolver = app_dialect_resolver;
-            client.dialect_vendor = config.dialect;
+            client.declared_dialect = config.dialect;
         }
         if (app.gemini_client) |*client| {
             client.dialect_resolver = app_dialect_resolver;
-            client.dialect_vendor = config.dialect;
+            client.declared_dialect = config.dialect;
         }
         const plugin_skill_sources = if (app.plugin_snapshot) |snapshot| snapshot.skill_sources else &.{};
         const plugin_agent_sources = if (app.plugin_snapshot) |snapshot| snapshot.agent_sources else &.{};
@@ -2130,18 +2130,18 @@ pub const App = struct {
         app.api_client.credential = .{ .fixed = secret };
         app.api_client.base_url = endpoint;
         app.api_client.auth_scheme = binding.auth_scheme;
-        app.api_client.dialect_vendor = binding.dialect;
+        app.api_client.declared_dialect = binding.dialect;
         if (app.openai_client) |*client| {
             client.credential = .{ .fixed = secret };
             client.base_url = endpoint;
             client.protocol = binding.openai_protocol;
             client.auth_scheme = binding.auth_scheme;
-            client.dialect_vendor = binding.dialect;
+            client.declared_dialect = binding.dialect;
         }
         if (app.gemini_client) |*client| {
             client.credential = .{ .fixed = secret };
             client.base_url = endpoint;
-            client.dialect_vendor = binding.dialect;
+            client.declared_dialect = binding.dialect;
         }
         // Every out-of-process UI learns the *route*, not just the model name: a
         // visible model name can come from several providers, channels,

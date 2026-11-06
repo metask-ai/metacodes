@@ -755,9 +755,10 @@ pub const SessionConfig = struct {
     /// Null keeps the historical `authorization: Bearer` bytes, so an embedder
     /// that names no provider is byte-identical.
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
-    /// The vendor dialect the resolved route declares; null infers it from
-    /// the model name, which is what a Session did before routes could say.
-    dialect: ?@import("../provider/vendor.zig").Vendor = null,
+    /// The vendor dialect the resolved route declares, for `model`; empty
+    /// infers it from the model name, which is what a Session did before routes
+    /// could say.
+    dialect: @import("../provider/vendor.zig").Declaration = .{},
     api_key: []const u8,
     model: []const u8,
     base_url: ?[]const u8 = null,
@@ -1393,8 +1394,9 @@ pub const AgentSession = struct {
     /// own route does; a subagent sending bearer at an `x-api-key` endpoint has
     /// the right key and the wrong header.
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
-    /// Carried with `auth_scheme`: a tool-scoped provider writes the route's dialect.
-    dialect: ?@import("../provider/vendor.zig").Vendor = null,
+    /// Carried with `auth_scheme`: a tool-scoped provider writes the route's
+    /// dialect. Declared for `model`; a model switch keeps only the route's part.
+    dialect: @import("../provider/vendor.zig").Declaration = .{},
     /// Owned copy of `SessionConfig.model_capabilities`, handed to every
     /// provider this Session builds.
     model_capabilities: image_capability.Declarations = .{},
@@ -1873,6 +1875,9 @@ pub const AgentSession = struct {
         errdefer self.allocator.free(replacement_model);
         // Same options as creation: the route's auth scheme and the Host's
         // capability declarations belong to the Session, not to one model.
+        // A model entry's dialect declaration does: the new model keeps only
+        // the route's.
+        const replacement_dialect = self.dialect.rebind(self.model, replacement_model);
         var replacement_provider = provider_factory.makeProviderWithOptions(
             self.allocator,
             provider_kind,
@@ -1881,7 +1886,7 @@ pub const AgentSession = struct {
             self.base_url,
             self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = self.auth_scheme, .dialect = self.dialect, .limits = null, .capability_declarations = self.model_capabilities },
+            .{ .auth_scheme = self.auth_scheme, .dialect = replacement_dialect, .limits = null, .capability_declarations = self.model_capabilities },
         ) catch |err| {
             self.cancelMutation();
             return err;
@@ -1898,6 +1903,7 @@ pub const AgentSession = struct {
         const previous_model = self.model;
         const previous_provider = self.provider;
         self.model = replacement_model;
+        self.dialect = replacement_dialect;
         self.provider = replacement_provider;
         self.mutex.unlock();
 
