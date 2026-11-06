@@ -2,7 +2,12 @@
 //!
 //! This module is deliberately a run-scoped decorator around the neutral
 //! Provider and ToolDispatcher interfaces. It does not teach the shared agent
-//! loop AgentCore policy, and it never performs hidden compaction.
+//! loop AgentCore policy. Compaction inside a Run stays the shared loop's and
+//! compact kernel's; this layer only answers through
+//! `core.compaction_control` (issue #430): it asks for compaction under
+//! checkpoint pressure, admits the summary request as maintenance, refuses a
+//! replacement that does not fit, and re-measures the checkpoint the
+//! replacement produced.
 
 const std = @import("std");
 const core = @import("metacodes-core");
@@ -33,6 +38,17 @@ pub const Error = error{
     BudgetRequired,
     BudgetExhausted,
 };
+
+/// `beginOperation` with deferral: the operation did not fit, no outcome was
+/// recorded, and compaction may still relieve the capacity it lacked.
+pub const AdmissionError = Error || error{CapacityDeferred};
+
+/// Compactions one Run may start for checkpoint capacity (its own pressure,
+/// not the token window's). Each is a paid summary request at most; the
+/// re-arm rule in `Controller` already stops a fruitless attempt from
+/// repeating, so this only bounds a Run whose every compaction worked but
+/// whose growth keeps outrunning them.
+pub const MAX_CAPACITY_COMPACTIONS_PER_RUN: u8 = 3;
 
 pub const Profile = struct {
     hard_bytes: u64 = DEFAULT_HARD_BYTES,
@@ -322,6 +338,28 @@ pub const Controller = struct {
     provider_operations: u64 = 0,
     tool_operations: u64 = 0,
     mcp_operations: u64 = 0,
+    /// A compaction transaction is running (issue #430). Its provider traffic
+    /// is maintenance: admitted against the caps and the live reservations
+    /// but not against the Conversation it is about to replace, and settled
+    /// without growing the durable estimate. Its result becomes durable only
+    /// through the guarded replacement, which is re-measured.
+    compaction_active: bool = false,
+    /// Provider operations admitted as compaction maintenance (a subset of
+    /// `provider_operations`): the compaction requests this Run paid for.
+    maintenance_operations: u64 = 0,
+    /// Compactions started for checkpoint capacity in this Run.
+    capacity_compactions: u8 = 0,
+    /// The durable estimate when a capacity compaction last relieved nothing
+    /// (or found nothing to compact). Capacity pressure re-arms only once the
+    /// estimate has grown past it, so an attempt that did not help is never
+    /// repeated against the same state.
+    capacity_fruitless_at: ?u64 = null,
+    /// The bytes the last deferred root request needed (`CapacityDeferred`),
+    /// until a root request is admitted again. If the loop gives up on it
+    /// (`abandonDeferredCapacity`) this is the requirement the Run's budget
+    /// terminal reports — what the re-issued request would have been refused
+    /// with.
+    deferred_required_bytes: ?u64 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -341,14 +379,57 @@ pub const Controller = struct {
         kind: OperationKind,
         request_bytes: u64,
     ) Error!Reservation {
+        return self.beginOperationImpl(kind, request_bytes, .ordinary) catch |err| switch (err) {
+            error.CapacityDeferred => unreachable,
+            else => |e| return e,
+        };
+    }
+
+    /// `beginOperation` for a request of the root Run's own Provider
+    /// (issue #430), which is the only Provider a Run compacts through.
+    ///
+    /// - While a compaction is running the request is that compaction's
+    ///   summary: maintenance, admitted against the caps and the live
+    ///   reservations but not against the Conversation it may replace, and
+    ///   settled without charging the durable estimate.
+    /// - Otherwise, when it does not fit but a capacity compaction may still
+    ///   relieve it, this records **no** outcome and returns
+    ///   `error.CapacityDeferred`, so the loop can compact and re-issue the
+    ///   turn. Once compaction can no longer help it refuses exactly like
+    ///   `beginOperation`.
+    pub fn beginRootProviderOperation(
+        self: *Controller,
+        request_bytes: u64,
+    ) AdmissionError!Reservation {
+        return self.beginOperationImpl(.provider, request_bytes, .root_provider);
+    }
+
+    const AdmissionMode = enum { ordinary, root_provider };
+
+    fn beginOperationImpl(
+        self: *Controller,
+        kind: OperationKind,
+        request_bytes: u64,
+        mode: AdmissionMode,
+    ) AdmissionError!Reservation {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.outcome_value != .none) return error.BudgetExhausted;
+        const maintenance = mode == .root_provider and self.compaction_active;
+        const deferrable = mode == .root_provider and !maintenance and
+            self.canRelieveCapacityLocked();
         const request_cap = if (kind == .provider)
             self.profile.provider_request_cap_bytes
         else
             self.profile.input_cap_bytes;
         if (request_bytes > request_cap) {
+            // The request carries the Conversation, so compaction may shrink
+            // it below the cap; an oversized single payload is what the
+            // compaction then fails to relieve.
+            if (deferrable) {
+                self.deferred_required_bytes = request_bytes;
+                return error.CapacityDeferred;
+            }
             self.markOutcomeLocked(.budget_exhausted, request_bytes);
             return error.BudgetExhausted;
         }
@@ -365,8 +446,13 @@ pub const Controller = struct {
             self.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
             return error.BudgetExhausted;
         };
+        // A summary request does not append to the Conversation it reads: its
+        // durable effect is decided by the guarded replacement, exactly like
+        // the explicit compact transaction. Counting the live Conversation
+        // here would make a near-hard Session unable to compact at all.
+        const base_usage = if (maintenance) 0 else self.estimated_usage_bytes;
         var required = checkedAdd(
-            self.estimated_usage_bytes,
+            base_usage,
             self.reserved_bytes,
         ) catch {
             self.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
@@ -381,6 +467,10 @@ pub const Controller = struct {
             return error.BudgetExhausted;
         };
         if (required > self.profile.hard_bytes) {
+            if (deferrable) {
+                self.deferred_required_bytes = required;
+                return error.CapacityDeferred;
+            }
             self.markOutcomeLocked(.budget_exhausted, required);
             return error.BudgetExhausted;
         }
@@ -391,11 +481,115 @@ pub const Controller = struct {
             .tool => self.tool_operations += 1,
             .mcp => self.mcp_operations += 1,
         }
+        if (maintenance) self.maintenance_operations += 1;
+        if (mode == .root_provider and !maintenance) self.deferred_required_bytes = null;
         return .{
             .controller = self,
             .reserved_bytes = reserved,
             .payload_cap_bytes = payload_cap,
+            .maintenance = maintenance,
         };
+    }
+
+    /// Capacity pressure may still be relieved by a compaction this Run.
+    fn canRelieveCapacityLocked(self: *const Controller) bool {
+        if (self.outcome_value != .none or self.compaction_active) return false;
+        if (self.capacity_compactions >= MAX_CAPACITY_COMPACTIONS_PER_RUN) return false;
+        if (self.capacity_fruitless_at) |at| return self.estimated_usage_bytes > at;
+        return true;
+    }
+
+    /// Checkpoint pressure asks for compaction at a safe boundary: the
+    /// durable estimate reached `soft_bytes`, the point `describe` already
+    /// reports as `compaction_recommended`.
+    pub fn wantsCapacityCompaction(self: *Controller) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.canRelieveCapacityLocked() and
+            self.estimated_usage_bytes >= self.profile.soft_bytes;
+    }
+
+    pub fn beginCompaction(self: *Controller, trigger: core.compaction_control.Trigger) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(!self.compaction_active);
+        self.compaction_active = true;
+        if (trigger == .durable_capacity) self.capacity_compactions +|= 1;
+    }
+
+    /// The commit predicate: the replacement checkpoint, every live
+    /// reservation (unfinished operations, accepted but not adopted input)
+    /// and the terminal reserve must fit under `hard_bytes`. A refusal is the
+    /// Run's budget terminal, so the Host sees the bytes it would have needed.
+    pub fn allowCompactionCommit(self: *Controller, replacement_usage: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.outcome_value != .none) return false;
+        var required = checkedAdd(replacement_usage, self.reserved_bytes) catch {
+            self.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return false;
+        };
+        required = checkedAdd(required, self.profile.terminal_reserve_bytes) catch {
+            self.markOutcomeLocked(.resource_limit, std.math.maxInt(u64));
+            return false;
+        };
+        if (required > self.profile.hard_bytes) {
+            self.markOutcomeLocked(.budget_exhausted, required);
+            return false;
+        }
+        return true;
+    }
+
+    /// End of a compaction attempt. `committed_usage` is the exact checkpoint
+    /// size of the state the Run continues from, re-measured after the
+    /// replacement; it replaces the running estimate, while reservations for
+    /// unfinished operations and pending submitted input stay untouched.
+    /// `null` means no replacement happened.
+    pub fn settleCompaction(
+        self: *Controller,
+        trigger: core.compaction_control.Trigger,
+        admitted: bool,
+        committed_usage: ?u64,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (admitted) {
+            std.debug.assert(self.compaction_active);
+            self.compaction_active = false;
+        }
+        if (committed_usage) |usage| self.estimated_usage_bytes = usage;
+        const relieved = committed_usage != null and
+            self.estimated_usage_bytes < self.profile.soft_bytes;
+        if (relieved) {
+            self.capacity_fruitless_at = null;
+        } else if (trigger == .durable_capacity) {
+            self.capacity_fruitless_at = self.estimated_usage_bytes;
+        }
+    }
+
+    /// The loop gave up on the deferred root request without re-issuing it
+    /// (issue #430): its recovery compaction failed, or the turn's recovery
+    /// bound is spent. Record the refusal the request would have met, with
+    /// the bytes it needed, so the Run ends with the budget terminal.
+    pub fn abandonDeferredCapacity(self: *Controller) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const required = self.deferred_required_bytes orelse
+            self.profile.hard_bytes +| 1;
+        self.deferred_required_bytes = null;
+        self.markOutcomeLocked(.budget_exhausted, required);
+    }
+
+    pub fn estimatedUsage(self: *Controller) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.estimated_usage_bytes;
+    }
+
+    pub fn reservedBytes(self: *Controller) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.reserved_bytes;
     }
 
     /// Reserve one durable Session mutation that occurs inside a Run, such as
@@ -671,6 +865,8 @@ pub const Reservation = struct {
     reserved_bytes: u64,
     payload_cap_bytes: u64,
     active: bool = true,
+    /// Admitted as compaction maintenance (`Controller.compaction_active`).
+    maintenance: bool = false,
 
     pub fn payloadCap(self: *const Reservation) u64 {
         return self.payload_cap_bytes;
@@ -743,13 +939,16 @@ pub const Reservation = struct {
         }
     }
 
-    /// Dispatch on scope so both decorators settle through one seam.
+    /// Dispatch on scope so both decorators settle through one seam. A
+    /// compaction summary is transient whatever the Provider's scope: what it
+    /// leaves behind is re-measured from the replacement (issue #430).
     pub fn settle(
         self: *Reservation,
         scope: DurableScope,
         payload_bytes: u64,
         durable_delta_bytes: u64,
     ) Error!void {
+        if (self.maintenance) return self.settleTransient(payload_bytes);
         return switch (scope) {
             .session => self.settleSuccess(payload_bytes, durable_delta_bytes),
             .transient => self.settleTransient(payload_bytes),
@@ -921,6 +1120,11 @@ pub const BudgetedProvider = struct {
     base: core.api_provider.Provider,
     /// `.transient` for the Provider a child agent runs on (see `DurableScope`).
     scope: DurableScope = .session,
+    /// The root Run's own Provider, the one its compactions run through
+    /// (issue #430): admitted with `Controller.beginRootProviderOperation`.
+    /// A child agent's Provider and the explicit idle compact keep the plain
+    /// admission.
+    run_root: bool = false,
 
     pub fn provider(self: *BudgetedProvider) core.api_provider.Provider {
         return .{
@@ -931,10 +1135,16 @@ pub const BudgetedProvider = struct {
             .sendFn = send,
             .cancelFn = cancel,
             .maxTokensFn = maxTokens,
-            // AgentCore compact is an explicit idle activity. Returning the
-            // largest neutral window prevents shared automatic compaction;
-            // explicit provider context failures are translated below.
+            // The model's real window, output limit and learned-wall identity
+            // pass through (issue #430): the shared loop compacts a Run at its
+            // usual thresholds and recovers from the provider's own
+            // context-window rejection. Budgeting decorates requests; it does
+            // not redefine the model.
             .maxInputTokensFn = maxInputTokens,
+            .maxTokensForFn = maxTokensFor,
+            .maxInputTokensForFn = maxInputTokensFor,
+            .lastContextWindowNumbersFn = lastContextWindowNumbers,
+            .endpointIdFn = endpointId,
             .reasoningEffortFn = reasoningEffort,
             .supportsFn = supports,
         };
@@ -972,7 +1182,7 @@ pub const BudgetedProvider = struct {
             user_query,
         ) catch |err| {
             reservation.release();
-            return translateContextError(err);
+            return err;
         };
         return self.wrapStream(base_stream, reservation);
     }
@@ -1011,7 +1221,7 @@ pub const BudgetedProvider = struct {
             user_query,
         ) catch |err| {
             reservation.release();
-            return translateContextError(err);
+            return err;
         };
         return self.wrapStream(base_stream, reservation);
     }
@@ -1038,7 +1248,7 @@ pub const BudgetedProvider = struct {
             model_override,
         ) catch |err| {
             reservation.release();
-            return translateContextError(err);
+            return err;
         };
         const measured = measureApiResponse(response) catch {
             deinitApiResponse(self.allocator, response);
@@ -1076,8 +1286,14 @@ pub const BudgetedProvider = struct {
             tool_choice,
             self.base.supportsForModel(.image_input, model_override),
         );
-        return self.controller.beginOperation(.provider, request_bytes) catch
-            return error.CheckpointBudgetExhausted;
+        if (!self.run_root)
+            return self.controller.beginOperation(.provider, request_bytes) catch
+                return error.CheckpointBudgetExhausted;
+        return self.controller.beginRootProviderOperation(request_bytes) catch |err| switch (err) {
+            // Pre-network deferral: the loop compacts and re-issues the turn.
+            error.CapacityDeferred => return error.DurableCapacityExceeded,
+            else => return error.CheckpointBudgetExhausted,
+        };
     }
 
     fn wrapStream(
@@ -1109,8 +1325,24 @@ pub const BudgetedProvider = struct {
         return cast(raw).base.maxTokens();
     }
 
-    fn maxInputTokens(_: *anyopaque) u32 {
-        return std.math.maxInt(u32);
+    fn maxInputTokens(raw: *anyopaque) u32 {
+        return cast(raw).base.maxInputTokens();
+    }
+
+    fn maxTokensFor(raw: *anyopaque, name: []const u8) u32 {
+        return cast(raw).base.maxTokensFor(name);
+    }
+
+    fn maxInputTokensFor(raw: *anyopaque, name: []const u8) u32 {
+        return cast(raw).base.maxInputTokensFor(name);
+    }
+
+    fn lastContextWindowNumbers(raw: *anyopaque) core.api_error_class.ContextWindowNumbers {
+        return cast(raw).base.lastContextWindowNumbers();
+    }
+
+    fn endpointId(raw: *anyopaque) []const u8 {
+        return cast(raw).base.endpointId();
     }
 
     fn reasoningEffort(raw: *anyopaque) ?core.types.ReasoningEffort {
@@ -1171,7 +1403,7 @@ const StreamWrapper = struct {
         }
         const maybe_event = self.base.next() catch |err| {
             self.finish(.release);
-            return translateContextError(err);
+            return err;
         };
         const event = maybe_event orelse {
             self.finish(.settle);
@@ -1308,6 +1540,94 @@ pub const RunAdmission = struct {
     }
 };
 
+/// Exact checkpoint size of the Session as it would be exported with the given
+/// Conversation in place of the live one. Owned by the facade, which alone
+/// knows the other checkpoint sections; null when the state cannot be encoded
+/// within the profile's checkpoint limits.
+pub const CheckpointMeasurer = struct {
+    ctx: *anyopaque,
+    measureFn: *const fn (
+        ctx: *anyopaque,
+        conversation: *const core.conversation.Conversation,
+    ) ?u64,
+
+    pub fn measure(
+        self: CheckpointMeasurer,
+        conversation: *const core.conversation.Conversation,
+    ) ?u64 {
+        return self.measureFn(self.ctx, conversation);
+    }
+};
+
+/// The durable-budget side of Run compaction (issue #430): the
+/// `core.compaction_control.Control` a root Run installs beside its budgeted
+/// Provider and `RunAdmission`. All state lives in the Controller under its
+/// mutex; this adapter only adds the checkpoint measurement.
+pub const RunCompaction = struct {
+    controller: *Controller,
+    measurer: CheckpointMeasurer,
+
+    pub fn control(self: *RunCompaction) core.compaction_control.Control {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable = core.compaction_control.Control.VTable{
+        .wantsCompaction = wantsFn,
+        .begin = beginFn,
+        .allowCommit = allowFn,
+        .settle = settleFn,
+        .abandonDeferred = abandonFn,
+    };
+
+    fn wantsFn(raw: *anyopaque) bool {
+        return cast(raw).controller.wantsCapacityCompaction();
+    }
+
+    fn abandonFn(raw: *anyopaque) void {
+        cast(raw).controller.abandonDeferredCapacity();
+    }
+
+    fn beginFn(raw: *anyopaque, trigger: core.compaction_control.Trigger) void {
+        cast(raw).controller.beginCompaction(trigger);
+    }
+
+    fn allowFn(
+        raw: *anyopaque,
+        replacement: *const core.conversation.Conversation,
+    ) bool {
+        const self = cast(raw);
+        const usage = self.measurer.measure(replacement) orelse {
+            self.controller.failReplacementBudget(self.controller.profile.hard_bytes +| 1);
+            return false;
+        };
+        return self.controller.allowCompactionCommit(usage);
+    }
+
+    fn settleFn(
+        raw: *anyopaque,
+        trigger: core.compaction_control.Trigger,
+        settlement: core.compaction_control.Settlement,
+    ) void {
+        const self = cast(raw);
+        switch (settlement) {
+            // The guard measured this replacement before it was committed, so
+            // it encodes; if it no longer does, keep the larger running
+            // estimate rather than invent a smaller one.
+            .committed => |live| self.controller.settleCompaction(
+                trigger,
+                true,
+                self.measurer.measure(live),
+            ),
+            .not_committed => self.controller.settleCompaction(trigger, true, null),
+            .nothing_to_compact => self.controller.settleCompaction(trigger, false, null),
+        }
+    }
+
+    fn cast(raw: *anyopaque) *RunCompaction {
+        return @ptrCast(@alignCast(raw));
+    }
+};
+
 const MeasuredPayload = struct { payload: u64, durable: u64 };
 
 fn measureStreamEvent(event: core.api_stream.StreamEvent) Error!MeasuredPayload {
@@ -1430,12 +1750,6 @@ fn canonicalRequestBytes(
         else => {},
     };
     return @as(u64, @intCast(encoded.len)) +| payload_bytes;
-}
-
-fn translateContextError(err: anyerror) anyerror {
-    if (err == error.ContextWindowExceeded)
-        return error.AgentCoreContextLimitRequiresExplicitCompact;
-    return err;
 }
 
 fn checkedAdd(left: anytype, right: anytype) Error!u64 {
@@ -2562,4 +2876,271 @@ test "commitDurable charges the fork root final text once and fails closed at th
 
     // Once an outcome stands nothing further is admitted, even a zero-length commit.
     try std.testing.expectError(error.BudgetExhausted, controller.commitDurable(0));
+}
+
+fn projectedController(profile: Profile, projected: u64) Controller {
+    return Controller.init(std.testing.allocator, profile, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = projected,
+        .minimum_required_bytes = projected,
+    });
+}
+
+test "issue #430: capacity compaction asks at soft pressure, re-arms only after growth, and is bounded per Run" {
+    const profile = smallTestProfile();
+    var controller = projectedController(profile, profile.soft_bytes + 28);
+    try std.testing.expect(controller.wantsCapacityCompaction());
+
+    for (0..MAX_CAPACITY_COMPACTIONS_PER_RUN) |_| {
+        try std.testing.expect(controller.wantsCapacityCompaction());
+        controller.beginCompaction(.durable_capacity);
+        // Provider traffic while compacting never asks for another one.
+        try std.testing.expect(!controller.wantsCapacityCompaction());
+        controller.settleCompaction(.durable_capacity, true, null);
+        // Fruitless: the same state never asks again...
+        try std.testing.expect(!controller.wantsCapacityCompaction());
+        // ...until the durable estimate grows past it.
+        try controller.commitDurable(10);
+    }
+    // Every attempt this Run may start is spent.
+    try std.testing.expectEqual(MAX_CAPACITY_COMPACTIONS_PER_RUN, controller.capacity_compactions);
+    try std.testing.expect(!controller.wantsCapacityCompaction());
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+
+    // Window-triggered compactions do not spend capacity attempts.
+    var window = projectedController(profile, 100);
+    window.beginCompaction(.context_window);
+    window.settleCompaction(.context_window, true, 90);
+    try std.testing.expectEqual(@as(u8, 0), window.capacity_compactions);
+    try std.testing.expectEqual(@as(u64, 90), window.estimatedUsage());
+}
+
+test "issue #430: a root request the checkpoint cannot hold is deferred without an outcome until compaction cannot help" {
+    const profile = smallTestProfile();
+    // 2600 + terminal 128 + (1000 + 512 + 64) = 4304 > 4096.
+    var controller = projectedController(profile, 2600);
+    try std.testing.expectError(error.CapacityDeferred, controller.beginRootProviderOperation(1000));
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+    try std.testing.expectEqual(@as(u64, 0), controller.provider_operations);
+    try std.testing.expectEqual(@as(u64, 0), controller.reservedBytes());
+    // An over-cap request (it carries the Conversation) is deferred too.
+    try std.testing.expectError(error.CapacityDeferred, controller.beginRootProviderOperation(2000));
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+
+    // The compaction found nothing to drop: the same request now meets the
+    // real refusal, with the bytes it needed.
+    controller.settleCompaction(.durable_capacity, false, null);
+    try std.testing.expectError(error.BudgetExhausted, controller.beginRootProviderOperation(1000));
+    try std.testing.expectEqual(Outcome.budget_exhausted, controller.outcome());
+    try std.testing.expectEqual(@as(u64, 4304), controller.requiredBytes());
+
+    // Child-agent and Tool admissions never defer.
+    var plain = projectedController(profile, 2600);
+    try std.testing.expectError(error.BudgetExhausted, plain.beginOperation(.provider, 1000));
+    try std.testing.expectEqual(Outcome.budget_exhausted, plain.outcome());
+}
+
+test "issue #430: an abandoned deferred request records the budget terminal with the bytes it needed" {
+    const profile = smallTestProfile();
+    // 2600 + terminal 128 + (1000 + 512 + 64) = 4304 > 4096: deferred.
+    var controller = projectedController(profile, 2600);
+    try std.testing.expectError(error.CapacityDeferred, controller.beginRootProviderOperation(1000));
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+    // The loop gives up without re-issuing: the refusal it would have met.
+    controller.abandonDeferredCapacity();
+    try std.testing.expectEqual(Outcome.budget_exhausted, controller.outcome());
+    try std.testing.expectEqual(@as(u64, 4304), controller.requiredBytes());
+    try std.testing.expectError(error.BudgetExhausted, controller.beginRootProviderOperation(1));
+
+    // An over-cap deferral reports the request's own size.
+    var over_cap = projectedController(profile, 0);
+    try std.testing.expectError(error.CapacityDeferred, over_cap.beginRootProviderOperation(profile.provider_request_cap_bytes + 1));
+    over_cap.abandonDeferredCapacity();
+    try std.testing.expectEqual(Outcome.budget_exhausted, over_cap.outcome());
+    try std.testing.expectEqual(profile.provider_request_cap_bytes + 1, over_cap.requiredBytes());
+
+    // A root request admitted after the deferral clears it; the terminal is
+    // still recorded, and its requirement is past hard.
+    var cleared = projectedController(profile, 2600);
+    try std.testing.expectError(error.CapacityDeferred, cleared.beginRootProviderOperation(1000));
+    var admitted = try cleared.beginRootProviderOperation(1);
+    admitted.release();
+    try std.testing.expect(cleared.deferred_required_bytes == null);
+    cleared.abandonDeferredCapacity();
+    try std.testing.expectEqual(Outcome.budget_exhausted, cleared.outcome());
+    try std.testing.expectEqual(profile.hard_bytes + 1, cleared.requiredBytes());
+}
+
+test "issue #430: a compaction summary is maintenance: admitted beside the replaced state, never charged as durable" {
+    const profile = smallTestProfile();
+    // Near hard: an ordinary request of this size could not be admitted.
+    var controller = projectedController(profile, 3900);
+    controller.beginCompaction(.durable_capacity);
+    var summary = try controller.beginRootProviderOperation(500);
+    try std.testing.expect(summary.maintenance);
+    try std.testing.expectEqual(@as(u64, 1), controller.maintenance_operations);
+    try std.testing.expectEqual(@as(u64, 1), controller.provider_operations);
+    try summary.settle(.session, 100, 114);
+    try std.testing.expectEqual(@as(u64, 3900), controller.estimatedUsage());
+    try std.testing.expectEqual(@as(u64, 0), controller.reservedBytes());
+
+    // The caps still bind: an oversized summary is a resource limit, and a
+    // Run with an outcome refuses every replacement.
+    var oversized = try controller.beginRootProviderOperation(500);
+    try std.testing.expectError(error.ResourceLimit, oversized.settle(.session, 513, 527));
+    try std.testing.expectEqual(Outcome.resource_limit, controller.outcome());
+    try std.testing.expect(!controller.allowCompactionCommit(100));
+    controller.settleCompaction(.durable_capacity, true, null);
+    try std.testing.expect(!controller.compaction_active);
+
+    // The request cap binds a summary like any request.
+    var capped = projectedController(profile, 3900);
+    capped.beginCompaction(.context_window);
+    try std.testing.expectError(error.BudgetExhausted, capped.beginRootProviderOperation(profile.provider_request_cap_bytes + 1));
+    try std.testing.expectEqual(Outcome.budget_exhausted, capped.outcome());
+}
+
+test "issue #430: a committed compaction re-measures usage and keeps live reservations" {
+    const profile = smallTestProfile();
+    var controller = projectedController(profile, 2000);
+    // Pending submitted input and one unfinished Tool operation.
+    const input = try controller.reserveSubmittedInput("pending host input");
+    var tool = try controller.beginOperation(.tool, 10);
+    const reserved = controller.reservedBytes();
+    try std.testing.expectEqual(input + tool.reserved_bytes, reserved);
+
+    controller.beginCompaction(.durable_capacity);
+    try std.testing.expect(controller.allowCompactionCommit(1200));
+    controller.settleCompaction(.durable_capacity, true, 1200);
+    // The estimate is now the measured checkpoint; every reservation stands.
+    try std.testing.expectEqual(@as(u64, 1200), controller.estimatedUsage());
+    try std.testing.expectEqual(reserved, controller.reservedBytes());
+    try std.testing.expectEqual(input, controller.submitted_input_delta_bytes);
+    try std.testing.expect(controller.capacity_fruitless_at == null);
+    // Adoption and the Tool settle continue from the re-measured state.
+    controller.commitSubmittedInput(input);
+    try std.testing.expectEqual(@as(u64, 1200) + input, controller.estimatedUsage());
+    try tool.settle(.session, 4, 36);
+    try std.testing.expectEqual(@as(u64, 0), controller.reservedBytes());
+
+    // A replacement that does not fit beside the live reservations and the
+    // terminal reserve is refused as the Run's budget terminal.
+    var tight = projectedController(profile, 2000);
+    const pending = try tight.reserveSubmittedInput("pending host input");
+    tight.beginCompaction(.context_window);
+    const too_large = profile.hard_bytes - pending - profile.terminal_reserve_bytes + 1;
+    try std.testing.expect(!tight.allowCompactionCommit(too_large));
+    try std.testing.expectEqual(Outcome.budget_exhausted, tight.outcome());
+    try std.testing.expectEqual(profile.hard_bytes + 1, tight.requiredBytes());
+    tight.settleCompaction(.context_window, true, null);
+    try std.testing.expectEqual(@as(u64, 2000), tight.estimatedUsage());
+    tight.releaseSubmittedInput(pending);
+}
+
+test "issue #430: the budgeted Provider reports the real model window and passes context rejections through" {
+    const Fake = struct {
+        fn model(_: *anyopaque) []const u8 {
+            return "window-model";
+        }
+        fn sendStream(
+            _: *anyopaque,
+            _: []const core.types.ApiMessage,
+            _: ?[]const u8,
+            _: ?[]const core.json.ToolDefinition,
+            _: ?*const core.util_abort.AbortSignal,
+            _: ?[]const u8,
+            _: ?core.json.ToolChoice,
+            _: []const u8,
+        ) anyerror!core.api_provider.StreamHandle {
+            return error.ContextWindowExceeded;
+        }
+        fn sendStreamRetry(
+            _: *anyopaque,
+            _: []const core.types.ApiMessage,
+            _: ?[]const u8,
+            _: ?[]const core.json.ToolDefinition,
+            _: ?*const core.util_abort.AbortSignal,
+            _: ?[]const u8,
+            _: ?core.json.ToolChoice,
+            _: u32,
+            _: u64,
+            _: ?core.api_provider.RetryReporter,
+            _: []const u8,
+        ) anyerror!core.api_provider.StreamHandle {
+            return error.ContextWindowExceeded;
+        }
+        fn send(
+            _: *anyopaque,
+            _: []const core.types.ApiMessage,
+            _: ?[]const u8,
+            _: ?[]const core.json.ToolDefinition,
+            _: ?[]const u8,
+        ) anyerror!core.api_provider.ApiResponse {
+            return error.ContextWindowExceeded;
+        }
+        fn maxTokens(_: *anyopaque) u32 {
+            return 4096;
+        }
+        fn maxTokensFor(_: *anyopaque, _: []const u8) u32 {
+            return 2048;
+        }
+        fn maxInputTokens(_: *anyopaque) u32 {
+            return 131_072;
+        }
+        fn maxInputTokensFor(_: *anyopaque, _: []const u8) u32 {
+            return 32_768;
+        }
+        fn endpointId(_: *anyopaque) []const u8 {
+            return "https://endpoint.test";
+        }
+        fn numbers(_: *anyopaque) core.api_error_class.ContextWindowNumbers {
+            return .{ .input_limit = 1000 };
+        }
+        fn reasoningEffort(_: *anyopaque) ?core.types.ReasoningEffort {
+            return null;
+        }
+        fn supports(_: *anyopaque, _: core.api_provider.Capability) bool {
+            return false;
+        }
+    };
+    var dummy: u8 = 0;
+    const base = core.api_provider.Provider{
+        .ctx = &dummy,
+        .modelFn = Fake.model,
+        .sendStreamFn = Fake.sendStream,
+        .sendStreamRetryFn = Fake.sendStreamRetry,
+        .sendFn = Fake.send,
+        .maxTokensFn = Fake.maxTokens,
+        .maxTokensForFn = Fake.maxTokensFor,
+        .maxInputTokensFn = Fake.maxInputTokens,
+        .maxInputTokensForFn = Fake.maxInputTokensFor,
+        .endpointIdFn = Fake.endpointId,
+        .lastContextWindowNumbersFn = Fake.numbers,
+        .reasoningEffortFn = Fake.reasoningEffort,
+        .supportsFn = Fake.supports,
+    };
+    var controller = projectedController(.{}, 0);
+    var budgeted = BudgetedProvider{
+        .allocator = std.testing.allocator,
+        .controller = &controller,
+        .base = base,
+        .run_root = true,
+    };
+    const wrapped = budgeted.provider();
+    try std.testing.expectEqual(@as(u32, 131_072), wrapped.maxInputTokens());
+    try std.testing.expectEqual(@as(u32, 32_768), wrapped.maxInputTokensFor("child"));
+    try std.testing.expectEqual(@as(u32, 2048), wrapped.maxTokensFor("child"));
+    try std.testing.expectEqualStrings("https://endpoint.test", wrapped.endpointId());
+    try std.testing.expectEqual(@as(?u64, 1000), wrapped.lastContextWindowNumbers().input_limit);
+    const messages = [_]core.types.ApiMessage{.{
+        .role = .user,
+        .content = &[_]core.types.ApiContent{.{ .text = "hello" }},
+    }};
+    // The loop's context-window recovery sees the provider's own error.
+    try std.testing.expectError(
+        error.ContextWindowExceeded,
+        wrapped.sendStream(&messages, null, null, null, null, null, ""),
+    );
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+    try std.testing.expectEqual(@as(u64, 0), controller.reservedBytes());
 }

@@ -114,8 +114,13 @@ pub const RunContext = struct {
 
 /// Events a session service emits around the kernel's. Borrowed slices.
 pub const HostEvent = union(enum) {
-    /// A queued submission became the input of Run `run_id`.
-    user_message: struct { run_id: u64, trace_id: ?[]const u8 = null, text: []const u8 },
+    /// A queued submission became the input of Run `run_id`. `replaces` is
+    /// the 1-based position of the user message it was submitted to replace
+    /// (edit-and-rerun): that message and everything after it leave the
+    /// conversation before the Run, unless `run_done` names the refusal
+    /// (`PositionOutOfRange`, `NotUserMessage`, `PositionCompacted`). Null
+    /// when the text is appended after the whole conversation.
+    user_message: struct { run_id: u64, trace_id: ?[]const u8 = null, text: []const u8, replaces: ?usize = null },
     /// Run `run_id` ended: `stop_reason` when it returned, `error_name` when
     /// it failed. `model_error` says why, when the stop was a model failure.
     run_done: struct { run_id: u64, trace_id: ?[]const u8 = null, stop_reason: ?[]const u8 = null, error_name: ?[]const u8 = null, model_error: ?@import("../../api/model_error.zig").Detail.View = null },

@@ -144,6 +144,7 @@ pub const agent_loop = @import("core/agent_loop.zig");
 pub const agent_session = @import("core/agent_session.zig");
 pub const execution_effect = @import("core/execution_effect.zig");
 pub const response_candidate = @import("core/response_candidate.zig");
+pub const compaction_control = @import("core/compaction_control.zig");
 pub const run_recovery = @import("core/run_recovery.zig");
 pub const run_input = @import("core/run_input.zig");
 pub const plugin = @import("plugin/root.zig");

@@ -279,6 +279,9 @@ const host_events = [_]cc.wire.HostEvent{
     .{ .user_message = .{ .run_id = 3, .trace_id = "trace-1", .text = "fix the build" } },
     .{ .run_done = .{ .run_id = 3, .trace_id = "trace-1", .stop_reason = "end_turn" } },
     .{ .run_done = .{ .run_id = 4, .error_name = "ProviderUnavailable" } },
+    // Edit-and-rerun (issue #432): the submission replaced user message 6.
+    .{ .user_message = .{ .run_id = 6, .text = "fix the build, then the tests", .replaces = 6 } },
+    .{ .run_done = .{ .run_id = 7, .error_name = "PositionCompacted" } },
     .{ .run_done = .{ .run_id = 5, .stop_reason = "api_error", .model_error = .{
         .category = .payment_required,
         .code = "insufficient_balance",
