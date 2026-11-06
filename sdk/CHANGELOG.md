@@ -27,6 +27,8 @@ empty `### Migration`.
   `run_state` phase is `failed` (only a cancellation is `aborted`). Committed
   tool results are never cleared or truncated in place. `auto_compact` reports
   the new causes `durable_capacity_threshold` and `durable_capacity_recovery`.
+- No change a Host can see. The inputs moved for a fix in the CLI's plain headless
+  output (#417), which AgentCore does not use.
 
 ### Migration
 
