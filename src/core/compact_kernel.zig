@@ -17,6 +17,10 @@ pub const Outcome = enum {
     no_change,
     degraded,
     aborted,
+    /// The committer's owner declined the replacement at the commit point
+    /// (a budget guard): nothing was replaced, and the refusal is the
+    /// owner's to report. Never produced by the default committer.
+    refused,
 };
 
 pub const SummaryRequestOutcome = enum {
@@ -60,7 +64,11 @@ pub const Estimator = struct {
 
 pub const CommitResult = enum {
     committed,
+    /// The abort signal was raised before the replacement.
     aborted,
+    /// The committer's owner declined the replacement; distinct from a
+    /// cancellation so callers can report the owner's terminal instead.
+    refused,
     concurrent_mutation,
 };
 
@@ -351,9 +359,9 @@ pub fn run(
         );
     switch (commit_result) {
         .committed => {},
-        .aborted => {
+        .aborted, .refused => |declined| {
             var report = terminal(
-                .aborted,
+                if (declined == .aborted) .aborted else .refused,
                 before_tokens,
                 before_tokens,
                 0,

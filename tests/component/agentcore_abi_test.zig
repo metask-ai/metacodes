@@ -5977,6 +5977,193 @@ test "L2 public compact commits a summary and reports COMPACT_COMPACTED" {
     try std.testing.expect(std.mem.indexOf(u8, post_compact.body(), "done") != null);
 }
 
+/// Public observations of the issue #430 Run: every event's Run ID, and the
+/// `auto_compact` causes in order.
+const AutoCompactProbe = struct {
+    run_id: u64 = 0,
+    wrong_run: usize = 0,
+    auto_compacts: usize = 0,
+    model_errors: usize = 0,
+    /// The phase of the last `run_state` observed, decoded through the SDK.
+    last_phase: ?sdk.protocol.RunStatePhase = null,
+    causes: [128]u8 = undefined,
+    causes_len: usize = 0,
+
+    fn event(ctx: ?*anyopaque, run: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *AutoCompactProbe = @ptrCast(@alignCast(ctx.?));
+        const json = if (event_json.ptr) |ptr| ptr[0..event_json.len] else "";
+        if (run == null or run.?.run_id != self.run_id) self.wrong_run += 1;
+        if (std.mem.startsWith(u8, json, "{\"model_error\"")) self.model_errors += 1;
+        if (std.mem.startsWith(u8, json, "{\"run_state\"")) {
+            const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, json) catch return wire.EVENT_FATAL;
+            defer parsed.deinit();
+            switch (parsed.value) {
+                .known => |decoded| switch (decoded) {
+                    .run_state => |state| self.last_phase = state.phase,
+                    else => return wire.EVENT_FATAL,
+                },
+                .unknown => return wire.EVENT_FATAL,
+            }
+            return wire.EVENT_CONTINUE;
+        }
+        if (!std.mem.startsWith(u8, json, "{\"auto_compact\"")) return wire.EVENT_CONTINUE;
+        self.auto_compacts += 1;
+        const at = std.mem.indexOf(u8, json, "\"cause\":\"") orelse return wire.EVENT_CONTINUE;
+        const rest = json[at + 9 ..];
+        const cause = rest[0 .. std.mem.indexOfScalar(u8, rest, '"') orelse rest.len];
+        if (self.causes_len + cause.len + 1 > self.causes.len) return wire.EVENT_CONTINUE;
+        @memcpy(self.causes[self.causes_len..][0..cause.len], cause);
+        self.causes[self.causes_len + cause.len] = ';';
+        self.causes_len += cause.len + 1;
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+test "L2 issue #430: a context-window rejection inside a public Run compacts and the same Run finishes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const too_long =
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 250000 tokens > 200000 maximum\"}}";
+    // Six Runs of history, then Run 7: refused as too long, the compaction
+    // summary, and the re-issued request of the same turn.
+    const bodies = [_][]const u8{
+        FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE,
+        too_long,  FINAL_SSE, FINAL_SSE,
+    };
+    const statuses = [_][]const u8{
+        "HTTP/1.1 200 OK",          "HTTP/1.1 200 OK", "HTTP/1.1 200 OK",
+        "HTTP/1.1 200 OK",          "HTTP/1.1 200 OK", "HTTP/1.1 200 OK",
+        "HTTP/1.1 400 Bad Request", "HTTP/1.1 200 OK", "HTTP/1.1 200 OK",
+    };
+    var server = try harness.MockServer.startHttpCassette(&bodies, &statuses);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = AutoCompactProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "issue430-public-model", null, &probe, AutoCompactProbe.event);
+    defer fixture.deinit();
+    const old_context = [_]u8{'A'} ** 8192;
+    probe.run_id = 1;
+    var result = try fixture.runText(1, &old_context);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    for (2..7) |run_id| {
+        probe.run_id = run_id;
+        result = try fixture.runText(run_id, "recent context");
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    }
+    const usage_before = result.durable_usage_bytes;
+
+    probe.run_id = 7;
+    result = try fixture.runText(7, "continue the long task");
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u64, 0), fixture.diagnostic.len);
+    try std.testing.expectEqual(wire.RUN_CHECKPOINT_NONE, result.checkpoint_outcome_code);
+    try std.testing.expectEqual(@as(usize, 9), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), probe.auto_compacts);
+    try std.testing.expectEqualStrings("context_window_exceeded_recovery;", probe.causes[0..probe.causes_len]);
+    try std.testing.expectEqual(@as(usize, 0), probe.wrong_run);
+    // The refused request and the summary carried the old context; the
+    // re-issued request carries the summary instead, and the Run's own input
+    // exactly once (Core continued it; the Host replayed nothing).
+    const old_context_needle = [_]u8{'A'} ** 128;
+    const refused = server.requestAt(6) orelse return error.NoRequestCaptured;
+    const summary = server.requestAt(7) orelse return error.NoRequestCaptured;
+    const retried = server.requestAt(8) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, refused.body(), &old_context_needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary.body(), &old_context_needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, retried.body(), &old_context_needle) == null);
+    try std.testing.expect(std.mem.indexOf(u8, retried.body(), "Another language model started") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, retried.body(), "continue the long task"));
+    // The checkpoint no longer holds the dropped prefix.
+    try std.testing.expect(result.durable_usage_bytes < usage_before);
+}
+
+test "L2 issue #430: a compaction the budget refuses ends the public Run with the budget terminal, not aborted" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    // Run 7's own input carries the durable estimate past `soft_bytes`, so
+    // the pre-sampling boundary compacts for checkpoint capacity. Its summary
+    // is larger than the provider result cap: the budget cuts it, records the
+    // resource limit and refuses the replacement. Nothing was cancelled.
+    const oversized_summary =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" ++ ("S" ** 4096) ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    // History answers report no usage, so the pending-request estimate is
+    // the Conversation's own size rather than the mock's one-token anchor.
+    const unmetered_final =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_h\",\"role\":\"assistant\",\"model\":\"x\"}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const bodies = [_][]const u8{
+        unmetered_final, unmetered_final, unmetered_final, unmetered_final, unmetered_final, unmetered_final, oversized_summary,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const budget = wire.DurableBudgetProfileV1{
+        .struct_size = @sizeOf(wire.DurableBudgetProfileV1),
+        .reserved0 = 0,
+        .hard_bytes = 4 * 1024 * 1024,
+        .soft_bytes = 72 * 1024,
+        .input_cap_bytes = 64 * 1024,
+        .provider_request_cap_bytes = 512 * 1024,
+        .provider_result_cap_bytes = 1024,
+        .tool_result_cap_bytes = 64 * 1024,
+        .mcp_result_cap_bytes = 64 * 1024,
+        .audit_reserve_bytes = 64 * 1024,
+        .terminal_reserve_bytes = 64 * 1024,
+        .reserved = [_]u64{0} ** 4,
+    };
+    var probe = AutoCompactProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "issue430-refused-model", &budget, &probe, AutoCompactProbe.event);
+    defer fixture.deinit();
+    const old_context = [_]u8{'A'} ** (40 * 1024);
+    probe.run_id = 1;
+    var result = try fixture.runText(1, &old_context);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    for (2..7) |run_id| {
+        probe.run_id = run_id;
+        result = try fixture.runText(run_id, "recent context");
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    }
+    try std.testing.expect(result.durable_usage_bytes < budget.soft_bytes);
+    try std.testing.expectEqual(@as(usize, 0), probe.auto_compacts);
+    try std.testing.expectEqual(@as(?sdk.protocol.RunStatePhase, .completed), probe.last_phase);
+
+    probe.run_id = 7;
+    const new_context = [_]u8{'B'} ** (40 * 1024);
+    result = try fixture.runText(7, &new_context);
+    // The Host sees one consistent budget terminal: the stop code and the
+    // checkpoint outcome name the resource limit, and the terminal RunState
+    // is `failed` — never `aborted`, which only a cancellation produces.
+    try std.testing.expectEqual(wire.STOP_CHECKPOINT_RESOURCE_LIMIT, result.stop_reason_code);
+    try std.testing.expectEqual(wire.RUN_CHECKPOINT_RESOURCE_LIMIT, result.checkpoint_outcome_code);
+    try std.testing.expectEqual(@as(?sdk.protocol.RunStatePhase, .failed), probe.last_phase);
+    try std.testing.expectEqual(@as(usize, 0), probe.model_errors);
+    try std.testing.expectEqual(@as(u64, 0), fixture.diagnostic.len);
+    // The summary request was the Run's only provider request: no
+    // replacement, and no sampling request after the refusal.
+    try std.testing.expectEqual(@as(usize, 7), server.requestCount());
+    const summary = server.requestAt(6) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, summary.body(), "Summarize this conversation for compaction") != null);
+    try std.testing.expectEqual(@as(usize, 0), probe.auto_compacts);
+    try std.testing.expectEqual(@as(usize, 0), probe.wrong_run);
+}
+
 test "L2 public compact abort is concurrent bounded and leaves the facade reusable" {
     const CompactWorker = struct {
         api: sdk.Api,
