@@ -21,6 +21,7 @@ const model_command = @import("repl/model_command.zig");
 const theme_mod = @import("repl/tui/theme.zig");
 const session_intent = @import("session_intent.zig");
 const agent_loop = @import("core/agent_loop.zig");
+const conversation_mod = @import("core/conversation.zig");
 const permission_mode = @import("permission/mode.zig");
 const util_json = @import("util/json.zig");
 const util_time = @import("util/time.zig");
@@ -297,6 +298,7 @@ pub const SessionService = struct {
     pub const submitPrompt = submitPromptImpl;
     pub const submitMacro = submitMacroImpl;
     pub const prepareRetry = prepareRetryImpl;
+    pub const prepareEdit = prepareEditImpl;
     pub const shellExec = shellExecImpl;
     const shellDispatch = shellDispatchImpl;
 };
@@ -386,8 +388,80 @@ pub fn parseShellRecord(text: []const u8) ?ShellRecord {
 /// 保证 "failed preflight must not mutate Conversation or consume a run id"。
 pub const RunPlan = struct {
     kind: Kind,
-    pub const Kind = enum { user_prompt, injected_macro, retry };
+    pub const Kind = enum {
+        user_prompt,
+        injected_macro,
+        retry,
+        /// `/edit <n> <text>` (issue #432): user message n was replaced by
+        /// `text` and everything after it dropped; the run answers `text`.
+        edited_prompt,
+    };
 };
+
+/// The two arguments of `/edit <n> <text>`, borrowed from the raw args.
+pub const EditArgs = struct {
+    position: conversation_mod.MessagePosition,
+    text: []const u8,
+
+    pub const ParseError = error{ MissingEditText, InvalidPosition, PositionOutOfRange };
+
+    pub fn parse(args: []const u8) ParseError!EditArgs {
+        const trimmed = std.mem.trim(u8, args, " \t\r\n");
+        const split = std.mem.indexOfAny(u8, trimmed, " \t\r\n") orelse return error.MissingEditText;
+        const text = std.mem.trim(u8, trimmed[split..], " \t\r\n");
+        if (text.len == 0) return error.MissingEditText;
+        return .{ .position = try conversation_mod.MessagePosition.parse(trimmed[0..split]), .text = text };
+    }
+};
+
+pub const EDIT_USAGE = "usage: /edit <message number> <new text> (`/edit` alone lists the messages you can edit)";
+
+/// `/edit` without arguments: one line per message the user wrote, with the
+/// number `/edit` takes and the start of its first line. A message behind the
+/// compact boundary is listed as compacted: it cannot be edited.
+pub fn writeEditableMessages(w: *std.Io.Writer, conversation: *const conversation_mod.Conversation) std.Io.Writer.Error!void {
+    const PREVIEW_BYTES = 72;
+    const active_start = conversation.activeStart();
+    var listed: usize = 0;
+    for (conversation.messages.items, 0..) |m, i| {
+        if (!conversation_mod.isUserPrompt(m)) continue;
+        listed += 1;
+        var text: []const u8 = "";
+        var images: usize = 0;
+        for (m.blocks) |b| switch (b) {
+            .text => |t| if (text.len == 0) {
+                text = t;
+            },
+            .image => images += 1,
+            else => {},
+        };
+        const body = std.mem.trim(u8, text, " \t\r\n");
+        const first_line = std.mem.trimEnd(u8, body[0 .. std.mem.indexOfScalar(u8, body, '\n') orelse body.len], " \t\r");
+        const end = @import("util/utf8.zig").prefixEnd(first_line, PREVIEW_BYTES);
+        const more = end < first_line.len or first_line.len < body.len;
+        try w.print("  {d: >4}  {s}{s}", .{ i + 1, first_line[0..end], if (more) " …" else "" });
+        if (images > 0) try w.print(" [{d} image{s}]", .{ images, if (images == 1) "" else "s" });
+        if (i < active_start) try w.writeAll("  (compacted; cannot be edited)");
+        try w.writeByte('\n');
+    }
+    if (listed == 0) {
+        try w.writeAll("No messages of yours to edit yet.\n");
+    } else {
+        try w.writeAll(EDIT_USAGE);
+        try w.writeByte('\n');
+    }
+}
+
+/// What a refused `/edit` says, on every surface.
+pub fn editRefusal(err: (EditArgs.ParseError || conversation_mod.RewindError)) []const u8 {
+    return switch (err) {
+        error.MissingEditText => EDIT_USAGE,
+        error.InvalidPosition => "edit refused: the message number must be a positive whole number (InvalidPosition)",
+        error.PositionOutOfRange => "edit refused: there is no message at that position (PositionOutOfRange)",
+        error.NotUserMessage => "edit refused: that message is not one you wrote; only your own messages can be edited (NotUserMessage)",
+        error.PositionCompacted => "edit refused: that message was compacted into a summary, so the context before it cannot be reconstructed (PositionCompacted)",
+    };
+}
 
 /// dispatch 结果:结构化 outcome(渲染归各 UI)+ 可选 run 计划(宿主用自己的
 /// backend/装饰器提交,经 buildRunOptions 的 canonical Options)。
@@ -418,6 +492,7 @@ pub fn dispatchIntent(svc: *SessionService, alloc: std.mem.Allocator, intent: se
             if (eql(u8, c.verb, "review")) return svc.submitMacro(REVIEW_PROMPT);
             if (eql(u8, c.verb, "init")) return svc.submitMacro(INIT_PROMPT);
             if (eql(u8, c.verb, "retry")) return svc.prepareRetry();
+            if (eql(u8, c.verb, "edit")) return svc.prepareEdit(c.args);
             return .{ .outcome = svc.exec(alloc, c.verb, c.args) };
         },
     }
@@ -475,6 +550,30 @@ pub fn prepareRetryImpl(self: *SessionService) Dispatched {
     return .{
         .outcome = .{ .kind = .noop, .ok = true },
         .run = .{ .kind = .retry },
+    };
+}
+
+/// `/edit <n> <text>` (issue #432): edit user message n and rerun from there.
+/// The conversation becomes messages 1..n-1 followed by `text`; the original
+/// message n and everything after it are dropped (`Conversation.
+/// replaceUserMessage`), and the transcript is rewritten from it at the next
+/// flush, so a resume restores the edited history. Only the conversation
+/// changes: files and other effects of the dropped turns stay. What the model
+/// read in them no longer counts for the must-read-first check. A refused
+/// edit (`editRefusal`) changes nothing and plans no run.
+pub fn prepareEditImpl(self: *SessionService, args: []const u8) Dispatched {
+    const edit = EditArgs.parse(args) catch |err| {
+        return .{ .outcome = .{ .kind = .err, .ok = false, .data = .{ .text = editRefusal(err) } } };
+    };
+    self.app.conversation.replaceUserMessage(edit.position, &.{.{ .text = edit.text }}) catch |err| switch (err) {
+        error.OutOfMemory, error.EmptyMessage => |e| return .{ .outcome = .{ .kind = .err, .ok = false, .data = .{ .err_name = @errorName(e) } } },
+        error.PositionOutOfRange, error.NotUserMessage, error.PositionCompacted => |e| return .{ .outcome = .{ .kind = .err, .ok = false, .data = .{ .text = editRefusal(e) } } },
+    };
+    self.app.clearActiveSkill();
+    self.app.read_state.clearAll();
+    return .{
+        .outcome = .{ .kind = .noop, .ok = true },
+        .run = .{ .kind = .edited_prompt },
     };
 }
 
