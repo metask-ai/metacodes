@@ -13,6 +13,12 @@
 //! - **Response**: an AWS event stream (`aws_event_stream.zig`), one JSON
 //!   payload per frame, named by the `:event-type` header; failures arrive as
 //!   `:message-type exception` frames.
+//! - **Lifecycle**: the one every HTTP provider client shares (issue #434):
+//!   `client.ConnectRetryFor` retries a transient connect failure, a 429 and a
+//!   5xx with the same request bytes; a non-2xx head is classified by the same
+//!   table (`httpFailureError` / `errorBodyInfo`: 401, 429, 500/502/503, an
+//!   overflow is ContextWindowExceeded with its numbers); a cancel while the
+//!   head is awaited is `error.Aborted`.
 //!
 //! Thinking passback: Claude on Bedrock requires the previous assistant turn's
 //! reasoning blocks, signatures intact and in order, while a tool loop is in
@@ -89,6 +95,9 @@ pub const BedrockClient = struct {
     declared_dialect: dialect_mod.DialectDeclaration = .{},
     catalog: ?catalog_mod.Catalog = null,
     host_capabilities: image_capability.Declarations = .{},
+    /// Numbers the last head-phase overflow body carried (cleared on the next
+    /// accepted response), for the agent loop's context recovery.
+    last_context_window_numbers: error_class.ContextWindowNumbers = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) BedrockClient {
         return .{
@@ -129,7 +138,15 @@ pub const BedrockClient = struct {
             .supportsForModelFn = &pSupportsForModel,
             .imageInputFn = &pImageInput,
             .routeFn = &pRoute,
+            .lastContextWindowNumbersFn = &pLastContextWindowNumbers,
+            .endpointIdFn = &pEndpointId,
         };
+    }
+    fn pLastContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
+        return cast(ctx).last_context_window_numbers;
+    }
+    fn pEndpointId(ctx: *anyopaque) []const u8 {
+        return cast(ctx).base_url;
     }
 
     inline fn cast(ctx: *anyopaque) *BedrockClient {
@@ -200,14 +217,22 @@ pub const BedrockClient = struct {
         cast(ctx).abort_registry.cancel(signal);
     }
     fn pSendStreamRetry(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, max_retries: u32, retry_base_ms: u64, reporter: ?provider_mod.RetryReporter, user_query: []const u8) anyerror!StreamHandle {
-        _ = max_retries;
-        _ = retry_base_ms;
-        _ = reporter;
-        return pSendStream(ctx, messages, system, tools, abort, model_override, tool_choice, user_query);
+        _ = user_query;
+        // The shared connect retry (issue #434): the request is serialized
+        // once, so every attempt sends the same bytes to the same model's URL.
+        var retry = ConnectRetry.init(max_retries, retry_base_ms, reporter, abort);
+        return cast(ctx).sendStreamWith(messages, system, tools, abort, model_override, tool_choice, &retry);
     }
     fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!StreamHandle {
         _ = user_query;
-        const self = cast(ctx);
+        return cast(ctx).sendStreamWith(messages, system, tools, abort, model_override, tool_choice, null);
+    }
+
+    const ConnectRetry = client_mod.ConnectRetryFor("bedrock");
+
+    /// Serializes the request once and sends it: one attempt when `retry` is
+    /// null, else as many as `retry` allows.
+    fn sendStreamWith(self: *BedrockClient, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, retry: ?*ConnectRetry) anyerror!StreamHandle {
         const model = model_override orelse self.model;
         var o = self.overrides;
         if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
@@ -225,8 +250,19 @@ pub const BedrockClient = struct {
             .declared = self.declared_dialect.vendorFor(self.model, model),
         }, &report);
         defer self.allocator.free(body);
+        // Owned here until a stream takes it: every failed attempt leaves it
+        // for the next one.
         const placeholder_ids = try report.placeholder_ids.toOwnedSlice(self.allocator);
-        return self.doStream(model, body, abort, placeholder_ids);
+        errdefer self.allocator.free(placeholder_ids);
+        while (true) {
+            var retry_hint = client_mod.RetryHint{};
+            if (self.doStream(model, body, abort, placeholder_ids, &retry_hint)) |handle| {
+                return handle;
+            } else |err| {
+                const policy = retry orelse return err;
+                try policy.afterFailure(err, retry_hint.delay_ms);
+            }
+        }
     }
 
     pub fn maxTokensFor(self: *const BedrockClient, model: []const u8) u32 {
@@ -255,8 +291,9 @@ pub const BedrockClient = struct {
         };
     }
 
-    fn doStream(self: *BedrockClient, model: []const u8, body: []const u8, abort: ?*const AbortSignal, image_placeholder_ids: []const []const u8) !StreamHandle {
-        errdefer self.allocator.free(image_placeholder_ids);
+    /// One attempt. `image_placeholder_ids` belong to the stream on success
+    /// and stay the caller's on failure (the next attempt needs them).
+    fn doStream(self: *BedrockClient, model: []const u8, body: []const u8, abort: ?*const AbortSignal, image_placeholder_ids: []const []const u8, retry_hint: *client_mod.RetryHint) !StreamHandle {
         const rid = log.genRequestId();
         const url = try converseStreamUrl(self.allocator, self.base_url, model);
         defer self.allocator.free(url);
@@ -281,8 +318,8 @@ pub const BedrockClient = struct {
                 .{ .name = auth.name, .value = auth.value },
             },
         }) catch |err| {
-            log.errId("bedrock", rid, "request init failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
+            // errdefer destroys req_ptr; req_ptr.* was never initialized.
+            return client_mod.requestSetupFailure("bedrock", rid, err);
         };
         var registered = false;
         errdefer {
@@ -293,35 +330,51 @@ pub const BedrockClient = struct {
         registered = true;
         req_ptr.transfer_encoding = .{ .content_length = body.len };
         http_connection.sendBodyComplete(req_ptr, @constCast(body)) catch |err| {
-            log.errId("bedrock", rid, "send body failed: {s}", .{@errorName(err)});
-            client_mod.noteConnectFailure(err);
-            return error.RequestFailed;
+            // A cancel shut the socket: the write failed because of it.
+            if (client_mod.cancelled(abort)) return error.Aborted;
+            return client_mod.requestTransportFailure("bedrock", rid, "sendBody", err);
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
+            // Cancelled while the head was awaited: not a network failure.
+            if (client_mod.cancelled(abort)) {
+                log.warnId("bedrock", rid, "receiveHead failed after cancel ({s}) → Aborted", .{@errorName(err)});
+                return error.Aborted;
+            }
             if (self.abort_registry.stalled(req_ptr)) |stall| {
                 client_mod.reportHeadStall("bedrock", rid, stall);
                 return error.TransientNetwork;
             }
-            log.errId("bedrock", rid, "receiveHead failed: {s}", .{@errorName(err)});
-            client_mod.noteConnectFailure(err);
-            return err;
+            return client_mod.requestTransportFailure("bedrock", rid, "receiveHead", err);
         };
         const status = ResponseStatus.capture(&response);
         client_mod.noteResponseHead(status.code, response.head, auth.value);
         connection_lease.release();
         if (!status.isOk()) {
+            // Read from the head before the body read below reuses its bytes.
+            retry_hint.delay_ms = client_mod.retryAfterFromHead(response.head);
             var location_buf: [http_status.REDIRECT_LOCATION_BYTES]u8 = undefined;
             if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
                 client_mod.reportRedirect("bedrock", rid, status, location, auth.value);
-                return error.RequestFailed;
+                self.last_context_window_numbers = .{};
+                return error.HttpError;
             }
             var err_body: [4096]u8 = undefined;
             const body_reader = req_ptr.reader.bodyReader(err_body[0..], response.head.transfer_encoding, response.head.content_length);
             const n = body_reader.readSliceShort(err_body[0..]) catch 0;
-            client_mod.reportHttpFailure("bedrock", rid, status, err_body[0..@min(n, err_body.len)], err_body.len, auth.value);
-            return error.RequestFailed;
+            const preview = err_body[0..@min(n, err_body.len)];
+            client_mod.reportHttpFailure("bedrock", rid, status, preview, err_body.len, auth.value);
+            // The shared classification: 429 and 5xx are retried, an overflow
+            // is ContextWindowExceeded with its numbers kept. Bedrock has no
+            // token refresh, so a 401 stays Unauthorized. AWS documents an
+            // overflow only as a validation error; the shared classifier's
+            // wording decides, as for every other wire.
+            var info = client_mod.errorBodyInfo(status.code, preview);
+            info.token_expired = false;
+            self.last_context_window_numbers = info.context_window_numbers;
+            return client_mod.httpFailureError(status.code, info);
         }
         client_mod.noteRequestAccepted();
+        self.last_context_window_numbers = .{};
         self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.maxTokensFor(model)), .sse);
         const heap = try self.allocator.create(BedrockStream);
         heap.* = .{

@@ -1,6 +1,6 @@
-//! L2: the request lifecycle `Provider` promises is the same on all four wires
+//! L2: the request lifecycle `Provider` promises is the same on every wire
 //! (issue #434) - Anthropic Messages, OpenAI Chat Completions, OpenAI
-//! Responses and Gemini.
+//! Responses, Gemini, and Amazon Bedrock Converse.
 //!
 //!   ① A transient connect failure, a 429 and a 503 on the first attempt are
 //!     retried: the retry is the same request (same path, so the same protocol
@@ -24,14 +24,15 @@
 //!
 //! Before #434 the OpenAI and Gemini clients made one attempt whatever
 //! max_retries said, answered a 429/503/overflow with RequestFailed, and
-//! answered a cancel during the head wait with HttpConnectionClosing.
+//! answered a cancel during the head wait with HttpConnectionClosing; the
+//! Bedrock client, added beside #434, did the same until it joined it.
 
 const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
 
-const Wire = enum { anthropic, openai_chat, openai_responses, gemini };
-const ALL_WIRES = [_]Wire{ .anthropic, .openai_chat, .openai_responses, .gemini };
+const Wire = enum { anthropic, openai_chat, openai_responses, gemini, bedrock };
+const ALL_WIRES = [_]Wire{ .anthropic, .openai_chat, .openai_responses, .gemini, .bedrock };
 
 const DEFAULT_MODEL = "lifecycle-model-a";
 /// Every request below names this model per call: a retry must keep it.
@@ -56,7 +57,66 @@ fn complete(comptime wire: Wire) []const u8 {
             "event: response.completed\n" ++
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":2}}}\n\n",
         .gemini => "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":2}}\n\n",
+        .bedrock => &BEDROCK_COMPLETE,
     };
+}
+
+/// A container-level constant, so the slice `complete` returns points at
+/// static bytes rather than at a concatenation's temporary.
+const BEDROCK_COMPLETE = awsEvent("messageStart", "{\"role\":\"assistant\"}").* ++
+    awsEvent("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"answer\"}}").* ++
+    awsEvent("contentBlockStop", "{\"contentBlockIndex\":0}").* ++
+    awsEvent("messageStop", "{\"stopReason\":\"end_turn\"}").* ++
+    awsEvent("metadata", "{\"usage\":{\"inputTokens\":1,\"outputTokens\":2}}").*;
+
+/// One Bedrock event frame (AWS event-stream framing, both CRCs), built at
+/// compile time so the cassette is a constant like the SSE ones;
+/// `aws_event_stream.encodeEvent` is its runtime twin.
+fn awsEvent(comptime event_type: []const u8, comptime json: []const u8) *const [awsEventLen(event_type, json)]u8 {
+    const frame = comptime blk: {
+        @setEvalBranchQuota(200_000);
+        const headers = awsHeader(":event-type", event_type) ++ awsHeader(":content-type", "application/json") ++ awsHeader(":message-type", "event");
+        const total = awsEventLen(event_type, json);
+        const lengths = be32(total) ++ be32(headers.len);
+        const head = lengths ++ be32(std.hash.Crc32.hash(&lengths)) ++ headers ++ json[0..json.len].*;
+        break :blk head ++ be32(std.hash.Crc32.hash(&head));
+    };
+    return &frame;
+}
+
+fn awsEventLen(comptime event_type: []const u8, comptime json: []const u8) usize {
+    return 16 + awsHeader(":event-type", event_type).len + awsHeader(":content-type", "application/json").len + awsHeader(":message-type", "event").len + json.len;
+}
+
+/// A string-valued header: name length, name, type 7, value length, value.
+fn awsHeader(comptime name: []const u8, comptime value: []const u8) [1 + name.len + 3 + value.len]u8 {
+    return [_]u8{name.len} ++ name[0..name.len].* ++ [_]u8{7} ++ be16(value.len) ++ value[0..value.len].*;
+}
+
+fn be32(comptime value: u32) [4]u8 {
+    var out: [4]u8 = undefined;
+    std.mem.writeInt(u32, &out, value, .big);
+    return out;
+}
+
+fn be16(comptime value: u16) [2]u8 {
+    var out: [2]u8 = undefined;
+    std.mem.writeInt(u16, &out, value, .big);
+    return out;
+}
+
+test "the compile-time Bedrock cassette decodes with the client's own decoder" {
+    const a = std.testing.allocator;
+    var reader: std.Io.Reader = .fixed(complete(.bedrock));
+    var events: usize = 0;
+    while (try cc.api_aws_event_stream.readFrame(&reader, a)) |frame| {
+        defer a.free(frame);
+        var headers: [cc.api_aws_event_stream.MAX_HEADERS]cc.api_aws_event_stream.Header = undefined;
+        const message = try cc.api_aws_event_stream.decode(frame, &headers);
+        try std.testing.expectEqualStrings("event", message.header(":message-type").?);
+        events += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), events);
 }
 
 const RATE_LIMITED_BODY = "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}";
@@ -70,7 +130,7 @@ const OVERFLOW_BODY = "{\"error\":{\"message\":\"This model's maximum context le
 const Endpoint = struct {
     /// `MockServer.urlOwned`: the full endpoint for Messages and OpenAI.
     url: []const u8,
-    /// The same server's origin: Gemini appends its own model path.
+    /// The same server's origin: Gemini and Bedrock append their own model path.
     origin: []const u8,
 
     fn of(url: []const u8) Endpoint {
@@ -98,6 +158,11 @@ fn withProvider(comptime wire: Wire, endpoint: Endpoint, body: anytype) !void {
         },
         .gemini => {
             var client = cc.api_gemini.GeminiClient.init(a, io, KEY, DEFAULT_MODEL, endpoint.origin);
+            defer client.deinit();
+            try body.run(client.provider());
+        },
+        .bedrock => {
+            var client = cc.api_bedrock.BedrockClient.init(a, io, KEY, DEFAULT_MODEL, endpoint.origin);
             defer client.deinit();
             try body.run(client.provider());
         },
@@ -193,6 +258,10 @@ fn expectBoundRequest(comptime wire: Wire, request: harness.CapturedRequest) !vo
         .gemini => {
             try std.testing.expect(std.mem.indexOf(u8, line, "/v1beta/models/" ++ BOUND_MODEL ++ ":streamGenerateContent") != null);
             try std.testing.expect(std.mem.indexOf(u8, body, "\"contents\"") != null);
+        },
+        .bedrock => {
+            try std.testing.expect(std.mem.indexOf(u8, line, "/model/" ++ BOUND_MODEL ++ "/converse-stream") != null);
+            try std.testing.expect(std.mem.indexOf(u8, body, "\"messages\"") != null);
         },
     }
 }
@@ -590,11 +659,11 @@ fn overflowReachesRecovery(comptime wire: Wire) !void {
     try std.testing.expect(std.mem.indexOf(u8, recovered.body(), "current request") != null);
 }
 
-test "L2 provider lifecycle ⑤: in a Run an HTTP context-limit rejection reaches the loop's recovery on the OpenAI and Gemini wires" {
+test "L2 provider lifecycle ⑤: in a Run an HTTP context-limit rejection reaches the loop's recovery on the OpenAI, Gemini and Bedrock wires" {
     // The Messages wire's recovery sends a non-streaming summary request
     // first; context_window_recovery_test.zig covers it. The other wires have
     // no non-streaming send, so their recovery shrinks the request locally.
-    inline for (.{ Wire.openai_chat, Wire.openai_responses, Wire.gemini }) |wire| {
+    inline for (.{ Wire.openai_chat, Wire.openai_responses, Wire.gemini, Wire.bedrock }) |wire| {
         overflowReachesRecovery(wire) catch |err| {
             std.debug.print("wire {s} failed: {s}\n", .{ @tagName(wire), @errorName(err) });
             return err;
