@@ -487,6 +487,21 @@ jobs:
           fi
           zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           cat "$RUNNER_TEMP"/dist-1/metacodes-*-SHA256SUMS
+      # release.yml holds each unit's executable to its cli_target with
+      # scripts/check_binary_baseline.py; until then nothing built the macOS
+      # units for those targets, so 0.10.0's x86_64 macOS unit failed there
+      # first, at release time (a jump table the check decoded as AVX-512).
+      # The same build and check for both macOS units, on every change; the
+      # Apple disassembler reads both architectures.
+      - name: macOS release executables need no more than their targets
+        if: matrix.release && runner.os == 'macOS' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in x86_64-macos.13.0 aarch64-macos.13.0; do
+            zig build install -Drelease-layout=true -Doptimize=ReleaseSafe -Dtarget="$target" --prefix "$RUNNER_TEMP/baseline-$target"
+            python3 scripts/check_binary_baseline.py --target "$target" "$RUNNER_TEMP/baseline-$target/bin/metacodes"
+          done
       - name: Third-party notices check
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 scripts/gen_third_party_notices.py --check

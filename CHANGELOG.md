@@ -27,6 +27,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **The x86_64 macOS release unit no longer fails its CPU baseline check on a
+  jump table.** This is why 0.10.0 was tagged but never published: release run
+  41194755285 built every unit but stopped at `scripts/check_binary_baseline.py`
+  on the x86_64 macOS executable, which it said held one AVX-512 instruction,
+  so no draft release was made. The executable has no such instruction. The
+  six bytes were two entries of the jump table for `repl.loop.readLineRaw`'s
+  key switch. LLVM keeps such tables inside `__text` on x86_64 macOS, and the
+  linker lists them in `LC_DATA_IN_CODE`. A linear `objdump -d` decoded them as
+  code. 0.9.0's unit had 486 such tables, and none happened to decode as a
+  vector instruction. The check now disassembles a Mach-O in llvm-objdump's
+  Mach-O mode, which prints those ranges as data, over every section that
+  holds instructions. It fails unless every listed range came back as data and
+  no instruction starts inside one. The macOS `release` leg of `ci.yml` now
+  builds both macOS units for their release targets and runs the check on
+  every change, not first at release time.
 - **Plain headless says why a failed Run stopped (#417).** `-p` without `--json`
   exited 1 with nothing on stderr when the reply was still cut off after the
   three max-token continuations, and when the Run was interrupted by SIGINT or
