@@ -973,7 +973,8 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   `length`、Responses `response.incomplete` + `max_output_tokens`、Gemini `MAX_TOKENS`)→
   `stop_reason=max_tokens_exhausted`,该段定性 `partial`,不再走主机门、Stop hook 与 `final`
   收尾。有没有可见正文都一样:正文照样交付(`Ledger.partialText()` 是整个续写组的拼接),
-  headless 结果行 `text_kind=partial`、退出码 1,`--stream-json` 时间线是
+  headless 结果行 `text_kind=partial`、退出码 1,不带 `--json` 时 stdout 只有已有正文、
+  stderr 说明原因(#417),`--stream-json` 时间线是
   `continued → … → partial`;AgentCore ABI v1 报 `api_error`(RunState `failed`),Session
   可接着跑下一个 Run(`AGENTCORE_BINARY_ABI.md`)。此前只有无正文的一轮走这里,带正文的被当成完成的回答
   (`end_turn` / `final`,退出码 0)。完整的 tool_use 照常执行,不算耗尽;续写中途正常收尾
