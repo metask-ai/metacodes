@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 26;
+pub const ABI_REVISION: u32 = 27;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 26 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 27 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -51,6 +51,16 @@ pub const Status = enum(u32) {
     /// blocking a complete one), or a goal-continuation Run without an
     /// active goal. Nothing changed; the diagnostic names the reason.
     goal_conflict = 30,
+    /// Revision 27 (#441): `rewind_to_user_message` found no message at the
+    /// position. Nothing changed.
+    message_position_out_of_range = 31,
+    /// Revision 27: the message at the position is not one the user wrote (an
+    /// assistant reply, a tool result, or runtime-written text). Nothing
+    /// changed.
+    not_user_message = 32,
+    /// Revision 27: the message lies behind the compact boundary, where only a
+    /// summary stands for the context before it. Nothing changed.
+    message_position_compacted = 33,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -84,6 +94,9 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.image_input_unsupported) => .image_input_unsupported,
             @intFromEnum(Status.image_input_capability_unknown) => .image_input_capability_unknown,
             @intFromEnum(Status.goal_conflict) => .goal_conflict,
+            @intFromEnum(Status.message_position_out_of_range) => .message_position_out_of_range,
+            @intFromEnum(Status.not_user_message) => .not_user_message,
+            @intFromEnum(Status.message_position_compacted) => .message_position_compacted,
             else => error.UnknownStatus,
         };
     }
@@ -119,6 +132,9 @@ pub const STATUS_SKILL_CATALOG_INCOMPLETE: u32 = @intFromEnum(Status.skill_catal
 pub const STATUS_IMAGE_INPUT_UNSUPPORTED: u32 = @intFromEnum(Status.image_input_unsupported);
 pub const STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN: u32 = @intFromEnum(Status.image_input_capability_unknown);
 pub const STATUS_GOAL_CONFLICT: u32 = @intFromEnum(Status.goal_conflict);
+pub const STATUS_MESSAGE_POSITION_OUT_OF_RANGE: u32 = @intFromEnum(Status.message_position_out_of_range);
+pub const STATUS_NOT_USER_MESSAGE: u32 = @intFromEnum(Status.not_user_message);
+pub const STATUS_MESSAGE_POSITION_COMPACTED: u32 = @intFromEnum(Status.message_position_compacted);
 
 pub const ProviderKind = enum(u32) {
     anthropic = 1,
@@ -1314,6 +1330,19 @@ pub const SessionUpdatePermissionModeFnV1 = *const fn (
     permission_mode_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
+/// Revision 27 (#441): edit-and-rerun's history change, idle-only. Drops the
+/// user message at the 1-based `position` (counted over the full history, the
+/// compacted prefix included, as `describe`'s `conversation.message_count`
+/// counts) and everything after it, so the next Run's input takes its place
+/// after exactly the context before it. Zero is INVALID_ARGUMENT;
+/// MESSAGE_POSITION_OUT_OF_RANGE, NOT_USER_MESSAGE and
+/// MESSAGE_POSITION_COMPACTED refuse a position and change nothing. Only the
+/// Conversation changes: files and other effects of the dropped turns stay.
+pub const SessionRewindToUserMessageFnV1 = *const fn (
+    session: ?*SessionHandle,
+    position: u64,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 /// Runs the canonical default best-effort compact policy. Revision 22 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
@@ -1412,6 +1441,7 @@ pub const SessionControlApiV1 = extern struct {
     export_checkpoint: ?SessionExportCheckpointFnV1,
     set_prompt_profile: ?SessionSetPromptProfileFnV1,
     update_permission_mode: ?SessionUpdatePermissionModeFnV1,
+    rewind_to_user_message: ?SessionRewindToUserMessageFnV1,
 };
 
 pub const SkillApiV1 = extern struct {
@@ -1511,7 +1541,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionRestoreConfigV1));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(RuntimeApiV1));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(SessionApiV1));
-    try std.testing.expectEqual(@as(usize, 80), @sizeOf(SessionControlApiV1));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(SessionControlApiV1));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(SkillApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(GoalApiV1));
@@ -1581,6 +1611,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunOptionsV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(SessionControlApiV1, "set_prompt_profile"));
     try std.testing.expectEqual(@as(usize, 72), @offsetOf(SessionControlApiV1, "update_permission_mode"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(SessionControlApiV1, "rewind_to_user_message"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillPolicyV1, "granted_skill_ids"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(PermissionRuleSetV1, "allow"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(PermissionRuleSetV1, "ask"));
@@ -1644,7 +1675,10 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectEqual(Status.image_input_unsupported, try Status.fromCode(28));
     try std.testing.expectEqual(Status.image_input_capability_unknown, try Status.fromCode(29));
     try std.testing.expectEqual(Status.goal_conflict, try Status.fromCode(30));
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(31));
+    try std.testing.expectEqual(Status.message_position_out_of_range, try Status.fromCode(31));
+    try std.testing.expectEqual(Status.not_user_message, try Status.fromCode(32));
+    try std.testing.expectEqual(Status.message_position_compacted, try Status.fromCode(33));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(34));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
     try std.testing.expectEqual(StopReason.checkpoint_resource_limit, try StopReason.fromCode(8));
@@ -1666,9 +1700,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 26 keeps MCP wire codes stable" {
+test "Revision 27 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 26), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 27), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

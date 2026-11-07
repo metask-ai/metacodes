@@ -25,7 +25,7 @@ from ._client import (
 )
 from ._native import ABI_REVISION, BUILTIN_TOOLS, AgentCoreError, candidate_library_paths
 
-__version__ = "0.14.1.dev0"
+__version__ = "0.15.0.dev0"
 
 __all__ = [
     "ABI_REVISION",

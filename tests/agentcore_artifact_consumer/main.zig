@@ -21,7 +21,7 @@ fn readGoal(
 }
 
 comptime {
-    if (wire.ABI_REVISION != 26 or
+    if (wire.ABI_REVISION != 27 or
         wire.MAX_CREDENTIAL_BYTES_V1 != 16 * 1024 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
         wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
@@ -73,8 +73,11 @@ comptime {
         wire.TEAM_ROLE_LEAD != 1 or
         wire.TEAM_ROLE_MEMBER != 2 or
         wire.MAX_TEAM_NAME_BYTES_V1 != 64 or
-        wire.MAX_TEAM_MEMBER_BYTES_V1 != 64)
-        @compileError("source-free Revision 23-26 codes must match the public contract");
+        wire.MAX_TEAM_MEMBER_BYTES_V1 != 64 or
+        @intFromEnum(wire.Status.message_position_out_of_range) != 31 or
+        @intFromEnum(wire.Status.not_user_message) != 32 or
+        @intFromEnum(wire.Status.message_position_compacted) != 33)
+        @compileError("source-free Revision 23-27 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
         @compileError("revision 24 must not expose the removed catalog refresh entry");
@@ -1088,6 +1091,9 @@ pub fn main(init: std.process.Init) !void {
     var west_options = options;
     west_options.time_context_code = wire.TIME_CONTEXT_UTC_OFFSET;
     west_options.utc_offset_minutes = -300;
+    // Revision 27: the Run's own message is message_count + 1, read while
+    // idle just before it.
+    const multimodal_position = (try describedMessageCount(a, api, session)) + 1;
     try probe.beginRun(4);
     try expectStatus(.ok, api.session().runMultimodal(
         session,
@@ -1124,6 +1130,29 @@ pub fn main(init: std.process.Init) !void {
         const charged_goal = (try readGoal(api, goal_arena.allocator(), session, &diagnostic)) orelse
             return error.MissingGoal;
         if (charged_goal.tokens_used <= restored_goal.tokens_used) return error.UnexpectedGoal;
+    }
+
+    // Revision 27 (#441): in the restored Session, positions whose context
+    // cannot be rebuilt are refused with their own status and change
+    // nothing; rewinding the multimodal message drops it and everything
+    // after it, so the next Run would follow exactly the context before it.
+    {
+        const count = try describedMessageCount(a, api, session);
+        if (count <= multimodal_position) return error.UnexpectedMessageCount;
+        const refusals = [_]struct { position: u64, status: sdk.Status }{
+            .{ .position = 0, .status = .invalid_argument },
+            .{ .position = multimodal_position + 1, .status = .not_user_message },
+            .{ .position = std.math.maxInt(u64), .status = .message_position_out_of_range },
+        };
+        for (refusals) |refusal| {
+            try expectStatus(refusal.status, api.sessionControl().rewindToUserMessage()(session, refusal.position, &diagnostic), diagnostic);
+            if (diagnostic.len == 0) return error.MissingDiagnostic;
+            api.bufferRelease()(&diagnostic);
+        }
+        if (try describedMessageCount(a, api, session) != count) return error.UnexpectedMessageCount;
+        try expectStatus(.ok, api.sessionControl().rewindToUserMessage()(session, multimodal_position, &diagnostic), diagnostic);
+        if (try describedMessageCount(a, api, session) != multimodal_position - 1)
+            return error.UnexpectedMessageCount;
     }
 
     // ── Revision 24 (issue #277): the host-scheduled team table ───────────
@@ -1183,7 +1212,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 26 Agent Runtime, credential rotation, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 27 Agent Runtime, rewind to a user message, credential rotation, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 /// Revision 25 (#336): one Session's provider credential, rotated twice
@@ -1347,6 +1376,21 @@ fn readToolSse(a: std.mem.Allocator, path: []const u8) ![]u8 {
         "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
         "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
         "data: {{\"type\":\"message_stop\"}}\n\n", .{path});
+}
+
+/// Revision 27: describe's `conversation.message_count`.
+fn describedMessageCount(a: std.mem.Allocator, api: sdk.Api, session: ?*wire.SessionHandle) !u64 {
+    var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&diagnostic);
+    var description = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&description);
+    try expectStatus(.ok, api.sessionControl().describe()(session, &description, &diagnostic), diagnostic);
+    const decoded = try sdk.decodeSessionDescription(a, try sdk.borrowedBytes(.{
+        .ptr = description.ptr,
+        .len = description.len,
+    }));
+    defer decoded.deinit();
+    return decoded.value.conversation.message_count;
 }
 
 const DescribedPermission = struct {

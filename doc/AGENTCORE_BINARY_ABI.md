@@ -9,7 +9,7 @@ ABI v1 is an experimental in-process embedding contract for synchronous,
 stateful AgentSession execution. It does not expose or define a host product
 model.
 
-**Status: experimental.** Revision 26 is one exact hard-cut Agent Runtime wire
+**Status: experimental.** Revision 27 is one exact hard-cut Agent Runtime wire
 shape. It keeps the existing checkpoint/restore, durable budget, MCP
 Runtime/Session seams, Workspace Skill source/identity/policy binding,
 hash-pinned process-tool packages, Host/MCP byte-zero Tool Result streaming,
@@ -39,15 +39,19 @@ and `TEAM_ROLE_MEMBER`), Host-supplied at create and restore with no
 checkpoint state, and Revision 25's `session->update_credential` (see
 "Credential updates"), which replaces an existing Session's provider
 credential in place, while idle or during a Run, from any thread or from the
-Session's own callbacks, and the `MAX_CREDENTIAL_BYTES_V1` limit. Over
-Revision 25 it adds Skill source priorities (#390, see "Skill catalog and
-typed input"): `SkillSourceV1.priority` and the
+Session's own callbacks, and the `MAX_CREDENTIAL_BYTES_V1` limit, and
+Revision 26's Skill source priorities (#390, see "Skill catalog and typed
+input"): `SkillSourceV1.priority` and the
 `SkillCatalogQueryV1.default_user_source_priority` and
 `default_workspace_source_priority` fields rank same-scope sources that define
 one invocation name, where Revision 25 could only report them as a
-`source_conflict`. They take former reserved words; zero keeps Revision 25's
-resolution. No table, struct, or descriptor changes size, and the root stays
-80 bytes. Revision 16 stays
+`source_conflict`. Over Revision 26 it adds edit-and-rerun (#441, see "Edit
+and rerun"): a tenth Session Control slot, `rewind_to_user_message`, which
+drops a user message and everything after it so the next Run reruns from
+there, and the statuses 31 `MESSAGE_POSITION_OUT_OF_RANGE`, 32
+`NOT_USER_MESSAGE` and 33 `MESSAGE_POSITION_COMPACTED` that refuse a position.
+The Session Control table grows from 80 to 88 bytes; no other table, struct,
+or descriptor changes size, and the root stays 80 bytes. Revision 16 stays
 skipped: it named the withdrawn first-class PDF input on `main`, and a
 revision keeps a single meaning. The independent public Completion facade
 stays removed. This is not a general v1 stability promise.
@@ -57,7 +61,7 @@ and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 26**. Revision 26 is a
+The current experimental bundle is **ABI v1 revision 27**. Revision 27 is a
 hard-cut replacement for every earlier revision. The root is no longer a
 capability-tagged flat table. It is an 80-byte exact layout containing the
 stable 16-byte discovery prefix, `buffer_release`, and seven non-null typed
@@ -65,11 +69,11 @@ table pointers. Every table is mandatory at discovery; consumers simply avoid
 calling domains they do not use. There is no `query_interface`, string ID,
 optional-capability negotiation, or compatibility shim:
 
-- `metask_agentcore_api_v1` is 80 bytes and requires `abi_revision == 26`;
+- `metask_agentcore_api_v1` is 80 bytes and requires `abi_revision == 27`;
 - Runtime, Session, Session Control, Skill, MCP, Goal, and Team tables are
-  respectively 24, 56, 80, 32, 40, 40, and 24 bytes;
-- the root plus child tables expose 31 functions: root `buffer_release` and
-  30 domain slots;
+  respectively 24, 56, 88, 32, 40, 40, and 24 bytes;
+- the root plus child tables expose 32 functions: root `buffer_release` and
+  31 domain slots;
 - `MAX_CREDENTIAL_BYTES_V1` (16 KiB) bounds one `update_credential` candidate;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
   `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
@@ -98,8 +102,8 @@ optional-capability negotiation, or compatibility shim:
   `request` remains the bounded control-frame operation and
   `request_tool_stream` is mandatory for `tools/call`;
 - checkpoint, restore, describe, MCP refresh/describe/apply/selection,
-  Permission rule and mode update, compact, abort, submit_input, and
-  update_credential entries are mandatory;
+  Permission rule and mode update, compact, abort, submit_input,
+  update_credential, and rewind_to_user_message entries are mandatory;
 - `SkillSourceV1`, `SkillPolicyV1`, and `SkillCatalogQueryV1` are respectively
   64, 56, and 80 bytes; `SkillSourceV1` replaces its first reserved word with
   the `int32_t` `priority` (offset 40) and a zero `reserved0` (offset 44), and
@@ -108,18 +112,20 @@ optional-capability negotiation, or compatibility shim:
   `default_workspace_source_priority` (offset 76);
 - public status code 26 is a permanent tombstone; decoding it yields unknown,
   while `SKILL_CATALOG_INCOMPLETE` remains 27, `IMAGE_INPUT_UNSUPPORTED`
-  is 28, `IMAGE_INPUT_CAPABILITY_UNKNOWN` is 29, and `GOAL_CONFLICT` is 30;
+  is 28, `IMAGE_INPUT_CAPABILITY_UNKNOWN` is 29, `GOAL_CONFLICT` is 30, and
+  `MESSAGE_POSITION_OUT_OF_RANGE`, `NOT_USER_MESSAGE` and
+  `MESSAGE_POSITION_COMPACTED` are 31, 32 and 33;
 - `SessionHostConfigV1` stays 168 bytes and replaces two of its three reserved
   words with the `model_capabilities` pointer (offset 144) and
   `model_capability_count` (offset 152), and its last reserved word with the
   nullable `team` pointer (offset 160); `ModelCapabilityV1` is 40 bytes;
 - `GoalSetV1` and `GoalUpdateV1` are respectively 56 and 64 bytes;
 - `TeamConfigV1` is 88 bytes; `TeamApiV1` is 24 bytes;
-- `manifest.json` keeps schema version 1 and records revision 26 and root size
+- `manifest.json` keeps schema version 1 and records revision 27 and root size
   80. Child-table validation belongs to ABI discovery and is not duplicated in
   bundle metadata.
 
-Revision 26 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
+Revision 27 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then validate
@@ -128,16 +134,16 @@ per-Run callback validates and copies any retained `RunContext`
 fields during the callback, and Host registries bind/compare `session_id`
 atomically under their per-Session lock.
 
-Revision 26 deliberately exposes explicit process-package sources, their
+Revision 27 deliberately exposes explicit process-package sources, their
 namespaced `host_tool` contributions, and explicit Host stream-tool
 descriptors. It does not expose the generic
 data/static plugin grouping model or `metacodes.plugin-inventory/v1`; those
 remain available through the source-level Zig Runtime plus CLI/Web JSON Host
 interfaces. Projecting generic inventory into this binary table requires a
-later explicit ABI revision. A revision-26 consumer must not infer plugin
+later explicit ABI revision. A revision-27 consumer must not infer plugin
 identity from tool or Skill names, and every reserved field remains zero.
 
-### Revision 26 table topology
+### Revision 27 table topology
 
 The root layout is exact on the required 64-bit pointer ABI:
 
@@ -145,12 +151,12 @@ The root layout is exact on the required 64-bit pointer ABI:
 |---:|---|---|
 | 0 | `struct_size` | exactly 80 |
 | 4 | `abi_version` | exactly 1 |
-| 8 | `abi_revision` | exactly 26 |
+| 8 | `abi_revision` | exactly 27 |
 | 12 | `reserved0` | zero |
 | 16 | `buffer_release` | non-null function |
 | 24 | `runtime` | non-null 24-byte table |
 | 32 | `session` | non-null 56-byte table |
-| 40 | `session_control` | non-null 80-byte table |
+| 40 | `session_control` | non-null 88-byte table |
 | 48 | `skill` | non-null 32-byte table |
 | 56 | `mcp` | non-null 40-byte table |
 | 64 | `goal` | non-null 40-byte table |
@@ -163,7 +169,7 @@ these mandatory slots in this order:
 |---|---|
 | Runtime | `create`, `destroy` |
 | Session | `create`, `destroy`, `run_input`, `abort`, `submit_input`, `update_credential` |
-| Session Control | `restore`, `describe`, `set_model`, `update_permission_rules`, `compact`, `abort_compact`, `export_checkpoint`, `set_prompt_profile`, `update_permission_mode` |
+| Session Control | `restore`, `describe`, `set_model`, `update_permission_rules`, `compact`, `abort_compact`, `export_checkpoint`, `set_prompt_profile`, `update_permission_mode`, `rewind_to_user_message` |
 | Skill | `resolve_catalog`, `release_catalog`, `bind_policy` |
 | MCP | `apply_configuration`, `refresh`, `describe`, `update_selection` |
 | Goal | `get`, `set`, `update`, `clear` |
@@ -176,13 +182,14 @@ pointer is non-null and aligned. Wrong revision, reserved values, child sizes,
 or any null slot reject the entire discovery. The 280-byte Revision 13 root and
 the 64-byte Revision 14 through 22 roots and the 72-byte Revision 23 root
 therefore fail at root size without an out-of-bounds read. The 80-byte
-Revision 24 and 25 roots and a reference layout of the same size fail at the
-revision check, since none carries 26; a Revision 24 Session table is also 8
-bytes short of the 56 of Revisions 25 and 26, as a Revision 19 Session table
-was of the 48 of Revisions 20 through 24. A Revision 25 root has Revision 26's
-table and struct sizes and is told apart only by its revision; a Revision 25
-library would reject the Revision 26 source priorities as nonzero reserved
-words.
+Revision 24, 25 and 26 roots and a reference layout of the same size fail at
+the revision check, since none carries 27; a Revision 24 Session table is also
+8 bytes short of the 56 of Revisions 25 through 27, as a Revision 19 Session
+table was of the 48 of Revisions 20 through 24, and a Revision 26 Session
+Control table is 8 bytes short of Revision 27's 88, which ends with the
+`rewind_to_user_message` slot. A Revision 25 root has Revision 26's table and
+struct sizes and is told apart only by its revision; a Revision 25 library
+would reject the Revision 26 source priorities as nonzero reserved words.
 
 A future stability freeze first requires closure of the open items tracked in
 `doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (every group A item closed; every
@@ -342,20 +349,20 @@ Current delivery status is intentionally target-specific:
 
 | Target | Bundle/archive | Native source-free consumption |
 |---|---|---|
-| `aarch64-macos` | revision 25 ReleaseSafe bundle archived and gated by a `release.yml` dry run (`macos-latest`, run 40787422095, 2026-10-28); revision 24 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-17); revision 26 not revalidated | revision 25 native gate passed in run 40787422095; revision 24 native gate passed locally (2026-10-17): C and Zig source-free consumers (Session goals: the C one sets a goal, runs a goal-continuation Run whose runtime-written input the mock finds, sees it charged and is refused once the goal is paused; the Zig one carries a goal across checkpoint and restore over OpenAI Responses and keeps charging it; time context with a Host UTC offset; Host model-capability declarations; both submitting input to an active Run; host-scheduled teams: both consumers create a team member Session and read its roster through `team->describe` and its empty inbox through `team->poll`, and the L2 suite drives a lead delegating by `SpawnTeammate` and a member replying through the public ABI), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs; revision 26 not revalidated |
-| `x86_64-windows-msvc` | revision 26 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-29), revision 25 on 2026-10-28; CI (`agentcore-windows.yml`, GitHub-hosted `windows-latest`) builds and gates it | revision 26 native gate (`zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe`) passed locally (2026-10-29): both source-free consumers, the Rust crate tests and the ABI suite, including the Workspace Skill source-priority L2 test; revision 25 native gate passed locally (2026-10-28): the C consumer, statically linked and loading the DLL, rotates the provider credential from inside its Host stream tool callback mid-Run and again while idle, the Zig consumer does the same from its Host tool callback, and each consumer's loopback provider sees the creation, rotated and idle credentials in that order; revision 24 passed in CI on `main` at `7efc170d` (run 39107702062, 2026-10-18); the workflow repeats the gate on every push to `main` and on pull requests touching the native-gate paths |
-| `aarch64-windows-msvc` | revision 14 evidence retained; revision 26 not revalidated | native revision 26 gate pending |
-| `aarch64-windows-gnu` | revision 14 evidence retained; revision 26 not revalidated | native revision 26 gate pending |
-| `x86_64-windows-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run (`windows-latest`, run 40787422095, 2026-10-28) | revision 25 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169); revision 26 pending until the next release run |
-| `x86_64-linux-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run (`ubuntu-latest`, run 40787422095, 2026-10-28) | revision 25 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169); revision 26 pending until the next release run |
-| `aarch64-linux-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted arm64 Linux runner (`ubuntu-24.04-arm`, run 40787422095, 2026-10-28, #307) | revision 25 native gate (`zig build agentcore:gate`, Rust triple `aarch64-unknown-linux-gnu`) passed in that run; revision 26 pending until the next release run |
-| `x86_64-macos` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted Intel macOS runner (`macos-15-intel`, run 40787422095, 2026-10-28, #307) | revision 25 native gate (`zig build agentcore:gate`) passed in that run; revision 26 pending until the next release run |
+| `aarch64-macos` | revision 25 ReleaseSafe bundle archived and gated by a `release.yml` dry run (`macos-latest`, run 40787422095, 2026-10-28); revision 24 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-17); revision 27 not revalidated | revision 25 native gate passed in run 40787422095; revision 24 native gate passed locally (2026-10-17): C and Zig source-free consumers (Session goals: the C one sets a goal, runs a goal-continuation Run whose runtime-written input the mock finds, sees it charged and is refused once the goal is paused; the Zig one carries a goal across checkpoint and restore over OpenAI Responses and keeps charging it; time context with a Host UTC offset; Host model-capability declarations; both submitting input to an active Run; host-scheduled teams: both consumers create a team member Session and read its roster through `team->describe` and its empty inbox through `team->poll`, and the L2 suite drives a lead delegating by `SpawnTeammate` and a member replying through the public ABI), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs; revision 27 not revalidated |
+| `x86_64-windows-msvc` | revision 26 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-29), revision 25 on 2026-10-28; CI (`agentcore-windows.yml`, GitHub-hosted `windows-latest`) builds and gates it | revision 26 native gate (`zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe`) passed locally (2026-10-29): both source-free consumers, the Rust crate tests and the ABI suite, including the Workspace Skill source-priority L2 test (revision 27 not revalidated); revision 25 native gate passed locally (2026-10-28): the C consumer, statically linked and loading the DLL, rotates the provider credential from inside its Host stream tool callback mid-Run and again while idle, the Zig consumer does the same from its Host tool callback, and each consumer's loopback provider sees the creation, rotated and idle credentials in that order; revision 24 passed in CI on `main` at `7efc170d` (run 39107702062, 2026-10-18); the workflow repeats the gate on every push to `main` and on pull requests touching the native-gate paths |
+| `aarch64-windows-msvc` | revision 14 evidence retained; revision 27 not revalidated | native revision 27 gate pending |
+| `aarch64-windows-gnu` | revision 14 evidence retained; revision 27 not revalidated | native revision 27 gate pending |
+| `x86_64-windows-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run (`windows-latest`, run 40787422095, 2026-10-28) | revision 25 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169); revision 27 pending until the next release run |
+| `x86_64-linux-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run (`ubuntu-latest`, run 40787422095, 2026-10-28) | revision 25 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169); revision 27 pending until the next release run |
+| `aarch64-linux-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted arm64 Linux runner (`ubuntu-24.04-arm`, run 40787422095, 2026-10-28, #307) | revision 25 native gate (`zig build agentcore:gate`, Rust triple `aarch64-unknown-linux-gnu`) passed in that run; revision 27 pending until the next release run |
+| `x86_64-macos` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted Intel macOS runner (`macos-15-intel`, run 40787422095, 2026-10-28, #307) | revision 25 native gate (`zig build agentcore:gate`) passed in that run; revision 27 pending until the next release run |
 
 Cross-build success is not a support claim. In particular, the empty macOS
 framework list remains provisional until the corresponding native gates pass.
 This validation status is not an ABI restriction.
 
-Revision 26 hard-cuts the current schema-1 manifest contract in place. The
+Revision 27 hard-cuts the current schema-1 manifest contract in place. The
 manifest records the exact ABI version, revision, and root size, while runtime
 discovery validates all seven mandatory child tables. There is no manifest
 migration, dual parser, capability negotiation, or duplicated child-table
@@ -389,7 +396,7 @@ both copies.
 
 `decodeSkillCatalog` returns an owned `ParsedSkillCatalog` for
 `metask.skill-catalog/v1`. Revision 15 hard-cut the current experimental shape
-of that schema, and Revision 26 keeps it: every earlier unreleased experimental
+of that schema, and Revision 27 keeps it: every earlier unreleased experimental
 shape bearing the same token is void, and consumers must interpret the
 descriptor only with the exact bundle they pin. The decoder validates the
 schema, the 1024-Skill limit, identity forms, duplicate concrete `skill_id` or
@@ -476,7 +483,7 @@ ordering and may invoke their callbacks concurrently. The stream has no common
 event sequence number, cursor, replay, or exactly-once contract; only
 `run_state.transition_seq` orders RunState snapshots.
 
-`on_event` is mandatory in Revision 26. `run_state` is emitted for admitted-run
+`on_event` is mandatory in Revision 27. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
 and advances only for emitted RunState snapshots. While the observation
@@ -542,7 +549,7 @@ owned typed value. Older Hosts retain the event through the `unknown` path.
 decode it through the `unknown` observation path and ignore or retain it in
 accordance with the forward-compatibility rules above.
 
-`tool_result.file_refs` is an optional Revision 26 observation field. It is
+`tool_result.file_refs` is an optional Revision 27 observation field. It is
 present only for successful selected built-in file-tool executions and contains
 at most 32 entries. Each entry has one locator union (`workspace_path`,
 `absolute_path`, or `uri`), an open-ended bounded `kind` string, a bounded
@@ -569,7 +576,7 @@ their `ctx` and keeps it valid until Session destruction succeeds.
 
 ### Process-plugin Runtime configuration
 
-Revision 26 uses one `runtime->create(runtime_config, plugin_config,
+Revision 27 uses one `runtime->create(runtime_config, plugin_config,
 out_runtime, out_diagnostic)`. The Runtime config is required; the plugin
 config is nullable. Null and an empty, well-formed `RuntimePluginConfigV1`
 create equivalent no-extra-plugin generations. Descriptor arrays and path
@@ -628,7 +635,7 @@ version, pinned executable SHA-256, global tool name and validated reserialized
 input schema.
 The binding—not the display name alone—enters Permission provenance and
 checkpoint authority resolution. Process tools deliberately have no
-`allow_session`/`deny_session` candidate in revision 26, so a Host may answer
+`allow_session`/`deny_session` candidate in revision 27, so a Host may answer
 only the offered one-shot choices unless an independent native rule decides
 first. Changing executable/package/schema authority invalidates a restored
 binding instead of silently reauthorizing the new implementation.
@@ -729,7 +736,7 @@ not define status precedence when multiple other input or admission errors are
 present in the same call.
 
 ABI v1 provides no in-place recovery or mutation of a poisoned Session. The
-Host must destroy that physical handle. Revision 26 checkpoint/restore creates
+Host must destroy that physical handle. Revision 27 checkpoint/restore creates
 a new handle from a previously exported committed checkpoint; it does not
 reconstruct state that was never successfully exported or resume an active
 Run.
@@ -737,7 +744,7 @@ Run.
 When facade poison occurs after Core has returned to an inspectable idle state,
 `session_describe` succeeds and reports lifecycle `poisoned`; it must not report
 `idle`. An active ordinary Session activity makes `session_describe` return
-`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 26 description does not
+`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 27 description does not
 emit lifecycle `busy`.
 
 A checkpoint is resumable model state, not a raw transcript archive. Before
@@ -863,7 +870,7 @@ result. A Skill invocation in its own context is the Run, so its failure is.
 ### Manual compact
 
 `session_compact` runs the canonical default compact policy as a best-effort
-Conversation maintenance operation. Revision 26 has no Host-supplied target
+Conversation maintenance operation. Revision 27 has no Host-supplied target
 token budget and does not guarantee that the result fits the context window of
 the current or a future model. `session_set_model` and `session_compact` are
 independent primitives, not a compound model-migration transaction.
@@ -872,7 +879,7 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 `after_context_tokens` are context-size estimates for UI and policy decisions;
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
-reason in Revision 26, and a Host must not infer one by parsing diagnostics.
+reason in Revision 27, and a Host must not infer one by parsing diagnostics.
 
 ### Automatic compaction inside a Run
 
@@ -972,7 +979,7 @@ fresh-create input or restored checkpoint. `protocol_kind_code` occupies byte
 offset 140 in the unchanged 168-byte Host config and accepts:
 
 - `METASK_AGENTCORE_PROTOCOL_DEFAULT` (`0`): use the selected provider's
-  existing default. In Revision 26 that means Anthropic Messages, OpenAI Chat
+  existing default. In Revision 27 that means Anthropic Messages, OpenAI Chat
   Completions, or Gemini GenerateContent;
 - `METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES` (`1`): valid only with
   `METASK_AGENTCORE_PROVIDER_OPENAI`; serialize `POST /v1/responses` request
@@ -1098,7 +1105,7 @@ nothing.
 
 The runtime reaches the other two statuses itself: `budget_limited` when
 usage reaches the budget, and `usage_limited` is reserved for a provider
-usage limit (Revision 26 never sets it). A new budget with room makes a
+usage limit (Revision 27 never sets it). A new budget with room makes a
 `budget_limited` goal active, and an active goal already past a lowered
 budget becomes `budget_limited` at once.
 
@@ -1284,7 +1291,7 @@ reservation into the Session's durable usage; the Run's end releases the
 rest. Input passes no permission, sandbox, cancellation, or budget decision:
 it only adds a user record.
 
-Support is discovered through Revision 26 itself (the slot is mandatory);
+Support is discovered through Revision 27 itself (the slot is mandatory);
 `MAX_SUBMITTED_INPUTS_V1` (64) and `MAX_SUBMITTED_INPUT_BYTES_V1` (16 MiB) are
 published constants; `session_describe` is unchanged.
 
@@ -1364,8 +1371,62 @@ destroy and restore are not needed, also not while a Run is going.
   configuration (`SessionHostConfigV1.api_key`), never one published to the
   Session that exported the checkpoint.
 
-Support is discovered through Revision 26 itself (the slot is mandatory);
+Support is discovered through Revision 27 itself (the slot is mandatory);
 `MAX_CREDENTIAL_BYTES_V1` (16 KiB) is a published constant.
+
+### Edit and rerun
+
+Revision 27 adds `session_control->rewind_to_user_message(session, position,
+out_error)`, edit-and-rerun's history change (#441). It is the kernel operation
+the CLI's `/edit` and `SessionHost`'s `Submission.replaces` use (#432;
+[API.md, Edit and rerun](API.md#edit-and-rerun)).
+
+`position` is a 1-based count over the Session's full history: the compacted
+prefix is included (compaction is a projection and never renumbers), and the
+numbering is that of `describe`'s `conversation.message_count`. A Host learns a
+Run's own position as `message_count + 1`, read while idle just before
+`run_input`: the Run's input is the first record the Run appends (its context
+blocks and time context lead that same record). An input adopted by
+`submit_input` is its own user record, appended later in the Run. A restored
+Session numbers the history its checkpoint carries; before any compaction that
+is the exported one, position for position.
+
+On `STATUS_OK` the user message at `position` and everything after it — later
+prompts, replies, tool calls and tool results — are dropped and discarded, not
+kept as a branch. The next Run's input then takes the dropped message's place,
+after exactly the context that preceded it: the provider request is a
+byte-identical prefix of the earlier requests plus the new input, so nothing
+enters the cached prefix. The Host reruns by calling `run_input` with the
+edited input, of any kind. Only the Conversation changes:
+
+- files written, commands run and other effects of the dropped turns stay;
+  the must-read-first record is cleared, since the rerun's context no longer
+  shows what the dropped turns read;
+- the model, permission mode, policy generation and Session grants, Skill
+  binding, MCP selection, goal, prompt profile and `last_run_id` are
+  unchanged; run ids keep increasing;
+- the durable usage is re-measured, so `describe`'s `budget` shows the freed
+  bytes; a checkpoint exported afterwards holds the edited Conversation and
+  never the dropped one, and a Session restored from it continues from the
+  edited history.
+
+| Situation | Status |
+|---|---|
+| a user message at or after the compact boundary | `OK` |
+| zero | `INVALID_ARGUMENT` |
+| no message at `position` | `MESSAGE_POSITION_OUT_OF_RANGE` (31) |
+| an assistant reply (the leading summary of a Session restored after a compaction included), a tool result, or text the runtime wrote itself | `NOT_USER_MESSAGE` (32) |
+| a message behind the compact boundary, whose preceding context exists only as the summary | `MESSAGE_POSITION_COMPACTED` (33) |
+| a Run, compact, checkpoint export or other facade call is active, including from the Session's own callbacks | `BUSY` |
+| a poisoned Session (checked after the facade gate, before the position) | `INVALID_STATE` |
+
+Every refusal changes nothing and writes a diagnostic. The three position
+statuses name a position whose preceding context cannot be reconstructed as it
+stood; a Host must not infer which by parsing the diagnostic. A message at the
+compact boundary can be rewound: the summary stays its preceding context, as
+in every request since the compaction.
+
+Support is discovered through Revision 27 itself (the slot is mandatory).
 
 ### Active-Run intent/result journal
 
@@ -1395,7 +1456,7 @@ it therefore does not insert prompt bytes, reorder history, or invalidate a
 warm prompt-cache prefix. An unfinished pair fails closed, and so does a Run
 whose process exited before its terminal record (the next Run reports
 `UnfinishedRun`; a Run still held by a live process reports `JournalBusy`);
-revision 26 does **not** expose in-place active-Run resume, automatic
+revision 27 does **not** expose in-place active-Run resume, automatic
 tool replay, or exactly-once external effects. It provides durable evidence
 and deterministic recovery classification for a later explicit recovery API,
 not authority to guess whether an external side effect occurred.
@@ -1624,14 +1685,14 @@ published once, not that the Host filesystem is transactional.
 AgentCore does not implicitly read `/etc/metacodes/skills`, `.claude/skills`,
 `.codex/skills`, or `.metacodes/skills`. A Host may explicitly register any
 local directory only when its contents already use the canonical Agent Skill
-format. Directory names do not select a parser; Revision 26 has no Claude/Codex
+format. Directory names do not select a parser; Revision 27 has no Claude/Codex
 format adapter or public Provider Registry. The projected provider id is
 `agents.directory`.
 
 Each valid `skills[]` entry exposes separate identities:
 
 - `skill_policy_key`: the logical invocation slot, equal to
-  `invocation_name` in Revision 26;
+  `invocation_name` in Revision 27;
 - `provider_id`, `source_scope`, `source_instance_id`, and `contribution_id`:
   source identity;
 - `content_revision`: body/resources identity;
@@ -1808,7 +1869,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 26. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 27. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -1820,7 +1881,7 @@ product decision.
 
 ### MCP Runtime catalog and Session view
 
-Revision 26 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
+Revision 27 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
 connections. Public negotiation codes preserve Revision 6 meanings:
 `auto=1`, `modern_only=2`, and exact `legacy_only=3`; exact
 `legacy_2025_06_only=4` is appended. Runtime owns negotiation,
@@ -1872,7 +1933,7 @@ returns.
 | Reporting every completed HTTP response's final status and body | Host Connector |
 | Binding one connection context to `purpose_code` and `requested_era_code` | Host Connector |
 
-Revision 26 separates MCP control and result traffic in the type system.
+Revision 27 separates MCP control and result traffic in the type system.
 `McpConnectorV1.request` writes a 40-byte `McpResponseV1` only for bounded
 discovery/initialize/catalog control frames. Stdio responses use
 `http_status == 0`; Streamable HTTP completed responses use their final status
@@ -2021,7 +2082,7 @@ materializes a provider
 with the recorded envelope admission is an invariant violation. View
 destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
-outside Revision 26.
+outside Revision 27.
 
 The value-only MCP checkpoint section has one current `MCPSEL` format and no
 independent revision axis. Its decoder rejects every earlier `R6MCP`/`R7MCP`
@@ -2031,7 +2092,7 @@ Tools to the current catalog's, and the permission section's grants restore
 only where their binding names that connection. MCP grants in checkpoints
 exported before #389 carry the earlier connection-free binding, so restore
 invalidates them.
-The outer AgentCore ABI Revision 26 remains the sole compatibility boundary.
+The outer AgentCore ABI Revision 27 remains the sole compatibility boundary.
 
 ### Model-visible MCP diagnostics
 
@@ -2183,7 +2244,7 @@ needed.
   (`disableBypassPermissionsMode`, `disableAutoMode`) would also return
   `INVALID_ARGUMENT`, diagnostic `PermissionModeDisabled`; a Session's
   settings are the Host-imported rules, which cannot disable a mode, so this
-  does not occur in revision 26. None of these changes anything.
+  does not occur in revision 27. None of these changes anything.
 - **Effective point.** The first permission decision after the call returns
   `OK`, which is the first Tool call of the next Run.
 - **Grants.** A new mode is a new policy. The call starts a new policy
@@ -2277,7 +2338,7 @@ prompt-outcome contract replaces that seam.
 
 ### Completion boundary
 
-Revision 26 exposes no Completion handle, DTO, status, or function slot.
+Revision 27 exposes no Completion handle, DTO, status, or function slot.
 Independent title, summary, classification, and other product-level model calls
 belong to the Host or a product plugin. If the Agent itself must invoke such a
 capability, the Host exposes a semantically bounded Tool; a generic Completion
@@ -2545,7 +2606,7 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. While Revision 26 remains
+`struct_size`; every reserved field must be zero. While Revision 27 remains
 unreleased and experimental, an explicitly approved hard cut may replace its
 wire shape in place only when the library, headers, SDKs, consumers, tests, and
 documentation move atomically; the replaced bundle is void and no compatibility
@@ -2557,11 +2618,11 @@ or control-message extensions require `metask_agentcore_get_api(2)` and v2
 types. Assigning a meaning or non-zero value to a reserved field is always an
 explicit wire-contract decision, never an inferred compatible extension.
 
-Revision 26's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 27's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
-Revision 26 has no root capability mask. The seven typed table pointers and
+Revision 27 has no root capability mask. The seven typed table pointers and
 their exact layouts are the complete ABI surface and are all mandatory.
 Concrete Runtime and Session configuration still determines which tools and
 callbacks are active; that configuration is not ABI capability negotiation.

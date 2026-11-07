@@ -4072,7 +4072,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 26), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 27), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -15180,4 +15180,302 @@ test "L2 MCP checkpoint restore binds an allow_session grant to its endpoint (#3
     try std.testing.expectEqual(@as(usize, 1), toolCallsReceived(endpoint_b));
     try std.testing.expectEqual(@as(usize, 2), toolCallsReceived(endpoint_a));
     try std.testing.expectEqual(probe.asks, probe.ui_releases);
+}
+
+/// What `describe` says about a Session's Conversation and durable usage.
+const RewindView = struct {
+    message_count: u64,
+    compact_boundary: u64,
+    durable_usage_bytes: u64,
+};
+
+fn describeRewindView(api: sdk.Api, session: ?*wire.SessionHandle) !RewindView {
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().describe()(session, &description, &diagnostic),
+    );
+    defer api.bufferRelease()(&description);
+    const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    const decoded = try sdk.decodeSessionDescription(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    return .{
+        .message_count = decoded.value.conversation.message_count,
+        .compact_boundary = decoded.value.conversation.compact_boundary,
+        .durable_usage_bytes = decoded.value.budget.durable_usage_bytes,
+    };
+}
+
+/// Rewinds `position` and expects `status`; a refusal must carry a
+/// diagnostic, which is released here.
+fn expectRewind(
+    api: sdk.Api,
+    session: ?*wire.SessionHandle,
+    position: u64,
+    status: u32,
+) !void {
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        status,
+        api.sessionControl().rewindToUserMessage()(session, position, &diagnostic),
+    );
+    if (status == wire.STATUS_OK) {
+        try std.testing.expectEqual(@as(u64, 0), diagnostic.len);
+    } else {
+        try std.testing.expect(diagnostic.len != 0);
+    }
+}
+
+/// Calls `rewind_to_user_message` from inside a Run's own `on_event`
+/// callback, where the Run holds the facade gate.
+const RewindDuringRunProbe = struct {
+    api: sdk.Api,
+    attempts: u32 = 0,
+    busy: u32 = 0,
+
+    fn onEvent(raw: ?*anyopaque, run: ?*const wire.RunContextV1, _: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const context = run orelse return wire.EVENT_FATAL;
+        if (self.attempts != 0) return wire.EVENT_CONTINUE;
+        self.attempts += 1;
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer self.api.bufferRelease()(&diagnostic);
+        if (self.api.sessionControl().rewindToUserMessage()(context.session, 1, &diagnostic) == wire.STATUS_BUSY)
+            self.busy += 1;
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+test "L2 Revision 27 rewind_to_user_message reruns an edited message through the provider and survives checkpoint restore (#441)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    // Runs: alpha (1 request), beta with a Write tool call (2), gamma (1),
+    // the edit (1), and one Run after restore (1).
+    const bodies = [_][]const u8{ FINAL_SSE, WRITE_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    const builtins = [_]wire.BytesViewV1{sdk.bytesView("Write")};
+    runtime_config.builtin_tools = &builtins;
+    runtime_config.builtin_tool_count = builtins.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.allowed_tools = &builtins;
+    host.allowed_tool_count = builtins.len;
+    var create = sessionCreateConfig(&host, "rewind-model");
+    var probe = RewindDuringRunProbe{ .api = api };
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = RewindDuringRunProbe.onEvent;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &create, &callbacks, &session, &diagnostic),
+    );
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    // An empty history has nothing to rewind to.
+    try expectRewind(api, session, 1, wire.STATUS_MESSAGE_POSITION_OUT_OF_RANGE);
+
+    // The Host learns each Run's position the documented way: describe's
+    // message_count + 1, read while idle just before the Run.
+    const prompts = [_][]const u8{ "alpha-prompt", "beta-prompt", "gamma-prompt" };
+    var positions: [prompts.len]u64 = undefined;
+    for (prompts, &positions, 1..) |prompt, *position, run_id| {
+        position.* = (try describeRewindView(api, session)).message_count + 1;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.session().runText(session, run_id, sdk.bytesView(prompt), &options, &result, &diagnostic),
+        );
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    }
+    // A rewind inside a Run's own callback finds the facade busy.
+    try std.testing.expectEqual(@as(u32, 1), probe.attempts);
+    try std.testing.expectEqual(@as(u32, 1), probe.busy);
+    // user alpha, reply; user beta, tool_use, tool_result, reply; user gamma, reply.
+    try std.testing.expectEqualSlices(u64, &.{ 1, 3, 7 }, &positions);
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    const written_path = try std.fs.path.join(a, &.{ root, "blocked.txt" });
+    defer a.free(written_path);
+    try std.Io.Dir.cwd().access(std.testing.io, written_path, .{});
+    const before = try describeRewindView(api, session);
+    try std.testing.expectEqual(@as(u64, 8), before.message_count);
+
+    // Every position whose context cannot be rebuilt is refused with its own
+    // status and changes nothing.
+    try expectRewind(api, session, 0, wire.STATUS_INVALID_ARGUMENT);
+    try expectRewind(api, session, 2, wire.STATUS_NOT_USER_MESSAGE); // assistant reply
+    try expectRewind(api, session, 4, wire.STATUS_NOT_USER_MESSAGE); // tool call
+    try expectRewind(api, session, 5, wire.STATUS_NOT_USER_MESSAGE); // tool result
+    try expectRewind(api, session, 9, wire.STATUS_MESSAGE_POSITION_OUT_OF_RANGE);
+    try expectRewind(api, session, std.math.maxInt(u64), wire.STATUS_MESSAGE_POSITION_OUT_OF_RANGE);
+    try std.testing.expectEqual(before, try describeRewindView(api, session));
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+
+    // Edit beta: its context is alpha and alpha's reply; beta, the tool
+    // round trip and gamma are dropped.
+    try expectRewind(api, session, positions[1], wire.STATUS_OK);
+    const rewound = try describeRewindView(api, session);
+    try std.testing.expectEqual(@as(u64, 2), rewound.message_count);
+    try std.testing.expect(rewound.durable_usage_bytes < before.durable_usage_bytes);
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    options.max_turns = 1;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, 4, sdk.bytesView("delta-edited"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 5), server.requestCount());
+    {
+        const body = (server.lastRequest() orelse return error.MissingRequest).body();
+        const alpha = std.mem.indexOf(u8, body, "alpha-prompt") orelse return error.MissingContext;
+        const edited = std.mem.indexOf(u8, body, "delta-edited") orelse return error.MissingEdit;
+        try std.testing.expect(alpha < edited);
+        for ([_][]const u8{ "beta-prompt", "gamma-prompt", "tu_write", "must-not-write" }) |dropped|
+            try std.testing.expect(std.mem.indexOf(u8, body, dropped) == null);
+    }
+    // Context only: the file the dropped turn wrote stays.
+    try std.Io.Dir.cwd().access(std.testing.io, written_path, .{});
+    try std.testing.expectEqual(@as(u64, 4), (try describeRewindView(api, session)).message_count);
+
+    // The edited Conversation is what the checkpoint carries.
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic),
+    );
+    for ([_][]const u8{ "beta-prompt", "gamma-prompt", "tu_write" }) |dropped|
+        try std.testing.expect(std.mem.indexOf(u8, checkpoint.bytes.items, dropped) == null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.bytes.items, "delta-edited") != null);
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&restore_report);
+    callbacks.ctx = null;
+    callbacks.on_event = acceptEvent;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().restore()(runtime, &restore_config, &callbacks, &session, &restore_report, &diagnostic),
+    );
+    try std.testing.expectEqual(@as(u64, 4), (try describeRewindView(api, session)).message_count);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, 5, sdk.bytesView("epsilon-after-restore"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 6), server.requestCount());
+    {
+        const body = (server.lastRequest() orelse return error.MissingRequest).body();
+        const alpha = std.mem.indexOf(u8, body, "alpha-prompt") orelse return error.MissingContext;
+        const edited = std.mem.indexOf(u8, body, "delta-edited") orelse return error.MissingEdit;
+        const next = std.mem.indexOf(u8, body, "epsilon-after-restore") orelse return error.MissingPrompt;
+        try std.testing.expect(alpha < edited and edited < next);
+        for ([_][]const u8{ "beta-prompt", "gamma-prompt", "tu_write", "must-not-write" }) |dropped|
+            try std.testing.expect(std.mem.indexOf(u8, body, dropped) == null);
+    }
+    // Positions keep their meaning in the restored Session: the edit is
+    // still message 3 and can itself be rewound.
+    try expectRewind(api, session, 2, wire.STATUS_NOT_USER_MESSAGE);
+    try expectRewind(api, session, 3, wire.STATUS_OK);
+    try std.testing.expectEqual(@as(u64, 2), (try describeRewindView(api, session)).message_count);
+}
+
+test "L2 Revision 27 rewind_to_user_message refuses a compacted position and reruns from the compact boundary (#441)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    // Six history Runs, the compact summary, and the rerun.
+    const bodies = [_][]const u8{FINAL_SSE} ** 8;
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "compact-model");
+    defer fixture.deinit();
+    try appendCompactablePublicHistory(&fixture);
+
+    var compact_result = std.mem.zeroes(wire.CompactResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionControl().compact()(fixture.session, 1, &compact_result, &fixture.diagnostic),
+    );
+    try std.testing.expectEqual(wire.COMPACT_COMPACTED, compact_result.outcome_code);
+    const compacted = try describeRewindView(fixture.api, fixture.session);
+    try std.testing.expectEqual(@as(u64, 12), compacted.message_count);
+    try std.testing.expect(compacted.compact_boundary > 0);
+
+    // Positions keep counting the compacted prefix; one behind the boundary
+    // has only the summary for its context.
+    try expectRewind(fixture.api, fixture.session, 1, wire.STATUS_MESSAGE_POSITION_COMPACTED);
+    try std.testing.expectEqual(compacted, try describeRewindView(fixture.api, fixture.session));
+
+    // The first active message is the earliest one that can be rerun: the
+    // summary stays its context, as in every request since the compaction.
+    try expectRewind(fixture.api, fixture.session, compacted.compact_boundary + 1, wire.STATUS_OK);
+    const rewound = try describeRewindView(fixture.api, fixture.session);
+    try std.testing.expectEqual(compacted.compact_boundary, rewound.message_count);
+    try std.testing.expectEqual(@as(usize, 7), server.requestCount());
+
+    const result = try fixture.runText(7, "rerun-from-boundary");
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 8), server.requestCount());
+    const body = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "Another language model started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "rerun-from-boundary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "recent context") == null);
 }

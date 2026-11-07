@@ -1,6 +1,6 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 26,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 27,
                "AgentCore revision changed");
 _Static_assert(sizeof(metask_agentcore_api_v1) == 80,
                "AgentCore root layout changed");
@@ -10,7 +10,7 @@ _Static_assert(sizeof(metask_agentcore_session_api_v1) == 56,
                "Session table layout changed");
 _Static_assert(METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 == 16384ULL,
                "credential byte limit changed");
-_Static_assert(sizeof(metask_agentcore_session_control_api_v1) == 80,
+_Static_assert(sizeof(metask_agentcore_session_control_api_v1) == 88,
                "Session Control table layout changed");
 _Static_assert(sizeof(metask_agentcore_skill_api_v1) == 32,
                "Skill table layout changed");
@@ -30,6 +30,10 @@ _Static_assert(METASK_AGENTCORE_MAX_TEAM_NAME_BYTES_V1 == 64u &&
                "team byte limits changed");
 _Static_assert(METASK_AGENTCORE_STATUS_GOAL_CONFLICT == 30u,
                "goal conflict status changed");
+_Static_assert(METASK_AGENTCORE_STATUS_MESSAGE_POSITION_OUT_OF_RANGE == 31u &&
+                   METASK_AGENTCORE_STATUS_NOT_USER_MESSAGE == 32u &&
+                   METASK_AGENTCORE_STATUS_MESSAGE_POSITION_COMPACTED == 33u,
+               "rewind refusal statuses changed");
 _Static_assert(METASK_AGENTCORE_RUN_INPUT_GOAL_CONTINUATION == 4u,
                "goal continuation input kind changed");
 
@@ -197,6 +201,8 @@ void agentcore_revision_fifteen_call_shape_probe(
     (void)api->session_control->abort_compact;
     (void)api->session_control->export_checkpoint;
     (void)api->session_control->set_prompt_profile;
+    (void)api->session_control->rewind_to_user_message(
+        (metask_agentcore_session *)0, (uint64_t)3, diagnostic);
     (void)api->skill->resolve_catalog;
     (void)api->skill->release_catalog;
     (void)api->skill->bind_policy;

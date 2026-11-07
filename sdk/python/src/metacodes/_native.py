@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 ABI_V1 = 1
-ABI_REVISION = 26
+ABI_REVISION = 27
 
 # Status codes (METASK_AGENTCORE_STATUS_*).
 STATUS_NAMES = {
@@ -50,6 +50,9 @@ STATUS_NAMES = {
     28: "IMAGE_INPUT_UNSUPPORTED",
     29: "IMAGE_INPUT_CAPABILITY_UNKNOWN",
     30: "GOAL_CONFLICT",
+    31: "MESSAGE_POSITION_OUT_OF_RANGE",
+    32: "NOT_USER_MESSAGE",
+    33: "MESSAGE_POSITION_COMPACTED",
 }
 STATUS_OK = 0
 
@@ -338,6 +341,7 @@ SessionUpdateRulesFn = ctypes.CFUNCTYPE(
     ctypes.c_uint32, _P, ctypes.POINTER(PermissionRuleSet), _DIAG
 )
 SessionUpdateModeFn = ctypes.CFUNCTYPE(ctypes.c_uint32, _P, ctypes.c_uint32, _DIAG)
+SessionRewindFn = ctypes.CFUNCTYPE(ctypes.c_uint32, _P, ctypes.c_uint64, _DIAG)
 BufferReleaseFn = ctypes.CFUNCTYPE(None, ctypes.POINTER(OwnedBytes))
 
 
@@ -376,6 +380,7 @@ class SessionControlApi(ctypes.Structure):
         ("export_checkpoint", ctypes.c_void_p),
         ("set_prompt_profile", ctypes.c_void_p),
         ("update_permission_mode", SessionUpdateModeFn),
+        ("rewind_to_user_message", SessionRewindFn),
     ]
 
 
@@ -410,8 +415,9 @@ class ApiV1(ctypes.Structure):
     ]
 
 
-assert ctypes.sizeof(ApiV1) == 80, "AgentCore Revision 26 root is 80 bytes"
-assert ctypes.sizeof(SessionApi) == 56, "AgentCore Revision 26 Session table is 56 bytes"
+assert ctypes.sizeof(ApiV1) == 80, "AgentCore Revision 27 root is 80 bytes"
+assert ctypes.sizeof(SessionApi) == 56, "AgentCore Revision 27 Session table is 56 bytes"
+assert ctypes.sizeof(SessionControlApi) == 88, "AgentCore Revision 27 Session Control table is 88 bytes"
 
 
 class AgentCoreError(RuntimeError):

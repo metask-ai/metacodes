@@ -386,6 +386,11 @@ pub const SessionControlApi = struct {
     pub fn updatePermissionMode(self: SessionControlApi) types.SessionUpdatePermissionModeFnV1 {
         return self.raw.update_permission_mode.?;
     }
+    /// Revision 27 (#441): drops the user message at a 1-based position and
+    /// everything after it while idle, so the next Run reruns from there.
+    pub fn rewindToUserMessage(self: SessionControlApi) types.SessionRewindToUserMessageFnV1 {
+        return self.raw.rewind_to_user_message.?;
+    }
 };
 
 pub const SkillApi = struct {
@@ -487,7 +492,8 @@ fn validateSessionControlApi(raw: ?*const types.SessionControlApiV1) bool {
         api.restore != null and api.describe != null and api.set_model != null and
         api.update_permission_rules != null and api.compact != null and
         api.abort_compact != null and api.export_checkpoint != null and
-        api.set_prompt_profile != null and api.update_permission_mode != null;
+        api.set_prompt_profile != null and api.update_permission_mode != null and
+        api.rewind_to_user_message != null;
 }
 
 fn validateSkillApi(raw: ?*const types.SkillApiV1) bool {
@@ -534,7 +540,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 26 SDK rejects Revision 13 through 25 and stale reference roots" {
+test "Revision 27 SDK rejects Revision 13 through 26 and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -552,7 +558,7 @@ test "Revision 26 SDK rejects Revision 13 through 25 and stale reference roots" 
 
     // Revisions 14 through 22 (16 withdrawn) had the 64-byte root; Revision 23
     // added the goal table for a 72-byte root. Both are short of the 80-byte
-    // root Revisions 24 through 26 share, so the size check rejects every one.
+    // root Revisions 24 through 27 share, so the size check rejects every one.
     const Revision22Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -584,11 +590,13 @@ test "Revision 26 SDK rejects Revision 13 through 25 and stale reference roots" 
         try std.testing.expectError(error.UnsupportedAbi, Api.validate(&root));
     }
 
-    // The 80-byte reference layout has Revision 26's size, so it fails at the
+    // The 80-byte reference layout has Revision 27's size, so it fails at the
     // revision check (a Revision 24 root, whose Session table is 8 bytes
-    // short, and a Revision 25 root, whose Skill catalog structs carry no
-    // source priorities, included) or, carrying 26, at its missing tables.
-    for ([_]u32{ 13, 23, 24, 25, types.ABI_REVISION }) |revision| {
+    // short, a Revision 25 root, whose Skill catalog structs carry no source
+    // priorities, and a Revision 26 root, whose Session Control table is 8
+    // bytes short of the rewind slot, included) or, carrying 27, at its
+    // missing tables.
+    for ([_]u32{ 13, 23, 24, 25, 26, types.ABI_REVISION }) |revision| {
         var stale_reference: types.ApiV1 align(@alignOf(types.ApiV1)) = std.mem.zeroes(types.ApiV1);
         stale_reference.struct_size = @sizeOf(types.ApiV1);
         stale_reference.abi_version = types.ABI_VERSION_V1;

@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 26:
+C ABI v1 revision 27:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -20,7 +20,7 @@ C ABI v1 revision 26:
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 80-byte root, all
-seven mandatory typed tables, function slots, and reserved fields. Revision 26 is
+seven mandatory typed tables, function slots, and reserved fields. Revision 27 is
 the Agent Runtime surface; it does not expose an independent Completion client.
 `SessionCreateConfigV1.prompt_profile` edits the named system-prompt sections
 (replace the identity, add Host sections; governance sections stay locked) and
@@ -30,6 +30,13 @@ one Run as user-role context instead of system-prompt text.
 `session_control->update_permission_mode` changes an existing Session's
 permission mode in place while idle: same handle and Conversation, a new policy
 generation, every Session grant revoked; `describe` reports `permission_mode`.
+`session_control->rewind_to_user_message` (Revision 27) edits and reruns while
+idle: it drops the user message at a 1-based position (the numbering of
+`describe`'s `conversation.message_count`) and everything after it, and the
+next Run's input takes its place; a position it cannot rerun from is refused
+with `MESSAGE_POSITION_OUT_OF_RANGE`, `NOT_USER_MESSAGE` or
+`MESSAGE_POSITION_COMPACTED` and changes nothing. Only the Conversation
+changes, and a checkpoint exported afterwards holds the edited one.
 `session->update_credential` replaces a Session's provider credential in place,
 idle or during a Run, from any thread or callback: every request sent afterwards
 (later turns, retries, compaction, Skills, tool providers, requests still

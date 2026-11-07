@@ -799,6 +799,30 @@ class Session:
         )
         self._lib.check("session.update_permission_mode", status, diagnostic)
 
+    def rewind_to_user_message(self, position: int) -> None:
+        """Drop the user message at ``position`` and everything after it.
+
+        Edit-and-rerun's history change (AgentCore Revision 27): the next
+        :meth:`run` takes the dropped message's place, after exactly the
+        context that preceded it. ``position`` counts the full history from 1,
+        the way ``describe()["conversation"]["message_count"]`` counts, so a
+        Run's own message is ``message_count + 1`` read just before it. Only
+        the Conversation changes; files and other effects of the dropped turns
+        stay. A position that is not a user message, is out of range, or lies
+        behind the compact boundary raises :class:`AgentCoreError`
+        (``NOT_USER_MESSAGE``, ``MESSAGE_POSITION_OUT_OF_RANGE``,
+        ``MESSAGE_POSITION_COMPACTED``) and changes nothing.
+        """
+        if isinstance(position, bool) or not isinstance(position, int) or position < 1:
+            raise ValueError("position must be a positive int")
+        if position >= 1 << 64:
+            raise ValueError("position must fit in 64 bits")
+        diagnostic = n.OwnedBytes()
+        status = self._lib.api.session_control.contents.rewind_to_user_message(
+            self._handle, position, ctypes.byref(diagnostic)
+        )
+        self._lib.check("session.rewind_to_user_message", status, diagnostic)
+
     def close(self, timeout: Optional[float] = None) -> None:
         """Destroy the Session.
 

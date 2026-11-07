@@ -392,6 +392,31 @@ test('setPermissionMode applies to the next Run', { skip, timeout: TIMEOUT }, as
   assert.equal(fs.existsSync(path.join(root, 'second.txt')), true);
 });
 
+test('rewindToUserMessage reruns an edited message', { skip, timeout: TIMEOUT }, async (t) => {
+  const provider = await withProvider(t, [['text', 'first answer'], ['text', 'second answer'], ['text', 'edited answer']]);
+  const { session } = open(t, { tools: [] }, provider, workspace(t));
+  await session.run('alpha-prompt');
+  const position = session.describe().conversation.message_count + 1;
+  await session.run('beta-prompt');
+  assert.equal(session.describe().conversation.message_count, 4);
+  // An assistant reply and a position past the end are refused with their
+  // own codes and change nothing.
+  assert.throws(() => session.rewindToUserMessage(2), { code: 'NOT_USER_MESSAGE' });
+  assert.throws(() => session.rewindToUserMessage(9), { code: 'MESSAGE_POSITION_OUT_OF_RANGE' });
+  assert.throws(() => session.rewindToUserMessage(0), TypeError);
+  assert.equal(session.describe().conversation.message_count, 4);
+  assert.equal(provider.requests.length, 2);
+  session.rewindToUserMessage(position);
+  assert.equal(session.describe().conversation.message_count, 2);
+  const result = await session.run('gamma-edited');
+  assert.equal(result.text, 'edited answer');
+  const rerun = JSON.stringify(provider.requests[2].messages);
+  assert.match(rerun, /alpha-prompt/);
+  assert.match(rerun, /gamma-edited/);
+  assert.doesNotMatch(rerun, /beta-prompt/);
+  assert.doesNotMatch(rerun, /second answer/);
+});
+
 test('allowSession is asked once per target', { skip, timeout: TIMEOUT }, async (t) => {
   const root = workspace(t);
   const asked = [];

@@ -227,6 +227,13 @@ impl SessionControlApi {
     ) -> raw::metask_agentcore_session_update_permission_mode_fn_v1 {
         self.table().update_permission_mode
     }
+    /// Revision 27 (#441): drops the user message at a 1-based position and
+    /// everything after it while idle, so the next Run reruns from there.
+    pub fn rewind_to_user_message(
+        self,
+    ) -> raw::metask_agentcore_session_rewind_to_user_message_fn_v1 {
+        self.table().rewind_to_user_message
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -397,6 +404,7 @@ unsafe fn validate_session_control_api(
         && table.export_checkpoint.is_some()
         && table.set_prompt_profile.is_some()
         && table.update_permission_mode.is_some()
+        && table.rewind_to_user_message.is_some()
 }
 
 unsafe fn validate_skill_api(ptr: *const raw::metask_agentcore_skill_api_v1) -> bool {
@@ -710,7 +718,7 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 26);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 27);
         assert_eq!(raw::METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1, 16_384);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1, 64);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1, 16_777_216);
@@ -733,6 +741,9 @@ mod tests {
         assert_eq!(raw::METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE, 27);
         assert_eq!(raw::METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED, 28);
         assert_eq!(raw::METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN, 29);
+        assert_eq!(raw::METASK_AGENTCORE_STATUS_MESSAGE_POSITION_OUT_OF_RANGE, 31);
+        assert_eq!(raw::METASK_AGENTCORE_STATUS_NOT_USER_MESSAGE, 32);
+        assert_eq!(raw::METASK_AGENTCORE_STATUS_MESSAGE_POSITION_COMPACTED, 33);
         assert_eq!(raw::METASK_AGENTCORE_CAPABILITY_SUPPORTED, 1);
         assert_eq!(raw::METASK_AGENTCORE_CAPABILITY_UNSUPPORTED, 2);
         assert_eq!(raw::METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1, 256);
@@ -768,7 +779,7 @@ mod tests {
         assert_eq!(size_of::<raw::metask_agentcore_session_api_v1>(), 56);
         assert_eq!(
             size_of::<raw::metask_agentcore_session_control_api_v1>(),
-            80
+            88
         );
         assert_eq!(size_of::<raw::metask_agentcore_skill_api_v1>(), 32);
         assert_eq!(size_of::<raw::metask_agentcore_mcp_api_v1>(), 40);

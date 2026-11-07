@@ -585,6 +585,35 @@ class PythonSdkTest(unittest.TestCase):
         self.assertTrue((self.root / "allowed.txt").exists())
         self.assertEqual(asked, [])
 
+    def test_rewind_to_user_message_reruns_an_edited_message(self) -> None:
+        script = [("text", "first answer"), ("text", "second answer"), ("text", "edited answer")]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=()) as runtime:
+                session = self.session(runtime, provider)
+                session.run("alpha-prompt")
+                position = session.describe()["conversation"]["message_count"] + 1
+                session.run("beta-prompt")
+                self.assertEqual(session.describe()["conversation"]["message_count"], 4)
+                # An assistant reply and a position past the end are refused
+                # with their own statuses and change nothing.
+                for refused, name in ((2, "NOT_USER_MESSAGE"), (9, "MESSAGE_POSITION_OUT_OF_RANGE")):
+                    with self.assertRaises(metacodes.AgentCoreError) as caught:
+                        session.rewind_to_user_message(refused)
+                    self.assertEqual(caught.exception.status_name, name)
+                with self.assertRaises(ValueError):
+                    session.rewind_to_user_message(0)
+                self.assertEqual(session.describe()["conversation"]["message_count"], 4)
+                self.assertEqual(len(provider.requests), 2)
+                session.rewind_to_user_message(position)
+                self.assertEqual(session.describe()["conversation"]["message_count"], 2)
+                result = session.run("gamma-edited")
+        self.assertEqual(result.text, "edited answer")
+        rerun = str(provider.requests[2]["messages"])
+        self.assertIn("alpha-prompt", rerun)
+        self.assertIn("gamma-edited", rerun)
+        self.assertNotIn("beta-prompt", rerun)
+        self.assertNotIn("second answer", rerun)
+
     def test_set_permission_mode_applies_to_the_next_run(self) -> None:
         with MockProvider(self.write_script("first.txt") + self.write_script("second.txt")) as provider:
             with metacodes.Runtime(tools=["Write"]) as runtime:

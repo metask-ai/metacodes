@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const ABI_REVISION = 26;
+const ABI_REVISION = 27;
 const BUILTIN_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell',
   'WebSearch', 'WebFetch', 'AskUserQuestion',
@@ -507,6 +507,21 @@ class Session {
   setPermissionMode(mode) {
     if (!(mode in PERMISSION_MODES)) throw new Error(`permissionMode must be one of ${Object.keys(PERMISSION_MODES).join(', ')}`);
     this._native.sessionSetPermissionMode(this._handle, PERMISSION_MODES[mode]);
+  }
+
+  /**
+   * Drop the user message at `position` and everything after it (AgentCore
+   * Revision 27): the next Run takes its place, after exactly the context that
+   * preceded it. `position` counts the full history from 1, as
+   * `describe().conversation.message_count` counts, so a Run's own message is
+   * `message_count + 1` read just before it. Only the Conversation changes;
+   * files and other effects of the dropped turns stay. A refused position
+   * throws with code `NOT_USER_MESSAGE`, `MESSAGE_POSITION_OUT_OF_RANGE` or
+   * `MESSAGE_POSITION_COMPACTED` and changes nothing.
+   */
+  rewindToUserMessage(position) {
+    if (!Number.isSafeInteger(position) || position < 1) throw new TypeError('position must be a positive safe integer');
+    this._native.sessionRewindToUserMessage(this._handle, position);
   }
 
   close() {
