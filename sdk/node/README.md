@@ -64,7 +64,12 @@ is listed in [doc/AGENTCORE_BINARY_ABI.md](../../doc/AGENTCORE_BINARY_ABI.md).
 to it. `session.updateCredential(apiKey)` replaces the provider key in place,
 also during a run and from inside a tool or handler: every request sent
 afterwards (the run's next turn, a retry) carries it, and a request already
-sent keeps the old one. Separate sessions run concurrently; one session runs one prompt at a
+sent keeps the old one. `session.rewindToUserMessage(position)` edits and
+reruns: while idle it drops the user message at `position` (counted from 1 over
+the whole history, as `describe().conversation.message_count` counts) and
+everything after it, and the next `run()` takes its place; a refused position
+throws with code `NOT_USER_MESSAGE`, `MESSAGE_POSITION_OUT_OF_RANGE` or
+`MESSAGE_POSITION_COMPACTED` and changes nothing. Separate sessions run concurrently; one session runs one prompt at a
 time. `session.close()` throws while a run is active, and the session stays
 open; await the run, or `abort()` it, first.
 

@@ -117,6 +117,8 @@ export class Session {
   describe(): Record<string, unknown>;
   setModel(model: string): void;
   setPermissionMode(mode: NonNullable<SessionOptions['permissionMode']>): void;
+  /** Revision 27: drop the user message at a 1-based position and everything after it. */
+  rewindToUserMessage(position: number): void;
   close(): void;
 }
 

@@ -14,6 +14,35 @@ empty `### Migration`.
 
 ## Unreleased
 
+### Added
+
+- Edit and rerun (#441): `session_control->rewind_to_user_message(session,
+  position, out_error)`, idle-only. It drops the user message at the 1-based
+  `position` (counted over the full history, as `describe`'s
+  `conversation.message_count` counts; a Run's own message is `message_count +
+  1` read just before it) and everything after it: later prompts, replies,
+  tool calls and tool results. The next Run's input takes its place after
+  exactly the context before it, so its request is a prefix of the earlier ones
+  plus the new input. Only the Conversation changes: files and other effects of
+  the dropped turns stay, and model, permission policy, grants, Skill, MCP,
+  goal and prompt profile are untouched. A checkpoint exported afterwards holds
+  the edited Conversation, and a restored Session continues from it.
+- Statuses 31 `MESSAGE_POSITION_OUT_OF_RANGE`, 32 `NOT_USER_MESSAGE` (an
+  assistant reply, a tool result or runtime-written text) and 33
+  `MESSAGE_POSITION_COMPACTED` (behind the compact boundary) refuse a position
+  and change nothing; zero is `INVALID_ARGUMENT`, a Run or other facade call in
+  progress `BUSY`.
+- Python `Session.rewind_to_user_message(position)` and Node
+  `Session.rewindToUserMessage(position)`.
+
+### Migration
+
+- ABI revision 27. The Session Control table grows from 80 to 88 bytes with
+  `rewind_to_user_message` as its last slot, and discovery requires it, so a
+  Host built for revision 26 is refused at the revision check. Rebuild against
+  the revision 27 header and bindings; nothing else changes for a Host that
+  does not call the new slot.
+
 ## 0.14.0 — 2026-11-06
 
 ### Changed

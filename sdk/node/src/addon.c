@@ -63,6 +63,9 @@ static const char *status_name(uint32_t status) {
     case METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED: return "IMAGE_INPUT_UNSUPPORTED";
     case METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN: return "IMAGE_INPUT_CAPABILITY_UNKNOWN";
     case METASK_AGENTCORE_STATUS_GOAL_CONFLICT: return "GOAL_CONFLICT";
+    case METASK_AGENTCORE_STATUS_MESSAGE_POSITION_OUT_OF_RANGE: return "MESSAGE_POSITION_OUT_OF_RANGE";
+    case METASK_AGENTCORE_STATUS_NOT_USER_MESSAGE: return "NOT_USER_MESSAGE";
+    case METASK_AGENTCORE_STATUS_MESSAGE_POSITION_COMPACTED: return "MESSAGE_POSITION_COMPACTED";
     default: return "STATUS_ERROR";
     }
 }
@@ -946,6 +949,29 @@ static napi_value session_set_permission_mode(napi_env env, napi_callback_info i
     return NULL;
 }
 
+/* sessionRewindToUserMessage(session, position): index.js has checked that
+ * position is a safe integer >= 1. */
+static napi_value session_rewind_to_user_message(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+    session_t *session = get_session(env, argv[0]);
+    if (session == NULL) return NULL;
+    int64_t position = 0;
+    if (napi_get_value_int64(env, argv[1], &position) != napi_ok || position < 1) {
+        napi_throw_type_error(env, NULL, "position must be a positive integer");
+        return NULL;
+    }
+    metask_agentcore_owned_bytes_v1 diagnostic = {NULL, 0};
+    uint32_t status = g_api->session_control->rewind_to_user_message(session->handle, (uint64_t)position, &diagnostic);
+    if (status != METASK_AGENTCORE_STATUS_OK) {
+        throw_status(env, "session.rewind_to_user_message", status, &diagnostic);
+        return NULL;
+    }
+    g_api->buffer_release(&diagnostic);
+    return NULL;
+}
+
 static napi_value session_destroy(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1];
@@ -1014,7 +1040,7 @@ static napi_value load_library(napi_env env, napi_callback_info info) {
         if (!metask_agentcore_api_v1_is_compatible(api)) {
             dlclose(library);
             napi_throw_error(env, "ABI_MISMATCH",
-                             "library does not provide AgentCore ABI v1 revision " "26" " with the expected layout");
+                             "library does not provide AgentCore ABI v1 revision " "27" " with the expected layout");
             return NULL;
         }
         g_api = api; /* the library stays loaded for the life of the process */
@@ -1043,6 +1069,7 @@ NAPI_MODULE_INIT() {
     EXPORT("sessionDescribe", session_describe);
     EXPORT("sessionSetModel", session_set_model);
     EXPORT("sessionSetPermissionMode", session_set_permission_mode);
+    EXPORT("sessionRewindToUserMessage", session_rewind_to_user_message);
     EXPORT("sessionDestroy", session_destroy);
     EXPORT("completeCall", complete_call);
     napi_value revision;

@@ -2939,6 +2939,33 @@ const AbiSession = struct {
         self.commitDurableReplacement(projected);
     }
 
+    /// Every way `session_control->rewind_to_user_message` can refuse once
+    /// the facade gate is held: a position the Conversation cannot rerun from
+    /// (`conversation.RewindError`), or a Core Session that is not idle.
+    pub const RewindError = core.agent_session.AgentSession.RewindMutationError;
+
+    /// Revision 27 (#441): edit-and-rerun's history change, under the facade
+    /// mutation gate. The Core drops the user message at `position` and
+    /// everything after it and clears what the dropped turns read; a refused
+    /// position changes nothing. Only the Conversation changes: files and
+    /// other effects of the dropped turns stay, and the policy generation,
+    /// grants, Skill, MCP, goal, prompt profile and model are untouched.
+    ///
+    /// The checkpoint only shrinks, so there is nothing to admit against the
+    /// durable budget. The usage is re-measured afterwards so `describe` and
+    /// the next Run see the freed bytes; if measuring fails the previous,
+    /// larger usage stays, which only over-reserves until the next Run
+    /// measures again.
+    fn rewindToUserMessageAdmitted(
+        self: *AbiSession,
+        position: core.conversation.MessagePosition,
+    ) RewindError!void {
+        try self.core_session.rewindToUserMessage(position);
+        const usage = self.measureDurableUsage() catch return;
+        if (usage.total_bytes <= self.budget_state.profile.hard_bytes)
+            self.commitDurableReplacement(usage.total_bytes);
+    }
+
     /// The profile is part of durable state: its checkpoint section is
     /// admitted against the budget like any other replacement.
     fn setPromptProfileAdmitted(self: *AbiSession, profile: core.prompt_sections.Profile) !void {
@@ -4845,6 +4872,9 @@ fn statusText(status: u32) []const u8 {
     return switch (status) {
         wire.STATUS_INVALID_ARGUMENT => "invalid argument",
         wire.STATUS_GOAL_CONFLICT => "goal conflict",
+        wire.STATUS_MESSAGE_POSITION_OUT_OF_RANGE => "message position out of range",
+        wire.STATUS_NOT_USER_MESSAGE => "not a user message",
+        wire.STATUS_MESSAGE_POSITION_COMPACTED => "message position compacted",
         wire.STATUS_OUT_OF_MEMORY => "out of memory",
         wire.STATUS_BUSY => "busy",
         wire.STATUS_STALE_RUN => "stale run",
@@ -7864,6 +7894,45 @@ fn sessionUpdatePermissionMode(
     return wire.STATUS_OK;
 }
 
+/// The public status of each rewind refusal. Exhaustive over
+/// `AbiSession.RewindError`, so a new refusal cannot reach the Host as a
+/// generic code.
+fn rewindStatus(err: AbiSession.RewindError) u32 {
+    return switch (err) {
+        error.PositionOutOfRange => wire.STATUS_MESSAGE_POSITION_OUT_OF_RANGE,
+        error.NotUserMessage => wire.STATUS_NOT_USER_MESSAGE,
+        error.PositionCompacted => wire.STATUS_MESSAGE_POSITION_COMPACTED,
+        error.SessionBusy => wire.STATUS_BUSY,
+        error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+    };
+}
+
+/// Revision 27 (#441). `position` is the 1-based count over the full history
+/// (compacted messages included), the numbering of `describe`'s
+/// `conversation.message_count`.
+fn sessionRewindToUserMessage(
+    handle: ?*wire.SessionHandle,
+    position: u64,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    if (position == 0)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "message position counts from 1", out_error);
+    // u64 and usize are the same width on the required 64-bit ABI.
+    const message_position = core.conversation.MessagePosition.fromOrdinal(@intCast(position)) catch
+        unreachable;
+    self.rewindToUserMessageAdmitted(message_position) catch |err|
+        return failError(rewindStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
 fn sessionUpdateMcp(
     handle: ?*wire.SessionHandle,
     selection_ptr: ?*const wire.McpSelectionV1,
@@ -8583,6 +8652,7 @@ const session_control_api_v1 = wire.SessionControlApiV1{
     .export_checkpoint = sessionExportCheckpoint,
     .set_prompt_profile = sessionSetPromptProfile,
     .update_permission_mode = sessionUpdatePermissionMode,
+    .rewind_to_user_message = sessionRewindToUserMessage,
 };
 
 const skill_api_v1 = wire.SkillApiV1{
@@ -8876,13 +8946,15 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 26), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 27), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 80), api.struct_size);
     try std.testing.expectEqual(@as(u32, 56), api.session.?.struct_size);
     try std.testing.expect(api.session.?.update_credential != null);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
     try std.testing.expect(api.session_control != null);
+    try std.testing.expectEqual(@as(u32, 88), api.session_control.?.struct_size);
+    try std.testing.expect(api.session_control.?.rewind_to_user_message != null);
     try std.testing.expect(api.skill != null);
     try std.testing.expect(api.mcp != null);
     try std.testing.expect(api.goal != null);

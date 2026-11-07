@@ -1598,7 +1598,7 @@ test "CoreEvent decoder covers every ABI v1 tag" {
 test "auto_compact carries the cause of a compaction inside a Run (issue #430)" {
     // A Run compacts at its own boundaries; `cause` says which pressure asked.
     // The set is open (a Host must accept a cause it does not know), these
-    // are the ones a Revision 26 Run reports.
+    // are the ones a Revision 27 Run reports.
     const causes = [_][]const u8{
         "pre_sampling_pending_turn_threshold",
         "post_tool_follow_up_threshold",

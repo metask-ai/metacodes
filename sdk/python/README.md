@@ -68,6 +68,16 @@ idle or during a run, from any thread or from inside a tool or handler: every
 request sent afterwards (the run's next turn, a retry) carries it, and a
 request already sent keeps the old one. The provider, endpoint and model stay.
 
+To edit an earlier message and rerun from it, call
+`session.rewind_to_user_message(position)` while idle, then `run()` the edited
+text. `position` counts the whole history from 1, as
+`describe()["conversation"]["message_count"]` does, so a run's own message is
+`message_count + 1` read just before it. The message and everything after it
+are dropped; files and other effects of the dropped turns stay. A position that
+is not a user message, is out of range, or lies behind the compact boundary
+raises `AgentCoreError` (`NOT_USER_MESSAGE`, `MESSAGE_POSITION_OUT_OF_RANGE`,
+`MESSAGE_POSITION_COMPACTED`) and changes nothing.
+
 `session.close()`, and leaving a `with` block, aborts a run that is still going
 and waits for it first. That includes a `stream()` the loop stopped early with
 `break`.

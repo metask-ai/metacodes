@@ -165,7 +165,7 @@ Freeze the surfaces hosts depend on. Preconditions are already written down:
       locally on 2026-10-29, and the `release.yml` dry run 40787422095 on
       2026-10-28 passed revision 25 natively on `x86_64-linux-gnu`,
       `aarch64-linux-gnu`, `aarch64-macos`, `x86_64-macos` and
-      `x86_64-windows-gnu`; no other target is verified at revision 26
+      `x86_64-windows-gnu`; no target is verified at revision 27
       yet).
 - [ ] Plugin manifest/process-protocol v1 freeze with negative-test coverage.
 - [ ] CLI: versioned `--version`/`--help` surface and changelog discipline for
