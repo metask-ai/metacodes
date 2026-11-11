@@ -25,6 +25,21 @@ status, compatibility boundaries, and entry points are defined by
   (`Session.rewind_to_user_message`) and Node (`Session.rewindToUserMessage`)
   packages and the source-free consumers move to revision 27; AgentCore
   0.15.0-dev.
+- **A stream retry budget for AgentCore Hosts** (#452). A reasoning model
+  streams thinking first, so a gateway stream that breaks off has almost always
+  shown output, and the Run ended with `STOP_API_ERROR`. AgentCore ABI revision
+  28 adds `RunOptionsV1.stream_retry_budget` (0 to 8, default 0, in the
+  options' last reserved word): the Run may send the same request again that
+  many times when its accepted stream broke off without an answer (a stall, a
+  dropped connection, a stream that ended before its stop report); a server's
+  error and a local decode failure are never re-sent, and the budget is shared
+  with the existing re-send of an attempt that showed nothing. Each re-issue
+  tells the Host what to take back: the attempt's segment closes `discarded`,
+  the new `thinking_discarded` event names the thinking it showed, and a
+  `retry_notice` follows. Zero changes nothing a Host sees or a provider
+  receives. The header, the bindings, the Python (`stream_retry_budget=`) and
+  Node (`streamRetryBudget`) packages and the source-free consumers move to
+  revision 28.
 
 ### Fixed
 

@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 27);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 28);
         assert_eq!(raw::METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1, 16_384);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1, 64);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1, 16_777_216);
@@ -734,6 +734,11 @@ mod tests {
         assert_eq!(size_of::<raw::metask_agentcore_prompt_profile_v1>(), 56);
         assert_eq!(size_of::<raw::metask_agentcore_context_block_v1>(), 56);
         assert_eq!(size_of::<raw::metask_agentcore_run_options_v1>(), 40);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1, 8);
+        assert_eq!(
+            std::mem::offset_of!(raw::metask_agentcore_run_options_v1, stream_retry_budget),
+            32
+        );
         assert_eq!(
             size_of::<raw::metask_agentcore_session_create_config_v1>(),
             64

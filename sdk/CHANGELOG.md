@@ -34,6 +34,24 @@ empty `### Migration`.
   progress `BUSY`.
 - Python `Session.rewind_to_user_message(position)` and Node
   `Session.rewindToUserMessage(position)`.
+- A stream retry budget (#452): `RunOptionsV1.stream_retry_budget`, 0 to
+  `MAX_STREAM_RETRY_BUDGET_V1` (8), default 0. A Run may send the same request
+  again that many times when its accepted stream broke off without an answer
+  (a stall, a dropped connection, a stream that ended before its stop report),
+  after it had already shown output too; an error the server declared in the
+  stream and a local decode failure are never re-sent. The budget is the
+  Run's, across its turns, and shared with the one re-send an attempt that
+  showed nothing already gets, so a Run re-sends at most max(budget, 1) times.
+  A value above 8 is `RESOURCE_LIMIT`, a nonzero `reserved0` beside it
+  `INVALID_ARGUMENT`, both before admission.
+- The `thinking_discarded` observation event: `{index, turn, group, bytes}`
+  names the thinking a re-sent attempt showed while segment `index` was open,
+  for the Host to take back as it drops that segment's `discarded` text. Each
+  such re-send also emits `retry_notice` (`attempt` = streams broken off so
+  far, `max` = re-send limit + 1, `delay_ms` 0) and the `retrying` RunState
+  phase. `model_error.attempts` counts re-sends like connection retries.
+- Python `Session.run(..., stream_retry_budget=)` / `stream(...)` and Node
+  `run(prompt, { streamRetryBudget })` / `stream(...)`.
 
 ### Fixed
 
@@ -48,6 +66,12 @@ empty `### Migration`.
   Host built for revision 26 is refused at the revision check. Rebuild against
   the revision 27 header and bindings; nothing else changes for a Host that
   does not call the new slot.
+- ABI revision 28. `RunOptionsV1` stays 40 bytes; its last reserved word is now
+  `uint32_t stream_retry_budget` (offset 32) and a zero `uint32_t reserved0`
+  (offset 36). A Host built for revision 27 is refused at the revision check;
+  rebuild against the revision 28 header and bindings. A zeroed `RunOptionsV1`
+  keeps the revision 27 behavior, and a Host that does not set the budget sees
+  no new event.
 
 ## 0.14.0 — 2026-11-06
 

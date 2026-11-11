@@ -73,6 +73,18 @@ throws with code `NOT_USER_MESSAGE`, `MESSAGE_POSITION_OUT_OF_RANGE` or
 time. `session.close()` throws while a run is active, and the session stays
 open; await the run, or `abort()` it, first.
 
+A gateway stream sometimes breaks off mid-answer, and a reasoning model has
+usually shown thinking by then, so the run ends with `api_error`.
+`run(prompt, { streamRetryBudget: n })` (and `stream(...)`, 0 to 8, default 0)
+lets the run send the same request again up to `n` times when its stream broke
+off without an answer (a stall, a dropped connection, a stream that ended before
+its stop reason); a server's error is never re-sent. Before each retry the run
+tells you what to take back: the attempt's `output_segment_end` has disposition
+`'discarded'` (its text is not part of `result.text`), a `thinking_discarded`
+event `{ index, turn, group, bytes }` names the thinking shown while that
+segment was open, and a `retry_notice` follows. With 0 only a stream that
+showed nothing is retried, once.
+
 ## Permissions
 
 Sessions start in `permissionMode: 'default'` with the shell disabled. A tool

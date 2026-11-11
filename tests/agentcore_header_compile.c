@@ -1,9 +1,15 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 27,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 28,
                "AgentCore revision changed");
 _Static_assert(sizeof(metask_agentcore_api_v1) == 80,
                "AgentCore root layout changed");
+_Static_assert(sizeof(metask_agentcore_run_options_v1) == 40,
+               "RunOptionsV1 layout changed");
+_Static_assert(offsetof(metask_agentcore_run_options_v1, stream_retry_budget) == 32,
+               "RunOptionsV1 stream retry budget moved");
+_Static_assert(METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1 == 8u,
+               "stream retry budget limit changed");
 _Static_assert(sizeof(metask_agentcore_runtime_api_v1) == 24,
                "Runtime table layout changed");
 _Static_assert(sizeof(metask_agentcore_session_api_v1) == 56,

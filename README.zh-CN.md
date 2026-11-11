@@ -96,7 +96,7 @@ metacodes 吸收了 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 | 接口 | 适用场景 |
 |---|---|
 | `metacodes-core` Zig 模块 | 同工具链的 Zig 宿主；`zig build example` 运行 [example/main.zig](example/main.zig) |
-| AgentCore C ABI v1 revision 27 | [sdk/](sdk/README.md) 自带 C、C++、Zig、Rust 绑定；JNA、.NET P/Invoke 等任何 FFI 都能直接加载共享库 |
+| AgentCore C ABI v1 revision 28 | [sdk/](sdk/README.md) 自带 C、C++、Zig、Rust 绑定；JNA、.NET P/Invoke 等任何 FFI 都能直接加载共享库 |
 | Python 与 Node 包 | `import metacodes` / `require('metacodes')`：Runtime、Session、流式事件、用 Python 或 JavaScript 写工具（[sdk/python](sdk/python/README.md)、[sdk/node](sdk/node/README.md)；实验性） |
 | Headless `-p --json` / `--stream-json` | 任何能起子进程、能读 NDJSON 的语言 |
 | `serve` 守护进程（HTTP 与 UDS，多会话）和 `--web` | 服务端、桌面应用、远程 UI |

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 ABI_V1 = 1
-ABI_REVISION = 27
+ABI_REVISION = 28
 
 # Status codes (METASK_AGENTCORE_STATUS_*).
 STATUS_NAMES = {
@@ -86,6 +86,8 @@ UI_UNAVAILABLE = 1
 HOST_OK = 0
 HOST_FAILED = 1
 MAX_TURNS = 1000
+# Revision 28: RunOptions.stream_retry_budget runs from 0 to this.
+MAX_STREAM_RETRY_BUDGET = 8
 
 BUILTIN_TOOLS = (
     "Read",
@@ -258,7 +260,8 @@ class RunOptions(ctypes.Structure):
         ("context_block_count", ctypes.c_uint64),
         ("time_context_code", ctypes.c_uint32),
         ("utc_offset_minutes", ctypes.c_int32),
-        ("reserved", ctypes.c_uint64 * 1),
+        ("stream_retry_budget", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
     ]
 
 
@@ -415,9 +418,10 @@ class ApiV1(ctypes.Structure):
     ]
 
 
-assert ctypes.sizeof(ApiV1) == 80, "AgentCore Revision 27 root is 80 bytes"
-assert ctypes.sizeof(SessionApi) == 56, "AgentCore Revision 27 Session table is 56 bytes"
-assert ctypes.sizeof(SessionControlApi) == 88, "AgentCore Revision 27 Session Control table is 88 bytes"
+assert ctypes.sizeof(ApiV1) == 80, "AgentCore Revision 28 root is 80 bytes"
+assert ctypes.sizeof(SessionApi) == 56, "AgentCore Revision 28 Session table is 56 bytes"
+assert ctypes.sizeof(SessionControlApi) == 88, "AgentCore Revision 28 Session Control table is 88 bytes"
+assert ctypes.sizeof(RunOptions) == 40, "AgentCore Revision 28 RunOptionsV1 is 40 bytes"
 
 
 class AgentCoreError(RuntimeError):

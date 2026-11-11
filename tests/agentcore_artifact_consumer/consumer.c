@@ -6,10 +6,10 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 27 must not retain historical callback aliases"
+#error "revision 28 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 27u || \
+#if METASK_AGENTCORE_ABI_REVISION != 28u || \
     METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 != 16384u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
@@ -63,8 +63,9 @@
     METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1 != 64u || \
     METASK_AGENTCORE_STATUS_MESSAGE_POSITION_OUT_OF_RANGE != 31u || \
     METASK_AGENTCORE_STATUS_NOT_USER_MESSAGE != 32u || \
-    METASK_AGENTCORE_STATUS_MESSAGE_POSITION_COMPACTED != 33u
-#error "source-free Revision 23-27 codes must match the public contract"
+    METASK_AGENTCORE_STATUS_MESSAGE_POSITION_COMPACTED != 33u || \
+    METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1 != 8u
+#error "source-free Revision 23-28 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -1163,6 +1164,35 @@ int main(int argc, char **argv) {
     }
     api->buffer_release(&diagnostic);
 
+    /* Revision 28 (#452): a stream retry budget past its limit, or a nonzero
+     * reserved word beside it, is refused before admission; no provider round
+     * is consumed and the Run id stays reusable. */
+    {
+        metask_agentcore_run_input_v1 probe = {0};
+        probe.struct_size = sizeof(probe);
+        probe.kind_code = METASK_AGENTCORE_RUN_INPUT_TEXT;
+        probe.text = view("refused before admission");
+        metask_agentcore_run_options_v1 over_budget = options;
+        over_budget.stream_retry_budget = METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1 + 1u;
+        metask_agentcore_run_options_v1 dirty_reserved = options;
+        dirty_reserved.reserved0 = 1u;
+        if (api->session->run_input(session, 1, &probe, &over_budget, &result,
+                                    &diagnostic) !=
+                METASK_AGENTCORE_STATUS_RESOURCE_LIMIT ||
+            (api->buffer_release(&diagnostic),
+             api->session->run_input(session, 1, &probe, &dirty_reserved, &result,
+                                     &diagnostic)) !=
+                METASK_AGENTCORE_STATUS_INVALID_ARGUMENT) {
+            api->buffer_release(&diagnostic);
+            stop_server(&server);
+            api->session->destroy(session, &diagnostic);
+            api->buffer_release(&diagnostic);
+            api->runtime->destroy(runtime, &diagnostic);
+            return release_error(api, &diagnostic, 67);
+        }
+        api->buffer_release(&diagnostic);
+    }
+
     /* The family table says Claude takes images; the Host's declaration says
      * this route does not, and the Host wins - before any provider round. */
     if (api->session_control->set_model(session, view("claude-c-consumer"),
@@ -1255,6 +1285,9 @@ int main(int argc, char **argv) {
     metask_agentcore_run_options_v1 offset_options = options;
     offset_options.time_context_code = METASK_AGENTCORE_TIME_CONTEXT_UTC_OFFSET;
     offset_options.utc_offset_minutes = 330;
+    /* Revision 28: a budget at its limit is accepted; this stream completes,
+     * so it re-issues nothing. */
+    offset_options.stream_retry_budget = METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1;
     /* Revision 27: the Run's own message is message_count + 1, read while
      * idle just before it. */
     const uint64_t multimodal_position = description_message_count(api, session) + 1u;
@@ -1410,6 +1443,6 @@ int main(int argc, char **argv) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);
-    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, rewind to a user message, goal, host-scheduled team, credential rotation and lifecycle OK");
+    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, stream retry budget, rewind to a user message, goal, host-scheduled team, credential rotation and lifecycle OK");
     return 0;
 }

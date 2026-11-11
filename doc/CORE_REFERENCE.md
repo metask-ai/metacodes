@@ -138,6 +138,7 @@ pub const CoreEvent = union(enum) {
     // 输出语义(见 §3.2.1)
     output_segment_begin: struct { index, turn, group },
     output_segment_end: struct { index, turn, group, disposition, bytes },
+    thinking_discarded: struct { index, turn, group, bytes }, // 被重发的尝试流出的 thinking 撤回(#452)
     // 文件修改结果(见 §3.2.2)
     file_changes: struct { id, name, changes, overflow, lost },
 };
@@ -166,7 +167,10 @@ core 因此把它**已经知道**的判定发出来。一个 **段** = 一次 pr
 | `discarded` | 从未进入 Conversation(流内失败回滚),前端须丢弃已缓冲的该段字节 |
 
 `index` 在 Run 内单调,**被丢弃的段也占一个索引**("回滚过"与"没发生过"必须可区分)。
-`thinking_chunk` 不属于任何段——思考永不进入结果。
+`thinking_chunk` 不属于任何段——思考永不进入结果。但它总在本次 stream 的段打开期间到达,所以
+`retractable_stream_retries` 准许的重发撤回一个流出过 thinking 的尝试时,在该段 `discarded` 之后
+紧跟 `thinking_discarded`(同一段的 index/turn/group 与 thinking 字节数):前端丢弃该段打开期间
+到达的 thinking,与丢弃该段文本同理(见 §7 流内重发那一条)。
 
 不想消费事件的调用方挂 `Options.output_ledger: ?*output_semantics.Ledger`,run() 返回后直接
 `ledger.finalText()` / `partialText()`(续写组已拼好)。**账本不传给 subagent**:子 agent 的
@@ -944,7 +948,16 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   `StreamStalled`、`StreamIncomplete` 或 `RequestFailed`(`isSilentRetryFailure`),且本次尝试还没有
   文本 / thinking / 工具调用到达 backend 时,不论 `max_stream_turn_retries` 是多少(TUI 为 0)都至少重发
   一次。`ApiError` 是服务端的答复,本地失败重发也不会变,都不重发。已流出可见内容的失败仍按
-  `max_stream_turn_retries`。仍然成立的边界:
+  `max_stream_turn_retries`。
+  **宿主能撤回时,已流出可见内容的断连也同轮重发**(#452):`Options.retractable_stream_retries`
+  (AgentCore `RunOptionsV1.stream_retry_budget`,默认 0)只放宽上面那三种失败的重发上限,`ApiError`
+  与本地失败照旧不重发;次数按 Run 计,与兜底那一次共用一个计数,一个 Run 至多重发 max(额度, 1) 次,
+  每次重发各有自己的建连重试。重发一个已流出内容的尝试时先告诉宿主撤回什么:该段照常以 `discarded`
+  收口;流出过 thinking 时紧跟 `thinking_discarded`(同一段的 index/turn/group 与 thinking 字节数);
+  再发 `retry_notice`(`attempt` = 本 Run 已断的流数,含本次;`max` = 重发上限 + 1;`delay_ms` = 0)。
+  零可见输出的重发照旧不发这些事件;`max_stream_turn_retries` 准许的重发也不发(headless 输出不变)。
+  被丢弃尝试流式预取的只读工具结果在 `Prefetch.joinAll` 之后不可再取:重发的尝试即使复用同一个
+  工具调用 id,也会真正执行该调用。仍然成立的边界:
   已流出可见内容的正文 stall 在 TUI 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
   不会 detach 卡死的 worker;TUI 每个 provider 回合结束就刷 transcript,但一个回合内的内容仍只在
   内存里。

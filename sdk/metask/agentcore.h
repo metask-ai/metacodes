@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 27 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 28 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 27 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 28 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 27u
+#define METASK_AGENTCORE_ABI_REVISION 28u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -161,6 +161,8 @@ extern "C" {
 #define METASK_AGENTCORE_MAX_SKILL_SOURCE_ID_BYTES_V1 128ULL
 #define METASK_AGENTCORE_MAX_PROCESS_PLUGIN_SOURCES_V1 64ULL
 #define METASK_AGENTCORE_MAX_TURNS_V1 1000u
+/* Revision 28 (#452): the most run_options_v1.stream_retry_budget allows. */
+#define METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1 8u
 /* Prompt profile limits: entries, one section's text, and every entry's text
  * together. Ids are metacodes:<name> or host:<name>, name at most 64 bytes. */
 #define METASK_AGENTCORE_MAX_PROMPT_PROFILE_SECTIONS_V1 64ULL
@@ -844,7 +846,14 @@ typedef struct {
     /* Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET
      * (METASK_AGENTCORE_MIN/MAX_UTC_OFFSET_MINUTES_V1); zero otherwise. */
     int32_t utc_offset_minutes;
-    uint64_t reserved[1];
+    /* Revision 28 (#452): how many times this Run may re-issue a request whose
+     * accepted stream failed without an answer (a stall, a stream that ended
+     * before its stop report, a dropped connection) after it showed output,
+     * 0..MAX_STREAM_RETRY_BUDGET_V1. Each such re-issue closes the attempt's
+     * segment `discarded`, withdraws its thinking with `thinking_discarded` and
+     * is announced by `retry_notice`. Zero keeps the Revision 27 behavior. */
+    uint32_t stream_retry_budget;
+    uint32_t reserved0;
 } metask_agentcore_run_options_v1;
 
 /* The two input counts (Revision 20) are defined on every session_run_input
@@ -1093,7 +1102,7 @@ typedef uint32_t (*metask_agentcore_team_poll_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 27. No earlier revision layout
+/* Function-table order is fixed within Revision 28. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -1319,8 +1328,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 27u,
-                               "AgentCore revision 27");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 28u,
+                               "AgentCore revision 28");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1460,7 +1469,8 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_blocks, 
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_block_count, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, time_context_code, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, utc_offset_minutes, 28);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, reserved, 32);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, stream_retry_budget, 32);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, reserved0, 36);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_set_v1, objective, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_set_v1, token_budget, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_update_v1, objective, 8);

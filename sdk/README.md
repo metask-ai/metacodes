@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 27:
+C ABI v1 revision 28:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -20,7 +20,7 @@ C ABI v1 revision 27:
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 80-byte root, all
-seven mandatory typed tables, function slots, and reserved fields. Revision 27 is
+seven mandatory typed tables, function slots, and reserved fields. Revision 28 is
 the Agent Runtime surface; it does not expose an independent Completion client.
 `SessionCreateConfigV1.prompt_profile` edits the named system-prompt sections
 (replace the identity, add Host sections; governance sections stay locked) and
@@ -51,6 +51,15 @@ its terminal `run_state`: category, the upstream's code and type passed through
 verbatim, a redacted displayable message, HTTP status, request id and retry
 guidance (`unknown` when it cannot be determined). The SDKs do not interpret the
 code; deciding "ask for funds" or "reauthenticate" from it is the Host's.
+`RunOptionsV1.stream_retry_budget` (Revision 28, 0 to
+`MAX_STREAM_RETRY_BUDGET_V1` = 8, default 0) lets a Run send a request again
+when its stream broke off without an answer (a stall, a dropped connection, a
+stream that ended before its stop reason) after it had already shown output; a
+server's error and a local decode failure are never re-sent. Each such re-issue
+tells the Host what to take back: the attempt's segment closes `discarded`,
+`thinking_discarded` names the thinking it showed (by that segment's `index`),
+and `retry_notice` announces the next attempt. Zero keeps the Revision 27
+behavior.
 `skill->resolve_catalog` merges the default `.agents/skills` sources with up to
 64 Host-registered sources. Their source priorities (`SkillSourceV1.priority`,
 `SkillCatalogQueryV1.default_user_source_priority` and

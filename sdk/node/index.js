@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const ABI_REVISION = 27;
+const ABI_REVISION = 28;
 const BUILTIN_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell',
   'WebSearch', 'WebFetch', 'AskUserQuestion',
@@ -16,6 +16,8 @@ const SHELL_TOOLS = ['Bash', 'BashOutput', 'KillShell'];
 // The CLI agent loop's own default (src/core/agent_loop.zig Options.max_turns).
 const DEFAULT_MAX_TURNS = 400;
 const MAX_TURNS = 1000;
+// Revision 28: RunOptionsV1.stream_retry_budget runs from 0 to this.
+const MAX_STREAM_RETRY_BUDGET = 8;
 const PROVIDERS = { anthropic: 1, openai: 2, gemini: 3 };
 const PERMISSION_MODES = { default: 1, accept_edits: 2, auto: 3, dont_ask: 4, full_access: 5 };
 const SHELL_POLICIES = { disabled: 1, sandboxed: 2, unrestricted: 3 };
@@ -421,21 +423,29 @@ class Session {
   }
 
   /**
-   * Run one prompt to completion.
+   * Run one prompt to completion. `streamRetryBudget` (0 to 8, default 0) is
+   * how many times the Run may send a request again when its stream breaks off
+   * without an answer after some output was shown; each such retry ends the
+   * attempt's segment `discarded`, takes back its thinking with a
+   * `thinking_discarded` event and is announced by `retry_notice`.
    * @returns {Promise<{text: string, stopReason: string, turns: number, toolCalls: number, usage: object, segments: object[]}>}
    */
-  run(prompt, { maxTurns, onEvent } = {}) {
+  run(prompt, { maxTurns, streamRetryBudget = 0, onEvent } = {}) {
     if (!this._handle) return Promise.reject(new Error('session is closed'));
     if (this._active) return Promise.reject(new Error('a Run is already active on this session'));
     const turns = maxTurns === undefined ? DEFAULT_MAX_TURNS : Number(maxTurns);
     if (!Number.isInteger(turns) || turns < 1 || turns > MAX_TURNS) {
       return Promise.reject(new RangeError(`maxTurns must be between 1 and ${MAX_TURNS}`));
     }
+    const budget = Number(streamRetryBudget);
+    if (!Number.isInteger(budget) || budget < 0 || budget > MAX_STREAM_RETRY_BUDGET) {
+      return Promise.reject(new RangeError(`streamRetryBudget must be between 0 and ${MAX_STREAM_RETRY_BUDGET}`));
+    }
     return new Promise((resolve, reject) => {
       const runId = this._nextRunId++;
       this._active = { runId, state: new RunState(), onEvent, resolve, reject, error: null };
       try {
-        this._native.sessionRun(this._handle, runId, String(prompt), turns);
+        this._native.sessionRun(this._handle, runId, String(prompt), turns, budget);
       } catch (error) {
         this._active = null;
         reject(error);

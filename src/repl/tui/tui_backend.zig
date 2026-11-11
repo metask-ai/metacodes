@@ -339,6 +339,9 @@ pub const TuiBackend = struct {
             // 输出语义定性:TUI 边流边渲染,已把文字写进 scrollback,不需要事后重标;
             // 这两条是给需要区分 commentary/final 的消费者(web/headless/评测)的。
             .output_segment_begin, .output_segment_end => {},
+            // #452: only a Run with retractable re-issues emits it; the REPL
+            // never sets them (output already in scrollback cannot be taken back).
+            .thinking_discarded => {},
             // L4 诊断事件:DiagnosticsBackend 专属(经 TeeBackend 旁挂),TUI 不渲染,no-op。
             .diag_turn_begin, .diag_turn_end, .diag_model_request, .diag_compact_request, .diag_compact_begin, .diag_compact_end, .diag_tool_stage, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .context_projection, .policy_decision, .diag_run_end => {},
             // Session-only (AgentSession run inputs); the REPL steers through queue_message.

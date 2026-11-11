@@ -63,7 +63,7 @@ const sample_goal = cc.core_goal.Goal{
     .updated_at_ms = 2,
 };
 
-fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [48]CoreEvent {
+fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [49]CoreEvent {
     return .{
         .{ .text_chunk = "hello \"wire\"\n" },
         .{ .thinking_chunk = "considering" },
@@ -97,6 +97,7 @@ fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [48]CoreEvent {
         .stream_done,
         .{ .output_segment_begin = .{ .index = 0, .turn = 1, .group = 0 } },
         .{ .output_segment_end = .{ .index = 0, .turn = 1, .group = 0, .disposition = .final, .bytes = 5 } },
+        .{ .thinking_discarded = .{ .index = 1, .turn = 2, .group = 0, .bytes = 17 } },
         .{ .ui_request_pending = .{ .tool_use_id = "tu_3", .request_json = "{\"kind\":\"video_timeline\"}" } },
         .ui_request_resolved,
         .{ .prompt_manifest = .{ .entries = manifest_entries, .sha256 = [_]u8{0xcd} ** 32 } },

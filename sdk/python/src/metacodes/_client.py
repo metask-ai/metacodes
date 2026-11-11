@@ -637,9 +637,18 @@ class Session:
         prompt: str,
         *,
         max_turns: Optional[int] = None,
+        stream_retry_budget: int = 0,
         on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> RunResult:
         """Run one prompt to completion and return the final answer.
+
+        ``stream_retry_budget`` (0 to 8, default 0) is how many times the Run
+        may send a request again when its stream breaks off without an answer
+        (a stall, a dropped connection, a stream that ended early) after some
+        output was already shown. Each such retry is announced: the attempt's
+        segment ends ``discarded``, a ``thinking_discarded`` event takes back
+        its thinking, and a ``retry_notice`` follows. With 0 only a stream
+        that showed nothing is retried, once.
 
         The Run executes on its own thread (``RUN_STACK_BYTES`` of stack);
         this call waits for it. An interrupt while waiting (Ctrl+C) aborts the
@@ -660,6 +669,10 @@ class Session:
             if not 1 <= turns <= n.MAX_TURNS:
                 raise ValueError("max_turns must be between 1 and %d" % n.MAX_TURNS)
             options.max_turns = turns
+            budget = int(stream_retry_budget)
+            if not 0 <= budget <= n.MAX_STREAM_RETRY_BUDGET:
+                raise ValueError("stream_retry_budget must be between 0 and %d" % n.MAX_STREAM_RETRY_BUDGET)
+            options.stream_retry_budget = budget
             result = n.RunResult(struct_size=ctypes.sizeof(n.RunResult))
             diagnostic = n.OwnedBytes()
             run_id = self._next_run_id
@@ -718,13 +731,16 @@ class Session:
             model_error=state.model_error,
         )
 
-    def stream(self, prompt: str, *, max_turns: Optional[int] = None) -> "EventStream":
+    def stream(
+        self, prompt: str, *, max_turns: Optional[int] = None, stream_retry_budget: int = 0
+    ) -> "EventStream":
         """Run ``prompt`` on a background thread and iterate over its events.
 
         Iterating yields each event dict as it arrives; afterwards
-        ``stream.result`` holds the :class:`RunResult`.
+        ``stream.result`` holds the :class:`RunResult`. ``stream_retry_budget``
+        is :meth:`run`'s.
         """
-        return EventStream(self, prompt, max_turns)
+        return EventStream(self, prompt, max_turns, stream_retry_budget)
 
     def abort(self) -> None:
         """Ask the active Run to stop; it returns with stop_reason 'aborted'."""
@@ -879,7 +895,9 @@ _DONE = object()
 class EventStream:
     """Iterator over one Run's events; ``result`` is set when it ends."""
 
-    def __init__(self, session: Session, prompt: str, max_turns: Optional[int]) -> None:
+    def __init__(
+        self, session: Session, prompt: str, max_turns: Optional[int], stream_retry_budget: int = 0
+    ) -> None:
         self.result: Optional[RunResult] = None
         self._queue: "queue.Queue[Any]" = queue.Queue()
         self._error: Optional[BaseException] = None
@@ -887,7 +905,12 @@ class EventStream:
 
         def work() -> None:
             try:
-                self.result = session.run(prompt, max_turns=max_turns, on_event=self._queue.put)
+                self.result = session.run(
+                    prompt,
+                    max_turns=max_turns,
+                    stream_retry_budget=stream_retry_budget,
+                    on_event=self._queue.put,
+                )
             except BaseException as error:
                 self._error = error
             finally:
