@@ -38,6 +38,20 @@ status, compatibility boundaries, and entry points are defined by
   same acknowledgement line as `POST /capabilities` and journaled for every
   attached reader. doc/WIRE_PROTOCOL.md §2.3 and doc/API.md spell the ops out.
 
+### Fixed
+
+- **metacodes-core's isolation from the application is checked** (#448).
+  `src/lib.zig` claimed its import graph could not reach the UI and that
+  `test:lib` proved it, but lazy analysis skips imports in code nothing calls,
+  and nothing noticed a planted `core/` → `repl/tui/` import.
+  `zig build subsystem:boundary` now follows every `@import` from
+  `src/lib.zig`, function bodies and test blocks included, and fails on any
+  edge into `repl/`, `web/`, `daemon/`, `app/`, `main.zig`, `app.zig`,
+  `session_service.zig` or `session_intent.zig` outside a baseline that may
+  only shrink: a stale entry fails too, and `src/core/` has none. The model
+  context-window table moves from `src/app/` to `src/api/model_context.zig`,
+  removing seven of the eleven edges; the baseline holds the other four.
+
 ## 0.11.0 — 2026-11-06
 
 ### Added
