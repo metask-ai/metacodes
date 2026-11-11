@@ -26,6 +26,18 @@ status, compatibility boundaries, and entry points are defined by
   packages and the source-free consumers move to revision 27; AgentCore
   0.15.0-dev.
 
+- **The UDS binding answers UI requests and takes capability frames.** A
+  UDS-only frontend needed HTTP beside the socket for exactly the most
+  important exchange, the reverse requests; now
+  `{"op":"respond","session":"<id>","id":N,...}` answers the pending
+  `ui_request` N with the same answer fields `POST /respond` takes (a stale or
+  unknown id is refused, the HTTP surface's 409; an answer is parsed by
+  `wire.parseResponse`, so a malformed one is never a grant), and
+  `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` is
+  the capability frame itself beside the routing fields, answered with the
+  same acknowledgement line as `POST /capabilities` and journaled for every
+  attached reader. doc/WIRE_PROTOCOL.md §2.3 and doc/API.md spell the ops out.
+
 ## 0.11.0 — 2026-11-06
 
 ### Added

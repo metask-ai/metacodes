@@ -11,7 +11,10 @@
 #     unknown session → 404, the idle /interrupt gate (409), per-session rich
 #     /state and /command (/mode dont-ask) isolation.
 #   - UDS + NDJSON: list / message / attach (since, streaming) / interrupt,
-#     mid-run interrupt ends the run as aborted, consecutive messages.
+#     mid-run interrupt ends the run as aborted, consecutive messages;
+#     respond answers the pending ui_request on the socket (stale id refused)
+#     and capabilities installs a declaration (empty one routes the next ask
+#     unavailable), so a UDS-only frontend needs no HTTP side channel.
 #   - #254 dynamic lifecycle: GET /sessions, POST /sessions/create (201, 409
 #     live duplicate, 400 malformed id), /sessions/<id>/resume (200 live, 404
 #     not), /sessions/<id>/destroy (200, then 404 everywhere, /health drops,
@@ -106,6 +109,13 @@ grep -q '"frontend_capabilities":{"v":1,"type":"capabilities_accepted"' <<<"$sta
 stateB="$("${CURL[@]}" "${auth[@]}" "$url/s/$B/state")" || fail "GET B's /state failed"
 grep -q '"frontend_capabilities":null' <<<"$stateB" || fail "A's declaration reached B: $stateB"
 
+# Put A's permission mode back: in dont-ask the permission chain denies an
+# AskUserQuestion outright (never asks), which would starve the UDS respond
+# journey below of its pending request.
+cackA="$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$A/command" -H "Origin: $url" -d '{"cmd":"/mode default"}')"
+grep -q '"ok":true' <<<"$cackA" || fail "A's mode reset not queued: $cackA"
+events_until 'permission mode → default' "${auth[@]}" "$url/s/$A/events" >/dev/null || fail "A has no command_result mode → default"
+
 # ── UDS + NDJSON: no token; the socket file's 0600 mode is the access control ─
 [[ -S "$usock" ]] || fail "UDS socket not created: $usock"
 mode="$(python3 -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$usock")"
@@ -188,6 +198,58 @@ joinedA = "\n".join(allA)
 assert rd_after >= rd_before + 2, "consecutive messages did not each run: %d→%d" % (rd_before, rd_after)
 assert "multi-one-abc" in joinedA and "multi-two-def" in joinedA, "a consecutive message echo is missing"
 
+# respond: the whole UI-request journey stays on the socket. The HTTP section
+# above declared A as permission-only, so first re-declare over the socket
+# (one declaration per Session, replaced by the next accepted frame), then
+# CAPS_ASK makes the mock call AskUserQuestion and the pending request is
+# answered with a UDS line.
+recap = req({"op":"capabilities","session":A,"v":1,"type":"capabilities","ui_requests":["permission","ask_question"]})
+assert '"type":"capabilities_accepted"' in recap and '"ask_question"' in recap, \
+    "UDS re-declaration not accepted: "+recap
+assert '"ok":true' in req({"op":"message","session":A,"text":"CAPS_ASK over uds"})
+rid = None
+deadline = time.time() + 15
+while time.time() < deadline and rid is None:
+    for ln in attach_lines(A, 0, 1):
+        if '"type":"ui_request","id":' in ln:
+            rid = int(ln.split('"type":"ui_request","id":')[1].split(",")[0]); break
+    if rid is None: time.sleep(0.3)
+if rid is None:
+    _dbg = [l[:300] for l in attach_lines(A, 0, 2)
+            if any(k in l for k in ('ui_request', 'capabilities', 'tool_result', 'policy_decision', 'tool_start'))]
+    assert False, "CAPS_ASK announced no ui_request in A's journal; evidence:\n" + "\n".join(_dbg)
+stale = req({"op":"respond","session":A,"id":rid+7,"answers":["Red"]})
+assert '"ok":false' in stale and "no pending request" in stale, "stale respond not refused: "+stale
+noid = req({"op":"respond","session":A,"answers":["Red"]})
+assert "missing id" in noid, "respond without id not refused: "+noid
+ans = req({"op":"respond","session":A,"id":rid,"answers":["Red"]})
+assert '"ok":true' in ans, "UDS respond refused: "+ans
+closed_needle = '"type":"ui_request_closed","id":%d,"outcome":"answered"' % rid
+deadline = time.time() + 15; answered = False
+while time.time() < deadline:
+    allA = "\n".join(attach_lines(A, 0, 1))
+    if closed_needle in allA and allA.count('"run_done"') >= rd_after + 1:
+        answered = True; break
+    time.sleep(0.3)
+assert answered, "UDS respond did not close the request as answered"
+
+# capabilities: declared empty over the socket, the next ask is never announced,
+# it is journaled unavailable, and the run falls back and still finishes.
+cap = req({"op":"capabilities","session":B,"v":1,"type":"capabilities","ui_requests":[]})
+assert '"type":"capabilities_accepted"' in cap, "UDS capabilities not acknowledged: "+cap
+bad = req({"op":"capabilities","session":B,"v":1,"type":"capabilities","ui_requests":["custom"]})
+assert '"type":"capabilities_refused"' in bad, "a malformed frame was not refused: "+bad
+rdB = sum(1 for l in attach_lines(B, 0, 1) if '"run_done"' in l)
+assert '"ok":true' in req({"op":"message","session":B,"text":"CAPS_ASK on b"})
+deadline = time.time() + 15; unavailable = False
+while time.time() < deadline:
+    allB = "\n".join(attach_lines(B, 0, 1))
+    if '"type":"ui_request_unavailable"' in allB and allB.count('"run_done"') >= rdB + 1:
+        unavailable = True; break
+    time.sleep(0.3)
+assert unavailable, "the declared-empty frontend did not journal the ask unavailable"
+assert '"type":"ui_request","id":' not in allB, "an announce leaked past the empty declaration"
+
 print("UDS_OK")
 PY
 uds_out="$(python3 "$TMP/uds_check.py" "$usock" "$A" "$B" 2>&1)" || fail "UDS checks failed: $uds_out"
@@ -265,4 +327,4 @@ grep -q '"ok":true' <<<"$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$D/message" 
 events_until '"run_done".*end_turn' "${auth[@]}" "$url/s/$D/events" >/dev/null || fail "D produced no run"
 stop_daemon "$TMP/zero.out"
 
-echo "PASS: serve-multi e2e — /health, bearer token (HTTP) vs 0600 UDS, routing isolation, UDS list/message/attach/interrupt, per-session /state·/command, dynamic create/list/resume/destroy/restore (#254), --sessions 0 and the 429 cap, SIGINT shutdown"
+echo "PASS: serve-multi e2e — /health, bearer token (HTTP) vs 0600 UDS, routing isolation, UDS list/message/attach/interrupt/respond/capabilities, per-session /state·/command, dynamic create/list/resume/destroy/restore (#254), --sessions 0 and the 429 cap, SIGINT shutdown"
