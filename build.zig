@@ -2284,10 +2284,13 @@ pub fn build(b: *std.Build) void {
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
     provider_test_step.dependOn(&addTestRunArtifact(b, provider_test).step);
 
-    // subsystem:boundary —— the provider kernel and the picker may import only
-    // what their doc comments say, and so may every file they reach. The
-    // compile-from-a-narrow-root gates cannot enforce it: their module root is
-    // `src/`, so any file under it is importable. This checks the rule where
+    // subsystem:boundary —— the provider kernel, the picker and the MCP client
+    // may import only what their doc comments say, and so may every file they
+    // reach; nothing metacodes-core reaches from `src/lib.zig` may import the
+    // application side beyond a baseline that only shrinks (#448). The
+    // compile-from-a-narrow-root gates and `test:lib` cannot enforce it: their
+    // module root is `src/`, so any file under it is importable, and lazy
+    // analysis skips imports in code nothing calls. This checks the rule where
     // the rule lives, in the source.
     const subsystem_boundary_mod = b.createModule(.{
         .root_source_file = b.path("scripts/subsystem_boundary_gate.zig"),
@@ -2307,7 +2310,7 @@ pub fn build(b: *std.Build) void {
     });
     const subsystem_boundary_step = b.step(
         "subsystem:boundary",
-        "Enforce the provider, picker and MCP client import boundaries (#16, #405)",
+        "Enforce the provider, picker, MCP client and metacodes-core import boundaries (#16, #405, #448)",
     );
     subsystem_boundary_step.dependOn(&subsystem_boundary_run.step);
     subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit).step);

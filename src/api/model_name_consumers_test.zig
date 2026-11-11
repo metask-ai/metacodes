@@ -17,7 +17,7 @@ test "case-insensitive model routing, capability, pricing, catalog, and context"
     const capability = @import("capability.zig");
     const pricing = @import("../util/pricing.zig");
     const Catalog = @import("catalog.zig").Catalog;
-    const ModelContext = @import("../app/model_context.zig").ModelContext;
+    const ModelContext = @import("model_context.zig").ModelContext;
     const prompt = @import("../core/system_prompt.zig");
 
     const a = std.testing.allocator;

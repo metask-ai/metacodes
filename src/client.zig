@@ -668,7 +668,7 @@ pub const Client = struct {
     host_capabilities: image_capability.Declarations = .{},
     /// 模型上下文窗口表(~/.metacode/models.toml)。precedence:命中此表 > catalog probe > 200K。
     /// App 持有,借用不拥有(null = 未挂,落 catalog)。
-    model_context: ?*const @import("app/model_context.zig").ModelContext = null,
+    model_context: ?*const @import("api/model_context.zig").ModelContext = null,
     /// 用户 CLI `--max-tokens N` 覆盖；null = 自动（catalog → fallback table → default）。
     max_tokens_override: ?u32 = null,
     reasoning_effort: ?types.ReasoningEffort = null,
