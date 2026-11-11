@@ -26,6 +26,14 @@ status, compatibility boundaries, and entry points are defined by
   packages and the source-free consumers move to revision 27; AgentCore
   0.15.0-dev.
 
+### Fixed
+
+- A same-turn re-issue no longer looks up the abandoned attempt's speculative
+  tool results: they borrowed the attempt's freed tool-call ids, and a
+  re-issued call with a repeated id could take a released, empty result
+  instead of running. Reachable before through headless retries after a
+  streamed tool call (#452).
+
 ## 0.11.0 — 2026-11-06
 
 ### Added

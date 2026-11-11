@@ -35,6 +35,12 @@ empty `### Migration`.
 - Python `Session.rewind_to_user_message(position)` and Node
   `Session.rewindToUserMessage(position)`.
 
+### Fixed
+
+- A re-sent attempt no longer finds the abandoned attempt's speculative tool
+  results, whose ids it borrowed from freed memory; a re-sent call with the
+  same id runs instead of taking an empty result.
+
 ### Migration
 
 - ABI revision 27. The Session Control table grows from 80 to 88 bytes with
