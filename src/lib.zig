@@ -3,8 +3,13 @@
 //! 这是库的公共面:把 agent 循环层(引擎 + 工具 + 协议 + 权限 + 参考 backend)按命名
 //! 空间 re-export 出来,供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。
 //!
-//! **不**导出任何 UI/CLI(repl/、repl/tui/、app.zig、main.zig)。本文件可达的模块图
-//! 物理上够不到 UI 层 —— `test { refAllDeclsRecursive }` 编全图即编译器证明此隔离。
+//! **不**导出任何 UI/CLI(repl/、repl/tui/、app.zig、main.zig)。编译器证明不了这条隔离:
+//! 模块根在 `src/`,任何文件都可 import;惰性分析也不编译没人调用的函数体与 test 块里的
+//! import。真正的检查是 `zig build subsystem:boundary`(scripts/subsystem_boundary_gate.zig,
+//! #448):从本文件沿每条 `@import`(含函数体、test 块)走闭包,任何进入应用侧(repl/、web/、
+//! daemon/、app/、main.zig、app.zig、session_service.zig、session_intent.zig)的边都失败,
+//! 只有该脚本里只减不增的 baseline 例外(如下面 re-export 的 app/config.zig、app/doctor.zig);
+//! src/core/ 没有 baseline。
 //!
 //! 接入方式见 doc/LIB_API.md;最小示例见 example/main.zig。
 //!
@@ -241,9 +246,9 @@ pub const util_toolchain = @import("util/toolchain.zig"); // ripgrep 解析/可�
 pub const util_state_root = @import("util/state_root.zig"); // per-install state root (--state-dir / METACODES_HOME / install.json / ~/.metacodes)
 
 test {
-    // 引用所有 re-export → 强制编译每个库模块。若任何模块间接拉到 repl/tui/app(UI 层),
-    // 会因路径不存在/循环依赖编译失败。绿 = 库与 UI 物理隔离的编译器证明。
-    // (此 std 裁剪版无 refAllDeclsRecursive,用 refAllDecls;顶层 re-export 已覆盖全模块。)
+    // 引用所有 re-export → 编译每个库模块的公开声明及其测试。这证明库能单独编译,
+    // **不**证明它与 UI 隔离:refAllDecls 不递归,惰性分析也跳过没人调用的 import;
+    // 隔离由 `zig build subsystem:boundary` 在源码层检查(见文件头)。
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(protocol);
     // Test-only: no re-export reaches it (see the file's header).

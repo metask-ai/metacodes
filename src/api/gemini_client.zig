@@ -62,7 +62,7 @@ const credential_mod = @import("credential_cell.zig");
 const error_class = @import("error_class.zig");
 const secure = @import("../util/secure.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
-const model_context_mod = @import("../app/model_context.zig");
+const model_context_mod = @import("model_context.zig");
 
 const StreamEvent = api_stream.StreamEvent;
 const StreamHandle = api_stream.StreamHandle;

@@ -28,6 +28,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **metacodes-core's isolation from the application is checked** (#448).
+  `src/lib.zig` claimed its import graph could not reach the UI and that
+  `test:lib` proved it, but lazy analysis skips imports in code nothing calls,
+  and nothing noticed a planted `core/` → `repl/tui/` import.
+  `zig build subsystem:boundary` now follows every `@import` from
+  `src/lib.zig`, function bodies and test blocks included, and fails on any
+  edge into `repl/`, `web/`, `daemon/`, `app/`, `main.zig`, `app.zig`,
+  `session_service.zig` or `session_intent.zig` outside a baseline that may
+  only shrink: a stale entry fails too, and `src/core/` has none. The model
+  context-window table moves from `src/app/` to `src/api/model_context.zig`,
+  removing seven of the eleven edges; the baseline holds the other four.
+
 - **A stream that ends before it says how it stopped is reported as an
   interrupted stream** (#451). When an accepted stream ended cleanly without
   its stop report (no `message_delta.stop_reason` on Messages, no non-null
