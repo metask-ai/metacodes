@@ -678,7 +678,7 @@ pub const App = struct {
     /// Session 级 cron 调度。CronCreate/Delete/List 用;REPL 读 prompt 前 collectDue。
     cron_registry: CronRegistry,
     /// 模型上下文窗口表(~/.metacode/models.toml)。api_client.model_context 借用它做 auto-compact 阈值。
-    model_context: @import("app/model_context.zig").ModelContext,
+    model_context: @import("api/model_context.zig").ModelContext,
 
     /// What a host settles before `App.init` instead of leaving it to init.
     pub const InitOptions = struct {
@@ -753,7 +753,7 @@ pub const App = struct {
             .agents = AgentSet.init(allocator),
             .worktree_stack = .empty,
             .cron_registry = CronRegistry.init(allocator),
-            .model_context = @import("app/model_context.zig").ModelContext.init(allocator),
+            .model_context = @import("api/model_context.zig").ModelContext.init(allocator),
         };
         // The CLI resolves the state root (src/main.zig) and passes it in. An App
         // built without one keeps the historical `$HOME/.metacodes`.
