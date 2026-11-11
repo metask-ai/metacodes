@@ -2,9 +2,14 @@
 //!
 //! 角色对照:repl/loop.zig 的 web 等价物,但**只做编排不做表达**:
 //!   等 inbox 消息(POST /message 入队)→ startSubmission(应用该消息的 model/
-//!   permission_mode → append conversation → journal 回显 user_message)→ agent_loop.run
-//!   (WebBackend 做 emit,WebBackend.requester 做 UiRequest)→ persistTranscript
-//!   → journal 通告 run_done → 回到等待。
+//!   permission_mode → append conversation → beginRun + journal 回显 user_message)→
+//!   agent_loop.run(WebBackend 做 emit,WebBackend.requester 做 UiRequest)→
+//!   persistTranscript → journal 通告 run_done(endRun)→ 回到等待。
+//!
+//! journal 的每一行都经 core/protocol/wire.zig 写成 v1 行(doc/WIRE_PROTOCOL.md):host 行
+//! (user_message/run_done/command_result/message_rejected)经 WebBackend.journalHost/endRun,
+//! 内核事件与 config_changed 经 WebBackend.journalEvent(Run 内带 run_id),session_lifecycle
+//! 经 wire.writeEvent。本文件不手写任何 journal 行。
 //!
 //! 生成期入队的消息天然排队(inbox 是 SubmissionQueue,线程安全),本轮结束逐条续跑——
 //! 对齐 TUI 的 commandQueue 语义,但不需要 watcher 线程:HTTP 线程就是输入线程。
@@ -46,29 +51,28 @@ fn stringifyJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
 }
 
 /// **U4 A4:web 配置变更 sink**。config 变更(model/mode/dirs/reasoning/route 任一 UI/工具/消息
-/// 触发)→ journal.append 一条 wire v1 行 `{"v":1,"type":"config_changed","data":{...}}`(与内核
-/// 事件同一序列化,tests/fixtures/wire/v1 钉住)→ 浏览器 SSE 收到更新状态。与 command_result
-/// 分开(config_changed 是状态广播,任何来源都发;command_result 只是命令 ack)。
+/// 触发)→ 经 WebBackend.journalEvent 落一条 wire v1 行 `{"v":1,"type":"config_changed",...}`
+/// (与内核事件同一序列化,tests/fixtures/wire/v1 钉住;Run 内发生的带该 Run 的 run_id)→ 浏览器
+/// SSE 收到更新状态。与 command_result 分开(config_changed 是状态广播,任何来源都发;
+/// command_result 只是命令 ack)。
 /// **借用契约**:emit 在 driver 线程同步序列化 ev(含 borrow .model/.dirs)→ journal.append **dup**
 /// 进 journal 串,SSE 线程后读的是 dup,borrow 释放安全(dup 发生在 emit 调用内,早于下一次 mutation)。
 pub const WebConfigSink = struct { // U10-D:daemon app_driver 复用
-    journal: *EventJournal,
-    alloc: std.mem.Allocator,
+    wb: *WebBackend,
     fn emitThunk(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
         const self: *WebConfigSink = @ptrCast(@alignCast(ctx));
-        const line = wire.writeEvent(self.alloc, .{ .config_changed = ev }) catch return;
-        defer self.alloc.free(line);
-        self.journal.append(line); // journal dup → borrow 同步序列化后即可释放
+        self.wb.journalEvent(.{ .config_changed = ev }); // journal dup → borrow 同步序列化后即可释放
     }
     pub fn sink(self: *WebConfigSink) ui_event.ConfigEventSink { // U10-D 复用
         return .{ .ctx = @ptrCast(self), .emitFn = &emitThunk };
     }
 };
 
-/// U5 B2:把一条 session_lifecycle 事件序列化进 journal（进 seq 流，附着重放可见 session 边界）。
-/// created 挂 journal init 后（seq 0），closed 挂 journal.close 前。best-effort（OOM 静默丢）。
+/// U5 B2:把一条 session_lifecycle 事件以 wire v1 行写进 journal（进 seq 流，附着重放可见
+/// session 边界）。created 挂 journal init 后（seq 0），closed 挂 journal.close 前。不属于
+/// 任何 Run,故无 run_id。best-effort（OOM 静默丢）。
 pub fn journalSessionLifecycle(journal: *EventJournal, alloc: std.mem.Allocator, ev: ui_event.SessionLifecycle) void { // U10-D 复用
-    const line = stringifyJson(alloc, .{ .session_lifecycle = ev }) catch return;
+    const line = wire.writeEvent(alloc, .{ .session_lifecycle = ev }) catch return;
     defer alloc.free(line);
     journal.append(line);
 }
@@ -218,15 +222,57 @@ fn reply(allocator: std.mem.Allocator, ok: bool, msg: []const u8) ![]u8 {
     return stringifyJson(allocator, .{ .ok = ok, .message = msg });
 }
 
+/// The queued `/command` lines the driver runs in one go, and the Run they
+/// plan (a prompt, `/edit`, `/retry`, `/commit`, …). Lines of one batch that
+/// plan a Run share it: each already put its text into the conversation when
+/// it ran. It begins (`beginPlannedRun`) once the whole batch has run, so its
+/// `user_message` lines follow every line's `command_result` and nothing but
+/// the Run's own lines sits between its first line and its `run_done`.
+pub const CommandBatch = struct {
+    /// At least one line planned a Run.
+    run_planned: bool = false,
+    /// Its `user_message` lines, in order, owned by the allocator given to
+    /// `execCommand`: a prompt or an `/edit` echoes its text; a macro
+    /// (`/commit`, `/review`, `/init`) or `/retry` does not, as in the TUI.
+    echoes: std.ArrayList(Echo) = .empty,
+
+    pub const Echo = struct { text: []u8, replaces: ?usize = null };
+
+    pub fn deinit(self: *CommandBatch, allocator: std.mem.Allocator) void {
+        for (self.echoes.items) |echo| allocator.free(echo.text);
+        self.echoes.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Best effort, like every journal line: out of memory loses the echo,
+    /// never the Run.
+    fn addEcho(self: *CommandBatch, allocator: std.mem.Allocator, text: []const u8, replaces: ?usize) void {
+        const owned = allocator.dupe(u8, text) catch return;
+        self.echoes.append(allocator, .{ .text = owned, .replaces = replaces }) catch allocator.free(owned);
+    }
+};
+
+/// Driver thread: begins the Run a batch of `/command` lines planned and
+/// journals its `user_message` lines. The caller runs it and ends it with
+/// `announceRunFinished` or `announceRunFailed`.
+pub fn beginPlannedRun(wb: *WebBackend, batch: *const CommandBatch) void {
+    std.debug.assert(batch.run_planned);
+    const run_id = wb.beginRun();
+    for (batch.echoes.items) |echo| {
+        wb.journalHost(.{ .user_message = .{ .run_id = run_id, .text = echo.text, .replaces = echo.replaces } });
+    }
+}
+
 /// driver 线程执行一个命令(独占 conversation/config/app.allocator,无并发)。
-/// 结果经 journal `{"command_result":{ok,message}}` 事件发回浏览器(异步)。
+/// 结果经 journal 的 `command_result` 行发回浏览器(异步)。
 ///
 /// U2 S3 → U11:**不再有独立命令实现,也不再有独立解析**——整行进共享
 /// SessionService.execLine(session_intent.parse → dispatch,与 loop.zig 同一命令面/
 /// 同一解析)。web 由此白捡 /commit /review /init /retry /mode 与 `!cmd`(带 run 计划,
 /// caller 提交)。终端表达类动词(/help /tools…)按设计返回 unsupported 文案。
-/// 返回 dispatch 的 run 计划:非 null 时 caller(driver 循环)须跑一轮 agent_loop。
-pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.Allocator, cmd: []const u8) ?session_service_mod.RunPlan {
+/// 返回 dispatch 的 run 计划:非 null 时它已记进 `batch`(含要回显的 user_message),
+/// caller(driver 循环)跑完这一批命令后 beginPlannedRun,再跑一轮 agent_loop。
+pub fn execCommand(app: *app_mod.App, wb: *WebBackend, web_alloc: std.mem.Allocator, cmd: []const u8, batch: *CommandBatch) ?session_service_mod.RunPlan {
     const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
     var svc = session_service_mod.SessionService.init(app);
     // `!cmd` shell 车道单独走:业务核仍是 service.shellExec(执行 + 输出进对话上下文),
@@ -234,52 +280,77 @@ pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem
     // (对齐 TUI 的"渲染归各 UI":TUI 打终端,这里进 journal)。
     const intent = session_service_mod.service_intent.parse(trimmed);
     if (intent == .shell and intent.shell.len > 0) {
-        shellCommandResult(&svc, journal, web_alloc, intent.shell);
+        shellCommandResult(&svc, wb, web_alloc, intent.shell);
         return null;
     }
     const d = session_service_mod.execLine(&svc, app.allocator, trimmed);
-    // prompt 经 /command 提交时补 user_message 回显——与 POST /message 的回显对齐
-    // (driver 在该轮开跑时回显,见 startSubmission),否则 attach/重放的 SSE 客户端只见
-    // assistant 回合,可见 transcript 与 conversation 脱节。宏注入(/commit 等)不回显,对齐 TUI。
-    if (d.run != null and d.run.?.kind == .user_prompt) {
-        if (stringifyJson(web_alloc, .{ .user_message = trimmed }) catch null) |echo| {
-            defer web_alloc.free(echo);
-            journal.append(echo);
+    if (d.run) |plan| {
+        batch.run_planned = true;
+        switch (plan.kind) {
+            // prompt 经 /command 提交时补 user_message 回显——与 POST /message 的回显对齐,
+            // 否则 attach/重放的 SSE 客户端只见 assistant 回合,可见 transcript 与 conversation 脱节。
+            .user_prompt => batch.addEcho(web_alloc, trimmed, null),
+            // `/edit <n> <text>` (issue #432): the edited text is the turn's input and
+            // `replaces` the position it took over; everything from there was dropped.
+            .edited_prompt => if (session_service_mod.EditArgs.parse(intent.command.args)) |edit| {
+                batch.addEcho(web_alloc, edit.text, edit.position.ordinal());
+            } else |_| {}, // not reached: the plan exists only for args that parsed
+            // 宏注入(/commit 等)与 /retry 不回显,对齐 TUI。
+            .injected_macro, .retry => {},
         }
     }
-    // `/edit <n> <text>` (issue #432): the edited text is the turn's input and
-    // `replaces` the position it took over; everything from there was dropped.
-    if (d.run != null and d.run.?.kind == .edited_prompt) {
-        if (session_service_mod.EditArgs.parse(intent.command.args)) |edit| {
-            if (stringifyJson(web_alloc, .{ .user_message = edit.text, .replaces = edit.position.ordinal() }) catch null) |echo| {
-                defer web_alloc.free(echo);
-                journal.append(echo);
-            }
-        } else |_| {} // not reached: the plan exists only for args that parsed
-
-    }
     var buf: [256]u8 = undefined;
-    const msg: []const u8 = switch (d.outcome.kind) {
+    const message: []const u8 = switch (d.outcome.kind) {
         .unhandled => std.fmt.bufPrint(&buf, "unsupported here: {s}", .{trimmed}) catch "unsupported command",
         .noop => if (d.run != null) "queued for run" else d.outcome.render(&buf),
         else => d.outcome.render(&buf),
     };
     const ok = d.outcome.ok and d.outcome.kind != .unhandled;
-    const line = stringifyJson(web_alloc, .{ .command_result = .{ .ok = ok, .message = msg } }) catch return d.run;
-    defer web_alloc.free(line);
-    journal.append(line);
+    wb.journalHost(.{ .command_result = .{
+        .command = commandName(intent),
+        .ok = ok,
+        .error_name = if (ok) null else refusalName(d.outcome),
+        .message = if (message.len > 0) message else null,
+    } });
     return d.run;
 }
 const session_service_mod = @import("../session_service.zig");
 
+/// `command_result.command` of a `/command` line: the verb of a `/verb` line
+/// (a built-in verb, or the name of a skill this surface does not run),
+/// `shell` for `!cmd`, `prompt` for plain text. Borrows `intent`.
+fn commandName(intent: session_service_mod.service_intent.InputIntent) []const u8 {
+    return switch (intent) {
+        .command => |command| command.verb,
+        .skill => |skill| skill.head,
+        .shell => "shell",
+        .prompt => "prompt",
+        .empty => "empty",
+    };
+}
+
+/// `command_result.error_name` of a refused line: the error the service
+/// names, when it names one; `CommandUnsupported` for a line this surface
+/// does not run (a terminal verb, a skill, a listing such as `/model` alone);
+/// `CommandRefused` for any other refusal, whose reason is the `message`.
+fn refusalName(outcome: session_service_mod.CommandOutcome) []const u8 {
+    if (outcome.kind == .unhandled) return "CommandUnsupported";
+    return switch (outcome.data) {
+        .err_name => |name| name,
+        else => "CommandRefused",
+    };
+}
+
 /// Driver-thread start of one queued message (`POST /message`, UDS `message`):
-/// apply its configuration, put its text into the conversation and announce
-/// the turn. true = the caller runs the turn now. The web `run()` loop and the
+/// apply its configuration, put its text into the conversation and begin its
+/// Run. true = the caller runs the Run now and ends it with
+/// `announceRunFinished` or `announceRunFailed`. The web `run()` loop and the
 /// daemon driver (daemon/app_driver.zig) both take messages through here.
 ///
-/// Journal order for one message:
+/// Journal order for one message (wire v1 lines):
 ///   `config_changed{model}` (if `model` was given) → `config_changed{mode}`
-///   (if `permission_mode` was given) → `{"user_message":text}` → the turn's events.
+///   (if `permission_mode` was given) → `user_message` (the Run's first line,
+///   with its `run_id`) → the Run's events.
 /// A given field is announced even when its value was already in force, so a
 /// client sees what the turn runs with.
 ///
@@ -287,25 +358,25 @@ const session_service_mod = @import("../session_service.zig");
 /// the settings disable (`disableBypassPermissionsMode`, `disableAutoMode`),
 /// and the model must resolve (tier names) and be usable with the current
 /// provider. If either is refused, neither is applied, the text stays out of
-/// the conversation, and `{"message_rejected":{...}}` takes the place of
+/// the conversation, no Run begins, and `message_rejected` takes the place of
 /// `user_message`. The model is switched for the session only: the login's
 /// saved selection, which `/model` writes, is left alone
 /// (SessionService.setTurnModel).
-pub fn startSubmission(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.Allocator, submission: *const Submission) bool {
+pub fn startSubmission(app: *app_mod.App, wb: *WebBackend, web_alloc: std.mem.Allocator, submission: *const Submission) bool {
     var svc = session_service_mod.SessionService.init(app);
     var reason_buf: [256]u8 = undefined;
     // Check the mode before switching the model: a refusal found after setTurnModel would
     // leave the model switched for a message that is then refused.
     if (submission.permission_mode) |mode| {
         if (svc.checkPermMode(mode)) |refusal| {
-            journalRejected(journal, web_alloc, submission, refusal.render(&reason_buf));
+            journalRejected(wb, submission, refusal.render(&reason_buf));
             return false;
         }
     }
     if (submission.model) |model| {
         const outcome = svc.setTurnModel(web_alloc, model);
         if (!outcome.ok) {
-            journalRejected(journal, web_alloc, submission, outcome.render(&reason_buf));
+            journalRejected(wb, submission, outcome.render(&reason_buf));
             return false;
         }
     }
@@ -314,7 +385,7 @@ pub fn startSubmission(app: *app_mod.App, journal: *EventJournal, web_alloc: std
         // that ever change, refuse the turn rather than run it in a mode the settings forbid.
         const applied = svc.setPermMode(mode);
         if (!applied.ok) {
-            journalRejected(journal, web_alloc, submission, applied.render(&reason_buf));
+            journalRejected(wb, submission, applied.render(&reason_buf));
             return false;
         }
     }
@@ -322,38 +393,32 @@ pub fn startSubmission(app: *app_mod.App, journal: *EventJournal, web_alloc: std
     if (d.run == null) {
         // Only an allocation failure gets here (the transport refuses empty text). Whatever
         // configuration was applied stays applied; its config_changed lines say so.
-        journalRejected(journal, web_alloc, submission, if (d.outcome.ok) "empty message" else d.outcome.render(&reason_buf));
+        journalRejected(wb, submission, if (d.outcome.ok) "empty message" else d.outcome.render(&reason_buf));
         return false;
     }
-    const echo = stringifyJson(web_alloc, .{ .user_message = submission.text }) catch return true;
-    defer web_alloc.free(echo);
-    journal.append(echo);
+    const run_id = wb.beginRun();
+    wb.journalHost(.{ .user_message = .{ .run_id = run_id, .text = submission.text } });
     return true;
 }
 
-/// `{"message_rejected":{"message","text","model","permission_mode"}}`: the message
-/// started no turn. `model`/`permission_mode` repeat what the message asked for (null =
-/// not given); `permission_mode` in the canonical spelling `/state` reports.
-fn journalRejected(journal: *EventJournal, web_alloc: std.mem.Allocator, submission: *const Submission, message: []const u8) void {
+/// `message_rejected`: the message started no Run. `model`/`permission_mode` repeat
+/// what the message asked for (null = not given); `permission_mode` in the canonical
+/// spelling `/state` reports.
+fn journalRejected(wb: *WebBackend, submission: *const Submission, message: []const u8) void {
     log.warn("web", "message rejected: {s}", .{message});
-    const requested_mode: ?[]const u8 = if (submission.permission_mode) |m| @tagName(m) else null;
-    const line = stringifyJson(web_alloc, .{ .message_rejected = .{
+    wb.journalHost(.{ .message_rejected = .{
         .message = message,
         .text = submission.text,
         .model = submission.model,
-        .permission_mode = requested_mode,
-    } }) catch return;
-    defer web_alloc.free(line);
-    journal.append(line);
+        .permission_mode = if (submission.permission_mode) |m| @tagName(m) else null,
+    } });
 }
 
 /// `!cmd` 的 journal 渲染:执行(service 业务核)→ stdout/stderr 摘录进 command_result。
 /// 摘录上限 2 KiB/流(完整输出已在对话上下文里,模型可见;这里只为浏览器用户回显)。
-fn shellCommandResult(svc: *session_service_mod.SessionService, journal: *EventJournal, web_alloc: std.mem.Allocator, command: []const u8) void {
+fn shellCommandResult(svc: *session_service_mod.SessionService, wb: *WebBackend, web_alloc: std.mem.Allocator, command: []const u8) void {
     const result = session_service_mod.shellExecImpl(svc, web_alloc, command) catch |e| {
-        const line = stringifyJson(web_alloc, .{ .command_result = .{ .ok = false, .message = @errorName(e) } }) catch return;
-        defer web_alloc.free(line);
-        journal.append(line);
+        wb.journalHost(.{ .command_result = .{ .command = "shell", .ok = false, .error_name = @errorName(e) } });
         return;
     };
     defer web_alloc.free(result);
@@ -380,9 +445,7 @@ fn shellCommandResult(svc: *session_service_mod.SessionService, journal: *EventJ
             }
         }
     }
-    const line = stringifyJson(web_alloc, .{ .command_result = .{ .ok = true, .message = msg_buf.items } }) catch return;
-    defer web_alloc.free(line);
-    journal.append(line);
+    wb.journalHost(.{ .command_result = .{ .command = "shell", .ok = true, .message = msg_buf.items } });
 }
 
 /// **U10-D → U11**:构造 web/daemon session 的 agent_loop.Options(web run() 与 daemon
@@ -430,7 +493,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
     // 线程 snapshot() 撞 null-cache fallback(直读 app.additionalDirs(),driver 若此刻 mutate 则 UAF)。
     // 提前 seed 关死该窗口:server 起来时 cache 必已就位。defer setConfigEventSink(null) 注册在
     // srv.stop 之前 → LIFO 保证它在 server 停后才清(无 HTTP 线程读已清 sink)。
-    var config_sink = WebConfigSink{ .journal = &journal, .alloc = web_alloc };
+    var config_sink = WebConfigSink{ .wb = &wb };
     app.setConfigEventSink(config_sink.sink());
     defer app.setConfigEventSink(null);
 
@@ -468,8 +531,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         // ── 斜杠命令:driver 线程独占执行(唯一 conversation/allocator toucher,无并发)。
         // HTTP 线程只入队(见 StateSource.command);此处执行 → journal command_result。
         // U11:命令可携带 run 计划(/commit /review /init /retry;append 已在 service 内
-        // 完成)→ 本轮直接跑 agent_loop,不等 inbox;多条计划合并一轮 run(对话已含全部注入)。
-        var pending_run = false;
+        // 完成)→ 本轮直接跑 agent_loop,不等 inbox;多条计划合并一轮 run(对话已含全部注入),
+        // 这一批命令全部跑完才 beginPlannedRun(Run 的行连续,见 CommandBatch)。
+        var batch: CommandBatch = .{};
+        defer batch.deinit(web_alloc);
         while (cmdbox.popFront()) |c| {
             defer web_alloc.free(c);
             // 命令执行期也亮 generating:`!cmd` 可长时间阻塞 driver,不亮则 /interrupt 被
@@ -477,7 +542,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
             // (空闲分支的残留 reset / run 后的 user_interrupt reset)。
             generating_flag.store(true, .release);
             defer generating_flag.store(false, .release);
-            if (execCommand(app, &journal, web_alloc, c) != null) pending_run = true;
+            _ = execCommand(app, &wb, web_alloc, c, &batch);
         }
         // 命令期被 Stop 打断(如中断长 `!cmd`)的残留 interrupt 在此复位——否则紧随的
         // pending run / inbox 消息会被 already-aborted 即刻吞掉(S1 同类)。SIGINT 不复位;
@@ -485,7 +550,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         // 复位丢失、下一次生效——与既有空闲/run 后复位点的语义一致,可接受。
         if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.reset();
 
-        if (!pending_run) {
+        if (batch.run_planned) {
+            beginPlannedRun(&wb, &batch);
+        } else {
             // ── 空闲期:等消息 ──────────────────────────────────────────────
             // abort 二义:user_ctrl_c=真 SIGINT(退出进程)vs user_interrupt=浏览器 Stop
             // (只中断 run)。空闲期若 flag 亮:SIGINT → 退出;残留的 interrupt(门 race 漏进
@@ -501,11 +568,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
                 continue;
             };
             defer msg.deinit(web_alloc);
-            // 消息自带的 model/permission_mode 在本轮开跑前原子应用,再回显 user_message;
-            // prompt 提交经 service.submitPrompt(clearActiveSkill + append 与 TUI 同源)。
-            // 应用失败 → message_rejected,不跑本轮。
-            if (!startSubmission(app, &journal, web_alloc, &msg)) continue;
+            // 消息自带的 model/permission_mode 在本轮开跑前原子应用,再 beginRun + 回显
+            // user_message;prompt 提交经 service.submitPrompt(clearActiveSkill + append 与
+            // TUI 同源)。应用失败 → message_rejected,不起 Run。
+            if (!startSubmission(app, &wb, web_alloc, &msg)) continue;
         }
+        // 自此到 announceRunFinished/announceRunFailed 是一个 Run:每条出口都写它的 run_done。
         generating_flag.store(true, .release);
         defer generating_flag.store(false, .release);
 
@@ -524,7 +592,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
                     @errorName(err),
                     run_journal.describeRefusal(&lease_text, err, &lease_report) orelse "",
                 });
-                announceRunDone(&journal, web_alloc, "error", @errorName(err));
+                announceRunFailed(&wb, @errorName(err));
                 exit_code = 1;
                 continue;
             }
@@ -540,7 +608,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         ) catch |err| {
             control.finishRun(@errorName(err)) catch {};
             log.err("web", "project rules rejected detached workers: {s}", .{@errorName(err)});
-            announceRunDone(&journal, web_alloc, "error", @errorName(err));
+            announceRunFailed(&wb, @errorName(err));
             exit_code = 1;
             continue;
         };
@@ -568,19 +636,19 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
                 log.err("web", "run control finish failed: {s}", .{@errorName(finish_err)});
             };
             log.err("web", "agent_loop failed: {s}", .{@errorName(err)});
-            announceRunDone(&journal, web_alloc, "error", @errorName(err));
+            announceRunFailed(&wb, @errorName(err));
             exit_code = 1;
             continue;
         };
         if (run_control) |control| control.finishRun(@tagName(result.stop_reason)) catch |err| {
             log.err("web", "run control finish failed: {s}", .{@errorName(err)});
-            announceRunDone(&journal, web_alloc, "error", @errorName(err));
+            announceRunFailed(&wb, @errorName(err));
             exit_code = 1;
             continue;
         };
 
         app.persistTranscript();
-        announceRunFinished(&journal, web_alloc, @tagName(result.stop_reason), if (model_failure) |*detail| detail else null);
+        announceRunFinished(&wb, @tagName(result.stop_reason), if (model_failure) |*detail| detail else null);
 
         // run 因 abort 结束:据 reason 决定退出还是继续(复位供下一轮)。
         // user_ctrl_c=生成期真 SIGINT → 退出;user_interrupt=浏览器 Stop → 继续。
@@ -594,29 +662,17 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
     return exit_code;
 }
 
-pub fn announceRunDone(journal: *EventJournal, allocator: std.mem.Allocator, stop_reason: []const u8, err_name: ?[]const u8) void { // U10-D 复用
-    const line = stringifyJson(allocator, .{
-        .run_done = .{ .stop_reason = stop_reason, .err = err_name },
-    }) catch return;
-    defer allocator.free(line);
-    journal.append(line);
+/// Ends the Run in progress as failed (it never returned): `run_done` names the
+/// error in `error_name`, with no `stop_reason`, as SessionHost writes it.
+pub fn announceRunFailed(wb: *WebBackend, error_name: []const u8) void { // U10-D 复用
+    wb.endRun(.{ .error_name = error_name });
 }
 
-/// A Run that returned. On a model failure `err` is the displayable message and
-/// `model_error` the structured detail (issue #408); any other stop writes
-/// exactly what `announceRunDone` does.
-pub fn announceRunFinished(journal: *EventJournal, allocator: std.mem.Allocator, stop_reason: []const u8, failure: ?*const model_error.Detail) void {
-    const detail = failure orelse return announceRunDone(journal, allocator, stop_reason, null);
-    const view = detail.view();
-    const line = stringifyJson(allocator, .{
-        .run_done = .{ .stop_reason = stop_reason, .err = view.message, .model_error = view },
-    }) catch {
-        // The notification matters more than its detail.
-        announceRunDone(journal, allocator, stop_reason, null);
-        return;
-    };
-    defer allocator.free(line);
-    journal.append(line);
+/// Ends a Run that returned. On a model failure (`api_error`,
+/// `max_tokens_exhausted`) `model_error` is the structured detail (issue
+/// #408), whose `message` is the displayable text; otherwise it is null.
+pub fn announceRunFinished(wb: *WebBackend, stop_reason: []const u8, failure: ?*const model_error.Detail) void {
+    wb.endRun(.{ .stop_reason = stop_reason, .model_error = if (failure) |detail| detail.view() else null });
 }
 
 test {
@@ -627,7 +683,9 @@ test "U4 A5: web config sink 跨线程留存 dup(emit 后覆写源串,journal �
     const a = std.testing.allocator;
     var journal = EventJournal.init(a);
     defer journal.deinit();
-    var config_sink = WebConfigSink{ .journal = &journal, .alloc = a };
+    var wb = WebBackend.init(a, &journal);
+    defer wb.deinit();
+    var config_sink = WebConfigSink{ .wb = &wb };
     const sink = config_sink.sink();
 
     // 可变缓冲当 model 源串(模拟 app.activeModel() 借用会被 switchModel free/覆写)。
@@ -669,13 +727,51 @@ test "U5 B2: session_lifecycle.created 落 journal seq 0；closed 可 journal" {
         a.free(lines);
     }
     try std.testing.expect(lines.len == 1);
-    try std.testing.expect(std.mem.indexOf(u8, lines[0], "session_lifecycle") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines[0], "created") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines[0], "abc123session") != null);
+    // A wire v1 line (#444), byte for byte the fixture's shape.
+    try std.testing.expectEqualStrings("{\"v\":1,\"type\":\"session_lifecycle\",\"data\":{\"created\":\"abc123session\"}}", lines[0]);
 
     // closed 可 journal（收尾）。
     journalSessionLifecycle(&journal, a, .{ .closed = "abc123session" });
     try std.testing.expectEqual(@as(usize, 2), journal.count());
+}
+
+test "#444 /command lines: command_result first, then the planned Run's user_message lines with its run_id" {
+    const a = std.testing.allocator;
+    var journal = EventJournal.init(a);
+    defer journal.deinit();
+    var wb = WebBackend.init(a, &journal);
+    defer wb.deinit();
+
+    // What execCommand records for a batch: a prompt and an edit plan one Run.
+    var batch: CommandBatch = .{};
+    defer batch.deinit(a);
+    batch.run_planned = true;
+    batch.addEcho(a, "first", null);
+    wb.journalHost(.{ .command_result = .{ .command = "prompt", .ok = true, .message = "queued for run" } });
+    batch.addEcho(a, "second, edited", 3);
+    wb.journalHost(.{ .command_result = .{ .command = "edit", .ok = true, .message = "queued for run" } });
+    beginPlannedRun(&wb, &batch);
+    wb.journalEvent(.stream_done);
+    announceRunFinished(&wb, "end_turn", null);
+    wb.journalEvent(.stream_done); // between Runs: no run_id
+
+    const lines = (try journal.waitSince(a, 0, 0)).?;
+    defer {
+        for (lines) |l| a.free(l);
+        a.free(lines);
+    }
+    const expected = [_][]const u8{
+        "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"prompt\",\"ok\":true,\"error_name\":null,\"message\":\"queued for run\"}}",
+        "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"edit\",\"ok\":true,\"error_name\":null,\"message\":\"queued for run\"}}",
+        "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"first\",\"replaces\":null}}",
+        "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"second, edited\",\"replaces\":3}}",
+        "{\"v\":1,\"type\":\"stream_done\",\"run_id\":1,\"data\":null}",
+        "{\"v\":1,\"type\":\"run_done\",\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"end_turn\",\"error_name\":null,\"model_error\":null}}",
+        "{\"v\":1,\"type\":\"stream_done\",\"data\":null}",
+    };
+    try std.testing.expectEqual(expected.len, lines.len);
+    for (expected, lines) |want, got| try std.testing.expectEqualStrings(want, got);
+    try std.testing.expectEqual(@as(u64, 0), wb.runId());
 }
 
 test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {

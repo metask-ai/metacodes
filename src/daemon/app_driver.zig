@@ -9,7 +9,11 @@
 //!
 //! **allocator 分裂(与 web run() 一致,'allocator 一致铁律')**:
 //! - **app.allocator**(App arena,与 app.conversation 同源)→ agent_loop.run + scoped_recall。
-//! - **host.allocator**(serve 建 host 时的 web_alloc/c_allocator,线程安全)→ msg free / announceRunDone。
+//! - **host.allocator**(serve 建 host 时的 web_alloc/c_allocator,线程安全)→ msg free / 命令批的回显。
+//!
+//! **journal**:与 web run() 同一套 wire v1 行(#444)——Run 由 startSubmission / beginPlannedRun
+//! 开始(wb.beginRun,user_message 带 run_id),由 announceRunFinished / announceRunFailed 结束
+//! (run_done);其间内核事件经 wb 带同一 run_id。
 //!
 //! **线程**:driver_fn 在 SessionHost 线程跑。App arena 单线程(每 session 一个 App,本 driver 唯一
 //! toucher);host.journal/wb 线程安全(c_alloc)。
@@ -72,33 +76,38 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
     const dctx: *DriverCtx = @ptrCast(@alignCast(ctx));
     const app = dctx.app;
     const app_alloc = app.allocator; // agent_loop + scoped_recall(与 conversation 同源)
-    const infra = host.allocator; // msg free / announceRunDone(线程安全 c_alloc)
-    const be = dctx.wb.backend();
+    const infra = host.allocator; // msg free / 命令批的回显(线程安全 c_alloc)
+    const wb = dctx.wb;
+    const be = wb.backend();
     var lead_mail = @import("../session_service.zig").LeadMail{};
 
     while (!host.stopRequested()) {
         // U11:斜杠命令(host.cmdbox,transport 只入队)在 driver 独占点执行——与 web run()
         // 同一 execCommand(execLine canonical 命令面)。带 run 计划的命令(/commit /review
-        // /init /retry;append 已在 service 内完成)→ 本轮直接跑 agent_loop,不等 inbox。
-        var pending_run = false;
+        // /init /retry;append 已在 service 内完成)→ 本轮直接跑 agent_loop,不等 inbox;
+        // 这一批命令全部跑完才 beginPlannedRun(Run 的行连续,见 web_session.CommandBatch)。
+        var batch: web_session.CommandBatch = .{};
+        defer batch.deinit(infra);
         while (host.cmdbox.popFront()) |c| {
             defer infra.free(c);
             // 命令执行期也亮 generating(对齐 web run):`!cmd` 可长时间阻塞,不亮则
             // /interrupt 被 409 门挡死——daemon session 没有终端 SIGINT 兜底,必须能中断。
             host.generating.store(true, .seq_cst);
             defer host.generating.store(false, .seq_cst);
-            if (web_session.execCommand(app, &host.journal, infra, c) != null) pending_run = true;
+            _ = web_session.execCommand(app, wb, infra, c, &batch);
         }
         // 停机窗口:排水期间 requestStop 可能已发——AbortSignal 是 first-reason-wins,
         // 其 user_ctrl_c 会被先落座的 user_interrupt **遮蔽**。此时绝不复位、绝不起 run
         // (复位会清掉停机 abort,让一整轮 un-aborted run 卡住 destroy 的 join);
-        // 直接回环,由循环条件 stopRequested 退出。
+        // 直接回环,由循环条件 stopRequested 退出。计划中的 Run 尚未 begin,不留半截 Run。
         if (host.stopRequested()) continue;
         // 命令期被打断的残留 interrupt 复位——否则毒化紧随的 pending run / inbox 消息
         // (already-aborted 即刻吞掉)。
         if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.reset();
 
-        if (!pending_run) {
+        if (batch.run_planned) {
+            web_session.beginPlannedRun(wb, &batch);
+        } else {
             var msg = host.inbox.popFront() orelse idle: {
                 reapAgentDone(app, &be, host.id, infra); // 空闲期也 reap:后台 job 可能在无新消息时完成
                 // #277: a teammate's reply is the lead's next turn.
@@ -109,9 +118,10 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
             defer msg.deinit(infra); // msg 来自 host.inbox(infra alloc)
 
             // 与 web run() 同一入口:先应用消息自带的 model/permission_mode,再提交 prompt
-            // (service.submitPrompt)并回显 user_message;应用失败 → message_rejected,无 run。
-            if (!web_session.startSubmission(app, &host.journal, infra, &msg)) continue;
+            // (service.submitPrompt)、beginRun 并回显 user_message;应用失败 → message_rejected,无 run。
+            if (!web_session.startSubmission(app, wb, infra, &msg)) continue;
         }
+        // 自此到 announceRunFinished/announceRunFailed 是一个 Run:每条出口都写它的 run_done。
 
         var lease_report: run_journal.OpenReport = .{};
         var lease_text: [512]u8 = undefined;
@@ -128,7 +138,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
                     @errorName(err),
                     run_journal.describeRefusal(&lease_text, err, &lease_report) orelse "",
                 });
-                web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
+                web_session.announceRunFailed(wb, @errorName(err));
                 continue;
             }
         else
@@ -143,7 +153,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         ) catch |err| {
             control.finishRun(@errorName(err)) catch {};
             log.err("daemon", "project rules rejected detached workers: {s}", .{@errorName(err)});
-            web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
+            web_session.announceRunFailed(wb, @errorName(err));
             continue;
         };
 
@@ -173,17 +183,17 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
                 log.err("daemon", "run control finish failed: {s}", .{@errorName(finish_err)});
             };
             log.err("daemon", "agent_loop failed: {s}", .{@errorName(err)});
-            web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
+            web_session.announceRunFailed(wb, @errorName(err));
             continue;
         };
         if (run_control) |control| control.finishRun(@tagName(result.stop_reason)) catch |err| {
             log.err("daemon", "run control finish failed: {s}", .{@errorName(err)});
-            web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
+            web_session.announceRunFailed(wb, @errorName(err));
             continue;
         };
 
         app.persistTranscript();
-        web_session.announceRunFinished(&host.journal, infra, @tagName(result.stop_reason), if (model_failure) |*detail| detail else null);
+        web_session.announceRunFinished(wb, @tagName(result.stop_reason), if (model_failure) |*detail| detail else null);
         reapAgentDone(app, &be, host.id, infra); // 本轮内完成的后台 job → 发 done
 
         // abort 复位:user_interrupt(前端 Stop)复位继续下一条;user_ctrl_c(host 停)由循环条件

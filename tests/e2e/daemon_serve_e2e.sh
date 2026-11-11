@@ -117,8 +117,11 @@ grep -q '"session_id"' <<<"$state" || fail "/state with the token failed"
 ack="$("${CURL[@]}" "${auth[@]}" -X POST "$url/message" -H "Origin: $url" -d '{"text":"with token"}')"
 grep -q '"ok":true' <<<"$ack" || fail "/message with the token not accepted: $ack"
 events="$(events_until '"run_done".*end_turn' "$url/events?token=$token")" || fail "SSE with ?token= did not stream: $events"
-grep -q '"user_message":"with token"' <<<"$events" || fail "the authenticated message is missing from the stream"
-if grep -q '"user_message":"query"' <<<"$events"; then fail "the query-authenticated POST had an effect"; fi
+grep -q '"type":"user_message","data":{"run_id":[0-9]*,"trace_id":null,"text":"with token"' <<<"$events" ||
+  fail "the authenticated message is missing from the stream"
+if grep -q '"type":"user_message","data":{"run_id":[0-9]*,"trace_id":null,"text":"query"' <<<"$events"; then
+  fail "the query-authenticated POST had an effect"
+fi
 # The trace surface sits behind the same token.
 [[ "$(http_code "$url/spans")" == 401 ]] || fail "/spans without a token is not 401"
 [[ "$(http_code "$url/trace")" == 401 ]] || fail "/trace without a token is not 401"

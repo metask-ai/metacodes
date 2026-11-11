@@ -640,7 +640,7 @@ pub const MultiDaemon = struct {
         slot.wb.abort = &slot.app.abort;
         slot.wb.usage_totals = &slot.app.usage;
         slot.dctx = .{ .app = slot.app, .wb = &slot.wb };
-        slot.config_sink = .{ .journal = &host.journal, .alloc = md.gpa };
+        slot.config_sink = .{ .wb = &slot.wb };
         slot.state_src = .{ .app = slot.app, .wb = &slot.wb, .cmdbox = &host.cmdbox, .journal = &host.journal, .generating = &host.generating };
         slot.app.setConfigEventSink(slot.config_sink.sink());
         slot.app.permission_ctx.ui_requester = slot.wb.requester();
