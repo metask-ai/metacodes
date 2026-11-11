@@ -23,9 +23,12 @@ metacodes-core 是一个**无 UI、无 CLI** 的 LLM 编码-agent 引擎。它�
 
 ### 1.1 四条 load-bearing 设计不变式(前端开发者必须知道)
 
-1. **core↔UI 物理隔离**。`src/lib.zig` 可达的模块图够不到 `repl/`、`tui/`、`app.zig`、
-   `main.zig`。`zig build test:lib`(refAllDecls 编全图)是**编译器证明**——前端再多,core
-   不被污染,core 不依赖任何前端。
+1. **core↔UI 隔离**。`src/lib.zig` 的 import 闭包不得进入应用侧(`repl/`、`web/`、
+   `daemon/`、`app/`、`main.zig`、`app.zig`、`session_service.zig`、`session_intent.zig`)。
+   `zig build test:lib` 只证明库能单独编译:惰性分析不编译没人调用的 import,证明不了隔离。
+   `zig build subsystem:boundary`(`scripts/subsystem_boundary_gate.zig`)在源码层沿每条
+   `@import`(含函数体与 test 块)检查这条规则;现存的几条边记在只减不增的 baseline 里,
+   `src/core/` 没有 baseline。前端再多,core 不被污染,core 不依赖任何前端。
 
 2. **窄腰协议(narrow waist)**。core↔UI 全部走 `UiBackend` 的 **emit/poll 两个函数指针** +
    一个**全可序列化**的 `CoreEvent`/`UiEvent` union。无指针、无闭包穿过协议 → 同一协议可进程内
@@ -1015,11 +1018,13 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
 ```bash
 zig build                 # 主二进制(含 TUI 前端)
 zig build test            # 全单测(含协议/工具/权限)
-zig build test:lib        # ★ refAllDecls 编 core 全图 = core↔UI 物理隔离的编译器证明
+zig build test:lib        # refAllDecls 编 core 的公开声明 = 库能单独编译
+zig build subsystem:boundary  # ★ core 的 import 闭包够不到应用侧(源码层检查)
 zig build example         # 跑 example/ 最小前端(真端点;离线见 LIB_API.md §1)
 ```
 
-**`zig build test:lib` 绿 = core 不依赖任何前端**——这是平台内核最该守的不变式,每次改 core 后必跑。
+**`zig build subsystem:boundary` 绿 = core 不依赖任何前端**——这是平台内核最该守的不变式,每次改 core 后必跑
+(`zig build test` 经 `test:units` 也会跑它)。
 
 ---
 
