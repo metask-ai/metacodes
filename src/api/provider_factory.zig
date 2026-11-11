@@ -271,7 +271,7 @@ test "provider factory limits inherit and defaults remain provider specific" {
     var catalog = @import("catalog.zig").Catalog.init(a);
     defer catalog.deinit();
     try catalog.loadFromModelsListJson("{\"data\":[{\"id\":\"GLM-5.2\",\"max_tokens\":64000,\"max_input_tokens\":1048576}]} ");
-    var context = @import("../app/model_context.zig").ModelContext.init(a);
+    var context = @import("model_context.zig").ModelContext.init(a);
     defer context.deinit();
     context.parse("[models]\n\"gpt-5\" = 400000\n");
 
