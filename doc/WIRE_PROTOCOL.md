@@ -105,7 +105,7 @@ is one JSON object of string values, in the order submitted. `text` stays
 the submitted text when a submission template shaped what the provider saw
 ([API.md](API.md#sessionhost-a-multi-session-service-for-network-hosts)).
 Only `SessionHost` takes typed submissions so far: `--web` and `serve`
-never write these fields.
+refuse an `idempotency_key` and never write these fields.
 
 ```text
 {"v":1,"type":"user_message","data":{"run_id":8,"trace_id":null,"text":"heart rate high","replaces":null,"source":"device:hr-01","kind":"telemetry","idempotency_key":"hr-01:seq-42","attributes":{"bpm":"132","unit":"bpm"}}}

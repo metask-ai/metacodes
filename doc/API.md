@@ -949,6 +949,12 @@ three fields with the same checks (replies `{"ok":true}` or
   answered `400 {"error":"invalid permission_mode (...)"}`, a `model` that is
   not a non-empty string `400 {"error":"invalid model: ..."}`, and nothing is
   queued. `200 {"ok":true}` means queued.
+- Other fields are ignored, except `idempotency_key`: these hosts do not
+  de-duplicate yet, so a message carrying one (not `null`) is refused with
+  `400 {"error":"idempotency_key not supported: this host does not de-duplicate messages"}`
+  rather than run once per delivery while the client relies on the key
+  (#447; [`SessionHost`](#sessionhost-a-multi-session-service-for-network-hosts)
+  takes it).
 
 The session's driver takes messages one at a time, after the turn in progress
 and after queued `POST /command`s. For each message it checks the permission

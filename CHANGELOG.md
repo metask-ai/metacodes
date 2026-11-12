@@ -36,6 +36,15 @@ status, compatibility boundaries, and entry points are defined by
   `command_result.message` an appended field
   (`tests/fixtures/wire/v1/host_events.jsonl`).
 
+- **`--web` and `serve` refuse an `idempotency_key` instead of ignoring it**
+  (#447). A message carrying one was accepted and the key dropped, so a
+  retried delivery ran twice while its client believed it was de-duplicated.
+  `POST /message` now answers `400` and the UDS `message` op
+  `{"ok":false,...}`, both with `idempotency_key not supported: this host does
+  not de-duplicate messages`, and nothing is queued; `"idempotency_key":null`
+  still counts as absent, and other unknown fields are still ignored. These
+  hosts take keys once they run on `SessionHost` (#445).
+
 ### Added
 
 - **Typed submissions and a bounded inbox on `SessionHost`** (#447).
