@@ -86,6 +86,7 @@ const util_json = @import("../../util/json.zig");
 const PermissionChoice = @import("permission_choice.zig").PermissionChoice;
 const prompt_sections = @import("../prompt_sections.zig");
 const goal = @import("../goal.zig");
+const typed_submission = @import("../typed_submission.zig");
 
 const CoreEvent = ui_event.CoreEvent;
 const UiRequest = ui_request.UiRequest;
@@ -130,13 +131,8 @@ pub const RunContext = struct {
 
 /// Events a session service emits around the kernel's. Borrowed slices.
 pub const HostEvent = union(enum) {
-    /// A queued submission became the input of Run `run_id`. `replaces` is
-    /// the 1-based position of the user message it was submitted to replace
-    /// (edit-and-rerun): that message and everything after it leave the
-    /// conversation before the Run, unless `run_done` names the refusal
-    /// (`PositionOutOfRange`, `NotUserMessage`, `PositionCompacted`). Null
-    /// when the text is appended after the whole conversation.
-    user_message: struct { run_id: u64, trace_id: ?[]const u8 = null, text: []const u8, replaces: ?usize = null },
+    /// A queued submission became the input of Run `run_id` (`UserMessage`).
+    user_message: UserMessage,
     /// Run `run_id` ended: `stop_reason` when it returned, `error_name` when
     /// it failed. `model_error` says why, when the stop was a model failure.
     run_done: struct { run_id: u64, trace_id: ?[]const u8 = null, stop_reason: ?[]const u8 = null, error_name: ?[]const u8 = null, model_error: ?@import("../../api/model_error.zig").Detail.View = null },
@@ -162,6 +158,28 @@ pub const HostEvent = union(enum) {
     /// takes the place of `user_message` as the Run's first line, and
     /// `trace_id` is the suspended Run's.
     run_resumed: struct { run_id: u64, trace_id: ?[]const u8 = null, request_id: u64 },
+};
+
+/// `user_message`'s payload. `text` is the submitted text. `replaces` is the
+/// 1-based position of the user message it was submitted to replace
+/// (edit-and-rerun): that message and everything after it leave the
+/// conversation before the Run, unless `run_done` names the refusal
+/// (`PositionOutOfRange`, `NotUserMessage`, `PositionCompacted`). Null when
+/// the text is appended after the whole conversation.
+///
+/// A typed submission (#447) adds `source`, `kind`, `idempotency_key` and
+/// `attributes` (one JSON object), appended under doc/WIRE_PROTOCOL.md §4's
+/// additive rule 2. Each is written only when the submission had it, so the
+/// line of a submission without them keeps its bytes.
+pub const UserMessage = struct {
+    run_id: u64,
+    trace_id: ?[]const u8 = null,
+    text: []const u8,
+    replaces: ?usize = null,
+    source: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    idempotency_key: ?[]const u8 = null,
+    attributes: []const typed_submission.Attribute = &.{},
 };
 
 /// The `type`s of the lines this module writes or reads besides the event
@@ -248,7 +266,37 @@ fn writeHostEventTo(json: *std.json.Stringify, event: HostEvent) std.json.String
     try json.write(@tagName(event));
     try json.objectField("data");
     switch (event) {
+        .user_message => |message| try writeUserMessage(json, message),
         inline else => |payload| try json.write(payload),
+    }
+    try json.endObject();
+}
+
+fn writeUserMessage(json: *std.json.Stringify, message: UserMessage) std.json.Stringify.Error!void {
+    try json.beginObject();
+    try json.objectField("run_id");
+    try json.write(message.run_id);
+    try json.objectField("trace_id");
+    try json.write(message.trace_id);
+    try json.objectField("text");
+    try json.write(message.text);
+    try json.objectField("replaces");
+    try json.write(message.replaces);
+    if (message.source) |source| {
+        try json.objectField("source");
+        try json.write(source);
+    }
+    if (message.kind) |kind| {
+        try json.objectField("kind");
+        try json.write(kind);
+    }
+    if (message.idempotency_key) |key| {
+        try json.objectField("idempotency_key");
+        try json.write(key);
+    }
+    if (message.attributes.len != 0) {
+        try json.objectField("attributes");
+        try typed_submission.writeAttributes(json, message.attributes);
     }
     try json.endObject();
 }

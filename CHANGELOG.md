@@ -36,7 +36,35 @@ status, compatibility boundaries, and entry points are defined by
   `command_result.message` an appended field
   (`tests/fixtures/wire/v1/host_events.jsonl`).
 
+- **`--web` and `serve` refuse an `idempotency_key` instead of ignoring it**
+  (#447). A message carrying one was accepted and the key dropped, so a
+  retried delivery ran twice while its client believed it was de-duplicated.
+  `POST /message` now answers `400` and the UDS `message` op
+  `{"ok":false,...}`, both with `idempotency_key not supported: this host does
+  not de-duplicate messages`, and nothing is queued; `"idempotency_key":null`
+  still counts as absent, and other unknown fields are still ignored. These
+  hosts take keys once they run on `SessionHost` (#445).
+
 ### Added
+
+- **Typed submissions and a bounded inbox on `SessionHost`** (#447).
+  `Submission` gains `source`, `kind`, `attributes` and `idempotency_key`. One
+  key is one Run: a delivery whose key is queued, running, or whose Run
+  started within `Options.idempotency_retention_ms` (24 h) is refused with
+  `error.DuplicateSubmission`, and the same key on a different submission with
+  `error.IdempotencyKeyReused`. Started keys are kept in the session
+  directory (`idempotency.jsonl`), so a Host that reopens the Session after a
+  restart refuses them too; a key is spent only when its Run starts, so a
+  delivery the restart dropped from the queue may be sent again. A full queue
+  refuses with `error.QueueFull` after duplicates are answered and holds
+  nothing, and `Snapshot.max_queued` reports the bound next to `queued`.
+  `source`, `kind`, `attributes` and the key are echoed on the Run's
+  `user_message`, as appended fields written only when given, so other lines
+  keep their bytes (`tests/fixtures/wire/v1/host_events.jsonl`). They reach
+  the provider only through `OpenSpec.submission_template` (`{{text}}`,
+  `{{source}}`, `{{kind}}`, `{{attributes}}`); without one the provider
+  receives the text's bytes, as before. `serve` and `--web` take typed
+  submissions once they run on `SessionHost` (#445).
 
 - **A stream retry budget for AgentCore Hosts** (#452). A reasoning model
   streams thinking first, so a gateway stream that breaks off has almost always
@@ -67,6 +95,21 @@ status, compatibility boundaries, and entry points are defined by
   (`Session.rewind_to_user_message`) and Node (`Session.rewindToUserMessage`)
   packages and the source-free consumers move to revision 27; AgentCore
   0.15.0-dev.
+- **`SessionHost` feeds a team lead its teammates' replies** (part of #445).
+  A lead Session (`SessionConfig.team` with the lead role) hosted on
+  `core/session_host.zig` never saw a member's `SendMessage`: the inbox is
+  driver-owned state, so no Host thread could read it safely, while the
+  bundled daemon's `App` lead takes each reply as its next turn. Now the
+  driver of an idle lead whose team exists reads the lead inbox at most every
+  `session_host.lead_inbox_poll_ms` (500 ms, the daemon's interval) and queues
+  the reply as the lead's next Run, journaled like any other (`user_message`,
+  kernel events, `run_done`). This is the first of the `App` dependencies the
+  daemon needs an `AgentSession` counterpart for before it can run on the one
+  `SessionHost`. `zig build subsystem:boundary` now also holds that move to a
+  ratchet: no file under `src/daemon/` or `src/web/` may import
+  `src/core/agent_loop.zig` beyond the two that do today
+  (`daemon/app_driver.zig`, `web/session.zig`), and a baseline entry whose
+  import is gone fails until it is deleted.
 
 - **The UDS binding answers UI requests and takes capability frames.** A
   UDS-only frontend needed HTTP beside the socket for exactly the most

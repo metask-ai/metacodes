@@ -844,3 +844,91 @@ test "L2 #408 a hosted Run's run_done carries its model failure, and the next Ru
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"api_error\",\"error_name\":null,\"model_error\":{\"category\":\"payment_required\",\"code\":\"insufficient_balance\",\"type\":null,\"message\":\"Top up\",\"http_status\":402,\"request_id\":\"req-hosted-1\",\"retry\":\"not_retryable\",\"retry_after_ms\":null,\"attempts\":1,\"truncated\":false}}"));
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"data\":{\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\",\"error_name\":null,\"model_error\":null}"));
 }
+
+fn toolSse(comptime id: []const u8, comptime name: []const u8, comptime input_json: []const u8) []const u8 {
+    return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"" ++ id ++ "\",\"name\":\"" ++ name ++ "\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"" ++ input_json ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+}
+
+test "L2 #445 SessionHost: a hosted team lead's next Run is its teammate's reply, as on the bundled daemon" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const formed = try textSse(a, "formed");
+    defer a.free(formed);
+    const ack = try textSse(a, "ack");
+    defer a.free(ack);
+    // Run 1: TeamCreate crew, then answer. Run 2 is the teammate's reply.
+    const lead_bodies = [_][]const u8{ toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"), formed, ack };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    const member_bodies = [_][]const u8{
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    var lead_config = baseConfig(lead_url, root, root, &.{ "TeamCreate", "SendMessage" });
+    lead_config.permission_mode = .bypass_permissions;
+    lead_config.workspace = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    lead_config.team = .{ .role = .lead, .team_name = "" };
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 1);
+    // An empty inbox starts nothing, however often it is read.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"type\":\"user_message\""));
+    try std.testing.expectEqual(@as(usize, 2), lead_srv.requestCount());
+
+    // The member, opened on the same host, reports to the lead.
+    var member_config = baseConfig(member_url, root, root, &.{"SendMessage"});
+    member_config.permission_mode = .bypass_permissions;
+    member_config.workspace = lead_config.workspace;
+    const lease = cc.session_id.gen();
+    member_config.team = .{
+        .role = .member,
+        .team_name = "crew",
+        .member_name = "solver",
+        .lead_session_id = lead.id.asSlice(),
+        .member_lease = lease.asSlice(),
+    };
+    const member = try host.open(.{ .config = member_config });
+    defer host.release(member);
+    try member.submit(.{ .text = "work and report" });
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+
+    // Nobody submits to the lead: its driver takes the reply as Run 2, and
+    // the provider request carries it.
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":2"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "done: 42"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+    try std.testing.expectEqual(@as(usize, 3), lead_srv.requestCount());
+    const request = lead_srv.requestAt(2).?;
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "done: 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "solver") != null);
+
+    // The mail was taken once: the lead does not run it again.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&lead.journal, "\"type\":\"user_message\""));
+}

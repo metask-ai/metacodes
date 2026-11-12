@@ -10,7 +10,17 @@
 //! from the kernel's own parts — `AgentRuntime`/`AgentSession`,
 //! `EventJournal` (seq + epoch), `protocol.wire` lines and
 //! `transcript.sessionDir` — so each Host does not rebuild them.
-//! Authentication, tenancy, idempotency and the transport stay with the Host.
+//! Authentication, tenancy and the transport stay with the Host.
+//!
+//! A submission may be typed (#447, core/typed_submission.zig): its
+//! `source`, `kind` and `attributes` are echoed on its `user_message` and
+//! reach the provider only through the Session's submission template. Its
+//! `idempotency_key` makes repeated deliveries one Run: a key already queued,
+//! running or started within `idempotency_retention_ms` is refused as
+//! `error.DuplicateSubmission`, also by a Host that resumed the Session after
+//! a restart (core/idempotency_ledger.zig, kept in the session directory).
+//! A full queue refuses before anything is held, so a refused delivery can
+//! be retried; `Snapshot` reports the depth and the bound.
 //!
 //! A Host whose client opens the channel with a capability frame
 //! (doc/WIRE_PROTOCOL.md §2) hands it to `declareCapabilities`; from then on
@@ -36,6 +46,12 @@
 //! then send this" happens in that order and only while the Session is idle.
 //! `interrupt` is the one cross-thread call into the kernel; its abort is
 //! built for that.
+//!
+//! A team lead (`SessionConfig.team` with the lead role, once its team
+//! exists) is fed its inbox the way the bundled daemon feeds an `App` lead
+//! (#277, #445): while its queue is empty the driver reads the lead inbox at
+//! most every `lead_inbox_poll_ms`, and a teammate's reply becomes the lead's
+//! next Run, queued behind the work already there.
 //!
 //! Lifetimes: `open` and `acquire` return a counted reference that `release`
 //! gives back; no pointer escapes without one. `close` takes the Session out
@@ -69,9 +85,16 @@ const frontend_capabilities = @import("protocol/frontend_capabilities.zig");
 const session_id_mod = @import("session_id.zig");
 const types = @import("../types.zig");
 const prompt_sections = @import("prompt_sections.zig");
+const typed_submission = @import("typed_submission.zig");
+const idempotency_ledger = @import("idempotency_ledger.zig");
 const permission_settings = @import("../permission/settings.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
+const swarm_tools = @import("../swarm/tools.zig");
+
+/// How often an idle team lead's inbox, a locked file, is read: the bundled
+/// daemon's `session_service.LeadMail.POLL_MS`.
+pub const lead_inbox_poll_ms: u64 = 500;
 
 const AgentRuntime = agent_session.AgentRuntime;
 const AgentSession = agent_session.AgentSession;
@@ -98,6 +121,13 @@ pub const Options = struct {
     /// How long a UI request waits for `respond`. Null waits until
     /// `interrupt` or `close`. An expired request gets `ui_request_expiry`.
     ui_request_timeout_ms: ?u64 = null,
+    /// How long after its Run started an idempotency key still makes a
+    /// delivery a duplicate. With `transcripts`, the keys outlive the Host:
+    /// a Session opened again under its id (resumed or fresh) keeps them.
+    idempotency_retention_ms: u64 = 24 * std.time.ms_per_hour,
+    /// Started idempotency keys kept per Session; beyond it the oldest is
+    /// forgotten first.
+    idempotency_max_keys: usize = 10_000,
 };
 
 pub const OpenMode = enum {
@@ -115,12 +145,22 @@ pub const OpenSpec = struct {
     /// Null generates an id (fresh only).
     id: ?SessionId = null,
     mode: OpenMode = .fresh,
+    /// How a submission becomes its Run's user message (#447). Null: the
+    /// text alone, byte for byte, so `source`, `kind` and `attributes` never
+    /// reach the provider. Otherwise `{{text}}`, `{{source}}`, `{{kind}}` and
+    /// `{{attributes}}` are substituted (`typed_submission.render`); any
+    /// other `{{` refuses the open (`error.InvalidSubmissionTemplate`).
+    /// Copied.
+    submission_template: ?[]const u8 = null,
 };
 
 /// `suspended` (#446): a Run ended `suspended` on UI request
 /// `Snapshot.pending_request_id` (`Options.ui_request_wait = .suspend`);
 /// nothing else runs until that request is answered, interrupted or expires.
 pub const Phase = enum { idle, running, suspended, poisoned, closing };
+
+/// One of a typed submission's `attributes` (#447).
+pub const Attribute = typed_submission.Attribute;
 
 pub const Submission = struct {
     text: []const u8,
@@ -133,6 +173,16 @@ pub const Submission = struct {
     /// cannot be rerun fails the Run with its `RewindError` name and changes
     /// nothing. Null appends `text` after the whole conversation.
     replaces: ?MessagePosition = null,
+    /// Typed submission (#447; rules in core/typed_submission.zig): echoed
+    /// on `user_message`, and seen by the provider only as the Session's
+    /// submission template renders them.
+    source: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    attributes: []const Attribute = &.{},
+    /// One Run per key: see `SubmitError.DuplicateSubmission`. The key is
+    /// spent when its Run starts, whatever the Run then does; to try again,
+    /// submit under a new key.
+    idempotency_key: ?[]const u8 = null,
 };
 
 /// A configuration change applied by the driver between Runs, in queue
@@ -148,6 +198,18 @@ pub const Command = union(enum) {
 };
 
 pub const EnqueueError = error{ QueueFull, SessionClosed, SessionPoisoned, OutOfMemory };
+/// `submit`'s refusals. Nothing is queued or held by any of them.
+pub const SubmitError = EnqueueError || typed_submission.Invalid || error{
+    /// The idempotency key was accepted before with the same submission:
+    /// it is queued, running, or its Run started within
+    /// `idempotency_retention_ms`. That delivery's Run answers for this one,
+    /// so a transport reports it as accepted. Checked before the queue
+    /// bound: a retry of accepted work is never told to back off.
+    DuplicateSubmission,
+    /// The idempotency key was accepted before for a different submission
+    /// (its text, source, kind, attributes or `replaces` differ).
+    IdempotencyKeyReused,
+};
 pub const RespondError = error{
     /// No request with this id is open: never announced, closed, or
     /// cancelled by an interrupt, a close or its expiry.
@@ -240,7 +302,10 @@ pub const Snapshot = struct {
     model: []const u8,
     permission_mode: types.PermissionMode,
     reasoning_effort: ?types.ReasoningEffort,
+    /// Submissions and commands waiting, and the bound (`Options.max_queued`)
+    /// at which `submit` and `command` refuse with `error.QueueFull`.
     queued: usize,
+    max_queued: usize,
     seq: usize,
     epoch: [16]u8,
     pending_request_id: u64,
@@ -304,6 +369,7 @@ pub const SessionHost = struct {
         if (self.options.ui_request_wait == .@"suspend" and !self.options.transcripts) return error.SuspendRequiresTranscripts;
         if (spec.config.ui_requester != null or spec.config.run_ui_requester != null) return error.UiRequesterNotAllowed;
         if (spec.mode == .@"resume" and spec.id == null) return error.IdRequiredForResume;
+        if (spec.submission_template) |template| try typed_submission.checkTemplate(template);
         if (spec.id) |id| {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -315,6 +381,8 @@ pub const SessionHost = struct {
         errdefer self.gpa.destroy(hosted);
         const model = try self.gpa.dupe(u8, spec.config.model);
         errdefer self.gpa.free(model);
+        const template = if (spec.submission_template) |text| try self.gpa.dupe(u8, text) else null;
+        errdefer if (template) |text| self.gpa.free(text);
         hosted.* = .{
             .host = self,
             .gpa = self.gpa,
@@ -323,8 +391,12 @@ pub const SessionHost = struct {
             .journal = EventJournal.init(self.gpa),
             .model = model,
             .reasoning_effort = spec.config.reasoning_effort,
+            .max_queued = self.options.max_queued,
+            .submission_template = template,
+            .ledger = .init(self.gpa, self.options.idempotency_retention_ms, self.options.idempotency_max_keys),
         };
         errdefer hosted.journal.deinit();
+        errdefer hosted.ledger.deinit();
 
         var config = spec.config;
         config.ui_requester = .{ .ctx = hosted, .requestFn = HostedSession.requestUi };
@@ -369,6 +441,9 @@ pub const SessionHost = struct {
             }
         }
         errdefer if (hosted.writer) |*writer| writer.deinit();
+        // The keys belong to the id, not to one conversation: a fresh open
+        // under a reused id keeps them, as a delivery that ran stays run.
+        if (hosted.writer) |*writer| try hosted.ledger.load(writer.dir, wallMs());
 
         // UI requests (#446): the policies, read by a shell that outlives the
         // SessionHost too, and what the Session's directory kept.
@@ -585,10 +660,19 @@ pub const HostedSession = struct {
     suspension: ?*Suspension = null,
     /// What the client declared it renders; empty until `declareCapabilities`.
     capabilities: frontend_capabilities.Slot = .{},
+    /// `Options.max_queued`, for a `snapshot` of a shell that outlived its
+    /// SessionHost.
+    max_queued: usize,
+    /// `OpenSpec.submission_template`, owned.
+    submission_template: ?[]u8 = null,
+    /// Idempotency keys (#447): entries under `mutex`, the file the driver's.
+    ledger: idempotency_ledger.Ledger,
 
     // Driver-only.
     last_run_id: u64 = 0,
     last_compact_id: u64 = 0,
+    /// When an idle team lead's inbox is read next (`util_time.nowNs`).
+    next_lead_poll_ns: i128 = 0,
 
     /// Gives back a reference from `open` or `acquire`; the last one of a
     /// closed Session frees it. Valid after `SessionHost.deinit`.
@@ -601,7 +685,9 @@ pub const HostedSession = struct {
         if (free_now) self.destroyShell();
     }
 
-    pub fn submit(self: *HostedSession, submission: Submission) EnqueueError!void {
+    pub fn submit(self: *HostedSession, submission: Submission) SubmitError!void {
+        const fields = typedFields(submission);
+        try typed_submission.validate(fields);
         const work = try self.newWork();
         errdefer self.freeWork(work);
         const a = work.arena.allocator();
@@ -609,8 +695,36 @@ pub const HostedSession = struct {
             .text = try a.dupe(u8, submission.text),
             .trace_id = if (submission.trace_id) |trace_id| try a.dupe(u8, trace_id) else null,
             .replaces = submission.replaces,
+            .source = if (submission.source) |source| try a.dupe(u8, source) else null,
+            .kind = if (submission.kind) |kind| try a.dupe(u8, kind) else null,
+            .attributes = try typed_submission.dupeAttributes(a, submission.attributes),
+            .idempotency_key = if (submission.idempotency_key) |key| try a.dupe(u8, key) else null,
         } };
-        try self.enqueue(work);
+        const key = submission.idempotency_key orelse return self.enqueue(work);
+        try self.enqueueKeyed(work, key, typed_submission.digest(fields));
+    }
+
+    /// `enqueue` holding `key` as pending under the same lock, so of two
+    /// racing deliveries exactly one is queued. A duplicate is refused before
+    /// the queue bound, and a delivery refused for the bound holds nothing.
+    fn enqueueKeyed(self: *HostedSession, work: *Work, key: []const u8, digest: typed_submission.Digest) SubmitError!void {
+        const now = wallMs();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.closing) return error.SessionClosed;
+        if (self.phase == .poisoned) return error.SessionPoisoned;
+        switch (self.ledger.check(key, digest, now)) {
+            .new => {},
+            .duplicate => return error.DuplicateSubmission,
+            .reused => return error.IdempotencyKeyReused,
+        }
+        if (self.queue.items.len >= self.host.options.max_queued) return error.QueueFull;
+        try self.ledger.accept(key, digest);
+        self.queue.append(self.gpa, work) catch |err| {
+            self.ledger.forget(key);
+            return err;
+        };
+        self.work_ready.signal();
     }
 
     pub fn command(self: *HostedSession, cmd: Command) EnqueueError!void {
@@ -763,6 +877,7 @@ pub const HostedSession = struct {
             .permission_mode = if (self.closing) self.final_permission_mode else self.session.permission_ctx.modeValue(),
             .reasoning_effort = self.reasoning_effort,
             .queued = self.queue.items.len,
+            .max_queued = self.max_queued,
             .seq = self.journal.count(),
             .epoch = self.journal.epochHex(),
             .pending_request_id = self.pending_request_id,
@@ -805,7 +920,11 @@ pub const HostedSession = struct {
                 continue;
             }
             if (self.closing) return null;
-            if (self.queue.items.len > 0 and self.phase != .poisoned) {
+            if (self.phase == .poisoned) {
+                self.work_ready.wait(&self.mutex);
+                continue;
+            }
+            if (self.queue.items.len > 0) {
                 const work = self.queue.orderedRemove(0);
                 if (work.item == .submission) {
                     self.phase = .running;
@@ -815,8 +934,48 @@ pub const HostedSession = struct {
                 }
                 return work;
             }
-            self.work_ready.wait(&self.mutex);
+            if (!self.leadsTeam()) {
+                self.work_ready.wait(&self.mutex);
+                continue;
+            }
+            const now = util_time.nowNs();
+            if (now < self.next_lead_poll_ns) {
+                _ = self.work_ready.timedWait(&self.mutex, @intCast(self.next_lead_poll_ns - now));
+                continue;
+            }
+            self.next_lead_poll_ns = now + @as(i128, lead_inbox_poll_ms) * std.time.ns_per_ms;
+            // The inbox is a locked file: read it without holding the Session.
+            self.mutex.unlock();
+            const mail = self.takeLeadMail();
+            self.mutex.lock();
+            if (mail) |work| self.queue.append(self.gpa, work) catch {
+                log.warn("session_host", "dropped teammate mail for {s} (OOM)", .{self.id.asSlice()});
+                self.freeWork(work);
+            };
         }
+    }
+
+    /// True for a team lead whose team exists. Driver-only: its Runs are what
+    /// create and delete the team.
+    fn leadsTeam(self: *const HostedSession) bool {
+        const swarm = if (self.session.swarm) |*swarm| swarm else return false;
+        return swarm.is_lead and swarm.hasTeam();
+    }
+
+    /// The lead inbox's unread mail as a submission, or null when there is
+    /// none. Mail it returns is marked read. Driver-only.
+    fn takeLeadMail(self: *HostedSession) ?*Work {
+        const work = self.newWork() catch return null;
+        const text = swarm_tools.pollLeadInbox(work.arena.allocator(), &self.session.swarm.?) catch |err| {
+            log.warn("session_host", "lead inbox of {s} unreadable: {s}", .{ self.id.asSlice(), @errorName(err) });
+            self.freeWork(work);
+            return null;
+        } orelse {
+            self.freeWork(work);
+            return null;
+        };
+        work.item = .{ .submission = .{ .text = text } };
+        return work;
     }
 
     fn freeWork(self: *HostedSession, work: *Work) void {
@@ -852,7 +1011,25 @@ pub const HostedSession = struct {
             .trace_id = context.trace_id,
             .text = submission.text,
             .replaces = if (submission.replaces) |position| position.ordinal() else null,
+            .source = submission.source,
+            .kind = submission.kind,
+            .idempotency_key = submission.idempotency_key,
+            .attributes = submission.attributes,
         } });
+        if (submission.idempotency_key) |key| self.startKey(key) catch |err| {
+            self.finishRun(context, null, err, null);
+            return;
+        };
+        // Without a template the Run's input is the submitted text, byte for
+        // byte: nothing typed reaches the provider.
+        const rendered: ?[]u8 = if (self.submission_template) |template|
+            typed_submission.render(self.gpa, template, typedFields(submission)) catch |err| {
+                self.finishRun(context, null, err, null);
+                return;
+            }
+        else
+            null;
+        defer if (rendered) |input| self.gpa.free(input);
 
         var scope = RunScope{ .hosted = self, .context = context };
         // An interrupt of the previous Run may still be inside the provider's
@@ -880,7 +1057,7 @@ pub const HostedSession = struct {
             self.releaseUi();
         }
 
-        const outcome = admitted.runText(submission.text, self.host.options.max_turns);
+        const outcome = admitted.runText(rendered orelse submission.text, self.host.options.max_turns);
         self.mutex.lock();
         self.current_run_id = 0;
         self.run_returned = true;
@@ -911,6 +1088,35 @@ pub const HostedSession = struct {
         const failed_on_model = result.stop_reason == .api_error or result.stop_reason == .max_tokens_exhausted;
         const model_failure = if (failed_on_model) &self.session.last_model_error else null;
         self.finishRun(context, @tagName(result.stop_reason), null, model_failure);
+    }
+
+    /// Spends `key` on the Run starting now: in memory at once, so a delivery
+    /// racing it is a duplicate, then in the ledger file before the Run does
+    /// anything. A key that cannot be written is let go and the Run fails as
+    /// `IdempotencyKeyNotRecorded`: without its record a restarted Host would
+    /// run the delivery again.
+    fn startKey(self: *HostedSession, key: []const u8) error{IdempotencyKeyNotRecorded}!void {
+        const now = wallMs();
+        self.mutex.lock();
+        const entry = self.ledger.start(key, now);
+        self.mutex.unlock();
+        const started = entry orelse return;
+        self.ledger.append(key, started) catch |err| {
+            log.warn("session_host", "idempotency key of {s} not recorded: {s}", .{ self.id.asSlice(), @errorName(err) });
+            self.mutex.lock();
+            self.ledger.forget(key);
+            self.mutex.unlock();
+            return error.IdempotencyKeyNotRecorded;
+        };
+        if (!self.ledger.wantsRewrite()) return;
+        self.mutex.lock();
+        const live = self.ledger.encodeStarted(self.gpa);
+        self.mutex.unlock();
+        // Best effort: an untrimmed file still answers every key it holds.
+        const bytes = live catch return;
+        defer self.gpa.free(bytes);
+        self.ledger.replaceFile(bytes) catch |err|
+            log.warn("session_host", "idempotency ledger of {s} not trimmed: {s}", .{ self.id.asSlice(), @errorName(err) });
     }
 
     fn finishRun(
@@ -1706,10 +1912,28 @@ pub const HostedSession = struct {
     fn destroyShell(self: *HostedSession) void {
         self.capabilities.deinit(self.gpa);
         self.journal.deinit();
+        self.ledger.deinit();
+        if (self.submission_template) |template| self.gpa.free(template);
         self.gpa.free(self.model);
         self.gpa.destroy(self);
     }
 };
+
+fn typedFields(submission: Submission) typed_submission.Fields {
+    return .{
+        .text = submission.text,
+        .source = submission.source,
+        .kind = submission.kind,
+        .idempotency_key = submission.idempotency_key,
+        .attributes = submission.attributes,
+        .replaces = if (submission.replaces) |position| position.ordinal() else null,
+    };
+}
+
+/// Wall-clock milliseconds: idempotency keys outlive the process.
+fn wallMs() i64 {
+    return @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
+}
 
 fn copyCommand(a: std.mem.Allocator, cmd: Command) error{OutOfMemory}!Command {
     return switch (cmd) {

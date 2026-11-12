@@ -960,6 +960,12 @@ journaled, like the HTTP route) or `capabilities_refused`.
   answered `400 {"error":"invalid permission_mode (...)"}`, a `model` that is
   not a non-empty string `400 {"error":"invalid model: ..."}`, and nothing is
   queued. `200 {"ok":true}` means queued.
+- Other fields are ignored, except `idempotency_key`: these hosts do not
+  de-duplicate yet, so a message carrying one (not `null`) is refused with
+  `400 {"error":"idempotency_key not supported: this host does not de-duplicate messages"}`
+  rather than run once per delivery while the client relies on the key
+  (#447; [`SessionHost`](#sessionhost-a-multi-session-service-for-network-hosts)
+  takes it).
 
 The session's driver takes messages one at a time, after the turn in progress
 and after queued `POST /command`s. For each message it checks the permission
@@ -1061,6 +1067,38 @@ leaving every Host to rebuild them:
   carries `"replaces":n`; a refused position ends the Run with `run_done`
   naming it (`PositionOutOfRange`, `NotUserMessage`, `PositionCompacted`)
   and changes nothing.
+- A submission may be typed (#447): `source` (where it came from, such as
+  `im:lark`), `kind` (`[a-z0-9][a-z0-9_.-]*`, such as `telemetry`),
+  `attributes` (name/value strings) and `idempotency_key`. A field outside
+  its bounds (`core/typed_submission.zig`) is refused before anything is
+  queued: `error.InvalidSource`, `InvalidKind`, `InvalidAttributes`,
+  `InvalidIdempotencyKey`. The four are echoed on the Run's `user_message`
+  ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#11-host-events)) and reach the
+  provider only through the Session's template, `open(.{ ...,
+  .submission_template })`: `{{text}}`, `{{source}}`, `{{kind}}` and
+  `{{attributes}}` (one JSON object) are substituted, and any other `{{` is
+  `error.InvalidSubmissionTemplate`. Without a template the Run's input is
+  the text, byte for byte, so the provider-visible bytes, a cache contract,
+  are those of an untyped submission.
+- One idempotency key is one Run. A delivery whose key is queued, running,
+  or whose Run started less than `idempotency_retention_ms` ago (24 h) is
+  refused with `error.DuplicateSubmission`: nothing is queued, and the first
+  delivery's Run answers for it, so a transport reports it as accepted (an
+  HTTP Host: `200` and `"duplicate":true`). The same key on a different
+  submission (text, source, kind, attributes or `replaces`) is
+  `error.IdempotencyKeyReused`. With `transcripts`, started keys are kept in
+  the session directory (`idempotency.jsonl`), so a Host that opens the
+  Session again under its id after a restart, resumed or fresh, refuses them
+  too. A key is spent when its Run starts, whatever the Run then does, and
+  not before: a delivery still queued when the Host stopped may be delivered
+  again. A key that cannot be recorded fails its Run
+  (`IdempotencyKeyNotRecorded`) and stays unspent. At most
+  `idempotency_max_keys` (10 000) started keys are kept; the oldest goes
+  first.
+- The queue holds `max_queued` (64) submissions and commands. Beyond it
+  `submit` and `command` refuse with `error.QueueFull` and hold nothing (an
+  HTTP Host: `429`); a duplicate is answered as one before the bound is
+  checked. `snapshot()` reports `queued` and `max_queued`.
 - `HostedSession.submit` and `command` (`set_model`, `set_permission_mode`,
   `set_reasoning_effort`, `set_additional_directories`, `set_prompt_profile`,
   `update_permission_rules`, `compact`) share one FIFO run by the Session's
@@ -1090,9 +1128,18 @@ leaving every Host to rebuild them:
   so the id can be opened again as soon as it returns. It never waits for
   references: a holder keeps a closed `HostedSession` readable (journal,
   `snapshot`) until its own `release`, which frees it last.
+- A team lead (`SessionConfig.team` with `.role = .lead`, once its team
+  exists) is fed its inbox: while its queue is empty the driver reads it at
+  most every `session_host.lead_inbox_poll_ms` (500 ms) with
+  `swarm_tools.pollLeadInbox`, and a member's reply becomes the lead's next
+  Run, queued behind any work already there and journaled like a submission
+  without a `trace_id`. The bundled daemon does the same for its `App` lead.
+  Fulfilling the lead's `SpawnTeammate` requests is still the Host's: open a
+  member Session (`.role = .member`) on the same SessionHost.
 
-Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`.
-Authentication, tenancy, idempotency and the transport stay with the Host.
+Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`,
+`idempotency_retention_ms`, `idempotency_max_keys`.
+Authentication, tenancy and the transport stay with the Host.
 To stream a Session's journal over SSE, parse the client's position with
 `event_journal.Cursor.fromLastEventId` / `fromSince`, start from
 `EventJournal.planResume(cursor)` (send `resync` when it reports a restart),

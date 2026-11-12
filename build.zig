@@ -2287,7 +2287,9 @@ pub fn build(b: *std.Build) void {
     // subsystem:boundary —— the provider kernel, the picker and the MCP client
     // may import only what their doc comments say, and so may every file they
     // reach; nothing metacodes-core reaches from `src/lib.zig` may import the
-    // application side beyond a baseline that only shrinks (#448). The
+    // application side beyond a baseline that only shrinks (#448), and no
+    // file under `src/daemon/` or `src/web/` may import the AgentLoop beyond
+    // another such baseline (#445). The
     // compile-from-a-narrow-root gates and `test:lib` cannot enforce it: their
     // module root is `src/`, so any file under it is importable, and lazy
     // analysis skips imports in code nothing calls. This checks the rule where
@@ -2310,7 +2312,7 @@ pub fn build(b: *std.Build) void {
     });
     const subsystem_boundary_step = b.step(
         "subsystem:boundary",
-        "Enforce the provider, picker, MCP client and metacodes-core import boundaries (#16, #405, #448)",
+        "Enforce the provider, picker, MCP client, metacodes-core and host import boundaries (#16, #405, #445, #448)",
     );
     subsystem_boundary_step.dependOn(&subsystem_boundary_run.step);
     subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit).step);
