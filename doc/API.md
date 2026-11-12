@@ -903,9 +903,15 @@ holder a Host keeps.
 
 `wire.parseResponse` turns the client's answer (`{"choice":...}`,
 `{"answers":[...]}` or `{"result":...}`) back into a `UiResponse`; anything
-malformed or of another version is answered as a cancellation, never as a
-grant, and closes as `malformed`. An answer that races an interrupt or close
-loses: it is refused or discarded and the request closes as `cancelled`. `tests/fixtures/wire/v1` pins one line for every event tag and request
+malformed or of another version fails as a cancellation, never as a
+grant, and closes as `malformed` (`wire.closedOnParseError`). An answer that
+races an interrupt or close loses: it is refused or discarded and the request
+closes as `cancelled`. A request nobody answered fails through
+`wire.cancelResponse(request, why)`: a permission prompt with the
+`ui_request.Unanswered` error naming the timeout, cancellation or unreadable
+answer, so the model reads that nobody answered instead of that the user
+declined; a question or a custom UI with `InputAborted`
+([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#14-requests-nobody-answered)). `tests/fixtures/wire/v1` pins one line for every event tag and request
 kind, plus capability frames with core's reply to each, and doubles as
 conformance vectors for Hosts in other languages. The bundled `--web` UI
 consumes exactly these lines and declares `permission` and `ask_question`

@@ -9660,7 +9660,8 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
             core.permission.checkPermission(child_ctx, "Edit", "{}"),
         );
         const calls_before_child_prompt = Probe.calls;
-        try std.testing.expect(!try core.permission.promptUser(
+        // A child has no requester: denied without asking anyone (#463).
+        try std.testing.expectError(error.PromptNobodyToAsk, core.permission.promptUser(
             child_ctx,
             "Edit",
             "{}",

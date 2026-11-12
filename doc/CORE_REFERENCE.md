@@ -823,6 +823,12 @@ session)。这是 `requestUi`/`promptUser` 当前的全部行为。
 (AskUserQuestion→NotATty;plan→answer_queue/reject)。参考 `WriterBackend.initNull()` /
 `HeadlessBackend`。
 
+权限 prompt 没人答时(`promptUser` 返 `permission.PromptUnanswered` 错误：无人可问、
+`.pending`/`.unavailable`、requester 失败、超时、被中断/关闭取消、应答读不懂、前端渲染不了),
+照样拒绝，但告诉模型的是原因，不是"user declined"。requester 用 `ui_request.Unanswered`
+(`UiRequestTimedOut`/`UiRequestCancelled`/`UiAnswerUnreadable`)报告超时、取消与读不懂。
+文本与 `recoverable` 见 [WIRE_PROTOCOL.md §1.4](WIRE_PROTOCOL.md#14-requests-nobody-answered)。
+
 ### 5.3 异步前端(IM / 邮件 / 工作流)— 可挂起路径
 
 人类响应延迟 >> 进程寿命(几小时 + 跨重启),活线程无法存活那么久。**协议层已预留**:

@@ -94,7 +94,9 @@ pub const Options = struct {
     /// it.
     transcripts: bool = true,
     /// How long a UI request waits for `respond`. Null waits until
-    /// `interrupt` or `close`. An expired request is answered as cancelled.
+    /// `interrupt` or `close`. An expired request closes as `cancelled`; a
+    /// permission prompt is denied and the model reads that nobody answered
+    /// in time (doc/WIRE_PROTOCOL.md §1.4). The value never reaches the model.
     ui_request_timeout_ms: ?u64 = null,
     /// How long after its Run started an idempotency key still makes a
     /// delivery a duplicate. With `transcripts`, the keys outlive the Host:
@@ -994,7 +996,7 @@ pub const HostedSession = struct {
         // to the kernel lets the prompt be announced and wait for it.
         if (self.ui_released) {
             self.mutex.unlock();
-            return wire.cancelResponse(req, out);
+            return wire.cancelResponse(req, .cancelled);
         }
         const request_id = self.next_request_id;
         self.next_request_id += 1;
@@ -1025,20 +1027,28 @@ pub const HostedSession = struct {
             }
         }
         const response = self.takeResponseLocked();
+        // No answer: an interrupt or close in force cancelled it (and
+        // discarded any answer that raced it); otherwise the deadline passed.
+        const why: wire.NoAnswer = if (self.ui_released or self.run_interrupted or self.closing)
+            .cancelled
+        else
+            .timed_out;
         self.pending_request_id = 0;
         self.mutex.unlock();
 
         if (response) |json| {
             defer self.gpa.free(json);
-            const reading = wire.parseResponse(req, json, allocator, out) catch |err| {
-                self.appendLine(wire.writeRequestClosed(self.gpa, request_id, if (err == error.InputAborted) .malformed else .cancelled));
+            wire.parseResponse(req, json, allocator, out) catch |err| {
+                self.appendLine(wire.writeRequestClosed(self.gpa, request_id, wire.closedOnParseError(err)));
                 return err;
             };
-            self.appendLine(wire.writeRequestClosed(self.gpa, request_id, reading.closed()));
+            self.appendLine(wire.writeRequestClosed(self.gpa, request_id, .answered));
             return .answered;
         }
-        self.appendLine(wire.writeRequestClosed(self.gpa, request_id, .cancelled));
-        return wire.cancelResponse(req, out);
+        // The journal and the requester's error come from the same `why`, so
+        // what the Host records and what the model reads agree.
+        self.appendLine(wire.writeRequestClosed(self.gpa, request_id, why.closed()));
+        return wire.cancelResponse(req, why);
     }
 
     /// The stored answer to the pending request, unless cancellation won: an
@@ -1320,8 +1330,9 @@ test "SessionHost: a pending prompt answered and interrupted at once is cancelle
     defer thread.join();
     const request = ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var response: ui_request.UiResponse = undefined;
-    try std.testing.expectEqual(ui_request.RequestOutcome.answered, try HostedSession.requestUi(hosted, hosted.id, a, &request, &response));
-    try std.testing.expectEqual(ui_request.PermissionChoice.deny_once, response.permission);
+    // Cancelled, not answered: the allow is discarded and nobody's deny is
+    // invented in its place.
+    try std.testing.expectError(error.UiRequestCancelled, HostedSession.requestUi(hosted, hosted.id, a, &request, &response));
     try waitForLine(&hosted.journal, "\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"cancelled\"");
     hosted.mutex.lock();
     hosted.run_interrupted = false;

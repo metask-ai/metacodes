@@ -165,6 +165,49 @@ not the session: SSE sends the same two signals as a comment and a named
 event, outside its journal frames. A `v` would also make them look like
 journal lines, which a reader would then count.
 
+### 1.4 Requests nobody answered
+
+A request can close without the client's answer: `SessionHost`'s
+`ui_request_timeout_ms` runs out, an interrupt or a close cancels it, or the
+answer cannot be read. The Host journals `ui_request_closed` with `outcome`
+`cancelled` (timeout, interrupt, close) or `malformed` (unreadable), and
+nothing is granted. A question or a custom UI fails with `InputAborted`, as
+Esc does in the terminal. A permission prompt is denied, and the requester
+reports why (`wire.cancelResponse(request, why)`, `ui_request.Unanswered`),
+so the model is not told the user declined. The tool_result keeps `code`
+`permission_denied`:
+
+| How the prompt ended | `outcome` | The model reads (`detail`) | `recoverable` |
+|---|---|---|---|
+| Timeout | `cancelled` | *"'\<tool\>' did not run: nobody answered its permission request in time. The user did not decline it; you may offer to ask again."* | `true` |
+| Interrupt or close | `cancelled` | *"'\<tool\>' did not run: an interrupt or a close cancelled its permission request before anyone answered. The user did not decline it; you may offer to ask again."* | `true` |
+| Unreadable answer | `malformed` | *"'\<tool\>' was denied: an answer to its permission request arrived but could not be read. This is not the user's decision."* | `false` |
+
+The timeout's length is never in the text, so these bytes do not change
+with the Host's configuration. v1 has no `timed_out` close outcome: adding
+one is a breaking change (§4), so a timeout closes as `cancelled`, as it
+always has; the journal and the tool_result both say that nobody answered.
+
+Prompts that never reach a frontend are told apart the same way, in every
+Host, the in-process ones included:
+
+- Nobody to ask: no requester under `no_interactive_prompt` (headless runs,
+  a subagent), or a requester that answers `unavailable` or `pending` (the
+  permission gate is synchronous and cannot suspend) — *"'\<tool\>' was
+  denied without asking: this session has no way to ask for permission and
+  wait for the answer. This is not the user's decision; the user never saw
+  the request."*
+- The requester failed — *"'\<tool\>' was denied: its permission request
+  failed before anyone answered. This is not the user's decision."*
+- A declared frontend that does not render permission prompts — the
+  `unrenderable` text of §2.2.
+
+All three are `recoverable: false`. Only a person's deny, answered now or
+remembered for the Session, still reads *"user declined '\<tool\>' via
+prompt"*, byte for byte. Evidence: `tests/component/permission_unanswered_test.zig`
+(every cause through a real Run) and the timeout, interrupt and malformed
+cases of `tests/component/session_host_test.zig`.
+
 ## 2. Capability exchange
 
 A frontend states what it can render with one **capability frame**, the first
@@ -265,8 +308,9 @@ would without a UI, but tells the model why, never as the user's answer:
   can never grant a permission.
 
 Every other path keeps its wording: no UI at all is still `NotATty` /
-`CustomUiUnsupported`, and a user who refuses a prompt is still *"user
-declined '<tool>' via prompt"*.
+`CustomUiUnsupported` (a permission prompt with nobody to ask says so, §1.4),
+and a user who refuses a prompt is still *"user declined '<tool>' via
+prompt"*.
 
 A declaration applies to requests made after it is installed. A request
 already announced stays pending and is answered or cancelled as before.
