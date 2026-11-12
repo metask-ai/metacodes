@@ -45,16 +45,18 @@ fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const 
     };
 
     const rg_path = try toolchain.ripgrepPath();
-    const pattern_z = try allocator.dupeZ(u8, pattern);
-    defer allocator.free(pattern_z);
+    // The glob is bound to its flag in one element and the path follows `--`,
+    // so neither can be read as a ripgrep option (#460).
+    const glob_z = try std.fmt.allocPrintSentinel(allocator, "--glob={s}", .{pattern}, 0);
+    defer allocator.free(glob_z);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
     var argv = [_]?[*:0]const u8{
         rg_path.ptr,
         "--files",
         "--no-messages",
-        "--glob",
-        pattern_z.ptr,
+        glob_z.ptr,
+        "--",
         path_z.ptr,
         null,
     };
@@ -177,8 +179,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const rg_path = try toolchain.ripgrepPath();
 
-    const pattern_z = try allocator.dupeZ(u8, pattern);
-    defer allocator.free(pattern_z);
+    // Glob 值绑定在同一 argv 元素里,路径放在 `--` 之后:二者都不可能被 rg 当成选项(#460)。
+    const glob_z = try std.fmt.allocPrintSentinel(allocator, "--glob={s}", .{pattern}, 0);
+    defer allocator.free(glob_z);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
@@ -186,8 +189,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         rg_path.ptr,
         "--files",
         "--no-messages",
-        "--glob",
-        pattern_z.ptr,
+        glob_z.ptr,
+        "--",
         path_z.ptr,
         null,
     };

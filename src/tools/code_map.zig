@@ -255,14 +255,14 @@ fn isGlob(path: []const u8) bool {
 /// 用 rg --files -g <glob> 解析 glob 命中的文件(复用 Glob 工具同款机制)。
 fn listFiles(allocator: std.mem.Allocator, glob: []const u8, ctx: *const ToolContext) ![][]const u8 {
     const rg_path = try toolchain.ripgrepPath();
-    const glob_z = try allocator.dupeZ(u8, glob);
+    // Bound to its flag in one element: a glob can never stand alone as an option (#460).
+    const glob_z = try std.fmt.allocPrintSentinel(allocator, "--glob={s}", .{glob}, 0);
     defer allocator.free(glob_z);
 
     var argv = [_]?[*:0]const u8{
         rg_path.ptr,
         "--files",
         "--no-messages",
-        "--glob",
         glob_z.ptr,
         null,
     };

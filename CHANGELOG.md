@@ -157,6 +157,32 @@ status, compatibility boundaries, and entry points are defined by
   retry that succeeds are unchanged; a local decode failure such as an
   oversized SSE line stays `unknown`.
 
+### Security
+
+- **A Grep pattern can no longer act as a ripgrep option** (#460). Grep is
+  read-only, so `accept_edits` runs it without a prompt and
+  `ShellPolicy.disabled` keeps it available. Both of its execution paths, the
+  direct one and the artifact-capture one that AgentCore uses, and every retry
+  passed `pattern` to ripgrep as a separate argument. A pattern that began with
+  `-` was read as a flag, and `--pre=<program>` made ripgrep run that program
+  on every file it searched, with no approval for running a command. Both
+  paths and every retry now build their arguments with one function. The
+  pattern goes in only as the value of `--regexp=`, the search path comes
+  after `--`, and every other value the model supplies is joined to its flag
+  in a single argument (`--glob=…`, `--type=…`, `--context=…`). A
+  leading-dash pattern now matches its literal text. Two other tools passed
+  model text to ripgrep the same way, and they are fixed too: FindSymbol's
+  `name` (now `--regexp=` plus `--`), and Glob's pattern and path (now
+  `--glob=` plus `--`). CodeMap's glob now joins its flag in one argument as
+  well. `tests/component/grep_option_injection_test.zig` runs the
+  repository-pinned ripgrep, after checking its digest, against both paths.
+  It checks that a `--pre=<script>` pattern returns the literal line on both
+  paths and with an `artifact_id`, and that the script never runs. It reads the
+  result back from the artifact store and checks ordinary regex, `-i`, glob
+  and type filters, context, and line numbers in file and directory searches.
+  It also checks that `accept_edits` still allows Grep while a denied Bash
+  request for the same script leaves no trace.
+
 ## 0.11.0 — 2026-11-06
 
 ### Added

@@ -2564,6 +2564,16 @@ normally deploys that file next to its own executable — a location the probe
 resolves without additional configuration. Hosts that deliberately drop the
 asset must also omit `Glob`/`Grep` from `builtin_tools`.
 
+Model input never reaches ripgrep as an option (#460). `Grep` passes its
+`pattern` only as the value of `--regexp=` and its search path only after
+`--`. It joins every other value the model supplies to its flag in a single
+argument: `--glob=`, `--type=`, and `--before-context=`, `--after-context=`
+and `--context=` for `-B`/`-A`/`-C`. `Glob` passes its pattern as `--glob=`
+and its path after `--`. A pattern that begins with `-`, such as
+`--pre=<program>`, is searched as literal text and runs no program. That is
+why both tools can stay read-only: `accept_edits` runs them without a prompt,
+and `ShellPolicy.disabled` keeps them available.
+
 ### Resource limits
 
 V1 applies these limits to inputs or identities that amplify library
