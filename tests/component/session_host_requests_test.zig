@@ -1182,3 +1182,35 @@ test "L2 #446 SessionHost suspend mode: a request file this version cannot read 
         try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request\",\"id\":9,"));
     }
 }
+
+test "L2 #446 SessionHost suspend mode: the idempotency key of a suspended Run does not expire while it waits" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const thanks = try textSse(a, "thanks");
+    defer a.free(thanks);
+    const bodies = [_][]const u8{ ASK_SSE, thanks, ASK_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &TOOLS });
+    defer runtime.destroy() catch unreachable;
+    // Keys expire at once: only the suspension can keep this one.
+    var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend", .idempotency_retention_ms = 0 });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, dirs.workspace, dirs.home) });
+    defer host.release(hosted);
+
+    try hosted.submit(.{ .text = "ask me", .idempotency_key = "im:evt-1" });
+    try waitFor(&hosted.journal, "\"stop_reason\":\"suspended\"", 1);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    try std.testing.expectError(error.DuplicateSubmission, hosted.submit(.{ .text = "ask me", .idempotency_key = "im:evt-1" }));
+    try expectSnapshot(hosted, .suspended, 1, 0, .none);
+    try hosted.respond(1, "{\"answers\":[\"Ship\"]}");
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"user_message\""));
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+}

@@ -56,6 +56,9 @@ pub const Suspended = struct {
     trace_id: ?[]const u8 = null,
     max_turns: u32,
     stream_retry_budget: u8 = 0,
+    /// The idempotency key the Run was submitted under (#447), held while
+    /// the Run waits.
+    idempotency_key: ?[]const u8 = null,
     /// Wall-clock milliseconds at which the request expires unanswered
     /// (`Options.ui_request_timeout_ms`); null never.
     expires_at_ms: ?i64 = null,
@@ -203,6 +206,7 @@ test "ui_request_store: no file, a round trip with a settled suspension, and wha
         .trace_id = "t-1",
         .max_turns = 40,
         .stream_retry_budget = 2,
+        .idempotency_key = "im:evt-1",
         .expires_at_ms = 1_700_000_000_000,
         .settled = .{ .outcome = .answered, .answer = "{\"answers\":[\"Ship\"]}", .by = "alice" },
     } });
@@ -215,6 +219,7 @@ test "ui_request_store: no file, a round trip with a settled suspension, and wha
     try std.testing.expect(suspended.completed[1].is_error);
     try std.testing.expectEqualStrings("t-1", suspended.trace_id.?);
     try std.testing.expectEqual(@as(u8, 2), suspended.stream_retry_budget);
+    try std.testing.expectEqualStrings("im:evt-1", suspended.idempotency_key.?);
     try std.testing.expectEqual(@as(?i64, 1_700_000_000_000), suspended.expires_at_ms);
     try std.testing.expectEqual(Outcome.answered, suspended.settled.?.outcome);
     try std.testing.expectEqualStrings("alice", suspended.settled.?.by.?);

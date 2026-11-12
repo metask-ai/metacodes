@@ -598,6 +598,10 @@ const RunSettings = struct {
     /// `AdmittedRun.stream_retry_budget` (#452). SessionHost leaves it at 0
     /// (the loop's default) and keeps whatever its Run had.
     stream_retry_budget: u8 = 0,
+    /// The submission's idempotency key (#447): while its Run is suspended
+    /// or resuming, a delivery under it is a duplicate, however old the
+    /// key's ledger entry is.
+    idempotency_key: ?[]const u8 = null,
 };
 
 pub const HostedSession = struct {
@@ -736,7 +740,9 @@ pub const HostedSession = struct {
         if (self.closing) return error.SessionClosed;
         if (self.phase == .poisoned) return error.SessionPoisoned;
         switch (self.ledger.check(key, digest, now)) {
-            .new => {},
+            // The ledger lets a key go after its retention; a suspended
+            // Run's key is held until the Run ends all the same (#446).
+            .new => if (self.heldKeyLocked(key)) return error.DuplicateSubmission,
             .duplicate => return error.DuplicateSubmission,
             .reused => return error.IdempotencyKeyReused,
         }
@@ -1098,6 +1104,7 @@ pub const HostedSession = struct {
             .trace_id = submission.trace_id,
             .max_turns = self.host.options.max_turns,
             .stream_retry_budget = admitted.stream_retry_budget,
+            .idempotency_key = submission.idempotency_key,
         });
     }
 
@@ -1271,6 +1278,17 @@ pub const HostedSession = struct {
         if (self.suspension) |suspension| return suspension.request_id;
         if (self.suspending) |pending| return pending.id;
         return 0;
+    }
+
+    /// Whether `key` is the idempotency key of the Run suspended or being
+    /// resumed. Caller holds `mutex`.
+    fn heldKeyLocked(self: *const HostedSession, key: []const u8) bool {
+        for ([_]?*Suspension{ self.suspension, self.resuming }) |maybe| {
+            const suspension = maybe orelse continue;
+            const held = suspension.settings.idempotency_key orelse continue;
+            if (std.mem.eql(u8, held, key)) return true;
+        }
+        return false;
     }
 
     fn emitHost(self: *HostedSession, event: wire.HostEvent) void {
@@ -1550,6 +1568,7 @@ pub const HostedSession = struct {
             .trace_id = if (settings.trace_id) |trace_id| try a.dupe(u8, trace_id) else null,
             .max_turns = settings.max_turns,
             .stream_retry_budget = settings.stream_retry_budget,
+            .idempotency_key = if (settings.idempotency_key) |key| try a.dupe(u8, key) else null,
         };
         suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| wallMs() +| @as(i64, @intCast(ms)) else null;
         return suspension;
@@ -1680,6 +1699,7 @@ pub const HostedSession = struct {
             .trace_id = held.settings.trace_id,
             .max_turns = held.settings.max_turns,
             .stream_retry_budget = held.settings.stream_retry_budget,
+            .idempotency_key = held.settings.idempotency_key,
             .expires_at_ms = held.expires_at_ms,
             .settled = switch (held.settled) {
                 .open => null,
@@ -1761,6 +1781,7 @@ pub const HostedSession = struct {
             .trace_id = if (record.trace_id) |trace_id| try a.dupe(u8, trace_id) else null,
             .max_turns = record.max_turns,
             .stream_retry_budget = record.stream_retry_budget,
+            .idempotency_key = if (record.idempotency_key) |key| try a.dupe(u8, key) else null,
         };
         suspension.expires_at_ms = record.expires_at_ms;
         // `.re_announce`: the announcement this open makes is one.
