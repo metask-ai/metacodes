@@ -610,12 +610,18 @@ pub fn noteRequestAccepted() void {
 }
 
 /// 流在报告"怎么停的"之前就结束(干净 EOF / 只有 `[DONE]`,却没有 stop_reason、
-/// finish_reason、Responses 终止事件或 finishReason)的统一交代:日志 + last_error 现场。
-/// 这样的流不能当成完整回答——丢的可能正是 max_tokens(issue #269);调用方(agent_loop)
-/// 把它当流内失败,丢弃残片走同轮重试。取消/stall 判定在调用前已排除。四个流解析器共用。
+/// finish_reason、Responses 终止事件或 finishReason)的统一交代:日志 + last_error 现场 +
+/// Run 级明细(`stream_interrupted` / `retryable`,带本次响应头的 status 与 request id,
+/// issue #451)。这样的流不能当成完整回答——丢的可能正是 max_tokens(issue #269);调用方
+/// (agent_loop)把它当流内失败,丢弃残片走同轮重试。取消/stall 判定在调用前已排除。
+/// 四个流解析器共用(Messages、OpenAI chat 与 Responses、Gemini、Bedrock)。
 pub fn reportStreamIncomplete(comptime module: []const u8, rid: log.RequestId) void {
     log.warnId(module, rid, "stream ended before reporting how it stopped (no terminal event): treated as a mid-stream failure", .{});
     last_error.recordNamed("流未完整结束", "响应流在报告停止原因(stop_reason / finish_reason / 终止事件)之前就结束了,回答可能被截断");
+    // The server stated no failure: the stream it accepted just ended. That is
+    // the connection giving no answer, as a drop or a stall is (agent_loop
+    // `isSilentRetryFailure`), so the same request may well succeed.
+    model_error.noteStreamFailure(.stream_interrupted, .retryable, "The response stream ended before it reported how it stopped.");
 }
 
 /// 重试 UI 上报回调(agent_loop 注入,把 attempt/max/delay 渲染成 "Retrying in Ns…")。

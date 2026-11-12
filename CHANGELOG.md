@@ -66,6 +66,20 @@ status, compatibility boundaries, and entry points are defined by
   context-window table moves from `src/app/` to `src/api/model_context.zig`,
   removing seven of the eleven edges; the baseline holds the other four.
 
+- **A stream that ends before it says how it stopped is reported as an
+  interrupted stream** (#451). When an accepted stream ended cleanly without
+  its stop report (no `message_delta.stop_reason` on Messages, no non-null
+  `finish_reason` on Chat Completions, no terminal event on Responses, no
+  `finishReason` on Gemini, no `messageStop` on Bedrock), the Run's
+  `model_error` said `category: unknown`, `retry: unknown` and "The response
+  stream could not be read: StreamIncomplete." It now says
+  `stream_interrupted` and `retryable`, with that response's status and request
+  id and the message "The response stream ended before it reported how it
+  stopped.", as the ABI already documented and as Core's same-turn retry
+  already treated it. The retry, the attempt count and the empty detail after a
+  retry that succeeds are unchanged; a local decode failure such as an
+  oversized SSE line stays `unknown`.
+
 ## 0.11.0 — 2026-11-06
 
 ### Added

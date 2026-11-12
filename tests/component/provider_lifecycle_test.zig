@@ -21,6 +21,9 @@
 //!   ⑥ In a Run, the retry is the existing `retry_notice` event, honours
 //!     Retry-After, and the execution boundary journals two physical attempts
 //!     of one request (the same request_sha256).
+//!   ⑦ A stream that ends cleanly before it reports how it stopped fails the
+//!     Run with the detail `stream_interrupted` / `retryable`, carrying that
+//!     response's status and request id (issue #451).
 //!
 //! Before #434 the OpenAI and Gemini clients made one attempt whatever
 //! max_retries said, answered a 429/503/overflow with RequestFailed, and
@@ -758,4 +761,73 @@ fn runRetriesWithNotice(comptime wire: Wire) !void {
 
 test "L2 provider lifecycle ⑥: in a Run a 503 is retried with retry_notice and two journaled attempts on every wire" {
     try eachWire(runRetriesWithNotice);
+}
+
+// ── ⑦ a stream that ends before its stop report (#451) ───────────────────────
+
+/// Text, then a clean end of body before the wire's stop report: no
+/// `message_delta.stop_reason`, no non-null `finish_reason`, no terminal
+/// Responses event, no `finishReason`, no `messageStop`.
+fn endsBeforeStop(comptime wire: Wire) []const u8 {
+    return switch (wire) {
+        .anthropic => "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        .openai_chat => "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+        .openai_responses => "event: response.output_text.delta\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"partial\"}\n\n",
+        .gemini => "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]},\"index\":0}]}\n\n",
+        .bedrock => &BEDROCK_ENDS_BEFORE_STOP,
+    };
+}
+
+const BEDROCK_ENDS_BEFORE_STOP = awsEvent("messageStart", "{\"role\":\"assistant\"}").* ++
+    awsEvent("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"partial\"}}").*;
+
+const EARLY_END_REQUEST_ID = "req-ended-early";
+
+const EndedEarlyRun = struct {
+    fn run(_: @This(), provider: cc.api_provider.Provider) !void {
+        const a = std.testing.allocator;
+        var conv = cc.conversation.Conversation.init(a);
+        defer conv.deinit();
+        try conv.appendText(.user, "hi");
+        var perm = cc.permission.createContext(.bypass_permissions, a);
+        perm.no_interactive_prompt = true;
+        var sink: u8 = 0;
+        const backend = cc.ui_backend.UiBackend{ .ctx = @ptrCast(&sink), .emit = NullBackend.emit, .poll = NullBackend.poll };
+        var model_error: ?cc.api_model_error.Detail = null;
+        const result = try cc.agent_loop.run(&conv, provider, &.{}, &perm, .{
+            .max_turns = 1,
+            .auto_compact_threshold = std.math.maxInt(usize),
+            .model_error_out = &model_error,
+        }, &backend, a);
+        try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+        // What every Host surface reads (ABI `model_error`, `run_done`).
+        const detail = model_error orelse return error.TestExpectedModelError;
+        const view = detail.view();
+        try std.testing.expectEqual(cc.api_model_error.Category.stream_interrupted, view.category);
+        try std.testing.expectEqual(cc.api_model_error.Retry.retryable, view.retry);
+        try std.testing.expectEqualStrings("The response stream ended before it reported how it stopped.", view.message);
+        try std.testing.expectEqual(@as(?u16, 200), view.http_status);
+        try std.testing.expectEqualStrings(EARLY_END_REQUEST_ID, view.request_id orelse "");
+        try std.testing.expectEqual(@as(u32, 1), view.attempts);
+        try std.testing.expect(view.code == null and view.type == null);
+    }
+};
+
+fn endedEarlyIsStreamInterrupted(comptime wire: Wire) !void {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{endsBeforeStop(wire)}, 0);
+    defer srv.stop();
+    srv.extra_response_headers = "x-request-id: " ++ EARLY_END_REQUEST_ID ++ "\r\n";
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    try withProvider(wire, Endpoint.of(url), EndedEarlyRun{});
+    // Text was shown before the end, so the turn was not sent again.
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+}
+
+test "L2 provider lifecycle ⑦: a stream that ends before its stop report fails the Run as stream_interrupted on every wire" {
+    try eachWire(endedEarlyIsStreamInterrupted);
 }
