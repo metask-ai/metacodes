@@ -278,7 +278,16 @@ already announced stays pending and is answered or cancelled as before.
 | `--web`, `serve` | `POST /capabilities` | `200` `capabilities_accepted`, `400` `capabilities_refused` |
 | `serve --sessions N` | `POST /s/<id>/capabilities` | the same, per Session |
 | `SessionHost` | `HostedSession.declareCapabilities(allocator, frame)` | the acknowledgement line, or a `DeclareError` |
-| UDS `attach` | none: UDS carries no answers, so it is not a UI frontend | — |
+| UDS (`serve --uds`) | the frame itself as one NDJSON line, with the routing fields beside it: `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` | the acknowledgement line |
+
+UDS is a full UI frontend: it carries answers too. `{"op":"respond","session":
+"<id>","id":N,...}` answers UI request `N` with the same answer fields
+`POST /respond` takes beside the routing fields (`{"ok":true}`; a stale or
+unknown id is `{"ok":false,"error":"no pending request with this id"}`, the 409
+of the HTTP surface), so a UDS-only frontend needs no HTTP side channel.
+Evidence: `tests/component/serve_sessions_test.zig` (the `uds respond` /
+`uds capabilities` cases) and the UDS leg of
+`tests/e2e/daemon_serve_multi_e2e.sh`.
 
 `GET /state` reports the declaration in force as `frontend_capabilities`: the
 last `capabilities_accepted` object, or `null` while undeclared. The bundled

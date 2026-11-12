@@ -97,6 +97,8 @@ export interface SessionOptions {
 
 export interface RunOptions {
   maxTurns?: number;
+  /** Revision 28: re-issues after a broken-off stream that showed output, 0 to 8 (default 0). */
+  streamRetryBudget?: number;
   onEvent?: (event: AgentEvent) => void;
 }
 
@@ -109,7 +111,7 @@ export class Session {
   readonly runtime: Runtime;
   model: string;
   run(prompt: string, options?: RunOptions): Promise<RunResult>;
-  stream(prompt: string, options?: { maxTurns?: number }): EventStream;
+  stream(prompt: string, options?: { maxTurns?: number; streamRetryBudget?: number }): EventStream;
   abort(): void;
   submit(text: string): number;
   /** Revision 25: replace the provider credential in place, also mid-Run. */

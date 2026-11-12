@@ -356,6 +356,18 @@ pub const CoreEvent = union(enum) {
         disposition: OutputSegmentDisposition,
         bytes: u64,
     },
+    /// Revision 28 (#452): a Run re-issues a provider attempt under its
+    /// `RunOptionsV1.stream_retry_budget`, and the `thinking_chunk`s delivered
+    /// while visible-output segment `index` was open (`bytes` in total) belong
+    /// to that withdrawn attempt: remove them, as a `discarded` segment's text.
+    /// Follows that segment's `output_segment_end`; `turn` is 1-based and
+    /// `bytes` is never zero.
+    thinking_discarded: struct {
+        index: u32,
+        turn: u32,
+        group: u32,
+        bytes: u64,
+    },
     tool_start: struct {
         id: []const u8,
         name: []const u8,
@@ -832,6 +844,8 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
             .tool_result => |value| try validateFileReferences(value.file_refs),
             .file_changes => |value| try validateFileChanges(value.changes),
             .input_adopted => |value| if (value.input_id == 0 or value.sequence == 0 or value.turn == 0)
+                return error.InvalidPayload,
+            .thinking_discarded => |value| if (value.turn == 0 or value.bytes == 0)
                 return error.InvalidPayload,
             .model_error => |value| if (value.run_id == 0 or value.message.len == 0 or value.attempts == 0)
                 return error.InvalidPayload,
@@ -1571,6 +1585,7 @@ test "CoreEvent decoder covers every ABI v1 tag" {
         "{\"thinking_chunk\":\"private reasoning\"}",
         "{\"output_segment_begin\":{\"index\":1,\"turn\":2,\"group\":3}}",
         "{\"output_segment_end\":{\"index\":1,\"turn\":2,\"group\":3,\"disposition\":\"final\",\"bytes\":4}}",
+        "{\"thinking_discarded\":{\"index\":1,\"turn\":2,\"group\":3,\"bytes\":17}}",
         "{\"tool_start\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\"}}",
         "{\"tool_progress\":{\"id\":\"t1\",\"text\":\"working\"}}",
         "{\"progress\":{\"turn\":1,\"tool_name\":\"Read\",\"tool_input\":\"{}\",\"tool_calls\":2}}",
@@ -1598,7 +1613,7 @@ test "CoreEvent decoder covers every ABI v1 tag" {
 test "auto_compact carries the cause of a compaction inside a Run (issue #430)" {
     // A Run compacts at its own boundaries; `cause` says which pressure asked.
     // The set is open (a Host must accept a cause it does not know), these
-    // are the ones a Revision 27 Run reports.
+    // are the ones a Revision 28 Run reports.
     const causes = [_][]const u8{
         "pre_sampling_pending_turn_threshold",
         "post_tool_follow_up_threshold",
@@ -1839,6 +1854,19 @@ test "CoreEvent decoder normalizes malformed and invalid inputs" {
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"input_adopted\":{\"input_id\":1,\"sequence\":0,\"turn\":1}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"input_adopted\":{\"input_id\":1,\"sequence\":1,\"turn\":0}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"input_adopted\":{\"input_id\":1,\"sequence\":1}}"));
+    // thinking_discarded names a withdrawn attempt: a 1-based turn and the
+    // thinking bytes it showed, never zero; the segment identity is required.
+    {
+        const decoded = try decodeCoreEvent(a, "{\"thinking_discarded\":{\"index\":0,\"turn\":1,\"group\":0,\"bytes\":17,\"added_later\":true}}");
+        defer decoded.deinit();
+        const withdrawn = decoded.value.known.thinking_discarded;
+        try std.testing.expectEqual(@as(u32, 0), withdrawn.index);
+        try std.testing.expectEqual(@as(u32, 1), withdrawn.turn);
+        try std.testing.expectEqual(@as(u64, 17), withdrawn.bytes);
+    }
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"thinking_discarded\":{\"index\":0,\"turn\":0,\"group\":0,\"bytes\":17}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"thinking_discarded\":{\"index\":0,\"turn\":1,\"group\":0,\"bytes\":0}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"thinking_discarded\":{\"turn\":1,\"group\":0,\"bytes\":17}}"));
 }
 
 test "UiRequest decoder covers every tag and response encoder enforces pairing" {

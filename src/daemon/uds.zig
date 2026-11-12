@@ -8,6 +8,18 @@
 //!                                                  → {"ok":true}(入 session inbox,driver 消费;
 //!                                                     字段与校验同 HTTP POST /message,见 web/submission.zig)
 //!   {"op":"interrupt","session":"<id>"}            → {"ok":true|false}(生成期门,同 web /interrupt)
+//!   {"op":"respond","session":"<id>","id":N,...}   → {"ok":true} | {"ok":false,"error":"..."}。
+//!                                                     回答挂起的 ui_request N,同 HTTP POST /respond:
+//!                                                     这一行本身就是答案(choice/answers/result 与
+//!                                                     路由字段并列;wire.parseResponse 只读答案字段)。
+//!                                                     stale/未知 id → {"ok":false,"error":"no pending
+//!                                                     request with this id"}(即 HTTP 的 409)。
+//!   {"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}
+//!                                                  → 应答行:capabilities_accepted(同时落 journal,
+//!                                                     每个 attach 读者可见)或 capabilities_refused。
+//!                                                     这一行就是 wire §2 的能力帧本体(v/type 必填),
+//!                                                     外加路由字段(parseCapabilities 忽略之),
+//!                                                     同 HTTP POST /capabilities。
 //!   {"op":"attach","session":"<id>","since":N}     → 从 seq N 起流式推 journal 行(每行原样 JSON),
 //!                                                     直到 session 关停({"type":"session_closed"})或断连。
 //!
@@ -30,13 +42,15 @@ const log = @import("../util/log.zig");
 const time = @import("../util/time.zig");
 const server_mod = @import("../web/server.zig");
 const submission_mod = @import("../web/submission.zig");
+const wire = @import("../core/protocol/wire.zig");
 const SessionView = server_mod.SessionView;
 const Lease = server_mod.Lease;
 
 pub const Deps = struct {
     /// 线程安全(连接线程并发分配)。
     allocator: std.mem.Allocator,
-    /// 按 session id 租用 session(复用 server.zig 的 resolver;UDS 只用 journal/inbox/abort/generating)。
+    /// 按 session id 租用 session(复用 server.zig 的 resolver;UDS 用 journal/inbox/abort/
+    /// generating/web_backend——respond/capabilities 直达每会话 WebBackend,与 HTTP 同一语义源)。
     resolver: *const fn (ctx: *anyopaque, id: []const u8) ?Lease,
     resolver_ctx: *anyopaque,
     /// `list` op:返回 NDJSON session 列表(caller-allocated,dispatch 用完 free)。null → 返 {"sessions":[]}。
@@ -226,6 +240,51 @@ pub const UdsServer = struct {
             }
             sv.abort.abort(.user_interrupt);
             _ = self.writeLine(conn, "{\"ok\":true}");
+            return false;
+        }
+        if (std.mem.eql(u8, op, "respond")) {
+            // Answer the pending UI request, as HTTP `POST /s/<id>/respond` does. The
+            // line itself is the answer: `wire.parseResponse` reads `choice`/`answers`/
+            // `result` beside the routing fields it ignores, and a malformed answer is
+            // never a grant (the request closes `malformed` with the safe answer). A
+            // stale or unknown id is refused, so a reconnecting client cannot answer a
+            // dialog that is no longer the open one.
+            const id = getUint(v, "id") orelse {
+                _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"missing id\"}");
+                return false;
+            };
+            if (sv.web_backend.respond(@intCast(id), line)) {
+                _ = self.writeLine(conn, "{\"ok\":true}");
+            } else {
+                _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"no pending request with this id\"}");
+            }
+            return false;
+        }
+        if (std.mem.eql(u8, op, "capabilities")) {
+            // Declare frontend capabilities, as HTTP `POST /s/<id>/capabilities` does.
+            // The line is the wire §2 capability frame itself (`v`/`type` and the kind
+            // lists; `parseCapabilities` ignores the routing fields), and the reply is
+            // the same acknowledgement line HTTP answers with: `capabilities_accepted`
+            // (which `declareCapabilities` also journals, so every attached reader sees
+            // the declaration take effect) or `capabilities_refused`. A refused frame
+            // installs nothing.
+            const accepted = sv.web_backend.declareCapabilities(line) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"out of memory\"}");
+                    return false;
+                },
+                else => |refusal| {
+                    const refused = wire.writeCapabilitiesRefused(self.allocator, refusal) catch {
+                        _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"out of memory\"}");
+                        return false;
+                    };
+                    defer self.allocator.free(refused);
+                    _ = self.writeLine(conn, refused);
+                    return false;
+                },
+            };
+            defer sv.web_backend.allocator.free(accepted);
+            _ = self.writeLine(conn, accepted);
             return false;
         }
         if (std.mem.eql(u8, op, "attach")) {

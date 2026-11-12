@@ -21,7 +21,8 @@ fn readGoal(
 }
 
 comptime {
-    if (wire.ABI_REVISION != 27 or
+    if (wire.ABI_REVISION != 28 or
+        wire.MAX_STREAM_RETRY_BUDGET_V1 != 8 or
         wire.MAX_CREDENTIAL_BYTES_V1 != 16 * 1024 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
         wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
@@ -874,12 +875,31 @@ pub fn main(init: std.process.Init) !void {
         diagnostic,
     );
     api.bufferRelease()(&diagnostic);
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 7, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+    // Revision 28 (#452): the Skill invocation Run carries a stream retry
+    // budget; its streams complete, so the budget re-issues nothing.
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 7, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 2, .reserved0 = 0 };
     var result: wire.RunResultV1 = undefined;
     const encoded_arguments = try sdk.encodeSkillArguments(
         a,
         &.{"artifact-target"},
     );
+    {
+        // A budget past its limit is refused before admission: no provider
+        // round is consumed and Run id 1 stays free.
+        var over_budget = options;
+        over_budget.stream_retry_budget = wire.MAX_STREAM_RETRY_BUDGET_V1 + 1;
+        try expectStatus(.resource_limit, api.session().runSkill(
+            session,
+            1,
+            sdk.bytesView(identities.skill_id),
+            sdk.bytesView(identities.revision),
+            sdk.bytesView(encoded_arguments),
+            &over_budget,
+            &result,
+            &diagnostic,
+        ), diagnostic);
+        api.bufferRelease()(&diagnostic);
+    }
     probe.api = api;
     probe.submit_during_ui = true;
     try probe.beginRun(1);
@@ -1212,7 +1232,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 27 Agent Runtime, rewind to a user message, credential rotation, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 28 Agent Runtime, stream retry budget, rewind to a user message, credential rotation, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 /// Revision 25 (#336): one Session's provider credential, rotated twice

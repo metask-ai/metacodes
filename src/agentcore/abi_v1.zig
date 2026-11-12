@@ -3456,6 +3456,7 @@ const AbiSession = struct {
         skill_id: []const u8,
         arguments_json: []const u8,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         const binding = if (self.skill_binding) |*value| value else return error.SkillCatalogNotBound;
         const root_frame = self.policy_root orelse
@@ -3548,8 +3549,8 @@ const AbiSession = struct {
             .ready => |ready_value| blk: {
                 var ready = ready_value;
                 break :blk switch (plan.skill.definition.context) {
-                    .inline_ctx => try ready.executeInline(&plan, max_turns),
-                    .fork => try ready.executeFork(&plan, max_turns),
+                    .inline_ctx => try ready.executeInline(&plan, max_turns, stream_retry_budget),
+                    .fork => try ready.executeFork(&plan, max_turns, stream_retry_budget),
                 };
             },
         };
@@ -3569,12 +3570,14 @@ const AbiSession = struct {
         run_id: u64,
         prompt: []const u8,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         return self.runRootWithBoundSkills(
             materializations,
             run_id,
             .{ .text = prompt },
             max_turns,
+            stream_retry_budget,
         );
     }
 
@@ -3586,12 +3589,14 @@ const AbiSession = struct {
         run_id: u64,
         parts: []const core.message.UserContentPart,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         return self.runRootWithBoundSkills(
             materializations,
             run_id,
             .{ .parts = parts },
             max_turns,
+            stream_retry_budget,
         );
     }
 
@@ -3601,12 +3606,14 @@ const AbiSession = struct {
         run_id: u64,
         input: RootRunInput,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         return self.runRootWithBoundSkillsUsingProvider(
             materializations,
             run_id,
             input,
             max_turns,
+            stream_retry_budget,
             self.core_session.provider.provider(),
         );
     }
@@ -3621,6 +3628,7 @@ const AbiSession = struct {
         run_id: u64,
         input: RootRunInput,
         max_turns: u32,
+        stream_retry_budget: u8,
         base_provider: core.api_provider.Provider,
     ) anyerror!SkillExecution {
         const preflight = switch (input) {
@@ -3728,6 +3736,9 @@ const AbiSession = struct {
             run_id,
             .{ .ctx = self, .emit = AbiSession.emit },
         );
+        // Revision 28 (#452): the Host's re-issue budget for this Run's own
+        // model requests.
+        admitted.stream_retry_budget = stream_retry_budget;
         if (!self.startRunState(identity.session_id, run_id)) {
             _ = admitted.finishWithoutConversation() catch {};
             return error.CallbackFailed;
@@ -3937,6 +3948,7 @@ const MaterializedSkillRun = struct {
         self: *MaterializedSkillRun,
         plan: *const skill_activation.ActivationPlan,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         var owned_invocation: ?[]u8 = null;
         defer if (owned_invocation) |record| allocator.free(record);
@@ -4070,6 +4082,8 @@ const MaterializedSkillRun = struct {
             .controller = budget_controller,
             .base = inner_surface,
         };
+        // Revision 28 (#452): an inline Skill invocation is the Run's own loop.
+        self.admitted.stream_retry_budget = stream_retry_budget;
         const result = self.admitted.runUserMessagesWithToolSurfaceUsingProvider(
             &.{ invocation_record, body_record },
             max_turns,
@@ -4113,6 +4127,7 @@ const MaterializedSkillRun = struct {
         self: *MaterializedSkillRun,
         plan: *const skill_activation.ActivationPlan,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         var owned_invocation: ?[]u8 = null;
         defer if (owned_invocation) |record| allocator.free(record);
@@ -4158,6 +4173,7 @@ const MaterializedSkillRun = struct {
             .activation = &self.activation,
             .plan = plan,
             .max_turns = max_turns,
+            .stream_retry_budget = stream_retry_budget,
             .budget_controller = budget_controller,
             .budget_provider = budget_provider,
             .mcp_view = if (self.mcp_view) |*run_view| run_view else null,
@@ -4211,6 +4227,8 @@ const ForkExecutorContext = struct {
     activation: *skill_activation.Activation,
     plan: *const skill_activation.ActivationPlan,
     max_turns: u32,
+    /// Revision 28 (#452): the Host's budget, for a child that is the Run.
+    stream_retry_budget: u8,
     budget_controller: *session_budget.Controller,
     budget_provider: *session_budget.BudgetedProvider,
     mcp_view: ?*const mcp_session.View,
@@ -4357,6 +4375,13 @@ const ForkExecutorContext = struct {
                 .model_error_out = switch (mode) {
                     .external_run_root => &self.session.last_model_error,
                     .model_tool => null,
+                },
+                // Revision 28 (#452): a child that is the Run streams the
+                // Run's visible output, so the Host's budget applies to it; a
+                // model-invoked fork's output is a tool result and has none.
+                .retractable_stream_retries = switch (mode) {
+                    .external_run_root => self.stream_retry_budget,
+                    .model_tool => 0,
                 },
                 .system_prompt = subagent_system_prompt,
                 .session = identity.session_id,
@@ -8046,10 +8071,14 @@ fn sessionRunInput(
     const out = out_result orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
     if (run_id == 0 or input.struct_size != @sizeOf(wire.RunInputV1) or
         !allZero(input.reserved) or options.struct_size != @sizeOf(wire.RunOptionsV1) or
-        options.max_turns == 0 or !allZero(options.reserved))
+        options.max_turns == 0 or options.reserved0 != 0)
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid run id, RunInputV1, or RunOptionsV1", out_error);
     if (options.max_turns > wire.MAX_TURNS_V1)
         return fail(wire.STATUS_RESOURCE_LIMIT, "max_turns exceeds AgentCore ABI v1 limit", out_error);
+    // Revision 28 (#452): bounded, and refused before anything is admitted.
+    if (options.stream_retry_budget > wire.MAX_STREAM_RETRY_BUDGET_V1)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "stream_retry_budget exceeds AgentCore ABI v1 limit", out_error);
+    const stream_retry_budget: u8 = @intCast(options.stream_retry_budget);
     // Host context blocks become one <system-reminder> text part leading the
     // Run's user record: conversation content, so later requests keep it in
     // their cached prefix and checkpoints keep it byte for byte.
@@ -8129,6 +8158,7 @@ fn sessionRunInput(
                     run_id,
                     prompt,
                     options.max_turns,
+                    stream_retry_budget,
                 )
             else
                 self.runMultimodalWithBoundSkills(
@@ -8136,6 +8166,7 @@ fn sessionRunInput(
                     run_id,
                     if (prompt.len == 0) context_parts[0..1] else &context_parts,
                     options.max_turns,
+                    stream_retry_budget,
                 )) catch |err| {
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
@@ -8176,6 +8207,7 @@ fn sessionRunInput(
                 skill_id,
                 arguments,
                 options.max_turns,
+                stream_retry_budget,
             ) catch |err| {
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
@@ -8235,6 +8267,7 @@ fn sessionRunInput(
                 run_id,
                 record_parts,
                 options.max_turns,
+                stream_retry_budget,
             ) catch |err| {
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
@@ -8946,7 +8979,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 27), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 28), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 80), api.struct_size);
     try std.testing.expectEqual(@as(u32, 56), api.session.?.struct_size);
     try std.testing.expect(api.session.?.update_credential != null);
@@ -13989,6 +14022,7 @@ test "disabled AgentCore Skill fails before admission and materialization" {
         &record.execution_id,
         "{\"values\":[]}",
         1,
+        0,
     ));
     try std.testing.expectEqual(
         wire.STATUS_SKILL_POLICY_VIOLATION,
@@ -14014,6 +14048,7 @@ test "disabled AgentCore Skill fails before admission and materialization" {
         &record.execution_id,
         "{\"values\":[]}",
         1,
+        0,
     ));
     try std.testing.expectEqual(@as(u64, 0), native_session.last_run_id);
     try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
@@ -14075,6 +14110,7 @@ test "checkpoint budget rejects text before consuming run identity" {
             1,
             &oversized,
             1,
+            0,
         ),
     );
 
@@ -15291,6 +15327,7 @@ const AutoCompactFixture = struct {
             run_id,
             .{ .text = prompt },
             8,
+            0,
             script.provider(),
         );
     }

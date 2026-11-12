@@ -496,6 +496,7 @@ typedef struct {
     uint64_t run_id;
     owned_t text;
     uint32_t max_turns;
+    uint32_t stream_retry_budget;
 } session_t;
 
 static uint32_t session_on_event(void *ctx, const metask_agentcore_run_context_v1 *run,
@@ -747,6 +748,7 @@ static void *run_thread(void *arg) {
     memset(&options, 0, sizeof(options));
     options.struct_size = (uint32_t)sizeof(options);
     options.max_turns = session->max_turns;
+    options.stream_retry_budget = session->stream_retry_budget;
     message_t *message = (message_t *)calloc(1, sizeof(message_t));
     metask_agentcore_run_result_v1 local_result;
     metask_agentcore_run_result_v1 *result = message ? &message->result : &local_result;
@@ -769,10 +771,11 @@ static void *run_thread(void *arg) {
     return NULL;
 }
 
-/* sessionRun(session, runId, text, maxTurns): starts the Run; completion is a "done" dispatch. */
+/* sessionRun(session, runId, text, maxTurns, streamRetryBudget): starts the Run;
+ * completion is a "done" dispatch. */
 static napi_value session_run(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value argv[4];
+    size_t argc = 5;
+    napi_value argv[5];
     napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
     session_t *session = get_session(env, argv[0]);
     if (session == NULL) return NULL;
@@ -782,9 +785,11 @@ static napi_value session_run(napi_env env, napi_callback_info info) {
     }
     int64_t run_id = 0;
     uint32_t max_turns = 0;
+    uint32_t stream_retry_budget = 0;
     owned_t text;
-    if (napi_get_value_int64(env, argv[1], &run_id) != napi_ok || run_id <= 0 ||
-        napi_get_value_uint32(env, argv[3], &max_turns) != napi_ok || !get_string(env, argv[2], &text)) {
+    if (argc < 5 || napi_get_value_int64(env, argv[1], &run_id) != napi_ok || run_id <= 0 ||
+        napi_get_value_uint32(env, argv[3], &max_turns) != napi_ok ||
+        napi_get_value_uint32(env, argv[4], &stream_retry_budget) != napi_ok || !get_string(env, argv[2], &text)) {
         bool pending = false;
         napi_is_exception_pending(env, &pending);
         if (!pending) napi_throw_type_error(env, NULL, "invalid Run arguments");
@@ -793,6 +798,7 @@ static napi_value session_run(napi_env env, napi_callback_info info) {
     session->run_id = (uint64_t)run_id;
     session->text = text;
     session->max_turns = max_turns;
+    session->stream_retry_budget = stream_retry_budget;
     session->running = 1;
     napi_ref_threadsafe_function(env, session->tsfn);
     pthread_t thread;
@@ -1040,7 +1046,7 @@ static napi_value load_library(napi_env env, napi_callback_info info) {
         if (!metask_agentcore_api_v1_is_compatible(api)) {
             dlclose(library);
             napi_throw_error(env, "ABI_MISMATCH",
-                             "library does not provide AgentCore ABI v1 revision " "27" " with the expected layout");
+                             "library does not provide AgentCore ABI v1 revision " "28" " with the expected layout");
             return NULL;
         }
         g_api = api; /* the library stays loaded for the life of the process */

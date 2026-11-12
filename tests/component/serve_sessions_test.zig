@@ -53,6 +53,14 @@ fn toolUseSse(comptime id: []const u8, comptime name: []const u8, comptime input
         "data: {\"type\":\"message_stop\"}\n\n";
 }
 
+/// One AskUserQuestion turn: the driver announces a `ui_request` and blocks on
+/// the frontend's answer (the UDS `respond`/`capabilities` tests below).
+const ASK_SSE = toolUseSse(
+    "tu_ask",
+    "AskUserQuestion",
+    "{\\\"questions\\\":[{\\\"question\\\":\\\"Favorite color?\\\",\\\"header\\\":\\\"Color\\\",\\\"options\\\":[{\\\"label\\\":\\\"Red\\\",\\\"description\\\":\\\"r\\\"},{\\\"label\\\":\\\"Blue\\\",\\\"description\\\":\\\"b\\\"}],\\\"multiSelect\\\":false}]}",
+);
+
 const EnvGuard = struct {
     name: [*:0]const u8,
     previous: ?[:0]u8,
@@ -323,6 +331,19 @@ const Stream = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return std.mem.indexOf(u8, self.bytes.items, needle);
+    }
+
+    /// The decimal number right after the first `needle` (e.g. the id in
+    /// `"type":"ui_request","id":`). Call after `waitFor(needle)`.
+    fn idAfter(self: *Stream, needle: []const u8) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const at = std.mem.indexOf(u8, self.bytes.items, needle) orelse return error.NeedleMissing;
+        const rest = self.bytes.items[at + needle.len ..];
+        var end: usize = 0;
+        while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+        if (end == 0) return error.NoDigitsAfterNeedle;
+        return std.fmt.parseInt(u64, rest[0..end], 10);
     }
 
     fn destroy(self: *Stream) void {
@@ -1090,3 +1111,85 @@ test "#277 an idle daemon lead takes a teammate's reply as its next turn, withou
 }
 
 const swarm_lead_poll_ms: u64 = @intCast(cc.session_service.LeadMail.POLL_MS);
+
+// ── the UDS binding answers UI requests and takes capability frames ──────────
+
+test "uds respond: a pure-UDS frontend answers the pending ui_request; missing and stale ids are refused" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // the UDS binding is POSIX-only
+    const a = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(.{ .uds = true, .responses = &.{ ASK_SSE, textSse("thanks-red") } });
+    defer fx.deinit();
+    const id = try fx.create("");
+    const attach = try Stream.openAttach(fx.uds_path.?, id);
+    defer attach.destroy();
+
+    // The whole journey stays on the socket: the message goes in as a UDS op too.
+    var line_buffer: [256]u8 = undefined;
+    const msg = try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"message\",\"session\":\"{s}\",\"text\":\"ask me\"}}\n", .{id.asSlice()});
+    const accepted = try udsRequest(fx.uds_path.?, msg);
+    defer a.free(accepted);
+    try std.testing.expect(std.mem.indexOf(u8, accepted, "\"ok\":true") != null);
+
+    const announce_key = "\"type\":\"ui_request\",\"id\":";
+    try attach.waitFor(announce_key);
+    const rid = try attach.idAfter(announce_key);
+
+    // No id → refused before touching the slot.
+    const no_id = try udsRequest(fx.uds_path.?, try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"respond\",\"session\":\"{s}\",\"answers\":[\"Red\"]}}\n", .{id.asSlice()}));
+    defer a.free(no_id);
+    try std.testing.expect(std.mem.indexOf(u8, no_id, "missing id") != null);
+
+    // A stale id is refused and the real request stays pending.
+    const stale = try udsRequest(fx.uds_path.?, try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"respond\",\"session\":\"{s}\",\"id\":{d},\"answers\":[\"Red\"]}}\n", .{ id.asSlice(), rid + 7 }));
+    defer a.free(stale);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "no pending request with this id") != null);
+
+    // The answer itself: the op line carries the same fields POST /respond takes.
+    const answered = try udsRequest(fx.uds_path.?, try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"respond\",\"session\":\"{s}\",\"id\":{d},\"answers\":[\"Red\"]}}\n", .{ id.asSlice(), rid }));
+    defer a.free(answered);
+    try std.testing.expect(std.mem.indexOf(u8, answered, "\"ok\":true") != null);
+
+    try attach.waitFor("\"type\":\"ui_request_closed\"");
+    try attach.waitFor("\"outcome\":\"answered\"");
+    try attach.waitFor("thanks-red");
+    try attach.waitFor("\"run_done\"");
+    // L2: the chosen label reached the provider as the tool's result.
+    const follow_up = (fx.provider.requestAt(1) orelse return error.MissingFollowUpRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, follow_up, "Red") != null);
+}
+
+test "uds capabilities: a declaration over the socket is acknowledged, journaled, and routes the next ask unavailable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // the UDS binding is POSIX-only
+    const a = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(.{ .uds = true, .responses = &.{ ASK_SSE, textSse("fell back") } });
+    defer fx.deinit();
+    const id = try fx.create("");
+
+    var line_buffer: [320]u8 = undefined;
+    // A malformed frame is refused with the refusal line and installs nothing.
+    const refused = try udsRequest(fx.uds_path.?, try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"capabilities\",\"session\":\"{s}\",\"v\":1,\"type\":\"capabilities\",\"ui_requests\":[\"custom\"]}}\n", .{id.asSlice()}));
+    defer a.free(refused);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "\"type\":\"capabilities_refused\"") != null);
+
+    // The real declaration: this frontend renders nothing.
+    const acked = try udsRequest(fx.uds_path.?, try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"capabilities\",\"session\":\"{s}\",\"v\":1,\"type\":\"capabilities\",\"ui_requests\":[]}}\n", .{id.asSlice()}));
+    defer a.free(acked);
+    try std.testing.expect(std.mem.indexOf(u8, acked, "\"type\":\"capabilities_accepted\"") != null);
+
+    const attach = try Stream.openAttach(fx.uds_path.?, id);
+    defer attach.destroy();
+    try attach.waitFor("\"type\":\"capabilities_accepted\""); // journaled for every reader
+
+    const msg = try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"message\",\"session\":\"{s}\",\"text\":\"ask me\"}}\n", .{id.asSlice()});
+    const accepted = try udsRequest(fx.uds_path.?, msg);
+    defer a.free(accepted);
+    try std.testing.expect(std.mem.indexOf(u8, accepted, "\"ok\":true") != null);
+
+    // The ask is not announced: it is journaled unavailable and the run falls back.
+    try attach.waitFor("\"type\":\"ui_request_unavailable\"");
+    try attach.waitFor("fell back");
+    try attach.waitFor("\"run_done\"");
+    try std.testing.expect(!attach.contains("\"type\":\"ui_request\",\"id\":"));
+}

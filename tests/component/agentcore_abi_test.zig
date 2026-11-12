@@ -4072,7 +4072,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 27), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 28), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -8263,7 +8263,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     try std.testing.expectEqual(wire.STATUS_BUSY, api.runtime().destroy()(runtime, &diagnostic));
     api.bufferRelease()(&diagnostic);
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 0, .reserved0 = 0 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().abort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
@@ -8400,7 +8400,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
         diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
 
         fn run(self: *@This()) void {
-            var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+            var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 0, .reserved0 = 0 };
             self.status = self.api.session().runText(self.session, 1, sdk.bytesView("pause in facade epilogue"), &options, &self.result, &self.diagnostic);
         }
     };
@@ -8460,7 +8460,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     try std.testing.expectEqual(@as(u64, 1), barrier.seen_run_id.load(.acquire));
 
     var competing_result: wire.RunResultV1 = undefined;
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 0, .reserved0 = 0 };
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
         api.session().runText(session, 2, sdk.bytesView("must not enter during epilogue"), &options, &competing_result, &diagnostic),
@@ -8631,7 +8631,7 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 0, .reserved0 = 0 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("invoke failing host"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
@@ -8773,7 +8773,8 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
         .context_block_count = 0,
         .time_context_code = wire.TIME_CONTEXT_SYSTEM,
         .utc_offset_minutes = 0,
-        .reserved = [_]u64{0} ** 1,
+        .stream_retry_budget = 0,
+        .reserved0 = 0,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
@@ -8914,7 +8915,8 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
         .context_block_count = 0,
         .time_context_code = wire.TIME_CONTEXT_SYSTEM,
         .utc_offset_minutes = 0,
-        .reserved = [_]u64{0} ** 1,
+        .stream_retry_budget = 0,
+        .reserved0 = 0,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
@@ -9059,7 +9061,7 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 0, .reserved0 = 0 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_CALLBACK_FAILED,
@@ -9125,7 +9127,7 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 0, .reserved0 = 0 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
@@ -9204,7 +9206,7 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 0, .reserved0 = 0 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(expected_status, api.session().runText(session, 1, sdk.bytesView("ask through Host UI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
@@ -9301,6 +9303,10 @@ test "L2 every public AgentCoreEventV1 mapping preserves its complete payload" {
     try expectOutputSegmentEndMapping(.continued, .continued);
     try expectOutputSegmentEndMapping(.partial, .partial);
     try expectOutputSegmentEndMapping(.discarded, .discarded);
+    try expectMappedEventEquals(
+        .{ .thinking_discarded = .{ .index = 21, .turn = 22, .group = 23, .bytes = 24 } },
+        .{ .thinking_discarded = .{ .index = 21, .turn = 22, .group = 23, .bytes = 24 } },
+    );
     try expectMappedEventEquals(
         .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },
         .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },
@@ -10809,7 +10815,7 @@ test "L2 RunState: an abort accepted from the finalizing callback yields one ter
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 0, .reserved0 = 0 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
@@ -10860,7 +10866,7 @@ test "L2 RunState: a Host rejecting the terminal snapshot fails the Run with CAL
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .stream_retry_budget = 0, .reserved0 = 0 };
     var result: wire.RunResultV1 = undefined;
     // 修复前:终态快照被拒绝的结果被丢弃,这里返回 STATUS_OK。
     try std.testing.expectEqual(
@@ -15582,4 +15588,432 @@ test "L2 Revision 27 rewind_to_user_message refuses a compacted position and rer
     try std.testing.expect(std.mem.indexOf(u8, body, "Another language model started") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "rerun-from-boundary") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "recent context") == null);
+}
+
+// ── Revision 28 (#452): a Host-granted stream retry budget ──────────────────
+
+/// #452's reproduction: a thinking delta, then a clean end of body, with no
+/// stop report. The sentinel is 17 bytes and appears in no system prompt.
+/// (#451 has its own `THINKING_THEN_EOF_SSE`.)
+const RETRY_THINKING_THEN_EOF_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cut\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"THINKING_SENTINEL\"}}\n\n";
+
+/// Thinking, then the server's own failure inside the stream.
+const THINKING_THEN_ERROR_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_err\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"THINKING_SENTINEL\"}}\n\n" ++
+    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+
+/// What a Host sees, decoded through the public SDK: every tag in order, and
+/// one line per event a Host acts on to take back or rebuild output.
+const RetryBudgetProbe = struct {
+    tags: [4096]u8 = undefined,
+    tags_len: usize = 0,
+    log: [4096]u8 = undefined,
+    log_len: usize = 0,
+    /// The text of the segments that closed `final`.
+    answer: [256]u8 = undefined,
+    answer_len: usize = 0,
+    current: [256]u8 = undefined,
+    current_len: usize = 0,
+    saw_retrying: bool = false,
+    last_phase: ?sdk.protocol.RunStatePhase = null,
+    model_error_attempts: ?u32 = null,
+    overflow: bool = false,
+
+    fn append(buffer: []u8, len: *usize, overflow: *bool, comptime fmt: []const u8, args: anytype) void {
+        const written = std.fmt.bufPrint(buffer[len.*..], fmt ++ "\n", args) catch {
+            overflow.* = true;
+            return;
+        };
+        len.* += written.len;
+    }
+
+    fn line(self: *RetryBudgetProbe, comptime fmt: []const u8, args: anytype) void {
+        append(&self.log, &self.log_len, &self.overflow, fmt, args);
+    }
+
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *RetryBudgetProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const known = switch (parsed.value) {
+            .known => |decoded| decoded,
+            .unknown => |unknown| {
+                append(&self.tags, &self.tags_len, &self.overflow, "unknown:{s}", .{unknown.tag});
+                return wire.EVENT_CONTINUE;
+            },
+        };
+        switch (known) {
+            .run_state => |state| append(&self.tags, &self.tags_len, &self.overflow, "run_state:{s}", .{@tagName(state.phase)}),
+            else => append(&self.tags, &self.tags_len, &self.overflow, "{s}", .{@tagName(known)}),
+        }
+        switch (known) {
+            .output_segment_begin => |segment| {
+                self.current_len = 0;
+                self.line("begin {d}", .{segment.index});
+            },
+            .text_chunk => |text| {
+                if (text.len > self.current.len - self.current_len) return wire.EVENT_FATAL;
+                @memcpy(self.current[self.current_len..][0..text.len], text);
+                self.current_len += text.len;
+                self.line("text {d}", .{text.len});
+            },
+            .thinking_chunk => |text| self.line("thinking {d}", .{text.len}),
+            .output_segment_end => |segment| {
+                self.line("end {d} turn {d} group {d} {s} {d}", .{ segment.index, segment.turn, segment.group, @tagName(segment.disposition), segment.bytes });
+                if (segment.disposition == .final) {
+                    @memcpy(self.answer[0..self.current_len], self.current[0..self.current_len]);
+                    self.answer_len = self.current_len;
+                }
+                self.current_len = 0;
+            },
+            .thinking_discarded => |withdrawn| self.line("thinking_discarded {d} turn {d} group {d} {d}", .{ withdrawn.index, withdrawn.turn, withdrawn.group, withdrawn.bytes }),
+            .retry_notice => |notice| self.line("retry {d}/{d} after {d}", .{ notice.attempt, notice.max, notice.delay_ms }),
+            .model_error => |detail| self.model_error_attempts = detail.attempts,
+            .run_state => |state| {
+                if (state.phase == .retrying) self.saw_retrying = true;
+                self.last_phase = state.phase;
+            },
+            else => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn logText(self: *const RetryBudgetProbe) []const u8 {
+        return self.log[0..self.log_len];
+    }
+
+    fn tagText(self: *const RetryBudgetProbe) []const u8 {
+        return self.tags[0..self.tags_len];
+    }
+};
+
+fn retryBudgetOptions(max_turns: u32, budget: u32) wire.RunOptionsV1 {
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = max_turns;
+    options.stream_retry_budget = budget;
+    return options;
+}
+
+fn runTextWithOptions(fixture: *PublicSessionFixture, run_id: u64, prompt: []const u8, options: *const wire.RunOptionsV1) !wire.RunResultV1 {
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.session().runText(fixture.session, run_id, sdk.bytesView(prompt), options, &result, &fixture.diagnostic),
+    );
+    return result;
+}
+
+fn expectIdenticalRequestBodies(server: *harness.MockServer) !void {
+    const first = (server.requestAt(0) orelse return error.MissingRequest).body();
+    for (1..server.requestCount()) |index| {
+        const again = (server.requestAt(index) orelse return error.MissingRequest).body();
+        try std.testing.expectEqualStrings(first, again);
+    }
+}
+
+test "L2 Revision 28 stream_retry_budget re-issues the issue #452 reproduction and the Host can take back what it showed" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var server = try harness.MockServer.startCassette(&.{ RETRY_THINKING_THEN_EOF_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = RetryBudgetProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, RetryBudgetProbe.event);
+    defer fixture.deinit();
+
+    const options = retryBudgetOptions(2, 1);
+    const result = try runTextWithOptions(&fixture, 1, "think it through", &options);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expect(!probe.overflow);
+    // The same request was sent again, byte for byte.
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try expectIdenticalRequestBodies(server);
+    // The withdrawn attempt: its (empty) text segment closes discarded, its
+    // thinking is withdrawn under the same segment identity, and the re-issue
+    // is announced like a connection retry: one failed stream of two, at once.
+    try std.testing.expectEqualStrings(
+        "begin 0\n" ++
+            "thinking 17\n" ++
+            "end 0 turn 1 group 0 discarded 0\n" ++
+            "thinking_discarded 0 turn 1 group 0 17\n" ++
+            "retry 1/2 after 0\n" ++
+            "begin 1\n" ++
+            "text 4\n" ++
+            "end 1 turn 1 group 0 final 4\n",
+        probe.logText(),
+    );
+    try std.testing.expectEqualStrings("done", probe.answer[0..probe.answer_len]);
+    try std.testing.expect(probe.saw_retrying);
+    try std.testing.expectEqual(sdk.protocol.RunStatePhase.completed, probe.last_phase.?);
+    // A failed attempt that a retry recovered from reports nothing.
+    try std.testing.expectEqual(@as(?u32, null), probe.model_error_attempts);
+    // Only the second attempt's answer reached the Conversation, so the next
+    // request carries it and none of the withdrawn thinking.
+    const next = try fixture.runText(2, "and then");
+    try std.testing.expectEqual(wire.STOP_END_TURN, next.stop_reason_code);
+    const followup = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, followup, "THINKING_SENTINEL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, followup, "\"done\"") != null);
+}
+
+test "L2 Revision 28 with a zero budget the reproduction ends after one attempt, events and bytes as before" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var server = try harness.MockServer.startCassette(&.{ RETRY_THINKING_THEN_EOF_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = RetryBudgetProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, RetryBudgetProbe.event);
+    defer fixture.deinit();
+
+    const options = retryBudgetOptions(2, 0);
+    const result = try runTextWithOptions(&fixture, 1, "think it through", &options);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expect(!probe.overflow);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expectEqualStrings(
+        "begin 0\n" ++
+            "thinking 17\n" ++
+            "end 0 turn 1 group 0 discarded 0\n",
+        probe.logText(),
+    );
+    // Every event the Host receives, in order: nothing new.
+    try std.testing.expectEqualStrings(
+        "run_state:starting\n" ++
+            "prompt_manifest\n" ++
+            "run_state:generating\n" ++
+            "progress\n" ++
+            "output_segment_begin\n" ++
+            "usage\n" ++
+            "thinking_chunk\n" ++
+            "stream_done\n" ++
+            "output_segment_end\n" ++
+            "run_state:finalizing\n" ++
+            "model_error\n" ++
+            "run_state:failed\n",
+        probe.tagText(),
+    );
+    try std.testing.expectEqual(@as(?u32, 1), probe.model_error_attempts);
+}
+
+test "L2 Revision 28 the budget never reaches the provider request" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var bodies: [2][]u8 = undefined;
+    for ([_]u32{ 0, wire.MAX_STREAM_RETRY_BUDGET_V1 }, 0..) |budget, index| {
+        var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var probe = RetryBudgetProbe{};
+        var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, RetryBudgetProbe.event);
+        defer fixture.deinit();
+        var options = retryBudgetOptions(1, budget);
+        options.time_context_code = wire.TIME_CONTEXT_OFF;
+        const result = try runTextWithOptions(&fixture, 1, "same prompt", &options);
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+        bodies[index] = try a.dupe(u8, (server.requestAt(0) orelse return error.MissingRequest).body());
+    }
+    defer for (bodies) |body| a.free(body);
+    try std.testing.expectEqualStrings(bodies[0], bodies[1]);
+}
+
+test "L2 Revision 28 an exhausted budget ends the Run, and model_error counts every attempt" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    // The cassette repeats its last body: every attempt drops after thinking.
+    var server = try harness.MockServer.startCassette(&.{RETRY_THINKING_THEN_EOF_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = RetryBudgetProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, RetryBudgetProbe.event);
+    defer fixture.deinit();
+
+    const options = retryBudgetOptions(2, 2);
+    const result = try runTextWithOptions(&fixture, 1, "think it through", &options);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    try expectIdenticalRequestBodies(server);
+    try std.testing.expectEqualStrings(
+        "begin 0\n" ++
+            "thinking 17\n" ++
+            "end 0 turn 1 group 0 discarded 0\n" ++
+            "thinking_discarded 0 turn 1 group 0 17\n" ++
+            "retry 1/3 after 0\n" ++
+            "begin 1\n" ++
+            "thinking 17\n" ++
+            "end 1 turn 1 group 0 discarded 0\n" ++
+            "thinking_discarded 1 turn 1 group 0 17\n" ++
+            "retry 2/3 after 0\n" ++
+            "begin 2\n" ++
+            "thinking 17\n" ++
+            // The last attempt is not re-issued: no withdrawal, no notice.
+            "end 2 turn 1 group 0 discarded 0\n",
+        probe.logText(),
+    );
+    // model_error.attempts counts the physical attempts of the failed request,
+    // the re-issues included.
+    try std.testing.expectEqual(@as(?u32, 3), probe.model_error_attempts);
+    try std.testing.expectEqual(sdk.protocol.RunStatePhase.failed, probe.last_phase.?);
+}
+
+test "L2 Revision 28 a server-declared error after thinking is not re-issued under the budget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var server = try harness.MockServer.startCassette(&.{ THINKING_THEN_ERROR_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = RetryBudgetProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, RetryBudgetProbe.event);
+    defer fixture.deinit();
+
+    const options = retryBudgetOptions(2, wire.MAX_STREAM_RETRY_BUDGET_V1);
+    const result = try runTextWithOptions(&fixture, 1, "think it through", &options);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expectEqualStrings(
+        "begin 0\n" ++
+            "thinking 17\n" ++
+            "end 0 turn 1 group 0 discarded 0\n",
+        probe.logText(),
+    );
+    try std.testing.expect(!probe.saw_retrying);
+}
+
+test "L2 Revision 28 an out-of-range budget or a dirty reserved word is refused before admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    var result = std.mem.zeroes(wire.RunResultV1);
+    var over = retryBudgetOptions(1, wire.MAX_STREAM_RETRY_BUDGET_V1 + 1);
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        fixture.api.session().runText(fixture.session, 1, sdk.bytesView("refused"), &over, &result, &fixture.diagnostic),
+    );
+    fixture.releaseDiagnostic();
+    var dirty = retryBudgetOptions(1, 1);
+    dirty.reserved0 = 1;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        fixture.api.session().runText(fixture.session, 1, sdk.bytesView("refused"), &dirty, &result, &fixture.diagnostic),
+    );
+    fixture.releaseDiagnostic();
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    // Nothing was admitted: the same Run id runs.
+    const at_limit = retryBudgetOptions(1, wire.MAX_STREAM_RETRY_BUDGET_V1);
+    const accepted = try runTextWithOptions(&fixture, 1, "accepted", &at_limit);
+    try std.testing.expectEqual(wire.STOP_END_TURN, accepted.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
+fn runSkillWithRetryBudget(context_line: []const u8, budget: u32) !void {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const skill = try std.fmt.allocPrint(a, "---\nname: Retried\ndescription: Streams through a flaky gateway\n{s}---\nRETRIED_SKILL_SENTINEL", .{context_line});
+    defer a.free(skill);
+    try writeSkillFixture(a, root, "retried", skill);
+    var server = try harness.MockServer.startCassette(&.{ RETRY_THINKING_THEN_EOF_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = RetryBudgetProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, RetryBudgetProbe.event);
+    defer fixture.deinit();
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("stream-retry-budget-epoch"),
+        .additional_sources = null,
+        .additional_source_count = 0,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer fixture.api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().resolveCatalog()(fixture.runtime, &query, &catalog, &descriptor, &fixture.diagnostic));
+    defer if (catalog) |handle| {
+        _ = fixture.api.skill().releaseCatalog()(handle, &fixture.diagnostic);
+    };
+    const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    var policy = try DecodedSkillPolicy.init(a, descriptor_bytes);
+    defer policy.deinit();
+    const ids = try extractCatalogIdentities(a, descriptor_bytes, "retried");
+    defer a.free(ids.revision);
+    defer a.free(ids.skill_id);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().bindPolicy()(fixture.session, catalog, &policy.policy, &fixture.diagnostic));
+    const options = retryBudgetOptions(2, budget);
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runSkill(
+        fixture.session,
+        1,
+        sdk.bytesView(ids.skill_id),
+        sdk.bytesView(ids.revision),
+        sdk.bytesView(""),
+        &options,
+        &result,
+        &fixture.diagnostic,
+    ));
+    if (budget == 0) {
+        try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+        return;
+    }
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try expectIdenticalRequestBodies(server);
+    const log = probe.logText();
+    try std.testing.expect(std.mem.indexOf(u8, log, "end 0 turn 1 group 0 discarded 0\nthinking_discarded 0 turn 1 group 0 17\nretry 1/2 after 0\n") != null);
+    try std.testing.expectEqualStrings("done", probe.answer[0..probe.answer_len]);
+}
+
+test "L2 Revision 28 a Skill invocation Run, inline or in its own context, takes the budget" {
+    // Inline: the Skill body runs on the Run's own loop.
+    try runSkillWithRetryBudget("", 1);
+    try runSkillWithRetryBudget("", 0);
+    // In its own context: the child is the Run, so the Host's budget is its.
+    try runSkillWithRetryBudget("context: fork\n", 1);
+    try runSkillWithRetryBudget("context: fork\n", 0);
 }
