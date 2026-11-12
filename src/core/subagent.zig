@@ -42,6 +42,10 @@ pub const SubagentResult = struct {
 
 pub const SpawnOptions = struct {
     max_turns: u32 = 20,
+    /// `agent_loop.Options.retractable_stream_retries` of the child, for a
+    /// child that is itself the Run (an AgentCore Skill invocation in its own
+    /// context, #452). 0 for every other child.
+    retractable_stream_retries: u8 = 0,
     /// `agent_loop.Options.model_error_out` of the child, for a child that is
     /// itself the Run (an AgentCore Skill invocation in its own context).
     model_error_out: ?*?@import("../api/model_error.zig").Detail = null,
@@ -236,6 +240,7 @@ pub fn spawnAgentSink(
         ctx_to_use,
         .{
             .max_turns = opts.max_turns,
+            .retractable_stream_retries = opts.retractable_stream_retries,
             .model_error_out = opts.model_error_out,
             .cost_budget_usd = opts.cost_budget_usd,
             .goal_meter = opts.goal_meter,

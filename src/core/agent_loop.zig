@@ -684,6 +684,23 @@ pub const Options = struct {
     /// unterminated stream before anything visible streamed has no such text
     /// and always gets at least `SILENT_STREAM_RETRY_FLOOR` retries.
     max_stream_turn_retries: u8 = 0,
+    /// Same-turn re-issues for a host that can take back what it showed
+    /// (#452; AgentCore `RunOptionsV1.stream_retry_budget`). This Run may
+    /// re-issue a request whose accepted stream failed without an answer
+    /// (`isSilentRetryFailure`: a stall, a stream that ended before its stop
+    /// report, a dropped connection) up to this many times, after visible
+    /// output too. Unlike `max_stream_turn_retries`, a server-declared error
+    /// (`ApiError`) or a local decode failure is never re-issued under it, and
+    /// every re-issue of an attempt that showed something is announced: the
+    /// attempt's segment closes `discarded` (as on any stream error), its
+    /// thinking is withdrawn with `thinking_discarded`, and `retry_notice`
+    /// precedes the next attempt. An attempt that showed nothing is re-issued
+    /// silently, as under the floor. The count is the Run's, shared with
+    /// `max_stream_turn_retries` and `SILENT_STREAM_RETRY_FLOOR`, so a Run
+    /// re-issues at most max(this, the floor) times; each re-issue has its own
+    /// connection retries (`providerAttemptLimit`). 0, the default, changes
+    /// nothing.
+    retractable_stream_retries: u8 = 0,
     /// 统一 UI 请求回调(替代旧 ask_question 等多套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -971,6 +988,9 @@ const OutputChannel = struct {
     /// later close that would make text part of the result (an abort inside a
     /// learning pass closes `.final`) is recorded as commentary instead.
     final_sealed: bool = false,
+    /// The segment the latest `close` ended, so a re-issue can name the
+    /// attempt it withdraws (`thinking_discarded`).
+    last_closed: ?output_semantics.Segment = null,
 
     fn begin(self: *OutputChannel, turn: u32) void {
         // 配对兜底(见顶注):漏关的段在这里以 .partial 收口,end 事件照发。
@@ -982,6 +1002,7 @@ const OutputChannel = struct {
         }
         const seg = self.tracker.begin(turn);
         self.pending_bytes = 0;
+        self.last_closed = null;
         self.backend.emitEvent(self.session, .{ .output_segment_begin = .{
             .index = seg.index,
             .turn = seg.turn,
@@ -1002,6 +1023,7 @@ const OutputChannel = struct {
             requested;
         const seg = self.tracker.close(disposition, self.pending_bytes) orelse return;
         self.pending_bytes = 0;
+        self.last_closed = seg;
         self.backend.emitEvent(self.session, .{ .output_segment_end = .{
             .index = seg.index,
             .turn = seg.turn,
@@ -2893,19 +2915,24 @@ fn runCounted(
                 // 残缺 assistant_text 下面会被整体丢弃(不 commit 到 conversation)→ discarded。
                 // 消费者据此丢掉已缓冲的该段字节,不会把残片误当结果。
                 output_channel.close(.discarded, assistant_text.items);
+                // The segment this attempt's text and thinking belonged to.
+                const discarded_segment = output_channel.last_closed;
                 const can_recover_context_error = stream_context_window_exceeded and
                     assistant_text.items.len == 0 and
                     tool_uses.items.len == 0 and
                     assistant_blocks.items.len == 0;
-                // Nothing the user could have watched: no text, thinking or
+                // Something the user could have watched: text, thinking or a
                 // tool call reached the backend in this attempt (usage and
-                // reasoning items are not shown), and the connection gave no
-                // answer at all. See SILENT_STREAM_RETRY_FLOOR.
-                const silent_retry_eligible = assistant_text.items.len == 0 and
-                    thinking_text.items.len == 0 and
-                    tool_uses.items.len == 0 and
-                    assistant_blocks.items.len == 0 and
-                    isSilentRetryFailure(stream_failure);
+                // reasoning items are not shown).
+                const showed_output = assistant_text.items.len != 0 or
+                    thinking_text.items.len != 0 or
+                    tool_uses.items.len != 0 or
+                    assistant_blocks.items.len != 0;
+                // The connection gave no answer at all (isSilentRetryFailure).
+                const connection_failure = isSilentRetryFailure(stream_failure);
+                // Nothing shown and no answer: see SILENT_STREAM_RETRY_FLOOR.
+                const silent_retry_eligible = !showed_output and connection_failure;
+                const thinking_bytes: u64 = thinking_text.items.len;
                 // 先 join 预取线程再释放 tool_uses(它们 borrow 其字节),防 UAF(Linus HIGH-1)。
                 prefetch.joinAll();
                 for (tool_uses.items) |tu| {
@@ -2960,13 +2987,25 @@ fn runCounted(
                 // re-issue of the same request is safe. Aborts keep their
                 // own path; context-window exhaustion was handled before.
                 const abort_pending = if (opts.abort) |a| a.isAborted() else false;
+                // A host that can take back what it showed (#452) extends the
+                // re-issue limit, for a connection that gave no answer only.
+                const retractable_cap: u8 = if (connection_failure) opts.retractable_stream_retries else 0;
                 const stream_retry_cap = if (silent_retry_eligible)
-                    @max(opts.max_stream_turn_retries, SILENT_STREAM_RETRY_FLOOR)
+                    @max(opts.max_stream_turn_retries, SILENT_STREAM_RETRY_FLOOR, retractable_cap)
                 else
-                    opts.max_stream_turn_retries;
+                    @max(opts.max_stream_turn_retries, retractable_cap);
                 if (stream_turn_retries < stream_retry_cap and
                     !abort_pending)
                 {
+                    if (showed_output and opts.retractable_stream_retries > 0)
+                        announceRetractedAttempt(
+                            backend,
+                            sess,
+                            discarded_segment,
+                            thinking_bytes,
+                            @as(u32, stream_turn_retries) + 1,
+                            @as(u32, stream_retry_cap) + 1,
+                        );
                     stream_turn_retries += 1;
                     log.warnId("agent", rid_for_turn, "mid-stream failure{s} → same-turn retry {d}/{d}", .{
                         if (silent_retry_eligible) " before any visible output" else "",
@@ -5803,6 +5842,32 @@ fn settleCandidate(
     if (!open.*) return;
     open.* = false;
     if (observer) |installed| installed.settle(candidate, settlement);
+}
+
+/// A re-issue a host can take back (#452, `Options.retractable_stream_retries`).
+/// The attempt's text segment has already closed `discarded`; what it showed
+/// in thinking is withdrawn under the same segment identity, then the next
+/// attempt is announced the way a connection retry is: `failed_streams` of at
+/// most `max_streams` failed, and the next starts at once.
+fn announceRetractedAttempt(
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    segment: ?output_semantics.Segment,
+    thinking_bytes: u64,
+    failed_streams: u32,
+    max_streams: u32,
+) void {
+    if (thinking_bytes != 0) if (segment) |closed| backend.emitEvent(sess, .{ .thinking_discarded = .{
+        .index = closed.index,
+        .turn = closed.turn,
+        .group = closed.group,
+        .bytes = thinking_bytes,
+    } });
+    backend.emitEvent(sess, .{ .retry_notice = .{
+        .attempt = failed_streams,
+        .max = max_streams,
+        .delay_ms = 0,
+    } });
 }
 
 fn estimateInputSchemaTokens(schema: json_mod.InputSchema) usize {

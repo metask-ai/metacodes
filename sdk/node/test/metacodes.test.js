@@ -75,6 +75,37 @@ test('a model failure reaches the result and a later success clears it', { skip 
   assert.equal(recovered.modelError, null);
 });
 
+test('a stream cut after thinking is sent again under the budget (Revision 28)', { skip }, async (t) => {
+  // Issue #452: thinking, then the body ends with no stop reason.
+  const provider = await withProvider(t, [['thinking_cut', 'private reasoning'], ['text', 'recovered']]);
+  const { session } = open(t, { tools: [] }, provider, workspace(t));
+  const events = [];
+  const result = await session.run('think', { streamRetryBudget: 1, onEvent: (event) => events.push(event) });
+  assert.equal(result.stopReason, 'end_turn');
+  assert.equal(result.text, 'recovered');
+  assert.equal(result.modelError, null);
+  assert.equal(provider.requests.length, 2);
+  assert.deepEqual(provider.requests[1], provider.requests[0]);
+  const payloads = (tag) => events.filter((event) => tag in event).map((event) => event[tag]);
+  assert.deepEqual(payloads('thinking_discarded'), [{ index: 0, turn: 1, group: 0, bytes: 17 }]);
+  assert.deepEqual(payloads('retry_notice'), [{ attempt: 1, max: 2, delay_ms: 0 }]);
+  assert.deepEqual(result.segments.map((segment) => segment.disposition), ['discarded', 'final']);
+});
+
+test('without a budget a stream cut after thinking ends the Run', { skip }, async (t) => {
+  const provider = await withProvider(t, [['thinking_cut', 'private reasoning'], ['text', 'never sent']]);
+  const { session } = open(t, { tools: [] }, provider, workspace(t));
+  const tags = [];
+  const result = await session.run('think', { onEvent: (event) => tags.push(Object.keys(event)[0]) });
+  assert.equal(result.stopReason, 'api_error');
+  assert.equal(provider.requests.length, 1);
+  assert.ok(!tags.includes('thinking_discarded'));
+  assert.ok(!tags.includes('retry_notice'));
+  assert.equal(result.modelError.attempts, 1);
+  await assert.rejects(session.run('think', { streamRetryBudget: 9 }), RangeError);
+  assert.equal(provider.requests.length, 1);
+});
+
 test('every event of a Run arrives before its Promise settles', { skip }, async (t) => {
   const provider = await withProvider(t, [['text', 'ordered']]);
   const { session } = open(t, { tools: [] }, provider, workspace(t));

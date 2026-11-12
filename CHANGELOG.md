@@ -38,6 +38,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A stream retry budget for AgentCore Hosts** (#452). A reasoning model
+  streams thinking first, so a gateway stream that breaks off has almost always
+  shown output, and the Run ended with `STOP_API_ERROR`. AgentCore ABI revision
+  28 adds `RunOptionsV1.stream_retry_budget` (0 to 8, default 0, in the
+  options' last reserved word): the Run may send the same request again that
+  many times when its accepted stream broke off without an answer (a stall, a
+  dropped connection, a stream that ended before its stop report); a server's
+  error and a local decode failure are never re-sent, and the budget is shared
+  with the existing re-send of an attempt that showed nothing. Each re-issue
+  tells the Host what to take back: the attempt's segment closes `discarded`,
+  the new `thinking_discarded` event names the thinking it showed, and a
+  `retry_notice` follows. Zero changes nothing a Host sees or a provider
+  receives. The header, the bindings, the Python (`stream_retry_budget=`) and
+  Node (`streamRetryBudget`) packages and the source-free consumers move to
+  revision 28.
+
 - **Edit and rerun through AgentCore** (#441). AgentCore ABI revision 27 adds
   `session_control->rewind_to_user_message(session, position, out_error)`, the
   operation behind `/edit` (#432): while idle it drops the user message at a
@@ -65,6 +81,12 @@ status, compatibility boundaries, and entry points are defined by
   attached reader. doc/WIRE_PROTOCOL.md §2.3 and doc/API.md spell the ops out.
 
 ### Fixed
+
+- A same-turn re-issue no longer looks up the abandoned attempt's speculative
+  tool results: they borrowed the attempt's freed tool-call ids, and a
+  re-issued call with a repeated id could take a released, empty result
+  instead of running. Reachable before through headless retries after a
+  streamed tool call (#452).
 
 - **metacodes-core's isolation from the application is checked** (#448).
   `src/lib.zig` claimed its import graph could not reach the UI and that

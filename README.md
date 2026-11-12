@@ -145,7 +145,7 @@ See [PLUGIN_ARCHITECTURE](doc/PLUGIN_ARCHITECTURE.md),
 | Surface | Use it from |
 |---|---|
 | `metacodes-core` Zig module | Zig hosts on the same toolchain; `zig build example` runs [example/main.zig](example/main.zig) |
-| AgentCore C ABI v1 revision 27 | C, C++, Zig and Rust bindings ship in [sdk/](sdk/README.md); JNA, .NET P/Invoke and any other FFI load the shared library |
+| AgentCore C ABI v1 revision 28 | C, C++, Zig and Rust bindings ship in [sdk/](sdk/README.md); JNA, .NET P/Invoke and any other FFI load the shared library |
 | Python and Node packages | `import metacodes` / `require('metacodes')`: Runtime, Session, streaming events, tools written in Python or JavaScript ([sdk/python](sdk/python/README.md), [sdk/node](sdk/node/README.md); experimental) |
 | Headless `-p --json` / `--stream-json` | Any language that can spawn a process and read NDJSON |
 | `serve` daemon (HTTP and UDS, multi-session) and `--web` | Services, desktop apps, remote UIs |

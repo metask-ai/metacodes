@@ -5,6 +5,8 @@
 //   ['tool', name, inputObject] one tool_use block
 //   ['echo']                   "saw: " + the last tool_result text it received
 //   ['status', code, headers, bodyObject]  that non-2xx JSON
+//   ['thinking_cut', '...']    one thinking delta, then the body ends with no
+//                              stop reason, the way a dropped gateway stream looks
 
 const http = require('node:http');
 
@@ -46,6 +48,14 @@ function toolResponse(index, name, input) {
     ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } }],
     ['content_block_stop', { type: 'content_block_stop', index: 0 }],
     ...finish('tool_use'),
+  ]);
+}
+
+function thinkingCutResponse(index, thinking) {
+  return sse([
+    start(index),
+    ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking } }],
   ]);
 }
 
@@ -96,6 +106,7 @@ async function startMockProvider(script) {
       if (request.url.endsWith('/chat/completions')) payload = openaiTextResponse(step[0] === 'text' ? step[1] : 'unsupported step');
       else if (step[0] === 'tool') payload = toolResponse(index, step[1], step[2]);
       else if (step[0] === 'echo') payload = textResponse(index, `saw: ${lastToolResult(body)}`);
+      else if (step[0] === 'thinking_cut') payload = thinkingCutResponse(index, step[1]);
       else payload = textResponse(index, step[1]);
       response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Content-Length': Buffer.byteLength(payload) });
       response.end(payload);

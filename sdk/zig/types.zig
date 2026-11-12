@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 27;
+pub const ABI_REVISION: u32 = 28;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 27 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 28 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -276,6 +276,8 @@ pub const MAX_SKILL_SOURCES_V1: u64 = 64;
 pub const MAX_SKILL_SOURCE_ID_BYTES_V1: u64 = 128;
 pub const MAX_PROCESS_PLUGIN_SOURCES_V1: u64 = 64;
 pub const MAX_TURNS_V1: u32 = 1000;
+/// Revision 28 (#452): the most `RunOptionsV1.stream_retry_budget` allows.
+pub const MAX_STREAM_RETRY_BUDGET_V1: u32 = 8;
 /// Prompt profile limits (#184): entries, one section's text, and every
 /// entry's text together. Ids are `metacodes:<name>` or `host:<name>` with a
 /// name of at most 64 bytes.
@@ -1043,7 +1045,16 @@ pub const RunOptionsV1 = extern struct {
     /// Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET; zero
     /// under any other code.
     utc_offset_minutes: i32,
-    reserved: [1]u64,
+    /// Revision 28 (#452): how many times this Run may re-issue a request
+    /// whose accepted stream failed without an answer (a stall, a stream that
+    /// ended before its stop report, a dropped connection) after it showed
+    /// output, 0..MAX_STREAM_RETRY_BUDGET_V1. Each such re-issue closes the
+    /// attempt's segment `discarded`, withdraws its thinking with
+    /// `thinking_discarded` and is announced by `retry_notice`. Zero keeps the
+    /// Revision 27 behavior: only an attempt that showed nothing is re-issued,
+    /// once.
+    stream_retry_budget: u32,
+    reserved0: u32,
 };
 
 /// Terminal Run summary. All fields are defined on STATUS_OK. On
@@ -1608,7 +1619,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunOptionsV1, "context_block_count"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunOptionsV1, "time_context_code"));
     try std.testing.expectEqual(@as(usize, 28), @offsetOf(RunOptionsV1, "utc_offset_minutes"));
-    try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunOptionsV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunOptionsV1, "stream_retry_budget"));
+    try std.testing.expectEqual(@as(usize, 36), @offsetOf(RunOptionsV1, "reserved0"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(SessionControlApiV1, "set_prompt_profile"));
     try std.testing.expectEqual(@as(usize, 72), @offsetOf(SessionControlApiV1, "update_permission_mode"));
     try std.testing.expectEqual(@as(usize, 80), @offsetOf(SessionControlApiV1, "rewind_to_user_message"));
@@ -1700,9 +1712,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 27 keeps MCP wire codes stable" {
+test "Revision 28 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 27), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 28), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

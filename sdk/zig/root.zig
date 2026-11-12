@@ -540,7 +540,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 27 SDK rejects Revision 13 through 26 and stale reference roots" {
+test "Revision 28 SDK rejects Revision 13 through 27 and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -590,13 +590,14 @@ test "Revision 27 SDK rejects Revision 13 through 26 and stale reference roots" 
         try std.testing.expectError(error.UnsupportedAbi, Api.validate(&root));
     }
 
-    // The 80-byte reference layout has Revision 27's size, so it fails at the
+    // The 80-byte reference layout has Revision 28's size, so it fails at the
     // revision check (a Revision 24 root, whose Session table is 8 bytes
     // short, a Revision 25 root, whose Skill catalog structs carry no source
-    // priorities, and a Revision 26 root, whose Session Control table is 8
-    // bytes short of the rewind slot, included) or, carrying 27, at its
-    // missing tables.
-    for ([_]u32{ 13, 23, 24, 25, 26, types.ABI_REVISION }) |revision| {
+    // priorities, a Revision 26 root, whose Session Control table is 8 bytes
+    // short of the rewind slot, and a Revision 27 root, whose RunOptionsV1
+    // has no stream retry budget, included) or, carrying 28, at its missing
+    // tables.
+    for ([_]u32{ 13, 23, 24, 25, 26, 27, types.ABI_REVISION }) |revision| {
         var stale_reference: types.ApiV1 align(@alignOf(types.ApiV1)) = std.mem.zeroes(types.ApiV1);
         stale_reference.struct_size = @sizeOf(types.ApiV1);
         stale_reference.abi_version = types.ABI_VERSION_V1;

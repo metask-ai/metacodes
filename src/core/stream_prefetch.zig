@@ -204,13 +204,22 @@ pub const Prefetch = struct {
     /// join 所有在飞线程 + 释放未取走结果(**幂等**:thread/content 置 null,可反复调)。
     /// **必须在释放 tool_uses(线程 borrow 其 id/name/input 字节)之前调**——否则在飞的 Read/Grep
     /// 线程会读已释放内存(Linus HIGH-1 UAF)。abort / stream-error 早退分支显式调它。
+    ///
+    /// Afterwards no entry can be taken: its result is gone and its `id` still
+    /// borrows the abandoned attempt's tool_use bytes, which the caller frees
+    /// next. A same-turn re-issue (#452) keeps this Prefetch, so its `take`
+    /// must neither compare against those bytes nor match an id the new
+    /// attempt happens to repeat with an empty result; such a call runs
+    /// normally instead.
     pub fn joinAll(self: *Prefetch) void {
         for (self.entries.items) |e| {
             if (e.thread) |t| {
                 t.join();
                 e.thread = null;
             }
+            e.id = "";
             if (!e.taken) {
+                e.taken = true;
                 if (e.content) |c| self.allocator.free(c);
                 e.content = null;
                 if (e.file_refs) |refs| {
@@ -278,6 +287,26 @@ test "Prefetch start+take:真 builtin Glob 结果正确落地(执行路径端到
     // 再取同 id → null(已取走);随机 id → null。
     try std.testing.expect(p.take("gid") == null);
     try std.testing.expect(p.take("nope") == null);
+}
+
+test "Prefetch: after joinAll an abandoned attempt's result is never taken (#452)" {
+    const a = std.testing.allocator;
+    var p = Prefetch.init(a);
+    defer p.deinit();
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "." };
+    // The id lives in the attempt's tool_use list, freed right after joinAll.
+    const first_id = try a.dupe(u8, "toolu_1");
+    p.start(&ctx, first_id, "Glob", "{\"pattern\":\"*.zig\"}", .{ .bytes = [_]u8{'0'} ** 12 });
+    p.joinAll();
+    a.free(first_id);
+    // A re-issued attempt that repeats the id finds nothing, so the call runs
+    // for real instead of taking a released, empty result.
+    try std.testing.expect(p.take("toolu_1") == null);
+    // Its own prefetch of that id is found.
+    p.start(&ctx, "toolu_1", "Glob", "{\"pattern\":\"*.zig\"}", .{ .bytes = [_]u8{'0'} ** 12 });
+    const r = p.take("toolu_1") orelse return error.PrefetchMissing;
+    try std.testing.expect(r.content != null);
+    if (r.content) |c| a.free(c);
 }
 
 test "Prefetch:在飞线程数被 MAX_TOOL_CONCURRENCY cap(一轮 20 个只起 ≤8 线程)" {

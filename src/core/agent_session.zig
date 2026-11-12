@@ -1073,6 +1073,11 @@ pub const AdmittedRun = struct {
     session: *AgentSession,
     identity_value: RunIdentity,
     completed: bool = false,
+    /// Same-turn re-issues this Run's loop may make after an accepted stream
+    /// failed without an answer and after it showed output
+    /// (`agent_loop.Options.retractable_stream_retries`, #452). The embedding
+    /// layer sets it before the Run starts; 0 keeps the loop's default.
+    stream_retry_budget: u8 = 0,
 
     pub fn identity(self: *const AdmittedRun) RunIdentity {
         std.debug.assert(!self.completed);
@@ -1191,6 +1196,7 @@ pub const AdmittedRun = struct {
             execution_policy,
             tool_surface,
             provider_override,
+            self.stream_retry_budget,
         );
     }
 
@@ -1272,6 +1278,7 @@ pub const AdmittedRun = struct {
             execution_policy,
             tool_surface,
             provider_override,
+            self.stream_retry_budget,
         );
     }
 
@@ -2678,6 +2685,7 @@ pub const AgentSession = struct {
         execution_policy: ?ToolExecutionPolicy,
         tool_surface: ?RunToolSurface,
         provider_override: ?provider_mod.Provider,
+        stream_retry_budget: u8,
     ) anyerror!agent_loop.RunResult {
         var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
         const tool_definitions = if (tool_surface) |surface|
@@ -2746,6 +2754,7 @@ pub const AgentSession = struct {
             &self.permission_ctx,
             .{
                 .max_turns = max_turns,
+                .retractable_stream_retries = stream_retry_budget,
                 .model_error_out = &self.last_model_error,
                 .session = identity.session_id,
                 .session_id = identity.session_id.asSlice(),

@@ -78,6 +78,18 @@ is not a user message, is out of range, or lies behind the compact boundary
 raises `AgentCoreError` (`NOT_USER_MESSAGE`, `MESSAGE_POSITION_OUT_OF_RANGE`,
 `MESSAGE_POSITION_COMPACTED`) and changes nothing.
 
+A gateway stream sometimes breaks off mid-answer, and a reasoning model has
+usually shown thinking by then, so the run ends with `api_error`.
+`run(prompt, stream_retry_budget=n)` (and `stream(...)`, 0 to 8, default 0)
+lets the run send the same request again up to `n` times when its stream broke
+off without an answer (a stall, a dropped connection, a stream that ended before
+its stop reason); a server's error is never re-sent. Before each retry the run
+tells you what to take back: the attempt's `output_segment_end` has disposition
+`"discarded"` (its text is not part of `RunResult.text`), a
+`thinking_discarded` event `{"index", "turn", "group", "bytes"}` names the
+thinking shown while that segment was open, and a `retry_notice` follows. With
+0 only a stream that showed nothing is retried, once.
+
 `session.close()`, and leaving a `with` block, aborts a run that is still going
 and waits for it first. That includes a `stream()` the loop stopped early with
 `break`.
