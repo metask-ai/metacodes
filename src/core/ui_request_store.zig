@@ -5,16 +5,16 @@
 //!   restarts and a late answer to a request of an earlier process cannot
 //!   reach a newer request;
 //! - the request a suspended Run waits for (`SessionHost.Options.
-//!   ui_request_wait = .suspend`), with what its Run needs to resume.
+//!   ui_request_wait = .suspend`), with everything its Run needs to resume:
+//!   the suspended tool call, a result for every other call of its turn, the
+//!   Run's own settings, and how the request was settled once it was.
 //!
-//! The kernel's own suspension point, the suspended tool call and the results
-//! of the calls beside it, stays in `suspend.json` (core/suspend_state.zig).
-//! This file is the commit point: a `suspend.json` without a `suspended`
-//! entry here is left over and ignored.
-//!
-//! The file is written whole and durably (a temporary file, fsync, rename) by
-//! the Session's driver, or by `close` once the driver has stopped; it is read
-//! when the Session is opened. One writer at a time, so no lock.
+//! It is self-sufficient: the kernel's `suspend.json` (core/suspend_state.zig)
+//! is overwritten in place without fsync and does not keep every sibling, so
+//! a SessionHost does not use it. The file is written whole and durably (a
+//! temporary file, fsync, rename) by the Session's driver, or by `close` once
+//! the driver has stopped; it is read when the Session is opened. One writer
+//! at a time, so no lock.
 
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -41,9 +41,13 @@ pub const Suspended = struct {
     id: u64,
     /// The request's `ui_request` line, announced again as is.
     announcement: []const u8,
-    /// The suspended tool call (`suspend.json` names it too) and its tool.
+    /// The suspended tool call and its tool.
     tool_use_id: []const u8,
     tool_name: []const u8,
+    /// A result for every other call of the suspended turn, in the turn's
+    /// order: what ran beside the suspended call, and, for a call that never
+    /// ran (denied, deferred), a result that says so.
+    completed: []const Result = &.{},
     /// The suspended Run's own settings, which the Run that resumes it keeps.
     trace_id: ?[]const u8 = null,
     max_turns: u32,
@@ -51,9 +55,18 @@ pub const Suspended = struct {
     /// Wall-clock milliseconds at which the request expires unanswered
     /// (`Options.ui_request_timeout_ms`); null never.
     expires_at_ms: ?i64 = null,
-    /// How the request was settled while it had not yet been applied when
-    /// its Session closed; null while it waits for an answer.
+    /// How the request was settled, once it was: recorded before the answer
+    /// enters the conversation and cleared after the resumed Run's transcript
+    /// is written, so the next open applies it, unless the transcript already
+    /// holds the call's result. Null while it waits for an answer.
     settled: ?Settled = null,
+};
+
+/// One tool result, as it enters the conversation on resume.
+pub const Result = struct {
+    tool_use_id: []const u8,
+    content: []const u8,
+    is_error: bool,
 };
 
 pub const Outcome = enum { answered, cancelled };
@@ -165,6 +178,10 @@ test "ui_request_store: no file, a round trip with a settled suspension, and wha
         .announcement = "{\"v\":1,\"type\":\"ui_request\",\"id\":7}",
         .tool_use_id = "tu_q",
         .tool_name = "AskUserQuestion",
+        .completed = &.{
+            .{ .tool_use_id = "tu_w", .content = "{\"ok\":true}", .is_error = false },
+            .{ .tool_use_id = "tu_r", .content = "{\"error\":\"NotRun\"}", .is_error = true },
+        },
         .trace_id = "t-1",
         .max_turns = 40,
         .stream_retry_budget = 2,
@@ -175,6 +192,9 @@ test "ui_request_store: no file, a round trip with a settled suspension, and wha
     const suspended = held.suspended.?;
     try std.testing.expectEqual(@as(u64, 7), suspended.id);
     try std.testing.expectEqualStrings("{\"v\":1,\"type\":\"ui_request\",\"id\":7}", suspended.announcement);
+    try std.testing.expectEqual(@as(usize, 2), suspended.completed.len);
+    try std.testing.expectEqualStrings("tu_r", suspended.completed[1].tool_use_id);
+    try std.testing.expect(suspended.completed[1].is_error);
     try std.testing.expectEqualStrings("t-1", suspended.trace_id.?);
     try std.testing.expectEqual(@as(u8, 2), suspended.stream_retry_budget);
     try std.testing.expectEqual(@as(?i64, 1_700_000_000_000), suspended.expires_at_ms);

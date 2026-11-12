@@ -220,7 +220,10 @@ and the answer then resumes the Run once:
 {"v":1,"type":"run_done","data":{"run_id":1,"trace_id":"t","stop_reason":"end_turn","error_name":null,"model_error":null}}
 ```
 
-The resumed Run keeps the suspended Run's `trace_id` and turn limit. Request
+The resumed Run keeps the suspended Run's `trace_id` and turn limit. An open
+that finds the suspended call already answered in the Session's transcript
+(the resumed Run was written, then the Host stopped) does not announce the
+request again: it was applied once and is not applied twice. Request
 ids are never reused for a Session in this mode, across restarts too, so a
 late answer cannot reach a newer request: an answer to a request that is no
 longer open changes nothing (`error.NoSuchRequest`), and a second answer to

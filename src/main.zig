@@ -306,6 +306,7 @@ pub const tui_backend = @import("repl/tui/tui_backend.zig");
 pub const writer_backend = @import("core/writer_backend.zig");
 pub const headless_backend = @import("core/headless_backend.zig");
 pub const suspend_state = @import("core/suspend_state.zig");
+pub const ui_request_store = @import("core/ui_request_store.zig");
 pub const tee_backend = @import("core/tee_backend.zig");
 pub const diagnostics_backend = @import("core/diagnostics_backend.zig");
 pub const evaluation_backend = @import("core/evaluation_backend.zig");

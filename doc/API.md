@@ -1168,11 +1168,19 @@ UI requests on a long-lived Session (#446; the wire side is
   `transcripts`, else `open` is `error.SuspendRequiresTranscripts`): a
   question or custom UI request ends its Run `suspended` (`Phase.suspended`)
   instead of holding the driver. The Session's directory keeps it
-  (`ui_requests.json` beside the kernel's `suspend.json`); `close` leaves it
+  (`ui_requests.json`, written whole and fsynced, with a result for every
+  other call of the suspended turn; the kernel's `suspend.json` is not
+  used); `close` leaves it
   there; `open(.resume)` under the id, after a restart too, announces it
   again under the same id; `respond` then resumes the Run once through
   `AdmittedRun.resumeWithResults`, journaled as `ui_request_closed` and
-  `run_resumed`. Nothing else runs while a Run is suspended: queued work
+  `run_resumed`. Exactly once, with the transcript as the witness: the
+  settlement is recorded before it enters the conversation and dropped once
+  the resumed Run's transcript holds the call's result; a crash in between
+  applies it on the next open, and an open that finds the result already
+  there only drops the record. A call of the suspended turn that the kernel
+  did not run (it denied or deferred it) is answered on resume with a result
+  saying it did not run. Nothing else runs while a Run is suspended: queued work
   waits, and a team lead does not read its inbox, so a teammate's reply
   waits there, unread, and becomes the lead's next Run after the resumed Run
   and the queue. The resumed Run keeps the suspended Run's `trace_id`, turn

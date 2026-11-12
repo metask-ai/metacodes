@@ -24,14 +24,46 @@ const QueueWaiting = cc.session_host.QueueWaiting;
 
 const TOOLS = [_][]const u8{ "AskUserQuestion", "Write" };
 
-/// The model asks one question (call `tu_q`).
-const ASK_SSE =
-    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_q\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+const TURN_START =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_q\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+/// Call `tu_q`, content block 0: AskUserQuestion with one question.
+const QUESTION_BLOCK =
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_q\",\"name\":\"AskUserQuestion\",\"input\":{}}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"questions\\\":[{\\\"question\\\":\\\"Ship now?\\\",\\\"header\\\":\\\"Decision\\\",\\\"options\\\":[{\\\"label\\\":\\\"Ship\\\",\\\"description\\\":\\\"Release now\\\"},{\\\"label\\\":\\\"Wait\\\",\\\"description\\\":\\\"Hold the release\\\"}]}]}\"}}\n\n" ++
-    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+const TOOL_TURN_END =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
+
+/// The model asks one question (call `tu_q`).
+const ASK_SSE = TURN_START ++ QUESTION_BLOCK ++ TOOL_TURN_END;
+
+/// One turn of three calls: the question (`tu_q`), a Write (`tu_w`) and a
+/// Read (`tu_r`).
+fn mixedTurnSse(allocator: std.mem.Allocator, write_path: []const u8, read_path: []const u8) ![]u8 {
+    const write_block = try std.fmt.allocPrint(allocator, "data: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_w\",\"name\":\"Write\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"file_path\\\":\\\"{s}\\\",\\\"content\\\":\\\"beside\\\"}}\"}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n", .{write_path});
+    defer allocator.free(write_block);
+    const read_block = try std.fmt.allocPrint(allocator, "data: {{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_r\",\"name\":\"Read\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_delta\",\"index\":2,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"file_path\\\":\\\"{s}\\\"}}\"}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_stop\",\"index\":2}}\n\n", .{read_path});
+    defer allocator.free(read_block);
+    return std.mem.concat(allocator, u8, &.{ TURN_START, QUESTION_BLOCK, write_block, read_block, TOOL_TURN_END });
+}
+
+/// The directory `SessionHost` keeps Session `id` in.
+fn sessionDirOf(a: std.mem.Allocator, config: cc.agent_session.SessionConfig, id: cc.session_id.SessionId) ![]u8 {
+    var policy = try cc.workspace_policy.WorkspacePolicy.init(a, config.workspace);
+    defer policy.deinit();
+    return cc.transcript.sessionDir(a, policy.stateRoot(), policy.root, id);
+}
+
+fn readFileIn(a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name });
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1 << 20));
+}
 
 fn textSse(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_t\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
@@ -759,4 +791,168 @@ test "L2 #446 SessionHost suspend mode: a suspended team lead runs nothing and l
     try std.testing.expect(std.mem.indexOf(u8, request.body(), "done: 42") != null);
     std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
     try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "done: 42"));
+}
+
+test "L2 #446 SessionHost suspend mode: a question asked beside other calls; across a restart every call of the turn gets its result, and what ran ran once" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const write_path = try std.fmt.allocPrint(a, "{s}/beside.txt", .{dirs.workspace});
+    defer a.free(write_path);
+    const read_path = try std.fmt.allocPrint(a, "{s}/secret.txt", .{dirs.workspace});
+    defer a.free(read_path);
+    const mixed = try mixedTurnSse(a, write_path, read_path);
+    defer a.free(mixed);
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ mixed, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const tools = [_][]const u8{ "AskUserQuestion", "Write", "Read" };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &tools });
+    defer runtime.destroy() catch unreachable;
+    var config = baseConfig(url, dirs.workspace, dirs.home);
+    config.allowed_tools = &tools;
+    // The Write runs (in the workspace); the Read is denied by a rule.
+    config.permission_mode = .accept_edits;
+
+    var id: cc.session_id.SessionId = undefined;
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config });
+        defer host.release(hosted);
+        id = hosted.id;
+        try hosted.command(.{ .update_permission_rules = .{ .deny = &.{"Read"} } });
+        try hosted.submit(.{ .text = "do three things" });
+        try waitFor(&hosted.journal, "\"stop_reason\":\"suspended\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"tool_start\",\"run_id\":1,\"data\":{\"id\":\"tu_w\""));
+    }
+    try std.testing.expect(try exists(dirs.workspace, "beside.txt"));
+    try std.testing.expect(!try exists(dirs.workspace, "secret.txt"));
+
+    // What the Session's directory holds: one self-sufficient record.
+    const dir = try sessionDirOf(a, config, id);
+    defer a.free(dir);
+    try std.testing.expect(!try exists(dir, "suspend.json"));
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const state = (try cc.ui_request_store.load(arena.allocator(), dir)).?;
+        const held = state.suspended.?;
+        try std.testing.expectEqualStrings("tu_q", held.tool_use_id);
+        try std.testing.expectEqual(@as(usize, 2), held.completed.len);
+        try std.testing.expectEqualStrings("tu_w", held.completed[0].tool_use_id);
+        try std.testing.expect(!held.completed[0].is_error);
+        try std.testing.expectEqualStrings("tu_r", held.completed[1].tool_use_id);
+        try std.testing.expect(held.completed[1].is_error);
+        try std.testing.expect(std.mem.indexOf(u8, held.completed[1].content, "Read did not run") != null);
+    }
+
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+        defer host.release(hosted);
+        try hosted.respond(1, "{\"answers\":[\"Ship\"]}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+        // Nothing ran again on resume.
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"tool_start\""));
+    }
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    // The resumed request answers all three calls itself, none by the
+    // request builder's stand-in.
+    const resumed = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    for ([_][]const u8{ "tu_q", "tu_w", "tu_r", "Read did not run" }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, resumed, needle) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, resumed, "tool_use had no result") == null);
+    // So does the transcript: one result for each call.
+    const transcript = try readFileIn(a, dir, "transcript.jsonl");
+    defer a.free(transcript);
+    for ([_][]const u8{ "\"tool_use_id\":\"tu_q\"", "\"tool_use_id\":\"tu_w\"", "\"tool_use_id\":\"tu_r\"" }) |needle| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, transcript, needle));
+    }
+    const written = try readFileIn(a, dirs.workspace, "beside.txt");
+    defer a.free(written);
+    try std.testing.expectEqualStrings("beside", written);
+}
+
+test "L2 #446 SessionHost suspend mode: the transcript is the witness; a recorded answer is applied once after a crash, and never again once it was" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const after = try textSse(a, "after the answer");
+    defer a.free(after);
+    const bodies = [_][]const u8{ ASK_SSE, after };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &TOOLS });
+    defer runtime.destroy() catch unreachable;
+    const config = baseConfig(url, dirs.workspace, dirs.home);
+
+    var id: cc.session_id.SessionId = undefined;
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config });
+        defer host.release(hosted);
+        id = hosted.id;
+        try hosted.submit(.{ .text = "ask me" });
+        try waitFor(&hosted.journal, "\"stop_reason\":\"suspended\"", 1);
+    }
+    const dir = try sessionDirOf(a, config, id);
+    defer a.free(dir);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var state = (try cc.ui_request_store.load(arena.allocator(), dir)).?;
+    // What the disk holds when the answer was recorded and the process
+    // stopped before the resumed Run was written.
+    state.suspended.?.settled = .{ .outcome = .answered, .answer = "{\"answers\":[\"Wait\"]}", .by = "carol" };
+    try cc.ui_request_store.store(a, dir, state);
+
+    // The next open applies it, once.
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+        defer host.release(hosted);
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\",\"by\":\"carol\"}"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"run_resumed\",\"data\":{\"run_id\":1,"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+    }
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    const resumed = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, resumed, "{\\\"answers\\\":[\\\"Wait\\\"]}") != null);
+    try std.testing.expect((try cc.ui_request_store.load(arena.allocator(), dir)).?.suspended == null);
+
+    // What the disk holds when the resumed Run was written and the process
+    // stopped before the record was cleared: the transcript already has the
+    // call's result, so the next open only drops the record.
+    try cc.ui_request_store.store(a, dir, state);
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+        defer host.release(hosted);
+        std.Io.sleep(std.testing.io, .fromMilliseconds(200), .awake) catch {};
+        try expectSnapshot(hosted, .idle, 0, 0, .none);
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"ui_request"));
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"run_resumed\""));
+        try std.testing.expectError(error.NoSuchRequest, hosted.respond(1, "{\"answers\":[\"Wait\"]}"));
+    }
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try std.testing.expect((try cc.ui_request_store.load(arena.allocator(), dir)).?.suspended == null);
+    const transcript = try readFileIn(a, dir, "transcript.jsonl");
+    defer a.free(transcript);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, transcript, "\"tool_use_id\":\"tu_q\""));
 }

@@ -842,7 +842,8 @@ Slack/邮件投递器仍属于宿主职责，core 不负责网络传输。
 在 `no_interactive_prompt` 下直接拒绝该工具，Run 不会挂起。所以 `SessionHost` 的挂起模式
 （`Options.ui_request_wait = .suspend`，#446）只挂起问答和 custom 请求，权限请求仍同步等待；
 它用 `AdmittedRun.resumeWithResults`（内部即 `agent_loop.resumeRunWithResults`）恢复挂起的
-Run，挂起状态落在会话目录的 `suspend.json` 与 `ui_requests.json`。
+Run。挂起状态只落在会话目录的 `ui_requests.json`（临时文件 + fsync + rename，自带同轮其余调用的结果），
+不用 `suspend.json`：后者原地覆写、不 fsync，也不保留被拒绝或推迟的兄弟调用。
 
 ---
 

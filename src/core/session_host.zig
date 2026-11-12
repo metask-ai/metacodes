@@ -33,7 +33,7 @@
 //! once `ui_request_timeout_ms` passes is `ui_request_expiry`'s choice. With
 //! `ui_request_wait = .suspend`, a question or custom UI request does not hold
 //! the driver: its Run ends `suspended`, the Session's directory keeps the
-//! request (`ui_request_store`, `suspend.json`), `close` leaves it there, a
+//! request (`ui_request_store`), `close` leaves it there, a
 //! Session opened again under its id announces it again under the same id,
 //! and `respond` resumes the Run with the answer, once (`AgentSession`'s
 //! `AdmittedRun.resumeWithResults`). A permission request always blocks: the
@@ -69,7 +69,6 @@ const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
 const agent_session = @import("agent_session.zig");
 const agent_loop = @import("agent_loop.zig");
-const suspend_state = @import("suspend_state.zig");
 const ui_request_store = @import("ui_request_store.zig");
 const tool_error = @import("tool_error.zig");
 const ask_user = @import("../tools/ask_user.zig");
@@ -660,6 +659,10 @@ pub const HostedSession = struct {
     /// resumption has journaled the request's close. Under `mutex`; the
     /// driver (or, once it stopped, `shutdown`) frees it.
     suspension: ?*Suspension = null,
+    /// The suspension the Run in progress resumes. Its settlement stays in
+    /// `ui_request_store` until the transcript holds the call's result, the
+    /// witness the next open checks. Under `mutex`; the driver frees it.
+    resuming: ?*Suspension = null,
     /// What the client declared it renders; empty until `declareCapabilities`.
     capabilities: frontend_capabilities.Slot = .{},
     /// `Options.max_queued`, for a `snapshot` of a shell that outlived its
@@ -1278,7 +1281,7 @@ pub const HostedSession = struct {
         self.mutex.unlock();
         // `.suspend` keeps ids across restarts: this one is written before
         // anyone can answer it. Unwritten, it is still unique in this process.
-        if (policy.wait == .@"suspend") self.storeRequests(null, false) catch |err|
+        if (policy.wait == .@"suspend") self.storeRequests() catch |err|
             log.warn("session_host", "request id {d} of {s} not recorded: {s}", .{ request_id, self.id.asSlice(), @errorName(err) });
 
         const announce = wire.writeRequest(self.gpa, request_id, req) catch |err| {
@@ -1429,9 +1432,10 @@ pub const HostedSession = struct {
     }
 
     /// Holds a Run that ended `suspended` until its request is settled.
-    /// Durable first: the conversation with the suspended call, the
-    /// kernel's suspension point (`suspend.json`), then the request
-    /// (`ui_request_store`), the commit point a later open reads.
+    /// Durable first: the conversation with the suspended call (the
+    /// transcript is fsynced), then the request with a result for every
+    /// other call of its turn (`ui_request_store`, the commit point a later
+    /// open reads).
     fn holdSuspension(self: *HostedSession, info: agent_loop.SuspendInfo, settings: RunSettings) void {
         self.mutex.lock();
         const taken = self.suspending;
@@ -1454,10 +1458,7 @@ pub const HostedSession = struct {
             return;
         };
         self.persist();
-        self.persistSuspension(info, suspension) catch |err|
-            log.warn("session_host", "suspended request {d} of {s} held in memory only, a restart loses it: {s}", .{ pending.id, self.id.asSlice(), @errorName(err) });
         self.mutex.lock();
-        defer self.mutex.unlock();
         self.suspension = suspension;
         self.pending_request_id = suspension.request_id;
         if (pending.answer) |json| {
@@ -1467,6 +1468,9 @@ pub const HostedSession = struct {
         }
         // An interrupt during the Run cancels what it suspended on.
         if (self.run_interrupted) self.cancelSuspensionLocked(suspension, true);
+        self.mutex.unlock();
+        self.storeRequests() catch |err|
+            log.warn("session_host", "suspended request {d} of {s} held in memory only, a restart loses it: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
     }
 
     fn buildSuspension(self: *HostedSession, pending: Suspending, info: agent_loop.SuspendInfo, settings: RunSettings) !*Suspension {
@@ -1476,14 +1480,7 @@ pub const HostedSession = struct {
         suspension.announcement = try a.dupe(u8, pending.announcement);
         suspension.request = (try wire.parseRequest(a, suspension.announcement)).request;
         suspension.tool_use_id = try a.dupe(u8, info.tool_use_id);
-        suspension.tool_name = try self.toolNameOf(a, info.tool_use_id);
-        const completed = try a.alloc(agent_loop.SuspendInfo.CompletedResult, info.completed_results.len);
-        for (info.completed_results, completed) |result, *copy| copy.* = .{
-            .tool_use_id = try a.dupe(u8, result.tool_use_id),
-            .content = try a.dupe(u8, result.content),
-            .is_error = result.is_error,
-        };
-        suspension.completed = completed;
+        try self.turnResults(a, info, suspension);
         suspension.settings = .{
             .trace_id = if (settings.trace_id) |trace_id| try a.dupe(u8, trace_id) else null,
             .max_turns = settings.max_turns,
@@ -1491,6 +1488,52 @@ pub const HostedSession = struct {
         };
         suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| wallMs() +| @as(i64, @intCast(ms)) else null;
         return suspension;
+    }
+
+    /// The suspended call's tool, and a result for every other call of its
+    /// turn, in the turn's order. The kernel keeps the results of the calls
+    /// that ran beside the suspended one, not of those it denied or deferred
+    /// (agent_loop's suspension), so a call without one gets a result that
+    /// says it did not run: resumed, the turn answers every call.
+    fn turnResults(self: *HostedSession, a: std.mem.Allocator, info: agent_loop.SuspendInfo, suspension: *Suspension) !void {
+        var results: std.ArrayList(agent_loop.SuspendInfo.CompletedResult) = .empty;
+        var lease = self.session.snapshotCommitted() catch {
+            // Not reached after a Run returned; keep what the kernel kept.
+            for (info.completed_results) |result| try results.append(a, try copyResult(a, result));
+            suspension.completed = results.items;
+            return;
+        };
+        defer lease.deinit();
+        const messages = lease.conversation.messages.items;
+        const turn = if (messages.len == 0) &[_]@import("message.zig").Block{} else messages[messages.len - 1].blocks;
+        for (turn) |block| switch (block) {
+            .tool_use => |call| {
+                if (std.mem.eql(u8, call.id, info.tool_use_id)) {
+                    suspension.tool_name = try a.dupe(u8, call.name);
+                    continue;
+                }
+                for (info.completed_results) |result| {
+                    if (std.mem.eql(u8, result.tool_use_id, call.id)) {
+                        try results.append(a, try copyResult(a, result));
+                        break;
+                    }
+                } else try results.append(a, .{
+                    .tool_use_id = try a.dupe(u8, call.id),
+                    .content = try tool_error.errorToJson("NotRun", "{s} did not run: its turn was suspended while another call waited for a person's answer", .{call.name}, a),
+                    .is_error = true,
+                });
+            },
+            else => {},
+        };
+        suspension.completed = results.items;
+    }
+
+    fn copyResult(a: std.mem.Allocator, result: agent_loop.SuspendInfo.CompletedResult) error{OutOfMemory}!agent_loop.SuspendInfo.CompletedResult {
+        return .{
+            .tool_use_id = try a.dupe(u8, result.tool_use_id),
+            .content = try a.dupe(u8, result.content),
+            .is_error = result.is_error,
+        };
     }
 
     fn newSuspension(self: *HostedSession, request_id: u64, max_turns: u32) error{OutOfMemory}!*Suspension {
@@ -1525,67 +1568,72 @@ pub const HostedSession = struct {
     fn dropRequests(self: *HostedSession) void {
         if (self.suspension) |suspension| self.destroySuspension(suspension);
         self.suspension = null;
+        if (self.resuming) |resumed| self.destroySuspension(resumed);
+        self.resuming = null;
         if (self.suspending) |pending| self.freeSuspending(pending);
         self.suspending = null;
         if (self.response_by) |by| self.gpa.free(by);
         self.response_by = null;
     }
 
-    /// The tool of call `id` in the committed conversation, or "".
-    fn toolNameOf(self: *HostedSession, a: std.mem.Allocator, id: []const u8) error{OutOfMemory}![]const u8 {
-        var lease = self.session.snapshotCommitted() catch return "";
-        defer lease.deinit();
-        const messages = lease.conversation.messages.items;
-        if (messages.len == 0) return "";
-        for (messages[messages.len - 1].blocks) |block| switch (block) {
-            .tool_use => |call| if (std.mem.eql(u8, call.id, id)) return a.dupe(u8, call.name),
-            else => {},
-        };
-        return "";
-    }
-
-    fn persistSuspension(self: *HostedSession, info: agent_loop.SuspendInfo, suspension: *const Suspension) !void {
-        const dir = self.store_dir orelse return error.NoSessionDirectory;
-        try suspend_state.writeFromSuspendInfo(dir, info, self.gpa);
-        try self.storeRequests(suspension, false);
-    }
-
     /// Writes the Session's request state (`ui_request_store`): the next
-    /// request id, and `suspended` with how it was settled when
-    /// `with_settlement` (only once the driver has stopped). Nothing without
-    /// a Session directory.
-    fn storeRequests(self: *HostedSession, suspended: ?*const Suspension, with_settlement: bool) !void {
+    /// request id and the suspension it holds, waiting (`suspension`) or
+    /// being resumed (`resuming`), with how it was settled. Nothing without a
+    /// Session directory. Only the driver writes, or `close` once the driver
+    /// has stopped; `respond` and `interrupt` change memory alone.
+    fn storeRequests(self: *HostedSession) !void {
         const dir = self.store_dir orelse return;
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const state = try self.requestStateLocked(a);
+        try ui_request_store.store(a, dir, state);
+    }
+
+    /// Takes `mutex`. The settlement's strings are copied: an interrupt may
+    /// free them once the lock is gone. The rest of a Suspension is fixed
+    /// once held and freed only by the driver, so it is borrowed.
+    fn requestStateLocked(self: *HostedSession, a: std.mem.Allocator) error{OutOfMemory}!ui_request_store.State {
         self.mutex.lock();
-        const next_id = self.next_request_id;
-        const settled: ?ui_request_store.Settled = if (!with_settlement) null else if (suspended) |suspension| switch (suspension.settled) {
-            .open => null,
-            .answered => |answered| .{ .outcome = .answered, .answer = answered.json, .by = answered.by },
-            .cancelled => |cancelled| .{ .outcome = .cancelled, .stop = cancelled.stop },
-        } else null;
-        const expires_at_ms = if (suspended) |suspension| suspension.expires_at_ms else null;
-        self.mutex.unlock();
-        const record: ?ui_request_store.Suspended = if (suspended) |suspension| .{
+        defer self.mutex.unlock();
+        const held = self.suspension orelse self.resuming orelse return .{ .next_id = self.next_request_id };
+        const completed = try a.alloc(ui_request_store.Result, held.completed.len);
+        for (held.completed, completed) |result, *copy| copy.* = .{
+            .tool_use_id = result.tool_use_id,
+            .content = result.content,
+            .is_error = result.is_error,
+        };
+        return .{ .next_id = self.next_request_id, .suspended = .{
             .kind = .answer,
-            .id = suspension.request_id,
-            .announcement = suspension.announcement,
-            .tool_use_id = suspension.tool_use_id,
-            .tool_name = suspension.tool_name,
-            .trace_id = suspension.settings.trace_id,
-            .max_turns = suspension.settings.max_turns,
-            .stream_retry_budget = suspension.settings.stream_retry_budget,
-            .expires_at_ms = expires_at_ms,
-            .settled = settled,
-        } else null;
-        try ui_request_store.store(self.gpa, dir, .{ .next_id = next_id, .suspended = record });
+            .id = held.request_id,
+            .announcement = held.announcement,
+            .tool_use_id = held.tool_use_id,
+            .tool_name = held.tool_name,
+            .completed = completed,
+            .trace_id = held.settings.trace_id,
+            .max_turns = held.settings.max_turns,
+            .stream_retry_budget = held.settings.stream_retry_budget,
+            .expires_at_ms = held.expires_at_ms,
+            .settled = switch (held.settled) {
+                .open => null,
+                .answered => |answered| .{
+                    .outcome = .answered,
+                    .answer = try a.dupe(u8, answered.json),
+                    .by = if (answered.by) |by| try a.dupe(u8, by) else null,
+                },
+                .cancelled => |cancelled| .{ .outcome = .cancelled, .stop = cancelled.stop },
+            },
+        } };
     }
 
     /// At `open`: what the Session's directory kept (#446). Ids go on from
-    /// where they stopped, whatever the open. A resumed Session holds its
-    /// suspended Run again and announces the request under its id; a fresh
-    /// one drops it with the conversation it belonged to. A file this
-    /// version cannot read is left in place; a suspension that no longer
-    /// matches the conversation is dropped. Both are logged.
+    /// where they stopped, whatever the open. On a resumed Session the
+    /// transcript is the witness: a call that already has its result there
+    /// was resumed, and its record is only marked consumed, never applied
+    /// again; a call still waiting is held again and its request announced
+    /// under its id, and a settlement it had is applied once the driver
+    /// starts. A fresh open drops it with the conversation it belonged to. A
+    /// file this version cannot read is left in place (logged).
     fn restoreRequests(self: *HostedSession, mode: OpenMode, conversation: *const Conversation) void {
         const dir = self.store_dir orelse return;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -1596,32 +1644,29 @@ pub const HostedSession = struct {
         }) orelse return;
         self.next_request_id = state.next_id;
         const record = state.suspended orelse return;
-        if (mode == .@"resume") {
-            if (self.restoreSuspension(dir, record, conversation)) |suspension| {
+        if (mode == .@"resume") switch (callState(conversation, record.tool_use_id)) {
+            .waiting => if (self.restoreSuspension(record)) |suspension| {
                 self.suspension = suspension;
                 self.pending_request_id = suspension.request_id;
                 self.phase = .suspended;
                 self.journal.append(suspension.announcement);
                 return;
             } else |err| {
-                log.err("session_host", "suspended request {d} of {s} not restored: {s}", .{ record.id, self.id.asSlice(), @errorName(err) });
-                if (err == error.OutOfMemory) return;
-            }
-        }
-        self.storeRequests(null, false) catch |err|
+                // Out of memory may pass; anything else will not.
+                if (err == error.OutOfMemory) {
+                    log.err("session_host", "suspended request {d} of {s} not restored, the file is left in place: {s}", .{ record.id, self.id.asSlice(), @errorName(err) });
+                    return;
+                }
+                log.err("session_host", "suspended request {d} of {s} unusable, dropped: {s}", .{ record.id, self.id.asSlice(), @errorName(err) });
+            },
+            .answered => log.info("session_host", "request {d} of {s} was resumed already: consumed", .{ record.id, self.id.asSlice() }),
+            .absent => log.warn("session_host", "request {d} of {s} no longer matches its conversation: dropped", .{ record.id, self.id.asSlice() }),
+        };
+        self.storeRequests() catch |err|
             log.warn("session_host", "UI requests of {s} not rewritten: {s}", .{ self.id.asSlice(), @errorName(err) });
-        suspend_state.clear(dir);
     }
 
-    fn restoreSuspension(self: *HostedSession, dir: []const u8, record: ui_request_store.Suspended, conversation: *const Conversation) !*Suspension {
-        // The conversation must still end in the suspended turn.
-        const messages = conversation.messages.items;
-        if (messages.len == 0 or messages[messages.len - 1].role != .assistant or
-            !madeCall(messages[messages.len - 1], record.tool_use_id)) return error.SuspensionStale;
-        const point = try suspend_state.read(dir, self.gpa);
-        defer suspend_state.freeState(point, self.gpa);
-        if (!std.mem.eql(u8, point.tool_use_id, record.tool_use_id)) return error.SuspensionStale;
-
+    fn restoreSuspension(self: *HostedSession, record: ui_request_store.Suspended) !*Suspension {
         const suspension = try self.newSuspension(record.id, record.max_turns);
         errdefer self.destroySuspension(suspension);
         const a = suspension.arena.allocator();
@@ -1631,8 +1676,8 @@ pub const HostedSession = struct {
         suspension.request = announced.request;
         suspension.tool_use_id = try a.dupe(u8, record.tool_use_id);
         suspension.tool_name = try a.dupe(u8, record.tool_name);
-        const completed = try a.alloc(agent_loop.SuspendInfo.CompletedResult, point.completed_results.len);
-        for (point.completed_results, completed) |result, *copy| copy.* = .{
+        const completed = try a.alloc(agent_loop.SuspendInfo.CompletedResult, record.completed.len);
+        for (record.completed, completed) |result, *copy| copy.* = .{
             .tool_use_id = try a.dupe(u8, result.tool_use_id),
             .content = try a.dupe(u8, result.content),
             .is_error = result.is_error,
@@ -1719,7 +1764,7 @@ pub const HostedSession = struct {
         self.mutex.unlock();
         if (!open) return;
         self.journal.append(suspension.announcement);
-        self.storeRequests(suspension, false) catch |err|
+        self.storeRequests() catch |err|
             log.warn("session_host", "new expiry of request {d} of {s} not recorded: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
     }
 
@@ -1782,9 +1827,12 @@ pub const HostedSession = struct {
     /// Resumes a suspended Run with how its request was settled: the request
     /// closes, then Run N+1 starts with `run_resumed` and continues the
     /// suspended turn under the suspended Run's settings
-    /// (`AdmittedRun.resumeWithResults`). Consumed exactly once: the record
-    /// is cleared before the Run goes on, and a request whose clearing
-    /// cannot be written stays open instead.
+    /// (`AdmittedRun.resumeWithResults`). Exactly once, with the transcript
+    /// as the witness: the settlement is recorded before it enters the
+    /// conversation and stays recorded until the resumed Run's transcript
+    /// holds the call's result. A crash before then applies it on the next
+    /// open; after then, that open sees the result and only drops the
+    /// record.
     fn runResumption(self: *HostedSession, suspension: *Suspension) void {
         if (builtin.is_test) if (testing_hooks.before_resumption) |hook| hook(self);
         // An interrupt that came since it was settled wins over an answer.
@@ -1798,16 +1846,13 @@ pub const HostedSession = struct {
             self.reopenSuspension(suspension, err);
             return;
         };
-        self.storeRequests(null, false) catch |err| {
-            self.reopenSuspension(suspension, err);
-            return;
-        };
-        if (self.store_dir) |dir| suspend_state.clear(dir);
         self.mutex.lock();
         self.suspension = null;
+        self.resuming = suspension;
         self.pending_request_id = 0;
         self.mutex.unlock();
-        defer self.destroySuspension(suspension);
+        self.storeRequests() catch |err|
+            log.warn("session_host", "settlement of request {d} of {s} not recorded; a crash before the resumed Run is written loses it: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
         self.appendLine(wire.writeRequestClosedBy(self.gpa, suspension.request_id, prepared.closed, prepared.by));
 
         self.last_run_id += 1;
@@ -1817,6 +1862,7 @@ pub const HostedSession = struct {
         self.session.awaitProviderCancelsDrained();
         var admitted = self.session.admitRun(context.run_id, scope.sink()) catch |err| {
             self.finishRun(context, null, err, null);
+            self.finishResumption();
             return;
         };
         admitted.stream_retry_budget = suspension.settings.stream_retry_budget;
@@ -1836,6 +1882,34 @@ pub const HostedSession = struct {
         self.run_returned = true;
         self.mutex.unlock();
         self.settleRun(context, outcome, suspension.settings);
+        self.finishResumption();
+    }
+
+    /// After a resumed Run, `finishRun` having written its transcript: when
+    /// the committed conversation holds the call's result, the recorded
+    /// settlement is spent and the record is rewritten without it (or with
+    /// the suspension the Run was held on again). When it does not (the Run
+    /// failed before the results entered it, or the Session is poisoned),
+    /// the record keeps the settlement for the next open to apply.
+    fn finishResumption(self: *HostedSession) void {
+        self.mutex.lock();
+        const resumed = self.resuming orelse {
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.unlock();
+        const applied = blk: {
+            var lease = self.session.snapshotCommitted() catch break :blk false;
+            defer lease.deinit();
+            break :blk callState(lease.conversation, resumed.tool_use_id) == .answered;
+        };
+        if (!applied) log.warn("session_host", "request {d} of {s}: the resumed Run did not record its result; the next open applies it", .{ resumed.request_id, self.id.asSlice() });
+        self.mutex.lock();
+        self.resuming = null;
+        self.mutex.unlock();
+        if (applied) self.storeRequests() catch |err|
+            log.warn("session_host", "request {d} of {s} not marked consumed; the next open finds its result and drops it: {s}", .{ resumed.request_id, self.id.asSlice(), @errorName(err) });
+        self.destroySuspension(resumed);
     }
 
     /// The resumption could not be applied: the request stays open for
@@ -1895,7 +1969,7 @@ pub const HostedSession = struct {
         // A suspended Run outlives the Session (#446): what settled its
         // request but was not applied yet is kept for the next open.
         if (self.suspension) |suspension| {
-            if (suspension.settled != .open) self.storeRequests(suspension, true) catch |err|
+            if (suspension.settled != .open) self.storeRequests() catch |err|
                 log.err("session_host", "settled request {d} of {s} not recorded: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
         }
         self.dropRequests();
@@ -1969,13 +2043,30 @@ fn copyStrings(a: std.mem.Allocator, strings: []const []const u8) error{OutOfMem
     return copy;
 }
 
-/// Whether `message` makes tool call `id`.
-fn madeCall(message: anytype, id: []const u8) bool {
-    for (message.blocks) |block| switch (block) {
-        .tool_use => |call| if (std.mem.eql(u8, call.id, id)) return true,
-        else => {},
-    };
-    return false;
+/// Where tool call `id` stands in `conversation` (#446): `answered` when a
+/// message after the one that made it holds its result, `waiting` when the
+/// call is in the last message and nothing answers it, `absent` otherwise.
+const CallState = enum { waiting, answered, absent };
+
+fn callState(conversation: *const Conversation, id: []const u8) CallState {
+    const messages = conversation.messages.items;
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        const made = for (messages[index].blocks) |block| switch (block) {
+            .tool_use => |call| if (std.mem.eql(u8, call.id, id)) break true,
+            else => {},
+        } else false;
+        if (!made) continue;
+        for (messages[index + 1 ..]) |later| {
+            for (later.blocks) |block| switch (block) {
+                .tool_result => |result| if (std.mem.eql(u8, result.tool_use_id, id)) return .answered,
+                else => {},
+            };
+        }
+        return if (index + 1 == messages.len) .waiting else .absent;
+    }
+    return .absent;
 }
 
 // ============================================================================
