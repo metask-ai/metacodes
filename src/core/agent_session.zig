@@ -1197,6 +1197,7 @@ pub const AdmittedRun = struct {
             tool_surface,
             provider_override,
             self.stream_retry_budget,
+            null,
         );
     }
 
@@ -1279,6 +1280,46 @@ pub const AdmittedRun = struct {
             tool_surface,
             provider_override,
             self.stream_retry_budget,
+            null,
+        );
+    }
+
+    /// Resume a Run that ended `suspended` (`RunResult.suspend_info`, #446):
+    /// `results` answer the tool calls of the Conversation's last assistant
+    /// turn, the suspended one's first, followed by the `completed_results`
+    /// of its siblings, and enter the Conversation as one user message
+    /// (`agent_loop.resumeRunWithResults`); the loop then goes on as any Run
+    /// does. Borrowed for the call.
+    ///
+    /// Everything that was per-Run in the suspended Run is the caller's to
+    /// give again: `max_turns`, and `stream_retry_budget` on this admission.
+    /// The Conversation, permissions and configuration are the Session's own
+    /// and carry over by themselves.
+    ///
+    /// Refused before anything changes, the admitted Run finished cleanly:
+    /// `error.NothingToResume` when the Conversation does not end in an
+    /// assistant turn with tool calls, `error.ResumeMismatch` when a result
+    /// names a call that turn did not make or names one twice.
+    pub fn resumeWithResults(
+        self: *AdmittedRun,
+        results: []const agent_loop.SuspendInfo.CompletedResult,
+        max_turns: u32,
+    ) anyerror!agent_loop.RunResult {
+        if (self.completed) return error.InvalidSessionState;
+        checkResumable(&self.session.conversation, results) catch |err| {
+            _ = try self.finishWithoutConversation();
+            return err;
+        };
+        try self.session.claimAdmittedRun(self.identity_value);
+        self.completed = true;
+        return self.session.runLoop(
+            self.identity_value,
+            max_turns,
+            null,
+            null,
+            null,
+            self.stream_retry_budget,
+            results,
         );
     }
 
@@ -2686,6 +2727,9 @@ pub const AgentSession = struct {
         tool_surface: ?RunToolSurface,
         provider_override: ?provider_mod.Provider,
         stream_retry_budget: u8,
+        /// Non-null: the Run resumes a suspended turn with these tool results
+        /// (`agent_loop.resumeRunWithResults`) instead of starting one.
+        resume_with: ?[]const agent_loop.SuspendInfo.CompletedResult,
     ) anyerror!agent_loop.RunResult {
         var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
         const tool_definitions = if (tool_surface) |surface|
@@ -2747,57 +2791,54 @@ pub const AgentSession = struct {
             return err;
         };
 
-        var native_result = agent_loop.run(
-            &self.conversation,
-            provider_override orelse self.provider.provider(),
-            tool_definitions,
-            &self.permission_ctx,
-            .{
-                .max_turns = max_turns,
-                .retractable_stream_retries = stream_retry_budget,
-                .model_error_out = &self.last_model_error,
-                .session = identity.session_id,
-                .session_id = identity.session_id.asSlice(),
-                .abort = &self.abort_signal,
-                .read_state = &self.read_state,
-                .jobs = if (self.jobs) |*registry| registry else null,
-                .provider_factory = self.toolProviderFactory(),
-                .tool_defs = tool_definitions,
-                .tool_dispatcher = tool_dispatcher,
-                .execution_policy = effective_execution_policy,
-                .tool_observer = if (run_journal) |*journal| journal.sink() else null,
-                .execution_boundary = if (run_journal) |*journal| journal.executionBoundary() else null,
-                .agent_ident = identity.session_id,
-                // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
-                .host_run = if (self.host_identity_ctx) |hctx| .{
-                    .identity = identity,
-                    .host_session_ctx = hctx,
-                } else null,
-                .ui_requester = self.permission_ctx.ui_requester,
-                .response_observer = self.response_observer,
-                .compaction_control = self.compaction_control,
-                .run_inputs = &self.run_inputs,
-                .emit_tool_cards = true,
-                .project_dir = self.workspace.root,
-                .cwd_abs = self.workspace.root,
-                .additional_dirs = self.workspace.additional_dirs,
-                .resolve_relative_paths = true,
-                .home_dir = self.workspace.home,
-                .state_root = self.workspace.state_root,
-                .artifact_root = self.artifact_root,
-                .tool_result_metrics = &self.tool_result_metrics,
-                .sandbox = self.workspace.sandbox(),
-                .parent_model = self.model,
-                .colorize = false,
-                .system_prompt = system_prompt,
-                .goal_meter = &self.goal_meter,
-                // Issue #277: the team tools execute against this; the SWARM
-                // addendum rides the system prompt while a team is active.
-                .swarm = if (self.swarm) |*s| s else null,
-            },
-            &backend,
-            self.allocator,
-        ) catch |err| {
+        const run_options: agent_loop.Options = .{
+            .max_turns = max_turns,
+            .retractable_stream_retries = stream_retry_budget,
+            .model_error_out = &self.last_model_error,
+            .session = identity.session_id,
+            .session_id = identity.session_id.asSlice(),
+            .abort = &self.abort_signal,
+            .read_state = &self.read_state,
+            .jobs = if (self.jobs) |*registry| registry else null,
+            .provider_factory = self.toolProviderFactory(),
+            .tool_defs = tool_definitions,
+            .tool_dispatcher = tool_dispatcher,
+            .execution_policy = effective_execution_policy,
+            .tool_observer = if (run_journal) |*journal| journal.sink() else null,
+            .execution_boundary = if (run_journal) |*journal| journal.executionBoundary() else null,
+            .agent_ident = identity.session_id,
+            // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
+            .host_run = if (self.host_identity_ctx) |hctx| .{
+                .identity = identity,
+                .host_session_ctx = hctx,
+            } else null,
+            .ui_requester = self.permission_ctx.ui_requester,
+            .response_observer = self.response_observer,
+            .compaction_control = self.compaction_control,
+            .run_inputs = &self.run_inputs,
+            .emit_tool_cards = true,
+            .project_dir = self.workspace.root,
+            .cwd_abs = self.workspace.root,
+            .additional_dirs = self.workspace.additional_dirs,
+            .resolve_relative_paths = true,
+            .home_dir = self.workspace.home,
+            .state_root = self.workspace.state_root,
+            .artifact_root = self.artifact_root,
+            .tool_result_metrics = &self.tool_result_metrics,
+            .sandbox = self.workspace.sandbox(),
+            .parent_model = self.model,
+            .colorize = false,
+            .system_prompt = system_prompt,
+            .goal_meter = &self.goal_meter,
+            // Issue #277: the team tools execute against this; the SWARM
+            // addendum rides the system prompt while a team is active.
+            .swarm = if (self.swarm) |*s| s else null,
+        };
+        const run_provider = provider_override orelse self.provider.provider();
+        var native_result = (if (resume_with) |results|
+            agent_loop.resumeRunWithResults(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, results, run_options, &backend, self.allocator)
+        else
+            agent_loop.run(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, run_options, &backend, self.allocator)) catch |err| {
             if (run_journal) |*journal| journal.finishRun(@errorName(err)) catch {};
             if (err == error.HostToolFatal) {
                 self.mutex.lock();
@@ -3097,6 +3138,37 @@ pub const AgentSession = struct {
         return null;
     }
 };
+
+/// `AdmittedRun.resumeWithResults`'s precondition: the Conversation ends in
+/// the suspended assistant turn, and every result answers one of its tool
+/// calls, at most once. A call left without a result is not refused here:
+/// the kernel's suspension does not carry results for calls it denied, and
+/// the request builder stands in for them (message_repair).
+fn checkResumable(
+    conversation: *const Conversation,
+    results: []const agent_loop.SuspendInfo.CompletedResult,
+) error{ NothingToResume, ResumeMismatch }!void {
+    const messages = conversation.messages.items;
+    if (messages.len == 0 or results.len == 0) return error.NothingToResume;
+    const last = messages[messages.len - 1];
+    if (last.role != .assistant) return error.NothingToResume;
+    var calls: usize = 0;
+    for (last.blocks) |block| {
+        if (block == .tool_use) calls += 1;
+    }
+    if (calls == 0) return error.NothingToResume;
+    for (results, 0..) |result, index| {
+        var made = false;
+        for (last.blocks) |block| switch (block) {
+            .tool_use => |call| made = made or std.mem.eql(u8, call.id, result.tool_use_id),
+            else => {},
+        };
+        if (!made) return error.ResumeMismatch;
+        for (results[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier.tool_use_id, result.tool_use_id)) return error.ResumeMismatch;
+        }
+    }
+}
 
 pub fn secureClear(bytes: []u8) void {
     secure.zero(bytes);
@@ -5421,4 +5493,25 @@ test "选择 Host tool 而无 host_identity_ctx → 创建拒绝且 registry 无
     });
     try std.testing.expectEqual(@as(?*anyopaque, &probe_ctx), ok.host_identity_ctx);
     try ok.destroy();
+}
+
+test "resumeWithResults' precondition: the results answer the last assistant turn's calls, each at most once" {
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    const Result = agent_loop.SuspendInfo.CompletedResult;
+    const question = Result{ .tool_use_id = "tu_q", .content = "{\"answers\":[\"Ship\"]}", .is_error = false };
+    try std.testing.expectError(error.NothingToResume, checkResumable(&conversation, &.{question}));
+    try conversation.appendText(.user, "ask me");
+    try std.testing.expectError(error.NothingToResume, checkResumable(&conversation, &.{question}));
+
+    const blocks = try a.alloc(message_mod.Block, 2);
+    blocks[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "tu_q"), .name = try a.dupe(u8, "AskUserQuestion"), .input = try a.dupe(u8, "{}") } };
+    blocks[1] = .{ .tool_use = .{ .id = try a.dupe(u8, "tu_r"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try conversation.append(.{ .role = .assistant, .blocks = blocks });
+    try checkResumable(&conversation, &.{question});
+    try checkResumable(&conversation, &.{ question, .{ .tool_use_id = "tu_r", .content = "x", .is_error = false } });
+    try std.testing.expectError(error.ResumeMismatch, checkResumable(&conversation, &.{ question, question }));
+    try std.testing.expectError(error.ResumeMismatch, checkResumable(&conversation, &.{.{ .tool_use_id = "tu_other", .content = "{}", .is_error = false }}));
+    try std.testing.expectError(error.NothingToResume, checkResumable(&conversation, &.{}));
 }
