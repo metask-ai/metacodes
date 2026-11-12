@@ -1086,6 +1086,14 @@ leaving every Host to rebuild them:
   so the id can be opened again as soon as it returns. It never waits for
   references: a holder keeps a closed `HostedSession` readable (journal,
   `snapshot`) until its own `release`, which frees it last.
+- A team lead (`SessionConfig.team` with `.role = .lead`, once its team
+  exists) is fed its inbox: while its queue is empty the driver reads it at
+  most every `session_host.lead_inbox_poll_ms` (500 ms) with
+  `swarm_tools.pollLeadInbox`, and a member's reply becomes the lead's next
+  Run, queued behind any work already there and journaled like a submission
+  without a `trace_id`. The bundled daemon does the same for its `App` lead.
+  Fulfilling the lead's `SpawnTeammate` requests is still the Host's: open a
+  member Session (`.role = .member`) on the same SessionHost.
 
 Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`.
 Authentication, tenancy, idempotency and the transport stay with the Host.

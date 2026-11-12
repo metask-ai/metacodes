@@ -113,7 +113,10 @@ Host 用 `writeTeamDescription` 读 `pending_spawns`、为每个待处理请求�
 Session,再用 `pollLeadInbox` 把 lead 收件箱的下一条消息喂给它的下一轮 Run。team 成员由
 Host 在 create/restore 时提供,不进 checkpoint(与 model_capabilities 同理)。AgentCore 的
 `team` 表(`describe`/`poll`)就是这一对操作的 C ABI 封装(见 `AGENTCORE_BINARY_ABI.md`
-"Teams")。
+"Teams")。`core/session_host.zig` 的 `SessionHost` 替宿主做了后半件(#445):lead 空闲且
+team 已建时,driver 至多每 `lead_inbox_poll_ms`(500 ms,与 daemon 的 `LeadMail` 同)
+`pollLeadInbox` 一次,把回信排成 lead 的下一轮 Run;member Session 仍由宿主在同一个
+SessionHost 上 `open`。
 
 与 in-process 共用同一套文件邮箱与名册语义,两条路径逐份核对安全属性(SW1 `waitForWork`
 vs host `pollLeadInbox`)。
