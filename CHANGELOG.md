@@ -51,6 +51,21 @@ status, compatibility boundaries, and entry points are defined by
   (`Session.rewind_to_user_message`) and Node (`Session.rewindToUserMessage`)
   packages and the source-free consumers move to revision 27; AgentCore
   0.15.0-dev.
+- **`SessionHost` feeds a team lead its teammates' replies** (part of #445).
+  A lead Session (`SessionConfig.team` with the lead role) hosted on
+  `core/session_host.zig` never saw a member's `SendMessage`: the inbox is
+  driver-owned state, so no Host thread could read it safely, while the
+  bundled daemon's `App` lead takes each reply as its next turn. Now the
+  driver of an idle lead whose team exists reads the lead inbox at most every
+  `session_host.lead_inbox_poll_ms` (500 ms, the daemon's interval) and queues
+  the reply as the lead's next Run, journaled like any other (`user_message`,
+  kernel events, `run_done`). This is the first of the `App` dependencies the
+  daemon needs an `AgentSession` counterpart for before it can run on the one
+  `SessionHost`. `zig build subsystem:boundary` now also holds that move to a
+  ratchet: no file under `src/daemon/` or `src/web/` may import
+  `src/core/agent_loop.zig` beyond the two that do today
+  (`daemon/app_driver.zig`, `web/session.zig`), and a baseline entry whose
+  import is gone fails until it is deleted.
 
 ### Fixed
 

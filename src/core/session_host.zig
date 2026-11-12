@@ -24,6 +24,12 @@
 //! `interrupt` is the one cross-thread call into the kernel; its abort is
 //! built for that.
 //!
+//! A team lead (`SessionConfig.team` with the lead role, once its team
+//! exists) is fed its inbox the way the bundled daemon feeds an `App` lead
+//! (#277, #445): while its queue is empty the driver reads the lead inbox at
+//! most every `lead_inbox_poll_ms`, and a teammate's reply becomes the lead's
+//! next Run, queued behind the work already there.
+//!
 //! Lifetimes: `open` and `acquire` return a counted reference that `release`
 //! gives back; no pointer escapes without one. `close` takes the Session out
 //! of the table, answers its pending prompt as cancelled, aborts its Run,
@@ -54,6 +60,11 @@ const prompt_sections = @import("prompt_sections.zig");
 const permission_settings = @import("../permission/settings.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
+const swarm_tools = @import("../swarm/tools.zig");
+
+/// How often an idle team lead's inbox, a locked file, is read: the bundled
+/// daemon's `session_service.LeadMail.POLL_MS`.
+pub const lead_inbox_poll_ms: u64 = 500;
 
 const AgentRuntime = agent_session.AgentRuntime;
 const AgentSession = agent_session.AgentSession;
@@ -397,6 +408,8 @@ pub const HostedSession = struct {
     // Driver-only.
     last_run_id: u64 = 0,
     last_compact_id: u64 = 0,
+    /// When an idle team lead's inbox is read next (`util_time.nowNs`).
+    next_lead_poll_ns: i128 = 0,
 
     /// Gives back a reference from `open` or `acquire`; the last one of a
     /// closed Session frees it. Valid after `SessionHost.deinit`.
@@ -566,7 +579,11 @@ pub const HostedSession = struct {
         defer self.mutex.unlock();
         while (true) {
             if (self.closing) return null;
-            if (self.queue.items.len > 0 and self.phase != .poisoned) {
+            if (self.phase == .poisoned) {
+                self.work_ready.wait(&self.mutex);
+                continue;
+            }
+            if (self.queue.items.len > 0) {
                 const work = self.queue.orderedRemove(0);
                 if (work.item == .submission) {
                     self.phase = .running;
@@ -576,8 +593,48 @@ pub const HostedSession = struct {
                 }
                 return work;
             }
-            self.work_ready.wait(&self.mutex);
+            if (!self.leadsTeam()) {
+                self.work_ready.wait(&self.mutex);
+                continue;
+            }
+            const now = util_time.nowNs();
+            if (now < self.next_lead_poll_ns) {
+                _ = self.work_ready.timedWait(&self.mutex, @intCast(self.next_lead_poll_ns - now));
+                continue;
+            }
+            self.next_lead_poll_ns = now + @as(i128, lead_inbox_poll_ms) * std.time.ns_per_ms;
+            // The inbox is a locked file: read it without holding the Session.
+            self.mutex.unlock();
+            const mail = self.takeLeadMail();
+            self.mutex.lock();
+            if (mail) |work| self.queue.append(self.gpa, work) catch {
+                log.warn("session_host", "dropped teammate mail for {s} (OOM)", .{self.id.asSlice()});
+                self.freeWork(work);
+            };
         }
+    }
+
+    /// True for a team lead whose team exists. Driver-only: its Runs are what
+    /// create and delete the team.
+    fn leadsTeam(self: *const HostedSession) bool {
+        const swarm = if (self.session.swarm) |*swarm| swarm else return false;
+        return swarm.is_lead and swarm.hasTeam();
+    }
+
+    /// The lead inbox's unread mail as a submission, or null when there is
+    /// none. Mail it returns is marked read. Driver-only.
+    fn takeLeadMail(self: *HostedSession) ?*Work {
+        const work = self.newWork() catch return null;
+        const text = swarm_tools.pollLeadInbox(work.arena.allocator(), &self.session.swarm.?) catch |err| {
+            log.warn("session_host", "lead inbox of {s} unreadable: {s}", .{ self.id.asSlice(), @errorName(err) });
+            self.freeWork(work);
+            return null;
+        } orelse {
+            self.freeWork(work);
+            return null;
+        };
+        work.item = .{ .submission = .{ .text = text } };
+        return work;
     }
 
     fn freeWork(self: *HostedSession, work: *Work) void {

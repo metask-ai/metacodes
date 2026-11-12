@@ -31,6 +31,12 @@
 //! sits, and fails on each edge into the application side that `LIBRARY`'s
 //! baseline does not name. The baseline may only shrink: an entry whose edge
 //! is gone fails too, and no file under `src/core/` may have one at all.
+//!
+//! The last rule is a ratchet for #445: `serve` and `--web` are to become
+//! transports over `src/core/session_host.zig`, so no file under `src/daemon/`
+//! or `src/web/` may drive the kernel by importing `src/core/agent_loop.zig`.
+//! `HOST_KERNEL`'s baseline names the files that still do; like the library's,
+//! it may only shrink.
 
 const std = @import("std");
 
@@ -240,6 +246,61 @@ const LIBRARY = Library{
 
 comptime {
     if (baselineError(LIBRARY)) |message| @compileError(message);
+    if (ratchetError(HOST_KERNEL)) |message| @compileError(message);
+}
+
+/// A file that no file under `dirs` may import, except the `baseline` files
+/// that still do.
+const Ratchet = struct {
+    name: []const u8,
+    /// Directories (ending in `/`) whose files, nested ones included, are held
+    /// to the rule.
+    dirs: []const []const u8,
+    /// The forbidden import, relative to the repository root.
+    target: []const u8,
+    /// The files that import `target` today. Delete an entry when its import
+    /// goes (a stale entry fails the gate); never add one.
+    baseline: []const []const u8,
+};
+
+/// #445: the bundled hosts reach the kernel through the one SessionHost, not
+/// by running the AgentLoop themselves.
+const HOST_KERNEL = Ratchet{
+    .name = "single session host (#445)",
+    .dirs = &.{ "src/daemon/", "src/web/" },
+    .target = "src/core/agent_loop.zig",
+    .baseline = &.{
+        // The daemon's per-session driver runs an `App` Run itself.
+        "src/daemon/app_driver.zig",
+        // `--web`'s driver loop, which `app_driver.zig` mirrors.
+        "src/web/session.zig",
+    },
+};
+
+/// Why `ratchet` is malformed, or null when it is not.
+fn ratchetError(ratchet: Ratchet) ?[]const u8 {
+    for (ratchet.dirs) |dir| {
+        if (!std.mem.endsWith(u8, dir, "/")) return "a ratchet directory must end in `/`";
+    }
+    for (ratchet.baseline, 0..) |file, index| {
+        if (!inRatchet(ratchet, file)) return "a ratchet baseline file must be under one of its directories";
+        if (ratchetIndex(ratchet, file).? != index) return "a ratchet baseline file is listed twice";
+    }
+    return null;
+}
+
+fn inRatchet(ratchet: Ratchet, path: []const u8) bool {
+    for (ratchet.dirs) |dir| {
+        if (std.mem.startsWith(u8, path, dir)) return true;
+    }
+    return false;
+}
+
+fn ratchetIndex(ratchet: Ratchet, path: []const u8) ?usize {
+    for (ratchet.baseline, 0..) |file, index| {
+        if (std.mem.eql(u8, file, path)) return index;
+    }
+    return null;
 }
 
 /// Why `library`'s baseline is malformed, or null when it is not.
@@ -370,6 +431,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     violations += try checkLibrary(allocator, init.io, root, LIBRARY);
+    violations += try checkRatchet(allocator, init.io, root, HOST_KERNEL);
     if (violations != 0) return error.SubsystemBoundaryViolation;
 }
 
@@ -478,6 +540,102 @@ fn staleBaseline(library: Library, used: []const bool) usize {
         );
     }
     return stale;
+}
+
+/// Count `ratchet`'s violations under `root`: every import of its target from
+/// a file the baseline does not name, and every baseline entry whose import is
+/// gone.
+fn checkRatchet(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, ratchet: Ratchet) !usize {
+    const used = try allocator.alloc(bool, ratchet.baseline.len);
+    defer allocator.free(used);
+    @memset(used, false);
+    var violations: usize = 0;
+    for (ratchet.dirs) |dir_path| {
+        const prefix = dir_path[0 .. dir_path.len - 1];
+        var dir = root.openDir(io, prefix, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+            // A directory that is gone holds no import.
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer dir.close(io);
+        try checkRatchetDir(allocator, io, root, dir, prefix, ratchet, used, &violations);
+    }
+    for (ratchet.baseline, used) |file, still| {
+        if (still) continue;
+        violations += 1;
+        std.debug.print(
+            "{s}: stale {s} baseline entry; it no longer imports {s}, so delete the entry\n",
+            .{ file, ratchet.name, ratchet.target },
+        );
+    }
+    return violations;
+}
+
+fn checkRatchetDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    dir: std.Io.Dir,
+    prefix: []const u8,
+    ratchet: Ratchet,
+    used: []bool,
+    violations: *usize,
+) !void {
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
+        defer allocator.free(path);
+        switch (entry.kind) {
+            .directory => {
+                var child = try dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
+                defer child.close(io);
+                try checkRatchetDir(allocator, io, root, child, path, ratchet, used, violations);
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+                const source = root.readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024)) catch |err| {
+                    violations.* += 1;
+                    std.debug.print("{s}: cannot be read ({s})\n", .{ path, @errorName(err) });
+                    continue;
+                };
+                defer allocator.free(source);
+                checkRatchetFile(source, path, ratchet, used, violations);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Check every `@import` in `source`, the text of `path`: mark the baseline
+/// entry of a listed file that still imports the target, and count every
+/// other import of it.
+fn checkRatchetFile(source: []const u8, path: []const u8, ratchet: Ratchet, used: []bool, violations: *usize) void {
+    const needle = "@import(\"";
+    var cursor: usize = 0;
+    var line: usize = 1;
+    var scanned: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, needle)) |found| {
+        while (scanned < found) : (scanned += 1) {
+            if (source[scanned] == '\n') line += 1;
+        }
+        const start = found + needle.len;
+        const end = std.mem.indexOfScalarPos(u8, source, start, '"') orelse break;
+        cursor = end + 1;
+        const line_start = if (std.mem.lastIndexOfScalar(u8, source[0..found], '\n')) |newline| newline + 1 else 0;
+        if (isProse(source[line_start..found])) continue;
+        var buffer: [512]u8 = undefined;
+        const resolved = resolve(&buffer, path, source[start..end]) orelse continue;
+        if (!std.mem.eql(u8, resolved, ratchet.target)) continue;
+        if (ratchetIndex(ratchet, path)) |index| {
+            used[index] = true;
+            continue;
+        }
+        violations.* += 1;
+        std.debug.print(
+            "{s}:{d}: imports {s}, which the {s} rule forbids; drive the kernel through src/core/session_host.zig\n",
+            .{ path, line, ratchet.target, ratchet.name },
+        );
+    }
 }
 
 /// Queue every file of the subsystem.
@@ -823,4 +981,76 @@ test "the real library's application side is the one #448 names" {
     try std.testing.expect(!isAppSide(LIBRARY, "src/api/model_context.zig"));
     try std.testing.expect(!isAppSide(LIBRARY, "src/application.zig"));
     try std.testing.expect(!isAppSide(LIBRARY, "src/app_extra.zig"));
+}
+
+/// A miniature of `HOST_KERNEL`, with one baseline file.
+const TEST_RATCHET = Ratchet{
+    .name = "host",
+    .dirs = &.{ "src/daemon/", "src/web/" },
+    .target = "src/core/agent_loop.zig",
+    .baseline = &.{"src/daemon/app_driver.zig"},
+};
+
+/// Lay out `files` as `checkTree` does and run the ratchet check there.
+fn checkRatchetTree(ratchet: Ratchet, files: []const [2][]const u8) !usize {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (files) |file| {
+        if (std.fs.path.dirnamePosix(file[0])) |dir| try tmp.dir.createDirPath(std.testing.io, dir);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file[0], .data = file[1] });
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    return checkRatchet(arena.allocator(), std.testing.io, tmp.dir, ratchet);
+}
+
+test "a host file may not start importing the AgentLoop (#445)" {
+    const driver = [2][]const u8{ "src/daemon/app_driver.zig", "const agent_loop = @import(\"../core/agent_loop.zig\");\n" };
+    const clean = [_][2][]const u8{
+        driver,
+        .{ "src/web/server.zig", "const host = @import(\"../core/session_host.zig\");\n" },
+        .{ "src/core/agent_loop.zig", "" },
+    };
+    try std.testing.expectEqual(@as(usize, 0), try checkRatchetTree(TEST_RATCHET, &clean));
+
+    // A new edge, from the other directory and from a nested one.
+    var web = clean;
+    web[1][1] = "const agent_loop = @import(\"../core/agent_loop.zig\");\n";
+    try std.testing.expectEqual(@as(usize, 1), try checkRatchetTree(TEST_RATCHET, &web));
+    const nested = [_][2][]const u8{
+        driver,
+        .{ "src/web/static/run.zig", "fn later() void {\n    _ = @import(\"../../core/agent_loop.zig\");\n}\n" },
+    };
+    try std.testing.expectEqual(@as(usize, 1), try checkRatchetTree(TEST_RATCHET, &nested));
+
+    // Outside the hosts, and in prose, it is not this rule's business.
+    const elsewhere = [_][2][]const u8{
+        driver,
+        .{ "src/session_service.zig", "const agent_loop = @import(\"core/agent_loop.zig\");\n" },
+        .{ "src/web/session.zig", "//! Used to call `@import(\"../core/agent_loop.zig\")` directly.\n" },
+    };
+    try std.testing.expectEqual(@as(usize, 0), try checkRatchetTree(TEST_RATCHET, &elsewhere));
+}
+
+test "a host baseline entry whose import is gone fails the ratchet" {
+    const migrated = [_][2][]const u8{
+        .{ "src/daemon/app_driver.zig", "const host = @import(\"../core/session_host.zig\");\n" },
+    };
+    try std.testing.expectEqual(@as(usize, 1), try checkRatchetTree(TEST_RATCHET, &migrated));
+    // The file itself gone counts the same way.
+    const deleted = [_][2][]const u8{.{ "src/web/server.zig", "" }};
+    try std.testing.expectEqual(@as(usize, 1), try checkRatchetTree(TEST_RATCHET, &deleted));
+}
+
+test "the host ratchet's baseline is under its directories and has no duplicate" {
+    try std.testing.expectEqual(@as(?[]const u8, null), ratchetError(HOST_KERNEL));
+    try std.testing.expectEqual(@as(usize, 2), HOST_KERNEL.baseline.len);
+    var ratchet = TEST_RATCHET;
+    ratchet.baseline = &.{"src/session_service.zig"};
+    try std.testing.expect(ratchetError(ratchet) != null);
+    ratchet.baseline = &.{ "src/web/session.zig", "src/web/session.zig" };
+    try std.testing.expect(ratchetError(ratchet) != null);
+    ratchet = TEST_RATCHET;
+    ratchet.dirs = &.{"src/web"};
+    try std.testing.expect(ratchetError(ratchet) != null);
 }
