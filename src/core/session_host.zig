@@ -61,13 +61,11 @@ const frontend_capabilities = @import("protocol/frontend_capabilities.zig");
 const session_id_mod = @import("session_id.zig");
 const types = @import("../types.zig");
 const prompt_sections = @import("prompt_sections.zig");
+const typed_submission = @import("typed_submission.zig");
+const idempotency_ledger = @import("idempotency_ledger.zig");
 const permission_settings = @import("../permission/settings.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
-const typed_submission = @import("typed_submission.zig");
-const idempotency_ledger = @import("idempotency_ledger.zig");
-
-pub const Attribute = typed_submission.Attribute;
 
 const AgentRuntime = agent_session.AgentRuntime;
 const AgentSession = agent_session.AgentSession;
@@ -121,6 +119,9 @@ pub const OpenSpec = struct {
 };
 
 pub const Phase = enum { idle, running, poisoned, closing };
+
+/// One of a typed submission's `attributes` (#447).
+pub const Attribute = typed_submission.Attribute;
 
 pub const Submission = struct {
     text: []const u8,
