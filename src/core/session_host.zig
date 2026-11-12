@@ -157,6 +157,8 @@ pub const OpenSpec = struct {
 /// `suspended` (#446): a Run ended `suspended` on UI request
 /// `Snapshot.pending_request_id` (`Options.ui_request_wait = .suspend`);
 /// nothing else runs until that request is answered, interrupted or expires.
+/// Queued work waits, and a team lead does not read its inbox (reading marks
+/// mail read), so a teammate's reply waits there for the lead to resume.
 pub const Phase = enum { idle, running, suspended, poisoned, closing };
 
 /// One of a typed submission's `attributes` (#447).
@@ -914,7 +916,10 @@ pub const HostedSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (true) {
-            // A suspended Run comes first, and nothing else runs meanwhile.
+            // A suspended Run comes first, and nothing else runs meanwhile:
+            // its conversation ends in a call without a result, so no Run may
+            // start on it. Queued work waits, and a lead's inbox is not read
+            // (the poll below marks what it takes as read).
             if (self.phase == .suspended and !self.closing) {
                 if (self.suspendedWorkLocked()) |work| return work;
                 continue;

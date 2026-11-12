@@ -142,7 +142,9 @@ status, compatibility boundaries, and entry points are defined by
   its id after a restart, and `respond` resumes the Run once through the new
   `AdmittedRun.resumeWithResults`, journaled with the new host event
   `run_resumed`; the resumed Run keeps the suspended Run's trace id, turn
-  limit and stream retry budget, and request ids are never reused. Permission
+  limit and stream retry budget, and request ids are never reused. Nothing
+  else runs while a Run is suspended, and a suspended team lead leaves its
+  inbox unread until it resumes. Permission
   requests still block in that mode: the kernel's permission gate reads a
   `pending` answer as a denial, so making them survive a restart needs the
   kernel to suspend there first (follow-up). doc/WIRE_PROTOCOL.md §1.4,

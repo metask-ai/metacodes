@@ -657,3 +657,106 @@ test "L2 #446 SessionHost: a question cancelled by its expiry fails its call, no
     try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
 }
+
+fn toolCallSse(comptime id: []const u8, comptime name: []const u8, comptime input_json: []const u8) []const u8 {
+    return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"" ++ id ++ "\",\"name\":\"" ++ name ++ "\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"" ++ input_json ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+}
+
+test "L2 #446 SessionHost suspend mode: a suspended team lead runs nothing and leaves its inbox unread; queued work, then the mail, run once it resumes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const formed = try textSse(a, "formed");
+    defer a.free(formed);
+    const thanks = try textSse(a, "thanks");
+    defer a.free(thanks);
+    const queued_reply = try textSse(a, "queued one done");
+    defer a.free(queued_reply);
+    const ack = try textSse(a, "ack");
+    defer a.free(ack);
+    // Run 1 forms the team; Run 2 asks and suspends; the resumed Run, the
+    // submission queued meanwhile, then the teammate's mail.
+    const lead_bodies = [_][]const u8{ toolCallSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"), formed, ASK_SSE, thanks, queued_reply, ack };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    const member_bodies = [_][]const u8{
+        toolCallSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"AskUserQuestion"}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+    defer host.deinit();
+    var lead_config = baseConfig(lead_url, root, root);
+    lead_config.allowed_tools = &.{ "TeamCreate", "SendMessage", "AskUserQuestion" };
+    lead_config.permission_mode = .bypass_permissions;
+    lead_config.workspace = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    lead_config.team = .{ .role = .lead, .team_name = "" };
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 1);
+    try lead.submit(.{ .text = "ask me" });
+    try waitFor(&lead.journal, "\"stop_reason\":\"suspended\"", 1);
+
+    // The member reports to the lead while the lead is suspended.
+    var member_config = baseConfig(member_url, root, root);
+    member_config.allowed_tools = &.{"SendMessage"};
+    member_config.permission_mode = .bypass_permissions;
+    member_config.workspace = lead_config.workspace;
+    const lease = cc.session_id.gen();
+    member_config.team = .{
+        .role = .member,
+        .team_name = "crew",
+        .member_name = "solver",
+        .lead_session_id = lead.id.asSlice(),
+        .member_lease = lease.asSlice(),
+    };
+    const member = try host.open(.{ .config = member_config });
+    defer host.release(member);
+    try member.submit(.{ .text = "work and report" });
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+    try lead.submit(.{ .text = "and then this" });
+
+    // Several poll periods pass: the suspended lead starts nothing, and its
+    // inbox is not read (read mail would have been queued as a submission).
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+    try expectSnapshot(lead, .suspended, 1, 1, .ui_request);
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&lead.journal, "\"type\":\"user_message\""));
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&lead.journal, "done: 42"));
+    try std.testing.expectEqual(@as(usize, 3), lead_srv.requestCount());
+
+    // Answered: the suspended Run resumes, then the queued submission, then
+    // the mail, once each.
+    try lead.respond(1, "{\"answers\":[\"Ship\"]}");
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 5);
+    const resumed = try lineIndex(&lead.journal, "\"type\":\"run_resumed\",\"data\":{\"run_id\":3");
+    const queued = try lineIndex(&lead.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":4,\"trace_id\":null,\"text\":\"and then this\"");
+    const mail = try lineIndex(&lead.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":5");
+    try std.testing.expect(resumed < queued);
+    try std.testing.expect(queued < mail);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "done: 42"));
+    try std.testing.expectEqual(@as(usize, 6), lead_srv.requestCount());
+    const request = lead_srv.requestAt(5).?;
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "done: 42") != null);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "done: 42"));
+}

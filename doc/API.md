@@ -1172,7 +1172,10 @@ UI requests on a long-lived Session (#446; the wire side is
   there; `open(.resume)` under the id, after a restart too, announces it
   again under the same id; `respond` then resumes the Run once through
   `AdmittedRun.resumeWithResults`, journaled as `ui_request_closed` and
-  `run_resumed`. The resumed Run keeps the suspended Run's `trace_id`, turn
+  `run_resumed`. Nothing else runs while a Run is suspended: queued work
+  waits, and a team lead does not read its inbox, so a teammate's reply
+  waits there, unread, and becomes the lead's next Run after the resumed Run
+  and the queue. The resumed Run keeps the suspended Run's `trace_id`, turn
   limit and `stream_retry_budget`. A question's answers reach the model as
   AskUserQuestion's result; a custom UI's `result` is the tool's result as
   is (the kernel's suspension convention); a cancelled or expired request is
