@@ -33,6 +33,7 @@ test {
     _ = @import("component/agent_session_team_test.zig");
     _ = @import("component/recovery_allowance_test.zig");
     _ = @import("component/agent_session_host_tools_test.zig");
+    _ = @import("component/session_host_requests_test.zig");
     _ = @import("component/plugin_runtime_test.zig");
     _ = @import("component/plugin_process_test.zig");
     _ = @import("component/agent_session_ui_test.zig");

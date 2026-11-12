@@ -154,10 +154,17 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
     }
 
+    return answersResult(allocator, answers.items);
+}
+
+/// The tool result for `answers`, one per question, as this tool returns it.
+/// A Host that resumes a suspended question (session_host.zig, #446) hands
+/// the model exactly what an answered call would have returned. Caller-owned.
+pub fn answersResult(allocator: std.mem.Allocator, answers: []const []const u8) ![]u8 {
     // "Chat about this" 哨兵:用户选择放弃结构化问答转自由回复(对齐 cc onRespondToClaude)。
     // 任一答案是哨兵 → 不把它当答案塞模型,返回一句话提示让模型等用户自由输入。
     const chat_sentinel = @import("../core/protocol/chat_sentinel.zig");
-    for (answers.items) |a| {
+    for (answers) |a| {
         if (std.mem.eql(u8, a, chat_sentinel.CHAT_SENTINEL)) {
             return try allocator.dupe(u8,
                 \\{"user_chose_free_response":true,"note":"User dismissed the structured question to reply in their own words. Wait for their next message; do not re-ask."}
@@ -169,7 +176,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"answers\":[");
-    for (answers.items, 0..) |a, i| {
+    for (answers, 0..) |a, i| {
         if (i > 0) try aw.writer.writeAll(",");
         try util_json.writeJsonString(&aw.writer, a);
     }
