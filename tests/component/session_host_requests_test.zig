@@ -1214,3 +1214,22 @@ test "L2 #446 SessionHost suspend mode: the idempotency key of a suspended Run d
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"user_message\""));
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
 }
+
+test "L2 #446 SessionHost: re_announce needs a period; a zero timeout is refused at open" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &TOOLS });
+    defer runtime.destroy() catch unreachable;
+    for ([_]cc.session_host.UiRequestWait{ .block, .@"suspend" }) |wait| {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = wait, .ui_request_timeout_ms = 0, .ui_request_expiry = .re_announce });
+        defer host.deinit();
+        try std.testing.expectError(error.InvalidUiRequestTimeout, host.open(.{ .config = baseConfig("http://127.0.0.1:9", dirs.workspace, dirs.home) }));
+    }
+    // Zero still means "at once" for the policies that end the request.
+    var host = SessionHost.init(a, runtime, .{ .ui_request_timeout_ms = 0, .ui_request_expiry = .cancel, .transcripts = false });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig("http://127.0.0.1:9", dirs.workspace, dirs.home) });
+    host.release(hosted);
+}

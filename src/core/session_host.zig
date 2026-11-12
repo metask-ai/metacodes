@@ -378,6 +378,8 @@ pub const SessionHost = struct {
     pub fn open(self: *SessionHost, spec: OpenSpec) !*HostedSession {
         // A suspended request lives in the Session's directory.
         if (self.options.ui_request_wait == .@"suspend" and !self.options.transcripts) return error.SuspendRequiresTranscripts;
+        // `.re_announce` with no period would announce without ever waiting.
+        if (self.options.ui_request_expiry == .re_announce and (self.options.ui_request_timeout_ms orelse 1) == 0) return error.InvalidUiRequestTimeout;
         if (spec.config.ui_requester != null or spec.config.run_ui_requester != null) return error.UiRequesterNotAllowed;
         if (spec.mode == .@"resume" and spec.id == null) return error.IdRequiredForResume;
         if (spec.submission_template) |template| try typed_submission.checkTemplate(template);
