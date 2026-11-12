@@ -292,16 +292,28 @@ pub const WebBackend = struct {
             self.announceClosed(id, .cancelled);
             return wire.cancelResponse(req, out);
         }
+        // Who answered (#446), recorded on the close. This host's respond has
+        // no error to refuse an unusable `by` with, so that one is not
+        // recorded and the answer still applies; SessionHost refuses it.
+        const by = wire.answerApprover(self.allocator, resp_json) catch |err| blk: {
+            log.warn("web", "approver of request {d} not recorded: {s}", .{ id, @errorName(err) });
+            break :blk null;
+        };
+        defer if (by) |name| self.allocator.free(name);
         const reading = wire.parseResponse(req, resp_json, allocator, out) catch |err| {
-            self.announceClosed(id, if (err == error.InputAborted) .malformed else .cancelled);
+            if (err == error.InputAborted) self.announceClosedBy(id, .malformed, by) else self.announceClosed(id, .cancelled);
             return err;
         };
-        self.announceClosed(id, reading.closed());
+        self.announceClosedBy(id, reading.closed(), by);
         return .answered;
     }
 
     fn announceClosed(self: *WebBackend, id: u64, outcome: wire.RequestClosed) void {
-        const line = wire.writeRequestClosed(self.allocator, id, outcome) catch return;
+        self.announceClosedBy(id, outcome, null);
+    }
+
+    fn announceClosedBy(self: *WebBackend, id: u64, outcome: wire.RequestClosed, by: ?[]const u8) void {
+        const line = wire.writeRequestClosedBy(self.allocator, id, outcome, by) catch return;
         defer self.allocator.free(line);
         self.journal.append(line);
     }
@@ -419,6 +431,42 @@ test "requester: permission 请求经 journal 通告,respond 回填 → answered
         testing.allocator.free(all);
     }
     try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "\"outcome\":\"answered\"") != null);
+}
+
+test "#446 requester: the answer's approver is recorded on ui_request_closed; an unusable one is not, and the answer still applies" {
+    const Case = struct { answer: []const u8, closed: []const u8, choice: PermissionChoice };
+    const cases = [_]Case{
+        .{ .answer = "{\"choice\":\"allow_once\",\"by\":\"alice@example.com\"}", .closed = "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\",\"by\":\"alice@example.com\"}", .choice = .allow_once },
+        .{ .answer = "{\"choice\":\"deny_once\",\"by\":42}", .closed = "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\"}", .choice = .deny_once },
+    };
+    for (cases) |case| {
+        var j = EventJournal.init(testing.allocator);
+        defer j.deinit();
+        var wb = WebBackend.init(testing.allocator, &j);
+        defer wb.deinit();
+        const Responder = struct {
+            fn run(b: *WebBackend, jj: *EventJournal, answer: []const u8) void {
+                const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
+                defer {
+                    for (batch) |l| std.testing.allocator.free(l);
+                    std.testing.allocator.free(batch);
+                }
+                _ = b.respond(1, answer);
+            }
+        };
+        const t = try std.Thread.spawn(.{}, Responder.run, .{ &wb, &j, case.answer });
+        defer t.join();
+        const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+        var resp: UiResponse = undefined;
+        try testing.expectEqual(RequestOutcome.answered, try wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
+        try testing.expectEqual(case.choice, resp.permission);
+        const all = (try j.waitSince(testing.allocator, 0, 10)).?;
+        defer {
+            for (all) |l| testing.allocator.free(l);
+            testing.allocator.free(all);
+        }
+        try testing.expectEqualStrings(case.closed, all[all.len - 1]);
+    }
 }
 
 test "requester: abort 中断等待 → permission 安全 deny + cancelled 事件" {
