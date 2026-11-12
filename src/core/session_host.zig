@@ -1049,7 +1049,7 @@ pub const HostedSession = struct {
         // to the kernel lets the prompt be announced and wait for it.
         if (self.ui_released) {
             self.mutex.unlock();
-            return wire.cancelResponse(req, out);
+            return cancelAnswer(req, out);
         }
         // The kernel suspends a turn on its first pending request, and the
         // resumption must answer the call this request belongs to: so one
@@ -1140,13 +1140,25 @@ pub const HostedSession = struct {
                     wire.writeRequestClosedBy(self.gpa, request_id, .malformed, by)
                 else
                     wire.writeRequestClosed(self.gpa, request_id, .cancelled));
-                return err;
+                return if (err == error.InputAborted) cancelAnswer(req, out) else err;
             };
             self.appendLine(wire.writeRequestClosedBy(self.gpa, request_id, reading.closed(), by));
             return .answered;
         }
         self.appendLine(wire.writeRequestClosed(self.gpa, request_id, .cancelled));
-        return wire.cancelResponse(req, out);
+        return cancelAnswer(req, out);
+    }
+
+    /// `wire.cancelResponse` as the AgentSession needs it (#446): a question
+    /// that was cancelled or answered unreadably is the user's outcome,
+    /// `error.UiCancelled`, which the AgentSession hands to the tool (the
+    /// call fails with InputAborted, as the model sees). Any other error from
+    /// a requester is a broken Host to it, and poisons the Session: a
+    /// cancelled question used to end its Session that way.
+    fn cancelAnswer(req: *const ui_request.UiRequest, out: *ui_request.UiResponse) anyerror!ui_request.RequestOutcome {
+        return wire.cancelResponse(req, out) catch |err| switch (err) {
+            error.InputAborted => if (req.* == .ask_question) error.UiCancelled else err,
+        };
     }
 
     /// The stored answer to the pending request, unless cancellation won: an

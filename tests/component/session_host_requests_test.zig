@@ -570,3 +570,38 @@ test "L2 #446 SessionHost suspend mode: a second answer is AlreadyAnswered, a la
     }
     try std.testing.expectEqual(@as(usize, 4), server.requestCount());
 }
+
+test "L2 #446 SessionHost: a question cancelled by its expiry fails its call, not the Session" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const after = try textSse(a, "asked in words instead");
+    defer a.free(after);
+    const later = try textSse(a, "still here");
+    defer a.free(later);
+    const bodies = [_][]const u8{ ASK_SSE, after, later };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &TOOLS });
+    defer runtime.destroy() catch unreachable;
+    // The defaults but for a timeout: the question blocks, then is cancelled.
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .ui_request_timeout_ms = 100 });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, dirs.workspace, dirs.home) });
+    defer host.release(hosted);
+
+    try hosted.submit(.{ .text = "ask me" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"cancelled\"}"));
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"session_poisoned\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+    const next = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, next, "AskUserQuestion failed with InputAborted") != null);
+    // The Session takes more work.
+    try hosted.submit(.{ .text = "hello" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+}
