@@ -36,7 +36,35 @@ status, compatibility boundaries, and entry points are defined by
   `command_result.message` an appended field
   (`tests/fixtures/wire/v1/host_events.jsonl`).
 
+- **`--web` and `serve` refuse an `idempotency_key` instead of ignoring it**
+  (#447). A message carrying one was accepted and the key dropped, so a
+  retried delivery ran twice while its client believed it was de-duplicated.
+  `POST /message` now answers `400` and the UDS `message` op
+  `{"ok":false,...}`, both with `idempotency_key not supported: this host does
+  not de-duplicate messages`, and nothing is queued; `"idempotency_key":null`
+  still counts as absent, and other unknown fields are still ignored. These
+  hosts take keys once they run on `SessionHost` (#445).
+
 ### Added
+
+- **Typed submissions and a bounded inbox on `SessionHost`** (#447).
+  `Submission` gains `source`, `kind`, `attributes` and `idempotency_key`. One
+  key is one Run: a delivery whose key is queued, running, or whose Run
+  started within `Options.idempotency_retention_ms` (24 h) is refused with
+  `error.DuplicateSubmission`, and the same key on a different submission with
+  `error.IdempotencyKeyReused`. Started keys are kept in the session
+  directory (`idempotency.jsonl`), so a Host that reopens the Session after a
+  restart refuses them too; a key is spent only when its Run starts, so a
+  delivery the restart dropped from the queue may be sent again. A full queue
+  refuses with `error.QueueFull` after duplicates are answered and holds
+  nothing, and `Snapshot.max_queued` reports the bound next to `queued`.
+  `source`, `kind`, `attributes` and the key are echoed on the Run's
+  `user_message`, as appended fields written only when given, so other lines
+  keep their bytes (`tests/fixtures/wire/v1/host_events.jsonl`). They reach
+  the provider only through `OpenSpec.submission_template` (`{{text}}`,
+  `{{source}}`, `{{kind}}`, `{{attributes}}`); without one the provider
+  receives the text's bytes, as before. `serve` and `--web` take typed
+  submissions once they run on `SessionHost` (#445).
 
 - **A stream retry budget for AgentCore Hosts** (#452). A reasoning model
   streams thinking first, so a gateway stream that breaks off has almost always

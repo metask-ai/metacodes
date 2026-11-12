@@ -504,6 +504,8 @@ test "L2 web: a refused field queues nothing; an unusable model applies neither 
         "{\"text\":\"bad mode\",\"permission_mode\":\"\"}",
         "{\"text\":\"bad model\",\"model\":\"\"}",
         "{\"text\":\"bad model\",\"model\":7}",
+        // Refused, not ignored: this host does not de-duplicate (#447).
+        "{\"text\":\"bad key\",\"idempotency_key\":\"im:evt-0001\"}",
     }) |body| {
         const resp = try postMessage(a, web.port, body);
         defer a.free(resp);
@@ -516,6 +518,11 @@ test "L2 web: a refused field queues nothing; an unusable model applies neither 
         const resp = try postMessage(a, web.port, "{\"text\":\"bad mode\",\"permission_mode\":\"plan\"}");
         defer a.free(resp);
         try std.testing.expect(std.mem.indexOf(u8, responseBody(resp), "invalid permission_mode") != null);
+    }
+    {
+        const resp = try postMessage(a, web.port, "{\"text\":\"bad key\",\"idempotency_key\":\"im:evt-0001\"}");
+        defer a.free(resp);
+        try std.testing.expectEqualStrings("{\"error\":\"idempotency_key not supported: this host does not de-duplicate messages\"}", responseBody(resp));
     }
 
     // Accepted, but the model is not this provider's: neither field applies, no turn runs.
@@ -537,6 +544,7 @@ test "L2 web: a refused field queues nothing; an unusable model applies neither 
     try std.testing.expectEqual(@as(usize, 0), countLines(lines, "\"type\":\"config_changed\""));
     try std.testing.expectEqual(@as(usize, 0), countLines(lines, "bad mode"));
     try std.testing.expectEqual(@as(usize, 0), countLines(lines, "bad model"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(lines, "bad key"));
 
     var after = try getState(a, web.port);
     defer after.deinit();
@@ -551,6 +559,7 @@ test "L2 web: a refused field queues nothing; an unusable model applies neither 
     try std.testing.expect(!fx.conversationHas("turn three"));
     try std.testing.expect(!fx.conversationHas("bad mode"));
     try std.testing.expect(!fx.conversationHas("bad model"));
+    try std.testing.expect(!fx.conversationHas("bad key"));
 }
 
 test "L2 web: /state seq grows across a run; pending_request_id names the open question, then 0" {

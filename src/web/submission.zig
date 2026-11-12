@@ -11,6 +11,11 @@
 //! on the App's provider and catalog, so the driver checks it when it takes the
 //! submission (`web/session.zig` `startSubmission`).
 //!
+//! Other fields are ignored, except one a client relies on for safety: an
+//! `idempotency_key` is refused, because these hosts do not de-duplicate
+//! (#447). Ignored, it let a retried delivery run twice while the client
+//! believed it could not. `core/session_host.zig` takes it.
+//!
 //! The terminal's queue (`repl/msg_queue.zig`) stays a plain text queue: the
 //! TUI has no per-message configuration.
 
@@ -51,6 +56,8 @@ pub const ParseError = error{
     /// `permission_mode` is present but not a mode name `permission/mode.zig`
     /// `parseName` accepts.
     InvalidPermissionMode,
+    /// `idempotency_key` is present and not null: this host cannot honor it.
+    UnsupportedIdempotencyKey,
     OutOfMemory,
 };
 
@@ -60,6 +67,7 @@ pub fn reason(err: ParseError) []const u8 {
         error.EmptyText => "empty message",
         error.InvalidModel => "invalid model: expected a non-empty string",
         error.InvalidPermissionMode => "invalid permission_mode (default, acceptEdits, auto, dontAsk, bypassPermissions)",
+        error.UnsupportedIdempotencyKey => "idempotency_key not supported: this host does not de-duplicate messages",
         error.OutOfMemory => "out of memory",
     };
 }
@@ -80,6 +88,9 @@ pub fn parseHttpBody(arena: std.mem.Allocator, body: []const u8) ParseError!Requ
 /// `{"text":...,"model":...,"permission_mode":...}` — the HTTP body and the
 /// UDS `message` request share this reading. The result borrows `object`.
 pub fn parseObject(object: std.json.ObjectMap) ParseError!Request {
+    if (object.get("idempotency_key")) |value| {
+        if (value != .null) return error.UnsupportedIdempotencyKey;
+    }
     const text_value = object.get("text") orelse return error.EmptyText;
     if (text_value != .string) return error.EmptyText;
     var request: Request = .{ .text = try trimmedText(text_value.string) };
@@ -212,6 +223,21 @@ test "parseHttpBody: model and permission_mode read and validated" {
     try testing.expectError(error.InvalidModel, parseForTest(&arena, "{\"text\":\"go\",\"model\":\"\"}"));
     try testing.expectError(error.InvalidModel, parseForTest(&arena, "{\"text\":\"go\",\"model\":\"  \"}"));
     try testing.expectError(error.InvalidModel, parseForTest(&arena, "{\"text\":\"go\",\"model\":[\"x\"]}"));
+}
+
+test "parseHttpBody: an idempotency_key is refused, not ignored; null is absent; typed fields are ignored (#447)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.UnsupportedIdempotencyKey, parseForTest(&arena, "{\"text\":\"go\",\"idempotency_key\":\"im:evt-0001\"}"));
+    try testing.expectError(error.UnsupportedIdempotencyKey, parseForTest(&arena, "{\"text\":\"go\",\"idempotency_key\":7}"));
+    // Refused for what the host cannot do, before the text is even read.
+    try testing.expectError(error.UnsupportedIdempotencyKey, parseForTest(&arena, "{\"idempotency_key\":\"k\"}"));
+    try testing.expectEqualStrings("go", (try parseForTest(&arena, "{\"text\":\"go\",\"idempotency_key\":null}")).text);
+    const typed = try parseForTest(&arena, "{\"text\":\"go\",\"source\":\"im:lark\",\"kind\":\"message\",\"attributes\":{\"chat\":\"C1\"}}");
+    try testing.expectEqualStrings("go", typed.text);
+    // The reply carries the reason whole: `{"error":"<reason>"}` and
+    // `{"ok":false,"error":"<reason>"}` fit their 192-byte buffers.
+    try testing.expect(reason(error.UnsupportedIdempotencyKey).len + "{\"ok\":false,\"error\":\"\"}".len <= 192);
 }
 
 test "SubmissionQueue: FIFO, owned copies, leftovers freed by deinit" {

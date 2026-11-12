@@ -282,6 +282,10 @@ const host_events = [_]cc.wire.HostEvent{
     .{ .run_done = .{ .run_id = 4, .error_name = "ProviderUnavailable" } },
     // Edit-and-rerun (issue #432): the submission replaced user message 6.
     .{ .user_message = .{ .run_id = 6, .text = "fix the build, then the tests", .replaces = 6 } },
+    // A typed submission (#447): source, kind, idempotency_key and
+    // attributes are appended, each only when the submission had it.
+    .{ .user_message = .{ .run_id = 8, .text = "heart rate high", .source = "device:hr-01", .kind = "telemetry", .idempotency_key = "hr-01:seq-42", .attributes = &.{ .{ .name = "bpm", .value = "132" }, .{ .name = "unit", .value = "bpm" } } } },
+    .{ .user_message = .{ .run_id = 9, .trace_id = "trace-9", .text = "deploy", .idempotency_key = "im:evt-0001" } },
     .{ .run_done = .{ .run_id = 7, .error_name = "PositionCompacted" } },
     .{ .run_done = .{ .run_id = 5, .stop_reason = "api_error", .model_error = .{
         .category = .payment_required,
