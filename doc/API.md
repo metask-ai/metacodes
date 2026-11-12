@@ -1160,7 +1160,9 @@ UI requests on a long-lived Session (#446; the wire side is
   `ui_request_expiry`: `.cancel` (default, as before) closes the request
   `cancelled` with its safe answer and the Run goes on; `.interrupt` does
   that and stops the Run; `.re_announce` journals the same `ui_request` line
-  again every period until someone answers.
+  again every period until someone answers. `.re_announce` needs a period:
+  with a zero `ui_request_timeout_ms`, `open` is
+  `error.InvalidUiRequestTimeout`.
 - **Waiting work.** A Session runs one thing at a time: a submission or
   command queued while a request is open waits behind it, never refused for
   it. `snapshot()` says why in `queue_waiting` (`.none`, `.run`,
@@ -1190,8 +1192,25 @@ UI requests on a long-lived Session (#446; the wire side is
   AskUserQuestion's result; a custom UI's `result` is the tool's result as
   is (the kernel's suspension convention); a cancelled or expired request is
   the call failing with `InputAborted`. Request ids are kept too, so none is
-  reused across restarts. A fresh `open` under the id drops a suspended Run
-  with the conversation it belonged to. **A permission request is never
+  reused across restarts. Each open request has its own id, and `respond`
+  gives an answer only to the request it names: a permission request that
+  blocks beside a suspended question is answered under its own id
+  (`pending_request_id` shows it while it blocks). A `ui_requests.json` this
+  version cannot read (corrupt, or written by a later version; a field it
+  does not know is ignored) is left as it is and never written over:
+  requests then block as under `.block`, under ids past the file's
+  `next_id` and past the clock in milliseconds. A Run submitted under an
+  idempotency key keeps the key spent while it is suspended, however long
+  the request waits; once the resumed Run ends, the key's
+  `idempotency_retention_ms` counts from the Run's start as before, so a
+  Host whose requests may wait long sets the retention above the longest
+  wait plus its redelivery window. One crash window is left: a crash after
+  the suspended turn reaches the transcript and before `ui_requests.json`
+  records its request loses the request; the next Run finds the call without
+  a result and closes it as any unanswered call is closed (message_repair),
+  so the conversation stays valid but the question is not asked again. A
+  fresh `open` under the id drops a suspended Run with the conversation it
+  belonged to. **A permission request is never
   suspended:** the kernel's permission gate reads a `pending` answer as no
   answer and denies the tool unasked, so under `.suspend` a permission
   request blocks as under `.block` (the Session reports `.running` with the

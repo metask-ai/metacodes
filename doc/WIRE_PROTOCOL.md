@@ -205,6 +205,8 @@ Run, which ends `"stop_reason":"aborted"`; `re_announce` writes the request's
 `ui_request` line again, the same bytes under the same id, every period until
 it is answered, interrupted or closed. A frontend shows a repeated
 announcement once, as it already does after replaying a journal.
+`re_announce` needs a period: `SessionHost.open` refuses it with a zero
+`ui_request_timeout_ms` (`error.InvalidUiRequestTimeout`).
 
 **Suspended Runs** (`SessionHost.Options.ui_request_wait = .suspend`). A
 question or custom UI request does not hold the Session: its Run ends
@@ -235,7 +237,11 @@ one that already took an answer it has not yet applied changes nothing
 either (`error.AlreadyAnswered`). A permission request is never suspended:
 the kernel's permission gate takes a `pending` answer for no answer and
 denies the tool, so under this mode a permission request blocks as before,
-and does not survive a close.
+and does not survive a close. Beside a suspended question it has an id of its
+own, and an answer goes to the request its id names and to no other. A
+Session whose request file the Host cannot read (corrupt, or written by a
+later version) keeps the file as it is and blocks instead of suspending,
+still under ids it never used before.
 
 ## 2. Capability exchange
 

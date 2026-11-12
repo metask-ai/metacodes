@@ -134,7 +134,8 @@ status, compatibility boundaries, and entry points are defined by
   `SessionHost.Options.ui_request_expiry` says what a request
   `ui_request_timeout_ms` leaves unanswered gets: `.cancel` (the default, as
   before), `.interrupt` (the Run stops too) or `.re_announce` (the same
-  `ui_request` line again every period). Work queued while a request is open
+  `ui_request` line again every period, so a zero timeout is refused,
+  `error.InvalidUiRequestTimeout`). Work queued while a request is open
   waits behind it, and `Snapshot.queue_waiting` says why. With
   `Options.ui_request_wait = .suspend`, a question or custom UI request ends
   its Run `suspended` instead of holding the driver: the Session's directory
@@ -142,7 +143,9 @@ status, compatibility boundaries, and entry points are defined by
   its id after a restart, and `respond` resumes the Run once through the new
   `AdmittedRun.resumeWithResults`, journaled with the new host event
   `run_resumed`; the resumed Run keeps the suspended Run's trace id, turn
-  limit and stream retry budget, and request ids are never reused. Nothing
+  limit and stream retry budget, and request ids are never reused. Each
+  answer reaches only the request it names, and a suspended Run's
+  idempotency key stays spent while it waits. Nothing
   else runs while a Run is suspended, and a suspended team lead leaves its
   inbox unread until it resumes. Permission
   requests still block in that mode: the kernel's permission gate reads a
@@ -151,6 +154,15 @@ status, compatibility boundaries, and entry points are defined by
   doc/API.md.
 
 ### Fixed
+
+- **A cancelled question no longer poisons its `SessionHost` Session** (part
+  of #446). A question the timeout, an interrupt or an unreadable answer
+  cancelled reached the AgentSession as `InputAborted`, which it takes for a
+  broken Host: the Run failed `CallbackFailed` and the Session reported
+  `session_poisoned`. It now gets `UiCancelled`, the user's outcome, so the
+  call fails with `InputAborted` as the model sees it and the Run and Session
+  go on. A cancelled custom UI request still poisons; that needs the
+  AgentSession to tell the two apart for custom requests too.
 
 - A same-turn re-issue no longer looks up the abandoned attempt's speculative
   tool results: they borrowed the attempt's freed tool-call ids, and a
@@ -183,15 +195,6 @@ status, compatibility boundaries, and entry points are defined by
   already treated it. The retry, the attempt count and the empty detail after a
   retry that succeeds are unchanged; a local decode failure such as an
   oversized SSE line stays `unknown`.
-
-- **A cancelled question no longer poisons its `SessionHost` Session** (part
-  of #446). A question the timeout, an interrupt or an unreadable answer
-  cancelled reached the AgentSession as `InputAborted`, which it takes for a
-  broken Host: the Run failed `CallbackFailed` and the Session reported
-  `session_poisoned`. It now gets `UiCancelled`, the user's outcome, so the
-  call fails with `InputAborted` as the model sees it and the Run and Session
-  go on. A cancelled custom UI request still poisons; that needs the
-  AgentSession to tell the two apart for custom requests too.
 
 ## 0.11.0 — 2026-11-06
 
