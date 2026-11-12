@@ -72,15 +72,13 @@ status, compatibility boundaries, and entry points are defined by
   28 adds `RunOptionsV1.stream_retry_budget` (0 to 8, default 0, in the
   options' last reserved word): the Run may send the same request again that
   many times when its accepted stream broke off without an answer (a stall, a
-  dropped connection, a stream that ended before its stop report); a server's
-  error and a local decode failure are never re-sent, and the budget is shared
-  with the existing re-send of an attempt that showed nothing. Each re-issue
-  tells the Host what to take back: the attempt's segment closes `discarded`,
-  the new `thinking_discarded` event names the thinking it showed, and a
-  `retry_notice` follows. Zero changes nothing a Host sees or a provider
-  receives. The header, the bindings, the Python (`stream_retry_budget=`) and
-  Node (`streamRetryBudget`) packages and the source-free consumers move to
-  revision 28.
+  dropped connection, a stream that ended before its stop report), beyond
+  each request's own re-send (#461); a server's error and a local decode
+  failure are never re-sent. Each re-issue tells the Host what to take back:
+  the attempt's segment closes `discarded`, the new `thinking_discarded` event
+  names the thinking it showed, and a `retry_notice` follows. The header, the
+  bindings, the Python (`stream_retry_budget=`) and Node (`streamRetryBudget`)
+  packages and the source-free consumers move to revision 28.
 
 - **Edit and rerun through AgentCore** (#441). AgentCore ABI revision 27 adds
   `session_control->rewind_to_user_message(session, position, out_error)`, the
@@ -124,6 +122,28 @@ status, compatibility boundaries, and entry points are defined by
   attached reader. doc/WIRE_PROTOCOL.md §2.3 and doc/API.md spell the ops out.
 
 ### Fixed
+
+- **A model request is retried once after a transient stream interruption,
+  even after partial output** (#461). A gateway stream that returned HTTP 200,
+  streamed some text or thinking and then dropped ended the Run with
+  `api_error` (`stream_interrupted`, `retryable`, `attempts=1`) in the TUI,
+  headless mode and AgentCore alike: the one automatic re-send applied only to
+  an attempt that had shown nothing and was shared across the whole Run, and
+  #452's re-send after output defaulted to zero. Now every model request has
+  one re-send of its own (`agent_loop.STREAM_RETRIES_PER_REQUEST`), so an
+  earlier turn cannot use it up. It applies when the connection gave no
+  answer (a stall, a drop, a stream that ended before its stop report) and the
+  failed response had not started a tool call: each client's parser reports a
+  call whose arguments were still streaming (`StreamHandle.toolCallStarted`),
+  which the loop never received. The attempt's text and thinking are
+  discarded, the identical request goes to the same provider, wire, model and
+  binding, and results of tools that completed on earlier turns stay. A
+  re-send of an attempt that showed output emits `retry_notice` (after the
+  `discarded` segment and, for thinking, `thinking_discarded`) and waits
+  500 ms; an abort during the wait ends the Run `aborted` and sends nothing.
+  A server-declared error, a local parse failure and a cut during a tool call
+  are still single-attempt. `max_stream_turn_retries` (headless) and the
+  AgentCore budget now come on top of the request's own re-send.
 
 - A same-turn re-issue no longer looks up the abandoned attempt's speculative
   tool results: they borrowed the attempt's freed tool-call ids, and a

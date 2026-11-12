@@ -628,7 +628,13 @@ const OpenAIStream = struct {
     reasoning_keys: std.ArrayList([]u8) = .empty,
 
     fn handle(self: *OpenAIStream) StreamHandle {
-        return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid, .serverRequestIdFn = &hServerRid, .httpStatusFn = &hHttpStatus, .retryAttemptFn = &hRetryAttempt };
+        return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid, .serverRequestIdFn = &hServerRid, .httpStatusFn = &hHttpStatus, .retryAttemptFn = &hRetryAttempt, .toolCallStartedFn = &hToolCallStarted };
+    }
+    /// A `tool_calls` delta (Chat) or a `function_call` item or arguments
+    /// delta (Responses) has arrived, flushed or not (#461).
+    fn hToolCallStarted(ctx: *anyopaque) bool {
+        const s: *OpenAIStream = @ptrCast(@alignCast(ctx));
+        return s.tc_active or s.tcs.items.len != 0;
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
         return @as(*OpenAIStream, @ptrCast(@alignCast(ctx))).next();

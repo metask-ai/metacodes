@@ -397,6 +397,61 @@ test "L2 bedrock: a frame cut by a closed connection is an incomplete stream, an
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
 }
 
+test "L2 bedrock: a stream cut while a tool call's input streams is sent once; one cut after text is sent again (#461)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
+    const whole = try endTurn(a);
+    defer a.free(whole);
+    // Text shown, then the connection ends before messageStop.
+    const text_cut = try responseBytes(a, &.{
+        .{ "messageStart", "{\"role\":\"assistant\"}" },
+        .{ "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"half an answer\"}}" },
+    });
+    defer a.free(text_cut);
+    // A toolUse block whose input is still streaming when the connection ends.
+    const tool_cut = try responseBytes(a, &.{
+        .{ "messageStart", "{\"role\":\"assistant\"}" },
+        .{ "contentBlockStart", "{\"contentBlockIndex\":0,\"start\":{\"toolUse\":{\"toolUseId\":\"tooluse_cut\",\"name\":\"Glob\"}}}" },
+        .{ "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"toolUse\":{\"input\":\"{\\\"pattern\\\":\"}}}" },
+    });
+    defer a.free(tool_cut);
+
+    {
+        // The handle reports the started call though no event carried it.
+        var server = try harness.MockServer.startCassette(&.{tool_cut}, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var owned = try bedrockProvider(a, "brk-key", MODEL, origin(url));
+        defer owned.deinit();
+        var handle = try owned.provider().sendStream(&HI, null, null, null, null, null, "");
+        defer handle.deinit();
+        try std.testing.expect(!handle.toolCallStarted());
+        try std.testing.expectError(error.StreamIncomplete, drain(a, handle));
+        try std.testing.expect(handle.toolCallStarted());
+    }
+    for ([_]struct { cut: []const u8, requests: usize, stop: cc.agent_loop.StopReason }{
+        .{ .cut = tool_cut, .requests = 1, .stop = .api_error },
+        .{ .cut = text_cut, .requests = 2, .stop = .end_turn },
+    }) |case| {
+        var server = try harness.MockServer.startCassette(&.{ case.cut, whole }, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var owned = try bedrockProvider(a, "brk-key", MODEL, origin(url));
+        defer owned.deinit();
+        var conv = cc.conversation.Conversation.init(a);
+        defer conv.deinit();
+        try conv.appendText(.user, "hi");
+        const result = try runLoop(a, &conv, owned.provider(), root);
+        try std.testing.expectEqual(case.stop, result.stop_reason);
+        try std.testing.expectEqual(case.requests, server.requestCount());
+    }
+}
+
 test "L2 bedrock: temperature and topP reach inferenceConfig unless the model always thinks" {
     const a = std.testing.allocator;
     const body = try endTurn(a);

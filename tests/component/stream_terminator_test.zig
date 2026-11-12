@@ -180,10 +180,12 @@ test "issue #269: with no retry left an unterminated stream ends the Run in api_
     const a = std.testing.allocator;
     for (std.enums.values(Wire)) |wire| {
         errdefer std.debug.print("wire={s}\n", .{@tagName(wire)});
+        // The cassette repeats its body, so the request's own re-issue (#461)
+        // is unterminated too and nothing is left after it.
         var out = try runWire(a, wire, &.{unterminated(wire)}, 0);
         defer out.deinit(a);
         try std.testing.expectEqual(agent_loop.StopReason.api_error, out.result.stop_reason);
-        try std.testing.expectEqual(@as(usize, 1), out.requests);
+        try std.testing.expectEqual(@as(usize, 2), out.requests);
         try std.testing.expectEqualStrings("", out.text);
     }
 }

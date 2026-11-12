@@ -54,7 +54,8 @@ Control table from 80 to 88 bytes. Over Revision 27 it adds a Host-granted
 stream retry budget (#452, see "Stream retry budget"):
 `RunOptionsV1.stream_retry_budget` takes the options' last reserved word and
 lets a Run re-issue a request whose accepted stream broke off without an
-answer after it had shown output, bounded by `MAX_STREAM_RETRY_BUDGET_V1`;
+answer after it had shown output, bounded by `MAX_STREAM_RETRY_BUDGET_V1`,
+beyond the one re-issue every request has of its own (#461);
 each such re-issue is announced by the existing `discarded` segment
 disposition, the new `thinking_discarded` observation event and the existing
 `retry_notice`. No table, struct, or descriptor changes size, and the root
@@ -467,9 +468,9 @@ The v1 observation set is:
 | Assistant visible-output segment protocol | `text_chunk` | UTF-8 data delta belonging to the currently open visible-output segment |
 | Assistant visible-output segment protocol | `output_segment_end` | Closes that segment with the authoritative `commentary` / `final` / `continued` / `partial` / `discarded` disposition and byte count |
 | Model reasoning-channel observation | `thinking_chunk` | Model reasoning delta, outside visible-output segments and final-output reconstruction |
-| Model reasoning-channel observation | `thinking_discarded` | The `thinking_chunk`s delivered while segment `index` was open belong to an attempt the Run withdrew and re-issues under its stream retry budget; carries the segment's `index`, `turn`, `group` and the withdrawn thinking `bytes` (see "Stream retry budget") |
+| Model reasoning-channel observation | `thinking_discarded` | The `thinking_chunk`s delivered while segment `index` was open belong to an attempt the Run withdrew and re-issues (the request's own re-issue or its stream retry budget); carries the segment's `index`, `turn`, `group` and the withdrawn thinking `bytes` (see "Stream retry budget") |
 | Provider stream boundary and retry | `stream_done` | One Provider stream completed; not a segment, turn, or Run completion signal |
-| Provider stream boundary and retry | `retry_notice` | Provider retry attempt and delay: a connection retry, or a same-turn re-issue under the Run's stream retry budget |
+| Provider stream boundary and retry | `retry_notice` | Provider retry attempt and delay: a connection retry, or a same-turn re-issue of an attempt that showed output (the request's own, or under the Run's stream retry budget) |
 | Tool execution observation | `tool_start` | Tool invocation identity, name, and input |
 | Tool execution observation | `tool_progress` | Incremental progress text for one tool call |
 | Tool execution observation | `tool_result` | Completed tool result, error flag, elapsed time, and optional successful file observations |
@@ -529,7 +530,7 @@ disposition is authoritative:
 
 Thinking has no segment of its own, but every `thinking_chunk` arrives while
 the segment of its Provider stream is open. When a Run re-issues an attempt
-under its stream retry budget, `thinking_discarded` follows that segment's
+that showed output, `thinking_discarded` follows that segment's
 `output_segment_end` (disposition `discarded`) with the same `index`, `turn`
 and `group`: the Host removes or ignores the thinking delivered while that
 segment was open, `bytes` in total, as it drops a `discarded` segment's text.
@@ -895,17 +896,23 @@ result. A Skill invocation in its own context is the Run, so its failure is.
 
 A provider stream can break off after its response head was accepted: the
 connection stalls past the body idle limit, drops, or ends before the stream
-reports how it stopped. A Run whose failed attempt showed nothing yet (no
-text, thinking or tool call) re-issues the same request once by itself, as
-before Revision 28. A reasoning model streams thinking first, so in practice
-the attempt has nearly always shown something, and without a budget the Run
-then ends with `STOP_API_ERROR`.
+reports how it stopped. A reasoning model streams thinking first, so in
+practice the failed attempt has nearly always shown something already.
 
-`RunOptionsV1.stream_retry_budget` (Revision 28, #452) lets the Host take that
-risk for one Run: it is how many times the Run may re-issue a request whose
-accepted stream broke off without an answer, after output was shown too.
-Zero, the value of a zeroed `RunOptionsV1`, keeps the Revision 27 behavior
-byte for byte: the same events, the same provider requests. A value above
+**Every model request re-issues once by itself** (#461), whatever the
+options: when its accepted stream broke off without an answer and the failed
+response had not started a tool call, the Run discards everything the attempt
+produced and sends the identical request again, to the same provider, wire,
+model and binding. The allowance is the request's, not the Run's: each turn's
+request has its own, so an earlier turn's re-issue never uses up a later
+one's. A failed response that started a tool call, even one whose arguments
+were still streaming when the connection ended, is not re-issued under it.
+
+`RunOptionsV1.stream_retry_budget` (Revision 28, #452) lets the Host grant the
+Run more: it is how many further times the Run may re-issue a request whose
+accepted stream broke off without an answer, after output was shown and after
+a started tool call too. Zero, the value of a zeroed `RunOptionsV1`, grants
+nothing beyond each request's own re-issue. A value above
 `MAX_STREAM_RETRY_BUDGET_V1` (8) is refused with `RESOURCE_LIMIT`, and a
 nonzero `reserved0` beside it with `INVALID_ARGUMENT`, both before admission:
 the Run id stays reusable and nothing is sent.
@@ -918,44 +925,51 @@ the Run id stays reusable and nothing is sent.
   16 MiB SSE line limit) would recur; neither is re-issued. Abort,
   a context-window refusal (its own recovery) and the checkpoint budget keep
   their paths.
-- **How many.** The budget is the Run's, across all its turns, and the
-  re-issue an attempt that showed nothing gets is counted against it: a Run
-  re-issues at most max(budget, 1) times. Each re-issue is the identical
-  request, byte for byte, with its own connection retries (the same limit and
-  backoff as the first attempt's).
+- **How many.** A request uses its own re-issue first, then the budget. The
+  budget is the Run's, across all its turns. A request whose own re-issue was
+  spent on an attempt that showed nothing has no second one: a silent and a
+  visible failure of the same request share it. Each re-issue is the
+  identical request, byte for byte, with its own connection retries (the same
+  limit and backoff as the first attempt's).
 - **What the Host sees.** When an attempt that showed output is re-issued,
   its segment closes `discarded` as on any stream error; if it delivered
   thinking, `thinking_discarded` follows with that segment's `index`, `turn`
   and `group` and the thinking `bytes` it delivered; then `retry_notice`
-  reports `attempt` as the number of the Run's streams that broke off so far,
-  this one included, `max` as one more than the Run's re-issue limit, and
-  `delay_ms` 0. The `run_state` phase is `retrying` until the next attempt's
-  stream opens, and its output arrives in a new segment (the next `index`, the
-  same `group`). A Host removes or ignores everything the withdrawn attempt
-  showed: the segment's text and the thinking `thinking_discarded` names. An
-  attempt that showed nothing is re-issued without any of these events, as
-  before. The last attempt, once the budget is spent, closes `discarded` and
-  the Run ends with `STOP_API_ERROR` and its `model_error`.
+  reports `attempt` as the number of this request's streams that broke off so
+  far, this one included, `max` as the most attempts the request may make (the
+  first, its own re-issue, and what is left of the budget), and `delay_ms` as
+  the short backoff (500 ms) the Run waits before sending the re-issue. An
+  abort during that wait ends the Run `STOP_ABORTED`, and nothing more is
+  sent. The `run_state` phase is `retrying` until the next attempt's stream
+  opens, and its output arrives in a new segment (the next `index`, the same
+  `group`). A Host removes or ignores everything the withdrawn attempt showed:
+  the segment's text and the thinking `thinking_discarded` names. An attempt
+  that showed nothing is re-issued at once, without any of these events. The
+  last attempt, once the request's re-issue and the budget are spent, closes
+  `discarded` and the Run ends with `STOP_API_ERROR` and its `model_error`.
 - **What it does not show.** No tool call of a withdrawn attempt is announced
   or executed: `tool_start` follows a completed stream. A read-only call the
   loop may have started speculatively while the attempt streamed is joined
   and its result dropped. An OpenAI Responses reasoning item never crosses
   this ABI; one from a withdrawn attempt is dropped with it and is never sent
-  back to the model.
+  back to the model. Results of tools that completed on earlier turns stay in
+  the Conversation and in the re-issued request.
 - **Accounting.** Every re-issue is another provider request: usage events
   report what each attempt consumed, the durable budget reserves and settles
   each request, and a durable Run journal records each with its own attempt
   identity. `model_error.attempts` counts every physical attempt of the
   request that failed, re-issues included. A re-issue that succeeds leaves no
   `model_error`.
-- **Which Runs.** The budget covers the Run's own model requests: Text,
-  multimodal and goal-continuation Runs, and a Skill invocation Run, inline or
-  in its own context (that child is the Run). A subagent, or a Skill the model
-  invokes in its own context, has none; its output is a tool result, not
-  segments the Host shows.
+- **Which Runs.** Each request's own re-issue applies to every model request
+  the engine makes, a subagent's included. The budget covers the Run's own
+  model requests: Text, multimodal and goal-continuation Runs, and a Skill
+  invocation Run, inline or in its own context (that child is the Run). A
+  subagent, or a Skill the model invokes in its own context, has none; its
+  output is a tool result, not segments the Host shows.
 
-The budget never enters a provider request; a Run whose streams complete sends
-the same bytes whatever its value.
+Neither the request's own re-issue nor the budget ever enters a provider
+request; a Run whose streams complete sends the same bytes whatever the
+budget's value.
 
 ### Manual compact
 

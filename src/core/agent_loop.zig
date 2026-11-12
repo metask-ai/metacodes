@@ -71,12 +71,27 @@ pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_erro
 /// 与 max_turns 不冲突:那是预算,这是按故障分类停止,不数模型行为。
 pub const MAX_ENVIRONMENT_FAULTS: u32 = 3;
 
-/// 连接没给出答复(`isSilentRetryFailure`)、而本次尝试**还没有任何可见输出**(文本 / thinking /
-/// 工具调用都没到 backend)时,同轮重发次数的下限,不论 `Options.max_stream_turn_retries` 是多少。
-/// TUI 默认不重发是怕重复用户已经看着流出来的半截文本;一个字都没流出来就没有这个顾虑。2026-10-24
-/// 实录:message_start 之后连接静默 30 分钟被判 stall,run 以 api_error 收口,用户手动 /retry,
-/// 同一请求 18.7 s 完成。
-pub const SILENT_STREAM_RETRY_FLOOR: u8 = 1;
+/// Same-turn re-issues every model request gets by default (#461), whatever
+/// `Options` say: after a connection that gave no answer
+/// (`isSilentRetryFailure`), as long as the failed attempt never started a
+/// tool call. The count is the request's, not the Run's, so an earlier turn
+/// cannot use it up. A reasoning model streams thinking first, so a gateway
+/// stream that drops has almost always shown something; that output is
+/// discarded with the attempt (it never reaches the Conversation) and the
+/// identical request goes out again. A started tool call, even one whose
+/// arguments were still streaming, rules the re-issue out: the call may have
+/// begun to run (stream prefetch), and a gateway that re-generates it gives no
+/// promise to name it the same way. 2026-10-24: a connection silent for 30
+/// minutes after `message_start` ended a Run with `api_error`; the user's
+/// manual /retry finished the same request in 18.7 s.
+pub const STREAM_RETRIES_PER_REQUEST: u8 = 1;
+
+/// How long a re-issue of an attempt that showed output waits after its
+/// `retry_notice` (#461). Short: the connection already died once, and the
+/// wait is there so a gateway that is restarting is not hit at once. The wait
+/// is a cancellation point; an abort during it ends the Run `aborted` and
+/// sends nothing.
+pub const STREAM_RETRY_BACKOFF_MS: u32 = 500;
 
 /// 哪些流内失败算"连接没给出答复",可以在零可见输出时兜底重发:监视线程判的 stall(进展沉默或
 /// 连接已死)、没报告停止原因就结束的流、以及流中途断连(`RequestFailed`——三个 provider client
@@ -674,33 +689,38 @@ pub const Options = struct {
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
-    /// Bounded same-turn retries after a mid-stream provider failure. The
-    /// stream-error path already discards the partial turn (nothing was
-    /// committed to the conversation), so re-issuing the identical request is
-    /// semantically clean. Default 0 preserves interactive behavior — a TUI
-    /// user has watched the partial text stream and a silent re-run would
-    /// duplicate it; headless evaluation enables 2, where one transient
-    /// otherwise destroys an entire paired arm's evidence. A stall or an
-    /// unterminated stream before anything visible streamed has no such text
-    /// and always gets at least `SILENT_STREAM_RETRY_FLOOR` retries.
+    /// Bounded same-turn retries after a mid-stream provider failure, on top
+    /// of the request's own `STREAM_RETRIES_PER_REQUEST`. The stream-error
+    /// path already discards the partial turn (nothing was committed to the
+    /// conversation), so re-issuing the identical request is semantically
+    /// clean. Unlike the per-request allowance this counts every stream
+    /// failure, a server-declared error included, and the count is the Run's.
+    /// Headless evaluation enables 2, where one transient otherwise destroys
+    /// an entire paired arm's evidence. Default 0.
     max_stream_turn_retries: u8 = 0,
-    /// Same-turn re-issues for a host that can take back what it showed
-    /// (#452; AgentCore `RunOptionsV1.stream_retry_budget`). This Run may
-    /// re-issue a request whose accepted stream failed without an answer
-    /// (`isSilentRetryFailure`: a stall, a stream that ended before its stop
-    /// report, a dropped connection) up to this many times, after visible
-    /// output too. Unlike `max_stream_turn_retries`, a server-declared error
-    /// (`ApiError`) or a local decode failure is never re-issued under it, and
-    /// every re-issue of an attempt that showed something is announced: the
-    /// attempt's segment closes `discarded` (as on any stream error), its
-    /// thinking is withdrawn with `thinking_discarded`, and `retry_notice`
-    /// precedes the next attempt. An attempt that showed nothing is re-issued
-    /// silently, as under the floor. The count is the Run's, shared with
-    /// `max_stream_turn_retries` and `SILENT_STREAM_RETRY_FLOOR`, so a Run
-    /// re-issues at most max(this, the floor) times; each re-issue has its own
-    /// connection retries (`providerAttemptLimit`). 0, the default, changes
-    /// nothing.
+    /// Same-turn re-issues a host grants on top of the request's own
+    /// `STREAM_RETRIES_PER_REQUEST` (#452; AgentCore
+    /// `RunOptionsV1.stream_retry_budget`). This Run may re-issue a request
+    /// whose accepted stream failed without an answer (`isSilentRetryFailure`:
+    /// a stall, a stream that ended before its stop report, a dropped
+    /// connection) up to this many more times, after visible output and a
+    /// started tool call too. Unlike `max_stream_turn_retries`, a
+    /// server-declared error (`ApiError`) or a local decode failure is never
+    /// re-issued under it. The count is the Run's, shared with
+    /// `max_stream_turn_retries`; each re-issue has its own connection retries
+    /// (`providerAttemptLimit`). 0, the default, leaves the per-request
+    /// allowance alone.
+    ///
+    /// Every re-issue of an attempt that showed something is announced, under
+    /// any allowance: the attempt's segment closes `discarded` (as on any
+    /// stream error), its thinking is withdrawn with `thinking_discarded`,
+    /// `retry_notice` follows, and the next attempt waits
+    /// `stream_retry_backoff_ms`. An attempt that showed nothing is re-issued
+    /// silently and at once.
     retractable_stream_retries: u8 = 0,
+    /// The wait before re-issuing an attempt that showed output (#461). Tests
+    /// shorten or lengthen it; every product path keeps the default.
+    stream_retry_backoff_ms: u32 = STREAM_RETRY_BACKOFF_MS,
     /// 统一 UI 请求回调(替代旧 ask_question 等多套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -1615,6 +1635,8 @@ fn runCounted(
     defer output_channel.close(.partial, "");
     var verification_nudges: u8 = 0;
     var required_first_repairs: u8 = 0;
+    // Re-issues under `max_stream_turn_retries` / `retractable_stream_retries`:
+    // the Run's count. The per-request allowance is counted per turn below.
     var stream_turn_retries: u8 = 0;
     var requirement_ledger_state = requirement_ledger_mod.State{};
     var delivery_cadence_state = delivery_cadence_mod.State{};
@@ -2164,6 +2186,13 @@ fn runCounted(
         // history 后重试。同一 turn 内重试,不把恢复尝试计成新 turn。
         var context_recovery = ContextRecoveryState{ .cap = @max(conversation.len(), 1) };
         model_error.beginRequest();
+        // Re-issues of this model request under `STREAM_RETRIES_PER_REQUEST`
+        // (#461): a fresh allowance for every request, so an earlier turn's
+        // re-issue cannot use it up.
+        var request_stream_retries: u8 = 0;
+        // The Run's count when this request started: the Run allowance this
+        // request may still draw on, and how many of its re-issues it made.
+        const run_stream_retries_at_request = stream_turn_retries;
         var turn_stop_reason: api_stream.StopReason = .unknown;
         var rid_for_turn: log.RequestId = undefined;
         // Re-issue counter for this turn. A context recovery or a mid-stream
@@ -2369,10 +2398,11 @@ fn runCounted(
             // — and a later resume's journal validation rejects the duplicate.
             // Fold every same-turn re-issue (context recovery *and* bounded
             // mid-stream retry) into the recorded generation; each outer
-            // `continue :request_recovery` advances exactly one of the two, so
-            // the sum strictly increases per turn.
+            // `continue :request_recovery` advances exactly one of the three
+            // counters, so the sum strictly increases per turn.
             const attempt_generation = context_recovery.attempts +
-                @as(usize, stream_turn_retries);
+                @as(usize, stream_turn_retries) +
+                @as(usize, request_stream_retries);
             if (!retry_ui.prepare(
                 request_sha256,
                 turns + 1,
@@ -2545,7 +2575,7 @@ fn runCounted(
             var aborted_during_stream = false;
             var stream_error = false;
             // Which error ended the stream (null = none, or a context-window frame).
-            // Only connection-shaped failures qualify for SILENT_STREAM_RETRY_FLOOR.
+            // Only connection-shaped failures qualify for STREAM_RETRIES_PER_REQUEST.
             var stream_failure: ?anyerror = null;
             var stream_context_window_exceeded = false;
             var response_usage = @import("cache_break.zig").ResponseUsage{};
@@ -2930,8 +2960,11 @@ fn runCounted(
                     assistant_blocks.items.len != 0;
                 // The connection gave no answer at all (isSilentRetryFailure).
                 const connection_failure = isSilentRetryFailure(stream_failure);
-                // Nothing shown and no answer: see SILENT_STREAM_RETRY_FLOOR.
-                const silent_retry_eligible = !showed_output and connection_failure;
+                // The response began a tool call: one the loop received, or
+                // one the parser saw open whose arguments never finished.
+                const tool_call_started = tool_uses.items.len != 0 or stream.toolCallStarted();
+                // See STREAM_RETRIES_PER_REQUEST.
+                const request_retry_eligible = connection_failure and !tool_call_started;
                 const thinking_bytes: u64 = thinking_text.items.len;
                 // 先 join 预取线程再释放 tool_uses(它们 borrow 其字节),防 UAF(Linus HIGH-1)。
                 prefetch.joinAll();
@@ -2987,31 +3020,52 @@ fn runCounted(
                 // re-issue of the same request is safe. Aborts keep their
                 // own path; context-window exhaustion was handled before.
                 const abort_pending = if (opts.abort) |a| a.isAborted() else false;
-                // A host that can take back what it showed (#452) extends the
-                // re-issue limit, for a connection that gave no answer only.
+                // The Run's allowance: a host that can take back what it
+                // showed (#452) extends it for a connection that gave no
+                // answer only.
                 const retractable_cap: u8 = if (connection_failure) opts.retractable_stream_retries else 0;
-                const stream_retry_cap = if (silent_retry_eligible)
-                    @max(opts.max_stream_turn_retries, SILENT_STREAM_RETRY_FLOOR, retractable_cap)
+                const run_retry_cap = @max(opts.max_stream_turn_retries, retractable_cap);
+                const reissue: ?enum { request, run } = if (abort_pending)
+                    null
+                else if (request_retry_eligible and request_stream_retries < STREAM_RETRIES_PER_REQUEST)
+                    .request
+                else if (stream_turn_retries < run_retry_cap)
+                    .run
                 else
-                    @max(opts.max_stream_turn_retries, retractable_cap);
-                if (stream_turn_retries < stream_retry_cap and
-                    !abort_pending)
-                {
-                    if (showed_output and opts.retractable_stream_retries > 0)
+                    null;
+                if (reissue) |allowance| {
+                    switch (allowance) {
+                        .request => request_stream_retries += 1,
+                        .run => stream_turn_retries += 1,
+                    }
+                    const run_used: u32 = stream_turn_retries - run_stream_retries_at_request;
+                    const failed_streams: u32 = @as(u32, request_stream_retries) + run_used;
+                    log.warnId("agent", rid_for_turn, "mid-stream failure{s} → same-turn retry {d} ({s} allowance)", .{
+                        if (showed_output) " after visible output" else "",
+                        failed_streams,
+                        @tagName(allowance),
+                    });
+                    if (showed_output) {
+                        // Every attempt this request may make: the first, its
+                        // own re-issue (when this failure qualifies for it or
+                        // it was spent), and what is left of the Run's.
+                        const own: u8 = if (request_retry_eligible) STREAM_RETRIES_PER_REQUEST else request_stream_retries;
+                        const max_streams: u32 = 1 + @as(u32, own) +
+                            @as(u32, run_retry_cap -| run_stream_retries_at_request);
                         announceRetractedAttempt(
                             backend,
                             sess,
                             discarded_segment,
                             thinking_bytes,
-                            @as(u32, stream_turn_retries) + 1,
-                            @as(u32, stream_retry_cap) + 1,
+                            failed_streams,
+                            @max(max_streams, failed_streams + 1),
+                            opts.stream_retry_backoff_ms,
                         );
-                    stream_turn_retries += 1;
-                    log.warnId("agent", rid_for_turn, "mid-stream failure{s} → same-turn retry {d}/{d}", .{
-                        if (silent_retry_eligible) " before any visible output" else "",
-                        stream_turn_retries,
-                        stream_retry_cap,
-                    });
+                        if (!waitStreamRetryBackoff(opts.abort, opts.stream_retry_backoff_ms)) {
+                            log.warnId("agent", rid_for_turn, "aborted during stream retry backoff", .{});
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        }
+                    }
                     continue :request_recovery;
                 }
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
@@ -5844,11 +5898,11 @@ fn settleCandidate(
     if (observer) |installed| installed.settle(candidate, settlement);
 }
 
-/// A re-issue a host can take back (#452, `Options.retractable_stream_retries`).
-/// The attempt's text segment has already closed `discarded`; what it showed
-/// in thinking is withdrawn under the same segment identity, then the next
-/// attempt is announced the way a connection retry is: `failed_streams` of at
-/// most `max_streams` failed, and the next starts at once.
+/// A re-issue of an attempt that showed output (#452, #461). The attempt's
+/// text segment has already closed `discarded`; what it showed in thinking is
+/// withdrawn under the same segment identity, then the next attempt is
+/// announced the way a connection retry is: `failed_streams` of at most
+/// `max_streams` failed, and the next starts after `delay_ms`.
 fn announceRetractedAttempt(
     backend: *const UiBackend,
     sess: @import("session_id.zig").SessionId,
@@ -5856,6 +5910,7 @@ fn announceRetractedAttempt(
     thinking_bytes: u64,
     failed_streams: u32,
     max_streams: u32,
+    delay_ms: u32,
 ) void {
     if (thinking_bytes != 0) if (segment) |closed| backend.emitEvent(sess, .{ .thinking_discarded = .{
         .index = closed.index,
@@ -5866,8 +5921,26 @@ fn announceRetractedAttempt(
     backend.emitEvent(sess, .{ .retry_notice = .{
         .attempt = failed_streams,
         .max = max_streams,
-        .delay_ms = 0,
+        .delay_ms = delay_ms,
     } });
+}
+
+/// The wait between a `retry_notice` and the re-issue it announced (#461).
+/// False when the Run was cancelled before or during it: nothing more is sent.
+fn waitStreamRetryBackoff(abort: ?*const AbortSignal, delay_ms: u32) bool {
+    const aborted = struct {
+        fn check(signal: ?*const AbortSignal) bool {
+            return if (signal) |a| a.isAborted() else false;
+        }
+    }.check;
+    var left: u32 = delay_ms;
+    while (left > 0) {
+        if (aborted(abort)) return false;
+        const step = @min(left, 10);
+        util_time.sleepMs(step);
+        left -= step;
+    }
+    return !aborted(abort);
 }
 
 fn estimateInputSchemaTokens(schema: json_mod.InputSchema) usize {

@@ -642,13 +642,14 @@ class Session:
     ) -> RunResult:
         """Run one prompt to completion and return the final answer.
 
-        ``stream_retry_budget`` (0 to 8, default 0) is how many times the Run
-        may send a request again when its stream breaks off without an answer
-        (a stall, a dropped connection, a stream that ended early) after some
-        output was already shown. Each such retry is announced: the attempt's
-        segment ends ``discarded``, a ``thinking_discarded`` event takes back
-        its thinking, and a ``retry_notice`` follows. With 0 only a stream
-        that showed nothing is retried, once.
+        Every request is sent once more by itself when its stream breaks off
+        without an answer (a stall, a dropped connection, a stream that ended
+        early) before any tool call started. ``stream_retry_budget`` (0 to 8,
+        default 0) is how many more times the Run may send a request again
+        after that, a started tool call included. Each retry of an attempt
+        that showed output is announced: the attempt's segment ends
+        ``discarded``, a ``thinking_discarded`` event takes back its thinking,
+        and a ``retry_notice`` follows before a short wait.
 
         The Run executes on its own thread (``RUN_STACK_BYTES`` of stack);
         this call waits for it. An interrupt while waiting (Ctrl+C) aborts the
