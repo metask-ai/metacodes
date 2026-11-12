@@ -30,6 +30,14 @@
 //! most every `lead_inbox_poll_ms`, and a teammate's reply becomes the lead's
 //! next Run, queued behind the work already there.
 //!
+//! With `Options.teammates`, the SessionHost also fulfils the lead's
+//! `SpawnTeammate` requests, as the daemon's `App` starts its teammates
+//! (#445): after each item the lead's driver takes the pending requests in
+//! order, asks the Host's `TeammateFactory` for each member's configuration,
+//! opens the member as another Session on the same host under the lead's team
+//! identity and a fresh lease, and submits the request's prompt as its first
+//! Run. Closing the lead closes the members it opened.
+//!
 //! Lifetimes: `open` and `acquire` return a counted reference that `release`
 //! gives back; no pointer escapes without one. `close` takes the Session out
 //! of the table, answers its pending prompt as cancelled, aborts its Run,
@@ -61,6 +69,7 @@ const permission_settings = @import("../permission/settings.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const swarm_tools = @import("../swarm/tools.zig");
+const swarm_context = @import("../swarm/context.zig");
 
 /// How often an idle team lead's inbox, a locked file, is read: the bundled
 /// daemon's `session_service.LeadMail.POLL_MS`.
@@ -77,6 +86,10 @@ pub const Options = struct {
     max_queued: usize = 64,
     /// Turn limit of each Run.
     max_turns: u32 = 400,
+    /// Configures the member Sessions a hosted team lead's `SpawnTeammate`
+    /// asks for; the SessionHost opens and runs them. Null leaves the
+    /// requests pending, for the Host to fulfil itself.
+    teammates: ?TeammateFactory = null,
     /// Flush each Session's transcript (`transcript.sessionDir` under its
     /// state root) after every Run and command, so `open(.resume)` restores
     /// it.
@@ -168,6 +181,40 @@ pub const Snapshot = struct {
         allocator.free(self.model);
         self.* = undefined;
     }
+};
+
+/// A teammate a hosted lead asked for. Borrowed for `TeammateFactory.configure`.
+pub const TeammateSpawn = struct {
+    /// The lead Session that asked.
+    lead: SessionId,
+    /// The lead's team (sanitized).
+    team_name: []const u8,
+    /// The member's sanitized name; never "team-lead".
+    name: []const u8,
+    /// The member's first Run, submitted once it is open.
+    prompt: []const u8,
+    /// As the lead model passed them; the factory decides what they mean.
+    agent_type: ?[]const u8,
+    effort: ?[]const u8,
+};
+
+/// How the Host configures a member Session (#445). The SessionHost owns the
+/// team identity: `configure` returns `team = null`, and the member joins
+/// `spawn.team_name` as `spawn.name` under the lead's session id and a fresh
+/// lease. Provider, workspace, tools and permissions are the Host's choice,
+/// as for any Session it opens. The returned configuration may borrow from
+/// `arena`, which lives until the member is open. Runs on the lead's driver
+/// thread, so two leads may call it at once; an error drops the request
+/// (logged) and leaves the lead running.
+pub const TeammateFactory = struct {
+    ctx: *anyopaque,
+    configure: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, spawn: TeammateSpawn) anyerror!SessionConfig,
+};
+
+/// A member Session a lead's driver opened, closed with the lead.
+const Teammate = struct {
+    name: []u8,
+    id: SessionId,
 };
 
 pub const SessionHost = struct {
@@ -410,6 +457,9 @@ pub const HostedSession = struct {
     last_compact_id: u64 = 0,
     /// When an idle team lead's inbox is read next (`util_time.nowNs`).
     next_lead_poll_ns: i128 = 0,
+    /// Members this lead opened (`Options.teammates`); names owned by `gpa`.
+    /// Driver-only until the driver is joined, then `shutdown` closes them.
+    teammates: std.ArrayList(Teammate) = .empty,
 
     /// Gives back a reference from `open` or `acquire`; the last one of a
     /// closed Session frees it. Valid after `SessionHost.deinit`.
@@ -571,6 +621,7 @@ pub const HostedSession = struct {
                 .submission => |submission| self.runSubmission(submission),
                 .command => |cmd| self.applyCommand(cmd),
             }
+            self.fulfilSpawns();
         }
     }
 
@@ -635,6 +686,90 @@ pub const HostedSession = struct {
         };
         work.item = .{ .submission = .{ .text = text } };
         return work;
+    }
+
+    /// Opens a member Session for each `SpawnTeammate` request the lead's
+    /// last Run made, oldest first, and submits its prompt. A name this lead
+    /// already opened and the Host has not closed takes the prompt as its
+    /// next Run instead. Driver-only: the requests live in the lead's
+    /// `SwarmContext`.
+    fn fulfilSpawns(self: *HostedSession) void {
+        const factory = self.host.options.teammates orelse return;
+        if (!self.leadsTeam()) return;
+        const swarm = &self.session.swarm.?;
+        while (self.admitsSpawns()) {
+            const request = swarm.popPendingSpawn() orelse return;
+            var owned = request;
+            defer owned.deinit(swarm.allocator);
+            self.spawnTeammate(factory, swarm, &owned) catch |err|
+                log.warn("session_host", "teammate {s} of {s} not started: {s}", .{ owned.name, self.id.asSlice(), @errorName(err) });
+        }
+    }
+
+    fn spawnTeammate(
+        self: *HostedSession,
+        factory: TeammateFactory,
+        swarm: *const swarm_context.SwarmContext,
+        request: *const swarm_context.SpawnRequest,
+    ) !void {
+        for (self.teammates.items, 0..) |known, index| {
+            if (!std.mem.eql(u8, known.name, request.name)) continue;
+            if (self.host.acquire(known.id)) |member| {
+                defer member.release();
+                return member.submit(.{ .text = request.prompt });
+            }
+            // The Host closed it: forget it and open the name again.
+            self.gpa.free(known.name);
+            _ = self.teammates.swapRemove(index);
+            break;
+        }
+
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        var config = try factory.configure(factory.ctx, arena.allocator(), .{
+            .lead = self.id,
+            .team_name = swarm.team_sanitized,
+            .name = request.name,
+            .prompt = request.prompt,
+            .agent_type = request.agent_type,
+            .effort = request.effort,
+        });
+        if (config.team != null) return error.TeammateTeamConfigNotAllowed;
+        const lease = session_id_mod.gen();
+        config.team = .{
+            .role = .member,
+            .team_name = swarm.team_sanitized,
+            .member_name = request.name,
+            .lead_session_id = swarm.session.asSlice(),
+            .member_lease = lease.asSlice(),
+        };
+        // Room first, so an opened member is always one the lead will close.
+        try self.teammates.ensureUnusedCapacity(self.gpa, 1);
+        const name = try self.gpa.dupe(u8, request.name);
+        errdefer self.gpa.free(name);
+        const member = try self.host.open(.{ .config = config });
+        defer member.release();
+        self.teammates.appendAssumeCapacity(.{ .name = name, .id = member.id });
+        try member.submit(.{ .text = request.prompt });
+    }
+
+    /// A closing lead starts no member, and neither does a poisoned one: it
+    /// could never take the member's reply.
+    fn admitsSpawns(self: *HostedSession) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return !self.closing and self.phase != .poisoned;
+    }
+
+    /// Closes the members this lead opened; after the driver is joined.
+    fn closeTeammates(self: *HostedSession) void {
+        for (self.teammates.items) |member| {
+            // Already closed by the Host: nothing to do.
+            self.host.close(member.id) catch {};
+            self.gpa.free(member.name);
+        }
+        self.teammates.deinit(self.gpa);
+        self.teammates = .empty;
     }
 
     fn freeWork(self: *HostedSession, work: *Work) void {
@@ -931,6 +1066,7 @@ pub const HostedSession = struct {
     /// and the id is free; the shell (journal, snapshot) stays for holders.
     fn shutdown(self: *HostedSession) void {
         self.stopDriver();
+        self.closeTeammates();
         self.journal.close();
         self.mutex.lock();
         while (self.kernel_users > 0) self.kernel_idle.wait(&self.mutex);

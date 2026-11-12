@@ -31,7 +31,7 @@ pub const SpawnRequest = struct {
     agent_type: ?[]u8 = null,
     effort: ?[]u8 = null,
 
-    fn deinit(self: *SpawnRequest, a: std.mem.Allocator) void {
+    pub fn deinit(self: *SpawnRequest, a: std.mem.Allocator) void {
         a.free(self.name);
         a.free(self.prompt);
         if (self.agent_type) |v| a.free(v);
@@ -238,6 +238,14 @@ pub const SwarmContext = struct {
         try self.pending_spawns.append(self.allocator, req);
     }
 
+    /// Takes the oldest pending request, or null when there is none. The
+    /// caller owns it and frees it with `deinit(self.allocator)` (#445: a
+    /// `SessionHost` fulfils a hosted lead's requests in the order made).
+    pub fn popPendingSpawn(self: *SwarmContext) ?SpawnRequest {
+        if (self.pending_spawns.items.len == 0) return null;
+        return self.pending_spawns.orderedRemove(0);
+    }
+
     /// Drops the pending request for `name`, if any (the Host fulfilled it, or
     /// the member joined the roster). Returns whether one was removed.
     pub fn clearPendingSpawn(self: *SwarmContext, name: []const u8) bool {
@@ -325,4 +333,9 @@ test "host scheduler records, supersedes and clears pending spawn requests (#277
     try testing.expect(!sw.clearPendingSpawn("solver"));
     try testing.expectEqual(@as(usize, 1), sw.pending_spawns.items.len);
     try testing.expectEqualStrings("writer", sw.pending_spawns.items[0].name);
+
+    var taken = sw.popPendingSpawn().?;
+    defer taken.deinit(testing.allocator);
+    try testing.expectEqualStrings("writer", taken.name);
+    try testing.expect(sw.popPendingSpawn() == null);
 }
