@@ -43,7 +43,9 @@ empty `### Migration`.
   Run's, across its turns, and shared with the one re-send an attempt that
   showed nothing already gets, so a Run re-sends at most max(budget, 1) times.
   A value above 8 is `RESOURCE_LIMIT`, a nonzero `reserved0` beside it
-  `INVALID_ARGUMENT`, both before admission.
+  `INVALID_ARGUMENT`, both before admission. A re-sent attempt never finds the
+  abandoned attempt's speculative tool results: a call it repeats runs, even
+  under the same id.
 - The `thinking_discarded` observation event: `{index, turn, group, bytes}`
   names the thinking a re-sent attempt showed while segment `index` was open,
   for the Host to take back as it drops that segment's `discarded` text. Each
@@ -52,12 +54,6 @@ empty `### Migration`.
   phase. `model_error.attempts` counts re-sends like connection retries.
 - Python `Session.run(..., stream_retry_budget=)` / `stream(...)` and Node
   `run(prompt, { streamRetryBudget })` / `stream(...)`.
-
-### Fixed
-
-- A re-sent attempt no longer finds the abandoned attempt's speculative tool
-  results, whose ids it borrowed from freed memory; a re-sent call with the
-  same id runs instead of taking an empty result.
 
 ### Migration
 

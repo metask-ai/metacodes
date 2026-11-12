@@ -12,19 +12,6 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
-- **Edit and rerun through AgentCore** (#441). AgentCore ABI revision 27 adds
-  `session_control->rewind_to_user_message(session, position, out_error)`, the
-  operation behind `/edit` (#432): while idle it drops the user message at a
-  1-based position and everything after it, and the Host's next Run takes its
-  place after exactly the context before it. A position that cannot be rerun is
-  refused with its own status (31 `MESSAGE_POSITION_OUT_OF_RANGE`, 32
-  `NOT_USER_MESSAGE`, 33 `MESSAGE_POSITION_COMPACTED`) and changes nothing. Only
-  the Conversation changes; a checkpoint exported afterwards holds the edited
-  history and a restored Session continues from it. The Session Control table
-  grows to 88 bytes. The header, the Zig and Rust bindings, the Python
-  (`Session.rewind_to_user_message`) and Node (`Session.rewindToUserMessage`)
-  packages and the source-free consumers move to revision 27; AgentCore
-  0.15.0-dev.
 - **A stream retry budget for AgentCore Hosts** (#452). A reasoning model
   streams thinking first, so a gateway stream that breaks off has almost always
   shown output, and the Run ended with `STOP_API_ERROR`. AgentCore ABI revision
@@ -41,6 +28,20 @@ status, compatibility boundaries, and entry points are defined by
   Node (`streamRetryBudget`) packages and the source-free consumers move to
   revision 28.
 
+- **Edit and rerun through AgentCore** (#441). AgentCore ABI revision 27 adds
+  `session_control->rewind_to_user_message(session, position, out_error)`, the
+  operation behind `/edit` (#432): while idle it drops the user message at a
+  1-based position and everything after it, and the Host's next Run takes its
+  place after exactly the context before it. A position that cannot be rerun is
+  refused with its own status (31 `MESSAGE_POSITION_OUT_OF_RANGE`, 32
+  `NOT_USER_MESSAGE`, 33 `MESSAGE_POSITION_COMPACTED`) and changes nothing. Only
+  the Conversation changes; a checkpoint exported afterwards holds the edited
+  history and a restored Session continues from it. The Session Control table
+  grows to 88 bytes. The header, the Zig and Rust bindings, the Python
+  (`Session.rewind_to_user_message`) and Node (`Session.rewindToUserMessage`)
+  packages and the source-free consumers move to revision 27; AgentCore
+  0.15.0-dev.
+
 ### Fixed
 
 - A same-turn re-issue no longer looks up the abandoned attempt's speculative
@@ -48,8 +49,6 @@ status, compatibility boundaries, and entry points are defined by
   re-issued call with a repeated id could take a released, empty result
   instead of running. Reachable before through headless retries after a
   streamed tool call (#452).
-
-### Fixed
 
 - **metacodes-core's isolation from the application is checked** (#448).
   `src/lib.zig` claimed its import graph could not reach the UI and that
