@@ -55,7 +55,7 @@ What a Host adds around the kernel's events, as
 
 | `type` | `data` | Written by |
 |---|---|---|
-| `user_message` | `run_id`, `trace_id`, `text`, `replaces` | both Hosts: a Run's first line |
+| `user_message` | `run_id`, `trace_id`, `text`, `replaces`; `source`, `kind`, `idempotency_key`, `attributes` when given | both Hosts: a Run's first line |
 | `run_done` | `run_id`, `trace_id`, `stop_reason`, `error_name`, `model_error` | both Hosts: a Run's last line |
 | `command_result` | `command`, `ok`, `error_name`, `message` | both Hosts |
 | `message_rejected` | `message`, `text`, `model`, `permission_mode` | `--web`/`serve` |
@@ -95,6 +95,20 @@ nothing changed.
 
 ```text
 {"v":1,"type":"user_message","data":{"run_id":6,"trace_id":null,"text":"...","replaces":6}}
+```
+
+A typed submission (#447) appends `source`, `kind`, `idempotency_key` and
+`attributes` to its `user_message` under §4's additive rule 2. Each is
+written only when the submission had it, so the line of any other submission
+keeps its bytes; a reader takes an absent field as not given. `attributes`
+is one JSON object of string values, in the order submitted. `text` stays
+the submitted text when a submission template shaped what the provider saw
+([API.md](API.md#sessionhost-a-multi-session-service-for-network-hosts)).
+Only `SessionHost` takes typed submissions so far: `--web` and `serve`
+refuse an `idempotency_key` and never write these fields.
+
+```text
+{"v":1,"type":"user_message","data":{"run_id":8,"trace_id":null,"text":"heart rate high","replaces":null,"source":"device:hr-01","kind":"telemetry","idempotency_key":"hr-01:seq-42","attributes":{"bpm":"132","unit":"bpm"}}}
 ```
 
 ### 1.2 Runs
