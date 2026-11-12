@@ -202,7 +202,8 @@ const routed_away = [_]UiRequest{
 test "wire_contract: every UiRequest kind, close outcome and unavailable reason has a pinned v1 line" {
     const a = std.testing.allocator;
     const closed_count = std.meta.fields(cc.wire.RequestClosed).len;
-    var lines: [requests.len + closed_count + routed_away.len][]u8 = undefined;
+    // One close per outcome, then one naming its approver (#446).
+    var lines: [requests.len + closed_count + 1 + routed_away.len][]u8 = undefined;
     var written: usize = 0;
     defer for (lines[0..written]) |line| a.free(line);
 
@@ -223,6 +224,8 @@ test "wire_contract: every UiRequest kind, close outcome and unavailable reason 
         lines[requests.len + index] = try cc.wire.writeRequestClosed(a, index + 1, @enumFromInt(field.value));
         written += 1;
     }
+    lines[requests.len + closed_count] = try cc.wire.writeRequestClosedBy(a, 1, .answered, "alice@example.com");
+    written += 1;
 
     // The unavailable lines come from routing, not from naming a reason.
     var declaration = try cc.wire.parseCapabilities(a, "{\"v\":1,\"type\":\"capabilities\",\"ui_requests\":[\"permission\"],\"custom\":[\"video_timeline@1\"]}");
@@ -234,7 +237,7 @@ test "wire_contract: every UiRequest kind, close outcome and unavailable reason 
     inline for (std.meta.fields(cc.frontend_capabilities.Unavailable), 0..) |field, index| {
         const route = cc.frontend_capabilities.route(capabilities, &routed_away[index]);
         try std.testing.expectEqual(cc.frontend_capabilities.Route{ .unavailable = @enumFromInt(field.value) }, route);
-        lines[requests.len + closed_count + index] = try cc.wire.writeRequestUnavailable(a, &routed_away[index], route.unavailable);
+        lines[requests.len + closed_count + 1 + index] = try cc.wire.writeRequestUnavailable(a, &routed_away[index], route.unavailable);
         written += 1;
     }
     try compareOrDump(a, &lines, REQUESTS_FIXTURE, "requests.jsonl");
@@ -304,6 +307,8 @@ const host_events = [_]cc.wire.HostEvent{
     .{ .message_rejected = .{ .message = "model not available for current provider", .text = "fix the build", .model = "gpt-5.6-luna", .permission_mode = "bypass_permissions" } },
     .{ .message_rejected = .{ .message = "bypassPermissions is disabled by settings", .text = "fix the build", .permission_mode = "bypass_permissions" } },
     .{ .session_poisoned = .{ .error_name = "CallbackFailed", .dropped = 2 } },
+    // A Run resuming one that ended `suspended` on request 1 (#446).
+    .{ .run_resumed = .{ .run_id = 2, .trace_id = "trace-1", .request_id = 1 } },
 };
 
 test "wire_contract: every HostEvent tag and the Run context form have a pinned v1 line" {
