@@ -10,6 +10,32 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- **Breaking: the `--web`/`serve` event stream is wire v1 throughout** (#444).
+  `/events` and the UDS `attach` op carried two envelopes. Kernel events and
+  UI requests were versioned wire lines, but the host lines were unversioned
+  `{"<name>":...}` objects written by hand, with their own field names and no
+  Run identity. Now every journal line is one wire v1 line written by
+  `core/protocol/wire.zig`, in the form `SessionHost` writes
+  ([doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md) §1.1–1.2). `user_message`,
+  `run_done`, `command_result` and the new `message_rejected` are host
+  events (`{"v":1,"type":...,"data":{...}}`), and `session_lifecycle` is a
+  kernel event. `run_done.err` is gone: a failed Run names its error in
+  `error_name` with a `null` `stop_reason` (it said `"error"`), and a model
+  failure's text is `model_error.message`. `command_result` gains `command`
+  (the line's verb) and `error_name`, and keeps its text in `message`. Runs
+  are numbered per session, and `user_message`, `run_done` and every kernel
+  event in between carry the Run's `run_id`. A `/command` that plans a Run
+  journals its `command_result` before the Run's `user_message`. Out-of-tree
+  readers of `/events` and `attach` switch on `type` and read `data`; the
+  bundled browser UI parses this one form. The UDS frames
+  `{"type":"keepalive"}` and `{"type":"session_closed"}` stay as they were:
+  they are the transport's, not journal lines (§1.3). For the wire contract
+  the change is additive: `message_rejected` is a new HostEvent tag, and
+  `command_result.message` an appended field
+  (`tests/fixtures/wire/v1/host_events.jsonl`).
+
 ### Added
 
 - **Edit and rerun through AgentCore** (#441). AgentCore ABI revision 27 adds

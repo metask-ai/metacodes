@@ -1603,7 +1603,9 @@ test "L2: a route change is broadcast as an ordered, replayable event carrying i
     // what a browser or an attached client reads.
     var journal = cc.event_journal.EventJournal.init(a);
     defer journal.deinit();
-    var web_sink = cc.web_session.WebConfigSink{ .journal = &journal, .alloc = a };
+    var wb = cc.web_backend.WebBackend.init(a, &journal);
+    defer wb.deinit();
+    var web_sink = cc.web_session.WebConfigSink{ .wb = &wb };
     const sink = web_sink.sink();
 
     // A route event as `bindCommittedSelection` produces one.

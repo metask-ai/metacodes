@@ -397,7 +397,7 @@ test "#254 create → message → the turn on SSE → listed → destroy ends th
     const sse = try Stream.openSse(&fx, id);
     defer sse.destroy();
     var needle_buffer: [96]u8 = undefined;
-    try sse.waitFor(try std.fmt.bufPrint(&needle_buffer, "\"session_lifecycle\":{{\"created\":\"{s}\"}}", .{id.asSlice()}));
+    try sse.waitFor(try std.fmt.bufPrint(&needle_buffer, "\"type\":\"session_lifecycle\",\"data\":{{\"created\":\"{s}\"}}", .{id.asSlice()}));
 
     try fx.message(id, "hello daemon");
     try sse.waitFor("hello from the provider");
@@ -442,7 +442,7 @@ test "#254 create → message → the turn on SSE → listed → destroy ends th
 
     // The stream sees the run end, then the session close, then the transport's close, and ends.
     try sse.waitClosed();
-    const closed = try std.fmt.bufPrint(&needle_buffer, "\"session_lifecycle\":{{\"closed\":\"{s}\"}}", .{id.asSlice()});
+    const closed = try std.fmt.bufPrint(&needle_buffer, "\"type\":\"session_lifecycle\",\"data\":{{\"closed\":\"{s}\"}}", .{id.asSlice()});
     const at_run_done = sse.offsetOf("\"run_done\"").?;
     const at_closed = sse.offsetOf(closed) orelse return error.NoClosedLifecycle;
     const at_transport_close = sse.offsetOf("event: session_closed") orelse return error.NoSessionClosedEvent;
@@ -513,8 +513,8 @@ test "#254 destroy while a turn is generating: bounded, the driver joined, the r
     // Joined before the close: the aborted run's run_done precedes the closed lifecycle.
     try sse.waitClosed();
     var needle_buffer: [96]u8 = undefined;
-    const closed = try std.fmt.bufPrint(&needle_buffer, "\"session_lifecycle\":{{\"closed\":\"{s}\"}}", .{id.asSlice()});
-    const at_run_done = sse.offsetOf("\"run_done\":{\"stop_reason\":\"aborted\"") orelse return error.NoAbortedRunDone;
+    const closed = try std.fmt.bufPrint(&needle_buffer, "\"type\":\"session_lifecycle\",\"data\":{{\"closed\":\"{s}\"}}", .{id.asSlice()});
+    const at_run_done = sse.offsetOf("\"type\":\"run_done\",\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"aborted\"") orelse return error.NoAbortedRunDone;
     const at_closed = sse.offsetOf(closed) orelse return error.NoClosedLifecycle;
     try std.testing.expect(at_run_done < at_closed);
     try fx.expectHealth(0);
@@ -529,7 +529,7 @@ test "#254 destroy never waits for leases: SSE and UDS attach end and give their
 
     const id = try fx.create("");
     var needle_buffer: [96]u8 = undefined;
-    const created = try std.fmt.bufPrint(&needle_buffer, "\"session_lifecycle\":{{\"created\":\"{s}\"}}", .{id.asSlice()});
+    const created = try std.fmt.bufPrint(&needle_buffer, "\"type\":\"session_lifecycle\",\"data\":{{\"created\":\"{s}\"}}", .{id.asSlice()});
 
     // Both readers hold a lease from the moment they have read anything.
     const sse = try Stream.openSse(&fx, id);
@@ -570,7 +570,7 @@ test "#254 destroy never waits for leases: SSE and UDS attach end and give their
 
     // The journal close ends both readers; each sees the closed lifecycle and
     // its transport's close, and gives its lease back.
-    const closed = try std.fmt.bufPrint(&needle_buffer, "\"session_lifecycle\":{{\"closed\":\"{s}\"}}", .{id.asSlice()});
+    const closed = try std.fmt.bufPrint(&needle_buffer, "\"type\":\"session_lifecycle\",\"data\":{{\"closed\":\"{s}\"}}", .{id.asSlice()});
     try sse.waitClosed();
     try attach.waitClosed();
     try std.testing.expect(sse.contains(closed) and sse.contains("event: session_closed"));

@@ -165,8 +165,9 @@ tool results. They are discarded, not kept as a branch. In the terminal,
 - **Context only.** Files written, commands run and other effects of the
   dropped turns stay. The must-read-first record is cleared (as by `/clear`),
   since the rerun's context no longer shows what was read.
-- **Hosts.** `POST /command` takes the same line; the turn's input is
-  journaled as `{"user_message":"<text>","replaces":n}`. A Zig Host calls
+- **Hosts.** `POST /command` takes the same line; the Run's `user_message`
+  line carries the text and `"replaces":n`
+  ([Wire lines](#wire-lines-for-out-of-process-hosts)). A Zig Host calls
   `AgentSession.rewindToUserMessage(position)` while idle and then runs the
   edited text; `SessionHost` does both for a submission with `.replaces`
   (see [SessionHost](#sessionhost-a-multi-session-service-for-network-hosts)).
@@ -858,11 +859,21 @@ with the schema version `v` (currently 1) and a `type`:
 
 ```text
 {"v":1,"type":"<CoreEvent tag>","data":<payload or null>}
+{"v":1,"type":"<CoreEvent tag>","run_id":N,"trace_id":"...","data":...}
+{"v":1,"type":"<HostEvent tag>","data":{...}}
 {"v":1,"type":"ui_request","id":N,"kind":"permission|ask_question|custom","request":{...}}
 {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled|malformed"}
 {"v":1,"type":"ui_request_unavailable","kind":"...","custom_kind":"...","reason":"..."}
 {"v":1,"type":"capabilities_accepted",...}
 ```
+
+Host events (`user_message`, `run_done`, `command_result`,
+`message_rejected`, `session_poisoned`) are what a Host adds around the
+kernel's events ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#11-host-events)). Runs
+are numbered 1, 2, … per Session. A Run's lines run from its `user_message`
+to its `run_done`, and every kernel event in between carries its `run_id`
+([Runs](WIRE_PROTOCOL.md#12-runs)). The bundled `--web` and `serve` host
+journals nothing but these lines.
 
 The normative contract, including which changes keep v1 and which bump
 `SCHEMA_VERSION`, is [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
@@ -900,7 +911,10 @@ conformance vectors for Hosts in other languages. The bundled `--web` UI
 consumes exactly these lines and declares `permission` and `ask_question`
 when it loads.
 
-The `--web` server streams these lines over SSE with ids `<epoch>-<seq>`. The
+The `--web` server streams these lines over SSE with ids `<epoch>-<seq>`; the
+UDS `attach` op streams the same lines, one per line. Each transport also has
+frames of its own that are not journal lines and carry no `v`
+([Transport frames](WIRE_PROTOCOL.md#13-transport-frames)). The
 epoch names the event journal; a restarted host or a rebuilt session has a new
 one. A client resumes with `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`
 (`/state` reports both). When the cursor belongs to another epoch, names a
@@ -951,32 +965,32 @@ message reads, with nothing from the driver in between:
 ```text
 {"v":1,"type":"config_changed","data":{"model":"claude-opus-4-6"}}   if model was given
 {"v":1,"type":"config_changed","data":{"mode":"accept_edits"}}      if permission_mode was given
-{"user_message":"..."}
-... the turn's events ...
-{"run_done":{"stop_reason":"end_turn","err":null}}
+{"v":1,"type":"user_message","data":{"run_id":N,"trace_id":null,"text":"...","replaces":null}}
+... the Run's events, each with "run_id":N ...
+{"v":1,"type":"run_done","data":{"run_id":N,"trace_id":null,"stop_reason":"end_turn","error_name":null,"model_error":null}}
 ```
 
-A turn that stops on the model (`api_error`, `max_tokens_exhausted`) says why,
-on the same line: `err` is the displayable message and `model_error` the
-structured detail. Every other stop writes the line above, byte for byte, with
-no `model_error` key.
+A turn that stops on the model (`api_error`, `max_tokens_exhausted`) says why
+on the same line: `model_error` is the structured detail, and its `message` is
+the text to show. Every other stop has `"model_error":null`. A Run that fails
+without returning (the run control refuses it, or the loop fails) has
+`"stop_reason":null` and names the error in `error_name`.
 
 ```text
-{"run_done":{"stop_reason":"api_error","err":"Balance too low","model_error":{"category":"payment_required","code":"insufficient_balance","type":null,"message":"Balance too low","http_status":402,"request_id":"req_1","retry":"not_retryable","retry_after_ms":null,"attempts":1,"truncated":false}}}
+{"v":1,"type":"run_done","data":{"run_id":N,"trace_id":null,"stop_reason":"api_error","error_name":null,"model_error":{"category":"payment_required","code":"insufficient_balance","type":null,"message":"Balance too low","http_status":402,"request_id":"req_1","retry":"not_retryable","retry_after_ms":null,"attempts":1,"truncated":false}}}
 ```
 
 The fields, what is redacted and how `retry` is decided are specified in
 [AGENTCORE_BINARY_ABI.md](AGENTCORE_BINARY_ABI.md#model-failure-detail).
 `code` passes through whatever the provider sent: metacodes attaches no billing
-or quota meaning to it. The `SessionHost` wire `run_done` carries the same object
-as `model_error` (null when there is none).
+or quota meaning to it. `SessionHost` writes the same `run_done` line.
 
 If either field is refused, neither is applied, the text stays out of the
 conversation, no turn runs, and this line takes the place of `user_message`:
 
 ```text
-{"message_rejected":{"message":"model not available for current provider","text":"...","model":"...","permission_mode":"bypass_permissions"}}
-{"message_rejected":{"message":"bypassPermissions is disabled by settings","text":"...","model":"...","permission_mode":"bypass_permissions"}}
+{"v":1,"type":"message_rejected","data":{"message":"model not available for current provider","text":"...","model":"...","permission_mode":"bypass_permissions"}}
+{"v":1,"type":"message_rejected","data":{"message":"bypassPermissions is disabled by settings","text":"...","model":"...","permission_mode":"bypass_permissions"}}
 ```
 
 `model` and `permission_mode` repeat what the message asked for (`null` when
@@ -985,12 +999,17 @@ therefore ends in exactly one `user_message` or `message_rejected`.
 `user_message` is journaled when the turn starts, not when the message is
 queued: a message sent during a turn appears after that turn's `run_done`.
 
-`config_changed` lines, whatever caused the change (a message, `/command`, a
-tool), are wire v1 lines whose `data` holds one of `model`, `mode`, `dirs`,
-`reasoning` or `route`. The other host lines (`user_message`, `run_done`,
-`command_result`, `message_rejected`, `session_lifecycle`) keep their
-`{"<name>":...}` shape. A `user_message` from `/edit <n> <text>` adds one
-sibling key, `{"user_message":"<text>","replaces":n}`: the conversation
+Every line is a wire v1 line ([Wire lines](#wire-lines-for-out-of-process-hosts)).
+A `config_changed` line has one of `model`, `mode`, `dirs`, `reasoning` or
+`route` in `data`, whatever caused the change: a message, `/command` or a
+tool. `session_lifecycle` is a kernel event. `user_message`, `run_done`,
+`command_result` and `message_rejected` are host events
+([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#11-host-events)). A `/command` is
+answered by `command_result`: `command` is the line's verb, `message` what it
+reports, and `error_name` is set when `ok` is false. A `/command` that plans a
+Run (a prompt, `/edit`, `/retry`, `/commit`, …) journals its `command_result`
+first, then the Run's `user_message` (none for a macro or `/retry`). A
+`user_message` from `/edit <n> <text>` has `"replaces":n`: the conversation
 before the turn is messages `1..n-1` ([Edit and rerun](#edit-and-rerun)).
 
 `GET /state` (`/s/<id>/state`) is the snapshot a client reconciles with after

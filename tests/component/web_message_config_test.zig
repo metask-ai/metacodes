@@ -12,12 +12,20 @@
 //! A real App (temporary HOME, a MockServer provider) under both drivers: the
 //! `--web` loop (`web_session.run`) and the daemon driver
 //! (`daemon/app_driver.zig` behind a SessionHost, reached over HTTP and UDS).
+//!
+//! The same drivers write every journal line as wire v1 (#444,
+//! doc/WIRE_PROTOCOL.md): a session's whole journal, through a Run with a
+//! permission prompt, a command, a refused message and a Run a `/command`
+//! planned, parses line by line as `{"v":1,"type":...}` of a known type, and
+//! every line of a Run carries that Run's `run_id` (`expectWireJournal`); the
+//! SSE stream and the UDS attachment carry exactly the journal's lines.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const harness = @import("harness");
 const cc = @import("cc");
 const pnet = @import("platform").net;
+const pfs = @import("platform").fs;
 const ppaths = @import("platform").paths;
 
 const START_MODEL = "claude-sonnet-4-20250514";
@@ -359,7 +367,7 @@ fn expectAppliedBeforeTurn(a: std.mem.Allocator, fx: *AppFixture, port: u16) !vo
     const lines = try dataLines(a, sse);
     defer a.free(lines);
     // config_changed for each given field, then the turn's user_message, then the turn.
-    const user = try expectLine(lines, "{\"user_message\":\"turn one\"}");
+    const user = try expectLine(lines, "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"turn one\",\"replaces\":null}}");
     const model_changed = try expectLine(lines, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"" ++ TURN_MODEL ++ "\"}}");
     const mode_changed = try expectLine(lines, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"accept_edits\"}}");
     try std.testing.expectEqual(user, model_changed + 2);
@@ -390,7 +398,7 @@ fn expectAppliedBeforeTurn(a: std.mem.Allocator, fx: *AppFixture, port: u16) !vo
     defer a.free(sse2);
     const lines2 = try dataLines(a, sse2);
     defer a.free(lines2);
-    _ = try expectLine(lines2, "{\"user_message\":\"turn two\"}");
+    _ = try expectLine(lines2, "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":2,\"trace_id\":null,\"text\":\"turn two\",\"replaces\":null}}");
     try std.testing.expectEqual(@as(usize, 0), countLines(lines2, "\"type\":\"config_changed\""));
     try std.testing.expectEqualStrings("\"" ++ TURN_MODEL ++ "\"", try requestModel(fx.mock, requests_bare));
     var after2 = try getState(a, port);
@@ -407,7 +415,7 @@ fn expectAppliedBeforeTurn(a: std.mem.Allocator, fx: *AppFixture, port: u16) !vo
     defer a.free(sse3);
     const lines3 = try dataLines(a, sse3);
     defer a.free(lines3);
-    const user3 = try expectLine(lines3, "{\"user_message\":\"turn three\"}");
+    const user3 = try expectLine(lines3, "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":3,\"trace_id\":null,\"text\":\"turn three\",\"replaces\":null}}");
     try std.testing.expectEqual(user3, 2 + try expectLine(lines3, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"" ++ TURN_MODEL ++ "\"}}"));
     try std.testing.expectEqual(user3, 1 + try expectLine(lines3, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"accept_edits\"}}"));
     try fx.expectLoginModel(START_MODEL);
@@ -448,7 +456,7 @@ fn expectModelFailureOnRunDone(a: std.mem.Allocator, port: u16) !void {
     defer a.free(failed);
     const failed_lines = try dataLines(a, failed);
     defer a.free(failed_lines);
-    _ = try expectLine(failed_lines, "{\"run_done\":{\"stop_reason\":\"api_error\",\"err\":\"Balance too low\",\"model_error\":{\"category\":\"unknown\",\"code\":\"insufficient_balance\",\"type\":\"billing_error\",\"message\":\"Balance too low\",\"http_status\":200,\"request_id\":\"req-web-1\",\"retry\":\"unknown\",\"retry_after_ms\":null,\"attempts\":1,\"truncated\":false}}}");
+    _ = try expectLine(failed_lines, "{\"v\":1,\"type\":\"run_done\",\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"api_error\",\"error_name\":null,\"model_error\":{\"category\":\"unknown\",\"code\":\"insufficient_balance\",\"type\":\"billing_error\",\"message\":\"Balance too low\",\"http_status\":200,\"request_id\":\"req-web-1\",\"retry\":\"unknown\",\"retry_after_ms\":null,\"attempts\":1,\"truncated\":false}}}");
 
     var after = try getState(a, port);
     defer after.deinit();
@@ -458,7 +466,7 @@ fn expectModelFailureOnRunDone(a: std.mem.Allocator, port: u16) !void {
     defer a.free(clean);
     const clean_lines = try dataLines(a, clean);
     defer a.free(clean_lines);
-    _ = try expectLine(clean_lines, "{\"run_done\":{\"stop_reason\":\"end_turn\",\"err\":null}}");
+    _ = try expectLine(clean_lines, "{\"v\":1,\"type\":\"run_done\",\"data\":{\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\",\"error_name\":null,\"model_error\":null}}");
 }
 
 test "L2 web: run_done carries the model failure's detail and a later success carries none (#408)" {
@@ -521,7 +529,7 @@ test "L2 web: a refused field queues nothing; an unusable model applies neither 
     defer a.free(lines);
     const rejected = lines[try expectLine(lines, "\"message_rejected\"")];
     try std.testing.expectEqualStrings(
-        "{\"message_rejected\":{\"message\":\"model not available for current provider\",\"text\":\"turn three\",\"model\":\"" ++ FOREIGN_MODEL ++ "\",\"permission_mode\":\"bypass_permissions\"}}",
+        "{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"model not available for current provider\",\"text\":\"turn three\",\"model\":\"" ++ FOREIGN_MODEL ++ "\",\"permission_mode\":\"bypass_permissions\"}}",
         rejected,
     );
     // FIFO: the refused bodies would have been taken before this one.
@@ -648,7 +656,7 @@ test "L2 web: a mode the settings disable is refused on a message and by /mode, 
     const lines = try dataLines(a, sse);
     defer a.free(lines);
     try std.testing.expectEqualStrings(
-        "{\"message_rejected\":{\"message\":\"bypassPermissions is disabled by settings\",\"text\":\"escalate\",\"model\":\"" ++ TURN_MODEL ++ "\",\"permission_mode\":\"bypass_permissions\"}}",
+        "{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"bypassPermissions is disabled by settings\",\"text\":\"escalate\",\"model\":\"" ++ TURN_MODEL ++ "\",\"permission_mode\":\"bypass_permissions\"}}",
         lines[try expectLine(lines, "\"message_rejected\"")],
     );
     try std.testing.expectEqual(@as(usize, 0), countLines(lines, "\"user_message\""));
@@ -665,7 +673,7 @@ test "L2 web: a mode the settings disable is refused on a message and by /mode, 
         defer from.deinit();
         const result = try commandResult(a, web.port, cmd, &from);
         defer a.free(result);
-        try std.testing.expectEqualStrings("{\"command_result\":{\"ok\":false,\"message\":\"bypassPermissions is disabled by settings\"}}", result);
+        try std.testing.expectEqualStrings("{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"mode\",\"ok\":false,\"error_name\":\"CommandRefused\",\"message\":\"bypassPermissions is disabled by settings\"}}", result);
         var after = try getState(a, web.port);
         defer after.deinit();
         try std.testing.expectEqualStrings("default", after.str("permission_mode"));
@@ -701,7 +709,7 @@ test "L2 web: without that setting the same message and /mode apply; disableAuto
     defer a.free(sse);
     const lines = try dataLines(a, sse);
     defer a.free(lines);
-    const user = try expectLine(lines, "{\"user_message\":\"escalate\"}");
+    const user = try expectLine(lines, "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"escalate\",\"replaces\":null}}");
     try std.testing.expectEqual(user, 2 + try expectLine(lines, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"" ++ TURN_MODEL ++ "\"}}"));
     try std.testing.expectEqual(user, 1 + try expectLine(lines, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"bypass_permissions\"}}"));
     try std.testing.expectEqual(@as(usize, 0), countLines(lines, "\"message_rejected\""));
@@ -716,7 +724,7 @@ test "L2 web: without that setting the same message and /mode apply; disableAuto
     {
         const result = try commandResult(a, web.port, "/mode auto", &applied);
         defer a.free(result);
-        try std.testing.expectEqualStrings("{\"command_result\":{\"ok\":false,\"message\":\"auto mode is disabled by settings\"}}", result);
+        try std.testing.expectEqualStrings("{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"mode\",\"ok\":false,\"error_name\":\"CommandRefused\",\"message\":\"auto mode is disabled by settings\"}}", result);
         var after = try getState(a, web.port);
         defer after.deinit();
         try std.testing.expectEqualStrings("bypass_permissions", after.str("permission_mode"));
@@ -765,7 +773,7 @@ const DaemonHost = struct {
         self.wb.abort = &app.abort;
         self.wb.usage_totals = &app.usage;
         self.dctx = .{ .app = app, .wb = &self.wb };
-        self.config_sink = .{ .journal = &self.host.journal, .alloc = a };
+        self.config_sink = .{ .wb = &self.wb };
         app.setConfigEventSink(self.config_sink.sink());
         errdefer app.setConfigEventSink(null);
         app.permission_ctx.ui_requester = self.wb.requester();
@@ -785,6 +793,8 @@ const DaemonHost = struct {
             self.host.journal.close();
             self.srv.stop();
         }
+        // serve.zig's first journal line (seq 0).
+        cc.web_session.journalSessionLifecycle(&self.host.journal, a, .{ .created = app.session_id.asSlice() });
         // The driver starts last, so no failure above leaves it running over a freed wb.
         try self.host.start();
     }
@@ -916,7 +926,7 @@ test "L2 serve: the UDS message op carries the same fields, checks and order" {
     }
     const lines = try daemon.linesUntil(a, from, "\"run_done\"");
     defer freeLines(a, lines);
-    const user = try expectLine(lines, "{\"user_message\":\"over uds\"}");
+    const user = try expectLine(lines, "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"over uds\",\"replaces\":null}}");
     try std.testing.expectEqual(user, 2 + try expectLine(lines, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"" ++ TURN_MODEL ++ "\"}}"));
     try std.testing.expectEqual(user, 1 + try expectLine(lines, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"dont_ask\"}}"));
     try std.testing.expect(user < try expectLine(lines, "\"run_done\""));
@@ -955,4 +965,359 @@ fn udsRoundtrip(a: std.mem.Allocator, conn: pnet.Socket, line: []const u8) ![]u8
     const nl = std.mem.indexOfScalar(u8, out.items, '\n').?;
     out.shrinkRetainingCapacity(nl);
     return out.toOwnedSlice(a);
+}
+
+// ── every journal line is wire v1; a Run's lines carry its run_id (#444) ─────
+
+/// How a journal line's `type` stands in the wire grammar.
+const LineClass = enum { core, host, other };
+
+fn classOf(type_name: []const u8) LineClass {
+    inline for (std.meta.fields(cc.ui_event.CoreEvent)) |field| {
+        if (std.mem.eql(u8, field.name, type_name)) return .core;
+    }
+    inline for (std.meta.fields(cc.wire.HostEvent)) |field| {
+        if (std.mem.eql(u8, field.name, type_name)) return .host;
+    }
+    return .other;
+}
+
+/// A web/serve journal, in order, against wire v1: each line is one JSON
+/// object with `v` 1 and a `type` of the grammar (`wire.isLineType`). A Run's
+/// lines - its `user_message`, the kernel events journaled while it runs, its
+/// `run_done` - carry its `run_id`, numbered 1, 2, … in order; no other line
+/// carries one and no other host line falls inside a Run. These hosts take no
+/// trace ID, so no line has one. Returns how many Runs the journal holds.
+fn checkWireJournal(a: std.mem.Allocator, lines: []const []const u8, bad_line: *usize) !u64 {
+    var open: ?u64 = null;
+    var runs: u64 = 0;
+    for (lines, 0..) |line, index| {
+        bad_line.* = index;
+        try checkWireLine(a, line, &open, &runs);
+    }
+    bad_line.* = lines.len;
+    if (open != null) return error.TestRunNeverEnded;
+    return runs;
+}
+
+/// `checkWireJournal`, naming the line that breaks it.
+fn expectWireJournal(a: std.mem.Allocator, lines: []const []const u8) !u64 {
+    var bad_line: usize = 0;
+    return checkWireJournal(a, lines, &bad_line) catch |err| {
+        if (bad_line < lines.len) {
+            std.debug.print("journal line {d} is not wire v1 ({s}): {s}\n", .{ bad_line, @errorName(err), lines[bad_line] });
+        } else std.debug.print("journal ends inside a Run ({s})\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+fn checkWireLine(a: std.mem.Allocator, line: []const u8, open: *?u64, runs: *u64) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, a, line, .{}) catch return error.TestLineNotJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestLineNotObject;
+    const object = parsed.value.object;
+    const version = object.get("v") orelse return error.TestUnversionedLine;
+    if (version != .integer or version.integer != cc.wire.SCHEMA_VERSION) return error.TestWrongVersion;
+    const type_value = object.get("type") orelse return error.TestLineWithoutType;
+    if (type_value != .string or !cc.wire.isLineType(type_value.string)) return error.TestUnknownLineType;
+    const type_name = type_value.string;
+    if (object.get("trace_id") != null) return error.TestTraceIdWithoutOne;
+    switch (classOf(type_name)) {
+        .core => if (object.get("run_id")) |value| {
+            try enterRun(open, runs, try runIdOf(value));
+        } else if (open.* != null) return error.TestRunEventWithoutRunId,
+        .host => {
+            const data = object.get("data") orelse return error.TestHostLineWithoutData;
+            if (data != .object) return error.TestHostLineWithoutData;
+            const run_line = std.mem.eql(u8, type_name, "user_message") or std.mem.eql(u8, type_name, "run_done");
+            if (!run_line) {
+                if (open.* != null) return error.TestHostLineInsideRun;
+                return;
+            }
+            const trace = data.object.get("trace_id") orelse return error.TestHostLineWithoutTraceId;
+            if (trace != .null) return error.TestTraceIdWithoutOne;
+            try enterRun(open, runs, try runIdOf(data.object.get("run_id") orelse return error.TestHostLineWithoutRunId));
+            if (std.mem.eql(u8, type_name, "run_done")) open.* = null;
+        },
+        // UI request and capability lines belong to no Run.
+        .other => if (object.get("run_id") != null) return error.TestRunIdOnRequestLine,
+    }
+}
+
+/// A line of Run `run_id`: the Run in progress, or the next one, which it
+/// opens (a Run a macro started has no `user_message`).
+fn enterRun(open: *?u64, runs: *u64, run_id: u64) !void {
+    if (open.*) |current| {
+        if (run_id != current) return error.TestLineOfAnotherRun;
+        return;
+    }
+    if (run_id != runs.* + 1) return error.TestRunIdOutOfOrder;
+    runs.* = run_id;
+    open.* = run_id;
+}
+
+fn runIdOf(value: std.json.Value) !u64 {
+    if (value != .integer or value.integer < 1) return error.TestBadRunId;
+    return @intCast(value.integer);
+}
+
+test "#444 the journal check refuses an unversioned line, an unknown type and a Run line without its run_id" {
+    const a = std.testing.allocator;
+    var bad: usize = 0;
+    const user1 = "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"hi\",\"replaces\":null}}";
+    const done1 = "{\"v\":1,\"type\":\"run_done\",\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"end_turn\",\"error_name\":null,\"model_error\":null}}";
+    // What the web/serve host wrote before #444.
+    try std.testing.expectError(error.TestUnversionedLine, checkWireJournal(a, &.{"{\"user_message\":\"hi\"}"}, &bad));
+    try std.testing.expectError(error.TestUnversionedLine, checkWireJournal(a, &.{"{\"session_lifecycle\":{\"created\":\"x\"}}"}, &bad));
+    try std.testing.expectError(error.TestUnknownLineType, checkWireJournal(a, &.{"{\"v\":1,\"type\":\"keepalive\"}"}, &bad));
+    try std.testing.expectError(error.TestRunEventWithoutRunId, checkWireJournal(a, &.{ user1, "{\"v\":1,\"type\":\"text_chunk\",\"data\":\"x\"}", done1 }, &bad));
+    try std.testing.expectError(error.TestHostLineInsideRun, checkWireJournal(a, &.{ user1, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"mode\",\"ok\":true,\"error_name\":null,\"message\":null}}", done1 }, &bad));
+    try std.testing.expectError(error.TestRunNeverEnded, checkWireJournal(a, &.{user1}, &bad));
+    try std.testing.expectError(error.TestRunIdOutOfOrder, checkWireJournal(a, &.{"{\"v\":1,\"type\":\"text_chunk\",\"run_id\":2,\"data\":\"x\"}"}, &bad));
+    try std.testing.expectEqual(@as(u64, 1), try checkWireJournal(a, &.{ "{\"v\":1,\"type\":\"stream_done\",\"data\":null}", user1, "{\"v\":1,\"type\":\"text_chunk\",\"run_id\":1,\"data\":\"x\"}", done1 }, &bad));
+}
+
+/// A provider turn that calls Write on `path`; in `default` mode its
+/// permission prompt goes to the frontend (caller frees).
+fn writeToolSse(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_w\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_w\",\"name\":\"Write\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"file_path\\\":\\\"{s}\\\",\\\"content\\\":\\\"wire\\\"}}\"}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+        "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+        "data: {{\"type\":\"message_stop\"}}\n\n", .{path});
+}
+
+/// Where the granted Write lands: a fresh file under the system temporary
+/// directory, outside the repository (forward slashes, so it sits in JSON as
+/// is). Caller frees.
+fn wireWritePath(a: std.mem.Allocator) ![:0]u8 {
+    var nonce: [6]u8 = undefined;
+    if (!@import("platform").rng.randomBytes(&nonce)) return error.TestNoRandomness;
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/mc-wire-{s}.txt", .{ std.mem.trimEnd(u8, ppaths.tempDir(), "/\\"), &std.fmt.bytesToHex(nonce, .lower) }, 0);
+    for (path) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return path;
+}
+
+/// The SSE stream from seq 0 of the journal `epoch` names, read until `until`.
+fn eventsFromStart(a: std.mem.Allocator, port: u16, epoch: []const u8, until: []const u8) ![]u8 {
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/events?since=0&epoch={s}", .{epoch});
+    return request(a, port, "GET", path, "", until);
+}
+
+/// The id of the newest `ui_request` of `kind` in an SSE body.
+fn requestIdIn(sse: []const u8, kind: []const u8) !u64 {
+    const key = "\"type\":\"ui_request\",\"id\":";
+    var id: ?u64 = null;
+    var rest = sse;
+    while (std.mem.indexOf(u8, rest, key)) |at| {
+        rest = rest[at + key.len ..];
+        const comma = std.mem.indexOfScalar(u8, rest, ',') orelse break;
+        const after = rest[comma..];
+        var kind_buf: [48]u8 = undefined;
+        if (std.mem.startsWith(u8, after, try std.fmt.bufPrint(&kind_buf, ",\"kind\":\"{s}\"", .{kind})))
+            id = try std.fmt.parseInt(u64, rest[0..comma], 10);
+    }
+    return id orelse error.TestExpectedUiRequest;
+}
+
+/// The scenario's last line. Read to its end: the SSE read stops at the first
+/// match, and every line it returns must be whole.
+const RUN2_DONE = "{\"v\":1,\"type\":\"run_done\",\"data\":{\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\",\"error_name\":null,\"model_error\":null}}";
+
+/// One session's journal over the HTTP surface, shared by both drivers:
+///   Run 1: a message whose Write asks permission; the test, as the browser,
+///          answers it `allow_once`, the file is written, the turn ends;
+///   between Runs: `/mode dont-ask` (its command_result and config_changed),
+///          then a message whose model is refused (message_rejected, no Run);
+///   Run 2: a prompt through `/command` (its command_result, then its
+///          user_message).
+/// Returns the data lines of the whole journal, read over SSE from seq 0
+/// (caller frees `sse` and the slice).
+fn driveWireScenario(a: std.mem.Allocator, port: u16, write_path: [:0]const u8, sse_out: *[]u8) ![]const []const u8 {
+    var start = try getState(a, port);
+    defer start.deinit();
+
+    const ack = try postMessage(a, port, "{\"text\":\"write the file\"}");
+    defer a.free(ack);
+    try std.testing.expect(std.mem.indexOf(u8, ack, "200 OK") != null);
+    const asked = try eventsFrom(a, port, &start, "\"kind\":\"permission\"");
+    defer a.free(asked);
+    const id = try requestIdIn(asked, "permission");
+    var answer_buf: [64]u8 = undefined;
+    const answer = try std.fmt.bufPrint(&answer_buf, "{{\"id\":{d},\"choice\":\"allow_once\"}}", .{id});
+    const granted = try request(a, port, "POST", "/respond", answer, null);
+    defer a.free(granted);
+    try std.testing.expect(std.mem.indexOf(u8, granted, "200 OK") != null);
+    const first = try eventsFrom(a, port, &start, "\"type\":\"run_done\"");
+    defer a.free(first);
+    try std.testing.expect(pfs.exists(write_path.ptr)); // the answer reached the tool
+
+    var idle = try getState(a, port);
+    defer idle.deinit();
+    try postCommand(a, port, "/mode dont-ask");
+    const moded = try eventsFrom(a, port, &idle, "permission mode \xe2\x86\x92 dont_ask");
+    defer a.free(moded);
+    const refused = try postMessage(a, port, "{\"text\":\"refused\",\"model\":\"" ++ FOREIGN_MODEL ++ "\"}");
+    defer a.free(refused);
+    const rejected = try eventsFrom(a, port, &idle, "\"type\":\"message_rejected\"");
+    defer a.free(rejected);
+    try postCommand(a, port, "say hi");
+
+    const sse = try eventsFromStart(a, port, start.str("epoch"), RUN2_DONE ++ "\n");
+    errdefer a.free(sse);
+    sse_out.* = sse;
+    return dataLines(a, sse);
+}
+
+/// What the scenario journals, beyond the grammar: the lines that make it a
+/// Run with a permission prompt, in their places.
+fn expectWireScenario(a: std.mem.Allocator, lines: []const []const u8, session_id: []const u8) !void {
+    try std.testing.expectEqual(@as(u64, 2), try expectWireJournal(a, lines));
+
+    var created_buf: [128]u8 = undefined;
+    const created = try std.fmt.bufPrint(&created_buf, "{{\"v\":1,\"type\":\"session_lifecycle\",\"data\":{{\"created\":\"{s}\"}}}}", .{session_id});
+    try std.testing.expectEqualStrings(created, lines[0]);
+
+    const user1 = try expectLine(lines, "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"write the file\",\"replaces\":null}}");
+    const prompt = try expectLine(lines, "\"type\":\"ui_request\",\"id\":");
+    try std.testing.expect(std.mem.indexOf(u8, lines[prompt], "\"kind\":\"permission\",\"request\":{\"tool\":\"Write\"") != null);
+    const closed = try expectLine(lines, "\"type\":\"ui_request_closed\"");
+    try std.testing.expect(std.mem.endsWith(u8, lines[closed], "\"outcome\":\"answered\"}"));
+    const tool = try expectLine(lines, "{\"v\":1,\"type\":\"tool_result\",\"run_id\":1,\"data\":{\"id\":\"tu_w\",\"name\":\"Write\"");
+    const done1 = try expectLine(lines, "{\"v\":1,\"type\":\"run_done\",\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"end_turn\",\"error_name\":null,\"model_error\":null}}");
+    try std.testing.expect(user1 < prompt and prompt < closed and closed < tool and tool < done1);
+
+    const mode = try expectLine(lines, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"mode\",\"ok\":true,\"error_name\":null,\"message\":\"permission mode \xe2\x86\x92 dont_ask\"}}");
+    const mode_changed = try expectLine(lines, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"dont_ask\"}}");
+    const rejected = try expectLine(lines, "{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"model not available for current provider\",\"text\":\"refused\",\"model\":\"" ++ FOREIGN_MODEL ++ "\",\"permission_mode\":null}}");
+    const queued = try expectLine(lines, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"prompt\",\"ok\":true,\"error_name\":null,\"message\":\"queued for run\"}}");
+    const user2 = try expectLine(lines, "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":2,\"trace_id\":null,\"text\":\"say hi\",\"replaces\":null}}");
+    const text2 = try expectLine(lines, "{\"v\":1,\"type\":\"text_chunk\",\"run_id\":2,\"data\":");
+    try std.testing.expect(done1 < mode_changed and mode_changed < mode and mode < rejected and rejected < queued);
+    try std.testing.expect(queued < user2 and user2 < text2 and text2 < try expectLine(lines, RUN2_DONE));
+}
+
+test "L2 web: every journal line is wire v1 and a Run's lines carry its run_id, through a permission prompt (#444)" {
+    const a = std.testing.allocator;
+    const write_path = try wireWritePath(a);
+    defer a.free(write_path);
+    defer pfs.unlinkPath(write_path.ptr) catch {};
+    const write_sse = try writeToolSse(a, write_path);
+    defer a.free(write_sse);
+    var fx: AppFixture = undefined;
+    try fx.setup(&.{ write_sse, TEXT_SSE });
+    defer fx.deinit();
+
+    var web = WebRun{ .app = fx.app, .port = try freePort() };
+    try web.start();
+    var stopped = false;
+    defer if (!stopped) web.stop() catch {};
+
+    var sse: []u8 = &.{};
+    const lines = try driveWireScenario(a, web.port, write_path, &sse);
+    defer a.free(sse);
+    defer a.free(lines);
+    try expectWireScenario(a, lines, fx.app.session_id.asSlice());
+
+    try web.stop();
+    stopped = true;
+}
+
+/// Every NDJSON line a UDS attachment from seq 0 streams, until it has
+/// carried `want` journal lines. The transport's own keepalive frame is not
+/// a journal line (doc/WIRE_PROTOCOL.md §1.3) and is left out.
+fn udsAttachLines(a: std.mem.Allocator, sock_path: []const u8, sid: []const u8, want: usize) ![][]u8 {
+    const conn = try pnet.connectUnix(sock_path);
+    defer pnet.closeSocket(conn);
+    pnet.setRecvTimeoutMs(conn, 500);
+    var line_buf: [128]u8 = undefined;
+    const attach = try std.fmt.bufPrint(&line_buf, "{{\"op\":\"attach\",\"session\":\"{s}\",\"since\":0}}\n", .{sid});
+    var off: usize = 0;
+    while (off < attach.len) {
+        const n = pnet.send(conn, attach[off..]);
+        if (n <= 0) return error.WriteFailed;
+        off += @intCast(n);
+    }
+    var lines: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (lines.items) |l| a.free(l);
+        lines.deinit(a);
+    }
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(a);
+    var chunk: [4096]u8 = undefined;
+    const deadline = cc.util_time.nowMs() + 10_000;
+    while (lines.items.len < want) {
+        if (cc.util_time.nowMs() > deadline) return error.TestUdsAttachShort;
+        const n = pnet.recv(conn, &chunk);
+        if (n == 0) return error.TestUdsAttachShort;
+        if (n < 0) {
+            if (!pnet.recvRetriable()) return error.TestUdsAttachShort;
+            continue;
+        }
+        try pending.appendSlice(a, chunk[0..@intCast(n)]);
+        while (std.mem.indexOfScalar(u8, pending.items, '\n')) |nl| {
+            const line = pending.items[0..nl];
+            if (!std.mem.eql(u8, line, "{\"type\":\"keepalive\"}")) try lines.append(a, try a.dupe(u8, line));
+            const rest = pending.items.len - nl - 1;
+            std.mem.copyForwards(u8, pending.items[0..rest], pending.items[nl + 1 ..]);
+            pending.shrinkRetainingCapacity(rest);
+        }
+    }
+    return lines.toOwnedSlice(a);
+}
+
+test "L2 serve: the daemon driver journals the same wire v1 lines; SSE and UDS attach carry exactly them (#444)" {
+    const a = std.testing.allocator;
+    const write_path = try wireWritePath(a);
+    defer a.free(write_path);
+    defer pfs.unlinkPath(write_path.ptr) catch {};
+    const write_sse = try writeToolSse(a, write_path);
+    defer a.free(write_sse);
+    var fx: AppFixture = undefined;
+    try fx.setup(&.{ write_sse, TEXT_SSE });
+    defer fx.deinit();
+
+    var daemon: DaemonHost = undefined;
+    try daemon.start(fx.app);
+    defer daemon.stop();
+
+    var sse: []u8 = &.{};
+    const lines = try driveWireScenario(a, daemon.srv.port, write_path, &sse);
+    defer a.free(sse);
+    defer a.free(lines);
+    try expectWireScenario(a, lines, fx.app.session_id.asSlice());
+
+    // The journal itself, which SSE replayed line for line.
+    const journal = (try daemon.host.journal.waitSince(a, 0, 0)) orelse return error.TestEmptyJournal;
+    defer freeLines(a, journal);
+    try std.testing.expect(journal.len >= lines.len);
+    for (lines, journal[0..lines.len]) |streamed, journaled| try std.testing.expectEqualStrings(journaled, streamed);
+    _ = try expectWireJournal(a, journal);
+
+    if (builtin.os.tag == .windows) return; // UDS is POSIX-only
+    var nonce: [6]u8 = undefined;
+    if (!@import("platform").rng.randomBytes(&nonce)) return error.TestNoRandomness;
+    var path_buf: [256]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&path_buf, "{s}/mc-wire-{s}.sock", .{ std.mem.trimEnd(u8, ppaths.tempDir(), "/"), &std.fmt.bytesToHex(nonce, .lower) });
+    const uds = try cc.daemon_uds.UdsServer.start(a, sock_path, .{
+        .allocator = a,
+        .resolver = &DaemonHost.resolve,
+        .resolver_ctx = @ptrCast(&daemon),
+    });
+    defer {
+        // As serve shuts down: the journal's close ends the attachment, whose
+        // thread waits on the journal, before the socket stops (`stop` closes
+        // it again, which is harmless).
+        daemon.host.journal.close();
+        uds.stop();
+    }
+    const attached = try udsAttachLines(a, sock_path, fx.app.session_id.asSlice(), journal.len);
+    defer freeLines(a, attached);
+    try std.testing.expect(attached.len >= journal.len);
+    for (journal, attached[0..journal.len]) |journaled, line| try std.testing.expectEqualStrings(journaled, line);
 }

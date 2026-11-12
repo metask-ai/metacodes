@@ -18,6 +18,9 @@
 #     the main loop reaps it), create {"resume":true} restores the transcript;
 #     a second daemon with --sessions 0 starts empty and answers 429 at
 #     --max-sessions.
+#   - #444 wire v1: both sessions' journals, over SSE and over UDS attach,
+#     are wire v1 line for line, a Run's lines carry its run_id, and the two
+#     transports carry the same lines.
 #   - SIGINT shuts every driver down cleanly.
 #
 # Run by `zig build test` on POSIX hosts (build.zig sets
@@ -192,6 +195,119 @@ print("UDS_OK")
 PY
 uds_out="$(python3 "$TMP/uds_check.py" "$usock" "$A" "$B" 2>&1)" || fail "UDS checks failed: $uds_out"
 grep -q "UDS_OK" <<<"$uds_out" || fail "UDS checks did not finish: $uds_out"
+
+# ── wire v1 (#444): both journals, as SSE and as a UDS attachment carry them ─
+cat >"$TMP/wire_check.py" <<'PY'
+"""Each session's whole journal, read from seq 0 over SSE and over UDS attach:
+every line is one wire v1 line (doc/WIRE_PROTOCOL.md) whose type the v1
+fixtures pin (tests/component/wire_contract_test.zig keeps them complete), a
+Run's lines carry its run_id (1, 2, ... in order) and nothing else does, and
+both transports carry the same lines. An unversioned line fails. Transport
+frames are not journal lines: SSE marks them (`event:`, `retry:`, `:`
+comments), UDS writes exactly {"type":"keepalive"} and {"type":"session_closed"}."""
+import http.client, json, socket, sys, time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+fixtures, url, token, sock_path = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+sessions = sys.argv[5:]
+
+def types_in(name):
+    text = (fixtures / name).read_text(encoding="utf-8")
+    return {json.loads(line)["type"] for line in text.splitlines() if line}
+CORE = types_in("events.jsonl")
+HOST = types_in("host_events.jsonl") - CORE
+OTHER = types_in("requests.jsonl") | types_in("capability_replies.jsonl")
+UDS_FRAMES = {'{"type":"keepalive"}', '{"type":"session_closed"}'}
+
+def sse_journal(sid, secs=2):
+    parts = urlsplit(url)
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=secs)
+    frames, frame = [], []
+    try:
+        conn.request("GET", "/s/%s/events?since=0" % sid, headers={"Authorization": "Bearer " + token})
+        resp = conn.getresponse()
+        assert resp.status == 200, "GET events: %d" % resp.status
+        while True:
+            raw = resp.fp.readline()
+            if not raw: break
+            field = raw.decode("utf-8").rstrip("\n")
+            if field: frame.append(field); continue
+            frames.append(frame); frame = []  # a blank line ends a frame
+    except OSError: pass  # the read timeout ends the replay; a cut frame is dropped
+    finally: conn.close()
+    lines = []
+    for fields in frames:
+        # Comments and the reconnection delay (`retry:`) are the transport's.
+        fields = [f for f in fields if not f.startswith(":") and not f.startswith("retry:")]
+        if not fields or any(f.startswith("event:") for f in fields): continue
+        assert len(fields) == 2 and fields[0].startswith("id: ") and fields[1].startswith("data: "), \
+            "not a journal frame: %r" % fields
+        lines.append(fields[1][len("data: "):])
+    return lines
+
+def uds_journal(sid, secs=2):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sock_path)
+    s.sendall((json.dumps({"op": "attach", "session": sid, "since": 0}) + "\n").encode())
+    s.settimeout(secs); buf = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d: break
+            buf += d
+    except socket.timeout: pass
+    s.close()
+    raw = buf.decode("utf-8").split("\n")[:-1]  # the last piece may be cut
+    return [ln for ln in raw if ln not in UDS_FRAMES]
+
+def check(lines, where):
+    open_run, runs = None, 0
+    def fail(i, why):
+        raise AssertionError("%s line %d is not wire v1 (%s): %s" % (where, i, why, lines[i]))
+    def enter(i, rid):
+        nonlocal open_run, runs
+        if not isinstance(rid, int) or rid < 1: fail(i, "bad run_id")
+        if open_run is not None:
+            if rid != open_run: fail(i, "a line of another Run")
+            return
+        if rid != runs + 1: fail(i, "run_id out of order")
+        runs = rid; open_run = rid
+    for i, line in enumerate(lines):
+        try: ev = json.loads(line)
+        except ValueError: fail(i, "not JSON")
+        if not isinstance(ev, dict) or ev.get("v") != 1: fail(i, "unversioned")
+        t = ev.get("type")
+        if t not in CORE | HOST | OTHER: fail(i, "unknown type")
+        if "trace_id" in ev: fail(i, "a trace_id this host never takes")
+        if t in CORE:
+            if "run_id" in ev: enter(i, ev["run_id"])
+            elif open_run is not None: fail(i, "a kernel event inside Run %d without its run_id" % open_run)
+        elif t in HOST:
+            data = ev.get("data")
+            if not isinstance(data, dict): fail(i, "no data")
+            if t in ("user_message", "run_done"):
+                if data.get("trace_id") is not None: fail(i, "a trace_id this host never takes")
+                enter(i, data.get("run_id"))
+                if t == "run_done": open_run = None
+            elif open_run is not None: fail(i, "a host line inside Run %d" % open_run)
+        elif "run_id" in ev: fail(i, "a run_id on a request line")
+    assert open_run is None, "%s ends inside Run %d" % (where, open_run)
+    return runs
+
+for sid in sessions:
+    sse, uds = sse_journal(sid), uds_journal(sid)
+    assert sse and uds, "empty journal for %s" % sid
+    n = min(len(sse), len(uds))
+    assert sse[:n] == uds[:n], "SSE and UDS attach disagree for %s" % sid
+    full = sse if len(sse) >= len(uds) else uds
+    assert check(sse, "SSE " + sid) >= 2 and check(uds, "UDS " + sid) >= 2, "fewer than two Runs in %s" % sid
+    assert full[0] == '{"v":1,"type":"session_lifecycle","data":{"created":"%s"}}' % sid, full[0]
+print("WIRE_OK")
+PY
+wire_out="$(python3 "$TMP/wire_check.py" "$ROOT/tests/fixtures/wire/v1" "$url" "$token" "$usock" "$A" "$B" 2>&1)" ||
+  fail "wire v1 checks failed: $wire_out"
+grep -q "WIRE_OK" <<<"$wire_out" || fail "wire v1 checks did not finish: $wire_out"
+echo "wire v1: every SSE and UDS attach line of sessions A and B"
 
 # ── #254: dynamic session lifecycle over HTTP ───────────────────────────────
 # lifecycle <method> <path> [body]: prints "<status> <body>" (authenticated).

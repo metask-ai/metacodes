@@ -217,25 +217,39 @@ function connect() {
 }
 
 // ── 顶层信封分发:处理每一种响应 ─────────────────────────────────────────────
+// Every journal line is one wire v1 line (core/protocol/wire.zig, doc/WIRE_PROTOCOL.md):
+// {"v":1,"type":...}. Kernel events, host events and UI requests share that one form;
+// a line of another version, or a type this page does not know, is ignored.
 function dispatch(ev) {
-  // Kernel events and UI requests arrive as versioned wire lines (core/protocol/wire.zig).
-  if (ev.v === 1) {
-    if (ev.type === "ui_request") return showDialog(ev.id, ev.kind, ev.request);
-    if (ev.type === "ui_request_closed") return hideDialog();
-    if (ev.type === "capabilities_accepted") return;
-    if (ev.type === "ui_request_unavailable")
+  if (!ev || ev.v !== 1) return;
+  const d = ev.data;
+  switch (ev.type) {
+    case "ui_request": return showDialog(ev.id, ev.kind, ev.request);
+    case "ui_request_closed": return hideDialog();
+    case "capabilities_accepted": return;
+    case "ui_request_unavailable":
       return sysline("· a tool asked for " + (ev.custom_kind || ev.kind) + ", which this page does not render (" + ev.reason + ")", true);
-    return coreEvent(ev.type, ev.data);
+    // Host events: what the session adds around the kernel's events.
+    case "user_message": endAssistant(); unqueue(d.text); scroll.appendChild(el("msg-user", d.text)); return;
+    case "message_rejected": unqueue(d.text);
+      return sysline("⚠ message not run: " + (d.message || "rejected") + " · " + trunc(d.text, 80), true);
+    case "run_done": {
+      endAssistant(); setGenerating(false);
+      // stop_reason when the Run returned, error_name when it failed; a model failure
+      // says why in model_error.
+      const sr = d.stop_reason || "error";
+      const me = d.model_error;
+      const why = d.error_name || (me && me.message) || "";
+      const tail = me ? [me.code, me.request_id && "request " + me.request_id].filter(Boolean).join(" · ") : "";
+      if (sr !== "end_turn") sysline("· " + sr + (why ? ": " + why : "") + (tail ? " (" + tail + ")" : ""), !!me || !!d.error_name);
+      return;
+    }
+    case "command_result":
+      sysline((d.ok ? "· " : "⚠ ") + (d.message || d.error_name || d.command), !d.ok);
+      if (d.ok) refreshState();
+      return;
+    default: return coreEvent(ev.type, d);
   }
-  if ("user_message" in ev) { endAssistant(); unqueue(ev.user_message); scroll.appendChild(el("msg-user", ev.user_message)); return; }
-  if ("message_rejected" in ev) { const r = ev.message_rejected; unqueue(r.text);
-    sysline("⚠ message not run: " + (r.message || "rejected") + " · " + trunc(r.text, 80), true); return; }
-  if ("run_done" in ev) { endAssistant(); setGenerating(false);
-    const sr = ev.run_done.stop_reason || "done";
-    const me = ev.run_done.model_error;
-    const tail = me ? [me.code, me.request_id && "request " + me.request_id].filter(Boolean).join(" · ") : "";
-    if (sr !== "end_turn") sysline("· " + sr + (ev.run_done.err ? ": " + ev.run_done.err : "") + (tail ? " (" + tail + ")" : ""), !!me); return; }
-  if ("command_result" in ev) { const r = ev.command_result; sysline((r.ok ? "· " : "⚠ ") + (r.message || ""), !r.ok); if (r.ok) refreshState(); return; }
 }
 
 function coreEvent(tag, p) {
@@ -257,6 +271,7 @@ function coreEvent(tag, p) {
       break;
 
     case "config_changed": configChanged(p); break;
+    case "session_lifecycle": break; // session boundaries: /state and the stream's own close cover the page
     case "usage": refreshStateSoon(); break;
     case "context_warning":
       sysline("⚠ context " + p.level + " — " + p.current_tokens + " / " + p.auto_compact_threshold + " tokens", true); break;
