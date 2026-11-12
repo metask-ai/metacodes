@@ -38,6 +38,25 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Typed submissions and a bounded inbox on `SessionHost`** (#447).
+  `Submission` gains `source`, `kind`, `attributes` and `idempotency_key`. One
+  key is one Run: a delivery whose key is queued, running, or whose Run
+  started within `Options.idempotency_retention_ms` (24 h) is refused with
+  `error.DuplicateSubmission`, and the same key on a different submission with
+  `error.IdempotencyKeyReused`. Started keys are kept in the session
+  directory (`idempotency.jsonl`), so a Host that reopens the Session after a
+  restart refuses them too; a key is spent only when its Run starts, so a
+  delivery the restart dropped from the queue may be sent again. A full queue
+  refuses with `error.QueueFull` after duplicates are answered and holds
+  nothing, and `Snapshot.max_queued` reports the bound next to `queued`.
+  `source`, `kind`, `attributes` and the key are echoed on the Run's
+  `user_message`, as appended fields written only when given, so other lines
+  keep their bytes (`tests/fixtures/wire/v1/host_events.jsonl`). They reach
+  the provider only through `OpenSpec.submission_template` (`{{text}}`,
+  `{{source}}`, `{{kind}}`, `{{attributes}}`); without one the provider
+  receives the text's bytes, as before. `serve` and `--web` take typed
+  submissions once they run on `SessionHost` (#445).
+
 - **Edit and rerun through AgentCore** (#441). AgentCore ABI revision 27 adds
   `session_control->rewind_to_user_message(session, position, out_error)`, the
   operation behind `/edit` (#432): while idle it drops the user message at a
