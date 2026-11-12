@@ -956,3 +956,64 @@ test "L2 #446 SessionHost suspend mode: the transcript is the witness; a recorde
     defer a.free(transcript);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, transcript, "\"tool_use_id\":\"tu_q\""));
 }
+
+const Handover = struct {
+    var ran = false;
+    var refused: ?anyerror = null;
+
+    fn answer(hosted: *HostedSession) void {
+        ran = true;
+        hosted.respond(1, "{\"answers\":[\"Ship\"],\"by\":\"bot\"}") catch |err| {
+            refused = err;
+        };
+    }
+};
+
+test "L2 #446 SessionHost suspend mode: an answer that arrives while the suspension is being held reaches its request, and no later request takes it" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const thanks = try textSse(a, "thanks");
+    defer a.free(thanks);
+    const path = try std.fmt.allocPrint(a, "{s}/later.txt", .{dirs.workspace});
+    defer a.free(path);
+    const write = try writeToolSse(a, path);
+    defer a.free(write);
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ ASK_SSE, thanks, write, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &TOOLS });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, dirs.workspace, dirs.home) });
+    defer host.release(hosted);
+
+    Handover.ran = false;
+    Handover.refused = null;
+    cc.session_host.testing_hooks.before_handover = Handover.answer;
+    defer cc.session_host.testing_hooks.before_handover = null;
+    try hosted.submit(.{ .text = "ask me" });
+    // The answer given in the window resumes the Run, by itself.
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expect(Handover.ran);
+    try std.testing.expect(Handover.refused == null);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\",\"by\":\"bot\"}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+    cc.session_host.testing_hooks.before_handover = null;
+
+    // The next request, a permission, waits for its own answer.
+    try hosted.submit(.{ .text = "write it" });
+    try waitFor(&hosted.journal, "\"type\":\"ui_request\",\"id\":2,\"kind\":\"permission\"", 1);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(150), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"ui_request_closed\",\"id\":2"));
+    try expectSnapshot(hosted, .running, 2, 0, .none);
+    try hosted.respond(2, "{\"choice\":\"allow_once\"}");
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 3);
+    try std.testing.expect(try exists(dirs.workspace, "later.txt"));
+}

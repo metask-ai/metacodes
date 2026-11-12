@@ -233,6 +233,10 @@ pub const testing_hooks = struct {
     /// before anything is applied (#446): the window in which a second
     /// answer to the same request must change nothing.
     pub var before_resumption: ?*const fn (*HostedSession) void = null;
+    /// On the driver, while a Run that suspended is being held, after the
+    /// transcript is written and before the suspension is registered
+    /// (#446): an answer that arrives then must still reach the request.
+    pub var before_handover: ?*const fn (*HostedSession) void = null;
 };
 
 pub const InterruptOutcome = enum {
@@ -309,6 +313,12 @@ pub const Snapshot = struct {
     max_queued: usize,
     seq: usize,
     epoch: [16]u8,
+    /// The UI request the Session waits on, 0 for none: the one the Run in
+    /// progress blocks on (a permission request always blocks), else the
+    /// question or custom UI request a Run suspended on (#446). Beside a
+    /// suspended or suspending question a permission request takes its own
+    /// id, shown here while it blocks; `respond` takes an answer only for
+    /// the request it names.
     pending_request_id: u64,
     /// What queued work waits for (#446); `.ui_request` names
     /// `pending_request_id`.
@@ -543,8 +553,9 @@ const RequestPolicy = struct {
 /// the tool calls in flight. Strings are the Session allocator's.
 const Suspending = struct {
     id: u64,
-    /// Its `ui_request` line.
-    announcement: []u8,
+    /// Its `ui_request` line, once built; the id and its owner are
+    /// registered together, before it.
+    announcement: ?[]u8 = null,
     /// An answer that came before the Run suspended, applied once it has.
     answer: ?[]u8 = null,
     by: ?[]u8 = null,
@@ -642,6 +653,9 @@ pub const HostedSession = struct {
 
     /// One UI request at a time; a second (from a parallel tool) waits.
     ui_serial: sync.Mutex = .{},
+    /// The request the Run in progress blocks on, under `mutex`; `response`
+    /// is its answer. A suspending or suspended request is not one: it has
+    /// its own id (`suspending`, `suspension`).
     pending_request_id: u64 = 0,
     next_request_id: u64 = 1,
     response: ?[]u8 = null,
@@ -827,25 +841,32 @@ pub const HostedSession = struct {
         errdefer self.gpa.free(owned);
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.pending_request_id == 0 or self.pending_request_id != request_id or self.closing) return error.NoSuchRequest;
+        if (request_id == 0 or self.closing) return error.NoSuchRequest;
+        // Each open request takes the answers given under its own id, and
+        // only those.
         if (self.suspension) |suspension| {
-            switch (suspension.settled) {
-                .open => {},
-                .answered => return error.AlreadyAnswered,
-                .cancelled => return error.NoSuchRequest,
+            if (suspension.request_id == request_id) {
+                switch (suspension.settled) {
+                    .open => {},
+                    .answered => return error.AlreadyAnswered,
+                    .cancelled => return error.NoSuchRequest,
+                }
+                suspension.settled = .{ .answered = .{ .json = owned, .by = by } };
+                self.work_ready.signal();
+                return;
             }
-            suspension.settled = .{ .answered = .{ .json = owned, .by = by } };
-            self.work_ready.signal();
-            return;
         }
-        if (self.run_interrupted) return error.NoSuchRequest;
         if (self.suspending) |*pending| {
-            // Before its Run has suspended: applied once it has.
-            if (pending.answer != null) return error.AlreadyAnswered;
-            pending.answer = owned;
-            pending.by = by;
-            return;
+            if (pending.id == request_id) {
+                // Before its Run has suspended: applied once it has.
+                if (self.run_interrupted) return error.NoSuchRequest;
+                if (pending.answer != null) return error.AlreadyAnswered;
+                pending.answer = owned;
+                pending.by = by;
+                return;
+            }
         }
+        if (self.pending_request_id == 0 or self.pending_request_id != request_id or self.run_interrupted) return error.NoSuchRequest;
         if (self.response != null) return error.AlreadyAnswered;
         self.response = owned;
         self.response_by = by;
@@ -885,10 +906,10 @@ pub const HostedSession = struct {
             .max_queued = self.max_queued,
             .seq = self.journal.count(),
             .epoch = self.journal.epochHex(),
-            .pending_request_id = self.pending_request_id,
+            .pending_request_id = self.pendingIdLocked(),
             .queue_waiting = if (self.queue.items.len == 0)
                 .none
-            else if (self.pending_request_id != 0)
+            else if (self.pendingIdLocked() != 0)
                 .ui_request
             else if (self.phase == .running)
                 .run
@@ -1217,6 +1238,15 @@ pub const HostedSession = struct {
         self.mutex.unlock();
     }
 
+    /// The request id a Host waits on: the blocking request's, else the
+    /// suspended or suspending question's (#446). Caller holds `mutex`.
+    fn pendingIdLocked(self: *const HostedSession) u64 {
+        if (self.pending_request_id != 0) return self.pending_request_id;
+        if (self.suspension) |suspension| return suspension.request_id;
+        if (self.suspending) |pending| return pending.id;
+        return 0;
+    }
+
     fn emitHost(self: *HostedSession, event: wire.HostEvent) void {
         const line = wire.writeHostEvent(self.gpa, event) catch {
             log.warn("session_host", "dropped host event .{s} (OOM)", .{@tagName(event)});
@@ -1254,9 +1284,6 @@ pub const HostedSession = struct {
         self.ui_serial.lock();
         defer self.ui_serial.unlock();
         const policy = self.request_policy;
-        // `.suspend` never suspends a permission request: the kernel's gate
-        // would read `pending` as no answer and deny the tool unasked.
-        const suspends = policy.wait == .@"suspend" and req.* != .permission;
 
         self.mutex.lock();
         // Released means the abort is in force. An interrupt still on its way
@@ -1275,9 +1302,14 @@ pub const HostedSession = struct {
             self.mutex.unlock();
             return .unavailable;
         }
+        // `.suspend` never suspends a permission request: the kernel's gate
+        // would read `pending` as no answer and deny the tool unasked.
+        const suspends = policy.wait == .@"suspend" and req.* != .permission;
+        // The id and the request it names are registered together, so an
+        // answer never finds the one without the other.
         const request_id = self.next_request_id;
         self.next_request_id += 1;
-        self.pending_request_id = request_id;
+        if (suspends) self.suspending = .{ .id = request_id } else self.pending_request_id = request_id;
         self.mutex.unlock();
         // `.suspend` keeps ids across restarts: this one is written before
         // anyone can answer it. Unwritten, it is still unique in this process.
@@ -1285,16 +1317,16 @@ pub const HostedSession = struct {
             log.warn("session_host", "request id {d} of {s} not recorded: {s}", .{ request_id, self.id.asSlice(), @errorName(err) });
 
         const announce = wire.writeRequest(self.gpa, request_id, req) catch |err| {
-            self.mutex.lock();
-            self.pending_request_id = 0;
-            self.mutex.unlock();
+            if (suspends) self.closeSuspending() else {
+                self.mutex.lock();
+                self.pending_request_id = 0;
+                self.mutex.unlock();
+            }
             return err;
         };
         if (suspends) {
-            // Registered before it is announced, so an answer that comes at
-            // once is kept for the suspension.
             self.mutex.lock();
-            self.suspending = .{ .id = request_id, .announcement = announce };
+            self.suspending.?.announcement = announce;
             self.mutex.unlock();
             self.journal.append(announce);
             return .pending;
@@ -1411,7 +1443,7 @@ pub const HostedSession = struct {
     }
 
     fn freeSuspending(self: *HostedSession, pending: Suspending) void {
-        self.gpa.free(pending.announcement);
+        if (pending.announcement) |line| self.gpa.free(line);
         if (pending.answer) |json| self.gpa.free(json);
         if (pending.by) |by| self.gpa.free(by);
     }
@@ -1425,10 +1457,9 @@ pub const HostedSession = struct {
             return;
         };
         self.suspending = null;
-        self.pending_request_id = 0;
         self.mutex.unlock();
         self.freeSuspending(pending);
-        self.appendLine(wire.writeRequestClosed(self.gpa, pending.id, .cancelled));
+        if (pending.announcement != null) self.appendLine(wire.writeRequestClosed(self.gpa, pending.id, .cancelled));
     }
 
     /// Holds a Run that ended `suspended` until its request is settled.
@@ -1437,47 +1468,48 @@ pub const HostedSession = struct {
     /// other call of its turn (`ui_request_store`, the commit point a later
     /// open reads).
     fn holdSuspension(self: *HostedSession, info: agent_loop.SuspendInfo, settings: RunSettings) void {
+        // The request stays registered (`suspending`) until the suspension
+        // takes its place under one lock, so an answer given meanwhile still
+        // reaches it. Only the driver clears `suspending`.
         self.mutex.lock();
-        const taken = self.suspending;
-        self.suspending = null;
+        const registered = self.suspending;
         self.mutex.unlock();
-        var pending = taken orelse {
+        const pending = registered orelse {
             // Only `requestUi` answers `pending`, so this is not reached.
             // With no request there is nothing to resume the call with; the
             // next Run's request stands in for its result (message_repair).
             log.err("session_host", "a Run of {s} suspended on {s} without a pending request", .{ self.id.asSlice(), info.tool_use_id });
             return;
         };
-        defer self.freeSuspending(pending);
-        const suspension = self.buildSuspension(pending, info, settings) catch |err| {
+        const suspension = self.buildSuspension(pending.id, pending.announcement.?, info, settings) catch |err| {
             log.err("session_host", "request {d} of {s} not held: {s}", .{ pending.id, self.id.asSlice(), @errorName(err) });
-            self.mutex.lock();
-            self.pending_request_id = 0;
-            self.mutex.unlock();
-            self.appendLine(wire.writeRequestClosed(self.gpa, pending.id, .cancelled));
+            self.closeSuspending();
             return;
         };
         self.persist();
+        if (builtin.is_test) if (testing_hooks.before_handover) |hook| hook(self);
         self.mutex.lock();
+        var taken = self.suspending.?;
+        self.suspending = null;
         self.suspension = suspension;
-        self.pending_request_id = suspension.request_id;
-        if (pending.answer) |json| {
-            suspension.settled = .{ .answered = .{ .json = json, .by = pending.by } };
-            pending.answer = null;
-            pending.by = null;
+        if (taken.answer) |json| {
+            suspension.settled = .{ .answered = .{ .json = json, .by = taken.by } };
+            taken.answer = null;
+            taken.by = null;
         }
         // An interrupt during the Run cancels what it suspended on.
         if (self.run_interrupted) self.cancelSuspensionLocked(suspension, true);
         self.mutex.unlock();
+        self.freeSuspending(taken);
         self.storeRequests() catch |err|
             log.warn("session_host", "suspended request {d} of {s} held in memory only, a restart loses it: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
     }
 
-    fn buildSuspension(self: *HostedSession, pending: Suspending, info: agent_loop.SuspendInfo, settings: RunSettings) !*Suspension {
-        const suspension = try self.newSuspension(pending.id, settings.max_turns);
+    fn buildSuspension(self: *HostedSession, request_id: u64, announcement: []const u8, info: agent_loop.SuspendInfo, settings: RunSettings) !*Suspension {
+        const suspension = try self.newSuspension(request_id, settings.max_turns);
         errdefer self.destroySuspension(suspension);
         const a = suspension.arena.allocator();
-        suspension.announcement = try a.dupe(u8, pending.announcement);
+        suspension.announcement = try a.dupe(u8, announcement);
         suspension.request = (try wire.parseRequest(a, suspension.announcement)).request;
         suspension.tool_use_id = try a.dupe(u8, info.tool_use_id);
         try self.turnResults(a, info, suspension);
@@ -1647,7 +1679,6 @@ pub const HostedSession = struct {
         if (mode == .@"resume") switch (callState(conversation, record.tool_use_id)) {
             .waiting => if (self.restoreSuspension(record)) |suspension| {
                 self.suspension = suspension;
-                self.pending_request_id = suspension.request_id;
                 self.phase = .suspended;
                 self.journal.append(suspension.announcement);
                 return;
@@ -1849,7 +1880,6 @@ pub const HostedSession = struct {
         self.mutex.lock();
         self.suspension = null;
         self.resuming = suspension;
-        self.pending_request_id = 0;
         self.mutex.unlock();
         self.storeRequests() catch |err|
             log.warn("session_host", "settlement of request {d} of {s} not recorded; a crash before the resumed Run is written loses it: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
@@ -2235,4 +2265,70 @@ test "SessionHost: a pending prompt answered and interrupted at once is cancelle
     hosted.mutex.lock();
     hosted.run_interrupted = false;
     hosted.mutex.unlock();
+}
+
+test "SessionHost #446: an answer reaches only the request it names; a permission beside a suspending question keeps its own id" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const runtime = try AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    // A timeout only so that a misrouted answer fails the test instead of
+    // hanging it.
+    var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend", .ui_request_timeout_ms = 2_000 });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = .{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = "http://127.0.0.1:9",
+        .workspace = .{ .root = root, .home = root, .state_root = root },
+        .allowed_tools = &.{},
+    } });
+    defer hosted.release();
+
+    // A question of the Run in progress goes pending (id 1)...
+    const options = [_]ui_request.AskOption{ .{ .label = "Ship", .description = "" }, .{ .label = "Wait", .description = "" } };
+    const questions = [_]ui_request.AskQuestion{.{ .question = "Ship now?", .header = "Decision", .multi = false, .options = &options }};
+    const question = ui_request.UiRequest{ .ask_question = &questions };
+    var question_out: ui_request.UiResponse = undefined;
+    try std.testing.expectEqual(ui_request.RequestOutcome.pending, try HostedSession.requestUi(hosted, hosted.id, a, &question, &question_out));
+    defer hosted.closeSuspending();
+
+    // ...and a tool still running in that turn asks for permission (id 2).
+    const Asker = struct {
+        outcome: anyerror!ui_request.RequestOutcome = error.NotRun,
+        response: ui_request.UiResponse = undefined,
+        fn run(self: *@This(), session: *HostedSession) void {
+            const permission = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+            self.outcome = HostedSession.requestUi(session, session.id, std.testing.allocator, &permission, &self.response);
+        }
+    };
+    var asker = Asker{};
+    const thread = try std.Thread.spawn(.{}, Asker.run, .{ &asker, hosted });
+    try waitForLine(&hosted.journal, "\"type\":\"ui_request\",\"id\":2,\"kind\":\"permission\"");
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.pending_request_id);
+
+    // The permission's answer is the permission's.
+    try hosted.respond(2, "{\"choice\":\"allow_once\",\"by\":\"oncall\"}");
+    thread.join();
+    try std.testing.expectEqual(ui_request.RequestOutcome.answered, try asker.outcome);
+    try std.testing.expectEqual(ui_request.PermissionChoice.allow_once, asker.response.permission);
+    try waitForLine(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":2,\"outcome\":\"answered\",\"by\":\"oncall\"}");
+    hosted.mutex.lock();
+    const question_answer = hosted.suspending.?.answer;
+    hosted.mutex.unlock();
+    try std.testing.expect(question_answer == null);
+
+    // The question still waits, under its own id.
+    try std.testing.expectError(error.NoSuchRequest, hosted.respond(2, "{\"choice\":\"allow_once\"}"));
+    try hosted.respond(1, "{\"answers\":[\"Ship\"]}");
+    hosted.mutex.lock();
+    const answered = hosted.suspending.?.answer != null;
+    hosted.mutex.unlock();
+    try std.testing.expect(answered);
 }
