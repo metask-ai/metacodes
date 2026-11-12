@@ -15488,9 +15488,10 @@ test "L2 Revision 27 rewind_to_user_message refuses a compacted position and rer
 
 // ── Revision 28 (#452): a Host-granted stream retry budget ──────────────────
 
-/// The issue's reproduction: a thinking delta, then a clean end of body, with
-/// no stop report. The sentinel is 17 bytes and appears in no system prompt.
-const THINKING_THEN_EOF_SSE =
+/// #452's reproduction: a thinking delta, then a clean end of body, with no
+/// stop report. The sentinel is 17 bytes and appears in no system prompt.
+/// (#451 has its own `THINKING_THEN_EOF_SSE`.)
+const RETRY_THINKING_THEN_EOF_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cut\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"THINKING_SENTINEL\"}}\n\n";
@@ -15619,7 +15620,7 @@ test "L2 Revision 28 stream_retry_budget re-issues the issue #452 reproduction a
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try rootPath(&tmp, &root_buf);
-    var server = try harness.MockServer.startCassette(&.{ THINKING_THEN_EOF_SSE, FINAL_SSE }, 0);
+    var server = try harness.MockServer.startCassette(&.{ RETRY_THINKING_THEN_EOF_SSE, FINAL_SSE }, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
@@ -15668,7 +15669,7 @@ test "L2 Revision 28 with a zero budget the reproduction ends after one attempt,
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try rootPath(&tmp, &root_buf);
-    var server = try harness.MockServer.startCassette(&.{ THINKING_THEN_EOF_SSE, FINAL_SSE }, 0);
+    var server = try harness.MockServer.startCassette(&.{ RETRY_THINKING_THEN_EOF_SSE, FINAL_SSE }, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
@@ -15739,7 +15740,7 @@ test "L2 Revision 28 an exhausted budget ends the Run, and model_error counts ev
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try rootPath(&tmp, &root_buf);
     // The cassette repeats its last body: every attempt drops after thinking.
-    var server = try harness.MockServer.startCassette(&.{THINKING_THEN_EOF_SSE}, 0);
+    var server = try harness.MockServer.startCassette(&.{RETRY_THINKING_THEN_EOF_SSE}, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
@@ -15846,7 +15847,7 @@ fn runSkillWithRetryBudget(context_line: []const u8, budget: u32) !void {
     const skill = try std.fmt.allocPrint(a, "---\nname: Retried\ndescription: Streams through a flaky gateway\n{s}---\nRETRIED_SKILL_SENTINEL", .{context_line});
     defer a.free(skill);
     try writeSkillFixture(a, root, "retried", skill);
-    var server = try harness.MockServer.startCassette(&.{ THINKING_THEN_EOF_SSE, FINAL_SSE }, 0);
+    var server = try harness.MockServer.startCassette(&.{ RETRY_THINKING_THEN_EOF_SSE, FINAL_SSE }, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
