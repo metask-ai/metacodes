@@ -667,6 +667,9 @@ pub const HostedSession = struct {
     /// ids and a suspended request; null without transcripts. Borrowed from
     /// `writer`; set before the driver starts.
     store_dir: ?[]const u8 = null,
+    /// The request file there could not be read: it is left as it is,
+    /// never written over, and requests block instead of suspending.
+    store_unwritable: bool = false,
     /// The request the Run in progress answered `pending`, under `mutex`.
     suspending: ?Suspending = null,
     /// The suspended Run while `phase` is `.suspended`, and until its
@@ -1326,8 +1329,9 @@ pub const HostedSession = struct {
             return .unavailable;
         }
         // `.suspend` never suspends a permission request: the kernel's gate
-        // would read `pending` as no answer and deny the tool unasked.
-        const suspends = policy.wait == .@"suspend" and req.* != .permission;
+        // would read `pending` as no answer and deny the tool unasked. Nor
+        // one it cannot keep: a request file it could not read.
+        const suspends = policy.wait == .@"suspend" and req.* != .permission and !self.store_unwritable;
         // The id and the request it names are registered together, so an
         // answer never finds the one without the other.
         const request_id = self.next_request_id;
@@ -1644,6 +1648,8 @@ pub const HostedSession = struct {
     /// has stopped; `respond` and `interrupt` change memory alone.
     fn storeRequests(self: *HostedSession) !void {
         const dir = self.store_dir orelse return;
+        // Left as it is (`restoreRequests` said so once).
+        if (self.store_unwritable) return;
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -1700,7 +1706,15 @@ pub const HostedSession = struct {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const state = (ui_request_store.load(arena.allocator(), dir) catch |err| {
-            log.err("session_host", "UI requests of {s} not read, the file is left in place: {s}", .{ self.id.asSlice(), @errorName(err) });
+            // Never written over, and its ids never reused, though nothing
+            // records the ids handed out from now on: they go on past the
+            // file's last one and past the clock in milliseconds, which no
+            // earlier process can have counted up to (a request takes a
+            // model turn, far longer than a millisecond).
+            self.store_unwritable = true;
+            const clock: u64 = @intCast(@max(wallMs(), 1));
+            self.next_request_id = @max(ui_request_store.peekNextId(arena.allocator(), dir) orelse 1, clock);
+            log.err("session_host", "UI requests of {s} not read ({s}): the file is left as it is, requests block, ids start at {d}", .{ self.id.asSlice(), @errorName(err), self.next_request_id });
             return;
         }) orelse return;
         self.next_request_id = state.next_id;

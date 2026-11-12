@@ -15,6 +15,10 @@
 //! temporary file, fsync, rename) by the Session's driver, or by `close` once
 //! the driver has stopped; it is read when the Session is opened. One writer
 //! at a time, so no lock.
+//!
+//! A field this version does not know is ignored, so a later version may add
+//! one; a field this version must not ignore comes with a new `v`. A file
+//! this version cannot read is never written over (`SessionHost`).
 
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -97,7 +101,7 @@ pub fn load(arena: std.mem.Allocator, dir: []const u8) LoadError!?State {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.UnreadableState,
     };
-    const state = std.json.parseFromSliceLeaky(State, arena, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+    const state = std.json.parseFromSliceLeaky(State, arena, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.UnreadableState,
     };
@@ -109,6 +113,20 @@ pub fn load(arena: std.mem.Allocator, dir: []const u8) LoadError!?State {
         }
     }
     return state;
+}
+
+/// The `next_id` of a file `load` refuses, if it still has a readable one:
+/// the ids it handed out are below it.
+pub fn peekNextId(arena: std.mem.Allocator, dir: []const u8) ?u64 {
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/" ++ FILE_NAME, .{dir}) catch return null;
+    const bytes = readAll(arena, path) catch return null;
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch return null;
+    if (value != .object) return null;
+    return switch (value.object.get("next_id") orelse return null) {
+        .integer => |n| if (n > 0) @intCast(n) else null,
+        else => null,
+    };
 }
 
 /// Replaces the Session's state in `dir`, durably. `scratch` holds the
@@ -216,4 +234,12 @@ test "ui_request_store: no file, a round trip with a settled suspension, and wha
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = FILE_NAME, .data = bytes });
         try std.testing.expectError(error.UnreadableState, load(arena.allocator(), dir));
     }
+    // Refused, a file still tells where its ids went up to, when it can.
+    try std.testing.expectEqual(@as(?u64, 2), peekNextId(arena.allocator(), dir));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = FILE_NAME, .data = "not json" });
+    try std.testing.expectEqual(@as(?u64, null), peekNextId(arena.allocator(), dir));
+
+    // A field it does not know, beside those it does, is read past.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = FILE_NAME, .data = "{\"v\":1,\"next_id\":9,\"later\":true,\"suspended\":null}" });
+    try std.testing.expectEqual(@as(u64, 9), (try load(arena.allocator(), dir)).?.next_id);
 }

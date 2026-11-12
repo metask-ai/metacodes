@@ -1107,3 +1107,78 @@ test "L2 #446 SessionHost suspend mode: with a background job running, the suspe
     }
     try std.testing.expectEqual(@as(usize, 3), server.requestCount());
 }
+
+test "L2 #446 SessionHost suspend mode: a request file this version cannot read is never overwritten and its ids are not reused; an unknown field alone does not make it unreadable" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const thanks = try textSse(a, "thanks");
+    defer a.free(thanks);
+    const bodies = [_][]const u8{ ASK_SSE, thanks, ASK_SSE, thanks, ASK_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &TOOLS });
+    defer runtime.destroy() catch unreachable;
+    const config = baseConfig(url, dirs.workspace, dirs.home);
+
+    var id: cc.session_id.SessionId = undefined;
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config });
+        defer host.release(hosted);
+        id = hosted.id;
+    }
+    const dir = try sessionDirOf(a, config, id);
+    defer a.free(dir);
+    // What a later version might write: a kind this one does not know.
+    const unknown = "{\"v\":1,\"next_id\":7,\"suspended\":{\"kind\":\"permission\",\"id\":6,\"announcement\":\"\",\"tool_use_id\":\"tu_p\",\"tool_name\":\"Write\",\"max_turns\":4}}";
+    {
+        var file_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const target = try std.fmt.bufPrint(&file_buf, "{s}/" ++ cc.ui_request_store.FILE_NAME, .{dir});
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = target, .data = unknown });
+    }
+    // Twice, as two processes would: neither starts its ids again, nor
+    // repeats the other's, though the file records neither.
+    var last_id: u64 = 6;
+    for ([_][]const u8{ "ask me", "ask once more" }) |prompt| {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+        defer host.release(hosted);
+        try hosted.submit(.{ .text = prompt });
+        // Not suspended: with nowhere to keep it, it blocks.
+        try waitFor(&hosted.journal, "\"type\":\"ui_request\"", 1);
+        var snapshot = try hosted.snapshot(a);
+        const request_id = snapshot.pending_request_id;
+        snapshot.deinit(a);
+        try std.testing.expect(request_id > last_id);
+        last_id = request_id;
+        try expectSnapshot(hosted, .running, request_id, 0, .none);
+        try hosted.respond(request_id, "{\"answers\":[\"Ship\"]}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"stop_reason\":\"suspended\""));
+        const kept = try readFileIn(a, dir, cc.ui_request_store.FILE_NAME);
+        defer a.free(kept);
+        try std.testing.expectEqualStrings(unknown, kept);
+    }
+
+    // A field this version does not know, beside ones it does: still read.
+    {
+        var file_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const target = try std.fmt.bufPrint(&file_buf, "{s}/" ++ cc.ui_request_store.FILE_NAME, .{dir});
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = target, .data = "{\"v\":1,\"next_id\":9,\"later\":true,\"suspended\":null}" });
+    }
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+        defer host.release(hosted);
+        try hosted.submit(.{ .text = "ask again" });
+        try waitFor(&hosted.journal, "\"stop_reason\":\"suspended\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request\",\"id\":9,"));
+    }
+}
