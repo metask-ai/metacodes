@@ -27,9 +27,17 @@
 //! request, as before.
 //!
 //! Host events are what a session service adds around the kernel's events
-//! (core/session_host.zig): the submitted text, the end of a Run, the result
-//! of a configuration command, a poisoned Session. Their tags never collide
-//! with CoreEvent tags (checked at compile time).
+//! (core/session_host.zig, and the bundled `--web`/`serve` host in src/web):
+//! the submitted text, the end of a Run, the result of a configuration
+//! command, a message refused before it ran, a poisoned Session. Their tags
+//! never collide with CoreEvent tags (checked at compile time).
+//!
+//! A Host numbers the Runs of a Session 1, 2, … as they start. A Run's lines
+//! run from its `user_message` (none when a `/command` macro or `/retry`
+//! started it) to its `run_done`, both carrying its `run_id`; every CoreEvent
+//! journaled in between is written by `writeRunEvent` with the same `run_id`
+//! and the submission's `trace_id`, when it had one. UI request and
+//! capability lines carry no `run_id`; no other host line falls inside a Run.
 //!
 //! `data` is the CoreEvent payload with the field names of
 //! core/protocol/ui_event.zig, except `prompt_manifest`, whose digests are
@@ -124,8 +132,20 @@ pub const HostEvent = union(enum) {
     /// Run `run_id` ended: `stop_reason` when it returned, `error_name` when
     /// it failed. `model_error` says why, when the stop was a model failure.
     run_done: struct { run_id: u64, trace_id: ?[]const u8 = null, stop_reason: ?[]const u8 = null, error_name: ?[]const u8 = null, model_error: ?@import("../../api/model_error.zig").Detail.View = null },
-    /// A configuration command was applied (`ok`) or refused.
-    command_result: struct { command: []const u8, ok: bool, error_name: ?[]const u8 = null },
+    /// A configuration command was applied (`ok`) or refused. `command` names
+    /// it: SessionHost's `Command` tag, or the verb of a `--web`/`serve`
+    /// `/command` line (`mode`, `edit`, …; `shell` for `!cmd`, `prompt` for
+    /// plain text). `error_name` is set exactly when `ok` is false. `message`
+    /// is what the command reports for a person (`--web`/`serve`: its outcome
+    /// or a shell command's output); SessionHost has none.
+    command_result: struct { command: []const u8, ok: bool, error_name: ?[]const u8 = null, message: ?[]const u8 = null },
+    /// A message (`--web`/`serve` `POST /message`, UDS `message`) started no
+    /// Run: its `model` or `permission_mode` was refused, neither was applied
+    /// and its `text` stayed out of the conversation. It takes the place of
+    /// that message's `user_message`. `model` and `permission_mode` repeat
+    /// what the message asked for (null when not given; the mode in the
+    /// spelling `/state` reports); `message` says why.
+    message_rejected: struct { message: []const u8, text: []const u8, model: ?[]const u8 = null, permission_mode: ?[]const u8 = null },
     /// The Session can no longer run; the Host must close it. Work still
     /// queued was dropped and is counted.
     session_poisoned: struct { error_name: []const u8, dropped: usize },
@@ -156,6 +176,23 @@ comptime {
             if (std.mem.eql(u8, core.name, line_type)) @compileError("CoreEvent tag collides with a wire line type: " ++ core.name);
         }
     }
+}
+
+/// Whether `name` is the `type` of a v1 line: a CoreEvent or HostEvent tag,
+/// or a request or capability line. A frontend ignores a `type` it does not
+/// know (doc/WIRE_PROTOCOL.md §4); a check of what a Host journals uses this
+/// to refuse any line outside the grammar.
+pub fn isLineType(name: []const u8) bool {
+    inline for (std.meta.fields(CoreEvent)) |field| {
+        if (std.mem.eql(u8, field.name, name)) return true;
+    }
+    inline for (std.meta.fields(HostEvent)) |field| {
+        if (std.mem.eql(u8, field.name, name)) return true;
+    }
+    for (LINE_TYPES) |line_type| {
+        if (std.mem.eql(u8, line_type, name)) return true;
+    }
+    return false;
 }
 
 /// One CoreEvent as a wire line, caller-owned. The event's borrowed slices
@@ -655,6 +692,25 @@ test "writeEvent: version, tag and payload; a void payload is null" {
     const done = try writeEvent(testing.allocator, .stream_done);
     defer testing.allocator.free(done);
     try testing.expectEqualStrings("{\"v\":1,\"type\":\"stream_done\",\"data\":null}", done);
+}
+
+test "isLineType: every tag and line type of the grammar, and no transport frame" {
+    for ([_][]const u8{ "text_chunk", "session_lifecycle", "user_message", "message_rejected", "session_poisoned", "ui_request", "ui_request_closed", "ui_request_unavailable", "capabilities", "capabilities_accepted", "capabilities_refused" }) |name| {
+        try testing.expect(isLineType(name));
+    }
+    // UDS `attach` frames sit outside the journal (doc/WIRE_PROTOCOL.md §1.3).
+    for ([_][]const u8{ "keepalive", "session_closed", "resync", "Text_chunk", "" }) |name| {
+        try testing.expect(!isLineType(name));
+    }
+}
+
+test "writeHostEvent: message_rejected, and command_result with what it reports" {
+    const rejected = try writeHostEvent(testing.allocator, .{ .message_rejected = .{ .message = "no", .text = "hi", .permission_mode = "auto" } });
+    defer testing.allocator.free(rejected);
+    try testing.expectEqualStrings("{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"no\",\"text\":\"hi\",\"model\":null,\"permission_mode\":\"auto\"}}", rejected);
+    const result = try writeHostEvent(testing.allocator, .{ .command_result = .{ .command = "shell", .ok = true, .message = "$ ls" } });
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"shell\",\"ok\":true,\"error_name\":null,\"message\":\"$ ls\"}}", result);
 }
 
 test "parseResponse: a malformed or wrong-version answer never grants a permission" {

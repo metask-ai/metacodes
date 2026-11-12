@@ -297,6 +297,12 @@ const host_events = [_]cc.wire.HostEvent{
     } } },
     .{ .command_result = .{ .command = "set_model", .ok = true } },
     .{ .command_result = .{ .command = "set_reasoning_effort", .ok = false, .error_name = "AgentEffortUnsupportedProvider" } },
+    // The `--web`/`serve` form (#444): the verb of a `/command` line, and what
+    // it reports for a person.
+    .{ .command_result = .{ .command = "mode", .ok = true, .message = "permission mode → dont_ask" } },
+    .{ .command_result = .{ .command = "help", .ok = false, .error_name = "CommandUnsupported", .message = "unsupported here: /help" } },
+    .{ .message_rejected = .{ .message = "model not available for current provider", .text = "fix the build", .model = "gpt-5.6-luna", .permission_mode = "bypass_permissions" } },
+    .{ .message_rejected = .{ .message = "bypassPermissions is disabled by settings", .text = "fix the build", .permission_mode = "bypass_permissions" } },
     .{ .session_poisoned = .{ .error_name = "CallbackFailed", .dropped = 2 } },
 };
 

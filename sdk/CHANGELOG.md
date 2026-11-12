@@ -55,6 +55,17 @@ empty `### Migration`.
 - Python `Session.run(..., stream_retry_budget=)` / `stream(...)` and Node
   `run(prompt, { streamRetryBudget })` / `stream(...)`.
 
+### Fixed
+
+- A Run whose accepted stream ended cleanly before it said how it stopped (no
+  stop reason, finish reason or terminal event) now delivers `model_error` with
+  `category` `stream_interrupted` and `retry` `retryable`, that response's
+  `http_status` and `request_id`, and the message "The response stream ended
+  before it reported how it stopped." (#451). It used to be `unknown` /
+  `unknown` with "The response stream could not be read: StreamIncomplete."
+  The same-turn resend when nothing had been shown, `attempts`, and the absence
+  of a `model_error` after a resend that succeeds are unchanged. No ABI change.
+
 ### Migration
 
 - ABI revision 27. The Session Control table grows from 80 to 88 bytes with

@@ -391,6 +391,8 @@ test "L2 /edit (issue #432): web/daemon/TUI edit user message n, rerun from it, 
     const app = fx.app;
     var journal = cc.event_journal.EventJournal.init(a);
     defer journal.deinit();
+    var wb = cc.web_backend.WebBackend.init(a, &journal);
+    defer wb.deinit();
 
     try app.conversation.appendText(.user, "q1");
     try app.conversation.appendText(.assistant, "a1");
@@ -413,7 +415,10 @@ test "L2 /edit (issue #432): web/daemon/TUI edit user message n, rerun from it, 
         .{ .line = "/edit 7 new", .reason = "(NotUserMessage)" },
     };
     for (refused) |case| {
-        try std.testing.expect(cc.web_session.execCommand(app, &journal, a, case.line) == null);
+        var batch: cc.web_session.CommandBatch = .{};
+        defer batch.deinit(a);
+        try std.testing.expect(cc.web_session.execCommand(app, &wb, a, case.line, &batch) == null);
+        try std.testing.expect(!batch.run_planned);
         var buf: [256]u8 = undefined;
         var svc = session_service.SessionService.init(app);
         const d = session_service.execLine(&svc, app.allocator, case.line);
@@ -431,7 +436,9 @@ test "L2 /edit (issue #432): web/daemon/TUI edit user message n, rerun from it, 
     try std.testing.expect(std.mem.indexOf(u8, listing.written(), "a1") == null);
 
     // The web/daemon entry (POST /command) edits message 3 and plans the run.
-    const plan = cc.web_session.execCommand(app, &journal, a, "/edit 3   q2, edited  ") orelse return error.NoRunPlanned;
+    var batch: cc.web_session.CommandBatch = .{};
+    defer batch.deinit(a);
+    const plan = cc.web_session.execCommand(app, &wb, a, "/edit 3   q2, edited  ", &batch) orelse return error.NoRunPlanned;
     try std.testing.expectEqual(session_service.RunPlan.Kind.edited_prompt, plan.kind);
     try std.testing.expectEqual(@as(usize, 3), app.conversation.len());
     try std.testing.expectEqualStrings("q1", messageText(&app.conversation, 0));
@@ -439,14 +446,24 @@ test "L2 /edit (issue #432): web/daemon/TUI edit user message n, rerun from it, 
     try std.testing.expectEqualStrings("q2, edited", messageText(&app.conversation, 2));
     try std.testing.expect(app.read_state.get("/tmp/read-in-a-dropped-turn") == null);
     {
+        // The Run begins once the batch has run: its user_message (wire v1, #444)
+        // follows the command_result and carries the run_id and `replaces`.
+        cc.web_session.beginPlannedRun(&wb, &batch);
+        cc.web_session.announceRunFailed(&wb, "NotRunHere");
         const lines = (try journal.waitSince(a, 0, 1)) orelse return error.NoJournal;
         defer {
             for (lines) |line| a.free(line);
             a.free(lines);
         }
-        var echoed = false;
-        for (lines) |line| echoed = echoed or std.mem.eql(u8, line, "{\"user_message\":\"q2, edited\",\"replaces\":3}");
-        try std.testing.expect(echoed);
+        const echo = "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"q2, edited\",\"replaces\":3}}";
+        const queued = "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"edit\",\"ok\":true,\"error_name\":null,\"message\":\"queued for run\"}}";
+        var at_echo: ?usize = null;
+        var at_queued: ?usize = null;
+        for (lines, 0..) |line, index| {
+            if (std.mem.eql(u8, line, echo)) at_echo = index;
+            if (std.mem.eql(u8, line, queued)) at_queued = index;
+        }
+        try std.testing.expect(at_queued.? < at_echo.?);
     }
 
     // The transcript on disk follows the edit (a full rewrite), so a restart

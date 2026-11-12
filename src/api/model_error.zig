@@ -385,8 +385,11 @@ pub fn noteRequestError(err: anyerror) void {
 }
 
 /// `agent_loop`'s net under the stream readers: a failed read nobody described.
-/// `RequestFailed` is the name the three clients reserve for a mid-stream
-/// disconnect; any other name is a local decode failure that a resend repeats.
+/// The clients describe a stall and a stream that ended before its stop report
+/// themselves (`client.reportBodyStall`, `client.reportStreamIncomplete`), so
+/// those never reach this undescribed. `RequestFailed` is the name the clients
+/// reserve for a mid-stream disconnect; any other name is a local decode
+/// failure that a resend repeats.
 pub fn noteStreamReadError(err: anyerror) void {
     const capture = active orelse return;
     if (capture.has_failure) return;

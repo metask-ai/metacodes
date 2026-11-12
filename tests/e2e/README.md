@@ -26,7 +26,8 @@ zig build && bash tests/e2e/daemon_serve_e2e.sh && bash tests/e2e/daemon_serve_m
 `serve` / `serve --sessions 2 --uds` 对 loopback mock provider(`daemon_mock_provider.py`)跑:
 `GET /health`、bearer token、`--web-bind ::1`、非回环无鉴权拒绝启动、按 session 路由、UDS、
 动态 session 生命周期(`/sessions` create/list/resume/destroy、`"resume":true` 从 transcript
-恢复、`--sessions 0`、`--max-sessions` 的 429,#254)、SIGINT 关停。端口全由内核分配,HOME 与
+恢复、`--sessions 0`、`--max-sessions` 的 429,#254)、journal 逐行是 wire v1 且 Run 的行带
+`run_id`(SSE 与 UDS attach 各读一遍,#444)、SIGINT 关停。端口全由内核分配,HOME 与
 state root 临时,TinyKG autostart 关,共用 `daemon_e2e_lib.sh`。
 
 前端能力交换(doc/WIRE_PROTOCOL.md §2)另有一个跨进程 e2e,纯 Python + HTTP,所以每个平台的

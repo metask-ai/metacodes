@@ -5253,6 +5253,7 @@ fn expectOptionalString(want: ?[]const u8, got: ?[]const u8) !void {
 
 const ModelFailureCase = struct {
     provider: u32 = wire.PROVIDER_ANTHROPIC,
+    protocol: u32 = wire.PROTOCOL_DEFAULT,
     expected: ModelErrorProbe.Expected,
 };
 
@@ -5274,7 +5275,7 @@ fn expectModelFailure(server: *harness.MockServer, case: ModelFailureCase) !void
         null,
         wire.RUN_JOURNAL_EPHEMERAL,
         case.provider,
-        wire.PROTOCOL_DEFAULT,
+        case.protocol,
         &.{},
         &probe,
         ModelErrorProbe.event,
@@ -5924,6 +5925,109 @@ test "L2 #408 a Skill invocation Run in its own context reports its child's fail
     ));
     try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
     try probe.expect(1, .{ .category = .payment_required, .code = "fork_code", .message = "fork failed", .http_status = 402, .retry = .not_retryable });
+}
+
+// --- issue #451: a stream that ends before it says how it stopped ------------
+
+/// What the Host reads, on every wire, about an accepted stream that ended
+/// cleanly before its stop report.
+const STREAM_ENDED_EARLY = "The response stream ended before it reported how it stopped.";
+
+/// Thinking reaches the Host, then the body ends cleanly: no
+/// `message_delta.stop_reason`, no `message_stop`.
+const THINKING_THEN_EOF_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"early\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"weighing it\"}}\n\n";
+
+/// Nothing the Host could show, then the body ends cleanly.
+const START_THEN_EOF_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"early\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+
+test "L2 #451 a stream that ends before its stop report reaches the Host as stream_interrupted on every ABI wire" {
+    const cases = [_]struct { provider: u32, protocol: u32 = wire.PROTOCOL_DEFAULT, body: []const u8 }{
+        // Messages: thinking, and no stop_reason.
+        .{ .provider = wire.PROVIDER_ANTHROPIC, .body = THINKING_THEN_EOF_SSE },
+        // Chat Completions: text, then `[DONE]` with no finish_reason before it.
+        .{ .provider = wire.PROVIDER_OPENAI, .body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n" ++
+            "data: [DONE]\n\n" },
+        // Responses: text, and neither response.completed nor response.incomplete.
+        .{ .provider = wire.PROVIDER_OPENAI, .protocol = wire.OPENAI_PROTOCOL_RESPONSES, .body = "event: response.output_text.delta\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_early\",\"output_index\":0,\"delta\":\"partial\"}\n\n" },
+        // Gemini: text, and no finishReason.
+        .{ .provider = wire.PROVIDER_GEMINI, .body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]},\"index\":0}]}\n\n" },
+    };
+    for (cases) |case| {
+        var server = try harness.MockServer.startCassette(&[_][]const u8{case.body}, 0);
+        defer server.stop();
+        server.extra_response_headers = "x-request-id: req-early-1\r\n";
+        try expectModelFailure(server, .{ .provider = case.provider, .protocol = case.protocol, .expected = .{
+            .category = .stream_interrupted,
+            .message = STREAM_ENDED_EARLY,
+            .http_status = 200,
+            .request_id = "req-early-1",
+            .retry = .retryable,
+        } });
+        // Output reached the Host before the end, so the turn was not sent again.
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    }
+}
+
+test "L2 #451 with nothing shown the turn is sent once more, and the Host's detail counts both attempts" {
+    var server = try harness.MockServer.startCassette(&[_][]const u8{START_THEN_EOF_SSE}, 0);
+    defer server.stop();
+    server.extra_response_headers = "x-request-id: req-early-2\r\n";
+    try expectModelFailure(server, .{ .expected = .{
+        .category = .stream_interrupted,
+        .message = STREAM_ENDED_EARLY,
+        .http_status = 200,
+        .request_id = "req-early-2",
+        .retry = .retryable,
+        .attempts = 2,
+    } });
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+}
+
+test "L2 #451 a stream that ended early and was sent again successfully leaves the Host no detail" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var server = try harness.MockServer.startCassette(&[_][]const u8{ START_THEN_EOF_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ModelErrorProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ModelErrorProbe.event);
+    defer fixture.deinit();
+    const result = try fixture.runTextTurns(1, "recover", 2);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 0), probe.count);
+}
+
+test "L2 #451 a stream line this client cannot read still reaches the Host as unknown" {
+    // One SSE line past the parser's bound (StreamTooLong): a local decode
+    // failure, which sending the request again would only repeat.
+    const a = std.testing.allocator;
+    const head = START_THEN_EOF_SSE ++ "data: ";
+    const body = try a.alloc(u8, head.len + core.api_stream.MAX_SSE_LINE_BYTES + 1 + "\n\n".len);
+    defer a.free(body);
+    @memcpy(body[0..head.len], head);
+    @memset(body[head.len .. body.len - 2], 'x');
+    @memcpy(body[body.len - 2 ..], "\n\n");
+    var server = try harness.MockServer.startCassette(&[_][]const u8{body}, 0);
+    defer server.stop();
+    server.extra_response_headers = "x-request-id: req-early-3\r\n";
+    try expectModelFailure(server, .{ .expected = .{
+        .category = .unknown,
+        .message = "The response stream could not be read: StreamTooLong.",
+        .http_status = 200,
+        .request_id = "req-early-3",
+        .retry = .unknown,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
 }
 
 test "L2 public compact commits a summary and reports COMPACT_COMPACTED" {

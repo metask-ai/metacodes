@@ -40,6 +40,50 @@ malformed answer is never a grant) and the capability frame of §2. Payload
 shapes are spelled out in `wire.zig`'s module comment and pinned by the
 fixtures.
 
+A Host journals these lines and nothing else. The bundled `--web`/`serve`
+host writes every journal line through `wire.zig`, its host events and
+`session_lifecycle` included (#444). Two tests refuse any line that is not
+one of these: `tests/component/web_message_config_test.zig` reads a whole
+session journal of both drivers through a Run with a permission prompt, and
+the wire leg of `tests/e2e/daemon_serve_multi_e2e.sh` does the same for the
+installed `serve`'s SSE stream and UDS attachment.
+
+### 1.1 Host events
+
+What a Host adds around the kernel's events, as
+`{"v":1,"type":"<HostEvent tag>","data":{...}}`:
+
+| `type` | `data` | Written by |
+|---|---|---|
+| `user_message` | `run_id`, `trace_id`, `text`, `replaces` | both Hosts: a Run's first line |
+| `run_done` | `run_id`, `trace_id`, `stop_reason`, `error_name`, `model_error` | both Hosts: a Run's last line |
+| `command_result` | `command`, `ok`, `error_name`, `message` | both Hosts |
+| `message_rejected` | `message`, `text`, `model`, `permission_mode` | `--web`/`serve` |
+| `session_poisoned` | `error_name`, `dropped` | `SessionHost` |
+
+- `run_done` has `stop_reason` when the Run returned and `error_name` when it
+  failed without returning (a refused rewind, a run the `--web`/`serve` run
+  control refused). A Run that stopped on the model (`api_error`,
+  `max_tokens_exhausted`) carries the detail in `model_error`, whose
+  `message` is the text to show; otherwise `model_error` is `null`.
+- `command_result.command` names the command: `SessionHost`'s `Command` tag
+  (`set_model`, …), or the verb of a `--web`/`serve` `/command` line (`mode`,
+  `edit`, `compact`, …; the name of a skill, `shell` for `!cmd`, `prompt` for
+  plain text). `error_name` is set exactly when `ok` is false. On
+  `--web`/`serve` it is the error the command failed with, if it has one;
+  `CommandUnsupported` for a line that surface does not run (a terminal verb
+  such as `/help`, a skill, a listing such as `/model` alone); and
+  `CommandRefused` for a refusal stated only in words. `message` holds those
+  words, or the outcome (`queued for run`, a shell command's output) for a
+  person. `SessionHost` writes `null` there. `message` was appended under
+  §4's additive rule 2.
+- `message_rejected` (added under §4's rule 1) is a `--web`/`serve` message
+  whose `model` or `permission_mode` was refused. Neither is applied, its
+  `text` stays out of the conversation, no Run starts, and the line takes
+  the place of the message's `user_message`. `model` and `permission_mode`
+  repeat what the message asked for: `null` when not given, the mode as
+  `/state` spells it. `message` says why.
+
 The `user_message` host event carries `replaces`, appended under §4's
 additive rule 2: `null` when the Run's text was appended after the whole
 conversation, or the 1-based position `n` of the user message it replaced
@@ -52,6 +96,60 @@ nothing changed.
 ```text
 {"v":1,"type":"user_message","data":{"run_id":6,"trace_id":null,"text":"...","replaces":6}}
 ```
+
+### 1.2 Runs
+
+A Host numbers the Runs of a Session 1, 2, … in the order they start. A
+restored or rebuilt Session starts again at 1 in a new journal, so the
+journal epoch tells the two apart. A Run's lines run from its
+`user_message` to its `run_done`, and each carries its `run_id`:
+
+```text
+{"v":1,"type":"user_message","data":{"run_id":2,"trace_id":null,"text":"write the file","replaces":null}}
+{"v":1,"type":"tool_start","run_id":2,"data":{"id":"tu_w","name":"Write","input":"..."}}
+{"v":1,"type":"ui_request","id":1,"kind":"permission","request":{"tool":"Write","args":"..."}}
+{"v":1,"type":"ui_request_closed","id":1,"outcome":"answered"}
+{"v":1,"type":"tool_result","run_id":2,"data":{"id":"tu_w","name":"Write",...}}
+{"v":1,"type":"run_done","data":{"run_id":2,"trace_id":null,"stop_reason":"end_turn","error_name":null,"model_error":null}}
+```
+
+- Every kernel event journaled while the Run is in progress has `run_id`
+  after `type`, and `trace_id` when the submission had one. Events between
+  Runs have neither: `session_lifecycle`, `config_changed` from a command or
+  from a message's `model` and `permission_mode` (journaled before its
+  `user_message`), and a background agent's `agent_lifecycle` reaped after
+  `run_done`.
+- UI request and capability lines carry no `run_id`. A request belongs to
+  the Run in progress when it is announced.
+- No other host line falls inside a Run: `command_result` and
+  `message_rejected` are journaled between Runs. A `--web`/`serve`
+  `/command` that plans a Run (a prompt, `/edit`, `/retry`, `/commit`, …)
+  journals its `command_result` first. The Run begins once every queued
+  command has run, so commands queued together that plan a Run share one,
+  and its `user_message` lines follow. A macro or `/retry` journals none, so
+  its Run starts with a kernel event.
+- `trace_id` is the opaque ID the caller attached to the submission
+  (`SessionHost`'s `Submission.trace_id`). `--web` and `serve` take none:
+  their host lines say `null` and their kernel events omit it. Where the two
+  Hosts overlap they write the same bytes.
+
+### 1.3 Transport frames
+
+A journal holds only wire lines. A transport adds frames of its own, which
+are not journal lines: they carry no `v`, take no seq and are never
+replayed.
+
+| Transport | Frames |
+|---|---|
+| SSE (`GET /events`) | `retry: 1000` first; `: keepalive` comments; `event: resync` when a cursor cannot be continued; `event: session_closed` once the journal is closed. A journal line is a frame with `id: <epoch>-<seq>` and no `event:`. |
+| UDS `attach` | `{"type":"keepalive"}` after 15 s without a line; `{"type":"session_closed"}` once the journal is closed, after which the stream ends. |
+
+A UDS reader tells them apart by `v`: a line with `v` is a journal line and
+advances its cursor (its next `since`), and a line without one is the
+transport's. They stay unversioned on purpose. They signal the connection,
+not the session: SSE sends the same two signals as a comment and a named
+event, outside its journal frames. A `v` would also make them look like
+journal lines, which a reader would then count.
 
 ## 2. Capability exchange
 

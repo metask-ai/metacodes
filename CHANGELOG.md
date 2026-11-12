@@ -10,6 +10,32 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- **Breaking: the `--web`/`serve` event stream is wire v1 throughout** (#444).
+  `/events` and the UDS `attach` op carried two envelopes. Kernel events and
+  UI requests were versioned wire lines, but the host lines were unversioned
+  `{"<name>":...}` objects written by hand, with their own field names and no
+  Run identity. Now every journal line is one wire v1 line written by
+  `core/protocol/wire.zig`, in the form `SessionHost` writes
+  ([doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md) §1.1–1.2). `user_message`,
+  `run_done`, `command_result` and the new `message_rejected` are host
+  events (`{"v":1,"type":...,"data":{...}}`), and `session_lifecycle` is a
+  kernel event. `run_done.err` is gone: a failed Run names its error in
+  `error_name` with a `null` `stop_reason` (it said `"error"`), and a model
+  failure's text is `model_error.message`. `command_result` gains `command`
+  (the line's verb) and `error_name`, and keeps its text in `message`. Runs
+  are numbered per session, and `user_message`, `run_done` and every kernel
+  event in between carry the Run's `run_id`. A `/command` that plans a Run
+  journals its `command_result` before the Run's `user_message`. Out-of-tree
+  readers of `/events` and `attach` switch on `type` and read `data`; the
+  bundled browser UI parses this one form. The UDS frames
+  `{"type":"keepalive"}` and `{"type":"session_closed"}` stay as they were:
+  they are the transport's, not journal lines (§1.3). For the wire contract
+  the change is additive: `message_rejected` is a new HostEvent tag, and
+  `command_result.message` an appended field
+  (`tests/fixtures/wire/v1/host_events.jsonl`).
+
 ### Added
 
 - **A stream retry budget for AgentCore Hosts** (#452). A reasoning model
@@ -61,6 +87,20 @@ status, compatibility boundaries, and entry points are defined by
   only shrink: a stale entry fails too, and `src/core/` has none. The model
   context-window table moves from `src/app/` to `src/api/model_context.zig`,
   removing seven of the eleven edges; the baseline holds the other four.
+
+- **A stream that ends before it says how it stopped is reported as an
+  interrupted stream** (#451). When an accepted stream ended cleanly without
+  its stop report (no `message_delta.stop_reason` on Messages, no non-null
+  `finish_reason` on Chat Completions, no terminal event on Responses, no
+  `finishReason` on Gemini, no `messageStop` on Bedrock), the Run's
+  `model_error` said `category: unknown`, `retry: unknown` and "The response
+  stream could not be read: StreamIncomplete." It now says
+  `stream_interrupted` and `retryable`, with that response's status and request
+  id and the message "The response stream ended before it reported how it
+  stopped.", as the ABI already documented and as Core's same-turn retry
+  already treated it. The retry, the attempt count and the empty detail after a
+  retry that succeeds are unchanged; a local decode failure such as an
+  oversized SSE line stays `unknown`.
 
 ## 0.11.0 — 2026-11-06
 
