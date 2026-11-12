@@ -1711,21 +1711,6 @@ pub const HostedSession = struct {
     }
 };
 
-/// Whether `message` makes tool call `id`.
-fn madeCall(message: anytype, id: []const u8) bool {
-    for (message.blocks) |block| switch (block) {
-        .tool_use => |call| if (std.mem.eql(u8, call.id, id)) return true,
-        else => {},
-    };
-    return false;
-}
-
-/// Wall-clock milliseconds: a suspended request's expiry outlives the
-/// process (#446).
-fn nowWallMs() i64 {
-    return @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
-}
-
 fn copyCommand(a: std.mem.Allocator, cmd: Command) error{OutOfMemory}!Command {
     return switch (cmd) {
         .set_model => |model| .{ .set_model = try a.dupe(u8, model) },
@@ -1752,6 +1737,21 @@ fn copyStrings(a: std.mem.Allocator, strings: []const []const u8) error{OutOfMem
     const copy = try a.alloc([]const u8, strings.len);
     for (strings, copy) |string, *slot| slot.* = try a.dupe(u8, string);
     return copy;
+}
+
+/// Whether `message` makes tool call `id`.
+fn madeCall(message: anytype, id: []const u8) bool {
+    for (message.blocks) |block| switch (block) {
+        .tool_use => |call| if (std.mem.eql(u8, call.id, id)) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Wall-clock milliseconds: a suspended request's expiry outlives the
+/// process (#446).
+fn nowWallMs() i64 {
+    return @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
 }
 
 // ============================================================================
