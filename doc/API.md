@@ -1138,7 +1138,8 @@ leaving every Host to rebuild them:
   member Session (`.role = .member`) on the same SessionHost.
 
 Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`,
-`idempotency_retention_ms`, `idempotency_max_keys`.
+`ui_request_expiry`, `ui_request_wait`, `idempotency_retention_ms`,
+`idempotency_max_keys`.
 Authentication, tenancy and the transport stay with the Host.
 To stream a Session's journal over SSE, parse the client's position with
 `event_journal.Cursor.fromLastEventId` / `fromSince`, start from
