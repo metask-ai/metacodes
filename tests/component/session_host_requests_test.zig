@@ -363,7 +363,7 @@ test "L2 #446 SessionHost suspend mode: a permission request still blocks and is
     try std.testing.expect(try exists(dirs.workspace, "approved.txt"));
 }
 
-test "L2 #446 SessionHost expiry: interrupt stops the Run, re_announce repeats the request until answered, cancel resumes a suspended question without its answer" {
+test "L2 #446 SessionHost expiry: interrupt stops the Run, re_announce repeats the request until answered, blocking or suspended; cancel resumes a suspended question without its answer" {
     const a = std.testing.allocator;
     var dirs: Dirs = undefined;
     try dirs.init();
@@ -454,6 +454,58 @@ test "L2 #446 SessionHost expiry: interrupt stops the Run, re_announce repeats t
         try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
         const resumed = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
         try std.testing.expect(std.mem.indexOf(u8, resumed, "AskUserQuestion failed with InputAborted") != null);
+    }
+
+    // `.re_announce` on a suspended question: the idle driver announces it
+    // again each period, and an answer still resumes the Run once.
+    {
+        const thanks = try textSse(a, "thanks");
+        defer a.free(thanks);
+        const bodies = [_][]const u8{ ASK_SSE, thanks };
+        var server = try harness.MockServer.startCassette(&bodies, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend", .ui_request_timeout_ms = 50, .ui_request_expiry = .re_announce });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = baseConfig(url, dirs.workspace, dirs.home) });
+        defer host.release(hosted);
+
+        try hosted.submit(.{ .text = "ask me" });
+        try waitFor(&hosted.journal, "\"stop_reason\":\"suspended\"", 1);
+        const line = try lineWith(&hosted.journal, "{\"v\":1,\"type\":\"ui_request\",\"id\":1,");
+        defer a.free(line);
+        try waitFor(&hosted.journal, line, 3);
+        try expectSnapshot(hosted, .suspended, 1, 0, .none);
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+        try hosted.respond(1, "{\"answers\":[\"Ship\"]}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\"}"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+        try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    }
+
+    // `.interrupt` on a suspended question: it resumes only to record the
+    // cancellation, with no provider request, and stops.
+    {
+        const unused = try textSse(a, "never sent");
+        defer a.free(unused);
+        const bodies = [_][]const u8{ ASK_SSE, unused };
+        var server = try harness.MockServer.startCassette(&bodies, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend", .ui_request_timeout_ms = 100, .ui_request_expiry = .interrupt });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = baseConfig(url, dirs.workspace, dirs.home) });
+        defer host.release(hosted);
+
+        try hosted.submit(.{ .text = "ask me" });
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"cancelled\"}"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"aborted\""));
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+        try expectSnapshot(hosted, .idle, 0, 0, .none);
     }
 }
 
