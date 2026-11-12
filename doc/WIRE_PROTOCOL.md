@@ -182,9 +182,13 @@ string of 1 to 256 bytes (`wire.MAX_APPROVER_BYTES`), next to the answer's
 own fields. The request's `ui_request_closed` then carries it, appended after
 `outcome`, when it closes on that answer (`answered` or `malformed`); a
 request cancelled by an interrupt, a close or its expiry names nobody, even
-if an answer raced it. `by` never changes how the answer is read. Who may
-answer, and what name they go by, is the Host's to authenticate; core records
-what it is given. `SessionHost.respond` refuses a `by` that is not such a
+if an answer raced it. `by` never changes how the answer is read. `by` is
+**self-reported and unauthenticated**: it is whatever the answering side says
+about itself, and core records it as given. A Host that needs a verified
+approver takes the identity from its own authentication (an HTTP token, a UDS
+peer credential, an IM platform's user id), and either fills `by` itself
+instead of passing the client's through, or records the verified identity
+separately; it never trusts `by` from an answer body for authorization. `SessionHost.respond` refuses a `by` that is not such a
 string (`error.InvalidApprover`) and the request stays open. `--web` and
 `serve`, whose `respond` has only the 409, record a valid `by` and ignore
 another, applying the answer as before.

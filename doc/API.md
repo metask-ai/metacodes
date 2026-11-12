@@ -1152,8 +1152,10 @@ UI requests on a long-lived Session (#446; the wire side is
 
 - **Approver.** An answer may carry `"by":"<approver>"`, 1 to 256 bytes; the
   request's `ui_request_closed` records it. `respond` refuses any other `by`
-  with `error.InvalidApprover` and leaves the request open. Authenticating
-  who answered is the Host's.
+  with `error.InvalidApprover` and leaves the request open. `by` is
+  self-reported, not authenticated: a Host that needs a verified approver
+  sets it from its own authentication (or records the verified identity
+  apart), never from the client's answer body.
 - **Expiry.** `ui_request_timeout_ms` (null: no limit) and
   `ui_request_expiry`: `.cancel` (default, as before) closes the request
   `cancelled` with its safe answer and the Run goes on; `.interrupt` does

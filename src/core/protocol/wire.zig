@@ -489,7 +489,9 @@ pub const ApproverError = error{
 };
 
 /// Who gave `json`, an answer to a UI request, as it names them in its
-/// optional `by` field (#446), copied into `allocator`. Null when it names
+/// optional `by` field (#446), copied into `allocator`. Self-reported and
+/// unauthenticated: a Host that needs a verified approver takes it from its
+/// own authentication, not from an answer body. Null when it names
 /// nobody: no `by`, `"by":null`, or an answer that is not a JSON object
 /// (`parseResponse` reads that one as malformed anyway). The answer itself is
 /// read by `parseResponse` alone; `by` never changes that reading.
