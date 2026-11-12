@@ -1017,3 +1017,93 @@ test "L2 #446 SessionHost suspend mode: an answer that arrives while the suspens
     try waitFor(&hosted.journal, "\"type\":\"run_done\"", 3);
     try std.testing.expect(try exists(dirs.workspace, "later.txt"));
 }
+
+/// A Bash call that leaves `sleep 30` running as a background job.
+fn backgroundSse(comptime id: []const u8, comptime index: []const u8) []const u8 {
+    return "data: {\"type\":\"content_block_start\",\"index\":" ++ index ++ ",\"content_block\":{\"type\":\"tool_use\",\"id\":\"" ++ id ++ "\",\"name\":\"Bash\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":" ++ index ++ ",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"sleep 30\\\",\\\"run_in_background\\\":true}\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":" ++ index ++ "}\n\n";
+}
+
+/// The question as content block 1.
+const QUESTION_BLOCK_1 =
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_q\",\"name\":\"AskUserQuestion\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"questions\\\":[{\\\"question\\\":\\\"Ship now?\\\",\\\"header\\\":\\\"Decision\\\",\\\"options\\\":[{\\\"label\\\":\\\"Ship\\\",\\\"description\\\":\\\"Release now\\\"},{\\\"label\\\":\\\"Wait\\\",\\\"description\\\":\\\"Hold the release\\\"}]}]}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n";
+
+test "L2 #446 SessionHost suspend mode: with a background job running, the suspended turn and the resumed Run are still written, and nothing is applied twice" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const suspended_turn = comptime TURN_START ++ backgroundSse("tu_b", "0") ++ QUESTION_BLOCK_1 ++ TOOL_TURN_END;
+    const resumed_turn = comptime TURN_START ++ backgroundSse("tu_b2", "0") ++ TOOL_TURN_END;
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ suspended_turn, resumed_turn, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const tools = [_][]const u8{ "AskUserQuestion", "Bash" };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &tools });
+    defer runtime.destroy() catch unreachable;
+    var config = baseConfig(url, dirs.workspace, dirs.home);
+    config.allowed_tools = &tools;
+    config.permission_mode = .bypass_permissions;
+    config.workspace.shell = .unrestricted;
+
+    var id: cc.session_id.SessionId = undefined;
+    var dir: []u8 = &.{};
+    defer a.free(dir);
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config });
+        defer host.release(hosted);
+        id = hosted.id;
+        dir = try sessionDirOf(a, config, id);
+        try hosted.submit(.{ .text = "start it, then ask" });
+        try waitFor(&hosted.journal, "\"stop_reason\":\"suspended\"", 1);
+        // The job still runs; the suspended turn is written all the same.
+        const transcript = try readFileIn(a, dir, "transcript.jsonl");
+        defer a.free(transcript);
+        try std.testing.expect(std.mem.indexOf(u8, transcript, "\"tu_q\"") != null);
+        {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const held = (try cc.ui_request_store.load(arena.allocator(), dir)).?.suspended.?;
+            try std.testing.expectEqualStrings("AskUserQuestion", held.tool_name);
+            try std.testing.expectEqual(@as(usize, 1), held.completed.len);
+            try std.testing.expectEqualStrings("tu_b", held.completed[0].tool_use_id);
+        }
+
+        // The resumed Run leaves another job running when it ends.
+        try hosted.respond(1, "{\"answers\":[\"Ship\"]}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+    }
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    // Its result is written, once, and the record let go all the same.
+    {
+        const transcript = try readFileIn(a, dir, "transcript.jsonl");
+        defer a.free(transcript);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, transcript, "\"tool_use_id\":\"tu_q\""));
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        try std.testing.expect((try cc.ui_request_store.load(arena.allocator(), dir)).?.suspended == null);
+    }
+
+    // Closed and opened again: nothing to resume, nothing run twice.
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+        defer host.release(hosted);
+        std.Io.sleep(std.testing.io, .fromMilliseconds(200), .awake) catch {};
+        try expectSnapshot(hosted, .idle, 0, 0, .none);
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"ui_request"));
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"run_resumed\""));
+    }
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+}

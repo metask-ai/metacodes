@@ -1238,6 +1238,29 @@ pub const HostedSession = struct {
         self.mutex.unlock();
     }
 
+    /// The committed conversation where the transcript is the witness of a
+    /// suspension (#446). A background job does not stand in the way: jobs
+    /// are no part of the committed state (`AgentSession.
+    /// snapshotCommittedForRunMeasurement`), so the lease that ignores them
+    /// is a coherent read; a provider cancel still in flight is waited out.
+    fn conversationLease(self: *HostedSession) !agent_session.CheckpointLease {
+        self.session.awaitProviderCancelsDrained();
+        return self.session.snapshotCommittedForRunMeasurement();
+    }
+
+    /// `persist` for the suspend and resume points (#446): written even with
+    /// a background job running. Whether the transcript was written.
+    fn persistDurable(self: *HostedSession) bool {
+        const writer = if (self.writer) |*writer| writer else return false;
+        var lease = self.conversationLease() catch return false;
+        defer lease.deinit();
+        writer.flush(lease.conversation);
+        self.mutex.lock();
+        self.messages = lease.conversation.len();
+        self.mutex.unlock();
+        return true;
+    }
+
     /// The request id a Host waits on: the blocking request's, else the
     /// suspended or suspending question's (#446). Caller holds `mutex`.
     fn pendingIdLocked(self: *const HostedSession) u64 {
@@ -1486,7 +1509,9 @@ pub const HostedSession = struct {
             self.closeSuspending();
             return;
         };
-        self.persist();
+        // The record is written only once the transcript holds the turn: a
+        // record whose call the transcript lacks is dropped on open.
+        const written = self.persistDurable();
         if (builtin.is_test) if (testing_hooks.before_handover) |hook| hook(self);
         self.mutex.lock();
         var taken = self.suspending.?;
@@ -1501,6 +1526,10 @@ pub const HostedSession = struct {
         if (self.run_interrupted) self.cancelSuspensionLocked(suspension, true);
         self.mutex.unlock();
         self.freeSuspending(taken);
+        if (!written) {
+            log.warn("session_host", "suspended request {d} of {s} held in memory only, its turn could not be written", .{ suspension.request_id, self.id.asSlice() });
+            return;
+        }
         self.storeRequests() catch |err|
             log.warn("session_host", "suspended request {d} of {s} held in memory only, a restart loses it: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
     }
@@ -1529,7 +1558,7 @@ pub const HostedSession = struct {
     /// says it did not run: resumed, the turn answers every call.
     fn turnResults(self: *HostedSession, a: std.mem.Allocator, info: agent_loop.SuspendInfo, suspension: *Suspension) !void {
         var results: std.ArrayList(agent_loop.SuspendInfo.CompletedResult) = .empty;
-        var lease = self.session.snapshotCommitted() catch {
+        var lease = self.conversationLease() catch {
             // Not reached after a Run returned; keep what the kernel kept.
             for (info.completed_results) |result| try results.append(a, try copyResult(a, result));
             suspension.completed = results.items;
@@ -1928,8 +1957,10 @@ pub const HostedSession = struct {
             return;
         };
         self.mutex.unlock();
+        // `finishRun` skips the transcript while a background job runs.
+        _ = self.persistDurable();
         const applied = blk: {
-            var lease = self.session.snapshotCommitted() catch break :blk false;
+            var lease = self.conversationLease() catch break :blk false;
             defer lease.deinit();
             break :blk callState(lease.conversation, resumed.tool_use_id) == .answered;
         };
