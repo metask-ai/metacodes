@@ -1484,7 +1484,7 @@ pub const HostedSession = struct {
             .max_turns = settings.max_turns,
             .stream_retry_budget = settings.stream_retry_budget,
         };
-        suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| nowWallMs() +| @as(i64, @intCast(ms)) else null;
+        suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| wallMs() +| @as(i64, @intCast(ms)) else null;
         return suspension;
     }
 
@@ -1642,7 +1642,7 @@ pub const HostedSession = struct {
         // `.re_announce`: the announcement this open makes is one.
         if (self.request_policy.expiry == .re_announce) {
             if (record.expires_at_ms) |deadline| {
-                if (deadline <= nowWallMs()) suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| nowWallMs() +| @as(i64, @intCast(ms)) else null;
+                if (deadline <= wallMs()) suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| wallMs() +| @as(i64, @intCast(ms)) else null;
             }
         }
         if (record.settled) |settled| switch (settled.outcome) {
@@ -1671,7 +1671,7 @@ pub const HostedSession = struct {
                 self.work_ready.wait(&self.mutex);
                 return null;
             };
-            const now = nowWallMs();
+            const now = wallMs();
             if (now < deadline) {
                 _ = self.work_ready.timedWait(&self.mutex, @intCast((deadline - now) * std.time.ns_per_ms));
                 return null;
@@ -1710,7 +1710,7 @@ pub const HostedSession = struct {
             return;
         };
         const open = suspension.settled == .open;
-        if (open) suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| nowWallMs() +| @as(i64, @intCast(ms)) else null;
+        if (open) suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| wallMs() +| @as(i64, @intCast(ms)) else null;
         self.mutex.unlock();
         if (!open) return;
         self.journal.append(suspension.announcement);
@@ -1930,7 +1930,8 @@ fn typedFields(submission: Submission) typed_submission.Fields {
     };
 }
 
-/// Wall-clock milliseconds: idempotency keys outlive the process.
+/// Wall-clock milliseconds: idempotency keys and a suspended request's
+/// expiry outlive the process.
 fn wallMs() i64 {
     return @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
 }
@@ -1970,12 +1971,6 @@ fn madeCall(message: anytype, id: []const u8) bool {
         else => {},
     };
     return false;
-}
-
-/// Wall-clock milliseconds: a suspended request's expiry outlives the
-/// process (#446).
-fn nowWallMs() i64 {
-    return @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
 }
 
 // ============================================================================
