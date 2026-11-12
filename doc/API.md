@@ -1067,10 +1067,13 @@ leaving every Host to rebuild them:
   driver thread, so configuration changes apply between Runs in the order
   they were queued.
 - Every kernel event, host event (`user_message`, `run_done`,
-  `command_result`, `session_poisoned`) and UI request lands in the
-  Session's `journal` as a wire line; CoreEvents carry `run_id` and the
-  submission's `trace_id`. `respond(id, json)` answers a UI request;
-  anything but the pending id is `error.NoSuchRequest`.
+  `command_result`, `session_poisoned`, `run_resumed`) and UI request lands
+  in the Session's `journal` as a wire line; CoreEvents carry `run_id` and
+  the submission's `trace_id`. `respond(id, json)` answers a UI request, and
+  may name who answered (`"by"`); anything but an open request is
+  `error.NoSuchRequest`, a second answer to one that has not yet applied its
+  first is `error.AlreadyAnswered`, and neither changes anything (see UI
+  requests below).
 - `declareCapabilities(allocator, frame)` installs the client's capability
   frame ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#2-capability-exchange)) and
   returns, and journals, its `capabilities_accepted` line; a refused frame
@@ -1078,7 +1081,8 @@ leaving every Host to rebuild them:
   leaves out is journaled as `ui_request_unavailable` and answered
   `unavailable` without waiting.
 - `interrupt` aborts the Run (or the one being admitted) and answers a
-  pending UI request as cancelled. A Session the kernel poisoned reports
+  pending UI request as cancelled; a suspended Run's request is cancelled
+  too, and the Run resumes only to record that. A Session the kernel poisoned reports
   `session_poisoned`, drops its queue and refuses further work; close and
   reopen it.
 - `close` stops the driver, closes the journal (waking readers), waits only
@@ -1094,6 +1098,45 @@ To stream a Session's journal over SSE, parse the client's position with
 `EventJournal.planResume(cursor)` (send `resync` when it reports a restart),
 and label lines with `EventJournal.eventId` — the rule the bundled `--web`
 server uses.
+
+UI requests on a long-lived Session (#446; the wire side is
+[WIRE_PROTOCOL.md §1.4](WIRE_PROTOCOL.md#14-ui-requests-approvers-expiry-suspended-runs)):
+
+- **Approver.** An answer may carry `"by":"<approver>"`, 1 to 256 bytes; the
+  request's `ui_request_closed` records it. `respond` refuses any other `by`
+  with `error.InvalidApprover` and leaves the request open. Authenticating
+  who answered is the Host's.
+- **Expiry.** `ui_request_timeout_ms` (null: no limit) and
+  `ui_request_expiry`: `.cancel` (default, as before) closes the request
+  `cancelled` with its safe answer and the Run goes on; `.interrupt` does
+  that and stops the Run; `.re_announce` journals the same `ui_request` line
+  again every period until someone answers.
+- **Waiting work.** A Session runs one thing at a time: a submission or
+  command queued while a request is open waits behind it, never refused for
+  it. `snapshot()` says why in `queue_waiting` (`.none`, `.run`,
+  `.ui_request` with `pending_request_id`). A Host that wants the work to run
+  at once opens another Session.
+- **Suspend mode.** `ui_request_wait = .suspend` (default `.block`; needs
+  `transcripts`, else `open` is `error.SuspendRequiresTranscripts`): a
+  question or custom UI request ends its Run `suspended` (`Phase.suspended`)
+  instead of holding the driver. The Session's directory keeps it
+  (`ui_requests.json` beside the kernel's `suspend.json`); `close` leaves it
+  there; `open(.resume)` under the id, after a restart too, announces it
+  again under the same id; `respond` then resumes the Run once through
+  `AdmittedRun.resumeWithResults`, journaled as `ui_request_closed` and
+  `run_resumed`. The resumed Run keeps the suspended Run's `trace_id`, turn
+  limit and `stream_retry_budget`. A question's answers reach the model as
+  AskUserQuestion's result; a custom UI's `result` is the tool's result as
+  is (the kernel's suspension convention); a cancelled or expired request is
+  the call failing with `InputAborted`. Request ids are kept too, so none is
+  reused across restarts. A fresh `open` under the id drops a suspended Run
+  with the conversation it belonged to. **A permission request is never
+  suspended:** the kernel's permission gate reads a `pending` answer as no
+  answer and denies the tool unasked, so under `.suspend` a permission
+  request blocks as under `.block` (the Session reports `.running` with the
+  request pending) and is cancelled by `close`. Making permission requests
+  survive a restart needs the kernel to suspend at its permission gate and
+  run the approved call on resume; that is follow-up work.
 
 Static trusted plugins can contribute typed tools, streaming tools, services,
 advisory policies, and deterministic provider dialects. Process plugins can only

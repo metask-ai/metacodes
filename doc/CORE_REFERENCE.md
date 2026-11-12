@@ -834,6 +834,13 @@ session)。这是 `requestUi`/`promptUser` 当前的全部行为。
 调用 `resumeRun` 注入成对的 `tool_result` 并继续运行（再次挂起时链式重写状态）。真正的
 Slack/邮件投递器仍属于宿主职责，core 不负责网络传输。
 
+`.pending` 只对工具执行时发起的请求生效（AskUserQuestion、custom UI）。权限请求不在此列：
+权限门在 `executeSlots` 之前同步询问，`permission/prompt.zig` 把 `.pending` 当成没有回答，
+在 `no_interactive_prompt` 下直接拒绝该工具，Run 不会挂起。所以 `SessionHost` 的挂起模式
+（`Options.ui_request_wait = .suspend`，#446）只挂起问答和 custom 请求，权限请求仍同步等待；
+它用 `AdmittedRun.resumeWithResults`（内部即 `agent_loop.resumeRunWithResults`）恢复挂起的
+Run，挂起状态落在会话目录的 `suspend.json` 与 `ui_requests.json`。
+
 ---
 
 ## 6. 构建一个前端的最小路径
