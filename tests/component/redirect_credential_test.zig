@@ -18,8 +18,6 @@
 const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
-const pfs = @import("platform").fs;
-const ppaths = @import("platform").paths;
 
 const SECRET = "redirect-test-secret-7f3a";
 
@@ -249,13 +247,11 @@ const Reported = struct {
         var io_runtime = @import("platform").signal.threadedIo(arena_state.allocator(), .{});
         defer io_runtime.deinit();
 
-        var path_buf: [512]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&path_buf, "{s}/cc-zig-redirect-credential-test.log", .{ppaths.tempDir()});
-        const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o644);
-        try std.testing.expect(fd >= 0);
-        defer pfs.close(fd);
-        defer pfs.unlinkPath(path.ptr) catch {};
-        const previous_log_state = cc.util_log.setLogFileFdForTest(fd);
+        // Private to this process and capture: the shards of `test:integration`
+        // share one temp directory (#472).
+        var log_file = try harness.LogFile.create("redirect-credential-test");
+        defer log_file.deinit();
+        const previous_log_state = cc.util_log.setLogFileFdForTest(log_file.fd);
         defer cc.util_log.restoreForTest(previous_log_state);
         // A failing run must not print the secret to the test output either.
         cc.util_log.setStderrEnabled(false);
@@ -271,10 +267,8 @@ const Reported = struct {
         try std.testing.expect(std.mem.indexOf(u8, first.raw, SECRET) != null);
 
         self.summary_len = takeLastError(&self.summary_buf).len;
-        _ = pfs.lseek(fd, 0, .set);
-        const n = pfs.read(fd, &self.log_buf);
-        try std.testing.expect(n > 0);
-        self.log_len = @intCast(n);
+        self.log_len = (try log_file.readAll(&self.log_buf)).len;
+        try std.testing.expect(self.log_len > 0);
     }
 };
 
