@@ -35,6 +35,18 @@ status, compatibility boundaries, and entry points are defined by
   (`api/model_availability.zig`) is the one `--web`/`serve` messages and
   `/model` use. Without `Options.models` a name is taken as before.
 
+### Fixed
+
+- **The log-capture tests no longer read another shard's log** (#472).
+  `redirect_credential_test` and `http_error_test` logged every capture to
+  one fixed file, `<tmp>/cc-zig-<name>-test.log`, which all eight
+  `test:integration` shard processes share. A capture in one shard truncated
+  or unlinked the file another was logging into, which then read a foreign
+  line or lost its own; a merge-queue run failed this way. Each capture now
+  creates its own file, named by pid and a per-process counter with
+  `O_EXCL` (`harness.LogFile`), and reads it to EOF instead of with one
+  bounded `read`; a log larger than the buffer is an error, not a cut.
+
 ## 0.12.0 — 2026-11-13
 
 ### Changed
