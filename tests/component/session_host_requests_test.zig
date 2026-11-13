@@ -1233,3 +1233,65 @@ test "L2 #446 SessionHost: re_announce needs a period; a zero timeout is refused
     const hosted = try host.open(.{ .config = baseConfig("http://127.0.0.1:9", dirs.workspace, dirs.home) });
     host.release(hosted);
 }
+
+test "L2 #446 SessionHost: an unreadable answer closes malformed under its approver, blocking or suspended; a question's call fails, not the Session" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &TOOLS });
+    defer runtime.destroy() catch unreachable;
+
+    // Blocking: a permission prompt's unreadable answer grants nothing, and
+    // its close names who sent it.
+    {
+        const path = try std.fmt.allocPrint(a, "{s}/garbled.txt", .{dirs.workspace});
+        defer a.free(path);
+        const write = try writeToolSse(a, path);
+        defer a.free(write);
+        const done = try textSse(a, "done");
+        defer a.free(done);
+        const bodies = [_][]const u8{ write, done };
+        var server = try harness.MockServer.startCassette(&bodies, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = baseConfig(url, dirs.workspace, dirs.home) });
+        defer host.release(hosted);
+
+        try hosted.submit(.{ .text = "write it" });
+        try waitFor(&hosted.journal, "\"type\":\"ui_request\",\"id\":1,\"kind\":\"permission\"", 1);
+        try hosted.respond(1, "{\"choice\":\"allow_everything\",\"by\":\"alice\"}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"malformed\",\"by\":\"alice\"}"));
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"session_poisoned\""));
+        try std.testing.expect(!try exists(dirs.workspace, "garbled.txt"));
+    }
+
+    // Suspended: the question's call fails with InputAborted, the close
+    // names who sent the answer, and the Session goes on.
+    {
+        const later = try textSse(a, "noted");
+        defer a.free(later);
+        const bodies = [_][]const u8{ ASK_SSE, later };
+        var server = try harness.MockServer.startCassette(&bodies, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = baseConfig(url, dirs.workspace, dirs.home) });
+        defer host.release(hosted);
+
+        try hosted.submit(.{ .text = "ask me" });
+        try waitFor(&hosted.journal, "\"stop_reason\":\"suspended\"", 1);
+        try hosted.respond(1, "{\"answers\":\"Ship\",\"by\":\"bob\"}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"malformed\",\"by\":\"bob\"}"));
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"session_poisoned\""));
+        const resumed = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+        try std.testing.expect(std.mem.indexOf(u8, resumed, "AskUserQuestion failed with InputAborted") != null);
+    }
+}
