@@ -3116,6 +3116,10 @@ pub const AgentSession = struct {
             // not a broken Host transport. AgentCore is the only current
             // producer; every other callback error retains poison semantics.
             if (err == error.UiCancelled and req.* == .ask_question) return err;
+            // Likewise a permission prompt nobody answered (a Host timeout,
+            // an interrupt or close, an unreadable answer): the gate denies
+            // the call and tells the model why (#463).
+            if (req.* == .permission and ui_request.isUnanswered(err)) return err;
             // A Host UI transport/decoding error is infrastructure failure,
             // not a model-visible tool error. Abort the current Run and let
             // finishRunLifecycle poison the Session consistently with event
@@ -5109,6 +5113,54 @@ test "Host UI requester failure aborts and poisons the active Run" {
     const completion = self.finishRunLifecycle();
     try std.testing.expect(completion.callback_failed);
     try std.testing.expectEqual(State.poisoned, self.state);
+}
+
+test "a permission prompt nobody answered reaches the gate without poisoning the Run (#463)" {
+    const Unanswered = struct {
+        var next: anyerror = error.UiRequestTimedOut;
+        fn request(
+            _: *anyopaque,
+            _: SessionId,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            return next;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var ui_state: u8 = 0;
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+        .ui_requester = .{ .ctx = &ui_state, .requestFn = Unanswered.request },
+    });
+    defer self.destroy() catch unreachable;
+    var sink_probe = SinkProbe{};
+    _ = try self.beginRun(12, sink_probe.sink());
+
+    const req = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+    inline for (.{ error.UiRequestTimedOut, error.UiRequestCancelled, error.UiAnswerUnreadable }) |cause| {
+        Unanswered.next = cause;
+        try std.testing.expectError(cause, self.permission_ctx.ui_requester.?.request(
+            self.session_id,
+            std.testing.allocator,
+            &req,
+            &response,
+        ));
+    }
+    try std.testing.expect(!self.abort_signal.isAborted());
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(!completion.callback_failed);
+    try std.testing.expectEqual(State.idle, self.state);
 }
 
 test "run-aware Host UI adapter snapshots identity and allows callback abort" {

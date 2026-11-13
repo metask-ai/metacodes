@@ -118,7 +118,9 @@ pub const Options = struct {
     /// What a request `ui_request_timeout_ms` leaves unanswered gets.
     ui_request_expiry: UiRequestExpiry = .cancel,
     /// How long a UI request waits for `respond`. Null waits until
-    /// `interrupt` or `close`. An expired request gets `ui_request_expiry`.
+    /// `interrupt` or `close`. An expired request gets `ui_request_expiry`;
+    /// a permission prompt it closes is denied, and the model reads why
+    /// (doc/WIRE_PROTOCOL.md §1.4). The value never reaches the model.
     ui_request_timeout_ms: ?u64 = null,
     /// How long after its Run started an idempotency key still makes a
     /// delivery a duplicate. With `transcripts`, the keys outlive the Host:
@@ -1336,7 +1338,7 @@ pub const HostedSession = struct {
         // to the kernel lets the prompt be announced and wait for it.
         if (self.ui_released) {
             self.mutex.unlock();
-            return cancelAnswer(req, out);
+            return cancelAnswer(req, .cancelled);
         }
         // The kernel suspends a turn on its first pending request, and the
         // resumption must answer the call this request belongs to: so one
@@ -1414,6 +1416,12 @@ pub const HostedSession = struct {
         const response = self.takeResponseLocked();
         const by = self.response_by;
         self.response_by = null;
+        // No answer: an interrupt or close in force cancelled it (and
+        // discarded any answer that raced it); otherwise the deadline passed.
+        const why: wire.NoAnswer = if (self.ui_released or self.run_interrupted or self.closing)
+            .cancelled
+        else
+            .timed_out;
         self.pending_request_id = 0;
         const run_id = self.current_run_id;
         self.mutex.unlock();
@@ -1428,30 +1436,33 @@ pub const HostedSession = struct {
 
         if (response) |json| {
             defer self.gpa.free(json);
-            const reading = wire.parseResponse(req, json, allocator, out) catch |err| {
-                self.appendLine(if (err == error.InputAborted)
-                    wire.writeRequestClosedBy(self.gpa, request_id, .malformed, by)
-                else
-                    wire.writeRequestClosed(self.gpa, request_id, .cancelled));
-                return if (err == error.InputAborted) cancelAnswer(req, out) else err;
+            wire.parseResponse(req, json, allocator, out) catch |err| {
+                // An unreadable answer still names who sent it; running out
+                // of memory reading it closes on nobody's answer.
+                const closed = wire.closedOnParseError(err);
+                self.appendLine(wire.writeRequestClosedBy(self.gpa, request_id, closed, if (closed == .malformed) by else null));
+                return if (err == error.OutOfMemory) err else cancelAnswer(req, .unreadable);
             };
-            self.appendLine(wire.writeRequestClosedBy(self.gpa, request_id, reading.closed(), by));
+            self.appendLine(wire.writeRequestClosedBy(self.gpa, request_id, .answered, by));
             return .answered;
         }
-        self.appendLine(wire.writeRequestClosed(self.gpa, request_id, .cancelled));
-        return cancelAnswer(req, out);
+        // The journal and the requester's error come from the same `why`, so
+        // what the Host records and what the model reads agree.
+        self.appendLine(wire.writeRequestClosed(self.gpa, request_id, why.closed()));
+        return cancelAnswer(req, why);
     }
 
     /// `wire.cancelResponse` as the AgentSession needs it (#446): a question
     /// that was cancelled or answered unreadably is the user's outcome,
     /// `error.UiCancelled`, which the AgentSession hands to the tool (the
-    /// call fails with InputAborted, as the model sees). Any other error from
-    /// a requester is a broken Host to it, and poisons the Session: a
-    /// cancelled question used to end its Session that way.
-    fn cancelAnswer(req: *const ui_request.UiRequest, out: *ui_request.UiResponse) anyerror!ui_request.RequestOutcome {
-        return wire.cancelResponse(req, out) catch |err| switch (err) {
-            error.InputAborted => if (req.* == .ask_question) error.UiCancelled else err,
-        };
+    /// call fails with InputAborted, as the model sees). A permission
+    /// prompt's `ui_request.Unanswered` error goes on as it is: the gate
+    /// denies the call and tells the model why (#463). Any other error from a
+    /// requester is a broken Host to the AgentSession, and poisons the
+    /// Session: a cancelled question used to end its Session that way.
+    fn cancelAnswer(req: *const ui_request.UiRequest, why: wire.NoAnswer) anyerror!ui_request.RequestOutcome {
+        const err = wire.cancelResponse(req, why);
+        return if (err == error.InputAborted and req.* == .ask_question) error.UiCancelled else err;
     }
 
     /// The stored answer to the pending request, unless cancellation won: an
@@ -1893,11 +1904,7 @@ pub const HostedSession = struct {
                 by = answered.by;
                 closed = .malformed;
                 var out: ui_request.UiResponse = undefined;
-                const reading = wire.parseResponse(&suspension.request, answered.json, a, &out) catch |err| switch (err) {
-                    error.InputAborted => wire.Reading.malformed,
-                    error.OutOfMemory => return error.OutOfMemory,
-                };
-                if (reading == .answer) switch (out) {
+                if (wire.parseResponse(&suspension.request, answered.json, a, &out)) |_| switch (out) {
                     .answers => |answers| {
                         content = try ask_user.answersResult(a, answers);
                         closed = .answered;
@@ -1908,7 +1915,13 @@ pub const HostedSession = struct {
                     },
                     // A suspension is never a permission request.
                     .permission => {},
-                };
+                } else |err| switch (err) {
+                    // Unreadable: `InputAborted`, as a suspension is never a
+                    // permission request. It closes as the blocking path
+                    // closes it.
+                    error.InputAborted, error.UiAnswerUnreadable => closed = wire.closedOnParseError(err),
+                    error.OutOfMemory => return error.OutOfMemory,
+                }
             },
         }
         const results = try a.alloc(agent_loop.SuspendInfo.CompletedResult, suspension.completed.len + 1);
@@ -2327,8 +2340,9 @@ test "SessionHost: a pending prompt answered and interrupted at once is cancelle
     defer thread.join();
     const request = ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var response: ui_request.UiResponse = undefined;
-    try std.testing.expectEqual(ui_request.RequestOutcome.answered, try HostedSession.requestUi(hosted, hosted.id, a, &request, &response));
-    try std.testing.expectEqual(ui_request.PermissionChoice.deny_once, response.permission);
+    // Cancelled, not answered: the allow is discarded and nobody's deny is
+    // invented in its place.
+    try std.testing.expectError(error.UiRequestCancelled, HostedSession.requestUi(hosted, hosted.id, a, &request, &response));
     try waitForLine(&hosted.journal, "\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"cancelled\"");
     hosted.mutex.lock();
     hosted.run_interrupted = false;

@@ -404,16 +404,18 @@ test "L2 验收③: dispatcher 在场的未知名在 auto 模式不按低风险�
     // .execute 分类 → auto 只放行低风险(read)→ ask → 无 UI fail-closed 拒绝;若错落
     // legacy unknown-read 会被当低风险 allow 并执行出 "does not exist" 的 UnknownTool 引导。
     try std.testing.expect(std.mem.indexOf(u8, run.content, "permission_denied") != null);
-    try std.testing.expect(std.mem.indexOf(u8, run.content, "user declined") != null);
+    // Nobody could be asked (#463): not the user's decline.
+    try std.testing.expect(std.mem.indexOf(u8, run.content, "has no way to ask for permission") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.content, "user declined") == null);
     try std.testing.expect(std.mem.indexOf(u8, run.content, "does not exist") == null);
 }
 
 test "L2 验收③: dispatcher 在场的未知名在 default 模式走 ask" {
     var run = try runUnknownNameClassification(.default);
     defer run.allocator.free(run.content);
-    // .execute 分类 → default ask → 无 UI fail-closed 拒绝("user declined")。
+    // .execute 分类 → default ask → 无 UI fail-closed 拒绝(nobody to ask, #463)。
     // 绝不是 .read → allow → 执行到 UnknownTool 引导。
-    try std.testing.expect(std.mem.indexOf(u8, run.content, "user declined") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.content, "has no way to ask for permission") != null);
     try std.testing.expect(std.mem.indexOf(u8, run.content, "does not exist") == null);
 }
 

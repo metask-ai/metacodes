@@ -64,9 +64,11 @@
 //!   ask_question   {"answers":["...", ...]}  one per question; several labels joined by ", "
 //!   custom         {"result":<any JSON>}
 //!
-//! A malformed answer is never a grant: `parseResponse` answers it the way a
-//! cancelled request is answered (`cancelResponse`) and reports it as
-//! `.malformed`, so the request closes as `"malformed"`, not `"answered"`.
+//! A malformed answer is never a grant: `parseResponse` fails it the way a
+//! request nobody answered fails (`cancelResponse`), so the request closes as
+//! `"malformed"`, not `"answered"`. For a permission prompt the failure names
+//! the cause (`ui_request.Unanswered`), so the model is not told the user
+//! declined (doc/WIRE_PROTOCOL.md §1.4).
 //!
 //! Any answer may also name who gave it, `"by":"<approver>"` (#446): a string
 //! of 1 to `MAX_APPROVER_BYTES` bytes, read by `answerApprover` and written on
@@ -99,25 +101,29 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const RequestClosed = enum {
     /// The client's well-formed answer was used.
     answered,
-    /// Interrupt, close or timeout won; the safe answer was used.
+    /// Interrupt, close or timeout won; nothing was granted.
     cancelled,
-    /// The client's answer could not be read; the safe answer was used.
+    /// The client's answer could not be read; nothing was granted.
     malformed,
 };
 
-/// How `parseResponse` read a client's answer.
-pub const Reading = enum {
-    /// Well-formed: `out` holds the client's answer.
-    answer,
-    /// Malformed or of another version: `out` holds `cancelResponse`'s safe
-    /// answer.
-    malformed,
+/// Why a request ended without the client's well-formed answer: what
+/// `cancelResponse` reports and what the Host journals, from one value.
+pub const NoAnswer = enum {
+    /// Nobody answered before the Host's deadline.
+    timed_out,
+    /// An interrupt or a close won.
+    cancelled,
+    /// The client's answer could not be read.
+    unreadable,
 
-    /// The `ui_request_closed` outcome to journal for this reading.
-    pub fn closed(self: Reading) RequestClosed {
+    /// The `ui_request_closed` outcome to journal. A timeout closes as
+    /// `cancelled`: v1's outcome set has no timeout, and adding one is a
+    /// breaking change (doc/WIRE_PROTOCOL.md §4).
+    pub fn closed(self: NoAnswer) RequestClosed {
         return switch (self) {
-            .answer => .answered,
-            .malformed => .malformed,
+            .timed_out, .cancelled => .cancelled,
+            .unreadable => .malformed,
         };
     }
 };
@@ -803,51 +809,69 @@ fn finish(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating) error{Ou
     return util_json.repairJsonUtf8(allocator, raw);
 }
 
-/// The answer to a request that was cancelled or answered unreadably: a
-/// permission prompt is denied once, never granted;
-/// a question or a custom UI reports `error.InputAborted`, as Esc does in the
-/// terminal.
-pub fn cancelResponse(request: *const UiRequest, out: *UiResponse) error{InputAborted}!RequestOutcome {
-    switch (request.*) {
-        .permission => {
-            out.* = .{ .permission = .deny_once };
-            return .answered;
+pub const CancelError = error{InputAborted} || ui_request.Unanswered;
+
+/// How a requester fails a request that ended with nobody's answer. Nothing
+/// is ever granted. A permission prompt fails with the `ui_request.Unanswered`
+/// error naming `why`, so the gate denies it and tells the model the user did
+/// not decline it; a question or a custom UI reports `error.InputAborted`, as
+/// Esc does in the terminal.
+pub fn cancelResponse(request: *const UiRequest, why: NoAnswer) CancelError {
+    return switch (request.*) {
+        .permission => switch (why) {
+            .timed_out => error.UiRequestTimedOut,
+            .cancelled => error.UiRequestCancelled,
+            .unreadable => error.UiAnswerUnreadable,
         },
-        .ask_question, .custom => return error.InputAborted,
-    }
+        .ask_question, .custom => error.InputAborted,
+    };
+}
+
+pub const ParseError = error{ InputAborted, UiAnswerUnreadable, OutOfMemory };
+
+/// The `ui_request_closed` outcome for a `parseResponse` failure: an answer
+/// that could not be read is `malformed`; running out of memory reading it
+/// is not the client's fault and closes as `cancelled`.
+pub fn closedOnParseError(err: ParseError) RequestClosed {
+    return switch (err) {
+        error.InputAborted, error.UiAnswerUnreadable => NoAnswer.unreadable.closed(),
+        error.OutOfMemory => .cancelled,
+    };
 }
 
 /// Parses the Host's answer `json` to `request` into `out`. Answer slices
-/// (`answers`, `custom`) are owned by `allocator`. Anything malformed takes
-/// `cancelResponse`'s safe answer and reads as `.malformed`; for a question or
-/// a custom UI that safe answer is `error.InputAborted`.
+/// (`answers`, `custom`) are owned by `allocator`. Anything malformed fails as
+/// `cancelResponse(request, .unreadable)` does and leaves `out` unwritten:
+/// `error.UiAnswerUnreadable` for a permission prompt, `error.InputAborted`
+/// for a question or a custom UI. The Host closes the request as
+/// `closedOnParseError` says, or as `answered` when this returns.
 pub fn parseResponse(
     request: *const UiRequest,
     json: []const u8,
     allocator: std.mem.Allocator,
     out: *UiResponse,
-) error{ InputAborted, OutOfMemory }!Reading {
+) ParseError!void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch
-        return malformed(request, out);
-    if (parsed != .object) return malformed(request, out);
+        return malformed(request);
+    if (parsed != .object) return malformed(request);
     const object = parsed.object;
     if (object.get("v")) |version| {
-        if (version != .integer or version.integer != SCHEMA_VERSION) return malformed(request, out);
+        if (version != .integer or version.integer != SCHEMA_VERSION) return malformed(request);
     }
 
     switch (request.*) {
         .permission => {
-            const choice = choiceField(object, PermissionChoice) orelse return malformed(request, out);
+            const choice = choiceField(object, PermissionChoice) orelse return malformed(request);
             out.* = .{ .permission = choice };
-            return .answer;
+            return;
         },
         .ask_question => |questions| {
-            const value = object.get("answers") orelse return malformed(request, out);
-            if (value != .array or value.array.items.len != questions.len) return malformed(request, out);
+            const value = object.get("answers") orelse return malformed(request);
+            if (value != .array or value.array.items.len != questions.len) return malformed(request);
             for (value.array.items) |item| {
-                if (item != .string) return malformed(request, out);
+                if (item != .string) return malformed(request);
             }
             const answers = try allocator.alloc([]const u8, questions.len);
             var filled: usize = 0;
@@ -860,21 +884,23 @@ pub fn parseResponse(
                 filled += 1;
             }
             out.* = .{ .answers = answers };
-            return .answer;
+            return;
         },
         .custom => {
-            const result = object.get("result") orelse return malformed(request, out);
+            const result = object.get("result") orelse return malformed(request);
             const raw = try std.json.Stringify.valueAlloc(allocator, result, .{});
             defer allocator.free(raw);
             out.* = .{ .custom = try util_json.repairJsonUtf8(allocator, raw) };
-            return .answer;
+            return;
         },
     }
 }
 
-fn malformed(request: *const UiRequest, out: *UiResponse) error{InputAborted}!Reading {
-    _ = try cancelResponse(request, out);
-    return .malformed;
+fn malformed(request: *const UiRequest) error{ InputAborted, UiAnswerUnreadable } {
+    return switch (request.*) {
+        .permission => error.UiAnswerUnreadable,
+        .ask_question, .custom => error.InputAborted,
+    };
 }
 
 fn choiceField(object: std.json.ObjectMap, comptime E: type) ?E {
@@ -929,12 +955,29 @@ test "parseResponse: a malformed or wrong-version answer never grants a permissi
     };
     for (bad) |json| {
         var out: UiResponse = undefined;
-        try testing.expectEqual(Reading.malformed, try parseResponse(&request, json, testing.allocator, &out));
-        try testing.expectEqual(PermissionChoice.deny_once, out.permission);
+        // Unreadable, not the user's deny: the gate tells the model so.
+        try testing.expectError(error.UiAnswerUnreadable, parseResponse(&request, json, testing.allocator, &out));
+        try testing.expectEqual(RequestClosed.malformed, closedOnParseError(error.UiAnswerUnreadable));
     }
     var out: UiResponse = undefined;
-    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"v\":1,\"choice\":\"allow_always\"}", testing.allocator, &out));
+    try parseResponse(&request, "{\"v\":1,\"choice\":\"allow_always\"}", testing.allocator, &out);
     try testing.expectEqual(PermissionChoice.allow_always, out.permission);
+}
+
+test "cancelResponse: a permission prompt nobody answered names why; the journal agrees" {
+    const permission = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    try testing.expectEqual(error.UiRequestTimedOut, cancelResponse(&permission, .timed_out));
+    try testing.expectEqual(error.UiRequestCancelled, cancelResponse(&permission, .cancelled));
+    try testing.expectEqual(error.UiAnswerUnreadable, cancelResponse(&permission, .unreadable));
+    // v1's close outcomes are unchanged: a timeout still closes as cancelled.
+    try testing.expectEqual(RequestClosed.cancelled, NoAnswer.timed_out.closed());
+    try testing.expectEqual(RequestClosed.cancelled, NoAnswer.cancelled.closed());
+    try testing.expectEqual(RequestClosed.malformed, NoAnswer.unreadable.closed());
+    // A question or a custom UI aborts as Esc does, whatever the cause.
+    const custom = UiRequest{ .custom = .{ .kind = "k@1", .payload_json = "{}" } };
+    inline for (.{ NoAnswer.timed_out, NoAnswer.cancelled, NoAnswer.unreadable }) |why| {
+        try testing.expectEqual(error.InputAborted, cancelResponse(&custom, why));
+    }
 }
 
 test "parseResponse: ask_question needs one string per question" {
@@ -947,7 +990,7 @@ test "parseResponse: ask_question needs one string per question" {
     var out: UiResponse = undefined;
     try testing.expectError(error.InputAborted, parseResponse(&request, "{\"answers\":[\"Yes\"]}", testing.allocator, &out));
     try testing.expectError(error.InputAborted, parseResponse(&request, "{\"answers\":[\"Yes\",2]}", testing.allocator, &out));
-    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"answers\":[\"Yes\",\"Yes, No\"]}", testing.allocator, &out));
+    try parseResponse(&request, "{\"answers\":[\"Yes\",\"Yes, No\"]}", testing.allocator, &out);
     defer {
         for (out.answers) |answer| testing.allocator.free(answer);
         testing.allocator.free(out.answers);
@@ -958,7 +1001,7 @@ test "parseResponse: ask_question needs one string per question" {
 test "parseResponse: a custom result reaches the tool as JSON text" {
     const request = UiRequest{ .custom = .{ .kind = "video_timeline", .payload_json = "{}" } };
     var out: UiResponse = undefined;
-    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"result\":{\"in\":3,\"out\":42}}", testing.allocator, &out));
+    try parseResponse(&request, "{\"result\":{\"in\":3,\"out\":42}}", testing.allocator, &out);
     defer testing.allocator.free(out.custom);
     try testing.expectEqualStrings("{\"in\":3,\"out\":42}", out.custom);
     try testing.expectError(error.InputAborted, parseResponse(&request, "{\"output\":1}", testing.allocator, &out));
@@ -1068,7 +1111,7 @@ test "answerApprover: a string of 1 to MAX_APPROVER_BYTES bytes; nobody when abs
     // The answer is read the same with or without its approver.
     const request = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var out: UiResponse = undefined;
-    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"choice\":\"allow_once\",\"by\":7}", a, &out));
+    try parseResponse(&request, "{\"choice\":\"allow_once\",\"by\":7}", a, &out);
     try testing.expectEqual(PermissionChoice.allow_once, out.permission);
 }
 

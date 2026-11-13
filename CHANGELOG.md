@@ -150,7 +150,7 @@ status, compatibility boundaries, and entry points are defined by
   inbox unread until it resumes. Permission
   requests still block in that mode: the kernel's permission gate reads a
   `pending` answer as a denial, so making them survive a restart needs the
-  kernel to suspend there first (follow-up). doc/WIRE_PROTOCOL.md §1.4,
+  kernel to suspend there first (follow-up). doc/WIRE_PROTOCOL.md §1.5,
   doc/API.md.
 
 ### Fixed
@@ -163,6 +163,20 @@ status, compatibility boundaries, and entry points are defined by
   call fails with `InputAborted` as the model sees it and the Run and Session
   go on. A cancelled custom UI request still poisons; that needs the
   AgentSession to tell the two apart for custom requests too.
+
+- **A permission prompt nobody answered no longer reaches the model as
+  "user declined"** (#463). A `SessionHost` timeout, an interrupt or close, an
+  unreadable answer, a requester that answers `pending` or `unavailable` or
+  fails, and a headless run with nobody to ask each read as what happened
+  ([doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md) §1.4); a timeout or a
+  cancellation is `recoverable: true`. Every case still denies with `code`
+  `permission_denied`, and a person's deny keeps its exact bytes. For Zig
+  Hosts: `wire.cancelResponse(request, why)` replaces
+  `cancelResponse(request, out)` and fails a permission prompt with a
+  `ui_request.Unanswered` error instead of answering `deny_once`;
+  `wire.parseResponse` returns `void` and fails an unreadable permission
+  answer with `UiAnswerUnreadable` (journal it with
+  `wire.closedOnParseError`). Wire lines are unchanged.
 
 - A same-turn re-issue no longer looks up the abandoned attempt's speculative
   tool results: they borrowed the attempt's freed tool-call ids, and a
