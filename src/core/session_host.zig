@@ -44,6 +44,9 @@
 //! Per Session one driver thread makes every call into the AgentSession.
 //! Submissions and configuration commands share one FIFO, so "set the model,
 //! then send this" happens in that order and only while the Session is idle.
+//! A submission may carry that model and permission mode itself (#445), as
+//! the bundled daemon's message does; a refusal of either applies neither
+//! and is journaled as `message_rejected` instead of a Run.
 //! `interrupt` is the one cross-thread call into the kernel; its abort is
 //! built for that.
 //!
@@ -209,8 +212,20 @@ pub const Submission = struct {
     attributes: []const Attribute = &.{},
     /// One Run per key: see `SubmitError.DuplicateSubmission`. The key is
     /// spent when its Run starts, whatever the Run then does; to try again,
-    /// submit under a new key.
+    /// submit under a new key. A submission `message_rejected` refused
+    /// started no Run and does not spend its key. `model` and
+    /// `permission_mode` are not part of what a key compares.
     idempotency_key: ?[]const u8 = null,
+    /// The Session's model and permission mode from this Run on (#445), as
+    /// the bundled daemon's `POST /message` takes them: applied by the
+    /// driver just before the Run, as `set_model` then `set_permission_mode`
+    /// queued right ahead of it would be, each journaled as that command's
+    /// `command_result`. The mode is checked first, so a refusal of either
+    /// changes nothing; then `message_rejected` takes the place of
+    /// `user_message`, the text stays out of the conversation and no Run
+    /// starts. Null leaves the setting as it is.
+    model: ?[]const u8 = null,
+    permission_mode: ?types.PermissionMode = null,
 };
 
 /// A configuration change applied by the driver between Runs, in queue
@@ -882,6 +897,8 @@ pub const HostedSession = struct {
             .kind = if (submission.kind) |kind| try a.dupe(u8, kind) else null,
             .attributes = try typed_submission.dupeAttributes(a, submission.attributes),
             .idempotency_key = if (submission.idempotency_key) |key| try a.dupe(u8, key) else null,
+            .model = if (submission.model) |model| try a.dupe(u8, model) else null,
+            .permission_mode = submission.permission_mode,
         } };
         const key = submission.idempotency_key orelse return self.enqueue(work);
         try self.enqueueKeyed(work, key, typed_submission.digest(fields));
@@ -1350,6 +1367,7 @@ pub const HostedSession = struct {
     };
 
     fn runSubmission(self: *HostedSession, submission: Submission) void {
+        if (!self.applySubmissionConfig(submission)) return;
         self.last_run_id += 1;
         const context = wire.RunContext{ .run_id = self.last_run_id, .trace_id = submission.trace_id };
         self.emitHost(.{ .user_message = .{
@@ -1414,6 +1432,60 @@ pub const HostedSession = struct {
             .stream_retry_budget = admitted.stream_retry_budget,
             .idempotency_key = submission.idempotency_key,
         });
+    }
+
+    /// Applies a submission's own `model` and `permission_mode` (#445), in
+    /// that order, each journaled as its command's `command_result`. The mode
+    /// is checked before anything changes, so either refusal applies nothing;
+    /// only a mode switch that fails once allowed (it cannot, while the
+    /// driver alone mutates the Session) leaves the model applied, as its
+    /// line says. False = rejected: `message_rejected` is journaled and no
+    /// Run starts.
+    fn applySubmissionConfig(self: *HostedSession, submission: Submission) bool {
+        if (submission.model == null and submission.permission_mode == null) return true;
+        self.session.awaitProviderCancelsDrained();
+        if (submission.permission_mode) |mode| {
+            // AgentSession.setPermissionMode's own check, made before the
+            // model changes.
+            if (!self.session.permission_ctx.modeAllowed(mode)) {
+                self.rejectSubmission(submission, error.PermissionModeDisabled, false);
+                return false;
+            }
+        }
+        if (submission.model) |model| {
+            if (self.applyModel(model)) |err| {
+                self.rejectSubmission(submission, err, false);
+                return false;
+            }
+            self.emitHost(.{ .command_result = .{ .command = @tagName(std.meta.Tag(Command).set_model), .ok = true } });
+        }
+        if (submission.permission_mode) |mode| {
+            self.session.setPermissionMode(mode) catch |err| {
+                self.rejectSubmission(submission, err, submission.model != null);
+                return false;
+            };
+            self.emitHost(.{ .command_result = .{ .command = @tagName(std.meta.Tag(Command).set_permission_mode), .ok = true } });
+        }
+        return true;
+    }
+
+    /// `message_rejected` in place of the submission's `user_message`: its
+    /// text stays out of the conversation, its idempotency key is let go (no
+    /// Run started) and the Session is idle again. `applied` = the model
+    /// was switched before the refusal and stays so.
+    fn rejectSubmission(self: *HostedSession, submission: Submission, err: anyerror, applied: bool) void {
+        log.warn("session_host", "submission to {s} rejected: {s}", .{ self.id.asSlice(), @errorName(err) });
+        if (applied) self.persist();
+        self.mutex.lock();
+        if (submission.idempotency_key) |key| self.ledger.forget(key);
+        if (!self.closing) self.phase = .idle;
+        self.mutex.unlock();
+        self.emitHost(.{ .message_rejected = .{
+            .message = @errorName(err),
+            .text = submission.text,
+            .model = submission.model,
+            .permission_mode = if (submission.permission_mode) |mode| @tagName(mode) else null,
+        } });
     }
 
     /// The end of a Run that returned: a suspended Run is held (#446), a
