@@ -645,7 +645,9 @@ fn rmMemberMutate(c: RmNameCtx, tf: *team_mod.TeamFile) anyerror!void {
         !std.mem.eql(u8, member_lease, c.lease)) return error.SessionMismatch;
     _ = tf.removeMember(c.name);
 }
-fn removeMemberFromConfig(
+/// Removes member `name` from the roster at `config_path` only while it is
+/// the worker `session` + `lease` name; false when nothing was removed.
+pub fn removeMemberFromConfig(
     a: std.mem.Allocator,
     config_path: []const u8,
     name_sanitized: []const u8,

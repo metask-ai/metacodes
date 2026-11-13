@@ -120,6 +120,22 @@ status, compatibility boundaries, and entry points are defined by
   next Run, and closing the lead closes its members. Without a factory
   nothing changes. `SwarmContext.popPendingSpawn` hands a request over with
   its ownership.
+- **`SessionHost` teammates inherit their lead, re-spawn, and fail visibly**
+  (part of #445). The new `session_host.InheritLead` is the `TeammateFactory`
+  the bundled daemon needs: each member gets the Host's base configuration
+  with its lead's current model and permission mode, and the spawn's effort
+  or else the lead's reasoning effort, as an `App` teammate inherits its
+  lead's. `TeammateSpawn` now carries those lead settings
+  (`lead_model`, `lead_permission_mode`, `lead_reasoning_effort`), read on
+  the lead's driver after the commands queued before the spawn. A name whose
+  member the Host closed is opened again: its old roster entry, which held
+  the old lease and refused the new member, is dropped first, so the new
+  member joins under a fresh lease and the closed one's mail stays
+  unaddressed. A spawn that fails is no longer only logged: it becomes the
+  lead's next Run, `<teammate-status from="<name>" state="failed">teammate
+  was not started: <error></teammate-status>`, journaled as a typed
+  `user_message` (`source` `session_host`, `kind`
+  `teammate_spawn_failed`).
 
 - **The UDS binding answers UI requests and takes capability frames.** A
   UDS-only frontend needed HTTP beside the socket for exactly the most

@@ -1050,3 +1050,234 @@ test "L2 #445 SessionHost: a hosted lead's SpawnTeammate opens and runs the memb
     try std.testing.expect(host.acquire(member_id) == null);
     try std.testing.expect(member.journal.isClosed());
 }
+
+/// The lead's half of the spawn tests below: Run 1 creates team `crew` and
+/// delegates to `solver`.
+fn spawnLeadConfig(url: []const u8, workspace: cc.agent_session.WorkspaceConfig) cc.agent_session.SessionConfig {
+    var config = baseConfig(url, workspace.root, workspace.root, &.{ "TeamCreate", "SpawnTeammate", "SendMessage" });
+    config.permission_mode = .bypass_permissions;
+    config.workspace = workspace;
+    config.team = .{ .role = .lead, .team_name = "" };
+    return config;
+}
+
+/// The id on `host` that is not `lead`'s; `host` holds exactly two.
+fn memberId(host: *SessionHost, lead: *HostedSession) !cc.session_id.SessionId {
+    const ids = try host.list(std.testing.allocator);
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    return if (std.mem.eql(u8, ids[0].asSlice(), lead.id.asSlice())) ids[1] else ids[0];
+}
+
+test "L2 #445 SessionHost InheritLead: the member runs with its lead's current model and permission mode, as an App teammate inherits them" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const ack = try textSse(a, "ack");
+    defer a.free(ack);
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        ack,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    const member_bodies = [_][]const u8{
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    const lead_config = spawnLeadConfig(lead_url, workspace);
+    // The Host's base for its leads, here on the member's cassette. Its
+    // model and permission mode are what the lead no longer runs with.
+    var base = lead_config;
+    base.base_url = member_url;
+    base.model = "base-model";
+    base.permission_mode = .default;
+    var inherit = cc.session_host.InheritLead{ .base = base };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = inherit.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    // The lead switches model before it delegates; the member follows it.
+    try lead.command(.{ .set_model = "lead-live-model" });
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(0).?.body(), "\"model\":\"lead-live-model\"") != null);
+
+    const member = host.acquire(try memberId(&host, lead)).?;
+    defer host.release(member);
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 2), member_srv.requestCount());
+    const first = member_srv.requestAt(0).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, first, "fix the parser") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"model\":\"lead-live-model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "base-model") == null);
+    var snap = try member.snapshot(a);
+    defer snap.deinit(a);
+    try std.testing.expectEqualStrings("lead-live-model", snap.model);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.bypass_permissions, snap.permission_mode);
+
+    // The member's reply reached the lead under the inherited configuration.
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(3).?.body(), "done: 42") != null);
+}
+
+test "L2 #445 SessionHost: a lead re-spawns a name whose member the Host closed, under a fresh lease, and hears from the new member" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const ack = try textSse(a, "ack");
+    defer a.free(ack);
+    const redelegated = try textSse(a, "redelegated");
+    defer a.free(redelegated);
+    const ack2 = try textSse(a, "ack2");
+    defer a.free(ack2);
+    // Run 1 delegates "task one", Run 2 is its reply, Run 3 delegates
+    // "task two" to the same name, Run 4 is the new member's reply.
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"task one\\\"}"),
+        delegated,
+        ack,
+        toolSse("t3", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"task two\\\"}"),
+        redelegated,
+        ack2,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    const member_bodies = [_][]const u8{
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 1\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+        toolSse("s2", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 2\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var members = MemberFactory{ .url = member_url, .workspace = workspace };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = members.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = spawnLeadConfig(lead_url, workspace) });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+    const first_id = try memberId(&host, lead);
+    const first = host.acquire(first_id).?;
+    try waitFor(&first.journal, "\"type\":\"run_done\"", 1);
+    host.release(first);
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(3).?.body(), "done: 1") != null);
+
+    // The Host closes the member; the lead later delegates to the name again.
+    try host.close(first_id);
+    try lead.submit(.{ .text = "delegate again" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 4);
+
+    try std.testing.expectEqual(@as(usize, 2), members.calls);
+    const second_id = try memberId(&host, lead);
+    try std.testing.expect(!std.mem.eql(u8, first_id.asSlice(), second_id.asSlice()));
+    const second = host.acquire(second_id).?;
+    defer host.release(second);
+    try waitFor(&second.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&second.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"task two\""));
+    try std.testing.expect(std.mem.indexOf(u8, member_srv.requestAt(2).?.body(), "task two") != null);
+
+    // The new member's reply is the lead's Run 4; nothing failed.
+    try std.testing.expectEqual(@as(usize, 7), lead_srv.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(6).?.body(), "done: 2") != null);
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&lead.journal, "teammate_spawn_failed"));
+}
+
+/// A Host that cannot configure any member.
+const RefusingFactory = struct {
+    calls: usize = 0,
+
+    fn factory(self: *RefusingFactory) cc.session_host.TeammateFactory {
+        return .{ .ctx = self, .configure = configure };
+    }
+
+    fn configure(ctx: *anyopaque, _: std.mem.Allocator, _: cc.session_host.TeammateSpawn) anyerror!cc.agent_session.SessionConfig {
+        const self: *RefusingFactory = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return error.NoTeammateProvider;
+    }
+};
+
+test "L2 #445 SessionHost: a spawn that fails is the lead's next Run, so its model learns the teammate was not started" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const noted = try textSse(a, "noted");
+    defer a.free(noted);
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        noted,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var refusing = RefusingFactory{};
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = refusing.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = spawnLeadConfig(lead_url, workspace) });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+
+    try std.testing.expectEqual(@as(usize, 1), refusing.calls);
+    const ids = try host.list(a);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    // Run 2 is the failure: typed for the Host, plain text for the provider.
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"kind\":\"teammate_spawn_failed\""));
+    try std.testing.expectEqual(@as(usize, 4), lead_srv.requestCount());
+    const report = lead_srv.requestAt(3).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, report, "teammate-status from=\\\"solver\\\" state=\\\"failed\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "teammate was not started: NoTeammateProvider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "teammate_spawn_failed") == null);
+}

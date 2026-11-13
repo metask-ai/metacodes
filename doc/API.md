@@ -1139,11 +1139,24 @@ leaving every Host to rebuild them:
   `effort`), opens it on the same SessionHost as a member of the lead's team
   under the lead's session id and a fresh lease, and submits the prompt as
   its first Run. The factory returns `team = null` (the SessionHost owns the
-  identity; anything else is refused); a refused or failed spawn is logged
-  and dropped. A name the lead already opened, still open, takes the prompt
-  as its next Run. Closing the lead closes the members it opened. Without a
-  factory the requests stay pending for the Host to fulfil itself (open a
-  `.role = .member` Session).
+  identity; anything else is refused). `spawn` also carries the lead's
+  current `lead_model`, `lead_permission_mode` and `lead_reasoning_effort`.
+  A refused or failed spawn becomes the lead's next Run, so its model learns
+  of it: `<teammate-status from="<name>" state="failed">teammate was not
+  started: <error></teammate-status>`, journaled as a typed `user_message`
+  (`source` `session_host`, `kind` `teammate_spawn_failed`). A name the lead
+  already opened, still open, takes the prompt as its next Run; one whose
+  member the Host closed is opened again under a fresh lease, after its old
+  roster entry is dropped. Closing the lead closes the members it opened.
+  Without a factory the requests stay pending for the Host to fulfil itself
+  (open a `.role = .member` Session).
+- `session_host.InheritLead{ .base = config }.factory()` is the factory that
+  configures each member like its lead, as the bundled daemon's `App`
+  teammates are: `base` (the configuration the Host opens its leads with;
+  borrowed, outlives the SessionHost) with the lead's current model and
+  permission mode, and the spawn's `effort` or else the lead's reasoning
+  effort. `InheritLead.derive(base, spawn)` is the same mapping as a pure
+  function. `agent_type` is not interpreted.
 
 Options: `max_queued`, `max_turns`, `teammates`, `transcripts`,
 `ui_request_timeout_ms`, `idempotency_retention_ms`, `idempotency_max_keys`.
