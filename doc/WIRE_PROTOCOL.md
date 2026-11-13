@@ -59,7 +59,7 @@ What a Host adds around the kernel's events, as
 | `user_message` | `run_id`, `trace_id`, `text`, `replaces`; `source`, `kind`, `idempotency_key`, `attributes` when given | both Hosts: a Run's first line |
 | `run_done` | `run_id`, `trace_id`, `stop_reason`, `error_name`, `model_error` | both Hosts: a Run's last line |
 | `command_result` | `command`, `ok`, `error_name`, `message` | both Hosts |
-| `message_rejected` | `message`, `text`, `model`, `permission_mode` | `--web`/`serve` |
+| `message_rejected` | `message`, `text`, `model`, `permission_mode` | both Hosts |
 | `session_poisoned` | `error_name`, `dropped` | `SessionHost` |
 | `run_resumed` | `run_id`, `trace_id`, `request_id` | `SessionHost`: the first line of a Run that resumes a suspended one (§1.5) |
 
@@ -79,12 +79,18 @@ What a Host adds around the kernel's events, as
   words, or the outcome (`queued for run`, a shell command's output) for a
   person. `SessionHost` writes `null` there. `message` was appended under
   §4's additive rule 2.
-- `message_rejected` (added under §4's rule 1) is a `--web`/`serve` message
-  whose `model` or `permission_mode` was refused. Neither is applied, its
-  `text` stays out of the conversation, no Run starts, and the line takes
-  the place of the message's `user_message`. `model` and `permission_mode`
-  repeat what the message asked for: `null` when not given, the mode as
-  `/state` spells it. `message` says why.
+- `message_rejected` (added under §4's rule 1) is a `--web`/`serve` message,
+  or a `SessionHost` submission (#445), whose `model` or `permission_mode`
+  was refused. Neither is applied, its `text` stays out of the
+  conversation, no Run starts, and the line takes the place of the
+  message's `user_message`. `model` and `permission_mode` repeat what the
+  message asked for: `null` when not given, the mode as `/state` spells it.
+  `message` says why: words on `--web`/`serve`, the error name
+  (`PermissionModeDisabled`, `InvalidModel`, …) on `SessionHost`. A
+  submission's accepted `model` and `permission_mode` are journaled before
+  its `user_message`: as `config_changed` on `--web`/`serve`, as the
+  `command_result` of `set_model` and `set_permission_mode` on
+  `SessionHost`.
 
 The `user_message` host event carries `replaces`, appended under §4's
 additive rule 2: `null` when the Run's text was appended after the whole

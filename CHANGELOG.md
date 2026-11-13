@@ -93,6 +93,17 @@ status, compatibility boundaries, and entry points are defined by
   (`Session.rewind_to_user_message`) and Node (`Session.rewindToUserMessage`)
   packages and the source-free consumers move to revision 27; AgentCore
   0.15.0-dev.
+- **A `SessionHost` submission may carry its own `model` and
+  `permission_mode`** (part of #445), as a `--web`/`serve` message does.
+  The driver applies them just before the Run, journaled as the
+  `command_result` of `set_model` and `set_permission_mode`, and they stay
+  the Session's settings. The mode is checked first, so when either is
+  refused nothing is applied, no Run starts and `message_rejected` (now
+  written by both Hosts) takes the place of `user_message`, naming the
+  error; the submission's idempotency key is not spent. Before, an
+  embedder had to queue the two commands itself and could not refuse the
+  text together with them.
+
 - **`SessionHost` feeds a team lead its teammates' replies** (part of #445).
   A lead Session (`SessionConfig.team` with the lead role) hosted on
   `core/session_host.zig` never saw a member's `SendMessage`: the inbox is
