@@ -1137,7 +1137,17 @@ leaving every Host to rebuild them:
   `set_reasoning_effort`, `set_additional_directories`, `set_prompt_profile`,
   `update_permission_rules`, `compact`) share one FIFO run by the Session's
   driver thread, so configuration changes apply between Runs in the order
-  they were queued.
+  they were queued. Each command is answered by `command_result`. As the
+  `--web`/`serve` config sink journals `/model`, `/mode`, `/effort` and
+  `/add-dir` (#445), an accepted `set_model`, `set_permission_mode` or
+  `set_reasoning_effort` is first journaled as `config_changed`
+  (`{"model":...}` as resolved, `{"mode":...}`, `{"reasoning":...}`, `null`
+  when the effort was cleared), also when the value was already in force,
+  and `set_additional_directories` journals `{"dirs":...}` for each
+  directory in force afterwards that was not before, as its resolved path
+  (a directory taken away has no line). A refused command journals none.
+  The permission mode is journaled by a config sink on the Session's
+  permission context, so a mode set any other way is journaled too.
 - Every kernel event, host event (`user_message`, `run_done`,
   `command_result`, `message_rejected`, `session_poisoned`, `run_resumed`)
   and UI request lands in the Session's `journal` as a wire line;

@@ -137,8 +137,9 @@ journal epoch tells the two apart. A Run's lines run from its
 
 - Every kernel event journaled while the Run is in progress has `run_id`
   after `type`, and `trace_id` when the submission had one. Events between
-  Runs have neither: `session_lifecycle`, `config_changed` from a command or
-  from a message's `model` and `permission_mode` (journaled before its
+  Runs have neither: `session_lifecycle`, `config_changed` from a command
+  (journaled before its `command_result`, by both Hosts) or from a
+  message's `model` and `permission_mode` (journaled before its
   `user_message`), and a background agent's `agent_lifecycle` reaped after
   `run_done`.
 - UI request and capability lines carry no `run_id`. A request belongs to
