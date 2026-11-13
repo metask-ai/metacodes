@@ -107,6 +107,14 @@ pub const MockServer = struct {
     /// `gateResponseAt`: the 0-based response held before any of its bytes
     /// are sent (maxInt = none).
     gate_response_index: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+    /// Answer like DeepSeek (#467): a request that offers gzip in
+    /// `Accept-Encoding` gets its 200 body gzip-compressed with
+    /// `content-encoding: gzip`; any other request gets it as is.
+    gzip_when_accepted: bool = false,
+    /// Set by serveLoop for the request being answered.
+    current_accepts_gzip: bool = false,
+    /// 200 responses sent gzip-encoded so far.
+    gzip_responses: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 停机标志:stop() 先置位、再自连唤醒 accept。Windows 上 closesocket **不可靠唤醒**
     /// 已阻塞的 accept(实测 join 永挂,竞态:线程先进 accept 则挂);POSIX close 同样无保证。
     /// 自连是跨平台确定性唤醒;accept 线程醒来见标志立即退出。
@@ -184,6 +192,18 @@ pub const MockServer = struct {
         const self = try startCassette(bodies, 0);
         self.cassette_status_lines = status_lines;
         return self;
+    }
+
+    /// Cassette whose 200 bodies are gzip-encoded for any request that offers
+    /// gzip, the way DeepSeek answers (#467). `gzipResponses` counts them.
+    pub fn startCassetteGzipWhenAccepted(bodies: []const []const u8) !*MockServer {
+        const self = try startCassette(bodies, 0);
+        self.gzip_when_accepted = true;
+        return self;
+    }
+
+    pub fn gzipResponses(self: *MockServer) u32 {
+        return self.gzip_responses.load(.acquire);
     }
 
     /// flaky 模式:前 close_first_n 个连接读完请求后直接断开(不写响应),之后正常回 body。
@@ -463,6 +483,7 @@ pub const MockServer = struct {
             };
             const total = readRequest(conn, buf);
             self.captureRequest(buf[0..total]);
+            self.current_accepts_gzip = self.gzip_when_accepted and offersGzip(buf[0..total]);
             std.heap.page_allocator.free(buf);
 
             if (self.gate_response_index.load(.acquire) == response_index) {
@@ -605,6 +626,10 @@ pub const MockServer = struct {
             "cache-control: no-cache\r\n" ++
             "transfer-encoding: chunked\r\n" ++
             "connection: close\r\n";
+        if (self.current_accepts_gzip) {
+            sendGzipResponse(conn, self, header);
+            return;
+        }
         sendAll(conn, header);
         sendAll(conn, self.extra_response_headers);
         sendAll(conn, "\r\n");
@@ -641,6 +666,47 @@ pub const MockServer = struct {
             }
         }
         if (self.current_response_cut) return; // 不发终止 chunk:模拟正文流中断
+        sendAll(conn, "0\r\n\r\n");
+    }
+
+    /// Whether the request head names gzip in an `Accept-Encoding` header.
+    fn offersGzip(raw: []const u8) bool {
+        const head_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse raw.len;
+        var lines = std.mem.splitSequence(u8, raw[0..head_end], "\r\n");
+        _ = lines.next(); // request line
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "accept-encoding")) continue;
+            var codings = std.mem.splitScalar(u8, line[colon + 1 ..], ',');
+            while (codings.next()) |coding| {
+                const name = std.mem.trim(u8, coding, " \t");
+                const bare = name[0 .. std.mem.indexOfScalar(u8, name, ';') orelse name.len];
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, bare, " \t"), "gzip")) return true;
+            }
+        }
+        return false;
+    }
+
+    /// The whole body, gzip-compressed, in one chunk after a
+    /// `content-encoding: gzip` head. A body the harness cannot compress is
+    /// not sent at all, so the client sees an empty stream rather than a
+    /// plain one under a gzip label.
+    fn sendGzipResponse(conn: net.Socket, self: *MockServer, header: []const u8) void {
+        const gpa = std.heap.page_allocator;
+        var out = std.Io.Writer.Allocating.initCapacity(gpa, 64) catch return;
+        defer out.deinit();
+        const window = gpa.alloc(u8, std.compress.flate.max_window_len) catch return;
+        defer gpa.free(window);
+        var compress = std.compress.flate.Compress.init(&out.writer, window, .gzip, .default) catch return;
+        compress.writer.writeAll(self.body) catch return;
+        compress.finish() catch return;
+
+        sendAll(conn, header);
+        sendAll(conn, "content-encoding: gzip\r\n");
+        sendAll(conn, self.extra_response_headers);
+        sendAll(conn, "\r\n");
+        _ = self.gzip_responses.fetchAdd(1, .release);
+        if (!tryWriteChunk(conn, out.written())) return;
         sendAll(conn, "0\r\n\r\n");
     }
 
