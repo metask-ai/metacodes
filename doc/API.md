@@ -1178,6 +1178,18 @@ leaving every Host to rebuild them:
   `swarm_tools.pollLeadInbox`, and a member's reply becomes the lead's next
   Run, queued behind any work already there and journaled like a submission
   without a `trace_id`. The bundled daemon does the same for its `App` lead.
+- A Session that selected the cron tools (`CronCreate`, `CronDelete`,
+  `CronList`; admitted only with `RuntimeConfig.enable_cron`) has its
+  scheduled prompts fired by its driver, as the CLI fires them once it is
+  back at the prompt: while its queue is empty and it has cron jobs, the
+  driver calls `AgentSession.takeDueCronPrompts` at most every
+  `session_host.cron_poll_ms` (1000 ms), and each prompt due becomes a Run
+  typed `source = session_host.cron_source` (`session_host`) and
+  `kind = session_host.cron_kind` (`cron_fired`), in the order the jobs were
+  created. The Run's user message is the prompt byte for byte; the typing
+  reaches the provider only through a submission template. A job never fires
+  during a Run or ahead of queued work, and its jobs close with the Session
+  (they are not persisted, as in the CLI).
 - With `Options.teammates` (a `TeammateFactory`), the SessionHost also
   fulfils the lead's `SpawnTeammate` requests, as the daemon's `App` starts
   its teammates: after each Run the lead's driver takes the pending requests

@@ -1679,3 +1679,77 @@ test "L2 #445 SessionHost config sink: each accepted configuration command journ
     try std.testing.expectEqual(cc.types_mod.PermissionMode.accept_edits, snapshot.permission_mode);
     try std.testing.expect(snapshot.reasoning_effort == null);
 }
+
+test "L2 #445 SessionHost cron: a CronCreate prompt fires as the Session's next Run once it is idle, after queued work, as the CLI fires it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const scheduled = try textSse(a, "scheduled");
+    defer a.free(scheduled);
+    const second = try textSse(a, "second done");
+    defer a.free(second);
+    const fired = try textSse(a, "fired");
+    defer a.free(fired);
+    // Run 1 schedules a one-shot prompt due at once; Run 2 was queued
+    // behind it; Run 3 is the prompt.
+    const bodies = [_][]const u8{
+        toolSse("c1", "CronCreate", "{\\\"prompt\\\":\\\"cron says hi\\\",\\\"delaySeconds\\\":0,\\\"recurring\\\":false}"),
+        scheduled,
+        second,
+        fired,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // Without `enable_cron` the tools are not in the Runtime, and they never
+    // enter through the explicit list.
+    try std.testing.expectError(error.UnsupportedBuiltinTool, cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"CronCreate"} }));
+    {
+        const plain = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+        defer plain.destroy() catch unreachable;
+        var plain_host = SessionHost.init(a, plain, .{ .transcripts = false });
+        defer plain_host.deinit();
+        try std.testing.expectError(error.ToolNotInRuntime, plain_host.open(.{ .config = baseConfig(url, workspace, home, &.{"CronCreate"}) }));
+    }
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_cron = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{ "CronCreate", "CronList", "CronDelete" });
+    config.permission_mode = .bypass_permissions;
+    const hosted = try host.open(.{ .config = config });
+    defer host.release(hosted);
+
+    try hosted.submit(.{ .text = "remind me" });
+    try hosted.submit(.{ .text = "second" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 3);
+
+    // The tool scheduled the job: its result reached the provider.
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, server.requestAt(1).?.body(), "\\\"scheduled\\\":true") != null);
+    // Queued work ran first: Run 2 is the submission, Run 3 the prompt.
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":2,\"trace_id\":null,\"text\":\"second\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":3,\"trace_id\":null,\"text\":\"cron says hi\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":3,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+    // The provider sees the prompt as the user's message, and nothing of its
+    // typing.
+    // Before it, the prompt is only in Run 1's CronCreate input.
+    const request = server.requestAt(3).?.body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, server.requestAt(2).?.body(), "cron says hi"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, request, "cron says hi"));
+    try std.testing.expect(std.mem.indexOf(u8, request, "cron_fired") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "session_host") == null);
+
+    // A one-shot job fires once.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.cron_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 3), try countLines(&hosted.journal, "\"type\":\"user_message\""));
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+}

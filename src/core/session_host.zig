@@ -61,6 +61,14 @@
 //! most every `lead_inbox_poll_ms`, and a teammate's reply becomes the lead's
 //! next Run, queued behind the work already there.
 //!
+//! A Session that selected the cron tools (`RuntimeConfig.enable_cron`) has
+//! its scheduled prompts fired by its driver (#445), as the CLI fires them
+//! when it is back at the prompt: while the queue is empty and the Session has
+//! cron jobs, the driver checks them at most every `cron_poll_ms`, and each
+//! prompt due becomes a Run typed `cron_source`/`cron_kind`, in the order the
+//! jobs were created. A job never fires during a Run or ahead of queued work.
+//! Jobs live with the AgentSession: closing it drops them.
+//!
 //! With `Options.teammates`, the SessionHost also fulfils the lead's
 //! `SpawnTeammate` requests, as the daemon's `App` starts its teammates
 //! (#445): after each item the lead's driver takes the pending requests in
@@ -126,6 +134,17 @@ pub const lead_inbox_poll_ms: u64 = 500;
 /// only logged, so reports never chain.
 pub const spawn_failure_source = "session_host";
 pub const spawn_failure_kind = "teammate_spawn_failed";
+
+/// How often an idle Session with cron jobs checks which are due (#445).
+/// Cron expressions name minutes and `delaySeconds` seconds, so a check a
+/// second keeps a prompt at most that late.
+pub const cron_poll_ms: u64 = 1000;
+
+/// The typed `source` and `kind` of a Run a cron job fired (#445). Neither
+/// reaches the provider without a submission template: the Run's user
+/// message is the job's prompt, as when the CLI fires it.
+pub const cron_source = "session_host";
+pub const cron_kind = "cron_fired";
 
 const AgentRuntime = agent_session.AgentRuntime;
 const AgentSession = agent_session.AgentSession;
@@ -952,6 +971,8 @@ pub const HostedSession = struct {
     last_compact_id: u64 = 0,
     /// When an idle team lead's inbox is read next (`util_time.nowNs`).
     next_lead_poll_ns: i128 = 0,
+    /// When an idle Session with cron jobs checks them next.
+    next_cron_poll_ns: i128 = 0,
     /// Members this lead opened (`Options.teammates`); names owned by `gpa`.
     /// Driver-only until the driver is joined, then `shutdown` closes them.
     teammates: std.ArrayList(Teammate) = .empty,
@@ -1231,22 +1252,76 @@ pub const HostedSession = struct {
                 }
                 return work;
             }
-            if (!self.leadsTeam()) {
-                self.work_ready.wait(&self.mutex);
-                continue;
-            }
+            // Idle: what fires by itself is checked on its own clock, and
+            // the driver sleeps until the earlier of the two is due.
             const now = util_time.nowNs();
-            if (now < self.next_lead_poll_ns) {
-                _ = self.work_ready.timedWait(&self.mutex, @intCast(self.next_lead_poll_ns - now));
-                continue;
+            var wake_at: ?i128 = null;
+            if (self.session.cronJobCount() > 0) {
+                if (now >= self.next_cron_poll_ns) {
+                    self.next_cron_poll_ns = now + @as(i128, cron_poll_ms) * std.time.ns_per_ms;
+                    // `takeDueCronPrompts` takes the AgentSession's lock.
+                    var fired: std.ArrayList(*Work) = .empty;
+                    defer fired.deinit(self.gpa);
+                    self.mutex.unlock();
+                    self.takeDueCron(&fired);
+                    self.mutex.lock();
+                    for (fired.items) |work| self.queue.append(self.gpa, work) catch {
+                        log.warn("session_host", "dropped a cron prompt for {s} (OOM)", .{self.id.asSlice()});
+                        self.freeWork(work);
+                    };
+                    continue;
+                }
+                wake_at = self.next_cron_poll_ns;
             }
-            self.next_lead_poll_ns = now + @as(i128, lead_inbox_poll_ms) * std.time.ns_per_ms;
-            // The inbox is a locked file: read it without holding the Session.
-            self.mutex.unlock();
-            const mail = self.takeLeadMail();
-            self.mutex.lock();
-            if (mail) |work| self.queue.append(self.gpa, work) catch {
-                log.warn("session_host", "dropped teammate mail for {s} (OOM)", .{self.id.asSlice()});
+            if (self.leadsTeam()) {
+                if (now >= self.next_lead_poll_ns) {
+                    self.next_lead_poll_ns = now + @as(i128, lead_inbox_poll_ms) * std.time.ns_per_ms;
+                    // The inbox is a locked file: read it without holding the Session.
+                    self.mutex.unlock();
+                    const mail = self.takeLeadMail();
+                    self.mutex.lock();
+                    if (mail) |work| self.queue.append(self.gpa, work) catch {
+                        log.warn("session_host", "dropped teammate mail for {s} (OOM)", .{self.id.asSlice()});
+                        self.freeWork(work);
+                    };
+                    continue;
+                }
+                wake_at = if (wake_at) |at| @min(at, self.next_lead_poll_ns) else self.next_lead_poll_ns;
+            }
+            if (wake_at) |at| {
+                _ = self.work_ready.timedWait(&self.mutex, @intCast(at - now));
+            } else {
+                self.work_ready.wait(&self.mutex);
+            }
+        }
+    }
+
+    /// Appends a submission to `fired` for each cron prompt due now, in the
+    /// order the jobs were created (`AgentSession.takeDueCronPrompts`). Each
+    /// is typed `cron_source`/`cron_kind`; its text is the prompt, byte for
+    /// byte. Driver-only, while the Session is idle.
+    fn takeDueCron(self: *HostedSession, fired: *std.ArrayList(*Work)) void {
+        const prompts = self.session.takeDueCronPrompts(self.gpa) catch |err| {
+            log.warn("session_host", "cron of {s} not checked: {s}", .{ self.id.asSlice(), @errorName(err) });
+            return;
+        };
+        defer {
+            for (prompts) |prompt| self.gpa.free(prompt);
+            self.gpa.free(prompts);
+        }
+        for (prompts) |prompt| {
+            const work = self.newWork() catch {
+                log.warn("session_host", "dropped a cron prompt for {s} (OOM)", .{self.id.asSlice()});
+                continue;
+            };
+            const text = work.arena.allocator().dupe(u8, prompt) catch {
+                log.warn("session_host", "dropped a cron prompt for {s} (OOM)", .{self.id.asSlice()});
+                self.freeWork(work);
+                continue;
+            };
+            work.item = .{ .submission = .{ .text = text, .source = cron_source, .kind = cron_kind } };
+            fired.append(self.gpa, work) catch {
+                log.warn("session_host", "dropped a cron prompt for {s} (OOM)", .{self.id.asSlice()});
                 self.freeWork(work);
             };
         }

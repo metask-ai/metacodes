@@ -25,6 +25,10 @@ empty `### Migration`.
 - No change a Host can see. The Zig `SessionHost` now journals
   `config_changed` for its accepted configuration commands, as the daemon's
   config sink does (#445); ABI revision 28 does not expose `SessionHost`.
+- No change a Host can see. The Zig `RuntimeConfig.enable_cron` admits the
+  cron tools into a Zig Runtime, and the Zig `SessionHost` fires their
+  prompts as Runs (#445); `RuntimeConfigV1` has no such flag, and the cron
+  tools stay out of the tools an ABI Runtime admits.
 
 ## 0.15.0 — 2026-11-13
 

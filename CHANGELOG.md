@@ -44,6 +44,16 @@ status, compatibility boundaries, and entry points are defined by
   provider`, or `command_result` with `ModelUnavailable`. The rule
   (`api/model_availability.zig`) is the one `--web`/`serve` messages and
   `/model` use. Without `Options.models` a name is taken as before.
+- **`SessionHost` fires a Session's cron prompts** (part of #445). With the
+  new `RuntimeConfig.enable_cron`, a Session can select `CronCreate`,
+  `CronDelete` and `CronList`; it owns their `CronRegistry`, as the CLI's
+  and the daemon's `App` does, and `AgentSession.takeDueCronPrompts` takes
+  the prompts due while it is idle. A SessionHost driver checks them at
+  most every `cron_poll_ms` (1 s) while its queue is empty, and each prompt
+  due becomes a Run typed `session_host`/`cron_fired` whose user message is
+  the prompt, as the CLI fires one when it is back at the prompt. A job
+  never fires during a Run or ahead of queued work. The cron tools stay out
+  of the explicit `builtin_tools` list and the C ABI.
 
 ### Fixed
 
