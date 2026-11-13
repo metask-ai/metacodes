@@ -46,7 +46,9 @@
 //! then send this" happens in that order and only while the Session is idle.
 //! A submission may carry that model and permission mode itself (#445), as
 //! the bundled daemon's message does; a refusal of either applies neither
-//! and is journaled as `message_rejected` instead of a Run.
+//! and is journaled as `message_rejected` instead of a Run. With
+//! `Options.models` a model name resolves as on the daemon: tier names,
+//! then the provider guard (`ModelPolicy`).
 //! `interrupt` is the one cross-thread call into the kernel; its abort is
 //! built for that.
 //!
@@ -102,6 +104,10 @@ const prompt_sections = @import("prompt_sections.zig");
 const typed_submission = @import("typed_submission.zig");
 const idempotency_ledger = @import("idempotency_ledger.zig");
 const permission_settings = @import("../permission/settings.zig");
+const model_tiers = @import("../api/model_tiers.zig");
+const model_availability = @import("../api/model_availability.zig");
+const model_name = @import("../api/model_name.zig");
+const permission_mode = @import("../permission/mode.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const swarm_tools = @import("../swarm/tools.zig");
@@ -157,7 +163,67 @@ pub const Options = struct {
     /// Started idempotency keys kept per Session; beyond it the oldest is
     /// forgotten first.
     idempotency_max_keys: usize = 10_000,
+    /// How a model name in `Submission.model` or `Command.set_model` becomes
+    /// the model a Session switches to (#445). Null takes the name as it is,
+    /// for the Session's own check (`InvalidModel`) and its provider.
+    models: ?ModelPolicy = null,
 };
+
+/// The bundled daemon's model resolution (`SessionService.setTurnModel`,
+/// api/model_availability.zig), for a Host that offers it (#445). A name is
+/// trimmed, a tier name (`low`/`mid`/`high`, or `haiku`/`sonnet`/`opus`)
+/// resolves through `tiers`' entry for the Session's provider kind, and the
+/// result must be one the provider takes: one `catalog` lists for it, or
+/// one whose id names it (`claude-`, `gpt`/`o1`/`o3`, `gemini`). Anything
+/// else, an unset tier included, is `error.ModelUnavailable` and changes
+/// nothing. A tier's reasoning effort is not applied, as on the daemon.
+pub const ModelPolicy = struct {
+    /// Borrowed; outlives the SessionHost.
+    tiers: ?*const model_tiers.TierTable = null,
+    /// Borrowed; outlives the SessionHost.
+    catalog: []const CatalogModel = &.{},
+};
+
+/// A model a provider's catalog lists (`ModelPolicy.catalog`).
+pub const CatalogModel = struct {
+    provider: types.ProviderKind,
+    id: []const u8,
+};
+
+/// Why a model switch through the SessionHost failed.
+pub const ModelChangeError = agent_session.ModelMutationError || error{
+    /// `Options.models` refused the name: an unset tier, or a model the
+    /// Session's provider does not take.
+    ModelUnavailable,
+};
+
+/// Why a submission was `message_rejected`.
+pub const SubmissionRefusal = ModelChangeError || agent_session.PermissionModeMutationError;
+
+/// The model `requested` names under `policy`, for a Session of `provider`;
+/// borrowed from `requested` or the tier table.
+fn resolveModel(policy: ModelPolicy, provider: types.ProviderKind, requested: []const u8) error{ModelUnavailable}![]const u8 {
+    const tiers = if (policy.tiers) |table| table.forKind(provider) else null;
+    const model = model_availability.resolveTierName(tiers, requested);
+    const listed = for (policy.catalog) |entry| {
+        if (entry.provider == provider and model_name.eqlIgnoreCase(entry.id, model)) break true;
+    } else false;
+    if (!model_availability.available(provider, listed, model)) return error.ModelUnavailable;
+    return model;
+}
+
+/// `message_rejected.message`: why, in words, as the bundled daemon says it
+/// where the two refuse alike. `mode` is the submission's own.
+fn refusalReason(err: SubmissionRefusal, mode: ?types.PermissionMode) []const u8 {
+    return switch (err) {
+        error.PermissionModeDisabled => permission_mode.disabledReason(mode orelse .default),
+        error.ModelUnavailable => model_availability.unavailable_reason,
+        error.InvalidModel => "model name is empty or not valid UTF-8",
+        error.SessionBusy => "session is busy",
+        error.InvalidSessionState => "session can no longer take changes",
+        error.OutOfMemory => "out of memory",
+    };
+}
 
 pub const OpenMode = enum {
     /// A new conversation. Under an explicit id whose transcript exists, the
@@ -219,11 +285,12 @@ pub const Submission = struct {
     /// The Session's model and permission mode from this Run on (#445), as
     /// the bundled daemon's `POST /message` takes them: applied by the
     /// driver just before the Run, as `set_model` then `set_permission_mode`
-    /// queued right ahead of it would be, each journaled as that command's
-    /// `command_result`. The mode is checked first, so a refusal of either
+    /// queued right ahead of it would be, each journaled as `config_changed`
+    /// as the daemon journals them. The model resolves through
+    /// `Options.models`. The mode is checked first, so a refusal of either
     /// changes nothing; then `message_rejected` takes the place of
-    /// `user_message`, the text stays out of the conversation and no Run
-    /// starts. Null leaves the setting as it is.
+    /// `user_message`, saying why in words, the text stays out of the
+    /// conversation and no Run starts. Null leaves the setting as it is.
     model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
 };
@@ -571,6 +638,7 @@ pub const SessionHost = struct {
             .journal = EventJournal.init(self.gpa),
             .model = model,
             .reasoning_effort = spec.config.reasoning_effort,
+            .provider_kind = spec.config.provider_kind,
             .max_queued = self.options.max_queued,
             .submission_template = template,
             .ledger = .init(self.gpa, self.options.idempotency_retention_ms, self.options.idempotency_max_keys),
@@ -823,6 +891,9 @@ pub const HostedSession = struct {
     model: []u8,
     reasoning_effort: ?types.ReasoningEffort,
     messages: usize = 0,
+    /// The Session's provider kind, which `setModel` keeps:
+    /// `Options.models` resolves names for it.
+    provider_kind: types.ProviderKind,
 
     /// One UI request at a time; a second (from a parallel tool) waits.
     ui_serial: sync.Mutex = .{},
@@ -1435,12 +1506,14 @@ pub const HostedSession = struct {
     }
 
     /// Applies a submission's own `model` and `permission_mode` (#445), in
-    /// that order, each journaled as its command's `command_result`. The mode
-    /// is checked before anything changes, so either refusal applies nothing;
-    /// only a mode switch that fails once allowed (it cannot, while the
-    /// driver alone mutates the Session) leaves the model applied, as its
-    /// line says. False = rejected: `message_rejected` is journaled and no
-    /// Run starts.
+    /// that order, each journaled as `config_changed`, as the bundled daemon
+    /// journals a message's fields (`web/session.startSubmission`): even
+    /// when already in force, the model as resolved. The mode is checked
+    /// before anything changes, so either refusal applies nothing; only a
+    /// mode switch that fails once allowed (it cannot, while the driver
+    /// alone mutates the Session) leaves the model applied, as its line
+    /// says. False = rejected: `message_rejected` is journaled and no Run
+    /// starts.
     fn applySubmissionConfig(self: *HostedSession, submission: Submission) bool {
         if (submission.model == null and submission.permission_mode == null) return true;
         self.session.awaitProviderCancelsDrained();
@@ -1453,18 +1526,19 @@ pub const HostedSession = struct {
             }
         }
         if (submission.model) |model| {
-            if (self.applyModel(model)) |err| {
+            self.applyModel(model) catch |err| {
                 self.rejectSubmission(submission, err, false);
                 return false;
-            }
-            self.emitHost(.{ .command_result = .{ .command = @tagName(std.meta.Tag(Command).set_model), .ok = true } });
+            };
+            // Only the driver writes `model`.
+            self.emitConfig(.{ .model = self.model });
         }
         if (submission.permission_mode) |mode| {
             self.session.setPermissionMode(mode) catch |err| {
                 self.rejectSubmission(submission, err, submission.model != null);
                 return false;
             };
-            self.emitHost(.{ .command_result = .{ .command = @tagName(std.meta.Tag(Command).set_permission_mode), .ok = true } });
+            self.emitConfig(.{ .mode = mode });
         }
         return true;
     }
@@ -1473,7 +1547,7 @@ pub const HostedSession = struct {
     /// text stays out of the conversation, its idempotency key is let go (no
     /// Run started) and the Session is idle again. `applied` = the model
     /// was switched before the refusal and stays so.
-    fn rejectSubmission(self: *HostedSession, submission: Submission, err: anyerror, applied: bool) void {
+    fn rejectSubmission(self: *HostedSession, submission: Submission, err: SubmissionRefusal, applied: bool) void {
         log.warn("session_host", "submission to {s} rejected: {s}", .{ self.id.asSlice(), @errorName(err) });
         if (applied) self.persist();
         self.mutex.lock();
@@ -1481,7 +1555,7 @@ pub const HostedSession = struct {
         if (!self.closing) self.phase = .idle;
         self.mutex.unlock();
         self.emitHost(.{ .message_rejected = .{
-            .message = @errorName(err),
+            .message = refusalReason(err, submission.permission_mode),
             .text = submission.text,
             .model = submission.model,
             .permission_mode = if (submission.permission_mode) |mode| @tagName(mode) else null,
@@ -1575,7 +1649,7 @@ pub const HostedSession = struct {
     fn applyCommand(self: *HostedSession, cmd: Command) void {
         self.session.awaitProviderCancelsDrained();
         const failure: ?anyerror = switch (cmd) {
-            .set_model => |model| self.applyModel(model),
+            .set_model => |model| if (self.applyModel(model)) |_| null else |err| err,
             .set_permission_mode => |mode| if (self.session.setPermissionMode(mode)) |_| null else |err| err,
             .set_reasoning_effort => |effort| if (self.session.setReasoningEffort(effort)) |_| blk: {
                 self.mutex.lock();
@@ -1600,8 +1674,14 @@ pub const HostedSession = struct {
         } });
     }
 
-    fn applyModel(self: *HostedSession, model: []const u8) ?anyerror {
-        const copy = self.gpa.dupe(u8, model) catch |err| return err;
+    /// Switches the Session to `requested`, resolved through
+    /// `Options.models` when the Host set it.
+    fn applyModel(self: *HostedSession, requested: []const u8) ModelChangeError!void {
+        const model = if (self.host.options.models) |policy|
+            try resolveModel(policy, self.provider_kind, requested)
+        else
+            requested;
+        const copy = try self.gpa.dupe(u8, model);
         self.session.setModel(model) catch |err| {
             self.gpa.free(copy);
             return err;
@@ -1613,7 +1693,6 @@ pub const HostedSession = struct {
         // The transcript's meta names the model; the writer borrows this copy.
         if (self.writer) |*writer| writer.model = self.model;
         self.gpa.free(previous);
-        return null;
     }
 
     /// Flush the committed Conversation to the transcript. A poisoned Session
@@ -1669,6 +1748,16 @@ pub const HostedSession = struct {
             if (std.mem.eql(u8, held, key)) return true;
         }
         return false;
+    }
+
+    /// A `config_changed` line between Runs, as the daemon journals one.
+    fn emitConfig(self: *HostedSession, change: ui_event.ConfigChange) void {
+        const line = wire.writeEvent(self.gpa, .{ .config_changed = change }) catch {
+            log.warn("session_host", "dropped config_changed (OOM)", .{});
+            return;
+        };
+        defer self.gpa.free(line);
+        self.journal.append(line);
     }
 
     fn emitHost(self: *HostedSession, event: wire.HostEvent) void {

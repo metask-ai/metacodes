@@ -14,6 +14,15 @@ empty `### Migration`.
 
 ## Unreleased
 
+### Changed
+
+- No change a Host can see. The inputs moved for the Zig `SessionHost`'s model
+  resolution and submission journal (#445: tier names and the provider guard
+  through `Options.models`, `config_changed` lines, a worded
+  `message_rejected`), which the main project's daemon and network Hosts use
+  and ABI revision 28 does not expose; the CLI's `/model` and the daemon's
+  messages now share that rule (`api/model_availability.zig`).
+
 ## 0.15.0 — 2026-11-13
 
 ### Added

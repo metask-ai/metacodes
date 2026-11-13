@@ -120,6 +120,7 @@ pub const model_adapter = @import("api/model_adapter.zig");
 pub const time_context = @import("core/time_context.zig"); // date + time zone for the model (#276)
 pub const image_capability = @import("api/image_capability.zig");
 pub const model_tiers = @import("api/model_tiers.zig");
+pub const model_availability = @import("api/model_availability.zig"); // tier names + provider guard, shared by /model, web/daemon messages and SessionHost (#445)
 pub const client_mod = client; // alias for L2 component tests
 pub const api_api_keys = api_keys_mod;
 pub const api_model_error = @import("api/model_error.zig"); // L2 provider lifecycle tests read the structured failure detail

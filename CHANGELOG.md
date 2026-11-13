@@ -10,6 +10,31 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- **A `SessionHost` submission's own `model` and `permission_mode` are
+  journaled as the daemon journals a message's fields** (part of #445). The
+  driver writes a `config_changed` line for each one it applies, where
+  0.12.0 wrote the `command_result` of `set_model` and
+  `set_permission_mode`. When either is refused, `message_rejected` says why
+  in the daemon's words, for example `model not available for current
+  provider` or `bypassPermissions is disabled by settings`, where 0.12.0
+  named the error.
+
+### Added
+
+- **`SessionHost` resolves model names as the daemon does, when the Host
+  asks** (part of #445). With the new `Options.models` (a
+  `session_host.ModelPolicy`: a borrowed `model_tiers.TierTable` and the
+  provider catalogs' models), a `Submission.model` or `set_model` name is
+  trimmed, a tier name (`low`/`mid`/`high`, `haiku`/`sonnet`/`opus`)
+  resolves through the Session's provider's tiers, and a model that
+  provider does not take (another provider's id, an unset tier) is
+  refused: `message_rejected` with `model not available for current
+  provider`, or `command_result` with `ModelUnavailable`. The rule
+  (`api/model_availability.zig`) is the one `--web`/`serve` messages and
+  `/model` use. Without `Options.models` a name is taken as before.
+
 ### Fixed
 
 - **The log-capture tests no longer read another shard's log** (#472).
