@@ -146,6 +146,10 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "PathTraversal", .code = .path_traversal, .category = .safety, .recoverable = false },
     .{ .name = "DangerousCommand", .code = .dangerous_command, .category = .safety, .recoverable = false },
     .{ .name = "PermissionDenied", .code = .permission_denied, .category = .safety, .recoverable = false },
+    // A permission prompt that timed out or was cancelled before anyone
+    // answered (#463): still a deny, but nobody refused, so asking again may
+    // get an answer. A real deny stays PermissionDenied (recoverable: false).
+    .{ .name = "PermissionPromptUnanswered", .code = .permission_denied, .category = .safety, .recoverable = true },
     .{ .name = "ToolPolicyDenied", .code = .permission_denied, .category = .safety, .recoverable = false },
     .{ .name = "PreToolUseBlocked", .code = .permission_denied, .category = .safety, .recoverable = false },
     .{ .name = "ProjectRuleBlocked", .code = .project_rule_blocked, .category = .safety, .recoverable = false },

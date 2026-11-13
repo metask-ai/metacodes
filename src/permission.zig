@@ -183,15 +183,19 @@ pub fn checkPermissionClassified(
     return decision_mod.checkClassified(&d_ctx, tool_name, args, category);
 }
 
+/// Why a permission prompt ended with nobody's answer; see `prompt.Unanswered`.
+pub const PromptUnanswered = prompt_mod.Unanswered;
+
 /// 询问用户(有副作用:写 session 记忆 / 落盘)。ctx 非 const,见 prompt.ask 线程契约。
-pub fn promptUser(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+/// `false` is a person's deny; a `PromptUnanswered` error is a deny nobody gave.
+pub fn promptUser(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) PromptUnanswered!bool {
     return prompt_mod.ask(ctx, tool_name, args);
 }
 
 /// A confirmation the `confirm_gate` demanded: the same prompt, but a
 /// remembered "allow always" for the tool does not answer it (a remembered
 /// deny still does). See permission/confirm_gate.zig.
-pub fn promptUserForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+pub fn promptUserForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) PromptUnanswered!bool {
     return prompt_mod.askForced(ctx, tool_name, args);
 }
 

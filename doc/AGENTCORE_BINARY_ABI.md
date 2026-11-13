@@ -2435,10 +2435,16 @@ permission deny.
 AgentCore sets `no_interactive_prompt` as an absolute input-ownership boundary.
 After an unavailable, cancelled, or failed UI callback it never reads a process
 answer queue or stdin. Public provenance preserves the typed callback outcome.
-The current shared bool prompt seam still renders non-answered permission
-outcomes to the model as the same ordinary deny Tool result; consumers that
-need the distinction must use `permission_provenance` until a shared typed
-prompt-outcome contract replaces that seam.
+The Tool result the model reads tells a non-answer from a person's deny
+([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#14-requests-nobody-answered), #463): a
+permission request with no `on_ui_request`, or answered
+`METASK_AGENTCORE_UI_UNAVAILABLE`, reads *"'\<tool\>' was denied without
+asking: this session has no way to ask for permission and wait for the
+answer. …"*, while a Host's `deny_once`/`deny_session` response still reads
+*"user declined '\<tool\>' via prompt"*. Both keep `code` `permission_denied`
+and `recoverable: false`. The C ABI's types, statuses and callback contract
+are unchanged; `permission_provenance` remains the typed record of the
+callback outcome.
 
 ### Completion boundary
 

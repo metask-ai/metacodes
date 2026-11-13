@@ -1253,6 +1253,23 @@ fn adoptRunInputs(
     }
 }
 
+/// The tool result for a permission prompt that ended with nobody's answer
+/// (doc/WIRE_PROTOCOL.md §1.4). It never says the user declined; `code`
+/// stays `permission_denied` and the call never runs. A timeout or a
+/// cancellation is recoverable: asking again may get an answer. No Host
+/// setting (such as the timeout's length) enters the text, so these bytes do
+/// not change with configuration.
+fn unansweredPromptJson(cause: permission_mod.PromptUnanswered, tool: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    return switch (cause) {
+        error.PromptUnrenderable => tool_error.errorToJson("PermissionDenied", "'{s}' was denied without asking: the frontend connected to this session cannot render permission prompts (it declared that it does not render permission requests). This is not the user's decision; the user never saw the request.", .{tool}, allocator),
+        error.PromptTimedOut => tool_error.errorToJson("PermissionPromptUnanswered", "'{s}' did not run: nobody answered its permission request in time. The user did not decline it; you may offer to ask again.", .{tool}, allocator),
+        error.PromptCancelled => tool_error.errorToJson("PermissionPromptUnanswered", "'{s}' did not run: an interrupt or a close cancelled its permission request before anyone answered. The user did not decline it; you may offer to ask again.", .{tool}, allocator),
+        error.PromptAnswerUnreadable => tool_error.errorToJson("PermissionDenied", "'{s}' was denied: an answer to its permission request arrived but could not be read. This is not the user's decision.", .{tool}, allocator),
+        error.PromptNobodyToAsk => tool_error.errorToJson("PermissionDenied", "'{s}' was denied without asking: this session has no way to ask for permission and wait for the answer. This is not the user's decision; the user never saw the request.", .{tool}, allocator),
+        error.PromptRequestFailed => tool_error.errorToJson("PermissionDenied", "'{s}' was denied: its permission request failed before anyone answered. This is not the user's decision.", .{tool}, allocator),
+    };
+}
+
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
 /// 收集事件到 assistant message 里（text 和 tool_use blocks），
 /// 如果有 tool_use 则执行、追加 tool_result 到 conversation，继续下一轮。
@@ -3782,24 +3799,25 @@ fn runCounted(
                     // R2-3:传 canonical_name——ask 记忆(rememberAllow/Deny)与决策链读取
                     // (decisionFor)必须同键,否则 "always deny" 存 "bash" 键、后续按 "Bash"
                     // 查不到,session deny 被 settings allow 越过。
-                    // Every failure denies. PromptUnrenderable is the one that
-                    // asked nobody: the connected frontend declared it cannot
-                    // render permission prompts (doc/WIRE_PROTOCOL.md §2.2).
-                    var unrenderable = false;
+                    // Every failure denies. `false` is a person's deny; an
+                    // error is a deny nobody gave, and the model is told why
+                    // instead of that the user declined (#463,
+                    // doc/WIRE_PROTOCOL.md §1.4).
+                    var unanswered: ?permission_mod.PromptUnanswered = null;
                     const prompted = if (forced_confirm)
                         permission_mod.promptUserForced(@constCast(permission_ctx), canonical_name, eff_input)
                     else
                         permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input);
                     const allowed = prompted catch |err| blk: {
-                        unrenderable = err == error.PromptUnrenderable;
+                        unanswered = err;
                         break :blk false;
                     };
                     policy_allowed = allowed;
-                    log.infoId("permission", rid, "prompt tool={s} user_allowed={} unrenderable={}", .{ tu.name, allowed, unrenderable });
+                    log.infoId("permission", rid, "prompt tool={s} user_allowed={} unanswered={s}", .{ tu.name, allowed, if (unanswered) |cause| @errorName(cause) else "-" });
                     if (!allowed) {
                         slot.decision = .denied;
-                        slot.content = if (unrenderable)
-                            try tool_error.errorToJson("PermissionDenied", "'{s}' was denied without asking: the frontend connected to this session cannot render permission prompts (it declared that it does not render permission requests). This is not the user's decision; the user never saw the request.", .{tu.name}, allocator)
+                        slot.content = if (unanswered) |cause|
+                            try unansweredPromptJson(cause, tu.name, allocator)
                         else
                             try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
                         slot.is_error = true;

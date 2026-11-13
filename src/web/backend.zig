@@ -275,7 +275,7 @@ pub const WebBackend = struct {
                 self.pending_id = 0;
                 self.unlock();
                 self.announceClosed(id, .cancelled);
-                return wire.cancelResponse(req, out);
+                return wire.cancelResponse(req, .cancelled);
             };
             _ = self.cond.timedWait(&self.mutex, 200 * std.time.ns_per_ms);
         }
@@ -290,13 +290,13 @@ pub const WebBackend = struct {
 
         if (cancelled) {
             self.announceClosed(id, .cancelled);
-            return wire.cancelResponse(req, out);
+            return wire.cancelResponse(req, .cancelled);
         }
-        const reading = wire.parseResponse(req, resp_json, allocator, out) catch |err| {
-            self.announceClosed(id, if (err == error.InputAborted) .malformed else .cancelled);
+        wire.parseResponse(req, resp_json, allocator, out) catch |err| {
+            self.announceClosed(id, wire.closedOnParseError(err));
             return err;
         };
-        self.announceClosed(id, reading.closed());
+        self.announceClosed(id, .answered);
         return .answered;
     }
 
@@ -433,9 +433,8 @@ test "requester: abort 中断等待 → permission 安全 deny + cancelled 事�
     const r = wb.requester();
     const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var resp: UiResponse = undefined;
-    const outcome = try r.request(SessionId.single, testing.allocator, &req, &resp);
-    try testing.expectEqual(RequestOutcome.answered, outcome);
-    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
+    // Denied as cancelled (#463), not as the user's deny_once answer.
+    try testing.expectError(error.UiRequestCancelled, r.request(SessionId.single, testing.allocator, &req, &resp));
 
     const all = (try j.waitSince(testing.allocator, 0, 10)).?;
     defer {
@@ -509,8 +508,7 @@ test "requester: 与中断赛跑的应答作废,按取消处理并记 cancelled"
     defer t.join();
     const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var resp: UiResponse = undefined;
-    try testing.expectEqual(RequestOutcome.answered, try wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
-    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
+    try testing.expectError(error.UiRequestCancelled, wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
     const all = (try j.waitSince(testing.allocator, 0, 10)).?;
     defer {
         for (all) |l| testing.allocator.free(l);
@@ -536,8 +534,7 @@ test "requester: 读不懂的应答按取消处理,记 malformed 而非 answered
     defer t.join();
     const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var resp: UiResponse = undefined;
-    try testing.expectEqual(RequestOutcome.answered, try wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
-    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
+    try testing.expectError(error.UiAnswerUnreadable, wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
     const all = (try j.waitSince(testing.allocator, 0, 10)).?;
     defer {
         for (all) |l| testing.allocator.free(l);

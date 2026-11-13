@@ -119,6 +119,16 @@ fn pendingRequestId(journal: *EventJournal) !u64 {
     return id orelse error.NoRequest;
 }
 
+/// Whether provider request `index` carries `text` (the model read it).
+fn modelRead(server: *harness.MockServer, index: usize, text: []const u8) !bool {
+    const request = server.requestAt(index) orelse return error.NoRequestCaptured;
+    return std.mem.indexOf(u8, request.body(), text) != null;
+}
+
+const TIMED_OUT_TEXT = "'Write' did not run: nobody answered its permission request in time. The user did not decline it; you may offer to ask again.";
+const CANCELLED_TEXT = "'Write' did not run: an interrupt or a close cancelled its permission request before anyone answered. The user did not decline it; you may offer to ask again.";
+const UNREADABLE_TEXT = "'Write' was denied: an answer to its permission request arrived but could not be read. This is not the user's decision.";
+
 fn baseConfig(url: []const u8, workspace: []const u8, home: []const u8, tools: []const []const u8) cc.agent_session.SessionConfig {
     return .{
         .provider_kind = .anthropic,
@@ -455,6 +465,14 @@ test "L2 SessionHost interrupt releases a pending prompt and stops the Run" {
     try std.testing.expect(!try exists(workspace, "never.txt"));
     try std.testing.expectError(error.NoSuchRequest, hosted.respond(request_id, "{\"choice\":\"allow_once\"}"));
     try std.testing.expectEqual(cc.session_host.InterruptOutcome.no_run, hosted.interrupt());
+
+    // #463: the journal says cancelled and so does the transcript. The next
+    // Run's request carries the denied call as cancelled, not declined.
+    try hosted.submit(.{ .text = "and now?" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expect(try modelRead(server, 1, CANCELLED_TEXT));
+    try std.testing.expect(try modelRead(server, 1, "\\\"recoverable\\\":true"));
+    try std.testing.expect(!try modelRead(server, 1, "user declined"));
 }
 
 /// Watches the window between an interrupt's (or close's) decision to cancel
@@ -610,6 +628,9 @@ test "L2 SessionHost an unreadable answer denies the prompt and closes it as mal
     try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"malformed\""));
     try std.testing.expect(!try exists(workspace, "garbled.txt"));
+    // #463: journaled malformed, read by the model as unreadable.
+    try std.testing.expect(try modelRead(server, 1, UNREADABLE_TEXT));
+    try std.testing.expect(!try modelRead(server, 1, "user declined"));
 }
 
 const FatalTool = struct {
@@ -789,6 +810,11 @@ test "L2 SessionHost options: UI timeout, queue bound, turn limit, no transcript
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"cancelled\""));
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
     try std.testing.expect(!try exists(workspace, "unanswered.txt"));
+    // #463: the model reads that nobody answered in time (recoverable), not
+    // that the user declined.
+    try std.testing.expect(try modelRead(server, 1, TIMED_OUT_TEXT));
+    try std.testing.expect(try modelRead(server, 1, "\\\"recoverable\\\":true"));
+    try std.testing.expect(!try modelRead(server, 1, "user declined"));
 
     // One queued item at most; the driver holds Run 2 while 3 waits.
     var bounded = SessionHost.init(a, runtime, .{ .max_queued = 1, .max_turns = 1, .transcripts = false });

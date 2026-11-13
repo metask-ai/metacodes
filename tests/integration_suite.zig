@@ -139,6 +139,7 @@ test {
     _ = @import("component/gemini_provider_test.zig");
     _ = @import("component/background_main_test.zig");
     _ = @import("component/suspend_resume_test.zig");
+    _ = @import("component/permission_unanswered_test.zig");
     _ = @import("component/diff_highlight_test.zig");
     _ = @import("component/prompt_override_test.zig");
     _ = @import("component/web_ui_test.zig");

@@ -135,6 +135,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A permission prompt nobody answered no longer reaches the model as
+  "user declined"** (#463). A `SessionHost` timeout, an interrupt or close, an
+  unreadable answer, a requester that answers `pending` or `unavailable` or
+  fails, and a headless run with nobody to ask each read as what happened
+  ([doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md) §1.4); a timeout or a
+  cancellation is `recoverable: true`. Every case still denies with `code`
+  `permission_denied`, and a person's deny keeps its exact bytes. For Zig
+  Hosts: `wire.cancelResponse(request, why)` replaces
+  `cancelResponse(request, out)` and fails a permission prompt with a
+  `ui_request.Unanswered` error instead of answering `deny_once`;
+  `wire.parseResponse` returns `void` and fails an unreadable permission
+  answer with `UiAnswerUnreadable` (journal it with
+  `wire.closedOnParseError`). Wire lines are unchanged.
 - **A model request is retried once after a transient stream interruption,
   even after partial output** (#461). A gateway stream that returned HTTP 200,
   streamed some text or thinking and then dropped ended the Run with
