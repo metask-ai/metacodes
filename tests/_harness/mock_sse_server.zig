@@ -116,7 +116,7 @@ pub const MockServer = struct {
     gzip_unasked: bool = false,
     /// Set by serveLoop: the 200 body being sent goes out gzip-encoded.
     current_response_gzip: bool = false,
-    /// 200 responses sent gzip-encoded so far.
+    /// 200 responses sent gzip-encoded so far, each counted before its head.
     gzip_responses: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 停机标志:stop() 先置位、再自连唤醒 accept。Windows 上 closesocket **不可靠唤醒**
     /// 已阻塞的 accept(实测 join 永挂,竞态:线程先进 accept 则挂);POSIX close 同样无保证。
@@ -712,11 +712,13 @@ pub const MockServer = struct {
         compress.writer.writeAll(self.body) catch return;
         compress.finish() catch return;
 
+        // Counted before the head: a client that refuses the coding fails on
+        // the head and can read the count before this thread runs again.
+        _ = self.gzip_responses.fetchAdd(1, .release);
         sendAll(conn, header);
         sendAll(conn, "content-encoding: gzip\r\n");
         sendAll(conn, self.extra_response_headers);
         sendAll(conn, "\r\n");
-        _ = self.gzip_responses.fetchAdd(1, .release);
         if (!tryWriteChunk(conn, out.written())) return;
         sendAll(conn, "0\r\n\r\n");
     }
