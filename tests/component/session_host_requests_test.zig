@@ -1295,3 +1295,44 @@ test "L2 #446 SessionHost: an unreadable answer closes malformed under its appro
         try std.testing.expect(std.mem.indexOf(u8, resumed, "AskUserQuestion failed with InputAborted") != null);
     }
 }
+
+test "L2 #446 SessionHost expiry: a permission prompt the interrupt expiry ends reads as unanswered in time, not as cancelled" {
+    const a = std.testing.allocator;
+    var dirs: Dirs = undefined;
+    try dirs.init();
+    defer dirs.tmp.cleanup();
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &TOOLS });
+    defer runtime.destroy() catch unreachable;
+    const path = try std.fmt.allocPrint(a, "{s}/expired.txt", .{dirs.workspace});
+    defer a.free(path);
+    const write = try writeToolSse(a, path);
+    defer a.free(write);
+    const done = try textSse(a, "asked again");
+    defer a.free(done);
+    const bodies = [_][]const u8{ write, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .ui_request_timeout_ms = 100, .ui_request_expiry = .interrupt });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, dirs.workspace, dirs.home) });
+    defer host.release(hosted);
+
+    try hosted.submit(.{ .text = "write it" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"cancelled\"}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"stop_reason\":\"aborted\""));
+    try std.testing.expect(!try exists(dirs.workspace, "expired.txt"));
+
+    // The expiry stopped the Run, but nobody interrupted the prompt: the
+    // next Run's model reads that nobody answered in time (#463's timeout
+    // text, doc/WIRE_PROTOCOL.md §1.4), which invites asking again.
+    try hosted.submit(.{ .text = "and now?" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    const next = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, next, "'Write' did not run: nobody answered its permission request in time. The user did not decline it; you may offer to ask again.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next, "\\\"recoverable\\\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next, "an interrupt or a close cancelled") == null);
+    try std.testing.expect(std.mem.indexOf(u8, next, "user declined") == null);
+}

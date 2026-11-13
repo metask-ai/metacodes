@@ -133,10 +133,11 @@ status, compatibility boundaries, and entry points are defined by
   (`error.AlreadyAnswered`); `--web` and `serve` record a valid `by` as well.
   `SessionHost.Options.ui_request_expiry` says what a request
   `ui_request_timeout_ms` leaves unanswered gets: `.cancel` (the default, as
-  before), `.interrupt` (the Run stops too) or `.re_announce` (the same
-  `ui_request` line again every period, so a zero timeout is refused,
-  `error.InvalidUiRequestTimeout`). Work queued while a request is open
-  waits behind it, and `Snapshot.queue_waiting` says why. With
+  before), `.interrupt` (the Run stops too; an expired permission prompt
+  still reads as unanswered in time, doc/WIRE_PROTOCOL.md §1.4) or
+  `.re_announce` (the same `ui_request` line again every period, so a zero
+  timeout is refused, `error.InvalidUiRequestTimeout`). Work queued while a
+  request is open waits behind it, and `Snapshot.queue_waiting` says why. With
   `Options.ui_request_wait = .suspend`, a question or custom UI request ends
   its Run `suspended` instead of holding the driver: the Session's directory
   keeps it, `close` leaves it there, `open(.resume)` announces it again under

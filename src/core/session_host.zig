@@ -119,8 +119,9 @@ pub const Options = struct {
     ui_request_expiry: UiRequestExpiry = .cancel,
     /// How long a UI request waits for `respond`. Null waits until
     /// `interrupt` or `close`. An expired request gets `ui_request_expiry`;
-    /// a permission prompt it closes is denied, and the model reads why
-    /// (doc/WIRE_PROTOCOL.md §1.4). The value never reaches the model.
+    /// a permission prompt it closes is denied, and the model reads that
+    /// nobody answered in time (doc/WIRE_PROTOCOL.md §1.4). The value never
+    /// reaches the model.
     ui_request_timeout_ms: ?u64 = null,
     /// How long after its Run started an idempotency key still makes a
     /// delivery a duplicate. With `transcripts`, the keys outlive the Host:
@@ -279,7 +280,8 @@ pub const UiRequestExpiry = enum {
     /// aborted) and the Run goes on without the answer.
     cancel,
     /// As `cancel`, and the Run stops there, as after `interrupt`, instead of
-    /// going on without the answer.
+    /// going on without the answer. A permission prompt still reads as
+    /// unanswered in time, not as interrupted: nobody stopped the prompt.
     interrupt,
     /// The request is announced again, the same line under the same id, and
     /// waits another `ui_request_timeout_ms`; again until it is answered,
@@ -1416,9 +1418,13 @@ pub const HostedSession = struct {
         const response = self.takeResponseLocked();
         const by = self.response_by;
         self.response_by = null;
-        // No answer: an interrupt or close in force cancelled it (and
-        // discarded any answer that raced it); otherwise the deadline passed.
-        const why: wire.NoAnswer = if (self.ui_released or self.run_interrupted or self.closing)
+        // No answer: the deadline passed, also under `.interrupt`, whose stop
+        // follows from it (nobody interrupted the prompt); else an interrupt
+        // or close in force cancelled it (and discarded any answer that
+        // raced it); else the deadline passed.
+        const why: wire.NoAnswer = if (expired_stop)
+            .timed_out
+        else if (self.ui_released or self.run_interrupted or self.closing)
             .cancelled
         else
             .timed_out;
