@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.12.0 — 2026-11-13
+
 ### Changed
 
 - **Breaking: the `--web`/`serve` event stream is wire v1 throughout** (#444).
