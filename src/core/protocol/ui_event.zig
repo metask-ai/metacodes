@@ -306,10 +306,11 @@ pub const CoreEvent = union(enum) {
     },
 
     /// 流式建连重试提示(第 attempt/max 次,退避 delay_ms)。Also announces a
-    /// same-turn re-issue that `agent_loop.Options.retractable_stream_retries`
-    /// granted after an accepted stream failed with visible output (#452):
-    /// `attempt` counts the Run's failed streams so far, this one included,
-    /// `max` is one more than the Run's re-issue limit, `delay_ms` 0.
+    /// same-turn re-issue after an accepted stream failed with visible output
+    /// (#452, #461): `attempt` counts this request's failed streams so far,
+    /// this one included, `max` is the most attempts the request may make
+    /// (the first, its own re-issue, what is left of the Run's allowance),
+    /// `delay_ms` the backoff before the re-issue is sent.
     retry_notice: struct {
         attempt: u32,
         max: u32,
@@ -360,9 +361,9 @@ pub const CoreEvent = union(enum) {
     /// provider attempt that the loop rolled back and is sending again; a
     /// consumer that kept those chunks removes them, as it drops a `discarded`
     /// segment's text. `bytes` is their total. Emitted right after that
-    /// segment's `output_segment_end` (disposition `discarded`), only for a
-    /// re-issue that `agent_loop.Options.retractable_stream_retries` granted and
-    /// only when the attempt delivered thinking.
+    /// segment's `output_segment_end` (disposition `discarded`), for every
+    /// same-turn re-issue (`agent_loop.STREAM_RETRIES_PER_REQUEST` or a Run
+    /// allowance) and only when the attempt delivered thinking.
     thinking_discarded: struct {
         index: u32,
         turn: u32,

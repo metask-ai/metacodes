@@ -97,7 +97,7 @@ export interface SessionOptions {
 
 export interface RunOptions {
   maxTurns?: number;
-  /** Revision 28: re-issues after a broken-off stream that showed output, 0 to 8 (default 0). */
+  /** Revision 28: re-issues after a broken-off stream, beyond each request's own one (#461), 0 to 8 (default 0). */
   streamRetryBudget?: number;
   onEvent?: (event: AgentEvent) => void;
 }

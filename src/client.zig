@@ -1787,7 +1787,12 @@ pub const StreamResponse = struct {
             .httpStatusFn = &hHttpStatus,
             .retryAttemptFn = &hRetryAttempt,
             .contextWindowNumbersFn = &hContextWindowNumbers,
+            .toolCallStartedFn = &hToolCallStarted,
         };
+    }
+    fn hToolCallStarted(ctx: *anyopaque) bool {
+        const sr: *StreamResponse = @ptrCast(@alignCast(ctx));
+        return sr.iter_initialized and sr.event_iter.tool_call_started;
     }
     fn hContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
         return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).context_window_numbers;

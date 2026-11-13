@@ -1140,12 +1140,24 @@ leaving every Host to rebuild them:
   `swarm_tools.pollLeadInbox`, and a member's reply becomes the lead's next
   Run, queued behind any work already there and journaled like a submission
   without a `trace_id`. The bundled daemon does the same for its `App` lead.
-  Fulfilling the lead's `SpawnTeammate` requests is still the Host's: open a
-  member Session (`.role = .member`) on the same SessionHost.
+- With `Options.teammates` (a `TeammateFactory`), the SessionHost also
+  fulfils the lead's `SpawnTeammate` requests, as the daemon's `App` starts
+  its teammates: after each Run the lead's driver takes the pending requests
+  oldest first, calls `configure(ctx, arena, spawn)` for the member's
+  `SessionConfig` (provider, workspace, tools and permissions are the
+  Host's; `spawn` names the lead, team, member, prompt, `agent_type` and
+  `effort`), opens it on the same SessionHost as a member of the lead's team
+  under the lead's session id and a fresh lease, and submits the prompt as
+  its first Run. The factory returns `team = null` (the SessionHost owns the
+  identity; anything else is refused); a refused or failed spawn is logged
+  and dropped. A name the lead already opened, still open, takes the prompt
+  as its next Run. Closing the lead closes the members it opened. Without a
+  factory the requests stay pending for the Host to fulfil itself (open a
+  `.role = .member` Session).
 
-Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`,
-`ui_request_expiry`, `ui_request_wait`, `idempotency_retention_ms`,
-`idempotency_max_keys`.
+Options: `max_queued`, `max_turns`, `teammates`, `transcripts`,
+`ui_request_timeout_ms`, `ui_request_expiry`, `ui_request_wait`,
+`idempotency_retention_ms`, `idempotency_max_keys`.
 Authentication, tenancy and the transport stay with the Host.
 To stream a Session's journal over SSE, parse the client's position with
 `event_journal.Cursor.fromLastEventId` / `fromSince`, start from
@@ -1254,11 +1266,14 @@ provider's context-window refusal and checkpoint capacity each compact the
 Conversation at a safe boundary and the same Run continues; the summary
 request is budgeted and the replacement commits only if the checkpoint fits —
 the `auto_compact` event and its `cause`), the structured reason a Run stopped
-with `STOP_API_ERROR` (the `model_error` event), the Host-granted stream retry budget
-(`RunOptionsV1.stream_retry_budget`: a Run re-issues a request whose stream broke
-off without an answer after it showed output, and the Host takes back what that
-attempt showed through the `discarded` segment, `thinking_discarded` and
-`retry_notice`), the in-place credential update (`session->update_credential`),
+with `STOP_API_ERROR` (the `model_error` event), each request's own re-issue
+after a stream that broke off without an answer and before any tool call
+started (#461), and the Host-granted stream retry budget beyond it
+(`RunOptionsV1.stream_retry_budget`: a Run re-issues such a request further
+times, after output and a started tool call too); for every re-issue of an
+attempt that showed output the Host takes back what it showed through the
+`discarded` segment, `thinking_discarded` and `retry_notice`, which precedes a
+short cancellable backoff, the in-place credential update (`session->update_credential`),
 edit-and-rerun (`session_control->rewind_to_user_message` and its three refusal statuses), the Session goal (the `goal` table, goal-continuation Runs, the
 `goal_updated` event), the host-scheduled team (`enable_teams`, the `team`
 config, and the `team` table's `describe` and `poll`), the Workspace Skill

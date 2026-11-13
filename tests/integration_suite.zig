@@ -79,11 +79,13 @@ test {
     _ = @import("component/prompt_model_identity_test.zig");
     _ = @import("component/stream_terminator_test.zig");
     _ = @import("component/stream_retractable_retry_test.zig");
+    _ = @import("component/stream_retry_default_test.zig");
     _ = @import("component/max_tokens_exhaustion_test.zig");
     _ = @import("component/time_context_test.zig");
     _ = @import("component/file_change_test.zig");
     _ = @import("component/compound_perm_test.zig");
     _ = @import("component/bash_auto_allow_test.zig");
+    _ = @import("component/grep_option_injection_test.zig");
     _ = @import("component/protected_skill_inject_test.zig");
     _ = @import("component/read_state_test.zig");
     _ = @import("component/symbol_capability_test.zig");

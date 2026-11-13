@@ -5405,6 +5405,9 @@ test "L2 #408 timeout in the body of an accepted stream carries that response's 
     const with_text = std.mem.indexOfPos(u8, FINAL_SSE, second, "\n\n").? + 2;
     var server = try harness.MockServer.startCassetteSilent(&[_][]const u8{FINAL_SSE}, 0, with_text);
     defer server.stop();
+    // Every response stalls after its text, the request's own re-issue (#461)
+    // too, so the Run still ends with the stall's detail.
+    server.silent_from = true;
     server.extra_response_headers = "x-request-id: req-stall-1\r\n";
 
     const a = std.testing.allocator;
@@ -5429,7 +5432,8 @@ test "L2 #408 timeout in the body of an accepted stream carries that response's 
     try std.testing.expect(std.mem.startsWith(u8, got.message, "No model output for "));
 }
 
-/// Text reaches the Host in the half that is sent, so the loop does not resend.
+/// Text reaches the Host in the half that is sent; the request's one re-issue
+/// (#461) is cut the same way.
 const CUT_AFTER_TEXT_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"cut\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
@@ -5967,9 +5971,11 @@ test "L2 #451 a stream that ends before its stop report reaches the Host as stre
             .http_status = 200,
             .request_id = "req-early-1",
             .retry = .retryable,
+            .attempts = 2,
         } });
-        // Output reached the Host before the end, so the turn was not sent again.
-        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+        // Output reached the Host before the end; the request's own re-issue
+        // (#461) ended the same way, and the second failure ends the Run.
+        try std.testing.expectEqual(@as(usize, 2), server.requestCount());
     }
 }
 
@@ -15741,13 +15747,15 @@ test "L2 Revision 28 stream_retry_budget re-issues the issue #452 reproduction a
     try expectIdenticalRequestBodies(server);
     // The withdrawn attempt: its (empty) text segment closes discarded, its
     // thinking is withdrawn under the same segment identity, and the re-issue
-    // is announced like a connection retry: one failed stream of two, at once.
+    // is announced like a connection retry: one failed stream of at most
+    // three (the first attempt, the request's own re-issue, the budget's
+    // one), after the short backoff.
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
             "end 0 turn 1 group 0 discarded 0\n" ++
             "thinking_discarded 0 turn 1 group 0 17\n" ++
-            "retry 1/2 after 0\n" ++
+            "retry 1/3 after 500\n" ++
             "begin 1\n" ++
             "text 4\n" ++
             "end 1 turn 1 group 0 final 4\n",
@@ -15767,7 +15775,7 @@ test "L2 Revision 28 stream_retry_budget re-issues the issue #452 reproduction a
     try std.testing.expect(std.mem.indexOf(u8, followup, "\"done\"") != null);
 }
 
-test "L2 Revision 28 with a zero budget the reproduction ends after one attempt, events and bytes as before" {
+test "L2 issue #461 with zeroed RunOptions the reproduction is re-issued once and the Host takes back what it showed" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -15783,32 +15791,69 @@ test "L2 Revision 28 with a zero budget the reproduction ends after one attempt,
 
     const options = retryBudgetOptions(2, 0);
     const result = try runTextWithOptions(&fixture, 1, "think it through", &options);
-    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expect(!probe.overflow);
-    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try expectIdenticalRequestBodies(server);
+    // Every request has one re-issue of its own: one failed stream of at
+    // most two, announced before the backoff.
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
-            "end 0 turn 1 group 0 discarded 0\n",
+            "end 0 turn 1 group 0 discarded 0\n" ++
+            "thinking_discarded 0 turn 1 group 0 17\n" ++
+            "retry 1/2 after 500\n" ++
+            "begin 1\n" ++
+            "text 4\n" ++
+            "end 1 turn 1 group 0 final 4\n",
         probe.logText(),
     );
-    // Every event the Host receives, in order: nothing new.
+    try std.testing.expectEqualStrings("done", probe.answer[0..probe.answer_len]);
+    try std.testing.expect(probe.saw_retrying);
+    try std.testing.expectEqual(sdk.protocol.RunStatePhase.completed, probe.last_phase.?);
+    try std.testing.expectEqual(@as(?u32, null), probe.model_error_attempts);
+    const next = try fixture.runText(2, "and then");
+    try std.testing.expectEqual(wire.STOP_END_TURN, next.stop_reason_code);
+    const followup = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, followup, "THINKING_SENTINEL") == null);
+}
+
+test "L2 issue #461 with zeroed RunOptions a request cut twice ends api_error after two attempts" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    // The cassette repeats its last body: every attempt drops after thinking.
+    var server = try harness.MockServer.startCassette(&.{RETRY_THINKING_THEN_EOF_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = RetryBudgetProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, RetryBudgetProbe.event);
+    defer fixture.deinit();
+
+    const options = retryBudgetOptions(2, 0);
+    const result = try runTextWithOptions(&fixture, 1, "think it through", &options);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expect(!probe.overflow);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try expectIdenticalRequestBodies(server);
     try std.testing.expectEqualStrings(
-        "run_state:starting\n" ++
-            "prompt_manifest\n" ++
-            "run_state:generating\n" ++
-            "progress\n" ++
-            "output_segment_begin\n" ++
-            "usage\n" ++
-            "thinking_chunk\n" ++
-            "stream_done\n" ++
-            "output_segment_end\n" ++
-            "run_state:finalizing\n" ++
-            "model_error\n" ++
-            "run_state:failed\n",
-        probe.tagText(),
+        "begin 0\n" ++
+            "thinking 17\n" ++
+            "end 0 turn 1 group 0 discarded 0\n" ++
+            "thinking_discarded 0 turn 1 group 0 17\n" ++
+            "retry 1/2 after 500\n" ++
+            "begin 1\n" ++
+            "thinking 17\n" ++
+            // The second failure is not re-issued: no withdrawal, no notice.
+            "end 1 turn 1 group 0 discarded 0\n",
+        probe.logText(),
     );
-    try std.testing.expectEqual(@as(?u32, 1), probe.model_error_attempts);
+    // model_error counts both physical attempts of the failed request.
+    try std.testing.expectEqual(@as(?u32, 2), probe.model_error_attempts);
+    try std.testing.expect(std.mem.endsWith(u8, probe.tagText(), "model_error\nrun_state:failed\n"));
 }
 
 test "L2 Revision 28 the budget never reaches the provider request" {
@@ -15855,28 +15900,34 @@ test "L2 Revision 28 an exhausted budget ends the Run, and model_error counts ev
     const options = retryBudgetOptions(2, 2);
     const result = try runTextWithOptions(&fixture, 1, "think it through", &options);
     try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
-    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    // The first attempt, the request's own re-issue (#461), the budget's two.
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
     try expectIdenticalRequestBodies(server);
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
             "end 0 turn 1 group 0 discarded 0\n" ++
             "thinking_discarded 0 turn 1 group 0 17\n" ++
-            "retry 1/3 after 0\n" ++
+            "retry 1/4 after 500\n" ++
             "begin 1\n" ++
             "thinking 17\n" ++
             "end 1 turn 1 group 0 discarded 0\n" ++
             "thinking_discarded 1 turn 1 group 0 17\n" ++
-            "retry 2/3 after 0\n" ++
+            "retry 2/4 after 500\n" ++
             "begin 2\n" ++
             "thinking 17\n" ++
+            "end 2 turn 1 group 0 discarded 0\n" ++
+            "thinking_discarded 2 turn 1 group 0 17\n" ++
+            "retry 3/4 after 500\n" ++
+            "begin 3\n" ++
+            "thinking 17\n" ++
             // The last attempt is not re-issued: no withdrawal, no notice.
-            "end 2 turn 1 group 0 discarded 0\n",
+            "end 3 turn 1 group 0 discarded 0\n",
         probe.logText(),
     );
     // model_error.attempts counts the physical attempts of the failed request,
     // the re-issues included.
-    try std.testing.expectEqual(@as(?u32, 3), probe.model_error_attempts);
+    try std.testing.expectEqual(@as(?u32, 4), probe.model_error_attempts);
     try std.testing.expectEqual(sdk.protocol.RunStatePhase.failed, probe.last_phase.?);
 }
 
@@ -15996,16 +16047,15 @@ fn runSkillWithRetryBudget(context_line: []const u8, budget: u32) !void {
         &result,
         &fixture.diagnostic,
     ));
-    if (budget == 0) {
-        try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
-        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
-        return;
-    }
+    // Budget or none, the request's own re-issue (#461) recovers the cut; the
+    // budget only raises the most the notice announces.
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
     try expectIdenticalRequestBodies(server);
     const log = probe.logText();
-    try std.testing.expect(std.mem.indexOf(u8, log, "end 0 turn 1 group 0 discarded 0\nthinking_discarded 0 turn 1 group 0 17\nretry 1/2 after 0\n") != null);
+    var expected_buf: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, "end 0 turn 1 group 0 discarded 0\nthinking_discarded 0 turn 1 group 0 17\nretry 1/{d} after 500\n", .{2 + budget});
+    try std.testing.expect(std.mem.indexOf(u8, log, expected) != null);
     try std.testing.expectEqualStrings("done", probe.answer[0..probe.answer_len]);
 }
 

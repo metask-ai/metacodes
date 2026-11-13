@@ -846,12 +846,14 @@ typedef struct {
     /* Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET
      * (METASK_AGENTCORE_MIN/MAX_UTC_OFFSET_MINUTES_V1); zero otherwise. */
     int32_t utc_offset_minutes;
-    /* Revision 28 (#452): how many times this Run may re-issue a request whose
-     * accepted stream failed without an answer (a stall, a stream that ended
-     * before its stop report, a dropped connection) after it showed output,
-     * 0..MAX_STREAM_RETRY_BUDGET_V1. Each such re-issue closes the attempt's
-     * segment `discarded`, withdraws its thinking with `thinking_discarded` and
-     * is announced by `retry_notice`. Zero keeps the Revision 27 behavior. */
+    /* Revision 28 (#452): how many more times this Run may re-issue a request
+     * whose accepted stream failed without an answer (a stall, a stream that
+     * ended before its stop report, a dropped connection) after it showed
+     * output, 0..MAX_STREAM_RETRY_BUDGET_V1, beyond the one re-issue every
+     * request has of its own while it started no tool call (#461). Each
+     * re-issue of an attempt that showed output closes its segment
+     * `discarded`, withdraws its thinking with `thinking_discarded` and is
+     * announced by `retry_notice`. Zero grants nothing beyond that one. */
     uint32_t stream_retry_budget;
     uint32_t reserved0;
 } metask_agentcore_run_options_v1;

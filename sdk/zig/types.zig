@@ -1045,14 +1045,15 @@ pub const RunOptionsV1 = extern struct {
     /// Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET; zero
     /// under any other code.
     utc_offset_minutes: i32,
-    /// Revision 28 (#452): how many times this Run may re-issue a request
-    /// whose accepted stream failed without an answer (a stall, a stream that
-    /// ended before its stop report, a dropped connection) after it showed
-    /// output, 0..MAX_STREAM_RETRY_BUDGET_V1. Each such re-issue closes the
-    /// attempt's segment `discarded`, withdraws its thinking with
-    /// `thinking_discarded` and is announced by `retry_notice`. Zero keeps the
-    /// Revision 27 behavior: only an attempt that showed nothing is re-issued,
-    /// once.
+    /// Revision 28 (#452): how many more times this Run may re-issue a
+    /// request whose accepted stream failed without an answer (a stall, a
+    /// stream that ended before its stop report, a dropped connection) after
+    /// it showed output, 0..MAX_STREAM_RETRY_BUDGET_V1, beyond the one
+    /// re-issue every request has of its own while it started no tool call
+    /// (#461). Each re-issue of an attempt that showed output closes its
+    /// segment `discarded`, withdraws its thinking with `thinking_discarded`
+    /// and is announced by `retry_notice`. Zero grants nothing beyond that
+    /// one.
     stream_retry_budget: u32,
     reserved0: u32,
 };
