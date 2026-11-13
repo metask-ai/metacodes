@@ -149,8 +149,9 @@ pub const HostEvent = union(enum) {
     /// is what the command reports for a person (`--web`/`serve`: its outcome
     /// or a shell command's output); SessionHost has none.
     command_result: struct { command: []const u8, ok: bool, error_name: ?[]const u8 = null, message: ?[]const u8 = null },
-    /// A message (`--web`/`serve` `POST /message`, UDS `message`) started no
-    /// Run: its `model` or `permission_mode` was refused, neither was applied
+    /// A message (`--web`/`serve` `POST /message`, UDS `message`; a
+    /// SessionHost `Submission`) started no Run: its `model` or
+    /// `permission_mode` was refused, neither was applied
     /// and its `text` stayed out of the conversation. It takes the place of
     /// that message's `user_message`. `model` and `permission_mode` repeat
     /// what the message asked for (null when not given; the mode in the

@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.12.0 — 2026-11-13
+
 ### Changed
 
 - **Breaking: the `--web`/`serve` event stream is wire v1 throughout** (#444).
@@ -93,6 +95,17 @@ status, compatibility boundaries, and entry points are defined by
   (`Session.rewind_to_user_message`) and Node (`Session.rewindToUserMessage`)
   packages and the source-free consumers move to revision 27; AgentCore
   0.15.0-dev.
+- **A `SessionHost` submission may carry its own `model` and
+  `permission_mode`** (part of #445), as a `--web`/`serve` message does.
+  The driver applies them just before the Run, journaled as the
+  `command_result` of `set_model` and `set_permission_mode`, and they stay
+  the Session's settings. The mode is checked first, so when either is
+  refused nothing is applied, no Run starts and `message_rejected` (now
+  written by both Hosts) takes the place of `user_message`, naming the
+  error; the submission's idempotency key is not spent. Before, an
+  embedder had to queue the two commands itself and could not refuse the
+  text together with them.
+
 - **`SessionHost` feeds a team lead its teammates' replies** (part of #445).
   A lead Session (`SessionConfig.team` with the lead role) hosted on
   `core/session_host.zig` never saw a member's `SendMessage`: the inbox is
@@ -272,6 +285,20 @@ status, compatibility boundaries, and entry points are defined by
   already treated it. The retry, the attempt count and the empty detail after a
   retry that succeeds are unchanged; a local decode failure such as an
   oversized SSE line stays `unknown`.
+
+- **A provider that compresses its answer no longer breaks the request**
+  (#467). A std.http request offers `accept-encoding: gzip, deflate` by
+  default and accepts either in the response head, but every body in `src/`
+  is read as sent: `Response.reader` and `Reader.bodyReader` do not decode.
+  DeepSeek takes the offer, so its SSE reached the line reader as gzip, no
+  event parsed, and every attempt ended as `StreamIncomplete` (the Run as
+  `api_error`). The four streaming model clients (Messages, OpenAI-compatible,
+  Gemini, Bedrock) no longer offer it (#468). And every request in `src/`,
+  which sends through `api/http_connection.zig`, now accepts the identity
+  coding only. A request that left the header at std's default says
+  `accept-encoding: identity`, as the OAuth, telemetry and catalog requests
+  do. A server or gateway that compresses anyway fails in `receiveHead`
+  (`HttpContentEncodingUnsupported`) instead of handing gzip to a parser.
 
 ### Security
 

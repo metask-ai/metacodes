@@ -1063,7 +1063,7 @@ leaving every Host to rebuild them:
   Session's state root). A fresh open under an id that has a transcript
   replaces that transcript at once. `open` and `acquire` return a counted
   reference; `release` gives it back.
-- `HostedSession.submit(.{ .text, .trace_id, .replaces })` queues a Run.
+- `HostedSession.submit(.{ .text, .trace_id, .replaces, .model, .permission_mode })` queues a Run.
   With `.replaces` (a `conversation.MessagePosition`, from
   `MessagePosition.fromOrdinal(n)`), the text replaces user message `n`: just
   before the Run the driver drops that message and everything after it
@@ -1101,6 +1101,18 @@ leaving every Host to rebuild them:
   (`IdempotencyKeyNotRecorded`) and stays unspent. At most
   `idempotency_max_keys` (10 000) started keys are kept; the oldest goes
   first.
+- A submission may carry its own `model` and `permission_mode` (#445), as a
+  `--web`/`serve` message does: the driver applies them just before the
+  Run, as `set_model` then `set_permission_mode` queued right ahead of it
+  would, and journals each as that command's `command_result` before the
+  Run's `user_message`. They stay the Session's settings afterwards. The
+  mode is checked first (`AgentSession.setPermissionMode`'s check), so
+  when either is refused (`PermissionModeDisabled`, or the model's
+  `InvalidModel` or provider error) nothing is applied, the text stays out
+  of the conversation, no Run starts, and `message_rejected` takes the
+  place of `user_message`, its `message` the error name. Its idempotency
+  key is not spent; `model` and `permission_mode` are not part of what a
+  key compares.
 - The queue holds `max_queued` (64) submissions and commands. Beyond it
   `submit` and `command` refuse with `error.QueueFull` and hold nothing (an
   HTTP Host: `429`); a duplicate is answered as one before the bound is
@@ -1111,9 +1123,9 @@ leaving every Host to rebuild them:
   driver thread, so configuration changes apply between Runs in the order
   they were queued.
 - Every kernel event, host event (`user_message`, `run_done`,
-  `command_result`, `session_poisoned`, `run_resumed`) and UI request lands
-  in the Session's `journal` as a wire line; CoreEvents carry `run_id` and
-  the submission's `trace_id`. `respond(id, json)` answers a UI request, and
+  `command_result`, `message_rejected`, `session_poisoned`, `run_resumed`)
+  and UI request lands in the Session's `journal` as a wire line;
+  CoreEvents carry `run_id` and the submission's `trace_id`. `respond(id, json)` answers a UI request, and
   may name who answered (`"by"`); anything but an open request is
   `error.NoSuchRequest`, a second answer to one that has not yet applied its
   first is `error.AlreadyAnswered`, and neither changes anything (see UI

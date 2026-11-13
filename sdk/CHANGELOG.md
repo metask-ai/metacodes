@@ -14,6 +14,8 @@ empty `### Migration`.
 
 ## Unreleased
 
+## 0.15.0 — 2026-11-13
+
 ### Added
 
 - Edit and rerun (#441): `session_control->rewind_to_user_message(session,

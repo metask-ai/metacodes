@@ -1361,3 +1361,153 @@ test "L2 #445 SessionHost: a lead that keeps re-spawning a failing name stops af
     try std.testing.expectEqual(cc.session_host.Phase.idle, snap.phase);
     try std.testing.expectEqual(@as(usize, 0), snap.queued);
 }
+
+/// The `type` of each host line in `journal`, in order, joined by spaces;
+/// kernel events are left out.
+fn hostLineTypes(journal: *EventJournal, out: []u8) ![]const u8 {
+    const a = std.testing.allocator;
+    const lines = (try journal.waitSince(a, 0, 1)) orelse return out[0..0];
+    defer {
+        for (lines) |line| a.free(line);
+        a.free(lines);
+    }
+    var len: usize = 0;
+    for (lines) |line| {
+        inline for (.{ "user_message", "run_done", "command_result", "message_rejected" }) |tag| {
+            if (std.mem.indexOf(u8, line, "\"type\":\"" ++ tag ++ "\"") != null) {
+                const written = try std.fmt.bufPrint(out[len..], "{s}{s}", .{ if (len == 0) "" else " ", tag });
+                len += written.len;
+            }
+        }
+    }
+    return out[0..len];
+}
+
+test "L2 #445 SessionHost: a submission's own model and permission mode apply before its Run, as the daemon's POST /message takes them" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const path = try std.fmt.allocPrint(a, "{s}/m.txt", .{workspace});
+    defer a.free(path);
+    const write = try writeToolSse(a, path);
+    defer a.free(write);
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ write, done, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    // Default mode: without the message's own mode, the Write would ask.
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{"Write"}) });
+    defer host.release(hosted);
+
+    try hosted.submit(.{ .text = "write it", .model = "message-model", .permission_mode = .accept_edits });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+
+    // The Run ran on the message's model and mode: the provider got that
+    // model, and the edit did not ask.
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"message-model\""));
+    try std.testing.expect(!try modelRead(server, 0, "test-model"));
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"ui_request\""));
+    try std.testing.expect(try exists(workspace, "m.txt"));
+    // Journaled as the two commands queued ahead of it would be, before the
+    // Run's first line.
+    var types_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("command_result command_result user_message run_done", try hostLineTypes(&hosted.journal, &types_buf));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"command\":\"set_model\",\"ok\":true"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"command\":\"set_permission_mode\",\"ok\":true"));
+
+    // They are the Session's settings from then on.
+    try hosted.submit(.{ .text = "and now" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expect(try modelRead(server, 2, "\"model\":\"message-model\""));
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("message-model", snapshot.model);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.accept_edits, snapshot.permission_mode);
+    try std.testing.expectEqual(cc.session_host.Phase.idle, snapshot.phase);
+}
+
+test "L2 #445 SessionHost: a submission whose mode or model is refused is message_rejected: nothing applied, no Run, its key not spent" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{done};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{}) });
+    defer host.release(hosted);
+
+    // Settings that disable bypass, as a settings-bearing Session has them
+    // (a hosted Session's imported rule layer has no mode switches). Put on
+    // before the first submission, which the driver takes under the
+    // Session's lock.
+    const no_rules: []const cc.permission_settings.Rule = &.{};
+    const layers = [_]cc.permission_settings.Layer{.{
+        .source = .host,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+    }};
+    const disabling = cc.permission_settings.MergedSettings{ .layers = &layers, .allocator = a };
+    const imported = hosted.session.permission_ctx.settings;
+    hosted.session.permission_ctx.settings = &disabling;
+    defer hosted.session.permission_ctx.settings = imported;
+
+    // A disabled mode: the model it came with is not switched either.
+    try hosted.submit(.{ .text = "first try", .model = "other-model", .permission_mode = .bypass_permissions, .idempotency_key = "im:evt-1" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"PermissionModeDisabled\",\"text\":\"first try\",\"model\":\"other-model\",\"permission_mode\":\"bypass_permissions\"}}"));
+    // A model the Session cannot take.
+    try hosted.submit(.{ .text = "second try", .model = "" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"InvalidModel\",\"text\":\"second try\",\"model\":\"\",\"permission_mode\":null"));
+
+    var rejected = try hosted.snapshot(a);
+    defer rejected.deinit(a);
+    try std.testing.expectEqualStrings("test-model", rejected.model);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.default, rejected.permission_mode);
+    try std.testing.expectEqual(cc.session_host.Phase.idle, rejected.phase);
+    try std.testing.expectEqual(@as(usize, 0), rejected.messages);
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    // The rejected delivery started no Run, so its key was not spent: the
+    // same delivery without the refused mode runs, once.
+    try hosted.submit(.{ .text = "first try", .idempotency_key = "im:evt-1" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectError(error.DuplicateSubmission, hosted.submit(.{ .text = "first try", .idempotency_key = "im:evt-1" }));
+    var types_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("message_rejected message_rejected user_message run_done", try hostLineTypes(&hosted.journal, &types_buf));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"test-model\""));
+    try std.testing.expect(!try modelRead(server, 0, "second try"));
+    var ran = try hosted.snapshot(a);
+    defer ran.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), ran.messages);
+}
