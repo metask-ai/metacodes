@@ -1585,13 +1585,97 @@ test "L2 #445 SessionHost Options.models: a tier name resolves and a model the p
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"command\":\"set_model\",\"ok\":true"));
 
     var types_buf: [512]u8 = undefined;
+    // The accepted `set_model` is journaled as the daemon's `/model` is:
+    // `config_changed` with the resolved model, then its `command_result`.
     try std.testing.expectEqualStrings(
         "config_changed user_message run_done message_rejected message_rejected message_rejected " ++
-            "config_changed user_message run_done config_changed user_message run_done command_result command_result",
+            "config_changed user_message run_done config_changed user_message run_done command_result config_changed command_result",
         try hostLineTypes(&hosted.journal, &types_buf),
     );
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"claude-tier-high\"}}"));
     var snapshot = try hosted.snapshot(a);
     defer snapshot.deinit(a);
     try std.testing.expectEqualStrings("claude-tier-high", snapshot.model);
     try std.testing.expectEqual(@as(usize, 6), snapshot.messages);
+}
+
+test "L2 #445 SessionHost config sink: each accepted configuration command journals config_changed before its command_result, as the daemon's /model, /mode, /effort and /add-dir" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    var extra_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const extra = try subdir(&tmp, "extra", &extra_buf);
+    var extra2_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const extra2 = try subdir(&tmp, "extra2", &extra2_buf);
+
+    const path = try std.fmt.allocPrint(a, "{s}/c.txt", .{extra2});
+    defer a.free(path);
+    const write = try writeToolSse(a, path);
+    defer a.free(write);
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ write, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{"Write"}) });
+    defer host.release(hosted);
+
+    // A refused command changes nothing, so no line says anything changed.
+    try hosted.command(.{ .set_model = "" });
+    try hosted.command(.{ .set_model = "cmd-model" });
+    try hosted.command(.{ .set_permission_mode = .accept_edits });
+    try hosted.command(.{ .set_reasoning_effort = .high });
+    try hosted.command(.{ .set_additional_directories = &.{extra} });
+    // Only the directory that came into force is announced; one taken away
+    // has no line.
+    try hosted.command(.{ .set_additional_directories = &.{ extra, extra2 } });
+    try hosted.command(.{ .set_additional_directories = &.{extra2} });
+    try hosted.submit(.{ .text = "write in the extra directory" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try hosted.command(.{ .set_reasoning_effort = null });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 8);
+
+    var types_buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "command_result config_changed command_result config_changed command_result config_changed command_result " ++
+            "config_changed command_result config_changed command_result command_result user_message run_done " ++
+            "config_changed command_result",
+        try hostLineTypes(&hosted.journal, &types_buf),
+    );
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_model\",\"ok\":false,\"error_name\":\"InvalidModel\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"cmd-model\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"accept_edits\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"reasoning\":\"high\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"reasoning\":null}}"));
+    // The directories as resolved: `extra`, then `extra2` (the one in force
+    // now), each once.
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "\"type\":\"config_changed\",\"data\":{\"dirs\":"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "extra\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), hosted.session.workspace.additional_dirs.len);
+    const in_force = try cc.wire.writeEvent(a, .{ .config_changed = .{ .dirs = hosted.session.workspace.additional_dirs[0] } });
+    defer a.free(in_force);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, in_force));
+
+    // What the lines say is what the Run used: the model and the effort
+    // reached the provider, and the edit in the added directory did not ask.
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"cmd-model\""));
+    try std.testing.expect(try modelRead(server, 0, "\"output_config\":{\"effort\":\"high\"}"));
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"ui_request\""));
+    try std.testing.expect(try exists(extra2, "c.txt"));
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("cmd-model", snapshot.model);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.accept_edits, snapshot.permission_mode);
+    try std.testing.expect(snapshot.reasoning_effort == null);
 }

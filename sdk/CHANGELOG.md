@@ -22,6 +22,9 @@ empty `### Migration`.
   `message_rejected`), which the main project's daemon and network Hosts use
   and ABI revision 28 does not expose; the CLI's `/model` and the daemon's
   messages now share that rule (`api/model_availability.zig`).
+- No change a Host can see. The Zig `SessionHost` now journals
+  `config_changed` for its accepted configuration commands, as the daemon's
+  config sink does (#445); ABI revision 28 does not expose `SessionHost`.
 
 ## 0.15.0 — 2026-11-13
 

@@ -20,6 +20,16 @@ status, compatibility boundaries, and entry points are defined by
   in the daemon's words, for example `model not available for current
   provider` or `bypassPermissions is disabled by settings`, where 0.12.0
   named the error.
+- **A `SessionHost` configuration command is journaled as the daemon's
+  `/command` is** (part of #445). An accepted `set_model`,
+  `set_permission_mode` or `set_reasoning_effort` now writes a
+  `config_changed` line (`model` as resolved, `mode`, `reasoning`) before
+  its `command_result`, as `/model`, `/mode` and `/effort` do through the
+  daemon's config sink, and `set_additional_directories` writes
+  `config_changed{dirs}` for each directory it adds, as `/add-dir` does.
+  0.12.0 wrote the `command_result` alone. The permission mode is journaled
+  by a config sink on the Session's permission context, so a submission's
+  mode is journaled once, as before.
 
 ### Added
 

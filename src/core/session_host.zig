@@ -48,7 +48,10 @@
 //! the bundled daemon's message does; a refusal of either applies neither
 //! and is journaled as `message_rejected` instead of a Run. With
 //! `Options.models` a model name resolves as on the daemon: tier names,
-//! then the provider guard (`ModelPolicy`).
+//! then the provider guard (`ModelPolicy`). Every change of model, permission
+//! mode, reasoning effort or additional directory is journaled as
+//! `config_changed`, as the daemon's config sink journals it: a command's
+//! before its `command_result`, a submission's before its `user_message`.
 //! `interrupt` is the one cross-thread call into the kernel; its abort is
 //! built for that.
 //!
@@ -296,7 +299,15 @@ pub const Submission = struct {
 };
 
 /// A configuration change applied by the driver between Runs, in queue
-/// order. Borrowed for `HostedSession.command`, which copies it.
+/// order. Borrowed for `HostedSession.command`, which copies it. Each is
+/// answered by `command_result`. An accepted `set_model`,
+/// `set_permission_mode` or `set_reasoning_effort` is first journaled as
+/// `config_changed` (`model` as resolved, `mode`, `reasoning`, null
+/// included), also when the value was already in force, as the bundled
+/// daemon's `/model`, `/mode` and `/effort` are (#445).
+/// `set_additional_directories` journals `config_changed{dirs}` for each
+/// directory in force afterwards that was not before, its resolved path, as
+/// the daemon's `/add-dir` does; a directory taken away has no line.
 pub const Command = union(enum) {
     set_model: []const u8,
     set_permission_mode: types.PermissionMode,
@@ -673,6 +684,8 @@ pub const SessionHost = struct {
             try self.runtime.createSession(config);
         errdefer session.destroy() catch {};
         hosted.session = session;
+        // Before the driver exists, so every mode change it makes is seen.
+        session.permission_ctx.event_sink = hosted.configSink();
         hosted.id = session.session_id;
         hosted.messages = conversation.len();
 
@@ -1534,11 +1547,11 @@ pub const HostedSession = struct {
             self.emitConfig(.{ .model = self.model });
         }
         if (submission.permission_mode) |mode| {
+            // Journaled by the config sink (`configSink`) as it is set.
             self.session.setPermissionMode(mode) catch |err| {
                 self.rejectSubmission(submission, err, submission.model != null);
                 return false;
             };
-            self.emitConfig(.{ .mode = mode });
         }
         return true;
     }
@@ -1648,16 +1661,25 @@ pub const HostedSession = struct {
 
     fn applyCommand(self: *HostedSession, cmd: Command) void {
         self.session.awaitProviderCancelsDrained();
+        // A change a `config_changed` line can say is journaled as one before
+        // the `command_result`, as the bundled daemon's config sink journals
+        // `/model`, `/mode`, `/effort` and `/add-dir` (#445). The mode goes
+        // through the sink itself (`configSink`).
         const failure: ?anyerror = switch (cmd) {
-            .set_model => |model| if (self.applyModel(model)) |_| null else |err| err,
+            .set_model => |model| if (self.applyModel(model)) |_| blk: {
+                // Only the driver writes `model`.
+                self.emitConfig(.{ .model = self.model });
+                break :blk null;
+            } else |err| err,
             .set_permission_mode => |mode| if (self.session.setPermissionMode(mode)) |_| null else |err| err,
             .set_reasoning_effort => |effort| if (self.session.setReasoningEffort(effort)) |_| blk: {
                 self.mutex.lock();
                 self.reasoning_effort = effort;
                 self.mutex.unlock();
+                self.emitConfig(.{ .reasoning = effort });
                 break :blk null;
             } else |err| err,
-            .set_additional_directories => |dirs| if (self.session.setAdditionalDirectories(dirs)) |_| null else |err| err,
+            .set_additional_directories => |dirs| self.applyDirectories(dirs),
             .set_prompt_profile => |profile| if (self.session.setPromptProfile(profile)) |_| null else |err| err,
             .update_permission_rules => |rules| if (self.session.updatePermissionRules(rules)) |_| null else |err| err,
             .compact => blk: {
@@ -1672,6 +1694,28 @@ pub const HostedSession = struct {
             .ok = failure == null,
             .error_name = if (failure) |err| @errorName(err) else null,
         } });
+    }
+
+    /// Replaces the Session's additional directories and journals each
+    /// directory now in force that was not before as `config_changed{dirs}`,
+    /// its resolved path, as the daemon journals the one `/add-dir` adds. A
+    /// directory taken away has no line: v1's `dirs` names one directory
+    /// that came into force.
+    fn applyDirectories(self: *HostedSession, dirs: []const []const u8) ?anyerror {
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        // The driver alone changes them, so this read is not racing a write.
+        const previous = self.session.workspace.additional_dirs;
+        const before = scratch.allocator().alloc([]const u8, previous.len) catch |err| return err;
+        for (previous, before) |dir, *copy| copy.* = scratch.allocator().dupe(u8, dir) catch |err| return err;
+        self.session.setAdditionalDirectories(dirs) catch |err| return err;
+        for (self.session.workspace.additional_dirs) |dir| {
+            const known = for (before) |old| {
+                if (std.mem.eql(u8, old, dir)) break true;
+            } else false;
+            if (!known) self.emitConfig(.{ .dirs = dir });
+        }
+        return null;
     }
 
     /// Switches the Session to `requested`, resolved through
@@ -1748,6 +1792,19 @@ pub const HostedSession = struct {
             if (std.mem.eql(u8, held, key)) return true;
         }
         return false;
+    }
+
+    /// The Session's config sink, as the daemon's `WebConfigSink` (#445):
+    /// attached to its permission context at `open`, so every permission
+    /// mode the Session takes is journaled as `config_changed{mode}`,
+    /// whatever set it. Called on the thread that set it.
+    fn configSink(self: *HostedSession) ui_event.ConfigEventSink {
+        return .{ .ctx = self, .emitFn = emitConfigThunk };
+    }
+
+    fn emitConfigThunk(ctx: *anyopaque, change: ui_event.ConfigChange) void {
+        const self: *HostedSession = @ptrCast(@alignCast(ctx));
+        self.emitConfig(change);
     }
 
     /// A `config_changed` line between Runs, as the daemon journals one.
