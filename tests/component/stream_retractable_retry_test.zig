@@ -3,14 +3,16 @@
 //! `RunOptionsV1.stream_retry_budget`).
 //!
 //! A reasoning model streams thinking first, so a stream that drops almost
-//! always drops after visible output, where the silent floor
-//! (`SILENT_STREAM_RETRY_FLOOR`) does not apply and the Run ends. With a
-//! retractable budget the loop re-issues the identical request instead, but
-//! only for a connection that gave no answer (`isSilentRetryFailure`), and it
-//! says so: the attempt's segment closes `discarded`, its thinking is
-//! withdrawn with `thinking_discarded`, and a `retry_notice` precedes the next
-//! attempt. These tests drive the real clients and the real loop against a
-//! cassette server and read the events the way a host does.
+//! always drops after visible output. Every request has one re-issue of its
+//! own for that (#461, `STREAM_RETRIES_PER_REQUEST`); a retractable budget
+//! grants the Run more, after a started tool call too, but only for a
+//! connection that gave no answer (`isSilentRetryFailure`). Every re-issue of
+//! an attempt that showed something says so: the attempt's segment closes
+//! `discarded`, its thinking is withdrawn with `thinking_discarded`, and a
+//! `retry_notice` precedes the next attempt. These tests drive the real
+//! clients and the real loop against a cassette server and read the events
+//! the way a host does; the backoff after a notice is set to zero here
+//! (`stream_retry_default_test.zig` covers it).
 
 const std = @import("std");
 const harness = @import("harness");
@@ -244,6 +246,7 @@ fn runLoop(
     return agent_loop.run(conv, provider, no_tools, &perm, .{
         .max_turns = max_turns,
         .retractable_stream_retries = retractable,
+        .stream_retry_backoff_ms = 0,
     }, &be, a);
 }
 
@@ -264,8 +267,9 @@ test "issue #452: thinking then a clean end of body is re-issued, and the host i
             "end 0 turn 1 group 0 discarded 0\n" ++
             // Its thinking, under the same segment identity.
             "thinking_discarded 0 turn 1 group 0 17\n" ++
-            // One failed stream of at most two, the next at once.
-            "retry 1/2 after 0\n" ++
+            // One failed stream of at most three: the first attempt, the
+            // request's own re-issue and the budget's one.
+            "retry 1/3 after 0\n" ++
             "begin 1\n" ++
             "text 15\n" ++
             "end 1 turn 1 group 0 final 15\n",
@@ -288,7 +292,7 @@ test "issue #452: thinking and text from a dropped attempt are both withdrawn" {
             "text 14\n" ++
             "end 0 turn 1 group 0 discarded 14\n" ++
             "thinking_discarded 0 turn 1 group 0 17\n" ++
-            "retry 1/3 after 0\n" ++
+            "retry 1/4 after 0\n" ++
             "begin 1\n" ++
             "text 15\n" ++
             "end 1 turn 1 group 0 final 15\n",
@@ -297,19 +301,25 @@ test "issue #452: thinking and text from a dropped attempt are both withdrawn" {
     try std.testing.expectEqualStrings("complete answer", out.answer);
 }
 
-test "issue #452: with no retractable budget the reproduction still ends after one attempt, as before" {
+test "issue #452: with no retractable budget the reproduction is re-issued once, under the request's own allowance (#461)" {
     const a = std.testing.allocator;
     var out = try run(a, .anthropic, &.{ ANTHROPIC_THINKING_THEN_EOF, ANTHROPIC_COMPLETE }, 0, 4);
     defer out.deinit(a);
-    try std.testing.expectEqual(agent_loop.StopReason.api_error, out.result.stop_reason);
-    try std.testing.expectEqual(@as(usize, 1), out.requests);
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), out.requests);
+    try out.expectIdenticalRequests();
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
-            "end 0 turn 1 group 0 discarded 0\n",
+            "end 0 turn 1 group 0 discarded 0\n" ++
+            "thinking_discarded 0 turn 1 group 0 17\n" ++
+            "retry 1/2 after 0\n" ++
+            "begin 1\n" ++
+            "text 15\n" ++
+            "end 1 turn 1 group 0 final 15\n",
         out.events.text.items,
     );
-    try std.testing.expectEqualStrings("", out.answer);
+    try std.testing.expectEqualStrings("complete answer", out.answer);
 }
 
 test "issue #452: visible text cut before its stop report is re-issued on every wire" {
@@ -327,7 +337,7 @@ test "issue #452: visible text cut before its stop report is re-issued on every 
                     "text 14\n" ++
                     "end 0 turn 1 group 0 discarded 14\n" ++
                     // No thinking was shown, so none is withdrawn.
-                    "retry 1/2 after 0\n" ++
+                    "retry 1/3 after 0\n" ++
                     "begin 1\n" ++
                     "text 15\n" ++
                     "end 1 turn 1 group 0 final 15\n",
@@ -336,12 +346,14 @@ test "issue #452: visible text cut before its stop report is re-issued on every 
             try std.testing.expectEqualStrings("complete answer", out.answer);
         }
         {
-            // The default: unchanged, one attempt and api_error.
+            // The default (#461): the request's own re-issue.
             var out = try run(a, wire, &.{ textThenEof(wire), complete(wire) }, 0, 4);
             defer out.deinit(a);
-            try std.testing.expectEqual(agent_loop.StopReason.api_error, out.result.stop_reason);
-            try std.testing.expectEqual(@as(usize, 1), out.requests);
-            try std.testing.expectEqual(@as(usize, 0), out.events.count("retry "));
+            try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
+            try std.testing.expectEqual(@as(usize, 2), out.requests);
+            try out.expectIdenticalRequests();
+            try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 1/2 after 0\n"));
+            try std.testing.expectEqualStrings("complete answer", out.answer);
         }
     }
 }
@@ -389,21 +401,23 @@ test "issue #452: the budget bounds the re-issues; the last failure ends the Run
     var out = try run(a, .anthropic, &.{ANTHROPIC_THINKING_TEXT_THEN_EOF}, 2, 4);
     defer out.deinit(a);
     try std.testing.expectEqual(agent_loop.StopReason.api_error, out.result.stop_reason);
-    try std.testing.expectEqual(@as(usize, 3), out.requests);
+    // The first attempt, the request's own re-issue, and the budget's two.
+    try std.testing.expectEqual(@as(usize, 4), out.requests);
     try out.expectIdenticalRequests();
-    try std.testing.expectEqual(@as(usize, 2), out.events.count("thinking_discarded "));
-    try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 1/3 after 0\n"));
-    try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 2/3 after 0\n"));
-    // The third attempt's segment still closes discarded; no notice follows it.
-    try std.testing.expectEqual(@as(usize, 3), out.events.count(" discarded 14\n"));
-    try std.testing.expect(std.mem.endsWith(u8, out.events.text.items, "end 2 turn 1 group 0 discarded 14\n"));
+    try std.testing.expectEqual(@as(usize, 3), out.events.count("thinking_discarded "));
+    try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 1/4 after 0\n"));
+    try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 2/4 after 0\n"));
+    try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 3/4 after 0\n"));
+    // The fourth attempt's segment still closes discarded; no notice follows it.
+    try std.testing.expectEqual(@as(usize, 4), out.events.count(" discarded 14\n"));
+    try std.testing.expect(std.mem.endsWith(u8, out.events.text.items, "end 3 turn 1 group 0 discarded 14\n"));
     try std.testing.expectEqualStrings("", out.answer);
 }
 
 test "issue #452: an attempt that showed nothing is still re-issued silently, and the budget raises that limit too" {
     const a = std.testing.allocator;
     {
-        // Two silent failures: the floor alone allows one re-issue.
+        // Two silent failures: the request's own allowance is one re-issue.
         var out = try run(a, .anthropic, &.{ ANTHROPIC_SILENT_EOF, ANTHROPIC_SILENT_EOF, ANTHROPIC_COMPLETE }, 0, 4);
         defer out.deinit(a);
         try std.testing.expectEqual(agent_loop.StopReason.api_error, out.result.stop_reason);
@@ -423,16 +437,31 @@ test "issue #452: an attempt that showed nothing is still re-issued silently, an
     }
 }
 
-test "issue #452: the budget is the Run's, shared with the floor's re-issue" {
+test "issue #452: a silent and a visible failure share the request's own re-issue; the budget adds to it" {
     const a = std.testing.allocator;
-    // A silent re-issue uses the one re-issue a budget of one allows, so the
-    // visible failure after it ends the Run.
-    var out = try run(a, .anthropic, &.{ ANTHROPIC_SILENT_EOF, ANTHROPIC_THINKING_THEN_EOF, ANTHROPIC_COMPLETE }, 1, 4);
-    defer out.deinit(a);
-    try std.testing.expectEqual(agent_loop.StopReason.api_error, out.result.stop_reason);
-    try std.testing.expectEqual(@as(usize, 2), out.requests);
-    try std.testing.expectEqual(@as(usize, 0), out.events.count("retry "));
-    try std.testing.expectEqual(@as(usize, 0), out.events.count("thinking_discarded "));
+    {
+        // The silent re-issue uses the request's one, so with no budget the
+        // visible failure after it ends the Run.
+        var out = try run(a, .anthropic, &.{ ANTHROPIC_SILENT_EOF, ANTHROPIC_THINKING_THEN_EOF, ANTHROPIC_COMPLETE }, 0, 4);
+        defer out.deinit(a);
+        try std.testing.expectEqual(agent_loop.StopReason.api_error, out.result.stop_reason);
+        try std.testing.expectEqual(@as(usize, 2), out.requests);
+        try std.testing.expectEqual(@as(usize, 0), out.events.count("retry "));
+        try std.testing.expectEqual(@as(usize, 0), out.events.count("thinking_discarded "));
+    }
+    {
+        // A budget of one covers the visible failure: the request's second
+        // failed stream of at most three.
+        var out = try run(a, .anthropic, &.{ ANTHROPIC_SILENT_EOF, ANTHROPIC_THINKING_THEN_EOF, ANTHROPIC_COMPLETE }, 1, 4);
+        defer out.deinit(a);
+        try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
+        try std.testing.expectEqual(@as(usize, 3), out.requests);
+        try out.expectIdenticalRequests();
+        try std.testing.expectEqual(@as(usize, 1), out.events.count("retry "));
+        try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 2/3 after 0\n"));
+        try std.testing.expectEqual(@as(usize, 1), out.events.count("thinking_discarded "));
+        try std.testing.expectEqualStrings("complete answer", out.answer);
+    }
 }
 
 /// One Glob call `toolu_1` over `root`, closed; `stop` ends the stream with
@@ -497,6 +526,7 @@ test "issue #452: a re-issued attempt that repeats a withdrawn tool call's id ru
     const result = try agent_loop.run(&conv, client.provider(), defs, &perm, .{
         .max_turns = 4,
         .retractable_stream_retries = 1,
+        .stream_retry_backoff_ms = 0,
         .cwd_abs = root,
         .home_dir = root,
         .auto_compact_threshold = std.math.maxInt(usize),
@@ -504,6 +534,8 @@ test "issue #452: a re-issued attempt that repeats a withdrawn tool call's id ru
 
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
     try std.testing.expectEqual(@as(usize, 3), srv.requestCount());
+    // A started tool call rules out the request's own re-issue (#461); the
+    // budget's re-issue is the one taken, of at most two attempts.
     try std.testing.expectEqual(@as(usize, 1), events.count("retry 1/2 after 0\n"));
     try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
     // The call's real result reached the model.

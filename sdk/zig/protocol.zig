@@ -356,8 +356,9 @@ pub const CoreEvent = union(enum) {
         disposition: OutputSegmentDisposition,
         bytes: u64,
     },
-    /// Revision 28 (#452): a Run re-issues a provider attempt under its
-    /// `RunOptionsV1.stream_retry_budget`, and the `thinking_chunk`s delivered
+    /// Revision 28 (#452): a Run re-issues a provider attempt that showed
+    /// output (each request's own re-issue, #461, or under its
+    /// `RunOptionsV1.stream_retry_budget`), and the `thinking_chunk`s delivered
     /// while visible-output segment `index` was open (`bytes` in total) belong
     /// to that withdrawn attempt: remove them, as a `discarded` segment's text.
     /// Follows that segment's `output_segment_end`; `turn` is 1-based and

@@ -174,7 +174,7 @@ core 因此把它**已经知道**的判定发出来。一个 **段** = 一次 pr
 
 `index` 在 Run 内单调,**被丢弃的段也占一个索引**("回滚过"与"没发生过"必须可区分)。
 `thinking_chunk` 不属于任何段——思考永不进入结果。但它总在本次 stream 的段打开期间到达,所以
-`retractable_stream_retries` 准许的重发撤回一个流出过 thinking 的尝试时,在该段 `discarded` 之后
+同轮重发(请求自带的那一次或 `retractable_stream_retries` 准许的)撤回一个流出过 thinking 的尝试时,在该段 `discarded` 之后
 紧跟 `thinking_discarded`(同一段的 index/turn/group 与 thinking 字节数):前端丢弃该段打开期间
 到达的 thinking,与丢弃该段文本同理(见 §7 流内重发那一条)。
 
@@ -950,21 +950,26 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   经 `client.reportServerError` 写"API 错误帧"现场);`StreamStalled` / `StreamIncomplete` /
   `ContextWindowExceeded` / `Aborted` 各有专名;本地或解析类失败(`StreamTooLong`、`OutOfMemory`…)
   保留原名。
-  **连接没给出答复、又零可见输出时同轮重发一次**:`agent_loop.SILENT_STREAM_RETRY_FLOOR`——失败是
-  `StreamStalled`、`StreamIncomplete` 或 `RequestFailed`(`isSilentRetryFailure`),且本次尝试还没有
-  文本 / thinking / 工具调用到达 backend 时,不论 `max_stream_turn_retries` 是多少(TUI 为 0)都至少重发
-  一次。`ApiError` 是服务端的答复,本地失败重发也不会变,都不重发。已流出可见内容的失败仍按
-  `max_stream_turn_retries`。
-  **宿主能撤回时,已流出可见内容的断连也同轮重发**(#452):`Options.retractable_stream_retries`
-  (AgentCore `RunOptionsV1.stream_retry_budget`,默认 0)只放宽上面那三种失败的重发上限,`ApiError`
-  与本地失败照旧不重发;次数按 Run 计,与兜底那一次共用一个计数,一个 Run 至多重发 max(额度, 1) 次,
-  每次重发各有自己的建连重试。重发一个已流出内容的尝试时先告诉宿主撤回什么:该段照常以 `discarded`
-  收口;流出过 thinking 时紧跟 `thinking_discarded`(同一段的 index/turn/group 与 thinking 字节数);
-  再发 `retry_notice`(`attempt` = 本 Run 已断的流数,含本次;`max` = 重发上限 + 1;`delay_ms` = 0)。
-  零可见输出的重发照旧不发这些事件;`max_stream_turn_retries` 准许的重发也不发(headless 输出不变)。
+  **每个模型请求自带一次同轮重发**(#461):`agent_loop.STREAM_RETRIES_PER_REQUEST`(1)——失败是
+  `StreamStalled`、`StreamIncomplete` 或 `RequestFailed`(`isSilentRetryFailure`),且失败的响应**没有
+  开始任何工具调用**时,不论 Options 怎么配(TUI、headless、AgentCore 一样)都重发一次同一请求(同
+  provider / wire / 模型 / 绑定,逐字节相同);失败尝试流出的文本与 thinking 一并丢弃,不进 Conversation。
+  "开始了工具调用"包括参数还在流的半截调用:loop 只在块收口时才收到 `tool_use_start`,所以由各 client
+  的解析器经 `StreamHandle.toolCallStarted()` 报告(Anthropic 的 `tool_use` 块开头、chat 的
+  `delta.tool_calls`、Responses 的 `function_call` item 或参数增量、Bedrock 的 `toolUse` 块开头;
+  Gemini 的调用整块到达,loop 自己看得到)。额度按请求计(每个 turn 重置),前面的 turn 用不掉后面的。
+  `ApiError` 是服务端的答复,本地失败重发也不会变,都不重发。
+  **额度之外的重发**:`max_stream_turn_retries`(headless 为 2,任何流内失败,`ApiError` 也算)与
+  `Options.retractable_stream_retries`(#452,AgentCore `RunOptionsV1.stream_retry_budget`,默认 0,只限
+  上面那三种失败,开始了工具调用也可以)按 Run 计、共用一个计数,在请求自己那一次用完之后才用;
+  每次重发各有自己的建连重试。重发一个已流出内容的尝试时,不论用的是哪一份额度,都先告诉宿主撤回什么:
+  该段照常以 `discarded` 收口;流出过 thinking 时紧跟 `thinking_discarded`(同一段的 index/turn/group
+  与 thinking 字节数);再发 `retry_notice`(`attempt` = 本请求已断的流数,含本次;`max` = 本请求至多
+  几次尝试:首次 + 自带一次 + Run 额度余量;`delay_ms` = `Options.stream_retry_backoff_ms`,默认
+  `STREAM_RETRY_BACKOFF_MS` 500 ms),然后等这段退避再重发。退避期间 abort → Run 以 `aborted` 收口,
+  不再发请求。零可见输出的重发不发这些事件、也不等。
   被丢弃尝试流式预取的只读工具结果在 `Prefetch.joinAll` 之后不可再取:重发的尝试即使复用同一个
-  工具调用 id,也会真正执行该调用。仍然成立的边界:
-  已流出可见内容的正文 stall 在 TUI 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
+  工具调用 id,也会真正执行该调用。仍然成立的边界:TaskBatch 的 join 有界于空闲上限,
   不会 detach 卡死的 worker;TUI 每个 provider 回合结束就刷 transcript,但一个回合内的内容仍只在
   内存里。
 - **流必须报告它是怎么停的,否则不是收尾**(issue #269):四条 wire 各有一个停止报告——Anthropic

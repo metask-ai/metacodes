@@ -122,16 +122,24 @@ class PythonSdkTest(unittest.TestCase):
         self.assertEqual(
             payloads["thinking_discarded"], [{"index": 0, "turn": 1, "group": 0, "bytes": 17}]
         )
-        self.assertEqual(payloads["retry_notice"], [{"attempt": 1, "max": 2, "delay_ms": 0}])
+        # One failed stream of at most three: the first attempt, the request's
+        # own re-issue (#461) and the budget's one, after the short backoff.
+        self.assertEqual(payloads["retry_notice"], [{"attempt": 1, "max": 3, "delay_ms": 500}])
         self.assertEqual(
             [segment["disposition"] for segment in result.segments], ["discarded", "final"]
         )
         tags = [next(iter(event)) for event in events]
         self.assertLess(tags.index("thinking_discarded"), tags.index("retry_notice"))
 
-    def test_without_a_budget_a_stream_cut_after_thinking_ends_the_run(self) -> None:
+    def test_without_a_budget_a_request_cut_twice_after_thinking_ends_the_run(self) -> None:
+        # Issue #461: every request has one re-issue of its own; the second
+        # cut of the same request ends the Run.
         events = []
-        script = [("thinking_cut", "private reasoning"), ("text", "never sent")]
+        script = [
+            ("thinking_cut", "private reasoning"),
+            ("thinking_cut", "private reasoning"),
+            ("text", "never sent"),
+        ]
         with MockProvider(script) as provider:
             with metacodes.Runtime(tools=()) as runtime:
                 session = self.session(runtime, provider)
@@ -139,11 +147,17 @@ class PythonSdkTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     session.run("think", stream_retry_budget=_native.MAX_STREAM_RETRY_BUDGET + 1)
         self.assertEqual(result.stop_reason, "api_error")
-        self.assertEqual(len(provider.requests), 1)
-        tags = [next(iter(event)) for event in events]
-        self.assertNotIn("thinking_discarded", tags)
-        self.assertNotIn("retry_notice", tags)
-        self.assertEqual(result.model_error.attempts, 1)
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(provider.requests[0], provider.requests[1])
+        payloads = {}
+        for event in events:
+            tag, payload = next(iter(event.items()))
+            payloads.setdefault(tag, []).append(payload)
+        self.assertEqual(
+            payloads["thinking_discarded"], [{"index": 0, "turn": 1, "group": 0, "bytes": 17}]
+        )
+        self.assertEqual(payloads["retry_notice"], [{"attempt": 1, "max": 2, "delay_ms": 500}])
+        self.assertEqual(result.model_error.attempts, 2)
 
     def test_python_tool_result_reaches_the_model(self) -> None:
         calls = []

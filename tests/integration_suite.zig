@@ -78,6 +78,7 @@ test {
     _ = @import("component/prompt_model_identity_test.zig");
     _ = @import("component/stream_terminator_test.zig");
     _ = @import("component/stream_retractable_retry_test.zig");
+    _ = @import("component/stream_retry_default_test.zig");
     _ = @import("component/max_tokens_exhaustion_test.zig");
     _ = @import("component/time_context_test.zig");
     _ = @import("component/file_change_test.zig");

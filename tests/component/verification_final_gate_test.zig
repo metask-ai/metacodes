@@ -29,7 +29,7 @@ const END_TURN =
 
 /// Same answer with the visible text first and more of it after: the MockServer's mid-stream
 /// cut (half the body) lands after "done" has streamed. END_TURN's half lands before any text,
-/// a dropped connection that `agent_loop.SILENT_STREAM_RETRY_FLOOR` re-sends even with the
+/// a dropped connection that `agent_loop.STREAM_RETRIES_PER_REQUEST` re-sends even with the
 /// zero-retry default.
 const TEXT_THEN_MORE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"done\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -407,7 +407,7 @@ test "L2 a mid-stream provider failure retries the same turn instead of dying" {
     try std.testing.expectEqual(@as(usize, 3), server.requestCount());
 }
 
-test "L2 zero-retry default preserves the api_error surface once text has streamed" {
+test "L2 zero-retry default re-sends a response cut after its text once, and the replay completes (#461)" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -415,7 +415,8 @@ test "L2 zero-retry default preserves the api_error surface once text has stream
     const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const write = try writeSse(a, root);
     defer a.free(write);
-    // Response #1 is cut after "done" streamed: the user watched it, so it is not re-sent.
+    // Response #1 is cut after "done" streamed: the request's own re-issue
+    // (#461) withdraws it and the replay completes.
     var server = try harness.MockServer.startCassetteMidStreamCut(
         &.{ write, TEXT_THEN_MORE, END_TURN },
         1,
@@ -451,8 +452,12 @@ test "L2 zero-retry default preserves the api_error surface once text has stream
         &backend,
         a,
     );
-    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
-    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    try std.testing.expectEqualStrings(
+        (server.requestAt(1) orelse return error.MissingRequest).body(),
+        (server.requestAt(2) orelse return error.MissingRequest).body(),
+    );
 }
 
 test "L2 zero-retry default still re-sends a connection dropped before any visible output, once" {

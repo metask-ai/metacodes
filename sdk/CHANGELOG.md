@@ -40,8 +40,8 @@ empty `### Migration`.
   (a stall, a dropped connection, a stream that ended before its stop report),
   after it had already shown output too; an error the server declared in the
   stream and a local decode failure are never re-sent. The budget is the
-  Run's, across its turns, and shared with the one re-send an attempt that
-  showed nothing already gets, so a Run re-sends at most max(budget, 1) times.
+  Run's, across its turns, and comes on top of each request's own re-send
+  (see Changed).
   A value above 8 is `RESOURCE_LIMIT`, a nonzero `reserved0` beside it
   `INVALID_ARGUMENT`, both before admission. A re-sent attempt never finds the
   abandoned attempt's speculative tool results: a call it repeats runs, even
@@ -49,11 +49,32 @@ empty `### Migration`.
 - The `thinking_discarded` observation event: `{index, turn, group, bytes}`
   names the thinking a re-sent attempt showed while segment `index` was open,
   for the Host to take back as it drops that segment's `discarded` text. Each
-  such re-send also emits `retry_notice` (`attempt` = streams broken off so
-  far, `max` = re-send limit + 1, `delay_ms` 0) and the `retrying` RunState
+  such re-send also emits `retry_notice` (`attempt` = this request's streams
+  broken off so far, `max` = the most attempts the request may make,
+  `delay_ms` = the backoff before the re-send) and the `retrying` RunState
   phase. `model_error.attempts` counts re-sends like connection retries.
 - Python `Session.run(..., stream_retry_budget=)` / `stream(...)` and Node
   `run(prompt, { streamRetryBudget })` / `stream(...)`.
+
+### Changed
+
+- Every model request is sent once more by itself after a transient stream
+  interruption, with no budget set (#461). When an accepted stream broke off
+  without an answer (a stall, a dropped connection, a stream that ended before
+  its stop report) and the failed response had not started a tool call, not
+  even one whose arguments were still streaming, the Run discards everything
+  the attempt produced, text and thinking alike, and sends the identical
+  request again. The allowance is the request's, not the Run's: an earlier
+  turn's re-send never uses up a later one's, and it replaces the one re-send
+  per Run an attempt that showed nothing used to get. A re-send of an attempt
+  that showed output is announced like a budgeted one (`discarded` segment,
+  `thinking_discarded`, `retry_notice`) and waits a short backoff (500 ms,
+  `retry_notice.delay_ms`), during which an abort ends the Run `aborted`
+  without sending it. Before, a zeroed `RunOptionsV1` ended such a Run with
+  `api_error` and `attempts: 1`; when the re-send is cut too, `attempts` is
+  now 2. An error the server declared, a local decode failure and a cut
+  during a tool call are still sent once. Budgeted re-sends now wait the same
+  backoff, and their `retry_notice` counts this request's streams.
 
 ### Fixed
 
@@ -76,9 +97,10 @@ empty `### Migration`.
 - ABI revision 28. `RunOptionsV1` stays 40 bytes; its last reserved word is now
   `uint32_t stream_retry_budget` (offset 32) and a zero `uint32_t reserved0`
   (offset 36). A Host built for revision 27 is refused at the revision check;
-  rebuild against the revision 28 header and bindings. A zeroed `RunOptionsV1`
-  keeps the revision 27 behavior, and a Host that does not set the budget sees
-  no new event.
+  rebuild against the revision 28 header and bindings. A Host that does not
+  set the budget still sees `thinking_discarded` and `retry_notice` when a
+  request's own re-send (#461) withdraws an attempt that showed output; drop
+  the `discarded` segment's text and the thinking `thinking_discarded` names.
 
 ## 0.14.0 — 2026-11-06
 

@@ -1168,11 +1168,14 @@ provider's context-window refusal and checkpoint capacity each compact the
 Conversation at a safe boundary and the same Run continues; the summary
 request is budgeted and the replacement commits only if the checkpoint fits —
 the `auto_compact` event and its `cause`), the structured reason a Run stopped
-with `STOP_API_ERROR` (the `model_error` event), the Host-granted stream retry budget
-(`RunOptionsV1.stream_retry_budget`: a Run re-issues a request whose stream broke
-off without an answer after it showed output, and the Host takes back what that
-attempt showed through the `discarded` segment, `thinking_discarded` and
-`retry_notice`), the in-place credential update (`session->update_credential`),
+with `STOP_API_ERROR` (the `model_error` event), each request's own re-issue
+after a stream that broke off without an answer and before any tool call
+started (#461), and the Host-granted stream retry budget beyond it
+(`RunOptionsV1.stream_retry_budget`: a Run re-issues such a request further
+times, after output and a started tool call too); for every re-issue of an
+attempt that showed output the Host takes back what it showed through the
+`discarded` segment, `thinking_discarded` and `retry_notice`, which precedes a
+short cancellable backoff, the in-place credential update (`session->update_credential`),
 edit-and-rerun (`session_control->rewind_to_user_message` and its three refusal statuses), the Session goal (the `goal` table, goal-continuation Runs, the
 `goal_updated` event), the host-scheduled team (`enable_teams`, the `team`
 config, and the `team` table's `describe` and `poll`), the Workspace Skill

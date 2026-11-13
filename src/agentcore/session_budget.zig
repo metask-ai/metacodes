@@ -1390,7 +1390,12 @@ const StreamWrapper = struct {
             .deinitFn = deinit,
             .stopReasonFn = stopReason,
             .requestIdFn = requestId,
+            .toolCallStartedFn = toolCallStarted,
         };
+    }
+
+    fn toolCallStarted(raw: *anyopaque) bool {
+        return cast(raw).base.toolCallStarted();
     }
 
     fn next(raw: *anyopaque) anyerror!?core.api_stream.StreamEvent {

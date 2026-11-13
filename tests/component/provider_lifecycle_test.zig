@@ -811,7 +811,9 @@ const EndedEarlyRun = struct {
         try std.testing.expectEqualStrings("The response stream ended before it reported how it stopped.", view.message);
         try std.testing.expectEqual(@as(?u16, 200), view.http_status);
         try std.testing.expectEqualStrings(EARLY_END_REQUEST_ID, view.request_id orelse "");
-        try std.testing.expectEqual(@as(u32, 1), view.attempts);
+        // Both physical attempts: the first and the request's own re-issue
+        // (#461), cut the same way.
+        try std.testing.expectEqual(@as(u32, 2), view.attempts);
         try std.testing.expect(view.code == null and view.type == null);
     }
 };
@@ -824,8 +826,9 @@ fn endedEarlyIsStreamInterrupted(comptime wire: Wire) !void {
     const url = try srv.urlOwned(a);
     defer a.free(url);
     try withProvider(wire, Endpoint.of(url), EndedEarlyRun{});
-    // Text was shown before the end, so the turn was not sent again.
-    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    // Text was shown before the end; the request was sent once more (#461),
+    // the cassette ended it the same way, and nothing was left after that.
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
 }
 
 test "L2 provider lifecycle ⑦: a stream that ends before its stop report fails the Run as stream_interrupted on every wire" {
