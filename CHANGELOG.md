@@ -72,15 +72,13 @@ status, compatibility boundaries, and entry points are defined by
   28 adds `RunOptionsV1.stream_retry_budget` (0 to 8, default 0, in the
   options' last reserved word): the Run may send the same request again that
   many times when its accepted stream broke off without an answer (a stall, a
-  dropped connection, a stream that ended before its stop report); a server's
-  error and a local decode failure are never re-sent, and the budget is shared
-  with the existing re-send of an attempt that showed nothing. Each re-issue
-  tells the Host what to take back: the attempt's segment closes `discarded`,
-  the new `thinking_discarded` event names the thinking it showed, and a
-  `retry_notice` follows. Zero changes nothing a Host sees or a provider
-  receives. The header, the bindings, the Python (`stream_retry_budget=`) and
-  Node (`streamRetryBudget`) packages and the source-free consumers move to
-  revision 28.
+  dropped connection, a stream that ended before its stop report), beyond
+  each request's own re-send (#461); a server's error and a local decode
+  failure are never re-sent. Each re-issue tells the Host what to take back:
+  the attempt's segment closes `discarded`, the new `thinking_discarded` event
+  names the thinking it showed, and a `retry_notice` follows. The header, the
+  bindings, the Python (`stream_retry_budget=`) and Node (`streamRetryBudget`)
+  packages and the source-free consumers move to revision 28.
 
 - **Edit and rerun through AgentCore** (#441). AgentCore ABI revision 27 adds
   `session_control->rewind_to_user_message(session, position, out_error)`, the
@@ -110,6 +108,18 @@ status, compatibility boundaries, and entry points are defined by
   `src/core/agent_loop.zig` beyond the two that do today
   (`daemon/app_driver.zig`, `web/session.zig`), and a baseline entry whose
   import is gone fails until it is deleted.
+- **`SessionHost` starts a hosted lead's teammates** (part of #445). A lead
+  hosted on `core/session_host.zig` could ask for a teammate
+  (`SpawnTeammate`), but the request only sat in `pending_spawns`, while the
+  bundled daemon's `App` starts its teammates itself. With the new
+  `session_host.Options.teammates` (a `TeammateFactory` the Host supplies
+  for the member's provider, workspace, tools and permissions), the lead's
+  driver now opens each requested member on the same `SessionHost` under the
+  lead's team identity and a fresh lease, and submits the request's prompt
+  as the member's first Run; the member's reply comes back as the lead's
+  next Run, and closing the lead closes its members. Without a factory
+  nothing changes. `SwarmContext.popPendingSpawn` hands a request over with
+  its ownership.
 
 - **The UDS binding answers UI requests and takes capability frames.** A
   UDS-only frontend needed HTTP beside the socket for exactly the most
@@ -138,6 +148,27 @@ status, compatibility boundaries, and entry points are defined by
   `wire.parseResponse` returns `void` and fails an unreadable permission
   answer with `UiAnswerUnreadable` (journal it with
   `wire.closedOnParseError`). Wire lines are unchanged.
+- **A model request is retried once after a transient stream interruption,
+  even after partial output** (#461). A gateway stream that returned HTTP 200,
+  streamed some text or thinking and then dropped ended the Run with
+  `api_error` (`stream_interrupted`, `retryable`, `attempts=1`) in the TUI,
+  headless mode and AgentCore alike: the one automatic re-send applied only to
+  an attempt that had shown nothing and was shared across the whole Run, and
+  #452's re-send after output defaulted to zero. Now every model request has
+  one re-send of its own (`agent_loop.STREAM_RETRIES_PER_REQUEST`), so an
+  earlier turn cannot use it up. It applies when the connection gave no
+  answer (a stall, a drop, a stream that ended before its stop report) and the
+  failed response had not started a tool call: each client's parser reports a
+  call whose arguments were still streaming (`StreamHandle.toolCallStarted`),
+  which the loop never received. The attempt's text and thinking are
+  discarded, the identical request goes to the same provider, wire, model and
+  binding, and results of tools that completed on earlier turns stay. A
+  re-send of an attempt that showed output emits `retry_notice` (after the
+  `discarded` segment and, for thinking, `thinking_discarded`) and waits
+  500 ms; an abort during the wait ends the Run `aborted` and sends nothing.
+  A server-declared error, a local parse failure and a cut during a tool call
+  are still single-attempt. `max_stream_turn_retries` (headless) and the
+  AgentCore budget now come on top of the request's own re-send.
 
 - A same-turn re-issue no longer looks up the abandoned attempt's speculative
   tool results: they borrowed the attempt's freed tool-call ids, and a
@@ -170,6 +201,32 @@ status, compatibility boundaries, and entry points are defined by
   already treated it. The retry, the attempt count and the empty detail after a
   retry that succeeds are unchanged; a local decode failure such as an
   oversized SSE line stays `unknown`.
+
+### Security
+
+- **A Grep pattern can no longer act as a ripgrep option** (#460). Grep is
+  read-only, so `accept_edits` runs it without a prompt and
+  `ShellPolicy.disabled` keeps it available. Both of its execution paths, the
+  direct one and the artifact-capture one that AgentCore uses, and every retry
+  passed `pattern` to ripgrep as a separate argument. A pattern that began with
+  `-` was read as a flag, and `--pre=<program>` made ripgrep run that program
+  on every file it searched, with no approval for running a command. Both
+  paths and every retry now build their arguments with one function. The
+  pattern goes in only as the value of `--regexp=`, the search path comes
+  after `--`, and every other value the model supplies is joined to its flag
+  in a single argument (`--glob=…`, `--type=…`, `--context=…`). A
+  leading-dash pattern now matches its literal text. Two other tools passed
+  model text to ripgrep the same way, and they are fixed too: FindSymbol's
+  `name` (now `--regexp=` plus `--`), and Glob's pattern and path (now
+  `--glob=` plus `--`). CodeMap's glob now joins its flag in one argument as
+  well. `tests/component/grep_option_injection_test.zig` runs the
+  repository-pinned ripgrep, after checking its digest, against both paths.
+  It checks that a `--pre=<script>` pattern returns the literal line on both
+  paths and with an `artifact_id`, and that the script never runs. It reads the
+  result back from the artifact store and checks ordinary regex, `-i`, glob
+  and type filters, context, and line numbers in file and directory searches.
+  It also checks that `accept_edits` still allows Grep while a denied Bash
+  request for the same script leaves no trace.
 
 ## 0.11.0 — 2026-11-06
 

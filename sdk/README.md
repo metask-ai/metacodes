@@ -51,15 +51,17 @@ its terminal `run_state`: category, the upstream's code and type passed through
 verbatim, a redacted displayable message, HTTP status, request id and retry
 guidance (`unknown` when it cannot be determined). The SDKs do not interpret the
 code; deciding "ask for funds" or "reauthenticate" from it is the Host's.
+Every model request is sent once more by itself when its stream broke off
+without an answer (a stall, a dropped connection, a stream that ended before
+its stop reason) and no tool call had started (#461);
 `RunOptionsV1.stream_retry_budget` (Revision 28, 0 to
-`MAX_STREAM_RETRY_BUDGET_V1` = 8, default 0) lets a Run send a request again
-when its stream broke off without an answer (a stall, a dropped connection, a
-stream that ended before its stop reason) after it had already shown output; a
-server's error and a local decode failure are never re-sent. Each such re-issue
-tells the Host what to take back: the attempt's segment closes `discarded`,
-`thinking_discarded` names the thinking it showed (by that segment's `index`),
-and `retry_notice` announces the next attempt. Zero keeps the Revision 27
-behavior.
+`MAX_STREAM_RETRY_BUDGET_V1` = 8, default 0) lets a Run send such a request
+again more times, after a started tool call too. A server's error and a local
+decode failure are never re-sent. Each re-issue of an attempt that showed
+output tells the Host what to take back: the attempt's segment closes
+`discarded`, `thinking_discarded` names the thinking it showed (by that
+segment's `index`), and `retry_notice` announces the next attempt, which
+follows a short backoff that an abort ends.
 `skill->resolve_catalog` merges the default `.agents/skills` sources with up to
 64 Host-registered sources. Their source priorities (`SkillSourceV1.priority`,
 `SkillCatalogQueryV1.default_user_source_priority` and

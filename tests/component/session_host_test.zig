@@ -958,3 +958,121 @@ test "L2 #445 SessionHost: a hosted team lead's next Run is its teammate's reply
     std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
     try std.testing.expectEqual(@as(usize, 2), try countLines(&lead.journal, "\"type\":\"user_message\""));
 }
+
+/// The Host side of `Options.teammates` in the test below: every member gets
+/// the member cassette and `SendMessage`, and each spawn it is asked for is
+/// recorded.
+const MemberFactory = struct {
+    url: []const u8,
+    workspace: cc.agent_session.WorkspaceConfig,
+    calls: usize = 0,
+    lead: ?cc.session_id.SessionId = null,
+    name_buf: [64]u8 = undefined,
+    name_len: usize = 0,
+    team_buf: [64]u8 = undefined,
+    team_len: usize = 0,
+
+    fn factory(self: *MemberFactory) cc.session_host.TeammateFactory {
+        return .{ .ctx = self, .configure = configure };
+    }
+
+    fn configure(ctx: *anyopaque, arena: std.mem.Allocator, spawn: cc.session_host.TeammateSpawn) anyerror!cc.agent_session.SessionConfig {
+        const self: *MemberFactory = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.lead = spawn.lead;
+        @memcpy(self.name_buf[0..spawn.name.len], spawn.name);
+        self.name_len = spawn.name.len;
+        @memcpy(self.team_buf[0..spawn.team_name.len], spawn.team_name);
+        self.team_len = spawn.team_name.len;
+        const tools = try arena.dupe([]const u8, &.{"SendMessage"});
+        var config = baseConfig(self.url, self.workspace.root, self.workspace.root, tools);
+        config.permission_mode = .bypass_permissions;
+        config.workspace = self.workspace;
+        return config;
+    }
+};
+
+test "L2 #445 SessionHost: a hosted lead's SpawnTeammate opens and runs the member on the same host, as the daemon's App starts its teammates" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const ack = try textSse(a, "ack");
+    defer a.free(ack);
+    // Run 1: TeamCreate crew, SpawnTeammate solver, then answer. Run 2 is the
+    // member's reply.
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        ack,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    const member_bodies = [_][]const u8{
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var members = MemberFactory{ .url = member_url, .workspace = workspace };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = members.factory() });
+    defer host.deinit();
+    var lead_config = baseConfig(lead_url, root, root, &.{ "TeamCreate", "SpawnTeammate", "SendMessage" });
+    lead_config.permission_mode = .bypass_permissions;
+    lead_config.workspace = workspace;
+    lead_config.team = .{ .role = .lead, .team_name = "" };
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    // One submission to the lead and nothing else: its spawn request opens
+    // the member, whose Run reaches its own provider with the lead's prompt,
+    // and whose reply becomes the lead's Run 2.
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+
+    try std.testing.expectEqual(@as(usize, 1), members.calls);
+    try std.testing.expectEqualStrings("solver", members.name_buf[0..members.name_len]);
+    try std.testing.expectEqualStrings("crew", members.team_buf[0..members.team_len]);
+    try std.testing.expectEqualStrings(lead.id.asSlice(), members.lead.?.asSlice());
+
+    try std.testing.expect(member_srv.requestCount() >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, member_srv.requestAt(0).?.body(), "fix the parser") != null);
+
+    const ids = try host.list(a);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    const member_id = if (std.mem.eql(u8, ids[0].asSlice(), lead.id.asSlice())) ids[1] else ids[0];
+    const member = host.acquire(member_id).?;
+    defer host.release(member);
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 2), member_srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&member.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"fix the parser\""));
+
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":2"));
+    try std.testing.expectEqual(@as(usize, 4), lead_srv.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(3).?.body(), "done: 42") != null);
+
+    // The request was fulfilled once: no second member, no second spawn.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(2 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), members.calls);
+
+    // Closing the lead closes the member it opened.
+    try host.close(lead.id);
+    try std.testing.expect(host.acquire(member_id) == null);
+    try std.testing.expect(member.journal.isClosed());
+}

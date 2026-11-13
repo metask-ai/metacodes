@@ -814,6 +814,13 @@ pub const StreamHandle = struct {
     httpStatusFn: *const fn (ctx: *anyopaque) u16 = emptyHttpStatus,
     retryAttemptFn: *const fn (ctx: *anyopaque) u32 = emptyRetryAttempt,
     contextWindowNumbersFn: *const fn (ctx: *anyopaque) error_class.ContextWindowNumbers = emptyContextWindowNumbers,
+    /// Whether the response has begun a tool call, complete or not (#461).
+    /// A tool call's arguments stream in pieces and reach the loop as one
+    /// `tool_use_start` only when the block closes, so a stream that breaks
+    /// off mid-arguments shows the loop nothing; only the parser knows the
+    /// call had started. The default answers false: it suits a handle whose
+    /// tool calls arrive whole (or never), which the loop sees itself.
+    toolCallStartedFn: *const fn (ctx: *anyopaque) bool = noToolCallStarted,
 
     pub inline fn next(self: StreamHandle) anyerror!?StreamEvent {
         return self.nextFn(self.ctx);
@@ -842,7 +849,14 @@ pub const StreamHandle = struct {
     pub inline fn contextWindowNumbers(self: StreamHandle) error_class.ContextWindowNumbers {
         return self.contextWindowNumbersFn(self.ctx);
     }
+    pub inline fn toolCallStarted(self: StreamHandle) bool {
+        return self.toolCallStartedFn(self.ctx);
+    }
 };
+
+fn noToolCallStarted(_: *anyopaque) bool {
+    return false;
+}
 
 fn emptyContextWindowNumbers(_: *anyopaque) error_class.ContextWindowNumbers {
     return .{};
@@ -987,6 +1001,9 @@ pub const EventIterator = struct {
     /// 后续 `content_block_delta`(input_json_delta) 持续 append partial_json 到 input_buf。
     /// `content_block_stop` 时整体 emit 为 `.tool_use_start`（带完整 input_json）并清空。
     pending_tool: ?PendingTool = null,
+    /// A `tool_use` block has opened in this stream, whether or not it closed
+    /// (#461, `StreamHandle.toolCallStarted`).
+    tool_call_started: bool = false,
 
     /// 单行 SSE 超出 reader buffer(8KB)时的溢出累积缓冲。
     /// 正常短行走 takeDelimiter 快路径,不碰这里;只有大 input_json_delta(写大文件
@@ -1195,6 +1212,7 @@ pub const EventIterator = struct {
                             .name = try allocator.dupe(u8, tu.name),
                             .input_buf = .empty,
                         };
+                        self.tool_call_started = true;
                         self.logInfo("tool_use_start id={s} name={s}", .{ tu.id, tu.name });
                         // tool_use 的参数通过后续 input_json_delta 累加——不立即 emit
                         continue;

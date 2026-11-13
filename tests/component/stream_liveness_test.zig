@@ -30,8 +30,9 @@
 //! ⑤⑨ 仍成立(input_json_delta 帧是非保活行);⑥ 反转;⑥b 补正例。
 //!
 //! 2026-10-24 起,还没有任何可见输出(文本 / thinking / 工具调用)就 stall 或没收尾就结束的流,
-//! TUI 默认也同轮重发一次(`agent_loop.SILENT_STREAM_RETRY_FLOOR`):② 改用带可见文本的前缀,证明
-//! 已流出内容仍不重发;②z 证明零输出的 stall 重发后正常收尾;②i 同理覆盖 StreamIncomplete;②e 证明
+//! TUI 默认也同轮重发一次;#461 起已流出可见内容的也一样(`agent_loop.STREAM_RETRIES_PER_REQUEST`,
+//! 每个请求一次):② 两次尝试都在可见文本之后 stall,证明只重发一次、第二次 stall 以 api_error 收口;
+//! ②z 证明零输出的 stall 重发后正常收尾;②i 同理覆盖 StreamIncomplete;②e 证明
 //! 服务端错误帧(零输出)不重发;⑥ 两次零输出 stall,只重发一次。死连接按保活节奏判见
 //! stream_dead_connection_test.zig。
 
@@ -186,10 +187,11 @@ test "L2 liveness ①: 收头阶段对端沉默 → 空闲监视 shutdown 连接
     try std.testing.expect(takeLastError(&buf) == null);
 }
 
-test "L2 liveness ②: 正文阶段已流出可见文本后对端沉默 → StreamStalled 结束本轮(api_error),不挂死也不空转重试,TUI 文案点名 stall" {
+test "L2 liveness ②: 正文阶段已流出可见文本后对端沉默 → StreamStalled,同轮重发一次仍沉默 → api_error,不挂死也不空转重试,TUI 文案点名 stall" {
     const a = std.testing.allocator;
-    // 已流出 "alive":TUI 默认不重发(用户看过的半截文本不能假装没发生)。
+    // 每条响应都在流出 "alive" 后沉默:请求自带的那次重发(#461)照样 stall,之后不再重发。
     var srv = try harness.MockServer.startCassetteSilent(&[_][]const u8{OK_SSE}, 0, MID_STREAM_PREFIX_WITH_TEXT);
+    srv.silent_from = true;
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
@@ -203,8 +205,8 @@ test "L2 liveness ②: 正文阶段已流出可见文本后对端沉默 → Stre
     const result = try runOneTurn(a, &client, null);
     const elapsed = cc.util_time.nowMs() - t0;
     try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
-    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
-    try std.testing.expect(elapsed >= @as(i64, @intCast(IDLE_MS)));
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    try std.testing.expect(elapsed >= @as(i64, @intCast(2 * IDLE_MS)));
     try std.testing.expect(elapsed < BOUND_MS);
     // TUI 打印的就是这行:必须点名"正文空闲超时"+ 空闲毫秒 + 生效的上限,而不是
     // "重试耗尽 / 后端错误 / 上下文超限"的猜谜文案。
@@ -446,7 +448,7 @@ test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限�
     const result = try runOneTurn(a, &client, null);
     const elapsed = cc.util_time.nowMs() - t0;
     try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
-    // 两次都在任何可见输出之前 stall:第一次兜底重发,第二次用尽(SILENT_STREAM_RETRY_FLOOR = 1)。
+    // 两次都在任何可见输出之前 stall:第一次重发,第二次用尽(STREAM_RETRIES_PER_REQUEST = 1)。
     try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
     try std.testing.expect(elapsed >= @as(i64, @intCast(2 * PING_ONLY_BODY_MS)));
     // 挂死的上界:两次 stall,第一次的上限之外和其它用例一样留 BOUND_MS。
@@ -485,8 +487,9 @@ test "L2 liveness ⑥b: ping 之间夹着真实进展(进展间隔 < 上限)→ 
 
 test "L2 liveness ⑦: 收头/正文阶段各用各的上限——正文沉默按正文上限判(更大),收头严上限不越界" {
     const a = std.testing.allocator;
-    // 带可见文本的前缀:本用例只看上限,不让零输出兜底重发掺进来(那是 ②z)。
+    // 每条响应都在可见文本后沉默:请求自带的那次重发(#461)也按正文上限判。
     var srv = try harness.MockServer.startCassetteSilent(&[_][]const u8{OK_SSE}, 0, MID_STREAM_PREFIX_WITH_TEXT);
+    srv.silent_from = true;
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
@@ -501,9 +504,9 @@ test "L2 liveness ⑦: 收头/正文阶段各用各的上限——正文沉默�
     const result = try runOneTurn(a, &client, null);
     const elapsed = cc.util_time.nowMs() - t0;
     try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
-    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
-    // 若正文阶段仍按收头上限(400ms)判,这里会在 ~400-650ms 就结束。
-    try std.testing.expect(elapsed >= @as(i64, @intCast(body_ms)));
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    // 若正文阶段仍按收头上限(400ms)判,两次尝试会在 ~1.3-1.8 s 就结束。
+    try std.testing.expect(elapsed >= @as(i64, @intCast(2 * body_ms)));
     try std.testing.expect(elapsed < BOUND_MS);
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     const detail = takeLastError(&buf) orelse return error.TestExpectedLastError;

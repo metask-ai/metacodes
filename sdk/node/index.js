@@ -423,10 +423,11 @@ class Session {
   }
 
   /**
-   * Run one prompt to completion. `streamRetryBudget` (0 to 8, default 0) is
-   * how many times the Run may send a request again when its stream breaks off
-   * without an answer after some output was shown; each such retry ends the
-   * attempt's segment `discarded`, takes back its thinking with a
+   * Run one prompt to completion. Every request is sent once more by itself
+   * when its stream breaks off without an answer before any tool call started;
+   * `streamRetryBudget` (0 to 8, default 0) is how many more times the Run may
+   * send a request again after that. Each retry of an attempt that showed
+   * output ends its segment `discarded`, takes back its thinking with a
    * `thinking_discarded` event and is announced by `retry_notice`.
    * @returns {Promise<{text: string, stopReason: string, turns: number, toolCalls: number, usage: object, segments: object[]}>}
    */

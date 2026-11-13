@@ -678,6 +678,8 @@ const BedrockStream = struct {
     /// head of the message and is not handed on for replay (moving it there
     /// would reorder the model's blocks; dropping trailing ones is allowed).
     content_started: bool = false,
+    /// A `toolUse` content block has started, finished or not (#461).
+    tool_call_started: bool = false,
     /// A reasoning block was withheld; every later one is withheld too, so
     /// what is replayed is always a prefix of what the model produced.
     reasoning_cut: bool = false,
@@ -694,7 +696,11 @@ const BedrockStream = struct {
             .stopReasonFn = &hStop,
             .requestIdFn = &hRid,
             .contextWindowNumbersFn = &hContextWindowNumbers,
+            .toolCallStartedFn = &hToolCallStarted,
         };
+    }
+    fn hToolCallStarted(ctx: *anyopaque) bool {
+        return @as(*BedrockStream, @ptrCast(@alignCast(ctx))).tool_call_started;
     }
     fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
         return @as(*BedrockStream, @ptrCast(@alignCast(ctx))).next();
@@ -828,6 +834,7 @@ const BedrockStream = struct {
             const id = stringField(tool, "toolUseId") orelse return;
             const name = stringField(tool, "name") orelse return;
             self.content_started = true;
+            self.tool_call_started = true;
             try self.tools.ensureUnusedCapacity(self.allocator, 1);
             const id_owned = try self.allocator.dupe(u8, id);
             errdefer self.allocator.free(id_owned);
