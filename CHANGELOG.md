@@ -263,6 +263,20 @@ status, compatibility boundaries, and entry points are defined by
   retry that succeeds are unchanged; a local decode failure such as an
   oversized SSE line stays `unknown`.
 
+- **A provider that compresses its answer no longer breaks the request**
+  (#467). A std.http request offers `accept-encoding: gzip, deflate` by
+  default and accepts either in the response head, but every body in `src/`
+  is read as sent: `Response.reader` and `Reader.bodyReader` do not decode.
+  DeepSeek takes the offer, so its SSE reached the line reader as gzip, no
+  event parsed, and every attempt ended as `StreamIncomplete` (the Run as
+  `api_error`). The four streaming model clients (Messages, OpenAI-compatible,
+  Gemini, Bedrock) no longer offer it (#468). And every request in `src/`,
+  which sends through `api/http_connection.zig`, now accepts the identity
+  coding only. A request that left the header at std's default says
+  `accept-encoding: identity`, as the OAuth, telemetry and catalog requests
+  do. A server or gateway that compresses anyway fails in `receiveHead`
+  (`HttpContentEncodingUnsupported`) instead of handing gzip to a parser.
+
 ### Security
 
 - **A Grep pattern can no longer act as a ripgrep option** (#460). Grep is
