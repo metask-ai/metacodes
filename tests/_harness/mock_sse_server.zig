@@ -111,8 +111,11 @@ pub const MockServer = struct {
     /// `Accept-Encoding` gets its 200 body gzip-compressed with
     /// `content-encoding: gzip`; any other request gets it as is.
     gzip_when_accepted: bool = false,
-    /// Set by serveLoop for the request being answered.
-    current_accepts_gzip: bool = false,
+    /// gzip every 200 body, whatever the request offers: a server or
+    /// gateway that ignores `Accept-Encoding` (#467).
+    gzip_unasked: bool = false,
+    /// Set by serveLoop: the 200 body being sent goes out gzip-encoded.
+    current_response_gzip: bool = false,
     /// 200 responses sent gzip-encoded so far.
     gzip_responses: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 停机标志:stop() 先置位、再自连唤醒 accept。Windows 上 closesocket **不可靠唤醒**
@@ -199,6 +202,14 @@ pub const MockServer = struct {
     pub fn startCassetteGzipWhenAccepted(bodies: []const []const u8) !*MockServer {
         const self = try startCassette(bodies, 0);
         self.gzip_when_accepted = true;
+        return self;
+    }
+
+    /// Cassette whose 200 bodies are gzip-encoded whatever the request
+    /// offers (#467). `gzipResponses` counts them.
+    pub fn startCassetteGzipUnasked(bodies: []const []const u8) !*MockServer {
+        const self = try startCassette(bodies, 0);
+        self.gzip_unasked = true;
         return self;
     }
 
@@ -483,7 +494,7 @@ pub const MockServer = struct {
             };
             const total = readRequest(conn, buf);
             self.captureRequest(buf[0..total]);
-            self.current_accepts_gzip = self.gzip_when_accepted and offersGzip(buf[0..total]);
+            self.current_response_gzip = self.gzip_unasked or (self.gzip_when_accepted and offersGzip(buf[0..total]));
             std.heap.page_allocator.free(buf);
 
             if (self.gate_response_index.load(.acquire) == response_index) {
@@ -626,7 +637,7 @@ pub const MockServer = struct {
             "cache-control: no-cache\r\n" ++
             "transfer-encoding: chunked\r\n" ++
             "connection: close\r\n";
-        if (self.current_accepts_gzip) {
+        if (self.current_response_gzip) {
             sendGzipResponse(conn, self, header);
             return;
         }

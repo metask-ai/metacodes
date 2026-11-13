@@ -12,10 +12,20 @@
 //! answer, because it no longer offers gzip. The first test proves the mock
 //! does compress when asked, so the provider tests cannot pass vacuously.
 //! Bedrock's case is in bedrock_converse_test.zig, next to its frame helpers.
+//!
+//! Not offering gzip is not enough on its own: `receiveHead` checks the
+//! answer against the request's `accept_encoding` set, which still allowed
+//! gzip and deflate, so a server or gateway that compresses unasked got its
+//! bytes to the parser all the same. Every request in `src/` sends through
+//! `api/http_connection.zig`, which now makes that set identity only. The
+//! last tests here serve gzip unasked: the request is refused at the head,
+//! on every model client and on the send path itself.
 
 const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
+
+const http_connection = cc.api_http_connection;
 
 const ANTHROPIC_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" ++
@@ -151,4 +161,96 @@ test "#467 L2: the Gemini stream is requested uncompressed and read whole" {
     var client = cc.api_gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
     try expectWholeAnswer(a, client.provider(), srv);
+}
+
+/// A provider's stream request, answered with gzip it did not offer, must
+/// fail at the response head: no stream opens, so no parser sees the bytes.
+fn expectRefusedAtHead(provider: cc.api_provider.Provider, srv: *harness.MockServer) !void {
+    if (provider.sendStream(&HI, null, null, null, null, null, "")) |opened| {
+        var handle = opened;
+        handle.deinit();
+        return error.CompressedAnswerReachedTheParser;
+    } else |err| try std.testing.expectEqual(error.RequestFailed, err);
+    // The server did compress, and the one attempt was not re-sent.
+    try std.testing.expectEqual(@as(u32, 1), srv.gzipResponses());
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+}
+
+test "#467 L2: a request sent through http_connection accepts only an uncompressed answer" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassetteGzipUnasked(&.{OPENAI_SSE});
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    const uri = try std.Uri.parse(url);
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client: std.http.Client = .{ .allocator = a, .io = io_rt.io() };
+    defer client.deinit();
+
+    // A send with a body and std's default header, as the OAuth, telemetry
+    // and catalog requests make: it says identity, and gzip is refused.
+    {
+        var request = try client.request(.POST, uri, .{ .keep_alive = false });
+        defer request.deinit();
+        try http_connection.sendBodyComplete(&request, @constCast("{}"));
+        try std.testing.expectError(error.HttpContentEncodingUnsupported, request.receiveHead(&.{}));
+    }
+    const first = srv.requestAt(0) orelse return error.NoRequestCaptured;
+    try std.testing.expectEqualStrings("identity", headerValue(first, "accept-encoding") orelse "");
+
+    // A bodiless send that omits the header, as the model clients and MCP
+    // transports do: no header goes out, and gzip is refused all the same.
+    {
+        var request = try client.request(.GET, uri, .{ .keep_alive = false, .headers = .{ .accept_encoding = .omit } });
+        defer request.deinit();
+        try http_connection.sendBodiless(&request);
+        try std.testing.expectError(error.HttpContentEncodingUnsupported, request.receiveHead(&.{}));
+    }
+    const second = srv.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(second, "accept-encoding"));
+    try std.testing.expectEqual(@as(u32, 2), srv.gzipResponses());
+}
+
+test "#467 L2: the Anthropic Messages stream refuses gzip it did not offer" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassetteGzipUnasked(&.{ANTHROPIC_SSE});
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    try expectRefusedAtHead(client.provider(), srv);
+}
+
+test "#467 L2: the OpenAI chat and Responses streams refuse gzip they did not offer" {
+    const a = std.testing.allocator;
+    for ([_]cc.types_mod.OpenAIProtocol{ .chat_completions, .responses }) |protocol| {
+        errdefer std.debug.print("protocol={s}\n", .{@tagName(protocol)});
+        var srv = try harness.MockServer.startCassetteGzipUnasked(&.{OPENAI_SSE});
+        defer srv.stop();
+        const url = try srv.urlOwned(a);
+        defer a.free(url);
+        var io_rt = @import("platform").signal.threadedIo(a, .{});
+        defer io_rt.deinit();
+        var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "test-key", "deepseek-chat", url);
+        defer client.deinit();
+        client.protocol = protocol;
+        try expectRefusedAtHead(client.provider(), srv);
+    }
+}
+
+test "#467 L2: the Gemini stream refuses gzip it did not offer" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassetteGzipUnasked(&.{GEMINI_SSE});
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = cc.api_gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
+    defer client.deinit();
+    try expectRefusedAtHead(client.provider(), srv);
 }

@@ -225,6 +225,28 @@ test "L2 bedrock: the event stream is requested uncompressed, so a server that g
     try std.testing.expectEqual(@as(u32, 0), server.gzipResponses());
 }
 
+test "L2 bedrock: an event stream gzipped without being asked is refused at the head, never parsed (#467)" {
+    const a = std.testing.allocator;
+    const body = try endTurn(a);
+    defer a.free(body);
+    // Compresses whatever the request offered, as a gateway that ignores
+    // Accept-Encoding would; api/http_connection.zig accepts identity only.
+    var server = try harness.MockServer.startCassetteGzipUnasked(&.{body});
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var owned = try bedrockProvider(a, "brk-key", MODEL, origin(url));
+    defer owned.deinit();
+    if (owned.provider().sendStream(&HI, null, null, null, null, null, "")) |opened| {
+        var handle = opened;
+        handle.deinit();
+        return error.CompressedAnswerReachedTheParser;
+    } else |err| try std.testing.expectEqual(error.RequestFailed, err);
+    try std.testing.expectEqual(@as(u32, 1), server.gzipResponses());
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
 test "L2 bedrock: reasoning that follows text is shown but never handed on for replay" {
     const a = std.testing.allocator;
     const body = try responseBytes(a, &.{
