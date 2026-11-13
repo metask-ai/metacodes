@@ -10,8 +10,6 @@
 const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
-const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
-const ppaths = @import("platform").paths;
 
 const MINIMAL_END_TURN_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -33,19 +31,45 @@ fn drainStream(resp: *cc.client_mod.StreamResponse) !void {
     }
 }
 
+// #472:日志捕获文件按进程 + 捕获唯一。同一进程的两次捕获路径不同、都带本进程 pid,
+// 互不串行;读取一直读到 EOF,超出缓冲是错误而不是静默截断。
+test "L2 log capture: two captures in one process get distinct private files read to EOF" {
+    var first = try harness.LogFile.create("http-error-test");
+    defer first.deinit();
+    var second = try harness.LogFile.create("http-error-test");
+    defer second.deinit();
+
+    try std.testing.expect(!std.mem.eql(u8, first.path(), second.path()));
+    var pid_buf: [32]u8 = undefined;
+    const pid_part = try std.fmt.bufPrint(&pid_buf, "-{d}-", .{@import("platform").process.currentPid()});
+    try std.testing.expect(std.mem.indexOf(u8, first.path(), pid_part) != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.path(), pid_part) != null);
+
+    // 写进一个的行不会出现在另一个里。
+    const line = "only-in-first\n";
+    try std.testing.expectEqual(@as(isize, line.len), @import("platform").fs.write(first.fd, line));
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(line, try first.readAll(&buf));
+    try std.testing.expectEqualStrings("", try second.readAll(&buf));
+
+    // 跨多次 read 读到 EOF;比缓冲大则报错。
+    const chunk = "y" ** 48;
+    for (0..3) |_| try std.testing.expectEqual(@as(isize, chunk.len), @import("platform").fs.write(second.fd, chunk));
+    var big: [chunk.len * 3]u8 = undefined;
+    try std.testing.expectEqual(chunk.len * 3, (try second.readAll(&big)).len);
+    try std.testing.expectError(error.LogFileTooLong, second.readAll(&buf));
+}
+
 // Stage 6.1:401 → sendMessageStream 返 error.Unauthorized,且 body 进日志(err 级)。
 // 用 setLogFileFdForTest 注入临时文件,断言文件内含 "body=" + 错误文本。
 test "L2 Stage6: HTTP 401 → error.Unauthorized 且 body 进日志" {
     const a = std.testing.allocator;
 
     // 1) 准备临时日志文件 + 注入(绕过 METACODES_LOG_FILE 一次性 init)
-    var lp_buf: [512]u8 = undefined;
-    const full_path = try std.fmt.bufPrintZ(&lp_buf, "{s}/cc-zig-http-error-test.log", .{ppaths.tempDir()});
-    const fd = pfs.open(full_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o644);
-    try std.testing.expect(fd >= 0);
-    defer pfs.close(fd);
-    defer pfs.unlinkPath(full_path.ptr) catch {};
-    const previous_log_state = cc.util_log.setLogFileFdForTest(fd);
+    //    文件按进程 + 捕获唯一:integration 分片进程共用同一个 temp 目录(#472)。
+    var log_file = try harness.LogFile.create("http-error-test");
+    defer log_file.deinit();
+    const previous_log_state = cc.util_log.setLogFileFdForTest(log_file.fd);
     defer cc.util_log.restoreForTest(previous_log_state);
     cc.util_log.setLevel(.debug);
 
@@ -73,10 +97,8 @@ test "L2 Stage6: HTTP 401 → error.Unauthorized 且 body 进日志" {
 
     // 4) 读日志文件,断言含 body 摘要
     var read_buf: [8192]u8 = undefined;
-    _ = pfs.lseek(fd, 0, .set);
-    const n = pfs.read(fd, &read_buf);
-    try std.testing.expect(n > 0);
-    const log_content = read_buf[0..@intCast(n)];
+    const log_content = try log_file.readAll(&read_buf);
+    try std.testing.expect(log_content.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, log_content, "body=") != null);
     try std.testing.expect(std.mem.indexOf(u8, log_content, "BADKEY42") != null);
 }

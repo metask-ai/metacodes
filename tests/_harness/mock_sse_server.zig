@@ -14,6 +14,9 @@ const std = @import("std");
 const net = @import("platform").net;
 const psync = @import("platform").sync;
 
+/// A log file private to one test capture: unique per process and capture (#472).
+pub const LogFile = @import("log_capture.zig").LogFile;
+
 /// 把路径里的反斜杠原地改成正斜杠,返回同一 slice。
 ///
 /// L2 组件测试普遍用 `tmpDir` + `realPath` 取 fixture 根,再把它插进 JSON 工具输入的
