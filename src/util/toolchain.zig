@@ -104,6 +104,12 @@ pub fn currentLayout() Layout {
 pub var test_ripgrep_override: if (builtin.is_test) ?bool else void =
     if (builtin.is_test) null else {};
 
+/// 测试 seam(同上,仅测试构建存在):把 `ripgrepPath` 钉到一个确定的可执行文件,
+/// 供需要"仓库钉住的 ripgrep"(vendor/ripgrep,按 SHA-256 核对)的回归测试使用,
+/// 不受 PATH 上的 rg 版本影响(#460)。设置后必须 defer 复位为 null。
+pub var test_ripgrep_path_override: if (builtin.is_test) ?[:0]const u8 else void =
+    if (builtin.is_test) null else {};
+
 pub const RipgrepSource = enum { env, path, adjacent, fallback };
 const Step = enum { env, path, adjacent, fallbacks };
 fn resolutionOrder(layout: Layout) []const Step {
@@ -127,6 +133,9 @@ pub fn ripgrepAvailable() bool {
 /// 返回可执行 rg。开发顺序为 RG_BIN、PATH、相邻、fallback；发布顺序为
 /// RG_BIN、相邻、PATH。返回值静态生命周期。
 pub fn ripgrepPath() error{RipgrepNotFound}![:0]const u8 {
+    if (comptime builtin.is_test) {
+        if (test_ripgrep_path_override) |forced| return forced;
+    }
     return (ripgrepResolution() catch return error.RipgrepNotFound).path;
 }
 

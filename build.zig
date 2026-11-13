@@ -234,26 +234,51 @@ fn gitStdout(b: *std.Build, argv: []const []const u8) ?[]const u8 {
     return std.mem.trim(u8, raw, " \t\r\n");
 }
 
-const RipgrepBundleInfo = struct { version: []const u8, revision: []const u8, sha256: ?[]const u8 };
+const RipgrepBundleInfo = struct {
+    version: []const u8,
+    revision: []const u8,
+    sha256: ?[]const u8,
+    /// Repository-relative path of the vendored binary for this target.
+    path: ?[]const u8,
+};
+
+/// Hands the repository-pinned ripgrep to a test process: the tests that must
+/// run against exactly the manifest-pinned binary (Grep's argv contract, #460)
+/// read it from here instead of whatever `rg` is on PATH, and check the digest
+/// before using it. A target without a vendored binary says so explicitly
+/// (`unavailable`, not an empty value Windows may drop), so a test can tell a
+/// missing pin from missing wiring.
+fn wirePinnedRipgrepTestInput(b: *std.Build, run: *std.Build.Step.Run, ripgrep: RipgrepBundleInfo) void {
+    const path = ripgrep.path orelse {
+        run.setEnvironmentVariable("METACODES_TEST_PINNED_RG", "unavailable");
+        return;
+    };
+    run.setEnvironmentVariable("METACODES_TEST_PINNED_RG", b.pathFromRoot(b.fmt("vendor/ripgrep/{s}", .{path})));
+    run.setEnvironmentVariable("METACODES_TEST_PINNED_RG_SHA256", ripgrep.sha256.?);
+}
 
 /// `vendor/ripgrep/manifest.json` names the upstream release and, per target,
 /// the vendored binary's digest; a target without one resolves rg from the
 /// environment and carries no expectation.
 fn ripgrepBundleInfo(b: *std.Build, target: std.Target) RipgrepBundleInfo {
     const Manifest = struct {
-        artifacts: []const struct { sha256: []const u8, targets: []const []const u8 },
+        artifacts: []const struct { sha256: []const u8, path: []const u8, targets: []const []const u8 },
         upstream_release: []const u8,
         upstream_revision: []const u8,
     };
     const parsed = parseJsonFile(b, Manifest, "vendor/ripgrep/manifest.json");
     const family = b.fmt("{s}-{s}", .{ @tagName(target.cpu.arch), @tagName(target.os.tag) });
     var sha256: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
     for (parsed.artifacts) |artifact| {
         for (artifact.targets) |candidate| {
-            if (std.mem.eql(u8, candidate, family)) sha256 = artifact.sha256;
+            if (std.mem.eql(u8, candidate, family)) {
+                sha256 = artifact.sha256;
+                path = artifact.path;
+            }
         }
     }
-    return .{ .version = parsed.upstream_release, .revision = parsed.upstream_revision, .sha256 = sha256 };
+    return .{ .version = parsed.upstream_release, .revision = parsed.upstream_revision, .sha256 = sha256, .path = path };
 }
 
 const TinyKgContractInfo = struct { version: []const u8, source_commit: []const u8 };
@@ -2951,6 +2976,7 @@ pub fn build(b: *std.Build) void {
         wireTinyKgTestInput(run_shard, staged_tinykg);
         wireTinyKgdTestInput(run_shard, staged_tinykgd);
         wireLeanKernelTestInputs(run_shard, staged_lean_kernels);
+        wirePinnedRipgrepTestInput(b, run_shard, ripgrep_bundle);
         integration_reports[shard_index] = run_shard.captureStdOut(.{
             .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
         });
@@ -2970,6 +2996,7 @@ pub fn build(b: *std.Build) void {
     wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
     wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
     wireLeanKernelTestInputs(integration_monolithic_run, staged_lean_kernels);
+    wirePinnedRipgrepTestInput(b, integration_monolithic_run, ripgrep_bundle);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
     integration_monolithic_step.dependOn(&integration_monolithic_run.step);
 
@@ -2991,6 +3018,7 @@ pub fn build(b: *std.Build) void {
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
     wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
     wireLeanKernelTestInputs(integration_timed_run, staged_lean_kernels);
+    wirePinnedRipgrepTestInput(b, integration_timed_run, ripgrep_bundle);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
 

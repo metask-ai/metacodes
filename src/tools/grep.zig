@@ -66,60 +66,15 @@ fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const 
     }
 
     const rg_path = try toolchain.ripgrepPath();
-    const output_mode = common.extractJsonArg(args, "output_mode") orelse
+    const output_mode_raw = common.extractJsonArg(args, "output_mode") orelse
         if (artifact_id != null) "content" else "files_with_matches";
-    var base_argv = std.ArrayList([]const u8).empty;
-    defer base_argv.deinit(allocator);
-    try base_argv.append(allocator, rg_path);
-    try base_argv.append(allocator, "--no-messages");
-    if (artifact_id != null) {
-        // Belt and braces: ripgrep already omits the filename for a single
-        // explicit file, and this makes that independent of its heuristics.
-        try base_argv.append(allocator, "--no-filename");
+    const output_mode = std.meta.stringToEnum(OutputMode, output_mode_raw) orelse return error.InvalidOutputMode;
+    if (output_mode == .files_with_matches and artifact_id != null) {
+        common.setErrorDetail(ctx.error_detail, allocator, "output_mode files_with_matches is meaningless for a single artifact; use content or count", .{});
+        return error.InvalidOutputMode;
     }
-    if (std.mem.eql(u8, output_mode, "files_with_matches")) {
-        if (artifact_id != null) {
-            common.setErrorDetail(ctx.error_detail, allocator, "output_mode files_with_matches is meaningless for a single artifact; use content or count", .{});
-            return error.InvalidOutputMode;
-        }
-        try base_argv.append(allocator, "-l");
-    } else if (std.mem.eql(u8, output_mode, "count")) {
-        try base_argv.append(allocator, "-c");
-    } else if (std.mem.eql(u8, output_mode, "content")) {
-        if (common.extractJsonArg(args, "-n") == null or isTrue(common.extractJsonArg(args, "-n")))
-            try base_argv.append(allocator, "-n");
-    } else return error.InvalidOutputMode;
-
-    if (std.mem.eql(u8, output_mode, "content")) {
-        if (common.extractJsonArg(args, "-B")) |value| {
-            try base_argv.append(allocator, "-B");
-            try base_argv.append(allocator, value);
-        }
-        if (common.extractJsonArg(args, "-A")) |value| {
-            try base_argv.append(allocator, "-A");
-            try base_argv.append(allocator, value);
-        }
-        if (common.extractJsonArg(args, "-C")) |value| {
-            try base_argv.append(allocator, "-C");
-            try base_argv.append(allocator, value);
-        } else if (common.extractJsonArg(args, "context")) |value| {
-            try base_argv.append(allocator, "-C");
-            try base_argv.append(allocator, value);
-        }
-    }
-    if (isTrue(common.extractJsonArg(args, "-i"))) try base_argv.append(allocator, "-i");
-    if (common.extractJsonArg(args, "type")) |value| {
-        try base_argv.append(allocator, "--type");
-        try base_argv.append(allocator, value);
-    }
-    if (common.extractJsonArg(args, "glob")) |value| {
-        try base_argv.append(allocator, "--glob");
-        try base_argv.append(allocator, value);
-    }
-    if (isTrue(common.extractJsonArg(args, "multiline"))) {
-        try base_argv.append(allocator, "-U");
-        try base_argv.append(allocator, "--multiline-dotall");
-    }
+    var options = try buildOptionArgv(allocator, args, rg_path, output_mode, if (artifact_id != null) .artifact else .workspace);
+    defer options.deinit(allocator);
 
     const head_limit = parseUsize(common.extractJsonArg(args, "head_limit")) orelse DEFAULT_HEAD_LIMIT;
     const offset = parseUsize(common.extractJsonArg(args, "offset")) orelse 0;
@@ -144,20 +99,8 @@ fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const 
     var attempt_index: usize = 0;
     while (attempt_index < attempt_count) : (attempt_index += 1) {
         const attempt = attempts[attempt_index];
-        var items = std.array_list.Managed([]const u8).init(allocator);
-        defer items.deinit();
-        try items.appendSlice(base_argv.items);
-        if (attempt.literal) try items.append("-F");
-        try items.append(attempt.pat);
-        try items.append(path);
-        var argv_z = try allocator.alloc(?[*:0]const u8, items.items.len + 1);
-        defer {
-            for (argv_z[0..items.items.len]) |value| if (value) |ptr| allocator.free(std.mem.span(ptr));
-            allocator.free(argv_z);
-        }
-        for (items.items, 0..) |value, index|
-            argv_z[index] = (try allocator.dupeZ(u8, value)).ptr;
-        argv_z[items.items.len] = null;
+        const argv_z = try attemptArgv(allocator, options.items.items, attempt.pat, attempt.literal, path);
+        defer freeArgv(allocator, argv_z);
 
         spawned = try common.spawnCaptureToSpoolTimed(
             argv_z,
@@ -245,6 +188,119 @@ fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const 
     );
 }
 
+const OutputMode = enum { files_with_matches, count, content };
+
+/// What a search names: a workspace file or directory, or one recovered
+/// artifact blob whose store path must not reach the output.
+const SearchTarget = enum { workspace, artifact };
+
+/// The option part of every Grep argv (#460). Each model-supplied option value
+/// is bound to its flag inside one argv element (`--glob=<value>`), so no value
+/// stands where ripgrep could parse it as a flag of its own.
+const OptionArgv = struct {
+    /// Static or `owned` slices, in argv order.
+    items: std.ArrayList([]const u8) = .empty,
+    owned: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *OptionArgv, allocator: std.mem.Allocator) void {
+        for (self.owned.items) |value| allocator.free(value);
+        self.owned.deinit(allocator);
+        self.items.deinit(allocator);
+    }
+
+    fn flag(self: *OptionArgv, allocator: std.mem.Allocator, value: []const u8) !void {
+        try self.items.append(allocator, value);
+    }
+
+    fn bound(self: *OptionArgv, allocator: std.mem.Allocator, comptime name: []const u8, value: []const u8) !void {
+        const element = try std.fmt.allocPrint(allocator, name ++ "={s}", .{value});
+        self.owned.append(allocator, element) catch |err| {
+            allocator.free(element);
+            return err;
+        };
+        try self.items.append(allocator, element);
+    }
+};
+
+/// The one option builder both execution paths use (`execute` and the
+/// artifact-capture `executeBody`), shared by every rung of the retry ladder.
+fn buildOptionArgv(
+    allocator: std.mem.Allocator,
+    args: []const u8,
+    rg_path: []const u8,
+    output_mode: OutputMode,
+    target: SearchTarget,
+) !OptionArgv {
+    var options: OptionArgv = .{};
+    errdefer options.deinit(allocator);
+    try options.flag(allocator, rg_path);
+    // 静默 stderr 上的权限/访问错误，避免污染 tool_result 和 CI 日志。
+    try options.flag(allocator, "--no-messages");
+    // Belt and braces for an artifact: ripgrep already omits the filename for
+    // a single explicit file, and this makes that independent of its heuristics.
+    if (target == .artifact) try options.flag(allocator, "--no-filename");
+    switch (output_mode) {
+        .files_with_matches => try options.flag(allocator, "-l"),
+        .count => try options.flag(allocator, "-c"),
+        .content => {
+            // 默认 content 模式开 -n
+            const line_numbers = common.extractJsonArg(args, "-n");
+            if (line_numbers == null or isTrue(line_numbers)) try options.flag(allocator, "-n");
+            // -B / -A / -C 仅在 content 模式有意义;旧参数 "context" 兼容为 -C。
+            if (common.extractJsonArg(args, "-B")) |value| try options.bound(allocator, "--before-context", value);
+            if (common.extractJsonArg(args, "-A")) |value| try options.bound(allocator, "--after-context", value);
+            if (common.extractJsonArg(args, "-C") orelse common.extractJsonArg(args, "context")) |value|
+                try options.bound(allocator, "--context", value);
+        },
+    }
+    if (isTrue(common.extractJsonArg(args, "-i"))) try options.flag(allocator, "-i");
+    if (common.extractJsonArg(args, "type")) |value| try options.bound(allocator, "--type", value);
+    if (common.extractJsonArg(args, "glob")) |value| try options.bound(allocator, "--glob", value);
+    // multiline：-U 启用多行模式
+    if (isTrue(common.extractJsonArg(args, "multiline"))) {
+        try options.flag(allocator, "-U");
+        try options.flag(allocator, "--multiline-dotall");
+    }
+    return options;
+}
+
+/// One attempt's complete, null-terminated argv: the options, `-F` on the
+/// literal rung, the pattern only as the value of `--regexp=`, and the search
+/// path only after `--`. A pattern such as `--pre=<program>` therefore stays a
+/// pattern (#460): ripgrep never reads it, or the path, as an option.
+fn attemptArgv(
+    allocator: std.mem.Allocator,
+    options: []const []const u8,
+    pattern: []const u8,
+    literal: bool,
+    path: []const u8,
+) ![]?[*:0]const u8 {
+    const tail_len: usize = if (literal) 4 else 3;
+    const argv = try allocator.alloc(?[*:0]const u8, options.len + tail_len + 1);
+    @memset(argv, null);
+    errdefer freeArgv(allocator, argv);
+    var index: usize = 0;
+    for (options) |value| {
+        argv[index] = (try allocator.dupeZ(u8, value)).ptr;
+        index += 1;
+    }
+    if (literal) {
+        argv[index] = (try allocator.dupeZ(u8, "-F")).ptr;
+        index += 1;
+    }
+    argv[index] = (try std.fmt.allocPrintSentinel(allocator, "--regexp={s}", .{pattern}, 0)).ptr;
+    index += 1;
+    argv[index] = (try allocator.dupeZ(u8, "--")).ptr;
+    index += 1;
+    argv[index] = (try allocator.dupeZ(u8, path)).ptr;
+    return argv;
+}
+
+fn freeArgv(allocator: std.mem.Allocator, argv: []?[*:0]const u8) void {
+    for (argv) |value| if (value) |ptr| allocator.free(std.mem.span(ptr));
+    allocator.free(argv);
+}
+
 fn captureContains(
     allocator: std.mem.Allocator,
     capture: *artifact_store.Capture,
@@ -326,71 +382,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const rg_path = try toolchain.ripgrepPath();
 
     // output_mode: content (默认，带行号) / files_with_matches / count
-    const output_mode = common.extractJsonArg(args, "output_mode") orelse "files_with_matches";
-
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-
-    try argv.append(allocator, rg_path);
-    // 静默 stderr 上的权限/访问错误，避免污染 tool_result 和 CI 日志。
-    try argv.append(allocator, "--no-messages");
-
-    // 基础模式选择
-    if (std.mem.eql(u8, output_mode, "files_with_matches")) {
-        try argv.append(allocator, "-l");
-    } else if (std.mem.eql(u8, output_mode, "count")) {
-        try argv.append(allocator, "-c");
-    } else if (std.mem.eql(u8, output_mode, "content")) {
-        // 默认 content 模式开 -n
-        if (common.extractJsonArg(args, "-n") == null or isTrue(common.extractJsonArg(args, "-n"))) {
-            try argv.append(allocator, "-n");
-        }
-    } else {
-        return error.InvalidOutputMode;
-    }
-
-    // -B / -A / -C（仅在 content 模式有意义，但 rg 会忽略非 content 的数值）
-    if (std.mem.eql(u8, output_mode, "content")) {
-        if (common.extractJsonArg(args, "-B")) |s| {
-            try argv.append(allocator, "-B");
-            try argv.append(allocator, s);
-        }
-        if (common.extractJsonArg(args, "-A")) |s| {
-            try argv.append(allocator, "-A");
-            try argv.append(allocator, s);
-        }
-        if (common.extractJsonArg(args, "-C")) |s| {
-            try argv.append(allocator, "-C");
-            try argv.append(allocator, s);
-        } else if (common.extractJsonArg(args, "context")) |s| {
-            // 兼容旧 "context" 参数
-            try argv.append(allocator, "-C");
-            try argv.append(allocator, s);
-        }
-    }
-
-    // -i 大小写不敏感
-    if (isTrue(common.extractJsonArg(args, "-i"))) {
-        try argv.append(allocator, "-i");
-    }
-
-    // --type
-    if (common.extractJsonArg(args, "type")) |t| {
-        try argv.append(allocator, "--type");
-        try argv.append(allocator, t);
-    }
-
-    // --glob
-    if (common.extractJsonArg(args, "glob")) |g| {
-        try argv.append(allocator, "--glob");
-        try argv.append(allocator, g);
-    }
-
-    // multiline：-U 启用多行模式（需要 -P PCRE）
-    if (isTrue(common.extractJsonArg(args, "multiline"))) {
-        try argv.append(allocator, "-U");
-        try argv.append(allocator, "--multiline-dotall");
-    }
+    const output_mode = std.meta.stringToEnum(
+        OutputMode,
+        common.extractJsonArg(args, "output_mode") orelse "files_with_matches",
+    ) orelse return error.InvalidOutputMode;
+    var options = try buildOptionArgv(allocator, args, rg_path, output_mode, .workspace);
+    defer options.deinit(allocator);
 
     // head_limit / offset：全局（跨文件）分页。
     // 不再用 rg 的 -m（那是每文件上限，跨文件会失真）；改为抓全量输出后按行截断。
@@ -425,21 +422,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var ai: usize = 0;
     while (ai < n_attempts) : (ai += 1) {
         const at = attempts_buf[ai];
-        var items = std.array_list.Managed([]const u8).init(allocator);
-        defer items.deinit();
-        try items.appendSlice(argv.items);
-        if (at.literal) try items.append("-F");
-        try items.append(at.pat);
-        try items.append(path);
-        var argv_z = try allocator.alloc(?[*:0]const u8, items.items.len + 1);
-        defer {
-            for (argv_z[0..items.items.len]) |p| if (p) |pp| allocator.free(std.mem.span(pp));
-            allocator.free(argv_z);
-        }
-        for (items.items, 0..) |s, i| {
-            argv_z[i] = (try allocator.dupeZ(u8, s)).ptr;
-        }
-        argv_z[items.items.len] = null;
+        const argv_z = try attemptArgv(allocator, options.items.items, at.pat, at.literal, path);
+        defer freeArgv(allocator, argv_z);
 
         // rg 退出语义:0=有匹配,1=无匹配(合法空),>=2/信号死=真实故障。
         spawned = try common.spawnCaptureWithStderrTimed(
@@ -1009,6 +993,46 @@ test "collapseDoubleBackslashes unit" {
     const c2 = collapseDoubleBackslashes(a, "a\\\\(b").?;
     defer a.free(c2);
     try std.testing.expectEqualStrings("a\\(b", c2);
+}
+
+test "Grep argv: model values never stand alone where ripgrep reads options (#460)" {
+    const a = std.testing.allocator;
+    const args =
+        \\{"pattern":"--pre=/tmp/x","output_mode":"content","-B":"--pre=/tmp/b","-A":"1","-C":"2","-i":true,"type":"--pre=/tmp/t","glob":"--pre=/tmp/g"}
+    ;
+    var options = try buildOptionArgv(a, args, "rg", .content, .workspace);
+    defer options.deinit(a);
+    for ([_]bool{ false, true }) |literal| {
+        const argv = try attemptArgv(a, options.items.items, "--pre=/tmp/x", literal, "-dir");
+        defer freeArgv(a, argv);
+        var got = std.ArrayList([]const u8).empty;
+        defer got.deinit(a);
+        for (argv) |value| if (value) |ptr| try got.append(a, std.mem.span(ptr));
+        try std.testing.expect(argv[argv.len - 1] == null);
+        const expected_head = [_][]const u8{
+            "rg",                            "--no-messages",       "-n",
+            "--before-context=--pre=/tmp/b", "--after-context=1",   "--context=2",
+            "-i",                            "--type=--pre=/tmp/t", "--glob=--pre=/tmp/g",
+        };
+        try std.testing.expectEqual(expected_head.len + @as(usize, if (literal) 4 else 3), got.items.len);
+        for (expected_head, got.items[0..expected_head.len]) |want, have| try std.testing.expectEqualStrings(want, have);
+        const tail = got.items[expected_head.len..];
+        const rest = if (literal) blk: {
+            try std.testing.expectEqualStrings("-F", tail[0]);
+            break :blk tail[1..];
+        } else tail;
+        try std.testing.expectEqualStrings("--regexp=--pre=/tmp/x", rest[0]);
+        try std.testing.expectEqualStrings("--", rest[1]);
+        try std.testing.expectEqualStrings("-dir", rest[2]);
+    }
+
+    // The artifact target suppresses filenames; files_with_matches and count
+    // carry no context options.
+    var artifact = try buildOptionArgv(a, args, "rg", .count, .artifact);
+    defer artifact.deinit(a);
+    const want_artifact = [_][]const u8{ "rg", "--no-messages", "--no-filename", "-c", "-i", "--type=--pre=/tmp/t", "--glob=--pre=/tmp/g" };
+    try std.testing.expectEqual(want_artifact.len, artifact.items.items.len);
+    for (want_artifact, artifact.items.items) |want, have| try std.testing.expectEqualStrings(want, have);
 }
 
 test "Grep searches a recovered artifact without leaking the store path" {
