@@ -115,8 +115,13 @@ Host 在 create/restore 时提供,不进 checkpoint(与 model_capabilities 同�
 `team` 表(`describe`/`poll`)就是这一对操作的 C ABI 封装(见 `AGENTCORE_BINARY_ABI.md`
 "Teams")。`core/session_host.zig` 的 `SessionHost` 替宿主做了后半件(#445):lead 空闲且
 team 已建时,driver 至多每 `lead_inbox_poll_ms`(500 ms,与 daemon 的 `LeadMail` 同)
-`pollLeadInbox` 一次,把回信排成 lead 的下一轮 Run;member Session 仍由宿主在同一个
-SessionHost 上 `open`。
+`pollLeadInbox` 一次,把回信排成 lead 的下一轮 Run。配了 `Options.teammates`
+(`TeammateFactory`)时它也做前半件,对应 daemon `App` 的 `.in_process` 调度:lead 每跑完
+一项,driver 按先后取出 `pending_spawns`(`SwarmContext.popPendingSpawn`),向宿主的
+`configure` 要 member 的 `SessionConfig`(provider/工作区/工具/权限归宿主,`team` 必须为
+null),以 lead 的 session id 和新 lease 作为该 team 的 member 在同一个 SessionHost 上
+`open`,并把请求的 prompt 作为它的第一轮 Run 提交;同名且仍开着的 member 收到的是下一轮
+Run。lead `close` 时一并关闭它开的 member。未配 factory 时请求照旧挂起,由宿主自己 `open`。
 
 与 in-process 共用同一套文件邮箱与名册语义,两条路径逐份核对安全属性(SW1 `waitForWork`
 vs host `pollLeadInbox`)。

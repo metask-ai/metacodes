@@ -108,6 +108,18 @@ status, compatibility boundaries, and entry points are defined by
   `src/core/agent_loop.zig` beyond the two that do today
   (`daemon/app_driver.zig`, `web/session.zig`), and a baseline entry whose
   import is gone fails until it is deleted.
+- **`SessionHost` starts a hosted lead's teammates** (part of #445). A lead
+  hosted on `core/session_host.zig` could ask for a teammate
+  (`SpawnTeammate`), but the request only sat in `pending_spawns`, while the
+  bundled daemon's `App` starts its teammates itself. With the new
+  `session_host.Options.teammates` (a `TeammateFactory` the Host supplies
+  for the member's provider, workspace, tools and permissions), the lead's
+  driver now opens each requested member on the same `SessionHost` under the
+  lead's team identity and a fresh lease, and submits the request's prompt
+  as the member's first Run; the member's reply comes back as the lead's
+  next Run, and closing the lead closes its members. Without a factory
+  nothing changes. `SwarmContext.popPendingSpawn` hands a request over with
+  its ownership.
 
 - **The UDS binding answers UI requests and takes capability frames.** A
   UDS-only frontend needed HTTP beside the socket for exactly the most

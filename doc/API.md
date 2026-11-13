@@ -1130,11 +1130,23 @@ leaving every Host to rebuild them:
   `swarm_tools.pollLeadInbox`, and a member's reply becomes the lead's next
   Run, queued behind any work already there and journaled like a submission
   without a `trace_id`. The bundled daemon does the same for its `App` lead.
-  Fulfilling the lead's `SpawnTeammate` requests is still the Host's: open a
-  member Session (`.role = .member`) on the same SessionHost.
+- With `Options.teammates` (a `TeammateFactory`), the SessionHost also
+  fulfils the lead's `SpawnTeammate` requests, as the daemon's `App` starts
+  its teammates: after each Run the lead's driver takes the pending requests
+  oldest first, calls `configure(ctx, arena, spawn)` for the member's
+  `SessionConfig` (provider, workspace, tools and permissions are the
+  Host's; `spawn` names the lead, team, member, prompt, `agent_type` and
+  `effort`), opens it on the same SessionHost as a member of the lead's team
+  under the lead's session id and a fresh lease, and submits the prompt as
+  its first Run. The factory returns `team = null` (the SessionHost owns the
+  identity; anything else is refused); a refused or failed spawn is logged
+  and dropped. A name the lead already opened, still open, takes the prompt
+  as its next Run. Closing the lead closes the members it opened. Without a
+  factory the requests stay pending for the Host to fulfil itself (open a
+  `.role = .member` Session).
 
-Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`,
-`idempotency_retention_ms`, `idempotency_max_keys`.
+Options: `max_queued`, `max_turns`, `teammates`, `transcripts`,
+`ui_request_timeout_ms`, `idempotency_retention_ms`, `idempotency_max_keys`.
 Authentication, tenancy and the transport stay with the Host.
 To stream a Session's journal over SSE, parse the client's position with
 `event_journal.Cursor.fromLastEventId` / `fromSince`, start from
