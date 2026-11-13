@@ -312,6 +312,11 @@ pub const BedrockClient = struct {
         req_ptr.* = self.http_client.request(.POST, uri, .{
             .keep_alive = false,
             .redirect_behavior = no_redirects,
+            // The body is read raw (`response.reader`), so ask for it
+            // uncompressed: std's default offers gzip, and a server that
+            // takes the offer (DeepSeek, #467) sends bytes the SSE parser
+            // cannot read.
+            .headers = .{ .accept_encoding = .omit },
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "accept", .value = "application/vnd.amazon.eventstream" },

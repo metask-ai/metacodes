@@ -200,6 +200,31 @@ test "L2 bedrock: request shape, and an event stream becomes neutral events" {
     try std.testing.expect(has(sent, "\"additionalModelRequestFields\":{\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"high\"}}"));
 }
 
+test "L2 bedrock: the event stream is requested uncompressed, so a server that gzips when offered still streams it whole (#467)" {
+    const a = std.testing.allocator;
+    const body = try endTurn(a);
+    defer a.free(body);
+    // Answers a request that offers gzip with a gzip-encoded body; the
+    // client reads the body raw, so the frames would not decode.
+    var server = try harness.MockServer.startCassetteGzipWhenAccepted(&.{body});
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var owned = try bedrockProvider(a, "brk-key", MODEL, origin(url));
+    defer owned.deinit();
+    var handle = try owned.provider().sendStream(&HI, null, null, null, null, null, "");
+    defer handle.deinit();
+    var got = try drain(a, handle);
+    defer got.deinit(a);
+    try std.testing.expectEqualStrings("done", got.text.items);
+    try std.testing.expectEqual(cc.api_stream.StopReason.end_turn, handle.stopReason());
+
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expectEqual(@as(?[]const u8, null), headerValue(captured, "accept-encoding"));
+    try std.testing.expectEqual(@as(u32, 0), server.gzipResponses());
+}
+
 test "L2 bedrock: reasoning that follows text is shown but never handed on for replay" {
     const a = std.testing.allocator;
     const body = try responseBytes(a, &.{
