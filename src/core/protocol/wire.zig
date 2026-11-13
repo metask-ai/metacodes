@@ -155,7 +155,7 @@ pub const HostEvent = union(enum) {
     /// and its `text` stayed out of the conversation. It takes the place of
     /// that message's `user_message`. `model` and `permission_mode` repeat
     /// what the message asked for (null when not given; the mode in the
-    /// spelling `/state` reports); `message` says why.
+    /// spelling `/state` reports); `message` says why, in words.
     message_rejected: struct { message: []const u8, text: []const u8, model: ?[]const u8 = null, permission_mode: ?[]const u8 = null },
     /// The Session can no longer run; the Host must close it. Work still
     /// queued was dropped and is counted.

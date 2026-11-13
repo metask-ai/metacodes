@@ -95,14 +95,25 @@ status, compatibility boundaries, and entry points are defined by
   0.15.0-dev.
 - **A `SessionHost` submission may carry its own `model` and
   `permission_mode`** (part of #445), as a `--web`/`serve` message does.
-  The driver applies them just before the Run, journaled as the
-  `command_result` of `set_model` and `set_permission_mode`, and they stay
-  the Session's settings. The mode is checked first, so when either is
-  refused nothing is applied, no Run starts and `message_rejected` (now
-  written by both Hosts) takes the place of `user_message`, naming the
-  error; the submission's idempotency key is not spent. Before, an
-  embedder had to queue the two commands itself and could not refuse the
-  text together with them.
+  The driver applies them just before the Run, journaled as
+  `config_changed` lines as the daemon journals a message's fields, and
+  they stay the Session's settings. The mode is checked first, so when
+  either is refused nothing is applied, no Run starts and
+  `message_rejected` (now written by both Hosts) takes the place of
+  `user_message`, saying why in the daemon's words; the submission's
+  idempotency key is not spent. Before, an embedder had to queue the two
+  commands itself and could not refuse the text together with them.
+- **`SessionHost` resolves model names as the daemon does, when the Host
+  asks** (part of #445). With the new `Options.models` (a
+  `session_host.ModelPolicy`: a borrowed `model_tiers.TierTable` and the
+  provider catalogs' models), a `Submission.model` or `set_model` name is
+  trimmed, a tier name (`low`/`mid`/`high`, `haiku`/`sonnet`/`opus`)
+  resolves through the Session's provider's tiers, and a model that
+  provider does not take (another provider's id, an unset tier) is
+  refused: `message_rejected` with `model not available for current
+  provider`, or `command_result` with `ModelUnavailable`. The rule
+  (`api/model_availability.zig`) is the one `--web`/`serve` messages and
+  `/model` use. Without `Options.models` a name is taken as before.
 
 - **`SessionHost` feeds a team lead its teammates' replies** (part of #445).
   A lead Session (`SessionConfig.team` with the lead role) hosted on

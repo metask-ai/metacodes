@@ -18,6 +18,7 @@ const std = @import("std");
 const app_mod = @import("app.zig");
 const types = @import("types.zig");
 const model_command = @import("repl/model_command.zig");
+const model_availability = @import("api/model_availability.zig");
 const theme_mod = @import("repl/tui/theme.zig");
 const session_intent = @import("session_intent.zig");
 const agent_loop = @import("core/agent_loop.zig");
@@ -203,12 +204,7 @@ pub const SessionService = struct {
         // U11:档位/别名解析先于守卫——对齐 loop.zig /model use 路径。档位名
         // (low/mid/high;兼容 haiku/sonnet/opus)查当前 provider 档位表;未配置时
         // 按字面交给 provider 守卫拒绝(明确报错,不静默映射硬编码 ID,不无声 no-op)。
-        const trimmed = std.mem.trim(u8, model_id, " \t");
-        const resolved = @import("tools/agent.zig").resolveModelSelection(
-            self.app.activeModelTiers(),
-            trimmed,
-            null,
-        ).model orelse trimmed;
+        const resolved = model_availability.resolveTierName(self.app.activeModelTiers(), model_id);
         // provider 守卫(对齐 loop.zig 旧 /model；顺带修 web /model 之前漏守卫)：收集当前
         // provider 的候选，拒绝跨 provider 的 model。候选 slice owned,元素借 catalog/BUILTINS。
         const candidates = model_command.collectCandidates(alloc, self.app.config.provider_kind, self.app.api_client.catalog.entries.items) catch {
@@ -216,7 +212,7 @@ pub const SessionService = struct {
         };
         defer alloc.free(candidates);
         if (!model_command.canUseInCurrentProvider(self.app.config.provider_kind, candidates, resolved)) {
-            return .{ .refused = .{ .kind = .err, .ok = false, .data = .{ .text = "model not available for current provider" } } };
+            return .{ .refused = .{ .kind = .err, .ok = false, .data = .{ .text = model_availability.unavailable_reason } } };
         }
         return .{ .model = resolved };
     }
@@ -242,12 +238,7 @@ pub const SessionService = struct {
     /// applying anything else (web/session.zig startSubmission).
     pub fn checkPermMode(self: *SessionService, mode: types.PermissionMode) ?CommandOutcome {
         if (self.app.permission_ctx.modeAllowed(mode)) return null;
-        const text = switch (permission_mode.canonical(mode)) {
-            .bypass_permissions => "bypassPermissions is disabled by settings",
-            .auto => "auto mode is disabled by settings",
-            else => "permission mode is disabled by settings",
-        };
-        return .{ .kind = .err, .ok = false, .data = .{ .text = text } };
+        return .{ .kind = .err, .ok = false, .data = .{ .text = permission_mode.disabledReason(mode) } };
     }
 
     /// Set the permission mode; a mode the settings disable is refused and

@@ -85,12 +85,12 @@ What a Host adds around the kernel's events, as
   conversation, no Run starts, and the line takes the place of the
   message's `user_message`. `model` and `permission_mode` repeat what the
   message asked for: `null` when not given, the mode as `/state` spells it.
-  `message` says why: words on `--web`/`serve`, the error name
-  (`PermissionModeDisabled`, `InvalidModel`, …) on `SessionHost`. A
-  submission's accepted `model` and `permission_mode` are journaled before
-  its `user_message`: as `config_changed` on `--web`/`serve`, as the
-  `command_result` of `set_model` and `set_permission_mode` on
-  `SessionHost`.
+  `message` says why, in words a person reads; where both Hosts refuse
+  alike they say the same (`bypassPermissions is disabled by settings`,
+  `model not available for current provider`). A message's accepted
+  `model` and `permission_mode` are journaled before its `user_message`
+  as `config_changed`, by both Hosts, also when already in force; `model`
+  as resolved (a tier name becomes the tier's model).
 
 The `user_message` host event carries `replaces`, appended under §4's
 additive rule 2: `null` when the Run's text was appended after the whole

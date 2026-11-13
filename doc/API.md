@@ -1104,15 +1104,31 @@ leaving every Host to rebuild them:
 - A submission may carry its own `model` and `permission_mode` (#445), as a
   `--web`/`serve` message does: the driver applies them just before the
   Run, as `set_model` then `set_permission_mode` queued right ahead of it
-  would, and journals each as that command's `command_result` before the
-  Run's `user_message`. They stay the Session's settings afterwards. The
-  mode is checked first (`AgentSession.setPermissionMode`'s check), so
-  when either is refused (`PermissionModeDisabled`, or the model's
-  `InvalidModel` or provider error) nothing is applied, the text stays out
-  of the conversation, no Run starts, and `message_rejected` takes the
-  place of `user_message`, its `message` the error name. Its idempotency
-  key is not spent; `model` and `permission_mode` are not part of what a
-  key compares.
+  would, and journals each as `config_changed` (`{"model":...}` as
+  resolved, `{"mode":...}`) before the Run's `user_message`, also when
+  the value was already in force, as `--web`/`serve` does. They stay the
+  Session's settings afterwards. The mode is checked first
+  (`AgentSession.setPermissionMode`'s check), so when either is refused
+  (a mode the settings disable, or a model `Options.models` or the
+  Session refuses) nothing is applied, the text stays out of the
+  conversation, no Run starts, and `message_rejected` takes the place of
+  `user_message`, its `message` saying why in words (the daemon's, such
+  as `bypassPermissions is disabled by settings` or `model not available
+  for current provider`, where the two refuse alike). Its idempotency key
+  is not spent; `model` and `permission_mode` are not part of what a key
+  compares.
+- With `Options.models` (a `ModelPolicy`), a model name in a submission
+  or a `set_model` command resolves as the bundled daemon resolves one
+  (`api/model_availability.zig`, shared with `/model` and `--web`/`serve`
+  messages): it is trimmed, a tier name (`low`/`mid`/`high`, or
+  `haiku`/`sonnet`/`opus`) becomes the model `tiers` (a borrowed
+  `model_tiers.TierTable`) sets for the Session's provider kind, and the
+  result must be one that provider takes: listed for it in `catalog`
+  (`CatalogModel{ provider, id }`, borrowed), or with an id that names it
+  (`claude-`, `gpt`/`o1`/`o3`, `gemini`). Anything else, an unset tier
+  included, is `error.ModelUnavailable` (`set_model`'s `error_name`) and
+  changes nothing. A tier's reasoning effort is not applied, as on the
+  daemon. Without `Options.models` the name goes to the Session as it is.
 - The queue holds `max_queued` (64) submissions and commands. Beyond it
   `submit` and `command` refuse with `error.QueueFull` and hold nothing (an
   HTTP Host: `429`); a duplicate is answered as one before the bound is
@@ -1189,7 +1205,7 @@ leaving every Host to rebuild them:
 
 Options: `max_queued`, `max_turns`, `teammates`, `transcripts`,
 `ui_request_timeout_ms`, `ui_request_expiry`, `ui_request_wait`,
-`idempotency_retention_ms`, `idempotency_max_keys`.
+`idempotency_retention_ms`, `idempotency_max_keys`, `models`.
 Authentication, tenancy and the transport stay with the Host.
 To stream a Session's journal over SSE, parse the client's position with
 `event_journal.Cursor.fromLastEventId` / `fromSince`, start from

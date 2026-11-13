@@ -1362,8 +1362,8 @@ test "L2 #445 SessionHost: a lead that keeps re-spawning a failing name stops af
     try std.testing.expectEqual(@as(usize, 0), snap.queued);
 }
 
-/// The `type` of each host line in `journal`, in order, joined by spaces;
-/// kernel events are left out.
+/// The `type` of each host line and `config_changed` in `journal`, in
+/// order, joined by spaces; other kernel events are left out.
 fn hostLineTypes(journal: *EventJournal, out: []u8) ![]const u8 {
     const a = std.testing.allocator;
     const lines = (try journal.waitSince(a, 0, 1)) orelse return out[0..0];
@@ -1373,7 +1373,7 @@ fn hostLineTypes(journal: *EventJournal, out: []u8) ![]const u8 {
     }
     var len: usize = 0;
     for (lines) |line| {
-        inline for (.{ "user_message", "run_done", "command_result", "message_rejected" }) |tag| {
+        inline for (.{ "config_changed", "user_message", "run_done", "command_result", "message_rejected" }) |tag| {
             if (std.mem.indexOf(u8, line, "\"type\":\"" ++ tag ++ "\"") != null) {
                 const written = try std.fmt.bufPrint(out[len..], "{s}{s}", .{ if (len == 0) "" else " ", tag });
                 len += written.len;
@@ -1421,12 +1421,12 @@ test "L2 #445 SessionHost: a submission's own model and permission mode apply be
     try std.testing.expect(!try modelRead(server, 0, "test-model"));
     try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"ui_request\""));
     try std.testing.expect(try exists(workspace, "m.txt"));
-    // Journaled as the two commands queued ahead of it would be, before the
-    // Run's first line.
+    // Journaled as the daemon journals a message's fields, before the Run's
+    // first line.
     var types_buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("command_result command_result user_message run_done", try hostLineTypes(&hosted.journal, &types_buf));
-    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"command\":\"set_model\",\"ok\":true"));
-    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"command\":\"set_permission_mode\",\"ok\":true"));
+    try std.testing.expectEqualStrings("config_changed config_changed user_message run_done", try hostLineTypes(&hosted.journal, &types_buf));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"message-model\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"accept_edits\"}}"));
 
     // They are the Session's settings from then on.
     try hosted.submit(.{ .text = "and now" });
@@ -1483,11 +1483,11 @@ test "L2 #445 SessionHost: a submission whose mode or model is refused is messag
     // A disabled mode: the model it came with is not switched either.
     try hosted.submit(.{ .text = "first try", .model = "other-model", .permission_mode = .bypass_permissions, .idempotency_key = "im:evt-1" });
     try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 1);
-    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"PermissionModeDisabled\",\"text\":\"first try\",\"model\":\"other-model\",\"permission_mode\":\"bypass_permissions\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"bypassPermissions is disabled by settings\",\"text\":\"first try\",\"model\":\"other-model\",\"permission_mode\":\"bypass_permissions\"}}"));
     // A model the Session cannot take.
     try hosted.submit(.{ .text = "second try", .model = "" });
     try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 2);
-    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"InvalidModel\",\"text\":\"second try\",\"model\":\"\",\"permission_mode\":null"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model name is empty or not valid UTF-8\",\"text\":\"second try\",\"model\":\"\",\"permission_mode\":null"));
 
     var rejected = try hosted.snapshot(a);
     defer rejected.deinit(a);
@@ -1510,4 +1510,88 @@ test "L2 #445 SessionHost: a submission whose mode or model is refused is messag
     var ran = try hosted.snapshot(a);
     defer ran.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), ran.messages);
+}
+
+test "L2 #445 SessionHost Options.models: a tier name resolves and a model the provider does not take is message_rejected, as the daemon's setTurnModel" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ done, done, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // The daemon's two sources: the state root's `model_tiers` (only
+    // `high` set for anthropic) and the provider's server catalog.
+    var tiers = (try cc.model_tiers.parseTableFromConfig(a, "{\"model_tiers\":{\"anthropic\":{\"high\":{\"model\":\"claude-tier-high\"}},\"openai\":{\"low\":{\"model\":\"gpt-tier-low\"}}}}")).?;
+    defer tiers.deinit();
+    const catalog = [_]cc.session_host.CatalogModel{
+        .{ .provider = .anthropic, .id = "house-model" },
+        .{ .provider = .openai, .id = "openai-house" },
+    };
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .models = .{ .tiers = &tiers, .catalog = &catalog } });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{}) });
+    defer host.release(hosted);
+
+    // A tier name: the provider gets the tier's model, and `config_changed`
+    // names it.
+    try hosted.submit(.{ .text = "on the tier", .model = " high " });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"claude-tier-high\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"claude-tier-high\"}}"));
+
+    // A tier the table leaves unset for this provider (set only for
+    // openai), another provider's model, and another provider's catalog
+    // entry: refused in words, nothing applied, no Run.
+    try hosted.submit(.{ .text = "unset tier", .model = "low" });
+    try hosted.submit(.{ .text = "other provider", .model = "gpt-4o" });
+    try hosted.submit(.{ .text = "other catalog", .model = "openai-house" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 3);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"model not available for current provider\",\"text\":\"unset tier\",\"model\":\"low\",\"permission_mode\":null}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model not available for current provider\",\"text\":\"other provider\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model not available for current provider\",\"text\":\"other catalog\""));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+
+    // A model the catalog lists for this provider, though its id names
+    // none; then the model already in force, announced again.
+    try hosted.submit(.{ .text = "from the catalog", .model = "house-model" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try hosted.submit(.{ .text = "same again", .model = "house-model" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 3);
+    try std.testing.expect(try modelRead(server, 1, "\"model\":\"house-model\""));
+    try std.testing.expect(try modelRead(server, 2, "\"model\":\"house-model\""));
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"house-model\"}}"));
+    for ([_][]const u8{ "unset tier", "other provider", "other catalog" }) |refused| {
+        try std.testing.expect(!try modelRead(server, 2, refused));
+    }
+
+    // `set_model` resolves the same way.
+    try hosted.command(.{ .set_model = "mid" });
+    try hosted.command(.{ .set_model = "opus" });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_model\",\"ok\":false,\"error_name\":\"ModelUnavailable\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"command\":\"set_model\",\"ok\":true"));
+
+    var types_buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "config_changed user_message run_done message_rejected message_rejected message_rejected " ++
+            "config_changed user_message run_done config_changed user_message run_done command_result command_result",
+        try hostLineTypes(&hosted.journal, &types_buf),
+    );
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("claude-tier-high", snapshot.model);
+    try std.testing.expectEqual(@as(usize, 6), snapshot.messages);
 }

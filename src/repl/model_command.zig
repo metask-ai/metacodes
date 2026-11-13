@@ -9,6 +9,7 @@ const types = @import("../types.zig");
 const catalog_mod = @import("../api/catalog.zig");
 const capability_mod = @import("../api/capability.zig");
 const provider_mod = @import("../api/provider.zig");
+const model_availability = @import("../api/model_availability.zig");
 
 pub const Capability = provider_mod.Capability;
 
@@ -112,12 +113,7 @@ pub fn capabilityLabel(cap: Capability) []const u8 {
     };
 }
 
-pub fn providerForModel(model: []const u8) ?types.ProviderKind {
-    if (model_name.startsWithIgnoreCase(model, "claude-")) return .anthropic;
-    if (model_name.startsWithIgnoreCase(model, "gpt") or model_name.startsWithIgnoreCase(model, "o1") or model_name.startsWithIgnoreCase(model, "o3")) return .openai;
-    if (model_name.startsWithIgnoreCase(model, "gemini")) return .gemini;
-    return null;
-}
+pub const providerForModel = model_availability.providerForModel;
 
 pub fn looksLikeModelId(model: []const u8) bool {
     return providerForModel(model) != null or std.mem.indexOfScalar(u8, model, '-') != null;
@@ -207,12 +203,13 @@ pub fn isKnownCandidate(candidates: []const Candidate, model: []const u8) bool {
     return false;
 }
 
+/// The provider guard (api/model_availability.zig) over `collectCandidates`'
+/// list, whose every entry is the current provider's.
 pub fn canUseInCurrentProvider(current_provider: types.ProviderKind, candidates: []const Candidate, model: []const u8) bool {
     for (candidates) |c| {
         if (model_name.eqlIgnoreCase(c.id, model)) return c.provider == current_provider;
     }
-    const inferred = providerForModel(model) orelse return false;
-    return inferred == current_provider;
+    return model_availability.available(current_provider, false, model);
 }
 
 test "parseQuery supports group capability and model selection" {
