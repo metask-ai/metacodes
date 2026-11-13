@@ -593,3 +593,29 @@ test "requester: 读不懂的应答按取消处理,记 malformed 而非 answered
     }
     try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "\"outcome\":\"malformed\"") != null);
 }
+
+test "#446 requester: an unreadable answer closes malformed under its approver" {
+    var j = EventJournal.init(testing.allocator);
+    defer j.deinit();
+    var wb = WebBackend.init(testing.allocator, &j);
+    defer wb.deinit();
+    const Responder = struct {
+        fn run(b: *WebBackend, jj: *EventJournal) void {
+            const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
+            for (batch) |l| std.testing.allocator.free(l);
+            std.testing.allocator.free(batch);
+            _ = b.respond(1, "{\"choice\":\"pretty_please\",\"by\":\"alice\"}");
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Responder.run, .{ &wb, &j });
+    defer t.join();
+    const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    var resp: UiResponse = undefined;
+    try testing.expectError(error.UiAnswerUnreadable, wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
+    const all = (try j.waitSince(testing.allocator, 0, 10)).?;
+    defer {
+        for (all) |l| testing.allocator.free(l);
+        testing.allocator.free(all);
+    }
+    try testing.expectEqualStrings("{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"malformed\",\"by\":\"alice\"}", all[all.len - 1]);
+}
