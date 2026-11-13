@@ -1164,11 +1164,15 @@ UI requests on a long-lived Session (#446; the wire side is
   apart), never from the client's answer body.
 - **Expiry.** `ui_request_timeout_ms` (null: no limit) and
   `ui_request_expiry`: `.cancel` (default, as before) closes the request
-  `cancelled` with its safe answer and the Run goes on; `.interrupt` does
+  `cancelled` and the Run goes on without the answer; `.interrupt` does
   that and stops the Run; `.re_announce` journals the same `ui_request` line
-  again every period until someone answers. `.re_announce` needs a period:
-  with a zero `ui_request_timeout_ms`, `open` is
-  `error.InvalidUiRequestTimeout`.
+  again every period until someone answers. Under `.cancel` and
+  `.interrupt` alike, an expired permission prompt is denied and the model
+  reads that nobody answered in time, and an expired question or custom UI
+  fails with `InputAborted`
+  ([WIRE_PROTOCOL.md §1.4](WIRE_PROTOCOL.md#14-requests-nobody-answered)).
+  `.re_announce` needs a period: with a zero `ui_request_timeout_ms`, `open`
+  is `error.InvalidUiRequestTimeout`.
 - **Waiting work.** A Session runs one thing at a time: a submission or
   command queued while a request is open waits behind it, never refused for
   it. `snapshot()` says why in `queue_waiting` (`.none`, `.run`,

@@ -242,9 +242,12 @@ another, applying the answer as before.
 
 **Expiry** (`SessionHost.Options.ui_request_expiry`, with
 `ui_request_timeout_ms`). Every policy closes a request with an outcome v1
-already has: `cancel` (the default, as before) closes it `"cancelled"` with
-its safe answer and the Run goes on; `interrupt` does the same and stops the
-Run, which ends `"stop_reason":"aborted"`; `re_announce` writes the request's
+already has: `cancel` (the default, as before) closes it `"cancelled"` and
+the Run goes on without the answer; `interrupt` does the same and stops the
+Run, which ends `"stop_reason":"aborted"`. Under either, the model reads
+§1.4's timeout: an expired permission prompt did not run because nobody
+answered in time, also when `interrupt` then stops the Run, and a question or
+a custom UI fails with `InputAborted`. `re_announce` writes the request's
 `ui_request` line again, the same bytes under the same id, every period until
 it is answered, interrupted or closed. A frontend shows a repeated
 announcement once, as it already does after replaying a journal.

@@ -275,9 +275,10 @@ pub const UiRequestWait = enum {
 /// (`Options.ui_request_expiry`, #446). Each closes the request with an
 /// outcome v1 already has, never a new one (doc/WIRE_PROTOCOL.md §4).
 pub const UiRequestExpiry = enum {
-    /// The default, as before #446: the request closes `"cancelled"` with
-    /// its safe answer (a permission denied once, a question or custom UI
-    /// aborted) and the Run goes on without the answer.
+    /// The default, as before #446: the request closes `"cancelled"` and the
+    /// Run goes on without the answer. A permission prompt is denied, and
+    /// the model reads that nobody answered in time; a question or a custom
+    /// UI fails with `InputAborted` (doc/WIRE_PROTOCOL.md §1.4).
     cancel,
     /// As `cancel`, and the Run stops there, as after `interrupt`, instead of
     /// going on without the answer. A permission prompt still reads as
@@ -1897,7 +1898,7 @@ pub const HostedSession = struct {
     /// it under `.block`: the question's answers as AskUserQuestion returns
     /// them, a custom UI's `result` as is (the kernel's suspension convention,
     /// doc/CORE_REFERENCE.md §5.3). Cancelled or unreadable, the call fails
-    /// with InputAborted, the safe answer (`wire.cancelResponse`).
+    /// with InputAborted, as `wire.cancelResponse` fails a question.
     fn prepareResumption(suspension: *const Suspension, settled: Suspension.Settled, a: std.mem.Allocator) !Resumption {
         var closed: wire.RequestClosed = .cancelled;
         var by: ?[]const u8 = null;
