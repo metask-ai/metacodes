@@ -131,7 +131,11 @@ provider/model/权限上下文一致(`agent_type` 不解释)。同名 member 若
 重开,旧 member 的迟到邮件仍不可寻址,对应 `App` 回收已终止 teammate。spawn 失败不再只记
 日志:失败以 `<teammate-status from="<name>" state="failed">teammate was not started:
 <error></teammate-status>` 作为 lead 的下一轮 Run(`user_message` 带 `source`
-`session_host`、`kind` `teammate_spawn_failed`),对应 `App` 下该失败就是 spawn 工具的结果。
+`session_host`、`kind` `teammate_spawn_failed`),对应 `App` 下该失败就是 spawn 工具的结果;
+同名 member 仍开着却拒收 prompt 时文字为 `teammate did not take the prompt: <error>`。
+`App` 下这类失败是同一轮 Run 内的工具结果,受 `max_turns` 约束;这里每次报告都是新一轮
+Run,所以报告不链式触发:履行"失败报告 Run"自身的 spawn 时再失败只记日志,模型反复
+spawn 一个起不来的名字最多多花一轮。
 
 与 in-process 共用同一套文件邮箱与名册语义,两条路径逐份核对安全属性(SW1 `waitForWork`
 vs host `pollLeadInbox`)。

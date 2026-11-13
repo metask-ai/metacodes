@@ -1281,3 +1281,57 @@ test "L2 #445 SessionHost: a spawn that fails is the lead's next Run, so its mod
     try std.testing.expect(std.mem.indexOf(u8, report, "teammate was not started: NoTeammateProvider") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "teammate_spawn_failed") == null);
 }
+
+test "L2 #445 SessionHost: a lead that keeps re-spawning a failing name stops after one failure report, as the App's turn limit bounds it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const retried = try textSse(a, "retried");
+    defer a.free(retried);
+    const again = try textSse(a, "again");
+    defer a.free(again);
+    // Every Run the model is given asks for `solver` again. Run 2 is the
+    // report of Run 1's failure; a Run 3 would be a report of a report.
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        toolSse("t3", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        retried,
+        toolSse("t4", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        again,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var refusing = RefusingFactory{};
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = refusing.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = spawnLeadConfig(lead_url, workspace) });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+    // Give a third Run every chance to start.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+
+    // Both spawns were tried; only the first was reported.
+    try std.testing.expectEqual(@as(usize, 2), refusing.calls);
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&lead.journal, "\"type\":\"run_done\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"kind\":\"teammate_spawn_failed\""));
+    try std.testing.expectEqual(@as(usize, 5), lead_srv.requestCount());
+    var snap = try lead.snapshot(a);
+    defer snap.deinit(a);
+    try std.testing.expectEqual(cc.session_host.Phase.idle, snap.phase);
+    try std.testing.expectEqual(@as(usize, 0), snap.queued);
+}

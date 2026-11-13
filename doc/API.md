@@ -1144,7 +1144,14 @@ leaving every Host to rebuild them:
   A refused or failed spawn becomes the lead's next Run, so its model learns
   of it: `<teammate-status from="<name>" state="failed">teammate was not
   started: <error></teammate-status>`, journaled as a typed `user_message`
-  (`source` `session_host`, `kind` `teammate_spawn_failed`). A name the lead
+  (`source` `session_host`, `kind` `teammate_spawn_failed`;
+  `session_host.spawn_failure_source`/`spawn_failure_kind`). When the name
+  was already open and its member refused the prompt, the text says
+  `teammate did not take the prompt: <error>` instead. A failure while
+  fulfilling such a report Run's own spawns is only logged, so a model that
+  keeps asking for a name that cannot start gets one report, not a Run per
+  retry (under the `App` the failure is a tool result, bounded by the turn
+  limit). A name the lead
   already opened, still open, takes the prompt as its next Run; one whose
   member the Host closed is opened again under a fresh lease, after its old
   roster entry is dropped. Closing the lead closes the members it opened.

@@ -135,7 +135,11 @@ status, compatibility boundaries, and entry points are defined by
   lead's next Run, `<teammate-status from="<name>" state="failed">teammate
   was not started: <error></teammate-status>`, journaled as a typed
   `user_message` (`source` `session_host`, `kind`
-  `teammate_spawn_failed`).
+  `teammate_spawn_failed`); a member that was open but refused the prompt
+  reads `teammate did not take the prompt: <error>`. Reports do not chain:
+  a failure while fulfilling a report Run's own spawns is only logged, so a
+  model that keeps re-spawning a name that cannot start costs one extra Run,
+  not one per retry.
 
 - **The UDS binding answers UI requests and takes capability frames.** A
   UDS-only frontend needed HTTP beside the socket for exactly the most
