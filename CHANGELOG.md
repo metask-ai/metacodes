@@ -120,6 +120,26 @@ status, compatibility boundaries, and entry points are defined by
   next Run, and closing the lead closes its members. Without a factory
   nothing changes. `SwarmContext.popPendingSpawn` hands a request over with
   its ownership.
+- **`SessionHost` teammates inherit their lead, re-spawn, and fail visibly**
+  (part of #445). The new `session_host.InheritLead` is the `TeammateFactory`
+  the bundled daemon needs: each member gets the Host's base configuration
+  with its lead's current model and permission mode, and the spawn's effort
+  or else the lead's reasoning effort, as an `App` teammate inherits its
+  lead's. `TeammateSpawn` now carries those lead settings
+  (`lead_model`, `lead_permission_mode`, `lead_reasoning_effort`), read on
+  the lead's driver after the commands queued before the spawn. A name whose
+  member the Host closed is opened again: its old roster entry, which held
+  the old lease and refused the new member, is dropped first, so the new
+  member joins under a fresh lease and the closed one's mail stays
+  unaddressed. A spawn that fails is no longer only logged: it becomes the
+  lead's next Run, `<teammate-status from="<name>" state="failed">teammate
+  was not started: <error></teammate-status>`, journaled as a typed
+  `user_message` (`source` `session_host`, `kind`
+  `teammate_spawn_failed`); a member that was open but refused the prompt
+  reads `teammate did not take the prompt: <error>`. Reports do not chain:
+  a failure while fulfilling a report Run's own spawns is only logged, so a
+  model that keeps re-spawning a name that cannot start costs one extra Run,
+  not one per retry.
 
 - **The UDS binding answers UI requests and takes capability frames.** A
   UDS-only frontend needed HTTP beside the socket for exactly the most
@@ -133,7 +153,47 @@ status, compatibility boundaries, and entry points are defined by
   same acknowledgement line as `POST /capabilities` and journaled for every
   attached reader. doc/WIRE_PROTOCOL.md §2.3 and doc/API.md spell the ops out.
 
+- **UI requests on long-lived Hosts: who answered, what an unanswered one
+  gets, and questions that survive a restart** (part of #446). An answer may
+  name its approver, `"by"`; the request's `ui_request_closed` records it,
+  appended after `outcome` only when given, so other lines keep their bytes
+  (`tests/fixtures/wire/v1/requests.jsonl`). `SessionHost.respond` refuses a
+  `by` that is not 1 to 256 bytes of string (`error.InvalidApprover`) and a
+  second answer to a request whose first is not applied yet
+  (`error.AlreadyAnswered`); `--web` and `serve` record a valid `by` as well.
+  `SessionHost.Options.ui_request_expiry` says what a request
+  `ui_request_timeout_ms` leaves unanswered gets: `.cancel` (the default, as
+  before), `.interrupt` (the Run stops too; an expired permission prompt
+  still reads as unanswered in time, doc/WIRE_PROTOCOL.md §1.4) or
+  `.re_announce` (the same `ui_request` line again every period, so a zero
+  timeout is refused, `error.InvalidUiRequestTimeout`). Work queued while a
+  request is open waits behind it, and `Snapshot.queue_waiting` says why. With
+  `Options.ui_request_wait = .suspend`, a question or custom UI request ends
+  its Run `suspended` instead of holding the driver: the Session's directory
+  keeps it, `close` leaves it there, `open(.resume)` announces it again under
+  its id after a restart, and `respond` resumes the Run once through the new
+  `AdmittedRun.resumeWithResults`, journaled with the new host event
+  `run_resumed`; the resumed Run keeps the suspended Run's trace id, turn
+  limit and stream retry budget, and request ids are never reused. Each
+  answer reaches only the request it names, and a suspended Run's
+  idempotency key stays spent while it waits. Nothing
+  else runs while a Run is suspended, and a suspended team lead leaves its
+  inbox unread until it resumes. Permission
+  requests still block in that mode: the kernel's permission gate reads a
+  `pending` answer as a denial, so making them survive a restart needs the
+  kernel to suspend there first (follow-up). doc/WIRE_PROTOCOL.md §1.5,
+  doc/API.md.
+
 ### Fixed
+
+- **A cancelled question no longer poisons its `SessionHost` Session** (part
+  of #446). A question the timeout, an interrupt or an unreadable answer
+  cancelled reached the AgentSession as `InputAborted`, which it takes for a
+  broken Host: the Run failed `CallbackFailed` and the Session reported
+  `session_poisoned`. It now gets `UiCancelled`, the user's outcome, so the
+  call fails with `InputAborted` as the model sees it and the Run and Session
+  go on. A cancelled custom UI request still poisons; that needs the
+  AgentSession to tell the two apart for custom requests too.
 
 - **A permission prompt nobody answered no longer reaches the model as
   "user declined"** (#463). A `SessionHost` timeout, an interrupt or close, an
@@ -148,6 +208,7 @@ status, compatibility boundaries, and entry points are defined by
   `wire.parseResponse` returns `void` and fails an unreadable permission
   answer with `UiAnswerUnreadable` (journal it with
   `wire.closedOnParseError`). Wire lines are unchanged.
+
 - **A model request is retried once after a transient stream interruption,
   even after partial output** (#461). A gateway stream that returned HTTP 200,
   streamed some text or thinking and then dropped ended the Run with

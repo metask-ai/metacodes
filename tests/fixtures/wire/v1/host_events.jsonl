@@ -13,5 +13,6 @@
 {"v":1,"type":"message_rejected","data":{"message":"model not available for current provider","text":"fix the build","model":"gpt-5.6-luna","permission_mode":"bypass_permissions"}}
 {"v":1,"type":"message_rejected","data":{"message":"bypassPermissions is disabled by settings","text":"fix the build","model":null,"permission_mode":"bypass_permissions"}}
 {"v":1,"type":"session_poisoned","data":{"error_name":"CallbackFailed","dropped":2}}
+{"v":1,"type":"run_resumed","data":{"run_id":2,"trace_id":"trace-1","request_id":1}}
 {"v":1,"type":"text_chunk","run_id":3,"trace_id":"trace-1","data":"on it"}
 {"v":1,"type":"stream_done","run_id":4,"data":null}

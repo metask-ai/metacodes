@@ -28,6 +28,19 @@
 //! `ui_request_unavailable` and answered `unrenderable` without waiting. A
 //! Session whose client never declares announces every request, as before.
 //!
+//! UI requests (#446). An answer may name who gave it (`by`); its
+//! `ui_request_closed` line records them. What an unanswered request gets
+//! once `ui_request_timeout_ms` passes is `ui_request_expiry`'s choice. With
+//! `ui_request_wait = .suspend`, a question or custom UI request does not hold
+//! the driver: its Run ends `suspended`, the Session's directory keeps the
+//! request (`ui_request_store`), `close` leaves it there, a
+//! Session opened again under its id announces it again under the same id,
+//! and `respond` resumes the Run with the answer, once (`AgentSession`'s
+//! `AdmittedRun.resumeWithResults`). A permission request always blocks: the
+//! kernel's permission gate reads a `pending` answer as no answer and denies
+//! the tool. Work submitted while a request waits is queued behind it, and
+//! `Snapshot.queue_waiting` says so.
+//!
 //! Per Session one driver thread makes every call into the AgentSession.
 //! Submissions and configuration commands share one FIFO, so "set the model,
 //! then send this" happens in that order and only while the Session is idle.
@@ -46,7 +59,11 @@
 //! order, asks the Host's `TeammateFactory` for each member's configuration,
 //! opens the member as another Session on the same host under the lead's team
 //! identity and a fresh lease, and submits the request's prompt as its first
-//! Run. Closing the lead closes the members it opened.
+//! Run. Closing the lead closes the members it opened. A name whose member
+//! the Host closed is opened again under a fresh lease, and a spawn that
+//! fails becomes the lead's next Run, so its model learns of it; a failure
+//! while fulfilling that report Run's own spawns is only logged.
+//! `InheritLead` is the factory that configures each member like its lead.
 //!
 //! Lifetimes: `open` and `acquire` return a counted reference that `release`
 //! gives back; no pointer escapes without one. `close` takes the Session out
@@ -63,6 +80,10 @@ const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
 const agent_session = @import("agent_session.zig");
+const agent_loop = @import("agent_loop.zig");
+const ui_request_store = @import("ui_request_store.zig");
+const tool_error = @import("tool_error.zig");
+const ask_user = @import("../tools/ask_user.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const MessagePosition = @import("conversation.zig").MessagePosition;
 const transcript = @import("transcript.zig");
@@ -82,10 +103,17 @@ const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const swarm_tools = @import("../swarm/tools.zig");
 const swarm_context = @import("../swarm/context.zig");
+const swarm_team = @import("../swarm/team.zig");
 
 /// How often an idle team lead's inbox, a locked file, is read: the bundled
 /// daemon's `session_service.LeadMail.POLL_MS`.
 pub const lead_inbox_poll_ms: u64 = 500;
+
+/// The typed `source` and `kind` of the Run that reports a failed teammate
+/// spawn to its lead. A failure while fulfilling such a Run's own spawns is
+/// only logged, so reports never chain.
+pub const spawn_failure_source = "session_host";
+pub const spawn_failure_kind = "teammate_spawn_failed";
 
 const AgentRuntime = agent_session.AgentRuntime;
 const AgentSession = agent_session.AgentSession;
@@ -106,10 +134,18 @@ pub const Options = struct {
     /// state root) after every Run and command, so `open(.resume)` restores
     /// it.
     transcripts: bool = true,
+    /// How a question or custom UI request waits for its answer: holding the
+    /// driver (`.block`, as before #446) or as a suspended Run that survives
+    /// `close` (`.suspend`, which needs `transcripts`). A permission request
+    /// always blocks.
+    ui_request_wait: UiRequestWait = .block,
+    /// What a request `ui_request_timeout_ms` leaves unanswered gets.
+    ui_request_expiry: UiRequestExpiry = .cancel,
     /// How long a UI request waits for `respond`. Null waits until
-    /// `interrupt` or `close`. An expired request closes as `cancelled`; a
-    /// permission prompt is denied and the model reads that nobody answered
-    /// in time (doc/WIRE_PROTOCOL.md §1.4). The value never reaches the model.
+    /// `interrupt` or `close`. An expired request gets `ui_request_expiry`;
+    /// a permission prompt it closes is denied, and the model reads that
+    /// nobody answered in time (doc/WIRE_PROTOCOL.md §1.4). The value never
+    /// reaches the model.
     ui_request_timeout_ms: ?u64 = null,
     /// How long after its Run started an idempotency key still makes a
     /// delivery a duplicate. With `transcripts`, the keys outlive the Host:
@@ -144,7 +180,12 @@ pub const OpenSpec = struct {
     submission_template: ?[]const u8 = null,
 };
 
-pub const Phase = enum { idle, running, poisoned, closing };
+/// `suspended` (#446): a Run ended `suspended` on UI request
+/// `Snapshot.pending_request_id` (`Options.ui_request_wait = .suspend`);
+/// nothing else runs until that request is answered, interrupted or expires.
+/// Queued work waits, and a team lead does not read its inbox (reading marks
+/// mail read), so a teammate's reply waits there for the lead to resume.
+pub const Phase = enum { idle, running, suspended, poisoned, closing };
 
 /// One of a typed submission's `attributes` (#447).
 pub const Attribute = typed_submission.Attribute;
@@ -197,13 +238,32 @@ pub const SubmitError = EnqueueError || typed_submission.Invalid || error{
     /// (its text, source, kind, attributes or `replaces` differ).
     IdempotencyKeyReused,
 };
-pub const RespondError = error{ NoSuchRequest, OutOfMemory };
+pub const RespondError = error{
+    /// No request with this id is open: never announced, closed, or
+    /// cancelled by an interrupt, a close or its expiry.
+    NoSuchRequest,
+    /// The request already took an answer, not yet applied (#446): this one
+    /// changed nothing. A Host may report it as accepted.
+    AlreadyAnswered,
+    /// The answer's `by` is not an approver (`wire.answerApprover`); the
+    /// request is still open.
+    InvalidApprover,
+    OutOfMemory,
+};
 /// Test seam, read only in test builds: runs on the interrupting or closing
 /// thread once the cancellation is decided and before the kernel abort is
 /// requested - the window in which a released prompt used to let the Run take
 /// another turn.
 pub const testing_hooks = struct {
     pub var before_abort: ?*const fn (*HostedSession) void = null;
+    /// On the driver, once it has taken a suspended Run's resumption and
+    /// before anything is applied (#446): the window in which a second
+    /// answer to the same request must change nothing.
+    pub var before_resumption: ?*const fn (*HostedSession) void = null;
+    /// On the driver, while a Run that suspended is being held, after the
+    /// transcript is written and before the suspension is registered
+    /// (#446): an answer that arrives then must still reach the request.
+    pub var before_handover: ?*const fn (*HostedSession) void = null;
 };
 
 pub const InterruptOutcome = enum {
@@ -214,6 +274,58 @@ pub const InterruptOutcome = enum {
     requested,
     /// The Run had already finished.
     too_late,
+};
+
+/// How a question or custom UI request waits for its answer
+/// (`Options.ui_request_wait`, #446).
+pub const UiRequestWait = enum {
+    /// The driver waits inside the request until `respond`, the timeout,
+    /// `interrupt` or `close`, which answers it as cancelled. The default,
+    /// and the only way before #446.
+    block,
+    /// The Run ends `suspended` (the kernel's suspension: the tool call is
+    /// left without a result) and the Session's directory keeps the request.
+    /// `close` leaves it there; a Session opened again under the id
+    /// (`.resume`) announces it again under the same id; `respond` resumes
+    /// the Run with the answer then, once. Request ids are kept too, so none
+    /// is reused across restarts. A permission request still blocks as under
+    /// `.block`: the kernel's permission gate reads a `pending` answer as no
+    /// answer and denies the tool (permission/prompt.zig), so this mode never
+    /// answers one `pending`. Needs `Options.transcripts`.
+    @"suspend",
+};
+
+/// What a UI request that `ui_request_timeout_ms` leaves unanswered gets
+/// (`Options.ui_request_expiry`, #446). Each closes the request with an
+/// outcome v1 already has, never a new one (doc/WIRE_PROTOCOL.md §4).
+pub const UiRequestExpiry = enum {
+    /// The default, as before #446: the request closes `"cancelled"` and the
+    /// Run goes on without the answer. A permission prompt is denied, and
+    /// the model reads that nobody answered in time; a question or a custom
+    /// UI fails with `InputAborted` (doc/WIRE_PROTOCOL.md §1.4).
+    cancel,
+    /// As `cancel`, and the Run stops there, as after `interrupt`, instead of
+    /// going on without the answer. A permission prompt still reads as
+    /// unanswered in time, not as interrupted: nobody stopped the prompt.
+    interrupt,
+    /// The request is announced again, the same line under the same id, and
+    /// waits another `ui_request_timeout_ms`; again until it is answered,
+    /// interrupted or closed. A Host escalates on the repeated line.
+    re_announce,
+};
+
+/// Why queued work has not started (`Snapshot.queue_waiting`, #446). A
+/// Session runs one thing at a time, so work submitted while a request is
+/// open is queued behind it, never refused for it; a Host that wants it to
+/// run at once opens another Session.
+pub const QueueWaiting = enum {
+    /// Nothing is queued, or the driver is taking the head now.
+    none,
+    /// Behind the Run in progress.
+    run,
+    /// Behind UI request `pending_request_id`: the Run in progress waits for
+    /// its answer, or, in `Phase.suspended`, the suspended Run does.
+    ui_request,
 };
 
 /// What a Host reports about a Session (e.g. as `/state`). `model` is owned
@@ -230,7 +342,22 @@ pub const Snapshot = struct {
     max_queued: usize,
     seq: usize,
     epoch: [16]u8,
+    /// The UI request the Session waits on, 0 for none: the one the Run in
+    /// progress blocks on (a permission request always blocks), else the
+    /// question or custom UI request a Run suspended on (#446). Beside a
+    /// suspended or suspending question a permission request takes its own
+    /// id, shown here while it blocks; `respond` takes an answer only for
+    /// the request it names.
     pending_request_id: u64,
+    /// What queued work waits for (#446); `.ui_request` names
+    /// `pending_request_id`.
+    queue_waiting: QueueWaiting,
+    /// The Session's UI request policies, as `Options` declared them: how a
+    /// question or custom UI request waits (a permission request always
+    /// blocks), how long a request waits, and what it gets when that passes.
+    ui_request_wait: UiRequestWait,
+    ui_request_timeout_ms: ?u64,
+    ui_request_expiry: UiRequestExpiry,
     messages: usize,
 
     pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
@@ -252,6 +379,12 @@ pub const TeammateSpawn = struct {
     /// As the lead model passed them; the factory decides what they mean.
     agent_type: ?[]const u8,
     effort: ?[]const u8,
+    /// The lead's settings when it asked, after every command its queue ran
+    /// before (`set_model`, `set_permission_mode`, `set_reasoning_effort`):
+    /// what the bundled daemon's `App` teammates inherit from their lead.
+    lead_model: []const u8,
+    lead_permission_mode: types.PermissionMode,
+    lead_reasoning_effort: ?types.ReasoningEffort,
 };
 
 /// How the Host configures a member Session (#445). The SessionHost owns the
@@ -260,17 +393,100 @@ pub const TeammateSpawn = struct {
 /// lease. Provider, workspace, tools and permissions are the Host's choice,
 /// as for any Session it opens. The returned configuration may borrow from
 /// `arena`, which lives until the member is open. Runs on the lead's driver
-/// thread, so two leads may call it at once; an error drops the request
-/// (logged) and leaves the lead running.
+/// thread, so two leads may call it at once; an error drops the request,
+/// reports it to the lead as its next Run (unless the Run that asked was
+/// itself such a report) and leaves the lead running.
 pub const TeammateFactory = struct {
     ctx: *anyopaque,
     configure: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, spawn: TeammateSpawn) anyerror!SessionConfig,
 };
 
-/// A member Session a lead's driver opened, closed with the lead.
+/// The `TeammateFactory` that configures each member like its lead, as the
+/// bundled daemon's `App` starts its teammates with the lead's provider,
+/// model and permission context (#445). A member gets `base` (the
+/// configuration the Host opens its leads with: provider, credentials,
+/// workspace, tools, permission rules) with the lead's current model and
+/// permission mode, and the spawn's `effort` or else the lead's reasoning
+/// effort. `agent_type` is not interpreted.
+pub const InheritLead = struct {
+    /// Borrowed; outlives the SessionHost. Its `team` and UI requesters are
+    /// not used.
+    base: SessionConfig,
+
+    pub fn factory(self: *InheritLead) TeammateFactory {
+        return .{ .ctx = self, .configure = configure };
+    }
+
+    /// `base` as the member of the lead `spawn` describes. Borrows from
+    /// both.
+    pub fn derive(base: SessionConfig, spawn: TeammateSpawn) error{InvalidTeammateEffort}!SessionConfig {
+        var config = base;
+        config.team = null;
+        config.ui_requester = null;
+        config.run_ui_requester = null;
+        config.model = spawn.lead_model;
+        config.permission_mode = spawn.lead_permission_mode;
+        config.reasoning_effort = if (spawn.effort) |name|
+            std.meta.stringToEnum(types.ReasoningEffort, name) orelse return error.InvalidTeammateEffort
+        else
+            spawn.lead_reasoning_effort;
+        return config;
+    }
+
+    fn configure(ctx: *anyopaque, arena: std.mem.Allocator, spawn: TeammateSpawn) anyerror!SessionConfig {
+        const self: *InheritLead = @ptrCast(@alignCast(ctx));
+        var config = try derive(self.base, spawn);
+        // `spawn` is borrowed for this call only.
+        config.model = try arena.dupe(u8, spawn.lead_model);
+        return config;
+    }
+};
+
+test "InheritLead.derive: the lead's model, mode and effort over the base; the spawn's effort wins; no team" {
+    const base: SessionConfig = .{
+        .provider_kind = .anthropic,
+        .api_key = "k",
+        .model = "base-model",
+        .permission_mode = .default,
+        .reasoning_effort = .low,
+        .workspace = .{ .root = "/w" },
+        .allowed_tools = &.{"Read"},
+        .team = .{ .role = .lead, .team_name = "crew" },
+    };
+    var spawn: TeammateSpawn = .{
+        .lead = session_id_mod.gen(),
+        .team_name = "crew",
+        .name = "solver",
+        .prompt = "p",
+        .agent_type = null,
+        .effort = null,
+        .lead_model = "lead-model",
+        .lead_permission_mode = .accept_edits,
+        .lead_reasoning_effort = .high,
+    };
+    const inherited = try InheritLead.derive(base, spawn);
+    try std.testing.expectEqualStrings("lead-model", inherited.model);
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, inherited.permission_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.high, inherited.reasoning_effort.?);
+    try std.testing.expect(inherited.team == null);
+    try std.testing.expectEqualStrings("/w", inherited.workspace.root);
+    try std.testing.expectEqualStrings("Read", inherited.allowed_tools[0]);
+
+    spawn.effort = "minimal";
+    try std.testing.expectEqual(types.ReasoningEffort.minimal, (try InheritLead.derive(base, spawn)).reasoning_effort.?);
+    spawn.lead_reasoning_effort = null;
+    spawn.effort = null;
+    try std.testing.expect((try InheritLead.derive(base, spawn)).reasoning_effort == null);
+    spawn.effort = "loud";
+    try std.testing.expectError(error.InvalidTeammateEffort, InheritLead.derive(base, spawn));
+}
+
+/// A member Session a lead's driver opened, closed with the lead. `lease` is
+/// the roster identity it joined under.
 const Teammate = struct {
     name: []u8,
     id: SessionId,
+    lease: SessionId,
 };
 
 pub const SessionHost = struct {
@@ -312,6 +528,10 @@ pub const SessionHost = struct {
 
     /// Returns the Session holding one reference for the caller.
     pub fn open(self: *SessionHost, spec: OpenSpec) !*HostedSession {
+        // A suspended request lives in the Session's directory.
+        if (self.options.ui_request_wait == .@"suspend" and !self.options.transcripts) return error.SuspendRequiresTranscripts;
+        // `.re_announce` with no period would announce without ever waiting.
+        if (self.options.ui_request_expiry == .re_announce and (self.options.ui_request_timeout_ms orelse 1) == 0) return error.InvalidUiRequestTimeout;
         if (spec.config.ui_requester != null or spec.config.run_ui_requester != null) return error.UiRequesterNotAllowed;
         if (spec.mode == .@"resume" and spec.id == null) return error.IdRequiredForResume;
         if (spec.submission_template) |template| try typed_submission.checkTemplate(template);
@@ -390,6 +610,16 @@ pub const SessionHost = struct {
         // under a reused id keeps them, as a delivery that ran stays run.
         if (hosted.writer) |*writer| try hosted.ledger.load(writer.dir, wallMs());
 
+        // UI requests (#446): the policies, read by a shell that outlives the
+        // SessionHost too, and what the Session's directory kept.
+        hosted.request_policy = .{
+            .wait = self.options.ui_request_wait,
+            .timeout_ms = self.options.ui_request_timeout_ms,
+            .expiry = self.options.ui_request_expiry,
+        };
+        hosted.store_dir = if (hosted.writer) |*writer| writer.dir else null;
+        hosted.restoreRequests(spec.mode, &conversation);
+        errdefer hosted.dropRequests();
         hosted.driver = try std.Thread.spawn(.{}, HostedSession.driverMain, .{hosted});
         // The caller's reference, taken before the Session becomes visible.
         hosted.references = 1;
@@ -456,7 +686,76 @@ const Work = struct {
     item: union(enum) {
         submission: Submission,
         command: Command,
+        /// The driver's own (#446): resume the suspended Run with how its
+        /// request was settled (`HostedSession.suspension`, not owned here).
+        resumption: *Suspension,
+        /// The driver's own (#446): announce the suspended Run's request
+        /// again (`UiRequestExpiry.re_announce`).
+        re_announce,
     },
+};
+
+/// The UI request policies of a Session (`Options`, #446).
+const RequestPolicy = struct {
+    wait: UiRequestWait = .block,
+    timeout_ms: ?u64 = null,
+    expiry: UiRequestExpiry = .cancel,
+};
+
+/// A question or custom UI request the Run in progress answered `pending`
+/// (`UiRequestWait.suspend`): the kernel suspends the Run on it at the end of
+/// the tool calls in flight. Strings are the Session allocator's.
+const Suspending = struct {
+    id: u64,
+    /// Its `ui_request` line, once built; the id and its owner are
+    /// registered together, before it.
+    announcement: ?[]u8 = null,
+    /// An answer that came before the Run suspended, applied once it has.
+    answer: ?[]u8 = null,
+    by: ?[]u8 = null,
+};
+
+/// A Run that ended `suspended`, kept until its request is settled and the
+/// driver resumes it (#446). Everything but `settled` is fixed once held and
+/// lives in `arena`; `settled`'s strings are the Session allocator's.
+const Suspension = struct {
+    arena: std.heap.ArenaAllocator,
+    request_id: u64,
+    /// The request's `ui_request` line, announced again as is, and the
+    /// request read back from it.
+    announcement: []const u8,
+    request: ui_request.UiRequest,
+    /// The tool call the Run suspended on, and the results of the calls that
+    /// ran beside it (the kernel's `SuspendInfo`).
+    tool_use_id: []const u8,
+    tool_name: []const u8,
+    completed: []const agent_loop.SuspendInfo.CompletedResult,
+    /// The suspended Run's own settings, which the Run resuming it keeps.
+    settings: RunSettings,
+    /// Wall-clock milliseconds at which the request expires unanswered.
+    /// Driver-only.
+    expires_at_ms: ?i64,
+    /// Under the Session's `mutex`.
+    settled: Settled = .open,
+
+    const Settled = union(enum) {
+        open,
+        answered: struct { json: []u8, by: ?[]u8 },
+        cancelled: struct { stop: bool },
+    };
+};
+
+/// What was per-Run in a Run, given again to the Run that resumes it.
+const RunSettings = struct {
+    trace_id: ?[]const u8 = null,
+    max_turns: u32,
+    /// `AdmittedRun.stream_retry_budget` (#452). SessionHost leaves it at 0
+    /// (the loop's default) and keeps whatever its Run had.
+    stream_retry_budget: u8 = 0,
+    /// The submission's idempotency key (#447): while its Run is suspended
+    /// or resuming, a delivery under it is a duplicate, however old the
+    /// key's ledger entry is.
+    idempotency_key: ?[]const u8 = null,
 };
 
 pub const HostedSession = struct {
@@ -512,9 +811,33 @@ pub const HostedSession = struct {
 
     /// One UI request at a time; a second (from a parallel tool) waits.
     ui_serial: sync.Mutex = .{},
+    /// The request the Run in progress blocks on, under `mutex`; `response`
+    /// is its answer. A suspending or suspended request is not one: it has
+    /// its own id (`suspending`, `suspension`).
     pending_request_id: u64 = 0,
     next_request_id: u64 = 1,
     response: ?[]u8 = null,
+    /// Who gave `response`, when it named them (`wire.answerApprover`).
+    response_by: ?[]u8 = null,
+    /// The policies the Session's requests follow (#446).
+    request_policy: RequestPolicy = .{},
+    /// The Session's directory, where `ui_request_store` keeps its request
+    /// ids and a suspended request; null without transcripts. Borrowed from
+    /// `writer`; set before the driver starts.
+    store_dir: ?[]const u8 = null,
+    /// The request file there could not be read: it is left as it is,
+    /// never written over, and requests block instead of suspending.
+    store_unwritable: bool = false,
+    /// The request the Run in progress answered `pending`, under `mutex`.
+    suspending: ?Suspending = null,
+    /// The suspended Run while `phase` is `.suspended`, and until its
+    /// resumption has journaled the request's close. Under `mutex`; the
+    /// driver (or, once it stopped, `shutdown`) frees it.
+    suspension: ?*Suspension = null,
+    /// The suspension the Run in progress resumes. Its settlement stays in
+    /// `ui_request_store` until the transcript holds the call's result, the
+    /// witness the next open checks. Under `mutex`; the driver frees it.
+    resuming: ?*Suspension = null,
     /// What the client declared it renders; empty until `declareCapabilities`.
     capabilities: frontend_capabilities.Slot = .{},
     /// `Options.max_queued`, for a `snapshot` of a shell that outlived its
@@ -574,7 +897,9 @@ pub const HostedSession = struct {
         if (self.closing) return error.SessionClosed;
         if (self.phase == .poisoned) return error.SessionPoisoned;
         switch (self.ledger.check(key, digest, now)) {
-            .new => {},
+            // The ledger lets a key go after its retention; a suspended
+            // Run's key is held until the Run ends all the same (#446).
+            .new => if (self.heldKeyLocked(key)) return error.DuplicateSubmission,
             .duplicate => return error.DuplicateSubmission,
             .reused => return error.IdempotencyKeyReused,
         }
@@ -619,6 +944,14 @@ pub const HostedSession = struct {
             self.mutex.unlock();
             return .no_run;
         }
+        if (self.phase == .suspended) {
+            // The suspended request is cancelled, winning over an answer not
+            // yet applied; the Run resumes only to record that, then stops.
+            if (self.suspension) |suspension| self.cancelSuspensionLocked(suspension, true);
+            self.work_ready.signal();
+            self.mutex.unlock();
+            return .requested;
+        }
         if (self.phase == .running and self.run_returned) {
             self.mutex.unlock();
             return .too_late;
@@ -660,21 +993,49 @@ pub const HostedSession = struct {
         if (self.kernel_users == 0) self.kernel_idle.broadcast();
     }
 
-    /// Answers UI request `request_id` with a `protocol.wire` response. A
-    /// request that is not the pending one (answered, cancelled, stale), or
-    /// one an interrupt or close has already cancelled, is
-    /// `error.NoSuchRequest`.
+    /// Answers UI request `request_id` with a `protocol.wire` response, which
+    /// may name who gave it (`by`, recorded on `ui_request_closed`). A
+    /// request that is not open (closed, stale, or cancelled by an interrupt,
+    /// a close or its expiry) is `error.NoSuchRequest`; one that already took
+    /// an answer not yet applied is `error.AlreadyAnswered`. Neither changes
+    /// anything. A suspended Run's request (`UiRequestWait.suspend`) is
+    /// answered the same way, also after a restart; its Run then resumes.
     pub fn respond(self: *HostedSession, request_id: u64, response_json: []const u8) RespondError!void {
+        const by = try wire.answerApprover(self.gpa, response_json);
+        errdefer if (by) |name| self.gpa.free(name);
         const owned = try self.gpa.dupe(u8, response_json);
+        errdefer self.gpa.free(owned);
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.pending_request_id == 0 or self.pending_request_id != request_id or self.response != null or
-            self.run_interrupted or self.closing)
-        {
-            self.gpa.free(owned);
-            return error.NoSuchRequest;
+        if (request_id == 0 or self.closing) return error.NoSuchRequest;
+        // Each open request takes the answers given under its own id, and
+        // only those.
+        if (self.suspension) |suspension| {
+            if (suspension.request_id == request_id) {
+                switch (suspension.settled) {
+                    .open => {},
+                    .answered => return error.AlreadyAnswered,
+                    .cancelled => return error.NoSuchRequest,
+                }
+                suspension.settled = .{ .answered = .{ .json = owned, .by = by } };
+                self.work_ready.signal();
+                return;
+            }
         }
+        if (self.suspending) |*pending| {
+            if (pending.id == request_id) {
+                // Before its Run has suspended: applied once it has.
+                if (self.run_interrupted) return error.NoSuchRequest;
+                if (pending.answer != null) return error.AlreadyAnswered;
+                pending.answer = owned;
+                pending.by = by;
+                return;
+            }
+        }
+        if (self.pending_request_id == 0 or self.pending_request_id != request_id or self.run_interrupted) return error.NoSuchRequest;
+        if (self.response != null) return error.AlreadyAnswered;
         self.response = owned;
+        self.response_by = by;
         self.ui_ready.broadcast();
     }
 
@@ -711,7 +1072,18 @@ pub const HostedSession = struct {
             .max_queued = self.max_queued,
             .seq = self.journal.count(),
             .epoch = self.journal.epochHex(),
-            .pending_request_id = self.pending_request_id,
+            .pending_request_id = self.pendingIdLocked(),
+            .queue_waiting = if (self.queue.items.len == 0)
+                .none
+            else if (self.pendingIdLocked() != 0)
+                .ui_request
+            else if (self.phase == .running)
+                .run
+            else
+                .none,
+            .ui_request_wait = self.request_policy.wait,
+            .ui_request_timeout_ms = self.request_policy.timeout_ms,
+            .ui_request_expiry = self.request_policy.expiry,
             .messages = self.messages,
         };
     }
@@ -724,8 +1096,10 @@ pub const HostedSession = struct {
             switch (work.item) {
                 .submission => |submission| self.runSubmission(submission),
                 .command => |cmd| self.applyCommand(cmd),
+                .resumption => |suspension| self.runResumption(suspension),
+                .re_announce => self.reannounce(),
             }
-            self.fulfilSpawns();
+            self.fulfilSpawns(!isSpawnFailureReport(work));
         }
     }
 
@@ -733,6 +1107,14 @@ pub const HostedSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (true) {
+            // A suspended Run comes first, and nothing else runs meanwhile:
+            // its conversation ends in a call without a result, so no Run may
+            // start on it. Queued work waits, and a lead's inbox is not read
+            // (the poll below marks what it takes as read).
+            if (self.phase == .suspended and !self.closing) {
+                if (self.suspendedWorkLocked()) |work| return work;
+                continue;
+            }
             if (self.closing) return null;
             if (self.phase == .poisoned) {
                 self.work_ready.wait(&self.mutex);
@@ -795,9 +1177,11 @@ pub const HostedSession = struct {
     /// Opens a member Session for each `SpawnTeammate` request the lead's
     /// last Run made, oldest first, and submits its prompt. A name this lead
     /// already opened and the Host has not closed takes the prompt as its
-    /// next Run instead. Driver-only: the requests live in the lead's
+    /// next Run instead. A request that fails is reported to the lead as its
+    /// next Run (`reportSpawnFailure`) when `report_failures`; otherwise it is
+    /// only logged. Driver-only: the requests live in the lead's
     /// `SwarmContext`.
-    fn fulfilSpawns(self: *HostedSession) void {
+    fn fulfilSpawns(self: *HostedSession, report_failures: bool) void {
         const factory = self.host.options.teammates orelse return;
         if (!self.leadsTeam()) return;
         const swarm = &self.session.swarm.?;
@@ -805,9 +1189,34 @@ pub const HostedSession = struct {
             const request = swarm.popPendingSpawn() orelse return;
             var owned = request;
             defer owned.deinit(swarm.allocator);
-            self.spawnTeammate(factory, swarm, &owned) catch |err|
+            var target: SpawnTarget = .new_member;
+            self.spawnTeammate(factory, swarm, &owned, &target) catch |err| {
                 log.warn("session_host", "teammate {s} of {s} not started: {s}", .{ owned.name, self.id.asSlice(), @errorName(err) });
+                if (report_failures) self.reportSpawnFailure(owned.name, target, err);
+            };
         }
+    }
+
+    /// Whether a spawn request went to an open member or a new one.
+    const SpawnTarget = enum { new_member, open_member };
+
+    /// True for the Run `reportSpawnFailure` queued. A failure while
+    /// fulfilling that Run's own spawns is only logged: under the `App` a
+    /// failed spawn is a tool result inside the same Run, bounded by its turn
+    /// limit, while here each report is a new Run, so a model that keeps
+    /// asking for a name that cannot start would otherwise loop without end.
+    fn isSpawnFailureReport(work: *const Work) bool {
+        const submission = switch (work.item) {
+            .submission => |submission| submission,
+            // A resumed Run (#446) keeps no record of what its submission
+            // was, so its spawn failures are reported. Each resumption waits
+            // for a person's answer first, so reports still cannot loop on
+            // their own. Re-announcing a request runs nothing.
+            .command, .resumption, .re_announce => return false,
+        };
+        const source = submission.source orelse return false;
+        const kind = submission.kind orelse return false;
+        return std.mem.eql(u8, source, spawn_failure_source) and std.mem.eql(u8, kind, spawn_failure_kind);
     }
 
     fn spawnTeammate(
@@ -815,14 +1224,23 @@ pub const HostedSession = struct {
         factory: TeammateFactory,
         swarm: *const swarm_context.SwarmContext,
         request: *const swarm_context.SpawnRequest,
+        target: *SpawnTarget,
     ) !void {
         for (self.teammates.items, 0..) |known, index| {
             if (!std.mem.eql(u8, known.name, request.name)) continue;
             if (self.host.acquire(known.id)) |member| {
                 defer member.release();
+                target.* = .open_member;
                 return member.submit(.{ .text = request.prompt });
             }
-            // The Host closed it: forget it and open the name again.
+            // The Host closed it, but its roster entry still holds the old
+            // lease, under which no member may join again. Drop that entry
+            // (only while it is still the one this lead opened) and open the
+            // name anew under a fresh lease, so mail from the closed member
+            // stays unaddressed, as the `App` reaps a terminated teammate.
+            var config_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const config_path = swarm_team.configPath(swarm.state_root, swarm.team_sanitized, &config_buf);
+            _ = swarm_tools.removeMemberFromConfig(self.gpa, config_path, known.name, swarm.session.asSlice(), known.lease.asSlice());
             self.gpa.free(known.name);
             _ = self.teammates.swapRemove(index);
             break;
@@ -837,6 +1255,9 @@ pub const HostedSession = struct {
             .prompt = request.prompt,
             .agent_type = request.agent_type,
             .effort = request.effort,
+            .lead_model = self.model,
+            .lead_permission_mode = self.session.permission_ctx.modeValue(),
+            .lead_reasoning_effort = self.reasoning_effort,
         });
         if (config.team != null) return error.TeammateTeamConfigNotAllowed;
         const lease = session_id_mod.gen();
@@ -853,8 +1274,35 @@ pub const HostedSession = struct {
         errdefer self.gpa.free(name);
         const member = try self.host.open(.{ .config = config });
         defer member.release();
-        self.teammates.appendAssumeCapacity(.{ .name = name, .id = member.id });
+        self.teammates.appendAssumeCapacity(.{ .name = name, .id = member.id, .lease = lease });
         try member.submit(.{ .text = request.prompt });
+    }
+
+    /// Tells the lead model that teammate `name` was not started (or, when
+    /// it was already open, did not take the prompt), as the lead's next Run,
+    /// in the `teammate-status` form its inbox uses for a failed teammate;
+    /// under the `App` the same failure is the spawn tool's result. The Run's
+    /// `user_message` is typed (`spawn_failure_source`,
+    /// `spawn_failure_kind`); the provider sees only the text.
+    fn reportSpawnFailure(self: *HostedSession, name: []const u8, target: SpawnTarget, err: anyerror) void {
+        const work = self.newWork() catch return;
+        const what = switch (target) {
+            .new_member => "teammate was not started",
+            .open_member => "teammate did not take the prompt",
+        };
+        const text = std.fmt.allocPrint(
+            work.arena.allocator(),
+            "<teammate-status from=\"{s}\" state=\"failed\">{s}: {s}</teammate-status>",
+            .{ name, what, @errorName(err) },
+        ) catch {
+            self.freeWork(work);
+            return;
+        };
+        work.item = .{ .submission = .{ .text = text, .source = spawn_failure_source, .kind = spawn_failure_kind } };
+        self.enqueue(work) catch |enqueue_err| {
+            log.warn("session_host", "spawn failure of {s} not reported to {s}: {s}", .{ name, self.id.asSlice(), @errorName(enqueue_err) });
+            self.freeWork(work);
+        };
     }
 
     /// A closing lead starts no member, and neither does a poisoned one: it
@@ -960,14 +1408,33 @@ pub const HostedSession = struct {
         self.current_run_id = 0;
         self.run_returned = true;
         self.mutex.unlock();
-        if (outcome) |result| {
-            if (result.suspend_info) |info| info.deinit();
-            const failed_on_model = result.stop_reason == .api_error or result.stop_reason == .max_tokens_exhausted;
-            const model_failure = if (failed_on_model) &self.session.last_model_error else null;
-            self.finishRun(context, @tagName(result.stop_reason), null, model_failure);
-        } else |err| {
+        self.settleRun(context, outcome, .{
+            .trace_id = submission.trace_id,
+            .max_turns = self.host.options.max_turns,
+            .stream_retry_budget = admitted.stream_retry_budget,
+            .idempotency_key = submission.idempotency_key,
+        });
+    }
+
+    /// The end of a Run that returned: a suspended Run is held (#446), a
+    /// request it answered `pending` without suspending on is closed, and
+    /// `finishRun` reports it.
+    fn settleRun(self: *HostedSession, context: wire.RunContext, outcome: anyerror!agent_loop.RunResult, settings: RunSettings) void {
+        const result = outcome catch |err| {
+            self.closeSuspending();
             self.finishRun(context, null, err, null);
-        }
+            return;
+        };
+        // Keyed on `suspend_info`, not the stop reason: an abort requested
+        // while the turn suspended reports `aborted` and still leaves the
+        // tool call without a result.
+        if (result.suspend_info) |info| {
+            defer info.deinit();
+            self.holdSuspension(info, settings);
+        } else self.closeSuspending();
+        const failed_on_model = result.stop_reason == .api_error or result.stop_reason == .max_tokens_exhausted;
+        const model_failure = if (failed_on_model) &self.session.last_model_error else null;
+        self.finishRun(context, @tagName(result.stop_reason), null, model_failure);
     }
 
     /// Spends `key` on the Run starting now: in memory at once, so a delivery
@@ -1015,7 +1482,7 @@ pub const HostedSession = struct {
             self.phase = .poisoned;
             std.mem.swap(std.ArrayList(*Work), &dropped, &self.queue);
         } else if (!self.closing) {
-            self.phase = .idle;
+            self.phase = if (self.suspension != null) .suspended else .idle;
         }
         self.mutex.unlock();
         for (dropped.items) |work| self.freeWork(work);
@@ -1089,6 +1556,49 @@ pub const HostedSession = struct {
         self.mutex.unlock();
     }
 
+    /// The committed conversation where the transcript is the witness of a
+    /// suspension (#446). A background job does not stand in the way: jobs
+    /// are no part of the committed state (`AgentSession.
+    /// snapshotCommittedForRunMeasurement`), so the lease that ignores them
+    /// is a coherent read; a provider cancel still in flight is waited out.
+    fn conversationLease(self: *HostedSession) !agent_session.CheckpointLease {
+        self.session.awaitProviderCancelsDrained();
+        return self.session.snapshotCommittedForRunMeasurement();
+    }
+
+    /// `persist` for the suspend and resume points (#446): written even with
+    /// a background job running. Whether the transcript was written.
+    fn persistDurable(self: *HostedSession) bool {
+        const writer = if (self.writer) |*writer| writer else return false;
+        var lease = self.conversationLease() catch return false;
+        defer lease.deinit();
+        writer.flush(lease.conversation);
+        self.mutex.lock();
+        self.messages = lease.conversation.len();
+        self.mutex.unlock();
+        return true;
+    }
+
+    /// The request id a Host waits on: the blocking request's, else the
+    /// suspended or suspending question's (#446). Caller holds `mutex`.
+    fn pendingIdLocked(self: *const HostedSession) u64 {
+        if (self.pending_request_id != 0) return self.pending_request_id;
+        if (self.suspension) |suspension| return suspension.request_id;
+        if (self.suspending) |pending| return pending.id;
+        return 0;
+    }
+
+    /// Whether `key` is the idempotency key of the Run suspended or being
+    /// resumed. Caller holds `mutex`.
+    fn heldKeyLocked(self: *const HostedSession, key: []const u8) bool {
+        for ([_]?*Suspension{ self.suspension, self.resuming }) |maybe| {
+            const suspension = maybe orelse continue;
+            const held = suspension.settings.idempotency_key orelse continue;
+            if (std.mem.eql(u8, held, key)) return true;
+        }
+        return false;
+    }
+
     fn emitHost(self: *HostedSession, event: wire.HostEvent) void {
         const line = wire.writeHostEvent(self.gpa, event) catch {
             log.warn("session_host", "dropped host event .{s} (OOM)", .{@tagName(event)});
@@ -1125,65 +1635,142 @@ pub const HostedSession = struct {
         }
         self.ui_serial.lock();
         defer self.ui_serial.unlock();
+        const policy = self.request_policy;
 
         self.mutex.lock();
         // Released means the abort is in force. An interrupt still on its way
         // to the kernel lets the prompt be announced and wait for it.
         if (self.ui_released) {
             self.mutex.unlock();
-            return wire.cancelResponse(req, .cancelled);
+            return cancelAnswer(req, .cancelled);
         }
+        // The kernel suspends a turn on its first pending request, and the
+        // resumption must answer the call this request belongs to: so one
+        // per turn. Another question or custom UI of the same turn is not
+        // announced and answered `unavailable` (its call fails as without a
+        // frontend; an error here would poison the AgentSession). A
+        // permission request blocks as always.
+        if (self.suspending != null and req.* != .permission) {
+            self.mutex.unlock();
+            return .unavailable;
+        }
+        // `.suspend` never suspends a permission request: the kernel's gate
+        // would read `pending` as no answer and deny the tool unasked. Nor
+        // one it cannot keep: a request file it could not read.
+        const suspends = policy.wait == .@"suspend" and req.* != .permission and !self.store_unwritable;
+        // The id and the request it names are registered together, so an
+        // answer never finds the one without the other.
         const request_id = self.next_request_id;
         self.next_request_id += 1;
-        self.pending_request_id = request_id;
+        if (suspends) self.suspending = .{ .id = request_id } else self.pending_request_id = request_id;
         self.mutex.unlock();
+        // `.suspend` keeps ids across restarts: this one is written before
+        // anyone can answer it. Unwritten, it is still unique in this process.
+        if (policy.wait == .@"suspend") self.storeRequests() catch |err|
+            log.warn("session_host", "request id {d} of {s} not recorded: {s}", .{ request_id, self.id.asSlice(), @errorName(err) });
 
         const announce = wire.writeRequest(self.gpa, request_id, req) catch |err| {
-            self.mutex.lock();
-            self.pending_request_id = 0;
-            self.mutex.unlock();
+            if (suspends) self.closeSuspending() else {
+                self.mutex.lock();
+                self.pending_request_id = 0;
+                self.mutex.unlock();
+            }
             return err;
         };
+        if (suspends) {
+            self.mutex.lock();
+            self.suspending.?.announcement = announce;
+            self.mutex.unlock();
+            self.journal.append(announce);
+            return .pending;
+        }
         defer self.gpa.free(announce);
         self.journal.append(announce);
 
-        const deadline: ?i128 = if (self.host.options.ui_request_timeout_ms) |ms|
-            util_time.nowNs() + @as(i128, ms) * std.time.ns_per_ms
-        else
-            null;
+        const timeout_ns: ?i128 = if (policy.timeout_ms) |ms| @as(i128, ms) * std.time.ns_per_ms else null;
+        var deadline: ?i128 = if (timeout_ns) |span| util_time.nowNs() + span else null;
+        var expired_stop = false;
         self.mutex.lock();
         while (self.response == null and !self.ui_released) {
             if (deadline) |limit| {
                 const now = util_time.nowNs();
-                if (now >= limit) break;
+                if (now >= limit) {
+                    switch (policy.expiry) {
+                        .cancel => break,
+                        .interrupt => {
+                            // From now on no answer is taken, as after `interrupt`.
+                            self.run_interrupted = true;
+                            expired_stop = true;
+                            break;
+                        },
+                        .re_announce => {
+                            deadline = now + timeout_ns.?;
+                            self.mutex.unlock();
+                            self.journal.append(announce);
+                            self.mutex.lock();
+                            continue;
+                        },
+                    }
+                }
                 _ = self.ui_ready.timedWait(&self.mutex, @intCast(limit - now));
             } else {
                 self.ui_ready.wait(&self.mutex);
             }
         }
         const response = self.takeResponseLocked();
-        // No answer: an interrupt or close in force cancelled it (and
-        // discarded any answer that raced it); otherwise the deadline passed.
-        const why: wire.NoAnswer = if (self.ui_released or self.run_interrupted or self.closing)
+        const by = self.response_by;
+        self.response_by = null;
+        // No answer: the deadline passed, also under `.interrupt`, whose stop
+        // follows from it (nobody interrupted the prompt); else an interrupt
+        // or close in force cancelled it (and discarded any answer that
+        // raced it); else the deadline passed.
+        const why: wire.NoAnswer = if (expired_stop)
+            .timed_out
+        else if (self.ui_released or self.run_interrupted or self.closing)
             .cancelled
         else
             .timed_out;
         self.pending_request_id = 0;
+        const run_id = self.current_run_id;
         self.mutex.unlock();
+        defer if (by) |name| self.gpa.free(name);
+        // As in `interrupt`: the abort, then the release that answers any
+        // later prompt of this Run as cancelled at once. This thread is
+        // inside the Run, so the Session cannot go away meanwhile.
+        if (expired_stop) {
+            if (run_id != 0) self.session.abort(run_id, .user_interrupt) catch {};
+            self.releaseUi();
+        }
 
         if (response) |json| {
             defer self.gpa.free(json);
             wire.parseResponse(req, json, allocator, out) catch |err| {
-                self.appendLine(wire.writeRequestClosed(self.gpa, request_id, wire.closedOnParseError(err)));
-                return err;
+                // An unreadable answer still names who sent it; running out
+                // of memory reading it closes on nobody's answer.
+                const closed = wire.closedOnParseError(err);
+                self.appendLine(wire.writeRequestClosedBy(self.gpa, request_id, closed, if (closed == .malformed) by else null));
+                return if (err == error.OutOfMemory) err else cancelAnswer(req, .unreadable);
             };
-            self.appendLine(wire.writeRequestClosed(self.gpa, request_id, .answered));
+            self.appendLine(wire.writeRequestClosedBy(self.gpa, request_id, .answered, by));
             return .answered;
         }
         // The journal and the requester's error come from the same `why`, so
         // what the Host records and what the model reads agree.
         self.appendLine(wire.writeRequestClosed(self.gpa, request_id, why.closed()));
-        return wire.cancelResponse(req, why);
+        return cancelAnswer(req, why);
+    }
+
+    /// `wire.cancelResponse` as the AgentSession needs it (#446): a question
+    /// that was cancelled or answered unreadably is the user's outcome,
+    /// `error.UiCancelled`, which the AgentSession hands to the tool (the
+    /// call fails with InputAborted, as the model sees). A permission
+    /// prompt's `ui_request.Unanswered` error goes on as it is: the gate
+    /// denies the call and tells the model why (#463). Any other error from a
+    /// requester is a broken Host to the AgentSession, and poisons the
+    /// Session: a cancelled question used to end its Session that way.
+    fn cancelAnswer(req: *const ui_request.UiRequest, why: wire.NoAnswer) anyerror!ui_request.RequestOutcome {
+        const err = wire.cancelResponse(req, why);
+        return if (err == error.InputAborted and req.* == .ask_question) error.UiCancelled else err;
     }
 
     /// The stored answer to the pending request, unless cancellation won: an
@@ -1195,9 +1782,571 @@ pub const HostedSession = struct {
         self.response = null;
         if (self.run_interrupted or self.closing) {
             self.gpa.free(response);
+            // Nobody answered what the request closes on.
+            if (self.response_by) |by| self.gpa.free(by);
+            self.response_by = null;
             return null;
         }
         return response;
+    }
+
+    // ── suspended Runs (#446) ─────────────────────────────────────────────
+
+    /// Cancels a suspended Run's request, winning over an answer not yet
+    /// applied. `stop`: the Run resumes only to record it, then stops.
+    /// Caller holds `mutex`.
+    fn cancelSuspensionLocked(self: *HostedSession, suspension: *Suspension, stop: bool) void {
+        const stopping = switch (suspension.settled) {
+            .open => false,
+            .answered => |answered| blk: {
+                self.gpa.free(answered.json);
+                if (answered.by) |by| self.gpa.free(by);
+                break :blk false;
+            },
+            .cancelled => |cancelled| cancelled.stop,
+        };
+        suspension.settled = .{ .cancelled = .{ .stop = stop or stopping } };
+    }
+
+    fn freeSuspending(self: *HostedSession, pending: Suspending) void {
+        if (pending.announcement) |line| self.gpa.free(line);
+        if (pending.answer) |json| self.gpa.free(json);
+        if (pending.by) |by| self.gpa.free(by);
+    }
+
+    /// A request the Run answered `pending` but did not suspend on (it
+    /// failed, or was stopped first) closes as cancelled.
+    fn closeSuspending(self: *HostedSession) void {
+        self.mutex.lock();
+        const pending = self.suspending orelse {
+            self.mutex.unlock();
+            return;
+        };
+        self.suspending = null;
+        self.mutex.unlock();
+        self.freeSuspending(pending);
+        if (pending.announcement != null) self.appendLine(wire.writeRequestClosed(self.gpa, pending.id, .cancelled));
+    }
+
+    /// Holds a Run that ended `suspended` until its request is settled.
+    /// Durable first: the conversation with the suspended call (the
+    /// transcript is fsynced), then the request with a result for every
+    /// other call of its turn (`ui_request_store`, the commit point a later
+    /// open reads).
+    fn holdSuspension(self: *HostedSession, info: agent_loop.SuspendInfo, settings: RunSettings) void {
+        // The request stays registered (`suspending`) until the suspension
+        // takes its place under one lock, so an answer given meanwhile still
+        // reaches it. Only the driver clears `suspending`.
+        self.mutex.lock();
+        const registered = self.suspending;
+        self.mutex.unlock();
+        const pending = registered orelse {
+            // Only `requestUi` answers `pending`, so this is not reached.
+            // With no request there is nothing to resume the call with; the
+            // next Run's request stands in for its result (message_repair).
+            log.err("session_host", "a Run of {s} suspended on {s} without a pending request", .{ self.id.asSlice(), info.tool_use_id });
+            return;
+        };
+        const suspension = self.buildSuspension(pending.id, pending.announcement.?, info, settings) catch |err| {
+            log.err("session_host", "request {d} of {s} not held: {s}", .{ pending.id, self.id.asSlice(), @errorName(err) });
+            self.closeSuspending();
+            return;
+        };
+        // The record is written only once the transcript holds the turn: a
+        // record whose call the transcript lacks is dropped on open.
+        const written = self.persistDurable();
+        if (builtin.is_test) if (testing_hooks.before_handover) |hook| hook(self);
+        self.mutex.lock();
+        var taken = self.suspending.?;
+        self.suspending = null;
+        self.suspension = suspension;
+        if (taken.answer) |json| {
+            suspension.settled = .{ .answered = .{ .json = json, .by = taken.by } };
+            taken.answer = null;
+            taken.by = null;
+        }
+        // An interrupt during the Run cancels what it suspended on.
+        if (self.run_interrupted) self.cancelSuspensionLocked(suspension, true);
+        self.mutex.unlock();
+        self.freeSuspending(taken);
+        if (!written) {
+            log.warn("session_host", "suspended request {d} of {s} held in memory only, its turn could not be written", .{ suspension.request_id, self.id.asSlice() });
+            return;
+        }
+        self.storeRequests() catch |err|
+            log.warn("session_host", "suspended request {d} of {s} held in memory only, a restart loses it: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
+    }
+
+    fn buildSuspension(self: *HostedSession, request_id: u64, announcement: []const u8, info: agent_loop.SuspendInfo, settings: RunSettings) !*Suspension {
+        const suspension = try self.newSuspension(request_id, settings.max_turns);
+        errdefer self.destroySuspension(suspension);
+        const a = suspension.arena.allocator();
+        suspension.announcement = try a.dupe(u8, announcement);
+        suspension.request = (try wire.parseRequest(a, suspension.announcement)).request;
+        suspension.tool_use_id = try a.dupe(u8, info.tool_use_id);
+        try self.turnResults(a, info, suspension);
+        suspension.settings = .{
+            .trace_id = if (settings.trace_id) |trace_id| try a.dupe(u8, trace_id) else null,
+            .max_turns = settings.max_turns,
+            .stream_retry_budget = settings.stream_retry_budget,
+            .idempotency_key = if (settings.idempotency_key) |key| try a.dupe(u8, key) else null,
+        };
+        suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| wallMs() +| @as(i64, @intCast(ms)) else null;
+        return suspension;
+    }
+
+    /// The suspended call's tool, and a result for every other call of its
+    /// turn, in the turn's order. The kernel keeps the results of the calls
+    /// that ran beside the suspended one, not of those it denied or deferred
+    /// (agent_loop's suspension), so a call without one gets a result that
+    /// says it did not run: resumed, the turn answers every call.
+    fn turnResults(self: *HostedSession, a: std.mem.Allocator, info: agent_loop.SuspendInfo, suspension: *Suspension) !void {
+        var results: std.ArrayList(agent_loop.SuspendInfo.CompletedResult) = .empty;
+        var lease = self.conversationLease() catch {
+            // Not reached after a Run returned; keep what the kernel kept.
+            for (info.completed_results) |result| try results.append(a, try copyResult(a, result));
+            suspension.completed = results.items;
+            return;
+        };
+        defer lease.deinit();
+        const messages = lease.conversation.messages.items;
+        const turn = if (messages.len == 0) &[_]@import("message.zig").Block{} else messages[messages.len - 1].blocks;
+        for (turn) |block| switch (block) {
+            .tool_use => |call| {
+                if (std.mem.eql(u8, call.id, info.tool_use_id)) {
+                    suspension.tool_name = try a.dupe(u8, call.name);
+                    continue;
+                }
+                for (info.completed_results) |result| {
+                    if (std.mem.eql(u8, result.tool_use_id, call.id)) {
+                        try results.append(a, try copyResult(a, result));
+                        break;
+                    }
+                } else try results.append(a, .{
+                    .tool_use_id = try a.dupe(u8, call.id),
+                    .content = try tool_error.errorToJson("NotRun", "{s} did not run: its turn was suspended while another call waited for a person's answer", .{call.name}, a),
+                    .is_error = true,
+                });
+            },
+            else => {},
+        };
+        suspension.completed = results.items;
+    }
+
+    fn copyResult(a: std.mem.Allocator, result: agent_loop.SuspendInfo.CompletedResult) error{OutOfMemory}!agent_loop.SuspendInfo.CompletedResult {
+        return .{
+            .tool_use_id = try a.dupe(u8, result.tool_use_id),
+            .content = try a.dupe(u8, result.content),
+            .is_error = result.is_error,
+        };
+    }
+
+    fn newSuspension(self: *HostedSession, request_id: u64, max_turns: u32) error{OutOfMemory}!*Suspension {
+        const suspension = try self.gpa.create(Suspension);
+        suspension.* = .{
+            .arena = std.heap.ArenaAllocator.init(self.gpa),
+            .request_id = request_id,
+            .announcement = "",
+            .request = .{ .custom = .{ .kind = "", .payload_json = "" } },
+            .tool_use_id = "",
+            .tool_name = "",
+            .completed = &.{},
+            .settings = .{ .max_turns = max_turns },
+            .expires_at_ms = null,
+        };
+        return suspension;
+    }
+
+    fn destroySuspension(self: *HostedSession, suspension: *Suspension) void {
+        switch (suspension.settled) {
+            .answered => |answered| {
+                self.gpa.free(answered.json);
+                if (answered.by) |by| self.gpa.free(by);
+            },
+            .open, .cancelled => {},
+        }
+        suspension.arena.deinit();
+        self.gpa.destroy(suspension);
+    }
+
+    /// Frees the request state nothing will use any more.
+    fn dropRequests(self: *HostedSession) void {
+        if (self.suspension) |suspension| self.destroySuspension(suspension);
+        self.suspension = null;
+        if (self.resuming) |resumed| self.destroySuspension(resumed);
+        self.resuming = null;
+        if (self.suspending) |pending| self.freeSuspending(pending);
+        self.suspending = null;
+        if (self.response_by) |by| self.gpa.free(by);
+        self.response_by = null;
+    }
+
+    /// Writes the Session's request state (`ui_request_store`): the next
+    /// request id and the suspension it holds, waiting (`suspension`) or
+    /// being resumed (`resuming`), with how it was settled. Nothing without a
+    /// Session directory. Only the driver writes, or `close` once the driver
+    /// has stopped; `respond` and `interrupt` change memory alone.
+    fn storeRequests(self: *HostedSession) !void {
+        const dir = self.store_dir orelse return;
+        // Left as it is (`restoreRequests` said so once).
+        if (self.store_unwritable) return;
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const state = try self.requestStateLocked(a);
+        try ui_request_store.store(a, dir, state);
+    }
+
+    /// Takes `mutex`. The settlement's strings are copied: an interrupt may
+    /// free them once the lock is gone. The rest of a Suspension is fixed
+    /// once held and freed only by the driver, so it is borrowed.
+    fn requestStateLocked(self: *HostedSession, a: std.mem.Allocator) error{OutOfMemory}!ui_request_store.State {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const held = self.suspension orelse self.resuming orelse return .{ .next_id = self.next_request_id };
+        const completed = try a.alloc(ui_request_store.Result, held.completed.len);
+        for (held.completed, completed) |result, *copy| copy.* = .{
+            .tool_use_id = result.tool_use_id,
+            .content = result.content,
+            .is_error = result.is_error,
+        };
+        return .{ .next_id = self.next_request_id, .suspended = .{
+            .kind = .answer,
+            .id = held.request_id,
+            .announcement = held.announcement,
+            .tool_use_id = held.tool_use_id,
+            .tool_name = held.tool_name,
+            .completed = completed,
+            .trace_id = held.settings.trace_id,
+            .max_turns = held.settings.max_turns,
+            .stream_retry_budget = held.settings.stream_retry_budget,
+            .idempotency_key = held.settings.idempotency_key,
+            .expires_at_ms = held.expires_at_ms,
+            .settled = switch (held.settled) {
+                .open => null,
+                .answered => |answered| .{
+                    .outcome = .answered,
+                    .answer = try a.dupe(u8, answered.json),
+                    .by = if (answered.by) |by| try a.dupe(u8, by) else null,
+                },
+                .cancelled => |cancelled| .{ .outcome = .cancelled, .stop = cancelled.stop },
+            },
+        } };
+    }
+
+    /// At `open`: what the Session's directory kept (#446). Ids go on from
+    /// where they stopped, whatever the open. On a resumed Session the
+    /// transcript is the witness: a call that already has its result there
+    /// was resumed, and its record is only marked consumed, never applied
+    /// again; a call still waiting is held again and its request announced
+    /// under its id, and a settlement it had is applied once the driver
+    /// starts. A fresh open drops it with the conversation it belonged to. A
+    /// file this version cannot read is left in place (logged).
+    fn restoreRequests(self: *HostedSession, mode: OpenMode, conversation: *const Conversation) void {
+        const dir = self.store_dir orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const state = (ui_request_store.load(arena.allocator(), dir) catch |err| {
+            // Never written over, and its ids never reused, though nothing
+            // records the ids handed out from now on: they go on past the
+            // file's last one and past the clock in milliseconds, which no
+            // earlier process can have counted up to (a request takes a
+            // model turn, far longer than a millisecond).
+            self.store_unwritable = true;
+            const clock: u64 = @intCast(@max(wallMs(), 1));
+            self.next_request_id = @max(ui_request_store.peekNextId(arena.allocator(), dir) orelse 1, clock);
+            log.err("session_host", "UI requests of {s} not read ({s}): the file is left as it is, requests block, ids start at {d}", .{ self.id.asSlice(), @errorName(err), self.next_request_id });
+            return;
+        }) orelse return;
+        self.next_request_id = state.next_id;
+        const record = state.suspended orelse return;
+        if (mode == .@"resume") switch (callState(conversation, record.tool_use_id)) {
+            .waiting => if (self.restoreSuspension(record)) |suspension| {
+                self.suspension = suspension;
+                self.phase = .suspended;
+                self.journal.append(suspension.announcement);
+                return;
+            } else |err| {
+                // Out of memory may pass; anything else will not.
+                if (err == error.OutOfMemory) {
+                    log.err("session_host", "suspended request {d} of {s} not restored, the file is left in place: {s}", .{ record.id, self.id.asSlice(), @errorName(err) });
+                    return;
+                }
+                log.err("session_host", "suspended request {d} of {s} unusable, dropped: {s}", .{ record.id, self.id.asSlice(), @errorName(err) });
+            },
+            .answered => log.info("session_host", "request {d} of {s} was resumed already: consumed", .{ record.id, self.id.asSlice() }),
+            .absent => log.warn("session_host", "request {d} of {s} no longer matches its conversation: dropped", .{ record.id, self.id.asSlice() }),
+        };
+        self.storeRequests() catch |err|
+            log.warn("session_host", "UI requests of {s} not rewritten: {s}", .{ self.id.asSlice(), @errorName(err) });
+    }
+
+    fn restoreSuspension(self: *HostedSession, record: ui_request_store.Suspended) !*Suspension {
+        const suspension = try self.newSuspension(record.id, record.max_turns);
+        errdefer self.destroySuspension(suspension);
+        const a = suspension.arena.allocator();
+        suspension.announcement = try a.dupe(u8, record.announcement);
+        const announced = try wire.parseRequest(a, suspension.announcement);
+        if (announced.id != record.id or announced.request == .permission) return error.SuspensionStale;
+        suspension.request = announced.request;
+        suspension.tool_use_id = try a.dupe(u8, record.tool_use_id);
+        suspension.tool_name = try a.dupe(u8, record.tool_name);
+        const completed = try a.alloc(agent_loop.SuspendInfo.CompletedResult, record.completed.len);
+        for (record.completed, completed) |result, *copy| copy.* = .{
+            .tool_use_id = try a.dupe(u8, result.tool_use_id),
+            .content = try a.dupe(u8, result.content),
+            .is_error = result.is_error,
+        };
+        suspension.completed = completed;
+        suspension.settings = .{
+            .trace_id = if (record.trace_id) |trace_id| try a.dupe(u8, trace_id) else null,
+            .max_turns = record.max_turns,
+            .stream_retry_budget = record.stream_retry_budget,
+            .idempotency_key = if (record.idempotency_key) |key| try a.dupe(u8, key) else null,
+        };
+        suspension.expires_at_ms = record.expires_at_ms;
+        // `.re_announce`: the announcement this open makes is one.
+        if (self.request_policy.expiry == .re_announce) {
+            if (record.expires_at_ms) |deadline| {
+                if (deadline <= wallMs()) suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| wallMs() +| @as(i64, @intCast(ms)) else null;
+            }
+        }
+        if (record.settled) |settled| switch (settled.outcome) {
+            .answered => {
+                const json = try self.gpa.dupe(u8, settled.answer orelse return error.SuspensionStale);
+                errdefer self.gpa.free(json);
+                const by = if (settled.by) |name| try self.gpa.dupe(u8, name) else null;
+                suspension.settled = .{ .answered = .{ .json = json, .by = by } };
+            },
+            .cancelled => suspension.settled = .{ .cancelled = .{ .stop = settled.stop } },
+        };
+        return suspension;
+    }
+
+    /// While a Run is suspended (caller holds `mutex`): its resumption once
+    /// its request is settled, a re-announcement once it expired under
+    /// `.re_announce`; otherwise null, after waiting for either.
+    fn suspendedWorkLocked(self: *HostedSession) ?*Work {
+        const suspension = self.suspension orelse {
+            // Not reached: `.suspended` always has one. Never spin on it.
+            self.phase = .idle;
+            return null;
+        };
+        if (suspension.settled == .open) {
+            const deadline = suspension.expires_at_ms orelse {
+                self.work_ready.wait(&self.mutex);
+                return null;
+            };
+            const now = wallMs();
+            if (now < deadline) {
+                _ = self.work_ready.timedWait(&self.mutex, @intCast((deadline - now) * std.time.ns_per_ms));
+                return null;
+            }
+            switch (self.request_policy.expiry) {
+                .cancel => suspension.settled = .{ .cancelled = .{ .stop = false } },
+                .interrupt => suspension.settled = .{ .cancelled = .{ .stop = true } },
+                .re_announce => return self.driverWorkLocked(.re_announce),
+            }
+        }
+        const work = self.driverWorkLocked(.{ .resumption = suspension }) orelse return null;
+        self.phase = .running;
+        self.run_interrupted = false;
+        self.ui_released = false;
+        self.run_returned = false;
+        return work;
+    }
+
+    /// A Work item of the driver's own; null, after a short wait, when there
+    /// is no memory for one. Caller holds `mutex`.
+    fn driverWorkLocked(self: *HostedSession, item: @FieldType(Work, "item")) ?*Work {
+        const work = self.newWork() catch {
+            _ = self.work_ready.timedWait(&self.mutex, 50 * std.time.ns_per_ms);
+            return null;
+        };
+        work.item = item;
+        return work;
+    }
+
+    /// `.re_announce` on a suspended Run's request: the same line again and
+    /// another `ui_request_timeout_ms`, recorded for a restart.
+    fn reannounce(self: *HostedSession) void {
+        self.mutex.lock();
+        const suspension = self.suspension orelse {
+            self.mutex.unlock();
+            return;
+        };
+        const open = suspension.settled == .open;
+        if (open) suspension.expires_at_ms = if (self.request_policy.timeout_ms) |ms| wallMs() +| @as(i64, @intCast(ms)) else null;
+        self.mutex.unlock();
+        if (!open) return;
+        self.journal.append(suspension.announcement);
+        self.storeRequests() catch |err|
+            log.warn("session_host", "new expiry of request {d} of {s} not recorded: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
+    }
+
+    /// What the suspended call returns, and how its request closes.
+    const Resumption = struct {
+        closed: wire.RequestClosed,
+        /// Who gave the answer the request closes on.
+        by: ?[]const u8,
+        /// Stop the resumed Run once the results are recorded.
+        stop: bool,
+        /// The suspended call's result first, then its siblings'.
+        results: []agent_loop.SuspendInfo.CompletedResult,
+    };
+
+    /// The suspended call's result as an answered call would have returned
+    /// it under `.block`: the question's answers as AskUserQuestion returns
+    /// them, a custom UI's `result` as is (the kernel's suspension convention,
+    /// doc/CORE_REFERENCE.md §5.3). Cancelled or unreadable, the call fails
+    /// with InputAborted, as `wire.cancelResponse` fails a question.
+    fn prepareResumption(suspension: *const Suspension, settled: Suspension.Settled, a: std.mem.Allocator) !Resumption {
+        var closed: wire.RequestClosed = .cancelled;
+        var by: ?[]const u8 = null;
+        var stop = false;
+        var content: ?[]const u8 = null;
+        switch (settled) {
+            .open => return error.NotSettled,
+            .cancelled => |cancelled| stop = cancelled.stop,
+            .answered => |answered| {
+                by = answered.by;
+                closed = .malformed;
+                var out: ui_request.UiResponse = undefined;
+                if (wire.parseResponse(&suspension.request, answered.json, a, &out)) |_| switch (out) {
+                    .answers => |answers| {
+                        content = try ask_user.answersResult(a, answers);
+                        closed = .answered;
+                    },
+                    .custom => |result| {
+                        content = result;
+                        closed = .answered;
+                    },
+                    // A suspension is never a permission request.
+                    .permission => {},
+                } else |err| switch (err) {
+                    // Unreadable: `InputAborted`, as a suspension is never a
+                    // permission request. It closes as the blocking path
+                    // closes it.
+                    error.InputAborted, error.UiAnswerUnreadable => closed = wire.closedOnParseError(err),
+                    error.OutOfMemory => return error.OutOfMemory,
+                }
+            },
+        }
+        const results = try a.alloc(agent_loop.SuspendInfo.CompletedResult, suspension.completed.len + 1);
+        results[0] = .{
+            .tool_use_id = suspension.tool_use_id,
+            .content = content orelse try tool_error.errorToJson("InputAborted", "{s} failed with {s}", .{ suspension.tool_name, "InputAborted" }, a),
+            .is_error = content == null,
+        };
+        @memcpy(results[1..], suspension.completed);
+        return .{ .closed = closed, .by = if (closed == .cancelled) null else by, .stop = stop, .results = results };
+    }
+
+    /// Resumes a suspended Run with how its request was settled: the request
+    /// closes, then Run N+1 starts with `run_resumed` and continues the
+    /// suspended turn under the suspended Run's settings
+    /// (`AdmittedRun.resumeWithResults`). Exactly once, with the transcript
+    /// as the witness: the settlement is recorded before it enters the
+    /// conversation and stays recorded until the resumed Run's transcript
+    /// holds the call's result. A crash before then applies it on the next
+    /// open; after then, that open sees the result and only drops the
+    /// record.
+    fn runResumption(self: *HostedSession, suspension: *Suspension) void {
+        if (builtin.is_test) if (testing_hooks.before_resumption) |hook| hook(self);
+        // An interrupt that came since it was settled wins over an answer.
+        self.mutex.lock();
+        if (self.run_interrupted) self.cancelSuspensionLocked(suspension, true);
+        const settled = suspension.settled;
+        self.mutex.unlock();
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const prepared = prepareResumption(suspension, settled, scratch.allocator()) catch |err| {
+            self.reopenSuspension(suspension, err);
+            return;
+        };
+        self.mutex.lock();
+        self.suspension = null;
+        self.resuming = suspension;
+        self.mutex.unlock();
+        self.storeRequests() catch |err|
+            log.warn("session_host", "settlement of request {d} of {s} not recorded; a crash before the resumed Run is written loses it: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
+        self.appendLine(wire.writeRequestClosedBy(self.gpa, suspension.request_id, prepared.closed, prepared.by));
+
+        self.last_run_id += 1;
+        const context = wire.RunContext{ .run_id = self.last_run_id, .trace_id = suspension.settings.trace_id };
+        self.emitHost(.{ .run_resumed = .{ .run_id = context.run_id, .trace_id = context.trace_id, .request_id = suspension.request_id } });
+        var scope = RunScope{ .hosted = self, .context = context };
+        self.session.awaitProviderCancelsDrained();
+        var admitted = self.session.admitRun(context.run_id, scope.sink()) catch |err| {
+            self.finishRun(context, null, err, null);
+            self.finishResumption();
+            return;
+        };
+        admitted.stream_retry_budget = suspension.settings.stream_retry_budget;
+        // As in `runSubmission`: an interrupt or close since the resumption
+        // was taken applies now, and so does an interrupt that settled it.
+        self.mutex.lock();
+        self.current_run_id = context.run_id;
+        const stop_now = self.run_interrupted or self.closing or prepared.stop;
+        self.mutex.unlock();
+        if (stop_now) {
+            self.session.abort(context.run_id, .user_interrupt) catch {};
+            self.releaseUi();
+        }
+        const outcome = admitted.resumeWithResults(prepared.results, suspension.settings.max_turns);
+        self.mutex.lock();
+        self.current_run_id = 0;
+        self.run_returned = true;
+        self.mutex.unlock();
+        self.settleRun(context, outcome, suspension.settings);
+        self.finishResumption();
+    }
+
+    /// After a resumed Run, `finishRun` having written its transcript: when
+    /// the committed conversation holds the call's result, the recorded
+    /// settlement is spent and the record is rewritten without it (or with
+    /// the suspension the Run was held on again). When it does not (the Run
+    /// failed before the results entered it, or the Session is poisoned),
+    /// the record keeps the settlement for the next open to apply.
+    fn finishResumption(self: *HostedSession) void {
+        self.mutex.lock();
+        const resumed = self.resuming orelse {
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.unlock();
+        // `finishRun` skips the transcript while a background job runs.
+        _ = self.persistDurable();
+        const applied = blk: {
+            var lease = self.conversationLease() catch break :blk false;
+            defer lease.deinit();
+            break :blk callState(lease.conversation, resumed.tool_use_id) == .answered;
+        };
+        if (!applied) log.warn("session_host", "request {d} of {s}: the resumed Run did not record its result; the next open applies it", .{ resumed.request_id, self.id.asSlice() });
+        self.mutex.lock();
+        self.resuming = null;
+        self.mutex.unlock();
+        if (applied) self.storeRequests() catch |err|
+            log.warn("session_host", "request {d} of {s} not marked consumed; the next open finds its result and drops it: {s}", .{ resumed.request_id, self.id.asSlice(), @errorName(err) });
+        self.destroySuspension(resumed);
+    }
+
+    /// The resumption could not be applied: the request stays open for
+    /// another answer, and any answer it took is dropped (logged).
+    fn reopenSuspension(self: *HostedSession, suspension: *Suspension, err: anyerror) void {
+        log.err("session_host", "request {d} of {s} not resumed, it stays open: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (suspension.settled) {
+            .answered => |answered| {
+                self.gpa.free(answered.json);
+                if (answered.by) |by| self.gpa.free(by);
+            },
+            .open, .cancelled => {},
+        }
+        suspension.settled = .open;
+        suspension.expires_at_ms = null;
+        if (!self.closing) self.phase = .suspended;
     }
 
     // ── teardown ──────────────────────────────────────────────────────────
@@ -1237,6 +2386,13 @@ pub const HostedSession = struct {
         for (queue.items) |work| self.freeWork(work);
         queue.deinit(self.gpa);
         if (response) |json| self.gpa.free(json);
+        // A suspended Run outlives the Session (#446): what settled its
+        // request but was not applied yet is kept for the next open.
+        if (self.suspension) |suspension| {
+            if (suspension.settled != .open) self.storeRequests() catch |err|
+                log.err("session_host", "settled request {d} of {s} not recorded: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
+        }
+        self.dropRequests();
 
         self.session.destroy() catch |err| log.err("session_host", "destroy {s}: {s}", .{ self.id.asSlice(), @errorName(err) });
         if (self.writer) |*writer| writer.deinit();
@@ -1273,7 +2429,8 @@ fn typedFields(submission: Submission) typed_submission.Fields {
     };
 }
 
-/// Wall-clock milliseconds: idempotency keys outlive the process.
+/// Wall-clock milliseconds: idempotency keys and a suspended request's
+/// expiry outlive the process.
 fn wallMs() i64 {
     return @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
 }
@@ -1304,6 +2461,32 @@ fn copyStrings(a: std.mem.Allocator, strings: []const []const u8) error{OutOfMem
     const copy = try a.alloc([]const u8, strings.len);
     for (strings, copy) |string, *slot| slot.* = try a.dupe(u8, string);
     return copy;
+}
+
+/// Where tool call `id` stands in `conversation` (#446): `answered` when a
+/// message after the one that made it holds its result, `waiting` when the
+/// call is in the last message and nothing answers it, `absent` otherwise.
+const CallState = enum { waiting, answered, absent };
+
+fn callState(conversation: *const Conversation, id: []const u8) CallState {
+    const messages = conversation.messages.items;
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        const made = for (messages[index].blocks) |block| switch (block) {
+            .tool_use => |call| if (std.mem.eql(u8, call.id, id)) break true,
+            else => {},
+        } else false;
+        if (!made) continue;
+        for (messages[index + 1 ..]) |later| {
+            for (later.blocks) |block| switch (block) {
+                .tool_result => |result| if (std.mem.eql(u8, result.tool_use_id, id)) return .answered,
+                else => {},
+            };
+        }
+        return if (index + 1 == messages.len) .waiting else .absent;
+    }
+    return .absent;
 }
 
 // ============================================================================
@@ -1473,4 +2656,70 @@ test "SessionHost: a pending prompt answered and interrupted at once is cancelle
     hosted.mutex.lock();
     hosted.run_interrupted = false;
     hosted.mutex.unlock();
+}
+
+test "SessionHost #446: an answer reaches only the request it names; a permission beside a suspending question keeps its own id" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const runtime = try AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    // A timeout only so that a misrouted answer fails the test instead of
+    // hanging it.
+    var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend", .ui_request_timeout_ms = 2_000 });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = .{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = "http://127.0.0.1:9",
+        .workspace = .{ .root = root, .home = root, .state_root = root },
+        .allowed_tools = &.{},
+    } });
+    defer hosted.release();
+
+    // A question of the Run in progress goes pending (id 1)...
+    const options = [_]ui_request.AskOption{ .{ .label = "Ship", .description = "" }, .{ .label = "Wait", .description = "" } };
+    const questions = [_]ui_request.AskQuestion{.{ .question = "Ship now?", .header = "Decision", .multi = false, .options = &options }};
+    const question = ui_request.UiRequest{ .ask_question = &questions };
+    var question_out: ui_request.UiResponse = undefined;
+    try std.testing.expectEqual(ui_request.RequestOutcome.pending, try HostedSession.requestUi(hosted, hosted.id, a, &question, &question_out));
+    defer hosted.closeSuspending();
+
+    // ...and a tool still running in that turn asks for permission (id 2).
+    const Asker = struct {
+        outcome: anyerror!ui_request.RequestOutcome = error.NotRun,
+        response: ui_request.UiResponse = undefined,
+        fn run(self: *@This(), session: *HostedSession) void {
+            const permission = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+            self.outcome = HostedSession.requestUi(session, session.id, std.testing.allocator, &permission, &self.response);
+        }
+    };
+    var asker = Asker{};
+    const thread = try std.Thread.spawn(.{}, Asker.run, .{ &asker, hosted });
+    try waitForLine(&hosted.journal, "\"type\":\"ui_request\",\"id\":2,\"kind\":\"permission\"");
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.pending_request_id);
+
+    // The permission's answer is the permission's.
+    try hosted.respond(2, "{\"choice\":\"allow_once\",\"by\":\"oncall\"}");
+    thread.join();
+    try std.testing.expectEqual(ui_request.RequestOutcome.answered, try asker.outcome);
+    try std.testing.expectEqual(ui_request.PermissionChoice.allow_once, asker.response.permission);
+    try waitForLine(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":2,\"outcome\":\"answered\",\"by\":\"oncall\"}");
+    hosted.mutex.lock();
+    const question_answer = hosted.suspending.?.answer;
+    hosted.mutex.unlock();
+    try std.testing.expect(question_answer == null);
+
+    // The question still waits, under its own id.
+    try std.testing.expectError(error.NoSuchRequest, hosted.respond(2, "{\"choice\":\"allow_once\"}"));
+    try hosted.respond(1, "{\"answers\":[\"Ship\"]}");
+    hosted.mutex.lock();
+    const answered = hosted.suspending.?.answer != null;
+    hosted.mutex.unlock();
+    try std.testing.expect(answered);
 }

@@ -1111,10 +1111,13 @@ leaving every Host to rebuild them:
   driver thread, so configuration changes apply between Runs in the order
   they were queued.
 - Every kernel event, host event (`user_message`, `run_done`,
-  `command_result`, `session_poisoned`) and UI request lands in the
-  Session's `journal` as a wire line; CoreEvents carry `run_id` and the
-  submission's `trace_id`. `respond(id, json)` answers a UI request;
-  anything but the pending id is `error.NoSuchRequest`.
+  `command_result`, `session_poisoned`, `run_resumed`) and UI request lands
+  in the Session's `journal` as a wire line; CoreEvents carry `run_id` and
+  the submission's `trace_id`. `respond(id, json)` answers a UI request, and
+  may name who answered (`"by"`); anything but an open request is
+  `error.NoSuchRequest`, a second answer to one that has not yet applied its
+  first is `error.AlreadyAnswered`, and neither changes anything (see UI
+  requests below).
 - `declareCapabilities(allocator, frame)` installs the client's capability
   frame ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#2-capability-exchange)) and
   returns, and journals, its `capabilities_accepted` line; a refused frame
@@ -1122,7 +1125,8 @@ leaving every Host to rebuild them:
   leaves out is journaled as `ui_request_unavailable` and answered
   `unavailable` without waiting.
 - `interrupt` aborts the Run (or the one being admitted) and answers a
-  pending UI request as cancelled. A Session the kernel poisoned reports
+  pending UI request as cancelled; a suspended Run's request is cancelled
+  too, and the Run resumes only to record that. A Session the kernel poisoned reports
   `session_poisoned`, drops its queue and refuses further work; close and
   reopen it.
 - `close` stops the driver, closes the journal (waking readers), waits only
@@ -1145,20 +1149,116 @@ leaving every Host to rebuild them:
   `effort`), opens it on the same SessionHost as a member of the lead's team
   under the lead's session id and a fresh lease, and submits the prompt as
   its first Run. The factory returns `team = null` (the SessionHost owns the
-  identity; anything else is refused); a refused or failed spawn is logged
-  and dropped. A name the lead already opened, still open, takes the prompt
-  as its next Run. Closing the lead closes the members it opened. Without a
-  factory the requests stay pending for the Host to fulfil itself (open a
-  `.role = .member` Session).
+  identity; anything else is refused). `spawn` also carries the lead's
+  current `lead_model`, `lead_permission_mode` and `lead_reasoning_effort`.
+  A refused or failed spawn becomes the lead's next Run, so its model learns
+  of it: `<teammate-status from="<name>" state="failed">teammate was not
+  started: <error></teammate-status>`, journaled as a typed `user_message`
+  (`source` `session_host`, `kind` `teammate_spawn_failed`;
+  `session_host.spawn_failure_source`/`spawn_failure_kind`). When the name
+  was already open and its member refused the prompt, the text says
+  `teammate did not take the prompt: <error>` instead. A failure while
+  fulfilling such a report Run's own spawns is only logged, so a model that
+  keeps asking for a name that cannot start gets one report, not a Run per
+  retry (under the `App` the failure is a tool result, bounded by the turn
+  limit). A name the lead
+  already opened, still open, takes the prompt as its next Run; one whose
+  member the Host closed is opened again under a fresh lease, after its old
+  roster entry is dropped. Closing the lead closes the members it opened.
+  Without a factory the requests stay pending for the Host to fulfil itself
+  (open a `.role = .member` Session).
+- `session_host.InheritLead{ .base = config }.factory()` is the factory that
+  configures each member like its lead, as the bundled daemon's `App`
+  teammates are: `base` (the configuration the Host opens its leads with;
+  borrowed, outlives the SessionHost) with the lead's current model and
+  permission mode, and the spawn's `effort` or else the lead's reasoning
+  effort. `InheritLead.derive(base, spawn)` is the same mapping as a pure
+  function. `agent_type` is not interpreted.
 
 Options: `max_queued`, `max_turns`, `teammates`, `transcripts`,
-`ui_request_timeout_ms`, `idempotency_retention_ms`, `idempotency_max_keys`.
+`ui_request_timeout_ms`, `ui_request_expiry`, `ui_request_wait`,
+`idempotency_retention_ms`, `idempotency_max_keys`.
 Authentication, tenancy and the transport stay with the Host.
 To stream a Session's journal over SSE, parse the client's position with
 `event_journal.Cursor.fromLastEventId` / `fromSince`, start from
 `EventJournal.planResume(cursor)` (send `resync` when it reports a restart),
 and label lines with `EventJournal.eventId` — the rule the bundled `--web`
 server uses.
+
+UI requests on a long-lived Session (#446; the wire side is
+[WIRE_PROTOCOL.md §1.5](WIRE_PROTOCOL.md#15-ui-requests-approvers-expiry-suspended-runs)):
+
+- **Approver.** An answer may carry `"by":"<approver>"`, 1 to 256 bytes; the
+  request's `ui_request_closed` records it. `respond` refuses any other `by`
+  with `error.InvalidApprover` and leaves the request open. `by` is
+  self-reported, not authenticated: a Host that needs a verified approver
+  sets it from its own authentication (or records the verified identity
+  apart), never from the client's answer body.
+- **Expiry.** `ui_request_timeout_ms` (null: no limit) and
+  `ui_request_expiry`: `.cancel` (default, as before) closes the request
+  `cancelled` and the Run goes on without the answer; `.interrupt` does
+  that and stops the Run; `.re_announce` journals the same `ui_request` line
+  again every period until someone answers. Under `.cancel` and
+  `.interrupt` alike, an expired permission prompt is denied and the model
+  reads that nobody answered in time, and an expired question or custom UI
+  fails with `InputAborted`
+  ([WIRE_PROTOCOL.md §1.4](WIRE_PROTOCOL.md#14-requests-nobody-answered)).
+  `.re_announce` needs a period: with a zero `ui_request_timeout_ms`, `open`
+  is `error.InvalidUiRequestTimeout`.
+- **Waiting work.** A Session runs one thing at a time: a submission or
+  command queued while a request is open waits behind it, never refused for
+  it. `snapshot()` says why in `queue_waiting` (`.none`, `.run`,
+  `.ui_request` with `pending_request_id`). A Host that wants the work to run
+  at once opens another Session.
+- **Suspend mode.** `ui_request_wait = .suspend` (default `.block`; needs
+  `transcripts`, else `open` is `error.SuspendRequiresTranscripts`): a
+  question or custom UI request ends its Run `suspended` (`Phase.suspended`)
+  instead of holding the driver. The Session's directory keeps it
+  (`ui_requests.json`, written whole and fsynced, with a result for every
+  other call of the suspended turn; the kernel's `suspend.json` is not
+  used); `close` leaves it
+  there; `open(.resume)` under the id, after a restart too, announces it
+  again under the same id; `respond` then resumes the Run once through
+  `AdmittedRun.resumeWithResults`, journaled as `ui_request_closed` and
+  `run_resumed`. Exactly once, with the transcript as the witness: the
+  settlement is recorded before it enters the conversation and dropped once
+  the resumed Run's transcript holds the call's result; a crash in between
+  applies it on the next open, and an open that finds the result already
+  there only drops the record. A call of the suspended turn that the kernel
+  did not run (it denied or deferred it) is answered on resume with a result
+  saying it did not run. Nothing else runs while a Run is suspended: queued work
+  waits, and a team lead does not read its inbox, so a teammate's reply
+  waits there, unread, and becomes the lead's next Run after the resumed Run
+  and the queue. The resumed Run keeps the suspended Run's `trace_id`, turn
+  limit and `stream_retry_budget`. A question's answers reach the model as
+  AskUserQuestion's result; a custom UI's `result` is the tool's result as
+  is (the kernel's suspension convention); a cancelled or expired request is
+  the call failing with `InputAborted`. Request ids are kept too, so none is
+  reused across restarts. Each open request has its own id, and `respond`
+  gives an answer only to the request it names: a permission request that
+  blocks beside a suspended question is answered under its own id
+  (`pending_request_id` shows it while it blocks). A `ui_requests.json` this
+  version cannot read (corrupt, or written by a later version; a field it
+  does not know is ignored) is left as it is and never written over:
+  requests then block as under `.block`, under ids past the file's
+  `next_id` and past the clock in milliseconds. A Run submitted under an
+  idempotency key keeps the key spent while it is suspended, however long
+  the request waits; once the resumed Run ends, the key's
+  `idempotency_retention_ms` counts from the Run's start as before, so a
+  Host whose requests may wait long sets the retention above the longest
+  wait plus its redelivery window. One crash window is left: a crash after
+  the suspended turn reaches the transcript and before `ui_requests.json`
+  records its request loses the request; the next Run finds the call without
+  a result and closes it as any unanswered call is closed (message_repair),
+  so the conversation stays valid but the question is not asked again. A
+  fresh `open` under the id drops a suspended Run with the conversation it
+  belonged to. **A permission request is never
+  suspended:** the kernel's permission gate reads a `pending` answer as no
+  answer and denies the tool unasked, so under `.suspend` a permission
+  request blocks as under `.block` (the Session reports `.running` with the
+  request pending) and is cancelled by `close`. Making permission requests
+  survive a restart needs the kernel to suspend at its permission gate and
+  run the approved call on resume; that is follow-up work.
 
 Static trusted plugins can contribute typed tools, streaming tools, services,
 advisory policies, and deterministic provider dialects. Process plugins can only

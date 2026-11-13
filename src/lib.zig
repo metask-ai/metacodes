@@ -234,6 +234,7 @@ pub const mcp_session = @import("core/mcp_session.zig"); // McpSessionEntry
 pub const writer_backend = @import("core/writer_backend.zig"); // 打印型 sink
 pub const headless_backend = @import("core/headless_backend.zig"); // CoreEvent → JSON
 pub const suspend_state = @import("core/suspend_state.zig");
+pub const ui_request_store = @import("core/ui_request_store.zig"); // a SessionHost Session's request ids and suspended request (#446)
 pub const tee_backend = @import("core/tee_backend.zig"); // L4:多路转发 decorator
 pub const diagnostics_backend = @import("core/diagnostics_backend.zig"); // L4:诊断 trace 后端
 pub const evaluation_backend = @import("core/evaluation_backend.zig"); // V1:稳定评估事件投影
