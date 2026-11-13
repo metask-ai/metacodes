@@ -59,7 +59,11 @@
 //! order, asks the Host's `TeammateFactory` for each member's configuration,
 //! opens the member as another Session on the same host under the lead's team
 //! identity and a fresh lease, and submits the request's prompt as its first
-//! Run. Closing the lead closes the members it opened.
+//! Run. Closing the lead closes the members it opened. A name whose member
+//! the Host closed is opened again under a fresh lease, and a spawn that
+//! fails becomes the lead's next Run, so its model learns of it; a failure
+//! while fulfilling that report Run's own spawns is only logged.
+//! `InheritLead` is the factory that configures each member like its lead.
 //!
 //! Lifetimes: `open` and `acquire` return a counted reference that `release`
 //! gives back; no pointer escapes without one. `close` takes the Session out
@@ -99,10 +103,17 @@ const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const swarm_tools = @import("../swarm/tools.zig");
 const swarm_context = @import("../swarm/context.zig");
+const swarm_team = @import("../swarm/team.zig");
 
 /// How often an idle team lead's inbox, a locked file, is read: the bundled
 /// daemon's `session_service.LeadMail.POLL_MS`.
 pub const lead_inbox_poll_ms: u64 = 500;
+
+/// The typed `source` and `kind` of the Run that reports a failed teammate
+/// spawn to its lead. A failure while fulfilling such a Run's own spawns is
+/// only logged, so reports never chain.
+pub const spawn_failure_source = "session_host";
+pub const spawn_failure_kind = "teammate_spawn_failed";
 
 const AgentRuntime = agent_session.AgentRuntime;
 const AgentSession = agent_session.AgentSession;
@@ -368,6 +379,12 @@ pub const TeammateSpawn = struct {
     /// As the lead model passed them; the factory decides what they mean.
     agent_type: ?[]const u8,
     effort: ?[]const u8,
+    /// The lead's settings when it asked, after every command its queue ran
+    /// before (`set_model`, `set_permission_mode`, `set_reasoning_effort`):
+    /// what the bundled daemon's `App` teammates inherit from their lead.
+    lead_model: []const u8,
+    lead_permission_mode: types.PermissionMode,
+    lead_reasoning_effort: ?types.ReasoningEffort,
 };
 
 /// How the Host configures a member Session (#445). The SessionHost owns the
@@ -376,17 +393,100 @@ pub const TeammateSpawn = struct {
 /// lease. Provider, workspace, tools and permissions are the Host's choice,
 /// as for any Session it opens. The returned configuration may borrow from
 /// `arena`, which lives until the member is open. Runs on the lead's driver
-/// thread, so two leads may call it at once; an error drops the request
-/// (logged) and leaves the lead running.
+/// thread, so two leads may call it at once; an error drops the request,
+/// reports it to the lead as its next Run (unless the Run that asked was
+/// itself such a report) and leaves the lead running.
 pub const TeammateFactory = struct {
     ctx: *anyopaque,
     configure: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, spawn: TeammateSpawn) anyerror!SessionConfig,
 };
 
-/// A member Session a lead's driver opened, closed with the lead.
+/// The `TeammateFactory` that configures each member like its lead, as the
+/// bundled daemon's `App` starts its teammates with the lead's provider,
+/// model and permission context (#445). A member gets `base` (the
+/// configuration the Host opens its leads with: provider, credentials,
+/// workspace, tools, permission rules) with the lead's current model and
+/// permission mode, and the spawn's `effort` or else the lead's reasoning
+/// effort. `agent_type` is not interpreted.
+pub const InheritLead = struct {
+    /// Borrowed; outlives the SessionHost. Its `team` and UI requesters are
+    /// not used.
+    base: SessionConfig,
+
+    pub fn factory(self: *InheritLead) TeammateFactory {
+        return .{ .ctx = self, .configure = configure };
+    }
+
+    /// `base` as the member of the lead `spawn` describes. Borrows from
+    /// both.
+    pub fn derive(base: SessionConfig, spawn: TeammateSpawn) error{InvalidTeammateEffort}!SessionConfig {
+        var config = base;
+        config.team = null;
+        config.ui_requester = null;
+        config.run_ui_requester = null;
+        config.model = spawn.lead_model;
+        config.permission_mode = spawn.lead_permission_mode;
+        config.reasoning_effort = if (spawn.effort) |name|
+            std.meta.stringToEnum(types.ReasoningEffort, name) orelse return error.InvalidTeammateEffort
+        else
+            spawn.lead_reasoning_effort;
+        return config;
+    }
+
+    fn configure(ctx: *anyopaque, arena: std.mem.Allocator, spawn: TeammateSpawn) anyerror!SessionConfig {
+        const self: *InheritLead = @ptrCast(@alignCast(ctx));
+        var config = try derive(self.base, spawn);
+        // `spawn` is borrowed for this call only.
+        config.model = try arena.dupe(u8, spawn.lead_model);
+        return config;
+    }
+};
+
+test "InheritLead.derive: the lead's model, mode and effort over the base; the spawn's effort wins; no team" {
+    const base: SessionConfig = .{
+        .provider_kind = .anthropic,
+        .api_key = "k",
+        .model = "base-model",
+        .permission_mode = .default,
+        .reasoning_effort = .low,
+        .workspace = .{ .root = "/w" },
+        .allowed_tools = &.{"Read"},
+        .team = .{ .role = .lead, .team_name = "crew" },
+    };
+    var spawn: TeammateSpawn = .{
+        .lead = session_id_mod.gen(),
+        .team_name = "crew",
+        .name = "solver",
+        .prompt = "p",
+        .agent_type = null,
+        .effort = null,
+        .lead_model = "lead-model",
+        .lead_permission_mode = .accept_edits,
+        .lead_reasoning_effort = .high,
+    };
+    const inherited = try InheritLead.derive(base, spawn);
+    try std.testing.expectEqualStrings("lead-model", inherited.model);
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, inherited.permission_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.high, inherited.reasoning_effort.?);
+    try std.testing.expect(inherited.team == null);
+    try std.testing.expectEqualStrings("/w", inherited.workspace.root);
+    try std.testing.expectEqualStrings("Read", inherited.allowed_tools[0]);
+
+    spawn.effort = "minimal";
+    try std.testing.expectEqual(types.ReasoningEffort.minimal, (try InheritLead.derive(base, spawn)).reasoning_effort.?);
+    spawn.lead_reasoning_effort = null;
+    spawn.effort = null;
+    try std.testing.expect((try InheritLead.derive(base, spawn)).reasoning_effort == null);
+    spawn.effort = "loud";
+    try std.testing.expectError(error.InvalidTeammateEffort, InheritLead.derive(base, spawn));
+}
+
+/// A member Session a lead's driver opened, closed with the lead. `lease` is
+/// the roster identity it joined under.
 const Teammate = struct {
     name: []u8,
     id: SessionId,
+    lease: SessionId,
 };
 
 pub const SessionHost = struct {
@@ -999,7 +1099,7 @@ pub const HostedSession = struct {
                 .resumption => |suspension| self.runResumption(suspension),
                 .re_announce => self.reannounce(),
             }
-            self.fulfilSpawns();
+            self.fulfilSpawns(!isSpawnFailureReport(work));
         }
     }
 
@@ -1077,9 +1177,11 @@ pub const HostedSession = struct {
     /// Opens a member Session for each `SpawnTeammate` request the lead's
     /// last Run made, oldest first, and submits its prompt. A name this lead
     /// already opened and the Host has not closed takes the prompt as its
-    /// next Run instead. Driver-only: the requests live in the lead's
+    /// next Run instead. A request that fails is reported to the lead as its
+    /// next Run (`reportSpawnFailure`) when `report_failures`; otherwise it is
+    /// only logged. Driver-only: the requests live in the lead's
     /// `SwarmContext`.
-    fn fulfilSpawns(self: *HostedSession) void {
+    fn fulfilSpawns(self: *HostedSession, report_failures: bool) void {
         const factory = self.host.options.teammates orelse return;
         if (!self.leadsTeam()) return;
         const swarm = &self.session.swarm.?;
@@ -1087,9 +1189,34 @@ pub const HostedSession = struct {
             const request = swarm.popPendingSpawn() orelse return;
             var owned = request;
             defer owned.deinit(swarm.allocator);
-            self.spawnTeammate(factory, swarm, &owned) catch |err|
+            var target: SpawnTarget = .new_member;
+            self.spawnTeammate(factory, swarm, &owned, &target) catch |err| {
                 log.warn("session_host", "teammate {s} of {s} not started: {s}", .{ owned.name, self.id.asSlice(), @errorName(err) });
+                if (report_failures) self.reportSpawnFailure(owned.name, target, err);
+            };
         }
+    }
+
+    /// Whether a spawn request went to an open member or a new one.
+    const SpawnTarget = enum { new_member, open_member };
+
+    /// True for the Run `reportSpawnFailure` queued. A failure while
+    /// fulfilling that Run's own spawns is only logged: under the `App` a
+    /// failed spawn is a tool result inside the same Run, bounded by its turn
+    /// limit, while here each report is a new Run, so a model that keeps
+    /// asking for a name that cannot start would otherwise loop without end.
+    fn isSpawnFailureReport(work: *const Work) bool {
+        const submission = switch (work.item) {
+            .submission => |submission| submission,
+            // A resumed Run (#446) keeps no record of what its submission
+            // was, so its spawn failures are reported. Each resumption waits
+            // for a person's answer first, so reports still cannot loop on
+            // their own. Re-announcing a request runs nothing.
+            .command, .resumption, .re_announce => return false,
+        };
+        const source = submission.source orelse return false;
+        const kind = submission.kind orelse return false;
+        return std.mem.eql(u8, source, spawn_failure_source) and std.mem.eql(u8, kind, spawn_failure_kind);
     }
 
     fn spawnTeammate(
@@ -1097,14 +1224,23 @@ pub const HostedSession = struct {
         factory: TeammateFactory,
         swarm: *const swarm_context.SwarmContext,
         request: *const swarm_context.SpawnRequest,
+        target: *SpawnTarget,
     ) !void {
         for (self.teammates.items, 0..) |known, index| {
             if (!std.mem.eql(u8, known.name, request.name)) continue;
             if (self.host.acquire(known.id)) |member| {
                 defer member.release();
+                target.* = .open_member;
                 return member.submit(.{ .text = request.prompt });
             }
-            // The Host closed it: forget it and open the name again.
+            // The Host closed it, but its roster entry still holds the old
+            // lease, under which no member may join again. Drop that entry
+            // (only while it is still the one this lead opened) and open the
+            // name anew under a fresh lease, so mail from the closed member
+            // stays unaddressed, as the `App` reaps a terminated teammate.
+            var config_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const config_path = swarm_team.configPath(swarm.state_root, swarm.team_sanitized, &config_buf);
+            _ = swarm_tools.removeMemberFromConfig(self.gpa, config_path, known.name, swarm.session.asSlice(), known.lease.asSlice());
             self.gpa.free(known.name);
             _ = self.teammates.swapRemove(index);
             break;
@@ -1119,6 +1255,9 @@ pub const HostedSession = struct {
             .prompt = request.prompt,
             .agent_type = request.agent_type,
             .effort = request.effort,
+            .lead_model = self.model,
+            .lead_permission_mode = self.session.permission_ctx.modeValue(),
+            .lead_reasoning_effort = self.reasoning_effort,
         });
         if (config.team != null) return error.TeammateTeamConfigNotAllowed;
         const lease = session_id_mod.gen();
@@ -1135,8 +1274,35 @@ pub const HostedSession = struct {
         errdefer self.gpa.free(name);
         const member = try self.host.open(.{ .config = config });
         defer member.release();
-        self.teammates.appendAssumeCapacity(.{ .name = name, .id = member.id });
+        self.teammates.appendAssumeCapacity(.{ .name = name, .id = member.id, .lease = lease });
         try member.submit(.{ .text = request.prompt });
+    }
+
+    /// Tells the lead model that teammate `name` was not started (or, when
+    /// it was already open, did not take the prompt), as the lead's next Run,
+    /// in the `teammate-status` form its inbox uses for a failed teammate;
+    /// under the `App` the same failure is the spawn tool's result. The Run's
+    /// `user_message` is typed (`spawn_failure_source`,
+    /// `spawn_failure_kind`); the provider sees only the text.
+    fn reportSpawnFailure(self: *HostedSession, name: []const u8, target: SpawnTarget, err: anyerror) void {
+        const work = self.newWork() catch return;
+        const what = switch (target) {
+            .new_member => "teammate was not started",
+            .open_member => "teammate did not take the prompt",
+        };
+        const text = std.fmt.allocPrint(
+            work.arena.allocator(),
+            "<teammate-status from=\"{s}\" state=\"failed\">{s}: {s}</teammate-status>",
+            .{ name, what, @errorName(err) },
+        ) catch {
+            self.freeWork(work);
+            return;
+        };
+        work.item = .{ .submission = .{ .text = text, .source = spawn_failure_source, .kind = spawn_failure_kind } };
+        self.enqueue(work) catch |enqueue_err| {
+            log.warn("session_host", "spawn failure of {s} not reported to {s}: {s}", .{ name, self.id.asSlice(), @errorName(enqueue_err) });
+            self.freeWork(work);
+        };
     }
 
     /// A closing lead starts no member, and neither does a poisoned one: it

@@ -122,6 +122,20 @@ team 已建时,driver 至多每 `lead_inbox_poll_ms`(500 ms,与 daemon 的 `Lead
 null),以 lead 的 session id 和新 lease 作为该 team 的 member 在同一个 SessionHost 上
 `open`,并把请求的 prompt 作为它的第一轮 Run 提交;同名且仍开着的 member 收到的是下一轮
 Run。lead `close` 时一并关闭它开的 member。未配 factory 时请求照旧挂起,由宿主自己 `open`。
+`TeammateSpawn` 同时带上 lead 当前的 `lead_model`/`lead_permission_mode`/
+`lead_reasoning_effort`(lead driver 上读取,已含此前排队的命令);`InheritLead`
+就是 daemon 要用的 factory:宿主给出开 lead 用的 base 配置,member 取 lead 当前的 model
+与权限模式,effort 取请求的 `effort`,否则沿用 lead 的,与 `App` teammate 继承 lead 的
+provider/model/权限上下文一致(`agent_type` 不解释)。同名 member 若已被宿主关闭,driver
+先按 lead session + 旧 lease 把名册里的旧条目摘掉(否则新 lease 入册被拒),再以新 lease
+重开,旧 member 的迟到邮件仍不可寻址,对应 `App` 回收已终止 teammate。spawn 失败不再只记
+日志:失败以 `<teammate-status from="<name>" state="failed">teammate was not started:
+<error></teammate-status>` 作为 lead 的下一轮 Run(`user_message` 带 `source`
+`session_host`、`kind` `teammate_spawn_failed`),对应 `App` 下该失败就是 spawn 工具的结果;
+同名 member 仍开着却拒收 prompt 时文字为 `teammate did not take the prompt: <error>`。
+`App` 下这类失败是同一轮 Run 内的工具结果,受 `max_turns` 约束;这里每次报告都是新一轮
+Run,所以报告不链式触发:履行"失败报告 Run"自身的 spawn 时再失败只记日志,模型反复
+spawn 一个起不来的名字最多多花一轮。
 
 与 in-process 共用同一套文件邮箱与名册语义,两条路径逐份核对安全属性(SW1 `waitForWork`
 vs host `pollLeadInbox`)。
