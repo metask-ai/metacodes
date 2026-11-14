@@ -54,6 +54,7 @@ test {
     _ = @import("component/base_url_flag_test.zig");
     _ = @import("component/unknown_flag_test.zig");
     _ = @import("component/cli_help_test.zig");
+    _ = @import("component/launcher_hint_test.zig");
     _ = @import("component/task_error_test.zig");
     _ = @import("component/tool_loop_breaker_test.zig");
     _ = @import("component/user_context_inject_test.zig");

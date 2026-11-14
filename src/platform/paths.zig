@@ -35,6 +35,7 @@ var home_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
 var temp_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
 var state_home_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
 var codex_home_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
+var launcher_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
 
 fn envNonEmptyW(name: [*:0]const u16, out: []u8) ?[]const u8 {
     var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
@@ -68,6 +69,18 @@ pub fn metacodesHomeEnv() ?[]const u8 {
 pub fn codexHomeEnv() ?[]const u8 {
     if (is_windows) return envNonEmptyW(std.unicode.utf8ToUtf16LeStringLiteral("CODEX_HOME"), &codex_home_utf8);
     return envNonEmpty("CODEX_HOME");
+}
+
+/// The variable the launcher `metacodes install` writes sets to its own path
+/// (`$0`) before it execs the installed executable (app/install.zig
+/// `launcherBody`), so messages can name the command the user ran (#482).
+pub const launcher_env_name = "METACODES_LAUNCHER";
+
+/// `METACODES_LAUNCHER`, UTF-8; empty = unset. Believe it only through
+/// app/invocation.zig, which checks the launcher it names.
+pub fn launcherEnv() ?[]const u8 {
+    if (is_windows) return envNonEmptyW(std.unicode.utf8ToUtf16LeStringLiteral(launcher_env_name), &launcher_utf8);
+    return envNonEmpty(launcher_env_name);
 }
 
 /// 当前进程完整环境,`KEY=VALUE` UTF-8 串(arena 持有)。MCP stdio server 的子进程环境由此
