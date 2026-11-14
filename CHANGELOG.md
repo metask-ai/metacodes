@@ -57,6 +57,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A run that finds no credential names the command that was run in its
+  sign-in hint, and lists the default sign-in first** (#482). Run as
+  `metacodes-dev`, a side-by-side development install (`scripts/install.sh
+  --dev`) said to run `metacodes login …`, which signs in the release
+  install, whose state root is separate; and the list left out the bare
+  `metacodes login` that a plain launch reads. The hint now opens with
+  `<command> login`, and its other lines, the incomplete-login message, the
+  Metask session messages and a named provider's credential help name the
+  same command. The launcher `metacodes install` writes now exports its own
+  path as `METACODES_LAUNCHER`, because the executable it `exec`s starts as
+  `<prefix>/bin/metacodes` for every install. The executable believes the
+  variable only when that file is a launcher that execs it; otherwise it
+  takes argv[0] (a symlink under another name), then `metacodes`. A
+  launcher written before this keeps the hint at `metacodes` until
+  `scripts/install.sh` writes it again; `metacodes update` leaves launchers
+  as they are.
+
 - **A `CronCreate` with only `delaySeconds` fires once, as the tool says.**
   `recurring` defaulted to true without a `cron` expression too, so the job
   was stored as recurring with no expression to repeat on. After its first
