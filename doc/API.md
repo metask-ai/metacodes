@@ -1129,6 +1129,15 @@ leaving every Host to rebuild them:
   included, is `error.ModelUnavailable` (`set_model`'s `error_name`) and
   changes nothing. A tier's reasoning effort is not applied, as on the
   daemon. Without `Options.models` the name goes to the Session as it is.
+- `SessionHost.setModelCatalog(catalog)` replaces `Options.models`'
+  `catalog` while the Host runs (#445), as the daemon adopts a refreshed
+  `/v1/models` answer (cached at startup, replaced when the background
+  refresh lands). The Host copies `catalog`; from the call on, every
+  Session's next `Submission.model` or `set_model` is checked against it
+  and no longer against the catalog before (replaced, not merged). The
+  model a Session is on stays in force, also when the new catalog no
+  longer lists it. Without `Options.models` it is
+  `error.ModelPolicyUnset` and nothing is kept.
 - The queue holds `max_queued` (64) submissions and commands. Beyond it
   `submit` and `command` refuse with `error.QueueFull` and hold nothing (an
   HTTP Host: `429`); a duplicate is answered as one before the bound is
