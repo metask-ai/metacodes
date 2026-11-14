@@ -172,6 +172,32 @@ pub const StateRootDiagnosis = struct {
     err: ?[]const u8,
 };
 
+/// `<state root>/.env` as a session would read it (#486): names and line
+/// numbers only, never a value. Borrowed from the host's loaded file.
+/// Optional by design, so never part of `healthy()`: what the file does not
+/// say, a session takes from elsewhere.
+pub const LocalConfigDiagnosis = struct {
+    /// Absolute; null when there is no state root.
+    path: ?[]const u8,
+    /// `absent`, `read`, `unreadable`, `not_a_file`, `too_large` or
+    /// `no_state_root`.
+    state: []const u8,
+    /// Names a session reads from it, in file order.
+    accepted: []const []const u8 = &.{},
+    /// Names it sets that are ignored, in file order.
+    ignored: []const []const u8 = &.{},
+    /// Lines that are not `NAME=value`.
+    malformed_lines: []const u32 = &.{},
+    /// POSIX permission bits (`0600`); null on Windows or when not read.
+    permissions: ?u32 = null,
+
+    /// Other users may read or change the file.
+    pub fn shared(self: LocalConfigDiagnosis) bool {
+        const mode = self.permissions orelse return false;
+        return mode & 0o077 != 0;
+    }
+};
+
 pub const Report = struct {
     /// `[0]` ripgrep, `[1]` TinyKG CLI, `[2]` formal kernel, `[3]` project kernel, `[4]` tinykgd.
     checks: [5]Check,
@@ -179,6 +205,8 @@ pub const Report = struct {
     state_root: ?StateRootDiagnosis = null,
     /// The System-One advisor's effective configuration; null when not diagnosed.
     jev: ?JevDiagnosis = null,
+    /// `<state root>/.env`; null when not diagnosed.
+    local_config: ?LocalConfigDiagnosis = null,
     /// Borrowed, for the human report only: this build's full version and
     /// the install prefix around the executable.
     version: ?[]const u8 = null,
@@ -595,6 +623,25 @@ pub fn writeText(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
         root.source orelse "-",
         root.err orelse "-",
     });
+    if (report.local_config) |local| {
+        try w.print("local_config {s} state={s} accepted=", .{ local.path orelse "-", local.state });
+        try writeNameList(w, local.accepted, ",");
+        try w.writeAll(" ignored=");
+        try writeNameList(w, local.ignored, ",");
+        try w.writeAll(" malformed_lines=");
+        if (local.malformed_lines.len == 0) try w.writeByte('-');
+        for (local.malformed_lines, 0..) |line, index| try w.print("{s}{d}", .{ if (index == 0) "" else ",", line });
+        if (local.permissions) |mode| try w.print(" permissions={o:0>4}\n", .{mode}) else try w.writeAll(" permissions=-\n");
+    }
+}
+
+/// `A<sep>B<sep>C`, or `-` for none.
+fn writeNameList(w: *std.Io.Writer, names: []const []const u8, sep: []const u8) std.Io.Writer.Error!void {
+    if (names.len == 0) return w.writeByte('-');
+    for (names, 0..) |name, index| {
+        if (index > 0) try w.writeAll(sep);
+        try w.writeAll(name);
+    }
 }
 
 pub const HumanOptions = struct {
@@ -772,6 +819,11 @@ pub fn writeHuman(w: *std.Io.Writer, report: *const Report, options: HumanOption
         }
     }
 
+    if (report.local_config) |local| {
+        try w.print("\n{s}Local configuration (.env){s}\n", .{ style.on(BOLD), style.off() });
+        warns += try writeLocalConfig(w, style, local, options.home, &buf);
+    }
+
     try w.writeByte('\n');
     if (fails == 0 and warns == 0) {
         try w.print("{s}All checks passed.{s}\n", .{ style.on(GREEN), style.off() });
@@ -781,6 +833,56 @@ pub fn writeHuman(w: *std.Io.Writer, report: *const Report, options: HumanOption
         if (warns > 0) try w.print("{s}{d} warning{s}{s}", .{ style.on(YELLOW), warns, if (warns == 1) "" else "s", style.off() });
         try w.writeAll(". `metacodes doctor --plain` shows full digests and sources.\n");
     }
+}
+
+/// The `.env` section of the human report; returns how many warnings it
+/// showed.
+fn writeLocalConfig(w: *std.Io.Writer, style: Style, local: LocalConfigDiagnosis, home: ?[]const u8, buf: []u8) std.Io.Writer.Error!usize {
+    const path = homeRelative(local.path orelse "-", home, buf);
+    var warns: usize = 0;
+    if (std.mem.eql(u8, local.state, "no_state_root")) {
+        try writeMark(w, style, .skip);
+        try w.print("none  {s}(no state root){s}\n", .{ style.on(DIM), style.off() });
+        return 0;
+    }
+    if (std.mem.eql(u8, local.state, "absent")) {
+        try writeMark(w, style, .skip);
+        try w.print("{s}  {s}not present; a provider key put there is read at start{s}\n", .{ path, style.on(DIM), style.off() });
+        return 0;
+    }
+    if (!std.mem.eql(u8, local.state, "read")) {
+        try writeMark(w, style, .warn);
+        try w.print("{s}  {s}{s}, nothing in it is read{s}\n", .{ path, style.on(YELLOW), local.state, style.off() });
+        return 1;
+    }
+    try writeMark(w, style, .ok);
+    try w.print("{s}  {s}read{s}\n", .{ path, style.on(DIM), style.off() });
+    if (local.accepted.len > 0) {
+        try w.writeAll("    reads    ");
+        try writeNameList(w, local.accepted, ", ");
+        try w.writeByte('\n');
+    }
+    if (local.ignored.len > 0) {
+        warns += 1;
+        try writeMark(w, style, .warn);
+        try w.writeAll("ignores  ");
+        try writeNameList(w, local.ignored, ", ");
+        try w.print("  {s}(not names this file sets; request addresses go in config.json){s}\n", .{ style.on(DIM), style.off() });
+    }
+    if (local.malformed_lines.len > 0) {
+        warns += 1;
+        try writeMark(w, style, .warn);
+        try w.writeAll("skips line");
+        if (local.malformed_lines.len > 1) try w.writeByte('s');
+        for (local.malformed_lines, 0..) |line, index| try w.print("{s}{d}", .{ if (index == 0) " " else ", ", line });
+        try w.print("  {s}(not NAME=value){s}\n", .{ style.on(DIM), style.off() });
+    }
+    if (local.shared()) {
+        warns += 1;
+        try writeMark(w, style, .warn);
+        try w.print("other users can open it (mode {o:0>4}): chmod 600 {s}\n", .{ local.permissions.?, local.path orelse "" });
+    }
+    return warns;
 }
 
 fn jevSourceNote(source: []const u8) []const u8 {
@@ -873,6 +975,24 @@ pub fn writeJson(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
     const state_root: ?StateRootJson = if (report.state_root) |root| .{ .path = root.path, .source = root.source, .@"error" = root.err } else null;
     const JevJson = struct { state: []const u8, url: ?[]const u8, source: []const u8, @"error": ?[]const u8 };
     const jev: ?JevJson = if (report.jev) |d| .{ .state = d.state, .url = d.url, .source = d.source, .@"error" = d.err } else null;
+    // Names and line numbers only: the file's values never reach the report.
+    const LocalConfigJson = struct {
+        path: ?[]const u8,
+        state: []const u8,
+        accepted: []const []const u8,
+        ignored: []const []const u8,
+        malformed_lines: []const u32,
+        permissions: ?[]const u8,
+    };
+    var mode_buf: [8]u8 = undefined;
+    const local_config: ?LocalConfigJson = if (report.local_config) |d| .{
+        .path = d.path,
+        .state = d.state,
+        .accepted = d.accepted,
+        .ignored = d.ignored,
+        .malformed_lines = d.malformed_lines,
+        .permissions = if (d.permissions) |mode| std.fmt.bufPrint(&mode_buf, "{o:0>4}", .{mode}) catch null else null,
+    } else null;
     try w.writeAll("{\"checks\":");
     try std.json.Stringify.value(entries, .{}, w);
     if (kg) |value| {
@@ -885,6 +1005,10 @@ pub fn writeJson(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!v
     }
     if (jev) |value| {
         try w.writeAll(",\"jev\":");
+        try std.json.Stringify.value(value, .{}, w);
+    }
+    if (local_config) |value| {
+        try w.writeAll(",\"local_config\":");
         try std.json.Stringify.value(value, .{}, w);
     }
     try w.writeByte('}');
@@ -1023,6 +1147,50 @@ test "doctor human report: problems name the cause and agree with --strict" {
     try std.testing.expectEqual(CheckStatus.fail, checkStatus(&report.checks[1]));
     try std.testing.expectEqual(CheckStatus.fail, checkStatus(&report.checks[4]));
     try std.testing.expectEqual(CheckStatus.fail, checkStatus(&report.checks[3]));
+}
+
+test "doctor reports the local configuration by name, never affecting --strict (#486)" {
+    const allocator = std.testing.allocator;
+    var report = try testInstalledReport(allocator);
+    defer report.deinit(allocator);
+    report.local_config = .{
+        .path = "/home/u/.metacodes/.env",
+        .state = "read",
+        .accepted = &.{ "DEEPSEEK_API_KEY", "METACODES_PROVIDER" },
+        .ignored = &.{ "METACODES_BASE_URL", "FOO" },
+        .malformed_lines = &.{ 4, 9 },
+        .permissions = 0o644,
+    };
+
+    var plain: std.Io.Writer.Allocating = .init(allocator);
+    defer plain.deinit();
+    try writeText(&plain.writer, &report);
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "local_config /home/u/.metacodes/.env state=read accepted=DEEPSEEK_API_KEY,METACODES_PROVIDER ignored=METACODES_BASE_URL,FOO malformed_lines=4,9 permissions=0644\n") != null);
+
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    try writeJson(&json.writer, &report);
+    try std.testing.expect(std.mem.indexOf(u8, json.written(), ",\"local_config\":{\"path\":\"/home/u/.metacodes/.env\",\"state\":\"read\",\"accepted\":[\"DEEPSEEK_API_KEY\",\"METACODES_PROVIDER\"],\"ignored\":[\"METACODES_BASE_URL\",\"FOO\"],\"malformed_lines\":[4,9],\"permissions\":\"0644\"}}") != null);
+
+    var human: std.Io.Writer.Allocating = .init(allocator);
+    defer human.deinit();
+    try writeHuman(&human.writer, &report, .{ .home = "/home/u" });
+    const text = human.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "\nLocal configuration (.env)\n  \u{2713} ~/.metacodes/.env  read\n    reads    DEEPSEEK_API_KEY, METACODES_PROVIDER\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  ! ignores  METACODES_BASE_URL, FOO") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  ! skips lines 4, 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  ! other users can open it (mode 0644): chmod 600 /home/u/.metacodes/.env\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "3 warnings. `metacodes doctor --plain` shows full digests and sources.\n"));
+    // Optional, like the advisor: nothing here fails --strict.
+    try std.testing.expect(report.healthy());
+
+    // An install without one says where it would be read from.
+    report.local_config = .{ .path = "/home/u/.metacodes/.env", .state = "absent" };
+    var absent: std.Io.Writer.Allocating = .init(allocator);
+    defer absent.deinit();
+    try writeHuman(&absent.writer, &report, .{ .home = "/home/u" });
+    try std.testing.expect(std.mem.indexOf(u8, absent.written(), "  - ~/.metacodes/.env  not present; a provider key put there is read at start\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, absent.written(), "All checks passed.\n"));
 }
 
 test "doctor human report: a stopped service a session will start is not a warning" {
