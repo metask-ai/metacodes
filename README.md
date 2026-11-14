@@ -273,6 +273,10 @@ zig build && ./zig-out/bin/metacodes --help
 zig build example                          # embed the runtime from Zig
 ```
 
+To use your own provider key instead of signing in, put it in the install's
+`~/.local/opt/metacodes/state/.env` and start again:
+[doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md).
+
 [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) covers isolated installs,
 providers, Metask OAuth, Lean kernels and Windows.
 
@@ -346,6 +350,7 @@ vulnerabilities go through [SECURITY.md](SECURITY.md), never public issues.
 | | |
 |---|---|
 | [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) | Install, providers, build from source |
+| [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md) | Your own provider key in the install's `.env` |
 | [doc/API.md](doc/API.md) | Every supported entry point and its compatibility |
 | [doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md) | The normative C ABI contract |
 | [doc/BENCHMARKS.md](doc/BENCHMARKS.md) | How metacodes is measured, and every result so far |

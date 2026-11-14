@@ -125,6 +125,16 @@ differences, sources) are the header of `src/api/dialects/<vendor>.zig`.
 `KIMI_API_KEY` belongs to Kimi Code: the open-platform profile reads
 `MOONSHOT_API_KEY` only.
 
+Instead of exporting a key in your shell, you can put it in the install's own
+configuration file, `.env` in its state root (`~/.local/opt/metacodes/state/.env`
+for a release install), and start metacodes again: a file holding one
+provider's key uses that provider, and `METACODES_PROVIDER` and
+`METACODES_MODEL` in it choose among several. `metacodes install` writes a
+template beside it. A `.env` in a project directory is never read. Which
+names it accepts, and how it ranks against a Metask sign-in and a `/model`
+default: [LOCAL_CONFIG.md](LOCAL_CONFIG.md). `METACODES_MODEL` in the shell
+is `--model`.
+
 ## GLM Coding Plan
 
 ```sh

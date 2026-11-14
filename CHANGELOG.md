@@ -98,6 +98,37 @@ status, compatibility boundaries, and entry points are defined by
   again, and are journaled as `command_result` like the other commands; an
   unknown id is `ok: false`, `CronJobNotFound`. `AgentSession` gains
   `cronJobs`, `cancelCronJob`, `cancelAllCronJobs` and `cronDueCount`.
+- **Local configuration in the install's `<state root>/.env`** (#486). A
+  provider key, `METACODES_PROVIDER` and the new `METACODES_MODEL` can live
+  in one file of the install, beside `auth.json`
+  (`~/.local/opt/metacodes/state/.env`; `~/.metacodes/.env` for a build run
+  from a checkout), instead of the shell profile; side-by-side installs keep
+  separate files. It is read once at start, as a layer below the process
+  environment, never `setenv`: the shell's value of a name wins, and a key
+  in the shell under any of a provider's names hides that provider's keys in
+  the file, so the two are never refused as conflicting. It may set every
+  registered provider's key names, the variables `config.json` names
+  (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`;
+  these select no provider), `METACODES_PROVIDER` and `METACODES_MODEL`;
+  request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, any `*_URL`)
+  are refused, and every ignored name is listed once in a warning, without its
+  value (a line whose name is not written like a variable name, which may be
+  part of a pasted key, by its line number only). Its
+  provider ranks last: `METACODES_PROVIDER` there (else the one provider whose
+  key it holds) applies only when no flag or environment variable names a
+  provider, no `/model` default is stored and there is no Metask sign-in
+  (`--api-key`, `METASK_API_KEY`, `auth.json`; the file's own
+  `METASK_API_KEY` counts only while the file names no other provider); a
+  file with keys of several providers and no name stops the run and lists
+  them. A key only in the shell
+  still never selects a provider, and a `.env` in the working directory or a
+  repository is never read. The missing-credential hint and a provider's
+  credential help name the file; `metacodes install` and `update` write a
+  `.env.example` template beside it and never touch `.env`; `metacodes
+  doctor` reports which names the file sets are read or ignored (`--json`:
+  `local_config`), never a value. `METACODES_MODEL` in the shell is
+  `--model`. Guide: `doc/LOCAL_CONFIG.md`. A `.env` already sitting in a
+  state root is read from this release on.
 
 ### Fixed
 

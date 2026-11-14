@@ -71,6 +71,8 @@ normative model; the entry points are:
 | Surface | Contract |
 |---|---|
 | `--provider <id\|alias>` / `METACODES_PROVIDER` | resolve the route through the provider registry instead of inferring a transport from the model name |
+| `METACODES_MODEL` | the model, as `--model` gives it (the flag wins) |
+| `<state root>/.env` | the install's local configuration ([LOCAL_CONFIG.md](LOCAL_CONFIG.md)), read once at start and never `setenv`: a layer below the process environment for the names it may set — every registered profile's `env_aliases`, the variables `config.json` names (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`, `METACODES_MODEL`; a provider's aliases are read from it only when the environment sets none of them. Request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`, `METACODES_KG_URL`, any `*_URL`) are refused; other names are ignored with one warning listing them. Its `METACODES_PROVIDER` (else the one provider whose key it holds) applies only when no flag or environment variable names a provider, no `global_selection` is stored and no Metask sign-in exists (`--api-key`, `METASK_API_KEY`, `auth.json`); keys of several providers and no name stop the run and list them. A `.env` anywhere else, the working directory included, is never read. `metacodes install` writes `<state root>/.env.example` on every install and upgrade and never touches `.env` |
 | `--channel <id>` | narrow to one endpoint/region/plan/account binding |
 | `--offer <offer-id>` | pin one exact reproducible route |
 | `--base-url <url>` | validated against the selected profile and route policy before any request URL is built |
@@ -213,7 +215,12 @@ terminal, keep one `key=value` line per check, which scripts parse; `--json` emi
 `{checks: [{name, resolved_path, sha256, expected_sha256, match, source,
 provenance}]}` with `name` in `ripgrep`, `tinykg`, `formal_kernel`,
 `project_kernel`, `tinykgd`, plus a `kg` object when the TinyKG diagnosis could
-be built. `--strict` exits 1 when a binary is unresolved or mismatched, when a
+be built and a `local_config` object for `<state root>/.env`
+(`{path, state, accepted, ignored, malformed_lines, permissions}`: the names a
+session reads from it and the names it ignores, never a value; `state` one of
+`absent`, `read`, `unreadable`, `not_a_file`, `too_large`, `no_state_root`;
+`permissions` the POSIX mode as `"0600"`, null on Windows); the plain form adds
+a `local_config` line, and neither affects `--strict`. `--strict` exits 1 when a binary is unresolved or mismatched, when a
 resolved kernel's `provenance` is not `true`, or when an environment override
 was present but resolved nothing (`source: "env"` with a null `resolved_path`);
 an unpinned kernel or daemon may be absent. `metacodes terminal-setup
