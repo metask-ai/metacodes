@@ -47,6 +47,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A `CronCreate` with only `delaySeconds` fires once, as the tool says.**
+  `recurring` defaulted to true without a `cron` expression too, so the job
+  was stored as recurring with no expression to repeat on. After its first
+  fire `CronRegistry.collectDue` could not compute the next one and set it a
+  minute on, so the "one-shot" prompt ran again every minute until the job
+  was 7 days old; in the CLI, after each exchange that ended at least 60 s
+  after the last fire. Now `recurring` defaults to true only with a `cron`
+  expression, and `recurring: true` without one is refused as
+  `invalid_args`, with nothing scheduled; a `cron` or `recurring` sent as
+  JSON `null` counts as left out. A recurring job whose next fire cannot be
+  computed is removed after it fires, which also stops a valid expression
+  with no match within a year (a Feb 29 job after a leap day) from firing
+  every minute, and `CronRegistry.create` refuses one, also when
+  `delay_seconds` sets its first fire. A delay-only job's tool result now
+  says `"recurring":false`; the tool definitions are unchanged.
+
 - **The log-capture tests no longer read another shard's log** (#472).
   `redirect_credential_test` and `http_error_test` logged every capture to
   one fixed file, `<tmp>/cc-zig-<name>-test.log`, which all eight

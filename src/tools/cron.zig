@@ -17,7 +17,7 @@ pub fn createExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer a.free(prompt);
     if (prompt.len == 0) return error.EmptyPrompt;
 
-    const cron_raw = common.extractJsonArg(args, "cron");
+    const cron_raw = optionalArg(args, "cron");
     const cron_expr = if (cron_raw) |raw| try util_json.unescapeString(raw, a) else "";
     defer if (cron_raw != null) a.free(cron_expr);
     const delay_s: ?i64 = blk: {
@@ -27,10 +27,14 @@ pub fn createExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     };
     if (cron_expr.len == 0 and delay_s == null) return error.MissingSchedule;
 
-    const recurring = blk: {
-        const v = common.extractJsonArg(args, "recurring") orelse break :blk true;
-        break :blk !std.mem.eql(u8, v, "false");
-    };
+    // Only a cron expression repeats. Without one the job is the one-shot
+    // delaySeconds the tool's description promises, and `recurring: true` is
+    // refused: stored, it had no expression to repeat on.
+    const recurring = if (optionalArg(args, "recurring")) |v| !std.mem.eql(u8, v, "false") else cron_expr.len > 0;
+    if (recurring and cron_expr.len == 0) {
+        common.setErrorDetail(ctx.error_detail, a, "recurring: true needs a cron expression to repeat on, and none was given; nothing was scheduled. For a recurring job pass cron (5-field 'M H DoM Mon DoW'); for one fire after delaySeconds, leave out recurring or set it to false.", .{});
+        return error.InvalidRecurringWithoutCron;
+    }
 
     const id = reg.create(cron_expr, delay_s, prompt, recurring) catch |err| {
         return try std.fmt.allocPrint(a, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
@@ -42,6 +46,13 @@ pub fn createExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try util_json.writeJsonString(&out.writer, id[0..]);
     try out.writer.print(",\"recurring\":{},\"scheduled\":true}}", .{recurring});
     return try out.toOwnedSlice();
+}
+
+/// An optional argument as given, or null when it is absent or JSON `null`,
+/// which a model may send for a parameter it means to leave out.
+fn optionalArg(args: []const u8, field: []const u8) ?[]const u8 {
+    const v = common.extractJsonArg(args, field) orelse return null;
+    return if (std.mem.eql(u8, v, "null")) null else v;
 }
 
 pub fn deleteExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -130,4 +141,76 @@ test "CronCreate: one-shot delay" {
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"recurring\":false") != null);
     try testing.expectEqual(@as(usize, 1), reg.count());
+}
+
+test "CronCreate: delaySeconds alone is one-shot, gone after it fires" {
+    const a = testing.allocator;
+    // `recurring` left out, and sent as JSON null, which counts as left out.
+    for ([_][]const u8{
+        "{\"prompt\":\"remind me once\",\"delaySeconds\":0}",
+        "{\"prompt\":\"remind me once\",\"delaySeconds\":0,\"cron\":null,\"recurring\":null}",
+    }) |args| {
+        var reg = CronRegistry.init(a);
+        defer reg.deinit();
+        var ctx = ToolContext.simple(a);
+        ctx.cron_registry = &reg;
+
+        const out = try createExecute(&ctx, args);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "\"recurring\":false") != null);
+        try testing.expectEqual(@as(usize, 1), reg.count());
+
+        const due = try reg.collectDue(a);
+        defer {
+            for (due) |p| a.free(p);
+            a.free(due);
+        }
+        try testing.expectEqual(@as(usize, 1), due.len);
+        try testing.expectEqualStrings("remind me once", due[0]);
+        try testing.expectEqual(@as(usize, 0), reg.count());
+    }
+}
+
+test "CronCreate: recurring true without cron is refused and schedules nothing" {
+    const a = testing.allocator;
+    var reg = CronRegistry.init(a);
+    defer reg.deinit();
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    var ctx = ToolContext.simple(a);
+    ctx.cron_registry = &reg;
+    ctx.error_detail = &detail;
+
+    const err = createExecute(&ctx, "{\"prompt\":\"every minute\",\"delaySeconds\":60,\"recurring\":true}");
+    try testing.expectError(error.InvalidRecurringWithoutCron, err);
+    try testing.expectEqual(@as(usize, 0), reg.count());
+
+    // What the model reads: tool_exec sends the detail under the error's
+    // code, and the name makes it invalid_args, the model's to correct.
+    const tool_error = @import("../core/tool_error.zig");
+    const seen = try tool_error.errorToJson(@errorName(error.InvalidRecurringWithoutCron), "{s}", .{detail.?}, a);
+    defer a.free(seen);
+    try testing.expect(std.mem.indexOf(u8, seen, "\"code\":\"invalid_args\",\"category\":\"user_error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, seen, "recurring: true needs a cron expression") != null);
+    try testing.expect(std.mem.indexOf(u8, seen, "nothing was scheduled") != null);
+}
+
+test "CronCreate: a cron expression is recurring by default" {
+    const a = testing.allocator;
+    var reg = CronRegistry.init(a);
+    defer reg.deinit();
+    var ctx = ToolContext.simple(a);
+    ctx.cron_registry = &reg;
+
+    // Also with delaySeconds, which sets the first fire.
+    for ([_][]const u8{
+        "{\"cron\":\"*/5 * * * *\",\"prompt\":\"check deploy\"}",
+        "{\"cron\":\"*/5 * * * *\",\"delaySeconds\":30,\"prompt\":\"check deploy\"}",
+    }) |args| {
+        const out = try createExecute(&ctx, args);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "\"recurring\":true") != null);
+    }
+    try testing.expectEqual(@as(usize, 2), reg.count());
+    for (reg.jobs.items) |j| try testing.expect(j.recurring);
 }

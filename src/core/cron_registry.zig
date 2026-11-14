@@ -20,7 +20,8 @@ pub const CronJob = struct {
     cron_expr: []const u8, // owned
     /// 要注入的 prompt
     prompt: []const u8, // owned
-    /// recurring=false 时单次后删除
+    /// recurring=false 时单次后删除。A recurring job has an expression to
+    /// repeat on (`create` refuses one without).
     recurring: bool,
     /// 下次触发的 unix 秒(由 cron_expr 或 delay 计算)
     next_fire_unix: i64,
@@ -45,6 +46,9 @@ pub const CronRegistry = struct {
     }
 
     /// 创建一个 cron。cron_expr 或 delay_seconds 二选一。返回 job id。
+    /// A recurring job repeats on its expression, also after a first fire
+    /// that delay_seconds set, so it needs one that matches within the
+    /// scan's year: otherwise error.InvalidCronExpr, and nothing is stored.
     pub fn create(
         self: *CronRegistry,
         cron_expr: []const u8,
@@ -53,12 +57,11 @@ pub const CronRegistry = struct {
         recurring: bool,
     ) ![12]u8 {
         const now = util_time.nowUnix();
-        var next_fire: i64 = undefined;
-        if (delay_seconds) |d| {
-            next_fire = now + d;
-        } else {
-            next_fire = computeNextFire(cron_expr, now) catch return error.InvalidCronExpr;
-        }
+        const by_expr: ?i64 = if (recurring or delay_seconds == null)
+            computeNextFire(cron_expr, now) catch return error.InvalidCronExpr
+        else
+            null;
+        const next_fire = if (delay_seconds) |d| now + d else by_expr.?;
 
         const id = try genId();
         const job = CronJob{
@@ -90,6 +93,9 @@ pub const CronRegistry = struct {
     ///   - recurring=true → 重算 next_fire(滚动)
     ///   - recurring=false → 删除(one-shot)
     ///   - 超过 7 天的 recurring → 最后触发一次后删除(对齐 Claude Code)
+    ///   - a recurring job whose next fire cannot be computed (no expression,
+    ///     or no match within the scan's year) → removed after this fire, not
+    ///     rescheduled
     /// 返回的 prompts owned slice(caller free 每个 + 数组)。
     pub fn collectDue(self: *CronRegistry, allocator: std.mem.Allocator) ![]const []const u8 {
         const now = util_time.nowUnix();
@@ -110,15 +116,20 @@ pub const CronRegistry = struct {
             try out.append(allocator, try allocator.dupe(u8, j.prompt));
 
             const expired = (now - j.created_unix) > 7 * 24 * 3600;
-            if (!j.recurring or expired) {
+            // A recurring job with no next fire goes too: rescheduled a
+            // minute on instead, it fired every minute until it expired.
+            const next: ?i64 = if (j.recurring and !expired)
+                computeNextFire(j.cron_expr, now + 1) catch null
+            else
+                null;
+            if (next) |n| {
+                j.next_fire_unix = n;
+                i += 1;
+            } else {
                 self.allocator.free(j.cron_expr);
                 self.allocator.free(j.prompt);
                 _ = self.jobs.orderedRemove(i);
                 // 不 i+=1,因为 orderedRemove 把后面前移
-            } else {
-                // 重算下次
-                j.next_fire_unix = computeNextFire(j.cron_expr, now + 1) catch (now + 60);
-                i += 1;
             }
         }
         return try out.toOwnedSlice(allocator);
@@ -311,4 +322,60 @@ test "CronRegistry: future job not collected" {
     }
     try testing.expectEqual(@as(usize, 0), due.len);
     try testing.expectEqual(@as(usize, 1), reg.count()); // 仍在
+}
+
+test "CronRegistry: a recurring job with no next fire is removed after it fires" {
+    const a = testing.allocator;
+    // No expression: what a CronCreate with only delaySeconds stored before
+    // this fix. "0 0 30 2 *" (Feb 30) never matches, as a Feb 29 job finds no
+    // match within a year after a leap day. `create` refuses both as
+    // recurring, so each is stored one-shot and made recurring here.
+    for ([_][]const u8{ "", "0 0 30 2 *" }) |expr| {
+        var reg = CronRegistry.init(a);
+        defer reg.deinit();
+        _ = try reg.create(expr, 0, "fire once", false);
+        reg.jobs.items[0].recurring = true;
+
+        const due = try reg.collectDue(a);
+        defer {
+            for (due) |p| a.free(p);
+            a.free(due);
+        }
+        try testing.expectEqual(@as(usize, 1), due.len);
+        try testing.expectEqualStrings("fire once", due[0]);
+        try testing.expectEqual(@as(usize, 0), reg.count());
+    }
+}
+
+test "CronRegistry: create refuses a recurring job it cannot repeat" {
+    const a = testing.allocator;
+    var reg = CronRegistry.init(a);
+    defer reg.deinit();
+    try testing.expectError(error.InvalidCronExpr, reg.create("", 60, "x", true));
+    try testing.expectError(error.InvalidCronExpr, reg.create("0 0 30 2 *", 60, "x", true));
+    try testing.expectEqual(@as(usize, 0), reg.count());
+    // A delay alone fires once; a delay with an expression is a recurring
+    // job's first fire.
+    _ = try reg.create("", 60, "once", false);
+    _ = try reg.create("*/5 * * * *", 60, "every 5 min", true);
+    try testing.expectEqual(@as(usize, 2), reg.count());
+}
+
+test "CronRegistry: a recurring job is rescheduled on its expression after it fires" {
+    const a = testing.allocator;
+    var reg = CronRegistry.init(a);
+    defer reg.deinit();
+    const before = util_time.nowUnix();
+    _ = try reg.create("* * * * *", 0, "every minute", true);
+
+    const due = try reg.collectDue(a);
+    defer {
+        for (due) |p| a.free(p);
+        a.free(due);
+    }
+    try testing.expectEqual(@as(usize, 1), due.len);
+    try testing.expectEqual(@as(usize, 1), reg.count());
+    const next = reg.jobs.items[0].next_fire_unix;
+    try testing.expect(next > before);
+    try testing.expectEqual(@as(i64, 0), @mod(next, 60));
 }
