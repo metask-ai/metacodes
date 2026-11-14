@@ -659,7 +659,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
     // created.  The foreground path below also bypasses JobRegistry while a
     // project gate is active, preventing the 15-second auto-background path.
     if (ctx.project_rule_gate != null and
-        (util_json.extractBoolField(args, "run_in_background") orelse false))
+        (util_json.topLevelBoolField(args, "run_in_background") orelse false))
         return error.ProjectRulesRequireSynchronousExecution;
 
     // description 仅作日志用途，本期透传但不输出

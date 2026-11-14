@@ -57,6 +57,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **The permission check and the tool read one spelling of a call's
+  arguments** (#494). Arguments that named a key twice (`"-i"` twice in a
+  `Grep` call, `file_path` twice in a `Read` call) failed the strict parse
+  of AgentCore's permission digest, and that failure became a deny: the
+  model got `permission_denied` (`safety`, not recoverable) in every
+  permission mode, for a mistake it could correct. And `Grep` found its
+  `path` by the substring `"path":`, so `"path" : "target.ts"` searched the
+  whole working directory while the permission layer judged `target.ts`.
+  Now the agent loop admits a call's arguments before the PreToolUse hook,
+  the permission check and the tool see them: one JSON object with no
+  duplicate key at any level, rewritten in one compact spelling, or an
+  `invalid_args` result (`user_error`, recoverable) with nothing run —
+  `DuplicateArgumentKey`, or `InvalidArgumentsJson` for arguments that are
+  not a JSON object. The bytes the model sent stay in the Conversation
+  unchanged. Built-in tools read their arguments as top-level members
+  (`tools/common.extractJsonArg`, `util/json.topLevel*Field`) rather than
+  the first substring match, so a key nested in another value or inside a
+  string is no longer taken for the argument; so do the schema checks
+  (`tools.validateRequired`/`validateTypes`), the permission rule matcher
+  and the MCP resource tools.
 - **A `CronCreate` with only `delaySeconds` fires once, as the tool says.**
   `recurring` defaulted to true without a `cron` expression too, so the job
   was stored as recurring with no expression to repeat on. After its first

@@ -6,6 +6,7 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
+const util_json = @import("../util/json.zig");
 
 /// nowMs：毫秒时间戳，复用 util/time.zig 的单一实现
 fn nowMs() util_time.Millis {
@@ -27,63 +28,62 @@ pub fn setErrorDetail(
 
 /// Progress 心跳:子进程长命令"仍在运行"提示。重构前是进程全局 g_progress_cb(多 Session
 /// 串台),已移到 ToolContext.spawn_tick_fn(per-session),作为参数传入 spawnCaptureWithStderrTimed。
-/// 从 JSON 对象字符串提取字段值（纯手写解析，适配流式 partial JSON）
+/// The raw value of the top-level member `field` of the tool-argument object
+/// `data`, found by a structural scan (`util/json.topLevelField`), not by a
+/// substring search: whitespace around the colon is allowed, and a key that
+/// appears only inside a nested value or inside a string is not a match.
 ///
-/// 支持：
-/// - 带引号字符串：`"field":"value"` → 返回 `value`（**含原始转义**，调用方需自行 unescape）
-/// - 带引号字符串（带空格）：`"field": "value"` → 同上
-/// - 不带引号标量：`"field":123` / `"field":true` → 返回 `123` / `true`
-/// - 转义的引号 `\"` 不误判为结束
+/// - string value: the bytes between the quotes, **still JSON-escaped**
+///   (the caller unescapes);
+/// - any other value: its lexeme (`123`, `true`, `null`, or a whole
+///   object/array including its brackets).
 ///
-/// 返回的切片指向 `data` 内部，生命周期与 `data` 绑定。
-/// 无此字段时返回 null。
+/// The slice borrows `data`. Returns null when the member is absent or `data`
+/// is not a well-formed object up to it. Arguments reach executors only
+/// after `canonicalizeArgs` admitted them (issue #494), so a duplicate key
+/// never gets here from the agent loop.
 pub fn extractJsonArg(data: []const u8, field: []const u8) ?[]const u8 {
-    var pattern_buf: [256]u8 = undefined;
-    std.debug.assert(field.len < 200);
+    const value = util_json.topLevelField(data, field) orelse return null;
+    if (value.len >= 2 and value[0] == '"') return value[1 .. value.len - 1];
+    return value;
+}
 
-    pattern_buf[0] = '"';
-    @memcpy(pattern_buf[1..][0..field.len], field);
-    pattern_buf[1 + field.len] = '"';
-    pattern_buf[2 + field.len] = ':';
+pub const ArgsError = error{
+    /// The arguments name one key twice at the same level. Readers disagree
+    /// on which one wins, so neither the permission check nor the tool may
+    /// pick one (issue #494).
+    DuplicateArgumentKey,
+    /// The arguments are not one well-formed JSON object.
+    InvalidArgumentsJson,
+    OutOfMemory,
+};
 
-    const key_pattern = pattern_buf[0 .. 3 + field.len];
-    const idx = std.mem.indexOf(u8, data, key_pattern) orelse return null;
-    const start = idx + key_pattern.len;
-
-    var pos = start;
-    while (pos < data.len and data[pos] == ' ') : (pos += 1) {}
-    if (pos >= data.len) return null;
-
-    if (data[pos] == '"') {
-        var end = pos + 1;
-        var escaped = false;
-        while (end < data.len) {
-            if (escaped) {
-                escaped = false;
-                end += 1;
-                continue;
-            }
-            if (data[end] == '\\') {
-                escaped = true;
-                end += 1;
-                continue;
-            }
-            if (data[end] == '"') {
-                return data[pos + 1 .. end];
-            }
-            end += 1;
-        }
-        return null;
-    }
-
-    var end = pos;
-    while (end < data.len) {
-        const c = data[end];
-        if (c == ',' or c == '}' or c == ' ' or c == '\n' or c == '\r' or c == '\t') break;
-        end += 1;
-    }
-    if (end == pos) return null;
-    return data[pos..end];
+/// Admit a tool call's arguments and return them in one canonical spelling
+/// (allocator-owned): parsed strictly as one JSON object with no duplicate
+/// key at any level, then written back compactly, members in their original
+/// order, number lexemes unchanged. The permission check and the executor
+/// both receive these bytes, so they read the same value for every key
+/// whatever whitespace or escapes the model used (issue #494).
+pub fn canonicalizeArgs(allocator: std.mem.Allocator, args: []const u8) ArgsError![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, args, .{
+        .duplicate_field_behavior = .@"error",
+        .parse_numbers = false,
+        // A string value may be as long as the arguments themselves (Write
+        // content); std's default cap would turn a large file into a parse error.
+        .max_value_len = args.len,
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.DuplicateField => error.DuplicateArgumentKey,
+        else => error.InvalidArgumentsJson,
+    };
+    if (value != .object) return error.InvalidArgumentsJson;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 /// 把 posix fd 上的全部内容读到 allocator 拥有的 buffer 中。
@@ -523,6 +523,47 @@ test "extractJsonArg field ordering" {
     try std.testing.expectEqualStrings("1", extractJsonArg(data, "a").?);
     try std.testing.expectEqualStrings("2", extractJsonArg(data, "b").?);
     try std.testing.expectEqualStrings("3", extractJsonArg(data, "c").?);
+}
+
+test "extractJsonArg: whitespace before the colon (#494)" {
+    const data = "{\"pattern\":\"needle\",\"path\" : \"target.ts\",\"output_mode\":\"content\"}";
+    try std.testing.expectEqualStrings("target.ts", extractJsonArg(data, "path").?);
+    try std.testing.expectEqualStrings("content", extractJsonArg(data, "output_mode").?);
+}
+
+test "extractJsonArg: only top-level members match" {
+    // The key inside a nested object or inside a string is not the argument.
+    const nested = "{\"edits\":[{\"path\":\"inner\"}],\"path\":\"outer\"}";
+    try std.testing.expectEqualStrings("outer", extractJsonArg(nested, "path").?);
+    const in_string = "{\"pattern\":\"\\\"path\\\":\\\"x\\\"\"}";
+    try std.testing.expect(extractJsonArg(in_string, "path") == null);
+    try std.testing.expect(extractJsonArg("{\"o\":{\"path\":\"x\"}}", "path") == null);
+    // An object value comes back whole.
+    try std.testing.expectEqualStrings("{\"a\":[1,2]}", extractJsonArg("{\"o\":{\"a\":[1,2]},\"b\":1}", "o").?);
+}
+
+test "canonicalizeArgs: one spelling for every reader (#494)" {
+    const a = std.testing.allocator;
+    const out = try canonicalizeArgs(a, " { \"pattern\" : \"needle\" ,\n\"path\" : \"t\\u0061rget.ts\", \"n\": 1.50, \"-i\": true, \"o\": {\"k\" : [1, null]} } ");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("{\"pattern\":\"needle\",\"path\":\"target.ts\",\"n\":1.50,\"-i\":true,\"o\":{\"k\":[1,null]}}", out);
+}
+
+test "canonicalizeArgs: duplicate keys at any level are refused" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.DuplicateArgumentKey, canonicalizeArgs(a, "{\"file_path\":\"a\",\"file_path\":\"b\"}"));
+    try std.testing.expectError(error.DuplicateArgumentKey, canonicalizeArgs(a, "{\"pattern\":\"x\",\"-i\":true,\"-n\":true,\"-i\":true,\"-n\":true}"));
+    try std.testing.expectError(error.DuplicateArgumentKey, canonicalizeArgs(a, "{\"o\":{\"k\":1,\"k\":1}}"));
+}
+
+test "canonicalizeArgs: anything but one JSON object is refused" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "ls", "[]", "\"x\"", "{\"a\":1", "{\"a\":1}{}", "{\"a\":1,}" }) |bad| {
+        try std.testing.expectError(error.InvalidArgumentsJson, canonicalizeArgs(a, bad));
+    }
+    const empty = try canonicalizeArgs(a, " {} ");
+    defer a.free(empty);
+    try std.testing.expectEqualStrings("{}", empty);
 }
 
 test "spawnCaptureStdout echo" {

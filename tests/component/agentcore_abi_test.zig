@@ -16067,3 +16067,165 @@ test "L2 Revision 28 a Skill invocation Run, inline or in its own context, takes
     try runSkillWithRetryBudget("context: fork\n", 1);
     try runSkillWithRetryBudget("context: fork\n", 0);
 }
+
+// ============================================================================
+// Issue #494: one reading of a tool call's arguments
+// ============================================================================
+
+const Issue494Call = struct { id: []const u8, name: []const u8, args: []const u8 };
+
+/// One assistant turn whose tool_use blocks carry `calls[i].args` verbatim
+/// as the streamed `partial_json`, so the bytes reach Core exactly as a
+/// model could spell them (duplicate keys, whitespace before the colon).
+fn issue494ToolTurnSse(a: std.mem.Allocator, calls: []const Issue494Call) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_494\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n");
+    for (calls, 0..) |call, index| {
+        try w.print("data: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n", .{ index, call.id, call.name });
+        try w.print("data: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{f}}}}}\n\n", .{ index, std.json.fmt(call.args, .{}) });
+        try w.print("data: {{\"type\":\"content_block_stop\",\"index\":{d}}}\n\n", .{index});
+    }
+    try w.writeAll("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n");
+    try w.writeAll("data: {\"type\":\"message_stop\"}\n\n");
+    return out.toOwnedSlice();
+}
+
+/// The tool_result text the provider received for `tool_use_id` (owned).
+fn issue494ToolResult(a: std.mem.Allocator, request_body: []const u8, tool_use_id: []const u8) ![]u8 {
+    // The request replays the model's tool_use input verbatim, duplicates included.
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, request_body, .{ .duplicate_field_behavior = .use_last });
+    defer parsed.deinit();
+    for (parsed.value.object.get("messages").?.array.items) |message| {
+        const content = message.object.get("content") orelse continue;
+        if (content != .array) continue;
+        for (content.array.items) |block| {
+            const kind = block.object.get("type") orelse continue;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "tool_result")) continue;
+            if (!std.mem.eql(u8, block.object.get("tool_use_id").?.string, tool_use_id)) continue;
+            switch (block.object.get("content").?) {
+                .string => |text| return a.dupe(u8, text),
+                .array => |parts| {
+                    var text: std.ArrayList(u8) = .empty;
+                    errdefer text.deinit(a);
+                    for (parts.items) |part| if (part.object.get("text")) |t| try text.appendSlice(a, t.string);
+                    return text.toOwnedSlice(a);
+                },
+                else => return error.UnexpectedToolResultShape,
+            }
+        }
+    }
+    return error.MissingToolResult;
+}
+
+/// The tool result is the recoverable argument error the model can correct.
+fn expectIssue494InvalidArgs(a: std.mem.Allocator, result_text: []const u8) !void {
+    errdefer std.debug.print("tool result: {s}\n", .{result_text});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result_text, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("invalid_args", err.get("code").?.string);
+    try std.testing.expectEqualStrings("user_error", err.get("category").?.string);
+    try std.testing.expect(err.get("recoverable").?.bool);
+}
+
+test "L2 issue #494: duplicate argument keys are a recoverable invalid_args, and whitespace before the colon names the same argument, through AgentCore" {
+    const a = std.testing.allocator;
+    for ([_]u32{ wire.PERMISSION_DEFAULT, wire.PERMISSION_FULL_ACCESS }) |mode| {
+        errdefer std.debug.print("permission mode code {d}\n", .{mode});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = try rootPath(&tmp, &root_buf);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target.txt", .data = "ISSUE494_TARGET_LINE\n" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "decoy.txt", .data = "ISSUE494_DECOY_LINE\n" });
+
+        const tool_sse = try issue494ToolTurnSse(a, &.{
+            .{ .id = "tu_grep_dup", .name = "Grep", .args = "{\"output_mode\":\"content\",\"path\":\"target.txt\",\"pattern\":\"ISSUE494\",\"-i\":true,\"-n\":true,\"glob\":\"*.txt\",\"-i\":true,\"-n\":true}" },
+            .{ .id = "tu_read_dup", .name = "Read", .args = "{\"file_path\":\"target.txt\",\"file_path\":\"decoy.txt\"}" },
+            .{ .id = "tu_read_compact", .name = "Read", .args = "{\"file_path\":\"target.txt\"}" },
+            .{ .id = "tu_read_space", .name = "Read", .args = "{\"file_path\" : \"target.txt\"}" },
+        });
+        defer a.free(tool_sse);
+        const bodies = [_][]const u8{ tool_sse, FINAL_SSE };
+        var server = try harness.MockServer.startCassette(&bodies, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+
+        const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+            return error.MissingApi;
+        const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer api.bufferRelease()(&diagnostic);
+        const builtins = [_]wire.BytesViewV1{ sdk.bytesView("Grep"), sdk.bytesView("Read") };
+        var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+        runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+        runtime_config.builtin_tools = &builtins;
+        runtime_config.builtin_tool_count = builtins.len;
+        var runtime: ?*wire.RuntimeHandle = null;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+        );
+        defer if (runtime) |handle| {
+            _ = api.runtime().destroy()(handle, &diagnostic);
+        };
+        var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+        host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+        host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+        host_config.permission_mode_code = mode;
+        host_config.shell_policy_code = wire.SHELL_DISABLED;
+        host_config.api_key = sdk.bytesView("test-key");
+        host_config.base_url = sdk.bytesView(url);
+        host_config.workspace_root = sdk.bytesView(root);
+        host_config.workspace_home = sdk.bytesView(root);
+        host_config.allowed_tools = &builtins;
+        host_config.allowed_tool_count = builtins.len;
+        var config = sessionCreateConfig(&host_config, "test-model");
+        var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+        callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+        callbacks.on_event = acceptEvent;
+        var session: ?*wire.SessionHandle = null;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
+        );
+        defer if (session) |handle| {
+            _ = api.session().destroy()(handle, &diagnostic);
+        };
+        var options = std.mem.zeroes(wire.RunOptionsV1);
+        options.struct_size = @sizeOf(wire.RunOptionsV1);
+        options.max_turns = 2;
+        var result = std.mem.zeroes(wire.RunResultV1);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.session().runText(session, 1, sdk.bytesView("search the target"), &options, &result, &diagnostic),
+        );
+        try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+        const follow_up = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+
+        // Before #494 both duplicate-key calls came back as a non-recoverable
+        // permission_denied: the permission digest refused the arguments and
+        // its caller turned that into a deny, in every permission mode.
+        for ([_][]const u8{ "tu_grep_dup", "tu_read_dup" }) |id| {
+            const text = try issue494ToolResult(a, follow_up, id);
+            defer a.free(text);
+            try std.testing.expect(std.mem.indexOf(u8, text, "permission_denied") == null);
+            try expectIssue494InvalidArgs(a, text);
+        }
+        // Neither spelling of the duplicate was read: the decoy never reached the model.
+        try std.testing.expect(std.mem.indexOf(u8, follow_up, "ISSUE494_DECOY_LINE") == null);
+        // `"file_path" : "target.txt"` is the same argument as the compact
+        // spelling for the permission check and the tool alike: one outcome.
+        const compact = try issue494ToolResult(a, follow_up, "tu_read_compact");
+        defer a.free(compact);
+        const spaced = try issue494ToolResult(a, follow_up, "tu_read_space");
+        defer a.free(spaced);
+        errdefer std.debug.print("compact read: {s}\nspaced read: {s}\n", .{ compact, spaced });
+        try std.testing.expectEqualStrings(compact, spaced);
+        // The tool runs, and reads exactly that file.
+        try std.testing.expect(std.mem.indexOf(u8, spaced, "ISSUE494_TARGET_LINE") != null);
+    }
+}

@@ -30,6 +30,21 @@ empty `### Migration`.
   prompts as Runs (#445); `RuntimeConfigV1` has no such flag, and the cron
   tools stay out of the tools an ABI Runtime admits.
 
+### Fixed
+
+- A tool call whose arguments name a key twice (#494), such as `Grep` with
+  `"-i"` twice or `Read` with `file_path` twice, no longer ends as
+  `permission_denied` (`safety`, `recoverable: false`) in every permission
+  mode. It runs nothing and its result is `invalid_args` (`user_error`,
+  `recoverable: true`), as are arguments that are not one JSON object; the
+  Host's permission callback is not called for it. Whitespace around a
+  colon (`"path" : "target.ts"`) now names the same argument for the tool
+  as for the permission check: `Grep` searched the whole Workspace for
+  that spelling. A key that appears only inside another value, or inside
+  an escaped key, is no longer read as a built-in tool's argument, so a
+  `Write`/`Edit` call spelled that way now gets the `file_target`
+  candidate for the file it really writes.
+
 ## 0.15.0 — 2026-11-13
 
 ### Added

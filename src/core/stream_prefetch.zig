@@ -64,7 +64,9 @@ const Job = struct {
     entry: *Entry,
     ctx: *const ToolContext,
     name: []const u8, // borrowed
-    input: []const u8, // borrowed
+    input: []const u8, // borrowed, unless `owns_input`
+    /// `input` belongs to the Prefetch (`startOwned`) and is freed with the job.
+    owns_input: bool = false,
     parent_allocator: std.mem.Allocator,
     rid: log.RequestId,
 };
@@ -131,6 +133,20 @@ pub const Prefetch = struct {
     /// **并发上限**:在飞线程 ≥ MAX_TOOL_CONCURRENCY 时不预取(直接 return,take 返 null →
     /// executeSlots 正常执行)——消费路径有 8 的滑动窗口,预取侧无界曾是疏漏。
     pub fn start(self: *Prefetch, ctx: *const ToolContext, id: []const u8, name: []const u8, input: []const u8, rid: log.RequestId) void {
+        self.startJob(ctx, id, name, input, false, rid);
+    }
+
+    /// `start` with arguments the Prefetch takes ownership of (allocated with
+    /// its allocator): the agent loop's canonical spelling of a call's
+    /// arguments (issue #494) lives as long as the job that reads it. Freed
+    /// here on every path, including when no job starts.
+    pub fn startOwned(self: *Prefetch, ctx: *const ToolContext, id: []const u8, name: []const u8, input: []u8, rid: log.RequestId) void {
+        self.startJob(ctx, id, name, input, true, rid);
+    }
+
+    fn startJob(self: *Prefetch, ctx: *const ToolContext, id: []const u8, name: []const u8, input: []const u8, owns_input: bool, rid: log.RequestId) void {
+        var input_owned = owns_input;
+        defer if (input_owned) self.allocator.free(input);
         if (self.inflightCount() >= @import("tool_exec.zig").MAX_TOOL_CONCURRENCY) return;
         const entry = self.allocator.create(Entry) catch return;
         entry.* = .{ .id = id };
@@ -139,11 +155,13 @@ pub const Prefetch = struct {
             return;
         };
         const job = self.allocator.create(Job) catch return; // entry 已入表,deinit 会收
-        job.* = .{ .entry = entry, .ctx = ctx, .name = name, .input = input, .parent_allocator = self.allocator, .rid = rid };
+        job.* = .{ .entry = entry, .ctx = ctx, .name = name, .input = input, .owns_input = owns_input, .parent_allocator = self.allocator, .rid = rid };
         self.jobs.append(self.allocator, job) catch {
             self.allocator.destroy(job);
             return;
         };
+        // From here the job owns the input; `deinit` frees it after the join.
+        input_owned = false;
         entry.thread = std.Thread.spawn(.{}, runJob, .{job}) catch blk: {
             runJob(job); // spawn 失败 → 当场同步跑(仍能用结果)
             break :blk null;
@@ -239,7 +257,10 @@ pub const Prefetch = struct {
     pub fn deinit(self: *Prefetch) void {
         self.joinAll();
         for (self.entries.items) |e| self.allocator.destroy(e);
-        for (self.jobs.items) |j| self.allocator.destroy(j);
+        for (self.jobs.items) |j| {
+            if (j.owns_input) self.allocator.free(j.input);
+            self.allocator.destroy(j);
+        }
         self.jobs.deinit(self.allocator);
         self.entries.deinit(self.allocator);
     }

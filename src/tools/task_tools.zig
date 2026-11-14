@@ -224,27 +224,27 @@ fn missingFieldError(field: []const u8) anyerror {
 }
 
 fn extractString(args: []const u8, field: []const u8) !?[]const u8 {
-    return util_json.extractStringField(args, field);
+    return util_json.topLevelStringField(args, field);
 }
 
 fn extractStringOrError(args: []const u8, field: []const u8) ![]const u8 {
-    return util_json.extractStringField(args, field) orelse return missingFieldError(field);
+    return util_json.topLevelStringField(args, field) orelse return missingFieldError(field);
 }
 
 /// 取 id 类字段(taskId),**容忍裸数字**:模型常把数字 id 发成 `"taskId":1` 而非 `"1"`
 /// (实测:TaskCreate 返 id="1" 后模型调 TaskUpdate 发 `"taskId":1` → 旧版误报 MissingTaskId)。
 /// id 永不含 JSON 转义(序列号/slug),故借 raw slice 即可,无需 unescape。
 fn extractIdOrError(args: []const u8, field: []const u8) ![]const u8 {
-    return util_json.extractStringOrNumberField(args, field) orelse return missingFieldError(field);
+    return util_json.topLevelStringOrNumberField(args, field) orelse return missingFieldError(field);
 }
 
 fn extractUnescaped(allocator: std.mem.Allocator, args: []const u8, field: []const u8) !?[]u8 {
-    const raw = util_json.extractStringField(args, field) orelse return null;
+    const raw = util_json.topLevelStringField(args, field) orelse return null;
     return try util_json.unescapeString(raw, allocator);
 }
 
 fn extractUnescapedOrError(allocator: std.mem.Allocator, args: []const u8, field: []const u8) ![]u8 {
-    const raw = util_json.extractStringField(args, field) orelse return missingFieldError(field);
+    const raw = util_json.topLevelStringField(args, field) orelse return missingFieldError(field);
     return try util_json.unescapeString(raw, allocator);
 }
 
@@ -986,8 +986,8 @@ pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 优先看 agent_job_id;没有再看 taskId 是否带 agent_ 前缀。
     const agent_id: ?[]const u8 = blk: {
-        if (@import("../util/json.zig").extractStringField(args, "agent_job_id")) |aid| break :blk aid;
-        if (@import("../util/json.zig").extractStringField(args, "taskId")) |tid| {
+        if (@import("../util/json.zig").topLevelStringField(args, "agent_job_id")) |aid| break :blk aid;
+        if (@import("../util/json.zig").topLevelStringField(args, "taskId")) |tid| {
             if (std.mem.startsWith(u8, tid, "agent_")) break :blk tid;
         }
         break :blk null;

@@ -10356,9 +10356,19 @@ test "Revision 17 AgentCore allow_session on Write covers later writes to the sa
         .undecided,
     ) == null);
 
-    // A call the tool and a JSON reader would resolve differently gets only
-    // the exact-argument candidate.
-    const ambiguous = "{\"a\\\"file_path\":\"elsewhere.txt\",\"file_path\":\"notes.txt\",\"content\":\"x\"}";
+    // The tool reads its top-level `file_path` structurally (#494): a key
+    // that only looks like `file_path` inside another key names nothing, so
+    // this call writes notes.txt and the file grant covers it.
+    const escaped_key = "{\"a\\\"file_path\":\"elsewhere.txt\",\"file_path\":\"notes.txt\",\"content\":\"x\"}";
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.allow,
+        AbiSession.permissionDecisionOverride(&fake, "Write", escaped_key, .undecided).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+
+    // A call that names no file the tool could open gets only the
+    // exact-argument candidate.
+    const ambiguous = "{\"file_path\":\"notes\\u0000.txt\",\"content\":\"x\"}";
     try ToolCall.append(native_session, "write-2", "Write", ambiguous);
     try std.testing.expect(AbiSession.permissionDecisionOverride(&fake, "Write", ambiguous, .undecided) == null);
     const ambiguous_request = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = ambiguous } };
