@@ -100,7 +100,7 @@ pub const Service = struct {
             .broken = std.StringHashMap(void).init(allocator),
             .baselines = std.StringHashMap(Baseline).init(allocator),
         };
-        self.reaper = std.Thread.spawn(.{}, reaperLoop, .{self}) catch null;
+        self.reaper = @import("platform").thread.spawn(.full, reaperLoop, .{self}) catch null;
         return self;
     }
 

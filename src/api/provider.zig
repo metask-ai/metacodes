@@ -23,6 +23,7 @@ const api_stream = @import("stream.zig");
 const request_overrides = @import("request_overrides.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const sync = @import("platform").sync;
+const platform_thread = @import("platform").thread;
 const log = @import("../util/log.zig");
 const error_class = @import("error_class.zig");
 const auth_header_mod = @import("auth_header.zig");
@@ -198,6 +199,10 @@ pub const RequestAbortRegistry = struct {
     slots: std.ArrayList(Slot) = .empty,
     monitor: ?std.Thread = null,
     monitor_stop: bool = false,
+    /// Set by the monitor, under `mutex`, as it returns because no slot was
+    /// left to watch (#503): an idle Session keeps no monitor thread and takes
+    /// no wake-ups. The next monitored registration joins it and spawns anew.
+    monitor_exited: bool = false,
     monitor_cond: sync.Condition = .{},
     keepalive: KeepaliveEvidence = .{},
     keepalive_tuning: KeepaliveTuning = .{},
@@ -240,12 +245,21 @@ pub const RequestAbortRegistry = struct {
         self.ensureMonitorLocked(idle_limit_ms);
     }
 
-    /// Spawn the monitor thread on first monitored registration. Caller holds
-    /// the mutex. A limit of 0 never needs a monitor.
+    /// Spawn the monitor thread on a monitored registration when none is
+    /// running. Caller holds the mutex. A limit of 0 never needs a monitor.
     fn ensureMonitorLocked(self: *RequestAbortRegistry, idle_limit_ms: u64) void {
-        if (idle_limit_ms == 0 or self.monitor != null) return;
+        if (idle_limit_ms == 0) return;
+        if (self.monitor) |thread| {
+            if (!self.monitor_exited) return;
+            // The monitor set the flag under this mutex and does nothing after
+            // releasing it but return, so this join is short.
+            thread.join();
+            self.monitor = null;
+        }
         self.monitor_stop = false;
-        self.monitor = std.Thread.spawn(.{}, monitorMain, .{self}) catch |err| blk: {
+        self.monitor_exited = false;
+        // Waits on a condition and runs `reapStalled`: a waiter's stack.
+        self.monitor = platform_thread.spawn(.waiter, monitorMain, .{self}) catch |err| blk: {
             // No monitor = no liveness guarantee for this process; say so
             // once rather than pretending the limit is enforced.
             log.warn("client", "stream liveness monitor unavailable ({s}); idle limit {d}ms will not be enforced", .{ @errorName(err), idle_limit_ms });
@@ -431,7 +445,19 @@ pub const RequestAbortRegistry = struct {
             self.mutex.unlock();
             _ = self.reapStalled(monotonicMs());
             self.mutex.lock();
+            if (!self.watchingLocked()) {
+                self.monitor_exited = true;
+                return;
+            }
         }
+    }
+
+    /// Whether a slot can still stall: monitored and not shut down yet.
+    fn watchingLocked(self: *const RequestAbortRegistry) bool {
+        for (self.slots.items) |active| {
+            if (active.idle_limit_ms != 0 and active.stalled_after_ms == null) return true;
+        }
+        return false;
     }
 
     pub fn deinit(
@@ -863,6 +889,49 @@ test "RequestAbortRegistry: the monitor thread reaps a stalled request on its ow
     // deinit signals the monitor instead of waiting out a full tick (generous bound: a loaded
     // CI box, not a tick multiple, is what this must survive).
     try std.testing.expect(monotonicMs() - before < 2_000);
+}
+
+fn monitorExited(registry: *RequestAbortRegistry) bool {
+    registry.mutex.lock();
+    defer registry.mutex.unlock();
+    return registry.monitor_exited;
+}
+
+fn waitMonitorExited(registry: *RequestAbortRegistry) bool {
+    var waited_ms: u64 = 0;
+    while (!monitorExited(registry) and waited_ms < 5_000) : (waited_ms += 20) {
+        @import("../util/time.zig").sleepMs(20);
+    }
+    return monitorExited(registry);
+}
+
+test "RequestAbortRegistry: the monitor exits once nothing is watched and the next monitored request brings it back (#503)" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(a);
+    var first = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&first), LivenessProbe.shutdown, 60_000);
+    try std.testing.expect(registry.monitor != null);
+    // A watched slot keeps the monitor running across ticks.
+    @import("../util/time.zig").sleepMs(3 * RequestAbortRegistry.MONITOR_TICK_MS);
+    try std.testing.expect(!monitorExited(&registry));
+    // The request ends: within a tick the monitor is gone, as it is for a
+    // Session idling between Runs.
+    registry.unregister(@ptrCast(&first));
+    try std.testing.expect(waitMonitorExited(&registry));
+    // The next monitored request gets a monitor again, and it still reaps.
+    var second = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&second), LivenessProbe.shutdown, 50);
+    defer registry.unregister(@ptrCast(&second));
+    try std.testing.expect(!monitorExited(&registry));
+    var waited_ms: u64 = 0;
+    while (second.shutdowns.load(.acquire) == 0 and waited_ms < 5_000) : (waited_ms += 20) {
+        @import("../util/time.zig").sleepMs(20);
+    }
+    try std.testing.expectEqual(@as(u32, 1), second.shutdowns.load(.acquire));
+    try std.testing.expect(registry.stalledIdleMs(@ptrCast(&second)).? >= 50);
+    // Its only slot is shut down, so nothing is left to watch: it exits again.
+    try std.testing.expect(waitMonitorExited(&registry));
 }
 
 test "RequestAbortRegistry closes pre-registration abort race" {

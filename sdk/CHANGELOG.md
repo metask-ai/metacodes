@@ -40,6 +40,13 @@ empty `### Migration`.
 
 ### Fixed
 
+- A Session idling in `Open.Idle` after a streaming Run costs far less on
+  Windows (#503): about 4 MB of private commit and 2 threads instead of about
+  50 MB and 3. Each of its threads used to commit Zig's 16 MiB default stack;
+  the provider's connection workers now commit 2 MiB each, and the stream
+  liveness monitor exits while no request is in flight and starts again with
+  the next one. Nothing changes in the ABI, and a Host needs no new
+  configuration; closing a Session still releases everything it held.
 - A tool call whose arguments name a key twice (#494), such as `Grep` with
   `"-i"` twice or `Read` with `file_path` twice, no longer ends as
   `permission_denied` (`safety`, `recoverable: false`) in every permission

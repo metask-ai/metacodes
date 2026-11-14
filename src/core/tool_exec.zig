@@ -1693,7 +1693,7 @@ fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_alloca
 const SpawnJobFn = *const fn (job: *Job) std.Thread.SpawnError!std.Thread;
 
 fn spawnJob(job: *Job) std.Thread.SpawnError!std.Thread {
-    return std.Thread.spawn(.{}, runJob, .{job});
+    return @import("platform").thread.spawn(.full, runJob, .{job});
 }
 
 /// Spawner injection exists solely to make the resource-exhaustion fallback

@@ -607,7 +607,7 @@ const FakeService = struct {
 fn probeFake(reply: []const u8) !struct { occupant: Occupant, key: [80]u8, key_len: usize } {
     const listener = try net.listenLoopback(0, 4);
     var fake = FakeService{ .listener = listener, .reply = reply };
-    const thread = try std.Thread.spawn(.{}, FakeService.serve, .{&fake});
+    const thread = try @import("platform").thread.spawn(.full, FakeService.serve, .{&fake});
     const verdict = occupant(listener.port, "k" ** 64);
     thread.join();
     net.closeSocket(listener.sock);

@@ -486,7 +486,7 @@ pub const RenderRegion = struct {
         const m = &(self.merge orelse return);
         if (!m.timer) return;
         if (m.thread == null) {
-            m.thread = std.Thread.spawn(.{}, timerMain, .{self}) catch {
+            m.thread = @import("platform").thread.spawn(.full, timerMain, .{self}) catch {
                 self.merge = null;
                 self.paintLocked(.as_needed, "");
                 return;

@@ -770,7 +770,7 @@ pub const SessionHost = struct {
         hosted.store_dir = if (hosted.writer) |*writer| writer.dir else null;
         hosted.restoreRequests(spec.mode, &conversation);
         errdefer hosted.dropRequests();
-        hosted.driver = try std.Thread.spawn(.{}, HostedSession.driverMain, .{hosted});
+        hosted.driver = try @import("platform").thread.spawn(.full, HostedSession.driverMain, .{hosted});
         // The caller's reference, taken before the Session becomes visible.
         hosted.references = 1;
 

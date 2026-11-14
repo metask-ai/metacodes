@@ -941,7 +941,7 @@ pub const TeammateRegistry = struct {
             self.listUnlock();
         };
 
-        entry.thread = try std.Thread.spawn(.{}, teammateThreadMain, .{input});
+        entry.thread = try @import("platform").thread.spawn(.full, teammateThreadMain, .{input});
         committed = true;
         log.info("swarm", "teammate spawned {s} (team {s})", .{ entry.agent_id, entry.team });
         return entry;

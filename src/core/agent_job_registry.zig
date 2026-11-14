@@ -999,7 +999,7 @@ pub const AgentJobRegistry = struct {
 
         // 5) spawn 线程。成功 → committed=true,所有权(input/entry/client/io/prebuilt)归线程 + registry,
         //    所有 errdefer 失效。失败 → return e,errdefer 统一回滚(摘 registry + 释放全部资源)。
-        entry.thread = std.Thread.spawn(.{}, jobThreadMain, .{input}) catch |err| {
+        entry.thread = @import("platform").thread.spawn(.full, jobThreadMain, .{input}) catch |err| {
             return err;
         };
         committed = true;

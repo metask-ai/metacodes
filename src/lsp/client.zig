@@ -82,7 +82,7 @@ pub const Client = struct {
             .abort = abort,
         };
         self.transport.abort = abort; // reader 的 readMessage 也 abort-aware
-        self.reader_thread = try std.Thread.spawn(.{}, readerLoop, .{self});
+        self.reader_thread = try @import("platform").thread.spawn(.full, readerLoop, .{self});
         return self;
     }
 

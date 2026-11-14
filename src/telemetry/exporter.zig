@@ -78,7 +78,7 @@ pub const Exporter = struct {
         headers[0] = .{ .name = "content-type", .value = config.protocol.contentType() };
         for (config.headers, 1..) |h, i| headers[i] = .{ .name = h.name, .value = h.value };
         self.http_headers = headers;
-        self.thread = try std.Thread.spawn(.{}, worker, .{self});
+        self.thread = try @import("platform").thread.spawn(.full, worker, .{self});
         return self;
     }
 
@@ -300,7 +300,7 @@ pub const TestCollector = struct {
 
     pub fn start(gpa: std.mem.Allocator, self: *TestCollector) !void {
         self.* = .{ .listener = try net.listenLoopback(0, 8), .gpa = gpa };
-        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+        self.thread = try @import("platform").thread.spawn(.full, serve, .{self});
     }
 
     pub fn url(self: *const TestCollector, buf: []u8) []const u8 {
