@@ -915,7 +915,9 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
 `RuntimeConfig.enable_cron`(issue #445)把 cron 工具(`CronCreate`/`CronDelete`/`CronList`)
 放进目录;选了它们的 Session 自带 `CronRegistry`(不落盘)。到期 prompt 由 Host 在空闲时经
 `AgentSession.takeDueCronPrompts` 取走;`SessionHost` 的 driver 把每条变成一个
-`cron_fired` Run(见 `API.md` 的 SessionHost 一节)。C ABI 不提供 cron 工具。
+`cron_fired` Run,只取队列 `max_queued` 容得下的条数,其余仍到期留待下次;Host 经
+`Snapshot.cron_jobs` 看任务、经 `cancel_cron_job`/`cancel_all_cron_jobs` 命令删任务
+(#493,见 `API.md` 的 SessionHost 一节)。C ABI 不提供 cron 工具。
 
 ---
 

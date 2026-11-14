@@ -67,7 +67,13 @@
 //! cron jobs, the driver checks them at most every `cron_poll_ms`, and each
 //! prompt due becomes a Run typed `cron_source`/`cron_kind`, in the order the
 //! jobs were created. A job never fires during a Run or ahead of queued work.
-//! Jobs live with the AgentSession: closing it drops them.
+//! Jobs live with the AgentSession: closing it drops them. Fired prompts
+//! count against `max_queued` (#493): the driver takes only as many as the
+//! queue has room for, and a job left out stays due and fires once there is
+//! room, so `Snapshot.queued` never passes the bound and no prompt is lost.
+//! The lead's inbox is read under the same bound. A Host sees the jobs in
+//! `Snapshot.cron_jobs` and removes them without a Run through
+//! `Command.cancel_cron_job` and `cancel_all_cron_jobs`.
 //!
 //! With `Options.teammates`, the SessionHost also fulfils the lead's
 //! `SpawnTeammate` requests, as the daemon's `App` starts its teammates
@@ -124,6 +130,15 @@ const log = @import("../util/log.zig");
 const swarm_tools = @import("../swarm/tools.zig");
 const swarm_context = @import("../swarm/context.zig");
 const swarm_team = @import("../swarm/team.zig");
+const cron_registry = @import("cron_registry.zig");
+
+/// A cron job's id (#493), as `CronCreate` returned it to the model and
+/// `Snapshot.cron_jobs` reports it. `CronJobId.parse` takes a Host's text.
+pub const CronJobId = cron_registry.JobId;
+/// A cron job as `Snapshot.cron_jobs` reports it (#493).
+pub const CronJob = cron_registry.JobView;
+/// `CronJob.schedule`: `.once`, or `.recurring` with its cron expression.
+pub const CronSchedule = cron_registry.Schedule;
 
 /// How often an idle team lead's inbox, a locked file, is read: the bundled
 /// daemon's `session_service.LeadMail.POLL_MS`.
@@ -327,6 +342,13 @@ pub const Submission = struct {
 /// `set_additional_directories` journals `config_changed{dirs}` for each
 /// directory in force afterwards that was not before, its resolved path, as
 /// the daemon's `/add-dir` does; a directory taken away has no line.
+///
+/// `cancel_cron_job` and `cancel_all_cron_jobs` (#493) remove the Session's
+/// cron jobs without a Run, so they never fire again; a prompt one of them
+/// already fired, queued, still runs. An id the Session does not have is
+/// `command_result{ok:false, error_name:"CronJobNotFound"}`; cancelling all
+/// of none succeeds. `Snapshot.cron_jobs` shows the result once the
+/// `command_result` is journaled.
 pub const Command = union(enum) {
     set_model: []const u8,
     set_permission_mode: types.PermissionMode,
@@ -335,6 +357,8 @@ pub const Command = union(enum) {
     set_prompt_profile: prompt_sections.Profile,
     update_permission_rules: permission_settings.RuleSetInput,
     compact,
+    cancel_cron_job: CronJobId,
+    cancel_all_cron_jobs,
 };
 
 pub const EnqueueError = error{ QueueFull, SessionClosed, SessionPoisoned, OutOfMemory };
@@ -440,8 +464,8 @@ pub const QueueWaiting = enum {
     ui_request,
 };
 
-/// What a Host reports about a Session (e.g. as `/state`). `model` is owned
-/// by the allocator given to `snapshot`.
+/// What a Host reports about a Session (e.g. as `/state`). `model` and
+/// `cron_jobs` are owned by the allocator given to `snapshot`.
 pub const Snapshot = struct {
     id: SessionId,
     phase: Phase,
@@ -449,9 +473,19 @@ pub const Snapshot = struct {
     permission_mode: types.PermissionMode,
     reasoning_effort: ?types.ReasoningEffort,
     /// Submissions and commands waiting, and the bound (`Options.max_queued`)
-    /// at which `submit` and `command` refuse with `error.QueueFull`.
+    /// at which `submit` and `command` refuse with `error.QueueFull`. Runs
+    /// fired by cron jobs and the team lead's inbox count too (#493), and
+    /// never take `queued` past the bound: a cron prompt that does not fit
+    /// stays due and fires once the queue has room.
     queued: usize,
     max_queued: usize,
+    /// The Session's cron jobs (#493), oldest first: id, next fire time
+    /// (unix seconds) and whether each repeats. As of the last time the
+    /// Session was between Runs: a job a Run creates or deletes shows from
+    /// that Run's `run_done` on, a cancel command's from its
+    /// `command_result`, and a one-shot job is gone once it fired. Empty for
+    /// a Session without cron tools, and once it is closed.
+    cron_jobs: []const CronJob,
     seq: usize,
     epoch: [16]u8,
     /// The UI request the Session waits on, 0 for none: the one the Run in
@@ -474,6 +508,7 @@ pub const Snapshot = struct {
 
     pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.model);
+        cron_registry.freeViews(allocator, self.cron_jobs);
         self.* = undefined;
     }
 };
@@ -961,6 +996,15 @@ pub const HostedSession = struct {
     /// `Options.max_queued`, for a `snapshot` of a shell that outlived its
     /// SessionHost.
     max_queued: usize,
+    /// Queue slots the driver holds for Runs it is taking from the cron
+    /// jobs or the lead's inbox with `mutex` released (#493): `submit` and
+    /// `command` count them against `max_queued`, so what the driver then
+    /// appends always fits. Under `mutex`.
+    reserved: usize = 0,
+    /// The Session's cron jobs as of the last time it was between Runs
+    /// (#493), owned by `gpa`; under `mutex`, written by the driver
+    /// (`refreshCronJobs`) and emptied once the AgentSession is destroyed.
+    cron_jobs: []const CronJob = &.{},
     /// `OpenSpec.submission_template`, owned.
     submission_template: ?[]u8 = null,
     /// Idempotency keys (#447): entries under `mutex`, the file the driver's.
@@ -1025,7 +1069,7 @@ pub const HostedSession = struct {
             .duplicate => return error.DuplicateSubmission,
             .reused => return error.IdempotencyKeyReused,
         }
-        if (self.queue.items.len >= self.host.options.max_queued) return error.QueueFull;
+        if (self.roomLocked() == 0) return error.QueueFull;
         try self.ledger.accept(key, digest);
         self.queue.append(self.gpa, work) catch |err| {
             self.ledger.forget(key);
@@ -1053,9 +1097,15 @@ pub const HostedSession = struct {
         defer self.mutex.unlock();
         if (self.closing) return error.SessionClosed;
         if (self.phase == .poisoned) return error.SessionPoisoned;
-        if (self.queue.items.len >= self.host.options.max_queued) return error.QueueFull;
+        if (self.roomLocked() == 0) return error.QueueFull;
         try self.queue.append(self.gpa, work);
         self.work_ready.signal();
+    }
+
+    /// Queue slots still free under `max_queued`, after those the driver
+    /// holds (`reserved`). Caller holds `mutex`.
+    fn roomLocked(self: *const HostedSession) usize {
+        return self.max_queued -| (self.queue.items.len + self.reserved);
     }
 
     /// Stops the current Run (or the one about to be admitted) and answers a
@@ -1182,10 +1232,13 @@ pub const HostedSession = struct {
     pub fn snapshot(self: *HostedSession, allocator: std.mem.Allocator) error{OutOfMemory}!Snapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
+        const model = try allocator.dupe(u8, self.model);
+        errdefer allocator.free(model);
         return .{
             .id = self.id,
             .phase = self.phase,
-            .model = try allocator.dupe(u8, self.model),
+            .model = model,
+            .cron_jobs = try cron_registry.dupeViews(allocator, self.cron_jobs),
             // `closing` is set under this lock before the kernel Session is
             // destroyed, so a live read here cannot race the destroy.
             .permission_mode = if (self.closing) self.final_permission_mode else self.session.permission_ctx.modeValue(),
@@ -1259,12 +1312,24 @@ pub const HostedSession = struct {
             if (self.session.cronJobCount() > 0) {
                 if (now >= self.next_cron_poll_ns) {
                     self.next_cron_poll_ns = now + @as(i128, cron_poll_ms) * std.time.ns_per_ms;
-                    // `takeDueCronPrompts` takes the AgentSession's lock.
+                    // Fired prompts count against `max_queued` (#493): take
+                    // only as many as the queue has room for, holding those
+                    // slots while the lock is released; a job left out stays
+                    // due for a later poll. The registry changes only on
+                    // this thread, so the count read here is still due when
+                    // the prompts are taken.
+                    const slots = @min(self.roomLocked(), self.session.cronDueCount());
+                    if (slots == 0) continue;
+                    self.reserved += slots;
                     var fired: std.ArrayList(*Work) = .empty;
                     defer fired.deinit(self.gpa);
+                    // `takeDueCronPrompts` takes the AgentSession's lock.
                     self.mutex.unlock();
-                    self.takeDueCron(&fired);
+                    self.takeDueCron(&fired, slots);
+                    self.refreshCronJobs();
                     self.mutex.lock();
+                    self.reserved -= slots;
+                    std.debug.assert(fired.items.len <= slots);
                     for (fired.items) |work| self.queue.append(self.gpa, work) catch {
                         log.warn("session_host", "dropped a cron prompt for {s} (OOM)", .{self.id.asSlice()});
                         self.freeWork(work);
@@ -1276,10 +1341,16 @@ pub const HostedSession = struct {
             if (self.leadsTeam()) {
                 if (now >= self.next_lead_poll_ns) {
                     self.next_lead_poll_ns = now + @as(i128, lead_inbox_poll_ms) * std.time.ns_per_ms;
+                    // A reply is a Run like any other (#493): read only
+                    // with a slot held for it, so it never takes the queue
+                    // past `max_queued`; unread mail waits in the inbox.
+                    if (self.roomLocked() == 0) continue;
+                    self.reserved += 1;
                     // The inbox is a locked file: read it without holding the Session.
                     self.mutex.unlock();
                     const mail = self.takeLeadMail();
                     self.mutex.lock();
+                    self.reserved -= 1;
                     if (mail) |work| self.queue.append(self.gpa, work) catch {
                         log.warn("session_host", "dropped teammate mail for {s} (OOM)", .{self.id.asSlice()});
                         self.freeWork(work);
@@ -1299,9 +1370,10 @@ pub const HostedSession = struct {
     /// Appends a submission to `fired` for each cron prompt due now, in the
     /// order the jobs were created (`AgentSession.takeDueCronPrompts`). Each
     /// is typed `cron_source`/`cron_kind`; its text is the prompt, byte for
-    /// byte. Driver-only, while the Session is idle.
-    fn takeDueCron(self: *HostedSession, fired: *std.ArrayList(*Work)) void {
-        const prompts = self.session.takeDueCronPrompts(self.gpa) catch |err| {
+    /// byte. At most `limit`: the jobs past it stay due. Driver-only, while
+    /// the Session is idle.
+    fn takeDueCron(self: *HostedSession, fired: *std.ArrayList(*Work), limit: usize) void {
+        const prompts = self.session.takeDueCronPrompts(self.gpa, limit) catch |err| {
             log.warn("session_host", "cron of {s} not checked: {s}", .{ self.id.asSlice(), @errorName(err) });
             return;
         };
@@ -1325,6 +1397,29 @@ pub const HostedSession = struct {
                 self.freeWork(work);
             };
         }
+    }
+
+    /// Copies the Session's cron jobs for `snapshot` (#493). Driver-only,
+    /// between Runs: a Run's cron tools change them. A copy that fails keeps
+    /// the last one.
+    fn refreshCronJobs(self: *HostedSession) void {
+        if (self.session.cronJobCount() == 0) {
+            self.mutex.lock();
+            const previous = self.cron_jobs;
+            self.cron_jobs = &.{};
+            self.mutex.unlock();
+            cron_registry.freeViews(self.gpa, previous);
+            return;
+        }
+        const jobs = self.session.cronJobs(self.gpa) catch |err| {
+            log.warn("session_host", "cron jobs of {s} not reported: {s}", .{ self.id.asSlice(), @errorName(err) });
+            return;
+        };
+        self.mutex.lock();
+        const previous = self.cron_jobs;
+        self.cron_jobs = jobs;
+        self.mutex.unlock();
+        cron_registry.freeViews(self.gpa, previous);
     }
 
     /// True for a team lead whose team exists. Driver-only: its Runs are what
@@ -1720,6 +1815,9 @@ pub const HostedSession = struct {
         }
         self.mutex.unlock();
         for (dropped.items) |work| self.freeWork(work);
+        // The jobs the Run's cron tools created or deleted, in `snapshot`
+        // by the time `run_done` says the Run ended (#493).
+        self.refreshCronJobs();
 
         self.emitHost(.{ .run_done = .{
             .run_id = context.run_id,
@@ -1762,7 +1860,17 @@ pub const HostedSession = struct {
                 _ = self.session.compact(self.last_compact_id, .{}) catch |err| break :blk err;
                 break :blk null;
             },
+            .cancel_cron_job => |id| blk: {
+                const found = self.session.cancelCronJob(id) catch |err| break :blk err;
+                break :blk if (found) null else error.CronJobNotFound;
+            },
+            .cancel_all_cron_jobs => if (self.session.cancelAllCronJobs()) |_| null else |err| err,
         };
+        switch (cmd) {
+            // What `snapshot` shows before the `command_result` says so.
+            .cancel_cron_job, .cancel_all_cron_jobs => self.refreshCronJobs(),
+            else => {},
+        }
         if (failure == null) self.persist();
         self.emitHost(.{ .command_result = .{
             .command = @tagName(cmd),
@@ -2688,6 +2796,12 @@ pub const HostedSession = struct {
         self.dropRequests();
 
         self.session.destroy() catch |err| log.err("session_host", "destroy {s}: {s}", .{ self.id.asSlice(), @errorName(err) });
+        // The jobs closed with the AgentSession.
+        self.mutex.lock();
+        const cron_jobs = self.cron_jobs;
+        self.cron_jobs = &.{};
+        self.mutex.unlock();
+        cron_registry.freeViews(self.gpa, cron_jobs);
         if (self.writer) |*writer| writer.deinit();
         self.writer = null;
     }
@@ -2731,7 +2845,7 @@ fn wallMs() i64 {
 fn copyCommand(a: std.mem.Allocator, cmd: Command) error{OutOfMemory}!Command {
     return switch (cmd) {
         .set_model => |model| .{ .set_model = try a.dupe(u8, model) },
-        .set_permission_mode, .set_reasoning_effort, .compact => cmd,
+        .set_permission_mode, .set_reasoning_effort, .compact, .cancel_cron_job, .cancel_all_cron_jobs => cmd,
         .set_additional_directories => |dirs| .{ .set_additional_directories = try copyStrings(a, dirs) },
         .set_prompt_profile => |profile| blk: {
             const sections = try a.alloc(prompt_sections.ProfileSection, profile.sections.len);
