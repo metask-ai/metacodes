@@ -1218,6 +1218,26 @@ leaving every Host to rebuild them:
   limit; `cronJobs`, `cancelCronJob` and `cancelAllCronJobs` are the idle-only
   reads and changes the SessionHost makes. A team lead's inbox is read only
   while the queue has room.
+- A Session whose `SessionConfig.run_control` asks for it opens, for every
+  Run, the per-Run control the bundled daemon opens
+  (`project_rule_activation.RunControl`, #445). It needs a durable
+  `run_journal`: anything but the default on an ephemeral Session is refused
+  by `open` (`error.RunControlRequiresRunJournal`). With
+  `project_rules = .enforced`, an active bundle in
+  `<dirname(run journal root)>/project-rules` (the daemon's layout when the
+  journal root is the Session's directory) for the workspace root is
+  re-attested before the provider request and decides each tool call through
+  the project kernel: a call it blocks reaches the model as a
+  `project_rule_blocked` tool error. A missing or invalid kernel
+  configuration, a bundle that fails attestation, or a Bash job of the
+  Session still running or a team it leads (`ProjectRulesRequireDetachedWorkersIdle`)
+  fails the Run before any provider request: `run_done` names the error,
+  the Run is closed in the journal and, as for any Run that fails, the
+  Session is poisoned. After a Run the bundle is re-attested and the Run's
+  operational observation is published beside the journal.
+  `abandoned_run = .record_abandoned` closes a Run whose process died as
+  abandoned and runs the next one, as the daemon does; the default,
+  `fail_closed`, keeps the Session closed (`UnfinishedRun`).
 - With `Options.teammates` (a `TeammateFactory`), the SessionHost also
   fulfils the lead's `SpawnTeammate` requests, as the daemon's `App` starts
   its teammates: after each Run the lead's driver takes the pending requests
