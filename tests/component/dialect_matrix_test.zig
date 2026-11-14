@@ -196,6 +196,31 @@ test "原则2: kimi-k2 effort=high → thinking:{type,keep}(K2.6 方言,与 K3 �
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":") == null);
 }
 
+test "原则2: kimi-for-coding(Kimi Code 的 K2.8 Preview,按名推断)→ 顶层 reasoning_effort,未指定不发(#487)" {
+    // 按名推断是 AgentCore 与不带 --provider 的会话走的路径:名字含 kimi,方言是 Kimi。
+    // 来源:kimi.com/code/docs/en/kimi-code/models.html(2026-11):reasoning_effort
+    // low / high / max,默认 max;以前发的是 K2.7-code 的 thinking 对象。
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+    };
+    const chosen = try openai.serializeOpenAIRequest(a, "kimi-for-coding", &msgs, "sys", null, .xhigh, null);
+    defer a.free(chosen);
+    try std.testing.expect(std.mem.indexOf(u8, chosen, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chosen, "\"thinking\":") == null);
+    for ([_]?types.ReasoningEffort{ null, .none }) |effort| {
+        const unset = try openai.serializeOpenAIRequest(a, "kimi-for-coding", &msgs, "sys", null, effort, null);
+        defer a.free(unset);
+        try std.testing.expect(std.mem.indexOf(u8, unset, "reasoning_effort") == null);
+        try std.testing.expect(std.mem.indexOf(u8, unset, "\"thinking\":") == null);
+    }
+    // K2.7 Code Highspeed 照旧:思考恒开,没有档位。
+    const highspeed = try openai.serializeOpenAIRequest(a, "kimi-for-coding-highspeed", &msgs, "sys", null, .high, null);
+    defer a.free(highspeed);
+    try std.testing.expect(std.mem.indexOf(u8, highspeed, "\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, highspeed, "reasoning_effort") == null);
+}
+
 test "原则2: gemini-2.5-pro reasoning_effort=high → thinking_level high(Gemini 方言)" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{

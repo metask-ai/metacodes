@@ -34,6 +34,17 @@ empty `### Migration`.
   prompts within `max_queued` (#493); ABI revision 28 exposes neither
   `SessionHost` nor the cron tools.
 
+### Fixed
+
+- A Run on `kimi-for-coding` (the Kimi Code subscription's K2.8 Preview) over
+  the OpenAI chat wire sends the thinking parameter Kimi Code documents
+  (#487): an active reasoning effort goes out as the top-level
+  `reasoning_effort` in Kimi's `low` / `high` / `max`, and no effort, `none`
+  or `minimal` sends nothing, so the server's own default applies. It used to
+  send K2.7-code's `"thinking":{"type":"enabled","keep":"all"}` and no
+  effort. `kimi-for-coding-highspeed` and the Moonshot open platform's
+  models send the bytes they did. No ABI change.
+
 ## 0.15.0 — 2026-11-13
 
 ### Added
