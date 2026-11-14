@@ -58,6 +58,26 @@ pub const ArgsError = error{
     OutOfMemory,
 };
 
+/// Whether two spellings are the same admitted arguments: equal bytes, or the
+/// same `canonicalizeArgs` result. A record keeps the bytes the model sent
+/// while the permission path sees the canonical spelling (#494), so anything
+/// that pairs a permission request with its recorded call compares this way.
+/// Arguments that are not admissible only match byte for byte.
+pub fn sameArgs(scratch: std.mem.Allocator, a: []const u8, b: []const u8) error{OutOfMemory}!bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const canonical_a = canonicalizeArgs(scratch, a) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => false,
+    };
+    defer scratch.free(canonical_a);
+    const canonical_b = canonicalizeArgs(scratch, b) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => false,
+    };
+    defer scratch.free(canonical_b);
+    return std.mem.eql(u8, canonical_a, canonical_b);
+}
+
 /// Admit a tool call's arguments and return them in one canonical spelling
 /// (allocator-owned): parsed strictly as one JSON object with no duplicate
 /// key at any level, then written back compactly, members in their original
@@ -547,6 +567,15 @@ test "canonicalizeArgs: one spelling for every reader (#494)" {
     const out = try canonicalizeArgs(a, " { \"pattern\" : \"needle\" ,\n\"path\" : \"t\\u0061rget.ts\", \"n\": 1.50, \"-i\": true, \"o\": {\"k\" : [1, null]} } ");
     defer a.free(out);
     try std.testing.expectEqualStrings("{\"pattern\":\"needle\",\"path\":\"target.ts\",\"n\":1.50,\"-i\":true,\"o\":{\"k\":[1,null]}}", out);
+}
+
+test "sameArgs: raw and canonical spellings of one call match; different calls do not" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try sameArgs(a, "{\"file_path\": \"x\", \"content\": \"y\"}", "{\"file_path\":\"x\",\"content\":\"y\"}"));
+    try std.testing.expect(!try sameArgs(a, "{\"file_path\": \"x\"}", "{\"file_path\":\"z\"}"));
+    try std.testing.expect(!try sameArgs(a, "{\"a\":1,\"b\":2}", "{\"b\":2,\"a\":1}"));
+    try std.testing.expect(!try sameArgs(a, "{\"k\":1,\"k\":1}", "{\"k\":1}"));
+    try std.testing.expect(try sameArgs(a, "not json", "not json"));
 }
 
 test "canonicalizeArgs: duplicate keys at any level are refused" {

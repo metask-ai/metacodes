@@ -1144,8 +1144,11 @@ const AbiSession = struct {
         var match: ?[]const u8 = null;
         for (latest.blocks) |block| switch (block) {
             .tool_use => |tool_use| {
+                // The Conversation keeps the model's bytes; the permission
+                // path asks with the admitted canonical spelling (#494).
                 if (!std.mem.eql(u8, tool_use.name, tool_name) or
-                    !std.mem.eql(u8, tool_use.input, arguments_json)) continue;
+                    !(core.tool_args.sameArgs(output_allocator, tool_use.input, arguments_json) catch
+                        return error.OutOfMemory)) continue;
                 // The old UiRequest omits tool_call_id. Ambiguous identical
                 // calls must fail closed; guessing would bind approval to the
                 // wrong operation. The R6 public DTO removes this scan.
