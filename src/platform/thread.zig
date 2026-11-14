@@ -41,14 +41,32 @@ pub const Stack = enum {
     /// code whose recursion depth follows its input. Keeps std's default.
     full,
 
+    /// The stack size to ask for: the depth the class's threads rely on, plus
+    /// `static_tls_allowance` where the thread library takes static TLS out of
+    /// the stack. `full` stays exactly std's default.
     pub fn bytes(stack: Stack) usize {
         return switch (stack) {
-            .waiter => 256 * 1024,
-            .io_worker => 2 * 1024 * 1024,
+            .waiter => 256 * 1024 + static_tls_allowance,
+            .io_worker => 2 * 1024 * 1024 + static_tls_allowance,
             .full => std.Thread.SpawnConfig.default_stack_size,
         };
     }
 };
+
+/// glibc places a new thread's static TLS inside the stack it is given and
+/// refuses the thread (`pthread_create` returns EINVAL, which std treats as
+/// unreachable) when the TLS does not fit. Zig 0.16's std puts a per-thread
+/// alternate signal stack of `std.options.signal_stack_size` (256 KiB by
+/// default) in that TLS, so a 256 KiB stack cannot even start there, and every
+/// other stack loses that much depth. On Linux each class asks for that much
+/// more, plus 256 KiB for the TLS of the executable and the other libraries it
+/// loaded (this repository's own thread-locals are a few hundred bytes). A
+/// Linux stack is an address-space reservation, not a commit, so the allowance
+/// costs no memory. macOS and Windows keep TLS outside the stack.
+pub const static_tls_allowance: usize = if (builtin.os.tag == .linux)
+    @as(usize, @intCast(std.options.signal_stack_size orelse 0)) + 256 * 1024
+else
+    0;
 
 comptime {
     // `full` must stay what std gives an unconfigured thread: moving a site to

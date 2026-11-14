@@ -132,7 +132,10 @@ status, compatibility boundaries, and entry points are defined by
   49,351 KiB and 3 threads per Session before, 4,231 KiB and 2 threads
   after. Every production thread now spawns through
   `platform.thread.spawn` with a named stack class (`waiter`, `io_worker`,
-  `full`); the others keep std's 16 MiB as `full`, unchanged.
+  `full`); the others keep std's 16 MiB as `full`, unchanged. On Linux the
+  smaller classes ask for 512 KiB more: glibc carves a thread's static TLS,
+  which holds std's 256 KiB alternate signal stack, out of the stack it is
+  given, and refuses a thread whose TLS does not fit.
   `zig build test:thread-stack` (part of `test:units`) refuses a direct
   `std.Thread.spawn` outside test blocks.
 - **The permission check and the tool read one spelling of a call's
