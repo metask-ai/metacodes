@@ -1173,12 +1173,12 @@ pub fn fileTargetDigest(path: []const u8) ArgumentsDigest {
 /// The target file of a built-in Write/Edit call, or null when the call gets
 /// only the exact-argument candidate. The path is the one the tool itself
 /// would open (`core.tool_file_target.resolve`: Write's and Edit's own
-/// extraction and normalization). That extraction takes the first textual
-/// occurrence of the key, so a strict parse must agree with it first: the
-/// arguments are one JSON object whose top-level path argument is a string
-/// equal to what the tool reads. A nested or escaped-key spelling that makes
-/// the tool and a reader of `arguments_json` name different files never
-/// widens a grant.
+/// extraction and normalization). That extraction reads the top-level member
+/// structurally (#494); a strict parse must still agree with it: the
+/// arguments are one JSON object, with no duplicate key, whose top-level
+/// path argument is a string equal to what the tool reads. Any spelling that
+/// made the tool and a reader of `arguments_json` name different files would
+/// never widen a grant.
 pub fn deriveFileTarget(
     allocator: std.mem.Allocator,
     tool: ToolIdentity,
@@ -2319,14 +2319,18 @@ test "Revision 17 Permission file_target refuses readings the tool would not sha
     const write = ToolIdentity{ .namespace = .builtin, .name = "Write" };
     const edit = ToolIdentity{ .namespace = .builtin, .name = "Edit" };
 
-    // The tools take the first textual `"file_path":`, which an escaped key
-    // supplies here; a JSON reader sees /w/a.txt. Such a call keeps only the
-    // exact-argument candidate.
+    // The tools read the top-level member structurally (#494): neither an
+    // escaped key nor a nested object supplies another `file_path`, so the
+    // tool and a JSON reader name the same file and the target stands.
     const escaped_key = "{\"a\\\"file_path\":\"/etc/x\",\"file_path\":\"/w/a.txt\",\"content\":\"x\"}";
-    try std.testing.expectEqualStrings("/etc/x", core.tool_file_target.rawPath(.write, escaped_key).?);
+    const nested = "{\"meta\":{\"file_path\":\"/etc/x\"},\"file_path\":\"/w/a.txt\",\"content\":\"x\"}";
+    for ([_][]const u8{ escaped_key, nested }) |arguments| {
+        try std.testing.expectEqualStrings("/w/a.txt", core.tool_file_target.rawPath(.write, arguments).?);
+        var agreed = (try deriveFileTarget(allocator, write, arguments, test_file_context)).?;
+        defer agreed.deinit(allocator);
+        try std.testing.expectEqualStrings("/w/a.txt", agreed.path);
+    }
     const refused = [_]struct { tool: ToolIdentity, arguments: []const u8 }{
-        .{ .tool = write, .arguments = escaped_key },
-        .{ .tool = write, .arguments = "{\"meta\":{\"file_path\":\"/etc/x\"},\"file_path\":\"/w/a.txt\",\"content\":\"x\"}" },
         .{ .tool = write, .arguments = "{\"file_path\":7,\"content\":\"x\"}" },
         .{ .tool = write, .arguments = "{\"file_path\":\"/w/a.txt\",\"file_path\":\"/w/b.txt\",\"content\":\"x\"}" },
         .{ .tool = write, .arguments = "{\"file_path\":\"\",\"content\":\"x\"}" },

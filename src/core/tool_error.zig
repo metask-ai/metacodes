@@ -160,6 +160,9 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "ExactRecoverySourceChanged", .code = .stale_file, .category = .user_error, .recoverable = true },
     .{ .name = "ExactRecoveryTargetUnavailable", .code = .file_not_found, .category = .user_error, .recoverable = true },
     .{ .name = "ExactRecoveryReplaceAllForbidden", .code = .invalid_args, .category = .user_error, .recoverable = true },
+    // Arguments that name one key twice (issue #494): the model can resend the
+    // call with each key once, so it is its argument error, not a deny.
+    .{ .name = "DuplicateArgumentKey", .code = .invalid_args, .category = .user_error, .recoverable = true },
     .{ .name = "UnknownTool", .code = .unknown_tool, .category = .user_error, .recoverable = true },
     .{ .name = "NoToolMatch", .code = .unknown_tool, .category = .user_error, .recoverable = true },
     .{ .name = "FileNotFound", .code = .file_not_found, .category = .user_error, .recoverable = true },
@@ -452,6 +455,17 @@ test "fromErrorName maps image and MCP capability errors" {
     defer missing.deinit(a);
     try std.testing.expectEqual(Code.invalid_args, missing.code);
     try std.testing.expect(missing.recoverable);
+}
+
+test "fromErrorName: malformed tool arguments are recoverable argument errors (#494)" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "DuplicateArgumentKey", "InvalidArgumentsJson" }) |name| {
+        const e = fromErrorName(name, try a.dupe(u8, "d"));
+        defer e.deinit(a);
+        try std.testing.expectEqual(Code.invalid_args, e.code);
+        try std.testing.expectEqual(Category.user_error, e.category);
+        try std.testing.expect(e.recoverable);
+    }
 }
 
 test "errorToJson oneliner" {

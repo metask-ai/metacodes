@@ -19,6 +19,7 @@ const execution_effect = @import("execution_effect.zig");
 const response_candidate = @import("response_candidate.zig");
 const json_mod = @import("../json.zig");
 const tools_mod = @import("../tools.zig");
+const tools_common = @import("../tools/common.zig");
 const permission_mod = @import("../permission.zig");
 const message_repair_mod = @import("message_repair.zig");
 const hooks_mod = @import("../permission/hooks.zig");
@@ -1251,6 +1252,49 @@ fn adoptRunInputs(
             .turn = turn,
         } });
     }
+}
+
+const ArgsAdmission = union(enum) {
+    /// The canonical arguments: `input` itself when it already is canonical,
+    /// otherwise a copy owned by the turn's `owned` list.
+    admitted: []const u8,
+    /// The invalid_args tool result for the model (owned by the caller).
+    rejected: []u8,
+};
+
+/// Admit one tool call's arguments (issue #494) through
+/// `tools/common.canonicalizeArgs`. The bytes the provider sent stay in the
+/// Conversation unchanged; only what the hook, the permission check and the
+/// executor read is canonical.
+fn admitToolArgs(
+    allocator: std.mem.Allocator,
+    owned: *std.ArrayList([]u8),
+    input: []const u8,
+) !ArgsAdmission {
+    const canonical = tools_common.canonicalizeArgs(allocator, input) catch |err| return .{ .rejected = switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateArgumentKey => try tool_error.errorToJson(
+            "DuplicateArgumentKey",
+            "the arguments name the same key more than once; send the call again with each key once",
+            .{},
+            allocator,
+        ),
+        error.InvalidArgumentsJson => try tool_error.errorToJson(
+            "InvalidArgumentsJson",
+            "the arguments are not one well-formed JSON object; send the call again with a JSON object of the tool's parameters",
+            .{},
+            allocator,
+        ),
+    } };
+    if (std.mem.eql(u8, canonical, input)) {
+        allocator.free(canonical);
+        return .{ .admitted = input };
+    }
+    owned.append(allocator, canonical) catch |err| {
+        allocator.free(canonical);
+        return err;
+    };
+    return .{ .admitted = canonical };
 }
 
 /// The tool result for a permission prompt that ended with nobody's answer
@@ -2743,12 +2787,20 @@ fn runCounted(
                         // started here it would run before the user answered.
                         const needs_confirm = if (permission_ctx.confirm_gate) |gate| gate.requires(tu.id, tu.name) else false;
                         if (prefetch_enabled and not_aborted and activation_allows_prefetch and !after_root_move and !needs_confirm and sp.isStreamable(tu.name) and
-                            prefetch_ctx.isPrefetchSafe(tu.name) and
-                            tools_mod.isConcurrencySafeInput(tu.name, tu.input_json) and
-                            permission_mod.checkPermission(&pc_prefetch, tu.name, tu.input_json) == .allow)
-                        {
+                            prefetch_ctx.isPrefetchSafe(tu.name))
+                        prefetch: {
+                            // The same argument admission as the authoritative path
+                            // (issue #494): rejected arguments are not prefetched, and
+                            // admitted ones run in their canonical spelling.
+                            const canonical = tools_common.canonicalizeArgs(allocator, tu.input_json) catch break :prefetch;
+                            var canonical_owned = true;
+                            defer if (canonical_owned) allocator.free(canonical);
+                            if (!tools_mod.isConcurrencySafeInput(tu.name, canonical) or
+                                permission_mod.checkPermission(&pc_prefetch, tu.name, canonical) != .allow)
+                                break :prefetch;
                             const last = &tool_uses.items[tool_uses.items.len - 1];
-                            prefetch.start(&prefetch_ctx, last.id, last.name, last.input, rid);
+                            canonical_owned = false;
+                            prefetch.startOwned(&prefetch_ctx, last.id, last.name, canonical, rid);
                         }
                     },
                     .web_search_result => |w| {
@@ -3734,14 +3786,41 @@ fn runCounted(
                 try slots.append(allocator, lslot);
                 continue;
             }
+            // Argument admission (issue #494): the hook, the permission check
+            // and the executor all read one canonical spelling of the
+            // arguments. Arguments that are not one JSON object, or that name
+            // a key twice, never reach either: the model gets a recoverable
+            // invalid_args instead of a deny it cannot correct.
+            var eff_input: []const u8 = switch (try admitToolArgs(allocator, &mod_inputs, tu.input)) {
+                .admitted => |canonical| canonical,
+                .rejected => |content| {
+                    log.warnId("agent", rid, "tool={s} arguments rejected", .{tu.name});
+                    var rejected = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
+                    rejected.content = content;
+                    rejected.is_error = true;
+                    try slots.append(allocator, rejected);
+                    continue;
+                },
+            };
             // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
-            var eff_input = tu.input;
             if (hookset) |hs| if (hs.hasPre()) {
-                const pre = hooks_mod.runPreToolUseFull(hs, allocator, canonical_name, tu.input, opts.abort);
+                const pre = hooks_mod.runPreToolUseFull(hs, allocator, canonical_name, eff_input, opts.abort);
                 if (pre.modified_input) |mi| {
                     mod_inputs.append(allocator, mi) catch allocator.free(mi);
                     // append 成功才用改写值;失败(OOM)已 free,退回原 input。
-                    if (mod_inputs.items.len > 0 and mod_inputs.items[mod_inputs.items.len - 1].ptr == mi.ptr) eff_input = mi;
+                    if (mod_inputs.items.len > 0 and mod_inputs.items[mod_inputs.items.len - 1].ptr == mi.ptr) {
+                        // A rewritten input passes the same admission as the model's.
+                        switch (try admitToolArgs(allocator, &mod_inputs, mi)) {
+                            .admitted => |canonical| eff_input = canonical,
+                            .rejected => |content| {
+                                var rejected = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = mi };
+                                rejected.content = content;
+                                rejected.is_error = true;
+                                try slots.append(allocator, rejected);
+                                continue;
+                            },
+                        }
+                    }
                 }
                 if (pre.decision == .block) {
                     log.warnId("permission", rid, "PreToolUse hook blocked tool={s}", .{tu.name});

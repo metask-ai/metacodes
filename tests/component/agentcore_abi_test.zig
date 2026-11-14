@@ -16067,3 +16067,321 @@ test "L2 Revision 28 a Skill invocation Run, inline or in its own context, takes
     try runSkillWithRetryBudget("context: fork\n", 1);
     try runSkillWithRetryBudget("context: fork\n", 0);
 }
+
+// ============================================================================
+// Issue #494: one reading of a tool call's arguments
+// ============================================================================
+
+const Issue494Call = struct { id: []const u8, name: []const u8, args: []const u8 };
+
+/// One assistant turn whose tool_use blocks carry `calls[i].args` verbatim
+/// as the streamed `partial_json`, so the bytes reach Core exactly as a
+/// model could spell them (duplicate keys, whitespace before the colon).
+fn issue494ToolTurnSse(a: std.mem.Allocator, calls: []const Issue494Call) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_494\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n");
+    for (calls, 0..) |call, index| {
+        try w.print("data: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n", .{ index, call.id, call.name });
+        try w.print("data: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{f}}}}}\n\n", .{ index, std.json.fmt(call.args, .{}) });
+        try w.print("data: {{\"type\":\"content_block_stop\",\"index\":{d}}}\n\n", .{index});
+    }
+    try w.writeAll("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n");
+    try w.writeAll("data: {\"type\":\"message_stop\"}\n\n");
+    return out.toOwnedSlice();
+}
+
+/// The tool_result text the provider received for `tool_use_id` (owned).
+fn issue494ToolResult(a: std.mem.Allocator, request_body: []const u8, tool_use_id: []const u8) ![]u8 {
+    // The request replays the model's tool_use input verbatim, duplicates included.
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, request_body, .{ .duplicate_field_behavior = .use_last });
+    defer parsed.deinit();
+    for (parsed.value.object.get("messages").?.array.items) |message| {
+        const content = message.object.get("content") orelse continue;
+        if (content != .array) continue;
+        for (content.array.items) |block| {
+            const kind = block.object.get("type") orelse continue;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "tool_result")) continue;
+            if (!std.mem.eql(u8, block.object.get("tool_use_id").?.string, tool_use_id)) continue;
+            switch (block.object.get("content").?) {
+                .string => |text| return a.dupe(u8, text),
+                .array => |parts| {
+                    var text: std.ArrayList(u8) = .empty;
+                    errdefer text.deinit(a);
+                    for (parts.items) |part| if (part.object.get("text")) |t| try text.appendSlice(a, t.string);
+                    return text.toOwnedSlice(a);
+                },
+                else => return error.UnexpectedToolResultShape,
+            }
+        }
+    }
+    return error.MissingToolResult;
+}
+
+/// The tool result is the recoverable argument error the model can correct.
+fn expectIssue494InvalidArgs(a: std.mem.Allocator, result_text: []const u8) !void {
+    errdefer std.debug.print("tool result: {s}\n", .{result_text});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result_text, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("invalid_args", err.get("code").?.string);
+    try std.testing.expectEqualStrings("user_error", err.get("category").?.string);
+    try std.testing.expect(err.get("recoverable").?.bool);
+}
+
+test "L2 issue #494: duplicate argument keys are a recoverable invalid_args, and whitespace before the colon names the same argument, through AgentCore" {
+    const a = std.testing.allocator;
+    for ([_]u32{ wire.PERMISSION_DEFAULT, wire.PERMISSION_FULL_ACCESS }) |mode| {
+        errdefer std.debug.print("permission mode code {d}\n", .{mode});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = try rootPath(&tmp, &root_buf);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target.txt", .data = "ISSUE494_TARGET_LINE\n" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "decoy.txt", .data = "ISSUE494_DECOY_LINE\n" });
+
+        const tool_sse = try issue494ToolTurnSse(a, &.{
+            .{ .id = "tu_grep_dup", .name = "Grep", .args = "{\"output_mode\":\"content\",\"path\":\"target.txt\",\"pattern\":\"ISSUE494\",\"-i\":true,\"-n\":true,\"glob\":\"*.txt\",\"-i\":true,\"-n\":true}" },
+            .{ .id = "tu_read_dup", .name = "Read", .args = "{\"file_path\":\"target.txt\",\"file_path\":\"decoy.txt\"}" },
+            .{ .id = "tu_read_compact", .name = "Read", .args = "{\"file_path\":\"target.txt\"}" },
+            .{ .id = "tu_read_space", .name = "Read", .args = "{\"file_path\" : \"target.txt\"}" },
+        });
+        defer a.free(tool_sse);
+        const bodies = [_][]const u8{ tool_sse, FINAL_SSE };
+        var server = try harness.MockServer.startCassette(&bodies, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+
+        const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+            return error.MissingApi;
+        const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer api.bufferRelease()(&diagnostic);
+        const builtins = [_]wire.BytesViewV1{ sdk.bytesView("Grep"), sdk.bytesView("Read") };
+        var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+        runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+        runtime_config.builtin_tools = &builtins;
+        runtime_config.builtin_tool_count = builtins.len;
+        var runtime: ?*wire.RuntimeHandle = null;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+        );
+        defer if (runtime) |handle| {
+            _ = api.runtime().destroy()(handle, &diagnostic);
+        };
+        var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+        host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+        host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+        host_config.permission_mode_code = mode;
+        host_config.shell_policy_code = wire.SHELL_DISABLED;
+        host_config.api_key = sdk.bytesView("test-key");
+        host_config.base_url = sdk.bytesView(url);
+        host_config.workspace_root = sdk.bytesView(root);
+        host_config.workspace_home = sdk.bytesView(root);
+        host_config.allowed_tools = &builtins;
+        host_config.allowed_tool_count = builtins.len;
+        var config = sessionCreateConfig(&host_config, "test-model");
+        var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+        callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+        callbacks.on_event = acceptEvent;
+        var session: ?*wire.SessionHandle = null;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
+        );
+        defer if (session) |handle| {
+            _ = api.session().destroy()(handle, &diagnostic);
+        };
+        var options = std.mem.zeroes(wire.RunOptionsV1);
+        options.struct_size = @sizeOf(wire.RunOptionsV1);
+        options.max_turns = 2;
+        var result = std.mem.zeroes(wire.RunResultV1);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.session().runText(session, 1, sdk.bytesView("search the target"), &options, &result, &diagnostic),
+        );
+        try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+        const follow_up = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+
+        // Before #494 both duplicate-key calls came back as a non-recoverable
+        // permission_denied: the permission digest refused the arguments and
+        // its caller turned that into a deny, in every permission mode.
+        for ([_][]const u8{ "tu_grep_dup", "tu_read_dup" }) |id| {
+            const text = try issue494ToolResult(a, follow_up, id);
+            defer a.free(text);
+            try std.testing.expect(std.mem.indexOf(u8, text, "permission_denied") == null);
+            try expectIssue494InvalidArgs(a, text);
+        }
+        // Neither spelling of the duplicate was read: the decoy never reached the model.
+        try std.testing.expect(std.mem.indexOf(u8, follow_up, "ISSUE494_DECOY_LINE") == null);
+        // `"file_path" : "target.txt"` is the same argument as the compact
+        // spelling for the permission check and the tool alike: one outcome.
+        const compact = try issue494ToolResult(a, follow_up, "tu_read_compact");
+        defer a.free(compact);
+        const spaced = try issue494ToolResult(a, follow_up, "tu_read_space");
+        defer a.free(spaced);
+        errdefer std.debug.print("compact read: {s}\nspaced read: {s}\n", .{ compact, spaced });
+        try std.testing.expectEqualStrings(compact, spaced);
+        // The tool runs, and reads exactly that file.
+        try std.testing.expect(std.mem.indexOf(u8, spaced, "ISSUE494_TARGET_LINE") != null);
+    }
+}
+
+/// Answers every permission request for a built-in `Write` with
+/// `allow_session` and records the arguments it was shown.
+const Issue494WriteProbe = struct {
+    ui_calls: u32 = 0,
+    saw_other_request: bool = false,
+
+    fn ui(
+        raw: ?*anyopaque,
+        _: ?*const wire.RunContextV1,
+        request_json: wire.BytesViewV1,
+        out_response: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        const encoded = sdk.borrowedBytes(request_json) catch return wire.UI_FATAL;
+        const parsed = sdk.decodeUiRequest(std.heap.c_allocator, encoded) catch return wire.UI_FATAL;
+        defer parsed.deinit();
+        const request = switch (parsed.value) {
+            .permission => |value| value,
+            else => {
+                self.saw_other_request = true;
+                return wire.UI_FATAL;
+            },
+        };
+        const candidate = request.candidate orelse return wire.UI_FATAL;
+        if (!std.mem.eql(u8, request.tool.name, "Write")) {
+            self.saw_other_request = true;
+            return wire.UI_FATAL;
+        }
+        const response_json = sdk.encodeUiResponse(
+            std.heap.c_allocator,
+            parsed.value,
+            .{ .permission = .{
+                .permission = .allow_session,
+                .request_id = request.request_id,
+                .policy_generation = request.policy_generation,
+                .rule_id = candidate.rule_id,
+            } },
+        ) catch return wire.UI_FATAL;
+        const out = out_response orelse {
+            std.heap.c_allocator.free(response_json);
+            return wire.UI_FATAL;
+        };
+        out.* = .{ .ptr = response_json.ptr, .len = response_json.len };
+        self.ui_calls += 1;
+        return wire.UI_ANSWERED;
+    }
+
+    fn releaseUi(_: ?*anyopaque, response: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const out = response orelse return;
+        if (out.ptr) |ptr| {
+            const len = std.math.cast(usize, out.len) orelse return;
+            std.heap.c_allocator.free(ptr[0..len]);
+        }
+        out.* = .{ .ptr = null, .len = 0 };
+    }
+};
+
+test "L2 issue #494: a Write whose arguments are spaced like json.dumps goes through the permission prompt and writes" {
+    // SDK hosts' models (and Python's json.dumps) spell arguments with a space
+    // after `:` and `,`. The permission path sees the admitted canonical
+    // spelling while the Conversation keeps the model's bytes; pairing the
+    // request with its call must not depend on the spelling, or the Run ends
+    // CALLBACK_FAILED before the Host is asked.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+
+    const first_sse = try issue494ToolTurnSse(a, &.{
+        .{ .id = "tu_write_spaced", .name = "Write", .args = "{\"file_path\": \"spaced.txt\", \"content\": \"first\"}" },
+    });
+    defer a.free(first_sse);
+    // The same target again, in another spelling: the session grant covers it.
+    const second_sse = try issue494ToolTurnSse(a, &.{
+        .{ .id = "tu_write_pretty", .name = "Write", .args = "{\n  \"file_path\" : \"spaced.txt\" ,\n  \"content\" : \"second\"\n}" },
+    });
+    defer a.free(second_sse);
+    const bodies = [_][]const u8{ first_sse, FINAL_SSE, second_sse, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    const builtins = [_]wire.BytesViewV1{sdk.bytesView("Write")};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.builtin_tools = &builtins;
+    runtime_config.builtin_tool_count = builtins.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_DEFAULT;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &builtins;
+    host_config.allowed_tool_count = builtins.len;
+    var config = sessionCreateConfig(&host_config, "test-model");
+    var probe = Issue494WriteProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = acceptEvent;
+    callbacks.on_ui_request = Issue494WriteProbe.ui;
+    callbacks.release_response = Issue494WriteProbe.releaseUi;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
+    );
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    errdefer if (diagnostic.ptr) |ptr| std.debug.print("diagnostic: {s} ui_calls={d}\n", .{ ptr[0..@intCast(diagnostic.len)], probe.ui_calls });
+    // Before the fix: STATUS_CALLBACK_FAILED, the Host never asked.
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, 1, sdk.bytesView("write the file"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), probe.ui_calls);
+    var read_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("first", try tmp.dir.readFile(std.testing.io, "spaced.txt", &read_buf));
+
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, 2, sdk.bytesView("write it again"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    // Asked once per target, whatever the spelling.
+    try std.testing.expectEqual(@as(u32, 1), probe.ui_calls);
+    try std.testing.expect(!probe.saw_other_request);
+    try std.testing.expectEqualStrings("second", try tmp.dir.readFile(std.testing.io, "spaced.txt", &read_buf));
+}

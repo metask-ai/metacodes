@@ -75,7 +75,7 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
     if (!kg.retryReadyIfDue()) return degradedResult(ctx.allocator, kg);
     kg.setAbort(ctx.abort); // M1:ESC 可中断 spawn
 
-    const text = util_json.extractStringField(args, "text") orelse {
+    const text = util_json.topLevelStringField(args, "text") orelse {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRemember 缺少必填字段 text", .{});
         return error.MissingText;
     };
@@ -90,14 +90,14 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
     // 自定义类型(observation node + 自定义 schema_type,由 tinykg 项目级 schema 按 project 治理)。
     // concept 仍拒绝(催收池转世);空/非法字符/保留字拒绝,不静默。
     const resolved: kg_mod.ResolvedType = blk: {
-        const raw = util_json.extractStringField(args, "kind") orelse break :blk .{ .node_kind = .observation, .schema_type = "observation" };
+        const raw = util_json.topLevelStringField(args, "kind") orelse break :blk .{ .node_kind = .observation, .schema_type = "observation" };
         break :blk kg_mod.resolveMemoryType(raw) orelse {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "kind 非法:基类型 decision|user_preference|module|bug|observation,或自定义类型(字母数字/_-:.、≤64字符);不接受 concept 或空/特殊字符", .{});
             return error.InvalidKind;
         };
     };
     const scope_global = blk: {
-        const raw = util_json.extractStringField(args, "scope") orelse break :blk false;
+        const raw = util_json.topLevelStringField(args, "scope") orelse break :blk false;
         break :blk std.ascii.eqlIgnoreCase(raw, "global");
     };
     // Types the host writes and reads back by type (kg/reserved_types.zig) are

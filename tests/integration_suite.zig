@@ -88,6 +88,7 @@ test {
     _ = @import("component/compound_perm_test.zig");
     _ = @import("component/bash_auto_allow_test.zig");
     _ = @import("component/grep_option_injection_test.zig");
+    _ = @import("component/tool_args_admission_test.zig");
     _ = @import("component/protected_skill_inject_test.zig");
     _ = @import("component/read_state_test.zig");
     _ = @import("component/symbol_capability_test.zig");

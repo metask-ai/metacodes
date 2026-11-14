@@ -299,48 +299,11 @@ fn jsonString(value: ?std.json.Value) ?[]const u8 {
     };
 }
 
-/// 从工具参数 JSON 里取一个字符串字段。容忍键与值之间的空白(模型/服务端产出的 JSON
-/// 常见 `"uri": "x"`),值里的转义引号不截断。
+/// A top-level string argument (still JSON-escaped): the structural lookup
+/// every executor uses, so a key nested in another value or inside a string
+/// is not the argument and whitespace around the colon is the same key (#494).
 fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    if (field.len > 200) return null;
-    buf[0] = '"';
-    @memcpy(buf[1..][0..field.len], field);
-    buf[1 + field.len] = '"';
-    const key = buf[0 .. 2 + field.len];
-    var search: usize = 0;
-    while (std.mem.indexOfPos(u8, data, search, key)) |idx| {
-        var pos = idx + key.len;
-        while (pos < data.len and isJsonWs(data[pos])) : (pos += 1) {}
-        if (pos >= data.len or data[pos] != ':') {
-            search = idx + 1;
-            continue;
-        }
-        pos += 1;
-        while (pos < data.len and isJsonWs(data[pos])) : (pos += 1) {}
-        if (pos >= data.len or data[pos] != '"') return null;
-        const s = pos + 1;
-        var e = s;
-        var escaped = false;
-        while (e < data.len) : (e += 1) {
-            const byte = data[e];
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (byte == '\\') {
-                escaped = true;
-                continue;
-            }
-            if (byte == '"') break;
-        }
-        return data[s..e];
-    }
-    return null;
-}
-
-fn isJsonWs(c: u8) bool {
-    return c == ' ' or c == '\n' or c == '\r' or c == '\t';
+    return @import("../util/json.zig").topLevelStringField(data, field);
 }
 
 // ============================================================================

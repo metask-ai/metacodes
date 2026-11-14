@@ -2382,6 +2382,15 @@ needed.
 
 ### Permission authority and provenance
 
+A tool call reaches the permission decision only with admissible arguments
+(#494): one JSON object that names no key twice at any level. Anything else
+runs nothing, calls no Permission callback, and its result is the ordinary
+tool error `invalid_args` (`category` `user_error`, `recoverable` true), so
+the model can send the call again. The PreToolUse hook, the permission
+decision and the tool all read the arguments in one canonical spelling;
+whitespace around a colon or a different escape does not change what any
+of them sees.
+
 A Permission callback request carries a `candidate`
 (`{"rule_id","scope","target"}`, or null) whenever a Session answer can take
 part in later decisions; `deny_session`/`allow_session` echo its `rule_id`.
@@ -2399,10 +2408,11 @@ AgentCore derives `target` exactly as the tool derives the file it opens: the
 tool's own reading of its path argument (`file_path`; `Write` also accepts the
 historical `path`), JSON unescaping, `~` against the Workspace home, relative
 paths against the Workspace root, then lexical normalization (symlinks are not
-resolved). It offers `file_target` only when a strict JSON parse of the
-arguments finds the same top-level path string; arguments that the tool and a
-JSON reader would resolve to different files (a nested object or an escaped
-key carrying a second `file_path`) get `exact_arguments`. A file grant is
+resolved). The tool reads only the top-level member, so a nested object or
+an escaped key carrying a second `file_path` names nothing. It offers
+`file_target` only when a strict JSON parse of the arguments finds the same
+top-level path string; arguments that do not name a file the tool could open
+get `exact_arguments`. A file grant is
 bound to its Tool (a `Write` grant does not cover `Edit`) and to the logical
 Session, and ranks where `session_allow`/`session_deny` always rank: explicit
 deny, Core safety, active Skill narrowing, and explicit ask still decide first.
