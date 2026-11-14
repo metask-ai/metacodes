@@ -29,6 +29,10 @@ empty `### Migration`.
   cron tools into a Zig Runtime, and the Zig `SessionHost` fires their
   prompts as Runs (#445); `RuntimeConfigV1` has no such flag, and the cron
   tools stay out of the tools an ABI Runtime admits.
+- No change a Host can see. The Zig `SessionHost` reports a Session's cron
+  jobs in its `Snapshot`, cancels them by command, and keeps fired cron
+  prompts within `max_queued` (#493); ABI revision 28 exposes neither
+  `SessionHost` nor the cron tools.
 
 ### Fixed
 

@@ -363,10 +363,16 @@ team 成员由 Host 在 create/restore 时提供，不进 checkpoint。AgentCore
 `RuntimeConfig.enable_cron` 打开后，cron 工具（`CronCreate`/`CronDelete`/`CronList`）
 进入目录（不能经显式 `builtin_tools` 列表进入）；选了其中任一工具的 `AgentSession`
 自带一个 `CronRegistry`，随 Session 生灭、不落盘、不进 checkpoint。工具只负责登记：
-到期的 prompt 由 Host 在 Session 空闲时用 `takeDueCronPrompts(allocator)` 取走
-（运行中 `error.SessionBusy`），`cronJobCount()` 报当前登记数。`SessionHost` 的
-driver 就这样做：队列空闲时至多每 `cron_poll_ms` 取一次，每条到期 prompt 成为一个
-`source = "session_host"`、`kind = "cron_fired"` 的 Run。C ABI 不提供 cron 工具。
+到期的 prompt 由 Host 在 Session 空闲时用 `takeDueCronPrompts(allocator, limit)` 取走
+（运行中 `error.SessionBusy`；至多 `limit` 条，超出的仍保持到期、原样留待下次），
+`cronJobCount()` 报当前登记数，`cronDueCount()` 报其中已到期的数目。`SessionHost` 的
+driver 就这样做：队列空闲时至多每 `cron_poll_ms` 取一次，只取队列 `max_queued` 还
+容得下的条数（#493），每条到期 prompt 成为一个
+`source = "session_host"`、`kind = "cron_fired"` 的 Run。Host 不经 Run 读、删任务
+（#493）：`cronJobs(allocator)` 列出 `cron_registry.JobView`（id、下次触发时间、
+`.once`/`.recurring` 表达式），`cancelCronJob(id)`、`cancelAllCronJobs()` 删除，三者
+都只在空闲时可用；`SessionHost` 经 `Snapshot.cron_jobs` 和
+`Command.cancel_cron_job`/`cancel_all_cron_jobs` 提供它们。C ABI 不提供 cron 工具。
 
 ### 模型能力声明
 

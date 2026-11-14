@@ -43,7 +43,7 @@ pub fn createExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     try out.writer.writeAll("{\"id\":");
-    try util_json.writeJsonString(&out.writer, id[0..]);
+    try util_json.writeJsonString(&out.writer, id.slice());
     try out.writer.print(",\"recurring\":{},\"scheduled\":true}}", .{recurring});
     return try out.toOwnedSlice();
 }
@@ -81,7 +81,7 @@ pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     for (reg.jobs.items, 0..) |j, i| {
         if (i > 0) try out.writer.writeByte(',');
         try out.writer.writeAll("{\"id\":");
-        try util_json.writeJsonString(&out.writer, j.id[0..]);
+        try util_json.writeJsonString(&out.writer, j.id.slice());
         try out.writer.writeAll(",\"cron\":");
         try util_json.writeJsonString(&out.writer, j.cron_expr);
         try out.writer.print(",\"recurring\":{},\"next_fire_unix\":{d}}}", .{ j.recurring, j.next_fire_unix });
@@ -160,7 +160,7 @@ test "CronCreate: delaySeconds alone is one-shot, gone after it fires" {
         try testing.expect(std.mem.indexOf(u8, out, "\"recurring\":false") != null);
         try testing.expectEqual(@as(usize, 1), reg.count());
 
-        const due = try reg.collectDue(a);
+        const due = try reg.collectDue(a, std.math.maxInt(usize));
         defer {
             for (due) |p| a.free(p);
             a.free(due);
