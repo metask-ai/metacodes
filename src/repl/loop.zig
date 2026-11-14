@@ -5302,7 +5302,7 @@ fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []c
 fn fireDueCrons(host: *const TurnHost) !void {
     const app = host.app;
     const allocator = host.allocator;
-    const due = app.cron_registry.collectDue(allocator) catch return;
+    const due = app.cron_registry.collectDue(allocator, std.math.maxInt(usize)) catch return;
     defer {
         for (due) |p| allocator.free(p);
         allocator.free(due);

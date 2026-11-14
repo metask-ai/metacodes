@@ -54,8 +54,26 @@ status, compatibility boundaries, and entry points are defined by
   the prompt, as the CLI fires one when it is back at the prompt. A job
   never fires during a Run or ahead of queued work. The cron tools stay out
   of the explicit `builtin_tools` list and the C ABI.
+- **A Host sees and cancels a Session's cron jobs without a Run** (#493).
+  `SessionHost`'s `Snapshot.cron_jobs` lists them oldest first, each with
+  its `id` (a `CronJobId`), `next_fire_unix` and `schedule` (`.once`, or
+  `.recurring` with its cron expression), as of the last time the Session
+  was between Runs. The new commands `cancel_cron_job` (by id) and
+  `cancel_all_cron_jobs` remove jobs in queue order, so they never fire
+  again, and are journaled as `command_result` like the other commands; an
+  unknown id is `ok: false`, `CronJobNotFound`. `AgentSession` gains
+  `cronJobs`, `cancelCronJob`, `cancelAllCronJobs` and `cronDueCount`.
 
 ### Fixed
+
+- **Cron prompts no longer push a `SessionHost` queue past `max_queued`**
+  (#493). With more jobs due at once than the queue had room for, the
+  driver queued every prompt, `Snapshot.queued` went past `max_queued`, and
+  `submit` and `command` refused with `QueueFull` until it drained. Now it
+  takes only as many prompts as fit, oldest job first; a job left out stays
+  due and fires once there is room, so none is lost. A team lead's inbox is
+  read under the same bound. `AgentSession.takeDueCronPrompts` and
+  `CronRegistry.collectDue` take the limit as a new argument.
 
 - **A `CronCreate` with only `delaySeconds` fires once, as the tool says.**
   `recurring` defaulted to true without a `cron` expression too, so the job

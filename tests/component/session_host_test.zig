@@ -1753,3 +1753,234 @@ test "L2 #445 SessionHost cron: a CronCreate prompt fires as the Session's next 
     try std.testing.expectEqual(@as(usize, 3), try countLines(&hosted.journal, "\"type\":\"user_message\""));
     try std.testing.expectEqual(@as(usize, 4), server.requestCount());
 }
+
+test "L2 #493 SessionHost cron: a Host reads a Session's cron jobs from Snapshot and cancels one or all by command, without a Run; a cancelled job never fires" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const scheduled = try textSse(a, "scheduled");
+    defer a.free(scheduled);
+    const b_fired = try textSse(a, "b fired");
+    defer a.free(b_fired);
+    // Run 1 schedules two one-shot jobs due in 5 s and one that repeats every
+    // New Year; Run 2 is job b. Job a is cancelled before it is due, and the
+    // cassette has no reply for it.
+    const bodies = [_][]const u8{
+        toolSse("c1", "CronCreate", "{\\\"prompt\\\":\\\"job a\\\",\\\"delaySeconds\\\":5}"),
+        toolSse("c2", "CronCreate", "{\\\"prompt\\\":\\\"job b\\\",\\\"delaySeconds\\\":5}"),
+        toolSse("c3", "CronCreate", "{\\\"prompt\\\":\\\"new year\\\",\\\"cron\\\":\\\"0 0 1 1 *\\\"}"),
+        scheduled,
+        b_fired,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_cron = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{ "CronCreate", "CronList", "CronDelete" });
+    config.permission_mode = .bypass_permissions;
+    const hosted = try host.open(.{ .config = config });
+    defer host.release(hosted);
+
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.cron_jobs.len);
+    }
+
+    const before = cc.util_time.nowUnix();
+    try hosted.submit(.{ .text = "schedule" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+
+    // The jobs the Run created, oldest first: id, next fire, schedule.
+    var ids: [3]cc.session_host.CronJobId = undefined;
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        const jobs = snapshot.cron_jobs;
+        try std.testing.expectEqual(@as(usize, 3), jobs.len);
+        for (jobs, &ids) |job, *id| id.* = job.id;
+        try std.testing.expect(jobs[0].schedule == .once);
+        try std.testing.expect(jobs[1].schedule == .once);
+        try std.testing.expectEqualStrings("0 0 1 1 *", jobs[2].schedule.recurring);
+        for (jobs[0..2]) |job| {
+            try std.testing.expect(job.next_fire_unix >= before + 5);
+            try std.testing.expect(job.next_fire_unix <= cc.util_time.nowUnix() + 5);
+        }
+        try std.testing.expect(jobs[2].next_fire_unix > cc.util_time.nowUnix());
+        try std.testing.expect(!ids[0].eql(ids[1]) and !ids[1].eql(ids[2]) and !ids[0].eql(ids[2]));
+        // The ids are the ones the model was given.
+        for (ids) |id| try std.testing.expect(std.mem.indexOf(u8, server.requestAt(3).?.body(), id.slice()) != null);
+    }
+
+    // Cancel job a by id: journaled as a command_result, no Run, gone from
+    // Snapshot by the time the result is journaled.
+    try hosted.command(.{ .cancel_cron_job = ids[0] });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"cancel_cron_job\",\"ok\":true,\"error_name\":null,\"message\":null}}"));
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), snapshot.cron_jobs.len);
+        try std.testing.expect(snapshot.cron_jobs[0].id.eql(ids[1]));
+        try std.testing.expect(snapshot.cron_jobs[1].id.eql(ids[2]));
+    }
+    // An id the Session no longer has, and text that is no id at all.
+    try hosted.command(.{ .cancel_cron_job = ids[0] });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"cancel_cron_job\",\"ok\":false,\"error_name\":\"CronJobNotFound\",\"message\":null}}"));
+    try std.testing.expectError(error.InvalidCronJobId, cc.session_host.CronJobId.parse("job a"));
+    try std.testing.expectEqual(ids[1], try cc.session_host.CronJobId.parse(ids[1].slice()));
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"run_done\""));
+
+    // Job b, due with job a, fires; job a does not.
+    try waitFor(&hosted.journal, "\"kind\":\"cron_fired\"", 1);
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.cron_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"text\":\"job b\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\""));
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"text\":\"job a\""));
+    try std.testing.expectEqual(@as(usize, 5), server.requestCount());
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.cron_jobs.len);
+        try std.testing.expect(snapshot.cron_jobs[0].id.eql(ids[2]));
+    }
+
+    // Cancel all: the recurring job goes too.
+    try hosted.command(.cancel_all_cron_jobs);
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 3);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"cancel_all_cron_jobs\",\"ok\":true,\"error_name\":null,\"message\":null}}"));
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.cron_jobs.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), hosted.session.cronJobCount());
+    try std.testing.expectEqual(@as(usize, 5), server.requestCount());
+}
+
+test "L2 #493 SessionHost cron: prompts due beyond max_queued stay due and fire once the queue has room; queued never passes the bound and none is lost" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    const target = try std.fmt.allocPrint(a, "{s}/w.txt", .{workspace});
+    defer a.free(target);
+
+    const scheduled = try textSse(a, "scheduled");
+    defer a.free(scheduled);
+    const write = try writeToolSse(a, target);
+    defer a.free(write);
+    const wrote = try textSse(a, "wrote");
+    defer a.free(wrote);
+    const p2 = try textSse(a, "p2 done");
+    defer a.free(p2);
+    const by_host = try textSse(a, "host done");
+    defer a.free(by_host);
+    const p3 = try textSse(a, "p3 done");
+    defer a.free(p3);
+    const p4 = try textSse(a, "p4 done");
+    defer a.free(p4);
+    // Run 1 schedules four prompts due at once. With room for two, p1 and p2
+    // fire; p1's Run holds the driver on a permission request while p2
+    // waits in the queue beside one Host submission. p3 and p4 fire once
+    // the queue has drained.
+    const bodies = [_][]const u8{
+        toolSse("c1", "CronCreate", "{\\\"prompt\\\":\\\"p1\\\",\\\"delaySeconds\\\":0}"),
+        toolSse("c2", "CronCreate", "{\\\"prompt\\\":\\\"p2\\\",\\\"delaySeconds\\\":0}"),
+        toolSse("c3", "CronCreate", "{\\\"prompt\\\":\\\"p3\\\",\\\"delaySeconds\\\":0}"),
+        toolSse("c4", "CronCreate", "{\\\"prompt\\\":\\\"p4\\\",\\\"delaySeconds\\\":0}"),
+        scheduled,
+        write,
+        wrote,
+        p2,
+        by_host,
+        p3,
+        p4,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"}, .enable_cron = true });
+    defer runtime.destroy() catch unreachable;
+    const max_queued = 2;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .max_queued = max_queued });
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{ "CronCreate", "CronList", "CronDelete", "Write" });
+    config.permission_mode = .bypass_permissions;
+    const hosted = try host.open(.{ .config = config });
+    defer host.release(hosted);
+
+    // The command is queued behind Run 1, so no prompt fires before it:
+    // from then on the Write asks.
+    try hosted.submit(.{ .text = "schedule" });
+    try hosted.command(.{ .set_permission_mode = .default });
+    try waitFor(&hosted.journal, "\"type\":\"ui_request\"", 1);
+
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(cc.session_host.Phase.running, snapshot.phase);
+        try std.testing.expectEqual(@as(usize, max_queued), snapshot.max_queued);
+        // p1 runs, p2 is queued: two fired, the bound's worth. p3 and p4
+        // stay due in the registry instead of a third and fourth queued Run.
+        try std.testing.expectEqual(@as(usize, 1), snapshot.queued);
+        try std.testing.expectEqual(@as(usize, 2), snapshot.cron_jobs.len);
+        for (snapshot.cron_jobs) |job| try std.testing.expect(job.schedule == .once);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"kind\":\"cron_fired\""));
+    // The room left is the Host's, and the bound holds.
+    try hosted.submit(.{ .text = "from the host" });
+    try std.testing.expectError(error.QueueFull, hosted.submit(.{ .text = "one too many" }));
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, max_queued), snapshot.queued);
+    }
+
+    try hosted.respond(try pendingRequestId(&hosted.journal), "{\"choice\":\"allow_once\"}");
+    // Watch the queue drain and the rest fire: it never passes the bound.
+    var waited: u64 = 0;
+    while (waited < 15_000) : (waited += 5) {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expect(snapshot.queued <= max_queued);
+        if (try countLines(&hosted.journal, "\"type\":\"run_done\"") >= 6 and snapshot.cron_jobs.len == 0 and snapshot.queued == 0) break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    } else return error.CronNeverDrained;
+
+    // Every prompt ran once, in the order its job was created, the Host's
+    // submission where it was queued.
+    const order = [_][]const u8{
+        "\"run_id\":2,\"trace_id\":null,\"text\":\"p1\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\"",
+        "\"run_id\":3,\"trace_id\":null,\"text\":\"p2\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\"",
+        "\"run_id\":4,\"trace_id\":null,\"text\":\"from the host\"",
+        "\"run_id\":5,\"trace_id\":null,\"text\":\"p3\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\"",
+        "\"run_id\":6,\"trace_id\":null,\"text\":\"p4\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\"",
+    };
+    for (order) |line| try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, line));
+    try std.testing.expectEqual(@as(usize, 4), try countLines(&hosted.journal, "\"kind\":\"cron_fired\""));
+    for (1..7) |run_id| {
+        var line_buf: [128]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "\"type\":\"run_done\",\"data\":{{\"run_id\":{d},\"trace_id\":null,\"stop_reason\":\"end_turn\"", .{run_id});
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, line));
+    }
+    try std.testing.expectEqual(bodies.len, server.requestCount());
+    try std.testing.expect(try exists(workspace, "w.txt"));
+}
