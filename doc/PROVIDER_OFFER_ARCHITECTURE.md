@@ -104,7 +104,7 @@ and `dialects/registry.zig` fails a test when one is missing.
 | Anthropic Claude | `src/api/dialects/claude.zig` | `metask` (Claude models) |
 | Google Gemini | `src/api/dialects/gemini.zig` | `gemini` |
 | Zhipu GLM | `src/api/dialects/glm.zig` | `zai-coding-plan` |
-| Moonshot Kimi | `src/api/dialects/kimi.zig` | `kimi` |
+| Moonshot Kimi | `src/api/dialects/kimi.zig` | `kimi` (open platform), `kimi-code` (Kimi Code subscription) |
 | DeepSeek | `src/api/dialects/deepseek.zig` | `deepseek` |
 | Alibaba Qwen | `src/api/dialects/qwen.zig` | `qwen` |
 | MiniMax | `src/api/dialects/minimax.zig` | `minimax` |
@@ -239,6 +239,33 @@ Error classification is provider-owned: `429` with quota wording is
 `quota_exceeded` (not retryable) while plain throttling is `rate_limited`
 (retryable); invalid key, wrong endpoint, and permission failures never retry as
 transport errors.
+
+## Kimi Code
+
+```text
+cn-responses      https://api.kimi.com/coding/v1   openai_responses   (default)
+cn-chat           https://api.kimi.com/coding/v1   openai_chat
+global-responses  https://api.kimi.ai/coding/v1    openai_responses
+global-chat       https://api.kimi.ai/coding/v1    openai_chat
+```
+
+`kimi-code` is the coding quota of a Kimi membership, a different account
+from the Moonshot open platform (`kimi`): Kimi says their keys and base URLs
+are not interchangeable. Kimi documents one OpenAI-protocol base URL per host
+for both wires; each wire is its own channel, because two routes on the
+default channel would make `--model k3.1-pro` an ambiguity. Responses is the
+default, the wire Kimi asks Responses-capable tools to use. Every route
+requires `/coding/v1`, which no open-platform URL carries, so an override
+cannot fall back to the pay-as-you-go platform.
+
+Kimi Code keys are their own kind (`kimi_code_api_key`). `KIMI_CODE_API_KEY` is
+canonical; `KIMI_API_KEY`, the name Kimi's guides give the subscription key, is
+an alias, and the `kimi` profile reads `MOONSHOT_API_KEY` only. The
+Anthropic-compatible surface (`https://api.kimi.com/coding/`) is not a channel
+yet: Kimi does not document how a Messages request turns thinking on, and K3.1
+Pro refuses a request with thinking off. K3.1 Pro and K3 declare 262,144
+tokens, the window every plan that offers them gets; quotes stay `unknown`, as
+for the GLM plan.
 
 ## Credential pools
 
@@ -473,6 +500,10 @@ declares four plan pages — China and Global, personal and team — and its not
 says why the standard API-key page is the wrong one: since 2026-10-16 a key
 from it bills the account balance even on the Coding Plan endpoints. The page
 offered first follows the region of the chosen channel (`defaultKeyPage`).
+Kimi Code (`kimi-code`, its own `kimi_code_api_key` kind) declares the Kimi
+Code Console twice, China and Global, each checked on its own host's
+`/coding/v1/models`; its note says a Moonshot open-platform key does not work
+there.
 
 The login is a `provider_login.Flow` variant (`ApiKeyPrepared`), so the CLI,
 `/login` and the picker share it with the OAuth grants and run it on the same

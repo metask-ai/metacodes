@@ -607,8 +607,10 @@ fn writeLauncher(arena: std.mem.Allocator, io: std.Io, plan: Launcher, log: *std
 }
 
 /// The executable a launcher written by `launcherBody` runs, or null when
-/// `body` is anything else (another script, a binary).
-fn launcherTarget(arena: std.mem.Allocator, body: []const u8) !?[]const u8 {
+/// `body` is anything else (another script, a binary). Any form
+/// `launcherBody` has written reads back: the marker line and the `exec`
+/// line are all it looks at.
+pub fn launcherTarget(arena: std.mem.Allocator, body: []const u8) !?[]const u8 {
     var target: std.ArrayList(u8) = .empty;
     if (is_windows) {
         if (!std.mem.startsWith(u8, body, "@\"")) return null;
@@ -640,7 +642,14 @@ fn launcherTarget(arena: std.mem.Allocator, body: []const u8) !?[]const u8 {
 
 /// The launcher script for `executable`, quoted so that no character of the
 /// path is interpreted by the shell (POSIX) or by cmd's `%` expansion.
-fn launcherBody(arena: std.mem.Allocator, executable: []const u8) ![]const u8 {
+///
+/// The POSIX script exports its own path (`$0`) as `METACODES_LAUNCHER`
+/// first: `exec` hands the executable its own path as argv[0], the same for
+/// every install, so this is how a run learns that the user typed
+/// `metacodes-dev` and names that command in its messages
+/// (app/invocation.zig, #482). Argv[0] itself is left alone, so `ps` still
+/// shows the install's path, which `install.sh --uninstall` looks for.
+pub fn launcherBody(arena: std.mem.Allocator, executable: []const u8) ![]const u8 {
     var quoted: std.ArrayList(u8) = .empty;
     if (is_windows) {
         for (executable) |c| {
@@ -654,7 +663,11 @@ fn launcherBody(arena: std.mem.Allocator, executable: []const u8) ![]const u8 {
         if (c == '\'') try quoted.appendSlice(arena, "'\\''") else try quoted.append(arena, c);
     }
     try quoted.append(arena, '\'');
-    return std.fmt.allocPrint(arena, "#!/bin/sh\n# metacodes launcher written by `metacodes install`\nexec {s} \"$@\"\n", .{quoted.items});
+    return std.fmt.allocPrint(
+        arena,
+        "#!/bin/sh\n# metacodes launcher written by `metacodes install`\nexport {s}=\"$0\"\nexec {s} \"$@\"\n",
+        .{ @import("platform").paths.launcher_env_name, quoted.items },
+    );
 }
 
 /// The installed executable vouches for itself: every runtime asset resolves
@@ -1330,6 +1343,21 @@ test "launcherTarget reads back what launcherBody writes, and nothing else" {
     try testing.expect(try launcherTarget(arena, "#!/bin/sh\nexec /elsewhere/bin/metacodes \"$@\"\n") == null);
     try testing.expect(try launcherTarget(arena, "\x7fELF\x02\x01\x01") == null);
     try testing.expect(try launcherTarget(arena, "") == null);
+}
+
+test "the launcher passes its own path on as METACODES_LAUNCHER; the form before that still reads back (#482)" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings(
+        "#!/bin/sh\n# metacodes launcher written by `metacodes install`\nexport METACODES_LAUNCHER=\"$0\"\nexec '/opt/mc/bin/metacodes' \"$@\"\n",
+        try launcherBody(arena, "/opt/mc/bin/metacodes"),
+    );
+    // Every launcher written before #482: still this install's own, so a
+    // rerun replaces it without --force.
+    const before = "#!/bin/sh\n# metacodes launcher written by `metacodes install`\nexec '/opt/mc/bin/metacodes' \"$@\"\n";
+    try testing.expectEqualStrings("/opt/mc/bin/metacodes", (try launcherTarget(arena, before)).?);
 }
 
 test "a launcher held by another metacodes install is named; this install's own in another form is replaced" {

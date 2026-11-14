@@ -19,6 +19,7 @@ const catalog_mod = @import("api/catalog.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const provider_ids_mod = @import("provider/ids.zig");
 const version_info = @import("version_info.zig");
+const invocation = @import("app/invocation.zig");
 pub const doctor = @import("app/doctor.zig"); // pub: component tests build the report by hand
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
@@ -582,6 +583,59 @@ test "compact summary module tests are reachable from root" {
     try std.testing.expect(compact_summary.defaultSystemPrompt().len > 0);
 }
 
+/// Argv[0], recorded by `main` for `invokedCommand`.
+var started_as: ?[]const u8 = null;
+
+/// Argv[0], copied into `allocator`: on Windows the iterator owns its strings.
+fn firstArgument(init: std.process.Init, allocator: std.mem.Allocator) ?[]const u8 {
+    var args = argsIter(init);
+    defer args.deinit();
+    const first = args.next() orelse return null;
+    return allocator.dupe(u8, first) catch null;
+}
+
+/// The command the user ran (`metacodes-dev` for a side-by-side development
+/// install), for the hints that tell them what to run next: a hint naming
+/// another install's command signs in that install, not this one (#482).
+/// Resolved only when a hint is printed; `scratch` holds the launcher while
+/// it is checked.
+fn invokedCommand(scratch: std.mem.Allocator) []const u8 {
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    return invocation.commandName(scratch, .{
+        .launcher = @import("platform").paths.launcherEnv(),
+        .argv0 = started_as,
+        .self_exe = @import("platform").paths.selfExeRealPath(&exe_buf),
+    });
+}
+
+/// What a run prints when it finds no credential: the ways to sign in, as
+/// commands of the install that printed it (`command`), the default sign-in
+/// that a plain launch reads first.
+const auth_required_hint =
+    \\Authentication required.
+    \\Use one of:
+    \\  {[command]s} login
+    \\  {[command]s} login --oauth-token-json <token-response.json>
+    \\  {[command]s} login --provider <id>
+    \\  {[command]s} login --provider <id> --oauth-token-json <token-response.json>
+    \\  {[command]s} login --api-key <key>
+    \\  export METASK_API_KEY=...
+    \\
+    \\No token value was printed.
+    \\
+;
+
+/// What a run prints when the stored Metask login has no model selection.
+const incomplete_login_hint =
+    \\Metask login is incomplete.
+    \\Run `{[command]s} login` in a terminal and select an API key, model, and reasoning effort.
+    \\Use --model and --reasoning-effort only when intentionally overriding the saved selection.
+    \\
+;
+
+/// What a `--provider metask` run prints when no usable Metask session is stored.
+const metask_session_hint = "Metask session is unavailable or expired; run `{[command]s} login --provider metask` to log in again.\n";
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
@@ -610,6 +664,7 @@ pub fn main(init: std.process.Init) !void {
         printHelp();
         std.process.exit(0);
     }
+    started_as = firstArgument(init, allocator);
 
     // `--state-dir` as argv[1] is a global option: it precedes, and applies
     // to, every subcommand below (login, doctor, kg, ...).
@@ -780,11 +835,11 @@ pub fn main(init: std.process.Init) !void {
                     // models_url is retained only as informational metadata.
                     const gateway = gateway_override orelse std.mem.trimEnd(u8, tokens.gateway_url orelse "", "/");
                     if (gateway.len == 0) {
-                        std.debug.print("error: stored Metask session lacks gateway_url; run `metacodes login --provider metask`\n", .{});
+                        std.debug.print("error: stored Metask session lacks gateway_url; run `{s} login --provider metask`\n", .{invokedCommand(allocator)});
                         std.process.exit(2);
                     }
                     if (!metask_oauth_mod.isGatewayOrigin(gateway)) {
-                        std.debug.print("error: stored Metask gateway_url is invalid; run `metacodes login --provider metask`\n", .{});
+                        std.debug.print("error: stored Metask gateway_url is invalid; run `{s} login --provider metask`\n", .{invokedCommand(allocator)});
                         std.process.exit(2);
                     }
                     if (gateway_override == null)
@@ -825,7 +880,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         }
         const current = config.base_url orelse {
-            std.debug.print("error: Metask gateway route has no endpoint; run `metacodes login --provider metask`\n", .{});
+            std.debug.print("error: Metask gateway route has no endpoint; run `{s} login --provider metask`\n", .{invokedCommand(allocator)});
             std.process.exit(2);
         };
         const messages_suffix = "/v1/messages";
@@ -892,7 +947,7 @@ pub fn main(init: std.process.Init) !void {
     {
         provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| {
             if (err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession) {
-                std.debug.print("Metask session is unavailable or expired; run `metacodes login --provider metask` to log in again.\n", .{});
+                std.debug.print(metask_session_hint, .{ .command = invokedCommand(allocator) });
             } else {
                 std.debug.print("Metask OAuth refresh failed: {s}\n", .{@errorName(err)});
             }
@@ -920,18 +975,7 @@ pub fn main(init: std.process.Init) !void {
     if (!introspection_only and provider_secret == null) {
         resolved_credential = auth.resolveRuntimeCredential(allocator, config.state_root, config.api_key, config.auth_precedence) catch |err| {
             @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
-            std.debug.print(
-                \\Authentication required.
-                \\Use one of:
-                \\  metacodes login --oauth-token-json <token-response.json>
-                \\  metacodes login --provider <id>
-                \\  metacodes login --provider <id> --oauth-token-json <token-response.json>
-                \\  metacodes login --api-key <key>
-                \\  export METASK_API_KEY=...
-                \\
-                \\No token value was printed.
-                \\
-            , .{});
+            std.debug.print(auth_required_hint, .{ .command = invokedCommand(allocator) });
             return err;
         };
     }
@@ -953,12 +997,7 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     if (metask_scope) if (resolved_credential) |credential| if (!isUsableConfiguredSession(config, credential.source)) {
-        std.debug.print(
-            \\Metask login is incomplete.
-            \\Run `metacodes login` in a terminal and select an API key, model, and reasoning effort.
-            \\Use --model and --reasoning-effort only when intentionally overriding the saved selection.
-            \\
-        , .{});
+        std.debug.print(incomplete_login_hint, .{ .command = invokedCommand(allocator) });
         return error.IncompleteLoginSelection;
     };
 
@@ -3047,7 +3086,7 @@ pub fn resolveProviderScopedSecret(
 
     // The key `login --provider` stored for this provider, in its own file.
     var stored_key = provider_api_key_store.load(allocator, config.state_root, profile.id) catch |err| blk: {
-        std.debug.print("warning: the stored key for '{s}' cannot be used ({s}); run `metacodes login --provider {s}` again\n", .{ profile.id.slice(), @errorName(err), profile.id.slice() });
+        std.debug.print("warning: the stored key for '{s}' cannot be used ({s}); run `{s} login --provider {s}` again\n", .{ profile.id.slice(), @errorName(err), invokedCommand(allocator), profile.id.slice() });
         break :blk null;
     };
     defer if (stored_key) |*key| key.deinit();
@@ -3061,15 +3100,17 @@ pub fn resolveProviderScopedSecret(
         .stored_api_key = if (stored_key) |*key| key.entry() else null,
         .env = credential_mod.EnvLookup.process(),
     }, &reference_buffer) catch |err| {
-        printProviderCredentialHelp(profile.*, err);
+        printProviderCredentialHelp(profile.*, err, invokedCommand(allocator));
         return err;
     };
     return allocator.dupe(u8, resolved.secret);
 }
 
+/// `command` is the command the user ran (`invokedCommand`).
 fn printProviderCredentialHelp(
     profile: @import("provider/profile.zig").ProviderProfile,
     err: anyerror,
+    command: []const u8,
 ) void {
     switch (err) {
         error.AmbiguousCredentialAliases => {
@@ -3086,7 +3127,7 @@ fn printProviderCredentialHelp(
                 .{profile.id.slice()},
             );
             if (profile.api_key_setup) |setup| {
-                std.debug.print("  metacodes login --provider {s}   (opens the page the key is created on, then stores it)\n", .{profile.id.slice()});
+                std.debug.print("  {s} login --provider {s}   (opens the page the key is created on, then stores it)\n", .{ command, profile.id.slice() });
                 if (setup.note) |note| std.debug.print("  {s}\n", .{note});
             }
             for (profile.accepted_credential_kinds) |kind| {
@@ -3094,7 +3135,7 @@ fn printProviderCredentialHelp(
                     std.debug.print("  export {s}=...\n", .{canonical});
                 }
             }
-            std.debug.print("  metacodes --api-key <key> --provider {s} ...\n", .{profile.id.slice()});
+            std.debug.print("  {s} --api-key <key> --provider {s} ...\n", .{ command, profile.id.slice() });
             std.debug.print("No token value was printed.\n", .{});
         },
     }
@@ -3929,6 +3970,64 @@ test "Metask login dispatch uses JSON device flow except token import" {
     try std.testing.expect(!metaskUsesDeviceFlow(.oauth_json));
 }
 
+test "the sign-in hints name the command that was run, the default sign-in first (#482)" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { argv0: []const u8, command: []const u8 }{
+        .{ .argv0 = "metacodes", .command = "metacodes" },
+        .{ .argv0 = "metacodes-dev", .command = "metacodes-dev" },
+        .{ .argv0 = "/Users/someone/.local/bin/metacodes-dev", .command = "metacodes-dev" },
+    };
+    for (cases) |case| {
+        const command = invocation.commandName(a, .{ .argv0 = case.argv0 });
+        try std.testing.expectEqualStrings(case.command, command);
+        const login = try std.fmt.allocPrint(a, "  {s} login", .{command});
+        defer a.free(login);
+
+        const hint = try std.fmt.allocPrint(a, auth_required_hint, .{ .command = command });
+        defer a.free(hint);
+        // Every sign-in line but the environment variable runs this command,
+        // and the first is the bare `login` a plain launch reads.
+        var lines = std.mem.splitScalar(u8, hint, '\n');
+        var sign_ins: usize = 0;
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "  ")) continue;
+            if (std.mem.eql(u8, line, "  export METASK_API_KEY=...")) continue;
+            try std.testing.expect(std.mem.startsWith(u8, line, login));
+            if (sign_ins == 0) try std.testing.expectEqualStrings(login, line);
+            sign_ins += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 5), sign_ins);
+
+        const incomplete = try std.fmt.allocPrint(a, incomplete_login_hint, .{ .command = command });
+        defer a.free(incomplete);
+        const run_login = try std.fmt.allocPrint(a, "Run `{s} login` in a terminal", .{command});
+        defer a.free(run_login);
+        try std.testing.expect(std.mem.indexOf(u8, incomplete, run_login) != null);
+
+        const session = try std.fmt.allocPrint(a, metask_session_hint, .{ .command = command });
+        defer a.free(session);
+        const run_metask = try std.fmt.allocPrint(a, "run `{s} login --provider metask` to log in again", .{command});
+        defer a.free(run_metask);
+        try std.testing.expect(std.mem.indexOf(u8, session, run_metask) != null);
+    }
+
+    const dev = try std.fmt.allocPrint(a, auth_required_hint, .{ .command = "metacodes-dev" });
+    defer a.free(dev);
+    try std.testing.expectEqualStrings(
+        \\Authentication required.
+        \\Use one of:
+        \\  metacodes-dev login
+        \\  metacodes-dev login --oauth-token-json <token-response.json>
+        \\  metacodes-dev login --provider <id>
+        \\  metacodes-dev login --provider <id> --oauth-token-json <token-response.json>
+        \\  metacodes-dev login --api-key <key>
+        \\  export METASK_API_KEY=...
+        \\
+        \\No token value was printed.
+        \\
+    , dev);
+}
+
 test {
     _ = &@import("json.zig");
     _ = &@import("client.zig");
@@ -3977,6 +4076,7 @@ test {
     _ = &@import("app/route_strings.zig");
     _ = &@import("app/mcp_startup.zig");
     _ = &@import("app/install.zig");
+    _ = &@import("app/invocation.zig");
     _ = &@import("app/release_source.zig");
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");

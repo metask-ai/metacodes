@@ -107,8 +107,8 @@ install record, then `~/.metacodes` ([INSTALL_DESIGN.md](INSTALL_DESIGN.md)).
 ## Choose a model provider
 
 metacodes is model-agnostic. `--provider` selects a provider profile
-(`metask`, `openai`, `gemini`, `zai-coding-plan`, `deepseek`, `kimi`, `qwen`,
-`minimax`, `bedrock`, or one you define), `--channel` a route within it, and `--offer` pins one exact model route. `metacodes
+(`metask`, `openai`, `gemini`, `zai-coding-plan`, `deepseek`, `kimi`,
+`kimi-code`, `qwen`, `minimax`, `bedrock`, or one you define), `--channel` a route within it, and `--offer` pins one exact model route. `metacodes
 --check-providers` validates the configuration and lists every route without
 touching the network. `--base-url`, `--api-key` and `--model` override the
 endpoint, key and model for a single run; `--openai-protocol responses`
@@ -117,10 +117,13 @@ channels, offers and typed credentials are specified in
 [PROVIDER_OFFER_ARCHITECTURE.md](PROVIDER_OFFER_ARCHITECTURE.md).
 
 Each built-in vendor reads its key from its own variable — `DEEPSEEK_API_KEY`,
-`MOONSHOT_API_KEY`, `DASHSCOPE_API_KEY`, `MINIMAX_API_KEY`,
-`AWS_BEARER_TOKEN_BEDROCK` (a Bedrock API key) — and its integration notes
-(endpoints, thinking parameters, known differences, sources) are the header of
-`src/api/dialects/<vendor>.zig`.
+`MOONSHOT_API_KEY` (the Moonshot open platform, `kimi`), `KIMI_CODE_API_KEY`
+or `KIMI_API_KEY` (the Kimi Code subscription, `kimi-code`),
+`DASHSCOPE_API_KEY`, `MINIMAX_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock
+API key) — and its integration notes (endpoints, thinking parameters, known
+differences, sources) are the header of `src/api/dialects/<vendor>.zig`.
+`KIMI_API_KEY` belongs to Kimi Code: the open-platform profile reads
+`MOONSHOT_API_KEY` only.
 
 ## GLM Coding Plan
 
@@ -138,6 +141,32 @@ standard API-key page: a standard key bills the account balance. `/login`
 and `/model` in the TUI offer the same steps. `ZAI_API_KEY` still works and
 wins over the stored key; `metacodes logout --provider zai-coding-plan`
 forgets it.
+
+## Kimi Code
+
+```sh
+metacodes login --provider kimi-code
+metacodes --provider kimi-code --model k3.1-pro
+```
+
+Kimi Code is the coding subscription of a Kimi membership, a different account
+from the Moonshot open platform (`kimi`): its key comes from the Kimi Code
+Console (https://www.kimi.com/code/console), and a platform key does not work
+on it. The login asks which host to check the key on (China or Global), opens
+the Console, reads the pasted key without showing it, checks it against the
+subscription's model list and stores it in
+`$HOME/.metacodes/keys/kimi-code.json` (0600). `/login` lists it as "Kimi Code
+· API key"; `KIMI_CODE_API_KEY` or `KIMI_API_KEY` in the environment wins over
+the stored key.
+
+Requests go to `https://api.kimi.com/coding/v1` on the Responses wire by
+default (`--channel cn-chat` for Chat Completions, which shows the thinking
+stream; `global-responses` and `global-chat` use the overseas host
+`https://api.kimi.ai/coding/v1`). The models are `k3.1-pro`,
+`k3.1-pro-highspeed`, `k3`, `k3-256k`, `kimi-for-coding` and
+`kimi-for-coding-highspeed`; which ones a key may call depends on the plan
+(legacy Andante plans have `kimi-for-coding` only). `/model` sets the reasoning
+effort (low, high or max; unset is the server's default).
 
 ## Metask OAuth
 

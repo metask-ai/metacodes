@@ -23,6 +23,7 @@ test {
     _ = @import("component/gemini_thought_signature_test.zig");
     _ = @import("component/provider_oauth_login_test.zig");
     _ = @import("component/provider_key_login_test.zig");
+    _ = @import("component/kimi_code_provider_test.zig");
     _ = @import("component/redirect_credential_test.zig");
     _ = @import("component/http_send_failure_test.zig");
     _ = @import("component/subagent_model_test.zig");
@@ -53,6 +54,7 @@ test {
     _ = @import("component/base_url_flag_test.zig");
     _ = @import("component/unknown_flag_test.zig");
     _ = @import("component/cli_help_test.zig");
+    _ = @import("component/launcher_hint_test.zig");
     _ = @import("component/task_error_test.zig");
     _ = @import("component/tool_loop_breaker_test.zig");
     _ = @import("component/user_context_inject_test.zig");

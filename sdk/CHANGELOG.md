@@ -48,6 +48,14 @@ empty `### Migration`.
   an escaped key, is no longer read as a built-in tool's argument, so a
   `Write`/`Edit` call spelled that way now gets the `file_target`
   candidate for the file it really writes.
+- A Run on `kimi-for-coding` (the Kimi Code subscription's K2.8 Preview) over
+  the OpenAI chat wire sends the thinking parameter Kimi Code documents
+  (#487): an active reasoning effort goes out as the top-level
+  `reasoning_effort` in Kimi's `low` / `high` / `max`, and no effort, `none`
+  or `minimal` sends nothing, so the server's own default applies. It used to
+  send K2.7-code's `"thinking":{"type":"enabled","keep":"all"}` and no
+  effort. `kimi-for-coding-highspeed` and the Moonshot open platform's
+  models send the bytes they did. No ABI change.
 
 ## 0.15.0 — 2026-11-13
 

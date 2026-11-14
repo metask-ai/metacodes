@@ -11,7 +11,9 @@
 //! OpenAI channels alone.
 //!
 //! The Kimi Code subscription (`api.kimi.com/coding/v1`) is a different account
-//! and quota and is not part of this profile. Quotes stay `unknown` until a
+//! and quota: it is the `kimi-code` profile (`kimi_code.zig`), and
+//! `KIMI_API_KEY`, the name Kimi's guides give the subscription key, belongs to
+//! it. This profile reads `MOONSHOT_API_KEY` only. Quotes stay `unknown` until a
 //! catalog supplies them.
 
 const std = @import("std");
@@ -145,10 +147,11 @@ const CHANNELS = [_]profile.ChannelDescriptor{
 
 const CREDENTIAL_KINDS = [_]profile.CredentialKind{.api_key};
 
-/// `MOONSHOT_API_KEY` is what the vendor's documentation uses.
+/// `MOONSHOT_API_KEY` is what the vendor's documentation uses. `KIMI_API_KEY`
+/// is not read here: Kimi's guides name the Kimi Code subscription key that
+/// way, and a subscription key sent to this platform reaches another account.
 const ENV_ALIASES = [_]profile.EnvAlias{
     .{ .name = "MOONSHOT_API_KEY", .kind = .api_key, .canonical = true },
-    .{ .name = "KIMI_API_KEY", .kind = .api_key },
 };
 
 pub const PROFILE = profile.ProviderProfile{
@@ -187,4 +190,12 @@ test "kimi profile: four channels, every route declares the Kimi dialect" {
     try std.testing.expect(MODELS[2].servesProtocol(.openai_chat));
     try std.testing.expect(!MODELS[2].servesProtocol(.anthropic_messages));
     try std.testing.expect(MODELS[0].servesProtocol(.anthropic_messages));
+}
+
+test "kimi profile: only MOONSHOT_API_KEY; KIMI_API_KEY is the Kimi Code subscription's" {
+    try std.testing.expectEqual(@as(usize, 1), PROFILE.env_aliases.len);
+    try std.testing.expectEqualStrings("MOONSHOT_API_KEY", PROFILE.canonicalEnvAlias(.api_key).?);
+    for (PROFILE.env_aliases) |alias| {
+        try std.testing.expect(!std.mem.eql(u8, alias.name, "KIMI_API_KEY"));
+    }
 }

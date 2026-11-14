@@ -12,6 +12,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **`KIMI_API_KEY` is the Kimi Code subscription's key, no longer an alias
+  of `MOONSHOT_API_KEY`** (#487). The `kimi` profile (the Moonshot open
+  platform) now reads `MOONSHOT_API_KEY` only, and `KIMI_API_KEY`
+  authenticates the new `kimi-code` profile beside its canonical
+  `KIMI_CODE_API_KEY`. Kimi's own Codex and Hermes guides give the
+  subscription key that name, so with it set `--provider kimi` sent a
+  subscription key to the platform, a different account. A platform user who
+  set only `KIMI_API_KEY` renames it to `MOONSHOT_API_KEY`; until then
+  `--provider kimi` stops with `Authentication required for provider 'kimi'`
+  before any request is sent. `KIMI_CODE_API_KEY` and `KIMI_API_KEY` holding
+  different values is refused as conflicting, as the GLM plan's names are.
 - **A `SessionHost` submission's own `model` and `permission_mode` are
   journaled as the daemon journals a message's fields** (part of #445). The
   driver writes a `config_changed` line for each one it applies, where
@@ -33,6 +44,30 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Built-in Kimi Code provider** (#487). `--provider kimi-code` (alias
+  `kimi-coding-plan`) uses a Kimi Code subscription: requests go to
+  `https://api.kimi.com/coding/v1` (`global-*` channels:
+  `https://api.kimi.ai/coding/v1`) and count against the membership, not the
+  Moonshot open platform. The key is its own credential kind
+  (`kimi_code_api_key`), read from `KIMI_CODE_API_KEY` or `KIMI_API_KEY`.
+  The default channel `cn-responses` speaks the Responses wire, as Kimi's
+  Codex guide configures it; `cn-chat` and `global-chat` speak Chat
+  Completions with the Kimi dialect, which shows the thinking stream. The
+  models are the six of Kimi's model page: `k3.1-pro` (the default),
+  `k3.1-pro-highspeed`, `k3`, `k3-256k`, `kimi-for-coding` and
+  `kimi-for-coding-highspeed`, each with `reasoning_effort` low / high / max
+  except the last, which always thinks. `/login` lists "Kimi Code · API
+  key": the pasted key is checked by listing the subscription's models and
+  stored in `<state root>/keys/kimi-code.json` (0600), as `metacodes login
+  --provider kimi-code` does. On Chat Completions the `k3*` models and
+  `kimi-for-coding` send no `reasoning_effort` when none is chosen, so the
+  server's default applies (high for K3.1 Pro and K3, max for K2.8
+  Preview), and never `none`; `kimi-for-coding` sends `reasoning_effort`
+  instead of K2.7-code's `thinking` object. K3.1 Pro and K3 declare a
+  262,144-token window, the one every plan gets (1,048,576 needs Pro or
+  Allegretto). The Anthropic-compatible surface is not offered yet: Kimi does
+  not document how a Messages request turns thinking on, and K3.1 Pro
+  refuses a request with thinking off. Quotes stay unknown.
 - **`SessionHost` resolves model names as the daemon does, when the Host
   asks** (part of #445). With the new `Options.models` (a
   `session_host.ModelPolicy`: a borrowed `model_tiers.TierTable` and the
@@ -95,6 +130,23 @@ status, compatibility boundaries, and entry points are defined by
   due and fires once there is room, so none is lost. A team lead's inbox is
   read under the same bound. `AgentSession.takeDueCronPrompts` and
   `CronRegistry.collectDue` take the limit as a new argument.
+
+- **A run that finds no credential names the command that was run in its
+  sign-in hint, and lists the default sign-in first** (#482). Run as
+  `metacodes-dev`, a side-by-side development install (`scripts/install.sh
+  --dev`) said to run `metacodes login …`, which signs in the release
+  install, whose state root is separate; and the list left out the bare
+  `metacodes login` that a plain launch reads. The hint now opens with
+  `<command> login`, and its other lines, the incomplete-login message, the
+  Metask session messages and a named provider's credential help name the
+  same command. The launcher `metacodes install` writes now exports its own
+  path as `METACODES_LAUNCHER`, because the executable it `exec`s starts as
+  `<prefix>/bin/metacodes` for every install. The executable believes the
+  variable only when that file is a launcher that execs it; otherwise it
+  takes argv[0] (a symlink under another name), then `metacodes`. A
+  launcher written before this keeps the hint at `metacodes` until
+  `scripts/install.sh` writes it again; `metacodes update` leaves launchers
+  as they are.
 
 - **A `CronCreate` with only `delaySeconds` fires once, as the tool says.**
   `recurring` defaulted to true without a `cron` expression too, so the job

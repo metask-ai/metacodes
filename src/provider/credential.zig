@@ -36,6 +36,9 @@ pub const CredentialKind = enum {
     openai_codex_oauth,
     /// Coding Plan keys are billed and scoped separately from general Z.AI keys.
     zai_coding_plan_api_key,
+    /// Kimi Code subscription keys: a separate account and quota from the
+    /// Moonshot open platform, whose keys and base URLs are not interchangeable.
+    kimi_code_api_key,
 
     pub fn id(self: CredentialKind) []const u8 {
         return @tagName(self);
@@ -51,7 +54,7 @@ pub const CredentialKind = enum {
     pub fn isOAuth(self: CredentialKind) bool {
         return switch (self) {
             .metask_oauth, .openai_oauth, .openai_codex_oauth => true,
-            .api_key, .zai_coding_plan_api_key => false,
+            .api_key, .zai_coding_plan_api_key, .kimi_code_api_key => false,
         };
     }
 };
