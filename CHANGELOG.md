@@ -57,6 +57,20 @@ status, compatibility boundaries, and entry points are defined by
   `O_EXCL` (`harness.LogFile`), and reads it to EOF instead of with one
   bounded `read`; a log larger than the buffer is an error, not a cut.
 
+- **Two tests no longer assume `/bin/sleep` and `/bin/echo` are regular
+  files.** Ubuntu 26.04, now GitHub's `ubuntu-latest`, ships the Rust
+  coreutils (uutils): `/usr/bin/sleep` and `/usr/bin/echo` are symlinks
+  into `/usr/lib/cargo/bin/coreutils/`, to a multi-call binary that acts as
+  the command it is run as. There the `process_scan` test looked for its
+  `/bin/sleep` child under `/usr/bin`, which the child does not run from,
+  and the formal runtime's hash-mismatch test failed with `OpenFailed`
+  before its comparison, since `hashChecker` does not follow a symlink.
+  Both failed on every run, so `Gates (Linux)` failed for every pull
+  request. The first now scans the directory of the program's real path
+  and still spawns `/bin/sleep` by that name; the second hashes an
+  executable it writes into a temporary directory. Product code is
+  unchanged.
+
 ## 0.12.0 — 2026-11-13
 
 ### Changed
