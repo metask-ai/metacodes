@@ -358,6 +358,16 @@ Session 不变更期间有效；每个 Run 自动计账，checkpoint 恢复（`R
 team 成员由 Host 在 create/restore 时提供，不进 checkpoint。AgentCore 的 `team` 表
 （`describe`/`poll`）就是它的封装。
 
+### 定时 prompt（cron，issue #445）
+
+`RuntimeConfig.enable_cron` 打开后，cron 工具（`CronCreate`/`CronDelete`/`CronList`）
+进入目录（不能经显式 `builtin_tools` 列表进入）；选了其中任一工具的 `AgentSession`
+自带一个 `CronRegistry`，随 Session 生灭、不落盘、不进 checkpoint。工具只负责登记：
+到期的 prompt 由 Host 在 Session 空闲时用 `takeDueCronPrompts(allocator)` 取走
+（运行中 `error.SessionBusy`），`cronJobCount()` 报当前登记数。`SessionHost` 的
+driver 就这样做：队列空闲时至多每 `cron_poll_ms` 取一次，每条到期 prompt 成为一个
+`source = "session_host"`、`kind = "cron_fired"` 的 Run。C ABI 不提供 cron 工具。
+
 ### 模型能力声明
 
 `SessionConfig.model_capabilities`（`[]const core.image_capability.Declaration`，

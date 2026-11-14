@@ -48,6 +48,7 @@ const swarm_team = @import("../swarm/team.zig");
 const swarm_mailbox = @import("../swarm/mailbox.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const run_input = @import("run_input.zig");
+const CronRegistry = @import("cron_registry.zig").CronRegistry;
 
 pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_party_plugins.ARTIFACT_TOOLS;
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
@@ -69,6 +70,18 @@ pub const SESSION_BUILTIN_TOOLS = DEFAULT_BUILTIN_TOOLS ++ [_][]const u8{"AskUse
 /// the process-level-tool exclusion. `SpawnTeammate` records a host spawn
 /// request; the Host, not the runtime, creates the teammate Session.
 pub const TEAM_BUILTIN_TOOLS = [_][]const u8{ "TeamCreate", "TeamDelete", "SendMessage", "SpawnTeammate" };
+
+/// Issue #445: the cron tools, admissible only when the Runtime enables cron
+/// (`RuntimeConfig.enable_cron`). Their whole dependency is the Session's own
+/// `CronRegistry`, which lives as long as the Session and is never persisted
+/// (as the CLI's `App` keeps it). The tools only schedule: a prompt fires when
+/// the Session's Host takes it with `takeDueCronPrompts` while the Session is
+/// idle, as `SessionHost` does, so the C ABI does not offer them.
+pub const CRON_BUILTIN_TOOLS = [_][]const u8{ "CronCreate", "CronDelete", "CronList" };
+
+pub fn isCronBuiltin(name: []const u8) bool {
+    return containsToolName(&CRON_BUILTIN_TOOLS, name);
+}
 
 pub fn isTeamBuiltin(name: []const u8) bool {
     for (TEAM_BUILTIN_TOOLS) |supported| {
@@ -258,6 +271,11 @@ pub const RuntimeConfig = struct {
     /// catalog so team Sessions can select them. Off by default — teams are
     /// opt-in, as `--agent-teams` is in the CLI.
     enable_teams: bool = false,
+    /// Issue #445: admit the cron tools (`CRON_BUILTIN_TOOLS`) into the
+    /// catalog so Sessions can select them. Off by default: a Session's
+    /// cron prompts fire only through a Host that takes them
+    /// (`AgentSession.takeDueCronPrompts`), which `SessionHost` does.
+    enable_cron: bool = false,
 };
 
 pub const HostSyncTool = tool_catalog.HostSyncTool;
@@ -352,6 +370,7 @@ pub const AgentRuntime = struct {
         if (config.builtin_tools) |explicit| {
             for (explicit) |name| {
                 if (isTeamBuiltin(name)) return error.UnsupportedBuiltinTool; // team tools come from enable_teams, not the explicit list
+                if (isCronBuiltin(name)) return error.UnsupportedBuiltinTool; // cron tools come from enable_cron
                 if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
             }
         }
@@ -387,7 +406,13 @@ pub const AgentRuntime = struct {
                 if (!containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
             }
         }
+        if (config.enable_cron) {
+            for (CRON_BUILTIN_TOOLS) |name| {
+                if (!containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
+            }
+        }
         for (builtin_tools.items) |name| {
+            if (config.enable_cron and isCronBuiltin(name)) continue;
             if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
         }
         const catalog = try tool_catalog.Catalog.initWithExecutors(
@@ -1461,6 +1486,10 @@ pub const AgentSession = struct {
     tools: tool_catalog.Selection,
     read_state: ReadState,
     jobs: ?JobRegistry,
+    /// Issue #445: the Session's scheduled prompts, present when it selected
+    /// a cron tool. The cron tools change it during a Run and
+    /// `takeDueCronPrompts` while idle; never persisted.
+    cron: ?CronRegistry = null,
     session_rules: SessionRules,
     imported_permission_rules: ?permission_settings.MergedSettings,
     permission_ctx: permission.PermissionContext,
@@ -1613,6 +1642,11 @@ pub const AgentSession = struct {
             jobs = try JobRegistry.init(allocator);
         }
         errdefer if (jobs) |*registry| registry.deinit();
+        var cron: ?CronRegistry = null;
+        for (CRON_BUILTIN_TOOLS) |name| {
+            if (cron == null and selected_tools.contains(name)) cron = CronRegistry.init(allocator);
+        }
+        errdefer if (cron) |*registry| registry.deinit();
         var imported_permission_rules: ?permission_settings.MergedSettings =
             if (config.permission_rules) |rules|
                 if (rules.isEmpty())
@@ -1713,6 +1747,7 @@ pub const AgentSession = struct {
             .tools = selected_tools,
             .read_state = ReadState.init(allocator),
             .jobs = jobs,
+            .cron = cron,
             .session_rules = .{},
             .imported_permission_rules = imported_permission_rules,
             .permission_ctx = permission_ctx,
@@ -1795,6 +1830,7 @@ pub const AgentSession = struct {
         self.conversation.deinit();
         self.run_inputs.deinit();
         if (self.jobs) |*registry| registry.deinit();
+        if (self.cron) |*registry| registry.deinit();
         if (self.imported_permission_rules) |*rules| rules.deinit();
         self.read_state.deinit();
         self.tools.deinit();
@@ -2119,6 +2155,32 @@ pub const AgentSession = struct {
         std.debug.assert(self.state == .mutating);
         self.state = .idle;
         self.mutex.unlock();
+    }
+
+    /// Issue #445: the prompts of the cron jobs due now, in the order the
+    /// jobs were created, owned by `allocator` (free each and the slice). A
+    /// recurring job is rescheduled and a one-shot job removed
+    /// (`CronRegistry.collectDue`). Empty for a Session without cron tools.
+    /// Only while idle: a Run's cron tools change the same registry.
+    pub fn takeDueCronPrompts(
+        self: *AgentSession,
+        allocator: std.mem.Allocator,
+    ) error{ OutOfMemory, SessionBusy, InvalidSessionState }![]const []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => return error.SessionBusy,
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+        const registry = if (self.cron) |*registry| registry else return &.{};
+        return registry.collectDue(allocator);
+    }
+
+    /// Issue #445: how many cron jobs the Session has scheduled; 0 without
+    /// cron tools. Read it between Runs, when no cron tool runs.
+    pub fn cronJobCount(self: *const AgentSession) usize {
+        return if (self.cron) |*registry| registry.count() else 0;
     }
 
     /// Replace the Session's reasoning effort at the idle mutation boundary;
@@ -2800,6 +2862,7 @@ pub const AgentSession = struct {
             .abort = &self.abort_signal,
             .read_state = &self.read_state,
             .jobs = if (self.jobs) |*registry| registry else null,
+            .cron_registry = if (self.cron) |*registry| registry else null,
             .provider_factory = self.toolProviderFactory(),
             .tool_defs = tool_definitions,
             .tool_dispatcher = tool_dispatcher,
