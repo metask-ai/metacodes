@@ -37,6 +37,10 @@ empty `### Migration`.
   embedded Session's Runs the daemon's project rule gate and abandoned-Run
   policy (#445); `SessionConfigV1` has no such field, and an ABI Session's
   Runs open the journal as before.
+- No change a Host can see. The Zig `SessionHost.setModelCatalog` replaces
+  the catalog `Options.models` resolves model names against while the Host
+  runs (#445); ABI revision 28 exposes neither `SessionHost` nor
+  `ModelPolicy`.
 
 ### Fixed
 
