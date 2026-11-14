@@ -35,6 +35,7 @@ pub const gemini = @import("profiles/gemini.zig");
 pub const zai_coding_plan = @import("profiles/zai_coding_plan.zig");
 pub const deepseek = @import("profiles/deepseek.zig");
 pub const kimi = @import("profiles/kimi.zig");
+pub const kimi_code = @import("profiles/kimi_code.zig");
 pub const qwen = @import("profiles/qwen.zig");
 pub const minimax = @import("profiles/minimax.zig");
 pub const bedrock = @import("profiles/bedrock.zig");
@@ -50,6 +51,7 @@ pub const BUILTIN_PROFILES = [_]ProviderProfile{
     zai_coding_plan.PROFILE,
     deepseek.PROFILE,
     kimi.PROFILE,
+    kimi_code.PROFILE,
     qwen.PROFILE,
     minimax.PROFILE,
     bedrock.PROFILE,
