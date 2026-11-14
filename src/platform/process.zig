@@ -1819,7 +1819,7 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
 
     var capped = std.atomic.Value(bool).init(false);
     var out_reader = WinReader{ .handle = out_rd, .list = &out, .allocator = allocator, .max_bytes = opts.max_bytes, .capped = &capped };
-    const out_thread = std.Thread.spawn(.{}, WinReader.run, .{&out_reader}) catch {
+    const out_thread = @import("thread.zig").spawn(.full, WinReader.run, .{&out_reader}) catch {
         win.CloseHandle(out_rd);
         if (err_rd) |h| win.CloseHandle(h);
         win.CloseHandle(pi.hProcess);
@@ -1830,7 +1830,7 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
     var err_thread: ?std.Thread = null;
     if (err_rd) |h| {
         err_reader = WinReader{ .handle = h, .list = &err, .allocator = allocator, .max_bytes = opts.max_bytes, .capped = &capped };
-        err_thread = std.Thread.spawn(.{}, WinReader.run, .{&err_reader}) catch null;
+        err_thread = @import("thread.zig").spawn(.full, WinReader.run, .{&err_reader}) catch null;
     }
 
     // 分片轮询等进程：每 100ms 查 abort/timeout/tick。

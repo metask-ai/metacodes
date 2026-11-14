@@ -118,6 +118,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **An idle AgentCore Session no longer holds about 50 MB of private commit
+  on Windows** (#503). Zig 0.16's `std.Thread.spawn` hands its 16 MiB
+  default stack to `NtCreateThreadEx` as the stack *commit*, so each thread
+  charges 16 MiB of private commit for its whole life; on POSIX it is only a
+  reservation. A Session that had streamed one Run kept three: its
+  provider's two `std.Io.Threaded` pool workers and the stream liveness
+  monitor. Pool workers created through `platform.signal.threadedIo` now get
+  a 2 MiB stack (a whole HTTPS exchange peaks at 544 KiB in Debug), and the
+  liveness monitor runs on a 256 KiB stack and exits once no request is left
+  to watch, coming back with the next one; an idle Session no longer wakes
+  every 250 ms either. Measured on Windows 10 x64 with four idle Sessions:
+  49,351 KiB and 3 threads per Session before, 4,231 KiB and 2 threads
+  after. Every production thread now spawns through
+  `platform.thread.spawn` with a named stack class (`waiter`, `io_worker`,
+  `full`); the others keep std's 16 MiB as `full`, unchanged.
+  `zig build test:thread-stack` (part of `test:units`) refuses a direct
+  `std.Thread.spawn` outside test blocks.
 - **The permission check and the tool read one spelling of a call's
   arguments** (#494). Arguments that named a key twice (`"-i"` twice in a
   `Grep` call, `file_path` twice in a `Read` call) failed the strict parse

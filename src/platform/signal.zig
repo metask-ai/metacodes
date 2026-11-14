@@ -61,8 +61,17 @@ fn setBrokenPipe(handler: @FieldType(std.posix.Sigaction, "handler")) void {
 /// 设回 SIG_IGN,并把实例记下的"旧值"也换成 SIG_IGN,所以 deinit 还原出来的仍是 SIG_IGN。
 /// SIGIO 处理器(取消机制靠它打断阻塞调用)原样保留。子进程在 exec 前经
 /// defaultBrokenPipeInChild 恢复默认 SIGPIPE。
+///
+/// Pool workers get `thread.Stack.io_worker` (#503): std's default stack is a
+/// 16 MiB commit per worker on Windows, held for the Io's whole life. A caller
+/// that needs another size states it in `options.stack_size`; std's default is
+/// the one size this cannot be asked for, so work that needs a `full` stack
+/// runs on a `thread.spawn(.full, ...)` thread, not in an Io task.
 pub fn threadedIo(gpa: std.mem.Allocator, options: std.Io.Threaded.InitOptions) std.Io.Threaded {
-    var threaded = std.Io.Threaded.init(gpa, options);
+    var stated = options;
+    if (stated.stack_size == std.Thread.SpawnConfig.default_stack_size)
+        stated.stack_size = @import("thread.zig").Stack.io_worker.bytes();
+    var threaded = std.Io.Threaded.init(gpa, stated);
     if (builtin.is_test or g_keep_broken_pipe_ignored.load(.acquire)) keepBrokenPipeIgnored(&threaded);
     return threaded;
 }
@@ -279,7 +288,7 @@ fn recvUnderSigpipe() !RecvOutcome {
         }
     };
     var reader: Reader = .{ .sock = server };
-    const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    const thread = try @import("thread.zig").spawn(.full, Reader.run, .{&reader});
     while (!reader.started.load(.acquire)) std.Thread.yield() catch {};
     var rounds: usize = 0;
     while (rounds < 15 and !reader.finished.load(.acquire)) : (rounds += 1) {

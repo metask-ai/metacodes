@@ -82,7 +82,7 @@ pub const SessionHost = struct {
     }
 
     pub fn start(self: *SessionHost) !void {
-        self.thread = try std.Thread.spawn(.{}, driverTrampoline, .{self});
+        self.thread = try @import("platform").thread.spawn(.full, driverTrampoline, .{self});
     }
 
     fn driverTrampoline(self: *SessionHost) void {

@@ -17,6 +17,8 @@ pub const dir = @import("dir.zig");
 pub const exe_lookup = @import("exe_lookup.zig");
 pub const timezone = @import("timezone.zig");
 pub const process_scan = @import("process_scan.zig");
+/// Thread creation with a stated stack class (#503); see the file header.
+pub const thread = @import("thread.zig");
 /// 测试夹具(symlink-or-skip / junction / 目录枚举断言 / 按 tick 早醒的虚拟时钟)。只在 test 块里用;见文件头。
 pub const test_support = @import("test_support.zig");
 

@@ -2564,6 +2564,18 @@ pub fn build(b: *std.Build) void {
     const io_threaded_test_step = b.step("test:io-threaded", "Test that std.Io.Threaded is created only through platform.signal.threadedIo");
     io_threaded_test_step.dependOn(&io_threaded_test_cmd.step);
     units_test_step.dependOn(&io_threaded_test_cmd.step);
+    // Production threads state their stack through platform.thread.spawn: std's
+    // 16 MiB default is a 16 MiB commit per thread on Windows (#503).
+    const thread_stack_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_thread_stack_discipline",
+        "-v",
+    });
+    const thread_stack_test_step = b.step("test:thread-stack", "Test that production threads spawn through platform.thread.spawn with a stated stack");
+    thread_stack_test_step.dependOn(&thread_stack_test_cmd.step);
+    units_test_step.dependOn(&thread_stack_test_cmd.step);
     // The REPL's SIGWINCH handler has no SA_RESTART: its terminal reads retry
     // EINTR and its terminal writes go through pfs.writeAll (#340).
     const terminal_io_test_cmd = b.addSystemCommand(&.{
