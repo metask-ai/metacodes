@@ -33,6 +33,10 @@ empty `### Migration`.
   jobs in its `Snapshot`, cancels them by command, and keeps fired cron
   prompts within `max_queued` (#493); ABI revision 28 exposes neither
   `SessionHost` nor the cron tools.
+- No change a Host can see. The Zig `SessionConfig.run_control` gives an
+  embedded Session's Runs the daemon's project rule gate and abandoned-Run
+  policy (#445); `SessionConfigV1` has no such field, and an ABI Session's
+  Runs open the journal as before.
 
 ### Fixed
 

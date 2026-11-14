@@ -44,6 +44,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **An embedded Session's Runs can be gated by the project's rules, as the
+  daemon's are** (part of #445). `SessionConfig.run_control` opens, for every
+  Run on a durable `run_journal`, the `RunControl` the bundled daemon opens:
+  with `project_rules = .enforced`, an active bundle in
+  `<dirname(run journal root)>/project-rules` for the workspace root is
+  re-attested before the provider request, decides each tool call through
+  the project kernel, and publishes the Run's operational observer after it;
+  a missing or invalid kernel configuration, a bundle that fails
+  attestation, or a running background job or active team fails the Run
+  before any provider request. `abandoned_run = .record_abandoned` closes a
+  Run whose process died as abandoned and runs the next one, as the daemon
+  does; the default stays `fail_closed`. Either setting on an ephemeral
+  Session is refused (`RunControlRequiresRunJournal`), and a Session that
+  enforces project rules refuses an isolated executor Run
+  (`ProjectRulesUnsupportedForIsolatedRun`), which the gate cannot reach.
+  The default (`project_rules = .ignored`) reads no bundle, as before.
+
 - **Built-in Kimi Code provider** (#487). `--provider kimi-code` (alias
   `kimi-coding-plan`) uses a Kimi Code subscription: requests go to
   `https://api.kimi.com/coding/v1` (`global-*` channels:

@@ -5011,3 +5011,212 @@ test "dispatch_started 记录真实 within_root(根外 false/根内 true)" {
     try std.testing.expect(std.mem.indexOf(u8, outside_line.?, "\"within_root\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, inside_line.?, "\"within_root\":true") != null);
 }
+
+fn hostedTextSse(comptime text: []const u8) []const u8 {
+    return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" ++ text ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+}
+
+fn hostedToolSse(allocator: std.mem.Allocator, name: []const u8, input_json: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{s}\"}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+        "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+        "data: {{\"type\":\"message_stop\"}}\n\n", .{ name, input_json });
+}
+
+/// Waits until `needle` occurs in at least `count` journal lines.
+fn waitForHosted(journal: *cc.event_journal.EventJournal, needle: []const u8, count: usize) !void {
+    const allocator = std.testing.allocator;
+    var waited: u64 = 0;
+    while (waited < 20_000) : (waited += 20) {
+        var seen: usize = 0;
+        if (try journal.waitSince(allocator, 0, 20)) |lines| {
+            defer {
+                for (lines) |line| allocator.free(line);
+                allocator.free(lines);
+            }
+            for (lines) |line| {
+                if (std.mem.indexOf(u8, line, needle) != null) seen += 1;
+            }
+        }
+        if (seen >= count) return;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    }
+    std.debug.print("journal never showed {d}x {s}\n", .{ count, needle });
+    return error.JournalTimeout;
+}
+
+fn countObservations(session_dir: []const u8) !usize {
+    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, session_dir, .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (try it.next(std.testing.io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, cc.rule_impact_operational_observation.FILE_PREFIX)) count += 1;
+    }
+    return count;
+}
+
+fn hostedPathExists(path: []const u8) !bool {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+    return pfs.exists(z.ptr);
+}
+
+test "L2 #445 SessionHost project rules: an enforced Session's Runs are gated by the promoted bundle, publish their observer and refuse to run beside a team, as the daemon's RunControl" {
+    const config = (try testKernel()) orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    _ = harness.normalizeSlashes(root_buffer[0..root_len]);
+    const root = root_buffer[0..root_len];
+    // The daemon's layout: each Session's Run journal in its own session
+    // directory, the project's bundle beside them.
+    const lead_dir = try std.fmt.allocPrint(allocator, "{s}/sessions/lead", .{root});
+    defer allocator.free(lead_dir);
+    const solo_dir = try std.fmt.allocPrint(allocator, "{s}/sessions/solo", .{root});
+    defer allocator.free(solo_dir);
+    const ignored_dir = try std.fmt.allocPrint(allocator, "{s}/sessions/ignored", .{root});
+    defer allocator.free(ignored_dir);
+    const rules_dir = try std.fmt.allocPrint(allocator, "{s}/sessions/project-rules", .{root});
+    defer allocator.free(rules_dir);
+    const project = cc.project_rule_bundle.projectIdentity(root);
+    const checker_path_z = try allocator.dupeZ(u8, config.checker_path);
+    defer allocator.free(checker_path_z);
+    const checker_hash_z = try allocator.dupeZ(u8, &config.expected_sha256);
+    defer allocator.free(checker_hash_z);
+    @import("platform").paths.setEnv("METACODES_PROJECT_KERNEL_PATH", checker_path_z.ptr);
+    defer @import("platform").paths.unsetEnv("METACODES_PROJECT_KERNEL_PATH");
+    @import("platform").paths.setEnv("METACODES_PROJECT_KERNEL_SHA256", checker_hash_z.ptr);
+    defer @import("platform").paths.unsetEnv("METACODES_PROJECT_KERNEL_SHA256");
+
+    const denied_path = try std.fmt.allocPrint(allocator, "{s}/denied.txt", .{root});
+    defer allocator.free(denied_path);
+    const allowed_path = try std.fmt.allocPrint(allocator, "{s}/allowed.txt", .{root});
+    defer allocator.free(allowed_path);
+    const denied_input = try std.fmt.allocPrint(allocator, "{{\\\"file_path\\\":\\\"{s}\\\",\\\"content\\\":\\\"x\\\"}}", .{denied_path});
+    defer allocator.free(denied_input);
+    const allowed_input = try std.fmt.allocPrint(allocator, "{{\\\"file_path\\\":\\\"{s}\\\",\\\"content\\\":\\\"x\\\"}}", .{allowed_path});
+    defer allocator.free(allowed_input);
+    const write_denied = try hostedToolSse(allocator, "Write", denied_input);
+    defer allocator.free(write_denied);
+    const write_allowed = try hostedToolSse(allocator, "Write", allowed_input);
+    defer allocator.free(write_allowed);
+    const team_create = try hostedToolSse(allocator, "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}");
+    defer allocator.free(team_create);
+    // The lead's TeamCreate, the solo Session's gated Write, the ignored
+    // Session's Write; each followed by the model's answer.
+    const bodies = [_][]const u8{
+        team_create,   hostedTextSse("formed"),
+        write_denied,  hostedTextSse("gated"),
+        write_allowed, hostedTextSse("written"),
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(allocator, .{ .builtin_tools = &.{"Write"}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = cc.session_host.SessionHost.init(allocator, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    var session_config: cc.agent_session.SessionConfig = .{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .home = root, .state_root = root, .shell = .disabled },
+        .allowed_tools = &.{ "Write", "TeamCreate" },
+        .run_journal = .{ .exact_root = lead_dir },
+        .run_control = .{ .project_rules = .enforced },
+        .team = .{ .role = .lead, .team_name = "" },
+    };
+    // promoteFixture's journal identity: one session journal, one id.
+    const lead_id = cc.session_id.SessionId.fromSlice("fedcba9876543210fedcba98").?;
+    const lead = try host.open(.{ .config = session_config, .id = lead_id });
+    defer host.release(lead);
+
+    // No bundle yet: the gate admits nothing it does not know of, and the
+    // lead forms its team.
+    try lead.submit(.{ .text = "form a team" });
+    try waitForHosted(&lead.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 0), try countObservations(lead_dir));
+
+    const promoted = try promoteFixture(
+        allocator,
+        lead_dir,
+        rules_dir,
+        project,
+        config,
+        .{
+            .target = .{ .tool = "Write" },
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        },
+        "def spec : RuleSpec := { targetTool := \"Write\", denyTarget := true, maxInputBytes := 8192, maxAgentDepth := 4, authoritativeOnly := true, effectRequirement := .none }; theorem spec_valid : valid spec = true := by rfl",
+    );
+    try std.testing.expect(promoted.revision > 0);
+
+    // With the bundle active, the team is a detached worker the gate cannot
+    // see: the lead's next Run is refused before any provider request.
+    try lead.submit(.{ .text = "and now" });
+    try waitForHosted(&lead.journal, "\"stop_reason\":null,\"error_name\":\"ProjectRulesRequireDetachedWorkersIdle\"", 1);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+
+    // A Session without a team: permissions allow the Write, the bundle's
+    // rule blocks it before dispatch.
+    session_config.run_journal = .{ .exact_root = solo_dir };
+    session_config.team = null;
+    const solo = try host.open(.{ .config = session_config });
+    defer host.release(solo);
+    try solo.submit(.{ .text = "write it" });
+    try waitForHosted(&solo.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countHosted(&solo.journal, "\"stop_reason\":\"end_turn\""));
+    try std.testing.expectEqual(@as(usize, 1), try countHosted(&solo.journal, "project_rule_blocked"));
+    try std.testing.expect(!try hostedPathExists(denied_path));
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, server.requestAt(3).?.body(), "project_rule_blocked") != null);
+    // After the Run the bundle was re-attested and the Run's operational
+    // observer published beside its journal.
+    try std.testing.expectEqual(@as(usize, 1), try countObservations(solo_dir));
+
+    // The same bundle does not govern a Session that leaves project rules
+    // ignored: its Write runs.
+    session_config.run_journal = .{ .exact_root = ignored_dir };
+    session_config.run_control = .{};
+    const ignored = try host.open(.{ .config = session_config });
+    defer host.release(ignored);
+    try ignored.submit(.{ .text = "write it" });
+    try waitForHosted(&ignored.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expect(try hostedPathExists(allowed_path));
+    try std.testing.expectEqual(@as(usize, 0), try countHosted(&ignored.journal, "project_rule_blocked"));
+    try std.testing.expectEqual(@as(usize, 6), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 0), try countObservations(ignored_dir));
+}
+
+fn countHosted(journal: *cc.event_journal.EventJournal, needle: []const u8) !usize {
+    const allocator = std.testing.allocator;
+    const lines = (try journal.waitSince(allocator, 0, 1)) orelse return 0;
+    defer {
+        for (lines) |line| allocator.free(line);
+        allocator.free(lines);
+    }
+    var seen: usize = 0;
+    for (lines) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null) seen += 1;
+    }
+    return seen;
+}
