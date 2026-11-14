@@ -1132,10 +1132,13 @@ leaving every Host to rebuild them:
 - The queue holds `max_queued` (64) submissions and commands. Beyond it
   `submit` and `command` refuse with `error.QueueFull` and hold nothing (an
   HTTP Host: `429`); a duplicate is answered as one before the bound is
-  checked. `snapshot()` reports `queued` and `max_queued`.
+  checked. `snapshot()` reports `queued` and `max_queued`. Runs the
+  driver starts by itself, a cron job's prompt or a team lead's inbox,
+  count against the same bound and never take `queued` past it (#493).
 - `HostedSession.submit` and `command` (`set_model`, `set_permission_mode`,
   `set_reasoning_effort`, `set_additional_directories`, `set_prompt_profile`,
-  `update_permission_rules`, `compact`) share one FIFO run by the Session's
+  `update_permission_rules`, `compact`, `cancel_cron_job`,
+  `cancel_all_cron_jobs`) share one FIFO run by the Session's
   driver thread, so configuration changes apply between Runs in the order
   they were queued. Each command is answered by `command_result`. As the
   `--web`/`serve` config sink journals `/model`, `/mode`, `/effort` and
@@ -1190,6 +1193,31 @@ leaving every Host to rebuild them:
   reaches the provider only through a submission template. A job never fires
   during a Run or ahead of queued work, and its jobs close with the Session
   (they are not persisted, as in the CLI).
+- A Host sees and stops a Session's cron jobs without a Run (#493).
+  `snapshot().cron_jobs` lists them oldest first, each a
+  `session_host.CronJob`: `id` (a `CronJobId`, the 12 hex digits
+  `CronCreate` gave the model), `next_fire_unix` (unix seconds) and
+  `schedule`, `.once` or `.recurring` with its cron expression; the prompt
+  stays with the model. The list is as of the last time the Session was
+  between Runs: a job a Run creates or deletes shows from its `run_done` on,
+  and a one-shot job is gone once it fired. `command(.{ .cancel_cron_job =
+  id })` removes one job and `command(.cancel_all_cron_jobs)` all of them, in
+  queue order like any command; neither job fires again, and a prompt
+  already fired and queued still runs. Each is answered by `command_result`
+  (`cancel_cron_job`, `cancel_all_cron_jobs`), by which time `snapshot()`
+  shows the change; an id the Session does not have is `ok: false`,
+  `error_name: "CronJobNotFound"`. `CronJobId.parse(text)` takes a Host's
+  text and refuses anything but 12 lowercase hex digits
+  (`error.InvalidCronJobId`).
+- Fired prompts count against `max_queued` (#493): the driver takes only
+  as many due prompts as the queue has room for, oldest job first, and a
+  job left out stays due, untouched, and fires once the queue has room. So
+  `queued` never passes `max_queued` and no prompt is lost; a recurring job
+  is rescheduled, and a one-shot job removed, only when its prompt is
+  taken. `AgentSession.takeDueCronPrompts(allocator, limit)` takes that
+  limit; `cronJobs`, `cancelCronJob` and `cancelAllCronJobs` are the idle-only
+  reads and changes the SessionHost makes. A team lead's inbox is read only
+  while the queue has room.
 - With `Options.teammates` (a `TeammateFactory`), the SessionHost also
   fulfils the lead's `SpawnTeammate` requests, as the daemon's `App` starts
   its teammates: after each Run the lead's driver takes the pending requests

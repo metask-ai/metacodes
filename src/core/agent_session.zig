@@ -48,7 +48,11 @@ const swarm_team = @import("../swarm/team.zig");
 const swarm_mailbox = @import("../swarm/mailbox.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const run_input = @import("run_input.zig");
-const CronRegistry = @import("cron_registry.zig").CronRegistry;
+const cron_registry = @import("cron_registry.zig");
+const CronRegistry = cron_registry.CronRegistry;
+
+/// Why a Host could not read or change a Session's cron jobs.
+pub const CronAccessError = error{ OutOfMemory, SessionBusy, InvalidSessionState };
 
 pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_party_plugins.ARTIFACT_TOOLS;
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
@@ -2161,26 +2165,72 @@ pub const AgentSession = struct {
     /// jobs were created, owned by `allocator` (free each and the slice). A
     /// recurring job is rescheduled and a one-shot job removed
     /// (`CronRegistry.collectDue`). Empty for a Session without cron tools.
-    /// Only while idle: a Run's cron tools change the same registry.
+    /// At most `limit` prompts (#493): a job due past it stays due, untouched,
+    /// for a later call. Only while idle: a Run's cron tools change the same
+    /// registry.
     pub fn takeDueCronPrompts(
         self: *AgentSession,
         allocator: std.mem.Allocator,
-    ) error{ OutOfMemory, SessionBusy, InvalidSessionState }![]const []const u8 {
+        limit: usize,
+    ) CronAccessError![]const []const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        switch (self.state) {
-            .idle => {},
-            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => return error.SessionBusy,
-            .poisoned, .destroying => return error.InvalidSessionState,
-        }
+        try self.requireIdleForCron();
         const registry = if (self.cron) |*registry| registry else return &.{};
-        return registry.collectDue(allocator);
+        return registry.collectDue(allocator, limit);
     }
 
     /// Issue #445: how many cron jobs the Session has scheduled; 0 without
     /// cron tools. Read it between Runs, when no cron tool runs.
     pub fn cronJobCount(self: *const AgentSession) usize {
         return if (self.cron) |*registry| registry.count() else 0;
+    }
+
+    /// Issue #493: how many cron jobs are due now; 0 without cron tools.
+    /// Read it between Runs, as `cronJobCount`.
+    pub fn cronDueCount(self: *const AgentSession) usize {
+        return if (self.cron) |*registry| registry.dueCount() else 0;
+    }
+
+    /// Issue #493: the Session's cron jobs as a Host sees them (id, next
+    /// fire, schedule), in the order they were created, owned by `allocator`
+    /// (`cron_registry.freeViews`). Empty without cron tools. Only while
+    /// idle, as `takeDueCronPrompts`.
+    pub fn cronJobs(self: *AgentSession, allocator: std.mem.Allocator) CronAccessError![]cron_registry.JobView {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.requireIdleForCron();
+        const registry = if (self.cron) |*registry| registry else return allocator.alloc(cron_registry.JobView, 0);
+        return registry.list(allocator);
+    }
+
+    /// Issue #493: removes cron job `id` without a Run, so it never fires
+    /// again; whether the Session had it. Only while idle.
+    pub fn cancelCronJob(self: *AgentSession, id: cron_registry.JobId) CronAccessError!bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.requireIdleForCron();
+        const registry = if (self.cron) |*registry| registry else return false;
+        return registry.remove(id);
+    }
+
+    /// Issue #493: removes every cron job without a Run; how many there
+    /// were. Only while idle.
+    pub fn cancelAllCronJobs(self: *AgentSession) CronAccessError!usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.requireIdleForCron();
+        const registry = if (self.cron) |*registry| registry else return 0;
+        return registry.clear();
+    }
+
+    /// Caller holds `mutex`.
+    fn requireIdleForCron(self: *const AgentSession) error{ SessionBusy, InvalidSessionState }!void {
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => return error.SessionBusy,
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
     }
 
     /// Replace the Session's reasoning effort at the idle mutation boundary;
