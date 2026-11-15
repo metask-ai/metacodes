@@ -158,6 +158,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`/model` names the variable and the file for a provider without a key**
+  (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
+  chosen without its key ended in `switch failed (MissingCredentials)`: these
+  providers have neither a sign-in nor a key page the picker could open. The
+  picker now says which provider has no key, the variable to set (the
+  canonical one, e.g. `MOONSHOT_API_KEY`), this install's
+  `<state root>/.env` and the guide (`doc/LOCAL_CONFIG.md`); the previous
+  route stays active. A notice longer than the terminal is wide is broken
+  into rows inside the width instead of running past it.
 - **An idle AgentCore Session no longer holds about 50 MB of private commit
   on Windows** (#503). Zig 0.16's `std.Thread.spawn` hands its 16 MiB
   default stack to `NtCreateThreadEx` as the stack *commit*, so each thread
