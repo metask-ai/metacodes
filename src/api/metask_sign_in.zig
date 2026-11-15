@@ -317,9 +317,16 @@ test "a sign-in that never gets its callback is cancelled, and nothing is kept" 
 
     var spins: usize = 0;
     var buffer: [TRANSCRIPT_CAPACITY]u8 = undefined;
-    while (std.mem.indexOf(u8, worker.copyTranscript(&buffer), "Open this URL") == null and spins < 1_000) : (spins += 1)
+    // The instructions arrive in several writes, the URL to open after the
+    // line that introduces it: wait for the URL itself. Its redirect is the
+    // loopback callback, form-encoded like every query value.
+    const callback = "redirect_uri=http%3A%2F%2Flocalhost%3A";
+    while (std.mem.indexOf(u8, worker.copyTranscript(&buffer), callback) == null and spins < 1_000) : (spins += 1)
         @import("../util/time.zig").sleepMs(10);
-    try std.testing.expect(std.mem.indexOf(u8, worker.copyTranscript(&buffer), "/auth/callback") != null);
+    const transcript = worker.copyTranscript(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Open this URL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, callback) != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "%2Fauth%2Fcallback") != null);
     try std.testing.expectEqual(State.signing_in, worker.currentState());
 
     worker.cancel();
