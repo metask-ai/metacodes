@@ -339,6 +339,24 @@ pub const Host = struct {
         self.refresh() catch return error.OutOfMemory;
     }
 
+    /// The Metask profile the registry holds now, compiled or ingested, for
+    /// a caller that may have to put it back (`restoreMetask`). What it
+    /// points at lives until `destroy`: an ingested profile's arena stays in
+    /// `catalog_arenas`.
+    pub fn metaskProfile(self: *const Host) ?profile_mod.ProviderProfile {
+        const found = self.registry.findById(metask_profile.PROFILE.id) orelse return null;
+        return found.*;
+    }
+
+    /// Put back a Metask profile `metaskProfile` returned, undoing an ingest
+    /// whose purpose failed (a `/login` whose commit did not happen, #485).
+    pub fn restoreMetask(self: *Host, profile: profile_mod.ProviderProfile) HostError!void {
+        try self.registry.checkReplace(profile);
+        try self.registry.reserve(0);
+        self.registry.replaceAssumeCapacity(profile);
+        try self.refresh();
+    }
+
     /// Rebuild the catalog and hand it to the kernel. The previous catalog is
     /// retired rather than freed, so a reader that snapshotted the old pointer
     /// finishes against valid memory.

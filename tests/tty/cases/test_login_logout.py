@@ -22,10 +22,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from tty_driver import READY, case_tmpdir, run, submit, wait_for  # noqa: E402
+from tty_driver import IS_WINDOWS, READY, case_tmpdir, run, submit, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
+from e2e_helpers import SkipTest  # noqa: E402
 from metask_mock import KEY_SECRET, MODEL, MetaskMock, ACCESS_TOKEN, REFRESH_TOKEN  # noqa: E402
 from test_unbound import KEY_VARIABLES  # noqa: E402
+from test_key_login import _cli  # noqa: E402
 
 RELAY_KEY = "sk-relay-tty-env-0001"
 
@@ -192,6 +194,45 @@ def test_a_browser_sign_in_serves_a_stored_metask_default_at_the_next_start(bin_
         assert len(mock.requests) == before
 
 
+def test_cli_login_in_the_browser_forgets_a_stored_default(bin_path):
+    # `metacodes login` is the most recent explicit choice, as /login is: a
+    # stored /model default, which would outrank the sign-in at the next
+    # start, is forgotten, and the run says so.
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock)
+        config = os.path.join(state, "config.json")
+        with open(config, "w") as f:
+            json.dump({"global_selection": {
+                "target": {"kind": "pinned_offer", "offer_id": _metask_offer_id("claude-sonnet-4-6"), "offer_revision": 1},
+                "scope": "global"}}, f)
+        cli_env = {k: v for k, v in os.environ.items() if k not in KEY_VARIABLES}
+        for name, value in env.items():
+            if value is None:
+                cli_env.pop(name, None)
+            else:
+                cli_env[name] = value
+        # The model list is read from the mock; nothing else starts.
+        cli_env.pop("METACODES_NO_PROBE", None)
+        cli_env.update({"METACODES_KG_AUTOSTART": "0", "TERM": "xterm-256color"})
+        code, out = _cli(os.path.abspath(bin_path), ["login"], cli_env, [
+            ("Select API key", "1\r"),
+            ("Select model:", "1\r"),
+            ("Select reasoning effort:", "1\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert "Successfully logged in with Metask OAuth." in text, text
+        assert "Forgot the stored default model: new sessions start on Metask." in text, text
+        with open(config) as f:
+            assert json.load(f).get("global_selection") is None
+        with open(os.path.join(state, "auth.json")) as f:
+            assert json.load(f)["api_key"] == KEY_SECRET
+        for secret in (KEY_SECRET, ACCESS_TOKEN, REFRESH_TOKEN):
+            assert secret.encode() not in out, f"{secret} reached the terminal"
+
+
 def test_login_cancelled_with_esc_changes_nothing(bin_path):
     # The browser never comes back (BROWSER=true opens nothing): Esc ends the wait.
     with MetaskMock() as mock:
@@ -210,6 +251,8 @@ def test_login_cancelled_with_esc_changes_nothing(bin_path):
         if echo is None:
             a._fail("the /login echo is missing")
         a.assert_line_contains(echo + 1, "⎿  Login interrupted · nothing was changed")
+        # While it waited, the pane said what a machine without a browser does.
+        assert b"No browser on this machine? /login metask signs in with a short code instead." in raw
         assert not os.path.exists(os.path.join(state, "auth.json"))
         assert mock.messages == []
         assert not any(p.startswith("/oauth/token") for _, p, _ in mock.requests)

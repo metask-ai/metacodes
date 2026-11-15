@@ -1220,6 +1220,10 @@ pub const MetaskSignInDialog = struct {
                 try p.blank();
                 try self.drawTranscript(p);
                 try p.blank();
+                // A machine with no browser to come back from (#485): the
+                // device-code sign-in needs only a code typed elsewhere.
+                try p.paragraph(p.th.dim, "No browser on this machine? /login metask signs in with a short code instead.");
+                try p.blank();
                 if (self.others.len > 0) {
                     var others_buf: [512]u8 = undefined;
                     try p.paragraph(p.th.dim, std.fmt.bufPrint(&others_buf, "Another provider instead: /login <provider> ({s})", .{self.others}) catch "Another provider instead: /login <provider>");
@@ -1680,6 +1684,16 @@ test "skills: search takes Space as text; Esc clears, then leaves, then closes" 
     try testing.expectEqual(Step.redraw, dialog.key(.esc));
     try testing.expectEqual(SkillsDialog.Mode.list, dialog.mode);
     try testing.expectEqual(Step.done, dialog.key(.esc));
+}
+
+test "metask sign-in: the browser wait names the short-code sign-in for a machine without a browser (#485)" {
+    var dialog = MetaskSignInDialog.init(testing.allocator);
+    defer dialog.deinit();
+    dialog.others = "deepseek, zai-coding-plan";
+    const plain = try renderPlain(&dialog, 120);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "No browser on this machine? /login metask signs in with a short code instead.") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "Another provider instead: /login <provider> (deepseek, zai-coding-plan)") != null);
 }
 
 test "login: no provider to sign in to says how keys are configured" {

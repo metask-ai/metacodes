@@ -838,6 +838,15 @@ pub const Kernel = struct {
         self.session_selection = null;
     }
 
+    /// This session's selection, for a host that puts it back when moving
+    /// the session fails half-way (`/login`, #485; `replaceSessionSelection`
+    /// or `forgetSessionSelection` restores it).
+    pub fn sessionSelection(self: *Kernel) ?RuntimeSelection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.session_selection;
+    }
+
     /// Install the route this session started on, as resolved by `--provider`,
     /// `--offer`, or a stored selection at boot.
     ///

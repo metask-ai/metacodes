@@ -636,8 +636,9 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
 fn browserSignInKey(arena: std.mem.Allocator, state_root: []const u8) ?[]u8 {
     var stored = auth.loadDefault(arena, state_root) catch return null;
     defer stored.deinit(arena);
-    const key = stored.api_key orelse return null;
-    if (std.mem.trim(u8, key, " \t\r\n").len == 0) return null;
+    // The key as it is sent: blanks around it in the file are not part of it.
+    const key = std.mem.trim(u8, stored.api_key orelse return null, " \t\r\n");
+    if (key.len == 0) return null;
     return arena.dupe(u8, key) catch null;
 }
 
@@ -2577,6 +2578,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
             };
             try auth.saveDefault(allocator, state_dir, stored);
             std.debug.print("Successfully logged in with Metask OAuth. API key, model, and reasoning effort were selected. Secrets were not printed.\n", .{});
+            forgetDefaultForSignIn(allocator, state_dir);
             return 0;
         },
         .help => {
@@ -2736,6 +2738,26 @@ fn runModelSelectionForStoredApiKey(allocator: std.mem.Allocator, io: std.Io, st
     }
     const effort_idx = try promptChoice(allocator, efforts.len);
     stored.reasoning_effort = efforts[effort_idx];
+}
+
+/// `metacodes login` in the browser, as `/login` (#485): the sign-in is the
+/// most recent explicit choice, so a stored `/model` default, which would
+/// outrank it at the next start, is forgotten. Says what it did; writes
+/// nothing when none is stored.
+fn forgetDefaultForSignIn(allocator: std.mem.Allocator, state_dir: []const u8) void {
+    var store = provider_config_store.Store.initHome(allocator, state_dir) catch return;
+    defer store.deinit();
+    var document = store.load() catch |err| {
+        std.debug.print("warning: the stored default model could not be read ({s}); the next start may use it\n", .{@errorName(err)});
+        return;
+    };
+    defer document.deinit();
+    if (document.global_selection == null) return;
+    const outcome = provider_config_store.clearGlobalSelection(&store, null) catch |err| {
+        std.debug.print("warning: the stored default model could not be cleared ({s}); the next start may use it\n", .{@errorName(err)});
+        return;
+    };
+    if (outcome.cleared) std.debug.print("Forgot the stored default model: new sessions start on Metask.\n", .{});
 }
 
 fn loginMessagesUrl() []const u8 {
@@ -2962,10 +2984,10 @@ fn logoutMetask(allocator: std.mem.Allocator, state_dir: []const u8) u8 {
     var default_cleared = false;
     if (buildProviderHost(allocator)) |host| {
         defer host.destroy();
-        default_cleared = sign_out_mod.clearMetaskDefault(allocator, state_dir, host.kernel.catalogSnapshot()) catch |err| blk: {
+        default_cleared = (sign_out_mod.clearMetaskDefault(allocator, state_dir, host.kernel.catalogSnapshot()) catch |err| blk: {
             std.debug.print("warning: the stored default could not be checked ({s})\n", .{@errorName(err)});
-            break :blk false;
-        };
+            break :blk null;
+        }) != null;
     }
     if (removed.browser) std.debug.print("Removed the Metask browser sign-in ({s}).\n", .{authPathForDisplay(allocator, state_dir)});
     if (removed.device) std.debug.print("Removed the Metask device-code sign-in and its refresh token ({s}).\n", .{metaskSessionPathForDisplay(allocator, state_dir)});
@@ -4554,6 +4576,28 @@ test "Metask login dispatch uses JSON device flow except token import" {
     try std.testing.expect(!metaskUsesDeviceFlow(.status));
     try std.testing.expect(!metaskUsesDeviceFlow(.api_key));
     try std.testing.expect(!metaskUsesDeviceFlow(.oauth_json));
+}
+
+test "a stored Metask default takes the browser sign-in's key without the blanks around it (#485)" {
+    // The variable would point the read at the developer's own auth.json.
+    if (std.c.getenv(auth.AUTH_FILE_ENV) != null) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const path = try std.fs.path.joinZ(a, &.{ root, "auth.json" });
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "auth.json", .data = "{\"api_key\":\"  sk-browser-key\\n\"}" });
+    _ = pfs.chmod(path.ptr, 0o600);
+    try std.testing.expectEqualStrings("sk-browser-key", browserSignInKey(a, root) orelse return error.NoKey);
+
+    // Blanks only: no key.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "auth.json", .data = "{\"api_key\":\" \\t \"}" });
+    _ = pfs.chmod(path.ptr, 0o600);
+    try std.testing.expect(browserSignInKey(a, root) == null);
 }
 
 test "install names the next step while the state root has neither a sign-in nor a .env (#484)" {

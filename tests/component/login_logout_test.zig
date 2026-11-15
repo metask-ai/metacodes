@@ -304,7 +304,9 @@ test "/logout: a session on Metask moves to the .env provider and never sends th
     const done = try app.signOutOfMetask();
     try testing.expect(done.removed.browser and done.removed.device);
     try testing.expect(done.session == .switched);
-    try testing.expectEqualStrings("House relay", done.session.switched);
+    try testing.expectEqualStrings("House relay", done.session.switched.name);
+    try testing.expectEqual(cc.app_route_state.CredentialOrigin.local_config, done.session.switched.origin);
+    try testing.expect(!done.key_in_shell and !done.key_in_local_config);
     try testing.expect(!case.exists("state/auth.json"));
     try testing.expect(!case.exists("state/oauth/metask.json"));
     var line_buf: [256]u8 = undefined;
@@ -484,6 +486,255 @@ test "/login again: the new key replaces the old one for every later Metask pick
     try testing.expectEqualStrings("Bearer " ++ NEW_METASK_KEY, headerValue(captured, "authorization").?);
     try testing.expectEqualStrings("\"glm-5-air\"", captured.jsonField("model").?);
     try expectNeverSent(gateway, METASK_KEY);
+}
+
+/// A `/v1/models` answer of another account: no glm-5-air.
+const OTHER_GATEWAY_MODELS = "{\"object\":\"list\",\"data\":[{\"id\":\"glm-5\",\"max_input_tokens\":200000,\"max_tokens\":32000},{\"id\":\"glm-6\",\"max_input_tokens\":200000,\"max_tokens\":32000}]}";
+/// The key a `/login` that fails hands over.
+const FAILED_SIGN_IN_KEY = "sk-metask-sign-in-that-failed";
+
+test "/login that cannot move the session leaves the previous key, route and models working, and frees nothing in use (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ ANTHROPIC_SSE, ANTHROPIC_SSE }, 0);
+    defer gateway.stop();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    const app = try signedInApp(&case, io_runtime.io(), try originOf(a, gateway), null);
+    defer app.deinit();
+    // Signed in once: the session's key route holds that sign-in's key, the
+    // one a Metask pick authenticates with.
+    const messages_url = try std.fmt.allocPrint(a, "{s}/v1/messages", .{try originOf(a, gateway)});
+    try app.bindMetaskSignIn(.{ .messages_url = messages_url, .key = NEW_METASK_KEY, .model = "glm-5", .models_json = GATEWAY_MODELS });
+
+    // A second sign-in whose offer is nowhere: the endpoint it names is not
+    // the one its gateway's models are offered at.
+    const astray = try std.fmt.allocPrint(a, "{s}//v1/messages", .{try originOf(a, gateway)});
+    try testing.expectError(error.OfferUnavailable, app.bindMetaskSignIn(.{
+        .messages_url = astray,
+        .key = FAILED_SIGN_IN_KEY,
+        .model = "glm-5",
+        .models_json = OTHER_GATEWAY_MODELS,
+    }));
+
+    // Everything is as before: the route, the offer in force, the account's
+    // models (glm-5-air is the first sign-in's), and its key.
+    try testing.expectEqualStrings(try originOf(a, gateway), app.metask_key_route.?.gateway_origin);
+    const current = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expectEqualStrings("glm-5", current.request_model_id);
+    try testing.expectEqualStrings(messages_url, current.endpoint_ref);
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ NEW_METASK_KEY, headerValue(gateway.lastRequest().?, "authorization").?);
+    const offer = try offerIdText(app, "metask", "glm-5-air", "anthropic_messages");
+    try testing.expect(cc.repl_picker_host.useSelector(app, &offer) == .switched);
+    try sendOneTurn(app);
+    const picked = gateway.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expectEqualStrings("Bearer " ++ NEW_METASK_KEY, headerValue(picked, "authorization").?);
+    try testing.expectEqualStrings("\"glm-5-air\"", picked.jsonField("model").?);
+    try expectNeverSent(gateway, FAILED_SIGN_IN_KEY);
+    // The testing allocator checks the rest at `app.deinit`: nothing the
+    // failed sign-in allocated leaks, and nothing is freed twice.
+}
+
+test "/login that cannot move the session still forgets the stored default: the sign-in is the latest choice (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer gateway.stop();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    try storeDefault(&case, "house-relay", "relay-model");
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    var config = cc.parseArgsForTest(&.{"metacodes"}, a);
+    config.state_root = case.state;
+    const app = try App.initWithOptions(testing.allocator, io_runtime.io(), config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
+    defer app.deinit();
+    const astray = try std.fmt.allocPrint(a, "{s}//v1/messages", .{try originOf(a, gateway)});
+    const applied = app.applyMetaskSignIn(.{ .messages_url = astray, .key = METASK_KEY, .model = "glm-5", .models_json = GATEWAY_MODELS });
+    try testing.expectEqual(@as(?anyerror, error.OfferUnavailable), applied.switch_error);
+    try testing.expect(applied.default_forgotten);
+    try testing.expect(applied.default_error == null);
+    try testing.expect(app.unbound() != null);
+    var store = try cc.provider_config_store.Store.initHome(a, case.state);
+    defer store.deinit();
+    var document = try store.load();
+    defer document.deinit();
+    try testing.expect(document.global_selection == null);
+    try testing.expectEqual(@as(usize, 0), gateway.requestCount());
+}
+
+test "/logout with .env configuring Metask: the session goes on with .env's key only, never the one signed out of (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ ANTHROPIC_SSE, ANTHROPIC_SSE, ANTHROPIC_SSE }, 0);
+    defer gateway.stop();
+    const file_key = "sk-metask-from-the-env-file";
+    try case.write("state/.env", "METASK_API_KEY=" ++ file_key ++ "\n");
+    var layer = try cc.app_state_env.load(testing.allocator, case.state, .{
+        .keys = &.{.{ .name = "METASK_API_KEY", .provider = "metask" }},
+    });
+    defer layer.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    // Started on the historical route; `.env` holds only a Metask key, so it
+    // configures Metask.
+    var config = cc.parseArgsForTest(&.{ "metacodes", "--base-url", (try std.fmt.allocPrintSentinel(a, "{s}/v1/messages", .{try originOf(a, gateway)}, 0)).ptr, "--model", "glm-5" }, a);
+    config.state_root = case.state;
+    config.credential_env_fallback = layer.lookup();
+    const app = try App.initWithOptions(testing.allocator, io_runtime.io(), config, METASK_KEY, .{
+        .route_state = .{ .bound = .metask },
+        .local_provider = .{ .name = "metask" },
+    });
+    defer app.deinit();
+    const messages_url = try std.fmt.allocPrint(a, "{s}/v1/messages", .{try originOf(a, gateway)});
+    try app.bindMetaskSignIn(.{ .messages_url = messages_url, .key = NEW_METASK_KEY, .model = "glm-5", .models_json = GATEWAY_MODELS });
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ NEW_METASK_KEY, headerValue(gateway.lastRequest().?, "authorization").?);
+
+    // A Metask key in the shell too: it is not what `.env` configures.
+    const shell_key = "sk-metask-from-the-shell";
+    try case.guard("METASK_API_KEY", shell_key);
+    const done = try app.signOutOfMetask();
+    try testing.expect(done.session == .switched);
+    try testing.expectEqualStrings("Metask", done.session.switched.name);
+    try testing.expectEqual(cc.app_route_state.CredentialOrigin.local_config, done.session.switched.origin);
+    try testing.expect(done.key_in_shell and done.key_in_local_config);
+
+    const signed_out_at = gateway.requestCount();
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ file_key, headerValue(gateway.lastRequest().?, "authorization").?);
+    // Another of the account's models: still `.env`'s key.
+    const offer = try offerIdText(app, "metask", "glm-5-air", "anthropic_messages");
+    try testing.expect(cc.repl_picker_host.useSelector(app, &offer) == .switched);
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ file_key, headerValue(gateway.lastRequest().?, "authorization").?);
+    for (signed_out_at..gateway.requestCount()) |index| {
+        const captured = gateway.requestAt(index) orelse continue;
+        for ([_][]const u8{ NEW_METASK_KEY, METASK_KEY, shell_key }) |secret| {
+            if (std.mem.indexOf(u8, captured.raw, secret) != null) {
+                std.debug.print("{s} was sent after /logout: {s}\n", .{ secret, requestLine(captured) });
+                return error.CredentialStillSent;
+            }
+        }
+    }
+}
+
+test "/logout says where the .env provider's key came from: the shell's, ahead of the file (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer gateway.stop();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    // `.env` names the relay; its key is in the shell only.
+    try case.write("state/.env", "METACODES_PROVIDER=house-relay\n");
+    try case.guard(RELAY_ENV, RELAY_KEY);
+    var layer = try cc.app_state_env.load(testing.allocator, case.state, .{
+        .keys = &.{.{ .name = RELAY_ENV, .provider = "house-relay" }},
+    });
+    defer layer.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    const app = try signedInApp(&case, io_runtime.io(), try originOf(a, gateway), &layer);
+    defer app.deinit();
+    const done = try app.signOutOfMetask();
+    try testing.expect(done.session == .switched);
+    try testing.expectEqualStrings("House relay", done.session.switched.name);
+    try testing.expectEqual(cc.app_route_state.CredentialOrigin.environment, done.session.switched.origin);
+    try testing.expectEqualStrings("from shell", done.session.switched.origin.label().?);
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ RELAY_KEY, headerValue(relay.lastRequest().?, "authorization").?);
+}
+
+test "/logout forgets a Metask default in the kernel too, at the store's revision (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer gateway.stop();
+    try case.writeSignedIn();
+    try storeDefault(&case, "metask", "claude-sonnet-4-6");
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    const app = try signedInApp(&case, io_runtime.io(), try originOf(a, gateway), null);
+    defer app.deinit();
+    const host = try app.providerHost();
+    const done = try app.signOutOfMetask();
+    try testing.expect(done.default_cleared);
+    var store = try cc.provider_config_store.Store.initHome(a, case.state);
+    defer store.deinit();
+    var document = try store.load();
+    defer document.deinit();
+    try testing.expect(document.global_selection == null);
+    // The kernel mirrors the store's revision: a client that compares
+    // against it sees no conflict that is not there.
+    try testing.expectEqual(document.config_revision.value(), host.kernel.config_revision.value());
+}
+
+test "a named provider without its key starts unbound: no offer is marked current, in the picker or /providers (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    // The offer `--provider house-relay` resolves to, which `main` records
+    // for the session (`config.selected_offer_id`).
+    const named = blk: {
+        var config = cc.parseArgsForTest(&.{"metacodes"}, a);
+        config.state_root = case.state;
+        const probe = try App.initWithOptions(testing.allocator, io_runtime.io(), config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
+        defer probe.deinit();
+        break :blk try offerIdText(probe, "house-relay", "relay-model", "openai_chat");
+    };
+    var config = cc.parseArgsForTest(&.{ "metacodes", "--provider", "house-relay" }, a);
+    config.state_root = case.state;
+    config.selected_offer_id = &named;
+    // No key for it: `main` opens the TUI unbound (第十节第 3 条).
+    const app = try App.initWithOptions(testing.allocator, io_runtime.io(), config, "", .{
+        .route_state = .{ .unbound = .{ .missing_credential = cc.provider_ids.Slug.lit("house-relay") } },
+    });
+    defer app.deinit();
+    const host = try app.providerHost();
+    try testing.expect(host.kernel.currentOfferId() == null);
+    // `/providers` marks what `model.list` calls current.
+    var page: std.ArrayList(cc.provider_control_plane.OfferSummary) = .empty;
+    defer page.deinit(testing.allocator);
+    const listed = try host.kernel.modelList(.{}, .{}, testing.allocator, &page);
+    for (listed.offers) |summary| try testing.expect(!summary.is_current);
+    const described = host.kernel.modelDescribe(try cc.provider_ids.OfferId.parse(&named)) orelse return error.OfferMissing;
+    try testing.expect(!described.is_current);
+    // The picker marks the kernel's current offer.
+    try app.refreshModelPicker();
+    try testing.expect(app.model_picker.current_offer == null);
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
 }
 
 test "/logout <provider>: the stored key goes, and a session that ran on it holds none (#485)" {

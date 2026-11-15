@@ -67,10 +67,11 @@ pub fn isMetaskSelection(catalog: *const registry_mod.OfferCatalog, selection: s
 }
 
 /// Forget `config.json`'s global selection when it is Metask's (resolved in
-/// `catalog`). True when one was forgotten.
-pub fn clearMetaskDefault(allocator: std.mem.Allocator, state_root: []const u8, catalog: *const registry_mod.OfferCatalog) config_store.StoreError!bool {
+/// `catalog`). Returns the configuration revision that leaves, for a kernel
+/// to adopt (`Kernel.adoptConfigRevision`), or null when none was forgotten.
+pub fn clearMetaskDefault(allocator: std.mem.Allocator, state_root: []const u8, catalog: *const registry_mod.OfferCatalog) config_store.StoreError!?config_store.ConfigRevision {
     var store = config_store.Store.initHome(allocator, state_root) catch |err| switch (err) {
-        error.NoHome => return false,
+        error.NoHome => return null,
         else => return err,
     };
     defer store.deinit();
@@ -78,12 +79,13 @@ pub fn clearMetaskDefault(allocator: std.mem.Allocator, state_root: []const u8, 
         error.OutOfMemory => return error.OutOfMemory,
         // A config.json that cannot be read holds no default to forget here;
         // the start that reads it reports it.
-        else => return false,
+        else => return null,
     };
     defer document.deinit();
-    const selection = document.global_selection orelse return false;
-    if (!isMetaskSelection(catalog, selection)) return false;
-    return (try config_store.clearGlobalSelection(&store, null)).cleared;
+    const selection = document.global_selection orelse return null;
+    if (!isMetaskSelection(catalog, selection)) return null;
+    const outcome = try config_store.clearGlobalSelection(&store, null);
+    return if (outcome.cleared) outcome.result.config_revision else null;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

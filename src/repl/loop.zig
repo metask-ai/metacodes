@@ -2475,6 +2475,24 @@ fn codepointDisplayWidth(cp: u21) usize {
 
 const testing = std.testing;
 
+test "/login: a copy that runs out of memory leaves the stored sign-in whole for its deinit (#485)" {
+    const Run = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var stored: @import("../core/auth.zig").StoredCredentials = .{};
+            defer stored.deinit(allocator);
+            stored.api_key = try allocator.dupe(u8, "sk-previous-key");
+            stored.selected_model = try allocator.dupe(u8, "previous-model");
+            try recordSignInChoice(allocator, &stored, "sk-chosen-key", "glm-5", .low);
+            try std.testing.expectEqualStrings("sk-chosen-key", stored.api_key.?);
+            try std.testing.expectEqualStrings("glm-5", stored.selected_model.?);
+            try std.testing.expectEqual(@as(?types_mod.ReasoningEffort, .low), stored.reasoning_effort);
+        }
+    };
+    // Every allocation fails in turn; the testing allocator reports a double
+    // free or a leak in any of them.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
 test "insertStartupText: memory running out drops the startup text with a notice, and the prompt comes up" {
     const a = std.testing.allocator;
     var startup = input.StartupText.init(a);
@@ -3228,40 +3246,62 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool) !void {
     defer stored.deinit(app.allocator);
     if (stored.oauth) |*old| old.deinit(app.allocator);
     stored.oauth = worker.takeOAuth();
-    if (stored.api_key) |old| {
-        std.crypto.secureZero(u8, old);
-        app.allocator.free(old);
-    }
-    stored.api_key = try app.allocator.dupe(u8, key);
-    if (stored.selected_model) |old| app.allocator.free(old);
-    stored.selected_model = try app.allocator.dupe(u8, model);
-    stored.reasoning_effort = dialog.effort;
+    try recordSignInChoice(app.allocator, &stored, key, model, dialog.effort);
     auth.saveDefault(app.allocator, app.stateRoot(), stored) catch |err| {
         cmd_output.print("{s}The sign-in was not stored: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
         return;
     };
 
-    app.bindMetaskSignIn(.{
+    // The session moves onto the sign-in, and a stored `/model` default is
+    // forgotten either way: the sign-in is the most recent explicit choice.
+    const applied = app.applyMetaskSignIn(.{
         .messages_url = messages_url,
         .key = key,
         .model = model,
         .effort = dialog.effort,
         .models_json = worker.models_json,
-    }) catch |err| {
-        cmd_output.print("{s}Signed in, but this session could not switch to Metask ({s}); a new session starts on it{s}\n", .{ th.danger, @errorName(err), th.reset });
-        return;
-    };
-    // The most recent explicit choice wins: a stored `/model` default would
-    // outrank the sign-in at the next start.
-    const forgot_default = app.forgetStoredDefault() catch |err| blk: {
+    });
+    if (applied.switch_error) |err| {
+        cmd_output.print("{s}Signed in, but this session could not switch to Metask ({s}); it stays as it was{s}\n", .{ th.danger, @errorName(err), th.reset });
+    } else {
+        cmd_output.print("Signed in to Metask · {s}", .{app.activeModel()});
+        if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
+        if (label.len > 0) cmd_output.print(" · key \"{s}\"", .{label});
+        cmd_output.print("\n", .{});
+    }
+    if (applied.default_error) |err| {
         cmd_output.print("{s}The stored default model could not be cleared ({s}); the next start may use it{s}\n", .{ th.warn, @errorName(err), th.reset });
-        break :blk false;
-    };
-    cmd_output.print("Signed in to Metask · {s}", .{app.activeModel()});
-    if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
-    if (label.len > 0) cmd_output.print(" · key \"{s}\"", .{label});
-    cmd_output.print("\n", .{});
-    cmd_output.print("{s}New sessions start on Metask too{s}.{s}\n", .{ th.dim, if (forgot_default) " (the previous default model is forgotten)" else "", th.reset });
+    } else {
+        cmd_output.print("{s}New sessions start on Metask{s}{s}.{s}\n", .{
+            th.dim,
+            if (applied.switch_error == null) " too" else "",
+            if (applied.default_forgotten) " (the previous default model is forgotten)" else "",
+            th.reset,
+        });
+    }
+}
+
+/// `auth.json`'s part of a `/login` (#485): the chosen key, model and
+/// reasoning level, replacing what the file held. Each copy is made before
+/// the value it replaces is freed, so a copy that fails leaves `stored`
+/// whole for its deinit.
+fn recordSignInChoice(
+    allocator: std.mem.Allocator,
+    stored: *@import("../core/auth.zig").StoredCredentials,
+    key: []const u8,
+    model: []const u8,
+    effort: ?types_mod.ReasoningEffort,
+) error{OutOfMemory}!void {
+    const key_copy = try allocator.dupe(u8, key);
+    if (stored.api_key) |old| {
+        std.crypto.secureZero(u8, old);
+        allocator.free(old);
+    }
+    stored.api_key = key_copy;
+    const model_copy = try allocator.dupe(u8, model);
+    if (stored.selected_model) |old| allocator.free(old);
+    stored.selected_model = model_copy;
+    stored.reasoning_effort = effort;
 }
 
 /// `/logout` (#485, #499 part 2): out of Metask, both sign-ins, and the
@@ -3301,10 +3341,18 @@ fn handleLogout(app: *app_mod.App, rest: []const u8) void {
     if (done.default_cleared) cmd_output.print("Forgot the default model, which was a Metask one.\n", .{});
     switch (done.session) {
         .kept => {},
-        .switched => |name| cmd_output.print("Switched to {s} (from .env) · {s}\n", .{ name, app.activeModel() }),
+        .switched => |switched| if (switched.origin.label()) |origin|
+            cmd_output.print("Switched to {s} ({s}) · {s}\n", .{ switched.name, origin, app.activeModel() })
+        else
+            cmd_output.print("Switched to {s} · {s}\n", .{ switched.name, app.activeModel() }),
         .unbound => cmd_output.print("{s}No model is set up now: /login, or configure .env{s}\n", .{ th.warn, th.reset }),
     }
     if (done.key_in_shell) cmd_output.print("{s}METASK_API_KEY is still set in your shell: the next start signs in with it.{s}\n", .{ th.warn, th.reset });
+    if (done.key_in_local_config) {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}{c}.env", .{ app.stateRoot(), std.fs.path.sep }) catch ".env";
+        cmd_output.print("{s}METASK_API_KEY is still set in {s}; remove it there to stay signed out.{s}\n", .{ th.warn, path, th.reset });
+    }
 }
 
 /// `/logout <provider>`: the key `/login <provider>` stored. A session that

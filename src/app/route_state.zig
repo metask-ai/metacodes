@@ -102,7 +102,8 @@ pub const MissingProvider = struct {
     variables: []const []const u8 = &.{},
     /// `/login <id>` stores a credential for it (a key page or a sign-in).
     login_id: ?[]const u8 = null,
-    /// Metask: what it lacks is a sign-in, and `/login` is the way in.
+    /// Metask: what it lacks is a sign-in, the device-code one `/login
+    /// metask` makes.
     metask: bool = false,
 };
 
@@ -175,7 +176,9 @@ fn writeMissingReminder(w: *std.Io.Writer, r: Reminder) std.Io.Writer.Error!void
     const missing = r.missing orelse MissingProvider{ .display_name = "The provider you named" };
     if (missing.metask or missing.variables.len == 0) {
         try w.print("No model is set up: {s} has no sign-in.\n", .{missing.display_name});
-        if (missing.metask) try w.writeAll("  Sign in to Metask:            /login\n");
+        // A named Metask route reads the device-code sign-in, which `/login
+        // metask` makes; the browser sign-in `/login` makes does not serve it.
+        if (missing.metask) try w.writeAll("  Sign in to Metask:            /login metask\n");
     } else {
         try w.print("No model is set up: {s} has no key.\n", .{missing.display_name});
         try w.writeAll("  Put ");
@@ -309,6 +312,26 @@ test "the reminder for a named provider without a key names its variables, not a
     const out = try reminderText(.{ .reason = .signed_out, .env_path = "/s/.env", .template = false, .guide_url = "https://guide" });
     defer testing.allocator.free(out);
     try testing.expect(std.mem.startsWith(u8, out, "No model is set up: you signed out of Metask.\n  Sign in to Metask:            /login\n"));
+}
+
+test "the reminder for a named Metask without a sign-in points at the device-code sign-in" {
+    const text = try reminderText(.{
+        .reason = .{ .missing_credential = ids.Slug.lit("metask") },
+        .missing = .{ .display_name = "Metask", .metask = true },
+        .env_path = "/s/.env",
+        .template = false,
+        .guide_url = "https://guide",
+    });
+    defer testing.allocator.free(text);
+    // `--provider metask` reads the device-code session: the browser
+    // sign-in plain `/login` makes would not serve it.
+    try testing.expectEqualStrings(
+        \\No model is set up: Metask has no sign-in.
+        \\  Sign in to Metask:            /login metask
+        \\  Or choose another model:      /model
+        \\  How to: https://guide
+        \\
+    , text);
 }
 
 test "the reminder without a state root has no .env line" {
