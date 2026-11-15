@@ -39,6 +39,9 @@ status, compatibility boundaries, and entry points are defined by
   (`global_selection`) whose provider has no credential is passed over for
   the Metask sign-in or `.env`, with one notice (`The default model, X, has
   no key or sign-in; this session uses Y.`), where it used to stop the start.
+  A Metask default is served by the browser sign-in's key (`auth.json`) when
+  there is no device-code sign-in: it used to stop with `Metask session is
+  unavailable`.
 - **`metacodes logout` removes both Metask sign-ins and says which** (#499,
   part 2). It used to remove `auth.json` only, leaving the device-code
   sign-in and its refresh token in `oauth/metask.json` usable. It now removes

@@ -608,6 +608,13 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
     const label = std.fmt.allocPrint(arena, "{s} · {s}", .{ provider_name, route.request_model_id }) catch return .usable;
     if (route.provider_id.eqlText("metask")) {
         if (metask_key_present) return .usable;
+        // The browser sign-in's key serves a stored Metask default too
+        // (`browserSignInKey`), the way it serves the historical path.
+        if (browserSignInKey(arena, config.state_root)) |key| {
+            std.crypto.secureZero(u8, key);
+            arena.free(key);
+            return .usable;
+        }
         var session = provider_oauth_mod.Session.initHome(arena, config.state_root, provider_ids_mod.Slug.lit("metask")) catch
             return .{ .lacks_credential = label };
         defer session.deinit();
@@ -618,6 +625,20 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
         arena.free(found.secret);
         return .usable;
     } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .usable;
+}
+
+/// The API key a browser sign-in (`metacodes login`, `/login`) stored in
+/// `auth.json`, owned by `arena`; null when there is none. It authenticates a
+/// stored Metask default as it authenticates the historical path (#485):
+/// a `/model` "every future session" pick of a Metask route, made while
+/// signed in in the browser, must not need the device-code session that a
+/// named Metask route otherwise reads.
+fn browserSignInKey(arena: std.mem.Allocator, state_root: []const u8) ?[]u8 {
+    var stored = auth.loadDefault(arena, state_root) catch return null;
+    defer stored.deinit(arena);
+    const key = stored.api_key orelse return null;
+    if (std.mem.trim(u8, key, " \t\r\n").len == 0) return null;
+    return arena.dupe(u8, key) catch null;
 }
 
 /// What this start uses instead of a passed-over default, for the notice.
@@ -1142,13 +1163,18 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+    // Whether level 2 decided the route: a stored Metask default then also
+    // takes the browser sign-in's key (`browserSignInKey`).
+    var stored_default_applied = false;
     if (config.provider_profile) |profile_name| {
         applyProviderRoute(&config, allocator, profile_name);
     } else if (config.provider_offer != null) {
         // An offer id names its own provider; requiring `--provider` beside it
         // would make a copied offer id unusable on its own.
         applyProviderRoute(&config, allocator, null);
-    } else if (!stored_default.consulted() or !applyPersistedGlobalSelection(&config, allocator)) {
+    } else if (stored_default.consulted() and applyPersistedGlobalSelection(&config, allocator)) {
+        stored_default_applied = true;
+    } else {
         config.provider_kind = inferProviderKind(config.model);
     }
 
@@ -1248,8 +1274,16 @@ pub fn main(init: std.process.Init) !void {
     if (!introspection_only and metask_scope and config.provider_profile != null and
         std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit)
     {
+        var browser_key = false;
         provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| blk: {
             const no_sign_in = err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession;
+            // Level 2 (#485): a stored Metask default with no device-code
+            // session authenticates with the browser sign-in's key, on the
+            // stored route, as the historical path would.
+            if (no_sign_in and stored_default_applied) if (browserSignInKey(allocator, config.state_root)) |key| {
+                browser_key = true;
+                break :blk key;
+            };
             // Level 1 (#485): Metask was named and has no sign-in. The TUI
             // opens on nothing rather than on another provider.
             if (no_sign_in and may_open_unbound) {
@@ -1263,7 +1297,7 @@ pub fn main(init: std.process.Init) !void {
             }
             return err;
         };
-        metask_oauth_selected = provider_secret != null;
+        metask_oauth_selected = provider_secret != null and !browser_key;
     } else if (!introspection_only and metask_scope and metask_legacy_explicit) {
         provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
     } else if (!introspection_only and !metask_scope) {

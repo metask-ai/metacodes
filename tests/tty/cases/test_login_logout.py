@@ -11,9 +11,11 @@
 Everything runs against loopback stand-ins (`metask_mock.py`, a relay mock for
 the `.env` provider): no account, no real request.
 """
+import hashlib
 import http.server
 import json
 import os
+import struct
 import sys
 import threading
 import time
@@ -144,6 +146,50 @@ def test_login_signs_in_in_the_browser_and_the_session_and_next_start_use_it(bin
         b = TTYAssert(raw2, rows=30, cols=140)
         b.assert_prose_contains("glm-5 · Metask")
         assert mock.messages[-1] == (f"Bearer {KEY_SECRET}", MODEL), mock.messages
+
+
+def _metask_offer_id(model, endpoint="https://napi.metask-ai.com/v1/messages"):
+    """The offer id of the compiled Metask route for `model` (src/provider/ids.zig
+    `OfferId.derive`): what `/model` stores when it is chosen for every session."""
+    digest = hashlib.sha256(b"metacodes.offer.v1")
+    for field in ("metask", "default", "anthropic_messages", endpoint, model, ""):
+        raw = field.encode()
+        digest.update(struct.pack("<I", len(raw)))
+        digest.update(raw)
+    return "offer-" + digest.digest()[:16].hex()
+
+
+def test_a_browser_sign_in_serves_a_stored_metask_default_at_the_next_start(bin_path):
+    # Sign in in the browser, keep a Metask model as the default (what /model's
+    # "every future session" writes), start again: the start is on that
+    # default, authenticated by the browser sign-in. It used to look only for
+    # the device-code sign-in and stop with `Metask session is unavailable`.
+    with MetaskMock() as mock:
+        home, state, env = _case(mock)
+        work = case_tmpdir("cc-tty-default-work-")
+        run(bin_path, [
+            READY, "type:/login", "key:enter",
+            wait_for("Select an API key", 20), "key:enter",
+            wait_for("Select a model", 15), "key:enter",
+            wait_for("Select a reasoning level", 10), "key:enter",
+            wait_for("Signed in to Metask", 10),
+        ], env=env, base_url=None, cwd=work, term_size=(30, 140))
+        assert os.path.exists(os.path.join(state, "auth.json"))
+        config = os.path.join(state, "config.json")
+        with open(config, "w") as f:
+            json.dump({"global_selection": {
+                "target": {"kind": "pinned_offer", "offer_id": _metask_offer_id("claude-sonnet-4-6"), "offer_revision": 1},
+                "scope": "global"}}, f)
+        before = len(mock.requests)
+        # Nothing is typed: the stored route is Metask's own endpoint, and the
+        # startup probe stays off (METACODES_NO_PROBE), so nothing is sent.
+        raw = run(bin_path, [READY, "strictsleep:0.5"], env=env, base_url=None, cwd=work, term_size=(30, 140))
+        a = TTYAssert(raw, rows=30, cols=140)
+        a.assert_prose_contains("claude-sonnet-4-6 · Metask")
+        a.assert_box_present()
+        for refused in (b"Metask session is unavailable", b"has no key or sign-in", b"not set"):
+            assert refused not in raw, f"{refused!r} on the start:\n{_screen(a)}"
+        assert len(mock.requests) == before
 
 
 def test_login_cancelled_with_esc_changes_nothing(bin_path):

@@ -1997,7 +1997,12 @@ pub const App = struct {
     fn metaskKeyFor(app: *const App, provider_id: provider_ids_mod.Slug) ?provider_binding_mod.ScopedSecret {
         const route = app.metask_key_route orelse return null;
         if (!provider_id.eqlText("metask")) return null;
-        return .{ .provider_id = provider_id, .secret = app.selected_api_key_owned orelse route.startup_key };
+        const secret = app.selected_api_key_owned orelse route.startup_key;
+        // A session that started without a key has none to offer: resolution
+        // goes on to the environment, `.env` and the stores (an empty
+        // `--api-key` would stop it at MissingCredentials).
+        if (secret.len == 0) return null;
+        return .{ .provider_id = provider_id, .secret = secret };
     }
 
     // ── issue #16: the cross-UI provider control plane ──────────────────────

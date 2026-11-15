@@ -400,6 +400,53 @@ test "/login: the chosen key and model become the session's route at once (#485)
     try testing.expect(std.mem.startsWith(u8, requestLine(captured), "POST /v1/messages "));
     try testing.expectEqualStrings("Bearer " ++ METASK_KEY, headerValue(captured, "authorization").?);
     try testing.expectEqualStrings("\"glm-5\"", captured.jsonField("model").?);
+
+    // The session started without a key; after /login, Metask's other
+    // models are usable in /model too, with the sign-in's key.
+    const offer = try offerIdText(app, "metask", "glm-5-air", "anthropic_messages");
+    try testing.expect(cc.repl_picker_host.useSelector(app, &offer) == .switched);
+    try sendOneTurn(app);
+    const picked = gateway.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expectEqualStrings("Bearer " ++ METASK_KEY, headerValue(picked, "authorization").?);
+    try testing.expectEqualStrings("\"glm-5-air\"", picked.jsonField("model").?);
+}
+
+test "a session built without a key offers no empty Metask key: a Metask pick reads METASK_API_KEY from .env (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer gateway.stop();
+    try case.write("state/.env", "METASK_API_KEY=sk-metask-from-file\n");
+    var layer = try cc.app_state_env.load(testing.allocator, case.state, .{
+        .keys = &.{.{ .name = "METASK_API_KEY", .provider = "metask" }},
+    });
+    defer layer.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    // The historical route with an empty key, as a host that has none
+    // builds it: the Metask key route is recorded with nothing in it.
+    var config = cc.parseArgsForTest(&.{ "metacodes", "--base-url", (try std.fmt.allocPrintSentinel(a, "{s}/v1/messages", .{try originOf(a, gateway)}, 0)).ptr }, a);
+    config.state_root = case.state;
+    config.credential_env_fallback = layer.lookup();
+    const app = try App.init(testing.allocator, io_runtime.io(), config, "");
+    defer app.deinit();
+    try testing.expect(app.metask_key_route != null);
+    const host = try app.providerHost();
+    try host.ingestMetask(try originOf(a, gateway), GATEWAY_MODELS, .messages);
+
+    const offer = try offerIdText(app, "metask", "glm-5-air", "anthropic_messages");
+    const outcome = cc.repl_picker_host.useSelector(app, &offer);
+    if (outcome != .switched) {
+        std.debug.print("the pick was not applied: {s}\n", .{if (outcome == .failed) outcome.failed else @tagName(outcome)});
+        return error.EmptyKeyBlockedResolution;
+    }
+    try sendOneTurn(app);
+    const captured = gateway.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expectEqualStrings("Bearer sk-metask-from-file", headerValue(captured, "authorization").?);
 }
 
 test "/login again: the new key replaces the old one for every later Metask pick, and the kernel names its offer (#485)" {
