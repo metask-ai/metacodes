@@ -44,6 +44,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A `SessionHost`'s model catalog can be refreshed while it runs, as the
+  daemon's is** (part of #445). The daemon's catalog is its cached
+  `/v1/models` answer, replaced when the background refresh lands;
+  `Options.models.catalog` was fixed for the Host's life, so a model the
+  refresh adds stayed refused. The new `SessionHost.setModelCatalog`
+  replaces it (copied): every Session's next `Submission.model` or
+  `set_model` resolves against the new catalog, and the model a Session is
+  on stays in force. A Host without `Options.models` gets
+  `error.ModelPolicyUnset`.
 - **An embedded Session's Runs can be gated by the project's rules, as the
   daemon's are** (part of #445). `SessionConfig.run_control` opens, for every
   Run on a durable `run_journal`, the `RunControl` the bundled daemon opens:

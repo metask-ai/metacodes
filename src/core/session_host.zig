@@ -48,8 +48,10 @@
 //! the bundled daemon's message does; a refusal of either applies neither
 //! and is journaled as `message_rejected` instead of a Run. With
 //! `Options.models` a model name resolves as on the daemon: tier names,
-//! then the provider guard (`ModelPolicy`). Every change of model, permission
-//! mode, reasoning effort or additional directory is journaled as
+//! then the provider guard (`ModelPolicy`), against the catalog
+//! `setModelCatalog` last installed when the Host refreshes it. Every
+//! change of model, permission mode, reasoning effort or additional
+//! directory is journaled as
 //! `config_changed`, as the daemon's config sink journals it: a command's
 //! before its `command_result`, a submission's before its `user_message`.
 //! `interrupt` is the one cross-thread call into the kernel; its abort is
@@ -214,10 +216,15 @@ pub const Options = struct {
 /// one whose id names it (`claude-`, `gpt`/`o1`/`o3`, `gemini`). Anything
 /// else, an unset tier included, is `error.ModelUnavailable` and changes
 /// nothing. A tier's reasoning effort is not applied, as on the daemon.
+///
+/// The daemon's catalog is not fixed at startup: its `/v1/models` answer
+/// comes from a cache first and is replaced when the background refresh
+/// lands. `SessionHost.setModelCatalog` replaces `catalog` the same way.
 pub const ModelPolicy = struct {
     /// Borrowed; outlives the SessionHost.
     tiers: ?*const model_tiers.TierTable = null,
-    /// Borrowed; outlives the SessionHost.
+    /// Borrowed; outlives the SessionHost, or until the first
+    /// `SessionHost.setModelCatalog`, which takes its place.
     catalog: []const CatalogModel = &.{},
 };
 
@@ -643,10 +650,58 @@ pub const SessionHost = struct {
     mutex: sync.Mutex = .{},
     sessions: std.AutoHashMapUnmanaged([24]u8, *HostedSession) = .empty,
     closed: bool = false,
+    /// Guards `model_catalog`: every Session's driver resolves model names
+    /// through it while a Host thread may replace it.
+    models_mutex: sync.Mutex = .{},
+    /// The catalog `setModelCatalog` installed (owned); null while
+    /// `Options.models.catalog` is in force.
+    model_catalog: ?[]CatalogModel = null,
 
     /// `runtime` is borrowed and must outlive `deinit`.
     pub fn init(gpa: std.mem.Allocator, runtime: *AgentRuntime, options: Options) SessionHost {
         return .{ .gpa = gpa, .runtime = runtime, .options = options };
+    }
+
+    /// Replaces the catalog `Options.models` resolves model names against
+    /// (#445), as the daemon adopts a refreshed `/v1/models` answer: every
+    /// Session's next `Submission.model` or `set_model` is checked against
+    /// `catalog`, copied for the call, and no longer against the one before.
+    /// The model a Session is on stays in force, also when the new catalog
+    /// no longer lists it, as on the daemon. A Host without
+    /// `Options.models` has no catalog to replace:
+    /// `error.ModelPolicyUnset`, nothing kept.
+    pub fn setModelCatalog(self: *SessionHost, catalog: []const CatalogModel) error{ ModelPolicyUnset, OutOfMemory }!void {
+        if (self.options.models == null) return error.ModelPolicyUnset;
+        const copy = try self.gpa.alloc(CatalogModel, catalog.len);
+        var copied: usize = 0;
+        errdefer {
+            for (copy[0..copied]) |entry| self.gpa.free(entry.id);
+            self.gpa.free(copy);
+        }
+        for (catalog, copy) |entry, *slot| {
+            slot.* = .{ .provider = entry.provider, .id = try self.gpa.dupe(u8, entry.id) };
+            copied += 1;
+        }
+        self.models_mutex.lock();
+        const previous = self.model_catalog;
+        self.model_catalog = copy;
+        self.models_mutex.unlock();
+        if (previous) |old| self.freeCatalog(old);
+    }
+
+    fn freeCatalog(self: *SessionHost, catalog: []CatalogModel) void {
+        for (catalog) |entry| self.gpa.free(entry.id);
+        self.gpa.free(catalog);
+    }
+
+    /// The model `requested` names under `Options.models` and the catalog
+    /// in force, for a Session of `provider`; null without `Options.models`.
+    fn resolveModelName(self: *SessionHost, provider: types.ProviderKind, requested: []const u8) error{ModelUnavailable}!?[]const u8 {
+        var policy = self.options.models orelse return null;
+        self.models_mutex.lock();
+        defer self.models_mutex.unlock();
+        if (self.model_catalog) |catalog| policy.catalog = catalog;
+        return try resolveModel(policy, provider, requested);
     }
 
     /// Closes every Session (see `close`) and refuses further `open`s.
@@ -671,6 +726,8 @@ pub const SessionHost = struct {
             hosted.retire();
         }
         self.sessions.deinit(self.gpa);
+        if (self.model_catalog) |catalog| self.freeCatalog(catalog);
+        self.model_catalog = null;
     }
 
     /// Returns the Session holding one reference for the caller.
@@ -1904,10 +1961,7 @@ pub const HostedSession = struct {
     /// Switches the Session to `requested`, resolved through
     /// `Options.models` when the Host set it.
     fn applyModel(self: *HostedSession, requested: []const u8) ModelChangeError!void {
-        const model = if (self.host.options.models) |policy|
-            try resolveModel(policy, self.provider_kind, requested)
-        else
-            requested;
+        const model = (try self.host.resolveModelName(self.provider_kind, requested)) orelse requested;
         const copy = try self.gpa.dupe(u8, model);
         self.session.setModel(model) catch |err| {
             self.gpa.free(copy);
