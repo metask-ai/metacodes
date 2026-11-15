@@ -33,9 +33,36 @@ empty `### Migration`.
   jobs in its `Snapshot`, cancels them by command, and keeps fired cron
   prompts within `max_queued` (#493); ABI revision 28 exposes neither
   `SessionHost` nor the cron tools.
+- No change a Host can see. The Zig `SessionConfig.run_control` gives an
+  embedded Session's Runs the daemon's project rule gate and abandoned-Run
+  policy (#445); `SessionConfigV1` has no such field, and an ABI Session's
+  Runs open the journal as before.
+- No change a Host can see. The Zig `SessionHost.setModelCatalog` replaces
+  the catalog `Options.models` resolves model names against while the Host
+  runs (#445); ABI revision 28 exposes neither `SessionHost` nor
+  `ModelPolicy`.
 
 ### Fixed
 
+- A Session idling in `Open.Idle` after a streaming Run costs far less on
+  Windows (#503): about 4 MB of private commit and 2 threads instead of about
+  50 MB and 3. Each of its threads used to commit Zig's 16 MiB default stack;
+  the provider's connection workers now commit 2 MiB each, and the stream
+  liveness monitor exits while no request is in flight and starts again with
+  the next one. Nothing changes in the ABI, and a Host needs no new
+  configuration; closing a Session still releases everything it held.
+- A tool call whose arguments name a key twice (#494), such as `Grep` with
+  `"-i"` twice or `Read` with `file_path` twice, no longer ends as
+  `permission_denied` (`safety`, `recoverable: false`) in every permission
+  mode. It runs nothing and its result is `invalid_args` (`user_error`,
+  `recoverable: true`), as are arguments that are not one JSON object; the
+  Host's permission callback is not called for it. Whitespace around a
+  colon (`"path" : "target.ts"`) now names the same argument for the tool
+  as for the permission check: `Grep` searched the whole Workspace for
+  that spelling. A key that appears only inside another value, or inside
+  an escaped key, is no longer read as a built-in tool's argument, so a
+  `Write`/`Edit` call spelled that way now gets the `file_target`
+  candidate for the file it really writes.
 - A Run on `kimi-for-coding` (the Kimi Code subscription's K2.8 Preview) over
   the OpenAI chat wire sends the thinking parameter Kimi Code documents
   (#487): an active reasoning effort goes out as the top-level

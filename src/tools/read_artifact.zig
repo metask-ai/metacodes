@@ -32,7 +32,7 @@ pub const Request = struct {
 /// `util/json.unescapeString`, so a value that carried JSON escapes comes back
 /// as the string the model sent rather than its escaped spelling.
 pub fn describeRequest(allocator: std.mem.Allocator, args: []const u8) !Request {
-    const raw_id = json_util.extractStringField(args, "artifact_id");
+    const raw_id = json_util.topLevelStringField(args, "artifact_id");
     const artifact_id = if (raw_id) |id| try json_util.unescapeString(id, allocator) else null;
     const offset = (parseOptionalU64(args, "offset") catch null) orelse 0;
     return .{ .artifact_id = artifact_id, .offset = offset };

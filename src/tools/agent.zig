@@ -33,8 +33,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // Precondition: depth guard
     if (ctx.agent_depth >= MAX_AGENT_DEPTH) return error.AgentDepthExceeded;
     if (ctx.project_rule_gate != null and
-        ((util_json.extractBoolField(args, "run_in_background") orelse false) or
-            util_json.extractStringField(args, "name") != null))
+        ((util_json.topLevelBoolField(args, "run_in_background") orelse false) or
+            util_json.topLevelStringField(args, "name") != null))
         return error.ProjectRulesRequireSynchronousAgent;
 
     const api_client = ctx.api_client;
@@ -45,12 +45,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 缺 prompt:返回**具名** error(对齐 Bash=MissingCommand / Grep=MissingPattern 约定),
     // 让 agent_loop 的 "{name} failed with MissingPrompt" 现场告诉模型缺哪个字段,
     // 而非笼统 MissingField(模型据此原地空参重试,见 e2e Task input={} 风暴)。
-    const prompt_raw = util_json.extractStringField(args, "prompt") orelse return error.MissingPrompt;
+    const prompt_raw = util_json.topLevelStringField(args, "prompt") orelse return error.MissingPrompt;
     const prompt = try util_json.unescapeString(prompt_raw, ctx.allocator);
     defer ctx.allocator.free(prompt);
 
     // subagent_type:缺省 "general-purpose"(向后兼容旧 Agent 调用)
-    const subagent_type_raw = util_json.extractStringField(args, "subagent_type") orelse "general-purpose";
+    const subagent_type_raw = util_json.topLevelStringField(args, "subagent_type") orelse "general-purpose";
 
     // 找 AgentDef(builtin + personal + project)
     var maybe_def: ?*const @import("../agents/def.zig").AgentDef = null;
@@ -64,9 +64,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         fallback_def = ctx.agents.?.find("general-purpose");
     }
     const def_opt = maybe_def orelse fallback_def;
-    const requested_background = util_json.extractBoolField(args, "run_in_background") orelse false;
+    const requested_background = util_json.topLevelBoolField(args, "run_in_background") orelse false;
     const bg = requested_background or (if (def_opt) |d| d.background else false);
-    const teammate_request = util_json.extractStringField(args, "name") != null;
+    const teammate_request = util_json.topLevelStringField(args, "name") != null;
     const out_of_process_teammate = teammate_request and ctx.swarm != null and ctx.swarm.?.out_of_process;
     if (ctx.project_rule_gate != null and (bg or teammate_request))
         return error.ProjectRulesRequireSynchronousAgent;
@@ -224,7 +224,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 查当前 provider 档位表,未配置的档位回退 inherit——绝不产出跨 provider 的
     // 硬编码模型 ID(issue #11);其余字符串视作显式模型名透传。档位可附带推理
     // 深度,优先级 AgentDef.effort > 档位 effort > inherit。
-    const model_arg = util_json.extractStringField(args, "model");
+    const model_arg = util_json.topLevelStringField(args, "model");
     const model_selection = resolveModelSelection(
         ctx.model_tiers,
         model_arg,
@@ -271,7 +271,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // Swarm 分支:给了 `name` → spawn 一个持久 teammate(而非一次性 subagent)。
     // 对齐 cc AgentTool 的 name+team_name 分支,但 metacodes 一 lead 一队(team 隐含在
     // SwarmContext),故只需 name 触发。
-    if (util_json.extractStringField(args, "name")) |name_raw| {
+    if (util_json.topLevelStringField(args, "name")) |name_raw| {
         const sw = ctx.swarm orelse return error.SwarmUnavailable;
         if (!sw.is_lead) return error.NotTeamLead; // teammate 不 spawn teammate(扁平 roster)
         if (!sw.hasTeam()) return error.NoActiveTeam;
@@ -389,7 +389,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .parent_model = ctx.parent_model,
             // desc = 纯描述(进度树行 `├ <desc>`);agent_type 单独传(标题按 type 分组)。
             // 无 description 时退回纯 type 作描述。
-            .desc = util_json.extractStringField(args, "description") orelse subagent_type_raw,
+            .desc = util_json.topLevelStringField(args, "description") orelse subagent_type_raw,
             .agent_type = subagent_type_raw,
             // subagent 只接 skill 激活(skillOnly 投影:不碰父 worktree 栈/ToolSearch 集)。
             .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
@@ -414,7 +414,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (ctx.event_reporter) |r| r.agentLifecycle(.{ .spawned = .{
             .id = job_id,
             .agent_type = subagent_type_raw,
-            .desc = util_json.extractStringField(args, "description") orelse subagent_type_raw,
+            .desc = util_json.topLevelStringField(args, "description") orelse subagent_type_raw,
             .foreground = false,
         } });
         var background_out: std.Io.Writer.Allocating = .init(ctx.allocator);
@@ -434,7 +434,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 同步路径:注册前台进度 entry(供进度树实时显示),并发安全靠 per-call client。
     // desc(纯描述,不带 "type: " 前缀)给进度树行;agent_type 给标题分组。
-    const fg_desc = util_json.extractStringField(args, "description") orelse subagent_type_raw;
+    const fg_desc = util_json.topLevelStringField(args, "description") orelse subagent_type_raw;
     var fg_entry: ?*@import("../core/agent_job_registry.zig").JobEntry = null;
     if (ctx.agent_jobs) |reg| {
         fg_entry = reg.registerForegroundForSession(subagent_type_raw, fg_desc, prompt, ctx.session);

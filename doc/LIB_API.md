@@ -290,6 +290,19 @@ prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
   init 决定接手这个 Run 之后才真正截断，拒绝时 journal 原样保留。`fail_closed` 下仍是
   `PartialRecord`。
 
+**每 Run 控制（`SessionConfig.run_control`，#445）。** durable Session 的每个 Run 都经
+`project_rule_activation.RunControl.initWithOptions` 打开 journal，与 daemon 每个 Run 打开的
+是同一个控制。`abandoned_run` 选上面的策略（默认 `fail_closed`，daemon 用
+`record_abandoned`）。`project_rules = .enforced` 时，`<dirname(journal 根)>/project-rules`
+里针对 workspace root 的 active bundle 在 provider 请求前重新验证、经 project kernel 判定每次
+工具调用，Run 结束后再验证一次并发布该 Run 的 operational observation；kernel 配置缺失或
+无效、bundle 验证失败、本 Session 仍有运行中的 Bash 后台 job 或它带着 team
+（`ProjectRulesRequireDetachedWorkersIdle`）时，Run 在任何 provider 请求之前失败（journal 里
+以错误名关闭，Session 照常 poison）。默认 `.ignored` 不读 bundle。ephemeral Session 上设置
+非默认值在 create 时被拒（`error.RunControlRequiresRunJournal`）；启用 project rules 的
+Session 拒绝 `runIsolated`（`error.ProjectRulesUnsupportedForIsolatedRun`），因为 executor
+自己的 loop 不在 gate 之内。C ABI 的 `SessionConfigV1` 没有这个字段。
+
 新 lease 先以 `<lock>.<run_id>.<attempt>` 写好记录再用不覆盖的 link（Windows：move）发布，所以
 锁文件名下永远不会出现空文件；不支持硬链接的文件系统退回原地创建。产品宿主在 Run
 被中止（Esc、Ctrl+C、SIGTERM/SIGHUP）后发布派生产物时不再沿用该中止信号，由 kernel

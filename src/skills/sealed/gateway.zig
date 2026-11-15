@@ -2099,11 +2099,11 @@ pub const Server = struct {
             for (workers[0..spawned]) |thread| thread.join();
         }
         for (workers) |*thread| {
-            thread.* = try std.Thread.spawn(.{}, workerLoop, .{self});
+            thread.* = try @import("platform").thread.spawn(.full, workerLoop, .{self});
             spawned += 1;
         }
         self.workers = workers;
-        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+        self.accept_thread = try @import("platform").thread.spawn(.full, acceptLoop, .{self});
         return self;
     }
 
@@ -2320,7 +2320,7 @@ const Pinger = struct {
 
     fn start(self: *Pinger) void {
         if (self.interval_ms == 0) return;
-        self.thread = std.Thread.spawn(.{}, loop, .{self}) catch null;
+        self.thread = @import("platform").thread.spawn(.full, loop, .{self}) catch null;
     }
 
     fn loop(self: *Pinger) void {

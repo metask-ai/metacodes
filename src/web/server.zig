@@ -343,7 +343,7 @@ pub const WebServer = struct {
             .version = surface.version,
             .deps = deps,
         };
-        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+        self.accept_thread = try @import("platform").thread.spawn(.full, acceptLoop, .{self});
         return self;
     }
 
@@ -427,7 +427,7 @@ pub const WebServer = struct {
             }
             // 计数在 spawn 前加(accept 线程侧):避免"已 accept 未及计数"时 stop 误判 0。
             _ = self.live_conns.fetchAdd(1, .acq_rel);
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn_fd }) catch {
+            const t = @import("platform").thread.spawn(.full, handleConn, .{ self, conn_fd }) catch {
                 _ = self.live_conns.fetchSub(1, .acq_rel);
                 net.closeSocket(conn_fd);
                 continue;

@@ -44,6 +44,32 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A `SessionHost`'s model catalog can be refreshed while it runs, as the
+  daemon's is** (part of #445). The daemon's catalog is its cached
+  `/v1/models` answer, replaced when the background refresh lands;
+  `Options.models.catalog` was fixed for the Host's life, so a model the
+  refresh adds stayed refused. The new `SessionHost.setModelCatalog`
+  replaces it (copied): every Session's next `Submission.model` or
+  `set_model` resolves against the new catalog, and the model a Session is
+  on stays in force. A Host without `Options.models` gets
+  `error.ModelPolicyUnset`.
+- **An embedded Session's Runs can be gated by the project's rules, as the
+  daemon's are** (part of #445). `SessionConfig.run_control` opens, for every
+  Run on a durable `run_journal`, the `RunControl` the bundled daemon opens:
+  with `project_rules = .enforced`, an active bundle in
+  `<dirname(run journal root)>/project-rules` for the workspace root is
+  re-attested before the provider request, decides each tool call through
+  the project kernel, and publishes the Run's operational observer after it;
+  a missing or invalid kernel configuration, a bundle that fails
+  attestation, or a running background job or active team fails the Run
+  before any provider request. `abandoned_run = .record_abandoned` closes a
+  Run whose process died as abandoned and runs the next one, as the daemon
+  does; the default stays `fail_closed`. Either setting on an ephemeral
+  Session is refused (`RunControlRequiresRunJournal`), and a Session that
+  enforces project rules refuses an isolated executor Run
+  (`ProjectRulesUnsupportedForIsolatedRun`), which the gate cannot reach.
+  The default (`project_rules = .ignored`) reads no bundle, as before.
+
 - **Built-in Kimi Code provider** (#487). `--provider kimi-code` (alias
   `kimi-coding-plan`) uses a Kimi Code subscription: requests go to
   `https://api.kimi.com/coding/v1` (`global-*` channels:
@@ -131,6 +157,47 @@ status, compatibility boundaries, and entry points are defined by
   state root is read from this release on.
 
 ### Fixed
+
+- **An idle AgentCore Session no longer holds about 50 MB of private commit
+  on Windows** (#503). Zig 0.16's `std.Thread.spawn` hands its 16 MiB
+  default stack to `NtCreateThreadEx` as the stack *commit*, so each thread
+  charges 16 MiB of private commit for its whole life; on POSIX it is only a
+  reservation. A Session that had streamed one Run kept three: its
+  provider's two `std.Io.Threaded` pool workers and the stream liveness
+  monitor. Pool workers created through `platform.signal.threadedIo` now get
+  a 2 MiB stack (a whole HTTPS exchange peaks at 544 KiB in Debug), and the
+  liveness monitor runs on a 256 KiB stack and exits once no request is left
+  to watch, coming back with the next one; an idle Session no longer wakes
+  every 250 ms either. Measured on Windows 10 x64 with four idle Sessions:
+  49,351 KiB and 3 threads per Session before, 4,231 KiB and 2 threads
+  after. Every production thread now spawns through
+  `platform.thread.spawn` with a named stack class (`waiter`, `io_worker`,
+  `full`); the others keep std's 16 MiB as `full`, unchanged. On Linux the
+  smaller classes ask for 512 KiB more: glibc carves a thread's static TLS,
+  which holds std's 256 KiB alternate signal stack, out of the stack it is
+  given, and refuses a thread whose TLS does not fit.
+  `zig build test:thread-stack` (part of `test:units`) refuses a direct
+  `std.Thread.spawn` outside test blocks.
+- **The permission check and the tool read one spelling of a call's
+  arguments** (#494). Arguments that named a key twice (`"-i"` twice in a
+  `Grep` call, `file_path` twice in a `Read` call) failed the strict parse
+  of AgentCore's permission digest, and that failure became a deny: the
+  model got `permission_denied` (`safety`, not recoverable) in every
+  permission mode, for a mistake it could correct. And `Grep` found its
+  `path` by the substring `"path":`, so `"path" : "target.ts"` searched the
+  whole working directory while the permission layer judged `target.ts`.
+  Now the agent loop admits a call's arguments before the PreToolUse hook,
+  the permission check and the tool see them: one JSON object with no
+  duplicate key at any level, rewritten in one compact spelling, or an
+  `invalid_args` result (`user_error`, recoverable) with nothing run —
+  `DuplicateArgumentKey`, or `InvalidArgumentsJson` for arguments that are
+  not a JSON object. The bytes the model sent stay in the Conversation
+  unchanged. Built-in tools read their arguments as top-level members
+  (`tools/common.extractJsonArg`, `util/json.topLevel*Field`) rather than
+  the first substring match, so a key nested in another value or inside a
+  string is no longer taken for the argument; so do the schema checks
+  (`tools.validateRequired`/`validateTypes`), the permission rule matcher
+  and the MCP resource tools.
 
 - **Cron prompts no longer push a `SessionHost` queue past `max_queued`**
   (#493). With more jobs due at once than the queue had room for, the
