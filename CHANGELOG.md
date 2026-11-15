@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **`metacodes logout` removes both Metask sign-ins and says which** (#499,
+  part 2). It used to remove `auth.json` only, leaving the device-code
+  sign-in and its refresh token in `oauth/metask.json` usable. It now removes
+  both (and a key stored with `login --provider metask`, which `logout
+  --provider metask` now also does), forgets a stored default that resolves
+  to Metask so the next start falls back instead of failing, and names a
+  `METASK_API_KEY` still set in the shell or `.env`. README's quick start
+  signs in with `metacodes login`, or `metacodes login --provider metask
+  --no-browser` on a machine without a browser.
 - **`metacodes` with nothing configured opens the terminal UI instead of
   exiting** (#484). With no flag, stored `/model` default, Metask sign-in or
   `.env` provider, or with a Metask sign-in whose key and model were never

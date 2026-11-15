@@ -381,6 +381,29 @@ pub fn setGlobalSelection(
     });
 }
 
+/// Forget the global selection (#485): the next plain start resolves its
+/// route from the sign-in or `.env` instead. No selection stored is not an
+/// error; the result says whether one was.
+pub fn clearGlobalSelection(
+    store: *const Store,
+    operation_id: ?[]const u8,
+) StoreError!struct { cleared: bool, result: CommitResult } {
+    const Apply = struct {
+        cleared: bool = false,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.cleared = document.global_selection != null;
+            document.global_selection = null;
+        }
+    };
+    var apply = Apply{};
+    const result = try store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+    return .{ .cleared = apply.cleared, .result = result };
+}
+
 /// Record a credential failure durably.
 ///
 /// The learned state has to outlive the process, or every run rediscovers the
@@ -496,6 +519,41 @@ test "an empty idempotency key is rejected rather than matching every other one"
         .mutation = .{ .ctx = @ptrCast(&anchor), .applyFn = Noop.run },
     });
     try std.testing.expect(!anonymous.idempotent_replay);
+}
+
+test "clearing the global selection removes the key and keeps the rest of the file" {
+    const a = std.testing.allocator;
+    var path_buf: [512]u8 = undefined;
+    const path = try testFixturePath(&path_buf, "clear-global-test.json");
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    }
+    defer for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        var cleanup: [std.fs.max_path_bytes]u8 = undefined;
+        const target = std.fmt.bufPrintZ(&cleanup, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    };
+
+    var store = try Store.initPath(a, path);
+    defer store.deinit();
+    // Nothing stored: nothing to clear, and that is no error.
+    try std.testing.expect(!(try clearGlobalSelection(&store, null)).cleared);
+
+    _ = try setGlobalSelection(&store, config_doc.RuntimeSelection.pinned(.{ .digest = @splat(0x33) }, 1, .global), null, null);
+    var before = try store.load();
+    defer before.deinit();
+    try std.testing.expect(before.global_selection != null);
+
+    try std.testing.expect((try clearGlobalSelection(&store, null)).cleared);
+    var after = try store.load();
+    defer after.deinit();
+    try std.testing.expect(after.global_selection == null);
+    const text = try store.readText();
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "global_selection") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "config_revision") != null);
 }
 
 test "the home store resolves either the override or <state_root>/config.json" {

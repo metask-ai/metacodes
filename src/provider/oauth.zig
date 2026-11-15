@@ -178,6 +178,26 @@ pub const Session = struct {
         return init(allocator, provider_id, path);
     }
 
+    /// Delete this provider's stored login (`metacodes logout`, `/logout`,
+    /// #499). True when there was one; a file already gone is not an error.
+    /// The in-memory tokens of any open `Session` are untouched: a caller
+    /// that holds one drops it too.
+    pub fn removeStored(allocator: std.mem.Allocator, state_root: []const u8, provider_id: Slug) error{ OutOfMemory, RemoveFailed }!bool {
+        var session = initHome(allocator, state_root, provider_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
+        defer session.deinit();
+        const path_z = try allocator.dupeZ(u8, session.path);
+        defer allocator.free(path_z);
+        if (!pfs.exists(path_z)) return false;
+        pfs.unlinkPath(path_z) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return error.RemoveFailed,
+        };
+        return true;
+    }
+
     pub fn deinit(self: *Session) void {
         if (self.tokens) |*set| set.deinit(self.allocator);
         if (self.client_id) |value| self.allocator.free(value);

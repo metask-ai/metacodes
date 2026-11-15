@@ -25,6 +25,8 @@ pub const app_state_env = @import("app/state_env.zig"); // pub: component tests 
 const state_env_mod = app_state_env;
 pub const app_route_state = @import("app/route_state.zig"); // pub: component tests read the banner and the reminder
 const route_state_mod = app_route_state;
+pub const app_sign_out = @import("app/sign_out.zig"); // pub: component tests sign out in process
+const sign_out_mod = app_sign_out;
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
 pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
@@ -2210,23 +2212,14 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
                     std.debug.print("error: unknown logout argument '{s}'\n", .{more});
                     return 2;
                 }
+                // Metask's sign-ins are what a plain `logout` removes.
+                if (providerIsMetask(allocator, name)) return logoutMetask(allocator, state_dir);
                 return logoutProviderKey(allocator, state_dir, name);
             }
             std.debug.print("error: unknown logout argument '{s}'\n", .{extra});
             return 2;
         }
-        auth.clearDefault(allocator, state_dir) catch |err| switch (err) {
-            error.NoHome => {
-                std.debug.print("No HOME set; no credentials cleared.\n", .{});
-                return 1;
-            },
-            else => {
-                std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
-                return 1;
-            },
-        };
-        std.debug.print("Logged out. Local credentials cleared.\n", .{});
-        return 0;
+        return logoutMetask(allocator, state_dir);
     }
     if (!std.mem.eql(u8, cmd, "login")) return null;
 
@@ -2769,6 +2762,71 @@ fn readSecretLine(prompt: []const u8, buf: []u8) !usize {
         }
     }
     return len;
+}
+
+/// `metacodes logout` (#499 part 2): remove both Metask sign-ins — the
+/// browser one in auth.json and the device-code one in oauth/metask.json,
+/// refresh token and all — and a stored default that is Metask's, and say
+/// which were there. A key in `.env` or the shell is not a sign-in: it is
+/// named, never removed.
+fn logoutMetask(allocator: std.mem.Allocator, state_dir: []const u8) u8 {
+    if (state_dir.len == 0 and std.c.getenv(auth.AUTH_FILE_ENV) == null and std.c.getenv("METACODES_OAUTH_DIR") == null) {
+        std.debug.print("No state root (set HOME or --state-dir); no credentials cleared.\n", .{});
+        return 1;
+    }
+    const removed = sign_out_mod.removeMetaskSignIns(allocator, state_dir) catch |err| {
+        std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    // A Metask key stored with `login --provider metask --api-key` is a
+    // Metask credential too.
+    const key_removed = provider_api_key_store.remove(allocator, state_dir, provider_ids_mod.Slug.lit("metask")) catch |err| {
+        std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    var default_cleared = false;
+    if (buildProviderHost(allocator)) |host| {
+        defer host.destroy();
+        default_cleared = sign_out_mod.clearMetaskDefault(allocator, state_dir, host.kernel.catalogSnapshot()) catch |err| blk: {
+            std.debug.print("warning: the stored default could not be checked ({s})\n", .{@errorName(err)});
+            break :blk false;
+        };
+    }
+    if (removed.browser) std.debug.print("Removed the Metask browser sign-in ({s}).\n", .{authPathForDisplay(allocator, state_dir)});
+    if (removed.device) std.debug.print("Removed the Metask device-code sign-in and its refresh token ({s}).\n", .{metaskSessionPathForDisplay(allocator, state_dir)});
+    if (key_removed) std.debug.print("Removed the stored key for Metask.\n", .{});
+    if (!removed.any() and !key_removed) std.debug.print("No Metask sign-in was stored.\n", .{});
+    if (default_cleared) std.debug.print("Forgot the default model, which was a Metask one.\n", .{});
+    printRemainingMetaskKeys(allocator, state_dir);
+    std.debug.print("Logged out. No secret was printed.\n", .{});
+    return 0;
+}
+
+/// `<state root>/auth.json` as the removal names it ("auth.json" when it
+/// cannot be built).
+fn authPathForDisplay(allocator: std.mem.Allocator, state_dir: []const u8) []const u8 {
+    return auth.authFilePath(allocator, state_dir) catch "auth.json";
+}
+
+fn metaskSessionPathForDisplay(allocator: std.mem.Allocator, state_dir: []const u8) []const u8 {
+    var session = provider_oauth_mod.Session.initHome(allocator, state_dir, provider_ids_mod.Slug.lit("metask")) catch return "oauth/metask.json";
+    defer session.deinit();
+    return allocator.dupe(u8, session.path) catch "oauth/metask.json";
+}
+
+/// A `METASK_API_KEY` that signs a plain start in again, though nothing was
+/// stored: in the shell, or in this install's `.env` (names only).
+fn printRemainingMetaskKeys(allocator: std.mem.Allocator, state_dir: []const u8) void {
+    if (nonEmptyEnv(auth.METASK_API_KEY_ENV) != null) {
+        std.debug.print("METASK_API_KEY is still set in your shell; a start signs in with it until you unset it.\n", .{});
+    }
+    var local = state_env_mod.load(allocator, state_dir, .{
+        .keys = &.{.{ .name = auth.METASK_API_KEY_ENV, .provider = "metask" }},
+    }) catch return;
+    defer local.deinit();
+    if (local.get(auth.METASK_API_KEY_ENV) != null) {
+        std.debug.print("METASK_API_KEY is still set in {s}; remove it there to stay signed out.\n", .{local.path});
+    }
 }
 
 /// `metacodes logout --provider <id>`: forget the API key stored for it.
@@ -4449,6 +4507,7 @@ test {
     _ = &@import("app/invocation.zig");
     _ = &@import("app/state_env.zig");
     _ = &@import("app/route_state.zig");
+    _ = &@import("app/sign_out.zig");
     _ = &@import("app/release_source.zig");
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");
