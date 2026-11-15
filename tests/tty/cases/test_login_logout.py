@@ -202,6 +202,7 @@ def test_logout_switches_to_the_env_provider_and_never_uses_the_sign_in_again(bi
         a = TTYAssert(raw, rows=30, cols=140)
         screen = _screen(a)
         assert "Signed out of Metask: removed the browser sign-in and the device-code sign-in." in screen, screen
+        assert "Switched to House relay (from .env) · relay-model\n" in screen + "\n", screen
         # Started on Metask (the sign-in outranks .env), and said why the
         # file's provider is not in use (第七节第 3 条); one turn there ...
         a.assert_prose_contains("glm-5 · Metask")

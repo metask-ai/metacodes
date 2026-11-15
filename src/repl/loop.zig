@@ -3301,10 +3301,7 @@ fn handleLogout(app: *app_mod.App, rest: []const u8) void {
     if (done.default_cleared) cmd_output.print("Forgot the default model, which was a Metask one.\n", .{});
     switch (done.session) {
         .kept => {},
-        .switched => |name| {
-            var line_buf: [256]u8 = undefined;
-            cmd_output.print("Switched to {s} (from .env) · {s}\n", .{ name, app.bannerModelLine(&line_buf) });
-        },
+        .switched => |name| cmd_output.print("Switched to {s} (from .env) · {s}\n", .{ name, app.activeModel() }),
         .unbound => cmd_output.print("{s}No model is set up now: /login, or configure .env{s}\n", .{ th.warn, th.reset }),
     }
     if (done.key_in_shell) cmd_output.print("{s}METASK_API_KEY is still set in your shell: the next start signs in with it.{s}\n", .{ th.warn, th.reset });
