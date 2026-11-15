@@ -1406,23 +1406,23 @@ pub const App = struct {
         models_json: ?[]const u8 = null,
     };
 
-    /// Move the session onto the Metask sign-in `/login` just stored: the
-    /// historical Metask API-key route (Anthropic Messages at the sign-in's
-    /// gateway, bearer auth) with the chosen key, model and reasoning level,
-    /// as a start on that `auth.json` would be. Nothing is sent. As in
-    /// `bindCommittedSelection`, whatever can fail goes first; the previous
-    /// strings are retired, not freed.
+    /// Move the session onto the Metask sign-in `/login` just stored, through
+    /// the kernel's selection commit like any `/model` pick, so everything
+    /// that reads the current offer (the picker, the next-step hints) names
+    /// Metask from here.
+    ///
+    /// First the sign-in becomes the session's Metask API-key route: its
+    /// gateway, its key (what `metaskKeyFor` offers a Metask commit from now
+    /// on, replacing any earlier key, #485), and the account's `/v1/models`
+    /// answer as the Metask inventory. Then the offer for the chosen model at
+    /// that gateway is committed for this session; the binding authenticates
+    /// it with the new key. Nothing is sent. A commit the kernel refuses
+    /// leaves the previous route in force (`bindCommittedSelection` is
+    /// all-or-nothing); the key route already belongs to the new sign-in,
+    /// which `auth.json` holds.
     pub fn bindMetaskSignIn(app: *App, sign_in: MetaskSignIn) !void {
         const origin = MetaskKeyRoute.gatewayOriginOf(sign_in.messages_url) orelse return error.UnexpectedUrl;
-        const endpoint = try app.allocator.dupe(u8, sign_in.messages_url);
-        errdefer app.allocator.free(endpoint);
-        const secret = try app.allocator.dupe(u8, sign_in.key);
-        errdefer {
-            std.crypto.secureZero(u8, secret);
-            app.allocator.free(secret);
-        }
-        // The key route's own copy: `/models` and a Metask pick in `/model`
-        // authenticate with it (`metaskKeyFor`).
+        const document = sign_in.models_json orelse return error.NoModelList;
         const route_key = try app.allocator.dupe(u8, sign_in.key);
         errdefer {
             std.crypto.secureZero(u8, route_key);
@@ -1430,48 +1430,10 @@ pub const App = struct {
         }
         const gateway = try app.allocator.dupe(u8, origin);
         errdefer app.allocator.free(gateway);
+        // Built first, so the inventory below is ingested into it.
+        const host = try app.providerHost();
 
-        const previous_key = app.api_key;
-        const previous_url = app.config.base_url;
-        const previous_kind = app.config.provider_kind;
-        const previous_protocol = app.config.openai_protocol;
-        const previous_scheme = app.config.auth_scheme;
-        const previous_dialect = app.config.dialect;
-        var jobs_rerouted = false;
-        errdefer if (jobs_rerouted) {
-            if (app.agent_jobs) |*jobs| jobs.setRoute(previous_key, previous_url, previous_kind, previous_protocol, previous_scheme, previous_dialect) catch {};
-        };
-        if (app.agent_jobs) |*jobs| {
-            try jobs.setRoute(secret, endpoint, .anthropic, .chat_completions, null, .{});
-            jobs_rerouted = true;
-        }
-        try app.switchModel(sign_in.model);
-
-        // Nothing fails from here on.
-        app.route_strings.install(endpoint, secret);
-        {
-            app.route_mutex.lock();
-            defer app.route_mutex.unlock();
-            app.config.provider_kind = .anthropic;
-        }
-        app.config.auth_scheme = null;
-        app.config.dialect = .{};
-        app.config.base_url = endpoint;
-        app.config.metask_oauth_selected = false;
-        // The startup offer (if any) is not this route; the key route marks
-        // the current offer from here (`seedStartupSelection`).
-        app.config.selected_offer_id = null;
-        app.api_key = secret;
-        app.api_client.credential = .{ .fixed = secret };
-        app.api_client.base_url = endpoint;
-        app.api_client.auth_scheme = null;
-        app.api_client.declared_dialect = .{};
-        app.swarm.api_key = secret;
-        app.swarm.base_url = endpoint;
-        app.swarm.provider_kind = .anthropic;
-        app.swarm.auth_scheme = null;
-        app.swarm.dialect = .{};
-
+        // Nothing below fails before the commit.
         if (app.metask_key_route) |*route| route.deinit(app.allocator);
         if (app.selected_api_key_owned) |old| {
             std.crypto.secureZero(u8, old);
@@ -1479,6 +1441,8 @@ pub const App = struct {
         }
         app.selected_api_key_owned = route_key;
         app.metask_key_route = .{ .gateway_origin = gateway, .startup_key = route_key };
+        // A device-code session is not what this sign-in authenticates with.
+        app.config.metask_oauth_selected = false;
         // The account's key list and the menu's place in it were the
         // previous sign-in's.
         app.api_key_catalog.clear();
@@ -1487,19 +1451,30 @@ pub const App = struct {
         app.models_picker_model_index = null;
         app.api_client.catalog.deinit();
         app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
-        if (sign_in.models_json) |document| {
-            app.api_client.catalog.loadFromModelsListJson(document) catch |err| {
-                @import("util/log.zig").debug("catalog", "sign-in /v1/models unusable: {s}", .{@errorName(err)});
-            };
-            app.adoptMetaskKeyModels(endpoint, document);
-        }
+        app.api_client.catalog.loadFromModelsListJson(document) catch |err| {
+            @import("util/log.zig").debug("catalog", "sign-in /v1/models unusable: {s}", .{@errorName(err)});
+        };
+        app.adoptMetaskKeyModels(sign_in.messages_url, document);
+
+        const offer = for (host.kernel.catalogSnapshot().items()) |*candidate| {
+            if (candidate.provider_id.eqlText("metask") and
+                std.mem.eql(u8, candidate.request_model_id, sign_in.model) and
+                std.mem.eql(u8, candidate.protocol, "anthropic_messages") and
+                std.mem.eql(u8, candidate.endpoint_ref, sign_in.messages_url)) break candidate;
+        } else return error.OfferUnavailable;
+        const committed = try app.commitModelSelection(.{
+            .offer_id = offer.offer_id,
+            .offer_revision = offer.offer_revision,
+            .controls = .{},
+            .scope = .session,
+        });
+        if (committed != .committed) return error.SelectionRefused;
         app.refreshChildCatalogSnapshots() catch |err| {
             @import("util/log.zig").warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
         };
         if (sign_in.effort) |effort| app.setReasoningEffort(effort) catch |err| {
             @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
         };
-        app.adoptBoundRoute(.metask);
     }
 
     /// What `/logout` did (#485).
@@ -1664,6 +1639,9 @@ pub const App = struct {
     /// gets an empty one, which the transports refuse before building a
     /// request, and the REPL refuses first.
     fn unbindRoute(app: *App, reason: route_state_mod.Unbound) void {
+        // No route is in force: the kernel's current offer goes too, so
+        // nothing that reads it names the provider just left.
+        if (app.provider_host) |host| host.kernel.forgetSessionSelection();
         if (app.agent_jobs) |*jobs| jobs.setApiKey("") catch {};
         app.api_key = "";
         app.api_client.credential = .{ .fixed = "" };

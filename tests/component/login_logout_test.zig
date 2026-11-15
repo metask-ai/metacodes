@@ -44,7 +44,9 @@ const OPENAI_SSE =
     "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" ++
     "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n" ++
     "data: [DONE]\n\n";
-const GATEWAY_MODELS = "{\"object\":\"list\",\"data\":[{\"id\":\"glm-5\",\"max_input_tokens\":200000,\"max_tokens\":32000}]}";
+const GATEWAY_MODELS = "{\"object\":\"list\",\"data\":[{\"id\":\"glm-5\",\"max_input_tokens\":200000,\"max_tokens\":32000},{\"id\":\"glm-5-air\",\"max_input_tokens\":128000,\"max_tokens\":16000}]}";
+/// The key a second `/login` hands over.
+const NEW_METASK_KEY = "sk-metask-signed-in-again";
 
 /// Sets (or unsets, with null) one variable and puts the old value back.
 const EnvGuard = struct {
@@ -212,6 +214,40 @@ fn expectNeverSent(server: *harness.MockServer, secret: []const u8) !void {
     }
 }
 
+/// The rendered offer id of `provider`'s offer for `model` on `protocol`.
+fn offerIdText(app: *App, provider: []const u8, model: []const u8, protocol: []const u8) ![cc.provider_ids.OFFER_ID_TEXT_LEN]u8 {
+    const host = try app.providerHost();
+    for (host.kernel.catalogSnapshot().items()) |offer| {
+        if (!offer.provider_id.eqlText(provider)) continue;
+        if (!std.mem.eql(u8, offer.request_model_id, model)) continue;
+        if (!std.mem.eql(u8, offer.protocol, protocol)) continue;
+        return offer.offer_id.render();
+    }
+    return error.OfferMissing;
+}
+
+/// The offer the provider kernel holds in force: what the picker marks and
+/// the next-step hints name.
+fn currentOffer(app: *App) !?*const cc.provider_registry.ModelOffer {
+    const host = try app.providerHost();
+    const id = host.kernel.currentOfferId() orelse return null;
+    return host.kernel.catalogSnapshot().find(id);
+}
+
+/// A `/model` pick of a Metask offer is refused for want of a credential:
+/// nothing of the signed-out account is offered for it. (The compiled
+/// offer's endpoint is Metask's own; a pick that wrongly succeeded is only
+/// bound, never sent.)
+fn expectMetaskPickRefused(app: *App) !void {
+    const offer = try offerIdText(app, "metask", "claude-sonnet-4-6", "anthropic_messages");
+    const outcome = cc.repl_picker_host.useSelector(app, &offer);
+    if (outcome != .failed) {
+        std.debug.print("a Metask pick after /logout was not refused: {s}\n", .{@tagName(outcome)});
+        return error.SignedOutKeyStillOffered;
+    }
+    try testing.expectEqualStrings("MissingCredentials", outcome.failed);
+}
+
 fn sendOneTurn(app: *App) !void {
     const messages = [_]cc.types_mod.ApiMessage{
         .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
@@ -283,6 +319,12 @@ test "/logout: a session on Metask moves to the .env provider and never sends th
     try testing.expectEqualStrings("Bearer " ++ RELAY_KEY, headerValue(captured, "authorization").?);
     try expectNeverSent(relay, METASK_KEY);
     try testing.expect(app.metask_key_route == null);
+    // The kernel holds the relay's offer: the switch was a selection commit.
+    const current = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(current.provider_id.eqlText("house-relay"));
+    // And Metask is not usable any more: its key went with the sign-in.
+    try expectMetaskPickRefused(app);
+    try testing.expectEqual(@as(usize, 1), gateway.requestCount());
 }
 
 test "/logout: with no .env provider the session is unbound and nothing is sent (#485)" {
@@ -312,6 +354,10 @@ test "/logout: with no .env provider the session is unbound and nothing is sent 
     defer reminder.deinit();
     try app.writeUnboundReminder(&reminder.writer);
     try expectContains(reminder.written(), "No model is set up: you signed out of Metask.\n");
+    // No offer is in force, and the old key is offered to no Metask pick.
+    try testing.expect((try currentOffer(app)) == null);
+    try expectMetaskPickRefused(app);
+    try testing.expectEqual(@as(usize, 0), gateway.requestCount());
 }
 
 test "/login: the chosen key and model become the session's route at once (#485)" {
@@ -346,11 +392,51 @@ test "/login: the chosen key and model become the session's route at once (#485)
     try testing.expect(app.sessionDir() != null);
     try testing.expectEqual(@as(usize, 0), gateway.requestCount());
 
+    const current = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(current.provider_id.eqlText("metask"));
+
     try sendOneTurn(app);
     const captured = gateway.lastRequest() orelse return error.NoRequestCaptured;
     try testing.expect(std.mem.startsWith(u8, requestLine(captured), "POST /v1/messages "));
     try testing.expectEqualStrings("Bearer " ++ METASK_KEY, headerValue(captured, "authorization").?);
     try testing.expectEqualStrings("\"glm-5\"", captured.jsonField("model").?);
+}
+
+test "/login again: the new key replaces the old one for every later Metask pick, and the kernel names its offer (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ ANTHROPIC_SSE, ANTHROPIC_SSE }, 0);
+    defer gateway.stop();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    // On the Metask API-key route with the old key (`main` built it from
+    // auth.json): `/models` and Metask picks would authenticate with it.
+    const app = try signedInApp(&case, io_runtime.io(), try originOf(a, gateway), null);
+    defer app.deinit();
+    try testing.expect(app.metask_key_route != null);
+
+    const messages_url = try std.fmt.allocPrint(a, "{s}/v1/messages", .{try originOf(a, gateway)});
+    try app.bindMetaskSignIn(.{ .messages_url = messages_url, .key = NEW_METASK_KEY, .model = "glm-5", .models_json = GATEWAY_MODELS });
+    // A selection commit: the kernel's current offer is the sign-in's.
+    const current = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(current.provider_id.eqlText("metask"));
+    try testing.expectEqualStrings("glm-5", current.request_model_id);
+    try testing.expectEqualStrings(messages_url, current.endpoint_ref);
+
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ NEW_METASK_KEY, headerValue(gateway.lastRequest().?, "authorization").?);
+    // A later pick of another of the account's models: still the new key.
+    const offer = try offerIdText(app, "metask", "glm-5-air", "anthropic_messages");
+    try testing.expect(cc.repl_picker_host.useSelector(app, &offer) == .switched);
+    try sendOneTurn(app);
+    const captured = gateway.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expectEqualStrings("Bearer " ++ NEW_METASK_KEY, headerValue(captured, "authorization").?);
+    try testing.expectEqualStrings("\"glm-5-air\"", captured.jsonField("model").?);
+    try expectNeverSent(gateway, METASK_KEY);
 }
 
 test "/logout <provider>: the stored key goes, and a session that ran on it holds none (#485)" {

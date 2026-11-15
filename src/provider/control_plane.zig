@@ -829,6 +829,15 @@ pub const Kernel = struct {
         self.global_selection = null;
     }
 
+    /// Forget this session's selection: the host left its route without
+    /// choosing another (`/logout` with nothing to fall back to, #485). Not
+    /// a commit: no route was chosen, so there is no event to replay.
+    pub fn forgetSessionSelection(self: *Kernel) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.session_selection = null;
+    }
+
     /// Install the route this session started on, as resolved by `--provider`,
     /// `--offer`, or a stored selection at boot.
     ///
