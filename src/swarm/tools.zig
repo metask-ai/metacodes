@@ -74,7 +74,7 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
     if (sw.state_root.len == 0) return error.SwarmUnavailable;
     if (sw.hasTeam()) return error.TeamAlreadyExists;
 
-    const name_raw = util_json.extractStringField(args, "name") orelse return error.MissingName;
+    const name_raw = util_json.topLevelStringField(args, "name") orelse return error.MissingName;
     const name = try util_json.unescapeString(name_raw, ctx.allocator);
     defer ctx.allocator.free(name);
     if (name.len == 0 or name.len > 64) return error.BadName;
@@ -102,7 +102,7 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
     // no in-process registry pointer) can reject stale members after a crash
     // or restart instead of addressing by name alone.
     tf.lead_session_id = try ctx.allocator.dupe(u8, sw.session.asSlice());
-    if (util_json.extractStringField(args, "description")) |d| {
+    if (util_json.topLevelStringField(args, "description")) |d| {
         const desc = try util_json.unescapeString(d, ctx.allocator);
         tf.description = desc; // owned by tf, freed in deinit
     }
@@ -223,17 +223,17 @@ pub fn executeSendMessage(ctx: *const ToolContext, args: []const u8) anyerror![]
     // run id differs by design; the SwarmContext itself is its authorization.
     if (sw.is_lead and !std.mem.eql(u8, sw.session.asSlice(), ctx.session.asSlice())) return error.NoActiveTeam;
 
-    const to_raw = util_json.extractStringField(args, "to") orelse return error.MissingRecipient;
+    const to_raw = util_json.topLevelStringField(args, "to") orelse return error.MissingRecipient;
     const to = try util_json.unescapeString(to_raw, ctx.allocator);
     defer ctx.allocator.free(to);
     if (to.len == 0) return error.MissingRecipient;
     if (std.mem.indexOfScalar(u8, to, '@') != null) return error.BadRecipient; // name 不含 @
 
-    const msg_raw = util_json.extractStringField(args, "message") orelse return error.MissingMessage;
+    const msg_raw = util_json.topLevelStringField(args, "message") orelse return error.MissingMessage;
     const message = try util_json.unescapeString(msg_raw, ctx.allocator);
     defer ctx.allocator.free(message);
 
-    const summary: ?[]const u8 = if (util_json.extractStringField(args, "summary")) |s|
+    const summary: ?[]const u8 = if (util_json.topLevelStringField(args, "summary")) |s|
         try util_json.unescapeString(s, ctx.allocator)
     else
         null;
@@ -359,7 +359,7 @@ pub fn executeSpawnTeammate(ctx: *const ToolContext, args: []const u8) anyerror!
     if (!sw.hasTeam()) return error.NoActiveTeam;
     if (!std.mem.eql(u8, sw.session.asSlice(), ctx.session.asSlice())) return error.NoActiveTeam;
 
-    const name_raw = util_json.extractStringField(args, "name") orelse return error.MissingName;
+    const name_raw = util_json.topLevelStringField(args, "name") orelse return error.MissingName;
     const name = try util_json.unescapeString(name_raw, ctx.allocator);
     defer ctx.allocator.free(name);
     var name_buf: [64]u8 = undefined;
@@ -367,12 +367,12 @@ pub fn executeSpawnTeammate(ctx: *const ToolContext, args: []const u8) anyerror!
     if (name_s.len == 0) return error.BadName;
     if (std.mem.eql(u8, name_s, team_mod.TEAM_LEAD_NAME)) return error.BadName;
 
-    const prompt_raw = util_json.extractStringField(args, "prompt") orelse return error.MissingMessage;
+    const prompt_raw = util_json.topLevelStringField(args, "prompt") orelse return error.MissingMessage;
     const prompt = try util_json.unescapeString(prompt_raw, ctx.allocator);
     defer ctx.allocator.free(prompt);
     if (prompt.len == 0) return error.MissingMessage;
 
-    const agent_type: ?[]const u8 = if (util_json.extractStringField(args, "agent_type")) |t|
+    const agent_type: ?[]const u8 = if (util_json.topLevelStringField(args, "agent_type")) |t|
         try util_json.unescapeString(t, ctx.allocator)
     else
         null;

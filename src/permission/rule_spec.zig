@@ -820,24 +820,13 @@ pub fn extractPath(args: []const u8) []const u8 {
         extractStringField(args, "path") orelse "";
 }
 
+/// A top-level string argument, still JSON-escaped: the same structural
+/// lookup the executors use (`tools/common.extractJsonArg`), so the rule
+/// matcher and the tool read the same member (issue #494).
 fn extractStringField(args: []const u8, field: []const u8) ?[]const u8 {
-    var buf: [128]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "\"{s}\":", .{field}) catch return null;
-    const idx = std.mem.indexOf(u8, args, key) orelse return null;
-    var pos = idx + key.len;
-    while (pos < args.len and (args[pos] == ' ' or args[pos] == '\t')) : (pos += 1) {}
-    if (pos >= args.len or args[pos] != '"') return null;
-    pos += 1;
-    var end = pos;
-    while (end < args.len) : (end += 1) {
-        if (args[end] == '\\') {
-            end += 1;
-            continue;
-        }
-        if (args[end] == '"') break;
-    }
-    if (end >= args.len) return null;
-    return args[pos..end];
+    const value = util_json_mod.topLevelField(args, field) orelse return null;
+    if (value.len < 2 or value[0] != '"') return null;
+    return value[1 .. value.len - 1];
 }
 
 // ============================================================================

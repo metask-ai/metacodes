@@ -1599,6 +1599,78 @@ test "L2 #445 SessionHost Options.models: a tier name resolves and a model the p
     try std.testing.expectEqual(@as(usize, 6), snapshot.messages);
 }
 
+test "L2 #445 SessionHost setModelCatalog: a refreshed catalog replaces the one model names resolve against, as the daemon adopts a refreshed /v1/models answer; the model in force stays" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ done, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+
+    // A Host without `Options.models` has no catalog to replace.
+    {
+        var plain = SessionHost.init(a, runtime, .{});
+        defer plain.deinit();
+        const one = [_]cc.session_host.CatalogModel{.{ .provider = .anthropic, .id = "fresh-model" }};
+        try std.testing.expectError(error.ModelPolicyUnset, plain.setModelCatalog(&one));
+    }
+
+    // The daemon's startup catalog (its cached `/v1/models`): `cached-model`.
+    const startup = [_]cc.session_host.CatalogModel{.{ .provider = .anthropic, .id = "cached-model" }};
+    var host = SessionHost.init(a, runtime, .{ .models = .{ .catalog = &startup } });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{}) });
+    defer host.release(hosted);
+
+    // Before the refresh, a model only the refreshed answer lists is refused.
+    try hosted.submit(.{ .text = "too early", .model = "fresh-model" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 1);
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    // The refresh lands. The Host's copy is the one in force: the caller's
+    // buffer is overwritten right after the call.
+    var refreshed_id = "fresh-model".*;
+    const refreshed = [_]cc.session_host.CatalogModel{.{ .provider = .anthropic, .id = &refreshed_id }};
+    try host.setModelCatalog(&refreshed);
+    @memset(&refreshed_id, 'x');
+    try hosted.submit(.{ .text = "after refresh", .model = "fresh-model" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"fresh-model\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"fresh-model\"}}"));
+
+    // A second refresh that no longer lists it: the startup catalog does not
+    // come back (replaced, not merged), the next name is checked against the
+    // new one, and the Session stays on the model it is on.
+    const later = [_]cc.session_host.CatalogModel{.{ .provider = .anthropic, .id = "later-model" }};
+    try host.setModelCatalog(&later);
+    try hosted.submit(.{ .text = "startup model again", .model = "cached-model" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 2);
+    try hosted.command(.{ .set_model = "fresh-model" });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_model\",\"ok\":false,\"error_name\":\"ModelUnavailable\""));
+    try hosted.submit(.{ .text = "no model given" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expect(try modelRead(server, 1, "\"model\":\"fresh-model\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model not available for current provider\",\"text\":\"too early\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model not available for current provider\",\"text\":\"startup model again\""));
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("fresh-model", snapshot.model);
+}
+
 test "L2 #445 SessionHost config sink: each accepted configuration command journals config_changed before its command_result, as the daemon's /model, /mode, /effort and /add-dir" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1983,4 +2055,146 @@ test "L2 #493 SessionHost cron: prompts due beyond max_queued stay due and fire 
     }
     try std.testing.expectEqual(bodies.len, server.requestCount());
     try std.testing.expect(try exists(workspace, "w.txt"));
+}
+
+/// `<dir>/<name>` written with `bytes`, creating `dir`.
+fn writeFileUnder(dir: []const u8, name: []const u8, bytes: []const u8) !void {
+    try cc.util_fs.mkdirParents(dir);
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name });
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.TestOpenFailed;
+    defer _ = pfs.close(fd);
+    if (!pfs.writeAll(fd, bytes)) return error.TestWriteFailed;
+}
+
+test "L2 #445 SessionHost project rules: an enforced Session opens the daemon's RunControl, so an active bundle it cannot attest fails the Run before any provider request; an ignored Session never reads it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state = try subdir(&tmp, "state", &state_buf);
+    const enforced_root = try std.fmt.allocPrint(a, "{s}/enforced", .{state});
+    defer a.free(enforced_root);
+    const ignored_root = try std.fmt.allocPrint(a, "{s}/ignored", .{state});
+    defer a.free(ignored_root);
+    // The daemon's layout: the bundle beside the session directories.
+    const rules_dir = try std.fmt.allocPrint(a, "{s}/project-rules", .{state});
+    defer a.free(rules_dir);
+    try writeFileUnder(rules_dir, cc.project_rule_bundle.ACTIVE_FILE, "{}");
+    // A kernel configuration that cannot be used (a path without its
+    // digest), whatever this build pins beside its executable.
+    @import("platform").paths.setEnv("METACODES_PROJECT_KERNEL_PATH", "/nonexistent/metacodes-project-kernel");
+    defer @import("platform").paths.unsetEnv("METACODES_PROJECT_KERNEL_PATH");
+
+    const answered = try textSse(a, "answered");
+    defer a.free(answered);
+    const bodies = [_][]const u8{answered};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+
+    // A policy with no journal to apply it to is refused, not ignored.
+    var ephemeral = baseConfig(url, workspace, home, &.{});
+    ephemeral.run_control = .{ .project_rules = .enforced };
+    try std.testing.expectError(error.RunControlRequiresRunJournal, host.open(.{ .config = ephemeral }));
+    ephemeral.run_control = .{ .abandoned_run = .record_abandoned };
+    try std.testing.expectError(error.RunControlRequiresRunJournal, host.open(.{ .config = ephemeral }));
+
+    var enforced_config = baseConfig(url, workspace, home, &.{});
+    enforced_config.run_journal = .{ .exact_root = enforced_root };
+    enforced_config.run_control = .{ .project_rules = .enforced };
+    const enforced = try host.open(.{ .config = enforced_config });
+    defer host.release(enforced);
+    try enforced.submit(.{ .text = "governed" });
+    try waitFor(&enforced.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&enforced.journal, "\"stop_reason\":null,\"error_name\":\"ProjectKernelConfigurationInvalid\""));
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    {
+        var snapshot = try enforced.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(cc.session_host.Phase.poisoned, snapshot.phase);
+    }
+    // The refused Run is closed in the journal, so it is no Run a later
+    // owner finds abandoned.
+    try std.testing.expect((try cc.tool_observation_journal.validate(enforced_root, enforced.id)).complete);
+
+    // The same bundle, the same kernel configuration: a Session that does
+    // not enforce project rules never loads them.
+    var ignored_config = baseConfig(url, workspace, home, &.{});
+    ignored_config.run_journal = .{ .exact_root = ignored_root };
+    const ignored = try host.open(.{ .config = ignored_config });
+    defer host.release(ignored);
+    try ignored.submit(.{ .text = "ungoverned" });
+    try waitFor(&ignored.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&ignored.journal, "\"stop_reason\":\"end_turn\""));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
+test "L2 #445 SessionHost project rules: a Run its dead owner left open keeps a fail_closed Session closed and is recorded abandoned under record_abandoned, as the daemon's RunControl does" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const journal_root = try subdir(&tmp, "journal", &root_buf);
+    const id = cc.session_id.SessionId.fromSlice("0a1b2c3d4e5f60718293a4b5").?;
+
+    // A process that died mid-Run: the journal goes away without the Run's
+    // terminal record.
+    {
+        var dead = try cc.tool_observation_journal.Journal.init(journal_root, id);
+        dead.deinit();
+    }
+
+    const answered = try textSse(a, "answered");
+    defer a.free(answered);
+    const bodies = [_][]const u8{answered};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{});
+    config.run_journal = .{ .exact_root = journal_root };
+
+    // The library default: the Session stays closed.
+    {
+        const closed = try host.open(.{ .config = config, .id = id });
+        defer host.release(closed);
+        try closed.submit(.{ .text = "first" });
+        try waitFor(&closed.journal, "\"type\":\"run_done\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&closed.journal, "\"stop_reason\":null,\"error_name\":\"UnfinishedRun\""));
+        try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+        try host.close(id);
+    }
+    try std.testing.expect(!(try cc.tool_observation_journal.validate(journal_root, id)).complete);
+
+    // The daemon's policy: the dead Run is closed as abandoned and this one
+    // runs.
+    config.run_control = .{ .abandoned_run = .record_abandoned };
+    const reopened = try host.open(.{ .config = config, .id = id });
+    defer host.release(reopened);
+    try reopened.submit(.{ .text = "second" });
+    try waitFor(&reopened.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&reopened.journal, "\"stop_reason\":\"end_turn\""));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expect((try cc.tool_observation_journal.validate(journal_root, id)).complete);
 }

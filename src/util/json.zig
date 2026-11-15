@@ -517,6 +517,51 @@ pub fn topLevelObjectField(data: []const u8, key: []const u8) ?[]const u8 {
     return if (value[0] == '{') value else null;
 }
 
+/// Top-level string member of a tool-argument object: the bytes between the
+/// quotes, **still JSON-escaped** (borrowed from data). Missing, or a value
+/// that is not a string → null. Tool executors read their arguments with the
+/// `topLevel*` lookups, never with the first-substring `extract*Field`
+/// family: a key inside a nested value or inside a string is not the
+/// argument, and whitespace around the colon is still the same key (#494).
+pub fn topLevelStringField(data: []const u8, key: []const u8) ?[]const u8 {
+    const value = topLevelField(data, key) orelse return null;
+    if (value.len < 2 or value[0] != '"') return null;
+    return value[1 .. value.len - 1];
+}
+
+/// Top-level boolean member (`true`/`false`). Missing or another type → null.
+pub fn topLevelBoolField(data: []const u8, key: []const u8) ?bool {
+    const value = topLevelField(data, key) orelse return null;
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return null;
+}
+
+/// Top-level member that is a string (inner bytes, still escaped) or a bare
+/// scalar lexeme (number/true/false/null), the structural counterpart of
+/// `extractStringOrNumberField` for id-like arguments. Object/array → null.
+pub fn topLevelStringOrNumberField(data: []const u8, key: []const u8) ?[]const u8 {
+    const value = topLevelField(data, key) orelse return null;
+    return switch (value[0]) {
+        '"' => if (value.len >= 2) value[1 .. value.len - 1] else null,
+        '{', '[' => null,
+        else => value,
+    };
+}
+
+test "topLevel*Field: structural tool-argument lookups (#494)" {
+    const args = "{\"o\":{\"name\":\"inner\"},\"name\" : \"outer\",\"bg\" :true,\"id\": 7,\"s\":\"\\\"name\\\":\\\"x\\\"\"}";
+    try std.testing.expectEqualStrings("outer", topLevelStringField(args, "name").?);
+    try std.testing.expect(topLevelBoolField(args, "bg").?);
+    try std.testing.expectEqualStrings("7", topLevelStringOrNumberField(args, "id").?);
+    try std.testing.expectEqualStrings("outer", topLevelStringOrNumberField(args, "name").?);
+    try std.testing.expect(topLevelStringOrNumberField(args, "o") == null);
+    try std.testing.expect(topLevelStringField(args, "id") == null);
+    try std.testing.expect(topLevelBoolField(args, "name") == null);
+    try std.testing.expect(topLevelStringField("{\"s\":\"\\\"k\\\":\\\"v\\\"\"}", "k") == null);
+    try std.testing.expect(topLevelStringField("{\"o\":{\"k\":\"v\"}}", "k") == null);
+}
+
 fn skipJsonWhitespace(data: []const u8, from: usize) usize {
     var i = from;
     while (i < data.len and (data[i] == ' ' or data[i] == '\t' or data[i] == '\n' or data[i] == '\r')) : (i += 1) {}

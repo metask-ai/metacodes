@@ -99,7 +99,7 @@ pub fn hostSupported() bool {
 /// chain does not auto-allow it as sandboxed.
 pub fn escapeHatchHonored(sb: *const config_mod.SandboxSettings, args_json: []const u8) bool {
     if (!sb.allow_unsandboxed_commands) return false;
-    return util_json.extractBoolField(args_json, "dangerouslyDisableSandbox") orelse false;
+    return util_json.topLevelBoolField(args_json, "dangerouslyDisableSandbox") orelse false;
 }
 
 /// 决定是否 / 如何沙箱化一条 bash 命令。

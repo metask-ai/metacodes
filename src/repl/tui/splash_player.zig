@@ -175,7 +175,7 @@ pub const Background = struct {
         const self = try gpa.create(Background);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .plan = plan, .style = style, .seed = seed };
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.thread = try @import("platform").thread.spawn(.full, run, .{self});
         return self;
     }
 

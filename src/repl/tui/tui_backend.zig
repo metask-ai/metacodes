@@ -457,7 +457,7 @@ pub const TuiBackend = struct {
         self.input_ctx.set(fd, app, allocator); // 持 I 锁写;spawn 的 release 另给初值可见性
         self.input_stop.store(false, .release);
         self.cancel_sent = false;
-        self.input_thread = try std.Thread.spawn(.{}, watcherMain, .{self});
+        self.input_thread = try @import("platform").thread.spawn(.full, watcherMain, .{self});
     }
 
     /// SIGINT 桥:abort 标志已置但连接还没被 shutdown → 代 handler 调 provider.cancel(一次)。
