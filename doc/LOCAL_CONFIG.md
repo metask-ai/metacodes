@@ -179,8 +179,9 @@ out of Metask and switches the session to the provider this file configures
 (`Switched to DeepSeek (from .env)`); later starts use it too.
 
 A file with keys of several providers and no `METACODES_PROVIDER` chooses
-none: metacodes stops and lists those providers, and you add
-`METACODES_PROVIDER` to pick one. A `METASK_API_KEY` among them is the
+none: the terminal UI opens without a model, as in step 5, and its red note
+lists those providers; you add `METACODES_PROVIDER` to pick one. `-p` stops
+instead, listing them the same way. A `METASK_API_KEY` among them is the
 exception: with no name in the file it is a Metask sign-in (step 3), so that
 file starts on Metask.
 
