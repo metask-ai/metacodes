@@ -557,11 +557,20 @@ fn readBounded(gpa: std.mem.Allocator, path: []const u8) ReadResult {
     path_buf[path.len] = 0;
     const path_z: [*:0]const u8 = @ptrCast(&path_buf);
     // Opening a FIFO for reading blocks until a writer comes: look first.
-    if (pfs.statMode(path_z, true)) |mode| {
-        if (mode & S_IFMT != S_IFREG) return .{ .status = .not_a_file };
+    // The look follows a symlink, so a `.env` linked from elsewhere still reads.
+    const mode = pfs.statMode(path_z, true);
+    if (mode) |bits| {
+        if (bits & S_IFMT != S_IFREG) return .{ .status = .not_a_file };
     }
     const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
-    if (fd < 0) return .{ .status = if (pfs.lastErrnoIs(.NOENT)) .absent else .unreadable };
+    if (fd < 0) {
+        if (pfs.lastErrnoIs(.NOENT)) return .{ .status = .absent };
+        // Windows gives no file type to the look above (`statMode` is null
+        // there), and its CRT cannot open a directory: ask the platform what
+        // the path is, so a directory reads as one there too.
+        if (mode == null and pfs.pathKindNoFollow(path_z) == .other) return .{ .status = .not_a_file };
+        return .{ .status = .unreadable };
+    }
     defer pfs.close(fd);
     const info = pfs.fileInfo(fd) catch return .{ .status = .unreadable };
     if (!info.is_regular) return .{ .status = .not_a_file };
@@ -856,30 +865,30 @@ test "load: the choice is METACODES_PROVIDER, else one provider's keys, else non
     // Two aliases of one provider are one provider.
     try root.write("ZAI_API_KEY=a\nGLM_API_KEY=b\n");
     var one = try load(testing.allocator, root.path, test_allowlist);
+    defer one.deinit();
     try testing.expectEqualStrings("zai-coding-plan", one.choice().provider.name);
-    one.deinit();
 
     try root.write("DEEPSEEK_API_KEY=a\nOPENAI_API_KEY=b\n");
     var several = try load(testing.allocator, root.path, test_allowlist);
+    defer several.deinit();
     const listed = several.choice().several;
     try testing.expectEqual(@as(usize, 2), listed.len);
     try testing.expectEqualStrings("deepseek", listed[0]);
     try testing.expectEqualStrings("openai", listed[1]);
-    several.deinit();
 
     try root.write("DEEPSEEK_API_KEY=a\nOPENAI_API_KEY=b\nMETACODES_PROVIDER=openai\nMETACODES_MODEL=gpt-x\n");
     var named = try load(testing.allocator, root.path, test_allowlist);
+    defer named.deinit();
     const chosen = named.choice().provider;
     try testing.expectEqualStrings("openai", chosen.name);
     try testing.expect(chosen.named);
     try testing.expectEqualStrings("gpt-x", named.get(model_variable).?);
-    named.deinit();
 
     // A catalog's token selects nothing; an empty provider name is unset.
     try root.write("CATALOG_TOKEN=a\nMETACODES_PROVIDER=\n");
     var none = try load(testing.allocator, root.path, test_allowlist);
+    defer none.deinit();
     try testing.expect(none.choice() == .none);
-    none.deinit();
 }
 
 test "load: absent, not a file, too large, no state root" {
@@ -887,19 +896,23 @@ test "load: absent, not a file, too large, no state root" {
     try root.init();
     defer root.tmp.cleanup();
 
+    // Each result is released by `defer`, so one failed expectation does not
+    // also report the others' memory as leaked.
     var absent = try load(testing.allocator, root.path, test_allowlist);
+    defer absent.deinit();
     try testing.expectEqual(Status.absent, absent.status);
     try testing.expect(absent.choice() == .none);
-    absent.deinit();
 
     var no_root = try load(testing.allocator, "", test_allowlist);
+    defer no_root.deinit();
     try testing.expectEqual(Status.no_state_root, no_root.status);
-    no_root.deinit();
 
+    // A directory named `.env` is not a file on every platform: POSIX says so
+    // before opening it, Windows when opening it fails.
     try root.tmp.dir.createDirPath(testing.io, file_name);
     var directory = try load(testing.allocator, root.path, test_allowlist);
+    defer directory.deinit();
     try testing.expectEqual(Status.not_a_file, directory.status);
-    directory.deinit();
     try root.tmp.dir.deleteDir(testing.io, file_name);
 
     const big = try testing.allocator.alloc(u8, max_file_bytes + 1);
@@ -907,8 +920,8 @@ test "load: absent, not a file, too large, no state root" {
     @memset(big, '#');
     try root.write(big);
     var too_large = try load(testing.allocator, root.path, test_allowlist);
+    defer too_large.deinit();
     try testing.expectEqual(Status.too_large, too_large.status);
-    too_large.deinit();
 }
 
 test "load: other users' access to the file is reported" {
@@ -922,14 +935,14 @@ test "load: other users' access to the file is reported" {
 
     _ = pfs.chmod(path_z.ptr, 0o644);
     var shared = try load(testing.allocator, root.path, test_allowlist);
+    defer shared.deinit();
     try testing.expectEqual(@as(?u32, 0o644), shared.permissions);
     try testing.expect(shared.sharedWithOthers());
-    shared.deinit();
 
     _ = pfs.chmod(path_z.ptr, 0o600);
     var private = try load(testing.allocator, root.path, test_allowlist);
+    defer private.deinit();
     try testing.expect(!private.sharedWithOthers());
-    private.deinit();
 }
 
 test "load: an ignored line not written like a variable name is reported by number only" {
