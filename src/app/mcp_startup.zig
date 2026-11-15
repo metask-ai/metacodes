@@ -286,7 +286,7 @@ pub const Startup = struct {
                 job.settle();
                 continue;
             }
-            thread.* = std.Thread.spawn(.{}, Job.run, .{job}) catch blk: {
+            thread.* = @import("platform").thread.spawn(.full, Job.run, .{job}) catch blk: {
                 job.run();
                 break :blk null;
             };

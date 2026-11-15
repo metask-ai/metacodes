@@ -40,6 +40,8 @@ const ToolExecutionPolicy = @import("../tools.zig").ToolExecutionPolicy;
 const ToolDispatcher = @import("../tools.zig").ToolDispatcher;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
 const tool_observation_journal = @import("tool_observation_journal.zig");
+const project_rule_activation = @import("project_rule_activation.zig");
+const log = @import("../util/log.zig");
 const util_fs = @import("../util/fs.zig");
 const prompt_sections = @import("prompt_sections.zig");
 const goal_mod = @import("goal.zig");
@@ -776,6 +778,40 @@ pub const RunJournalConfig = union(enum) {
     }
 };
 
+/// What a Run whose process died, without its terminal record, gets when the
+/// next Run opens the durable journal (`tool_observation_journal`).
+pub const AbandonedRunPolicy = tool_observation_journal.AbandonedRunPolicy;
+
+/// Whether a Session's Runs are gated by the project's active rule bundle.
+pub const ProjectRules = enum {
+    /// No bundle is consulted (the default, and every Session before #445).
+    ignored,
+    /// As the bundled daemon gates a Run (`project_rule_activation.RunControl`):
+    /// when `<dirname(run journal root)>/project-rules` has an active bundle
+    /// for the workspace root, it is re-attested before the provider request
+    /// and decides each tool call through the project kernel; a missing or
+    /// invalid kernel configuration, a bundle that fails attestation, or a
+    /// running background job or active team fails the Run before any
+    /// provider request. After the Run the bundle is re-attested and the
+    /// Run's operational observation published.
+    enforced,
+};
+
+/// The per-Run control a durable Session's Runs open (#445), the
+/// `RunControl` the bundled daemon opens for each Run. Only a durable
+/// `run_journal` has one: anything but the default on an ephemeral Session
+/// is refused at creation (`error.RunControlRequiresRunJournal`).
+pub const RunControlConfig = struct {
+    /// The daemon records an abandoned Run (`record_abandoned`); a library
+    /// Session stays closed by default (`UnfinishedRun`).
+    abandoned_run: AbandonedRunPolicy = .fail_closed,
+    project_rules: ProjectRules = .ignored,
+
+    fn isDefault(self: RunControlConfig) bool {
+        return self.abandoned_run == .fail_closed and self.project_rules == .ignored;
+    }
+};
+
 pub const SessionConfig = struct {
     provider_kind: types.ProviderKind,
     /// OpenAI wire protocol. Public adapters validate provider/protocol
@@ -809,6 +845,9 @@ pub const SessionConfig = struct {
     /// export: checkpoints preserve committed model state; the Run journal
     /// preserves effects that may be in flight across a process crash.
     run_journal: RunJournalConfig = .ephemeral,
+    /// What each Run opens on the durable `run_journal` (#445): the
+    /// abandoned-Run policy and the project rule gate.
+    run_control: RunControlConfig = .{},
     /// Explicit Host authority ceiling. The kernel adds only ReadArtifact when
     /// `artifact_store` is enabled; no other global built-in fallback exists.
     allowed_tools: []const []const u8,
@@ -1366,6 +1405,12 @@ pub const AdmittedRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         }
+        // The executor runs its own loop, out of the project rule gate's
+        // reach: refused before anything changes, the Session still usable.
+        if (self.session.run_control.project_rules == .enforced) {
+            _ = try self.finishWithoutConversation();
+            return error.ProjectRulesUnsupportedForIsolatedRun;
+        }
         try self.session.claimAdmittedRun(self.identity_value);
         self.completed = true;
         // The executor runs on its own Conversation, discarded when it returns:
@@ -1393,10 +1438,10 @@ pub const AdmittedRun = struct {
         var run_journal: ?tool_observation_journal.Journal = if (self.session.run_journal_root.len == 0)
             null
         else
-            tool_observation_journal.Journal.initWithPrompt(
+            tool_observation_journal.Journal.initWithOptions(
                 self.session.run_journal_root,
                 self.identity_value.session_id,
-                rendered_prompt.manifest,
+                .{ .prompt = rendered_prompt.manifest, .abandoned_run = self.session.run_control.abandoned_run },
             ) catch |err| {
                 _ = self.session.poisonRun();
                 return err;
@@ -1486,6 +1531,8 @@ pub const AgentSession = struct {
     workspace: workspace_mod.WorkspacePolicy,
     artifact_root: []u8,
     run_journal_root: []u8,
+    /// `SessionConfig.run_control`; meaningful only with a durable journal.
+    run_control: RunControlConfig,
     tool_result_metrics: @import("tool_result_metrics.zig").Metrics = .{},
     tools: tool_catalog.Selection,
     read_state: ReadState,
@@ -1617,6 +1664,8 @@ pub const AgentSession = struct {
 
     fn createWithHooks(runtime: *AgentRuntime, config: SessionConfig, hooks: SessionCreateHooks) !*AgentSession {
         if (system_prompt_mod.validateProfile(config.prompt_profile) != null) return error.InvalidPromptProfile;
+        // A policy without the journal it governs would be a silent no-op.
+        if (!config.run_journal.enabled() and !config.run_control.isDefault()) return error.RunControlRequiresRunJournal;
         try runtime.retainSession();
         errdefer runtime.releaseSession();
         const allocator = runtime.allocator;
@@ -1748,6 +1797,7 @@ pub const AgentSession = struct {
             .workspace = workspace,
             .artifact_root = artifact_root,
             .run_journal_root = run_journal_root,
+            .run_control = config.run_control,
             .tools = selected_tools,
             .read_state = ReadState.init(allocator),
             .jobs = jobs,
@@ -2885,20 +2935,21 @@ pub const AgentSession = struct {
         defer rendered_prompt.deinit(self.allocator);
         const system_prompt: ?[]const u8 = rendered_prompt.text;
 
-        var run_journal: ?tool_observation_journal.Journal = if (self.run_journal_root.len == 0)
+        // #445: the bundled daemon's per-Run control. It opens the durable
+        // journal and, under `project_rules = .enforced`, loads and
+        // re-attests the active project rule bundle; a refusal fails the Run
+        // before any provider request or tool action, as a journal that
+        // cannot open does.
+        const run_control: ?*project_rule_activation.RunControl = if (self.run_journal_root.len == 0)
             null
         else
-            tool_observation_journal.Journal.initWithPrompt(
-                self.run_journal_root,
-                identity.session_id,
-                rendered_prompt.manifest,
-            ) catch |err| {
+            self.openRunControl(identity, rendered_prompt.manifest) catch |err| {
                 _ = self.poisonRun();
                 return err;
             };
-        defer if (run_journal) |*journal| journal.deinit();
+        defer if (run_control) |control| control.deinit();
         self.announcePromptManifest(rendered_prompt.manifest) catch |err| {
-            if (run_journal) |*journal| journal.finishRun(@errorName(err)) catch {};
+            if (run_control) |control| control.finishRun(@errorName(err)) catch {};
             _ = self.poisonRun();
             return err;
         };
@@ -2917,8 +2968,9 @@ pub const AgentSession = struct {
             .tool_defs = tool_definitions,
             .tool_dispatcher = tool_dispatcher,
             .execution_policy = effective_execution_policy,
-            .tool_observer = if (run_journal) |*journal| journal.sink() else null,
-            .execution_boundary = if (run_journal) |*journal| journal.executionBoundary() else null,
+            .tool_observer = if (run_control) |control| control.observer() else null,
+            .execution_boundary = if (run_control) |control| control.executionBoundary() else null,
+            .project_rule_gate = if (run_control) |control| control.formalGate() else null,
             .agent_ident = identity.session_id,
             // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
             .host_run = if (self.host_identity_ctx) |hctx| .{
@@ -2952,7 +3004,7 @@ pub const AgentSession = struct {
             agent_loop.resumeRunWithResults(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, results, run_options, &backend, self.allocator)
         else
             agent_loop.run(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, run_options, &backend, self.allocator)) catch |err| {
-            if (run_journal) |*journal| journal.finishRun(@errorName(err)) catch {};
+            if (run_control) |control| control.finishRun(@errorName(err)) catch {};
             if (err == error.HostToolFatal) {
                 self.mutex.lock();
                 self.callback_failed = true;
@@ -2963,7 +3015,7 @@ pub const AgentSession = struct {
             return err;
         };
 
-        if (run_journal) |*journal| journal.finishRun(@tagName(native_result.stop_reason)) catch {
+        if (run_control) |control| control.finishRun(@tagName(native_result.stop_reason)) catch {
             if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
             _ = self.poisonRun();
             return error.RunJournalFailed;
@@ -2976,6 +3028,48 @@ pub const AgentSession = struct {
         }
         if (completion.abort_requested) native_result.stop_reason = .aborted;
         return native_result;
+    }
+
+    /// The Run's `RunControl` on the durable journal (#445), as
+    /// `daemon/app_driver.zig` opens one per Run: the bundle of the
+    /// workspace root when `project_rules` is enforced, then the
+    /// detached-worker check the daemon makes (a Bash job of this Session
+    /// still running, or a team). A refusal after the journal opened closes
+    /// the Run in it under the error's name.
+    fn openRunControl(
+        self: *AgentSession,
+        identity: RunIdentity,
+        prompt: prompt_sections.Manifest,
+    ) !*project_rule_activation.RunControl {
+        var report: tool_observation_journal.OpenReport = .{};
+        const control = try project_rule_activation.RunControl.initWithOptions(
+            self.allocator,
+            self.run_journal_root,
+            identity.session_id,
+            .{
+                .project_root = switch (self.run_control.project_rules) {
+                    .ignored => null,
+                    .enforced => self.workspace.root,
+                },
+                .abandoned_run = self.run_control.abandoned_run,
+                .prompt = prompt,
+                .abort = &self.abort_signal,
+                .report = &report,
+            },
+        );
+        errdefer control.deinit();
+        if (report.unfinished) |abandoned| {
+            var text: [512]u8 = undefined;
+            log.warn("agent_session", "{s}", .{tool_observation_journal.describeAbandoned(&text, &abandoned)});
+        }
+        control.requireDetachedIdle(
+            if (self.jobs) |*registry| registry.runningCountForOwner(self.session_id) else 0,
+            if (self.swarm) |*swarm| swarm.hasTeam() else false,
+        ) catch |err| {
+            control.finishRun(@errorName(err)) catch {};
+            return err;
+        };
+        return control;
     }
 
     const RunCompletion = struct {

@@ -28,6 +28,10 @@ These rules apply to the entire repository.
   `std.Io.Threaded.init`: std's init replaces the ignored SIGPIPE with a
   handler, and a delivered SIGPIPE turns any thread's blocked syscall into
   EINTR (`zig build test:io-threaded` enforces it).
+- Spawn production threads through `platform.thread.spawn(stack, ...)`, never
+  `std.Thread.spawn`: std's 16 MiB default stack is a 16 MiB commit per thread
+  on Windows. Pick the `Stack` class by what the thread runs; outside test
+  blocks `zig build test:thread-stack` enforces it.
 - The REPL's SIGWINCH handler has no SA_RESTART either. In `src/repl/`, read
   keys through `input.readKey` or check `input.retryInterruptedRead` right
   after a raw read, and write to the terminal through `pfs.writeAll`; a call

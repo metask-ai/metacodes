@@ -919,6 +919,13 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
 `Snapshot.cron_jobs` 看任务、经 `cancel_cron_job`/`cancel_all_cron_jobs` 命令删任务
 (#493,见 `API.md` 的 SessionHost 一节)。C ABI 不提供 cron 工具。
 
+`SessionConfig.run_control`(issue #445)让 durable Session 的每个 Run 打开 daemon 那一套
+`project_rule_activation.RunControl`:`project_rules = .enforced` 时由
+`<dirname(run journal 根)>/project-rules` 的 active bundle 门控工具调用(加载失败、或仍有
+后台 Bash job / team 时 Run 在 provider 请求前失败),`abandoned_run = .record_abandoned`
+把死掉的 owner 留下的 Run 记为 abandoned 后继续。ephemeral Session 设置非默认值被拒
+(`RunControlRequiresRunJournal`)。C ABI 不暴露它。
+
 ---
 
 ## 7. 已知约束与边界(诚实清单)

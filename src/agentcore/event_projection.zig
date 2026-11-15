@@ -99,8 +99,10 @@ pub const Projector = struct {
         if (self.reconstruction_error != null) return error.OutOfMemory;
         var found: ?[]const u8 = null;
         for (self.tool_attempts.items) |attempt| {
+            // The attempt keeps the model's bytes; the permission path asks
+            // with the admitted canonical spelling (#494).
             if (!std.mem.eql(u8, attempt.name, tool_name) or
-                !std.mem.eql(u8, attempt.input, input)) continue;
+                !try core.tool_args.sameArgs(allocator, attempt.input, input)) continue;
             if (found != null) return error.InvalidIdentity;
             found = attempt.id;
         }

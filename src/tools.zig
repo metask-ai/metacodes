@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = @import("json.zig");
+const util_json = @import("util/json.zig");
 
 const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
@@ -890,16 +891,13 @@ pub fn executeTool(tool: *const ToolEntry, ctx: *const ToolContext, args: []cons
 /// Schema 层校验(对齐 cc 的 zod safeParse 层):执行前检查 input JSON 含所有 required
 /// 字段。缺则返回字段具名错误(agent_loop 转 invalid_args 现场给模型)。
 /// 这是工具自身 MissingX 检查之外的统一前置层——uniform + 在 dispatch 前拦,且对没写
-/// 自检的工具也兜底。检查用顶层 "field": 子串(与 extractJsonArg 同口径,够分辨缺失)。
+/// 自检的工具也兜底。The field must be a top-level member (the same structural
+/// lookup as `extractJsonArg`), not a substring found anywhere in the text.
 pub fn validateRequired(name: []const u8, args: []const u8) anyerror!void {
     const t = getTool(name) orelse return; // 动态工具(MCP/Skill)走自己的校验
     const required = t.input_schema.required orelse return;
     for (required) |field| {
-        var pat_buf: [128]u8 = undefined;
-        if (field.len + 3 > pat_buf.len) continue;
-        // 匹配 "field": (顶层键)。简化:子串匹配(args 是工具入参 JSON,误报概率极低)。
-        const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{field}) catch continue;
-        if (std.mem.indexOf(u8, args, pat) == null) return missingRequiredFieldError(field);
+        if (util_json.topLevelField(args, field) == null) return missingRequiredFieldError(field);
     }
 }
 
@@ -981,20 +979,11 @@ pub fn validateTypes(name: []const u8, args: []const u8) error{InvalidFieldType}
 
 const JsonKind = enum { string, number, boolean, null_, array, object };
 
-/// 定位顶层 "key": 后的值,判其 JSON 类型(单点探测,不解析整树)。
+/// The JSON type of the top-level member `key`, by the structural lookup
+/// every executor uses (`util/json.topLevelField`).
 fn jsonValueKind(args: []const u8, key: []const u8) ?JsonKind {
-    var pat_buf: [128]u8 = undefined;
-    if (key.len + 3 > pat_buf.len) return null;
-    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return null;
-    const at = std.mem.indexOf(u8, args, pat) orelse return null;
-    var p = at + pat.len;
-    // 跳过空白到冒号
-    while (p < args.len and (args[p] == ' ' or args[p] == '\t')) : (p += 1) {}
-    if (p >= args.len or args[p] != ':') return null;
-    p += 1;
-    while (p < args.len and (args[p] == ' ' or args[p] == '\t' or args[p] == '\n' or args[p] == '\r')) : (p += 1) {}
-    if (p >= args.len) return null;
-    return switch (args[p]) {
+    const value = util_json.topLevelField(args, key) orelse return null;
+    return switch (value[0]) {
         '"' => .string,
         '[' => .array,
         '{' => .object,

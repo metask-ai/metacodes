@@ -5160,7 +5160,7 @@ const StartupSuggestionGit = struct {
 
     fn start(self: *StartupSuggestionGit) void {
         self.started_ms = util_time.nowMs();
-        self.thread = std.Thread.spawn(.{}, fetch, .{self}) catch null;
+        self.thread = @import("platform").thread.spawn(.full, fetch, .{self}) catch null;
     }
 
     fn fetch(self: *StartupSuggestionGit) void {
