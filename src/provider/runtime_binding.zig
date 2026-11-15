@@ -63,6 +63,8 @@ pub const CredentialSources = struct {
     stored_oauth: ?credential.StoredEntry = null,
     precedence: credential.AuthPrecedence = .api_key_first,
     env: credential.EnvLookup = credential.EnvLookup.empty(),
+    /// The host's layer below `env` (`credential.ResolveInput.env_fallback`).
+    env_fallback: credential.EnvLookup = credential.EnvLookup.empty(),
     now_seconds: i64 = 0,
     /// The provider's credential pool. When the offer names a `credential_ref`,
     /// *that* member is used — the reference is part of the route identity, so
@@ -181,6 +183,7 @@ pub fn bindOffer(
         .stored_oauth = sources.stored_oauth,
         .precedence = sources.precedence,
         .env = sources.env,
+        .env_fallback = sources.env_fallback,
         .now_seconds = sources.now_seconds,
         .pool = sources.pool,
     }, ref_id_buffer);
@@ -355,6 +358,27 @@ test "binding fails before I/O when no eligible credential exists" {
         &buffer,
         false,
     ));
+}
+
+test "the host's layer below the environment reaches binding, behind the environment" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    const offer = offerFor(&catalog, "cn-anthropic", "glm-5.3");
+
+    var empty = TestEnv{ .pairs = &.{} };
+    var file = TestEnv{ .pairs = &.{.{ "ZAI_API_KEY", "file-secret" }} };
+    const from_file = try bindOffer(&registry, offer, .{ .env = empty.lookup(), .env_fallback = file.lookup() }, &buffer, false);
+    try std.testing.expectEqualStrings("file-secret", from_file.secret);
+
+    // Another alias of the same provider in the environment wins, and the
+    // differing value below it is not a conflict.
+    var env = TestEnv{ .pairs = &.{.{ "GLM_API_KEY", "env-secret" }} };
+    const from_env = try bindOffer(&registry, offer, .{ .env = env.lookup(), .env_fallback = file.lookup() }, &buffer, false);
+    try std.testing.expectEqualStrings("env-secret", from_env.secret);
 }
 
 test "a command-line key binds only the provider it was given for" {

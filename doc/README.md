@@ -5,7 +5,8 @@ Start here rather than reading design ledgers chronologically.
 ## Start here
 
 - **Using metacodes:** [Getting started](GETTING_STARTED.md) — install,
-  providers, Metask OAuth, build from source; [Terminal setup](TERMINAL_SETUP.md)
+  providers, Metask OAuth, build from source; [Local configuration](LOCAL_CONFIG.md)
+  — your own provider key in the install's `.env`; [Terminal setup](TERMINAL_SETUP.md)
   — Shift+Enter for a newline in Apple Terminal and VS Code.
 - **Embedding it in your program:** [API overview](API.md), then
   [LIB_API](LIB_API.md) for Zig hosts or the

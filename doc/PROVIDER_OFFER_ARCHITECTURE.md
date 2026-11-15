@@ -372,6 +372,15 @@ runtime descriptor → profile-declared environment aliases → persisted store
 (expiry aware) → interactive setup. `api_key_first`/`oauth_first` only reorders
 the last two steps *within one provider*; it never widens scope.
 
+A host may keep a layer below the process environment
+(`ResolveInput.env_fallback`): the CLI's `<state root>/.env`
+([LOCAL_CONFIG.md](LOCAL_CONFIG.md)). It is read for a provider's aliases only
+when the process environment sets none of them, so an alias in the
+environment and another in the file is never an ambiguity; two aliases with
+different values inside the file still are. The pool's credential variables
+and a catalog's `credential_env` are read from it when the environment leaves
+them unset. AgentCore and every other embedder keep no such layer.
+
 Because aliases are profile data, a Metask key is not reachable from an OpenAI
 or Z.AI resolution at all. `--api-key` is the one key that arrives without a
 kind or a provider, and every API-key profile would accept it — ahead of its

@@ -11,7 +11,8 @@
 //! launcher in a directory on PATH. The installed executable checks itself
 //! with `doctor --strict`.
 //!
-//! Writes happen only under `--prefix`, the state root, and the `--link`
+//! Writes happen only under `--prefix`, the state root (where only the
+//! `.env.example` template is written, never `.env`), and the `--link`
 //! directory. A prefix that holds anything but this product's own install is
 //! refused unless `--force`; reinstalling the same version over itself is
 //! allowed, and `--upgrade` replaces another version of this product's install
@@ -20,8 +21,8 @@
 //! backwards when that label points at an older version. A launcher name held
 //! by another metacodes install is reported with that install's prefix and
 //! version. Replacing a version removes the files the previous
-//! unit's manifest listed and the new one does not; the state root is never
-//! touched. Install logic lives here, once, for every platform:
+//! unit's manifest listed and the new one does not; in the state root only
+//! the template is rewritten. Install logic lives here, once, for every platform:
 //! scripts/install.sh and scripts/install.ps1 only unpack an archive and call
 //! this.
 
@@ -58,6 +59,11 @@ pub const Options = struct {
     update_source: SourceChoice = .keep,
     /// Run the installed executable's `doctor --strict` (tests switch it off).
     self_check: bool = true,
+    /// The text of `<state root>/.env.example`, the local-configuration
+    /// template (#486; `state_env.renderExample`). Written on every install
+    /// and upgrade, so it lists the providers of the version installed;
+    /// `.env` itself is never created or touched. Null writes none.
+    local_config_template: ?[]const u8 = null,
 };
 
 pub const SourceChoice = union(enum) {
@@ -103,6 +109,8 @@ const unit_name = "metacodes-cli";
 const unit_schema: u32 = 2;
 const sdk_name = "agentcore";
 const install_manifest_rel = state_root.manifest_relative_path;
+/// `state_env.example_file_name`, beside the `.env` it documents.
+const local_config_example = ".env.example";
 const max_artifact_bytes = 256 << 20;
 
 pub const FileEntry = struct { path: []const u8, sha256: []const u8 };
@@ -245,6 +253,11 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
     if (previous) |old| try removeDropped(arena, io, prefix, old, manifest, log);
     try log.print("installed metacodes {s}: {d} files verified under {s}\n", .{ version, manifest.files.len, prefix });
     try log.print("state root: {s}{s}\n", .{ resolved_root, if (kept_root != null) " (kept from the install record)" else "" });
+    if (options.local_config_template) |template| {
+        const example = try std.fs.path.join(arena, &.{ resolved_root, local_config_example });
+        try cwd.writeFile(io, .{ .sub_path = example, .data = template });
+        try log.print("local configuration: {s}{c}.env (template: {s})\n", .{ resolved_root, std.fs.path.sep, example });
+    }
     switch (update_source) {
         .default_release => try log.print("updates from: {s}\n", .{release_source.default_release_base}),
         .mirror => |base| try log.print("updates from: {s} (a mirror)\n", .{base}),
@@ -1084,6 +1097,41 @@ test "a reinstall or upgrade keeps the recorded state root unless --state-dir na
     const first = try run(arena, testing.io, newer, .{ .prefix = fresh, .self_check = false }, &log.writer);
     try testing.expectEqualStrings(try std.fs.path.join(arena, &.{ fresh, "state" }), first.state_root);
     try testing.expect(std.mem.indexOf(u8, try read(arena, try fixture.path(arena, "opt/fresh/etc/metacodes/install.json")), "\"state_root\": \"state\"") != null);
+}
+
+test "install and upgrade rewrite the .env.example template and never create or touch .env (#486)" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+    const prefix = try fixture.path(arena, "opt/mc");
+    const example = try fixture.path(arena, "opt/mc/state/.env.example");
+    const env = try fixture.path(arena, "opt/mc/state/.env");
+
+    _ = try run(arena, testing.io, try fixture.unit(arena, "0.3.0", &unit_files), .{
+        .prefix = prefix,
+        .self_check = false,
+        .local_config_template = "# template 0.3.0\n",
+    }, &log.writer);
+    try testing.expectEqualStrings("# template 0.3.0\n", try read(arena, example));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, env, .{}));
+
+    // The user's file survives an upgrade byte for byte; the template follows
+    // the version installed.
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "opt/mc/state/.env", .data = "DEEPSEEK_API_KEY=mine\n" });
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    _ = try run(arena, testing.io, try fixture.unit(arena, "0.4.0", &unit_files), .{
+        .prefix = prefix,
+        .upgrade = true,
+        .self_check = false,
+        .local_config_template = "# template 0.4.0\n",
+    }, &log.writer);
+    try testing.expectEqualStrings("# template 0.4.0\n", try read(arena, example));
+    try testing.expectEqualStrings("DEEPSEEK_API_KEY=mine\n", try read(arena, env));
 }
 
 test "the record names its update source: set, kept across reinstalls, replaced and cleared" {

@@ -182,6 +182,8 @@ zig build && ./zig-out/bin/metacodes --help
 zig build example                          # 在 Zig 程序里嵌入运行时
 ```
 
+不登录、改用自己的 provider key：写进本安装的 `~/.local/opt/metacodes/state/.env`，重新启动即可，见 [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md)。
+
 隔离安装、provider 配置、Metask OAuth、Lean 内核和 Windows 等细节见 [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md)。
 
 ## 架构
@@ -241,6 +243,7 @@ metacodes 由 Metask Lab 开发，也就是 [Metask](https://app.metask-ai.com)�
 | | |
 |---|---|
 | [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) | 安装、provider、从源码构建 |
+| [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md) | 在本安装的 `.env` 里配置自己的 provider key |
 | [doc/API.md](doc/API.md) | 所有受支持的入口及其兼容性 |
 | [doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md) | C ABI 的规范性契约 |
 | [doc/BENCHMARKS.md](doc/BENCHMARKS.md) | metacodes 如何被测量，以及迄今所有结果 |

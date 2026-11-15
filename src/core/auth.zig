@@ -119,7 +119,21 @@ pub fn resolveCredential(
     cli_api_key: ?[]const u8,
     precedence: AuthPrecedence,
 ) !ResolvedCredential {
-    const env_api_key = if (std.c.getenv(METASK_API_KEY_ENV)) |v| std.mem.span(v) else null;
+    return resolveCredentialWithEnvFallback(allocator, state_root, cli_api_key, precedence, null);
+}
+
+/// `resolveCredential` for a host that keeps a layer below the process
+/// environment (the CLI's `<state root>/.env`, #486). `env_fallback_api_key`
+/// is `METASK_API_KEY` in that layer: it counts as the environment variable,
+/// and only when the process environment leaves that unset.
+pub fn resolveCredentialWithEnvFallback(
+    allocator: std.mem.Allocator,
+    state_root: []const u8,
+    cli_api_key: ?[]const u8,
+    precedence: AuthPrecedence,
+    env_fallback_api_key: ?[]const u8,
+) !ResolvedCredential {
+    const env_api_key = if (std.c.getenv(METASK_API_KEY_ENV)) |v| std.mem.span(v) else env_fallback_api_key;
     const path = authFilePath(allocator, state_root) catch |err| switch (err) {
         error.NoHome => null,
         else => return err,
@@ -161,6 +175,18 @@ pub fn resolveRuntimeCredential(
     cli_api_key: ?[]const u8,
     precedence: AuthPrecedence,
 ) !ResolvedCredential {
+    return resolveRuntimeCredentialWithEnvFallback(allocator, state_root, cli_api_key, precedence, null);
+}
+
+/// `resolveRuntimeCredential` with the host's layer below the process
+/// environment (`resolveCredentialWithEnvFallback`).
+pub fn resolveRuntimeCredentialWithEnvFallback(
+    allocator: std.mem.Allocator,
+    state_root: []const u8,
+    cli_api_key: ?[]const u8,
+    precedence: AuthPrecedence,
+    env_fallback_api_key: ?[]const u8,
+) !ResolvedCredential {
     var fd_api_key = try takeRuntimeFdApiKey(allocator);
     defer if (fd_api_key) |*runtime| runtime.deinit(allocator);
     if (cli_api_key != null and fd_api_key != null) return error.AmbiguousRuntimeCredentials;
@@ -168,8 +194,10 @@ pub fn resolveRuntimeCredential(
     // pointer block: HTTPS lazily scans that borrowed block while loading the
     // CA bundle, and unsetenv can otherwise turn it into a use-after-free.
     // An ambient key alongside FD authority is rejected and the process exits,
-    // instead of trying to scrub the second channel in place.
-    if (fd_api_key != null and std.c.getenv(METASK_API_KEY_ENV) != null) {
+    // instead of trying to scrub the second channel in place. A key in the
+    // layer below the environment is a second channel too: a teammate this
+    // process starts reads the same file.
+    if (fd_api_key != null and (std.c.getenv(METASK_API_KEY_ENV) != null or env_fallback_api_key != null)) {
         return error.AmbiguousRuntimeCredentials;
     }
 
@@ -179,7 +207,7 @@ pub fn resolveRuntimeCredential(
     var credential = if (fd_api_key) |runtime|
         try credentialFromApiKey(allocator, runtime.bytes, .fd_api_key)
     else
-        try resolveCredential(allocator, state_root, cli_api_key, precedence);
+        try resolveCredentialWithEnvFallback(allocator, state_root, cli_api_key, precedence, env_fallback_api_key);
     errdefer credential.deinit(allocator);
     if (fd_api_key) |*runtime| {
         credential.spent_runtime_fd = runtime.fd;

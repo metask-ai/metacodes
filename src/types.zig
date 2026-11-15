@@ -267,6 +267,15 @@ pub const Config = struct {
     /// True only when startup resolved the bearer from the Metask OAuth session;
     /// explicit legacy API-key mode must not load that session or hydrate it.
     metask_oauth_selected: bool = false,
+    /// The host's layer below the process environment for the variables
+    /// credentials are read from (#486): the CLI's `<state root>/.env`, as
+    /// `src/app/state_env.zig` accepted it at startup. A name the process
+    /// environment sets is never read here, nor a provider's alias while the
+    /// environment sets another alias of that provider
+    /// (`credential.ResolveInput.env_fallback`). Null for every host that
+    /// keeps none: the process environment is then the only one. Borrowed;
+    /// the host keeps it alive for as long as any App built from this Config.
+    credential_env_fallback: ?@import("provider/credential.zig").EnvLookup = null,
     /// OpenAI wire 协议选择(`--openai-protocol` / env METACODES_OPENAI_PROTOCOL)。
     /// 默认 chat_completions;responses 走 /v1/responses(typed SSE 事件流)。
     /// 仅 provider_kind==.openai 时被消费;**显式配置,绝不从 base_url/model 推断**。

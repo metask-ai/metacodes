@@ -327,6 +327,12 @@ pub const ResolveInput = struct {
     pool: []const PoolEntry = &.{},
     precedence: AuthPrecedence = .api_key_first,
     env: EnvLookup = EnvLookup.empty(),
+    /// A layer below `env`, which a host keeps for itself: the CLI's
+    /// `<state root>/.env` (#486). It is read for this provider's aliases
+    /// only when `env` sets none of them, so one alias in `env` and another
+    /// in this layer is never an ambiguity: `env` wins outright. Two aliases
+    /// with different values inside the layer still are one.
+    env_fallback: EnvLookup = EnvLookup.empty(),
     now_seconds: i64 = 0,
 };
 
@@ -351,7 +357,8 @@ pub const Resolved = struct {
 /// Order (matching the requirement):
 ///   1. explicit reference / one-shot runtime material
 ///   2. injected runtime descriptor secret
-///   3. provider-declared environment aliases
+///   3. provider-declared environment aliases: the process environment, else
+///      the host's layer below it (`env_fallback`)
 ///   4. persisted credential store (expiry-aware)
 ///   5. interactive setup — the caller's job, signalled by MissingCredentials
 ///
@@ -514,14 +521,22 @@ const EnvHit = struct {
     kind: CredentialKind,
 };
 
-/// Scan every declared alias. Aliases sit at the same precedence level, so two
-/// aliases holding *different* values is an ambiguity the user must resolve —
-/// picking the first would silently prefer one account over another.
+/// The process environment's aliases, else the layer below it
+/// (`ResolveInput.env_fallback`). Whole layers, never a mix of the two.
 fn resolveEnv(input: ResolveInput) ResolveError!?EnvHit {
+    if (try scanAliases(input, input.env)) |hit| return hit;
+    return scanAliases(input, input.env_fallback);
+}
+
+/// Scan every declared alias in one layer. Aliases sit at the same precedence
+/// level, so two aliases holding *different* values is an ambiguity the user
+/// must resolve — picking the first would silently prefer one account over
+/// another.
+fn scanAliases(input: ResolveInput, env: EnvLookup) ResolveError!?EnvHit {
     var hit: ?EnvHit = null;
     for (input.env_aliases) |alias| {
         if (!isAccepted(input.accepted_kinds, alias.kind)) continue;
-        const value = input.env.get(alias.name) orelse continue;
+        const value = env.get(alias.name) orelse continue;
         if (hit) |existing| {
             if (!std.mem.eql(u8, existing.value, value)) return error.AmbiguousCredentialAliases;
             // Same value under several names: keep the canonical one for output.
@@ -688,6 +703,70 @@ test "a Metask key cannot satisfy a Z.AI resolution" {
         .accepted_kinds = &ZAI_KINDS,
         .env_aliases = &ZAI_ALIASES,
         .env = env.lookup(),
+    }, &buffer));
+}
+
+test "the layer below the environment answers when the environment sets no alias" {
+    var env = TestEnv{ .pairs = &.{} };
+    var file = TestEnv{ .pairs = &.{.{ "GLM_API_KEY", "file-secret" }} };
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    const resolved = try resolve(.{
+        .provider_id = Slug.lit("zai-coding-plan"),
+        .accepted_kinds = &ZAI_KINDS,
+        .env_aliases = &ZAI_ALIASES,
+        .env = env.lookup(),
+        .env_fallback = file.lookup(),
+    }, &buffer);
+    try std.testing.expectEqualStrings("file-secret", resolved.secret);
+    try std.testing.expectEqualStrings("GLM_API_KEY", resolved.alias_used.?);
+    try std.testing.expectEqual(CredentialSource.env, resolved.ref.source);
+}
+
+test "any alias in the environment hides the layer below: never an ambiguity" {
+    // One alias in the process environment, another with a different value
+    // in the file: the environment wins, where one layer holding both would
+    // be refused as conflicting.
+    var env = TestEnv{ .pairs = &.{.{ "GLM_API_KEY", "env-secret" }} };
+    var file = TestEnv{ .pairs = &.{
+        .{ "ZAI_API_KEY", "file-secret" },
+        .{ "GLM_API_KEY", "file-other" },
+    } };
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    const resolved = try resolve(.{
+        .provider_id = Slug.lit("zai-coding-plan"),
+        .accepted_kinds = &ZAI_KINDS,
+        .env_aliases = &ZAI_ALIASES,
+        .env = env.lookup(),
+        .env_fallback = file.lookup(),
+    }, &buffer);
+    try std.testing.expectEqualStrings("env-secret", resolved.secret);
+    try std.testing.expectEqualStrings("GLM_API_KEY", resolved.alias_used.?);
+}
+
+test "two aliases with different values in the layer below still conflict" {
+    var env = TestEnv{ .pairs = &.{} };
+    var file = TestEnv{ .pairs = &.{
+        .{ "GLM_API_KEY", "one" },
+        .{ "ZAI_API_KEY", "two" },
+    } };
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    try std.testing.expectError(error.AmbiguousCredentialAliases, resolve(.{
+        .provider_id = Slug.lit("zai-coding-plan"),
+        .accepted_kinds = &ZAI_KINDS,
+        .env_aliases = &ZAI_ALIASES,
+        .env = env.lookup(),
+        .env_fallback = file.lookup(),
+    }, &buffer));
+}
+
+test "the layer below answers only for the provider's own aliases" {
+    var file = TestEnv{ .pairs = &.{.{ "METASK_API_KEY", "metask-secret" }} };
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    try std.testing.expectError(error.MissingCredentials, resolve(.{
+        .provider_id = Slug.lit("zai-coding-plan"),
+        .accepted_kinds = &ZAI_KINDS,
+        .env_aliases = &ZAI_ALIASES,
+        .env_fallback = file.lookup(),
     }, &buffer));
 }
 

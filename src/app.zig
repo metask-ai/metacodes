@@ -1633,14 +1633,21 @@ pub const App = struct {
     ///
     /// The document holds only references — an id, an environment variable
     /// name, a kind, a priority — so reading it never touches a secret. The
-    /// secrets are read here, from the process environment, and borrowed for
-    /// the duration of request setup.
+    /// secrets are read here, from the process environment (or the host's
+    /// layer below it), and borrowed for the duration of request setup.
     /// Load the configuration document, or null when there is none to read.
     /// The caller owns it — see `credentialPoolFrom` for why that matters.
     pub fn loadConfigDocument(app: *App) ?provider_config_doc.Document {
         var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch return null;
         defer store.deinit();
         return store.load() catch null;
+    }
+
+    /// The host's layer below the process environment for credential
+    /// variables (`Config.credential_env_fallback`), or one that never
+    /// answers when the host keeps none.
+    fn credentialEnvFallback(app: *const App) provider_credential_mod.EnvLookup {
+        return app.config.credential_env_fallback orelse provider_credential_mod.EnvLookup.empty();
     }
 
     /// Materialize the configured credential pool.
@@ -1653,9 +1660,12 @@ pub const App = struct {
     ///
     /// Secrets come from the named environment variables, never from the
     /// document: that document is read by several tools and is not mode 0600.
+    /// A variable the process environment leaves unset is read from
+    /// `env_fallback`, the host's layer below it (`<state root>/.env`, #486).
     pub fn credentialPoolFrom(
         document: *const provider_config_doc.Document,
         buffer: []provider_credential_mod.PoolEntry,
+        env_fallback: provider_credential_mod.EnvLookup,
     ) []const provider_credential_mod.PoolEntry {
         const env = provider_credential_mod.EnvLookup.process();
         var len: usize = 0;
@@ -1665,7 +1675,7 @@ pub const App = struct {
             if (!entry.enabled) continue;
             for (entry.credentials.items()) |*credential| {
                 if (len == buffer.len) break;
-                const secret = env.get(credential.env.slice()) orelse continue;
+                const secret = env.get(credential.env.slice()) orelse env_fallback.get(credential.env.slice()) orelse continue;
                 const kind = provider_credential_mod.parseCredentialKind(credential.kind.slice()) orelse continue;
                 buffer[len] = .{
                     .id = credential.id,
@@ -2006,7 +2016,7 @@ pub const App = struct {
         defer if (pool_document) |*value| value.deinit();
         var pool_buffer: [provider_config_doc.MAX_POOL_CREDENTIALS]provider_credential_mod.PoolEntry = undefined;
         const pool = if (pool_document) |*value|
-            credentialPoolFrom(value, &pool_buffer)
+            credentialPoolFrom(value, &pool_buffer, app.credentialEnvFallback())
         else
             &.{};
 
@@ -2043,6 +2053,7 @@ pub const App = struct {
                 } else null,
                 .precedence = if (oauth_token != null) .oauth_first else .api_key_first,
                 .env = @import("provider/credential.zig").EnvLookup.process(),
+                .env_fallback = app.credentialEnvFallback(),
                 .now_seconds = now,
             },
             &reference_buffer,
@@ -2994,7 +3005,7 @@ pub const App = struct {
             const models_url = stringField(entry.object.get("models_url")) orelse continue;
             const provider_id = provider_ids_mod.Slug.parse(pair.key_ptr.*) catch continue;
             const bearer = if (stringField(entry.object.get("credential_env"))) |name|
-                provider_credential_mod.EnvLookup.process().get(name)
+                provider_credential_mod.EnvLookup.process().get(name) orelse app.credentialEnvFallback().get(name)
             else
                 null;
 

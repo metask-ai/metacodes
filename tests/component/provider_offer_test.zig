@@ -1772,7 +1772,7 @@ test "L2: a configured pool entry's account label outlives the read that produce
     var document = try store.load();
     defer document.deinit();
     var buffer: [cc.provider_config_doc.MAX_POOL_CREDENTIALS]cc.provider_credential.PoolEntry = undefined;
-    const pool = cc.app_module.App.credentialPoolFrom(&document, &buffer);
+    const pool = cc.app_module.App.credentialPoolFrom(&document, &buffer, cc.provider_credential.EnvLookup.empty());
     try std.testing.expectEqual(@as(usize, 1), pool.len);
 
     // Everything the entry borrows must still read correctly while the document
@@ -1787,6 +1787,40 @@ test "L2: a configured pool entry's account label outlives the read that produce
     // same mistake that made the pool builder hand back dangling slices.
     const stored = &document.providers.items[0].credentials.entries[0];
     try std.testing.expect(pool[0].account_or_plan.?.ptr == stored.account_or_plan.?.slice().ptr);
+}
+
+test "L2: a pool credential's variable is read from the state root's .env when the environment leaves it unset (#486)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".env", .data = "METACODES_POOL_FILE_KEY=sk-pool-from-file\n" });
+
+    // The pool names its variable in config.json; the allowlist the host
+    // builds from that document is what lets the file set it.
+    var document = try cc.provider_config_doc.parse(a,
+        \\{"providers": {"openai": {"credentials": [{"id": "work", "env": "METACODES_POOL_FILE_KEY", "kind": "api_key"}]}}}
+    );
+    defer document.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const allowlist = try cc.app_state_env.allowlistFrom(arena_state.allocator(), &cc.provider_registry.BUILTIN_PROFILES, &document, null);
+    var layer = try cc.app_state_env.load(a, root, allowlist);
+    defer layer.deinit();
+
+    unsetEnvZ("METACODES_POOL_FILE_KEY");
+    var buffer: [cc.provider_config_doc.MAX_POOL_CREDENTIALS]cc.provider_credential.PoolEntry = undefined;
+    const from_file = cc.app_module.App.credentialPoolFrom(&document, &buffer, layer.lookup());
+    try std.testing.expectEqual(@as(usize, 1), from_file.len);
+    try std.testing.expectEqualStrings("sk-pool-from-file", from_file[0].secret);
+    // Without the layer the member has no secret and is left out.
+    try std.testing.expectEqual(@as(usize, 0), cc.app_module.App.credentialPoolFrom(&document, &buffer, cc.provider_credential.EnvLookup.empty()).len);
+
+    setEnvZ("METACODES_POOL_FILE_KEY", "sk-pool-from-env");
+    defer unsetEnvZ("METACODES_POOL_FILE_KEY");
+    const from_env = cc.app_module.App.credentialPoolFrom(&document, &buffer, layer.lookup());
+    try std.testing.expectEqualStrings("sk-pool-from-env", from_env[0].secret);
 }
 
 test "L2: a session that named its provider on the command line has a current offer" {

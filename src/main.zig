@@ -21,6 +21,8 @@ const provider_ids_mod = @import("provider/ids.zig");
 const version_info = @import("version_info.zig");
 const invocation = @import("app/invocation.zig");
 pub const doctor = @import("app/doctor.zig"); // pub: component tests build the report by hand
+pub const app_state_env = @import("app/state_env.zig"); // pub: component tests read the template and the parser
+const state_env_mod = app_state_env;
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
 pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
@@ -482,6 +484,144 @@ pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.A
     return true;
 }
 
+/// `<state root>/.env` (#486), read once at startup. The provider runtime
+/// that decides which names it may set is built only when there is a file
+/// to judge, so a start without one does no extra work. `gpa` owns the
+/// result (the read buffer goes back at once); `arena` the allowlist.
+fn loadLocalConfig(gpa: std.mem.Allocator, arena: std.mem.Allocator, state_root: []const u8) state_env_mod.Loaded {
+    const allowlist: state_env_mod.Allowlist = if (state_env_mod.exists(state_root)) localConfigAllowlist(arena) else .{};
+    return state_env_mod.load(gpa, state_root, allowlist) catch {
+        std.debug.print("error: out of memory while reading {s}{c}{s}\n", .{ state_root, std.fs.path.sep, state_env_mod.file_name });
+        std.process.exit(2);
+    };
+}
+
+/// The names `<state root>/.env` may set, from the provider runtime a
+/// session builds (`buildProviderHost`) and the config.json it read.
+fn localConfigAllowlist(arena: std.mem.Allocator) state_env_mod.Allowlist {
+    const host = buildProviderHost(arena) orelse return .{};
+    defer host.destroy();
+    var store = provider_config_store.Store.initHome(arena, hostRoot()) catch
+        return state_env_mod.allowlistFrom(arena, host.registry.profiles.items, null, null) catch .{};
+    defer store.deinit();
+    const text: ?[]u8 = store.readText() catch null;
+    defer if (text) |bytes| arena.free(bytes);
+    var document: ?provider_config_doc.Document = store.load() catch null;
+    defer if (document) |*value| value.deinit();
+    return state_env_mod.allowlistFrom(arena, host.registry.profiles.items, if (document) |*value| value else null, text) catch .{};
+}
+
+/// Says once what of `<state root>/.env` is not read: a file that cannot be,
+/// and the names it sets that are ignored (never a value). To the log only
+/// while the TUI owns the terminal; `metacodes doctor` shows the same.
+fn warnLocalConfig(allocator: std.mem.Allocator, local: *const state_env_mod.Loaded, to: enum { stderr, log }) void {
+    const log = @import("util/log.zig");
+    const quiet = to == .log;
+    const problem: ?[]const u8 = switch (local.status) {
+        .unreadable => "cannot be read",
+        .not_a_file => "is not a regular file",
+        .too_large => "is larger than " ++ std.fmt.comptimePrint("{d}", .{state_env_mod.max_file_bytes / 1024}) ++ " KiB",
+        .absent, .read, .no_state_root => null,
+    };
+    if (problem) |what| {
+        if (quiet)
+            log.warn("config", "{s} {s}; nothing in it is read", .{ local.path, what })
+        else
+            std.debug.print("warning: {s} {s}; nothing in it is read\n", .{ local.path, what });
+    }
+    const summary = (local.ignoredSummary(allocator) catch null) orelse return;
+    defer allocator.free(summary);
+    if (quiet) log.warn("config", "{s}", .{summary}) else std.debug.print("warning: {s}\n", .{summary});
+}
+
+/// Level 5's other way in, after the sign-in hint: where this install's
+/// `.env` is, the template beside it when an install wrote one, and which
+/// providers' keys the file holds when it names none of them.
+fn printLocalConfigHint(local: *const state_env_mod.Loaded, unchosen: []const []const u8) void {
+    if (local.path.len == 0) return;
+    var template_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    std.debug.print(local_config_hint, .{
+        .path = local.path,
+        .template = localTemplateNote(local.path, &template_buf),
+        .guide = state_env_mod.guide_url,
+    });
+    if (unchosen.len == 0) return;
+    std.debug.print("{s} holds keys for several providers (", .{local.path});
+    for (unchosen, 0..) |id, index| std.debug.print("{s}{s}", .{ if (index == 0) "" else ", ", id });
+    std.debug.print(") and names none: add {s}=<id> to choose one.\n", .{state_env_mod.provider_variable});
+}
+
+/// ` (template: <dir>/.env.example)` when that file exists, else "".
+fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
+    const dir = std.fs.path.dirname(env_path) orelse return "";
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const template = std.fmt.bufPrintZ(&path_buf, "{s}{c}{s}", .{ dir, std.fs.path.sep, state_env_mod.example_file_name }) catch return "";
+    if (!pfs.exists(template.ptr)) return "";
+    return std.fmt.bufPrint(buf, " (template: {s})", .{template}) catch "";
+}
+
+/// Level 2 of the startup order: a default `/model` stored in config.json.
+fn hasStoredGlobalSelection(allocator: std.mem.Allocator) bool {
+    var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch return false;
+    defer store.deinit();
+    var document = store.load() catch return false;
+    defer document.deinit();
+    return document.global_selection != null;
+}
+
+/// Level 3 of the startup order: a Metask sign-in the historical path would
+/// use — `--api-key`, a runtime key descriptor, `METASK_API_KEY` (the
+/// environment's, or `file_key` from `.env`), or a login stored in
+/// `auth.json`. A stored login that cannot be read counts, so the run says
+/// why rather than quietly using another provider. The device-code session
+/// is not one (#499).
+fn metaskSignInPresent(allocator: std.mem.Allocator, config: types.Config, file_key: ?[]const u8) bool {
+    if (config.api_key != null) return true;
+    if (std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) != null) return true;
+    if (file_key != null or nonEmptyEnv(auth.METASK_API_KEY_ENV) != null) return true;
+    const path = auth.authFilePath(allocator, config.state_root) catch return false;
+    defer allocator.free(path);
+    var stored = auth.loadFromPath(allocator, path) catch |err| return err != error.NotFound;
+    defer stored.deinit(allocator);
+    return stored.api_key != null or stored.oauth != null;
+}
+
+/// Whether the registry this run builds knows `name` as a provider id or
+/// alias. Unknown here means route resolution would refuse it too.
+fn providerKnown(allocator: std.mem.Allocator, name: []const u8) bool {
+    const host = buildProviderHost(allocator) orelse return true;
+    defer host.destroy();
+    return host.registry.find(name) != null;
+}
+
+/// Whether `name` (a provider id or alias, as `--provider` takes it) is
+/// Metask in the registry this run builds.
+fn providerIsMetask(allocator: std.mem.Allocator, name: []const u8) bool {
+    const host = buildProviderHost(allocator) orelse return std.ascii.eqlIgnoreCase(name, "metask");
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse return false;
+    return profile.id.eqlText("metask");
+}
+
+/// `METASK_API_KEY` in `<state root>/.env`, for the historical path: it
+/// counts as the environment variable only while the file names no provider
+/// other than Metask (#486). A file that says METACODES_PROVIDER=deepseek
+/// chose DeepSeek; a Metask key beside it is there for when Metask is chosen
+/// (`--provider metask`, `/model`), and must not sign the start in, take the
+/// legacy route, or outrank auth.json.
+fn localSignInKey(allocator: std.mem.Allocator, local: *const state_env_mod.Loaded) ?[]const u8 {
+    const key = local.get(auth.METASK_API_KEY_ENV) orelse return null;
+    const named = local.get(state_env_mod.provider_variable) orelse return key;
+    return if (providerIsMetask(allocator, named)) key else null;
+}
+
+/// An environment variable's value, with an empty one treated as unset.
+fn nonEmptyEnv(name: [*:0]const u8) ?[]const u8 {
+    const raw = std.c.getenv(name) orelse return null;
+    const value = std.mem.span(raw);
+    return if (value.len == 0) null else value;
+}
+
 fn applyStartupOutcome(
     config: *types.Config,
     allocator: std.mem.Allocator,
@@ -610,7 +750,8 @@ fn invokedCommand(scratch: std.mem.Allocator) []const u8 {
 
 /// What a run prints when it finds no credential: the ways to sign in, as
 /// commands of the install that printed it (`command`), the default sign-in
-/// that a plain launch reads first.
+/// that a plain launch reads first. `printLocalConfigHint` and
+/// `no_token_printed` follow it.
 const auth_required_hint =
     \\Authentication required.
     \\Use one of:
@@ -621,9 +762,17 @@ const auth_required_hint =
     \\  {[command]s} login --api-key <key>
     \\  export METASK_API_KEY=...
     \\
-    \\No token value was printed.
+;
+
+/// The other way in after the sign-ins (#486): a provider key in this
+/// install's own `<state root>/.env`.
+const local_config_hint =
+    \\Or use your own provider key: put it in {[path]s}{[template]s}, then start again.
+    \\  How to: {[guide]s}
     \\
 ;
+
+const no_token_printed = "\nNo token value was printed.\n";
 
 /// What a run prints when the stored Metask login has no model selection.
 const incomplete_login_hint =
@@ -802,19 +951,78 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(checkProviders(allocator));
     }
 
+    // --- <state root>/.env (#486) ---
+    // The install's local configuration, read once: a layer below the process
+    // environment for the names it may set (src/app/state_env.zig), never
+    // setenv. It outlives every App built from `config`: they borrow it.
+    var local_config = loadLocalConfig(init.gpa, allocator, config.state_root);
+    defer local_config.deinit();
+    // The TUI gets its warning in the log, once it owns the terminal (below).
+    const tui_owns_stderr = interactiveRepl(config) and !config.verbose and platform_term.isatty(2);
+    if (!tui_owns_stderr) warnLocalConfig(allocator, &local_config, .stderr);
+    config.credential_env_fallback = local_config.lookup();
+    // The file's METASK_API_KEY as the historical path reads it: everywhere
+    // that path looks (the sign-in check, the legacy route, credential
+    // resolution), or nowhere — never only some of them (localSignInKey).
+    const local_metask_key = localSignInKey(allocator, &local_config);
+
     // --- provider 选择 ---
     // issue #16:命名一个 provider profile 时走 registry 解析出**真实路由**
     // (endpoint + 协议 + wire model id + auth scheme),不再靠 model 名前缀猜。
     // 没命名 provider 的会话保持历史推断路径,行为零变化。
+    //
+    // The startup order (#486), first that applies wins:
+    //   1. flags and the process environment: --provider, --offer,
+    //      METACODES_PROVIDER (--model and METACODES_MODEL pick the model);
+    //   2. the default stored by /model (config.json `global_selection`);
+    //   3. a Metask sign-in: --api-key, METASK_API_KEY, auth.json — the
+    //      historical path. The file's METASK_API_KEY counts only while the
+    //      file names no provider other than Metask;
+    //   4. the provider `<state root>/.env` configures;
+    //   5. none: the historical path stops at credential resolution.
+    // A file that simply fed the environment would put its
+    // METACODES_PROVIDER in level 1, above a stored default and a sign-in.
     if (config.provider_profile == null) {
         if (std.c.getenv("METACODES_PROVIDER")) |c| config.provider_profile = std.mem.span(c);
     }
+    // `METACODES_MODEL` is `--model` from the environment; the flag wins.
+    if (!config.model_explicit) if (nonEmptyEnv(state_env_mod.model_variable)) |model| {
+        config.model = model;
+        config.model_explicit = true;
+    };
     // A Metask access token carries the gateway origin. Resolve it before the
     // declarative route so the legacy napi endpoint cannot win when a new
     // session exists. An explicit METASK_GATEWAY_URL is the documented local
     // development override and is an origin, never a /v1/messages URL.
     const metask_legacy_requested = config.api_key != null or
-        (config.auth_precedence == .api_key_first and std.c.getenv("METASK_API_KEY") != null);
+        (config.auth_precedence == .api_key_first and (std.c.getenv("METASK_API_KEY") != null or local_metask_key != null));
+    // Level 4. Nothing below a stored default or a sign-in reads the file's
+    // choice, and a key that is only in the shell environment never selects
+    // a provider: those keys were not put there for metacodes.
+    var unchosen_local_providers: []const []const u8 = &.{};
+    const local_choice = local_config.choice();
+    if (local_choice != .none and config.provider_profile == null and config.provider_offer == null and
+        !hasStoredGlobalSelection(allocator) and !metaskSignInPresent(allocator, config, local_metask_key))
+    {
+        switch (local_choice) {
+            .none => {},
+            .several => |ids| unchosen_local_providers = ids,
+            .provider => |chosen| {
+                if (chosen.named and !providerKnown(allocator, chosen.name)) {
+                    std.debug.print("error: {s}={s} in {s} names no provider this install has; `{s} --check-providers` lists them\n", .{
+                        state_env_mod.provider_variable, chosen.name, local_config.path, invokedCommand(allocator),
+                    });
+                    std.process.exit(2);
+                }
+                config.provider_profile = chosen.name;
+                if (!config.model_explicit) if (local_config.get(state_env_mod.model_variable)) |model| {
+                    config.model = model;
+                    config.model_explicit = true;
+                };
+                log.info("config", "provider {s} from {s}", .{ chosen.name, local_config.path });
+            },
+        }
+    }
     if (config.provider_profile) |profile_name| {
         if (std.ascii.eqlIgnoreCase(profile_name, "metask") and config.base_url == null and !metask_legacy_requested) {
             var gateway_override: ?[]const u8 = null;
@@ -921,6 +1129,7 @@ pub fn main(init: std.process.Init) !void {
     const interactive_tui = interactiveRepl(config);
     const quiet_stderr = interactive_tui and !config.verbose and platform_term.isatty(2);
     if (quiet_stderr) log.setStderrEnabled(false);
+    if (quiet_stderr) warnLocalConfig(allocator, &local_config, .log);
     // The REPL shows its prompt while MCP servers connect and joins them
     // before its first request; every other frontend connects them in App.init.
     if (interactive_tui) config.mcp_connect = .first_request;
@@ -973,9 +1182,11 @@ pub fn main(init: std.process.Init) !void {
 
     var resolved_credential: ?auth.ResolvedCredential = null;
     if (!introspection_only and provider_secret == null) {
-        resolved_credential = auth.resolveRuntimeCredential(allocator, config.state_root, config.api_key, config.auth_precedence) catch |err| {
+        resolved_credential = auth.resolveRuntimeCredentialWithEnvFallback(allocator, config.state_root, config.api_key, config.auth_precedence, local_metask_key) catch |err| {
             @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
             std.debug.print(auth_required_hint, .{ .command = invokedCommand(allocator) });
+            printLocalConfigHint(&local_config, unchosen_local_providers);
+            std.debug.print(no_token_printed, .{});
             return err;
         };
     }
@@ -1290,6 +1501,23 @@ fn jevDiagnosis(arena: std.mem.Allocator, io: std.Io, state_root: []const u8) do
     };
 }
 
+/// The doctor's view of `<state root>/.env`: names and line numbers, never
+/// a value. Borrows `local`; the name lists live in `arena`.
+fn localConfigDiagnosis(arena: std.mem.Allocator, local: *const state_env_mod.Loaded) error{OutOfMemory}!doctor.LocalConfigDiagnosis {
+    const accepted = try arena.alloc([]const u8, local.accepted.len);
+    for (local.accepted, accepted) |entry, *name| name.* = entry.name;
+    const ignored = try arena.alloc([]const u8, local.ignored.len);
+    for (local.ignored, ignored) |entry, *name| name.* = entry.name;
+    return .{
+        .path = if (local.path.len == 0) null else local.path,
+        .state = @tagName(local.status),
+        .accepted = accepted,
+        .ignored = ignored,
+        .malformed_lines = local.malformed,
+        .permissions = local.permissions,
+    };
+}
+
 fn kgDiagnosisOwned(allocator: std.mem.Allocator, state: []const u8, transport: []const u8, config: []const u8, hint: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
     const s = try allocator.dupe(u8, state);
     errdefer allocator.free(s);
@@ -1464,6 +1692,13 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
     var jev_arena = std.heap.ArenaAllocator.init(allocator);
     defer jev_arena.deinit();
     report.jev = jevDiagnosis(jev_arena.allocator(), io, state_dir);
+    // `<state root>/.env` judged as a session would judge it (#486), names only.
+    var local_config = state_env_mod.load(allocator, state_dir, localConfigAllowlist(allocator)) catch {
+        std.debug.print("error: out of memory while reading the local configuration\n", .{});
+        return 1;
+    };
+    defer local_config.deinit();
+    report.local_config = localConfigDiagnosis(allocator, &local_config) catch null;
     var version_buf: [version_info.MAX_VERSION_LEN]u8 = undefined;
     report.version = version_info.fullVersion(&version_buf, VERSION, version_info.BuildInfo.fromOptions(build_options));
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1689,6 +1924,11 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
     };
     const source_root = @import("util/state_root.zig").prefixOf(exe) orelse {
         std.debug.print("error: this executable is not inside a release unit (<root>/bin/metacodes)\n", .{});
+        return 1;
+    };
+    // The template lists this version's built-in providers (#486).
+    options.local_config_template = state_env_mod.renderExample(allocator, &provider_registry.BUILTIN_PROFILES) catch {
+        std.debug.print("error: out of memory\n", .{});
         return 1;
     };
     var log: std.Io.Writer.Allocating = .init(allocator);
@@ -2541,6 +2781,15 @@ fn readLine(buf: []u8) !usize {
 }
 
 fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
+    // `METASK_API_KEY` in `<state root>/.env` signs a plain launch in as the
+    // environment variable does, unless the file names another provider
+    // (#486, `localSignInKey`); only that name and METACODES_PROVIDER are
+    // looked at here.
+    var local_config = try state_env_mod.load(allocator, state_dir, .{
+        .keys = &.{.{ .name = auth.METASK_API_KEY_ENV, .provider = "metask" }},
+    });
+    defer local_config.deinit();
+    const local_key = localSignInKey(allocator, &local_config);
     const path = auth.authFilePath(allocator, state_dir) catch |err| {
         std.debug.print("No credential file path: {s}\n", .{@errorName(err)});
         return;
@@ -2551,6 +2800,8 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
             std.debug.print("Not logged in. Credential file: {s}\n", .{path});
             if (std.c.getenv(auth.METASK_API_KEY_ENV) != null) {
                 std.debug.print("METASK_API_KEY override is set.\n", .{});
+            } else if (local_key != null) {
+                std.debug.print("METASK_API_KEY is set in {s}, which a launch reads like the environment variable.\n", .{local_config.path});
             }
             return;
         },
@@ -2574,6 +2825,8 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     std.debug.print("Reasoning effort: {s}\n", .{if (stored.reasoning_effort) |e| e.name() else "no"});
     if (std.c.getenv(auth.METASK_API_KEY_ENV) != null) {
         std.debug.print("METASK_API_KEY override is set and wins unless --auth-precedence oauth-first is used.\n", .{});
+    } else if (local_key != null) {
+        std.debug.print("METASK_API_KEY is set in {s} and wins unless --auth-precedence oauth-first is used.\n", .{local_config.path});
     }
 }
 
@@ -3099,27 +3352,39 @@ pub fn resolveProviderScopedSecret(
         .cli_api_key = config.api_key,
         .stored_api_key = if (stored_key) |*key| key.entry() else null,
         .env = credential_mod.EnvLookup.process(),
+        // `<state root>/.env` (#486), below the process environment.
+        .env_fallback = config.credential_env_fallback orelse credential_mod.EnvLookup.empty(),
     }, &reference_buffer) catch |err| {
-        printProviderCredentialHelp(profile.*, err, invokedCommand(allocator));
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const local_path: []const u8 = if (config.state_root.len == 0) "" else std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{
+            config.state_root, std.fs.path.sep, state_env_mod.file_name,
+        }) catch "";
+        printProviderCredentialHelp(profile.*, err, invokedCommand(allocator), local_path);
         return err;
     };
     return allocator.dupe(u8, resolved.secret);
 }
 
-/// `command` is the command the user ran (`invokedCommand`).
+/// `command` is the command the user ran (`invokedCommand`); `local_path`
+/// this install's `<state root>/.env` ("" when it has no state root).
 fn printProviderCredentialHelp(
     profile: @import("provider/profile.zig").ProviderProfile,
     err: anyerror,
     command: []const u8,
+    local_path: []const u8,
 ) void {
     switch (err) {
         error.AmbiguousCredentialAliases => {
             std.debug.print(
                 "Conflicting credentials for provider '{s}'.\n" ++
-                    "Several accepted environment variables hold different values; unset all but one.\n" ++
-                    "No token value was printed.\n",
+                    "Several accepted environment variables hold different values; unset all but one.\n",
                 .{profile.id.slice()},
             );
+            if (local_path.len > 0) std.debug.print(
+                "When the environment sets none of them, the ones in {s} are read instead and must agree too.\n",
+                .{local_path},
+            );
+            std.debug.print("No token value was printed.\n", .{});
         },
         else => {
             std.debug.print(
@@ -3133,6 +3398,7 @@ fn printProviderCredentialHelp(
             for (profile.accepted_credential_kinds) |kind| {
                 if (profile.canonicalEnvAlias(kind)) |canonical| {
                     std.debug.print("  export {s}=...\n", .{canonical});
+                    if (local_path.len > 0) std.debug.print("    or {s}=... in {s} (read when metacodes starts)\n", .{ canonical, local_path });
                 }
             }
             std.debug.print("  {s} --api-key <key> --provider {s} ...\n", .{ command, profile.id.slice() });
@@ -4011,7 +4277,7 @@ test "the sign-in hints name the command that was run, the default sign-in first
         try std.testing.expect(std.mem.indexOf(u8, session, run_metask) != null);
     }
 
-    const dev = try std.fmt.allocPrint(a, auth_required_hint, .{ .command = "metacodes-dev" });
+    const dev = try std.fmt.allocPrint(a, auth_required_hint ++ no_token_printed, .{ .command = "metacodes-dev" });
     defer a.free(dev);
     try std.testing.expectEqualStrings(
         \\Authentication required.
@@ -4077,6 +4343,7 @@ test {
     _ = &@import("app/mcp_startup.zig");
     _ = &@import("app/install.zig");
     _ = &@import("app/invocation.zig");
+    _ = &@import("app/state_env.zig");
     _ = &@import("app/release_source.zig");
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");
