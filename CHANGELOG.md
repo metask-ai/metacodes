@@ -20,8 +20,11 @@ status, compatibility boundaries, and entry points are defined by
   for Metask the session's own key or, in a session started on another
   provider, the key `metacodes login` stored in `auth.json` (a pick of a
   Metask route now binds that key; it used to fail with
-  `MissingCredentials`). A provider with no such credential is no longer a
-  row that leads to a sign-in or a key field: it is listed dimmed under
+  `MissingCredentials`). Only a missing credential takes a route off the
+  list: one refused for another reason (two names of its key that
+  disagree, say) stays listed, and a pick says why. A provider with no such
+  credential is no longer a row that leads to a sign-in or a key field: it
+  is listed dimmed under
   "Not configured", below the others, and choosing it shows the variable to
   set, this install's `.env` and `doc/LOCAL_CONFIG.md` (for Metask, `/login`
   first), and starts nothing. The in-picker sign-in and key-paste stage of
@@ -178,12 +181,13 @@ status, compatibility boundaries, and entry points are defined by
 - **`/model` names the variable and the file for a provider without a key**
   (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
   chosen without its key ended in `switch failed (MissingCredentials)`: these
-  providers have neither a sign-in nor a key page the picker could open. The
-  picker now says which provider has no key, the variable to set (the
-  canonical one, e.g. `MOONSHOT_API_KEY`), this install's
-  `<state root>/.env` and the guide (`doc/LOCAL_CONFIG.md`); the previous
-  route stays active. A notice longer than the terminal is wide is broken
-  into rows inside the width instead of running past it.
+  providers have neither a sign-in nor a key page the picker could open.
+  Such a provider is now listed under "Not configured" (#488), and a pick
+  whose key went away after the picker opened shows the same setup: the
+  variable to set (the canonical one, e.g. `MOONSHOT_API_KEY`), this
+  install's `<state root>/.env` and the guide (`doc/LOCAL_CONFIG.md`); the
+  previous route stays active. A picker notice longer than the terminal is
+  wide is broken into rows inside the width instead of running past it.
 - **An idle AgentCore Session no longer holds about 50 MB of private commit
   on Windows** (#503). Zig 0.16's `std.Thread.spawn` hands its 16 MiB
   default stack to `NtCreateThreadEx` as the stack *commit*, so each thread

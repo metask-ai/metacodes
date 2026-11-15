@@ -97,7 +97,9 @@ fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 
         .model => "Model",
         .offer => "Channel / offer",
         .options => "Options",
-        .setup => if (picker.setup) |setup| setup.provider.slice() else "Provider",
+        // By pointer: the slug's bytes are inline, and a copy captured by
+        // value would be gone before `title` is printed.
+        .setup => if (picker.setup) |*setup| setup.provider.slice() else "Provider",
     };
     w.print("  {s}{s}{s}", .{ th.accent, title, th.reset }) catch {};
     if (picker.stage == .setup) if (picker.setup) |setup| {

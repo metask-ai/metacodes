@@ -1863,7 +1863,15 @@ pub const App = struct {
                 if (!candidate.provider_id.eql(provider_id)) continue;
                 const offer = snapshot.find(candidate.offer_id) orelse continue;
                 var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
-                _ = provider_binding_mod.bindOffer(&host.registry, offer, sources, &reference_buffer, false) catch continue;
+                // Only a missing credential makes a route not configured. Any
+                // other refusal (two names of its key that disagree, a kind
+                // the provider does not take, a wire it cannot drive) is not
+                // cured by setting the variable the setup would name, so the
+                // route stays listed and a commit reports why, as before.
+                if (provider_binding_mod.bindOffer(&host.registry, offer, sources, &reference_buffer, false)) |_| {} else |err| switch (err) {
+                    error.MissingCredentials => continue,
+                    else => {},
+                }
                 listing.ready.items[index] = true;
                 any_ready = true;
             }

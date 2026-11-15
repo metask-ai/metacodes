@@ -107,7 +107,9 @@ binds with, without a request: the environment, `<state root>/.env`, a key
 `/login <id>` stored, a provider's stored OAuth login, a credential-pool
 member, `--api-key` for the provider it was given for, and for Metask the
 session's own key or, in a session started on another provider, the key
-`metacodes login` stored in `auth.json`. A
+`metacodes login` stored in `auth.json`. Only a missing credential takes a
+route off the list: a route refused for another reason (two names of its key
+that disagree, say) stays listed, and a commit reports why. A
 provider none of whose routes has one is listed dimmed under "Not
 configured", below the others; choosing it shows the variable its key is read
 from, this install's `<state root>/.env` and `doc/LOCAL_CONFIG.md` (for

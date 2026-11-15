@@ -702,6 +702,45 @@ test "state .env: a provider with no key is listed not configured, and choosing 
     try testing.expectEqualStrings("claude-sonnet-4-6", app.activeModel());
 }
 
+test "state .env: a provider whose two key names disagree stays listed, and a pick says why, not where a key goes (#488)" {
+    var case: Case = undefined;
+    try case.initInProcess();
+    defer case.deinit();
+    const a = case.arena();
+    var env: InProcessEnv = .{};
+    try env.init((try a.dupeZ(u8, case.home)).ptr);
+    defer env.deinit();
+    // Both of Gemini's names, holding different keys: resolution refuses
+    // them as ambiguous. A setup saying "set GEMINI_API_KEY" would point at
+    // a variable that is already set.
+    var gemini = try EnvGuard.set("GEMINI_API_KEY", "sk-placeholder-gemini-one");
+    defer gemini.restore();
+    var google = try EnvGuard.set("GOOGLE_API_KEY", "sk-placeholder-gemini-two");
+    defer google.restore();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    const app = try startedApp(&case, io_runtime.io(), null);
+    defer app.deinit();
+
+    const picker = &app.model_picker;
+    var ui: cc.tui_ui_state.UiState = .{};
+    cc.repl_picker_host.open(app, &ui, .unguarded);
+    try testing.expect((try cursorOnProvider(app, &ui, "gemini")).ready);
+    // Provider, model, channel: Enter takes the first of each, up to the
+    // options; Enter there applies the route.
+    var steps: usize = 0;
+    while (picker.stage != .options and steps < 5) : (steps += 1) _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
+    try testing.expectEqual(cc.repl_model_picker.Stage.options, picker.stage);
+    _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
+
+    try testing.expect(picker.stage != .setup);
+    var buffer: [16384]u8 = undefined;
+    const text = drawPicker(app, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "switch failed (AmbiguousCredentialAliases); the previous route is still active") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Set GEMINI_API_KEY") == null);
+    try testing.expectEqualStrings("claude-sonnet-4-6", app.activeModel());
+}
+
 test "state .env: a pick whose key went away after the picker opened shows the provider's setup, not the bare error (#483)" {
     var case: Case = undefined;
     try case.initInProcess();
