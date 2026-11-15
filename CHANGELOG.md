@@ -12,6 +12,30 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **`/login` signs in to Metask in the browser; `/logout` switches back to
+  local configuration** (#485). `/login` alone now runs `metacodes login`'s
+  browser sign-in, then asks for the API key, model and reasoning level in
+  the pane (an account without keys is told where to create one); Esc at any
+  step stores and changes nothing. Once chosen, `auth.json` is written as
+  `metacodes login` writes it, the session moves onto Metask at once, and a
+  stored `/model` default is forgotten so the next start uses the sign-in.
+  The provider list it used to open is `/login <provider>` (the pane names
+  those providers); `/login metask` is still the device-code sign-in. The new
+  `/logout` removes both Metask sign-ins (`auth.json` and
+  `oauth/metask.json`), forgets a stored default that resolves to Metask,
+  drops every Metask credential the process holds, and moves a session on
+  Metask to the provider `.env` configures (`Switched to <provider> (from
+  .env)`) or leaves it without a model; `/logout <provider>` removes the key
+  `/login <provider>` stored. Neither runs in the middle of a turn.
+- **A provider named at start without a key opens the TUI without a model,
+  and a stored default without one is passed over** (#485). `--provider`,
+  `--offer`, `METACODES_PROVIDER` or `.env` naming a provider that has no
+  credential no longer stops the TUI, nor quietly uses another provider: the
+  TUI opens unbound and its note names the variables that provider reads
+  (`-p` still stops with the provider's help). A `/model` default
+  (`global_selection`) whose provider has no credential is passed over for
+  the Metask sign-in or `.env`, with one notice (`The default model, X, has
+  no key or sign-in; this session uses Y.`), where it used to stop the start.
 - **`metacodes logout` removes both Metask sign-ins and says which** (#499,
   part 2). It used to remove `auth.json` only, leaving the device-code
   sign-in and its refresh token in `oauth/metask.json` usable. It now removes

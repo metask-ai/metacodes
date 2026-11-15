@@ -149,9 +149,12 @@ At start, metacodes takes the first of these that applies:
 
 1. **Flags and the shell environment**: `--provider`, `--offer`, or
    `METACODES_PROVIDER` set in the shell. `--model` (or `METACODES_MODEL` in
-   the shell) picks the model.
+   the shell) picks the model. A provider named this way and without a key
+   is not replaced by another: the terminal UI opens without a model and
+   names the variable it needs; `-p` stops with the same.
 2. **The default you chose in `/model`** (Tab, "use from now on"), kept in
-   `config.json`.
+   `config.json`. When its provider has no key (anymore), it is passed over
+   for the steps below, and the start says so once.
 3. **A Metask sign-in**: `--api-key`, `METASK_API_KEY` in the shell, or the
    login `metacodes login` stored in `auth.json`. `METASK_API_KEY` in this
    file counts too, unless the file's `METACODES_PROVIDER` names another
@@ -166,9 +169,12 @@ At start, metacodes takes the first of these that applies:
    instead, with the same advice.
 
 So `METACODES_PROVIDER` and `METACODES_MODEL` in the file apply only when
-nothing above them decides: once you sign in to Metask, the file's provider no
-longer takes over. Its keys still work: a provider you choose with
-`--provider` or in `/model` reads its key from the file.
+nothing above them decides: once you sign in to Metask (`/login`, or
+`metacodes login`), the file's provider no longer takes over. Its keys still
+work: a provider you choose with `--provider` or in `/model` reads its key
+from the file. `/logout` signs you out of Metask and switches the session to
+the provider this file configures (`Switched to DeepSeek (from .env)`); later
+starts use it too.
 
 A file with keys of several providers and no `METACODES_PROVIDER` chooses
 none: metacodes stops and lists those providers, and you add

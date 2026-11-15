@@ -162,6 +162,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
 
     printStartupBanner(app, allocator, splash);
     splash = .off; // ended (and freed) by the banner
+    // A stored default passed over for want of a credential (#485): once.
+    if (app.startup_notice) |notice| cmd_output.print("{s}{s}{s}\n\n", .{ app.theme.warn, notice, app.theme.reset });
 
     printStartupSuggestion(&suggestion_git);
 
@@ -563,6 +565,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         if (std.mem.eql(u8, trimmed, "/login") or std.mem.startsWith(u8, trimmed, "/login ")) {
             const rest = std.mem.trim(u8, trimmed[6..], " \t");
             if (shaped) try handleLoginDialog(app, rest) else try handleLogin(app, allocator, rest);
+            continue;
+        }
+        // #485: `/logout` signs out of Metask (both sign-ins) and moves the
+        // session to the provider `.env` configures, or to none;
+        // `/logout <provider>` forgets the key `/login <provider>` stored.
+        if (std.mem.eql(u8, trimmed, "/logout") or std.mem.startsWith(u8, trimmed, "/logout ")) {
+            handleLogout(app, std.mem.trim(u8, trimmed["/logout".len..], " \t"));
             continue;
         }
         // issue #16:`/providers` 列出当前所有路由;`/providers refresh` 重新拉取
@@ -2999,9 +3008,13 @@ fn reportAliasAmbiguity(app: *app_mod.App, store: *const @import("../provider/co
 
 fn printLoginUsage() void {
     cmd_output.print(
-        \\Usage: /login [<provider>] [--device-code] [--no-browser] [--client-id <id>]
-        \\With no provider, choose one from a list. The login is stored where
-        \\`metacodes login --provider <id>` stores it.
+        \\Usage: /login [--no-browser]
+        \\       /login <provider> [--device-code] [--no-browser] [--client-id <id>]
+        \\With no provider, sign in to Metask in the browser, as `metacodes login`
+        \\does, and choose an API key, a model and a reasoning level; the session
+        \\and new sessions use it. With a provider, sign in to that provider; the
+        \\login is stored where `metacodes login --provider <id>` stores it.
+        \\/logout signs out of Metask; /logout <provider> forgets that provider's key.
         \\
     , .{});
 }
@@ -3095,6 +3108,11 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             break :blk value.options;
         },
     };
+    // `/login` alone (or with `--no-browser`) is the Metask browser sign-in
+    // `metacodes login` runs (#485); the provider list is `/login <provider>`.
+    if (named == null and options.method == .loopback and options.client_id == null) {
+        return handleMetaskSignIn(app, options.open_browser);
+    }
     const host = app.providerHost() catch |err| {
         cmd_output.print("{s}The provider registry is unavailable: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
         return;
@@ -3156,6 +3174,163 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             };
         },
     }
+}
+
+/// `/login` (#485): the Metask browser sign-in, then the key, model and
+/// reasoning level, in a dialog (`dialogs.MetaskSignInDialog`). Once all
+/// three are chosen the sign-in is stored where `metacodes login` stores it
+/// (`auth.json`), the session moves onto it, and Metask becomes the default:
+/// a stored `/model` default (which would outrank the sign-in at the next
+/// start) is forgotten. Esc at any step stores and changes nothing.
+fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool) !void {
+    const th = app.theme;
+    const auth = @import("../core/auth.zig");
+    var dialog = dialogs.MetaskSignInDialog.init(app.allocator);
+    defer dialog.deinit();
+    dialog.term_rows = terminalRows();
+    dialog.site_url = @import("../api/metask_oauth.zig").siteUrl();
+    var others: std.ArrayList(u8) = .empty;
+    defer others.deinit(app.allocator);
+    if (app.providerHost()) |host| {
+        // The providers `/login <provider>` signs in to: a key page, or a
+        // grant it can run.
+        for (host.registry.profiles.items) |*profile| {
+            if (profile.id.eqlText("metask")) continue;
+            const flow_ok = if (provider_login.prepareFlow(profile, .{ .state_root = app.stateRoot() }, host.oauthClientIdFor(profile.id))) |_| true else |_| false;
+            if (!flow_ok and profile.api_key_setup == null) continue;
+            if (others.items.len > 0) others.appendSlice(app.allocator, ", ") catch break;
+            others.appendSlice(app.allocator, profile.id.slice()) catch break;
+        }
+    } else |_| {}
+    dialog.others = others.items;
+    const messages_url = @import("../api/metask_sign_in.zig").messagesUrl();
+    dialog.start(app.io, .{ .messages_url = messages_url, .open_browser = open_browser });
+    runDialog(dialogs.MetaskSignInDialog, &dialog, app);
+    if (dialog.outcome != .chosen) {
+        cmd_output.print("Login interrupted · nothing was changed\n", .{});
+        return;
+    }
+    const key = dialog.chosenKey() orelse return;
+    const model = dialog.chosenModel() orelse return;
+    const label = dialog.chosenKeyLabel();
+    const worker = dialog.takeWorker() orelse return;
+    defer worker.release();
+
+    // auth.json, as `metacodes login` writes it: the sign-in, the key, the
+    // model and the reasoning level.
+    var stored = auth.loadDefault(app.allocator, app.stateRoot()) catch |err| switch (err) {
+        error.NotFound, error.NoHome => auth.StoredCredentials{},
+        else => {
+            cmd_output.print("{s}The sign-in was not stored: {s} could not be read ({s}){s}\n", .{ th.danger, "auth.json", @errorName(err), th.reset });
+            return;
+        },
+    };
+    defer stored.deinit(app.allocator);
+    if (stored.oauth) |*old| old.deinit(app.allocator);
+    stored.oauth = worker.takeOAuth();
+    if (stored.api_key) |old| {
+        std.crypto.secureZero(u8, old);
+        app.allocator.free(old);
+    }
+    stored.api_key = try app.allocator.dupe(u8, key);
+    if (stored.selected_model) |old| app.allocator.free(old);
+    stored.selected_model = try app.allocator.dupe(u8, model);
+    stored.reasoning_effort = dialog.effort;
+    auth.saveDefault(app.allocator, app.stateRoot(), stored) catch |err| {
+        cmd_output.print("{s}The sign-in was not stored: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
+        return;
+    };
+
+    app.bindMetaskSignIn(.{
+        .messages_url = messages_url,
+        .key = key,
+        .model = model,
+        .effort = dialog.effort,
+        .models_json = worker.models_json,
+    }) catch |err| {
+        cmd_output.print("{s}Signed in, but this session could not switch to Metask ({s}); a new session starts on it{s}\n", .{ th.danger, @errorName(err), th.reset });
+        return;
+    };
+    // The most recent explicit choice wins: a stored `/model` default would
+    // outrank the sign-in at the next start.
+    const forgot_default = app.forgetStoredDefault() catch |err| blk: {
+        cmd_output.print("{s}The stored default model could not be cleared ({s}); the next start may use it{s}\n", .{ th.warn, @errorName(err), th.reset });
+        break :blk false;
+    };
+    cmd_output.print("Signed in to Metask · {s}", .{app.activeModel()});
+    if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
+    if (label.len > 0) cmd_output.print(" · key \"{s}\"", .{label});
+    cmd_output.print("\n", .{});
+    cmd_output.print("{s}New sessions start on Metask too{s}.{s}\n", .{ th.dim, if (forgot_default) " (the previous default model is forgotten)" else "", th.reset });
+}
+
+/// `/logout` (#485, #499 part 2): out of Metask, both sign-ins, and the
+/// session onto the provider `.env` configures, or none. `/logout
+/// <provider>` forgets the key `/login <provider>` stored for it.
+fn handleLogout(app: *app_mod.App, rest: []const u8) void {
+    const th = app.theme;
+    if (rest.len > 0) {
+        if (std.mem.indexOfAny(u8, rest, " \t") != null or rest[0] == '-') {
+            cmd_output.print("Usage: /logout [<provider>]\n", .{});
+            return;
+        }
+        const host = app.providerHost() catch |err| {
+            cmd_output.print("{s}The provider registry is unavailable: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
+            return;
+        };
+        const profile = host.registry.find(rest) orelse {
+            cmd_output.print("{s}Unknown provider '{s}'{s}\n", .{ th.danger, rest, th.reset });
+            return;
+        };
+        if (!profile.id.eqlText("metask")) return logoutProvider(app, profile);
+    }
+    const done = app.signOutOfMetask() catch |err| {
+        cmd_output.print("{s}Logout failed: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
+        return;
+    };
+    if (done.removed.browser and done.removed.device) {
+        cmd_output.print("Signed out of Metask: removed the browser sign-in and the device-code sign-in.\n", .{});
+    } else if (done.removed.browser) {
+        cmd_output.print("Signed out of Metask: removed the browser sign-in.\n", .{});
+    } else if (done.removed.device) {
+        cmd_output.print("Signed out of Metask: removed the device-code sign-in.\n", .{});
+    } else if (!done.key_removed) {
+        cmd_output.print("No Metask sign-in was stored.\n", .{});
+    }
+    if (done.key_removed) cmd_output.print("Removed the stored key for Metask.\n", .{});
+    if (done.default_cleared) cmd_output.print("Forgot the default model, which was a Metask one.\n", .{});
+    switch (done.session) {
+        .kept => {},
+        .switched => |name| {
+            var line_buf: [256]u8 = undefined;
+            cmd_output.print("Switched to {s} (from .env) · {s}\n", .{ name, app.bannerModelLine(&line_buf) });
+        },
+        .unbound => cmd_output.print("{s}No model is set up now: /login, or configure .env{s}\n", .{ th.warn, th.reset }),
+    }
+    if (done.key_in_shell) cmd_output.print("{s}METASK_API_KEY is still set in your shell: the next start signs in with it.{s}\n", .{ th.warn, th.reset });
+}
+
+/// `/logout <provider>`: the key `/login <provider>` stored. A session that
+/// was using it holds no credential afterwards. A key in `.env` or the shell
+/// is not removed here; the line says where it is.
+fn logoutProvider(app: *app_mod.App, profile: *const @import("../provider/profile.zig").ProviderProfile) void {
+    const th = app.theme;
+    const result = app.forgetProviderKey(profile.id) catch |err| {
+        cmd_output.print("{s}Logout failed: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
+        return;
+    };
+    if (result.removed) {
+        cmd_output.print("Removed the stored key for {s}.\n", .{profile.display_name});
+    } else {
+        cmd_output.print("No key is stored for {s}.\n", .{profile.display_name});
+    }
+    if (result.unbound) cmd_output.print("{s}This session was using it: no model is set up now (/model, or /login {s}).{s}\n", .{ th.warn, profile.id.slice(), th.reset });
+    if (result.local_variable) |name| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}{c}.env", .{ app.stateRoot(), std.fs.path.sep }) catch ".env";
+        cmd_output.print("{s}{s} is set in {s}; remove it there to stop using that key.{s}\n", .{ th.dim, name, path, th.reset });
+    }
+    if (result.shell_variable) |name| cmd_output.print("{s}{s} is set in your shell; unset it to stop using that key.{s}\n", .{ th.dim, name, th.reset });
 }
 
 /// `/login` without a terminal to draw a dialog on: the named provider's

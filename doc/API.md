@@ -73,7 +73,8 @@ normative model; the entry points are:
 | `--provider <id\|alias>` / `METACODES_PROVIDER` | resolve the route through the provider registry instead of inferring a transport from the model name |
 | `METACODES_MODEL` | the model, as `--model` gives it (the flag wins) |
 | `<state root>/.env` | the install's local configuration ([LOCAL_CONFIG.md](LOCAL_CONFIG.md)), read once at start and never `setenv`: a layer below the process environment for the names it may set — every registered profile's `env_aliases`, the variables `config.json` names (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`, `METACODES_MODEL`; a provider's aliases are read from it only when the environment sets none of them. Request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`, `METACODES_KG_URL`, any `*_URL`) are refused; other names are ignored with one warning listing them. Its `METACODES_PROVIDER` (else the one provider whose key it holds) applies only when no flag or environment variable names a provider, no `global_selection` is stored and no Metask sign-in exists (`--api-key`, `METASK_API_KEY`, `auth.json`); keys of several providers and no name choose none, and the run lists them. A `.env` anywhere else, the working directory included, is never read. `metacodes install` writes `<state root>/.env.example` on every install and upgrade and never touches `.env` |
-| no credential at all | the interactive TUI opens without a model (#484): its banner reads `not set — /login, or configure .env`; a prompt, `/retry`, `/edit <n>`, `/init`, `/commit`, `/review`, `/btw`, `/recap` and a Skill are refused with a note before any request is assembled; nothing is probed; no session directory is made until a route binds (`/model`). A Metask sign-in in `auth.json` with no key and model chosen opens it the same way. `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe exit non-zero with the sign-in hint instead. The banner names where a bound route's credential came from (`· Metask`, `· from .env`, `· from shell`, `· saved key`, `· signed in`, `· --api-key`) |
+| no credential at all | the interactive TUI opens without a model (#484): its banner reads `not set — /login, or configure .env`; a prompt, `/retry`, `/edit <n>`, `/init`, `/commit`, `/review`, `/btw`, `/recap` and a Skill are refused with a note before any request is assembled; nothing is probed; no session directory is made until a route binds (`/model`, `/login`). A Metask sign-in in `auth.json` with no key and model chosen opens it the same way, and so does a provider named by `--provider`, `--offer`, `METACODES_PROVIDER` or `.env` that has no credential: the note names that provider's variables, and no other provider is used in its place (#485). `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe exit non-zero with the sign-in hint (or the named provider's help) instead. The banner names where a bound route's credential came from (`· Metask`, `· from .env`, `· from shell`, `· saved key`, `· signed in`, `· --api-key`) |
+| stored default without a credential | a `global_selection` whose provider has no credential (a Metask one: no device-code session and no Metask key) is passed over for the levels below it, with one notice: `The default model, <provider> · <model>, has no key or sign-in; this session uses <model> · <origin>.` (under the TUI's banner, else on stderr) (#485) |
 | `metacodes logout` | removes both Metask sign-ins (`auth.json`, `oauth/metask.json` with its refresh token) and a key stored with `login --provider metask`, forgets a stored default that resolves to Metask, and says which it removed; `METASK_API_KEY` left in the shell or `.env` is named, never removed. `logout --provider metask` is the same (#499) |
 | `--channel <id>` | narrow to one endpoint/region/plan/account binding |
 | `--offer <offer-id>` | pin one exact reproducible route |
@@ -91,12 +92,26 @@ Interactive surfaces: `Ctrl+O` and `/model` open the route picker (transcript
 viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
 and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
 names a route (`pin`, `float`, `use`, `remove`); `/models` still selects the
-account key; `/login` opens a Login pane listing the providers this
-installation can sign in to (Metask's own device grant included), and
+account key; `/login` alone runs the Metask browser sign-in
+`metacodes login` runs (authorization code + PKCE on a loopback
+`/auth/callback`; `--no-browser` prints the URL without opening it) on a
+worker thread, then asks for the API key, model and reasoning level in the
+pane; `Esc` at any step stores and changes nothing. Once all three are chosen
+it writes `auth.json` as `metacodes login` does, moves the session onto that
+route at once, and forgets a stored `global_selection`, so the next start is
+on the sign-in too (#485). `/logout` removes both Metask sign-ins
+(`auth.json` and the device-code session `oauth/metask.json`) and a Metask key
+stored with `login --provider metask`, forgets a stored default that resolves
+to Metask, drops every Metask credential the process holds (nothing is sent
+with one again), and moves a session on Metask to the provider `.env`
+configures (`Switched to <provider> (from .env)`) or leaves it unbound;
+`/logout <id>` removes `keys/<id>.json`, and a session that ran on that key
+holds no credential afterwards. Neither runs in the middle of a turn: a
+command typed then waits in the queue until the turn ends.
 `/login <id> [--device-code] [--no-browser] [--client-id <client>]` starts that
-provider's sign-in directly; either runs the kernel OAuth flow on a worker
-thread (`Esc` cancels it) and stores the login where
-`metacodes login --provider <id>` does (issue #33); `--client-id` is needed
+provider's sign-in directly (`/login metask` is Metask's device grant); it
+runs the kernel OAuth flow on a worker thread (`Esc` cancels it) and stores
+the login where `metacodes login --provider <id>` does (issue #33); `--client-id` is needed
 only when neither the profile nor `providers.<id>.oauth_client_id` in
 `~/.metacodes/config.json` names the installation's registered client (#87). Choosing a route whose
 OAuth-capable provider has no credential signs in inside the picker: the

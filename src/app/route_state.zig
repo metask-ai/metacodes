@@ -18,6 +18,7 @@
 const std = @import("std");
 const credential = @import("../provider/credential.zig");
 const profile_mod = @import("../provider/profile.zig");
+const ids = @import("../provider/ids.zig");
 
 /// Where the credential of the route a session runs on came from: who bills
 /// the session (第十节第 2 条 of the login/logout design, #484). The banner
@@ -56,13 +57,19 @@ pub const CredentialOrigin = enum {
 };
 
 /// Why a session has no model. Each says, in the reminder, what is missing.
-pub const Unbound = enum {
+pub const Unbound = union(enum) {
     /// No flag or environment variable names a provider, no default is
     /// stored, there is no Metask sign-in, and `.env` configures none.
     nothing_configured,
     /// `auth.json` holds a Metask sign-in whose key, model and reasoning
     /// effort were never chosen ("Metask login is incomplete").
     metask_login_incomplete,
+    /// The provider the user named (`--provider`, `--offer`,
+    /// `METACODES_PROVIDER`, or `.env`'s) has no credential (#485, 第十节第
+    /// 3 条): the session stays on nothing rather than quietly using another.
+    missing_credential: ids.Slug,
+    /// `/logout` (#485) left nothing to fall back to: no `.env` provider.
+    signed_out,
 };
 
 pub const RouteState = union(enum) {
@@ -87,9 +94,23 @@ pub fn modelLine(buffer: []u8, state: RouteState, model: []const u8) []const u8 
     };
 }
 
+/// The provider a `missing_credential` reminder is about, in words.
+pub const MissingProvider = struct {
+    display_name: []const u8,
+    /// The variables its key is read from (canonical first); may be empty
+    /// for a provider that signs in instead.
+    variables: []const []const u8 = &.{},
+    /// `/login <id>` stores a credential for it (a key page or a sign-in).
+    login_id: ?[]const u8 = null,
+    /// Metask: what it lacks is a sign-in, and `/login` is the way in.
+    metask: bool = false,
+};
+
 /// What the unbound reminder says, beyond the reason.
 pub const Reminder = struct {
     reason: Unbound,
+    /// Set for `missing_credential`: the provider, by name.
+    missing: ?MissingProvider = null,
     /// This install's `<state root>/.env`; "" when it has no state root.
     env_path: []const u8,
     /// Whether `.env.example` sits beside it (an install wrote it).
@@ -117,6 +138,8 @@ pub fn writeReminder(w: *std.Io.Writer, r: Reminder) std.Io.Writer.Error!void {
     switch (r.reason) {
         .nothing_configured => try w.writeAll("No model is set up.\n"),
         .metask_login_incomplete => try w.writeAll("No model is set up: the Metask sign-in has no API key and model chosen yet.\n"),
+        .signed_out => try w.writeAll("No model is set up: you signed out of Metask.\n"),
+        .missing_credential => return writeMissingReminder(w, r),
     }
     try w.writeAll("  Sign in to Metask:            /login\n");
     if (r.env_path.len > 0) {
@@ -137,6 +160,37 @@ pub fn writeReminder(w: *std.Io.Writer, r: Reminder) std.Io.Writer.Error!void {
         try writeList(w, r.environment_keys);
         try w.writeAll(")\n");
     }
+    try w.print("  How to: {s}\n", .{r.guide_url});
+}
+
+/// The provider the user named has no credential: say which, and where its
+/// key goes, rather than offering another provider first.
+///
+///     No model is set up: DeepSeek has no key.
+///       Put DEEPSEEK_API_KEY in your shell, or in <state root>/.env, then restart
+///       Or store a key for it:        /login deepseek
+///       Or choose another model:      /model
+///       How to: https://…/doc/LOCAL_CONFIG.md
+fn writeMissingReminder(w: *std.Io.Writer, r: Reminder) std.Io.Writer.Error!void {
+    const missing = r.missing orelse MissingProvider{ .display_name = "The provider you named" };
+    if (missing.metask or missing.variables.len == 0) {
+        try w.print("No model is set up: {s} has no sign-in.\n", .{missing.display_name});
+        if (missing.metask) try w.writeAll("  Sign in to Metask:            /login\n");
+    } else {
+        try w.print("No model is set up: {s} has no key.\n", .{missing.display_name});
+        try w.writeAll("  Put ");
+        for (missing.variables, 0..) |name, index| {
+            if (index > 0) try w.writeAll(" or ");
+            try w.writeAll(name);
+        }
+        if (r.env_path.len > 0) {
+            try w.print(" in your shell, or in {s}{s}, then restart\n", .{ r.env_path, if (r.template) " (template: .env.example)" else "" });
+        } else {
+            try w.writeAll(" in your shell, then restart\n");
+        }
+    }
+    if (missing.login_id) |id| try w.print("  Or store a key for it:        /login {s}\n", .{id});
+    try w.writeAll("  Or choose another model:      /model\n");
     try w.print("  How to: {s}\n", .{r.guide_url});
 }
 
@@ -232,6 +286,29 @@ test "the reminder lists shell keys and unchosen .env providers by name, and say
         \\  How to: https://guide
         \\
     , text);
+}
+
+test "the reminder for a named provider without a key names its variables, not another provider" {
+    const text = try reminderText(.{
+        .reason = .{ .missing_credential = ids.Slug.lit("deepseek") },
+        .missing = .{ .display_name = "DeepSeek", .variables = &.{"DEEPSEEK_API_KEY"}, .login_id = "deepseek" },
+        .env_path = "/s/.env",
+        .template = true,
+        .guide_url = "https://guide",
+    });
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(
+        \\No model is set up: DeepSeek has no key.
+        \\  Put DEEPSEEK_API_KEY in your shell, or in /s/.env (template: .env.example), then restart
+        \\  Or store a key for it:        /login deepseek
+        \\  Or choose another model:      /model
+        \\  How to: https://guide
+        \\
+    , text);
+    // Signed out: the usual ways in, with the reason.
+    const out = try reminderText(.{ .reason = .signed_out, .env_path = "/s/.env", .template = false, .guide_url = "https://guide" });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "No model is set up: you signed out of Metask.\n  Sign in to Metask:            /login\n"));
 }
 
 test "the reminder without a state root has no .env line" {

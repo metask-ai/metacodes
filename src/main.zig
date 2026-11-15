@@ -109,6 +109,7 @@ pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_oauth_login = @import("api/oauth_login.zig");
 pub const api_provider_login = @import("api/provider_login.zig");
 pub const api_login_worker = @import("api/login_worker.zig");
+pub const api_metask_sign_in = @import("api/metask_sign_in.zig"); // `/login`'s browser sign-in on a worker (#485)
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
 pub const api_catalog_fetch = @import("api/catalog_fetch.zig");
 pub const api_capability = @import("api/capability.zig");
@@ -564,13 +565,75 @@ fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, " (template: {s})", .{template}) catch "";
 }
 
-/// Level 2 of the startup order: a default `/model` stored in config.json.
-fn hasStoredGlobalSelection(allocator: std.mem.Allocator) bool {
-    var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch return false;
+/// Level 2 of the startup order, judged before it is applied (#485).
+const StoredDefault = union(enum) {
+    /// No `global_selection` is stored.
+    none,
+    /// config.json cannot be read: `applyPersistedGlobalSelection` says so,
+    /// and the levels below decide.
+    unreadable,
+    /// Stored, and its provider has a credential (or it does not resolve,
+    /// which `applyPersistedGlobalSelection` reports as it always has).
+    usable,
+    /// Stored, but its provider has no credential: passed over. The text
+    /// names it (`DeepSeek · deepseek-v4-pro`), for the notice.
+    lacks_credential: []const u8,
+
+    /// Whether `applyPersistedGlobalSelection` runs.
+    fn consulted(self: StoredDefault) bool {
+        return self == .usable or self == .unreadable;
+    }
+};
+
+/// Whether the default stored by `/model` can serve this start: its route
+/// resolves and its provider has a credential. A Metask default needs a
+/// Metask device-code session or a Metask key (`metask_key_present`, the
+/// historical path's own sign-in): that is what a named Metask route
+/// authenticates with. Nothing is printed and nothing sent; the strings live
+/// in `arena`.
+fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_present: bool) StoredDefault {
+    var store = provider_config_store.Store.initHome(arena, hostRoot()) catch return .none;
     defer store.deinit();
-    var document = store.load() catch return false;
+    var document = store.load() catch return .unreadable;
     defer document.deinit();
-    return document.global_selection != null;
+    const selection = document.global_selection orelse return .none;
+    const host = buildProviderHost(arena) orelse return .usable;
+    defer host.destroy();
+    const outcome = provider_startup.resolveSelection(arena, &host.registry, selection) catch return .usable;
+    const route = switch (outcome) {
+        .failure => return .usable,
+        .route => |value| value,
+    };
+    const provider_name = if (host.registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
+    const label = std.fmt.allocPrint(arena, "{s} · {s}", .{ provider_name, route.request_model_id }) catch return .usable;
+    if (route.provider_id.eqlText("metask")) {
+        if (metask_key_present) return .usable;
+        var session = provider_oauth_mod.Session.initHome(arena, config.state_root, provider_ids_mod.Slug.lit("metask")) catch
+            return .{ .lacks_credential = label };
+        defer session.deinit();
+        return if (session.load() catch false) .usable else .{ .lacks_credential = label };
+    }
+    if (resolveProviderScopedCredentialReporting(arena, config, route.provider_id.slice(), .quiet)) |found| {
+        std.crypto.secureZero(u8, found.secret);
+        arena.free(found.secret);
+        return .usable;
+    } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .usable;
+}
+
+/// What this start uses instead of a passed-over default, for the notice.
+const StartRoute = struct {
+    model: []const u8,
+    origin: route_state_mod.CredentialOrigin,
+};
+
+/// `The default model, DeepSeek · deepseek-v4-pro, has no key or sign-in;
+/// this session uses glm-5 · Metask.` (#485, 第四节第 2 级). `instead` is
+/// null when nothing else is set up either. In `arena`.
+fn skippedDefaultNotice(arena: std.mem.Allocator, label: []const u8, instead: ?StartRoute) ?[]const u8 {
+    const route = instead orelse return std.fmt.allocPrint(arena, "The default model, {s}, has no key or sign-in, and nothing else is set up.", .{label}) catch null;
+    var buf: [256]u8 = undefined;
+    const line = route_state_mod.modelLine(&buf, .{ .bound = route.origin }, route.model);
+    return std.fmt.allocPrint(arena, "The default model, {s}, has no key or sign-in; this session uses {s}.", .{ label, line }) catch null;
 }
 
 /// Level 3 of the startup order: a Metask sign-in the historical path would
@@ -1000,13 +1063,20 @@ pub fn main(init: std.process.Init) !void {
     // development override and is an origin, never a /v1/messages URL.
     const metask_legacy_requested = config.api_key != null or
         (config.auth_precedence == .api_key_first and (std.c.getenv("METASK_API_KEY") != null or local_metask_key != null));
+    // Level 2 (#485): a stored default counts only while its provider has a
+    // credential; one that lacks it is passed over for the levels below, and
+    // the start says so once (`skipped_default_notice`).
+    const stored_default: StoredDefault = if (config.provider_profile == null and config.provider_offer == null)
+        storedDefault(allocator, config, metask_legacy_requested)
+    else
+        .none;
     // Level 4. Nothing below a stored default or a sign-in reads the file's
     // choice, and a key that is only in the shell environment never selects
     // a provider: those keys were not put there for metacodes.
     var unchosen_local_providers: []const []const u8 = &.{};
     const local_choice = local_config.choice();
     if (local_choice != .none and config.provider_profile == null and config.provider_offer == null and
-        !hasStoredGlobalSelection(allocator) and !metaskSignInPresent(allocator, config, local_metask_key))
+        stored_default != .usable and !metaskSignInPresent(allocator, config, local_metask_key))
     {
         switch (local_choice) {
             .none => {},
@@ -1066,7 +1136,7 @@ pub fn main(init: std.process.Init) !void {
         // An offer id names its own provider; requiring `--provider` beside it
         // would make a copied offer id unusable on its own.
         applyProviderRoute(&config, allocator, null);
-    } else if (!applyPersistedGlobalSelection(&config, allocator)) {
+    } else if (!stored_default.consulted() or !applyPersistedGlobalSelection(&config, allocator)) {
         config.provider_kind = inferProviderKind(config.model);
     }
 
@@ -1158,28 +1228,55 @@ pub fn main(init: std.process.Init) !void {
     // Where the session's credential came from, for the banner (#484): every
     // credential the Metask scope resolves is Metask's.
     var credential_origin: route_state_mod.CredentialOrigin = .metask;
+    // Only the interactive TUI has someone to tell what is missing (#484):
+    // `-p`, `-`, `serve`, `--web`, resumed suspensions, teammates and a REPL
+    // whose input is a pipe stop at once, non-zero, as scripts expect.
+    const may_open_unbound = interactive_tui and platform_term.isatty(0);
+    var unbound: ?route_state_mod.Unbound = null;
     if (!introspection_only and metask_scope and config.provider_profile != null and
         std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit)
     {
-        provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| {
-            if (err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession) {
+        provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| blk: {
+            const no_sign_in = err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession;
+            // Level 1 (#485): Metask was named and has no sign-in. The TUI
+            // opens on nothing rather than on another provider.
+            if (no_sign_in and may_open_unbound) {
+                unbound = .{ .missing_credential = provider_ids_mod.Slug.lit("metask") };
+                break :blk null;
+            }
+            if (no_sign_in) {
                 std.debug.print(metask_session_hint, .{ .command = invokedCommand(allocator) });
             } else {
                 std.debug.print("Metask OAuth refresh failed: {s}\n", .{@errorName(err)});
             }
             return err;
         };
-        metask_oauth_selected = true;
+        metask_oauth_selected = provider_secret != null;
     } else if (!introspection_only and metask_scope and metask_legacy_explicit) {
         provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
     } else if (!introspection_only and !metask_scope) {
-        const scoped = try resolveProviderScopedCredential(
-            allocator,
-            config,
-            config.provider_profile.?,
-        );
-        provider_secret = scoped.secret;
-        credential_origin = scoped.origin;
+        // Level 1 (and 2 and 4, which name their provider the same way): a
+        // provider without a key opens the TUI unbound, naming the key it
+        // needs (#485, 第十节第 3 条); `-p` and the rest stop with its help.
+        const report: CredentialReport = if (may_open_unbound) .quiet else .print_help;
+        if (resolveProviderScopedCredentialReporting(allocator, config, config.provider_profile.?, report)) |scoped| {
+            provider_secret = scoped.secret;
+            credential_origin = scoped.origin;
+        } else |err| {
+            if (!may_open_unbound or err != error.MissingCredentials) {
+                // Any other refusal (conflicting variables) still stops the
+                // start, with the help it always printed.
+                if (report == .quiet) {
+                    if (resolveProviderScopedCredentialReporting(allocator, config, config.provider_profile.?, .print_help)) |again| {
+                        std.crypto.secureZero(u8, again.secret);
+                        allocator.free(again.secret);
+                    } else |_| {}
+                }
+                return err;
+            }
+            const named = provider_ids_mod.Slug.parse(config.resolved_provider_id orelse config.provider_profile.?) catch provider_ids_mod.Slug.lit("unknown");
+            unbound = .{ .missing_credential = named };
+        }
     }
     // Same handling as `ResolvedCredential.deinit`: zero the bytes before
     // returning them to the allocator so key material does not linger in freed
@@ -1191,13 +1288,9 @@ pub fn main(init: std.process.Init) !void {
 
     // Level 5 of the startup order (#484): with no credential at all, the
     // interactive TUI opens unbound — no model, nothing sent, a reminder of
-    // what to set up — instead of exiting. `-p`, `-`, `serve`, `--web`,
-    // resumed suspensions, teammates and a REPL whose input is a pipe have
-    // nobody to remind: they stop here, non-zero, as scripts expect.
-    const may_open_unbound = interactive_tui and platform_term.isatty(0);
-    var unbound: ?route_state_mod.Unbound = null;
+    // what to set up — instead of exiting (`may_open_unbound`).
     var resolved_credential: ?auth.ResolvedCredential = null;
-    if (!introspection_only and provider_secret == null) {
+    if (!introspection_only and provider_secret == null and unbound == null) {
         resolved_credential = auth.resolveRuntimeCredentialWithEnvFallback(allocator, config.state_root, config.api_key, config.auth_precedence, local_metask_key) catch |err| blk: {
             if (may_open_unbound and err == error.MissingCredentials) {
                 log.info("auth", "no credential: the TUI opens without a model", .{});
@@ -1241,6 +1334,16 @@ pub fn main(init: std.process.Init) !void {
         @as([]const u8, credential.bearer_token)
     else
         "";
+    // Level 2 passed over (#485): said once — in the TUI under its banner,
+    // elsewhere on stderr now — with what this start uses instead.
+    const skipped_default_notice: ?[]const u8 = switch (stored_default) {
+        .lacks_credential => |label| skippedDefaultNotice(allocator, label, if (unbound != null) null else .{
+            .model = config.model,
+            .origin = credential_origin,
+        }),
+        else => null,
+    };
+    if (skipped_default_notice) |notice| if (!interactive_tui) std.debug.print("warning: {s}\n", .{notice});
 
     // The session runs on the general-purpose allocator, never on the process
     // arena `allocator` above: an arena frees nothing, and a session allocates
@@ -1262,7 +1365,17 @@ pub fn main(init: std.process.Init) !void {
     var init_options: app_mod.App.InitOptions = .{
         .models_cache = interactive_tui,
         .route_state = if (unbound) |why| .{ .unbound = why } else .{ .bound = credential_origin },
-        .unchosen_local_providers = unchosen_local_providers,
+        .unchosen_local_providers = switch (local_choice) {
+            .several => |ids| ids,
+            else => unchosen_local_providers,
+        },
+        // What `/logout` falls back to (#485): the provider `.env`
+        // configures, whatever this start was decided by.
+        .local_provider = switch (local_choice) {
+            .provider => |chosen| .{ .name = chosen.name, .model = local_config.get(state_env_mod.model_variable) },
+            else => null,
+        },
+        .startup_notice = skipped_default_notice,
     };
     if (interactive_tui) {
         const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);
@@ -2563,8 +2676,7 @@ fn runModelSelectionForStoredApiKey(allocator: std.mem.Allocator, io: std.Io, st
 }
 
 fn loginMessagesUrl() []const u8 {
-    if (std.c.getenv("METACODES_BASE_URL")) |u| return std.mem.span(u);
-    return client.ANTHROPIC_API_URL;
+    return api_metask_sign_in.messagesUrl();
 }
 
 fn replaceStoredApiKey(allocator: std.mem.Allocator, stored: *auth.StoredCredentials, key: []const u8) !void {
@@ -3454,6 +3566,19 @@ pub fn resolveProviderScopedCredential(
     config: types.Config,
     profile_name: []const u8,
 ) !ScopedCredential {
+    return resolveProviderScopedCredentialReporting(allocator, config, profile_name, .print_help);
+}
+
+/// Whether a failure prints the provider's credential help (`-p`, the CLI)
+/// or leaves saying it to the caller (the TUI's reminder, a dry check).
+const CredentialReport = enum { print_help, quiet };
+
+fn resolveProviderScopedCredentialReporting(
+    allocator: std.mem.Allocator,
+    config: types.Config,
+    profile_name: []const u8,
+    report: CredentialReport,
+) !ScopedCredential {
     const credential_mod = provider_credential;
     const provider_ids_local = provider_ids;
     const host = buildProviderHost(allocator) orelse return error.UnknownProviderProfile;
@@ -3462,7 +3587,7 @@ pub fn resolveProviderScopedCredential(
 
     // The key `login --provider` stored for this provider, in its own file.
     var stored_key = provider_api_key_store.load(allocator, config.state_root, profile.id) catch |err| blk: {
-        std.debug.print("warning: the stored key for '{s}' cannot be used ({s}); run `{s} login --provider {s}` again\n", .{ profile.id.slice(), @errorName(err), invokedCommand(allocator), profile.id.slice() });
+        if (report == .print_help) std.debug.print("warning: the stored key for '{s}' cannot be used ({s}); run `{s} login --provider {s}` again\n", .{ profile.id.slice(), @errorName(err), invokedCommand(allocator), profile.id.slice() });
         break :blk null;
     };
     defer if (stored_key) |*key| key.deinit();
@@ -3478,6 +3603,7 @@ pub fn resolveProviderScopedCredential(
         // `<state root>/.env` (#486), below the process environment.
         .env_fallback = config.credential_env_fallback orelse credential_mod.EnvLookup.empty(),
     }, &reference_buffer) catch |err| {
+        if (report == .quiet) return err;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const local_path: []const u8 = if (config.state_root.len == 0) "" else std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{
             config.state_root, std.fs.path.sep, state_env_mod.file_name,

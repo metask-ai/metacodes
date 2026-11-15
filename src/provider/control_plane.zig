@@ -820,6 +820,15 @@ pub const Kernel = struct {
         self.global_selection = seeded;
     }
 
+    /// Forget the durable global selection whose stored copy was just removed
+    /// (`/login`, `/logout`, #485). Not a commit either: the store already
+    /// changed; the kernel catches up.
+    pub fn forgetGlobalSelection(self: *Kernel) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.global_selection = null;
+    }
+
     /// Install the route this session started on, as resolved by `--provider`,
     /// `--offer`, or a stored selection at boot.
     ///

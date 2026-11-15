@@ -115,6 +115,8 @@ const provider_config_doc = @import("provider/config_doc.zig");
 const model_picker_mod = @import("repl/model_picker.zig");
 const route_strings_mod = @import("app/route_strings.zig");
 pub const route_state_mod = @import("app/route_state.zig");
+const sign_out_mod = @import("app/sign_out.zig");
+const provider_startup_mod = @import("provider/startup.zig");
 const kg_provider_audit = @import("kg/provider_audit.zig");
 const provider_alias_mod = @import("provider/alias.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
@@ -414,6 +416,12 @@ pub const App = struct {
     /// Providers `<state root>/.env` holds keys for while naming none of them
     /// (#486), for the unbound reminder. Borrowed from the host.
     unchosen_local_providers: []const []const u8 = &.{},
+    /// The provider `<state root>/.env` configures, which `/logout` falls
+    /// back to (#485). Borrowed from the host; null when it configures none.
+    local_provider: ?LocalProvider = null,
+    /// Said once under the banner (#485: a stored default passed over for
+    /// want of a credential). Borrowed from the host.
+    startup_notice: ?[]const u8 = null,
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
     model_picker: model_picker_mod.Picker = undefined,
@@ -709,6 +717,19 @@ pub const App = struct {
         route_state: route_state_mod.RouteState = .{ .bound = .unknown },
         /// `App.unchosen_local_providers`; borrowed for the App's life.
         unchosen_local_providers: []const []const u8 = &.{},
+        /// `App.local_provider`; borrowed for the App's life.
+        local_provider: ?LocalProvider = null,
+        /// `App.startup_notice`; borrowed for the App's life.
+        startup_notice: ?[]const u8 = null,
+    };
+
+    /// The provider `<state root>/.env` configures (#486): its
+    /// `METACODES_PROVIDER`, or the one provider whose key it holds, and its
+    /// `METACODES_MODEL`.
+    pub const LocalProvider = struct {
+        /// A provider id or alias, as `--provider` takes it.
+        name: []const u8,
+        model: ?[]const u8 = null,
     };
 
     pub fn init(
@@ -742,6 +763,8 @@ pub const App = struct {
             .route_strings = route_strings_mod.RouteStrings.init(allocator),
             .route_state = options.route_state,
             .unchosen_local_providers = options.unchosen_local_providers,
+            .local_provider = options.local_provider,
+            .startup_notice = options.startup_notice,
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
             .session_id = if (config.session_id) |s|
@@ -1295,12 +1318,18 @@ pub const App = struct {
             const path = try std.fs.path.joinZ(arena, &.{ root, state_env.example_file_name });
             break :blk pfs.exists(path.ptr);
         };
-        const keys: []const []const u8 = if (app.providerHost()) |host|
-            try route_state_mod.environmentKeys(arena, host.registry.profiles.items, provider_credential_mod.EnvLookup.process())
-        else |_|
+        const host: ?*provider_host_mod.Host = app.providerHost() catch null;
+        const keys: []const []const u8 = if (host) |found|
+            try route_state_mod.environmentKeys(arena, found.registry.profiles.items, provider_credential_mod.EnvLookup.process())
+        else
             &.{};
+        const missing: ?route_state_mod.MissingProvider = switch (reason) {
+            .missing_credential => |id| if (host) |found| try missingProvider(arena, found, id) else null,
+            else => null,
+        };
         try route_state_mod.writeReminder(w, .{
             .reason = reason,
+            .missing = missing,
             .env_path = env_path,
             .template = template,
             .guide_url = state_env.guide_url,
@@ -1308,6 +1337,29 @@ pub const App = struct {
             .unchosen_local = app.unchosen_local_providers,
             .provider_variable = state_env.provider_variable,
         });
+    }
+
+    /// The provider `id` as the reminder names it: its display name, the
+    /// variables its key is read from (canonical ones), and whether `/login
+    /// <id>` can store one (a key page, or a sign-in it runs).
+    fn missingProvider(arena: std.mem.Allocator, host: *provider_host_mod.Host, id: provider_ids_mod.Slug) !?route_state_mod.MissingProvider {
+        const profile = host.registry.findById(id) orelse return null;
+        if (profile.id.eqlText("metask")) return .{ .display_name = profile.display_name, .metask = true };
+        var names: std.ArrayList([]const u8) = .empty;
+        for (profile.accepted_credential_kinds) |kind| {
+            const name = profile.canonicalEnvAlias(kind) orelse continue;
+            const seen = for (names.items) |existing| {
+                if (std.mem.eql(u8, existing, name)) break true;
+            } else false;
+            if (!seen) try names.append(arena, name);
+        }
+        const login_capable = profile.api_key_setup != null or
+            if (@import("api/provider_login.zig").requireOAuthCapable(profile)) |_| true else |_| false;
+        return .{
+            .display_name = profile.display_name,
+            .variables = names.items,
+            .login_id = if (login_capable) profile.id.slice() else null,
+        };
     }
 
     /// Where a `/model` commit's credential came from, for the banner: who
@@ -1337,6 +1389,315 @@ pub const App = struct {
             },
             .stored, .interactive, .unknown => .unknown,
         };
+    }
+
+    // ── /login and /logout (#485) ───────────────────────────────────────────
+
+    /// What `/login` hands over once its dialog is done: the key, model and
+    /// reasoning level chosen, and the gateway's `/v1/models` answer for that
+    /// key (the dialog fetched it to list the models). Borrowed.
+    pub const MetaskSignIn = struct {
+        /// The Metask Messages endpoint the sign-in reached the account
+        /// through (`auth.metaskMessagesUrl`).
+        messages_url: []const u8,
+        key: []const u8,
+        model: []const u8,
+        effort: ?types.ReasoningEffort = null,
+        models_json: ?[]const u8 = null,
+    };
+
+    /// Move the session onto the Metask sign-in `/login` just stored: the
+    /// historical Metask API-key route (Anthropic Messages at the sign-in's
+    /// gateway, bearer auth) with the chosen key, model and reasoning level,
+    /// as a start on that `auth.json` would be. Nothing is sent. As in
+    /// `bindCommittedSelection`, whatever can fail goes first; the previous
+    /// strings are retired, not freed.
+    pub fn bindMetaskSignIn(app: *App, sign_in: MetaskSignIn) !void {
+        const origin = MetaskKeyRoute.gatewayOriginOf(sign_in.messages_url) orelse return error.UnexpectedUrl;
+        const endpoint = try app.allocator.dupe(u8, sign_in.messages_url);
+        errdefer app.allocator.free(endpoint);
+        const secret = try app.allocator.dupe(u8, sign_in.key);
+        errdefer {
+            std.crypto.secureZero(u8, secret);
+            app.allocator.free(secret);
+        }
+        // The key route's own copy: `/models` and a Metask pick in `/model`
+        // authenticate with it (`metaskKeyFor`).
+        const route_key = try app.allocator.dupe(u8, sign_in.key);
+        errdefer {
+            std.crypto.secureZero(u8, route_key);
+            app.allocator.free(route_key);
+        }
+        const gateway = try app.allocator.dupe(u8, origin);
+        errdefer app.allocator.free(gateway);
+
+        const previous_key = app.api_key;
+        const previous_url = app.config.base_url;
+        const previous_kind = app.config.provider_kind;
+        const previous_protocol = app.config.openai_protocol;
+        const previous_scheme = app.config.auth_scheme;
+        const previous_dialect = app.config.dialect;
+        var jobs_rerouted = false;
+        errdefer if (jobs_rerouted) {
+            if (app.agent_jobs) |*jobs| jobs.setRoute(previous_key, previous_url, previous_kind, previous_protocol, previous_scheme, previous_dialect) catch {};
+        };
+        if (app.agent_jobs) |*jobs| {
+            try jobs.setRoute(secret, endpoint, .anthropic, .chat_completions, null, .{});
+            jobs_rerouted = true;
+        }
+        try app.switchModel(sign_in.model);
+
+        // Nothing fails from here on.
+        app.route_strings.install(endpoint, secret);
+        {
+            app.route_mutex.lock();
+            defer app.route_mutex.unlock();
+            app.config.provider_kind = .anthropic;
+        }
+        app.config.auth_scheme = null;
+        app.config.dialect = .{};
+        app.config.base_url = endpoint;
+        app.config.metask_oauth_selected = false;
+        // The startup offer (if any) is not this route; the key route marks
+        // the current offer from here (`seedStartupSelection`).
+        app.config.selected_offer_id = null;
+        app.api_key = secret;
+        app.api_client.credential = .{ .fixed = secret };
+        app.api_client.base_url = endpoint;
+        app.api_client.auth_scheme = null;
+        app.api_client.declared_dialect = .{};
+        app.swarm.api_key = secret;
+        app.swarm.base_url = endpoint;
+        app.swarm.provider_kind = .anthropic;
+        app.swarm.auth_scheme = null;
+        app.swarm.dialect = .{};
+
+        if (app.metask_key_route) |*route| route.deinit(app.allocator);
+        if (app.selected_api_key_owned) |old| {
+            std.crypto.secureZero(u8, old);
+            app.allocator.free(old);
+        }
+        app.selected_api_key_owned = route_key;
+        app.metask_key_route = .{ .gateway_origin = gateway, .startup_key = route_key };
+        // The account's key list and the menu's place in it were the
+        // previous sign-in's.
+        app.api_key_catalog.clear();
+        app.api_key_catalog_load = .deferred;
+        app.models_picker_key_index = null;
+        app.models_picker_model_index = null;
+        app.api_client.catalog.deinit();
+        app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
+        if (sign_in.models_json) |document| {
+            app.api_client.catalog.loadFromModelsListJson(document) catch |err| {
+                @import("util/log.zig").debug("catalog", "sign-in /v1/models unusable: {s}", .{@errorName(err)});
+            };
+            app.adoptMetaskKeyModels(endpoint, document);
+        }
+        app.refreshChildCatalogSnapshots() catch |err| {
+            @import("util/log.zig").warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
+        };
+        if (sign_in.effort) |effort| app.setReasoningEffort(effort) catch |err| {
+            @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
+        };
+        app.adoptBoundRoute(.metask);
+    }
+
+    /// What `/logout` did (#485).
+    pub const SignOut = struct {
+        removed: sign_out_mod.Removed,
+        /// A key `login --provider metask` stored, also Metask's.
+        key_removed: bool,
+        /// The stored `/model` default was Metask's and is forgotten.
+        default_cleared: bool,
+        session: SessionAfter,
+        /// `METASK_API_KEY` in the shell signs the next start in again.
+        key_in_shell: bool,
+
+        pub const SessionAfter = union(enum) {
+            /// The session was not on Metask; it stays where it is.
+            kept,
+            /// On the provider `.env` configures: its display name.
+            switched: []const u8,
+            /// Nothing to fall back to: unbound (`signed_out`).
+            unbound,
+        };
+    };
+
+    /// `/logout` (#485, #499 part 2): remove both Metask sign-ins (and a
+    /// Metask key stored with `login --provider metask`), forget a stored
+    /// default that is Metask's, and drop every Metask credential this
+    /// process holds, so nothing is sent with one again. A session on Metask
+    /// moves to the provider `.env` configures, or becomes unbound. Keys of
+    /// other providers are not touched.
+    pub fn signOutOfMetask(app: *App) !SignOut {
+        const root = app.stateRoot();
+        const removed = try sign_out_mod.removeMetaskSignIns(app.allocator, root);
+        const key_removed = provider_api_key_store.remove(app.allocator, root, provider_ids_mod.Slug.lit("metask")) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.RemoveFailed,
+        };
+        const host = try app.providerHost();
+        const default_cleared = sign_out_mod.clearMetaskDefault(app.allocator, root, host.kernel.catalogSnapshot()) catch |err| blk: {
+            @import("util/log.zig").warn("provider", "the stored default could not be checked: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        if (default_cleared) host.kernel.forgetGlobalSelection();
+        const on_metask = switch (app.route_state) {
+            .bound => |origin| origin == .metask,
+            .unbound => false,
+        };
+
+        // Where the session goes. A switch reads the `.env` provider's key
+        // before anything Metask's is dropped, so a failure leaves a route.
+        var session: SignOut.SessionAfter = .kept;
+        if (on_metask) {
+            session = .unbound;
+            if (app.local_provider) |local| {
+                if (app.bindLocalProvider(host, local)) |display_name| {
+                    session = .{ .switched = display_name };
+                } else |err| {
+                    @import("util/log.zig").warn("provider", "the .env provider {s} could not be used: {s}", .{ local.name, @errorName(err) });
+                }
+            }
+            if (session == .unbound) app.unbindRoute(.signed_out);
+        }
+        app.forgetMetaskCredentials();
+        return .{
+            .removed = removed,
+            .key_removed = key_removed,
+            .default_cleared = default_cleared,
+            .session = session,
+            .key_in_shell = provider_credential_mod.EnvLookup.process().get("METASK_API_KEY") != null,
+        };
+    }
+
+    /// Forget the stored `/model` default, on disk and in the kernel (`/login`,
+    /// #485: the most recent explicit choice is the sign-in). True when one
+    /// was stored.
+    pub fn forgetStoredDefault(app: *App) !bool {
+        var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch |err| switch (err) {
+            error.NoHome => return false,
+            else => return err,
+        };
+        defer store.deinit();
+        const outcome = try provider_config_store.clearGlobalSelection(&store, null);
+        if (app.provider_host) |host| {
+            host.kernel.adoptConfigRevision(outcome.result.config_revision);
+            host.kernel.forgetGlobalSelection();
+        }
+        return outcome.cleared;
+    }
+
+    /// What `/logout <provider>` did (#485).
+    pub const ProviderKeyForgotten = struct {
+        /// `<state root>/keys/<provider>.json` was there and is gone.
+        removed: bool,
+        /// The session ran on that saved key and holds no credential now.
+        unbound: bool = false,
+        /// One of the provider's variables `.env` sets, which still supplies
+        /// a key (a name, never a value).
+        local_variable: ?[]const u8 = null,
+        /// One the shell sets.
+        shell_variable: ?[]const u8 = null,
+    };
+
+    /// `/logout <provider>` (#485, 第十节第 6 条): forget the key `/login
+    /// <provider>` stored, as `metacodes logout --provider` does. A session
+    /// running on that key keeps nothing of it. `.env` and the shell are not
+    /// edited; the result names what of them still holds a key.
+    pub fn forgetProviderKey(app: *App, provider_id: provider_ids_mod.Slug) !ProviderKeyForgotten {
+        const removed = try provider_api_key_store.remove(app.allocator, app.stateRoot(), provider_id);
+        var result: ProviderKeyForgotten = .{ .removed = removed };
+        const host = try app.providerHost();
+        const profile = host.registry.findById(provider_id) orelse return result;
+        const on_saved_key = switch (app.route_state) {
+            .bound => |origin| origin == .saved_key,
+            .unbound => false,
+        };
+        if (removed and on_saved_key) {
+            const current = if (host.kernel.currentOfferId()) |id| host.kernel.catalogSnapshot().find(id) else null;
+            if (current) |offer| if (offer.provider_id.eql(provider_id)) {
+                app.unbindRoute(.{ .missing_credential = provider_id });
+                result.unbound = true;
+            };
+        }
+        const env = provider_credential_mod.EnvLookup.process();
+        for (profile.env_aliases) |alias| {
+            if (env.get(alias.name) != null) {
+                result.shell_variable = alias.name;
+            } else if (app.credentialEnvFallback().get(alias.name) != null) {
+                result.local_variable = alias.name;
+            }
+        }
+        return result;
+    }
+
+    /// Drop the Metask material this process holds after `/logout`: the
+    /// device session, the key route and the account's key list, the key
+    /// picked in `/models`, and `--api-key` when it was Metask's. Whatever
+    /// the clients authenticate with was replaced first.
+    fn forgetMetaskCredentials(app: *App) void {
+        if (app.oauth_session_provider) |id| if (id.eqlText("metask")) {
+            if (app.oauth_session) |*session| session.deinit();
+            app.oauth_session = null;
+            app.oauth_session_provider = null;
+        };
+        app.config.metask_oauth_selected = false;
+        if (app.metask_key_route) |*route| route.deinit(app.allocator);
+        app.metask_key_route = null;
+        app.api_key_catalog.clear();
+        app.api_key_catalog_load = .off;
+        app.models_picker_key_index = null;
+        app.models_picker_model_index = null;
+        if (app.selected_api_key_owned) |old| {
+            // Nothing points at it any more: the clients moved to another
+            // route's credential, or to none.
+            std.crypto.secureZero(u8, old);
+            app.allocator.free(old);
+            app.selected_api_key_owned = null;
+        }
+        const flag_is_metask = if (app.config.provider_profile) |name| std.ascii.eqlIgnoreCase(name, "metask") else true;
+        if (flag_is_metask) app.config.api_key = null;
+    }
+
+    /// The session holds no credential from here (#484/#485): every client
+    /// gets an empty one, which the transports refuse before building a
+    /// request, and the REPL refuses first.
+    fn unbindRoute(app: *App, reason: route_state_mod.Unbound) void {
+        if (app.agent_jobs) |*jobs| jobs.setApiKey("") catch {};
+        app.api_key = "";
+        app.api_client.credential = .{ .fixed = "" };
+        if (app.openai_client) |*client| client.credential = .{ .fixed = "" };
+        if (app.gemini_client) |*client| client.credential = .{ .fixed = "" };
+        if (app.bedrock_client) |*client| client.credential = .{ .fixed = "" };
+        app.swarm.api_key = "";
+        app.route_state = .{ .unbound = reason };
+    }
+
+    /// Bind the provider `.env` configures, on its default route (or the
+    /// model the file names), for this session: what a start with only that
+    /// file resolves to. Returns the provider's display name.
+    fn bindLocalProvider(app: *App, host: *provider_host_mod.Host, local: LocalProvider) ![]const u8 {
+        const profile = host.registry.find(local.name) orelse return error.UnknownProvider;
+        var arena_state = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena_state.deinit();
+        const outcome = try provider_startup_mod.resolve(arena_state.allocator(), &host.registry, .{
+            .provider = local.name,
+            .model = local.model,
+        });
+        const route = switch (outcome) {
+            .route => |value| value,
+            .failure => return error.NoRoute,
+        };
+        const offer = host.kernel.catalogSnapshot().find(route.offer_id) orelse return error.OfferUnavailable;
+        const committed = try app.commitModelSelection(.{
+            .offer_id = offer.offer_id,
+            .offer_revision = offer.offer_revision,
+            .controls = .{},
+            .scope = .session,
+        });
+        if (committed != .committed) return error.SelectionRefused;
+        return profile.display_name;
     }
 
     /// 当前 provider 的模型档位表(low/mid/high)。未配置 → null(档位名全 inherit)。

@@ -280,7 +280,9 @@ that sign-in up yet (#499): start it with `metacodes --provider metask`.
 
 To use your own provider key instead of signing in, put it in the install's
 `~/.local/opt/metacodes/state/.env` and start again:
-[doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md).
+[doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md). `metacodes` opens even with
+nothing set up, and says how to do either; `/logout` switches back from the
+Metask account to that key.
 
 [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) covers isolated installs,
 providers, Metask OAuth, Lean kernels and Windows.

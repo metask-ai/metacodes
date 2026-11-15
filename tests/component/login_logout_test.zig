@@ -1,12 +1,26 @@
-//! L2 for #499 part 2: `metacodes logout` leaves no Metask credential
-//! behind.
+//! L2 for #485 and #499 part 2: `/login` and `/logout` switch a session
+//! between the Metask account and local configuration, and signing out
+//! leaves no Metask credential behind.
 //!
-//! Through the real CLI (`METACODES_TEST_CLI_BIN`), against a MockServer
-//! standing in for a relay `config.json` defines (the provider `.env`
-//! configures): `metacodes logout` removes both Metask sign-ins — the
-//! browser one in auth.json and the device-code one in oauth/metask.json —
-//! and a stored default that resolves to Metask, says which, prints no
-//! secret, and the next start falls back to `.env` instead of failing.
+//! In process, on a real `App`, against MockServers standing in for the
+//! Metask gateway and for a relay `config.json` defines (the provider
+//! `.env` configures):
+//! - `bindMetaskSignIn` (what `/login` does once key, model and reasoning
+//!   level are chosen) moves the session, unbound or not, onto the sign-in:
+//!   the next turn reaches the gateway with that key and model;
+//! - `signOutOfMetask` (`/logout`) removes both Metask sign-ins, moves a
+//!   session on Metask to the `.env` provider, and never sends the Metask key
+//!   again; with no `.env` provider the session is unbound and nothing is
+//!   sent at all;
+//! - `forgetProviderKey` (`/logout <provider>`) removes the stored key and
+//!   leaves a session that ran on it without a credential.
+//!
+//! Through the real CLI (`METACODES_TEST_CLI_BIN`):
+//! - `metacodes logout` removes both sign-ins and a Metask default, says
+//!   which, and the next start falls back to `.env` instead of failing;
+//! - a stored default whose provider has no key is passed over with one
+//!   warning (level 2), and is used when it has one;
+//! - `--provider` naming a provider without a key stops `-p` with its help.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -187,6 +201,194 @@ fn expectAbsent(haystack: []const u8, needle: []const u8) !void {
     }
 }
 
+/// No request `server` received carries `secret`.
+fn expectNeverSent(server: *harness.MockServer, secret: []const u8) !void {
+    for (0..server.requestCount()) |index| {
+        const captured = server.requestAt(index) orelse continue;
+        if (std.mem.indexOf(u8, captured.raw, secret) != null) {
+            std.debug.print("{s} was sent: {s}\n", .{ secret, requestLine(captured) });
+            return error.CredentialStillSent;
+        }
+    }
+}
+
+fn sendOneTurn(app: *App) !void {
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = try app.provider().sendStream(&messages, null, null, null, null, null, "");
+    defer handle.deinit();
+    while (try handle.next()) |event| switch (event) {
+        .text => |text| app.allocator.free(text),
+        else => {},
+    };
+}
+
+/// A session started on the Metask sign-in (the historical route, as `main`
+/// builds it from auth.json), at `gateway`; `.env` configures the relay.
+fn signedInApp(case: *Case, io: std.Io, gateway: []const u8, layer: ?*const cc.app_state_env.Loaded) !*App {
+    const a = case.arena();
+    var config = cc.parseArgsForTest(&.{ "metacodes", "--base-url", (try std.fmt.allocPrintSentinel(a, "{s}/v1/messages", .{gateway}, 0)).ptr, "--model", "glm-5" }, a);
+    try testing.expect(config.parse_error == null);
+    config.state_root = case.state;
+    config.credential_env_fallback = if (layer) |loaded| loaded.lookup() else null;
+    return App.initWithOptions(testing.allocator, io, config, METASK_KEY, .{
+        .route_state = .{ .bound = .metask },
+        .local_provider = if (layer != null) .{ .name = "house-relay" } else null,
+    });
+}
+
+test "/logout: a session on Metask moves to the .env provider and never sends the Metask key again (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ ANTHROPIC_SSE, ANTHROPIC_SSE }, 0);
+    defer gateway.stop();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    try case.write("state/.env", RELAY_ENV ++ "=" ++ RELAY_KEY ++ "\nMETACODES_PROVIDER=house-relay\n");
+    try case.writeSignedIn();
+    try case.write("state/oauth/metask.json", "{}");
+    var layer = try cc.app_state_env.load(testing.allocator, case.state, .{
+        .keys = &.{.{ .name = RELAY_ENV, .provider = "house-relay" }},
+    });
+    defer layer.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    const app = try signedInApp(&case, io_runtime.io(), try originOf(a, gateway), &layer);
+    defer app.deinit();
+    try sendOneTurn(app);
+    try testing.expectEqual(@as(usize, 1), gateway.requestCount());
+    try testing.expectEqualStrings("Bearer " ++ METASK_KEY, headerValue(gateway.lastRequest().?, "authorization").?);
+
+    const done = try app.signOutOfMetask();
+    try testing.expect(done.removed.browser and done.removed.device);
+    try testing.expect(done.session == .switched);
+    try testing.expectEqualStrings("House relay", done.session.switched);
+    try testing.expect(!case.exists("state/auth.json"));
+    try testing.expect(!case.exists("state/oauth/metask.json"));
+    var line_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("relay-model · from .env", app.bannerModelLine(&line_buf));
+
+    // The next turn goes to the .env provider with its key; the gateway
+    // sees nothing more, and nobody sees the Metask key again.
+    try sendOneTurn(app);
+    try testing.expectEqual(@as(usize, 1), gateway.requestCount());
+    const captured = relay.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expect(std.mem.startsWith(u8, requestLine(captured), "POST /relay/v1/chat/completions "));
+    try testing.expectEqualStrings("Bearer " ++ RELAY_KEY, headerValue(captured, "authorization").?);
+    try expectNeverSent(relay, METASK_KEY);
+    try testing.expect(app.metask_key_route == null);
+}
+
+test "/logout: with no .env provider the session is unbound and nothing is sent (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ ANTHROPIC_SSE, ANTHROPIC_SSE }, 0);
+    defer gateway.stop();
+    try case.writeSignedIn();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    const app = try signedInApp(&case, io_runtime.io(), try originOf(a, gateway), null);
+    defer app.deinit();
+    const done = try app.signOutOfMetask();
+    try testing.expect(done.removed.browser and !done.removed.device);
+    try testing.expect(done.session == .unbound);
+    try testing.expect(app.unbound().? == .signed_out);
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    try testing.expectError(error.InvalidCredential, app.provider().sendStream(&messages, null, null, null, null, null, ""));
+    try testing.expectEqual(@as(usize, 0), gateway.requestCount());
+    var reminder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer reminder.deinit();
+    try app.writeUnboundReminder(&reminder.writer);
+    try expectContains(reminder.written(), "No model is set up: you signed out of Metask.\n");
+}
+
+test "/login: the chosen key and model become the session's route at once (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer gateway.stop();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    // Unbound, as `main` starts the TUI with nothing configured.
+    var config = cc.parseArgsForTest(&.{"metacodes"}, a);
+    config.state_root = case.state;
+    const app = try App.initWithOptions(testing.allocator, io_runtime.io(), config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
+    defer app.deinit();
+    try testing.expect(app.sessionDir() == null);
+
+    const messages_url = try std.fmt.allocPrint(a, "{s}/v1/messages", .{try originOf(a, gateway)});
+    try app.bindMetaskSignIn(.{
+        .messages_url = messages_url,
+        .key = METASK_KEY,
+        .model = "glm-5",
+        .effort = .low,
+        .models_json = GATEWAY_MODELS,
+    });
+    try testing.expect(app.unbound() == null);
+    var line_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("glm-5 · Metask", app.bannerModelLine(&line_buf));
+    try testing.expect(app.sessionDir() != null);
+    try testing.expectEqual(@as(usize, 0), gateway.requestCount());
+
+    try sendOneTurn(app);
+    const captured = gateway.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expect(std.mem.startsWith(u8, requestLine(captured), "POST /v1/messages "));
+    try testing.expectEqualStrings("Bearer " ++ METASK_KEY, headerValue(captured, "authorization").?);
+    try testing.expectEqualStrings("\"glm-5\"", captured.jsonField("model").?);
+}
+
+test "/logout <provider>: the stored key goes, and a session that ran on it holds none (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    try cc.provider_api_key_store.save(testing.allocator, case.state, cc.provider_ids.Slug.lit("house-relay"), .api_key, RELAY_KEY, null, cc.util_time.nowUnix());
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    var config = cc.parseArgsForTest(&.{"metacodes"}, a);
+    config.state_root = case.state;
+    const app = try App.initWithOptions(testing.allocator, io_runtime.io(), config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
+    defer app.deinit();
+    try testing.expect(cc.repl_picker_host.useSelector(app, "relay-model") == .switched);
+    var line_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("relay-model · saved key", app.bannerModelLine(&line_buf));
+
+    const result = try app.forgetProviderKey(cc.provider_ids.Slug.lit("house-relay"));
+    try testing.expect(result.removed and result.unbound);
+    try testing.expect(!case.exists("state/keys/house-relay.json"));
+    try testing.expect(app.unbound().? == .missing_credential);
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    try testing.expectError(error.InvalidCredential, app.provider().sendStream(&messages, null, null, null, null, null, ""));
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
+    var reminder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer reminder.deinit();
+    try app.writeUnboundReminder(&reminder.writer);
+    try expectContains(reminder.written(), "No model is set up: House relay has no key.\n  Put " ++ RELAY_ENV ++ " in your shell, or in ");
+}
+
 // ── through the real CLI ─────────────────────────────────────────────────────
 
 const Run = struct {
@@ -281,4 +483,59 @@ test "metacodes logout removes both Metask sign-ins and a Metask default, says w
     // Nothing left: says so.
     const again = try runCli(&case, cli, &.{}, &.{ "logout", "--provider", "metask" });
     try expectContains(again.stderr, "No Metask sign-in was stored.");
+}
+
+test "a stored default without a credential is passed over with one warning, and used once it has one (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer gateway.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    try storeDefault(&case, "house-relay", "relay-model");
+    try case.writeSignedIn();
+    const base_url = try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}/v1/messages", .{try originOf(a, gateway)});
+
+    // No relay key anywhere: the default is passed over for the Metask
+    // sign-in (level 3), and the run says so once.
+    const skipped = try runCli(&case, cli, &.{base_url}, &.{ "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ skipped.exit_code, skipped.stderr });
+    try testing.expectEqual(@as(i32, 0), skipped.exit_code);
+    try expectContains(skipped.stderr, "warning: The default model, House relay · relay-model, has no key or sign-in; this session uses glm-5 · Metask.");
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, skipped.stderr, "The default model"));
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
+    try testing.expectEqualStrings("Bearer " ++ METASK_KEY, headerValue(gateway.lastRequest().?, "authorization").?);
+
+    // With its key, the default is what the start uses, without a word.
+    const used = try runCli(&case, cli, &.{ base_url, RELAY_ENV ++ "=" ++ RELAY_KEY }, &.{ "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ used.exit_code, used.stderr });
+    try testing.expectEqual(@as(i32, 0), used.exit_code);
+    try expectAbsent(used.stderr, "The default model");
+    try testing.expectEqualStrings("Bearer " ++ RELAY_KEY, headerValue(relay.lastRequest().?, "authorization").?);
+    try testing.expectEqual(@as(usize, 1), gateway.requestCount());
+}
+
+test "--provider naming a provider without a key stops -p with its help, sending nothing (#485)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    // A Metask sign-in is there; it is not used in the named provider's place.
+    try case.writeSignedIn();
+    const run = try runCli(&case, cli, &.{}, &.{ "--provider", "house-relay", "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ run.exit_code, run.stderr });
+    try testing.expect(run.exit_code != 0);
+    try expectContains(run.stderr, "Authentication required for provider 'house-relay'.");
+    try expectContains(run.stderr, "export " ++ RELAY_ENV ++ "=...");
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
 }
