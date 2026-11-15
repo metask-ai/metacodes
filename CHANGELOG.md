@@ -12,6 +12,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **`metacodes` with nothing configured opens the terminal UI instead of
+  exiting** (#484). With no flag, stored `/model` default, Metask sign-in or
+  `.env` provider, or with a Metask sign-in whose key and model were never
+  chosen (`Metask login is incomplete`), the TUI starts without a model: the
+  banner's model line reads `not set — /login, or configure .env`, slash
+  commands work, and a prompt — or `/retry`, `/init`, `/commit`, `/review`,
+  `/btw`, `/recap`, a Skill — is not sent. A red note in its place names
+  `/login`, this install's `.env` (and `.env.example` when an install wrote
+  it), the provider keys the shell holds by name only (they are still never
+  used on their own: `/model` picks one) and doc/LOCAL_CONFIG.md. The prompt
+  stays in the history for ↑, no request of any kind goes out (not even the
+  `/v1/models` probe), and no session directory is made until a model is
+  chosen. `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe still
+  stop at once, non-zero, with the sign-in hint. The banner now also says
+  where the model's credential came from — `· Metask`, `· from .env`,
+  `· from shell`, `· saved key`, `· signed in`, `· --api-key` — and
+  `metacodes install` ends with the next step while the install has neither a
+  Metask sign-in nor a `.env`.
 - **`KIMI_API_KEY` is the Kimi Code subscription's key, no longer an alias
   of `MOONSHOT_API_KEY`** (#487). The `kimi` profile (the Moonshot open
   platform) now reads `MOONSHOT_API_KEY` only, and `KIMI_API_KEY`

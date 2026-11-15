@@ -159,7 +159,11 @@ At start, metacodes takes the first of these that applies:
    beside it does not overrule that.
 4. **The provider this file configures**: `METACODES_PROVIDER` here, or, when
    it names none, the one provider whose key the file holds.
-5. **Nothing**: metacodes stops and says how to sign in or set up this file.
+5. **Nothing**: the terminal UI opens without a model. Its banner reads
+   `not set — /login, or configure .env`, and a message you send is not sent:
+   a red note says how to sign in or set up this file, and ↑ brings the
+   message back once a model is set up. `-p`, `serve` and `--web` stop
+   instead, with the same advice.
 
 So `METACODES_PROVIDER` and `METACODES_MODEL` in the file apply only when
 nothing above them decides: once you sign in to Metask, the file's provider no
@@ -215,5 +219,7 @@ Local configuration (.env)
     reads    DEEPSEEK_API_KEY, METACODES_PROVIDER
 ```
 
-When no provider has a key, the error names this install's file and the
-template beside it, and links this page.
+When no provider has a key, the terminal UI's note (and the error of `-p`,
+`serve` and `--web`) names this install's file and the template beside it, and
+links this page. Keys that are only in your shell are listed by name there,
+never used: choose one of those providers in `/model` to use its key.

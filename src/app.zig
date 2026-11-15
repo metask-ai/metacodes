@@ -114,6 +114,7 @@ const provider_credential_mod = @import("provider/credential.zig");
 const provider_config_doc = @import("provider/config_doc.zig");
 const model_picker_mod = @import("repl/model_picker.zig");
 const route_strings_mod = @import("app/route_strings.zig");
+pub const route_state_mod = @import("app/route_state.zig");
 const kg_provider_audit = @import("kg/provider_audit.zig");
 const provider_alias_mod = @import("provider/alias.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
@@ -404,6 +405,15 @@ pub const App = struct {
     /// Set when the session runs the historical Metask API-key route; null on
     /// every other route. See `MetaskKeyRoute`.
     metask_key_route: ?MetaskKeyRoute = null,
+    /// What the model route rests on (#484): bound, and where its credential
+    /// came from (the banner names it), or unbound: no usable model, so
+    /// nothing is sent until a route with a credential is chosen
+    /// (`app/route_state.zig`). The host sets it (`InitOptions.route_state`);
+    /// a committed `/model` choice binds it (`bindCommittedSelection`).
+    route_state: route_state_mod.RouteState = .{ .bound = .unknown },
+    /// Providers `<state root>/.env` holds keys for while naming none of them
+    /// (#486), for the unbound reminder. Borrowed from the host.
+    unchosen_local_providers: []const []const u8 = &.{},
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
     model_picker: model_picker_mod.Picker = undefined,
@@ -693,6 +703,12 @@ pub const App = struct {
         /// that takes the refreshed answer, at its idle points
         /// (`adoptModelCatalogRefresh`).
         models_cache: bool = false,
+        /// Bound (and to what), or unbound (#484). An unbound App neither
+        /// probes `/v1/models` nor opens a session directory for a new
+        /// session; `api_key` is then empty and never sent.
+        route_state: route_state_mod.RouteState = .{ .bound = .unknown },
+        /// `App.unchosen_local_providers`; borrowed for the App's life.
+        unchosen_local_providers: []const []const u8 = &.{},
     };
 
     pub fn init(
@@ -724,6 +740,8 @@ pub const App = struct {
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
             .model_picker = model_picker_mod.Picker.init(allocator),
             .route_strings = route_strings_mod.RouteStrings.init(allocator),
+            .route_state = options.route_state,
+            .unchosen_local_providers = options.unchosen_local_providers,
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
             .session_id = if (config.session_id) |s|
@@ -1021,14 +1039,19 @@ pub const App = struct {
         const metask_session_active =
             std.ascii.eqlIgnoreCase(config.provider_profile orelse "", "metask") and
             app.oauth_session != null;
+        // Unbound (#484): no route, no credential, so nothing to probe and no
+        // key route to record. Nothing is sent from here until a route binds.
+        const bound = app.route_state == .bound;
         // Recorded whether or not the probe below runs or answers: a later
         // `/models` key switch probes this same gateway again.
-        if (MetaskKeyRoute.of(config, app.api_client.base_url)) |origin| {
+        if (bound) if (MetaskKeyRoute.of(config, app.api_client.base_url)) |origin| {
             app.metask_key_route = .{ .gateway_origin = try allocator.dupe(u8, origin), .startup_key = api_key };
-        }
+        };
         errdefer if (app.metask_key_route) |*route| route.deinit(allocator);
         if (config.provider_kind == .anthropic) {
-            if (std.c.getenv("METACODES_NO_PROBE") == null and !metask_session_active) {
+            if (!bound) {
+                @import("util/log.zig").debug("catalog", "probeModels skipped (no model is set up)", .{});
+            } else if (std.c.getenv("METACODES_NO_PROBE") == null and !metask_session_active) {
                 // The account's key list waits for the `/models` key menu (ensureApiKeyCatalog).
                 app.api_key_catalog_load = .deferred;
                 app.loadModelCatalog(options.models_cache);
@@ -1043,7 +1066,10 @@ pub const App = struct {
         }
 
         // 初始化 transcript writer：需要 cwd + HOME
-        app.initTranscriptWriter() catch |err| {
+        // A new unbound session makes no session directory (#484): nothing
+        // can happen in it worth keeping until a route binds, which opens the
+        // writer then (`adoptBoundRoute`). A resumed one reopens its own.
+        if (bound or config.session_id != null) app.initTranscriptWriter() catch |err| {
             @import("util/log.zig").warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
         };
 
@@ -1219,6 +1245,97 @@ pub const App = struct {
             .openai => app.openai_client.?.model,
             .gemini => app.gemini_client.?.model,
             .bedrock => app.bedrock_client.?.model,
+        };
+    }
+
+    /// Why the session has no model, or null when it has one (#484). The
+    /// REPL refuses every request while this is set.
+    pub fn unbound(app: *const App) ?route_state_mod.Unbound {
+        return switch (app.route_state) {
+            .unbound => |why| why,
+            .bound => null,
+        };
+    }
+
+    /// The model a status line names: `not set` while unbound (#484), where
+    /// `activeModel()` is only the placeholder the clients were built with.
+    pub fn displayModel(app: *const App) []const u8 {
+        return if (app.unbound() != null) "not set" else app.activeModel();
+    }
+
+    /// The banner's model line: `not set — /login, or configure .env`, or the
+    /// model with where its credential came from (`· from .env`, `· Metask`).
+    pub fn bannerModelLine(app: *const App, buffer: []u8) []const u8 {
+        return route_state_mod.modelLine(buffer, app.route_state, app.activeModel());
+    }
+
+    /// The session now runs on a route with a credential from `origin`. An
+    /// unbound session gets the session directory it went without (#484), so
+    /// a session-scoped choice and the first turn have somewhere to persist.
+    fn adoptBoundRoute(app: *App, origin: route_state_mod.CredentialOrigin) void {
+        app.route_state = .{ .bound = origin };
+        if (app.transcript_writer == null) app.initTranscriptWriter() catch |err| {
+            @import("util/log.zig").warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
+        };
+    }
+
+    /// The unbound reminder (#484) for this install: its `.env` (and the
+    /// template beside it when an install wrote one), the provider keys the
+    /// environment sets (names only), the providers `.env` names none of.
+    /// Plain text, one line per `\n`; the REPL colours it.
+    pub fn writeUnboundReminder(app: *App, w: *std.Io.Writer) !void {
+        const reason = app.unbound() orelse return;
+        const state_env = @import("app/state_env.zig");
+        var arena_state = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const root = app.stateRoot();
+        const env_path: []const u8 = if (root.len == 0) "" else try std.fs.path.join(arena, &.{ root, state_env.file_name });
+        const template = if (root.len == 0) false else blk: {
+            const path = try std.fs.path.joinZ(arena, &.{ root, state_env.example_file_name });
+            break :blk pfs.exists(path.ptr);
+        };
+        const keys: []const []const u8 = if (app.providerHost()) |host|
+            try route_state_mod.environmentKeys(arena, host.registry.profiles.items, provider_credential_mod.EnvLookup.process())
+        else |_|
+            &.{};
+        try route_state_mod.writeReminder(w, .{
+            .reason = reason,
+            .env_path = env_path,
+            .template = template,
+            .guide_url = state_env.guide_url,
+            .environment_keys = keys,
+            .unchosen_local = app.unchosen_local_providers,
+            .provider_variable = state_env.provider_variable,
+        });
+    }
+
+    /// Where a `/model` commit's credential came from, for the banner: who
+    /// bills the session from here. `oauth_token` and `stored_key` are the
+    /// sign-in and the saved key the binding was offered.
+    fn bindingOrigin(
+        host: *provider_host_mod.Host,
+        binding: provider_binding_mod.RuntimeBinding,
+        oauth_token: ?[]const u8,
+        stored_key: ?[]const u8,
+    ) route_state_mod.CredentialOrigin {
+        if (binding.provider_id.eqlText("metask")) return .metask;
+        if (oauth_token) |token| if (binding.secret.ptr == token.ptr) return .sign_in;
+        if (stored_key) |key| if (binding.secret.ptr == key.ptr) return .saved_key;
+        return switch (binding.credential_ref.source) {
+            .cli, .runtime_fd => .flag,
+            // The process environment wins over `.env` for a provider's
+            // aliases (`credential.resolveEnv`): any of them set there is
+            // where the key came from.
+            .env => blk: {
+                const profile = host.registry.findById(binding.provider_id) orelse break :blk .unknown;
+                const env = provider_credential_mod.EnvLookup.process();
+                for (profile.env_aliases) |alias| {
+                    if (env.get(alias.name) != null) break :blk .environment;
+                }
+                break :blk .local_config;
+            },
+            .stored, .interactive, .unknown => .unknown,
         };
     }
 
@@ -2059,6 +2176,8 @@ pub const App = struct {
             &reference_buffer,
         );
 
+        // Read while the material the binding borrows is still live.
+        const origin = bindingOrigin(host, binding, oauth_token, if (stored_key) |*key| key.secret else null);
         const endpoint = try app.allocator.dupe(u8, binding.endpoint_url);
         errdefer app.allocator.free(endpoint);
         const secret = try app.allocator.dupe(u8, binding.secret);
@@ -2222,6 +2341,7 @@ pub const App = struct {
         app.swarm.openai_protocol = binding.openai_protocol;
         app.swarm.auth_scheme = binding.auth_scheme;
         app.swarm.dialect = binding.dialect;
+        app.adoptBoundRoute(origin);
     }
 
     pub fn selectApiKeyForModels(app: *App, idx: usize) !void {
@@ -2505,7 +2625,8 @@ pub const App = struct {
         if (app.transcript_writer) |*w| w.deinit();
         app.transcript_writer = null;
         app.publishSessionDir();
-        app.initTranscriptWriter() catch |err| {
+        // An unbound session opens its directory when a route binds (#484).
+        if (app.route_state == .bound) app.initTranscriptWriter() catch |err| {
             @import("util/log.zig").warn("transcript", "rotate writer failed: {s}", .{@errorName(err)});
         };
         // R4-3:goal 属于被转走的旧会话——不清则旧 goal 记进新会话目录、用量记错账,

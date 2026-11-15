@@ -23,6 +23,8 @@ const invocation = @import("app/invocation.zig");
 pub const doctor = @import("app/doctor.zig"); // pub: component tests build the report by hand
 pub const app_state_env = @import("app/state_env.zig"); // pub: component tests read the template and the parser
 const state_env_mod = app_state_env;
+pub const app_route_state = @import("app/route_state.zig"); // pub: component tests read the banner and the reminder
+const route_state_mod = app_route_state;
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
 pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
@@ -1151,6 +1153,9 @@ pub fn main(init: std.process.Init) !void {
     const metask_legacy_explicit = metask_legacy_requested;
     var provider_secret: ?[]u8 = null;
     var metask_oauth_selected = false;
+    // Where the session's credential came from, for the banner (#484): every
+    // credential the Metask scope resolves is Metask's.
+    var credential_origin: route_state_mod.CredentialOrigin = .metask;
     if (!introspection_only and metask_scope and config.provider_profile != null and
         std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit)
     {
@@ -1166,11 +1171,13 @@ pub fn main(init: std.process.Init) !void {
     } else if (!introspection_only and metask_scope and metask_legacy_explicit) {
         provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
     } else if (!introspection_only and !metask_scope) {
-        provider_secret = try resolveProviderScopedSecret(
+        const scoped = try resolveProviderScopedCredential(
             allocator,
             config,
             config.provider_profile.?,
         );
+        provider_secret = scoped.secret;
+        credential_origin = scoped.origin;
     }
     // Same handling as `ResolvedCredential.deinit`: zero the bytes before
     // returning them to the allocator so key material does not linger in freed
@@ -1180,9 +1187,21 @@ pub fn main(init: std.process.Init) !void {
         allocator.free(secret);
     };
 
+    // Level 5 of the startup order (#484): with no credential at all, the
+    // interactive TUI opens unbound — no model, nothing sent, a reminder of
+    // what to set up — instead of exiting. `-p`, `-`, `serve`, `--web`,
+    // resumed suspensions, teammates and a REPL whose input is a pipe have
+    // nobody to remind: they stop here, non-zero, as scripts expect.
+    const may_open_unbound = interactive_tui and platform_term.isatty(0);
+    var unbound: ?route_state_mod.Unbound = null;
     var resolved_credential: ?auth.ResolvedCredential = null;
     if (!introspection_only and provider_secret == null) {
-        resolved_credential = auth.resolveRuntimeCredentialWithEnvFallback(allocator, config.state_root, config.api_key, config.auth_precedence, local_metask_key) catch |err| {
+        resolved_credential = auth.resolveRuntimeCredentialWithEnvFallback(allocator, config.state_root, config.api_key, config.auth_precedence, local_metask_key) catch |err| blk: {
+            if (may_open_unbound and err == error.MissingCredentials) {
+                log.info("auth", "no credential: the TUI opens without a model", .{});
+                unbound = .nothing_configured;
+                break :blk null;
+            }
             @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
             std.debug.print(auth_required_hint, .{ .command = invokedCommand(allocator) });
             printLocalConfigHint(&local_config, unchosen_local_providers);
@@ -1191,12 +1210,6 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     defer if (resolved_credential) |*credential| credential.deinit(allocator);
-    const api_key = if (provider_secret) |secret|
-        @as([]const u8, secret)
-    else if (resolved_credential) |credential|
-        @as([]const u8, credential.bearer_token)
-    else
-        "";
     config.metask_oauth_selected = metask_oauth_selected;
 
     // The stored Metask login carries a Metask model and reasoning effort;
@@ -1208,9 +1221,24 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     if (metask_scope) if (resolved_credential) |credential| if (!isUsableConfiguredSession(config, credential.source)) {
-        std.debug.print(incomplete_login_hint, .{ .command = invokedCommand(allocator) });
-        return error.IncompleteLoginSelection;
+        // A sign-in without a key and model to run: the TUI opens unbound
+        // (the reminder says so; `/login` finishes it), anything else stops.
+        if (!may_open_unbound) {
+            std.debug.print(incomplete_login_hint, .{ .command = invokedCommand(allocator) });
+            return error.IncompleteLoginSelection;
+        }
+        log.info("auth", "Metask login is incomplete: the TUI opens without a model", .{});
+        unbound = .metask_login_incomplete;
     };
+    // Unbound, the session holds no key at all: none is ever sent.
+    const api_key = if (unbound != null)
+        ""
+    else if (provider_secret) |secret|
+        @as([]const u8, secret)
+    else if (resolved_credential) |credential|
+        @as([]const u8, credential.bearer_token)
+    else
+        "";
 
     // The session runs on the general-purpose allocator, never on the process
     // arena `allocator` above: an arena frees nothing, and a session allocates
@@ -1229,7 +1257,11 @@ pub fn main(init: std.process.Init) !void {
     // reads stdin, which is the splash's until it ends, and the protocol must
     // be known before the REPL first enters raw mode.
     var splash: repl.Splash = .not_started;
-    var init_options: app_mod.App.InitOptions = .{ .models_cache = interactive_tui };
+    var init_options: app_mod.App.InitOptions = .{
+        .models_cache = interactive_tui,
+        .route_state = if (unbound) |why| .{ .unbound = why } else .{ .bound = credential_origin },
+        .unchosen_local_providers = unchosen_local_providers,
+    };
     if (interactive_tui) {
         const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);
         init_options.theme_variant = variant;
@@ -1958,8 +1990,25 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
     summary.writer.print("  update: {s} update\n", .{outcome.launcher orelse outcome.executable}) catch {};
     if (outcome.launcher == null) summary.writer.print("  add {s}{c}bin to PATH, or reinstall with --link <dir on PATH>\n", .{ outcome.prefix, std.fs.path.sep }) catch {};
     if (outcome.sdk) |sdk| summary.writer.print("  SDK: {s}\n", .{sdk}) catch {};
+    writeInstallNextStep(&summary.writer, outcome.state_root, std.fs.path.basename(outcome.launcher orelse outcome.executable)) catch {};
     dumpWrite(summary.written());
     return 0;
+}
+
+/// What to do after installing (#484, 第十节第 9 条), while this install's
+/// state root has neither a Metask sign-in (`auth.json`) nor a `.env`: start
+/// it and `/login`, or put a provider key in its own `.env`.
+fn writeInstallNextStep(w: *std.Io.Writer, state_root: []const u8, command: []const u8) !void {
+    if (state_root.len == 0) return;
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    for ([_][]const u8{ "auth.json", state_env_mod.file_name }) |name| {
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}{c}{s}", .{ state_root, std.fs.path.sep, name }) catch return;
+        if (pfs.exists(path.ptr)) return;
+    }
+    try w.print("  next: run `{s}` and type /login to sign in to Metask,\n", .{command});
+    try w.print("        or put your provider key in {s}{c}{s} (template: {s}), then run it\n", .{
+        state_root, std.fs.path.sep, state_env_mod.file_name, state_env_mod.example_file_name,
+    });
 }
 
 const update_usage =
@@ -3331,6 +3380,22 @@ pub fn resolveProviderScopedSecret(
     config: types.Config,
     profile_name: []const u8,
 ) ![]u8 {
+    return (try resolveProviderScopedCredential(allocator, config, profile_name)).secret;
+}
+
+/// A provider-scoped credential and where it came from (the banner says it).
+pub const ScopedCredential = struct {
+    /// Owned by the caller's allocator; zero it before freeing.
+    secret: []u8,
+    origin: route_state_mod.CredentialOrigin,
+};
+
+/// `resolveProviderScopedSecret`, with the credential's origin.
+pub fn resolveProviderScopedCredential(
+    allocator: std.mem.Allocator,
+    config: types.Config,
+    profile_name: []const u8,
+) !ScopedCredential {
     const credential_mod = provider_credential;
     const provider_ids_local = provider_ids;
     const host = buildProviderHost(allocator) orelse return error.UnknownProviderProfile;
@@ -3362,7 +3427,15 @@ pub fn resolveProviderScopedSecret(
         printProviderCredentialHelp(profile.*, err, invokedCommand(allocator), local_path);
         return err;
     };
-    return allocator.dupe(u8, resolved.secret);
+    const origin: route_state_mod.CredentialOrigin = switch (resolved.ref.source) {
+        .cli, .runtime_fd => .flag,
+        .stored => .saved_key,
+        // The process environment wins over `.env` (#486): an alias it does
+        // not set came from the file.
+        .env => if (resolved.alias_used) |name| (if (credential_mod.EnvLookup.process().get(name) != null) .environment else .local_config) else .unknown,
+        .interactive, .unknown => .unknown,
+    };
+    return .{ .secret = try allocator.dupe(u8, resolved.secret), .origin = origin };
 }
 
 /// `command` is the command the user ran (`invokedCommand`); `local_path`
@@ -4236,6 +4309,37 @@ test "Metask login dispatch uses JSON device flow except token import" {
     try std.testing.expect(!metaskUsesDeviceFlow(.oauth_json));
 }
 
+test "install names the next step while the state root has neither a sign-in nor a .env (#484)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try writeInstallNextStep(&out.writer, root, "metacodes-dev");
+    const env_path = try std.fs.path.join(a, &.{ root, ".env" });
+    defer a.free(env_path);
+    const expected = try std.fmt.allocPrint(a,
+        \\  next: run `metacodes-dev` and type /login to sign in to Metask,
+        \\        or put your provider key in {s} (template: .env.example), then run it
+        \\
+    , .{env_path});
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, out.written());
+
+    // Signed in, or configured: nothing to say.
+    for ([_][]const u8{ "auth.json", ".env" }) |name| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = "{}" });
+        var quiet: std.Io.Writer.Allocating = .init(a);
+        defer quiet.deinit();
+        try writeInstallNextStep(&quiet.writer, root, "metacodes");
+        try std.testing.expectEqualStrings("", quiet.written());
+        try tmp.dir.deleteFile(std.testing.io, name);
+    }
+}
+
 test "the sign-in hints name the command that was run, the default sign-in first (#482)" {
     const a = std.testing.allocator;
     const cases = [_]struct { argv0: []const u8, command: []const u8 }{
@@ -4344,6 +4448,7 @@ test {
     _ = &@import("app/install.zig");
     _ = &@import("app/invocation.zig");
     _ = &@import("app/state_env.zig");
+    _ = &@import("app/route_state.zig");
     _ = &@import("app/release_source.zig");
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");

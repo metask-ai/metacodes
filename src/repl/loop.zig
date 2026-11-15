@@ -246,7 +246,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             }
         }
 
-        if (shouldRunLoopContinuation(app, msg_queue.len())) {
+        if (app.unbound() == null and shouldRunLoopContinuation(app, msg_queue.len())) {
             try runLoopContinuation(&turn_host);
             continue;
         }
@@ -492,6 +492,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/retry")) {
+            if (refusedUnbound(app)) continue;
             // U11:回卷(丢弃最后 user 之后的回合)经 service;run 提交留宿主。
             if (svc.prepareRetry().run != null) {
                 try runTurn(&turn_host, .macro, null);
@@ -511,6 +512,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 cmd_output.print("{s}", .{listing.written()});
                 continue;
             }
+            if (refusedUnbound(app)) continue;
             const d = svc.prepareEdit(rest);
             if (d.run != null) {
                 cmd_output.print("\x1b[2mRewound to your message {s}; rerunning with the edited text.\x1b[0m\n", .{rest[0 .. std.mem.indexOfAny(u8, rest, " \t") orelse rest.len]});
@@ -533,7 +535,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 \\Usage:       {d} input, {d} output, {d} cache read, {d} cache write
                 \\Model:       {s}
                 \\
-            , .{ u.costUsd(app.activeModel()), u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, app.activeModel() });
+            , .{ u.costUsd(app.activeModel()), u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, app.displayModel() });
             continue;
         }
         // issue #16:`/models` 选的是**凭证**(账号 API key),不是路由。路由选择归
@@ -631,6 +633,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/init")) {
+            if (refusedUnbound(app)) continue;
             // 对齐 cc:prompt 型命令——注入指令让模型扫码库写 CLAUDE.md(走正常 agent_loop)。
             const d = svc.submitMacro(session_service.INIT_PROMPT);
             if (d.run != null) {
@@ -647,12 +650,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         }
         // /btw <question>:侧问,不进对话历史(用临时 conversation 跑一次)
         if (std.mem.startsWith(u8, trimmed, "/btw ")) {
+            if (refusedUnbound(app)) continue;
             if (!try awaitMcpServers(&turn_host)) continue;
             try handleBtw(app, allocator, std.mem.trim(u8, trimmed[5..], " \t"));
             continue;
         }
         // /recap:生成会话一行总结(不进历史)
         if (std.mem.eql(u8, trimmed, "/recap")) {
+            if (refusedUnbound(app)) continue;
             if (app.conversation.len() >= 2 and !try awaitMcpServers(&turn_host)) continue;
             try handleRecap(app, allocator);
             continue;
@@ -711,6 +716,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         // /commit 和 /review：把预置 prompt 注入为 user message，走正常 agent_loop 路径
         // (U11:注入经 service.submitMacro,prompt 常量归 session_service——web/daemon 同源)
         if (std.mem.eql(u8, trimmed, "/commit")) {
+            if (refusedUnbound(app)) continue;
             const d = svc.submitMacro(session_service.COMMIT_PROMPT);
             if (d.run != null) {
                 try runTurn(&turn_host, .macro, null);
@@ -721,6 +727,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/review")) {
+            if (refusedUnbound(app)) continue;
             const d = svc.submitMacro(session_service.REVIEW_PROMPT);
             if (d.run != null) {
                 try runTurn(&turn_host, .macro, null);
@@ -758,6 +765,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 .command => |head| if (app.skill_runtime.findRecord(head) != null and
                     app.skill_runtime.overrideState(head).userInvocable())
                 {
+                    // A Skill run is a model request (a fork sends its own).
+                    if (refusedUnbound(app)) continue;
                     if (!try awaitMcpServers(&turn_host)) continue;
                 },
                 .not_a_command => {},
@@ -806,6 +815,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         app.clearActiveSkill();
 
         try history.append(final_input);
+        // No model (#484): the line stays in the history (↑ brings it back
+        // once one is set up) and goes nowhere else: no conversation entry,
+        // no request, no session record. The reminder hangs off its echo.
+        if (app.unbound() != null) {
+            if (tty) beginCommandBlock(app, "");
+            printUnboundReminder(app);
+            if (tty) cmd_output.end();
+            continue;
+        }
         // 粘贴占位符 [Pasted text #N] → 展开成真实内容再喂给模型；history 保留紧凑占位符。
         const expanded = blk: {
             if (app.stateRoot().len == 0) break :blk null;
@@ -910,6 +928,8 @@ fn awaitMcpServers(host: *const TurnHost) !bool {
 fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const u8) !void {
     const app = host.app;
     const allocator = host.allocator;
+    // Every way into a turn checks first; this is the last line (#484).
+    if (refusedUnbound(app)) return;
     // A `/v1/models` refresh that finished while the prompt was typed sets
     // this turn's limits.
     app.adoptModelCatalogRefresh();
@@ -1645,6 +1665,28 @@ fn beginCommandBlock(app: *const app_mod.App, line: []const u8) void {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     const head_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
     if (complete.isBuiltinCommand(trimmed[0..head_end])) cmd_output.flushEcho();
+}
+
+/// #484: the session has no model, so nothing that would reach one runs.
+/// True after printing the reminder in its place (inside the open command
+/// block, if any); false when the session has a model.
+fn refusedUnbound(app: *app_mod.App) bool {
+    if (app.unbound() == null) return false;
+    printUnboundReminder(app);
+    return true;
+}
+
+/// The unbound reminder (`App.writeUnboundReminder`), in the theme's danger
+/// colour, line by line (a block's gutter would otherwise reset it).
+fn printUnboundReminder(app: *app_mod.App) void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    app.writeUnboundReminder(&text.writer) catch {
+        cmd_output.print("{s}No model is set up: /login, or configure .env{s}\n", .{ app.theme.danger, app.theme.reset });
+        return;
+    };
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text.written(), "\n"), '\n');
+    while (lines.next()) |line| cmd_output.print("{s}{s}{s}\n", .{ app.theme.danger, line, app.theme.reset });
 }
 
 /// `⏺ Unknown command: /foo. Did you mean /loop?` in place of the command's
@@ -3303,7 +3345,7 @@ fn printModelList(
     group_filter: ?[]const u8,
     cap_filter: ?model_command.Capability,
 ) void {
-    cmd_output.print("current model: \x1b[36m{s}\x1b[0m  provider={s}\n", .{ app.activeModel(), @tagName(app.config.provider_kind) });
+    cmd_output.print("current model: \x1b[36m{s}\x1b[0m  provider={s}\n", .{ app.displayModel(), @tagName(app.config.provider_kind) });
     if (group_filter) |g| cmd_output.print("filter group: {s}\n", .{g});
     if (cap_filter) |cap| cmd_output.print("filter capability: {s}\n", .{model_command.capabilityLabel(cap)});
 
@@ -3401,7 +3443,7 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     const th = app.theme;
     var problems_buf: [160]u8 = undefined;
     const problems = formatConfigProblems(&problems_buf, app.configProblems());
-    cmd_output.print("Model:            {s}\n", .{app.activeModel()});
+    cmd_output.print("Model:            {s}\n", .{app.displayModel()});
     cmd_output.print("Permission mode:  {s}\n", .{modeName(app.permission_ctx.modeValue())});
     if (app.api_key.len > 0) {
         cmd_output.print("Credential:       set\n", .{});
@@ -3449,7 +3491,7 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         // The summary only: the file itself is the user's to open, and a raw
         // dump would echo whatever was hand-written into it.
         const theme_mod = @import("tui/theme.zig");
-        cmd_output.print("Model:            {s}\n", .{app.activeModel()});
+        cmd_output.print("Model:            {s}\n", .{app.displayModel()});
         cmd_output.print("Permission mode:  {s}\n", .{modeName(app.permMode())});
         cmd_output.print("Theme:            {s}\n", .{theme_mod.variantName(app.theme_variant)});
         cmd_output.print("Verbose output:   {}\n", .{app.config.verbose});
@@ -5029,8 +5071,10 @@ fn printBanner(app: *const app_mod.App) void {
     while (filled < inner) : (filled += 1) cmd_output.print("{s}", .{th.box_h});
     cmd_output.print("{s}{s}\n", .{ th.box_tr, th.reset });
 
-    // 内容行:模型 + cwd。
-    printBannerLine(th, inner, app.activeModel());
+    // 内容行:模型 + cwd。The model line says where its credential came
+    // from, or that none is set up (#484).
+    var model_line_buf: [256]u8 = undefined;
+    printBannerLine(th, inner, app.bannerModelLine(&model_line_buf));
     printBannerLine(th, inner, app.cwdAbs());
     if (app.kg == null or !(app.kg.?.ready)) {
         const kind = if (app.kg) |*kg| @tagName(kg.degradedKind() orelse .unconfigured) else "unconfigured";
@@ -5302,6 +5346,8 @@ fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []c
 fn fireDueCrons(host: *const TurnHost) !void {
     const app = host.app;
     const allocator = host.allocator;
+    // Without a model a due prompt stays due (#484).
+    if (app.unbound() != null) return;
     const due = app.cron_registry.collectDue(allocator, std.math.maxInt(usize)) catch return;
     defer {
         for (due) |p| allocator.free(p);
