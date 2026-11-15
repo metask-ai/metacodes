@@ -1240,9 +1240,13 @@ leaving every Host to rebuild them:
   `project_rule_blocked` tool error. A missing or invalid kernel
   configuration, a bundle that fails attestation, or a Bash job of the
   Session still running or a team it leads (`ProjectRulesRequireDetachedWorkersIdle`)
-  fails the Run before any provider request: `run_done` names the error,
-  the Run is closed in the journal and, as for any Run that fails, the
-  Session is poisoned. After a Run the bundle is re-attested and the Run's
+  fails the Run before any provider request: `run_done` names the error and
+  the Run is closed in the journal. Unlike other failed Runs, such a refusal
+  does not poison the Session, as the daemon reports the Run failed and
+  takes the next message: the submission's text never enters the
+  Conversation and the Session is idle again (a refused resumption of a
+  suspended Run still poisons it). A journal that cannot open still
+  poisons. After a Run the bundle is re-attested and the Run's
   operational observation is published beside the journal.
   `abandoned_run = .record_abandoned` closes a Run whose process died as
   abandoned and runs the next one, as the daemon does; the default,

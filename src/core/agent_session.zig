@@ -792,8 +792,12 @@ pub const ProjectRules = enum {
     /// and decides each tool call through the project kernel; a missing or
     /// invalid kernel configuration, a bundle that fails attestation, or a
     /// running background job or active team fails the Run before any
-    /// provider request. After the Run the bundle is re-attested and the
-    /// Run's operational observation published.
+    /// provider request. Such a refusal fails only that Run, as the daemon
+    /// reports it failed and takes the next message: its input never enters
+    /// the Conversation and the Session stays usable (a refused resumption,
+    /// whose suspended turn could not be continued, still poisons). After
+    /// the Run the bundle is re-attested and the Run's operational
+    /// observation published.
     enforced,
 };
 
@@ -1134,6 +1138,31 @@ pub const RunExecutionEvidence = struct {
     system_prompt: ?[]const u8 = null,
 };
 
+/// What an admitted Run puts into the Conversation. `runLoop` appends it
+/// only once the Run's control let the Run go on, so a Run the project
+/// rules refuse leaves the Conversation as it was (#445).
+const RunInput = union(enum) {
+    /// User text records, in order. Borrowed.
+    prompts: []const []const u8,
+    /// One built user record, owned by the Run: the Conversation takes it,
+    /// or `runLoop` frees it when the Run ends before.
+    record: message_mod.Message,
+    /// Results for the suspended turn's tool calls
+    /// (`agent_loop.resumeRunWithResults`, #446). Borrowed.
+    resumption: []const agent_loop.SuspendInfo.CompletedResult,
+};
+
+/// A durable Run's control once its journal opened (#445).
+const RunControlOpening = union(enum) {
+    /// The Run goes on; the caller finishes and frees it.
+    open: *project_rule_activation.RunControl,
+    /// The project rules refused the Run before any provider request or
+    /// tool action: an active bundle that cannot be attested (or a kernel
+    /// configuration that cannot be used), or a detached worker running.
+    /// The Run is closed in the journal under this error's name.
+    refused: anyerror,
+};
+
 /// Exactly-once capability returned after Run admission but before any
 /// Conversation mutation. AgentCore uses this narrow seam to materialize a
 /// typed Skill without duplicating the Session lifecycle state machine.
@@ -1170,7 +1199,9 @@ pub const AdmittedRun = struct {
 
     /// Append the already-prepared root prompt and reuse the ordinary Run
     /// pipeline. Any failure after this call begins has normal admitted-Run
-    /// poison semantics.
+    /// poison semantics, except the project rules refusing the Run
+    /// (`RunControlConfig.project_rules`, #445): that error returns with the
+    /// Run finished, the prompt not appended and the Session idle.
     pub fn runText(
         self: *AdmittedRun,
         prompt: []const u8,
@@ -1181,7 +1212,8 @@ pub const AdmittedRun = struct {
 
     /// Continue an admitted Run with a caller-defined sequence of user
     /// records and an immutable execution upper bound. Appends and provider
-    /// execution retain the ordinary poison semantics.
+    /// execution retain the ordinary poison semantics; a project-rules
+    /// refusal fails only the Run, as for `runText`.
     pub fn runUserMessagesWithPolicy(
         self: *AdmittedRun,
         prompts: []const []const u8,
@@ -1252,12 +1284,6 @@ pub const AdmittedRun = struct {
         }
         try self.session.claimAdmittedRun(self.identity_value);
         self.completed = true;
-        for (prompts) |prompt| {
-            self.session.conversation.appendText(.user, prompt) catch |err| {
-                _ = self.session.poisonRun();
-                return err;
-            };
-        }
         return self.session.runLoop(
             self.identity_value,
             max_turns,
@@ -1265,7 +1291,7 @@ pub const AdmittedRun = struct {
             tool_surface,
             provider_override,
             self.stream_retry_budget,
-            null,
+            .{ .prompts = prompts },
         );
     }
 
@@ -1328,19 +1354,13 @@ pub const AdmittedRun = struct {
             _ = try self.finishWithoutConversation();
             return err;
         };
-        // 显式转移标志而非裸 errdefer:Conversation.append 失败时**不**接管
-        // record,成功后所有权归 conversation。裸 errdefer 会在 append 成功之后
-        // 的任何错误(runLoop 返错是常态)上二次释放。
-        var record_owned = true;
-        errdefer if (record_owned) record.deinit(self.session.conversation.allocator);
-        try self.session.claimAdmittedRun(self.identity_value);
-        self.completed = true;
-        // 此后失败才是普通的 admitted-Run poison 语义。
-        self.session.conversation.append(record) catch |err| {
-            _ = self.session.poisonRun();
+        self.session.claimAdmittedRun(self.identity_value) catch |err| {
+            record.deinit(self.session.conversation.allocator);
             return err;
         };
-        record_owned = false;
+        self.completed = true;
+        // 此后失败才是普通的 admitted-Run poison 语义;record 归 runLoop
+        // (追加进 Conversation,或在追加前失败时由它释放)。
         return self.session.runLoop(
             self.identity_value,
             max_turns,
@@ -1348,7 +1368,7 @@ pub const AdmittedRun = struct {
             tool_surface,
             provider_override,
             self.stream_retry_budget,
-            null,
+            .{ .record = record },
         );
     }
 
@@ -1387,7 +1407,7 @@ pub const AdmittedRun = struct {
             null,
             null,
             self.stream_retry_budget,
-            results,
+            .{ .resumption = results },
         );
     }
 
@@ -2889,10 +2909,14 @@ pub const AgentSession = struct {
         tool_surface: ?RunToolSurface,
         provider_override: ?provider_mod.Provider,
         stream_retry_budget: u8,
-        /// Non-null: the Run resumes a suspended turn with these tool results
-        /// (`agent_loop.resumeRunWithResults`) instead of starting one.
-        resume_with: ?[]const agent_loop.SuspendInfo.CompletedResult,
+        input: RunInput,
     ) anyerror!agent_loop.RunResult {
+        // A built record is the Run's until the Conversation takes it.
+        var pending_record: ?message_mod.Message = switch (input) {
+            .record => |record| record,
+            .prompts, .resumption => null,
+        };
+        defer if (pending_record) |record| record.deinit(self.conversation.allocator);
         var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
         const tool_definitions = if (tool_surface) |surface|
             surface.definitions
@@ -2937,17 +2961,39 @@ pub const AgentSession = struct {
 
         // #445: the bundled daemon's per-Run control. It opens the durable
         // journal and, under `project_rules = .enforced`, loads and
-        // re-attests the active project rule bundle; a refusal fails the Run
-        // before any provider request or tool action, as a journal that
-        // cannot open does.
+        // re-attests the active project rule bundle. A journal that cannot
+        // open poisons the Session; the project rules refusing the Run fail
+        // only the Run, as the daemon reports such a Run failed and takes the
+        // next message: nothing of it entered the Conversation yet.
         const run_control: ?*project_rule_activation.RunControl = if (self.run_journal_root.len == 0)
             null
-        else
-            self.openRunControl(identity, rendered_prompt.manifest) catch |err| {
-                _ = self.poisonRun();
+        else switch (self.openRunControl(identity, rendered_prompt.manifest) catch |err| {
+            _ = self.poisonRun();
+            return err;
+        }) {
+            .open => |control| control,
+            .refused => |err| {
+                switch (input) {
+                    // The suspended turn's tool calls stay without results
+                    // and the Host drops its suspension on a failed Run: no
+                    // later Run could continue that Conversation.
+                    .resumption => _ = self.poisonRun(),
+                    .prompts, .record => {
+                        const completion = self.finishRunLifecycle();
+                        if (completion.callback_failed) return error.CallbackFailed;
+                    },
+                }
                 return err;
-            };
+            },
+        };
         defer if (run_control) |control| control.deinit();
+        // The Run's input enters the Conversation once the Run may go on.
+        self.appendRunInput(input) catch |err| {
+            if (run_control) |control| control.finishRun(@errorName(err)) catch {};
+            _ = self.poisonRun();
+            return err;
+        };
+        pending_record = null;
         self.announcePromptManifest(rendered_prompt.manifest) catch |err| {
             if (run_control) |control| control.finishRun(@errorName(err)) catch {};
             _ = self.poisonRun();
@@ -3000,10 +3046,10 @@ pub const AgentSession = struct {
             .swarm = if (self.swarm) |*s| s else null,
         };
         const run_provider = provider_override orelse self.provider.provider();
-        var native_result = (if (resume_with) |results|
-            agent_loop.resumeRunWithResults(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, results, run_options, &backend, self.allocator)
-        else
-            agent_loop.run(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, run_options, &backend, self.allocator)) catch |err| {
+        var native_result = (switch (input) {
+            .resumption => |results| agent_loop.resumeRunWithResults(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, results, run_options, &backend, self.allocator),
+            .prompts, .record => agent_loop.run(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, run_options, &backend, self.allocator),
+        }) catch |err| {
             if (run_control) |control| control.finishRun(@errorName(err)) catch {};
             if (err == error.HostToolFatal) {
                 self.mutex.lock();
@@ -3034,42 +3080,57 @@ pub const AgentSession = struct {
     /// `daemon/app_driver.zig` opens one per Run: the bundle of the
     /// workspace root when `project_rules` is enforced, then the
     /// detached-worker check the daemon makes (a Bash job of this Session
-    /// still running, or a team). A refusal after the journal opened closes
-    /// the Run in it under the error's name.
+    /// still running, or a team). An error is a journal that cannot open;
+    /// the project rules refusing the Run after it opened is `.refused`,
+    /// the Run closed in the journal under the refusal's name.
     fn openRunControl(
         self: *AgentSession,
         identity: RunIdentity,
         prompt: prompt_sections.Manifest,
-    ) !*project_rule_activation.RunControl {
+    ) !RunControlOpening {
         var report: tool_observation_journal.OpenReport = .{};
         const control = try project_rule_activation.RunControl.initWithOptions(
             self.allocator,
             self.run_journal_root,
             identity.session_id,
             .{
-                .project_root = switch (self.run_control.project_rules) {
-                    .ignored => null,
-                    .enforced => self.workspace.root,
-                },
+                .project_root = null,
                 .abandoned_run = self.run_control.abandoned_run,
                 .prompt = prompt,
-                .abort = &self.abort_signal,
                 .report = &report,
             },
         );
-        errdefer control.deinit();
         if (report.unfinished) |abandoned| {
             var text: [512]u8 = undefined;
             log.warn("agent_session", "{s}", .{tool_observation_journal.describeAbandoned(&text, &abandoned)});
+        }
+        switch (self.run_control.project_rules) {
+            .ignored => {},
+            .enforced => control.loadProjectGate(self.workspace.root, &self.abort_signal) catch |err| {
+                control.deinit();
+                return .{ .refused = err };
+            },
         }
         control.requireDetachedIdle(
             if (self.jobs) |*registry| registry.runningCountForOwner(self.session_id) else 0,
             if (self.swarm) |*swarm| swarm.hasTeam() else false,
         ) catch |err| {
             control.finishRun(@errorName(err)) catch {};
-            return err;
+            control.deinit();
+            return .{ .refused = err };
         };
-        return control;
+        return .{ .open = control };
+    }
+
+    /// The Run's input, appended to the Conversation (#445). A record is
+    /// the Conversation's only once this returns; a resumption's results
+    /// enter it through `agent_loop.resumeRunWithResults`.
+    fn appendRunInput(self: *AgentSession, input: RunInput) !void {
+        switch (input) {
+            .prompts => |prompts| for (prompts) |prompt| try self.conversation.appendText(.user, prompt),
+            .record => |record| try self.conversation.append(record),
+            .resumption => {},
+        }
     }
 
     const RunCompletion = struct {

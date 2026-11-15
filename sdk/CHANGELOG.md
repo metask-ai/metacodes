@@ -41,6 +41,11 @@ empty `### Migration`.
   the catalog `Options.models` resolves model names against while the Host
   runs (#445); ABI revision 28 exposes neither `SessionHost` nor
   `ModelPolicy`.
+- No change a Host can see. A Zig Session whose `run_control` enforces
+  project rules now fails only the Run those rules refuse, leaving the
+  Session idle instead of poisoned, as the daemon does (#445);
+  `SessionConfigV1` has no `run_control`, so an ABI Session never opens the
+  gate.
 
 ### Fixed
 

@@ -62,7 +62,11 @@ status, compatibility boundaries, and entry points are defined by
   the project kernel, and publishes the Run's operational observer after it;
   a missing or invalid kernel configuration, a bundle that fails
   attestation, or a running background job or active team fails the Run
-  before any provider request. `abandoned_run = .record_abandoned` closes a
+  before any provider request. Such a refusal fails only that Run, as the
+  daemon reports it failed and takes the next message: the submission's
+  text stays out of the Conversation and the Session is idle again, not
+  poisoned (a refused resumption of a suspended Run still poisons, and so
+  does a journal that cannot open). `abandoned_run = .record_abandoned` closes a
   Run whose process died as abandoned and runs the next one, as the daemon
   does; the default stays `fail_closed`. Either setting on an ephemeral
   Session is refused (`RunControlRequiresRunJournal`), and a Session that

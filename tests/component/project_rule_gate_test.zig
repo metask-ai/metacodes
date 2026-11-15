@@ -5175,6 +5175,13 @@ test "L2 #445 SessionHost project rules: an enforced Session's Runs are gated by
     try lead.submit(.{ .text = "and now" });
     try waitForHosted(&lead.journal, "\"stop_reason\":null,\"error_name\":\"ProjectRulesRequireDetachedWorkersIdle\"", 1);
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    // Only that Run failed, as on the daemon: the lead is not poisoned.
+    {
+        var snapshot = try lead.snapshot(allocator);
+        defer snapshot.deinit(allocator);
+        try std.testing.expectEqual(cc.session_host.Phase.idle, snapshot.phase);
+    }
+    try std.testing.expectEqual(@as(usize, 0), try countHosted(&lead.journal, "\"type\":\"session_poisoned\""));
 
     // A Session without a team: permissions allow the Write, the bundle's
     // rule blocks it before dispatch.
