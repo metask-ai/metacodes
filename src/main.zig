@@ -661,6 +661,15 @@ fn providerKnown(allocator: std.mem.Allocator, name: []const u8) bool {
     return host.registry.find(name) != null;
 }
 
+/// `name`'s display name in the registry this run builds (`name` itself when
+/// it names no provider there); in `arena`.
+fn providerDisplayName(arena: std.mem.Allocator, name: []const u8) []const u8 {
+    const host = buildProviderHost(arena) orelse return name;
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse return name;
+    return arena.dupe(u8, profile.display_name) catch name;
+}
+
 /// Whether `name` (a provider id or alias, as `--provider` takes it) is
 /// Metask in the registry this run builds.
 fn providerIsMetask(allocator: std.mem.Allocator, name: []const u8) bool {
@@ -1070,6 +1079,9 @@ pub fn main(init: std.process.Init) !void {
         storedDefault(allocator, config, metask_legacy_requested)
     else
         .none;
+    // Whether a flag or the shell named the route: then nothing below is a
+    // "default" the start chose for the user.
+    const named_at_start = config.provider_profile != null or config.provider_offer != null;
     // Level 4. Nothing below a stored default or a sign-in reads the file's
     // choice, and a key that is only in the shell environment never selects
     // a provider: those keys were not put there for metacodes.
@@ -1344,6 +1356,23 @@ pub fn main(init: std.process.Init) !void {
         else => null,
     };
     if (skipped_default_notice) |notice| if (!interactive_tui) std.debug.print("warning: {s}\n", .{notice});
+    // 第七节第 3 条 (#485): `.env` configures a provider, yet the start is on
+    // Metask, which ranks above it (a sign-in or a stored default). Said once
+    // under the TUI's banner, with the two ways to the file's provider.
+    const shadowed_local_notice: ?[]const u8 = shadowed: {
+        if (!interactive_tui or named_at_start or unbound != null or credential_origin != .metask) break :shadowed null;
+        const chosen = switch (local_choice) {
+            .provider => |value| value,
+            else => break :shadowed null,
+        };
+        if (providerIsMetask(allocator, chosen.name)) break :shadowed null;
+        const name = providerDisplayName(allocator, chosen.name);
+        break :shadowed std.fmt.allocPrint(allocator, ".env configures {s}; the default is Metask. To use {s}: /model, or /logout", .{ name, name }) catch null;
+    };
+    const startup_notice: ?[]const u8 = if (skipped_default_notice != null and shadowed_local_notice != null)
+        std.fmt.allocPrint(allocator, "{s}\n{s}", .{ skipped_default_notice.?, shadowed_local_notice.? }) catch skipped_default_notice
+    else
+        skipped_default_notice orelse shadowed_local_notice;
 
     // The session runs on the general-purpose allocator, never on the process
     // arena `allocator` above: an arena frees nothing, and a session allocates
@@ -1375,7 +1404,7 @@ pub fn main(init: std.process.Init) !void {
             .provider => |chosen| .{ .name = chosen.name, .model = local_config.get(state_env_mod.model_variable) },
             else => null,
         },
-        .startup_notice = skipped_default_notice,
+        .startup_notice = startup_notice,
     };
     if (interactive_tui) {
         const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);

@@ -202,16 +202,19 @@ def test_logout_switches_to_the_env_provider_and_never_uses_the_sign_in_again(bi
         a = TTYAssert(raw, rows=30, cols=140)
         screen = _screen(a)
         assert "Signed out of Metask: removed the browser sign-in and the device-code sign-in." in screen, screen
-        # Started on Metask (the sign-in outranks .env), one turn there ...
+        # Started on Metask (the sign-in outranks .env), and said why the
+        # file's provider is not in use (第七节第 3 条); one turn there ...
         a.assert_prose_contains("glm-5 · Metask")
+        a.assert_prose_contains(".env configures House relay; the default is Metask. To use House relay: /model, or /logout")
         assert mock.messages == [(f"Bearer {KEY_SECRET}", MODEL)], mock.messages
         # ... and after /logout the turn went to the .env provider, with its key.
         assert relay.requests == [("/relay/v1/chat/completions", f"Bearer {RELAY_KEY}", "relay-model")], relay.requests
         assert not os.path.exists(os.path.join(state, "auth.json"))
         assert not os.path.exists(device)
-        # The next plain start is on the .env provider.
+        # The next plain start is on the .env provider, with nothing to explain.
         raw2 = run(bin_path, [READY, "strictsleep:0.3"], env=env, base_url=None, cwd=work, term_size=(30, 140))
         TTYAssert(raw2, rows=30, cols=140).assert_prose_contains("relay-model · from .env")
+        assert b".env configures" not in raw2
         assert len(mock.messages) == 1, mock.messages
 
 

@@ -26,7 +26,10 @@ status, compatibility boundaries, and entry points are defined by
   drops every Metask credential the process holds, and moves a session on
   Metask to the provider `.env` configures (`Switched to <provider> (from
   .env)`) or leaves it without a model; `/logout <provider>` removes the key
-  `/login <provider>` stored. Neither runs in the middle of a turn.
+  `/login <provider>` stored. Neither runs in the middle of a turn. A start
+  on Metask while `.env` configures another provider says so once under the
+  banner (`.env configures DeepSeek; the default is Metask. To use DeepSeek:
+  /model, or /logout`).
 - **A provider named at start without a key opens the TUI without a model,
   and a stored default without one is passed over** (#485). `--provider`,
   `--offer`, `METACODES_PROVIDER` or `.env` naming a provider that has no
