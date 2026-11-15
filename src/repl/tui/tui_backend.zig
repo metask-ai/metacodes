@@ -632,18 +632,6 @@ pub const TuiBackend = struct {
                     // 卡在 readv 里的读醒不了。这里代它 shutdown 在飞连接(一次)。
                     self.cancelInFlightIfAborted(app);
                     self.region.tickSpinner(app);
-                    // The picker's sign-in runs on a worker thread (#67);
-                    // this tick moves its transcript into the overlay and
-                    // commits the pending route once the login lands.
-                    if (self.region.pickerOpen()) switch (picker_host.poll(app, &self.region.ui, .of(self.region))) {
-                        .committed => {
-                            self.region.writeGenText(picker_host.lastNotice(app));
-                            self.region.writeGenText("\n");
-                            self.region.redrawGen(app);
-                        },
-                        .redraw => self.region.redrawGen(app),
-                        .ignored => {},
-                    };
                 }
                 continue;
             }

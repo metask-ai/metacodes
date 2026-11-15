@@ -1941,10 +1941,10 @@ test "L2: a `--provider` startup route is a resolvable selection before any comm
     try std.testing.expect(profile.oauth_token_url != null);
 }
 
-test "L2 (#33): a commit that lacks a credential names /login only for an OAuth-capable provider" {
-    // The picker's failure notice is the one place a user who picked a route
-    // without a credential learns there is a way in. The pointer is decided
-    // from the provider profile, not from error text.
+test "L2 (#488): a provider's setup names the variable its key is read from, and /login only for Metask" {
+    // The picker shows this for a provider with no credential, and for a
+    // commit that found none; it starts no sign-in, so it points at the
+    // place the key goes. It is decided from the provider profile.
     const a = std.testing.allocator;
     const host = try cc.provider_host.Host.create(a);
     defer host.destroy();
@@ -1957,19 +1957,27 @@ test "L2 (#33): a commit that lacks a credential names /login only for an OAuth-
         \\},"keyonly":{
         \\  "models":[{"request_model_id":"m","display_name":"M"}],
         \\  "channels":[{"id":"default","base_url":"https://keyonly.invalid/v1","protocol":"openai_chat"}],
-        \\  "credential_kinds":["api_key"]
+        \\  "credential_kinds":["api_key"],
+        \\  "env_aliases":[{"name":"KEYONLY_OTHER","kind":"api_key","canonical":false},{"name":"KEYONLY_TOKEN","kind":"api_key","canonical":true}]
         \\}}}
     );
-    var relay_offer: ?cc.provider_ids.OfferId = null;
-    var keyonly_offer: ?cc.provider_ids.OfferId = null;
-    for (host.kernel.catalogSnapshot().items()) |offer| {
-        if (offer.provider_id.eqlText("relay")) relay_offer = offer.offer_id;
-        if (offer.provider_id.eqlText("keyonly")) keyonly_offer = offer.offer_id;
+    const App = cc.app_module.App;
+    const cases = [_]struct { id: []const u8, variable: ?[]const u8, sign_in: bool }{
+        .{ .id = "metask", .variable = "METASK_API_KEY", .sign_in = true },
+        // The canonical alias, wherever it is declared.
+        .{ .id = "keyonly", .variable = "KEYONLY_TOKEN", .sign_in = false },
+        // A provider with an OAuth grant gets no /login pointer here either.
+        .{ .id = "relay", .variable = null, .sign_in = false },
+        .{ .id = "kimi", .variable = "MOONSHOT_API_KEY", .sign_in = false },
+        .{ .id = "kimi-code", .variable = "KIMI_CODE_API_KEY", .sign_in = false },
+        .{ .id = "gemini", .variable = "GEMINI_API_KEY", .sign_in = false },
+    };
+    for (cases) |expected| {
+        const setup = App.providerSetup(host, try cc.provider_ids.Slug.parse(expected.id));
+        try std.testing.expectEqualStrings(expected.id, setup.provider.slice());
+        if (expected.variable) |variable| {
+            try std.testing.expectEqualStrings(variable, setup.variable orelse return error.NoVariable);
+        } else try std.testing.expect(setup.variable == null);
+        try std.testing.expectEqual(expected.sign_in, setup.sign_in);
     }
-    const picker_host = cc.repl_picker_host;
-    const pointer = picker_host.missingCredentialPointer(host, relay_offer orelse return error.RelayOfferMissing) orelse
-        return error.PointerMissing;
-    try std.testing.expectEqualStrings("relay", pointer.slice());
-    // A key-only provider has no login to point at; the plain error stands.
-    try std.testing.expect(picker_host.missingCredentialPointer(host, keyonly_offer orelse return error.KeyonlyOfferMissing) == null);
 }

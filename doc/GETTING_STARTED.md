@@ -147,10 +147,11 @@ Z.AI has no third-party sign-in, so the login asks which plan the key is for
 the pasted key without showing it. The key is checked against the plan's
 model list and stored in `$HOME/.metacodes/keys/zai-coding-plan.json` (0600);
 a refused key is not stored. Create it on the Coding Plan page, not the
-standard API-key page: a standard key bills the account balance. `/login`
-and `/model` in the TUI offer the same steps. `ZAI_API_KEY` still works and
-wins over the stored key; `metacodes logout --provider zai-coding-plan`
-forgets it.
+standard API-key page: a standard key bills the account balance. `/login
+zai-coding-plan` in the TUI offers the same steps; `/model` lists the plan
+once a key is stored or set, and until then says where one goes.
+`ZAI_API_KEY` still works and wins over the stored key;
+`metacodes logout --provider zai-coding-plan` forgets it.
 
 ## Kimi Code
 

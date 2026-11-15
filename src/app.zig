@@ -407,9 +407,6 @@ pub const App = struct {
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
     model_picker: model_picker_mod.Picker = undefined,
-    /// The sign-in the picker's credential stage is running (#67); owned
-    /// here because it outlives any one key press.
-    login_worker: ?*login_worker.LoginWorker = null,
     /// `/login` sign-ins cancelled with Esc while their thread was still in a
     /// request it cannot abandon (the first device-code POST). The dialog
     /// closes at once; the thread is joined once it settles (`reapLoginWorkers`)
@@ -1260,12 +1257,6 @@ pub const App = struct {
         // A refresh still in flight finishes (and frees itself) on its own thread.
         if (app.models_refresh) |refresh| refresh.release();
         if (app.metask_key_route) |*route| route.deinit(app.allocator);
-        if (app.login_worker) |worker| {
-            worker.cancel();
-            worker.join();
-            app.allocator.destroy(worker);
-            app.login_worker = null;
-        }
         for (&app.parked_login_workers) |*slot| if (slot.*) |worker| {
             worker.cancel();
             worker.join();
@@ -1805,9 +1796,15 @@ pub const App = struct {
         /// Borrows `page`. Null when the kernel could not list the catalog.
         listed: ?provider_control_plane.ListPage = null,
         current: ?provider_control_plane.OfferId = null,
+        /// Per offer of `page`: a commit could bind it now (#488).
+        ready: std.ArrayList(bool) = .empty,
+        /// Where each provider with no ready offer gets its credential.
+        setups: std.ArrayList(model_picker_mod.Setup) = .empty,
 
         pub fn deinit(listing: *ModelListing, allocator: std.mem.Allocator) void {
             listing.page.deinit(allocator);
+            listing.ready.deinit(allocator);
+            listing.setups.deinit(allocator);
         }
     };
 
@@ -1815,8 +1812,10 @@ pub const App = struct {
     pub fn listModelOffers(app: *App) !ModelListing {
         const host = try app.providerHost();
         var listing: ModelListing = .{};
+        errdefer listing.deinit(app.allocator);
         listing.listed = host.kernel.modelList(.{}, .{}, app.allocator, &listing.page) catch null;
         listing.current = host.kernel.currentOfferId();
+        if (listing.listed != null) try app.judgeReadiness(host, &listing);
         return listing;
     }
 
@@ -1825,6 +1824,198 @@ pub const App = struct {
     pub fn adoptModelListing(app: *App, listing: *const ModelListing) !void {
         const listed = listing.listed orelse return app.model_picker.markFailed();
         try app.model_picker.adopt(listed, listing.current);
+        try app.model_picker.setReadiness(listing.ready.items, listing.setups.items);
+    }
+
+    /// Which offers of `listing` a commit could bind now (#488): for each, the
+    /// binding `bindCommittedSelection` runs, from the same credential
+    /// material (`credentialSources`), without a request. The one difference
+    /// is the OAuth token a commit refreshes first: here a stored login
+    /// stands for it (`oauthLoginStored`). Every provider none of whose
+    /// offers is ready gets its setup. Reads files (the pool's config.json,
+    /// stored keys and logins), once per provider.
+    fn judgeReadiness(app: *App, host: *provider_host_mod.Host, listing: *ModelListing) !void {
+        const offers = listing.page.items;
+        try listing.ready.resize(app.allocator, offers.len);
+        @memset(listing.ready.items, false);
+        const snapshot = host.kernel.catalogSnapshot();
+        const now = @import("util/time.zig").nowUnix();
+        var pool: CredentialPool = .{};
+        pool.load(app);
+        defer pool.deinit();
+        for (offers, 0..) |summary, first| {
+            const provider_id = summary.provider_id;
+            // Each provider once, from its first offer.
+            const seen = for (offers[0..first]) |earlier| {
+                if (earlier.provider_id.eql(provider_id)) break true;
+            } else false;
+            if (seen) continue;
+            const profile = host.registry.findById(provider_id);
+            var stored = StoredKey.load(app, provider_id, .quiet);
+            defer stored.deinit();
+            const oauth: ?provider_credential_mod.StoredEntry = if (profile) |built|
+                (if (app.oauthLoginStored(built)) .{ .kind = oauthKindOf(built), .secret = "stored login" } else null)
+            else
+                null;
+            const sources = app.credentialSources(provider_id, &pool, &stored, oauth, now);
+            var any_ready = false;
+            for (offers[first..], first..) |candidate, index| {
+                if (!candidate.provider_id.eql(provider_id)) continue;
+                const offer = snapshot.find(candidate.offer_id) orelse continue;
+                var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
+                _ = provider_binding_mod.bindOffer(&host.registry, offer, sources, &reference_buffer, false) catch continue;
+                listing.ready.items[index] = true;
+                any_ready = true;
+            }
+            if (!any_ready) try listing.setups.append(app.allocator, providerSetup(host, provider_id));
+        }
+    }
+
+    /// Where `provider` gets its credential, for the picker's setup (#488):
+    /// the variable its key is read from (the canonical alias, else the
+    /// first), and, for Metask, `/login`.
+    pub fn providerSetup(host: *provider_host_mod.Host, provider_id: provider_ids_mod.Slug) model_picker_mod.Setup {
+        const profile = host.registry.findById(provider_id) orelse return .{ .provider = provider_id };
+        const variable: ?[]const u8 = for (profile.env_aliases) |alias| {
+            if (alias.canonical) break alias.name;
+        } else if (profile.env_aliases.len > 0) profile.env_aliases[0].name else null;
+        return .{
+            .provider = profile.id,
+            .variable = variable,
+            .sign_in = profile.id.eqlText("metask"),
+        };
+    }
+
+    /// The kind an OAuth token for `built` is presented as: the profile's
+    /// own, not a constant. A profile that accepts only `openai_codex_oauth`
+    /// would reject a token labelled `openai_oauth`, and the failure would
+    /// look like a missing credential rather than a mislabelled one.
+    fn oauthKindOf(built: *const @import("provider/profile.zig").ProviderProfile) provider_credential_mod.CredentialKind {
+        for (built.accepted_credential_kinds) |kind| {
+            if (provider_oauth_mod.servesKind(kind)) return kind;
+        }
+        return .openai_oauth;
+    }
+
+    /// Whether a commit onto `built` would get an OAuth token from a stored
+    /// login, judged without a request: `oauthAccessToken`'s conditions,
+    /// with the login on disk standing for the token a refresh would give.
+    fn oauthLoginStored(app: *App, built: *const @import("provider/profile.zig").ProviderProfile) bool {
+        if (built.id.eqlText("metask") and !app.config.metask_oauth_selected) return false;
+        if (built.oauth_token_url == null) return false;
+        var serves = false;
+        for (built.accepted_credential_kinds) |kind| {
+            if (provider_oauth_mod.servesKind(kind)) serves = true;
+        }
+        if (!serves) return false;
+        var session = provider_oauth_mod.Session.initHome(app.allocator, app.stateRoot(), built.id) catch return false;
+        defer session.deinit();
+        return session.load() catch false;
+    }
+
+    /// The configured credential pool as a binding reads it. The document
+    /// outlives the pool: its entries borrow their account labels from it.
+    const CredentialPool = struct {
+        document: ?provider_config_doc.Document = null,
+        buffer: [provider_config_doc.MAX_POOL_CREDENTIALS]provider_credential_mod.PoolEntry = undefined,
+        len: usize = 0,
+
+        fn load(pool: *CredentialPool, app: *App) void {
+            pool.document = app.loadConfigDocument();
+            if (pool.document) |*document| pool.len = credentialPoolFrom(document, &pool.buffer, app.credentialEnvFallback()).len;
+        }
+
+        fn entries(pool: *const CredentialPool) []const provider_credential_mod.PoolEntry {
+            return pool.buffer[0..pool.len];
+        }
+
+        fn deinit(pool: *CredentialPool) void {
+            if (pool.document) |*document| document.deinit();
+        }
+    };
+
+    /// The key stored for one provider: the one `login --provider` stored in
+    /// its own file, else, for Metask, the key `metacodes login` stored in
+    /// `auth.json` (#488) while the session runs neither on Metask's API-key
+    /// route (whose key `metaskKeyFor` supplies) nor on its device login. A
+    /// session started on another provider then still has the sign-in it
+    /// would have started on, as the startup order reads it: behind
+    /// `METASK_API_KEY`, which outranks `auth.json` there too.
+    const StoredKey = struct {
+        allocator: std.mem.Allocator,
+        file: ?provider_api_key_store.Stored = null,
+        /// Owned; wiped by `deinit`.
+        metask_login: ?[]u8 = null,
+
+        fn load(app: *App, provider_id: ?provider_ids_mod.Slug, report: enum { warn, quiet }) StoredKey {
+            var stored: StoredKey = .{ .allocator = app.allocator };
+            const id = provider_id orelse return stored;
+            stored.file = provider_api_key_store.load(app.allocator, app.stateRoot(), id) catch |err| blk: {
+                if (report == .warn) @import("util/log.zig").warn("provider", "the stored key for {s} cannot be used: {s}", .{ id.slice(), @errorName(err) });
+                break :blk null;
+            };
+            if (stored.file == null and id.eqlText("metask") and app.metask_key_route == null and !app.config.metask_oauth_selected) {
+                stored.metask_login = metaskLoginKey(app);
+            }
+            return stored;
+        }
+
+        fn entry(stored: *const StoredKey) ?provider_credential_mod.StoredEntry {
+            if (stored.file) |*file| return file.entry();
+            const key = stored.metask_login orelse return null;
+            return .{ .kind = .api_key, .secret = key };
+        }
+
+        fn deinit(stored: *StoredKey) void {
+            if (stored.file) |*file| file.deinit();
+            if (stored.metask_login) |key| {
+                std.crypto.secureZero(u8, key);
+                stored.allocator.free(key);
+            }
+            stored.* = undefined;
+        }
+    };
+
+    /// The API key `metacodes login` stored in `auth.json` (owned), or null.
+    fn metaskLoginKey(app: *App) ?[]u8 {
+        const auth = @import("core/auth.zig");
+        const path = auth.authFilePath(app.allocator, app.stateRoot()) catch return null;
+        defer app.allocator.free(path);
+        var stored = auth.loadFromPath(app.allocator, path) catch return null;
+        defer stored.deinit(app.allocator);
+        const key = stored.api_key orelse return null;
+        return app.allocator.dupe(u8, key) catch null;
+    }
+
+    /// What a binding onto `provider` reads, other than the OAuth token the
+    /// caller passes: shared by a commit and by the picker's readiness, so
+    /// the list cannot offer what a commit would refuse (#488).
+    fn credentialSources(
+        app: *const App,
+        provider_id: ?provider_ids_mod.Slug,
+        pool: *const CredentialPool,
+        stored: *const StoredKey,
+        oauth: ?provider_credential_mod.StoredEntry,
+        now: i64,
+    ) provider_binding_mod.CredentialSources {
+        return .{
+            .pool = pool.entries(),
+            .stored_api_key = stored.entry(),
+            // On the Metask API-key route the session's own key — stored
+            // by `metacodes login`, picked in `/models`, or `--api-key` —
+            // authenticates a Metask offer, ahead of the environment, as
+            // it does every turn on the historical path. Without it a
+            // stored key is invisible here and the commit asks for a
+            // sign-in the session does not need. Any other pick sees only
+            // `--api-key`, and only for the provider the session started
+            // on (`cliApiKey`).
+            .cli_api_key = (if (provider_id) |id| app.metaskKeyFor(id) else null) orelse cliApiKey(app.config),
+            .stored_oauth = oauth,
+            .precedence = if (oauth != null) .oauth_first else .api_key_first,
+            .env = provider_credential_mod.EnvLookup.process(),
+            .env_fallback = app.credentialEnvFallback(),
+            .now_seconds = now,
+        };
     }
 
     /// Apply a picker commit: validate through the kernel, bind the winning
@@ -1987,16 +2178,7 @@ pub const App = struct {
         var committed_provider: ?provider_ids_mod.Slug = null;
         if (resolvedProfileFor(host, selection)) |built| {
             committed_provider = built.id;
-            // The kind comes from the profile, not from a constant: a profile
-            // that accepts only `openai_codex_oauth` would reject a token
-            // labelled `openai_oauth`, and the failure would look like a
-            // missing credential rather than a mislabelled one.
-            for (built.accepted_credential_kinds) |kind| {
-                if (provider_oauth_mod.servesKind(kind)) {
-                    oauth_kind = kind;
-                    break;
-                }
-            }
+            oauth_kind = oauthKindOf(built);
             oauth_token = app.oauthAccessToken(built, now) catch |err| blk: {
                 // A dead login is worth saying out loud: resolution will fall
                 // through to an environment key, and "it silently used a
@@ -2010,52 +2192,24 @@ pub const App = struct {
             };
         }
 
-        // The document outlives the pool it produces: the entries borrow the
-        // account label out of it.
-        var pool_document = app.loadConfigDocument();
-        defer if (pool_document) |*value| value.deinit();
-        var pool_buffer: [provider_config_doc.MAX_POOL_CREDENTIALS]provider_credential_mod.PoolEntry = undefined;
-        const pool = if (pool_document) |*value|
-            credentialPoolFrom(value, &pool_buffer, app.credentialEnvFallback())
-        else
-            &.{};
-
-        // The key the user stored for this provider (`login --provider`), in
-        // that provider's own file: it can only ever answer for that provider.
-        var stored_key: ?provider_api_key_store.Stored = if (committed_provider) |id|
-            provider_api_key_store.load(app.allocator, app.stateRoot(), id) catch |err| blk: {
-                @import("util/log.zig").warn("provider", "the stored key for {s} cannot be used: {s}", .{ id.slice(), @errorName(err) });
-                break :blk null;
-            }
-        else
-            null;
-        defer if (stored_key) |*key| key.deinit();
+        // The credential pool, and the key the user stored for this provider
+        // (`login --provider`, in that provider's own file: it can only ever
+        // answer for that provider). The picker judges readiness from the
+        // same material (`judgeReadiness`).
+        var pool: CredentialPool = .{};
+        pool.load(app);
+        defer pool.deinit();
+        var stored_key = StoredKey.load(app, committed_provider, .warn);
+        defer stored_key.deinit();
 
         const binding = try provider_binding_mod.bind(
             &host.registry,
             host.kernel.catalogSnapshot(),
             selection,
-            .{
-                .pool = pool,
-                .stored_api_key = if (stored_key) |*key| key.entry() else null,
-                // On the Metask API-key route the session's own key — stored
-                // by `metacodes login`, picked in `/models`, or `--api-key` —
-                // authenticates a Metask offer, ahead of the environment, as
-                // it does every turn on the historical path. Without it a
-                // stored key is invisible here and the commit asks for a
-                // sign-in the session does not need. Any other pick sees only
-                // `--api-key`, and only for the provider the session started
-                // on (`cliApiKey`).
-                .cli_api_key = (if (committed_provider) |id| app.metaskKeyFor(id) else null) orelse cliApiKey(app.config),
-                .stored_oauth = if (oauth_token) |value| .{
-                    .kind = oauth_kind,
-                    .secret = value,
-                } else null,
-                .precedence = if (oauth_token != null) .oauth_first else .api_key_first,
-                .env = @import("provider/credential.zig").EnvLookup.process(),
-                .env_fallback = app.credentialEnvFallback(),
-                .now_seconds = now,
-            },
+            app.credentialSources(committed_provider, &pool, &stored_key, if (oauth_token) |value| .{
+                .kind = oauth_kind,
+                .secret = value,
+            } else null, now),
             &reference_buffer,
         );
 

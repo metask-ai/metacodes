@@ -1839,17 +1839,6 @@ fn readLineRaw(
                         }
                     }
                 }
-                // The picker's sign-in runs on a worker thread (#67); the idle
-                // tick is where its transcript reaches the overlay.
-                if (region.pickerOpen()) switch (picker_host.poll(app, &region.ui, .of(region))) {
-                    .committed => {
-                        region.clear();
-                        region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
-                        redraw(region, &editor, app);
-                    },
-                    .redraw => redraw(region, &editor, app),
-                    .ignored => {},
-                };
                 continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
             }
             if (rc > 0) break; // 有字节可读

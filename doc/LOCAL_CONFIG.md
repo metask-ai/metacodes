@@ -164,7 +164,10 @@ At start, metacodes takes the first of these that applies:
 So `METACODES_PROVIDER` and `METACODES_MODEL` in the file apply only when
 nothing above them decides: once you sign in to Metask, the file's provider no
 longer takes over. Its keys still work: a provider you choose with
-`--provider` or in `/model` reads its key from the file.
+`--provider` or in `/model` reads its key from the file. `/model` lists a
+provider as usable only once its key is here (or in the environment, or stored
+by `/login <provider>`); until then it sits under "Not configured" and, when
+you choose it, names the variable and this file.
 
 A file with keys of several providers and no `METACODES_PROVIDER` chooses
 none: metacodes stops and lists those providers, and you add

@@ -24,10 +24,7 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
     var rows: u16 = 0;
     rows += header(picker, w, th, cols);
 
-    if (picker.stage == .credential) {
-        if (picker.credential_mode == .paste_key) return rows + keyBody(picker, w, th, cols);
-        return rows + credentialBody(picker, w, th, cols);
-    }
+    if (picker.stage == .setup) return rows + setupBody(picker, w, th, cols);
 
     var buffer = Picker.RowBuffer.init(picker.allocator);
     defer buffer.deinit();
@@ -37,13 +34,24 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
         line(w);
         w.print("  {s}{s}{s}", .{ th.dim, emptyText(picker), th.reset }) catch {};
         newline(w);
-        return rows + 1 + footer(picker, w, th);
+        return rows + 1 + footer(picker, w, th, false);
     }
 
     const window = @max(picker.page_rows, 1);
     const top = @min(picker.window_top, visible.len -| 1);
     const end = @min(top + window, visible.len);
+    var group_named = false;
     for (visible[top..end], top..) |row, index| {
+        // The providers no credential is configured for come last, under a
+        // heading of their own: named once, above the first of them drawn,
+        // so a list scrolled into the group still says what it is (#488).
+        if (!group_named and row == .provider and !row.provider.ready) {
+            line(w);
+            w.print("  {s}Not configured{s}", .{ th.dim, th.reset }) catch {};
+            newline(w);
+            rows += 1;
+            group_named = true;
+        }
         rows += drawRow(picker, w, th, cols, row, index == picker.cursor);
     }
     if (end < visible.len or top > 0) {
@@ -61,7 +69,13 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
         newline(w);
         rows += 1;
     }
-    return rows + footer(picker, w, th);
+    // Enter on a provider in the "Not configured" group applies nothing; the
+    // footer says what it does instead (#488).
+    const on_unconfigured = switch (visible[@min(picker.cursor, visible.len - 1)]) {
+        .provider => |group| !group.ready,
+        else => false,
+    };
+    return rows + footer(picker, w, th, on_unconfigured);
 }
 
 fn emptyText(picker: *const Picker) []const u8 {
@@ -83,13 +97,13 @@ fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 
         .model => "Model",
         .offer => "Channel / offer",
         .options => "Options",
-        .credential => if (picker.credential_mode == .paste_key) "API key" else "sign in",
+        .setup => if (picker.setup) |setup| setup.provider.slice() else "Provider",
     };
     w.print("  {s}{s}{s}", .{ th.accent, title, th.reset }) catch {};
-    if (picker.stage == .credential) if (picker.credential_provider) |p| {
-        w.print(" {s} {s}", .{ if (picker.credential_mode == .paste_key) "for" else "to", p.slice() }) catch {};
+    if (picker.stage == .setup) if (picker.setup) |setup| {
+        w.print(" {s}{s}{s}", .{ th.dim, if (setup.sign_in) "not signed in" else "not configured", th.reset }) catch {};
     };
-    if (picker.filter_len > 0) {
+    if (picker.filter_len > 0 and picker.stage != .setup) {
         w.print(" {s}/{s}{s}", .{ th.dim, picker.filter(), th.reset }) catch {};
     }
     switch (picker.status) {
@@ -181,6 +195,9 @@ fn drawRow(
         .provider => |group| {
             const offer = picker.offers.items[group.offer_index];
             paint(w, th, selected, group.is_current);
+            // A provider with no credential is drawn dim: it can be chosen
+            // to see where its credential goes, not to switch (#488).
+            if (!group.ready) w.print("{s}{s}", .{ th.reset, th.dim }) catch {};
             w.print("{s}", .{offer.provider_id.slice()}) catch {};
             w.print("{s} {s}{d} model", .{ th.reset, th.dim, group.offer_count }) catch {};
             if (group.offer_count != 1) w.writeAll("s") catch {};
@@ -323,7 +340,7 @@ fn writeHealth(w: *std.Io.Writer, health: offer_mod.Health, availability: offer_
     if (health.latency_ms_p50) |latency| w.print(" p50={d}ms", .{latency}) catch {};
 }
 
-fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
+fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme, on_unconfigured: bool) u16 {
     line(w);
     // Scope and its next-turn semantics are stated, not implied: a commit that
     // silently outlived the session would be a surprise the user cannot undo
@@ -333,12 +350,16 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
         .global => "every future session (durable)",
         .once => "the next turn only",
     };
-    // On the options step the values change with ←/→ and Enter applies them;
-    // a footer that named only Enter left the values looking fixed.
-    w.print(
-        "  {s}{s}enter apply to {s} · tab scope · esc back · q close{s}",
-        .{ th.dim, if (picker.stage == .options) "←/→ change · " else "", scope_text, th.reset },
-    ) catch {};
+    if (on_unconfigured) {
+        w.print("  {s}enter shows where its credential goes · esc back · q close{s}", .{ th.dim, th.reset }) catch {};
+    } else {
+        // On the options step the values change with ←/→ and Enter applies
+        // them; a footer that named only Enter left the values looking fixed.
+        w.print(
+            "  {s}{s}enter apply to {s} · tab scope · esc back · q close{s}",
+            .{ th.dim, if (picker.stage == .options) "←/→ change · " else "", scope_text, th.reset },
+        ) catch {};
+    }
     newline(w);
     line(w);
     w.print(
@@ -349,120 +370,28 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
     return 2;
 }
 
-/// The sign-in transcript in place of the list (#67): the flow's lines — the
-/// URL to open, a device code — wrapped to the width so a URL stays readable,
-/// oldest dropped when they do not fit the window, then how to leave.
-/// The paste-a-key step: what to know, which plan's page, the page itself
-/// (whole, so it can be copied), the key as dots, and the check once it runs.
-fn keyBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
+/// Where a provider that is not configured gets its credential, in place of
+/// the list (#488): the variable, this install's `.env` and the guide; for a
+/// provider one signs in to (Metask), `/login` first. Nothing to choose and
+/// nothing to type, so the only keys named are the ones that leave.
+fn setupBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
     var rows: u16 = 0;
-    if (picker.key_note) |note| {
-        // Word-wrapped: it is the one line saying which key to create, and a
-        // narrow terminal cut it mid-sentence.
-        const width = @max(cols -| 2, 8);
-        var words = std.mem.tokenizeScalar(u8, note, ' ');
-        var used: usize = 0;
-        line(w);
-        w.print("  {s}", .{th.warn}) catch {};
-        while (words.next()) |word| {
-            if (used > 0 and used + 1 + word.len > width) {
-                w.print("{s}", .{th.reset}) catch {};
-                newline(w);
-                rows += 1;
-                line(w);
-                w.print("  {s}", .{th.warn}) catch {};
-                used = 0;
-            }
-            if (used > 0) {
-                w.writeAll(" ") catch {};
-                used += 1;
-            }
-            w.writeAll(word) catch {};
-            used += word.len;
+    if (picker.setup) |setup| {
+        const path = if (picker.local_config_path_len > 0) picker.localConfigPath() else ".env";
+        var text_buf: [picker_mod.MAX_LOCAL_CONFIG_PATH + 512]u8 = undefined;
+        var text: std.Io.Writer = .fixed(&text_buf);
+        if (setup.sign_in) text.writeAll("Sign in: /login\n") catch {};
+        if (setup.variable) |variable| {
+            text.print("{s}et {s} in {s}, then restart\n", .{ if (setup.sign_in) "Or s" else "S", variable, path }) catch {};
         }
-        w.print("{s}", .{th.reset}) catch {};
-        newline(w);
-        rows += 1;
-    }
-    const choices = picker.keyChoices();
-    for (choices, 0..) |choice, index| {
-        line(w);
-        paint(w, th, index == picker.key_choice, false);
-        w.print("{s}{s}", .{ choice.label, th.reset }) catch {};
-        newline(w);
-        rows += 1;
-    }
-    if (choices.len > 0) {
-        line(w);
-        // The page is written whole even when it overflows: a truncated URL
-        // cannot be copied.
-        w.print("  {s}{s}{s}", .{ th.accent, choices[picker.key_choice].url, th.reset }) catch {};
-        newline(w);
-        rows += 1;
+        if (picker.guide_url.len > 0) text.print("How to: {s}\n", .{picker.guide_url}) catch {};
+        const body = std.mem.trimEnd(u8, text.buffered(), "\n");
+        if (body.len > 0) rows += writeWrapped(w, th.primary, th.reset, body, cols);
     }
     line(w);
-    if (picker.key_checking) {
-        w.print("  {s}checking the key…{s}", .{ th.dim, th.reset }) catch {};
-    } else if (picker.key_len == 0) {
-        w.print("  key: {s}(paste it; it is not shown){s}", .{ th.dim, th.reset }) catch {};
-    } else {
-        w.writeAll("  key: ") catch {};
-        for (0..@min(picker.key_len, 24)) |_| w.writeAll("\u{2022}") catch {};
-        w.print("  {s}({d} characters){s}", .{ th.dim, picker.key_len, th.reset }) catch {};
-    }
-    newline(w);
-    rows += 1;
-    if (picker.credentialLines().len > 0 or picker.credential_failed) rows += credentialBody(picker, w, th, cols) else {
-        line(w);
-        w.print("  {s}↑/↓ plan · tab opens the page · enter checks and stores · esc cancels{s}", .{ th.dim, th.reset }) catch {};
-        newline(w);
-        rows += 1;
-    }
-    return rows;
-}
-
-fn credentialBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
-    const width = @max(cols -| 2, 8);
-    const budget = @max(picker.page_rows, 1);
-    const text = picker.credentialLines();
-    var total: usize = 0;
-    var count_it = std.mem.splitScalar(u8, text, '\n');
-    while (count_it.next()) |line_text| total += wrappedCount(line_text.len, width);
-    var skip = if (total > budget) total - budget else 0;
-
-    var rows: u16 = 0;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line_text| {
-        var start: usize = 0;
-        while (true) {
-            const end = @min(start + width, line_text.len);
-            if (skip > 0) {
-                skip -= 1;
-            } else {
-                line(w);
-                w.print("  {s}", .{line_text[start..end]}) catch {};
-                newline(w);
-                rows += 1;
-            }
-            if (end >= line_text.len) break;
-            start = end;
-        }
-    }
-    line(w);
-    if (picker.credential_failed) {
-        w.print("  {s}{s}{s}", .{ th.warn, picker.notice(), th.reset }) catch {};
-    } else if (picker.credential_mode == .paste_key) {
-        w.print("  {s}Esc cancels{s}", .{ th.dim, th.reset }) catch {};
-    } else {
-        w.print("  {s}Esc cancels the sign-in{s}", .{ th.dim, th.reset }) catch {};
-    }
+    w.print("  {s}esc back · q close{s}", .{ th.dim, th.reset }) catch {};
     newline(w);
     return rows + 1;
-}
-
-fn wrappedCount(len: usize, width: usize) usize {
-    if (len == 0) return 1;
-    return (len + width - 1) / width;
 }
 
 fn line(w: *std.Io.Writer) void {
@@ -826,75 +755,114 @@ test "an option row shows the vocabulary and marks an unsettable control" {
     try testing.expect(std.mem.indexOf(u8, text, "←/→ change · enter apply to") != null);
 }
 
-test "the credential stage draws the sign-in transcript, wrapped, and the Esc hint" {
-    var picker = Picker.init(testing.allocator);
-    defer picker.deinit();
-    var offers = [_]control_plane.OfferSummary{richOffer()};
-    try seed(&picker, &offers, null);
-    picker.page_rows = 6;
-    _ = picker.onKey(.enter); // provider
-    const outcome = picker.onKey(.enter); // one route → commit
-    try testing.expect(outcome == .commit);
-    _ = picker.enterCredentialStage(ids.Slug.lit("zai"), outcome.commit);
-    _ = picker.setCredentialLines("Open this URL to authorize:\nhttps://example.test/authorize?client_id=c&state=s0123456789abcdef&code_challenge=xyz\n");
-
-    var buffer: [8192]u8 = undefined;
-    const text = draw(&picker, &buffer);
-    try testing.expect(std.mem.indexOf(u8, text, "sign in") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Open this URL to authorize:") != null);
-    // The URL is longer than the width `draw` renders at; every character of
-    // it must still be on screen, split across lines rather than cut.
-    try testing.expect(std.mem.indexOf(u8, text, "code_challenge=xyz") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Esc cancels the sign-in") != null);
-
-    picker.credentialFailed("ConnectionRefused");
-    const failed_text = draw(&picker, &buffer);
-    try testing.expect(std.mem.indexOf(u8, failed_text, "sign-in failed (ConnectionRefused)") != null);
-    try testing.expect(std.mem.indexOf(u8, failed_text, "Esc cancels the sign-in") == null);
+/// A route of `provider` in `richOffer`'s shape.
+fn offerOf(provider: []const u8, model: []const u8) control_plane.OfferSummary {
+    var offer = richOffer();
+    offer.provider_id = ids.Slug.parse(provider) catch unreachable;
+    offer.display_name = model;
+    offer.canonical_model_id = model;
+    offer.request_model_id = model;
+    offer.offer_id = ids.OfferId.derive(.{
+        .provider_id = offer.provider_id,
+        .channel_id = offer.channel_id,
+        .protocol = offer.protocol,
+        .endpoint_url = offer.endpoint_ref,
+        .request_model_id = model,
+    });
+    return offer;
 }
 
-test "the key step names the plan, writes its page whole, and never the key" {
+test "providers with no credential are drawn last, dim, under a Not configured heading (#488)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
-    var offers = [_]control_plane.OfferSummary{richOffer()};
-    try seed(&picker, &offers, null);
-    picker.page_rows = 6;
-    _ = picker.onKey(.enter);
-    const outcome = picker.onKey(.enter);
-    try testing.expect(outcome == .commit);
-    const choices = [_]picker_mod.KeyChoice{
-        .{ .label = "China · Personal Coding Plan", .url = "https://bigmodel.cn/coding-plan/personal/overview?long=0123456789abcdef0123456789abcdef" },
-        .{ .label = "Global · Personal Coding Plan", .url = "https://z.ai/manage-apikey/apikey-list" },
+    const offers = [_]control_plane.OfferSummary{
+        offerOf("metask", "m1"),
+        offerOf("kimi", "k1"),
+        offerOf("deepseek", "d1"),
+        offerOf("qwen", "q1"),
     };
-    _ = picker.enterKeyStage(ids.Slug.lit("zai"), outcome.commit, &choices, 0, "A standard key bills your balance.");
+    try seed(&picker, &offers, null);
+    try picker.setReadiness(&.{ true, false, true, false }, &.{});
 
     var buffer: [8192]u8 = undefined;
-    const empty = draw(&picker, &buffer);
-    try testing.expect(std.mem.indexOf(u8, empty, "API key") != null);
-    try testing.expect(std.mem.indexOf(u8, empty, " for zai") != null);
-    try testing.expect(std.mem.indexOf(u8, empty, "A standard key bills your balance.") != null);
-    try testing.expect(std.mem.indexOf(u8, empty, "Global · Personal Coding Plan") != null);
-    try testing.expect(std.mem.indexOf(u8, empty, "0123456789abcdef0123456789abcdef") != null);
-    try testing.expect(std.mem.indexOf(u8, empty, "it is not shown") != null);
-    try testing.expect(std.mem.indexOf(u8, empty, "tab opens the page") != null);
+    var writer = std.Io.Writer.fixed(&buffer);
+    const drawn = render(&picker, &writer, theme_mod.dark, 100);
+    const text = writer.buffered();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const rows = try visibleRows(arena_state.allocator(), text);
+    try testing.expectEqual(rows.len, @as(usize, drawn));
 
-    for ("secret-plan-key") |byte| _ = picker.onKey(.{ .char = byte });
-    const typed = draw(&picker, &buffer);
-    try testing.expect(std.mem.indexOf(u8, typed, "secret") == null);
-    try testing.expect(std.mem.indexOf(u8, typed, "(15 characters)") != null);
+    // Order on screen: the two configured, the heading, the two without.
+    var order: [5]usize = undefined;
+    for ([_][]const u8{ "metask", "deepseek", "Not configured", "kimi", "qwen" }, 0..) |needle, slot| {
+        order[slot] = for (rows, 0..) |row, index| {
+            if (std.mem.indexOf(u8, row, needle) != null) break index;
+        } else return error.RowMissing;
+    }
+    for (order[1..], order[0 .. order.len - 1]) |later, earlier| try testing.expect(later > earlier);
+    // The heading is drawn once, and the rows under it are dim.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Not configured"));
+    try testing.expect(std.mem.indexOf(u8, text, theme_mod.dark.dim ++ "kimi") != null);
+    try testing.expect(std.mem.indexOf(u8, text, theme_mod.dark.dim ++ "deepseek") == null);
+}
 
-    // A narrow terminal wraps the note at a word instead of cutting it.
-    var narrow_buffer: [8192]u8 = undefined;
-    var narrow_writer = std.Io.Writer.fixed(&narrow_buffer);
-    const narrow_rows = render(&picker, &narrow_writer, theme_mod.monochrome, 24);
-    const narrow = narrow_writer.buffered();
-    try testing.expect(std.mem.indexOf(u8, narrow, "A standard key bills") != null);
-    try testing.expect(std.mem.indexOf(u8, narrow, "your balance.") != null);
-    var wide_buffer: [8192]u8 = undefined;
-    var wide_writer = std.Io.Writer.fixed(&wide_buffer);
-    try testing.expect(narrow_rows > render(&picker, &wide_writer, theme_mod.monochrome, 100));
+test "on a provider with no credential the footer says what Enter does there, not that it applies (#488)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]control_plane.OfferSummary{ offerOf("metask", "m1"), offerOf("kimi", "k1") };
+    try seed(&picker, &offers, null);
+    try picker.setReadiness(&.{ true, false }, &.{});
+    var buffer: [8192]u8 = undefined;
+    const on_ready = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, on_ready, "enter apply to this session") != null);
+    _ = picker.onKey(.down);
+    const on_unready = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, on_unready, "enter shows where its credential goes") != null);
+    try testing.expect(std.mem.indexOf(u8, on_unready, "enter apply") == null);
+}
 
-    picker.keySubmitted();
-    const checking = draw(&picker, &buffer);
-    try testing.expect(std.mem.indexOf(u8, checking, "checking the key") != null);
+test "the setup stage shows the variable, this install's .env and the guide, and no way to type a key (#488)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]control_plane.OfferSummary{ offerOf("metask", "m1"), offerOf("kimi", "k1") };
+    try seed(&picker, &offers, null);
+    const guide = "https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md";
+    try picker.setReadiness(&.{ false, false }, &.{
+        .{ .provider = ids.Slug.lit("metask"), .variable = "METASK_API_KEY", .sign_in = true },
+        .{ .provider = ids.Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" },
+    });
+    picker.setLocalConfig("/home/u/.local/opt/metacodes/state/.env", guide);
+
+    var buffer: [8192]u8 = undefined;
+    _ = picker.onKey(.down); // kimi
+    _ = picker.onKey(.enter);
+    try testing.expectEqual(picker_mod.Stage.setup, picker.stage);
+    const kimi = draw(&picker, &buffer);
+    for ([_][]const u8{
+        "kimi",
+        "not configured",
+        "Set MOONSHOT_API_KEY in /home/u/.local/opt/metacodes/state/.env, then restart",
+        "How to: " ++ guide,
+        "esc back · q close",
+    }) |needle| {
+        testing.expect(std.mem.indexOf(u8, kimi, needle) != null) catch |err| {
+            std.debug.print("missing from the setup: {s}\n{s}\n", .{ needle, kimi });
+            return err;
+        };
+    }
+    // No key field, no sign-in, no route to apply.
+    for ([_][]const u8{ "paste", "API key", "enter apply", "Sign in", "/login" }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, kimi, needle) == null);
+    }
+
+    // Metask is signed in to: /login comes first, the .env key after it.
+    _ = picker.onKey(.escape);
+    _ = picker.onKey(.up);
+    _ = picker.onKey(.enter);
+    const metask = draw(&picker, &buffer);
+    const sign_in = std.mem.indexOf(u8, metask, "Sign in: /login") orelse return error.NoSignIn;
+    const key = std.mem.indexOf(u8, metask, "Or set METASK_API_KEY in /home/u/.local/opt/metacodes/state/.env, then restart") orelse return error.NoKeyLine;
+    try testing.expect(sign_in < key);
+    try testing.expect(std.mem.indexOf(u8, metask, "not signed in") != null);
 }
