@@ -81,7 +81,7 @@ pub const UdsServer = struct {
             .path = try allocator.dupe(u8, path),
         };
         errdefer allocator.free(self.path);
-        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+        self.accept_thread = try @import("platform").thread.spawn(.full, acceptLoop, .{self});
         return self;
     }
 
@@ -131,7 +131,7 @@ pub const UdsServer = struct {
                 continue;
             }
             _ = self.live_conns.fetchAdd(1, .acq_rel);
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch {
+            const t = @import("platform").thread.spawn(.full, handleConn, .{ self, conn }) catch {
                 net.closeSocket(conn);
                 _ = self.live_conns.fetchSub(1, .acq_rel);
                 continue;

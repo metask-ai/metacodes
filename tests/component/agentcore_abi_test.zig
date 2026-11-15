@@ -16385,3 +16385,171 @@ test "L2 issue #494: a Write whose arguments are spaced like json.dumps goes thr
     try std.testing.expect(!probe.saw_other_request);
     try std.testing.expectEqualStrings("second", try tmp.dir.readFile(std.testing.io, "spaced.txt", &read_buf));
 }
+
+/// Threads and private commit of this process, where this test can ask (#503).
+const ProcessCost = struct {
+    threads: ?usize,
+    private_commit: ?usize,
+
+    fn now() ProcessCost {
+        return .{ .threads = processThreadCount(), .private_commit = processPrivateCommit() };
+    }
+
+    fn processThreadCount() ?usize {
+        switch (@import("builtin").os.tag) {
+            .macos => {
+                const c = std.c;
+                var list: c.mach_port_array_t = undefined;
+                var count: c.mach_msg_type_number_t = 0;
+                if (c.task_threads(c.mach_task_self(), &list, &count) != 0) return null;
+                for (list[0..count]) |port| _ = c.mach_port_deallocate(c.mach_task_self(), port);
+                _ = c.vm_deallocate(c.mach_task_self(), @intFromPtr(list), count * @sizeOf(c.mach_port_t));
+                return count;
+            },
+            .linux => {
+                // POSIX-only fixed path: no Windows path decoding involved.
+                var buffer: [4096]u8 = undefined;
+                const status = std.Io.Dir.cwd().readFile(std.testing.io, "/proc/self/status", &buffer) catch return null;
+                var lines = std.mem.splitScalar(u8, status, '\n');
+                while (lines.next()) |line| {
+                    if (!std.mem.startsWith(u8, line, "Threads:")) continue;
+                    return std.fmt.parseInt(usize, std.mem.trim(u8, line["Threads:".len..], " \t"), 10) catch null;
+                }
+                return null;
+            },
+            .windows => {
+                const snapshot = win_cost.CreateToolhelp32Snapshot(win_cost.TH32CS_SNAPTHREAD, 0);
+                if (snapshot == std.os.windows.INVALID_HANDLE_VALUE) return null;
+                defer std.os.windows.CloseHandle(snapshot);
+                const pid = win_cost.GetCurrentProcessId();
+                var entry = std.mem.zeroes(win_cost.ThreadEntry32);
+                entry.dwSize = @sizeOf(win_cost.ThreadEntry32);
+                var count: usize = 0;
+                var more = win_cost.Thread32First(snapshot, &entry) != 0;
+                while (more) : (more = win_cost.Thread32Next(snapshot, &entry) != 0) {
+                    if (entry.th32OwnerProcessID == pid) count += 1;
+                }
+                return count;
+            },
+            else => return null,
+        }
+    }
+
+    fn processPrivateCommit() ?usize {
+        if (@import("builtin").os.tag != .windows) return null;
+        var counters = std.mem.zeroes(win_cost.ProcessMemoryCountersEx);
+        counters.cb = @sizeOf(win_cost.ProcessMemoryCountersEx);
+        if (win_cost.K32GetProcessMemoryInfo(win_cost.GetCurrentProcess(), &counters, counters.cb) == 0) return null;
+        return counters.PrivateUsage;
+    }
+};
+
+const win_cost = struct {
+    const HANDLE = std.os.windows.HANDLE;
+    const TH32CS_SNAPTHREAD: u32 = 0x4;
+    const ThreadEntry32 = extern struct {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ThreadID: u32,
+        th32OwnerProcessID: u32,
+        tpBasePri: i32,
+        tpDeltaPri: i32,
+        dwFlags: u32,
+    };
+    const ProcessMemoryCountersEx = extern struct {
+        cb: u32,
+        PageFaultCount: u32,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+        PrivateUsage: usize,
+    };
+    extern "kernel32" fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) callconv(.winapi) HANDLE;
+    extern "kernel32" fn Thread32First(snapshot: HANDLE, entry: *ThreadEntry32) callconv(.winapi) i32;
+    extern "kernel32" fn Thread32Next(snapshot: HANDLE, entry: *ThreadEntry32) callconv(.winapi) i32;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+    extern "kernel32" fn K32GetProcessMemoryInfo(process: HANDLE, counters: *ProcessMemoryCountersEx, cb: u32) callconv(.winapi) i32;
+};
+
+test "L2 #503 Sessions idling after a streaming Run keep at most their provider's two Io workers, and on Windows no 16 MiB commit each" {
+    const idle_sessions = 4;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer _ = api.runtime().destroy()(runtime, &diagnostic);
+
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL;
+    var session_config = sessionCreateConfig(&host_config, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+
+    const baseline = ProcessCost.now();
+    var sessions = [_]?*wire.SessionHandle{null} ** idle_sessions;
+    defer for (sessions) |session| if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+    for (&sessions) |*session| {
+        try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, session, &diagnostic));
+        var options = std.mem.zeroes(wire.RunOptionsV1);
+        options.struct_size = @sizeOf(wire.RunOptionsV1);
+        options.max_turns = 1;
+        var result = std.mem.zeroes(wire.RunResultV1);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.session().runText(session.*, 1, sdk.bytesView("stream once, then idle"), &options, &result, &diagnostic),
+        );
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    }
+
+    // Idle: the stream liveness monitor leaves within a tick of the last
+    // request. What stays per Session is its provider's Io pool, at most the
+    // two workers std's connect used.
+    var idle = ProcessCost.now();
+    var waited_ms: u64 = 0;
+    if (baseline.threads) |before| {
+        while (idle.threads.? > before + 2 * idle_sessions and waited_ms < 5_000) : (waited_ms += 50) {
+            sync.sleepMs(50);
+            idle = ProcessCost.now();
+        }
+        errdefer std.debug.print("#503 threads: {d} before {d} idle Sessions, {d} after\n", .{ before, idle_sessions, idle.threads.? });
+        try std.testing.expect(idle.threads.? <= before + 2 * idle_sessions);
+    }
+    // Before #503 each idle Session held three threads committing 16 MiB each
+    // on Windows (about 50 MB). Now no idle Session holds even one.
+    if (baseline.private_commit) |before| {
+        const per_session = (idle.private_commit.? -| before) / idle_sessions;
+        errdefer std.debug.print("#503 private commit per idle Session: {d} KiB\n", .{per_session / 1024});
+        try std.testing.expect(per_session < std.Thread.SpawnConfig.default_stack_size);
+    }
+}

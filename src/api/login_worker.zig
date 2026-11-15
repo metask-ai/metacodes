@@ -112,7 +112,7 @@ pub const LoginWorker = struct {
             return error.ThreadSpawnFailed;
         };
         self.flow.options().abort_signal = &self.abort_signal;
-        self.thread = std.Thread.spawn(.{}, run, .{self}) catch {
+        self.thread = @import("platform").thread.spawn(.full, run, .{self}) catch {
             self.wipeSecret();
             _ = self.owned.reset(.free_all);
             self.state.store(idle, .release);

@@ -206,7 +206,7 @@ pub const Refresh = struct {
         errdefer secureFree(self.auth_value);
         self.state_root = try gpa.dupe(u8, state_root);
         errdefer gpa.free(self.state_root);
-        const thread = try std.Thread.spawn(.{}, run, .{self});
+        const thread = try @import("platform").thread.spawn(.full, run, .{self});
         thread.detach();
         return self;
     }

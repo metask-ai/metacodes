@@ -162,7 +162,7 @@ pub const Prefetch = struct {
         };
         // From here the job owns the input; `deinit` frees it after the join.
         input_owned = false;
-        entry.thread = std.Thread.spawn(.{}, runJob, .{job}) catch blk: {
+        entry.thread = @import("platform").thread.spawn(.full, runJob, .{job}) catch blk: {
             runJob(job); // spawn 失败 → 当场同步跑(仍能用结果)
             break :blk null;
         };
