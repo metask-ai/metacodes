@@ -41,6 +41,23 @@ status, compatibility boundaries, and entry points are defined by
   0.12.0 wrote the `command_result` alone. The permission mode is journaled
   by a config sink on the Session's permission context, so a submission's
   mode is journaled once, as before.
+- **A request whose sign-in or key was rejected, or whose balance ran out,
+  ends by saying what to do instead of suggesting `/retry`.** The TUI ended
+  every failed request with `Retry with /retry, or switch models or compact
+  the context first.`, and a retry cannot help either of these. On HTTP 401
+  or 403 the last line is now `Your Metask sign-in is no longer valid. Sign
+  in again: /login` on Metask, and on another provider `DeepSeek rejected
+  the API key. Check DEEPSEEK_API_KEY in <state root>/.env or your shell,
+  then restart.`, with that provider's name and key variable. On HTTP 402,
+  or when the provider's error code is `insufficient_balance` or
+  `insufficient_quota` (OpenAI answers a used-up quota with 429), it is
+  `Your Metask balance has run out. Top up your Metask account, or switch
+  provider: /model`, or `DeepSeek reports no balance or quota left. Top up
+  with DeepSeek, or switch provider: /model`. `-p` prints the same line on
+  stderr after the raw error, naming the command that was run
+  (`metacodes login`) and `--provider` where the TUI names `/login` and
+  `/model`; its exit code stays 1. Every other failure keeps the old
+  advice, and nothing is retried or switched by itself.
 
 ### Added
 

@@ -216,4 +216,7 @@ Local configuration (.env)
 ```
 
 When no provider has a key, the error names this install's file and the
-template beside it, and links this page.
+template beside it, and links this page. When the provider rejects the key
+(HTTP 401 or 403), the failed request ends by naming the variable and this
+file: `DeepSeek rejected the API key. Check DEEPSEEK_API_KEY in
+~/.local/opt/metacodes/state/.env or your shell, then restart.`
