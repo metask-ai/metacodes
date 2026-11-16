@@ -160,6 +160,20 @@ status, compatibility boundaries, and entry points are defined by
   `config_changed`. A teammate a lead opens afterwards runs on the lead's
   route (`TeammateSpawn.lead_route`, applied by `InheritLead`). An
   `AgentSession` now keeps its own copy of `SessionConfig.auth_scheme`.
+- **A hosted lead's members follow the permission rules and directories it
+  gains, as the daemon's teammates do** (part of #445). Under
+  `session_host.InheritLead` a member decided its tool calls with what its
+  configuration held when it opened, so a rule the lead gained later
+  (`update_permission_rules`, an "allow always" or "deny" answer) or a
+  directory it added (`set_additional_directories`) never reached it. The
+  new `TeammateFactory.permissions = .lead`, which `InheritLead` declares,
+  opens each member through the new `AgentSession.inheritPermissions`: it
+  decides every tool call with its lead's imported rules, additional
+  directories and Session memory as they are at that call, from its next
+  tool call on, and refuses its own `update_permission_rules` and
+  `set_additional_directories` (`PermissionsInherited`). Each decision holds
+  the lead's lock (`permission/lent.zig`); the lead frees replaced rules
+  only after it, and its AgentSession outlives its members'.
 - **A `SessionHost`'s model catalog can be refreshed while it runs, as the
   daemon's is** (part of #445). The daemon's catalog is its cached
   `/v1/models` answer, replaced when the background refresh lands;
@@ -181,8 +195,11 @@ status, compatibility boundaries, and entry points are defined by
   before any provider request. Such a refusal fails only that Run, as the
   daemon reports it failed and takes the next message: the submission's
   text stays out of the Conversation and the Session is idle again, not
-  poisoned (a refused resumption of a suspended Run still poisons, and so
-  does a journal that cannot open). `abandoned_run = .record_abandoned` closes a
+  poisoned (a journal that cannot open still poisons). A refused resumption
+  of a suspended Run (`AdmittedRun.resumeWithResults`) leaves the answer
+  out of the Conversation too, and `SessionHost` keeps the suspension:
+  `run_done` names the error, the request is announced again under its id,
+  recorded open, and a later answer resumes the turn. `abandoned_run = .record_abandoned` closes a
   Run whose process died as abandoned and runs the next one, as the daemon
   does; the default stays `fail_closed`. Either setting on an ephemeral
   Session is refused (`RunControlRequiresRunJournal`), and a Session that

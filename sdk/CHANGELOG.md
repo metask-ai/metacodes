@@ -43,6 +43,12 @@ empty `### Migration`.
   #16, #445); ABI revision 28 exposes neither `SessionHost` nor `setRoute`,
   and an ABI Session's `auth_scheme` is now copied at create with the same
   bytes on the wire.
+- No change a Host can see. A Zig `SessionHost` member opened through
+  `InheritLead` now decides each tool call with its lead's current
+  permission rules and directories (#445,
+  `AgentSession.inheritPermissions`); ABI revision 28 exposes neither
+  `SessionHost` nor that call, and an ABI Session's
+  `update_permission_rules` never meets `PermissionsInherited`.
 - No change a Host can see. The Zig `SessionHost.setModelCatalog` replaces
   the catalog `Options.models` resolves model names against while the Host
   runs (#445); ABI revision 28 exposes neither `SessionHost` nor
@@ -52,6 +58,10 @@ empty `### Migration`.
   Session idle instead of poisoned, as the daemon does (#445);
   `SessionConfigV1` has no `run_control`, so an ABI Session never opens the
   gate.
+- No change a Host can see. A Zig `SessionHost` whose project rules refuse
+  the resumption of a suspended Run now keeps the suspension and announces
+  its request again under the same id instead of poisoning the Session
+  (#445); ABI revision 28 exposes neither `SessionHost` nor `run_control`.
 
 ### Fixed
 

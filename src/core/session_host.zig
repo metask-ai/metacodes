@@ -36,7 +36,11 @@
 //! request (`ui_request_store`), `close` leaves it there, a
 //! Session opened again under its id announces it again under the same id,
 //! and `respond` resumes the Run with the answer, once (`AgentSession`'s
-//! `AdmittedRun.resumeWithResults`). A permission request always blocks: the
+//! `AdmittedRun.resumeWithResults`). A resumed Run that fails before the
+//! answer enters the conversation, the Session still usable (the project
+//! rules refused it, #445), keeps the suspension: `run_done` names the
+//! error, the request is announced again under its id and waits for another
+//! answer. A permission request always blocks: the
 //! kernel's permission gate reads a `pending` answer as no answer and denies
 //! the tool. Work submitted while a request waits is queued behind it, and
 //! `Snapshot.queue_waiting` says so.
@@ -93,6 +97,14 @@
 //! fails becomes the lead's next Run, so its model learns of it; a failure
 //! while fulfilling that report Run's own spawns is only logged.
 //! `InheritLead` is the factory that configures each member like its lead.
+//! A factory that declares `TeammatePermissions.lead` (as `InheritLead`
+//! does) opens each member under its lead's permissions, live: a permission
+//! rule or additional directory the lead gains after the member opened
+//! applies to the member's next tool call, as on the daemon
+//! (`AgentSession.inheritPermissions`; the locking rule is in
+//! permission/lent.zig). The lead's AgentSession outlives its members': the
+//! lead closes them before it destroys its own, and a member the Host closes
+//! meanwhile is waited for.
 //!
 //! Lifetimes: `open` and `acquire` return a counted reference that `release`
 //! gives back; no pointer escapes without one. `close` takes the Session out
@@ -602,6 +614,28 @@ pub const TeammateSpawn = struct {
 pub const TeammateFactory = struct {
     ctx: *anyopaque,
     configure: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, spawn: TeammateSpawn) anyerror!SessionConfig,
+    /// Whose permission rules, additional directories and Session memory a
+    /// member decides its tool calls with (#445).
+    permissions: TeammatePermissions = .own,
+};
+
+/// `TeammateFactory.permissions` (#445).
+pub const TeammatePermissions = enum {
+    /// The member's own, from the configuration `configure` returned; what
+    /// the lead gains later never reaches it.
+    own,
+    /// Its lead's, read at each tool call (`AgentSession.inheritPermissions`):
+    /// a rule the lead gains through `update_permission_rules` or an "allow
+    /// always" answer, and a directory it gains through
+    /// `set_additional_directories`, apply to the member's next tool call,
+    /// as the bundled daemon's in-process teammates borrow their lead's
+    /// permission context. Both remember "allow always"/"deny" answers in
+    /// the lead's Session memory. The member's own `update_permission_rules`
+    /// and `set_additional_directories` are refused
+    /// (`command_result{ok:false, error_name:"PermissionsInherited"}`). Its
+    /// permission mode, tools, workspace root and sandbox stay what
+    /// `configure` returned.
+    lead,
 };
 
 /// The `TeammateFactory` that configures each member like its lead, as the
@@ -610,14 +644,18 @@ pub const TeammateFactory = struct {
 /// configuration the Host opens its leads with: provider, credentials,
 /// workspace, tools, permission rules) with the lead's current model and
 /// permission mode, and the spawn's `effort` or else the lead's reasoning
-/// effort. `agent_type` is not interpreted.
+/// effort. `agent_type` is not interpreted. The member decides its tool
+/// calls with its lead's permission rules, additional directories and
+/// Session memory, live (`TeammatePermissions.lead`), so `base`'s
+/// `permission_rules` and `workspace.additional_dirs` are not what it
+/// decides with.
 pub const InheritLead = struct {
     /// Borrowed; outlives the SessionHost. Its `team` and UI requesters are
     /// not used.
     base: SessionConfig,
 
     pub fn factory(self: *InheritLead) TeammateFactory {
-        return .{ .ctx = self, .configure = configure };
+        return .{ .ctx = self, .configure = configure, .permissions = .lead };
     }
 
     /// `base` as the member of the lead `spawn` describes. Borrows from
@@ -797,6 +835,15 @@ pub const SessionHost = struct {
 
     /// Returns the Session holding one reference for the caller.
     pub fn open(self: *SessionHost, spec: OpenSpec) !*HostedSession {
+        return self.openSession(spec, null);
+    }
+
+    /// `open`, with the kernel Session deciding with `lender`'s permissions
+    /// (`AgentSession.inheritPermissions`) from before its driver starts, so
+    /// no Run of it ever decides with its own. `lender` must outlive it: a
+    /// lead's driver opens its members, and the lead closes them before it
+    /// destroys its own Session.
+    fn openSession(self: *SessionHost, spec: OpenSpec, lender: ?*AgentSession) !*HostedSession {
         // A suspended request lives in the Session's directory.
         if (self.options.ui_request_wait == .@"suspend" and !self.options.transcripts) return error.SuspendRequiresTranscripts;
         // `.re_announce` with no period would announce without ever waiting.
@@ -859,6 +906,7 @@ pub const SessionHost = struct {
         else
             try self.runtime.createSession(config);
         errdefer session.destroy() catch {};
+        if (lender) |lead| try session.inheritPermissions(lead);
         hosted.session = session;
         // Before the driver exists, so every mode change it makes is seen.
         session.permission_ctx.event_sink = hosted.configSink();
@@ -1670,7 +1718,11 @@ pub const HostedSession = struct {
         try self.teammates.ensureUnusedCapacity(self.gpa, 1);
         const name = try self.gpa.dupe(u8, request.name);
         errdefer self.gpa.free(name);
-        const member = try self.host.open(.{ .config = config });
+        const lender: ?*AgentSession = switch (factory.permissions) {
+            .own => null,
+            .lead => self.session,
+        };
+        const member = try self.host.openSession(.{ .config = config }, lender);
         defer member.release();
         self.teammates.appendAssumeCapacity(.{ .name = name, .id = member.id, .lease = lease });
         try member.submit(.{ .text = request.prompt });
@@ -1989,6 +2041,8 @@ pub const HostedSession = struct {
             } else |err| err,
             .set_additional_directories => |dirs| self.applyDirectories(dirs),
             .set_prompt_profile => |profile| if (self.session.setPromptProfile(profile)) |_| null else |err| err,
+            // A member under its lead's permissions refuses both
+            // (`PermissionsInherited`, #445).
             .update_permission_rules => |rules| if (self.session.updatePermissionRules(rules)) |_| null else |err| err,
             .compact => blk: {
                 self.last_compact_id += 1;
@@ -2851,8 +2905,9 @@ pub const HostedSession = struct {
         var scope = RunScope{ .hosted = self, .context = context };
         self.session.awaitProviderCancelsDrained();
         var admitted = self.session.admitRun(context.run_id, scope.sink()) catch |err| {
+            const kept = self.keepUnresumed(suspension);
             self.finishRun(context, null, err, null);
-            self.finishResumption();
+            self.endResumption(kept);
             return;
         };
         admitted.stream_retry_budget = suspension.settings.stream_retry_budget;
@@ -2871,16 +2926,68 @@ pub const HostedSession = struct {
         self.current_run_id = 0;
         self.run_returned = true;
         self.mutex.unlock();
+        // Before `settleRun`, so `run_done` already finds the Session
+        // suspended again.
+        const kept = if (outcome) |_| false else |_| self.keepUnresumed(suspension);
         self.settleRun(context, outcome, suspension.settings);
-        self.finishResumption();
+        self.endResumption(kept);
+    }
+
+    /// A resumed Run that failed before its results entered the
+    /// conversation, the Session not poisoned (the project rules refused it,
+    /// #445): the suspension is held again, its request open for another
+    /// answer, as `reopenSuspension` leaves one. The settlement it took is
+    /// spent on the failed Run and dropped; the request gets no new
+    /// expiry, so a refusal that persists never resumes it by itself.
+    /// Otherwise false, and `finishResumption` ends it as before.
+    fn keepUnresumed(self: *HostedSession, suspension: *Suspension) bool {
+        if (self.session.isPoisoned()) return false;
+        const waiting = blk: {
+            var lease = self.conversationLease() catch break :blk false;
+            defer lease.deinit();
+            break :blk callState(lease.conversation, suspension.tool_use_id) == .waiting;
+        };
+        if (!waiting) return false;
+        log.warn("session_host", "request {d} of {s} not resumed, its Run failed first; it stays open", .{ suspension.request_id, self.id.asSlice() });
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (suspension.settled) {
+            .answered => |answered| {
+                self.gpa.free(answered.json);
+                if (answered.by) |by| self.gpa.free(by);
+            },
+            .open, .cancelled => {},
+        }
+        suspension.settled = .open;
+        suspension.expires_at_ms = null;
+        self.resuming = null;
+        self.suspension = suspension;
+        return true;
+    }
+
+    /// After a resumed Run, `finishRun` having reported it: a suspension
+    /// `keepUnresumed` held again is announced again under its id, as a
+    /// Session opened again announces it, and recorded open; any other ends
+    /// as `finishResumption` says.
+    fn endResumption(self: *HostedSession, kept: bool) void {
+        if (!kept) return self.finishResumption();
+        self.mutex.lock();
+        const held = self.suspension;
+        const announce = !self.closing;
+        self.mutex.unlock();
+        const suspension = held orelse return;
+        if (announce) self.journal.append(suspension.announcement);
+        self.storeRequests() catch |err|
+            log.warn("session_host", "request {d} of {s} open again, not recorded; a restart applies the answer it took: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
     }
 
     /// After a resumed Run, `finishRun` having written its transcript: when
     /// the committed conversation holds the call's result, the recorded
     /// settlement is spent and the record is rewritten without it (or with
-    /// the suspension the Run was held on again). When it does not (the Run
-    /// failed before the results entered it, or the Session is poisoned),
-    /// the record keeps the settlement for the next open to apply.
+    /// the suspension the Run was held on again). When it does not (the
+    /// Session is poisoned; a Run that failed before the results entered it
+    /// on a usable Session is `keepUnresumed`'s), the record keeps the
+    /// settlement for the next open to apply.
     fn finishResumption(self: *HostedSession) void {
         self.mutex.lock();
         const resumed = self.resuming orelse {

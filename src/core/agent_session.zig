@@ -794,10 +794,11 @@ pub const ProjectRules = enum {
     /// running background job or active team fails the Run before any
     /// provider request. Such a refusal fails only that Run, as the daemon
     /// reports it failed and takes the next message: its input never enters
-    /// the Conversation and the Session stays usable (a refused resumption,
-    /// whose suspended turn could not be continued, still poisons). After
-    /// the Run the bundle is re-attested and the Run's operational
-    /// observation published.
+    /// the Conversation and the Session stays usable. A refused resumption
+    /// (`AdmittedRun.resumeWithResults`) leaves its suspended turn waiting
+    /// for its results, so a later Run can still continue it. After the Run
+    /// the bundle is re-attested and the Run's operational observation
+    /// published.
     enforced,
 };
 
@@ -1034,6 +1035,10 @@ pub const PermissionRuleMutationError = error{
     OutOfMemory,
     ResourceLimit,
     InvalidRule,
+    /// The Session decides with another Session's rules
+    /// (`AgentSession.inheritPermissions`, #445), so its own would never be
+    /// read. Nothing changes.
+    PermissionsInherited,
 };
 
 pub const PermissionModeMutationError = error{
@@ -1052,6 +1057,23 @@ pub const AdditionalDirectoriesMutationError = error{
     InvalidSessionState,
     InvalidAdditionalDirectory,
     OutOfMemory,
+    /// The Session decides with another Session's directories
+    /// (`AgentSession.inheritPermissions`, #445), so a permission decision
+    /// would never read its own. Nothing changes.
+    PermissionsInherited,
+};
+
+/// `AgentSession.inheritPermissions` refusals; each leaves both Sessions as
+/// they were.
+pub const InheritPermissionsError = error{
+    /// This Session is not idle.
+    SessionBusy,
+    /// This Session or the lender is poisoned or being destroyed.
+    InvalidSessionState,
+    /// This Session already decides with another Session's permissions.
+    PermissionsInherited,
+    /// A Session cannot lend to itself.
+    InvalidPermissionLender,
 };
 
 pub const ReasoningEffortMutationError = error{
@@ -1441,7 +1463,11 @@ pub const AdmittedRun = struct {
     /// Refused before anything changes, the admitted Run finished cleanly:
     /// `error.NothingToResume` when the Conversation does not end in an
     /// assistant turn with tool calls, `error.ResumeMismatch` when a result
-    /// names a call that turn did not make or names one twice.
+    /// names a call that turn did not make or names one twice. The project
+    /// rules refusing the Run (`RunControlConfig.project_rules`, #445) also
+    /// return with the Run finished, the results not recorded and the
+    /// Session idle: the suspended turn still waits for them, and another
+    /// admitted Run can resume it.
     pub fn resumeWithResults(
         self: *AdmittedRun,
         results: []const agent_loop.SuspendInfo.CompletedResult,
@@ -1693,6 +1719,22 @@ pub const AgentSession = struct {
     /// Broadcast under `mutex` when `in_flight_provider_cancels` reaches zero
     /// (`awaitProviderCancelsDrained`).
     provider_cancels_drained: sync.Condition = .{},
+    /// Issue #445: this Session's imported rules and additional directories
+    /// as other Sessions' permission decisions read them
+    /// (`inheritPermissions`). Republished by `updatePermissionRules` and
+    /// `setAdditionalDirectories`; permission/lent.zig states the locking
+    /// rule.
+    lent_permissions: permission.LentPermissions = .{},
+    /// Sessions that decide with this one's permissions
+    /// (`inheritPermissions`) and are not destroyed yet; under `mutex`.
+    /// `destroy` waits for zero, so a lender outlives every borrower.
+    permission_heirs: usize = 0,
+    /// Broadcast under `mutex` when `permission_heirs` reaches zero.
+    permission_heirs_gone: sync.Condition = .{},
+    /// The Session whose permissions this one decides with
+    /// (`inheritPermissions`): set once while idle, given back only at the
+    /// end of `destroy`.
+    permission_lender: ?*AgentSession = null,
     last_admitted_compact_id: u64 = 0,
     last_terminal_compact_id: u64 = 0,
     callback_failed: bool = false,
@@ -1928,6 +1970,7 @@ pub const AgentSession = struct {
         // options): autoAllowBashIfSandboxed allows only a call they really
         // confine, and a sandboxed shell ignores `dangerouslyDisableSandbox`.
         self.permission_ctx.sandbox = self.workspace.sandbox();
+        self.lent_permissions.publish(self.permission_ctx.settings, self.workspace.additional_dirs);
         return self;
     }
 
@@ -1952,11 +1995,16 @@ pub const AgentSession = struct {
                 return error.InvalidSessionState;
             },
         }
+        // #445: a Session others decide with outlives them. `.destroying`
+        // admits no new borrower; the ones there leave at the end of their
+        // own destroy.
+        while (self.permission_heirs > 0) self.permission_heirs_gone.wait(&self.mutex);
         self.mutex.unlock();
 
         const allocator = self.allocator;
         const runtime = self.runtime;
         const sid = self.session_id;
+        const lender = self.permission_lender;
         self.provider.deinit();
         self.conversation.deinit();
         self.run_inputs.deinit();
@@ -1982,6 +2030,9 @@ pub const AgentSession = struct {
         self.credential.destroy();
         self.* = undefined;
         allocator.destroy(self);
+        // Last: nothing of this Session reads the lender's state any more
+        // (its Runs, jobs and scoped permission copies are gone).
+        if (lender) |lead| lead.releasePermissionHeir();
         // destroy 成功必须注销(先于 releaseSession:live==0 时 registry 必须已空)。
         runtime.unregisterSessionId(sid);
         runtime.releaseSession();
@@ -2149,6 +2200,10 @@ pub const AgentSession = struct {
         input: permission_settings.RuleSetInput,
     ) PermissionRuleMutationError!void {
         self.mutex.lock();
+        if (self.permission_lender != null) {
+            self.mutex.unlock();
+            return error.PermissionsInherited;
+        }
         if (self.in_flight_provider_cancels != 0) {
             self.mutex.unlock();
             return error.SessionBusy;
@@ -2187,6 +2242,9 @@ pub const AgentSession = struct {
             rules
         else
             null;
+        // Borrowers' next decision reads the new layer, and none reads
+        // `previous` once `publish` returns, so it is freed below.
+        self.lent_permissions.publish(self.permission_ctx.settings, self.workspace.additional_dirs);
         self.mutex.unlock();
 
         if (previous) |rules_value| {
@@ -2252,6 +2310,10 @@ pub const AgentSession = struct {
         dirs: []const []const u8,
     ) AdditionalDirectoriesMutationError!void {
         self.mutex.lock();
+        if (self.permission_lender != null) {
+            self.mutex.unlock();
+            return error.PermissionsInherited;
+        }
         if (self.in_flight_provider_cancels != 0) {
             self.mutex.unlock();
             return error.SessionBusy;
@@ -2280,6 +2342,9 @@ pub const AgentSession = struct {
         const previous = self.workspace.additional_dirs;
         self.workspace.additional_dirs = replacement;
         self.permission_ctx.match_ctx.additional_dirs = replacement;
+        // As for the rules: borrowers read the new set from their next
+        // decision on, and none reads `previous` once `publish` returns.
+        self.lent_permissions.publish(self.permission_ctx.settings, replacement);
         self.mutex.unlock();
         workspace_mod.freeDirs(self.allocator, previous);
 
@@ -2287,6 +2352,79 @@ pub const AgentSession = struct {
         std.debug.assert(self.state == .mutating);
         self.state = .idle;
         self.mutex.unlock();
+    }
+
+    /// Issue #445: from now on this Session decides every tool call with
+    /// `lead`'s imported permission rules and additional working directories
+    /// as they are at that call, and both Sessions remember "allow
+    /// always"/"deny" answers in `lead`'s Session memory and read it: a rule
+    /// or directory the lead gains later applies to this Session's next tool
+    /// call, as the bundled daemon's in-process teammates borrow their lead's
+    /// permission context. This Session's own rules, directories and memory
+    /// are no longer read, so `updatePermissionRules` and
+    /// `setAdditionalDirectories` on it refuse with
+    /// `error.PermissionsInherited`. Its permission mode, workspace root,
+    /// tools and sandbox stay its own. A lead that itself inherits lends what
+    /// it inherits.
+    ///
+    /// Locking and lifetime (permission/lent.zig): each decision holds the
+    /// lender's `lent_permissions.mutex`; the lender republishes under it and
+    /// frees what it replaced afterwards. The lender outlives this Session:
+    /// its `destroy` waits until every Session that inherits from it is
+    /// destroyed, so destroy borrowers first. Only while this Session is
+    /// idle; once.
+    pub fn inheritPermissions(self: *AgentSession, lead: *AgentSession) InheritPermissionsError!void {
+        const lender = lead.permission_lender orelse lead;
+        if (lender == self) return error.InvalidPermissionLender;
+        self.mutex.lock();
+        if (self.permission_lender != null) {
+            self.mutex.unlock();
+            return error.PermissionsInherited;
+        }
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+
+        // Never under this Session's lock: no path takes the two the other
+        // way round, but none needs to take them together either.
+        lender.mutex.lock();
+        const admitted = lender.state != .destroying and lender.state != .poisoned;
+        if (admitted) lender.permission_heirs += 1;
+        lender.mutex.unlock();
+        if (!admitted) {
+            self.cancelMutation();
+            return error.InvalidSessionState;
+        }
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.permission_lender = lender;
+        self.permission_ctx.inherited = &lender.lent_permissions;
+        self.permission_ctx.session_rules = &lender.session_rules;
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    /// The end of a borrower's `destroy`.
+    fn releasePermissionHeir(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.permission_heirs > 0);
+        self.permission_heirs -= 1;
+        if (self.permission_heirs == 0) self.permission_heirs_gone.broadcast();
     }
 
     /// Issue #445: the prompts of the cron jobs due now, in the order the
@@ -3123,16 +3261,11 @@ pub const AgentSession = struct {
         }) {
             .open => |control| control,
             .refused => |err| {
-                switch (input) {
-                    // The suspended turn's tool calls stay without results
-                    // and the Host drops its suspension on a failed Run: no
-                    // later Run could continue that Conversation.
-                    .resumption => _ = self.poisonRun(),
-                    .prompts, .record => {
-                        const completion = self.finishRunLifecycle();
-                        if (completion.callback_failed) return error.CallbackFailed;
-                    },
-                }
+                // A resumption's results stay out of the Conversation too:
+                // its suspended turn still waits for them, so a later Run
+                // can still give them (`SessionHost` keeps the suspension).
+                const completion = self.finishRunLifecycle();
+                if (completion.callback_failed) return error.CallbackFailed;
                 return err;
             },
         };
@@ -6034,4 +6167,124 @@ test "resumeWithResults' precondition: the results answer the last assistant tur
     try std.testing.expectError(error.ResumeMismatch, checkResumable(&conversation, &.{ question, question }));
     try std.testing.expectError(error.ResumeMismatch, checkResumable(&conversation, &.{.{ .tool_use_id = "tu_other", .content = "{}", .is_error = false }}));
     try std.testing.expectError(error.NothingToResume, checkResumable(&conversation, &.{}));
+}
+
+test "AgentSession.inheritPermissions: the lead's rules, directories and memory as they are at each decision; the lead outlives the member" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.createDirPath(std.testing.io, "extra");
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(std.testing.io, &base_buffer);
+    for (base_buffer[0..base_len]) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    const base = base_buffer[0..base_len];
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, "{s}/root", .{base});
+    var extra_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const extra = try std.fmt.bufPrint(&extra_buffer, "{s}/extra", .{base});
+    var args_buffer: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const write_args = try std.fmt.bufPrint(&args_buffer, "{{\"file_path\":\"{s}/x.txt\",\"content\":\"x\"}}", .{extra});
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const lead = try createTestSession(runtime, .bypass_permissions, root);
+    var lead_destroyed = false;
+    defer if (!lead_destroyed) lead.destroy() catch unreachable;
+    const member = try createTestSession(runtime, .accept_edits, root);
+    var member_destroyed = false;
+    defer if (!member_destroyed) member.destroy() catch unreachable;
+
+    try std.testing.expectError(error.InvalidPermissionLender, lead.inheritPermissions(lead));
+    try member.inheritPermissions(lead);
+    try std.testing.expectError(error.PermissionsInherited, member.inheritPermissions(lead));
+    // The member keeps its own mode.
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, member.permission_ctx.modeValue());
+
+    // A Write outside the working directories asks; once the lead gains the
+    // directory, the member's next decision allows it, a scoped copy too.
+    try std.testing.expectEqual(permission.PermissionResult.ask, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+    try lead.setAdditionalDirectories(&.{extra});
+    try std.testing.expectEqual(permission.PermissionResult.allow, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+    const scoped = member.permission_ctx.scopedDerive(null);
+    try std.testing.expectEqual(permission.PermissionResult.allow, permission.checkPermission(&scoped, "Write", write_args));
+
+    // A rule the lead gains decides the member's next call; replacing it
+    // again frees the layer the member read.
+    try lead.updatePermissionRules(.{ .deny = &.{"Write"} });
+    try std.testing.expectEqual(permission.PermissionResult.deny, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+    try lead.updatePermissionRules(.{});
+    try std.testing.expectEqual(permission.PermissionResult.allow, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+
+    // Session memory is the lead's: its "deny" applies to the member.
+    lead.session_rules.rememberDeny("Write");
+    try std.testing.expectEqual(permission.PermissionResult.deny, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+
+    // The member's own rules and directories would never be read: refused.
+    try std.testing.expectError(error.PermissionsInherited, member.updatePermissionRules(.{ .allow = &.{"Write"} }));
+    try std.testing.expectError(error.PermissionsInherited, member.setAdditionalDirectories(&.{}));
+    try std.testing.expectEqual(State.idle, member.state);
+
+    // The lead's destroy waits for the member's.
+    const Destroyer = struct {
+        fn run(session: *AgentSession, done: *std.atomic.Value(bool)) void {
+            session.destroy() catch unreachable;
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Destroyer.run, .{ lead, &done });
+    lead_destroyed = true;
+    std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake) catch {};
+    try std.testing.expect(!done.load(.acquire));
+    try member.destroy();
+    member_destroyed = true;
+    thread.join();
+    try std.testing.expect(done.load(.acquire));
+}
+
+test "AgentSession.inheritPermissions: the lead replaces its rules and directories while a member decides, and no decision reads a freed set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const lead = try createTestSession(runtime, .bypass_permissions, root);
+    defer lead.destroy() catch unreachable;
+    const member = try createTestSession(runtime, .bypass_permissions, root);
+    defer member.destroy() catch unreachable;
+    try member.inheritPermissions(lead);
+
+    const Writer = struct {
+        fn run(session: *AgentSession, dir: []const u8, stop: *std.atomic.Value(bool)) void {
+            var i: usize = 0;
+            while (!stop.load(.acquire)) : (i += 1) {
+                if (i % 2 == 0) {
+                    session.updatePermissionRules(.{ .deny = &.{"Bash"} }) catch unreachable;
+                    session.setAdditionalDirectories(&.{dir}) catch unreachable;
+                } else {
+                    session.updatePermissionRules(.{}) catch unreachable;
+                    session.setAdditionalDirectories(&.{}) catch unreachable;
+                }
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{ lead, root, &stop });
+    var denied: usize = 0;
+    var allowed: usize = 0;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        switch (permission.checkPermission(&member.permission_ctx, "Bash", "{\"command\":\"make\"}")) {
+            .deny => denied += 1,
+            .allow => allowed += 1,
+            else => return error.UnexpectedDecision,
+        }
+    }
+    stop.store(true, .release);
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 2000), denied + allowed);
 }
