@@ -4420,6 +4420,7 @@ test {
     _ = &@import("teamwork/merge_back.zig");
     _ = &@import("teamwork/runtime.zig");
     _ = &@import("teamwork/swe_loop.zig");
+    _ = &@import("teamwork/verifier_auditor.zig");
     _ = &@import("teamwork/runtime_test.zig");
     _ = &@import("core/memory/import.zig");
     _ = &@import("core/memory/claudemd.zig");

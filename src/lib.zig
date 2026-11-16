@@ -105,6 +105,7 @@ pub const teamwork_audit = @import("teamwork/audit.zig"); // completion audit se
 pub const teamwork_merge_back = @import("teamwork/merge_back.zig"); // implementer worktree and merge-back (#523)
 pub const teamwork_runtime = @import("teamwork/runtime.zig"); // run state machine and operations API (#514, #520, #523)
 pub const teamwork_swe_loop = @import("teamwork/swe_loop.zig"); // built-in deterministic manager (#514)
+pub const teamwork_verifier_auditor = @import("teamwork/verifier_auditor.zig"); // completion audit by the isolated verifier (#516)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");

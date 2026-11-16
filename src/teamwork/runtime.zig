@@ -82,9 +82,9 @@ pub const SeatSource = union(enum) {
 /// What a run depends on, borrowed for the run's life.
 pub const Deps = struct {
     seats: SeatSource,
-    /// The completion audit (audit.zig). Until the verifier adapter lands,
-    /// production passes `audit.UnavailableAuditor`: no run completes
-    /// unaudited.
+    /// The completion audit: in production
+    /// `verifier_auditor.VerifierAuditor`; a host without a verifier passes
+    /// `audit.UnavailableAuditor`, so no run completes unaudited.
     auditor: audit.CompletionAuditor,
     /// Re-runs the pinned check for review verification (sandboxed like
     /// the Bash tool when the host has a sandbox).
@@ -614,6 +614,7 @@ pub const Run = struct {
         var verdict = try self.deps.auditor.audit(self.gpa, .{
             .original_request = request,
             .workspace = self.worktree,
+            .base = self.base.commit.slice(),
             .check = self.cfg.check_command,
             .attempt = attempt,
             .scratch_dir = scratch,

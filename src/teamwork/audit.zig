@@ -14,16 +14,12 @@
 //! Implementations:
 //!
 //! - `StubAuditor`: scripted verdicts, for tests only.
-//! - `UnavailableAuditor`: the production default until the isolated
-//!   verifier lands. It always answers `unavailable`, so without a real
-//!   verifier no run can complete: fail closed, never open.
-//! - VERIFIER ADAPTER POINT: the isolated verifier (#516,
-//!   doc/ISOLATED_VERIFIER_DESIGN.md) exposes a standalone `verify` API.
-//!   Its adapter is a `CompletionAuditor` whose `audit` maps an
-//!   `AuditRequest` onto that call and the verifier's result onto
-//!   `AuditVerdict` (a demoted or inconclusive result is `unverified`, an
-//!   infrastructure failure `unavailable`). Nothing else in the runtime
-//!   changes when it is plugged in through `runtime.Deps.auditor`.
+//! - `UnavailableAuditor`: always `unavailable`, for a host that has no
+//!   verifier configured: without one no run can complete (fail closed).
+//! - `verifier_auditor.VerifierAuditor`: the production auditor, the
+//!   isolated verifier's standalone `verify` (#516,
+//!   doc/ISOLATED_VERIFIER_DESIGN.md) behind this interface. Another auditor
+//!   plugs in the same way, through `runtime.Deps.auditor`.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -39,6 +35,9 @@ pub const AuditRequest = struct {
     /// approved. The auditor must not modify it (the runtime re-checks the
     /// tree afterwards and fails the run if it changed).
     workspace: []const u8,
+    /// The commit the worktree started from: `git diff <base>` against the
+    /// workspace is exactly the run's change.
+    base: []const u8,
     /// The host-pinned check command, if configured.
     check: ?config.CheckCommand,
     /// 1 or 2.
@@ -174,6 +173,7 @@ test "audit: the default auditor is unavailable, never a pass" {
     var verdict = try default.auditor().audit(testing.allocator, .{
         .original_request = "x",
         .workspace = "/w",
+        .base = "b",
         .check = null,
         .attempt = 1,
         .scratch_dir = "/s",
@@ -191,7 +191,7 @@ test "audit: the stub replays its script and records the request" {
     const script = [_]StubAuditor.Scripted{ .{ .fail = "missing flag" }, .pass };
     var stub: StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer stub.deinit();
-    const request: AuditRequest = .{ .original_request = "req", .workspace = "/wt", .check = null, .attempt = 1, .scratch_dir = "/s", .ledger = &ledger, .abort = &abort };
+    const request: AuditRequest = .{ .original_request = "req", .workspace = "/wt", .base = "b", .check = null, .attempt = 1, .scratch_dir = "/s", .ledger = &ledger, .abort = &abort };
     var first = try stub.auditor().audit(testing.allocator, request);
     defer first.deinit(testing.allocator);
     try testing.expectEqualStrings("missing flag", first.fail);

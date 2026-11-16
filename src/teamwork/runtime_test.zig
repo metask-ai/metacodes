@@ -799,3 +799,75 @@ test "teamwork runtime L2: the same reviewer claim is rejected when the metacode
     try testing.expectEqual(std.meta.Tag(@import("reviewer.zig").RejectReason).evidence_not_observed, run.status().seats[1].result.?.review.rejected);
     try testing.expect(!exists(fx.repo(), "feature.txt"));
 }
+
+// ── through the real isolated verifier ──────────────────────────────────────
+
+test "teamwork runtime L2: the isolated verifier audits the result; its FAIL report drives the repair round, its PASS completes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const verifier_auditor = @import("verifier_auditor.zig");
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-verifier");
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const plans = [_]Plan{
+        // The pinned check only asks for the file; the request asks for its content.
+        .{ .seat = "implementer-1", .files = &.{.{ .path = "feature.txt", .bytes = "wrong\n" }} },
+        .{ .seat = "reviewer-1", .review = approve_review },
+        .{ .seat = "implementer-2", .files = &.{feature} },
+        .{ .seat = "reviewer-2", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const Event = drivers_test.ScriptedProvider.Event;
+    const probe = "{\"command\":\"cat feature.txt\"}";
+    const turns = [_][]const Event{
+        // audit 1
+        &.{.{ .tool = .{ .name = "Bash", .input = probe } }},
+        &.{.{ .text = "REQUIREMENT: feature.txt must exist and say \"feature\"\nSUBSTITUTE: a feature.txt with other content\nPROBE: cat feature.txt\nOBSERVED: wrong\nVERDICT: FAIL" }},
+        // audit 2
+        &.{.{ .tool = .{ .name = "Bash", .input = probe } }},
+        &.{.{ .text = "REQUIREMENT: feature.txt must exist and say \"feature\"\nSUBSTITUTE: a feature.txt with other content\nPROBE: cat feature.txt\nOBSERVED: feature\nVERDICT: PASS" }},
+    };
+    var scripted: drivers_test.ScriptedProvider = .{ .allocator = testing.allocator, .turns = &turns };
+    defer scripted.deinit();
+    var perm = permission_mod.createContext(.accept_edits, testing.allocator);
+    perm.no_interactive_prompt = true;
+    var verifier: verifier_auditor.VerifierAuditor = .{ .deps = .{
+        .provider = scripted.provider(),
+        .tool_defs = try tools_mod.toToolDefinitions(a),
+        .permission_ctx = &perm,
+        .state_root = fx.state(),
+    } };
+    const run = try runtime.Run.start(testing.allocator, .{ .seats = seats.source(), .auditor = verifier.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    const final = try swe_loop.drive(run);
+
+    if (final.phase() != .done) {
+        var report_buf: PathBuf = undefined;
+        if (readFile(fx.runFile(&report_buf, ""), "audits/audit-1.md")) |r| {
+            defer testing.allocator.free(r);
+            std.debug.print("audit-1:\n{s}\n", .{r});
+        }
+        if (readFile(fx.runFile(&report_buf, ""), "audits/audit-2.md")) |r| {
+            defer testing.allocator.free(r);
+            std.debug.print("audit-2:\n{s}\n", .{r});
+        }
+    }
+    try testing.expectEqual(runtime.Phase.done, final.phase());
+    try testing.expectEqual(@as(usize, 4), scripted.calls);
+    try expectFile(fx.repo(), "feature.txt", "feature\n");
+    // The verifier's packet is the recorded request, verbatim.
+    try testing.expect(std.mem.indexOf(u8, scripted.first_user.?, request_text) != null);
+    var run_buf: PathBuf = undefined;
+    const report = readFile(fx.runFile(&run_buf, ""), "audits/audit-1.md") orelse return error.NoReport;
+    defer testing.allocator.free(report);
+    try testing.expect(std.mem.startsWith(u8, report, "# Completion audit 1: fail\n\nIsolated verifier verdict: FAIL\n"));
+    try testing.expect(std.mem.indexOf(u8, report, "  Probe: `cat feature.txt`\n  Observed: wrong\n") != null);
+    try testing.expect(std.mem.indexOf(u8, seats.packetOf("implementer-2"), run_dir.seat_relative_first_audit_report) != null);
+    // Both audits were charged to the run ledger.
+    const ledger_text = readFile(fx.runFile(&run_buf, ""), "budget.jsonl") orelse return error.NoLedger;
+    defer testing.allocator.free(ledger_text);
+    try testing.expect(std.mem.indexOf(u8, ledger_text, "\"seat_id\":\"verifier-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ledger_text, "\"seat_id\":\"verifier-2\"") != null);
+    try testing.expectEqual(@as(u8, 2), run.status().audit.used);
+}
