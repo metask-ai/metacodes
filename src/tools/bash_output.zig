@@ -2252,18 +2252,30 @@ test "BashOutput ticks batched by a guarded wait keep the streak growing" {
     var registry = try JobRegistry.init(a);
     defer registry.deinit();
     const ctx = ToolContext{ .allocator = a, .jobs = &registry };
-    // 130-byte lines every 50 ms: a 400 ms guarded wait gathers well past
-    // POLL_GUARD_LOW_YIELD_BYTES without filling a page.
-    const job = try registry.spawnBackground("i=0; while [ $i -lt 100 ]; do printf '%0129d\\n' 0; sleep 0.05; i=$((i+1)); done", null);
-    try waitForSpoolBytes(&registry, job.idSlice(), 1);
-    var head = try poll(&ctx, "{{\"job_id\":\"{s}\",\"wait_ms\":0}}", .{job.idSlice()});
-    head.deinit();
+    // The test writes the ticks into the spool itself. A shell loop printing
+    // them raced the 400 ms wait: on a loaded machine its `sleep` processes
+    // started too slowly for two lines to land in time, which failed the
+    // 0.12.0 release build (#480).
+    const job = try registry.spawnBackground("sleep 60", null);
     primeStreak(&registry, job.idSlice(), time.nowMs());
+    // Each tick alone is a low-yield poll's worth; two are past
+    // POLL_GUARD_LOW_YIELD_BYTES and nowhere near a page.
+    const tick = "0" ** 129 ++ "\n";
+    comptime std.debug.assert(tick.len < POLL_GUARD_LOW_YIELD_BYTES and 2 * tick.len >= POLL_GUARD_LOW_YIELD_BYTES);
+    try appendToSpool(job.stdout_path, tick ++ tick);
     var env = try poll(&ctx, "{{\"job_id\":\"{s}\",\"wait_ms\":100,\"until\":\"output\"}}", .{job.idSlice()});
     defer env.deinit();
+    // Unguarded, `output` would have returned the unread ticks at once.
     try std.testing.expectEqualStrings("deadline", envString(env, "returned_on"));
-    try std.testing.expect(envString(env, "stdout").len >= POLL_GUARD_LOW_YIELD_BYTES);
+    try std.testing.expectEqualStrings(tick ++ tick, envString(env, "stdout"));
     try std.testing.expectEqual(POLL_GUARD_STREAK + 1, registry.get(job.idSlice()).?.poll_streak.low_yield);
+}
+
+/// Append `bytes` to a spool the way the job's own writes would land.
+fn appendToSpool(path: []const u8, bytes: []const u8) !void {
+    const fd = try pfs.openZ(path, .{ .ACCMODE = .WRONLY, .APPEND = true }, 0);
+    defer _ = pfs.close(fd);
+    if (!pfs.writeAll(fd, bytes)) return error.SpoolWriteFailed;
 }
 
 test "BashOutput until quiet also returns a full page at once" {
