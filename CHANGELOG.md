@@ -47,6 +47,13 @@ status, compatibility boundaries, and entry points are defined by
   session and model choice are rolled back: the previous sign-in, stored
   default, and current route keep working together.
 
+- **The line that ends a Metask sign-in says who signed in** (follow-up to
+  #527). `/login`, `/login metask` and `metacodes login` ask the server for
+  the account's name (`/api/oauth/userinfo`: its name, else its email) and
+  end with `Signed in to Metask as <name> · <model> · reasoning <level>`; a
+  control character in it is shown as `?`. Without an answer within 3 s the
+  line is as before.
+
 - **A suspended Metask account says so** (follow-up to #527). The Metask
   gateway refuses a suspended account with a 403 `account_suspended`, which
   read as a rejected sign-in, with "sign in again" as the next step, which

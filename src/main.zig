@@ -2638,7 +2638,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
                 std.crypto.secureZero(u8, token_json);
                 allocator.free(token_json);
             }
-            return finishMetaskSignIn(allocator, init.io, state_dir, token_json, "Signed in to Metask in the browser.");
+            return finishMetaskSignIn(allocator, init.io, state_dir, token_json, "Signed in to Metask in the browser");
         },
         .help => {
             printLoginHelp();
@@ -2682,7 +2682,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
                 std.crypto.secureZero(u8, body);
                 allocator.free(body);
             }
-            return finishMetaskSignIn(allocator, init.io, state_dir, body, "Stored the Metask sign-in from the token response.");
+            return finishMetaskSignIn(allocator, init.io, state_dir, body, "Stored the Metask sign-in from the token response");
         },
     }
 }
@@ -2739,7 +2739,8 @@ fn printLoginHelp() void {
 /// token response is stored as the Metask session (`oauth/metask.json`), and
 /// the choice in `auth.json`, replacing a key or an older sign-in there (left
 /// there they would outrank the session at the next start). A stored `/model`
-/// default is forgotten, as `/login` does. Prints `done` on success.
+/// default is forgotten, as `/login` does. Prints `done` (no full stop),
+/// the account it signed in as when the server says, on success.
 fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, token_json: []const u8, done: []const u8) u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2757,6 +2758,9 @@ fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []con
         return 1;
     };
     defer allocator.free(fetched.body);
+    // Who signed in, for the line that ends the sign-in; best effort.
+    const account = metask_oauth_mod.accountName(allocator, metask_oauth_mod.siteUrl(), outcome.access_token, metask_oauth_mod.ACCOUNT_NAME_WAIT_MS);
+    defer if (account) |name| allocator.free(name);
     var catalog = catalog_mod.Catalog.init(allocator);
     defer catalog.deinit();
     catalog.loadFromModelsListJson(fetched.body) catch {};
@@ -2786,7 +2790,13 @@ fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []con
         std.debug.print("Signed in, but the model choice was not stored: {s}\n", .{@errorName(err)});
         return 1;
     };
-    std.debug.print("{s} Model {s}, reasoning {s}. Secrets were not printed.\n", .{ done, catalog.entries.items[choice.model].model_id, choice.effort.name() });
+    std.debug.print("{s}{s}{s}. Model {s}, reasoning {s}. Secrets were not printed.\n", .{
+        done,
+        if (account != null) " as " else "",
+        account orelse "",
+        catalog.entries.items[choice.model].model_id,
+        choice.effort.name(),
+    });
     forgetDefaultForSignIn(allocator, state_dir);
     return 0;
 }
@@ -3449,7 +3459,7 @@ fn runMetaskDeviceLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []c
         allocator.free(token_json);
     }
     if (platform_term.isatty(0) and platform_term.isatty(2)) {
-        return finishMetaskSignIn(allocator, io, state_dir, token_json, "Signed in to Metask with the device code.");
+        return finishMetaskSignIn(allocator, io, state_dir, token_json, "Signed in to Metask with the device code");
     }
 
     var arena = std.heap.ArenaAllocator.init(allocator);
