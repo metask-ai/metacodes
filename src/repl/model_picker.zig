@@ -144,9 +144,11 @@ pub const Picker = struct {
     window_top: usize = 0,
     page_rows: usize = 10,
 
-    /// One line of feedback from the last commit attempt. Bounded and owned by
-    /// the picker so the host never has to keep a matching allocation alive.
-    notice_buffer: [160]u8 = undefined,
+    /// Feedback from the last commit attempt: one line, or a few separated by
+    /// '\n' when it names a variable, a path and a link (#483). Bounded and
+    /// owned by the picker so the host never has to keep a matching
+    /// allocation alive.
+    notice_buffer: [512]u8 = undefined,
     notice_len: usize = 0,
     /// The credential stage (#67): the commit that wanted a credential, the
     /// provider being signed in to, where Esc returns, and the flow's

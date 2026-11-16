@@ -23,6 +23,7 @@ const view_mod = @import("model_picker_view.zig");
 const provider_login = @import("../api/provider_login.zig");
 const provider_host_mod = @import("../provider/host.zig");
 const login_worker_mod = @import("../api/login_worker.zig");
+const state_env = @import("../app/state_env.zig");
 const RenderRegion = @import("tui/render_region.zig").RenderRegion;
 
 pub const Key = picker_mod.Key;
@@ -357,6 +358,22 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, gu
                 app.model_picker.setNotice("no credential for {s}; sign in with /login {s}; the previous route is still active", .{ provider.slice(), provider.slice() });
                 return .redraw;
             };
+            // #483: no sign-in and no key page (Kimi, Gemini, Qwen, MiniMax):
+            // the key goes into this install's .env, so say which variable
+            // and where, instead of the bare error name.
+            if (host) |value| if (missingKeyFor(value, commit.offer_id)) |missing| {
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const env_path = localConfigPath(app, &path_buf);
+                guard.lock();
+                defer guard.unlock();
+                app.model_picker.setNotice("{s} has no key; the previous route is still active\nSet {s} in {s}, then restart\nHow to: {s}", .{
+                    missing.provider.slice(),
+                    missing.variable,
+                    env_path,
+                    state_env.guide_url,
+                });
+                return .redraw;
+            };
         }
         guard.lock();
         defer guard.unlock();
@@ -412,6 +429,32 @@ pub fn missingCredentialPointer(host: *provider_host_mod.Host, offer_id: ids_mod
     const profile = host.registry.findById(offer.provider_id) orelse return null;
     provider_login.requireOAuthCapable(profile) catch return null;
     return profile.id;
+}
+
+/// The provider of an offer whose commit found no credential, and the
+/// variable its key is read from: the canonical alias, else the first one
+/// (#483). Null when the offer is gone or the provider reads no variable.
+pub const MissingKey = struct {
+    provider: picker_mod.Slug,
+    /// Borrowed from the provider registry.
+    variable: []const u8,
+};
+
+pub fn missingKeyFor(host: *provider_host_mod.Host, offer_id: ids_mod.OfferId) ?MissingKey {
+    const offer = host.kernel.catalogSnapshot().find(offer_id) orelse return null;
+    const profile = host.registry.findById(offer.provider_id) orelse return null;
+    for (profile.env_aliases) |alias| {
+        if (alias.canonical) return .{ .provider = profile.id, .variable = alias.name };
+    }
+    if (profile.env_aliases.len == 0) return null;
+    return .{ .provider = profile.id, .variable = profile.env_aliases[0].name };
+}
+
+/// This install's `<state root>/.env`, written as `state_env.load` names it
+/// (`Loaded.path`), into `buf`.
+fn localConfigPath(app: *const app_mod.App, buf: []u8) []const u8 {
+    var fixed = std.heap.FixedBufferAllocator.init(buf);
+    return std.fs.path.join(fixed.allocator(), &.{ app.stateRoot(), state_env.file_name }) catch state_env.file_name;
 }
 
 fn rejectionText(outcome: @import("../provider/control_plane.zig").ValidationOutcome) []const u8 {

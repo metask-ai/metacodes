@@ -57,6 +57,7 @@ test {
     _ = @import("component/launcher_hint_test.zig");
     _ = @import("component/state_env_test.zig");
     _ = @import("component/unbound_session_test.zig");
+    _ = @import("component/next_step_test.zig");
     _ = @import("component/task_error_test.zig");
     _ = @import("component/tool_loop_breaker_test.zig");
     _ = @import("component/user_context_inject_test.zig");

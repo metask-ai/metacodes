@@ -222,4 +222,8 @@ Local configuration (.env)
 When no provider has a key, the terminal UI's note (and the error of `-p`,
 `serve` and `--web`) names this install's file and the template beside it, and
 links this page. Keys that are only in your shell are listed by name there,
-never used: choose one of those providers in `/model` to use its key.
+never used: choose one of those providers in `/model` to use its key. When the
+provider rejects the key (HTTP 401 or 403), the failed request ends by naming
+the variable and this file: `DeepSeek rejected the API key. Check
+DEEPSEEK_API_KEY in ~/.local/opt/metacodes/state/.env or your shell, then
+restart.`
