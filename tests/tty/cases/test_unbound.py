@@ -111,6 +111,9 @@ def _assert_nothing_sent(case):
 def test_unbound_start_reminds_and_sends_nothing(bin_path):
     with _Case() as case:
         case.bin = bin_path
+        # 180 columns hold the whole `.env` path on one row. Windows' temp
+        # path is long enough to wrap at 80, and the wrapped part starts
+        # indented, so the path could not be read back across the rows.
         raw = case.run([
             READY,
             "type:hi",
@@ -119,8 +122,8 @@ def test_unbound_start_reminds_and_sends_nothing(bin_path):
             READY,
             "key:up",
             "strictsleep:0.5",
-        ])
-        a = TTYAssert(raw)
+        ], term_size=(40, 180))
+        a = TTYAssert(raw, rows=40, cols=180)
         a.assert_prose_contains(NOT_SET)
         # The reminder hangs off the prompt's echo, in words.
         echo = a.final.find_row("❯ hi")
