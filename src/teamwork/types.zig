@@ -102,6 +102,10 @@ pub const RunId = Id("run");
 /// One seat of a run; names `seats/<seat_id>/`.
 pub const SeatId = Id("seat");
 
+/// One reviewer finding in the run's `open_issues.json` ledger (#517). Stable
+/// across rounds and reviewer seats; never reused once assigned.
+pub const IssueId = Id("issue");
+
 /// The conventional seat id for the `ordinal`-th seat of `role`
 /// (`implementer-1`, `reviewer-2`, ...).
 pub fn seatIdFor(role: Role, ordinal: u32) SeatId {
@@ -496,6 +500,7 @@ test "ids: path-safe charset, distinct types, conventional seat ids" {
     const bad = [_][]const u8{ "", "..", "a/b", "a\\b", "A", "-x", "x.y", "c:", "x" ** 65 };
     for (bad) |text| try testing.expectError(error.InvalidId, SeatId.parse(text));
     try testing.expect(RunId != SeatId);
+    try testing.expect(IssueId != SeatId);
 }
 
 test "seat spec: harness-specific settings live in the harness union" {

@@ -1,7 +1,7 @@
 # metacodes Teamwork — 设计文档
 
-> 状态:阶段 0(共享类型、配置、运行目录、预算账本)已落地于 `src/teamwork/`;runtime、
-> 驱动、命令入口尚未实现,见 §8。
+> 状态:阶段 0(共享类型、配置、运行目录、预算账本)与内置 reviewer(评审结果契约、证据核验、
+> open-issues 台账,§6)已落地于 `src/teamwork/`;runtime、驱动、命令入口尚未实现,见 §9。
 > 来源:umbrella issue #514 及子 issue #515–#525。工作方式借鉴 Google Antigravity 的
 > `/teamwork` 预览功能(先批准再开跑、写的人不验、完成必须审计、状态全部落盘);本文与代码中的
 > 角色定义、契约和文字均为原创,未复制其任何提示词或文本。
@@ -83,6 +83,7 @@ Claude Code 子进程)在后续分支(#515 余下部分、#521)实现。
   "teamwork": {
     "enabled": true,
     "budget_usd": 5,
+    "check_command": "zig build test",
     "seats": {
       "implementer": { "harness": "claude_code", "command": "/opt/claude/bin/claude", "model": "m", "effort": "high" },
       "reviewer":    { "harness": "metacodes" },
@@ -100,6 +101,9 @@ Claude Code 子进程)在后续分支(#515 余下部分、#521)实现。
 
 **默认值**:没写的角色一律是 `metacodes` seat;外部 seat 的 `budget_enforcement` 默认 `cost`。
 
+`check_command`(可选,顶层)是宿主钉住的检查命令,`Config.Enabled.check_command: ?CheckCommand`。
+runtime 用它核验 reviewer 的批准(§6.2);各层逐字段覆盖,与其他标量相同。
+
 **校验规则**(每条一个 error,各有单元测试):
 
 | 规则 | error |
@@ -116,6 +120,8 @@ Claude Code 子进程)在后续分支(#515 余下部分、#521)实现。
 | 有 `wallclock_seconds` 却不是 `wallclock_only`(否则静默无效) | `WallclockWithoutWallclockOnly` |
 | `enabled: true` 没有 `budget_usd`(付费运行必须有美元上限) | `BudgetMissing` |
 | `budget_usd` 不是有限正数 | `InvalidBudget` |
+| `check_command` 为空白、超过 1024 字节或含 NUL | `InvalidCheckCommand`(空字符串在解析阶段即 `WrongType`) |
+| reviewer 是外部 harness 却没有 `check_command`(其工具调用不可观测,批准将永远无法核验) | `ExternalReviewerWithoutCheck` |
 
 即使 `enabled` 为假,所有 seat 也照样校验,坏配置在启动时就报错。`Diagnostic` 记录出错的
 角色和字段。类型层面同样排除了非法状态:`HarnessConfig = union(Harness) { metacodes, claude_code: ExternalHarness }`,
@@ -143,6 +149,8 @@ teamwork 段将在 `src/app/config.zig` 旁接入:读出 `teamwork` 成员后交
     handoff.md            seat 写
     progress.md           seat 写
     status.json           runtime 写:{seat_id, role, harness, status}
+    review.json           reviewer seat 写(§6.1)
+    open_issues.json      runtime 写给本 seat 的台账只读副本(§6.3)
 ```
 
 - `RunId` / `SeatId` 是互不相同的类型,字符集 `[a-z0-9][a-z0-9_-]*`(≤ 64 字节),直接当目录名,
@@ -184,23 +192,104 @@ seat 的参数里,不进入 Manager 的提示词。写入隔离(seat 只能写�
 - `remainingUsd()` 将作为 metacodes seat 子 agent 的 `cost_budget_usd`(`src/core/subagent.zig`)。
 - 账本只有 runtime 写,不是线程安全的,由 runtime 串行化。
 
-## 6. 公共面
+## 6. 内置 reviewer 与 open-issues 台账(#517)
 
-`src/lib.zig` 导出 `teamwork_types`、`teamwork_config`、`teamwork_run_dir`、`teamwork_ledger`
-(与 swarm 子系统相同的方式);`stub_driver.zig` 只由测试引用。单元测试同时进入
+`src/teamwork/reviewer.zig` 与 `src/teamwork/issues.zig`。reviewer seat 可以是任何 harness;
+评审是否成立由 runtime 按机制判定,不看 seat 自己怎么说。
+
+**内置、不可被遮蔽**:宪章 `reviewer.charter` 是编译期常量(原创文本),`charterSha256()` 供运行
+记录;工具为 `Read`、`Grep`、`Glob`、`Bash`(`reviewer.tools`)。teamwork seat 从不经过
+`AgentDef` 查找(同 [ISOLATED_VERIFIER_DESIGN.md](ISOLATED_VERIFIER_DESIGN.md) §2),所以项目里
+名为 `reviewer` 的 agent 只影响 `Agent` 工具,不影响 teamwork 评审;有单元测试固定这一点。
+
+### 6.1 评审结果契约
+
+reviewer seat 除 `handoff.md` 外,在自己的 seat 目录写 `review.json`:
+
+```json
+{
+  "verdict": "approve" | "request_changes",
+  "evidence": [{"command": "zig build test", "exit_code": 0,
+                "output_digest": "<64 位小写十六进制 sha256>", "output_excerpt": "..."}],
+  "issues": {
+    "opened": [{"id": "可选", "title": "...", "detail": "...", "file": "可选", "line": 12}],
+    "closed": ["issue-1"],
+    "still_open": ["issue-2"]
+  }
+}
+```
+
+`Review.parse` 严格解析(上限 256 KiB):未知键 `UnknownField`、缺键 `MissingField`、类型或范围
+错误 `WrongType`、`UnknownVerdict`、`InvalidDigest`、`InvalidIssueId`、`LineWithoutFile`、
+同一列表内重复 `DuplicateIssueId`、同一 id 既关闭又未解决 `ConflictingIssueStatus`。矛盾的评审在
+类型上不可表示:`Verdict.approve` 只有 `NonEmptyEvidence`(首项 + 其余)和 `closed`,没有
+`opened` / `still_open` 的位置,所以无证据的批准是 `ApproveWithoutEvidence`,开新问题或留问题的
+批准是 `ApproveWithOpenIssues`;`request_changes` 既不开也不留问题是 `RequestChangesWithoutIssues`。
+`opened[].id` 给出时即成为该问题的稳定 id,否则 runtime 分配 `issue-<n>`。
+
+### 6.2 证据核验
+
+`judge` / `judgeSeat` 给出 `ReviewOutcome = approved: Approval | changes_requested: Summary |
+review_rejected: RejectReason`;`review_rejected` 由编排器再开一轮。顺序:
+
+1. **零修改**:runtime 在 seat 运行前后各取一次工作区树 id(`workspaceTree`),不同即
+   `reviewer_edited_workspace`。
+2. **台账引用**:`closed` / `still_open` 必须是台账里仍打开的 id,`opened` 的 id 不得已存在,
+   否则 `issues_invalid`;批准后仍有打开的问题为 `open_issues_remain`(没提到的旧问题保持打开)。
+3. 仅对 approve 核验证据:
+   - **metacodes seat**:每条证据必须对应 seat 真正跑完的一次 `Bash`(命令逐字节相同,只忽略首尾
+     空白;退出码相同),否则 `evidence_not_observed{index}`。来源是 `BashCallLog`:它的 `sink()`
+     接到 seat 的 `SpawnOptions.tool_observer`,事件原样转发给 `next`(运行 journal)。观测走
+     `tool_exec` 的分派缝:`ToolObservationSink` 新增可选 `tapFn`,在 `dispatch_finished` 被接受后
+     收到本次分派的明文输入与结果(`DispatchTap`)。它不是 `Event`,journal 不设 `tapFn`,所以
+     journal 仍只记哈希。被自动转后台、结果里没有 `exit_code` 的 Bash 调用不记录。
+   - **任意 seat**:配置了 `check_command` 时,证据里必须有这条命令(否则 `check_not_in_evidence`),
+     其声称的退出码必须为 0(否则 `check_failing`);runtime 再用 `CheckRunner` 在工作区重跑**这一条**
+     命令——与 Bash 工具同一路径:启用沙箱时经 `sandbox/exec.zig` 包裹(`failIfUnavailable` 时拒跑,
+     绝不降级裸跑),经平台 shell 执行,cwd 为工作区——退出码不同即 `check_disagrees{claimed, actual}`,
+     跑不起来、超时或沙箱不可用即 `check_unavailable`。runtime 从不执行 seat 给出的命令。
+   - 不可观测的 seat 且没有 `check_command`:`unverifiable`(配置校验已拒绝外部 reviewer 缺
+     `check_command`,这里是 runtime 的兜底)。
+4. 通过后应用台账,`judgeSeat` 原子写回 `open_issues.json`;被拒的评审不改台账。
+
+**批准绑定最终 diff**:`Approval.tree` 记录评审看到的工作区树 id。宣布完成前 runtime 调
+`confirmApproval`,树变了(含新增未跟踪文件;`.gitignore` 忽略的构建产物不算)即 `stale`,批准作废。
+`workspaceTree` 用临时索引(先复制工作区的 index,放在运行目录里)执行 `git add -A` 与
+`git write-tree`,不动工作区的 index 和文件,唯一副作用是对象库里的 blob。
+
+### 6.3 open-issues 台账
+
+`open_issues.json` 只有 runtime 写,是一个数组,每个开过的问题一项:
+
+```json
+[{"id":"issue-1","state":"open","title":"...","detail":"...","file":"src/a.zig","line":12,
+  "round_opened":1,"round_closed":null}]
+```
+
+关闭的问题保留为墓碑,id 永不复用。`Ledger.check` 只校验不修改,`Ledger.apply` 全有或全无;
+`Ledger.load` / `save` 读写运行目录;`writeSeatCopy` 在 seat 目录放一份只读(0444)副本,packet 用
+`run_dir.seat_relative_open_issues_copy` 指向它;`renderOpen` 把仍打开的问题渲染成 packet 段落
+(按开出顺序,不含路径、run id、时间,是稳定的提示前缀)。`reviewer.renderPacket` 组装 reviewer
+packet:原始请求的相对路径、钉住的检查命令、未解决问题、`review.json` 格式。因为每轮都从磁盘台账
+渲染,换了 reviewer seat 或 harness,上一轮没解决的问题照样出现在下一轮。
+
+## 7. 公共面
+
+`src/lib.zig` 导出 `teamwork_types`、`teamwork_config`、`teamwork_run_dir`、`teamwork_ledger`、
+`teamwork_issues`、`teamwork_reviewer`(与 swarm 子系统相同的方式);`stub_driver.zig` 只由测试引用。单元测试同时进入
 `zig build test:units`(`src/main.zig` 的测试根)与 `zig build test:lib`。
 
-## 7. 不做
+## 8. 不做
 
 锦标赛树、数学证明管线、文档评审路线、大规模角色组合(见 #514"不做")。
 
-## 8. 实现状态
+## 9. 实现状态
 
 | Issue | 内容 | 状态 |
 |---|---|---|
 | #515 | runtime / seat 分层、角色配置、worker 契约 | 本分支:类型、`SeatDriver` 接口、handoff 解析、配置 parse/merge/validate、测试用 stub 驱动。待做:真实 metacodes 驱动、接入配置加载、L2(改 harness 即改子进程) |
 | #516 | 独立 verifier / 完成审计 | 待做 |
-| #517 | reviewer 角色与 open-issues 台账 | 本分支只建空 `open_issues.json`;其余待做 |
+| #517 | reviewer 角色与 open-issues 台账 | 已做(§6):宪章与工具表、`review.json` 解析、观测比对(`BashCallLog`)、钉住检查重跑(`check_command`)、零修改与过期批准(树 id)、台账与跨轮 packet。待做:metacodes 驱动接上 `BashCallLog` 与 `charters.forRole(.reviewer)`、编排器的再开一轮;Windows 上 `workspaceTree` 返回 `Unsupported`,批准无法确认 |
 | #518 | `/teamwork` 命令、面试与批准 | 待做(含配置接线,§3) |
 | #519 | 运行状态目录与写入隔离 | 本分支:目录布局、只写一次的原始请求、seat 状态、崩溃恢复。待做:权限层与沙箱的写入隔离、provider 字节不含运行路径的 L2 断言 |
 | #520 | 运行级预算 | 本分支:账本、上限、崩溃安全重载。待做:接 `cost_budget_usd`、停止所有 seat、外部 harness 花费采集 |

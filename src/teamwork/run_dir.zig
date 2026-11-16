@@ -10,6 +10,9 @@
 //!     handoff.md          written by the seat
 //!     progress.md         written by the seat
 //!     status.json         written by the runtime
+//!     review.json         written by a reviewer seat (reviewer.zig)
+//!     open_issues.json    the runtime's read-only copy of the ledger
+//!                         for this seat (issues.zig)
 //! ```
 //!
 //! Everything a run knows is on disk, so `recover` rebuilds the seat table
@@ -38,6 +41,9 @@ pub const seats_dir = "seats";
 pub const seat_relative_original_request = "../../" ++ original_request_file;
 /// The `open_issues.json` ledger, relative to the seat directory.
 pub const seat_relative_open_issues = "../../" ++ open_issues_file;
+/// The seat's read-only copy of the ledger, relative to the seat directory.
+/// Packets name this one: only the runtime writes the run-level ledger.
+pub const seat_relative_open_issues_copy = open_issues_file;
 
 pub const RunFile = enum {
     original_request,
@@ -60,6 +66,10 @@ pub const SeatFile = enum {
     handoff,
     progress,
     status,
+    /// A reviewer seat's structured verdict (reviewer.zig).
+    review,
+    /// The runtime's read-only copy of `open_issues.json` (issues.zig).
+    open_issues_copy,
 
     pub fn name(self: SeatFile) []const u8 {
         return switch (self) {
@@ -67,6 +77,8 @@ pub const SeatFile = enum {
             .handoff => "handoff.md",
             .progress => "progress.md",
             .status => "status.json",
+            .review => "review.json",
+            .open_issues_copy => open_issues_file,
         };
     }
 };
@@ -377,7 +389,8 @@ fn joinZ(buf: *PathBuf, parts: []const []const u8) error{PathTooLong}![:0]const 
     return buf[0..len :0];
 }
 
-fn writeAtomic(path_z: [:0]const u8, bytes: []const u8) Error!void {
+/// Replace `path_z` atomically (temporary file + rename).
+pub fn writeAtomic(path_z: [:0]const u8, bytes: []const u8) Error!void {
     swarm_team.atomicWrite(path_z, bytes) catch |err| return switch (err) {
         error.PathTooLong => error.PathTooLong,
         else => error.WriteFailed,
