@@ -113,7 +113,8 @@ pub const Ledger = struct {
         if (entry.cost.usd()) |amount| {
             if (!std.math.isFinite(amount) or amount < 0) return error.InvalidAmount;
         }
-        var line_buf: [512]u8 = undefined;
+        // `{d}` spells an f64 out in full: up to ~330 digits at the extremes.
+        var line_buf: [1024]u8 = undefined;
         const line = formatEntry(&line_buf, entry);
         const fd = pfs.open(self.path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600);
         if (fd < 0) return error.WriteFailed;
@@ -219,7 +220,7 @@ fn truncate(path_z: [:0]const u8, len: usize) LoadError!void {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const TestRoot = @import("run_dir.zig").TestRoot;
+const TestRoot = @import("run_dir.zig").test_support.TestRoot;
 
 fn seat(text: []const u8) types.SeatId {
     return types.SeatId.parse(text) catch unreachable;

@@ -77,7 +77,7 @@ pub const StubDriver = struct {
 const testing = std.testing;
 
 const Fixture = struct {
-    root: run_dir.TestRoot,
+    root: run_dir.test_support.TestRoot,
     run: run_dir.RunDir,
     seat: types.SeatId,
     packet: run_dir.PathBuf = undefined,
@@ -86,7 +86,7 @@ const Fixture = struct {
     handoff_len: usize = 0,
 
     fn init(self: *Fixture, tag: []const u8) !void {
-        self.root = run_dir.TestRoot.init(tag);
+        self.root = run_dir.test_support.TestRoot.init(tag);
         errdefer self.root.deinit();
         self.run = try run_dir.RunDir.create(testing.allocator, self.root.slice(), try types.RunId.parse("r1"));
         self.seat = types.seatIdFor(.implementer, 1);

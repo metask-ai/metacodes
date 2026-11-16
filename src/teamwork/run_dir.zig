@@ -404,25 +404,28 @@ fn writeFresh(path_z: [:0]const u8, bytes: []const u8) Error!void {
 
 const testing = std.testing;
 
-/// A unique fixture state root, removed by `deinit`.
-pub const TestRoot = struct {
-    buf: PathBuf,
-    len: usize,
+/// Fixtures for teamwork tests.
+pub const test_support = struct {
+    /// A unique fixture state root under the test temp root, removed by `deinit`.
+    pub const TestRoot = struct {
+        buf: PathBuf,
+        len: usize,
 
-    pub fn init(tag: []const u8) TestRoot {
-        var self: TestRoot = .{ .buf = undefined, .len = 0 };
-        self.len = util_fs.testing.uniqueDir(&self.buf, tag).len;
-        util_fs.mkdirParents(self.slice()) catch {};
-        return self;
-    }
+        pub fn init(tag: []const u8) TestRoot {
+            var self: TestRoot = .{ .buf = undefined, .len = 0 };
+            self.len = util_fs.testing.uniqueDir(&self.buf, tag).len;
+            util_fs.mkdirParents(self.slice()) catch {};
+            return self;
+        }
 
-    pub fn slice(self: *const TestRoot) []const u8 {
-        return self.buf[0..self.len];
-    }
+        pub fn slice(self: *const TestRoot) []const u8 {
+            return self.buf[0..self.len];
+        }
 
-    pub fn deinit(self: *TestRoot) void {
-        util_fs.testing.rmrfBestEffort(self.slice());
-    }
+        pub fn deinit(self: *TestRoot) void {
+            util_fs.testing.rmrfBestEffort(self.slice());
+        }
+    };
 };
 
 fn testRecord(id_text: []const u8, role: types.Role, harness: types.Harness, status: types.SeatStatus) SeatRecord {
@@ -430,7 +433,7 @@ fn testRecord(id_text: []const u8, role: types.Role, harness: types.Harness, sta
 }
 
 test "run dir: create lays out the run and refuses to adopt an existing one" {
-    var root = TestRoot.init("cc-zig-teamwork-create");
+    var root = test_support.TestRoot.init("cc-zig-teamwork-create");
     defer root.deinit();
     const run_id = try RunId.parse("r1");
     var run = try RunDir.create(testing.allocator, root.slice(), run_id);
@@ -449,7 +452,7 @@ test "run dir: create lays out the run and refuses to adopt an existing one" {
 }
 
 test "run dir: ORIGINAL_REQUEST.md is write-once" {
-    var root = TestRoot.init("cc-zig-teamwork-request");
+    var root = test_support.TestRoot.init("cc-zig-teamwork-request");
     defer root.deinit();
     var run = try RunDir.create(testing.allocator, root.slice(), try RunId.parse("r1"));
     defer run.deinit(testing.allocator);
@@ -466,7 +469,7 @@ test "run dir: ORIGINAL_REQUEST.md is write-once" {
 }
 
 test "run dir: seats record status, packets and handoffs" {
-    var root = TestRoot.init("cc-zig-teamwork-seat");
+    var root = test_support.TestRoot.init("cc-zig-teamwork-seat");
     defer root.deinit();
     var run = try RunDir.create(testing.allocator, root.slice(), try RunId.parse("r1"));
     defer run.deinit(testing.allocator);
@@ -494,7 +497,7 @@ test "run dir: seats record status, packets and handoffs" {
 }
 
 test "run dir: recover rebuilds the seat table after a simulated crash" {
-    var root = TestRoot.init("cc-zig-teamwork-recover");
+    var root = test_support.TestRoot.init("cc-zig-teamwork-recover");
     defer root.deinit();
     const run_id = try RunId.parse("r1");
     {
