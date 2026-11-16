@@ -5,6 +5,11 @@
 //!   ORIGINAL_REQUEST.md   write-once; the completion audit's baseline
 //!   budget.jsonl          append-only run ledger (ledger.zig)
 //!   open_issues.json      reviewer findings (#517)
+//!   run.json              the runtime's own state (runtime.zig)
+//!   worktree/             the implementer's git worktree (merge_back.zig)
+//!   audits/audit-<n>.md   completion audit reports (runtime.zig)
+//!   merge.patch           the change merge-back applied or could not apply
+//!   merge-conflicts.txt   paths both the user and the implementer changed
 //!   seats/<seat_id>/
 //!     packet.md           written by the runtime
 //!     handoff.md          written by the seat
@@ -38,6 +43,11 @@ pub const original_request_file = "ORIGINAL_REQUEST.md";
 pub const budget_file = "budget.jsonl";
 pub const open_issues_file = "open_issues.json";
 pub const seats_dir = "seats";
+pub const state_file = "run.json";
+pub const worktree_dir = "worktree";
+pub const audits_dir = "audits";
+pub const merge_patch_file = "merge.patch";
+pub const merge_conflicts_file = "merge-conflicts.txt";
 
 /// `ORIGINAL_REQUEST.md` as a packet names it, relative to the seat directory.
 pub const seat_relative_original_request = "../../" ++ original_request_file;
@@ -46,12 +56,20 @@ pub const seat_relative_open_issues = "../../" ++ open_issues_file;
 /// The seat's read-only copy of the ledger, relative to the seat directory.
 /// Packets name this one: only the runtime writes the run-level ledger.
 pub const seat_relative_open_issues_copy = open_issues_file;
+/// The first completion audit's report, relative to the seat directory: the
+/// one a repair round's packets name (a second failed audit ends the run).
+pub const seat_relative_first_audit_report = "../../" ++ audits_dir ++ "/audit-1.md";
 
 pub const RunFile = enum {
     original_request,
     budget,
     open_issues,
     seats,
+    state,
+    worktree,
+    audits,
+    merge_patch,
+    merge_conflicts,
 
     pub fn name(self: RunFile) []const u8 {
         return switch (self) {
@@ -59,6 +77,11 @@ pub const RunFile = enum {
             .budget => budget_file,
             .open_issues => open_issues_file,
             .seats => seats_dir,
+            .state => state_file,
+            .worktree => worktree_dir,
+            .audits => audits_dir,
+            .merge_patch => merge_patch_file,
+            .merge_conflicts => merge_conflicts_file,
         };
     }
 };

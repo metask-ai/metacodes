@@ -101,6 +101,10 @@ pub const teamwork_issues = @import("teamwork/issues.zig"); // open_issues.json 
 pub const teamwork_reviewer = @import("teamwork/reviewer.zig"); // built-in reviewer: charter, review.json, verification (#517)
 pub const teamwork_charters = @import("teamwork/charters.zig"); // role charters (#515)
 pub const teamwork_drivers = @import("teamwork/drivers/factory.zig"); // seat drivers by harness (#515, #521)
+pub const teamwork_audit = @import("teamwork/audit.zig"); // completion audit seam (#516)
+pub const teamwork_merge_back = @import("teamwork/merge_back.zig"); // implementer worktree and merge-back (#523)
+pub const teamwork_runtime = @import("teamwork/runtime.zig"); // run state machine and operations API (#514, #520, #523)
+pub const teamwork_swe_loop = @import("teamwork/swe_loop.zig"); // built-in deterministic manager (#514)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
@@ -271,4 +275,5 @@ test {
     _ = &@import("teamwork/drivers/metacodes.zig");
     _ = &@import("teamwork/drivers/claude_code.zig");
     _ = &@import("teamwork/drivers/drivers_test.zig");
+    _ = &@import("teamwork/runtime_test.zig");
 }

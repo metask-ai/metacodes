@@ -1,0 +1,294 @@
+//! The implementer's worktree and merge-back (#523).
+//!
+//! At run start the runtime snapshots the user's workspace as it is on disk
+//! (tracked changes and untracked, non-ignored files included) into a commit
+//! object that no ref names, and adds a detached git worktree at that commit
+//! inside the run directory. The implementer therefore starts from exactly
+//! what the user sees, uncommitted work included, and the user's index,
+//! refs and files are never touched: the only side effects on the user's
+//! repository are objects in its object store and the worktree's entry
+//! under `.git/worktrees/`.
+//!
+//! (`agents/isolation.zig` bases its worktree on `HEAD` and creates a
+//! branch, which would drop the user's uncommitted work and leave a ref
+//! behind; this module uses the same git primitives — `git worktree add` and
+//! `teammate_process.removeWorktreeStrict` — with the snapshot commit and a
+//! detached `HEAD` instead.)
+//!
+//! Merge-back, only after a passing completion audit, applies the diff from
+//! the snapshot commit to the approved tree onto the user's workspace with
+//! `git apply` (no index, no commit). If the user changed, during the run,
+//! any path the implementer changed (or a parent or child of one), nothing
+//! is applied: the conflicting paths go to `merge-conflicts.txt`, the patch
+//! to `merge.patch`, the worktree is kept, and both sides stay as they are.
+//! `git apply` is all-or-nothing, so a patch that does not apply leaves the
+//! workspace unchanged too.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const pfs = @import("platform").fs;
+const common = @import("../tools/common.zig");
+const teammate_process = @import("../swarm/teammate_process.zig");
+const log = @import("../util/log.zig");
+const run_dir = @import("run_dir.zig");
+const reviewer = @import("reviewer.zig");
+const types = @import("types.zig");
+
+const Abort = ?*const types.AbortSignal;
+
+pub const TreeId = reviewer.TreeId;
+/// A git object id (commit or tree): 40 or 64 lowercase hex digits.
+pub const ObjectId = reviewer.TreeId;
+
+pub const Error = error{
+    /// The workspace is not inside a git work tree.
+    NotARepository,
+    GitFailed,
+    /// Not implemented on this platform (Windows: `reviewer.workspaceTree`).
+    Unsupported,
+    PathTooLong,
+    Aborted,
+    OutOfMemory,
+};
+
+const git_timeout_ms: u64 = 120_000;
+const max_git_output: usize = 64 * 1024 * 1024;
+
+const GitOut = struct {
+    exit_code: i32,
+    stdout: []u8,
+    stderr: []u8,
+
+    fn deinit(self: *GitOut, gpa: std.mem.Allocator) void {
+        gpa.free(self.stdout);
+        gpa.free(self.stderr);
+    }
+};
+
+fn git(gpa: std.mem.Allocator, cwd: []const u8, args: []const []const u8, abort: Abort) Error!GitOut {
+    var owned: std.ArrayList([:0]u8) = .empty;
+    defer {
+        for (owned.items) |arg| gpa.free(arg);
+        owned.deinit(gpa);
+    }
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, "/usr/bin/env");
+    try argv.append(gpa, "git");
+    for (args) |arg| {
+        const z = try gpa.dupeZ(u8, arg);
+        try owned.append(gpa, z);
+        try argv.append(gpa, z.ptr);
+    }
+    try argv.append(gpa, null);
+    const out = common.spawnCaptureWithStderrTimed(argv.items, gpa, abort, git_timeout_ms, null, max_git_output, cwd) catch |err| switch (err) {
+        error.Aborted => return error.Aborted,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.GitFailed,
+    };
+    return .{ .exit_code = out.exit_code, .stdout = out.stdout, .stderr = out.stderr };
+}
+
+/// stdout of a git command that must succeed, trimmed; owned by `gpa`.
+fn gitText(gpa: std.mem.Allocator, cwd: []const u8, args: []const []const u8, abort: Abort) Error![]u8 {
+    var out = try git(gpa, cwd, args, abort);
+    defer out.deinit(gpa);
+    if (out.exit_code != 0) {
+        log.warn("teamwork", "git {s} failed in {s}: {s}", .{ args[0], cwd, std.mem.trimEnd(u8, out.stderr, "\r\n") });
+        return error.GitFailed;
+    }
+    return gpa.dupe(u8, std.mem.trimEnd(u8, out.stdout, "\r\n "));
+}
+
+fn parseObject(text: []const u8) Error!ObjectId {
+    return ObjectId.parse(text) catch error.GitFailed;
+}
+
+/// The top directory of the git work tree holding `workspace`, owned by
+/// `gpa`. Every merge-back path is relative to it.
+pub fn toplevel(gpa: std.mem.Allocator, workspace: []const u8, abort: Abort) Error![]u8 {
+    if (builtin.os.tag == .windows) return error.Unsupported;
+    var out = try git(gpa, workspace, &.{ "rev-parse", "--show-toplevel" }, abort);
+    defer out.deinit(gpa);
+    if (out.exit_code != 0) return error.NotARepository;
+    return gpa.dupe(u8, std.mem.trimEnd(u8, out.stdout, "\r\n"));
+}
+
+pub const Snapshot = struct {
+    /// A commit of `tree` (parent: `HEAD`, if the repository has one) that
+    /// no ref names: the implementer worktree's base.
+    commit: ObjectId,
+    /// The user's workspace as it was on disk at run start.
+    tree: TreeId,
+};
+
+/// Snapshot the workspace at `repo` without touching its index, refs or
+/// files. `scratch_dir` (outside the workspace) holds a throwaway index.
+pub fn snapshot(gpa: std.mem.Allocator, repo: []const u8, scratch_dir: []const u8, abort: Abort) Error!Snapshot {
+    const tree = reviewer.workspaceTree(gpa, repo, scratch_dir, abort) catch |err| return switch (err) {
+        error.NotARepository => error.NotARepository,
+        error.Unsupported => error.Unsupported,
+        error.PathTooLong => error.PathTooLong,
+        error.Aborted => error.Aborted,
+        error.OutOfMemory => error.OutOfMemory,
+        error.GitFailed => error.GitFailed,
+    };
+    var head_out = try git(gpa, repo, &.{ "rev-parse", "--verify", "-q", "HEAD^{commit}" }, abort);
+    defer head_out.deinit(gpa);
+    const head: ?[]const u8 = if (head_out.exit_code == 0) std.mem.trimEnd(u8, head_out.stdout, "\r\n") else null;
+    // A fixed identity: the user's may be unset, and the commit is never
+    // published (no ref names it).
+    var args = [_][]const u8{ "-c", "user.name=metacodes teamwork", "-c", "user.email=teamwork@metacodes.invalid", "-c", "commit.gpgSign=false", "commit-tree", tree.slice(), "-m", "metacodes teamwork base", "-p", "" };
+    const used: usize = if (head) |parent| blk: {
+        args[args.len - 1] = parent;
+        break :blk args.len;
+    } else args.len - 2;
+    const commit_text = try gitText(gpa, repo, args[0..used], abort);
+    defer gpa.free(commit_text);
+    return .{ .commit = try parseObject(commit_text), .tree = tree };
+}
+
+/// Add a detached worktree of `repo` at `path`, checked out at `commit`.
+pub fn addWorktree(gpa: std.mem.Allocator, repo: []const u8, path: []const u8, commit: ObjectId, abort: Abort) Error!void {
+    const out = try gitText(gpa, repo, &.{ "worktree", "add", "--detach", "--quiet", path, commit.slice() }, abort);
+    gpa.free(out);
+}
+
+/// Remove the worktree at `path`; true when it is confirmed gone.
+pub fn removeWorktree(gpa: std.mem.Allocator, repo: []const u8, path: []const u8) bool {
+    teammate_process.removeWorktreeStrict(gpa, path, repo, null) catch |err| {
+        log.warn("teamwork", "worktree {s} kept: removal failed: {s}", .{ path, @errorName(err) });
+        return false;
+    };
+    return true;
+}
+
+/// Paths that differ between two tree-ish objects (repository-relative,
+/// renames as delete + add), owned by `gpa`.
+pub fn changedPaths(gpa: std.mem.Allocator, repo: []const u8, from: ObjectId, to: ObjectId, abort: Abort) Error!PathList {
+    var list: PathList = .{};
+    errdefer list.deinit(gpa);
+    if (from.eql(to)) return list;
+    // The flags keep the user's git configuration out of machine-read output.
+    var out = try git(gpa, repo, &.{ "diff", "--name-only", "-z", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", from.slice(), to.slice() }, abort);
+    defer out.deinit(gpa);
+    if (out.exit_code != 0) return error.GitFailed;
+    var it = std.mem.splitScalar(u8, out.stdout, 0);
+    while (it.next()) |name| {
+        if (name.len == 0) continue;
+        try list.items.append(gpa, try gpa.dupe(u8, name));
+    }
+    return list;
+}
+
+pub const PathList = struct {
+    items: std.ArrayList([]u8) = .empty,
+
+    pub fn deinit(self: *PathList, gpa: std.mem.Allocator) void {
+        for (self.items.items) |p| gpa.free(p);
+        self.items.deinit(gpa);
+        self.* = undefined;
+    }
+};
+
+/// The binary patch from `from` to `to`, owned by `gpa`.
+pub fn diffPatch(gpa: std.mem.Allocator, repo: []const u8, from: ObjectId, to: ObjectId, abort: Abort) Error![]u8 {
+    const out = try git(gpa, repo, &.{ "diff", "--binary", "--full-index", "--src-prefix=a/", "--dst-prefix=b/", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", from.slice(), to.slice() }, abort);
+    defer gpa.free(out.stderr);
+    if (out.exit_code != 0) {
+        gpa.free(out.stdout);
+        return error.GitFailed;
+    }
+    return out.stdout;
+}
+
+/// Two repository-relative paths collide when they are equal or one is a
+/// directory prefix of the other (a file replaced by a directory).
+fn collide(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const short, const long = if (a.len < b.len) .{ a, b } else .{ b, a };
+    return std.mem.startsWith(u8, long, short) and long[short.len] == '/';
+}
+
+pub const Input = struct {
+    /// The user's work tree top (`toplevel`).
+    repo: []const u8,
+    /// The implementer worktree's base and the user's tree at run start.
+    base: Snapshot,
+    /// The tree the reviewer approved and the audit passed.
+    approved: TreeId,
+    /// A directory outside the workspace for a throwaway index.
+    scratch_dir: []const u8,
+    /// Where the patch and the conflict list are written (run directory).
+    patch_path: [:0]const u8,
+    conflicts_path: [:0]const u8,
+};
+
+pub const Result = union(enum) {
+    /// The workspace now carries the implementer's change, uncommitted.
+    applied: struct { files: u32 },
+    /// The user changed this many of the implementer's paths during the
+    /// run; nothing was applied (see `merge-conflicts.txt`).
+    conflict: u32,
+    /// `git apply` refused the patch; nothing was applied.
+    apply_failed,
+};
+
+/// Apply the approved change to the user's workspace, or report why not.
+/// The workspace is either fully updated or left byte-for-byte unchanged.
+pub fn mergeBack(gpa: std.mem.Allocator, in: Input) Error!Result {
+    var ours = try changedPaths(gpa, in.repo, in.base.commit, in.approved, null);
+    defer ours.deinit(gpa);
+    const patch = try diffPatch(gpa, in.repo, in.base.commit, in.approved, null);
+    defer gpa.free(patch);
+    run_dir.writeAtomic(in.patch_path, patch) catch return error.GitFailed;
+
+    const user_now = reviewer.workspaceTree(gpa, in.repo, in.scratch_dir, null) catch |err| return switch (err) {
+        error.NotARepository => error.NotARepository,
+        error.Unsupported => error.Unsupported,
+        error.PathTooLong => error.PathTooLong,
+        error.Aborted => error.Aborted,
+        error.OutOfMemory => error.OutOfMemory,
+        error.GitFailed => error.GitFailed,
+    };
+    var theirs = try changedPaths(gpa, in.repo, in.base.tree, user_now, null);
+    defer theirs.deinit(gpa);
+
+    var report: std.ArrayList(u8) = .empty;
+    defer report.deinit(gpa);
+    var conflicts: u32 = 0;
+    for (ours.items.items) |path| {
+        for (theirs.items.items) |user_path| {
+            if (!collide(path, user_path)) continue;
+            conflicts += 1;
+            try report.print(gpa, "{s}\n", .{path});
+            break;
+        }
+    }
+    if (conflicts != 0) {
+        run_dir.writeAtomic(in.conflicts_path, report.items) catch return error.GitFailed;
+        return .{ .conflict = conflicts };
+    }
+    if (ours.items.items.len == 0) return .{ .applied = .{ .files = 0 } };
+
+    var out = try git(gpa, in.repo, &.{ "apply", "--binary", "--whitespace=nowarn", in.patch_path }, null);
+    defer out.deinit(gpa);
+    if (out.exit_code != 0) {
+        run_dir.writeAtomic(in.conflicts_path, out.stderr) catch {};
+        log.warn("teamwork", "merge-back: git apply refused the patch: {s}", .{std.mem.trimEnd(u8, out.stderr, "\r\n")});
+        return .apply_failed;
+    }
+    return .{ .applied = .{ .files = @intCast(ours.items.items.len) } };
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "merge-back: colliding paths are equal or nested" {
+    try testing.expect(collide("src/a.zig", "src/a.zig"));
+    try testing.expect(collide("src", "src/a.zig"));
+    try testing.expect(collide("src/a.zig", "src"));
+    try testing.expect(!collide("src/a.zig", "src/a.zig2"));
+    try testing.expect(!collide("src/ab", "src/a"));
+}
