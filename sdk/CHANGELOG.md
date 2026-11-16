@@ -37,6 +37,12 @@ empty `### Migration`.
   embedded Session's Runs the daemon's project rule gate and abandoned-Run
   policy (#445); `SessionConfigV1` has no such field, and an ABI Session's
   Runs open the journal as before.
+- No change a Host can see. A Zig `SessionHost` member opened through
+  `InheritLead` now decides each tool call with its lead's current
+  permission rules and directories (#445,
+  `AgentSession.inheritPermissions`); ABI revision 28 exposes neither
+  `SessionHost` nor that call, and an ABI Session's
+  `update_permission_rules` never meets `PermissionsInherited`.
 - No change a Host can see. The Zig `SessionHost.setModelCatalog` replaces
   the catalog `Options.models` resolves model names against while the Host
   runs (#445); ABI revision 28 exposes neither `SessionHost` nor

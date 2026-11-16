@@ -88,6 +88,14 @@
 //! fails becomes the lead's next Run, so its model learns of it; a failure
 //! while fulfilling that report Run's own spawns is only logged.
 //! `InheritLead` is the factory that configures each member like its lead.
+//! A factory that declares `TeammatePermissions.lead` (as `InheritLead`
+//! does) opens each member under its lead's permissions, live: a permission
+//! rule or additional directory the lead gains after the member opened
+//! applies to the member's next tool call, as on the daemon
+//! (`AgentSession.inheritPermissions`; the locking rule is in
+//! permission/lent.zig). The lead's AgentSession outlives its members': the
+//! lead closes them before it destroys its own, and a member the Host closes
+//! meanwhile is waited for.
 //!
 //! Lifetimes: `open` and `acquire` return a counted reference that `release`
 //! gives back; no pointer escapes without one. `close` takes the Session out
@@ -553,6 +561,28 @@ pub const TeammateSpawn = struct {
 pub const TeammateFactory = struct {
     ctx: *anyopaque,
     configure: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, spawn: TeammateSpawn) anyerror!SessionConfig,
+    /// Whose permission rules, additional directories and Session memory a
+    /// member decides its tool calls with (#445).
+    permissions: TeammatePermissions = .own,
+};
+
+/// `TeammateFactory.permissions` (#445).
+pub const TeammatePermissions = enum {
+    /// The member's own, from the configuration `configure` returned; what
+    /// the lead gains later never reaches it.
+    own,
+    /// Its lead's, read at each tool call (`AgentSession.inheritPermissions`):
+    /// a rule the lead gains through `update_permission_rules` or an "allow
+    /// always" answer, and a directory it gains through
+    /// `set_additional_directories`, apply to the member's next tool call,
+    /// as the bundled daemon's in-process teammates borrow their lead's
+    /// permission context. Both remember "allow always"/"deny" answers in
+    /// the lead's Session memory. The member's own `update_permission_rules`
+    /// and `set_additional_directories` are refused
+    /// (`command_result{ok:false, error_name:"PermissionsInherited"}`). Its
+    /// permission mode, tools, workspace root and sandbox stay what
+    /// `configure` returned.
+    lead,
 };
 
 /// The `TeammateFactory` that configures each member like its lead, as the
@@ -561,14 +591,18 @@ pub const TeammateFactory = struct {
 /// configuration the Host opens its leads with: provider, credentials,
 /// workspace, tools, permission rules) with the lead's current model and
 /// permission mode, and the spawn's `effort` or else the lead's reasoning
-/// effort. `agent_type` is not interpreted.
+/// effort. `agent_type` is not interpreted. The member decides its tool
+/// calls with its lead's permission rules, additional directories and
+/// Session memory, live (`TeammatePermissions.lead`), so `base`'s
+/// `permission_rules` and `workspace.additional_dirs` are not what it
+/// decides with.
 pub const InheritLead = struct {
     /// Borrowed; outlives the SessionHost. Its `team` and UI requesters are
     /// not used.
     base: SessionConfig,
 
     pub fn factory(self: *InheritLead) TeammateFactory {
-        return .{ .ctx = self, .configure = configure };
+        return .{ .ctx = self, .configure = configure, .permissions = .lead };
     }
 
     /// `base` as the member of the lead `spawn` describes. Borrows from
@@ -732,6 +766,15 @@ pub const SessionHost = struct {
 
     /// Returns the Session holding one reference for the caller.
     pub fn open(self: *SessionHost, spec: OpenSpec) !*HostedSession {
+        return self.openSession(spec, null);
+    }
+
+    /// `open`, with the kernel Session deciding with `lender`'s permissions
+    /// (`AgentSession.inheritPermissions`) from before its driver starts, so
+    /// no Run of it ever decides with its own. `lender` must outlive it: a
+    /// lead's driver opens its members, and the lead closes them before it
+    /// destroys its own Session.
+    fn openSession(self: *SessionHost, spec: OpenSpec, lender: ?*AgentSession) !*HostedSession {
         // A suspended request lives in the Session's directory.
         if (self.options.ui_request_wait == .@"suspend" and !self.options.transcripts) return error.SuspendRequiresTranscripts;
         // `.re_announce` with no period would announce without ever waiting.
@@ -794,6 +837,7 @@ pub const SessionHost = struct {
         else
             try self.runtime.createSession(config);
         errdefer session.destroy() catch {};
+        if (lender) |lead| try session.inheritPermissions(lead);
         hosted.session = session;
         // Before the driver exists, so every mode change it makes is seen.
         session.permission_ctx.event_sink = hosted.configSink();
@@ -1600,7 +1644,11 @@ pub const HostedSession = struct {
         try self.teammates.ensureUnusedCapacity(self.gpa, 1);
         const name = try self.gpa.dupe(u8, request.name);
         errdefer self.gpa.free(name);
-        const member = try self.host.open(.{ .config = config });
+        const lender: ?*AgentSession = switch (factory.permissions) {
+            .own => null,
+            .lead => self.session,
+        };
+        const member = try self.host.openSession(.{ .config = config }, lender);
         defer member.release();
         self.teammates.appendAssumeCapacity(.{ .name = name, .id = member.id, .lease = lease });
         try member.submit(.{ .text = request.prompt });
@@ -1911,6 +1959,8 @@ pub const HostedSession = struct {
             } else |err| err,
             .set_additional_directories => |dirs| self.applyDirectories(dirs),
             .set_prompt_profile => |profile| if (self.session.setPromptProfile(profile)) |_| null else |err| err,
+            // A member under its lead's permissions refuses both
+            // (`PermissionsInherited`, #445).
             .update_permission_rules => |rules| if (self.session.updatePermissionRules(rules)) |_| null else |err| err,
             .compact => blk: {
                 self.last_compact_id += 1;

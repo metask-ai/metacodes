@@ -842,7 +842,7 @@ in one of five ways:
 
 | Class | Settings | How it changes |
 |---|---|---|
-| Idle-mutable | model, permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value. |
+| Idle-mutable | model, permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value; a Session that inherits this one's permissions (`inheritPermissions`, #445) decides its next tool call with the new rules and directories, and refuses its own `updatePermissionRules`/`setAdditionalDirectories` (`error.PermissionsInherited`). |
 | Live-replaceable | API key (the provider credential) | `updateCredential`, idle or during a Run, from any thread or from the Session's own callbacks; never `error.SessionBusy`, and refused only for a poisoned Session or an invalid candidate. Create and restore apply the same rule to `SessionConfig.api_key` (1 to 16 KiB of printable ASCII; `error.InvalidCredentialByte`, `error.EmptyCredential`, `error.CredentialTooLong`). The candidate is validated and copied before anything changes; a refusal keeps the previous credential. A request reads the credential when it is sent (once it holds its connection slot), so every request sent after the call returns uses the new credential, retries, tool providers built earlier and requests still waiting for a connection included; one already sent keeps the old one. See [Credential updates](AGENTCORE_BINARY_ABI.md#credential-updates). |
 | Runtime generation | built-in tool set, static and process plugins, provider dialects | `RuntimeHost.replace`. Sessions created afterwards use the new generation; existing Sessions stay on theirs. To move a Session, persist it and restore it with `createRestoredSession` on the new generation. |
 | Fixed at create | provider kind, OpenAI protocol, auth scheme, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
@@ -1322,7 +1322,27 @@ leaving every Host to rebuild them:
   borrowed, outlives the SessionHost) with the lead's current model and
   permission mode, and the spawn's `effort` or else the lead's reasoning
   effort. `InheritLead.derive(base, spawn)` is the same mapping as a pure
-  function. `agent_type` is not interpreted.
+  function. `agent_type` is not interpreted. Its factory declares
+  `TeammatePermissions.lead`, below.
+- `TeammateFactory.permissions` (`TeammatePermissions`, default `.own`) says
+  whose permission state a member decides its tool calls with. `.own`: what
+  `configure` returned, fixed when the member opened. `.lead`: its lead's
+  imported rules, additional directories and Session memory, read at each
+  tool call (`AgentSession.inheritPermissions`), as the bundled daemon's
+  in-process teammates borrow their lead's permission context: a rule the
+  lead gains through `update_permission_rules` or an "allow always"/"deny"
+  answer, and a directory it gains through `set_additional_directories`,
+  decide the member's next tool call, also inside a Run already going. Both
+  Sessions remember answers in the lead's memory. The member's own
+  `update_permission_rules` and `set_additional_directories` are refused
+  (`command_result{ok:false, error_name:"PermissionsInherited"}`); its
+  permission mode, tools, workspace root and the sandbox its shell runs in
+  stay what `configure` returned. Locking: each member decision holds the
+  lead's `lent_permissions` lock for the whole decision (never across a
+  prompt); the lead replaces its rules or directories under that lock and
+  frees the old ones after it. The lead's AgentSession outlives its
+  members': the lead closes them before destroying its own, and its
+  `destroy` waits for any member still being destroyed (permission/lent.zig).
 
 Options: `max_queued`, `max_turns`, `teammates`, `transcripts`,
 `ui_request_timeout_ms`, `ui_request_expiry`, `ui_request_wait`,

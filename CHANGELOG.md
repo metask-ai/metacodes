@@ -143,6 +143,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A hosted lead's members follow the permission rules and directories it
+  gains, as the daemon's teammates do** (part of #445). Under
+  `session_host.InheritLead` a member decided its tool calls with what its
+  configuration held when it opened, so a rule the lead gained later
+  (`update_permission_rules`, an "allow always" or "deny" answer) or a
+  directory it added (`set_additional_directories`) never reached it. The
+  new `TeammateFactory.permissions = .lead`, which `InheritLead` declares,
+  opens each member through the new `AgentSession.inheritPermissions`: it
+  decides every tool call with its lead's imported rules, additional
+  directories and Session memory as they are at that call, from its next
+  tool call on, and refuses its own `update_permission_rules` and
+  `set_additional_directories` (`PermissionsInherited`). Each decision holds
+  the lead's lock (`permission/lent.zig`); the lead frees replaced rules
+  only after it, and its AgentSession outlives its members'.
 - **A `SessionHost`'s model catalog can be refreshed while it runs, as the
   daemon's is** (part of #445). The daemon's catalog is its cached
   `/v1/models` answer, replaced when the background refresh lands;
