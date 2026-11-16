@@ -239,7 +239,10 @@ def run_command(
         + f" <{shlex.quote(instruction_path)}"
         + f" >{logs}/{OUTPUT_FILENAME} 2>{logs}/{STDERR_FILENAME}",
         "status=$?",
-        'mapfile -t transcripts < <(find "$state" -type f -name transcript.jsonl 2>/dev/null)',
+        # A read loop, not `mapfile`: that builtin is bash 4, and macOS ships 3.2.
+        "transcripts=()",
+        'while IFS= read -r found; do transcripts+=("$found"); done'
+        ' < <(find "$state" -type f -name transcript.jsonl 2>/dev/null)',
         'if [ "${#transcripts[@]}" -eq 1 ]; then',
         f'  cp -- "${{transcripts[0]}}" {logs}/{TRANSCRIPT_FILENAME}',
         "else",
