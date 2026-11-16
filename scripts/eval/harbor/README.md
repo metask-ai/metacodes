@@ -91,6 +91,43 @@ Agent options (`--ak name=value`):
 | `max_tokens` | the model's default | `--max-tokens` |
 | `disallowed_tools` | `Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage,EnterPlanMode,ExitPlanMode` | `--disallowed-tools`; an empty value enables every tool |
 
+### A third-party gateway
+
+A provider metacodes has no profile for (an OpenAI-compatible relay, a
+self-hosted server) is a `custom_providers` entry
+([doc/PROVIDER_OFFER_ARCHITECTURE.md](../../../doc/PROVIDER_OFFER_ARCHITECTURE.md#user-defined-providers)).
+The config names the variable the key is read from, never the key:
+
+```json
+{
+  "schema_version": 1,
+  "custom_providers": {
+    "gateway": {
+      "display_name": "My gateway",
+      "auth": {"kind": "bearer"},
+      "env_aliases": [{"name": "GATEWAY_API_KEY", "kind": "api_key", "canonical": true}],
+      "channels": [{"id": "chat", "base_url": "https://gateway.example.com/v1", "protocol": "openai_chat"}],
+      "models": [{
+        "request_model_id": "GLM5.3-Flash",
+        "dialect": "glm",
+        "limits": {"context_window": 200000, "max_output_tokens": 32768}
+      }]
+    }
+  }
+}
+```
+
+```sh
+PYTHONPATH=. harbor run ... -m gateway/GLM5.3-Flash \
+  --ak config=/path/to/gateway-config.json \
+  --ae 'GATEWAY_API_KEY=${GATEWAY_API_KEY}'
+```
+
+Declare `limits`: a model with an unknown context window is refused before
+the first request. `dialect` names the vendor whose request parameters the
+model takes (`glm`, `deepseek`, `kimi`, `qwen`, ...). Check the definition
+offline with `metacodes --state-dir <dir with config.json> --check-providers`.
+
 ## Smoke
 
 ```sh
