@@ -75,6 +75,9 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
   no saved cursor, the half-line snapshot; enforced by
   `zig build test:scrollback`.
 - [Swarm design](SWARM_DESIGN.md)
+- [Teamwork design](TEAMWORK_DESIGN.md) — harness-agnostic multi-agent runs:
+  runtime vs seat, the worker contract, configuration, run directory and
+  budget ledger; foundation types implemented, runtime pending.
 - [Provider offers and control plane](PROVIDER_OFFER_ARCHITECTURE.md) — provider
   profiles, channels, model offers, typed credentials, routing, and persistence.
 
