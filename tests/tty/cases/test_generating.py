@@ -242,6 +242,98 @@ def test_empty_esc_and_ctrl_c_interrupt_generation(bin_path):
         assert b"Interrupted" in raw, f"空框 {key} 没有中断慢请求"
 
 
+# Shift+Enter as terminals send it: CSI-u (Kitty's protocol, and xterm's
+# modifyOtherKeys with formatOtherKeys=1), and ESC CR in one write (the binding
+# /terminal-setup installs for Apple Terminal and VS Code).
+SHIFT_ENTERS = {
+    "CSI-u ESC[13;2u": ["key:shift_enter"],
+    "ESC CR in one write": ["raw:\\x1b\\x0d"],
+}
+
+
+def _reply_with_keys(bin_path, keys):
+    """Press `keys` while a slow reply streams, then let the reply end on its
+    own. The TTYAssert and the model requests that were made."""
+    from tty_driver import IDLE, READY, wait_for
+    from slow_mock_server import SlowMockServer, simple_text, slow_text_then_end
+
+    # A message queued during the reply is sent when it ends; the second turn
+    # answers it at once, so the request is in hand before the case finishes.
+    turns = [slow_text_then_end(n_chunks=14, delay=0.3), simple_text("SECOND_REPLY")]
+    with SlowMockServer(turns) as srv:
+        raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("esc to interrupt")]
+                  + keys + [IDLE, "strictsleep:1.0"],
+                  base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
+        requests = list(srv.requests)
+    return TTYAssert(raw), requests
+
+
+def _reply_frames(a):
+    """The frames drawn while the reply streamed."""
+    return [sc for sc in a.frame_screens if sc.find_last_row("esc to interrupt") is not None]
+
+
+def _box_rows(a, sc):
+    """The input box's content rows in a frame, trimmed."""
+    top, bottom = a.box_top_row(sc), a.box_bottom_row(sc)
+    if top is None or bottom is None:
+        return None
+    return [sc.line_text(r).strip() for r in range(top + 1, bottom)]
+
+
+def _user_texts(request_body):
+    """The text of each user message in a model request, oldest first."""
+    import json
+    texts = []
+    for message in json.loads(request_body)["messages"]:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.append("".join(block.get("text", "") for block in content
+                                 if isinstance(block, dict) and block.get("type") == "text"))
+    return texts
+
+
+def test_shift_enter_during_a_reply_inserts_a_newline(bin_path):
+    """#456: during a reply Shift+Enter is a newline in the draft, as it is at
+    the prompt. It used to take Enter's branch: the draft went into the queue,
+    the box was cleared, and when the reply ended the first line was sent as
+    the next message."""
+    for name, shift_enter in SHIFT_ENTERS.items():
+        a, requests = _reply_with_keys(
+            bin_path, ["type:DRAFT_A"] + shift_enter + ["type:DRAFT_B", "strictsleep:0.5"])
+        frames = _reply_frames(a)
+        if not any(_box_rows(a, sc) == ["❯ DRAFT_A", "DRAFT_B"] for sc in frames):
+            last = frames[-1].render_ascii() if frames else "(no frame drawn during the reply)"
+            a._fail(f"{name}: the box never held the two-line draft during the reply; last frame:\n{last}")
+        queued = sorted({sc.line_text(r) for sc in a.frame_screens for r in range(sc.rows)
+                         if "⏳" in sc.line_text(r)})
+        if queued:
+            a._fail(f"{name}: Shift+Enter queued the draft: {queued}")
+        if b"Interrupted" in a.raw:
+            a._fail(f"{name}: Shift+Enter interrupted the reply")
+        if len(requests) != 1:
+            sent = [_user_texts(body)[-1] for body in requests[1:]]
+            a._fail(f"{name}: Shift+Enter sent the draft when the reply ended: {sent}")
+
+
+def test_enter_after_shift_enter_during_a_reply_sends_one_message(bin_path):
+    """Enter after Shift+Enter during a reply queues the whole draft, and the
+    next request carries it as one message with its newline. With #456 the
+    first line went into the queue on its own and the two queued messages
+    were joined as `DRAFT_A\\n\\nDRAFT_B`."""
+    a, requests = _reply_with_keys(
+        bin_path, ["type:DRAFT_A", "key:shift_enter", "type:DRAFT_B", "key:enter"])
+    if len(requests) != 2:
+        a._fail(f"expected the reply and the queued draft, got {len(requests)} requests")
+    sent = _user_texts(requests[1])[-1]
+    if "DRAFT_A\nDRAFT_B" not in sent:
+        a._fail(f"the next request did not carry the draft as one two-line message: {sent!r}")
+
+
 def test_ctrl_l_while_generating_resets_the_screen_in_one_frame(bin_path):
     """Ctrl+L during a reply goes through RenderRegion.resetScreen under the
     render lock: the region is erased, ED 2 clears the screen and the region
