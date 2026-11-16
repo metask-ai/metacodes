@@ -100,6 +100,42 @@ fn toolBody(wire: Wire) []const u8 {
     };
 }
 
+/// A complete tool call with call id `id`, ending either at the token limit
+/// (`cut`) or normally (`complete`: the wire's tool-call stop).
+fn toolCallBody(a: std.mem.Allocator, wire: Wire, id: []const u8, ending: Ending) ![]u8 {
+    return switch (wire) {
+        .anthropic => std.fmt.allocPrint(a, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"DefinitelyUnknown\",\"input\":{{}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{}}\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":2}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n", .{ id, switch (ending) {
+            .cut => "max_tokens",
+            .complete => "tool_use",
+        } }),
+        .openai_chat => std.fmt.allocPrint(a, "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"tool_calls\":[{{\"index\":0,\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"DefinitelyUnknown\",\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n" ++
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}\n\n" ++
+            "data: [DONE]\n\n", .{ id, switch (ending) {
+            .cut => "length",
+            .complete => "tool_calls",
+        } }),
+        .openai_responses => std.fmt.allocPrint(a, "event: response.output_item.added\n" ++
+            "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"function_call\",\"id\":\"fc_{s}\",\"call_id\":\"{s}\",\"name\":\"DefinitelyUnknown\",\"arguments\":\"\"}}}}\n\n" ++
+            "event: response.function_call_arguments.done\n" ++
+            "data: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_{s}\",\"output_index\":0,\"arguments\":\"{{}}\"}}\n\n" ++
+            "{s}", .{ id, id, id, switch (ending) {
+            .cut => "event: response.incomplete\n" ++
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":2}}}\n\n",
+            .complete => "event: response.completed\n" ++
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":2}}}\n\n",
+        } }),
+        .gemini => std.fmt.allocPrint(a, "data: {{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"DefinitelyUnknown\",\"args\":{{}}}}}}]}},\"finishReason\":\"{s}\"}}],\"usageMetadata\":{{\"promptTokenCount\":1,\"candidatesTokenCount\":2}}}}\n\n", .{switch (ending) {
+            .cut => "MAX_TOKENS",
+            .complete => "STOP",
+        }}),
+    };
+}
+
 // ── driver ───────────────────────────────────────────────────────────────────
 
 /// The `--stream-json` lines, as headless writes them to stdout.
@@ -166,6 +202,10 @@ const Outcome = struct {
 };
 
 fn runWire(a: std.mem.Allocator, wire: Wire, bodies: []const []const u8) !Outcome {
+    return runWireTurns(a, wire, bodies, 4);
+}
+
+fn runWireTurns(a: std.mem.Allocator, wire: Wire, bodies: []const []const u8, max_turns: u32) !Outcome {
     var srv = try harness.MockServer.startCassette(bodies, 0);
     defer srv.stop();
     const url = try srv.urlOwned(a);
@@ -190,18 +230,18 @@ fn runWire(a: std.mem.Allocator, wire: Wire, bodies: []const []const u8) !Outcom
         .anthropic => blk: {
             var client = cc.client_mod.Client.initWithBaseUrl(a, io, "key", "model", url);
             defer client.deinit();
-            break :blk try runLoop(a, &conv, client.provider(), &be, &ledger);
+            break :blk try runLoop(a, &conv, client.provider(), &be, &ledger, max_turns);
         },
         .openai_chat, .openai_responses => blk: {
             var client = cc.api_openai.OpenAIClient.init(a, io, "key", "model", url);
             defer client.deinit();
             if (wire == .openai_responses) client.protocol = .responses;
-            break :blk try runLoop(a, &conv, client.provider(), &be, &ledger);
+            break :blk try runLoop(a, &conv, client.provider(), &be, &ledger, max_turns);
         },
         .gemini => blk: {
             var client = cc.api_gemini.GeminiClient.init(a, io, "key", "gemini-2.5-flash", url);
             defer client.deinit();
-            break :blk try runLoop(a, &conv, client.provider(), &be, &ledger);
+            break :blk try runLoop(a, &conv, client.provider(), &be, &ledger, max_turns);
         },
     };
     stream.flush();
@@ -245,12 +285,13 @@ fn runLoop(
     provider: cc.api_provider.Provider,
     be: *const cc.ui_backend.UiBackend,
     ledger: *cc.output_semantics.Ledger,
+    max_turns: u32,
 ) !agent_loop.RunResult {
     var perm = cc.permission.createContext(.bypass_permissions, a);
     perm.no_interactive_prompt = true;
     const no_tools: []const cc.json_mod.ToolDefinition = &.{};
     return agent_loop.run(conv, provider, no_tools, &perm, .{
-        .max_turns = 4,
+        .max_turns = max_turns,
         .max_stream_turn_retries = 0,
         .output_ledger = ledger,
     }, be, a);
@@ -359,5 +400,81 @@ test "issue #394 control: a complete tool_use on the last cut turn still runs in
         try std.testing.expectEqualSlices(Disposition, &.{ .continued, .continued, .continued, .commentary }, out.timeline);
         try std.testing.expectEqualStrings("max_turns", out.field("stop_reason").string);
         try std.testing.expectEqual(@as(u8, 0), out.exit_code);
+    }
+}
+
+// ── the allowance bounds consecutive cuts, not the Run ─────────────────────────
+//
+// A long agentic Run can hit the output-token limit on a handful of turns that
+// are far apart, recovering after each continuation with a tool call. The
+// allowance used to be counted over the whole Run, so the fourth cut anywhere
+// ended it as max_tokens_exhausted even though no answer had been cut more
+// than once in a row (WorkBuddy: 24 Clover runs, longest streak 3).
+
+test "continuation allowance resets after the model recovers with a tool call, on every wire" {
+    const a = std.testing.allocator;
+    for (std.enums.values(Wire)) |wire| {
+        for ([_]Ending{ .complete, .cut }) |tool_ending| {
+            errdefer std.debug.print("wire={s} tool_ending={s}\n", .{ @tagName(wire), @tagName(tool_ending) });
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const ar = arena.allocator();
+            // cut, cut, cut, tool call (recovery), cut, cut, cut, clean end:
+            // six continuations in the Run, never more than three in a row.
+            const bodies = [_][]const u8{
+                try textBody(ar, wire, "one ", .cut),
+                try textBody(ar, wire, "two ", .cut),
+                try textBody(ar, wire, "three ", .cut),
+                try toolCallBody(ar, wire, "call_recover", tool_ending),
+                try textBody(ar, wire, "four ", .cut),
+                try textBody(ar, wire, "five ", .cut),
+                try textBody(ar, wire, "six ", .cut),
+                try textBody(ar, wire, "done", .complete),
+            };
+
+            var out = try runWireTurns(a, wire, &bodies, 10);
+            defer out.deinit(a);
+
+            try std.testing.expectEqual(@as(usize, bodies.len), out.requests);
+            try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
+            try std.testing.expectEqual(@as(u32, 1), out.result.tool_calls);
+            // The run total still counts every continuation (#269).
+            try std.testing.expectEqual(@as(u32, 6), out.result.continuations);
+            try std.testing.expectEqual(@as(i64, 6), out.field("continuations").integer);
+            try std.testing.expectEqualStrings("end_turn", out.run_end_stop);
+            try std.testing.expectEqualStrings("final", out.field("text_kind").string);
+            try std.testing.expectEqualStrings("four five six done", out.field("text").string);
+            try std.testing.expectEqual(@as(u8, 0), out.exit_code);
+        }
+    }
+}
+
+test "four consecutive cuts after a recovery still exhaust the allowance, on every wire" {
+    const a = std.testing.allocator;
+    for (std.enums.values(Wire)) |wire| {
+        errdefer std.debug.print("wire={s}\n", .{@tagName(wire)});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const ar = arena.allocator();
+        const bodies = [_][]const u8{
+            try textBody(ar, wire, "one ", .cut),
+            try toolCallBody(ar, wire, "call_recover", .complete),
+            try textBody(ar, wire, "a ", .cut),
+            try textBody(ar, wire, "b ", .cut),
+            try textBody(ar, wire, "c ", .cut),
+            try textBody(ar, wire, "d", .cut),
+        };
+
+        var out = try runWireTurns(a, wire, &bodies, 10);
+        defer out.deinit(a);
+
+        try std.testing.expectEqual(@as(usize, bodies.len), out.requests);
+        try std.testing.expectEqual(agent_loop.StopReason.max_tokens_exhausted, out.result.stop_reason);
+        try std.testing.expectEqual(@as(u32, 1), out.result.tool_calls);
+        try std.testing.expectEqual(@as(u32, 4), out.result.continuations);
+        try std.testing.expectEqualStrings("max_tokens_exhausted", out.run_end_stop);
+        try std.testing.expectEqualStrings("partial", out.field("text_kind").string);
+        try std.testing.expectEqualStrings("a b c d", out.field("text").string);
+        try std.testing.expectEqual(@as(u8, 1), out.exit_code);
     }
 }
