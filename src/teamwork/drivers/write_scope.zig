@@ -16,9 +16,11 @@
 //!    with exactly those two roots as its working directories and no prompt
 //!    channel, so anything that would ask is refused.
 //! 3. `seatSandbox` confines Bash: writes allowed only under the workspace,
-//!    the seat directory and the platform temp roots (Seatbelt profile). On a
-//!    host without a sandbox backend (Linux, Windows today) only read-only
-//!    Bash commands run. The profile always lets Bash write the workspace
+//!    the seat directory and the platform temp roots (Seatbelt profile on
+//!    macOS, bubblewrap mounts on Linux), so an implementer seat can build
+//!    and run tests. On a host without a working backend (Windows; Linux
+//!    without a bwrap that can create user namespaces) only read-only Bash
+//!    commands run. The sandbox always lets Bash write the workspace
 //!    (build caches), so for a non-implementer seat Bash is not a fence
 //!    against workspace edits; the reviewer's tree check is (reviewer.zig).
 

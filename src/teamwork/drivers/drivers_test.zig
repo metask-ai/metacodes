@@ -30,6 +30,7 @@ const swarm_team = @import("../../swarm/team.zig");
 const util_fs = @import("../../util/fs.zig");
 const util_time = @import("../../util/time.zig");
 const log = @import("../../util/log.zig");
+const sandbox_exec = @import("../../sandbox/exec.zig");
 
 const testing = std.testing;
 const PathBuf = [std.fs.max_path_bytes]u8;
@@ -162,7 +163,7 @@ const Scenario = enum {
     exit_nonzero,
     /// Kills itself with SIGKILL.
     killed,
-    /// Starts a grandchild in its group, records its pid, then hangs.
+    /// Starts a heartbeating grandchild in its group, records its pid, then hangs.
     hang,
     /// Reports success, exits 0, writes no handoff.
     no_handoff,
@@ -179,6 +180,8 @@ const FakeCli = struct {
     record_len: usize = 0,
     pidfile: PathBuf = undefined,
     pidfile_len: usize = 0,
+    heartbeat: PathBuf = undefined,
+    heartbeat_len: usize = 0,
 
     fn scriptPath(self: *const FakeCli) []const u8 {
         return self.script[0..self.script_len];
@@ -192,12 +195,17 @@ const FakeCli = struct {
         return self.pidfile[0..self.pidfile_len :0];
     }
 
+    fn heartbeatPath(self: *const FakeCli) [:0]const u8 {
+        return self.heartbeat[0..self.heartbeat_len :0];
+    }
+
     /// Install the fake as `<root>/bin/claude`; it records into the
     /// workspace (writable under any seat sandbox).
     fn install(self: *FakeCli, fx: *const Fixture, scenario: Scenario) !void {
         self.script_len = (try std.fmt.bufPrintZ(&self.script, "{s}/bin/claude", .{fx.root.slice()})).len;
         self.record_len = (try std.fmt.bufPrintZ(&self.record, "{s}/.fake-claude-record", .{fx.workspace()})).len;
         self.pidfile_len = (try std.fmt.bufPrintZ(&self.pidfile, "{s}/.fake-claude-grandchild", .{fx.workspace()})).len;
+        self.heartbeat_len = (try std.fmt.bufPrintZ(&self.heartbeat, "{s}/.fake-claude-heartbeat", .{fx.workspace()})).len;
         var bin_buf: PathBuf = undefined;
         try util_fs.mkdirParents(fx.path(&bin_buf, "bin"));
 
@@ -237,7 +245,7 @@ const FakeCli = struct {
             .exit_nonzero => try text.appendSlice(a, "echo '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"total_cost_usd\":0.1}'\nexit 3\n"),
             .killed => try text.appendSlice(a, "kill -9 $$\n"),
             .hang => {
-                try text.print(a, "sleep 300 &\necho $! > '{s}'\nsleep 300\n", .{self.pidfilePath()});
+                try text.print(a, "(n=0; while :; do n=$((n+1)); echo $n > '{s}'; sleep 0.1; done) &\necho $! > '{s}'\nsleep 300\n", .{ self.heartbeatPath(), self.pidfilePath() });
             },
             .no_handoff => try text.appendSlice(a, "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"total_cost_usd\":0.05}'\nexit 0\n"),
             .over_budget => try text.appendSlice(a, "echo '{\"type\":\"result\",\"subtype\":\"error_max_budget_usd\",\"is_error\":true,\"total_cost_usd\":0.5}'\nexit 1\n"),
@@ -291,24 +299,17 @@ fn recordHasEnv(record: []const u8, name: []const u8) bool {
     return false;
 }
 
-/// The pid is gone (or a zombie awaiting its new parent's reap).
-fn processGone(pid: std.c.pid_t) bool {
-    var waited: u32 = 0;
-    while (waited < 3000) : (waited += 20) {
-        if (std.c.kill(pid, @enumFromInt(0)) != 0) return true;
-        if (builtin.os.tag == .linux) {
-            var path_buf: [64]u8 = undefined;
-            const stat_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return false;
-            if (swarm_team.readFileAlloc(testing.allocator, stat_path)) |stat| {
-                defer testing.allocator.free(stat);
-                if (std.mem.lastIndexOfScalar(u8, stat, ')')) |close| {
-                    if (close + 2 < stat.len and stat[close + 2] == 'Z') return true;
-                }
-            }
-        }
-        util_time.sleepMs(20);
-    }
-    return false;
+/// The grandchild's heartbeat stopped: it died with its group. Its pid is
+/// no evidence under bwrap, whose `--unshare-pid` makes `$!` a pid of the
+/// sandbox's namespace, so the test watches what the process does instead.
+fn heartbeatStopped(path: [:0]const u8) bool {
+    util_time.sleepMs(300);
+    const before = swarm_team.readFileAlloc(testing.allocator, path) orelse return false;
+    defer testing.allocator.free(before);
+    util_time.sleepMs(800);
+    const after = swarm_team.readFileAlloc(testing.allocator, path) orelse return false;
+    defer testing.allocator.free(after);
+    return std.mem.eql(u8, before, after);
 }
 
 // ── scripted provider ───────────────────────────────────────────────────────
@@ -813,10 +814,8 @@ test "teamwork drivers L2: claude seat timeout, wallclock budget and abort kill 
         try testing.expect(elapsed < 20_000);
 
         // The grandchild the CLI left behind died with its group.
-        const pid_text = swarm_team.readFileAlloc(testing.allocator, fake.pidfilePath()) orelse return error.NoGrandchild;
-        defer testing.allocator.free(pid_text);
-        const pid = try std.fmt.parseInt(std.c.pid_t, std.mem.trim(u8, pid_text, " \n"), 10);
-        try testing.expect(processGone(pid));
+        try testing.expect(pfs.exists(fake.pidfilePath().ptr));
+        try testing.expect(heartbeatStopped(fake.heartbeatPath()));
 
         // Spend is charged even for a killed seat: its wallclock.
         try testing.expectEqual(@as(usize, 1), fx.ledger.entries);
@@ -904,4 +903,65 @@ test "teamwork drivers L2: a metacodes reviewer seat taps the plugged-in tool ob
     var edit_buf: PathBuf = undefined;
     try testing.expect(!pfs.exists(try std.fmt.bufPrintZ(&edit_buf, "{s}/src/fix.zig", .{fx.workspace()})));
     try testing.expect(std.mem.indexOf(u8, scripted.tool_results.items, "outside the current execution policy") != null);
+}
+
+test "teamwork drivers L2: an implementer seat's Bash builds in its workspace inside the sandbox and writes nothing outside" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // comptime: the rest is POSIX-only
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-drivers-bash", 5);
+    defer fx.deinit();
+    // Outside every temp root the sandbox opens (the fixture lives in /tmp).
+    var outside_dir = testing.tmpDir(.{});
+    defer outside_dir.cleanup();
+    var outside_buf: PathBuf = undefined;
+    const outside = outside_buf[0..try outside_dir.dir.realPath(testing.io, &outside_buf)];
+    var host: MetacodesHost = undefined;
+    try host.init();
+    defer host.deinit();
+    const seat = try fx.addSeat(.implementer, 1, .metacodes);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bash = struct {
+        fn input(a: std.mem.Allocator, command: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(a, "{f}", .{std.json.fmt(.{ .command = command }, .{})});
+        }
+    }.input;
+    const escape = try std.fmt.allocPrint(arena, "echo x > {s}/escaped", .{outside});
+    const turns = [_][]const ScriptedProvider.Event{
+        &.{
+            // A build step: writes its output into the workspace (cwd).
+            .{ .tool = .{ .name = "Bash", .input = try bash(arena, "mkdir -p zig-out && echo built > zig-out/built.ok && echo BUILD_DONE") } },
+            .{ .tool = .{ .name = "Bash", .input = try bash(arena, escape) } },
+            .{ .tool = .{ .name = "Write", .input = try writeHandoffInput(arena, fx.paths(seat).handoff) } },
+        },
+        &.{.{ .text = "Built." }},
+    };
+    var scripted: ScriptedProvider = .{ .allocator = testing.allocator, .turns = &turns };
+    defer scripted.deinit();
+
+    var driver_impl = metacodes.MetacodesDriver.init(host.deps(scripted.provider(), &fx), fx.binding(seat));
+    const spec: types.SeatSpec = .{ .role = .implementer };
+    var abort = types.AbortSignal.init();
+    var outcome = try driver_impl.driver().run(testing.allocator, &spec, fx.paths(seat), &abort);
+    defer outcome.deinit(testing.allocator);
+    try testing.expect(outcome == .finished);
+
+    var built_buf: PathBuf = undefined;
+    const built = try std.fmt.bufPrintZ(&built_buf, "{s}/zig-out/built.ok", .{fx.workspace()});
+    var escaped_buf: PathBuf = undefined;
+    const escaped = try std.fmt.bufPrintZ(&escaped_buf, "{s}/escaped", .{outside});
+    // Nothing outside the seat's roots, with or without a sandbox backend.
+    try testing.expect(!pfs.exists(escaped.ptr));
+    errdefer std.debug.print("tool results: {s}\n", .{scripted.tool_results.items});
+    if (sandbox_exec.hostSupported()) {
+        // Seatbelt or bubblewrap: the write command ran, confined.
+        try testing.expect(pfs.exists(built.ptr));
+        try testing.expect(std.mem.indexOf(u8, scripted.tool_results.items, "BUILD_DONE") != null);
+    } else {
+        // No backend: only read-only commands run.
+        try testing.expect(!pfs.exists(built.ptr));
+        try testing.expect(std.mem.indexOf(u8, scripted.tool_results.items, "outside the current execution policy") != null);
+    }
 }

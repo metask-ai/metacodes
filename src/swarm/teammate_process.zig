@@ -26,9 +26,10 @@
 //!   - **register(SW7 真机 e2e + 剩项)**:① 完整 lead→fork+exec 真 metacodes→处理消息→shutdown
 //!     e2e(须干净进程 harness——组件测试带 live MockServer 线程 fork() 多线程不安全);forkExecTeammate
 //!     的真 fork+exec 待真机验。② plan-mode-required 非继承:buildTeammateArgv 不传 --permission →
-//!     子进程默认 default(非 bypass),满足"绝不继承 bypass"但无显式 guard/测试,SW7 补。③ Seatbelt
-//!     Bash 包裹:teammate 进程用同 App/同 Bash 工具,settings 开沙箱则自然套 wrapCommand(未测,SW7 验)。
-//!   - **排除(用户指令)**:Linux bubblewrap 沙箱不做(登记差距矩阵)。
+//!     子进程默认 default(非 bypass),满足"绝不继承 bypass"但无显式 guard/测试,SW7 补。③ 沙箱
+//!     (Seatbelt / bwrap) Bash 包裹:teammate 进程用同 App/同 Bash 工具,settings 开沙箱则自然套 wrapCommand(未测,SW7 验)。
+//!   - Linux 沙箱:bubblewrap 后端已实现(sandbox/bwrap.zig;此前"不做"的用户指令已撤回),③ 同理
+//!     在 Linux 上套 bwrap。
 
 const std = @import("std");
 const builtin = @import("builtin");

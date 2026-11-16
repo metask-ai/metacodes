@@ -541,7 +541,7 @@ pub const Options = struct {
     session_id: []const u8 = "",
     project_dir: []const u8 = "",
     disable_shell_execution: bool = false,
-    /// Sandbox 配置(Bash 工具用):非 null 且 enabled 时包 sandbox-exec。
+    /// Sandbox 配置(Bash 工具用):非 null 且 enabled 时包平台沙箱(sandbox-exec / bwrap)。
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     /// cwd 绝对路径 + HOME(sandbox profile 用)。
     cwd_abs: []const u8 = "",

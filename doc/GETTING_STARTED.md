@@ -7,6 +7,7 @@ the overview; this page holds the details it links to.
 - [Choose a model provider](#choose-a-model-provider)
 - [Metask OAuth](#metask-oauth)
 - [Run it](#run-it)
+- [Sandbox Bash commands](#sandbox-bash-commands)
 - [Build from source](#build-from-source)
 - [Auditing a different TinyKG binary](#auditing-a-different-tinykg-binary)
 
@@ -239,6 +240,47 @@ it ([Terminal setup](TERMINAL_SETUP.md)).
 
 `metacodes --help` lists every flag. Embedding the runtime in your own process
 (Zig module or the AgentCore C ABI) starts at [API.md](API.md).
+
+## Sandbox Bash commands
+
+The `sandbox` section of `.claude/settings.json` (in the project or in `~`)
+confines the commands Bash, Monitor and skill `!` lines run:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "filesystem": { "allowWrite": ["~/.cache/zig"], "denyWrite": [".env"], "denyRead": ["~/.ssh"] },
+    "excludedCommands": ["docker"]
+  }
+}
+```
+
+A sandboxed command reads everywhere except `denyRead` and writes only in the
+working directory, `--add-dir` directories, the linked worktree's `.git`, the
+temp directories and `allowWrite`, minus `denyWrite`. Paths take `~/`,
+absolute or working-directory-relative forms.
+
+| Host | Backend |
+|---|---|
+| macOS | Seatbelt, `/usr/bin/sandbox-exec` with a generated profile |
+| Linux | bubblewrap: `/usr/bin/bwrap` or `/bin/bwrap`, or the absolute path in `METACODES_BWRAP`; never `PATH` |
+| Windows | none |
+
+On Linux the command runs in fresh mount, pid and IPC namespaces with `/`
+mounted read-only and the write roots bound back writable at their physical
+paths, so a symlink cannot carry a write out of them. metacodes probes bwrap
+once per process; a missing bwrap, or one the kernel does not let create a
+user namespace, counts as no sandbox. With no backend, `failIfUnavailable`
+refuses every Bash command; without it the command runs unconfined and
+`autoAllowBashIfSandboxed` does not apply. Differences from Seatbelt: a
+`denyWrite` path that does not exist yet makes its nearest existing ancestor
+read-only when that lies in a write root; `/tmp` and `/var/tmp` are the
+temp roots; a command killed by a signal shows as exit 128+N; and the
+network is open unless `network.allowedDomains` or `deniedDomains` lists a
+domain, in which case bwrap removes it entirely, having no per-host filter
+(Seatbelt does not restrict the network either way).
 
 ## Build from source
 

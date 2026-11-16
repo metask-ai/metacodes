@@ -19,11 +19,16 @@
 //! - Process group: the child leads its own group, killed whole on abort,
 //!   timeout or wallclock budget, and swept after a normal exit so no
 //!   descendant outlives the seat (POSIX; Windows kills the CLI alone).
-//! - Sandbox: on macOS the CLI runs under the Seatbelt profile
-//!   (`sandbox/exec.zig`) whose write roots are the workspace, the seat
-//!   directory, the temp roots and Claude Code's own state under `~`. Other
-//!   platforms have no backend yet, and the child runs unconfined there:
-//!   Claude Code's own permission mode is then the only write fence.
+//! - Sandbox: the CLI runs under the host's sandbox backend
+//!   (`sandbox/exec.zig`: Seatbelt on macOS, bubblewrap on Linux) whose
+//!   write roots are the workspace, the seat directory, the temp roots and
+//!   Claude Code's own state under `~` (bwrap binds only the entries that
+//!   exist when the seat starts). The network stays open: the CLI talks to
+//!   its API. On a host without a backend (Windows, Linux without a working
+//!   bwrap) the child runs unconfined: Claude Code's own permission mode is
+//!   then the only write fence. Under bwrap a CLI killed by signal N shows
+//!   as bwrap's exit 128+N, mapped back to the signal
+//!   (`WrappedCommand.childExitCode`).
 //! - Result: stdout is read only for the last `result` event (status and
 //!   `total_cost_usd`, charged as `harness_reported`); a `wallclock_only`
 //!   seat is charged its wallclock. The handoff decides a clean exit
@@ -108,7 +113,8 @@ pub const Options = struct {
     timeout_ms: ?u64 = null,
     /// Limit on each compatibility probe.
     probe_timeout_ms: u64 = 15_000,
-    /// Run under the platform sandbox where one exists (macOS Seatbelt).
+    /// Run under the platform sandbox where one exists (macOS Seatbelt,
+    /// Linux bubblewrap).
     sandbox: bool = true,
 };
 
@@ -195,7 +201,7 @@ pub const ClaudeCodeDriver = struct {
         };
         const cli_argv = try buildArgv(arena, external.command.bytes, seat_dir, spec.model, spec.effort, remaining);
 
-        // Sandbox wrap: same argv, run as `exec` under sandbox-exec's bash.
+        // Sandbox wrap: same argv, run as `exec` under the backend's bash.
         var wrapped: ?sandbox_exec.WrappedCommand = null;
         defer if (wrapped) |*w| w.deinit();
         var sandbox_settings: sandbox_config.SandboxSettings = .{
@@ -261,7 +267,8 @@ pub const ClaudeCodeDriver = struct {
         }
         if (charged == .unrecorded) return .budget_exhausted;
         if (sink.result) |result| if (result.subtype == .error_max_budget_usd) return .budget_exhausted;
-        const code = supervised.exit_code orelse 0;
+        const raw_code = supervised.exit_code orelse 0;
+        const code = if (wrapped) |*w| w.childExitCode(raw_code) else raw_code;
         if (code != 0) {
             if (builtin.os.tag != .windows and code < 0) return .{ .failed = .{ .signaled = @intCast(-code) } };
             return .{ .failed = .{ .exited = @truncate(@as(u32, @bitCast(code))) } };

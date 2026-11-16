@@ -4315,6 +4315,7 @@ test {
     _ = &@import("sandbox/profile.zig");
     _ = &@import("sandbox/config.zig");
     _ = &@import("sandbox/exec.zig");
+    _ = &@import("sandbox/bwrap.zig");
     _ = &@import("core/message.zig");
     _ = &@import("core/conversation.zig");
     _ = &@import("core/agent_loop.zig");

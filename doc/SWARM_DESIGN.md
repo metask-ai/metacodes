@@ -87,8 +87,10 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
   被删除、换绑或 cwd/worktree 改变后，进程在启动和下一次轮询前 fail closed；指定的
   worktree 无法 chdir/realpath 时也直接退出，绝不降级到 lead cwd。spawn 后尚未登记成功
   时的子进程会被 kill+reap，避免留下无主进程。
-- **排除(用户指令)**:Linux bubblewrap 沙箱不做。macOS Seatbelt 沙箱复用(同 App/同 Bash 工具,settings 开则自然套 wrapCommand)。
-- register SW7:真 fork+exec e2e / Seatbelt 验证。
+- **沙箱**:teammate 进程用同 App/同 Bash 工具,settings 开沙箱则自然套 `wrapCommand`:macOS 走
+  Seatbelt,Linux 走 bubblewrap(`src/sandbox/bwrap.zig`;此前"Linux bubblewrap 不做"的用户指令已由用户
+  撤回,后端已实现)。
+- register SW7:真 fork+exec e2e / 进程外 teammate 的沙箱包裹验证。
 
 ## 7b. 宿主调度 teammate(AgentCore,issue #277)
 
@@ -154,7 +156,7 @@ vs host `pollLeadInbox`)。
 
 | 项 | 状态 |
 |----|------|
-| Linux bubblewrap 沙箱 | 排除(用户指令) |
+| Linux bubblewrap 沙箱 | 已实现(`src/sandbox/bwrap.zig`,与 Seatbelt 同一份 `SandboxSettings`;原"排除"指令已撤回) |
 | permission 代理(teammate→lead 弹框) | register SW7(当前 fail-closed 安全) |
 | mode 响应 from-gate | register(消费者建时补) |
 | 真 fork+exec 进程外完整 e2e | register SW7(干净进程 harness) |
