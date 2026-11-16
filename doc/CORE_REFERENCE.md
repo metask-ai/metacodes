@@ -262,6 +262,34 @@ query、Ctrl+O transcript、resume 回放与 `/recap` 把它们与用户输入�
   响应只是证据;宿主按 `KgRemember` 同一套头绑定把信封写成 `lesson` 节点,头不符的信封计入
   refused。distill 与 reconcile 合在这一次请求里,报告记一段。形式化:`LearningTurn.lean`。
 
+**隔离验证者(isolated verifier,`core/isolated_verifier.zig` + `agents/isolation.zig` 的 `Snapshot`,
+设计说明 [ISOLATED_VERIFIER_DESIGN.md](ISOLATED_VERIFIER_DESIGN.md))**:钉住检查通过之后,宿主在代码里
+起一个全新的子 agent,对照原始任务逐项找证据。它只能降级,不能升级。
+- **隔离**:不是 `AgentDef`,同名项目 agent 无法顶替;system prompt 是编译期常量 `CHARTER`(SHA-256
+  进记录);唯一的 user 消息是 packet(任务原文、钉住检查与计数、快照路径与 `base`/`candidate` 两个
+  ref,第二个边界另带上次 FAIL 的 probe);工具只有 Bash / Read / Grep / Glob;kg、Skills、MCP、宿主
+  服务、read state、文件改动账本、后台任务全为 null。工作目录是工作区的 git 快照(临时 index,不碰
+  actor 的 index / HEAD / ref / stash;独立仓库经 alternates 读对象;结束后总是删除),绑定树 id **T**,
+  返回后重算 T′,不等即 `unavailable`(`workspace_changed`)。
+- **判定**:只读最后一条 assistant 消息的最后一个非空行 `VERDICT: PASS|FAIL|UNVERIFIED`;其他以
+  `VERDICT:` 开头的行使结果 `unavailable`。每个 `PROBE:` 必须是它真跑过的 Bash 命令的子串,否则 PASS /
+  FAIL 降为 UNVERIFIED。基础设施错误(快照失败、spawn 失败、provider 错误、非 `end_turn`、墙钟、无 token)
+  一律 `unavailable`,回退到钉住判定。
+- **检查门接线**:`Options.isolated_verifier: ?isolated_verifier.Options`(需要 `check_gate`,根 Run,
+  canonical `buildRunOptions` 不带)。enforce:FAIL 变成 `failed`(`State.last_source = .verifier`),
+  在检查门同一个续跑预算内续跑,续跑消息只引用复现过的证据块;UNVERIFIED 且还有预算时开一轮只读
+  leads(至多 3 轮,只跑 Read / Grep / Glob,占一次续跑),再起一个新验证者看同一个 T。observe 只记录。
+  每 Run 至多 2 个边界、每边界至多 2 次 spawn,单次 US$0.20、整 Run US$0.60、单次 300 s。
+- **收尾形态**:print 模式下检查门未武装时,`host_check.runAndIngestVerified` 在干净通过之后跑一次,
+  enforce 在 `host_run` 行上写 `"verifier"` 限定(provenance 不变);`verdict.effectiveRank` 让
+  `verifier=fail` 的行同分时排在未受质疑的 `host_run` 之下、`host_run_tainted` 之上。
+- **独立入口**:`isolated_verifier.verify(gpa, Deps, VerifyRequest) → VerifyResult`,不依赖检查门
+  状态,teamwork 运行时可以直接调用。
+- **CLI 与记录**:`--verifier` / `--verifier-observe` / `--verifier-model <model|tier>`,print 模式另认
+  `METACODES_VERIFIER=enforce|observe`;没有钉住检查、单独给 `--verifier-model`、或与 `--learning-turn`
+  同时开都是参数错误(`main.resolveVerifier`)。武装时 Run 结束发一条 `isolated_verifier` 终局记录
+  (`metacodes-isolated-verifier-v1`)。
+
 #### 3.2.1.1 候选响应边界:这条响应能不能进 Conversation(`core/response_candidate.zig`)
 
 段的定性回答"这段文本算什么";候选响应边界回答的是上一个问题——**这条 provider 响应最终
