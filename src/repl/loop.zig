@@ -1212,6 +1212,9 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
         break :blk false;
     };
 
+    // Why the model failed, for the next step the `.api_error` notice below gives.
+    var model_failure: ?@import("../api/model_error.zig").Detail = null;
+    run_opts.model_error_out = &model_failure;
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
@@ -1302,13 +1305,22 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
     }
     // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
     // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。
+    // The last line is the next step. A rejected sign-in or key, or a balance
+    // that ran out, says what helps instead of /retry (next_step.zig).
     if (result.stop_reason == .api_error) {
         const last_error = @import("../api/last_error.zig");
+        const next_step = @import("next_step.zig");
+        const next_owned: ?[]u8 = if (model_failure) |*failure|
+            next_step.forFailure(allocator, app, failure, .interactive) catch null
+        else
+            null;
+        defer if (next_owned) |line| allocator.free(line);
+        const next = next_owned orelse "Retry with /retry, or switch models or compact the context first.";
         var detail_buf: [last_error.SUMMARY_BUF_LEN]u8 = undefined;
         if (last_error.take(&detail_buf)) |detail| {
-            cmd_output.print("\x1b[31mAPI request failed; the turn stopped.\n  {s}\nRetry with /retry, or switch models or compact the context first.\x1b[0m\n", .{detail});
+            cmd_output.print("\x1b[31mAPI request failed; the turn stopped.\n  {s}\n{s}\x1b[0m\n", .{ detail, next });
         } else {
-            cmd_output.print("\x1b[31mAPI request failed (retries exhausted, server error, or context too long); the turn stopped.\nRetry with /retry, or switch models or compact the context first.\x1b[0m\n", .{});
+            cmd_output.print("\x1b[31mAPI request failed (retries exhausted, server error, or context too long); the turn stopped.\n{s}\x1b[0m\n", .{next});
         }
     }
     // 工具不可恢复错误撞墙:明确告知,非静默。
@@ -1890,17 +1902,6 @@ fn readLineRaw(
                         }
                     }
                 }
-                // The picker's sign-in runs on a worker thread (#67); the idle
-                // tick is where its transcript reaches the overlay.
-                if (region.pickerOpen()) switch (picker_host.poll(app, &region.ui, .of(region))) {
-                    .committed => {
-                        region.clear();
-                        region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
-                        redraw(region, &editor, app);
-                    },
-                    .redraw => redraw(region, &editor, app),
-                    .ignored => {},
-                };
                 continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
             }
             if (rc > 0) break; // 有字节可读

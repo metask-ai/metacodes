@@ -73,6 +73,27 @@ status, compatibility boundaries, and entry points are defined by
   `· from shell`, `· saved key`, `· signed in`, `· --api-key` — and
   `metacodes install` ends with the next step while the install has neither a
   Metask sign-in nor a `.env`.
+
+- **`/model` lists only routes it can apply, and takes no key** (#488). A
+  route is listed when a credential resolves for it now, by the resolution a
+  commit binds with, without sending a request: the environment,
+  `<state root>/.env`, a key `/login <provider>` stored, a provider's stored
+  OAuth login, a credential-pool member, `--api-key` for its provider, and
+  for Metask the session's own key or, in a session started on another
+  provider, the key `metacodes login` stored in `auth.json` (a pick of a
+  Metask route now binds that key; it used to fail with
+  `MissingCredentials`). Only a missing credential takes a route off the
+  list: one refused for another reason (two names of its key that
+  disagree, say) stays listed, and a pick says why. A provider with no such
+  credential is no longer a row that leads to a sign-in or a key field: it
+  is listed dimmed under
+  "Not configured", below the others, and choosing it shows the variable to
+  set, this install's `.env` and `doc/LOCAL_CONFIG.md` (for Metask, `/login`
+  first), and starts nothing. The in-picker sign-in and key-paste stage of
+  #67 are gone; `/login <provider>` pastes a key or signs in, as before. A
+  pick that moves the session to another provider says on a second line who
+  bills it from then on (`from now on billed to your DeepSeek account`).
+
 - **`KIMI_API_KEY` is the Kimi Code subscription's key, no longer an alias
   of `MOONSHOT_API_KEY`** (#487). The `kimi` profile (the Moonshot open
   platform) now reads `MOONSHOT_API_KEY` only, and `KIMI_API_KEY`
@@ -102,6 +123,23 @@ status, compatibility boundaries, and entry points are defined by
   0.12.0 wrote the `command_result` alone. The permission mode is journaled
   by a config sink on the Session's permission context, so a submission's
   mode is journaled once, as before.
+- **A request whose sign-in or key was rejected, or whose balance ran out,
+  ends by saying what to do instead of suggesting `/retry`.** The TUI ended
+  every failed request with `Retry with /retry, or switch models or compact
+  the context first.`, and a retry cannot help either of these. On HTTP 401
+  or 403 the last line is now `Your Metask sign-in is no longer valid. Sign
+  in again: /login` on Metask, and on another provider `DeepSeek rejected
+  the API key. Check DEEPSEEK_API_KEY in <state root>/.env or your shell,
+  then restart.`, with that provider's name and key variable. On HTTP 402,
+  or when the provider's error code is `insufficient_balance` or
+  `insufficient_quota` (OpenAI answers a used-up quota with 429), it is
+  `Your Metask balance has run out. Top up your Metask account, or switch
+  provider: /model`, or `DeepSeek reports no balance or quota left. Top up
+  with DeepSeek, or switch provider: /model`. `-p` prints the same line on
+  stderr after the raw error, naming the command that was run
+  (`metacodes login`) and `--provider` where the TUI names `/login` and
+  `/model`; its exit code stays 1. Every other failure keeps the old
+  advice, and nothing is retried or switched by itself.
 
 ### Added
 
@@ -219,6 +257,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`/model` names the variable and the file for a provider without a key**
+  (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
+  chosen without its key ended in `switch failed (MissingCredentials)`: these
+  providers have neither a sign-in nor a key page the picker could open.
+  Such a provider is now listed under "Not configured" (#488), and a pick
+  whose key went away after the picker opened shows the same setup: the
+  variable to set (the canonical one, e.g. `MOONSHOT_API_KEY`), this
+  install's `<state root>/.env` and the guide (`doc/LOCAL_CONFIG.md`); the
+  previous route stays active. A picker notice longer than the terminal is
+  wide is broken into rows inside the width instead of running past it.
 - **An idle AgentCore Session no longer holds about 50 MB of private commit
   on Windows** (#503). Zig 0.16's `std.Thread.spawn` hands its 16 MiB
   default stack to `NtCreateThreadEx` as the stack *commit*, so each thread

@@ -232,6 +232,7 @@ pub const cache_break = @import("core/cache_break.zig");
 pub const core_message = @import("core/message.zig");
 pub const transcript = @import("core/transcript.zig");
 pub const repl_headless = @import("repl/headless.zig");
+pub const repl_next_step = @import("repl/next_step.zig"); // pub: the component test reads the route a /model pick moved to
 pub const repl_stream_json = @import("repl/stream_json_backend.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
@@ -1543,10 +1544,12 @@ pub fn main(init: std.process.Init) !void {
 
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
     if (config.prompt) |p| {
-        const code = @import("repl/headless.zig").run(app, gpa, p, config.images, config.json_output) catch |err| blk: {
+        var model_failure: ?api_model_error.Detail = null;
+        const code = @import("repl/headless.zig").run(app, gpa, p, config.images, config.json_output, &model_failure) catch |err| blk: {
             std.debug.print("error: headless setup failed: {s}\n", .{@errorName(err)});
             break :blk 1;
         };
+        if (model_failure) |*failure| printNextStep(app, allocator, failure);
         app.deinit(); // 同上:headless 一样跑 MCP/LSP,同款孤儿病(agent loop 已结束,quiescent)
         std.process.exit(code);
     }
@@ -1565,6 +1568,16 @@ pub fn main(init: std.process.Init) !void {
 
     // (stderr 日志 gate 已提前到 App.init 之前——见 interactive_tui;init 期日志同样不得上屏。)
     try repl.run(app, gpa, .{ .resumed = resumed, .splash = splash });
+}
+
+/// `-p`: after the raw error the run printed, one line saying what to do when
+/// a retry cannot help — a rejected sign-in or key, or no balance left — with
+/// this install's command for `/login` and `--provider` for `/model`
+/// (repl/next_step.zig). Nothing for any other failure; the exit code stays.
+fn printNextStep(app: *app_mod.App, allocator: std.mem.Allocator, failure: *const api_model_error.Detail) void {
+    if (!repl_next_step.applies(failure)) return;
+    const line = (repl_next_step.forFailure(allocator, app, failure, .{ .print = invokedCommand(allocator) }) catch return) orelse return;
+    std.debug.print("{s}\n", .{line});
 }
 
 /// Whether this run ends in the interactive REPL (`repl.run`): no daemon,
@@ -4790,6 +4803,7 @@ test {
     _ = &@import("repl/multiline.zig");
     _ = &@import("repl/render.zig");
     _ = &@import("repl/headless.zig");
+    _ = &@import("repl/next_step.zig");
     _ = &@import("repl/complete.zig");
     _ = &@import("repl/paste.zig");
     _ = &@import("repl/transcript_viewer.zig");

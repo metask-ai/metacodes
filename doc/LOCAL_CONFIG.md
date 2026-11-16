@@ -172,10 +172,13 @@ So `METACODES_PROVIDER` and `METACODES_MODEL` in the file apply only when
 nothing above them decides: once you sign in to Metask (`/login`, or
 `metacodes login`), the file's provider no longer takes over. Its keys still
 work: a provider you choose with `--provider` or in `/model` reads its key
-from the file. While the terminal UI starts on Metask instead of this file's
-provider, it says so once under its banner (`.env configures DeepSeek; the
-default is Metask. To use DeepSeek: /model, or /logout`). `/logout` signs you
-out of Metask and switches the session to the provider this file configures
+from the file. `/model` lists a provider as usable only once its key is here
+(or in the environment, or stored by `/login <provider>`); until then it sits
+under "Not configured" and, when you choose it, names the variable and this
+file. While the terminal UI starts on Metask instead of this file's provider,
+it says so once under its banner (`.env configures DeepSeek; the default is
+Metask. To use DeepSeek: /model, or /logout`). `/logout` signs you out of
+Metask and switches the session to the provider this file configures
 (`Switched to DeepSeek (from .env)`); later starts use it too.
 
 A file with keys of several providers and no `METACODES_PROVIDER` chooses
@@ -231,4 +234,8 @@ Local configuration (.env)
 When no provider has a key, the terminal UI's note (and the error of `-p`,
 `serve` and `--web`) names this install's file and the template beside it, and
 links this page. Keys that are only in your shell are listed by name there,
-never used: choose one of those providers in `/model` to use its key.
+never used: choose one of those providers in `/model` to use its key. When the
+provider rejects the key (HTTP 401 or 403), the failed request ends by naming
+the variable and this file: `DeepSeek rejected the API key. Check
+DEEPSEEK_API_KEY in ~/.local/opt/metacodes/state/.env or your shell, then
+restart.`

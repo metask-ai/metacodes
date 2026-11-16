@@ -147,12 +147,15 @@ fn buildImageUserMessage(
 /// `images`:`--image <path>` 的 \x00 分隔路径列表(null=纯文本)。有图时构造一条
 /// text+images 按序混排的多模态 user 消息(issue #10);读文件/MIME/大小校验失败或
 /// 当前 (provider, model) 不支持图像输入时显式报错退出——绝不静默丢图降级为文本。
+/// `model_error_out`: where the Run leaves why the model failed
+/// (`agent_loop.Options.model_error_out`), for the caller's next-step line.
 pub fn run(
     app: *app_mod.App,
     allocator: std.mem.Allocator,
     prompt: []const u8,
     images: ?[]const u8,
     json_output: bool,
+    model_error_out: ?*?@import("../api/model_error.zig").Detail,
 ) !u8 {
     const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
     if (trimmed.len == 0 and images == null) {
@@ -334,6 +337,7 @@ pub fn run(
             null,
     );
     run_options.obligations = obligation_runtime;
+    run_options.model_error_out = model_error_out;
     // Lesson headers name the run by its journal id (stable for the Run).
     if (run_options.learning_turn) |*learning| if (run_control) |control| {
         learning.run_label = control.journal.runId();

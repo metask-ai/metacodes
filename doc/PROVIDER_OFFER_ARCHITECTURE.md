@@ -489,8 +489,8 @@ installation presents is registered by whoever runs it, and shipping a
 guessed one would point every user's first exchange at a client that is not
 theirs. That is the resolution of #87: the built-in `openai` profile stays
 undeclared, the installation configures its own registration once, and
-`/login openai`, `metacodes login --provider openai` and the picker's
-credential stage then need no `--client-id`. A metask-registered default, if
+`/login openai` and `metacodes login --provider openai` then need no
+`--client-id`. A metask-registered default, if
 one is ever wanted, is a one-line profile constant behind the same precedence.
 
 A profile that declares neither an authorization nor a device endpoint has no
@@ -544,17 +544,14 @@ removes it.
 tests use, as `METASK_GATEWAY_URL` is for Metask. Only https or plain http to
 an exact loopback host is accepted, because the check carries the key.
 
-The three front ends differ only in how the key is typed. The CLI prompts for
+The two front ends differ only in how the key is typed. The CLI prompts for
 the plan, prints the page whole, opens it, and reads the key with echo off;
 echo goes off before the prompt is written, so a paste that arrives early is
 not echoed by the terminal (`--api-key-stdin` and `--key-page` script it).
-`/login` lists such a provider as "API key" and walks plan page → paste. In
-the picker, a commit refused with `MissingCredentials` on a provider with no
-OAuth grant but a key setup enters the credential stage in paste mode: ↑/↓
-picks the plan, Tab opens its page, Enter hands the key to the worker and the
-field is wiped, and a landed key retries the pending commit. Every front end
-masks the key as a character count and draws the page URL whole so it can be
-copied.
+`/login` lists such a provider as "API key" and walks plan page → paste. Both
+mask the key as a character count and draw the page URL whole so it can be
+copied. The picker takes no key (#488): it lists such a provider as not
+configured until a key resolves for it, and says where one goes.
 
 ## Controls
 
@@ -907,21 +904,24 @@ stderr. The loopback wait polls its socket (`platform/net.pollReadable`) and
 checks an `AbortSignal` every 100 ms, and both device-code polls sleep in the
 same slices, so every flow can be cancelled from another thread (#67).
 
-The picker has a credential stage (#67). A commit that fails with
-`MissingCredentials` on an OAuth-capable provider does not leave the overlay:
-`picker_host` prepares the same kernel login (`prepareProfile`, so every
-refusal — no token endpoint, no client id — is the typed one `/login` gives)
-and runs it on a worker thread (`api/login_worker.zig`), whose `Notify` sink is
-a bounded buffer the picker draws in place of the route list: the URL to
-open, or the device code. The TUI's 100 ms input tick polls the worker; `Esc`
-aborts the flow through the signal and returns to the stage the user came
-from; a landed login refreshes the catalog and retries the pending commit, so
-the route the user chose is the one that becomes active. The state machine
-stays pure (`Stage.credential`, `Outcome.login` / `Outcome.cancel_login`); the
-thread, the network and `App` live in the host and the worker. A provider with
-no OAuth grant but a key setup gets the same stage in paste mode
-(`CredentialMode.paste_key`, `Outcome.submit_key` / `Outcome.open_key_page`;
-see *Stored API keys and the guided key login*).
+The picker lists only routes a commit can apply as they are (#488). When it
+opens, and whenever its catalog is refreshed, the host judges every offer by
+the binding a commit runs (`App.judgeReadiness`): the same credential material
+(`App.credentialSources`: the pool, the provider's stored key, for Metask the
+session's own key or the `auth.json` sign-in, `--api-key`, the environment and
+the `.env` layer below it) through `runtime_binding.bindOffer`, with one
+difference — a stored OAuth login stands for the token a commit would refresh
+first, so judging sends no request. The picker hides the offers that would
+not bind (`Picker.setReadiness`), and lists a provider none of whose offers
+would as a dimmed row under "Not configured", below the others. Choosing it
+enters `Stage.setup`, which shows the provider's `model_picker.Setup` — the
+variable its key is read from, `/login` for Metask — with this install's
+`.env` and `doc/LOCAL_CONFIG.md`, and takes no other key than Esc and `q`. A
+commit that still fails with `MissingCredentials` (the credential went away
+after the picker opened) shows the same setup. The picker never signs in or
+takes a key: the credential stage #67 put in it is gone, and `/login <id>` is
+where both happen. A commit that moves the session to another provider says,
+on a second line of its confirmation, who bills the session from then on.
 
 ## Module map
 
