@@ -299,8 +299,10 @@ prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
 无效、bundle 验证失败、本 Session 仍有运行中的 Bash 后台 job 或它带着 team
 （`ProjectRulesRequireDetachedWorkersIdle`）时，Run 在任何 provider 请求之前失败（journal 里
 以错误名关闭）。与其它失败的 Run 不同，这种拒绝只让这个 Run 失败、不 poison Session（与 daemon
-报告 Run 失败后接着处理下一条消息一致）：本次输入不进入 Conversation，Session 回到 idle；被拒的
-suspended Run 续跑（`resumeWithResults`）仍会 poison。journal 打不开仍会 poison。默认 `.ignored` 不读 bundle。ephemeral Session 上设置
+报告 Run 失败后接着处理下一条消息一致）：本次输入不进入 Conversation，Session 回到 idle。被拒的
+suspended Run 续跑（`resumeWithResults`）同样不 poison，答案不进入 Conversation，SessionHost 保留
+挂起：`run_done` 给出错误名，同一 id 的 `ui_request` 再次写入 journal，请求按未回答记录，之后的
+`respond`（重启后也可以）照常续跑。journal 打不开仍会 poison。默认 `.ignored` 不读 bundle。ephemeral Session 上设置
 非默认值在 create 时被拒（`error.RunControlRequiresRunJournal`）；启用 project rules 的
 Session 拒绝 `runIsolated`（`error.ProjectRulesUnsupportedForIsolatedRun`），因为 executor
 自己的 loop 不在 gate 之内。C ABI 的 `SessionConfigV1` 没有这个字段。

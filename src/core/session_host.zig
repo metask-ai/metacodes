@@ -36,7 +36,11 @@
 //! request (`ui_request_store`), `close` leaves it there, a
 //! Session opened again under its id announces it again under the same id,
 //! and `respond` resumes the Run with the answer, once (`AgentSession`'s
-//! `AdmittedRun.resumeWithResults`). A permission request always blocks: the
+//! `AdmittedRun.resumeWithResults`). A resumed Run that fails before the
+//! answer enters the conversation, the Session still usable (the project
+//! rules refused it, #445), keeps the suspension: `run_done` names the
+//! error, the request is announced again under its id and waits for another
+//! answer. A permission request always blocks: the
 //! kernel's permission gate reads a `pending` answer as no answer and denies
 //! the tool. Work submitted while a request waits is queued behind it, and
 //! `Snapshot.queue_waiting` says so.
@@ -2733,8 +2737,9 @@ pub const HostedSession = struct {
         var scope = RunScope{ .hosted = self, .context = context };
         self.session.awaitProviderCancelsDrained();
         var admitted = self.session.admitRun(context.run_id, scope.sink()) catch |err| {
+            const kept = self.keepUnresumed(suspension);
             self.finishRun(context, null, err, null);
-            self.finishResumption();
+            self.endResumption(kept);
             return;
         };
         admitted.stream_retry_budget = suspension.settings.stream_retry_budget;
@@ -2753,16 +2758,68 @@ pub const HostedSession = struct {
         self.current_run_id = 0;
         self.run_returned = true;
         self.mutex.unlock();
+        // Before `settleRun`, so `run_done` already finds the Session
+        // suspended again.
+        const kept = if (outcome) |_| false else |_| self.keepUnresumed(suspension);
         self.settleRun(context, outcome, suspension.settings);
-        self.finishResumption();
+        self.endResumption(kept);
+    }
+
+    /// A resumed Run that failed before its results entered the
+    /// conversation, the Session not poisoned (the project rules refused it,
+    /// #445): the suspension is held again, its request open for another
+    /// answer, as `reopenSuspension` leaves one. The settlement it took is
+    /// spent on the failed Run and dropped; the request gets no new
+    /// expiry, so a refusal that persists never resumes it by itself.
+    /// Otherwise false, and `finishResumption` ends it as before.
+    fn keepUnresumed(self: *HostedSession, suspension: *Suspension) bool {
+        if (self.session.isPoisoned()) return false;
+        const waiting = blk: {
+            var lease = self.conversationLease() catch break :blk false;
+            defer lease.deinit();
+            break :blk callState(lease.conversation, suspension.tool_use_id) == .waiting;
+        };
+        if (!waiting) return false;
+        log.warn("session_host", "request {d} of {s} not resumed, its Run failed first; it stays open", .{ suspension.request_id, self.id.asSlice() });
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (suspension.settled) {
+            .answered => |answered| {
+                self.gpa.free(answered.json);
+                if (answered.by) |by| self.gpa.free(by);
+            },
+            .open, .cancelled => {},
+        }
+        suspension.settled = .open;
+        suspension.expires_at_ms = null;
+        self.resuming = null;
+        self.suspension = suspension;
+        return true;
+    }
+
+    /// After a resumed Run, `finishRun` having reported it: a suspension
+    /// `keepUnresumed` held again is announced again under its id, as a
+    /// Session opened again announces it, and recorded open; any other ends
+    /// as `finishResumption` says.
+    fn endResumption(self: *HostedSession, kept: bool) void {
+        if (!kept) return self.finishResumption();
+        self.mutex.lock();
+        const held = self.suspension;
+        const announce = !self.closing;
+        self.mutex.unlock();
+        const suspension = held orelse return;
+        if (announce) self.journal.append(suspension.announcement);
+        self.storeRequests() catch |err|
+            log.warn("session_host", "request {d} of {s} open again, not recorded; a restart applies the answer it took: {s}", .{ suspension.request_id, self.id.asSlice(), @errorName(err) });
     }
 
     /// After a resumed Run, `finishRun` having written its transcript: when
     /// the committed conversation holds the call's result, the recorded
     /// settlement is spent and the record is rewritten without it (or with
-    /// the suspension the Run was held on again). When it does not (the Run
-    /// failed before the results entered it, or the Session is poisoned),
-    /// the record keeps the settlement for the next open to apply.
+    /// the suspension the Run was held on again). When it does not (the
+    /// Session is poisoned; a Run that failed before the results entered it
+    /// on a usable Session is `keepUnresumed`'s), the record keeps the
+    /// settlement for the next open to apply.
     fn finishResumption(self: *HostedSession) void {
         self.mutex.lock();
         const resumed = self.resuming orelse {

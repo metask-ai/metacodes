@@ -1282,9 +1282,14 @@ leaving every Host to rebuild them:
   the Run is closed in the journal. Unlike other failed Runs, such a refusal
   does not poison the Session, as the daemon reports the Run failed and
   takes the next message: the submission's text never enters the
-  Conversation and the Session is idle again (a refused resumption of a
-  suspended Run still poisons it). A journal that cannot open still
-  poisons. After a Run the bundle is re-attested and the Run's
+  Conversation and the Session is idle again. A refused resumption of a
+  suspended Run (`ui_request_wait = .suspend`) keeps the suspension: after
+  `ui_request_closed` and `run_resumed`, `run_done` names the error, the
+  request's `ui_request` line is journaled again under the same id, the
+  Session is `suspended` with that `pending_request_id`, and the request is
+  recorded open, so the answer the refused Run took is dropped and a later
+  `respond` (also after a restart) resumes the turn. A journal that cannot
+  open still poisons. After a Run the bundle is re-attested and the Run's
   operational observation is published beside the journal.
   `abandoned_run = .record_abandoned` closes a Run whose process died as
   abandoned and runs the next one, as the daemon does; the default,

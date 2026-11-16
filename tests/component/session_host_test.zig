@@ -2163,6 +2163,129 @@ test "L2 #445 SessionHost project rules: an enforced Session opens the daemon's 
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
 }
 
+/// The model asks one question (AskUserQuestion, call `tu_q`).
+const ASK_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_q\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_q\",\"name\":\"AskUserQuestion\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"questions\\\":[{\\\"question\\\":\\\"Ship now?\\\",\\\"header\\\":\\\"Decision\\\",\\\"options\\\":[{\\\"label\\\":\\\"Ship\\\",\\\"description\\\":\\\"Release now\\\"},{\\\"label\\\":\\\"Wait\\\",\\\"description\\\":\\\"Hold the release\\\"}]}]}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+test "L2 #445 SessionHost project rules: a resumption the rules refuse fails that Run and keeps the suspension, open again under its id across a restart, so a later answer resumes the turn; the Session is not poisoned" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state = try subdir(&tmp, "state", &state_buf);
+    const journal_root = try std.fmt.allocPrint(a, "{s}/sessions", .{state});
+    defer a.free(journal_root);
+    const rules_dir = try std.fmt.allocPrint(a, "{s}/project-rules", .{state});
+    defer a.free(rules_dir);
+    const active = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ rules_dir, cc.project_rule_bundle.ACTIVE_FILE }, 0);
+    defer a.free(active);
+    // An active bundle, once written, with a kernel configuration that
+    // cannot be used, whatever this build pins beside its executable.
+    @import("platform").paths.setEnv("METACODES_PROJECT_KERNEL_PATH", "/nonexistent/metacodes-project-kernel");
+    defer @import("platform").paths.unsetEnv("METACODES_PROJECT_KERNEL_PATH");
+
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ ASK_SSE, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const tools = [_][]const u8{"AskUserQuestion"};
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &tools });
+    defer runtime.destroy() catch unreachable;
+    var config = baseConfig(url, workspace, home, &tools);
+    config.run_journal = .{ .exact_root = journal_root };
+    config.run_control = .{ .project_rules = .enforced };
+
+    // Process 1: no bundle yet, so the question's Run is admitted and
+    // suspends on it. Then a bundle the Session cannot attest becomes
+    // active, and the answer's resumption is refused.
+    var id: cc.session_id.SessionId = undefined;
+    const announcement = "{\"v\":1,\"type\":\"ui_request\",\"id\":1,\"kind\":\"ask_question\"";
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config });
+        defer host.release(hosted);
+        id = hosted.id;
+        try hosted.submit(.{ .text = "ask first", .trace_id = "t-refused" });
+        try waitFor(&hosted.journal, "\"stop_reason\":\"suspended\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+
+        try writeFileUnder(rules_dir, cc.project_rule_bundle.ACTIVE_FILE, "{}");
+        try hosted.respond(1, "{\"answers\":[\"Ship\"],\"by\":\"alice\"}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+        // The request closes on the answer and Run 2 resumes, as for any
+        // resumption; the rules refuse it before any provider request.
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\",\"by\":\"alice\"}"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"run_resumed\",\"data\":{\"run_id\":2,\"trace_id\":\"t-refused\",\"request_id\":1}"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":2,\"trace_id\":\"t-refused\",\"stop_reason\":null,\"error_name\":\"ProjectKernelConfigurationInvalid\""));
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+        // Only that Run failed: the suspension is held again and its request
+        // announced again under its id, after the Run's end.
+        try waitFor(&hosted.journal, announcement, 2);
+        {
+            var snapshot = try hosted.snapshot(a);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqual(cc.session_host.Phase.suspended, snapshot.phase);
+            try std.testing.expectEqual(@as(u64, 1), snapshot.pending_request_id);
+        }
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"session_poisoned\""));
+        try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "\"type\":\"run_done\""));
+        // The refused Run is closed in the run journal.
+        try std.testing.expect((try cc.tool_observation_journal.validate(journal_root, hosted.id)).complete);
+    }
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+
+    // Process 2: the bundle withdrawn. The request is open, not settled
+    // with the refused answer: the Session announces it again and waits,
+    // and a new answer resumes the suspended turn with it.
+    try pfs.unlinkPath(active.ptr);
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+        defer host.release(hosted);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, announcement));
+        {
+            var snapshot = try hosted.snapshot(a);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqual(cc.session_host.Phase.suspended, snapshot.phase);
+            try std.testing.expectEqual(@as(u64, 1), snapshot.pending_request_id);
+        }
+        try hosted.respond(1, "{\"answers\":[\"Wait\"],\"by\":\"bob\"}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\",\"by\":\"bob\"}"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"trace_id\":\"t-refused\",\"stop_reason\":\"end_turn\""));
+        try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+        // The suspended call's result is the later answer; the refused one
+        // never reached the conversation.
+        const resumed = server.requestAt(1).?.body();
+        try std.testing.expect(std.mem.indexOf(u8, resumed, "tu_q") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resumed, "{\\\"answers\\\":[\\\"Wait\\\"]}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resumed, "Ship\\\"]}") == null);
+        {
+            var snapshot = try hosted.snapshot(a);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqual(cc.session_host.Phase.idle, snapshot.phase);
+            try std.testing.expectEqual(@as(u64, 0), snapshot.pending_request_id);
+        }
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"session_poisoned\""));
+        try std.testing.expect((try cc.tool_observation_journal.validate(journal_root, hosted.id)).complete);
+    }
+}
+
 test "L2 #445 SessionHost project rules: a Run its dead owner left open keeps a fail_closed Session closed and is recorded abandoned under record_abandoned, as the daemon's RunControl does" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
