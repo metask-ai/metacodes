@@ -2068,7 +2068,7 @@ fn writeFileUnder(dir: []const u8, name: []const u8, bytes: []const u8) !void {
     if (!pfs.writeAll(fd, bytes)) return error.TestWriteFailed;
 }
 
-test "L2 #445 SessionHost project rules: an enforced Session opens the daemon's RunControl, so an active bundle it cannot attest fails the Run before any provider request; an ignored Session never reads it" {
+test "L2 #445 SessionHost project rules: an enforced Session opens the daemon's RunControl, so an active bundle it cannot attest fails the Run before any provider request without poisoning the Session, as the daemon takes the next message; an ignored Session never reads it" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2093,7 +2093,7 @@ test "L2 #445 SessionHost project rules: an enforced Session opens the daemon's 
 
     const answered = try textSse(a, "answered");
     defer a.free(answered);
-    const bodies = [_][]const u8{answered};
+    const bodies = [_][]const u8{ answered, answered };
     var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
@@ -2116,18 +2116,40 @@ test "L2 #445 SessionHost project rules: an enforced Session opens the daemon's 
     enforced_config.run_control = .{ .project_rules = .enforced };
     const enforced = try host.open(.{ .config = enforced_config });
     defer host.release(enforced);
-    try enforced.submit(.{ .text = "governed" });
+    try enforced.submit(.{ .text = "refused prompt" });
     try waitFor(&enforced.journal, "\"type\":\"run_done\"", 1);
     try std.testing.expectEqual(@as(usize, 1), try countLines(&enforced.journal, "\"stop_reason\":null,\"error_name\":\"ProjectKernelConfigurationInvalid\""));
     try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    // Only the Run failed: the Session is idle, not poisoned, as the
+    // daemon reports the Run failed and takes the next message.
     {
         var snapshot = try enforced.snapshot(a);
         defer snapshot.deinit(a);
-        try std.testing.expectEqual(cc.session_host.Phase.poisoned, snapshot.phase);
+        try std.testing.expectEqual(cc.session_host.Phase.idle, snapshot.phase);
     }
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&enforced.journal, "\"type\":\"session_poisoned\""));
     // The refused Run is closed in the journal, so it is no Run a later
     // owner finds abandoned.
     try std.testing.expect((try cc.tool_observation_journal.validate(enforced_root, enforced.id)).complete);
+
+    // The bundle withdrawn, the same Session runs its next message. The
+    // refused prompt never entered its Conversation, so the provider sees
+    // only the new one.
+    {
+        const active = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ rules_dir, cc.project_rule_bundle.ACTIVE_FILE }, 0);
+        defer a.free(active);
+        try pfs.unlinkPath(active.ptr);
+    }
+    try enforced.submit(.{ .text = "admitted prompt" });
+    try waitFor(&enforced.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&enforced.journal, "\"stop_reason\":\"end_turn\""));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    const admitted_body = server.requestAt(0).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, admitted_body, "admitted prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admitted_body, "refused prompt") == null);
+    try std.testing.expect((try cc.tool_observation_journal.validate(enforced_root, enforced.id)).complete);
+    // Restore the bundle for the ignored Session below.
+    try writeFileUnder(rules_dir, cc.project_rule_bundle.ACTIVE_FILE, "{}");
 
     // The same bundle, the same kernel configuration: a Session that does
     // not enforce project rules never loads them.
@@ -2138,7 +2160,7 @@ test "L2 #445 SessionHost project rules: an enforced Session opens the daemon's 
     try ignored.submit(.{ .text = "ungoverned" });
     try waitFor(&ignored.journal, "\"type\":\"run_done\"", 1);
     try std.testing.expectEqual(@as(usize, 1), try countLines(&ignored.journal, "\"stop_reason\":\"end_turn\""));
-    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
 }
 
 test "L2 #445 SessionHost project rules: a Run its dead owner left open keeps a fail_closed Session closed and is recorded abandoned under record_abandoned, as the daemon's RunControl does" {
