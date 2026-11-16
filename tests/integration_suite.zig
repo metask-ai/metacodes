@@ -82,6 +82,7 @@ test {
     _ = @import("component/message_origin_test.zig");
     _ = @import("component/startup_catalogs_test.zig");
     _ = @import("component/mcp_background_startup_test.zig");
+    _ = @import("component/mcp_permission_test.zig");
     _ = @import("component/prompt_model_identity_test.zig");
     _ = @import("component/stream_terminator_test.zig");
     _ = @import("component/stream_retractable_retry_test.zig");

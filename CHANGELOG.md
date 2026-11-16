@@ -395,6 +395,31 @@ status, compatibility boundaries, and entry points are defined by
   executable it writes into a temporary directory. Product code is
   unchanged.
 
+### Security
+
+- **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**
+  (#473). The TUI, `-p`, `--web` and `serve` permissioned a tool an MCP
+  server contributes as a read, so `default`, `acceptEdits` and `auto` ran it
+  on the model's decision alone: a tool that changes something outside the
+  machine (a database, a ticket system, a deployment, a device) ran without a
+  prompt, and text the model read in a web page, a file or another tool's
+  output could steer it there. AgentCore already permissioned the same tool
+  as executing and asked. Every tool a server lists is now permissioned as
+  executing, as `Bash` is: `default`, `acceptEdits` and `auto` ask before it
+  runs (`-p`, with nobody to ask, denies it), `dontAsk` denies it, and
+  `bypassPermissions` runs it. A server's annotations (`readOnlyHint` and the
+  rest) are its own claim and do not relax this. To keep a trusted server's
+  tools running without a prompt, allow the server:
+  `{"permissions": {"allow": ["mcp__<server>"]}}` in a settings file
+  (`mcp__<server>__*` and `mcp__<server>__<tool>` work too), or
+  `--allowedTools mcp__<server>`. Approving a project server in `.mcp.json`
+  only starts it. `ListMcpResourcesTool`, `ReadMcpResourceTool` and the
+  Skill tool keep their classification.
+  `tests/component/mcp_permission_test.zig` runs a real App against the
+  stdio mock server in every mode and under each spelling of the allow rule,
+  and checks what the server received; `tests/tty/cases/test_mcp_permission.py`
+  checks the TUI's dialog.
+
 ## 0.12.0 — 2026-11-13
 
 ### Changed
