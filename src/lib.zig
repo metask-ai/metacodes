@@ -93,6 +93,10 @@ pub const swarm_context = @import("swarm/context.zig"); // Session team membersh
 pub const swarm_team = @import("swarm/team.zig");
 pub const swarm_mailbox = @import("swarm/mailbox.zig");
 pub const swarm_tools = @import("swarm/tools.zig");
+pub const teamwork_types = @import("teamwork/types.zig"); // Teamwork roles, seats, handoff, SeatDriver (#515)
+pub const teamwork_config = @import("teamwork/config.zig"); // `teamwork` config parse/merge/validate
+pub const teamwork_run_dir = @import("teamwork/run_dir.zig"); // per-run state directory (#519)
+pub const teamwork_ledger = @import("teamwork/ledger.zig"); // run budget ledger (#520)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
@@ -257,4 +261,5 @@ test {
     std.testing.refAllDecls(protocol);
     // Test-only: no re-export reaches it (see the file's header).
     _ = &@import("api/model_name_consumers_test.zig");
+    _ = &@import("teamwork/stub_driver.zig");
 }

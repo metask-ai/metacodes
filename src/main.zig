@@ -4333,6 +4333,11 @@ test {
     _ = &@import("swarm/context.zig");
     _ = &@import("swarm/tools.zig");
     _ = &@import("swarm/teammate_process.zig");
+    _ = &@import("teamwork/types.zig");
+    _ = &@import("teamwork/config.zig");
+    _ = &@import("teamwork/run_dir.zig");
+    _ = &@import("teamwork/ledger.zig");
+    _ = &@import("teamwork/stub_driver.zig");
     _ = &@import("core/memory/import.zig");
     _ = &@import("core/memory/claudemd.zig");
     _ = &@import("core/memory/user_context.zig");
