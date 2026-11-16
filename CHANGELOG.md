@@ -12,12 +12,27 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **`/model` is one screen, models first** (follow-up to #527). The models of
+  every configured provider are listed under a heading per provider that says
+  where its key comes from and who bills it, the provider in use first and the
+  cursor on the model in use; typing filters across them all and lists the
+  matches flat. A model served on several routes lists them under it, in
+  words, while the cursor is on it; Enter on the model takes its preferred
+  route, Enter on a route takes that one. The reasoning level is a line under
+  the list, changed with ←/→ from any row, and kept as the level wanted: each
+  model shows and commits the nearest one it takes. The three scopes are named
+  in the header. Providers without a key are one "Not configured" line at the
+  bottom; Enter lists them. Closing the picker without a choice prints
+  `kept <model>`. On the Metask session, `/model` lists only the models the
+  gateway serves on `/v1/messages`, with the reasoning levels it names
+  (`capabilities.reasoning.efforts`); before, it listed the gateway's image
+  and video models too, and offered no level.
+
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
   be refused with `INVALID_ARGUMENT`; the blocks now lead the Skill's
   invocation record, so the selected Skill sees them, and the date, from its
   first request (`doc/AGENTCORE_BINARY_ABI.md`).
-
 - **The Metask sign-in moves to `www.metask-ai.com` and is kept as the Metask
   session** (#527). `/login` and `metacodes login` sign in at Metask's OAuth
   server as the public client `metacodes`, ask for `read model:invoke`, and

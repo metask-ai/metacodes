@@ -642,16 +642,24 @@ fn drawPicker(app: *App, buffer: []u8) []const u8 {
 }
 
 /// Move the provider stage's cursor onto `provider`'s row.
+/// Filter the picker to `provider`, as a user who types its name, and put
+/// the cursor on its first model: that model's row, ready (a pick applies
+/// it) or not (Enter shows where its credential goes).
 fn cursorOnProvider(app: *App, ui: *cc.tui_ui_state.UiState, provider: []const u8) !cc.repl_model_picker.Group {
     const picker = &app.model_picker;
+    for (provider) |byte| _ = cc.repl_picker_host.onKey(app, ui, .{ .char = byte }, .unguarded);
     var rows = cc.repl_model_picker.Picker.RowBuffer.init(testing.allocator);
     defer rows.deinit();
-    const listed = try picker.rows(&rows);
-    const index = for (listed, 0..) |row, index| {
-        if (picker.offers.items[row.provider.offer_index].provider_id.eqlText(provider)) break index;
-    } else return error.ProviderNotListed;
-    for (0..index) |_| _ = cc.repl_picker_host.onKey(app, ui, .down, .unguarded);
-    return listed[index].provider;
+    // Other providers' models can match the name too ("kimi" also finds
+    // kimi-code's): down until the cursor is on this one's.
+    for (0..64) |_| {
+        const listed = try picker.rows(&rows);
+        if (listed.len == 0) return error.ProviderNotListed;
+        const row = listed[@min(picker.cursor, listed.len - 1)];
+        if (row == .model and picker.offers.items[row.model.offer_index].provider_id.eqlText(provider)) return row.model;
+        _ = cc.repl_picker_host.onKey(app, ui, .down, .unguarded);
+    }
+    return error.ProviderNotListed;
 }
 
 fn expectSetupOf(text: []const u8, variable: []const u8, env_path: []const u8) !void {
@@ -726,11 +734,7 @@ test "state .env: a provider whose two key names disagree stays listed, and a pi
     var ui: cc.tui_ui_state.UiState = .{};
     cc.repl_picker_host.open(app, &ui, .unguarded);
     try testing.expect((try cursorOnProvider(app, &ui, "gemini")).ready);
-    // Provider, model, channel: Enter takes the first of each, up to the
-    // options; Enter there applies the route.
-    var steps: usize = 0;
-    while (picker.stage != .options and steps < 5) : (steps += 1) _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
-    try testing.expectEqual(cc.repl_model_picker.Stage.options, picker.stage);
+    // Enter on the model applies its preferred route.
     _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
 
     try testing.expect(picker.stage != .setup);
@@ -760,10 +764,8 @@ test "state .env: a pick whose key went away after the picker opened shows the p
     var ui: cc.tui_ui_state.UiState = .{};
     cc.repl_picker_host.open(app, &ui, .unguarded);
     try testing.expect((try cursorOnProvider(app, &ui, "kimi")).ready);
-    // Provider, model, channel: each Enter takes the first. Then the key
-    // goes, and Enter on the options applies the route.
-    for (0..3) |_| _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
-    try testing.expectEqual(cc.repl_model_picker.Stage.options, picker.stage);
+    // The key goes, then Enter on the model applies its route.
+    try testing.expectEqual(cc.repl_model_picker.Stage.list, picker.stage);
     ppaths.unsetEnv("MOONSHOT_API_KEY");
     try testing.expectEqual(cc.repl_picker_host.Result.redraw, cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded));
 
@@ -773,9 +775,11 @@ test "state .env: a pick whose key went away after the picker opened shows the p
     try testing.expect(std.mem.indexOf(u8, text, "no credential for kimi; the previous route is still active") != null);
     try expectSetupOf(text, "MOONSHOT_API_KEY", try std.fs.path.join(a, &.{ case.state, ".env" }));
     try testing.expectEqualStrings("claude-sonnet-4-6", app.activeModel());
-    // Esc goes back to the route the user was applying.
+    // Esc goes back to the model the user was applying, in the list.
     _ = cc.repl_picker_host.onKey(app, &ui, .escape, .unguarded);
-    try testing.expectEqual(cc.repl_model_picker.Stage.options, picker.stage);
+    try testing.expectEqual(cc.repl_model_picker.Stage.list, picker.stage);
+    const back = picker.focusedOffer() orelse return error.NoFocusedRoute;
+    try testing.expect(back.provider_id.eqlText("kimi"));
 }
 
 test "state .env: /model lists a provider whose key is only in the file as one a pick applies, with the file's key (#488)" {
