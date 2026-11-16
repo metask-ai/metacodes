@@ -97,6 +97,8 @@ pub const teamwork_types = @import("teamwork/types.zig"); // Teamwork roles, sea
 pub const teamwork_config = @import("teamwork/config.zig"); // `teamwork` config parse/merge/validate
 pub const teamwork_run_dir = @import("teamwork/run_dir.zig"); // per-run state directory (#519)
 pub const teamwork_ledger = @import("teamwork/ledger.zig"); // run budget ledger (#520)
+pub const teamwork_charters = @import("teamwork/charters.zig"); // role charters (#515)
+pub const teamwork_drivers = @import("teamwork/drivers/factory.zig"); // seat drivers by harness (#515, #521)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
@@ -262,4 +264,9 @@ test {
     // Test-only: no re-export reaches it (see the file's header).
     _ = &@import("api/model_name_consumers_test.zig");
     _ = &@import("teamwork/stub_driver.zig");
+    _ = &@import("teamwork/drivers/common.zig");
+    _ = &@import("teamwork/drivers/write_scope.zig");
+    _ = &@import("teamwork/drivers/metacodes.zig");
+    _ = &@import("teamwork/drivers/claude_code.zig");
+    _ = &@import("teamwork/drivers/drivers_test.zig");
 }

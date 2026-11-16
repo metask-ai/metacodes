@@ -213,6 +213,10 @@ pub const SeatError = union(enum) {
     exited: u8,
     /// The harness was killed by this signal.
     signaled: u32,
+    /// The harness outlived the driver's hard time limit and was killed. (A
+    /// `wallclock_only` seat that reaches its own limit is
+    /// `budget_exhausted` instead: that limit is its budget.)
+    timed_out,
     /// The harness ended without writing `handoff.md`.
     handoff_missing,
     /// `handoff.md` exists but breaks the contract.
@@ -370,9 +374,10 @@ pub const SeatPaths = struct {
     workspace: []const u8,
 };
 
-/// One harness's way of running a seat. Implementations: the metacodes
-/// subagent driver and the Claude Code child-process driver (both later
-/// branches); `stub_driver.zig` is the test double.
+/// One harness's way of running a seat. Implementations:
+/// `drivers/metacodes.zig` (in-process subagent) and
+/// `drivers/claude_code.zig` (child process), chosen per seat by
+/// `drivers/factory.zig`; `stub_driver.zig` is the test double.
 ///
 /// Every harness-level failure (spawn error, nonzero exit, missing or invalid
 /// handoff, abort, budget stop) is a `SeatOutcome`, not a Zig error: the only
