@@ -97,14 +97,28 @@ provider's sign-in directly; either runs the kernel OAuth flow on a worker
 thread (`Esc` cancels it) and stores the login where
 `metacodes login --provider <id>` does (issue #33); `--client-id` is needed
 only when neither the profile nor `providers.<id>.oauth_client_id` in
-`~/.metacodes/config.json` names the installation's registered client (#87). Choosing a route whose
-OAuth-capable provider has no credential signs in inside the picker: the
-authorization URL or device code is drawn in the overlay, `Esc` cancels the
-flow, and the chosen route is committed once the login lands (issue #67). A
-provider that takes a pasted key instead (`zai-coding-plan`, `kimi-code`) is listed in
-`/login` as "API key", and choosing one of its routes without a key shows its
-key pages in the picker: ↑/↓ picks the plan, Tab opens the page, the key is
-typed masked, and Enter checks and stores it before the route is committed.
+`~/.metacodes/config.json` names the installation's registered client (#87). A
+provider that takes a pasted key instead (`zai-coding-plan`, `kimi-code`) is
+listed in `/login` as "API key": ↑/↓ picks the plan, its page opens, the key is
+typed masked, and Enter checks and stores it.
+
+The picker lists only routes a commit can apply as they are (#488): a route is
+listed when a credential resolves for it now, by the same resolution a commit
+binds with, without a request: the environment, `<state root>/.env`, a key
+`/login <id>` stored, a provider's stored OAuth login, a credential-pool
+member, `--api-key` for the provider it was given for, and for Metask the
+session's own key or, in a session started on another provider, the key
+`metacodes login` stored in `auth.json`. Only a missing credential takes a
+route off the list: a route refused for another reason (two names of its key
+that disagree, say) stays listed, and a commit reports why. A
+provider none of whose routes has one is listed dimmed under "Not
+configured", below the others; choosing it shows the variable its key is read
+from, this install's `<state root>/.env` and `doc/LOCAL_CONFIG.md` (for
+Metask, `/login` first), and nothing else: the picker starts no sign-in, takes
+no key and sends no request. A commit that still finds no credential shows the
+same. `/login <id>` is where a key is pasted or a provider signed in to; the
+in-picker sign-in and key stage of #67 are gone. When a commit moves the
+session to another provider, its confirmation says who bills it from then on.
 
 A committed route is broadcast on the UI event stream as `config_changed` →
 `route`, carrying provider, channel, protocol, wire model id, offer id,

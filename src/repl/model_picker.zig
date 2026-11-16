@@ -17,6 +17,13 @@
 //! *canonical id*, never by visible name: two channels serving "GLM-4.6" over
 //! different protocols, regions, or prices are different routes, and collapsing
 //! them by display name would hide the choice this whole model exists to give.
+//!
+//! Every route the list offers can be applied as it is (#488). The host says,
+//! per offer, whether a commit would find a credential for it now
+//! (`setReadiness`); an offer without one is not listed, and a provider with
+//! none of its offers ready sits dimmed in a "Not configured" group under the
+//! others. Choosing such a provider shows where its credential goes
+//! (`Stage.setup`) and nothing else: no sign-in, no key field, no request.
 
 const std = @import("std");
 const control_plane = @import("../provider/control_plane.zig");
@@ -34,11 +41,21 @@ pub const MAX_FILTER: usize = 64;
 /// Canonical grouping keys are model ids, which are short; a longer one is
 /// truncated for grouping only and never for routing.
 pub const MAX_GROUP_KEY: usize = 128;
+/// Room for this install's `<state root>/.env`, as the setup stage shows it.
+pub const MAX_LOCAL_CONFIG_PATH: usize = 1024;
 
-pub const Stage = enum { provider, model, offer, options, credential };
+pub const Stage = enum { provider, model, offer, options, setup };
 
-/// What the credential stage can show of the flow's transcript.
-pub const MAX_CREDENTIAL_LINES: usize = 512;
+/// Where a provider that is not configured gets its credential, as the setup
+/// stage shows it (#488). The host derives it from the provider's profile.
+pub const Setup = struct {
+    provider: Slug,
+    /// The variable its key is read from (the canonical alias, else the
+    /// first), borrowed from the provider registry. Null: it declares none.
+    variable: ?[]const u8 = null,
+    /// Signing in with `/login` is the way in (Metask).
+    sign_in: bool = false,
+};
 
 /// What the list is showing right now. `stale` and `failed` are states a client
 /// must be able to render: a picker that silently shows an out-of-date catalog
@@ -55,6 +72,9 @@ pub const Group = struct {
     label: []const u8,
     /// True when the committed selection is one of the offers behind this row.
     is_current: bool,
+    /// False for a provider none of whose offers a commit could bind now: its
+    /// row is in the "Not configured" group and opens its setup (#488).
+    ready: bool = true,
 };
 
 pub const Row = union(enum) {
@@ -78,33 +98,7 @@ pub const Outcome = union(enum) {
     ignored,
     closed,
     commit: Commit,
-    /// The commit needs a credential the provider can be signed in for:
-    /// the host starts that login and the picker shows it (#67).
-    login: Slug,
-    /// Esc in the credential stage: the host aborts the running login.
-    cancel_login,
-    /// Enter on a pasted key (`credential_mode == .paste_key`): the host checks
-    /// and stores `keyText()` for `credential_provider`, then retries the
-    /// pending commit.
-    submit_key,
-    /// Tab on the key step: the host opens the chosen key page.
-    open_key_page,
 };
-
-/// A page an API key is created on, as the credential stage shows it. The
-/// host maps its provider's key pages to these; the strings are borrowed from
-/// the provider registry for as long as the stage is shown.
-pub const KeyChoice = struct {
-    label: []const u8,
-    url: []const u8,
-};
-
-pub const MAX_KEY_CHOICES: usize = 8;
-pub const MAX_KEY_LEN: usize = 512;
-
-/// What the credential stage is doing: following an OAuth sign-in, or taking
-/// a pasted API key for a provider that has no OAuth grant.
-pub const CredentialMode = enum { sign_in, paste_key };
 
 pub const Key = union(enum) {
     up,
@@ -150,25 +144,24 @@ pub const Picker = struct {
     /// allocation alive.
     notice_buffer: [512]u8 = undefined,
     notice_len: usize = 0,
-    /// The credential stage (#67): the commit that wanted a credential, the
-    /// provider being signed in to, where Esc returns, and the flow's
-    /// transcript (a bounded copy the host refreshes on its idle tick).
-    pending_commit: ?Commit = null,
-    credential_provider: ?Slug = null,
-    credential_return_stage: Stage = .model,
-    credential_failed: bool = false,
-    credential_lines: [MAX_CREDENTIAL_LINES]u8 = undefined,
-    credential_lines_len: usize = 0,
-    credential_mode: CredentialMode = .sign_in,
-    key_choices: [MAX_KEY_CHOICES]KeyChoice = undefined,
-    key_choice_count: usize = 0,
-    key_choice: usize = 0,
-    /// What the provider asks the user to know before creating a key.
-    key_note: ?[]const u8 = null,
-    key_buffer: [MAX_KEY_LEN]u8 = undefined,
-    key_len: usize = 0,
-    /// The pasted key is being checked; typing waits for the answer.
-    key_checking: bool = false,
+
+    /// Per offer of `offers`: a commit could bind it now (#488). An offer past
+    /// its end counts as ready, so a snapshot no verdict came with hides
+    /// nothing (`adopt` empties it; `setReadiness` fills it).
+    ready: std.ArrayList(bool) = .empty,
+    /// Where each provider with no ready offer gets its credential.
+    setups: std.ArrayList(Setup) = .empty,
+    /// What the setup stage shows.
+    setup: ?Setup = null,
+    /// Where Esc leaves the setup stage for: the stage and row it was opened
+    /// from.
+    setup_return_stage: Stage = .provider,
+    setup_return_cursor: usize = 0,
+    /// This install's `<state root>/.env` and the guide to it, for the setup
+    /// stage; the host sets both when it opens the picker.
+    local_config_path_buffer: [MAX_LOCAL_CONFIG_PATH]u8 = undefined,
+    local_config_path_len: usize = 0,
+    guide_url: []const u8 = "",
 
     provider: ?Slug = null,
     group_key_buffer: [MAX_GROUP_KEY]u8 = undefined,
@@ -188,6 +181,8 @@ pub const Picker = struct {
 
     pub fn deinit(self: *Picker) void {
         self.offers.deinit(self.allocator);
+        self.ready.deinit(self.allocator);
+        self.setups.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -227,24 +222,113 @@ pub const Picker = struct {
     ) error{OutOfMemory}!void {
         self.offers.clearRetainingCapacity();
         try self.offers.appendSlice(self.allocator, page.offers);
+        // The verdicts were about the previous snapshot.
+        self.ready.clearRetainingCapacity();
+        self.setups.clearRetainingCapacity();
         self.catalog_revision = page.meta.catalog_revision;
         self.config_revision = page.meta.config_revision;
         self.current_offer = current_offer;
         self.status = if (self.offers.items.len == 0) .empty else .ready;
+        self.stepBackFromLostDraft();
+    }
 
-        // A refresh can remove the offer a half-finished draft was built on:
-        // the options stage would then render nothing and Enter would silently
-        // do nothing, because there is no offer left to commit. Step back to
-        // where a choice is still possible and say why.
-        if (self.offer_id != null and self.currentOfferIndex() == null) {
+    /// Which offers of the snapshot a commit could bind now (`ready`, in
+    /// snapshot order), and where each provider with none of them gets its
+    /// credential (#488). The host calls it right after `adopt`, under the
+    /// same lock.
+    pub fn setReadiness(self: *Picker, ready: []const bool, setups: []const Setup) error{OutOfMemory}!void {
+        self.ready.clearRetainingCapacity();
+        self.setups.clearRetainingCapacity();
+        try self.ready.appendSlice(self.allocator, ready[0..@min(ready.len, self.offers.items.len)]);
+        try self.setups.appendSlice(self.allocator, setups);
+        self.stepBackFromLostDraft();
+    }
+
+    /// A refresh can take away the offer a half-finished draft was built on
+    /// (it is gone, or no longer has a credential), or every ready offer of
+    /// its provider: the stage would render nothing and Enter silently do
+    /// nothing. Step back to where a choice is still possible and say why.
+    fn stepBackFromLostDraft(self: *Picker) void {
+        if (self.provider) |provider| if (self.stage != .provider and self.stage != .setup and !self.providerReady(provider)) {
+            self.provider = null;
+            self.group_key_len = 0;
             self.offer_id = null;
             self.controls = .{};
-            if (self.stage == .options or self.stage == .offer) self.stage = .model;
+            self.stage = .provider;
             self.cursor = 0;
             self.window_top = 0;
-            self.setNotice("that route is no longer offered; pick another", .{});
+            self.setNotice("{s} has no usable route now; pick another", .{provider.slice()});
+        };
+        if (self.offer_id != null) {
+            const lost = if (self.currentOfferIndex()) |index| !self.isReady(index) else true;
+            if (lost) {
+                self.offer_id = null;
+                self.controls = .{};
+                if (self.stage == .options or self.stage == .offer) self.stage = .model;
+                self.cursor = 0;
+                self.window_top = 0;
+                self.setNotice("that route is no longer offered; pick another", .{});
+            }
         }
         self.clampCursor();
+    }
+
+    /// Whether a commit could bind the offer at `index` now.
+    pub fn isReady(self: *const Picker, index: usize) bool {
+        return index >= self.ready.items.len or self.ready.items[index];
+    }
+
+    /// Whether any offer of `provider` is ready.
+    pub fn providerReady(self: *const Picker, provider: Slug) bool {
+        for (self.offers.items, 0..) |offer, index| {
+            if (offer.provider_id.eql(provider) and self.isReady(index)) return true;
+        }
+        return false;
+    }
+
+    /// Where `provider` gets its credential, as the host described it; just
+    /// the provider when the host said nothing about it.
+    pub fn setupFor(self: *const Picker, provider: Slug) Setup {
+        for (self.setups.items) |entry| {
+            if (entry.provider.eql(provider)) return entry;
+        }
+        return .{ .provider = provider };
+    }
+
+    /// This install's `<state root>/.env` (copied, cut at
+    /// `MAX_LOCAL_CONFIG_PATH`) and the guide to it (borrowed; a static
+    /// string), for the setup stage.
+    pub fn setLocalConfig(self: *Picker, path: []const u8, guide: []const u8) void {
+        const len = @min(path.len, MAX_LOCAL_CONFIG_PATH);
+        @memcpy(self.local_config_path_buffer[0..len], path[0..len]);
+        self.local_config_path_len = len;
+        self.guide_url = guide;
+    }
+
+    pub fn localConfigPath(self: *const Picker) []const u8 {
+        return self.local_config_path_buffer[0..self.local_config_path_len];
+    }
+
+    /// Show where `setup.provider` gets its credential in place of the list:
+    /// Enter on a provider in the "Not configured" group, or a commit the
+    /// host found no credential for (#488). Esc goes back to where the user
+    /// was, filter and row included.
+    pub fn enterSetup(self: *Picker, setup: Setup) void {
+        if (self.stage != .setup) {
+            self.setup_return_stage = self.stage;
+            self.setup_return_cursor = self.cursor;
+        }
+        self.setup = setup;
+        self.stage = .setup;
+    }
+
+    fn leaveSetup(self: *Picker) void {
+        self.stage = self.setup_return_stage;
+        self.setup = null;
+        self.notice_len = 0;
+        self.cursor = self.setup_return_cursor;
+        // A refresh while the setup was shown may have taken the draft away.
+        self.stepBackFromLostDraft();
     }
 
     /// Mark the snapshot out of date without discarding it: the user keeps
@@ -271,172 +355,9 @@ pub const Picker = struct {
         self.controls = .{};
         self.preset_controls = .{};
         self.scope = .session;
-        self.pending_commit = null;
-        self.credential_provider = null;
-        self.credential_return_stage = .model;
-        self.credential_failed = false;
-        self.credential_lines_len = 0;
-        self.leaveKeyMode();
-    }
-
-    /// A commit that needs an API key the provider has no OAuth grant for:
-    /// show its key pages and take the pasted key in place of the list. The
-    /// choices are copied (at most `MAX_KEY_CHOICES`); their strings are
-    /// borrowed.
-    pub fn enterKeyStage(
-        self: *Picker,
-        provider: Slug,
-        commit: Commit,
-        choices: []const KeyChoice,
-        default_choice: usize,
-        note: ?[]const u8,
-    ) Outcome {
-        _ = self.enterCredentialStage(provider, commit);
-        self.credential_mode = .paste_key;
-        self.key_choice_count = @min(choices.len, MAX_KEY_CHOICES);
-        @memcpy(self.key_choices[0..self.key_choice_count], choices[0..self.key_choice_count]);
-        self.key_choice = @min(default_choice, self.key_choice_count -| 1);
-        self.key_note = note;
-        self.clearKey();
-        return .redraw;
-    }
-
-    pub fn keyText(self: *const Picker) []const u8 {
-        return self.key_buffer[0..self.key_len];
-    }
-
-    pub fn keyChoices(self: *const Picker) []const KeyChoice {
-        return self.key_choices[0..self.key_choice_count];
-    }
-
-    /// The key is handed to the host (which copies it); the field is wiped.
-    pub fn clearKey(self: *Picker) void {
-        std.crypto.secureZero(u8, self.key_buffer[0..self.key_len]);
-        self.key_len = 0;
-    }
-
-    fn leaveKeyMode(self: *Picker) void {
-        self.clearKey();
-        self.credential_mode = .sign_in;
-        self.key_choice_count = 0;
-        self.key_choice = 0;
-        self.key_note = null;
-        self.key_checking = false;
-    }
-
-    /// Keys on the paste-a-key step.
-    fn onKeyStep(self: *Picker, key: Key) Outcome {
-        if (key == .escape) return self.back();
-        // While the key is being checked, only Esc (above) does anything.
-        if (self.key_checking) return .ignored;
-        switch (key) {
-            .up, .down => {
-                if (self.key_choice_count == 0) return .ignored;
-                self.key_choice = if (key == .down)
-                    (self.key_choice + 1) % self.key_choice_count
-                else if (self.key_choice == 0) self.key_choice_count - 1 else self.key_choice - 1;
-                return .redraw;
-            },
-            .cycle_scope => return if (self.key_choice_count == 0) .ignored else .open_key_page,
-            .backspace => {
-                if (self.key_len == 0) return .ignored;
-                self.key_len -= 1;
-                self.key_buffer[self.key_len] = 0;
-                return .redraw;
-            },
-            .char => |byte| {
-                // A paste arrives as characters; whitespace and controls a
-                // terminal adds around it are not part of a key.
-                if (byte <= ' ' or byte == 0x7f) return .ignored;
-                if (self.key_len == self.key_buffer.len) return .ignored;
-                if (self.credential_failed) {
-                    // A new attempt after a refused key starts clean.
-                    self.credential_failed = false;
-                    self.notice_len = 0;
-                    self.credential_lines_len = 0;
-                }
-                self.key_buffer[self.key_len] = byte;
-                self.key_len += 1;
-                return .redraw;
-            },
-            .enter => {
-                if (self.key_len == 0) return .ignored;
-                return .submit_key;
-            },
-            else => return .ignored,
-        }
-    }
-
-    /// The host started checking the key: show the check, not the field.
-    pub fn keySubmitted(self: *Picker) void {
-        self.clearKey();
-        self.key_checking = true;
-        self.credential_failed = false;
-        self.credential_lines_len = 0;
-    }
-
-    /// A commit the host could not perform for want of a credential (#67):
-    /// remember it, and show the sign-in the host starts in place of the list.
-    pub fn enterCredentialStage(self: *Picker, provider: Slug, commit: Commit) Outcome {
-        self.pending_commit = commit;
-        self.credential_provider = provider;
-        self.credential_return_stage = self.stage;
-        self.credential_failed = false;
-        self.credential_lines_len = 0;
-        self.notice_len = 0;
-        self.stage = .credential;
-        self.cursor = 0;
-        self.window_top = 0;
-        return .{ .login = provider };
-    }
-
-    /// The flow's transcript so far (bounded copy). True when it changed, so
-    /// the host redraws only then.
-    pub fn setCredentialLines(self: *Picker, text: []const u8) bool {
-        const len = @min(text.len, self.credential_lines.len);
-        if (len == self.credential_lines_len and std.mem.eql(u8, self.credential_lines[0..len], text[0..len])) return false;
-        @memcpy(self.credential_lines[0..len], text[0..len]);
-        self.credential_lines_len = len;
-        return true;
-    }
-
-    pub fn credentialLines(self: *const Picker) []const u8 {
-        return self.credential_lines[0..self.credential_lines_len];
-    }
-
-    /// The login ended without a credential; the stage stays so the user can
-    /// read why, and Esc returns without a further notice.
-    pub fn credentialFailed(self: *Picker, error_name: []const u8) void {
-        self.credential_failed = true;
-        if (self.credential_mode == .paste_key) {
-            self.key_checking = false;
-            if (std.mem.eql(u8, error_name, "KeyRefused")) {
-                self.setNotice("the provider refused that key; paste another, or Esc returns to the route list", .{});
-            } else {
-                self.setNotice("the key was not stored ({s}); paste it again, or Esc returns to the route list", .{error_name});
-            }
-            return;
-        }
-        self.setNotice("sign-in failed ({s}); Esc returns to the route list", .{error_name});
-    }
-
-    /// After the login landed: the commit to retry, with the picker back on
-    /// the stage the user came from.
-    pub fn takePendingCommit(self: *Picker) ?Commit {
-        const commit = self.pending_commit;
-        self.leaveCredentialStage();
-        return commit;
-    }
-
-    fn leaveCredentialStage(self: *Picker) void {
-        self.stage = self.credential_return_stage;
-        self.pending_commit = null;
-        self.credential_provider = null;
-        self.credential_failed = false;
-        self.credential_lines_len = 0;
-        self.leaveKeyMode();
-        self.cursor = 0;
-        self.window_top = 0;
+        self.setup = null;
+        self.setup_return_stage = .provider;
+        self.setup_return_cursor = 0;
     }
 
     // ── row construction ────────────────────────────────────────────────────
@@ -470,7 +391,7 @@ pub const Picker = struct {
             .model => try self.modelRows(buffer),
             .offer => try self.offerRows(buffer),
             .options => try self.controlRows(buffer),
-            .credential => {},
+            .setup => {},
         }
         return buffer.list.items;
     }
@@ -483,29 +404,39 @@ pub const Picker = struct {
     }
 
     fn providerRows(self: *const Picker, buffer: *RowBuffer) error{OutOfMemory}!void {
-        // By pointer: a provider id is an inline `Slug`, so the label of a by-value
-        // capture points into the loop variable. Every stored label then read the
-        // offer being visited, and providers whose ids had the same length
-        // (metask, openai, gemini) folded into the first one's row.
-        for (self.offers.items, 0..) |*offer, index| {
-            const label = offer.provider_id.slice();
-            // The filter also matches what the provider *serves*. The first
-            // stage is the one where the user knows least: someone looking for
-            // GLM should not have to already know it lives behind
-            // `zai-coding-plan`.
-            if (!matches(self.filter(), label) and
-                !matches(self.filter(), offer.display_name) and
-                !matches(self.filter(), canonicalKey(offer.*))) continue;
-            if (findGroup(buffer.list.items, label, self)) |existing| {
-                bumpGroup(&buffer.list.items[existing], index, self.isCurrent(offer.*));
-                continue;
+        // The providers a commit can use, counting their ready offers; then,
+        // as the "Not configured" group below them, those with no ready offer
+        // at all (#488), each in catalog order.
+        for ([_]bool{ true, false }) |configured| {
+            const group_start = buffer.list.items.len;
+            // By pointer: a provider id is an inline `Slug`, so the label of a by-value
+            // capture points into the loop variable. Every stored label then read the
+            // offer being visited, and providers whose ids had the same length
+            // (metask, openai, gemini) folded into the first one's row.
+            for (self.offers.items, 0..) |*offer, index| {
+                if (configured) {
+                    if (!self.isReady(index)) continue;
+                } else if (self.providerReady(offer.provider_id)) continue;
+                const label = offer.provider_id.slice();
+                // The filter also matches what the provider *serves*. The first
+                // stage is the one where the user knows least: someone looking for
+                // GLM should not have to already know it lives behind
+                // `zai-coding-plan`.
+                if (!matches(self.filter(), label) and
+                    !matches(self.filter(), offer.display_name) and
+                    !matches(self.filter(), canonicalKey(offer.*))) continue;
+                if (findGroup(buffer.list.items[group_start..], label, self)) |existing| {
+                    bumpGroup(&buffer.list.items[group_start + existing], index, self.isCurrent(offer.*));
+                    continue;
+                }
+                try buffer.list.append(buffer.gpa, .{ .provider = .{
+                    .offer_index = index,
+                    .offer_count = 1,
+                    .label = label,
+                    .is_current = self.isCurrent(offer.*),
+                    .ready = configured,
+                } });
             }
-            try buffer.list.append(buffer.gpa, .{ .provider = .{
-                .offer_index = index,
-                .offer_count = 1,
-                .label = label,
-                .is_current = self.isCurrent(offer.*),
-            } });
         }
     }
 
@@ -513,6 +444,8 @@ pub const Picker = struct {
         const wanted = self.provider orelse return;
         for (self.offers.items, 0..) |offer, index| {
             if (!offer.provider_id.eql(wanted)) continue;
+            // Listed only when a commit could bind it now (#488).
+            if (!self.isReady(index)) continue;
             const key = canonicalKey(offer);
             if (!matches(self.filter(), offer.display_name) and
                 !matches(self.filter(), key) and
@@ -536,6 +469,7 @@ pub const Picker = struct {
         for (self.offers.items, 0..) |offer, index| {
             if (!offer.provider_id.eql(wanted)) continue;
             if (!std.mem.eql(u8, canonicalKey(offer), key)) continue;
+            if (!self.isReady(index)) continue;
             // Deliberately no filter on this stage: it exists precisely to show
             // every route behind one visible name, and a filter over names
             // would hide the ones that share it.
@@ -579,12 +513,13 @@ pub const Picker = struct {
     // ── key handling ────────────────────────────────────────────────────────
 
     pub fn onKey(self: *Picker, key: Key) Outcome {
-        // The credential stage has no list to move in: a sign-in takes only
-        // Esc; the paste-a-key step takes the key.
-        if (self.stage == .credential) {
-            if (self.credential_mode == .paste_key) return self.onKeyStep(key);
-            return if (key == .escape) self.back() else .ignored;
-        }
+        // The setup stage has no list: Esc goes back, q closes, and nothing
+        // else does anything — it starts no sign-in and takes no key (#488).
+        if (self.stage == .setup) return switch (key) {
+            .escape => self.back(),
+            .char => |byte| if (byte == 'q') .closed else .ignored,
+            else => .ignored,
+        };
         var buffer = RowBuffer.init(self.allocator);
         defer buffer.deinit();
         // Without its rows a key cannot be interpreted; nothing changes.
@@ -695,6 +630,12 @@ pub const Picker = struct {
     }
 
     fn back(self: *Picker) Outcome {
+        // The setup stage keeps the filter it was opened under: Esc returns to
+        // that list, on the row it was opened from.
+        if (self.stage == .setup) {
+            self.leaveSetup();
+            return .redraw;
+        }
         if (self.filter_len > 0) {
             self.filter_len = 0;
             self.cursor = 0;
@@ -721,19 +662,7 @@ pub const Picker = struct {
                 self.offer_id = null;
                 self.controls = .{};
             },
-            .credential => {
-                // Esc ends the sign-in: the host aborts the worker on
-                // `.cancel_login`; the draft route stays selectable.
-                if (self.credential_failed) {
-                    self.notice_len = 0;
-                } else if (self.credential_mode == .paste_key) {
-                    self.setNotice("no key was stored; the previous route is still active", .{});
-                } else {
-                    self.setNotice("sign-in cancelled; the previous route is still active", .{});
-                }
-                self.leaveCredentialStage();
-                return .cancel_login;
-            },
+            .setup => unreachable, // handled above
         }
         self.cursor = 0;
         self.window_top = 0;
@@ -752,7 +681,14 @@ pub const Picker = struct {
         const row = visible[@min(self.cursor, visible.len - 1)];
         switch (row) {
             .provider => |group| {
-                self.provider = self.offers.items[group.offer_index].provider_id;
+                const provider = self.offers.items[group.offer_index].provider_id;
+                if (!group.ready) {
+                    // Not configured: where its credential goes, and nothing
+                    // more (#488).
+                    self.enterSetup(self.setupFor(provider));
+                    return .redraw;
+                }
+                self.provider = provider;
                 self.stage = .model;
                 self.filter_len = 0;
                 self.cursor = 0;
@@ -1466,134 +1402,182 @@ test "the provider stage is searchable by what a provider serves" {
     try testing.expectEqual(@as(usize, 1), (try picker.rows(&scratch)).len);
 }
 
-test "a commit refused for want of a credential enters the credential stage and Esc brings it back" {
+/// The offers of `fixtureOffer`'s three providers: metask (two models),
+/// kimi (one model on two channels), deepseek (one model).
+fn readinessFixture() [5]OfferSummary {
+    return .{
+        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
+        fixtureOffer("kimi", "cn-openai", "Kimi K3", "moonshotai/kimi-k3", "kimi-k3", "openai_chat"),
+        fixtureOffer("kimi", "cn-anthropic", "Kimi K3", "moonshotai/kimi-k3", "kimi-k3", "anthropic_messages"),
+        fixtureOffer("metask", "default", "Claude Sonnet 4.6", "anthropic/claude-sonnet-4-6", "claude-sonnet-4-6", "anthropic_messages"),
+        fixtureOffer("deepseek", "openai", "DeepSeek V4 Pro", "deepseek/deepseek-v4-pro", "deepseek-v4-pro", "openai_chat"),
+    };
+}
+
+/// A provider row as (id, ready, offer count).
+const ProviderLine = struct { []const u8, bool, usize };
+
+/// The provider rows in display order, into `out`.
+fn providerSummary(picker: *const Picker, scratch: *Picker.RowBuffer, out: []ProviderLine) ![]const ProviderLine {
+    const listed = try picker.rows(scratch);
+    for (listed, 0..) |row, index| out[index] = .{ row.provider.label, row.provider.ready, row.provider.offer_count };
+    return out[0..listed.len];
+}
+
+test "providers with no ready offer sit last, as the not-configured group, and their offers are not listed (#488)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
-    const offers = [_]OfferSummary{
-        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
-    };
+    const offers = readinessFixture();
     try loadFixture(&picker, &offers, null);
-    _ = picker.onKey(.enter); // provider
-    const outcome = picker.onKey(.enter); // one route → commit
-    try testing.expect(outcome == .commit);
-    const came_from = picker.stage;
+    var scratch = Picker.RowBuffer.init(testing.allocator);
+    defer scratch.deinit();
+    var lines: [8]ProviderLine = undefined;
 
-    const login = picker.enterCredentialStage(Slug.lit("metask"), outcome.commit);
-    try testing.expect(login == .login);
-    try testing.expect(login.login.eqlText("metask"));
-    try testing.expectEqual(Stage.credential, picker.stage);
+    // No verdict yet: everything is listed, in catalog order.
+    const before = try providerSummary(&picker, &scratch, &lines);
+    try testing.expectEqual(@as(usize, 3), before.len);
+    try testing.expectEqualStrings("kimi", before[1][0]);
+
+    // Kimi has no key; the second Metask model has no credential either (an
+    // offer pinned to a pool member that is gone).
+    try picker.setReadiness(&.{ true, false, false, false, true }, &.{
+        .{ .provider = Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" },
+    });
+    const after = try providerSummary(&picker, &scratch, &lines);
+    try testing.expectEqual(@as(usize, 3), after.len);
+    try testing.expectEqualStrings("metask", after[0][0]);
+    try testing.expect(after[0][1]);
+    // Only the offer a commit can use is counted.
+    try testing.expectEqual(@as(usize, 1), after[0][2]);
+    try testing.expectEqualStrings("deepseek", after[1][0]);
+    try testing.expect(after[1][1]);
+    try testing.expectEqualStrings("kimi", after[2][0]);
+    try testing.expect(!after[2][1]);
+    try testing.expectEqual(@as(usize, 2), after[2][2]);
+
+    // Into Metask: the model without a credential is not there.
+    _ = picker.onKey(.enter);
+    try testing.expectEqual(Stage.model, picker.stage);
+    const models = try picker.rows(&scratch);
+    try testing.expectEqual(@as(usize, 1), models.len);
+    try testing.expectEqualStrings("anthropic/claude-opus-4-6", models[0].model.label);
+
+    // A filter that matches only the not-configured provider still finds it.
+    picker.restart();
+    for ("kimi") |byte| _ = picker.onKey(.{ .char = byte });
+    const filtered = try providerSummary(&picker, &scratch, &lines);
+    try testing.expectEqual(@as(usize, 1), filtered.len);
+    try testing.expect(!filtered[0][1]);
+}
+
+test "Enter on a not-configured provider shows its setup, starts nothing, and Esc returns to the same row (#488)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = readinessFixture();
+    try loadFixture(&picker, &offers, null);
+    try picker.setReadiness(&.{ true, false, false, true, true }, &.{
+        .{ .provider = Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" },
+    });
+    picker.setLocalConfig("/state/.env", "https://example.test/guide");
+
+    _ = picker.onKey(.end); // the last row: kimi, not configured
+    try testing.expectEqual(@as(usize, 2), picker.cursor);
+    try testing.expect(picker.onKey(.enter) == .redraw);
+    try testing.expectEqual(Stage.setup, picker.stage);
+    const shown = picker.setup orelse return error.NoSetup;
+    try testing.expect(shown.provider.eqlText("kimi"));
+    try testing.expectEqualStrings("MOONSHOT_API_KEY", shown.variable.?);
+    try testing.expectEqualStrings("/state/.env", picker.localConfigPath());
+
+    // Nothing in the setup stage commits, signs in or takes a key.
     var scratch = Picker.RowBuffer.init(testing.allocator);
     defer scratch.deinit();
     try testing.expectEqual(@as(usize, 0), (try picker.rows(&scratch)).len);
-    try testing.expect(picker.onKey(.down) == .ignored);
-    try testing.expect(picker.onKey(.{ .char = 'q' }) == .ignored);
-    try testing.expect(picker.onKey(.enter) == .ignored);
-    try testing.expectEqual(Stage.credential, picker.stage);
+    for ([_]Key{ .enter, .down, .up, .cycle_scope, .backspace, .left, .right, .{ .char = 'x' } }) |key| {
+        try testing.expect(picker.onKey(key) == .ignored);
+    }
+    try testing.expectEqual(Stage.setup, picker.stage);
 
-    const transcript = "Open this URL to authorize:\nhttps://example.test/authorize?state=s\n";
-    try testing.expect(picker.setCredentialLines(transcript));
-    try testing.expect(!picker.setCredentialLines(transcript));
-    try testing.expectEqualStrings(transcript, picker.credentialLines());
+    try testing.expect(picker.onKey(.escape) == .redraw);
+    try testing.expectEqual(Stage.provider, picker.stage);
+    try testing.expectEqual(@as(usize, 2), picker.cursor);
+    try testing.expect(picker.setup == null);
 
-    try testing.expect(picker.onKey(.escape) == .cancel_login);
-    try testing.expectEqual(came_from, picker.stage);
-    try testing.expect(picker.pending_commit == null);
-    try testing.expectEqual(@as(usize, 0), picker.credentialLines().len);
-    try testing.expect(std.mem.indexOf(u8, picker.notice(), "sign-in cancelled") != null);
+    // q closes from the setup stage, as from a list with no filter.
+    _ = picker.onKey(.enter);
+    try testing.expect(picker.onKey(.{ .char = 'q' }) == .closed);
 }
 
-test "a landed login hands the pending commit back and restores the stage" {
+test "a setup opened under a filter returns to the filtered list" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
-    const offers = [_]OfferSummary{
-        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
-    };
+    const offers = readinessFixture();
     try loadFixture(&picker, &offers, null);
+    try picker.setReadiness(&.{ true, false, false, true, true }, &.{});
+    for ("kimi") |byte| _ = picker.onKey(.{ .char = byte });
     _ = picker.onKey(.enter);
-    const outcome = picker.onKey(.enter);
-    const came_from = picker.stage;
-    _ = picker.enterCredentialStage(Slug.lit("metask"), outcome.commit);
+    try testing.expectEqual(Stage.setup, picker.stage);
+    // A provider the host described no setup for still gets its own name.
+    try testing.expect(picker.setup.?.provider.eqlText("kimi"));
+    try testing.expect(picker.setup.?.variable == null);
+    _ = picker.onKey(.escape);
+    try testing.expectEqualStrings("kimi", picker.filter());
+    try testing.expectEqual(Stage.provider, picker.stage);
+}
 
-    const taken = picker.takePendingCommit() orelse return error.NoPendingCommit;
-    try testing.expect(taken.offer_id.eql(outcome.commit.offer_id));
-    try testing.expectEqual(came_from, picker.stage);
-    try testing.expect(picker.takePendingCommit() == null);
+test "a commit the host found no credential for shows the setup, and Esc returns to the draft (#488)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = readinessFixture();
+    try loadFixture(&picker, &offers, null);
+    _ = picker.onKey(.down); // kimi, ready until the commit finds otherwise
+    _ = picker.onKey(.enter);
+    _ = picker.onKey(.enter); // Kimi K3 → two channels
+    try testing.expectEqual(Stage.offer, picker.stage);
+    try testing.expect(picker.onKey(.enter) == .commit);
+
+    picker.setNotice("kimi has no key; the previous route is still active", .{});
+    picker.enterSetup(.{ .provider = Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" });
+    try testing.expectEqual(Stage.setup, picker.stage);
+    try testing.expect(picker.notice_len > 0);
+    _ = picker.onKey(.escape);
+    try testing.expectEqual(Stage.offer, picker.stage);
     try testing.expectEqual(@as(usize, 0), picker.notice_len);
 }
 
-test "a failed sign-in explains itself and Esc then leaves no notice" {
+test "a refresh that leaves the draft's provider with no ready offer steps back to the providers (#488)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
-    const offers = [_]OfferSummary{
-        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
-    };
+    const offers = readinessFixture();
     try loadFixture(&picker, &offers, null);
-    _ = picker.onKey(.enter);
-    const outcome = picker.onKey(.enter);
-    _ = picker.enterCredentialStage(Slug.lit("metask"), outcome.commit);
+    try picker.setReadiness(&.{ true, true, true, true, true }, &.{});
+    _ = picker.onKey(.down);
+    _ = picker.onKey(.enter); // kimi
+    _ = picker.onKey(.enter); // Kimi K3 → offer stage
+    try testing.expectEqual(Stage.offer, picker.stage);
 
-    picker.credentialFailed("ConnectionRefused");
-    try testing.expect(std.mem.indexOf(u8, picker.notice(), "sign-in failed (ConnectionRefused)") != null);
-    try testing.expect(picker.onKey(.escape) == .cancel_login);
-    try testing.expectEqual(@as(usize, 0), picker.notice_len);
-    try testing.expect(!picker.credential_failed);
+    try loadFixture(&picker, &offers, null);
+    try picker.setReadiness(&.{ true, false, false, true, true }, &.{});
+    try testing.expectEqual(Stage.provider, picker.stage);
+    try testing.expect(picker.provider == null);
+    try testing.expect(std.mem.indexOf(u8, picker.notice(), "kimi has no usable route now") != null);
+    try testing.expect(picker.rowCount() > 0);
 }
 
-test "a pasted key is typed blind, chosen per plan, and handed over once" {
+test "a refresh that takes the credential of the chosen offer only steps back to its models (#488)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
-    const offers = [_]OfferSummary{
-        fixtureOffer("zai-coding-plan", "cn-anthropic", "GLM-5.3", "zai/glm-5.3", "glm-5.3", "anthropic_messages"),
-    };
+    const offers = readinessFixture();
     try loadFixture(&picker, &offers, null);
-    _ = picker.onKey(.enter);
-    const outcome = picker.onKey(.enter);
-    try testing.expect(outcome == .commit);
-    const came_from = picker.stage;
-    const choices = [_]KeyChoice{
-        .{ .label = "China · Personal", .url = "https://example.test/cn" },
-        .{ .label = "Global · Personal", .url = "https://example.test/global" },
-    };
-    try testing.expect(picker.enterKeyStage(Slug.lit("zai-coding-plan"), outcome.commit, &choices, 1, "plan keys only") == .redraw);
-    try testing.expectEqual(Stage.credential, picker.stage);
-    try testing.expectEqual(CredentialMode.paste_key, picker.credential_mode);
-    try testing.expectEqual(@as(usize, 1), picker.key_choice);
+    _ = picker.onKey(.down);
+    _ = picker.onKey(.enter); // kimi
+    _ = picker.onKey(.enter); // Kimi K3 → offer stage
+    _ = picker.onKey(.down);
+    _ = picker.onKey(.enter); // the cn-anthropic channel: a commit
+    try testing.expect(picker.offer_id.?.eql(offers[2].offer_id));
 
-    // Nothing to submit yet; Tab opens the chosen page; arrows choose a plan.
-    try testing.expect(picker.onKey(.enter) == .ignored);
-    try testing.expect(picker.onKey(.cycle_scope) == .open_key_page);
-    try testing.expect(picker.onKey(.down) == .redraw);
-    try testing.expectEqual(@as(usize, 0), picker.key_choice);
-    try testing.expect(picker.onKey(.up) == .redraw);
-    try testing.expectEqual(@as(usize, 1), picker.key_choice);
-
-    // Characters are the key, not a filter; whitespace from a paste is dropped.
-    for (" plan-key\t") |byte| _ = picker.onKey(.{ .char = byte });
-    try testing.expectEqualStrings("plan-key", picker.keyText());
-    try testing.expectEqual(@as(usize, 0), picker.filter_len);
-    try testing.expect(picker.onKey(.backspace) == .redraw);
-    try testing.expectEqualStrings("plan-ke", picker.keyText());
-    try testing.expect(picker.onKey(.enter) == .submit_key);
-
-    // Handed over: the field is wiped and only Esc acts while it is checked.
-    picker.keySubmitted();
-    try testing.expectEqual(@as(usize, 0), picker.key_len);
-    for (picker.key_buffer[0..7]) |byte| try testing.expectEqual(@as(u8, 0), byte);
-    try testing.expect(picker.onKey(.{ .char = 'x' }) == .ignored);
-    try testing.expect(picker.onKey(.enter) == .ignored);
-
-    // A refused key asks for another on the same plan.
-    picker.credentialFailed("KeyRefused");
-    try testing.expect(!picker.key_checking);
-    try testing.expect(std.mem.indexOf(u8, picker.notice(), "refused that key") != null);
-    try testing.expect(picker.onKey(.{ .char = 'k' }) == .redraw);
-    try testing.expect(!picker.credential_failed);
-    try testing.expectEqual(@as(usize, 1), picker.key_choice);
-
-    // Esc gives up: nothing stored, the previous route kept, key mode left.
-    try testing.expect(picker.onKey(.escape) == .cancel_login);
-    try testing.expectEqual(came_from, picker.stage);
-    try testing.expectEqual(CredentialMode.sign_in, picker.credential_mode);
-    try testing.expectEqual(@as(usize, 0), picker.key_len);
-    try testing.expect(std.mem.indexOf(u8, picker.notice(), "no key was stored") != null);
+    try picker.setReadiness(&.{ true, true, false, true, true }, &.{});
+    try testing.expectEqual(Stage.model, picker.stage);
+    try testing.expect(picker.offer_id == null);
+    try testing.expect(std.mem.indexOf(u8, picker.notice(), "no longer offered") != null);
 }
