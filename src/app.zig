@@ -1551,6 +1551,121 @@ pub const App = struct {
         return applied;
     }
 
+    /// What `/login` hands over once its dialog is done (#527): the gateway
+    /// the Metask session it stored is for, the model and reasoning level
+    /// chosen, and that gateway's `/v1/models` answer (the dialog listed the
+    /// models from it). Borrowed.
+    pub const MetaskSession = struct {
+        /// The gateway origin the token response named (`gateway_url`).
+        gateway: []const u8,
+        model: []const u8,
+        effort: ?types.ReasoningEffort = null,
+        models_json: []const u8,
+    };
+
+    /// Move the session onto the Metask session `/login` just stored
+    /// (`oauth/metask.json`), the way a start with that session binds it
+    /// (#527): the gateway's inventory, its offer for the chosen model, and
+    /// the session's access token as the credential, refreshed by the session
+    /// rather than read from a key. Committed through the kernel's selection
+    /// commit like any `/model` pick.
+    ///
+    /// All or nothing, as `bindMetaskSignIn`: a failure puts back the
+    /// previous key route, key, inventory, catalog, kernel selection and the
+    /// OAuth flag, so the previous route keeps working. The session file
+    /// stays either way: `/login` stored it, and the next start uses it.
+    pub fn bindMetaskSession(app: *App, sign_in: MetaskSession) !void {
+        const gateway = std.mem.trimEnd(u8, sign_in.gateway, "/");
+        if (!metask_oauth_mod.isGatewayOrigin(gateway)) return error.UnexpectedUrl;
+        const host = try app.providerHost();
+        const messages_url = try std.fmt.allocPrint(app.allocator, "{s}/v1/messages", .{gateway});
+        defer app.allocator.free(messages_url);
+        var catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
+        catalog.loadFromModelsListJson(sign_in.models_json) catch |err| {
+            @import("util/log.zig").debug("catalog", "sign-in /v1/models unusable: {s}", .{@errorName(err)});
+        };
+
+        // What the attempt replaces.
+        var previous_route = app.metask_key_route;
+        const previous_key = app.selected_api_key_owned;
+        const previous_oauth_selected = app.config.metask_oauth_selected;
+        var previous_catalog = app.api_client.catalog;
+        const previous_profile = host.metaskProfile();
+        const previous_selection = host.kernel.sessionSelection();
+
+        // The process keeps one Metask session object (single flight); one
+        // already held read the file before `/login` replaced it. The next
+        // token request loads the new one (`oauthAccessToken`).
+        if (app.oauth_session) |*held| held.deinit();
+        app.oauth_session = null;
+        app.oauth_session_provider = null;
+        app.metask_key_route = null;
+        app.selected_api_key_owned = null;
+        app.config.metask_oauth_selected = true;
+        app.api_client.catalog = catalog;
+        errdefer {
+            app.api_client.catalog.deinit();
+            app.api_client.catalog = previous_catalog;
+            app.config.metask_oauth_selected = previous_oauth_selected;
+            app.selected_api_key_owned = previous_key;
+            app.metask_key_route = previous_route;
+            app.restoreMetaskOffers(host, previous_profile, previous_selection);
+        }
+
+        try host.ingestMetask(gateway, sign_in.models_json, .messages_and_chat);
+        const offer = for (host.kernel.catalogSnapshot().items()) |*candidate| {
+            if (candidate.provider_id.eqlText("metask") and
+                std.mem.eql(u8, candidate.request_model_id, sign_in.model) and
+                std.mem.eql(u8, candidate.protocol, "anthropic_messages") and
+                std.mem.eql(u8, candidate.endpoint_ref, messages_url)) break candidate;
+        } else return error.OfferUnavailable;
+        const committed = try app.commitModelSelection(.{
+            .offer_id = offer.offer_id,
+            .offer_revision = offer.offer_revision,
+            .controls = .{},
+            .scope = .session,
+        });
+        if (committed != .committed) return error.SelectionRefused;
+
+        // The session is on the sign-in. What the previous route held goes;
+        // its key is retired, as the clients may have borrowed it.
+        previous_catalog.deinit();
+        if (previous_route) |*route| route.deinit(app.allocator);
+        if (previous_key) |key| app.retireApiKey(key);
+        // A gateway 401 refreshes through the session, as after a start on it.
+        app.api_client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
+        if (app.openai_client) |*client| client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
+        // The session has no account key list (`/models` keys are napi's).
+        app.api_key_catalog.clear();
+        app.api_key_catalog_load = .off;
+        app.models_picker_key_index = null;
+        app.models_picker_model_index = null;
+        app.refreshChildCatalogSnapshots() catch |err| {
+            @import("util/log.zig").warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
+        };
+        // A picker kept open lists the new inventory.
+        app.refreshModelPicker() catch app.model_picker.markFailed();
+        if (sign_in.effort) |effort| app.setReasoningEffort(effort) catch |err| {
+            @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
+        };
+    }
+
+    /// `/login`, once the Metask session is stored (#527): move this session
+    /// onto it (`bindMetaskSession`) and forget a stored `/model` default, as
+    /// `applyMetaskSignIn` does for a key.
+    pub fn applyMetaskSession(app: *App, sign_in: MetaskSession) SignInApplied {
+        var applied: SignInApplied = .{};
+        app.bindMetaskSession(sign_in) catch |err| {
+            applied.switch_error = err;
+        };
+        if (app.forgetStoredDefault()) |forgotten| {
+            applied.default_forgotten = forgotten;
+        } else |err| {
+            applied.default_error = err;
+        }
+        return applied;
+    }
+
     /// Undo the Metask inventory a failed `/login` ingested (#485): the
     /// previous profile, and the session selection the kernel held. Under
     /// memory pressure the catalog may not rebuild; that is logged.
@@ -1580,6 +1695,8 @@ pub const App = struct {
     /// What `/logout` did (#485).
     pub const SignOut = struct {
         removed: sign_out_mod.Removed,
+        /// What revoking the Metask session at the server did (#527).
+        revoke: metask_oauth_mod.RevokeOutcome = .nothing_stored,
         /// A key `login --provider metask` stored, also Metask's.
         key_removed: bool,
         /// The stored `/model` default was Metask's and is forgotten.
@@ -1615,6 +1732,9 @@ pub const App = struct {
     /// Keys of other providers are not touched.
     pub fn signOutOfMetask(app: *App) !SignOut {
         const root = app.stateRoot();
+        // At the server first (#527): the refresh token is read from the
+        // file removed below. Bounded, as the REPL waits for it.
+        const revoke = metask_oauth_mod.revokeStoredSession(root, metask_oauth_mod.siteUrl(), 3000);
         const removed = try sign_out_mod.removeMetaskSignIns(app.allocator, root);
         const key_removed = provider_api_key_store.remove(app.allocator, root, provider_ids_mod.Slug.lit("metask")) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1655,6 +1775,7 @@ pub const App = struct {
         }
         return .{
             .removed = removed,
+            .revoke = revoke,
             .key_removed = key_removed,
             .default_cleared = cleared_revision != null,
             .session = session,

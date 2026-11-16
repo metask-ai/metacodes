@@ -66,6 +66,11 @@ pub const Catalog = struct {
         /// 枚举仍是中立的 `.xhigh`,只有给人看的标签跟着目录走——用户在 picker 里看到的
         /// 必须是 provider 自己的词。
         effort_vocabulary: EffortVocabulary = .neutral,
+        /// `capabilities.endpoints.messages.supported` (#527): whether this
+        /// route serves the model on `/v1/messages`. Metask's gateway lists
+        /// image and video models beside the text ones and says so per
+        /// endpoint. null = the catalog did not say.
+        messages: ?bool = null,
 
         pub fn supportsReasoning(self: Entry, effort: types.ReasoningEffort) bool {
             return (self.reasoning_mask & reasoningBit(effort)) != 0;
@@ -82,7 +87,7 @@ pub const Catalog = struct {
         for (self.entries.items) |entry| {
             const id = try allocator.dupe(u8, entry.model_id);
             errdefer allocator.free(id);
-            try copy.entries.append(allocator, .{ .model_id = id, .max_tokens = entry.max_tokens, .max_input_tokens = entry.max_input_tokens, .reasoning_mask = entry.reasoning_mask, .image_input = entry.image_input, .effort_vocabulary = entry.effort_vocabulary });
+            try copy.entries.append(allocator, .{ .model_id = id, .max_tokens = entry.max_tokens, .max_input_tokens = entry.max_input_tokens, .reasoning_mask = entry.reasoning_mask, .image_input = entry.image_input, .effort_vocabulary = entry.effort_vocabulary, .messages = entry.messages });
         }
         return copy;
     }
@@ -90,6 +95,21 @@ pub const Catalog = struct {
     pub fn deinit(self: *Catalog) void {
         for (self.entries.items) |e| self.allocator.free(e.model_id);
         self.entries.deinit(self.allocator);
+    }
+
+    /// Drop the models the catalog says are not served on `/v1/messages`
+    /// (`Entry.messages == false`); the ones it says nothing about stay.
+    pub fn dropMessagesUnsupported(self: *Catalog) void {
+        var kept: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.messages == false) {
+                self.allocator.free(entry.model_id);
+                continue;
+            }
+            self.entries.items[kept] = entry;
+            kept += 1;
+        }
+        self.entries.shrinkRetainingCapacity(kept);
     }
 
     /// 解析 `/v1/models` 响应 JSON，把 max_tokens / max_input_tokens 字段存入。
@@ -123,6 +143,7 @@ pub const Catalog = struct {
             const reasoning_mask = extractReasoningMask(obj);
             const effort_vocabulary = extractEffortVocabulary(obj);
             const image_input = extractImageInput(obj);
+            const messages = extractMessagesEndpoint(obj);
 
             const id_owned = try self.allocator.dupe(u8, id);
             errdefer self.allocator.free(id_owned);
@@ -133,6 +154,7 @@ pub const Catalog = struct {
                 .reasoning_mask = reasoning_mask,
                 .image_input = image_input,
                 .effort_vocabulary = effort_vocabulary,
+                .messages = messages,
             });
             log.debug("catalog", "model {s}: max_tokens={?d} max_input_tokens={?d} image_input={?}", .{ id, mt, mit, image_input });
         }
@@ -282,7 +304,7 @@ fn nonZero(v: ?u64) ?u32 {
 
 fn extractReasoningMask(obj: []const u8) u8 {
     const caps = findObjectField(obj, "capabilities") orelse return 0;
-    const effort = findObjectField(caps, "effort") orelse return 0;
+    const effort = findObjectField(caps, "effort") orelse return reasoningEffortsMask(caps);
     var mask: u8 = 0;
     if (capSupported(effort, "low")) mask |= reasoningBit(.low);
     if (capSupported(effort, "medium")) mask |= reasoningBit(.medium);
@@ -296,10 +318,55 @@ fn extractReasoningMask(obj: []const u8) u8 {
     return mask;
 }
 
+/// Metask's gateway names the levels a model takes as a list (#527):
+/// `capabilities.reasoning.efforts`, e.g. `["none","low","medium","high","max"]`.
+/// Read the way `capabilities.effort` is: a list with `max` and no `xhigh`
+/// calls its top level that.
+fn reasoningEffortsMask(caps: []const u8) u8 {
+    const reasoning = findObjectField(caps, "reasoning") orelse return 0;
+    const efforts = findObjectField(reasoning, "efforts") orelse return 0;
+    var mask: u8 = 0;
+    if (listNames(efforts, "low")) mask |= reasoningBit(.low);
+    if (listNames(efforts, "medium")) mask |= reasoningBit(.medium);
+    if (listNames(efforts, "high")) mask |= reasoningBit(.high);
+    const has_xhigh = listNames(efforts, "xhigh");
+    if (has_xhigh) mask |= reasoningBit(.xhigh);
+    if (listNames(efforts, "max")) mask |= reasoningBit(if (has_xhigh) .max else .xhigh);
+    return mask;
+}
+
+/// Whether the JSON array `list` holds the string `name`.
+fn listNames(list: []const u8, name: []const u8) bool {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, list, pos, name)) |at| : (pos = at + 1) {
+        if (at > 0 and at + name.len < list.len and list[at - 1] == '"' and list[at + name.len] == '"') return true;
+    }
+    return false;
+}
+
+/// `capabilities.endpoints.messages.supported`, as `extractImageInput` reads
+/// its field: true/false as written, null when any part is missing.
+fn extractMessagesEndpoint(obj: []const u8) ?bool {
+    const caps = findObjectField(obj, "capabilities") orelse return null;
+    const endpoints = findObjectField(caps, "endpoints") orelse return null;
+    const messages = findObjectField(endpoints, "messages") orelse return null;
+    const value_start = findFieldValueStart(messages, "supported") orelse return null;
+    const rest = messages[value_start..];
+    if (std.mem.startsWith(u8, rest, "true")) return true;
+    if (std.mem.startsWith(u8, rest, "false")) return false;
+    return null;
+}
+
 /// 目录顶档词汇:声明了 xhigh → neutral(OpenAI 叫法);只声明 max → max;都没有 → neutral。
 fn extractEffortVocabulary(obj: []const u8) EffortVocabulary {
     const caps = findObjectField(obj, "capabilities") orelse return .neutral;
-    const effort = findObjectField(caps, "effort") orelse return .neutral;
+    const effort = findObjectField(caps, "effort") orelse {
+        const reasoning = findObjectField(caps, "reasoning") orelse return .neutral;
+        const efforts = findObjectField(reasoning, "efforts") orelse return .neutral;
+        if (listNames(efforts, "xhigh")) return .neutral;
+        if (listNames(efforts, "max")) return .max;
+        return .neutral;
+    };
     if (capSupported(effort, "xhigh")) return .neutral;
     if (capSupported(effort, "max")) return .max;
     return .neutral;
@@ -669,4 +736,28 @@ test "Catalog: empty/invalid json no crash" {
     try c.loadFromModelsListJson("");
     try c.loadFromModelsListJson("{}");
     try testing.expect(c.entries.items.len == 0);
+}
+
+test "Metask's gateway catalog: reasoning levels from capabilities.reasoning.efforts and the messages endpoint (#527)" {
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    try catalog.loadFromModelsListJson(
+        \\{"object":"list","data":[
+        \\ {"id":"glm-5.3","capabilities":{"endpoints":{"messages":{"supported":true,"status":"supported"},"chat_completions":{"supported":true}},
+        \\   "reasoning":{"supported":true,"disable":{"supported":false},"efforts":["low","medium","high","max"],"translated":true}}},
+        \\ {"id":"seedance-2.0","capabilities":{"endpoints":{"messages":{"supported":false,"status":"unsupported"},"videos":{"supported":true}},
+        \\   "reasoning":{"supported":false,"efforts":[]}}},
+        \\ {"id":"old-route-model","max_tokens":1024}
+        \\]}
+    );
+    try std.testing.expectEqual(@as(usize, 3), catalog.entries.items.len);
+    const glm = catalog.entries.items[0];
+    try std.testing.expectEqual(@as(?bool, true), glm.messages);
+    try std.testing.expect(glm.supportsReasoning(.low) and glm.supportsReasoning(.medium) and glm.supportsReasoning(.high));
+    // `max` without `xhigh`: the neutral top level, labelled max.
+    try std.testing.expect(glm.supportsReasoning(.xhigh) and !glm.supportsReasoning(.max));
+    try std.testing.expectEqual(EffortVocabulary.max, glm.effort_vocabulary);
+    try std.testing.expectEqual(@as(?bool, false), catalog.entries.items[1].messages);
+    try std.testing.expectEqual(@as(u8, 0), catalog.entries.items[1].reasoning_mask);
+    try std.testing.expectEqual(@as(?bool, null), catalog.entries.items[2].messages);
 }

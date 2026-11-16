@@ -1050,22 +1050,21 @@ pub const LoginDialog = struct {
     }
 };
 
-// ── /login: the Metask browser sign-in (#485) ───────────────────────────────
+// ── /login: the Metask browser sign-in (#485, #527) ─────────────────────────
 
-/// `/login` with no provider: the Metask browser sign-in, then the API key,
-/// model and reasoning level `metacodes login` asks for line by line, as
-/// choices in the pane. The network work runs on a worker
-/// (`api/metask_sign_in.zig`); this only draws and moves between stages.
-/// Esc at any stage closes it with nothing stored: the caller writes
-/// `auth.json` only after `outcome` is `chosen`.
+/// `/login` with no provider: the Metask browser sign-in, then the model and
+/// reasoning level `metacodes login` asks for line by line, as choices in the
+/// pane. `/login metask` is the same with the device code (`device_code`).
+/// The sign-in is used with its own token at the gateway it names, so there
+/// is no API key to choose (#527). The network work runs on a worker
+/// (`api/metask_sign_in.zig`); this only draws and moves between stages. Esc
+/// at any stage closes it with nothing stored: the caller stores the sign-in
+/// only after `outcome` is `chosen`.
 pub const MetaskSignInDialog = struct {
     pub const Stage = enum {
-        /// Waiting for the browser to come back, then listing the keys.
+        /// Waiting for the browser to come back (or the code to be
+        /// confirmed), then listing the models.
         signing_in,
-        choose_key,
-        /// Signed in, but the account has no API key to use.
-        no_keys,
-        loading_models,
         choose_model,
         choose_effort,
         failed,
@@ -1078,8 +1077,9 @@ pub const MetaskSignInDialog = struct {
     stage: Stage = .signing_in,
     sel: usize = 0,
     term_rows: usize = 24,
-    /// Where a key is created, for an account that has none.
-    site_url: []const u8 = "https://metask-ai.com",
+    /// `/login metask`: a code confirmed on any device, not the browser
+    /// coming back here (`metask_sign_in.Options.device_code`).
+    device_code: bool = false,
     /// The providers `/login <provider>` signs in to, comma-separated, for
     /// the line that says so (borrowed); empty leaves it out.
     others: []const u8 = "",
@@ -1087,9 +1087,9 @@ pub const MetaskSignInDialog = struct {
     transcript_len: usize = 0,
     failure: [96]u8 = undefined,
     failure_len: usize = 0,
-    /// The chosen key's models, parsed from the worker's answer.
+    /// The models the sign-in can use on `/v1/messages`, parsed from the
+    /// worker's answer.
     models: model_catalog.Catalog,
-    key_index: usize = 0,
     model_index: usize = 0,
     efforts: model_catalog.ReasoningOptions = undefined,
     efforts_len: usize = 0,
@@ -1102,6 +1102,7 @@ pub const MetaskSignInDialog = struct {
 
     /// Start the sign-in. A worker that cannot start is the dialog's failure.
     pub fn start(self: *MetaskSignInDialog, io: std.Io, options: metask_sign_in.Options) void {
+        self.device_code = options.device_code;
         const worker = metask_sign_in.Worker.create(self.allocator, io, options) catch {
             self.setFailure("out of memory");
             return;
@@ -1122,24 +1123,12 @@ pub const MetaskSignInDialog = struct {
         self.models.deinit();
     }
 
-    /// After `chosen`: the worker, holding the sign-in (`takeOAuth`) and the
-    /// chosen key's `/v1/models` answer. The caller releases it.
+    /// After `chosen`: the worker, holding the token response
+    /// (`takeTokenJson`), the gateway it names and that gateway's
+    /// `/v1/models` answer. The caller releases it.
     pub fn takeWorker(self: *MetaskSignInDialog) ?*metask_sign_in.Worker {
         defer self.worker = null;
         return self.worker;
-    }
-
-    /// The chosen key (borrowed from the worker).
-    pub fn chosenKey(self: *const MetaskSignInDialog) ?[]const u8 {
-        const worker = self.worker orelse return null;
-        if (self.key_index >= worker.keys.entries.items.len) return null;
-        return worker.keys.entries.items[self.key_index].secret;
-    }
-
-    pub fn chosenKeyLabel(self: *const MetaskSignInDialog) []const u8 {
-        const worker = self.worker orelse return "";
-        if (self.key_index >= worker.keys.entries.items.len) return "";
-        return worker.keys.entries.items[self.key_index].label;
     }
 
     pub fn chosenModel(self: *const MetaskSignInDialog) ?[]const u8 {
@@ -1154,30 +1143,13 @@ pub const MetaskSignInDialog = struct {
         self.stage = .failed;
     }
 
-    fn keyCount(self: *const MetaskSignInDialog) usize {
-        const worker = self.worker orelse return 0;
-        return worker.keys.entries.items.len;
-    }
-
     /// How many choices the current stage lists.
     fn choiceCount(self: *const MetaskSignInDialog) usize {
         return switch (self.stage) {
-            .choose_key => self.keyCount(),
             .choose_model => self.models.entries.items.len,
             .choose_effort => self.efforts_len,
             else => 0,
         };
-    }
-
-    fn chooseKey(self: *MetaskSignInDialog, index: usize) void {
-        const worker = self.worker orelse return;
-        self.key_index = index;
-        worker.startModels(worker.keys.entries.items[index].secret) catch |err| {
-            self.setFailure(@errorName(err));
-            return;
-        };
-        self.stage = .loading_models;
-        self.sel = 0;
     }
 
     fn chooseModel(self: *MetaskSignInDialog, index: usize) void {
@@ -1202,7 +1174,6 @@ pub const MetaskSignInDialog = struct {
     fn pick(self: *MetaskSignInDialog, index: usize) Step {
         if (index >= self.choiceCount()) return .none;
         switch (self.stage) {
-            .choose_key => self.chooseKey(index),
             .choose_model => self.chooseModel(index),
             .choose_effort => return self.chooseEffort(index),
             else => return .none,
@@ -1216,14 +1187,19 @@ pub const MetaskSignInDialog = struct {
         try p.blank();
         switch (self.stage) {
             .signing_in => {
-                try p.paragraph("", "Sign in in your browser; you come back here to choose an API key, a model and a reasoning level.");
+                try p.paragraph("", if (self.device_code)
+                    "Confirm the code below in a browser on any device; then choose a model and a reasoning level here."
+                else
+                    "Sign in in your browser; you come back here to choose a model and a reasoning level.");
                 try p.blank();
                 try self.drawTranscript(p);
                 try p.blank();
                 // A machine with no browser to come back from (#485): the
                 // device-code sign-in needs only a code typed elsewhere.
-                try p.paragraph(p.th.dim, "No browser on this machine? /login metask signs in with a short code instead.");
-                try p.blank();
+                if (!self.device_code) {
+                    try p.paragraph(p.th.dim, "No browser on this machine? /login metask signs in with a short code instead.");
+                    try p.blank();
+                }
                 if (self.others.len > 0) {
                     var others_buf: [512]u8 = undefined;
                     try p.paragraph(p.th.dim, std.fmt.bufPrint(&others_buf, "Another provider instead: /login <provider> ({s})", .{self.others}) catch "Another provider instead: /login <provider>");
@@ -1231,21 +1207,7 @@ pub const MetaskSignInDialog = struct {
                 }
                 try p.footer("Esc to cancel");
             },
-            .no_keys => {
-                try p.paragraph(p.th.warn, "Your Metask account has no API key yet.");
-                try p.blank();
-                try p.text("Create one on the Metask site, then /login again:");
-                try p.raw(self.site_url);
-                try p.blank();
-                try p.footer("Esc to close");
-            },
-            .loading_models => {
-                var head: [192]u8 = undefined;
-                try p.text(std.fmt.bufPrint(&head, "Listing the models of {s}…", .{self.chosenKeyLabel()}) catch "Listing the models…");
-                try p.blank();
-                try p.footer("Esc to cancel");
-            },
-            .choose_key, .choose_model, .choose_effort => try self.drawChoices(p),
+            .choose_model, .choose_effort => try self.drawChoices(p),
             .failed => {
                 var head: [160]u8 = undefined;
                 try p.line(p.th.danger, std.fmt.bufPrint(&head, "Sign-in failed: {s}", .{self.failure[0..self.failure_len]}) catch "Sign-in failed");
@@ -1260,7 +1222,6 @@ pub const MetaskSignInDialog = struct {
     fn drawChoices(self: *MetaskSignInDialog, p: *Pane) !void {
         const count = self.choiceCount();
         try p.text(switch (self.stage) {
-            .choose_key => "Select an API key:",
             .choose_model => "Select a model:",
             else => "Select a reasoning level:",
         });
@@ -1273,14 +1234,6 @@ pub const MetaskSignInDialog = struct {
         var detail_buf: [96]u8 = undefined;
         for (first..last) |i| {
             switch (self.stage) {
-                .choose_key => {
-                    const entry = self.worker.?.keys.entries.items[i];
-                    const detail = if (entry.group.len > 0)
-                        std.fmt.bufPrint(&detail_buf, "{s} · …{s}", .{ entry.group, entry.suffix }) catch ""
-                    else
-                        std.fmt.bufPrint(&detail_buf, "…{s}", .{entry.suffix}) catch "";
-                    try p.option(i + 1, i == self.sel, entry.label, detail);
-                },
                 .choose_model => {
                     const entry = self.models.entries.items[i];
                     const detail = if (entry.max_input_tokens) |window|
@@ -1329,7 +1282,7 @@ pub const MetaskSignInDialog = struct {
             else => {},
         }
         switch (self.stage) {
-            .choose_key, .choose_model, .choose_effort => {
+            .choose_model, .choose_effort => {
                 const count = self.choiceCount();
                 if (count == 0) return .none;
                 switch (k) {
@@ -1349,23 +1302,19 @@ pub const MetaskSignInDialog = struct {
                     else => return .none,
                 }
             },
-            .no_keys => return if (k == .enter) .done else .none,
             .failed => {
                 if (k != .enter) return .none;
-                // Retry from the browser: the stage that failed may have
-                // been any of them.
+                // Retry from the browser.
                 const worker = self.worker orelse return .none;
-                const options: metask_sign_in.Options = .{ .messages_url = worker.messages_url, .open_browser = worker.open_browser, .port = worker.port };
+                const options: metask_sign_in.Options = .{ .open_browser = worker.open_browser, .port = worker.port, .device_code = worker.device_code };
                 const io = worker.io;
-                var url_buf: [1024]u8 = undefined;
-                const url = std.fmt.bufPrint(&url_buf, "{s}", .{options.messages_url}) catch return .none;
                 worker.release();
                 self.worker = null;
                 self.transcript_len = 0;
-                self.start(io, .{ .messages_url = url, .open_browser = options.open_browser, .port = options.port });
+                self.start(io, options);
                 return .redraw;
             },
-            .signing_in, .loading_models => return .none,
+            .signing_in => return .none,
         }
     }
 
@@ -1381,22 +1330,6 @@ pub const MetaskSignInDialog = struct {
         }
         switch (self.stage) {
             .signing_in => switch (worker.currentState()) {
-                .keys_ready => {
-                    self.sel = 0;
-                    self.stage = if (worker.keys.entries.items.len == 0) .no_keys else .choose_key;
-                    return .redraw;
-                },
-                .failed => {
-                    self.setFailure(worker.failureName());
-                    return .redraw;
-                },
-                .cancelled => {
-                    self.outcome = .cancelled;
-                    return .done;
-                },
-                else => return if (changed) .redraw else .none,
-            },
-            .loading_models => switch (worker.currentState()) {
                 .models_ready => {
                     self.models.deinit();
                     self.models = model_catalog.Catalog.init(self.allocator);
@@ -1404,8 +1337,11 @@ pub const MetaskSignInDialog = struct {
                         self.setFailure(@errorName(err));
                         return .redraw;
                     };
+                    // The gateway also lists image and video models: only
+                    // the ones it serves on `/v1/messages` can run a session.
+                    self.models.dropMessagesUnsupported();
                     if (self.models.entries.items.len == 0) {
-                        self.setFailure("this key has no models");
+                        self.setFailure("no model this account can chat with");
                         return .redraw;
                     }
                     self.sel = 0;
@@ -1420,7 +1356,7 @@ pub const MetaskSignInDialog = struct {
                     self.outcome = .cancelled;
                     return .done;
                 },
-                else => return .none,
+                else => return if (changed) .redraw else .none,
             },
             else => return .none,
         }

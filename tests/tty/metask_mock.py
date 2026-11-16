@@ -1,17 +1,23 @@
-"""A local stand-in for Metask's browser sign-in and gateway (#485), loopback only.
+"""A local stand-in for Metask's OAuth server and gateway (#485, #527), loopback only.
 
 `metacodes login` and the TUI's `/login` sign in with an authorization code and
 PKCE: the browser opens the authorize URL, Metask redirects it back to
-`http://localhost:<port>/auth/callback?code=…&state=…`, and metacodes trades
-the code for tokens at the token URL. They then list the account's API keys
-and a key's models through the Messages endpoint's origin. This server answers
-all of that, and `/v1/messages` too, so a case can sign in, choose, and send a
-turn without an account or a real request:
+`http://localhost:<port>/auth/metask/callback?code=…&state=…`, and metacodes
+trades the code for tokens at the token URL (the device code, `/login metask`,
+asks `/api/oauth/device/code` for a code instead and polls the token URL with
+it). The token response names the
+gateway (`gateway_url`, here this server): the models are listed there with
+the access token, and turns go there with it. Sign-out revokes the session at
+`/api/oauth/revoke`. This server answers all of that (and a key's models and
+the account's keys, for the key routes an older sign-in left), so a case can
+sign in, choose, send a turn and sign out without an account or a real
+request:
 
     with MetaskMock() as mock:
         env = mock.env(home)      # the URL overrides and a $BROWSER stub
         raw = run(bin, [...], env=env, base_url=None)
         mock.requests             # (method, path, authorization) of each request
+        mock.revocations          # the body of each revocation request
 
 The `$BROWSER` stub plays the user's browser: it reads the authorize URL it is
 handed and requests the redirect URI with a code and the same `state`.
@@ -28,6 +34,11 @@ REFRESH_TOKEN = "mk-refresh-tty-0001"
 KEY_SECRET = "sk-mk-tty-dev-0001"
 OTHER_KEY_SECRET = "sk-mk-tty-ops-0002"
 MODEL = "glm-5"
+# The device code (`/login metask`, `metacodes login --provider metask`): the
+# code the user would confirm elsewhere. The first poll is answered with the
+# tokens, as if it had been confirmed already.
+DEVICE_CODE = "mk-device-tty-0001"
+USER_CODE = "MOCK-4711"
 
 _BROWSER_STUB = r'''#!{python}
 import sys, urllib.parse, urllib.request
@@ -53,13 +64,32 @@ def _sse_text(text):
     ).encode()
 
 
+# The gateway's `/v1/models`, in its capabilities format (#527): a chat model
+# with two reasoning levels, another chat model, and an image model the gateway
+# does not serve on `/v1/messages` (the sign-in must not offer it).
+DEFAULT_MODELS = [
+    {"id": MODEL, "max_input_tokens": 200000, "max_tokens": 32000,
+     "capabilities": {"endpoints": {"messages": {"supported": True, "status": "supported"}},
+                      "reasoning": {"supported": True, "disable": {"supported": False},
+                                    "efforts": ["low", "high"], "translated": True}}},
+    {"id": "glm-5-air", "max_input_tokens": 128000, "max_tokens": 16000,
+     "capabilities": {"endpoints": {"messages": {"supported": True, "status": "supported"}}}},
+    {"id": "image-model-only",
+     "capabilities": {"endpoints": {"messages": {"supported": False, "status": "unsupported"},
+                                    "images_generations": {"supported": True}}}},
+]
+
+
 class MetaskMock:
-    def __init__(self, keys=None, reply="METASK_MOCK_REPLY"):
-        # [(name, secret)]; an empty list is an account without keys.
+    def __init__(self, keys=None, reply="METASK_MOCK_REPLY", models=None):
+        # [(name, secret)]: the keys an older sign-in's key route lists.
         self.keys = [("dev key", KEY_SECRET), ("ops key", OTHER_KEY_SECRET)] if keys is None else keys
+        self.models = DEFAULT_MODELS if models is None else models
         self.reply = reply
         self.requests = []
         self.messages = []  # (authorization, model) of each /v1/messages request
+        self.revocations = []  # the body of each /api/oauth/revoke request
+        self.device_requests = []  # the body of each /api/oauth/device/code request
 
     def __enter__(self):
         outer = self
@@ -89,25 +119,36 @@ class MetaskMock:
                             for i, (name, secret) in enumerate(outer.keys)]
                     return self._send(200, json.dumps({"data": data}).encode())
                 if self.path.startswith("/v1/models"):
-                    if auth not in (f"Bearer {secret}" for _, secret in outer.keys):
-                        return self._send(401, b'{"error":"unauthorized"}')
-                    body = {"data": [
-                        {"id": MODEL, "max_input_tokens": 200000, "max_tokens": 32000,
-                         "capabilities": {"effort": {"low": {"supported": True}, "high": {"supported": True}}}},
-                        {"id": "glm-5-air", "max_input_tokens": 128000, "max_tokens": 16000},
-                    ]}
-                    return self._send(200, json.dumps(body).encode())
+                    allowed = [f"Bearer {ACCESS_TOKEN}"] + [f"Bearer {secret}" for _, secret in outer.keys]
+                    if auth not in allowed:
+                        return self._send(401, b'{"error":{"code":"invalid_api_key"}}')
+                    return self._send(200, json.dumps({"object": "list", "data": outer.models}).encode())
                 self._send(404, b'{"error":"not found"}')
 
             def do_POST(self):  # noqa: N802
                 self._record()
                 length = int(self.headers.get("content-length", 0))
                 body = self.rfile.read(length)
-                if self.path.startswith("/oauth/token"):
-                    if b"tty-code-0001" not in body:
+                if self.path.startswith("/api/oauth/revoke"):
+                    outer.revocations.append(body.decode("utf-8", "replace"))
+                    return self._send(200, b"")
+                if self.path.startswith("/api/oauth/device/code"):
+                    outer.device_requests.append(body.decode("utf-8", "replace"))
+                    grant = {"device_code": DEVICE_CODE, "user_code": USER_CODE,
+                             "verification_uri": f"{outer.origin}/device",
+                             "verification_uri_complete": f"{outer.origin}/device?user_code={USER_CODE}",
+                             "expires_in": 600, "interval": 1}
+                    return self._send(200, json.dumps(grant).encode())
+                if self.path.startswith("/api/oauth/token") or self.path.startswith("/oauth/token"):
+                    if (b"tty-code-0001" not in body and REFRESH_TOKEN.encode() not in body
+                            and DEVICE_CODE.encode() not in body):
                         return self._send(400, b'{"error":"invalid_grant"}')
+                    if b"client_id=metacodes" not in body and b'"client_id":"metacodes"' not in body:
+                        return self._send(401, b'{"error":"invalid_client"}')
                     token = {"access_token": ACCESS_TOKEN, "refresh_token": REFRESH_TOKEN,
-                             "token_type": "Bearer", "expires_in": 3600}
+                             "token_type": "bearer", "expires_in": 3600,
+                             "gateway_url": outer.origin, "models_url": f"{outer.origin}/v1/models",
+                             "client_name": "metacodes", "scope": "read model:invoke"}
                     return self._send(200, json.dumps(token).encode())
                 if self.path.startswith("/v1/messages"):
                     model = None
@@ -134,7 +175,8 @@ class MetaskMock:
 
     def env(self, home):
         """The environment a session signs in against this mock with: the
-        sign-in URLs, the Messages endpoint, and the browser stub."""
+        sign-in URLs, the authorization server (revocation, refresh), and the
+        browser stub. The gateway is the one the token response names."""
         log = os.path.join(home, "browser-opened.txt")
         stub = os.path.join(home, "browser-stub")
         with open(stub, "w") as f:
@@ -144,10 +186,37 @@ class MetaskMock:
         return {
             "BROWSER": stub,
             "METACODE_OAUTH_AUTHORIZE_URL": f"{self.origin}/oauth/authorize",
-            "METACODE_OAUTH_TOKEN_URL": f"{self.origin}/oauth/token",
-            "METACODES_BASE_URL": f"{self.origin}/v1/messages",
+            "METACODE_OAUTH_TOKEN_URL": f"{self.origin}/api/oauth/token",
+            "METASK_SITE_URL": self.origin,
+            "METASK_GATEWAY_URL": None,
+            "METACODES_BASE_URL": None,
             "METACODE_API_KEYS_URL": None,
         }
+
+    def key_route_env(self):
+        """For a start on an older sign-in's key (`auth.json`): the Messages
+        endpoint the historical key route uses."""
+        return {"METACODES_BASE_URL": f"{self.origin}/v1/messages"}
+
+    def write_session(self, state):
+        """The Metask session `/login` stores (`oauth/metask.json`), naming
+        this server as its gateway, and the model choice it leaves in
+        `auth.json`."""
+        oauth = os.path.join(state, "oauth")
+        os.makedirs(oauth, exist_ok=True)
+        path = os.path.join(oauth, "metask.json")
+        with open(path, "w") as f:
+            # The layout `provider/oauth.zig` stores (`renderStored`).
+            json.dump({"schema_version": 1, "access_token": ACCESS_TOKEN, "refresh_token": REFRESH_TOKEN,
+                       "token_type": "bearer", "expires_at": int(time.time()) + 3600,
+                       "scope": "read model:invoke",
+                       "gateway_url": self.origin, "models_url": f"{self.origin}/v1/models"}, f)
+        os.chmod(path, 0o600)
+        auth = os.path.join(state, "auth.json")
+        with open(auth, "w") as f:
+            json.dump({"selected_model": MODEL, "reasoning_effort": "low"}, f)
+        os.chmod(auth, 0o600)
+        return path
 
     def wait_for(self, predicate, timeout=10.0):
         deadline = time.monotonic() + timeout

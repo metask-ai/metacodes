@@ -1,12 +1,15 @@
 //! Signing out of Metask (#485, #499 part 2): both of its sign-ins, and the
 //! remembered default when that is Metask's.
 //!
-//! Metask has two sign-ins that reach the same account: the browser one
-//! (`metacodes login`, `/login`), stored in `<state root>/auth.json`, and the
-//! device-code one (`metacodes login --provider metask`), stored in
-//! `<state root>/oauth/metask.json` with its refresh token. Signing out
-//! removes both, so no Metask credential stays on the machine; the CLI's
-//! `metacodes logout` and the TUI's `/logout` share this.
+//! Metask has two sign-ins that reach the same account, and both store the
+//! Metask session in `<state root>/oauth/metask.json` with its refresh token
+//! (#527): the browser one (`metacodes login`, `/login`) and the device-code
+//! one (`metacodes login --provider metask`). `<state root>/auth.json` holds
+//! the browser sign-in's model and reasoning level, or a key, or a browser
+//! sign-in older than #527. Signing out removes both files, so no Metask
+//! credential stays on the machine; the CLI's `metacodes logout` and the
+//! TUI's `/logout` share this. They revoke the session at the server first
+//! (`metask_oauth.revokeStoredSession`).
 //!
 //! A stored `/model` default that resolves to Metask is forgotten with them:
 //! the next plain start would otherwise try Metask without a sign-in. Keys of
@@ -24,10 +27,11 @@ const registry_mod = @import("../provider/registry.zig");
 
 /// What was on disk and is gone.
 pub const Removed = struct {
-    /// `<state root>/auth.json` (or `METACODES_AUTH_FILE`): the browser sign-in.
+    /// `<state root>/auth.json` (or `METACODES_AUTH_FILE`): the browser
+    /// sign-in's model choice, a key, or a browser sign-in older than #527.
     browser: bool = false,
-    /// `<state root>/oauth/metask.json` (or `METACODES_OAUTH_DIR`): the
-    /// device-code sign-in and its refresh token.
+    /// `<state root>/oauth/metask.json` (or `METACODES_OAUTH_DIR`): the Metask
+    /// session, from the browser or the device code, and its refresh token.
     device: bool = false,
 
     pub fn any(self: Removed) bool {

@@ -170,12 +170,10 @@ pub const MetaskPrepared = struct {
         notify: oauth_login.Notify,
         diagnostic: ?*ImportDiagnostic,
     ) !Outcome {
-        var hostname_buf: HostNameBuffer = undefined;
         const token_json = try metask_oauth.acquireDeviceTokenWith(
             allocator,
             io,
             metask_oauth.siteUrl(),
-            hostName(&hostname_buf),
             self.options.open_browser,
             .{ .ctx = @ptrCast(@constCast(&notify)), .show = showDeviceCode },
             self.options.abort_signal,
@@ -196,19 +194,6 @@ pub const MetaskPrepared = struct {
         notify.say(std.fmt.bufPrint(&buffer, "Open {s} and enter the code {s}\n\n", .{ uri, code }) catch "Open the Metask device page and enter the code it asks for.\n");
     }
 };
-
-const is_windows = @import("builtin").os.tag == .windows;
-const HostNameBuffer = if (is_windows) [1]u8 else [std.posix.HOST_NAME_MAX]u8;
-
-/// The kernel-reported host name (sent to the Metask device grant so the
-/// authorization page can say which machine asks); `localhost` when unknown.
-/// HOSTNAME is often unset on macOS and is not authoritative when inherited.
-fn hostName(buffer: *HostNameBuffer) []const u8 {
-    return if (is_windows) "localhost" else blk: {
-        const resolved = std.posix.gethostname(buffer) catch break :blk "localhost";
-        break :blk if (resolved.len == 0) "localhost" else resolved;
-    };
-}
 
 /// Longest API key a login accepts from a paste or a prompt.
 pub const MAX_KEY_LEN = 512;
