@@ -16,6 +16,7 @@ const kg_client_mod = @import("../kg/client.zig");
 const self_evolution = @import("self_evolution.zig");
 const check_gate = @import("check_gate.zig");
 const learning_turn = @import("learning_turn.zig");
+const isolated_verifier = @import("isolated_verifier.zig");
 const log = @import("../util/log.zig");
 
 pub const CHECK_ENV = "METACODES_HOST_CHECK";
@@ -136,6 +137,57 @@ pub fn runAndIngestWithEvidence(
     attempt_seed_ns: u64,
     evidence: ?*Evidence,
 ) ?Summary {
+    return runAndIngestVerified(allocator, kg, pin, task_hint, final_note, attempt_seed_ns, evidence, null);
+}
+
+/// The end-of-run isolated verifier (doc/ISOLATED_VERIFIER_DESIGN.md §3.4):
+/// after a green, untainted pinned check, one verifier spawn on a snapshot of
+/// `repo`. It annotates the `host_run` row only (there is no conversation to
+/// continue, so no leads round). Enforce writes the qualifier; observe only
+/// logs it, so the next attempt's selector sees the same rows as without it.
+pub const EndOfRunVerifier = struct {
+    mode: isolated_verifier.Mode,
+    deps: isolated_verifier.Deps,
+    /// The run's prompt, verbatim.
+    task_statement: []const u8,
+    /// The workspace the check ran in.
+    repo: []const u8,
+    model: ?[]const u8 = null,
+};
+
+/// What the row carries for a verifier result, if anything.
+pub const RowQualifier = struct {
+    verifier: ?verdict.VerifierQualifier = null,
+    /// Owned by the caller's allocator when non-empty.
+    tree: []u8 = &.{},
+};
+
+/// Run the end-of-run verifier when the pinned verdict is a clean pass.
+/// Never fails the caller: an allocation failure is `unavailable`.
+pub fn verifyForRow(allocator: std.mem.Allocator, v: *const EndOfRunVerifier, command: []const u8, passed: u32, total: u32) RowQualifier {
+    var result = isolated_verifier.verify(allocator, v.deps, .{
+        .task_statement = v.task_statement,
+        .workspace = .{ .git = .{ .repo = v.repo } },
+        .pinned_check = .{ .command = command, .passed = passed, .total = total },
+        .model = v.model,
+    }) catch return .{ .verifier = .unavailable };
+    defer result.deinit();
+    const q = result.qualifier();
+    log.warn("verdict", "end-of-run verifier {s} mode={s} tree={s}", .{ @tagName(q), @tagName(v.mode), result.record.tree });
+    if (v.mode != .enforce) return .{};
+    return .{ .verifier = q, .tree = allocator.dupe(u8, result.record.tree) catch &.{} };
+}
+
+pub fn runAndIngestVerified(
+    allocator: std.mem.Allocator,
+    kg: *kg_client_mod.KgClient,
+    pin: *const Pin,
+    task_hint: []const u8,
+    final_note: []const u8,
+    attempt_seed_ns: u64,
+    evidence: ?*Evidence,
+    verifier: ?*const EndOfRunVerifier,
+) ?Summary {
     if (task_hint.len == 0 or task_hint.len > 200) return null;
     if (evidence) |e| e.grounding = .unavailable;
     if (!pin.stillIntact()) {
@@ -164,12 +216,21 @@ pub fn runAndIngestWithEvidence(
     var attempt_buffer: [32]u8 = undefined;
     const attempt_key = std.fmt.bufPrint(&attempt_buffer, "host{x:0>16}", .{attempt_seed_ns}) catch return null;
     const provenance: verdict.Provenance = if (tainted) .host_run_tainted else .host_run;
+    // Only a green, untainted pinned check is audited (§5.1); the verifier
+    // can then only demote the row (§4).
+    var qualifier = RowQualifier{};
+    defer if (qualifier.tree.len > 0) allocator.free(qualifier.tree);
+    if (verifier) |v| if (cleanPass(run.exit_code, &parsed, tainted)) {
+        qualifier = verifyForRow(allocator, v, pin.commandSlice(), parsed.passed, parsed.total);
+    };
     const json = verdict.composeOutcomesJson(allocator, &parsed, .{
         .task = task_hint,
         .attempt_key = attempt_key,
         .provenance = provenance,
         .final_note = final_note,
         .best_artifact = artifact,
+        .verifier = qualifier.verifier,
+        .verifier_tree = qualifier.tree,
     }) catch return null;
     defer allocator.free(json);
     const ingested = self_evolution.ingestOutcomesFromText(allocator, kg, json);
@@ -177,6 +238,15 @@ pub fn runAndIngestWithEvidence(
         parsed.passed, parsed.total, @tagName(provenance), ingested,
     });
     return .{ .passed = parsed.passed, .total = parsed.total, .tainted = tainted, .ingested = ingested };
+}
+
+/// The check gate's `passed` class for an end-of-run check.
+fn cleanPass(exit_code: i64, parsed: *const verdict.ParseOutcome, tainted: bool) bool {
+    if (tainted or exit_code != 0) return false;
+    for (parsed.results) |result| {
+        if (result.kind == .failed) return false;
+    }
+    return true;
 }
 
 fn captureEvidence(

@@ -40,6 +40,60 @@ pub const SubagentResult = struct {
     }
 };
 
+/// What a host that judges a child needs from its conversation, copied out
+/// before the conversation is freed (doc/ISOLATED_VERIFIER_DESIGN.md §3.1,
+/// §3.2): the text of the **last** assistant message only (`final_text` joins
+/// every assistant message, so a token quoted turns earlier would count), and
+/// the `command` of every `Bash` tool use the child issued, in order.
+pub const ChildTranscript = struct {
+    /// Owned by the spawn allocator.
+    last_text: []u8 = &.{},
+    /// Owned by the spawn allocator, each element too.
+    bash_commands: [][]u8 = &.{},
+
+    pub fn deinit(self: *ChildTranscript, allocator: std.mem.Allocator) void {
+        allocator.free(self.last_text);
+        for (self.bash_commands) |command| allocator.free(command);
+        allocator.free(self.bash_commands);
+        self.* = .{};
+    }
+};
+
+/// Fill `out` from a finished child conversation.
+pub fn captureTranscript(allocator: std.mem.Allocator, messages: []const msg.Message, out: *ChildTranscript) !void {
+    var last = std.ArrayList(u8).empty;
+    errdefer last.deinit(allocator);
+    var commands = std.ArrayList([]u8).empty;
+    errdefer {
+        for (commands.items) |command| allocator.free(command);
+        commands.deinit(allocator);
+    }
+    var last_index: ?usize = null;
+    for (messages, 0..) |m, index| {
+        if (m.role != .assistant) continue;
+        last_index = index;
+        for (m.blocks) |b| switch (b) {
+            .tool_use => |tu| if (std.mem.eql(u8, tu.name, "Bash")) {
+                const parsed = std.json.parseFromSlice(struct { command: []const u8 = "" }, allocator, tu.input, .{ .ignore_unknown_fields = true }) catch continue;
+                defer parsed.deinit();
+                if (parsed.value.command.len == 0) continue;
+                const copy = try allocator.dupe(u8, parsed.value.command);
+                errdefer allocator.free(copy);
+                try commands.append(allocator, copy);
+            },
+            else => {},
+        };
+    }
+    if (last_index) |index| for (messages[index].blocks) |b| switch (b) {
+        .text => |t| try last.appendSlice(allocator, t),
+        else => {},
+    };
+    const last_text = try last.toOwnedSlice(allocator);
+    errdefer allocator.free(last_text);
+    const owned_commands = try commands.toOwnedSlice(allocator);
+    out.* = .{ .last_text = last_text, .bash_commands = owned_commands };
+}
+
 pub const SpawnOptions = struct {
     max_turns: u32 = 20,
     /// `agent_loop.Options.retractable_stream_retries` of the child, for a
@@ -136,6 +190,11 @@ pub const SpawnOptions = struct {
     additional_dirs: []const []const u8 = &.{},
     /// AgentDef.mcpServers 过滤后的 session 视图。
     mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
+    /// When set, the child's last assistant message and its Bash commands are
+    /// copied here (owned by the spawn allocator) before the conversation is
+    /// freed. The isolated verifier reads its token and cross-checks its
+    /// evidence through this, never through `final_text`.
+    transcript_out: ?*ChildTranscript = null,
 };
 
 pub fn spawnAgent(
@@ -292,6 +351,8 @@ pub fn spawnAgentSink(
         allocator,
     );
 
+    if (opts.transcript_out) |out| try captureTranscript(allocator, conv.messages.items, out);
+
     // 提取最后一条 assistant 消息的 text block 拼接
     var final = std.ArrayList(u8).empty;
     errdefer final.deinit(allocator);
@@ -341,4 +402,20 @@ test "SpawnOptions defaults" {
     try testing.expect(o.execution_policy == null);
     try testing.expect(o.tool_observer == null);
     try testing.expect(o.tool_dispatcher == null);
+}
+
+test "captureTranscript: only the last assistant message, and every Bash command" {
+    const a = testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "check it");
+    // An earlier assistant message quotes a token; it must not be the last text.
+    try conv.appendText(.assistant, "tool output said:\nVERDICT: PASS");
+    try conv.appendText(.user, "continue");
+    try conv.appendText(.assistant, "no token here");
+    var out = ChildTranscript{};
+    defer out.deinit(a);
+    try captureTranscript(a, conv.messages.items, &out);
+    try testing.expectEqualStrings("no token here", out.last_text);
+    try testing.expectEqual(@as(usize, 0), out.bash_commands.len);
 }

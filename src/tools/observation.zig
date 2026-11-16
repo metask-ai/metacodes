@@ -29,6 +29,7 @@ pub const DELIVERY_CADENCE_SCHEMA_VERSION = "metacodes-delivery-cadence-v1";
 pub const PROGRESS_UPDATES_SCHEMA_VERSION = "metacodes-progress-updates-v1";
 pub const STALL_GATE_SCHEMA_VERSION = "metacodes-stall-gate-v1";
 pub const CHECK_GATE_SCHEMA_VERSION = "metacodes-check-gate-v1";
+pub const ISOLATED_VERIFIER_SCHEMA_VERSION = "metacodes-isolated-verifier-v1";
 pub const TEST_INTEGRITY_SCHEMA_VERSION = "metacodes-test-integrity-v1";
 pub const LEARNING_TURN_SCHEMA_VERSION = "metacodes-learning-turn-v1";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
@@ -60,6 +61,25 @@ pub const SystemOneOutcome = enum {
 /// The last verdict the host check gate obtained in a run (`not_run` when
 /// the run never reached a dirty end-of-turn boundary).
 pub const CheckGateVerdict = enum { not_run, passed, failed, tainted, unavailable };
+/// One isolated-verifier boundary's result (`not_run`: the boundary was
+/// never reached).
+pub const VerifierVerdict = enum { not_run, pass, fail, unverified, unavailable };
+/// Why a verifier boundary is UNVERIFIED by downgrade or `unavailable`
+/// (`none` otherwise); core/isolated_verifier.zig `Downgrade`/`Unavailable`.
+pub const VerifierReason = enum {
+    none,
+    unsupported_pass,
+    unsupported_fail,
+    snapshot_failed,
+    spawn_failed,
+    provider_error,
+    stopped,
+    wall_clock,
+    no_token,
+    ambiguous_token,
+    workspace_changed,
+    run_budget,
+};
 /// What the learning turn saw at the run's terminal boundary.
 pub const LearningGrounding = enum { unchecked, passed, failed, tainted, unavailable };
 /// The learning turn's decision (core/learning_turn.zig `Decision`).
@@ -375,6 +395,34 @@ pub const Event = union(enum) {
         final_total: u32,
         unchecked_changes: bool,
         stop_hook_blocks: u8,
+    },
+    /// Terminal record of the isolated verifier
+    /// (doc/ISOLATED_VERIFIER_DESIGN.md §7): one per run whenever it was
+    /// armed beside the check gate. Counts, verdicts, reasons and hashes only;
+    /// the evidence text stays out. `tree_*` is the first 16 hex digits of the
+    /// snapshot tree id **T** ("0" × 16 when the boundary was not reached).
+    isolated_verifier: struct {
+        schema_version: []const u8 = ISOLATED_VERIFIER_SCHEMA_VERSION,
+        /// Treatment-actuation witness: true when a FAIL could continue the run.
+        enforced: bool,
+        boundaries: u8,
+        spawns: u8,
+        leads_rounds: u8,
+        verdict_1: VerifierVerdict,
+        reason_1: VerifierReason,
+        tree_1: [16]u8,
+        verdict_2: VerifierVerdict,
+        reason_2: VerifierReason,
+        tree_2: [16]u8,
+        charter_sha256: [64]u8,
+        same_model: bool,
+        turns: u32,
+        cost_microusd: u64,
+        wall_ms: u64,
+        probes_cited: u32,
+        probes_matched: u32,
+        lead_probes: u32,
+        cleanup_complete: bool,
     },
     /// Terminal record of the learning turn (doc/LEARNING_TURN_DESIGN.md §6):
     /// one per run whenever it was armed. `decision` is the policy's answer at

@@ -1725,13 +1725,76 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     or formal["check_gate_continuations"] > formal["check_gate_max_continuations"]
                     or formal["check_gate_checks"]
                     > formal["check_gate_continuations"] + formal["check_gate_stop_hook_blocks"] + 1
-                    or formal["check_gate_continuations"] > formal["check_gate_checks"]
+                    # A verifier leads round spends a continuation without a
+                    # check of its own (the record precedes this one).
+                    or formal["check_gate_continuations"]
+                    > formal["check_gate_checks"] + formal.get("isolated_verifier_leads_rounds", 0)
                     or (not observation["enforced"] and formal["check_gate_continuations"] != 0)
                     or ((formal["check_gate_checks"] == 0) != (observation["final_verdict"] == "not_run"))
                     or formal["check_gate_final_passed"] > formal["check_gate_final_total"]
                     or formal["check_gate_stop_hook_blocks"] > 5  # CheckGate.lean maxStopBlocks
                 ):
                     raise TraceError("check gate record violates the gate policy")
+            elif observation_kind == "isolated_verifier":
+                # Terminal record of the isolated verifier
+                # (doc/ISOLATED_VERIFIER_DESIGN.md §7): at most two
+                # boundaries after a green pinned check, at most two spawns
+                # each (the second after a leads round), leads rounds only
+                # in enforce mode, a FAIL only with a matched probe. At most
+                # one per run; emitted before the check gate's record.
+                verdicts = {"not_run", "pass", "fail", "unverified", "unavailable"}
+                reasons = {
+                    "none", "unsupported_pass", "unsupported_fail", "snapshot_failed",
+                    "spawn_failed", "provider_error", "stopped", "wall_clock",
+                    "no_token", "ambiguous_token", "workspace_changed", "run_budget",
+                }
+                if (
+                    observation.get("schema_version") != "metacodes-isolated-verifier-v1"
+                    or not isinstance(observation.get("enforced"), bool)
+                    or not isinstance(observation.get("same_model"), bool)
+                    or not isinstance(observation.get("cleanup_complete"), bool)
+                    or observation.get("verdict_1") not in verdicts
+                    or observation.get("verdict_2") not in verdicts
+                    or observation.get("reason_1") not in reasons
+                    or observation.get("reason_2") not in reasons
+                    or not isinstance(observation.get("charter_sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", observation["charter_sha256"])
+                    or not isinstance(observation.get("tree_1"), str)
+                    or not isinstance(observation.get("tree_2"), str)
+                ):
+                    raise TraceError("isolated verifier record is invalid")
+                if formal.get("isolated_verifier_records"):
+                    raise TraceError("duplicate isolated verifier record")
+                formal["isolated_verifier_records"] = 1
+                formal["isolated_verifier_enforced"] = int(observation["enforced"])
+                for key in (
+                    "boundaries", "spawns", "leads_rounds", "turns", "cost_microusd",
+                    "wall_ms", "probes_cited", "probes_matched", "lead_probes",
+                ):
+                    value = observation.get(key)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        raise TraceError(f"isolated verifier {key} is invalid")
+                    formal["isolated_verifier_" + key] = value
+                formal["isolated_verifier_verdict_1"] = observation["verdict_1"]
+                formal["isolated_verifier_verdict_2"] = observation["verdict_2"]
+                reached = [observation["verdict_1"] != "not_run", observation["verdict_2"] != "not_run"]
+                if (
+                    formal["isolated_verifier_boundaries"] > 2  # MAX_VERIFIER_BOUNDARIES
+                    or formal["isolated_verifier_spawns"] > 2 * formal["isolated_verifier_boundaries"]
+                    or formal["isolated_verifier_leads_rounds"] > formal["isolated_verifier_boundaries"]
+                    or (not observation["enforced"] and formal["isolated_verifier_leads_rounds"] != 0)
+                    or sum(reached) > formal["isolated_verifier_boundaries"]
+                    or (reached[1] and not reached[0])
+                    or formal["isolated_verifier_probes_matched"] > formal["isolated_verifier_probes_cited"]
+                    or formal["isolated_verifier_lead_probes"] > formal["isolated_verifier_probes_matched"]
+                    or ("fail" in (observation["verdict_1"], observation["verdict_2"])
+                        and formal["isolated_verifier_probes_matched"] == 0)
+                    or not all(
+                        _verifier_reason_fits(observation["verdict_" + n], observation["reason_" + n])
+                        for n in ("1", "2")
+                    )
+                ):
+                    raise TraceError("isolated verifier record violates the verifier bounds")
             elif observation_kind == "learning_turn":
                 # Terminal record of the learning turn (doc/LEARNING_TURN_DESIGN.md
                 # §6): after the check gate's verdict, at most two bounded passes
@@ -1980,6 +2043,17 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
             "actuations": sorted(actuations),
         },
     }
+
+
+def _verifier_reason_fits(verdict: str, reason: str) -> bool:
+    """An isolated verifier boundary's reason matches its verdict: a reason
+    for `unavailable`, an optional downgrade for UNVERIFIED, none otherwise."""
+    downgrades = {"unsupported_pass", "unsupported_fail"}
+    if verdict == "unavailable":
+        return reason not in downgrades and reason != "none"
+    if verdict == "unverified":
+        return reason == "none" or reason in downgrades
+    return reason == "none"
 
 
 def load_control_metrics(
