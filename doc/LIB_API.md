@@ -422,6 +422,17 @@ Host 导入的规则层，禁用不了模式，所以给用户开放哪些模式
 只有 CLI/TUI/Web 这类 App 产品（`permission.AlwaysAllowScope.settings_file`）会追加
 `.claude/settings.local.json`，因为它的 settings loader 会在下次启动时读回。
 
+swarm 成员可以借用 lead 的权限（#445）：`member.inheritPermissions(lead)`（只在 member
+空闲时、只一次）之后，member 每次工具调用都按 lead **当时**的导入规则层和 additional
+directories 判定，"总是允许/拒绝"记进并读自 lead 的 `session_rules`；lead 之后
+`updatePermissionRules`/`setAdditionalDirectories` 或在权限框里选的 always，从 member 的
+下一次工具调用起生效。member 自己的 `updatePermissionRules`/`setAdditionalDirectories`
+返回 `PermissionsInherited`；权限模式、工具、工作区根和 shell 沙箱仍是 member 自己的。
+锁规则：member 的每次判定全程持有 lead 的 `lent_permissions.mutex`（不跨权限询问），
+lead 在同一把锁下替换规则/目录、释放锁后才 free 旧值；lead 的 `destroy` 等所有借用者
+destroy 完才继续，所以先销毁 member。`SessionHost` 的 `InheritLead` 工厂
+（`TeammatePermissions.lead`）自动这样打开成员，见 [API.md](API.md)。
+
 Host 自己持久化 transcript 时，路径只从一处推导，不要手写布局：
 
 ```zig

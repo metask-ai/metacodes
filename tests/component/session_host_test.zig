@@ -1166,6 +1166,107 @@ test "L2 #445 SessionHost InheritLead: the member runs with its lead's current m
     try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(3).?.body(), "done: 42") != null);
 }
 
+test "L2 #445 SessionHost InheritLead: a rule or directory the lead gains after the member opened decides the member's next tool call, as an App teammate reads its lead's permission context" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+    var extra_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const extra = try subdir(&tmp, "extra", &extra_buf);
+    var outside_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const outside_path = try std.fmt.bufPrint(&outside_path_buf, "{s}/gained-dir.txt", .{extra});
+    var inside_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const inside_path = try std.fmt.bufPrint(&inside_path_buf, "{s}/gained-rule.txt", .{root});
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"stand by\\\"}"),
+        delegated,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    // Member Run 1 answers; Run 2 writes into the directory the lead gains;
+    // Run 3 writes inside the workspace after the lead gains a deny rule.
+    const ready = try textSse(a, "ready");
+    defer a.free(ready);
+    const write_outside = try writeToolSse(a, outside_path);
+    defer a.free(write_outside);
+    const write_inside = try writeToolSse(a, inside_path);
+    defer a.free(write_inside);
+    const wrote = try textSse(a, "wrote");
+    defer a.free(wrote);
+    const member_bodies = [_][]const u8{ ready, write_outside, wrote, write_inside, wrote };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    // The lead runs under accept_edits with its team tools allowed by rule;
+    // the member inherits the mode at spawn, and its permissions live.
+    const team_tools = [_][]const u8{ "TeamCreate", "SpawnTeammate", "SendMessage" };
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var lead_config = spawnLeadConfig(lead_url, workspace);
+    lead_config.allowed_tools = &.{ "TeamCreate", "SpawnTeammate", "SendMessage", "Write" };
+    lead_config.permission_mode = .accept_edits;
+    lead_config.permission_rules = .{ .allow = &team_tools };
+    var base = lead_config;
+    base.base_url = member_url;
+    var inherit = cc.session_host.InheritLead{ .base = base };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    // Without the lead's directory the member's Write would ask; the prompt
+    // then closes unanswered instead of holding the test.
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = inherit.factory(), .ui_request_timeout_ms = 1_000 });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 1);
+    const member = host.acquire(try memberId(&host, lead)).?;
+    defer host.release(member);
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+    var snap = try member.snapshot(a);
+    defer snap.deinit(a);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.accept_edits, snap.permission_mode);
+
+    // The lead gains a directory after the member opened: the member's next
+    // Write there is inside its working directories, so accept_edits takes it.
+    try lead.command(.{ .set_additional_directories = &.{extra} });
+    try waitFor(&lead.journal, "\"type\":\"command_result\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"command\":\"set_additional_directories\",\"ok\":true"));
+    try member.submit(.{ .text = "write into the new directory" });
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&member.journal, "\"type\":\"ui_request\""));
+    try std.testing.expect(try exists(extra, "gained-dir.txt"));
+
+    // The lead gains a deny rule: the member's next Write, inside the
+    // workspace and so allowed until now, is denied.
+    try lead.command(.{ .update_permission_rules = .{ .allow = &team_tools, .deny = &.{"Write"} } });
+    try waitFor(&lead.journal, "\"type\":\"command_result\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"command\":\"update_permission_rules\",\"ok\":true"));
+    try member.submit(.{ .text = "write inside the workspace" });
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 3);
+    try std.testing.expect(!try exists(root, "gained-rule.txt"));
+    try std.testing.expectEqual(@as(usize, 5), member_srv.requestCount());
+
+    // The member's own rules and directories would never be read: refused.
+    try member.command(.{ .update_permission_rules = .{ .allow = &.{"Write"} } });
+    try member.command(.{ .set_additional_directories = &.{} });
+    try waitFor(&member.journal, "\"type\":\"command_result\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&member.journal, "{\"command\":\"update_permission_rules\",\"ok\":false,\"error_name\":\"PermissionsInherited\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&member.journal, "{\"command\":\"set_additional_directories\",\"ok\":false,\"error_name\":\"PermissionsInherited\""));
+
+    // Closing the lead closes the member first; its AgentSession outlives it.
+    try host.close(lead.id);
+    try std.testing.expect(member.journal.isClosed());
+}
+
 test "L2 #445 SessionHost: a lead re-spawns a name whose member the Host closed, under a fresh lease, and hears from the new member" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
