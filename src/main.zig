@@ -4340,6 +4340,13 @@ test {
     _ = &@import("teamwork/issues.zig");
     _ = &@import("teamwork/reviewer.zig");
     _ = &@import("teamwork/stub_driver.zig");
+    _ = &@import("teamwork/charters.zig");
+    _ = &@import("teamwork/drivers/common.zig");
+    _ = &@import("teamwork/drivers/write_scope.zig");
+    _ = &@import("teamwork/drivers/metacodes.zig");
+    _ = &@import("teamwork/drivers/claude_code.zig");
+    _ = &@import("teamwork/drivers/factory.zig");
+    _ = &@import("teamwork/drivers/drivers_test.zig");
     _ = &@import("core/memory/import.zig");
     _ = &@import("core/memory/claudemd.zig");
     _ = &@import("core/memory/user_context.zig");

@@ -13,6 +13,8 @@
 //!     review.json         written by a reviewer seat (reviewer.zig)
 //!     open_issues.json    the runtime's read-only copy of the ledger
 //!                         for this seat (issues.zig)
+//!     harness.log         an external harness's stderr and the driver's
+//!                         diagnostics (drivers/claude_code.zig)
 //! ```
 //!
 //! Everything a run knows is on disk, so `recover` rebuilds the seat table
