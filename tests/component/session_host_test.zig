@@ -1087,12 +1087,20 @@ fn spawnLeadConfig(url: []const u8, workspace: cc.agent_session.WorkspaceConfig)
     return config;
 }
 
-/// The id on `host` that is not `lead`'s; `host` holds exactly two.
+/// The id on `host` that is not `lead`'s; `host` holds exactly two. The
+/// lead's driver opens the member after the lead's Run is journaled as done,
+/// so a caller that saw that `run_done` waits here for the member to open.
 fn memberId(host: *SessionHost, lead: *HostedSession) !cc.session_id.SessionId {
-    const ids = try host.list(std.testing.allocator);
-    defer std.testing.allocator.free(ids);
-    try std.testing.expectEqual(@as(usize, 2), ids.len);
-    return if (std.mem.eql(u8, ids[0].asSlice(), lead.id.asSlice())) ids[1] else ids[0];
+    var waited: u64 = 0;
+    while (true) : (waited += 20) {
+        const ids = try host.list(std.testing.allocator);
+        defer std.testing.allocator.free(ids);
+        if (ids.len >= 2 or waited >= 10_000) {
+            try std.testing.expectEqual(@as(usize, 2), ids.len);
+            return if (std.mem.eql(u8, ids[0].asSlice(), lead.id.asSlice())) ids[1] else ids[0];
+        }
+        std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    }
 }
 
 test "L2 #445 SessionHost InheritLead: the member runs with its lead's current model and permission mode, as an App teammate inherits them" {
