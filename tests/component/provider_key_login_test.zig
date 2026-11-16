@@ -7,6 +7,10 @@
 //! token endpoint"), a Z.AI key could live only in an environment variable,
 //! and a `/model` pick of a Z.AI model without one ended in
 //! `MissingCredentials`.
+//!
+//! `/model` takes no key itself (#488): a provider without one is listed as
+//! not configured, and the key this login stores makes its routes ones a
+//! pick applies.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -288,11 +292,12 @@ test "L2 key login: a stored key starts a Z.AI session and reaches its requests,
     try std.testing.expectEqualStrings("Bearer " ++ GOOD_KEY, headerValue(captured, "authorization").?);
 }
 
-test "L2 key login: a /model pick without a key takes the pasted key, stores it, and applies the route" {
+test "L2 key login (#488): /model takes no key; a provider without one is not configured, and the key /login stored makes its routes applicable" {
     var case: Case = undefined;
     try case.init();
     defer case.deinit();
     const allocator = case.arena.allocator();
+    // Any request the picker made would land here.
     var check = try harness.MockServer.start(MODELS_OK, 0);
     defer check.stop();
     try case.checkAt(check);
@@ -302,96 +307,47 @@ test "L2 key login: a /model pick without a key takes the pasted key, stores it,
     const argv = [_][*:0]const u8{"metacodes"};
     const app = try App.init(std.testing.allocator, io_runtime.io(), try case.config(&argv), "metask-key");
     defer app.deinit();
+    const picker = &app.model_picker;
+    var rows = cc.repl_model_picker.Picker.RowBuffer.init(std.testing.allocator);
+    defer rows.deinit();
 
+    // No key: the plan is listed, in the not-configured group, and Enter on
+    // it shows where the key goes. No key stage, no worker, no request.
     var ui: cc.tui_ui_state.UiState = .{};
     picker_host.open(app, &ui, .unguarded);
     for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    const unconfigured = try picker.rows(&rows);
+    try std.testing.expectEqual(@as(usize, 1), unconfigured.len);
+    try std.testing.expect(!unconfigured[0].provider.ready);
+    try std.testing.expectEqual(picker_host.Result.redraw, picker_host.onKey(app, &ui, .enter, .unguarded));
+    try std.testing.expectEqual(cc.repl_model_picker.Stage.setup, picker.stage);
+    try std.testing.expectEqualStrings("ZAI_API_KEY", picker.setup.?.variable.?);
+    const env_path = try std.fs.path.join(allocator, &.{ case.root, ".env" });
+    try std.testing.expectEqualStrings(env_path, picker.localConfigPath());
+    for ([_]cc.repl_model_picker.Key{ .enter, .{ .char = 'k' }, .cycle_scope }) |key| {
+        try std.testing.expectEqual(picker_host.Result.ignored, picker_host.onKey(app, &ui, key, .unguarded));
+    }
+    try std.testing.expectEqual(@as(usize, 0), check.requestCount());
+    try std.testing.expect(try key_store.load(std.testing.allocator, case.root, Slug.lit("zai-coding-plan")) == null);
+    // The session stays on the route it started on.
+    try std.testing.expectEqualStrings("metask-key", app.api_key);
+    picker_host.close(app, &ui, .unguarded);
+
+    // The key `/login zai-coding-plan` would store: the next /model lists
+    // the plan as ready, and a pick applies its route with that key.
+    try key_store.save(std.testing.allocator, case.root, Slug.lit("zai-coding-plan"), .zai_coding_plan_api_key, GOOD_KEY, null, 1);
+    picker_host.open(app, &ui, .unguarded);
+    for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    const configured = try picker.rows(&rows);
+    try std.testing.expectEqual(@as(usize, 1), configured.len);
+    try std.testing.expect(configured[0].provider.ready);
     _ = picker_host.onKey(app, &ui, .enter, .unguarded); // provider
     _ = picker_host.onKey(app, &ui, .enter, .unguarded); // GLM-5.3, listed first
     _ = picker_host.onKey(app, &ui, .enter, .unguarded); // its first channel (cn-anthropic)
-    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // options: apply → no key
-    const picker = &app.model_picker;
-    try std.testing.expectEqual(cc.repl_model_picker.Stage.credential, picker.stage);
-    try std.testing.expectEqual(cc.repl_model_picker.CredentialMode.paste_key, picker.credential_mode);
-    // The plan page for the channel's region is the one offered first.
-    try std.testing.expectEqualStrings("China · Personal Coding Plan", picker.keyChoices()[picker.key_choice].label);
-
-    for (GOOD_KEY) |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
-    try std.testing.expectEqual(picker_host.Result.redraw, picker_host.onKey(app, &ui, .enter, .unguarded));
-    // The field is wiped as soon as the worker has its copy.
-    try std.testing.expectEqual(@as(usize, 0), picker.key_len);
-
-    // The idle tick settles the worker and retries the pending commit.
-    var result: picker_host.Result = .ignored;
-    var waited_ms: u32 = 0;
-    while (app.login_worker != null) : (waited_ms += 10) {
-        if (waited_ms > 10_000) return error.KeyLoginTimedOut;
-        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
-        result = picker_host.poll(app, &ui, .unguarded);
-    }
-    try std.testing.expectEqual(picker_host.Result.committed, result);
+    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded)); // options: apply
     try std.testing.expectEqualStrings("glm-5.3", app.activeModel());
-    try std.testing.expectEqualStrings("Bearer " ++ GOOD_KEY, headerValue(check.lastRequest().?, "authorization").?);
-    var stored = (try key_store.load(std.testing.allocator, case.root, Slug.lit("zai-coding-plan"))).?;
-    defer stored.deinit();
-    try std.testing.expectEqualStrings(GOOD_KEY, stored.secret);
-}
-
-test "L2 key login: Esc during a key check that does not answer returns at once and stores nothing" {
-    var case: Case = undefined;
-    try case.init();
-    defer case.deinit();
-    const allocator = case.arena.allocator();
-    var check = try harness.MockServer.start(MODELS_OK, 0);
-    defer check.stop();
-    try case.checkAt(check);
-    check.gateNextResponse();
-
-    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
-    defer io_runtime.deinit();
-    const argv = [_][*:0]const u8{"metacodes"};
-    const app = try App.init(std.testing.allocator, io_runtime.io(), try case.config(&argv), "metask-key");
-    var app_alive = true;
-    defer if (app_alive) app.deinit();
-
-    var ui: cc.tui_ui_state.UiState = .{};
-    picker_host.open(app, &ui, .unguarded);
-    for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
-    for (0..4) |_| _ = picker_host.onKey(app, &ui, .enter, .unguarded);
-    try std.testing.expectEqual(cc.repl_model_picker.CredentialMode.paste_key, app.model_picker.credential_mode);
-    for (GOOD_KEY) |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
-    _ = picker_host.onKey(app, &ui, .enter, .unguarded);
-    // The check is on the wire and the server holds its answer.
-    try check.waitUntilResponseGated();
-    // Should Esc wait on the worker, it waits ~3 s for this and the timing
-    // check below fails, rather than the test hanging.
-    const Fallback = struct {
-        fn release(server: *harness.MockServer, done: *std.atomic.Value(bool)) void {
-            var waited_ms: u32 = 0;
-            while (!done.load(.acquire) and waited_ms < 3_000) : (waited_ms += 10) {
-                std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
-            }
-            server.releaseGatedResponse();
-        }
-    };
-    var done = std.atomic.Value(bool).init(false);
-    const fallback = try std.Thread.spawn(.{}, Fallback.release, .{ check, &done });
-    defer {
-        done.store(true, .release);
-        fallback.join();
-    }
-
-    const before = cc.util_time.nowMs();
-    _ = picker_host.onKey(app, &ui, .escape, .unguarded);
-    try std.testing.expect(cc.util_time.nowMs() - before < 1_000);
-    try std.testing.expect(app.login_worker == null);
-    try std.testing.expect(app.model_picker.stage != cc.repl_model_picker.Stage.credential);
-    try std.testing.expect(std.mem.indexOf(u8, app.model_picker.notice(), "no key was stored") != null);
-
-    // The answer arrives after the cancel: the parked worker drops it.
-    done.store(true, .release);
-    check.releaseGatedResponse();
-    app.deinit();
-    app_alive = false;
-    try std.testing.expect(try key_store.load(std.testing.allocator, case.root, Slug.lit("zai-coding-plan")) == null);
+    try std.testing.expectEqualStrings(GOOD_KEY, app.api_key);
+    // Another provider bills the session from here, and the notice says so.
+    try std.testing.expect(std.mem.indexOf(u8, picker.notice(), "from now on billed to your Z.AI GLM Coding Plan account") != null);
+    try std.testing.expectEqual(@as(usize, 0), check.requestCount());
 }

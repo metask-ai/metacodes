@@ -1,8 +1,11 @@
 """TTY coverage for the cross-UI model picker (issue #16).
 
-Offline: the picker reads compiled provider profiles, so no request is made and
-no credential is needed — except on the Metask API-key route, whose inventory is
-the gateway's own `/v1/models`; that case runs against a local mock gateway.
+Offline: the picker reads compiled provider profiles, so no request is made —
+except on the two Metask logins, whose inventory is the gateway's own
+`/v1/models`; those cases run against a local mock gateway. Every route listed
+can be applied as it is (#488): a provider is a normal row only with a
+credential, so a case that walks into one gives it a placeholder key, and the
+others sit dimmed under "Not configured".
 What is asserted here is the behaviour the requirement names and that unit
 tests cannot see — that the overlay reaches a real terminal,
 that it owns the keyboard without eating the draft, and that a mid-stream
@@ -49,10 +52,12 @@ def _provider_rows(text):
 def test_model_command_lists_every_provider_and_reaches_its_models(bin_path):
     # metask / openai / gemini 的 id 都是 6 字节。分组标签曾指向循环变量的栈拷贝,
     # 等长 id 被并成一行 "metask 16 models",进去只有 metask 的模型:openai、gemini
-    # 在 /model 里根本选不到。
+    # 在 /model 里根本选不到。OpenAI 给占位 key,它才是能进去的正常行(#488);
+    # gemini 没有 key,排在 "Not configured" 下面,仍是独立一行。
     raw = run(
         bin_path,
         submit("/model", "Provider") + ["sleep:0.3", "key:down", "sleep:0.3", "key:enter", wait_for("Model")],
+        env={"OPENAI_API_KEY": "tty-dummy-openai-key", "GEMINI_API_KEY": None, "GOOGLE_API_KEY": None},
         per_key_drain=0.1,
     )
     a, text = _screen(raw)
@@ -312,32 +317,170 @@ def test_picker_options_step_changes_reasoning_with_arrows_and_applies_with_ente
     assert any("Reasoning effort" in sc and "= high" in sc and "[low high max]" in sc for sc in options), \
         "→ 没有把推理强度改到 high:\n" + options[-1]
     assert "switched to glm-5.3" in text, "Enter 没有应用线路:\n" + text
+    # Metask to the GLM plan: the bill moves, and the notice says where (#488).
+    flat = " ".join(text.split())
+    assert "from now on billed to your Z.AI GLM Coding Plan account" in flat, "切到另一家没写明扣钱的一方:\n" + text
 
 
 GUIDE = "https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md"
 
+# Every variable a built-in vendor reads its key from: cleared, so a case sees
+# only the keys it gives.
+VENDOR_KEYS = (
+    "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY",
+    "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY", "KIMI_CODE_API_KEY", "KIMI_API_KEY", "DASHSCOPE_API_KEY",
+    "MINIMAX_API_KEY", "AWS_BEARER_TOKEN_BEDROCK",
+)
+
+
+def _no_vendor_keys(**given):
+    env = {name: None for name in VENDOR_KEYS}
+    env.update(given)
+    return env
+
+
+def _provider_groups(screen):
+    """(normal rows, rows under "Not configured") of one Provider-stage frame."""
+    normal, unconfigured, target = [], [], None
+    for line in screen.splitlines():
+        if line.strip() == "Provider":
+            target = normal
+            continue
+        if line.strip() == "Not configured":
+            target = unconfigured
+            continue
+        parts = line.replace(">", " ").replace("*", " ").split()
+        if target is not None and len(parts) == 3 and parts[2] in ("model", "models") and parts[1].isdigit():
+            target.append(parts[0])
+    return normal, unconfigured
+
+
+def _last_provider_frame(raw, rows, cols):
+    a = TTYAssert(raw, rows=rows, cols=cols)
+    frames = []
+    for sc in a.frame_screens:
+        text = "\n".join(sc.line_text(r) for r in range(sc.rows))
+        if any(sc.line_text(r).strip() == "Provider" for r in range(sc.rows)):
+            frames.append(text)
+    assert frames, "/model 没有打开 Provider 阶段"
+    return frames[-1]
+
+
+def test_picker_lists_only_providers_with_a_credential_and_dims_the_rest_last(bin_path):
+    # #488: with no vendor key, only Metask (the session's own key) is a row a
+    # pick applies; every vendor sits dimmed under "Not configured", last. A
+    # key makes its vendor a normal row.
+    events = submit("/model", "Provider") + ["sleep:0.4"]
+    bare = _last_provider_frame(run(bin_path, events, term_size=(40, 120), env=_no_vendor_keys(),
+                                    per_key_drain=0.1), 40, 120)
+    normal, unconfigured = _provider_groups(bare)
+    assert normal == ["metask"], f"没有 key 时只该有 Metask 一行:{normal}\n" + bare
+    for vendor in ("openai", "gemini", "zai-coding-plan", "deepseek", "kimi", "kimi-code"):
+        assert vendor in unconfigured, f"{vendor} 应灰显在 Not configured 组:{unconfigured}\n" + bare
+
+    keyed = _last_provider_frame(run(bin_path, events, term_size=(40, 120),
+                                     env=_no_vendor_keys(DEEPSEEK_API_KEY="tty-dummy-deepseek-key"),
+                                     per_key_drain=0.1), 40, 120)
+    normal, unconfigured = _provider_groups(keyed)
+    assert normal == ["metask", "deepseek"], f"有 DEEPSEEK_API_KEY 时 DeepSeek 应是正常行:{normal}\n" + keyed
+    assert "deepseek" not in unconfigured, keyed
+
 
 def test_picker_names_the_variable_and_the_env_file_for_a_provider_without_a_key(bin_path):
-    # #483: Kimi on Moonshot's open platform has no sign-in and no key page. A
-    # route chosen without MOONSHOT_API_KEY ended in a bare
-    # "switch failed (MissingCredentials)"; now the picker names the variable,
-    # this install's .env and the guide. KIMI_API_KEY is Kimi Code's (#487).
+    # #483, #488: Kimi on Moonshot's open platform has no sign-in and no key
+    # page. A route chosen without MOONSHOT_API_KEY ended in a bare
+    # "switch failed (MissingCredentials)". Now the provider is listed dimmed,
+    # and choosing it shows the variable, this install's .env and the guide,
+    # and nothing to type. KIMI_API_KEY is Kimi Code's (#487).
     home = case_tmpdir("cc-tty-nokey-home-")
     env_file = os.path.join(home, ".metacodes", ".env")
     raw = run(
         bin_path,
         submit("/model", "Provider") + [
-            "type:kimi", wait_for("kimi-code"), "key:enter", f"waitline:Model:{WAIT_S}",
-            "key:enter", wait_for("Channel / offer"), "key:enter",
-            wait_for("Options"), "key:enter", wait_for("MOONSHOT_API_KEY"),
+            "type:kimi", wait_for("kimi-code"), "key:enter", wait_for("MOONSHOT_API_KEY"),
         ],
         term_size=(30, 160),
-        env={"HOME": home, "MOONSHOT_API_KEY": None, "KIMI_API_KEY": None, "KIMI_CODE_API_KEY": None},
+        env=_no_vendor_keys(HOME=home),
         per_key_drain=0.1,
     )
     _, text = _screen(raw, rows=30, cols=160)
-    assert "kimi has no key; the previous route is still active" in text, text
+    assert "kimi not configured" in text, text
     assert f"Set MOONSHOT_API_KEY in {env_file}, then restart" in text, text
     assert f"How to: {GUIDE}" in text, text
+    assert "esc back · q close" in text, text
     assert "MissingCredentials" not in text, text
     assert "KIMI_API_KEY" not in text, text
+    assert "enter apply" not in text, "setup 不该提供应用线路:\n" + text
+
+
+class _DeviceGatewayMock(http.server.BaseHTTPRequestHandler):
+    """The gateway a Metask device login names: two models on /v1/models."""
+
+    seen = []
+
+    def log_message(self, fmt, *args):  # noqa: D401
+        return
+
+    def do_GET(self):  # noqa: N802
+        type(self).seen.append((self.path, self.headers.get("authorization", "")))
+        if self.path != "/v1/models":
+            self.send_error(404)
+            return
+        body = json.dumps({"object": "list", "data": [
+            {"id": "device-model-a", "display_name": "Device Model A", "max_input_tokens": 200000, "max_tokens": 8192},
+            {"id": "device-model-b", "display_name": "Device Model B", "max_input_tokens": 128000, "max_tokens": 8192},
+        ]}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_picker_on_a_metask_device_login_offers_the_gateway_models(bin_path):
+    # #488, the other Metask login: a device-code session (oauth/metask.json)
+    # lists what its gateway's /v1/models answers, as the auth.json key route
+    # does above, not the compiled Claude list. The token is fresh, so nothing
+    # is refreshed; the site URL points nowhere in case something tried.
+    import time
+
+    home = case_tmpdir("cc-tty-device-home-")
+    oauth_dir = os.path.join(home, ".metacodes", "oauth")
+    os.makedirs(oauth_dir)
+    _DeviceGatewayMock.seen = []
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _DeviceGatewayMock)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    gateway = f"http://127.0.0.1:{server.server_port}"
+    login = os.path.join(oauth_dir, "metask.json")
+    with open(login, "w", encoding="utf-8") as handle:
+        json.dump({"schema_version": 1, "access_token": "tty-device-access", "refresh_token": "tty-device-refresh",
+                   "token_type": "Bearer", "expires_at": int(time.time()) + 86400, "gateway_url": gateway}, handle)
+    os.chmod(login, 0o600)
+    try:
+        raw = run(
+            bin_path,
+            submit("/model", "Provider") + ["key:enter", f"waitline:Model:{WAIT_S}", wait_for("Device Model B")],
+            base_url=None,
+            env=_no_vendor_keys(HOME=home, METASK_API_KEY=None, METACODES_BASE_URL=None,
+                                METASK_GATEWAY_URL=None, METASK_SITE_URL="http://127.0.0.1:1"),
+            extra_args=["--provider", "metask"],
+            startup_drain=1.2,
+            per_key_drain=0.1,
+        )
+    finally:
+        server.shutdown()
+    a, text = _screen(raw)
+
+    def screen_text(sc):
+        return "\n".join(sc.line_text(r) for r in range(sc.rows))
+
+    model_stage = [screen_text(sc) for sc in a.frame_screens
+                   if "Device Model B" in screen_text(sc)
+                   and any(sc.line_text(r).strip() == "Model" for r in range(sc.rows))]
+    assert model_stage, "设备码登录的 Model 阶段没列出网关模型:\n" + text
+    listing = model_stage[-1]
+    assert "Device Model A" in listing, listing
+    assert "Claude" not in listing, "设备码登录仍列出编译期 Claude 模型:\n" + listing
+    assert ("/v1/models", "Bearer tty-device-access") in _DeviceGatewayMock.seen, _DeviceGatewayMock.seen
+    assert b"tty-device-access" not in raw and b"tty-device-refresh" not in raw, "TTY 输出泄漏了令牌"
