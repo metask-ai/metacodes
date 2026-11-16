@@ -794,10 +794,11 @@ pub const ProjectRules = enum {
     /// running background job or active team fails the Run before any
     /// provider request. Such a refusal fails only that Run, as the daemon
     /// reports it failed and takes the next message: its input never enters
-    /// the Conversation and the Session stays usable (a refused resumption,
-    /// whose suspended turn could not be continued, still poisons). After
-    /// the Run the bundle is re-attested and the Run's operational
-    /// observation published.
+    /// the Conversation and the Session stays usable. A refused resumption
+    /// (`AdmittedRun.resumeWithResults`) leaves its suspended turn waiting
+    /// for its results, so a later Run can still continue it. After the Run
+    /// the bundle is re-attested and the Run's operational observation
+    /// published.
     enforced,
 };
 
@@ -1408,7 +1409,11 @@ pub const AdmittedRun = struct {
     /// Refused before anything changes, the admitted Run finished cleanly:
     /// `error.NothingToResume` when the Conversation does not end in an
     /// assistant turn with tool calls, `error.ResumeMismatch` when a result
-    /// names a call that turn did not make or names one twice.
+    /// names a call that turn did not make or names one twice. The project
+    /// rules refusing the Run (`RunControlConfig.project_rules`, #445) also
+    /// return with the Run finished, the results not recorded and the
+    /// Session idle: the suspended turn still waits for them, and another
+    /// admitted Run can resume it.
     pub fn resumeWithResults(
         self: *AdmittedRun,
         results: []const agent_loop.SuspendInfo.CompletedResult,
@@ -3106,16 +3111,11 @@ pub const AgentSession = struct {
         }) {
             .open => |control| control,
             .refused => |err| {
-                switch (input) {
-                    // The suspended turn's tool calls stay without results
-                    // and the Host drops its suspension on a failed Run: no
-                    // later Run could continue that Conversation.
-                    .resumption => _ = self.poisonRun(),
-                    .prompts, .record => {
-                        const completion = self.finishRunLifecycle();
-                        if (completion.callback_failed) return error.CallbackFailed;
-                    },
-                }
+                // A resumption's results stay out of the Conversation too:
+                // its suspended turn still waits for them, so a later Run
+                // can still give them (`SessionHost` keeps the suspension).
+                const completion = self.finishRunLifecycle();
+                if (completion.callback_failed) return error.CallbackFailed;
                 return err;
             },
         };

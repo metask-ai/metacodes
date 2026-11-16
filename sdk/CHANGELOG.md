@@ -52,6 +52,10 @@ empty `### Migration`.
   Session idle instead of poisoned, as the daemon does (#445);
   `SessionConfigV1` has no `run_control`, so an ABI Session never opens the
   gate.
+- No change a Host can see. A Zig `SessionHost` whose project rules refuse
+  the resumption of a suspended Run now keeps the suspension and announces
+  its request again under the same id instead of poisoning the Session
+  (#445); ABI revision 28 exposes neither `SessionHost` nor `run_control`.
 
 ### Fixed
 
