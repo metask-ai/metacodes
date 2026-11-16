@@ -12,6 +12,32 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **The Metask sign-in moves to `www.metask-ai.com` and is kept as the Metask
+  session** (#527). `/login` and `metacodes login` sign in at Metask's OAuth
+  server as the public client `metacodes`, ask for `read model:invoke`, and
+  come back on `http://localhost:<port>/auth/metask/callback`. There is no API
+  key to choose any more: the model and reasoning level are picked from the
+  `/v1/models` of the gateway the sign-in names (image-only models are left
+  out), and turns go there with the session's own access token, billed to the
+  account. The sign-in is stored as `oauth/metask.json`, its model and
+  reasoning level in `auth.json`; a key or an older sign-in there is replaced.
+  Until then an older sign-in there keeps refreshing at `napi.metask-ai.com`
+  as `metacode-cli`, which Metask keeps up for the transition.
+  A plain start signs in with the session, ahead of the provider `.env`
+  configures and after any key that signs Metask in (#499's first part); a
+  stored Metask default the session authenticates runs at the session's
+  gateway. `/logout` and `metacodes logout` revoke the session at Metask
+  first, bounded, and say when that fails. `metacodes login status` shows the
+  session. The device-code sign-in now posts to `www.metask-ai.com` (the bare
+  host answers every request with a redirect, so it failed with
+  `RequestFailed`), asks for the same scope, names the client in every grant
+  and the refresh, and sends no host name. It also asks for the model and
+  reasoning level, as the browser sign-in does: `metacodes login --provider
+  metask` at a terminal, and `/login metask` in `/login`'s pane. Before, it
+  chose none, and a start on it ran the compiled default model, which the
+  gateway does not serve. Without a terminal it stores only the session and
+  says so.
+
 - **`/login` signs in to Metask in the browser; `/logout` switches back to
   local configuration** (#485). `/login` alone now runs `metacodes login`'s
   browser sign-in, then asks for the API key, model and reasoning level in

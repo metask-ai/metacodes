@@ -275,8 +275,9 @@ zig build example                          # embed the runtime from Zig
 
 On a machine without a browser (a server, an SSH session), sign in with a
 device code instead: `metacodes login --provider metask --no-browser` prints
-a link and a code to confirm on any device. A plain `metacodes` does not pick
-that sign-in up yet (#499): start it with `metacodes --provider metask`.
+a link and a code to confirm on any device, then asks for the model and
+reasoning level (`/login metask` in the TUI). Either sign-in is kept as the
+Metask session, and a plain `metacodes` uses it.
 
 To use your own provider key instead of signing in, put it in the install's
 `~/.local/opt/metacodes/state/.env` and start again:
