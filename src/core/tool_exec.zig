@@ -649,7 +649,7 @@ const ObservationCapture = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (event) {
-            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => return true,
+            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .isolated_verifier, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => return true,
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.depth = started.agent_depth;
@@ -2419,7 +2419,7 @@ test "project post gate runs before terminal observation and block preserves act
         fn emit(raw: *anyopaque, event: tool_observation.Event) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
-                .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => {},
+                .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .isolated_verifier, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => {},
                 .dispatch_started => self.starts += 1,
                 .dispatch_finished => |finished| {
                     self.finishes += 1;

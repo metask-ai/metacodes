@@ -1,12 +1,14 @@
 # Isolated verifier: a second verdict source for the check gate
 
-Status: design only, 2026-10-17. Nothing here is implemented. This is the
+Status: implemented on `main` for the in-run check gate and the end-of-run
+host check, 2026-11-16 (design 2026-10-17); §12 lists what is implemented,
+where it departs from this design, and what is still open. This is the
 second of three borrowings from RSIAgent (AetherLabsAI/RSIAgent, arXiv
 2609.15364). The first, the learning turn, is `doc/LEARNING_TURN_DESIGN.md`
-and `src/core/learning_turn.zig` in
-[metask-ai/metacodes#292](https://github.com/metask-ai/metacodes/pull/292),
-which is not merged yet. Statements about the learning turn below refer to
-that branch. Every other statement names a module on `main`.
+and `src/core/learning_turn.zig`. When this design was written it lived in
+[metask-ai/metacodes#292](https://github.com/metask-ai/metacodes/pull/292);
+it has since reached `main`, but the verifier is not wired into it yet
+(§12.3).
 
 The RSIAgent properties this design borrows are the six named in §1.1. They
 come from that repository's verifier charter
@@ -747,7 +749,7 @@ claim.
   stay outside the snapshot, and the reference is used only by the harness
   for the discrimination check.
 
-## 10. Implementation sketch (not started)
+## 10. Implementation sketch (as designed; see §12 for the state)
 
 | Step | Files | Evidence that closes it |
 |---|---|---|
@@ -781,3 +783,67 @@ is all §9 needs: it uses steps 1–3 directly and does not depend on steps 4–
   findings reach memory only through the learning turn, as the actor's
   lesson, under the actor's header.
 - **Running on red, tainted or unavailable pinned verdicts.** See §5.1.
+
+## 12. Implementation state
+
+### 12.1 Implemented
+
+| Step | Where | Evidence |
+|---|---|---|
+| 1. Snapshot | `isolation.Snapshot` in [`agents/isolation.zig`](../src/agents/isolation.zig): a temporary index seeded from the run-start `HEAD`, `git add -A`, `write-tree` → **T**, `base`/`candidate` written by `commit-tree` with a fixed identity and date, a separate repository whose objects resolve through `objects/info/alternates`, `workspaceUnchanged` (T′ = T), an always-delete `finalize` | Unit test: untracked in, ignored out, two host commits and no actor history, the actor's status, refs, stash and `HEAD` byte-identical, a `git stash` in the snapshot never reaches the actor, T′ ≠ T after a write, the directory removed |
+| 2. Verifier core | [`core/isolated_verifier.zig`](../src/core/isolated_verifier.zig): `CHARTER` and `charterSha256Hex`, `renderPacket`, `parseToken`, `parseEvidence`, `crossCheck`, `judge`, `compose`, the §5.2 constants, `Gate` | Unit tests per row of the §3.2 table, the §3.1 token rules, the demote-only composition |
+| 3. Last message and tool inputs | `subagent.ChildTranscript` / `SpawnOptions.transcript_out` | Unit test: an earlier `VERDICT: PASS` is not the last message |
+| 4. Check-gate wiring | `agent_loop.zig` (`Options.isolated_verifier`, `verifierSpawn`, `verifierConclude`, `verifierAfterLeads`), `check_gate.State.noteVerifierFail` and `Source` | Component tests in [`tests/component/isolated_verifier_test.zig`](../tests/component/isolated_verifier_test.zig): FAIL → continuation → fixed → PASS; FAIL in observe mode changes nothing; PASS leaves the verdict; an ambiguous token is `unavailable`; the leads round refuses a write and feeds a fresh verifier; a project agent named `verifier` cannot shadow the charter |
+| 6. End-of-run qualifier | `verdict.VerifierQualifier`, `verdict.effectiveRank`, `ComposeOptions.verifier`; `host_check.runAndIngestVerified`; the ` verifier=<q>` token in `self_evolution` rows; `scoped_recall.rowProvenanceRank` | Unit tests for the three §4 properties; a component test: a standalone FAIL composes a `host_run` row with `"verifier":"fail"` that loses to an uncontested row of equal reward |
+| 8. Flags | `--verifier`, `--verifier-observe`, `--verifier-model <model or tier>`, and `METACODES_VERIFIER=enforce\|observe` in print mode (`main.resolveVerifier`) | A verifier with no pinned check, `--verifier-model` alone, or a verifier beside `--learning-turn` is a parse error |
+| 9. Record | `isolated_verifier` observation (`metacodes-isolated-verifier-v1`) in [`tools/observation.zig`](../src/tools/observation.zig); `scripts/eval/workbuddy/trace.py` validates it | `WorkBuddyIsolatedVerifierRecordTest` |
+
+The standalone entry point is `isolated_verifier.verify(gpa, Deps, VerifyRequest) → VerifyResult`.
+It holds no check-gate state, so a teamwork runtime can call it after an
+implementer finishes. `VerifyRequest` carries the task statement, a
+`Workspace` (`.git` = snapshot this repository, or `.snapshot` = a snapshot
+the caller keeps), an optional `PinnedCheck`, a `Budget` and an optional
+model. `VerifyResult.outcome` is `pass: Report`, `fail: Report`,
+`unverified: Unverified` (downgrade and `NOT ESTABLISHED` list) or
+`unavailable: Unavailable`; `VerifyResult.record` carries the charter hash,
+the tree id, the model, turns, metered cost, wall time and probe counts.
+`Deps` has no field for a KG client, memory, MCP, Skills, host services or a
+transcript, so none can reach the verifier.
+
+### 12.2 Departures from the design
+
+- **The leads round's output (§6.3).** The answer before the round is
+  closed `final` and the channel is sealed for the round, so the leads reply
+  is commentary and the answer survives if the run ends. A post-leads FAIL
+  that continues the run unseals the channel; the next answer is a second
+  `final` segment that supersedes the first.
+- **Layer 2 of §2.4 (a derived Seatbelt profile) is not built.** The
+  verifier inherits the actor's sandbox, with the snapshot as its working
+  directory. Detection (T′ = T) runs on every platform.
+- **Permissions.** The verifier runs under the actor's permission mode with
+  path rules resolved against the snapshot. A host that asks before `Bash`
+  and cannot ask a person in a subagent gets denied probes, which surface as
+  UNVERIFIED, not as a verdict.
+- **The end-of-run verifier runs only when the in-run gate is not armed**,
+  and writes the qualifier only in enforce mode: an observe arm's next
+  attempt sees the same rows as without the verifier.
+- **Snapshot refs** are written as plain files and the work tree is filled
+  with `read-tree -u --reset candidate` instead of `update-ref` and
+  `checkout`: on a loaded test host each ref transaction took up to 15 s,
+  and no hook from any configuration runs. A host whose default ref format
+  is not `files` gets `unavailable` (`snapshot_failed`).
+- **The record** carries the first 16 hex digits of each boundary's tree and
+  run totals for turns, cost and wall time rather than per-spawn lists.
+
+### 12.3 Not implemented
+
+- **Step 5, the learning turn's `contested` grounding.** Until it exists,
+  `--verifier` and `--learning-turn` are refused together.
+- **Step 7, the Lean model.** `effectiveRank` and the §4 theorems have Zig
+  unit tests only; `VerdictProvenance.lean` and an `IsolatedVerifier.lean`
+  are still to be written.
+- **Step 9's replay driver and `evals/experiments/isolated-verifier-v1.md`**,
+  and every run of §9. No paid run has been made.
+- **Teamwork integration** (#516): the runtime that calls `verify` after a
+  manager claims completion, uses `ORIGINAL_REQUEST.md` as the task
+  statement, and routes a first FAIL to a fix round.
