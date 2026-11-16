@@ -223,6 +223,8 @@ pub fn spawnDetached(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureErr
         _ = std.c.close(0);
         _ = std.c.close(1);
         _ = std.c.close(2);
+        // Detached like spawnService: keeps none of the caller's descriptors.
+        markInheritedCloseOnExec();
         execChild(argv, inherit_env, null, report.wr);
     }
     _ = std.c.close(report.wr);
@@ -268,6 +270,11 @@ pub fn spawnService(argv: []const ?[*:0]const u8, log_fd: c_int) CaptureError!vo
         }
         if (null_fd > 2) _ = std.c.close(null_fd);
         if (log_fd > 2) _ = std.c.close(log_fd);
+        // The service outlives this process: it must not keep a descriptor
+        // this process inherited without close-on-exec (a shell's process
+        // substitution, a caller's pass_fds), or whoever reads that pipe
+        // never sees EOF. The report pipe still closes on exec as before.
+        markInheritedCloseOnExec();
         const service = std.c.fork();
         if (service < 0) {
             reportChildFailure(report.wr, .exec, currentErrno());
@@ -1114,6 +1121,27 @@ const ReportPipe = struct {
 fn setCloseOnExec(fd: std.c.fd_t) bool {
     const current = std.c.fcntl(fd, std.c.F.GETFD);
     return current >= 0 and std.c.fcntl(fd, std.c.F.SETFD, current | std.c.FD_CLOEXEC) >= 0;
+}
+
+/// Child side, between fork and exec (async-signal-safe): mark every
+/// descriptor ≥ 3 close-on-exec, so the program exec'd next starts with
+/// stdio only. Marking rather than closing keeps the report pipe usable
+/// until the exec, which then closes it as the parent expects.
+fn markInheritedCloseOnExec() void {
+    if (builtin.os.tag == .linux) {
+        // CLOSE_RANGE_CLOEXEC is `1 << 2` in the kernel UAPI
+        // (linux/close_range.h). std.os.linux.CLOSE_RANGE (Zig 0.16) puts
+        // CLOEXEC at bit 1, which the kernel reads as CLOSE_RANGE_UNSHARE, so
+        // the raw syscall is used. Before Linux 5.11 it fails and the loop runs.
+        const close_range_cloexec: usize = 1 << 2;
+        const rc = std.os.linux.syscall3(.close_range, 3, std.math.maxInt(u32), close_range_cloexec);
+        if (std.os.linux.errno(rc) == .SUCCESS) return;
+    }
+    var rl: std.c.rlimit = undefined;
+    const ceiling: u64 = 1 << 20;
+    const limit: u64 = if (std.c.getrlimit(.NOFILE, &rl) == 0) @min(@as(u64, @intCast(rl.cur)), ceiling) else ceiling;
+    var fd: std.c.fd_t = 3;
+    while (@as(u64, @intCast(fd)) < limit) : (fd += 1) _ = setCloseOnExec(fd);
 }
 
 /// Returns `fd` itself when it is already ≥ 3, otherwise a close-on-exec
@@ -2529,6 +2557,32 @@ test "spawnService Windows allow-list does not retain caller pipe handles" {
     win.CloseHandle(probe_wr);
     var available: win.DWORD = 0;
     try std.testing.expect(PeekNamedPipe(probe_rd, null, 0, null, &available, null) == 0);
+}
+
+test "spawnService POSIX: the service keeps none of the caller's inherited descriptors" {
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+
+    // A pipe without close-on-exec, as a shell hands its process substitution
+    // (`2> >(tee …)`) to metacodes. An autostarted kgd used to keep the write
+    // end, so the reader never saw EOF while the service ran.
+    var probe: [2]std.c.fd_t = undefined;
+    try std.testing.expect(std.c.pipe(&probe) == 0);
+    defer _ = std.c.close(probe[0]);
+    try std.testing.expect(probe[1] > 2);
+
+    const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(null_fd >= 0);
+    defer _ = std.c.close(null_fd);
+    const argv: []const ?[*:0]const u8 = &.{ "/bin/sh", "-c", "sleep 5", null };
+    try spawnService(argv, null_fd);
+
+    // Our write end is the only one left: the read end reports hangup now,
+    // seconds before the service exits.
+    _ = std.c.close(probe[1]);
+    var pfd = [_]std.c.pollfd{.{ .fd = probe[0], .events = std.c.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(c_int, 1), std.c.poll(&pfd, 1, 2000));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), std.c.read(probe[0], &byte, 1));
 }
 
 test "buildWindowsCmdline quoting" {
