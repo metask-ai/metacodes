@@ -31,6 +31,11 @@ from test_key_login import _cli  # noqa: E402
 
 RELAY_KEY = "sk-relay-tty-env-0001"
 
+# Windows opens the browser with `cmd /c start` and never reads $BROWSER
+# (`auth.openBrowser`), so the stub that plays the browser never runs there,
+# and a sign-in that needs it waits until the case times out.
+_NO_BROWSER_STUB = "Windows opens the browser with `cmd /c start`, not $BROWSER: the stub cannot play the browser"
+
 
 class _Relay:
     """An OpenAI-wire provider defined in config.json, answering one text turn."""
@@ -105,6 +110,8 @@ def _screen(a):
 
 
 def test_login_signs_in_in_the_browser_and_the_session_and_next_start_use_it(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
     with MetaskMock() as mock:
         home, state, env = _case(mock)
         work = case_tmpdir("cc-tty-login-work-")
@@ -166,6 +173,8 @@ def test_a_browser_sign_in_serves_a_stored_metask_default_at_the_next_start(bin_
     # "every future session" writes), start again: the start is on that
     # default, authenticated by the browser sign-in. It used to look only for
     # the device-code sign-in and stop with `Metask session is unavailable`.
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
     with MetaskMock() as mock:
         home, state, env = _case(mock)
         work = case_tmpdir("cc-tty-default-work-")
@@ -259,6 +268,8 @@ def test_login_cancelled_with_esc_changes_nothing(bin_path):
 
 
 def test_login_on_an_account_without_keys_says_where_to_make_one(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
     with MetaskMock(keys=[]) as mock:
         home, state, env = _case(mock, {"METASK_SITE_URL": "http://127.0.0.1:9/site"})
         raw = run(bin_path, [
