@@ -369,6 +369,20 @@ pub const BrowserLoginOptions = struct {
     open_browser: bool = true,
     port: u16 = DEFAULT_LOGIN_PORT,
     force_state: ?[]const u8 = null,
+    /// Checked while the callback is awaited (`error.Aborted`): `/login`'s
+    /// Esc (#485). Null waits for the browser for as long as it takes.
+    abort_signal: ?*const AbortSignal = null,
+    /// Where the instructions go (the URL to open). Null prints them to
+    /// stderr, as `metacodes login` always has; the TUI draws them instead.
+    notify: ?Notify = null,
+};
+
+/// A sink for the lines the user must act on, shaped like
+/// `api/oauth_login.zig`'s (that file is outside the MCP client's import
+/// boundary, which reaches this one).
+pub const Notify = struct {
+    ctx: *anyopaque,
+    write: *const fn (ctx: *anyopaque, text: []const u8) void,
 };
 
 pub fn loginWithBrowser(allocator: std.mem.Allocator, opts: BrowserLoginOptions) !StoredCredentials {
@@ -385,19 +399,25 @@ pub fn loginWithBrowser(allocator: std.mem.Allocator, opts: BrowserLoginOptions)
     const authorize_url = try buildAuthorizeUrlFromEnv(allocator, redirect_uri, pkce.code_challenge, state);
     defer allocator.free(authorize_url);
 
-    std.debug.print(
-        "Starting local login server on http://localhost:{d}.\nOpen this URL to authenticate:\n\n{s}\n\n",
-        .{ server.port, authorize_url },
-    );
+    var line_buf: [512]u8 = undefined;
+    say(opts.notify, std.fmt.bufPrint(&line_buf, "Starting local login server on http://localhost:{d}.\nOpen this URL to authenticate:\n\n", .{server.port}) catch "Open this URL to authenticate:\n\n");
+    say(opts.notify, authorize_url);
+    say(opts.notify, "\n\n");
     if (opts.open_browser) openBrowser(allocator, authorize_url) catch |err| {
-        std.debug.print("Could not open browser automatically: {s}\n", .{@errorName(err)});
+        say(opts.notify, std.fmt.bufPrint(&line_buf, "Could not open browser automatically: {s}\n", .{@errorName(err)}) catch "Could not open the browser automatically.\n");
     };
 
-    const code = try server.waitForAuthorizationCode(allocator, state, null);
+    const code = try server.waitForAuthorizationCode(allocator, state, opts.abort_signal);
     defer secureFree(allocator, code);
+    if (opts.abort_signal) |signal| if (signal.isAborted()) return error.Aborted;
     const token_body = try exchangeAuthorizationCode(allocator, code, redirect_uri, pkce.code_verifier);
     defer secureFree(allocator, token_body);
     return importOAuthTokenResponse(allocator, token_body, nowUnixSeconds());
+}
+
+/// `text` to `notify`, or to stderr when there is none (the CLI).
+fn say(notify: ?Notify, text: []const u8) void {
+    if (notify) |sink| sink.write(sink.ctx, text) else std.debug.print("{s}", .{text});
 }
 
 pub const PkceCodes = struct {

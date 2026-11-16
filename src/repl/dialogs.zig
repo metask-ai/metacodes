@@ -19,6 +19,9 @@ const catalog_mod = @import("../skills/runtime/catalog.zig");
 const overrides_mod = @import("../skills/overrides.zig");
 const provider_login = @import("../api/provider_login.zig");
 const login_worker_mod = @import("../api/login_worker.zig");
+const metask_sign_in = @import("../api/metask_sign_in.zig");
+const model_catalog = @import("../api/catalog.zig");
+const types = @import("../types.zig");
 const provider_profile = @import("../provider/profile.zig");
 
 const Pane = pane_mod.Pane;
@@ -1047,6 +1050,383 @@ pub const LoginDialog = struct {
     }
 };
 
+// ── /login: the Metask browser sign-in (#485) ───────────────────────────────
+
+/// `/login` with no provider: the Metask browser sign-in, then the API key,
+/// model and reasoning level `metacodes login` asks for line by line, as
+/// choices in the pane. The network work runs on a worker
+/// (`api/metask_sign_in.zig`); this only draws and moves between stages.
+/// Esc at any stage closes it with nothing stored: the caller writes
+/// `auth.json` only after `outcome` is `chosen`.
+pub const MetaskSignInDialog = struct {
+    pub const Stage = enum {
+        /// Waiting for the browser to come back, then listing the keys.
+        signing_in,
+        choose_key,
+        /// Signed in, but the account has no API key to use.
+        no_keys,
+        loading_models,
+        choose_model,
+        choose_effort,
+        failed,
+    };
+
+    pub const Outcome = enum { cancelled, chosen };
+
+    allocator: std.mem.Allocator,
+    worker: ?*metask_sign_in.Worker = null,
+    stage: Stage = .signing_in,
+    sel: usize = 0,
+    term_rows: usize = 24,
+    /// Where a key is created, for an account that has none.
+    site_url: []const u8 = "https://metask-ai.com",
+    /// The providers `/login <provider>` signs in to, comma-separated, for
+    /// the line that says so (borrowed); empty leaves it out.
+    others: []const u8 = "",
+    transcript: [metask_sign_in.TRANSCRIPT_CAPACITY]u8 = undefined,
+    transcript_len: usize = 0,
+    failure: [96]u8 = undefined,
+    failure_len: usize = 0,
+    /// The chosen key's models, parsed from the worker's answer.
+    models: model_catalog.Catalog,
+    key_index: usize = 0,
+    model_index: usize = 0,
+    efforts: model_catalog.ReasoningOptions = undefined,
+    efforts_len: usize = 0,
+    effort: ?types.ReasoningEffort = null,
+    outcome: Outcome = .cancelled,
+
+    pub fn init(allocator: std.mem.Allocator) MetaskSignInDialog {
+        return .{ .allocator = allocator, .models = model_catalog.Catalog.init(allocator) };
+    }
+
+    /// Start the sign-in. A worker that cannot start is the dialog's failure.
+    pub fn start(self: *MetaskSignInDialog, io: std.Io, options: metask_sign_in.Options) void {
+        const worker = metask_sign_in.Worker.create(self.allocator, io, options) catch {
+            self.setFailure("out of memory");
+            return;
+        };
+        worker.startSignIn() catch |err| {
+            worker.release();
+            self.setFailure(@errorName(err));
+            return;
+        };
+        self.worker = worker;
+        self.stage = .signing_in;
+    }
+
+    /// Lets go of the worker (a step still running frees it when it ends).
+    pub fn deinit(self: *MetaskSignInDialog) void {
+        if (self.worker) |worker| worker.release();
+        self.worker = null;
+        self.models.deinit();
+    }
+
+    /// After `chosen`: the worker, holding the sign-in (`takeOAuth`) and the
+    /// chosen key's `/v1/models` answer. The caller releases it.
+    pub fn takeWorker(self: *MetaskSignInDialog) ?*metask_sign_in.Worker {
+        defer self.worker = null;
+        return self.worker;
+    }
+
+    /// The chosen key (borrowed from the worker).
+    pub fn chosenKey(self: *const MetaskSignInDialog) ?[]const u8 {
+        const worker = self.worker orelse return null;
+        if (self.key_index >= worker.keys.entries.items.len) return null;
+        return worker.keys.entries.items[self.key_index].secret;
+    }
+
+    pub fn chosenKeyLabel(self: *const MetaskSignInDialog) []const u8 {
+        const worker = self.worker orelse return "";
+        if (self.key_index >= worker.keys.entries.items.len) return "";
+        return worker.keys.entries.items[self.key_index].label;
+    }
+
+    pub fn chosenModel(self: *const MetaskSignInDialog) ?[]const u8 {
+        if (self.model_index >= self.models.entries.items.len) return null;
+        return self.models.entries.items[self.model_index].model_id;
+    }
+
+    fn setFailure(self: *MetaskSignInDialog, why: []const u8) void {
+        const n = @min(why.len, self.failure.len);
+        @memcpy(self.failure[0..n], why[0..n]);
+        self.failure_len = n;
+        self.stage = .failed;
+    }
+
+    fn keyCount(self: *const MetaskSignInDialog) usize {
+        const worker = self.worker orelse return 0;
+        return worker.keys.entries.items.len;
+    }
+
+    /// How many choices the current stage lists.
+    fn choiceCount(self: *const MetaskSignInDialog) usize {
+        return switch (self.stage) {
+            .choose_key => self.keyCount(),
+            .choose_model => self.models.entries.items.len,
+            .choose_effort => self.efforts_len,
+            else => 0,
+        };
+    }
+
+    fn chooseKey(self: *MetaskSignInDialog, index: usize) void {
+        const worker = self.worker orelse return;
+        self.key_index = index;
+        worker.startModels(worker.keys.entries.items[index].secret) catch |err| {
+            self.setFailure(@errorName(err));
+            return;
+        };
+        self.stage = .loading_models;
+        self.sel = 0;
+    }
+
+    fn chooseModel(self: *MetaskSignInDialog, index: usize) void {
+        self.model_index = index;
+        const entry = self.models.entries.items[index];
+        self.efforts_len = model_catalog.reasoningOptions(entry.reasoning_mask, &self.efforts).len;
+        self.stage = .choose_effort;
+        // The level a model declares in the middle, as `/models` starts on.
+        const preferred = model_catalog.defaultReasoningForMask(entry.reasoning_mask);
+        self.sel = 0;
+        if (preferred) |level| for (self.efforts[0..self.efforts_len], 0..) |candidate, i| {
+            if (candidate == level) self.sel = i;
+        };
+    }
+
+    fn chooseEffort(self: *MetaskSignInDialog, index: usize) Step {
+        self.effort = self.efforts[index];
+        self.outcome = .chosen;
+        return .done;
+    }
+
+    fn pick(self: *MetaskSignInDialog, index: usize) Step {
+        if (index >= self.choiceCount()) return .none;
+        switch (self.stage) {
+            .choose_key => self.chooseKey(index),
+            .choose_model => self.chooseModel(index),
+            .choose_effort => return self.chooseEffort(index),
+            else => return .none,
+        }
+        return .redraw;
+    }
+
+    pub fn draw(self: *MetaskSignInDialog, p: *Pane) !void {
+        try p.rule();
+        try p.title("Sign in to Metask");
+        try p.blank();
+        switch (self.stage) {
+            .signing_in => {
+                try p.paragraph("", "Sign in in your browser; you come back here to choose an API key, a model and a reasoning level.");
+                try p.blank();
+                try self.drawTranscript(p);
+                try p.blank();
+                // A machine with no browser to come back from (#485): the
+                // device-code sign-in needs only a code typed elsewhere.
+                try p.paragraph(p.th.dim, "No browser on this machine? /login metask signs in with a short code instead.");
+                try p.blank();
+                if (self.others.len > 0) {
+                    var others_buf: [512]u8 = undefined;
+                    try p.paragraph(p.th.dim, std.fmt.bufPrint(&others_buf, "Another provider instead: /login <provider> ({s})", .{self.others}) catch "Another provider instead: /login <provider>");
+                    try p.blank();
+                }
+                try p.footer("Esc to cancel");
+            },
+            .no_keys => {
+                try p.paragraph(p.th.warn, "Your Metask account has no API key yet.");
+                try p.blank();
+                try p.text("Create one on the Metask site, then /login again:");
+                try p.raw(self.site_url);
+                try p.blank();
+                try p.footer("Esc to close");
+            },
+            .loading_models => {
+                var head: [192]u8 = undefined;
+                try p.text(std.fmt.bufPrint(&head, "Listing the models of {s}…", .{self.chosenKeyLabel()}) catch "Listing the models…");
+                try p.blank();
+                try p.footer("Esc to cancel");
+            },
+            .choose_key, .choose_model, .choose_effort => try self.drawChoices(p),
+            .failed => {
+                var head: [160]u8 = undefined;
+                try p.line(p.th.danger, std.fmt.bufPrint(&head, "Sign-in failed: {s}", .{self.failure[0..self.failure_len]}) catch "Sign-in failed");
+                try p.blank();
+                try p.paragraph("", "Nothing was stored.");
+                try p.blank();
+                try p.footer("Enter to retry · Esc to close");
+            },
+        }
+    }
+
+    fn drawChoices(self: *MetaskSignInDialog, p: *Pane) !void {
+        const count = self.choiceCount();
+        try p.text(switch (self.stage) {
+            .choose_key => "Select an API key:",
+            .choose_model => "Select a model:",
+            else => "Select a reasoning level:",
+        });
+        try p.blank();
+        // A long list scrolls with the selection.
+        const rows = listRows(self.term_rows, 10);
+        const first = if (self.sel >= rows) self.sel + 1 - rows else 0;
+        const last = @min(count, first + rows);
+        if (first > 0) try p.dim("  ↑ more");
+        var detail_buf: [96]u8 = undefined;
+        for (first..last) |i| {
+            switch (self.stage) {
+                .choose_key => {
+                    const entry = self.worker.?.keys.entries.items[i];
+                    const detail = if (entry.group.len > 0)
+                        std.fmt.bufPrint(&detail_buf, "{s} · …{s}", .{ entry.group, entry.suffix }) catch ""
+                    else
+                        std.fmt.bufPrint(&detail_buf, "…{s}", .{entry.suffix}) catch "";
+                    try p.option(i + 1, i == self.sel, entry.label, detail);
+                },
+                .choose_model => {
+                    const entry = self.models.entries.items[i];
+                    const detail = if (entry.max_input_tokens) |window|
+                        std.fmt.bufPrint(&detail_buf, "context {d}", .{window}) catch ""
+                    else
+                        "";
+                    try p.option(i + 1, i == self.sel, entry.model_id, detail);
+                },
+                else => {
+                    const entry = self.models.entries.items[self.model_index];
+                    try p.option(i + 1, i == self.sel, model_catalog.effortLabel(entry.effort_vocabulary, self.efforts[i]), "");
+                },
+            }
+        }
+        if (last < count) try p.dim("  ↓ more");
+        try p.blank();
+        try p.footer("↑/↓ to select · Enter to choose · Esc to cancel");
+    }
+
+    /// What the sign-in asked the user to do (the URL to open), whole lines,
+    /// URLs at column 0 so they can be copied.
+    fn drawTranscript(self: *MetaskSignInDialog, p: *Pane) !void {
+        const text = self.transcript[0..self.transcript_len];
+        if (std.mem.trim(u8, text, " \r\n").len == 0) {
+            try p.dim("Starting the sign-in…");
+            return;
+        }
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \r");
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, "http://") or std.mem.startsWith(u8, line, "https://")) {
+                try p.raw(line);
+            } else {
+                try p.paragraph("", line);
+            }
+        }
+    }
+
+    pub fn key(self: *MetaskSignInDialog, k: input.Key) Step {
+        switch (k) {
+            .esc, .ctrl_c => {
+                self.outcome = .cancelled;
+                return .done;
+            },
+            else => {},
+        }
+        switch (self.stage) {
+            .choose_key, .choose_model, .choose_effort => {
+                const count = self.choiceCount();
+                if (count == 0) return .none;
+                switch (k) {
+                    .up => {
+                        self.sel = if (self.sel == 0) count - 1 else self.sel - 1;
+                        return .redraw;
+                    },
+                    .down => {
+                        self.sel = (self.sel + 1) % count;
+                        return .redraw;
+                    },
+                    .enter => return self.pick(self.sel),
+                    .char => |c| {
+                        if (c < '1' or c > '9') return .none;
+                        return self.pick(c - '1');
+                    },
+                    else => return .none,
+                }
+            },
+            .no_keys => return if (k == .enter) .done else .none,
+            .failed => {
+                if (k != .enter) return .none;
+                // Retry from the browser: the stage that failed may have
+                // been any of them.
+                const worker = self.worker orelse return .none;
+                const options: metask_sign_in.Options = .{ .messages_url = worker.messages_url, .open_browser = worker.open_browser, .port = worker.port };
+                const io = worker.io;
+                var url_buf: [1024]u8 = undefined;
+                const url = std.fmt.bufPrint(&url_buf, "{s}", .{options.messages_url}) catch return .none;
+                worker.release();
+                self.worker = null;
+                self.transcript_len = 0;
+                self.start(io, .{ .messages_url = url, .open_browser = options.open_browser, .port = options.port });
+                return .redraw;
+            },
+            .signing_in, .loading_models => return .none,
+        }
+    }
+
+    /// Follow the worker: a new instruction redraws; a finished step moves on.
+    pub fn tick(self: *MetaskSignInDialog) Step {
+        const worker = self.worker orelse return .none;
+        var buf: [metask_sign_in.TRANSCRIPT_CAPACITY]u8 = undefined;
+        const text = worker.copyTranscript(&buf);
+        const changed = !std.mem.eql(u8, text, self.transcript[0..self.transcript_len]);
+        if (changed) {
+            @memcpy(self.transcript[0..text.len], text);
+            self.transcript_len = text.len;
+        }
+        switch (self.stage) {
+            .signing_in => switch (worker.currentState()) {
+                .keys_ready => {
+                    self.sel = 0;
+                    self.stage = if (worker.keys.entries.items.len == 0) .no_keys else .choose_key;
+                    return .redraw;
+                },
+                .failed => {
+                    self.setFailure(worker.failureName());
+                    return .redraw;
+                },
+                .cancelled => {
+                    self.outcome = .cancelled;
+                    return .done;
+                },
+                else => return if (changed) .redraw else .none,
+            },
+            .loading_models => switch (worker.currentState()) {
+                .models_ready => {
+                    self.models.deinit();
+                    self.models = model_catalog.Catalog.init(self.allocator);
+                    self.models.loadFromModelsListJson(worker.models_json orelse "") catch |err| {
+                        self.setFailure(@errorName(err));
+                        return .redraw;
+                    };
+                    if (self.models.entries.items.len == 0) {
+                        self.setFailure("this key has no models");
+                        return .redraw;
+                    }
+                    self.sel = 0;
+                    self.stage = .choose_model;
+                    return .redraw;
+                },
+                .failed => {
+                    self.setFailure(worker.failureName());
+                    return .redraw;
+                },
+                .cancelled => {
+                    self.outcome = .cancelled;
+                    return .done;
+                },
+                else => return .none,
+            },
+            else => return .none,
+        }
+    }
+};
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1304,6 +1684,16 @@ test "skills: search takes Space as text; Esc clears, then leaves, then closes" 
     try testing.expectEqual(Step.redraw, dialog.key(.esc));
     try testing.expectEqual(SkillsDialog.Mode.list, dialog.mode);
     try testing.expectEqual(Step.done, dialog.key(.esc));
+}
+
+test "metask sign-in: the browser wait names the short-code sign-in for a machine without a browser (#485)" {
+    var dialog = MetaskSignInDialog.init(testing.allocator);
+    defer dialog.deinit();
+    dialog.others = "deepseek, zai-coding-plan";
+    const plain = try renderPlain(&dialog, 120);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "No browser on this machine? /login metask signs in with a short code instead.") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "Another provider instead: /login <provider> (deepseek, zai-coding-plan)") != null);
 }
 
 test "login: no provider to sign in to says how keys are configured" {

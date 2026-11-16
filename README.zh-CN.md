@@ -167,7 +167,7 @@ curl -fsSL https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/in
 它会在 macOS 或 Linux（arm64 或 x86_64）上安装最新发布版。Windows 用 `scripts\install.ps1` 配合发布的 zip 安装。然后：
 
 ```sh
-metacodes login --provider metask          # 或 --api-key / --provider openai|gemini|zai-coding-plan
+metacodes login                            # 在浏览器里登录 Metask(TUI 里是 /login)
 metacodes                                  # 交互式 TUI
 metacodes -p "explain src/main.zig" --json # headless，输出一条 NDJSON 结果
 metacodes --web                            # 浏览器 UI，127.0.0.1:7777
@@ -182,7 +182,9 @@ zig build && ./zig-out/bin/metacodes --help
 zig build example                          # 在 Zig 程序里嵌入运行时
 ```
 
-不登录、改用自己的 provider key：写进本安装的 `~/.local/opt/metacodes/state/.env`，重新启动即可，见 [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md)。
+没有浏览器的机器(服务器、SSH)改用设备码登录：`metacodes login --provider metask --no-browser`，它给出一个链接和一个短码，在任何设备上确认即可。直接敲 `metacodes` 暂时还用不上这种登录(#499)，要用 `metacodes --provider metask` 启动。
+
+不登录、改用自己的 provider key：写进本安装的 `~/.local/opt/metacodes/state/.env`，重新启动即可，见 [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md)。什么都没配时 `metacodes` 也能打开，并告诉你这两条路；`/logout` 从 Metask 账号切回这把 key。
 
 隔离安装、provider 配置、Metask OAuth、Lean 内核和 Windows 等细节见 [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md)。
 

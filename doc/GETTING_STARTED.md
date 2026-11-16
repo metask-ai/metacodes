@@ -181,8 +181,16 @@ effort (low, high or max; unset is the server's default).
 
 ## Metask OAuth
 
-`metacodes login --provider metask` uses Metask's JSON device authorization
-flow. It prints `METASK_VERIFICATION_URI=...` and `METASK_USER_CODE=...` to
+`metacodes login` (and `/login` in the TUI) signs in to Metask in the browser:
+the browser returns to `http://localhost:<port>/auth/callback`, and you choose
+an API key, a model and a reasoning level, stored in `<state root>/auth.json`.
+The session switches to Metask at once, and later starts use it. `/logout` (or
+`metacodes logout`) removes both Metask sign-ins and switches the session to
+the provider `.env` configures, if any.
+
+On a machine without a browser, `metacodes login --provider metask` uses
+Metask's JSON device authorization flow (start with `--provider metask` to use
+it: a plain start does not pick it up yet, #499). It prints `METASK_VERIFICATION_URI=...` and `METASK_USER_CODE=...` to
 stderr (use `--no-browser` on a headless machine), then stores the access and
 rotating refresh tokens plus gateway/model URLs in
 `$HOME/.metacodes/oauth/metask.json`. Set `METASK_SITE_URL` for a local control

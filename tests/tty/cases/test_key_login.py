@@ -283,15 +283,17 @@ def test_cli_login_reads_the_key_without_echo(bin_path):
 
 def test_login_dialog_lists_kimi_code_as_an_api_key_provider(bin_path):
     with _KimiCase() as case:
-        events = [READY, "type:/login", "key:enter", wait_for("Select a provider:", 10),
+        # `/login` alone is the Metask sign-in (#485); it names the providers
+        # `/login <provider>` signs in to, the API-key ones among them.
+        events = [READY, "type:/login", "key:enter", wait_for("/login <provider>", 10),
                   "key:esc", wait_for("Login interrupted", 10)]
-        raw = run(bin_path, events, term_size=(30, 120), env=case.env(), per_key_drain=0.05)
-        a, _ = _screen(raw, 30, 120)
-        # The row comes from the profile's api_key_setup, like the GLM plan's.
-        if not a.screens_with("Kimi Code · API key"):
-            a._fail("/login should list Kimi Code as an API-key provider")
-        if not a.screens_with("Z.AI GLM Coding Plan · API key"):
-            a._fail("/login should still list the GLM Coding Plan")
+        raw = run(bin_path, events, term_size=(30, 200), env=dict(case.env(), BROWSER="true"), per_key_drain=0.05)
+        a, _ = _screen(raw, 30, 200)
+        # The names come from the profiles' api_key_setup, the GLM plan's too.
+        if not a.screens_with("kimi-code"):
+            a._fail("/login should name Kimi Code as a provider it signs in to")
+        if not a.screens_with("zai-coding-plan"):
+            a._fail("/login should still name the GLM Coding Plan")
         assert case.checks() == [], case.checks()
 
 

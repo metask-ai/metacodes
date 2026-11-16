@@ -12,6 +12,68 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **`/login` signs in to Metask in the browser; `/logout` switches back to
+  local configuration** (#485). `/login` alone now runs `metacodes login`'s
+  browser sign-in, then asks for the API key, model and reasoning level in
+  the pane (an account without keys is told where to create one); Esc at any
+  step stores and changes nothing. Once chosen, `auth.json` is written as
+  `metacodes login` writes it, the session moves onto Metask at once, and a
+  stored `/model` default is forgotten so the next start uses the sign-in
+  (`metacodes login` now forgets it too). The provider list it used to open
+  is `/login <provider>` (the pane names those providers); `/login metask` is
+  still the device-code sign-in, which the pane names for a machine without
+  a browser. The new `/logout` removes both Metask sign-ins (`auth.json` and
+  `oauth/metask.json`), forgets a stored default that resolves to Metask,
+  drops every Metask credential the process holds, and moves a session on
+  Metask to the provider `.env` configures (`Switched to <provider> (from
+  .env)`: the parenthesis names where its key came from, and a Metask that
+  `.env` configures runs on `.env`'s key) or leaves it without a model; it
+  names a `METASK_API_KEY` still set in the shell or `.env`. `/logout
+  <provider>` removes the key `/login <provider>` stored. Neither runs in
+  the middle of a turn. A start on Metask while `.env` configures another
+  provider says so once under the banner (`.env configures DeepSeek; the
+  default is Metask. To use DeepSeek: /model, or /logout`).
+- **A provider named at start without a key opens the TUI without a model,
+  and a stored default without one is passed over** (#485). `--provider`,
+  `--offer`, `METACODES_PROVIDER` or `.env` naming a provider that has no
+  credential no longer stops the TUI, nor quietly uses another provider: the
+  TUI opens unbound and its note names the variables that provider reads, or
+  `/login metask` for Metask (`-p` still stops with the provider's help). A
+  `/model` default (`global_selection`) whose provider has no credential is
+  passed over for the Metask sign-in or `.env`, with one notice (`The
+  default model, X, has no key or sign-in; this session uses Y.`), where it
+  used to stop the start.
+  A Metask default is served by the browser sign-in's key (`auth.json`) when
+  there is no device-code sign-in: it used to stop with `Metask session is
+  unavailable`.
+- **`metacodes logout` removes both Metask sign-ins and says which** (#499,
+  part 2). It used to remove `auth.json` only, leaving the device-code
+  sign-in and its refresh token in `oauth/metask.json` usable. It now removes
+  both (and a key stored with `login --provider metask`, which `logout
+  --provider metask` now also does), forgets a stored default that resolves
+  to Metask so the next start falls back instead of failing, and names a
+  `METASK_API_KEY` still set in the shell or `.env`. README's quick start
+  signs in with `metacodes login`, or `metacodes login --provider metask
+  --no-browser` on a machine without a browser.
+- **`metacodes` with nothing configured opens the terminal UI instead of
+  exiting** (#484). With no flag, stored `/model` default, Metask sign-in or
+  `.env` provider, or with a Metask sign-in whose key and model were never
+  chosen (`Metask login is incomplete`), the TUI starts without a model: the
+  banner's model line reads `not set — /login, or configure .env`, slash
+  commands work, and a prompt — or `/retry`, `/init`, `/commit`, `/review`,
+  `/btw`, `/recap`, a Skill — is not sent. A red note in its place names
+  `/login`, this install's `.env` (and `.env.example` when an install wrote
+  it), the provider keys the shell holds by name only (they are still never
+  used on their own: `/model` picks one) and doc/LOCAL_CONFIG.md. The prompt
+  stays in the history for ↑, no request of any kind goes out (not even the
+  `/v1/models` probe), and no session directory is made until a model is
+  chosen. `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe still
+  stop at once, non-zero, with the sign-in hint. The banner now also says
+  where the model's credential came from — `· Metask`, `· from .env`,
+  `· from shell`, `· saved key`, `· signed in`, `· --api-key` — and
+  `metacodes install` ends with the next step while the install has neither a
+  Metask sign-in nor a `.env`.
+
 - **`/model` lists only routes it can apply, and takes no key** (#488). A
   route is listed when a credential resolves for it now, by the resolution a
   commit binds with, without sending a request: the environment,

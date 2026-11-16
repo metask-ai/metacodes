@@ -1,28 +1,33 @@
-"""/login (issue #33), aligned with Claude Code 2.1.278's Login dialog.
+"""/login (issue #33, #485), aligned with Claude Code 2.1.278's Login dialog.
 
-`/login` opens a bottom pane listing the providers this installation can sign
-in to; Esc leaves `⎿  Login interrupted` under the echo. A provider name starts
-its sign-in directly; a typo'd flag fails closed before anything starts. The
-flow itself needs an authorization server: the kernel flows are covered against
-mock servers by tests/component/provider_oauth_login_test.zig, and the dialog's
-states by the unit tests in src/repl/dialogs.zig.
+`/login` alone opens the Metask browser sign-in in a bottom pane (#485; the
+whole flow against a stand-in is tests/tty/cases/test_login_logout.py); Esc
+leaves `⎿  Login interrupted · nothing was changed` under the echo. A provider
+name starts that provider's sign-in directly; a typo'd flag fails closed
+before anything starts. The provider flows need an authorization server: the
+kernel flows are covered against mock servers by
+tests/component/provider_oauth_login_test.zig, and the dialog's states by the
+unit tests in src/repl/dialogs.zig.
 """
 from tty_driver import run, submit, READY, wait_for
 from asserts import TTYAssert
 
 
-def test_login_opens_the_provider_list_and_esc_interrupts(bin_path):
-    raw = run(bin_path, [READY, "type:/login", "key:enter", wait_for("Select a provider", 10),
-                         "key:esc", wait_for("Login interrupted", 10)])
-    a = TTYAssert(raw)
-    listed = a.screens_with("1. Metask")
-    if not listed:
-        a._fail("the Login pane should list Metask")
+def test_login_opens_the_metask_sign_in_and_esc_interrupts(bin_path):
+    raw = run(bin_path, [READY, "type:/login", "key:enter", wait_for("Sign in to Metask", 10),
+                         "key:esc", wait_for("Login interrupted", 10)], term_size=(30, 120))
+    # The authorize URL is longer than a row: the terminal wraps it.
+    a = TTYAssert(raw, rows=30, cols=120, autowrap=True)
+    if not a.screens_with("Open this URL to authenticate"):
+        a._fail("the pane should show the URL to open")
+    # The other providers are still one command away.
+    if not a.screens_with("/login <provider>"):
+        a._fail("the pane should say how to sign in to another provider")
     echo = a.final.find_row("❯ /login")
     if echo is None:
         a._fail("the /login echo is missing")
-    a.assert_line_contains(echo + 1, "⎿  Login interrupted")
-    if a.final.find_row("Select a provider") is not None:
+    a.assert_line_contains(echo + 1, "⎿  Login interrupted · nothing was changed")
+    if a.final.find_row("Sign in to Metask") is not None:
         a._fail("the Login pane should be erased after Esc")
     a.assert_box_present()
     a.assert_box_at_bottom()

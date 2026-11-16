@@ -114,6 +114,9 @@ const provider_credential_mod = @import("provider/credential.zig");
 const provider_config_doc = @import("provider/config_doc.zig");
 const model_picker_mod = @import("repl/model_picker.zig");
 const route_strings_mod = @import("app/route_strings.zig");
+pub const route_state_mod = @import("app/route_state.zig");
+const sign_out_mod = @import("app/sign_out.zig");
+const provider_startup_mod = @import("provider/startup.zig");
 const kg_provider_audit = @import("kg/provider_audit.zig");
 const provider_alias_mod = @import("provider/alias.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
@@ -346,8 +349,12 @@ pub const MetaskKeyRoute = struct {
     /// Where this session's Messages requests and its `/v1/models` probe go,
     /// without the `/v1/messages` path (owned).
     gateway_origin: []u8,
-    /// The key the session started with. Borrowed: `App.init`'s caller keeps
-    /// it for the process, exactly as it does `App.api_key`.
+    /// The key the route authenticates with when none was picked in
+    /// `/models`. Borrowed, never freed through this field: the key the
+    /// session started with (`App.init`'s caller keeps it for the process,
+    /// exactly as it does `App.api_key`), a `/login`'s (held by
+    /// `App.selected_api_key_owned`), or after `/logout` the Metask key
+    /// `.env` holds (the host's layer, kept for the process).
     startup_key: []const u8,
     /// The newest `/v1/models` document that origin answered (owned), or null
     /// until one has.
@@ -386,6 +393,11 @@ pub const App = struct {
     state_root_default: ?[]u8 = null,
     api_key: []const u8,
     selected_api_key_owned: ?[]u8 = null,
+    /// The key `selected_api_key_owned` held before `/login` or `/logout`
+    /// replaced it (#485). A client may still borrow it (a `/models` key
+    /// switch points them straight at it), so it stays readable for one
+    /// more generation, as `route_strings` keeps a route's (`retireApiKey`).
+    retired_api_key: ?[]u8 = null,
     api_key_catalog: api_keys_mod.Catalog,
     /// When `api_key_catalog` is filled: never on this route, or once, the
     /// first time the `/models` key menu needs it (`ensureApiKeyCatalog`).
@@ -404,6 +416,21 @@ pub const App = struct {
     /// Set when the session runs the historical Metask API-key route; null on
     /// every other route. See `MetaskKeyRoute`.
     metask_key_route: ?MetaskKeyRoute = null,
+    /// What the model route rests on (#484): bound, and where its credential
+    /// came from (the banner names it), or unbound: no usable model, so
+    /// nothing is sent until a route with a credential is chosen
+    /// (`app/route_state.zig`). The host sets it (`InitOptions.route_state`);
+    /// a committed `/model` choice binds it (`bindCommittedSelection`).
+    route_state: route_state_mod.RouteState = .{ .bound = .unknown },
+    /// Providers `<state root>/.env` holds keys for while naming none of them
+    /// (#486), for the unbound reminder. Borrowed from the host.
+    unchosen_local_providers: []const []const u8 = &.{},
+    /// The provider `<state root>/.env` configures, which `/logout` falls
+    /// back to (#485). Borrowed from the host; null when it configures none.
+    local_provider: ?LocalProvider = null,
+    /// Said once under the banner (#485: a stored default passed over for
+    /// want of a credential). Borrowed from the host.
+    startup_notice: ?[]const u8 = null,
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
     model_picker: model_picker_mod.Picker = undefined,
@@ -690,6 +717,25 @@ pub const App = struct {
         /// that takes the refreshed answer, at its idle points
         /// (`adoptModelCatalogRefresh`).
         models_cache: bool = false,
+        /// Bound (and to what), or unbound (#484). An unbound App neither
+        /// probes `/v1/models` nor opens a session directory for a new
+        /// session; `api_key` is then empty and never sent.
+        route_state: route_state_mod.RouteState = .{ .bound = .unknown },
+        /// `App.unchosen_local_providers`; borrowed for the App's life.
+        unchosen_local_providers: []const []const u8 = &.{},
+        /// `App.local_provider`; borrowed for the App's life.
+        local_provider: ?LocalProvider = null,
+        /// `App.startup_notice`; borrowed for the App's life.
+        startup_notice: ?[]const u8 = null,
+    };
+
+    /// The provider `<state root>/.env` configures (#486): its
+    /// `METACODES_PROVIDER`, or the one provider whose key it holds, and its
+    /// `METACODES_MODEL`.
+    pub const LocalProvider = struct {
+        /// A provider id or alias, as `--provider` takes it.
+        name: []const u8,
+        model: ?[]const u8 = null,
     };
 
     pub fn init(
@@ -721,6 +767,10 @@ pub const App = struct {
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
             .model_picker = model_picker_mod.Picker.init(allocator),
             .route_strings = route_strings_mod.RouteStrings.init(allocator),
+            .route_state = options.route_state,
+            .unchosen_local_providers = options.unchosen_local_providers,
+            .local_provider = options.local_provider,
+            .startup_notice = options.startup_notice,
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
             .session_id = if (config.session_id) |s|
@@ -1018,14 +1068,19 @@ pub const App = struct {
         const metask_session_active =
             std.ascii.eqlIgnoreCase(config.provider_profile orelse "", "metask") and
             app.oauth_session != null;
+        // Unbound (#484): no route, no credential, so nothing to probe and no
+        // key route to record. Nothing is sent from here until a route binds.
+        const bound = app.route_state == .bound;
         // Recorded whether or not the probe below runs or answers: a later
         // `/models` key switch probes this same gateway again.
-        if (MetaskKeyRoute.of(config, app.api_client.base_url)) |origin| {
+        if (bound) if (MetaskKeyRoute.of(config, app.api_client.base_url)) |origin| {
             app.metask_key_route = .{ .gateway_origin = try allocator.dupe(u8, origin), .startup_key = api_key };
-        }
+        };
         errdefer if (app.metask_key_route) |*route| route.deinit(allocator);
         if (config.provider_kind == .anthropic) {
-            if (std.c.getenv("METACODES_NO_PROBE") == null and !metask_session_active) {
+            if (!bound) {
+                @import("util/log.zig").debug("catalog", "probeModels skipped (no model is set up)", .{});
+            } else if (std.c.getenv("METACODES_NO_PROBE") == null and !metask_session_active) {
                 // The account's key list waits for the `/models` key menu (ensureApiKeyCatalog).
                 app.api_key_catalog_load = .deferred;
                 app.loadModelCatalog(options.models_cache);
@@ -1040,7 +1095,10 @@ pub const App = struct {
         }
 
         // 初始化 transcript writer：需要 cwd + HOME
-        app.initTranscriptWriter() catch |err| {
+        // A new unbound session makes no session directory (#484): nothing
+        // can happen in it worth keeping until a route binds, which opens the
+        // writer then (`adoptBoundRoute`). A resumed one reopens its own.
+        if (bound or config.session_id != null) app.initTranscriptWriter() catch |err| {
             @import("util/log.zig").warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
         };
 
@@ -1219,6 +1277,569 @@ pub const App = struct {
         };
     }
 
+    /// Why the session has no model, or null when it has one (#484). The
+    /// REPL refuses every request while this is set.
+    pub fn unbound(app: *const App) ?route_state_mod.Unbound {
+        return switch (app.route_state) {
+            .unbound => |why| why,
+            .bound => null,
+        };
+    }
+
+    /// The model a status line names: `not set` while unbound (#484), where
+    /// `activeModel()` is only the placeholder the clients were built with.
+    pub fn displayModel(app: *const App) []const u8 {
+        return if (app.unbound() != null) "not set" else app.activeModel();
+    }
+
+    /// The banner's model line: `not set — /login, or configure .env`, or the
+    /// model with where its credential came from (`· from .env`, `· Metask`).
+    pub fn bannerModelLine(app: *const App, buffer: []u8) []const u8 {
+        return route_state_mod.modelLine(buffer, app.route_state, app.activeModel());
+    }
+
+    /// The session now runs on a route with a credential from `origin`. An
+    /// unbound session gets the session directory it went without (#484), so
+    /// a session-scoped choice and the first turn have somewhere to persist.
+    fn adoptBoundRoute(app: *App, origin: route_state_mod.CredentialOrigin) void {
+        app.route_state = .{ .bound = origin };
+        if (app.transcript_writer == null) app.initTranscriptWriter() catch |err| {
+            @import("util/log.zig").warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
+        };
+    }
+
+    /// The unbound reminder (#484) for this install: its `.env` (and the
+    /// template beside it when an install wrote one), the provider keys the
+    /// environment sets (names only), the providers `.env` names none of.
+    /// Plain text, one line per `\n`; the REPL colours it.
+    pub fn writeUnboundReminder(app: *App, w: *std.Io.Writer) !void {
+        const reason = app.unbound() orelse return;
+        const state_env = @import("app/state_env.zig");
+        var arena_state = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const root = app.stateRoot();
+        const env_path: []const u8 = if (root.len == 0) "" else try std.fs.path.join(arena, &.{ root, state_env.file_name });
+        const template = if (root.len == 0) false else blk: {
+            const path = try std.fs.path.joinZ(arena, &.{ root, state_env.example_file_name });
+            break :blk pfs.exists(path.ptr);
+        };
+        const host: ?*provider_host_mod.Host = app.providerHost() catch null;
+        const keys: []const []const u8 = if (host) |found|
+            try route_state_mod.environmentKeys(arena, found.registry.profiles.items, provider_credential_mod.EnvLookup.process())
+        else
+            &.{};
+        const missing: ?route_state_mod.MissingProvider = switch (reason) {
+            .missing_credential => |id| if (host) |found| try missingProvider(arena, found, id) else null,
+            else => null,
+        };
+        try route_state_mod.writeReminder(w, .{
+            .reason = reason,
+            .missing = missing,
+            .env_path = env_path,
+            .template = template,
+            .guide_url = state_env.guide_url,
+            .environment_keys = keys,
+            .unchosen_local = app.unchosen_local_providers,
+            .provider_variable = state_env.provider_variable,
+        });
+    }
+
+    /// The provider `id` as the reminder names it: its display name, the
+    /// variables its key is read from (canonical ones), and whether `/login
+    /// <id>` can store one (a key page, or a sign-in it runs).
+    fn missingProvider(arena: std.mem.Allocator, host: *provider_host_mod.Host, id: provider_ids_mod.Slug) !?route_state_mod.MissingProvider {
+        const profile = host.registry.findById(id) orelse return null;
+        if (profile.id.eqlText("metask")) return .{ .display_name = profile.display_name, .metask = true };
+        var names: std.ArrayList([]const u8) = .empty;
+        for (profile.accepted_credential_kinds) |kind| {
+            const name = profile.canonicalEnvAlias(kind) orelse continue;
+            const seen = for (names.items) |existing| {
+                if (std.mem.eql(u8, existing, name)) break true;
+            } else false;
+            if (!seen) try names.append(arena, name);
+        }
+        const login_capable = profile.api_key_setup != null or
+            if (@import("api/provider_login.zig").requireOAuthCapable(profile)) |_| true else |_| false;
+        return .{
+            .display_name = profile.display_name,
+            .variables = names.items,
+            .login_id = if (login_capable) profile.id.slice() else null,
+        };
+    }
+
+    /// Where a `/model` commit's credential came from, for the banner: who
+    /// bills the session from here. `oauth_token` and `stored_key` are the
+    /// sign-in and the saved key the binding was offered.
+    fn bindingOrigin(
+        host: *provider_host_mod.Host,
+        binding: provider_binding_mod.RuntimeBinding,
+        oauth_token: ?[]const u8,
+        stored_key: ?[]const u8,
+    ) route_state_mod.CredentialOrigin {
+        if (binding.provider_id.eqlText("metask")) return .metask;
+        if (oauth_token) |token| if (binding.secret.ptr == token.ptr) return .sign_in;
+        if (stored_key) |key| if (binding.secret.ptr == key.ptr) return .saved_key;
+        return switch (binding.credential_ref.source) {
+            .cli, .runtime_fd => .flag,
+            // The process environment wins over `.env` for a provider's
+            // aliases (`credential.resolveEnv`): any of them set there is
+            // where the key came from.
+            .env => blk: {
+                const profile = host.registry.findById(binding.provider_id) orelse break :blk .unknown;
+                const env = provider_credential_mod.EnvLookup.process();
+                for (profile.env_aliases) |alias| {
+                    if (env.get(alias.name) != null) break :blk .environment;
+                }
+                break :blk .local_config;
+            },
+            .stored, .interactive, .unknown => .unknown,
+        };
+    }
+
+    // ── /login and /logout (#485) ───────────────────────────────────────────
+
+    /// What `/login` hands over once its dialog is done: the key, model and
+    /// reasoning level chosen, and the gateway's `/v1/models` answer for that
+    /// key (the dialog fetched it to list the models). Borrowed.
+    pub const MetaskSignIn = struct {
+        /// The Metask Messages endpoint the sign-in reached the account
+        /// through (`auth.metaskMessagesUrl`).
+        messages_url: []const u8,
+        key: []const u8,
+        model: []const u8,
+        effort: ?types.ReasoningEffort = null,
+        models_json: ?[]const u8 = null,
+    };
+
+    /// Move the session onto the Metask sign-in `/login` just stored, through
+    /// the kernel's selection commit like any `/model` pick, so everything
+    /// that reads the current offer (the picker, the next-step hints) names
+    /// Metask from here.
+    ///
+    /// The sign-in becomes the session's Metask API-key route: its gateway,
+    /// its key (what `metaskKeyFor` offers a Metask commit from now on,
+    /// replacing any earlier key), and the account's `/v1/models` answer as
+    /// the Metask inventory and the client catalog. Then the offer for the
+    /// chosen model at that gateway is committed for this session; the
+    /// binding authenticates it with the new key. Nothing is sent.
+    ///
+    /// All or nothing: any failure (no such offer, a refused commit, memory)
+    /// puts back the previous key route, key, inventory, catalog and kernel
+    /// selection, so the previous route keeps working, and frees only what
+    /// the attempt allocated. On success the previous key is retired, not
+    /// freed (`retireApiKey`): a client may still be reading it.
+    pub fn bindMetaskSignIn(app: *App, sign_in: MetaskSignIn) !void {
+        const origin = MetaskKeyRoute.gatewayOriginOf(sign_in.messages_url) orelse return error.UnexpectedUrl;
+        const document = sign_in.models_json orelse return error.NoModelList;
+        // Built first, so the inventory below is ingested into it.
+        const host = try app.providerHost();
+
+        // The attempt's material. Its errdefers end with this block: once the
+        // App holds it, the restore below is what frees it.
+        const attempt = blk: {
+            const key = try app.allocator.dupe(u8, sign_in.key);
+            errdefer {
+                std.crypto.secureZero(u8, key);
+                app.allocator.free(key);
+            }
+            const gateway = try app.allocator.dupe(u8, origin);
+            errdefer app.allocator.free(gateway);
+            const models_json = try app.allocator.dupe(u8, document);
+            break :blk .{
+                .key = key,
+                .route = MetaskKeyRoute{ .gateway_origin = gateway, .startup_key = key, .models_json = models_json },
+            };
+        };
+        var catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
+        catalog.loadFromModelsListJson(document) catch |err| {
+            @import("util/log.zig").debug("catalog", "sign-in /v1/models unusable: {s}", .{@errorName(err)});
+        };
+
+        // What the attempt replaces.
+        var previous_route = app.metask_key_route;
+        const previous_key = app.selected_api_key_owned;
+        const previous_oauth_selected = app.config.metask_oauth_selected;
+        var previous_catalog = app.api_client.catalog;
+        const previous_profile = host.metaskProfile();
+        const previous_selection = host.kernel.sessionSelection();
+
+        app.metask_key_route = attempt.route;
+        app.selected_api_key_owned = attempt.key;
+        // A device-code session is not what this sign-in authenticates with.
+        app.config.metask_oauth_selected = false;
+        // `switchModel` reads the chosen model's limits from it.
+        app.api_client.catalog = catalog;
+        errdefer {
+            // The App points back at what it had before anything is freed.
+            app.api_client.catalog.deinit();
+            app.api_client.catalog = previous_catalog;
+            app.config.metask_oauth_selected = previous_oauth_selected;
+            if (app.selected_api_key_owned) |attempted| {
+                std.crypto.secureZero(u8, attempted);
+                app.allocator.free(attempted);
+            }
+            app.selected_api_key_owned = previous_key;
+            if (app.metask_key_route) |*attempted| attempted.deinit(app.allocator);
+            app.metask_key_route = previous_route;
+            app.restoreMetaskOffers(host, previous_profile, previous_selection);
+        }
+
+        try host.ingestMetask(attempt.route.gateway_origin, document, .messages);
+        const offer = for (host.kernel.catalogSnapshot().items()) |*candidate| {
+            if (candidate.provider_id.eqlText("metask") and
+                std.mem.eql(u8, candidate.request_model_id, sign_in.model) and
+                std.mem.eql(u8, candidate.protocol, "anthropic_messages") and
+                std.mem.eql(u8, candidate.endpoint_ref, sign_in.messages_url)) break candidate;
+        } else return error.OfferUnavailable;
+        const committed = try app.commitModelSelection(.{
+            .offer_id = offer.offer_id,
+            .offer_revision = offer.offer_revision,
+            .controls = .{},
+            .scope = .session,
+        });
+        if (committed != .committed) return error.SelectionRefused;
+
+        // The session is on the sign-in. What the previous route held goes;
+        // its key is retired, as the clients may have borrowed it.
+        previous_catalog.deinit();
+        if (previous_route) |*route| route.deinit(app.allocator);
+        if (previous_key) |key| app.retireApiKey(key);
+        // The account's key list and the menu's place in it were the
+        // previous sign-in's.
+        app.api_key_catalog.clear();
+        app.api_key_catalog_load = .deferred;
+        app.models_picker_key_index = null;
+        app.models_picker_model_index = null;
+        app.refreshChildCatalogSnapshots() catch |err| {
+            @import("util/log.zig").warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
+        };
+        // A picker kept open lists the new inventory.
+        app.refreshModelPicker() catch app.model_picker.markFailed();
+        if (sign_in.effort) |effort| app.setReasoningEffort(effort) catch |err| {
+            @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
+        };
+    }
+
+    /// What `/login` did with a sign-in `auth.json` already holds (#485).
+    pub const SignInApplied = struct {
+        /// Why this session could not move onto the sign-in (it stays as it
+        /// was), or null when it did.
+        switch_error: ?anyerror = null,
+        /// A stored `/model` default was forgotten.
+        default_forgotten: bool = false,
+        /// Why the stored default could not be forgotten: the next start
+        /// may still use it.
+        default_error: ?anyerror = null,
+    };
+
+    /// `/login`, once `auth.json` holds the sign-in: move this session onto
+    /// it (`bindMetaskSignIn`) and forget a stored `/model` default. The
+    /// sign-in is the most recent explicit choice whether or not this
+    /// session could move, and a default left stored would outrank it at
+    /// the next start.
+    pub fn applyMetaskSignIn(app: *App, sign_in: MetaskSignIn) SignInApplied {
+        var applied: SignInApplied = .{};
+        app.bindMetaskSignIn(sign_in) catch |err| {
+            applied.switch_error = err;
+        };
+        if (app.forgetStoredDefault()) |forgotten| {
+            applied.default_forgotten = forgotten;
+        } else |err| {
+            applied.default_error = err;
+        }
+        return applied;
+    }
+
+    /// Undo the Metask inventory a failed `/login` ingested (#485): the
+    /// previous profile, and the session selection the kernel held. Under
+    /// memory pressure the catalog may not rebuild; that is logged.
+    fn restoreMetaskOffers(
+        app: *App,
+        host: *provider_host_mod.Host,
+        profile: ?@import("provider/profile.zig").ProviderProfile,
+        selection: ?provider_selection_mod.RuntimeSelection,
+    ) void {
+        if (profile) |value| host.restoreMetask(value) catch |err| {
+            @import("util/log.zig").warn("catalog", "the previous Metask models were not restored: {s}", .{@errorName(err)});
+        };
+        if (selection) |value| host.kernel.replaceSessionSelection(value) else host.kernel.forgetSessionSelection();
+        app.refreshModelPicker() catch app.model_picker.markFailed();
+    }
+
+    /// Retire `key`, a `selected_api_key_owned` the session no longer uses
+    /// (#485): it stays readable until the next one is retired.
+    fn retireApiKey(app: *App, key: []u8) void {
+        if (app.retired_api_key) |older| {
+            std.crypto.secureZero(u8, older);
+            app.allocator.free(older);
+        }
+        app.retired_api_key = key;
+    }
+
+    /// What `/logout` did (#485).
+    pub const SignOut = struct {
+        removed: sign_out_mod.Removed,
+        /// A key `login --provider metask` stored, also Metask's.
+        key_removed: bool,
+        /// The stored `/model` default was Metask's and is forgotten.
+        default_cleared: bool,
+        session: SessionAfter,
+        /// `METASK_API_KEY` in the shell signs the next start in again.
+        key_in_shell: bool,
+        /// So does `METASK_API_KEY` in `<state root>/.env`.
+        key_in_local_config: bool,
+
+        pub const SessionAfter = union(enum) {
+            /// The session was not on Metask; it stays where it is.
+            kept,
+            /// On the provider `.env` configures.
+            switched: Switched,
+            /// Nothing to fall back to: unbound (`signed_out`).
+            unbound,
+        };
+
+        pub const Switched = struct {
+            /// The provider's display name.
+            name: []const u8,
+            /// Where the key it runs on came from.
+            origin: route_state_mod.CredentialOrigin,
+        };
+    };
+
+    /// `/logout` (#485, #499 part 2): remove both Metask sign-ins (and a
+    /// Metask key stored with `login --provider metask`), forget a stored
+    /// default that is Metask's, and drop every Metask credential this
+    /// process holds, so nothing is sent with one again. A session on Metask
+    /// then moves to the provider `.env` configures, or becomes unbound.
+    /// Keys of other providers are not touched.
+    pub fn signOutOfMetask(app: *App) !SignOut {
+        const root = app.stateRoot();
+        const removed = try sign_out_mod.removeMetaskSignIns(app.allocator, root);
+        const key_removed = provider_api_key_store.remove(app.allocator, root, provider_ids_mod.Slug.lit("metask")) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.RemoveFailed,
+        };
+        const host = try app.providerHost();
+        const cleared_revision = sign_out_mod.clearMetaskDefault(app.allocator, root, host.kernel.catalogSnapshot()) catch |err| blk: {
+            @import("util/log.zig").warn("provider", "the stored default could not be checked: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (cleared_revision) |revision| {
+            // As `forgetStoredDefault`: the kernel mirrors the store's revision.
+            host.kernel.adoptConfigRevision(revision);
+            host.kernel.forgetGlobalSelection();
+        }
+        const on_metask = switch (app.route_state) {
+            .bound => |origin| origin == .metask,
+            .unbound => false,
+        };
+
+        // Every Metask credential goes before the session moves, so nothing
+        // it moves to can authenticate with one: not the key just signed out
+        // of, not the device session (whose refresh would write its file
+        // back). The clients keep the previous route's strings, which stay
+        // readable, until they are moved or emptied below.
+        app.forgetMetaskCredentials();
+        var session: SignOut.SessionAfter = .kept;
+        if (on_metask) {
+            session = .unbound;
+            if (app.local_provider) |local| {
+                if (app.bindLocalProvider(host, local)) |switched| {
+                    session = .{ .switched = switched };
+                } else |err| {
+                    @import("util/log.zig").warn("provider", "the .env provider {s} could not be used: {s}", .{ local.name, @errorName(err) });
+                }
+            }
+            if (session == .unbound) app.unbindRoute(.signed_out);
+        }
+        return .{
+            .removed = removed,
+            .key_removed = key_removed,
+            .default_cleared = cleared_revision != null,
+            .session = session,
+            .key_in_shell = provider_credential_mod.EnvLookup.process().get("METASK_API_KEY") != null,
+            .key_in_local_config = app.localConfigHasMetaskKey(),
+        };
+    }
+
+    /// Whether `<state root>/.env` sets `METASK_API_KEY` now (read again:
+    /// the file may have changed since the start), as `metacodes logout`
+    /// reports it.
+    fn localConfigHasMetaskKey(app: *App) bool {
+        var local = @import("app/state_env.zig").load(app.allocator, app.stateRoot(), .{
+            .keys = &.{.{ .name = "METASK_API_KEY", .provider = "metask" }},
+        }) catch return false;
+        defer local.deinit();
+        return local.get("METASK_API_KEY") != null;
+    }
+
+    /// Forget the stored `/model` default, on disk and in the kernel (`/login`,
+    /// #485: the most recent explicit choice is the sign-in). True when one
+    /// was stored.
+    pub fn forgetStoredDefault(app: *App) !bool {
+        var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch |err| switch (err) {
+            error.NoHome => return false,
+            else => return err,
+        };
+        defer store.deinit();
+        const outcome = try provider_config_store.clearGlobalSelection(&store, null);
+        if (app.provider_host) |host| {
+            host.kernel.adoptConfigRevision(outcome.result.config_revision);
+            host.kernel.forgetGlobalSelection();
+        }
+        return outcome.cleared;
+    }
+
+    /// What `/logout <provider>` did (#485).
+    pub const ProviderKeyForgotten = struct {
+        /// `<state root>/keys/<provider>.json` was there and is gone.
+        removed: bool,
+        /// The session ran on that saved key and holds no credential now.
+        unbound: bool = false,
+        /// One of the provider's variables `.env` sets, which still supplies
+        /// a key (a name, never a value).
+        local_variable: ?[]const u8 = null,
+        /// One the shell sets.
+        shell_variable: ?[]const u8 = null,
+    };
+
+    /// `/logout <provider>` (#485, 第十节第 6 条): forget the key `/login
+    /// <provider>` stored, as `metacodes logout --provider` does. A session
+    /// running on that key keeps nothing of it. `.env` and the shell are not
+    /// edited; the result names what of them still holds a key.
+    pub fn forgetProviderKey(app: *App, provider_id: provider_ids_mod.Slug) !ProviderKeyForgotten {
+        const removed = try provider_api_key_store.remove(app.allocator, app.stateRoot(), provider_id);
+        var result: ProviderKeyForgotten = .{ .removed = removed };
+        const host = try app.providerHost();
+        const profile = host.registry.findById(provider_id) orelse return result;
+        const on_saved_key = switch (app.route_state) {
+            .bound => |origin| origin == .saved_key,
+            .unbound => false,
+        };
+        if (removed and on_saved_key) {
+            const current = if (host.kernel.currentOfferId()) |id| host.kernel.catalogSnapshot().find(id) else null;
+            if (current) |offer| if (offer.provider_id.eql(provider_id)) {
+                app.unbindRoute(.{ .missing_credential = provider_id });
+                result.unbound = true;
+            };
+        }
+        const env = provider_credential_mod.EnvLookup.process();
+        for (profile.env_aliases) |alias| {
+            if (env.get(alias.name) != null) {
+                result.shell_variable = alias.name;
+            } else if (app.credentialEnvFallback().get(alias.name) != null) {
+                result.local_variable = alias.name;
+            }
+        }
+        return result;
+    }
+
+    /// Drop the Metask material this process holds, for `/logout`: the
+    /// device session, the key route and the account's key list, the key
+    /// picked in `/models`, and `--api-key` when it was Metask's. From here
+    /// no commit can authenticate with any of them.
+    fn forgetMetaskCredentials(app: *App) void {
+        if (app.oauth_session_provider) |id| if (id.eqlText("metask")) {
+            if (app.oauth_session) |*session| session.deinit();
+            app.oauth_session = null;
+            app.oauth_session_provider = null;
+        };
+        app.config.metask_oauth_selected = false;
+        if (app.metask_key_route) |*route| route.deinit(app.allocator);
+        app.metask_key_route = null;
+        app.api_key_catalog.clear();
+        app.api_key_catalog_load = .off;
+        app.models_picker_key_index = null;
+        app.models_picker_model_index = null;
+        if (app.selected_api_key_owned) |old| {
+            // Retired, not freed: the clients may still borrow it until the
+            // session moves.
+            app.retireApiKey(old);
+            app.selected_api_key_owned = null;
+        }
+        const flag_is_metask = if (app.config.provider_profile) |name| std.ascii.eqlIgnoreCase(name, "metask") else true;
+        if (flag_is_metask) app.config.api_key = null;
+    }
+
+    /// The session holds no credential from here (#484/#485): every client
+    /// gets an empty one, which the transports refuse before building a
+    /// request, and the REPL refuses first.
+    fn unbindRoute(app: *App, reason: route_state_mod.Unbound) void {
+        // No route is in force: the kernel's current offer goes too, so
+        // nothing that reads it names the provider just left.
+        if (app.provider_host) |host| host.kernel.forgetSessionSelection();
+        if (app.agent_jobs) |*jobs| jobs.setApiKey("") catch {};
+        app.api_key = "";
+        app.api_client.credential = .{ .fixed = "" };
+        if (app.openai_client) |*client| client.credential = .{ .fixed = "" };
+        if (app.gemini_client) |*client| client.credential = .{ .fixed = "" };
+        if (app.bedrock_client) |*client| client.credential = .{ .fixed = "" };
+        app.swarm.api_key = "";
+        app.route_state = .{ .unbound = reason };
+    }
+
+    /// Bind the provider `.env` configures, on its default route (or the
+    /// model the file names), for this session: what a start with only that
+    /// file resolves to. Returns its display name and where its key came
+    /// from.
+    ///
+    /// When that provider is Metask, the key is `.env`'s and no other
+    /// (#485): the session signed out of everything else Metask's, and a
+    /// key in the shell is not what `.env` configures. It becomes the
+    /// session's Metask API-key route, as a start on that file has.
+    fn bindLocalProvider(app: *App, host: *provider_host_mod.Host, local: LocalProvider) !SignOut.Switched {
+        const profile = host.registry.find(local.name) orelse return error.UnknownProvider;
+        var arena_state = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena_state.deinit();
+        const outcome = try provider_startup_mod.resolve(arena_state.allocator(), &host.registry, .{
+            .provider = local.name,
+            .model = local.model,
+        });
+        const route = switch (outcome) {
+            .route => |value| value,
+            .failure => return error.NoRoute,
+        };
+        const offer = host.kernel.catalogSnapshot().find(route.offer_id) orelse return error.OfferUnavailable;
+        const metask = profile.id.eqlText("metask");
+        if (metask) {
+            // `forgetMetaskCredentials` dropped the previous one.
+            std.debug.assert(app.metask_key_route == null);
+            const key = localMetaskKey(app.credentialEnvFallback(), profile) orelse return error.MissingCredentials;
+            const gateway = MetaskKeyRoute.gatewayOriginOf(offer.endpoint_ref) orelse return error.UnexpectedUrl;
+            app.metask_key_route = .{ .gateway_origin = try app.allocator.dupe(u8, gateway), .startup_key = key };
+        }
+        errdefer if (metask) {
+            if (app.metask_key_route) |*attempted| attempted.deinit(app.allocator);
+            app.metask_key_route = null;
+        };
+        const committed = try app.commitModelSelection(.{
+            .offer_id = offer.offer_id,
+            .offer_revision = offer.offer_revision,
+            .controls = .{},
+            .scope = .session,
+        });
+        if (committed != .committed) return error.SelectionRefused;
+        return .{
+            .name = profile.display_name,
+            // A Metask binding is labelled Metask's (`bindingOrigin`); the
+            // key is `.env`'s by construction.
+            .origin = if (metask) .local_config else switch (app.route_state) {
+                .bound => |origin| origin,
+                .unbound => .unknown,
+            },
+        };
+    }
+
+    /// The Metask key in `local`, the host's `.env` layer: borrowed from it,
+    /// which lives for the process. Null when it holds none.
+    fn localMetaskKey(local: provider_credential_mod.EnvLookup, profile: *const @import("provider/profile.zig").ProviderProfile) ?[]const u8 {
+        for (profile.env_aliases) |alias| {
+            if (local.get(alias.name)) |value| if (value.len > 0) return value;
+        }
+        return null;
+    }
+
     /// 当前 provider 的模型档位表(low/mid/high)。未配置 → null(档位名全 inherit)。
     /// 返回指针借用 App 生命周期的表,启动后只读——后台 worker 线程读安全。
     pub fn activeModelTiers(app: *const App) ?*const @import("api/model_tiers.zig").ProviderTiers {
@@ -1269,6 +1890,10 @@ pub const App = struct {
         app.route_strings.deinit();
         if (app.selected_api_key_owned) |k| {
             @memset(k, 0);
+            app.allocator.free(k);
+        }
+        if (app.retired_api_key) |k| {
+            std.crypto.secureZero(u8, k);
             app.allocator.free(k);
         }
         if (app.model_switch_owned) |m| app.allocator.free(m);
@@ -1532,7 +2157,12 @@ pub const App = struct {
     fn metaskKeyFor(app: *const App, provider_id: provider_ids_mod.Slug) ?provider_binding_mod.ScopedSecret {
         const route = app.metask_key_route orelse return null;
         if (!provider_id.eqlText("metask")) return null;
-        return .{ .provider_id = provider_id, .secret = app.selected_api_key_owned orelse route.startup_key };
+        const secret = app.selected_api_key_owned orelse route.startup_key;
+        // A session that started without a key has none to offer: resolution
+        // goes on to the environment, `.env` and the stores (an empty
+        // `--api-key` would stop it at MissingCredentials).
+        if (secret.len == 0) return null;
+        return .{ .provider_id = provider_id, .secret = secret };
     }
 
     // ── issue #16: the cross-UI provider control plane ──────────────────────
@@ -1580,6 +2210,10 @@ pub const App = struct {
     /// — the one that actually breaks a session — the turn-boundary OAuth
     /// refresh, which keys on the effective selection, never runs.
     fn seedStartupSelection(app: *App, host: *provider_host_mod.Host) void {
+        // An unbound session started on no route (#484, #485): the offer a
+        // flag named lacks its credential, and seeding it would have the
+        // picker and `/providers` mark as current a route nothing is sent on.
+        if (app.route_state == .unbound) return;
         const snapshot = host.kernel.catalogSnapshot();
         if (app.config.selected_offer_id) |rendered| {
             const offer_id = provider_ids_mod.OfferId.parse(rendered) catch return;
@@ -2221,6 +2855,8 @@ pub const App = struct {
             &reference_buffer,
         );
 
+        // Read while the material the binding borrows is still live.
+        const origin = bindingOrigin(host, binding, oauth_token, if (stored_key.entry()) |entry| entry.secret else null);
         const endpoint = try app.allocator.dupe(u8, binding.endpoint_url);
         errdefer app.allocator.free(endpoint);
         const secret = try app.allocator.dupe(u8, binding.secret);
@@ -2384,6 +3020,7 @@ pub const App = struct {
         app.swarm.openai_protocol = binding.openai_protocol;
         app.swarm.auth_scheme = binding.auth_scheme;
         app.swarm.dialect = binding.dialect;
+        app.adoptBoundRoute(origin);
     }
 
     pub fn selectApiKeyForModels(app: *App, idx: usize) !void {
@@ -2667,7 +3304,8 @@ pub const App = struct {
         if (app.transcript_writer) |*w| w.deinit();
         app.transcript_writer = null;
         app.publishSessionDir();
-        app.initTranscriptWriter() catch |err| {
+        // An unbound session opens its directory when a route binds (#484).
+        if (app.route_state == .bound) app.initTranscriptWriter() catch |err| {
             @import("util/log.zig").warn("transcript", "rotate writer failed: {s}", .{@errorName(err)});
         };
         // R4-3:goal 属于被转走的旧会话——不清则旧 goal 记进新会话目录、用量记错账,

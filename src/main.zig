@@ -23,6 +23,10 @@ const invocation = @import("app/invocation.zig");
 pub const doctor = @import("app/doctor.zig"); // pub: component tests build the report by hand
 pub const app_state_env = @import("app/state_env.zig"); // pub: component tests read the template and the parser
 const state_env_mod = app_state_env;
+pub const app_route_state = @import("app/route_state.zig"); // pub: component tests read the banner and the reminder
+const route_state_mod = app_route_state;
+pub const app_sign_out = @import("app/sign_out.zig"); // pub: component tests sign out in process
+const sign_out_mod = app_sign_out;
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
 pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
@@ -105,6 +109,7 @@ pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_oauth_login = @import("api/oauth_login.zig");
 pub const api_provider_login = @import("api/provider_login.zig");
 pub const api_login_worker = @import("api/login_worker.zig");
+pub const api_metask_sign_in = @import("api/metask_sign_in.zig"); // `/login`'s browser sign-in on a worker (#485)
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
 pub const api_catalog_fetch = @import("api/catalog_fetch.zig");
 pub const api_capability = @import("api/capability.zig");
@@ -561,13 +566,97 @@ fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, " (template: {s})", .{template}) catch "";
 }
 
-/// Level 2 of the startup order: a default `/model` stored in config.json.
-fn hasStoredGlobalSelection(allocator: std.mem.Allocator) bool {
-    var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch return false;
+/// Level 2 of the startup order, judged before it is applied (#485).
+const StoredDefault = union(enum) {
+    /// No `global_selection` is stored.
+    none,
+    /// config.json cannot be read: `applyPersistedGlobalSelection` says so,
+    /// and the levels below decide.
+    unreadable,
+    /// Stored, and its provider has a credential (or it does not resolve,
+    /// which `applyPersistedGlobalSelection` reports as it always has).
+    usable,
+    /// Stored, but its provider has no credential: passed over. The text
+    /// names it (`DeepSeek · deepseek-v4-pro`), for the notice.
+    lacks_credential: []const u8,
+
+    /// Whether `applyPersistedGlobalSelection` runs.
+    fn consulted(self: StoredDefault) bool {
+        return self == .usable or self == .unreadable;
+    }
+};
+
+/// Whether the default stored by `/model` can serve this start: its route
+/// resolves and its provider has a credential. A Metask default needs a
+/// Metask device-code session or a Metask key (`metask_key_present`, the
+/// historical path's own sign-in): that is what a named Metask route
+/// authenticates with. Nothing is printed and nothing sent; the strings live
+/// in `arena`.
+fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_present: bool) StoredDefault {
+    var store = provider_config_store.Store.initHome(arena, hostRoot()) catch return .none;
     defer store.deinit();
-    var document = store.load() catch return false;
+    var document = store.load() catch return .unreadable;
     defer document.deinit();
-    return document.global_selection != null;
+    const selection = document.global_selection orelse return .none;
+    const host = buildProviderHost(arena) orelse return .usable;
+    defer host.destroy();
+    const outcome = provider_startup.resolveSelection(arena, &host.registry, selection) catch return .usable;
+    const route = switch (outcome) {
+        .failure => return .usable,
+        .route => |value| value,
+    };
+    const provider_name = if (host.registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
+    const label = std.fmt.allocPrint(arena, "{s} · {s}", .{ provider_name, route.request_model_id }) catch return .usable;
+    if (route.provider_id.eqlText("metask")) {
+        if (metask_key_present) return .usable;
+        // The browser sign-in's key serves a stored Metask default too
+        // (`browserSignInKey`), the way it serves the historical path.
+        if (browserSignInKey(arena, config.state_root)) |key| {
+            std.crypto.secureZero(u8, key);
+            arena.free(key);
+            return .usable;
+        }
+        var session = provider_oauth_mod.Session.initHome(arena, config.state_root, provider_ids_mod.Slug.lit("metask")) catch
+            return .{ .lacks_credential = label };
+        defer session.deinit();
+        return if (session.load() catch false) .usable else .{ .lacks_credential = label };
+    }
+    if (resolveProviderScopedCredentialReporting(arena, config, route.provider_id.slice(), .quiet)) |found| {
+        std.crypto.secureZero(u8, found.secret);
+        arena.free(found.secret);
+        return .usable;
+    } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .usable;
+}
+
+/// The API key a browser sign-in (`metacodes login`, `/login`) stored in
+/// `auth.json`, owned by `arena`; null when there is none. It authenticates a
+/// stored Metask default as it authenticates the historical path (#485):
+/// a `/model` "every future session" pick of a Metask route, made while
+/// signed in in the browser, must not need the device-code session that a
+/// named Metask route otherwise reads.
+fn browserSignInKey(arena: std.mem.Allocator, state_root: []const u8) ?[]u8 {
+    var stored = auth.loadDefault(arena, state_root) catch return null;
+    defer stored.deinit(arena);
+    // The key as it is sent: blanks around it in the file are not part of it.
+    const key = std.mem.trim(u8, stored.api_key orelse return null, " \t\r\n");
+    if (key.len == 0) return null;
+    return arena.dupe(u8, key) catch null;
+}
+
+/// What this start uses instead of a passed-over default, for the notice.
+const StartRoute = struct {
+    model: []const u8,
+    origin: route_state_mod.CredentialOrigin,
+};
+
+/// `The default model, DeepSeek · deepseek-v4-pro, has no key or sign-in;
+/// this session uses glm-5 · Metask.` (#485, 第四节第 2 级). `instead` is
+/// null when nothing else is set up either. In `arena`.
+fn skippedDefaultNotice(arena: std.mem.Allocator, label: []const u8, instead: ?StartRoute) ?[]const u8 {
+    const route = instead orelse return std.fmt.allocPrint(arena, "The default model, {s}, has no key or sign-in, and nothing else is set up.", .{label}) catch null;
+    var buf: [256]u8 = undefined;
+    const line = route_state_mod.modelLine(&buf, .{ .bound = route.origin }, route.model);
+    return std.fmt.allocPrint(arena, "The default model, {s}, has no key or sign-in; this session uses {s}.", .{ label, line }) catch null;
 }
 
 /// Level 3 of the startup order: a Metask sign-in the historical path would
@@ -593,6 +682,15 @@ fn providerKnown(allocator: std.mem.Allocator, name: []const u8) bool {
     const host = buildProviderHost(allocator) orelse return true;
     defer host.destroy();
     return host.registry.find(name) != null;
+}
+
+/// `name`'s display name in the registry this run builds (`name` itself when
+/// it names no provider there); in `arena`.
+fn providerDisplayName(arena: std.mem.Allocator, name: []const u8) []const u8 {
+    const host = buildProviderHost(arena) orelse return name;
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse return name;
+    return arena.dupe(u8, profile.display_name) catch name;
 }
 
 /// Whether `name` (a provider id or alias, as `--provider` takes it) is
@@ -997,13 +1095,23 @@ pub fn main(init: std.process.Init) !void {
     // development override and is an origin, never a /v1/messages URL.
     const metask_legacy_requested = config.api_key != null or
         (config.auth_precedence == .api_key_first and (std.c.getenv("METASK_API_KEY") != null or local_metask_key != null));
+    // Level 2 (#485): a stored default counts only while its provider has a
+    // credential; one that lacks it is passed over for the levels below, and
+    // the start says so once (`skipped_default_notice`).
+    const stored_default: StoredDefault = if (config.provider_profile == null and config.provider_offer == null)
+        storedDefault(allocator, config, metask_legacy_requested)
+    else
+        .none;
+    // Whether a flag or the shell named the route: then nothing below is a
+    // "default" the start chose for the user.
+    const named_at_start = config.provider_profile != null or config.provider_offer != null;
     // Level 4. Nothing below a stored default or a sign-in reads the file's
     // choice, and a key that is only in the shell environment never selects
     // a provider: those keys were not put there for metacodes.
     var unchosen_local_providers: []const []const u8 = &.{};
     const local_choice = local_config.choice();
     if (local_choice != .none and config.provider_profile == null and config.provider_offer == null and
-        !hasStoredGlobalSelection(allocator) and !metaskSignInPresent(allocator, config, local_metask_key))
+        stored_default != .usable and !metaskSignInPresent(allocator, config, local_metask_key))
     {
         switch (local_choice) {
             .none => {},
@@ -1057,13 +1165,18 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+    // Whether level 2 decided the route: a stored Metask default then also
+    // takes the browser sign-in's key (`browserSignInKey`).
+    var stored_default_applied = false;
     if (config.provider_profile) |profile_name| {
         applyProviderRoute(&config, allocator, profile_name);
     } else if (config.provider_offer != null) {
         // An offer id names its own provider; requiring `--provider` beside it
         // would make a copied offer id unusable on its own.
         applyProviderRoute(&config, allocator, null);
-    } else if (!applyPersistedGlobalSelection(&config, allocator)) {
+    } else if (stored_default.consulted() and applyPersistedGlobalSelection(&config, allocator)) {
+        stored_default_applied = true;
+    } else {
         config.provider_kind = inferProviderKind(config.model);
     }
 
@@ -1152,26 +1265,66 @@ pub fn main(init: std.process.Init) !void {
     const metask_legacy_explicit = metask_legacy_requested;
     var provider_secret: ?[]u8 = null;
     var metask_oauth_selected = false;
+    // Where the session's credential came from, for the banner (#484): every
+    // credential the Metask scope resolves is Metask's.
+    var credential_origin: route_state_mod.CredentialOrigin = .metask;
+    // Only the interactive TUI has someone to tell what is missing (#484):
+    // `-p`, `-`, `serve`, `--web`, resumed suspensions, teammates and a REPL
+    // whose input is a pipe stop at once, non-zero, as scripts expect.
+    const may_open_unbound = interactive_tui and platform_term.isatty(0);
+    var unbound: ?route_state_mod.Unbound = null;
     if (!introspection_only and metask_scope and config.provider_profile != null and
         std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit)
     {
-        provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| {
-            if (err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession) {
+        var browser_key = false;
+        provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| blk: {
+            const no_sign_in = err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession;
+            // Level 2 (#485): a stored Metask default with no device-code
+            // session authenticates with the browser sign-in's key, on the
+            // stored route, as the historical path would.
+            if (no_sign_in and stored_default_applied) if (browserSignInKey(allocator, config.state_root)) |key| {
+                browser_key = true;
+                break :blk key;
+            };
+            // Level 1 (#485): Metask was named and has no sign-in. The TUI
+            // opens on nothing rather than on another provider.
+            if (no_sign_in and may_open_unbound) {
+                unbound = .{ .missing_credential = provider_ids_mod.Slug.lit("metask") };
+                break :blk null;
+            }
+            if (no_sign_in) {
                 std.debug.print(metask_session_hint, .{ .command = invokedCommand(allocator) });
             } else {
                 std.debug.print("Metask OAuth refresh failed: {s}\n", .{@errorName(err)});
             }
             return err;
         };
-        metask_oauth_selected = true;
+        metask_oauth_selected = provider_secret != null and !browser_key;
     } else if (!introspection_only and metask_scope and metask_legacy_explicit) {
         provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
     } else if (!introspection_only and !metask_scope) {
-        provider_secret = try resolveProviderScopedSecret(
-            allocator,
-            config,
-            config.provider_profile.?,
-        );
+        // Level 1 (and 2 and 4, which name their provider the same way): a
+        // provider without a key opens the TUI unbound, naming the key it
+        // needs (#485, 第十节第 3 条); `-p` and the rest stop with its help.
+        const report: CredentialReport = if (may_open_unbound) .quiet else .print_help;
+        if (resolveProviderScopedCredentialReporting(allocator, config, config.provider_profile.?, report)) |scoped| {
+            provider_secret = scoped.secret;
+            credential_origin = scoped.origin;
+        } else |err| {
+            if (!may_open_unbound or err != error.MissingCredentials) {
+                // Any other refusal (conflicting variables) still stops the
+                // start, with the help it always printed.
+                if (report == .quiet) {
+                    if (resolveProviderScopedCredentialReporting(allocator, config, config.provider_profile.?, .print_help)) |again| {
+                        std.crypto.secureZero(u8, again.secret);
+                        allocator.free(again.secret);
+                    } else |_| {}
+                }
+                return err;
+            }
+            const named = provider_ids_mod.Slug.parse(config.resolved_provider_id orelse config.provider_profile.?) catch provider_ids_mod.Slug.lit("unknown");
+            unbound = .{ .missing_credential = named };
+        }
     }
     // Same handling as `ResolvedCredential.deinit`: zero the bytes before
     // returning them to the allocator so key material does not linger in freed
@@ -1181,9 +1334,17 @@ pub fn main(init: std.process.Init) !void {
         allocator.free(secret);
     };
 
+    // Level 5 of the startup order (#484): with no credential at all, the
+    // interactive TUI opens unbound — no model, nothing sent, a reminder of
+    // what to set up — instead of exiting (`may_open_unbound`).
     var resolved_credential: ?auth.ResolvedCredential = null;
-    if (!introspection_only and provider_secret == null) {
-        resolved_credential = auth.resolveRuntimeCredentialWithEnvFallback(allocator, config.state_root, config.api_key, config.auth_precedence, local_metask_key) catch |err| {
+    if (!introspection_only and provider_secret == null and unbound == null) {
+        resolved_credential = auth.resolveRuntimeCredentialWithEnvFallback(allocator, config.state_root, config.api_key, config.auth_precedence, local_metask_key) catch |err| blk: {
+            if (may_open_unbound and err == error.MissingCredentials) {
+                log.info("auth", "no credential: the TUI opens without a model", .{});
+                unbound = .nothing_configured;
+                break :blk null;
+            }
             @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
             std.debug.print(auth_required_hint, .{ .command = invokedCommand(allocator) });
             printLocalConfigHint(&local_config, unchosen_local_providers);
@@ -1192,12 +1353,6 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     defer if (resolved_credential) |*credential| credential.deinit(allocator);
-    const api_key = if (provider_secret) |secret|
-        @as([]const u8, secret)
-    else if (resolved_credential) |credential|
-        @as([]const u8, credential.bearer_token)
-    else
-        "";
     config.metask_oauth_selected = metask_oauth_selected;
 
     // The stored Metask login carries a Metask model and reasoning effort;
@@ -1209,9 +1364,51 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     if (metask_scope) if (resolved_credential) |credential| if (!isUsableConfiguredSession(config, credential.source)) {
-        std.debug.print(incomplete_login_hint, .{ .command = invokedCommand(allocator) });
-        return error.IncompleteLoginSelection;
+        // A sign-in without a key and model to run: the TUI opens unbound
+        // (the reminder says so; `/login` finishes it), anything else stops.
+        if (!may_open_unbound) {
+            std.debug.print(incomplete_login_hint, .{ .command = invokedCommand(allocator) });
+            return error.IncompleteLoginSelection;
+        }
+        log.info("auth", "Metask login is incomplete: the TUI opens without a model", .{});
+        unbound = .metask_login_incomplete;
     };
+    // Unbound, the session holds no key at all: none is ever sent.
+    const api_key = if (unbound != null)
+        ""
+    else if (provider_secret) |secret|
+        @as([]const u8, secret)
+    else if (resolved_credential) |credential|
+        @as([]const u8, credential.bearer_token)
+    else
+        "";
+    // Level 2 passed over (#485): said once — in the TUI under its banner,
+    // elsewhere on stderr now — with what this start uses instead.
+    const skipped_default_notice: ?[]const u8 = switch (stored_default) {
+        .lacks_credential => |label| skippedDefaultNotice(allocator, label, if (unbound != null) null else .{
+            .model = config.model,
+            .origin = credential_origin,
+        }),
+        else => null,
+    };
+    if (skipped_default_notice) |notice| if (!interactive_tui) std.debug.print("warning: {s}\n", .{notice});
+    // 第七节第 3 条 (#485): `.env` configures a provider, yet the start is on
+    // Metask, which ranks above it (a sign-in or a stored default). Said once
+    // under the TUI's banner, with the two ways to the file's provider.
+    const shadowed_local_notice: ?[]const u8 = shadowed: {
+        if (!interactive_tui or named_at_start or unbound != null or credential_origin != .metask) break :shadowed null;
+        const chosen = switch (local_choice) {
+            .provider => |value| value,
+            else => break :shadowed null,
+        };
+        if (providerIsMetask(allocator, chosen.name)) break :shadowed null;
+        const name = providerDisplayName(allocator, chosen.name);
+        break :shadowed std.fmt.allocPrint(allocator, ".env configures {s}; the default is Metask. To use {s}: /model, or /logout", .{ name, name }) catch null;
+    };
+    const startup_notice: ?[]const u8 = if (skipped_default_notice != null and shadowed_local_notice != null)
+        std.fmt.allocPrint(allocator, "{s}\n{s}", .{ skipped_default_notice.?, shadowed_local_notice.? }) catch skipped_default_notice
+    else
+        skipped_default_notice orelse shadowed_local_notice;
 
     // The session runs on the general-purpose allocator, never on the process
     // arena `allocator` above: an arena frees nothing, and a session allocates
@@ -1230,7 +1427,21 @@ pub fn main(init: std.process.Init) !void {
     // reads stdin, which is the splash's until it ends, and the protocol must
     // be known before the REPL first enters raw mode.
     var splash: repl.Splash = .not_started;
-    var init_options: app_mod.App.InitOptions = .{ .models_cache = interactive_tui };
+    var init_options: app_mod.App.InitOptions = .{
+        .models_cache = interactive_tui,
+        .route_state = if (unbound) |why| .{ .unbound = why } else .{ .bound = credential_origin },
+        .unchosen_local_providers = switch (local_choice) {
+            .several => |ids| ids,
+            else => unchosen_local_providers,
+        },
+        // What `/logout` falls back to (#485): the provider `.env`
+        // configures, whatever this start was decided by.
+        .local_provider = switch (local_choice) {
+            .provider => |chosen| .{ .name = chosen.name, .model = local_config.get(state_env_mod.model_variable) },
+            else => null,
+        },
+        .startup_notice = startup_notice,
+    };
     if (interactive_tui) {
         const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);
         init_options.theme_variant = variant;
@@ -1971,8 +2182,25 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
     summary.writer.print("  update: {s} update\n", .{outcome.launcher orelse outcome.executable}) catch {};
     if (outcome.launcher == null) summary.writer.print("  add {s}{c}bin to PATH, or reinstall with --link <dir on PATH>\n", .{ outcome.prefix, std.fs.path.sep }) catch {};
     if (outcome.sdk) |sdk| summary.writer.print("  SDK: {s}\n", .{sdk}) catch {};
+    writeInstallNextStep(&summary.writer, outcome.state_root, std.fs.path.basename(outcome.launcher orelse outcome.executable)) catch {};
     dumpWrite(summary.written());
     return 0;
+}
+
+/// What to do after installing (#484, 第十节第 9 条), while this install's
+/// state root has neither a Metask sign-in (`auth.json`) nor a `.env`: start
+/// it and `/login`, or put a provider key in its own `.env`.
+fn writeInstallNextStep(w: *std.Io.Writer, state_root: []const u8, command: []const u8) !void {
+    if (state_root.len == 0) return;
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    for ([_][]const u8{ "auth.json", state_env_mod.file_name }) |name| {
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}{c}{s}", .{ state_root, std.fs.path.sep, name }) catch return;
+        if (pfs.exists(path.ptr)) return;
+    }
+    try w.print("  next: run `{s}` and type /login to sign in to Metask,\n", .{command});
+    try w.print("        or put your provider key in {s}{c}{s} (template: {s}), then run it\n", .{
+        state_root, std.fs.path.sep, state_env_mod.file_name, state_env_mod.example_file_name,
+    });
 }
 
 const update_usage =
@@ -2174,23 +2402,14 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
                     std.debug.print("error: unknown logout argument '{s}'\n", .{more});
                     return 2;
                 }
+                // Metask's sign-ins are what a plain `logout` removes.
+                if (providerIsMetask(allocator, name)) return logoutMetask(allocator, state_dir);
                 return logoutProviderKey(allocator, state_dir, name);
             }
             std.debug.print("error: unknown logout argument '{s}'\n", .{extra});
             return 2;
         }
-        auth.clearDefault(allocator, state_dir) catch |err| switch (err) {
-            error.NoHome => {
-                std.debug.print("No HOME set; no credentials cleared.\n", .{});
-                return 1;
-            },
-            else => {
-                std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
-                return 1;
-            },
-        };
-        std.debug.print("Logged out. Local credentials cleared.\n", .{});
-        return 0;
+        return logoutMetask(allocator, state_dir);
     }
     if (!std.mem.eql(u8, cmd, "login")) return null;
 
@@ -2372,6 +2591,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
             };
             try auth.saveDefault(allocator, state_dir, stored);
             std.debug.print("Successfully logged in with Metask OAuth. API key, model, and reasoning effort were selected. Secrets were not printed.\n", .{});
+            forgetDefaultForSignIn(allocator, state_dir);
             return 0;
         },
         .help => {
@@ -2533,9 +2753,28 @@ fn runModelSelectionForStoredApiKey(allocator: std.mem.Allocator, io: std.Io, st
     stored.reasoning_effort = efforts[effort_idx];
 }
 
+/// `metacodes login` in the browser, as `/login` (#485): the sign-in is the
+/// most recent explicit choice, so a stored `/model` default, which would
+/// outrank it at the next start, is forgotten. Says what it did; writes
+/// nothing when none is stored.
+fn forgetDefaultForSignIn(allocator: std.mem.Allocator, state_dir: []const u8) void {
+    var store = provider_config_store.Store.initHome(allocator, state_dir) catch return;
+    defer store.deinit();
+    var document = store.load() catch |err| {
+        std.debug.print("warning: the stored default model could not be read ({s}); the next start may use it\n", .{@errorName(err)});
+        return;
+    };
+    defer document.deinit();
+    if (document.global_selection == null) return;
+    const outcome = provider_config_store.clearGlobalSelection(&store, null) catch |err| {
+        std.debug.print("warning: the stored default model could not be cleared ({s}); the next start may use it\n", .{@errorName(err)});
+        return;
+    };
+    if (outcome.cleared) std.debug.print("Forgot the stored default model: new sessions start on Metask.\n", .{});
+}
+
 fn loginMessagesUrl() []const u8 {
-    if (std.c.getenv("METACODES_BASE_URL")) |u| return std.mem.span(u);
-    return client.ANTHROPIC_API_URL;
+    return api_metask_sign_in.messagesUrl();
 }
 
 fn replaceStoredApiKey(allocator: std.mem.Allocator, stored: *auth.StoredCredentials, key: []const u8) !void {
@@ -2733,6 +2972,71 @@ fn readSecretLine(prompt: []const u8, buf: []u8) !usize {
         }
     }
     return len;
+}
+
+/// `metacodes logout` (#499 part 2): remove both Metask sign-ins — the
+/// browser one in auth.json and the device-code one in oauth/metask.json,
+/// refresh token and all — and a stored default that is Metask's, and say
+/// which were there. A key in `.env` or the shell is not a sign-in: it is
+/// named, never removed.
+fn logoutMetask(allocator: std.mem.Allocator, state_dir: []const u8) u8 {
+    if (state_dir.len == 0 and std.c.getenv(auth.AUTH_FILE_ENV) == null and std.c.getenv("METACODES_OAUTH_DIR") == null) {
+        std.debug.print("No state root (set HOME or --state-dir); no credentials cleared.\n", .{});
+        return 1;
+    }
+    const removed = sign_out_mod.removeMetaskSignIns(allocator, state_dir) catch |err| {
+        std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    // A Metask key stored with `login --provider metask --api-key` is a
+    // Metask credential too.
+    const key_removed = provider_api_key_store.remove(allocator, state_dir, provider_ids_mod.Slug.lit("metask")) catch |err| {
+        std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    var default_cleared = false;
+    if (buildProviderHost(allocator)) |host| {
+        defer host.destroy();
+        default_cleared = (sign_out_mod.clearMetaskDefault(allocator, state_dir, host.kernel.catalogSnapshot()) catch |err| blk: {
+            std.debug.print("warning: the stored default could not be checked ({s})\n", .{@errorName(err)});
+            break :blk null;
+        }) != null;
+    }
+    if (removed.browser) std.debug.print("Removed the Metask browser sign-in ({s}).\n", .{authPathForDisplay(allocator, state_dir)});
+    if (removed.device) std.debug.print("Removed the Metask device-code sign-in and its refresh token ({s}).\n", .{metaskSessionPathForDisplay(allocator, state_dir)});
+    if (key_removed) std.debug.print("Removed the stored key for Metask.\n", .{});
+    if (!removed.any() and !key_removed) std.debug.print("No Metask sign-in was stored.\n", .{});
+    if (default_cleared) std.debug.print("Forgot the default model, which was a Metask one.\n", .{});
+    printRemainingMetaskKeys(allocator, state_dir);
+    std.debug.print("Logged out. No secret was printed.\n", .{});
+    return 0;
+}
+
+/// `<state root>/auth.json` as the removal names it ("auth.json" when it
+/// cannot be built).
+fn authPathForDisplay(allocator: std.mem.Allocator, state_dir: []const u8) []const u8 {
+    return auth.authFilePath(allocator, state_dir) catch "auth.json";
+}
+
+fn metaskSessionPathForDisplay(allocator: std.mem.Allocator, state_dir: []const u8) []const u8 {
+    var session = provider_oauth_mod.Session.initHome(allocator, state_dir, provider_ids_mod.Slug.lit("metask")) catch return "oauth/metask.json";
+    defer session.deinit();
+    return allocator.dupe(u8, session.path) catch "oauth/metask.json";
+}
+
+/// A `METASK_API_KEY` that signs a plain start in again, though nothing was
+/// stored: in the shell, or in this install's `.env` (names only).
+fn printRemainingMetaskKeys(allocator: std.mem.Allocator, state_dir: []const u8) void {
+    if (nonEmptyEnv(auth.METASK_API_KEY_ENV) != null) {
+        std.debug.print("METASK_API_KEY is still set in your shell; a start signs in with it until you unset it.\n", .{});
+    }
+    var local = state_env_mod.load(allocator, state_dir, .{
+        .keys = &.{.{ .name = auth.METASK_API_KEY_ENV, .provider = "metask" }},
+    }) catch return;
+    defer local.deinit();
+    if (local.get(auth.METASK_API_KEY_ENV) != null) {
+        std.debug.print("METASK_API_KEY is still set in {s}; remove it there to stay signed out.\n", .{local.path});
+    }
 }
 
 /// `metacodes logout --provider <id>`: forget the API key stored for it.
@@ -3344,6 +3648,35 @@ pub fn resolveProviderScopedSecret(
     config: types.Config,
     profile_name: []const u8,
 ) ![]u8 {
+    return (try resolveProviderScopedCredential(allocator, config, profile_name)).secret;
+}
+
+/// A provider-scoped credential and where it came from (the banner says it).
+pub const ScopedCredential = struct {
+    /// Owned by the caller's allocator; zero it before freeing.
+    secret: []u8,
+    origin: route_state_mod.CredentialOrigin,
+};
+
+/// `resolveProviderScopedSecret`, with the credential's origin.
+pub fn resolveProviderScopedCredential(
+    allocator: std.mem.Allocator,
+    config: types.Config,
+    profile_name: []const u8,
+) !ScopedCredential {
+    return resolveProviderScopedCredentialReporting(allocator, config, profile_name, .print_help);
+}
+
+/// Whether a failure prints the provider's credential help (`-p`, the CLI)
+/// or leaves saying it to the caller (the TUI's reminder, a dry check).
+const CredentialReport = enum { print_help, quiet };
+
+fn resolveProviderScopedCredentialReporting(
+    allocator: std.mem.Allocator,
+    config: types.Config,
+    profile_name: []const u8,
+    report: CredentialReport,
+) !ScopedCredential {
     const credential_mod = provider_credential;
     const provider_ids_local = provider_ids;
     const host = buildProviderHost(allocator) orelse return error.UnknownProviderProfile;
@@ -3352,7 +3685,7 @@ pub fn resolveProviderScopedSecret(
 
     // The key `login --provider` stored for this provider, in its own file.
     var stored_key = provider_api_key_store.load(allocator, config.state_root, profile.id) catch |err| blk: {
-        std.debug.print("warning: the stored key for '{s}' cannot be used ({s}); run `{s} login --provider {s}` again\n", .{ profile.id.slice(), @errorName(err), invokedCommand(allocator), profile.id.slice() });
+        if (report == .print_help) std.debug.print("warning: the stored key for '{s}' cannot be used ({s}); run `{s} login --provider {s}` again\n", .{ profile.id.slice(), @errorName(err), invokedCommand(allocator), profile.id.slice() });
         break :blk null;
     };
     defer if (stored_key) |*key| key.deinit();
@@ -3368,6 +3701,7 @@ pub fn resolveProviderScopedSecret(
         // `<state root>/.env` (#486), below the process environment.
         .env_fallback = config.credential_env_fallback orelse credential_mod.EnvLookup.empty(),
     }, &reference_buffer) catch |err| {
+        if (report == .quiet) return err;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const local_path: []const u8 = if (config.state_root.len == 0) "" else std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{
             config.state_root, std.fs.path.sep, state_env_mod.file_name,
@@ -3375,7 +3709,15 @@ pub fn resolveProviderScopedSecret(
         printProviderCredentialHelp(profile.*, err, invokedCommand(allocator), local_path);
         return err;
     };
-    return allocator.dupe(u8, resolved.secret);
+    const origin: route_state_mod.CredentialOrigin = switch (resolved.ref.source) {
+        .cli, .runtime_fd => .flag,
+        .stored => .saved_key,
+        // The process environment wins over `.env` (#486): an alias it does
+        // not set came from the file.
+        .env => if (resolved.alias_used) |name| (if (credential_mod.EnvLookup.process().get(name) != null) .environment else .local_config) else .unknown,
+        .interactive, .unknown => .unknown,
+    };
+    return .{ .secret = try allocator.dupe(u8, resolved.secret), .origin = origin };
 }
 
 /// `command` is the command the user ran (`invokedCommand`); `local_path`
@@ -4249,6 +4591,59 @@ test "Metask login dispatch uses JSON device flow except token import" {
     try std.testing.expect(!metaskUsesDeviceFlow(.oauth_json));
 }
 
+test "a stored Metask default takes the browser sign-in's key without the blanks around it (#485)" {
+    // The variable would point the read at the developer's own auth.json.
+    if (std.c.getenv(auth.AUTH_FILE_ENV) != null) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const path = try std.fs.path.joinZ(a, &.{ root, "auth.json" });
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "auth.json", .data = "{\"api_key\":\"  sk-browser-key\\n\"}" });
+    _ = pfs.chmod(path.ptr, 0o600);
+    try std.testing.expectEqualStrings("sk-browser-key", browserSignInKey(a, root) orelse return error.NoKey);
+
+    // Blanks only: no key.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "auth.json", .data = "{\"api_key\":\" \\t \"}" });
+    _ = pfs.chmod(path.ptr, 0o600);
+    try std.testing.expect(browserSignInKey(a, root) == null);
+}
+
+test "install names the next step while the state root has neither a sign-in nor a .env (#484)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try writeInstallNextStep(&out.writer, root, "metacodes-dev");
+    const env_path = try std.fs.path.join(a, &.{ root, ".env" });
+    defer a.free(env_path);
+    const expected = try std.fmt.allocPrint(a,
+        \\  next: run `metacodes-dev` and type /login to sign in to Metask,
+        \\        or put your provider key in {s} (template: .env.example), then run it
+        \\
+    , .{env_path});
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, out.written());
+
+    // Signed in, or configured: nothing to say.
+    for ([_][]const u8{ "auth.json", ".env" }) |name| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = "{}" });
+        var quiet: std.Io.Writer.Allocating = .init(a);
+        defer quiet.deinit();
+        try writeInstallNextStep(&quiet.writer, root, "metacodes");
+        try std.testing.expectEqualStrings("", quiet.written());
+        try tmp.dir.deleteFile(std.testing.io, name);
+    }
+}
+
 test "the sign-in hints name the command that was run, the default sign-in first (#482)" {
     const a = std.testing.allocator;
     const cases = [_]struct { argv0: []const u8, command: []const u8 }{
@@ -4357,6 +4752,8 @@ test {
     _ = &@import("app/install.zig");
     _ = &@import("app/invocation.zig");
     _ = &@import("app/state_env.zig");
+    _ = &@import("app/route_state.zig");
+    _ = &@import("app/sign_out.zig");
     _ = &@import("app/release_source.zig");
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");
