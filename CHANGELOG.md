@@ -47,6 +47,12 @@ status, compatibility boundaries, and entry points are defined by
   session and model choice are rolled back: the previous sign-in, stored
   default, and current route keep working together.
 
+- **A suspended Metask account says so** (follow-up to #527). The Metask
+  gateway refuses a suspended account with a 403 `account_suspended`, which
+  read as a rejected sign-in, with "sign in again" as the next step, which
+  cannot help. It now says the account is suspended and where to see to it.
+  `key_quota_exhausted` reads as a used-up quota, like `insufficient_balance`.
+
 - **`/login` signs in to Metask in the browser; `/logout` switches back to
   local configuration** (#485). `/login` alone now runs `metacodes login`'s
   browser sign-in, then asks for the API key, model and reasoning level in
