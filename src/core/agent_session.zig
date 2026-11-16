@@ -960,11 +960,65 @@ pub const SubmitInputError = error{
     InvalidSessionState,
 } || run_input.SubmitError;
 
+/// What `AgentSession.setRoute` moves a Session onto (issue #16, #445): the
+/// provider fields of `SessionConfig`, as one value, so a route is never
+/// half-applied. Borrowed for the call, which copies it.
+pub const Route = struct {
+    provider_kind: types.ProviderKind,
+    openai_protocol: types.OpenAIProtocol = .chat_completions,
+    /// Null keeps the historical `authorization: Bearer` bytes.
+    auth_scheme: ?AuthScheme = null,
+    /// Declared for `model`.
+    dialect: @import("../provider/vendor.zig").Declaration = .{},
+    /// The route's credential. Never journaled or logged.
+    api_key: []const u8,
+    /// The model id the route's requests carry.
+    model: []const u8,
+    base_url: ?[]const u8 = null,
+};
+
+const AuthScheme = @import("../provider/credential.zig").AuthScheme;
+
+/// An owned copy of `scheme` and the bytes it names (`freeAuthScheme`).
+fn dupeAuthScheme(allocator: std.mem.Allocator, scheme: ?AuthScheme) error{OutOfMemory}!?AuthScheme {
+    const value = scheme orelse return null;
+    return switch (value) {
+        .bearer => .bearer,
+        .api_key_header => |name| .{ .api_key_header = try allocator.dupe(u8, name) },
+        .signed_adapter => |name| .{ .signed_adapter = try allocator.dupe(u8, name) },
+        .custom_header => |custom| blk: {
+            const name = try allocator.dupe(u8, custom.name);
+            errdefer allocator.free(name);
+            break :blk .{ .custom_header = .{ .name = name, .value_prefix = try allocator.dupe(u8, custom.value_prefix) } };
+        },
+    };
+}
+
+fn freeAuthScheme(allocator: std.mem.Allocator, scheme: ?AuthScheme) void {
+    switch (scheme orelse return) {
+        .bearer => {},
+        .api_key_header, .signed_adapter => |name| allocator.free(name),
+        .custom_header => |custom| {
+            allocator.free(custom.name);
+            allocator.free(custom.value_prefix);
+        },
+    }
+}
+
 pub const ModelMutationError = error{
     SessionBusy,
     InvalidSessionState,
     InvalidModel,
     OutOfMemory,
+};
+
+/// `setRoute` refusals (issue #16, #445). Each leaves the Session on the
+/// route it had: provider, endpoint, credential, model and effort.
+pub const RouteMutationError = ModelMutationError || credential_cell.ValidationError || error{
+    /// The Session has a reasoning effort and the route's provider takes
+    /// none. Clearing it first (`setReasoningEffort(null)`) is the Host's
+    /// explicit choice; it is never dropped silently.
+    AgentEffortUnsupportedProvider,
 };
 
 /// `updateCredential` refusals (issue #336). `InvalidSessionState`: the
@@ -1535,8 +1589,9 @@ pub const AgentSession = struct {
     openai_protocol: types.OpenAIProtocol,
     /// Carried so a tool-scoped provider authenticates the way the session's
     /// own route does; a subagent sending bearer at an `x-api-key` endpoint has
-    /// the right key and the wrong header.
-    auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
+    /// the right key and the wrong header. Owned (`dupeAuthScheme`), so a
+    /// route `setRoute` took outlives the Host's copy.
+    auth_scheme: ?AuthScheme = null,
     /// Carried with `auth_scheme`: a tool-scoped provider writes the route's
     /// dialect. Declared for `model`; a model switch keeps only the route's part.
     dialect: @import("../provider/vendor.zig").Declaration = .{},
@@ -1736,6 +1791,8 @@ pub const AgentSession = struct {
         errdefer allocator.free(model);
         const base_url = if (config.base_url) |url| try allocator.dupe(u8, url) else null;
         errdefer if (base_url) |url| allocator.free(url);
+        const auth_scheme = try dupeAuthScheme(allocator, config.auth_scheme);
+        errdefer freeAuthScheme(allocator, auth_scheme);
         var prompt_profile = try prompt_sections.OwnedProfile.clone(allocator, config.prompt_profile);
         errdefer prompt_profile.deinit();
         var model_capabilities = try image_capability.Declarations.init(allocator, config.model_capabilities);
@@ -1760,7 +1817,7 @@ pub const AgentSession = struct {
             base_url,
             config.openai_protocol,
             runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = config.auth_scheme, .dialect = config.dialect, .limits = null, .capability_declarations = model_capabilities },
+            .{ .auth_scheme = auth_scheme, .dialect = config.dialect, .limits = null, .capability_declarations = model_capabilities },
         );
         errdefer owned_provider.deinit();
         if (config.reasoning_effort) |effort| try owned_provider.provider().setReasoningEffort(effort);
@@ -1808,7 +1865,7 @@ pub const AgentSession = struct {
             .model = model,
             .base_url = base_url,
             .openai_protocol = config.openai_protocol,
-            .auth_scheme = config.auth_scheme,
+            .auth_scheme = auth_scheme,
             .dialect = config.dialect,
             .model_capabilities = model_capabilities,
             .provider = owned_provider,
@@ -1918,6 +1975,7 @@ pub const AgentSession = struct {
         allocator.free(self.artifact_root);
         allocator.free(self.run_journal_root);
         if (self.base_url) |url| allocator.free(url);
+        freeAuthScheme(allocator, self.auth_scheme);
         allocator.free(self.model);
         // After every provider that read it: `provider` above, and each tool
         // provider, which lives within a Run.
@@ -2701,6 +2759,98 @@ pub const AgentSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (self.in_flight_provider_cancels != 0) self.provider_cancels_drained.wait(&self.mutex);
+    }
+
+    /// Move the Session onto another route (issue #16, #445), as the bundled
+    /// CLI binds a committed `/model` selection: provider kind, wire
+    /// protocol, authentication, dialect, endpoint, credential and model
+    /// change together at the idle mutation boundary, so no request is ever
+    /// sent on a mix of the old route and the new. Every request after this
+    /// returns (the Session's own, a tool's, a compaction's) goes to the new
+    /// endpoint with the new credential. The conversation, the Host's model
+    /// capability declarations and the reasoning effort carry over; an
+    /// effort the new provider cannot take is refused
+    /// (`AgentEffortUnsupportedProvider`). Every refusal, out of memory
+    /// included, leaves the previous route in force. The previous credential
+    /// is erased.
+    pub fn setRoute(self: *AgentSession, route: Route) RouteMutationError!void {
+        if (route.model.len == 0 or
+            !std.unicode.utf8ValidateSlice(route.model))
+            return error.InvalidModel;
+        try credential_cell.validate(route.api_key);
+
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        const effort = self.reasoning_effort;
+        self.mutex.unlock();
+        errdefer self.cancelMutation();
+
+        const model = try self.allocator.dupe(u8, route.model);
+        errdefer self.allocator.free(model);
+        const base_url = if (route.base_url) |url| try self.allocator.dupe(u8, url) else null;
+        errdefer if (base_url) |url| self.allocator.free(url);
+        const auth_scheme = try dupeAuthScheme(self.allocator, route.auth_scheme);
+        errdefer freeAuthScheme(self.allocator, auth_scheme);
+        var credential = try self.credential.prepare(route.api_key);
+        errdefer credential.discard();
+        // Reads the cell at each request, so it authenticates with the new
+        // credential once it is published below, and is not used before.
+        var provider = try provider_factory.makeProviderWithOptions(
+            self.allocator,
+            route.provider_kind,
+            .{ .replaceable = self.credential },
+            model,
+            base_url,
+            route.openai_protocol,
+            self.runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = auth_scheme, .dialect = route.dialect, .limits = null, .capability_declarations = self.model_capabilities },
+        );
+        errdefer provider.deinit();
+        if (effort) |value| provider.provider().setReasoningEffort(value) catch
+            return error.AgentEffortUnsupportedProvider;
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        const previous_provider = self.provider;
+        const previous_model = self.model;
+        const previous_base_url = self.base_url;
+        const previous_auth_scheme = self.auth_scheme;
+        self.provider = provider;
+        self.model = model;
+        self.base_url = base_url;
+        self.openai_protocol = route.openai_protocol;
+        self.auth_scheme = auth_scheme;
+        self.dialect = route.dialect;
+        // Lock order: `mutex`, then the credential's own.
+        _ = credential.publish();
+        self.mutex.unlock();
+
+        // Concrete clients borrow their model, endpoint and scheme bytes: the
+        // previous provider goes first. The mutation gate stays held until
+        // cleanup finishes, as in `setModel`.
+        previous_provider.deinit();
+        self.allocator.free(previous_model);
+        if (previous_base_url) |url| self.allocator.free(url);
+        freeAuthScheme(self.allocator, previous_auth_scheme);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
     }
 
     fn cancelMutation(self: *AgentSession) void {
@@ -3855,6 +4005,56 @@ test "AgentSession model mutation rolls back allocation failures" {
     try std.testing.expect(self.conversation.messages.items.ptr == original_message_ptr);
     try std.testing.expectEqualStrings("test-model", self.model);
     try std.testing.expect(!self.isPoisoned());
+}
+
+test "AgentSession route mutation moves provider, endpoint, scheme, credential and model together; a refusal changes none of them (#16)" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.setReasoningEffort(.high);
+
+    try std.testing.expectError(error.InvalidModel, self.setRoute(.{ .provider_kind = .openai, .api_key = "route-key", .model = "" }));
+    try std.testing.expectError(error.InvalidCredentialByte, self.setRoute(.{ .provider_kind = .openai, .api_key = "bad key", .model = "gpt-route" }));
+    // Gemini takes no effort: the Session's is never dropped to fit.
+    try std.testing.expectError(error.AgentEffortUnsupportedProvider, self.setRoute(.{ .provider_kind = .gemini, .api_key = "route-key", .model = "gemini-route" }));
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(types.ProviderKind.anthropic, self.provider.kind());
+    try std.testing.expectEqualStrings("test-model", self.model);
+    try std.testing.expect(self.base_url == null);
+    try std.testing.expect(self.auth_scheme == null);
+    try std.testing.expect(self.credential.matches("test-key"));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, .high), self.reasoning_effort);
+
+    // The caller's bytes are copied: overwritten after the call, the route
+    // stays as bound.
+    var header = "x-route-key".*;
+    var url = "http://127.0.0.1:9/v1".*;
+    try self.setRoute(.{
+        .provider_kind = .openai,
+        .openai_protocol = .responses,
+        .auth_scheme = .{ .api_key_header = &header },
+        .api_key = "route-key",
+        .model = "gpt-route",
+        .base_url = &url,
+    });
+    @memset(&header, 'x');
+    @memset(&url, 'x');
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(types.ProviderKind.openai, self.provider.kind());
+    try std.testing.expectEqual(types.OpenAIProtocol.responses, self.openai_protocol);
+    try std.testing.expectEqualStrings("gpt-route", self.model);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9/v1", self.base_url.?);
+    try std.testing.expectEqualStrings("x-route-key", self.auth_scheme.?.api_key_header);
+    try std.testing.expect(self.credential.matches("route-key"));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, .high), self.reasoning_effort);
+
+    self.state = .poisoned;
+    try std.testing.expectError(error.InvalidSessionState, self.setRoute(.{ .provider_kind = .anthropic, .api_key = "k", .model = "m" }));
+    self.state = .idle;
+    try std.testing.expectEqualStrings("gpt-route", self.model);
 }
 
 test "AgentSession owns initial imported permission rules" {

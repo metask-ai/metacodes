@@ -842,7 +842,7 @@ in one of five ways:
 
 | Class | Settings | How it changes |
 |---|---|---|
-| Idle-mutable | model, permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value. |
+| Idle-mutable | model, route (provider kind, endpoint, auth scheme, dialect, credential and model together), permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setRoute`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value. |
 | Live-replaceable | API key (the provider credential) | `updateCredential`, idle or during a Run, from any thread or from the Session's own callbacks; never `error.SessionBusy`, and refused only for a poisoned Session or an invalid candidate. Create and restore apply the same rule to `SessionConfig.api_key` (1 to 16 KiB of printable ASCII; `error.InvalidCredentialByte`, `error.EmptyCredential`, `error.CredentialTooLong`). The candidate is validated and copied before anything changes; a refusal keeps the previous credential. A request reads the credential when it is sent (once it holds its connection slot), so every request sent after the call returns uses the new credential, retries, tool providers built earlier and requests still waiting for a connection included; one already sent keeps the old one. See [Credential updates](AGENTCORE_BINARY_ABI.md#credential-updates). |
 | Runtime generation | built-in tool set, static and process plugins, provider dialects | `RuntimeHost.replace`. Sessions created afterwards use the new generation; existing Sessions stay on theirs. To move a Session, persist it and restore it with `createRestoredSession` on the new generation. |
 | Fixed at create | provider kind, OpenAI protocol, auth scheme, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
@@ -1185,7 +1185,7 @@ leaving every Host to rebuild them:
 - `HostedSession.submit` and `command` (`set_model`, `set_permission_mode`,
   `set_reasoning_effort`, `set_additional_directories`, `set_prompt_profile`,
   `update_permission_rules`, `compact`, `cancel_cron_job`,
-  `cancel_all_cron_jobs`) share one FIFO run by the Session's
+  `cancel_all_cron_jobs`, `set_route`) share one FIFO run by the Session's
   driver thread, so configuration changes apply between Runs in the order
   they were queued. Each command is answered by `command_result`. As the
   `--web`/`serve` config sink journals `/model`, `/mode`, `/effort` and
@@ -1198,6 +1198,24 @@ leaving every Host to rebuild them:
   (a directory taken away has no line). A refused command journals none.
   The permission mode is journaled by a config sink on the Session's
   permission context, so a mode set any other way is journaled too.
+- `command(.{ .set_route = route })` (issue #16, #445) moves the Session
+  onto a route the Host's provider control plane bound, as the CLI's
+  `/model` commit does (`App.bindCommittedSelection`). `Route.binding` is
+  what the Session sends with (`AgentSession.Route`: provider kind, OpenAI
+  protocol, auth scheme, dialect, credential, model, base URL); the rest
+  says who the route is (`provider_id`, `channel_id`, `protocol`,
+  `offer_id`, `credential_ref`, `scope`). `AgentSession.setRoute` swaps
+  them together while idle, so no request goes out on a mix of the two
+  routes, and keeps the conversation and the reasoning effort; an effort
+  the new provider cannot take is `error.AgentEffortUnsupportedProvider`,
+  never dropped. An accepted route is journaled as `config_changed`
+  `{"model":...}` (the route's model) and then `{"route":{...}}`, as the
+  CLI does, before its `command_result`; the credential is in neither. A
+  refused route (an invalid model or credential, a busy or poisoned
+  Session) changes nothing and journals no `config_changed`. Later
+  `set_model` names resolve for the new provider kind, and a teammate the
+  Session spawns afterwards runs on its route (`TeammateSpawn.lead_route`,
+  which `InheritLead` applies).
 - Every kernel event, host event (`user_message`, `run_done`,
   `command_result`, `message_rejected`, `session_poisoned`, `run_resumed`)
   and UI request lands in the Session's `journal` as a wire line;
