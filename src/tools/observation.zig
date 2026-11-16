@@ -598,10 +598,37 @@ pub const Event = union(enum) {
 pub const Sink = struct {
     ctx: *anyopaque,
     emitFn: *const fn (ctx: *anyopaque, event: Event) bool,
+    /// Optional plaintext tap, called once per dispatch right after its
+    /// `dispatch_finished` was accepted. Null for every serializing sink:
+    /// see `DispatchTap`.
+    tapFn: ?*const fn (ctx: *anyopaque, record: DispatchTap) void = null,
 
     pub fn emit(self: Sink, event: Event) bool {
         return self.emitFn(self.ctx, event);
     }
+
+    pub fn tap(self: Sink, record: DispatchTap) void {
+        if (self.tapFn) |f| f(self.ctx, record);
+    }
+};
+
+/// The plaintext of one finished dispatch, for an in-process consumer that
+/// must check what a tool actually ran rather than what a model says it ran
+/// (the teamwork reviewer's evidence check, `teamwork/reviewer.zig`). It is
+/// deliberately not an `Event`: journals serialize every event and keep only
+/// commitments, while this carries the raw input and result bytes. Every
+/// slice is borrowed for the duration of the call; the tap may run on a tool
+/// worker thread and must synchronize its own state. It cannot veto anything.
+pub const DispatchTap = struct {
+    id: []const u8,
+    dispatched_name: []const u8,
+    origin: Origin,
+    agent_depth: u8,
+    outcome: Outcome,
+    /// The input the tool implementation received.
+    input: []const u8,
+    /// The rendered result, when the tool produced one.
+    result: ?[]const u8,
 };
 
 pub const BeforeContent = union(BeforeState) {

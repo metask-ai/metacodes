@@ -46,6 +46,9 @@ pub const SeatLayer = struct {
 pub const Layer = struct {
     enabled: ?bool = null,
     budget_usd: ?f64 = null,
+    /// The host-pinned check the runtime re-runs to verify an approval
+    /// (#517); borrowed from the parse arena.
+    check_command: ?[]const u8 = null,
     seats: std.EnumArray(Role, SeatLayer) = .initFill(.{}),
 };
 
@@ -96,6 +99,29 @@ pub const ValidateError = error{
     WallclockWithoutWallclockOnly,
     /// `wallclock_seconds` of zero.
     InvalidWallclock,
+    /// `check_command` is blank, longer than `CheckCommand.max_len`, or
+    /// contains a NUL byte.
+    InvalidCheckCommand,
+    /// An external reviewer seat without `check_command`: its tool calls
+    /// cannot be observed, so without a pinned check the runtime could never
+    /// verify one of its approvals.
+    ExternalReviewerWithoutCheck,
+};
+
+/// The host-pinned check command (#517). The runtime runs exactly this
+/// string, in the workspace, through the sandboxed shell path; it never runs
+/// a command a model chose. Validated: not blank, at most `max_len` bytes,
+/// no NUL. Borrowed from the parse arena.
+pub const CheckCommand = struct {
+    pub const max_len = 1024;
+
+    text: []const u8,
+
+    pub fn init(text: []const u8) error{InvalidCheckCommand}!CheckCommand {
+        if (text.len > max_len or std.mem.indexOfScalar(u8, text, 0) != null or
+            std.mem.trim(u8, text, " \t\r\n").len == 0) return error.InvalidCheckCommand;
+        return .{ .text = text };
+    }
 };
 
 /// A validated configuration.
@@ -106,6 +132,9 @@ pub const Config = union(enum) {
     pub const Enabled = struct {
         /// Finite and > 0.
         budget_usd: f64,
+        /// Re-run by the runtime before an approval counts; required when
+        /// the reviewer seat is external.
+        check_command: ?CheckCommand = null,
         /// One spec per role; strings borrowed from the parse arenas.
         seats: std.EnumArray(Role, types.SeatSpec),
     };
@@ -138,6 +167,8 @@ pub fn parseValue(arena: std.mem.Allocator, value: std.json.Value, diag: ?*Diagn
             layer.enabled = item.bool;
         } else if (std.mem.eql(u8, key, "budget_usd")) {
             layer.budget_usd = numberOf(item) orelse return error.WrongType;
+        } else if (std.mem.eql(u8, key, "check_command")) {
+            layer.check_command = try arena.dupe(u8, try stringOf(item));
         } else if (std.mem.eql(u8, key, "seats")) {
             if (item != .object) return error.NotAnObject;
             var seats = item.object.iterator();
@@ -212,6 +243,7 @@ pub fn merge(lower: Layer, upper: Layer) Layer {
     var out = lower;
     if (upper.enabled) |v| out.enabled = v;
     if (upper.budget_usd) |v| out.budget_usd = v;
+    if (upper.check_command) |v| out.check_command = v;
     for (std.enums.values(Role)) |role| {
         out.seats.set(role, mergeSeat(lower.seats.get(role), upper.seats.get(role)));
     }
@@ -246,6 +278,13 @@ pub fn validate(layer: Layer, diag: ?*Diagnostic) ValidateError!Config {
         setDiag(diag, role, null);
         seats.set(role, try validateSeat(role, layer.seats.get(role), diag));
     }
+    setDiag(diag, null, "check_command");
+    const check_command: ?CheckCommand = if (layer.check_command) |text|
+        try CheckCommand.init(text)
+    else
+        null;
+    if (check_command == null and seats.get(.reviewer).harnessKind() != .metacodes)
+        return fail(diag, .reviewer, "check_command", error.ExternalReviewerWithoutCheck);
     setDiag(diag, null, "budget_usd");
     if (layer.budget_usd) |usd| {
         if (!std.math.isFinite(usd) or usd <= 0) return error.InvalidBudget;
@@ -256,7 +295,7 @@ pub fn validate(layer: Layer, diag: ?*Diagnostic) ValidateError!Config {
     }
     const budget_usd = layer.budget_usd orelse return error.BudgetMissing;
     setDiag(diag, null, null);
-    return .{ .enabled = .{ .budget_usd = budget_usd, .seats = seats } };
+    return .{ .enabled = .{ .budget_usd = budget_usd, .check_command = check_command, .seats = seats } };
 }
 
 fn validateSeat(role: Role, seat: SeatLayer, diag: ?*Diagnostic) ValidateError!types.SeatSpec {
@@ -339,7 +378,7 @@ test "config: defaults make every role a metacodes seat" {
 test "config: a full external configuration builds typed seat specs" {
     var arena = arenaFixture();
     defer arena.deinit();
-    const text = "{\"enabled\":true,\"budget_usd\":12.5,\"seats\":{" ++
+    const text = "{\"enabled\":true,\"budget_usd\":12.5,\"check_command\":\"zig build test\",\"seats\":{" ++
         "\"implementer\":{\"harness\":\"claude_code\",\"command\":\"" ++ abs_claude ++ "\",\"model\":\"m-1\",\"effort\":\"high\"}," ++
         "\"reviewer\":{\"harness\":\"claude_code\",\"command\":\"" ++ abs_claude ++ "\",\"budget_enforcement\":\"wallclock_only\",\"wallclock_seconds\":900}," ++
         "\"verifier\":{\"harness\":\"claude_code\",\"command\":\"" ++ abs_claude ++ "\",\"demote_only\":true}}}";
@@ -353,6 +392,39 @@ test "config: a full external configuration builds typed seat specs" {
     try testing.expectEqual(@as(u32, 900), seats.get(.reviewer).harness.claude_code.budget.wallclock_only.seconds);
     try testing.expect(seats.get(.verifier).harness.claude_code.demote_only);
     try testing.expectEqual(Harness.metacodes, seats.get(.manager).harnessKind());
+    try testing.expectEqualStrings("zig build test", config.enabled.check_command.?.text);
+}
+
+test "config: check_command is validated, merged, and required for an external reviewer" {
+    var arena = arenaFixture();
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.WrongType, parse(a, "{\"check_command\":\"\"}", null));
+    try testing.expectError(error.WrongType, parse(a, "{\"check_command\":7}", null));
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.InvalidCheckCommand, validate(try parse(a, "{\"check_command\":\"  \\n\"}", null), &diag));
+    try testing.expectEqualStrings("check_command", diag.field.?);
+    try testing.expectError(error.InvalidCheckCommand, load(a, "{\"check_command\":\"make\\u0000test\"}"));
+    const long = "{\"check_command\":\"" ++ "x" ** (CheckCommand.max_len + 1) ++ "\"}";
+    try testing.expectError(error.InvalidCheckCommand, load(a, long));
+    _ = try load(a, "{\"check_command\":\"" ++ "x" ** CheckCommand.max_len ++ "\"}");
+
+    // An external reviewer cannot be observed; without a pinned check its
+    // approvals could never be verified, so the configuration is refused.
+    const external_reviewer = "\"seats\":{\"reviewer\":{\"harness\":\"claude_code\",\"command\":\"" ++ abs_claude ++ "\"}}";
+    try testing.expectError(error.ExternalReviewerWithoutCheck, validate(try parse(a, "{" ++ external_reviewer ++ "}", null), &diag));
+    try testing.expectEqual(Role.reviewer, diag.role.?);
+    const ok = try load(a, "{\"enabled\":true,\"budget_usd\":1,\"check_command\":\"make check\"," ++ external_reviewer ++ "}");
+    try testing.expectEqualStrings("make check", ok.enabled.check_command.?.text);
+    // A metacodes reviewer needs none: its Bash calls are observed.
+    try testing.expect((try load(a, "{\"enabled\":true,\"budget_usd\":1}")).enabled.check_command == null);
+
+    // A higher layer's command wins; a layer without one keeps the lower one.
+    const global = try parse(a, "{\"check_command\":\"make check\"}", null);
+    const project = try parse(a, "{\"enabled\":true,\"budget_usd\":2,\"check_command\":\"zig build test\"}", null);
+    try testing.expectEqualStrings("zig build test", (try validate(merge(global, project), null)).enabled.check_command.?.text);
+    const cli = try parse(a, "{\"enabled\":true,\"budget_usd\":2}", null);
+    try testing.expectEqualStrings("make check", (try validate(merge(global, cli), null)).enabled.check_command.?.text);
 }
 
 test "config: parse rejects unknown fields, roles, harnesses and enumerations" {
