@@ -327,12 +327,17 @@ ledger.remainingUsd()`;`spec.model`/`spec.effort` 作为覆盖。用量经 `Writ
 |---|---|---|
 | 执行策略 | `Scope.executionPolicy()` 作为 `SpawnOptions.execution_policy`,agent_loop/tool_exec 在工具运行前最后一道检查,与权限模式、allow 规则无关 | 只提供该角色的工具(`toolsFor`:implementer = Read/Grep/Glob/Write/Edit/Bash;reviewer = `reviewer.tools` + Write;其余角色 = Read/Grep/Glob/Bash/Write);Write/Edit 的目标按工具自己的解析方式求出后**物理**落在写根内(符号链接解析,含尚不存在的尾部;悬空链接拒绝);写根 = seat 目录,implementer 另加工作区;Bash 必须只读或确实在沙箱内运行 |
 | 权限 | 宿主权限上下文派生:`acceptEdits`、工作目录集 = 工作区 + seat 目录、`no_interactive_prompt`、无 UI 请求器、无会话记忆、无 memdir 豁免 | 需要询问的一律拒绝;宿主 deny 规则、settings、hooks 照样生效 |
-| 沙箱 | `seatSandbox`:有后端(macOS Seatbelt)时强制开启、`failIfUnavailable`、不可绕过(`allowUnsandboxedCommands = false`),丢弃宿主的 `allowWrite` 与 `excludedCommands` | Bash 只能写工作区、seat 目录和临时目录 |
+| 沙箱 | `seatSandbox`:有后端(macOS Seatbelt;Linux bubblewrap,`sandbox/bwrap.zig`)时强制开启、`failIfUnavailable`、不可绕过(`allowUnsandboxedCommands = false`),丢弃宿主的 `allowWrite` 与 `excludedCommands` | Bash 只能写工作区、seat 目录和临时目录 |
 
-**未强制的部分**:Linux/Windows 没有沙箱后端,seat 的 Bash 只放行只读命令(`bash_readonly`),
-所以那里的 metacodes seat 跑不了构建或测试(reviewer 的钉住检查由 runtime 自己重跑,§6.2)。
-macOS 的 Seatbelt 配置总允许写工作区(构建缓存)和临时目录,所以对非 implementer seat,Bash
-挡不住对工作区的改动;reviewer 由工作区树 id 检查兜底。
+Linux 上 implementer seat 的 Bash 跑在 bubblewrap 里:根目录只读挂载,只把工作区、seat 目录、
+临时目录(`/tmp`、`/var/tmp`、`$TMPDIR`)按物理路径可写绑定,所以能在工作区里构建、跑测试,写不到别处
+(符号链接改变不了挂载)。
+
+**未强制的部分**:Windows,以及没有可用 bwrap(未安装、或内核/容器不允许非特权 user namespace,
+探测失败)的 Linux 没有沙箱后端,seat 的 Bash 只放行只读命令(`bash_readonly`),所以那里的
+metacodes seat 跑不了构建或测试(reviewer 的钉住检查由 runtime 自己重跑,§6.2)。两个后端都总允许
+写工作区(构建缓存)和临时目录,所以对非 implementer seat,Bash 挡不住对工作区的改动;reviewer 由
+工作区树 id 检查兜底。
 
 ### 7.4 Claude Code 驱动
 
@@ -359,9 +364,12 @@ macOS 的 Seatbelt 配置总允许写工作区(构建缓存)和临时目录,所�
   Code 用它自己的登录。stdin 立即关闭,stderr 写入 `harness.log`。
 - **进程组**:子进程自成进程组。中止、硬超时、wallclock 预算到时整组 SIGTERM→SIGKILL;正常退出
   后也清扫一次整组,不留后代进程。Windows 只杀 CLI 本身。
-- **沙箱**:macOS 上整条命令经 `sandbox/exec.zig` 包进 Seatbelt,可写根 = 工作区、seat 目录、
-  临时目录和 Claude Code 自己的状态(`~/.claude`、`~/.claude.json*`)。**其他平台没有后端,CLI
-  不受限运行**,写入只靠 Claude Code 自己的权限模式。真实 CLI 在该配置下的运行尚未用真模型验证。
+- **沙箱**:整条命令经 `sandbox/exec.zig` 包进宿主的后端(macOS Seatbelt,Linux bubblewrap),
+  可写根 = 工作区、seat 目录、临时目录和 Claude Code 自己的状态(`~/.claude`、`~/.claude.json*`;
+  bwrap 只能绑定启动时已存在的条目)。网络保持开放(CLI 要连它的 API)。bwrap 下 CLI 被信号 N
+  杀死表现为 bwrap 退出码 128+N,驱动换算回信号(`WrappedCommand.childExitCode`)。**没有后端的
+  平台(Windows、没有可用 bwrap 的 Linux),CLI 不受限运行**,写入只靠 Claude Code 自己的权限模式。
+  真实 CLI 在该配置下的运行尚未用真模型验证。
 - **结果**:stdout 只解析最后一个 `result` 事件(`subtype`、`total_cost_usd`),不解析对话。
   `cost` seat 以 `harness_reported` 记报告的花费(没有结果事件,如被杀,则记 `wallclock_only`);
   `wallclock_only` seat 记 wallclock。
@@ -405,9 +413,9 @@ macOS 的 Seatbelt 配置总允许写工作区(构建缓存)和临时目录,所�
 | #516 | 独立 verifier / 完成审计 | 待做 |
 | #517 | reviewer 角色与 open-issues 台账 | 已做(§6):宪章与工具表、`review.json` 解析、观测比对(`BashCallLog`)、钉住检查重跑(`check_command`)、零修改与过期批准(树 id)、台账与跨轮 packet。metacodes 驱动已接 `charters.forRole(.reviewer)` 与可选 `tool_observer`(§7.2)。待做:编排器把 `BashCallLog` 插上并再开一轮;流式预取的只读 Bash 以 `speculative_prefetch` 来源分派,`BashCallLog` 不记录它们;Windows 上 `workspaceTree` 返回 `Unsupported`,批准无法确认 |
 | #518 | `/teamwork` 命令、面试与批准 | 待做(含配置接线,§3) |
-| #519 | 运行状态目录与写入隔离 | 已做:目录布局、只写一次的原始请求、seat 状态、崩溃恢复;metacodes seat 的写入隔离(执行策略 + 权限 + 沙箱)及 L2;bootstrap/宪章不含运行路径的 L2 断言(§7.3)。未强制:无沙箱后端的平台上 Claude Code seat 不受限运行;Linux 上 metacodes seat 只能跑只读 Bash |
+| #519 | 运行状态目录与写入隔离 | 已做:目录布局、只写一次的原始请求、seat 状态、崩溃恢复;metacodes seat 的写入隔离(执行策略 + 权限 + 沙箱)及 L2;bootstrap/宪章不含运行路径的 L2 断言(§7.3)。Linux 上 seat 的 Bash 与 Claude Code CLI 经 bubblewrap 受限运行(L2:implementer seat 在工作区构建、写不出去)。未强制:无沙箱后端的平台(Windows、没有可用 bwrap 的 Linux)上 Claude Code seat 不受限运行、metacodes seat 只能跑只读 Bash |
 | #520 | 运行级预算 | 已做:账本、上限、崩溃安全重载;`cost_budget_usd` 与 `--max-budget-usd` 取剩余预算;metacodes 估算与 Claude Code 自报花费入账、wallclock_only 计时(§7)。待做:runtime 在 `isExhausted()` 时停止所有 seat |
-| #521 | Claude Code 作为 worker | 已做(§7.4):钉住的 argv 与版本/参数探测、环境白名单、进程组、macOS 沙箱、结果事件记账、失败映射及 L2(假 CLI)。待做:真实 CLI 的手动 e2e job(需预算上限,不进默认 gate) |
+| #521 | Claude Code 作为 worker | 已做(§7.4):钉住的 argv 与版本/参数探测、环境白名单、进程组、macOS Seatbelt / Linux bubblewrap 沙箱、结果事件记账、失败映射及 L2(假 CLI)。待做:真实 CLI 的手动 e2e job(需预算上限,不进默认 gate) |
 | #522 | Claude Code 作为 Manager(MCP) | 待做 |
 | #523 | worktree 合回 | 待做 |
 | #524 | 进度面板与 AgentCore 事件 | 待做 |

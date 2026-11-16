@@ -71,6 +71,14 @@ pub fn codexHomeEnv() ?[]const u8 {
     return envNonEmpty("CODEX_HOME");
 }
 
+/// `METACODES_BWRAP`: the bubblewrap executable the Linux sandbox uses
+/// instead of `/usr/bin/bwrap` / `/bin/bwrap` (sandbox/bwrap.zig); empty =
+/// unset. Linux only: no other platform has the backend.
+pub fn bwrapEnv() ?[]const u8 {
+    if (builtin.os.tag != .linux) return null;
+    return envNonEmpty("METACODES_BWRAP");
+}
+
 /// The variable the launcher `metacodes install` writes sets to its own path
 /// (`$0`) before it execs the installed executable (app/install.zig
 /// `launcherBody`), so messages can name the command the user ran (#482).

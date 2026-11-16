@@ -518,7 +518,8 @@ pub const ToolContext = struct {
     project_dir: []const u8 = "",
     /// 全局 disable-shell-execution 开关(settings.json `disableSkillShellExecution`)。
     disable_shell_execution: bool = false,
-    /// Sandbox 配置(macOS Seatbelt)。非 null 且 enabled 时,Bash 命令包进 sandbox-exec。
+    /// Sandbox 配置。非 null 且 enabled 时,Bash 命令包进平台沙箱(macOS sandbox-exec /
+    /// Linux bwrap,sandbox/exec.zig)。
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     /// 当前 cwd 绝对路径(sandbox profile 工作目录写权限)。空 = 用 process cwd。
     cwd_abs: []const u8 = "",

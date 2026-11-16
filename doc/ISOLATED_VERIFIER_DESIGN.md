@@ -187,12 +187,14 @@ host enforces the boundary in three layers:
    - The verifier has no file-writing tool.
    - Its only write vector is `Bash`, whose working directory is the snapshot.
    - Its git commands operate on a repository whose refs are not the actor's.
-2. **Prevention by sandbox, where available.** On macOS the verifier's `Bash`
-   runs under a derived `SandboxSettings`: `allowWrite` covers the snapshot and
-   a temporary directory, and `denyWrite` covers the actor's root.
-   `sandbox/exec.zig` has only a Seatbelt backend, and Linux bubblewrap is not
-   implemented. On Linux and Windows, layer 2 is absent, and the design does
-   not claim prevention there.
+2. **Prevention by sandbox, where available.** On macOS and Linux the
+   verifier's `Bash` runs under a derived `SandboxSettings`: `allowWrite`
+   covers the snapshot and a temporary directory, and `denyWrite` covers the
+   actor's root. `sandbox/exec.zig` confines it with Seatbelt on macOS and
+   with bubblewrap on Linux (`sandbox/bwrap.zig`, when a bwrap that can
+   create user namespaces is installed). On Windows, and on a Linux host
+   without a usable bwrap, layer 2 is absent, and the design does not claim
+   prevention there.
 3. **Detection, on every platform.**
    - After the verifier returns (and after a leads round, §6), the host
      recomputes the tree id **T′** of the actor's workspace the same way.
@@ -608,8 +610,10 @@ What remains:
 
 - An injection aiming for **FAIL** can force continuations. That is a cost
   attack, bounded by `max_continuations` and `MAX_VERIFIER_BOUNDARIES`.
-- On hosts without Seatbelt, a probe's `Bash` keeps the network access the
-  actor's `Bash` has.
+- A probe's `Bash` keeps the network access the actor's `Bash` has: neither
+  sandbox backend restricts the network by default (bubblewrap removes it
+  only when the settings carry a domain list), and a host without a backend
+  restricts nothing.
 - A candidate can instruct the verifier to write outside the snapshot. Any
   write that changes T′ is detected (§2.4), and writes to ignored files are
   not.

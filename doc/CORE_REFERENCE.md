@@ -88,7 +88,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 | `transcript` | 对话持久化(JSONL per-turn)+ 重建 | `Writer`, `loadTranscript`, `sessionDir` |
 | `session_id` | session 身份值类型(多 session 基石) | `SessionId`, `.single`, `gen()` |
 | `permission*` | 权限决策链(模式 + 规则 + 沙箱 + UI 请求) | `PermissionContext`, decision/settings/session_rules |
-| `agents` / `skills` / `mcp` / `sandbox` | subagent 定义 / Skill / MCP 客户端 / Seatbelt 沙箱 | `AgentSet`, `SkillSet`, `mcp_client`, `sandbox_config` |
+| `agents` / `skills` / `mcp` / `sandbox` | subagent 定义 / Skill / MCP 客户端 / Seatbelt / bubblewrap 沙箱 | `AgentSet`, `SkillSet`, `mcp_client`, `sandbox_config` |
 | registries | task/job/agent_job/cron 的运行时态 | `TaskStore`, `JobRegistry`, `AgentJobRegistry`, `CronRegistry` |
 | `client` / `api/stream` | Anthropic HTTP + SSE 流式 + 重试 | `Client.init(WithBaseUrl)`, `sendMessageStreamFull`, `UsageDelta` |
 | 参考 backend | 库自带非-UI 前端(可直接用或当模板) | `WriterBackend`(打印型), `HeadlessBackend`(CoreEvent→JSON) |

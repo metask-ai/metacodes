@@ -1,43 +1,72 @@
-//! 把 Bash 命令包进 macOS Seatbelt 沙箱。
+//! 把 Bash 命令包进平台沙箱:macOS Seatbelt,Linux bubblewrap。
 //!
-//! 入口:wrapCommand(alloc, cmd, opts) → ?WrappedCommand
-//!   返回 null = 不沙箱(disabled / 平台不支持 / excludedCommand / 逃生口)
-//!   返回 WrappedCommand = 用 sandbox-exec 包裹后的 argv + profile 临时文件路径
+//! 入口:wrapCommand(alloc, cmd, opts) → WrapResult
+//!   .passthrough = 不沙箱(disabled / 平台不支持 / excludedCommand / 逃生口)
+//!   .unavailable = 本机无可用后端且 failIfUnavailable
+//!   .wrapped     = 包裹后的 argv(Seatbelt 另带 profile 临时文件路径)
 //!
-//! sandbox-exec 调用形式:
-//!   sandbox-exec -f <profile_file> /bin/bash -c "<cmd>"
-//! (用 -f 文件而非 -p inline,避免超长 profile 命令行截断)
-//!
-//! 只在 macOS 生效(builtin.os.tag == .macos)。其它平台返回 null(暂不实现 bubblewrap)。
+//! 后端(`Backend`,按平台二选一,同一份 SandboxSettings):
+//!   macOS:  /usr/bin/sandbox-exec -f <profile_file> /bin/bash -c "<cmd>"
+//!           (用 -f 文件而非 -p inline,避免超长 profile 命令行截断;profile.zig)
+//!   Linux:  bwrap --ro-bind / / ... --bind <write roots> ... -- /bin/bash -c "<cmd>"
+//!           (挂载命名空间,无临时文件;bwrap.zig 有逐项映射表与定位/探测规则)
+//! Windows 等其它平台无后端:plan 给 passthrough / unavailable。
 
 const std = @import("std");
 const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
+const ppaths = @import("platform").paths;
 const builtin = @import("builtin");
 const profile_mod = @import("profile.zig");
+const bwrap_mod = @import("bwrap.zig");
 const config_mod = @import("config.zig");
 const util_json = @import("../util/json.zig");
+
+/// The sandbox implementation a host uses.
+pub const Backend = enum {
+    /// macOS `sandbox-exec` with a generated SBPL profile (profile.zig).
+    seatbelt,
+    /// Linux bubblewrap mount/pid/ipc(/net) namespaces (bwrap.zig).
+    bwrap,
+};
 
 pub const WrappedCommand = struct {
     /// argv(以 NUL 结尾的指针数组由 caller 构造;这里给 []const []const u8)
     argv: []const []const u8,
-    /// 临时 profile 文件路径(caller 在子进程结束后 unlink + free)
-    profile_path: []const u8,
+    /// Seatbelt 的临时 profile 文件路径(deinit 时 unlink + free);bwrap 无文件 = null。
+    profile_path: ?[]const u8,
+    backend: Backend,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *WrappedCommand) void {
-        // 删临时 profile 文件
-        var pz: [std.fs.max_path_bytes]u8 = undefined;
-        if (self.profile_path.len < pz.len) {
-            @memcpy(pz[0..self.profile_path.len], self.profile_path);
-            pz[self.profile_path.len] = 0;
-            pfs.unlinkPath(@ptrCast(&pz)) catch {};
+        if (self.profile_path) |p| {
+            unlinkProfile(p);
+            self.allocator.free(p);
         }
         for (self.argv) |a| self.allocator.free(a);
         self.allocator.free(self.argv);
-        self.allocator.free(self.profile_path);
+    }
+
+    /// The wrapped command's exit code in `platform.process` terms (negative
+    /// = killed by that signal). sandbox-exec execs the command, so its
+    /// status is the command's own; bwrap waits for it and exits 128+N when
+    /// it died of signal N, which is mapped back here.
+    pub fn childExitCode(self: *const WrappedCommand, code: i32) i32 {
+        return switch (self.backend) {
+            .seatbelt => code,
+            .bwrap => bwrap_mod.decodeExit(code),
+        };
     }
 };
+
+fn unlinkProfile(path: []const u8) void {
+    var pz: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len < pz.len) {
+        @memcpy(pz[0..path.len], path);
+        pz[path.len] = 0;
+        pfs.unlinkPath(@ptrCast(&pz)) catch {};
+    }
+}
 
 pub const WrapOptions = struct {
     cwd: []const u8,
@@ -61,7 +90,8 @@ pub const WrapResult = union(enum) {
 };
 
 /// What `wrapCommand` does with one command, decided before any I/O other
-/// than the sandbox-exec probe. The permission chain's
+/// than the backend probe (sandbox-exec present; bwrap located and able to
+/// build its namespaces, probed once per path). The permission chain's
 /// autoAllowBashIfSandboxed asks the same question: only `.sandboxed` earns
 /// the auto-allow, so a command that will run outside the sandbox (another
 /// platform, an excluded command, the escape hatch) is never auto-allowed
@@ -72,23 +102,42 @@ pub const Plan = enum {
     passthrough,
     /// No sandbox on this host and failIfUnavailable=true: refuse to run.
     unavailable,
-    /// Run inside the Seatbelt profile.
+    /// Run inside the host's sandbox backend.
     sandboxed,
 };
 
 pub fn plan(sb: *const config_mod.SandboxSettings, cmd: []const u8, disable_for_this_command: bool) Plan {
     // 1. 未启用 / 单次禁用 → passthrough
     if (!sb.enabled or disable_for_this_command) return .passthrough;
-    // 2. 非 macOS / sandbox-exec 不存在 → unavailable / passthrough(Linux bubblewrap 留待 C.2)
+    // 2. 本机无可用后端(非 macOS/Linux、sandbox-exec 不存在、bwrap 缺失或建不了命名空间)
+    //    → unavailable / passthrough
     if (!hostSupported()) return if (sb.fail_if_unavailable) .unavailable else .passthrough;
     // 3. excludedCommands:命令首 token 命中 → passthrough
     if (sb.isExcludedCommand(firstToken(cmd))) return .passthrough;
     return .sandboxed;
 }
 
-/// Seatbelt is the only backend: macOS with /usr/bin/sandbox-exec.
+/// Whether this host has a working sandbox backend: macOS with
+/// /usr/bin/sandbox-exec, or Linux with a bubblewrap that passed its probe.
 pub fn hostSupported() bool {
-    return builtin.os.tag == .macos and sandboxExecAvailable();
+    return hostBackend() != null;
+}
+
+/// The backend this host confines commands with, null when it has none.
+pub fn hostBackend() ?Backend {
+    return switch (builtin.os.tag) {
+        .macos => if (sandboxExecAvailable()) .seatbelt else null,
+        .linux => if (bwrap_mod.availability() == .available) .bwrap else null,
+        else => null,
+    };
+}
+
+/// The bwrap network policy for `sb`. Seatbelt leaves the network open
+/// (`(allow default)`), and so does bwrap by default. A domain list asks
+/// for per-host filtering, which needs a filtering proxy neither backend
+/// has; bwrap fails closed and gives the command no network at all.
+pub fn bwrapNetwork(sb: *const config_mod.SandboxSettings) bwrap_mod.Network {
+    return if (sb.allowed_domains.len > 0 or sb.denied_domains.len > 0) .isolated else .shared;
 }
 
 /// The Bash tool's per-call `dangerouslyDisableSandbox` escape hatch. It is
@@ -109,6 +158,28 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
         .passthrough => return .passthrough,
         .unavailable => return .unavailable,
         .sandboxed => {},
+    }
+
+    const backend = hostBackend() orelse return if (sb.fail_if_unavailable) .unavailable else .passthrough;
+    if (backend == .bwrap) {
+        var located_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const bwrap_path = switch (bwrap_mod.locate(&located_buf)) {
+            .path => |p| p,
+            // Gone between the probe and now: no backend after all.
+            .missing, .override_not_absolute => return if (sb.fail_if_unavailable) .unavailable else .passthrough,
+        };
+        const argv = try bwrap_mod.buildArgv(alloc, bwrap_path, bwrap_mod.shellPath(), .{
+            .cwd = opts.cwd,
+            .home = opts.home,
+            .allow_write = sb.allow_write,
+            .deny_write = sb.deny_write,
+            .deny_read = sb.deny_read,
+            .main_git_dir = opts.main_git_dir,
+            .additional_dirs = opts.additional_dirs,
+            .network = bwrapNetwork(sb),
+            .tmpdir = ppaths.tempDir(),
+        }, cmd);
+        return .{ .wrapped = .{ .argv = argv, .profile_path = null, .backend = .bwrap, .allocator = alloc } };
     }
 
     // 4. 生成 profile
@@ -152,6 +223,7 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
     return .{ .wrapped = .{
         .argv = try argv.toOwnedSlice(alloc),
         .profile_path = prof_path,
+        .backend = .seatbelt,
         .allocator = alloc,
     } };
 }
@@ -170,7 +242,9 @@ fn firstToken(cmd: []const u8) []const u8 {
 
 /// 字符串级包裹:返回可直接喂 `/bin/sh -c <ret.command>` 的命令串。
 ///
-/// 形式: /usr/bin/sandbox-exec -f '<profile>' /bin/bash -c '<original-cmd>'
+/// 形式: wrapCommand 的 argv 逐个单引号转义后以空格拼接,如
+///   '/usr/bin/sandbox-exec' '-f' '<profile>' '/bin/bash' '-c' '<original-cmd>'
+///   '/usr/bin/bwrap' '--ro-bind' '/' '/' ... '--' '/bin/bash' '-c' '<original-cmd>'
 /// 与 wrapCommand 不同:不返回 argv 而是 shell 串(单引号转义),
 /// 方便复用现有 job_registry / spawnBackground 的 `/bin/sh -c` 路径。
 ///
@@ -182,41 +256,49 @@ pub fn wrapAsShellString(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOp
         .passthrough => return null,
         .unavailable => return error.SandboxUnavailable,
         .wrapped => |wc| {
-            const w = wc;
-            const q_prof = try shellSingleQuote(alloc, w.profile_path);
-            defer alloc.free(q_prof);
-            const q_cmd = try shellSingleQuote(alloc, cmd);
-            defer alloc.free(q_cmd);
-            const shell = try std.fmt.allocPrint(alloc, "/usr/bin/sandbox-exec -f {s} /bin/bash -c {s}", .{ q_prof, q_cmd });
-            // 释放 argv 但保留 profile 文件(deinit 会 unlink,这里不调)
+            var w = wc;
+            const command = joinQuoted(alloc, w.argv) catch |e| {
+                w.deinit(); // unlinks the profile too
+                return e;
+            };
+            // 释放 argv 但保留 profile 文件(交给 ShellWrap 管)
             for (w.argv) |a| alloc.free(a);
             alloc.free(w.argv);
-            return ShellWrap{ .command = shell, .profile_path = w.profile_path, .allocator = alloc };
+            return ShellWrap{ .command = command, .profile_path = w.profile_path, .allocator = alloc };
         },
     }
 }
 
 pub const ShellWrap = struct {
     command: []const u8,
-    profile_path: []const u8,
+    /// Seatbelt 的 profile 文件;bwrap = null。
+    profile_path: ?[]const u8,
     allocator: std.mem.Allocator,
     /// detached:不删 profile 文件(后台作业场景——进程还在跑,profile 不能删)。
     detached: bool = false,
 
     /// 删 profile 文件 + free。前台命令执行完后调。
     pub fn deinit(self: *ShellWrap) void {
-        if (!self.detached) {
-            var pz: [std.fs.max_path_bytes]u8 = undefined;
-            if (self.profile_path.len < pz.len) {
-                @memcpy(pz[0..self.profile_path.len], self.profile_path);
-                pz[self.profile_path.len] = 0;
-                pfs.unlinkPath(@ptrCast(&pz)) catch {};
-            }
+        if (self.profile_path) |p| {
+            if (!self.detached) unlinkProfile(p);
+            self.allocator.free(p);
         }
         self.allocator.free(self.command);
-        self.allocator.free(self.profile_path);
     }
 };
+
+/// argv 逐个单引号转义、空格拼接成一条 shell 命令。caller free。
+fn joinQuoted(alloc: std.mem.Allocator, argv: []const []const u8) error{OutOfMemory}![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    for (argv, 0..) |arg, i| {
+        if (i > 0) try buf.append(alloc, ' ');
+        const quoted = try shellSingleQuote(alloc, arg);
+        defer alloc.free(quoted);
+        try buf.appendSlice(alloc, quoted);
+    }
+    return try buf.toOwnedSlice(alloc);
+}
 
 /// 单引号包裹 + 内部 ' 转义为 '\'',供 shell 安全嵌入。caller free。
 fn shellSingleQuote(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -336,7 +418,7 @@ test "wrapCommand: disabled → passthrough" {
 }
 
 test "wrapCommand: excluded command → passthrough" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!hostSupported()) return error.SkipZigTest;
     const sb = config_mod.SandboxSettings{
         .enabled = true,
         .excluded_commands = &.{"docker"},
@@ -355,15 +437,15 @@ test "wrapCommand: disable_for_this_command → passthrough" {
     try testing.expect(r == .passthrough);
 }
 
-test "wrapAsShellString: failIfUnavailable on non-macos → error.SandboxUnavailable" {
-    if (builtin.os.tag == .macos) return error.SkipZigTest; // macos 有 sandbox-exec,测不到 unavailable
+test "wrapAsShellString: failIfUnavailable without a backend → error.SandboxUnavailable" {
+    if (hostSupported()) return error.SkipZigTest; // 有后端测不到 unavailable(Linux 见 "bwrap L2: a bwrap that is missing...")
     const sb = config_mod.SandboxSettings{ .enabled = true, .fail_if_unavailable = true };
     const r = wrapAsShellString(testing.allocator, "ls", .{ .cwd = "/tmp", .sandbox = &sb });
     try testing.expectError(error.SandboxUnavailable, r);
 }
 
-test "wrapAsShellString: failIfUnavailable=false on non-macos → null passthrough" {
-    if (builtin.os.tag == .macos) return error.SkipZigTest;
+test "wrapAsShellString: failIfUnavailable=false without a backend → null passthrough" {
+    if (hostSupported()) return error.SkipZigTest;
     const sb = config_mod.SandboxSettings{ .enabled = true, .fail_if_unavailable = false };
     const r = try wrapAsShellString(testing.allocator, "ls", .{ .cwd = "/tmp", .sandbox = &sb });
     try testing.expect(r == null);
@@ -381,10 +463,12 @@ test "wrapCommand: enabled on macos → wrapped argv" {
     try testing.expectEqualStrings("/bin/bash", wc.argv[3]);
     try testing.expectEqualStrings("-c", wc.argv[4]);
     try testing.expectEqualStrings("echo hi", wc.argv[5]);
+    try testing.expectEqual(Backend.seatbelt, wc.backend);
     // profile 文件应已写入(用 std.c.access 检查存在)
+    const profile_path = wc.profile_path.?;
     var pz: [std.fs.max_path_bytes]u8 = undefined;
-    @memcpy(pz[0..wc.profile_path.len], wc.profile_path);
-    pz[wc.profile_path.len] = 0;
+    @memcpy(pz[0..profile_path.len], profile_path);
+    pz[profile_path.len] = 0;
     try testing.expect(pfs.exists(@ptrCast(&pz)));
 }
 
@@ -500,8 +584,7 @@ test "linkedWorktreeGitDir: a linked worktree names its common .git, a main chec
 }
 
 test "e2e: git commit in a linked worktree needs its common .git writable, and gets it" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
-    if (!sandboxExecAvailable()) return error.SkipZigTest;
+    if (!hostSupported()) return error.SkipZigTest; // Seatbelt or bwrap
     const alloc = testing.allocator;
     // Not under /tmp or $TMPDIR: the profile lets every command write there,
     // which would hide the main repository's .git being outside the worktree.
@@ -538,4 +621,275 @@ test "e2e: git commit in a linked worktree needs its common .git writable, and g
     const out = try runShell(alloc, w.command);
     defer alloc.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "COMMITTED") != null);
+}
+
+// ── bubblewrap L2 (Linux) ────────────────────────────────────────────────────
+// Each test runs real commands under the bwrap backend through `wrapCommand`
+// / `wrapAsShellString`, the paths the Bash tool, Monitor, the reviewer's
+// check runner and the Claude Code seat driver take. Skipped off Linux, and
+// on a Linux host whose bwrap cannot build a sandbox.
+
+fn requireBwrap() !void {
+    if (hostBackend() != .bwrap) return error.SkipZigTest;
+}
+
+const Ran = struct {
+    stdout: []u8,
+    stderr: []u8,
+    /// `childExitCode`: negative = killed by that signal.
+    code: i32,
+
+    fn deinit(self: Ran) void {
+        testing.allocator.free(self.stdout);
+        testing.allocator.free(self.stderr);
+    }
+
+    fn has(self: Ran, needle: []const u8) bool {
+        return std.mem.indexOf(u8, self.stdout, needle) != null;
+    }
+};
+
+/// Wrap `cmd` and run the argv directly (no outer shell), so the exit
+/// status is the wrapper's own.
+fn runWrapped(cmd: []const u8, opts: WrapOptions) !Ran {
+    const alloc = testing.allocator;
+    const r = try wrapCommand(alloc, cmd, opts);
+    if (r != .wrapped) return error.TestExpectedWrapped;
+    var wc = r.wrapped;
+    defer wc.deinit();
+    try testing.expectEqual(Backend.bwrap, wc.backend);
+    try testing.expect(wc.profile_path == null);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const argv = try arena.alloc(?[*:0]const u8, wc.argv.len + 1);
+    for (wc.argv, 0..) |a, i| argv[i] = (try arena.dupeZ(u8, a)).ptr;
+    argv[wc.argv.len] = null;
+    const out = try pprocess.capture(argv, alloc, .{ .timeout_ms = RUN_SHELL_TIMEOUT_MS });
+    return .{ .stdout = out.stdout, .stderr = out.stderr, .code = wc.childExitCode(out.exit_code) };
+}
+
+/// A scratch tree outside every temp root (`testing.tmpDir` lives in the
+/// build's cache directory), so only what the sandbox grants is writable.
+const Tree = struct {
+    tmp: std.testing.TmpDir,
+    root_buf: [std.fs.max_path_bytes]u8 = undefined,
+    root_len: usize = 0,
+    join_buf: [4][std.fs.max_path_bytes]u8 = undefined,
+    join_next: usize = 0,
+
+    fn init(self: *Tree) !void {
+        self.* = .{ .tmp = testing.tmpDir(.{}) };
+        self.root_len = try self.tmp.dir.realPath(testing.io, &self.root_buf);
+        try testing.expect(!std.mem.startsWith(u8, self.root(), "/tmp/"));
+    }
+
+    fn deinit(self: *Tree) void {
+        self.tmp.cleanup();
+    }
+
+    fn root(self: *const Tree) []const u8 {
+        return self.root_buf[0..self.root_len];
+    }
+
+    /// `<root>/<rel>`, valid until four more calls.
+    fn path(self: *Tree, rel: []const u8) [:0]const u8 {
+        const buf = &self.join_buf[self.join_next % self.join_buf.len];
+        self.join_next += 1;
+        return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ self.root(), rel }) catch unreachable;
+    }
+};
+
+test "bwrap L2: a command writes inside the workspace and nowhere outside it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // comptime: keeps the body off other targets
+    try requireBwrap();
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.tmp.dir.createDirPath(testing.io, "ws");
+    try t.tmp.dir.createDirPath(testing.io, "outside");
+    try t.tmp.dir.createDirPath(testing.io, "extra");
+
+    const sb = config_mod.SandboxSettings{ .enabled = true };
+    const cmd = try std.fmt.allocPrint(testing.allocator,
+        \\echo in > ok.txt && echo INSIDE_OK
+        \\(echo x > {s}) 2>/dev/null && echo OUTSIDE_BAD || echo OUTSIDE_BLOCKED
+        \\(echo x > {s}) 2>/dev/null && echo EXTRA_OK || echo EXTRA_BLOCKED
+        \\(echo x > /tmp/cc-zig-bwrap-tmp-$$ && rm /tmp/cc-zig-bwrap-tmp-$$) 2>/dev/null && echo TMP_OK || echo TMP_BLOCKED
+        \\(echo x > /etc/cc-zig-bwrap-etc) 2>/dev/null && echo ETC_BAD || echo ETC_BLOCKED
+    , .{ t.path("outside/bad.txt"), t.path("extra/in.txt") });
+    defer testing.allocator.free(cmd);
+    const extra = try testing.allocator.dupe(u8, t.path("extra"));
+    defer testing.allocator.free(extra);
+    const ran = try runWrapped(cmd, .{ .cwd = t.path("ws"), .home = "/nonexistent-home", .sandbox = &sb, .additional_dirs = &.{extra} });
+    defer ran.deinit();
+    errdefer std.debug.print("stdout={s}\nstderr={s}\n", .{ ran.stdout, ran.stderr });
+    for ([_][]const u8{ "INSIDE_OK", "OUTSIDE_BLOCKED", "EXTRA_OK", "TMP_OK", "ETC_BLOCKED" }) |want| try testing.expect(ran.has(want));
+    try testing.expect(pfs.exists(t.path("ws/ok.txt")));
+    try testing.expect(pfs.exists(t.path("extra/in.txt")));
+    try testing.expect(!pfs.exists(t.path("outside/bad.txt")));
+}
+
+test "bwrap L2: a symlink in the workspace pointing outside cannot carry a write out" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // comptime: keeps the body off other targets
+    try requireBwrap();
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.tmp.dir.createDirPath(testing.io, "ws");
+    try t.tmp.dir.createDirPath(testing.io, "outside");
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "outside/victim", .data = "original\n" });
+    if (std.c.symlink(t.path("outside"), t.path("ws/escape")) != 0) return error.SkipZigTest;
+    if (std.c.symlink(t.path("outside/victim"), t.path("ws/victim-link")) != 0) return error.SkipZigTest;
+    // A write root that is itself a link is bound at its target: the link
+    // names that directory, nothing wider.
+    if (std.c.symlink(t.path("ws"), t.path("ws-link")) != 0) return error.SkipZigTest;
+
+    const sb = config_mod.SandboxSettings{ .enabled = true };
+    const ran = try runWrapped(
+        \\(echo x > escape/new) 2>/dev/null && echo DIR_LINK_BAD || echo DIR_LINK_BLOCKED
+        \\(echo x > victim-link) 2>/dev/null && echo FILE_LINK_BAD || echo FILE_LINK_BLOCKED
+        \\(ln -s ../outside made && echo x > made/new2) 2>/dev/null && echo NEW_LINK_BAD || echo NEW_LINK_BLOCKED
+        \\(echo y > via-link.txt) && echo LINKED_ROOT_OK
+    , .{ .cwd = t.path("ws-link"), .sandbox = &sb });
+    defer ran.deinit();
+    errdefer std.debug.print("stdout={s}\nstderr={s}\n", .{ ran.stdout, ran.stderr });
+    for ([_][]const u8{ "DIR_LINK_BLOCKED", "FILE_LINK_BLOCKED", "NEW_LINK_BLOCKED", "LINKED_ROOT_OK" }) |want| try testing.expect(ran.has(want));
+    try testing.expect(!pfs.exists(t.path("outside/new")));
+    try testing.expect(!pfs.exists(t.path("outside/new2")));
+    try testing.expect(pfs.exists(t.path("ws/via-link.txt")));
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("original", readSmall(t.path("outside/victim"), &buf).?);
+}
+
+test "bwrap L2: denyRead hides a directory and a file; denyWrite protects an existing and a future path" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // comptime: keeps the body off other targets
+    try requireBwrap();
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.tmp.dir.createDirPath(testing.io, "home/.ssh");
+    try t.tmp.dir.createDirPath(testing.io, "ws/locked");
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "home/.ssh/id_test", .data = "SSH_SECRET_9c1\n" });
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "home/.netrc", .data = "NETRC_SECRET_4b2\n" });
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "home/visible", .data = "VISIBLE_7d3\n" });
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "ws/.env", .data = "ENV_ORIGINAL\n" });
+
+    const home = try testing.allocator.dupe(u8, t.path("home"));
+    defer testing.allocator.free(home);
+    const sb = config_mod.SandboxSettings{
+        .enabled = true,
+        .deny_read = &.{ "~/.ssh", "~/.netrc" },
+        .deny_write = &.{ ".env", "locked/not-yet/out.bin" },
+    };
+    const cmd = try std.fmt.allocPrint(testing.allocator,
+        \\cat {s}/.ssh/id_test 2>/dev/null; ls {s}/.ssh; cat {s}/.netrc 2>/dev/null; cat {s}/visible
+        \\(echo x > .env) 2>/dev/null && echo ENV_BAD || echo ENV_BLOCKED
+        \\(mkdir -p locked/not-yet && echo x > locked/not-yet/out.bin) 2>/dev/null && echo FUTURE_BAD || echo FUTURE_BLOCKED
+        \\(echo x > free.txt) && echo FREE_OK
+    , .{ home, home, home, home });
+    defer testing.allocator.free(cmd);
+    const ran = try runWrapped(cmd, .{ .cwd = t.path("ws"), .home = home, .sandbox = &sb });
+    defer ran.deinit();
+    errdefer std.debug.print("stdout={s}\nstderr={s}\n", .{ ran.stdout, ran.stderr });
+    try testing.expect(!ran.has("SSH_SECRET"));
+    try testing.expect(!ran.has("id_test"));
+    try testing.expect(!ran.has("NETRC_SECRET"));
+    try testing.expect(ran.has("VISIBLE_7d3"));
+    try testing.expect(ran.has("ENV_BLOCKED"));
+    try testing.expect(ran.has("FUTURE_BLOCKED"));
+    try testing.expect(ran.has("FREE_OK"));
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("ENV_ORIGINAL", readSmall(t.path("ws/.env"), &buf).?);
+    try testing.expect(!pfs.exists(t.path("ws/locked/not-yet/out.bin")));
+}
+
+test "bwrap L2: a domain list leaves the command no network; without one the host's stays" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // comptime: keeps the body off other targets
+    try requireBwrap();
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    const interfaces = "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | sort | tr '\\n' ,; echo";
+    const host_ifaces = try runShell(testing.allocator, interfaces);
+    defer testing.allocator.free(host_ifaces);
+
+    const allowed = [_][]const u8{"example.com"};
+    const closed = config_mod.SandboxSettings{ .enabled = true, .allowed_domains = &allowed };
+    try testing.expectEqual(bwrap_mod.Network.isolated, bwrapNetwork(&closed));
+    const cmd = interfaces ++ "\n(exec 3<>/dev/tcp/1.1.1.1/53) 2>/dev/null && echo NET_OPEN || echo NET_CLOSED";
+    const ran = try runWrapped(cmd, .{ .cwd = t.root(), .sandbox = &closed });
+    defer ran.deinit();
+    errdefer std.debug.print("stdout={s}\nstderr={s}\n", .{ ran.stdout, ran.stderr });
+    try testing.expect(std.mem.startsWith(u8, ran.stdout, "lo,\n"));
+    try testing.expect(ran.has("NET_CLOSED"));
+
+    const open = config_mod.SandboxSettings{ .enabled = true };
+    try testing.expectEqual(bwrap_mod.Network.shared, bwrapNetwork(&open));
+    const shared = try runWrapped(interfaces, .{ .cwd = t.root(), .sandbox = &open });
+    defer shared.deinit();
+    try testing.expectEqualStrings(host_ifaces, shared.stdout);
+}
+
+test "bwrap L2: the exit code and a killing signal pass through" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // comptime: keeps the body off other targets
+    try requireBwrap();
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    const sb = config_mod.SandboxSettings{ .enabled = true };
+    const cases = [_]struct { cmd: []const u8, code: i32 }{
+        .{ .cmd = "exit 0", .code = 0 },
+        .{ .cmd = "exit 7", .code = 7 },
+        .{ .cmd = "kill -TERM $$", .code = -15 },
+        .{ .cmd = "kill -KILL $$", .code = -9 },
+    };
+    for (cases) |case| {
+        const ran = try runWrapped(case.cmd, .{ .cwd = t.root(), .sandbox = &sb });
+        defer ran.deinit();
+        testing.expectEqual(case.code, ran.code) catch |err| {
+            std.debug.print("cmd={s} stderr={s}\n", .{ case.cmd, ran.stderr });
+            return err;
+        };
+    }
+    // Through the shell-string form the Bash tool runs, the code is the
+    // shell's: 128+N for a signal, as bash itself reports it.
+    var w = (try wrapAsShellString(testing.allocator, "exit 7", .{ .cwd = t.root(), .sandbox = &sb })).?;
+    defer w.deinit();
+    try testing.expect(w.profile_path == null);
+    const cmd_z = try testing.allocator.dupeZ(u8, w.command);
+    defer testing.allocator.free(cmd_z);
+    var argv = [_]?[*:0]const u8{ "/bin/sh", "-c", cmd_z.ptr, null };
+    const out = try pprocess.capture(&argv, testing.allocator, .{ .timeout_ms = RUN_SHELL_TIMEOUT_MS });
+    defer testing.allocator.free(out.stdout);
+    defer testing.allocator.free(out.stderr);
+    try testing.expectEqual(@as(i32, 7), out.exit_code);
+}
+
+test "bwrap L2: a bwrap that is missing, relative or cannot sandbox fails closed" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const saved: ?[:0]u8 = if (ppaths.bwrapEnv()) |v| try testing.allocator.dupeZ(u8, v) else null;
+    defer if (saved) |v| testing.allocator.free(v);
+    defer if (saved) |v| ppaths.setEnv("METACODES_BWRAP", v.ptr) else ppaths.unsetEnv("METACODES_BWRAP");
+
+    const strict = config_mod.SandboxSettings{ .enabled = true, .fail_if_unavailable = true };
+    const lax = config_mod.SandboxSettings{ .enabled = true };
+    const cases = [_]struct { value: [*:0]const u8, want: bwrap_mod.Availability }{
+        .{ .value = "/nonexistent-cc-zig/bwrap", .want = .missing },
+        .{ .value = "relative/bwrap", .want = .override_not_absolute },
+        // A real executable that is not bwrap: located, but the probe fails.
+        .{ .value = "/bin/false", .want = .probe_failed },
+    };
+    for (cases) |case| {
+        ppaths.setEnv("METACODES_BWRAP", case.value);
+        try testing.expectEqual(case.want, bwrap_mod.availability());
+        try testing.expect(!hostSupported());
+        try testing.expectEqual(Plan.unavailable, plan(&strict, "touch x", false));
+        try testing.expectError(error.SandboxUnavailable, wrapAsShellString(testing.allocator, "touch x", .{ .cwd = "/", .sandbox = &strict }));
+        const r = try wrapCommand(testing.allocator, "touch x", .{ .cwd = "/", .sandbox = &strict });
+        try testing.expect(r == .unavailable);
+        // failIfUnavailable=false runs it bare, and says so: not `.sandboxed`,
+        // so autoAllowBashIfSandboxed does not apply.
+        try testing.expectEqual(Plan.passthrough, plan(&lax, "touch x", false));
+    }
 }

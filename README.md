@@ -232,7 +232,7 @@ This is the research frontier of the project and an open invitation.
 - **Permissions.** Five modes; allow, ask and deny rules in the
   `Tool(specifier)` syntax Claude Code users know; protected paths (`.git`,
   `.env` files, `.ssh`, shell rc files and more) always ask.
-- **Sandbox.** An opt-in macOS Seatbelt sandbox. A Linux backend is wanted.
+- **Sandbox.** An opt-in Bash sandbox: Seatbelt on macOS, bubblewrap on Linux.
 - **Stall gate.** On by default in interactive sessions, it stops runs whose
   tool rounds keep returning nothing new.
 - **Observable output.** Every file change is an event with a bounded diff, and
@@ -314,7 +314,7 @@ ship for five targets with checksums.
 | TinyKG memory and task DAG | On by default in the CLI; not yet in AgentCore |
 | Lean project rules | Experimental; dormant until a project activates them |
 | Self-evolution, learning turn, check gate | Experimental, off by default |
-| Sandbox | macOS only, opt-in |
+| Sandbox | macOS (Seatbelt) and Linux (bubblewrap), opt-in |
 
 Milestones are tracked in [ROADMAP.md](ROADMAP.md) and launch readiness in
 [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md).
@@ -337,7 +337,8 @@ We want contributors, and the most useful work right now is:
   fixtures for real failures.
 - **Memory research.** A Markdown-memory or vector-RAG comparison arm against
   TinyKG.
-- **Platforms.** A Linux sandbox backend (bubblewrap or Landlock).
+- **Platforms.** A Windows sandbox backend, and per-host network filtering for
+  the sandbox.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) maps each area to a starting point and
 explains how changes get accepted. Read [AGENTS.md](AGENTS.md) before your
