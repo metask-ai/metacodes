@@ -1,7 +1,8 @@
 # metacodes Teamwork — 设计文档
 
-> 状态:阶段 0(共享类型、配置、运行目录、预算账本)与内置 reviewer(评审结果契约、证据核验、
-> open-issues 台账,§6)已落地于 `src/teamwork/`;runtime、驱动、命令入口尚未实现,见 §9。
+> 状态:阶段 0(共享类型、配置、运行目录、预算账本)、内置 reviewer(评审结果契约、证据核验、
+> open-issues 台账,§6)与 seat 驱动(metacodes 子 agent、Claude Code 子进程、写入隔离,§7)已落地于
+> `src/teamwork/`;runtime 编排与命令入口尚未实现,见 §10。
 > 来源:umbrella issue #514 及子 issue #515–#525。工作方式借鉴 Google Antigravity 的
 > `/teamwork` 预览功能(先批准再开跑、写的人不验、完成必须审计、状态全部落盘);本文与代码中的
 > 角色定义、契约和文字均为原创,未复制其任何提示词或文本。
@@ -65,8 +66,8 @@ pub const SeatOutcome = union(enum) { finished: Handoff, failed: SeatError, budg
 重复段 `DuplicateSection`;空段 `EmptySection`;其他二级标题 `UnknownSection`(标题区分大小写)。
 代码围栏内的 `##` 行是正文;第一个段之前的文字(如 `# Handoff` 标题)被忽略。
 
-`stub_driver.zig` 是仅供测试的驱动,按脚本扮演 harness;真实驱动(metacodes 子 agent、
-Claude Code 子进程)在后续分支(#515 余下部分、#521)实现。
+真实驱动是 `drivers/metacodes.zig`(进程内子 agent)与 `drivers/claude_code.zig`(外部 CLI
+子进程),见 §7;`stub_driver.zig` 是仅供测试的驱动,按脚本扮演 harness。
 
 ## 3. 配置
 
@@ -151,6 +152,7 @@ teamwork 段将在 `src/app/config.zig` 旁接入:读出 `teamwork` 成员后交
     status.json           runtime 写:{seat_id, role, harness, status}
     review.json           reviewer seat 写(§6.1)
     open_issues.json      runtime 写给本 seat 的台账只读副本(§6.3)
+    harness.log           Claude Code 驱动写:CLI 的 stderr 与兼容性诊断(§7.4)
 ```
 
 - `RunId` / `SeatId` 是互不相同的类型,字符集 `[a-z0-9][a-z0-9_-]*`(≤ 64 字节),直接当目录名,
@@ -168,9 +170,9 @@ teamwork 段将在 `src/app/config.zig` 旁接入:读出 `teamwork` 成员后交
 
 **缓存契约**:run id、时间戳和运行目录的绝对路径都不进入 metacodes 发给 provider 的字节。
 packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径(`seat_relative_original_request`
-= `../../ORIGINAL_REQUEST.md`、`seat_relative_open_issues`);packet 的绝对路径只出现在驱动启动
-seat 的参数里,不进入 Manager 的提示词。写入隔离(seat 只能写自己的目录)由权限层和沙箱在
-#519 余下部分保证,不靠提示词。
+= `../../ORIGINAL_REQUEST.md`、`seat_relative_open_issues`);seat 目录的绝对路径只作为环境事实
+交给 harness(§7.1),不进入宪章、bootstrap 或 Manager 的提示词。写入隔离(seat 只能写工作区和
+自己的 seat 目录)由执行策略、权限层和沙箱保证,不靠提示词(§7.3)。
 
 ## 5. 预算账本
 
@@ -189,7 +191,8 @@ seat 的参数里,不进入 Manager 的提示词。写入隔离(seat 只能写�
 - `Ledger.load` 从磁盘重新求和。最后一行没有换行符说明追加时崩溃:丢弃并把文件截断到最后一个
   完整行,保证下一次追加从新行开始;**完整行**解析失败则不是崩溃产物,返回 `CorruptLedger`
   (预算数据宁可停也不猜)。
-- `remainingUsd()` 将作为 metacodes seat 子 agent 的 `cost_budget_usd`(`src/core/subagent.zig`)。
+- `remainingUsd()` 是 metacodes seat 子 agent 的 `cost_budget_usd`(`src/core/subagent.zig`),也是
+  Claude Code seat 的 `--max-budget-usd`(§7)。
 - 账本只有 runtime 写,不是线程安全的,由 runtime 串行化。
 
 ## 6. 内置 reviewer 与 open-issues 台账(#517)
@@ -273,27 +276,138 @@ review_rejected: RejectReason`;`review_rejected` 由编排器再开一轮。顺�
 packet:原始请求的相对路径、钉住的检查命令、未解决问题、`review.json` 格式。因为每轮都从磁盘台账
 渲染,换了 reviewer seat 或 harness,上一轮没解决的问题照样出现在下一轮。
 
-## 7. 公共面
+## 7. seat 驱动(#515、#519、#520、#521)
+
+`src/teamwork/drivers/`。`factory.zig` 是唯一按 harness 分派的地方:
+
+```zig
+pub const Deps = struct { metacodes: metacodes.Deps, claude_code: claude_code.Options };
+pub const Driver = union(Harness) { metacodes: MetacodesDriver, claude_code: ClaudeCodeDriver,
+                                    pub fn driver(self: *Driver) SeatDriver };
+pub fn forSeat(spec: *const SeatSpec, deps: Deps, binding: common.Binding) Driver;
+// common.Binding = struct { ledger: *Ledger, seat: SeatId }
+```
+
+`spec` 来自校验过的 `config.Config`;一个 `Driver` 服务一个 seat,向 `binding` 的账本记这个 seat 的账。
+
+### 7.1 两种 harness 共用的部分
+
+- **bootstrap**(`common.bootstrap`):编译期常量,两种 harness 逐字节相同(metacodes 的首条用户
+  消息开头、Claude Code 的 `-p` 提示词)。它只用相对 seat 目录的文件名:读 `packet.md`,写
+  `handoff.md`(五段)。没有 run id、路径、时间戳。
+- **seat 目录在哪是环境事实,不是指令**:Claude Code 经 `--add-dir <seat 目录>` 得知(由它自己的
+  环境段告诉模型);metacodes 子 agent 经首条用户消息里 bootstrap 之后的 `<seat-environment>` 块
+  (工作区与 seat 目录的绝对路径)——与 Claude Code `--exclude-dynamic-system-prompt-sections`
+  把机器相关段放进首条用户消息同一做法。所以宪章(系统提示词)和 bootstrap 跨 seat、跨运行
+  逐字节稳定;含 run id 的 seat 目录路径只出现在环境块里。
+- **宪章**(`charters.forRole(role)`):interviewer、implementer、manager 为原创文本;reviewer 即
+  `reviewer.charter`(§6);verifier 是标明的占位,真正的宪章在 verifier 模块(#516)。
+  `charters.digest(role)` 是编译期 SHA-256,尚未写进 seat 记录(`status.json` 格式未改)。
+- **判定顺序**:中止 → `aborted`;预算停(子 agent 因 `cost_budget_usd` 停、Claude Code 报
+  `error_max_budget_usd`、wallclock_only seat 到时、账本写不进)→ `budget_exhausted`;硬超时 →
+  `failed.timed_out`;被信号杀 → `failed.signaled`;非零退出 → `failed.exited`;否则
+  `run_dir.collectHandoff` 按 handoff 判定。一笔钱只要花了就先记账再判定;记账让总额到顶时,
+  已完成的 handoff 照样返回,停不停所有 seat 由 runtime 看 `Ledger.isExhausted()` 决定。
+
+### 7.2 metacodes 驱动
+
+`MetacodesDriver.init(deps: metacodes.Deps, binding)`,`Deps` 显式给出 provider、Anthropic
+client(可空)、宿主工具定义、宿主权限上下文、宿主沙箱设置(可空)、home、state root、artifact
+root、session、`max_turns`。可选字段 `tool_observer` 接一个额外的工具观测 sink(reviewer seat 接
+`reviewer.BashCallLog.sink()`)。经 `subagent.spawnAgentSink` 运行:系统提示词 = 宪章;cwd =
+工作区且 `resolve_relative_paths = true`;额外目录 = seat 目录;`cost_budget_usd =
+ledger.remainingUsd()`;`spec.model`/`spec.effort` 作为覆盖。用量经 `WriterBackend` 的 usage
+累加器收集,结束后按模型单价折算,以 `provider_estimate` 入账。
+
+### 7.3 写入隔离(metacodes seat)
+
+`write_scope.zig`,三层各自成立:
+
+| 层 | 机制 | 管什么 |
+|---|---|---|
+| 执行策略 | `Scope.executionPolicy()` 作为 `SpawnOptions.execution_policy`,agent_loop/tool_exec 在工具运行前最后一道检查,与权限模式、allow 规则无关 | 只提供该角色的工具(`toolsFor`:implementer = Read/Grep/Glob/Write/Edit/Bash;reviewer = `reviewer.tools` + Write;其余角色 = Read/Grep/Glob/Bash/Write);Write/Edit 的目标按工具自己的解析方式求出后**物理**落在写根内(符号链接解析,含尚不存在的尾部;悬空链接拒绝);写根 = seat 目录,implementer 另加工作区;Bash 必须只读或确实在沙箱内运行 |
+| 权限 | 宿主权限上下文派生:`acceptEdits`、工作目录集 = 工作区 + seat 目录、`no_interactive_prompt`、无 UI 请求器、无会话记忆、无 memdir 豁免 | 需要询问的一律拒绝;宿主 deny 规则、settings、hooks 照样生效 |
+| 沙箱 | `seatSandbox`:有后端(macOS Seatbelt)时强制开启、`failIfUnavailable`、不可绕过(`allowUnsandboxedCommands = false`),丢弃宿主的 `allowWrite` 与 `excludedCommands` | Bash 只能写工作区、seat 目录和临时目录 |
+
+**未强制的部分**:Linux/Windows 没有沙箱后端,seat 的 Bash 只放行只读命令(`bash_readonly`),
+所以那里的 metacodes seat 跑不了构建或测试(reviewer 的钉住检查由 runtime 自己重跑,§6.2)。
+macOS 的 Seatbelt 配置总允许写工作区(构建缓存)和临时目录,所以对非 implementer seat,Bash
+挡不住对工作区的改动;reviewer 由工作区树 id 检查兜底。
+
+### 7.4 Claude Code 驱动
+
+`ClaudeCodeDriver.init(options: claude_code.Options, binding)`,`Options` = 运行时环境变量
+(`KEY=VALUE`,按白名单过滤)、home、可选硬超时 `timeout_ms`、探测超时、是否用沙箱。
+
+- **可执行文件**:只用配置里的绝对路径 `command`,从不查 `PATH`。
+- **兼容性探测**(每个驱动实例首次运行前):`--version` 必须是 `<x.y.z> (Claude Code)`,`--help`
+  必须列出所用的每个参数(`required_help_text`);不满足即 `failed.spawn_failed`,原因写进 seat
+  目录的 `harness.log` 并记日志。参数按 Claude Code 2.1.323(`pinned_version`)的 `--help` 写死:
+
+  ```
+  <command> -p <bootstrap> --output-format stream-json --verbose --add-dir <seat 目录>
+    --permission-mode acceptEdits --permission-prompts none --no-session-persistence
+    [--model <m>] [--effort <low|medium|high|xhigh|max>] [--max-budget-usd <剩余预算>]
+  ```
+
+  `acceptEdits` + `--permission-prompts none`:工作目录内的编辑自动接受,其余需要询问的一律拒绝
+  (与 teammate 的 fail-closed 一致)。`--add-dir` 接多个值,所以它后面紧跟另一个选项。
+  `effort` 的 `none`/`minimal` 映射为 `low`。`cost` seat 传 `--max-budget-usd`,`wallclock_only`
+  seat 不传。
+- **cwd** = 工作区;**环境变量**只传白名单(`env_allowlist`:HOME、PATH、语言、临时目录、XDG、
+  CA 证书、`CLAUDE_CONFIG_DIR` 等),任何 provider 密钥(含 `ANTHROPIC_API_KEY`)都不传;Claude
+  Code 用它自己的登录。stdin 立即关闭,stderr 写入 `harness.log`。
+- **进程组**:子进程自成进程组。中止、硬超时、wallclock 预算到时整组 SIGTERM→SIGKILL;正常退出
+  后也清扫一次整组,不留后代进程。Windows 只杀 CLI 本身。
+- **沙箱**:macOS 上整条命令经 `sandbox/exec.zig` 包进 Seatbelt,可写根 = 工作区、seat 目录、
+  临时目录和 Claude Code 自己的状态(`~/.claude`、`~/.claude.json*`)。**其他平台没有后端,CLI
+  不受限运行**,写入只靠 Claude Code 自己的权限模式。真实 CLI 在该配置下的运行尚未用真模型验证。
+- **结果**:stdout 只解析最后一个 `result` 事件(`subtype`、`total_cost_usd`),不解析对话。
+  `cost` seat 以 `harness_reported` 记报告的花费(没有结果事件,如被杀,则记 `wallclock_only`);
+  `wallclock_only` seat 记 wallclock。
+
+### 7.5 测试(L2)
+
+`drivers/drivers_test.zig`(POSIX;假 `claude` 是 `/bin/sh` 脚本,记录 argv、cwd、环境并输出
+预录的 stream-json;metacodes 侧用脚本化 provider 驱动真实的子 agent 循环和真实工具):
+
+- 同一角色先配 `metacodes` 再配 `claude_code`(经 `config.parse`/`validate`),工厂给出不同驱动:
+  前者不起子进程、以 `provider_estimate` 记账,后者起假 CLI,断言完整 argv、cwd = 工作区、
+  白名单环境(密钥不在)、$0.25 以 `harness_reported` 入账;同一份 packet 两边都得到 `finished`
+  且 handoff 各段相同。
+- 非零退出 → `failed.exited`、被 SIGKILL → `failed.signaled`、无 handoff → `failed.handoff_missing`、
+  CLI 自报预算停 → `budget_exhausted`、`--help` 缺参数 → `failed.spawn_failed`(`harness.log` 写明
+  缺哪个参数与钉住的版本)。
+- 硬超时 → `failed.timed_out`、wallclock 预算 → `budget_exhausted`、中止 → `aborted`;三种情况下
+  CLI 留下的孙进程都随进程组消失,花费以 `wallclock_only` 入账。
+- metacodes seat 写工作区/seat 目录之外(绝对路径、`../` 相对路径、`ORIGINAL_REQUEST.md`、别的
+  seat 的 handoff)全部被拒且磁盘上不存在;系统提示词恰为宪章;首条用户消息以 bootstrap 开头,
+  bootstrap 部分不含 run id 与状态路径。
+- metacodes reviewer seat:系统提示词为 `reviewer.charter`,外接观测 sink 收到 Bash 分派,Write/Edit
+  进不了工作区。
+
+## 8. 公共面
 
 `src/lib.zig` 导出 `teamwork_types`、`teamwork_config`、`teamwork_run_dir`、`teamwork_ledger`、
-`teamwork_issues`、`teamwork_reviewer`(与 swarm 子系统相同的方式);`stub_driver.zig` 只由测试引用。单元测试同时进入
+`teamwork_issues`、`teamwork_reviewer`、`teamwork_charters`、`teamwork_drivers`(`drivers/factory.zig`)
+(与 swarm 子系统相同的方式);`stub_driver.zig` 与 `drivers/drivers_test.zig` 只由测试引用。单元测试同时进入
 `zig build test:units`(`src/main.zig` 的测试根)与 `zig build test:lib`。
 
-## 8. 不做
+## 9. 不做
 
 锦标赛树、数学证明管线、文档评审路线、大规模角色组合(见 #514"不做")。
 
-## 9. 实现状态
+## 10. 实现状态
 
 | Issue | 内容 | 状态 |
 |---|---|---|
-| #515 | runtime / seat 分层、角色配置、worker 契约 | 本分支:类型、`SeatDriver` 接口、handoff 解析、配置 parse/merge/validate、测试用 stub 驱动。待做:真实 metacodes 驱动、接入配置加载、L2(改 harness 即改子进程) |
+| #515 | runtime / seat 分层、角色配置、worker 契约 | 已做:类型、`SeatDriver` 接口、handoff 解析、配置 parse/merge/validate、测试用 stub 驱动、metacodes 驱动、驱动工厂、角色宪章、L2(改 harness 即改子进程;同一 packet 两种 harness 结果同形)(§7)。待做:接入配置加载(§3)、runtime 编排 |
 | #516 | 独立 verifier / 完成审计 | 待做 |
-| #517 | reviewer 角色与 open-issues 台账 | 已做(§6):宪章与工具表、`review.json` 解析、观测比对(`BashCallLog`)、钉住检查重跑(`check_command`)、零修改与过期批准(树 id)、台账与跨轮 packet。待做:metacodes 驱动接上 `BashCallLog` 与 `charters.forRole(.reviewer)`、编排器的再开一轮;Windows 上 `workspaceTree` 返回 `Unsupported`,批准无法确认 |
+| #517 | reviewer 角色与 open-issues 台账 | 已做(§6):宪章与工具表、`review.json` 解析、观测比对(`BashCallLog`)、钉住检查重跑(`check_command`)、零修改与过期批准(树 id)、台账与跨轮 packet。metacodes 驱动已接 `charters.forRole(.reviewer)` 与可选 `tool_observer`(§7.2)。待做:编排器把 `BashCallLog` 插上并再开一轮;流式预取的只读 Bash 以 `speculative_prefetch` 来源分派,`BashCallLog` 不记录它们;Windows 上 `workspaceTree` 返回 `Unsupported`,批准无法确认 |
 | #518 | `/teamwork` 命令、面试与批准 | 待做(含配置接线,§3) |
-| #519 | 运行状态目录与写入隔离 | 本分支:目录布局、只写一次的原始请求、seat 状态、崩溃恢复。待做:权限层与沙箱的写入隔离、provider 字节不含运行路径的 L2 断言 |
-| #520 | 运行级预算 | 本分支:账本、上限、崩溃安全重载。待做:接 `cost_budget_usd`、停止所有 seat、外部 harness 花费采集 |
-| #521 | Claude Code 作为 worker | 待做 |
+| #519 | 运行状态目录与写入隔离 | 已做:目录布局、只写一次的原始请求、seat 状态、崩溃恢复;metacodes seat 的写入隔离(执行策略 + 权限 + 沙箱)及 L2;bootstrap/宪章不含运行路径的 L2 断言(§7.3)。未强制:无沙箱后端的平台上 Claude Code seat 不受限运行;Linux 上 metacodes seat 只能跑只读 Bash |
+| #520 | 运行级预算 | 已做:账本、上限、崩溃安全重载;`cost_budget_usd` 与 `--max-budget-usd` 取剩余预算;metacodes 估算与 Claude Code 自报花费入账、wallclock_only 计时(§7)。待做:runtime 在 `isExhausted()` 时停止所有 seat |
+| #521 | Claude Code 作为 worker | 已做(§7.4):钉住的 argv 与版本/参数探测、环境白名单、进程组、macOS 沙箱、结果事件记账、失败映射及 L2(假 CLI)。待做:真实 CLI 的手动 e2e job(需预算上限,不进默认 gate) |
 | #522 | Claude Code 作为 Manager(MCP) | 待做 |
 | #523 | worktree 合回 | 待做 |
 | #524 | 进度面板与 AgentCore 事件 | 待做 |

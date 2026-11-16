@@ -1,14 +1,16 @@
 //! Write isolation for a metacodes seat (#519), by mechanism: a seat may
-//! write inside its workspace and its own seat directory, nowhere else.
+//! write inside its workspace and its own seat directory, nowhere else; a
+//! seat whose role does not change code (every role but the implementer)
+//! may write its seat directory only.
 //!
 //! Three layers, each sufficient for the case it covers:
 //!
 //! 1. `Scope.executionPolicy()` is the seat's `ToolExecutionPolicy`, the final
 //!    layer agent_loop and tool_exec consult before a tool runs, independent
-//!    of the permission mode and of every allow rule. It offers only
-//!    `seat_tools`; a Write/Edit target must lie in the workspace or the seat
-//!    directory *physically* (symlinks resolved, also through a not-yet-
-//!    existing tail, and a dangling link is refused); a Bash command must be
+//!    of the permission mode and of every allow rule. It offers only the
+//!    role's tools (`toolsFor`); a Write/Edit target must lie in a write
+//!    root *physically* (symlinks resolved, also through a not-yet-existing
+//!    tail, and a dangling link is refused); a Bash command must be
 //!    read-only or run inside the seat sandbox.
 //! 2. The seat's permission context (metacodes.zig) runs in `acceptEdits`
 //!    with exactly those two roots as its working directories and no prompt
@@ -16,7 +18,9 @@
 //! 3. `seatSandbox` confines Bash: writes allowed only under the workspace,
 //!    the seat directory and the platform temp roots (Seatbelt profile). On a
 //!    host without a sandbox backend (Linux, Windows today) only read-only
-//!    Bash commands run.
+//!    Bash commands run. The profile always lets Bash write the workspace
+//!    (build caches), so for a non-implementer seat Bash is not a fence
+//!    against workspace edits; the reviewer's tree check is (reviewer.zig).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,23 +30,47 @@ const tool_context = @import("../../tools/context.zig");
 const bash_readonly = @import("../../permission/bash_readonly.zig");
 const sandbox_config = @import("../../sandbox/config.zig");
 const sandbox_exec = @import("../../sandbox/exec.zig");
+const types = @import("../types.zig");
+const reviewer = @import("../reviewer.zig");
 
 const PathBuf = [std.fs.max_path_bytes]u8;
 
-/// The tools a metacodes seat is offered. Anything else (Agent, MCP, Skills,
-/// web, KG writes, ApplyPatch, NotebookEdit) is neither advertised nor
-/// executable.
-pub const seat_tools = [_][]const u8{ "Read", "Grep", "Glob", "Write", "Edit", "Bash" };
+/// The implementer's tools.
+pub const implementer_tools = [_][]const u8{ "Read", "Grep", "Glob", "Write", "Edit", "Bash" };
+/// The reviewer's: `reviewer.tools` (read-only plus Bash for tests) and
+/// Write, confined to the seat directory, for `handoff.md` and `review.json`.
+pub const reviewer_tools = reviewer.tools ++ [_][]const u8{"Write"};
+/// Every other role's: read, run read-only or sandboxed commands, and write
+/// its own seat files.
+pub const planner_tools = [_][]const u8{ "Read", "Grep", "Glob", "Bash", "Write" };
 
-pub fn isSeatTool(name: []const u8) bool {
-    for (seat_tools) |tool| if (std.mem.eql(u8, tool, name)) return true;
+/// The tools a metacodes seat of `role` is offered. Anything else (Agent,
+/// MCP, Skills, web, KG writes, ApplyPatch, NotebookEdit) is neither
+/// advertised nor executable.
+pub fn toolsFor(role: types.Role) []const []const u8 {
+    return switch (role) {
+        .implementer => &implementer_tools,
+        .reviewer => &reviewer_tools,
+        .interviewer, .manager, .verifier => &planner_tools,
+    };
+}
+
+/// Only the implementer changes the workspace.
+pub fn writesWorkspace(role: types.Role) bool {
+    return role == .implementer;
+}
+
+fn contains(names: []const []const u8, name: []const u8) bool {
+    for (names) |tool| if (std.mem.eql(u8, tool, name)) return true;
     return false;
 }
 
 /// The seat's Bash sandbox: on whenever the host has a backend, never
 /// bypassed, and no extra write roots. The host's read restrictions and
 /// network lists carry over; its `allow_write` and `excluded_commands` do
-/// not (either would let a seat write outside its two roots).
+/// not (either would let a seat write outside its two roots). Without a
+/// backend it is off, so read-only commands still run, and the execution
+/// policy refuses every other command (`Scope.allows`).
 pub fn seatSandbox(host: ?*const sandbox_config.SandboxSettings) sandbox_config.SandboxSettings {
     var settings: sandbox_config.SandboxSettings = .{};
     if (host) |h| {
@@ -52,7 +80,7 @@ pub fn seatSandbox(host: ?*const sandbox_config.SandboxSettings) sandbox_config.
         settings.allowed_domains = h.allowed_domains;
         settings.denied_domains = h.denied_domains;
     }
-    settings.enabled = true;
+    settings.enabled = sandbox_exec.hostSupported();
     settings.fail_if_unavailable = true;
     settings.allow_unsandboxed_commands = false;
     settings.auto_allow_bash_if_sandboxed = true;
@@ -75,17 +103,28 @@ pub const Scope = struct {
     /// The workspace as the tools see it (relative paths resolve against it).
     workspace_logical: []const u8,
     sandbox: *const sandbox_config.SandboxSettings,
+    tools: []const []const u8,
+    /// Write/Edit may target the workspace (the implementer), not only the
+    /// seat directory.
+    workspace_writable: bool,
 
     /// Both roots must exist. `home` and `workspace` are borrowed for the
     /// scope's life, as is `sandbox`.
     pub fn init(
         self: *Scope,
+        role: types.Role,
         workspace_dir: []const u8,
         seat_dir: []const u8,
         home: []const u8,
         sandbox: *const sandbox_config.SandboxSettings,
     ) InitError!void {
-        self.* = .{ .home = home, .workspace_logical = workspace_dir, .sandbox = sandbox };
+        self.* = .{
+            .home = home,
+            .workspace_logical = workspace_dir,
+            .sandbox = sandbox,
+            .tools = toolsFor(role),
+            .workspace_writable = writesWorkspace(role),
+        };
         self.workspace_len = (try physicalRoot(&self.workspace_buf, workspace_dir)).len;
         self.seat_dir_len = (try physicalRoot(&self.seat_dir_buf, seat_dir)).len;
     }
@@ -108,14 +147,14 @@ pub const Scope = struct {
 
     /// Whether the seat may run tool `name` with `arguments_json`.
     pub fn allows(self: *const Scope, name: []const u8, arguments_json: []const u8) bool {
-        if (!isSeatTool(name)) return false;
+        if (!contains(self.tools, name)) return false;
         if (file_target.Tool.fromName(name)) |tool| return self.allowsFileWrite(tool, arguments_json);
         if (std.mem.eql(u8, name, "Bash")) return self.allowsBash(arguments_json);
         return true; // Read, Grep, Glob
     }
 
     /// The physical path a Write/Edit call targets, as the tool resolves it,
-    /// must lie in one of the two roots.
+    /// must lie in a write root.
     pub fn allowsFileWrite(self: *const Scope, tool: file_target.Tool, arguments_json: []const u8) bool {
         var scratch_buf: [2 * std.fs.max_path_bytes + 1024]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&scratch_buf);
@@ -127,11 +166,12 @@ pub const Scope = struct {
         return self.containsPhysical(target);
     }
 
-    /// Whether `path` (absolute, normalized) is physically inside a root.
+    /// Whether `path` (absolute, normalized) is physically inside a write root.
     pub fn containsPhysical(self: *const Scope, path: []const u8) bool {
         var buf: PathBuf = undefined;
         const physical = physicalTarget(&buf, path) orelse return false;
-        return within(self.workspace(), physical) or within(self.seatDir(), physical);
+        if (within(self.seatDir(), physical)) return true;
+        return self.workspace_writable and within(self.workspace(), physical);
     }
 
     fn allowsBash(self: *const Scope, arguments_json: []const u8) bool {
@@ -143,8 +183,8 @@ pub const Scope = struct {
     }
 
     fn allowsToolAdapter(raw: *const anyopaque, name: []const u8) bool {
-        _ = raw;
-        return isSeatTool(name);
+        const self: *const Scope = @ptrCast(@alignCast(raw));
+        return contains(self.tools, name);
     }
 
     fn allowsInvocationAdapter(raw: *const anyopaque, name: []const u8, arguments_json: []const u8) bool {
@@ -225,6 +265,7 @@ const Fixture = struct {
     join_buf: PathBuf = undefined,
     sandbox: sandbox_config.SandboxSettings = undefined,
     scope: Scope = undefined,
+    role: types.Role = .implementer,
 
     fn init(self: *Fixture, tag: []const u8) !void {
         self.root_len = util_fs.testing.uniqueDir(&self.root_buf, tag).len;
@@ -236,7 +277,7 @@ const Fixture = struct {
         self.ws_logical_len = ws.len;
         var seat_buf: PathBuf = undefined;
         const seat = try std.fmt.bufPrint(&seat_buf, "{s}/run/seats/implementer-1", .{self.root()});
-        try self.scope.init(self.ws_logical[0..self.ws_logical_len], seat, "/nonexistent-home", &self.sandbox);
+        try self.scope.init(self.role, self.ws_logical[0..self.ws_logical_len], seat, "/nonexistent-home", &self.sandbox);
     }
 
     fn root(self: *const Fixture) []const u8 {
@@ -335,9 +376,34 @@ test "write scope: seat sandbox drops host write widenings and escape hatches" {
         .deny_read = &deny_read,
     };
     const seat = seatSandbox(&host);
-    try testing.expect(seat.enabled and seat.fail_if_unavailable and !seat.allow_unsandboxed_commands);
+    try testing.expectEqual(sandbox_exec.hostSupported(), seat.enabled);
+    try testing.expect(seat.fail_if_unavailable and !seat.allow_unsandboxed_commands);
     try testing.expectEqual(@as(usize, 0), seat.allow_write.len);
     try testing.expectEqual(@as(usize, 0), seat.excluded_commands.len);
     try testing.expectEqual(@as(usize, 1), seat.deny_read.len);
-    try testing.expect(sandbox_exec.plan(&seat, "git commit -m x", false) != .passthrough);
+    const want: sandbox_exec.Plan = if (sandbox_exec.hostSupported()) .sandboxed else .passthrough;
+    try testing.expectEqual(want, sandbox_exec.plan(&seat, "git commit -m x", false));
+}
+
+test "write scope: a non-implementer seat writes only its seat directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    for ([_]types.Role{ .reviewer, .interviewer, .manager, .verifier }) |role| {
+        var fx: Fixture = .{ .role = role };
+        try fx.init("cc-zig-teamwork-scope-role");
+        defer fx.deinit();
+        var buf: [8192]u8 = undefined;
+        try testing.expect(fx.scope.allows("Write", fx.writeArgs(&buf, "run/seats/implementer-1/handoff.md", true)));
+        try testing.expect(!fx.scope.allows("Write", fx.writeArgs(&buf, "src/relative.zig", false)));
+        try testing.expect(!fx.scope.allows("Write", fx.writeArgs(&buf, "ws/new.zig", true)));
+        try testing.expect(!fx.scope.allows("Edit", "{\"file_path\":\"notes.md\",\"old_string\":\"a\",\"new_string\":\"b\"}"));
+        try testing.expect(fx.scope.allows("Bash", "{\"command\":\"ls\"}"));
+    }
+}
+
+test "write scope: the reviewer's tools are reviewer.tools plus Write" {
+    try testing.expectEqual(reviewer.tools.len + 1, toolsFor(.reviewer).len);
+    for (reviewer.tools) |tool| try testing.expect(contains(toolsFor(.reviewer), tool));
+    try testing.expect(contains(toolsFor(.reviewer), "Write"));
+    try testing.expect(!contains(toolsFor(.reviewer), "Edit"));
+    try testing.expect(contains(toolsFor(.implementer), "Edit"));
 }

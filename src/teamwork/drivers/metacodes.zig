@@ -29,6 +29,7 @@ const json_mod = @import("../../json.zig");
 const permission_mod = @import("../../permission.zig");
 const sandbox_config = @import("../../sandbox/config.zig");
 const writer_backend = @import("../../core/writer_backend.zig");
+const tool_context = @import("../../tools/context.zig");
 const usage_mod = @import("../../core/usage.zig");
 const SessionId = @import("../../core/session_id.zig").SessionId;
 const util_time = @import("../../util/time.zig");
@@ -39,8 +40,8 @@ pub const Deps = struct {
     provider: provider_mod.Provider,
     /// For Anthropic server tools; null for any other provider.
     anthropic_client: ?*client_mod.Client = null,
-    /// The host's tool definitions; the seat is offered only
-    /// `write_scope.seat_tools` among them.
+    /// The host's tool definitions; the seat is offered only its role's
+    /// tools among them (`write_scope.toolsFor`).
     tool_defs: []const json_mod.ToolDefinition,
     /// The host's permission context. The seat derives its own from it:
     /// deny rules, settings and hooks still apply; mode, working directories,
@@ -60,6 +61,10 @@ pub const Deps = struct {
 pub const MetacodesDriver = struct {
     deps: Deps,
     binding: common.Binding,
+    /// An extra observer of the seat's tool dispatches, borrowed for the
+    /// seat's run: a reviewer seat's `reviewer.BashCallLog.sink()`, so the
+    /// runtime can check the review's evidence against what really ran.
+    tool_observer: ?tool_context.ToolObservationSink = null,
 
     pub fn init(deps: Deps, binding: common.Binding) MetacodesDriver {
         return .{ .deps = deps, .binding = binding };
@@ -99,13 +104,13 @@ pub const MetacodesDriver = struct {
         const seat_dir = common.seatDir(paths);
         var seat_sandbox = write_scope.seatSandbox(self.deps.host_sandbox);
         var scope: write_scope.Scope = undefined;
-        scope.init(paths.workspace, seat_dir, self.deps.home_dir, &seat_sandbox) catch |err| {
+        scope.init(spec.role, paths.workspace, seat_dir, self.deps.home_dir, &seat_sandbox) catch |err| {
             log.warn("teamwork", "seat {s}: workspace or seat directory unusable: {s}", .{ self.binding.seat.slice(), @errorName(err) });
             return .{ .failed = .spawn_failed };
         };
         const policy = scope.executionPolicy();
 
-        const tool_defs = try seatToolDefs(gpa, self.deps.tool_defs);
+        const tool_defs = try seatToolDefs(gpa, self.deps.tool_defs, write_scope.toolsFor(spec.role));
         defer gpa.free(tool_defs);
 
         const additional_dirs = [_][]const u8{seat_dir};
@@ -137,6 +142,7 @@ pub const MetacodesDriver = struct {
                 .model_override = spec.model,
                 .reasoning_effort_override = spec.effort,
                 .execution_policy = policy,
+                .tool_observer = self.tool_observer,
                 .project_dir = paths.workspace,
                 .sandbox = &seat_sandbox,
                 .cwd_abs = paths.workspace,
@@ -174,13 +180,20 @@ pub const MetacodesDriver = struct {
     }
 };
 
-/// The host tool definitions the seat is offered, in host order. The slice
-/// is owned by `gpa`; the definitions are borrowed.
-pub fn seatToolDefs(gpa: std.mem.Allocator, host: []const json_mod.ToolDefinition) error{OutOfMemory}![]json_mod.ToolDefinition {
+/// The host tool definitions named in `names`, in host order. The slice is
+/// owned by `gpa`; the definitions are borrowed.
+pub fn seatToolDefs(
+    gpa: std.mem.Allocator,
+    host: []const json_mod.ToolDefinition,
+    names: []const []const u8,
+) error{OutOfMemory}![]json_mod.ToolDefinition {
     var out: std.ArrayList(json_mod.ToolDefinition) = .empty;
     errdefer out.deinit(gpa);
     for (host) |def| {
-        if (write_scope.isSeatTool(def.name)) try out.append(gpa, def);
+        for (names) |name| if (std.mem.eql(u8, name, def.name)) {
+            try out.append(gpa, def);
+            break;
+        };
     }
     return out.toOwnedSlice(gpa);
 }
@@ -234,7 +247,7 @@ test "metacodes driver: seat tool set is a filter of the host's, in order" {
         .{ .name = "Write", .description = "", .input_schema = .{} },
         .{ .name = "Bash", .description = "", .input_schema = .{} },
     };
-    const defs = try seatToolDefs(testing.allocator, &host);
+    const defs = try seatToolDefs(testing.allocator, &host, write_scope.toolsFor(.implementer));
     defer testing.allocator.free(defs);
     try testing.expectEqual(@as(usize, 3), defs.len);
     try testing.expectEqualStrings("Read", defs[0].name);
@@ -246,7 +259,7 @@ test "metacodes driver: seat permission refuses to prompt and keeps the seat's r
     var host = permission_mod.createContext(.bypass_permissions, testing.allocator);
     host.memdir_abs = "/home/u/.metacodes/memory";
     const dirs = [_][]const u8{"/state/teamwork/r1/seats/implementer-1"};
-    const sandbox = @import("write_scope.zig").seatSandbox(null);
+    const sandbox = write_scope.seatSandbox(null);
     const perm = seatPermission(&host, "/ws", "/home/u", &dirs, &sandbox);
     try testing.expectEqual(@import("../../types.zig").PermissionMode.accept_edits, perm.modeValue());
     try testing.expect(perm.no_interactive_prompt);

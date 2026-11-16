@@ -24,6 +24,8 @@ const app_types = @import("../../types.zig");
 const permission_mod = @import("../../permission.zig");
 const tools_mod = @import("../../tools.zig");
 const usage_mod = @import("../../core/usage.zig");
+const reviewer = @import("../reviewer.zig");
+const observation = @import("../../tools/observation.zig");
 const swarm_team = @import("../../swarm/team.zig");
 const util_fs = @import("../../util/fs.zig");
 const util_time = @import("../../util/time.zig");
@@ -55,10 +57,6 @@ const handoff_text =
     \\zig build test:units
     \\
 ;
-
-fn skipUnlessPosix() !void {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-}
 
 // ── fixture ─────────────────────────────────────────────────────────────────
 
@@ -529,7 +527,7 @@ fn expectSameHandoff(a: types.Handoff, b: types.Handoff) !void {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 test "teamwork drivers L2: switching a seat's harness in config switches the spawned child; same packet, same outcome shape" {
-    try skipUnlessPosix();
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // comptime: the rest is POSIX-only
     var fx: Fixture = undefined;
     try fx.init("cc-zig-teamwork-drivers-switch", 5);
     defer fx.deinit();
@@ -607,9 +605,9 @@ test "teamwork drivers L2: switching a seat's harness in config switches the spa
     const bootstrap_line = try std.fmt.bufPrint(&bootstrap_line_buf, "arg:{s}", .{common.bootstrap});
     std.mem.replaceScalar(u8, bootstrap_line, '\n', '|');
     const want_args = [_][]const u8{
-        fake.scriptPath(), "-p",                    bootstrap_line[4..], "--output-format", "stream-json",
-        "--verbose",       "--add-dir",             seat_dir,            "--permission-mode", "acceptEdits",
-        "--permission-prompts", "none",             "--no-session-persistence", "--max-budget-usd", budget_arg,
+        fake.scriptPath(),      "-p",        bootstrap_line[4..],        "--output-format",   "stream-json",
+        "--verbose",            "--add-dir", seat_dir,                   "--permission-mode", "acceptEdits",
+        "--permission-prompts", "none",      "--no-session-persistence", "--max-budget-usd",  budget_arg,
     };
     try testing.expect(recordHas(record, "argc:14")); // $0 is not in "$@"
     for (want_args[1..]) |arg| {
@@ -641,7 +639,7 @@ test "teamwork drivers L2: switching a seat's harness in config switches the spa
 }
 
 test "teamwork drivers L2: metacodes seat cannot write outside its workspace and seat dir; bootstrap bytes are fixed" {
-    try skipUnlessPosix();
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // comptime: the rest is POSIX-only
     var fx: Fixture = undefined;
     try fx.init("cc-zig-teamwork-drivers-isolation", 5);
     defer fx.deinit();
@@ -711,7 +709,7 @@ test "teamwork drivers L2: metacodes seat cannot write outside its workspace and
 }
 
 test "teamwork drivers L2: claude seat failures map to outcomes" {
-    try skipUnlessPosix();
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // comptime: the rest is POSIX-only
     const cases = [_]struct { scenario: Scenario, check: *const fn (types.SeatOutcome) anyerror!void }{
         .{ .scenario = .exit_nonzero, .check = struct {
             fn f(o: types.SeatOutcome) !void {
@@ -773,7 +771,7 @@ test "teamwork drivers L2: claude seat failures map to outcomes" {
 }
 
 test "teamwork drivers L2: claude seat timeout, wallclock budget and abort kill the whole group" {
-    try skipUnlessPosix();
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // comptime: the rest is POSIX-only
     const Mode = enum { timeout, wallclock, abort };
     for ([_]Mode{ .timeout, .wallclock, .abort }) |mode| {
         var fx: Fixture = undefined;
@@ -827,4 +825,83 @@ test "teamwork drivers L2: claude seat timeout, wallclock budget and abort kill 
         try testing.expect(std.mem.indexOf(u8, line, "\"source\":\"wallclock_only\"") != null);
         if (mode == .wallclock) try testing.expect(fx.ledger.wallclock_ms >= 1000);
     }
+}
+
+/// Records every Bash dispatch the seat's tool observer is tapped with.
+const TapRecorder = struct {
+    gpa: std.mem.Allocator,
+    mutex: @import("platform").sync.Mutex = .{},
+    bash_inputs: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *TapRecorder) void {
+        for (self.bash_inputs.items) |input| self.gpa.free(input);
+        self.bash_inputs.deinit(self.gpa);
+    }
+
+    fn sink(self: *TapRecorder) observation.Sink {
+        return .{ .ctx = self, .emitFn = emit, .tapFn = tap };
+    }
+
+    fn emit(_: *anyopaque, _: observation.Event) bool {
+        return true;
+    }
+
+    fn tap(ctx: *anyopaque, dispatch: observation.DispatchTap) void {
+        const self: *TapRecorder = @ptrCast(@alignCast(ctx));
+        if (!std.mem.eql(u8, dispatch.dispatched_name, "Bash")) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const copy = self.gpa.dupe(u8, dispatch.input) catch return;
+        self.bash_inputs.append(self.gpa, copy) catch self.gpa.free(copy);
+    }
+};
+
+test "teamwork drivers L2: a metacodes reviewer seat taps the plugged-in tool observer and cannot edit the workspace" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // comptime: the rest is POSIX-only
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-drivers-reviewer", 5);
+    defer fx.deinit();
+    var host: MetacodesHost = undefined;
+    try host.init();
+    defer host.deinit();
+    const seat = try fx.addSeat(.reviewer, 1, .metacodes);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const turns = [_][]const ScriptedProvider.Event{
+        &.{
+            .{ .tool = .{ .name = "Bash", .input = "{\"command\":\"ls\"}" } },
+            .{ .tool = .{ .name = "Write", .input = "{\"file_path\":\"src/fix.zig\",\"content\":\"reviewer edit\"}" } },
+            .{ .tool = .{ .name = "Edit", .input = "{\"file_path\":\"src/fix.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}" } },
+            .{ .tool = .{ .name = "Write", .input = try writeHandoffInput(arena, fx.paths(seat).handoff) } },
+        },
+        &.{.{ .text = "Reviewed." }},
+    };
+    var scripted: ScriptedProvider = .{ .allocator = testing.allocator, .turns = &turns };
+    defer scripted.deinit();
+
+    var recorder: TapRecorder = .{ .gpa = testing.allocator };
+    defer recorder.deinit();
+    var driver_impl = metacodes.MetacodesDriver.init(host.deps(scripted.provider(), &fx), fx.binding(seat));
+    driver_impl.tool_observer = recorder.sink();
+    // The reviewer's own log plugs into the same slot.
+    var calls = reviewer.BashCallLog.init(testing.allocator, null);
+    defer calls.deinit();
+    const log_slot: @TypeOf(driver_impl.tool_observer) = calls.sink();
+    _ = log_slot;
+
+    const spec: types.SeatSpec = .{ .role = .reviewer };
+    var abort = types.AbortSignal.init();
+    var outcome = try driver_impl.driver().run(testing.allocator, &spec, fx.paths(seat), &abort);
+    defer outcome.deinit(testing.allocator);
+
+    try testing.expect(outcome == .finished);
+    try testing.expectEqualStrings(reviewer.charter, scripted.first_system.?);
+    try testing.expectEqual(@as(usize, 1), recorder.bash_inputs.items.len);
+    try testing.expect(std.mem.indexOf(u8, recorder.bash_inputs.items[0], "\"ls\"") != null);
+    // A reviewer's Write/Edit cannot reach the workspace.
+    var edit_buf: PathBuf = undefined;
+    try testing.expect(!pfs.exists(try std.fmt.bufPrintZ(&edit_buf, "{s}/src/fix.zig", .{fx.workspace()})));
+    try testing.expect(std.mem.indexOf(u8, scripted.tool_results.items, "outside the current execution policy") != null);
 }

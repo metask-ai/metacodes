@@ -5,13 +5,13 @@
 //! Where the seat finds its packet is said by the shared bootstrap text
 //! (`drivers/common.zig`), not here.
 //!
-//! The texts are original to metacodes. `reviewer` and `verifier` hold
-//! placeholders owned by other branches: `feat/teamwork-reviewer` replaces
-//! the reviewer entry, and the verifier's charter lives in the verifier
-//! module (#516).
+//! The texts are original to metacodes. The reviewer's charter is
+//! `reviewer.charter` (#517); `verifier` holds a placeholder: the verifier's
+//! charter lives in the verifier module (#516).
 
 const std = @import("std");
 const types = @import("types.zig");
+const reviewer = @import("reviewer.zig");
 
 const Role = types.Role;
 
@@ -77,14 +77,6 @@ pub const manager =
     \\
 ++ contract;
 
-/// Owned by `feat/teamwork-reviewer`, which replaces this entry.
-pub const reviewer_placeholder =
-    \\[placeholder: the reviewer charter is owned by the feat/teamwork-reviewer branch]
-    \\You are the reviewer of a teamwork run. Review the change described in your
-    \\packet and report findings.
-    \\
-++ contract;
-
 /// The verifier's charter lives in the verifier module (#516); this entry is
 /// a placeholder for a metacodes seat built before that module exists.
 pub const verifier_placeholder =
@@ -100,7 +92,7 @@ pub fn forRole(role: Role) []const u8 {
         .interviewer => interviewer,
         .implementer => implementer,
         .manager => manager,
-        .reviewer => reviewer_placeholder,
+        .reviewer => reviewer.charter,
         .verifier => verifier_placeholder,
     };
 }
@@ -139,10 +131,10 @@ test "charters: every role has a distinct, non-empty charter with a matching dig
     }
 }
 
-test "charters: reviewer and verifier are marked placeholders; the others are not" {
-    try testing.expect(std.mem.startsWith(u8, forRole(.reviewer), "[placeholder:"));
+test "charters: the reviewer's is the built-in reviewer charter; only the verifier's is a placeholder" {
+    try testing.expectEqualStrings(reviewer.charter, forRole(.reviewer));
     try testing.expect(std.mem.startsWith(u8, forRole(.verifier), "[placeholder:"));
-    for ([_]Role{ .interviewer, .implementer, .manager }) |role| {
+    for ([_]Role{ .interviewer, .implementer, .manager, .reviewer }) |role| {
         try testing.expect(std.mem.indexOf(u8, forRole(role), "placeholder") == null);
     }
 }
