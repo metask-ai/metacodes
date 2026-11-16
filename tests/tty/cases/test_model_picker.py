@@ -312,3 +312,32 @@ def test_picker_options_step_changes_reasoning_with_arrows_and_applies_with_ente
     assert any("Reasoning effort" in sc and "= high" in sc and "[low high max]" in sc for sc in options), \
         "→ 没有把推理强度改到 high:\n" + options[-1]
     assert "switched to glm-5.3" in text, "Enter 没有应用线路:\n" + text
+
+
+GUIDE = "https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md"
+
+
+def test_picker_names_the_variable_and_the_env_file_for_a_provider_without_a_key(bin_path):
+    # #483: Kimi on Moonshot's open platform has no sign-in and no key page. A
+    # route chosen without MOONSHOT_API_KEY ended in a bare
+    # "switch failed (MissingCredentials)"; now the picker names the variable,
+    # this install's .env and the guide. KIMI_API_KEY is Kimi Code's (#487).
+    home = case_tmpdir("cc-tty-nokey-home-")
+    env_file = os.path.join(home, ".metacodes", ".env")
+    raw = run(
+        bin_path,
+        submit("/model", "Provider") + [
+            "type:kimi", wait_for("kimi-code"), "key:enter", f"waitline:Model:{WAIT_S}",
+            "key:enter", wait_for("Channel / offer"), "key:enter",
+            wait_for("Options"), "key:enter", wait_for("MOONSHOT_API_KEY"),
+        ],
+        term_size=(30, 160),
+        env={"HOME": home, "MOONSHOT_API_KEY": None, "KIMI_API_KEY": None, "KIMI_CODE_API_KEY": None},
+        per_key_drain=0.1,
+    )
+    _, text = _screen(raw, rows=30, cols=160)
+    assert "kimi has no key; the previous route is still active" in text, text
+    assert f"Set MOONSHOT_API_KEY in {env_file}, then restart" in text, text
+    assert f"How to: {GUIDE}" in text, text
+    assert "MissingCredentials" not in text, text
+    assert "KIMI_API_KEY" not in text, text

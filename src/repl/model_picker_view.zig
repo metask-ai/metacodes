@@ -22,7 +22,7 @@ pub const Row = picker_mod.Row;
 /// can account for them in its fixed-region height.
 pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
     var rows: u16 = 0;
-    rows += header(picker, w, th);
+    rows += header(picker, w, th, cols);
 
     if (picker.stage == .credential) {
         if (picker.credential_mode == .paste_key) return rows + keyBody(picker, w, th, cols);
@@ -76,7 +76,7 @@ fn emptyText(picker: *const Picker) []const u8 {
     };
 }
 
-fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
+fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
     line(w);
     const title = switch (picker.stage) {
         .provider => "Provider",
@@ -103,13 +103,69 @@ fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
     }
     newline(w);
     var used: u16 = 1;
-    if (picker.notice_len > 0) {
-        line(w);
-        w.print("  {s}{s}{s}", .{ th.warn, picker.notice(), th.reset }) catch {};
-        newline(w);
-        used += 1;
-    }
+    if (picker.notice_len > 0) used += writeWrapped(w, th.warn, th.reset, picker.notice(), cols);
     return used;
+}
+
+/// `text` in `color`, indented two columns: a row per line, each line broken
+/// at spaces to fit `cols`, and a word longer than a row (a path, a URL)
+/// broken where the row ends. Returns the rows written. No row reaches the
+/// last column, so an autowrapping terminal never adds a row the region does
+/// not count (a notice naming a variable, a path and a link is longer than
+/// any terminal is wide, #483).
+fn writeWrapped(w: *std.Io.Writer, color: []const u8, reset: []const u8, text: []const u8, cols: usize) u16 {
+    const width = @max(cols -| 3, 8);
+    var rows: u16 = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |text_line| {
+        line(w);
+        w.print("  {s}", .{color}) catch {};
+        var used: usize = 0;
+        var words = std.mem.tokenizeScalar(u8, text_line, ' ');
+        while (words.next()) |whole| {
+            var word = whole;
+            if (used > 0 and used + 1 + word.len > width) {
+                w.print("{s}", .{reset}) catch {};
+                newline(w);
+                rows += 1;
+                line(w);
+                w.print("  {s}", .{color}) catch {};
+                used = 0;
+            }
+            if (used > 0) {
+                w.writeAll(" ") catch {};
+                used += 1;
+            }
+            while (used + word.len > width) {
+                const take = utf8Prefix(word, width - used);
+                w.writeAll(word[0..take]) catch {};
+                word = word[take..];
+                w.print("{s}", .{reset}) catch {};
+                newline(w);
+                rows += 1;
+                line(w);
+                w.print("  {s}", .{color}) catch {};
+                used = 0;
+            }
+            w.writeAll(word) catch {};
+            used += word.len;
+        }
+        w.print("{s}", .{reset}) catch {};
+        newline(w);
+        rows += 1;
+    }
+    return rows;
+}
+
+/// The longest prefix of `bytes` of at most `limit` bytes that ends on a
+/// character boundary, and never empty: a row too narrow for the first
+/// character still takes it rather than looping.
+fn utf8Prefix(bytes: []const u8, limit: usize) usize {
+    var end = @min(limit, bytes.len);
+    while (end > 0 and end < bytes.len and bytes[end] & 0xC0 == 0x80) end -= 1;
+    if (end > 0) return end;
+    const first = std.unicode.utf8ByteSequenceLength(bytes[0]) catch 1;
+    return @min(@as(usize, first), bytes.len);
 }
 
 fn drawRow(
@@ -581,6 +637,79 @@ test "a stale or failed catalog says so on screen" {
     try testing.expect(std.mem.indexOf(u8, draw(&picker, &buffer), "stale") != null);
     picker.markFailed();
     try testing.expect(std.mem.indexOf(u8, draw(&picker, &buffer), "unavailable") != null);
+}
+
+/// The rows `text` occupies on screen, escape sequences removed.
+fn visibleRows(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var rows = std.mem.splitSequence(u8, text, "\r\n");
+    while (rows.next()) |raw| {
+        var plain: std.ArrayList(u8) = .empty;
+        var index: usize = 0;
+        while (index < raw.len) {
+            if (raw[index] == 0x1b and index + 1 < raw.len and raw[index + 1] == '[') {
+                index += 2;
+                while (index < raw.len and (raw[index] < 0x40 or raw[index] > 0x7e)) index += 1;
+                index += 1;
+                continue;
+            }
+            try plain.append(arena, raw[index]);
+            index += 1;
+        }
+        try out.append(arena, plain.items);
+    }
+    // The last "\r\n" ends the last row; nothing follows it.
+    if (out.items.len > 0 and out.items[out.items.len - 1].len == 0) _ = out.pop();
+    return out.items;
+}
+
+test "a notice of several lines is drawn a row per line, every row inside the width (#483)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]control_plane.OfferSummary{richOffer()};
+    try seed(&picker, &offers, null);
+    const path = "/Users/someone/.local/opt/metacodes-with-a-long-name/state/.env";
+    const guide = "https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md";
+    picker.setNotice("kimi has no key; the previous route is still active\nSet MOONSHOT_API_KEY in {s}, then restart\nHow to: {s}", .{ path, guide });
+
+    for ([_]usize{ 40, 60, 100 }) |cols| {
+        // The header alone: the title row and the notice under it (the
+        // footer's own fixed text is not what is measured here).
+        var buffer: [8192]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        const drawn = header(&picker, &writer, theme_mod.monochrome, cols);
+        const rows = try visibleRows(arena, writer.buffered());
+        // The count the region reserves is the rows on screen.
+        try testing.expectEqual(rows.len, @as(usize, drawn));
+        var joined: std.ArrayList(u8) = .empty;
+        for (rows) |row| {
+            testing.expect(row.len < cols) catch |err| {
+                std.debug.print("row of {d} bytes at {d} columns: {s}\n", .{ row.len, cols, row });
+                return err;
+            };
+            try joined.appendSlice(arena, std.mem.trim(u8, row, " "));
+        }
+        // Every line of the notice is on screen, the path and the link whole
+        // once the rows they were broken across are put back together.
+        for ([_][]const u8{ "kimi has no key", "MOONSHOT_API_KEY", path, guide }) |needle| {
+            testing.expect(std.mem.indexOf(u8, joined.items, needle) != null) catch |err| {
+                std.debug.print("missing at {d} columns: {s}\n{s}\n", .{ cols, needle, joined.items });
+                return err;
+            };
+        }
+    }
+}
+
+test "a row too narrow for a character breaks after it, never inside it" {
+    // "ab" then a three-byte character then "c": rows may end at 2 or 5.
+    try testing.expectEqual(@as(usize, 5), utf8Prefix("ab\u{4e2d}c", 5));
+    try testing.expectEqual(@as(usize, 2), utf8Prefix("ab\u{4e2d}c", 4));
+    try testing.expectEqual(@as(usize, 2), utf8Prefix("ab\u{4e2d}c", 3));
+    try testing.expectEqual(@as(usize, 3), utf8Prefix("\u{4e2d}c", 1));
+    try testing.expectEqual(@as(usize, 2), utf8Prefix("ab", 9));
 }
 
 test "an empty result explains itself instead of drawing a blank box" {

@@ -27,7 +27,9 @@
 //!
 //! In process, on a real `App` built with the layer the CLI builds
 //! (`Config.credential_env_fallback`): a `/model` pick mid-session and a
-//! catalog refresh read their keys from the file, behind the environment.
+//! catalog refresh read their keys from the file, behind the environment;
+//! a pick of a provider that has no key and no way to sign in names the
+//! variable and the file to put it in (#483).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -630,4 +632,59 @@ test "state .env: a catalog refresh reads its credential_env from it (#486)" {
         try testing.expect(std.mem.startsWith(u8, requestLine(request), "GET /api/v1/models "));
         try testing.expectEqualStrings("Bearer sk-catalog-from-file", headerValue(request, "authorization") orelse "");
     }
+}
+
+test "state .env: a /model pick of a provider with neither a sign-in nor a key page names its variable, this install's .env and the guide (#483)" {
+    var case: Case = undefined;
+    try case.initInProcess();
+    defer case.deinit();
+    const a = case.arena();
+    var env: InProcessEnv = .{};
+    try env.init((try a.dupeZ(u8, case.home)).ptr);
+    defer env.deinit();
+    var moonshot = try EnvGuard.set("MOONSHOT_API_KEY", null);
+    defer moonshot.restore();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    const app = try startedApp(&case, io_runtime.io(), null);
+    defer app.deinit();
+
+    const picker_host = cc.repl_picker_host;
+    const picker = &app.model_picker;
+    var ui: cc.tui_ui_state.UiState = .{};
+    picker_host.open(app, &ui, .unguarded);
+    // Moonshot's open platform (`kimi`): no OAuth grant, no key page.
+    var rows = cc.repl_model_picker.Picker.RowBuffer.init(testing.allocator);
+    defer rows.deinit();
+    const providers = try picker.rows(&rows);
+    const kimi_row = for (providers, 0..) |row, index| {
+        if (picker.offers.items[row.provider.offer_index].provider_id.eqlText("kimi")) break index;
+    } else return error.KimiNotListed;
+    for (0..kimi_row) |_| _ = picker_host.onKey(app, &ui, .down, .unguarded);
+    // Provider, model, channel, options: each Enter takes the first, the
+    // last one applies the route.
+    var presses: usize = 0;
+    while (picker.notice_len == 0) : (presses += 1) {
+        if (presses == 6) return error.NoNotice;
+        try testing.expectEqual(picker_host.Result.redraw, picker_host.onKey(app, &ui, .enter, .unguarded));
+    }
+
+    const notice = picker.notice();
+    const env_path = try std.fs.path.join(a, &.{ case.state, ".env" });
+    for ([_][]const u8{
+        "kimi has no key; the previous route is still active",
+        "Set MOONSHOT_API_KEY in ",
+        env_path,
+        "How to: https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md",
+    }) |needle| {
+        testing.expect(std.mem.indexOf(u8, notice, needle) != null) catch |err| {
+            std.debug.print("missing from the notice: {s}\n{s}\n", .{ needle, notice });
+            return err;
+        };
+    }
+    // The bare error name is gone, and KIMI_API_KEY is Kimi Code's (#487).
+    try testing.expect(std.mem.indexOf(u8, notice, "MissingCredentials") == null);
+    try testing.expect(std.mem.indexOf(u8, notice, "KIMI_API_KEY") == null);
+    // Nothing was switched.
+    try testing.expectEqualStrings("claude-sonnet-4-6", app.activeModel());
 }
