@@ -1220,12 +1220,22 @@ pub const RunExecutionEvidence = struct {
 const RunInput = union(enum) {
     /// User text records, in order. Borrowed.
     prompts: []const []const u8,
+    /// User text records whose first leads with its own text part
+    /// (`AdmittedRun.lead_text`, #534). Borrowed.
+    led_prompts: LedPrompts,
     /// One built user record, owned by the Run: the Conversation takes it,
     /// or `runLoop` frees it when the Run ends before.
     record: message_mod.Message,
     /// Results for the suspended turn's tool calls
     /// (`agent_loop.resumeRunWithResults`, #446). Borrowed.
     resumption: []const agent_loop.SuspendInfo.CompletedResult,
+};
+
+/// `RunInput.led_prompts`: `lead` and `prompts[0]` are the two text parts of
+/// the first user record; the rest are text records, in order.
+const LedPrompts = struct {
+    lead: []const u8,
+    prompts: []const []const u8,
 };
 
 /// A durable Run's control once its journal opened (#445).
@@ -1251,6 +1261,13 @@ pub const AdmittedRun = struct {
     /// (`agent_loop.Options.retractable_stream_retries`, #452). The embedding
     /// layer sets it before the Run starts; 0 keeps the loop's default.
     stream_retry_budget: u8 = 0,
+    /// Text leading the Run's first user record as its own text part, the
+    /// Host's rendered context for this Run (#534): that record holds
+    /// `[lead_text, first prompt]` where it would hold the first prompt
+    /// alone, for `runUserMessages*` and `runIsolated`'s root records. The
+    /// embedding layer sets it before the Run starts; borrowed until the Run
+    /// returns. Null leaves every record a plain text record.
+    lead_text: ?[]const u8 = null,
 
     pub fn identity(self: *const AdmittedRun) RunIdentity {
         std.debug.assert(!self.completed);
@@ -1367,7 +1384,10 @@ pub const AdmittedRun = struct {
             tool_surface,
             provider_override,
             self.stream_retry_budget,
-            .{ .prompts = prompts },
+            if (self.lead_text) |lead|
+                .{ .led_prompts = .{ .lead = lead, .prompts = prompts } }
+            else
+                .{ .prompts = prompts },
         );
     }
 
@@ -1516,12 +1536,10 @@ pub const AdmittedRun = struct {
         // The executor runs on its own Conversation, discarded when it returns:
         // no boundary of this Run can adopt Host input, so stop accepting it.
         self.session.refuseRunInputs();
-        for (root_records) |record| {
-            self.session.conversation.appendText(.user, record) catch |err| {
-                _ = self.session.poisonRun();
-                return err;
-            };
-        }
+        self.session.appendUserTexts(self.lead_text, root_records) catch |err| {
+            _ = self.session.poisonRun();
+            return err;
+        };
 
         var final_text = std.ArrayList(u8).empty;
         defer final_text.deinit(self.session.allocator);
@@ -3202,7 +3220,7 @@ pub const AgentSession = struct {
         // A built record is the Run's until the Conversation takes it.
         var pending_record: ?message_mod.Message = switch (input) {
             .record => |record| record,
-            .prompts, .resumption => null,
+            .prompts, .led_prompts, .resumption => null,
         };
         defer if (pending_record) |record| record.deinit(self.conversation.allocator);
         var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
@@ -3331,7 +3349,7 @@ pub const AgentSession = struct {
         const run_provider = provider_override orelse self.provider.provider();
         var native_result = (switch (input) {
             .resumption => |results| agent_loop.resumeRunWithResults(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, results, run_options, &backend, self.allocator),
-            .prompts, .record => agent_loop.run(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, run_options, &backend, self.allocator),
+            .prompts, .led_prompts, .record => agent_loop.run(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, run_options, &backend, self.allocator),
         }) catch |err| {
             if (run_control) |control| control.finishRun(@errorName(err)) catch {};
             if (err == error.HostToolFatal) {
@@ -3410,9 +3428,29 @@ pub const AgentSession = struct {
     /// enter it through `agent_loop.resumeRunWithResults`.
     fn appendRunInput(self: *AgentSession, input: RunInput) !void {
         switch (input) {
-            .prompts => |prompts| for (prompts) |prompt| try self.conversation.appendText(.user, prompt),
+            .prompts => |prompts| try self.appendUserTexts(null, prompts),
+            .led_prompts => |led| try self.appendUserTexts(led.lead, led.prompts),
             .record => |record| try self.conversation.append(record),
             .resumption => {},
+        }
+    }
+
+    /// User text records, in order; a non-null `lead` is the first record's
+    /// leading text part (`AdmittedRun.lead_text`, #534).
+    fn appendUserTexts(self: *AgentSession, lead: ?[]const u8, prompts: []const []const u8) !void {
+        for (prompts, 0..) |prompt, index| {
+            if (index == 0) if (lead) |text| {
+                const record = try message_mod.userMessageFromParts(self.conversation.allocator, &.{
+                    .{ .text = text },
+                    .{ .text = prompt },
+                });
+                self.conversation.append(record) catch |err| {
+                    record.deinit(self.conversation.allocator);
+                    return err;
+                };
+                continue;
+            };
+            try self.conversation.appendText(.user, prompt);
         }
     }
 

@@ -1035,9 +1035,9 @@ pub const RunInputV1 = extern struct {
 pub const RunOptionsV1 = extern struct {
     struct_size: u32,
     max_turns: u32,
-    /// Optional per-Run Host context for RUN_INPUT_TEXT and
-    /// RUN_INPUT_MULTIMODAL, borrowed for the synchronous call. Null with
-    /// zero count adds nothing.
+    /// Optional per-Run Host context for RUN_INPUT_TEXT,
+    /// RUN_INPUT_MULTIMODAL and RUN_INPUT_SKILL, borrowed for the synchronous
+    /// call. Null with zero count adds nothing.
     context_blocks: ?[*]const ContextBlockV1,
     context_block_count: u64,
     /// Revision 22: one TIME_CONTEXT_* value; zero is TIME_CONTEXT_SYSTEM.

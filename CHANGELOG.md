@@ -12,6 +12,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **An explicit Skill run takes the Host's context blocks** (#534). An
+  AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
+  be refused with `INVALID_ARGUMENT`; the blocks now lead the Skill's
+  invocation record, so the selected Skill sees them, and the date, from its
+  first request (`doc/AGENTCORE_BINARY_ABI.md`).
 - **`/login` signs in to Metask in the browser; `/logout` switches back to
   local configuration** (#485). `/login` alone now runs `metacodes login`'s
   browser sign-in, then asks for the API key, model and reasoning level in

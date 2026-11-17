@@ -1554,7 +1554,10 @@ they extend the cached prefix instead of moving the system prompt. The date is
 supplied by default (issue #276): AgentCore leads each Run's context with a
 `currentDate` block in the process's time zone, or in a UTC offset the Host
 gives per Run (`RunOptionsV1.time_context_code` / `utc_offset_minutes`); a Host
-`currentDate` block replaces it, and `TIME_CONTEXT_OFF` drops it. The CLI's
+`currentDate` block replaces it, and `TIME_CONTEXT_OFF` drops it. An explicit
+Skill invocation Run (`RUN_INPUT_SKILL`) takes context blocks and the date
+like any other Run (#534): they lead its invocation record, ahead of the Skill
+body. The CLI's
 user-context message always states the session's start date and zone, and the
 first Run on a later local date gets one "the date has changed" notice in that
 turn (`agent_loop.Options.time_announcer`). Source-level Hosts build the same
