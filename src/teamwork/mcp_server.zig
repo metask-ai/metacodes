@@ -149,6 +149,8 @@ pub const Server = struct {
 
     /// Same transport on host-owned descriptors (also used by L2 tests).
     /// EOF cancels a live run, so subprocess shutdown cannot orphan it.
+    /// Idle input checks the shared abort at most every 50 ms. Windows is
+    /// unsupported until the runtime and its descriptor transport are ported.
     pub fn serveFds(self: *Server, input: pfs.Fd, output: pfs.Fd) !void {
         errdefer self.run.cancel() catch {};
         const buffer = try self.gpa.alloc(u8, max_message_bytes);
@@ -156,7 +158,9 @@ pub const Server = struct {
         var len: usize = 0;
         var oversized = false;
         var chunk: [4096]u8 = undefined;
-        while (true) {
+        while (!self.run.abort.isAborted()) {
+            if (!try waitForInput(input)) continue;
+            if (self.run.abort.isAborted()) break;
             const n = pfs.read(input, &chunk);
             if (n < 0) {
                 if (builtin.os.tag != .windows and pfs.lastErrnoIs(.INTR)) continue;
@@ -186,7 +190,7 @@ pub const Server = struct {
             }
         }
         // A partial final frame is never executed (it may be truncated).
-        if (len != 0 or oversized) {
+        if (!self.run.abort.isAborted() and (len != 0 or oversized)) {
             const bytes = try rpcError(self.gpa, .null, -32700, "Unterminated message");
             defer self.gpa.free(bytes);
             if (!pfs.writeAll(output, bytes) or !pfs.writeAll(output, "\n")) return error.WriteFailed;
@@ -194,6 +198,24 @@ pub const Server = struct {
         try self.run.cancel();
     }
 };
+
+fn waitForInput(input: pfs.Fd) error{ ReadFailed, UnsupportedPlatform }!bool {
+    if (builtin.os.tag == .windows) {
+        return error.UnsupportedPlatform;
+    } else {
+        // Borrow the descriptor without changing its blocking mode. Only the
+        // server reads it; readiness, including HUP/ERR, makes read bounded.
+        var fds = [_]std.c.pollfd{.{ .fd = input, .events = std.c.POLL.IN, .revents = 0 }};
+        const ready = std.c.poll(&fds, 1, 50);
+        if (ready < 0) {
+            // Return to the loop's abort check even when signals interrupt
+            // the wait; never retry indefinitely inside the transport wait.
+            if (pfs.lastErrnoIs(.INTR)) return false;
+            return error.ReadFailed;
+        }
+        return ready > 0;
+    }
+}
 
 fn field(value: std.json.Value, name: []const u8) ?std.json.Value {
     return if (value == .object) value.object.get(name) else null;
@@ -336,5 +358,7 @@ const tool_list = .{ .tools = .{
 } };
 
 test {
+    // Keep the transport entry points analyzed even where runtime tests skip.
+    std.testing.refAllDecls(Server);
     _ = @import("mcp_server_test.zig");
 }

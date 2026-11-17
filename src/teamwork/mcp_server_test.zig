@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const util_fs = @import("../util/fs.zig");
 const tools_common = @import("../tools/common.zig");
+const util_time = @import("../util/time.zig");
 const swarm_team = @import("../swarm/team.zig");
 const runtime = @import("runtime.zig");
 const config = @import("config.zig");
@@ -391,4 +392,113 @@ test "teamwork MCP L2: NDJSON descriptor transport bounds frames, recovers and c
     try testing.expectEqual(@as(usize, 5), count);
     try testing.expectEqual(@as(u32, 0), seats.calls);
     try testing.expectEqual(runtime.Phase.cancelled, run.state.phase());
+}
+
+const TransportWorker = struct {
+    server: *mcp.Server,
+    input: pfs.Fd,
+    output: pfs.Fd,
+    started: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    result: anyerror!void = {},
+
+    fn serve(self: *TransportWorker) void {
+        self.started.store(true, .release);
+        self.result = self.server.serveFds(self.input, self.output);
+        self.done.store(true, .release);
+    }
+};
+
+fn waitFor(flag: *const std.atomic.Value(bool), timeout_ms: i64) bool {
+    const deadline = util_time.nowMs() + timeout_ms;
+    while (!flag.load(.acquire)) {
+        if (util_time.nowMs() >= deadline) return false;
+        util_time.sleepMs(5);
+    }
+    return true;
+}
+
+fn expectIdleCancellation(input_bytes: []const u8) !void {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    var seats: Seats = .{};
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const run = try fx.start(&seats, auditor.auditor());
+    defer run.destroy();
+    var server = mcp.Server.init(gpa, run);
+    var input: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&input));
+    defer pfs.close(input[0]);
+    const input_flags = std.c.fcntl(input[0], std.c.F.GETFL);
+    var input_writer = input[1];
+    defer if (input_writer != pfs.invalid_fd) pfs.close(input_writer);
+    var output: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&output));
+    defer pfs.close(output[0]);
+    var output_writer = output[1];
+    defer if (output_writer != pfs.invalid_fd) pfs.close(output_writer);
+    // These small fixtures fit in one pipe write, including the partial frame.
+    try testing.expect(pfs.writeAll(input_writer, input_bytes));
+    var worker: TransportWorker = .{ .server = &server, .input = input[0], .output = output_writer };
+    const thread = try @import("platform").thread.spawn(.full, TransportWorker.serve, .{&worker});
+    defer {
+        // A regression must fail within the deadline, then unblock on EOF so
+        // cleanup can join the server instead of hanging the test process.
+        pfs.close(input_writer);
+        input_writer = pfs.invalid_fd;
+        thread.join();
+    }
+    try testing.expect(waitFor(&worker.started, 1_000));
+    // Let the server consume available bytes and enter its idle read wait.
+    util_time.sleepMs(150);
+    try testing.expect(!worker.done.load(.acquire));
+    run.abort.abort(.user_interrupt);
+    // The writer remains open throughout this assertion: EOF cannot help.
+    try testing.expect(waitFor(&worker.done, 1_000));
+    try worker.result;
+    try testing.expectEqual(runtime.Phase.cancelled, run.state.phase());
+    try testing.expectEqual(pfs.invalid_fd, run.lease_fd);
+    try testing.expectEqual(@as(u32, 0), seats.calls);
+    const durable = try readFile(run.dir.root, "run.json");
+    defer gpa.free(durable);
+    var saved = try std.json.parseFromSlice(std.json.Value, gpa, durable, .{});
+    defer saved.deinit();
+    try testing.expectEqualStrings("cancelled", saved.value.object.get("state").?.string);
+    // Both borrowed endpoints are still owned by the host, with no flag churn.
+    try testing.expect(std.c.fcntl(input[0], std.c.F.GETFD) >= 0);
+    try testing.expect(std.c.fcntl(output_writer, std.c.F.GETFD) >= 0);
+    try testing.expectEqual(input_flags, std.c.fcntl(input[0], std.c.F.GETFL));
+    pfs.close(output_writer);
+    output_writer = pfs.invalid_fd;
+    var bytes: [4096]u8 = undefined;
+    const n = pfs.read(output[0], &bytes);
+    try testing.expect(n >= 0);
+    if (std.mem.startsWith(u8, input_bytes, initialize ++ "\n")) {
+        // Exactly the initialize response, without cancellation progress or an
+        // unterminated-frame error when abort discards the pending bytes.
+        const line = std.mem.trimEnd(u8, bytes[0..@intCast(n)], "\n");
+        try testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+        var reply = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
+        defer reply.deinit();
+        try testing.expect(reply.value.object.get("result") != null);
+        try testing.expectEqual(@as(i64, 1), reply.value.object.get("id").?.integer);
+    } else {
+        try testing.expectEqual(@as(isize, 0), n);
+    }
+    try testing.expectEqual(@as(isize, 0), pfs.read(output[0], &bytes));
+}
+
+test "teamwork MCP L2: shared abort cancels an idle open input pipe before initialize" {
+    try expectIdleCancellation("");
+}
+
+test "teamwork MCP L2: shared abort cancels an idle open input pipe after initialize" {
+    try expectIdleCancellation(initialize ++ "\n" ++ initialized ++ "\n");
+}
+
+test "teamwork MCP L2: shared abort discards a partial frame on an open input pipe" {
+    try expectIdleCancellation(initialize ++ "\n" ++ initialized ++ "\n" ++ implement);
 }
