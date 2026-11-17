@@ -168,9 +168,18 @@ pub fn open(ctx: *const ToolContext, path: []const u8, flags: pfs.O, mode: c_uin
                 return error.SandboxHelperUnavailable;
         }
     }
-    const null_fd = pfs.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    var null_fd = pfs.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
     if (null_fd < 0) return error.SandboxHelperUnavailable;
     defer _ = std.c.close(null_fd);
+    // Lifting the sockets can leave a stdio slot free again. Keep the null
+    // source above stdio too, so dup2(socket, 0) cannot replace that source.
+    if (null_fd < 3) {
+        const raised = std.c.fcntl(null_fd, std.c.F.DUPFD, @as(c_int, 3));
+        if (raised < 0) return error.SandboxHelperUnavailable;
+        _ = std.c.close(null_fd);
+        null_fd = raised;
+    }
+    try pfs.makeCloseOnExec(null_fd);
     const pid = std.c.fork();
     if (pid < 0) return error.SandboxHelperUnavailable;
     if (pid == 0) {
@@ -517,6 +526,73 @@ test "L2 native filesystem sandbox: descriptor stays bound across path replaceme
     try TestFixture.expectBytes(moved, "other\n");
     try TestFixture.expectBytes(outside, "unchanged\n");
     try std.testing.expect(std.c.fcntl(fd, std.c.F.GETFD) & std.c.FD_CLOEXEC != 0);
+}
+
+test "L2 native filesystem sandbox: closed stdin keeps helper stderr out of the protocol" {
+    if (comptime !protocol.supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    const real_helper = try helperPath(allocator);
+    defer allocator.free(real_helper);
+    const helper_quoted = try shellQuote(allocator, real_helper);
+    defer allocator.free(helper_quoted);
+    const wrapper = try fixture.path("workspace/diagnostic helper");
+    defer allocator.free(wrapper);
+    const wrapper_z = try allocator.dupeZ(u8, wrapper);
+    defer allocator.free(wrapper_z);
+    const marker = try fixture.path("workspace/wrapper-ran");
+    defer allocator.free(marker);
+    const marker_quoted = try shellQuote(allocator, marker);
+    defer allocator.free(marker_quoted);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nprintf 'wrapper-used\\n' > {s}\nprintf 'helper stderr diagnostic\\n' >&2\nexec {s}\n",
+        .{ marker_quoted, helper_quoted },
+    );
+    defer allocator.free(script);
+    try TestFixture.write(wrapper, script);
+    try std.testing.expectEqual(@as(c_int, 0), pfs.chmod(wrapper_z, 0o755));
+    const path = try fixture.path("workspace/read.txt");
+    defer allocator.free(path);
+    try TestFixture.write(path, "closed-stdin-readable\n");
+    const sb = @import("config.zig").SandboxSettings{ .enabled = true };
+    var ctx = fixture.context(&sb);
+    // The forked probe owns its allocations and environment; neither closing
+    // stdin nor selecting the diagnostic wrapper changes the test runner.
+    ctx.allocator = std.heap.page_allocator;
+    platform.process.forkSerialLock();
+    const pid = std.c.fork();
+    platform.process.forkSerialUnlock();
+    try std.testing.expect(pid >= 0);
+    if (pid == 0) {
+        platform.paths.setEnv("METACODES_SANDBOX_HELPER", wrapper_z);
+        _ = std.c.close(0);
+        const result = @import("../tools/read.zig").execute(&ctx, "{\"path\":\"read.txt\"}") catch std.c._exit(1);
+        const correct = std.mem.indexOf(u8, result, "1\tclosed-stdin-readable") != null;
+        std.c._exit(if (correct) 0 else 2);
+    }
+    var reaped = false;
+    defer if (!reaped) {
+        _ = std.c.kill(pid, std.c.SIG.KILL);
+        var status: c_int = 0;
+        while (std.c.waitpid(pid, &status, 0) < 0 and pfs.lastErrnoIs(.INTR)) {}
+    };
+    const time = @import("../util/time.zig");
+    const deadline = time.nowMs() + 30_000;
+    while (true) {
+        var status: c_int = 0;
+        const waited = std.c.waitpid(pid, &status, 1); // WNOHANG
+        if (waited == pid) {
+            reaped = true;
+            try std.testing.expectEqual(@as(c_int, 0), status);
+            break;
+        }
+        if (waited < 0 and !pfs.lastErrnoIs(.INTR)) return error.TestChildWaitFailed;
+        if (time.nowMs() >= deadline) return error.TestChildTimeout;
+        time.sleepMs(10);
+    }
+    try TestFixture.expectBytes(marker, "wrapper-used\n");
 }
 
 test "L2 native filesystem sandbox: missing or relative host helper fails closed before mkdir" {
