@@ -93,8 +93,7 @@ The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`).
 
 The native bundled TinyKG is wired into tests by default. Supply
 `-Dtinykg-bin` and `-Dtinykg-sha256` together only to audit an explicit override.
-Do not run paid or provider-backed benchmarks without explicit user authorization,
-a dollar cap, and the durable budget journal.
+Do not run paid or provider-backed benchmarks without explicit user authorization.
 
 Judge a build by its exit code and `Build Summary`, never by the presence of
 `failed command:`. The Zig 0.16 build runner routes every step that wrote to
