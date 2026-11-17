@@ -122,6 +122,33 @@ pub const StoredCredentials = struct {
         self.* = .{};
     }
 
+    /// An independent copy for staging a replacement while keeping the
+    /// previous credentials available for rollback. Secret buffers are copied.
+    pub fn clone(self: *const StoredCredentials, allocator: std.mem.Allocator) !StoredCredentials {
+        var out = StoredCredentials{ .reasoning_effort = self.reasoning_effort };
+        errdefer out.deinit(allocator);
+        if (self.api_key) |value| out.api_key = try allocator.dupe(u8, value);
+        if (self.oauth) |value| {
+            out.oauth = blk: {
+                const access = try allocator.dupe(u8, value.access_token);
+                errdefer secureFree(allocator, access);
+                const refresh = try allocator.dupe(u8, value.refresh_token);
+                errdefer secureFree(allocator, refresh);
+                break :blk .{
+                    .access_token = access,
+                    .refresh_token = refresh,
+                    .token_type = value.token_type,
+                    .expires_at = value.expires_at,
+                };
+            };
+            if (value.scope) |text| out.oauth.?.scope = try allocator.dupe(u8, text);
+            if (value.account_id) |text| out.oauth.?.account_id = try allocator.dupe(u8, text);
+            if (value.profile) |text| out.oauth.?.profile = try allocator.dupe(u8, text);
+        }
+        if (self.selected_model) |value| out.selected_model = try allocator.dupe(u8, value);
+        return out;
+    }
+
     /// What a Metask browser sign-in leaves here (#527): the model and
     /// reasoning level chosen. The sign-in itself is the Metask session, so
     /// a key or an older sign-in held here goes: left here it would outrank

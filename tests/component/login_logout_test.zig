@@ -166,10 +166,14 @@ const Case = struct {
 
     /// The Metask session `/login` stores (#527): a token response naming
     /// the gateway at `origin`, imported as `/login` imports it.
-    fn storeSession(self: *Case, origin: []const u8, access: []const u8) !void {
-        const token_json = try std.fmt.allocPrint(self.arena(),
+    fn tokenJson(self: *Case, origin: []const u8, access: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.arena(),
             \\{{"access_token":"{s}","refresh_token":"mrt-{s}","token_type":"bearer","expires_in":3600,"gateway_url":"{s}","models_url":"{s}/v1/models","scope":"read model:invoke"}}
         , .{ access, access, origin, origin });
+    }
+
+    fn storeSession(self: *Case, origin: []const u8, access: []const u8) !void {
+        const token_json = try self.tokenJson(origin, access);
         try cc.api_provider_login.importTokenResponse(testing.allocator, self.state, cc.provider_ids.Slug.lit("metask"), token_json, null, null);
     }
 };
@@ -398,8 +402,14 @@ test "/login: the stored Metask session becomes the session's route at once, its
     try testing.expect(app.sessionDir() == null);
 
     const origin = try originOf(a, gateway);
-    try case.storeSession(origin, SESSION_TOKEN);
-    try app.bindMetaskSession(.{ .gateway = origin, .model = "glm-5", .effort = .low, .models_json = GATEWAY_MODELS });
+    const applied = app.applyMetaskSession(
+        .{ .gateway = origin, .model = "glm-5", .effort = .low, .models_json = GATEWAY_MODELS },
+        try case.tokenJson(origin, SESSION_TOKEN),
+        null,
+    );
+    try testing.expect(applied.switch_error == null);
+    try testing.expect(applied.storage_error == null);
+    try testing.expect(applied.rollback_error == null);
     try testing.expect(app.unbound() == null);
     var line_buf: [256]u8 = undefined;
     try testing.expectEqualStrings("glm-5 · Metask", app.bannerModelLine(&line_buf));
@@ -522,10 +532,13 @@ test "/login that cannot move the session leaves the previous route and models w
     const a = case.arena();
     var gateway = try harness.MockServer.startCassette(&.{ ANTHROPIC_SSE, ANTHROPIC_SSE }, 0);
     defer gateway.stop();
+    var second_gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer second_gateway.stop();
     var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
     defer io_runtime.deinit();
 
     const origin = try originOf(a, gateway);
+    try case.writeSignedIn();
     const app = try signedInApp(&case, io_runtime.io(), origin, null);
     defer app.deinit();
     // Signed in once: on the session, with its models.
@@ -533,12 +546,18 @@ test "/login that cannot move the session leaves the previous route and models w
     try app.bindMetaskSession(.{ .gateway = origin, .model = "glm-5", .models_json = GATEWAY_MODELS });
     const messages_url = try std.fmt.allocPrint(a, "{s}/v1/messages", .{origin});
 
-    // A second sign-in whose model its gateway does not list: no offer.
-    try testing.expectError(error.OfferUnavailable, app.bindMetaskSession(.{
-        .gateway = origin,
+    // The real /login order: the second token response reaches the durable
+    // import before its missing offer makes the route switch fail. It names
+    // another gateway, so sending B on the old route would also cross origins.
+    const second_origin = try originOf(a, second_gateway);
+    const applied = app.applyMetaskSession(.{
+        .gateway = second_origin,
         .model = "glm-5-air",
         .models_json = OTHER_GATEWAY_MODELS,
-    }));
+    }, try case.tokenJson(second_origin, NEW_SESSION_TOKEN), null);
+    try testing.expectEqual(@as(?anyerror, error.OfferUnavailable), applied.switch_error);
+    try testing.expect(applied.storage_error == null);
+    try testing.expect(applied.rollback_error == null);
 
     // Everything is as before: the offer in force, the first sign-in's
     // models (glm-5-air is the first sign-in's), and the session's token.
@@ -547,6 +566,7 @@ test "/login that cannot move the session leaves the previous route and models w
     try testing.expectEqualStrings(messages_url, current.endpoint_ref);
     try sendOneTurn(app);
     try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(gateway.lastRequest().?, "authorization").?);
+    try testing.expectEqual(@as(usize, 0), second_gateway.requestCount());
     const offer = try offerIdText(app, "metask", "glm-5-air", "anthropic_messages");
     try testing.expect(cc.repl_picker_host.useSelector(app, &offer) == .switched);
     try sendOneTurn(app);
@@ -554,11 +574,21 @@ test "/login that cannot move the session leaves the previous route and models w
     try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(picked, "authorization").?);
     try testing.expectEqualStrings("\"glm-5-air\"", picked.jsonField("model").?);
     try expectNeverSent(gateway, METASK_KEY);
+    // The durable half rolled back too: a restart cannot pick up session B,
+    // and the previous auth.json (including its key) is intact.
+    var stored_session = try cc.provider_oauth.Session.initHome(testing.allocator, case.state, cc.provider_ids.Slug.lit("metask"));
+    defer stored_session.deinit();
+    try testing.expect(try stored_session.load());
+    try testing.expectEqualStrings(SESSION_TOKEN, stored_session.tokens.?.access_token);
+    var restored_auth = try cc.core_auth.loadDefault(testing.allocator, case.state);
+    defer restored_auth.deinit(testing.allocator);
+    try testing.expectEqualStrings("glm-5", restored_auth.selected_model.?);
+    try testing.expectEqualStrings(METASK_KEY, restored_auth.api_key.?);
     // The testing allocator checks the rest at `app.deinit`: nothing the
     // failed sign-in allocated leaks, and nothing is freed twice.
 }
 
-test "/login that cannot move the session still forgets the stored default: the sign-in is the latest choice (#485, #527)" {
+test "/login that cannot bind a first session keeps the default and stores no partial sign-in (#485, #527)" {
     var case: Case = undefined;
     try case.init();
     defer case.deinit();
@@ -578,18 +608,24 @@ test "/login that cannot move the session still forgets the stored default: the 
     const app = try App.initWithOptions(testing.allocator, io_runtime.io(), config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
     defer app.deinit();
     const origin = try originOf(a, gateway);
-    try case.storeSession(origin, SESSION_TOKEN);
     // A model the gateway does not list: the switch fails.
-    const applied = app.applyMetaskSession(.{ .gateway = origin, .model = "glm-7", .models_json = GATEWAY_MODELS });
+    const applied = app.applyMetaskSession(
+        .{ .gateway = origin, .model = "glm-7", .models_json = GATEWAY_MODELS },
+        try case.tokenJson(origin, NEW_SESSION_TOKEN),
+        null,
+    );
     try testing.expectEqual(@as(?anyerror, error.OfferUnavailable), applied.switch_error);
-    try testing.expect(applied.default_forgotten);
+    try testing.expect(!applied.default_forgotten);
     try testing.expect(applied.default_error == null);
+    try testing.expect(applied.rollback_error == null);
     try testing.expect(app.unbound() != null);
+    try testing.expect(!case.exists("state/oauth/metask.json"));
+    try testing.expect(!case.exists("state/auth.json"));
     var store = try cc.provider_config_store.Store.initHome(a, case.state);
     defer store.deinit();
     var document = try store.load();
     defer document.deinit();
-    try testing.expect(document.global_selection == null);
+    try testing.expect(document.global_selection != null);
     try testing.expectEqual(@as(usize, 0), gateway.requestCount());
 }
 

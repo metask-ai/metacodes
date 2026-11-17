@@ -43,7 +43,9 @@ status, compatibility boundaries, and entry points are defined by
   metask` at a terminal, and `/login metask` in `/login`'s pane. Before, it
   chose none, and a start on it ran the compiled default model, which the
   gateway does not serve. Without a terminal it stores only the session and
-  says so.
+  says so. If the running session cannot switch to the chosen model, the new
+  session and model choice are rolled back: the previous sign-in, stored
+  default, and current route keep working together.
 
 - **`/login` signs in to Metask in the browser; `/logout` switches back to
   local configuration** (#485). `/login` alone now runs `metacodes login`'s

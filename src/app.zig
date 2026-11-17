@@ -1526,6 +1526,11 @@ pub const App = struct {
         /// Why this session could not move onto the sign-in (it stays as it
         /// was), or null when it did.
         switch_error: ?anyerror = null,
+        /// Why the durable sign-in could not be staged or saved.
+        storage_error: ?anyerror = null,
+        /// A failure after staging should restore both durable files and the
+        /// live route. This reports an incomplete rollback.
+        rollback_error: ?anyerror = null,
         /// A stored `/model` default was forgotten.
         default_forgotten: bool = false,
         /// Why the stored default could not be forgotten: the next start
@@ -1571,9 +1576,9 @@ pub const App = struct {
     /// commit like any `/model` pick.
     ///
     /// All or nothing, as `bindMetaskSignIn`: a failure puts back the
-    /// previous key route, key, inventory, catalog, kernel selection and the
-    /// OAuth flag, so the previous route keeps working. The session file
-    /// stays either way: `/login` stored it, and the next start uses it.
+    /// previous key route, key, inventory, catalog, kernel selection, OAuth
+    /// flag and live OAuth session, so the previous route keeps working.
+    /// `applyMetaskSession` owns the matching durable-file rollback.
     pub fn bindMetaskSession(app: *App, sign_in: MetaskSession) !void {
         const gateway = std.mem.trimEnd(u8, sign_in.gateway, "/");
         if (!metask_oauth_mod.isGatewayOrigin(gateway)) return error.UnexpectedUrl;
@@ -1593,12 +1598,6 @@ pub const App = struct {
         const previous_profile = host.metaskProfile();
         const previous_selection = host.kernel.sessionSelection();
 
-        // The process keeps one Metask session object (single flight); one
-        // already held read the file before `/login` replaced it. The next
-        // token request loads the new one (`oauthAccessToken`).
-        if (app.oauth_session) |*held| held.deinit();
-        app.oauth_session = null;
-        app.oauth_session_provider = null;
         app.metask_key_route = null;
         app.selected_api_key_owned = null;
         app.config.metask_oauth_selected = true;
@@ -1627,6 +1626,14 @@ pub const App = struct {
         });
         if (committed != .committed) return error.SelectionRefused;
 
+        // The process keeps one Metask session object (single flight). Only
+        // after the route commits may the old object go: on every error above
+        // it still holds the previous route's token. The next token request
+        // loads the newly stored session (`oauthAccessToken`).
+        if (app.oauth_session) |*held| held.deinit();
+        app.oauth_session = null;
+        app.oauth_session_provider = null;
+
         // The session is on the sign-in. What the previous route held goes;
         // its key is retired, as the clients may have borrowed it.
         previous_catalog.deinit();
@@ -1650,13 +1657,71 @@ pub const App = struct {
         };
     }
 
-    /// `/login`, once the Metask session is stored (#527): move this session
-    /// onto it (`bindMetaskSession`) and forget a stored `/model` default, as
-    /// `applyMetaskSignIn` does for a key.
-    pub fn applyMetaskSession(app: *App, sign_in: MetaskSession) SignInApplied {
+    /// `/login`'s durable and live sign-in as one transaction (#527). A
+    /// failure before or during the route switch restores the previous
+    /// session and `auth.json`; the default is forgotten only after the
+    /// switch commits. Thus the current process and the next start never
+    /// disagree about which login the previous route should use.
+    pub fn applyMetaskSession(
+        app: *App,
+        sign_in: MetaskSession,
+        token_json: []const u8,
+        diagnostic: ?*@import("api/provider_login.zig").ImportDiagnostic,
+    ) SignInApplied {
         var applied: SignInApplied = .{};
+        const auth = @import("core/auth.zig");
+        var had_auth = true;
+        var previous = auth.loadDefault(app.allocator, app.stateRoot()) catch |err| switch (err) {
+            error.NotFound, error.NoHome => blk: {
+                had_auth = false;
+                break :blk auth.StoredCredentials{};
+            },
+            else => {
+                applied.storage_error = err;
+                return applied;
+            },
+        };
+        defer previous.deinit(app.allocator);
+        var candidate = previous.clone(app.allocator) catch |err| {
+            applied.storage_error = err;
+            return applied;
+        };
+        defer candidate.deinit(app.allocator);
+        candidate.recordSessionChoice(app.allocator, sign_in.model, sign_in.effort) catch |err| {
+            applied.storage_error = err;
+            return applied;
+        };
+        var snapshot = provider_oauth_mod.StoredSnapshot.capture(
+            app.allocator,
+            app.stateRoot(),
+            provider_ids_mod.Slug.lit("metask"),
+        ) catch |err| {
+            applied.storage_error = err;
+            return applied;
+        };
+        defer snapshot.deinit();
+
+        @import("api/provider_login.zig").importTokenResponse(
+            app.allocator,
+            app.stateRoot(),
+            provider_ids_mod.Slug.lit("metask"),
+            token_json,
+            null,
+            diagnostic,
+        ) catch |err| {
+            applied.storage_error = if (diagnostic) |out| out.cause orelse err else err;
+            return applied;
+        };
+        auth.saveDefault(app.allocator, app.stateRoot(), candidate) catch |err| {
+            applied.storage_error = err;
+            applied.rollback_error = app.rollbackMetaskSession(&snapshot, &previous, had_auth);
+            return applied;
+        };
+
         app.bindMetaskSession(sign_in) catch |err| {
             applied.switch_error = err;
+            applied.rollback_error = app.rollbackMetaskSession(&snapshot, &previous, had_auth);
+            return applied;
         };
         if (app.forgetStoredDefault()) |forgotten| {
             applied.default_forgotten = forgotten;
@@ -1664,6 +1729,31 @@ pub const App = struct {
             applied.default_error = err;
         }
         return applied;
+    }
+
+    /// Restore both durable halves, attempting the auth file even if the
+    /// session restore failed. The live OAuth object was never retired.
+    fn rollbackMetaskSession(
+        app: *App,
+        snapshot: *const provider_oauth_mod.StoredSnapshot,
+        previous: *const @import("core/auth.zig").StoredCredentials,
+        had_auth: bool,
+    ) ?anyerror {
+        var first_error: ?anyerror = null;
+        snapshot.restore() catch |err| {
+            first_error = err;
+        };
+        const auth = @import("core/auth.zig");
+        if (had_auth) {
+            auth.saveDefault(app.allocator, app.stateRoot(), previous.*) catch |err| {
+                if (first_error == null) first_error = err;
+            };
+        } else {
+            auth.clearDefault(app.allocator, app.stateRoot()) catch |err| {
+                if (first_error == null) first_error = err;
+            };
+        }
+        return first_error;
     }
 
     /// Undo the Metask inventory a failed `/login` ingested (#485): the

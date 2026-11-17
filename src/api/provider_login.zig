@@ -487,8 +487,8 @@ pub fn importTokenResponse(
     defer session.deinit();
     // Recorded before the import so it lands in the same atomic write as the
     // tokens: a refresh that presents a different client is rejected outright.
-    // Metask's JSON refresh grant is bound to the authorization and expressly
-    // omits client_id; other provider profiles retain their registered client.
+    // Metask's JSON refresh grant uses the fixed public `metacodes` client;
+    // other provider profiles retain their registered client.
     session.setClientId(if (provider_id.eqlText("metask")) null else client_id) catch |err|
         return failed(diagnostic, err, error.ClientRecordFailed);
     session.importOutcome(outcome, time.nowUnix()) catch |err|

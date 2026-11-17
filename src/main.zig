@@ -909,7 +909,7 @@ const no_token_printed = "\nNo token value was printed.\n";
 /// What a run prints when the stored Metask login has no model selection.
 const incomplete_login_hint =
     \\Metask login is incomplete.
-    \\Run `{[command]s} login` in a terminal and select an API key, model, and reasoning effort.
+    \\Run `{[command]s} login` in a terminal and select a model and reasoning effort.
     \\Use --model and --reasoning-effort only when intentionally overriding the saved selection.
     \\
 ;
@@ -4780,6 +4780,8 @@ test "the sign-in hints name the command that was run, the default sign-in first
         const run_login = try std.fmt.allocPrint(a, "Run `{s} login` in a terminal", .{command});
         defer a.free(run_login);
         try std.testing.expect(std.mem.indexOf(u8, incomplete, run_login) != null);
+        try std.testing.expect(std.mem.indexOf(u8, incomplete, "select a model and reasoning effort") != null);
+        try std.testing.expect(std.mem.indexOf(u8, incomplete, "API key") == null);
 
         const session = try std.fmt.allocPrint(a, metask_session_hint, .{ .command = command });
         defer a.free(session);

@@ -3220,7 +3220,6 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
 /// changes nothing.
 fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) !void {
     const th = app.theme;
-    const auth = @import("../core/auth.zig");
     var dialog = dialogs.MetaskSignInDialog.init(app.allocator);
     defer dialog.deinit();
     dialog.term_rows = terminalRows();
@@ -3253,51 +3252,31 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) 
         app.allocator.free(token_json);
     }
 
-    // The sign-in, stored as `metacodes login` stores it: the token response
-    // as the Metask session, the gateway it names included.
     var diagnostic: provider_login.ImportDiagnostic = .{};
-    provider_login.importTokenResponse(app.allocator, app.stateRoot(), @import("../provider/ids.zig").Slug.lit("metask"), token_json, null, &diagnostic) catch |err| {
-        cmd_output.print("{s}The sign-in was not stored: {s}{s}\n", .{ th.danger, @errorName(diagnostic.cause orelse err), th.reset });
-        return;
-    };
-    // auth.json keeps the model and reasoning level. A key or an older
-    // sign-in an earlier `/login` left there would outrank the new session
-    // at the next start: the most recent sign-in replaces them.
-    var stored = auth.loadDefault(app.allocator, app.stateRoot()) catch |err| switch (err) {
-        error.NotFound, error.NoHome => auth.StoredCredentials{},
-        else => {
-            cmd_output.print("{s}Signed in, but the model choice was not stored: {s} could not be read ({s}){s}\n", .{ th.danger, "auth.json", @errorName(err), th.reset });
-            return;
-        },
-    };
-    defer stored.deinit(app.allocator);
-    try recordSignInChoice(app.allocator, &stored, model, dialog.effort);
-    auth.saveDefault(app.allocator, app.stateRoot(), stored) catch |err| {
-        cmd_output.print("{s}Signed in, but the model choice was not stored: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
-        return;
-    };
-
-    // The session moves onto the sign-in, and a stored `/model` default is
-    // forgotten either way: the sign-in is the most recent explicit choice.
     const applied = app.applyMetaskSession(.{
         .gateway = worker.gateway.?,
         .model = model,
         .effort = dialog.effort,
         .models_json = worker.models_json.?,
-    });
-    if (applied.switch_error) |err| {
-        cmd_output.print("{s}Signed in, but this session could not switch to Metask ({s}); it stays as it was{s}\n", .{ th.danger, @errorName(err), th.reset });
-    } else {
-        cmd_output.print("Signed in to Metask · {s}", .{app.activeModel()});
-        if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
-        cmd_output.print("\n", .{});
+    }, token_json, &diagnostic);
+    if (applied.storage_error != null or applied.switch_error != null) {
+        const err = if (applied.storage_error) |storage_err| storage_err else applied.switch_error.?;
+        if (applied.rollback_error) |rollback_err| {
+            cmd_output.print("{s}Login failed: {s}; the previous sign-in could not be fully restored ({s}){s}\n", .{ th.danger, @errorName(err), @errorName(rollback_err), th.reset });
+        } else {
+            cmd_output.print("{s}Login failed: {s}; the previous sign-in, model default, and this session are unchanged{s}\n", .{ th.danger, @errorName(err), th.reset });
+        }
+        return;
     }
+    cmd_output.print("Signed in to Metask · {s}", .{app.activeModel()});
+    if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
+    cmd_output.print("\n", .{});
     if (applied.default_error) |err| {
         cmd_output.print("{s}The stored default model could not be cleared ({s}); the next start may use it{s}\n", .{ th.warn, @errorName(err), th.reset });
     } else {
         cmd_output.print("{s}New sessions start on Metask{s}{s}.{s}\n", .{
             th.dim,
-            if (applied.switch_error == null) " too" else "",
+            " too",
             if (applied.default_forgotten) " (the previous default model is forgotten)" else "",
             th.reset,
         });
