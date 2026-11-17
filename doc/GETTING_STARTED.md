@@ -108,7 +108,9 @@ install record, then `~/.metacodes` ([INSTALL_DESIGN.md](INSTALL_DESIGN.md)).
 
 metacodes is model-agnostic. `--provider` selects a provider profile
 (`metask`, `openai`, `gemini`, `zai-coding-plan`, `deepseek`, `kimi`,
-`kimi-code`, `qwen`, `minimax`, `bedrock`, or one you define), `--channel` a route within it, and `--offer` pins one exact model route. `metacodes
+`kimi-code`, `qwen`, `minimax`, `bedrock`, or one you define), `--channel` a route within it, and `--offer` pins one exact model route.
+`--preset <name>` uses a named setup you keep in `config.json`, and a directory
+can remember one ([presets](LOCAL_CONFIG.md#presets)). `metacodes
 --check-providers` validates the configuration and lists every route without
 touching the network. `--base-url`, `--api-key` and `--model` override the
 endpoint, key and model for a single run; `--openai-protocol responses`
