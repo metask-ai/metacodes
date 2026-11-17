@@ -88,6 +88,13 @@ const Case = struct {
     fn request(self: *Case) ![]const u8 {
         return std.fmt.allocPrint(self.arena.allocator(), "{s}/request.md", .{self.root});
     }
+
+    fn configuredMcp(self: *Case, file: []const u8) !void {
+        const a = self.arena.allocator();
+        const script = try std.fmt.allocPrint(a, "printf started > '{s}/outbound-mcp-started'", .{self.root});
+        const json = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(.{ .mcpServers = .{ .teamwork = .{ .command = "/bin/sh", .args = .{ "-c", script } } } }, .{})});
+        try self.write(file, json);
+    }
 };
 
 test "teamwork command: approval and budget gates precede App, seats and worktrees" {
@@ -183,6 +190,7 @@ test "teamwork command: inherited native models are pinned on wire and retained 
     try c.init();
     defer c.deinit();
     const a = c.arena.allocator();
+    try c.configuredMcp("repo/.mcp.json");
     const text = start ++ "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"No handoff in this fixture\"}}\n\n" ++ stop;
     var server = try harness.MockServer.startCassette(&.{text}, 0);
     defer server.stop();
@@ -196,6 +204,16 @@ test "teamwork command: inherited native models are pinned on wire and retained 
     try testing.expectEqual(@as(i32, 1), out.exit_code);
     try testing.expectEqual(@as(usize, 1), server.requestCount());
     try testing.expectEqualStrings("\"fixture-original\"", server.requestAt(0).?.jsonField("model").?);
+    const tools = try std.json.parseFromSliceLeaky(std.json.Value, a, server.requestAt(0).?.jsonField("tools").?, .{});
+    try testing.expect(tools == .array and tools.array.items.len > 0);
+    inline for (.{ "Read", "Write", "Bash" }) |name| {
+        var found = false;
+        for (tools.array.items) |tool| if (std.mem.eql(u8, tool.object.get("name").?.string, name)) {
+            found = true;
+        };
+        try testing.expect(found);
+    }
+    try testing.expect(!try c.exists("outbound-mcp-started"));
     const policy_text = try c.read("state/teamwork/native1/approved-config.json");
     const policy = try std.json.parseFromSliceLeaky(std.json.Value, a, policy_text, .{});
     const seats = policy.object.get("seats").?.object;
@@ -224,7 +242,7 @@ test "teamwork command: approved external seats config reaches argv, verifier wi
         \\#!/bin/sh
         \\case "$1" in
         \\--version) echo '2.1.323 (Claude Code)'; exit 0 ;;
-        \\--help) echo '--print --output-format stream-json --verbose --add-dir --permission-mode acceptEdits dontAsk --permission-prompts host none --no-session-persistence --model --effort --max-budget-usd --append-system-prompt'; exit 0 ;;
+        \\--help) echo '--print --output-format stream-json --verbose --add-dir --permission-mode acceptEdits dontAsk --permission-prompts host none --no-session-persistence --model --effort --max-budget-usd --append-system-prompt --strict-mcp-config --mcp-config'; exit 0 ;;
         \\esac
         \\seat=''; prev=''
         \\for arg in "$@"; do
@@ -310,6 +328,9 @@ test "teamwork command: installed MCP endpoint negotiates on stdio and never sel
     try c.init();
     defer c.deinit();
     const a = c.arena.allocator();
+    // Claude Code's own config may contain this same teamwork endpoint.
+    // Its subprocess host must not discover and recursively launch it.
+    try c.configuredMcp(".claude.json");
     var provider = try harness.MockServer.startCassette(&.{}, 0);
     defer provider.stop();
     const frames =
@@ -346,6 +367,7 @@ test "teamwork command: installed MCP endpoint negotiates on stdio and never sel
     const final = replies[4].object.get("result").?.object.get("structuredContent").?.object.get("snapshot").?;
     try testing.expectEqualStrings("cancelled", final.object.get("state").?.object.get("kind").?.string);
     try testing.expectEqual(@as(usize, 0), provider.requestCount());
+    try testing.expect(!try c.exists("outbound-mcp-started"));
     try testing.expect(!try c.exists("repo/feature.txt"));
     try testing.expectEqualStrings("Add feature.txt containing feature.\n", try c.read("state/teamwork/mcp1/ORIGINAL_REQUEST.md"));
     // No seat ran: the ledger is empty. Missing-ledger status is also

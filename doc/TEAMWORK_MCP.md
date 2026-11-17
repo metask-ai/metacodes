@@ -37,6 +37,12 @@ broken-pipe policy. All host and driver diagnostics must go to stderr; stdout
 belongs exclusively to MCP. This adapter never changes drivers or sandbox
 policy.
 
+The built teamwork CLI does not discover or start outbound MCP servers. In
+particular, importing a Claude Code user configuration containing this endpoint
+must not recursively start another copy. Native built-in tools are published
+before seats are constructed. Claude Code Workers also receive an explicit
+empty strict MCP configuration; the Manager channel is not inherited by them.
+
 ## Transport and lifecycle
 
 `Server.handle(self, gpa, line) error{OutOfMemory}!?[]u8` processes one JSON-RPC

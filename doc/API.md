@@ -249,6 +249,12 @@ as `reserved` instead of treating unknown spend as zero. `reserved` is cap
 consumption, not a measured bill. The workers/audit cap does not include the
 MCP client's own Manager model calls.
 
+Teamwork CLI hosts set `Config.mcp_connect = .disabled`: configured outbound
+MCP servers (including imported Claude Code config) are not launched. The
+built-in tool surface is still published before seat dependencies are built.
+This prevents recursive launches of the teamwork endpoint and empty native
+seat tool lists. Ordinary CLI/REPL MCP connection modes retain their behavior.
+
 `metacodes --help` enumerates the current flag set and is the authoritative
 pre-1.0 surface; `metacodes --version` prints `metacodes <semver>` as its first
 line, then the build identity (commit and dirty state, Zig, target and

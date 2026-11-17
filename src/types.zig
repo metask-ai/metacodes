@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// See `Config.mcp_connect`.
-pub const McpConnect = enum { app_init, first_request };
+pub const McpConnect = enum { app_init, first_request, disabled };
 
 /// 通用配置
 pub const Config = struct {
@@ -54,6 +54,9 @@ pub const Config = struct {
     /// interactive REPL). `first_request`: App.init returns while they
     /// connect and the REPL joins them before it assembles its first request
     /// (`App.publishMcpServers`), so its prompt never waits on a server.
+    /// `disabled`: do not discover or launch outbound MCP servers; still
+    /// publish the built-in tool surface during App.init. Teamwork controls
+    /// its own tools and must not recursively import its Manager endpoint.
     mcp_connect: McpConnect = .app_init,
     /// Swarm(teams/teammates):`--agent-teams` 开启。opt-in——默认关,不污染单 agent 会话
     /// 的工具菜单(对齐 cc agentSwarmsEnabled 门)。

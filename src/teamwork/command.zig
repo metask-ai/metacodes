@@ -44,7 +44,7 @@ pub const Options = struct {
     approve: bool = false,
     overrides: config.Layer = .{},
     has_overrides: bool = false,
-    host_config: app_types.Config = .{ .prompt = "", .mcp_connect = .first_request },
+    host_config: app_types.Config = .{ .prompt = "", .mcp_connect = .disabled },
 };
 
 /// `args` starts after the word `teamwork`. All strings live in `arena`.
@@ -237,6 +237,9 @@ pub const Host = struct {
     pub fn create(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled) !*Host {
         try supported(cfg);
         if (!sandbox_exec.hostSupported()) return error.SandboxUnavailable;
+        // Other embedders can supply an App with deferred MCP publication.
+        // Never snapshot empty tool definitions into a paid seat's deps.
+        try app.publishMcpServers();
         const self = try arena.create(Host);
         self.* = .{
             .app = app,

@@ -70,6 +70,8 @@ pub const required_help_text = [_][]const u8{
     "--effort",
     "--max-budget-usd",
     "--append-system-prompt",
+    "--strict-mcp-config",
+    "--mcp-config",
 };
 
 /// The variables passed to the CLI, by name; every other variable of the
@@ -208,10 +210,15 @@ pub const ClaudeCodeDriver = struct {
             .wallclock_only => null,
         };
         const base_argv = try buildArgv(arena, external.command.bytes, seat_dir, spec.model, spec.effort, remaining);
-        const cli_argv = try arena.alloc([]const u8, base_argv.len + 2);
+        const cli_argv = try arena.alloc([]const u8, base_argv.len + 5);
         @memcpy(cli_argv[0..base_argv.len], base_argv);
         cli_argv[base_argv.len] = "--append-system-prompt";
         cli_argv[base_argv.len + 1] = charters.forRole(spec.role);
+        // Workers receive no orchestration channel from the user's own
+        // Claude Code config, in particular no copy of the Manager endpoint.
+        cli_argv[base_argv.len + 2] = "--strict-mcp-config";
+        cli_argv[base_argv.len + 3] = "--mcp-config";
+        cli_argv[base_argv.len + 4] = "{\"mcpServers\":{}}";
 
         var launch = self.prepareLaunch(gpa, cli_argv, paths.workspace, seat_dir) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;

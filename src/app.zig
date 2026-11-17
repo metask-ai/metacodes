@@ -3966,6 +3966,7 @@ pub const App = struct {
     /// this thread once every server has reported. Failures are recorded per
     /// server (`mcp_report`, `/mcp`) and never stop the App.
     fn beginMcpStartup(app: *App) void {
+        if (app.config.mcp_connect == .disabled) return;
         const log = @import("util/log.zig");
         const arena_state = app.allocator.create(std.heap.ArenaAllocator) catch |err| {
             log.warn("mcp", "no servers connected: {s}", .{@errorName(err)});

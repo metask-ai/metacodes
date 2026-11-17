@@ -372,12 +372,14 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
     --permission-mode acceptEdits --permission-prompts none --no-session-persistence
     [--model <m>] [--effort <low|medium|high|xhigh|max>] [--max-budget-usd <剩余预算>]
     --append-system-prompt <该角色的固定宪章>
+    --strict-mcp-config --mcp-config '{"mcpServers":{}}'
   ```
 
   `acceptEdits` + `--permission-prompts none`:工作目录内的编辑自动接受,其余需要询问的一律拒绝
   (与 teammate 的 fail-closed 一致)。`--add-dir` 接多个值,所以它后面紧跟另一个选项。
   `effort` 的 `none`/`minimal` 映射为 `low`。`cost` seat 传 `--max-budget-usd`,`wallclock_only`
   seat 不传。
+  Worker 不继承用户的 MCP 配置,避免把 Manager 的编排入口或其他未预算的模型调用引入 seat。
 - **cwd** = 工作区;**环境变量**只传白名单(`env_allowlist`:HOME、PATH、语言、临时目录、XDG、
   CA 证书、`CLAUDE_CONFIG_DIR` 等),任何 provider 密钥(含 `ANTHROPIC_API_KEY`)都不传;Claude
   Code 用它自己的登录。stdin 立即关闭,stderr 写入 `harness.log`。

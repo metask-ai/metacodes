@@ -154,7 +154,7 @@ const fake_help =
     "Usage: claude [options] [command] [prompt]\n" ++
     "  -p, --print  --output-format <format> (\"text\", \"json\", \"stream-json\")  --verbose\n" ++
     "  --add-dir <directories...>  --permission-mode <mode> (\"acceptEdits\", \"dontAsk\")\n" ++
-    "  --no-session-persistence  --model <model>  --effort <level>  --max-budget-usd <amount> --append-system-prompt <prompt>\n";
+    "  --no-session-persistence  --model <model>  --effort <level>  --max-budget-usd <amount> --append-system-prompt <prompt> --strict-mcp-config --mcp-config <config>\n";
 
 const Scenario = enum {
     /// Writes the handoff, reports $0.25, exits 0.
@@ -626,7 +626,10 @@ test "teamwork drivers L2: switching a seat's harness in config switches the spa
         "--verbose",            "--add-dir", seat_dir,                   "--permission-mode", "acceptEdits",
         "--permission-prompts", "none",      "--no-session-persistence", "--max-budget-usd",  budget_arg,
     };
-    try testing.expect(recordHas(record, "argc:16")); // $0 is not in "$@"
+    try testing.expect(recordHas(record, "argc:19")); // $0 is not in "$@"
+    try testing.expect(recordHas(record, "arg:--strict-mcp-config"));
+    try testing.expect(recordHas(record, "arg:--mcp-config"));
+    try testing.expect(recordHas(record, "arg:{\"mcpServers\":{}}"));
     try testing.expect(recordHas(record, "arg:--append-system-prompt"));
     const charter_line = try std.fmt.allocPrint(testing.allocator, "arg:{s}", .{@import("../charters.zig").forRole(.implementer)});
     defer testing.allocator.free(charter_line);
