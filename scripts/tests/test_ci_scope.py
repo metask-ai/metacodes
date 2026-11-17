@@ -59,7 +59,7 @@ RESULT_JOBS = {
 # The leg flags a gate step may be gated on; a step without one runs on every leg.
 LEG_FLAGS = {"units", "integration", "product", "release", "cross", "checks"}
 # Each gate job, its runner OS and the flags its steps read there.
-GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "cross", "checks"}),
+GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "checks"}),
              ("gates-macos", "macOS", {"units", "product", "release", "checks"}),
              ("windows-gates", "Windows", {"units", "integration", "product", "release"}))
 TEST_PARTS = {"test:units", "test:integration", "test:product"}
@@ -277,6 +277,35 @@ class WorkflowTest(unittest.TestCase):
     def test_the_merge_queue_runs_the_workflow(self) -> None:
         triggers = self.workflow.get("on", self.workflow.get(True))  # YAML 1.1 reads `on` as true
         self.assertIn("merge_group", triggers)
+        self.assertIn("pull_request", triggers)
+        self.assertNotIn("push", triggers)  # no duplicate full run after merging
+
+    def test_extended_architectures_are_release_only_and_block_publishing(self) -> None:
+        import yaml
+        release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+        targets = release["jobs"]["build-posix"]["strategy"]["matrix"]["include"]
+        self.assertTrue(any(t["zig_target"] == "x86_64-macos" and t["runner"] == "macos-15-intel" for t in targets))
+        self.assertTrue(any(t["zig_target"] == "aarch64-linux-gnu" and t["runner"] == "ubuntu-24.04-arm" for t in targets))
+        self.assertNotIn("cross", {t["leg"] for t in self.jobs["gates-linux"]["strategy"]["matrix"]["include"]})
+        baseline = next(s for s in self.jobs["gates-macos"]["steps"] if s.get("name") == "macOS release executables need no more than their targets")
+        self.assertNotIn("x86_64-macos", baseline["run"])
+        self.assertIn("aarch64-macos.13.0", baseline["run"])
+        arm = release["jobs"]["windows-arm-cross"]
+        self.assertEqual(arm["strategy"]["matrix"]["target"], ["aarch64-windows-gnu", "aarch64-windows-msvc"])
+        self.assertIn("agentcore:bundle", arm["steps"][-1]["run"])
+        self.assertIn("windows-arm-cross", release["jobs"]["publish"]["needs"])
+        self.assertTrue(any("tinykg:stage -Dtarget=aarch64-linux-musl" in s.get("run", "")
+                            for s in release["jobs"]["build-posix"]["steps"]))
+
+    def test_full_evidence_requires_all_suites_and_excludes_scope_fast_paths(self) -> None:
+        job = self.jobs["full-pr-evidence"]
+        self.assertEqual(set(job["needs"]), {"release-fast-path", "scope", "gates-linux", "gates-macos",
+                                            "windows-gates", "tty-linux", "tty-windows", "sdk-bindings"})
+        self.assertIn("needs.scope.outputs.scope == 'full'", job["if"])
+        self.assertIn("needs.release-fast-path.outputs.fast == 'false'", job["if"])
+        self.assertIn("github.event_name == 'pull_request'", job["if"])
+        self.assertIn('.result == "success"', job["steps"][0]["run"])
+        self.assertIn("ci_evidence.py", job["steps"][2]["run"])
 
     def test_every_leg_reads_its_scope(self) -> None:
         for job, var in LEG_JOBS:
@@ -482,6 +511,7 @@ class AgentCoreWorkflowTest(unittest.TestCase):
 
     def test_the_merge_queue_runs_the_workflow(self) -> None:
         self.assertIn("merge_group", self.workflow.get("on", self.workflow.get(True)))
+        self.assertNotIn("push", self.workflow.get("on", self.workflow.get(True)))
 
     def render(self, event: str) -> str:
         values = {
