@@ -16,6 +16,20 @@ empty `### Migration`.
 
 ### Changed
 
+- An explicit Skill invocation Run (`RUN_INPUT_SKILL`, `session->run_skill`)
+  takes `RunOptionsV1.context_blocks` (#534). It used to refuse any block with
+  `INVALID_ARGUMENT` ("context blocks are not accepted with SkillInvocation
+  input"). The blocks are validated as for a Text Run and rendered into the
+  same `<system-reminder>` text part, which leads the Skill's invocation
+  record, so the Skill's first request carries them before the Skill body; a
+  `context: fork` Skill's child gets them leading its one user record, before
+  the body. The Session Conversation and its checkpoints keep them, as for a
+  Text Run. The time context now applies to a Skill invocation too: under the
+  default `TIME_CONTEXT_SYSTEM` its first request names the date, and
+  `TIME_CONTEXT_UTC_OFFSET`, once refused for it, is accepted. ABI revision 28
+  is unchanged: no struct, slot or status moves, and input that used to be
+  refused is now accepted.
+
 - No change a Host can see. The inputs moved for the Zig `SessionHost`'s model
   resolution and submission journal (#445: tier names and the provider guard
   through `Options.models`, `config_changed` lines, a worded

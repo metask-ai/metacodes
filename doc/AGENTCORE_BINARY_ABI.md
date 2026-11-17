@@ -1164,8 +1164,9 @@ changes with the date. `RunOptionsV1.time_context_code` chooses the zone:
 `utc_offset_minutes` is zero under every code but `UTC_OFFSET`. A Host block
 labeled `currentDate` is the Run's time context: under `SYSTEM` the runtime
 adds none, and together with `UTC_OFFSET` it is two answers to one question
-and the Run is refused. A Skill invocation carries no context blocks, so it
-takes `SYSTEM` (nothing is added) or `OFF`. Every violation is
+and the Run is refused. A Skill invocation takes the time context as a Text
+Run does (#534): its context leads the invocation record, so under `SYSTEM`
+and `UTC_OFFSET` the Skill's first request names the date. Every violation is
 `INVALID_ARGUMENT` before admission: no `run_id` advances and nothing reaches
 the Provider.
 
@@ -1666,9 +1667,9 @@ workspace, and tools; a profile the current kernel refuses restores as
 `CHECKPOINT_UNSUPPORTED`.
 
 `RunOptionsV1.context_blocks` (with `context_block_count`, null with zero when
-absent) carries up to 32 `ContextBlockV1` facts for one `RUN_INPUT_TEXT` or
-`RUN_INPUT_MULTIMODAL` Run — the date, the state of the Host's page or
-document. Each has a label of 1-64 bytes of `[A-Za-z0-9 ._:/-]` starting with a
+absent) carries up to 32 `ContextBlockV1` facts for one `RUN_INPUT_TEXT`,
+`RUN_INPUT_MULTIMODAL` or `RUN_INPUT_SKILL` Run — the date, the state of the
+Host's page or document, a file the user attached. Each has a label of 1-64 bytes of `[A-Za-z0-9 ._:/-]` starting with a
 letter or digit and non-empty UTF-8 text of at most 64 KiB (256 KiB for labels
 and texts together); a text may not contain a `<system-reminder>` tag. They are
 rendered, in order, into one text part that leads the Run's user record:
@@ -1685,8 +1686,13 @@ Today's date is 2026/10/02.
 
 It is ordinary Conversation content: it enters the durable budget with the
 user record, stays in later requests' history (the cached prefix only grows),
-and checkpoints keep it. A `RUN_INPUT_SKILL` Run refuses context blocks with
-`STATUS_INVALID_ARGUMENT`. Volatile facts belong here rather than in profile
+and checkpoints keep it. A `RUN_INPUT_SKILL` Run takes the same blocks under
+the same rules (#534): the text part leads its invocation record, the user
+record that precedes the Skill body, so the Skill's first request carries the
+context before the body. A Skill with `context: fork` runs in a child
+Conversation whose one user record is the context and the Skill body, in
+that order; the Session Conversation keeps the context leading the
+invocation record either way. Volatile facts belong here rather than in profile
 text, which would move the system prompt and its cache prefix on every change.
 
 The process-wide `METACODES_PROMPT_OVERRIDE_USING_TOOLS` experiment slot sets

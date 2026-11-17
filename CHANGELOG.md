@@ -12,6 +12,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **An explicit Skill run takes the Host's context blocks** (#534). An
+  AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
+  be refused with `INVALID_ARGUMENT`; the blocks now lead the Skill's
+  invocation record, so the selected Skill sees them, and the date, from its
+  first request (`doc/AGENTCORE_BINARY_ABI.md`).
+
 - **The Metask sign-in moves to `www.metask-ai.com` and is kept as the Metask
   session** (#527). `/login` and `metacodes login` sign in at Metask's OAuth
   server as the public client `metacodes`, ask for `read model:invoke`, and
@@ -322,6 +328,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Shift+Enter inserts a newline while a reply streams** (#456). In the
+  terminal UI, Shift+Enter during a reply did what Enter does: the draft
+  went into the pending queue, the input box was cleared, and when the reply
+  ended the line typed so far was sent as the next message. It now inserts
+  a newline in the draft, as it does at the prompt; Enter still queues the
+  whole draft, newline included, as one message.
 - **`/model` names the variable and the file for a provider without a key**
   (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
   chosen without its key ended in `switch failed (MissingCredentials)`: these
