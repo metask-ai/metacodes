@@ -1,0 +1,6 @@
+# The scripted endpoint runs on the Docker host (smoke.py); this name reaches
+# it from the task container on Linux, as Docker Desktop provides by default.
+services:
+  main:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -251,6 +251,29 @@ The README reads it as: on Code, which hidden tests score, metacodes lands
 between the two official harnesses; Security trails; Web and Office are not
 compared because the judges differ. No stronger claim is made.
 
+### Upstream Harbor benchmarks (Terminal-Bench, DeepSWE)
+
+[scripts/eval/harbor/README.md](../scripts/eval/harbor/README.md) runs a
+metacodes Linux release as an installed agent of upstream Harbor (0.26), the
+runner behind Terminal-Bench 2.x and later, DeepSWE and the Harbor Hub
+datasets. Each trial gets its own state dir and an exclusive TinyKG store.
+The adapter produces ATIF trajectories and Harbor's token counters.
+
+| Stage | Status |
+|---|---|
+| Zero-cost smoke (`python3 -m scripts.eval.harbor.smoke`): real `harbor run`, scripted endpoint, `ubuntu:22.04` task | **Passed** 2026-11-16 with the 0.12.0 release: reward 1.0, one Bash call in the trajectory |
+| Paid pilot: Terminal-Bench 2.1, first 5 tasks, 1 attempt, `qwen/qwen3.8-max`, 0.12.0 | **Adapter check only** (2026-11-16, US$1.04 nominal): 2 of 2 valid trials reward 1.0; 3 invalid (see below) |
+| Paid pilot: the same 5 tasks, 1 attempt, GLM-5.3-Flash through an OpenAI-compatible gateway (`custom_providers`), 0.12.0, 5 concurrent | **Adapter check only** (2026-11-16): 2 of 4 graded trials reward 1.0 (`kv-store-grpc`, `pypi-server`); `schemelike-metacircular-eval` and `write-compressor` 0; `torch-tensor-parallelism` invalid (the agent finished, the task's verifier timed out); 1.05 M input tokens (92% cache reads), 34 k output |
+| Terminal-Bench / DeepSWE score | Not run |
+
+The first pilot's three invalid trials are infrastructure failures, not agent
+failures. Two task images (`torch-tensor-parallelism`, `write-compressor`:
+Ubuntu 24.04 without `ca-certificates`) had no CA bundle, so every provider
+request failed with `TlsInitializationFailed`; the adapter now installs the
+package when the image lacks one. The third (`schemelike-metacircular-eval`)
+stopped at turn 13 when the provider refused the account (DashScope
+`Arrearage`). Five tasks and one attempt make no score.
+
 ## 5. Rules for running and reporting
 
 1. Paid or model-backed runs never happen in ordinary development or CI; they
