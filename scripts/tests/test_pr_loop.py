@@ -79,6 +79,8 @@ class FixtureGitHub(GitHub):
         self.check_state = "success"
         self.external_app = False
         self.change_on_snapshot = None
+        self.change_target_on_snapshot = None
+        self.base_branch = "main"
         self.snapshots = 0
 
     def api(self, path, method="GET", payload=None):
@@ -88,8 +90,10 @@ class FixtureGitHub(GitHub):
             self.snapshots += 1
             if self.snapshots == self.change_on_snapshot:
                 self.base = "b" * 40
+            if self.snapshots == self.change_target_on_snapshot:
+                self.base_branch = "release"
             return {"node_id": "PR_7", "head": {"sha": head, "ref": "feature", "repo": {"full_name": "example/source"}},
-                    "base": {"sha": self.base, "ref": "main"}, "title": "Fix app", "body": "Task details",
+                    "base": {"sha": self.base, "ref": self.base_branch}, "title": "Fix app", "body": "Task details",
                     "html_url": f"https://github.com/{DEFAULT_REPO}/pull/7", "state": "open",
                     "merged": self.merged, "draft": False, "mergeable": True, "merge_commit_sha": "a" * 40}
         if path == "graphql":
@@ -214,6 +218,13 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(self.row()["state"], "waiting")
         self.assertFalse(self.github.queued)
 
+    def test_distinct_push_url_is_checked_before_starting_an_agent(self):
+        git(self.work, "config", "remote.origin.pushurl", "git@github.com:other/repository.git")
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_decision")
+        self.assertIn("push remote", self.row()["reason"])
+        self.assertEqual(self.requests("turn/start"), [])
+
     def test_ci_failure_is_returned_to_original_worker(self):
         self.configure(reports=[PASS], worker_texts=["fixed\n"])
         self.github.check_state = "failure"
@@ -229,6 +240,22 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertIsNone(self.row()["report"])
         self.assertFalse(self.github.queued)
         self.assertFalse(any(p.get("state") == "success" for _, _, p in self.github.calls if isinstance(p, dict)))
+
+    def test_retarget_with_identical_shas_cannot_reuse_a_review(self):
+        self.configure()
+        self.github.change_target_on_snapshot = 2
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_decision")
+        self.assertIn("identity changed", self.row()["reason"])
+        self.assertFalse(self.github.queued)
+
+    def test_gate_mutations_are_preserved_and_never_pushed(self):
+        self.controller.gate = (sys.executable, "-c", "from pathlib import Path; Path('app.txt').write_text('gate mutation')")
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_decision")
+        self.assertIn("dirty", self.row()["reason"])
+        self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)
+        self.assertEqual(len(self.requests("thread/resume")), 1)
 
     def test_crashed_in_flight_work_is_not_replayed(self):
         self.store.update(self.binding, State.PUSHING)

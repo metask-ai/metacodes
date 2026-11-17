@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import signal
 import subprocess
 import tempfile
@@ -149,10 +150,12 @@ class Git:
             self.clean()
         if self.branch() != binding.branch or self.git("rev-parse", "HEAD") != pr.head:
             raise LoopError("worker checkout does not match the bound PR branch and head")
-        url = self.git("config", "--get", f"remote.{binding.remote}.url")
         expected = binding.head_repo
-        if url.removesuffix(".git") not in (f"git@github.com:{expected}", f"https://github.com/{expected}"):
-            raise LoopError("push remote does not point to the PR's head repository")
+        urls = self.git("config", "--get-regexp", rf"^remote\.{re.escape(binding.remote)}\.(url|pushurl)$")
+        for setting in urls.splitlines():
+            url = setting.split(None, 1)[1]
+            if url.removesuffix(".git") not in (f"git@github.com:{expected}", f"https://github.com/{expected}"):
+                raise LoopError("push remote does not point to the PR's head repository")
 
     @contextmanager
     def review_tree(self, pr):

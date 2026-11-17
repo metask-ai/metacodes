@@ -166,6 +166,9 @@ class Controller:
 
     def current(self, binding, expected):
         latest = self.github.snapshot(binding.repo, binding.number)
+        if (latest.branch, latest.base_branch, latest.head_repo, latest.node_id) != (
+                expected.branch, expected.base_branch, expected.head_repo, expected.node_id):
+            raise LoopError("PR target or head identity changed during the operation")
         if not latest.open or latest.draft or latest.revision != expected.revision:
             self.store.update(binding, State.PENDING, report=None, reason="PR changed during the operation")
             return None
@@ -228,12 +231,13 @@ class Controller:
             # feedback, not an automatic request for human intervention.
             try:
                 run(self.gate, cwd=binding.worktree, timeout=binding.timeout)
-                git.clean()
-                if git.git("rev-parse", "HEAD") != local_head:
-                    raise LoopError("validation changed the checkpoint commit")
-                break
             except LoopError as exc:
                 evidence = {"prior_feedback": evidence, "local_gate_failure": str(exc)}
+                continue
+            git.clean()
+            if git.git("rev-parse", "HEAD") != local_head:
+                raise LoopError("validation changed the checkpoint commit")
+            break
         if not self.current(binding, pr):
             raise LoopError("PR changed during validation; local changes are preserved")
         self.store.update(binding, State.PUSHING)
