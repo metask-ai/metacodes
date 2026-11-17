@@ -27,7 +27,7 @@ pub const app_route_state = @import("app/route_state.zig"); // pub: component te
 const route_state_mod = app_route_state;
 pub const app_sign_out = @import("app/sign_out.zig"); // pub: component tests sign out in process
 const sign_out_mod = app_sign_out;
-pub const app_startup_order = @import("app/startup_order.zig"); // pub: component tests read the decision
+const app_startup_order = @import("app/startup_order.zig");
 const startup_order = app_startup_order;
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
@@ -583,34 +583,38 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
     var document = store.load() catch return .unreadable;
     defer document.deinit();
     const selection = document.global_selection orelse return .none;
-    const host = buildProviderHost(arena) orelse return .{ .usable = null };
+    const host = buildProviderHost(arena) orelse return .{ .usable = .{} };
     defer host.destroy();
-    const outcome = provider_startup.resolveSelection(arena, &host.registry, selection) catch return .{ .usable = null };
+    const outcome = provider_startup.resolveSelection(arena, &host.registry, selection) catch return .{ .usable = .{} };
     const route = switch (outcome) {
-        .failure => return .{ .usable = null },
+        .failure => return .{ .usable = .{} },
         .route => |value| value,
     };
     const provider_name = if (host.registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
-    const label = std.fmt.allocPrint(arena, "{s} · {s}", .{ provider_name, route.request_model_id }) catch return .{ .usable = null };
+    const label = std.fmt.allocPrint(arena, "{s} · {s}", .{ provider_name, route.request_model_id }) catch return .{ .usable = .{} };
+    const usable: StoredDefault.Usable = .{
+        .label = label,
+        .provider = arena.dupe(u8, route.provider_id.slice()) catch null,
+    };
     if (route.provider_id.eqlText("metask")) {
-        if (metask_key_present) return .{ .usable = label };
+        if (metask_key_present) return .{ .usable = usable };
         // The browser sign-in's key serves a stored Metask default too
         // (`browserSignInKey`), the way it serves the historical path.
         if (browserSignInKey(arena, config.state_root)) |key| {
             std.crypto.secureZero(u8, key);
             arena.free(key);
-            return .{ .usable = label };
+            return .{ .usable = usable };
         }
         var session = provider_oauth_mod.Session.initHome(arena, config.state_root, provider_ids_mod.Slug.lit("metask")) catch
             return .{ .lacks_credential = label };
         defer session.deinit();
-        return if (session.load() catch false) .{ .usable = label } else .{ .lacks_credential = label };
+        return if (session.load() catch false) .{ .usable = usable } else .{ .lacks_credential = label };
     }
     if (resolveProviderScopedCredentialReporting(arena, config, route.provider_id.slice(), .quiet)) |found| {
         std.crypto.secureZero(u8, found.secret);
         arena.free(found.secret);
-        return .{ .usable = label };
-    } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .{ .usable = label };
+        return .{ .usable = usable };
+    } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .{ .usable = usable };
 }
 
 /// `METACODES_AUTH_PRECEDENCE`, which overrides `--auth-precedence`. A start
@@ -3278,7 +3282,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
             env_model orelse "",
         }),
         .stored_default => switch (facts.stored_default) {
-            .usable => |label| if (label) |name|
+            .usable => |usable| if (usable.label) |name|
                 std.debug.print("This start uses the default stored with /model: {s}.\n", .{name})
             else
                 std.debug.print("This start uses the default stored with /model.\n", .{}),
@@ -3320,7 +3324,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     switch (facts.stored_default) {
         .none => std.debug.print("{s}2 stored default: {s}\n", .{ mark.at(2, decision), if (facts.named) "not consulted, level 1 names a provider" else "none" }),
         .unreadable => std.debug.print("{s}2 stored default: config.json cannot be read\n", .{mark.at(2, decision)}),
-        .usable => |label| std.debug.print("{s}2 stored default: {s}\n", .{ mark.at(2, decision), label orelse "set" }),
+        .usable => |usable| std.debug.print("{s}2 stored default: {s}\n", .{ mark.at(2, decision), usable.label orelse "set" }),
         .lacks_credential => |label| std.debug.print("{s}2 stored default: {s}, which has no key or sign-in: passed over\n", .{ mark.at(2, decision), label }),
     }
     // 3. A Metask sign-in: the historical path's key, else the session.
@@ -3366,6 +3370,10 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     // Keys only in the shell are not metacodes' to pick up (第四节).
     const chosen_provider: ?[]const u8 = switch (decision) {
         .named => config.provider_profile,
+        .stored_default => switch (facts.stored_default) {
+            .usable => |usable| usable.provider,
+            else => null,
+        },
         .local_provider => switch (facts.local) {
             .provider => |chosen| chosen.name,
             else => null,

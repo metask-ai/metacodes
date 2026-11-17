@@ -1120,6 +1120,22 @@ test "login status reads METACODES_AUTH_PRECEDENCE as the start does: under oaut
     try testing.expectEqual(sent, gateway.requestCount());
 }
 
+test "login status does not call the /model default's own shell key one that chooses no provider" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    // DeepSeek is the stored default and its key is in the shell. That key is
+    // the default's own credential, so only OpenAI's key chooses no provider.
+    try storeDefault(&case, "deepseek", "deepseek-v4-pro");
+    const out = try runCli(&case, cli, &.{ "DEEPSEEK_API_KEY=sk-shell-deepseek", "OPENAI_API_KEY=sk-shell-openai" }, &.{ "login", "status" });
+    try expectContains(out.stderr, "This start uses the default stored with /model: DeepSeek · deepseek-v4-pro.");
+    try expectContains(out.stderr, "Keys in the shell choose no provider: OPENAI_API_KEY (OpenAI).");
+    try expectAbsent(out.stderr, "DEEPSEEK_API_KEY (DeepSeek)");
+    for ([_][]const u8{ "sk-shell-deepseek", "sk-shell-openai" }) |secret| try expectAbsent(out.stderr, secret);
+}
+
 test "a plain start with only the Metask session signs in with it, at the gateway it names, ahead of .env (#499, #527)" {
     var case: Case = undefined;
     try case.init();
