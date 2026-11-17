@@ -461,6 +461,13 @@ pub const ProviderProfile = struct {
     /// `login --provider` setup of a provider without an OAuth grant. Null
     /// means the provider documents no such page.
     api_key_setup: ?ApiKeySetup = null,
+    /// A subscription plan: a coding plan billed by the month rather than by
+    /// the token. The vendors license these for a person working in a coding
+    /// tool (Kimi Code: personal, interactive use; the GLM Coding Plan: the
+    /// tools Zhipu lists), so a start with nobody at the keyboard (`-p`,
+    /// `serve`, a resumed suspension, the REPL reading a pipe) says so once
+    /// on stderr. It never refuses: the terms are the vendor's to enforce.
+    subscription_plan: bool = false,
 
     /// The key page for a channel's region, else the first page.
     pub fn defaultKeyPage(self: ProviderProfile, channel_id: ?Slug) ?KeyPage {

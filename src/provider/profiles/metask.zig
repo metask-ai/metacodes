@@ -120,8 +120,8 @@ pub const PROFILE = profile.ProviderProfile{
     .env_aliases = &ENV_ALIASES,
     .auth = .bearer,
     .default_channel = Slug.lit("default"),
-    .oauth_token_url = "https://metask-ai.com/api/oauth/token",
-    .oauth_device_authorization_url = "https://metask-ai.com/api/oauth/device/code",
+    .oauth_token_url = "https://www.metask-ai.com/api/oauth/token",
+    .oauth_device_authorization_url = "https://www.metask-ai.com/api/oauth/device/code",
     .oauth_client_id = "metacodes",
 };
 

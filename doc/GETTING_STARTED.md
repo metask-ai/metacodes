@@ -148,10 +148,11 @@ Z.AI has no third-party sign-in, so the login asks which plan the key is for
 the pasted key without showing it. The key is checked against the plan's
 model list and stored in `$HOME/.metacodes/keys/zai-coding-plan.json` (0600);
 a refused key is not stored. Create it on the Coding Plan page, not the
-standard API-key page: a standard key bills the account balance. `/login`
-and `/model` in the TUI offer the same steps. `ZAI_API_KEY` still works and
-wins over the stored key; `metacodes logout --provider zai-coding-plan`
-forgets it.
+standard API-key page: a standard key bills the account balance. `/login
+zai-coding-plan` in the TUI offers the same steps; `/model` lists the plan
+once a key is stored or set, and until then says where one goes.
+`ZAI_API_KEY` still works and wins over the stored key;
+`metacodes logout --provider zai-coding-plan` forgets it.
 
 ## Kimi Code
 
@@ -181,13 +182,33 @@ effort (low, high or max; unset is the server's default).
 
 ## Metask OAuth
 
-`metacodes login --provider metask` uses Metask's JSON device authorization
-flow. It prints `METASK_VERIFICATION_URI=...` and `METASK_USER_CODE=...` to
-stderr (use `--no-browser` on a headless machine), then stores the access and
-rotating refresh tokens plus gateway/model URLs in
-`$HOME/.metacodes/oauth/metask.json`. Set `METASK_SITE_URL` for a local control
-plane (`http://localhost:3000`); `METASK_GATEWAY_URL` overrides the gateway
-origin for local development. `METACODES_OAUTH_DIR` changes the OAuth store.
+`metacodes login` (and `/login` in the TUI) signs in to Metask in the browser,
+at Metask's OAuth server `https://www.metask-ai.com`, as the public client
+`metacodes` asking for `read model:invoke`: the browser returns to
+`http://localhost:<port>/auth/metask/callback`, and you choose a model and a
+reasoning level from the `/v1/models` of the gateway the sign-in names. There
+is no API key to choose: the session calls that gateway with its own access
+token, billed to the account. The access and rotating refresh tokens, with the
+gateway and model URLs, are stored as the Metask session in
+`<state root>/oauth/metask.json`; the model and reasoning level in
+`<state root>/auth.json`. The session switches to Metask at once, and later
+starts use it. `/logout` (or `metacodes logout`) revokes the session at Metask,
+removes both files, and switches the session to the provider `.env`
+configures, if any.
+
+On a machine without a browser, `metacodes login --provider metask` uses
+Metask's JSON device authorization flow and stores the same session. It prints
+`METASK_VERIFICATION_URI=...` and `METASK_USER_CODE=...` to stderr (use
+`--no-browser` on a headless machine). At a terminal it then asks for the
+model and reasoning level, as `metacodes login` does, and stores them the same
+way; without one (a script that confirms the code elsewhere) it stores only
+the session and says so, and a start on it names its model with `--model`.
+`/login metask` is the same in the TUI. A plain start signs in with the stored
+session unless a key signs Metask in (`--api-key`, `METASK_API_KEY`, or a key
+in `auth.json` from `metacodes login --api-key` or a sign-in older than this).
+Set `METASK_SITE_URL` for a local control plane (`http://localhost:3000`);
+`METASK_GATEWAY_URL` overrides the gateway origin for local development.
+`METACODES_OAUTH_DIR` changes the OAuth store.
 
 Gateway requests use both Anthropic Messages and OpenAI Chat routes. A request
 that receives `401` with `code=token_expired` is refreshed once and replayed;

@@ -422,7 +422,9 @@ test "bwrap argv: read-only root, physical write roots, carve-outs after them, c
     const ws_bind = indexOfSeq(argv, &.{ "--bind", ws, ws }).?;
     try testing.expect(indexOfSeq(argv, &.{ "--bind", extra, extra }) != null);
     try testing.expect(indexOfSeq(argv, &.{ "--bind", link, link }) == null);
-    try testing.expect(indexOfSeq(argv, &.{ "--bind", "/tmp", "/tmp" }) != null);
+    var tmp_buf: PathBuf = undefined;
+    const physical_tmp = std.mem.span(pfs.realpath("/tmp", &tmp_buf) orelse return error.PathResolutionFailed);
+    try testing.expect(indexOfSeq(argv, &.{ "--bind", physical_tmp, physical_tmp }) != null);
     const deny_w = indexOfSeq(argv, &.{ "--ro-bind", env_file, env_file }).?;
     const deny_r = indexOfSeq(argv, &.{ "--tmpfs", ssh, "--remount-ro", ssh }).?;
     try testing.expect(indexOfSeq(argv, &.{ "--ro-bind", "/dev/null", netrc }) != null);

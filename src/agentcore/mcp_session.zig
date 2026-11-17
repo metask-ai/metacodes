@@ -1479,4 +1479,9 @@ test "the same server through the product registry and the AgentCore overlay giv
     try std.testing.expect(!std.mem.eql(u8, view.entries[0].model_name, "mcp__weather__weather"));
     try std.testing.expectEqual(@as(u32, 1), overlay_server.calls);
     try std.testing.expectEqual(@as(u32, 1), product_server.calls);
+    // One permission class for the one tool (#473): the overlay's metadata
+    // and the product registry entry both say execute.
+    const overlay_class = environment.surface().dispatcher.category(view.entries[0].model_name);
+    try std.testing.expectEqual(@as(?core.tool_context.ToolCategory, .execute), overlay_class);
+    try std.testing.expectEqual(overlay_class, registry.category("mcp__weather__weather"));
 }

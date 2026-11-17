@@ -16,7 +16,8 @@ and how metacodes decides which provider to use.
 ## Where the file is
 
 Every install has a state root of its own: the directory that also holds
-`auth.json` (the Metask sign-in) and `config.json`. The file is `.env` in it.
+`oauth/metask.json` (the Metask sign-in), `auth.json` and `config.json`. The
+file is `.env` in it.
 
 | Install | File |
 |---|---|
@@ -149,26 +150,63 @@ At start, metacodes takes the first of these that applies:
 
 1. **Flags and the shell environment**: `--provider`, `--offer`, or
    `METACODES_PROVIDER` set in the shell. `--model` (or `METACODES_MODEL` in
-   the shell) picks the model.
+   the shell) picks the model. A provider named this way and without a key
+   is not replaced by another: the terminal UI opens without a model and
+   names the variable it needs; `-p` stops with the same.
 2. **The default you chose in `/model`** (Tab, "use from now on"), kept in
-   `config.json`.
-3. **A Metask sign-in**: `--api-key`, `METASK_API_KEY` in the shell, or the
-   login `metacodes login` stored in `auth.json`. `METASK_API_KEY` in this
+   `config.json`. When its provider has no key (anymore), it is passed over
+   for the steps below, and the start says so once.
+3. **A Metask sign-in**: `--api-key`, `METASK_API_KEY` in the shell, a key in
+   `auth.json`, or the Metask session `metacodes login` (or `/login`) stored
+   in `oauth/metask.json`; a key comes before the session. `METASK_API_KEY` in this
    file counts too, unless the file's `METACODES_PROVIDER` names another
    provider: the provider the file names is its choice, and a Metask key
    beside it does not overrule that.
 4. **The provider this file configures**: `METACODES_PROVIDER` here, or, when
    it names none, the one provider whose key the file holds.
-5. **Nothing**: metacodes stops and says how to sign in or set up this file.
+5. **Nothing**: the terminal UI opens without a model. Its banner reads
+   `not set — /login, or configure .env`, and a message you send is not sent:
+   a red note says how to sign in or set up this file, and ↑ brings the
+   message back once a model is set up. `-p`, `serve` and `--web` stop
+   instead, with the same advice.
 
 So `METACODES_PROVIDER` and `METACODES_MODEL` in the file apply only when
-nothing above them decides: once you sign in to Metask, the file's provider no
-longer takes over. Its keys still work: a provider you choose with
-`--provider` or in `/model` reads its key from the file.
+nothing above them decides: once you sign in to Metask (`/login`, or
+`metacodes login`), the file's provider no longer takes over. Its keys still
+work: a provider you choose with `--provider` or in `/model` reads its key
+from the file. `/model` lists a provider as usable only once its key is here
+(or in the environment, or stored by `/login <provider>`); until then it sits
+under "Not configured" and, when you choose it, names the variable and this
+file. While the terminal UI starts on Metask instead of this file's provider,
+it says so once under its banner (`.env configures DeepSeek; the default is
+Metask. To use DeepSeek: /model, or /logout`). `/logout` signs you out of
+Metask and switches the session to the provider this file configures
+(`Switched to DeepSeek (from .env)`); later starts use it too.
+
+`metacodes login status` shows this decision without starting anything: the
+provider a plain start here uses, the step that decided, and what each step
+holds (a variable's name, a file's path, a sign-in's expiry; never a key or a
+token). It also names the providers' keys that are only in the shell, which
+choose nothing:
+
+```text
+This start uses DeepSeek from /Users/you/.local/opt/metacodes/state/.env.
+Level 4 of 5 decided; the first that applies wins:
+  1 named at start: nothing (METACODES_PROVIDER is not set)
+  2 stored default: none
+  3 Metask sign-in: no session
+      /Users/you/.local/opt/metacodes/state/auth.json: not stored
+      METASK_API_KEY: not set
+> 4 /Users/you/.local/opt/metacodes/state/.env: read; DEEPSEEK_API_KEY; configures DeepSeek (the one provider whose key it holds)
+  5 nothing: the TUI opens without a model; -p and the rest stop
+Keys in the shell choose no provider: OPENAI_API_KEY (OpenAI). To use one: --provider <id>, or put it in /Users/you/.local/opt/metacodes/state/.env.
+No secret was printed.
+```
 
 A file with keys of several providers and no `METACODES_PROVIDER` chooses
-none: metacodes stops and lists those providers, and you add
-`METACODES_PROVIDER` to pick one. A `METASK_API_KEY` among them is the
+none: the terminal UI opens without a model, as in step 5, and its red note
+lists those providers; you add `METACODES_PROVIDER` to pick one. `-p` stops
+instead, listing them the same way. A `METASK_API_KEY` among them is the
 exception: with no name in the file it is a Metask sign-in (step 3), so that
 file starts on Metask.
 
@@ -215,5 +253,11 @@ Local configuration (.env)
     reads    DEEPSEEK_API_KEY, METACODES_PROVIDER
 ```
 
-When no provider has a key, the error names this install's file and the
-template beside it, and links this page.
+When no provider has a key, the terminal UI's note (and the error of `-p`,
+`serve` and `--web`) names this install's file and the template beside it, and
+links this page. Keys that are only in your shell are listed by name there,
+never used: choose one of those providers in `/model` to use its key. When the
+provider rejects the key (HTTP 401 or 403), the failed request ends by naming
+the variable and this file: `DeepSeek rejected the API key. Check
+DEEPSEEK_API_KEY in ~/.local/opt/metacodes/state/.env or your shell, then
+restart.`

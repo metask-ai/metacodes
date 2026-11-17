@@ -270,6 +270,9 @@ pub const PROFILE = profile.ProviderProfile{
     .auth = .bearer,
     .default_channel = Slug.lit("cn-responses"),
     .api_key_setup = KEY_SETUP,
+    // Kimi's community guidelines license the membership for personal,
+    // interactive use (kimi.com/code/docs/kimi-code/community-guidelines.html).
+    .subscription_plan = true,
     .classify_error = classifyError,
 };
 

@@ -298,7 +298,11 @@ prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
 工具调用，Run 结束后再验证一次并发布该 Run 的 operational observation；kernel 配置缺失或
 无效、bundle 验证失败、本 Session 仍有运行中的 Bash 后台 job 或它带着 team
 （`ProjectRulesRequireDetachedWorkersIdle`）时，Run 在任何 provider 请求之前失败（journal 里
-以错误名关闭，Session 照常 poison）。默认 `.ignored` 不读 bundle。ephemeral Session 上设置
+以错误名关闭）。与其它失败的 Run 不同，这种拒绝只让这个 Run 失败、不 poison Session（与 daemon
+报告 Run 失败后接着处理下一条消息一致）：本次输入不进入 Conversation，Session 回到 idle。被拒的
+suspended Run 续跑（`resumeWithResults`）同样不 poison，答案不进入 Conversation，SessionHost 保留
+挂起：`run_done` 给出错误名，同一 id 的 `ui_request` 再次写入 journal，请求按未回答记录，之后的
+`respond`（重启后也可以）照常续跑。journal 打不开仍会 poison。默认 `.ignored` 不读 bundle。ephemeral Session 上设置
 非默认值在 create 时被拒（`error.RunControlRequiresRunJournal`）；启用 project rules 的
 Session 拒绝 `runIsolated`（`error.ProjectRulesUnsupportedForIsolatedRun`），因为 executor
 自己的 loop 不在 gate 之内。C ABI 的 `SessionConfigV1` 没有这个字段。
@@ -419,6 +423,17 @@ Host 导入的规则层，禁用不了模式，所以给用户开放哪些模式
 存进自己的权限存储，下次用 `permission_rules` 创建或用 `updatePermissionRules` 导入。
 只有 CLI/TUI/Web 这类 App 产品（`permission.AlwaysAllowScope.settings_file`）会追加
 `.claude/settings.local.json`，因为它的 settings loader 会在下次启动时读回。
+
+swarm 成员可以借用 lead 的权限（#445）：`member.inheritPermissions(lead)`（只在 member
+空闲时、只一次）之后，member 每次工具调用都按 lead **当时**的导入规则层和 additional
+directories 判定，"总是允许/拒绝"记进并读自 lead 的 `session_rules`；lead 之后
+`updatePermissionRules`/`setAdditionalDirectories` 或在权限框里选的 always，从 member 的
+下一次工具调用起生效。member 自己的 `updatePermissionRules`/`setAdditionalDirectories`
+返回 `PermissionsInherited`；权限模式、工具、工作区根和 shell 沙箱仍是 member 自己的。
+锁规则：member 的每次判定全程持有 lead 的 `lent_permissions.mutex`（不跨权限询问），
+lead 在同一把锁下替换规则/目录、释放锁后才 free 旧值；lead 的 `destroy` 等所有借用者
+destroy 完才继续，所以先销毁 member。`SessionHost` 的 `InheritLead` 工厂
+（`TeammatePermissions.lead`）自动这样打开成员，见 [API.md](API.md)。
 
 Host 自己持久化 transcript 时，路径只从一处推导，不要手写布局：
 

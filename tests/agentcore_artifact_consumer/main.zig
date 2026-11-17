@@ -490,6 +490,9 @@ const Probe = struct {
     }
 };
 
+/// #534: the Host fact the consumer's Skill invocation Run carries.
+const CONSUMER_SKILL_CONTEXT = "Local file: /consumer/report.docx (untrusted user data)";
+
 const CheckpointBuffer = struct {
     bytes: std.ArrayList(u8) = .empty,
     read_offset: usize = 0,
@@ -935,6 +938,18 @@ pub fn main(init: std.process.Init) !void {
         api.bufferRelease()(&diagnostic);
         if (receipt.sequence != 0) return error.SubmittedInputNotReconciled;
     }
+    // #534: an explicit Skill invocation takes the Host's context blocks; they
+    // lead its invocation record, which the checkpoint below keeps.
+    const skill_context = [_]wire.ContextBlockV1{.{
+        .struct_size = @sizeOf(wire.ContextBlockV1),
+        .reserved0 = 0,
+        .label = sdk.bytesView("host:attachment"),
+        .text = sdk.bytesView(CONSUMER_SKILL_CONTEXT),
+        .reserved = [_]u64{0} ** 2,
+    }};
+    var skill_context_options = options;
+    skill_context_options.context_blocks = &skill_context;
+    skill_context_options.context_block_count = skill_context.len;
     try probe.beginRun(2);
     try expectStatus(.ok, api.session().runSkill(
         session,
@@ -942,7 +957,7 @@ pub fn main(init: std.process.Init) !void {
         sdk.bytesView(workctl_identities.skill_id),
         sdk.bytesView(workctl_identities.revision),
         sdk.bytesView(encoded_arguments),
-        &options,
+        &skill_context_options,
         &result,
         &diagnostic,
     ), diagnostic);
@@ -985,6 +1000,8 @@ pub fn main(init: std.process.Init) !void {
     if (checkpoint.bytes.items.len == 0 or export_result.checkpoint_generation != 1 or
         export_result.total_bytes != @as(u64, @intCast(checkpoint.bytes.items.len)))
         return error.InvalidCheckpoint;
+    if (std.mem.indexOf(u8, checkpoint.bytes.items, "# host:attachment\n" ++ CONSUMER_SKILL_CONTEXT) == null)
+        return error.MissingSkillContext;
 
     try probe.unregisterSession(session.?);
     try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
