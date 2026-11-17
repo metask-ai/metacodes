@@ -64,8 +64,11 @@ pub const DynToolEntry = struct {
     /// Optional full schema borrowed from a Runtime snapshot. The registrar
     /// must keep that snapshot alive until this registry is deinitialized.
     borrowed_input_schema: ?json.InputSchema = null,
-    /// Explicit native permission classification. Null preserves the legacy
-    /// name-based behavior for Skill/MCP tools.
+    /// Explicit permission classification. A process tool registers its own
+    /// and an MCP tool definition is always `.execute`
+    /// (`registerMcpDefinitionBody`). Null keeps the legacy name-based
+    /// fallback (`permission/category.zig`): the Skill tool, and the
+    /// per-server resource tools `McpSession.registerResourceTools` adds.
     category: ?ToolCategory = null,
 
     pub fn execute(
@@ -163,6 +166,15 @@ pub const DynRegistry = struct {
     /// MCP 工具带完整 inputSchema 注册:名字/描述/required 拷贝,`input_schema` 的嵌套
     /// 存储**借用**(由 McpSession 的 schema_arena 持有,随 session 存亡)。deferred 强制
     /// true(MCP 工具经 ToolSearch 激活),mcp_server 标记来源供 AgentDef.mcpServers 过滤。
+    ///
+    /// The entry is classified `.execute`: an MCP tool is a call into another
+    /// process or service, which may change things outside this machine, so
+    /// default, acceptEdits and auto ask before it runs and dontAsk denies it.
+    /// AgentCore's MCP environment declares the same class
+    /// (`agentcore/mcp_session.zig`, `metadata`). The server's annotations
+    /// (`readOnlyHint` and the rest) are the server's own claim and never
+    /// relax it (#473). An allow rule (`mcp__<server>`) is how a person
+    /// trusts a server.
     pub fn registerMcpDefinitionBody(
         self: *DynRegistry,
         definition: json.ToolDefinition,
@@ -184,6 +196,7 @@ pub const DynRegistry = struct {
         );
         const entry = &self.entries.items[self.entries.items.len - 1];
         entry.borrowed_input_schema = definition.input_schema;
+        entry.category = .execute;
     }
 
     /// Register a definition owned by an immutable plugin snapshot. Strings
@@ -405,6 +418,30 @@ test "DynRegistry: MCP provenance is owned and propagated" {
     try r.appendDefinitions(&defs, testing.allocator);
     try testing.expectEqual(@as(usize, 1), defs.items.len);
     try testing.expectEqualStrings("allowed", defs.items[0].mcp_server.?);
+}
+
+fn dummyExecBody(_: *const ToolContext, _: []const u8, _: ?*anyopaque) anyerror!ToolResultBody {
+    return ToolResultBody.initInline(try testing.allocator.dupe(u8, "dummy-result"));
+}
+
+test "DynRegistry: an MCP tool definition is classified execute; Skill and resource tools keep the name fallback (#473)" {
+    var r = DynRegistry.init(testing.allocator);
+    defer r.deinit();
+    try r.registerMcpDefinitionBody(.{
+        .name = "mcp__plc__set_line_speed",
+        .description = "Set the conveyor speed of line 3 in rpm.",
+        .input_schema = .{ .type = "object", .required = &.{} },
+        .deferred = true,
+        .mcp_server = "plc",
+    }, dummyExecBody, null, "plc");
+    try testing.expectEqual(@as(?ToolCategory, .execute), r.category("mcp__plc__set_line_speed"));
+
+    // Null still means "classify by name": the Skill tool and the per-server
+    // resource tools (`registerMcpBody`) are left as they were.
+    try r.register("Skill", "Run a skill", &.{}, dummyExec, null, false);
+    try r.registerMcpBody("mcp__plc__list_resources", "List resources", &.{}, dummyExecBody, null, "plc");
+    try testing.expect(r.category("Skill") == null);
+    try testing.expect(r.category("mcp__plc__list_resources") == null);
 }
 
 test "DynRegistry: execute dispatches to fn" {
