@@ -285,6 +285,10 @@ test "teamwork runtime L2: the SWE loop's happy path changes the workspace by ex
     try testing.expectEqualStrings("Add a feature file.", run.status().goal);
     const final = try swe_loop.drive(run);
 
+    if (final != .done) {
+        std.debug.print("happy path final state: {any}\n", .{final});
+        for (run.status().seats) |seat| std.debug.print("happy path seat {s}: {any}\n", .{ seat.id.slice(), seat.result });
+    }
     try testing.expectEqual(runtime.State{ .done = .{ .files_changed = 2, .worktree_removed = true } }, final);
     try expectFile(fx.repo(), "feature.txt", "feature\n");
     try expectFile(fx.repo(), "src/app.txt", "v2\n");

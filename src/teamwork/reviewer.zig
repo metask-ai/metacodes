@@ -541,12 +541,16 @@ pub fn workspaceTree(gpa: std.mem.Allocator, workspace: []const u8, scratch_dir:
     defer gpa.free(scratch);
     defer pfs.unlinkPath(scratch.ptr) catch {};
     pfs.unlinkPath(scratch.ptr) catch {};
-    // Start from the real index so unchanged files are not rehashed; a
-    // repository without one yet starts empty.
+    // Retain indexed paths (including staged ignored files), but not the
+    // stat cache: copying the index gives it a new timestamp and invalidates
+    // Git's racy-file protection. Re-read tracked bytes before adding new paths.
+    // A repository without an index yet starts empty.
     if (swarm_team.readFileAlloc(gpa, index_path)) |bytes| {
         defer gpa.free(bytes);
         run_dir.writeAtomic(scratch, bytes) catch return error.GitFailed;
     }
+    const rehash = (try git(gpa, workspace, scratch, &.{ "add", "--renormalize", "-A" }, abort)) orelse return error.GitFailed;
+    gpa.free(rehash);
     const add = (try git(gpa, workspace, scratch, &.{ "add", "-A" }, abort)) orelse return error.GitFailed;
     gpa.free(add);
     const tree = (try git(gpa, workspace, scratch, &.{"write-tree"}, abort)) orelse return error.GitFailed;
@@ -1179,6 +1183,44 @@ test "reviewer L2: an approval is stale once the tree changes, and a reviewer ma
     try testing.expectEqualStrings("", status_out);
 
     try testing.expectError(error.NotARepository, workspaceTree(testing.allocator, scratch, scratch, null));
+}
+
+test "reviewer L2: workspace snapshots rehash same-stat tracked edits without modifying the user index" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-review-stat-cache");
+    defer fx.deinit();
+    try fx.gitInit();
+    try fx.gitConfig("core.trustctime", "false");
+    try fx.gitConfig("core.checkStat", "minimal");
+    try fx.workspaceFile("tracked.txt", "old\n");
+    const touch_argv = [_]?[*:0]const u8{ "/usr/bin/touch", "-t", "202001010000", "tracked.txt", null };
+    var touched = try common.spawnCaptureWithStderrTimed(&touch_argv, testing.allocator, null, 30_000, null, 4096, fx.workspace());
+    testing.allocator.free(touched.stdout);
+    testing.allocator.free(touched.stderr);
+    try testing.expectEqual(@as(i32, 0), touched.exit_code);
+    const staged = (try git(testing.allocator, fx.workspace(), null, &.{ "add", "tracked.txt" }, null)).?;
+    testing.allocator.free(staged);
+    var index_buf: run_dir.PathBuf = undefined;
+    const index_path = try std.fmt.bufPrint(&index_buf, "{s}/.git/index", .{fx.workspace()});
+    const original = swarm_team.readFileAlloc(testing.allocator, index_path).?;
+    defer testing.allocator.free(original);
+
+    try fx.workspaceFile("tracked.txt", "new\n");
+    touched = try common.spawnCaptureWithStderrTimed(&touch_argv, testing.allocator, null, 30_000, null, 4096, fx.workspace());
+    testing.allocator.free(touched.stdout);
+    testing.allocator.free(touched.stderr);
+    try testing.expectEqual(@as(i32, 0), touched.exit_code);
+    const tree = try fx.tree();
+    const object = try std.fmt.allocPrint(testing.allocator, "{s}:tracked.txt", .{tree.slice()});
+    defer testing.allocator.free(object);
+    const blob = (try git(testing.allocator, fx.workspace(), null, &.{ "show", object }, null)).?;
+    defer testing.allocator.free(blob);
+    try testing.expectEqualStrings("new\n", blob);
+    try testing.expect(tree.eql(try fx.tree()));
+    const after = swarm_team.readFileAlloc(testing.allocator, index_path).?;
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, original, after);
 }
 
 test "reviewer L2: workspace snapshots disable hooks and fsmonitor without changing repository config" {
