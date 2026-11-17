@@ -3,8 +3,8 @@
 `python3 .github/pr-loop.py` is an opt-in delivery controller for PRs submitted
 to **metask-ai/metacodes**. It registers a PR with its original Codex thread
 and worktree, independently reviews each revision, returns actionable feedback
-to that thread, validates and pushes repairs, and requests admission to the
-upstream merge queue. Decisions and interrupted writes stop in a durable
+to that thread, validates and pushes repairs, and requests an exact-head
+upstream merge after validation against current main. Decisions and interrupted writes stop in a durable
 `needs_decision` state. Ordinary review findings, failing CI and failed local
 validation return to the worker automatically, within the registered limits.
 
@@ -38,7 +38,7 @@ Placing the script in `.github/` does not make it a hosted Actions workflow.
   and intentionally refuse dirty pinned inputs. A failed checkpoint is never
   pushed; its validation output goes back to the original worker.
 - GitHub permission to publish commit statuses, push the head branch and
-  enqueue the PR upstream. No admin bypass is used or requested.
+  merge the PR upstream. No admin bypass is used or requested.
 
 Codex uses its existing local authentication. The controller does not copy
 credentials to GitHub Actions, read auth tokens or write secrets to PR bodies.
@@ -124,7 +124,7 @@ The default SQLite database is
 option before the subcommand to select another database. Keep it outside the
 repository: it contains local paths, thread IDs, review evidence and decisions.
 Its event log records state transitions. A crash during review, repair,
-validation, push or enqueue is escalated on restart instead of replaying an
+validation, push, base update or merge is escalated on restart instead of replaying an
 operation with an uncertain outcome. Inspect the worktree and PR before
 answering; an answer does not automatically reconcile a divergent checkout.
 
@@ -135,11 +135,11 @@ answering; an answer does not automatically reconcile a divergent checkout.
    A passing report cannot contain unresolved findings or a question.
 2. Reports are bound to both head and base SHA. A changed revision invalidates
    them; the controller rechecks the revision after review, repair and local
-   validation, and immediately before enqueueing.
+   validation, and immediately before merging.
 3. The bound worker thread is resumed by ID, never by `--last`. It must be
    handed over idle and must not be driven concurrently by another host.
    It edits the original checkout. The controller owns validation, commit, ordinary push
-   and merge-queue admission. Policy, workflow and controller edits require
+   and exact-head merging. Policy, workflow and controller edits require
    a decision. The worker's network is disabled; the controller executes the
    devbox gate and returns failures as feedback. Writable tool access is
    limited by Codex's workspace sandbox; approval and user-input requests
@@ -149,16 +149,18 @@ answering; an answer does not automatically reconcile a divergent checkout.
    but their check runs are attached to the head SHA). Missing, pending,
    skipped, neutral and untrusted-source results never satisfy this test.
    GitHub additionally enforces current approvals and review-thread resolution.
-5. Admission uses `enqueuePullRequest` with `expectedHeadOid`. It never creates
-   a deferred auto-merge request or falls back to an admin/direct merge.
-   Being queued is not being merged; the watcher waits for GitHub's actual
-   merged state. Queue ejection returns the problem to the worker.
+5. A stale branch receives an ordinary merge commit from current main, local
+   validation and a push, followed by fresh review and PR CI. Conflicts go to
+   the worker. The merge API receives the exact reviewed head SHA. Effective
+   branch rules must require all four checks from GitHub Actions and an
+   up-to-date branch, with no merge queue. GitHub must confirm the merge;
+   no deferred auto-merge request or admin bypass is used.
 
 `agent/review` is a contributor-visible commit status. It is not added to the
 repository's required checks by this change; the local controller enforces it
 for its own admissions. Repository-wide mandatory agent review, including
 manual merges or admissions by other actors, would need a separately deployed
-trusted reviewer and a required check that also reports on merge groups.
+trusted reviewer and a required PR check.
 
 ## Verification
 
@@ -169,10 +171,10 @@ dx zig build test:pr-loop
 This suite also runs in `test:units` on every PR. It uses real temporary Git
 repositories and pushes to a local bare repository, a fake stdio Codex process,
 and recorded GitHub API requests. It proves review → original-thread repair →
-validation → push → fresh review → exact-head enqueue → observed merge, without
+validation → push → fresh review → exact-head merge → observed merge, without
 provider calls. It also exercises stale review rejection, CI failures, busy
 workers, decision recovery, invocation limits, policy edits and interrupted
 operations. No live PR is opened or merged by the tests.
 
 Protocol references: [Codex App Server](https://learn.chatgpt.com/docs/app-server),
-[GitHub merge queue](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/merging-a-pull-request-with-a-merge-queue).
+[GitHub protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).

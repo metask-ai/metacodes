@@ -735,12 +735,15 @@ pub const TuiBackend = struct {
                 return;
             },
             .picker_key => {
-                if (picker_host.onKey(app, &self.region.ui, eff.picker_key, .of(self.region)) == .committed) {
+                switch (picker_host.onKey(app, &self.region.ui, eff.picker_key, .of(self.region))) {
                     // Mid-stream the confirmation goes into scrollback through
                     // the same path streamed text uses, so it survives the
                     // overlay closing without fighting the region for stdout.
-                    self.region.writeGenText(picker_host.lastNotice(app));
-                    self.region.writeGenText("\n");
+                    .committed, .cancelled => {
+                        self.region.writeGenText(picker_host.lastNotice(app));
+                        self.region.writeGenText("\n");
+                    },
+                    .ignored, .redraw => {},
                 }
                 self.region.redrawGen(app);
                 return;

@@ -311,14 +311,18 @@ test "L2 key login (#488): /model takes no key; a provider without one is not co
     var rows = cc.repl_model_picker.Picker.RowBuffer.init(std.testing.allocator);
     defer rows.deinit();
 
-    // No key: the plan is listed, in the not-configured group, and Enter on
-    // it shows where the key goes. No key stage, no worker, no request.
+    // No key: typing finds the plan's models, dim (not configured), and
+    // Enter on one shows where the key goes. No key stage, no worker, no
+    // request.
     var ui: cc.tui_ui_state.UiState = .{};
     picker_host.open(app, &ui, .unguarded);
     for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
     const unconfigured = try picker.rows(&rows);
-    try std.testing.expectEqual(@as(usize, 1), unconfigured.len);
-    try std.testing.expect(!unconfigured[0].provider.ready);
+    try std.testing.expect(unconfigured.len > 0);
+    for (unconfigured) |row| {
+        try std.testing.expect(row == .model and !row.model.ready);
+        try std.testing.expect(picker.offers.items[row.model.offer_index].provider_id.eqlText("zai-coding-plan"));
+    }
     try std.testing.expectEqual(picker_host.Result.redraw, picker_host.onKey(app, &ui, .enter, .unguarded));
     try std.testing.expectEqual(cc.repl_model_picker.Stage.setup, picker.stage);
     try std.testing.expectEqualStrings("ZAI_API_KEY", picker.setup.?.variable.?);
@@ -339,12 +343,13 @@ test "L2 key login (#488): /model takes no key; a provider without one is not co
     picker_host.open(app, &ui, .unguarded);
     for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
     const configured = try picker.rows(&rows);
-    try std.testing.expectEqual(@as(usize, 1), configured.len);
-    try std.testing.expect(configured[0].provider.ready);
-    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // provider
-    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // GLM-5.3, listed first
-    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // its first channel (cn-anthropic)
-    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded)); // options: apply
+    try std.testing.expect(configured.len > 0);
+    try std.testing.expect(configured[0] == .model and configured[0].model.ready);
+    // The cursor is on GLM-5.3, listed first; Enter applies its preferred
+    // route, the first (cn-anthropic).
+    const focused = picker.focusedOffer() orelse return error.NoFocusedOffer;
+    try std.testing.expectEqualStrings("glm-5.3", focused.request_model_id);
+    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
     try std.testing.expectEqualStrings("glm-5.3", app.activeModel());
     try std.testing.expectEqualStrings(GOOD_KEY, app.api_key);
     // Another provider bills the session from here, and the notice says so.

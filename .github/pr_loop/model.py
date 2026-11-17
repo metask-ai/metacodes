@@ -33,6 +33,9 @@ class State(str, Enum):
     WORKING = "working"
     VALIDATING = "validating"
     PUSHING = "pushing"
+    UPDATING = "updating_base"
+    MERGING = "merging"
+    # Retained so existing SQLite rows remain readable during migration.
     QUEUEING = "queueing"
     WAITING = "waiting"
     QUEUED = "queued"
@@ -41,7 +44,8 @@ class State(str, Enum):
     CLOSED = "closed"
 
 
-IN_FLIGHT = {State.REVIEWING, State.WORKING, State.VALIDATING, State.PUSHING, State.QUEUEING}
+IN_FLIGHT = {State.REVIEWING, State.WORKING, State.VALIDATING, State.PUSHING,
+             State.UPDATING, State.MERGING, State.QUEUEING}
 
 
 @dataclass(frozen=True)

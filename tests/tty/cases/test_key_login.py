@@ -185,13 +185,13 @@ def test_login_dialog_refused_key_stores_nothing_and_says_why(bin_path):
 
 
 def test_model_takes_no_key_and_shows_where_it_goes(bin_path):
-    # #488: /model no longer opens a key field. Without a key the plan is listed
-    # dimmed under "Not configured"; choosing it shows the variable, this
+    # #488: /model no longer opens a key field. Without a key a filter finds the
+    # plan's models dimmed ("not configured"); choosing one shows the variable, this
     # install's .env and the guide. It checks nothing, opens nothing, stores
     # nothing: `/login zai-coding-plan` (above) is where a key is pasted.
     with _Case() as case:
-        events = [READY, "type:/model", "key:enter", wait_for("Provider", 10),
-                  "type:zai", wait_for("Not configured", 10), "key:enter",
+        events = [READY, "type:/model", "key:enter", wait_for("apply to", 10),
+                  "type:zai", wait_for("not configured", 10), "key:enter",
                   wait_for("ZAI_API_KEY", 10), f"type:{GOOD_KEY}", "key:enter", "sleep:0.8"]
         raw = run(bin_path, events, term_size=(40, 120), env=case.env(), per_key_drain=0.05)
         a, text = _screen(raw, 40, 120)

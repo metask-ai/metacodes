@@ -172,6 +172,14 @@ jobs:
       # The same watchdog again, as agentcore-windows.yml runs this gate: at
       # the one-minute default the 0.2.1 Windows dry run killed an
       # agentcore-abi-unit test ("test runner failed to respond for 1m6s").
+      # Release-only coverage: PR CI keeps Linux x86_64, macOS ARM64 and
+      # Windows x86_64. The ARM64 Linux and Intel macOS matrix entries above
+      # run their entire release suite natively here.
+      - name: Linux ARM64 cross-stage contract
+        if: matrix.os == 'Linux' && matrix.arch == 'X64'
+        run: |
+          zig build tinykg:stage -Dtarget=aarch64-linux-musl
+          zig build install -Dtarget=aarch64-linux-musl -Drelease-layout=true --prefix "$RUNNER_TEMP/stage-aarch64-linux"
       - name: AgentCore gate for the native target
         run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
@@ -329,9 +337,34 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  windows-arm-cross:
+    name: Release (Windows ARM64 cross / ${{ matrix.target }})
+    timeout-minutes: 60
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-windows-gnu, aarch64-windows-msvc]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      # Compile and link consumers; never try to execute ARM64 code on X64.
+      # This is SDK coverage, not an ARM64 CLI release unit: TinyKG does not
+      # have an ARM64 Windows bundle. No unsupported unit is published.
+      - name: Windows ARM64 SDK compiles and links
+        shell: cmd
+        run: zig build agentcore:bundle -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\sdk-arm64"
+
   publish:
     name: Draft release
-    needs: [build-posix, build-windows]
+    needs: [build-posix, build-windows, windows-arm-cross]
     if: ${{ github.event_name == 'push' || !inputs.dry_run }}
     timeout-minutes: 20
     runs-on: ubuntu-latest

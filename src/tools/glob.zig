@@ -1,6 +1,7 @@
 const std = @import("std");
 const tt = @import("test_tmp.zig");
 const pfs = @import("platform").fs;
+const filesystem = @import("../sandbox/filesystem.zig");
 const common = @import("common.zig");
 const toolchain = @import("../util/toolchain.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -39,7 +40,7 @@ fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const 
         .resolve_relative = ctx.resolve_relative_paths,
     });
     defer allocator.free(path);
-    _ = read_state.statPath(path) catch {
+    if (!filesystem.enabled(ctx)) _ = read_state.statPath(path) catch {
         common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
         return error.PathNotFound;
     };
@@ -60,8 +61,10 @@ fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const 
         path_z.ptr,
         null,
     };
+    var confined = try filesystem.wrapArgv(ctx, &argv);
+    defer if (confined) |*cmd| cmd.deinit();
     var spawned = try common.spawnCaptureToSpoolTimed(
-        argv[0..],
+        if (confined) |cmd| cmd.argv else &argv,
         allocator,
         ctx.artifact_root,
         ctx.abort,
@@ -172,7 +175,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     });
     defer allocator.free(path);
     // 存在性检查:--no-messages 会把"路径不存在"静默成空结果 → 先拦给明确错误。
-    _ = read_state.statPath(path) catch {
+    if (!filesystem.enabled(ctx)) _ = read_state.statPath(path) catch {
         common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
         return error.PathNotFound;
     };
@@ -197,8 +200,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // rg 退出语义:0=有结果,1=无匹配(合法空),>=2/信号死=真实故障。旧版只收
     // stdout 忽略退出码,rg 在沙箱内 dyld 加载失败会被静默当成"零文件"——
     // 假空结果比报错危险(模型会当成"目录为空"下结论)。fail loud。
+    var confined = try filesystem.wrapArgv(ctx, &argv);
+    defer if (confined) |*cmd| cmd.deinit();
     const spawned = try common.spawnCaptureWithStderrTimed(
-        argv[0..argv.len],
+        if (confined) |cmd| cmd.argv else &argv,
         allocator,
         ctx.abort,
         0,

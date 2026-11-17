@@ -465,7 +465,7 @@ fn runInjection(allocator: std.mem.Allocator, cmd: []const u8, opts: RenderOptio
         return try allocator.dupe(u8, "[powershell shell not supported in metacodes]");
     }
     // 沙箱包裹（task#25:防 Write→SKILL.md→activate 自造 skill 经注入 shell 逃逸沙箱）。
-    // 复用 Bash/Monitor 同款 wrapAsShellString 范式:enabled → sandbox-exec 包;
+    // 复用 Bash/Monitor 同款 wrapAsShellString 范式:enabled → sandbox-exec / bwrap 包;
     // 任一 sandbox 包裹失败都必须拒跑，绝不降级为原始命令。
     var sandbox_wrap: ?@import("../sandbox/exec.zig").ShellWrap = null;
     defer if (sandbox_wrap) |*sw| sw.deinit();
@@ -662,6 +662,12 @@ test "inject: sandbox 开 → cwd 外写被拦(task#25:Write→SKILL.md→activa
 
 test "inject: unavailable sandbox never falls back to the raw command" {
     if (@import("builtin").os.tag == .macos) return error.SkipZigTest;
+    // Linux has bubblewrap: point it at a bwrap that does not exist.
+    const paths = @import("platform").paths;
+    const saved: ?[:0]u8 = if (paths.bwrapEnv()) |v| try testing.allocator.dupeZ(u8, v) else null;
+    defer if (saved) |v| testing.allocator.free(v);
+    paths.setEnv("METACODES_BWRAP", "/nonexistent-cc-zig/bwrap");
+    defer if (saved) |v| paths.setEnv("METACODES_BWRAP", v.ptr) else paths.unsetEnv("METACODES_BWRAP");
     const SandboxSettings = @import("../sandbox/config.zig").SandboxSettings;
     const sandbox = SandboxSettings{
         .enabled = true,

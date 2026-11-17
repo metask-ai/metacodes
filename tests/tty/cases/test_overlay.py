@@ -131,7 +131,7 @@ def test_ctrl_o_via_kitty_csi_u(bin_path):
     raw = run(bin_path, ["sleep:0.8", "raw:\\x1b[111;5u", "sleep:0.4"], per_key_drain=0.1)
     a = TTYAssert(raw)
     text = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
-    assert "Provider" in text, "CSI-u 形式的 Ctrl+O 也应打开 model picker(回归 bug):\n" + text
+    assert "apply to" in text, "CSI-u 形式的 Ctrl+O 也应打开 model picker(回归 bug):\n" + text
 
 
 def test_ctrl_x_ctrl_o_via_kitty_csi_u(bin_path):

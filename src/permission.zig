@@ -132,7 +132,7 @@ pub const PermissionContext = struct {
         if (self.inherited) |lent| {
             lent.mutex.lock();
             defer lent.mutex.unlock();
-            const settings = lent.settings orelse return true;
+            const settings = lent.borrowedSettings() orelse return true;
             return settings.allowsMode(m);
         }
         const settings = self.settings orelse return true;
@@ -147,7 +147,7 @@ pub const PermissionContext = struct {
         if (self.inherited) |lent| {
             lent.mutex.lock();
             defer lent.mutex.unlock();
-            return decision_mod.effectiveMode(self.modeValue(), lent.settings);
+            return decision_mod.effectiveMode(self.modeValue(), lent.borrowedSettings());
         }
         return decision_mod.effectiveMode(self.modeValue(), self.settings);
     }
@@ -192,7 +192,7 @@ pub fn checkPermissionClassified(
     const lender = ctx.inherited;
     if (lender) |lent| {
         lent.mutex.lock();
-        settings = lent.settings;
+        settings = lent.borrowedSettings();
         mctx.additional_dirs = lent.additional_dirs;
     }
     defer if (lender) |lent| lent.mutex.unlock();
@@ -281,6 +281,25 @@ test "optional decision override is inert by default and receives imported actio
     try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Read", "{}"));
     try std.testing.expectEqual(@as(usize, 1), Probe.calls);
     try std.testing.expectEqual(ImportedPermissionDecision.undecided, Probe.last_imported);
+}
+
+test "inherited decisions keep the published rule header until the next publication" {
+    var owned = try settings_mod.buildRuleSet(std.testing.allocator, .{ .deny = &.{"Write"} }, .{});
+    defer owned.deinit();
+    var owner_header = owned;
+    var lent: LentPermissions = .{};
+    lent.publish(&owner_header, &.{});
+    var ctx = createContext(.bypass_permissions, std.testing.allocator);
+    ctx.inherited = &lent;
+    const args = "{\"file_path\":\"ordinary.txt\"}";
+    try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Write", args));
+
+    // AgentSession replaces its optional header before publish takes the
+    // lender lock. A decision still observes the last published deny set.
+    owner_header.layers = &.{};
+    try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Write", args));
+    lent.publish(&owner_header, &.{});
+    try std.testing.expectEqual(PermissionResult.allow, checkPermission(&ctx, "Write", args));
 }
 
 test "PermissionContext.mode 原子跨线程 write-read(无撕裂,release-acquire 可见)" {

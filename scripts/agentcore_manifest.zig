@@ -127,6 +127,7 @@ pub fn main(init: std.process.Init) !void {
         &no_link_inputs;
     const system_frameworks: []const []const u8 = &no_link_inputs;
     const ripgrep_rel: []const u8 = if (std.mem.eql(u8, os, "windows")) "bin/rg.exe" else "bin/rg";
+    const sandbox_helper_rel: []const u8 = if (std.mem.eql(u8, os, "windows")) "bin/metacodes-fs-helper.exe" else "bin/metacodes-fs-helper";
     const ripgrep_pin = try loadRipgrepPin(allocator, init.io);
     const readme = try renderReadme(
         allocator,
@@ -162,6 +163,7 @@ pub fn main(init: std.process.Init) !void {
         library_rel,
         shared_rel,
         ripgrep_rel,
+        sandbox_helper_rel,
         "bin/ripgrep-LICENSE-MIT",
         "include/metask/agentcore.h",
         "bindings/zig/build.zig",
@@ -338,6 +340,13 @@ fn renderReadme(
         \\resolves. Deploy it next to your Host executable — that location is probed
         \\automatically — or point the `RG_BIN` environment variable at it; installations
         \\on `PATH` also resolve.
+        \\
+        \\`bin/metacodes-fs-helper` (`.exe` on Windows) is the trusted native filesystem
+        \\executor, built from this same revision and pinned in `files`. For sandboxed
+        \\file tools on Linux/macOS, deploy it next to the Host executable or set
+        \\`METACODES_SANDBOX_HELPER` to its absolute path. An enabled sandbox refuses
+        \\the operation if the helper or platform backend cannot run; it never opens
+        \\the target on the Host as a fallback. Windows has no sandbox backend.
         \\
         \\The ABI is experimental and requires an exact revision match. Ownership, lifetime, concurrency,
         \\and failure contracts are defined by `doc/AGENTCORE_BINARY_ABI.md` at the source commit above.

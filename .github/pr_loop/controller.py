@@ -1,4 +1,4 @@
-"""Durable PR state machine. Only this module may decide to push or enqueue."""
+"""Durable PR state machine. Only this module may decide to push or merge."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -174,11 +174,37 @@ class Controller:
             return None
         return latest
 
-    def repair(self, binding, pr, evidence, git):
+    def update_base(self, binding, pr, git):
+        git.verify(binding, pr)
+        self.store.update(binding, State.UPDATING, report=None)
+        git.merge_base(pr.base)
+        if git.git("diff", "--name-only", "--diff-filter=U"):
+            self.repair(binding, pr, {"merge_conflict": "Resolve the prepared merge of current main"},
+                        git, base_prepared=True)
+            return
+        # These changes came from trusted main, including any policy changes;
+        # no worker edited them. Preserve history with an ordinary merge commit.
+        git.git("commit", "-m", "chore: merge current main before PR validation")
+        checkpoint = git.git("rev-parse", "HEAD")
+        self.store.update(binding, State.VALIDATING, checkpoint=checkpoint)
+        try:
+            run(self.gate, cwd=binding.worktree, timeout=binding.timeout)
+        except LoopError as exc:
+            self.repair(binding, pr, {"local_gate_failure": str(exc)}, git)
+            return
+        git.verify(binding, replace(pr, head=checkpoint))
+        if not self.current(binding, pr):
+            raise LoopError("PR changed during base update; local merge is preserved for reconciliation")
+        self.store.update(binding, State.PUSHING)
+        git.push(binding)
+        self.store.update(binding, State.PENDING, checkpoint=None, report=None,
+                          reason="current main merged and pushed; awaiting fresh review and PR CI")
+
+    def repair(self, binding, pr, evidence, git, base_prepared=False):
         row = self.store.get(binding.repo, binding.number)
         local_head = row["checkpoint"] or pr.head
-        git.verify(binding, replace(pr, head=local_head), allow_dirty=bool(row["answer"]))
-        if "merge_conflict" in evidence:
+        git.verify(binding, replace(pr, head=local_head), allow_dirty=base_prepared or bool(row["answer"]))
+        if "merge_conflict" in evidence and not base_prepared:
             git.merge_base(pr.base)
         while True:
             row = self.store.get(binding.repo, binding.number)
@@ -263,18 +289,17 @@ class Controller:
                 self.store.update(binding, State.WAITING, reason="PR is a draft")
                 return
             if pr.queued:
-                # Never mutate a queued PR's worktree. GitHub owns its group tests.
+                # A watcher upgraded during the policy migration leaves existing
+                # queued PRs alone until GitHub completes or removes them.
                 self.store.update(binding, State.QUEUED, reason="GitHub merge queue is running")
                 return
             git = Git(binding.worktree)
-            if state == State.QUEUED and (row["head"], row["base"]) == pr.revision:
-                # Queue removal may be a combined-tree regression. Return the
-                # failure to the worker rather than silently enqueueing forever.
-                self.repair(binding, pr, {"merge_queue": "PR left the merge queue without merging; inspect its merge_group CI logs"}, git)
-                return
             if (row["head"], row["base"]) != pr.revision:
                 self.store.update(binding, State.PENDING, head=pr.head, base=pr.base, report=None)
                 row = self.store.get(binding.repo, binding.number)
+            if not git.up_to_date(pr):
+                self.update_base(binding, pr, git)
+                return
             if row["report"]:
                 report = validate_report(json.loads(row["report"]))
             else:
@@ -312,9 +337,14 @@ class Controller:
             if latest.unresolved or latest.review_decision in ("CHANGES_REQUESTED", "REVIEW_REQUIRED"):
                 self.store.update(binding, State.WAITING, reason="upstream review requirements changed")
                 return
-            self.store.update(binding, State.QUEUEING)
-            self.github.enqueue(latest)
-            self.store.update(binding, State.QUEUED, reason="review and CI passed; enqueued exact head")
+            self.store.update(binding, State.MERGING)
+            try:
+                self.github.merge(latest)
+            except LoopError:
+                if not self.current(binding, latest):
+                    return  # main/head moved: update, re-review and re-test next pass
+                raise
+            self.store.update(binding, State.MERGED, reason="GitHub confirmed the exact reviewed head merged")
         except (LoopError, OSError, ValueError, KeyError, TypeError) as exc:
             self.decision(binding, str(exc))
 

@@ -995,27 +995,26 @@ test "L2: a picker-driven selection reaches the endpoint, path, and wire model i
     defer picker.deinit();
     try seedPicker(&picker, &kernel, a);
 
-    // Drive the picker exactly as a keyboard would: provider → model → offer.
-    _ = picker.onKey(.enter);
+    // Drive the picker exactly as a keyboard would: the filter lands on the
+    // model, whose routes are listed under it; down into them.
     // The filter matches GLM-5.3 and GLM-5.3-Flash; the flagship is listed first.
     for ("glm-5.3") |byte| _ = picker.onKey(.{ .char = byte });
-    _ = picker.onKey(.enter);
-    try std.testing.expectEqual(picker_mod.Stage.offer, picker.stage);
+    try std.testing.expectEqual(picker_mod.Stage.list, picker.stage);
 
-    // Walk to the OpenAI-wire China channel and choose it.
+    // Walk to the OpenAI-wire China channel's route.
     var scratch = picker_mod.Picker.RowBuffer.init(a);
     defer scratch.deinit();
     var guard: usize = 0;
-    while (guard < 8) : (guard += 1) {
-        const rows = try picker.rows(&scratch);
-        const candidate = picker.offers.items[rows[picker.cursor].offer.offer_index];
-        if (candidate.channel_id.eqlText("cn-openai")) break;
+    const found = while (guard < 8) : (guard += 1) {
         _ = picker.onKey(.down);
-    }
-    // GLM-5.3 declares its reasoning control: the options step, then Enter
-    // applies the route.
-    _ = picker.onKey(.enter);
-    try std.testing.expectEqual(picker_mod.Stage.options, picker.stage);
+        const rows = try picker.rows(&scratch);
+        const row = rows[picker.cursor];
+        if (row != .route) continue;
+        if (picker.offers.items[row.route.offer_index].channel_id.eqlText("cn-openai")) break true;
+    } else false;
+    try std.testing.expect(found);
+    // GLM-5.3 declares its reasoning control, on the line under the list;
+    // Enter on the route applies it as shown.
     const outcome = picker.onKey(.enter);
     try std.testing.expect(outcome == .commit);
 
@@ -1231,7 +1230,7 @@ test "L2: a configured provider's declared metadata reaches every client the sam
     defer scratch.deinit();
     const rows = try picker.rows(&scratch);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
-    try std.testing.expect(picker.offers.items[rows[0].provider.offer_index].provider_id.eqlText("house-relay"));
+    try std.testing.expect(picker.offers.items[rows[0].model.offer_index].provider_id.eqlText("house-relay"));
 
     // Token admission uses the declared limit, so a prompt that cannot fit is
     // rejected before any request exists.
@@ -1588,10 +1587,10 @@ test "L2: a provider metadata extension round-trips through the generic client v
     var picker = picker_mod.Picker.init(a);
     defer picker.deinit();
     try seedPicker(&picker, &kernel, a);
-    _ = picker.onKey(.enter);
-    _ = picker.onKey(.enter);
-    try std.testing.expectEqual(picker_mod.Stage.options, picker.stage);
-    try std.testing.expectEqual(@as(usize, 1), picker.rowCount());
+    try std.testing.expectEqual(picker_mod.Stage.list, picker.stage);
+    const focused = picker.focusedOffer() orelse return error.NoFocusedRoute;
+    try std.testing.expectEqual(@as(usize, 1), focused.controls.len);
+    try std.testing.expectEqualStrings("thinking", picker_mod.firstEnumeration(focused.controls).?.id);
 }
 
 // ── cross-UI: an out-of-process client sees the route, not just the name ─────

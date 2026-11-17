@@ -1398,6 +1398,31 @@ pub const App = struct {
         };
     }
 
+    /// Where the credential of a route `judgeReadiness` bound comes from, in
+    /// the terms of the picker's provider heading: the provider's own sign-in
+    /// (the Metask session included), a saved key, `.env`, the shell,
+    /// `--api-key`; a Metask key otherwise. `oauth` and `stored` are the
+    /// sign-in and the saved key the binding was offered.
+    fn noteOrigin(
+        host: *provider_host_mod.Host,
+        binding: provider_binding_mod.RuntimeBinding,
+        oauth: ?provider_credential_mod.StoredEntry,
+        stored: ?provider_credential_mod.StoredEntry,
+    ) model_picker_mod.ProviderNote.Origin {
+        if (oauth) |entry| if (binding.secret.ptr == entry.secret.ptr) return .signed_in;
+        if (stored) |entry| if (binding.secret.ptr == entry.secret.ptr) return .saved_key;
+        return switch (bindingOrigin(host, binding, null, null)) {
+            .unknown => .unknown,
+            // `METASK_API_KEY`, a key in `auth.json`, `--api-key` on Metask.
+            .metask => .key,
+            .local_config => .local_config,
+            .environment => .environment,
+            .saved_key => .saved_key,
+            .sign_in => .signed_in,
+            .flag => .flag,
+        };
+    }
+
     // ── /login and /logout (#485) ───────────────────────────────────────────
 
     /// What `/login` hands over once its dialog is done: the key, model and
@@ -2676,11 +2701,15 @@ pub const App = struct {
         ready: std.ArrayList(bool) = .empty,
         /// Where each provider with no ready offer gets its credential.
         setups: std.ArrayList(model_picker_mod.Setup) = .empty,
+        /// What each provider with a ready offer says in its heading: its
+        /// name, and where the credential a commit would use comes from.
+        notes: std.ArrayList(model_picker_mod.ProviderNote) = .empty,
 
         pub fn deinit(listing: *ModelListing, allocator: std.mem.Allocator) void {
             listing.page.deinit(allocator);
             listing.ready.deinit(allocator);
             listing.setups.deinit(allocator);
+            listing.notes.deinit(allocator);
         }
     };
 
@@ -2700,7 +2729,7 @@ pub const App = struct {
     pub fn adoptModelListing(app: *App, listing: *const ModelListing) !void {
         const listed = listing.listed orelse return app.model_picker.markFailed();
         try app.model_picker.adopt(listed, listing.current);
-        try app.model_picker.setReadiness(listing.ready.items, listing.setups.items);
+        try app.model_picker.setReadiness(listing.ready.items, listing.setups.items, listing.notes.items);
     }
 
     /// Which offers of `listing` a commit could bind now (#488): for each, the
@@ -2735,6 +2764,7 @@ pub const App = struct {
                 null;
             const sources = app.credentialSources(provider_id, &pool, &stored, oauth, now);
             var any_ready = false;
+            var origin: model_picker_mod.ProviderNote.Origin = .unknown;
             for (offers[first..], first..) |candidate, index| {
                 if (!candidate.provider_id.eql(provider_id)) continue;
                 const offer = snapshot.find(candidate.offer_id) orelse continue;
@@ -2744,14 +2774,23 @@ pub const App = struct {
                 // the provider does not take, a wire it cannot drive) is not
                 // cured by setting the variable the setup would name, so the
                 // route stays listed and a commit reports why, as before.
-                if (provider_binding_mod.bindOffer(&host.registry, offer, sources, &reference_buffer, false)) |_| {} else |err| switch (err) {
+                if (provider_binding_mod.bindOffer(&host.registry, offer, sources, &reference_buffer, false)) |binding| {
+                    // The first route that binds says where the provider's
+                    // credential comes from, for its heading in the picker.
+                    if (!any_ready) origin = noteOrigin(host, binding, oauth, stored.entry());
+                } else |err| switch (err) {
                     error.MissingCredentials => continue,
                     else => {},
                 }
                 listing.ready.items[index] = true;
                 any_ready = true;
             }
-            if (!any_ready) try listing.setups.append(app.allocator, providerSetup(host, provider_id));
+            if (!any_ready) {
+                try listing.setups.append(app.allocator, providerSetup(host, provider_id));
+            } else {
+                const name = if (profile) |built| built.display_name else provider_id.slice();
+                try listing.notes.append(app.allocator, model_picker_mod.ProviderNote.init(provider_id, name, origin));
+            }
         }
     }
 
@@ -4902,7 +4941,7 @@ pub const App = struct {
                         "failIfUnavailable refuses every Bash command"
                     else
                         "Bash commands run unsandboxed and autoAllowBashIfSandboxed does not apply";
-                    @import("util/log.zig").warn("sandbox", "enabled in {s}, but this host has no sandbox backend (macOS sandbox-exec only): {s}", .{ path, consequence });
+                    @import("util/log.zig").warn("sandbox", "enabled in {s}, but this host has no sandbox backend (macOS sandbox-exec, or a Linux bubblewrap at /usr/bin/bwrap, /bin/bwrap or $METACODES_BWRAP that can create user namespaces): {s}", .{ path, consequence });
                 }
                 return;
             }
