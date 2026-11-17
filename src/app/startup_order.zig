@@ -27,11 +27,19 @@ pub const StoredDefault = union(enum) {
     /// and the levels below decide.
     unreadable,
     /// Stored, and its provider has a credential (or it does not resolve,
-    /// which the start reports as it always has). Its name
-    /// (`DeepSeek · deepseek-v4-pro`) when it resolves.
-    usable: ?[]const u8,
+    /// which the start reports as it always has). See `Usable`.
+    usable: Usable,
     /// Stored, but its provider has no credential: passed over. Its name.
     lacks_credential: []const u8,
+
+    /// A `usable` default: its name (`DeepSeek · deepseek-v4-pro`) and the id
+    /// of its provider, both null when it does not resolve. The provider's key
+    /// is its own credential, so `login status` does not list that key as a
+    /// shell key that chooses no provider.
+    pub const Usable = struct {
+        label: ?[]const u8 = null,
+        provider: ?[]const u8 = null,
+    };
 
     /// Whether the start consults it (`applyPersistedGlobalSelection`).
     pub fn consulted(self: StoredDefault) bool {
@@ -118,7 +126,7 @@ const deepseek_file: state_env.Choice = .{ .provider = .{ .name = "deepseek", .n
 test "every level outranks the ones below it" {
     const everything = factsWith(.{
         .named = true,
-        .stored_default = StoredDefault{ .usable = "DeepSeek · deepseek-v4-pro" },
+        .stored_default = StoredDefault{ .usable = .{ .label = "DeepSeek · deepseek-v4-pro", .provider = "deepseek" } },
         .metask_key = true,
         .metask_session = true,
         .local = deepseek_file,

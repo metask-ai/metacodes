@@ -4667,6 +4667,93 @@ class WorkBuddyCheckGateRecordTest(unittest.TestCase):
             self._metrics(self._valid(), self._valid())
 
 
+class WorkBuddyIsolatedVerifierRecordTest(unittest.TestCase):
+    """Field-level contract for the isolated verifier's terminal record
+    (doc/ISOLATED_VERIFIER_DESIGN.md §7)."""
+
+    def _metrics(self, *records):
+        rows = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+        ]
+        for index, (kind, record) in enumerate(records, start=1):
+            rows.append(
+                {"schema_version": "metacodes-tool-observation-journal-v1",
+                 "sequence": index, "monotonic_elapsed_ns": index + 1,
+                 "session_id": "s" * 24, "run_id": "r" * 24,
+                 "event": {"tool_observation": {kind: record}}})
+        rows.append(
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": len(records) + 1, "monotonic_elapsed_ns": len(records) + 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "t.jsonl"
+            observation = root / "o.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            observation.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+            return load_control_metrics(transcript, observation)
+
+    def _valid(self):
+        return {
+            "schema_version": "metacodes-isolated-verifier-v1",
+            "enforced": True, "boundaries": 2, "spawns": 3, "leads_rounds": 1,
+            "verdict_1": "fail", "reason_1": "none", "tree_1": "0123456789abcdef",
+            "verdict_2": "unverified", "reason_2": "unsupported_pass", "tree_2": "fedcba9876543210",
+            "charter_sha256": "c" * 64, "same_model": True, "turns": 14,
+            "cost_microusd": 120000, "wall_ms": 9000, "probes_cited": 3,
+            "probes_matched": 2, "lead_probes": 1, "cleanup_complete": True,
+        }
+
+    def _check_gate(self):
+        # Two checks, two verifier-driven continuations plus a leads round.
+        return {
+            "schema_version": "metacodes-check-gate-v1",
+            "enforced": True, "command_sha256": "a" * 64,
+            "checks": 2, "continuations": 3, "max_continuations": 3,
+            "final_verdict": "passed", "final_passed": 1, "final_total": 1,
+            "unchecked_changes": False, "stop_hook_blocks": 0,
+        }
+
+    def test_valid_record_exports_counters(self):
+        lean = self._metrics(("isolated_verifier", self._valid()))["lean"]
+        self.assertEqual(lean["isolated_verifier_records"], 1)
+        self.assertEqual(lean["isolated_verifier_boundaries"], 2)
+        self.assertEqual(lean["isolated_verifier_spawns"], 3)
+        self.assertEqual(lean["isolated_verifier_verdict_1"], "fail")
+
+    def test_a_leads_round_spends_a_check_gate_continuation_without_a_check(self):
+        lean = self._metrics(("isolated_verifier", self._valid()), ("check_gate", self._check_gate()))["lean"]
+        self.assertEqual(lean["check_gate_continuations"], 3)
+        with self.assertRaises(TraceError):
+            self._metrics(("check_gate", self._check_gate()))
+
+    def test_bounds_and_field_violations_are_rejected(self):
+        for patch in (
+            {"boundaries": 3},
+            {"spawns": 5},
+            {"leads_rounds": 3},
+            {"enforced": False},  # leads rounds only in enforce mode
+            {"verdict_1": "not_run"},  # boundary 2 without boundary 1
+            {"probes_matched": 0, "lead_probes": 0},  # a FAIL needs a matched probe
+            {"lead_probes": 3},
+            {"reason_1": "no_token"},  # a reason without unavailable
+            {"verdict_2": "unavailable", "reason_2": "none"},
+            {"verdict_1": "maybe"},
+            {"charter_sha256": "x"},
+            {"schema_version": "metacodes-isolated-verifier-v0"},
+        ):
+            record = self._valid()
+            record.update(patch)
+            with self.subTest(patch=patch), self.assertRaises(TraceError):
+                self._metrics(("isolated_verifier", record))
+        with self.assertRaises(TraceError):
+            self._metrics(("isolated_verifier", self._valid()), ("isolated_verifier", self._valid()))
+
+
 class WorkBuddyLearningTurnRecordTest(unittest.TestCase):
     """Field-level contract for the learning turn journal record
     (doc/LEARNING_TURN_DESIGN.md §6)."""

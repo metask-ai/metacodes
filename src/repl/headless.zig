@@ -17,6 +17,7 @@ const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const check_gate_mod = @import("../core/check_gate.zig");
+const isolated_verifier_mod = @import("../core/isolated_verifier.zig");
 const learning_turn_mod = @import("../core/learning_turn.zig");
 const learning_end_of_run_mod = @import("../core/learning_end_of_run.zig");
 const test_integrity_mod = @import("../core/test_integrity.zig");
@@ -416,7 +417,28 @@ pub fn run(
             );
             var learning_evidence: host_check_mod.Evidence = .{};
             defer learning_evidence.deinit(allocator);
-            _ = host_check_mod.runAndIngestWithEvidence(
+            // End-of-run isolated verifier: only where the in-run check gate
+            // did not already audit the run (`main.resolveVerifier`).
+            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const end_verifier: ?host_check_mod.EndOfRunVerifier = if (run_options.check_gate == null)
+                if (isolated_verifier_mod.optionsFromFlags(app.config.verifier, app.config.verifier_observe, app.config.verifier_model)) |v| .{
+                    .mode = v.mode,
+                    .model = v.model,
+                    .task_statement = prompt,
+                    .repo = @import("platform").fs.getCwd(&cwd_buf) orelse "",
+                    .deps = .{
+                        .provider = app.provider(),
+                        .tool_defs = app.tool_defs,
+                        .permission_ctx = &app.permission_ctx,
+                        .abort = &app.abort,
+                        .session = app.session_id,
+                        .state_root = app.stateRoot(),
+                        .model_tiers = app.activeModelTiers(),
+                    },
+                } else null
+            else
+                null;
+            _ = host_check_mod.runAndIngestVerified(
                 allocator,
                 known_graph,
                 pin,
@@ -424,6 +446,7 @@ pub fn run(
                 note,
                 @intCast(@import("../util/time.zig").nowWallNs()),
                 if (learning_mode != null) &learning_evidence else null,
+                if (end_verifier) |*v| v else null,
             );
             if (learning_mode) |mode| {
                 _ = learning_end_of_run_mod.run(allocator, .{
@@ -578,6 +601,11 @@ pub fn buildOptions(
         // fixed: the stall gate runs here only when asked for.
         .stall_gate = stall_gate_mod.modeFor(app.config.stall_gate, .headless),
         .check_gate = check_gate,
+        // Isolated verifier: follows the in-run check gate's green verdicts.
+        .isolated_verifier = if (check_gate != null)
+            isolated_verifier_mod.optionsFromFlags(app.config.verifier, app.config.verifier_observe, app.config.verifier_model)
+        else
+            null,
         // In-run learning turn where the check gate grounds it; the
         // end-of-run form after the host check covers the rest (run()).
         .learning_turn = learning_turn_mod.inRunOptions(

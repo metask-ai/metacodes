@@ -1,5 +1,6 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
+const filesystem = @import("../sandbox/filesystem.zig");
 const common = @import("common.zig");
 const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const toolchain = @import("../util/toolchain.zig");
@@ -58,7 +59,7 @@ fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const 
         .resolve_relative = ctx.resolve_relative_paths,
     });
     defer allocator.free(path);
-    if (artifact_id == null) {
+    if (artifact_id == null and !filesystem.enabled(ctx)) {
         _ = read_state.statPath(path) catch {
             common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
             return error.PathNotFound;
@@ -101,9 +102,11 @@ fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const 
         const attempt = attempts[attempt_index];
         const argv_z = try attemptArgv(allocator, options.items.items, attempt.pat, attempt.literal, path);
         defer freeArgv(allocator, argv_z);
+        var confined = try filesystem.wrapArgv(ctx, argv_z);
+        defer if (confined) |*cmd| cmd.deinit();
 
         spawned = try common.spawnCaptureToSpoolTimed(
-            argv_z,
+            if (confined) |cmd| cmd.argv else argv_z,
             allocator,
             ctx.artifact_root,
             ctx.abort,
@@ -374,7 +377,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     });
     defer allocator.free(path);
     // 存在性检查:rg 的 --no-messages 会把"路径不存在"静默成空结果。这里先拦,给模型明确错误。
-    _ = read_state.statPath(path) catch {
+    if (!filesystem.enabled(ctx)) _ = read_state.statPath(path) catch {
         common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
         return error.PathNotFound;
     };
@@ -424,10 +427,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const at = attempts_buf[ai];
         const argv_z = try attemptArgv(allocator, options.items.items, at.pat, at.literal, path);
         defer freeArgv(allocator, argv_z);
+        var confined = try filesystem.wrapArgv(ctx, argv_z);
+        defer if (confined) |*cmd| cmd.deinit();
 
         // rg 退出语义:0=有匹配,1=无匹配(合法空),>=2/信号死=真实故障。
         spawned = try common.spawnCaptureWithStderrTimed(
-            argv_z,
+            if (confined) |cmd| cmd.argv else argv_z,
             allocator,
             ctx.abort,
             0,
@@ -498,6 +503,7 @@ fn definitionsPrefix(
     path: []const u8,
     ctx: *const ToolContext,
 ) ?[]u8 {
+    if (filesystem.enabled(ctx)) return null; // LSP searches are not confined.
     if (!isBareIdentifier(pattern)) return null;
     const find_symbol = @import("find_symbol.zig");
     const defs = find_symbol.findDefinitions(allocator, pattern, path, null, ctx) catch return null;

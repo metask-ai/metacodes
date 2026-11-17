@@ -201,7 +201,7 @@ const AutoRecoveryDispatchProbe = struct {
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         switch (event) {
-            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => {},
+            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision, .isolated_verifier => {},
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.requested_write = std.mem.eql(u8, started.requested_name, "Write");
@@ -258,7 +258,7 @@ const RejectDispatchStartSink = struct {
                 self.formal_events += 1;
                 break :blk true;
             },
-            .system_one_decision => true,
+            .system_one_decision, .isolated_verifier => true,
             .dispatch_started => blk: {
                 self.rejected_starts += 1;
                 break :blk false;

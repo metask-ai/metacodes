@@ -192,6 +192,17 @@ pub const Config = struct {
     /// (`main.resolveLearningTurn`). Enforce wins when both are given.
     learning_turn: bool = false,
     learning_turn_observe: bool = false,
+    /// `--verifier` / `--verifier-observe` (print mode also
+    /// `METACODES_VERIFIER=enforce|observe`): after a green pinned check,
+    /// spawn the isolated verifier (doc/ISOLATED_VERIFIER_DESIGN.md); enforce
+    /// lets a reproduced FAIL continue the run, observe only records. Needs a
+    /// pinned check: the check gate, or in print mode the self-evolution host
+    /// check, whose outcome row then carries the verifier qualifier
+    /// (`main.resolveVerifier`). Enforce wins when both are given.
+    verifier: bool = false,
+    verifier_observe: bool = false,
+    /// `--verifier-model <model|tier>`: the verifier's model; null = the actor's.
+    verifier_model: ?[]const u8 = null,
     /// `--test-integrity` / `--test-integrity-observe`: compare the tests that
     /// existed when a run started with the end state; enforce sends one
     /// message when the model stops with them rewritten, deleted or disabled,

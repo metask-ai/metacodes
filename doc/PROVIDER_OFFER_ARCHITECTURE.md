@@ -703,8 +703,8 @@ the candidate offer ids. A model the profile does not declare still routes —
 proxies legitimately accept private model names — with metadata left unknown.
 
 The built-in inventories name the current frontier models with their documented
-limits and reasoning controls (`reasoning_effort`, as the picker's options step
-shows): OpenAI `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` on the Responses wire
+limits and reasoning controls (`reasoning_effort`, as the picker's reasoning
+line shows): OpenAI `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` on the Responses wire
 only (tool calls need it there), Gemini `gemini-4-argon`, `gemini-3.8-flash`, and
 the GLM Coding Plan's `glm-5.3`, `glm-5.3-flash`. Metask's inventory is the
 gateway's own `/v1/models` whenever it answers.
@@ -865,15 +865,33 @@ binding, so a rebuild reproduces it.
 regressions, including the Kitty CSI-u forms, so the rebinding cannot leave
 either action unreachable.
 
+One screen, models first:
+
 ```text
-Provider → Canonical model → Channel/Offer (optional) → Options (optional) → Commit
+  Model                                  apply to  [this session]  from now on  this turn   tab
+  Metask · signed in · billed to your Metask account
+  >* glm-5.3-flash                    200K
+     glm-5.3                          200K   2 routes
+  DeepSeek · key from .env · billed to your DeepSeek account
+     DeepSeek V4 Pro                    1M   2 routes
+  Not configured · openai, gemini
+  Reasoning effort   default  low  medium  [high]  max          ←/→
 ```
 
-The channel step is skipped when a canonical model has exactly one offer, and
-the options step when the offer declares no controls. Offers are grouped by
-*canonical id*, never by visible name: two channels serving "GLM-4.6" over
-different protocols, regions, or prices are different routes, and collapsing
-them by display name would hide the choice the offer model exists to give.
+A row per model, grouped by *canonical id*, never by visible name: two
+channels serving "GLM-4.6" over different protocols, regions, or prices are
+different routes, and collapsing them by display name would hide the choice the
+offer model exists to give. The providers are headings, the one in use first,
+each saying where its credential comes from and who bills it; a typed filter
+drops the headings and lists the matches flat, naming each one's provider. A
+model served on several routes lists them under it, in words ("OpenAI Chat
+API"), while the cursor is on it: Enter on the model takes its preferred route
+(the one in use, else the first), Enter on a route takes that one. The
+reasoning effort the focused route declares is a line under the list, changed
+with ←/→ from any row; the level wanted is remembered, and each model shows and
+commits the nearest one its vocabulary has. Providers no commit could bind now
+are one "Not configured" line at the bottom; Enter lists them, and Enter on one
+shows where its credential goes.
 
 The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
@@ -882,11 +900,13 @@ streaming; a commit during a reply changes the next turn, not the one in flight.
 not depend on the picker's own state machine. `q` closes only on an empty
 filter, which keeps it typeable inside a model name.
 
-Enter commits at the scope the footer names. Session is the default, and `Tab`
-cycles session → global → once, so any durable write is an explicit act the user
-can see before pressing Enter. A successful commit closes the overlay and prints
-one line into the transcript — a picker that vanishes without saying which of
-several same-named routes it chose leaves the user unable to tell.
+Enter commits at the scope the header brackets. Session is the default, and
+`Tab` cycles session → global → once, so any durable write is an explicit act
+the user can see before pressing Enter. A successful commit closes the overlay
+and prints one line into the transcript (`switched to glm-5.3 for this session
+· reasoning high`) — a picker that vanishes without saying which of several
+same-named routes it chose leaves the user unable to tell — and closing it
+without one says what stays (`kept glm-5.3-flash · reasoning high`).
 
 A committed route is broadcast on the existing UI event stream as a
 `config_changed` → `route` event carrying provider, channel, protocol, wire

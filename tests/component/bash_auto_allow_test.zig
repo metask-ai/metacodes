@@ -16,7 +16,7 @@
 //! really wraps; the escape hatch obeys the setting).
 //!
 //! Crosses agent_loop → permission shim → decision → bash_readonly /
-//! sandbox_exec → tools/bash → /bin/sh (sandbox-exec on macOS). Y is the
+//! sandbox_exec → tools/bash → /bin/sh (sandbox-exec on macOS, bwrap on Linux). Y is the
 //! disk: a denied command leaves its target untouched, a read-only command
 //! really runs, a write the sandbox forbids does not happen.
 
@@ -438,7 +438,8 @@ test "L2 dangerouslyDisableSandbox: honored only where allowUnsandboxedCommands 
 }
 
 test "L2 a sandbox profile that cannot be written fails the call instead of running it bare" {
-    if (!cc.sandbox_exec.hostSupported()) return error.SkipZigTest; // needs a real sandbox
+    // Seatbelt writes a profile file; bubblewrap has none to fail on.
+    if (cc.sandbox_exec.hostBackend() != .seatbelt) return error.SkipZigTest;
     const a = std.testing.allocator;
     const paths = @import("platform").paths;
     var dir_buf: [512]u8 = undefined;

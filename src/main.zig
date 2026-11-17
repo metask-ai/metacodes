@@ -27,7 +27,7 @@ pub const app_route_state = @import("app/route_state.zig"); // pub: component te
 const route_state_mod = app_route_state;
 pub const app_sign_out = @import("app/sign_out.zig"); // pub: component tests sign out in process
 const sign_out_mod = app_sign_out;
-pub const app_startup_order = @import("app/startup_order.zig"); // pub: component tests read the decision
+const app_startup_order = @import("app/startup_order.zig");
 const startup_order = app_startup_order;
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
@@ -140,6 +140,8 @@ pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 led
 pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 delivery-cadence tests
 pub const progress_updates = @import("core/progress_updates.zig"); // L2 progress-update tests (#114)
 pub const check_gate = @import("core/check_gate.zig"); // L2 host check gate / Stop hook block tests
+pub const isolated_verifier = @import("core/isolated_verifier.zig"); // L2 isolated verifier tests
+pub const agent_isolation = @import("agents/isolation.zig"); // L2 verifier snapshot tests
 pub const learning_turn = @import("core/learning_turn.zig"); // L2 learning turn tests
 pub const learning_end_of_run = @import("core/learning_end_of_run.zig"); // L2 end-of-run learning turn tests
 pub const kg_lesson = @import("kg/lesson.zig"); // lesson envelope (learning turn)
@@ -616,34 +618,38 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
     var document = store.load() catch return .unreadable;
     defer document.deinit();
     const selection = document.global_selection orelse return .none;
-    const host = buildProviderHost(arena) orelse return .{ .usable = null };
+    const host = buildProviderHost(arena) orelse return .{ .usable = .{} };
     defer host.destroy();
-    const outcome = provider_startup.resolveSelection(arena, &host.registry, selection) catch return .{ .usable = null };
+    const outcome = provider_startup.resolveSelection(arena, &host.registry, selection) catch return .{ .usable = .{} };
     const route = switch (outcome) {
-        .failure => return .{ .usable = null },
+        .failure => return .{ .usable = .{} },
         .route => |value| value,
     };
     const provider_name = if (host.registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
-    const label = std.fmt.allocPrint(arena, "{s} · {s}", .{ provider_name, route.request_model_id }) catch return .{ .usable = null };
+    const label = std.fmt.allocPrint(arena, "{s} · {s}", .{ provider_name, route.request_model_id }) catch return .{ .usable = .{} };
+    const usable: StoredDefault.Usable = .{
+        .label = label,
+        .provider = arena.dupe(u8, route.provider_id.slice()) catch null,
+    };
     if (route.provider_id.eqlText("metask")) {
-        if (metask_key_present) return .{ .usable = label };
+        if (metask_key_present) return .{ .usable = usable };
         // The browser sign-in's key serves a stored Metask default too
         // (`browserSignInKey`), the way it serves the historical path.
         if (browserSignInKey(arena, config.state_root)) |key| {
             std.crypto.secureZero(u8, key);
             arena.free(key);
-            return .{ .usable = label };
+            return .{ .usable = usable };
         }
         var session = provider_oauth_mod.Session.initHome(arena, config.state_root, provider_ids_mod.Slug.lit("metask")) catch
             return .{ .lacks_credential = label };
         defer session.deinit();
-        return if (session.load() catch false) .{ .usable = label } else .{ .lacks_credential = label };
+        return if (session.load() catch false) .{ .usable = usable } else .{ .lacks_credential = label };
     }
     if (resolveProviderScopedCredentialReporting(arena, config, route.provider_id.slice(), .quiet)) |found| {
         std.crypto.secureZero(u8, found.secret);
         arena.free(found.secret);
-        return .{ .usable = label };
-    } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .{ .usable = label };
+        return .{ .usable = usable };
+    } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .{ .usable = usable };
 }
 
 /// `METACODES_AUTH_PRECEDENCE`, which overrides `--auth-precedence`. A start
@@ -1029,6 +1035,14 @@ pub fn main(init: std.process.Init) !void {
     // The learning turn's print-mode environment and its verdict-source rule.
     if (resolveLearningTurn(&config, .{
         .mode = if (std.c.getenv(learning_turn.MODE_ENV)) |c| std.mem.span(c) else null,
+        .host_check_armed = host_check.endOfRunArmedFromEnv(),
+    }, allocator)) |refusal| {
+        std.debug.print("error: {s} (use --help to list supported flags)\n", .{refusal});
+        std.process.exit(2);
+    }
+    // The isolated verifier's print-mode environment and its pinned-check rule.
+    if (resolveVerifier(&config, .{
+        .mode = if (std.c.getenv(isolated_verifier.MODE_ENV)) |c| std.mem.span(c) else null,
         .host_check_armed = host_check.endOfRunArmedFromEnv(),
     }, allocator)) |refusal| {
         std.debug.print("error: {s} (use --help to list supported flags)\n", .{refusal});
@@ -3339,7 +3353,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
             env_model orelse "",
         }),
         .stored_default => switch (facts.stored_default) {
-            .usable => |label| if (label) |name|
+            .usable => |usable| if (usable.label) |name|
                 std.debug.print("This start uses the default stored with /model: {s}.\n", .{name})
             else
                 std.debug.print("This start uses the default stored with /model.\n", .{}),
@@ -3383,7 +3397,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     switch (facts.stored_default) {
         .none => std.debug.print("{s}2 stored default: {s}\n", .{ mark.at(2, decision), if (facts.named) "not consulted, level 1 names a provider" else "none" }),
         .unreadable => std.debug.print("{s}2 stored default: config.json cannot be read\n", .{mark.at(2, decision)}),
-        .usable => |label| std.debug.print("{s}2 stored default: {s}\n", .{ mark.at(2, decision), label orelse "set" }),
+        .usable => |usable| std.debug.print("{s}2 stored default: {s}\n", .{ mark.at(2, decision), usable.label orelse "set" }),
         .lacks_credential => |label| std.debug.print("{s}2 stored default: {s}, which has no key or sign-in: passed over\n", .{ mark.at(2, decision), label }),
     }
     // 3. A Metask sign-in: the historical path's key, else the session.
@@ -3429,6 +3443,10 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     // Keys only in the shell are not metacodes' to pick up (第四节).
     const chosen_provider: ?[]const u8 = switch (decision) {
         .named => config.provider_profile,
+        .stored_default => switch (facts.stored_default) {
+            .usable => |usable| usable.provider,
+            else => null,
+        },
         .local_provider => switch (facts.local) {
             .provider => |chosen| chosen.name,
             else => null,
@@ -4251,6 +4269,20 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.learning_turn = true;
         } else if (std.mem.eql(u8, arg, "--learning-turn-observe")) {
             config.learning_turn_observe = true;
+        } else if (std.mem.eql(u8, arg, "--verifier")) {
+            config.verifier = true;
+        } else if (std.mem.eql(u8, arg, "--verifier-observe")) {
+            config.verifier_observe = true;
+        } else if (std.mem.eql(u8, arg, "--verifier-model")) {
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --verifier-model", .{});
+                return;
+            };
+            if (std.mem.trim(u8, s, " \t\r\n").len == 0 or std.mem.eql(u8, s, "inherit")) {
+                setParseError(config, allocator, "invalid value '{s}' for --verifier-model (expected a model or tier name)", .{s});
+                return;
+            }
+            config.verifier_model = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--test-integrity")) {
             config.test_integrity = true;
         } else if (std.mem.eql(u8, arg, "--test-integrity-observe")) {
@@ -4665,6 +4697,44 @@ pub fn resolveLearningTurn(config: *types.Config, env: LearningTurnEnv, allocato
         "METACODES_HOST_CHECK with METACODES_SELF_EVOLUTION=1 and METACODES_TASK_HINT", .{}) catch "--learning-turn needs a verdict source";
 }
 
+/// The verifier settings main reads from the environment; tests pass them in.
+pub const VerifierEnv = struct {
+    /// METACODES_VERIFIER (`enforce` or `observe`), honoured in print mode.
+    mode: ?[]const u8 = null,
+    /// The end-of-run host check is armed (`host_check.endOfRunArmedFromEnv`).
+    host_check_armed: bool = false,
+};
+
+/// After argument parsing: fill the verifier mode from METACODES_VERIFIER
+/// where no flag set it (print mode only; a flag wins), then refuse a
+/// verifier with no pinned check to follow (verifier-only mode is out of
+/// scope, design §11), `--verifier-model` without a verifier, and a verifier
+/// beside the learning turn (its `contested` grounding is not implemented
+/// yet, design §3.4). Returns the message main prints before exiting 2, or
+/// null to go on.
+pub fn resolveVerifier(config: *types.Config, env: VerifierEnv, allocator: std.mem.Allocator) ?[]const u8 {
+    const print_mode = config.prompt != null;
+    if (!config.verifier and !config.verifier_observe and print_mode) if (env.mode) |text| {
+        const mode = std.meta.stringToEnum(isolated_verifier.Mode, text) orelse
+            return std.fmt.allocPrint(allocator, "invalid {s} '{s}' (expected enforce or observe)", .{ isolated_verifier.MODE_ENV, text }) catch "invalid " ++ isolated_verifier.MODE_ENV;
+        switch (mode) {
+            .enforce => config.verifier = true,
+            .observe => config.verifier_observe = true,
+        }
+    };
+    if (!config.verifier and !config.verifier_observe) {
+        if (config.verifier_model != null) return "--verifier-model requires --verifier or --verifier-observe";
+        return null;
+    }
+    if (config.learning_turn or config.learning_turn_observe)
+        return "--verifier / --verifier-observe cannot be combined with --learning-turn yet (doc/ISOLATED_VERIFIER_DESIGN.md §3.4)";
+    const in_run = (config.check_gate or config.check_gate_observe) and config.host_check_command != null;
+    if (in_run or (print_mode and env.host_check_armed)) return null;
+    return std.fmt.allocPrint(allocator, "--verifier / --verifier-observe needs a pinned check to follow: " ++
+        "--check-gate or --check-gate-observe with --host-check <cmd>, or in print mode " ++
+        "METACODES_HOST_CHECK with METACODES_SELF_EVOLUTION=1 and METACODES_TASK_HINT", .{}) catch "--verifier needs a pinned check";
+}
+
 /// The web-surface settings main reads from the environment; tests pass them in.
 pub const WebEnv = struct {
     /// METACODES_WEB_BIND.
@@ -4829,6 +4899,11 @@ fn printHelp() void {
         \\                        for the next attempt (needs --check-gate[-observe], or in print mode
         \\                        METACODES_HOST_CHECK under METACODES_SELF_EVOLUTION with METACODES_TASK_HINT)
         \\  --learning-turn-observe  Only record whether a learning turn would have run
+        \\  --verifier            After the pinned check passes, let an isolated read-only verifier audit
+        \\                        the work against the task statement; a reproduced FAIL continues the run
+        \\                        (needs --check-gate[-observe], or in print mode the self-evolution host check)
+        \\  --verifier-observe    Run the isolated verifier at the same points and only record its verdict
+        \\  --verifier-model <m>  Model or tier (low/mid/high) for the verifier (default: the session model)
         \\  --test-integrity      When the model stops with tests that existed before the run rewritten,
         \\                        deleted or disabled, ask once to restore them or quote the request
         \\  --test-integrity-observe  Only record and report changes to tests that existed before the run
@@ -5066,6 +5141,7 @@ test {
     _ = &@import("sandbox/profile.zig");
     _ = &@import("sandbox/config.zig");
     _ = &@import("sandbox/exec.zig");
+    _ = &@import("sandbox/bwrap.zig");
     _ = &@import("core/message.zig");
     _ = &@import("core/conversation.zig");
     _ = &@import("core/agent_loop.zig");
@@ -5073,6 +5149,8 @@ test {
     _ = &@import("core/verdict.zig");
     _ = &@import("core/host_check.zig");
     _ = &@import("core/check_gate.zig");
+    _ = &@import("core/isolated_verifier.zig");
+    _ = &@import("agents/isolation.zig");
     _ = &@import("core/learning_turn.zig");
     _ = &@import("core/learning_end_of_run.zig");
     _ = &@import("kg/lesson.zig");
@@ -5084,6 +5162,20 @@ test {
     _ = &@import("swarm/context.zig");
     _ = &@import("swarm/tools.zig");
     _ = &@import("swarm/teammate_process.zig");
+    _ = &@import("teamwork/types.zig");
+    _ = &@import("teamwork/config.zig");
+    _ = &@import("teamwork/run_dir.zig");
+    _ = &@import("teamwork/ledger.zig");
+    _ = &@import("teamwork/issues.zig");
+    _ = &@import("teamwork/reviewer.zig");
+    _ = &@import("teamwork/stub_driver.zig");
+    _ = &@import("teamwork/charters.zig");
+    _ = &@import("teamwork/drivers/common.zig");
+    _ = &@import("teamwork/drivers/write_scope.zig");
+    _ = &@import("teamwork/drivers/metacodes.zig");
+    _ = &@import("teamwork/drivers/claude_code.zig");
+    _ = &@import("teamwork/drivers/factory.zig");
+    _ = &@import("teamwork/drivers/drivers_test.zig");
     _ = &@import("core/memory/import.zig");
     _ = &@import("core/memory/claudemd.zig");
     _ = &@import("core/memory/user_context.zig");

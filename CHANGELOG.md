@@ -38,6 +38,21 @@ status, compatibility boundaries, and entry points are defined by
   keys that are only in the shell and choose nothing. Never a key or a
   token. The start and `login status` take the decision from one place
   (`src/app/startup_order.zig`).
+- **`/model` is one screen, models first** (follow-up to #527). The models of
+  every configured provider are listed under a heading per provider that says
+  where its key comes from and who bills it, the provider in use first and the
+  cursor on the model in use; typing filters across them all and lists the
+  matches flat. A model served on several routes lists them under it, in
+  words, while the cursor is on it; Enter on the model takes its preferred
+  route, Enter on a route takes that one. The reasoning level is a line under
+  the list, changed with ←/→ from any row, and kept as the level wanted: each
+  model shows and commits the nearest one it takes. The three scopes are named
+  in the header. Providers without a key are one "Not configured" line at the
+  bottom; Enter lists them. Closing the picker without a choice prints
+  `kept <model>`. On the Metask session, `/model` lists only the models the
+  gateway serves on `/v1/messages`, with the reasoning levels it names
+  (`capabilities.reasoning.efforts`); before, it listed the gateway's image
+  and video models too, and offered no level.
 
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
@@ -255,6 +270,21 @@ status, compatibility boundaries, and entry points are defined by
   check. `metacodes login --provider openai` takes a pasted key too while no
   OAuth client is configured for OpenAI; it used to start the browser sign-in
   and stop on the missing client id.
+
+- **A Linux sandbox backend: bubblewrap.** With `sandbox.enabled`, Bash,
+  Monitor, skill `!` lines, the teamwork reviewer's check command and the
+  Claude Code seat's CLI now run on Linux in bwrap mount, pid and IPC
+  namespaces translated from the same settings Seatbelt reads on macOS:
+  `/` read-only, the write roots bound writable at their physical paths,
+  `denyWrite` read-only and `denyRead` hidden on top, `--new-session
+  --die-with-parent`. bwrap is `/usr/bin/bwrap`, `/bin/bwrap` or the absolute
+  path in `METACODES_BWRAP`, never `PATH`, and is probed once per process; one
+  that cannot create a user namespace counts as no sandbox, so
+  `failIfUnavailable` refuses and `autoAllowBashIfSandboxed` does not apply.
+  A domain list in `network` cuts the network off under bwrap (no per-host
+  filter). Teamwork seats on Linux get the sandbox too, so an implementer seat
+  can build and test in its workspace instead of running read-only commands
+  only.
 
 - **A `SessionHost` Session can move onto another provider route, journaled
   as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`

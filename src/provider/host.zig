@@ -24,6 +24,8 @@ const offer_mod = @import("offer.zig");
 const profile_mod = @import("profile.zig");
 const metask_profile = @import("profiles/metask.zig");
 const metask_catalog = @import("metask_catalog.zig");
+const controls_mod = @import("controls.zig");
+const ControlSpec = controls_mod.ControlSpec;
 
 pub const ProviderRegistry = registry_mod.ProviderRegistry;
 pub const OfferCatalog = registry_mod.OfferCatalog;
@@ -255,6 +257,24 @@ pub const Host = struct {
     /// Replace Metask's compiled inventory with a gateway's `/v1/models`
     /// document. The gateway origin is kept separate from either protocol
     /// path; every returned model is materialized once per wire in `wires`.
+    /// The reasoning levels a Metask model takes (`metask_catalog.Model.efforts`,
+    /// the gateway's words), as the `reasoning_effort` control `/model` offers
+    /// and a commit applies; none when the gateway names none. Copied into
+    /// `arena`, which the registry keeps.
+    fn metaskReasoningControls(arena: std.mem.Allocator, efforts: []const []const u8) ![]const ControlSpec {
+        if (efforts.len == 0) return &.{};
+        const values = try arena.alloc([]const u8, efforts.len);
+        for (efforts, 0..) |effort, i| values[i] = try arena.dupe(u8, effort);
+        const specs = try arena.alloc(ControlSpec, 1);
+        specs[0] = .{
+            .id = "reasoning_effort",
+            .label = "Reasoning effort",
+            .kind = .enumeration,
+            .allowed_values = values,
+        };
+        return specs;
+    }
+
     pub fn ingestMetask(
         self: *Host,
         gateway_origin: []const u8,
@@ -294,6 +314,7 @@ pub const Host = struct {
                 },
                 .capabilities = capabilities,
                 .quote = .unknown,
+                .controls = try metaskReasoningControls(scratch, model.efforts),
             };
         }
 
@@ -698,6 +719,33 @@ test "an API-key Metask catalog offers each gateway model once, on the Messages 
         try std.testing.expect(!std.mem.startsWith(u8, item.request_model_id, "claude-"));
     }
     try std.testing.expectEqual(@as(usize, 2), metask_offers);
+}
+
+test "the www gateway's catalog offers only the models it serves on /v1/messages, with their reasoning levels to choose" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask("https://www.metask-ai.com",
+        \\{"object":"list","data":[
+        \\ {"id":"glm-5.3","capabilities":{"endpoints":{"messages":{"supported":true}},
+        \\   "reasoning":{"supported":true,"disable":{"supported":false},"efforts":["low","medium","high","max"]}}},
+        \\ {"id":"wan3.0-video-prime","capabilities":{"endpoints":{"messages":{"supported":false},"videos":{"supported":true}}}}
+        \\]}
+    , .messages_and_chat);
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("metask")) continue;
+        seen += 1;
+        // The video model is not offered on either route.
+        try std.testing.expectEqualStrings("glm-5.3", item.request_model_id);
+        try std.testing.expectEqual(offer_mod.Tri.supported, item.capabilities.get(.reasoning));
+        const spec = controls_mod.findSpec(item.controls, "reasoning_effort") orelse return error.NoReasoningControl;
+        try std.testing.expectEqual(@as(usize, 4), spec.allowed_values.len);
+        try std.testing.expectEqualStrings("low", spec.allowed_values[0]);
+        try std.testing.expectEqualStrings("max", spec.allowed_values[3]);
+    }
+    // One model, on the Messages and the Chat route.
+    try std.testing.expectEqual(@as(usize, 2), seen);
 }
 
 test "two refreshes keep the retired catalog alive for one generation" {

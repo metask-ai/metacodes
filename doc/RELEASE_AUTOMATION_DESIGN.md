@@ -318,8 +318,8 @@ red until the reopen PR lands; the cut itself (stage A) also refuses without
 
 The cut and the reopen PR carry no code: they change the two version files,
 the changelog heading, AgentCore's generated files (§2a) and the fingerprint
-pin, and `main`'s full CI already
-ran on the commit they branch from. Running the suites again (about 25
+pin. A successful full PR CI run can prove the exact tree of the base they
+branch from; main pushes no longer repeat that run. Running the suites again (about 25
 minutes, and the reopen PR after every release) proves nothing new, so
 `ci.yml` starts with a `Release fast path` job that decides per PR, with
 `scripts/release_fast_path.py`, whether the required jobs may skip them.
@@ -339,23 +339,25 @@ Two facts must both hold:
    re-derived, so a raised version stays the reviewer's call. A reworded
    changelog line, a hand-edited pin, ledger or package version, or any other
    file is the full path.
-2. **Base.** The `CI` workflow's push run for that base commit concluded
-   `success`. A run still in progress is waited for, up to 45 minutes: the
-   reopen PR is opened while `main`'s run of the release merge commit is
-   going. A failed, cancelled or missing run is the full path.
+2. **Base.** A merged PR's successful `CI` run has a `pr-ci-evidence`
+   artifact for the exact Git tree of this base. Evidence records the tested
+   synthetic merge, head/base, repository, run ID and attempt. It is emitted
+   only after all CI suites pass on the full scope without the fast path.
+   The reader checks the merged commit identity, run identity, head and tree;
+   docs-only, evaluation-only and fast-path runs do not qualify. Missing,
+   expired or mismatched proof takes the full path immediately. The optional
+   wait is bounded and defaults to zero; no main push run is awaited.
 
 On the fast path the required `Gates (Linux|macOS|Windows)` and `TTY (Linux)`
 checks still run and report: every step of their legs and shards checks
 `FAST_PATH`, except the checkouts and the version state gate in the POSIX
 `checks` legs, which runs without `--rehearse`. The script never fails its job (an error decides the full
 path), and the required jobs run in full when the decision job itself fails,
-so a doubt costs time, never coverage. Pushes to `main` always run in full,
-including the release merge commit's run. In a merge queue group
-([CI_DESIGN.md](CI_DESIGN.md) §3) the base is the group's `base_sha` instead
-of `HEAD^1`, so only a group whose whole diff is the bump takes the fast
-path; in practice that is the bump queued alone. The version state gate
-judges the PR at the group's head, so a PR queued behind the release PR is
-dropped from the queue until the reopen PR has merged.
+so a doubt costs time, never coverage. Ordinary pushes to main do not run
+CI. The workflows retain the legacy merge-group handler only to let the
+policy migration land under the old rules; normal delivery requires current
+main on the PR branch, fresh CI and an exact-head merge
+([CI_DESIGN.md](CI_DESIGN.md) §3).
 
 What the fast path gives up is the pre-tag rehearsal of the stable-channel
 release layout on the candidate (`check_version_state.py --rehearse` followed
@@ -415,10 +417,10 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
   the checkout still ends on `main`, and the error says the branch is already
   pushed; re-running the same command regenerates it, pushes it with a lease
   and opens or updates the PR.
-- **Fast path on a bad base**: the release PR's base must have a successful
-  `CI` push run; a red, cancelled or still-missing run after the 45-minute wait
-  sends the PR through the full suites, and a merge that moves `main` makes the
-  PR behind, so its re-run decides again against the new base.
+- **Fast path on a bad base**: the release PR's base needs successful full
+  PR CI evidence for its exact tree. Missing, failed, expired or mismatched
+  evidence takes the full path. A merge that moves main makes the PR behind,
+  so updating its branch triggers a fresh decision against the new base.
 - **Stale clone**: the cut and the reopen refuse unless `main` equals freshly
   fetched `origin/main`; the reopen also requires the tag to exist on origin
   and to point at a commit `main` contains.

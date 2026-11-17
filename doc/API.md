@@ -4,6 +4,16 @@ Metacodes exposes several host shapes over one kernel. The fixed AgentLoop,
 Conversation projection, permission/sandbox chain, budgets, formal verdicts,
 artifact store, and TinyKG admission are not replaceable extensions.
 
+Sandbox execution has two boundaries: native filesystem/command tools use
+confined executors, while external harness workers run as a whole confined
+process tree. Linux combines bubblewrap and seccomp; macOS uses Seatbelt.
+Deploy the bundled `bin/metacodes-fs-helper` beside an embedded Host or set
+`METACODES_SANDBOX_HELPER` to its absolute path. Enabled native file/worker
+sandboxes refuse unavailable backends rather than opening/running on the Host.
+The Zig `sandbox_exec` namespace exposes platform discovery; no C ABI fields
+or wire layouts change. See [sandbox execution](SANDBOX_DESIGN.md) for the
+helper contract and the current network-policy limits.
+
 ## Compatibility matrix
 
 | Interface | Entry point | Status | Compatibility rule |
@@ -89,7 +99,13 @@ normative model; the entry points are:
 | `<session_dir>/runtime-selection.json` | `session_selection`; a session-scoped choice never reaches `config.json` |
 | `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
 
-Interactive surfaces: `Ctrl+O` and `/model` open the route picker (transcript
+Interactive surfaces: `Ctrl+O` and `/model` open the route picker, one screen
+of models under a heading per provider (where its key comes from, who bills
+it), the cursor on the model in use; a model served on several routes lists
+them under it while the cursor is on it, the reasoning level is a line under
+the list changed with ←/→, the three scopes are named in the header (`Tab`
+cycles them), typing filters across every provider, and closing without a
+choice prints `kept <model>` (transcript
 viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
 and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
 names a route (`pin`, `float`, `use`, `remove`); `/models` still selects the
@@ -856,6 +872,11 @@ in one of five ways:
 | Live-replaceable | API key (the provider credential) | `updateCredential`, idle or during a Run, from any thread or from the Session's own callbacks; never `error.SessionBusy`, and refused only for a poisoned Session or an invalid candidate. Create and restore apply the same rule to `SessionConfig.api_key` (1 to 16 KiB of printable ASCII; `error.InvalidCredentialByte`, `error.EmptyCredential`, `error.CredentialTooLong`). The candidate is validated and copied before anything changes; a refusal keeps the previous credential. A request reads the credential when it is sent (once it holds its connection slot), so every request sent after the call returns uses the new credential, retries, tool providers built earlier and requests still waiting for a connection included; one already sent keeps the old one. See [Credential updates](AGENTCORE_BINARY_ABI.md#credential-updates). |
 | Runtime generation | built-in tool set, static and process plugins, provider dialects | `RuntimeHost.replace`. Sessions created afterwards use the new generation; existing Sessions stay on theirs. To move a Session, persist it and restore it with `createRestoredSession` on the new generation. |
 | Fixed at create | provider kind, OpenAI protocol, auth scheme, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
+
+Inherited permission decisions hold the lender lock and read a published rule
+header stored with that lock. Replacing the lead's own optional rule header
+does not change an in-progress decision; publication completes before the
+previous rule allocations are freed.
 | Identity | Session ID | Never; a restore reuses it. |
 
 `SessionConfig.reasoning_effort` is carried by every provider request and kept
