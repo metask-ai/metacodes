@@ -176,6 +176,9 @@ metacodes providers add my-relay --base-url https://relay.example.com/v1 --proto
   it: `openai`, `claude`, `gemini`, `glm`, `kimi`, `deepseek`, `qwen`,
   `minimax`, `mistral`, `openrouter`. Without it, metacodes infers each from
   the model name, as it does for every route.
+- `--subscription-plan` — the endpoint is a coding plan licensed for
+  interactive use: a start with nobody at the keyboard (`-p`, `serve`, CI)
+  then prints a warning, as it does for `kimi-code`.
 
 `metacodes providers add` with no arguments, at a terminal, asks for each part
 in turn: id, display name, address, protocols, key, models (asking the
@@ -329,7 +332,7 @@ console lists.
 ```sh
 metacodes providers add bailian-coding --display-name "Bailian Coding Plan" \
   --base-url https://coding.dashscope.aliyuncs.com/apps/anthropic --protocol anthropic_messages \
-  --model qwen3.7-plus
+  --model qwen3.7-plus --subscription-plan
 metacodes login --provider bailian-coding
 ```
 
@@ -346,7 +349,7 @@ billed separately.
 ```sh
 metacodes providers add ark-coding --display-name "Ark Coding Plan" \
   --base-url https://ark.cn-beijing.volces.com/api/coding --protocol anthropic_messages \
-  --model ark-code-latest
+  --model ark-code-latest --subscription-plan
 metacodes login --provider ark-coding
 ```
 
@@ -354,8 +357,8 @@ metacodes login --provider ark-coding
 the plan keys to interactive use in coding tools; Alibaba's forbid automated
 scripts, application backends and non-interactive batch calls, and warn that
 misuse may suspend the subscription or ban the key. Do not run `-p`, `serve`
-or CI on them. (A plan defined here is not yet marked as one, so metacodes does
-not warn you as it does for `kimi-code`.)
+or CI on them; `--subscription-plan` makes metacodes say so when a start
+does.
 
 ### Common errors
 

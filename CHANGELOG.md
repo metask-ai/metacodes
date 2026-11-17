@@ -300,6 +300,15 @@ status, compatibility boundaries, and entry points are defined by
   provider reads. The check may be plain http to a server on this machine,
   as the provider's own requests may.
 
+- **A coding plan of your own can say it is one.** `providers add
+  --subscription-plan` (or `"subscription_plan": true` in `custom_providers`)
+  marks a provider you define as a subscription plan, as `kimi-code` and
+  `zai-coding-plan` are: a `-p`, `serve`, resumed-suspension or piped start on
+  it prints the one-line warning that its terms may not cover them. The coding
+  plans of Alibaba Cloud Model Studio and Volcano Engine Ark, which
+  `doc/PROVIDERS.md` shows defined this way, limit their keys to interactive
+  use in coding tools.
+
 - **A Linux sandbox backend: bubblewrap.** With `sandbox.enabled`, Bash,
   Monitor, skill `!` lines, the teamwork reviewer's check command and the
   Claude Code seat's CLI now run on Linux in bwrap mount, pid and IPC

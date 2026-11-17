@@ -183,6 +183,12 @@ fn buildProfile(
     if (oauth.token_url != null and !acceptsOAuthKind(kinds))
         return error.OAuthWithoutOAuthCredentialKind;
     const key_setup = try pastedKeySetup(arena, display, kinds, channelNamed(channels, default_channel));
+    // A coding plan the user defined (Bailian's, Ark's) is one as much as a
+    // built-in plan is: a start with nobody at the keyboard says so.
+    const subscription_plan = if (value.object.get("subscription_plan")) |flag| switch (flag) {
+        .bool => |set| set,
+        else => return error.InvalidDocument,
+    } else false;
 
     const built = ProviderProfile{
         .id = id,
@@ -202,6 +208,7 @@ fn buildProfile(
         .oauth_client_id = oauth.client_id,
         .oauth_scope = oauth.scope,
         .api_key_setup = key_setup,
+        .subscription_plan = subscription_plan,
     };
     // The same structural validation a built-in profile goes through. Doing it
     // here means a malformed definition fails at parse time rather than at the
@@ -644,6 +651,10 @@ fn parseValues(arena: std.mem.Allocator, value: ?std.json.Value) DefinitionError
 /// `--replace` keeps it (`patchEntry`).
 pub const Draft = struct {
     display_name: ?[]const u8 = null,
+    /// A subscription plan licensed for interactive use
+    /// (`ProviderProfile.subscription_plan`): `-p`, `serve` and CI starts
+    /// on it say so once.
+    subscription_plan: bool = false,
     /// Null keeps the schema default, a bearer token.
     auth: ?profile_mod.AuthScheme = null,
     /// The environment variable the key is read from (`env_aliases`), in the
@@ -683,6 +694,10 @@ fn writeDraft(json: *std.json.Stringify, draft: Draft) std.Io.Writer.Error!void 
     if (draft.display_name) |name| {
         try json.objectField("display_name");
         try json.write(name);
+    }
+    if (draft.subscription_plan) {
+        try json.objectField("subscription_plan");
+        try json.write(true);
     }
     if (draft.auth) |auth| {
         try json.objectField("auth");
@@ -783,6 +798,7 @@ fn writeModel(json: *std.json.Stringify, model: DraftModel) std.Io.Writer.Error!
 /// additions and all.
 pub const Patch = struct {
     display_name: ?[]const u8 = null,
+    subscription_plan: ?bool = null,
     auth: ?profile_mod.AuthScheme = null,
     key_env: ?[]const u8 = null,
     /// Replaces the channel list.
@@ -812,6 +828,7 @@ pub fn patchEntry(allocator: std.mem.Allocator, existing: []const u8, patch: Pat
     const object = &root.object;
 
     if (patch.display_name) |name| try object.put(arena, "display_name", .{ .string = name });
+    if (patch.subscription_plan) |set| try object.put(arena, "subscription_plan", .{ .bool = set });
     if (patch.auth) |auth| try object.put(arena, "auth", try valueOf(arena, auth, writeAuth));
     if (patch.key_env) |name| try object.put(arena, "env_aliases", try valueOf(arena, name, writeEnvAliases));
     if (patch.channels) |channels| {
@@ -1362,4 +1379,31 @@ test "a patch changes what it names and keeps what a person wrote by hand" {
     try testing.expectEqualStrings("eu", channel.get("region").?.string);
 
     try testing.expectError(error.InvalidDocument, patchEntry(a, "[1]", .{}));
+}
+
+test "a definition may say it is a subscription plan, and only with a boolean" {
+    const a = testing.allocator;
+    var definitions = try parse(a,
+        \\{"custom_providers": {"coding-plan": {"subscription_plan": true,
+        \\  "channels": [{"id":"anthropic","base_url":"https://plan.example.com","protocol":"anthropic_messages"}],
+        \\  "models": [{"request_model_id":"m"}]},
+        \\ "metered": {"channels": [{"id":"openai","base_url":"https://metered.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"m"}]}}}
+    );
+    defer definitions.deinit();
+    try testing.expect(definitions.find("coding-plan").?.subscription_plan);
+    try testing.expect(!definitions.find("metered").?.subscription_plan);
+    try testing.expectError(error.InvalidDocument, parse(a,
+        \\{"custom_providers": {"x": {"subscription_plan": "yes",
+        \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"m"}]}}}
+    ));
+    const channels = [_]DraftChannel{.{ .id = "anthropic", .base_url = "https://plan.example.com", .wire = .anthropic_messages }};
+    const models = [_]DraftModel{.{ .request_model_id = "m" }};
+    const text = try renderDraft(a, .{ .display_name = "Plan", .subscription_plan = true, .channels = &channels, .models = &models });
+    defer a.free(text);
+    try testing.expect(std.mem.startsWith(u8, text, "{\"display_name\":\"Plan\",\"subscription_plan\":true,"));
+    const unmarked = try patchEntry(a, text, .{ .subscription_plan = false });
+    defer a.free(unmarked);
+    try testing.expect(std.mem.indexOf(u8, unmarked, "\"subscription_plan\":false") != null);
 }

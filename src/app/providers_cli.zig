@@ -49,7 +49,7 @@ const USAGE =
     \\usage: metacodes providers add <id> --base-url <url> --protocol <wire> [--protocol <wire>[=<url>]]...
     \\                           [--model <model>]... [--probe] [--display-name <name>]
     \\                           [--key-env <VAR>] [--auth bearer|header:<name>[:<prefix>]]
-    \\                           [--dialect <vendor>] [--replace]
+    \\                           [--dialect <vendor>] [--subscription-plan] [--replace]
     \\       metacodes providers add                 (at a terminal: asks for each part)
     \\       metacodes providers probe <id>
     \\       metacodes providers probe --base-url <url> --protocol <wire> [--auth ...] [--key-env <VAR> | --api-key-stdin]
@@ -88,6 +88,9 @@ const HELP = USAGE ++
     \\  --dialect       Whose models these are when their names do not say: openai,
     \\                  claude, gemini, glm, kimi, deepseek, qwen, minimax, mistral,
     \\                  openrouter.
+    \\  --subscription-plan
+    \\                  A coding plan licensed for interactive use (Bailian's, Ark's):
+    \\                  a -p, serve or CI start on it prints a warning.
     \\  --replace       Change one that exists: only what you give changes, and what was
     \\                  written by hand (prices, limits, controls) stays.
     \\
@@ -159,6 +162,7 @@ const AddArgs = struct {
     models: std.ArrayList([]const u8) = .empty,
     probe: bool = false,
     replace: bool = false,
+    subscription_plan: bool = false,
     /// A key pasted at a terminal: for the probe, then stored.
     pasted_key: ?[]const u8 = null,
     /// The key question was answered already (the step-by-step `add`): the
@@ -340,7 +344,7 @@ const Cli = struct {
             return 2;
         }
         if (args.replace and args.display_name == null and args.auth == null and args.key_env == null and args.channels.items.len == 0 and
-            args.dialect == null and args.models.items.len == 0 and !args.probe)
+            args.dialect == null and args.models.items.len == 0 and !args.probe and !args.subscription_plan)
         {
             std.debug.print("error: --replace changes what you give with it (--display-name, --model, --protocol, …); nothing was given\n", .{});
             return 2;
@@ -490,6 +494,7 @@ const Cli = struct {
         const entry_json = if (existing) |current|
             custom_provider.patchEntry(self.gpa, current, .{
                 .display_name = args.display_name,
+                .subscription_plan = if (args.subscription_plan) true else null,
                 .auth = args.auth,
                 .key_env = args.key_env,
                 .channels = if (channels.items.len > 0) channels.items else null,
@@ -502,6 +507,7 @@ const Cli = struct {
         else
             custom_provider.renderDraft(self.gpa, .{
                 .display_name = args.display_name,
+                .subscription_plan = args.subscription_plan,
                 .auth = auth,
                 .key_env = args.key_env,
                 .channels = channels.items,
@@ -753,6 +759,7 @@ const Cli = struct {
         for (profiles) |*profile| {
             w.print("{s}", .{profile.id.slice()}) catch {};
             if (!std.mem.eql(u8, profile.display_name, profile.id.slice())) w.print("  {s}", .{profile.display_name}) catch {};
+            if (profile.subscription_plan) w.print("  (subscription plan)", .{}) catch {};
             if (document) |*value| if (value.provider(profile.id)) |entry| if (!entry.enabled) w.print("  (disabled: /providers enable {s})", .{profile.id.slice()}) catch {};
             w.print("\n", .{}) catch {};
             for (profile.channels) |channel| {
@@ -1441,6 +1448,8 @@ fn parseAddArgs(arena: std.mem.Allocator, argv: []const []const u8, args: *AddAr
             args.probe = true;
         } else if (std.mem.eql(u8, arg, "--replace")) {
             args.replace = true;
+        } else if (std.mem.eql(u8, arg, "--subscription-plan")) {
+            args.subscription_plan = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return unknownArgument(arg);
         } else if (args.id == null) {

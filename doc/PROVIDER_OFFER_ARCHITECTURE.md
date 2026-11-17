@@ -279,7 +279,11 @@ at the keyboard (`-p`, `serve`, a resumed suspension, the REPL reading a pipe)
 prints one `warning:` line on stderr saying so. It never refuses and never
 changes the exit code: the terms are the vendor's to enforce. `--web` is a
 person in a browser and a teammate answers to its lead's session; neither
-prints it.
+prints it. A provider the user defines can say it is one too
+(`"subscription_plan": true` in `custom_providers`, written by
+`metacodes providers add --subscription-plan`): the coding plans of Alibaba
+Cloud Model Studio and Volcano Engine Ark are reached that way, and their
+terms limit the plan keys to interactive use in coding tools as well.
 
 ## User-Agent
 
@@ -806,7 +810,8 @@ writes and reads the same section without hand-written JSON:
 
 - `add <id> --base-url <url> --protocol <wire> [--protocol <wire>[=<url>]]…
   [--model <id>]… [--probe] [--display-name] [--dialect] [--key-env <VAR>]
-  [--auth bearer|header:<name>[:<prefix>]] [--replace]` renders the definition
+  [--auth bearer|header:<name>[:<prefix>]] [--subscription-plan] [--replace]`
+  renders the definition
   (`custom_provider.renderDraft`: what a person would write, and nothing
   more), one channel per wire with ids named after the wire (`openai`,
   `responses`, `anthropic`, `gemini`, `bedrock`), so adding a second protocol
@@ -1145,9 +1150,6 @@ omission — and none of them is an acceptance criterion of the issue.
   from the next start, and `/providers refresh` re-reads only
   `provider_catalogs`. Re-adopting definitions live would free strings a
   running route may still borrow.
-- **A defined provider marked as a subscription plan.** The schema has no
-  `subscription_plan` field, so a coding plan defined here (Bailian's, Ark's)
-  gets no non-interactive warning.
 
 - **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
   signed adapter reference, which needs review and signing infrastructure. The

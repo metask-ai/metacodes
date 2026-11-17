@@ -649,3 +649,32 @@ test "the TUI's /providers remove takes a defined provider whole, and a built-in
     try testing.expect(!shipped.definition);
     try expectAbsent(try case.read("state/config.json"), "\"deepseek\"");
 }
+
+// ── a coding plan of one's own ───────────────────────────────────────────────
+
+test "a provider added as a subscription plan warns a start with nobody at the keyboard, once" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    const a = case.arena();
+    var server = try harness.MockServer.startCassette(&.{ OPENAI_SSE, OPENAI_SSE }, 0);
+    defer server.stop();
+    const base = try std.fmt.allocPrint(a, "{s}/v1", .{try originOf(a, server)});
+    const added = try case.run(&.{}, &.{ "providers", "add", "coding-plan", "--display-name", "House Coding Plan", "--base-url", base, "--protocol", "openai_chat", "--model", "glm-4.6", "--key-env", "PLAN_KEY", "--subscription-plan" });
+    try added.expectExit(0);
+    try testing.expect((try get(try case.defined("coding-plan"), "subscription_plan")).bool);
+    const listed = try case.run(&.{}, &.{ "providers", "list" });
+    try expectContains(listed.stdout, "coding-plan  House Coding Plan  (subscription plan)\n");
+
+    const warned = try case.run(&.{"PLAN_KEY=sk-plan"}, &.{ "--provider", "coding-plan", "--model", "glm-4.6", "-p", "hi" });
+    try warned.expectExit(0);
+    const line = "warning: House Coding Plan is a subscription plan for interactive use";
+    try expectContains(warned.stderr, line);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, warned.stderr, line));
+
+    // A provider not marked says nothing.
+    try (try case.run(&.{}, &.{ "providers", "add", "metered", "--base-url", base, "--protocol", "openai_chat", "--model", "glm-4.6", "--key-env", "METERED_KEY" })).expectExit(0);
+    const quiet = try case.run(&.{"METERED_KEY=sk-metered"}, &.{ "--provider", "metered", "--model", "glm-4.6", "-p", "hi" });
+    try quiet.expectExit(0);
+    try expectAbsent(quiet.stderr, "subscription plan");
+}
