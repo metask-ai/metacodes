@@ -19,6 +19,7 @@ from pr_loop.model import Binding, Busy, DEFAULT_REPO, LoopError, REQUIRED_CHECK
 
 
 PASS = {"verdict": "pass", "summary": "No blocking findings", "findings": [], "question": ""}
+RETRY = {"verdict": "retry", "summary": "Repository tools timed out", "findings": [], "question": ""}
 FIX = {"verdict": "fix_required", "summary": "Incorrect result", "findings": [
     {"path": "app.txt", "line": 1, "reason": "The result is incorrect", "acceptance": "The file says fixed"}], "question": ""}
 
@@ -46,6 +47,9 @@ for line in sys.stdin:
             send(response)
         if cfg.get("hang"):
             time.sleep(60)
+        if cfg.get("drop_worker") and "verdict" not in params["outputSchema"]["properties"]:
+            (pathlib.Path(params['cwd']) / 'app.txt').write_text('partial worker edit\n')
+            sys.exit(1)
         if cfg.get("approval"):
             send({"id": 999, "method": "item/commandExecution/requestApproval", "params": {}})
             continue
@@ -125,8 +129,6 @@ class FixtureGitHub(GitHub):
                 "status": "in_progress" if self.check_state == "pending" else "completed",
                 "conclusion": self.check_state, "html_url": "https://github.com/check/1"}
                 for i, name in enumerate(REQUIRED_CHECKS)]}
-        if "/statuses/" in path:
-            return {}
         raise AssertionError((path, method, payload))
 
 
@@ -207,6 +209,57 @@ class LoopIntegrationTest(unittest.TestCase):
         self.controller.once()
         self.assertEqual(self.row()["state"], "merged")
         self.assertEqual(self.notifications, [])
+        self.assertFalse(any('/statuses/' in path for path, _, _ in self.github.calls))
+
+    def test_unavailable_review_automatically_retries_then_repairs_without_status_gate(self):
+        self.configure(reports=[RETRY, FIX, PASS], worker_texts=['fixed\n'])
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'pending')
+        self.assertIsNone(self.row()['report'])
+        self.assertEqual((self.row()['agent_runs'], self.row()['rounds']), (1, 0))
+        self.assertEqual(self.notifications, [])
+        self.assertEqual(git(self.bare, 'rev-parse', 'feature'), self.head)
+        self.controller.once()
+        fixed = git(self.bare, 'rev-parse', 'feature')
+        self.assertNotEqual(fixed, self.head)
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'merged')
+        self.assertEqual((self.row()['agent_runs'], self.row()['rounds']), (4, 1))
+        self.assertEqual(self.notifications, [])
+        self.assertFalse(any('/statuses/' in path for path, _, _ in self.github.calls))
+
+    def test_interrupted_readonly_review_recovers_without_resetting_budget(self):
+        self.store.update(self.binding, State.REVIEWING, agent_runs=1)
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'pending')
+        self.assertEqual(self.row()['agent_runs'], 1)
+        self.assertEqual(self.requests('turn/start'), [])
+        self.configure()
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'merged')
+        self.assertEqual(self.row()['agent_runs'], 2)
+        self.assertEqual(self.notifications, [])
+
+    def test_review_retries_still_stop_at_persisted_invocation_limit(self):
+        binding = replace(self.binding, max_agent_runs=2)
+        with self.store.db:
+            self.store.db.execute('UPDATE prs SET binding=?', (json.dumps(binding.__dict__),))
+        self.configure(reports=[RETRY, RETRY, PASS])
+        self.controller.once()
+        self.controller.once()
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'needs_decision')
+        self.assertIn('budget exhausted', self.row()['reason'])
+        self.assertEqual(len(self.requests('turn/start')), 2)
+        self.assertFalse(self.github.merged)
+
+    def test_worker_transport_failure_preserves_candidate_and_stops_for_reconciliation(self):
+        self.configure(reports=[FIX], drop_worker=True)
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'needs_decision')
+        self.assertEqual(git(self.bare, 'rev-parse', 'feature'), self.head)
+        self.assertEqual((self.work / 'app.txt').read_text(), 'partial worker edit\n')
+        self.assertIn('app-server ended', self.row()['reason'])
 
     def test_failed_local_gate_returns_to_worker_without_notifying(self):
         self.configure(reports=[FIX], worker_texts=["half fixed\n", "fixed\n"])
@@ -402,14 +455,19 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertIn("approval", self.row()["reason"])
         self.assertEqual(len(self.notifications), 1)
 
-    def test_timeout_stops_the_child_and_preserves_decision(self):
+    def test_readonly_timeout_stops_child_and_retries_full_review(self):
         self.configure(hang=True)
         with self.store.db:
             binding = replace(self.binding, timeout=1)
             self.store.db.execute("UPDATE prs SET binding=?", (json.dumps(binding.__dict__),))
         self.controller.once()
-        self.assertEqual(self.row()["state"], "needs_decision")
+        self.assertEqual(self.row()["state"], "pending")
         self.assertIn("timeout", self.row()["reason"])
+        self.assertEqual(self.row()['agent_runs'], 1)
+        self.assertEqual(self.notifications, [])
+        self.configure()
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'merged')
 
     def test_cannot_bind_same_thread_or_checkout_twice(self):
         with self.assertRaisesRegex(LoopError, "already bound"):
@@ -462,6 +520,8 @@ class BoundaryTest(unittest.TestCase):
             validate_report(dict(FIX, verdict="pass"))
         with self.assertRaisesRegex(LoopError, "question"):
             validate_report(dict(PASS, verdict="needs_decision"))
+        with self.assertRaisesRegex(LoopError, 'retry verdict'):
+            validate_report(dict(FIX, verdict='retry'))
 
     def test_github_uses_json_stdin_and_does_not_interpret_pr_text(self):
         with tempfile.TemporaryDirectory() as tmp:

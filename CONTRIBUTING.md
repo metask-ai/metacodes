@@ -86,6 +86,12 @@ Only registered PRs participate. Ordinary main pushes do not repeat PR CI;
 Linux ARM64, Intel macOS and Windows ARM64 cross-build coverage runs at release
 time ([CI design](doc/CI_DESIGN.md#3-pr-only-validation-and-merge-policy)).
 
+Review and repair run automatically without an additional `agent/review`
+commit-status gate. Unavailable tools, review timeouts and interrupted
+read-only reviews retry on later polls within the same persisted invocation
+limit. Product/permission decisions, interrupted writes and exhausted limits
+still preserve progress for a recorded decision.
+
 When a decision or additional permission is needed, or a configured limit is
 reached, the loop pauses and notifies you locally. Check progress and answer:
 

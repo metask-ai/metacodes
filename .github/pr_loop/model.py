@@ -21,9 +21,14 @@ class Busy(LoopError):
     """The bound worker already has an active turn."""
 
 
+class AgentUnavailable(LoopError):
+    """The agent transport failed; only a read-only invocation may be replayed."""
+
+
 class Verdict(str, Enum):
     PASS = "pass"
     FIX = "fix_required"
+    RETRY = "retry"
     DECISION = "needs_decision"
 
 
@@ -141,6 +146,8 @@ def validate_report(value: dict) -> dict:
         raise LoopError("a passing review cannot contain unresolved findings or a question")
     if verdict == Verdict.FIX and (not value["findings"] or value["question"]):
         raise LoopError("a fix verdict needs findings and no decision question")
+    if verdict == Verdict.RETRY and (value["findings"] or value["question"]):
+        raise LoopError("a retry verdict needs no findings or decision question")
     if verdict == Verdict.DECISION and not value["question"].strip():
         raise LoopError("a decision verdict needs a question")
     return value

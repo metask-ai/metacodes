@@ -82,6 +82,10 @@ Before handing a PR over, confirm that the developer has the watcher running.
   back to the original worker. During repair, the worker edits; the controller
   owns checkpoint commits, `dx zig build gate:pr`, and ordinary pushes. Failed
   checkpoints stay local. A pushed revision receives a fresh review.
+- Review and repair are automatic work, not an additional `agent/review`
+  commit-status gate. Unavailable tools and interrupted read-only reviews
+  retry full review automatically within the existing invocation limits.
+  Never substitute a limited review or manufacture approval after a timeout.
 - Keep the PR branch current with main. The controller merges updated main,
   validates and pushes it, then requires fresh review and PR CI. Only the exact
   reviewed head with passing required checks and satisfied upstream reviews

@@ -11,7 +11,7 @@ import sys
 import time
 
 from .adapters import Codex, Git, GitHub, WORKER_SCHEMA, run
-from .model import Binding, Busy, IN_FLIGHT, LoopError, REPORT_SCHEMA, State, Verdict, validate_report
+from .model import AgentUnavailable, Binding, Busy, IN_FLIGHT, LoopError, REPORT_SCHEMA, State, Verdict, validate_report
 
 
 def default_state():
@@ -164,6 +164,16 @@ class Controller:
             raise LoopError(f"agent-run budget exhausted ({binding.max_agent_runs})")
         self.store.update(binding, state, agent_runs=row["agent_runs"] + 1)
 
+    def retry_review(self, binding, reason):
+        # A failed or interrupted read-only review made no candidate writes.
+        # Keep its spent invocation, discard incomplete evidence and let the
+        # next poll inspect the current revision. Never manufacture approval.
+        row = self.store.get(binding.repo, binding.number)
+        if row["agent_runs"] >= binding.max_agent_runs:
+            self.decision(binding, f"agent-run budget exhausted ({binding.max_agent_runs}): {reason}")
+            return
+        self.store.update(binding, State.PENDING, report=None, reason="retrying full review: " + reason)
+
     def current(self, binding, expected):
         latest = self.github.snapshot(binding.repo, binding.number)
         if (latest.branch, latest.base_branch, latest.head_repo, latest.node_id) != (
@@ -275,6 +285,9 @@ class Controller:
         state = State(row["state"])
         if state in (State.MERGED, State.CLOSED, State.DECISION):
             return
+        if state == State.REVIEWING:
+            self.retry_review(binding, "previous read-only review was interrupted")
+            return
         if state in IN_FLIGHT:
             self.decision(binding, f"interrupted during {state.value}; inspect worktree and remote before resuming")
             return
@@ -305,14 +318,15 @@ class Controller:
             else:
                 git.verify(binding, pr, allow_dirty=bool(row["answer"]))
                 self.reserve(binding, State.REVIEWING)
-                self.github.status(pr, "pending", "Independent review running")
                 with git.review_tree(pr) as tree:
                     prompt = self.codex.review(tree, pr) + "\nUser decision: " + json.dumps(row["answer"])
                     report = validate_report(self.codex.call(tree, prompt, REPORT_SCHEMA, binding.timeout))
                 if not self.current(binding, pr):
                     return  # a completed review for an obsolete revision is never reused
                 self.store.update(binding, State.WAITING, report=json.dumps(report))
-                self.github.status(pr, "success" if report["verdict"] == Verdict.PASS else "failure", report["summary"])
+            if report["verdict"] == Verdict.RETRY:
+                self.retry_review(binding, report["summary"])
+                return
             if report["verdict"] == Verdict.DECISION:
                 raise LoopError(report["question"])
             if report["verdict"] == Verdict.FIX:
@@ -345,6 +359,13 @@ class Controller:
                     return  # main/head moved: update, re-review and re-test next pass
                 raise
             self.store.update(binding, State.MERGED, reason="GitHub confirmed the exact reviewed head merged")
+        except AgentUnavailable as exc:
+            if self.store.get(binding.repo, binding.number)["state"] == State.REVIEWING.value:
+                self.retry_review(binding, str(exc))
+            else:
+                # A disconnected worker may already have edited files. Keep
+                # those changes and require reconciliation before any replay.
+                self.decision(binding, str(exc))
         except (LoopError, OSError, ValueError, KeyError, TypeError) as exc:
             self.decision(binding, str(exc))
 

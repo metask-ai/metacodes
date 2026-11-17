@@ -7,6 +7,8 @@ to that thread, validates and pushes repairs, and requests an exact-head
 upstream merge after validation against current main. Decisions and interrupted writes stop in a durable
 `needs_decision` state. Ordinary review findings, failing CI and failed local
 validation return to the worker automatically, within the registered limits.
+Tool availability failures and interrupted read-only reviews also retry
+automatically. Review is part of the repair loop, not an extra GitHub status gate.
 
 This is contributor tooling, not a metacodes runtime API. It runs on the
 contributor's Mac; local builds, tests and gates run on devbox through `dx`.
@@ -124,15 +126,21 @@ The default SQLite database is
 option before the subcommand to select another database. Keep it outside the
 repository: it contains local paths, thread IDs, review evidence and decisions.
 Its event log records state transitions. A crash during review, repair,
-validation, push, base update or merge is escalated on restart instead of replaying an
-operation with an uncertain outcome. Inspect the worktree and PR before
+validation, push, base update or merge preserves progress on restart. An
+interrupted read-only review retries automatically; interrupted writes are
+escalated instead of replaying an operation with an uncertain outcome.
+Inspect the worktree and PR before
 answering; an answer does not automatically reconcile a divergent checkout.
 
 ## Admission contract
 
 1. A review is a fresh, read-only Codex conversation in a detached snapshot.
-   It returns schema-validated `pass`, `fix_required` or `needs_decision`.
+   It returns schema-validated `pass`, `fix_required`, `retry` or `needs_decision`.
    A passing report cannot contain unresolved findings or a question.
+   A tool or repository-access failure returns `retry` with no findings or
+   decision question. The next poll starts a complete review of the current
+   revision. Transport failures and read-only timeouts use the same path;
+   spent invocations remain counted. No review from excerpts is substituted.
 2. Reports are bound to both head and base SHA. A changed revision invalidates
    them; the controller rechecks the revision after review, repair and local
    validation, and immediately before merging.
@@ -156,11 +164,13 @@ answering; an answer does not automatically reconcile a divergent checkout.
    up-to-date branch, with no merge queue. GitHub must confirm the merge;
    no deferred auto-merge request or admin bypass is used.
 
-`agent/review` is a contributor-visible commit status. It is not added to the
-repository's required checks by this change; the local controller enforces it
-for its own admissions. Repository-wide mandatory agent review, including
-manual merges or admissions by other actors, would need a separately deployed
-trusted reviewer and a required PR check.
+The controller stores its review evidence and progress locally. It does not
+publish an `agent/review` commit status or add a required review check to the
+repository. Findings drive automatic repairs; transient read-only failures
+drive automatic retries. Existing GitHub CI, upstream reviews, thread
+resolution and exact-head merge requirements still apply. Legacy commit
+statuses already published on older heads are historical records; retiring
+one does not mean a code review passed.
 
 ## Verification
 
@@ -174,7 +184,9 @@ and recorded GitHub API requests. It proves review → original-thread repair �
 validation → push → fresh review → exact-head merge → observed merge, without
 provider calls. It also exercises stale review rejection, CI failures, busy
 workers, decision recovery, invocation limits, policy edits and interrupted
-operations. No live PR is opened or merged by the tests.
+operations. It also proves unavailable tools → full review retry → repair →
+validation → fresh review → merge without publishing a review status gate.
+No live PR is opened or merged by the tests.
 
 Protocol references: [Codex App Server](https://learn.chatgpt.com/docs/app-server),
 [GitHub protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
