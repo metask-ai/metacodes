@@ -23,11 +23,17 @@ const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const fs_util = @import("../util/fs.zig");
 const file_lock = @import("../util/file_lock.zig");
+const json_merge = @import("../util/json_merge.zig");
 const config_doc = @import("config_doc.zig");
 const ids = @import("ids.zig");
 
 pub const Document = config_doc.Document;
 pub const ConfigRevision = ids.ConfigRevision;
+pub const MemberField = json_merge.MemberField;
+
+/// The section `metacodes providers` writes one member of
+/// (`custom_provider.zig` owns its schema).
+pub const CUSTOM_PROVIDERS_KEY = "custom_providers";
 
 pub const CONFIG_PATH_ENV = "METACODES_CONFIG_FILE";
 
@@ -59,6 +65,9 @@ pub const StoreError = error{
     /// An empty idempotency key would be recorded and then match every other
     /// empty key, silently turning unrelated commits into replays.
     InvalidOperationId,
+    /// The request's `validate` refused the document the commit would have
+    /// written; nothing was written. The validator keeps its own reason.
+    Rejected,
 } || config_doc.DocumentError;
 
 pub const Mutation = struct {
@@ -70,6 +79,16 @@ pub const Mutation = struct {
     }
 };
 
+/// A check of the complete document a commit is about to write.
+pub const Validator = struct {
+    ctx: *anyopaque,
+    validateFn: *const fn (ctx: *anyopaque, document_text: []const u8) anyerror!void,
+
+    pub fn check(self: Validator, document_text: []const u8) anyerror!void {
+        return self.validateFn(self.ctx, document_text);
+    }
+};
+
 pub const CommitRequest = struct {
     /// Optimistic concurrency. Null skips the check, which is only correct for
     /// a first write or a caller that has just loaded the document.
@@ -78,6 +97,16 @@ pub const CommitRequest = struct {
     /// instead of applying the mutation twice.
     operation_id: ?[]const u8 = null,
     mutation: Mutation,
+    /// Members of objects `Document` does not model, written in the same
+    /// commit: `custom_providers.<id>` (`putCustomProvider`). Each replaces
+    /// or deletes exactly its member; the object's other members, and every
+    /// other key, keep their content and order.
+    member_edits: []const MemberField = &.{},
+    /// Runs on the complete document text that would be written, under the
+    /// lock and after the re-read, so it judges exactly the bytes that land
+    /// and no other writer can change them in between. An error leaves the
+    /// file as it was (`error.Rejected`).
+    validate: ?Validator = null,
 };
 
 pub const CommitResult = struct {
@@ -167,8 +196,9 @@ pub const Store = struct {
         // that make earlier retries recognizable.
         if (request.operation_id) |operation_id| try document.recordOperation(operation_id);
 
-        const bytes = try document.merge(original);
+        const bytes = try document.mergeWith(original, request.member_edits);
         defer self.allocator.free(bytes);
+        if (request.validate) |validator| validator.check(bytes) catch return error.Rejected;
         try self.writeAtomic(bytes);
 
         return .{ .config_revision = document.config_revision };
@@ -316,6 +346,80 @@ pub fn removeProvider(
         .operation_id = operation_id,
         .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
     });
+}
+
+/// Insert or replace one configured provider's definition,
+/// `custom_providers.<id>`, with `entry_json` (an object
+/// `custom_provider.parse` reads). The section's other members and every
+/// other key keep their content and order. `validate` judges the whole
+/// document first; a refusal writes nothing.
+pub fn putCustomProvider(
+    store: *const Store,
+    id: ids.Slug,
+    entry_json: []const u8,
+    validate: ?Validator,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Noop = struct {
+        fn run(_: *anyopaque, _: *Document) anyerror!void {}
+    };
+    var anchor: u8 = 0;
+    const edits = [_]MemberField{.{ .object_key = CUSTOM_PROVIDERS_KEY, .member_key = id.slice(), .json = entry_json }};
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&anchor), .applyFn = Noop.run },
+        .member_edits = &edits,
+        .validate = validate,
+    });
+}
+
+/// What `removeCustomProvider` found to remove in the document it wrote.
+pub const CustomRemoval = struct {
+    /// `providers.<id>` was there (enable state, credential references).
+    settings: bool = false,
+    /// The global selection was `forget_default`'s and is gone.
+    default_forgotten: bool = false,
+    result: CommitResult,
+};
+
+/// Remove a configured provider in one write: its definition
+/// (`custom_providers.<id>`), its settings (`providers.<id>`), and — when
+/// it is still exactly `forget_default`, the selection the caller found to
+/// resolve to this provider — the stored default, which would otherwise name
+/// a route the next start cannot find.
+pub fn removeCustomProvider(
+    store: *const Store,
+    id: ids.Slug,
+    forget_default: ?config_doc.RuntimeSelection,
+    validate: ?Validator,
+    operation_id: ?[]const u8,
+) StoreError!CustomRemoval {
+    const Apply = struct {
+        id: ids.Slug,
+        forget_default: ?config_doc.RuntimeSelection,
+        settings: bool = false,
+        default_forgotten: bool = false,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.settings = document.removeProvider(self.id);
+            const observed = self.forget_default orelse return;
+            const current = document.global_selection orelse return;
+            // Changed since the caller resolved it: someone chose another
+            // default in between, which is not this removal's to forget.
+            if (!std.meta.eql(current, observed)) return;
+            document.global_selection = null;
+            self.default_forgotten = true;
+        }
+    };
+    var apply = Apply{ .id = id, .forget_default = forget_default };
+    const edits = [_]MemberField{.{ .object_key = CUSTOM_PROVIDERS_KEY, .member_key = id.slice(), .json = null }};
+    const result = try store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+        .member_edits = &edits,
+        .validate = validate,
+    });
+    return .{ .settings = apply.settings, .default_forgotten = apply.default_forgotten, .result = result };
 }
 
 /// Insert or replace one alias record.
@@ -714,4 +818,157 @@ test "a learned credential failure is durable and leaves the other members alone
         @as(?i64, 1_300),
         after.provider(ids.Slug.lit("openai")).?.credentials.items()[0].cooldown_until,
     );
+}
+
+/// Remove `<path>`, `<path>.lock` and `<path>.tmp`.
+fn removeFixture(path: []const u8) void {
+    for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    }
+}
+
+fn writeFixture(path: []const u8, text: []const u8) !void {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&buffer, "{s}", .{path});
+    const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o600));
+    if (fd < 0) return error.OpenFailed;
+    defer pfs.close(fd);
+    if (pfs.write(fd, text) != @as(isize, @intCast(text.len))) return error.WriteFailed;
+}
+
+fn expectKeys(expected: []const []const u8, actual: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+const HAND_WRITTEN =
+    \\{
+    \\  "theme": "dark",
+    \\  "mcp_servers": [{"name": "kg", "command": "kgd"}],
+    \\  "custom_providers": {
+    \\    "relay-a": {"display_name": "Relay A", "channels": [{"id": "c", "base_url": "https://a.example.com/v1", "protocol": "openai_chat"}],
+    \\                "models": [{"request_model_id": "m", "price": {"currency": "USD", "input": 2.5}}]},
+    \\    "relay-b": {"channels": [{"id": "c", "base_url": "https://b.example.com/v1", "protocol": "openai_chat"}], "models": [{"request_model_id": "n"}]}
+    \\  },
+    \\  "model_tiers": {"fast": "m"}
+    \\}
+;
+
+test "a configured provider is written as one member; every other key and member keeps its content and order" {
+    const a = std.testing.allocator;
+    var path_buf: [512]u8 = undefined;
+    const path = try testFixturePath(&path_buf, "custom-put.json");
+    removeFixture(path);
+    defer removeFixture(path);
+    try writeFixture(path, HAND_WRITTEN);
+
+    var store = try Store.initPath(a, path);
+    defer store.deinit();
+    const entry = "{\"display_name\":\"Relay C\",\"channels\":[{\"id\":\"openai\",\"base_url\":\"http://127.0.0.1:8000/v1\",\"protocol\":\"openai_chat\"}],\"models\":[{\"request_model_id\":\"qwen3\"}]}";
+    var before = try store.load();
+    const revision_before = before.config_revision.value();
+    before.deinit();
+    const first = try putCustomProvider(&store, ids.Slug.lit("relay-c"), entry, null, null);
+    // A commit like any other: the revision moves.
+    try std.testing.expectEqual(revision_before + 1, first.config_revision.value());
+
+    const text = try store.readText();
+    defer a.free(text);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    // The other writers' keys, in their order, with the control-plane keys
+    // appended after them.
+    try expectKeys(&.{ "theme", "mcp_servers", "custom_providers", "model_tiers" }, root.keys()[0..4]);
+    try std.testing.expectEqualStrings("kgd", root.get("mcp_servers").?.array.items[0].object.get("command").?.string);
+    const section = root.get("custom_providers").?.object;
+    try expectKeys(&.{ "relay-a", "relay-b", "relay-c" }, section.keys());
+    // A hand-written price is untouched by a write about another provider.
+    try std.testing.expectEqual(@as(f64, 2.5), section.get("relay-a").?.object.get("models").?.array.items[0].object.get("price").?.object.get("input").?.float);
+    try std.testing.expectEqualStrings("Relay C", section.get("relay-c").?.object.get("display_name").?.string);
+
+    // Replacing keeps the member where it was.
+    _ = try putCustomProvider(&store, ids.Slug.lit("relay-a"), "{\"display_name\":\"Relay A2\",\"channels\":[{\"id\":\"c\",\"base_url\":\"https://a.example.com/v1\",\"protocol\":\"openai_chat\"}],\"models\":[{\"request_model_id\":\"m\"}]}", null, null);
+    const again = try store.readText();
+    defer a.free(again);
+    var reparsed = try std.json.parseFromSlice(std.json.Value, a, again, .{});
+    defer reparsed.deinit();
+    const replaced = reparsed.value.object.get("custom_providers").?.object;
+    try expectKeys(&.{ "relay-a", "relay-b", "relay-c" }, replaced.keys());
+    try std.testing.expectEqualStrings("Relay A2", replaced.get("relay-a").?.object.get("display_name").?.string);
+}
+
+test "a refused document is never written" {
+    const a = std.testing.allocator;
+    var path_buf: [512]u8 = undefined;
+    const path = try testFixturePath(&path_buf, "custom-refused.json");
+    removeFixture(path);
+    defer removeFixture(path);
+    try writeFixture(path, HAND_WRITTEN);
+
+    var store = try Store.initPath(a, path);
+    defer store.deinit();
+    const Refuse = struct {
+        seen: usize = 0,
+        fn run(ctx: *anyopaque, text: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // It is shown the document as it would land, edit included.
+            if (std.mem.indexOf(u8, text, "\"relay-c\"") != null) self.seen += 1;
+            return error.NotThisOne;
+        }
+    };
+    var refuse = Refuse{};
+    try std.testing.expectError(error.Rejected, putCustomProvider(
+        &store,
+        ids.Slug.lit("relay-c"),
+        "{\"channels\":[],\"models\":[]}",
+        .{ .ctx = @ptrCast(&refuse), .validateFn = Refuse.run },
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), refuse.seen);
+    const text = try store.readText();
+    defer a.free(text);
+    try std.testing.expectEqualStrings(HAND_WRITTEN, text);
+}
+
+test "removing a configured provider drops its definition, its settings and a default that is still its own" {
+    const a = std.testing.allocator;
+    var path_buf: [512]u8 = undefined;
+    const path = try testFixturePath(&path_buf, "custom-remove.json");
+    removeFixture(path);
+    defer removeFixture(path);
+    try writeFixture(path, HAND_WRITTEN);
+
+    var store = try Store.initPath(a, path);
+    defer store.deinit();
+    _ = try setProviderEnabled(&store, ids.Slug.lit("relay-a"), false, null);
+    const chosen = config_doc.RuntimeSelection.pinned(.{ .digest = @splat(0x5a) }, 1, .global);
+    _ = try setGlobalSelection(&store, chosen, null, null);
+    var loaded = try store.load();
+    const observed = loaded.global_selection.?;
+    loaded.deinit();
+
+    // A default someone else chose meanwhile is not forgotten.
+    const other = config_doc.RuntimeSelection.pinned(.{ .digest = @splat(0x11) }, 1, .global);
+    const kept = try removeCustomProvider(&store, ids.Slug.lit("relay-b"), other, null, null);
+    try std.testing.expect(!kept.settings and !kept.default_forgotten);
+
+    const removed = try removeCustomProvider(&store, ids.Slug.lit("relay-a"), observed, null, null);
+    try std.testing.expect(removed.settings);
+    try std.testing.expect(removed.default_forgotten);
+
+    var after = try store.load();
+    defer after.deinit();
+    try std.testing.expect(after.provider(ids.Slug.lit("relay-a")) == null);
+    try std.testing.expect(after.global_selection == null);
+    const text = try store.readText();
+    defer a.free(text);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+    defer parsed.deinit();
+    const section = parsed.value.object.get("custom_providers").?.object;
+    try std.testing.expectEqual(@as(usize, 0), section.count());
+    try std.testing.expect(parsed.value.object.get("theme") != null);
+    try std.testing.expect(parsed.value.object.get("model_tiers") != null);
 }

@@ -263,6 +263,13 @@ pub const Document = struct {
     /// Serialize the control-plane keys into `original`, preserving every key
     /// this module does not own.
     pub fn merge(self: *const Document, original: []const u8) DocumentError![]u8 {
+        return self.mergeWith(original, &.{});
+    }
+
+    /// `merge`, with `members` applied in the same write: members of objects
+    /// this module does not model (`custom_providers.<id>`), owned by the
+    /// caller that names them.
+    pub fn mergeWith(self: *const Document, original: []const u8, members: []const json_merge.MemberField) DocumentError![]u8 {
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const arena = scratch.allocator();
@@ -291,7 +298,7 @@ pub const Document = struct {
             operations = buffer.items;
         }
 
-        return json_merge.mergeObjectFields(self.allocator, original, &.{
+        return json_merge.mergeFields(self.allocator, original, &.{
             .{ .key = "schema_version", .json = schema },
             .{ .key = "config_revision", .json = revision },
             .{ .key = "providers", .json = providers },
@@ -299,7 +306,7 @@ pub const Document = struct {
             .{ .key = "global_selection", .json = selection },
             .{ .key = "session_selection", .json = session },
             .{ .key = "recent_operation_ids", .json = operations },
-        }) catch |err| switch (err) {
+        }, members) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.InvalidDocument,
         };
