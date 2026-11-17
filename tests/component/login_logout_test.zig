@@ -505,10 +505,13 @@ test "/login from a key route, then again: each new session replaces the key and
     try expectNeverSent(gateway, METASK_KEY);
 
     // A second /login stores another session: its token, not the first's,
-    // goes with every later pick.
+    // goes with the very next request (no pick in between: the route the
+    // switch bound must already carry it) and with every later pick.
     try case.storeSession(origin, NEW_SESSION_TOKEN);
-    try app.bindMetaskSession(.{ .gateway = origin, .model = "glm-5", .models_json = GATEWAY_MODELS });
     const sent_before = gateway.requestCount();
+    try app.bindMetaskSession(.{ .gateway = origin, .model = "glm-5", .models_json = GATEWAY_MODELS });
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ NEW_SESSION_TOKEN, headerValue(gateway.lastRequest().?, "authorization").?);
     const offer = try offerIdText(app, "metask", "glm-5-air", "anthropic_messages");
     try testing.expect(cc.repl_picker_host.useSelector(app, &offer) == .switched);
     try sendOneTurn(app);
@@ -519,6 +522,57 @@ test "/login from a key route, then again: each new session replaces the key and
         const later = gateway.requestAt(index) orelse continue;
         if (std.mem.indexOf(u8, later.raw, SESSION_TOKEN) != null) return error.PreviousTokenStillSent;
     }
+}
+
+test "a second /login's first request carries its own token to its own gateway, with no pick in between (#527)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var first = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer first.stop();
+    var second = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer second.stop();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    var config = cc.parseArgsForTest(&.{"metacodes"}, a);
+    config.state_root = case.state;
+    const app = try App.initWithOptions(testing.allocator, io_runtime.io(), config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
+    defer app.deinit();
+
+    // The first /login, a pick of another of its models and a turn: the
+    // process now holds that session, its token loaded (the pick bound its
+    // route through it).
+    const first_origin = try originOf(a, first);
+    var applied = app.applyMetaskSession(
+        .{ .gateway = first_origin, .model = "glm-5", .models_json = GATEWAY_MODELS },
+        try case.tokenJson(first_origin, SESSION_TOKEN),
+        null,
+    );
+    try testing.expect(applied.switch_error == null and applied.storage_error == null);
+    const air = try offerIdText(app, "metask", "glm-5-air", "anthropic_messages");
+    try testing.expect(cc.repl_picker_host.useSelector(app, &air) == .switched);
+    try testing.expect(app.oauth_session != null);
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(first.lastRequest().?, "authorization").?);
+
+    // A second /login, another account at another gateway. The very next
+    // request goes there with the new token: the route was bound with it,
+    // not with the session object the process held when the switch began.
+    const second_origin = try originOf(a, second);
+    applied = app.applyMetaskSession(
+        .{ .gateway = second_origin, .model = "glm-5", .models_json = GATEWAY_MODELS },
+        try case.tokenJson(second_origin, NEW_SESSION_TOKEN),
+        null,
+    );
+    try testing.expect(applied.switch_error == null and applied.storage_error == null);
+    try sendOneTurn(app);
+    const captured = second.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expectEqualStrings("Bearer " ++ NEW_SESSION_TOKEN, headerValue(captured, "authorization").?);
+    try expectNeverSent(second, SESSION_TOKEN);
+    try testing.expectEqual(@as(usize, 1), first.requestCount());
 }
 
 /// A `/v1/models` answer of another account: no glm-5-air.

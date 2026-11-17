@@ -1611,6 +1611,24 @@ pub const App = struct {
             app.restoreMetaskOffers(host, previous_profile, previous_selection);
         }
 
+        // The process keeps one OAuth session object (single flight), and the
+        // one it holds read its tokens before `/login` stored the new session.
+        // Set aside while the route switches, so the commit's token request
+        // (`bindCommittedSelection` → `oauthAccessToken`) loads the session
+        // just stored and the new route is bound with its token, never with
+        // the previous account's (which a different gateway must not see). A
+        // failure puts the held object back, the previous route still using
+        // it; a success lets it go.
+        var previous_oauth_session = app.oauth_session;
+        const previous_oauth_provider = app.oauth_session_provider;
+        app.oauth_session = null;
+        app.oauth_session_provider = null;
+        errdefer {
+            if (app.oauth_session) |*loaded| loaded.deinit();
+            app.oauth_session = previous_oauth_session;
+            app.oauth_session_provider = previous_oauth_provider;
+        }
+
         try host.ingestMetask(gateway, sign_in.models_json, .messages_and_chat);
         const offer = for (host.kernel.catalogSnapshot().items()) |*candidate| {
             if (candidate.provider_id.eqlText("metask") and
@@ -1626,13 +1644,9 @@ pub const App = struct {
         });
         if (committed != .committed) return error.SelectionRefused;
 
-        // The process keeps one Metask session object (single flight). Only
-        // after the route commits may the old object go: on every error above
-        // it still holds the previous route's token. The next token request
-        // loads the newly stored session (`oauthAccessToken`).
-        if (app.oauth_session) |*held| held.deinit();
-        app.oauth_session = null;
-        app.oauth_session_provider = null;
+        // The route is on the new session: the object set aside goes.
+        if (previous_oauth_session) |*held| held.deinit();
+        previous_oauth_session = null;
 
         // The session is on the sign-in. What the previous route held goes;
         // its key is retired, as the clients may have borrowed it.
