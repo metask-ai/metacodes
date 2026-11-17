@@ -267,6 +267,29 @@ Pro refuses a request with thinking off. K3.1 Pro and K3 declare 262,144
 tokens, the window every plan that offers them gets; quotes stay `unknown`, as
 for the GLM plan.
 
+## Subscription plans
+
+`ProviderProfile.subscription_plan` marks a coding plan billed by the month
+rather than by the token: `kimi-code` and `zai-coding-plan` today, and a test
+in `provider/registry.zig` keeps a new one a deliberate entry. The vendors
+license these plans for a person working in a coding tool — Kimi Code's
+community guidelines name personal, interactive use, and the GLM Coding
+Plan's subscription agreement the tools Zhipu lists — so a start with nobody
+at the keyboard (`-p`, `serve`, a resumed suspension, the REPL reading a pipe)
+prints one `warning:` line on stderr saying so. It never refuses and never
+changes the exit code: the terms are the vendor's to enforce. `--web` is a
+person in a browser and a teammate answers to its lead's session; neither
+prints it.
+
+## User-Agent
+
+Every request says what it is: `src/api/http_connection.zig`, which all of
+`src/` sends through, sets `User-Agent: metacodes/<version>` unless the
+caller names itself (the OTLP exporter keeps `metacodes-otlp`). Vendors
+tell coding tools apart by this header, some refuse a client they do not
+recognise, and their terms forbid a forged one; an honest name is the only
+one a vendor can be asked to admit.
+
 ## Credential pools
 
 A provider can have several credentials — separate accounts, separate plans —
@@ -489,8 +512,8 @@ installation presents is registered by whoever runs it, and shipping a
 guessed one would point every user's first exchange at a client that is not
 theirs. That is the resolution of #87: the built-in `openai` profile stays
 undeclared, the installation configures its own registration once, and
-`/login openai`, `metacodes login --provider openai` and the picker's
-credential stage then need no `--client-id`. A metask-registered default, if
+`/login openai` and `metacodes login --provider openai` then need no
+`--client-id`. A metask-registered default, if
 one is ever wanted, is a one-line profile constant behind the same precedence.
 
 A profile that declares neither an authorization nor a device endpoint has no
@@ -544,17 +567,14 @@ removes it.
 tests use, as `METASK_GATEWAY_URL` is for Metask. Only https or plain http to
 an exact loopback host is accepted, because the check carries the key.
 
-The three front ends differ only in how the key is typed. The CLI prompts for
+The two front ends differ only in how the key is typed. The CLI prompts for
 the plan, prints the page whole, opens it, and reads the key with echo off;
 echo goes off before the prompt is written, so a paste that arrives early is
 not echoed by the terminal (`--api-key-stdin` and `--key-page` script it).
-`/login` lists such a provider as "API key" and walks plan page → paste. In
-the picker, a commit refused with `MissingCredentials` on a provider with no
-OAuth grant but a key setup enters the credential stage in paste mode: ↑/↓
-picks the plan, Tab opens its page, Enter hands the key to the worker and the
-field is wiped, and a landed key retries the pending commit. Every front end
-masks the key as a character count and draws the page URL whole so it can be
-copied.
+`/login` lists such a provider as "API key" and walks plan page → paste. Both
+mask the key as a character count and draw the page URL whole so it can be
+copied. The picker takes no key (#488): it lists such a provider as not
+configured until a key resolves for it, and says where one goes.
 
 ## Controls
 
@@ -661,8 +681,8 @@ the candidate offer ids. A model the profile does not declare still routes —
 proxies legitimately accept private model names — with metadata left unknown.
 
 The built-in inventories name the current frontier models with their documented
-limits and reasoning controls (`reasoning_effort`, as the picker's options step
-shows): OpenAI `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` on the Responses wire
+limits and reasoning controls (`reasoning_effort`, as the picker's reasoning
+line shows): OpenAI `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` on the Responses wire
 only (tool calls need it there), Gemini `gemini-4-argon`, `gemini-3.8-flash`, and
 the GLM Coding Plan's `glm-5.3`, `glm-5.3-flash`. Metask's inventory is the
 gateway's own `/v1/models` whenever it answers.
@@ -823,15 +843,33 @@ binding, so a rebuild reproduces it.
 regressions, including the Kitty CSI-u forms, so the rebinding cannot leave
 either action unreachable.
 
+One screen, models first:
+
 ```text
-Provider → Canonical model → Channel/Offer (optional) → Options (optional) → Commit
+  Model                                  apply to  [this session]  from now on  this turn   tab
+  Metask · signed in · billed to your Metask account
+  >* glm-5.3-flash                    200K
+     glm-5.3                          200K   2 routes
+  DeepSeek · key from .env · billed to your DeepSeek account
+     DeepSeek V4 Pro                    1M   2 routes
+  Not configured · openai, gemini
+  Reasoning effort   default  low  medium  [high]  max          ←/→
 ```
 
-The channel step is skipped when a canonical model has exactly one offer, and
-the options step when the offer declares no controls. Offers are grouped by
-*canonical id*, never by visible name: two channels serving "GLM-4.6" over
-different protocols, regions, or prices are different routes, and collapsing
-them by display name would hide the choice the offer model exists to give.
+A row per model, grouped by *canonical id*, never by visible name: two
+channels serving "GLM-4.6" over different protocols, regions, or prices are
+different routes, and collapsing them by display name would hide the choice the
+offer model exists to give. The providers are headings, the one in use first,
+each saying where its credential comes from and who bills it; a typed filter
+drops the headings and lists the matches flat, naming each one's provider. A
+model served on several routes lists them under it, in words ("OpenAI Chat
+API"), while the cursor is on it: Enter on the model takes its preferred route
+(the one in use, else the first), Enter on a route takes that one. The
+reasoning effort the focused route declares is a line under the list, changed
+with ←/→ from any row; the level wanted is remembered, and each model shows and
+commits the nearest one its vocabulary has. Providers no commit could bind now
+are one "Not configured" line at the bottom; Enter lists them, and Enter on one
+shows where its credential goes.
 
 The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
@@ -840,11 +878,13 @@ streaming; a commit during a reply changes the next turn, not the one in flight.
 not depend on the picker's own state machine. `q` closes only on an empty
 filter, which keeps it typeable inside a model name.
 
-Enter commits at the scope the footer names. Session is the default, and `Tab`
-cycles session → global → once, so any durable write is an explicit act the user
-can see before pressing Enter. A successful commit closes the overlay and prints
-one line into the transcript — a picker that vanishes without saying which of
-several same-named routes it chose leaves the user unable to tell.
+Enter commits at the scope the header brackets. Session is the default, and
+`Tab` cycles session → global → once, so any durable write is an explicit act
+the user can see before pressing Enter. A successful commit closes the overlay
+and prints one line into the transcript (`switched to glm-5.3 for this session
+· reasoning high`) — a picker that vanishes without saying which of several
+same-named routes it chose leaves the user unable to tell — and closing it
+without one says what stays (`kept glm-5.3-flash · reasoning high`).
 
 A committed route is broadcast on the existing UI event stream as a
 `config_changed` → `route` event carrying provider, channel, protocol, wire
@@ -907,21 +947,24 @@ stderr. The loopback wait polls its socket (`platform/net.pollReadable`) and
 checks an `AbortSignal` every 100 ms, and both device-code polls sleep in the
 same slices, so every flow can be cancelled from another thread (#67).
 
-The picker has a credential stage (#67). A commit that fails with
-`MissingCredentials` on an OAuth-capable provider does not leave the overlay:
-`picker_host` prepares the same kernel login (`prepareProfile`, so every
-refusal — no token endpoint, no client id — is the typed one `/login` gives)
-and runs it on a worker thread (`api/login_worker.zig`), whose `Notify` sink is
-a bounded buffer the picker draws in place of the route list: the URL to
-open, or the device code. The TUI's 100 ms input tick polls the worker; `Esc`
-aborts the flow through the signal and returns to the stage the user came
-from; a landed login refreshes the catalog and retries the pending commit, so
-the route the user chose is the one that becomes active. The state machine
-stays pure (`Stage.credential`, `Outcome.login` / `Outcome.cancel_login`); the
-thread, the network and `App` live in the host and the worker. A provider with
-no OAuth grant but a key setup gets the same stage in paste mode
-(`CredentialMode.paste_key`, `Outcome.submit_key` / `Outcome.open_key_page`;
-see *Stored API keys and the guided key login*).
+The picker lists only routes a commit can apply as they are (#488). When it
+opens, and whenever its catalog is refreshed, the host judges every offer by
+the binding a commit runs (`App.judgeReadiness`): the same credential material
+(`App.credentialSources`: the pool, the provider's stored key, for Metask the
+session's own key or the `auth.json` sign-in, `--api-key`, the environment and
+the `.env` layer below it) through `runtime_binding.bindOffer`, with one
+difference — a stored OAuth login stands for the token a commit would refresh
+first, so judging sends no request. The picker hides the offers that would
+not bind (`Picker.setReadiness`), and lists a provider none of whose offers
+would as a dimmed row under "Not configured", below the others. Choosing it
+enters `Stage.setup`, which shows the provider's `model_picker.Setup` — the
+variable its key is read from, `/login` for Metask — with this install's
+`.env` and `doc/LOCAL_CONFIG.md`, and takes no other key than Esc and `q`. A
+commit that still fails with `MissingCredentials` (the credential went away
+after the picker opened) shows the same setup. The picker never signs in or
+takes a key: the credential stage #67 put in it is gone, and `/login <id>` is
+where both happen. A commit that moves the session to another provider says,
+on a second line of its confirmation, who bills the session from then on.
 
 ## Module map
 

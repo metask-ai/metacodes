@@ -1,35 +1,16 @@
 #!/usr/bin/env python3
-"""Decide whether a pull request may take CI's release fast path.
+"""Decide whether a generated release/reopen bump may reuse full PR CI.
 
-Design: doc/RELEASE_AUTOMATION_DESIGN.md §3, "CI fast path". A release or
-reopen PR adds only what `scripts/release_cut.py` generates: the two version
-files, the changelog heading, AgentCore's version files, ledger and changelog,
-and the fingerprint repin. When its merge commit
-adds nothing else to a base commit whose full CI already passed on `main`,
-running the suites again proves nothing new, so ci.yml lets the required jobs
-report success without running them. Every other PR, and every doubt, takes
-the full path.
+Both the generated-content check and exact-tree evidence are required.
+Regenerating release_cut's files must reproduce the candidate byte for byte.
+The base must be the merge commit of a PR whose successful ci.yml run
+uploaded full-scope, non-fast-path evidence for that exact Git tree.
+Main push runs and head-only status checks are not evidence. Missing or
+expired artifacts, errors and all other doubts take the full path.
 
-Two facts decide it, both checked here:
-
-1. Content. The paths that differ between the base and the candidate (the
-   merge commit) are among the generated files, and regenerating those
-   files from the base with release_cut's own functions (`apply_version`,
-   `rewrite_changelog` or `ensure_unreleased`, `agentcore_release.apply_cut` or
-   `apply_reopen`, `repin_fingerprint`)
-   reproduces the candidate byte for byte. A bare version over a `-dev` base
-   is a cut; a `-dev` version over a bare base is a reopen.
-2. Base. The `CI` workflow's push run for the base commit concluded
-   `success`. A run that is still going (the reopen PR is opened while
-   `main`'s run of the release merge is in progress) is waited for, up to
-   `--wait-seconds`; anything else is the full path.
-
-ci.yml: `release_fast_path.py --base HEAD^1 --candidate HEAD --repository
-owner/repo --github-output "$GITHUB_OUTPUT"`; in a merge queue group the base
-is the group's `base_sha` (doc/CI_DESIGN.md §3), so only a group whose whole
-diff is the bump qualifies. It writes `fast=true|false` and
-`reason=...` and always exits 0: an error is reported and decides the full
-path. Python 3.9, stdlib only; tests in scripts/tests/test_release_fast_path.py.
+ci.yml passes HEAD^1 as the PR base; the legacy merge_group migration handler
+uses its group base_sha. The optional evidence wait defaults to zero.
+Python >= 3.9; doc/RELEASE_AUTOMATION_DESIGN.md section 3.
 """
 from __future__ import annotations
 
@@ -148,23 +129,53 @@ def verify_bump(
     return kind, version
 
 
-def base_ci_state(repository: str, sha: str) -> str:
-    """`success`, `pending`, or `failure` for the CI workflow's push runs of
-    `sha`. A missing run counts as pending: right after a merge GitHub may not
-    have created it yet, and the wait is bounded."""
-    proc = subprocess.run(
-        ["gh", "api", f"repos/{repository}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={sha}&event=push&per_page=20"],
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"gh api failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
-    runs = json.loads(proc.stdout.decode("utf-8")).get("workflow_runs") or []
-    if any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in runs):
-        return "success"
-    if not runs or any(run.get("status") != "completed" for run in runs):
-        return "pending"
-    return "failure"
+def github_json(path: str):
+    proc = subprocess.run(["gh", "api", path], capture_output=True, check=True)
+    return json.loads(proc.stdout)
+
+
+def base_ci_state(repository: str, sha: str, tree: str) -> str:
+    """Only a full PR run proving this exact merged tree is reusable.
+
+    A green head check alone is insufficient: it does not identify the base
+    used by the PR's synthetic merge. Main push CI is no longer required.
+    Missing/expired evidence always takes the full path.
+    """
+    pending = False
+    page = 1
+    while True:
+        pulls = github_json(f"repos/{repository}/commits/{sha}/pulls?per_page=100&page={page}")
+        for pr in pulls:
+            if (not pr.get("merged_at") or pr.get("merge_commit_sha") != sha
+                    or pr["base"]["ref"] != "main" or pr["base"]["repo"]["full_name"] != repository):
+                continue
+            runs = github_json(f"repos/{repository}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={pr['head']['sha']}&event=pull_request&per_page=100")["workflow_runs"]
+            for run in runs:
+                if (run.get("event") != "pull_request" or run.get("head_sha") != pr["head"]["sha"]):
+                    continue
+                if run.get("status") != "completed":
+                    pending = True
+                    continue
+                if run.get("conclusion") != "success":
+                    continue
+                with tempfile.TemporaryDirectory(prefix="metacodes-ci-evidence-") as tmp:
+                    proc = subprocess.run(["gh", "run", "download", str(run["id"]), "--repo", repository,
+                                           "--name", "pr-ci-evidence", "--dir", tmp], capture_output=True, check=False)
+                    if proc.returncode:
+                        continue
+                    try:
+                        proof = json.loads((Path(tmp) / "pr-ci-evidence.json").read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    if (proof.get("schema") == 1 and proof.get("repository") == repository
+                            and proof.get("run_id") == run["id"] and proof.get("attempt") == run.get("run_attempt")
+                            and proof.get("head") == pr["head"]["sha"] and proof.get("tree") == tree
+                            and proof.get("scope") == "full"):
+                        return "success"
+        if len(pulls) < 100:
+            break
+        page += 1
+    return "pending" if pending else "failure"
 
 
 def wait_for_base(
@@ -200,7 +211,7 @@ def decide(
     state = wait_for_base(lambda: query(base_sha), wait_seconds, sleep, clock)
     if state != "success":
         return False, f"full path: the {kind} to {version} is a generated bump, but CI on its base {base_sha[:12]} is {state}"
-    return True, f"fast path: the {kind} to {version} adds only release_cut's generated files to {base_sha[:12]}, whose full CI passed on main"
+    return True, f"fast path: the {kind} to {version} adds only release_cut's generated files to {base_sha[:12]}, whose exact tree passed full PR CI"
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -209,7 +220,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--github-output")
-    parser.add_argument("--wait-seconds", type=float, default=2700)
+    parser.add_argument("--wait-seconds", type=float, default=0)
     parser.add_argument("--repo-root", default=str(ROOT))
     args = parser.parse_args(argv)
     try:
@@ -217,7 +228,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             Path(args.repo_root),
             args.base,
             args.candidate,
-            lambda sha: base_ci_state(args.repository, sha),
+            lambda sha: base_ci_state(args.repository, sha, git(Path(args.repo_root), "rev-parse", sha + "^{tree}").decode().strip()),
             args.wait_seconds,
         )
     except Exception as exc:  # any doubt is the full path, never a red job

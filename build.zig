@@ -11,6 +11,8 @@ const manifest = @import("build.zig.zon");
 var g_hl_mod: ?*std.Build.Module = null;
 var g_formal_kernel_sha256: ?[]const u8 = null;
 var g_project_kernel_sha256: ?[]const u8 = null;
+var g_sandbox_helper_install: ?*std.Build.Step = null;
+var g_sandbox_helper_path: ?[]const u8 = null;
 fn addHl(b: *std.Build, mod: *std.Build.Module) void {
     addHlWithProjectHarnessActuation(b, mod, false);
 }
@@ -59,6 +61,10 @@ fn addTestRunArtifact(
     // steps regardless, but state the doctrine here so a future caching change
     // cannot silently turn cached test binaries into stale green evidence.
     run.has_side_effects = true;
+    if (g_sandbox_helper_install) |install| {
+        run.step.dependOn(install);
+        run.setEnvironmentVariable("METACODES_SANDBOX_HELPER", g_sandbox_helper_path.?);
+    }
     return run;
 }
 
@@ -904,6 +910,27 @@ pub fn build(b: *std.Build) void {
     } else .{ .step = &b.addInstallArtifact(exe, .{}).step, .debug_file = null };
     const install_cli = cli_install.step;
     b.getInstallStep().dependOn(install_cli);
+
+    // A small trusted executor opens native tool files inside the platform
+    // sandbox and passes the resulting fd back. Library hosts receive the
+    // same helper in their bundle; neither path depends on Python or PATH.
+    const sandbox_helper_mod = b.createModule(.{
+        .root_source_file = b.path("src/sandbox_helper_root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    addPlatform(b, sandbox_helper_mod);
+    const sandbox_helper_exe = b.addExecutable(.{
+        .name = "metacodes-fs-helper",
+        .root_module = sandbox_helper_mod,
+    });
+    const install_sandbox_helper = b.addInstallArtifact(sandbox_helper_exe, .{ .pdb_dir = .disabled });
+    g_sandbox_helper_install = &install_sandbox_helper.step;
+    g_sandbox_helper_path = b.getInstallPath(.bin, sandbox_helper_exe.out_filename);
+    b.getInstallStep().dependOn(&install_sandbox_helper.step);
+    const sandbox_helper_step = b.step("sandbox:helper", "Build and install the native filesystem sandbox helper");
+    sandbox_helper_step.dependOn(&install_sandbox_helper.step);
 
     // E3 causal evaluation only: same product root/provider/agent/tool path,
     // but formal blocks are observed rather than actuated.  There is no env or
@@ -1786,6 +1813,10 @@ pub fn build(b: *std.Build) void {
         .implib_dir = .disabled,
         .dylib_symlinks = false,
     });
+    const install_agentcore_sandbox_helper = b.addInstallArtifact(sandbox_helper_exe, .{
+        .dest_dir = .{ .override = .{ .custom = b.fmt("{s}/bin", .{agentcore_bundle_rel}) } },
+        .pdb_dir = .disabled,
+    });
     const install_agentcore_header = b.addInstallFileWithDir(
         b.path("sdk/metask/agentcore.h"),
         .prefix,
@@ -1872,6 +1903,7 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.step.dependOn(&agentcore_shared_gate_cmd.step);
     manifest_cmd.step.dependOn(installed_agentcore_lib_ready);
     manifest_cmd.step.dependOn(&install_agentcore_shared.step);
+    manifest_cmd.step.dependOn(&install_agentcore_sandbox_helper.step);
     manifest_cmd.step.dependOn(&install_agentcore_header.step);
     manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
     manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
@@ -2612,6 +2644,18 @@ pub fn build(b: *std.Build) void {
     const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
     gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
     units_test_step.dependOn(&gate_manifest_test_cmd.step);
+    const pr_loop_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_pr_loop",
+        "scripts.tests.test_pr_policy",
+        "scripts.tests.test_ci_evidence",
+        "-v",
+    });
+    const pr_loop_test_step = b.step("test:pr-loop", "Test PR review, repair, exact-head merging and CI evidence");
+    pr_loop_test_step.dependOn(&pr_loop_test_cmd.step);
+    units_test_step.dependOn(&pr_loop_test_cmd.step);
     const release_cut_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",

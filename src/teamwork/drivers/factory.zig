@@ -36,6 +36,10 @@ pub const Driver = union(types.Harness) {
 pub fn forSeat(spec: *const types.SeatSpec, deps: Deps, binding: common.Binding) Driver {
     return switch (spec.harness) {
         .metacodes => .{ .metacodes = metacodes.MetacodesDriver.init(deps.metacodes, binding) },
-        .claude_code => .{ .claude_code = claude_code.ClaudeCodeDriver.init(deps.claude_code, binding) },
+        .claude_code => blk: {
+            var options = deps.claude_code;
+            if (options.host_sandbox == null) options.host_sandbox = deps.metacodes.host_sandbox;
+            break :blk .{ .claude_code = claude_code.ClaudeCodeDriver.init(options, binding) };
+        },
     };
 }

@@ -145,7 +145,6 @@ Its model list combines the authenticated directories of all active account
 keys/model groups; each launch uses the chosen model's matching key. Existing
 gateway configurations stay in provider mode until `metacodes bench --auth
 metask` is selected; see [account configuration](../../../doc/BENCH_WORKBENCH.md#configure-execution).
-
 ## Smoke
 
 ```sh

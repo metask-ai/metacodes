@@ -12,17 +12,20 @@
 //! every write to `app.model_picker` and to `picker_open` happens under the
 //! caller's `Guard`, the region lock: held for an in-memory update, never
 //! across IO and never with another lock taken inside it. The writer's own
-//! reads need no lock. Committing a route, a sign-in, opening a browser and
-//! listing the catalog all run outside it.
+//! reads need no lock. Committing a route and listing the catalog (with the
+//! file reads that judge which routes have a credential) run outside it.
+//!
+//! The picker starts no sign-in and takes no key (#488): `/login <provider>`
+//! is where that happens. A provider with no credential is listed only to say
+//! where its credential goes.
 
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const ui_state = @import("tui/ui_state.zig");
 const picker_mod = @import("model_picker.zig");
 const view_mod = @import("model_picker_view.zig");
-const provider_login = @import("../api/provider_login.zig");
 const provider_host_mod = @import("../provider/host.zig");
-const login_worker_mod = @import("../api/login_worker.zig");
+const state_env = @import("../app/state_env.zig");
 const RenderRegion = @import("tui/render_region.zig").RenderRegion;
 
 pub const Key = picker_mod.Key;
@@ -58,9 +61,13 @@ fn pageRowsFor(rows: u16) usize {
 
 pub fn open(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
     refresh(app, guard);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const env_path = localConfigPath(app, &path_buf);
     guard.lock();
     defer guard.unlock();
     app.model_picker.restart();
+    // What the setup of a provider with no credential points at (#488).
+    app.model_picker.setLocalConfig(env_path, state_env.guide_url);
     // The level the session runs with starts selected on any route that
     // offers it, so applying a route does not quietly drop it.
     if (app.config.reasoning_effort) |effort| {
@@ -82,9 +89,6 @@ pub fn keep(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
 }
 
 pub fn close(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
-    // A picker that closes mid sign-in must not leave a thread waiting on
-    // a socket.
-    cancelLogin(app);
     guard.lock();
     defer guard.unlock();
     setOpen(ui, false);
@@ -123,8 +127,9 @@ pub fn publishListing(app: *app_mod.App, listing: *const app_mod.App.ModelListin
     app.adoptModelListing(listing) catch app.model_picker.markFailed();
 }
 
-/// One line describing the last commit. Stable until the picker is reopened,
-/// so the caller can put it into the transcript after the overlay is gone.
+/// What the last commit did, a line or two. Stable until the picker is
+/// reopened, so the caller can put it into the transcript after the overlay
+/// is gone.
 pub fn lastNotice(app: *const app_mod.App) []const u8 {
     return app.model_picker.notice();
 }
@@ -135,10 +140,15 @@ pub const Result = enum {
     /// State changed; redraw.
     redraw,
     /// A commit landed and the picker closed. `app.model_picker.notice()` holds
-    /// one line the caller should put into the transcript — a picker that
+    /// the line the caller should put into the transcript — a picker that
     /// vanishes without saying which of several same-named routes it chose
-    /// leaves the user unable to tell.
+    /// leaves the user unable to tell — and a second one naming who bills
+    /// the session from now on when that changed (#488).
     committed,
+    /// The picker was closed without a commit (Esc, q). The notice says so
+    /// and names the model the session stays on, for the transcript: "kept
+    /// glm-5.3 · reasoning high".
+    cancelled,
 };
 
 /// Feed one key.
@@ -156,208 +166,36 @@ pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key, guard: Guard) R
         .redraw => return .redraw,
         .closed => {
             close(app, ui, guard);
-            return .redraw;
+            guard.lock();
+            defer guard.unlock();
+            var level_buf: [48]u8 = undefined;
+            app.model_picker.setNotice("kept {s}{s}", .{ app.activeModel(), levelNote(app.config.reasoning_effort, &level_buf) });
+            return .cancelled;
         },
         .commit => |commit| return apply(app, ui, commit, guard),
-        // Only `enterCredentialStage` produces `.login`, never a key.
-        .login => unreachable,
-        .cancel_login => {
-            cancelLogin(app);
-            return .redraw;
-        },
-        .submit_key => return submitKey(app, guard),
-        .open_key_page => {
-            const choices = app.model_picker.keyChoices();
-            if (app.model_picker.key_choice < choices.len) {
-                @import("../core/auth.zig").openBrowser(app.allocator, choices[app.model_picker.key_choice].url) catch {};
-            }
-            return .ignored;
-        },
     }
-}
-
-/// Called from the input loops' idle tick while the picker is open (#67):
-/// moves the worker's transcript into the picker and settles a finished
-/// login. A landed login refreshes the catalog and retries the pending commit,
-/// so the route the user chose is the one that becomes active.
-pub fn poll(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) Result {
-    const worker = app.login_worker orelse return .ignored;
-    var transcript: [login_worker_mod.TRANSCRIPT_CAPACITY]u8 = undefined;
-    const lines = worker.copyTranscript(&transcript);
-    const changed = shown: {
-        guard.lock();
-        defer guard.unlock();
-        break :shown app.model_picker.setCredentialLines(lines);
-    };
-    switch (worker.currentState()) {
-        .idle => return .ignored,
-        .running => return if (changed) .redraw else .ignored,
-        .failed => {
-            {
-                guard.lock();
-                defer guard.unlock();
-                app.model_picker.credentialFailed(worker.failureName());
-            }
-            finishLogin(app);
-            return .redraw;
-        },
-        .cancelled => {
-            finishLogin(app);
-            return .redraw;
-        },
-        .succeeded => {
-            finishLogin(app);
-            // The catalog is rebuilt so the route's credential is seen, then
-            // the commit the user asked for goes through the normal path.
-            refresh(app, guard);
-            const pending = taken: {
-                guard.lock();
-                defer guard.unlock();
-                break :taken app.model_picker.takePendingCommit();
-            };
-            if (pending) |commit| return apply(app, ui, commit, guard);
-            return .redraw;
-        },
-    }
-}
-
-/// A commit refused for want of a credential on an OAuth-capable provider
-/// becomes a sign-in inside the picker (#67): the kernel prepares the same
-/// login `/login` runs (so every refusal is the typed one), a worker thread
-/// runs it, and the picker enters its credential stage with the commit
-/// pending. Returns false when nothing was started and no notice was set.
-fn startLogin(app: *app_mod.App, commit: picker_mod.Commit, guard: Guard) bool {
-    const host = app.providerHost() catch return false;
-    const provider = missingCredentialPointer(host, commit.offer_id) orelse return false;
-    const profile = host.registry.findById(provider) orelse return false;
-    const prepared = provider_login.prepareProfileWith(profile, .{ .state_root = app.stateRoot() }, host.oauthClientIdFor(provider)) catch |err| {
-        guard.lock();
-        defer guard.unlock();
-        app.model_picker.setNotice("no credential for {s}, and /login {s} cannot start: {s}; the previous route is still active", .{
-            provider.slice(),
-            provider.slice(),
-            provider_login.refusalText(err, .loopback),
-        });
-        return true;
-    };
-    const worker = app.allocator.create(login_worker_mod.LoginWorker) catch return false;
-    worker.* = login_worker_mod.LoginWorker.init(app.allocator, app.io, prepared);
-    worker.start() catch {
-        app.allocator.destroy(worker);
-        return false;
-    };
-    app.login_worker = worker;
-    guard.lock();
-    defer guard.unlock();
-    switch (app.model_picker.enterCredentialStage(provider, commit)) {
-        .login => {},
-        else => unreachable,
-    }
-    return true;
-}
-
-/// A commit refused for want of a credential on a provider that has no OAuth
-/// grant but declares where its API keys are created
-/// (`ProviderProfile.api_key_setup`): the picker shows those pages and takes
-/// the pasted key, with the commit pending. False when the provider declares
-/// no such pages.
-fn startKeyEntry(app: *app_mod.App, commit: picker_mod.Commit, guard: Guard) bool {
-    const host = app.providerHost() catch return false;
-    const offer = host.kernel.catalogSnapshot().find(commit.offer_id) orelse return false;
-    const profile = host.registry.findById(offer.provider_id) orelse return false;
-    const setup = profile.api_key_setup orelse return false;
-    var choices: [picker_mod.MAX_KEY_CHOICES]picker_mod.KeyChoice = undefined;
-    const count = @min(setup.pages.len, choices.len);
-    // The plan page for the region of the channel the user picked.
-    const default = profile.defaultKeyPage(offer.channel_id);
-    var default_index: usize = 0;
-    for (setup.pages[0..count], 0..) |page, index| {
-        choices[index] = .{ .label = page.label, .url = page.url };
-        if (default) |wanted| if (wanted.id.eql(page.id)) {
-            default_index = index;
-        };
-    }
-    guard.lock();
-    defer guard.unlock();
-    _ = app.model_picker.enterKeyStage(profile.id, commit, choices[0..count], default_index, setup.note);
-    return true;
-}
-
-/// Enter on a pasted key: check and store it on the login worker. `poll`
-/// then retries the pending commit, which finds the stored key.
-fn submitKey(app: *app_mod.App, guard: Guard) Result {
-    const picker = &app.model_picker;
-    const provider = picker.credential_provider orelse return .ignored;
-    const host = app.providerHost() catch return .ignored;
-    const profile = host.registry.findById(provider) orelse return .ignored;
-    const setup = profile.api_key_setup orelse return .ignored;
-    if (picker.key_choice >= setup.pages.len) return .ignored;
-    const prepared = provider_login.prepareApiKey(profile, setup.pages[picker.key_choice].id.slice(), null, picker.keyText(), .{
-        .state_root = app.stateRoot(),
-        .open_browser = false,
-    }) catch |err| {
-        guard.lock();
-        defer guard.unlock();
-        picker.credentialFailed(@errorName(err));
-        return .redraw;
-    };
-    cancelLogin(app);
-    const worker = app.allocator.create(login_worker_mod.LoginWorker) catch {
-        guard.lock();
-        defer guard.unlock();
-        picker.credentialFailed("OutOfMemory");
-        return .redraw;
-    };
-    worker.* = login_worker_mod.LoginWorker.initFlow(app.allocator, app.io, .{ .api_key = prepared });
-    // `start` copies the key into the worker; only then is the field wiped.
-    worker.start() catch |err| {
-        app.allocator.destroy(worker);
-        guard.lock();
-        defer guard.unlock();
-        picker.credentialFailed(@errorName(err));
-        return .redraw;
-    };
-    app.login_worker = worker;
-    guard.lock();
-    defer guard.unlock();
-    picker.keySubmitted();
-    return .redraw;
-}
-
-fn finishLogin(app: *app_mod.App) void {
-    const worker = app.login_worker orelse return;
-    worker.join();
-    app.allocator.destroy(worker);
-    app.login_worker = null;
-}
-
-/// Esc must not wait on the network: a key check is one GET that does not
-/// watch the abort signal, so a worker still inside it is parked on the App
-/// (cancelled, joined once it settles) instead of joined here.
-fn cancelLogin(app: *app_mod.App) void {
-    const worker = app.login_worker orelse return;
-    if (worker.isSettled()) return finishLogin(app);
-    app.login_worker = null;
-    app.parkLoginWorker(worker);
 }
 
 /// Commit through the kernel (IO, outside the guard), then say how it went
 /// in the picker (under it).
 fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, guard: Guard) Result {
+    // Who bills the session before the commit, to say so when it changes.
+    const before = currentProvider(app);
     const outcome = app.commitModelSelection(commit) catch |err| {
         // issue #33: the route resolved; what is missing is a credential for
-        // its provider. When the provider can be signed in to, say how.
-        if (err == error.MissingCredentials) {
-            if (startLogin(app, commit, guard)) return .redraw;
-            if (startKeyEntry(app, commit, guard)) return .redraw;
-            const host = app.providerHost() catch null;
-            if (host) |value| if (missingCredentialPointer(value, commit.offer_id)) |provider| {
+        // its provider. The picker listed it as ready, so the credential went
+        // away since it opened: show where it goes, as for a provider in the
+        // "Not configured" group (#483, #488). No sign-in starts here.
+        if (err == error.MissingCredentials) if (app.providerHost() catch null) |host| {
+            if (host.kernel.catalogSnapshot().find(commit.offer_id)) |offer| {
+                const setup = app_mod.App.providerSetup(host, offer.provider_id);
                 guard.lock();
                 defer guard.unlock();
-                app.model_picker.setNotice("no credential for {s}; sign in with /login {s}; the previous route is still active", .{ provider.slice(), provider.slice() });
+                app.model_picker.setNotice("no credential for {s}; the previous route is still active", .{offer.provider_id.slice()});
+                app.model_picker.enterSetup(setup);
                 return .redraw;
-            };
-        }
+            }
+        };
         guard.lock();
         defer guard.unlock();
         app.model_picker.setNotice("switch failed ({s}); the previous route is still active", .{@errorName(err)});
@@ -365,20 +203,28 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, gu
     };
     switch (outcome) {
         .committed => |accepted| {
+            // Switching to another provider moves the bill: say to whom
+            // (target state section ten, point 2).
+            var billed_buf: [160]u8 = undefined;
+            const billed = billingNote(app, before, commit.offer_id, &billed_buf);
             guard.lock();
             defer guard.unlock();
             if (app.last_persist_error) |why| {
                 // The route is live; what failed is making it survive a
                 // `/resume`. Saying "switched" alone would be true and
                 // misleading.
-                app.model_picker.setNotice("switched to {s}, but it was not saved ({s})", .{
+                app.model_picker.setNotice("switched to {s}, but it was not saved ({s}){s}", .{
                     app.activeModel(),
                     why,
+                    billed,
                 });
             } else {
-                app.model_picker.setNotice("switched to {s} for {s}", .{
+                var level_buf: [48]u8 = undefined;
+                app.model_picker.setNotice("switched to {s} {s}{s}{s}", .{
                     app.activeModel(),
-                    view_mod.scopeWord(accepted.scope),
+                    view_mod.scopePhrase(accepted.scope),
+                    levelNote(committedLevel(commit), &level_buf),
+                    billed,
                 });
             }
             setOpen(ui, false);
@@ -403,15 +249,48 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, gu
     }
 }
 
-/// The provider a commit that failed for want of a credential can be signed
-/// in to: the offer's provider, if a login could be stored for it at all
-/// (`provider_login.requireOAuthCapable`). Null means the notice has nothing
-/// better than the error to say.
-pub fn missingCredentialPointer(host: *provider_host_mod.Host, offer_id: ids_mod.OfferId) ?picker_mod.Slug {
-    const offer = host.kernel.catalogSnapshot().find(offer_id) orelse return null;
-    const profile = host.registry.findById(offer.provider_id) orelse return null;
-    provider_login.requireOAuthCapable(profile) catch return null;
-    return profile.id;
+/// " · reasoning high" for a level a route was committed with or the
+/// session runs at, "" for none.
+fn levelNote(level: ?@import("../types.zig").ReasoningEffort, buf: []u8) []const u8 {
+    const effort = level orelse return "";
+    if (!effort.active()) return "";
+    return std.fmt.bufPrint(buf, " · reasoning {s}", .{effort.name()}) catch "";
+}
+
+/// The reasoning level a commit carries, if any.
+fn committedLevel(commit: picker_mod.Commit) ?@import("../types.zig").ReasoningEffort {
+    const value = commit.controls.get("reasoning_effort") orelse return null;
+    if (value != .text) return null;
+    return @import("../types.zig").ReasoningEffort.parse(value.text.slice());
+}
+
+/// The provider of the route the session is on, as the kernel knows it;
+/// null when it knows none.
+fn currentProvider(app: *app_mod.App) ?picker_mod.Slug {
+    const host = app.providerHost() catch return null;
+    const current = host.kernel.currentOfferId() orelse return null;
+    const offer = host.kernel.catalogSnapshot().find(current) orelse return null;
+    return offer.provider_id;
+}
+
+/// A second line, "from now on billed to your <provider> account", when the
+/// commit of `committed` moved the session to another provider (or from one
+/// the kernel did not know), else "": a switch inside one provider does not
+/// change who bills it. A line of its own, so the transcript line it follows
+/// stays inside an ordinary terminal's width.
+fn billingNote(app: *app_mod.App, before: ?picker_mod.Slug, committed: ids_mod.OfferId, buf: []u8) []const u8 {
+    const host = app.providerHost() catch return "";
+    const offer = host.kernel.catalogSnapshot().find(committed) orelse return "";
+    if (before) |previous| if (previous.eql(offer.provider_id)) return "";
+    const profile = host.registry.findById(offer.provider_id) orelse return "";
+    return std.fmt.bufPrint(buf, "\nfrom now on billed to your {s} account", .{profile.display_name}) catch "";
+}
+
+/// This install's `<state root>/.env`, written as `state_env.load` names it
+/// (`Loaded.path`), into `buf`.
+fn localConfigPath(app: *const app_mod.App, buf: []u8) []const u8 {
+    var fixed = std.heap.FixedBufferAllocator.init(buf);
+    return std.fs.path.join(fixed.allocator(), &.{ app.stateRoot(), state_env.file_name }) catch state_env.file_name;
 }
 
 fn rejectionText(outcome: @import("../provider/control_plane.zig").ValidationOutcome) []const u8 {

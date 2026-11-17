@@ -73,8 +73,11 @@ glibc, or on a minimum macOS newer than the target's. A Mach-O is
 disassembled in llvm-objdump's Mach-O mode, which prints the ranges the linker
 lists in `LC_DATA_IN_CODE` (an x86_64 switch's jump table inside `__text`) as
 data; the check fails unless every such range came back as data. The macOS
-`release` leg of `ci.yml` builds both macOS executables for their targets and
-runs the same check on every change. On macOS and Linux,
+`release` leg of `ci.yml` checks only the native ARM64 target on PRs. Intel
+macOS and ARM64 Linux run their full suites natively at release time; the
+release-only Windows ARM64 GNU/MSVC job cross-builds and link-checks SDK
+consumers and must pass before drafting. It does not execute ARM64 code or
+publish an ARM64 Windows CLI unit. On macOS and Linux,
 `scripts/install.sh` then installs the job's own archives as a published
 release, from a loopback mirror that holds only that unit, so it must pick the
 archive by the host's target. The

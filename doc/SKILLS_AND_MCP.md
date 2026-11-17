@@ -300,6 +300,17 @@ stable hash. The earlier metacodes name `<server>__<tool>` still selects the
 same tool in those lists and rules. Resources are read through
 `ListMcpResourcesTool` and `ReadMcpResourceTool`.
 
+A call to a server's tool is permissioned as executing, like `Bash`, and as
+AgentCore permissions it: the server may change things outside this machine.
+`default`, `acceptEdits` and `auto` ask before it runs (`-p` has nobody to ask
+and denies it), `dontAsk` denies it, and `bypassPermissions` runs it. A
+server's annotations (`readOnlyHint` and the rest) are its own claim and do
+not relax this. To let a trusted server's tools run without a prompt, allow
+the server: `{"permissions": {"allow": ["mcp__server"]}}` in a settings file,
+or `--allowedTools mcp__server`. Approving a project server in `.mcp.json`
+starts it; it does not allow its tools. `ListMcpResourcesTool` and
+`ReadMcpResourceTool` read, and run without a prompt.
+
 ### Protocol
 
 The client (`src/mcp/client.zig`, the one implementation every entry point

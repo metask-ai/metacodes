@@ -16,6 +16,20 @@ empty `### Migration`.
 
 ### Changed
 
+- An explicit Skill invocation Run (`RUN_INPUT_SKILL`, `session->run_skill`)
+  takes `RunOptionsV1.context_blocks` (#534). It used to refuse any block with
+  `INVALID_ARGUMENT` ("context blocks are not accepted with SkillInvocation
+  input"). The blocks are validated as for a Text Run and rendered into the
+  same `<system-reminder>` text part, which leads the Skill's invocation
+  record, so the Skill's first request carries them before the Skill body; a
+  `context: fork` Skill's child gets them leading its one user record, before
+  the body. The Session Conversation and its checkpoints keep them, as for a
+  Text Run. The time context now applies to a Skill invocation too: under the
+  default `TIME_CONTEXT_SYSTEM` its first request names the date, and
+  `TIME_CONTEXT_UTC_OFFSET`, once refused for it, is accepted. ABI revision 28
+  is unchanged: no struct, slot or status moves, and input that used to be
+  refused is now accepted.
+
 - No change a Host can see. The inputs moved for the Zig `SessionHost`'s model
   resolution and submission journal (#445: tier names and the provider guard
   through `Options.models`, `config_changed` lines, a worded
@@ -37,10 +51,31 @@ empty `### Migration`.
   embedded Session's Runs the daemon's project rule gate and abandoned-Run
   policy (#445); `SessionConfigV1` has no such field, and an ABI Session's
   Runs open the journal as before.
+- No change a Host can see. The Zig `SessionHost` takes a `set_route`
+  command that moves a Session onto another provider route (the new Zig
+  `AgentSession.setRoute`) and journals it as `config_changed{route}` (issue
+  #16, #445); ABI revision 28 exposes neither `SessionHost` nor `setRoute`,
+  and an ABI Session's `auth_scheme` is now copied at create with the same
+  bytes on the wire.
+- No change a Host can see. A Zig `SessionHost` member opened through
+  `InheritLead` now decides each tool call with its lead's current
+  permission rules and directories (#445,
+  `AgentSession.inheritPermissions`); ABI revision 28 exposes neither
+  `SessionHost` nor that call, and an ABI Session's
+  `update_permission_rules` never meets `PermissionsInherited`.
 - No change a Host can see. The Zig `SessionHost.setModelCatalog` replaces
   the catalog `Options.models` resolves model names against while the Host
   runs (#445); ABI revision 28 exposes neither `SessionHost` nor
   `ModelPolicy`.
+- No change a Host can see. A Zig Session whose `run_control` enforces
+  project rules now fails only the Run those rules refuse, leaving the
+  Session idle instead of poisoned, as the daemon does (#445);
+  `SessionConfigV1` has no `run_control`, so an ABI Session never opens the
+  gate.
+- No change a Host can see. A Zig `SessionHost` whose project rules refuse
+  the resumption of a suspended Run now keeps the suspension and announces
+  its request again under the same id instead of poisoning the Session
+  (#445); ABI revision 28 exposes neither `SessionHost` nor `run_control`.
 
 ### Fixed
 

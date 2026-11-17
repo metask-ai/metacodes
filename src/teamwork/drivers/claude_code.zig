@@ -24,9 +24,10 @@
 //!   write roots are the workspace, the seat directory, the temp roots and
 //!   Claude Code's own state under `~` (bwrap binds only the entries that
 //!   exist when the seat starts). The network stays open: the CLI talks to
-//!   its API. On a host without a backend (Windows, Linux without a working
-//!   bwrap) the child runs unconfined: Claude Code's own permission mode is
-//!   then the only write fence. Under bwrap a CLI killed by signal N shows
+//!   its API unless the host restricts it. Compatibility probes run inside
+//!   the same boundary. Without a working backend the launch is refused;
+//!   only an explicit trusted `Options.sandbox=false` runs on the host.
+//!   Under bwrap a CLI killed by signal N shows
 //!   as bwrap's exit 128+N, mapped back to the signal
 //!   (`WrappedCommand.childExitCode`).
 //! - Result: stdout is read only for the last `result` event (status and
@@ -43,7 +44,7 @@ const run_dir = @import("../run_dir.zig");
 const ledger_mod = @import("../ledger.zig");
 const common = @import("common.zig");
 const sandbox_config = @import("../../sandbox/config.zig");
-const sandbox_exec = @import("../../sandbox/exec.zig");
+const worker_sandbox = @import("../../sandbox/worker.zig");
 const util_time = @import("../../util/time.zig");
 const log = @import("../../util/log.zig");
 
@@ -113,9 +114,12 @@ pub const Options = struct {
     timeout_ms: ?u64 = null,
     /// Limit on each compatibility probe.
     probe_timeout_ms: u64 = 15_000,
-    /// Run under the platform sandbox where one exists (macOS Seatbelt,
-    /// Linux bubblewrap).
+    /// Require the platform sandbox, including for compatibility probes.
+    /// false is an explicit host opt-out, never an availability fallback.
     sandbox: bool = true,
+    /// The host's read/write denials and network policy remain authoritative.
+    /// Host write grants are not inherited by the worker.
+    host_sandbox: ?*const sandbox_config.SandboxSettings = null,
 };
 
 /// The last `result` event of a stream-json run.
@@ -185,7 +189,7 @@ pub const ClaudeCodeDriver = struct {
         const env = try filterEnv(arena, self.options.parent_env);
 
         if (self.probed == null) {
-            self.probed = .{ .ok = try self.probe(arena, external.command.bytes, env, paths.workspace, abort, &harness_log) };
+            self.probed = .{ .ok = try self.probe(arena, external.command.bytes, env, paths.workspace, seat_dir, abort, &harness_log) };
         }
         if (!self.probed.?.ok) {
             if (abort.isAborted()) {
@@ -201,32 +205,13 @@ pub const ClaudeCodeDriver = struct {
         };
         const cli_argv = try buildArgv(arena, external.command.bytes, seat_dir, spec.model, spec.effort, remaining);
 
-        // Sandbox wrap: same argv, run as `exec` under the backend's bash.
-        var wrapped: ?sandbox_exec.WrappedCommand = null;
-        defer if (wrapped) |*w| w.deinit();
-        var sandbox_settings: sandbox_config.SandboxSettings = .{
-            .enabled = self.options.sandbox,
-            .fail_if_unavailable = false,
-            .allow_unsandboxed_commands = false,
-            .auto_allow_bash_if_sandboxed = false,
-            .allow_write = &claude_state_roots,
-        };
-        const additional_dirs = [_][]const u8{seat_dir};
-        const shell_command = try execShellCommand(arena, cli_argv);
-        switch (sandbox_exec.wrapCommand(gpa, shell_command, .{
-            .cwd = paths.workspace,
-            .home = self.options.home_dir,
-            .sandbox = &sandbox_settings,
-            .additional_dirs = &additional_dirs,
-        }) catch |err| {
+        var launch = self.prepareLaunch(gpa, cli_argv, paths.workspace, seat_dir) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             harness_log.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return .{ .failed = .spawn_failed };
-        }) {
-            .wrapped => |w| wrapped = w,
-            .passthrough, .unavailable => {},
-        }
-        const argv_slices: []const []const u8 = if (wrapped) |w| w.argv else cli_argv;
-        const argv = try nullTerminatedArgv(arena, argv_slices);
+        };
+        defer launch.deinit();
+        const argv = try nullTerminatedArgv(arena, launch.argv());
 
         const wallclock_deadline_ms: ?u64 = switch (external.budget) {
             .cost => null,
@@ -268,7 +253,7 @@ pub const ClaudeCodeDriver = struct {
         if (charged == .unrecorded) return .budget_exhausted;
         if (sink.result) |result| if (result.subtype == .error_max_budget_usd) return .budget_exhausted;
         const raw_code = supervised.exit_code orelse 0;
-        const code = if (wrapped) |*w| w.childExitCode(raw_code) else raw_code;
+        const code = launch.childExitCode(raw_code);
         if (code != 0) {
             if (builtin.os.tag != .windows and code < 0) return .{ .failed = .{ .signaled = @intCast(-code) } };
             return .{ .failed = .{ .exited = @truncate(@as(u32, @bitCast(code))) } };
@@ -284,16 +269,17 @@ pub const ClaudeCodeDriver = struct {
         command: []const u8,
         env: []const [:0]const u8,
         cwd: []const u8,
+        seat_dir: []const u8,
         abort: *const types.AbortSignal,
         harness_log: *HarnessLog,
     ) error{OutOfMemory}!bool {
-        const version_out = (try self.capture(arena, &.{ command, "--version" }, env, cwd, abort, harness_log)) orelse return false;
+        const version_out = (try self.capture(arena, &.{ command, "--version" }, env, cwd, seat_dir, abort, harness_log)) orelse return false;
         const version = parseVersion(version_out) orelse {
             harness_log.print("{s} --version did not identify Claude Code: {s}\n", .{ command, firstLine(version_out) });
             log.warn("teamwork", "seat {s}: {s} is not a Claude Code CLI", .{ self.binding.seat.slice(), command });
             return false;
         };
-        const help_out = (try self.capture(arena, &.{ command, "--help" }, env, cwd, abort, harness_log)) orelse return false;
+        const help_out = (try self.capture(arena, &.{ command, "--help" }, env, cwd, seat_dir, abort, harness_log)) orelse return false;
         for (required_help_text) |needle| {
             if (std.mem.indexOf(u8, help_out, needle) == null) {
                 harness_log.print(
@@ -314,10 +300,17 @@ pub const ClaudeCodeDriver = struct {
         argv_slices: []const []const u8,
         env: []const [:0]const u8,
         cwd: []const u8,
+        seat_dir: []const u8,
         abort: *const types.AbortSignal,
         harness_log: *HarnessLog,
     ) error{OutOfMemory}!?[]const u8 {
-        const argv = try nullTerminatedArgv(arena, argv_slices);
+        var launch = self.prepareLaunch(arena, argv_slices, cwd, seat_dir) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            harness_log.print("compatibility probe sandbox failed: {s}\n", .{@errorName(err)});
+            return null;
+        };
+        defer launch.deinit();
+        const argv = try nullTerminatedArgv(arena, launch.argv());
         var sink: LineSink = .{ .gpa = arena, .mode = .capture };
         const run_result = supervise(argv, env, cwd, harness_log.fd, abort, .{ .timeout_ms = self.options.probe_timeout_ms }, &sink) catch |err| {
             harness_log.print("could not start {s}: {s}\n", .{ argv_slices[0], @errorName(err) });
@@ -334,6 +327,29 @@ pub const ClaudeCodeDriver = struct {
             return null;
         }
         return sink.captured.items;
+    }
+
+    fn prepareLaunch(self: *const ClaudeCodeDriver, gpa: std.mem.Allocator, argv: []const []const u8, cwd: []const u8, seat_dir: []const u8) !worker_sandbox.Launch {
+        var settings: sandbox_config.SandboxSettings = .{
+            .enabled = self.options.sandbox,
+            .fail_if_unavailable = true,
+            .allow_unsandboxed_commands = false,
+            .auto_allow_bash_if_sandboxed = false,
+            .allow_write = &claude_state_roots,
+        };
+        if (self.options.host_sandbox) |host| {
+            settings.deny_read = host.deny_read;
+            settings.allow_read = host.allow_read;
+            settings.deny_write = host.deny_write;
+            settings.allowed_domains = host.allowed_domains;
+            settings.denied_domains = host.denied_domains;
+        }
+        return worker_sandbox.prepare(gpa, argv, .{
+            .cwd = cwd,
+            .home = self.options.home_dir,
+            .sandbox = &settings,
+            .additional_dirs = &.{seat_dir},
+        });
     }
 };
 
@@ -405,19 +421,6 @@ pub fn filterEnv(arena: std.mem.Allocator, parent_env: []const [:0]const u8) err
 }
 
 /// `exec 'arg0' 'arg1' ...` for `/bin/bash -c`, each argument single-quoted.
-fn execShellCommand(arena: std.mem.Allocator, argv: []const []const u8) error{OutOfMemory}![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, "exec");
-    for (argv) |arg| {
-        try out.appendSlice(arena, " '");
-        for (arg) |c| {
-            if (c == '\'') try out.appendSlice(arena, "'\\''") else try out.append(arena, c);
-        }
-        try out.append(arena, '\'');
-    }
-    return out.toOwnedSlice(arena);
-}
-
 fn nullTerminatedArgv(arena: std.mem.Allocator, argv: []const []const u8) error{OutOfMemory}![]const ?[*:0]const u8 {
     const out = try arena.alloc(?[*:0]const u8, argv.len + 1);
     for (argv, 0..) |arg, i| out[i] = (try arena.dupeZ(u8, arg)).ptr;
@@ -749,6 +752,6 @@ test "claude code: stdout lines split across reads still yield the last result e
 test "claude code: exec shell command quotes every argument" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const text = try execShellCommand(arena_state.allocator(), &.{ "/opt/claude", "it's", "a b" });
+    const text = try worker_sandbox.shellCommand(arena_state.allocator(), &.{ "/opt/claude", "it's", "a b" });
     try testing.expectEqualStrings("exec '/opt/claude' 'it'\\''s' 'a b'", text);
 }

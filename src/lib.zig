@@ -143,7 +143,7 @@ pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_credential_cell = @import("api/credential_cell.zig"); // a Session's replaceable provider credential (#336)
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
-pub const api_login_worker = @import("api/login_worker.zig"); // picker credential stage: a prepared login on a worker thread (#67)
+pub const api_login_worker = @import("api/login_worker.zig"); // `/login`: a prepared login on a worker thread (#67)
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
@@ -226,6 +226,8 @@ pub const mcp_tool_invocation = @import("mcp/tool_invocation.zig");
 pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
 pub const mcp_result_commit_test = @import("mcp/result_commit_test.zig");
 pub const sandbox_config = @import("sandbox/config.zig");
+/// Platform sandbox discovery used by embedded hosts at Session admission.
+pub const sandbox_exec = @import("sandbox/exec.zig");
 
 // ── 协议(core ↔ UI 契约;实现自定义前端只需这几个)────────────────────────
 pub const protocol = struct {

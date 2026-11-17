@@ -80,6 +80,7 @@ extern "C" {
 #define METASK_AGENTCORE_PERMISSION_DONT_ASK 4u
 #define METASK_AGENTCORE_PERMISSION_FULL_ACCESS 5u
 #define METASK_AGENTCORE_SHELL_DISABLED 1u
+/* Eagerly require macOS Seatbelt or Linux bubblewrap + seccomp at Session create. */
 #define METASK_AGENTCORE_SHELL_SANDBOXED 2u
 #define METASK_AGENTCORE_SHELL_UNRESTRICTED 3u
 /* Run journal mode is Session-stable. Durable records never enter model
@@ -837,8 +838,8 @@ typedef struct {
 typedef struct {
     uint32_t struct_size;
     uint32_t max_turns;
-    /* Optional per-Run Host context for RUN_INPUT_TEXT and RUN_INPUT_MULTIMODAL,
-     * borrowed for the call. Null with zero count adds nothing. */
+    /* Optional per-Run Host context for RUN_INPUT_TEXT, RUN_INPUT_MULTIMODAL and
+     * RUN_INPUT_SKILL, borrowed for the call. Null with zero count adds nothing. */
     const metask_agentcore_context_block_v1 *context_blocks;
     uint64_t context_block_count;
     /* Revision 22: one METASK_AGENTCORE_TIME_CONTEXT_* value; zero is SYSTEM. */

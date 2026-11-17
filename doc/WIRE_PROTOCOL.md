@@ -90,7 +90,11 @@ What a Host adds around the kernel's events, as
   `model not available for current provider`). A message's accepted
   `model` and `permission_mode` are journaled before its `user_message`
   as `config_changed`, by both Hosts, also when already in force; `model`
-  as resolved (a tier name becomes the tier's model).
+  as resolved (a tier name becomes the tier's model). A route change (the
+  CLI's `/model` commit, `SessionHost`'s `set_route`) is announced as
+  `config_changed` `{"model":...}` and then `{"route":{...}}`; the route
+  names the provider, channel, protocol, request model id, offer id,
+  credential reference and scope, never the credential.
 
 The `user_message` host event carries `replaces`, appended under §4's
 additive rule 2: `null` when the Run's text was appended after the whole
@@ -277,6 +281,22 @@ and the answer then resumes the Run once:
 {"v":1,"type":"run_resumed","data":{"run_id":1,"trace_id":"t","request_id":1}}
    … the resumed Run's events …
 {"v":1,"type":"run_done","data":{"run_id":1,"trace_id":"t","stop_reason":"end_turn","error_name":null,"model_error":null}}
+```
+
+A resumed Run that fails before the answer reaches the conversation, the
+Session still usable (a Session's project rules refusing the Run), does
+not drop the request: its `run_done` names the error, then the request's
+`ui_request` line is written again, the same bytes under the same id, and
+the request is open again for another answer, also after a restart. The
+answer the failed Run took is not kept, so a request whose
+`ui_request_closed` a frontend has seen can be announced again; it shows it
+open again:
+
+```text
+{"v":1,"type":"ui_request_closed","id":1,"outcome":"answered","by":"alice@example.com"}
+{"v":1,"type":"run_resumed","data":{"run_id":2,"trace_id":"t","request_id":1}}
+{"v":1,"type":"run_done","data":{"run_id":2,"trace_id":"t","stop_reason":null,"error_name":"ProjectKernelConfigurationInvalid","model_error":null}}
+{"v":1,"type":"ui_request","id":1,"kind":"ask_question","request":{...}}
 ```
 
 The resumed Run keeps the suspended Run's `trace_id` and turn limit. An open

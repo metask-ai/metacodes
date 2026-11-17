@@ -33,7 +33,7 @@
 //! every auto-allowed command bare.
 //!
 //! Availability is a cached one-shot probe per bwrap path: run `/bin/sh -c :`
-//! under exactly the namespace flags the wrapper uses. A host that has bwrap
+//! under exactly the namespace flags and seccomp delivery the wrapper uses. A host that has bwrap
 //! but forbids unprivileged user namespaces (a container, a hardened sysctl)
 //! fails the probe and reports the sandbox unavailable, never "sandboxed".
 
@@ -44,6 +44,7 @@ const pprocess = @import("platform").process;
 const ppaths = @import("platform").paths;
 const psync = @import("platform").sync;
 const log = @import("../util/log.zig");
+const seccomp = @import("seccomp.zig");
 
 /// Distribution install paths, tried in order when `METACODES_BWRAP` is unset.
 pub const default_paths = [_][:0]const u8{ "/usr/bin/bwrap", "/bin/bwrap" };
@@ -53,22 +54,18 @@ pub const Availability = enum {
     available,
     /// Not Linux.
     unsupported_os,
+    /// No reviewed syscall/audit-architecture policy for this ABI.
+    unsupported_architecture,
     /// `METACODES_BWRAP` names a relative path.
     override_not_absolute,
     /// No regular file at `METACODES_BWRAP` or at any default path.
     missing,
-    /// bwrap is there but could not build the namespaces (unprivileged user
-    /// namespaces disabled, a seccomp-filtered container, a wrong binary).
+    /// bwrap could not build the namespaces AND install the syscall filter.
     probe_failed,
 };
 
 /// What the sandboxed command may reach over the network.
-pub const Network = enum {
-    /// The host's network namespace, as Seatbelt's `(allow default)`.
-    shared,
-    /// A fresh network namespace with only a down loopback: nothing reachable.
-    isolated,
-};
+pub const Network = seccomp.Network;
 
 const PathBuf = [std.fs.max_path_bytes]u8;
 
@@ -103,6 +100,7 @@ fn isRegularFile(path: [:0]const u8) bool {
 /// once per process.
 pub fn availability() Availability {
     if (builtin.os.tag != .linux) return .unsupported_os;
+    if (!seccomp.supported()) return .unsupported_architecture;
     var buf: PathBuf = undefined;
     return switch (locate(&buf)) {
         .path => |path| probeCached(path),
@@ -142,14 +140,20 @@ fn probeCached(path: [:0]const u8) Availability {
 const namespace_flags = [_][]const u8{ "--unshare-pid", "--unshare-ipc", "--new-session", "--die-with-parent" };
 
 fn probe(path: [:0]const u8) Availability {
-    const argv = [_]?[*:0]const u8{
-        path.ptr,            "--ro-bind",     "/",             "/",
-        "--dev",             "/dev",          "--proc",        "/proc",
-        "--unshare-pid",     "--unshare-ipc", "--unshare-net", "--new-session",
-        "--die-with-parent", "--",            "/bin/sh",       "-c",
-        ":",                 null,
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const raw = [_][]const u8{
+        path,            "--seccomp",     "9",                 "--ro-bind", "/",             "/",
+        "--dev",         "/dev",          "--proc",            "/proc",     "--unshare-pid", "--unshare-ipc",
+        "--unshare-net", "--new-session", "--die-with-parent", "--",        "/bin/sh",       "-c",
+        ":",
     };
-    const out = pprocess.capture(&argv, std.heap.page_allocator, .{
+    const launched = seccomp.launchArgv(arena, .isolated, &raw) catch return .probe_failed;
+    const argv = arena.alloc(?[*:0]const u8, launched.len + 1) catch return .probe_failed;
+    for (launched, 0..) |arg, i| argv[i] = (arena.dupeZ(u8, arg) catch return .probe_failed).ptr;
+    argv[launched.len] = null;
+    const out = pprocess.capture(argv, std.heap.page_allocator, .{
         .timeout_ms = 10_000,
         .max_bytes = 4096,
     }) catch |err| {
@@ -191,17 +195,17 @@ pub fn shellPath() []const u8 {
     return if (pfs.exists("/bin/bash")) "/bin/bash" else "/bin/sh";
 }
 
-/// The argv `bwrap_path ... -- shell -c command`, every element owned by
-/// `alloc` (free each, then the slice).
+/// The launcher pipes BPF to `bwrap_path --seccomp 9 ... -- shell -c command`.
+/// No temporary file or parent fd. Every element is owned by alloc.
 pub fn buildArgv(
     alloc: std.mem.Allocator,
     bwrap_path: []const u8,
     shell: []const u8,
     req: Request,
     command: []const u8,
-) error{OutOfMemory}![]const []const u8 {
+) error{ OutOfMemory, UnsupportedArchitecture }![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
-    errdefer {
+    defer {
         for (argv.items) |a| alloc.free(a);
         argv.deinit(alloc);
     }
@@ -211,7 +215,7 @@ pub fn buildArgv(
         writable.deinit(alloc);
     }
 
-    try push(alloc, &argv, &.{ bwrap_path, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc" });
+    try push(alloc, &argv, &.{ bwrap_path, "--seccomp", "9", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc" });
 
     // Write roots, physical and deduplicated.
     try addWritable(alloc, &writable, req, req.cwd);
@@ -262,7 +266,7 @@ pub fn buildArgv(
     // A relative cwd ("." when the caller has none) is where bwrap already is.
     if (std.fs.path.isAbsolute(req.cwd)) try push(alloc, &argv, &.{ "--chdir", req.cwd });
     try push(alloc, &argv, &.{ "--", shell, "-c", command });
-    return try argv.toOwnedSlice(alloc);
+    return seccomp.launchArgv(alloc, req.network, argv.items);
 }
 
 fn push(alloc: std.mem.Allocator, argv: *std.ArrayList([]const u8), items: []const []const u8) error{OutOfMemory}!void {
@@ -410,14 +414,17 @@ test "bwrap argv: read-only root, physical write roots, carve-outs after them, c
     }, "echo hi");
     defer freeArgv(alloc, argv);
 
-    try testing.expectEqualStrings("/usr/bin/bwrap", argv[0]);
-    try testing.expectEqual(@as(?usize, 1), indexOfSeq(argv, &.{ "--ro-bind", "/", "/" }));
+    try testing.expectEqualStrings("/bin/sh", argv[0]);
+    try testing.expect(indexOfSeq(argv, &.{ "/usr/bin/bwrap", "--seccomp", "9" }) != null);
+    try testing.expect(indexOfSeq(argv, &.{ "--ro-bind", "/", "/" }) != null);
     try testing.expect(indexOfSeq(argv, &.{ "--dev", "/dev" }) != null);
     try testing.expect(indexOfSeq(argv, &.{ "--proc", "/proc" }) != null);
     const ws_bind = indexOfSeq(argv, &.{ "--bind", ws, ws }).?;
     try testing.expect(indexOfSeq(argv, &.{ "--bind", extra, extra }) != null);
     try testing.expect(indexOfSeq(argv, &.{ "--bind", link, link }) == null);
-    try testing.expect(indexOfSeq(argv, &.{ "--bind", "/tmp", "/tmp" }) != null);
+    var tmp_buf: PathBuf = undefined;
+    const physical_tmp = std.mem.span(pfs.realpath("/tmp", &tmp_buf) orelse return error.PathResolutionFailed);
+    try testing.expect(indexOfSeq(argv, &.{ "--bind", physical_tmp, physical_tmp }) != null);
     const deny_w = indexOfSeq(argv, &.{ "--ro-bind", env_file, env_file }).?;
     const deny_r = indexOfSeq(argv, &.{ "--tmpfs", ssh, "--remount-ro", ssh }).?;
     try testing.expect(indexOfSeq(argv, &.{ "--ro-bind", "/dev/null", netrc }) != null);
