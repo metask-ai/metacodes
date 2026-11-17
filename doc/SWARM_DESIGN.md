@@ -87,8 +87,10 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
   被删除、换绑或 cwd/worktree 改变后，进程在启动和下一次轮询前 fail closed；指定的
   worktree 无法 chdir/realpath 时也直接退出，绝不降级到 lead cwd。spawn 后尚未登记成功
   时的子进程会被 kill+reap，避免留下无主进程。
-- **排除(用户指令)**:Linux bubblewrap 沙箱不做。macOS Seatbelt 沙箱复用(同 App/同 Bash 工具,settings 开则自然套 wrapCommand)。
-- register SW7:真 fork+exec e2e / Seatbelt 验证。
+- **沙箱**:teammate 进程用同 App/同 Bash 工具,settings 开沙箱则自然套 `wrapCommand`:macOS 走
+  Seatbelt,Linux 走 bubblewrap(`src/sandbox/bwrap.zig`;此前"Linux bubblewrap 不做"的用户指令已由用户
+  撤回,后端已实现)。
+- register SW7:真 fork+exec e2e / 进程外 teammate 的沙箱包裹验证。
 
 ## 7b. 宿主调度 teammate(AgentCore,issue #277)
 
@@ -113,7 +115,29 @@ Host 用 `writeTeamDescription` 读 `pending_spawns`、为每个待处理请求�
 Session,再用 `pollLeadInbox` 把 lead 收件箱的下一条消息喂给它的下一轮 Run。team 成员由
 Host 在 create/restore 时提供,不进 checkpoint(与 model_capabilities 同理)。AgentCore 的
 `team` 表(`describe`/`poll`)就是这一对操作的 C ABI 封装(见 `AGENTCORE_BINARY_ABI.md`
-"Teams")。
+"Teams")。`core/session_host.zig` 的 `SessionHost` 替宿主做了后半件(#445):lead 空闲且
+team 已建时,driver 至多每 `lead_inbox_poll_ms`(500 ms,与 daemon 的 `LeadMail` 同)
+`pollLeadInbox` 一次,把回信排成 lead 的下一轮 Run。配了 `Options.teammates`
+(`TeammateFactory`)时它也做前半件,对应 daemon `App` 的 `.in_process` 调度:lead 每跑完
+一项,driver 按先后取出 `pending_spawns`(`SwarmContext.popPendingSpawn`),向宿主的
+`configure` 要 member 的 `SessionConfig`(provider/工作区/工具/权限归宿主,`team` 必须为
+null),以 lead 的 session id 和新 lease 作为该 team 的 member 在同一个 SessionHost 上
+`open`,并把请求的 prompt 作为它的第一轮 Run 提交;同名且仍开着的 member 收到的是下一轮
+Run。lead `close` 时一并关闭它开的 member。未配 factory 时请求照旧挂起,由宿主自己 `open`。
+`TeammateSpawn` 同时带上 lead 当前的 `lead_model`/`lead_permission_mode`/
+`lead_reasoning_effort`(lead driver 上读取,已含此前排队的命令);`InheritLead`
+就是 daemon 要用的 factory:宿主给出开 lead 用的 base 配置,member 取 lead 当前的 model
+与权限模式,effort 取请求的 `effort`,否则沿用 lead 的,与 `App` teammate 继承 lead 的
+provider/model/权限上下文一致(`agent_type` 不解释)。同名 member 若已被宿主关闭,driver
+先按 lead session + 旧 lease 把名册里的旧条目摘掉(否则新 lease 入册被拒),再以新 lease
+重开,旧 member 的迟到邮件仍不可寻址,对应 `App` 回收已终止 teammate。spawn 失败不再只记
+日志:失败以 `<teammate-status from="<name>" state="failed">teammate was not started:
+<error></teammate-status>` 作为 lead 的下一轮 Run(`user_message` 带 `source`
+`session_host`、`kind` `teammate_spawn_failed`),对应 `App` 下该失败就是 spawn 工具的结果;
+同名 member 仍开着却拒收 prompt 时文字为 `teammate did not take the prompt: <error>`。
+`App` 下这类失败是同一轮 Run 内的工具结果,受 `max_turns` 约束;这里每次报告都是新一轮
+Run,所以报告不链式触发:履行"失败报告 Run"自身的 spawn 时再失败只记日志,模型反复
+spawn 一个起不来的名字最多多花一轮。
 
 与 in-process 共用同一套文件邮箱与名册语义,两条路径逐份核对安全属性(SW1 `waitForWork`
 vs host `pollLeadInbox`)。
@@ -132,7 +156,7 @@ vs host `pollLeadInbox`)。
 
 | 项 | 状态 |
 |----|------|
-| Linux bubblewrap 沙箱 | 排除(用户指令) |
+| Linux bubblewrap 沙箱 | 已实现(`src/sandbox/bwrap.zig`,与 Seatbelt 同一份 `SandboxSettings`;原"排除"指令已撤回) |
 | permission 代理(teammate→lead 弹框) | register SW7(当前 fail-closed 安全) |
 | mode 响应 from-gate | register(消费者建时补) |
 | 真 fork+exec 进程外完整 e2e | register SW7(干净进程 harness) |

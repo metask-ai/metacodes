@@ -995,27 +995,26 @@ test "L2: a picker-driven selection reaches the endpoint, path, and wire model i
     defer picker.deinit();
     try seedPicker(&picker, &kernel, a);
 
-    // Drive the picker exactly as a keyboard would: provider → model → offer.
-    _ = picker.onKey(.enter);
+    // Drive the picker exactly as a keyboard would: the filter lands on the
+    // model, whose routes are listed under it; down into them.
     // The filter matches GLM-5.3 and GLM-5.3-Flash; the flagship is listed first.
     for ("glm-5.3") |byte| _ = picker.onKey(.{ .char = byte });
-    _ = picker.onKey(.enter);
-    try std.testing.expectEqual(picker_mod.Stage.offer, picker.stage);
+    try std.testing.expectEqual(picker_mod.Stage.list, picker.stage);
 
-    // Walk to the OpenAI-wire China channel and choose it.
+    // Walk to the OpenAI-wire China channel's route.
     var scratch = picker_mod.Picker.RowBuffer.init(a);
     defer scratch.deinit();
     var guard: usize = 0;
-    while (guard < 8) : (guard += 1) {
-        const rows = try picker.rows(&scratch);
-        const candidate = picker.offers.items[rows[picker.cursor].offer.offer_index];
-        if (candidate.channel_id.eqlText("cn-openai")) break;
+    const found = while (guard < 8) : (guard += 1) {
         _ = picker.onKey(.down);
-    }
-    // GLM-5.3 declares its reasoning control: the options step, then Enter
-    // applies the route.
-    _ = picker.onKey(.enter);
-    try std.testing.expectEqual(picker_mod.Stage.options, picker.stage);
+        const rows = try picker.rows(&scratch);
+        const row = rows[picker.cursor];
+        if (row != .route) continue;
+        if (picker.offers.items[row.route.offer_index].channel_id.eqlText("cn-openai")) break true;
+    } else false;
+    try std.testing.expect(found);
+    // GLM-5.3 declares its reasoning control, on the line under the list;
+    // Enter on the route applies it as shown.
     const outcome = picker.onKey(.enter);
     try std.testing.expect(outcome == .commit);
 
@@ -1231,7 +1230,7 @@ test "L2: a configured provider's declared metadata reaches every client the sam
     defer scratch.deinit();
     const rows = try picker.rows(&scratch);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
-    try std.testing.expect(picker.offers.items[rows[0].provider.offer_index].provider_id.eqlText("house-relay"));
+    try std.testing.expect(picker.offers.items[rows[0].model.offer_index].provider_id.eqlText("house-relay"));
 
     // Token admission uses the declared limit, so a prompt that cannot fit is
     // rejected before any request exists.
@@ -1588,10 +1587,10 @@ test "L2: a provider metadata extension round-trips through the generic client v
     var picker = picker_mod.Picker.init(a);
     defer picker.deinit();
     try seedPicker(&picker, &kernel, a);
-    _ = picker.onKey(.enter);
-    _ = picker.onKey(.enter);
-    try std.testing.expectEqual(picker_mod.Stage.options, picker.stage);
-    try std.testing.expectEqual(@as(usize, 1), picker.rowCount());
+    try std.testing.expectEqual(picker_mod.Stage.list, picker.stage);
+    const focused = picker.focusedOffer() orelse return error.NoFocusedRoute;
+    try std.testing.expectEqual(@as(usize, 1), focused.controls.len);
+    try std.testing.expectEqualStrings("thinking", picker_mod.firstEnumeration(focused.controls).?.id);
 }
 
 // ── cross-UI: an out-of-process client sees the route, not just the name ─────
@@ -1603,7 +1602,9 @@ test "L2: a route change is broadcast as an ordered, replayable event carrying i
     // what a browser or an attached client reads.
     var journal = cc.event_journal.EventJournal.init(a);
     defer journal.deinit();
-    var web_sink = cc.web_session.WebConfigSink{ .journal = &journal, .alloc = a };
+    var wb = cc.web_backend.WebBackend.init(a, &journal);
+    defer wb.deinit();
+    var web_sink = cc.web_session.WebConfigSink{ .wb = &wb };
     const sink = web_sink.sink();
 
     // A route event as `bindCommittedSelection` produces one.
@@ -1770,7 +1771,7 @@ test "L2: a configured pool entry's account label outlives the read that produce
     var document = try store.load();
     defer document.deinit();
     var buffer: [cc.provider_config_doc.MAX_POOL_CREDENTIALS]cc.provider_credential.PoolEntry = undefined;
-    const pool = cc.app_module.App.credentialPoolFrom(&document, &buffer);
+    const pool = cc.app_module.App.credentialPoolFrom(&document, &buffer, cc.provider_credential.EnvLookup.empty());
     try std.testing.expectEqual(@as(usize, 1), pool.len);
 
     // Everything the entry borrows must still read correctly while the document
@@ -1785,6 +1786,40 @@ test "L2: a configured pool entry's account label outlives the read that produce
     // same mistake that made the pool builder hand back dangling slices.
     const stored = &document.providers.items[0].credentials.entries[0];
     try std.testing.expect(pool[0].account_or_plan.?.ptr == stored.account_or_plan.?.slice().ptr);
+}
+
+test "L2: a pool credential's variable is read from the state root's .env when the environment leaves it unset (#486)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".env", .data = "METACODES_POOL_FILE_KEY=sk-pool-from-file\n" });
+
+    // The pool names its variable in config.json; the allowlist the host
+    // builds from that document is what lets the file set it.
+    var document = try cc.provider_config_doc.parse(a,
+        \\{"providers": {"openai": {"credentials": [{"id": "work", "env": "METACODES_POOL_FILE_KEY", "kind": "api_key"}]}}}
+    );
+    defer document.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const allowlist = try cc.app_state_env.allowlistFrom(arena_state.allocator(), &cc.provider_registry.BUILTIN_PROFILES, &document, null);
+    var layer = try cc.app_state_env.load(a, root, allowlist);
+    defer layer.deinit();
+
+    unsetEnvZ("METACODES_POOL_FILE_KEY");
+    var buffer: [cc.provider_config_doc.MAX_POOL_CREDENTIALS]cc.provider_credential.PoolEntry = undefined;
+    const from_file = cc.app_module.App.credentialPoolFrom(&document, &buffer, layer.lookup());
+    try std.testing.expectEqual(@as(usize, 1), from_file.len);
+    try std.testing.expectEqualStrings("sk-pool-from-file", from_file[0].secret);
+    // Without the layer the member has no secret and is left out.
+    try std.testing.expectEqual(@as(usize, 0), cc.app_module.App.credentialPoolFrom(&document, &buffer, cc.provider_credential.EnvLookup.empty()).len);
+
+    setEnvZ("METACODES_POOL_FILE_KEY", "sk-pool-from-env");
+    defer unsetEnvZ("METACODES_POOL_FILE_KEY");
+    const from_env = cc.app_module.App.credentialPoolFrom(&document, &buffer, layer.lookup());
+    try std.testing.expectEqualStrings("sk-pool-from-env", from_env[0].secret);
 }
 
 test "L2: a session that named its provider on the command line has a current offer" {
@@ -1905,10 +1940,10 @@ test "L2: a `--provider` startup route is a resolvable selection before any comm
     try std.testing.expect(profile.oauth_token_url != null);
 }
 
-test "L2 (#33): a commit that lacks a credential names /login only for an OAuth-capable provider" {
-    // The picker's failure notice is the one place a user who picked a route
-    // without a credential learns there is a way in. The pointer is decided
-    // from the provider profile, not from error text.
+test "L2 (#488): a provider's setup names the variable its key is read from, and /login only for Metask" {
+    // The picker shows this for a provider with no credential, and for a
+    // commit that found none; it starts no sign-in, so it points at the
+    // place the key goes. It is decided from the provider profile.
     const a = std.testing.allocator;
     const host = try cc.provider_host.Host.create(a);
     defer host.destroy();
@@ -1921,19 +1956,27 @@ test "L2 (#33): a commit that lacks a credential names /login only for an OAuth-
         \\},"keyonly":{
         \\  "models":[{"request_model_id":"m","display_name":"M"}],
         \\  "channels":[{"id":"default","base_url":"https://keyonly.invalid/v1","protocol":"openai_chat"}],
-        \\  "credential_kinds":["api_key"]
+        \\  "credential_kinds":["api_key"],
+        \\  "env_aliases":[{"name":"KEYONLY_OTHER","kind":"api_key","canonical":false},{"name":"KEYONLY_TOKEN","kind":"api_key","canonical":true}]
         \\}}}
     );
-    var relay_offer: ?cc.provider_ids.OfferId = null;
-    var keyonly_offer: ?cc.provider_ids.OfferId = null;
-    for (host.kernel.catalogSnapshot().items()) |offer| {
-        if (offer.provider_id.eqlText("relay")) relay_offer = offer.offer_id;
-        if (offer.provider_id.eqlText("keyonly")) keyonly_offer = offer.offer_id;
+    const App = cc.app_module.App;
+    const cases = [_]struct { id: []const u8, variable: ?[]const u8, sign_in: bool }{
+        .{ .id = "metask", .variable = "METASK_API_KEY", .sign_in = true },
+        // The canonical alias, wherever it is declared.
+        .{ .id = "keyonly", .variable = "KEYONLY_TOKEN", .sign_in = false },
+        // A provider with an OAuth grant gets no /login pointer here either.
+        .{ .id = "relay", .variable = null, .sign_in = false },
+        .{ .id = "kimi", .variable = "MOONSHOT_API_KEY", .sign_in = false },
+        .{ .id = "kimi-code", .variable = "KIMI_CODE_API_KEY", .sign_in = false },
+        .{ .id = "gemini", .variable = "GEMINI_API_KEY", .sign_in = false },
+    };
+    for (cases) |expected| {
+        const setup = App.providerSetup(host, try cc.provider_ids.Slug.parse(expected.id));
+        try std.testing.expectEqualStrings(expected.id, setup.provider.slice());
+        if (expected.variable) |variable| {
+            try std.testing.expectEqualStrings(variable, setup.variable orelse return error.NoVariable);
+        } else try std.testing.expect(setup.variable == null);
+        try std.testing.expectEqual(expected.sign_in, setup.sign_in);
     }
-    const picker_host = cc.repl_picker_host;
-    const pointer = picker_host.missingCredentialPointer(host, relay_offer orelse return error.RelayOfferMissing) orelse
-        return error.PointerMissing;
-    try std.testing.expectEqualStrings("relay", pointer.slice());
-    // A key-only provider has no login to point at; the plain error stands.
-    try std.testing.expect(picker_host.missingCredentialPointer(host, keyonly_offer orelse return error.KeyonlyOfferMissing) == null);
 }

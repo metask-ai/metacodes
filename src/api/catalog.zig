@@ -66,6 +66,11 @@ pub const Catalog = struct {
         /// 枚举仍是中立的 `.xhigh`,只有给人看的标签跟着目录走——用户在 picker 里看到的
         /// 必须是 provider 自己的词。
         effort_vocabulary: EffortVocabulary = .neutral,
+        /// `capabilities.endpoints.messages.supported` (#527): whether this
+        /// route serves the model on `/v1/messages`. Metask's gateway lists
+        /// image and video models beside the text ones and says so per
+        /// endpoint. null = the catalog did not say.
+        messages: ?bool = null,
 
         pub fn supportsReasoning(self: Entry, effort: types.ReasoningEffort) bool {
             return (self.reasoning_mask & reasoningBit(effort)) != 0;
@@ -82,7 +87,7 @@ pub const Catalog = struct {
         for (self.entries.items) |entry| {
             const id = try allocator.dupe(u8, entry.model_id);
             errdefer allocator.free(id);
-            try copy.entries.append(allocator, .{ .model_id = id, .max_tokens = entry.max_tokens, .max_input_tokens = entry.max_input_tokens, .reasoning_mask = entry.reasoning_mask, .image_input = entry.image_input, .effort_vocabulary = entry.effort_vocabulary });
+            try copy.entries.append(allocator, .{ .model_id = id, .max_tokens = entry.max_tokens, .max_input_tokens = entry.max_input_tokens, .reasoning_mask = entry.reasoning_mask, .image_input = entry.image_input, .effort_vocabulary = entry.effort_vocabulary, .messages = entry.messages });
         }
         return copy;
     }
@@ -90,6 +95,21 @@ pub const Catalog = struct {
     pub fn deinit(self: *Catalog) void {
         for (self.entries.items) |e| self.allocator.free(e.model_id);
         self.entries.deinit(self.allocator);
+    }
+
+    /// Drop the models the catalog says are not served on `/v1/messages`
+    /// (`Entry.messages == false`); the ones it says nothing about stay.
+    pub fn dropMessagesUnsupported(self: *Catalog) void {
+        var kept: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.messages == false) {
+                self.allocator.free(entry.model_id);
+                continue;
+            }
+            self.entries.items[kept] = entry;
+            kept += 1;
+        }
+        self.entries.shrinkRetainingCapacity(kept);
     }
 
     /// 解析 `/v1/models` 响应 JSON，把 max_tokens / max_input_tokens 字段存入。
@@ -123,6 +143,7 @@ pub const Catalog = struct {
             const reasoning_mask = extractReasoningMask(obj);
             const effort_vocabulary = extractEffortVocabulary(obj);
             const image_input = extractImageInput(obj);
+            const messages = extractMessagesEndpoint(obj);
 
             const id_owned = try self.allocator.dupe(u8, id);
             errdefer self.allocator.free(id_owned);
@@ -133,6 +154,7 @@ pub const Catalog = struct {
                 .reasoning_mask = reasoning_mask,
                 .image_input = image_input,
                 .effort_vocabulary = effort_vocabulary,
+                .messages = messages,
             });
             log.debug("catalog", "model {s}: max_tokens={?d} max_input_tokens={?d} image_input={?}", .{ id, mt, mit, image_input });
         }
@@ -238,15 +260,24 @@ pub fn reasoningBit(effort: types.ReasoningEffort) u8 {
     };
 }
 
+/// A mask bit that is no level: the catalog says `none` does not turn this
+/// model's reasoning off, so the menu does not offer it (Metask's gateway,
+/// `capabilities.reasoning.disable.supported` false, #527).
+pub const none_withheld: u8 = 1 << 7;
+
 /// `none` first, then every level `mask` declares, low to max.
 pub const ReasoningOptions = [6]types.ReasoningEffort;
 
-/// The `/models` reasoning menu for a model: `none`, then each level its
-/// catalog entry declares, in order.
+/// The reasoning menu for a model (`/models`, `/login`, `metacodes login`):
+/// `none` unless the catalog withholds it, then each level its catalog entry
+/// declares, in order.
 pub fn reasoningOptions(mask: u8, buf: *ReasoningOptions) []const types.ReasoningEffort {
     const ordered = [_]types.ReasoningEffort{ .low, .medium, .high, .xhigh, .max };
-    buf[0] = .none;
-    var n: usize = 1;
+    var n: usize = 0;
+    if ((mask & none_withheld) == 0) {
+        buf[0] = .none;
+        n = 1;
+    }
     for (ordered) |effort| {
         if ((mask & reasoningBit(effort)) != 0) {
             buf[n] = effort;
@@ -282,6 +313,9 @@ fn nonZero(v: ?u64) ?u32 {
 
 fn extractReasoningMask(obj: []const u8) u8 {
     const caps = findObjectField(obj, "capabilities") orelse return 0;
+    // The gateway's own list outranks the Anthropic-shaped `effort` block it
+    // sends beside it, all false, for every chat model (#527).
+    if (gatewayReasoning(caps)) |gateway| return gateway.mask;
     const effort = findObjectField(caps, "effort") orelse return 0;
     var mask: u8 = 0;
     if (capSupported(effort, "low")) mask |= reasoningBit(.low);
@@ -296,9 +330,64 @@ fn extractReasoningMask(obj: []const u8) u8 {
     return mask;
 }
 
+/// What Metask's gateway says of a model's reasoning when it names the levels
+/// (#527): `capabilities.reasoning.efforts`, e.g. `["low","high","max"]`, read
+/// the way `capabilities.effort` is (a list with `max` and no `xhigh` calls its
+/// top level that), and `reasoning.disable.supported`, whether `none` turns the
+/// reasoning off. Null when the catalog names no levels that way.
+const GatewayReasoning = struct { mask: u8, vocabulary: EffortVocabulary };
+
+fn gatewayReasoning(caps: []const u8) ?GatewayReasoning {
+    const reasoning = findObjectField(caps, "reasoning") orelse return null;
+    const efforts = findObjectField(reasoning, "efforts") orelse return null;
+    var mask: u8 = 0;
+    if (listNames(efforts, "low")) mask |= reasoningBit(.low);
+    if (listNames(efforts, "medium")) mask |= reasoningBit(.medium);
+    if (listNames(efforts, "high")) mask |= reasoningBit(.high);
+    const has_xhigh = listNames(efforts, "xhigh");
+    if (has_xhigh) mask |= reasoningBit(.xhigh);
+    const has_max = listNames(efforts, "max");
+    if (has_max) mask |= reasoningBit(if (has_xhigh) .max else .xhigh);
+    // A model whose reasoning cannot be turned off gets no `none`, which
+    // would not turn it off. Kept when the model names no level, as it is
+    // then all there is to choose.
+    const can_disable = if (findObjectField(reasoning, "disable")) |disable| supportedTrue(disable) else false;
+    if (mask != 0 and !can_disable) mask |= none_withheld;
+    return .{ .mask = mask, .vocabulary = if (!has_xhigh and has_max) .max else .neutral };
+}
+
+/// `"supported": true` in an object of the gateway's capabilities.
+fn supportedTrue(obj: []const u8) bool {
+    const value_start = findFieldValueStart(obj, "supported") orelse return false;
+    return std.mem.startsWith(u8, obj[value_start..], "true");
+}
+
+/// Whether the JSON array `list` holds the string `name`.
+fn listNames(list: []const u8, name: []const u8) bool {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, list, pos, name)) |at| : (pos = at + 1) {
+        if (at > 0 and at + name.len < list.len and list[at - 1] == '"' and list[at + name.len] == '"') return true;
+    }
+    return false;
+}
+
+/// `capabilities.endpoints.messages.supported`, as `extractImageInput` reads
+/// its field: true/false as written, null when any part is missing.
+fn extractMessagesEndpoint(obj: []const u8) ?bool {
+    const caps = findObjectField(obj, "capabilities") orelse return null;
+    const endpoints = findObjectField(caps, "endpoints") orelse return null;
+    const messages = findObjectField(endpoints, "messages") orelse return null;
+    const value_start = findFieldValueStart(messages, "supported") orelse return null;
+    const rest = messages[value_start..];
+    if (std.mem.startsWith(u8, rest, "true")) return true;
+    if (std.mem.startsWith(u8, rest, "false")) return false;
+    return null;
+}
+
 /// 目录顶档词汇:声明了 xhigh → neutral(OpenAI 叫法);只声明 max → max;都没有 → neutral。
 fn extractEffortVocabulary(obj: []const u8) EffortVocabulary {
     const caps = findObjectField(obj, "capabilities") orelse return .neutral;
+    if (gatewayReasoning(caps)) |gateway| return gateway.vocabulary;
     const effort = findObjectField(caps, "effort") orelse return .neutral;
     if (capSupported(effort, "xhigh")) return .neutral;
     if (capSupported(effort, "max")) return .max;
@@ -669,4 +758,71 @@ test "Catalog: empty/invalid json no crash" {
     try c.loadFromModelsListJson("");
     try c.loadFromModelsListJson("{}");
     try testing.expect(c.entries.items.len == 0);
+}
+
+test "Metask's gateway catalog as it answers: the levels it names outrank the all-false effort block beside them, and none only where reasoning turns off (#527)" {
+    // Three entries of www.metask-ai.com's `/v1/models` as it answered on
+    // 2026-11-17, trimmed to these fields. Every chat model carries an
+    // Anthropic-shaped `effort` block, all false; the levels are in
+    // `reasoning.efforts`. Read the other way round, GLM offered `none` alone.
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    try catalog.loadFromModelsListJson(
+        \\{"object":"list","data":[
+        \\{"id":"glm-5.3","capabilities":{"endpoints":{"messages":{"supported":true}},"effort":{"low":{"supported":false},"max":{"supported":false},"high":{"supported":false},"medium":{"supported":false},"supported":false},"reasoning":{"disable":{"supported":false},"efforts":["low","medium","high","max"],"supported":true,"translated":true}}},
+        \\{"id":"glm-5.3-flash","capabilities":{"endpoints":{"messages":{"supported":true}},"effort":{"low":{"supported":false},"max":{"supported":false},"high":{"supported":false},"medium":{"supported":false},"supported":false},"reasoning":{"disable":{"supported":false},"efforts":["low","high","max"],"supported":true,"translated":true}}},
+        \\{"id":"kimi-k3.1-pro","capabilities":{"endpoints":{"messages":{"supported":true}},"effort":{"low":{"supported":false},"max":{"supported":false},"high":{"supported":false},"medium":{"supported":false},"supported":false},"reasoning":{"disable":{"supported":true},"supported":true,"translated":true}}}
+        \\]}
+    );
+    try std.testing.expectEqual(@as(usize, 3), catalog.entries.items.len);
+    var buf: ReasoningOptions = undefined;
+
+    // GLM cannot turn reasoning off (`disable.supported` false): its levels,
+    // and no `none`, which would not turn it off.
+    const glm = catalog.entries.items[0];
+    try std.testing.expectEqualSlices(types.ReasoningEffort, &.{ .low, .medium, .high, .xhigh }, reasoningOptions(glm.reasoning_mask, &buf));
+    try std.testing.expectEqual(EffortVocabulary.max, glm.effort_vocabulary);
+    try std.testing.expectEqualStrings("max", effortLabel(glm.effort_vocabulary, .xhigh));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, .medium), defaultReasoningForMask(glm.reasoning_mask));
+    const flash = catalog.entries.items[1];
+    try std.testing.expectEqualSlices(types.ReasoningEffort, &.{ .low, .high, .xhigh }, reasoningOptions(flash.reasoning_mask, &buf));
+
+    // A model that names no level: `none` is all there is, as before.
+    const kimi = catalog.entries.items[2];
+    try std.testing.expectEqualSlices(types.ReasoningEffort, &.{.none}, reasoningOptions(kimi.reasoning_mask, &buf));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), defaultReasoningForMask(kimi.reasoning_mask));
+}
+
+test "a gateway model whose reasoning turns off is offered none before its levels (#527)" {
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    try catalog.loadFromModelsListJson(
+        \\{"data":[{"id":"m","capabilities":{"reasoning":{"disable":{"supported":true},"efforts":["low","high"],"supported":true}}}]}
+    );
+    var buf: ReasoningOptions = undefined;
+    try std.testing.expectEqualSlices(types.ReasoningEffort, &.{ .none, .low, .high }, reasoningOptions(catalog.entries.items[0].reasoning_mask, &buf));
+}
+
+test "Metask's gateway catalog: reasoning levels from capabilities.reasoning.efforts and the messages endpoint (#527)" {
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    try catalog.loadFromModelsListJson(
+        \\{"object":"list","data":[
+        \\ {"id":"glm-5.3","capabilities":{"endpoints":{"messages":{"supported":true,"status":"supported"},"chat_completions":{"supported":true}},
+        \\   "reasoning":{"supported":true,"disable":{"supported":false},"efforts":["low","medium","high","max"],"translated":true}}},
+        \\ {"id":"seedance-2.0","capabilities":{"endpoints":{"messages":{"supported":false,"status":"unsupported"},"videos":{"supported":true}},
+        \\   "reasoning":{"supported":false,"efforts":[]}}},
+        \\ {"id":"old-route-model","max_tokens":1024}
+        \\]}
+    );
+    try std.testing.expectEqual(@as(usize, 3), catalog.entries.items.len);
+    const glm = catalog.entries.items[0];
+    try std.testing.expectEqual(@as(?bool, true), glm.messages);
+    try std.testing.expect(glm.supportsReasoning(.low) and glm.supportsReasoning(.medium) and glm.supportsReasoning(.high));
+    // `max` without `xhigh`: the neutral top level, labelled max.
+    try std.testing.expect(glm.supportsReasoning(.xhigh) and !glm.supportsReasoning(.max));
+    try std.testing.expectEqual(EffortVocabulary.max, glm.effort_vocabulary);
+    try std.testing.expectEqual(@as(?bool, false), catalog.entries.items[1].messages);
+    try std.testing.expectEqual(@as(u8, 0), catalog.entries.items[1].reasoning_mask);
+    try std.testing.expectEqual(@as(?bool, null), catalog.entries.items[2].messages);
 }

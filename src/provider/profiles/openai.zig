@@ -1,5 +1,8 @@
 //! OpenAI provider profile.
 //!
+//! Integration notes live in `src/api/dialects/openai.zig`; this file is the
+//! route data.
+//!
 //! One channel exposing both OpenAI wire families. The protocol stays an
 //! explicit route choice — it is never inferred from the base URL or the model
 //! name, which is the same rule `types.OpenAIProtocol` already documents.
@@ -72,6 +75,7 @@ fn gpt6(comptime request_model_id: []const u8, comptime display_name: []const u8
             .with(.reasoning, .supported),
         .controls = &GPT6_CONTROLS,
         .protocols = &RESPONSES_ONLY,
+        .dialect = .openai,
     };
 }
 

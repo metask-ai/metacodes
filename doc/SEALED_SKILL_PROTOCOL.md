@@ -255,7 +255,10 @@ id is unknown or not visible to this subscriber.
   package (§12).
 - `provider` is the client's route without its credential; `auth` absent
   means the kind's default header. A `signed_adapter` scheme cannot be
-  carried and such a client cannot run sealed Skills.
+  carried and such a client cannot run sealed Skills. `kind` has exactly
+  the three values above: a client on any other transport (Amazon Bedrock's
+  Converse wire, for one) cannot run sealed Skills either, and a gateway
+  answers any other value with `invalid params`.
 
 Result: a Step (§4.3).
 
@@ -599,9 +602,9 @@ bound that — only the credential's lifetime and the provider-side limits
 do. A short-lived token, or a dedicated key with a spend cap, is the right
 thing to hand a gateway. The client's provider endpoint MUST be reachable
 from the gateway (a model served from the user's own loopback is not), and
-a credential whose scheme cannot be carried in a header (`signed_adapter`)
-cannot be delegated; the client says so rather than running the Skill
-without it.
+a credential whose scheme cannot be carried in a header (`signed_adapter`),
+or a route on a transport `provider.kind` has no value for (§3.4), cannot be
+delegated; the client says so rather than running the Skill without it.
 
 A gateway MAY keep a client's built provider — and, where its client allows
 it, the upstream connection — for a short idle window after a request,

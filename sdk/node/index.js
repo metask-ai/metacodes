@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const ABI_REVISION = 26;
+const ABI_REVISION = 28;
 const BUILTIN_TOOLS = [
   'ExecuteCode',
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell',
@@ -17,6 +17,8 @@ const SHELL_TOOLS = ['Bash', 'BashOutput', 'KillShell'];
 // The CLI agent loop's own default (src/core/agent_loop.zig Options.max_turns).
 const DEFAULT_MAX_TURNS = 400;
 const MAX_TURNS = 1000;
+// Revision 28: RunOptionsV1.stream_retry_budget runs from 0 to this.
+const MAX_STREAM_RETRY_BUDGET = 8;
 const PROVIDERS = { anthropic: 1, openai: 2, gemini: 3 };
 const PERMISSION_MODES = { default: 1, accept_edits: 2, auto: 3, dont_ask: 4, full_access: 5 };
 const SHELL_POLICIES = { disabled: 1, sandboxed: 2, unrestricted: 3 };
@@ -422,21 +424,30 @@ class Session {
   }
 
   /**
-   * Run one prompt to completion.
+   * Run one prompt to completion. Every request is sent once more by itself
+   * when its stream breaks off without an answer before any tool call started;
+   * `streamRetryBudget` (0 to 8, default 0) is how many more times the Run may
+   * send a request again after that. Each retry of an attempt that showed
+   * output ends its segment `discarded`, takes back its thinking with a
+   * `thinking_discarded` event and is announced by `retry_notice`.
    * @returns {Promise<{text: string, stopReason: string, turns: number, toolCalls: number, usage: object, segments: object[]}>}
    */
-  run(prompt, { maxTurns, onEvent } = {}) {
+  run(prompt, { maxTurns, streamRetryBudget = 0, onEvent } = {}) {
     if (!this._handle) return Promise.reject(new Error('session is closed'));
     if (this._active) return Promise.reject(new Error('a Run is already active on this session'));
     const turns = maxTurns === undefined ? DEFAULT_MAX_TURNS : Number(maxTurns);
     if (!Number.isInteger(turns) || turns < 1 || turns > MAX_TURNS) {
       return Promise.reject(new RangeError(`maxTurns must be between 1 and ${MAX_TURNS}`));
     }
+    const budget = Number(streamRetryBudget);
+    if (!Number.isInteger(budget) || budget < 0 || budget > MAX_STREAM_RETRY_BUDGET) {
+      return Promise.reject(new RangeError(`streamRetryBudget must be between 0 and ${MAX_STREAM_RETRY_BUDGET}`));
+    }
     return new Promise((resolve, reject) => {
       const runId = this._nextRunId++;
       this._active = { runId, state: new RunState(), onEvent, resolve, reject, error: null };
       try {
-        this._native.sessionRun(this._handle, runId, String(prompt), turns);
+        this._native.sessionRun(this._handle, runId, String(prompt), turns, budget);
       } catch (error) {
         this._active = null;
         reject(error);
@@ -508,6 +519,21 @@ class Session {
   setPermissionMode(mode) {
     if (!(mode in PERMISSION_MODES)) throw new Error(`permissionMode must be one of ${Object.keys(PERMISSION_MODES).join(', ')}`);
     this._native.sessionSetPermissionMode(this._handle, PERMISSION_MODES[mode]);
+  }
+
+  /**
+   * Drop the user message at `position` and everything after it (AgentCore
+   * Revision 27): the next Run takes its place, after exactly the context that
+   * preceded it. `position` counts the full history from 1, as
+   * `describe().conversation.message_count` counts, so a Run's own message is
+   * `message_count + 1` read just before it. Only the Conversation changes;
+   * files and other effects of the dropped turns stay. A refused position
+   * throws with code `NOT_USER_MESSAGE`, `MESSAGE_POSITION_OUT_OF_RANGE` or
+   * `MESSAGE_POSITION_COMPACTED` and changes nothing.
+   */
+  rewindToUserMessage(position) {
+    if (!Number.isSafeInteger(position) || position < 1) throw new TypeError('position must be a positive safe integer');
+    this._native.sessionRewindToUserMessage(this._handle, position);
   }
 
   close() {

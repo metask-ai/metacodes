@@ -70,6 +70,36 @@ pub const Provenance = enum(u8) {
     }
 };
 
+/// An isolated verifier's result on a `host_run` row
+/// (doc/ISOLATED_VERIFIER_DESIGN.md §4). A qualifier, never a provenance
+/// tier: an unknown provenance string parses as `external_oracle`, so a new
+/// tier would read as an authority escalation to every older binary, while an
+/// unknown field is ignored. It carries no reward either.
+pub const VerifierQualifier = enum {
+    pass,
+    fail,
+    unverified,
+    unavailable,
+
+    /// Unknown text is no qualifier at all (the row reads as it always did).
+    pub fn parse(text: []const u8) ?VerifierQualifier {
+        return std.meta.stringToEnum(VerifierQualifier, text);
+    }
+};
+
+/// The selector's rank of a row: `Provenance.rank` scaled so a contested
+/// `host_run` row (verifier = fail) sits strictly between `host_run_tainted`
+/// and an uncontested `host_run`. Every other qualifier, and every other
+/// provenance, keeps its tier's position. Mirrors `effectiveRank` in
+/// VerdictProvenance.lean's design (§4: `verifier_never_raises`,
+/// `contested_never_beats_clean`, `contested_below_oracle`).
+pub fn effectiveRank(provenance: Provenance, qualifier: ?VerifierQualifier) u8 {
+    const base = provenance.rank() * 2 + 1;
+    const q = qualifier orelse return base;
+    if (provenance == .host_run and q == .fail) return base - 1;
+    return base;
+}
+
 // ── JUnit XML(极简提取器:不求全 XML,只认 testcase/skipped/failure/error
 //    的属性与正文;实体解码只做五个标准实体 + 十进制数字实体)────────────
 
@@ -317,6 +347,11 @@ pub const ComposeOptions = struct {
     /// git 新文件工件(caller 提供,可空;截断责任在 caller 或此处 1600 帽)。
     best_artifact: []const u8 = "",
     max_entries: usize = 20,
+    /// Isolated verifier qualifier (§4 of doc/ISOLATED_VERIFIER_DESIGN.md).
+    /// Written only on a `host_run` row; the provenance string never changes.
+    verifier: ?VerifierQualifier = null,
+    /// The snapshot tree id the verifier judged (hex). Written with `verifier`.
+    verifier_tree: []const u8 = "",
 };
 
 /// 合成 task-outcomes JSON(单任务单行,schema=task-outcome-v1)。
@@ -387,6 +422,13 @@ pub fn composeOutcomesJson(gpa: std.mem.Allocator, parsed: *const ParseOutcome, 
         try aw.writer.print(",\"best_artifact\":", .{});
         try util_json.writeJsonString(&aw.writer, opts.best_artifact);
     }
+    if (opts.provenance == .host_run) if (opts.verifier) |q| {
+        try aw.writer.print(",\"verifier\":\"{s}\"", .{@tagName(q)});
+        if (opts.verifier_tree.len > 0) {
+            try aw.writer.print(",\"verifier_tree\":", .{});
+            try util_json.writeJsonString(&aw.writer, opts.verifier_tree);
+        }
+    };
     try aw.writer.print("}}]}}", .{});
     return aw.toOwnedSlice();
 }
@@ -597,4 +639,39 @@ test "provenance parse + rank order" {
     try std.testing.expect(Provenance.external_oracle.rank() > Provenance.host_run.rank());
     try std.testing.expect(Provenance.host_run.rank() > Provenance.host_run_tainted.rank());
     try std.testing.expect(Provenance.host_run_tainted.rank() > Provenance.self_claim.rank());
+}
+
+test "verifier qualifier: demotes a host_run row only, never raises any row" {
+    // verifier_never_raises: no qualifier lifts a row above its tier.
+    for (std.enums.values(Provenance)) |p| {
+        for (std.enums.values(VerifierQualifier)) |q| {
+            try std.testing.expect(effectiveRank(p, q) <= effectiveRank(p, null));
+        }
+    }
+    // contested_never_beats_clean, and still above a tainted row.
+    try std.testing.expect(effectiveRank(.host_run, .fail) < effectiveRank(.host_run, null));
+    try std.testing.expect(effectiveRank(.host_run, .fail) < effectiveRank(.host_run, .pass));
+    try std.testing.expect(effectiveRank(.host_run, .fail) > effectiveRank(.host_run_tainted, null));
+    // contested_below_oracle.
+    try std.testing.expect(effectiveRank(.host_run, .fail) < effectiveRank(.external_oracle, null));
+    // PASS, UNVERIFIED and unavailable leave the row where host_run puts it.
+    try std.testing.expectEqual(effectiveRank(.host_run, null), effectiveRank(.host_run, .pass));
+    try std.testing.expectEqual(effectiveRank(.host_run, null), effectiveRank(.host_run, .unverified));
+    try std.testing.expectEqual(effectiveRank(.host_run, null), effectiveRank(.host_run, .unavailable));
+    // A fail on any other tier changes nothing.
+    try std.testing.expectEqual(effectiveRank(.external_oracle, null), effectiveRank(.external_oracle, .fail));
+    try std.testing.expectEqual(@as(?VerifierQualifier, null), VerifierQualifier.parse("verifier"));
+}
+
+test "composeOutcomesJson: verifier qualifier rides a host_run row only" {
+    const a = std.testing.allocator;
+    var parsed = try parseAuto(a, "ok", 0);
+    defer parsed.deinit();
+    const row = try composeOutcomesJson(a, &parsed, .{ .task = "t", .attempt_key = "k", .provenance = .host_run, .verifier = .fail, .verifier_tree = "abc" });
+    defer a.free(row);
+    try std.testing.expect(std.mem.indexOf(u8, row, "\"provenance\":\"host_run\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "\"verifier\":\"fail\",\"verifier_tree\":\"abc\"") != null);
+    const tainted = try composeOutcomesJson(a, &parsed, .{ .task = "t", .attempt_key = "k", .provenance = .host_run_tainted, .verifier = .fail });
+    defer a.free(tainted);
+    try std.testing.expect(std.mem.indexOf(u8, tainted, "verifier") == null);
 }

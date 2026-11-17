@@ -192,6 +192,17 @@ pub const Config = struct {
     /// (`main.resolveLearningTurn`). Enforce wins when both are given.
     learning_turn: bool = false,
     learning_turn_observe: bool = false,
+    /// `--verifier` / `--verifier-observe` (print mode also
+    /// `METACODES_VERIFIER=enforce|observe`): after a green pinned check,
+    /// spawn the isolated verifier (doc/ISOLATED_VERIFIER_DESIGN.md); enforce
+    /// lets a reproduced FAIL continue the run, observe only records. Needs a
+    /// pinned check: the check gate, or in print mode the self-evolution host
+    /// check, whose outcome row then carries the verifier qualifier
+    /// (`main.resolveVerifier`). Enforce wins when both are given.
+    verifier: bool = false,
+    verifier_observe: bool = false,
+    /// `--verifier-model <model|tier>`: the verifier's model; null = the actor's.
+    verifier_model: ?[]const u8 = null,
     /// `--test-integrity` / `--test-integrity-observe`: compare the tests that
     /// existed when a run started with the end state; enforce sends one
     /// message when the model stops with them rewritten, deleted or disabled,
@@ -260,9 +271,22 @@ pub const Config = struct {
     /// Provider-declared authentication for the resolved route. Null keeps the
     /// historical `authorization: Bearer <key>` transport behaviour.
     auth_scheme: ?@import("provider/credential.zig").AuthScheme = null,
+    /// The vendor dialect the resolved route declares (`ModelOffer.dialect`),
+    /// for `model`. Empty infers it from the model name, the historical
+    /// behaviour.
+    dialect: @import("provider/vendor.zig").Declaration = .{},
     /// True only when startup resolved the bearer from the Metask OAuth session;
     /// explicit legacy API-key mode must not load that session or hydrate it.
     metask_oauth_selected: bool = false,
+    /// The host's layer below the process environment for the variables
+    /// credentials are read from (#486): the CLI's `<state root>/.env`, as
+    /// `src/app/state_env.zig` accepted it at startup. A name the process
+    /// environment sets is never read here, nor a provider's alias while the
+    /// environment sets another alias of that provider
+    /// (`credential.ResolveInput.env_fallback`). Null for every host that
+    /// keeps none: the process environment is then the only one. Borrowed;
+    /// the host keeps it alive for as long as any App built from this Config.
+    credential_env_fallback: ?@import("provider/credential.zig").EnvLookup = null,
     /// OpenAI wire 协议选择(`--openai-protocol` / env METACODES_OPENAI_PROTOCOL)。
     /// 默认 chat_completions;responses 走 /v1/responses(typed SSE 事件流)。
     /// 仅 provider_kind==.openai 时被消费;**显式配置,绝不从 base_url/model 推断**。
@@ -323,7 +347,7 @@ test "TinyKG arm respects an explicit auto-memory disable" {
 }
 
 /// LLM 后端协议种类(App 组装层据此选具体 Client;core 只见中立 Provider)。
-pub const ProviderKind = enum { anthropic, openai, gemini };
+pub const ProviderKind = enum { anthropic, openai, gemini, bedrock };
 
 /// OpenAI 后端的 wire 协议(仅 provider_kind==.openai 时生效):
 /// chat_completions = /v1/chat/completions(默认);responses = /v1/responses。

@@ -19,6 +19,7 @@ const execution_effect = @import("execution_effect.zig");
 const response_candidate = @import("response_candidate.zig");
 const json_mod = @import("../json.zig");
 const tools_mod = @import("../tools.zig");
+const tools_common = @import("../tools/common.zig");
 const permission_mod = @import("../permission.zig");
 const message_repair_mod = @import("message_repair.zig");
 const hooks_mod = @import("../permission/hooks.zig");
@@ -33,6 +34,7 @@ const context_pressure_mod = @import("context_pressure.zig");
 const context_caps = @import("context_caps.zig");
 const error_class = @import("../api/error_class.zig");
 const compact_kernel = @import("compact_kernel.zig");
+const compaction_control = @import("compaction_control.zig");
 const result_projection = @import("result_projection.zig");
 const result_budget_mod = @import("result_budget.zig");
 const verification_progress_mod = @import("verification_progress.zig");
@@ -40,6 +42,7 @@ const requirement_ledger_mod = @import("requirement_ledger.zig");
 const delivery_cadence_mod = @import("delivery_cadence.zig");
 const progress_updates_mod = @import("progress_updates.zig");
 const check_gate_mod = @import("check_gate.zig");
+const isolated_verifier_mod = @import("isolated_verifier.zig");
 const test_integrity_mod = @import("test_integrity.zig");
 const stall_gate_mod = @import("stall_gate.zig");
 const learning_turn_mod = @import("learning_turn.zig");
@@ -70,12 +73,27 @@ pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_erro
 /// 与 max_turns 不冲突:那是预算,这是按故障分类停止,不数模型行为。
 pub const MAX_ENVIRONMENT_FAULTS: u32 = 3;
 
-/// 连接没给出答复(`isSilentRetryFailure`)、而本次尝试**还没有任何可见输出**(文本 / thinking /
-/// 工具调用都没到 backend)时,同轮重发次数的下限,不论 `Options.max_stream_turn_retries` 是多少。
-/// TUI 默认不重发是怕重复用户已经看着流出来的半截文本;一个字都没流出来就没有这个顾虑。2026-10-24
-/// 实录:message_start 之后连接静默 30 分钟被判 stall,run 以 api_error 收口,用户手动 /retry,
-/// 同一请求 18.7 s 完成。
-pub const SILENT_STREAM_RETRY_FLOOR: u8 = 1;
+/// Same-turn re-issues every model request gets by default (#461), whatever
+/// `Options` say: after a connection that gave no answer
+/// (`isSilentRetryFailure`), as long as the failed attempt never started a
+/// tool call. The count is the request's, not the Run's, so an earlier turn
+/// cannot use it up. A reasoning model streams thinking first, so a gateway
+/// stream that drops has almost always shown something; that output is
+/// discarded with the attempt (it never reaches the Conversation) and the
+/// identical request goes out again. A started tool call, even one whose
+/// arguments were still streaming, rules the re-issue out: the call may have
+/// begun to run (stream prefetch), and a gateway that re-generates it gives no
+/// promise to name it the same way. 2026-10-24: a connection silent for 30
+/// minutes after `message_start` ended a Run with `api_error`; the user's
+/// manual /retry finished the same request in 18.7 s.
+pub const STREAM_RETRIES_PER_REQUEST: u8 = 1;
+
+/// How long a re-issue of an attempt that showed output waits after its
+/// `retry_notice` (#461). Short: the connection already died once, and the
+/// wait is there so a gateway that is restarting is not hit at once. The wait
+/// is a cancellation point; an abort during it ends the Run `aborted` and
+/// sends nothing.
+pub const STREAM_RETRY_BACKOFF_MS: u32 = 500;
 
 /// 哪些流内失败算"连接没给出答复",可以在零可见输出时兜底重发:监视线程判的 stall(进展沉默或
 /// 连接已死)、没报告停止原因就结束的流、以及流中途断连(`RequestFailed`——三个 provider client
@@ -327,8 +345,9 @@ pub const RunResult = struct {
     /// `stall_gate.renderStopNotice`.
     stall: ?stall_gate_mod.Report = null,
     /// How many times this call to `run` asked the model to continue an answer
-    /// the provider cut at its output-token limit (`max_tokens`), at most
-    /// `MAX_CONTINUATIONS`. The visible text of a continued answer is one
+    /// the provider cut at its output-token limit (`max_tokens`), in total.
+    /// `MAX_CONTINUATIONS` bounds consecutive continuations only, so this can
+    /// exceed it when the model recovers between cuts. The visible text of a continued answer is one
     /// seamless concatenation, so this is the only trace a host that reads
     /// only the result has of it (issue #269).
     continuations: u32 = 0,
@@ -388,6 +407,17 @@ pub const Options = struct {
     /// own Conversation; what reaches this one is a tool result, already
     /// governed by the tool-result side of whatever policy installed this.
     response_observer: ?response_candidate.Observer = null,
+    /// Optional durable-state compaction control (issue #430).
+    ///
+    /// Installed by an embedding layer that owns durable state (AgentCore's
+    /// checkpoint budget). Every compaction this loop runs then reports to it,
+    /// commits only if it allows the replacement, and may also be started by
+    /// its capacity pressure; the context-window recovery never falls back to
+    /// trimming history. Null keeps the loop exactly as before.
+    ///
+    /// Like `response_observer`, never passed to a subagent: a child compacts
+    /// its own discarded Conversation, which is not durable state.
+    compaction_control: ?compaction_control.Control = null,
     /// 本次 run 归属的会话(emit/poll 路由用)。默认 .single(N=1/TUI);M6 多 Session 时
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
@@ -513,7 +543,7 @@ pub const Options = struct {
     session_id: []const u8 = "",
     project_dir: []const u8 = "",
     disable_shell_execution: bool = false,
-    /// Sandbox 配置(Bash 工具用):非 null 且 enabled 时包 sandbox-exec。
+    /// Sandbox 配置(Bash 工具用):非 null 且 enabled 时包平台沙箱(sandbox-exec / bwrap)。
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     /// cwd 绝对路径 + HOME(sandbox profile 用)。
     cwd_abs: []const u8 = "",
@@ -626,6 +656,17 @@ pub const Options = struct {
     /// so macro runs and embedders never run a check; the terminal
     /// `check_gate` observation record is emitted once per run when armed.
     check_gate: ?check_gate_mod.Options = null,
+    /// Isolated verifier (doc/ISOLATED_VERIFIER_DESIGN.md): when the check
+    /// gate's pinned check passes at depth 0, the host spawns a fresh,
+    /// read-only verifier on a git snapshot of the workspace. Enforce mode
+    /// turns a reproduced FAIL into a `failed` verdict with source `verifier`
+    /// (a continuation under the check gate's own budget) and answers an
+    /// UNVERIFIED with one read-only leads round; observe mode only records.
+    /// It can only demote: PASS, UNVERIFIED and `unavailable` leave the
+    /// pinned verdict as it was. Needs `check_gate`; root run only; canonical
+    /// buildRunOptions leaves it null; one terminal `isolated_verifier`
+    /// observation record per armed run.
+    isolated_verifier: ?isolated_verifier_mod.Options = null,
     /// Learning turn (doc/LEARNING_TURN_DESIGN.md): after the check gate's
     /// verdict ends the run, the same conversation distills conditioned
     /// lessons (`KgRemember` kind `lesson`) and reconciles them with the
@@ -662,16 +703,38 @@ pub const Options = struct {
     /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
     /// nudge 哲学)。null = 无义务/关闭。
     obligations: ?*@import("obligation_gate.zig").Runtime = null,
-    /// Bounded same-turn retries after a mid-stream provider failure. The
-    /// stream-error path already discards the partial turn (nothing was
-    /// committed to the conversation), so re-issuing the identical request is
-    /// semantically clean. Default 0 preserves interactive behavior — a TUI
-    /// user has watched the partial text stream and a silent re-run would
-    /// duplicate it; headless evaluation enables 2, where one transient
-    /// otherwise destroys an entire paired arm's evidence. A stall or an
-    /// unterminated stream before anything visible streamed has no such text
-    /// and always gets at least `SILENT_STREAM_RETRY_FLOOR` retries.
+    /// Bounded same-turn retries after a mid-stream provider failure, on top
+    /// of the request's own `STREAM_RETRIES_PER_REQUEST`. The stream-error
+    /// path already discards the partial turn (nothing was committed to the
+    /// conversation), so re-issuing the identical request is semantically
+    /// clean. Unlike the per-request allowance this counts every stream
+    /// failure, a server-declared error included, and the count is the Run's.
+    /// Headless evaluation enables 2, where one transient otherwise destroys
+    /// an entire paired arm's evidence. Default 0.
     max_stream_turn_retries: u8 = 0,
+    /// Same-turn re-issues a host grants on top of the request's own
+    /// `STREAM_RETRIES_PER_REQUEST` (#452; AgentCore
+    /// `RunOptionsV1.stream_retry_budget`). This Run may re-issue a request
+    /// whose accepted stream failed without an answer (`isSilentRetryFailure`:
+    /// a stall, a stream that ended before its stop report, a dropped
+    /// connection) up to this many more times, after visible output and a
+    /// started tool call too. Unlike `max_stream_turn_retries`, a
+    /// server-declared error (`ApiError`) or a local decode failure is never
+    /// re-issued under it. The count is the Run's, shared with
+    /// `max_stream_turn_retries`; each re-issue has its own connection retries
+    /// (`providerAttemptLimit`). 0, the default, leaves the per-request
+    /// allowance alone.
+    ///
+    /// Every re-issue of an attempt that showed something is announced, under
+    /// any allowance: the attempt's segment closes `discarded` (as on any
+    /// stream error), its thinking is withdrawn with `thinking_discarded`,
+    /// `retry_notice` follows, and the next attempt waits
+    /// `stream_retry_backoff_ms`. An attempt that showed nothing is re-issued
+    /// silently and at once.
+    retractable_stream_retries: u8 = 0,
+    /// The wait before re-issuing an attempt that showed output (#461). Tests
+    /// shorten or lengthen it; every product path keeps the default.
+    stream_retry_backoff_ms: u32 = STREAM_RETRY_BACKOFF_MS,
     /// 统一 UI 请求回调(替代旧 ask_question 等多套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -959,6 +1022,9 @@ const OutputChannel = struct {
     /// later close that would make text part of the result (an abort inside a
     /// learning pass closes `.final`) is recorded as commentary instead.
     final_sealed: bool = false,
+    /// The segment the latest `close` ended, so a re-issue can name the
+    /// attempt it withdraws (`thinking_discarded`).
+    last_closed: ?output_semantics.Segment = null,
 
     fn begin(self: *OutputChannel, turn: u32) void {
         // 配对兜底(见顶注):漏关的段在这里以 .partial 收口,end 事件照发。
@@ -970,6 +1036,7 @@ const OutputChannel = struct {
         }
         const seg = self.tracker.begin(turn);
         self.pending_bytes = 0;
+        self.last_closed = null;
         self.backend.emitEvent(self.session, .{ .output_segment_begin = .{
             .index = seg.index,
             .turn = seg.turn,
@@ -990,6 +1057,7 @@ const OutputChannel = struct {
             requested;
         const seg = self.tracker.close(disposition, self.pending_bytes) orelse return;
         self.pending_bytes = 0;
+        self.last_closed = seg;
         self.backend.emitEvent(self.session, .{ .output_segment_end = .{
             .index = seg.index,
             .turn = seg.turn,
@@ -1199,6 +1267,56 @@ fn adoptRunInputs(
     }
 }
 
+const ArgsAdmission = union(enum) {
+    /// Canonical arguments, owned by the admitted slot.
+    admitted: []u8,
+    /// The invalid_args tool result for the model (owned by the caller).
+    rejected: []u8,
+};
+
+/// Admit one tool call's arguments (issue #494) through
+/// `tools/common.canonicalizeArgs`. The bytes the provider sent stay in the
+/// Conversation unchanged; only what the hook, the permission check and the
+/// executor read is canonical.
+fn admitToolArgs(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !ArgsAdmission {
+    const canonical = tools_common.canonicalizeArgs(allocator, input) catch |err| return .{ .rejected = switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateArgumentKey => try tool_error.errorToJson(
+            "DuplicateArgumentKey",
+            "the arguments name the same key more than once; send the call again with each key once",
+            .{},
+            allocator,
+        ),
+        error.InvalidArgumentsJson => try tool_error.errorToJson(
+            "InvalidArgumentsJson",
+            "the arguments are not one well-formed JSON object; send the call again with a JSON object of the tool's parameters",
+            .{},
+            allocator,
+        ),
+    } };
+    return .{ .admitted = canonical };
+}
+
+/// The tool result for a permission prompt that ended with nobody's answer
+/// (doc/WIRE_PROTOCOL.md §1.4). It never says the user declined; `code`
+/// stays `permission_denied` and the call never runs. A timeout or a
+/// cancellation is recoverable: asking again may get an answer. No Host
+/// setting (such as the timeout's length) enters the text, so these bytes do
+/// not change with configuration.
+fn unansweredPromptJson(cause: permission_mod.PromptUnanswered, tool: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    return switch (cause) {
+        error.PromptUnrenderable => tool_error.errorToJson("PermissionDenied", "'{s}' was denied without asking: the frontend connected to this session cannot render permission prompts (it declared that it does not render permission requests). This is not the user's decision; the user never saw the request.", .{tool}, allocator),
+        error.PromptTimedOut => tool_error.errorToJson("PermissionPromptUnanswered", "'{s}' did not run: nobody answered its permission request in time. The user did not decline it; you may offer to ask again.", .{tool}, allocator),
+        error.PromptCancelled => tool_error.errorToJson("PermissionPromptUnanswered", "'{s}' did not run: an interrupt or a close cancelled its permission request before anyone answered. The user did not decline it; you may offer to ask again.", .{tool}, allocator),
+        error.PromptAnswerUnreadable => tool_error.errorToJson("PermissionDenied", "'{s}' was denied: an answer to its permission request arrived but could not be read. This is not the user's decision.", .{tool}, allocator),
+        error.PromptNobodyToAsk => tool_error.errorToJson("PermissionDenied", "'{s}' was denied without asking: this session has no way to ask for permission and wait for the answer. This is not the user's decision; the user never saw the request.", .{tool}, allocator),
+        error.PromptRequestFailed => tool_error.errorToJson("PermissionDenied", "'{s}' was denied: its permission request failed before anyone answered. This is not the user's decision.", .{tool}, allocator),
+    };
+}
+
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
 /// 收集事件到 assistant message 里（text 和 tool_use blocks），
 /// 如果有 tool_use 则执行、追加 tool_result 到 conversation，继续下一轮。
@@ -1218,6 +1336,7 @@ const ToolAdmission = struct {
     depth: u8,
     rid: log.RequestId,
     learning_pass: bool,
+    verifier_leads: bool,
 
     fn admit(self: *const ToolAdmission, tu: msg.ToolUse, allocator: std.mem.Allocator) !tool_exec_mod.Slot {
         const opts = self.opts;
@@ -1243,6 +1362,30 @@ const ToolAdmission = struct {
             tu.name // dispatcher universe: exact-name policy, no repair
         else
             tools_mod.resolveToolNameExact(&name_probe_ctx, tu.name) orelse tu.name;
+        if (self.verifier_leads and !isolated_verifier_mod.allowedDuringLeads(canonical_name)) {
+            backend.emitEvent(sess, .{ .policy_decision = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .id = tu.id,
+                .tool = tu.name,
+                .decision = "deny",
+                .source = "isolated_verifier",
+                .allowed = false,
+            } });
+            return .{
+                .decision = .denied,
+                .name = tu.name,
+                .id = tu.id,
+                .input = tu.input,
+                .content = try tool_error.errorToJson(
+                    "VerifierLeadsToolUnavailable",
+                    "tool '{s}' does not run in a verifier leads round: only Read, Grep and Glob do, and files cannot change",
+                    .{tu.name},
+                    allocator,
+                ),
+                .is_error = true,
+            };
+        }
         // Learning pass: only read tools and KgRemember run, so the workspace
         // the check judged is the workspace the run hands back.
         if (self.learning_pass and !learning_turn_mod.allowedDuringPass(canonical_name)) {
@@ -1265,15 +1408,41 @@ const ToolAdmission = struct {
             lslot.is_error = true;
             return lslot;
         }
+        // Model calls and JS host requests share argument admission (#494).
+        // The slot owns the canonical bytes seen by hooks, permissions and dispatch.
+        var eff_input = switch (try admitToolArgs(allocator, tu.input)) {
+            .admitted => |canonical| canonical,
+            .rejected => |content| return .{
+                .decision = .denied,
+                .name = tu.name,
+                .id = tu.id,
+                .input = tu.input,
+                .content = content,
+                .is_error = true,
+            },
+        };
+        errdefer allocator.free(eff_input);
         // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
-        var eff_input = tu.input;
-        var modified_input: ?[]u8 = null;
-        errdefer if (modified_input) |input| allocator.free(input);
         if (hookset) |hs| if (hs.hasPre()) {
-            const pre = hooks_mod.runPreToolUseFull(hs, allocator, canonical_name, tu.input, opts.abort);
+            const pre = hooks_mod.runPreToolUseFull(hs, allocator, canonical_name, eff_input, opts.abort);
             if (pre.modified_input) |mi| {
-                modified_input = mi;
+                allocator.free(eff_input);
                 eff_input = mi;
+                switch (try admitToolArgs(allocator, mi)) {
+                    .admitted => |canonical| {
+                        allocator.free(eff_input);
+                        eff_input = canonical;
+                    },
+                    .rejected => |content| return .{
+                        .decision = .denied,
+                        .name = tu.name,
+                        .id = tu.id,
+                        .input = eff_input,
+                        .admitted_input = eff_input,
+                        .content = content,
+                        .is_error = true,
+                    },
+                }
             }
             if (pre.decision == .block) {
                 log.warnId("permission", rid, "PreToolUse hook blocked tool={s}", .{tu.name});
@@ -1289,7 +1458,7 @@ const ToolAdmission = struct {
                 var dslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = eff_input };
                 dslot.content = try tool_error.errorToJson("PreToolUseBlocked", "tool '{s}' blocked by PreToolUse hook", .{tu.name}, allocator);
                 dslot.is_error = true;
-                dslot.admitted_input = modified_input;
+                dslot.admitted_input = eff_input;
                 return dslot;
             }
         };
@@ -1331,24 +1500,23 @@ const ToolAdmission = struct {
                 // R2-3:传 canonical_name——ask 记忆(rememberAllow/Deny)与决策链读取
                 // (decisionFor)必须同键,否则 "always deny" 存 "bash" 键、后续按 "Bash"
                 // 查不到,session deny 被 settings allow 越过。
-                // Every failure denies. PromptUnrenderable is the one that
-                // asked nobody: the connected frontend declared it cannot
-                // render permission prompts (doc/WIRE_PROTOCOL.md §2.2).
-                var unrenderable = false;
+                // Preserve the unanswered-prompt causes from the ordinary
+                // model tool path (doc/WIRE_PROTOCOL.md §1.4).
+                var unanswered: ?permission_mod.PromptUnanswered = null;
                 const prompted = if (forced_confirm)
                     permission_mod.promptUserForced(@constCast(permission_ctx), canonical_name, eff_input)
                 else
                     permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input);
                 const allowed = prompted catch |err| blk: {
-                    unrenderable = err == error.PromptUnrenderable;
+                    unanswered = err;
                     break :blk false;
                 };
                 policy_allowed = allowed;
-                log.infoId("permission", rid, "prompt tool={s} user_allowed={} unrenderable={}", .{ tu.name, allowed, unrenderable });
+                log.infoId("permission", rid, "prompt tool={s} user_allowed={} unanswered={s}", .{ tu.name, allowed, if (unanswered) |cause| @errorName(cause) else "-" });
                 if (!allowed) {
                     slot.decision = .denied;
-                    slot.content = if (unrenderable)
-                        try tool_error.errorToJson("PermissionDenied", "'{s}' was denied without asking: the frontend connected to this session cannot render permission prompts (it declared that it does not render permission requests). This is not the user's decision; the user never saw the request.", .{tu.name}, allocator)
+                    slot.content = if (unanswered) |cause|
+                        try unansweredPromptJson(cause, tu.name, allocator)
                     else
                         try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
                     slot.is_error = true;
@@ -1365,7 +1533,7 @@ const ToolAdmission = struct {
             .source = if (perm_result == .ask) "user_prompt" else "permission_chain",
             .allowed = policy_allowed,
         } });
-        slot.admitted_input = modified_input;
+        slot.admitted_input = eff_input;
         // 任务义务观察:获准执行的 Bash 命令喂给义务运行时(needle 子串
         // 命中即 met)。denied 的调用不算——义务要的是"真的跑过"。
         // R3-4:按 canonical 名判——"bash" 会被 P0.6 修名真执行,raw 名判失配
@@ -1632,7 +1800,8 @@ fn runCaptured(
 }
 
 const RunCounters = struct {
-    /// max_tokens 续写次数(见 MAX_CONTINUATIONS);RunResult.continuations 的来源。
+    /// max_tokens 续写总次数(整个 Run 累计,不重置);RunResult.continuations 的来源。
+    /// 上限 MAX_CONTINUATIONS 只约束连续续写(见 runCounted 的 continuation_streak)。
     continuations: u32 = 0,
     /// The learning turn's report once it decided (RunResult.learning), set by a
     /// defer in runCounted so an abort inside a pass still reports it.
@@ -1811,6 +1980,171 @@ noinline fn recordCheckGate(opts: *const Options, gate: check_gate_mod.Options, 
     }
 }
 
+noinline fn recordIsolatedVerifier(opts: *const Options, verifier: isolated_verifier_mod.Options, gate: *const isolated_verifier_mod.Gate) void {
+    const observer = opts.tool_observer orelse return;
+    const obs = tools_mod.tool_observation;
+    var verdicts: [2]obs.VerifierVerdict = .{ .not_run, .not_run };
+    var reasons: [2]obs.VerifierReason = .{ .none, .none };
+    var trees: [2][16]u8 = .{ [_]u8{'0'} ** 16, [_]u8{'0'} ** 16 };
+    for (gate.results, 0..) |maybe, i| {
+        const r = maybe orelse continue;
+        verdicts[i] = switch (r.verdict) {
+            .pass => .pass,
+            .fail => .fail,
+            .unverified => .unverified,
+            .unavailable => .unavailable,
+        };
+        reasons[i] = if (r.unavailable) |reason| switch (reason) {
+            inline else => |tag| @field(obs.VerifierReason, @tagName(tag)),
+        } else if (r.downgrade) |downgrade| switch (downgrade) {
+            inline else => |tag| @field(obs.VerifierReason, @tagName(tag)),
+        } else .none;
+        @memcpy(trees[i][0..r.tree_len], r.tree_sha_prefix[0..r.tree_len]);
+    }
+    _ = observer.emit(.{ .isolated_verifier = .{
+        .enforced = verifier.mode == .enforce,
+        .boundaries = gate.boundaries,
+        .spawns = gate.spawns,
+        .leads_rounds = gate.leads_rounds,
+        .verdict_1 = verdicts[0],
+        .reason_1 = reasons[0],
+        .tree_1 = trees[0],
+        .verdict_2 = verdicts[1],
+        .reason_2 = reasons[1],
+        .tree_2 = trees[1],
+        .charter_sha256 = isolated_verifier_mod.charterSha256Hex(),
+        .same_model = gate.same_model,
+        .turns = gate.turns,
+        .cost_microusd = gate.cost_microusd,
+        .wall_ms = gate.wall_ms,
+        .probes_cited = gate.probes_cited,
+        .probes_matched = gate.probes_matched,
+        .lead_probes = gate.lead_probes,
+        .cleanup_complete = gate.cleanup_complete,
+    } });
+}
+
+/// What the agent loop does after a verifier boundary's final spawn.
+const VerifierAction = union(enum) {
+    /// The verdict stands as the pinned check left it.
+    stand,
+    /// Enforce mode, a reproduced FAIL with budget left: continue the run
+    /// with this message (owned).
+    continue_run: []u8,
+    /// Enforce mode, a reproduced FAIL with no budget left: the run ends
+    /// `failed` (source verifier).
+    exhausted,
+};
+
+/// The verifier's dependencies, taken from the run's own options.
+fn verifierDeps(
+    opts: *const Options,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    sess: @import("session_id.zig").SessionId,
+) isolated_verifier_mod.Deps {
+    return .{
+        .provider = provider,
+        .anthropic_client = opts.api_client,
+        .tool_defs = tool_defs,
+        .permission_ctx = permission_ctx,
+        .abort = opts.abort,
+        .session = sess,
+        .state_root = opts.state_root,
+        .home_dir = opts.home_dir,
+        .sandbox = opts.sandbox,
+        .model_tiers = opts.model_tiers,
+        .artifact_root = opts.artifact_root,
+    };
+}
+
+/// One verifier spawn at the check gate's boundary, on the gate's snapshot
+/// (built here on the boundary's first spawn). Bounded by the run budget.
+fn verifierSpawn(
+    allocator: std.mem.Allocator,
+    gate: *isolated_verifier_mod.Gate,
+    verifier: isolated_verifier_mod.Options,
+    deps: isolated_verifier_mod.Deps,
+    root: []const u8,
+    pinned: isolated_verifier_mod.PinnedCheck,
+    leads: ?[]const u8,
+) !isolated_verifier_mod.VerifyResult {
+    if (!gate.budgetAllowsSpawn()) return isolated_verifier_mod.unavailableResult(allocator, .run_budget);
+    if (gate.snapshot == null) {
+        gate.snapshot = @import("../agents/isolation.zig").Snapshot.create(allocator, deps.state_root, root, gate.base_head, deps.abort) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            log.warn("verifier", "snapshot unavailable: {s}", .{@errorName(err)});
+            return isolated_verifier_mod.unavailableResult(allocator, .snapshot_failed);
+        };
+    }
+    const result = try isolated_verifier_mod.verify(allocator, deps, .{
+        .task_statement = gate.task_statement,
+        .workspace = .{ .snapshot = &gate.snapshot.? },
+        .pinned_check = pinned,
+        .model = verifier.model,
+        .prior_failing_probes = @ptrCast(gate.prior_probes.items),
+        .leads = leads,
+    });
+    gate.noteSpawn(&result);
+    return result;
+}
+
+/// Close a verifier boundary: record it, drop the snapshot, and turn a
+/// reproduced FAIL in enforce mode into the check gate's `failed` verdict.
+fn verifierConclude(
+    allocator: std.mem.Allocator,
+    gate: *isolated_verifier_mod.Gate,
+    verifier: isolated_verifier_mod.Options,
+    check: check_gate_mod.Options,
+    check_state: *check_gate_mod.State,
+    result: *const isolated_verifier_mod.VerifyResult,
+) !VerifierAction {
+    const index = gate.boundaries -| 1;
+    try gate.finishBoundary(allocator, index, result.outcome, result.record.tree);
+    gate.dropSnapshot();
+    if (verifier.mode != .enforce) return .stand;
+    const evidence = switch (result.outcome) {
+        .fail => |report| report.evidence,
+        else => return .stand,
+    };
+    check_state.noteVerifierFail(isolated_verifier_mod.failureFingerprint(evidence));
+    const decision = check_gate_mod.decide(.enforce, check.max_continuations, check_state.continuations, .failed);
+    check_state.noteDecision(decision);
+    if (decision != .continue_run) return .exhausted;
+    const left = check.max_continuations -| check_state.continuations;
+    return .{ .continue_run = try isolated_verifier_mod.renderFailContinuation(allocator, evidence, left) };
+}
+
+/// The second spawn of a boundary, after a leads round: a fresh verifier on
+/// the same snapshot T, with the round's reply as leads (at most
+/// `LEADS_MAX_BYTES`). Its verdict is final for the boundary.
+fn verifierAfterLeads(
+    allocator: std.mem.Allocator,
+    opts: *const Options,
+    gate: *isolated_verifier_mod.Gate,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    sess: @import("session_id.zig").SessionId,
+    check_state: *check_gate_mod.State,
+    leads_text: []const u8,
+) !VerifierAction {
+    const verifier = opts.isolated_verifier.?;
+    const check = opts.check_gate.?;
+    var result = if (gate.snapshot == null)
+        isolated_verifier_mod.unavailableResult(allocator, .snapshot_failed)
+    else
+        try verifierSpawn(allocator, gate, verifier, verifierDeps(opts, provider, tool_defs, permission_ctx, sess), gate.snapshot.?.repo, .{
+            .command = check.command,
+            .passed = check_state.last_passed,
+            .total = check_state.last_total,
+        }, leads_text);
+    defer result.deinit();
+    log.info("agent", "isolated verifier after leads result={s}", .{@tagName(result.outcome)});
+    return verifierConclude(allocator, gate, verifier, check, check_state, &result);
+}
+
 noinline fn recordRequirementLedger(
     opts: *const Options,
     state: *const requirement_ledger_mod.State,
@@ -1905,9 +2239,14 @@ fn runCounted(
     var total_tool_calls: u32 = 0;
     // 环境故障计数(本 run 累计,不重置):见 MAX_ENVIRONMENT_FAULTS。
     var environment_faults: u32 = 0;
-    // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
-    // 计数放在 run() 持有的 counters 里,任何返回路径都会把它带进 RunResult。
+    // max_tokens 续写总数:放在 run() 持有的 counters 里,任何返回路径都会把它带进
+    // RunResult。它只用于报告,不用于封顶。
     const continuations = &counters.continuations;
+    // 连续续写计数:防止模型一直撞上限导致无限续写,上限 MAX_CONTINUATIONS 次。
+    // 一旦某轮不再以 max_tokens 收尾,或这轮带了 tool_use(模型已恢复并在行动),
+    // 就归零。按整个 Run 累计封顶会把"偶尔一轮想太长、续写后就恢复"的长任务在
+    // 第 4 次截断时直接判为 max_tokens_exhausted。
+    var continuation_streak: u32 = 0;
     // 上一轮以 max_tokens 续写提示收尾 → 下一个 turn 边界不消费 UI 队列(见 drainUiEvents)。
     var continuation_pending = false;
     // 输出语义通道:每个 provider stream 一个可见输出段,定性在 loop **真正知道**时才发。
@@ -1917,6 +2256,8 @@ fn runCounted(
     defer output_channel.close(.partial, "");
     var verification_nudges: u8 = 0;
     var required_first_repairs: u8 = 0;
+    // Re-issues under `max_stream_turn_retries` / `retractable_stream_retries`:
+    // the Run's count. The per-request allowance is counted per turn below.
     var stream_turn_retries: u8 = 0;
     var requirement_ledger_state = requirement_ledger_mod.State{};
     var delivery_cadence_state = delivery_cadence_mod.State{};
@@ -1957,12 +2298,26 @@ fn runCounted(
     defer if (opts.test_integrity) |integrity| if (depth == 0) recordTestIntegrity(&opts, integrity, &test_integrity_state, allocator);
     var stop_hook_active = false;
     defer if (opts.check_gate) |gate| recordCheckGate(&opts, gate, &check_gate_state);
+    // Isolated verifier (isolated_verifier.zig): armed beside the check gate
+    // at depth 0. The task statement and the run-start HEAD are fixed here,
+    // before any work; the record is emitted once per armed run.
+    const verifier_armed = opts.isolated_verifier != null and opts.check_gate != null and depth == 0;
+    var verifier_gate = isolated_verifier_mod.Gate{};
+    defer verifier_gate.deinit(allocator);
+    defer if (verifier_armed) recordIsolatedVerifier(&opts, opts.isolated_verifier.?, &verifier_gate);
+    var verifier_borrowed_turns: u32 = 0;
+    if (verifier_armed) {
+        verifier_gate.task_statement = try allocator.dupe(u8, latestUserText(conversation));
+        verifier_gate.base_head = @import("../agents/isolation.zig").headOf(allocator, opts.cwd_abs, opts.abort);
+    }
     // 元规则①:全部 host 注入共享一个计量器——各门自证有界不蕴含合成
     // 有界(Lean HostInjectionMeter.consumed_never_exceeds_cap 对任意门
     // 序列量化)。
     var host_injection_meter = @import("host_injection_meter.zig").Meter{};
     defer if (opts.requirement_ledger or opts.requirement_ledger_observe) recordRequirementLedger(&opts, &requirement_ledger_state, &verification_progress);
     defer if (opts.verification_final_gate or opts.verification_final_observe) recordVerificationFinalGate(&opts, &verification_progress, verification_nudges);
+    // At most this many max_tokens continuations in a row; the streak resets
+    // whenever a turn ends without the cut or carries a tool call.
     const MAX_CONTINUATIONS: u32 = 3;
 
     // Governed lexical recall is run-scoped: the model proposes aliases and
@@ -2003,7 +2358,7 @@ fn runCounted(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns +| learning_borrowed_turns) : (turns += 1) {
+    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns +| learning_borrowed_turns +| verifier_borrowed_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
@@ -2030,7 +2385,27 @@ fn runCounted(
         // post-execution gate must check it too. The phase only changes in
         // the end-turn branch, which leaves the iteration, so the value holds
         // for the whole iteration.
-        const in_learning_pass = learning_state.active();
+        // A verifier leads round (isolated_verifier.zig §6) is a host pass
+        // too: read-only, outside the attempt, so the same skips apply.
+        if (verifier_gate.leads == .active) {
+            verifier_gate.leads_turns += 1;
+            if (verifier_gate.leads_turns > isolated_verifier_mod.LEADS_MAX_TURNS) {
+                // The round kept calling tools: the second verifier gets no
+                // leads, and the boundary's verdict is final either way.
+                log.info("agent", "verifier leads round cut at {d} turns", .{isolated_verifier_mod.LEADS_MAX_TURNS});
+                verifier_gate.leads = .idle;
+                switch (try verifierAfterLeads(allocator, &opts, &verifier_gate, provider, tool_defs, permission_ctx, sess, &check_gate_state, "")) {
+                    .continue_run => |text| {
+                        defer allocator.free(text);
+                        output_channel.final_sealed = false;
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    },
+                    .stand, .exhausted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls }),
+                }
+            }
+        }
+        const in_learning_pass = learning_state.active() or verifier_gate.leads == .active;
 
         // 转后台请求(Ctrl+B):turn 边界检查——此刻 conversation 干净(上轮 tool_result 已 append),
         // 返回 .backgrounded 让调用方深拷贝转后台续跑。**只在 turn 开头查**(run 是同步循环,无中途
@@ -2280,7 +2655,7 @@ fn runCounted(
         var previous_model_compact_outcome: AutoCompactOutcome = .not_needed;
         if (model_switch_compact) |msc| {
             if (!std.mem.eql(u8, msc.previous_model, provider.model()) and msc.previous_context_window > msc.current_context_window) {
-                previous_model_compact_outcome = try runAutoCompactIfNeeded(
+                previous_model_compact_outcome = try runAutoCompactControlled(
                     conversation,
                     provider,
                     effective_system_prompt,
@@ -2306,17 +2681,16 @@ fn runCounted(
                     opts.request_gate,
                     opts.abort,
                     opts.goal_meter,
+                    opts.compaction_control,
+                    false,
                 );
-                if (previous_model_compact_outcome == .api_error) {
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
-                }
-                if (previous_model_compact_outcome == .aborted) {
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+                if (compactStopReason(previous_model_compact_outcome, opts.abort)) |stop_reason| {
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
                 }
             }
         }
         if (previous_model_compact_outcome != .skipped_no_savings) {
-            const pre_sampling_compact = try runAutoCompactIfNeeded(
+            const pre_sampling_compact = try runAutoCompactControlled(
                 conversation,
                 provider,
                 effective_system_prompt,
@@ -2342,12 +2716,11 @@ fn runCounted(
                 opts.request_gate,
                 opts.abort,
                 opts.goal_meter,
+                opts.compaction_control,
+                false,
             );
-            if (pre_sampling_compact == .api_error) {
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
-            }
-            if (pre_sampling_compact == .aborted) {
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+            if (compactStopReason(pre_sampling_compact, opts.abort)) |stop_reason| {
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
             }
         }
 
@@ -2468,6 +2841,13 @@ fn runCounted(
         // history 后重试。同一 turn 内重试,不把恢复尝试计成新 turn。
         var context_recovery = ContextRecoveryState{ .cap = @max(conversation.len(), 1) };
         model_error.beginRequest();
+        // Re-issues of this model request under `STREAM_RETRIES_PER_REQUEST`
+        // (#461): a fresh allowance for every request, so an earlier turn's
+        // re-issue cannot use it up.
+        var request_stream_retries: u8 = 0;
+        // The Run's count when this request started: the Run allowance this
+        // request may still draw on, and how many of its re-issues it made.
+        const run_stream_retries_at_request = stream_turn_retries;
         var turn_stop_reason: api_stream.StopReason = .unknown;
         var rid_for_turn: log.RequestId = undefined;
         // Re-issue counter for this turn. A context recovery or a mid-stream
@@ -2673,10 +3053,11 @@ fn runCounted(
             // — and a later resume's journal validation rejects the duplicate.
             // Fold every same-turn re-issue (context recovery *and* bounded
             // mid-stream retry) into the recorded generation; each outer
-            // `continue :request_recovery` advances exactly one of the two, so
-            // the sum strictly increases per turn.
+            // `continue :request_recovery` advances exactly one of the three
+            // counters, so the sum strictly increases per turn.
             const attempt_generation = context_recovery.attempts +
-                @as(usize, stream_turn_retries);
+                @as(usize, stream_turn_retries) +
+                @as(usize, request_stream_retries);
             if (!retry_ui.prepare(
                 request_sha256,
                 turns + 1,
@@ -2730,9 +3111,49 @@ fn runCounted(
                     .turn = turns + 1,
                     .attempt = @intCast(@min(context_recovery.attempts, std.math.maxInt(u32))),
                     .elapsed_ms = elapsedSinceNs(model_request_started_ns),
-                    .outcome = if (err == error.ContextWindowExceeded) "context_window_exceeded" else "api_error",
+                    .outcome = if (err == error.ContextWindowExceeded)
+                        "context_window_exceeded"
+                    else if (err == error.DurableCapacityExceeded)
+                        "durable_capacity_deferred"
+                    else
+                        "api_error",
                 } });
                 switch (err) {
+                    // Refused before any network I/O by the durable-state
+                    // owner, which asks for compaction first (issue #430).
+                    error.DurableCapacityExceeded => switch (recoverDurableCapacity(.{
+                        .conversation = conversation,
+                        .provider = provider,
+                        .system_prompt = effective_system_prompt,
+                        .inject_user_context = opts.inject_user_context,
+                        .synthetic_user_input = synthetic_user_input,
+                        .tool_defs = provider_tool_defs,
+                        .model_override = opts.model_override,
+                        .numbers = .{},
+                        .keep_recent = opts.auto_compact_keep_recent,
+                        .backend = backend,
+                        .sess = sess,
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .state = &context_recovery,
+                        .turn_number = turns + 1,
+                        .context_warning_emitted = &context_warning_emitted,
+                        .allocator = allocator,
+                        .tasks = opts.tasks,
+                        .hookset = permission_ctx.hooks,
+                        .summary_reserve_tokens = &compact_summary_reserve_tokens,
+                        .request_gate = opts.request_gate,
+                        .abort = opts.abort,
+                        .goal_meter = opts.goal_meter,
+                        .control = opts.compaction_control,
+                    })) {
+                        .retry => continue :request_recovery,
+                        .aborted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls }),
+                        // The owner recorded its terminal (a refused
+                        // replacement, or the deferred request abandoned):
+                        // its outcome, not a model failure, explains the stop.
+                        .owner_terminal => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls }),
+                    },
                     error.ContextWindowExceeded => {
                         if (!recoverContextWindowExceeded(.{
                             .conversation = conversation,
@@ -2758,6 +3179,7 @@ fn runCounted(
                             .request_gate = opts.request_gate,
                             .abort = opts.abort,
                             .goal_meter = opts.goal_meter,
+                            .control = opts.compaction_control,
                         })) {
                             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
                         }
@@ -2808,7 +3230,7 @@ fn runCounted(
             var aborted_during_stream = false;
             var stream_error = false;
             // Which error ended the stream (null = none, or a context-window frame).
-            // Only connection-shaped failures qualify for SILENT_STREAM_RETRY_FLOOR.
+            // Only connection-shaped failures qualify for STREAM_RETRIES_PER_REQUEST.
             var stream_failure: ?anyerror = null;
             var stream_context_window_exceeded = false;
             var response_usage = @import("cache_break.zig").ResponseUsage{};
@@ -2959,12 +3381,20 @@ fn runCounted(
                         // started here it would run before the user answered.
                         const needs_confirm = if (permission_ctx.confirm_gate) |gate| gate.requires(tu.id, tu.name) else false;
                         if (prefetch_enabled and not_aborted and activation_allows_prefetch and !after_root_move and !needs_confirm and sp.isStreamable(tu.name) and
-                            prefetch_ctx.isPrefetchSafe(tu.name) and
-                            tools_mod.isConcurrencySafeInput(tu.name, tu.input_json) and
-                            permission_mod.checkPermission(&pc_prefetch, tu.name, tu.input_json) == .allow)
-                        {
+                            prefetch_ctx.isPrefetchSafe(tu.name))
+                        prefetch: {
+                            // The same argument admission as the authoritative path
+                            // (issue #494): rejected arguments are not prefetched, and
+                            // admitted ones run in their canonical spelling.
+                            const canonical = tools_common.canonicalizeArgs(allocator, tu.input_json) catch break :prefetch;
+                            var canonical_owned = true;
+                            defer if (canonical_owned) allocator.free(canonical);
+                            if (!tools_mod.isConcurrencySafeInput(tu.name, canonical) or
+                                permission_mod.checkPermission(&pc_prefetch, tu.name, canonical) != .allow)
+                                break :prefetch;
                             const last = &tool_uses.items[tool_uses.items.len - 1];
-                            prefetch.start(&prefetch_ctx, last.id, last.name, last.input, rid);
+                            canonical_owned = false;
+                            prefetch.startOwned(&prefetch_ctx, last.id, last.name, canonical, rid);
                         }
                     },
                     .web_search_result => |w| {
@@ -3178,19 +3608,27 @@ fn runCounted(
                 // 残缺 assistant_text 下面会被整体丢弃(不 commit 到 conversation)→ discarded。
                 // 消费者据此丢掉已缓冲的该段字节,不会把残片误当结果。
                 output_channel.close(.discarded, assistant_text.items);
+                // The segment this attempt's text and thinking belonged to.
+                const discarded_segment = output_channel.last_closed;
                 const can_recover_context_error = stream_context_window_exceeded and
                     assistant_text.items.len == 0 and
                     tool_uses.items.len == 0 and
                     assistant_blocks.items.len == 0;
-                // Nothing the user could have watched: no text, thinking or
+                // Something the user could have watched: text, thinking or a
                 // tool call reached the backend in this attempt (usage and
-                // reasoning items are not shown), and the connection gave no
-                // answer at all. See SILENT_STREAM_RETRY_FLOOR.
-                const silent_retry_eligible = assistant_text.items.len == 0 and
-                    thinking_text.items.len == 0 and
-                    tool_uses.items.len == 0 and
-                    assistant_blocks.items.len == 0 and
-                    isSilentRetryFailure(stream_failure);
+                // reasoning items are not shown).
+                const showed_output = assistant_text.items.len != 0 or
+                    thinking_text.items.len != 0 or
+                    tool_uses.items.len != 0 or
+                    assistant_blocks.items.len != 0;
+                // The connection gave no answer at all (isSilentRetryFailure).
+                const connection_failure = isSilentRetryFailure(stream_failure);
+                // The response began a tool call: one the loop received, or
+                // one the parser saw open whose arguments never finished.
+                const tool_call_started = tool_uses.items.len != 0 or stream.toolCallStarted();
+                // See STREAM_RETRIES_PER_REQUEST.
+                const request_retry_eligible = connection_failure and !tool_call_started;
+                const thinking_bytes: u64 = thinking_text.items.len;
                 // 先 join 预取线程再释放 tool_uses(它们 borrow 其字节),防 UAF(Linus HIGH-1)。
                 prefetch.joinAll();
                 for (tool_uses.items) |tu| {
@@ -3234,6 +3672,7 @@ fn runCounted(
                         .request_gate = opts.request_gate,
                         .abort = opts.abort,
                         .goal_meter = opts.goal_meter,
+                        .control = opts.compaction_control,
                     })) {
                         return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
                     }
@@ -3244,19 +3683,52 @@ fn runCounted(
                 // re-issue of the same request is safe. Aborts keep their
                 // own path; context-window exhaustion was handled before.
                 const abort_pending = if (opts.abort) |a| a.isAborted() else false;
-                const stream_retry_cap = if (silent_retry_eligible)
-                    @max(opts.max_stream_turn_retries, SILENT_STREAM_RETRY_FLOOR)
+                // The Run's allowance: a host that can take back what it
+                // showed (#452) extends it for a connection that gave no
+                // answer only.
+                const retractable_cap: u8 = if (connection_failure) opts.retractable_stream_retries else 0;
+                const run_retry_cap = @max(opts.max_stream_turn_retries, retractable_cap);
+                const reissue: ?enum { request, run } = if (abort_pending)
+                    null
+                else if (request_retry_eligible and request_stream_retries < STREAM_RETRIES_PER_REQUEST)
+                    .request
+                else if (stream_turn_retries < run_retry_cap)
+                    .run
                 else
-                    opts.max_stream_turn_retries;
-                if (stream_turn_retries < stream_retry_cap and
-                    !abort_pending)
-                {
-                    stream_turn_retries += 1;
-                    log.warnId("agent", rid_for_turn, "mid-stream failure{s} → same-turn retry {d}/{d}", .{
-                        if (silent_retry_eligible) " before any visible output" else "",
-                        stream_turn_retries,
-                        stream_retry_cap,
+                    null;
+                if (reissue) |allowance| {
+                    switch (allowance) {
+                        .request => request_stream_retries += 1,
+                        .run => stream_turn_retries += 1,
+                    }
+                    const run_used: u32 = stream_turn_retries - run_stream_retries_at_request;
+                    const failed_streams: u32 = @as(u32, request_stream_retries) + run_used;
+                    log.warnId("agent", rid_for_turn, "mid-stream failure{s} → same-turn retry {d} ({s} allowance)", .{
+                        if (showed_output) " after visible output" else "",
+                        failed_streams,
+                        @tagName(allowance),
                     });
+                    if (showed_output) {
+                        // Every attempt this request may make: the first, its
+                        // own re-issue (when this failure qualifies for it or
+                        // it was spent), and what is left of the Run's.
+                        const own: u8 = if (request_retry_eligible) STREAM_RETRIES_PER_REQUEST else request_stream_retries;
+                        const max_streams: u32 = 1 + @as(u32, own) +
+                            @as(u32, run_retry_cap -| run_stream_retries_at_request);
+                        announceRetractedAttempt(
+                            backend,
+                            sess,
+                            discarded_segment,
+                            thinking_bytes,
+                            failed_streams,
+                            @max(max_streams, failed_streams + 1),
+                            opts.stream_retry_backoff_ms,
+                        );
+                        if (!waitStreamRetryBackoff(opts.abort, opts.stream_retry_backoff_ms)) {
+                            log.warnId("agent", rid_for_turn, "aborted during stream retry backoff", .{});
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        }
+                    }
                     continue :request_recovery;
                 }
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
@@ -3364,8 +3836,30 @@ fn runCounted(
         progress_state.observeTurn(visible_model_text_bytes, has_tool_use, util_time.nowNs());
         // 本轮跟着工具调用 → 这段文字是执行过程中的可见说明,不是最终答案。
         if (has_tool_use) output_channel.close(.commentary, assistant_text.items);
+        // 模型这一轮恢复了(没被截断,或带着工具调用往下走)→ 连续续写归零。
+        if (turn_stop_reason != .max_tokens or has_tool_use) continuation_streak = 0;
 
         if (!has_tool_use) {
+            // A verifier leads round ended (isolated_verifier.zig §6): its
+            // reply is the leads text (commentary; the answer before the
+            // round is already final). The fresh verifier on the same
+            // snapshot gives the boundary's final verdict.
+            var leads_just_ended = false;
+            if (verifier_gate.leads == .active) {
+                output_channel.close(.commentary, assistant_text.items);
+                verifier_gate.leads = .idle;
+                leads_just_ended = true;
+                switch (try verifierAfterLeads(allocator, &opts, &verifier_gate, provider, tool_defs, permission_ctx, sess, &check_gate_state, assistant_text.items)) {
+                    .continue_run => |text| {
+                        defer allocator.free(text);
+                        output_channel.final_sealed = false;
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    },
+                    .exhausted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls }),
+                    .stand => {},
+                }
+            }
             // A learning pass ended (learning_turn.zig): after distill, go on
             // to reconcile when a lesson was accepted and stored lessons exist;
             // otherwise the run ends with the attempt's own stop reason. No
@@ -3390,9 +3884,10 @@ fn runCounted(
                 log.infoId("agent", rid, "learning turn done passes={d} lessons={d} refused={d}", .{ report.passes, report.lessons_accepted, report.lessons_refused });
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
-            if (turn_stop_reason == .max_tokens and continuations.* >= MAX_CONTINUATIONS) {
+            if (turn_stop_reason == .max_tokens and continuation_streak >= MAX_CONTINUATIONS) {
                 // The provider cut this turn at its output-token limit again
-                // after the last allowed continuation, and the turn has no
+                // after the last allowed consecutive continuation (no turn in
+                // between ended normally or called a tool), and the turn has no
                 // tool call to act on. Any text it streamed is the visible
                 // prefix of an answer that never finished, so it closes as
                 // partial and the Run ends in the explicit exhaustion state,
@@ -3439,15 +3934,16 @@ fn runCounted(
                 continue;
             }
             // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
-            // 注入 continue 提示让它接着写,而不是当作完成。最多 MAX_CONTINUATIONS 次。
-            if (turn_stop_reason == .max_tokens and continuations.* < MAX_CONTINUATIONS) {
+            // 注入 continue 提示让它接着写,而不是当作完成。最多连续 MAX_CONTINUATIONS 次。
+            if (turn_stop_reason == .max_tokens and continuation_streak < MAX_CONTINUATIONS) {
+                continuation_streak += 1;
                 continuations.* += 1;
                 // 被 token 上限截断 → 本段与同 group 的下一段合成一个完整结果,单独任何一段
                 // 都不是 final(`stream_done` 更不是)。
                 output_channel.close(.continued, assistant_text.items);
-                log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d}", .{ continuations.*, MAX_CONTINUATIONS });
+                log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d} (run total {d})", .{ continuation_streak, MAX_CONTINUATIONS, continuations.* });
                 // L4 诊断:续写。
-                backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations.*, .max = MAX_CONTINUATIONS } });
+                backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuation_streak, .max = MAX_CONTINUATIONS } });
                 try conversation.appendHostText("Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
                 continuation_pending = true;
                 continue;
@@ -3727,6 +4223,50 @@ fn runCounted(
                     @tagName(outcome.verdict), outcome.passed, outcome.total, outcome.exit_code, @tagName(decision), check_gate_state.continuations, gate.max_continuations,
                 });
                 check_gate_state.noteDecision(decision);
+                // Isolated verifier: only after a green, untainted pinned
+                // check, at most MAX_VERIFIER_BOUNDARIES times per run.
+                if (verifier_armed and outcome.verdict == .passed and verifier_gate.canStartBoundary()) {
+                    const verifier = opts.isolated_verifier.?;
+                    verifier_gate.boundaries += 1;
+                    backend.emitEvent(sess, .{ .set_current_tool = .{ .name = "running the isolated verifier" } });
+                    var vresult = try verifierSpawn(allocator, &verifier_gate, verifier, verifierDeps(&opts, provider, tool_defs, permission_ctx, sess), root, .{ .command = gate.command, .passed = outcome.passed, .total = outcome.total }, null);
+                    defer vresult.deinit();
+                    backend.emitEvent(sess, .clear_current_tool);
+                    log.infoId("agent", rid, "isolated verifier boundary={d} result={s}", .{ verifier_gate.boundaries, @tagName(vresult.outcome) });
+                    if (opts.abort) |a| if (a.isAborted()) {
+                        verifier_gate.dropSnapshot();
+                        output_channel.close(.final, assistant_text.items);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                    };
+                    const leads_round = verifier.mode == .enforce and vresult.outcome == .unverified and
+                        check_gate_state.continuations < gate.max_continuations;
+                    if (leads_round) {
+                        // One leads round (§6): it consumes a continuation
+                        // of the check gate's budget. The answer is final
+                        // now; the round's reply is commentary unless a
+                        // post-leads FAIL sends the run back to work.
+                        check_gate_state.noteDecision(.continue_run);
+                        verifier_gate.leads = .active;
+                        verifier_gate.leads_turns = 0;
+                        verifier_gate.leads_rounds += 1;
+                        verifier_borrowed_turns +|= isolated_verifier_mod.LEADS_MAX_TURNS + 1;
+                        const text = try isolated_verifier_mod.renderLeadsRequest(allocator, vresult.outcome.unverified.not_established);
+                        defer allocator.free(text);
+                        output_channel.close(.final, assistant_text.items);
+                        output_channel.final_sealed = true;
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    }
+                    switch (try verifierConclude(allocator, &verifier_gate, verifier, gate, &check_gate_state, &vresult)) {
+                        .continue_run => |text| {
+                            defer allocator.free(text);
+                            output_channel.close(.commentary, assistant_text.items);
+                            try conversation.appendHostText(text);
+                            continue :outer_turn;
+                        },
+                        .stand, .exhausted => {},
+                    }
+                }
                 if (decision == .continue_run) {
                     const text = try check_gate_mod.renderContinuation(allocator, gate, &outcome, &check_gate_state);
                     defer allocator.free(text);
@@ -3761,7 +4301,7 @@ fn runCounted(
                 if (stop.blocked) log.warnId("agent", rid, "Stop hook asked to continue again; block budget {d} spent, finishing", .{check_gate_mod.MAX_STOP_HOOK_BLOCKS});
             };
             // 自然 end_turn 且无任何主机异议 → 这一段(连同同 group 的续写段)就是最终结果。
-            if (test_integrity_state.armed) test_integrity_state.noteFinalAnswer(assistant_text.items);
+            if (test_integrity_state.armed and !leads_just_ended) test_integrity_state.noteFinalAnswer(assistant_text.items);
             output_channel.close(.final, assistant_text.items);
             // Learning turn (learning_turn.zig): the answer is final; decide on
             // the verdict the check gate left at this workspace.
@@ -3820,6 +4360,7 @@ fn runCounted(
             .depth = depth,
             .rid = rid,
             .learning_pass = learning_state.active(),
+            .verifier_leads = verifier_gate.leads == .active,
         };
         var code_bridge = CodeBridge{
             .gpa = allocator,
@@ -4527,7 +5068,7 @@ fn runCounted(
         // This is the explicit Rust/metacode "post_sampling_follow_up_threshold"
         // equivalent; the next loop's pre-sampling check would be close, but this
         // makes the follow-up boundary a real trigger point with its own cause.
-        const post_tool_compact = try runAutoCompactIfNeeded(
+        const post_tool_compact = try runAutoCompactControlled(
             conversation,
             provider,
             effective_system_prompt,
@@ -4553,12 +5094,11 @@ fn runCounted(
             opts.request_gate,
             opts.abort,
             opts.goal_meter,
+            opts.compaction_control,
+            false,
         );
-        if (post_tool_compact == .api_error) {
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
-        }
-        if (post_tool_compact == .aborted) {
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+        if (compactStopReason(post_tool_compact, opts.abort)) |stop_reason| {
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
         // L4 诊断:turn span 终点(本轮有 tool_use、将进入下一轮的正常路径;无工具的
@@ -4780,7 +5320,9 @@ fn buildApiMessages(
     }
 
     for (conversation.activeMessages()) |m| {
-        // thinking block 不回 API(模型自己产);先算实际要回的 block 数
+        // thinking 块随消息投影,由方言决定是否上 wire(`ModelProfile.echoes_reasoning_content`):
+        // DeepSeek 要求回传历史思考,Claude 拒收无签名的 thinking 块,其余方言忽略它。
+        // 它和 reasoning_item 一样**不足以**撑起一条消息。
         var n_actual: usize = 0;
         // reasoning_item 是 provider 私有的续传状态,不是"内容":只有 OpenAI
         // Responses 序列化器会用它,别的方言整块跳过。它单独存在时**不足以**
@@ -4789,8 +5331,7 @@ fn buildApiMessages(
         // 这里是针对外部/未来版本 transcript 的防线,而不是热路径。
         var n_substantive: usize = 0;
         for (m.blocks) |b| switch (b) {
-            .thinking => {},
-            .reasoning_item => n_actual += 1,
+            .thinking, .reasoning_item => n_actual += 1,
             else => {
                 n_actual += 1;
                 n_substantive += 1;
@@ -4814,7 +5355,7 @@ fn buildApiMessages(
                 } },
                 .image => |img| .{ .image = .{ .media_type = img.media_type, .data = img.data } },
                 .reasoning_item => |item| .{ .reasoning_item = .{ .model = item.model, .json = item.json } },
-                .thinking => continue, // 不发回 API
+                .thinking => |t| .{ .thinking = t }, // 借用;是否上 wire 由方言决定
             };
             contents[idx] = c;
             idx += 1;
@@ -5079,7 +5620,31 @@ fn estimateNextRequestTokensOrFallback(
     };
 }
 
-const AutoCompactOutcome = enum { not_needed, compacted, skipped_no_savings, aborted, api_error };
+const AutoCompactOutcome = enum {
+    not_needed,
+    compacted,
+    skipped_no_savings,
+    /// The Run was cancelled while compacting.
+    aborted,
+    /// The durable-state owner refused the replacement at the commit point
+    /// (issue #430). It recorded its own terminal; the Run stops the way a
+    /// request the owner refused stops, never as a cancellation.
+    refused,
+    api_error,
+};
+
+/// The stop a compaction outcome imposes on the Run, or null when the Run
+/// continues. One mapping for every boundary, so a new outcome cannot be
+/// silently treated as "continue".
+fn compactStopReason(outcome: AutoCompactOutcome, abort: ?*const AbortSignal) ?StopReason {
+    return switch (outcome) {
+        .not_needed, .compacted, .skipped_no_savings => null,
+        .aborted => stopReasonForAbort(abort),
+        // A refused replacement ends where a refused owner admission ends: a
+        // failed request whose reason is the owner's recorded outcome.
+        .refused, .api_error => .api_error,
+    };
+}
 
 fn serializeToolSchemasForCache(
     allocator: std.mem.Allocator,
@@ -5158,6 +5723,10 @@ const RecoveryArgs = struct {
     request_gate: ?request_gate_mod.Gate,
     abort: ?*const AbortSignal,
     goal_meter: ?*@import("goal.zig").Meter,
+    /// The durable-state owner (issue #430). When present the recovery
+    /// compaction reports to it and the trim fallback is off: trimming would
+    /// rewrite durable history outside the guarded commit.
+    control: ?compaction_control.Control = null,
 };
 
 /// The server rejected the pending request as too large. Turn that into a
@@ -5228,7 +5797,7 @@ fn recoverContextWindowExceeded(args: RecoveryArgs) bool {
     // 3. Summary compaction, once per turn.
     if (st.compact_retries < CONTEXT_RECOVERY_COMPACT_RETRIES) {
         st.compact_retries += 1;
-        const outcome = runAutoCompactIfNeeded(
+        const outcome = runAutoCompactControlled(
             conversation,
             provider,
             args.system_prompt,
@@ -5254,17 +5823,34 @@ fn recoverContextWindowExceeded(args: RecoveryArgs) bool {
             args.request_gate,
             args.abort,
             args.goal_meter,
+            args.control,
+            false,
         ) catch |err| {
             log.err("agent", "context-window recovery compaction failed turn={d}: {s}", .{ args.turn_number, @errorName(err) });
+            noteUnrecoveredContextWindow(args.abort);
             return false;
         };
         switch (outcome) {
             .compacted => return true,
-            .api_error, .aborted => return false,
+            // Cancelled, or the durable-state owner refused the replacement
+            // and recorded its own terminal: not a context-window failure.
+            .aborted, .refused => return false,
+            .api_error => {
+                noteUnrecoveredContextWindow(args.abort);
+                return false;
+            },
             // Nothing droppable (active window already ≤ keep_recent) or the
             // savings gate refused: fall through to the trim.
             .not_needed, .skipped_no_savings => {},
         }
+    }
+
+    // A durable-state owner keeps history behind its guarded commit: no trim.
+    // The rejection stands, bounded at one compaction per turn (issue #430).
+    if (args.control != null) {
+        log.err("agent", "context-window recovery exhausted turn={d}: compaction could not make the request fit and trimming is disabled for durable state", .{args.turn_number});
+        noteUnrecoveredContextWindow(args.abort);
+        return false;
     }
 
     // 4. Last resort: shave the oldest pair. Invalidate the anchor first so
@@ -5290,6 +5876,89 @@ fn recoverContextWindowExceeded(args: RecoveryArgs) bool {
         .cause = "context_window_exceeded_trim",
     } });
     return true;
+}
+
+/// The Run is about to stop because the context window still refuses the
+/// request. A recovery summary request may have succeeded in between and
+/// cleared the rejection the Run will report; say what actually stopped it.
+fn noteUnrecoveredContextWindow(abort: ?*const AbortSignal) void {
+    if (abort) |signal| if (signal.isAborted()) return;
+    model_error.noteContextWindowUnrecovered(
+        "The request exceeds the model's context window and automatic compaction could not make it fit.",
+    );
+}
+
+const DurableRecovery = enum {
+    /// Re-issue the same turn.
+    retry,
+    /// The Run was cancelled.
+    aborted,
+    /// The owner recorded the Run's terminal: it refused the replacement, or
+    /// the loop gave up on the deferred request and told it so.
+    owner_terminal,
+};
+
+/// The durable-state owner deferred the pending request
+/// (`error.DurableCapacityExceeded`): compact once for its capacity, then
+/// re-issue the same turn. A compaction that relieved nothing has told the
+/// owner so through `settle`, and the re-issued request then meets the
+/// owner's real refusal and its terminal outcome — the recovery cannot loop
+/// (issue #430). When the loop stops without re-issuing (the turn's recovery
+/// bound is spent, or the compaction itself failed) it abandons the deferred
+/// request to the owner, which records the same refusal, so the Run never
+/// ends as an unexplained provider failure.
+fn recoverDurableCapacity(args: RecoveryArgs) DurableRecovery {
+    // Only a durable-state owner defers; without one there is nobody to ask.
+    const control = args.control orelse unreachable;
+    const st = args.state;
+    st.attempts += 1;
+    if (st.attempts > st.cap) {
+        log.err("agent", "durable-capacity recovery exhausted turn={d} attempts={d}", .{ args.turn_number, st.attempts });
+        control.abandonDeferred();
+        return .owner_terminal;
+    }
+    const outcome = runAutoCompactControlled(
+        args.conversation,
+        args.provider,
+        args.system_prompt,
+        args.inject_user_context,
+        args.synthetic_user_input,
+        args.tool_defs,
+        args.model_override,
+        null,
+        null,
+        args.keep_recent,
+        "durable_capacity_recovery",
+        false,
+        args.backend,
+        args.sess,
+        args.trace_id,
+        args.depth,
+        args.turn_number,
+        args.context_warning_emitted,
+        args.allocator,
+        args.tasks,
+        args.hookset,
+        args.summary_reserve_tokens,
+        args.request_gate,
+        args.abort,
+        args.goal_meter,
+        args.control,
+        true,
+    ) catch |err| {
+        log.err("agent", "durable-capacity compaction failed turn={d}: {s}", .{ args.turn_number, @errorName(err) });
+        control.abandonDeferred();
+        return .owner_terminal;
+    };
+    return switch (outcome) {
+        .aborted => .aborted,
+        .refused => .owner_terminal,
+        .api_error => {
+            control.abandonDeferred();
+            return .owner_terminal;
+        },
+        .compacted, .not_needed, .skipped_no_savings => .retry,
+    };
 }
 
 /// 构造 PostCompact hook 的 stdin JSON(summary 是自由文本须 JSON 转义)。
@@ -5401,7 +6070,104 @@ fn runAutoCompactIfNeeded(
     abort: ?*const AbortSignal,
     goal_meter: ?*@import("goal.zig").Meter,
 ) !AutoCompactOutcome {
+    return runAutoCompactControlled(
+        conversation,
+        provider,
+        system_prompt,
+        inject_user_context,
+        synthetic_user_input,
+        tool_defs,
+        model_override,
+        compact_model_override,
+        configured_threshold,
+        keep_recent,
+        trigger_cause,
+        forced,
+        backend,
+        sess,
+        trace_id,
+        depth,
+        turn,
+        context_warning_emitted,
+        allocator,
+        tasks,
+        hookset,
+        summary_reserve_tokens,
+        request_gate,
+        abort,
+        goal_meter,
+        null,
+        false,
+    );
+}
+
+/// Commits a kernel replacement only when the durable-state owner allows it
+/// (issue #430). Same suffix check and abort rule as the kernel's default.
+const ControlledCommit = struct {
+    control: compaction_control.Control,
+
+    fn commit(
+        raw: *anyopaque,
+        live: *Conversation,
+        suffix: *const Conversation.SuffixSnapshot,
+        replacement: *Conversation,
+        signal: *const AbortSignal,
+    ) compact_kernel.CommitResult {
+        const self: *ControlledCommit = @ptrCast(@alignCast(raw));
+        if (signal.isAborted()) return .aborted;
+        if (!self.control.allowCommit(replacement)) return .refused;
+        return if (live.replaceWithOwnedIfSuffixUnchanged(suffix, replacement))
+            .committed
+        else
+            .concurrent_mutation;
+    }
+};
+
+/// `runAutoCompactIfNeeded` reporting to the durable-state owner's control
+/// (issue #430). `durable_recovery` is the same-turn answer to
+/// `error.DurableCapacityExceeded`: compaction is forced like a context-window
+/// recovery, but the owner's capacity, not the window, asked for it.
+fn runAutoCompactControlled(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+    compact_model_override: ?[]const u8,
+    configured_threshold: ?usize,
+    keep_recent: usize,
+    requested_cause: []const u8,
+    forced: bool,
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    turn: u32,
+    context_warning_emitted: ?*bool,
+    allocator: std.mem.Allocator,
+    tasks: ?*@import("task_store.zig").TaskStore,
+    hookset: ?*const hooks_mod.HookSet,
+    summary_reserve_tokens: ?*usize,
+    request_gate: ?request_gate_mod.Gate,
+    abort: ?*const AbortSignal,
+    goal_meter: ?*@import("goal.zig").Meter,
+    control: ?compaction_control.Control,
+    durable_recovery: bool,
+) !AutoCompactOutcome {
     var outcome: AutoCompactOutcome = .not_needed;
+    // Durable pressure is the owner's to declare: it deferred the pending
+    // request (durable_recovery), or it asks at this boundary.
+    const durable_pressure = if (control) |c|
+        durable_recovery or (!forced and c.wantsCompaction())
+    else
+        false;
+    const trigger: compaction_control.Trigger = if (durable_pressure) .durable_capacity else .context_window;
+    const trigger_cause: []const u8 = if (durable_pressure and !durable_recovery)
+        "durable_capacity_threshold"
+    else
+        requested_cause;
 
     var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
     var pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
@@ -5413,7 +6179,12 @@ fn runAutoCompactIfNeeded(
         @max(pressure.auto_compact_threshold, MIN_AUTO_COMPACT_THRESHOLD);
     const micro_threshold = forced_threshold orelse
         @max(@min(pressure.warning_threshold, auto_threshold), MIN_AUTO_COMPACT_THRESHOLD);
-    if (!forced and request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
+    // Both tool-result passes rewrite committed history in place. A
+    // durable-state owner admits durable changes only through the kernel's
+    // guarded commit, so with a control installed they do not run; the
+    // kernel's own reduction of its preview still does (issue #430).
+    const in_place_reduction = control == null;
+    if (in_place_reduction and !forced and !durable_pressure and request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
         var reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
         // Clearing deliberately preserves the most recent results, and skips
         // anything whose artifact envelope is its only recovery capability.
@@ -5435,7 +6206,7 @@ fn runAutoCompactIfNeeded(
         }
     }
 
-    if (forced or request_tokens_before >= auto_threshold) {
+    if (forced or durable_pressure or request_tokens_before >= auto_threshold) {
         // PreCompact hook(压缩前):喂 {trigger, active_msgs, tokens},side-effect(如存盘/记忆快照),非阻塞。
         if (hookset) |hs| if (hs.hasPreCompact()) {
             const pre_json = std.fmt.allocPrint(allocator, "{{\"hook_event_name\":\"PreCompact\",\"trigger\":\"{s}\",\"active_messages\":{d},\"tokens\":{d}}}", .{ trigger_cause, conversation.activeMessages().len, request_tokens_before }) catch null;
@@ -5447,8 +6218,10 @@ fn runAutoCompactIfNeeded(
         const compact_summary = @import("compact_summary.zig");
         const summary_model = compact_model_override orelse model_override;
         const eff_keep_recent = forcedAutoCompactKeep() orelse keep_recent;
-        if (conversation.compactBoundary(eff_keep_recent) <= conversation.compact_boundary)
+        if (conversation.compactBoundary(eff_keep_recent) <= conversation.compact_boundary) {
+            if (durable_pressure) if (control) |c| c.settle(.durable_capacity, .nothing_to_compact);
             return outcome;
+        }
         // 任务锚:进行中的任务确定性追加到摘要尾(压缩有损,闭环纪律硬保底)。
         const task_anchor: ?[]u8 = if (tasks) |ts| compact_summary.buildTaskAnchor(allocator, ts) else null;
         defer if (task_anchor) |a| allocator.free(a);
@@ -5505,12 +6278,21 @@ fn runAutoCompactIfNeeded(
         };
         var local_abort = AbortSignal.init();
         const signal = abort orelse &local_abort;
+        var controlled_commit: ControlledCommit = undefined;
+        if (control) |c| {
+            controlled_commit = .{ .control = c };
+            c.begin(trigger);
+        }
         const report = compact_kernel.run(
             allocator,
             conversation,
             provider,
             signal,
             .{
+                .committer = if (control != null) .{
+                    .ctx = &controlled_commit,
+                    .commit_fn = ControlledCommit.commit,
+                } else null,
                 .keep_recent = eff_keep_recent,
                 .model_override = summary_model,
                 .task_anchor = task_anchor,
@@ -5531,8 +6313,15 @@ fn runAutoCompactIfNeeded(
             },
         ) catch |err| {
             log.warn("agent", "auto-compact kernel failed: {s}", .{@errorName(err)});
+            if (control) |c| c.settle(trigger, .not_committed);
             return .api_error;
         };
+        // The owner settles on the state the Run continues from: after the
+        // PostCompact hook below has extended the summary.
+        defer if (control) |c| c.settle(trigger, switch (report.outcome) {
+            .compacted, .degraded => .{ .committed = conversation },
+            .no_change, .aborted, .refused => .not_committed,
+        });
         // Persist metered usage before the diagnostic event. If the process is
         // hard-killed between the two complete NDJSON records, budget evidence
         // survives even if request-count telemetry is conservatively partial.
@@ -5555,6 +6344,10 @@ fn runAutoCompactIfNeeded(
             .aborted => {
                 compact_lifecycle_outcome = "aborted";
                 return .aborted;
+            },
+            .refused => {
+                compact_lifecycle_outcome = "refused";
+                return .refused;
             },
             .no_change => {
                 if (compact_model_override == null and report.summary_request != null) {
@@ -5608,24 +6401,26 @@ fn runAutoCompactIfNeeded(
     if (outcome == .skipped_no_savings) return outcome;
 
     if (pressure.isAtBlockingLimit()) {
-        var reduced = conversation.microcompactToolResultsByRecentResults(0);
-        // Same rationale as the stale-result valve above, and it matters more
-        // here: at the blocking limit the request is otherwise rejected, so a
-        // single unbounded surviving result is the difference between
-        // recovering and returning api_error.
-        reduced.merge(conversation.truncateLargeToolResults(
-            conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
-        ));
-        if (reduced.changed()) {
-            outcome = .compacted;
-            const before_block_tokens = request_tokens_before;
-            request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-            pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
-            log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
-            // This is the same lossy operation as the earlier stale-result
-            // pressure valve.  Keep the mechanism kind stable; the trigger
-            // cause already records that this happened at the blocking limit.
-            emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
+        if (in_place_reduction) {
+            var reduced = conversation.microcompactToolResultsByRecentResults(0);
+            // Same rationale as the stale-result valve above, and it matters more
+            // here: at the blocking limit the request is otherwise rejected, so a
+            // single unbounded surviving result is the difference between
+            // recovering and returning api_error.
+            reduced.merge(conversation.truncateLargeToolResults(
+                conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
+            ));
+            if (reduced.changed()) {
+                outcome = .compacted;
+                const before_block_tokens = request_tokens_before;
+                request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+                pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
+                log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
+                // This is the same lossy operation as the earlier stale-result
+                // pressure valve.  Keep the mechanism kind stable; the trigger
+                // cause already records that this happened at the blocking limit.
+                emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
+            }
         }
         if (pressure.isAtBlockingLimit()) {
             // A forced recovery already paid for its compaction; the retry the
@@ -5740,6 +6535,51 @@ fn settleCandidate(
     if (observer) |installed| installed.settle(candidate, settlement);
 }
 
+/// A re-issue of an attempt that showed output (#452, #461). The attempt's
+/// text segment has already closed `discarded`; what it showed in thinking is
+/// withdrawn under the same segment identity, then the next attempt is
+/// announced the way a connection retry is: `failed_streams` of at most
+/// `max_streams` failed, and the next starts after `delay_ms`.
+fn announceRetractedAttempt(
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    segment: ?output_semantics.Segment,
+    thinking_bytes: u64,
+    failed_streams: u32,
+    max_streams: u32,
+    delay_ms: u32,
+) void {
+    if (thinking_bytes != 0) if (segment) |closed| backend.emitEvent(sess, .{ .thinking_discarded = .{
+        .index = closed.index,
+        .turn = closed.turn,
+        .group = closed.group,
+        .bytes = thinking_bytes,
+    } });
+    backend.emitEvent(sess, .{ .retry_notice = .{
+        .attempt = failed_streams,
+        .max = max_streams,
+        .delay_ms = delay_ms,
+    } });
+}
+
+/// The wait between a `retry_notice` and the re-issue it announced (#461).
+/// False when the Run was cancelled before or during it: nothing more is sent.
+fn waitStreamRetryBackoff(abort: ?*const AbortSignal, delay_ms: u32) bool {
+    const aborted = struct {
+        fn check(signal: ?*const AbortSignal) bool {
+            return if (signal) |a| a.isAborted() else false;
+        }
+    }.check;
+    var left: u32 = delay_ms;
+    while (left > 0) {
+        if (aborted(abort)) return false;
+        const step = @min(left, 10);
+        util_time.sleepMs(step);
+        left -= step;
+    }
+    return !aborted(abort);
+}
+
 fn estimateInputSchemaTokens(schema: json_mod.InputSchema) usize {
     var total = Conversation.estimateTokens(schema.type);
     if (schema.prop_specs) |props| {
@@ -5847,6 +6687,36 @@ test "buildApiMessages omits thinking-only assistant before continuation" {
     try std.testing.expectEqual(types.MessageRole.user, api.items[0].role);
     try std.testing.expect(api.items[0].content.len > 0);
     for (api.items) |message| try std.testing.expect(message.content.len > 0);
+}
+
+test "buildApiMessages projects thinking in order and borrows its bytes (issue #421)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    try c.appendText(.user, "what time is it");
+    const blocks = try a.alloc(msg.Block, 3);
+    blocks[0] = .{ .thinking = try a.dupe(u8, "need the clock") };
+    blocks[1] = .{ .text = try a.dupe(u8, "checking") };
+    blocks[2] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "get_time"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = blocks });
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+
+    // The trailing tool_use gets a stub result; the assistant message keeps
+    // every block, thinking first, so the dialect can decide.
+    try std.testing.expectEqual(types.MessageRole.assistant, api.items[1].role);
+    const content = api.items[1].content;
+    try std.testing.expectEqual(@as(usize, 3), content.len);
+    try std.testing.expectEqualStrings("need the clock", content[0].thinking);
+    try std.testing.expectEqual(c.messages.items[1].blocks[0].thinking.ptr, content[0].thinking.ptr);
+    try std.testing.expectEqualStrings("checking", content[1].text);
+    try std.testing.expectEqualStrings("get_time", content[2].tool_use.name);
 }
 
 test "buildApiMessages maps tool_use and tool_result" {
@@ -6347,13 +7217,13 @@ test "auto-compact preflight never rewrites an already committed tool_result" {
     try std.testing.expectEqualStrings(body_before, body);
 }
 
-test "auto-compact emits stale tool-result projection from the real microcompact path" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    try c.appendText(.user, "inspect the accumulated results");
+/// One user prompt, then fourteen 12 KB tool results: enough stale results
+/// for the microcompact pass to clear all but the most recent.
+const STALE_TOOL_RESULT_COUNT = 14;
 
-    const result_count = 14;
+fn staleToolResultFixture(a: std.mem.Allocator, c: *Conversation) !void {
+    try c.appendText(.user, "inspect the accumulated results");
+    const result_count = STALE_TOOL_RESULT_COUNT;
     const tool_uses = try a.alloc(msg.Block, result_count);
     for (tool_uses, 0..) |*block, index| {
         var id_buf: [24]u8 = undefined;
@@ -6379,6 +7249,14 @@ test "auto-compact emits stale tool-result projection from the real microcompact
         } };
     }
     try c.append(.{ .role = .user, .blocks = tool_results });
+}
+
+test "auto-compact emits stale tool-result projection from the real microcompact path" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try staleToolResultFixture(a, &c);
+    const result_count = STALE_TOOL_RESULT_COUNT;
 
     var provider_state = TestProviderState{
         .allocator = a,
@@ -6460,6 +7338,56 @@ test "auto-compact emits stale tool-result projection from the real microcompact
         @as(u32, result_count - conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP),
         cap.changed_items,
     );
+}
+
+test "issue #430: with a compaction control no in-place tool-result reduction rewrites durable history" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try staleToolResultFixture(a, &c);
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .max_input_tokens = 100_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    // The same pending request the previous test clears stale results for:
+    // inside the microcompact band, below the auto-compact threshold.
+    const base_tokens = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    const target_tokens: usize = 51_000;
+    const padding_len = if (base_tokens < target_tokens) (target_tokens - base_tokens) * 4 else 0;
+    const system_prompt = try a.alloc(u8, padding_len);
+    defer a.free(system_prompt);
+    @memset(system_prompt, 's');
+    const before_tokens = try estimateNextRequestTokens(a, provider, &c, system_prompt, null, null, &.{}, null);
+    const pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), null, before_tokens);
+    try std.testing.expect(before_tokens > pressure.warning_threshold);
+    try std.testing.expect(before_tokens < pressure.auto_compact_threshold);
+
+    const Capture = struct {
+        projections: u32 = 0,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev == .context_projection) self.projections += 1;
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    const version = c.mutation_version;
+    var recorder = compaction_control.Recorder{};
+    const outcome = try runAutoCompactControlled(&c, provider, system_prompt, null, null, &.{}, null, null, null, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
+    // Nothing ran: no clearing, no truncation, no compaction attempt.
+    try std.testing.expectEqual(AutoCompactOutcome.not_needed, outcome);
+    try std.testing.expectEqual(@as(u32, 0), cap.projections);
+    try std.testing.expectEqual(version, c.mutation_version);
+    try std.testing.expectEqual(@as(u32, 0), recorder.begins);
+    for (c.messages.items[2].blocks) |block| switch (block) {
+        .tool_result => |result| try std.testing.expectEqual(@as(usize, 12 * 1024), result.content.len),
+        else => return error.TestUnexpectedResult,
+    };
 }
 
 test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool suffix" {
@@ -6921,6 +7849,162 @@ test "auto-compact charges its summary request to the Run's goal (issue #277)" {
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
     // The summary request's usage (11 in, 7 out) is goal work like any other.
     try std.testing.expectEqual(@as(u64, 18), state.current.?.tokens_used);
+}
+
+fn compactionControlFixture(a: std.mem.Allocator, c: *Conversation) !void {
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+}
+
+const NullBackend = struct {
+    fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+    fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+        return null;
+    }
+};
+
+test "issue #430: a compaction control sees every attempt and its refusal keeps the Conversation" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = NullBackend.emit, .poll = NullBackend.poll };
+
+    // Allowed: begin, one commit check, settled as committed.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
+        var recorder = compaction_control.Recorder{};
+        const outcome = try runAutoCompactControlled(&c, testProvider(&provider_state), null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
+        try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+        try std.testing.expectEqual(@as(u32, 1), recorder.begins);
+        try std.testing.expectEqual(@as(u32, 1), recorder.allow_calls);
+        try std.testing.expectEqual(@as(u32, 1), recorder.committed);
+        try std.testing.expectEqual(compaction_control.Trigger.context_window, recorder.last_trigger.?);
+        try std.testing.expect(c.compact_summary != null);
+    }
+    // Refused at the commit point: refused, nothing replaced.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        const version = c.mutation_version;
+        var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
+        var recorder = compaction_control.Recorder{ .allow = false };
+        const outcome = try runAutoCompactControlled(&c, testProvider(&provider_state), null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
+        // A refusal is the owner's terminal, never reported as a cancellation.
+        try std.testing.expectEqual(AutoCompactOutcome.refused, outcome);
+        try std.testing.expectEqual(@as(u32, 1), recorder.not_committed);
+        try std.testing.expectEqual(@as(u32, 0), recorder.committed);
+        try std.testing.expect(c.compact_summary == null);
+        try std.testing.expectEqual(version, c.mutation_version);
+        try std.testing.expectEqual(@as(usize, 30), c.len());
+    }
+    // Durable pressure alone, far below the token threshold: the owner's
+    // trigger compacts; with nothing compactable it is told so instead.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 2_000_000, .max_tokens = 32_000 };
+        var recorder = compaction_control.Recorder{ .wants = true };
+        const outcome = try runAutoCompactControlled(&c, testProvider(&provider_state), null, null, null, &.{}, null, null, null, 2, "pre_sampling_pending_turn_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
+        try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+        try std.testing.expectEqual(compaction_control.Trigger.durable_capacity, recorder.last_trigger.?);
+        try std.testing.expectEqual(@as(u32, 1), recorder.committed);
+
+        var small = Conversation.init(a);
+        defer small.deinit();
+        try small.appendText(.user, "one");
+        var nothing = compaction_control.Recorder{ .wants = true };
+        const none = try runAutoCompactControlled(&small, testProvider(&provider_state), null, null, null, &.{}, null, null, null, 2, "pre_sampling_pending_turn_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, nothing.control(), false);
+        try std.testing.expectEqual(AutoCompactOutcome.not_needed, none);
+        try std.testing.expectEqual(@as(u32, 0), nothing.begins);
+        try std.testing.expectEqual(@as(u32, 1), nothing.nothing);
+    }
+}
+
+test "issue #430: a refused replacement and an abandoned deferral end the Run as the owner's terminal" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = NullBackend.emit, .poll = NullBackend.poll };
+    // Every boundary maps a refusal to the failed-request stop, and only a
+    // cancellation to `aborted`.
+    try std.testing.expectEqual(@as(?StopReason, .api_error), compactStopReason(.refused, null));
+    try std.testing.expectEqual(@as(?StopReason, .api_error), compactStopReason(.api_error, null));
+    try std.testing.expectEqual(@as(?StopReason, .aborted), compactStopReason(.aborted, null));
+    try std.testing.expectEqual(@as(?StopReason, null), compactStopReason(.compacted, null));
+
+    var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
+    const Args = struct {
+        fn of(c: *Conversation, p: provider_mod.Provider, b: *const UiBackend, st: *ContextRecoveryState, alloc: std.mem.Allocator, control: compaction_control.Control) RecoveryArgs {
+            return .{
+                .conversation = c,
+                .provider = p,
+                .system_prompt = null,
+                .inject_user_context = null,
+                .synthetic_user_input = null,
+                .tool_defs = &.{},
+                .model_override = null,
+                .numbers = .{},
+                .keep_recent = 2,
+                .backend = b,
+                .sess = .single,
+                .trace_id = [_]u8{0} ** 12,
+                .depth = 0,
+                .state = st,
+                .turn_number = 1,
+                .context_warning_emitted = null,
+                .allocator = alloc,
+                .tasks = null,
+                .hookset = null,
+                .summary_reserve_tokens = null,
+                .request_gate = null,
+                .abort = null,
+                .goal_meter = null,
+                .control = control,
+            };
+        }
+    };
+    // The owner refuses the capacity compaction's replacement: its terminal,
+    // nothing to abandon.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var recorder = compaction_control.Recorder{ .allow = false };
+        var st = ContextRecoveryState{ .cap = 4 };
+        try std.testing.expectEqual(DurableRecovery.owner_terminal, recoverDurableCapacity(Args.of(&c, testProvider(&provider_state), &backend, &st, a, recorder.control())));
+        try std.testing.expectEqual(@as(u32, 1), recorder.allow_calls);
+        try std.testing.expectEqual(@as(u32, 0), recorder.abandoned);
+        try std.testing.expect(c.compact_summary == null);
+    }
+    // The turn's recovery bound is spent: the deferred request is abandoned
+    // to the owner without another compaction.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var recorder = compaction_control.Recorder{};
+        var st = ContextRecoveryState{ .cap = 1, .attempts = 1 };
+        try std.testing.expectEqual(DurableRecovery.owner_terminal, recoverDurableCapacity(Args.of(&c, testProvider(&provider_state), &backend, &st, a, recorder.control())));
+        try std.testing.expectEqual(@as(u32, 1), recorder.abandoned);
+        try std.testing.expectEqual(@as(u32, 0), recorder.begins);
+    }
+    // A compaction that relieved something re-issues the turn.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var recorder = compaction_control.Recorder{};
+        var st = ContextRecoveryState{ .cap = 4 };
+        try std.testing.expectEqual(DurableRecovery.retry, recoverDurableCapacity(Args.of(&c, testProvider(&provider_state), &backend, &st, a, recorder.control())));
+        try std.testing.expectEqual(@as(u32, 1), recorder.committed);
+        try std.testing.expectEqual(@as(u32, 0), recorder.abandoned);
+    }
 }
 
 test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)" {

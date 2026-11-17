@@ -4,6 +4,7 @@
 {"v":1,"type":"ui_request_closed","id":1,"outcome":"answered"}
 {"v":1,"type":"ui_request_closed","id":2,"outcome":"cancelled"}
 {"v":1,"type":"ui_request_closed","id":3,"outcome":"malformed"}
+{"v":1,"type":"ui_request_closed","id":1,"outcome":"answered","by":"alice@example.com"}
 {"v":1,"type":"ui_request_unavailable","kind":"ask_question","reason":"kind_not_declared"}
 {"v":1,"type":"ui_request_unavailable","kind":"custom","custom_kind":"video_timeline@2","reason":"custom_kind_not_declared"}
 {"v":1,"type":"ui_request_unavailable","kind":"custom","custom_kind":"video_timeline","reason":"custom_kind_unversioned"}

@@ -3,8 +3,13 @@
 //! 这是库的公共面:把 agent 循环层(引擎 + 工具 + 协议 + 权限 + 参考 backend)按命名
 //! 空间 re-export 出来,供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。
 //!
-//! **不**导出任何 UI/CLI(repl/、repl/tui/、app.zig、main.zig)。本文件可达的模块图
-//! 物理上够不到 UI 层 —— `test { refAllDeclsRecursive }` 编全图即编译器证明此隔离。
+//! **不**导出任何 UI/CLI(repl/、repl/tui/、app.zig、main.zig)。编译器证明不了这条隔离:
+//! 模块根在 `src/`,任何文件都可 import;惰性分析也不编译没人调用的函数体与 test 块里的
+//! import。真正的检查是 `zig build subsystem:boundary`(scripts/subsystem_boundary_gate.zig,
+//! #448):从本文件沿每条 `@import`(含函数体、test 块)走闭包,任何进入应用侧(repl/、web/、
+//! daemon/、app/、main.zig、app.zig、session_service.zig、session_intent.zig)的边都失败,
+//! 只有该脚本里只减不增的 baseline 例外(如下面 re-export 的 app/config.zig、app/doctor.zig);
+//! src/core/ 没有 baseline。
 //!
 //! 接入方式见 doc/LIB_API.md;最小示例见 example/main.zig。
 //!
@@ -26,6 +31,7 @@ pub const workspace_policy = @import("core/workspace_policy.zig");
 pub const conversation = @import("core/conversation.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
 pub const compact_kernel = @import("core/compact_kernel.zig");
+pub const compaction_control = @import("core/compaction_control.zig"); // durable-state owner seam into Run compaction (#430)
 pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
@@ -75,6 +81,8 @@ pub const cache_break = @import("core/cache_break.zig");
 pub const transcript = @import("core/transcript.zig");
 pub const event_journal = @import("core/event_journal.zig"); // bounded seq+epoch event log for SSE-style replay
 pub const session_host = @import("core/session_host.zig"); // multi-session service over AgentSession for network Hosts
+pub const typed_submission = @import("core/typed_submission.zig"); // a submission's source/kind/key/attributes and its template (#447)
+pub const idempotency_ledger = @import("core/idempotency_ledger.zig"); // one Run per idempotency key, across restarts (#447)
 pub const session_id = @import("core/session_id.zig"); // SessionId 值类型(多 Session 基石)
 pub const system_prompt = @import("core/system_prompt.zig");
 pub const prompt_sections = @import("core/prompt_sections.zig");
@@ -85,6 +93,14 @@ pub const swarm_context = @import("swarm/context.zig"); // Session team membersh
 pub const swarm_team = @import("swarm/team.zig");
 pub const swarm_mailbox = @import("swarm/mailbox.zig");
 pub const swarm_tools = @import("swarm/tools.zig");
+pub const teamwork_types = @import("teamwork/types.zig"); // Teamwork roles, seats, handoff, SeatDriver (#515)
+pub const teamwork_config = @import("teamwork/config.zig"); // `teamwork` config parse/merge/validate
+pub const teamwork_run_dir = @import("teamwork/run_dir.zig"); // per-run state directory (#519)
+pub const teamwork_ledger = @import("teamwork/ledger.zig"); // run budget ledger (#520)
+pub const teamwork_issues = @import("teamwork/issues.zig"); // open_issues.json reviewer-findings ledger (#517)
+pub const teamwork_reviewer = @import("teamwork/reviewer.zig"); // built-in reviewer: charter, review.json, verification (#517)
+pub const teamwork_charters = @import("teamwork/charters.zig"); // role charters (#515)
+pub const teamwork_drivers = @import("teamwork/drivers/factory.zig"); // seat drivers by harness (#515, #521)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
@@ -127,13 +143,15 @@ pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_credential_cell = @import("api/credential_cell.zig"); // a Session's replaceable provider credential (#336)
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
-pub const api_login_worker = @import("api/login_worker.zig"); // picker credential stage: a prepared login on a worker thread (#67)
+pub const api_login_worker = @import("api/login_worker.zig"); // `/login`: a prepared login on a worker thread (#67)
 pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
 pub const auth = @import("core/auth.zig");
 pub const api_openai = @import("api/openai_client.zig");
 pub const api_gemini = @import("api/gemini_client.zig"); // 第三 provider:Gemini + 有状态缓存
+pub const api_bedrock = @import("api/bedrock_client.zig"); // Bedrock Converse + AWS event stream
+pub const api_aws_event_stream = @import("api/aws_event_stream.zig");
 pub const provider_metask_catalog = @import("provider/metask_catalog.zig");
 pub const provider_metask_ledger = @import("provider/metask_ledger.zig");
 pub const api_dialect = @import("api/dialect.zig"); // 方言 vtable(模型 wire 格式适配)
@@ -155,6 +173,7 @@ pub const tools = @import("tools.zig"); // registry + dispatch
 pub const tool_read = @import("tools/read.zig"); // 图像上限/MIME 判定(多模态输入共用)
 pub const tool_context = @import("tools/context.zig"); // ToolContext
 pub const tool_file_target = @import("tools/file_target.zig"); // Write/Edit 目标文件(AgentCore 按文件授权共用)
+pub const tool_args = @import("tools/common.zig"); // tool-argument admission (#494): canonicalizeArgs / sameArgs
 pub const read_artifact = @import("tools/read_artifact.zig");
 pub const tools_bash_output = @import("tools/bash_output.zig"); // 预算常量供 schema 防分叉守卫绑定
 pub const tools_dynamic = @import("tools/dynamic.zig"); // Skill/MCP DynRegistry
@@ -207,6 +226,8 @@ pub const mcp_tool_invocation = @import("mcp/tool_invocation.zig");
 pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
 pub const mcp_result_commit_test = @import("mcp/result_commit_test.zig");
 pub const sandbox_config = @import("sandbox/config.zig");
+/// Platform sandbox discovery used by embedded hosts at Session admission.
+pub const sandbox_exec = @import("sandbox/exec.zig");
 
 // ── 协议(core ↔ UI 契约;实现自定义前端只需这几个)────────────────────────
 pub const protocol = struct {
@@ -224,6 +245,7 @@ pub const mcp_session = @import("core/mcp_session.zig"); // McpSessionEntry
 pub const writer_backend = @import("core/writer_backend.zig"); // 打印型 sink
 pub const headless_backend = @import("core/headless_backend.zig"); // CoreEvent → JSON
 pub const suspend_state = @import("core/suspend_state.zig");
+pub const ui_request_store = @import("core/ui_request_store.zig"); // a SessionHost Session's request ids and suspended request (#446)
 pub const tee_backend = @import("core/tee_backend.zig"); // L4:多路转发 decorator
 pub const diagnostics_backend = @import("core/diagnostics_backend.zig"); // L4:诊断 trace 后端
 pub const evaluation_backend = @import("core/evaluation_backend.zig"); // V1:稳定评估事件投影
@@ -238,11 +260,17 @@ pub const util_toolchain = @import("util/toolchain.zig"); // ripgrep 解析/可�
 pub const util_state_root = @import("util/state_root.zig"); // per-install state root (--state-dir / METACODES_HOME / install.json / ~/.metacodes)
 
 test {
-    // 引用所有 re-export → 强制编译每个库模块。若任何模块间接拉到 repl/tui/app(UI 层),
-    // 会因路径不存在/循环依赖编译失败。绿 = 库与 UI 物理隔离的编译器证明。
-    // (此 std 裁剪版无 refAllDeclsRecursive,用 refAllDecls;顶层 re-export 已覆盖全模块。)
+    // 引用所有 re-export → 编译每个库模块的公开声明及其测试。这证明库能单独编译,
+    // **不**证明它与 UI 隔离:refAllDecls 不递归,惰性分析也跳过没人调用的 import;
+    // 隔离由 `zig build subsystem:boundary` 在源码层检查(见文件头)。
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(protocol);
     // Test-only: no re-export reaches it (see the file's header).
     _ = &@import("api/model_name_consumers_test.zig");
+    _ = &@import("teamwork/stub_driver.zig");
+    _ = &@import("teamwork/drivers/common.zig");
+    _ = &@import("teamwork/drivers/write_scope.zig");
+    _ = &@import("teamwork/drivers/metacodes.zig");
+    _ = &@import("teamwork/drivers/claude_code.zig");
+    _ = &@import("teamwork/drivers/drivers_test.zig");
 }

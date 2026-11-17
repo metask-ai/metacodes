@@ -13,6 +13,7 @@ const std = @import("std");
 const client_mod = @import("../client.zig");
 const openai_mod = @import("openai_client.zig");
 const gemini_mod = @import("gemini_client.zig");
+const bedrock_mod = @import("bedrock_client.zig");
 const provider_mod = @import("provider.zig");
 const types = @import("../types.zig");
 const dialect_mod = @import("dialect.zig");
@@ -27,6 +28,7 @@ const OwnedClient = union(types.ProviderKind) {
     anthropic: *client_mod.Client,
     openai: *openai_mod.OpenAIClient,
     gemini: *gemini_mod.GeminiClient,
+    bedrock: *bedrock_mod.BedrockClient,
 };
 
 pub const OwnedProvider = struct {
@@ -45,6 +47,7 @@ pub const OwnedProvider = struct {
             .anthropic => |c| c.provider(),
             .openai => |c| c.provider(),
             .gemini => |c| c.provider(),
+            .bedrock => |c| c.provider(),
         };
     }
 
@@ -68,6 +71,10 @@ pub const OwnedProvider = struct {
                 a.destroy(c);
             },
             .gemini => |c| {
+                c.deinit();
+                a.destroy(c);
+            },
+            .bedrock => |c| {
                 c.deinit();
                 a.destroy(c);
             },
@@ -106,6 +113,10 @@ pub fn makeProvider(
 /// child agents authenticate the same way the parent does.
 pub const Options = struct {
     auth_scheme: ?auth_header_mod.AuthScheme = null,
+    /// The vendor dialect the route declares, for the model the provider is
+    /// built for; empty infers it from the model name. Travels with
+    /// `auth_scheme`: both are properties of the route.
+    dialect: dialect_mod.DialectDeclaration = .{},
     limits: ?limits_mod.ModelLimitsSource = null,
     /// 收头阶段流空闲上限(毫秒;见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS)。null = 各 client 自己
     /// 从 env/默认取;测试用小值让"对端沉默"在秒级可复现。
@@ -166,6 +177,7 @@ pub fn makeProviderWithOptions(
             c.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), "", model, base_url);
             c.credential = credential;
             c.dialect_resolver = dialect_resolver;
+            c.declared_dialect = options.dialect;
             c.auth_scheme = options.auth_scheme;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
@@ -185,6 +197,7 @@ pub fn makeProviderWithOptions(
             errdefer c.deinit();
             c.protocol = openai_protocol;
             c.dialect_resolver = dialect_resolver;
+            c.declared_dialect = options.dialect;
             c.auth_scheme = options.auth_scheme;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
@@ -202,6 +215,7 @@ pub fn makeProviderWithOptions(
             c.credential = credential;
             errdefer c.deinit();
             c.dialect_resolver = dialect_resolver;
+            c.declared_dialect = options.dialect;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
             if (options.limits) |limits| {
@@ -211,13 +225,32 @@ pub fn makeProviderWithOptions(
             c.host_capabilities = try options.capability_declarations.clone(a);
             break :blk .{ .gemini = c };
         },
+        .bedrock => blk: {
+            const c = try a.create(bedrock_mod.BedrockClient);
+            errdefer a.destroy(c);
+            c.* = bedrock_mod.BedrockClient.init(a, io_rt.io(), "", model, base_url);
+            c.credential = credential;
+            errdefer c.deinit();
+            c.dialect_resolver = dialect_resolver;
+            c.declared_dialect = options.dialect;
+            c.auth_scheme = options.auth_scheme;
+            if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
+            if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
+            if (options.limits) |limits| {
+                if (limits.catalog) |catalog| c.catalog = try catalog.clone(a);
+                c.model_context = limits.model_context;
+                c.max_tokens_override = limits.max_tokens_override;
+            }
+            c.host_capabilities = try options.capability_declarations.clone(a);
+            break :blk .{ .bedrock = c };
+        },
     };
     return .{ .io = io_rt, .allocator = a, .client = owned };
 }
 
 test "makeProvider:三 kind 各造对应 client + provider() 出中立 vtable" {
     const a = std.testing.allocator;
-    inline for (.{ types.ProviderKind.anthropic, .openai, .gemini }) |k| {
+    inline for (.{ types.ProviderKind.anthropic, .openai, .gemini, .bedrock }) |k| {
         var op = try makeProvider(a, k, "test-key", "some-model", null);
         defer op.deinit();
         try std.testing.expectEqual(k, op.kind());
@@ -238,7 +271,7 @@ test "provider factory limits inherit and defaults remain provider specific" {
     var catalog = @import("catalog.zig").Catalog.init(a);
     defer catalog.deinit();
     try catalog.loadFromModelsListJson("{\"data\":[{\"id\":\"GLM-5.2\",\"max_tokens\":64000,\"max_input_tokens\":1048576}]} ");
-    var context = @import("../app/model_context.zig").ModelContext.init(a);
+    var context = @import("model_context.zig").ModelContext.init(a);
     defer context.deinit();
     context.parse("[models]\n\"gpt-5\" = 400000\n");
 

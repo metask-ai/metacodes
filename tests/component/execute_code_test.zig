@@ -194,6 +194,60 @@ test "ExecuteCode L2 PreToolUse rewrites, blocks, and PostToolUse reaches provid
     try expectContains(evidence.request, "INNER_POST_CONTEXT");
 }
 
+test "ExecuteCode L2 hook arguments are canonical at the Host callback" {
+    const gpa = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        canonical: bool = false,
+        fn execute(raw: *anyopaque, _: cc.tool_catalog.HostRunIdentity, args: []const u8) error{OutOfMemory}!cc.tool_catalog.HostToolOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.canonical = std.mem.eql(u8, args, "{\"value\":42}");
+            return .{ .ok = .{ .bytes = "42", .release_ctx = raw, .releaseFn = release } };
+        }
+        fn release(_: *anyopaque, _: []const u8) void {}
+    };
+    var probe = Probe{};
+    const tool = cc.tool_catalog.HostSyncTool{
+        .ctx = &probe,
+        .execute = Probe.execute,
+        .definition = .{ .name = "HostProbe", .description = "observe admitted arguments", .input_schema = .{ .type = "object" } },
+    };
+    var catalog = try cc.tool_catalog.Catalog.init(gpa, &.{"ExecuteCode"}, &.{tool});
+    defer catalog.deinit();
+    var selected = try cc.tool_catalog.Selection.init(gpa, &catalog, &.{ "ExecuteCode", "HostProbe" });
+    defer selected.deinit();
+    const pre = [_]cc.permission_hooks.HookEntry{.{
+        .matcher = "HostProbe",
+        .commands = &.{"echo '{\"updatedInput\":{\"value\" : 42}}'"},
+    }};
+    const hooks = cc.permission_hooks.HookSet{ .allocator = gpa, .pre_tool_use = &pre };
+    var permission = cc.permission.createContext(.bypass_permissions, gpa);
+    permission.hooks = &hooks;
+    var conversation = cc.conversation.Conversation.init(gpa);
+    defer conversation.deinit();
+    const options = cc.agent_loop.Options{ .tool_defs = selected.definitions, .tool_dispatcher = selected.dispatcher(), .host_run = .{
+        .identity = .{ .session_id = cc.session_id.SessionId.single, .run_id = 1 },
+        .host_session_ctx = &probe,
+    } };
+    const evidence = try run(&conversation, &.{.{ .code = "await tools.HostProbe({value:0})" }}, &permission, options);
+    defer evidence.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(probe.canonical);
+    try expectContains((try resultAt(&conversation, 0)).content, "\"value\":42");
+
+    const invalid_pre = [_]cc.permission_hooks.HookEntry{.{
+        .matcher = "HostProbe",
+        .commands = &.{"echo '{\"updatedInput\":{\"value\":1,\"value\":2}}'"},
+    }};
+    const invalid_hooks = cc.permission_hooks.HookSet{ .allocator = gpa, .pre_tool_use = &invalid_pre };
+    permission.hooks = &invalid_hooks;
+    const rejected = try run(&conversation, &.{.{ .code = "try { await tools.HostProbe({value:0}); } catch(e) { e.result; }" }}, &permission, options);
+    defer rejected.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try expectContains((try resultAt(&conversation, 1)).content, "invalid_args");
+}
+
 test "ExecuteCode L2 timeout, unresolved promises, output limits reset the VM" {
     const gpa = std.testing.allocator;
     var permission = cc.permission.createContext(.bypass_permissions, gpa);

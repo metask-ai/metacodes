@@ -30,6 +30,7 @@
 {"v":1,"type":"stream_done","data":null}
 {"v":1,"type":"output_segment_begin","data":{"index":0,"turn":1,"group":0}}
 {"v":1,"type":"output_segment_end","data":{"index":0,"turn":1,"group":0,"disposition":"final","bytes":5}}
+{"v":1,"type":"thinking_discarded","data":{"index":1,"turn":2,"group":0,"bytes":17}}
 {"v":1,"type":"ui_request_pending","data":{"tool_use_id":"tu_3","request_json":"{\"kind\":\"video_timeline\"}"}}
 {"v":1,"type":"ui_request_resolved","data":null}
 {"v":1,"type":"prompt_manifest","data":{"sha256":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","sections":[{"id":"metacodes:identity","order":0,"origin":"kernel","class":"replaceable","sha256":"abababababababababababababababababababababababababababababababab"},{"id":"host:rules","order":500,"origin":"host","class":"removable","sha256":"0101010101010101010101010101010101010101010101010101010101010101"}]}}

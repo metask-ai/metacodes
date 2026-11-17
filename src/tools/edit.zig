@@ -1,5 +1,6 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
+const filesystem = @import("../sandbox/filesystem.zig");
 const common = @import("common.zig");
 const file_target = @import("file_target.zig");
 const path_mod = @import("../util/path.zig");
@@ -47,11 +48,14 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // recovery even though its stronger source check is already authoritative.
     if (ctx.project_edit_mode != .whole_file_exact) {
         if (ctx.read_state) |rs| {
-            const st = read_state.statPath(file_path) catch return error.FileNotFound;
+            const st = filesystem.statPath(ctx, file_path) catch |err| {
+                if (filesystem.enabled(ctx)) return err;
+                return error.FileNotFound;
+            };
             const rec = rs.get(file_path) orelse return error.NotRead;
             // staleness 双判:mtime 变但内容哈希没变 → 不算 stale(对齐 cc FileEdit)。
             if (rec.mtime_ns != st.mtime_ns) {
-                const cur_hash = read_state.hashFileContent(file_path);
+                const cur_hash = try filesystem.hashFileContent(ctx, file_path);
                 if (rec.content_hash == 0 or cur_hash != rec.content_hash) return error.StaleFile;
             }
         }
@@ -87,7 +91,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const new_stripped = try stripLineNumberPrefix(new_unesc, allocator);
     defer allocator.free(new_stripped);
 
-    const fd = pfs.openZ(file_path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = filesystem.open(ctx, file_path, .{ .ACCMODE = .RDONLY }, 0, false) catch |err| {
+        if (filesystem.enabled(ctx)) return err;
+        return error.FileNotFound;
+    };
     const original = blk: {
         defer _ = pfs.close(fd);
         const sz = read_state.statFd(fd) catch null;
@@ -159,7 +166,10 @@ fn finalizeWrite(
     old_content: []const u8,
     content: []const u8,
 ) ![]u8 {
-    const write_fd = pfs.openZ(file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
+    const write_fd = filesystem.open(ctx, file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644, false) catch |err| {
+        if (filesystem.enabled(ctx)) return err;
+        return error.WriteError;
+    };
     defer _ = pfs.close(write_fd);
 
     var pos: usize = 0;
@@ -200,11 +210,16 @@ fn executeWholeFileExact(
     if (replace_all != null and std.mem.eql(u8, replace_all.?, "true"))
         return error.ExactRecoveryReplaceAllForbidden;
 
-    const fd = pfs.openZ(
+    const fd = filesystem.open(
+        ctx,
         file_path,
         .{ .ACCMODE = .RDWR, .NOFOLLOW = true },
         0,
-    ) catch return error.ExactRecoveryTargetUnavailable;
+        false,
+    ) catch |err| {
+        if (filesystem.enabled(ctx)) return err;
+        return error.ExactRecoveryTargetUnavailable;
+    };
     defer _ = pfs.close(fd);
     pfs.makeCloseOnExec(fd) catch return error.ExactRecoveryTargetUnavailable;
 
@@ -347,7 +362,7 @@ fn finalizeCommittedWrite(
 
     // M2:LSP baseline snapshot 移到**盘写之后**——LSP 用 in-memory old_content 分析(不读盘),故语义
     // 不变,但盘写不再被 LSP initialize(最长 12s)阻塞。写已完成,只有工具**结果**等诊断。
-    @import("lsp_diag.zig").snapshotBaseline(ctx, file_path, old_content);
+    if (!filesystem.enabled(ctx)) @import("lsp_diag.zig").snapshotBaseline(ctx, file_path, old_content);
 
     // B/C 合并:memdir 记忆 markdown 自动入图(best-effort;content=编辑后全文)。
     @import("../kg/autosync.zig").maybeImportMemoryFile(ctx, file_path, content);
@@ -370,7 +385,7 @@ fn finalizeCommittedWrite(
         try receipt.writer.writeAll("{\"file_path\":");
         try util_json.writeJsonString(&receipt.writer, file_path);
         try receipt.writer.writeAll(",\"success\":true,\"recovery\":\"lean_authorized_source_cas\"");
-        try @import("lsp_diag.zig").appendToResult(
+        if (!filesystem.enabled(ctx)) try @import("lsp_diag.zig").appendToResult(
             ctx,
             allocator,
             &receipt.writer,
@@ -430,7 +445,7 @@ fn finalizeCommittedWrite(
     // ——更准(真类型/未声明/语法错)。**取舍登记**:LSP 不在位(`--no-lsp`,或该语言的 server
     // 没装)时编辑不再有免费语法警告(tree-sitter 时代无条件提供);在位则得 server 级诊断,更强。
     // 写后用**新内容**取 delta 诊断(vs 写前 baseline),非空则附进结果给模型。
-    try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, file_path, content);
+    if (!filesystem.enabled(ctx)) try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, file_path, content);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
 }

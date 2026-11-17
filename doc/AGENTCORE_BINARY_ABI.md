@@ -9,7 +9,7 @@ ABI v1 is an experimental in-process embedding contract for synchronous,
 stateful AgentSession execution. It does not expose or define a host product
 model.
 
-**Status: experimental.** Revision 26 is one exact hard-cut Agent Runtime wire
+**Status: experimental.** Revision 28 is one exact hard-cut Agent Runtime wire
 shape. It keeps the existing checkpoint/restore, durable budget, MCP
 Runtime/Session seams, Workspace Skill source/identity/policy binding,
 hash-pinned process-tool packages, Host/MCP byte-zero Tool Result streaming,
@@ -39,15 +39,27 @@ and `TEAM_ROLE_MEMBER`), Host-supplied at create and restore with no
 checkpoint state, and Revision 25's `session->update_credential` (see
 "Credential updates"), which replaces an existing Session's provider
 credential in place, while idle or during a Run, from any thread or from the
-Session's own callbacks, and the `MAX_CREDENTIAL_BYTES_V1` limit. Over
-Revision 25 it adds Skill source priorities (#390, see "Skill catalog and
-typed input"): `SkillSourceV1.priority` and the
+Session's own callbacks, and the `MAX_CREDENTIAL_BYTES_V1` limit, and
+Revision 26's Skill source priorities (#390, see "Skill catalog and typed
+input"): `SkillSourceV1.priority` and the
 `SkillCatalogQueryV1.default_user_source_priority` and
 `default_workspace_source_priority` fields rank same-scope sources that define
 one invocation name, where Revision 25 could only report them as a
-`source_conflict`. They take former reserved words; zero keeps Revision 25's
-resolution. No table, struct, or descriptor changes size, and the root stays
-80 bytes. Revision 16 stays
+`source_conflict`, and Revision 27's edit-and-rerun (#441, see "Edit and
+rerun"): a tenth Session Control slot, `rewind_to_user_message`, which drops a
+user message and everything after it so the next Run reruns from there, and
+the statuses 31 `MESSAGE_POSITION_OUT_OF_RANGE`, 32 `NOT_USER_MESSAGE` and 33
+`MESSAGE_POSITION_COMPACTED` that refuse a position, which grew the Session
+Control table from 80 to 88 bytes. Over Revision 27 it adds a Host-granted
+stream retry budget (#452, see "Stream retry budget"):
+`RunOptionsV1.stream_retry_budget` takes the options' last reserved word and
+lets a Run re-issue a request whose accepted stream broke off without an
+answer after it had shown output, bounded by `MAX_STREAM_RETRY_BUDGET_V1`,
+beyond the one re-issue every request has of its own (#461);
+each such re-issue is announced by the existing `discarded` segment
+disposition, the new `thinking_discarded` observation event and the existing
+`retry_notice`. No table, struct, or descriptor changes size, and the root
+stays 80 bytes. Revision 16 stays
 skipped: it named the withdrawn first-class PDF input on `main`, and a
 revision keeps a single meaning. The independent public Completion facade
 stays removed. This is not a general v1 stability promise.
@@ -57,7 +69,7 @@ and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 26**. Revision 26 is a
+The current experimental bundle is **ABI v1 revision 28**. Revision 28 is a
 hard-cut replacement for every earlier revision. The root is no longer a
 capability-tagged flat table. It is an 80-byte exact layout containing the
 stable 16-byte discovery prefix, `buffer_release`, and seven non-null typed
@@ -65,12 +77,13 @@ table pointers. Every table is mandatory at discovery; consumers simply avoid
 calling domains they do not use. There is no `query_interface`, string ID,
 optional-capability negotiation, or compatibility shim:
 
-- `metask_agentcore_api_v1` is 80 bytes and requires `abi_revision == 26`;
+- `metask_agentcore_api_v1` is 80 bytes and requires `abi_revision == 28`;
 - Runtime, Session, Session Control, Skill, MCP, Goal, and Team tables are
-  respectively 24, 56, 80, 32, 40, 40, and 24 bytes;
-- the root plus child tables expose 31 functions: root `buffer_release` and
-  30 domain slots;
-- `MAX_CREDENTIAL_BYTES_V1` (16 KiB) bounds one `update_credential` candidate;
+  respectively 24, 56, 88, 32, 40, 40, and 24 bytes;
+- the root plus child tables expose 32 functions: root `buffer_release` and
+  31 domain slots;
+- `MAX_CREDENTIAL_BYTES_V1` (16 KiB) bounds one `update_credential` candidate,
+  and `MAX_STREAM_RETRY_BUDGET_V1` (8) one Run's stream retry budget;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
   `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
   96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
@@ -86,8 +99,10 @@ optional-capability negotiation, or compatibility shim:
   72, 56, and 56 bytes; `SessionCreateConfigV1` replaces one reserved word with
   the nullable `prompt_profile` pointer (offset 32), and the 40-byte
   `RunOptionsV1` replaces two with the `context_blocks` pointer (offset 8) and
-  `context_block_count` (offset 16), and its next with `time_context_code`
-  (offset 24) and `utc_offset_minutes` (offset 28);
+  `context_block_count` (offset 16), its next with `time_context_code`
+  (offset 24) and `utc_offset_minutes` (offset 28), and its last with the
+  `uint32_t` `stream_retry_budget` (offset 32) and a zero `reserved0`
+  (offset 36);
 - `ProcessPluginSourceV1` and `RuntimePluginConfigV1` are respectively 48 and
   72 bytes; `HostResultSinkV1` and `HostStreamToolV1` are respectively 56 and
   96 bytes; the single `runtime->create` takes a nullable plugin config, where
@@ -98,8 +113,8 @@ optional-capability negotiation, or compatibility shim:
   `request` remains the bounded control-frame operation and
   `request_tool_stream` is mandatory for `tools/call`;
 - checkpoint, restore, describe, MCP refresh/describe/apply/selection,
-  Permission rule and mode update, compact, abort, submit_input, and
-  update_credential entries are mandatory;
+  Permission rule and mode update, compact, abort, submit_input,
+  update_credential, and rewind_to_user_message entries are mandatory;
 - `SkillSourceV1`, `SkillPolicyV1`, and `SkillCatalogQueryV1` are respectively
   64, 56, and 80 bytes; `SkillSourceV1` replaces its first reserved word with
   the `int32_t` `priority` (offset 40) and a zero `reserved0` (offset 44), and
@@ -108,18 +123,20 @@ optional-capability negotiation, or compatibility shim:
   `default_workspace_source_priority` (offset 76);
 - public status code 26 is a permanent tombstone; decoding it yields unknown,
   while `SKILL_CATALOG_INCOMPLETE` remains 27, `IMAGE_INPUT_UNSUPPORTED`
-  is 28, `IMAGE_INPUT_CAPABILITY_UNKNOWN` is 29, and `GOAL_CONFLICT` is 30;
+  is 28, `IMAGE_INPUT_CAPABILITY_UNKNOWN` is 29, `GOAL_CONFLICT` is 30, and
+  `MESSAGE_POSITION_OUT_OF_RANGE`, `NOT_USER_MESSAGE` and
+  `MESSAGE_POSITION_COMPACTED` are 31, 32 and 33;
 - `SessionHostConfigV1` stays 168 bytes and replaces two of its three reserved
   words with the `model_capabilities` pointer (offset 144) and
   `model_capability_count` (offset 152), and its last reserved word with the
   nullable `team` pointer (offset 160); `ModelCapabilityV1` is 40 bytes;
 - `GoalSetV1` and `GoalUpdateV1` are respectively 56 and 64 bytes;
 - `TeamConfigV1` is 88 bytes; `TeamApiV1` is 24 bytes;
-- `manifest.json` keeps schema version 1 and records revision 26 and root size
+- `manifest.json` keeps schema version 1 and records revision 28 and root size
   80. Child-table validation belongs to ABI discovery and is not duplicated in
   bundle metadata.
 
-Revision 26 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
+Revision 28 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then validate
@@ -128,16 +145,16 @@ per-Run callback validates and copies any retained `RunContext`
 fields during the callback, and Host registries bind/compare `session_id`
 atomically under their per-Session lock.
 
-Revision 26 deliberately exposes explicit process-package sources, their
+Revision 28 deliberately exposes explicit process-package sources, their
 namespaced `host_tool` contributions, and explicit Host stream-tool
 descriptors. It does not expose the generic
 data/static plugin grouping model or `metacodes.plugin-inventory/v1`; those
 remain available through the source-level Zig Runtime plus CLI/Web JSON Host
 interfaces. Projecting generic inventory into this binary table requires a
-later explicit ABI revision. A revision-26 consumer must not infer plugin
+later explicit ABI revision. A revision-28 consumer must not infer plugin
 identity from tool or Skill names, and every reserved field remains zero.
 
-### Revision 26 table topology
+### Revision 28 table topology
 
 The root layout is exact on the required 64-bit pointer ABI:
 
@@ -145,12 +162,12 @@ The root layout is exact on the required 64-bit pointer ABI:
 |---:|---|---|
 | 0 | `struct_size` | exactly 80 |
 | 4 | `abi_version` | exactly 1 |
-| 8 | `abi_revision` | exactly 26 |
+| 8 | `abi_revision` | exactly 28 |
 | 12 | `reserved0` | zero |
 | 16 | `buffer_release` | non-null function |
 | 24 | `runtime` | non-null 24-byte table |
 | 32 | `session` | non-null 56-byte table |
-| 40 | `session_control` | non-null 80-byte table |
+| 40 | `session_control` | non-null 88-byte table |
 | 48 | `skill` | non-null 32-byte table |
 | 56 | `mcp` | non-null 40-byte table |
 | 64 | `goal` | non-null 40-byte table |
@@ -163,7 +180,7 @@ these mandatory slots in this order:
 |---|---|
 | Runtime | `create`, `destroy` |
 | Session | `create`, `destroy`, `run_input`, `abort`, `submit_input`, `update_credential` |
-| Session Control | `restore`, `describe`, `set_model`, `update_permission_rules`, `compact`, `abort_compact`, `export_checkpoint`, `set_prompt_profile`, `update_permission_mode` |
+| Session Control | `restore`, `describe`, `set_model`, `update_permission_rules`, `compact`, `abort_compact`, `export_checkpoint`, `set_prompt_profile`, `update_permission_mode`, `rewind_to_user_message` |
 | Skill | `resolve_catalog`, `release_catalog`, `bind_policy` |
 | MCP | `apply_configuration`, `refresh`, `describe`, `update_selection` |
 | Goal | `get`, `set`, `update`, `clear` |
@@ -176,13 +193,17 @@ pointer is non-null and aligned. Wrong revision, reserved values, child sizes,
 or any null slot reject the entire discovery. The 280-byte Revision 13 root and
 the 64-byte Revision 14 through 22 roots and the 72-byte Revision 23 root
 therefore fail at root size without an out-of-bounds read. The 80-byte
-Revision 24 and 25 roots and a reference layout of the same size fail at the
-revision check, since none carries 26; a Revision 24 Session table is also 8
-bytes short of the 56 of Revisions 25 and 26, as a Revision 19 Session table
-was of the 48 of Revisions 20 through 24. A Revision 25 root has Revision 26's
+Revision 24 through 27 roots and a reference layout of the same size fail at
+the revision check, since none carries 28; a Revision 24 Session table is also
+8 bytes short of the 56 of Revisions 25 through 28, as a Revision 19 Session
+table was of the 48 of Revisions 20 through 24, and a Revision 26 Session
+Control table is 8 bytes short of the 88 of Revisions 27 and 28, which ends
+with the `rewind_to_user_message` slot. A Revision 25 root has Revision 26's
 table and struct sizes and is told apart only by its revision; a Revision 25
 library would reject the Revision 26 source priorities as nonzero reserved
-words.
+words. Likewise a Revision 27 root has Revision 28's sizes, and a Revision 27
+library would reject a nonzero `RunOptionsV1.stream_retry_budget` as a
+nonzero reserved word.
 
 A future stability freeze first requires closure of the open items tracked in
 `doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (every group A item closed; every
@@ -342,20 +363,20 @@ Current delivery status is intentionally target-specific:
 
 | Target | Bundle/archive | Native source-free consumption |
 |---|---|---|
-| `aarch64-macos` | revision 25 ReleaseSafe bundle archived and gated by a `release.yml` dry run (`macos-latest`, run 40787422095, 2026-10-28); revision 24 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-17); revision 26 not revalidated | revision 25 native gate passed in run 40787422095; revision 24 native gate passed locally (2026-10-17): C and Zig source-free consumers (Session goals: the C one sets a goal, runs a goal-continuation Run whose runtime-written input the mock finds, sees it charged and is refused once the goal is paused; the Zig one carries a goal across checkpoint and restore over OpenAI Responses and keeps charging it; time context with a Host UTC offset; Host model-capability declarations; both submitting input to an active Run; host-scheduled teams: both consumers create a team member Session and read its roster through `team->describe` and its empty inbox through `team->poll`, and the L2 suite drives a lead delegating by `SpawnTeammate` and a member replying through the public ABI), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs; revision 26 not revalidated |
-| `x86_64-windows-msvc` | revision 26 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-29), revision 25 on 2026-10-28; CI (`agentcore-windows.yml`, GitHub-hosted `windows-latest`) builds and gates it | revision 26 native gate (`zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe`) passed locally (2026-10-29): both source-free consumers, the Rust crate tests and the ABI suite, including the Workspace Skill source-priority L2 test; revision 25 native gate passed locally (2026-10-28): the C consumer, statically linked and loading the DLL, rotates the provider credential from inside its Host stream tool callback mid-Run and again while idle, the Zig consumer does the same from its Host tool callback, and each consumer's loopback provider sees the creation, rotated and idle credentials in that order; revision 24 passed in CI on `main` at `7efc170d` (run 39107702062, 2026-10-18); the workflow repeats the gate on every push to `main` and on pull requests touching the native-gate paths |
-| `aarch64-windows-msvc` | revision 14 evidence retained; revision 26 not revalidated | native revision 26 gate pending |
-| `aarch64-windows-gnu` | revision 14 evidence retained; revision 26 not revalidated | native revision 26 gate pending |
-| `x86_64-windows-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run (`windows-latest`, run 40787422095, 2026-10-28) | revision 25 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169); revision 26 pending until the next release run |
-| `x86_64-linux-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run (`ubuntu-latest`, run 40787422095, 2026-10-28) | revision 25 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169); revision 26 pending until the next release run |
-| `aarch64-linux-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted arm64 Linux runner (`ubuntu-24.04-arm`, run 40787422095, 2026-10-28, #307) | revision 25 native gate (`zig build agentcore:gate`, Rust triple `aarch64-unknown-linux-gnu`) passed in that run; revision 26 pending until the next release run |
-| `x86_64-macos` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted Intel macOS runner (`macos-15-intel`, run 40787422095, 2026-10-28, #307) | revision 25 native gate (`zig build agentcore:gate`) passed in that run; revision 26 pending until the next release run |
+| `aarch64-macos` | revision 25 ReleaseSafe bundle archived and gated by a `release.yml` dry run (`macos-latest`, run 40787422095, 2026-10-28); revision 24 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-17); revision 28 not revalidated | revision 25 native gate passed in run 40787422095; revision 24 native gate passed locally (2026-10-17): C and Zig source-free consumers (Session goals: the C one sets a goal, runs a goal-continuation Run whose runtime-written input the mock finds, sees it charged and is refused once the goal is paused; the Zig one carries a goal across checkpoint and restore over OpenAI Responses and keeps charging it; time context with a Host UTC offset; Host model-capability declarations; both submitting input to an active Run; host-scheduled teams: both consumers create a team member Session and read its roster through `team->describe` and its empty inbox through `team->poll`, and the L2 suite drives a lead delegating by `SpawnTeammate` and a member replying through the public ABI), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs; revision 28 not revalidated |
+| `x86_64-windows-msvc` | revision 26 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-29), revision 25 on 2026-10-28; CI (`agentcore-windows.yml`, GitHub-hosted `windows-latest`) builds and gates it | revision 26 native gate (`zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe`) passed locally (2026-10-29): both source-free consumers, the Rust crate tests and the ABI suite, including the Workspace Skill source-priority L2 test (revision 28 not revalidated); revision 25 native gate passed locally (2026-10-28): the C consumer, statically linked and loading the DLL, rotates the provider credential from inside its Host stream tool callback mid-Run and again while idle, the Zig consumer does the same from its Host tool callback, and each consumer's loopback provider sees the creation, rotated and idle credentials in that order; revision 24 passed in CI on `main` at `7efc170d` (run 39107702062, 2026-10-18); the workflow repeats the gate on every push to `main` and on pull requests touching the native-gate paths |
+| `aarch64-windows-msvc` | revision 14 evidence retained; revision 28 not revalidated | native revision 28 gate pending |
+| `aarch64-windows-gnu` | revision 14 evidence retained; revision 28 not revalidated | native revision 28 gate pending |
+| `x86_64-windows-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run (`windows-latest`, run 40787422095, 2026-10-28) | revision 25 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169); revision 28 pending until the next release run |
+| `x86_64-linux-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run (`ubuntu-latest`, run 40787422095, 2026-10-28) | revision 25 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169); revision 28 pending until the next release run |
+| `aarch64-linux-gnu` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted arm64 Linux runner (`ubuntu-24.04-arm`, run 40787422095, 2026-10-28, #307) | revision 25 native gate (`zig build agentcore:gate`, Rust triple `aarch64-unknown-linux-gnu`) passed in that run; revision 28 pending until the next release run |
+| `x86_64-macos` | revision 25 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted Intel macOS runner (`macos-15-intel`, run 40787422095, 2026-10-28, #307) | revision 25 native gate (`zig build agentcore:gate`) passed in that run; revision 28 pending until the next release run |
 
 Cross-build success is not a support claim. In particular, the empty macOS
 framework list remains provisional until the corresponding native gates pass.
 This validation status is not an ABI restriction.
 
-Revision 26 hard-cuts the current schema-1 manifest contract in place. The
+Revision 28 hard-cuts the current schema-1 manifest contract in place. The
 manifest records the exact ABI version, revision, and root size, while runtime
 discovery validates all seven mandatory child tables. There is no manifest
 migration, dual parser, capability negotiation, or duplicated child-table
@@ -389,7 +410,7 @@ both copies.
 
 `decodeSkillCatalog` returns an owned `ParsedSkillCatalog` for
 `metask.skill-catalog/v1`. Revision 15 hard-cut the current experimental shape
-of that schema, and Revision 26 keeps it: every earlier unreleased experimental
+of that schema, and Revision 28 keeps it: every earlier unreleased experimental
 shape bearing the same token is void, and consumers must interpret the
 descriptor only with the exact bundle they pin. The decoder validates the
 schema, the 1024-Skill limit, identity forms, duplicate concrete `skill_id` or
@@ -447,8 +468,9 @@ The v1 observation set is:
 | Assistant visible-output segment protocol | `text_chunk` | UTF-8 data delta belonging to the currently open visible-output segment |
 | Assistant visible-output segment protocol | `output_segment_end` | Closes that segment with the authoritative `commentary` / `final` / `continued` / `partial` / `discarded` disposition and byte count |
 | Model reasoning-channel observation | `thinking_chunk` | Model reasoning delta, outside visible-output segments and final-output reconstruction |
+| Model reasoning-channel observation | `thinking_discarded` | The `thinking_chunk`s delivered while segment `index` was open belong to an attempt the Run withdrew and re-issues (the request's own re-issue or its stream retry budget); carries the segment's `index`, `turn`, `group` and the withdrawn thinking `bytes` (see "Stream retry budget") |
 | Provider stream boundary and retry | `stream_done` | One Provider stream completed; not a segment, turn, or Run completion signal |
-| Provider stream boundary and retry | `retry_notice` | Provider retry attempt and delay |
+| Provider stream boundary and retry | `retry_notice` | Provider retry attempt and delay: a connection retry, or a same-turn re-issue of an attempt that showed output (the request's own, or under the Run's stream retry budget) |
 | Tool execution observation | `tool_start` | Tool invocation identity, name, and input |
 | Tool execution observation | `tool_progress` | Incremental progress text for one tool call |
 | Tool execution observation | `tool_result` | Completed tool result, error flag, elapsed time, and optional successful file observations |
@@ -457,7 +479,7 @@ The v1 observation set is:
 | Run state and coarse progress | `progress` | Current 1-based turn and cumulative tool-call progress sample; not a lifecycle boundary |
 | Context management and accounting | `usage` | Token-usage delta |
 | Context management and accounting | `context_warning` | Context-pressure thresholds and level |
-| Context management and accounting | `auto_compact` | Conversation compaction summary |
+| Context management and accounting | `auto_compact` | A compaction inside this Run committed: messages dropped and kept, context estimate before and after, and the pressure that asked (see "Automatic compaction inside a Run") |
 | Permission-decision evidence | `permission_provenance` | Final Permission decision, canonical source, request binding, generation, and typed callback outcome |
 | System prompt audit | `prompt_manifest` | The sections of the system prompt this Run sends (id, order, origin, class, SHA-256) and the prompt's SHA-256, when it differs from the previous Run's |
 | Goal accounting | `goal_updated` | The Session's goal changed during this Run: its budget ran out (`budget_limited`), or the Run ended and its usage and time are on the goal; carries the whole goal as `goal->get` writes it (see "Goals") |
@@ -476,7 +498,7 @@ ordering and may invoke their callbacks concurrently. The stream has no common
 event sequence number, cursor, replay, or exactly-once contract; only
 `run_state.transition_seq` orders RunState snapshots.
 
-`on_event` is mandatory in Revision 26. `run_state` is emitted for admitted-run
+`on_event` is mandatory in Revision 28. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
 and advances only for emitted RunState snapshots. While the observation
@@ -505,6 +527,14 @@ disposition is authoritative:
   in that group;
 - `partial`: visible but incomplete output;
 - `discarded`: rolled-back bytes that the Host must remove or ignore.
+
+Thinking has no segment of its own, but every `thinking_chunk` arrives while
+the segment of its Provider stream is open. When a Run re-issues an attempt
+that showed output, `thinking_discarded` follows that segment's
+`output_segment_end` (disposition `discarded`) with the same `index`, `turn`
+and `group`: the Host removes or ignores the thinking delivered while that
+segment was open, `bytes` in total, as it drops a `discarded` segment's text.
+No other path emits it (see "Stream retry budget").
 
 `stream_done` means only that one Provider stream ended; it neither closes nor
 classifies an output segment. Hosts must not reconstruct final-output semantics
@@ -540,9 +570,11 @@ owned typed value. Older Hosts retain the event through the `unknown` path.
 
 `thinking_chunk` is an additive ABI-v1 observation event. An older Host may
 decode it through the `unknown` observation path and ignore or retain it in
-accordance with the forward-compatibility rules above.
+accordance with the forward-compatibility rules above. `thinking_discarded`
+(Revision 28) is additive in the same way; a Run whose budget is zero never
+emits it.
 
-`tool_result.file_refs` is an optional Revision 26 observation field. It is
+`tool_result.file_refs` is an optional Revision 28 observation field. It is
 present only for successful selected built-in file-tool executions and contains
 at most 32 entries. Each entry has one locator union (`workspace_path`,
 `absolute_path`, or `uri`), an open-ended bounded `kind` string, a bounded
@@ -569,7 +601,7 @@ their `ctx` and keeps it valid until Session destruction succeeds.
 
 ### Process-plugin Runtime configuration
 
-Revision 26 uses one `runtime->create(runtime_config, plugin_config,
+Revision 28 uses one `runtime->create(runtime_config, plugin_config,
 out_runtime, out_diagnostic)`. The Runtime config is required; the plugin
 config is nullable. Null and an empty, well-formed `RuntimePluginConfigV1`
 create equivalent no-extra-plugin generations. Descriptor arrays and path
@@ -628,7 +660,7 @@ version, pinned executable SHA-256, global tool name and validated reserialized
 input schema.
 The binding—not the display name alone—enters Permission provenance and
 checkpoint authority resolution. Process tools deliberately have no
-`allow_session`/`deny_session` candidate in revision 26, so a Host may answer
+`allow_session`/`deny_session` candidate in revision 28, so a Host may answer
 only the offered one-shot choices unless an independent native rule decides
 first. Changing executable/package/schema authority invalidates a restored
 binding instead of silently reauthorizing the new implementation.
@@ -729,7 +761,7 @@ not define status precedence when multiple other input or admission errors are
 present in the same call.
 
 ABI v1 provides no in-place recovery or mutation of a poisoned Session. The
-Host must destroy that physical handle. Revision 26 checkpoint/restore creates
+Host must destroy that physical handle. Revision 28 checkpoint/restore creates
 a new handle from a previously exported committed checkpoint; it does not
 reconstruct state that was never successfully exported or resume an active
 Run.
@@ -737,7 +769,7 @@ Run.
 When facade poison occurs after Core has returned to an inspectable idle state,
 `session_describe` succeeds and reports lifecycle `poisoned`; it must not report
 `idle`. An active ordinary Session activity makes `session_describe` return
-`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 26 description does not
+`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 28 description does not
 emit lifecycle `busy`.
 
 A checkpoint is resumable model state, not a raw transcript archive. Before
@@ -814,7 +846,7 @@ slot or revision, and an older Host decodes it through the `unknown` path.
 | `request_id` | From `x-metask-request-id`, `request-id`, `x-request-id`, `x-goog-request-id`, `x-amzn-requestid` or `x-ms-request-id`, in that order, else the error body's `request_id`. Null if none |
 | `retry` | `retryable`, `not_retryable` or `unknown` |
 | `retry_after_ms` | The failing response's `Retry-After`, when it sent one |
-| `attempts` | Physical attempts of the request that failed, AgentCore's own retries included |
+| `attempts` | Physical attempts of the request that failed, AgentCore's own retries included: connection retries and same-turn re-issues alike (see "Stream retry budget") |
 | `truncated` | A string above was cut at its size limit |
 
 `category` describes the failure, from transport facts and the provider's
@@ -860,10 +892,89 @@ Sessions, other threads' subagents, and a subagent nested in this Run's tool cal
 each write their own, and a model-invoked fork's failure stays that tool's
 result. A Skill invocation in its own context is the Run, so its failure is.
 
+### Stream retry budget
+
+A provider stream can break off after its response head was accepted: the
+connection stalls past the body idle limit, drops, or ends before the stream
+reports how it stopped. A reasoning model streams thinking first, so in
+practice the failed attempt has nearly always shown something already.
+
+**Every model request re-issues once by itself** (#461), whatever the
+options: when its accepted stream broke off without an answer and the failed
+response had not started a tool call, the Run discards everything the attempt
+produced and sends the identical request again, to the same provider, wire,
+model and binding. The allowance is the request's, not the Run's: each turn's
+request has its own, so an earlier turn's re-issue never uses up a later
+one's. A failed response that started a tool call, even one whose arguments
+were still streaming when the connection ended, is not re-issued under it.
+
+`RunOptionsV1.stream_retry_budget` (Revision 28, #452) lets the Host grant the
+Run more: it is how many further times the Run may re-issue a request whose
+accepted stream broke off without an answer, after output was shown and after
+a started tool call too. Zero, the value of a zeroed `RunOptionsV1`, grants
+nothing beyond each request's own re-issue. A value above
+`MAX_STREAM_RETRY_BUDGET_V1` (8) is refused with `RESOURCE_LIMIT`, and a
+nonzero `reserved0` beside it with `INVALID_ARGUMENT`, both before admission:
+the Run id stays reusable and nothing is sent.
+
+- **What qualifies.** Only a connection that gave no answer: a stalled stream,
+  a dropped connection, or a stream that ended before its stop report. An
+  error the server declared inside the stream (an Anthropic error frame, an
+  OpenAI chat or Gemini `error` object, a Responses `response.failed`) is an
+  answer, and a local failure to read the stream (such as a line past the
+  16 MiB SSE line limit) would recur; neither is re-issued. Abort,
+  a context-window refusal (its own recovery) and the checkpoint budget keep
+  their paths.
+- **How many.** A request uses its own re-issue first, then the budget. The
+  budget is the Run's, across all its turns. A request whose own re-issue was
+  spent on an attempt that showed nothing has no second one: a silent and a
+  visible failure of the same request share it. Each re-issue is the
+  identical request, byte for byte, with its own connection retries (the same
+  limit and backoff as the first attempt's).
+- **What the Host sees.** When an attempt that showed output is re-issued,
+  its segment closes `discarded` as on any stream error; if it delivered
+  thinking, `thinking_discarded` follows with that segment's `index`, `turn`
+  and `group` and the thinking `bytes` it delivered; then `retry_notice`
+  reports `attempt` as the number of this request's streams that broke off so
+  far, this one included, `max` as the most attempts the request may make (the
+  first, its own re-issue, and what is left of the budget), and `delay_ms` as
+  the short backoff (500 ms) the Run waits before sending the re-issue. An
+  abort during that wait ends the Run `STOP_ABORTED`, and nothing more is
+  sent. The `run_state` phase is `retrying` until the next attempt's stream
+  opens, and its output arrives in a new segment (the next `index`, the same
+  `group`). A Host removes or ignores everything the withdrawn attempt showed:
+  the segment's text and the thinking `thinking_discarded` names. An attempt
+  that showed nothing is re-issued at once, without any of these events. The
+  last attempt, once the request's re-issue and the budget are spent, closes
+  `discarded` and the Run ends with `STOP_API_ERROR` and its `model_error`.
+- **What it does not show.** No tool call of a withdrawn attempt is announced
+  or executed: `tool_start` follows a completed stream. A read-only call the
+  loop may have started speculatively while the attempt streamed is joined
+  and its result dropped. An OpenAI Responses reasoning item never crosses
+  this ABI; one from a withdrawn attempt is dropped with it and is never sent
+  back to the model. Results of tools that completed on earlier turns stay in
+  the Conversation and in the re-issued request.
+- **Accounting.** Every re-issue is another provider request: usage events
+  report what each attempt consumed, the durable budget reserves and settles
+  each request, and a durable Run journal records each with its own attempt
+  identity. `model_error.attempts` counts every physical attempt of the
+  request that failed, re-issues included. A re-issue that succeeds leaves no
+  `model_error`.
+- **Which Runs.** Each request's own re-issue applies to every model request
+  the engine makes, a subagent's included. The budget covers the Run's own
+  model requests: Text, multimodal and goal-continuation Runs, and a Skill
+  invocation Run, inline or in its own context (that child is the Run). A
+  subagent, or a Skill the model invokes in its own context, has none; its
+  output is a tool result, not segments the Host shows.
+
+Neither the request's own re-issue nor the budget ever enters a provider
+request; a Run whose streams complete sends the same bytes whatever the
+budget's value.
+
 ### Manual compact
 
 `session_compact` runs the canonical default compact policy as a best-effort
-Conversation maintenance operation. Revision 26 has no Host-supplied target
+Conversation maintenance operation. Revision 28 has no Host-supplied target
 token budget and does not guarantee that the result fits the context window of
 the current or a future model. `session_set_model` and `session_compact` are
 independent primitives, not a compound model-migration transaction.
@@ -872,7 +983,78 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 `after_context_tokens` are context-size estimates for UI and policy decisions;
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
-reason in Revision 26, and a Host must not infer one by parsing diagnostics.
+reason in Revision 28, and a Host must not infer one by parsing diagnostics.
+
+### Automatic compaction inside a Run
+
+A Run compacts its own Conversation when context pressure that compaction can
+relieve would otherwise stop it, and then continues: the same Run ID, the same
+turn, no Host replay of the instruction. It uses the same compact kernel as
+`session_compact`, at the shared loop's safe boundaries — before a sampling
+request and after a turn's tool results are committed — never in the middle
+of a tool batch. Three pressures start it:
+
+| Pressure | When | `auto_compact.cause` |
+|---|---|---|
+| Model window | The pending request reaches the auto-compact threshold derived from the model's real input window and output reservation | `pre_sampling_pending_turn_threshold`, `post_tool_follow_up_threshold` |
+| Provider refusal | The provider rejects the request as exceeding its context window | `context_window_exceeded_recovery` |
+| Checkpoint capacity | The durable estimate reaches `soft_bytes` (what `RUN_RESULT_COMPACTION_RECOMMENDED` reports), or the next sampling request would not fit under `hard_bytes` (or `provider_request_cap_bytes`) beside the durable state | `durable_capacity_threshold`, `durable_capacity_recovery` |
+
+`summary_fallback` and `tool_result_pressure` replace the cause when the
+summary request failed (the kernel's degraded replacement, which keeps the
+user's own requests) or oversized tool results had to be cut as well. The cause
+set is open; a Host must accept one it does not know. While a compaction runs,
+`run_state.phase` is `compacting`.
+
+Compaction answers to the Run's durable budget:
+
+- The summary request goes through the Run's budgeted Provider. Its request and
+  result caps, the audit reserve, every live reservation and the terminal
+  reserve apply, it is charged to usage accounting (`usage` events and the
+  Session goal) like any request, and it counts as a provider operation. It is
+  admitted as maintenance: against the caps and the live reservations, not
+  against the Conversation it may replace, so a near-hard Session can compact.
+  A capacity refusal is deferred before any network I/O; the request is
+  re-issued after the compaction.
+- The replacement commits only if its exact checkpoint, every live
+  reservation (unfinished operations, input accepted by `submit_input` and not
+  yet adopted) and the terminal reserve fit under `hard_bytes`. After the
+  commit the Run's durable estimate is re-measured from the resulting state;
+  reservations are untouched.
+- A summary that exceeds `provider_result_cap_bytes`, a request over a cap, or
+  a refused replacement ends the Run with the ordinary budget terminal
+  (`STOP_CHECKPOINT_RESOURCE_LIMIT` / `STOP_CHECKPOINT_BUDGET_EXHAUSTED` with
+  `required_checkpoint_bytes`, and the matching `checkpoint_outcome_code`); the
+  Conversation is not replaced. The terminal `run_state.phase` is `failed`. A
+  refusal is never reported as `aborted`, which only a cancellation
+  (`session_abort`) produces.
+
+Recovery is bounded and stops with an actionable reason:
+
+- A provider refusal is answered with at most one compaction per turn and one
+  re-issue of that turn. When nothing older than the retained suffix exists,
+  when the kernel's savings gate refuses (one oversized message, typically the
+  newest, dominates the request), or when the re-issued request is refused
+  again, the Run stops with `STOP_API_ERROR` and its `model_error` category is
+  `context_window`. AgentCore never trims history to make a request fit, and
+  never clears or truncates committed tool results in place (the stale
+  tool-result clearing a CLI Run applies below the compaction threshold does
+  not run). The only tool-result reduction is the compact kernel's own, applied
+  to the replacement before its guarded commit (`tool_result_pressure`).
+- Checkpoint capacity starts at most three compactions per Run, and an attempt
+  that relieved nothing (or found nothing to compact) is not repeated until
+  the durable estimate has grown. When capacity is still short the Run stops
+  with `STOP_CHECKPOINT_BUDGET_EXHAUSTED` and the bytes it would have needed:
+  whether the re-issued request is refused, or the recovery gives up without
+  re-issuing it (its compaction failed, or the turn's recovery bound is
+  spent), `required_checkpoint_bytes` is what the deferred request needed.
+
+`session_abort` during a compaction cancels its summary request. Nothing is
+replaced; tool calls already executed keep their committed results and are
+never re-executed; tool calls and results stay paired; Permission state is
+unchanged; input accepted during the compaction and not yet adopted is
+released and counted in `input_accepted_count` but not in
+`input_adopted_count`. The Run stops with `STOP_ABORTED`.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
@@ -893,6 +1075,18 @@ shell tool selected under the disabled shell policy fail Session creation with
 `workspace_home` may be empty, in which case it defaults to the canonicalized
 `workspace_root`; a non-empty value must be absolute.
 
+`SHELL_SANDBOXED` eagerly verifies the platform executor at Session creation:
+Seatbelt on macOS, or bubblewrap with seccomp on Linux. An unavailable backend
+returns `METASK_AGENTCORE_STATUS_INVALID_ARGUMENT` without publishing a handle.
+The bundle also includes `bin/metacodes-fs-helper` (`.exe` on Windows), listed
+and hashed in `files`. Native file operations under an enabled sandbox use
+that helper; deploy it beside the Host executable or set the trusted Host
+environment variable `METACODES_SANDBOX_HELPER` to its absolute path. There is
+no PATH/project-config lookup and no unsandboxed file-operation fallback. The
+helper is an implementation dependency; its private fd-passing protocol adds
+no ABI table, struct field or negotiated capability. Windows currently cannot
+admit a sandboxed shell Session. See [sandbox execution](SANDBOX_DESIGN.md).
+
 ### Provider protocol selection
 
 `SessionHostConfigV1` defines one provider connection as
@@ -901,7 +1095,7 @@ fresh-create input or restored checkpoint. `protocol_kind_code` occupies byte
 offset 140 in the unchanged 168-byte Host config and accepts:
 
 - `METASK_AGENTCORE_PROTOCOL_DEFAULT` (`0`): use the selected provider's
-  existing default. In Revision 26 that means Anthropic Messages, OpenAI Chat
+  existing default. In Revision 28 that means Anthropic Messages, OpenAI Chat
   Completions, or Gemini GenerateContent;
 - `METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES` (`1`): valid only with
   `METASK_AGENTCORE_PROVIDER_OPENAI`; serialize `POST /v1/responses` request
@@ -982,8 +1176,9 @@ changes with the date. `RunOptionsV1.time_context_code` chooses the zone:
 `utc_offset_minutes` is zero under every code but `UTC_OFFSET`. A Host block
 labeled `currentDate` is the Run's time context: under `SYSTEM` the runtime
 adds none, and together with `UTC_OFFSET` it is two answers to one question
-and the Run is refused. A Skill invocation carries no context blocks, so it
-takes `SYSTEM` (nothing is added) or `OFF`. Every violation is
+and the Run is refused. A Skill invocation takes the time context as a Text
+Run does (#534): its context leads the invocation record, so under `SYSTEM`
+and `UTC_OFFSET` the Skill's first request names the date. Every violation is
 `INVALID_ARGUMENT` before admission: no `run_id` advances and nothing reaches
 the Provider.
 
@@ -1027,7 +1222,7 @@ nothing.
 
 The runtime reaches the other two statuses itself: `budget_limited` when
 usage reaches the budget, and `usage_limited` is reserved for a provider
-usage limit (Revision 26 never sets it). A new budget with room makes a
+usage limit (Revision 28 never sets it). A new budget with room makes a
 `budget_limited` goal active, and an active goal already past a lowered
 budget becomes `budget_limited` at once.
 
@@ -1213,7 +1408,7 @@ reservation into the Session's durable usage; the Run's end releases the
 rest. Input passes no permission, sandbox, cancellation, or budget decision:
 it only adds a user record.
 
-Support is discovered through Revision 26 itself (the slot is mandatory);
+Support is discovered through Revision 28 itself (the slot is mandatory);
 `MAX_SUBMITTED_INPUTS_V1` (64) and `MAX_SUBMITTED_INPUT_BYTES_V1` (16 MiB) are
 published constants; `session_describe` is unchanged.
 
@@ -1293,8 +1488,62 @@ destroy and restore are not needed, also not while a Run is going.
   configuration (`SessionHostConfigV1.api_key`), never one published to the
   Session that exported the checkpoint.
 
-Support is discovered through Revision 26 itself (the slot is mandatory);
+Support is discovered through Revision 28 itself (the slot is mandatory);
 `MAX_CREDENTIAL_BYTES_V1` (16 KiB) is a published constant.
+
+### Edit and rerun
+
+Revision 27 adds `session_control->rewind_to_user_message(session, position,
+out_error)`, edit-and-rerun's history change (#441). It is the kernel operation
+the CLI's `/edit` and `SessionHost`'s `Submission.replaces` use (#432;
+[API.md, Edit and rerun](API.md#edit-and-rerun)).
+
+`position` is a 1-based count over the Session's full history: the compacted
+prefix is included (compaction is a projection and never renumbers), and the
+numbering is that of `describe`'s `conversation.message_count`. A Host learns a
+Run's own position as `message_count + 1`, read while idle just before
+`run_input`: the Run's input is the first record the Run appends (its context
+blocks and time context lead that same record). An input adopted by
+`submit_input` is its own user record, appended later in the Run. A restored
+Session numbers the history its checkpoint carries; before any compaction that
+is the exported one, position for position.
+
+On `STATUS_OK` the user message at `position` and everything after it — later
+prompts, replies, tool calls and tool results — are dropped and discarded, not
+kept as a branch. The next Run's input then takes the dropped message's place,
+after exactly the context that preceded it: the provider request is a
+byte-identical prefix of the earlier requests plus the new input, so nothing
+enters the cached prefix. The Host reruns by calling `run_input` with the
+edited input, of any kind. Only the Conversation changes:
+
+- files written, commands run and other effects of the dropped turns stay;
+  the must-read-first record is cleared, since the rerun's context no longer
+  shows what the dropped turns read;
+- the model, permission mode, policy generation and Session grants, Skill
+  binding, MCP selection, goal, prompt profile and `last_run_id` are
+  unchanged; run ids keep increasing;
+- the durable usage is re-measured, so `describe`'s `budget` shows the freed
+  bytes; a checkpoint exported afterwards holds the edited Conversation and
+  never the dropped one, and a Session restored from it continues from the
+  edited history.
+
+| Situation | Status |
+|---|---|
+| a user message at or after the compact boundary | `OK` |
+| zero | `INVALID_ARGUMENT` |
+| no message at `position` | `MESSAGE_POSITION_OUT_OF_RANGE` (31) |
+| an assistant reply (the leading summary of a Session restored after a compaction included), a tool result, or text the runtime wrote itself | `NOT_USER_MESSAGE` (32) |
+| a message behind the compact boundary, whose preceding context exists only as the summary | `MESSAGE_POSITION_COMPACTED` (33) |
+| a Run, compact, checkpoint export or other facade call is active, including from the Session's own callbacks | `BUSY` |
+| a poisoned Session (checked after the facade gate, before the position) | `INVALID_STATE` |
+
+Every refusal changes nothing and writes a diagnostic. The three position
+statuses name a position whose preceding context cannot be reconstructed as it
+stood; a Host must not infer which by parsing the diagnostic. A message at the
+compact boundary can be rewound: the summary stays its preceding context, as
+in every request since the compaction.
+
+Support is discovered through Revision 28 itself (the slot is mandatory).
 
 ### Active-Run intent/result journal
 
@@ -1324,7 +1573,7 @@ it therefore does not insert prompt bytes, reorder history, or invalidate a
 warm prompt-cache prefix. An unfinished pair fails closed, and so does a Run
 whose process exited before its terminal record (the next Run reports
 `UnfinishedRun`; a Run still held by a live process reports `JournalBusy`);
-revision 26 does **not** expose in-place active-Run resume, automatic
+revision 28 does **not** expose in-place active-Run resume, automatic
 tool replay, or exactly-once external effects. It provides durable evidence
 and deterministic recovery classification for a later explicit recovery API,
 not authority to guess whether an external side effect occurred.
@@ -1430,9 +1679,9 @@ workspace, and tools; a profile the current kernel refuses restores as
 `CHECKPOINT_UNSUPPORTED`.
 
 `RunOptionsV1.context_blocks` (with `context_block_count`, null with zero when
-absent) carries up to 32 `ContextBlockV1` facts for one `RUN_INPUT_TEXT` or
-`RUN_INPUT_MULTIMODAL` Run — the date, the state of the Host's page or
-document. Each has a label of 1-64 bytes of `[A-Za-z0-9 ._:/-]` starting with a
+absent) carries up to 32 `ContextBlockV1` facts for one `RUN_INPUT_TEXT`,
+`RUN_INPUT_MULTIMODAL` or `RUN_INPUT_SKILL` Run — the date, the state of the
+Host's page or document, a file the user attached. Each has a label of 1-64 bytes of `[A-Za-z0-9 ._:/-]` starting with a
 letter or digit and non-empty UTF-8 text of at most 64 KiB (256 KiB for labels
 and texts together); a text may not contain a `<system-reminder>` tag. They are
 rendered, in order, into one text part that leads the Run's user record:
@@ -1449,8 +1698,13 @@ Today's date is 2026/10/02.
 
 It is ordinary Conversation content: it enters the durable budget with the
 user record, stays in later requests' history (the cached prefix only grows),
-and checkpoints keep it. A `RUN_INPUT_SKILL` Run refuses context blocks with
-`STATUS_INVALID_ARGUMENT`. Volatile facts belong here rather than in profile
+and checkpoints keep it. A `RUN_INPUT_SKILL` Run takes the same blocks under
+the same rules (#534): the text part leads its invocation record, the user
+record that precedes the Skill body, so the Skill's first request carries the
+context before the body. A Skill with `context: fork` runs in a child
+Conversation whose one user record is the context and the Skill body, in
+that order; the Session Conversation keeps the context leading the
+invocation record either way. Volatile facts belong here rather than in profile
 text, which would move the system prompt and its cache prefix on every change.
 
 The process-wide `METACODES_PROMPT_OVERRIDE_USING_TOOLS` experiment slot sets
@@ -1553,14 +1807,14 @@ published once, not that the Host filesystem is transactional.
 AgentCore does not implicitly read `/etc/metacodes/skills`, `.claude/skills`,
 `.codex/skills`, or `.metacodes/skills`. A Host may explicitly register any
 local directory only when its contents already use the canonical Agent Skill
-format. Directory names do not select a parser; Revision 26 has no Claude/Codex
+format. Directory names do not select a parser; Revision 28 has no Claude/Codex
 format adapter or public Provider Registry. The projected provider id is
 `agents.directory`.
 
 Each valid `skills[]` entry exposes separate identities:
 
 - `skill_policy_key`: the logical invocation slot, equal to
-  `invocation_name` in Revision 26;
+  `invocation_name` in Revision 28;
 - `provider_id`, `source_scope`, `source_instance_id`, and `contribution_id`:
   source identity;
 - `content_revision`: body/resources identity;
@@ -1737,7 +1991,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 26. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 28. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -1749,7 +2003,7 @@ product decision.
 
 ### MCP Runtime catalog and Session view
 
-Revision 26 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
+Revision 28 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
 connections. Public negotiation codes preserve Revision 6 meanings:
 `auto=1`, `modern_only=2`, and exact `legacy_only=3`; exact
 `legacy_2025_06_only=4` is appended. Runtime owns negotiation,
@@ -1801,7 +2055,7 @@ returns.
 | Reporting every completed HTTP response's final status and body | Host Connector |
 | Binding one connection context to `purpose_code` and `requested_era_code` | Host Connector |
 
-Revision 26 separates MCP control and result traffic in the type system.
+Revision 28 separates MCP control and result traffic in the type system.
 `McpConnectorV1.request` writes a 40-byte `McpResponseV1` only for bounded
 discovery/initialize/catalog control frames. Stdio responses use
 `http_status == 0`; Streamable HTTP completed responses use their final status
@@ -1950,7 +2204,7 @@ materializes a provider
 with the recorded envelope admission is an invariant violation. View
 destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
-outside Revision 26.
+outside Revision 28.
 
 The value-only MCP checkpoint section has one current `MCPSEL` format and no
 independent revision axis. Its decoder rejects every earlier `R6MCP`/`R7MCP`
@@ -1960,7 +2214,7 @@ Tools to the current catalog's, and the permission section's grants restore
 only where their binding names that connection. MCP grants in checkpoints
 exported before #389 carry the earlier connection-free binding, so restore
 invalidates them.
-The outer AgentCore ABI Revision 26 remains the sole compatibility boundary.
+The outer AgentCore ABI Revision 28 remains the sole compatibility boundary.
 
 ### Model-visible MCP diagnostics
 
@@ -2112,7 +2366,7 @@ needed.
   (`disableBypassPermissionsMode`, `disableAutoMode`) would also return
   `INVALID_ARGUMENT`, diagnostic `PermissionModeDisabled`; a Session's
   settings are the Host-imported rules, which cannot disable a mode, so this
-  does not occur in revision 26. None of these changes anything.
+  does not occur in revision 28. None of these changes anything.
 - **Effective point.** The first permission decision after the call returns
   `OK`, which is the first Tool call of the next Run.
 - **Grants.** A new mode is a new policy. The call starts a new policy
@@ -2146,6 +2400,15 @@ needed.
 
 ### Permission authority and provenance
 
+A tool call reaches the permission decision only with admissible arguments
+(#494): one JSON object that names no key twice at any level. Anything else
+runs nothing, calls no Permission callback, and its result is the ordinary
+tool error `invalid_args` (`category` `user_error`, `recoverable` true), so
+the model can send the call again. The PreToolUse hook, the permission
+decision and the tool all read the arguments in one canonical spelling;
+whitespace around a colon or a different escape does not change what any
+of them sees.
+
 A Permission callback request carries a `candidate`
 (`{"rule_id","scope","target"}`, or null) whenever a Session answer can take
 part in later decisions; `deny_session`/`allow_session` echo its `rule_id`.
@@ -2163,10 +2426,11 @@ AgentCore derives `target` exactly as the tool derives the file it opens: the
 tool's own reading of its path argument (`file_path`; `Write` also accepts the
 historical `path`), JSON unescaping, `~` against the Workspace home, relative
 paths against the Workspace root, then lexical normalization (symlinks are not
-resolved). It offers `file_target` only when a strict JSON parse of the
-arguments finds the same top-level path string; arguments that the tool and a
-JSON reader would resolve to different files (a nested object or an escaped
-key carrying a second `file_path`) get `exact_arguments`. A file grant is
+resolved). The tool reads only the top-level member, so a nested object or
+an escaped key carrying a second `file_path` names nothing. It offers
+`file_target` only when a strict JSON parse of the arguments finds the same
+top-level path string; arguments that do not name a file the tool could open
+get `exact_arguments`. A file grant is
 bound to its Tool (a `Write` grant does not cover `Edit`) and to the logical
 Session, and ranks where `session_allow`/`session_deny` always rank: explicit
 deny, Core safety, active Skill narrowing, and explicit ask still decide first.
@@ -2199,14 +2463,20 @@ permission deny.
 AgentCore sets `no_interactive_prompt` as an absolute input-ownership boundary.
 After an unavailable, cancelled, or failed UI callback it never reads a process
 answer queue or stdin. Public provenance preserves the typed callback outcome.
-The current shared bool prompt seam still renders non-answered permission
-outcomes to the model as the same ordinary deny Tool result; consumers that
-need the distinction must use `permission_provenance` until a shared typed
-prompt-outcome contract replaces that seam.
+The Tool result the model reads tells a non-answer from a person's deny
+([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#14-requests-nobody-answered), #463): a
+permission request with no `on_ui_request`, or answered
+`METASK_AGENTCORE_UI_UNAVAILABLE`, reads *"'\<tool\>' was denied without
+asking: this session has no way to ask for permission and wait for the
+answer. …"*, while a Host's `deny_once`/`deny_session` response still reads
+*"user declined '\<tool\>' via prompt"*. Both keep `code` `permission_denied`
+and `recoverable: false`. The C ABI's types, statuses and callback contract
+are unchanged; `permission_provenance` remains the typed record of the
+callback outcome.
 
 ### Completion boundary
 
-Revision 26 exposes no Completion handle, DTO, status, or function slot.
+Revision 28 exposes no Completion handle, DTO, status, or function slot.
 Independent title, summary, classification, and other product-level model calls
 belong to the Host or a product plugin. If the Agent itself must invoke such a
 capability, the Host exposes a semantically bounded Tool; a generic Completion
@@ -2342,6 +2612,16 @@ normally deploys that file next to its own executable — a location the probe
 resolves without additional configuration. Hosts that deliberately drop the
 asset must also omit `Glob`/`Grep` from `builtin_tools`.
 
+Model input never reaches ripgrep as an option (#460). `Grep` passes its
+`pattern` only as the value of `--regexp=` and its search path only after
+`--`. It joins every other value the model supplies to its flag in a single
+argument: `--glob=`, `--type=`, and `--before-context=`, `--after-context=`
+and `--context=` for `-B`/`-A`/`-C`. `Glob` passes its pattern as `--glob=`
+and its path after `--`. A pattern that begins with `-`, such as
+`--pre=<program>`, is searched as literal text and runs no program. That is
+why both tools can stay read-only: `accept_edits` runs them without a prompt,
+and `ShellPolicy.disabled` keeps them available.
+
 ### Resource limits
 
 V1 applies these limits to inputs or identities that amplify library
@@ -2383,6 +2663,7 @@ allocations or unbounded work:
 | MCP schema/arguments JSON container entries / admission work units | 256 / 65536 |
 | MCP legacy default TTL / maximum accepted TTL | 30 s / 300 s |
 | one Run | 1000 turns |
+| one Run's stream retry budget (`RunOptionsV1.stream_retry_budget`) | 8 re-issues |
 | one tool_result file_refs array / path / URI / title / kind | 32 / 4096 / 8192 / 256 / 64 bytes |
 | one file_changes array / retained unified diff per file | 64 records / 256 KiB |
 | prompt profile entries / one section text / all section texts | 64 / 64 KiB / 256 KiB |
@@ -2474,7 +2755,7 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. While Revision 26 remains
+`struct_size`; every reserved field must be zero. While Revision 28 remains
 unreleased and experimental, an explicitly approved hard cut may replace its
 wire shape in place only when the library, headers, SDKs, consumers, tests, and
 documentation move atomically; the replaced bundle is void and no compatibility
@@ -2486,11 +2767,11 @@ or control-message extensions require `metask_agentcore_get_api(2)` and v2
 types. Assigning a meaning or non-zero value to a reserved field is always an
 explicit wire-contract decision, never an inferred compatible extension.
 
-Revision 26's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 28's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
-Revision 26 has no root capability mask. The seven typed table pointers and
+Revision 28 has no root capability mask. The seven typed table pointers and
 their exact layouts are the complete ABI surface and are all mandatory.
 Concrete Runtime and Session configuration still determines which tools and
 callbacks are active; that configuration is not ABI capability negotiation.

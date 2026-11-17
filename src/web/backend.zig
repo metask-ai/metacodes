@@ -5,14 +5,19 @@
 //! 阻塞等浏览器 POST /respond 回填 UiResponse。agent_loop/core 零改动——协议合不合理,
 //! 这个文件写不写得顺就是答案。
 //!
-//! journal 行:内核事件与 UI 请求一律是 core/protocol/wire.zig 的 v1 行(带 "v" 与 "type"),
-//! 与任何进程外 Host 收到的完全相同:
-//!   {"v":1,"type":"<CoreEvent tag>","data":...}                    — emit
+//! journal 行:本宿主写进 journal 的每一行都是 core/protocol/wire.zig 的 v1 行(带 "v" 与
+//! "type"),与 SessionHost 及任何进程外 Host 收到的同一语法(doc/WIRE_PROTOCOL.md):
+//!   {"v":1,"type":"<CoreEvent tag>","run_id":N,"data":...}         — Run 内 emit
+//!   {"v":1,"type":"<CoreEvent tag>","data":...}                    — Run 外 emit
+//!   {"v":1,"type":"<HostEvent tag>","data":{...}}                  — journalHost(driver 的
+//!                                                                    user_message/run_done/
+//!                                                                    command_result/message_rejected)
 //!   {"v":1,"type":"ui_request","id":N,"kind":"...","request":{...}} — requester 发起
 //!   {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered"|"cancelled"}
 //!                                                                  — 回答/中断(重放时关对话框)
-//! session driver(session.zig)的 {"user_message": "..."} / {"run_done":{...}} 仍是本 web
-//! 宿主自己的信封。浏览器回填的 JSON 由 wire.parseResponse 解析。
+//! Run 编号同 SessionHost:每会话从 1 起,driver 在 Run 开始时 beginRun(随即写 user_message),
+//! endRun 写 run_done;其间 emit 的内核事件都带这个 run_id。本宿主不收 trace ID,故无 trace_id。
+//! 浏览器回填的 JSON 由 wire.parseResponse 解析。
 //!
 //! 能力声明(doc/WIRE_PROTOCOL.md §2):前端 POST /capabilities 的帧经 declareCapabilities
 //! 装进 `capabilities` 槽,并把 capabilities_accepted 行落 journal。之后 requester 先路由:
@@ -73,6 +78,13 @@ pub const WebBackend = struct {
     /// 前端声明的能力(POST /capabilities);空 = 未声明,全部通告。
     capabilities: frontend_capabilities.Slot = .{},
 
+    /// The Run in progress, 0 between Runs. Set and cleared by the driver
+    /// (`beginRun`/`endRun`); read by `emit` on any thread, so every kernel
+    /// event journaled while it is set carries it as `run_id`.
+    current_run: std.atomic.Value(u64) = .init(0),
+    /// Runs begun so far; the next one is `runs + 1`. Driver thread only.
+    runs: u64 = 0,
+
     pub fn init(allocator: std.mem.Allocator, journal: *EventJournal) WebBackend {
         return .{ .allocator = allocator, .journal = journal };
     }
@@ -128,6 +140,76 @@ pub const WebBackend = struct {
         return self.capabilities.acceptedLine(allocator);
     }
 
+    // ── Runs and host lines (driver thread) ───────────────────────────────
+
+    /// How a Run ended, as its `run_done` reports it: `stop_reason` when it
+    /// returned (with `model_error` when the stop was a model failure),
+    /// `error_name` when it failed.
+    pub const RunEnd = struct {
+        stop_reason: ?[]const u8 = null,
+        error_name: ?[]const u8 = null,
+        model_error: ?@import("../api/model_error.zig").Detail.View = null,
+    };
+
+    /// Driver thread: starts the next Run (1, 2, … per session, as
+    /// SessionHost numbers them) and returns its id. The caller journals its
+    /// `user_message` lines next, unless a macro or `/retry` started it.
+    pub fn beginRun(self: *WebBackend) u64 {
+        std.debug.assert(self.current_run.load(.acquire) == 0);
+        self.runs += 1;
+        self.current_run.store(self.runs, .release);
+        return self.runs;
+    }
+
+    /// The Run in progress, 0 between Runs.
+    pub fn runId(self: *WebBackend) u64 {
+        return self.current_run.load(.acquire);
+    }
+
+    /// Driver thread: journals the Run's `run_done` and ends it.
+    pub fn endRun(self: *WebBackend, end: RunEnd) void {
+        const run_id = self.current_run.load(.acquire);
+        std.debug.assert(run_id != 0);
+        defer self.current_run.store(0, .release);
+        var done = wire.HostEvent{ .run_done = .{
+            .run_id = run_id,
+            .stop_reason = end.stop_reason,
+            .error_name = end.error_name,
+            .model_error = end.model_error,
+        } };
+        if (self.appendLine(wire.writeHostEvent(self.allocator, done))) return;
+        // The notification matters more than its detail.
+        done.run_done.model_error = null;
+        if (!self.appendLine(wire.writeHostEvent(self.allocator, done)))
+            log.warn("web", "dropped run_done of run {d} (serialize OOM)", .{run_id});
+    }
+
+    /// Journals a host event (`user_message`, `command_result`,
+    /// `message_rejected`; `run_done` goes through `endRun`).
+    pub fn journalHost(self: *WebBackend, event: wire.HostEvent) void {
+        if (!self.appendLine(wire.writeHostEvent(self.allocator, event)))
+            log.warn("web", "dropped host event .{s} (serialize OOM)", .{@tagName(event)});
+    }
+
+    /// Journals a kernel event: with the Run's `run_id` while one is in
+    /// progress, without one between Runs. Any thread.
+    pub fn journalEvent(self: *WebBackend, ev: CoreEvent) void {
+        const run_id = self.current_run.load(.acquire);
+        // borrow slice 契约:序列化即拷贝,返回前完成消费。
+        const line = if (run_id != 0)
+            wire.writeRunEvent(self.allocator, .{ .run_id = run_id }, ev)
+        else
+            wire.writeEvent(self.allocator, ev);
+        if (!self.appendLine(line)) log.warn("web", "dropped CoreEvent .{s} (serialize OOM)", .{@tagName(ev)});
+    }
+
+    fn appendLine(self: *WebBackend, line: error{OutOfMemory}![]u8) bool {
+        const owned = line catch return false;
+        defer self.allocator.free(owned);
+        self.journal.append(owned);
+        return true;
+    }
+
     // ── UiBackend:emit / poll ──────────────────────────────────────────────
 
     fn emitThunk(ctx: *anyopaque, _: SessionId, ev: CoreEvent) void {
@@ -135,13 +217,7 @@ pub const WebBackend = struct {
         if (ev == .usage) {
             if (self.usage_totals) |u| u.apply(ev.usage);
         }
-        // borrow slice 契约:序列化即拷贝,返回前完成消费。
-        const line = wire.writeEvent(self.allocator, ev) catch {
-            log.warn("web", "dropped CoreEvent .{s} (serialize OOM)", .{@tagName(ev)});
-            return;
-        };
-        defer self.allocator.free(line);
-        self.journal.append(line);
+        self.journalEvent(ev);
     }
 
     fn pollThunk(_: *anyopaque, _: SessionId) ?UiEvent {
@@ -199,7 +275,7 @@ pub const WebBackend = struct {
                 self.pending_id = 0;
                 self.unlock();
                 self.announceClosed(id, .cancelled);
-                return wire.cancelResponse(req, out);
+                return wire.cancelResponse(req, .cancelled);
             };
             _ = self.cond.timedWait(&self.mutex, 200 * std.time.ns_per_ms);
         }
@@ -214,18 +290,33 @@ pub const WebBackend = struct {
 
         if (cancelled) {
             self.announceClosed(id, .cancelled);
-            return wire.cancelResponse(req, out);
+            return wire.cancelResponse(req, .cancelled);
         }
-        const reading = wire.parseResponse(req, resp_json, allocator, out) catch |err| {
-            self.announceClosed(id, if (err == error.InputAborted) .malformed else .cancelled);
+        // Who answered (#446), recorded on the close. This host's respond has
+        // no error to refuse an unusable `by` with, so that one is not
+        // recorded and the answer still applies; SessionHost refuses it.
+        const by = wire.answerApprover(self.allocator, resp_json) catch |err| blk: {
+            log.warn("web", "approver of request {d} not recorded: {s}", .{ id, @errorName(err) });
+            break :blk null;
+        };
+        defer if (by) |name| self.allocator.free(name);
+        wire.parseResponse(req, resp_json, allocator, out) catch |err| {
+            // An unreadable answer still names who sent it; running out of
+            // memory reading it closes on nobody's answer.
+            const closed = wire.closedOnParseError(err);
+            self.announceClosedBy(id, closed, if (closed == .malformed) by else null);
             return err;
         };
-        self.announceClosed(id, reading.closed());
+        self.announceClosedBy(id, .answered, by);
         return .answered;
     }
 
     fn announceClosed(self: *WebBackend, id: u64, outcome: wire.RequestClosed) void {
-        const line = wire.writeRequestClosed(self.allocator, id, outcome) catch return;
+        self.announceClosedBy(id, outcome, null);
+    }
+
+    fn announceClosedBy(self: *WebBackend, id: u64, outcome: wire.RequestClosed, by: ?[]const u8) void {
+        const line = wire.writeRequestClosedBy(self.allocator, id, outcome, by) catch return;
         defer self.allocator.free(line);
         self.journal.append(line);
     }
@@ -253,7 +344,7 @@ pub const WebBackend = struct {
 
 const testing = std.testing;
 
-test "emit 把 CoreEvent 以 core_event 信封落 journal" {
+test "emit 把 CoreEvent 以 wire v1 行落 journal" {
     var j = EventJournal.init(testing.allocator);
     defer j.deinit();
     var wb = WebBackend.init(testing.allocator, &j);
@@ -270,6 +361,40 @@ test "emit 把 CoreEvent 以 core_event 信封落 journal" {
     try testing.expect(std.mem.indexOf(u8, batch[0], "\"type\":\"text_chunk\"") != null);
     try testing.expect(std.mem.indexOf(u8, batch[0], "hello web") != null);
     try testing.expect(std.mem.indexOf(u8, batch[1], "stream_done") != null);
+}
+
+test "#444 a Run's kernel events carry its run_id, none between Runs; run_done ends it in SessionHost's form" {
+    var j = EventJournal.init(testing.allocator);
+    defer j.deinit();
+    var wb = WebBackend.init(testing.allocator, &j);
+    defer wb.deinit();
+    const be = wb.backend();
+    be.emitEvent(SessionId.single, .stream_done);
+    const first = wb.beginRun();
+    try testing.expectEqual(@as(u64, 1), first);
+    wb.journalHost(.{ .user_message = .{ .run_id = first, .text = "hi" } });
+    be.emitEvent(SessionId.single, .{ .text_chunk = "on it" });
+    wb.endRun(.{ .stop_reason = "end_turn" });
+    be.emitEvent(SessionId.single, .stream_done);
+    try testing.expectEqual(@as(u64, 2), wb.beginRun());
+    wb.endRun(.{ .error_name = "RunControlUnavailable" });
+    try testing.expectEqual(@as(u64, 0), wb.runId());
+
+    const lines = (try j.waitSince(testing.allocator, 0, 10)).?;
+    defer {
+        for (lines) |l| testing.allocator.free(l);
+        testing.allocator.free(lines);
+    }
+    const expected = [_][]const u8{
+        "{\"v\":1,\"type\":\"stream_done\",\"data\":null}",
+        "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"hi\",\"replaces\":null}}",
+        "{\"v\":1,\"type\":\"text_chunk\",\"run_id\":1,\"data\":\"on it\"}",
+        "{\"v\":1,\"type\":\"run_done\",\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"end_turn\",\"error_name\":null,\"model_error\":null}}",
+        "{\"v\":1,\"type\":\"stream_done\",\"data\":null}",
+        "{\"v\":1,\"type\":\"run_done\",\"data\":{\"run_id\":2,\"trace_id\":null,\"stop_reason\":null,\"error_name\":\"RunControlUnavailable\",\"model_error\":null}}",
+    };
+    try testing.expectEqual(expected.len, lines.len);
+    for (expected, lines) |want, got| try testing.expectEqualStrings(want, got);
 }
 
 test "requester: permission 请求经 journal 通告,respond 回填 → answered + done 事件" {
@@ -311,6 +436,42 @@ test "requester: permission 请求经 journal 通告,respond 回填 → answered
     try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "\"outcome\":\"answered\"") != null);
 }
 
+test "#446 requester: the answer's approver is recorded on ui_request_closed; an unusable one is not, and the answer still applies" {
+    const Case = struct { answer: []const u8, closed: []const u8, choice: PermissionChoice };
+    const cases = [_]Case{
+        .{ .answer = "{\"choice\":\"allow_once\",\"by\":\"alice@example.com\"}", .closed = "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\",\"by\":\"alice@example.com\"}", .choice = .allow_once },
+        .{ .answer = "{\"choice\":\"deny_once\",\"by\":42}", .closed = "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\"}", .choice = .deny_once },
+    };
+    for (cases) |case| {
+        var j = EventJournal.init(testing.allocator);
+        defer j.deinit();
+        var wb = WebBackend.init(testing.allocator, &j);
+        defer wb.deinit();
+        const Responder = struct {
+            fn run(b: *WebBackend, jj: *EventJournal, answer: []const u8) void {
+                const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
+                defer {
+                    for (batch) |l| std.testing.allocator.free(l);
+                    std.testing.allocator.free(batch);
+                }
+                _ = b.respond(1, answer);
+            }
+        };
+        const t = try std.Thread.spawn(.{}, Responder.run, .{ &wb, &j, case.answer });
+        defer t.join();
+        const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+        var resp: UiResponse = undefined;
+        try testing.expectEqual(RequestOutcome.answered, try wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
+        try testing.expectEqual(case.choice, resp.permission);
+        const all = (try j.waitSince(testing.allocator, 0, 10)).?;
+        defer {
+            for (all) |l| testing.allocator.free(l);
+            testing.allocator.free(all);
+        }
+        try testing.expectEqualStrings(case.closed, all[all.len - 1]);
+    }
+}
+
 test "requester: abort 中断等待 → permission 安全 deny + cancelled 事件" {
     var j = EventJournal.init(testing.allocator);
     defer j.deinit();
@@ -323,9 +484,8 @@ test "requester: abort 中断等待 → permission 安全 deny + cancelled 事�
     const r = wb.requester();
     const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var resp: UiResponse = undefined;
-    const outcome = try r.request(SessionId.single, testing.allocator, &req, &resp);
-    try testing.expectEqual(RequestOutcome.answered, outcome);
-    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
+    // Denied as cancelled (#463), not as the user's deny_once answer.
+    try testing.expectError(error.UiRequestCancelled, r.request(SessionId.single, testing.allocator, &req, &resp));
 
     const all = (try j.waitSince(testing.allocator, 0, 10)).?;
     defer {
@@ -399,8 +559,7 @@ test "requester: 与中断赛跑的应答作废,按取消处理并记 cancelled"
     defer t.join();
     const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var resp: UiResponse = undefined;
-    try testing.expectEqual(RequestOutcome.answered, try wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
-    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
+    try testing.expectError(error.UiRequestCancelled, wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
     const all = (try j.waitSince(testing.allocator, 0, 10)).?;
     defer {
         for (all) |l| testing.allocator.free(l);
@@ -426,12 +585,37 @@ test "requester: 读不懂的应答按取消处理,记 malformed 而非 answered
     defer t.join();
     const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var resp: UiResponse = undefined;
-    try testing.expectEqual(RequestOutcome.answered, try wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
-    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
+    try testing.expectError(error.UiAnswerUnreadable, wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
     const all = (try j.waitSince(testing.allocator, 0, 10)).?;
     defer {
         for (all) |l| testing.allocator.free(l);
         testing.allocator.free(all);
     }
     try testing.expect(std.mem.indexOf(u8, all[all.len - 1], "\"outcome\":\"malformed\"") != null);
+}
+
+test "#446 requester: an unreadable answer closes malformed under its approver" {
+    var j = EventJournal.init(testing.allocator);
+    defer j.deinit();
+    var wb = WebBackend.init(testing.allocator, &j);
+    defer wb.deinit();
+    const Responder = struct {
+        fn run(b: *WebBackend, jj: *EventJournal) void {
+            const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
+            for (batch) |l| std.testing.allocator.free(l);
+            std.testing.allocator.free(batch);
+            _ = b.respond(1, "{\"choice\":\"pretty_please\",\"by\":\"alice\"}");
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Responder.run, .{ &wb, &j });
+    defer t.join();
+    const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    var resp: UiResponse = undefined;
+    try testing.expectError(error.UiAnswerUnreadable, wb.requester().request(SessionId.single, testing.allocator, &req, &resp));
+    const all = (try j.waitSince(testing.allocator, 0, 10)).?;
+    defer {
+        for (all) |l| testing.allocator.free(l);
+        testing.allocator.free(all);
+    }
+    try testing.expectEqualStrings("{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"malformed\",\"by\":\"alice\"}", all[all.len - 1]);
 }

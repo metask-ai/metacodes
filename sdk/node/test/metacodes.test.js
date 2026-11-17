@@ -75,6 +75,47 @@ test('a model failure reaches the result and a later success clears it', { skip 
   assert.equal(recovered.modelError, null);
 });
 
+test('a stream cut after thinking is sent again under the budget (Revision 28)', { skip }, async (t) => {
+  // Issue #452: thinking, then the body ends with no stop reason.
+  const provider = await withProvider(t, [['thinking_cut', 'private reasoning'], ['text', 'recovered']]);
+  const { session } = open(t, { tools: [] }, provider, workspace(t));
+  const events = [];
+  const result = await session.run('think', { streamRetryBudget: 1, onEvent: (event) => events.push(event) });
+  assert.equal(result.stopReason, 'end_turn');
+  assert.equal(result.text, 'recovered');
+  assert.equal(result.modelError, null);
+  assert.equal(provider.requests.length, 2);
+  assert.deepEqual(provider.requests[1], provider.requests[0]);
+  const payloads = (tag) => events.filter((event) => tag in event).map((event) => event[tag]);
+  assert.deepEqual(payloads('thinking_discarded'), [{ index: 0, turn: 1, group: 0, bytes: 17 }]);
+  // One failed stream of at most three: the first attempt, the request's own
+  // re-issue (#461) and the budget's one, after the short backoff.
+  assert.deepEqual(payloads('retry_notice'), [{ attempt: 1, max: 3, delay_ms: 500 }]);
+  assert.deepEqual(result.segments.map((segment) => segment.disposition), ['discarded', 'final']);
+});
+
+test('without a budget a request cut twice after thinking ends the Run', { skip }, async (t) => {
+  // Issue #461: every request has one re-issue of its own; the second cut of
+  // the same request ends the Run.
+  const provider = await withProvider(t, [
+    ['thinking_cut', 'private reasoning'],
+    ['thinking_cut', 'private reasoning'],
+    ['text', 'never sent'],
+  ]);
+  const { session } = open(t, { tools: [] }, provider, workspace(t));
+  const events = [];
+  const result = await session.run('think', { onEvent: (event) => events.push(event) });
+  assert.equal(result.stopReason, 'api_error');
+  assert.equal(provider.requests.length, 2);
+  assert.deepEqual(provider.requests[1], provider.requests[0]);
+  const payloads = (tag) => events.filter((event) => tag in event).map((event) => event[tag]);
+  assert.deepEqual(payloads('thinking_discarded'), [{ index: 0, turn: 1, group: 0, bytes: 17 }]);
+  assert.deepEqual(payloads('retry_notice'), [{ attempt: 1, max: 2, delay_ms: 500 }]);
+  assert.equal(result.modelError.attempts, 2);
+  await assert.rejects(session.run('think', { streamRetryBudget: 9 }), RangeError);
+  assert.equal(provider.requests.length, 2);
+});
+
 test('every event of a Run arrives before its Promise settles', { skip }, async (t) => {
   const provider = await withProvider(t, [['text', 'ordered']]);
   const { session } = open(t, { tools: [] }, provider, workspace(t));
@@ -390,6 +431,31 @@ test('setPermissionMode applies to the next Run', { skip, timeout: TIMEOUT }, as
   await session.run('write two');
   assert.equal(fs.existsSync(path.join(root, 'first.txt')), false);
   assert.equal(fs.existsSync(path.join(root, 'second.txt')), true);
+});
+
+test('rewindToUserMessage reruns an edited message', { skip, timeout: TIMEOUT }, async (t) => {
+  const provider = await withProvider(t, [['text', 'first answer'], ['text', 'second answer'], ['text', 'edited answer']]);
+  const { session } = open(t, { tools: [] }, provider, workspace(t));
+  await session.run('alpha-prompt');
+  const position = session.describe().conversation.message_count + 1;
+  await session.run('beta-prompt');
+  assert.equal(session.describe().conversation.message_count, 4);
+  // An assistant reply and a position past the end are refused with their
+  // own codes and change nothing.
+  assert.throws(() => session.rewindToUserMessage(2), { code: 'NOT_USER_MESSAGE' });
+  assert.throws(() => session.rewindToUserMessage(9), { code: 'MESSAGE_POSITION_OUT_OF_RANGE' });
+  assert.throws(() => session.rewindToUserMessage(0), TypeError);
+  assert.equal(session.describe().conversation.message_count, 4);
+  assert.equal(provider.requests.length, 2);
+  session.rewindToUserMessage(position);
+  assert.equal(session.describe().conversation.message_count, 2);
+  const result = await session.run('gamma-edited');
+  assert.equal(result.text, 'edited answer');
+  const rerun = JSON.stringify(provider.requests[2].messages);
+  assert.match(rerun, /alpha-prompt/);
+  assert.match(rerun, /gamma-edited/);
+  assert.doesNotMatch(rerun, /beta-prompt/);
+  assert.doesNotMatch(rerun, /second answer/);
 });
 
 test('allowSession is asked once per target', { skip, timeout: TIMEOUT }, async (t) => {

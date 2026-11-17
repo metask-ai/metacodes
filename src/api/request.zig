@@ -330,6 +330,10 @@ fn serializeContent(
     var first = true;
     for (content) |block| {
         if (block == .reasoning_item) continue;
+        // thinking 块只回传给声明了回传的方言(DeepSeek 的 Anthropic 端点收无签名的
+        // thinking 块);Claude 拒收没有签名的 thinking 块,而签名没有保存。不回传时
+        // 请求字节与投影 thinking 之前逐字节相同。空的 thinking 块不是推理,不发。
+        if (block == .thinking and (!profile.echoes_reasoning_content or block.thinking.len == 0)) continue;
         if (!first) try buf.append(allocator, ',');
         first = false;
         switch (block) {
@@ -341,8 +345,7 @@ fn serializeContent(
                 try buf.append(allocator, '}');
             },
             .thinking => |t| {
-                // preserved thinking 回传(Anthropic):thinking block 必须原样、按序回传。
-                // 对齐 Claude Opus 4.5+:保留 thinking 提升多轮推理质量。
+                // 只有声明了回传的方言走到这里(见上方 continue)。
                 try buf.append(allocator, '{');
                 try buf.appendSlice(allocator, "\"type\":\"thinking\",\"thinking\":");
                 try util_json.serializeString(t, buf, allocator);
@@ -1188,7 +1191,7 @@ test "SerializationReport: fail-closed 方言把图像结果计入占位,内建 
     try std.testing.expect(std.mem.indexOf(u8, body_closed, "was read successfully but omitted") != null);
     var native = SerializationReport{};
     defer native.deinit(a);
-    const body_native = try serializeMessagesRequestWithDialectReport(req, a, dialect_mod.Resolver.builtin().resolve(.anthropic, req.model), &native);
+    const body_native = try serializeMessagesRequestWithDialectReport(req, a, dialect_mod.Resolver.builtin().resolve(.anthropic, null, req.model), &native);
     defer a.free(body_native);
     try std.testing.expectEqual(@as(usize, 1), native.image_results);
     try std.testing.expectEqual(@as(usize, 0), native.image_placeholders);

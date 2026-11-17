@@ -1,9 +1,10 @@
-"""Guided API-key login for a provider without OAuth (the GLM Coding Plan).
+"""Guided API-key login for a provider without OAuth (the GLM Coding Plan, Kimi Code).
 
-Z.AI offers no third-party sign-in, so `/login zai-coding-plan`, the `/model`
-picker and `metacodes login --provider zai-coding-plan` show the plan pages a
-key is created on, take the pasted key without showing it, check it with a
-GET the provider does not bill, and store it in that provider's own key file.
+Z.AI offers no third-party sign-in, so `/login zai-coding-plan` and
+`metacodes login --provider zai-coding-plan` show the plan pages a key is
+created on, take the pasted key without showing it, check it with a GET the
+provider does not bill, and store it in that provider's own key file. The
+`/model` picker takes no key (#488): it only says where one goes.
 
 The check is pointed at a local mock with METACODES_KEY_CHECK_URL; the page a
 key is created on is "opened" through a $BROWSER recorder. The kernel flow and
@@ -27,6 +28,7 @@ GOOD_KEY = "plan-key-7c1e93"
 BAD_KEY = "plan-key-wrong5"
 CN_PERSONAL = "https://bigmodel.cn/coding-plan/personal/overview"
 GLOBAL_PERSONAL = "https://z.ai/manage-apikey/apikey-list"
+KIMI_CONSOLE = "https://www.kimi.com/code/console"
 
 
 class _KeyCheck(http.server.BaseHTTPRequestHandler):
@@ -101,12 +103,12 @@ class _Case:
     def checks(self):
         return [auth for path, auth in self.server.seen if path.endswith("/models")]
 
-    def assert_stored(self, key):
+    def assert_stored(self, key, kind="zai_coding_plan_api_key"):
         path = self.key_file()
         assert os.path.exists(path), f"no key file at {path}"
         with open(path) as f:
             document = json.load(f)
-        assert document["key"] == key and document["kind"] == "zai_coding_plan_api_key", document.get("kind")
+        assert document["key"] == key and document["kind"] == kind, document.get("kind")
         if not IS_WINDOWS:
             mode = stat.S_IMODE(os.stat(path).st_mode)
             assert mode == 0o600, f"key file mode {oct(mode)}, expected 0o600"
@@ -115,6 +117,24 @@ class _Case:
         if os.path.exists(config):
             with open(config) as f:
                 assert key not in f.read(), "the key leaked into config.json"
+
+
+class _KimiCase(_Case):
+    """The same scratch HOME and recorder, for the Kimi Code subscription:
+    every Kimi and Moonshot variable cleared, the check on the coding path."""
+
+    def env(self):
+        env = super().env()
+        env.update({
+            "KIMI_CODE_API_KEY": None,
+            "KIMI_API_KEY": None,
+            "MOONSHOT_API_KEY": None,
+            "METACODES_KEY_CHECK_URL": f"http://127.0.0.1:{self.server.server_port}/coding/v1/models",
+        })
+        return env
+
+    def key_file(self):
+        return os.path.join(self.home, ".metacodes", "keys", "kimi-code.json")
 
 
 def _screen(raw, rows, cols):
@@ -164,25 +184,27 @@ def test_login_dialog_refused_key_stores_nothing_and_says_why(bin_path):
         assert not os.path.exists(case.key_file()), "a refused key was stored"
 
 
-def test_model_pick_without_a_key_takes_the_pasted_key_and_switches(bin_path):
+def test_model_takes_no_key_and_shows_where_it_goes(bin_path):
+    # #488: /model no longer opens a key field. Without a key a filter finds the
+    # plan's models dimmed ("not configured"); choosing one shows the variable, this
+    # install's .env and the guide. It checks nothing, opens nothing, stores
+    # nothing: `/login zai-coding-plan` (above) is where a key is pasted.
     with _Case() as case:
-        events = [READY, "type:/model", "key:enter", wait_for("Provider", 10),
-                  "type:zai", "sleep:0.5", "key:enter", "sleep:0.8",  # provider
-                  "key:enter", "sleep:0.8",  # GLM-5.3
-                  "key:enter", "sleep:0.8",  # its China · Anthropic channel
-                  "key:enter", wait_for("API key", 10),  # options: apply → no key
-                  f"type:{GOOD_KEY}", wait_for(f"({len(GOOD_KEY)} characters)", 10),
-                  "key:enter", wait_for("switched to glm-5.3", WAIT_S)]
+        events = [READY, "type:/model", "key:enter", wait_for("apply to", 10),
+                  "type:zai", wait_for("not configured", 10), "key:enter",
+                  wait_for("ZAI_API_KEY", 10), f"type:{GOOD_KEY}", "key:enter", "sleep:0.8"]
         raw = run(bin_path, events, term_size=(40, 120), env=case.env(), per_key_drain=0.05)
         a, text = _screen(raw, 40, 120)
-        if not a.screens_with("China · Personal Coding Plan"):
-            a._fail("the key step should list the plan pages")
-        assert "switched to glm-5.3 for session" in text, "the pending pick was not applied:\n" + text
-        assert GOOD_KEY.encode() not in raw, "the pasted key was echoed to the terminal"
-        assert case.checks() == [f"Bearer {GOOD_KEY}"], case.checks()
-        # Enter checks and stores; only Tab opens the page.
+        env_file = os.path.join(case.home, ".metacodes", ".env")
+        assert f"Set ZAI_API_KEY in {env_file}, then restart" in text, text
+        assert "LOCAL_CONFIG.md" in text, text
+        if a.screens_with("paste it"):
+            a._fail("/model should not offer a key field")
+        # The characters typed in the setup were not taken as a key.
+        assert GOOD_KEY.encode() not in raw, "the typed key was echoed to the terminal"
+        assert case.checks() == [], case.checks()
         assert case.opened_urls() == [], case.opened_urls()
-        case.assert_stored(GOOD_KEY)
+        assert not os.path.exists(case.key_file()), "a key was stored from /model"
 
 
 def _cli(bin_path, args, env, answers, timeout=WAIT_S):
@@ -257,3 +279,44 @@ def test_cli_login_reads_the_key_without_echo(bin_path):
         assert case.opened_urls(1) == [GLOBAL_PERSONAL], case.opened_urls()
         assert case.checks() == [f"Bearer {GOOD_KEY}"], case.checks()
         case.assert_stored(GOOD_KEY)
+
+
+def test_login_dialog_lists_kimi_code_as_an_api_key_provider(bin_path):
+    with _KimiCase() as case:
+        # `/login` alone is the Metask sign-in (#485); it names the providers
+        # `/login <provider>` signs in to, the API-key ones among them.
+        events = [READY, "type:/login", "key:enter", wait_for("/login <provider>", 10),
+                  "key:esc", wait_for("Login interrupted", 10)]
+        raw = run(bin_path, events, term_size=(30, 200), env=dict(case.env(), BROWSER="true"), per_key_drain=0.05)
+        a, _ = _screen(raw, 30, 200)
+        # The names come from the profiles' api_key_setup, the GLM plan's too.
+        if not a.screens_with("kimi-code"):
+            a._fail("/login should name Kimi Code as a provider it signs in to")
+        if not a.screens_with("zai-coding-plan"):
+            a._fail("/login should still name the GLM Coding Plan")
+        assert case.checks() == [], case.checks()
+
+
+def test_login_dialog_stores_a_kimi_code_key_checked_on_the_coding_path(bin_path):
+    with _KimiCase() as case:
+        flag = " --no-browser" if IS_WINDOWS else ""
+        events = [READY, f"type:/login kimi-code{flag}", "key:enter",
+                  wait_for("Which plan is the key for?", 10),
+                  "key:enter", wait_for("paste it here", 10),
+                  f"type:{GOOD_KEY}", wait_for(f"({len(GOOD_KEY)} characters)", 10),
+                  "key:enter", wait_for("Stored the key for Kimi Code", WAIT_S)]
+        raw = run(bin_path, events, term_size=(30, 120), env=case.env(), per_key_drain=0.05)
+        a, _ = _screen(raw, 30, 120)
+        a.assert_prose_contains("Stored the key for Kimi Code · /model to choose a model")
+        if not a.screens_with("A Moonshot open-platform key does not work here"):
+            a._fail("the subscription-key note was never shown")
+        if not a.screens_with("China · Kimi Code Console"):
+            a._fail("the key step should list the Kimi Code Console")
+        if not a.screens_with(KIMI_CONSOLE):
+            a._fail("the Console URL was never shown whole")
+        assert GOOD_KEY.encode() not in raw, "the pasted key was echoed to the terminal"
+        assert case.checks() == [f"Bearer {GOOD_KEY}"], case.checks()
+        assert [path for path, _ in case.server.seen] == ["/coding/v1/models"], case.server.seen
+        if not IS_WINDOWS:
+            assert case.opened_urls(1) == [KIMI_CONSOLE], case.opened_urls()
+        case.assert_stored(GOOD_KEY, kind="kimi_code_api_key")

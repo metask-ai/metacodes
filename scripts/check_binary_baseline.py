@@ -24,12 +24,26 @@ version-needs section and the Mach-O load commands directly. Only executables
 this repository builds belong here: a vendored binary such as ripgrep selects
 its CPU paths at run time, so its static instruction mix says nothing.
 
+A Mach-O executable keeps data inside `__text`: LLVM places an x86_64 switch's
+jump table after its function and the linker lists every such range in
+`LC_DATA_IN_CODE`. A linear `objdump -d` decodes those tables as instructions,
+and the code after one from a wrong offset; the x86_64 macOS unit of the 0.10.0
+release run 41194755285 failed on one such entry of `repl.loop.readLineRaw`'s
+key switch, `62 f1 ff ff 59 f0`, two offsets that read as an EVEX `vmulsd`. So
+a Mach-O is disassembled in LLVM's Mach-O mode, which prints each listed range
+as data and resumes decoding where it ends, over every section that holds
+instructions. The check reads `LC_DATA_IN_CODE` itself and fails unless every
+range came back as data and no instruction starts inside one: nothing is
+skipped that the linker did not record as data, and GNU objdump, which has no
+such mode, cannot check a Mach-O.
+
 Python 3.9, stdlib only.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import os
 import re
 import shutil
@@ -41,15 +55,23 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 SHT_GNU_VERNEED = 0x6FFFFFFE
+LC_SEGMENT_64 = 0x19
+LC_DATA_IN_CODE = 0x29
 LC_BUILD_VERSION = 0x32
 LC_VERSION_MIN_MACOSX = 0x24
+S_ATTR_PURE_INSTRUCTIONS = 0x80000000
+S_ATTR_SOME_INSTRUCTIONS = 0x00000400
 MACHO_MAGIC_64 = 0xFEEDFACF
 FAT_MAGIC = 0xCAFEBABE
 GLIBC_RE = re.compile(r"^GLIBC_(\d+)\.(\d+)(?:\.(\d+))?$")
 
 # An instruction line of llvm-objdump or GNU objdump with --no-show-raw-insn:
 # "  401000:\tvmovdqu\t%ymm0, (%rdi)" or "  401000:\tvmovdqu %ymm0,(%rdi)".
-INSN_RE = re.compile(r"^\s*[0-9a-f]+:\s+([a-z][a-z0-9.]*)\b(.*)$")
+INSN_RE = re.compile(r"^\s*([0-9a-f]+):\s+([a-z][a-z0-9.]*)\b(.*)$")
+# How llvm-objdump's Mach-O mode prints a data-in-code entry, one line per
+# element: "1000f17b4:\t.long 4294953688\t@ KIND_JUMP_TABLE32".
+DICE_LINE_RE = re.compile(r"^\s*([0-9a-f]+):\s+\.(?:byte|short|long)\s+\d+\s+@ ")
+MACHO_SECTION_RE = re.compile(r"^Contents of \(([^,()]+),([^,()]+)\) section$")
 # x86_64, AT&T syntax. A VEX- or EVEX-encoded instruction is a `v` mnemonic
 # with a vector register operand (the VMX `vm*` and `verr`/`verw` take none).
 X86_RULES = (
@@ -163,8 +185,21 @@ def elf_glibc_needs(data: bytes) -> list:
 # ── Mach-O: the minimum OS version ──────────────────────────────────────────
 
 
-def macho_min_versions(data: bytes) -> list:
-    """The minimum macOS version of each slice (fat files have several)."""
+@dataclass(frozen=True)
+class MachOSlice:
+    minimum: tuple
+    # (segment, section) of every section that holds instructions.
+    code_sections: tuple
+    # (address, length, kind) of every LC_DATA_IN_CODE entry.
+    data_in_code: tuple
+
+
+def _name(raw: bytes) -> str:
+    return raw.split(b"\0", 1)[0].decode("ascii", "replace")
+
+
+def macho_slices(data: bytes) -> list:
+    """Each slice's minimum macOS, code sections and data-in-code ranges."""
     magic, = struct.unpack_from(">I", data, 0)
     if magic == FAT_MAGIC:
         count, = struct.unpack_from(">I", data, 4)
@@ -179,17 +214,53 @@ def macho_min_versions(data: bytes) -> list:
         ncmds, = struct.unpack_from("<I", data, offset + 16)
         cursor = offset + 32
         version = None
+        segments = []
+        code_sections = []
+        dice = None
         for _ in range(ncmds):
             cmd, size = struct.unpack_from("<II", data, cursor)
             if cmd == LC_BUILD_VERSION:
                 version = struct.unpack_from("<I", data, cursor + 12)[0]
             elif cmd == LC_VERSION_MIN_MACOSX:
                 version = struct.unpack_from("<I", data, cursor + 8)[0]
+            elif cmd == LC_SEGMENT_64:
+                vmaddr, _, fileoff, filesize = struct.unpack_from("<QQQQ", data, cursor + 24)
+                segments.append((vmaddr, fileoff, filesize))
+                nsects, = struct.unpack_from("<I", data, cursor + 64)
+                for i in range(nsects):
+                    base = cursor + 72 + 80 * i
+                    flags, = struct.unpack_from("<I", data, base + 64)
+                    if flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS):
+                        code_sections.append((_name(data[base + 16:base + 32]), _name(data[base:base + 16])))
+            elif cmd == LC_DATA_IN_CODE:
+                dice = struct.unpack_from("<II", data, cursor + 8)
             cursor += size
         if version is None:
             raise CheckError("a Mach-O slice records no minimum macOS version")
-        found.append((version >> 16, (version >> 8) & 0xFF, version & 0xFF))
+        entries = []
+        if dice is not None:
+            dataoff, datasize = dice
+            for i in range(datasize // 8):
+                entry_offset, length, kind = struct.unpack_from("<IHH", data, offset + dataoff + 8 * i)
+                # The offset counts from the slice's header; the segment that
+                # holds those file bytes gives their address.
+                for vmaddr, fileoff, filesize in segments:
+                    if fileoff <= entry_offset < fileoff + filesize:
+                        entries.append((vmaddr + entry_offset - fileoff, length, kind))
+                        break
+                else:
+                    raise CheckError(f"a data-in-code entry at file offset {entry_offset:#x} lies in no segment")
+        found.append(MachOSlice(
+            minimum=(version >> 16, (version >> 8) & 0xFF, version & 0xFF),
+            code_sections=tuple(code_sections),
+            data_in_code=tuple(entries),
+        ))
     return found
+
+
+def macho_min_versions(data: bytes) -> list:
+    """The minimum macOS version of each slice (fat files have several)."""
+    return [piece.minimum for piece in macho_slices(data)]
 
 
 # ── Instructions ────────────────────────────────────────────────────────────
@@ -208,9 +279,25 @@ def find_disassembler(explicit: Optional[str]) -> str:
     raise CheckError("no disassembler: install llvm-objdump or binutils' objdump, or pass --objdump")
 
 
-def disassemble(objdump: str, path: Path, arch: str) -> Iterable[str]:
-    argv = [objdump, "-d", "--no-show-raw-insn"]
-    if arch == "aarch64" and is_llvm(objdump):
+def disassemble(objdump: str, path: Path, arch: str, macho_sections: Optional[list] = None) -> Iterable[str]:
+    """The disassembler's lines for every instruction section of `path`.
+
+    `macho_sections` [(segment, section), ...] selects LLVM's Mach-O mode,
+    which honors LC_DATA_IN_CODE, over exactly those sections.
+    """
+    llvm = is_llvm(objdump)
+    if macho_sections is None:
+        argv = [objdump, "-d", "--no-show-raw-insn"]
+    else:
+        if not llvm:
+            raise CheckError(f"{objdump} is not llvm-objdump: only its Mach-O mode reads a Mach-O's data-in-code ranges as data")
+        if not macho_sections:
+            raise CheckError(f"{path} has no section that holds instructions")
+        # Without -d the Mach-O mode prints the named sections, a section of
+        # instructions disassembled; -d would print only (__TEXT,__text).
+        argv = [objdump, "--macho", "--arch=all", "--no-show-raw-insn"]
+        argv += [f"--section={segment},{section}" for segment, section in macho_sections]
+    if arch == "aarch64" and llvm:
         # LLVM decodes only the extensions it is told about; GNU decodes all.
         argv.append("--mattr=+sve,+sve2,+sme,+bf16,+i8mm")
     argv.append(str(path))
@@ -220,6 +307,11 @@ def disassemble(objdump: str, path: Path, arch: str) -> Iterable[str]:
     lines = completed.stdout.splitlines()
     if not any(INSN_RE.match(line) for line in lines[:2000]):
         raise CheckError(f"{objdump} printed no instructions for {path}")
+    if macho_sections is not None:
+        printed = {match.groups() for match in map(MACHO_SECTION_RE.match, lines) if match}
+        missing = [f"{segment},{section}" for segment, section in macho_sections if (segment, section) not in printed]
+        if missing:
+            raise CheckError(f"{objdump} printed no section {', '.join(missing)} of {path}")
     return lines
 
 
@@ -245,11 +337,12 @@ def instruction_findings(lines: Iterable[str], arch: str) -> dict:
         match = INSN_RE.match(line)
         if not match:
             continue
-        mnemonic = match.group(1)
+        mnemonic = match.group(2)
         # Drop the disassembler's annotations (`<symbol>`, `# 0x..` on x86,
-        # `// =0x..` on aarch64), so a symbol name is never read as a register.
-        operands = COMMENT_RE.sub("", match.group(2))
-        operands = operands.split("#")[0] if arch == "x86_64" else operands.split("//")[0]
+        # `// =0x..` on aarch64, `; literal pool for: ".."` in Mach-O mode),
+        # so a symbol name or string is never read as a register.
+        operands = COMMENT_RE.sub("", match.group(3))
+        operands = operands.split("#")[0] if arch == "x86_64" else operands.split("//")[0].split(";")[0]
         if arch == "x86_64":
             for name, rule in X86_RULES:
                 if rule.search(operands):
@@ -269,12 +362,41 @@ def instruction_findings(lines: Iterable[str], arch: str) -> dict:
     return found
 
 
+def check_data_in_code(lines: Iterable[str], entries: Iterable[tuple]) -> None:
+    """Fail unless the disassembly printed every LC_DATA_IN_CODE range as data
+    and started no instruction inside one."""
+    # An entry of length 0 covers no byte, and the disassembler prints none.
+    ranges = sorted(entry for entry in entries if entry[1] > 0)
+    if not ranges:
+        return
+    starts = [start for start, _, _ in ranges]
+    as_data = set()
+    for line in lines:
+        data = DICE_LINE_RE.match(line)
+        if data:
+            as_data.add(int(data.group(1), 16))
+            continue
+        match = INSN_RE.match(line)
+        if not match:
+            continue
+        address = int(match.group(1), 16)
+        index = bisect.bisect_right(starts, address) - 1
+        if index >= 0:
+            start, length, kind = ranges[index]
+            if address < start + length:
+                raise CheckError(f"the disassembler decoded {address:#x}, inside the data-in-code range {start:#x}+{length} (kind {kind}), as an instruction: {line.strip()}")
+    for start, length, kind in ranges:
+        if start not in as_data:
+            raise CheckError(f"the disassembler did not print the data-in-code range {start:#x}+{length} (kind {kind}) as data")
+
+
 # ── The check ───────────────────────────────────────────────────────────────
 
 
 def check(path: Path, target: Target, objdump: str) -> Report:
     report = Report(path)
     data = path.read_bytes()
+    lines = None
     if data[:4] == b"\x7fELF":
         if target.os != "linux":
             raise CheckError(f"{path} is ELF but the target is {target.os}")
@@ -286,16 +408,25 @@ def check(path: Path, target: Target, objdump: str) -> Report:
     elif data[:4] in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"):
         if target.os != "macos":
             raise CheckError(f"{path} is Mach-O but the target is {target.os}")
-        for minimum in macho_min_versions(data):
-            report.notes.append(f"minimum macOS {show(minimum)}")
-            if target.macos_max is not None and minimum > target.macos_max:
-                report.findings.append(f"minimum macOS {show(minimum)}, newer than the target's macOS {show(target.macos_max)}")
+        slices = macho_slices(data)
+        for piece in slices:
+            report.notes.append(f"minimum macOS {show(piece.minimum)}")
+            if target.macos_max is not None and piece.minimum > target.macos_max:
+                report.findings.append(f"minimum macOS {show(piece.minimum)}, newer than the target's macOS {show(target.macos_max)}")
+        sections = list(dict.fromkeys(section for piece in slices for section in piece.code_sections))
+        entries = [entry for piece in slices for entry in piece.data_in_code]
+        lines = disassemble(objdump, path, target.arch, macho_sections=sections)
+        check_data_in_code(lines, entries)
+        if entries:
+            report.notes.append(f"{len(entries)} data-in-code range(s), {sum(length for _, length, _ in entries)} bytes, read as data")
     elif data[:2] == b"MZ":
         if target.os != "windows":
             raise CheckError(f"{path} is PE but the target is {target.os}")
     else:
         raise CheckError(f"{path} is not an ELF, Mach-O or PE executable")
-    for name, (count, examples) in sorted(instruction_findings(disassemble(objdump, path, target.arch), target.arch).items()):
+    if lines is None:
+        lines = disassemble(objdump, path, target.arch)
+    for name, (count, examples) in sorted(instruction_findings(lines, target.arch).items()):
         report.findings.append(f"{count} {name} instruction(s) beyond the {target.arch} baseline, e.g. " + " | ".join(examples))
     return report
 

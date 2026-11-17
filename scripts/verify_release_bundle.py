@@ -207,6 +207,7 @@ def _component(manifest: dict, name: str) -> dict:
 # Everything the executables read from the environment to find a runtime asset
 # or a kernel; stripped so the bundle is judged on its own contents.
 NEUTRALIZED_ENV = (
+    "METACODES_SANDBOX_HELPER",
     "RG_BIN",
     "METACODES_KG_BIN",
     "METACODES_KGD_BIN",
@@ -386,6 +387,7 @@ def _fixture(root: Path) -> dict:
     commit = "0123456789abcdef0123456789abcdef01234567"
     contents = {
         "bin/metacodes": b"metacodes",
+        "bin/metacodes-fs-helper": b"sandbox-helper",
         "bin/rg": b"rg",
         "libexec/metacodes/metacodes-formal-kernel": b"formal",
         "libexec/metacodes/metacodes-formal-kernel.provenance.json": b"{}",
@@ -419,7 +421,7 @@ def _fixture(root: Path) -> dict:
         "toolchain": {"zig_version": "0.16.0"},
         "target": {"id": "x86_64-linux-gnu", "architecture": "x86_64", "os": "linux", "abi": "gnu", "zig_target": "x86_64-linux-gnu"},
         "build": {"optimize": "ReleaseSafe", "strip": True},
-        "contract": {"cli_surface_version": 1, "binary_abi_status": "experimental", "binary_abi_version": 1, "binary_abi_revision": 26, "config_schema_version": 1},
+        "contract": {"cli_surface_version": 1, "binary_abi_status": "experimental", "binary_abi_version": 1, "binary_abi_revision": 28, "config_schema_version": 1},
         "components": [
             {"role": "primary_executable", "name": "metacodes", "path": "bin/metacodes", "sha256": digests["bin/metacodes"], "version": "0.1.0"},
             {

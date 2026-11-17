@@ -39,7 +39,7 @@ def test_csi_u_ctrl_o_opens_model_picker(bin_path):
     # 白名单终端下 'o' 不能解析成 .unknown、让这个键静默失效。
     raw = run(bin_path, ["sleep:0.8", csi_u(111), "sleep:0.4"], per_key_drain=0.15)
     final, _ = _final_text(raw)
-    assert "Provider" in final, "CSI-u Ctrl+O 未打开 model picker:\n" + final
+    assert "apply to" in final, "CSI-u Ctrl+O 未打开 model picker:\n" + final
 
 
 def test_csi_u_ctrl_o_opens_transcript(bin_path):

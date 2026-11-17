@@ -21,6 +21,7 @@ const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const check_gate_mod = @import("../core/check_gate.zig");
+const isolated_verifier_mod = @import("../core/isolated_verifier.zig");
 const learning_turn_mod = @import("../core/learning_turn.zig");
 const test_integrity_mod = @import("../core/test_integrity.zig");
 const stall_gate_mod = @import("../core/stall_gate.zig");
@@ -162,6 +163,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
 
     printStartupBanner(app, allocator, splash);
     splash = .off; // ended (and freed) by the banner
+    // A stored default passed over for want of a credential (#485): once.
+    if (app.startup_notice) |notice| cmd_output.print("{s}{s}{s}\n\n", .{ app.theme.warn, notice, app.theme.reset });
 
     printStartupSuggestion(&suggestion_git);
 
@@ -246,7 +249,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             }
         }
 
-        if (shouldRunLoopContinuation(app, msg_queue.len())) {
+        if (app.unbound() == null and shouldRunLoopContinuation(app, msg_queue.len())) {
             try runLoopContinuation(&turn_host);
             continue;
         }
@@ -492,11 +495,34 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/retry")) {
+            if (refusedUnbound(app)) continue;
             // U11:回卷(丢弃最后 user 之后的回合)经 service;run 提交留宿主。
             if (svc.prepareRetry().run != null) {
                 try runTurn(&turn_host, .macro, null);
             } else {
                 cmd_output.print("\x1b[33mNo user message to retry\x1b[0m\n", .{});
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/edit") or std.mem.startsWith(u8, trimmed, "/edit ")) {
+            // Issue #432: edit one of the user's messages and rerun from it.
+            // Rewinding the conversation is the service's; the run is ours.
+            const rest = std.mem.trim(u8, trimmed["/edit".len..], " \t");
+            if (rest.len == 0) {
+                var listing: std.Io.Writer.Allocating = .init(allocator);
+                defer listing.deinit();
+                session_service.writeEditableMessages(&listing.writer, &app.conversation) catch {};
+                cmd_output.print("{s}", .{listing.written()});
+                continue;
+            }
+            if (refusedUnbound(app)) continue;
+            const d = svc.prepareEdit(rest);
+            if (d.run != null) {
+                cmd_output.print("\x1b[2mRewound to your message {s}; rerunning with the edited text.\x1b[0m\n", .{rest[0 .. std.mem.indexOfAny(u8, rest, " \t") orelse rest.len]});
+                try runTurn(&turn_host, .prompt, null);
+            } else {
+                var buf: [256]u8 = undefined;
+                cmd_output.print("\x1b[33m{s}\x1b[0m\n", .{d.outcome.render(&buf)});
             }
             continue;
         }
@@ -512,7 +538,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 \\Usage:       {d} input, {d} output, {d} cache read, {d} cache write
                 \\Model:       {s}
                 \\
-            , .{ u.costUsd(app.activeModel()), u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, app.activeModel() });
+            , .{ u.costUsd(app.activeModel()), u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, app.displayModel() });
             continue;
         }
         // issue #16:`/models` 选的是**凭证**(账号 API key),不是路由。路由选择归
@@ -540,6 +566,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         if (std.mem.eql(u8, trimmed, "/login") or std.mem.startsWith(u8, trimmed, "/login ")) {
             const rest = std.mem.trim(u8, trimmed[6..], " \t");
             if (shaped) try handleLoginDialog(app, rest) else try handleLogin(app, allocator, rest);
+            continue;
+        }
+        // #485: `/logout` signs out of Metask (both sign-ins) and moves the
+        // session to the provider `.env` configures, or to none;
+        // `/logout <provider>` forgets the key `/login <provider>` stored.
+        if (std.mem.eql(u8, trimmed, "/logout") or std.mem.startsWith(u8, trimmed, "/logout ")) {
+            handleLogout(app, std.mem.trim(u8, trimmed["/logout".len..], " \t"));
             continue;
         }
         // issue #16:`/providers` 列出当前所有路由;`/providers refresh` 重新拉取
@@ -610,6 +643,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/init")) {
+            if (refusedUnbound(app)) continue;
             // 对齐 cc:prompt 型命令——注入指令让模型扫码库写 CLAUDE.md(走正常 agent_loop)。
             const d = svc.submitMacro(session_service.INIT_PROMPT);
             if (d.run != null) {
@@ -626,12 +660,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         }
         // /btw <question>:侧问,不进对话历史(用临时 conversation 跑一次)
         if (std.mem.startsWith(u8, trimmed, "/btw ")) {
+            if (refusedUnbound(app)) continue;
             if (!try awaitMcpServers(&turn_host)) continue;
             try handleBtw(app, allocator, std.mem.trim(u8, trimmed[5..], " \t"));
             continue;
         }
         // /recap:生成会话一行总结(不进历史)
         if (std.mem.eql(u8, trimmed, "/recap")) {
+            if (refusedUnbound(app)) continue;
             if (app.conversation.len() >= 2 and !try awaitMcpServers(&turn_host)) continue;
             try handleRecap(app, allocator);
             continue;
@@ -690,6 +726,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         // /commit 和 /review：把预置 prompt 注入为 user message，走正常 agent_loop 路径
         // (U11:注入经 service.submitMacro,prompt 常量归 session_service——web/daemon 同源)
         if (std.mem.eql(u8, trimmed, "/commit")) {
+            if (refusedUnbound(app)) continue;
             const d = svc.submitMacro(session_service.COMMIT_PROMPT);
             if (d.run != null) {
                 try runTurn(&turn_host, .macro, null);
@@ -700,6 +737,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/review")) {
+            if (refusedUnbound(app)) continue;
             const d = svc.submitMacro(session_service.REVIEW_PROMPT);
             if (d.run != null) {
                 try runTurn(&turn_host, .macro, null);
@@ -737,6 +775,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 .command => |head| if (app.skill_runtime.findRecord(head) != null and
                     app.skill_runtime.overrideState(head).userInvocable())
                 {
+                    // A Skill run is a model request (a fork sends its own).
+                    if (refusedUnbound(app)) continue;
                     if (!try awaitMcpServers(&turn_host)) continue;
                 },
                 .not_a_command => {},
@@ -785,6 +825,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         app.clearActiveSkill();
 
         try history.append(final_input);
+        // No model (#484): the line stays in the history (↑ brings it back
+        // once one is set up) and goes nowhere else: no conversation entry,
+        // no request, no session record. The reminder hangs off its echo.
+        if (app.unbound() != null) {
+            if (tty) beginCommandBlock(app, "");
+            printUnboundReminder(app);
+            if (tty) cmd_output.end();
+            continue;
+        }
         // 粘贴占位符 [Pasted text #N] → 展开成真实内容再喂给模型；history 保留紧凑占位符。
         const expanded = blk: {
             if (app.stateRoot().len == 0) break :blk null;
@@ -889,6 +938,8 @@ fn awaitMcpServers(host: *const TurnHost) !bool {
 fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const u8) !void {
     const app = host.app;
     const allocator = host.allocator;
+    // Every way into a turn checks first; this is the last line (#484).
+    if (refusedUnbound(app)) return;
     // A `/v1/models` refresh that finished while the prompt was typed sets
     // this turn's limits.
     app.adoptModelCatalogRefresh();
@@ -1123,6 +1174,11 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
         // Host check gate: primary run only, same host-contract shape (a macro
         // run must not trigger a check or emit a second terminal record).
         run_opts.check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max);
+        // Isolated verifier: follows the check gate's green verdicts.
+        run_opts.isolated_verifier = if (run_opts.check_gate != null)
+            isolated_verifier_mod.optionsFromFlags(app.config.verifier, app.config.verifier_observe, app.config.verifier_model)
+        else
+            null;
         // Learning turn: primary run only, armed where the check gate gives it
         // a verdict; lesson headers name the run by its journal id.
         run_opts.learning_turn = learning_turn_mod.inRunOptions(
@@ -1162,6 +1218,9 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
         break :blk false;
     };
 
+    // Why the model failed, for the next step the `.api_error` notice below gives.
+    var model_failure: ?@import("../api/model_error.zig").Detail = null;
+    run_opts.model_error_out = &model_failure;
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
@@ -1252,13 +1311,22 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
     }
     // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
     // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。
+    // The last line is the next step. A rejected sign-in or key, or a balance
+    // that ran out, says what helps instead of /retry (next_step.zig).
     if (result.stop_reason == .api_error) {
         const last_error = @import("../api/last_error.zig");
+        const next_step = @import("next_step.zig");
+        const next_owned: ?[]u8 = if (model_failure) |*failure|
+            next_step.forFailure(allocator, app, failure, .interactive) catch null
+        else
+            null;
+        defer if (next_owned) |line| allocator.free(line);
+        const next = next_owned orelse "Retry with /retry, or switch models or compact the context first.";
         var detail_buf: [last_error.SUMMARY_BUF_LEN]u8 = undefined;
         if (last_error.take(&detail_buf)) |detail| {
-            cmd_output.print("\x1b[31mAPI request failed; the turn stopped.\n  {s}\nRetry with /retry, or switch models or compact the context first.\x1b[0m\n", .{detail});
+            cmd_output.print("\x1b[31mAPI request failed; the turn stopped.\n  {s}\n{s}\x1b[0m\n", .{ detail, next });
         } else {
-            cmd_output.print("\x1b[31mAPI request failed (retries exhausted, server error, or context too long); the turn stopped.\nRetry with /retry, or switch models or compact the context first.\x1b[0m\n", .{});
+            cmd_output.print("\x1b[31mAPI request failed (retries exhausted, server error, or context too long); the turn stopped.\n{s}\x1b[0m\n", .{next});
         }
     }
     // 工具不可恢复错误撞墙:明确告知,非静默。
@@ -1626,6 +1694,28 @@ fn beginCommandBlock(app: *const app_mod.App, line: []const u8) void {
     if (complete.isBuiltinCommand(trimmed[0..head_end])) cmd_output.flushEcho();
 }
 
+/// #484: the session has no model, so nothing that would reach one runs.
+/// True after printing the reminder in its place (inside the open command
+/// block, if any); false when the session has a model.
+fn refusedUnbound(app: *app_mod.App) bool {
+    if (app.unbound() == null) return false;
+    printUnboundReminder(app);
+    return true;
+}
+
+/// The unbound reminder (`App.writeUnboundReminder`), in the theme's danger
+/// colour, line by line (a block's gutter would otherwise reset it).
+fn printUnboundReminder(app: *app_mod.App) void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    app.writeUnboundReminder(&text.writer) catch {
+        cmd_output.print("{s}No model is set up: /login, or configure .env{s}\n", .{ app.theme.danger, app.theme.reset });
+        return;
+    };
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text.written(), "\n"), '\n');
+    while (lines.next()) |line| cmd_output.print("{s}{s}{s}\n", .{ app.theme.danger, line, app.theme.reset });
+}
+
 /// `⏺ Unknown command: /foo. Did you mean /loop?` in place of the command's
 /// echo (Claude Code).
 fn reportUnknownCommand(app: *const app_mod.App, line: []const u8) void {
@@ -1818,17 +1908,6 @@ fn readLineRaw(
                         }
                     }
                 }
-                // The picker's sign-in runs on a worker thread (#67); the idle
-                // tick is where its transcript reaches the overlay.
-                if (region.pickerOpen()) switch (picker_host.poll(app, &region.ui, .of(region))) {
-                    .committed => {
-                        region.clear();
-                        region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
-                        redraw(region, &editor, app);
-                    },
-                    .redraw => redraw(region, &editor, app),
-                    .ignored => {},
-                };
                 continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
             }
             if (rc > 0) break; // 有字节可读
@@ -2138,11 +2217,15 @@ fn readLineRaw(
                     continue;
                 },
                 .picker_key => {
-                    if (picker_host.onKey(app, &region.ui, eff.picker_key, .of(region)) == .committed) {
+                    switch (picker_host.onKey(app, &region.ui, eff.picker_key, .of(region))) {
                         // The overlay is gone; the confirmation has to survive
-                        // it or the user cannot tell which route was chosen.
-                        region.clear();
-                        region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
+                        // it or the user cannot tell which route was chosen,
+                        // or that none was ("kept …").
+                        .committed, .cancelled => {
+                            region.clear();
+                            region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
+                        },
+                        .ignored, .redraw => {},
                     }
                     redraw(region, &editor, app);
                     continue;
@@ -2402,6 +2485,25 @@ fn codepointDisplayWidth(cp: u21) usize {
 // ============================================================================
 
 const testing = std.testing;
+
+test "/login: the model choice replaces an older key in auth.json, and a copy that runs out of memory leaves it whole (#485, #527)" {
+    const Run = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var stored: @import("../core/auth.zig").StoredCredentials = .{};
+            defer stored.deinit(allocator);
+            stored.api_key = try allocator.dupe(u8, "sk-previous-key");
+            stored.selected_model = try allocator.dupe(u8, "previous-model");
+            try recordSignInChoice(allocator, &stored, "glm-5", .low);
+            try std.testing.expect(stored.api_key == null);
+            try std.testing.expect(stored.oauth == null);
+            try std.testing.expectEqualStrings("glm-5", stored.selected_model.?);
+            try std.testing.expectEqual(@as(?types_mod.ReasoningEffort, .low), stored.reasoning_effort);
+        }
+    };
+    // Every allocation fails in turn; the testing allocator reports a double
+    // free or a leak in any of them.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
 
 test "insertStartupText: memory running out drops the startup text with a notice, and the prompt comes up" {
     const a = std.testing.allocator;
@@ -2936,9 +3038,14 @@ fn reportAliasAmbiguity(app: *app_mod.App, store: *const @import("../provider/co
 
 fn printLoginUsage() void {
     cmd_output.print(
-        \\Usage: /login [<provider>] [--device-code] [--no-browser] [--client-id <id>]
-        \\With no provider, choose one from a list. The login is stored where
-        \\`metacodes login --provider <id>` stores it.
+        \\Usage: /login [--no-browser]
+        \\       /login <provider> [--device-code] [--no-browser] [--client-id <id>]
+        \\With no provider, sign in to Metask in the browser, as `metacodes login`
+        \\does, and choose a model and a reasoning level; the session and new
+        \\sessions use it. /login metask does the same with a code confirmed on
+        \\any device. With another provider, sign in to that provider; the login
+        \\is stored where `metacodes login --provider <id>` stores it.
+        \\/logout signs out of Metask; /logout <provider> forgets that provider's key.
         \\
     , .{});
 }
@@ -3032,9 +3139,23 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             break :blk value.options;
         },
     };
+    // `/login` alone (or with `--no-browser`) is the Metask browser sign-in
+    // `metacodes login` runs (#485); the provider list is `/login <provider>`.
+    if (named == null and options.method == .loopback and options.client_id == null) {
+        return handleMetaskSignIn(app, options.open_browser, false);
+    }
     const host = app.providerHost() catch |err| {
         cmd_output.print("{s}The provider registry is unavailable: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
         return;
+    };
+    // `/login metask` is the device code (#485): the same dialog as `/login`,
+    // with the code confirmed on any device, then the model and reasoning
+    // level (#527). Without them a start on the sign-in would run the
+    // compiled default, which the gateway does not serve.
+    if (named) |name| if (options.client_id == null) {
+        for (host.registry.profiles.items) |*profile| {
+            if (profile.id.eqlText("metask") and profile.matchesName(name)) return handleMetaskSignIn(app, options.open_browser, true);
+        }
     };
 
     var dialog: dialogs.LoginDialog = .{
@@ -3045,6 +3166,9 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
     defer dialog.deinit();
     var start_at: ?usize = null;
     for (host.registry.profiles.items) |*profile| {
+        // Metask signs in by `/login` and `/login metask`, which go on to its
+        // model and reasoning level; the list does not offer a third way.
+        if (named == null and profile.id.eqlText("metask")) continue;
         // `--client-id` names one provider's client; it is not offered to the rest.
         var profile_options = options;
         if (named == null or !profile.matchesName(named.?)) profile_options.client_id = null;
@@ -3093,6 +3217,175 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             };
         },
     }
+}
+
+/// `/login` (#485, #527): the Metask browser sign-in, or with `device_code`
+/// (`/login metask`) the device code, then the model and reasoning level, in
+/// a dialog (`dialogs.MetaskSignInDialog`). Once both are chosen the sign-in
+/// is stored where `metacodes login` stores it: the token response as the
+/// Metask session (`oauth/metask.json`, the gateway it names included), the
+/// model and reasoning level in `auth.json`. The session moves onto it, and
+/// Metask becomes the default: a stored `/model` default (which would outrank
+/// the sign-in at the next start) is forgotten. Esc at any step stores and
+/// changes nothing.
+fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) !void {
+    const th = app.theme;
+    var dialog = dialogs.MetaskSignInDialog.init(app.allocator);
+    defer dialog.deinit();
+    dialog.term_rows = terminalRows();
+    var others: std.ArrayList(u8) = .empty;
+    defer others.deinit(app.allocator);
+    if (app.providerHost()) |host| {
+        // The providers `/login <provider>` signs in to: a key page, or a
+        // grant it can run.
+        for (host.registry.profiles.items) |*profile| {
+            if (profile.id.eqlText("metask")) continue;
+            const flow_ok = if (provider_login.prepareFlow(profile, .{ .state_root = app.stateRoot() }, host.oauthClientIdFor(profile.id))) |_| true else |_| false;
+            if (!flow_ok and profile.api_key_setup == null) continue;
+            if (others.items.len > 0) others.appendSlice(app.allocator, ", ") catch break;
+            others.appendSlice(app.allocator, profile.id.slice()) catch break;
+        }
+    } else |_| {}
+    dialog.others = others.items;
+    dialog.start(app.io, .{ .open_browser = open_browser, .device_code = device_code });
+    runDialog(dialogs.MetaskSignInDialog, &dialog, app);
+    if (dialog.outcome != .chosen) {
+        cmd_output.print("Login interrupted · nothing was changed\n", .{});
+        return;
+    }
+    const model = dialog.chosenModel() orelse return;
+    const worker = dialog.takeWorker() orelse return;
+    defer worker.release();
+    const token_json = worker.takeTokenJson() orelse return;
+    defer {
+        std.crypto.secureZero(u8, token_json);
+        app.allocator.free(token_json);
+    }
+
+    var diagnostic: provider_login.ImportDiagnostic = .{};
+    const applied = app.applyMetaskSession(.{
+        .gateway = worker.gateway.?,
+        .model = model,
+        .effort = dialog.effort,
+        .models_json = worker.models_json.?,
+    }, token_json, &diagnostic);
+    if (applied.storage_error != null or applied.switch_error != null) {
+        const err = if (applied.storage_error) |storage_err| storage_err else applied.switch_error.?;
+        if (applied.rollback_error) |rollback_err| {
+            cmd_output.print("{s}Login failed: {s}; the previous sign-in could not be fully restored ({s}){s}\n", .{ th.danger, @errorName(err), @errorName(rollback_err), th.reset });
+        } else {
+            cmd_output.print("{s}Login failed: {s}; the previous sign-in, model default, and this session are unchanged{s}\n", .{ th.danger, @errorName(err), th.reset });
+        }
+        return;
+    }
+    cmd_output.print("Signed in to Metask", .{});
+    // Who signed in, when the server said (a second account is easy to pick
+    // up from a browser already signed in).
+    if (worker.accountName()) |name| cmd_output.print(" as {s}", .{name});
+    cmd_output.print(" · {s}", .{app.activeModel()});
+    if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
+    cmd_output.print("\n", .{});
+    if (applied.default_error) |err| {
+        cmd_output.print("{s}The stored default model could not be cleared ({s}); the next start may use it{s}\n", .{ th.warn, @errorName(err), th.reset });
+    } else {
+        cmd_output.print("{s}New sessions start on Metask{s}{s}.{s}\n", .{
+            th.dim,
+            " too",
+            if (applied.default_forgotten) " (the previous default model is forgotten)" else "",
+            th.reset,
+        });
+    }
+}
+
+/// `auth.json`'s part of a `/login` (#485, #527): the chosen model and
+/// reasoning level (`StoredCredentials.recordSessionChoice`).
+fn recordSignInChoice(
+    allocator: std.mem.Allocator,
+    stored: *@import("../core/auth.zig").StoredCredentials,
+    model: []const u8,
+    effort: ?types_mod.ReasoningEffort,
+) error{OutOfMemory}!void {
+    try stored.recordSessionChoice(allocator, model, effort);
+}
+
+/// `/logout` (#485, #499 part 2): out of Metask, both sign-ins, and the
+/// session onto the provider `.env` configures, or none. `/logout
+/// <provider>` forgets the key `/login <provider>` stored for it.
+fn handleLogout(app: *app_mod.App, rest: []const u8) void {
+    const th = app.theme;
+    if (rest.len > 0) {
+        if (std.mem.indexOfAny(u8, rest, " \t") != null or rest[0] == '-') {
+            cmd_output.print("Usage: /logout [<provider>]\n", .{});
+            return;
+        }
+        const host = app.providerHost() catch |err| {
+            cmd_output.print("{s}The provider registry is unavailable: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
+            return;
+        };
+        const profile = host.registry.find(rest) orelse {
+            cmd_output.print("{s}Unknown provider '{s}'{s}\n", .{ th.danger, rest, th.reset });
+            return;
+        };
+        if (!profile.id.eqlText("metask")) return logoutProvider(app, profile);
+    }
+    const done = app.signOutOfMetask() catch |err| {
+        cmd_output.print("{s}Logout failed: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
+        return;
+    };
+    // The browser sign-in and the device code both store the Metask
+    // session (#527); `auth.json` alone is an older sign-in or a key.
+    if (done.removed.device) {
+        cmd_output.print("Signed out of Metask: removed the sign-in.\n", .{});
+    } else if (done.removed.browser) {
+        cmd_output.print("Signed out of Metask: removed the browser sign-in.\n", .{});
+    } else if (!done.key_removed) {
+        cmd_output.print("No Metask sign-in was stored.\n", .{});
+    }
+    switch (done.revoke) {
+        .revoked => cmd_output.print("{s}Metask revoked it too.{s}\n", .{ th.dim, th.reset }),
+        .nothing_stored => {},
+        .failed => cmd_output.print("{s}Metask could not revoke it; it stays valid there until it expires.{s}\n", .{ th.warn, th.reset }),
+        .timed_out => cmd_output.print("{s}Metask did not answer the revocation in time; it may stay valid there until it expires.{s}\n", .{ th.warn, th.reset }),
+    }
+    if (done.key_removed) cmd_output.print("Removed the stored key for Metask.\n", .{});
+    if (done.default_cleared) cmd_output.print("Forgot the default model, which was a Metask one.\n", .{});
+    switch (done.session) {
+        .kept => {},
+        .switched => |switched| if (switched.origin.label()) |origin|
+            cmd_output.print("Switched to {s} ({s}) · {s}\n", .{ switched.name, origin, app.activeModel() })
+        else
+            cmd_output.print("Switched to {s} · {s}\n", .{ switched.name, app.activeModel() }),
+        .unbound => cmd_output.print("{s}No model is set up now: /login, or configure .env{s}\n", .{ th.warn, th.reset }),
+    }
+    if (done.key_in_shell) cmd_output.print("{s}METASK_API_KEY is still set in your shell: the next start signs in with it.{s}\n", .{ th.warn, th.reset });
+    if (done.key_in_local_config) {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}{c}.env", .{ app.stateRoot(), std.fs.path.sep }) catch ".env";
+        cmd_output.print("{s}METASK_API_KEY is still set in {s}; remove it there to stay signed out.{s}\n", .{ th.warn, path, th.reset });
+    }
+}
+
+/// `/logout <provider>`: the key `/login <provider>` stored. A session that
+/// was using it holds no credential afterwards. A key in `.env` or the shell
+/// is not removed here; the line says where it is.
+fn logoutProvider(app: *app_mod.App, profile: *const @import("../provider/profile.zig").ProviderProfile) void {
+    const th = app.theme;
+    const result = app.forgetProviderKey(profile.id) catch |err| {
+        cmd_output.print("{s}Logout failed: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
+        return;
+    };
+    if (result.removed) {
+        cmd_output.print("Removed the stored key for {s}.\n", .{profile.display_name});
+    } else {
+        cmd_output.print("No key is stored for {s}.\n", .{profile.display_name});
+    }
+    if (result.unbound) cmd_output.print("{s}This session was using it: no model is set up now (/model, or /login {s}).{s}\n", .{ th.warn, profile.id.slice(), th.reset });
+    if (result.local_variable) |name| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}{c}.env", .{ app.stateRoot(), std.fs.path.sep }) catch ".env";
+        cmd_output.print("{s}{s} is set in {s}; remove it there to stop using that key.{s}\n", .{ th.dim, name, path, th.reset });
+    }
+    if (result.shell_variable) |name| cmd_output.print("{s}{s} is set in your shell; unset it to stop using that key.{s}\n", .{ th.dim, name, th.reset });
 }
 
 /// `/login` without a terminal to draw a dialog on: the named provider's
@@ -3282,7 +3575,7 @@ fn printModelList(
     group_filter: ?[]const u8,
     cap_filter: ?model_command.Capability,
 ) void {
-    cmd_output.print("current model: \x1b[36m{s}\x1b[0m  provider={s}\n", .{ app.activeModel(), @tagName(app.config.provider_kind) });
+    cmd_output.print("current model: \x1b[36m{s}\x1b[0m  provider={s}\n", .{ app.displayModel(), @tagName(app.config.provider_kind) });
     if (group_filter) |g| cmd_output.print("filter group: {s}\n", .{g});
     if (cap_filter) |cap| cmd_output.print("filter capability: {s}\n", .{model_command.capabilityLabel(cap)});
 
@@ -3380,7 +3673,7 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     const th = app.theme;
     var problems_buf: [160]u8 = undefined;
     const problems = formatConfigProblems(&problems_buf, app.configProblems());
-    cmd_output.print("Model:            {s}\n", .{app.activeModel()});
+    cmd_output.print("Model:            {s}\n", .{app.displayModel()});
     cmd_output.print("Permission mode:  {s}\n", .{modeName(app.permission_ctx.modeValue())});
     if (app.api_key.len > 0) {
         cmd_output.print("Credential:       set\n", .{});
@@ -3428,7 +3721,7 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         // The summary only: the file itself is the user's to open, and a raw
         // dump would echo whatever was hand-written into it.
         const theme_mod = @import("tui/theme.zig");
-        cmd_output.print("Model:            {s}\n", .{app.activeModel()});
+        cmd_output.print("Model:            {s}\n", .{app.displayModel()});
         cmd_output.print("Permission mode:  {s}\n", .{modeName(app.permMode())});
         cmd_output.print("Theme:            {s}\n", .{theme_mod.variantName(app.theme_variant)});
         cmd_output.print("Verbose output:   {}\n", .{app.config.verbose});
@@ -5008,8 +5301,10 @@ fn printBanner(app: *const app_mod.App) void {
     while (filled < inner) : (filled += 1) cmd_output.print("{s}", .{th.box_h});
     cmd_output.print("{s}{s}\n", .{ th.box_tr, th.reset });
 
-    // 内容行:模型 + cwd。
-    printBannerLine(th, inner, app.activeModel());
+    // 内容行:模型 + cwd。The model line says where its credential came
+    // from, or that none is set up (#484).
+    var model_line_buf: [256]u8 = undefined;
+    printBannerLine(th, inner, app.bannerModelLine(&model_line_buf));
     printBannerLine(th, inner, app.cwdAbs());
     if (app.kg == null or !(app.kg.?.ready)) {
         const kind = if (app.kg) |*kg| @tagName(kg.degradedKind() orelse .unconfigured) else "unconfigured";
@@ -5139,7 +5434,7 @@ const StartupSuggestionGit = struct {
 
     fn start(self: *StartupSuggestionGit) void {
         self.started_ms = util_time.nowMs();
-        self.thread = std.Thread.spawn(.{}, fetch, .{self}) catch null;
+        self.thread = @import("platform").thread.spawn(.full, fetch, .{self}) catch null;
     }
 
     fn fetch(self: *StartupSuggestionGit) void {
@@ -5281,7 +5576,9 @@ fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []c
 fn fireDueCrons(host: *const TurnHost) !void {
     const app = host.app;
     const allocator = host.allocator;
-    const due = app.cron_registry.collectDue(allocator) catch return;
+    // Without a model a due prompt stays due (#484).
+    if (app.unbound() != null) return;
+    const due = app.cron_registry.collectDue(allocator, std.math.maxInt(usize)) catch return;
     defer {
         for (due) |p| allocator.free(p);
         allocator.free(due);

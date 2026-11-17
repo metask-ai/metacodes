@@ -318,7 +318,7 @@ fn runConcurrent(jobs: []BatchJob, parent_abort: ?*const AbortSignal) !void {
     var wd = Watchdog{ .jobs = jobs, .parent_abort = parent_abort };
     // watchdog 是父 abort → job.abort_sig 的**唯一**中继(worker 传 &job.abort_sig 而非 ctx.abort)。
     // spawn 失败(近乎不可能)→ 降级:无超时保护 + 在飞子 agent 不再响应父 abort。低危,记一笔。
-    const wd_thread: ?std.Thread = std.Thread.spawn(.{}, watchdogMain, .{&wd}) catch null;
+    const wd_thread: ?std.Thread = @import("platform").thread.spawn(.full, watchdogMain, .{&wd}) catch null;
     defer if (wd_thread) |t| {
         wd.stop.store(true, .release);
         t.join();
@@ -330,7 +330,7 @@ fn runConcurrent(jobs: []BatchJob, parent_abort: ?*const AbortSignal) !void {
         var threads: [MAX_BATCH_CONCURRENCY]?std.Thread = .{null} ** MAX_BATCH_CONCURRENCY;
         for (next..batch_end) |i| {
             jobs[i].started_ms.store(@intCast(util_time.nowMs()), .release); // watchdog deadline 起点
-            threads[i - next] = std.Thread.spawn(.{}, runBatchJob, .{&jobs[i]}) catch blk: {
+            threads[i - next] = @import("platform").thread.spawn(.full, runBatchJob, .{&jobs[i]}) catch blk: {
                 runBatchJob(&jobs[i]); // spawn 失败 → 当场同步跑
                 break :blk null;
             };

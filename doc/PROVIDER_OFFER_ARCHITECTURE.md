@@ -63,6 +63,9 @@ it came from, and a slice into a list that later grows is a dangling pointer.
 
 1. Write `src/provider/profiles/<vendor>.zig` declaring a `ProviderProfile`.
 2. Add one line to `BUILTIN_PROFILES` in `src/provider/registry.zig`.
+3. If the vendor speaks its own dialect, write `src/api/dialects/<vendor>.zig`
+   (see *Vendor integrations* below), add the vendor to `Vendor` in
+   `src/provider/vendor.zig`, and declare it on the profile's routes.
 
 A runtime source — the `custom_providers` section, a fetched catalog — registers
 through the same call, and may **replace its own** registrations: re-reading a
@@ -83,6 +86,93 @@ goes through the same `ProviderRegistry.register` call, including validation.
 client. It is keyed by protocol, not by vendor, which is what removes the
 model-name guessing: a GLM model reached over `anthropic_messages` uses the
 Anthropic transport, which is the opposite of what a name prefix would say.
+
+## Vendor integrations: the code is the document
+
+Each vendor's integration notes live in exactly one place: the header of its
+dialect file, `src/api/dialects/<vendor>.zig`. There is no separate
+integration document to drift from the code. Every header has the same
+sections, in order — 接入点 (endpoints and the profile that declares them),
+协议 (wires and auth), 思考与推理 (thinking parameters and the effort mapping),
+回传与缓存 (reasoning passback and prompt caching), 已知差异 (quirks and known
+gaps), 来源 (the vendor pages the facts were checked against, with dates) —
+and `dialects/registry.zig` fails a test when one is missing.
+
+| Vendor | Integration file | Built-in profile |
+|---|---|---|
+| OpenAI | `src/api/dialects/openai.zig` | `openai` |
+| Anthropic Claude | `src/api/dialects/claude.zig` | `metask` (Claude models) |
+| Google Gemini | `src/api/dialects/gemini.zig` | `gemini` |
+| Zhipu GLM | `src/api/dialects/glm.zig` | `zai-coding-plan` |
+| Moonshot Kimi | `src/api/dialects/kimi.zig` | `kimi` (open platform), `kimi-code` (Kimi Code subscription) |
+| DeepSeek | `src/api/dialects/deepseek.zig` | `deepseek` |
+| Alibaba Qwen | `src/api/dialects/qwen.zig` | `qwen` |
+| MiniMax | `src/api/dialects/minimax.zig` | `minimax` |
+| Mistral | `src/api/dialects/mistral.zig` | — |
+| OpenRouter | `src/api/dialects/openrouter.zig` | catalog only |
+| Amazon Bedrock (Converse wire) | `src/api/dialects/bedrock.zig` | `bedrock`, and catalogs |
+
+The OpenAI chat building blocks every compatible vendor shares are
+`src/api/dialects/openai_compat.zig`.
+
+**Which dialect a request uses is a property of the route**, the way an
+OpenRouter endpoint names its upstream. `ProtocolRoute.dialect` declares it for
+a channel's route, `ModelEntry.dialect` overrides it for one model on a
+multi-vendor gateway, and the offer carries both (`ModelOffer.dialect`, a
+`vendor.Declaration`, not part of the offer id). It travels with the auth scheme
+through the startup route, a `/model` switch, child agents, swarm teammates and
+`AgentSession`, to the client's `declared_dialect`. The entry's declaration
+covers its own model only: a child agent's `model_override`, a teammate or a
+Session's model switch on another model of the same route inherits the route's
+declaration alone, and with none infers from its own name, so a GLM child of a
+Claude lead on the Metask gateway is still written in GLM's dialect. A route
+that declares none infers the vendor
+from the model name — the behaviour before routes could say — so a custom
+provider written for that keeps working. A runtime plugin's dialect for a model
+still wins over the route's declaration.
+
+Reasoning passback is the dialect's decision too. `buildApiMessages` projects
+the conversation's thinking blocks; a dialect that declares
+`ModelProfile.echoes_reasoning_content` sends them back (DeepSeek, which
+returns 400 without them once tools are present; Kimi, whose documentation
+requires them with tool calls; MiniMax M3 and later, which ask for the full
+response back; and OpenRouter), and every
+other dialect leaves the request bytes exactly as before. Claude never receives
+an unsigned thinking block. On Bedrock the stream hands each *signed* reasoning
+block to the conversation as a provider-private `reasoning_item` (its Converse
+JSON, verbatim, gated by model name), which the transcript and the AgentCore
+checkpoint keep; the next request for the same model writes the same bytes
+back at the head of their assistant message, so the signature survives a
+resume and the cached prefix stays byte-identical.
+
+## Amazon Bedrock
+
+`bedrock_converse` is a wire of its own: Converse JSON requests, answered with
+the AWS event-stream binary framing (`src/api/aws_event_stream.zig`, both CRCs
+checked) instead of SSE. Like Gemini, the channel declares an origin and the
+transport appends `/model/{modelId}/converse-stream`. The built-in `bedrock`
+profile has one channel per region and authenticates with a Bedrock API key
+(`AWS_BEARER_TOKEN_BEDROCK`, sent as a bearer); SigV4 is not implemented.
+Each channel names the inference profiles its Region can call (Tokyo:
+`jp.` for Sonnet 4.6, `global.` for Opus 4.6, which has no Japan profile).
+
+The authoritative model list of an account is its catalog, ingested the way
+OpenRouter's is: ListFoundationModels and ListInferenceProfiles documents
+become one channel whose every usable model and cross-region inference profile
+is an offer, each declaring its dialect from the catalog's `providerName`:
+
+```json
+"provider_catalogs": {
+  "bedrock-us": {"kind": "bedrock", "region": "us-east-1",
+                 "foundation_models_file": "…/foundation-models.json",
+                 "inference_profiles_file": "…/inference-profiles.json"}
+}
+```
+
+The documents are what
+`GET https://bedrock.<region>.amazonaws.com/foundation-models` and
+`GET https://bedrock.<region>.amazonaws.com/inference-profiles?type=SYSTEM_DEFINED&maxResults=1000`
+return with the same API key as a bearer.
 
 ## Conservative metadata
 
@@ -149,6 +239,56 @@ Error classification is provider-owned: `429` with quota wording is
 `quota_exceeded` (not retryable) while plain throttling is `rate_limited`
 (retryable); invalid key, wrong endpoint, and permission failures never retry as
 transport errors.
+
+## Kimi Code
+
+```text
+cn-responses      https://api.kimi.com/coding/v1   openai_responses   (default)
+cn-chat           https://api.kimi.com/coding/v1   openai_chat
+global-responses  https://api.kimi.ai/coding/v1    openai_responses
+global-chat       https://api.kimi.ai/coding/v1    openai_chat
+```
+
+`kimi-code` is the coding quota of a Kimi membership, a different account
+from the Moonshot open platform (`kimi`): Kimi says their keys and base URLs
+are not interchangeable. Kimi documents one OpenAI-protocol base URL per host
+for both wires; each wire is its own channel, because two routes on the
+default channel would make `--model k3.1-pro` an ambiguity. Responses is the
+default, the wire Kimi asks Responses-capable tools to use. Every route
+requires `/coding/v1`, which no open-platform URL carries, so an override
+cannot fall back to the pay-as-you-go platform.
+
+Kimi Code keys are their own kind (`kimi_code_api_key`). `KIMI_CODE_API_KEY` is
+canonical; `KIMI_API_KEY`, the name Kimi's guides give the subscription key, is
+an alias, and the `kimi` profile reads `MOONSHOT_API_KEY` only. The
+Anthropic-compatible surface (`https://api.kimi.com/coding/`) is not a channel
+yet: Kimi does not document how a Messages request turns thinking on, and K3.1
+Pro refuses a request with thinking off. K3.1 Pro and K3 declare 262,144
+tokens, the window every plan that offers them gets; quotes stay `unknown`, as
+for the GLM plan.
+
+## Subscription plans
+
+`ProviderProfile.subscription_plan` marks a coding plan billed by the month
+rather than by the token: `kimi-code` and `zai-coding-plan` today, and a test
+in `provider/registry.zig` keeps a new one a deliberate entry. The vendors
+license these plans for a person working in a coding tool — Kimi Code's
+community guidelines name personal, interactive use, and the GLM Coding
+Plan's subscription agreement the tools Zhipu lists — so a start with nobody
+at the keyboard (`-p`, `serve`, a resumed suspension, the REPL reading a pipe)
+prints one `warning:` line on stderr saying so. It never refuses and never
+changes the exit code: the terms are the vendor's to enforce. `--web` is a
+person in a browser and a teammate answers to its lead's session; neither
+prints it.
+
+## User-Agent
+
+Every request says what it is: `src/api/http_connection.zig`, which all of
+`src/` sends through, sets `User-Agent: metacodes/<version>` unless the
+caller names itself (the OTLP exporter keeps `metacodes-otlp`). Vendors
+tell coding tools apart by this header, some refuse a client they do not
+recognise, and their terms forbid a forged one; an honest name is the only
+one a vendor can be asked to admit.
 
 ## Credential pools
 
@@ -254,6 +394,15 @@ Resolution is provider-scoped and deterministic: explicit reference → injected
 runtime descriptor → profile-declared environment aliases → persisted store
 (expiry aware) → interactive setup. `api_key_first`/`oauth_first` only reorders
 the last two steps *within one provider*; it never widens scope.
+
+A host may keep a layer below the process environment
+(`ResolveInput.env_fallback`): the CLI's `<state root>/.env`
+([LOCAL_CONFIG.md](LOCAL_CONFIG.md)). It is read for a provider's aliases only
+when the process environment sets none of them, so an alias in the
+environment and another in the file is never an ambiguity; two aliases with
+different values inside the file still are. The pool's credential variables
+and a catalog's `credential_env` are read from it when the environment leaves
+them unset. AgentCore and every other embedder keep no such layer.
 
 Because aliases are profile data, a Metask key is not reachable from an OpenAI
 or Z.AI resolution at all. `--api-key` is the one key that arrives without a
@@ -363,8 +512,8 @@ installation presents is registered by whoever runs it, and shipping a
 guessed one would point every user's first exchange at a client that is not
 theirs. That is the resolution of #87: the built-in `openai` profile stays
 undeclared, the installation configures its own registration once, and
-`/login openai`, `metacodes login --provider openai` and the picker's
-credential stage then need no `--client-id`. A metask-registered default, if
+`/login openai` and `metacodes login --provider openai` then need no
+`--client-id`. A metask-registered default, if
 one is ever wanted, is a one-line profile constant behind the same precedence.
 
 A profile that declares neither an authorization nor a device endpoint has no
@@ -383,6 +532,10 @@ declares four plan pages — China and Global, personal and team — and its not
 says why the standard API-key page is the wrong one: since 2026-10-16 a key
 from it bills the account balance even on the Coding Plan endpoints. The page
 offered first follows the region of the chosen channel (`defaultKeyPage`).
+Kimi Code (`kimi-code`, its own `kimi_code_api_key` kind) declares the Kimi
+Code Console twice, China and Global, each checked on its own host's
+`/coding/v1/models`; its note says a Moonshot open-platform key does not work
+there.
 
 The login is a `provider_login.Flow` variant (`ApiKeyPrepared`), so the CLI,
 `/login` and the picker share it with the OAuth grants and run it on the same
@@ -414,17 +567,14 @@ removes it.
 tests use, as `METASK_GATEWAY_URL` is for Metask. Only https or plain http to
 an exact loopback host is accepted, because the check carries the key.
 
-The three front ends differ only in how the key is typed. The CLI prompts for
+The two front ends differ only in how the key is typed. The CLI prompts for
 the plan, prints the page whole, opens it, and reads the key with echo off;
 echo goes off before the prompt is written, so a paste that arrives early is
 not echoed by the terminal (`--api-key-stdin` and `--key-page` script it).
-`/login` lists such a provider as "API key" and walks plan page → paste. In
-the picker, a commit refused with `MissingCredentials` on a provider with no
-OAuth grant but a key setup enters the credential stage in paste mode: ↑/↓
-picks the plan, Tab opens its page, Enter hands the key to the worker and the
-field is wiped, and a landed key retries the pending commit. Every front end
-masks the key as a character count and draws the page URL whole so it can be
-copied.
+`/login` lists such a provider as "API key" and walks plan page → paste. Both
+mask the key as a character count and draw the page URL whole so it can be
+copied. The picker takes no key (#488): it lists such a provider as not
+configured until a key resolves for it, and says where one goes.
 
 ## Controls
 
@@ -531,8 +681,8 @@ the candidate offer ids. A model the profile does not declare still routes —
 proxies legitimately accept private model names — with metadata left unknown.
 
 The built-in inventories name the current frontier models with their documented
-limits and reasoning controls (`reasoning_effort`, as the picker's options step
-shows): OpenAI `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` on the Responses wire
+limits and reasoning controls (`reasoning_effort`, as the picker's reasoning
+line shows): OpenAI `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` on the Responses wire
 only (tool calls need it there), Gemini `gemini-4-argon`, `gemini-3.8-flash`, and
 the GLM Coding Plan's `glm-5.3`, `glm-5.3-flash`. Metask's inventory is the
 gateway's own `/v1/models` whenever it answers.
@@ -557,7 +707,8 @@ parsed into an arena that must outlive the registry borrowing its strings.
     "endpoint_policy": {"required_path_fragments": ["/relay"]},
     "channels": [{
       "id": "primary", "base_url": "https://relay.example.com/relay/v1", "region": "eu",
-      "protocol": {"wire": "openai_chat", "path_suffix": "/completions", "id": "relay_openai"}
+      "protocol": {"wire": "openai_chat", "path_suffix": "/completions", "id": "relay_openai"},
+      "dialect": "glm"
     }],
     "models": [{
       "request_model_id": "relay-glm-pro", "canonical_model_id": "zai/glm-4.6",
@@ -577,6 +728,12 @@ traffic — which the endpoint policy still constrains — but it cannot read
 prompts or reach a credential it was not given. `quote_hook` and
 `classify_error` stay at their defaults for configured providers; those are code
 and belong to a reviewed profile.
+
+`dialect` (on a channel, or on one model) names the vendor whose parameters the
+requests carry — a value of `Vendor` in `src/provider/vendor.zig`. On a channel
+it covers every model the channel serves; on a model, that model only. Absent, the
+vendor is inferred from the model name; a value that names no vendor fails the
+definition (`UnknownDialect`) rather than being guessed.
 
 A protocol is a **wire**, optionally with a different request path. That is what
 relays, gateways, and self-hosted servers actually differ by, and it keeps them
@@ -686,15 +843,33 @@ binding, so a rebuild reproduces it.
 regressions, including the Kitty CSI-u forms, so the rebinding cannot leave
 either action unreachable.
 
+One screen, models first:
+
 ```text
-Provider → Canonical model → Channel/Offer (optional) → Options (optional) → Commit
+  Model                                  apply to  [this session]  from now on  this turn   tab
+  Metask · signed in · billed to your Metask account
+  >* glm-5.3-flash                    200K
+     glm-5.3                          200K   2 routes
+  DeepSeek · key from .env · billed to your DeepSeek account
+     DeepSeek V4 Pro                    1M   2 routes
+  Not configured · openai, gemini
+  Reasoning effort   default  low  medium  [high]  max          ←/→
 ```
 
-The channel step is skipped when a canonical model has exactly one offer, and
-the options step when the offer declares no controls. Offers are grouped by
-*canonical id*, never by visible name: two channels serving "GLM-4.6" over
-different protocols, regions, or prices are different routes, and collapsing
-them by display name would hide the choice the offer model exists to give.
+A row per model, grouped by *canonical id*, never by visible name: two
+channels serving "GLM-4.6" over different protocols, regions, or prices are
+different routes, and collapsing them by display name would hide the choice the
+offer model exists to give. The providers are headings, the one in use first,
+each saying where its credential comes from and who bills it; a typed filter
+drops the headings and lists the matches flat, naming each one's provider. A
+model served on several routes lists them under it, in words ("OpenAI Chat
+API"), while the cursor is on it: Enter on the model takes its preferred route
+(the one in use, else the first), Enter on a route takes that one. The
+reasoning effort the focused route declares is a line under the list, changed
+with ←/→ from any row; the level wanted is remembered, and each model shows and
+commits the nearest one its vocabulary has. Providers no commit could bind now
+are one "Not configured" line at the bottom; Enter lists them, and Enter on one
+shows where its credential goes.
 
 The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
@@ -703,11 +878,13 @@ streaming; a commit during a reply changes the next turn, not the one in flight.
 not depend on the picker's own state machine. `q` closes only on an empty
 filter, which keeps it typeable inside a model name.
 
-Enter commits at the scope the footer names. Session is the default, and `Tab`
-cycles session → global → once, so any durable write is an explicit act the user
-can see before pressing Enter. A successful commit closes the overlay and prints
-one line into the transcript — a picker that vanishes without saying which of
-several same-named routes it chose leaves the user unable to tell.
+Enter commits at the scope the header brackets. Session is the default, and
+`Tab` cycles session → global → once, so any durable write is an explicit act
+the user can see before pressing Enter. A successful commit closes the overlay
+and prints one line into the transcript (`switched to glm-5.3 for this session
+· reasoning high`) — a picker that vanishes without saying which of several
+same-named routes it chose leaves the user unable to tell — and closing it
+without one says what stays (`kept glm-5.3-flash · reasoning high`).
 
 A committed route is broadcast on the existing UI event stream as a
 `config_changed` → `route` event carrying provider, channel, protocol, wire
@@ -770,21 +947,24 @@ stderr. The loopback wait polls its socket (`platform/net.pollReadable`) and
 checks an `AbortSignal` every 100 ms, and both device-code polls sleep in the
 same slices, so every flow can be cancelled from another thread (#67).
 
-The picker has a credential stage (#67). A commit that fails with
-`MissingCredentials` on an OAuth-capable provider does not leave the overlay:
-`picker_host` prepares the same kernel login (`prepareProfile`, so every
-refusal — no token endpoint, no client id — is the typed one `/login` gives)
-and runs it on a worker thread (`api/login_worker.zig`), whose `Notify` sink is
-a bounded buffer the picker draws in place of the route list: the URL to
-open, or the device code. The TUI's 100 ms input tick polls the worker; `Esc`
-aborts the flow through the signal and returns to the stage the user came
-from; a landed login refreshes the catalog and retries the pending commit, so
-the route the user chose is the one that becomes active. The state machine
-stays pure (`Stage.credential`, `Outcome.login` / `Outcome.cancel_login`); the
-thread, the network and `App` live in the host and the worker. A provider with
-no OAuth grant but a key setup gets the same stage in paste mode
-(`CredentialMode.paste_key`, `Outcome.submit_key` / `Outcome.open_key_page`;
-see *Stored API keys and the guided key login*).
+The picker lists only routes a commit can apply as they are (#488). When it
+opens, and whenever its catalog is refreshed, the host judges every offer by
+the binding a commit runs (`App.judgeReadiness`): the same credential material
+(`App.credentialSources`: the pool, the provider's stored key, for Metask the
+session's own key or the `auth.json` sign-in, `--api-key`, the environment and
+the `.env` layer below it) through `runtime_binding.bindOffer`, with one
+difference — a stored OAuth login stands for the token a commit would refresh
+first, so judging sends no request. The picker hides the offers that would
+not bind (`Picker.setReadiness`), and lists a provider none of whose offers
+would as a dimmed row under "Not configured", below the others. Choosing it
+enters `Stage.setup`, which shows the provider's `model_picker.Setup` — the
+variable its key is read from, `/login` for Metask — with this install's
+`.env` and `doc/LOCAL_CONFIG.md`, and takes no other key than Esc and `q`. A
+commit that still fails with `MissingCredentials` (the credential went away
+after the picker opened) shows the same setup. The picker never signs in or
+takes a key: the credential stage #67 put in it is gone, and `/login <id>` is
+where both happen. A commit that moves the session to another provider says,
+on a second line of its confirmation, who bills the session from then on.
 
 ## Module map
 
@@ -808,6 +988,12 @@ see *Stored API keys and the guided key login*).
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
+| `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
+| `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
+| `src/api/dialects/<vendor>.zig` | one vendor's dialect; its header is the integration document |
+| `src/api/dialects/registry.zig` | vendor → dialect file, name inference, the header contract test |
+| `src/api/bedrock_client.zig` | Bedrock Converse transport |
+| `src/api/aws_event_stream.zig` | AWS event-stream framing (decode, CRC checks) |
 | `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
 | `src/provider/api_key_store.zig` | provider-scoped API keys at rest, one 0600 file per provider |
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
@@ -848,6 +1034,18 @@ application.
 
 Listed rather than left silent. Each is a decision with a reason, not an
 omission — and none of them is an acceptance criterion of the issue.
+
+- **Bedrock SigV4 and AWS profiles.** The Bedrock transport authenticates with
+  a Bedrock API key only; access keys, session tokens and `~/.aws` profiles
+  need request signing, which is not written.
+- **Bedrock over the AgentCore C ABI and to sealed Skills.** ABI v1 has no
+  provider code for Bedrock (adding one is an ABI revision), and SSP/1's
+  `provider.kind` has no Bedrock value, so a Bedrock session cannot delegate
+  to a sealed Skill gateway: the client refuses it as an undelegable route
+  and the gateway refuses the kind (`doc/SEALED_SKILL_PROTOCOL.md` §3.4).
+- **Thinking fields for non-Claude models on Bedrock.** DeepSeek, Qwen, Kimi
+  and MiniMax on Bedrock think by their own defaults; only Claude and gpt-oss
+  get fields in `additionalModelRequestFields`.
 
 - **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
   signed adapter reference, which needs review and signing infrastructure. The

@@ -2,11 +2,9 @@ name: AgentCore Windows
 
 on:
   pull_request:
-  # The merge queue (doc/CI_DESIGN.md §3): a check that does not report on
-  # merge_group would hold every group if the ruleset ever requires it.
+  # Inert after the PR-only policy migration; supports landing the migration
+  # itself while main still requires a merge queue (doc/CI_DESIGN.md §3).
   merge_group:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -23,8 +21,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # `native-windows-gate` is a required status check on main, so the job
-      # must report on every pull request; the old `on.pull_request.paths`
+      # The job reports on every pull request so that it can be required;
+      # the old `on.pull_request.paths`
       # filter left doc-only / evals-only PRs permanently BLOCKED (#134). The
       # expensive steps still run only when a path that can affect the native
       # gate changed; other PRs report success from this step alone. A merge

@@ -105,6 +105,11 @@ above), **corrected** (see "Behaviour changes"), **evolve** (out of scope, separ
   `parseListToolsResponse`, are similar and stay per era: they are the era adapters.
 - `registry_bridge` and `agentcore/mcp_session.zig` both turn a catalog into a tool
   surface. They differ by the rows above, and both call `McpClient.invokeTool`.
+  Both classify every tool a server lists as `execute` for permission (#473): the
+  registry entry carries the class, the overlay declares it in its metadata, and a
+  server's annotations relax neither. What still differs is what a remembered
+  answer binds to: the tool's name on the CLI, its permission binding (server,
+  tool, schema, connection fingerprint) on AgentCore (#389).
 - `resources/list` over the byte-zero API reads one page. Paginating it changes what
   the model sees, so it is left as a separate change.
 

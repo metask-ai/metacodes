@@ -34,6 +34,19 @@ pub const RunControl = struct {
     project_gate: ?*RunGate,
     operational_observation_id: ?[64]u8,
 
+    /// How `initWithOptions` opens a Run.
+    pub const Options = struct {
+        /// The project whose active bundle gates the Run
+        /// (`<dirname(session_dir)>/project-rules`), named by its root.
+        /// Null consults no bundle: the Run is journaled only.
+        project_root: ?[]const u8,
+        abandoned_run: journal_mod.AbandonedRunPolicy,
+        /// Recorded in `run_started` (#184).
+        prompt: ?@import("prompt_sections.zig").Manifest = null,
+        abort: ?*const @import("../util/abort.zig").AbortSignal = null,
+        report: ?*journal_mod.OpenReport = null,
+    };
+
     /// A product session: a Run whose process died is closed as abandoned
     /// (`journal_mod.AbandonedRunPolicy`), and `report` says what `init`
     /// found — the abandoned Run, or why the session is not available.
@@ -45,13 +58,31 @@ pub const RunControl = struct {
         abort: ?*const @import("../util/abort.zig").AbortSignal,
         report: ?*journal_mod.OpenReport,
     ) !*RunControl {
+        return initWithOptions(allocator, session_dir, session_id, .{
+            .project_root = project_root,
+            .abandoned_run = .record_abandoned,
+            .abort = abort,
+            .report = report,
+        });
+    }
+
+    /// `init` for an embedded Session (`AgentSession`, #445): the caller
+    /// chooses whether a bundle is consulted, what a Run its dead owner left
+    /// open gets, and the prompt manifest `run_started` records.
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        session_dir: []const u8,
+        session_id: session_id_mod.SessionId,
+        options: Options,
+    ) !*RunControl {
         const self = try allocator.create(RunControl);
         errdefer allocator.destroy(self);
         const owned_session_dir = try allocator.dupe(u8, session_dir);
         errdefer allocator.free(owned_session_dir);
         const journal = try journal_mod.Journal.initWithOptions(session_dir, session_id, .{
-            .abandoned_run = .record_abandoned,
-            .report = report,
+            .prompt = options.prompt,
+            .abandoned_run = options.abandoned_run,
+            .report = options.report,
         });
         self.* = .{
             .allocator = allocator,
@@ -61,9 +92,26 @@ pub const RunControl = struct {
             .operational_observation_id = null,
         };
         errdefer self.journal.deinit();
-        const project_gate = RunGate.load(
-            allocator,
-            session_dir,
+        const project_root = options.project_root orelse return self;
+        try self.loadProjectGate(project_root, options.abort);
+        return self;
+    }
+
+    /// Gates the open Run by the active bundle of `project_root`, as
+    /// `initWithOptions` does when given one. A Host that tells a journal
+    /// that cannot open apart from the project rules refusing the Run
+    /// (`AgentSession`, #445) opens with `project_root = null` and calls
+    /// this: an error here is the rules' refusal, the Run already closed in
+    /// the journal. At most once per RunControl.
+    pub fn loadProjectGate(
+        self: *RunControl,
+        project_root: []const u8,
+        abort: ?*const @import("../util/abort.zig").AbortSignal,
+    ) !void {
+        std.debug.assert(self.project_gate == null);
+        self.project_gate = RunGate.load(
+            self.allocator,
+            self.session_dir,
             project_root,
             abort,
             self.journal.sink(),
@@ -76,8 +124,6 @@ pub const RunControl = struct {
             self.journal.finishRun("project_gate_load_failed") catch {};
             return err;
         };
-        self.project_gate = project_gate;
-        return self;
     }
 
     pub fn observer(self: *RunControl) observation.Sink {

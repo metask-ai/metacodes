@@ -68,6 +68,29 @@ idle or during a run, from any thread or from inside a tool or handler: every
 request sent afterwards (the run's next turn, a retry) carries it, and a
 request already sent keeps the old one. The provider, endpoint and model stay.
 
+To edit an earlier message and rerun from it, call
+`session.rewind_to_user_message(position)` while idle, then `run()` the edited
+text. `position` counts the whole history from 1, as
+`describe()["conversation"]["message_count"]` does, so a run's own message is
+`message_count + 1` read just before it. The message and everything after it
+are dropped; files and other effects of the dropped turns stay. A position that
+is not a user message, is out of range, or lies behind the compact boundary
+raises `AgentCoreError` (`NOT_USER_MESSAGE`, `MESSAGE_POSITION_OUT_OF_RANGE`,
+`MESSAGE_POSITION_COMPACTED`) and changes nothing.
+
+A gateway stream sometimes breaks off mid-answer, and a reasoning model has
+usually shown thinking by then. Every request is sent again once by itself when
+its stream broke off without an answer (a stall, a dropped connection, a stream
+that ended before its stop reason) and no tool call had started.
+`run(prompt, stream_retry_budget=n)` (and `stream(...)`, 0 to 8, default 0)
+lets the run send a request again up to `n` more times, after a started tool
+call too; a server's error is never re-sent. Before each retry of an attempt
+that showed output the run tells you what to take back: the attempt's
+`output_segment_end` has disposition `"discarded"` (its text is not part of
+`RunResult.text`), a `thinking_discarded` event
+`{"index", "turn", "group", "bytes"}` names the thinking shown while that
+segment was open, and a `retry_notice` follows before a short wait.
+
 `session.close()`, and leaving a `with` block, aborts a run that is still going
 and waits for it first. That includes a `stream()` the loop stopped early with
 `break`.

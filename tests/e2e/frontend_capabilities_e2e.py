@@ -151,7 +151,7 @@ def writes(lines: list[dict]) -> list[dict]:
 
 
 def runs_done(lines: list[dict]) -> int:
-    return sum(1 for line in lines if "run_done" in line)
+    return len(of_type(lines, "run_done"))
 
 
 def pending_request(lines: list[dict], kind: str, after: int) -> dict | None:

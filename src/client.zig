@@ -169,6 +169,91 @@ fn backOffBeforeRetry(
         if (!rep.beforeAttempt(attempt + 1, max_attempts))
             return error.Aborted;
     }
+    // A cancel that lands after the sleep's last check still stops the next request.
+    if (abort) |a| if (a.isAborted()) return error.Aborted;
+}
+
+/// The connect-phase retry policy of every HTTP provider client: Anthropic
+/// Messages, OpenAI Chat Completions and Responses, and Gemini (issue #434).
+/// One attempt covers DNS/TCP/TLS, the request and the response head, so
+/// nothing has reached the caller yet and the very same request bytes, to the
+/// same endpoint and model, can go again. A retriable failure
+/// (`isRetriableError`: transient network, 429, 500/502/503, a head stall)
+/// backs off - the server's Retry-After when it sent one, else `retryDelayMs` -
+/// with the caller's reporter told, as in the Messages client since it was
+/// added; anything else, and the last allowed attempt, ends the request with
+/// its diagnostics recorded. A cancel ends it at once as `error.Aborted`.
+///
+///     var retry = ConnectRetryFor("module").init(max_retries, retry_base_ms, reporter, abort);
+///     while (true) {
+///         var hint = RetryHint{};
+///         if (attempt(&hint)) |stream| return stream else |err| try retry.afterFailure(err, hint.delay_ms);
+///     }
+pub fn ConnectRetryFor(comptime module: []const u8) type {
+    return struct {
+        const Self = @This();
+
+        /// `max_retries` of the Provider interface: the most attempts, the first included.
+        max_attempts: u32,
+        base_ms: u64,
+        reporter: ?RetryReporter,
+        abort: ?*const AbortSignal,
+        /// Attempts that have failed so far.
+        failed: u32 = 0,
+
+        /// `retry_base_ms` 0 = `RETRY_BASE_MS` (tests pass a small value).
+        pub fn init(max_retries: u32, retry_base_ms: u64, reporter: ?RetryReporter, abort: ?*const AbortSignal) Self {
+            return .{
+                .max_attempts = max_retries,
+                .base_ms = if (retry_base_ms > 0) retry_base_ms else RETRY_BASE_MS,
+                .reporter = reporter,
+                .abort = abort,
+            };
+        }
+
+        /// The attempt just made failed with `err`: back off and return, so
+        /// the caller makes the next attempt, or return the error that ends
+        /// the request. `retry_after_ms` is the failed response's Retry-After.
+        pub fn afterFailure(self: *Self, err: anytype, retry_after_ms: ?u64) (@TypeOf(err) || error{Aborted})!void {
+            self.failed += 1;
+            const any_err: anyerror = err;
+            // A cancel is the caller's answer, not a failure to diagnose or retry.
+            if (any_err == error.Aborted) return err;
+            if (self.abort) |a| if (a.isAborted()) return error.Aborted;
+            // TlsInitializationFailed can hide both transient resource pressure and permanent
+            // certificate/protocol failures. Retrying is safe before body send, but cap it
+            // tighter than generic network/HTTP retries to avoid minutes of deterministic pain.
+            const max_attempts = if (any_err == error.TlsInitializationFailed)
+                @min(self.max_attempts, TLS_SETUP_MAX_ATTEMPTS)
+            else
+                self.max_attempts;
+            if (!isRetriableError(any_err) or self.failed >= max_attempts) {
+                log.err(module, "stream connect failed after {d} attempt(s): {s}", .{ self.failed, @errorName(any_err) });
+                noteConnectRetryEnd(any_err, self.failed);
+                return err;
+            }
+            const delay = retry_after_ms orelse retryDelayMs(self.failed, self.base_ms);
+            try backOffBeforeRetry(self.reporter, self.failed, max_attempts, delay, self.abort, @errorName(any_err));
+        }
+    };
+}
+
+/// The diagnostics of a request the connect retry gave up on after `attempts`.
+fn noteConnectRetryEnd(err: anyerror, attempts: u32) void {
+    switch (err) {
+        // HTTP 状态类:失败现场(body)已记,只补尝试次数。
+        error.Unauthorized, error.RateLimited, error.ServerError, error.BadGateway, error.ServiceUnavailable, error.HttpError, error.ContextWindowExceeded => last_error.noteAttempts(attempts),
+        // 连接类:无 HTTP 响应没走 HTTP 失败报告,现场在这里补记。
+        else => {
+            // doRequest 已记录具体底层错误（例如 TlsInitializationFailed）；
+            // TransientNetwork 是对 send/receive 错误的分类壳，不能在这里覆盖现场。
+            if (err != error.TransientNetwork) {
+                last_error.recordNamed("连接初始化失败", connectErrorDetail(err));
+                model_error.noteRequestError(err);
+            }
+            last_error.noteAttempts(attempts);
+        },
+    }
 }
 
 /// 重试退避(对齐 CC getRetryDelay):min(base * 2^(attempt-1), 32000) + 真随机 jitter(0~25%)。
@@ -253,7 +338,9 @@ fn daysFromCivil(year_raw: i64, month: u8, day: u8) ?i64 {
     return era * 146_097 + doe - 719_468;
 }
 
-const RetryHint = struct { delay_ms: ?u64 = null };
+/// What a failed attempt's response head said about the wait before the next
+/// one (Retry-After), for `ConnectRetryFor`.
+pub const RetryHint = struct { delay_ms: ?u64 = null };
 
 /// Deterministic L2 seam: fail the next N request-setup attempts with a concrete Zig error,
 /// then allow the real HTTP request. This proves the public retry wrapper is wired to setup
@@ -272,7 +359,7 @@ pub const RequestSetupFailureInjector = struct {
     }
 };
 
-fn retryAfterFromHead(head: http.Client.Response.Head) ?u64 {
+pub fn retryAfterFromHead(head: http.Client.Response.Head) ?u64 {
     var it = head.iterateHeaders();
     while (it.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "retry-after"))
@@ -414,6 +501,39 @@ pub fn reportBodyStall(comptime module: []const u8, rid: log.RequestId, stall: p
     model_error.noteStreamFailure(.timeout, .retryable, std.fmt.bufPrint(&message_buf, "No model output for {d} ms (limit {d} ms); the client closed the connection.", .{ stall.idle_ms, stall.limit_ms }) catch "No model output in time; the client closed the connection.");
 }
 
+/// The error a provider request ends with when `std.http.Client.request`
+/// failed (DNS, connect, TLS setup): a transient cause keeps its name, so the
+/// connect retry sees it, and anything else is `RequestFailed`. The same
+/// classification as the Messages client's `doRequestInto`, for the OpenAI
+/// and Gemini clients.
+pub fn requestSetupFailure(comptime module: []const u8, rid: log.RequestId, raw_err: anyerror) anyerror {
+    const err = requestSetupError(raw_err, builtin.os.tag);
+    log.errId(module, rid, "request setup failed: {s}", .{@errorName(err)});
+    if (isTransientNetworkError(err)) {
+        last_error.recordNamed("连接初始化失败", connectErrorDetail(err));
+        noteConnectFailure(err);
+        return err;
+    }
+    return error.RequestFailed;
+}
+
+/// The error a provider request ends with when sending its body (`stage`
+/// "sendBody") or reading the response head ("receiveHead") failed: nothing
+/// came back, so a transient cause is `TransientNetwork` (TLS setup keeps its
+/// name for its tighter cap) and the connect retry sends the request again.
+/// The caller has already ruled out a cancel and a head stall.
+pub fn requestTransportFailure(comptime module: []const u8, rid: log.RequestId, comptime stage: []const u8, err: anyerror) anyerror {
+    log.errId(module, rid, stage ++ " failed: {s}", .{@errorName(err)});
+    if (isTransientNetworkError(err)) {
+        last_error.recordNamed("连接失败", @errorName(err));
+        noteConnectFailure(err);
+        if (err == error.TlsInitializationFailed) return err;
+        return error.TransientNetwork;
+    }
+    noteConnectFailure(err);
+    return error.RequestFailed;
+}
+
 /// A connection-level failure before any response head, for the structured
 /// detail. Shared by the three provider clients.
 pub fn noteConnectFailure(err: anyerror) void {
@@ -490,17 +610,31 @@ pub fn noteRequestAccepted() void {
 }
 
 /// 流在报告"怎么停的"之前就结束(干净 EOF / 只有 `[DONE]`,却没有 stop_reason、
-/// finish_reason、Responses 终止事件或 finishReason)的统一交代:日志 + last_error 现场。
-/// 这样的流不能当成完整回答——丢的可能正是 max_tokens(issue #269);调用方(agent_loop)
-/// 把它当流内失败,丢弃残片走同轮重试。取消/stall 判定在调用前已排除。四个流解析器共用。
+/// finish_reason、Responses 终止事件或 finishReason)的统一交代:日志 + last_error 现场 +
+/// Run 级明细(`stream_interrupted` / `retryable`,带本次响应头的 status 与 request id,
+/// issue #451)。这样的流不能当成完整回答——丢的可能正是 max_tokens(issue #269);调用方
+/// (agent_loop)把它当流内失败,丢弃残片走同轮重试。取消/stall 判定在调用前已排除。
+/// 四个流解析器共用(Messages、OpenAI chat 与 Responses、Gemini、Bedrock)。
 pub fn reportStreamIncomplete(comptime module: []const u8, rid: log.RequestId) void {
     log.warnId(module, rid, "stream ended before reporting how it stopped (no terminal event): treated as a mid-stream failure", .{});
     last_error.recordNamed("流未完整结束", "响应流在报告停止原因(stop_reason / finish_reason / 终止事件)之前就结束了,回答可能被截断");
+    // The server stated no failure: the stream it accepted just ended. That is
+    // the connection giving no answer, as a drop or a stall is (agent_loop
+    // `isSilentRetryFailure`), so the same request may well succeed.
+    model_error.noteStreamFailure(.stream_interrupted, .retryable, "The response stream ended before it reported how it stopped.");
 }
 
 /// 重试 UI 上报回调(agent_loop 注入,把 attempt/max/delay 渲染成 "Retrying in Ns…")。
 /// state 类型擦除(指向 stdout_writer 等);headless 传 null。
 pub const RetryReporter = api_stream.RetryReporter;
+
+/// The caller cancelled this request. A transport error read after a cancel
+/// is the cancel's own doing (`Provider.cancel` shut the socket down), so the
+/// provider clients answer `error.Aborted` instead of a network failure.
+pub fn cancelled(abort: ?*const AbortSignal) bool {
+    const signal = abort orelse return false;
+    return signal.isAborted();
+}
 
 /// 可中断 sleep:分片 sleep(每 ≤50ms 查一次 abort)。返回 true=睡满,false=被 abort 打断。
 pub fn interruptibleSleepMs(total_ms: u64, abort: ?*const AbortSignal) bool {
@@ -540,7 +674,7 @@ pub const Client = struct {
     host_capabilities: image_capability.Declarations = .{},
     /// 模型上下文窗口表(~/.metacode/models.toml)。precedence:命中此表 > catalog probe > 200K。
     /// App 持有,借用不拥有(null = 未挂,落 catalog)。
-    model_context: ?*const @import("app/model_context.zig").ModelContext = null,
+    model_context: ?*const @import("api/model_context.zig").ModelContext = null,
     /// 用户 CLI `--max-tokens N` 覆盖；null = 自动（catalog → fallback table → default）。
     max_tokens_override: ?u32 = null,
     reasoning_effort: ?types.ReasoningEffort = null,
@@ -551,6 +685,11 @@ pub const Client = struct {
     /// Immutable Runtime-scoped model dialect lookup. Ordinary App/CLI clients
     /// use the built-in resolver; AgentRuntime injects its Snapshot resolver.
     dialect_resolver: dialect_mod.Resolver = .{},
+    /// The dialect the route declares (`ModelOffer.dialect`): the bound model's
+    /// entry declaration applies to `model` only, the route's to any model a
+    /// request names. Empty infers it from the model name. Set with the route,
+    /// like `auth_scheme`.
+    declared_dialect: dialect_mod.DialectDeclaration = .{},
     abort_registry: provider_mod.RequestAbortRegistry = .{},
     /// 收头阶段空闲上限,见 DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
     stream_idle_timeout_ms: u64 = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
@@ -744,7 +883,7 @@ pub const Client = struct {
     /// image_input 的声明(Host 优先)。**序列化守门与能力查询的唯一出口**——两条 send 路径和
     /// `supportsForModel` 都从这里拿 profile,声明不可能只影响其中一边。
     pub fn dialectFor(client: *const Client, model: []const u8) dialect_mod.Dialect {
-        var dialect = client.dialect_resolver.resolve(.anthropic, model);
+        var dialect = client.dialect_resolver.resolve(.anthropic, client.declared_dialect.vendorFor(client.model, model), model);
         dialect.declareImageInput(client.host_capabilities.imageInputFor(model), client.catalog.imageInputFor(model));
         return dialect;
     }
@@ -1019,44 +1158,12 @@ pub const Client = struct {
         retry_base_ms: u64,
         reporter: ?RetryReporter,
     ) !StreamResponse {
-        const base_ms = if (retry_base_ms > 0) retry_base_ms else RETRY_BASE_MS;
-        var attempt: u32 = 0;
+        var retry = ConnectRetryFor("client").init(max_retries, retry_base_ms, reporter, abort);
         while (true) {
             var retry_hint = RetryHint{};
-            const r = client.sendMessageStreamFullAttempt(messages, system, tools, abort, model_override, tool_choice, &retry_hint);
-            if (r) |stream| {
+            if (client.sendMessageStreamFullAttempt(messages, system, tools, abort, model_override, tool_choice, &retry_hint)) |stream| {
                 return stream;
-            } else |err| {
-                attempt += 1;
-                // TlsInitializationFailed can hide both transient resource pressure and permanent
-                // certificate/protocol failures. Retrying is safe before body send, but cap it
-                // tighter than generic network/HTTP retries to avoid minutes of deterministic pain.
-                const effective_max_attempts = if (err == error.TlsInitializationFailed)
-                    @min(max_retries, TLS_SETUP_MAX_ATTEMPTS)
-                else
-                    max_retries;
-                if (!isRetriableError(err) or attempt >= effective_max_attempts) {
-                    log.err("client", "stream connect failed after {d} attempt(s): {s}", .{ attempt, @errorName(err) });
-                    // (Aborted 不在 sendMessageStreamFull 的 error set 里,编译器背书,无需分支。)
-                    switch (err) {
-                        // HTTP 状态类:logErrorBody 已记 body,只补尝试次数。
-                        error.Unauthorized, error.RateLimited, error.ServerError, error.BadGateway, error.ServiceUnavailable, error.HttpError, error.ContextWindowExceeded => last_error.noteAttempts(attempt),
-                        // 连接类:无 HTTP 响应没走 logErrorBody,现场在这里补记。
-                        else => {
-                            // doRequest 已记录具体底层错误（例如 TlsInitializationFailed）；
-                            // TransientNetwork 是对 send/receive 错误的分类壳，不能在这里覆盖现场。
-                            if (err != error.TransientNetwork) {
-                                last_error.recordNamed("连接初始化失败", connectErrorDetail(err));
-                                model_error.noteRequestError(err);
-                            }
-                            last_error.noteAttempts(attempt);
-                        },
-                    }
-                    return err;
-                }
-                const delay = retry_hint.delay_ms orelse retryDelayMs(attempt, base_ms);
-                try backOffBeforeRetry(reporter, attempt, effective_max_attempts, delay, abort, @errorName(err));
-            }
+            } else |err| try retry.afterFailure(err, retry_hint.delay_ms);
         }
     }
 
@@ -1153,6 +1260,11 @@ pub const Client = struct {
             .keep_alive = false,
             // The key rides in a header; a redirect would carry it to another host.
             .redirect_behavior = no_redirects,
+            // The body is read raw (`response.reader`), so ask for it
+            // uncompressed: std's default offers gzip, and a server that
+            // takes the offer (DeepSeek, #467) sends bytes the SSE parser
+            // cannot read.
+            .headers = .{ .accept_encoding = .omit },
             .extra_headers = &.{
                 .{ .name = "anthropic-version", .value = "2023-06-01" },
                 .{ .name = "content-type", .value = "application/json" },
@@ -1184,6 +1296,8 @@ pub const Client = struct {
         // 发送 body。失败的连接由 http_connection 标为 closing:std 会把收头前失败的连接
         // 放回池里,重试会一直拿到同一条死连接(见 api/http_connection.zig)。
         http_connection.sendBodyComplete(req_ptr, @constCast(body)) catch |err| {
+            // 取消优先于传输层错误分类:cancel 关闭了 socket,写才失败的。
+            if (cancelled(abort)) return error.Aborted;
             log.errId("client", rid, "sendBody failed: {s}", .{@errorName(err)});
             if (isTransientNetworkError(err)) {
                 last_error.recordNamed("连接失败", @errorName(err));
@@ -1197,6 +1311,11 @@ pub const Client = struct {
         // 读取响应头
         var redirect_buf: [4096]u8 = undefined;
         const http_response = req_ptr.receiveHead(&redirect_buf) catch |err| {
+            // 等响应头时被取消:cancel 关闭了 socket,不是网络故障(issue #434)。
+            if (cancelled(abort)) {
+                log.warnId("client", rid, "receiveHead failed after cancel ({s}) → Aborted", .{@errorName(err)});
+                return error.Aborted;
+            }
             if (client.abort_registry.stalled(req_ptr)) |stall| {
                 // 监视线程因沉默 shutdown 了连接:请求没有副作用(还没收到响应头),按瞬态错误重试。
                 reportHeadStall("client", rid, stall);
@@ -1457,7 +1576,7 @@ const HttpDisposition = union(enum) {
     failure: HttpFailure,
 };
 
-const HttpFailureError = error{
+pub const HttpFailureError = error{
     TokenExpired,
     Unauthorized,
     RateLimited,
@@ -1516,11 +1635,29 @@ fn logErrorBody(
     const n = body_reader_tmp.readSliceShort(err_body[0..]) catch 0;
     const preview = err_body[0..@min(n, err_body.len)];
     reportHttpFailure("client", rid, status, preview, err_body.len, credential);
+    return errorBodyInfo(status.code, preview);
+}
+
+/// What a non-2xx body tells the request lifecycle. Read with the same
+/// classifier `model_error` uses, so a body the structured detail calls
+/// `context_window` is the one the provider answers `ContextWindowExceeded` for.
+pub fn errorBodyInfo(status_code: u16, preview: []const u8) ErrorBodyInfo {
     const context_window_exceeded = error_class.isContextWindowExceeded(preview);
     return .{
         .context_window_exceeded = context_window_exceeded,
         .context_window_numbers = if (context_window_exceeded) error_class.parseContextWindowNumbers(preview) else .{},
-        .token_expired = status.code == 401 and containsMetaskTokenExpired(preview),
+        .token_expired = status_code == 401 and containsMetaskTokenExpired(preview),
+    };
+}
+
+/// The error a provider request ends with for a non-2xx head, and what its
+/// body said. Shared by the provider clients so a 429, a 503 or an overflow
+/// is the same error on every protocol (issue #434).
+pub fn httpFailureError(status_code: u16, body: ErrorBodyInfo) HttpFailureError {
+    return switch (classifyHttpStatus(status_code)) {
+        // The clients accept a 200 before asking; the arm keeps the switch total.
+        .ok => error.HttpError,
+        .failure => |failure| resolveHttpFailure(failure, body),
     };
 }
 
@@ -1546,7 +1683,7 @@ fn containsMetaskTokenExpired(body: []const u8) bool {
     return false;
 }
 
-const ErrorBodyInfo = struct {
+pub const ErrorBodyInfo = struct {
     context_window_exceeded: bool = false,
     context_window_numbers: error_class.ContextWindowNumbers = .{},
     token_expired: bool = false,
@@ -1655,7 +1792,12 @@ pub const StreamResponse = struct {
             .httpStatusFn = &hHttpStatus,
             .retryAttemptFn = &hRetryAttempt,
             .contextWindowNumbersFn = &hContextWindowNumbers,
+            .toolCallStartedFn = &hToolCallStarted,
         };
+    }
+    fn hToolCallStarted(ctx: *anyopaque) bool {
+        const sr: *StreamResponse = @ptrCast(@alignCast(ctx));
+        return sr.iter_initialized and sr.event_iter.tool_call_started;
     }
     fn hContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
         return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).context_window_numbers;

@@ -153,6 +153,10 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "PathTraversal", .code = .path_traversal, .category = .safety, .recoverable = false },
     .{ .name = "DangerousCommand", .code = .dangerous_command, .category = .safety, .recoverable = false },
     .{ .name = "PermissionDenied", .code = .permission_denied, .category = .safety, .recoverable = false },
+    // A permission prompt that timed out or was cancelled before anyone
+    // answered (#463): still a deny, but nobody refused, so asking again may
+    // get an answer. A real deny stays PermissionDenied (recoverable: false).
+    .{ .name = "PermissionPromptUnanswered", .code = .permission_denied, .category = .safety, .recoverable = true },
     .{ .name = "ToolPolicyDenied", .code = .permission_denied, .category = .safety, .recoverable = false },
     .{ .name = "PreToolUseBlocked", .code = .permission_denied, .category = .safety, .recoverable = false },
     .{ .name = "ProjectRuleBlocked", .code = .project_rule_blocked, .category = .safety, .recoverable = false },
@@ -163,6 +167,9 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "ExactRecoverySourceChanged", .code = .stale_file, .category = .user_error, .recoverable = true },
     .{ .name = "ExactRecoveryTargetUnavailable", .code = .file_not_found, .category = .user_error, .recoverable = true },
     .{ .name = "ExactRecoveryReplaceAllForbidden", .code = .invalid_args, .category = .user_error, .recoverable = true },
+    // Arguments that name one key twice (issue #494): the model can resend the
+    // call with each key once, so it is its argument error, not a deny.
+    .{ .name = "DuplicateArgumentKey", .code = .invalid_args, .category = .user_error, .recoverable = true },
     .{ .name = "UnknownTool", .code = .unknown_tool, .category = .user_error, .recoverable = true },
     .{ .name = "NoToolMatch", .code = .unknown_tool, .category = .user_error, .recoverable = true },
     .{ .name = "FileNotFound", .code = .file_not_found, .category = .user_error, .recoverable = true },
@@ -455,6 +462,17 @@ test "fromErrorName maps image and MCP capability errors" {
     defer missing.deinit(a);
     try std.testing.expectEqual(Code.invalid_args, missing.code);
     try std.testing.expect(missing.recoverable);
+}
+
+test "fromErrorName: malformed tool arguments are recoverable argument errors (#494)" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "DuplicateArgumentKey", "InvalidArgumentsJson" }) |name| {
+        const e = fromErrorName(name, try a.dupe(u8, "d"));
+        defer e.deinit(a);
+        try std.testing.expectEqual(Code.invalid_args, e.code);
+        try std.testing.expectEqual(Category.user_error, e.category);
+        try std.testing.expect(e.recoverable);
+    }
 }
 
 test "errorToJson oneliner" {

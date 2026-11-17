@@ -2,10 +2,10 @@
 //!   - `RequestFailed` **只**表示连接在流中途断了;
 //!   - 服务端在流里声明的失败一律是 `ApiError`(Anthropic 错误帧、OpenAI chat 兼容端与 Gemini 的
 //!     顶层 `error` 对象、Responses 的 `response.failed`),并写"API 错误帧"现场;
-//! 以及它对 agent_loop 零产出兜底重发(`SILENT_STREAM_RETRY_FLOOR`)的后果,TUI 默认(不配重试):
+//! 以及它对 agent_loop 每个请求自带的那次重发(`STREAM_RETRIES_PER_REQUEST`,#461)的后果,TUI 默认(不配重试):
 //!   ① 服务端报错、零可见输出 → 不重发,api_error(答复不能被重发盖掉);
 //!   ② 断连、零可见输出 → 句柄上是 RequestFailed;run 同轮重发一次 → end_turn;
-//!   ③ 断连、已流出可见文本 → 不重发,api_error(用户看过的半截不能假装没发生)。
+//!   ③ 断连、已流出可见文本 → 同样重发一次(半截以 discarded 撤回)→ end_turn。
 //!
 //! 2026-10-24 之前:Responses 的 `response.failed` 也报 RequestFailed,与 Anthropic 的断连同名,
 //! 所以零产出重发只敢覆盖 stall 与没收尾的流;OpenAI chat / Gemini 的错误 chunk 被当空 chunk
@@ -298,18 +298,18 @@ test "L2 stream errors ②: a connection dropped before any output is RequestFai
     };
 }
 
-// ── ③ dropped connection after visible text: not re-sent ─────────────────────
+// ── ③ dropped connection after visible text: re-sent once (#461) ─────────────
 
 const DropAfter = struct {
     fn run(a: std.mem.Allocator, provider: cc.api_provider.Provider) anyerror!void {
         clearLastError();
         const result = try runOneTurn(a, provider);
-        try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+        try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
         clearLastError();
     }
 };
 
-fn dropAfterNotResent(comptime wire: Wire) !void {
+fn dropAfterResent(comptime wire: Wire) !void {
     const a = std.testing.allocator;
     const bodies = [_][]const u8{ dropAfterText(wire), complete(wire) };
     var srv = try harness.MockServer.startCassetteMidStreamCut(&bodies, 0);
@@ -317,11 +317,11 @@ fn dropAfterNotResent(comptime wire: Wire) !void {
     const url = try srv.urlOwned(a);
     defer a.free(url);
     try withProvider(wire, a, url, DropAfter.run);
-    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
 }
 
-test "L2 stream errors ③: a connection dropped after visible text is not re-sent on any wire" {
-    inline for (ALL_WIRES) |wire| dropAfterNotResent(wire) catch |err| {
+test "L2 stream errors ③: a connection dropped after visible text is re-sent once on every wire (#461)" {
+    inline for (ALL_WIRES) |wire| dropAfterResent(wire) catch |err| {
         std.debug.print("wire {s} failed\n", .{@tagName(wire)});
         return err;
     };

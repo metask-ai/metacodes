@@ -5,7 +5,8 @@ Start here rather than reading design ledgers chronologically.
 ## Start here
 
 - **Using metacodes:** [Getting started](GETTING_STARTED.md) — install,
-  providers, Metask OAuth, build from source; [Terminal setup](TERMINAL_SETUP.md)
+  providers, Metask OAuth, build from source; [Local configuration](LOCAL_CONFIG.md)
+  — your own provider key in the install's `.env`; [Terminal setup](TERMINAL_SETUP.md)
   — Shift+Enter for a newline in Apple Terminal and VS Code.
 - **Embedding it in your program:** [API overview](API.md), then
   [LIB_API](LIB_API.md) for Zig hosts or the
@@ -47,6 +48,8 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
   admission, route-keyed provider cache, SSE keepalive, the load benchmark
   and the numbers that are the claim.
 - [Core reference](CORE_REFERENCE.md)
+- [Agent sandbox execution](SANDBOX_DESIGN.md) — native tool executors and
+  whole-process external workers; Linux bubblewrap/seccomp and macOS Seatbelt.
 - [Stall gate](STALL_GATE_DESIGN.md) — the in-run breaker for tool rounds that
   keep returning nothing new.
 - [Isolated verifier](ISOLATED_VERIFIER_DESIGN.md) — design only: an LLM
@@ -76,6 +79,9 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
   no saved cursor, the half-line snapshot; enforced by
   `zig build test:scrollback`.
 - [Swarm design](SWARM_DESIGN.md)
+- [Teamwork design](TEAMWORK_DESIGN.md) — harness-agnostic multi-agent runs:
+  runtime vs seat, the worker contract, configuration, run directory and
+  budget ledger; foundation types implemented, runtime pending.
 - [Provider offers and control plane](PROVIDER_OFFER_ARCHITECTURE.md) — provider
   profiles, channels, model offers, typed credentials, routing, and persistence.
 
@@ -90,6 +96,9 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 
 ## Build, CI and release
 
+- [PR review and repair loop](PR_AGENT_LOOP.md) — submit new PRs upstream,
+  bind the original Codex worker, iterate on review feedback and enqueue the
+  exact reviewed head after CI passes.
 - [CI design](CI_DESIGN.md) — required checks, the change scope that skips
   suites a change cannot affect, and the merge queue that tests a batch of
   PRs once.

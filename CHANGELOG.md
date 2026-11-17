@@ -10,6 +10,1000 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- **Every request names metacodes as its User-Agent.** Provider, sign-in,
+  key-check, catalog, MCP and service requests used to go out as std's
+  `zig/0.16.0 (std.http)`; they now say `metacodes/<version>`
+  (`src/api/http_connection.zig`). Vendors tell coding tools apart by this
+  header, and their terms forbid a forged one. A request that names itself
+  keeps its own (the OTLP exporter's `metacodes-otlp`).
+
+- **A subscription plan run with nobody at the keyboard says so once.** The
+  coding plans (Kimi Code, the Z.AI GLM Coding Plan) are licensed for a
+  person in a coding tool, so a `-p`, `serve`, resumed-suspension or piped
+  REPL start on one prints `warning: <plan> is a subscription plan for
+  interactive use; its terms may not cover -p, serve or CI. Use a
+  pay-as-you-go key for automation.` on stderr. It never refuses, and the exit
+  code is unchanged; `--web` (a person in a browser) and teammates are not
+  told. Profiles declare it as `ProviderProfile.subscription_plan`.
+
+- **`metacodes login status` says which credential a plain start uses, and
+  why** (#537). It names what a start with no flag would use,
+  the step of the startup order that decides (flags and the shell, the
+  default stored with `/model`, a Metask sign-in, `<state root>/.env`,
+  nothing), and what each step holds: the session's path, gateway and
+  expiry, `auth.json`'s model and level, where `METASK_API_KEY` is set, the
+  names the `.env` sets and the provider it configures, and the providers'
+  keys that are only in the shell and choose nothing. Never a key or a
+  token. The start and `login status` take the decision from one place
+  (`src/app/startup_order.zig`).
+- **`/model` is one screen, models first** (follow-up to #527). The models of
+  every configured provider are listed under a heading per provider that says
+  where its key comes from and who bills it, the provider in use first and the
+  cursor on the model in use; typing filters across them all and lists the
+  matches flat. A model served on several routes lists them under it, in
+  words, while the cursor is on it; Enter on the model takes its preferred
+  route, Enter on a route takes that one. The reasoning level is a line under
+  the list, changed with ←/→ from any row, and kept as the level wanted: each
+  model shows and commits the nearest one it takes. The three scopes are named
+  in the header. Providers without a key are one "Not configured" line at the
+  bottom; Enter lists them. Closing the picker without a choice prints
+  `kept <model>`. On the Metask session, `/model` lists only the models the
+  gateway serves on `/v1/messages`, with the reasoning levels it names
+  (`capabilities.reasoning.efforts`); before, it listed the gateway's image
+  and video models too, and offered no level.
+
+- **An explicit Skill run takes the Host's context blocks** (#534). An
+  AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
+  be refused with `INVALID_ARGUMENT`; the blocks now lead the Skill's
+  invocation record, so the selected Skill sees them, and the date, from its
+  first request (`doc/AGENTCORE_BINARY_ABI.md`).
+- **The Metask sign-in moves to `www.metask-ai.com` and is kept as the Metask
+  session** (#527). `/login` and `metacodes login` sign in at Metask's OAuth
+  server as the public client `metacodes`, ask for `read model:invoke`, and
+  come back on `http://localhost:<port>/auth/metask/callback`. There is no API
+  key to choose any more: the model and reasoning level are picked from the
+  `/v1/models` of the gateway the sign-in names (image-only models are left
+  out; `none` is offered only for a model whose reasoning it can turn off),
+  and turns go there with the session's own access token, billed to the
+  account. The sign-in is stored as `oauth/metask.json`, its model and
+  reasoning level in `auth.json`; a key or an older sign-in there is replaced.
+  Until then an older sign-in there keeps refreshing at `napi.metask-ai.com`
+  as `metacode-cli`, which Metask keeps up for the transition.
+  A plain start signs in with the session, ahead of the provider `.env`
+  configures and after any key that signs Metask in (#499's first part); a
+  stored Metask default the session authenticates runs at the session's
+  gateway. `/logout` and `metacodes logout` revoke the session at Metask
+  first, bounded, and say when that fails. `metacodes login status` shows the
+  session. The device-code sign-in now posts to `www.metask-ai.com` (the bare
+  host answers every request with a redirect, so it failed with
+  `RequestFailed`), asks for the same scope, names the client in every grant
+  and the refresh, and sends no host name. It also asks for the model and
+  reasoning level, as the browser sign-in does: `metacodes login --provider
+  metask` at a terminal, and `/login metask` in `/login`'s pane. Before, it
+  chose none, and a start on it ran the compiled default model, which the
+  gateway does not serve. Without a terminal it stores only the session and
+  says so. If the running session cannot switch to the chosen model, the new
+  session and model choice are rolled back: the previous sign-in, stored
+  default, and current route keep working together.
+
+- **The line that ends a Metask sign-in says who signed in** (follow-up to
+  #527). `/login`, `/login metask` and `metacodes login` ask the server for
+  the account's name (`/api/oauth/userinfo`: its name, else its email) and
+  end with `Signed in to Metask as <name> · <model> · reasoning <level>`; a
+  control character in it is shown as `?`. Without an answer within 3 s the
+  line is as before.
+
+- **A suspended Metask account says so** (follow-up to #527). The Metask
+  gateway refuses a suspended account with a 403 `account_suspended`, which
+  read as a rejected sign-in, with "sign in again" as the next step, which
+  cannot help. It now says the account is suspended and where to see to it.
+  `key_quota_exhausted` reads as a used-up quota, like `insufficient_balance`.
+
+- **`/login` signs in to Metask in the browser; `/logout` switches back to
+  local configuration** (#485). `/login` alone now runs `metacodes login`'s
+  browser sign-in, then asks for the API key, model and reasoning level in
+  the pane (an account without keys is told where to create one); Esc at any
+  step stores and changes nothing. Once chosen, `auth.json` is written as
+  `metacodes login` writes it, the session moves onto Metask at once, and a
+  stored `/model` default is forgotten so the next start uses the sign-in
+  (`metacodes login` now forgets it too). The provider list it used to open
+  is `/login <provider>` (the pane names those providers); `/login metask` is
+  still the device-code sign-in, which the pane names for a machine without
+  a browser. The new `/logout` removes both Metask sign-ins (`auth.json` and
+  `oauth/metask.json`), forgets a stored default that resolves to Metask,
+  drops every Metask credential the process holds, and moves a session on
+  Metask to the provider `.env` configures (`Switched to <provider> (from
+  .env)`: the parenthesis names where its key came from, and a Metask that
+  `.env` configures runs on `.env`'s key) or leaves it without a model; it
+  names a `METASK_API_KEY` still set in the shell or `.env`. `/logout
+  <provider>` removes the key `/login <provider>` stored. Neither runs in
+  the middle of a turn. A start on Metask while `.env` configures another
+  provider says so once under the banner (`.env configures DeepSeek; the
+  default is Metask. To use DeepSeek: /model, or /logout`).
+- **A provider named at start without a key opens the TUI without a model,
+  and a stored default without one is passed over** (#485). `--provider`,
+  `--offer`, `METACODES_PROVIDER` or `.env` naming a provider that has no
+  credential no longer stops the TUI, nor quietly uses another provider: the
+  TUI opens unbound and its note names the variables that provider reads, or
+  `/login metask` for Metask (`-p` still stops with the provider's help). A
+  `/model` default (`global_selection`) whose provider has no credential is
+  passed over for the Metask sign-in or `.env`, with one notice (`The
+  default model, X, has no key or sign-in; this session uses Y.`), where it
+  used to stop the start.
+  A Metask default is served by the browser sign-in's key (`auth.json`) when
+  there is no device-code sign-in: it used to stop with `Metask session is
+  unavailable`.
+- **`metacodes logout` removes both Metask sign-ins and says which** (#499,
+  part 2). It used to remove `auth.json` only, leaving the device-code
+  sign-in and its refresh token in `oauth/metask.json` usable. It now removes
+  both (and a key stored with `login --provider metask`, which `logout
+  --provider metask` now also does), forgets a stored default that resolves
+  to Metask so the next start falls back instead of failing, and names a
+  `METASK_API_KEY` still set in the shell or `.env`. README's quick start
+  signs in with `metacodes login`, or `metacodes login --provider metask
+  --no-browser` on a machine without a browser.
+- **`metacodes` with nothing configured opens the terminal UI instead of
+  exiting** (#484). With no flag, stored `/model` default, Metask sign-in or
+  `.env` provider, or with a Metask sign-in whose key and model were never
+  chosen (`Metask login is incomplete`), the TUI starts without a model: the
+  banner's model line reads `not set — /login, or configure .env`, slash
+  commands work, and a prompt — or `/retry`, `/init`, `/commit`, `/review`,
+  `/btw`, `/recap`, a Skill — is not sent. A red note in its place names
+  `/login`, this install's `.env` (and `.env.example` when an install wrote
+  it), the provider keys the shell holds by name only (they are still never
+  used on their own: `/model` picks one) and doc/LOCAL_CONFIG.md. The prompt
+  stays in the history for ↑, no request of any kind goes out (not even the
+  `/v1/models` probe), and no session directory is made until a model is
+  chosen. `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe still
+  stop at once, non-zero, with the sign-in hint. The banner now also says
+  where the model's credential came from — `· Metask`, `· from .env`,
+  `· from shell`, `· saved key`, `· signed in`, `· --api-key` — and
+  `metacodes install` ends with the next step while the install has neither a
+  Metask sign-in nor a `.env`.
+
+- **`/model` lists only routes it can apply, and takes no key** (#488). A
+  route is listed when a credential resolves for it now, by the resolution a
+  commit binds with, without sending a request: the environment,
+  `<state root>/.env`, a key `/login <provider>` stored, a provider's stored
+  OAuth login, a credential-pool member, `--api-key` for its provider, and
+  for Metask the session's own key or, in a session started on another
+  provider, the key `metacodes login` stored in `auth.json` (a pick of a
+  Metask route now binds that key; it used to fail with
+  `MissingCredentials`). Only a missing credential takes a route off the
+  list: one refused for another reason (two names of its key that
+  disagree, say) stays listed, and a pick says why. A provider with no such
+  credential is no longer a row that leads to a sign-in or a key field: it
+  is listed dimmed under
+  "Not configured", below the others, and choosing it shows the variable to
+  set, this install's `.env` and `doc/LOCAL_CONFIG.md` (for Metask, `/login`
+  first), and starts nothing. The in-picker sign-in and key-paste stage of
+  #67 are gone; `/login <provider>` pastes a key or signs in, as before. A
+  pick that moves the session to another provider says on a second line who
+  bills it from then on (`from now on billed to your DeepSeek account`).
+
+- **`KIMI_API_KEY` is the Kimi Code subscription's key, no longer an alias
+  of `MOONSHOT_API_KEY`** (#487). The `kimi` profile (the Moonshot open
+  platform) now reads `MOONSHOT_API_KEY` only, and `KIMI_API_KEY`
+  authenticates the new `kimi-code` profile beside its canonical
+  `KIMI_CODE_API_KEY`. Kimi's own Codex and Hermes guides give the
+  subscription key that name, so with it set `--provider kimi` sent a
+  subscription key to the platform, a different account. A platform user who
+  set only `KIMI_API_KEY` renames it to `MOONSHOT_API_KEY`; until then
+  `--provider kimi` stops with `Authentication required for provider 'kimi'`
+  before any request is sent. `KIMI_CODE_API_KEY` and `KIMI_API_KEY` holding
+  different values is refused as conflicting, as the GLM plan's names are.
+- **A `SessionHost` submission's own `model` and `permission_mode` are
+  journaled as the daemon journals a message's fields** (part of #445). The
+  driver writes a `config_changed` line for each one it applies, where
+  0.12.0 wrote the `command_result` of `set_model` and
+  `set_permission_mode`. When either is refused, `message_rejected` says why
+  in the daemon's words, for example `model not available for current
+  provider` or `bypassPermissions is disabled by settings`, where 0.12.0
+  named the error.
+- **A `SessionHost` configuration command is journaled as the daemon's
+  `/command` is** (part of #445). An accepted `set_model`,
+  `set_permission_mode` or `set_reasoning_effort` now writes a
+  `config_changed` line (`model` as resolved, `mode`, `reasoning`) before
+  its `command_result`, as `/model`, `/mode` and `/effort` do through the
+  daemon's config sink, and `set_additional_directories` writes
+  `config_changed{dirs}` for each directory it adds, as `/add-dir` does.
+  0.12.0 wrote the `command_result` alone. The permission mode is journaled
+  by a config sink on the Session's permission context, so a submission's
+  mode is journaled once, as before.
+- **A request whose sign-in or key was rejected, or whose balance ran out,
+  ends by saying what to do instead of suggesting `/retry`.** The TUI ended
+  every failed request with `Retry with /retry, or switch models or compact
+  the context first.`, and a retry cannot help either of these. On HTTP 401
+  or 403 the last line is now `Your Metask sign-in is no longer valid. Sign
+  in again: /login` on Metask, and on another provider `DeepSeek rejected
+  the API key. Check DEEPSEEK_API_KEY in <state root>/.env or your shell,
+  then restart.`, with that provider's name and key variable. On HTTP 402,
+  or when the provider's error code is `insufficient_balance` or
+  `insufficient_quota` (OpenAI answers a used-up quota with 429), it is
+  `Your Metask balance has run out. Top up your Metask account, or switch
+  provider: /model`, or `DeepSeek reports no balance or quota left. Top up
+  with DeepSeek, or switch provider: /model`. `-p` prints the same line on
+  stderr after the raw error, naming the command that was run
+  (`metacodes login`) and `--provider` where the TUI names `/login` and
+  `/model`; its exit code stays 1. Every other failure keeps the old
+  advice, and nothing is retried or switched by itself.
+
+### Added
+
+- **A Linux sandbox backend: bubblewrap.** With `sandbox.enabled`, Bash,
+  Monitor, skill `!` lines, the teamwork reviewer's check command and the
+  Claude Code seat's CLI now run on Linux in bwrap mount, pid and IPC
+  namespaces translated from the same settings Seatbelt reads on macOS:
+  `/` read-only, the write roots bound writable at their physical paths,
+  `denyWrite` read-only and `denyRead` hidden on top, `--new-session
+  --die-with-parent`. bwrap is `/usr/bin/bwrap`, `/bin/bwrap` or the absolute
+  path in `METACODES_BWRAP`, never `PATH`, and is probed once per process; one
+  that cannot create a user namespace counts as no sandbox, so
+  `failIfUnavailable` refuses and `autoAllowBashIfSandboxed` does not apply.
+  A domain list in `network` cuts the network off under bwrap (no per-host
+  filter). Teamwork seats on Linux get the sandbox too, so an implementer seat
+  can build and test in its workspace instead of running read-only commands
+  only.
+
+- **A `SessionHost` Session can move onto another provider route, journaled
+  as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`
+  commit moves the session's provider, endpoint, credential and model
+  together and broadcasts the route's identity; `SessionHost` had no route
+  at all. The new `Command.set_route` takes a `Route` the Host's provider
+  control plane bound (`binding`: provider kind, wire protocol, auth scheme,
+  dialect, endpoint, credential, model; and the provider, channel, protocol,
+  offer id, credential reference and scope that identify it). The driver
+  applies it between Runs through the new `AgentSession.setRoute`, which
+  swaps all of them at once and keeps the conversation and reasoning effort
+  (an effort the new provider cannot take is refused with
+  `AgentEffortUnsupportedProvider`). It then journals
+  `config_changed{model}` and `config_changed{route}`, as the CLI does, and
+  never the credential. A refused route changes nothing and journals no
+  `config_changed`. A teammate a lead opens afterwards runs on the lead's
+  route (`TeammateSpawn.lead_route`, applied by `InheritLead`). An
+  `AgentSession` now keeps its own copy of `SessionConfig.auth_scheme`.
+- **A hosted lead's members follow the permission rules and directories it
+  gains, as the daemon's teammates do** (part of #445). Under
+  `session_host.InheritLead` a member decided its tool calls with what its
+  configuration held when it opened, so a rule the lead gained later
+  (`update_permission_rules`, an "allow always" or "deny" answer) or a
+  directory it added (`set_additional_directories`) never reached it. The
+  new `TeammateFactory.permissions = .lead`, which `InheritLead` declares,
+  opens each member through the new `AgentSession.inheritPermissions`: it
+  decides every tool call with its lead's imported rules, additional
+  directories and Session memory as they are at that call, from its next
+  tool call on, and refuses its own `update_permission_rules` and
+  `set_additional_directories` (`PermissionsInherited`). Each decision holds
+  the lead's lock (`permission/lent.zig`); the lead frees replaced rules
+  only after it, and its AgentSession outlives its members'.
+- **A `SessionHost`'s model catalog can be refreshed while it runs, as the
+  daemon's is** (part of #445). The daemon's catalog is its cached
+  `/v1/models` answer, replaced when the background refresh lands;
+  `Options.models.catalog` was fixed for the Host's life, so a model the
+  refresh adds stayed refused. The new `SessionHost.setModelCatalog`
+  replaces it (copied): every Session's next `Submission.model` or
+  `set_model` resolves against the new catalog, and the model a Session is
+  on stays in force. A Host without `Options.models` gets
+  `error.ModelPolicyUnset`.
+- **An embedded Session's Runs can be gated by the project's rules, as the
+  daemon's are** (part of #445). `SessionConfig.run_control` opens, for every
+  Run on a durable `run_journal`, the `RunControl` the bundled daemon opens:
+  with `project_rules = .enforced`, an active bundle in
+  `<dirname(run journal root)>/project-rules` for the workspace root is
+  re-attested before the provider request, decides each tool call through
+  the project kernel, and publishes the Run's operational observer after it;
+  a missing or invalid kernel configuration, a bundle that fails
+  attestation, or a running background job or active team fails the Run
+  before any provider request. Such a refusal fails only that Run, as the
+  daemon reports it failed and takes the next message: the submission's
+  text stays out of the Conversation and the Session is idle again, not
+  poisoned (a journal that cannot open still poisons). A refused resumption
+  of a suspended Run (`AdmittedRun.resumeWithResults`) leaves the answer
+  out of the Conversation too, and `SessionHost` keeps the suspension:
+  `run_done` names the error, the request is announced again under its id,
+  recorded open, and a later answer resumes the turn. `abandoned_run = .record_abandoned` closes a
+  Run whose process died as abandoned and runs the next one, as the daemon
+  does; the default stays `fail_closed`. Either setting on an ephemeral
+  Session is refused (`RunControlRequiresRunJournal`), and a Session that
+  enforces project rules refuses an isolated executor Run
+  (`ProjectRulesUnsupportedForIsolatedRun`), which the gate cannot reach.
+  The default (`project_rules = .ignored`) reads no bundle, as before.
+
+- **Built-in Kimi Code provider** (#487). `--provider kimi-code` (alias
+  `kimi-coding-plan`) uses a Kimi Code subscription: requests go to
+  `https://api.kimi.com/coding/v1` (`global-*` channels:
+  `https://api.kimi.ai/coding/v1`) and count against the membership, not the
+  Moonshot open platform. The key is its own credential kind
+  (`kimi_code_api_key`), read from `KIMI_CODE_API_KEY` or `KIMI_API_KEY`.
+  The default channel `cn-responses` speaks the Responses wire, as Kimi's
+  Codex guide configures it; `cn-chat` and `global-chat` speak Chat
+  Completions with the Kimi dialect, which shows the thinking stream. The
+  models are the six of Kimi's model page: `k3.1-pro` (the default),
+  `k3.1-pro-highspeed`, `k3`, `k3-256k`, `kimi-for-coding` and
+  `kimi-for-coding-highspeed`, each with `reasoning_effort` low / high / max
+  except the last, which always thinks. `/login` lists "Kimi Code · API
+  key": the pasted key is checked by listing the subscription's models and
+  stored in `<state root>/keys/kimi-code.json` (0600), as `metacodes login
+  --provider kimi-code` does. On Chat Completions the `k3*` models and
+  `kimi-for-coding` send no `reasoning_effort` when none is chosen, so the
+  server's default applies (high for K3.1 Pro and K3, max for K2.8
+  Preview), and never `none`; `kimi-for-coding` sends `reasoning_effort`
+  instead of K2.7-code's `thinking` object. K3.1 Pro and K3 declare a
+  262,144-token window, the one every plan gets (1,048,576 needs Pro or
+  Allegretto). The Anthropic-compatible surface is not offered yet: Kimi does
+  not document how a Messages request turns thinking on, and K3.1 Pro
+  refuses a request with thinking off. Quotes stay unknown.
+- **`SessionHost` resolves model names as the daemon does, when the Host
+  asks** (part of #445). With the new `Options.models` (a
+  `session_host.ModelPolicy`: a borrowed `model_tiers.TierTable` and the
+  provider catalogs' models), a `Submission.model` or `set_model` name is
+  trimmed, a tier name (`low`/`mid`/`high`, `haiku`/`sonnet`/`opus`)
+  resolves through the Session's provider's tiers, and a model that
+  provider does not take (another provider's id, an unset tier) is
+  refused: `message_rejected` with `model not available for current
+  provider`, or `command_result` with `ModelUnavailable`. The rule
+  (`api/model_availability.zig`) is the one `--web`/`serve` messages and
+  `/model` use. Without `Options.models` a name is taken as before.
+- **`SessionHost` fires a Session's cron prompts** (part of #445). With the
+  new `RuntimeConfig.enable_cron`, a Session can select `CronCreate`,
+  `CronDelete` and `CronList`; it owns their `CronRegistry`, as the CLI's
+  and the daemon's `App` does, and `AgentSession.takeDueCronPrompts` takes
+  the prompts due while it is idle. A SessionHost driver checks them at
+  most every `cron_poll_ms` (1 s) while its queue is empty, and each prompt
+  due becomes a Run typed `session_host`/`cron_fired` whose user message is
+  the prompt, as the CLI fires one when it is back at the prompt. A job
+  never fires during a Run or ahead of queued work. The cron tools stay out
+  of the explicit `builtin_tools` list and the C ABI.
+- **A Host sees and cancels a Session's cron jobs without a Run** (#493).
+  `SessionHost`'s `Snapshot.cron_jobs` lists them oldest first, each with
+  its `id` (a `CronJobId`), `next_fire_unix` and `schedule` (`.once`, or
+  `.recurring` with its cron expression), as of the last time the Session
+  was between Runs. The new commands `cancel_cron_job` (by id) and
+  `cancel_all_cron_jobs` remove jobs in queue order, so they never fire
+  again, and are journaled as `command_result` like the other commands; an
+  unknown id is `ok: false`, `CronJobNotFound`. `AgentSession` gains
+  `cronJobs`, `cancelCronJob`, `cancelAllCronJobs` and `cronDueCount`.
+- **Local configuration in the install's `<state root>/.env`** (#486). A
+  provider key, `METACODES_PROVIDER` and the new `METACODES_MODEL` can live
+  in one file of the install, beside `auth.json`
+  (`~/.local/opt/metacodes/state/.env`; `~/.metacodes/.env` for a build run
+  from a checkout), instead of the shell profile; side-by-side installs keep
+  separate files. It is read once at start, as a layer below the process
+  environment, never `setenv`: the shell's value of a name wins, and a key
+  in the shell under any of a provider's names hides that provider's keys in
+  the file, so the two are never refused as conflicting. It may set every
+  registered provider's key names, the variables `config.json` names
+  (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`;
+  these select no provider), `METACODES_PROVIDER` and `METACODES_MODEL`;
+  request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, any `*_URL`)
+  are refused, and every ignored name is listed once in a warning, without its
+  value (a line whose name is not written like a variable name, which may be
+  part of a pasted key, by its line number only). Its
+  provider ranks last: `METACODES_PROVIDER` there (else the one provider whose
+  key it holds) applies only when no flag or environment variable names a
+  provider, no `/model` default is stored and there is no Metask sign-in
+  (`--api-key`, `METASK_API_KEY`, `auth.json`; the file's own
+  `METASK_API_KEY` counts only while the file names no other provider); a
+  file with keys of several providers and no name stops the run and lists
+  them. A key only in the shell
+  still never selects a provider, and a `.env` in the working directory or a
+  repository is never read. The missing-credential hint and a provider's
+  credential help name the file; `metacodes install` and `update` write a
+  `.env.example` template beside it and never touch `.env`; `metacodes
+  doctor` reports which names the file sets are read or ignored (`--json`:
+  `local_config`), never a value. `METACODES_MODEL` in the shell is
+  `--model`. Guide: `doc/LOCAL_CONFIG.md`. A `.env` already sitting in a
+  state root is read from this release on.
+
+### Fixed
+
+- **Shift+Enter inserts a newline while a reply streams** (#456). In the
+  terminal UI, Shift+Enter during a reply did what Enter does: the draft
+  went into the pending queue, the input box was cleared, and when the reply
+  ended the line typed so far was sent as the next message. It now inserts
+  a newline in the draft, as it does at the prompt; Enter still queues the
+  whole draft, newline included, as one message.
+- **`/model` names the variable and the file for a provider without a key**
+  (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
+  chosen without its key ended in `switch failed (MissingCredentials)`: these
+  providers have neither a sign-in nor a key page the picker could open.
+  Such a provider is now listed under "Not configured" (#488), and a pick
+  whose key went away after the picker opened shows the same setup: the
+  variable to set (the canonical one, e.g. `MOONSHOT_API_KEY`), this
+  install's `<state root>/.env` and the guide (`doc/LOCAL_CONFIG.md`); the
+  previous route stays active. A picker notice longer than the terminal is
+  wide is broken into rows inside the width instead of running past it.
+- **An idle AgentCore Session no longer holds about 50 MB of private commit
+  on Windows** (#503). Zig 0.16's `std.Thread.spawn` hands its 16 MiB
+  default stack to `NtCreateThreadEx` as the stack *commit*, so each thread
+  charges 16 MiB of private commit for its whole life; on POSIX it is only a
+  reservation. A Session that had streamed one Run kept three: its
+  provider's two `std.Io.Threaded` pool workers and the stream liveness
+  monitor. Pool workers created through `platform.signal.threadedIo` now get
+  a 2 MiB stack (a whole HTTPS exchange peaks at 544 KiB in Debug), and the
+  liveness monitor runs on a 256 KiB stack and exits once no request is left
+  to watch, coming back with the next one; an idle Session no longer wakes
+  every 250 ms either. Measured on Windows 10 x64 with four idle Sessions:
+  49,351 KiB and 3 threads per Session before, 4,231 KiB and 2 threads
+  after. Every production thread now spawns through
+  `platform.thread.spawn` with a named stack class (`waiter`, `io_worker`,
+  `full`); the others keep std's 16 MiB as `full`, unchanged. On Linux the
+  smaller classes ask for 512 KiB more: glibc carves a thread's static TLS,
+  which holds std's 256 KiB alternate signal stack, out of the stack it is
+  given, and refuses a thread whose TLS does not fit.
+  `zig build test:thread-stack` (part of `test:units`) refuses a direct
+  `std.Thread.spawn` outside test blocks.
+- **The permission check and the tool read one spelling of a call's
+  arguments** (#494). Arguments that named a key twice (`"-i"` twice in a
+  `Grep` call, `file_path` twice in a `Read` call) failed the strict parse
+  of AgentCore's permission digest, and that failure became a deny: the
+  model got `permission_denied` (`safety`, not recoverable) in every
+  permission mode, for a mistake it could correct. And `Grep` found its
+  `path` by the substring `"path":`, so `"path" : "target.ts"` searched the
+  whole working directory while the permission layer judged `target.ts`.
+  Now the agent loop admits a call's arguments before the PreToolUse hook,
+  the permission check and the tool see them: one JSON object with no
+  duplicate key at any level, rewritten in one compact spelling, or an
+  `invalid_args` result (`user_error`, recoverable) with nothing run —
+  `DuplicateArgumentKey`, or `InvalidArgumentsJson` for arguments that are
+  not a JSON object. The bytes the model sent stay in the Conversation
+  unchanged. Built-in tools read their arguments as top-level members
+  (`tools/common.extractJsonArg`, `util/json.topLevel*Field`) rather than
+  the first substring match, so a key nested in another value or inside a
+  string is no longer taken for the argument; so do the schema checks
+  (`tools.validateRequired`/`validateTypes`), the permission rule matcher
+  and the MCP resource tools.
+
+- **Cron prompts no longer push a `SessionHost` queue past `max_queued`**
+  (#493). With more jobs due at once than the queue had room for, the
+  driver queued every prompt, `Snapshot.queued` went past `max_queued`, and
+  `submit` and `command` refused with `QueueFull` until it drained. Now it
+  takes only as many prompts as fit, oldest job first; a job left out stays
+  due and fires once there is room, so none is lost. A team lead's inbox is
+  read under the same bound. `AgentSession.takeDueCronPrompts` and
+  `CronRegistry.collectDue` take the limit as a new argument.
+
+- **A run that finds no credential names the command that was run in its
+  sign-in hint, and lists the default sign-in first** (#482). Run as
+  `metacodes-dev`, a side-by-side development install (`scripts/install.sh
+  --dev`) said to run `metacodes login …`, which signs in the release
+  install, whose state root is separate; and the list left out the bare
+  `metacodes login` that a plain launch reads. The hint now opens with
+  `<command> login`, and its other lines, the incomplete-login message, the
+  Metask session messages and a named provider's credential help name the
+  same command. The launcher `metacodes install` writes now exports its own
+  path as `METACODES_LAUNCHER`, because the executable it `exec`s starts as
+  `<prefix>/bin/metacodes` for every install. The executable believes the
+  variable only when that file is a launcher that execs it; otherwise it
+  takes argv[0] (a symlink under another name), then `metacodes`. A
+  launcher written before this keeps the hint at `metacodes` until
+  `scripts/install.sh` writes it again; `metacodes update` leaves launchers
+  as they are.
+
+- **A `CronCreate` with only `delaySeconds` fires once, as the tool says.**
+  `recurring` defaulted to true without a `cron` expression too, so the job
+  was stored as recurring with no expression to repeat on. After its first
+  fire `CronRegistry.collectDue` could not compute the next one and set it a
+  minute on, so the "one-shot" prompt ran again every minute until the job
+  was 7 days old; in the CLI, after each exchange that ended at least 60 s
+  after the last fire. Now `recurring` defaults to true only with a `cron`
+  expression, and `recurring: true` without one is refused as
+  `invalid_args`, with nothing scheduled; a `cron` or `recurring` sent as
+  JSON `null` counts as left out. A recurring job whose next fire cannot be
+  computed is removed after it fires, which also stops a valid expression
+  with no match within a year (a Feb 29 job after a leap day) from firing
+  every minute, and `CronRegistry.create` refuses one, also when
+  `delay_seconds` sets its first fire. A delay-only job's tool result now
+  says `"recurring":false`; the tool definitions are unchanged.
+
+- **The log-capture tests no longer read another shard's log** (#472).
+  `redirect_credential_test` and `http_error_test` logged every capture to
+  one fixed file, `<tmp>/cc-zig-<name>-test.log`, which all eight
+  `test:integration` shard processes share. A capture in one shard truncated
+  or unlinked the file another was logging into, which then read a foreign
+  line or lost its own; a merge-queue run failed this way. Each capture now
+  creates its own file, named by pid and a per-process counter with
+  `O_EXCL` (`harness.LogFile`), and reads it to EOF instead of with one
+  bounded `read`; a log larger than the buffer is an error, not a cut.
+
+- **Two tests no longer assume `/bin/sleep` and `/bin/echo` are regular
+  files.** Ubuntu 26.04, now GitHub's `ubuntu-latest`, ships the Rust
+  coreutils (uutils): `/usr/bin/sleep` and `/usr/bin/echo` are symlinks
+  into `/usr/lib/cargo/bin/coreutils/`, to a multi-call binary that acts as
+  the command it is run as. There the `process_scan` test looked for its
+  `/bin/sleep` child under `/usr/bin`, which the child does not run from,
+  and the formal runtime's hash-mismatch test failed with `OpenFailed`
+  before its comparison, since `hashChecker` does not follow a symlink.
+  Both failed on every run, so `Gates (Linux)` failed for every pull
+  request. The first now scans the directory of the program's real path
+  and still spawns `/bin/sleep` by that name; the second hashes an
+  executable it writes into a temporary directory. Product code is
+  unchanged.
+
+### Security
+
+- **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**
+  (#473). The TUI, `-p`, `--web` and `serve` permissioned a tool an MCP
+  server contributes as a read, so `default`, `acceptEdits` and `auto` ran it
+  on the model's decision alone: a tool that changes something outside the
+  machine (a database, a ticket system, a deployment, a device) ran without a
+  prompt, and text the model read in a web page, a file or another tool's
+  output could steer it there. AgentCore already permissioned the same tool
+  as executing and asked. Every tool a server lists is now permissioned as
+  executing, as `Bash` is: `default`, `acceptEdits` and `auto` ask before it
+  runs (`-p`, with nobody to ask, denies it), `dontAsk` denies it, and
+  `bypassPermissions` runs it. A server's annotations (`readOnlyHint` and the
+  rest) are its own claim and do not relax this. To keep a trusted server's
+  tools running without a prompt, allow the server:
+  `{"permissions": {"allow": ["mcp__<server>"]}}` in a settings file
+  (`mcp__<server>__*` and `mcp__<server>__<tool>` work too), or
+  `--allowedTools mcp__<server>`. Approving a project server in `.mcp.json`
+  only starts it. `ListMcpResourcesTool`, `ReadMcpResourceTool` and the
+  Skill tool keep their classification.
+  `tests/component/mcp_permission_test.zig` runs a real App against the
+  stdio mock server in every mode and under each spelling of the allow rule,
+  and checks what the server received; `tests/tty/cases/test_mcp_permission.py`
+  checks the TUI's dialog.
+
+## 0.12.0 — 2026-11-13
+
+### Changed
+
+- **Breaking: the `--web`/`serve` event stream is wire v1 throughout** (#444).
+  `/events` and the UDS `attach` op carried two envelopes. Kernel events and
+  UI requests were versioned wire lines, but the host lines were unversioned
+  `{"<name>":...}` objects written by hand, with their own field names and no
+  Run identity. Now every journal line is one wire v1 line written by
+  `core/protocol/wire.zig`, in the form `SessionHost` writes
+  ([doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md) §1.1–1.2). `user_message`,
+  `run_done`, `command_result` and the new `message_rejected` are host
+  events (`{"v":1,"type":...,"data":{...}}`), and `session_lifecycle` is a
+  kernel event. `run_done.err` is gone: a failed Run names its error in
+  `error_name` with a `null` `stop_reason` (it said `"error"`), and a model
+  failure's text is `model_error.message`. `command_result` gains `command`
+  (the line's verb) and `error_name`, and keeps its text in `message`. Runs
+  are numbered per session, and `user_message`, `run_done` and every kernel
+  event in between carry the Run's `run_id`. A `/command` that plans a Run
+  journals its `command_result` before the Run's `user_message`. Out-of-tree
+  readers of `/events` and `attach` switch on `type` and read `data`; the
+  bundled browser UI parses this one form. The UDS frames
+  `{"type":"keepalive"}` and `{"type":"session_closed"}` stay as they were:
+  they are the transport's, not journal lines (§1.3). For the wire contract
+  the change is additive: `message_rejected` is a new HostEvent tag, and
+  `command_result.message` an appended field
+  (`tests/fixtures/wire/v1/host_events.jsonl`).
+
+- **`--web` and `serve` refuse an `idempotency_key` instead of ignoring it**
+  (#447). A message carrying one was accepted and the key dropped, so a
+  retried delivery ran twice while its client believed it was de-duplicated.
+  `POST /message` now answers `400` and the UDS `message` op
+  `{"ok":false,...}`, both with `idempotency_key not supported: this host does
+  not de-duplicate messages`, and nothing is queued; `"idempotency_key":null`
+  still counts as absent, and other unknown fields are still ignored. These
+  hosts take keys once they run on `SessionHost` (#445).
+
+### Added
+
+- **Typed submissions and a bounded inbox on `SessionHost`** (#447).
+  `Submission` gains `source`, `kind`, `attributes` and `idempotency_key`. One
+  key is one Run: a delivery whose key is queued, running, or whose Run
+  started within `Options.idempotency_retention_ms` (24 h) is refused with
+  `error.DuplicateSubmission`, and the same key on a different submission with
+  `error.IdempotencyKeyReused`. Started keys are kept in the session
+  directory (`idempotency.jsonl`), so a Host that reopens the Session after a
+  restart refuses them too; a key is spent only when its Run starts, so a
+  delivery the restart dropped from the queue may be sent again. A full queue
+  refuses with `error.QueueFull` after duplicates are answered and holds
+  nothing, and `Snapshot.max_queued` reports the bound next to `queued`.
+  `source`, `kind`, `attributes` and the key are echoed on the Run's
+  `user_message`, as appended fields written only when given, so other lines
+  keep their bytes (`tests/fixtures/wire/v1/host_events.jsonl`). They reach
+  the provider only through `OpenSpec.submission_template` (`{{text}}`,
+  `{{source}}`, `{{kind}}`, `{{attributes}}`); without one the provider
+  receives the text's bytes, as before. `serve` and `--web` take typed
+  submissions once they run on `SessionHost` (#445).
+
+- **A stream retry budget for AgentCore Hosts** (#452). A reasoning model
+  streams thinking first, so a gateway stream that breaks off has almost always
+  shown output, and the Run ended with `STOP_API_ERROR`. AgentCore ABI revision
+  28 adds `RunOptionsV1.stream_retry_budget` (0 to 8, default 0, in the
+  options' last reserved word): the Run may send the same request again that
+  many times when its accepted stream broke off without an answer (a stall, a
+  dropped connection, a stream that ended before its stop report), beyond
+  each request's own re-send (#461); a server's error and a local decode
+  failure are never re-sent. Each re-issue tells the Host what to take back:
+  the attempt's segment closes `discarded`, the new `thinking_discarded` event
+  names the thinking it showed, and a `retry_notice` follows. The header, the
+  bindings, the Python (`stream_retry_budget=`) and Node (`streamRetryBudget`)
+  packages and the source-free consumers move to revision 28.
+
+- **Edit and rerun through AgentCore** (#441). AgentCore ABI revision 27 adds
+  `session_control->rewind_to_user_message(session, position, out_error)`, the
+  operation behind `/edit` (#432): while idle it drops the user message at a
+  1-based position and everything after it, and the Host's next Run takes its
+  place after exactly the context before it. A position that cannot be rerun is
+  refused with its own status (31 `MESSAGE_POSITION_OUT_OF_RANGE`, 32
+  `NOT_USER_MESSAGE`, 33 `MESSAGE_POSITION_COMPACTED`) and changes nothing. Only
+  the Conversation changes; a checkpoint exported afterwards holds the edited
+  history and a restored Session continues from it. The Session Control table
+  grows to 88 bytes. The header, the Zig and Rust bindings, the Python
+  (`Session.rewind_to_user_message`) and Node (`Session.rewindToUserMessage`)
+  packages and the source-free consumers move to revision 27; AgentCore
+  0.15.0-dev.
+- **A `SessionHost` submission may carry its own `model` and
+  `permission_mode`** (part of #445), as a `--web`/`serve` message does.
+  The driver applies them just before the Run, journaled as the
+  `command_result` of `set_model` and `set_permission_mode`, and they stay
+  the Session's settings. The mode is checked first, so when either is
+  refused nothing is applied, no Run starts and `message_rejected` (now
+  written by both Hosts) takes the place of `user_message`, naming the
+  error; the submission's idempotency key is not spent. Before, an
+  embedder had to queue the two commands itself and could not refuse the
+  text together with them.
+
+- **`SessionHost` feeds a team lead its teammates' replies** (part of #445).
+  A lead Session (`SessionConfig.team` with the lead role) hosted on
+  `core/session_host.zig` never saw a member's `SendMessage`: the inbox is
+  driver-owned state, so no Host thread could read it safely, while the
+  bundled daemon's `App` lead takes each reply as its next turn. Now the
+  driver of an idle lead whose team exists reads the lead inbox at most every
+  `session_host.lead_inbox_poll_ms` (500 ms, the daemon's interval) and queues
+  the reply as the lead's next Run, journaled like any other (`user_message`,
+  kernel events, `run_done`). This is the first of the `App` dependencies the
+  daemon needs an `AgentSession` counterpart for before it can run on the one
+  `SessionHost`. `zig build subsystem:boundary` now also holds that move to a
+  ratchet: no file under `src/daemon/` or `src/web/` may import
+  `src/core/agent_loop.zig` beyond the two that do today
+  (`daemon/app_driver.zig`, `web/session.zig`), and a baseline entry whose
+  import is gone fails until it is deleted.
+- **`SessionHost` starts a hosted lead's teammates** (part of #445). A lead
+  hosted on `core/session_host.zig` could ask for a teammate
+  (`SpawnTeammate`), but the request only sat in `pending_spawns`, while the
+  bundled daemon's `App` starts its teammates itself. With the new
+  `session_host.Options.teammates` (a `TeammateFactory` the Host supplies
+  for the member's provider, workspace, tools and permissions), the lead's
+  driver now opens each requested member on the same `SessionHost` under the
+  lead's team identity and a fresh lease, and submits the request's prompt
+  as the member's first Run; the member's reply comes back as the lead's
+  next Run, and closing the lead closes its members. Without a factory
+  nothing changes. `SwarmContext.popPendingSpawn` hands a request over with
+  its ownership.
+- **`SessionHost` teammates inherit their lead, re-spawn, and fail visibly**
+  (part of #445). The new `session_host.InheritLead` is the `TeammateFactory`
+  the bundled daemon needs: each member gets the Host's base configuration
+  with its lead's current model and permission mode, and the spawn's effort
+  or else the lead's reasoning effort, as an `App` teammate inherits its
+  lead's. `TeammateSpawn` now carries those lead settings
+  (`lead_model`, `lead_permission_mode`, `lead_reasoning_effort`), read on
+  the lead's driver after the commands queued before the spawn. A name whose
+  member the Host closed is opened again: its old roster entry, which held
+  the old lease and refused the new member, is dropped first, so the new
+  member joins under a fresh lease and the closed one's mail stays
+  unaddressed. A spawn that fails is no longer only logged: it becomes the
+  lead's next Run, `<teammate-status from="<name>" state="failed">teammate
+  was not started: <error></teammate-status>`, journaled as a typed
+  `user_message` (`source` `session_host`, `kind`
+  `teammate_spawn_failed`); a member that was open but refused the prompt
+  reads `teammate did not take the prompt: <error>`. Reports do not chain:
+  a failure while fulfilling a report Run's own spawns is only logged, so a
+  model that keeps re-spawning a name that cannot start costs one extra Run,
+  not one per retry.
+
+- **The UDS binding answers UI requests and takes capability frames.** A
+  UDS-only frontend needed HTTP beside the socket for exactly the most
+  important exchange, the reverse requests; now
+  `{"op":"respond","session":"<id>","id":N,...}` answers the pending
+  `ui_request` N with the same answer fields `POST /respond` takes (a stale or
+  unknown id is refused, the HTTP surface's 409; an answer is parsed by
+  `wire.parseResponse`, so a malformed one is never a grant), and
+  `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` is
+  the capability frame itself beside the routing fields, answered with the
+  same acknowledgement line as `POST /capabilities` and journaled for every
+  attached reader. doc/WIRE_PROTOCOL.md §2.3 and doc/API.md spell the ops out.
+
+- **UI requests on long-lived Hosts: who answered, what an unanswered one
+  gets, and questions that survive a restart** (part of #446). An answer may
+  name its approver, `"by"`; the request's `ui_request_closed` records it,
+  appended after `outcome` only when given, so other lines keep their bytes
+  (`tests/fixtures/wire/v1/requests.jsonl`). `SessionHost.respond` refuses a
+  `by` that is not 1 to 256 bytes of string (`error.InvalidApprover`) and a
+  second answer to a request whose first is not applied yet
+  (`error.AlreadyAnswered`); `--web` and `serve` record a valid `by` as well.
+  `SessionHost.Options.ui_request_expiry` says what a request
+  `ui_request_timeout_ms` leaves unanswered gets: `.cancel` (the default, as
+  before), `.interrupt` (the Run stops too; an expired permission prompt
+  still reads as unanswered in time, doc/WIRE_PROTOCOL.md §1.4) or
+  `.re_announce` (the same `ui_request` line again every period, so a zero
+  timeout is refused, `error.InvalidUiRequestTimeout`). Work queued while a
+  request is open waits behind it, and `Snapshot.queue_waiting` says why. With
+  `Options.ui_request_wait = .suspend`, a question or custom UI request ends
+  its Run `suspended` instead of holding the driver: the Session's directory
+  keeps it, `close` leaves it there, `open(.resume)` announces it again under
+  its id after a restart, and `respond` resumes the Run once through the new
+  `AdmittedRun.resumeWithResults`, journaled with the new host event
+  `run_resumed`; the resumed Run keeps the suspended Run's trace id, turn
+  limit and stream retry budget, and request ids are never reused. Each
+  answer reaches only the request it names, and a suspended Run's
+  idempotency key stays spent while it waits. Nothing
+  else runs while a Run is suspended, and a suspended team lead leaves its
+  inbox unread until it resumes. Permission
+  requests still block in that mode: the kernel's permission gate reads a
+  `pending` answer as a denial, so making them survive a restart needs the
+  kernel to suspend there first (follow-up). doc/WIRE_PROTOCOL.md §1.5,
+  doc/API.md.
+
+### Fixed
+
+- **A cancelled question no longer poisons its `SessionHost` Session** (part
+  of #446). A question the timeout, an interrupt or an unreadable answer
+  cancelled reached the AgentSession as `InputAborted`, which it takes for a
+  broken Host: the Run failed `CallbackFailed` and the Session reported
+  `session_poisoned`. It now gets `UiCancelled`, the user's outcome, so the
+  call fails with `InputAborted` as the model sees it and the Run and Session
+  go on. A cancelled custom UI request still poisons; that needs the
+  AgentSession to tell the two apart for custom requests too.
+
+- **A permission prompt nobody answered no longer reaches the model as
+  "user declined"** (#463). A `SessionHost` timeout, an interrupt or close, an
+  unreadable answer, a requester that answers `pending` or `unavailable` or
+  fails, and a headless run with nobody to ask each read as what happened
+  ([doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md) §1.4); a timeout or a
+  cancellation is `recoverable: true`. Every case still denies with `code`
+  `permission_denied`, and a person's deny keeps its exact bytes. For Zig
+  Hosts: `wire.cancelResponse(request, why)` replaces
+  `cancelResponse(request, out)` and fails a permission prompt with a
+  `ui_request.Unanswered` error instead of answering `deny_once`;
+  `wire.parseResponse` returns `void` and fails an unreadable permission
+  answer with `UiAnswerUnreadable` (journal it with
+  `wire.closedOnParseError`). Wire lines are unchanged.
+
+- **A model request is retried once after a transient stream interruption,
+  even after partial output** (#461). A gateway stream that returned HTTP 200,
+  streamed some text or thinking and then dropped ended the Run with
+  `api_error` (`stream_interrupted`, `retryable`, `attempts=1`) in the TUI,
+  headless mode and AgentCore alike: the one automatic re-send applied only to
+  an attempt that had shown nothing and was shared across the whole Run, and
+  #452's re-send after output defaulted to zero. Now every model request has
+  one re-send of its own (`agent_loop.STREAM_RETRIES_PER_REQUEST`), so an
+  earlier turn cannot use it up. It applies when the connection gave no
+  answer (a stall, a drop, a stream that ended before its stop report) and the
+  failed response had not started a tool call: each client's parser reports a
+  call whose arguments were still streaming (`StreamHandle.toolCallStarted`),
+  which the loop never received. The attempt's text and thinking are
+  discarded, the identical request goes to the same provider, wire, model and
+  binding, and results of tools that completed on earlier turns stay. A
+  re-send of an attempt that showed output emits `retry_notice` (after the
+  `discarded` segment and, for thinking, `thinking_discarded`) and waits
+  500 ms; an abort during the wait ends the Run `aborted` and sends nothing.
+  A server-declared error, a local parse failure and a cut during a tool call
+  are still single-attempt. `max_stream_turn_retries` (headless) and the
+  AgentCore budget now come on top of the request's own re-send.
+
+- A same-turn re-issue no longer looks up the abandoned attempt's speculative
+  tool results: they borrowed the attempt's freed tool-call ids, and a
+  re-issued call with a repeated id could take a released, empty result
+  instead of running. Reachable before through headless retries after a
+  streamed tool call (#452).
+
+- **metacodes-core's isolation from the application is checked** (#448).
+  `src/lib.zig` claimed its import graph could not reach the UI and that
+  `test:lib` proved it, but lazy analysis skips imports in code nothing calls,
+  and nothing noticed a planted `core/` → `repl/tui/` import.
+  `zig build subsystem:boundary` now follows every `@import` from
+  `src/lib.zig`, function bodies and test blocks included, and fails on any
+  edge into `repl/`, `web/`, `daemon/`, `app/`, `main.zig`, `app.zig`,
+  `session_service.zig` or `session_intent.zig` outside a baseline that may
+  only shrink: a stale entry fails too, and `src/core/` has none. The model
+  context-window table moves from `src/app/` to `src/api/model_context.zig`,
+  removing seven of the eleven edges; the baseline holds the other four.
+
+- **A stream that ends before it says how it stopped is reported as an
+  interrupted stream** (#451). When an accepted stream ended cleanly without
+  its stop report (no `message_delta.stop_reason` on Messages, no non-null
+  `finish_reason` on Chat Completions, no terminal event on Responses, no
+  `finishReason` on Gemini, no `messageStop` on Bedrock), the Run's
+  `model_error` said `category: unknown`, `retry: unknown` and "The response
+  stream could not be read: StreamIncomplete." It now says
+  `stream_interrupted` and `retryable`, with that response's status and request
+  id and the message "The response stream ended before it reported how it
+  stopped.", as the ABI already documented and as Core's same-turn retry
+  already treated it. The retry, the attempt count and the empty detail after a
+  retry that succeeds are unchanged; a local decode failure such as an
+  oversized SSE line stays `unknown`.
+
+- **A provider that compresses its answer no longer breaks the request**
+  (#467). A std.http request offers `accept-encoding: gzip, deflate` by
+  default and accepts either in the response head, but every body in `src/`
+  is read as sent: `Response.reader` and `Reader.bodyReader` do not decode.
+  DeepSeek takes the offer, so its SSE reached the line reader as gzip, no
+  event parsed, and every attempt ended as `StreamIncomplete` (the Run as
+  `api_error`). The four streaming model clients (Messages, OpenAI-compatible,
+  Gemini, Bedrock) no longer offer it (#468). And every request in `src/`,
+  which sends through `api/http_connection.zig`, now accepts the identity
+  coding only. A request that left the header at std's default says
+  `accept-encoding: identity`, as the OAuth, telemetry and catalog requests
+  do. A server or gateway that compresses anyway fails in `receiveHead`
+  (`HttpContentEncodingUnsupported`) instead of handing gzip to a parser.
+
+### Security
+
+- **A Grep pattern can no longer act as a ripgrep option** (#460). Grep is
+  read-only, so `accept_edits` runs it without a prompt and
+  `ShellPolicy.disabled` keeps it available. Both of its execution paths, the
+  direct one and the artifact-capture one that AgentCore uses, and every retry
+  passed `pattern` to ripgrep as a separate argument. A pattern that began with
+  `-` was read as a flag, and `--pre=<program>` made ripgrep run that program
+  on every file it searched, with no approval for running a command. Both
+  paths and every retry now build their arguments with one function. The
+  pattern goes in only as the value of `--regexp=`, the search path comes
+  after `--`, and every other value the model supplies is joined to its flag
+  in a single argument (`--glob=…`, `--type=…`, `--context=…`). A
+  leading-dash pattern now matches its literal text. Two other tools passed
+  model text to ripgrep the same way, and they are fixed too: FindSymbol's
+  `name` (now `--regexp=` plus `--`), and Glob's pattern and path (now
+  `--glob=` plus `--`). CodeMap's glob now joins its flag in one argument as
+  well. `tests/component/grep_option_injection_test.zig` runs the
+  repository-pinned ripgrep, after checking its digest, against both paths.
+  It checks that a `--pre=<script>` pattern returns the literal line on both
+  paths and with an `artifact_id`, and that the script never runs. It reads the
+  result back from the artifact store and checks ordinary regex, `-i`, glob
+  and type filters, context, and line numbers in file and directory searches.
+  It also checks that `accept_edits` still allows Grep while a denied Bash
+  request for the same script leaves no trace.
+
+## 0.11.0 — 2026-11-06
+
+### Added
+
+- **Amazon Bedrock, native** (#423). A
+  `bedrock_converse` wire: Converse requests, answered with the AWS event-stream
+  binary framing (both CRCs checked) rather than SSE. `--provider bedrock`
+  (alias `aws-bedrock`) has one channel per region, each naming the inference
+  profiles its region can call (Tokyo: `jp.` Sonnet 4.6, `global.` Opus 4.6),
+  and authenticates with a Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`); access
+  keys, SigV4 and AWS profiles are not supported, and the missing-key help says
+  so. Claude on Bedrock gets the thinking contract of its generation (Opus and
+  Sonnet 5.5, Fable and Mythos are never sent `disabled`; 3.7 and 4.0 – 4.5 get
+  a budget between 1,024 and `maxTokens`; Claude 3.5 gets none), never thinking
+  beside `temperature`, `topP` or a forced tool choice, and cache points after
+  the system prompt, the tools and the conversation. The signed reasoning of a
+  tool turn is kept in the conversation, so it goes back unchanged on the next
+  request, after a resume too. Requests share the other wires' lifecycle:
+  connect retry, 429/5xx retry, context-limit recovery, Aborted on cancel; an
+  exception frame carries its category and message, and a frame cut by a closed
+  connection is retried as an incomplete stream. An account's own catalog
+  (ListFoundationModels and ListInferenceProfiles) is ingested the way
+  OpenRouter's is: `provider_catalogs` with `"kind": "bedrock"`, one offer per
+  usable model and inference profile, each declaring its dialect from the
+  catalog's `providerName`. `model_tiers` takes a `bedrock` key. A Bedrock
+  session cannot run sealed Skills: SSP/1 has no provider kind for it.
+- **Built-in DeepSeek, Kimi, Qwen and MiniMax providers.** `--provider deepseek |
+  kimi | qwen | minimax` with the vendors' China and global channels on both the
+  OpenAI and Anthropic wires, each route declaring the vendor's dialect, limits
+  from the vendors' own documentation, and reasoning controls in the vendors'
+  vocabularies. Keys come from `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
+  `DASHSCOPE_API_KEY` and `MINIMAX_API_KEY`. Quotes stay unknown (time-of-day,
+  regional and tiered prices). On the Anthropic wire each vendor has its own
+  dialect rather than Claude's: Qwen sends `thinking` `enabled` / `disabled` and
+  its `low` / `medium` / `xhigh` effort, Kimi only `output_config.effort` in
+  `low` / `high` / `max`, MiniMax `adaptive` / `disabled` (M3 explicitly, since
+  it does not think on that wire unless asked) with an effort for M3.1. Kimi
+  K2.7-code is offered on the OpenAI channels only, and Kimi K3 and K2.7-code
+  leave a `temperature` / `top_p` override out, as their documentation asks.
+  Qwen 3.8's window and output limits are recorded as unverified: Model
+  Studio's own pages do not state them.
+- **A route says which vendor dialect it speaks.** `ProtocolRoute.dialect` and
+  `ModelEntry.dialect` (and `"dialect"` on a `custom_providers` channel or model)
+  name the vendor whose parameters the request carries, the way an OpenRouter
+  endpoint names its upstream. The declaration travels with the route's auth
+  scheme to the session, a `/model` switch, child agents, swarm teammates and
+  `AgentSession`. A route that declares nothing keeps model-name inference, so
+  existing configurations behave as before; an unknown value fails the definition.
+  A model's declaration covers that model only: a child agent, teammate or
+  Session model switch onto another model of the same route keeps the route's
+  declaration or infers from its own name.
+- **OpenRouter's own request surface.** Offers ingested from an OpenRouter catalog
+  declare the new OpenRouter dialect: `reasoning: {effort}` and `delta.reasoning`,
+  whatever the upstream model is called. A `deepseek/...` model through OpenRouter
+  no longer gets DeepSeek's native `thinking` fields. OpenRouter routes' request
+  bytes change once, so their provider-side prompt cache misses on the first
+  request after the upgrade.
+- **Edit and rerun.** `/edit <n> <text>` edits message `n`, one you wrote,
+  and reruns from it: the conversation becomes messages `1..n-1` plus the new
+  text, and everything after the original message (later prompts, replies,
+  tool calls and results) is dropped. The transcript is rewritten, so a
+  resumed session restores the edited history. Only the conversation changes;
+  files and other effects stay. A message that is not yours, out of range, or
+  compacted into a summary is refused by name (`NotUserMessage`,
+  `PositionOutOfRange`, `PositionCompacted`) and nothing changes. `/edit`
+  alone lists the editable messages. Web and daemon take the line over
+  `POST /command`; Zig Hosts use `AgentSession.rewindToUserMessage` or
+  `SessionHost`'s `Submission.replaces`, and the wire `user_message` line
+  gains `replaces` ([doc/API.md](doc/API.md#edit-and-rerun)). (#432)
+
+### Changed
+
+- **One integration file per model vendor.** The OpenAI-compatible dialects that
+  shared `src/api/dialects/openai.zig` (GLM, Kimi, DeepSeek, Qwen, MiniMax,
+  Mistral) each have their own file, next to OpenAI, Claude and Gemini. The header
+  of each file is that vendor's integration document — endpoints, wires, thinking
+  parameters and the effort mapping, reasoning passback and caching, known
+  differences, and the dated vendor pages it was checked against — and a test fails
+  when a section is missing. Model-name recognition is unchanged.
+- **Thinking parameters re-checked against the vendors' current documentation**
+  (2026-11). MiniMax M3 now sends `thinking.type: adaptive` instead of `enabled`
+  (the API accepts only `disabled` / `adaptive`), M3.1 sends its `reasoning_effort`,
+  and every MiniMax model asks for `reasoning_split`. Kimi K2.6 no longer puts an
+  `effort` in its `thinking` object, and K2.7-code never sends `disabled`.
+  DeepSeek's `low` level is sent as `low` rather than `high`. A Kimi model id
+  that names no generation (`kimi-latest`, `kimi-for-coding`) is now treated as
+  K2.7 or later: thinking stays on, and `none` no longer sends `disabled`.
+
+### Fixed
+
+- **DeepSeek, Kimi and MiniMax get their reasoning back.** DeepSeek answers 400
+  when a request with tools lacks the `reasoning_content` of earlier turns, Kimi's
+  documentation requires it with tool calls, and MiniMax M3 and later ask for the
+  full response back to keep the reasoning chain; none was ever sent. The
+  conversation's thinking blocks now reach the dialect, and a dialect that
+  declares passback (`ModelProfile.echoes_reasoning_content`: DeepSeek, Kimi,
+  MiniMax M3+, OpenRouter) sends them as `reasoning_content` on assistant history
+  — or, on a route declaring DeepSeek on the Anthropic wire, as its non-empty
+  thinking blocks. Every other dialect's request bytes are unchanged; Claude
+  never receives an unsigned thinking block. A custom DeepSeek Anthropic endpoint
+  gets its thinking back only when it declares `"dialect": "deepseek"`.
+- **Mistral reasoning is requested, read and sent back (#437).** The Mistral
+  dialect sent no reasoning control and looked for reasoning only in a flat
+  `reasoning_content`, which Mistral never returns. Mistral streams reasoning as
+  ThinkChunks inside a list-typed `delta.content`, and the list at the switch to
+  the answer also carries the first answer text, so both were lost. The dialect
+  now sends `reasoning_effort` in each model's documented vocabulary: Small 2603
+  and Medium 3.5 take `none` / `high`; Large 4 takes `low` / `medium` / `high`,
+  so a neutral `none` goes out as `low`. Magistral (always reasoning) and
+  models whose reasoning Mistral does not document (`mistral-large-latest` is
+  Large 3) get no effort field. On the Mistral dialect only, the OpenAI chat
+  stream parser reads a list-typed `content` in order: a text chunk is answer
+  text, a thinking chunk's text is reasoning. Assistant history with reasoning
+  goes back to Mistral's reasoning models as ThinkChunks in a list-typed
+  `content`, as Mistral asks. Those requests change bytes, so their
+  provider-side prompt cache misses once after the upgrade. Every other route's
+  request bytes and parsed streams are unchanged, including a route that
+  declares another dialect for a Mistral-named model.
+- **Kimi K2 with no reasoning effort set no longer crashes.** On the OpenAI chat
+  wire the K2.6 dialect unwrapped the unset effort while writing the `thinking`
+  object, which panicked in Debug and ReleaseSafe builds; it now sends
+  `{"type":"enabled","keep":"all"}`.
+- **The x86_64 macOS release unit no longer fails its CPU baseline check on a
+  jump table.** This is why 0.10.0 was tagged but never published: release run
+  41194755285 built every unit but stopped at `scripts/check_binary_baseline.py`
+  on the x86_64 macOS executable, which it said held one AVX-512 instruction,
+  so no draft release was made. The executable has no such instruction. The
+  six bytes were two entries of the jump table for `repl.loop.readLineRaw`'s
+  key switch. LLVM keeps such tables inside `__text` on x86_64 macOS, and the
+  linker lists them in `LC_DATA_IN_CODE`. A linear `objdump -d` decoded them as
+  code. 0.9.0's unit had 486 such tables, and none happened to decode as a
+  vector instruction. The check now disassembles a Mach-O in llvm-objdump's
+  Mach-O mode, which prints those ranges as data, over every section that
+  holds instructions. It fails unless every listed range came back as data and
+  no instruction starts inside one. The macOS `release` leg of `ci.yml` now
+  builds both macOS units for their release targets and runs the check on
+  every change, not first at release time.
+- **Plain headless says why a failed Run stopped (#417).** `-p` without `--json`
+  exited 1 with nothing on stderr when the reply was still cut off after the
+  three max-token continuations, and when the Run was interrupted by SIGINT or
+  SIGTERM. Those stops, and the same exit for a tool failure, now write one
+  `error: stopped (<stop_reason>): …` line to stderr, on `--resume-response`
+  too. Stdout (any partial text) and the exit code are unchanged, and so is
+  `--json`.
+- **One provider request lifecycle (#434).** OpenAI Chat Completions, OpenAI
+  Responses and Gemini retry a transient connect failure, a 429 or a 500/502/503
+  before the response head with the Anthropic client's policy (attempt limit,
+  backoff, Retry-After, retry notice). A cancel while the head is awaited is
+  `Aborted` on every provider, and an HTTP context-limit rejection is
+  `ContextWindowExceeded`, so the agent loop's context recovery runs.
+
 ## 0.10.0 — 2026-10-31
 
 ### Changed

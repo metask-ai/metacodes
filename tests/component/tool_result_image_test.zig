@@ -559,7 +559,7 @@ fn runOverrideDelivery(a: std.mem.Allocator, base_model: []const u8, override: ?
 
 /// 与 dialect.zig 默认 Dialect 相同的 fail-closed 方言:profile 声称支持图像,serializeImagePart
 /// 却返回 false——插件/运行时方言覆盖的真实形态。
-fn failClosedResolve(_: *const anyopaque, _: cc.api_dialect.ProviderKind, _: []const u8) cc.api_dialect.Dialect {
+fn failClosedResolve(_: *const anyopaque, _: cc.api_dialect.ProviderKind, _: ?cc.api_dialect.Vendor, _: []const u8) cc.api_dialect.Dialect {
     return .{ .ctx = undefined };
 }
 

@@ -586,6 +586,39 @@ test "L2 sealed: provider server tools in runs.start are refused as invalid para
     try std.testing.expectEqual(@as(usize, 0), lab.model.requestCount());
 }
 
+test "L2 sealed: a provider kind outside SSP/1 (bedrock) is refused as invalid params before any model call" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    try lab.start(a, "cc-zig-sealed-bedrock", &.{FINAL_SSE}, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+
+    var client = try transport.Client.init(a, lab.io_runtime.io(), lab.gateway_url, "");
+    defer client.deinit();
+    client.provider_credential = CLIENT_KEY;
+    var params: std.Io.Writer.Allocating = .init(a);
+    defer params.deinit();
+    try protocol.writeStartParams(&params.writer, .{
+        .skill_id = "ssk_test",
+        .manifest_digest = lab.gateway.packages[0].entry.manifest_digest,
+        .prompt = "go",
+        .max_cost_micros = 1000,
+        .max_steps = 10,
+        .client_name = "metacodes",
+        .client_version = "0",
+        .client_platform = "p",
+        .provider_kind = "bedrock",
+        .provider_base_url = lab.model_url,
+        .model = CLIENT_MODEL,
+        .max_tokens = 64,
+    });
+    var response = try client.call(.runs_start, params.written(), null);
+    defer response.deinit();
+    try std.testing.expect(response.response == .err);
+    try std.testing.expectEqual(@as(i64, -32602), response.response.err.code);
+    try std.testing.expectEqual(@as(usize, 0), lab.model.requestCount());
+}
+
 test "L2 sealed: the gateway holds no run state — it restarts between two Steps and the run continues" {
     const a = std.testing.allocator;
     var lab: Lab = undefined;

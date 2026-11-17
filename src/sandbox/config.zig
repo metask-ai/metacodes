@@ -6,9 +6,11 @@
 //!     "failIfUnavailable": false,
 //!     "allowUnsandboxedCommands": true,   // 逃生口开关:false 时 dangerouslyDisableSandbox 被忽略
 //!     "autoAllowBashIfSandboxed": true,   // 沙箱内 bash 自动放行——仅限真会被包裹的调用
-//!                                         // (sandbox_exec.plan:本机有 Seatbelt、非 excluded、未走逃生口)
+//!                                         // (sandbox_exec.plan:本机有后端——macOS Seatbelt /
+//!                                         //  Linux bubblewrap——、非 excluded、未走逃生口)
 //!     "filesystem": { "allowWrite":[], "denyWrite":[], "allowRead":[], "denyRead":[] },
-//!     "network": { "allowedDomains":[], "deniedDomains":[] },
+//!     "network": { "allowedDomains":[], "deniedDomains":[] },  // 无按域名过滤:Seatbelt 不管网络;
+//!                                         // bwrap 见到任一列表非空即断网(fail closed,exec.bwrapNetwork)
 //!     "excludedCommands": ["docker"]      // 这些命令不进沙箱
 //!   }
 //!

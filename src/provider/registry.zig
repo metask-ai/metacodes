@@ -33,14 +33,28 @@ pub const metask = @import("profiles/metask.zig");
 pub const openai = @import("profiles/openai.zig");
 pub const gemini = @import("profiles/gemini.zig");
 pub const zai_coding_plan = @import("profiles/zai_coding_plan.zig");
+pub const deepseek = @import("profiles/deepseek.zig");
+pub const kimi = @import("profiles/kimi.zig");
+pub const kimi_code = @import("profiles/kimi_code.zig");
+pub const qwen = @import("profiles/qwen.zig");
+pub const minimax = @import("profiles/minimax.zig");
+pub const bedrock = @import("profiles/bedrock.zig");
 
 /// The built-in profile table. One line per provider — this is the extension
-/// point the requirement asks for.
+/// point the requirement asks for. Each vendor's integration notes (dialect,
+/// endpoints, thinking parameters, sources) are the header of
+/// `src/api/dialects/<vendor>.zig`.
 pub const BUILTIN_PROFILES = [_]ProviderProfile{
     metask.PROFILE,
     openai.PROFILE,
     gemini.PROFILE,
     zai_coding_plan.PROFILE,
+    deepseek.PROFILE,
+    kimi.PROFILE,
+    kimi_code.PROFILE,
+    qwen.PROFILE,
+    minimax.PROFILE,
+    bedrock.PROFILE,
 };
 
 // ── transport bridge ─────────────────────────────────────────────────────────
@@ -62,6 +76,7 @@ pub fn transportKindFor(protocol: Protocol) TransportError!types.ProviderKind {
         .anthropic_messages => .anthropic,
         .openai_chat, .openai_responses => .openai,
         .gemini_generate_content => .gemini,
+        .bedrock_converse => .bedrock,
     };
 }
 
@@ -366,6 +381,7 @@ pub const OfferCatalog = struct {
                                 .upstream_model_id = entry.upstream_model_id,
                                 .protocol = route.protocol.id(),
                                 .wire = route.protocol.wire(),
+                                .dialect = .{ .route = route.dialect, .model = entry.dialect },
                                 .endpoint_ref = endpoint,
                                 .credential_ref = bound_credential,
                                 .display_name = entry.display_name,
@@ -498,6 +514,15 @@ test "built-in registry accepts every shipped profile" {
     try std.testing.expect(registry.find("glm-coding-plan").?.id.eqlText("zai-coding-plan"));
     try std.testing.expect(registry.find("anthropic").?.id.eqlText("metask"));
     try std.testing.expect(registry.find("nope") == null);
+}
+
+test "the coding plans, and only they, are subscription plans" {
+    // A new subscription plan is a deliberate entry here: its unattended
+    // starts get the stderr note `ProviderProfile.subscription_plan` documents.
+    for (BUILTIN_PROFILES) |entry| {
+        const plan = entry.id.eqlText("kimi-code") or entry.id.eqlText("zai-coding-plan");
+        try std.testing.expectEqual(plan, entry.subscription_plan);
+    }
 }
 
 test "registration rejects duplicate ids and alias collisions" {

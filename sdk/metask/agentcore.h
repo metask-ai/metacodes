@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 26 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 28 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 26 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 28 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 26u
+#define METASK_AGENTCORE_ABI_REVISION 28u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -56,6 +56,16 @@ extern "C" {
  * or a goal-continuation Run without an active goal. Nothing changed; the
  * diagnostic names the reason. */
 #define METASK_AGENTCORE_STATUS_GOAL_CONFLICT 30u
+/* Revision 27 (#441): why session_control->rewind_to_user_message refused a
+ * position. Each names a position whose preceding context cannot be rebuilt
+ * exactly; nothing changed. No message is at that position: */
+#define METASK_AGENTCORE_STATUS_MESSAGE_POSITION_OUT_OF_RANGE 31u
+/* The message there is not one the user wrote: an assistant reply, a tool
+ * result, or text the runtime wrote itself. */
+#define METASK_AGENTCORE_STATUS_NOT_USER_MESSAGE 32u
+/* The message lies behind the compact boundary; only a summary stands for the
+ * context before it. */
+#define METASK_AGENTCORE_STATUS_MESSAGE_POSITION_COMPACTED 33u
 
 #define METASK_AGENTCORE_PROVIDER_ANTHROPIC 1u
 #define METASK_AGENTCORE_PROVIDER_OPENAI 2u
@@ -70,6 +80,7 @@ extern "C" {
 #define METASK_AGENTCORE_PERMISSION_DONT_ASK 4u
 #define METASK_AGENTCORE_PERMISSION_FULL_ACCESS 5u
 #define METASK_AGENTCORE_SHELL_DISABLED 1u
+/* Eagerly require macOS Seatbelt or Linux bubblewrap + seccomp at Session create. */
 #define METASK_AGENTCORE_SHELL_SANDBOXED 2u
 #define METASK_AGENTCORE_SHELL_UNRESTRICTED 3u
 /* Run journal mode is Session-stable. Durable records never enter model
@@ -151,6 +162,8 @@ extern "C" {
 #define METASK_AGENTCORE_MAX_SKILL_SOURCE_ID_BYTES_V1 128ULL
 #define METASK_AGENTCORE_MAX_PROCESS_PLUGIN_SOURCES_V1 64ULL
 #define METASK_AGENTCORE_MAX_TURNS_V1 1000u
+/* Revision 28 (#452): the most run_options_v1.stream_retry_budget allows. */
+#define METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1 8u
 /* Prompt profile limits: entries, one section's text, and every entry's text
  * together. Ids are metacodes:<name> or host:<name>, name at most 64 bytes. */
 #define METASK_AGENTCORE_MAX_PROMPT_PROFILE_SECTIONS_V1 64ULL
@@ -825,8 +838,8 @@ typedef struct {
 typedef struct {
     uint32_t struct_size;
     uint32_t max_turns;
-    /* Optional per-Run Host context for RUN_INPUT_TEXT and RUN_INPUT_MULTIMODAL,
-     * borrowed for the call. Null with zero count adds nothing. */
+    /* Optional per-Run Host context for RUN_INPUT_TEXT, RUN_INPUT_MULTIMODAL and
+     * RUN_INPUT_SKILL, borrowed for the call. Null with zero count adds nothing. */
     const metask_agentcore_context_block_v1 *context_blocks;
     uint64_t context_block_count;
     /* Revision 22: one METASK_AGENTCORE_TIME_CONTEXT_* value; zero is SYSTEM. */
@@ -834,7 +847,16 @@ typedef struct {
     /* Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET
      * (METASK_AGENTCORE_MIN/MAX_UTC_OFFSET_MINUTES_V1); zero otherwise. */
     int32_t utc_offset_minutes;
-    uint64_t reserved[1];
+    /* Revision 28 (#452): how many more times this Run may re-issue a request
+     * whose accepted stream failed without an answer (a stall, a stream that
+     * ended before its stop report, a dropped connection) after it showed
+     * output, 0..MAX_STREAM_RETRY_BUDGET_V1, beyond the one re-issue every
+     * request has of its own while it started no tool call (#461). Each
+     * re-issue of an attempt that showed output closes its segment
+     * `discarded`, withdraws its thinking with `thinking_discarded` and is
+     * announced by `retry_notice`. Zero grants nothing beyond that one. */
+    uint32_t stream_retry_budget;
+    uint32_t reserved0;
 } metask_agentcore_run_options_v1;
 
 /* The two input counts (Revision 20) are defined on every session_run_input
@@ -1039,6 +1061,15 @@ typedef uint32_t (*metask_agentcore_session_set_prompt_profile_fn_v1)(
  * a no-op. Any failure leaves mode, generation and grants unchanged. */
 typedef uint32_t (*metask_agentcore_session_update_permission_mode_fn_v1)(
     metask_agentcore_session *, uint32_t, metask_agentcore_owned_bytes_v1 *);
+/* Revision 27 (#441): edit-and-rerun's history change, idle-only. Drops the
+ * user message at the 1-based position (counted over the full history, as
+ * describe's conversation.message_count counts) and everything after it; the
+ * next Run's input then takes its place after exactly the context before it.
+ * Zero is INVALID_ARGUMENT; MESSAGE_POSITION_OUT_OF_RANGE, NOT_USER_MESSAGE and
+ * MESSAGE_POSITION_COMPACTED refuse a position and change nothing. Context
+ * only: files and other effects of the dropped turns stay. */
+typedef uint32_t (*metask_agentcore_session_rewind_to_user_message_fn_v1)(
+    metask_agentcore_session *, uint64_t, metask_agentcore_owned_bytes_v1 *);
 /* Revision 23. Writes the Session's goal as JSON, {"goal":null} or
  * {"goal":{...}}. Like describe it is BUSY while a Run, compact, checkpoint or
  * mutation is in progress; a Run reports goal changes as goal_updated events. */
@@ -1074,7 +1105,7 @@ typedef uint32_t (*metask_agentcore_team_poll_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 26. No earlier revision layout
+/* Function-table order is fixed within Revision 28. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -1106,6 +1137,7 @@ typedef struct metask_agentcore_session_control_api_v1 {
     metask_agentcore_session_export_checkpoint_fn_v1 export_checkpoint;
     metask_agentcore_session_set_prompt_profile_fn_v1 set_prompt_profile;
     metask_agentcore_session_update_permission_mode_fn_v1 update_permission_mode;
+    metask_agentcore_session_rewind_to_user_message_fn_v1 rewind_to_user_message;
 } metask_agentcore_session_control_api_v1;
 
 typedef struct metask_agentcore_skill_api_v1 {
@@ -1229,6 +1261,8 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
                (metask_agentcore_session_set_prompt_profile_fn_v1)0 &&
            api->session_control->update_permission_mode !=
                (metask_agentcore_session_update_permission_mode_fn_v1)0 &&
+           api->session_control->rewind_to_user_message !=
+               (metask_agentcore_session_rewind_to_user_message_fn_v1)0 &&
            api->skill != (const metask_agentcore_skill_api_v1 *)0 &&
            ((uintptr_t)api->skill % sizeof(void *)) == 0 &&
            api->skill->struct_size == sizeof(*api->skill) &&
@@ -1297,8 +1331,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 26u,
-                               "AgentCore revision 26");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 28u,
+                               "AgentCore revision 28");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1362,7 +1396,7 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_checkpoint_export_result_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_restore_config_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_runtime_api_v1, 24);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_api_v1, 56);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 80);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 88);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_api_v1, 32);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_api_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_goal_api_v1, 40);
@@ -1438,7 +1472,8 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_blocks, 
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_block_count, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, time_context_code, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, utc_offset_minutes, 28);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, reserved, 32);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, stream_retry_budget, 32);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, reserved0, 36);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_set_v1, objective, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_set_v1, token_budget, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_update_v1, objective, 8);
@@ -1448,6 +1483,7 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, goal, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, team, 72);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, set_prompt_profile, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, update_permission_mode, 72);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, rewind_to_user_message, 80);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, durable_usage_bytes, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, required_checkpoint_bytes, 32);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, input_accepted_count, 40);

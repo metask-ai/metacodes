@@ -28,6 +28,10 @@ These rules apply to the entire repository.
   `std.Io.Threaded.init`: std's init replaces the ignored SIGPIPE with a
   handler, and a delivered SIGPIPE turns any thread's blocked syscall into
   EINTR (`zig build test:io-threaded` enforces it).
+- Spawn production threads through `platform.thread.spawn(stack, ...)`, never
+  `std.Thread.spawn`: std's 16 MiB default stack is a 16 MiB commit per thread
+  on Windows. Pick the `Stack` class by what the thread runs; outside test
+  blocks `zig build test:thread-stack` enforces it.
 - The REPL's SIGWINCH handler has no SA_RESTART either. In `src/repl/`, read
   keys through `input.readKey` or check `input.retryInterruptedRead` right
   after a raw read, and write to the terminal through `pfs.writeAll`; a call
@@ -48,6 +52,52 @@ These rules apply to the entire repository.
   manually reviewed cross-platform binary bundle, selected by target and pinned
   by SHA-256. Never add TinyKG source vendoring, download-on-build, `PATH` search,
   sibling-checkout discovery, or stale build-output fallback.
+
+## PR review and repair workflow
+
+The developer starts one local watcher during initial development setup,
+from a checkout containing the tooling, and keeps it running while PRs are
+being delivered:
+
+```sh
+python3 .github/pr-loop.py run
+```
+
+The watcher runs on the developer's Mac; local builds and validation run on
+devbox through `dx`. Closing its terminal or taking the Mac offline pauses
+local review and repair. Registration alone does not start the watcher.
+Before handing a PR over, confirm that the developer has the watcher running.
+
+- Submit PRs to **metask-ai/metacodes**, including when `origin` is a fork.
+  Use `python3 .github/pr-loop.py submit` to create and register a PR, or
+  `python3 .github/pr-loop.py bind` for an existing PR. Follow the command
+  examples in [CONTRIBUTING](CONTRIBUTING.md#initial-development-setup).
+- Register the original Codex thread ID and its dedicated worktree explicitly.
+  The branch must already be pushed, the checkout must be clean, and the
+  thread must be accessible to the local App Server. Hand the thread over
+  idle and avoid concurrent edits by another host. Do not invent a thread ID
+  or claim automatic delivery when these prerequisites are missing.
+- The controller reviews each head/base revision in an independent read-only
+  conversation. Blocking findings, failed CI and failed local validation go
+  back to the original worker. During repair, the worker edits; the controller
+  owns checkpoint commits, `dx zig build gate:pr`, and ordinary pushes. Failed
+  checkpoints stay local. A pushed revision receives a fresh review.
+- Keep the PR branch current with main. The controller merges updated main,
+  validates and pushes it, then requires fresh review and PR CI. Only the exact
+  reviewed head with passing required checks and satisfied upstream reviews
+  may be merged. Require strict up-to-date branch protection; no merge queue,
+  deferred auto-merge or admin bypass. Preserve review-thread resolution and
+  revision checks; a quiet reviewer is not an approval.
+- Ambiguous requirements, additional permissions, policy changes, interrupted
+  writes and exhausted limits require a recorded decision. Check with
+  `python3 .github/pr-loop.py status`; the developer responds with
+  `python3 .github/pr-loop.py answer --pr "$PR_NUMBER" --text "Your decision"`.
+  Preserve progress and invocation limits instead of restarting an unlimited
+  repair loop or answering on the developer's behalf.
+
+The [PR workflow guide](doc/PR_AGENT_LOOP.md) defines prerequisites, limits,
+state storage and recovery. Keep these agent instructions and CONTRIBUTING
+consistent with that guide when changing the workflow.
 
 ## Definition of done
 
@@ -81,16 +131,18 @@ reopen PR that adds only `scripts/release_cut.py`'s generated bump to a base
 whose full CI passed: it takes the CI fast path
 (`doc/RELEASE_AUTOMATION_DESIGN.md` §3). A change confined to documentation,
 or to documentation and the evaluation harness, skips the CI suites it cannot
-affect (`scripts/ci_scope.py`), and merge-queue groups run the same jobs
-(`doc/CI_DESIGN.md`). Run the full suite with
+affect (`scripts/ci_scope.py`). CI runs once per PR revision on Linux x86_64,
+macOS ARM64 and Windows x86_64; main pushes do not repeat it. Linux ARM64,
+Intel macOS and Windows ARM64 cross-build checks run in the release workflow
+(`doc/CI_DESIGN.md` §3); keep lightweight target-contract fixtures in PR CI.
+The local `gate:pr` checklist above remains unchanged. Run the full suite with
 `-Doptimize=ReleaseSafe` as well when a change touches unsafe code or an ABI.
 
 The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`).
 
 The native bundled TinyKG is wired into tests by default. Supply
 `-Dtinykg-bin` and `-Dtinykg-sha256` together only to audit an explicit override.
-Do not run paid or provider-backed benchmarks without explicit user authorization,
-a dollar cap, and the durable budget journal.
+Do not run paid or provider-backed benchmarks without explicit user authorization.
 
 Judge a build by its exit code and `Build Summary`, never by the presence of
 `failed command:`. The Zig 0.16 build runner routes every step that wrote to

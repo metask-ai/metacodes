@@ -34,7 +34,7 @@ a `type`. Core to frontend:
 {"v":1,"type":"<CoreEvent tag>","run_id":N,"trace_id":"...","data":...}
 {"v":1,"type":"<HostEvent tag>","data":{...}}
 {"v":1,"type":"ui_request","id":N,"kind":"permission|ask_question|custom","request":{...}}
-{"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled|malformed"}
+{"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled|malformed","by":"..."}
 {"v":1,"type":"ui_request_unavailable","kind":"...","custom_kind":"...","reason":"..."}
 {"v":1,"type":"capabilities_accepted",...}
 {"v":1,"type":"capabilities_refused","reason":"..."}
@@ -42,9 +42,285 @@ a `type`. Core to frontend:
 
 Frontend to core: the answer to UI request N (`{"choice":...}`,
 `{"answers":[...]}`, `{"result":...}`, read by `wire.parseResponse`; a
-malformed answer is never a grant) and the capability frame of §2. Payload
-shapes are spelled out in `wire.zig`'s module comment and pinned by the
-fixtures.
+malformed answer is never a grant), which may name who gave it (`"by"`,
+§1.5), and the capability frame of §2. Payload shapes are spelled out in
+`wire.zig`'s module comment and pinned by the fixtures. `ui_request_closed`
+carries `by` only when the answer it closed on named someone (§1.5).
+
+A Host journals these lines and nothing else. The bundled `--web`/`serve`
+host writes every journal line through `wire.zig`, its host events and
+`session_lifecycle` included (#444). Two tests refuse any line that is not
+one of these: `tests/component/web_message_config_test.zig` reads a whole
+session journal of both drivers through a Run with a permission prompt, and
+the wire leg of `tests/e2e/daemon_serve_multi_e2e.sh` does the same for the
+installed `serve`'s SSE stream and UDS attachment.
+
+### 1.1 Host events
+
+What a Host adds around the kernel's events, as
+`{"v":1,"type":"<HostEvent tag>","data":{...}}`:
+
+| `type` | `data` | Written by |
+|---|---|---|
+| `user_message` | `run_id`, `trace_id`, `text`, `replaces`; `source`, `kind`, `idempotency_key`, `attributes` when given | both Hosts: a Run's first line |
+| `run_done` | `run_id`, `trace_id`, `stop_reason`, `error_name`, `model_error` | both Hosts: a Run's last line |
+| `command_result` | `command`, `ok`, `error_name`, `message` | both Hosts |
+| `message_rejected` | `message`, `text`, `model`, `permission_mode` | both Hosts |
+| `session_poisoned` | `error_name`, `dropped` | `SessionHost` |
+| `run_resumed` | `run_id`, `trace_id`, `request_id` | `SessionHost`: the first line of a Run that resumes a suspended one (§1.5) |
+
+- `run_done` has `stop_reason` when the Run returned and `error_name` when it
+  failed without returning (a refused rewind, a run the `--web`/`serve` run
+  control refused). A Run that stopped on the model (`api_error`,
+  `max_tokens_exhausted`) carries the detail in `model_error`, whose
+  `message` is the text to show; otherwise `model_error` is `null`.
+- `command_result.command` names the command: `SessionHost`'s `Command` tag
+  (`set_model`, …), or the verb of a `--web`/`serve` `/command` line (`mode`,
+  `edit`, `compact`, …; the name of a skill, `shell` for `!cmd`, `prompt` for
+  plain text). `error_name` is set exactly when `ok` is false. On
+  `--web`/`serve` it is the error the command failed with, if it has one;
+  `CommandUnsupported` for a line that surface does not run (a terminal verb
+  such as `/help`, a skill, a listing such as `/model` alone); and
+  `CommandRefused` for a refusal stated only in words. `message` holds those
+  words, or the outcome (`queued for run`, a shell command's output) for a
+  person. `SessionHost` writes `null` there. `message` was appended under
+  §4's additive rule 2.
+- `message_rejected` (added under §4's rule 1) is a `--web`/`serve` message,
+  or a `SessionHost` submission (#445), whose `model` or `permission_mode`
+  was refused. Neither is applied, its `text` stays out of the
+  conversation, no Run starts, and the line takes the place of the
+  message's `user_message`. `model` and `permission_mode` repeat what the
+  message asked for: `null` when not given, the mode as `/state` spells it.
+  `message` says why, in words a person reads; where both Hosts refuse
+  alike they say the same (`bypassPermissions is disabled by settings`,
+  `model not available for current provider`). A message's accepted
+  `model` and `permission_mode` are journaled before its `user_message`
+  as `config_changed`, by both Hosts, also when already in force; `model`
+  as resolved (a tier name becomes the tier's model). A route change (the
+  CLI's `/model` commit, `SessionHost`'s `set_route`) is announced as
+  `config_changed` `{"model":...}` and then `{"route":{...}}`; the route
+  names the provider, channel, protocol, request model id, offer id,
+  credential reference and scope, never the credential.
+
+The `user_message` host event carries `replaces`, appended under §4's
+additive rule 2: `null` when the Run's text was appended after the whole
+conversation, or the 1-based position `n` of the user message it replaced
+(edit-and-rerun, [API.md](API.md#edit-and-rerun)). With `n`, messages `n` and
+later left the conversation before the Run, which saw messages `1..n-1` and
+the text, unless that Run's `run_done` names the refusal in `error_name`
+(`PositionOutOfRange`, `NotUserMessage` or `PositionCompacted`), in which case
+nothing changed.
+
+```text
+{"v":1,"type":"user_message","data":{"run_id":6,"trace_id":null,"text":"...","replaces":6}}
+```
+
+A typed submission (#447) appends `source`, `kind`, `idempotency_key` and
+`attributes` to its `user_message` under §4's additive rule 2. Each is
+written only when the submission had it, so the line of any other submission
+keeps its bytes; a reader takes an absent field as not given. `attributes`
+is one JSON object of string values, in the order submitted. `text` stays
+the submitted text when a submission template shaped what the provider saw
+([API.md](API.md#sessionhost-a-multi-session-service-for-network-hosts)).
+Only `SessionHost` takes typed submissions so far: `--web` and `serve`
+refuse an `idempotency_key` and never write these fields.
+
+```text
+{"v":1,"type":"user_message","data":{"run_id":8,"trace_id":null,"text":"heart rate high","replaces":null,"source":"device:hr-01","kind":"telemetry","idempotency_key":"hr-01:seq-42","attributes":{"bpm":"132","unit":"bpm"}}}
+```
+
+### 1.2 Runs
+
+A Host numbers the Runs of a Session 1, 2, … in the order they start. A
+restored or rebuilt Session starts again at 1 in a new journal, so the
+journal epoch tells the two apart. A Run's lines run from its
+`user_message` to its `run_done`, and each carries its `run_id`:
+
+```text
+{"v":1,"type":"user_message","data":{"run_id":2,"trace_id":null,"text":"write the file","replaces":null}}
+{"v":1,"type":"tool_start","run_id":2,"data":{"id":"tu_w","name":"Write","input":"..."}}
+{"v":1,"type":"ui_request","id":1,"kind":"permission","request":{"tool":"Write","args":"..."}}
+{"v":1,"type":"ui_request_closed","id":1,"outcome":"answered"}
+{"v":1,"type":"tool_result","run_id":2,"data":{"id":"tu_w","name":"Write",...}}
+{"v":1,"type":"run_done","data":{"run_id":2,"trace_id":null,"stop_reason":"end_turn","error_name":null,"model_error":null}}
+```
+
+- Every kernel event journaled while the Run is in progress has `run_id`
+  after `type`, and `trace_id` when the submission had one. Events between
+  Runs have neither: `session_lifecycle`, `config_changed` from a command
+  (journaled before its `command_result`, by both Hosts) or from a
+  message's `model` and `permission_mode` (journaled before its
+  `user_message`), and a background agent's `agent_lifecycle` reaped after
+  `run_done`.
+- UI request and capability lines carry no `run_id`. A request belongs to
+  the Run in progress when it is announced.
+- No other host line falls inside a Run: `command_result` and
+  `message_rejected` are journaled between Runs. A `--web`/`serve`
+  `/command` that plans a Run (a prompt, `/edit`, `/retry`, `/commit`, …)
+  journals its `command_result` first. The Run begins once every queued
+  command has run, so commands queued together that plan a Run share one,
+  and its `user_message` lines follow. A macro or `/retry` journals none, so
+  its Run starts with a kernel event.
+- `trace_id` is the opaque ID the caller attached to the submission
+  (`SessionHost`'s `Submission.trace_id`). `--web` and `serve` take none:
+  their host lines say `null` and their kernel events omit it. Where the two
+  Hosts overlap they write the same bytes.
+
+- A Run that resumes a suspended one (`SessionHost`'s suspend mode, §1.5)
+  has no `user_message`: its first line is `run_resumed`, right after the
+  `ui_request_closed` of the request the suspended Run waited for. The
+  suspended Run itself ended with `run_done` and `"stop_reason":"suspended"`.
+
+### 1.3 Transport frames
+
+A journal holds only wire lines. A transport adds frames of its own, which
+are not journal lines: they carry no `v`, take no seq and are never
+replayed.
+
+| Transport | Frames |
+|---|---|
+| SSE (`GET /events`) | `retry: 1000` first; `: keepalive` comments; `event: resync` when a cursor cannot be continued; `event: session_closed` once the journal is closed. A journal line is a frame with `id: <epoch>-<seq>` and no `event:`. |
+| UDS `attach` | `{"type":"keepalive"}` after 15 s without a line; `{"type":"session_closed"}` once the journal is closed, after which the stream ends. |
+
+A UDS reader tells them apart by `v`: a line with `v` is a journal line and
+advances its cursor (its next `since`), and a line without one is the
+transport's. They stay unversioned on purpose. They signal the connection,
+not the session: SSE sends the same two signals as a comment and a named
+event, outside its journal frames. A `v` would also make them look like
+journal lines, which a reader would then count.
+
+### 1.4 Requests nobody answered
+
+A request can close without the client's answer: `SessionHost`'s
+`ui_request_timeout_ms` runs out, an interrupt or a close cancels it, or the
+answer cannot be read. The Host journals `ui_request_closed` with `outcome`
+`cancelled` (timeout, interrupt, close) or `malformed` (unreadable), and
+nothing is granted. A question or a custom UI fails with `InputAborted`, as
+Esc does in the terminal. A permission prompt is denied, and the requester
+reports why (`wire.cancelResponse(request, why)`, `ui_request.Unanswered`),
+so the model is not told the user declined. The tool_result keeps `code`
+`permission_denied`:
+
+| How the prompt ended | `outcome` | The model reads (`detail`) | `recoverable` |
+|---|---|---|---|
+| Timeout | `cancelled` | *"'\<tool\>' did not run: nobody answered its permission request in time. The user did not decline it; you may offer to ask again."* | `true` |
+| Interrupt or close | `cancelled` | *"'\<tool\>' did not run: an interrupt or a close cancelled its permission request before anyone answered. The user did not decline it; you may offer to ask again."* | `true` |
+| Unreadable answer | `malformed` | *"'\<tool\>' was denied: an answer to its permission request arrived but could not be read. This is not the user's decision."* | `false` |
+
+The timeout's length is never in the text, so these bytes do not change
+with the Host's configuration. v1 has no `timed_out` close outcome: adding
+one is a breaking change (§4), so a timeout closes as `cancelled`, as it
+always has; the journal and the tool_result both say that nobody answered.
+
+Prompts that never reach a frontend are told apart the same way, in every
+Host, the in-process ones included:
+
+- Nobody to ask: no requester under `no_interactive_prompt` (headless runs,
+  a subagent), or a requester that answers `unavailable` or `pending` (the
+  permission gate is synchronous and cannot suspend) — *"'\<tool\>' was
+  denied without asking: this session has no way to ask for permission and
+  wait for the answer. This is not the user's decision; the user never saw
+  the request."*
+- The requester failed — *"'\<tool\>' was denied: its permission request
+  failed before anyone answered. This is not the user's decision."*
+- A declared frontend that does not render permission prompts — the
+  `unrenderable` text of §2.2.
+
+All three are `recoverable: false`. Only a person's deny, answered now or
+remembered for the Session, still reads *"user declined '\<tool\>' via
+prompt"*, byte for byte. Evidence: `tests/component/permission_unanswered_test.zig`
+(every cause through a real Run) and the timeout, interrupt and malformed
+cases of `tests/component/session_host_test.zig`.
+
+### 1.5 UI requests: approvers, expiry, suspended Runs
+
+Added in #446 under §4's additive rules 1 and 2; a frontend that ignores them
+behaves as before.
+
+**Approver.** An answer may name who gave it: `"by":"<approver>"`, a JSON
+string of 1 to 256 bytes (`wire.MAX_APPROVER_BYTES`), next to the answer's
+own fields. The request's `ui_request_closed` then carries it, appended after
+`outcome`, when it closes on that answer (`answered` or `malformed`); a
+request cancelled by an interrupt, a close or its expiry names nobody, even
+if an answer raced it. `by` never changes how the answer is read. `by` is
+**self-reported and unauthenticated**: it is whatever the answering side says
+about itself, and core records it as given. A Host that needs a verified
+approver takes the identity from its own authentication (an HTTP token, a UDS
+peer credential, an IM platform's user id), and either fills `by` itself
+instead of passing the client's through, or records the verified identity
+separately; it never trusts `by` from an answer body for authorization. `SessionHost.respond` refuses a `by` that is not such a
+string (`error.InvalidApprover`) and the request stays open. `--web` and
+`serve`, whose `respond` has only the 409, record a valid `by` and ignore
+another, applying the answer as before.
+
+```text
+{"v":1,"type":"ui_request_closed","id":1,"outcome":"answered","by":"alice@example.com"}
+```
+
+**Expiry** (`SessionHost.Options.ui_request_expiry`, with
+`ui_request_timeout_ms`). Every policy closes a request with an outcome v1
+already has: `cancel` (the default, as before) closes it `"cancelled"` and
+the Run goes on without the answer; `interrupt` does the same and stops the
+Run, which ends `"stop_reason":"aborted"`. Under either, the model reads
+§1.4's timeout: an expired permission prompt did not run because nobody
+answered in time, also when `interrupt` then stops the Run, and a question or
+a custom UI fails with `InputAborted`. `re_announce` writes the request's
+`ui_request` line again, the same bytes under the same id, every period until
+it is answered, interrupted or closed. A frontend shows a repeated
+announcement once, as it already does after replaying a journal.
+`re_announce` needs a period: `SessionHost.open` refuses it with a zero
+`ui_request_timeout_ms` (`error.InvalidUiRequestTimeout`).
+
+**Suspended Runs** (`SessionHost.Options.ui_request_wait = .suspend`). A
+question or custom UI request does not hold the Session: its Run ends
+`"stop_reason":"suspended"` with the request still open, and the Session's
+directory keeps it. A Session opened again under the id, also after a
+restart, announces the request again under the same id in its new journal,
+and the answer then resumes the Run once:
+
+```text
+{"v":1,"type":"ui_request","id":1,"kind":"ask_question","request":{...}}
+{"v":1,"type":"run_done","data":{"run_id":1,"trace_id":"t","stop_reason":"suspended","error_name":null,"model_error":null}}
+   … the Host restarts; the Session is opened again under its id …
+{"v":1,"type":"ui_request","id":1,"kind":"ask_question","request":{...}}
+{"v":1,"type":"ui_request_closed","id":1,"outcome":"answered","by":"alice@example.com"}
+{"v":1,"type":"run_resumed","data":{"run_id":1,"trace_id":"t","request_id":1}}
+   … the resumed Run's events …
+{"v":1,"type":"run_done","data":{"run_id":1,"trace_id":"t","stop_reason":"end_turn","error_name":null,"model_error":null}}
+```
+
+A resumed Run that fails before the answer reaches the conversation, the
+Session still usable (a Session's project rules refusing the Run), does
+not drop the request: its `run_done` names the error, then the request's
+`ui_request` line is written again, the same bytes under the same id, and
+the request is open again for another answer, also after a restart. The
+answer the failed Run took is not kept, so a request whose
+`ui_request_closed` a frontend has seen can be announced again; it shows it
+open again:
+
+```text
+{"v":1,"type":"ui_request_closed","id":1,"outcome":"answered","by":"alice@example.com"}
+{"v":1,"type":"run_resumed","data":{"run_id":2,"trace_id":"t","request_id":1}}
+{"v":1,"type":"run_done","data":{"run_id":2,"trace_id":"t","stop_reason":null,"error_name":"ProjectKernelConfigurationInvalid","model_error":null}}
+{"v":1,"type":"ui_request","id":1,"kind":"ask_question","request":{...}}
+```
+
+The resumed Run keeps the suspended Run's `trace_id` and turn limit. An open
+that finds the suspended call already answered in the Session's transcript
+(the resumed Run was written, then the Host stopped) does not announce the
+request again: it was applied once and is not applied twice. Request
+ids are never reused for a Session in this mode, across restarts too, so a
+late answer cannot reach a newer request: an answer to a request that is no
+longer open changes nothing (`error.NoSuchRequest`), and a second answer to
+one that already took an answer it has not yet applied changes nothing
+either (`error.AlreadyAnswered`). A permission request is never suspended:
+the kernel's permission gate takes a `pending` answer for no answer and
+denies the tool, so under this mode a permission request blocks as before,
+and does not survive a close. Beside a suspended question it has an id of its
+own, and an answer goes to the request its id names and to no other. A
+Session whose request file the Host cannot read (corrupt, or written by a
+later version) keeps the file as it is and blocks instead of suspending,
+still under ids it never used before.
 
 ## 2. Capability exchange
 
@@ -146,8 +422,9 @@ would without a UI, but tells the model why, never as the user's answer:
   can never grant a permission.
 
 Every other path keeps its wording: no UI at all is still `NotATty` /
-`CustomUiUnsupported`, and a user who refuses a prompt is still *"user
-declined '<tool>' via prompt"*.
+`CustomUiUnsupported` (a permission prompt with nobody to ask says so, §1.4),
+and a user who refuses a prompt is still *"user declined '<tool>' via
+prompt"*.
 
 A declaration applies to requests made after it is installed. A request
 already announced stays pending and is answered or cancelled as before.
@@ -159,7 +436,16 @@ already announced stays pending and is answered or cancelled as before.
 | `--web`, `serve` | `POST /capabilities` | `200` `capabilities_accepted`, `400` `capabilities_refused` |
 | `serve --sessions N` | `POST /s/<id>/capabilities` | the same, per Session |
 | `SessionHost` | `HostedSession.declareCapabilities(allocator, frame)` | the acknowledgement line, or a `DeclareError` |
-| UDS `attach` | none: UDS carries no answers, so it is not a UI frontend | — |
+| UDS (`serve --uds`) | the frame itself as one NDJSON line, with the routing fields beside it: `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` | the acknowledgement line |
+
+UDS is a full UI frontend: it carries answers too. `{"op":"respond","session":
+"<id>","id":N,...}` answers UI request `N` with the same answer fields
+`POST /respond` takes beside the routing fields (`{"ok":true}`; a stale or
+unknown id is `{"ok":false,"error":"no pending request with this id"}`, the 409
+of the HTTP surface), so a UDS-only frontend needs no HTTP side channel.
+Evidence: `tests/component/serve_sessions_test.zig` (the `uds respond` /
+`uds capabilities` cases) and the UDS leg of
+`tests/e2e/daemon_serve_multi_e2e.sh`.
 
 `GET /state` reports the declaration in force as `frontend_capabilities`: the
 last `capabilities_accepted` object, or `null` while undeclared. The bundled

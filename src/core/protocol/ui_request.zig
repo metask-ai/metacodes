@@ -69,6 +69,28 @@ pub const SessionId = @import("../session_id.zig").SessionId;
 ///   fail closed),但给模型的文字必须如实:是前端渲染不了,不是用户的回答或拒绝。**out 未写。**
 pub const RequestOutcome = enum { answered, pending, unavailable, unrenderable };
 
+/// A requester's error for a request that was announced and then ended with
+/// nobody's answer (doc/WIRE_PROTOCOL.md §1.4). Each one fails closed, as any
+/// requester error does; the permission gate also tells the model which it
+/// was instead of reporting the user's refusal. `out` is not written.
+pub const Unanswered = error{
+    /// Nobody answered before the Host's deadline.
+    UiRequestTimedOut,
+    /// An interrupt or a close cancelled the request before anyone answered.
+    UiRequestCancelled,
+    /// An answer arrived but could not be read.
+    UiAnswerUnreadable,
+};
+
+/// Whether `err` is one of `Unanswered`: an outcome of the request, not a
+/// broken Host transport.
+pub fn isUnanswered(err: anyerror) bool {
+    return switch (err) {
+        error.UiRequestTimedOut, error.UiRequestCancelled, error.UiAnswerUnreadable => true,
+        else => false,
+    };
+}
+
 pub const UiRequestFn = *const fn (
     state: *anyopaque,
     session: SessionId,

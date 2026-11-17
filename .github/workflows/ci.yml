@@ -1,11 +1,10 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
-  # The merge queue (doc/CI_DESIGN.md §3) runs the required jobs on each
-  # group: main plus the queued PRs, merged in order.
+  # Migration compatibility only: after the main ruleset disables the queue,
+  # no merge_group event is emitted. This lets the migration PR itself land
+  # under the old rules (doc/CI_DESIGN.md §3).
   merge_group:
   workflow_dispatch:
 
@@ -29,22 +28,20 @@ concurrency:
 jobs:
   # A release or reopen PR adds only what scripts/release_cut.py generates.
   # When that is proven against the merge commit, and the base commit already
-  # passed this workflow's full run on main, the gate legs and TTY shards
+  # passed a full PR run with exact-tree evidence, the gate legs and TTY shards
   # below report success without running the suites again: their steps check
   # FAST_PATH, except the checkouts and the version state gate in the
   # `checks` legs.
-  # Every other PR, every push, and every doubt (the script never fails the
+  # Every other PR, every manual run, and every doubt (the script never fails the
   # job; an error decides the full path) runs everything.
   # doc/RELEASE_AUTOMATION_DESIGN.md §3, "CI fast path".
   release-fast-path:
     name: Release fast path
-    # 50 minutes: a reopen PR is opened while main's run of the release merge
-    # commit is still going; the script waits up to 45 minutes for it.
-    timeout-minutes: 50
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read # the base commit's push run of this workflow
+      actions: read # exact-tree evidence from the base's successful PR CI
     outputs:
       fast: ${{ steps.decide.outputs.fast }}
       reason: ${{ steps.decide.outputs.reason }}
@@ -76,7 +73,7 @@ jobs:
               exit 0
               ;;
           esac
-          python3 scripts/release_fast_path.py --base "$base" --candidate HEAD --repository "$GITHUB_REPOSITORY" --github-output "$GITHUB_OUTPUT" --wait-seconds 2700
+          python3 scripts/release_fast_path.py --base "$base" --candidate HEAD --repository "$GITHUB_REPOSITORY" --github-output "$GITHUB_OUTPUT" --wait-seconds 0
 
   # Which suites the change can affect: scripts/ci_scope.py,
   # doc/CI_DESIGN.md §2. Only documentation changed: the gates run the
@@ -91,6 +88,7 @@ jobs:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     outputs:
+      scope: ${{ steps.decide.outputs.scope }}
       suites: ${{ steps.decide.outputs.suites }}
       tty: ${{ steps.decide.outputs.tty }}
       reason: ${{ steps.decide.outputs.reason }}
@@ -119,9 +117,9 @@ jobs:
   # command has a step here, and that `zig build test` runs as its three parts
   # (`test:units`, `test:integration`, `test:product`), so the two cannot
   # drift apart silently. Each step names the legs it belongs to through the
-  # matrix flags `units`, `product`, `release`, `cross` and `checks`; a step
+  # matrix flags `units`, `product`, `release` and `checks`; a step
   # without one is environment setup and runs on every leg. Linux has a runner
-  # per flag. macOS has three (the arm64 cross-stage is Linux-only), since an
+  # per flag. macOS has three, since an
   # organization runs at most five macOS jobs at once.
   # 45 minutes: a cold hosted runner compiles a leg's share of the tree and
   # the Lean kernel; warm runs (setup-zig + Lean cache hits) are far shorter.
@@ -138,8 +136,6 @@ jobs:
             product: true
           - leg: release
             release: true
-          - leg: cross
-            cross: true
           - leg: checks
             checks: true
     runs-on: ubuntu-latest
@@ -324,17 +320,6 @@ jobs:
           python3 scripts/verify_tinykg_binary.py
           python3 scripts/verify_ripgrep_binary.py
           zig build tinykg:stage
-      # Both vendored runtime assets stage for aarch64-linux (#86): the
-      # target's rg is the upstream aarch64 musl binary, first published with
-      # ripgrep 15.x. The complete aarch64-linux release unit (manifest v2)
-      # also needs both Lean kernels, which release.yml builds natively on an
-      # arm64 runner (#307, doc/INSTALL_DESIGN.md §5); this leg keeps proving
-      # the cross-staged assets on every change.
-      - name: Verify Linux arm64 cross-stage contract
-        if: matrix.cross && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
-        run: |
-          zig build tinykg:stage -Dtarget=aarch64-linux-musl
-          zig build install -Dtarget=aarch64-linux-musl -Drelease-layout=true --prefix "$RUNNER_TEMP/stage-aarch64-linux"
       # One binary from the platform root, whose test block references every
       # module: a per-module list here missed terminal.zig and timezone.zig.
       # Standalone `zig test`, not `zig build`, with METACODES_PROC_TEST=1:
@@ -487,6 +472,17 @@ jobs:
           fi
           zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           cat "$RUNNER_TEMP"/dist-1/metacodes-*-SHA256SUMS
+      # Keep the native ARM64 baseline in PR CI. Intel macOS is built and
+      # tested on its own runner by release.yml, rather than cross-built here.
+      - name: macOS release executables need no more than their targets
+        if: matrix.release && runner.os == 'macOS' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in aarch64-macos.13.0; do
+            zig build install -Drelease-layout=true -Doptimize=ReleaseSafe -Dtarget="$target" --prefix "$RUNNER_TEMP/baseline-$target"
+            python3 scripts/check_binary_baseline.py --target "$target" "$RUNNER_TEMP/baseline-$target/bin/metacodes"
+          done
       - name: Third-party notices check
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 scripts/gen_third_party_notices.py --check
@@ -535,6 +531,9 @@ jobs:
       - name: Change scope unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_ci_scope -v
+      - name: CI evidence and policy unit tests
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m unittest scripts.tests.test_ci_evidence scripts.tests.test_pr_policy -v
       - name: SDK package version unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_sdk_package_versions -v
@@ -1010,3 +1009,26 @@ jobs:
     timeout-minutes: 5
     runs-on: ubuntu-latest
     steps: *result-steps
+
+  full-pr-evidence:
+    name: Full PR evidence
+    needs: [release-fast-path, scope, gates-linux, gates-macos, windows-gates, tty-linux, tty-windows, sdk-bindings]
+    if: ${{ always() && github.event_name == 'pull_request' && needs.scope.outputs.scope == 'full' && needs.release-fast-path.outputs.fast == 'false' }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every full-suite job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: echo "$NEEDS" | jq -e 'length == 8 and all(.[]; .result == "success")' > /dev/null
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+      - name: Record the tested merge tree
+        run: python3 scripts/ci_evidence.py --output "$RUNNER_TEMP/pr-ci-evidence.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr-ci-evidence
+          path: ${{ runner.temp }}/pr-ci-evidence.json
+          if-no-files-found: error
+          retention-days: 90

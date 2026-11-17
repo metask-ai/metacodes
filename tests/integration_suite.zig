@@ -18,10 +18,13 @@ test {
     _ = @import("component/provider_offer_test.zig");
     _ = @import("component/metask_api_key_picker_test.zig");
     _ = @import("component/provider_cli_key_scope_test.zig");
+    _ = @import("component/vendor_dialect_test.zig");
+    _ = @import("component/bedrock_converse_test.zig");
     _ = @import("component/picker_reasoning_test.zig");
     _ = @import("component/gemini_thought_signature_test.zig");
     _ = @import("component/provider_oauth_login_test.zig");
     _ = @import("component/provider_key_login_test.zig");
+    _ = @import("component/kimi_code_provider_test.zig");
     _ = @import("component/redirect_credential_test.zig");
     _ = @import("component/http_send_failure_test.zig");
     _ = @import("component/subagent_model_test.zig");
@@ -32,6 +35,7 @@ test {
     _ = @import("component/agent_session_team_test.zig");
     _ = @import("component/recovery_allowance_test.zig");
     _ = @import("component/agent_session_host_tools_test.zig");
+    _ = @import("component/session_host_requests_test.zig");
     _ = @import("component/plugin_runtime_test.zig");
     _ = @import("component/plugin_process_test.zig");
     _ = @import("component/agent_session_ui_test.zig");
@@ -42,6 +46,7 @@ test {
     _ = @import("component/wire_contract_test.zig");
     _ = @import("component/frontend_capabilities_test.zig");
     _ = @import("component/session_host_test.zig");
+    _ = @import("component/session_host_submission_test.zig");
     _ = @import("component/skill_fork_test.zig");
     _ = @import("component/sealed_skill_test.zig");
     _ = @import("component/prompt_tool_coupling_test.zig");
@@ -50,6 +55,11 @@ test {
     _ = @import("component/base_url_flag_test.zig");
     _ = @import("component/unknown_flag_test.zig");
     _ = @import("component/cli_help_test.zig");
+    _ = @import("component/launcher_hint_test.zig");
+    _ = @import("component/state_env_test.zig");
+    _ = @import("component/unbound_session_test.zig");
+    _ = @import("component/login_logout_test.zig");
+    _ = @import("component/next_step_test.zig");
     _ = @import("component/task_error_test.zig");
     _ = @import("component/tool_loop_breaker_test.zig");
     _ = @import("component/user_context_inject_test.zig");
@@ -58,6 +68,7 @@ test {
     _ = @import("component/requirement_ledger_test.zig");
     _ = @import("component/delivery_cadence_test.zig");
     _ = @import("component/check_gate_test.zig");
+    _ = @import("component/isolated_verifier_test.zig");
     _ = @import("component/learning_turn_test.zig");
     _ = @import("component/learning_end_of_run_test.zig");
     _ = @import("component/test_integrity_test.zig");
@@ -73,13 +84,18 @@ test {
     _ = @import("component/message_origin_test.zig");
     _ = @import("component/startup_catalogs_test.zig");
     _ = @import("component/mcp_background_startup_test.zig");
+    _ = @import("component/mcp_permission_test.zig");
     _ = @import("component/prompt_model_identity_test.zig");
     _ = @import("component/stream_terminator_test.zig");
+    _ = @import("component/stream_retractable_retry_test.zig");
+    _ = @import("component/stream_retry_default_test.zig");
     _ = @import("component/max_tokens_exhaustion_test.zig");
     _ = @import("component/time_context_test.zig");
     _ = @import("component/file_change_test.zig");
     _ = @import("component/compound_perm_test.zig");
     _ = @import("component/bash_auto_allow_test.zig");
+    _ = @import("component/grep_option_injection_test.zig");
+    _ = @import("component/tool_args_admission_test.zig");
     _ = @import("component/protected_skill_inject_test.zig");
     _ = @import("component/read_state_test.zig");
     _ = @import("component/symbol_capability_test.zig");
@@ -119,6 +135,8 @@ test {
     _ = @import("component/picker_frame_race_test.zig");
     _ = @import("component/md_stream_convergence_test.zig");
     _ = @import("component/stream_retry_test.zig");
+    _ = @import("component/stream_content_encoding_test.zig");
+    _ = @import("component/provider_lifecycle_test.zig");
     _ = @import("component/ui_state_test.zig");
     _ = @import("component/tui_clear_conversation_test.zig");
     _ = @import("component/skill_overrides_test.zig");
@@ -133,6 +151,7 @@ test {
     _ = @import("component/gemini_provider_test.zig");
     _ = @import("component/background_main_test.zig");
     _ = @import("component/suspend_resume_test.zig");
+    _ = @import("component/permission_unanswered_test.zig");
     _ = @import("component/diff_highlight_test.zig");
     _ = @import("component/prompt_override_test.zig");
     _ = @import("component/web_ui_test.zig");

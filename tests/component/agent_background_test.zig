@@ -31,9 +31,9 @@ const background_test_dialect = cc.api_dialect.Dialect{
     .injectSystemModsFn = injectBackgroundDialectMarker,
 };
 
-fn resolveBackgroundDialect(_: *const anyopaque, kind: cc.api_dialect.ProviderKind, model: []const u8) cc.api_dialect.Dialect {
+fn resolveBackgroundDialect(_: *const anyopaque, kind: cc.api_dialect.ProviderKind, declared: ?cc.api_dialect.Vendor, model: []const u8) cc.api_dialect.Dialect {
     if (kind == .anthropic) return background_test_dialect;
-    return cc.api_dialect.dialectFor(kind, model);
+    return cc.api_dialect.dialectForVendor(kind, declared, model);
 }
 
 fn backgroundDialectResolver() cc.api_dialect.Resolver {

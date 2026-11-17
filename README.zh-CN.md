@@ -96,7 +96,7 @@ metacodes 吸收了 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 | 接口 | 适用场景 |
 |---|---|
 | `metacodes-core` Zig 模块 | 同工具链的 Zig 宿主；`zig build example` 运行 [example/main.zig](example/main.zig) |
-| AgentCore C ABI v1 revision 26 | [sdk/](sdk/README.md) 自带 C、C++、Zig、Rust 绑定；JNA、.NET P/Invoke 等任何 FFI 都能直接加载共享库 |
+| AgentCore C ABI v1 revision 28 | [sdk/](sdk/README.md) 自带 C、C++、Zig、Rust 绑定；JNA、.NET P/Invoke 等任何 FFI 都能直接加载共享库 |
 | Python 与 Node 包 | `import metacodes` / `require('metacodes')`：Runtime、Session、流式事件、用 Python 或 JavaScript 写工具（[sdk/python](sdk/python/README.md)、[sdk/node](sdk/node/README.md)；实验性） |
 | Headless `-p --json` / `--stream-json` | 任何能起子进程、能读 NDJSON 的语言 |
 | `serve` 守护进程（HTTP 与 UDS，多会话）和 `--web` | 服务端、桌面应用、远程 UI |
@@ -152,7 +152,7 @@ TinyKG 是 Metask Lab 自研的图存储，用 Zig 编写。它的源码暂未�
 ### 安全与可观测性
 
 - **权限。** 五种模式；allow、ask、deny 规则使用 Claude Code 用户熟悉的 `Tool(specifier)` 语法；受保护路径（`.git`、`.env` 文件、`.ssh`、shell rc 文件等）始终需要确认。
-- **沙箱。** 可选启用的 macOS Seatbelt 沙箱；Linux 后端有待贡献。
+- **沙箱。** 可选启用的 Bash 沙箱：macOS 用 Seatbelt，Linux 用 bubblewrap。
 - **Stall gate。** 交互式会话中默认开启，工具轮次反复拿不到新信息时会停下运行。
 - **可观测的输出。** 每次文件修改都是一个带有限长度 diff 的事件；模型输出被分类为 commentary、final、continued、partial 或 discarded。
 
@@ -167,7 +167,7 @@ curl -fsSL https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/in
 它会在 macOS 或 Linux（arm64 或 x86_64）上安装最新发布版。Windows 用 `scripts\install.ps1` 配合发布的 zip 安装。然后：
 
 ```sh
-metacodes login --provider metask          # 或 --api-key / --provider openai|gemini|zai-coding-plan
+metacodes login                            # 在浏览器里登录 Metask(TUI 里是 /login)
 metacodes                                  # 交互式 TUI
 metacodes -p "explain src/main.zig" --json # headless，输出一条 NDJSON 结果
 metacodes --web                            # 浏览器 UI，127.0.0.1:7777
@@ -181,6 +181,10 @@ git clone https://github.com/metask-ai/metacodes.git && cd metacodes
 zig build && ./zig-out/bin/metacodes --help
 zig build example                          # 在 Zig 程序里嵌入运行时
 ```
+
+没有浏览器的机器(服务器、SSH)改用设备码登录：`metacodes login --provider metask --no-browser`，它给出一个链接和一个短码，在任何设备上确认后，再选模型和推理强度（界面里是 `/login metask`）。两种登录都存成 Metask 会话，直接敲 `metacodes` 就会用它。
+
+不登录、改用自己的 provider key：写进本安装的 `~/.local/opt/metacodes/state/.env`，重新启动即可，见 [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md)。什么都没配时 `metacodes` 也能打开，并告诉你这两条路；`/logout` 从 Metask 账号切回这把 key。
 
 隔离安装、provider 配置、Metask OAuth、Lean 内核和 Windows 等细节见 [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md)。
 
@@ -217,7 +221,7 @@ metacodes 处于 1.0 之前，版本号以 `build.zig.zon` 为准，每个发布
 | TinyKG 记忆与任务 DAG | CLI 中默认开启；AgentCore 中尚未提供 |
 | Lean 项目规则 | 实验性；项目激活前保持休眠 |
 | 自演化、learning turn、check gate | 实验性，默认关闭 |
-| 沙箱 | 仅 macOS，需手动开启 |
+| 沙箱 | macOS（Seatbelt）与 Linux（bubblewrap），需手动开启 |
 
 里程碑见 [ROADMAP.md](ROADMAP.md)，开源发布准备情况见 [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md)。
 
@@ -232,7 +236,7 @@ metacodes 由 Metask Lab 开发，也就是 [Metask](https://app.metask-ai.com)�
 - **语言绑定。** Go 绑定、Node 扩展的 Windows 移植、发布 Python 和 Node 包，以及一个 30 行的 C 语言 "hello agent"。
 - **质量。** 补上 WorkBuddy Security 的差距，为真实失败编写离线回归用例。
 - **记忆研究。** 增加一个 Markdown 记忆或向量 RAG 对照组，与 TinyKG 比较。
-- **平台。** Linux 沙箱后端（bubblewrap 或 Landlock）。
+- **平台。** Windows 沙箱后端，以及沙箱的按域名网络过滤。
 
 [CONTRIBUTING.md](CONTRIBUTING.md) 把每个方向对应到具体的入口，并说明改动如何被接受。提交第一个 PR 之前请读一遍 [AGENTS.md](AGENTS.md)，它很短。问题和想法请发到 [Discussions](https://github.com/metask-ai/metacodes/discussions)；安全漏洞请按 [SECURITY.md](SECURITY.md) 私下报告，不要开公开 issue。
 
@@ -241,6 +245,7 @@ metacodes 由 Metask Lab 开发，也就是 [Metask](https://app.metask-ai.com)�
 | | |
 |---|---|
 | [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) | 安装、provider、从源码构建 |
+| [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md) | 在本安装的 `.env` 里配置自己的 provider key |
 | [doc/API.md](doc/API.md) | 所有受支持的入口及其兼容性 |
 | [doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md) | C ABI 的规范性契约 |
 | [doc/BENCHMARKS.md](doc/BENCHMARKS.md) | metacodes 如何被测量，以及迄今所有结果 |

@@ -1,9 +1,9 @@
-# CI design: required checks, change scope, the merge queue and the legs
+# CI design: PR validation, release targets and the legs
 
 `ci.yml` runs the AGENTS.md pre-submit checklist on three platforms plus the
 offline TTY suites. This document covers how a required job skips work (§1),
-which of that work a change has to pay for (§2), how a batch of approved PRs
-lands without every PR merging `main` in and starting over (§3), and how one
+which of that work a change has to pay for (§2), how approved PRs
+land after validation against current main (§3), and how one
 platform's work is spread over several runners so that a run takes about as
 long as its longest leg rather than the sum of a platform's steps (§4).
 
@@ -52,8 +52,8 @@ plus an add, so moving a file out of `doc/` is a code change.
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `full` | anything else | Everything |
 
-Push and manual runs are always `full`, and so are an empty diff and any
-error.
+Manual runs are always `full`, and so are an empty diff and any error.
+Neither CI workflow runs on ordinary pushes to main.
 
 The boundaries are deliberately narrow:
 
@@ -72,82 +72,72 @@ The boundaries are deliberately narrow:
   `scripts/eval/chained_memory_smoke.py`. It skips only the TTY suites, which
   drive the interactive binary and read neither tree.
 
-## 3. Merge queue
+## 3. PR-only validation and merge policy
 
-With the ruleset's "require branches to be up to date" policy, every merge to
-`main` invalidates the green checks of every other open PR. Each PR must then
-merge `main` in and run the full workflow again, and the PRs merge one after
-another. With N PRs ready, that is close to N²/2 runs in series.
+Run full primary-platform CI on `pull_request`, then merge the exact reviewed
+head. Ordinary pushes to `main` do not repeat that run. The four required
+check names and their GitHub Actions source stay unchanged. `Protect main`
+must require branches to be up to date and must not require a merge queue.
+If main advances, merge main into the PR branch and repeat review and CI.
+A busy main can therefore still require several updates.
 
-The merge queue removes the up-to-date requirement and tests what will
-actually land:
+The [local watcher](PR_AGENT_LOOP.md) makes an ordinary merge commit for a
+stale branch, validates it through `dx`, pushes it, and waits for fresh
+review and PR CI. Conflicts go to the original worker. Before merging it
+rechecks head/base and effective branch rules, then calls the merge API with
+the reviewed head SHA. Strict server-side checks close the race where main
+moves after that recheck. No deferred auto-merge or admin bypass is used.
 
-- An approved PR joins the queue. The queue builds a temporary branch for it,
-  `gh-readonly-queue/main/pr-<n>-<sha>`, with `main` plus every PR ahead of
-  it and the PR itself merged in order. The workflow runs on that branch
-  through the `merge_group` event.
-- Each entry is tested once, on top of the entries ahead of it. Up to the
-  build concurrency of these runs go in parallel. Up to that many queued PRs
-  therefore take about one run's wall time and one run each, instead of
-  runs in series plus a merge-`main`-and-rerun round for each PR still
-  waiting.
-- When an entry's run passes, the queue merges it together with the entries
-  ahead of it that passed, up to the maximum group size, and `main` becomes
-  exactly a tested tree. When it fails, the queue drops that PR and rebuilds
-  the entries behind it without it.
+### Policy migration
 
-`ci.yml` and `agentcore-windows.yml` run on `merge_group`. In a group:
+After deploying the workflow and watcher, a repository rules administrator
+previews and applies the migration from a checkout containing the tooling:
 
-- **Change scope** diffs the whole group against its `base_sha`, so a group
-  of documentation PRs still skips the suites.
-- **Release fast path** also diffs against `base_sha`. Only a group whose
-  whole diff is the generated bump takes the fast path, which in practice
-  means the bump queued alone.
-- **Version state gate.** The event carries no pull request. The group's ref
-  names the PR at its head, the newest entry, so the gate checks that PR's
-  head branch, title and labels. The release PR therefore passes only as its
-  group's head. A PR queued behind it sees the bare released version and is
-  dropped from the queue, exactly as it would be refused on `main`, until
-  the reopen PR has merged
-  ([RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md) stage D).
-  This relies on every entry having to pass its own run. Under "only the
-  head must pass" (HEADGREEN), a PR queued just ahead of the reopen PR would
-  merge with it although its own run was refused.
+```sh
+python3 .github/pr-policy.py
+python3 .github/pr-policy.py --apply
+```
 
-### Switching it on
+The preview prints existing and proposed rules. The write fetches the current
+ruleset, removes only `merge_queue`, enables strict required status checks,
+and preserves every other protection, check source and bypass actor. It
+refuses inactive or broad rulesets and verifies effective main rules after
+the write. It refuses to write if GitHub hides the bypass-actor list, rather
+than replace a ruleset whose complete contents it cannot read. Restart local
+watchers from the updated checkout before cutover. A maintain role alone
+cannot apply it. The watcher refuses direct
+merges until this policy is active.
 
-The workflows above report on `merge_group` before the rule exists, so the
-ruleset can be switched in one edit. A maintainer makes it in `Protect main`:
+The workflows retain `merge_group` as migration compatibility, so this change
+can land under the old rules. After the queue rule is removed those events
+are not emitted. Existing queued PRs are left alone by an upgraded watcher.
+The legacy handler diffs against `base_sha` and retains release version
+ordering checks; it is not the normal delivery path.
 
-- **Required status checks:** keep the four checks, and turn off "require
-  branches to be up to date before merging"; the queue provides that
-  guarantee.
-- **Add "require merge queue"** with these settings:
-  - merge method: merge commit (the repository's history convention);
-  - build concurrency 5: up to five entries tested at once, about thirty
-    hosted jobs each, four of them on macOS (§4);
-  - maximum group size 5 and minimum 1. With a minimum of 1 the wait time
-    setting has no effect;
-  - only merge non-failing pull requests (ALLGREEN), which the release
-    ordering above relies on;
-  - status check timeout 120 minutes. The long pole is a version-bump entry:
-    `Release fast path` can wait up to 45 minutes for the base's push run
-    before the gates start, and then they run in full if that run was not
-    green.
+### Reusable full-CI evidence
 
-### What stays the same
+`Full PR evidence` waits for every CI suite, including SDK and Windows TTY,
+to succeed. Only full-scope, non-fast-path PR runs upload `pr-ci-evidence`:
+the tested merge commit/tree, head/base, repository, run ID and attempt.
+The release fast path finds a merged PR for the exact base commit, requires
+a successful run of `ci.yml`, and compares downloaded evidence with the base's
+actual Git tree. Head-only checks, docs/eval/fast-path runs, unrelated trees,
+push runs and missing or expired artifacts do not prove full validation.
+Evidence expires after 90 days; expiration costs a full run.
 
-Pushes to `main` still run the full workflow. The release fast path needs
-that run, because its base check is the base commit's push run
-(`release_fast_path.py`). When merges land back to back, the concurrency
-group cancels the older push run. A release or reopen PR whose base run was
-cancelled then takes the full path, which costs one run and never coverage.
+### Platform allocation
 
-Once the queue merges every PR, the push run repeats an entry's run on the
-same tree. Replacing it, for instance with a nightly full run plus a
-fast-path base check that accepts the merge group run, is the next step and
-is not designed here. The per-PR `pull_request` run also stays full for now;
-with the queue as the final gate it could shrink to a subset.
+| Platform | PR CI | Release |
+|---|---|---|
+| Linux x86_64, macOS ARM64, Windows x86_64 | Full native suites, subject to scope rules in §2 | Native release suites and artifacts |
+| Linux ARM64 | No extra cross-stage leg | Native ARM64 release suite plus musl cross-stage check |
+| macOS x86_64 | No Intel cross-build | Native Intel release suite and executable baseline check |
+| Windows ARM64 GNU/MSVC | No cross-build | SDK cross-build and consumer link checks, required before drafting |
+
+Windows ARM64 is not a native runtime test or supported CLI release unit:
+there is no ARM64 Windows TinyKG bundle. Lightweight manifest and installer
+fixture tests stay in PR CI; they do not build every target. Formal release
+builds remain cold and tied to the release ref.
 
 ## 4. Legs, shards and result jobs
 
@@ -169,7 +159,7 @@ over its platform's share:
 
 | Job | Runners | What each one runs |
 |---|---|---|
-| `gates-linux` | `units`, `product`, `release`, `cross`, `checks` | One flag each, below |
+| `gates-linux` | `units`, `product`, `release`, `checks` | One flag each, below |
 | `gates-macos` | `units-checks`, `product`, `release` | `units` and `checks` on one; one flag each on the others |
 | `windows-gates` | `units`, `integration`, `product`, `release` | One flag each |
 | `tty-linux` | three shards | Every third case of `tests/tty` |
@@ -183,8 +173,7 @@ The gate flags (Windows has no `checks` leg; its version state gate runs on
 | `units` | `zig build test:units`, and on POSIX `test:integration` in the same build; the native platform modules (on `product` on Windows) |
 | `integration` | Windows only: `zig build test:integration`, whose integration suite waits five minutes for the ReleaseSmall app there |
 | `product` | `zig build test:product` (the smokes, and the evaluation suite as three shards), with the pinned WorkBuddy-Bench checkout (POSIX); the native platform modules on Windows |
-| `release` | The bundle verification, the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on POSIX also the footprint red lines (`scripts/perf_baseline.sh`, report-only: written to the job summary, never fails the leg); on Windows also the version state gate and the Windows script suites |
-| `cross` | Linux only: the arm64 cross-stage, a third ReleaseSmall build |
+| `release` | The bundle verification, the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on POSIX also the footprint red lines (`scripts/perf_baseline.sh`, report-only: written to the job summary, never fails the leg); on macOS also its native ARM64 executable built for the release target and held to it (`scripts/check_binary_baseline.py`); on Windows also the version state gate and the Windows script suites |
 | `checks` | `zig fmt`, the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
 
 The rules that keep the split from dropping coverage:
@@ -260,7 +249,7 @@ ones that land nowhere:
 | A module under `scripts/eval/tests/` | Nothing to wire, unless it shares state outside its own temporary directories with another module (the live checkout, a fixed path): then both declare one `EVAL_SHARD_GROUP`, and the group runs in one shard, in order | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules, and the plugin-v1 group stays in one shard |
 | A case under `tests/tty/cases/` | Nothing to wire | A TTY shard | The TTY case `test_runner_shards` |
 | A suite under `scripts/tests/` | A command in a `test:*` part of `build.zig`, or a step with a leg flag in `ci.yml` | That part or leg | `test_gate_manifest.py`: every module runs on pull requests, or is listed with where it runs instead |
-| A step in `ci.yml` | The leg flag of the work it belongs to (`units`, `integration`, `product`, `release`, `cross`, `checks`) | Those legs | `test_ci_scope.py`: only the listed setup steps carry no flag, and every flag is set by a leg |
+| A step in `ci.yml` | The leg flag of the work it belongs to (`units`, `integration`, `product`, `release`, `checks`) | Those legs | `test_ci_scope.py`: only the listed setup steps carry no flag, and every flag is set by a leg |
 | A smoke or another long command in `test:product` | Captured output (`expectExitCode(0)`) when it should overlap the rest; inheriting the terminal, it waits for every other such command | The product legs | Build Summary durations |
 
 When a part outgrows its legs, the Build Summary of the slowest leg says

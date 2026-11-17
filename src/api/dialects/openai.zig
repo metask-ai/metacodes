@@ -1,200 +1,88 @@
-//! OpenAI-compatible dialect 实现(覆盖 OpenAI 原生 + GLM-5 + Kimi K3 + DeepSeek + Qwen3 + Mistral + MiniMax M2/M3)。
+//! # OpenAI 接入
 //!
-//! 这些模型都走 OpenAI chat/completions wire 协议(Provider=OpenAIClient),但各有
-//! thinking 控制 / system 改写 / reasoning_content 解析的变体。本文件把它们集中,
-//! serializeOpenAIRequest 通过 dialectFor(.openai, model).serializeThinking(...) 调用,
-//! 不再自己 switch(profile.thinking_mode)。
+//! OpenAI 自家模型(GPT、o 系列)的方言,同时是 OpenAI chat/completions wire 上
+//! **所有认不出厂商的模型**的兜底方言(vLLM、自部署、未登记的兼容网关)。
 //!
-//! 设计:每厂商一个 namespace,导出一组静态 fn;Dialect struct 用 fn-ptr 指向它们。
-//! 新增厂商 = 加一个 namespace + 注册一行。
+//! ## 接入点
+//!
+//! - Provider:`src/provider/profiles/openai.zig`,渠道 `default`,
+//!   `https://api.openai.com/v1`。Codex OAuth 复用同一实现,是另一种凭证类型。
+//! - 环境变量:`OPENAI_API_KEY`。
+//!
+//! ## 协议
+//!
+//! - `openai_chat`(`/chat/completions`)与 `openai_responses`(`/responses`)两条路由,
+//!   由路由声明选择,绝不从 base URL 或模型名推断。
+//! - 鉴权:`Authorization: Bearer <key>`。
+//!
+//! ## 思考与推理
+//!
+//! - 顶层 `reasoning_effort`,中立档位原样透传(none / minimal / low / medium / high /
+//!   xhigh / max);`none`、未指定时不发,用服务端默认。
+//! - Responses 路由的 `reasoning.effort` 由 `openai_client.zig` 的 Responses 序列化器发。
+//! - chat/completions 不返回思考文本(只有 `reasoning_tokens` 计数),本方言不解析
+//!   `reasoning_content`。
+//!
+//! ## 回传与缓存
+//!
+//! - Responses 路由:`reasoning` output item(含 `encrypted_content`)按模型门控原样回传
+//!   (`types.ReasoningItemBlock`,issue #23)。chat/completions 无可回传的推理状态。
+//! - 缓存:服务端自动前缀缓存。本方言不发 `prompt_cache_key`(profile 未声明支持)。
+//!
+//! ## 已知差异
+//!
+//! - 作为兜底方言时,对认不出的模型按 OpenAI 原生处理:发 `reasoning_effort`,图像输入
+//!   保守视为不支持(来源 unknown),由目录或 Host 声明覆盖。
+//! - 未知字段一律不发:兼容网关遇到不认识的字段可能 400。
+//!
+//! ## 来源
+//!
+//! - https://platform.openai.com/docs/api-reference/chat(2026-08 核对)
+//! - https://platform.openai.com/docs/guides/reasoning(2026-08 核对)
 
 const std = @import("std");
 const types = @import("../../types.zig");
 const util_json = @import("../../util/json.zig");
 const model_adapter = @import("../model_adapter.zig");
 const dialect_mod = @import("../dialect.zig");
-const capability_activation = @import("../capability_activation.zig");
+const compat = @import("openai_compat.zig");
+const Vendor = @import("../../provider/vendor.zig").Vendor;
 
 const Dialect = dialect_mod.Dialect;
 const ModelProfile = model_adapter.ModelProfile;
+const ProviderKind = model_adapter.ProviderKind;
 const ReasoningEffort = types.ReasoningEffort;
-const ToolChoice = dialect_mod.ToolChoice;
-const ResponseFormatRequest = dialect_mod.ResponseFormatRequest;
 
-// ── 公共 helper ──────────────────────────────────────────────────────────────
+pub const vendor: Vendor = .openai;
 
-/// OpenAI-compatible dialect 共享一个 ctx 类型(无状态),所有变体共用。
-/// 不同厂商的 Dialect.ctx 都指向同一个静态 sentinel——它们是无状态的纯函数集合。
-const Stateless = struct {};
-
-var stateless: Stateless = .{};
-
-fn statelessCtx() *anyopaque {
-    return @ptrCast(&stateless);
-}
-
-// ── 共享:tool_choice 序列化(所有 OpenAI-compatible dialect 同 wire 格式)─────────
-//
-// 中立 ToolChoice(Anthropic 语义)→ OpenAI chat/completions wire:
-//   auto     → "auto"
-//   any      → "required"(OpenAI 强制选一个工具的语义)
-//   tool+name→ {"type":"function","function":{"name":...}}
-//   none     → "none"
-//
-// 能力降级:GLM-5 profile.tool_choice_support==.auto_only,任何非 auto 都降级成 "auto"
-// (服务端拒 required/function,静默降级保请求成功)。其它 dialect 全支持。
-// **本函数是 OpenAI-compatible 协议的单一真相源**——6 个 dialect struct 都指向它,
-// 通过 profile 参数实现 per-model 降级(无需每个 dialect 重复实现)。
-fn openaiSerializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
-    _ = ctx;
-    const t = tc orelse return false;
-    // none 是通用语义(不调用工具),所有 OpenAI-compatible 服务端都认,不降级。
-    if (std.mem.eql(u8, t.type, "none")) {
-        try out.appendSlice(a, ",\"tool_choice\":\"none\"");
-        return true;
-    }
-    // GLM-5 仅支持 auto:none(不支持 required/function)。auto 透传,其它降级成 auto。
-    if (p.tool_choice_support == .auto_only) {
-        try out.appendSlice(a, ",\"tool_choice\":\"auto\"");
-        return true;
-    }
-    if (std.mem.eql(u8, t.type, "auto")) {
-        try out.appendSlice(a, ",\"tool_choice\":\"auto\"");
-        return true;
-    }
-    if (std.mem.eql(u8, t.type, "any") or std.mem.eql(u8, t.type, "required")) {
-        try out.appendSlice(a, ",\"tool_choice\":\"required\"");
-        return true;
-    }
-    if (std.mem.eql(u8, t.type, "tool")) {
-        if (t.name) |n| {
-            try out.appendSlice(a, ",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":");
-            try util_json.serializeString(n, out, a);
-            try out.appendSlice(a, "}}");
-            return true;
-        }
-        // name 缺失:退到 required
-        try out.appendSlice(a, ",\"tool_choice\":\"required\"");
-        return true;
-    }
-    // 未识别 type:不发(让服务端用默认)
+/// OpenAI 是 chat/completions wire 的兜底方言,不参与按名推断:认不出厂商的模型
+/// 本来就落到这里。
+pub fn claims(kind: ProviderKind, model: []const u8) bool {
+    _ = kind;
+    _ = model;
     return false;
 }
 
-// ── 共享:response_format 序列化(所有 OpenAI-compatible dialect 同 wire 格式)─────────
-//
-// 中立 ResponseFormatRequest → OpenAI chat/completions wire:
-//   json_object → ",\"response_format\":{\"type\":\"json_object\"}"
-//   json_schema → ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"response\",\"schema\":<schema>}}"
-//   (name 是 OpenAI 必填字段——缺失服务端 400 "Missing required parameter";中立请求
-//   结构无 name 概念,发固定 "response"。R2-4 修:此前漏发,json_schema 从不可用。)
-//
-// 能力降级:GLM-5 profile.response_format_support==.json_object_only,json_schema 降级为
-// json_object(服务端拒 json_schema,静默降级保请求成功)。
-fn openaiSerializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?ResponseFormatRequest, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
-    _ = ctx;
-    const req = rf orelse return false;
-    if (req.kind == .none) return false;
-    // GLM-5 仅 json_object:json_schema 降级
-    const effective: ResponseFormatRequest = if (p.response_format_support == .json_object_only and req.kind == .json_schema) .{ .kind = .json_object } else req;
-    if (effective.kind == .json_object) {
-        try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_object\"}");
-        return true;
-    }
-    if (effective.kind == .json_schema) {
-        if (effective.schema) |s| {
-            try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"response\",\"schema\":");
-            try out.appendSlice(a, s);
-            try out.appendSlice(a, "}}");
-            return true;
-        }
-        // schema 缺失:退到 json_object
-        try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_object\"}");
-        return true;
-    }
-    return false;
+pub fn dialect(kind: ProviderKind, model: []const u8) ?Dialect {
+    _ = model;
+    return switch (kind) {
+        .openai => native(),
+        else => null,
+    };
 }
 
-// ── 共享:prompt_cache_key 序列化(OpenAI 原生 + DeepSeek + Kimi 支持)─────────────
-//
-// 中立 key → OpenAI chat/completions 顶层 \"prompt_cache_key\":\"<key>\"。
-// 该字段是 OpenAI 2024 引入的显式 cache 提示(同 prompt 命中率提升),DeepSeek/Kimi
-// 兼容此字段。GLM-5/Qwen/Mistral 当前不支持(未实测服务端是否忽略未知字段,故靠
-// profile.supports_prompt_cache_key 能力守门,只对已确认支持的 model 发)。
-fn openaiSerializePromptCacheKey(ctx: *anyopaque, p: ModelProfile, key: ?[]const u8, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
-    _ = ctx;
-    if (!p.supports_prompt_cache_key) return false;
-    const k = key orelse return false;
-    try out.appendSlice(a, ",\"prompt_cache_key\":");
-    try util_json.serializeString(k, out, a);
-    return true;
+/// OpenAI 原生方言值(也是 chat/completions wire 的兜底)。
+pub fn native() Dialect {
+    return compat.ready(Native.dialect);
 }
 
-// ── 共享:parallel_tool_calls 序列化(Mistral 独有控制)──────────────────────────
-//
-// 中立 enabled → OpenAI chat/completions 顶层 \"parallel_tool_calls\":true/false。
-// OpenAI 原生也有此字段但默认 true(通常不需要显式发);Mistral 默认 true 但支持显式关闭。
-// 能力守门:profile.supports_parallel_tool_calls=false 时不发(避免误导)。
-fn openaiSerializeParallelToolCalls(ctx: *anyopaque, p: ModelProfile, enabled: ?bool, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
-    _ = ctx;
-    if (!p.supports_parallel_tool_calls) return false;
-    const e = enabled orelse return false;
-    try out.appendSlice(a, ",\"parallel_tool_calls\":");
-    try out.appendSlice(a, if (e) "true" else "false");
-    return true;
-}
+/// `openai_client.zig` 的 Responses 序列化器与 chat 共用同一个 data URL 实现。
+pub const writeImageDataUrl = compat.writeImageDataUrl;
 
-// ── 共享:图像 content part 序列化(所有 OpenAI-compatible dialect 同 wire 格式)────
-//
-// 中立 ImageBlock → OpenAI chat/completions content-part:
-//   {"type":"image_url","image_url":{"url":"data:<mime>;base64,<data>"}}
-// (vision 全生态标准形态:GPT-4o+/Qwen-VL/GLM-4V 等 OpenAI-compatible vision 端点通用。
-//  Responses API 的 input_image 是 responses-local 形态,不经此方法。)
-// 能力守门在 Dialect.serializeImagePart wrapper(集中一处,vendor 覆盖也绕不开);
-// 本函数只管 wire 形态——绝不静默把 base64 当文本发(issue #10 铁律)。
-// **本函数是 OpenAI-compatible 协议的单一真相源**;将来某厂商原生端点要求不同
-// 图像形态时,该厂商 dialect 换挂自己的实现即可(方言扩展点)。
-fn openaiSerializeImagePart(ctx: *anyopaque, p: ModelProfile, image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
-    _ = ctx;
-    _ = p;
-    try out.appendSlice(a, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"");
-    try writeImageDataUrl(image, out, a);
-    try out.appendSlice(a, "\"}}");
-    return true;
-}
-
-/// data URL 核心(`data:<mime>;base64,<data>`,不带外围引号):chat 的 image_url 与
-/// Responses 的 input_image 共用同一注入安全实现。分段走 serializeStringContents
-/// (无引号 escape)——不信任上游校验,media_type/data 里的异常字节在此被正确转义,
-/// 不破坏请求 JSON 结构(合法 MIME 与 base64 字母表本就无需转义,零开销路径)。
-pub fn writeImageDataUrl(image: types.ImageBlock, out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-    try out.appendSlice(a, "data:");
-    try util_json.serializeStringContents(image.media_type, out, a);
-    try out.appendSlice(a, ";base64,");
-    try util_json.serializeStringContents(image.data, out, a);
-}
-
-// ── 共享:reasoning_content 流式增量解码(GLM/Kimi/DeepSeek/Qwen/Mistral 同一平级字段)──
-//
-// OpenAI-compatible 端点把 reasoning_content 作为 delta 平级字符串字段流式返回。
-// SSE string 片段带一层 JSON 转义(\n/\uXXXX 等)——必须解除后再交 UI/preserved-thinking
-// 回传,否则思考文本把转义序列当字面量显示(issue #4)。空片段 free-and-null(不发事件)。
-// **本函数是 6 个兼容 dialect 的单一真相源**;OpenAINative 例外(原生不返回此字段,保持 null 实现)。
-fn openaiExtractReasoningContent(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
-    _ = ctx;
-    if (try util_json.extractAndUnescapeStringField(raw, "reasoning_content", a)) |r| {
-        if (r.len > 0) return r;
-        a.free(r);
-    }
-    return null;
-}
-
-// ── OpenAI 原生(GPT-4o / GPT-5 / o1 / o3)──────────────────────────────────
-const OpenAINative = struct {
+const Native = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
         _ = ctx;
         _ = p;
-        // OpenAI 原生:reasoning.effort 嵌套对象(GPT-5/o3)。effort 直接透传 7 档。
         if (effort) |e| if (e.active()) {
             try out.appendSlice(a, ",\"reasoning_effort\":");
             try util_json.serializeString(e.name(), out, a);
@@ -209,573 +97,57 @@ const OpenAINative = struct {
         return null;
     }
 
-    const dialect = Dialect{
-        .ctx = undefined, // 运行时由 statelessCtx() 填
-        .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = extractThinkingDelta,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-        // injectSystemMods / supportsToolChoice / supportsResponseFormat / profile 走 default
+    const dialect = blk: {
+        var d = compat.base;
+        d.serializeThinkingFn = serializeThinking;
+        d.extractThinkingDeltaFn = extractThinkingDelta;
+        break :blk d;
     };
 };
-
-// ── GLM-5 ──────────────────────────────────────────────────────────────────
-const Glm = struct {
-    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        // GLM-5.2:thinking:{type} + 顶层 reasoning_effort(7 档,服务端自己做 low/medium→high 映射)。
-        // 来源:docs.z.ai/guides/capabilities/thinking(2026-08 KnowForge 调研)。
-        // effort=null 时默认 enabled(GLM 自动判断是否思考),不发 reasoning_effort(用服务端默认 max)。
-        const enable = if (effort) |e| e.active() else true;
-        try out.appendSlice(a, ",\"thinking\":{\"type\":");
-        try util_json.serializeString(if (enable) "enabled" else "disabled", out, a);
-        try out.append(a, '}');
-        if (enable) {
-            // clear_thinking=false(保留)→ 对齐 preserved thinking;coding-plan 默认。
-            try out.appendSlice(a, ",\"clear_thinking\":false");
-            // 顶层 reasoning_effort(7 档透传:服务端自己把 low/medium→high, xhigh→max)。
-            // 仅 GLM-5.2+ 支持;GLM-5.1/5/4.x 不支持(服务端会忽略未知字段,安全)。
-            if (effort) |e| {
-                try out.appendSlice(a, ",\"reasoning_effort\":");
-                try util_json.serializeString(e.name(), out, a);
-            }
-        }
-    }
-
-    fn activateCapabilities(ctx: *anyopaque, p: ModelProfile, capabilities: @import("../dialect.zig").VisibleCapabilities, system: *std.ArrayList(u8), allocator: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        try capability_activation.injectStrictSkillToolFirst(
-            system,
-            capabilities.skill_tool,
-            capabilities.requiredSkillInvocation(),
-            allocator,
-        );
-    }
-
-    const dialect = Dialect{
-        .ctx = undefined,
-        .serializeThinkingFn = serializeThinking,
-        .activateCapabilitiesFn = activateCapabilities,
-        .extractThinkingDeltaFn = openaiExtractReasoningContent,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-    };
-};
-
-// ── GLM-5.3 and later: thinking cannot be switched off ─────────────────────
-const Glm53 = struct {
-    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        // `thinking.type` is always `enabled`: GLM-5.3 fails a request that
-        // disables it, which the GLM-5.2 dialect sends for `none`. The effort
-        // is one of low / high / max; none and minimal ask for the least,
-        // `low`. Null leaves the server default (`max`).
-        try out.appendSlice(a, ",\"thinking\":{\"type\":\"enabled\"},\"clear_thinking\":false");
-        if (effort) |e| {
-            try out.appendSlice(a, ",\"reasoning_effort\":");
-            try util_json.serializeString(model_adapter.glm53EffortName(e), out, a);
-        }
-    }
-
-    const dialect = Dialect{
-        .ctx = undefined,
-        .serializeThinkingFn = serializeThinking,
-        .activateCapabilitiesFn = Glm.activateCapabilities,
-        .extractThinkingDeltaFn = openaiExtractReasoningContent,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-    };
-};
-
-// ── Kimi K3(顶层 reasoning_effort,不发 thinking body)─────────────────────────
-const KimiK3 = struct {
-    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        // Kimi K3:总是开 thinking(不能关),用顶层 reasoning_effort(low/high/max 默认 max)。
-        // 不发 thinking:{} body(那是 K2.6 的格式)。effort=null 走默认 "max"。
-        // 来源:platform.kimi.ai/docs/guide/kimi-k3-quickstart(2026-08 KnowForge 调研)。
-        const eff = effort orelse .xhigh; // null → 默认 max
-        const mapped = model_adapter.kimiK3EffortMap(eff);
-        try out.appendSlice(a, ",\"reasoning_effort\":");
-        try util_json.serializeString(mapped, out, a);
-    }
-
-    const dialect = Dialect{
-        .ctx = undefined,
-        .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = openaiExtractReasoningContent,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-    };
-};
-
-// ── Kimi K2.6(thinking:{type,keep,effort} body)───────────────────────────────
-const Kimi = struct {
-    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        // Kimi K2.6:thinking:{type,keep,effort} 在 body。effort 3 档(low/high/max)。
-        // K3 用顶层 reasoning_effort(见 KimiK3 dialect),这里只是 K2.6 及更早。
-        const enable = if (effort) |e| e.active() else true;
-        try out.appendSlice(a, ",\"thinking\":{\"type\":");
-        try util_json.serializeString(if (enable) "enabled" else "disabled", out, a);
-        if (enable) {
-            try out.appendSlice(a, ",\"keep\":\"all\"");
-            if (model_adapter.kimiEffortMap(effort.?)) |mapped| {
-                try out.appendSlice(a, ",\"effort\":");
-                try util_json.serializeString(mapped, out, a);
-            }
-        }
-        try out.append(a, '}');
-    }
-
-    const dialect = Dialect{
-        .ctx = undefined,
-        .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = openaiExtractReasoningContent,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-    };
-};
-
-// ── DeepSeek ────────────────────────────────────────────────────────────────
-const DeepSeek = struct {
-    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        // DeepSeek V4:thinking:{type} + reasoning_effort 顶层(两独立参数)。
-        // effort 2 档(high/max),V4 文档明确 xhigh→max(此前误为 high)。
-        // 来源:api-docs.deepseek.com/guides/thinking_mode(2026-08 KnowForge 调研)。
-        const enable = if (effort) |e| e.active() else true;
-        try out.appendSlice(a, ",\"thinking\":{\"type\":");
-        try util_json.serializeString(if (enable) "enabled" else "disabled", out, a);
-        try out.append(a, '}');
-        if (enable) {
-            // null means "use the provider default", so thinking remains enabled
-            // without inventing an explicit reasoning_effort value.
-            if (effort) |explicit| if (model_adapter.deepseekEffortMap(explicit)) |mapped| {
-                try out.appendSlice(a, ",\"reasoning_effort\":");
-                try util_json.serializeString(mapped, out, a);
-            };
-        }
-    }
-
-    const dialect = Dialect{
-        .ctx = undefined,
-        .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = openaiExtractReasoningContent,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-    };
-};
-
-// ── Qwen3 ────────────────────────────────────────────────────────────────────
-const Qwen = struct {
-    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        // Qwen3:enable_thinking bool + /think /no_think 文本指令(chat template 处理)。
-        // body 只传 enable_thinking;文本指令由 system prompt 携带(调用方加,本 dialect 不注入)。
-        const enable = if (effort) |e| e.active() else true;
-        try out.appendSlice(a, ",\"enable_thinking\":");
-        try out.appendSlice(a, if (enable) "true" else "false");
-    }
-
-    const dialect = Dialect{
-        .ctx = undefined,
-        .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = openaiExtractReasoningContent,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-    };
-};
-
-// ── Mistral(ThinkChunk,语义同 reasoning_content)────────────────────────────
-const Mistral = struct {
-    const dialect = Dialect{
-        .ctx = undefined,
-        .extractThinkingDeltaFn = openaiExtractReasoningContent,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-    };
-};
-
-// ── MiniMax M3 ──────────────────────────────────────────────────────────────
-const MiniMaxM3 = struct {
-    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        // M3:thinking:{type: disabled|adaptive|enabled} 三态。OpenAI-compat 的
-        // reasoning.effort 档位串仅兼容接受、不调深度——不发,避免假控制。
-        // null → "adaptive"(官方默认,显式发送保证请求字节确定性)。
-        // 来源:platform.minimax.io responses-create + MiniMax-M3 model card(2026-08 调研)。
-        try out.appendSlice(a, ",\"thinking\":{\"type\":");
-        try util_json.serializeString(model_adapter.minimaxM3ThinkingType(effort), out, a);
-        try out.append(a, '}');
-    }
-
-    const dialect = Dialect{
-        .ctx = undefined,
-        .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = openaiExtractReasoningContent,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-    };
-};
-
-// ── MiniMax M2.x ────────────────────────────────────────────────────────────
-const MiniMaxM2 = struct {
-    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        _ = effort; // M2.x thinking 常开且不可关(disabled 被接受但忽略)——不发无效档位。
-        // reasoning_split:思考以 reasoning_content 平级字段返回(而非内嵌 <think> 文本),
-        // 对齐 openaiExtractReasoningContent 既有解析路径。
-        try out.appendSlice(a, ",\"reasoning_split\":true");
-    }
-
-    const dialect = Dialect{
-        .ctx = undefined,
-        .serializeThinkingFn = serializeThinking,
-        .extractThinkingDeltaFn = openaiExtractReasoningContent,
-        .serializeToolChoiceFn = openaiSerializeToolChoice,
-        .serializeResponseFormatFn = openaiSerializeResponseFormat,
-        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
-        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
-        .serializeImagePartFn = openaiSerializeImagePart,
-    };
-};
-
-// ── dialectFor:按 model 子串返回对应 Dialect ────────────────────────────────
-// 顺序敏感:先匹配更具体的(GLM-4 在 GLM 前);k2/kimi 都匹配 Kimi。
-//
-// **ctx 共享**:所有 OpenAI-compatible dialect 无状态,共享同一个 `stateless` 实例。
-// 不同厂商只是 fn-ptr 集不同,ctx 指向同一块内存(不解引用)。
-
-pub fn openaiDialectFor(model: []const u8) Dialect {
-    if (model_adapter.glmAlwaysThinks(model)) return Glm53.dialect.withCtx(statelessCtx());
-    if (model_adapter.hasSubstr(model, "glm-5") or model_adapter.hasSubstr(model, "glm4") or model_adapter.hasSubstr(model, "glm-4")) {
-        return Glm.dialect.withCtx(statelessCtx());
-    }
-    // Kimi K3 必须在 K2.6 前匹配(更具体的子串)
-    if (model_adapter.hasSubstr(model, "kimi-k3") or model_adapter.hasSubstr(model, "kimi_k3")) {
-        return KimiK3.dialect.withCtx(statelessCtx());
-    }
-    if (model_adapter.hasSubstr(model, "kimi") or model_adapter.hasSubstr(model, "k2") or model_adapter.hasSubstr(model, "moonshot")) {
-        return Kimi.dialect.withCtx(statelessCtx());
-    }
-    if (model_adapter.hasSubstr(model, "deepseek")) {
-        return DeepSeek.dialect.withCtx(statelessCtx());
-    }
-    if (model_adapter.hasSubstr(model, "qwen3") or model_adapter.hasSubstr(model, "qwen-3")) {
-        return Qwen.dialect.withCtx(statelessCtx());
-    }
-    // MiniMax:M3 必须在 M2.x 通配前匹配(更具体的子串)
-    if (model_adapter.hasSubstr(model, "minimax-m3") or model_adapter.hasSubstr(model, "minimax_m3")) {
-        return MiniMaxM3.dialect.withCtx(statelessCtx());
-    }
-    if (model_adapter.hasSubstr(model, "minimax")) {
-        return MiniMaxM2.dialect.withCtx(statelessCtx());
-    }
-    if (model_adapter.hasSubstr(model, "mistral") or model_adapter.hasSubstr(model, "magistral")) {
-        return Mistral.dialect.withCtx(statelessCtx());
-    }
-    // 默认:OpenAI 原生(GPT-4o / GPT-5 / o1 / o3 / 其它未注册)。
-    return OpenAINative.dialect.withCtx(statelessCtx());
-}
-
-// Dialect.withCtx helper(因 const dialect 声明 ctx=undefined,运行时填)
-// 注:Dialect.withCtx 方法在 dialect.zig 定义,这里直接用。
 
 // ── 测试 ─────────────────────────────────────────────────────────────────────
 
-test "openaiDialectFor: GLM-5.3 never disables thinking and speaks low/high/max" {
-    const a = std.testing.allocator;
-    const d = openaiDialectFor("glm-5.3");
-    inline for (.{
-        .{ ReasoningEffort.none, "low" },
-        .{ ReasoningEffort.medium, "high" },
-        .{ ReasoningEffort.high, "high" },
-        .{ ReasoningEffort.xhigh, "max" },
-        .{ ReasoningEffort.max, "max" },
-    }) |case| {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(a);
-        try d.serializeThinking(.{}, case[0], &out, a);
-        try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out.items, "disabled") == null);
-        const want = "\"reasoning_effort\":\"" ++ case[1] ++ "\"";
-        try std.testing.expect(std.mem.indexOf(u8, out.items, want) != null);
-    }
-    // No effort chosen: thinking on, the server's default level.
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, null, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "reasoning_effort") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"type\":\"enabled\"") != null);
-}
+const capability_activation = @import("../capability_activation.zig");
 
-test "openaiDialectFor: GLM-5.2 返 Glm dialect(thinking+clear_thinking+reasoning_effort 顶层)" {
-    const d = openaiDialectFor("glm-5.2");
+test "OpenAI 原生: effort 原样透传,不发 thinking 对象" {
+    const d = native();
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
     try d.serializeThinking(.{}, .high, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "clear_thinking") != null);
-    // 顶层 reasoning_effort 透传 effort.name()(7 档),GLM-5.2+ 服务端自己做映射
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"high\"") != null);
-}
-
-test "openaiDialectFor: MiniMax M3 三态 thinking(不发 effort 串)" {
-    const d = openaiDialectFor("minimax-m3");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, .xhigh, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "reasoning_effort") == null);
-    out.clearRetainingCapacity();
-    try d.serializeThinking(.{}, .low, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"type\":\"adaptive\"") != null);
+    try std.testing.expectEqualStrings(",\"reasoning_effort\":\"high\"", out.items);
     out.clearRetainingCapacity();
     try d.serializeThinking(.{}, .none, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"type\":\"disabled\"") != null);
-}
-
-test "openaiDialectFor: MiniMax M2.1 只发 reasoning_split(常开不可关)" {
-    const d = openaiDialectFor("minimax-m2.1");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, .xhigh, &out, a);
-    try std.testing.expectEqualStrings(",\"reasoning_split\":true", out.items);
-    out.clearRetainingCapacity();
-    try d.serializeThinking(.{}, .none, &out, a);
-    try std.testing.expectEqualStrings(",\"reasoning_split\":true", out.items);
-}
-
-test "openaiDialectFor: GLM-5.2 effort=xhigh 透传 xhigh(非 7→2 映射)" {
-    const d = openaiDialectFor("glm-5.2");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, .xhigh, &out, a);
-    // 透传 xhigh(服务端映射 xhigh→max);旧实现是发 "max",新实现发 "xhigh" 让服务端映射
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"xhigh\"") != null);
-}
-
-test "openaiDialectFor: GLM-5.2 effort=null 不发 reasoning_effort(用服务端默认 max)" {
-    const d = openaiDialectFor("glm-5.2");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, null, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "reasoning_effort") == null);
-}
-
-test "openaiDialectFor: Kimi K3 返 KimiK3 dialect(顶层 reasoning_effort,不发 thinking body)" {
-    const d = openaiDialectFor("kimi-k3");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, .high, &out, a);
-    // K3:顶层 reasoning_effort,不发 thinking:{} body(那是 K2.6)
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"high\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"keep\":\"all\"") == null);
-}
-
-test "openaiDialectFor: Kimi K3 effort=null 走默认 max" {
-    const d = openaiDialectFor("kimi-k3");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, null, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"max\"") != null);
-}
-
-test "openaiDialectFor: Kimi K2.6 返 Kimi dialect(thinking:{type,keep,effort} body)" {
-    const d = openaiDialectFor("kimi-k2");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, .high, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"keep\":\"all\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"effort\":\"high\"") != null);
-}
-
-test "openaiDialectFor: DeepSeek V4 返 DeepSeek dialect(thinking+reasoning_effort, xhigh→max)" {
-    const d = openaiDialectFor("deepseek-chat");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, .high, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"high\"") != null);
-    // xhigh → max(V4 修正)
-    out.clearRetainingCapacity();
-    try d.serializeThinking(.{}, .xhigh, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"max\"") != null);
-
-    // null is a valid public override state: preserve provider-default thinking
-    // without dereferencing or fabricating an explicit effort.
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
     out.clearRetainingCapacity();
     try d.serializeThinking(.{}, null, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":") == null);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
-test "openaiDialectFor: Qwen3 返 Qwen dialect" {
-    const d = openaiDialectFor("qwen3-235b");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, .high, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"enable_thinking\":true") != null);
-}
-
-test "openaiDialectFor: GPT-4o 返 OpenAI native dialect" {
-    const d = openaiDialectFor("gpt-4o");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(.{}, .high, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"high\"") != null);
-    // OpenAI 原生不发 thinking:{} 对象
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":") == null);
-}
-
-test "openaiDialectFor: GLM-5.2 uses capability guidance without legacy effort tag" {
-    const d = openaiDialectFor("glm-5.2");
-    const a = std.testing.allocator;
-    var sys: std.ArrayList(u8) = .empty;
-    defer sys.deinit(a);
-    try sys.appendSlice(a, "base system\n\n# Available skills\n- verify: bounded review");
-    try d.activateCapabilities(.{}, .{ .skill_tool = true }, &sys, a);
-    // GLM-5.2 改用顶层 reasoning_effort body 字段,不再注入 system 标签
-    try std.testing.expect(std.mem.indexOf(u8, sys.items, "<reasoning_effort>") == null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        sys.items,
-        capability_activation.STRICT_SKILL_SECTION_MARKER,
-    ) != null);
-}
-
-test "openaiDialectFor: GPT-4o 不注入 system 标签(default no-op)" {
-    const d = openaiDialectFor("gpt-4o");
+test "OpenAI 原生: 不注入 system,不解析 reasoning_content" {
+    const d = native();
     const a = std.testing.allocator;
     var sys: std.ArrayList(u8) = .empty;
     defer sys.deinit(a);
     try sys.appendSlice(a, "base");
     try d.activateCapabilities(.{}, .{ .skill_tool = true }, &sys, a);
     try std.testing.expectEqualStrings("base", sys.items);
+    try std.testing.expect(try d.extractThinkingDelta("{\"delta\":{\"reasoning_content\":\"x\"}}", a) == null);
+    try std.testing.expect(std.mem.indexOf(u8, sys.items, capability_activation.STRICT_SKILL_SECTION_MARKER) == null);
 }
 
-test "openaiDialectFor: extractThinkingDelta 解析 reasoning_content" {
-    const a = std.testing.allocator;
-    const d = openaiDialectFor("deepseek-chat");
-    const got = try d.extractThinkingDelta("{\"delta\":{\"reasoning_content\":\"thinking...\"}}", a);
-    try std.testing.expect(got != null);
-    defer a.free(got.?);
-    try std.testing.expectEqualStrings("thinking...", got.?);
-}
-
-test "openaiDialectFor: extractThinkingDelta 解除 SSE 转义(\\n/\\t/\\uXXXX)" {
-    const a = std.testing.allocator;
-    const d = openaiDialectFor("deepseek-chat");
-    const got = try d.extractThinkingDelta("{\"delta\":{\"reasoning_content\":\"a\\nb\\t\\u4f60\"}}", a);
-    try std.testing.expect(got != null);
-    defer a.free(got.?);
-    // 真实换行/制表/你(不是字面 \n/\t/你)。
-    try std.testing.expectEqualStrings("a\nb\t你", got.?);
-}
-
-test "openaiDialectFor: extractThinkingDelta 空片段返 null(free-and-null)" {
-    const a = std.testing.allocator;
-    const d = openaiDialectFor("glm-5.2");
-    try std.testing.expect((try d.extractThinkingDelta("{\"delta\":{\"reasoning_content\":\"\"}}", a)) == null);
-}
-
-test "openaiDialectFor: extractThinkingDelta 结尾转义反斜杠不早断(奇偶)" {
-    const a = std.testing.allocator;
-    const d = openaiDialectFor("kimi-k3");
-    const got = try d.extractThinkingDelta("{\"delta\":{\"reasoning_content\":\"frag\\\\\"}}", a);
-    try std.testing.expect(got != null);
-    defer a.free(got.?);
-    try std.testing.expectEqualStrings("frag\\", got.?);
-}
-
-test "openaiDialectFor: OpenAI 原生 extractThinkingDelta 返 null" {
-    const a = std.testing.allocator;
-    const d = openaiDialectFor("gpt-4o");
-    const got = try d.extractThinkingDelta("{\"delta\":{\"content\":\"hi\"}}", a);
-    try std.testing.expect(got == null);
-}
-
-test "OpenAI dialect: serializeImagePart 发 image_url data URL(vision 模型)" {
-    const d = openaiDialectFor("gpt-4o");
+test "OpenAI 原生: serializeImagePart 发 image_url data URL;异常 MIME 被转义" {
+    const d = native();
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
     const p = d.profileFor(.openai, "gpt-4o");
-    const ok = try d.serializeImagePart(p, .{ .media_type = "image/png", .data = "QUJD" }, &out, a);
-    try std.testing.expect(ok);
+    try std.testing.expect(try d.serializeImagePart(p, .{ .media_type = "image/png", .data = "QUJD" }, &out, a));
     try std.testing.expectEqualStrings(
         "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,QUJD\"}}",
         out.items,
     );
-}
-
-test "OpenAI dialect: 非 vision 模型 serializeImagePart 返 false(能力守门)" {
-    const d = openaiDialectFor("deepseek-chat");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    const p = d.profileFor(.openai, "deepseek-chat");
-    try std.testing.expect(!(try d.serializeImagePart(p, .{ .media_type = "image/png", .data = "QUJD" }, &out, a)));
-    try std.testing.expectEqual(@as(usize, 0), out.items.len);
-}
-
-test "OpenAI dialect: 异常 media_type 字节被 JSON 转义(不破坏请求结构)" {
-    const d = openaiDialectFor("gpt-4o");
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    const p = d.profileFor(.openai, "gpt-4o");
+    out.clearRetainingCapacity();
     _ = try d.serializeImagePart(p, .{ .media_type = "image/\"x", .data = "QUJD" }, &out, a);
-    // 引号被转义为 \":序列化输出仍是合法 JSON 片段。
     try std.testing.expect(std.mem.indexOf(u8, out.items, "image/\\\"x") != null);
 }

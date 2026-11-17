@@ -637,9 +637,19 @@ class Session:
         prompt: str,
         *,
         max_turns: Optional[int] = None,
+        stream_retry_budget: int = 0,
         on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> RunResult:
         """Run one prompt to completion and return the final answer.
+
+        Every request is sent once more by itself when its stream breaks off
+        without an answer (a stall, a dropped connection, a stream that ended
+        early) before any tool call started. ``stream_retry_budget`` (0 to 8,
+        default 0) is how many more times the Run may send a request again
+        after that, a started tool call included. Each retry of an attempt
+        that showed output is announced: the attempt's segment ends
+        ``discarded``, a ``thinking_discarded`` event takes back its thinking,
+        and a ``retry_notice`` follows before a short wait.
 
         The Run executes on its own thread (``RUN_STACK_BYTES`` of stack);
         this call waits for it. An interrupt while waiting (Ctrl+C) aborts the
@@ -660,6 +670,10 @@ class Session:
             if not 1 <= turns <= n.MAX_TURNS:
                 raise ValueError("max_turns must be between 1 and %d" % n.MAX_TURNS)
             options.max_turns = turns
+            budget = int(stream_retry_budget)
+            if not 0 <= budget <= n.MAX_STREAM_RETRY_BUDGET:
+                raise ValueError("stream_retry_budget must be between 0 and %d" % n.MAX_STREAM_RETRY_BUDGET)
+            options.stream_retry_budget = budget
             result = n.RunResult(struct_size=ctypes.sizeof(n.RunResult))
             diagnostic = n.OwnedBytes()
             run_id = self._next_run_id
@@ -718,13 +732,16 @@ class Session:
             model_error=state.model_error,
         )
 
-    def stream(self, prompt: str, *, max_turns: Optional[int] = None) -> "EventStream":
+    def stream(
+        self, prompt: str, *, max_turns: Optional[int] = None, stream_retry_budget: int = 0
+    ) -> "EventStream":
         """Run ``prompt`` on a background thread and iterate over its events.
 
         Iterating yields each event dict as it arrives; afterwards
-        ``stream.result`` holds the :class:`RunResult`.
+        ``stream.result`` holds the :class:`RunResult`. ``stream_retry_budget``
+        is :meth:`run`'s.
         """
-        return EventStream(self, prompt, max_turns)
+        return EventStream(self, prompt, max_turns, stream_retry_budget)
 
     def abort(self) -> None:
         """Ask the active Run to stop; it returns with stop_reason 'aborted'."""
@@ -799,6 +816,30 @@ class Session:
         )
         self._lib.check("session.update_permission_mode", status, diagnostic)
 
+    def rewind_to_user_message(self, position: int) -> None:
+        """Drop the user message at ``position`` and everything after it.
+
+        Edit-and-rerun's history change (AgentCore Revision 27): the next
+        :meth:`run` takes the dropped message's place, after exactly the
+        context that preceded it. ``position`` counts the full history from 1,
+        the way ``describe()["conversation"]["message_count"]`` counts, so a
+        Run's own message is ``message_count + 1`` read just before it. Only
+        the Conversation changes; files and other effects of the dropped turns
+        stay. A position that is not a user message, is out of range, or lies
+        behind the compact boundary raises :class:`AgentCoreError`
+        (``NOT_USER_MESSAGE``, ``MESSAGE_POSITION_OUT_OF_RANGE``,
+        ``MESSAGE_POSITION_COMPACTED``) and changes nothing.
+        """
+        if isinstance(position, bool) or not isinstance(position, int) or position < 1:
+            raise ValueError("position must be a positive int")
+        if position >= 1 << 64:
+            raise ValueError("position must fit in 64 bits")
+        diagnostic = n.OwnedBytes()
+        status = self._lib.api.session_control.contents.rewind_to_user_message(
+            self._handle, position, ctypes.byref(diagnostic)
+        )
+        self._lib.check("session.rewind_to_user_message", status, diagnostic)
+
     def close(self, timeout: Optional[float] = None) -> None:
         """Destroy the Session.
 
@@ -855,7 +896,9 @@ _DONE = object()
 class EventStream:
     """Iterator over one Run's events; ``result`` is set when it ends."""
 
-    def __init__(self, session: Session, prompt: str, max_turns: Optional[int]) -> None:
+    def __init__(
+        self, session: Session, prompt: str, max_turns: Optional[int], stream_retry_budget: int = 0
+    ) -> None:
         self.result: Optional[RunResult] = None
         self._queue: "queue.Queue[Any]" = queue.Queue()
         self._error: Optional[BaseException] = None
@@ -863,7 +906,12 @@ class EventStream:
 
         def work() -> None:
             try:
-                self.result = session.run(prompt, max_turns=max_turns, on_event=self._queue.put)
+                self.result = session.run(
+                    prompt,
+                    max_turns=max_turns,
+                    stream_retry_budget=stream_retry_budget,
+                    on_event=self._queue.put,
+                )
             except BaseException as error:
                 self._error = error
             finally:

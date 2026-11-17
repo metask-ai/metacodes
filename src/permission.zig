@@ -13,6 +13,7 @@ const rule_mod = @import("permission/rule.zig");
 const rule_matcher_mod = @import("permission/rule_matcher.zig");
 const settings_mod = @import("permission/settings.zig");
 const rule_spec_mod = @import("permission/rule_spec.zig");
+const lent_mod = @import("permission/lent.zig");
 
 // --- 旧 API 重导出 ---
 
@@ -28,6 +29,7 @@ pub const RuleSet = rule_matcher_mod.RuleSet;
 pub const Rule = rule_matcher_mod.Rule;
 pub const MergedSettings = settings_mod.MergedSettings;
 pub const MatchContext = rule_spec_mod.MatchContext;
+pub const LentPermissions = lent_mod.LentPermissions;
 
 /// How far an "allow always" answer reaches.
 pub const AlwaysAllowScope = enum {
@@ -64,6 +66,13 @@ pub const PermissionContext = struct {
     /// Session 级权限记忆(always-allow / session-deny)。指针:*const ctx 仍可经它 remember。
     /// null = 无记忆(单测/库消费者不接)→ 每次都问。每 session 一个实例(多 Session 不串台)。
     session_rules: ?*@import("permission/session_rules.zig").SessionRules = null,
+    /// Another Session's rules and working directories this context decides
+    /// with instead of its own `settings` and `match_ctx.additional_dirs`
+    /// (#445: a swarm member under its lead's permissions,
+    /// `AgentSession.inheritPermissions`). Read under its lock, as they are
+    /// at each decision; see permission/lent.zig for the locking rule.
+    /// `scopedDerive` copies it, so a member's scoped copies follow too.
+    inherited: ?*LentPermissions = null,
     /// Where an "allow always" answer is remembered beyond `session_rules`.
     /// The default keeps it in the Session: an embedding Host owns its
     /// permission store and imports rules through
@@ -120,6 +129,12 @@ pub const PermissionContext = struct {
     /// at spawn). Historical aliases are judged by what they mean (`bypass` is
     /// bypass_permissions). No settings loaded → every mode is allowed.
     pub fn modeAllowed(self: *const PermissionContext, m: types.PermissionMode) bool {
+        if (self.inherited) |lent| {
+            lent.mutex.lock();
+            defer lent.mutex.unlock();
+            const settings = lent.borrowedSettings() orelse return true;
+            return settings.allowsMode(m);
+        }
         const settings = self.settings orelse return true;
         return settings.allowsMode(m);
     }
@@ -129,6 +144,11 @@ pub const PermissionContext = struct {
     /// changes behaviour by mode outside decision.zig reads this, not `modeValue()`;
     /// `modeValue()` stays the stored value for display and state round trips.
     pub fn effectiveMode(self: *const PermissionContext) types.PermissionMode {
+        if (self.inherited) |lent| {
+            lent.mutex.lock();
+            defer lent.mutex.unlock();
+            return decision_mod.effectiveMode(self.modeValue(), lent.borrowedSettings());
+        }
         return decision_mod.effectiveMode(self.modeValue(), self.settings);
     }
 
@@ -165,11 +185,22 @@ pub fn checkPermissionClassified(
     // 却漏填 match_ctx.alloc → 规则匹配退回原始字节被 .. 绕过"的窗口。
     var mctx = ctx.match_ctx;
     if (mctx.alloc == null) mctx.alloc = ctx.allocator;
+    var settings = ctx.settings;
+    // #445: a borrower decides with the lender's rules and directories as
+    // they are now, holding the lender's lock for the whole decision so
+    // neither is freed or swapped under it (permission/lent.zig).
+    const lender = ctx.inherited;
+    if (lender) |lent| {
+        lent.mutex.lock();
+        settings = lent.borrowedSettings();
+        mctx.additional_dirs = lent.additional_dirs;
+    }
+    defer if (lender) |lent| lent.mutex.unlock();
     const d_ctx = decision_mod.Context{
         .mode = ctx.modeValue(),
         .rules = ctx.rules,
         .active_skill = ctx.active_skill,
-        .settings = ctx.settings,
+        .settings = settings,
         .session_rules = ctx.session_rules,
         .decision_override = ctx.decision_override,
         .match_ctx = mctx,
@@ -183,15 +214,19 @@ pub fn checkPermissionClassified(
     return decision_mod.checkClassified(&d_ctx, tool_name, args, category);
 }
 
+/// Why a permission prompt ended with nobody's answer; see `prompt.Unanswered`.
+pub const PromptUnanswered = prompt_mod.Unanswered;
+
 /// 询问用户(有副作用:写 session 记忆 / 落盘)。ctx 非 const,见 prompt.ask 线程契约。
-pub fn promptUser(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+/// `false` is a person's deny; a `PromptUnanswered` error is a deny nobody gave.
+pub fn promptUser(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) PromptUnanswered!bool {
     return prompt_mod.ask(ctx, tool_name, args);
 }
 
 /// A confirmation the `confirm_gate` demanded: the same prompt, but a
 /// remembered "allow always" for the tool does not answer it (a remembered
 /// deny still does). See permission/confirm_gate.zig.
-pub fn promptUserForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+pub fn promptUserForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) PromptUnanswered!bool {
     return prompt_mod.askForced(ctx, tool_name, args);
 }
 
@@ -205,6 +240,7 @@ test {
     _ = &prompt_mod;
     _ = &@import("permission/bash_readonly.zig");
     _ = &@import("permission/confirm_gate.zig");
+    _ = &lent_mod;
 }
 
 test "shim checkPermission bypass" {
@@ -245,6 +281,25 @@ test "optional decision override is inert by default and receives imported actio
     try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Read", "{}"));
     try std.testing.expectEqual(@as(usize, 1), Probe.calls);
     try std.testing.expectEqual(ImportedPermissionDecision.undecided, Probe.last_imported);
+}
+
+test "inherited decisions keep the published rule header until the next publication" {
+    var owned = try settings_mod.buildRuleSet(std.testing.allocator, .{ .deny = &.{"Write"} }, .{});
+    defer owned.deinit();
+    var owner_header = owned;
+    var lent: LentPermissions = .{};
+    lent.publish(&owner_header, &.{});
+    var ctx = createContext(.bypass_permissions, std.testing.allocator);
+    ctx.inherited = &lent;
+    const args = "{\"file_path\":\"ordinary.txt\"}";
+    try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Write", args));
+
+    // AgentSession replaces its optional header before publish takes the
+    // lender lock. A decision still observes the last published deny set.
+    owner_header.layers = &.{};
+    try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Write", args));
+    lent.publish(&owner_header, &.{});
+    try std.testing.expectEqual(PermissionResult.allow, checkPermission(&ctx, "Write", args));
 }
 
 test "PermissionContext.mode 原子跨线程 write-read(无撕裂,release-acquire 可见)" {

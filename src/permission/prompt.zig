@@ -15,12 +15,33 @@ const PermissionChoice = @import("../core/protocol/permission_choice.zig").Permi
 const ui_request = @import("../core/protocol/ui_request.zig");
 const PermissionContext = @import("../permission.zig").PermissionContext;
 
+/// Why a prompt ended with nobody's answer. Every one denies, and the caller
+/// must not report it as the user's decision: it tells the model which it was
+/// (agent_loop's `.ask` branch, doc/WIRE_PROTOCOL.md §1.4).
+pub const Unanswered = error{
+    /// The connected frontend declared it cannot render permission prompts
+    /// (doc/WIRE_PROTOCOL.md §2.2): nobody was asked.
+    PromptUnrenderable,
+    /// Nobody answered before the Host's deadline.
+    PromptTimedOut,
+    /// An interrupt or a close cancelled the request before anyone answered.
+    PromptCancelled,
+    /// An answer arrived but could not be read.
+    PromptAnswerUnreadable,
+    /// This session has no way to ask and wait for an answer: no requester
+    /// under `no_interactive_prompt`, or one that answered `.unavailable` or
+    /// `.pending` (the gate is synchronous and cannot suspend).
+    PromptNobodyToAsk,
+    /// The requester failed before anyone answered.
+    PromptRequestFailed,
+};
+
 /// 阻塞式询问用户。返回 true = 允许。ctx 携带 session 记忆 / UI runner / persist 路径。
 /// **ctx 非 const**:本函数有副作用(写 session 记忆 rememberAllow/Deny、写 settings.local.json)。
 /// 线程契约:M6 前假设单线程调用(SessionRules 无锁);M6 多 session 多线程化时给 SessionRules 加锁。
-/// error.PromptUnrenderable:连着的前端声明了渲染不了权限请求,谁都没问——调用方必须拒绝,
-/// 且不能把它说成用户的回答。
-pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+/// `false` is a person's deny (an answer, or one remembered for the session);
+/// an `Unanswered` error is a deny nobody gave, and says why.
+pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) Unanswered!bool {
     return askWith(ctx, tool_name, args, false);
 }
 
@@ -29,11 +50,11 @@ pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bo
 /// remembered "allow always" for the tool does not answer it. A remembered
 /// deny still does, since the gate may only tighten; an "allow always" the
 /// user gives here is still remembered for the tool's ordinary calls.
-pub fn askForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+pub fn askForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) Unanswered!bool {
     return askWith(ctx, tool_name, args, true);
 }
 
-fn askWith(ctx: *PermissionContext, tool_name: []const u8, args: []const u8, forced: bool) !bool {
+fn askWith(ctx: *PermissionContext, tool_name: []const u8, args: []const u8, forced: bool) Unanswered!bool {
     // session 记忆优先(per-session,不串台)
     if (ctx.session_rules) |sr| {
         if (!forced and sr.isAllowed(tool_name)) return true;
@@ -44,7 +65,7 @@ fn askWith(ctx: *PermissionContext, tool_name: []const u8, args: []const u8, for
     // may answer, but every non-answer must fail closed instead of consulting
     // process-global answer queues or fd 0. This covers embedded libraries as
     // well as swarm teammates whose Host owns the surrounding process input.
-    if (ctx.no_interactive_prompt and ctx.ui_requester == null) return false;
+    if (ctx.no_interactive_prompt and ctx.ui_requester == null) return error.PromptNobodyToAsk;
 
     // 预置应答队列曾加载(Stage 3 e2e)→ 强制走文字路径(askText 从队列弹/耗尽则
     // 安全默认 deny,**绝不**退回读 fd 0——它被 REPL 行流独占,会死等)。
@@ -61,13 +82,26 @@ fn askWith(ctx: *PermissionContext, tool_name: []const u8, args: []const u8, for
     if (ctx.ui_requester != null or platform_term.isatty(0)) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
+        // What a deny without an answer reports, if no fallback prompt asks.
+        var unanswered: Unanswered = error.PromptNobodyToAsk;
         const choice_opt: ?PermissionChoice = blk: {
             if (ctx.ui_requester) |runner| {
                 const req = ui_request.UiRequest{ .permission = .{ .tool = tool_name, .args = args } };
                 var resp: ui_request.UiResponse = undefined;
                 // permission 门是 executeSlots 前的同步门,不支持挂起(out of scope)——
                 // 仅 .answered 读 resp;.pending/.unavailable 落文字 prompt 兜底。
-                const outcome = runner.request(ctx.session, arena.allocator(), &req, &resp) catch break :blk null;
+                const outcome = runner.request(ctx.session, arena.allocator(), &req, &resp) catch |err| switch (err) {
+                    // The request was announced and ended with nobody's answer
+                    // (#463). The frontend was asked, so no terminal prompt
+                    // stands in for it: deny at once, saying why.
+                    error.UiRequestTimedOut => return error.PromptTimedOut,
+                    error.UiRequestCancelled => return error.PromptCancelled,
+                    error.UiAnswerUnreadable => return error.PromptAnswerUnreadable,
+                    else => {
+                        unanswered = error.PromptRequestFailed;
+                        break :blk null;
+                    },
+                };
                 switch (outcome) {
                     .answered => {},
                     // 连着的前端声明了渲染不了权限请求(doc/WIRE_PROTOCOL.md §2.2):没人能答,
@@ -78,7 +112,10 @@ fn askWith(ctx: *PermissionContext, tool_name: []const u8, args: []const u8, for
                 }
                 break :blk switch (resp) {
                     .permission => |c| c,
-                    else => null,
+                    else => {
+                        unanswered = error.PromptAnswerUnreadable;
+                        break :blk null;
+                    },
                 };
             }
             break :blk null; // 无 runner → 落文字 prompt(不再裸调 TUI dialog)
@@ -118,19 +155,19 @@ fn askWith(ctx: *PermissionContext, tool_name: []const u8, args: []const u8, for
                 },
             }
         }
-        // requester 存在但未给出答案(异常/pending/取消)时，库消费者绝不
+        // requester 存在但未给出答案(异常/pending/unavailable)时，库消费者绝不
         // 回落到进程 stdin。交互产品仍保留既有文字 prompt 兜底。
-        if (ctx.no_interactive_prompt) return false;
+        if (ctx.no_interactive_prompt) return unanswered;
         // requester 存在但未给出答案且无 tty 可回落 → 安全 deny。
         // 绝不读 fd 0:web/GUI daemon 的 fd 0 不属于权限系统(读它 = 死等或吞别人的输入)。
         // tty 场景保留 askText 回落(TUI dialog Esc 的存量语义不动)。
-        if (!platform_term.isatty(0)) return false;
+        if (!platform_term.isatty(0)) return unanswered;
         // dialog 返回 null(意外非 TTY)→ 落到文字
     }
 
     // Keep the invariant local to the only textual input edge as defense in
     // depth if the control flow above changes later.
-    if (ctx.no_interactive_prompt) return false;
+    if (ctx.no_interactive_prompt) return error.PromptNobodyToAsk;
     // 非 TTY 退回文字 prompt
     return askText(tool_name, args);
 }
@@ -205,8 +242,9 @@ test "no_interactive_prompt: 无 ui_requester 时 .ask 直接 deny(绝不读 fd 
     // 不落 askText 读 fd 0(此测试在无 tty/CI 环境跑,若真读 fd 0 会 hang/EOF)。
     var ctx = PermissionContext{ .allocator = testing.allocator, .no_interactive_prompt = true };
     ctx.setMode(.default);
-    const allowed = try ask(&ctx, "Write", "{\"file_path\":\"/x\"}");
-    try testing.expect(!allowed); // fail-closed deny
+    // Fail-closed deny, and nobody's: there was no one to ask (#463).
+    try testing.expectError(error.PromptNobodyToAsk, ask(&ctx, "Write", "{\"file_path\":\"/x\"}"));
+    try testing.expectError(error.PromptNobodyToAsk, askForced(&ctx, "Write", "{\"file_path\":\"/x\"}"));
 }
 
 test "no_interactive_prompt: requester non-answer never falls back to process answer queue" {
@@ -237,7 +275,7 @@ test "no_interactive_prompt: requester non-answer never falls back to process an
         .ui_requester = .{ .ctx = &unavailable, .requestFn = Unavailable.request },
     };
     ctx.setMode(.default);
-    try testing.expect(!try ask(&ctx, "Write", "{\"file_path\":\"/x\"}"));
+    try testing.expectError(error.PromptNobodyToAsk, ask(&ctx, "Write", "{\"file_path\":\"/x\"}"));
     try testing.expectEqual(@as(usize, 1), unavailable.calls);
     // The process-global answer was not consumed by the embedded Session.
     try testing.expectEqualStrings("y", answer_queue.pop().?);
@@ -271,6 +309,84 @@ test "a frontend that cannot render permission prompts denies without any fallba
     try testing.expectError(error.PromptUnrenderable, ask(&ctx, "Write", "{\"file_path\":\"/x\"}"));
     try testing.expectError(error.PromptUnrenderable, askForced(&ctx, "Write", "{\"file_path\":\"/x\"}"));
     try testing.expectEqual(@as(usize, 2), unrenderable.calls);
+}
+
+test "a prompt nobody answered says why and never falls back to a terminal prompt (#463)" {
+    const testing = std.testing;
+    const answer_queue = @import("../core/answer_queue.zig");
+    const Scripted = struct {
+        calls: usize = 0,
+        result: anyerror!ui_request.RequestOutcome = .answered,
+        response: ui_request.UiResponse = .{ .permission = .deny_once },
+
+        fn request(
+            raw: *anyopaque,
+            _: ui_request.SessionId,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            out: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const outcome = try self.result;
+            if (outcome == .answered) out.* = self.response;
+            return outcome;
+        }
+    };
+    const Case = struct {
+        result: anyerror!ui_request.RequestOutcome,
+        response: ui_request.UiResponse = .{ .permission = .deny_once },
+        expected: Unanswered,
+    };
+    const cases = [_]Case{
+        .{ .result = error.UiRequestTimedOut, .expected = error.PromptTimedOut },
+        .{ .result = error.UiRequestCancelled, .expected = error.PromptCancelled },
+        .{ .result = error.UiAnswerUnreadable, .expected = error.PromptAnswerUnreadable },
+        .{ .result = .pending, .expected = error.PromptNobodyToAsk },
+        .{ .result = .unavailable, .expected = error.PromptNobodyToAsk },
+        .{ .result = error.HostUiFailed, .expected = error.PromptRequestFailed },
+        .{ .result = .answered, .response = .{ .answers = &.{} }, .expected = error.PromptAnswerUnreadable },
+    };
+    // A loaded answer queue would grant if anything fell back to it.
+    answer_queue.load("y\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\n");
+    defer answer_queue.resetForTest();
+    for (cases) |case| {
+        var scripted = Scripted{ .result = case.result, .response = case.response };
+        var ctx = PermissionContext{
+            .allocator = testing.allocator,
+            .no_interactive_prompt = true,
+            .ui_requester = .{ .ctx = &scripted, .requestFn = Scripted.request },
+        };
+        ctx.setMode(.default);
+        try testing.expectError(case.expected, ask(&ctx, "Write", "{\"file_path\":\"/x\"}"));
+        try testing.expectError(case.expected, askForced(&ctx, "Write", "{\"file_path\":\"/x\"}"));
+        try testing.expectEqual(@as(usize, 2), scripted.calls);
+    }
+    try testing.expectEqualStrings("y", answer_queue.pop().?);
+    // The causes the Host reported deny at once even in a product context
+    // (no `no_interactive_prompt`): the frontend was asked, so no terminal
+    // prompt stands in for it. (A loaded queue is consulted before any
+    // requester in a product context, so it is cleared here.)
+    answer_queue.resetForTest();
+    for (cases[0..3]) |case| {
+        var scripted = Scripted{ .result = case.result };
+        var ctx = PermissionContext{
+            .allocator = testing.allocator,
+            .ui_requester = .{ .ctx = &scripted, .requestFn = Scripted.request },
+        };
+        ctx.setMode(.default);
+        try testing.expectError(case.expected, ask(&ctx, "Write", "{\"file_path\":\"/x\"}"));
+    }
+
+    // A person's deny stays a plain `false`.
+    var denied = Scripted{};
+    var ctx = PermissionContext{
+        .allocator = testing.allocator,
+        .no_interactive_prompt = true,
+        .ui_requester = .{ .ctx = &denied, .requestFn = Scripted.request },
+    };
+    ctx.setMode(.default);
+    try testing.expect(!try ask(&ctx, "Write", "{\"file_path\":\"/x\"}"));
 }
 
 const AllowAlwaysAnswer = struct {

@@ -63,6 +63,7 @@ pub fn modeFor(kind: @import("capability.zig").ProviderKind) CacheMode {
         .anthropic => .explicit_breakpoint, // cache_control 断点
         .openai => .automatic_prefix, // 自动前缀,无标记
         .gemini => .stateful_object, // 句柄表 + cachedContent 引用(本 client 实现)
+        .bedrock => .explicit_breakpoint, // Converse cachePoint 块(仅 Claude)
         .other => .none,
     };
 }

@@ -179,20 +179,46 @@ test "原则2: kimi-k3 effort=null → reasoning_effort:\"max\"(K3 默认 max)" 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
 }
 
-test "原则2: kimi-k2 effort=high → thinking:{type,keep,effort}(K2.6 方言,与 K3 区分)" {
+test "原则2: kimi-k2 effort=high → thinking:{type,keep}(K2.6 方言,与 K3 区分)" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
     };
     const body = try openai.serializeOpenAIRequest(a, "kimi-k2", &msgs, "sys", null, .high, null);
     defer a.free(body);
-    // K2.6:thinking:{type,keep,effort} body(不是 K3 的顶层 reasoning_effort)
+    // K2.6:thinking:{type,keep} body(不是 K3 的顶层 reasoning_effort);K2.6 的 thinking
+    // 对象没有 effort(platform.kimi.ai/docs/api/chat,2026-11)。
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"enabled\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\"") == null);
     // K2.6 不该发顶层 reasoning_effort(那是 K3 的)
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":") == null);
+}
+
+test "原则2: kimi-for-coding(Kimi Code 的 K2.8 Preview,按名推断)→ 顶层 reasoning_effort,未指定不发(#487)" {
+    // 按名推断是 AgentCore 与不带 --provider 的会话走的路径:名字含 kimi,方言是 Kimi。
+    // 来源:kimi.com/code/docs/en/kimi-code/models.html(2026-11):reasoning_effort
+    // low / high / max,默认 max;以前发的是 K2.7-code 的 thinking 对象。
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+    };
+    const chosen = try openai.serializeOpenAIRequest(a, "kimi-for-coding", &msgs, "sys", null, .xhigh, null);
+    defer a.free(chosen);
+    try std.testing.expect(std.mem.indexOf(u8, chosen, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chosen, "\"thinking\":") == null);
+    for ([_]?types.ReasoningEffort{ null, .none }) |effort| {
+        const unset = try openai.serializeOpenAIRequest(a, "kimi-for-coding", &msgs, "sys", null, effort, null);
+        defer a.free(unset);
+        try std.testing.expect(std.mem.indexOf(u8, unset, "reasoning_effort") == null);
+        try std.testing.expect(std.mem.indexOf(u8, unset, "\"thinking\":") == null);
+    }
+    // K2.7 Code Highspeed 照旧:思考恒开,没有档位。
+    const highspeed = try openai.serializeOpenAIRequest(a, "kimi-for-coding-highspeed", &msgs, "sys", null, .high, null);
+    defer a.free(highspeed);
+    try std.testing.expect(std.mem.indexOf(u8, highspeed, "\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, highspeed, "reasoning_effort") == null);
 }
 
 test "原则2: gemini-2.5-pro reasoning_effort=high → thinking_level high(Gemini 方言)" {
@@ -409,4 +435,350 @@ test "交叉矩阵: 各模型 reasoning_effort=high 的 thinking 字段输出差
         try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") == null);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\"") == null);
     }
+}
+
+// ── Issue #421: reasoning passback ──────────────────────────────────────────
+//
+// The neutral IR now carries thinking blocks; each dialect decides. DeepSeek,
+// Kimi and MiniMax M3+ get their reasoning back as `reasoning_content` on
+// OpenAI chat, and a route declaring DeepSeek on the Anthropic wire gets its
+// non-empty thinking blocks (tests/component/vendor_dialect_test.zig); every
+// other request is byte-identical to the one without thinking, and Claude
+// never sees an unsigned thinking block. Carried over from #429.
+
+const harness = @import("harness");
+
+const SECRET_REASONING = "need the clock first";
+
+/// A tool turn after a thinking turn: user → assistant(thinking, text,
+/// tool_use) → user(tool_result).
+fn toolTurn(comptime with_thinking: bool) [3]types.ApiMessage {
+    const assistant_blocks = if (with_thinking) &[_]types.ApiContent{
+        .{ .thinking = SECRET_REASONING },
+        .{ .text = "checking" },
+        .{ .tool_use = .{ .id = "call_1", .name = "get_time", .input = "{}" } },
+    } else &[_]types.ApiContent{
+        .{ .text = "checking" },
+        .{ .tool_use = .{ .id = "call_1", .name = "get_time", .input = "{}" } },
+    };
+    return .{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "what time is it" }} },
+        .{ .role = .assistant, .content = assistant_blocks },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "call_1", .content = "{\"t\":42}" } }} },
+    };
+}
+
+test "issue #421 (a): DeepSeek/Kimi/MiniMax OpenAI chat sends reasoning_content on the assistant message" {
+    const a = std.testing.allocator;
+    const msgs = toolTurn(true);
+    inline for (.{ "deepseek-chat", "deepseek-v4-pro", "deepseek/deepseek-v4", "kimi-k3", "kimi-k2.6", "MiniMax-M3.1-Flash", "MiniMax-M3" }) |model| {
+        const body = try openai.serializeOpenAIRequest(a, model, &msgs, "sys", null, .high, null);
+        defer a.free(body);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            body,
+            "{\"role\":\"assistant\",\"content\":\"checking\",\"reasoning_content\":\"" ++ SECRET_REASONING ++ "\",\"tool_calls\":[",
+        ) != null);
+        // Exactly once: never on user or tool messages.
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "reasoning_content"));
+    }
+}
+
+test "issue #421 (b): a route declaring DeepSeek on the Anthropic wire gets its thinking back in order, never an empty block" {
+    const a = std.testing.allocator;
+    const msgs = toolTurn(true);
+    const d = dialect_mod.dialectForVendor(.anthropic, .deepseek, "house-deployment");
+    const req = request.MessagesRequest{ .model = "house-deployment", .messages = &msgs, .system = "sys" };
+    const body = try request.serializeMessagesRequestWithDialect(req, a, d);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        body,
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"" ++ SECRET_REASONING ++ "\"},{\"type\":\"text\",\"text\":\"checking\"},{\"type\":\"tool_use\"",
+    ) != null);
+
+    // An empty thinking block is not reasoning: it is left out.
+    const empty = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "what time is it" }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{ .{ .thinking = "" }, .{ .text = "checking" } } },
+    };
+    const empty_body = try request.serializeMessagesRequestWithDialect(.{ .model = "house-deployment", .messages = &empty, .system = "sys" }, a, d);
+    defer a.free(empty_body);
+    try std.testing.expect(std.mem.indexOf(u8, empty_body, "\"type\":\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_body, "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"checking\"}]}") != null);
+}
+
+test "issue #421 (c): every other dialect's request bytes are unchanged by thinking blocks" {
+    const a = std.testing.allocator;
+    const with = toolTurn(true);
+    const without = toolTurn(false);
+    // OpenAI chat: native, catch-all and every non-echoing compatible dialect
+    // (GLM/Qwen/MiniMax/Mistral return reasoning but do not ask for it back).
+    inline for (.{ "gpt-4o", "gpt-5.2", "some-unknown-model", "glm-5.2", "qwen3-235b-a22b", "minimax-m2.5", "mistral-large" }) |model| {
+        const got = try openai.serializeOpenAIRequest(a, model, &with, "sys", null, .high, null);
+        defer a.free(got);
+        const want = try openai.serializeOpenAIRequest(a, model, &without, "sys", null, .high, null);
+        defer a.free(want);
+        try std.testing.expectEqualStrings(want, got);
+    }
+    // OpenAI Responses.
+    inline for (.{ "gpt-5.2", "deepseek-chat" }) |model| {
+        const d = dialect_mod.dialectFor(.openai, model);
+        const got = try openai.serializeOpenAIResponsesRequest(a, model, &with, "sys", null, .{}, d);
+        defer a.free(got);
+        const want = try openai.serializeOpenAIResponsesRequest(a, model, &without, "sys", null, .{}, d);
+        defer a.free(want);
+        try std.testing.expectEqualStrings(want, got);
+    }
+    // Gemini.
+    inline for (.{ "gemini-2.5-pro", "gemini-3.1-pro" }) |model| {
+        const got = try gemini.serializeGeminiRequest(a, &with, "sys", null, null, model, null, .high);
+        defer a.free(got);
+        const want = try gemini.serializeGeminiRequest(a, &without, "sys", null, null, model, null, .high);
+        defer a.free(want);
+        try std.testing.expectEqualStrings(want, got);
+    }
+    // Anthropic Messages without a declaration: Claude's dialect for every
+    // name, DeepSeek's included (only a route declaring DeepSeek gets its
+    // thinking back on this wire).
+    inline for (.{ "claude-opus-4-6", "claude-sonnet-4-5", "claude-3-5-haiku-20241022", "glm-5.2", "kimi-k3", "deepseek-v4-pro", "test-model" }) |model| {
+        const got = try request.serializeMessagesRequest(.{ .model = model, .messages = &with, .system = "sys", .reasoning_effort = .high }, a);
+        defer a.free(got);
+        const want = try request.serializeMessagesRequest(.{ .model = model, .messages = &without, .system = "sys", .reasoning_effort = .high }, a);
+        defer a.free(want);
+        try std.testing.expectEqualStrings(want, got);
+        // The budget/journal projection keeps its bytes too.
+        const got_projection = try request.serializeCanonicalRequestProjection(.{ .model = model, .messages = &with }, a);
+        defer a.free(got_projection);
+        const want_projection = try request.serializeCanonicalRequestProjection(.{ .model = model, .messages = &without }, a);
+        defer a.free(want_projection);
+        try std.testing.expectEqualStrings(want_projection, got_projection);
+    }
+}
+
+test "issue #421 (d): Claude never receives an unsigned thinking block" {
+    const a = std.testing.allocator;
+    const msgs = toolTurn(true);
+    inline for (.{ "claude-opus-4-6", "claude-sonnet-4-5", "claude-haiku-4-5", "claude-3-7-sonnet-20250219", "claude-deepseek-distill" }) |model| {
+        const body = try request.serializeMessagesRequest(.{ .model = model, .messages = &msgs, .reasoning_effort = .high }, a);
+        defer a.free(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"thinking\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, SECRET_REASONING) == null);
+    }
+}
+
+// ── L2 through agent_loop: the reasoning a model streamed comes back (or not) ──
+
+const OPENAI_REASONING_TOOLCALL_SSE =
+    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"need the \"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"clock first\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+const OPENAI_FINAL_SSE =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"it is 42\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+const ANTHROPIC_THINKING_TOOLCALL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"" ++ SECRET_REASONING ++ "\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"get_time\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":3}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const ANTHROPIC_FINAL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":9,\"output_tokens\":0}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"it is 42\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+fn getTimeExec(ctx: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8 {
+    return ctx.allocator.dupe(u8, "{\"t\":42}");
+}
+
+const Wire = enum { openai_chat, anthropic };
+
+/// Runs one tool turn and a final turn through `agent_loop.run` against a
+/// mock server, then hands the second request's body to `check`.
+fn runToolTurn(comptime wire: Wire, model: []const u8, check: *const fn ([]const u8) anyerror!void) !void {
+    const a = std.testing.allocator;
+    const cassette = switch (wire) {
+        .openai_chat => [_][]const u8{ OPENAI_REASONING_TOOLCALL_SSE, OPENAI_FINAL_SSE },
+        .anthropic => [_][]const u8{ ANTHROPIC_THINKING_TOOLCALL_SSE, ANTHROPIC_FINAL_SSE },
+    };
+    var srv = try harness.MockServer.startCassette(&cassette, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("get_time", "Get current time", &.{}, getTimeExec, null, false);
+    const tool_defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(tool_defs);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "what time is it");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+
+    const result = switch (wire) {
+        .openai_chat => blk: {
+            var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", model, url);
+            defer client.deinit();
+            break :blk try cc.agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a);
+        },
+        .anthropic => blk: {
+            var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", model, url);
+            defer client.deinit();
+            break :blk try cc.agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a);
+        },
+    };
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+
+    // The streamed reasoning is in the conversation either way.
+    var saw_thinking = false;
+    for (conv.messages.items) |m| for (m.blocks) |b| switch (b) {
+        .thinking => |t| saw_thinking = saw_thinking or std.mem.eql(u8, t, SECRET_REASONING),
+        else => {},
+    };
+    try std.testing.expect(saw_thinking);
+
+    try check(srv.requestAt(1).?.body());
+}
+
+fn expectReasoningContentEchoed(body: []const u8) anyerror!void {
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        body,
+        "{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"" ++ SECRET_REASONING ++ "\",\"tool_calls\":[{\"id\":\"call_1\"",
+    ) != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "reasoning_content"));
+}
+
+fn expectNoReasoning(body: []const u8) anyerror!void {
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_content") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, SECRET_REASONING) == null);
+}
+
+test "issue #421 L2 (a): DeepSeek, Kimi and MiniMax M3.1 get reasoning_content back after a tool turn" {
+    try runToolTurn(.openai_chat, "deepseek-v4-pro", expectReasoningContentEchoed);
+    try runToolTurn(.openai_chat, "kimi-k3", expectReasoningContentEchoed);
+    try runToolTurn(.openai_chat, "MiniMax-M3.1-Flash", expectReasoningContentEchoed);
+}
+
+test "issue #421 L2 (c): GLM and Qwen stream reasoning but never get it back" {
+    try runToolTurn(.openai_chat, "glm-5.2", expectNoReasoning);
+    try runToolTurn(.openai_chat, "qwen3-235b-a22b", expectNoReasoning);
+}
+
+test "issue #421 L2 (d): Claude's next request carries no thinking block" {
+    try runToolTurn(.anthropic, "claude-sonnet-4-5", expectNoReasoning);
+}
+
+// ── Issue #437 L2: Mistral reasoning through agent_loop ─────────────────────
+//
+// Mistral asks for reasoning with a per-model `reasoning_effort`, streams it as
+// ThinkChunks inside a list-typed `delta.content` (a list while thinking, one
+// list holding the closing ThinkChunk and the first TextChunk at the
+// transition, a plain string after that), and asks for the full assistant
+// message back, ThinkChunks included. Mistral publishes no raw stream; this
+// cassette follows its prose and the openapi chunk schema.
+
+const MISTRAL_THINKING_TOOLCALL_SSE =
+    "data: {\"id\":\"m1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"need the \"}]}]},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"m1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"clock first\"}],\"closed\":true},{\"type\":\"text\",\"text\":\"Let me \"}]},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"m1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"check.\"},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"m1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"},\"index\":0}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":9,\"total_tokens\":21}}\n\n" ++
+    "data: [DONE]\n\n";
+
+fn runMistralToolTurn(model: []const u8, declared: ?dialect_mod.Vendor, effort: types.ReasoningEffort, want_effort: []const u8) !void {
+    const a = std.testing.allocator;
+    const cassette = [_][]const u8{ MISTRAL_THINKING_TOOLCALL_SSE, OPENAI_FINAL_SSE };
+    var srv = try harness.MockServer.startCassette(&cassette, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("get_time", "Get current time", &.{}, getTimeExec, null, false);
+    const tool_defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(tool_defs);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "what time is it");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+
+    var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", model, url);
+    defer client.deinit();
+    client.reasoning_effort = effort;
+    if (declared) |v| client.declared_dialect = .{ .route = v };
+    const result = try cc.agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+
+    // Request: the model's own effort word, right after the model name, on both turns.
+    var want_buf: [128]u8 = undefined;
+    const want_prefix = try std.fmt.bufPrint(&want_buf, "\"model\":\"{s}\",\"reasoning_effort\":\"{s}\",", .{ model, want_effort });
+    for (0..2) |i| {
+        const body = srv.requestAt(i).?.body();
+        try std.testing.expect(std.mem.startsWith(u8, body, "{"));
+        try std.testing.expect(std.mem.indexOf(u8, body, want_prefix) != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "reasoning_effort"));
+    }
+
+    // Response: the ThinkChunk text is the turn's thinking; the transition's
+    // TextChunk opens the answer text instead of being lost.
+    const first_reply = for (conv.messages.items) |m| {
+        if (m.role == .assistant) break m;
+    } else return error.TestUnexpectedResult;
+    var thinking: []const u8 = "";
+    var text: []const u8 = "";
+    for (first_reply.blocks) |b| switch (b) {
+        .thinking => |t| thinking = t,
+        .text => |t| text = t,
+        else => {},
+    };
+    try std.testing.expectEqualStrings(SECRET_REASONING, thinking);
+    try std.testing.expectEqualStrings("Let me check.", text);
+
+    // History: the whole assistant message comes back, ThinkChunk first, then
+    // the TextChunk, then the tool call; never as `reasoning_content`.
+    const second = srv.requestAt(1).?.body();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        second,
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"" ++ SECRET_REASONING ++ "\"}]},{\"type\":\"text\",\"text\":\"Let me check.\"}],\"tool_calls\":[{\"id\":\"call_1\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "reasoning_content") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second, SECRET_REASONING));
+}
+
+test "issue #437 L2: Mistral asks for reasoning in each model's vocabulary, parses ThinkChunks and sends them back" {
+    // Inferred from the name: Medium 3.5 takes none / high.
+    try runMistralToolTurn("mistral-medium-3-5", null, .medium, "high");
+    // A route declaring Mistral: Large 4 takes low / medium / high and no none.
+    try runMistralToolTurn("mistral-large-4-0", .mistral, .none, "low");
 }

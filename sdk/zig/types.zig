@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 26;
+pub const ABI_REVISION: u32 = 28;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 26 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 28 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -51,6 +51,16 @@ pub const Status = enum(u32) {
     /// blocking a complete one), or a goal-continuation Run without an
     /// active goal. Nothing changed; the diagnostic names the reason.
     goal_conflict = 30,
+    /// Revision 27 (#441): `rewind_to_user_message` found no message at the
+    /// position. Nothing changed.
+    message_position_out_of_range = 31,
+    /// Revision 27: the message at the position is not one the user wrote (an
+    /// assistant reply, a tool result, or runtime-written text). Nothing
+    /// changed.
+    not_user_message = 32,
+    /// Revision 27: the message lies behind the compact boundary, where only a
+    /// summary stands for the context before it. Nothing changed.
+    message_position_compacted = 33,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -84,6 +94,9 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.image_input_unsupported) => .image_input_unsupported,
             @intFromEnum(Status.image_input_capability_unknown) => .image_input_capability_unknown,
             @intFromEnum(Status.goal_conflict) => .goal_conflict,
+            @intFromEnum(Status.message_position_out_of_range) => .message_position_out_of_range,
+            @intFromEnum(Status.not_user_message) => .not_user_message,
+            @intFromEnum(Status.message_position_compacted) => .message_position_compacted,
             else => error.UnknownStatus,
         };
     }
@@ -119,6 +132,9 @@ pub const STATUS_SKILL_CATALOG_INCOMPLETE: u32 = @intFromEnum(Status.skill_catal
 pub const STATUS_IMAGE_INPUT_UNSUPPORTED: u32 = @intFromEnum(Status.image_input_unsupported);
 pub const STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN: u32 = @intFromEnum(Status.image_input_capability_unknown);
 pub const STATUS_GOAL_CONFLICT: u32 = @intFromEnum(Status.goal_conflict);
+pub const STATUS_MESSAGE_POSITION_OUT_OF_RANGE: u32 = @intFromEnum(Status.message_position_out_of_range);
+pub const STATUS_NOT_USER_MESSAGE: u32 = @intFromEnum(Status.not_user_message);
+pub const STATUS_MESSAGE_POSITION_COMPACTED: u32 = @intFromEnum(Status.message_position_compacted);
 
 pub const ProviderKind = enum(u32) {
     anthropic = 1,
@@ -150,6 +166,8 @@ pub const PERMISSION_DONT_ASK: u32 = 4;
 pub const PERMISSION_FULL_ACCESS: u32 = 5;
 
 pub const SHELL_DISABLED: u32 = 1;
+/// Eager platform probe: macOS Seatbelt / Linux bubblewrap + seccomp.
+/// An unavailable executor refuses Session creation; the ABI layout is unchanged.
 pub const SHELL_SANDBOXED: u32 = 2;
 pub const SHELL_UNRESTRICTED: u32 = 3;
 /// Session-stable execution evidence profile. Journal records are outside
@@ -260,6 +278,8 @@ pub const MAX_SKILL_SOURCES_V1: u64 = 64;
 pub const MAX_SKILL_SOURCE_ID_BYTES_V1: u64 = 128;
 pub const MAX_PROCESS_PLUGIN_SOURCES_V1: u64 = 64;
 pub const MAX_TURNS_V1: u32 = 1000;
+/// Revision 28 (#452): the most `RunOptionsV1.stream_retry_budget` allows.
+pub const MAX_STREAM_RETRY_BUDGET_V1: u32 = 8;
 /// Prompt profile limits (#184): entries, one section's text, and every
 /// entry's text together. Ids are `metacodes:<name>` or `host:<name>` with a
 /// name of at most 64 bytes.
@@ -1017,9 +1037,9 @@ pub const RunInputV1 = extern struct {
 pub const RunOptionsV1 = extern struct {
     struct_size: u32,
     max_turns: u32,
-    /// Optional per-Run Host context for RUN_INPUT_TEXT and
-    /// RUN_INPUT_MULTIMODAL, borrowed for the synchronous call. Null with
-    /// zero count adds nothing.
+    /// Optional per-Run Host context for RUN_INPUT_TEXT,
+    /// RUN_INPUT_MULTIMODAL and RUN_INPUT_SKILL, borrowed for the synchronous
+    /// call. Null with zero count adds nothing.
     context_blocks: ?[*]const ContextBlockV1,
     context_block_count: u64,
     /// Revision 22: one TIME_CONTEXT_* value; zero is TIME_CONTEXT_SYSTEM.
@@ -1027,7 +1047,17 @@ pub const RunOptionsV1 = extern struct {
     /// Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET; zero
     /// under any other code.
     utc_offset_minutes: i32,
-    reserved: [1]u64,
+    /// Revision 28 (#452): how many more times this Run may re-issue a
+    /// request whose accepted stream failed without an answer (a stall, a
+    /// stream that ended before its stop report, a dropped connection) after
+    /// it showed output, 0..MAX_STREAM_RETRY_BUDGET_V1, beyond the one
+    /// re-issue every request has of its own while it started no tool call
+    /// (#461). Each re-issue of an attempt that showed output closes its
+    /// segment `discarded`, withdraws its thinking with `thinking_discarded`
+    /// and is announced by `retry_notice`. Zero grants nothing beyond that
+    /// one.
+    stream_retry_budget: u32,
+    reserved0: u32,
 };
 
 /// Terminal Run summary. All fields are defined on STATUS_OK. On
@@ -1314,6 +1344,19 @@ pub const SessionUpdatePermissionModeFnV1 = *const fn (
     permission_mode_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
+/// Revision 27 (#441): edit-and-rerun's history change, idle-only. Drops the
+/// user message at the 1-based `position` (counted over the full history, the
+/// compacted prefix included, as `describe`'s `conversation.message_count`
+/// counts) and everything after it, so the next Run's input takes its place
+/// after exactly the context before it. Zero is INVALID_ARGUMENT;
+/// MESSAGE_POSITION_OUT_OF_RANGE, NOT_USER_MESSAGE and
+/// MESSAGE_POSITION_COMPACTED refuse a position and change nothing. Only the
+/// Conversation changes: files and other effects of the dropped turns stay.
+pub const SessionRewindToUserMessageFnV1 = *const fn (
+    session: ?*SessionHandle,
+    position: u64,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 /// Runs the canonical default best-effort compact policy. Revision 22 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
@@ -1412,6 +1455,7 @@ pub const SessionControlApiV1 = extern struct {
     export_checkpoint: ?SessionExportCheckpointFnV1,
     set_prompt_profile: ?SessionSetPromptProfileFnV1,
     update_permission_mode: ?SessionUpdatePermissionModeFnV1,
+    rewind_to_user_message: ?SessionRewindToUserMessageFnV1,
 };
 
 pub const SkillApiV1 = extern struct {
@@ -1511,7 +1555,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionRestoreConfigV1));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(RuntimeApiV1));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(SessionApiV1));
-    try std.testing.expectEqual(@as(usize, 80), @sizeOf(SessionControlApiV1));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(SessionControlApiV1));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(SkillApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(GoalApiV1));
@@ -1578,9 +1622,11 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunOptionsV1, "context_block_count"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunOptionsV1, "time_context_code"));
     try std.testing.expectEqual(@as(usize, 28), @offsetOf(RunOptionsV1, "utc_offset_minutes"));
-    try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunOptionsV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunOptionsV1, "stream_retry_budget"));
+    try std.testing.expectEqual(@as(usize, 36), @offsetOf(RunOptionsV1, "reserved0"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(SessionControlApiV1, "set_prompt_profile"));
     try std.testing.expectEqual(@as(usize, 72), @offsetOf(SessionControlApiV1, "update_permission_mode"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(SessionControlApiV1, "rewind_to_user_message"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillPolicyV1, "granted_skill_ids"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(PermissionRuleSetV1, "allow"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(PermissionRuleSetV1, "ask"));
@@ -1644,7 +1690,10 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectEqual(Status.image_input_unsupported, try Status.fromCode(28));
     try std.testing.expectEqual(Status.image_input_capability_unknown, try Status.fromCode(29));
     try std.testing.expectEqual(Status.goal_conflict, try Status.fromCode(30));
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(31));
+    try std.testing.expectEqual(Status.message_position_out_of_range, try Status.fromCode(31));
+    try std.testing.expectEqual(Status.not_user_message, try Status.fromCode(32));
+    try std.testing.expectEqual(Status.message_position_compacted, try Status.fromCode(33));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(34));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
     try std.testing.expectEqual(StopReason.checkpoint_resource_limit, try StopReason.fromCode(8));
@@ -1666,9 +1715,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 26 keeps MCP wire codes stable" {
+test "Revision 28 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 26), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 28), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

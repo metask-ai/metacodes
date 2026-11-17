@@ -6,7 +6,8 @@
 //! 客户端按 max_tokens 放大的正文上限盲等了 30 分钟,run 以 api_error 收口,用户手动 /retry,
 //! 同一请求 18.7 s 完成。修法两层,本文件用真 HTTP 链路 + 真 client + 真 agent loop 逐层证明:
 //!   ⑪ 三个 provider client(anthropic / openai chat / gemini)都学到保活节奏,随后的沉默连接在
-//!     学到的上限附近被判"连接已断",远早于正文进展上限,文案点名 keepalive 也没来;
+//!     学到的上限附近被判"连接已断",远早于正文进展上限,文案点名 keepalive 也没来(读于
+//!     `retry_notice` 之时:请求自带的那次重发(#461)随后成功,会清掉现场);
 //!   ⑫ 反例:从未在流中途发过 keepalive 的端点,沉默连接仍只按正文进展上限判(旧行为不变);
 //!   ⑬ 反例:已学到节奏的端点,keepalive 一直在到的慢流(进展沉默 > 死连接上限)不被误杀;
 //!   ⑭ 事故原形:message_start 之后连接死掉,判死后零可见输出 → 同轮自动重发一次 → end_turn。
@@ -101,16 +102,40 @@ fn clearLastError() void {
     _ = cc.api_last_error.take(&buf);
 }
 
+/// What the TUI would print when a request is re-issued: the stall's
+/// `last_error` record, read when `retry_notice` arrives (a re-issue that then
+/// succeeds clears it).
+const RetryCapture = struct {
+    buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined,
+    detail: ?[]const u8 = null,
+    notices: u32 = 0,
+
+    fn emit(ctx: *anyopaque, _: cc.session_id.SessionId, ev: cc.ui_event.CoreEvent) void {
+        const self: *RetryCapture = @ptrCast(@alignCast(ctx));
+        if (ev != .retry_notice) return;
+        self.notices += 1;
+        self.detail = cc.api_last_error.take(&self.buf);
+    }
+
+    fn poll(_: *anyopaque, _: cc.session_id.SessionId) ?cc.ui_event.UiEvent {
+        return null;
+    }
+};
+
 fn runOneTurn(a: std.mem.Allocator, provider: cc.api_provider.Provider) !cc.agent_loop.RunResult {
+    var capture = RetryCapture{};
+    return runOneTurnCapturing(a, provider, &capture);
+}
+
+fn runOneTurnCapturing(a: std.mem.Allocator, provider: cc.api_provider.Provider, capture: *RetryCapture) !cc.agent_loop.RunResult {
     var conv = cc.conversation.Conversation.init(a);
     defer conv.deinit();
     try conv.appendText(.user, "hi");
     var perm = cc.permission.createContext(.bypass_permissions, a);
     perm.no_interactive_prompt = true;
     const defs: []const cc.json_mod.ToolDefinition = &.{};
-    var render = cc.writer_backend.WriterBackend.initNull();
-    const be = render.backend();
-    // TUI 默认:max_stream_turn_retries = 0(只有零可见输出的失败才有一次兜底重发)。
+    const be = cc.ui_backend.UiBackend{ .ctx = @ptrCast(capture), .emit = RetryCapture.emit, .poll = RetryCapture.poll };
+    // TUI 默认:max_stream_turn_retries = 0(每个请求只有自带的那一次重发)。
     return cc.agent_loop.run(&conv, provider, defs, &perm, .{
         .max_turns = 1,
         .auto_compact_threshold = std.math.maxInt(usize),
@@ -181,17 +206,18 @@ const ArmedThenDead = struct {
 
         // Turn 2: visible text, then the connection dies without closing.
         clearLastError();
+        var capture = RetryCapture{};
         const t0 = cc.util_time.nowMs();
-        const dead = try runOneTurn(a, provider);
+        const dead = try runOneTurnCapturing(a, provider, &capture);
         const elapsed = cc.util_time.nowMs() - t0;
-        // Text had streamed: the TUI default does not re-issue it.
-        try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, dead.stop_reason);
+        // Text had streamed; the request's own re-issue (#461) answers.
+        try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, dead.stop_reason);
+        try std.testing.expectEqual(@as(u32, 1), capture.notices);
         try std.testing.expect(elapsed >= @as(i64, @intCast(TUNING.floor_ms)));
         // Judged by the learned limit, not by the progress limit (20 s).
         try std.testing.expect(elapsed < BOUND_MS);
         try std.testing.expect(elapsed < @as(i64, @intCast(BODY_MS)));
-        var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
-        const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
+        const detail = capture.detail orelse return error.TestExpectedLastError;
         try std.testing.expect(std.mem.startsWith(u8, detail, "连接已断: "));
         try std.testing.expect(std.mem.indexOf(u8, detail, "连 keepalive 也没有") != null);
         // The printed limit is the learned one (floor 1 s, more only if the cadence drifted),
@@ -212,7 +238,8 @@ fn armedThenDead(comptime wire: Wire) !void {
     const url = try srv.urlOwned(a);
     defer a.free(url);
     try withClient(wire, a, url, BODY_MS, ArmedThenDead.run);
-    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    // The learning turn, the dead attempt, its re-issue.
+    try std.testing.expectEqual(@as(usize, 3), srv.requestCount());
 }
 
 test "L2 dead connection ⑪ anthropic: learned keepalive cadence → a silent connection is judged dead at the learned limit, not the 20 s progress limit" {
@@ -236,15 +263,17 @@ const NeverPinged = struct {
         try std.testing.expectEqual(@as(u32, 0), keepaliveSamples(registry));
 
         clearLastError();
+        var capture = RetryCapture{};
         const t0 = cc.util_time.nowMs();
-        const stalled = try runOneTurn(a, provider);
+        const stalled = try runOneTurnCapturing(a, provider, &capture);
         const elapsed = cc.util_time.nowMs() - t0;
-        try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, stalled.stop_reason);
+        // The request's own re-issue (#461) answers after the stall.
+        try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, stalled.stop_reason);
+        try std.testing.expectEqual(@as(u32, 1), capture.notices);
         // Total silence, but no evidence: only the progress limit may end it.
         try std.testing.expect(elapsed >= @as(i64, @intCast(SHORT_BODY_MS)));
         try std.testing.expect(elapsed < BOUND_MS);
-        var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
-        const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
+        const detail = capture.detail orelse return error.TestExpectedLastError;
         try std.testing.expect(std.mem.startsWith(u8, detail, "正文空闲超时: "));
         try std.testing.expect(std.mem.indexOf(u8, detail, "内无任何字节(上限 2500 ms)") != null);
     }
@@ -258,7 +287,7 @@ fn neverPinged(comptime wire: Wire) !void {
     const url = try srv.urlOwned(a);
     defer a.free(url);
     try withClient(wire, a, url, SHORT_BODY_MS, NeverPinged.run);
-    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 3), srv.requestCount());
 }
 
 test "L2 dead connection ⑫ anthropic: no mid-stream keepalive ever seen → a silent connection waits for the progress limit" {

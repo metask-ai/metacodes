@@ -26,7 +26,8 @@ zig build && bash tests/e2e/daemon_serve_e2e.sh && bash tests/e2e/daemon_serve_m
 `serve` / `serve --sessions 2 --uds` 对 loopback mock provider(`daemon_mock_provider.py`)跑:
 `GET /health`、bearer token、`--web-bind ::1`、非回环无鉴权拒绝启动、按 session 路由、UDS、
 动态 session 生命周期(`/sessions` create/list/resume/destroy、`"resume":true` 从 transcript
-恢复、`--sessions 0`、`--max-sessions` 的 429,#254)、SIGINT 关停。端口全由内核分配,HOME 与
+恢复、`--sessions 0`、`--max-sessions` 的 429,#254)、journal 逐行是 wire v1 且 Run 的行带
+`run_id`(SSE 与 UDS attach 各读一遍,#444)、SIGINT 关停。端口全由内核分配,HOME 与
 state root 临时,TinyKG autostart 关,共用 `daemon_e2e_lib.sh`。
 
 前端能力交换(doc/WIRE_PROTOCOL.md §2)另有一个跨进程 e2e,纯 Python + HTTP,所以每个平台的
@@ -43,6 +44,16 @@ mock provider 见到 `CAPS_ASK` / `CAPS_WRITE:<path>` 时让模型调 AskUserQue
 拒绝、文件不写,模型读到的是"未询问即拒绝、前端渲染不了权限请求"而不是"user declined";两者都声明后
 同样的请求被通告、作答、文件写入;用户真的拒绝时仍是 "user declined 'Write' via prompt"。
 `CAPS_E2E_DUMP=<file>` 把最终 journal 落盘供复核。
+
+plain headless 的失败说明(#417)同样纯 Python,mock provider 就在脚本进程内:
+
+```bash
+zig build && python3 tests/e2e/headless_stop_notice_e2e.py
+```
+
+断言真实的退出码、stdout、stderr:四种 wire 上每次响应都以 max-token 终止,带可见文本和不带各跑一遍,
+`-p` 退出 1、stdout 只有已有文本、stderr 一条耗尽说明,`--json` 的 stderr 仍为空;`--resume-response`
+走同一断言;SIGINT / SIGTERM 中断同样有说明(POSIX);正常收尾与 HTTP 402 不多这一行。
 
 ## 它怎么工作
 

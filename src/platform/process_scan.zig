@@ -412,14 +412,17 @@ test "listUnder finds a child running from a prefix, with its parent, and termin
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A long-running system program, scanned for under its own directory.
-    // (A copy in a temporary prefix would not do: macOS kills a copied
-    // platform binary on exec.)
+    // A long-running system program, scanned for under the directory its
+    // executable really lies in. That need not be the directory it is named
+    // in: where coreutils are links to one multi-call binary (uutils, the
+    // default on Ubuntu 26.04), `/bin/sleep` runs from
+    // `/usr/lib/cargo/bin/coreutils`. It is still spawned as `/bin/sleep`,
+    // the name that makes that binary act as sleep. (A copy in a temporary
+    // prefix would not do: macOS kills a copied platform binary on exec.)
     const program: []const u8 = if (is_windows) "C:\\Windows\\System32\\PING.EXE" else "/bin/sleep";
-    var dir = try std.Io.Dir.cwd().openDir(testing.io, std.fs.path.dirname(program).?, .{});
-    defer dir.close(testing.io);
-    var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const prefix = prefix_buf[0..try dir.realPath(testing.io, &prefix_buf)];
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = real_buf[0..try std.Io.Dir.cwd().realPathFile(testing.io, program, &real_buf)];
+    const prefix = std.fs.path.dirname(real).?;
 
     const argv: []const []const u8 = if (is_windows) &.{ program, "-n", "60", "127.0.0.1" } else &.{ program, "60" };
     var child = try std.process.spawn(testing.io, .{

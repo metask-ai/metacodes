@@ -681,8 +681,8 @@ test "loginInteractive fails closed with typed errors and persists nothing" {
     try expectNoLogin(a, "openai");
 }
 
-/// The picker's credential stage runs the login through `LoginWorker` (#67);
-/// spin until the worker's transcript satisfies `predicate` or the bound runs out.
+/// `/login` runs the login through `LoginWorker` (#67); spin until the
+/// worker's transcript satisfies `predicate` or the bound runs out.
 fn awaitWorker(worker: *cc.api_login_worker.LoginWorker, comptime predicate: fn (*cc.api_login_worker.LoginWorker) bool) bool {
     var spins: usize = 0;
     while (spins < 1_000) : (spins += 1) {
@@ -701,7 +701,7 @@ fn workerSettled(worker: *cc.api_login_worker.LoginWorker) bool {
     return worker.isSettled();
 }
 
-test "L2 picker credential stage: the login worker lands a loopback grant as a durable login, and a cancelled one stores nothing" {
+test "L2 login worker: a loopback grant lands as a durable login, and a cancelled one stores nothing" {
     const a = std.testing.allocator;
 
     var token_server = try harness.MockServer.start(
@@ -733,14 +733,14 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
     var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
 
-    // What picker_host does on MissingCredentials: prepare (typed refusals
-    // happen here), then run on the worker. No browser; kernel-chosen port.
+    // What `/login <provider>` does: prepare (typed refusals happen here),
+    // then run on the worker. No browser; kernel-chosen port.
     const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "picker-client", .state_root = "" });
     var worker = cc.api_login_worker.LoginWorker.init(a, io_runtime.io(), prepared);
     try worker.start();
     defer worker.join();
 
-    // The transcript the picker draws is what the user acts on; the test acts
+    // The transcript `/login` draws is what the user acts on; the test acts
     // as the browser that follows it.
     if (!awaitWorker(&worker, workerNamesState)) return error.WorkerNeverPublishedInstructions;
     var transcript: [cc.api_login_worker.TRANSCRIPT_CAPACITY]u8 = undefined;

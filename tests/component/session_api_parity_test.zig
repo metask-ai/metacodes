@@ -377,3 +377,120 @@ test "L2 goal (issue #277): every CLI Run charges the App's goal and goal.json f
     try loaded.loadFromDir(app.sessionDir() orelse return error.NoSessionDir);
     try std.testing.expectEqual(charged, loaded.current.?.tokens_used);
 }
+
+/// The text of the message at 0-based `index` of `conversation`.
+fn messageText(conversation: *const cc.conversation.Conversation, index: usize) []const u8 {
+    return conversation.messages.items[index].blocks[0].text;
+}
+
+test "L2 /edit (issue #432): web/daemon/TUI edit user message n, rerun from it, and the transcript restores the edited history" {
+    const a = std.testing.allocator;
+    var fx: AppFixture = undefined;
+    try fx.setup();
+    defer fx.deinit();
+    const app = fx.app;
+    var journal = cc.event_journal.EventJournal.init(a);
+    defer journal.deinit();
+    var wb = cc.web_backend.WebBackend.init(a, &journal);
+    defer wb.deinit();
+
+    try app.conversation.appendText(.user, "q1");
+    try app.conversation.appendText(.assistant, "a1");
+    try app.conversation.appendText(.user, "q2");
+    try app.conversation.appendText(.assistant, "a2");
+    try app.conversation.appendText(.user, "q3");
+    try app.conversation.appendText(.assistant, "a3");
+    try app.conversation.appendHostText("[runtime notice]");
+    app.persistTranscript();
+    try app.read_state.record("/tmp/read-in-a-dropped-turn", 1, 1);
+
+    // Refusals: each names its reason, plans no run and changes nothing.
+    const refused = [_]struct { line: []const u8, reason: []const u8 }{
+        .{ .line = "/edit", .reason = "usage: /edit" },
+        .{ .line = "/edit 3", .reason = "usage: /edit" },
+        .{ .line = "/edit three new", .reason = "(InvalidPosition)" },
+        .{ .line = "/edit 0 new", .reason = "(PositionOutOfRange)" },
+        .{ .line = "/edit 99 new", .reason = "(PositionOutOfRange)" },
+        .{ .line = "/edit 2 new", .reason = "(NotUserMessage)" },
+        .{ .line = "/edit 7 new", .reason = "(NotUserMessage)" },
+    };
+    for (refused) |case| {
+        var batch: cc.web_session.CommandBatch = .{};
+        defer batch.deinit(a);
+        try std.testing.expect(cc.web_session.execCommand(app, &wb, a, case.line, &batch) == null);
+        try std.testing.expect(!batch.run_planned);
+        var buf: [256]u8 = undefined;
+        var svc = session_service.SessionService.init(app);
+        const d = session_service.execLine(&svc, app.allocator, case.line);
+        try std.testing.expect(d.run == null);
+        try std.testing.expect(std.mem.indexOf(u8, d.outcome.render(&buf), case.reason) != null);
+        try std.testing.expectEqual(@as(usize, 7), app.conversation.len());
+    }
+
+    // The TUI's `/edit` alone lists what can be edited, by the number it takes.
+    var listing: std.Io.Writer.Allocating = .init(a);
+    defer listing.deinit();
+    try session_service.writeEditableMessages(&listing.writer, &app.conversation);
+    try std.testing.expect(std.mem.indexOf(u8, listing.written(), "     3  q2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listing.written(), "runtime notice") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listing.written(), "a1") == null);
+
+    // The web/daemon entry (POST /command) edits message 3 and plans the run.
+    var batch: cc.web_session.CommandBatch = .{};
+    defer batch.deinit(a);
+    const plan = cc.web_session.execCommand(app, &wb, a, "/edit 3   q2, edited  ", &batch) orelse return error.NoRunPlanned;
+    try std.testing.expectEqual(session_service.RunPlan.Kind.edited_prompt, plan.kind);
+    try std.testing.expectEqual(@as(usize, 3), app.conversation.len());
+    try std.testing.expectEqualStrings("q1", messageText(&app.conversation, 0));
+    try std.testing.expectEqualStrings("a1", messageText(&app.conversation, 1));
+    try std.testing.expectEqualStrings("q2, edited", messageText(&app.conversation, 2));
+    try std.testing.expect(app.read_state.get("/tmp/read-in-a-dropped-turn") == null);
+    {
+        // The Run begins once the batch has run: its user_message (wire v1, #444)
+        // follows the command_result and carries the run_id and `replaces`.
+        cc.web_session.beginPlannedRun(&wb, &batch);
+        cc.web_session.announceRunFailed(&wb, "NotRunHere");
+        const lines = (try journal.waitSince(a, 0, 1)) orelse return error.NoJournal;
+        defer {
+            for (lines) |line| a.free(line);
+            a.free(lines);
+        }
+        const echo = "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"q2, edited\",\"replaces\":3}}";
+        const queued = "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"edit\",\"ok\":true,\"error_name\":null,\"message\":\"queued for run\"}}";
+        var at_echo: ?usize = null;
+        var at_queued: ?usize = null;
+        for (lines, 0..) |line, index| {
+            if (std.mem.eql(u8, line, echo)) at_echo = index;
+            if (std.mem.eql(u8, line, queued)) at_queued = index;
+        }
+        try std.testing.expect(at_queued.? < at_echo.?);
+    }
+
+    // The transcript on disk follows the edit (a full rewrite), so a restart
+    // restores messages 1-2 + the edited message, never the dropped turns.
+    app.persistTranscript();
+    var restored = cc.conversation.Conversation.init(a);
+    defer restored.deinit();
+    try cc.transcript.loadTranscript(&restored, app.sessionDir() orelse return error.NoSessionDir, a);
+    try std.testing.expectEqual(@as(usize, 3), restored.len());
+    try std.testing.expectEqualStrings("q1", messageText(&restored, 0));
+    try std.testing.expectEqualStrings("q2, edited", messageText(&restored, 2));
+
+    // A position the compact summary stands for cannot be rerun.
+    try app.conversation.appendText(.assistant, "a2'");
+    try app.conversation.restoreCompactState(2, "summary of q1/a1");
+    var svc = session_service.SessionService.init(app);
+    var buf: [256]u8 = undefined;
+    const compacted = session_service.execLine(&svc, app.allocator, "/edit 1 q1 again");
+    try std.testing.expect(compacted.run == null);
+    try std.testing.expect(std.mem.indexOf(u8, compacted.outcome.render(&buf), "(PositionCompacted)") != null);
+    try std.testing.expectEqual(@as(usize, 4), app.conversation.len());
+    listing.clearRetainingCapacity();
+    try session_service.writeEditableMessages(&listing.writer, &app.conversation);
+    try std.testing.expect(std.mem.indexOf(u8, listing.written(), "     1  q1  (compacted; cannot be edited)\n") != null);
+    // The first message after the boundary still can: the summary is the
+    // context before it, as in every request since the compaction.
+    try std.testing.expect(session_service.execLine(&svc, app.allocator, "/edit 3 q2 once more").run != null);
+    try std.testing.expectEqual(@as(usize, 3), app.conversation.len());
+    try std.testing.expectEqualStrings("q2 once more", messageText(&app.conversation, 2));
+}

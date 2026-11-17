@@ -119,6 +119,16 @@ fn pendingRequestId(journal: *EventJournal) !u64 {
     return id orelse error.NoRequest;
 }
 
+/// Whether provider request `index` carries `text` (the model read it).
+fn modelRead(server: *harness.MockServer, index: usize, text: []const u8) !bool {
+    const request = server.requestAt(index) orelse return error.NoRequestCaptured;
+    return std.mem.indexOf(u8, request.body(), text) != null;
+}
+
+const TIMED_OUT_TEXT = "'Write' did not run: nobody answered its permission request in time. The user did not decline it; you may offer to ask again.";
+const CANCELLED_TEXT = "'Write' did not run: an interrupt or a close cancelled its permission request before anyone answered. The user did not decline it; you may offer to ask again.";
+const UNREADABLE_TEXT = "'Write' was denied: an answer to its permission request arrived but could not be read. This is not the user's decision.";
+
 fn baseConfig(url: []const u8, workspace: []const u8, home: []const u8, tools: []const []const u8) cc.agent_session.SessionConfig {
     return .{
         .provider_kind = .anthropic,
@@ -184,6 +194,117 @@ test "L2 SessionHost runs queued work in order, journals wire lines and resumes 
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "remember the word pelican") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "pelican noted") != null);
+}
+
+test "L2 SessionHost edit-and-rerun (issue #432): the Run sees messages before the position + the edited text, the resumed Session too, files stay" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    const path = try std.fmt.allocPrint(a, "{s}/dropped.txt", .{workspace});
+    defer a.free(path);
+
+    const noted = try textSse(a, "pelican noted");
+    defer a.free(noted);
+    const write = try writeToolSse(a, path);
+    defer a.free(write);
+    const wrote = try textSse(a, "file written");
+    defer a.free(wrote);
+    const third = try textSse(a, "third answer");
+    defer a.free(third);
+    const edited = try textSse(a, "edited answer");
+    defer a.free(edited);
+    const resumed_reply = try textSse(a, "still the pelican");
+    defer a.free(resumed_reply);
+    const bodies = [_][]const u8{ noted, write, wrote, third, edited, resumed_reply };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{"Write"});
+    config.permission_mode = .accept_edits;
+
+    const hosted = try host.open(.{ .config = config });
+    const id = hosted.id;
+    // Messages: 1 user, 2 reply, 3 user, 4 tool_use, 5 tool_result,
+    // 6 reply, 7 user, 8 reply.
+    try hosted.submit(.{ .text = "remember the word pelican" });
+    try hosted.submit(.{ .text = "write the scratch file" });
+    try hosted.submit(.{ .text = "the third prompt" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 3);
+    try std.testing.expect(try exists(workspace, "dropped.txt"));
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 8), snapshot.messages);
+    }
+
+    // Positions that cannot be rerun fail the Run by name and change nothing.
+    const MessagePosition = cc.conversation.MessagePosition;
+    try hosted.submit(.{ .text = "not a reply", .replaces = try MessagePosition.fromOrdinal(2) });
+    try hosted.submit(.{ .text = "not a tool result", .replaces = try MessagePosition.fromOrdinal(5) });
+    try hosted.submit(.{ .text = "past the end", .replaces = try MessagePosition.fromOrdinal(9) });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 6);
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "\"error_name\":\"NotUserMessage\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"error_name\":\"PositionOutOfRange\""));
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 8), snapshot.messages);
+    }
+
+    // Edit message 3 and rerun from it.
+    try hosted.submit(.{ .text = "do not write anything", .trace_id = "edit", .replaces = try MessagePosition.fromOrdinal(3) });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\",\"data\":{\"run_id\":7,\"trace_id\":\"edit\",\"stop_reason\":\"end_turn\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"user_message\",\"data\":{\"run_id\":7,\"trace_id\":\"edit\",\"text\":\"do not write anything\",\"replaces\":3}}"));
+    {
+        const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+        try std.testing.expect(std.mem.indexOf(u8, body, "remember the word pelican") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "pelican noted") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "do not write anything") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "write the scratch file") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "tu_w") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "file written") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "the third prompt") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "third answer") == null);
+    }
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 4), snapshot.messages);
+    }
+    // Context only: what the dropped turns did to the workspace stays.
+    try std.testing.expect(try exists(workspace, "dropped.txt"));
+
+    // A restart restores the edited history, never the dropped one.
+    host.release(hosted);
+    try host.close(id);
+    const resumed = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+    defer host.release(resumed);
+    {
+        var snapshot = try resumed.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 4), snapshot.messages);
+    }
+    try resumed.submit(.{ .text = "which word was it" });
+    try waitFor(&resumed.journal, "\"type\":\"run_done\"", 1);
+    const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "remember the word pelican") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "do not write anything") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "edited answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "write the scratch file") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "file written") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "the third prompt") == null);
+    try std.testing.expect(try exists(workspace, "dropped.txt"));
 }
 
 test "L2 SessionHost opening an id fresh replaces its transcript instead of resuming it" {
@@ -344,6 +465,14 @@ test "L2 SessionHost interrupt releases a pending prompt and stops the Run" {
     try std.testing.expect(!try exists(workspace, "never.txt"));
     try std.testing.expectError(error.NoSuchRequest, hosted.respond(request_id, "{\"choice\":\"allow_once\"}"));
     try std.testing.expectEqual(cc.session_host.InterruptOutcome.no_run, hosted.interrupt());
+
+    // #463: the journal says cancelled and so does the transcript. The next
+    // Run's request carries the denied call as cancelled, not declined.
+    try hosted.submit(.{ .text = "and now?" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expect(try modelRead(server, 1, CANCELLED_TEXT));
+    try std.testing.expect(try modelRead(server, 1, "\\\"recoverable\\\":true"));
+    try std.testing.expect(!try modelRead(server, 1, "user declined"));
 }
 
 /// Watches the window between an interrupt's (or close's) decision to cancel
@@ -499,6 +628,9 @@ test "L2 SessionHost an unreadable answer denies the prompt and closes it as mal
     try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"malformed\""));
     try std.testing.expect(!try exists(workspace, "garbled.txt"));
+    // #463: journaled malformed, read by the model as unreadable.
+    try std.testing.expect(try modelRead(server, 1, UNREADABLE_TEXT));
+    try std.testing.expect(!try modelRead(server, 1, "user declined"));
 }
 
 const FatalTool = struct {
@@ -678,6 +810,11 @@ test "L2 SessionHost options: UI timeout, queue bound, turn limit, no transcript
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"cancelled\""));
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
     try std.testing.expect(!try exists(workspace, "unanswered.txt"));
+    // #463: the model reads that nobody answered in time (recoverable), not
+    // that the user declined.
+    try std.testing.expect(try modelRead(server, 1, TIMED_OUT_TEXT));
+    try std.testing.expect(try modelRead(server, 1, "\\\"recoverable\\\":true"));
+    try std.testing.expect(!try modelRead(server, 1, "user declined"));
 
     // One queued item at most; the driver holds Run 2 while 3 waits.
     var bounded = SessionHost.init(a, runtime, .{ .max_queued = 1, .max_turns = 1, .transcripts = false });
@@ -732,4 +869,1751 @@ test "L2 #408 a hosted Run's run_done carries its model failure, and the next Ru
 
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"data\":{\"run_id\":1,\"trace_id\":null,\"stop_reason\":\"api_error\",\"error_name\":null,\"model_error\":{\"category\":\"payment_required\",\"code\":\"insufficient_balance\",\"type\":null,\"message\":\"Top up\",\"http_status\":402,\"request_id\":\"req-hosted-1\",\"retry\":\"not_retryable\",\"retry_after_ms\":null,\"attempts\":1,\"truncated\":false}}"));
     try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"data\":{\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\",\"error_name\":null,\"model_error\":null}"));
+}
+
+fn toolSse(comptime id: []const u8, comptime name: []const u8, comptime input_json: []const u8) []const u8 {
+    return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"" ++ id ++ "\",\"name\":\"" ++ name ++ "\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"" ++ input_json ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+}
+
+test "L2 #445 SessionHost: a hosted team lead's next Run is its teammate's reply, as on the bundled daemon" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const formed = try textSse(a, "formed");
+    defer a.free(formed);
+    const ack = try textSse(a, "ack");
+    defer a.free(ack);
+    // Run 1: TeamCreate crew, then answer. Run 2 is the teammate's reply.
+    const lead_bodies = [_][]const u8{ toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"), formed, ack };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    const member_bodies = [_][]const u8{
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    var lead_config = baseConfig(lead_url, root, root, &.{ "TeamCreate", "SendMessage" });
+    lead_config.permission_mode = .bypass_permissions;
+    lead_config.workspace = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    lead_config.team = .{ .role = .lead, .team_name = "" };
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 1);
+    // An empty inbox starts nothing, however often it is read.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"type\":\"user_message\""));
+    try std.testing.expectEqual(@as(usize, 2), lead_srv.requestCount());
+
+    // The member, opened on the same host, reports to the lead.
+    var member_config = baseConfig(member_url, root, root, &.{"SendMessage"});
+    member_config.permission_mode = .bypass_permissions;
+    member_config.workspace = lead_config.workspace;
+    const lease = cc.session_id.gen();
+    member_config.team = .{
+        .role = .member,
+        .team_name = "crew",
+        .member_name = "solver",
+        .lead_session_id = lead.id.asSlice(),
+        .member_lease = lease.asSlice(),
+    };
+    const member = try host.open(.{ .config = member_config });
+    defer host.release(member);
+    try member.submit(.{ .text = "work and report" });
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+
+    // Nobody submits to the lead: its driver takes the reply as Run 2, and
+    // the provider request carries it.
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":2"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "done: 42"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"run_id\":2,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+    try std.testing.expectEqual(@as(usize, 3), lead_srv.requestCount());
+    const request = lead_srv.requestAt(2).?;
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "done: 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "solver") != null);
+
+    // The mail was taken once: the lead does not run it again.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&lead.journal, "\"type\":\"user_message\""));
+}
+
+/// The Host side of `Options.teammates` in the test below: every member gets
+/// the member cassette and `SendMessage`, and each spawn it is asked for is
+/// recorded.
+const MemberFactory = struct {
+    url: []const u8,
+    workspace: cc.agent_session.WorkspaceConfig,
+    calls: usize = 0,
+    lead: ?cc.session_id.SessionId = null,
+    name_buf: [64]u8 = undefined,
+    name_len: usize = 0,
+    team_buf: [64]u8 = undefined,
+    team_len: usize = 0,
+
+    fn factory(self: *MemberFactory) cc.session_host.TeammateFactory {
+        return .{ .ctx = self, .configure = configure };
+    }
+
+    fn configure(ctx: *anyopaque, arena: std.mem.Allocator, spawn: cc.session_host.TeammateSpawn) anyerror!cc.agent_session.SessionConfig {
+        const self: *MemberFactory = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.lead = spawn.lead;
+        @memcpy(self.name_buf[0..spawn.name.len], spawn.name);
+        self.name_len = spawn.name.len;
+        @memcpy(self.team_buf[0..spawn.team_name.len], spawn.team_name);
+        self.team_len = spawn.team_name.len;
+        const tools = try arena.dupe([]const u8, &.{"SendMessage"});
+        var config = baseConfig(self.url, self.workspace.root, self.workspace.root, tools);
+        config.permission_mode = .bypass_permissions;
+        config.workspace = self.workspace;
+        return config;
+    }
+};
+
+test "L2 #445 SessionHost: a hosted lead's SpawnTeammate opens and runs the member on the same host, as the daemon's App starts its teammates" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const ack = try textSse(a, "ack");
+    defer a.free(ack);
+    // Run 1: TeamCreate crew, SpawnTeammate solver, then answer. Run 2 is the
+    // member's reply.
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        ack,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    const member_bodies = [_][]const u8{
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var members = MemberFactory{ .url = member_url, .workspace = workspace };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = members.factory() });
+    defer host.deinit();
+    var lead_config = baseConfig(lead_url, root, root, &.{ "TeamCreate", "SpawnTeammate", "SendMessage" });
+    lead_config.permission_mode = .bypass_permissions;
+    lead_config.workspace = workspace;
+    lead_config.team = .{ .role = .lead, .team_name = "" };
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    // One submission to the lead and nothing else: its spawn request opens
+    // the member, whose Run reaches its own provider with the lead's prompt,
+    // and whose reply becomes the lead's Run 2.
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+
+    try std.testing.expectEqual(@as(usize, 1), members.calls);
+    try std.testing.expectEqualStrings("solver", members.name_buf[0..members.name_len]);
+    try std.testing.expectEqualStrings("crew", members.team_buf[0..members.team_len]);
+    try std.testing.expectEqualStrings(lead.id.asSlice(), members.lead.?.asSlice());
+
+    try std.testing.expect(member_srv.requestCount() >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, member_srv.requestAt(0).?.body(), "fix the parser") != null);
+
+    const ids = try host.list(a);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    const member_id = if (std.mem.eql(u8, ids[0].asSlice(), lead.id.asSlice())) ids[1] else ids[0];
+    const member = host.acquire(member_id).?;
+    defer host.release(member);
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 2), member_srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&member.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"fix the parser\""));
+
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":2"));
+    try std.testing.expectEqual(@as(usize, 4), lead_srv.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(3).?.body(), "done: 42") != null);
+
+    // The request was fulfilled once: no second member, no second spawn.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(2 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), members.calls);
+
+    // Closing the lead closes the member it opened.
+    try host.close(lead.id);
+    try std.testing.expect(host.acquire(member_id) == null);
+    try std.testing.expect(member.journal.isClosed());
+}
+
+/// The lead's half of the spawn tests below: Run 1 creates team `crew` and
+/// delegates to `solver`.
+fn spawnLeadConfig(url: []const u8, workspace: cc.agent_session.WorkspaceConfig) cc.agent_session.SessionConfig {
+    var config = baseConfig(url, workspace.root, workspace.root, &.{ "TeamCreate", "SpawnTeammate", "SendMessage" });
+    config.permission_mode = .bypass_permissions;
+    config.workspace = workspace;
+    config.team = .{ .role = .lead, .team_name = "" };
+    return config;
+}
+
+/// The id on `host` that is not `lead`'s; `host` holds exactly two. The
+/// lead's driver opens the member after the lead's Run is journaled as done,
+/// so a caller that saw that `run_done` waits here for the member to open.
+fn memberId(host: *SessionHost, lead: *HostedSession) !cc.session_id.SessionId {
+    var waited: u64 = 0;
+    while (true) : (waited += 20) {
+        const ids = try host.list(std.testing.allocator);
+        defer std.testing.allocator.free(ids);
+        if (ids.len >= 2 or waited >= 10_000) {
+            try std.testing.expectEqual(@as(usize, 2), ids.len);
+            return if (std.mem.eql(u8, ids[0].asSlice(), lead.id.asSlice())) ids[1] else ids[0];
+        }
+        std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    }
+}
+
+test "L2 #445 SessionHost InheritLead: the member runs with its lead's current model and permission mode, as an App teammate inherits them" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const ack = try textSse(a, "ack");
+    defer a.free(ack);
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        ack,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    const member_bodies = [_][]const u8{
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    const lead_config = spawnLeadConfig(lead_url, workspace);
+    // The Host's base for its leads, here on the member's cassette. Its
+    // model and permission mode are what the lead no longer runs with.
+    var base = lead_config;
+    base.base_url = member_url;
+    base.model = "base-model";
+    base.permission_mode = .default;
+    var inherit = cc.session_host.InheritLead{ .base = base };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = inherit.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    // The lead switches model before it delegates; the member follows it.
+    try lead.command(.{ .set_model = "lead-live-model" });
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(0).?.body(), "\"model\":\"lead-live-model\"") != null);
+
+    const member = host.acquire(try memberId(&host, lead)).?;
+    defer host.release(member);
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 2), member_srv.requestCount());
+    const first = member_srv.requestAt(0).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, first, "fix the parser") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"model\":\"lead-live-model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "base-model") == null);
+    var snap = try member.snapshot(a);
+    defer snap.deinit(a);
+    try std.testing.expectEqualStrings("lead-live-model", snap.model);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.bypass_permissions, snap.permission_mode);
+
+    // The member's reply reached the lead under the inherited configuration.
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(3).?.body(), "done: 42") != null);
+}
+
+test "L2 #445 SessionHost InheritLead: a rule or directory the lead gains after the member opened decides the member's next tool call, as an App teammate reads its lead's permission context" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+    var extra_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const extra = try subdir(&tmp, "extra", &extra_buf);
+    var outside_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const outside_path = try std.fmt.bufPrint(&outside_path_buf, "{s}/gained-dir.txt", .{extra});
+    var inside_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const inside_path = try std.fmt.bufPrint(&inside_path_buf, "{s}/gained-rule.txt", .{root});
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"stand by\\\"}"),
+        delegated,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    // Member Run 1 answers; Run 2 writes into the directory the lead gains;
+    // Run 3 writes inside the workspace after the lead gains a deny rule.
+    const ready = try textSse(a, "ready");
+    defer a.free(ready);
+    const write_outside = try writeToolSse(a, outside_path);
+    defer a.free(write_outside);
+    const write_inside = try writeToolSse(a, inside_path);
+    defer a.free(write_inside);
+    const wrote = try textSse(a, "wrote");
+    defer a.free(wrote);
+    const member_bodies = [_][]const u8{ ready, write_outside, wrote, write_inside, wrote };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    // The lead runs under accept_edits with its team tools allowed by rule;
+    // the member inherits the mode at spawn, and its permissions live.
+    const team_tools = [_][]const u8{ "TeamCreate", "SpawnTeammate", "SendMessage" };
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var lead_config = spawnLeadConfig(lead_url, workspace);
+    lead_config.allowed_tools = &.{ "TeamCreate", "SpawnTeammate", "SendMessage", "Write" };
+    lead_config.permission_mode = .accept_edits;
+    lead_config.permission_rules = .{ .allow = &team_tools };
+    var base = lead_config;
+    base.base_url = member_url;
+    var inherit = cc.session_host.InheritLead{ .base = base };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    // Without the lead's directory the member's Write would ask; the prompt
+    // then closes unanswered instead of holding the test.
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = inherit.factory(), .ui_request_timeout_ms = 1_000 });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 1);
+    const member = host.acquire(try memberId(&host, lead)).?;
+    defer host.release(member);
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+    var snap = try member.snapshot(a);
+    defer snap.deinit(a);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.accept_edits, snap.permission_mode);
+
+    // The lead gains a directory after the member opened: the member's next
+    // Write there is inside its working directories, so accept_edits takes it.
+    try lead.command(.{ .set_additional_directories = &.{extra} });
+    try waitFor(&lead.journal, "\"type\":\"command_result\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"command\":\"set_additional_directories\",\"ok\":true"));
+    try member.submit(.{ .text = "write into the new directory" });
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&member.journal, "\"type\":\"ui_request\""));
+    try std.testing.expect(try exists(extra, "gained-dir.txt"));
+
+    // The lead gains a deny rule: the member's next Write, inside the
+    // workspace and so allowed until now, is denied.
+    try lead.command(.{ .update_permission_rules = .{ .allow = &team_tools, .deny = &.{"Write"} } });
+    try waitFor(&lead.journal, "\"type\":\"command_result\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"command\":\"update_permission_rules\",\"ok\":true"));
+    try member.submit(.{ .text = "write inside the workspace" });
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 3);
+    try std.testing.expect(!try exists(root, "gained-rule.txt"));
+    try std.testing.expectEqual(@as(usize, 5), member_srv.requestCount());
+
+    // The member's own rules and directories would never be read: refused.
+    try member.command(.{ .update_permission_rules = .{ .allow = &.{"Write"} } });
+    try member.command(.{ .set_additional_directories = &.{} });
+    try waitFor(&member.journal, "\"type\":\"command_result\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&member.journal, "{\"command\":\"update_permission_rules\",\"ok\":false,\"error_name\":\"PermissionsInherited\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&member.journal, "{\"command\":\"set_additional_directories\",\"ok\":false,\"error_name\":\"PermissionsInherited\""));
+
+    // Closing the lead closes the member first; its AgentSession outlives it.
+    try host.close(lead.id);
+    try std.testing.expect(member.journal.isClosed());
+}
+
+test "L2 #445 SessionHost: a lead re-spawns a name whose member the Host closed, under a fresh lease, and hears from the new member" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const ack = try textSse(a, "ack");
+    defer a.free(ack);
+    const redelegated = try textSse(a, "redelegated");
+    defer a.free(redelegated);
+    const ack2 = try textSse(a, "ack2");
+    defer a.free(ack2);
+    // Run 1 delegates "task one", Run 2 is its reply, Run 3 delegates
+    // "task two" to the same name, Run 4 is the new member's reply.
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"task one\\\"}"),
+        delegated,
+        ack,
+        toolSse("t3", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"task two\\\"}"),
+        redelegated,
+        ack2,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    const member_bodies = [_][]const u8{
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 1\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+        toolSse("s2", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 2\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var members = MemberFactory{ .url = member_url, .workspace = workspace };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = members.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = spawnLeadConfig(lead_url, workspace) });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+    const first_id = try memberId(&host, lead);
+    const first = host.acquire(first_id).?;
+    try waitFor(&first.journal, "\"type\":\"run_done\"", 1);
+    host.release(first);
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(3).?.body(), "done: 1") != null);
+
+    // The Host closes the member; the lead later delegates to the name again.
+    try host.close(first_id);
+    try lead.submit(.{ .text = "delegate again" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 4);
+
+    try std.testing.expectEqual(@as(usize, 2), members.calls);
+    const second_id = try memberId(&host, lead);
+    try std.testing.expect(!std.mem.eql(u8, first_id.asSlice(), second_id.asSlice()));
+    const second = host.acquire(second_id).?;
+    defer host.release(second);
+    try waitFor(&second.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&second.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":1,\"trace_id\":null,\"text\":\"task two\""));
+    try std.testing.expect(std.mem.indexOf(u8, member_srv.requestAt(2).?.body(), "task two") != null);
+
+    // The new member's reply is the lead's Run 4; nothing failed.
+    try std.testing.expectEqual(@as(usize, 7), lead_srv.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, lead_srv.requestAt(6).?.body(), "done: 2") != null);
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&lead.journal, "teammate_spawn_failed"));
+}
+
+/// A Host that cannot configure any member.
+const RefusingFactory = struct {
+    calls: usize = 0,
+
+    fn factory(self: *RefusingFactory) cc.session_host.TeammateFactory {
+        return .{ .ctx = self, .configure = configure };
+    }
+
+    fn configure(ctx: *anyopaque, _: std.mem.Allocator, _: cc.session_host.TeammateSpawn) anyerror!cc.agent_session.SessionConfig {
+        const self: *RefusingFactory = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return error.NoTeammateProvider;
+    }
+};
+
+test "L2 #445 SessionHost: a spawn that fails is the lead's next Run, so its model learns the teammate was not started" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const noted = try textSse(a, "noted");
+    defer a.free(noted);
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        noted,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var refusing = RefusingFactory{};
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = refusing.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = spawnLeadConfig(lead_url, workspace) });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+
+    try std.testing.expectEqual(@as(usize, 1), refusing.calls);
+    const ids = try host.list(a);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    // Run 2 is the failure: typed for the Host, plain text for the provider.
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"kind\":\"teammate_spawn_failed\""));
+    try std.testing.expectEqual(@as(usize, 4), lead_srv.requestCount());
+    const report = lead_srv.requestAt(3).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, report, "teammate-status from=\\\"solver\\\" state=\\\"failed\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "teammate was not started: NoTeammateProvider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "teammate_spawn_failed") == null);
+}
+
+test "L2 #445 SessionHost: a lead that keeps re-spawning a failing name stops after one failure report, as the App's turn limit bounds it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const retried = try textSse(a, "retried");
+    defer a.free(retried);
+    const again = try textSse(a, "again");
+    defer a.free(again);
+    // Every Run the model is given asks for `solver` again. Run 2 is the
+    // report of Run 1's failure; a Run 3 would be a report of a report.
+    const lead_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        toolSse("t3", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        retried,
+        toolSse("t4", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        again,
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    var refusing = RefusingFactory{};
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = refusing.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = spawnLeadConfig(lead_url, workspace) });
+    defer host.release(lead);
+
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+    // Give a third Run every chance to start.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.lead_inbox_poll_ms), .awake) catch {};
+
+    // Both spawns were tried; only the first was reported.
+    try std.testing.expectEqual(@as(usize, 2), refusing.calls);
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&lead.journal, "\"type\":\"run_done\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&lead.journal, "\"kind\":\"teammate_spawn_failed\""));
+    try std.testing.expectEqual(@as(usize, 5), lead_srv.requestCount());
+    var snap = try lead.snapshot(a);
+    defer snap.deinit(a);
+    try std.testing.expectEqual(cc.session_host.Phase.idle, snap.phase);
+    try std.testing.expectEqual(@as(usize, 0), snap.queued);
+}
+
+/// The `type` of each host line and `config_changed` in `journal`, in
+/// order, joined by spaces; other kernel events are left out.
+fn hostLineTypes(journal: *EventJournal, out: []u8) ![]const u8 {
+    const a = std.testing.allocator;
+    const lines = (try journal.waitSince(a, 0, 1)) orelse return out[0..0];
+    defer {
+        for (lines) |line| a.free(line);
+        a.free(lines);
+    }
+    var len: usize = 0;
+    for (lines) |line| {
+        inline for (.{ "config_changed", "user_message", "run_done", "command_result", "message_rejected" }) |tag| {
+            if (std.mem.indexOf(u8, line, "\"type\":\"" ++ tag ++ "\"") != null) {
+                const written = try std.fmt.bufPrint(out[len..], "{s}{s}", .{ if (len == 0) "" else " ", tag });
+                len += written.len;
+            }
+        }
+    }
+    return out[0..len];
+}
+
+test "L2 #445 SessionHost: a submission's own model and permission mode apply before its Run, as the daemon's POST /message takes them" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const path = try std.fmt.allocPrint(a, "{s}/m.txt", .{workspace});
+    defer a.free(path);
+    const write = try writeToolSse(a, path);
+    defer a.free(write);
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ write, done, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    // Default mode: without the message's own mode, the Write would ask.
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{"Write"}) });
+    defer host.release(hosted);
+
+    try hosted.submit(.{ .text = "write it", .model = "message-model", .permission_mode = .accept_edits });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+
+    // The Run ran on the message's model and mode: the provider got that
+    // model, and the edit did not ask.
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"message-model\""));
+    try std.testing.expect(!try modelRead(server, 0, "test-model"));
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"ui_request\""));
+    try std.testing.expect(try exists(workspace, "m.txt"));
+    // Journaled as the daemon journals a message's fields, before the Run's
+    // first line.
+    var types_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("config_changed config_changed user_message run_done", try hostLineTypes(&hosted.journal, &types_buf));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"message-model\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"accept_edits\"}}"));
+
+    // They are the Session's settings from then on.
+    try hosted.submit(.{ .text = "and now" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expect(try modelRead(server, 2, "\"model\":\"message-model\""));
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("message-model", snapshot.model);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.accept_edits, snapshot.permission_mode);
+    try std.testing.expectEqual(cc.session_host.Phase.idle, snapshot.phase);
+}
+
+test "L2 #445 SessionHost: a submission whose mode or model is refused is message_rejected: nothing applied, no Run, its key not spent" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{done};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{}) });
+    defer host.release(hosted);
+
+    // Settings that disable bypass, as a settings-bearing Session has them
+    // (a hosted Session's imported rule layer has no mode switches). Put on
+    // before the first submission, which the driver takes under the
+    // Session's lock.
+    const no_rules: []const cc.permission_settings.Rule = &.{};
+    const layers = [_]cc.permission_settings.Layer{.{
+        .source = .host,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+    }};
+    const disabling = cc.permission_settings.MergedSettings{ .layers = &layers, .allocator = a };
+    const imported = hosted.session.permission_ctx.settings;
+    hosted.session.permission_ctx.settings = &disabling;
+    defer hosted.session.permission_ctx.settings = imported;
+
+    // A disabled mode: the model it came with is not switched either.
+    try hosted.submit(.{ .text = "first try", .model = "other-model", .permission_mode = .bypass_permissions, .idempotency_key = "im:evt-1" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"bypassPermissions is disabled by settings\",\"text\":\"first try\",\"model\":\"other-model\",\"permission_mode\":\"bypass_permissions\"}}"));
+    // A model the Session cannot take.
+    try hosted.submit(.{ .text = "second try", .model = "" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model name is empty or not valid UTF-8\",\"text\":\"second try\",\"model\":\"\",\"permission_mode\":null"));
+
+    var rejected = try hosted.snapshot(a);
+    defer rejected.deinit(a);
+    try std.testing.expectEqualStrings("test-model", rejected.model);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.default, rejected.permission_mode);
+    try std.testing.expectEqual(cc.session_host.Phase.idle, rejected.phase);
+    try std.testing.expectEqual(@as(usize, 0), rejected.messages);
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    // The rejected delivery started no Run, so its key was not spent: the
+    // same delivery without the refused mode runs, once.
+    try hosted.submit(.{ .text = "first try", .idempotency_key = "im:evt-1" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectError(error.DuplicateSubmission, hosted.submit(.{ .text = "first try", .idempotency_key = "im:evt-1" }));
+    var types_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("message_rejected message_rejected user_message run_done", try hostLineTypes(&hosted.journal, &types_buf));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"test-model\""));
+    try std.testing.expect(!try modelRead(server, 0, "second try"));
+    var ran = try hosted.snapshot(a);
+    defer ran.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), ran.messages);
+}
+
+test "L2 #445 SessionHost Options.models: a tier name resolves and a model the provider does not take is message_rejected, as the daemon's setTurnModel" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ done, done, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // The daemon's two sources: the state root's `model_tiers` (only
+    // `high` set for anthropic) and the provider's server catalog.
+    var tiers = (try cc.model_tiers.parseTableFromConfig(a, "{\"model_tiers\":{\"anthropic\":{\"high\":{\"model\":\"claude-tier-high\"}},\"openai\":{\"low\":{\"model\":\"gpt-tier-low\"}}}}")).?;
+    defer tiers.deinit();
+    const catalog = [_]cc.session_host.CatalogModel{
+        .{ .provider = .anthropic, .id = "house-model" },
+        .{ .provider = .openai, .id = "openai-house" },
+    };
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .models = .{ .tiers = &tiers, .catalog = &catalog } });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{}) });
+    defer host.release(hosted);
+
+    // A tier name: the provider gets the tier's model, and `config_changed`
+    // names it.
+    try hosted.submit(.{ .text = "on the tier", .model = " high " });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"claude-tier-high\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"claude-tier-high\"}}"));
+
+    // A tier the table leaves unset for this provider (set only for
+    // openai), another provider's model, and another provider's catalog
+    // entry: refused in words, nothing applied, no Run.
+    try hosted.submit(.{ .text = "unset tier", .model = "low" });
+    try hosted.submit(.{ .text = "other provider", .model = "gpt-4o" });
+    try hosted.submit(.{ .text = "other catalog", .model = "openai-house" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 3);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"model not available for current provider\",\"text\":\"unset tier\",\"model\":\"low\",\"permission_mode\":null}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model not available for current provider\",\"text\":\"other provider\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model not available for current provider\",\"text\":\"other catalog\""));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+
+    // A model the catalog lists for this provider, though its id names
+    // none; then the model already in force, announced again.
+    try hosted.submit(.{ .text = "from the catalog", .model = "house-model" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try hosted.submit(.{ .text = "same again", .model = "house-model" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 3);
+    try std.testing.expect(try modelRead(server, 1, "\"model\":\"house-model\""));
+    try std.testing.expect(try modelRead(server, 2, "\"model\":\"house-model\""));
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"house-model\"}}"));
+    for ([_][]const u8{ "unset tier", "other provider", "other catalog" }) |refused| {
+        try std.testing.expect(!try modelRead(server, 2, refused));
+    }
+
+    // `set_model` resolves the same way.
+    try hosted.command(.{ .set_model = "mid" });
+    try hosted.command(.{ .set_model = "opus" });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_model\",\"ok\":false,\"error_name\":\"ModelUnavailable\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"command\":\"set_model\",\"ok\":true"));
+
+    var types_buf: [512]u8 = undefined;
+    // The accepted `set_model` is journaled as the daemon's `/model` is:
+    // `config_changed` with the resolved model, then its `command_result`.
+    try std.testing.expectEqualStrings(
+        "config_changed user_message run_done message_rejected message_rejected message_rejected " ++
+            "config_changed user_message run_done config_changed user_message run_done command_result config_changed command_result",
+        try hostLineTypes(&hosted.journal, &types_buf),
+    );
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"claude-tier-high\"}}"));
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("claude-tier-high", snapshot.model);
+    try std.testing.expectEqual(@as(usize, 6), snapshot.messages);
+}
+
+test "L2 #445 SessionHost setModelCatalog: a refreshed catalog replaces the one model names resolve against, as the daemon adopts a refreshed /v1/models answer; the model in force stays" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ done, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+
+    // A Host without `Options.models` has no catalog to replace.
+    {
+        var plain = SessionHost.init(a, runtime, .{});
+        defer plain.deinit();
+        const one = [_]cc.session_host.CatalogModel{.{ .provider = .anthropic, .id = "fresh-model" }};
+        try std.testing.expectError(error.ModelPolicyUnset, plain.setModelCatalog(&one));
+    }
+
+    // The daemon's startup catalog (its cached `/v1/models`): `cached-model`.
+    const startup = [_]cc.session_host.CatalogModel{.{ .provider = .anthropic, .id = "cached-model" }};
+    var host = SessionHost.init(a, runtime, .{ .models = .{ .catalog = &startup } });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{}) });
+    defer host.release(hosted);
+
+    // Before the refresh, a model only the refreshed answer lists is refused.
+    try hosted.submit(.{ .text = "too early", .model = "fresh-model" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 1);
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    // The refresh lands. The Host's copy is the one in force: the caller's
+    // buffer is overwritten right after the call.
+    var refreshed_id = "fresh-model".*;
+    const refreshed = [_]cc.session_host.CatalogModel{.{ .provider = .anthropic, .id = &refreshed_id }};
+    try host.setModelCatalog(&refreshed);
+    @memset(&refreshed_id, 'x');
+    try hosted.submit(.{ .text = "after refresh", .model = "fresh-model" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"fresh-model\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"fresh-model\"}}"));
+
+    // A second refresh that no longer lists it: the startup catalog does not
+    // come back (replaced, not merged), the next name is checked against the
+    // new one, and the Session stays on the model it is on.
+    const later = [_]cc.session_host.CatalogModel{.{ .provider = .anthropic, .id = "later-model" }};
+    try host.setModelCatalog(&later);
+    try hosted.submit(.{ .text = "startup model again", .model = "cached-model" });
+    try waitFor(&hosted.journal, "\"type\":\"message_rejected\"", 2);
+    try hosted.command(.{ .set_model = "fresh-model" });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_model\",\"ok\":false,\"error_name\":\"ModelUnavailable\""));
+    try hosted.submit(.{ .text = "no model given" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expect(try modelRead(server, 1, "\"model\":\"fresh-model\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model not available for current provider\",\"text\":\"too early\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"message\":\"model not available for current provider\",\"text\":\"startup model again\""));
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("fresh-model", snapshot.model);
+}
+
+test "L2 #445 SessionHost config sink: each accepted configuration command journals config_changed before its command_result, as the daemon's /model, /mode, /effort and /add-dir" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    var extra_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const extra = try subdir(&tmp, "extra", &extra_buf);
+    var extra2_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const extra2 = try subdir(&tmp, "extra2", &extra2_buf);
+
+    const path = try std.fmt.allocPrint(a, "{s}/c.txt", .{extra2});
+    defer a.free(path);
+    const write = try writeToolSse(a, path);
+    defer a.free(write);
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ write, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{});
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(url, workspace, home, &.{"Write"}) });
+    defer host.release(hosted);
+
+    // A refused command changes nothing, so no line says anything changed.
+    try hosted.command(.{ .set_model = "" });
+    try hosted.command(.{ .set_model = "cmd-model" });
+    try hosted.command(.{ .set_permission_mode = .accept_edits });
+    try hosted.command(.{ .set_reasoning_effort = .high });
+    try hosted.command(.{ .set_additional_directories = &.{extra} });
+    // Only the directory that came into force is announced; one taken away
+    // has no line.
+    try hosted.command(.{ .set_additional_directories = &.{ extra, extra2 } });
+    try hosted.command(.{ .set_additional_directories = &.{extra2} });
+    try hosted.submit(.{ .text = "write in the extra directory" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    try hosted.command(.{ .set_reasoning_effort = null });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 8);
+
+    var types_buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "command_result config_changed command_result config_changed command_result config_changed command_result " ++
+            "config_changed command_result config_changed command_result command_result user_message run_done " ++
+            "config_changed command_result",
+        try hostLineTypes(&hosted.journal, &types_buf),
+    );
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_model\",\"ok\":false,\"error_name\":\"InvalidModel\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"cmd-model\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"accept_edits\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"reasoning\":\"high\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"reasoning\":null}}"));
+    // The directories as resolved: `extra`, then `extra2` (the one in force
+    // now), each once.
+    try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "\"type\":\"config_changed\",\"data\":{\"dirs\":"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "extra\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), hosted.session.workspace.additional_dirs.len);
+    const in_force = try cc.wire.writeEvent(a, .{ .config_changed = .{ .dirs = hosted.session.workspace.additional_dirs[0] } });
+    defer a.free(in_force);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, in_force));
+
+    // What the lines say is what the Run used: the model and the effort
+    // reached the provider, and the edit in the added directory did not ask.
+    try std.testing.expect(try modelRead(server, 0, "\"model\":\"cmd-model\""));
+    try std.testing.expect(try modelRead(server, 0, "\"output_config\":{\"effort\":\"high\"}"));
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"ui_request\""));
+    try std.testing.expect(try exists(extra2, "c.txt"));
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("cmd-model", snapshot.model);
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.accept_edits, snapshot.permission_mode);
+    try std.testing.expect(snapshot.reasoning_effort == null);
+}
+
+test "L2 #445 SessionHost cron: a CronCreate prompt fires as the Session's next Run once it is idle, after queued work, as the CLI fires it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const scheduled = try textSse(a, "scheduled");
+    defer a.free(scheduled);
+    const second = try textSse(a, "second done");
+    defer a.free(second);
+    const fired = try textSse(a, "fired");
+    defer a.free(fired);
+    // Run 1 schedules a one-shot prompt due at once; Run 2 was queued
+    // behind it; Run 3 is the prompt.
+    const bodies = [_][]const u8{
+        toolSse("c1", "CronCreate", "{\\\"prompt\\\":\\\"cron says hi\\\",\\\"delaySeconds\\\":0,\\\"recurring\\\":false}"),
+        scheduled,
+        second,
+        fired,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // Without `enable_cron` the tools are not in the Runtime, and they never
+    // enter through the explicit list.
+    try std.testing.expectError(error.UnsupportedBuiltinTool, cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"CronCreate"} }));
+    {
+        const plain = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+        defer plain.destroy() catch unreachable;
+        var plain_host = SessionHost.init(a, plain, .{ .transcripts = false });
+        defer plain_host.deinit();
+        try std.testing.expectError(error.ToolNotInRuntime, plain_host.open(.{ .config = baseConfig(url, workspace, home, &.{"CronCreate"}) }));
+    }
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_cron = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{ "CronCreate", "CronList", "CronDelete" });
+    config.permission_mode = .bypass_permissions;
+    const hosted = try host.open(.{ .config = config });
+    defer host.release(hosted);
+
+    try hosted.submit(.{ .text = "remind me" });
+    try hosted.submit(.{ .text = "second" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 3);
+
+    // The tool scheduled the job: its result reached the provider.
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, server.requestAt(1).?.body(), "\\\"scheduled\\\":true") != null);
+    // Queued work ran first: Run 2 is the submission, Run 3 the prompt.
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":2,\"trace_id\":null,\"text\":\"second\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"user_message\",\"data\":{\"run_id\":3,\"trace_id\":null,\"text\":\"cron says hi\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":3,\"trace_id\":null,\"stop_reason\":\"end_turn\""));
+    // The provider sees the prompt as the user's message, and nothing of its
+    // typing.
+    // Before it, the prompt is only in Run 1's CronCreate input.
+    const request = server.requestAt(3).?.body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, server.requestAt(2).?.body(), "cron says hi"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, request, "cron says hi"));
+    try std.testing.expect(std.mem.indexOf(u8, request, "cron_fired") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "session_host") == null);
+
+    // A one-shot job fires once.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.cron_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 3), try countLines(&hosted.journal, "\"type\":\"user_message\""));
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+}
+
+test "L2 #493 SessionHost cron: a Host reads a Session's cron jobs from Snapshot and cancels one or all by command, without a Run; a cancelled job never fires" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const scheduled = try textSse(a, "scheduled");
+    defer a.free(scheduled);
+    const b_fired = try textSse(a, "b fired");
+    defer a.free(b_fired);
+    // Run 1 schedules two one-shot jobs due in 5 s and one that repeats every
+    // New Year; Run 2 is job b. Job a is cancelled before it is due, and the
+    // cassette has no reply for it.
+    const bodies = [_][]const u8{
+        toolSse("c1", "CronCreate", "{\\\"prompt\\\":\\\"job a\\\",\\\"delaySeconds\\\":5}"),
+        toolSse("c2", "CronCreate", "{\\\"prompt\\\":\\\"job b\\\",\\\"delaySeconds\\\":5}"),
+        toolSse("c3", "CronCreate", "{\\\"prompt\\\":\\\"new year\\\",\\\"cron\\\":\\\"0 0 1 1 *\\\"}"),
+        scheduled,
+        b_fired,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_cron = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{ "CronCreate", "CronList", "CronDelete" });
+    config.permission_mode = .bypass_permissions;
+    const hosted = try host.open(.{ .config = config });
+    defer host.release(hosted);
+
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.cron_jobs.len);
+    }
+
+    const before = cc.util_time.nowUnix();
+    try hosted.submit(.{ .text = "schedule" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+
+    // The jobs the Run created, oldest first: id, next fire, schedule.
+    var ids: [3]cc.session_host.CronJobId = undefined;
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        const jobs = snapshot.cron_jobs;
+        try std.testing.expectEqual(@as(usize, 3), jobs.len);
+        for (jobs, &ids) |job, *id| id.* = job.id;
+        try std.testing.expect(jobs[0].schedule == .once);
+        try std.testing.expect(jobs[1].schedule == .once);
+        try std.testing.expectEqualStrings("0 0 1 1 *", jobs[2].schedule.recurring);
+        for (jobs[0..2]) |job| {
+            try std.testing.expect(job.next_fire_unix >= before + 5);
+            try std.testing.expect(job.next_fire_unix <= cc.util_time.nowUnix() + 5);
+        }
+        try std.testing.expect(jobs[2].next_fire_unix > cc.util_time.nowUnix());
+        try std.testing.expect(!ids[0].eql(ids[1]) and !ids[1].eql(ids[2]) and !ids[0].eql(ids[2]));
+        // The ids are the ones the model was given.
+        for (ids) |id| try std.testing.expect(std.mem.indexOf(u8, server.requestAt(3).?.body(), id.slice()) != null);
+    }
+
+    // Cancel job a by id: journaled as a command_result, no Run, gone from
+    // Snapshot by the time the result is journaled.
+    try hosted.command(.{ .cancel_cron_job = ids[0] });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"cancel_cron_job\",\"ok\":true,\"error_name\":null,\"message\":null}}"));
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), snapshot.cron_jobs.len);
+        try std.testing.expect(snapshot.cron_jobs[0].id.eql(ids[1]));
+        try std.testing.expect(snapshot.cron_jobs[1].id.eql(ids[2]));
+    }
+    // An id the Session no longer has, and text that is no id at all.
+    try hosted.command(.{ .cancel_cron_job = ids[0] });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"cancel_cron_job\",\"ok\":false,\"error_name\":\"CronJobNotFound\",\"message\":null}}"));
+    try std.testing.expectError(error.InvalidCronJobId, cc.session_host.CronJobId.parse("job a"));
+    try std.testing.expectEqual(ids[1], try cc.session_host.CronJobId.parse(ids[1].slice()));
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"run_done\""));
+
+    // Job b, due with job a, fires; job a does not.
+    try waitFor(&hosted.journal, "\"kind\":\"cron_fired\"", 1);
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(3 * cc.session_host.cron_poll_ms), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"text\":\"job b\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\""));
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"text\":\"job a\""));
+    try std.testing.expectEqual(@as(usize, 5), server.requestCount());
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.cron_jobs.len);
+        try std.testing.expect(snapshot.cron_jobs[0].id.eql(ids[2]));
+    }
+
+    // Cancel all: the recurring job goes too.
+    try hosted.command(.cancel_all_cron_jobs);
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 3);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"cancel_all_cron_jobs\",\"ok\":true,\"error_name\":null,\"message\":null}}"));
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.cron_jobs.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), hosted.session.cronJobCount());
+    try std.testing.expectEqual(@as(usize, 5), server.requestCount());
+}
+
+test "L2 #493 SessionHost cron: prompts due beyond max_queued stay due and fire once the queue has room; queued never passes the bound and none is lost" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    const target = try std.fmt.allocPrint(a, "{s}/w.txt", .{workspace});
+    defer a.free(target);
+
+    const scheduled = try textSse(a, "scheduled");
+    defer a.free(scheduled);
+    const write = try writeToolSse(a, target);
+    defer a.free(write);
+    const wrote = try textSse(a, "wrote");
+    defer a.free(wrote);
+    const p2 = try textSse(a, "p2 done");
+    defer a.free(p2);
+    const by_host = try textSse(a, "host done");
+    defer a.free(by_host);
+    const p3 = try textSse(a, "p3 done");
+    defer a.free(p3);
+    const p4 = try textSse(a, "p4 done");
+    defer a.free(p4);
+    // Run 1 schedules four prompts due at once. With room for two, p1 and p2
+    // fire; p1's Run holds the driver on a permission request while p2
+    // waits in the queue beside one Host submission. p3 and p4 fire once
+    // the queue has drained.
+    const bodies = [_][]const u8{
+        toolSse("c1", "CronCreate", "{\\\"prompt\\\":\\\"p1\\\",\\\"delaySeconds\\\":0}"),
+        toolSse("c2", "CronCreate", "{\\\"prompt\\\":\\\"p2\\\",\\\"delaySeconds\\\":0}"),
+        toolSse("c3", "CronCreate", "{\\\"prompt\\\":\\\"p3\\\",\\\"delaySeconds\\\":0}"),
+        toolSse("c4", "CronCreate", "{\\\"prompt\\\":\\\"p4\\\",\\\"delaySeconds\\\":0}"),
+        scheduled,
+        write,
+        wrote,
+        p2,
+        by_host,
+        p3,
+        p4,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"}, .enable_cron = true });
+    defer runtime.destroy() catch unreachable;
+    const max_queued = 2;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .max_queued = max_queued });
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{ "CronCreate", "CronList", "CronDelete", "Write" });
+    config.permission_mode = .bypass_permissions;
+    const hosted = try host.open(.{ .config = config });
+    defer host.release(hosted);
+
+    // The command is queued behind Run 1, so no prompt fires before it:
+    // from then on the Write asks.
+    try hosted.submit(.{ .text = "schedule" });
+    try hosted.command(.{ .set_permission_mode = .default });
+    try waitFor(&hosted.journal, "\"type\":\"ui_request\"", 1);
+
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(cc.session_host.Phase.running, snapshot.phase);
+        try std.testing.expectEqual(@as(usize, max_queued), snapshot.max_queued);
+        // p1 runs, p2 is queued: two fired, the bound's worth. p3 and p4
+        // stay due in the registry instead of a third and fourth queued Run.
+        try std.testing.expectEqual(@as(usize, 1), snapshot.queued);
+        try std.testing.expectEqual(@as(usize, 2), snapshot.cron_jobs.len);
+        for (snapshot.cron_jobs) |job| try std.testing.expect(job.schedule == .once);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"kind\":\"cron_fired\""));
+    // The room left is the Host's, and the bound holds.
+    try hosted.submit(.{ .text = "from the host" });
+    try std.testing.expectError(error.QueueFull, hosted.submit(.{ .text = "one too many" }));
+    {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(@as(usize, max_queued), snapshot.queued);
+    }
+
+    try hosted.respond(try pendingRequestId(&hosted.journal), "{\"choice\":\"allow_once\"}");
+    // Watch the queue drain and the rest fire: it never passes the bound.
+    var waited: u64 = 0;
+    while (waited < 15_000) : (waited += 5) {
+        var snapshot = try hosted.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expect(snapshot.queued <= max_queued);
+        if (try countLines(&hosted.journal, "\"type\":\"run_done\"") >= 6 and snapshot.cron_jobs.len == 0 and snapshot.queued == 0) break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    } else return error.CronNeverDrained;
+
+    // Every prompt ran once, in the order its job was created, the Host's
+    // submission where it was queued.
+    const order = [_][]const u8{
+        "\"run_id\":2,\"trace_id\":null,\"text\":\"p1\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\"",
+        "\"run_id\":3,\"trace_id\":null,\"text\":\"p2\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\"",
+        "\"run_id\":4,\"trace_id\":null,\"text\":\"from the host\"",
+        "\"run_id\":5,\"trace_id\":null,\"text\":\"p3\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\"",
+        "\"run_id\":6,\"trace_id\":null,\"text\":\"p4\",\"replaces\":null,\"source\":\"session_host\",\"kind\":\"cron_fired\"",
+    };
+    for (order) |line| try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, line));
+    try std.testing.expectEqual(@as(usize, 4), try countLines(&hosted.journal, "\"kind\":\"cron_fired\""));
+    for (1..7) |run_id| {
+        var line_buf: [128]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "\"type\":\"run_done\",\"data\":{{\"run_id\":{d},\"trace_id\":null,\"stop_reason\":\"end_turn\"", .{run_id});
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, line));
+    }
+    try std.testing.expectEqual(bodies.len, server.requestCount());
+    try std.testing.expect(try exists(workspace, "w.txt"));
+}
+
+/// `<dir>/<name>` written with `bytes`, creating `dir`.
+fn writeFileUnder(dir: []const u8, name: []const u8, bytes: []const u8) !void {
+    try cc.util_fs.mkdirParents(dir);
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name });
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.TestOpenFailed;
+    defer _ = pfs.close(fd);
+    if (!pfs.writeAll(fd, bytes)) return error.TestWriteFailed;
+}
+
+test "L2 #445 SessionHost project rules: an enforced Session opens the daemon's RunControl, so an active bundle it cannot attest fails the Run before any provider request without poisoning the Session, as the daemon takes the next message; an ignored Session never reads it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state = try subdir(&tmp, "state", &state_buf);
+    const enforced_root = try std.fmt.allocPrint(a, "{s}/enforced", .{state});
+    defer a.free(enforced_root);
+    const ignored_root = try std.fmt.allocPrint(a, "{s}/ignored", .{state});
+    defer a.free(ignored_root);
+    // The daemon's layout: the bundle beside the session directories.
+    const rules_dir = try std.fmt.allocPrint(a, "{s}/project-rules", .{state});
+    defer a.free(rules_dir);
+    try writeFileUnder(rules_dir, cc.project_rule_bundle.ACTIVE_FILE, "{}");
+    // A kernel configuration that cannot be used (a path without its
+    // digest), whatever this build pins beside its executable.
+    @import("platform").paths.setEnv("METACODES_PROJECT_KERNEL_PATH", "/nonexistent/metacodes-project-kernel");
+    defer @import("platform").paths.unsetEnv("METACODES_PROJECT_KERNEL_PATH");
+
+    const answered = try textSse(a, "answered");
+    defer a.free(answered);
+    const bodies = [_][]const u8{ answered, answered };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+
+    // A policy with no journal to apply it to is refused, not ignored.
+    var ephemeral = baseConfig(url, workspace, home, &.{});
+    ephemeral.run_control = .{ .project_rules = .enforced };
+    try std.testing.expectError(error.RunControlRequiresRunJournal, host.open(.{ .config = ephemeral }));
+    ephemeral.run_control = .{ .abandoned_run = .record_abandoned };
+    try std.testing.expectError(error.RunControlRequiresRunJournal, host.open(.{ .config = ephemeral }));
+
+    var enforced_config = baseConfig(url, workspace, home, &.{});
+    enforced_config.run_journal = .{ .exact_root = enforced_root };
+    enforced_config.run_control = .{ .project_rules = .enforced };
+    const enforced = try host.open(.{ .config = enforced_config });
+    defer host.release(enforced);
+    try enforced.submit(.{ .text = "refused prompt" });
+    try waitFor(&enforced.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&enforced.journal, "\"stop_reason\":null,\"error_name\":\"ProjectKernelConfigurationInvalid\""));
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    // Only the Run failed: the Session is idle, not poisoned, as the
+    // daemon reports the Run failed and takes the next message.
+    {
+        var snapshot = try enforced.snapshot(a);
+        defer snapshot.deinit(a);
+        try std.testing.expectEqual(cc.session_host.Phase.idle, snapshot.phase);
+    }
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&enforced.journal, "\"type\":\"session_poisoned\""));
+    // The refused Run is closed in the journal, so it is no Run a later
+    // owner finds abandoned.
+    try std.testing.expect((try cc.tool_observation_journal.validate(enforced_root, enforced.id)).complete);
+
+    // The bundle withdrawn, the same Session runs its next message. The
+    // refused prompt never entered its Conversation, so the provider sees
+    // only the new one.
+    {
+        const active = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ rules_dir, cc.project_rule_bundle.ACTIVE_FILE }, 0);
+        defer a.free(active);
+        try pfs.unlinkPath(active.ptr);
+    }
+    try enforced.submit(.{ .text = "admitted prompt" });
+    try waitFor(&enforced.journal, "\"type\":\"run_done\"", 2);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&enforced.journal, "\"stop_reason\":\"end_turn\""));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    const admitted_body = server.requestAt(0).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, admitted_body, "admitted prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admitted_body, "refused prompt") == null);
+    try std.testing.expect((try cc.tool_observation_journal.validate(enforced_root, enforced.id)).complete);
+    // Restore the bundle for the ignored Session below.
+    try writeFileUnder(rules_dir, cc.project_rule_bundle.ACTIVE_FILE, "{}");
+
+    // The same bundle, the same kernel configuration: a Session that does
+    // not enforce project rules never loads them.
+    var ignored_config = baseConfig(url, workspace, home, &.{});
+    ignored_config.run_journal = .{ .exact_root = ignored_root };
+    const ignored = try host.open(.{ .config = ignored_config });
+    defer host.release(ignored);
+    try ignored.submit(.{ .text = "ungoverned" });
+    try waitFor(&ignored.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&ignored.journal, "\"stop_reason\":\"end_turn\""));
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+}
+
+/// The model asks one question (AskUserQuestion, call `tu_q`).
+const ASK_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_q\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_q\",\"name\":\"AskUserQuestion\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"questions\\\":[{\\\"question\\\":\\\"Ship now?\\\",\\\"header\\\":\\\"Decision\\\",\\\"options\\\":[{\\\"label\\\":\\\"Ship\\\",\\\"description\\\":\\\"Release now\\\"},{\\\"label\\\":\\\"Wait\\\",\\\"description\\\":\\\"Hold the release\\\"}]}]}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+test "L2 #445 SessionHost project rules: a resumption the rules refuse fails that Run and keeps the suspension, open again under its id across a restart, so a later answer resumes the turn; the Session is not poisoned" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state = try subdir(&tmp, "state", &state_buf);
+    const journal_root = try std.fmt.allocPrint(a, "{s}/sessions", .{state});
+    defer a.free(journal_root);
+    const rules_dir = try std.fmt.allocPrint(a, "{s}/project-rules", .{state});
+    defer a.free(rules_dir);
+    const active = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ rules_dir, cc.project_rule_bundle.ACTIVE_FILE }, 0);
+    defer a.free(active);
+    // An active bundle, once written, with a kernel configuration that
+    // cannot be used, whatever this build pins beside its executable.
+    @import("platform").paths.setEnv("METACODES_PROJECT_KERNEL_PATH", "/nonexistent/metacodes-project-kernel");
+    defer @import("platform").paths.unsetEnv("METACODES_PROJECT_KERNEL_PATH");
+
+    const done = try textSse(a, "done");
+    defer a.free(done);
+    const bodies = [_][]const u8{ ASK_SSE, done };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const tools = [_][]const u8{"AskUserQuestion"};
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &tools });
+    defer runtime.destroy() catch unreachable;
+    var config = baseConfig(url, workspace, home, &tools);
+    config.run_journal = .{ .exact_root = journal_root };
+    config.run_control = .{ .project_rules = .enforced };
+
+    // Process 1: no bundle yet, so the question's Run is admitted and
+    // suspends on it. Then a bundle the Session cannot attest becomes
+    // active, and the answer's resumption is refused.
+    var id: cc.session_id.SessionId = undefined;
+    const announcement = "{\"v\":1,\"type\":\"ui_request\",\"id\":1,\"kind\":\"ask_question\"";
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config });
+        defer host.release(hosted);
+        id = hosted.id;
+        try hosted.submit(.{ .text = "ask first", .trace_id = "t-refused" });
+        try waitFor(&hosted.journal, "\"stop_reason\":\"suspended\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+
+        try writeFileUnder(rules_dir, cc.project_rule_bundle.ACTIVE_FILE, "{}");
+        try hosted.respond(1, "{\"answers\":[\"Ship\"],\"by\":\"alice\"}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+        // The request closes on the answer and Run 2 resumes, as for any
+        // resumption; the rules refuse it before any provider request.
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\",\"by\":\"alice\"}"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"run_resumed\",\"data\":{\"run_id\":2,\"trace_id\":\"t-refused\",\"request_id\":1}"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"run_id\":2,\"trace_id\":\"t-refused\",\"stop_reason\":null,\"error_name\":\"ProjectKernelConfigurationInvalid\""));
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+        // Only that Run failed: the suspension is held again and its request
+        // announced again under its id, after the Run's end.
+        try waitFor(&hosted.journal, announcement, 2);
+        {
+            var snapshot = try hosted.snapshot(a);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqual(cc.session_host.Phase.suspended, snapshot.phase);
+            try std.testing.expectEqual(@as(u64, 1), snapshot.pending_request_id);
+        }
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"session_poisoned\""));
+        try std.testing.expectEqual(@as(usize, 2), try countLines(&hosted.journal, "\"type\":\"run_done\""));
+        // The refused Run is closed in the run journal.
+        try std.testing.expect((try cc.tool_observation_journal.validate(journal_root, hosted.id)).complete);
+    }
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+
+    // Process 2: the bundle withdrawn. The request is open, not settled
+    // with the refused answer: the Session announces it again and waits,
+    // and a new answer resumes the suspended turn with it.
+    try pfs.unlinkPath(active.ptr);
+    {
+        var host = SessionHost.init(a, runtime, .{ .ui_request_wait = .@"suspend" });
+        defer host.deinit();
+        const hosted = try host.open(.{ .config = config, .id = id, .mode = .@"resume" });
+        defer host.release(hosted);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, announcement));
+        {
+            var snapshot = try hosted.snapshot(a);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqual(cc.session_host.Phase.suspended, snapshot.phase);
+            try std.testing.expectEqual(@as(u64, 1), snapshot.pending_request_id);
+        }
+        try hosted.respond(1, "{\"answers\":[\"Wait\"],\"by\":\"bob\"}");
+        try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\",\"by\":\"bob\"}"));
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"trace_id\":\"t-refused\",\"stop_reason\":\"end_turn\""));
+        try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+        // The suspended call's result is the later answer; the refused one
+        // never reached the conversation.
+        const resumed = server.requestAt(1).?.body();
+        try std.testing.expect(std.mem.indexOf(u8, resumed, "tu_q") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resumed, "{\\\"answers\\\":[\\\"Wait\\\"]}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resumed, "Ship\\\"]}") == null);
+        {
+            var snapshot = try hosted.snapshot(a);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqual(cc.session_host.Phase.idle, snapshot.phase);
+            try std.testing.expectEqual(@as(u64, 0), snapshot.pending_request_id);
+        }
+        try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "\"type\":\"session_poisoned\""));
+        try std.testing.expect((try cc.tool_observation_journal.validate(journal_root, hosted.id)).complete);
+    }
+}
+
+test "L2 #445 SessionHost project rules: a Run its dead owner left open keeps a fail_closed Session closed and is recorded abandoned under record_abandoned, as the daemon's RunControl does" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const journal_root = try subdir(&tmp, "journal", &root_buf);
+    const id = cc.session_id.SessionId.fromSlice("0a1b2c3d4e5f60718293a4b5").?;
+
+    // A process that died mid-Run: the journal goes away without the Run's
+    // terminal record.
+    {
+        var dead = try cc.tool_observation_journal.Journal.init(journal_root, id);
+        dead.deinit();
+    }
+
+    const answered = try textSse(a, "answered");
+    defer a.free(answered);
+    const bodies = [_][]const u8{answered};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    var config = baseConfig(url, workspace, home, &.{});
+    config.run_journal = .{ .exact_root = journal_root };
+
+    // The library default: the Session stays closed.
+    {
+        const closed = try host.open(.{ .config = config, .id = id });
+        defer host.release(closed);
+        try closed.submit(.{ .text = "first" });
+        try waitFor(&closed.journal, "\"type\":\"run_done\"", 1);
+        try std.testing.expectEqual(@as(usize, 1), try countLines(&closed.journal, "\"stop_reason\":null,\"error_name\":\"UnfinishedRun\""));
+        try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+        try host.close(id);
+    }
+    try std.testing.expect(!(try cc.tool_observation_journal.validate(journal_root, id)).complete);
+
+    // The daemon's policy: the dead Run is closed as abandoned and this one
+    // runs.
+    config.run_control = .{ .abandoned_run = .record_abandoned };
+    const reopened = try host.open(.{ .config = config, .id = id });
+    defer host.release(reopened);
+    try reopened.submit(.{ .text = "second" });
+    try waitFor(&reopened.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&reopened.journal, "\"stop_reason\":\"end_turn\""));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expect((try cc.tool_observation_journal.validate(journal_root, id)).complete);
+}
+
+/// A route the Host's provider control plane bound (#16): `url` with its own
+/// credential, model and header, under a fixed identity.
+fn testRoute(url: []const u8, api_key: []const u8) !cc.session_host.Route {
+    return .{
+        .binding = .{
+            .provider_kind = .anthropic,
+            .auth_scheme = .{ .api_key_header = "x-api-key" },
+            .api_key = api_key,
+            .model = "route-model",
+            .base_url = url,
+        },
+        .provider_id = try cc.session_host.RouteSlug.parse("acme"),
+        .channel_id = try cc.session_host.RouteSlug.parse("main"),
+        .protocol = "anthropic_messages",
+        .offer_id = try cc.session_host.OfferId.parse("offer-0123456789abcdef0123456789abcdef"),
+        .credential_ref = try cc.session_host.RouteSlug.parse("acme-key"),
+        .scope = .session,
+    };
+}
+
+const ROUTE_LINE = "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"route\":{\"provider_id\":\"acme\",\"channel_id\":\"main\"," ++
+    "\"protocol\":\"anthropic_messages\",\"request_model_id\":\"route-model\",\"offer_id\":\"offer-0123456789abcdef0123456789abcdef\"," ++
+    "\"credential_ref\":\"acme-key\",\"scope\":\"session\"}}}";
+
+test "L2 #445 #16 SessionHost set_route: the Session moves onto the bound route (endpoint, credential, header, model) and journals config_changed{model} then config_changed{route}, as the CLI's /model commit; a refused route changes nothing" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const first = try textSse(a, "first");
+    defer a.free(first);
+    const opened_bodies = [_][]const u8{first};
+    var opened_srv = try harness.MockServer.startCassette(&opened_bodies, 0);
+    defer opened_srv.stop();
+    const opened_url = try opened_srv.urlOwned(a);
+    defer a.free(opened_url);
+    const second = try textSse(a, "second");
+    defer a.free(second);
+    const route_bodies = [_][]const u8{second};
+    var route_srv = try harness.MockServer.startCassette(&route_bodies, 0);
+    defer route_srv.stop();
+    const route_url = try route_srv.urlOwned(a);
+    defer a.free(route_url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(opened_url, workspace, home, &.{}) });
+    defer host.release(hosted);
+
+    try hosted.command(.{ .set_reasoning_effort = .high });
+    try hosted.submit(.{ .text = "on the opened route" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    // The Host's buffers are copied when queued: overwritten right after,
+    // the route still arrives as bound.
+    var key_buf = "route-key".*;
+    var url_buf: [128]u8 = undefined;
+    @memcpy(url_buf[0..route_url.len], route_url);
+    try hosted.command(.{ .set_route = try testRoute(url_buf[0..route_url.len], &key_buf) });
+    @memset(&key_buf, 'x');
+    @memset(url_buf[0..route_url.len], 'x');
+    // A credential no header can carry is refused: nothing changes.
+    try hosted.command(.{ .set_route = try testRoute(opened_url, "bad key") });
+    try hosted.submit(.{ .text = "on the bound route" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+
+    var types_buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "config_changed command_result user_message run_done config_changed config_changed command_result command_result user_message run_done",
+        try hostLineTypes(&hosted.journal, &types_buf),
+    );
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"route-model\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, ROUTE_LINE));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_route\",\"ok\":true,\"error_name\":null"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_route\",\"ok\":false,\"error_name\":\"InvalidCredentialByte\""));
+    // The credential is never journaled.
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "route-key"));
+
+    // What the lines say is what the next Run used: the bound endpoint, its
+    // credential under its header, its model, and the effort carried over.
+    try std.testing.expectEqual(@as(usize, 1), opened_srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), route_srv.requestCount());
+    const opened = opened_srv.requestAt(0).?.raw;
+    try std.testing.expect(std.mem.indexOf(u8, opened, "Bearer test-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, opened, "\"model\":\"test-model\"") != null);
+    const routed = route_srv.requestAt(0).?.raw;
+    try std.testing.expect(std.mem.indexOf(u8, routed, "x-api-key: route-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routed, "test-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, routed, "Bearer") == null);
+    try std.testing.expect(try modelRead(route_srv, 0, "\"model\":\"route-model\""));
+    try std.testing.expect(try modelRead(route_srv, 0, "\"output_config\":{\"effort\":\"high\"}"));
+    try std.testing.expect(try modelRead(route_srv, 0, "on the opened route"));
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("route-model", snapshot.model);
+}
+
+test "L2 #445 #16 SessionHost InheritLead: a member the lead spawns after set_route runs on the lead's route, not on the one the Host opened leads with" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const unused = try textSse(a, "unused");
+    defer a.free(unused);
+    const opened_bodies = [_][]const u8{unused};
+    var opened_srv = try harness.MockServer.startCassette(&opened_bodies, 0);
+    defer opened_srv.stop();
+    const opened_url = try opened_srv.urlOwned(a);
+    defer a.free(opened_url);
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    // The lead's Run ends before its member opens; after the member's
+    // SendMessage, its last turn and the lead's next one may come in either
+    // order, so both answer the same.
+    const route_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+        idle,
+    };
+    var route_srv = try harness.MockServer.startCassette(&route_bodies, 0);
+    defer route_srv.stop();
+    const route_url = try route_srv.urlOwned(a);
+    defer a.free(route_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    const lead_config = spawnLeadConfig(opened_url, workspace);
+    var inherit = cc.session_host.InheritLead{ .base = lead_config };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = inherit.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    try lead.command(.{ .set_route = try testRoute(route_url, "route-key") });
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+
+    const member = host.acquire(try memberId(&host, lead)).?;
+    defer host.release(member);
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 0), opened_srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 6), route_srv.requestCount());
+    const first = route_srv.requestAt(3).?.raw;
+    try std.testing.expect(std.mem.indexOf(u8, first, "fix the parser") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"model\":\"route-model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "x-api-key: route-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "test-key") == null);
+    var snap = try member.snapshot(a);
+    defer snap.deinit(a);
+    try std.testing.expectEqualStrings("route-model", snap.model);
 }

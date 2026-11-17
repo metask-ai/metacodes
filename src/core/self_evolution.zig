@@ -511,7 +511,26 @@ const OutcomeRow = struct {
     /// 溯源层级(verdict.Provenance 名字)。缺省=external_oracle:存量行
     /// 全部来自评测验证器,如实向后兼容。
     provenance: []const u8 = "external_oracle",
+    /// Isolated verifier qualifier on a host_run row
+    /// (`verdict.VerifierQualifier`; doc/ISOLATED_VERIFIER_DESIGN.md §4).
+    /// Empty or unknown = no qualifier.
+    verifier: []const u8 = "",
 };
+
+/// The ` verifier=<q>` token of a stored outcome row: only a known qualifier
+/// on a `host_run` row (the only tier a verifier can demote). Comptime
+/// strings, nothing to free.
+pub fn verifierToken(provenance: []const u8, verifier: []const u8) []const u8 {
+    const verdict_mod = @import("verdict.zig");
+    if (verdict_mod.Provenance.parse(provenance) != .host_run) return "";
+    const q = verdict_mod.VerifierQualifier.parse(verifier) orelse return "";
+    return switch (q) {
+        .pass => " verifier=pass",
+        .fail => " verifier=fail",
+        .unverified => " verifier=unverified",
+        .unavailable => " verifier=unavailable",
+    };
+}
 
 const OutcomeFile = struct {
     schema_version: []const u8,
@@ -669,17 +688,20 @@ pub fn ingestOutcomesFromText(
         defer if (artifact_part.len > 0) allocator.free(artifact_part);
         // prov 放在 failing 之前(定界安全区),值经 Provenance.parse 归一。
         const prov = @tagName(@import("verdict.zig").Provenance.parse(row.provenance));
+        // The verifier qualifier sits right after prov, inside the same
+        // delimiter-safe zone; readers that predate it skip the token.
+        const qualifier = verifierToken(row.provenance, row.verifier);
         const text = if (note_bounded.len > 0)
             std.fmt.allocPrint(
                 allocator,
-                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} prov={s} failing=[{s}] note={s}{s}",
-                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, prov, failing.items, note_bounded, artifact_part },
+                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} prov={s}{s} failing=[{s}] note={s}{s}",
+                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, prov, qualifier, failing.items, note_bounded, artifact_part },
             ) catch continue
         else
             std.fmt.allocPrint(
                 allocator,
-                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} prov={s} failing=[{s}]{s}",
-                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, prov, failing.items, artifact_part },
+                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} prov={s}{s} failing=[{s}]{s}",
+                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, prov, qualifier, failing.items, artifact_part },
             ) catch continue;
         defer allocator.free(text);
         _ = kg.remember(.observation, text, OUTCOME_SCHEMA_TYPE, false) catch continue;
@@ -1259,4 +1281,13 @@ test "buildMergedActive appends provisional entries behind base rules" {
         error.NoProvisionalRules,
         buildMergedActive(a, &base, base.project_sha256, [_]u8{'9'} ** 64, &.{}),
     );
+}
+
+test "verifierToken: a qualifier only on a host_run row, unknown text dropped" {
+    try std.testing.expectEqualStrings(" verifier=fail", verifierToken("host_run", "fail"));
+    try std.testing.expectEqualStrings(" verifier=pass", verifierToken("host_run", "pass"));
+    try std.testing.expectEqualStrings("", verifierToken("host_run_tainted", "fail"));
+    try std.testing.expectEqualStrings("", verifierToken("external_oracle", "fail"));
+    try std.testing.expectEqualStrings("", verifierToken("host_run", "promote"));
+    try std.testing.expectEqualStrings("", verifierToken("host_run", ""));
 }

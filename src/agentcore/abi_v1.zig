@@ -1144,8 +1144,11 @@ const AbiSession = struct {
         var match: ?[]const u8 = null;
         for (latest.blocks) |block| switch (block) {
             .tool_use => |tool_use| {
+                // The Conversation keeps the model's bytes; the permission
+                // path asks with the admitted canonical spelling (#494).
                 if (!std.mem.eql(u8, tool_use.name, tool_name) or
-                    !std.mem.eql(u8, tool_use.input, arguments_json)) continue;
+                    !(core.tool_args.sameArgs(output_allocator, tool_use.input, arguments_json) catch
+                        return error.OutOfMemory)) continue;
                 // The old UiRequest omits tool_call_id. Ambiguous identical
                 // calls must fail closed; guessing would bind approval to the
                 // wrong operation. The R6 public DTO removes this scan.
@@ -2250,6 +2253,84 @@ const AbiSession = struct {
         }, self.budget_state.profile.checkpointLimits());
     }
 
+    /// The exact checkpoint the active Run `run_id` would leave if it ended
+    /// now with `conversation` as the Session Conversation (issue #430). Used
+    /// from the Run's own thread at a compaction boundary, where no tool,
+    /// callback or mutation can change the other sections; the Core Run is
+    /// active, so this reads the fields directly instead of taking a lease.
+    fn measureRunCheckpoint(
+        self: *AbiSession,
+        run_id: u64,
+        conversation: *const core.conversation.Conversation,
+    ) !session_checkpoint.Usage {
+        const binding_snapshot = if (self.skill_binding) |*binding|
+            binding.snapshot()
+        else
+            null;
+        const binding_selection = if (self.skill_binding) |*binding|
+            &binding.selection
+        else
+            null;
+        const skill_state = try session_authority.encodeSkillState(
+            allocator,
+            binding_snapshot,
+            binding_selection,
+        );
+        defer allocator.free(skill_state);
+        const permission_state = try session_authority.encodePermissionState(
+            allocator,
+            self.core_session.permission_ctx.modeValue(),
+            &self.permission_state,
+            self.policy_fingerprint,
+        );
+        defer allocator.free(permission_state);
+        const mcp_state = try mcp_checkpoint.encodeSelection(
+            allocator,
+            if (self.mcp_selection) |*selection| selection else null,
+        );
+        defer allocator.free(mcp_state);
+        const goal_section = try goal_checkpoint.encode(allocator, self.core_session.currentGoal());
+        defer allocator.free(goal_section);
+        return session_checkpoint.measureSnapshot(.{
+            .session_id = self.core_session.session_id,
+            .checkpoint_generation = self.checkpoint_generation +| 1,
+            .last_run_id = run_id,
+            .last_compact_id = self.core_session.last_terminal_compact_id,
+            .terminal_kind = .run,
+            .terminal_id = run_id,
+            .model = self.core_session.model,
+            .conversation = conversation,
+            .policy_generation = self.policy_generation,
+            .catalog_generation = self.catalog_generation,
+            .authority = .{
+                .skill = skill_state,
+                .permission = permission_state,
+                .mcp = mcp_state,
+            },
+            .prompt_profile = self.prompt_checkpoint_section,
+            .goal = goal_section,
+        }, self.budget_state.profile.checkpointLimits());
+    }
+
+    /// `session_budget.CheckpointMeasurer` over `measureRunCheckpoint`.
+    const RunCheckpointMeasurer = struct {
+        facade: *AbiSession,
+        run_id: u64,
+
+        fn measurer(self: *RunCheckpointMeasurer) session_budget.CheckpointMeasurer {
+            return .{ .ctx = self, .measureFn = measure };
+        }
+
+        fn measure(
+            raw: *anyopaque,
+            conversation: *const core.conversation.Conversation,
+        ) ?u64 {
+            const self: *RunCheckpointMeasurer = @ptrCast(@alignCast(raw));
+            const usage = self.facade.measureRunCheckpoint(self.run_id, conversation) catch return null;
+            return usage.total_bytes;
+        }
+    };
+
     fn preflightRootRecords(
         self: *AbiSession,
         records: []const []const u8,
@@ -2861,6 +2942,33 @@ const AbiSession = struct {
         self.commitDurableReplacement(projected);
     }
 
+    /// Every way `session_control->rewind_to_user_message` can refuse once
+    /// the facade gate is held: a position the Conversation cannot rerun from
+    /// (`conversation.RewindError`), or a Core Session that is not idle.
+    pub const RewindError = core.agent_session.AgentSession.RewindMutationError;
+
+    /// Revision 27 (#441): edit-and-rerun's history change, under the facade
+    /// mutation gate. The Core drops the user message at `position` and
+    /// everything after it and clears what the dropped turns read; a refused
+    /// position changes nothing. Only the Conversation changes: files and
+    /// other effects of the dropped turns stay, and the policy generation,
+    /// grants, Skill, MCP, goal, prompt profile and model are untouched.
+    ///
+    /// The checkpoint only shrinks, so there is nothing to admit against the
+    /// durable budget. The usage is re-measured afterwards so `describe` and
+    /// the next Run see the freed bytes; if measuring fails the previous,
+    /// larger usage stays, which only over-reserves until the next Run
+    /// measures again.
+    fn rewindToUserMessageAdmitted(
+        self: *AbiSession,
+        position: core.conversation.MessagePosition,
+    ) RewindError!void {
+        try self.core_session.rewindToUserMessage(position);
+        const usage = self.measureDurableUsage() catch return;
+        if (usage.total_bytes <= self.budget_state.profile.hard_bytes)
+            self.commitDurableReplacement(usage.total_bytes);
+    }
+
     /// The profile is part of durable state: its checkpoint section is
     /// admitted against the budget like any other replacement.
     fn setPromptProfileAdmitted(self: *AbiSession, profile: core.prompt_sections.Profile) !void {
@@ -3351,6 +3459,8 @@ const AbiSession = struct {
         skill_id: []const u8,
         arguments_json: []const u8,
         max_turns: u32,
+        stream_retry_budget: u8,
+        context_reminder: ?[]const u8,
     ) anyerror!SkillExecution {
         const binding = if (self.skill_binding) |*value| value else return error.SkillCatalogNotBound;
         const root_frame = self.policy_root orelse
@@ -3391,7 +3501,13 @@ const AbiSession = struct {
             &plan,
         );
         defer allocator.free(invocation_record);
-        const preflight = try self.preflightRootRecords(&.{invocation_record});
+        // The Host's context (#534) leads the invocation record as its own
+        // text part, so that record is reserved as the two-part record it
+        // becomes, as a Text Run's with context is.
+        const preflight = if (context_reminder) |reminder|
+            try self.preflightRootParts(&.{ .{ .text = reminder }, .{ .text = invocation_record } })
+        else
+            try self.preflightRootRecords(&.{invocation_record});
         var budget_controller = session_budget.Controller.init(
             allocator,
             self.budget_state.profile,
@@ -3402,6 +3518,7 @@ const AbiSession = struct {
             .allocator = allocator,
             .controller = &budget_controller,
             .base = self.core_session.provider.provider(),
+            .run_root = true,
         };
         if (self.active_budget_controller != null)
             return error.InvalidSessionState;
@@ -3415,6 +3532,16 @@ const AbiSession = struct {
         var run_admission = session_budget.RunAdmission{ .controller = &budget_controller };
         self.core_session.setResponseObserver(run_admission.observer());
         defer self.core_session.setResponseObserver(null);
+        // An inline Skill Run compacts the Session Conversation like a Text
+        // Run (issue #430); a fork child runs on a discarded Conversation and
+        // never consults the control.
+        var checkpoint_measurer = RunCheckpointMeasurer{ .facade = self, .run_id = run_id };
+        var run_compaction = session_budget.RunCompaction{
+            .controller = &budget_controller,
+            .measurer = checkpoint_measurer.measurer(),
+        };
+        self.core_session.setCompactionControl(run_compaction.control());
+        defer self.core_session.setCompactionControl(null);
         // Host input submitted during the Run is budgeted by the same controller.
         self.core_session.setRunInputAdmission(SubmittedInputBudget.admission(&budget_controller));
         defer self.core_session.finishRunInputAdmission();
@@ -3431,9 +3558,10 @@ const AbiSession = struct {
             .aborted => .aborted,
             .ready => |ready_value| blk: {
                 var ready = ready_value;
+                ready.context_reminder = context_reminder;
                 break :blk switch (plan.skill.definition.context) {
-                    .inline_ctx => try ready.executeInline(&plan, max_turns),
-                    .fork => try ready.executeFork(&plan, max_turns),
+                    .inline_ctx => try ready.executeInline(&plan, max_turns, stream_retry_budget),
+                    .fork => try ready.executeFork(&plan, max_turns, stream_retry_budget),
                 };
             },
         };
@@ -3453,12 +3581,14 @@ const AbiSession = struct {
         run_id: u64,
         prompt: []const u8,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         return self.runRootWithBoundSkills(
             materializations,
             run_id,
             .{ .text = prompt },
             max_turns,
+            stream_retry_budget,
         );
     }
 
@@ -3470,12 +3600,14 @@ const AbiSession = struct {
         run_id: u64,
         parts: []const core.message.UserContentPart,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         return self.runRootWithBoundSkills(
             materializations,
             run_id,
             .{ .parts = parts },
             max_turns,
+            stream_retry_budget,
         );
     }
 
@@ -3485,6 +3617,30 @@ const AbiSession = struct {
         run_id: u64,
         input: RootRunInput,
         max_turns: u32,
+        stream_retry_budget: u8,
+    ) anyerror!SkillExecution {
+        return self.runRootWithBoundSkillsUsingProvider(
+            materializations,
+            run_id,
+            input,
+            max_turns,
+            stream_retry_budget,
+            self.core_session.provider.provider(),
+        );
+    }
+
+    /// `runRootWithBoundSkills` over an explicit base Provider: the
+    /// production path passes the Session's own, and tests a scripted one, so
+    /// the whole budgeted Run composition — admission, compaction control,
+    /// input budget, terminal reconciliation — is the code under test.
+    fn runRootWithBoundSkillsUsingProvider(
+        self: *AbiSession,
+        materializations: *skill_materialization.Manager,
+        run_id: u64,
+        input: RootRunInput,
+        max_turns: u32,
+        stream_retry_budget: u8,
+        base_provider: core.api_provider.Provider,
     ) anyerror!SkillExecution {
         const preflight = switch (input) {
             .text => |prompt| try self.preflightRootRecords(&.{prompt}),
@@ -3499,7 +3655,8 @@ const AbiSession = struct {
         var budget_provider = session_budget.BudgetedProvider{
             .allocator = allocator,
             .controller = &budget_controller,
-            .base = self.core_session.provider.provider(),
+            .base = base_provider,
+            .run_root = true,
         };
         if (self.active_budget_controller != null)
             return error.InvalidSessionState;
@@ -3513,6 +3670,17 @@ const AbiSession = struct {
         var run_admission = session_budget.RunAdmission{ .controller = &budget_controller };
         self.core_session.setResponseObserver(run_admission.observer());
         defer self.core_session.setResponseObserver(null);
+        // Compaction inside the Run (issue #430) answers to the same
+        // controller: checkpoint pressure may start it, its summary request
+        // is admitted as maintenance, and its replacement commits only if the
+        // re-measured checkpoint fits beside every live reservation.
+        var checkpoint_measurer = RunCheckpointMeasurer{ .facade = self, .run_id = run_id };
+        var run_compaction = session_budget.RunCompaction{
+            .controller = &budget_controller,
+            .measurer = checkpoint_measurer.measurer(),
+        };
+        self.core_session.setCompactionControl(run_compaction.control());
+        defer self.core_session.setCompactionControl(null);
         // Host input submitted during the Run is budgeted by the same controller.
         self.core_session.setRunInputAdmission(SubmittedInputBudget.admission(&budget_controller));
         defer self.core_session.finishRunInputAdmission();
@@ -3579,6 +3747,9 @@ const AbiSession = struct {
             run_id,
             .{ .ctx = self, .emit = AbiSession.emit },
         );
+        // Revision 28 (#452): the Host's re-issue budget for this Run's own
+        // model requests.
+        admitted.stream_retry_budget = stream_retry_budget;
         if (!self.startRunState(identity.session_id, run_id)) {
             _ = admitted.finishWithoutConversation() catch {};
             return error.CallbackFailed;
@@ -3783,11 +3954,17 @@ const MaterializedSkillRun = struct {
     invocation_record: ?[]const u8,
     /// Exact catalog generation retained for this admitted Run.
     mcp_view: ?mcp_session.View,
+    /// The Host's rendered context blocks for a Skill invocation Run (#534),
+    /// borrowed from the synchronous external run. It leads the invocation
+    /// record in the Session Conversation and, for a fork, the child's first
+    /// user record, as its own text part. Null when the Run has no context.
+    context_reminder: ?[]const u8 = null,
 
     fn executeInline(
         self: *MaterializedSkillRun,
         plan: *const skill_activation.ActivationPlan,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         var owned_invocation: ?[]u8 = null;
         defer if (owned_invocation) |record| allocator.free(record);
@@ -3826,7 +4003,8 @@ const MaterializedSkillRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         };
-        budget_controller.reconcileGeneratedRootPrompts(
+        budget_controller.reconcileGeneratedRootRecords(
+            self.context_reminder,
             &.{ invocation_record, body_record },
         ) catch {
             _ = try self.finishWithoutConversation();
@@ -3921,6 +4099,11 @@ const MaterializedSkillRun = struct {
             .controller = budget_controller,
             .base = inner_surface,
         };
+        // Revision 28 (#452): an inline Skill invocation is the Run's own loop.
+        self.admitted.stream_retry_budget = stream_retry_budget;
+        // #534: the Host's context leads the invocation record, which the
+        // first request sends before the Skill body.
+        self.admitted.lead_text = self.context_reminder;
         const result = self.admitted.runUserMessagesWithToolSurfaceUsingProvider(
             &.{ invocation_record, body_record },
             max_turns,
@@ -3964,6 +4147,7 @@ const MaterializedSkillRun = struct {
         self: *MaterializedSkillRun,
         plan: *const skill_activation.ActivationPlan,
         max_turns: u32,
+        stream_retry_budget: u8,
     ) anyerror!SkillExecution {
         var owned_invocation: ?[]u8 = null;
         defer if (owned_invocation) |record| allocator.free(record);
@@ -3991,7 +4175,8 @@ const MaterializedSkillRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         };
-        budget_controller.reconcileGeneratedRootPrompts(
+        budget_controller.reconcileGeneratedRootRecords(
+            self.context_reminder,
             &.{invocation_record},
         ) catch {
             _ = try self.finishWithoutConversation();
@@ -4009,10 +4194,15 @@ const MaterializedSkillRun = struct {
             .activation = &self.activation,
             .plan = plan,
             .max_turns = max_turns,
+            .stream_retry_budget = stream_retry_budget,
             .budget_controller = budget_controller,
             .budget_provider = budget_provider,
             .mcp_view = if (self.mcp_view) |*run_view| run_view else null,
+            .context_reminder = self.context_reminder,
         };
+        // #534: the Host's context leads the invocation record the Session
+        // Conversation keeps, as for an inline Skill or a Text Run.
+        self.admitted.lead_text = self.context_reminder;
         const result = self.admitted.runIsolated(
             &.{invocation_record},
             .{
@@ -4062,9 +4252,15 @@ const ForkExecutorContext = struct {
     activation: *skill_activation.Activation,
     plan: *const skill_activation.ActivationPlan,
     max_turns: u32,
+    /// Revision 28 (#452): the Host's budget, for a child that is the Run.
+    stream_retry_budget: u8,
     budget_controller: *session_budget.Controller,
     budget_provider: *session_budget.BudgetedProvider,
     mcp_view: ?*const mcp_session.View,
+    /// The Host's context for a Skill invocation Run (#534): it leads the
+    /// child's first user record, before the Skill body. Null for a
+    /// model-invoked fork and for a Run without context.
+    context_reminder: ?[]const u8 = null,
 
     fn execute(
         raw: *anyopaque,
@@ -4192,6 +4388,24 @@ const ForkExecutorContext = struct {
         // 这里逐字节发送同一份。
         const subagent_system_prompt = evidence.system_prompt orelse return error.InvalidSessionState;
 
+        // #534: a Skill invocation Run's context leads the child's first user
+        // record as its own text part, so the child's first request carries
+        // it before the Skill body, in the bytes a Text Run's record has. The
+        // child takes the Conversation's ownership at the call.
+        const child_conversation: ?core.conversation.Conversation = if (self.context_reminder) |reminder| conversation: {
+            var conversation = core.conversation.Conversation.init(output_allocator);
+            errdefer conversation.deinit();
+            const record = try core.message.userMessageFromParts(output_allocator, &.{
+                .{ .text = reminder },
+                .{ .text = self.activation.rendered_body },
+            });
+            conversation.append(record) catch |err| {
+                record.deinit(output_allocator);
+                return err;
+            };
+            break :conversation conversation;
+        } else null;
+
         const child = core.subagent.spawnAgentSink(
             output_allocator,
             child_provider.provider(),
@@ -4208,6 +4422,13 @@ const ForkExecutorContext = struct {
                 .model_error_out = switch (mode) {
                     .external_run_root => &self.session.last_model_error,
                     .model_tool => null,
+                },
+                // Revision 28 (#452): a child that is the Run streams the
+                // Run's visible output, so the Host's budget applies to it; a
+                // model-invoked fork's output is a tool result and has none.
+                .retractable_stream_retries = switch (mode) {
+                    .external_run_root => self.stream_retry_budget,
+                    .model_tool => 0,
                 },
                 .system_prompt = subagent_system_prompt,
                 .session = identity.session_id,
@@ -4242,6 +4463,7 @@ const ForkExecutorContext = struct {
                 .home_dir = self.session.workspace.home,
                 .state_root = self.session.workspace.state_root,
                 .additional_dirs = self.session.permission_ctx.match_ctx.additional_dirs,
+                .prebuilt_conversation = child_conversation,
             },
             &child_backend,
         ) catch |run_error| {
@@ -4637,14 +4859,14 @@ fn parseContextBlocks(
 }
 
 /// Revision 22 (#276): the runtime's `currentDate` block for this Run, or
-/// null when the Host turned it off, supplied its own, or the input is a Skill
-/// invocation (which carries no context). A Host `currentDate` block together
-/// with an explicit UTC offset is two answers to one question and is refused.
+/// null when the Host turned it off or supplied its own. Every input kind
+/// takes it: a Skill invocation carries context too (#534). A Host
+/// `currentDate` block together with an explicit UTC offset is two answers to
+/// one question and is refused.
 fn timeContextBlock(
     arena: std.mem.Allocator,
     options: *const wire.RunOptionsV1,
     host_blocks: []const core.context_blocks.Block,
-    kind_code: u32,
     unix_seconds: i64,
 ) !?core.context_blocks.Block {
     const host_has_time = for (host_blocks) |block| {
@@ -4653,12 +4875,11 @@ fn timeContextBlock(
     const zone: core.time_context.Zone = switch (options.time_context_code) {
         wire.TIME_CONTEXT_SYSTEM => blk: {
             if (options.utc_offset_minutes != 0) return error.InvalidTimeContext;
-            if (host_has_time or kind_code == wire.RUN_INPUT_SKILL) return null;
+            if (host_has_time) return null;
             break :blk core.time_context.systemZone(unix_seconds);
         },
         wire.TIME_CONTEXT_UTC_OFFSET => blk: {
             if (host_has_time) return error.ConflictingTimeContext;
-            if (kind_code == wire.RUN_INPUT_SKILL) return error.InvalidTimeContext;
             break :blk core.time_context.Zone.fromHostOffset(options.utc_offset_minutes) catch
                 return error.InvalidTimeContext;
         },
@@ -4723,6 +4944,9 @@ fn statusText(status: u32) []const u8 {
     return switch (status) {
         wire.STATUS_INVALID_ARGUMENT => "invalid argument",
         wire.STATUS_GOAL_CONFLICT => "goal conflict",
+        wire.STATUS_MESSAGE_POSITION_OUT_OF_RANGE => "message position out of range",
+        wire.STATUS_NOT_USER_MESSAGE => "not a user message",
+        wire.STATUS_MESSAGE_POSITION_COMPACTED => "message position compacted",
         wire.STATUS_OUT_OF_MEMORY => "out of memory",
         wire.STATUS_BUSY => "busy",
         wire.STATUS_STALE_RUN => "stale run",
@@ -4933,6 +5157,9 @@ fn coreOpenAiProtocol(
             .chat_completions
         else
             null,
+        // Bedrock has no provider code on ABI v1 (`provider` never returns
+        // it); exposing it is an ABI revision.
+        .bedrock => null,
     };
 }
 
@@ -7739,6 +7966,45 @@ fn sessionUpdatePermissionMode(
     return wire.STATUS_OK;
 }
 
+/// The public status of each rewind refusal. Exhaustive over
+/// `AbiSession.RewindError`, so a new refusal cannot reach the Host as a
+/// generic code.
+fn rewindStatus(err: AbiSession.RewindError) u32 {
+    return switch (err) {
+        error.PositionOutOfRange => wire.STATUS_MESSAGE_POSITION_OUT_OF_RANGE,
+        error.NotUserMessage => wire.STATUS_NOT_USER_MESSAGE,
+        error.PositionCompacted => wire.STATUS_MESSAGE_POSITION_COMPACTED,
+        error.SessionBusy => wire.STATUS_BUSY,
+        error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+    };
+}
+
+/// Revision 27 (#441). `position` is the 1-based count over the full history
+/// (compacted messages included), the numbering of `describe`'s
+/// `conversation.message_count`.
+fn sessionRewindToUserMessage(
+    handle: ?*wire.SessionHandle,
+    position: u64,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    if (position == 0)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "message position counts from 1", out_error);
+    // u64 and usize are the same width on the required 64-bit ABI.
+    const message_position = core.conversation.MessagePosition.fromOrdinal(@intCast(position)) catch
+        unreachable;
+    self.rewindToUserMessageAdmitted(message_position) catch |err|
+        return failError(rewindStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
 fn sessionUpdateMcp(
     handle: ?*wire.SessionHandle,
     selection_ptr: ?*const wire.McpSelectionV1,
@@ -7852,10 +8118,14 @@ fn sessionRunInput(
     const out = out_result orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
     if (run_id == 0 or input.struct_size != @sizeOf(wire.RunInputV1) or
         !allZero(input.reserved) or options.struct_size != @sizeOf(wire.RunOptionsV1) or
-        options.max_turns == 0 or !allZero(options.reserved))
+        options.max_turns == 0 or options.reserved0 != 0)
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid run id, RunInputV1, or RunOptionsV1", out_error);
     if (options.max_turns > wire.MAX_TURNS_V1)
         return fail(wire.STATUS_RESOURCE_LIMIT, "max_turns exceeds AgentCore ABI v1 limit", out_error);
+    // Revision 28 (#452): bounded, and refused before anything is admitted.
+    if (options.stream_retry_budget > wire.MAX_STREAM_RETRY_BUDGET_V1)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "stream_retry_budget exceeds AgentCore ABI v1 limit", out_error);
+    const stream_retry_budget: u8 = @intCast(options.stream_retry_budget);
     // Host context blocks become one <system-reminder> text part leading the
     // Run's user record: conversation content, so later requests keep it in
     // their cached prefix and checkpoints keep it byte for byte.
@@ -7880,7 +8150,6 @@ fn sessionRunInput(
         context_scratch.allocator(),
         options,
         context_blocks,
-        input.kind_code,
         core.time_context.currentUnixSeconds(),
     ) catch |err| return failError(inputErrorStatus(err), err, out_error);
     const run_blocks: []const core.context_blocks.Block = if (time_block) |block| blk: {
@@ -7892,8 +8161,6 @@ fn sessionRunInput(
     } else context_blocks;
     const context_reminder = core.context_blocks.render(context_scratch.allocator(), run_blocks) catch
         return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
-    if (context_reminder != null and input.kind_code == wire.RUN_INPUT_SKILL)
-        return fail(wire.STATUS_INVALID_ARGUMENT, "context blocks are not accepted with SkillInvocation input", out_error);
     self.pruneMovedMcpGrants() catch |err|
         return failError(switch (err) {
             error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
@@ -7935,6 +8202,7 @@ fn sessionRunInput(
                     run_id,
                     prompt,
                     options.max_turns,
+                    stream_retry_budget,
                 )
             else
                 self.runMultimodalWithBoundSkills(
@@ -7942,6 +8210,7 @@ fn sessionRunInput(
                     run_id,
                     if (prompt.len == 0) context_parts[0..1] else &context_parts,
                     options.max_turns,
+                    stream_retry_budget,
                 )) catch |err| {
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
@@ -7982,6 +8251,8 @@ fn sessionRunInput(
                 skill_id,
                 arguments,
                 options.max_turns,
+                stream_retry_budget,
+                context_reminder,
             ) catch |err| {
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
@@ -8041,6 +8312,7 @@ fn sessionRunInput(
                 run_id,
                 record_parts,
                 options.max_turns,
+                stream_retry_budget,
             ) catch |err| {
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
@@ -8332,7 +8604,9 @@ fn sessionCompact(
             .compacted => wire.COMPACT_COMPACTED,
             .no_change => wire.COMPACT_NO_CHANGE,
             .degraded => wire.COMPACT_DEGRADED,
-            .aborted => wire.COMPACT_ABORTED,
+            // A budget refusal of the replacement reports as the frozen v1
+            // ABORTED code; the budget outcome carries the reason.
+            .aborted, .refused => wire.COMPACT_ABORTED,
         },
         .before_context_tokens = @intCast(report.before_tokens),
         .after_context_tokens = @intCast(report.after_tokens),
@@ -8456,6 +8730,7 @@ const session_control_api_v1 = wire.SessionControlApiV1{
     .export_checkpoint = sessionExportCheckpoint,
     .set_prompt_profile = sessionSetPromptProfile,
     .update_permission_mode = sessionUpdatePermissionMode,
+    .rewind_to_user_message = sessionRewindToUserMessage,
 };
 
 const skill_api_v1 = wire.SkillApiV1{
@@ -8749,13 +9024,15 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 26), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 28), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 80), api.struct_size);
     try std.testing.expectEqual(@as(u32, 56), api.session.?.struct_size);
     try std.testing.expect(api.session.?.update_credential != null);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
     try std.testing.expect(api.session_control != null);
+    try std.testing.expectEqual(@as(u32, 88), api.session_control.?.struct_size);
+    try std.testing.expect(api.session_control.?.rewind_to_user_message != null);
     try std.testing.expect(api.skill != null);
     try std.testing.expect(api.mcp != null);
     try std.testing.expect(api.goal != null);
@@ -9428,7 +9705,8 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
             core.permission.checkPermission(child_ctx, "Edit", "{}"),
         );
         const calls_before_child_prompt = Probe.calls;
-        try std.testing.expect(!try core.permission.promptUser(
+        // A child has no requester: denied without asking anyone (#463).
+        try std.testing.expectError(error.PromptNobodyToAsk, core.permission.promptUser(
             child_ctx,
             "Edit",
             "{}",
@@ -10123,9 +10401,19 @@ test "Revision 17 AgentCore allow_session on Write covers later writes to the sa
         .undecided,
     ) == null);
 
-    // A call the tool and a JSON reader would resolve differently gets only
-    // the exact-argument candidate.
-    const ambiguous = "{\"a\\\"file_path\":\"elsewhere.txt\",\"file_path\":\"notes.txt\",\"content\":\"x\"}";
+    // The tool reads its top-level `file_path` structurally (#494): a key
+    // that only looks like `file_path` inside another key names nothing, so
+    // this call writes notes.txt and the file grant covers it.
+    const escaped_key = "{\"a\\\"file_path\":\"elsewhere.txt\",\"file_path\":\"notes.txt\",\"content\":\"x\"}";
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.allow,
+        AbiSession.permissionDecisionOverride(&fake, "Write", escaped_key, .undecided).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+
+    // A call that names no file the tool could open gets only the
+    // exact-argument candidate.
+    const ambiguous = "{\"file_path\":\"notes\\u0000.txt\",\"content\":\"x\"}";
     try ToolCall.append(native_session, "write-2", "Write", ambiguous);
     try std.testing.expect(AbiSession.permissionDecisionOverride(&fake, "Write", ambiguous, .undecided) == null);
     const ambiguous_request = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = ambiguous } };
@@ -13790,6 +14078,8 @@ test "disabled AgentCore Skill fails before admission and materialization" {
         &record.execution_id,
         "{\"values\":[]}",
         1,
+        0,
+        null,
     ));
     try std.testing.expectEqual(
         wire.STATUS_SKILL_POLICY_VIOLATION,
@@ -13815,6 +14105,8 @@ test "disabled AgentCore Skill fails before admission and materialization" {
         &record.execution_id,
         "{\"values\":[]}",
         1,
+        0,
+        null,
     ));
     try std.testing.expectEqual(@as(u64, 0), native_session.last_run_id);
     try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
@@ -13876,6 +14168,7 @@ test "checkpoint budget rejects text before consuming run identity" {
             1,
             &oversized,
             1,
+            0,
         ),
     );
 
@@ -14199,7 +14492,7 @@ test "compact bounds Provider payload and preserves checkpointability" {
     );
     try std.testing.expectEqual(@as(u32, 1), test_provider.calls);
     try std.testing.expectEqual(
-        core.compact_kernel.Outcome.aborted,
+        core.compact_kernel.Outcome.refused,
         report.outcome,
     );
     try std.testing.expectEqual(
@@ -14690,4 +14983,934 @@ test "fork depth uses the shared child-agent recursion ceiling" {
         error.AgentDepthExceeded,
         ForkExecutorContext.childDepth(core.tool_context.MAX_AGENT_DEPTH),
     );
+}
+
+// ── Issue #430: automatic compaction and continuation inside one Run ────────
+//
+// These drive the production Run composition (`runRootWithBoundSkillsUsing
+// Provider`: budget controller, budgeted Provider, response admission,
+// compaction control, input budget, terminal reconciliation) over a scripted
+// base Provider with a controlled window, so each test can count the real
+// sampling and compaction requests and inspect the durable state they leave.
+
+const AutoCompactScriptProvider = struct {
+    const Step = union(enum) {
+        /// A final answer.
+        text: []const u8,
+        /// Visible text plus one tool call; the turn continues.
+        tool: struct { text: []const u8, name: []const u8, input: []const u8 },
+        /// The provider refuses the request as too long, before any stream.
+        context_window_exceeded,
+    };
+    const SummaryStep = enum { summarize, abort_run, fail };
+    const Hook = *const fn (self: *AutoCompactScriptProvider) void;
+
+    model_name: []const u8,
+    sampling: []const Step,
+    summary: SummaryStep = .summarize,
+    window_tokens: u32 = 200_000,
+    facade: ?*AbiSession = null,
+    run_id: u64 = 0,
+    on_sampling: ?Hook = null,
+    on_summary: ?Hook = null,
+    sampling_calls: u32 = 0,
+    summary_calls: u32 = 0,
+    /// Message count of each sampling request, in order.
+    sampling_messages: [8]usize = [_]usize{0} ** 8,
+    hook_failed: bool = false,
+    estimate_checked: bool = false,
+    /// A copy of the live Conversation at the first sampling request after a
+    /// compaction, and what `measureRunCheckpoint` said it would export as.
+    mid_run_state: ?core.conversation.Conversation = null,
+    mid_run_measured: u64 = 0,
+    stream: Stream = undefined,
+
+    fn releaseMidRunState(self: *@This()) void {
+        if (self.mid_run_state) |*state| state.deinit();
+        self.mid_run_state = null;
+    }
+
+    fn provider(self: *@This()) core.api_provider.Provider {
+        return .{
+            .ctx = self,
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+
+    fn cast(raw: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn model(raw: *anyopaque) []const u8 {
+        return cast(raw).model_name;
+    }
+
+    fn isSummaryRequest(
+        messages: []const core.types.ApiMessage,
+        tools: ?[]const core.json.ToolDefinition,
+    ) bool {
+        if (tools != null or messages.len != 1 or messages[0].content.len == 0) return false;
+        return switch (messages[0].content[0]) {
+            .text => |body| std.mem.startsWith(u8, body, "Summarize this conversation for compaction"),
+            else => false,
+        };
+    }
+
+    fn sendStream(
+        raw: *anyopaque,
+        messages: []const core.types.ApiMessage,
+        _: ?[]const u8,
+        tools: ?[]const core.json.ToolDefinition,
+        _: ?*const core.util_abort.AbortSignal,
+        _: ?[]const u8,
+        _: ?core.json.ToolChoice,
+        _: []const u8,
+    ) anyerror!core.api_provider.StreamHandle {
+        const self = cast(raw);
+        if (isSummaryRequest(messages, tools)) {
+            self.summary_calls += 1;
+            if (self.on_summary) |hook| hook(self);
+            switch (self.summary) {
+                .summarize => {},
+                .abort_run => {
+                    const facade = self.facade orelse return error.Unused;
+                    facade.core_session.abort(self.run_id, .user_interrupt) catch {
+                        self.hook_failed = true;
+                    };
+                    return error.Aborted;
+                },
+                .fail => return error.ServerError,
+            }
+            self.stream = .{ .stop = .end_turn };
+            try self.stream.push(.{ .text = try allocator.dupe(u8, "<summary>earlier history, compacted</summary>") });
+            try self.stream.push(.{ .usage = .{ .input_tokens = 321, .output_tokens = 12 } });
+            return self.stream.handle();
+        }
+        const index = self.sampling_calls;
+        self.sampling_calls += 1;
+        if (index < self.sampling_messages.len) self.sampling_messages[index] = messages.len;
+        if (self.on_sampling) |hook| hook(self);
+        if (index >= self.sampling.len) return error.Unused;
+        switch (self.sampling[index]) {
+            .context_window_exceeded => return error.ContextWindowExceeded,
+            .text => |body| {
+                self.stream = .{ .stop = .end_turn };
+                try self.stream.push(.{ .text = try allocator.dupe(u8, body) });
+            },
+            .tool => |call| {
+                self.stream = .{ .stop = .tool_use };
+                try self.stream.push(.{ .text = try allocator.dupe(u8, call.text) });
+                const id = try std.fmt.allocPrint(allocator, "toolu_430_{d}", .{index});
+                errdefer allocator.free(id);
+                const name = try allocator.dupe(u8, call.name);
+                errdefer allocator.free(name);
+                const input = try allocator.dupe(u8, call.input);
+                errdefer allocator.free(input);
+                try self.stream.push(.{ .tool_use_start = .{ .id = id, .name = name, .input_json = input } });
+            },
+        }
+        return self.stream.handle();
+    }
+
+    fn sendStreamRetry(
+        raw: *anyopaque,
+        messages: []const core.types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const core.json.ToolDefinition,
+        abort: ?*const core.util_abort.AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?core.json.ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?core.api_provider.RetryReporter,
+        user_query: []const u8,
+    ) anyerror!core.api_provider.StreamHandle {
+        return sendStream(raw, messages, system, tools, abort, model_override, tool_choice, user_query);
+    }
+
+    fn send(
+        _: *anyopaque,
+        _: []const core.types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const core.json.ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!core.api_provider.ApiResponse {
+        return error.Unused;
+    }
+
+    fn maxTokens(_: *anyopaque) u32 {
+        return 1024;
+    }
+
+    fn maxInputTokens(raw: *anyopaque) u32 {
+        return cast(raw).window_tokens;
+    }
+
+    fn reasoningEffort(_: *anyopaque) ?core.types.ReasoningEffort {
+        return null;
+    }
+
+    fn supports(_: *anyopaque, _: core.api_provider.Capability) bool {
+        return false;
+    }
+
+    /// Up to four owned events, handed to the consumer in order; whatever the
+    /// consumer did not take is released on deinit.
+    const Stream = struct {
+        stop: core.api_stream.StopReason,
+        events: [4]core.api_stream.StreamEvent = undefined,
+        len: usize = 0,
+        next_index: usize = 0,
+
+        fn push(self: *Stream, event: core.api_stream.StreamEvent) !void {
+            if (self.len == self.events.len) return error.Unused;
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+
+        fn handle(self: *Stream) core.api_provider.StreamHandle {
+            return .{
+                .ctx = self,
+                .nextFn = next,
+                .deinitFn = deinit,
+                .stopReasonFn = streamStopReason,
+                .requestIdFn = requestId,
+            };
+        }
+
+        fn next(raw: *anyopaque) anyerror!?core.api_stream.StreamEvent {
+            const self: *Stream = @ptrCast(@alignCast(raw));
+            if (self.next_index == self.len) return null;
+            defer self.next_index += 1;
+            return self.events[self.next_index];
+        }
+
+        fn deinit(raw: *anyopaque) void {
+            const self: *Stream = @ptrCast(@alignCast(raw));
+            while (self.next_index < self.len) : (self.next_index += 1) switch (self.events[self.next_index]) {
+                .text, .thinking, .reasoning_item, .web_search_query => |bytes| allocator.free(bytes),
+                .tool_use_start => |tool| {
+                    allocator.free(tool.id);
+                    allocator.free(tool.name);
+                    allocator.free(tool.input_json);
+                },
+                .web_search_result => |result| {
+                    allocator.free(result.ui_text);
+                    allocator.free(result.content_json);
+                },
+                .usage, .done => {},
+            };
+        }
+
+        fn streamStopReason(raw: *anyopaque) core.api_stream.StopReason {
+            const self: *Stream = @ptrCast(@alignCast(raw));
+            return self.stop;
+        }
+
+        fn requestId(_: *anyopaque) core.util_log.RequestId {
+            return core.util_log.genRequestId();
+        }
+    };
+};
+
+/// Public `on_event` observations of the Runs under test.
+const AutoCompactEventLog = struct {
+    events: u32 = 0,
+    wrong_run: u32 = 0,
+    expected_run: u64 = 0,
+    auto_compacts: u32 = 0,
+    usage_events: u32 = 0,
+    model_errors: u32 = 0,
+    context_window_errors: u32 = 0,
+    causes: [256]u8 = undefined,
+    causes_len: usize = 0,
+
+    fn callbacks(self: *AutoCompactEventLog) wire.SessionCallbacksV1 {
+        var value = std.mem.zeroes(wire.SessionCallbacksV1);
+        value.struct_size = @sizeOf(wire.SessionCallbacksV1);
+        value.ctx = self;
+        value.on_event = onEvent;
+        return value;
+    }
+
+    fn onEvent(
+        raw: ?*anyopaque,
+        run: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *AutoCompactEventLog = @ptrCast(@alignCast(raw.?));
+        const json = if (event_json.ptr) |ptr| ptr[0..event_json.len] else "";
+        self.events += 1;
+        if (run == null or run.?.run_id != self.expected_run) self.wrong_run += 1;
+        if (std.mem.startsWith(u8, json, "{\"auto_compact\"")) {
+            self.auto_compacts += 1;
+            if (std.mem.indexOf(u8, json, "\"cause\":\"")) |at| {
+                const rest = json[at + 9 ..];
+                const end = std.mem.indexOfScalar(u8, rest, '"') orelse rest.len;
+                const cause = rest[0..end];
+                if (self.causes_len + cause.len + 1 <= self.causes.len) {
+                    @memcpy(self.causes[self.causes_len..][0..cause.len], cause);
+                    self.causes[self.causes_len + cause.len] = ';';
+                    self.causes_len += cause.len + 1;
+                }
+            }
+        }
+        if (std.mem.startsWith(u8, json, "{\"usage\"")) self.usage_events += 1;
+        if (std.mem.startsWith(u8, json, "{\"model_error\"")) {
+            self.model_errors += 1;
+            if (std.mem.indexOf(u8, json, "\"category\":\"context_window\"") != null)
+                self.context_window_errors += 1;
+        }
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn causeList(self: *const AutoCompactEventLog) []const u8 {
+        return self.causes[0..self.causes_len];
+    }
+};
+
+const AutoCompactFixture = struct {
+    tmp: std.testing.TmpDir,
+    root_buffer: [std.fs.max_path_bytes]u8 = undefined,
+    cwd: []const u8 = "",
+    native_runtime: *core.agent_session.AgentRuntime = undefined,
+    runtime: AbiRuntime = undefined,
+    session: *AbiSession = undefined,
+    events: AutoCompactEventLog = .{},
+
+    const Options = struct {
+        profile: session_budget.Profile = .{},
+        tools: []const []const u8 = &.{},
+        permission_mode: core.types.PermissionMode = .default,
+    };
+
+    /// In place: the Session keeps pointers into the fixture.
+    fn init(self: *AutoCompactFixture, options: Options) !void {
+        self.* = .{ .tmp = std.testing.tmpDir(.{}) };
+        errdefer self.tmp.cleanup();
+        const root_len = try self.tmp.dir.realPath(std.testing.io, &self.root_buffer);
+        self.cwd = self.root_buffer[0..root_len];
+        self.native_runtime = try core.agent_session.AgentRuntime.create(
+            allocator,
+            .{ .builtin_tools = options.tools },
+        );
+        errdefer self.native_runtime.destroy() catch unreachable;
+        self.runtime = .{
+            .core_runtime = self.native_runtime,
+            .host_tools = &.{},
+            .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+                std.testing.allocator,
+                [_]u8{0x43} ** 32,
+            ),
+            .materializations = undefined,
+        };
+        errdefer {
+            self.runtime.catalogs.tryBeginDestroy() catch unreachable;
+            self.runtime.catalogs.finishDestroy();
+        }
+        self.session = try buildAbiSession(&self.runtime, .{
+            .callbacks = self.events.callbacks(),
+            .provider_kind = .anthropic,
+            .api_key = "test-key",
+            .model = "test-model",
+            .base_url = null,
+            .permission_mode = options.permission_mode,
+            .permission_rules = null,
+            .workspace = .{ .root = self.cwd, .home = self.cwd },
+            .allowed_tools = options.tools,
+            .workspace_scope_id = [_]u8{0} ** 64,
+            .skill_binding = null,
+            .budget_profile = options.profile,
+        });
+    }
+
+    fn deinit(self: *AutoCompactFixture) void {
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        const status = sessionDestroy(self.session.handle(), &diagnostic);
+        bufferRelease(&diagnostic);
+        std.debug.assert(status == wire.STATUS_OK);
+        self.runtime.catalogs.tryBeginDestroy() catch unreachable;
+        self.runtime.catalogs.finishDestroy();
+        self.native_runtime.destroy() catch unreachable;
+        self.tmp.cleanup();
+    }
+
+    /// Replace the Session's durable budget profile before its first Run,
+    /// keeping the measured usage of the seeded history.
+    fn setProfile(self: *AutoCompactFixture, profile: session_budget.Profile) !void {
+        self.session.budget_state = try session_budget.SessionState.init(profile);
+        const usage = try self.session.measureDurableUsage();
+        try self.session.budget_state.updateUsage(usage.total_bytes);
+    }
+
+    /// History the Run starts from: `large` old messages of `large_bytes`
+    /// each, then `small` short ones, alternating user/assistant and ending on
+    /// assistant so the Run's own input follows.
+    fn seed(self: *AutoCompactFixture, large: usize, large_bytes: usize, small: usize) !void {
+        const body = try std.testing.allocator.alloc(u8, @max(large_bytes, 1));
+        defer std.testing.allocator.free(body);
+        const total = large + small;
+        std.debug.assert(total % 2 == 0);
+        for (0..total) |index| {
+            const role: core.message.Role = if (index % 2 == 0) .user else .assistant;
+            if (index < large) {
+                @memset(body, @as(u8, 'a') + @as(u8, @intCast(index % 26)));
+                try self.session.core_session.conversation.appendText(role, body[0..large_bytes]);
+            } else {
+                const line = try std.fmt.allocPrint(std.testing.allocator, "recent context line {d}", .{index});
+                defer std.testing.allocator.free(line);
+                try self.session.core_session.conversation.appendText(role, line);
+            }
+        }
+    }
+
+    fn run(
+        self: *AutoCompactFixture,
+        run_id: u64,
+        prompt: []const u8,
+        script: *AutoCompactScriptProvider,
+    ) !SkillExecution {
+        self.events.expected_run = run_id;
+        script.facade = self.session;
+        script.run_id = run_id;
+        return self.session.runRootWithBoundSkillsUsingProvider(
+            &self.runtime.materializations,
+            run_id,
+            .{ .text = prompt },
+            8,
+            0,
+            script.provider(),
+        );
+    }
+
+    fn exportedBytes(self: *AutoCompactFixture) !u64 {
+        var checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
+        defer checkpoint.deinit();
+        const report = try self.session.exportCheckpoint(
+            self.session.budget_state.profile.checkpointLimits(),
+            checkpoint.sink(),
+        );
+        return report.total_bytes;
+    }
+};
+
+fn completedStop(execution: SkillExecution) !core.agent_loop.StopReason {
+    return switch (execution) {
+        .completed => |result| result.stop_reason,
+        .aborted => error.TestUnexpectedResult,
+    };
+}
+
+/// A profile whose hard limit is `hard_bytes`, with every per-operation cap
+/// below it (the profile invariant) and the request cap out of the way, so
+/// the checkpoint's own capacity is the only limit a request meets.
+fn capacityTestProfile(hard_bytes: u64) session_budget.Profile {
+    return .{
+        .hard_bytes = hard_bytes,
+        .soft_bytes = hard_bytes - 1,
+        .input_cap_bytes = 64 * 1024,
+        .provider_request_cap_bytes = hard_bytes - 1,
+        .provider_result_cap_bytes = 64 * 1024,
+        .tool_result_cap_bytes = 64 * 1024,
+        .mcp_result_cap_bytes = 64 * 1024,
+    };
+}
+
+/// Every tool_use in the Conversation is answered by a tool_result with its
+/// id in the next message, and no result is orphaned.
+fn expectToolPairing(conversation: *const core.conversation.Conversation) !void {
+    const items = conversation.messages.items;
+    for (items, 0..) |message, index| for (message.blocks) |block| switch (block) {
+        .tool_use => |use| {
+            try std.testing.expect(index + 1 < items.len);
+            var answered = false;
+            for (items[index + 1].blocks) |next| switch (next) {
+                .tool_result => |result| answered = answered or std.mem.eql(u8, result.tool_use_id, use.id),
+                else => {},
+            };
+            try std.testing.expect(answered);
+        },
+        .tool_result => |result| {
+            try std.testing.expect(index > 0);
+            var asked = false;
+            for (items[index - 1].blocks) |previous| switch (previous) {
+                .tool_use => |use| asked = asked or std.mem.eql(u8, result.tool_use_id, use.id),
+                else => {},
+            };
+            try std.testing.expect(asked);
+        },
+        else => {},
+    };
+}
+
+/// Sampling hook: once the Run has compacted, the durable estimate it
+/// admits requests against is the exact checkpoint of the state it
+/// continues from — re-measured, not the pre-compaction running sum.
+fn expectEstimateMatchesCheckpoint(script: *AutoCompactScriptProvider) void {
+    const facade = script.facade orelse {
+        script.hook_failed = true;
+        return;
+    };
+    if (facade.core_session.conversation.compact_summary == null) return;
+    const controller = facade.active_budget_controller orelse {
+        script.hook_failed = true;
+        return;
+    };
+    const measured = facade.measureRunCheckpoint(script.run_id, &facade.core_session.conversation) catch {
+        script.hook_failed = true;
+        return;
+    };
+    script.estimate_checked = true;
+    if (controller.estimatedUsage() != measured.total_bytes) script.hook_failed = true;
+    if (script.mid_run_state == null) {
+        script.mid_run_state = facade.core_session.conversation.cloneInto(std.testing.allocator) catch {
+            script.hook_failed = true;
+            return;
+        };
+        script.mid_run_measured = measured.total_bytes;
+    }
+}
+
+/// The measurement the Run budgets against is the real export: put the
+/// Conversation captured mid-Run back in place of the live one, export the
+/// checkpoint through the ordinary idle path, and compare byte counts. The
+/// export is the independent oracle — `exportCheckpoint` builds its sections
+/// from a committed lease, not from `measureRunCheckpoint`.
+fn expectMidRunMeasureIsExport(fixture: *AutoCompactFixture, script: *AutoCompactScriptProvider) !void {
+    var captured = script.mid_run_state orelse return error.TestUnexpectedResult;
+    script.mid_run_state = null;
+    defer captured.deinit();
+    const live = &fixture.session.core_session.conversation;
+    std.mem.swap(core.conversation.Conversation, live, &captured);
+    const exported = fixture.exportedBytes();
+    std.mem.swap(core.conversation.Conversation, live, &captured);
+    try std.testing.expectEqual(script.mid_run_measured, try exported);
+    // Leave the Session's verified usage on its own state again.
+    _ = try fixture.exportedBytes();
+}
+
+/// Summary hook: the live Conversation changes while the summary is in
+/// flight, so the kernel's suffix check refuses the replacement
+/// (`error.ConcurrentMutation`): the recovery compaction itself fails.
+fn mutateDuringSummary(script: *AutoCompactScriptProvider) void {
+    const facade = script.facade orelse {
+        script.hook_failed = true;
+        return;
+    };
+    facade.core_session.conversation.appendText(.user, "appended during compaction") catch {
+        script.hook_failed = true;
+    };
+}
+
+/// Summary hook: one Host input submitted while the compaction is in flight.
+fn submitInputDuringSummary(script: *AutoCompactScriptProvider) void {
+    const facade = script.facade orelse {
+        script.hook_failed = true;
+        return;
+    };
+    _ = facade.core_session.submitInput(script.run_id, 1, "input sent during compaction") catch {
+        script.hook_failed = true;
+    };
+}
+
+fn conversationHasText(conversation: *const core.conversation.Conversation, wanted: []const u8) usize {
+    var count: usize = 0;
+    for (conversation.messages.items) |message| for (message.blocks) |block| switch (block) {
+        .text => |body| {
+            if (std.mem.eql(u8, body, wanted)) count += 1;
+        },
+        else => {},
+    };
+    return count;
+}
+
+test "issue #430: a Run that crosses the context threshold compacts and finishes under the same Run ID" {
+    var fixture: AutoCompactFixture = undefined;
+    try fixture.init(.{ .tools = &.{"Read"}, .permission_mode = .bypass_permissions });
+    defer fixture.deinit();
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "note.txt", .data = "note" });
+    // 60K-token window: the auto threshold is the 32K-token floor (~128 KB).
+    // Old history (4 x 22 KB) stays under it before the Run; the first
+    // response's text (50 KB) carries the pending request over it.
+    try fixture.seed(4, 22 * 1024, 10);
+    try fixture.setProfile(.{});
+    const big_text = try std.testing.allocator.alloc(u8, 50 * 1024);
+    defer std.testing.allocator.free(big_text);
+    @memset(big_text, 'w');
+    var script = AutoCompactScriptProvider{
+        .model_name = "issue430-threshold",
+        .window_tokens = 60_000,
+        .sampling = &.{
+            .{ .tool = .{ .text = big_text, .name = "Read", .input = "{\"file_path\":\"note.txt\"}" } },
+            .{ .text = "done" },
+        },
+        .on_sampling = expectEstimateMatchesCheckpoint,
+    };
+    defer script.releaseMidRunState();
+    const execution = try fixture.run(7, "continue the task", &script);
+
+    try std.testing.expectEqual(core.agent_loop.StopReason.end_turn, try completedStop(execution));
+    try std.testing.expect(!script.hook_failed);
+    try std.testing.expect(script.estimate_checked);
+    try std.testing.expectEqual(@as(u32, 2), script.sampling_calls);
+    try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+    // The second request is the compacted state: summary + retained suffix,
+    // fewer messages than the first one carried.
+    try std.testing.expect(script.sampling_messages[1] < script.sampling_messages[0]);
+    try std.testing.expectEqual(@as(u32, 1), fixture.events.auto_compacts);
+    try std.testing.expectEqualStrings("post_tool_follow_up_threshold;", fixture.events.causeList());
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.wrong_run);
+    // The summary request's usage reached the Host like any other request's.
+    try std.testing.expect(fixture.events.usage_events >= 1);
+    // No Host replay: one admitted Run, its input recorded exactly once.
+    try std.testing.expectEqual(@as(u64, 7), fixture.session.core_session.lastAdmittedRunId());
+    const conversation = &fixture.session.core_session.conversation;
+    try std.testing.expect(conversation.compact_summary != null);
+    try std.testing.expectEqual(@as(usize, 1), conversationHasText(conversation, "continue the task"));
+    try std.testing.expectEqual(@as(usize, 1), conversationHasText(conversation, "done"));
+    try expectToolPairing(conversation);
+    try std.testing.expectEqual(session_budget.Outcome.none, fixture.session.budget_state.last_outcome);
+    try std.testing.expectEqual(try fixture.exportedBytes(), fixture.session.budget_state.durable_usage_bytes);
+    // The in-Run estimate was the real export of the state it measured.
+    try expectMidRunMeasureIsExport(&fixture, &script);
+}
+
+test "issue #430: a provider context-window rejection compacts once and retries the same turn" {
+    var fixture: AutoCompactFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    try fixture.seed(4, 10 * 1024, 10);
+    try fixture.setProfile(.{});
+    var script = AutoCompactScriptProvider{
+        .model_name = "issue430-rejection",
+        .sampling = &.{ .context_window_exceeded, .{ .text = "done after recovery" } },
+    };
+    const execution = try fixture.run(3, "next step", &script);
+    try std.testing.expectEqual(core.agent_loop.StopReason.end_turn, try completedStop(execution));
+    try std.testing.expectEqual(@as(u32, 2), script.sampling_calls);
+    try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+    try std.testing.expect(script.sampling_messages[1] < script.sampling_messages[0]);
+    try std.testing.expectEqualStrings("context_window_exceeded_recovery;", fixture.events.causeList());
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.wrong_run);
+    try std.testing.expect(fixture.session.core_session.conversation.compact_summary != null);
+    try std.testing.expectEqual(@as(usize, 1), conversationHasText(&fixture.session.core_session.conversation, "next step"));
+    try std.testing.expectEqual(try fixture.exportedBytes(), fixture.session.budget_state.durable_usage_bytes);
+}
+
+test "issue #430: context-window recovery is bounded and never trims durable history" {
+    // (a) The rejection persists after a successful compaction: one summary,
+    // one retry, then a context_window model failure.
+    {
+        var fixture: AutoCompactFixture = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        try fixture.seed(4, 10 * 1024, 10);
+        try fixture.setProfile(.{});
+        var script = AutoCompactScriptProvider{
+            .model_name = "issue430-persistent",
+            .sampling = &.{ .context_window_exceeded, .context_window_exceeded, .context_window_exceeded },
+        };
+        const execution = try fixture.run(1, "still too long", &script);
+        try std.testing.expectEqual(core.agent_loop.StopReason.api_error, try completedStop(execution));
+        try std.testing.expectEqual(@as(u32, 2), script.sampling_calls);
+        try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+        const recorded = fixture.session.core_session.last_model_error orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(core.api_model_error.Category.context_window, recorded.category);
+        // The compacted state committed; nothing beyond it was trimmed.
+        const conversation = &fixture.session.core_session.conversation;
+        try std.testing.expect(conversation.compact_summary != null);
+        try std.testing.expect(conversation.activeMessages().len >= 10);
+    }
+    // (b) Nothing compactable: no summary request, no retry, history intact
+    // (the CLI's trim fallback would have dropped the oldest pair).
+    {
+        var fixture: AutoCompactFixture = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        try fixture.seed(0, 0, 2);
+        try fixture.setProfile(.{});
+        var script = AutoCompactScriptProvider{
+            .model_name = "issue430-nothing",
+            .sampling = &.{ .context_window_exceeded, .context_window_exceeded },
+        };
+        const before = fixture.session.core_session.conversation.len();
+        const execution = try fixture.run(1, "short", &script);
+        try std.testing.expectEqual(core.agent_loop.StopReason.api_error, try completedStop(execution));
+        try std.testing.expectEqual(@as(u32, 1), script.sampling_calls);
+        try std.testing.expectEqual(@as(u32, 0), script.summary_calls);
+        try std.testing.expectEqual(@as(u32, 0), fixture.events.auto_compacts);
+        try std.testing.expectEqual(before + 1, fixture.session.core_session.conversation.len());
+        const recorded = fixture.session.core_session.last_model_error orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(core.api_model_error.Category.context_window, recorded.category);
+    }
+    // (c) One oversized payload — the Run's own input. Compacting the small
+    // history cannot save enough, so the savings gate refuses before any
+    // summary request is paid for.
+    {
+        var fixture: AutoCompactFixture = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        try fixture.seed(0, 0, 14);
+        try fixture.setProfile(.{});
+        const huge = try std.testing.allocator.alloc(u8, 400 * 1024);
+        defer std.testing.allocator.free(huge);
+        @memset(huge, 'h');
+        var script = AutoCompactScriptProvider{
+            .model_name = "issue430-oversized",
+            .sampling = &.{ .context_window_exceeded, .context_window_exceeded },
+        };
+        const execution = try fixture.run(1, huge, &script);
+        try std.testing.expectEqual(core.agent_loop.StopReason.api_error, try completedStop(execution));
+        try std.testing.expectEqual(@as(u32, 1), script.sampling_calls);
+        try std.testing.expectEqual(@as(u32, 0), script.summary_calls);
+        try std.testing.expect(fixture.session.core_session.conversation.compact_summary == null);
+    }
+    // (d) The summary request fails: at most the kernel's degraded
+    // replacement, one retry, then the Run stops.
+    {
+        var fixture: AutoCompactFixture = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        try fixture.seed(4, 10 * 1024, 10);
+        try fixture.setProfile(.{});
+        var script = AutoCompactScriptProvider{
+            .model_name = "issue430-summary-fails",
+            .summary = .fail,
+            .sampling = &.{ .context_window_exceeded, .context_window_exceeded, .context_window_exceeded },
+        };
+        const execution = try fixture.run(1, "again", &script);
+        try std.testing.expectEqual(core.agent_loop.StopReason.api_error, try completedStop(execution));
+        try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+        try std.testing.expect(script.sampling_calls <= 2);
+        const recorded = fixture.session.core_session.last_model_error orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(core.api_model_error.Category.context_window, recorded.category);
+    }
+}
+
+test "issue #430: checkpoint soft pressure compacts; usage is re-measured and pending input survives" {
+    var fixture: AutoCompactFixture = undefined;
+    try fixture.init(.{ .tools = &.{"Read"}, .permission_mode = .bypass_permissions });
+    defer fixture.deinit();
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "note.txt", .data = "note" });
+    try fixture.seed(4, 16 * 1024, 10);
+    // The token window is nowhere near: only the checkpoint budget asks.
+    const initial = try fixture.session.measureDurableUsage();
+    var profile = session_budget.Profile{};
+    profile.soft_bytes = initial.total_bytes + 2048;
+    try fixture.setProfile(profile);
+    const reply = try std.testing.allocator.alloc(u8, 4096);
+    defer std.testing.allocator.free(reply);
+    @memset(reply, 'r');
+    var script = AutoCompactScriptProvider{
+        .model_name = "issue430-soft",
+        .sampling = &.{
+            .{ .tool = .{ .text = reply, .name = "Read", .input = "{\"file_path\":\"note.txt\"}" } },
+            .{ .text = "done" },
+        },
+        .on_sampling = expectEstimateMatchesCheckpoint,
+        .on_summary = submitInputDuringSummary,
+    };
+    defer script.releaseMidRunState();
+    const execution = try fixture.run(5, "work", &script);
+    try std.testing.expectEqual(core.agent_loop.StopReason.end_turn, try completedStop(execution));
+    try std.testing.expect(!script.hook_failed);
+    try std.testing.expect(script.estimate_checked);
+    try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+    try std.testing.expectEqualStrings("durable_capacity_threshold;", fixture.events.causeList());
+    // The input accepted during compaction kept its reservation and was
+    // adopted at the next turn boundary: it is durable state now.
+    const counts = fixture.session.core_session.runInputReconciliation(5) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), counts.accepted);
+    try std.testing.expectEqual(@as(u32, 1), counts.adopted);
+    try std.testing.expectEqual(@as(usize, 1), conversationHasText(&fixture.session.core_session.conversation, "input sent during compaction"));
+    const budget = fixture.session.budget_state.describe();
+    try std.testing.expectEqual(session_budget.Outcome.none, budget.last_outcome);
+    try std.testing.expect(budget.durable_usage_bytes < initial.total_bytes);
+    try std.testing.expectEqual(try fixture.exportedBytes(), budget.durable_usage_bytes);
+    // Mid-Run, after the compaction and with the input still pending: the
+    // estimate the Run admitted against is what that state exports as.
+    try expectMidRunMeasureIsExport(&fixture, &script);
+}
+
+test "issue #430: a request the checkpoint cannot hold is deferred, compacted for, then sent" {
+    var fixture: AutoCompactFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    try fixture.seed(4, 96 * 1024, 10);
+    const initial = try fixture.session.measureDurableUsage();
+    // The first request (about the whole history again) beside the durable
+    // state cannot fit; dropping the old history shrinks both.
+    var profile = capacityTestProfile(2 * initial.total_bytes + 64 * 1024);
+    profile.soft_bytes = profile.hard_bytes - 1;
+    try fixture.setProfile(profile);
+    var script = AutoCompactScriptProvider{
+        .model_name = "issue430-hard",
+        .sampling = &.{.{ .text = "fits now" }},
+    };
+    const execution = try fixture.run(9, "go", &script);
+    try std.testing.expectEqual(core.agent_loop.StopReason.end_turn, try completedStop(execution));
+    // Deferred before any network I/O: the one sampling request sent is the
+    // one after compaction.
+    try std.testing.expectEqual(@as(u32, 1), script.sampling_calls);
+    try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+    try std.testing.expectEqualStrings("durable_capacity_recovery;", fixture.events.causeList());
+    try std.testing.expectEqual(session_budget.Outcome.none, fixture.session.budget_state.last_outcome);
+    try std.testing.expectEqual(try fixture.exportedBytes(), fixture.session.budget_state.durable_usage_bytes);
+}
+
+test "issue #430: capacity recovery stops with the budget terminal when compaction cannot help" {
+    var fixture: AutoCompactFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    // Two large messages and nothing older than the retained suffix.
+    try fixture.seed(2, 96 * 1024, 0);
+    const initial = try fixture.session.measureDurableUsage();
+    var profile = capacityTestProfile(2 * initial.total_bytes + 64 * 1024);
+    profile.soft_bytes = profile.hard_bytes - 1;
+    try fixture.setProfile(profile);
+    var script = AutoCompactScriptProvider{
+        .model_name = "issue430-hard-stuck",
+        .sampling = &.{.{ .text = "never sent" }},
+    };
+    const execution = try fixture.run(2, "go", &script);
+    try std.testing.expectEqual(core.agent_loop.StopReason.api_error, try completedStop(execution));
+    try std.testing.expectEqual(@as(u32, 0), script.sampling_calls);
+    try std.testing.expectEqual(@as(u32, 0), script.summary_calls);
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.auto_compacts);
+    const budget = fixture.session.budget_state.describe();
+    try std.testing.expectEqual(session_budget.Outcome.budget_exhausted, budget.last_outcome);
+    try std.testing.expect(budget.required_bytes > profile.hard_bytes);
+}
+
+test "issue #430: a compaction summary is budgeted: over its result cap nothing commits" {
+    var fixture: AutoCompactFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    try fixture.seed(4, 10 * 1024, 10);
+    // A summary larger than the provider result cap is a resource limit like
+    // any other response: the stream is cut, the replacement refused.
+    var profile = session_budget.Profile{};
+    profile.provider_result_cap_bytes = 16;
+    try fixture.setProfile(profile);
+    var script = AutoCompactScriptProvider{
+        .model_name = "issue430-summary-budget",
+        .sampling = &.{ .context_window_exceeded, .{ .text = "never" } },
+    };
+    const execution = try fixture.run(4, "go", &script);
+    // The refused replacement is the budget terminal, not a cancellation: the
+    // Run stops as a failed request whose reason is the recorded outcome
+    // (the facade reports it as STOP_CHECKPOINT_RESOURCE_LIMIT, phase
+    // `failed`), and no model failure is reported for it.
+    try std.testing.expectEqual(core.agent_loop.StopReason.api_error, try completedStop(execution));
+    try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+    try std.testing.expectEqual(@as(u32, 1), script.sampling_calls);
+    try std.testing.expectEqual(session_budget.Outcome.resource_limit, fixture.session.budget_state.last_outcome);
+    try std.testing.expect(fixture.session.core_session.conversation.compact_summary == null);
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.auto_compacts);
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.model_errors);
+    try std.testing.expect(!stopsOnModelFailure(fixture.session, .api_error));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.failed, terminalPhaseForStopReason(.api_error));
+    try std.testing.expect(!fixture.session.facade_poisoned.load(.acquire));
+}
+
+test "issue #430: a capacity recovery that gives up records the budget terminal with the bytes it needed" {
+    var fixture: AutoCompactFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    try fixture.seed(4, 96 * 1024, 10);
+    const initial = try fixture.session.measureDurableUsage();
+    // As in the deferral test: the first request cannot fit beside the
+    // durable state, and compaction could make it fit — but the compaction
+    // fails (the live Conversation changes under it), so the loop gives up
+    // on the deferred request instead of re-issuing it.
+    var profile = capacityTestProfile(2 * initial.total_bytes + 64 * 1024);
+    profile.soft_bytes = profile.hard_bytes - 1;
+    try fixture.setProfile(profile);
+    var script = AutoCompactScriptProvider{
+        .model_name = "issue430-give-up",
+        .sampling = &.{.{ .text = "never sent" }},
+        .on_summary = mutateDuringSummary,
+    };
+    const execution = try fixture.run(13, "go", &script);
+    try std.testing.expectEqual(core.agent_loop.StopReason.api_error, try completedStop(execution));
+    try std.testing.expect(!script.hook_failed);
+    try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+    try std.testing.expectEqual(@as(u32, 0), script.sampling_calls);
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.auto_compacts);
+    // The budget terminal, with the bytes the deferred request needed — not
+    // an unexplained provider failure.
+    const budget = fixture.session.budget_state.describe();
+    try std.testing.expectEqual(session_budget.Outcome.budget_exhausted, budget.last_outcome);
+    try std.testing.expect(budget.required_bytes > profile.hard_bytes);
+    try std.testing.expect(budget.required_bytes != profile.hard_bytes + 1);
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.model_errors);
+    try std.testing.expect(fixture.session.core_session.conversation.compact_summary == null);
+}
+
+test "issue #430: cancelling during compaction keeps tools, pairing, permission and input state" {
+    var fixture: AutoCompactFixture = undefined;
+    try fixture.init(.{ .tools = &.{"Write"}, .permission_mode = .bypass_permissions });
+    defer fixture.deinit();
+    try fixture.seed(4, 10 * 1024, 10);
+    const initial = try fixture.session.measureDurableUsage();
+    var profile = session_budget.Profile{};
+    profile.soft_bytes = initial.total_bytes + 2048;
+    try fixture.setProfile(profile);
+    const reply = try std.testing.allocator.alloc(u8, 4096);
+    defer std.testing.allocator.free(reply);
+    @memset(reply, 'c');
+    var script = AutoCompactScriptProvider{
+        .model_name = "issue430-cancel",
+        .summary = .abort_run,
+        .on_summary = submitInputDuringSummary,
+        .sampling = &.{
+            .{ .tool = .{ .text = reply, .name = "Write", .input = "{\"file_path\":\"ledger.txt\",\"content\":\"x\"}" } },
+            .{ .text = "must not be requested" },
+        },
+    };
+    const rules_before = fixture.session.permission_state.ruleCount();
+    const mode_before = fixture.session.core_session.permission_ctx.modeValue();
+    const execution = try fixture.run(11, "write the ledger", &script);
+    try std.testing.expectEqual(core.agent_loop.StopReason.aborted, try completedStop(execution));
+    try std.testing.expect(!script.hook_failed);
+    try std.testing.expectEqual(@as(u32, 1), script.sampling_calls);
+    try std.testing.expectEqual(@as(u32, 1), script.summary_calls);
+    const conversation = &fixture.session.core_session.conversation;
+    // The cancelled compaction committed nothing.
+    try std.testing.expect(conversation.compact_summary == null);
+    try std.testing.expectEqual(@as(u32, 0), fixture.events.auto_compacts);
+    try expectToolPairing(conversation);
+    try std.testing.expectEqual(rules_before, fixture.session.permission_state.ruleCount());
+    try std.testing.expectEqual(mode_before, fixture.session.core_session.permission_ctx.modeValue());
+    // Accepted during compaction, never adopted, and not in the Conversation.
+    const counts = fixture.session.core_session.runInputReconciliation(11) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), counts.accepted);
+    try std.testing.expectEqual(@as(u32, 0), counts.adopted);
+    try std.testing.expectEqual(@as(usize, 0), conversationHasText(conversation, "input sent during compaction"));
+    try std.testing.expect(!fixture.session.facade_poisoned.load(.acquire));
+    try std.testing.expectEqual(try fixture.exportedBytes(), fixture.session.budget_state.durable_usage_bytes);
+
+    // The tool ran once. Remove its effect: a later Run that replayed the
+    // call would bring the file back.
+    _ = try fixture.tmp.dir.statFile(std.testing.io, "ledger.txt", .{ .follow_symlinks = false });
+    try fixture.tmp.dir.deleteFile(std.testing.io, "ledger.txt");
+    var next = AutoCompactScriptProvider{
+        .model_name = "issue430-cancel-next",
+        .sampling = &.{.{ .text = "resumed" }},
+    };
+    const resumed = try fixture.run(12, "carry on", &next);
+    try std.testing.expectEqual(core.agent_loop.StopReason.end_turn, try completedStop(resumed));
+    try std.testing.expectEqual(@as(u32, 1), next.sampling_calls);
+    try std.testing.expectError(
+        error.FileNotFound,
+        fixture.tmp.dir.statFile(std.testing.io, "ledger.txt", .{ .follow_symlinks = false }),
+    );
+    try expectToolPairing(&fixture.session.core_session.conversation);
 }

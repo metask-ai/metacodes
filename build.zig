@@ -12,6 +12,8 @@ var g_hl_mod: ?*std.Build.Module = null;
 var g_code_mod: ?*std.Build.Module = null;
 var g_formal_kernel_sha256: ?[]const u8 = null;
 var g_project_kernel_sha256: ?[]const u8 = null;
+var g_sandbox_helper_install: ?*std.Build.Step = null;
+var g_sandbox_helper_path: ?[]const u8 = null;
 fn addHl(b: *std.Build, mod: *std.Build.Module) void {
     addHlWithProjectHarnessActuation(b, mod, false);
 }
@@ -70,6 +72,10 @@ fn addTestRunArtifact(
     // steps regardless, but state the doctrine here so a future caching change
     // cannot silently turn cached test binaries into stale green evidence.
     run.has_side_effects = true;
+    if (g_sandbox_helper_install) |install| {
+        run.step.dependOn(install);
+        run.setEnvironmentVariable("METACODES_SANDBOX_HELPER", g_sandbox_helper_path.?);
+    }
     return run;
 }
 
@@ -246,26 +252,51 @@ fn gitStdout(b: *std.Build, argv: []const []const u8) ?[]const u8 {
     return std.mem.trim(u8, raw, " \t\r\n");
 }
 
-const RipgrepBundleInfo = struct { version: []const u8, revision: []const u8, sha256: ?[]const u8 };
+const RipgrepBundleInfo = struct {
+    version: []const u8,
+    revision: []const u8,
+    sha256: ?[]const u8,
+    /// Repository-relative path of the vendored binary for this target.
+    path: ?[]const u8,
+};
+
+/// Hands the repository-pinned ripgrep to a test process: the tests that must
+/// run against exactly the manifest-pinned binary (Grep's argv contract, #460)
+/// read it from here instead of whatever `rg` is on PATH, and check the digest
+/// before using it. A target without a vendored binary says so explicitly
+/// (`unavailable`, not an empty value Windows may drop), so a test can tell a
+/// missing pin from missing wiring.
+fn wirePinnedRipgrepTestInput(b: *std.Build, run: *std.Build.Step.Run, ripgrep: RipgrepBundleInfo) void {
+    const path = ripgrep.path orelse {
+        run.setEnvironmentVariable("METACODES_TEST_PINNED_RG", "unavailable");
+        return;
+    };
+    run.setEnvironmentVariable("METACODES_TEST_PINNED_RG", b.pathFromRoot(b.fmt("vendor/ripgrep/{s}", .{path})));
+    run.setEnvironmentVariable("METACODES_TEST_PINNED_RG_SHA256", ripgrep.sha256.?);
+}
 
 /// `vendor/ripgrep/manifest.json` names the upstream release and, per target,
 /// the vendored binary's digest; a target without one resolves rg from the
 /// environment and carries no expectation.
 fn ripgrepBundleInfo(b: *std.Build, target: std.Target) RipgrepBundleInfo {
     const Manifest = struct {
-        artifacts: []const struct { sha256: []const u8, targets: []const []const u8 },
+        artifacts: []const struct { sha256: []const u8, path: []const u8, targets: []const []const u8 },
         upstream_release: []const u8,
         upstream_revision: []const u8,
     };
     const parsed = parseJsonFile(b, Manifest, "vendor/ripgrep/manifest.json");
     const family = b.fmt("{s}-{s}", .{ @tagName(target.cpu.arch), @tagName(target.os.tag) });
     var sha256: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
     for (parsed.artifacts) |artifact| {
         for (artifact.targets) |candidate| {
-            if (std.mem.eql(u8, candidate, family)) sha256 = artifact.sha256;
+            if (std.mem.eql(u8, candidate, family)) {
+                sha256 = artifact.sha256;
+                path = artifact.path;
+            }
         }
     }
-    return .{ .version = parsed.upstream_release, .revision = parsed.upstream_revision, .sha256 = sha256 };
+    return .{ .version = parsed.upstream_release, .revision = parsed.upstream_revision, .sha256 = sha256, .path = path };
 }
 
 const TinyKgContractInfo = struct { version: []const u8, source_commit: []const u8 };
@@ -890,6 +921,27 @@ pub fn build(b: *std.Build) void {
     } else .{ .step = &b.addInstallArtifact(exe, .{}).step, .debug_file = null };
     const install_cli = cli_install.step;
     b.getInstallStep().dependOn(install_cli);
+
+    // A small trusted executor opens native tool files inside the platform
+    // sandbox and passes the resulting fd back. Library hosts receive the
+    // same helper in their bundle; neither path depends on Python or PATH.
+    const sandbox_helper_mod = b.createModule(.{
+        .root_source_file = b.path("src/sandbox_helper_root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    addPlatform(b, sandbox_helper_mod);
+    const sandbox_helper_exe = b.addExecutable(.{
+        .name = "metacodes-fs-helper",
+        .root_module = sandbox_helper_mod,
+    });
+    const install_sandbox_helper = b.addInstallArtifact(sandbox_helper_exe, .{ .pdb_dir = .disabled });
+    g_sandbox_helper_install = &install_sandbox_helper.step;
+    g_sandbox_helper_path = b.getInstallPath(.bin, sandbox_helper_exe.out_filename);
+    b.getInstallStep().dependOn(&install_sandbox_helper.step);
+    const sandbox_helper_step = b.step("sandbox:helper", "Build and install the native filesystem sandbox helper");
+    sandbox_helper_step.dependOn(&install_sandbox_helper.step);
 
     // E3 causal evaluation only: same product root/provider/agent/tool path,
     // but formal blocks are observed rather than actuated.  There is no env or
@@ -1772,6 +1824,10 @@ pub fn build(b: *std.Build) void {
         .implib_dir = .disabled,
         .dylib_symlinks = false,
     });
+    const install_agentcore_sandbox_helper = b.addInstallArtifact(sandbox_helper_exe, .{
+        .dest_dir = .{ .override = .{ .custom = b.fmt("{s}/bin", .{agentcore_bundle_rel}) } },
+        .pdb_dir = .disabled,
+    });
     const install_agentcore_header = b.addInstallFileWithDir(
         b.path("sdk/metask/agentcore.h"),
         .prefix,
@@ -1864,6 +1920,7 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.step.dependOn(&agentcore_shared_gate_cmd.step);
     manifest_cmd.step.dependOn(installed_agentcore_lib_ready);
     manifest_cmd.step.dependOn(&install_agentcore_shared.step);
+    manifest_cmd.step.dependOn(&install_agentcore_sandbox_helper.step);
     manifest_cmd.step.dependOn(&install_agentcore_header.step);
     manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
     manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
@@ -2302,10 +2359,15 @@ pub fn build(b: *std.Build) void {
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
     provider_test_step.dependOn(&addTestRunArtifact(b, provider_test).step);
 
-    // subsystem:boundary —— the provider kernel and the picker may import only
-    // what their doc comments say, and so may every file they reach. The
-    // compile-from-a-narrow-root gates cannot enforce it: their module root is
-    // `src/`, so any file under it is importable. This checks the rule where
+    // subsystem:boundary —— the provider kernel, the picker and the MCP client
+    // may import only what their doc comments say, and so may every file they
+    // reach; nothing metacodes-core reaches from `src/lib.zig` may import the
+    // application side beyond a baseline that only shrinks (#448), and no
+    // file under `src/daemon/` or `src/web/` may import the AgentLoop beyond
+    // another such baseline (#445). The
+    // compile-from-a-narrow-root gates and `test:lib` cannot enforce it: their
+    // module root is `src/`, so any file under it is importable, and lazy
+    // analysis skips imports in code nothing calls. This checks the rule where
     // the rule lives, in the source.
     const subsystem_boundary_mod = b.createModule(.{
         .root_source_file = b.path("scripts/subsystem_boundary_gate.zig"),
@@ -2325,7 +2387,7 @@ pub fn build(b: *std.Build) void {
     });
     const subsystem_boundary_step = b.step(
         "subsystem:boundary",
-        "Enforce the provider, picker and MCP client import boundaries (#16, #405)",
+        "Enforce the provider, picker, MCP client, metacodes-core and host import boundaries (#16, #405, #445, #448)",
     );
     subsystem_boundary_step.dependOn(&subsystem_boundary_run.step);
     subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit).step);
@@ -2552,6 +2614,18 @@ pub fn build(b: *std.Build) void {
     const io_threaded_test_step = b.step("test:io-threaded", "Test that std.Io.Threaded is created only through platform.signal.threadedIo");
     io_threaded_test_step.dependOn(&io_threaded_test_cmd.step);
     units_test_step.dependOn(&io_threaded_test_cmd.step);
+    // Production threads state their stack through platform.thread.spawn: std's
+    // 16 MiB default is a 16 MiB commit per thread on Windows (#503).
+    const thread_stack_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_thread_stack_discipline",
+        "-v",
+    });
+    const thread_stack_test_step = b.step("test:thread-stack", "Test that production threads spawn through platform.thread.spawn with a stated stack");
+    thread_stack_test_step.dependOn(&thread_stack_test_cmd.step);
+    units_test_step.dependOn(&thread_stack_test_cmd.step);
     // The REPL's SIGWINCH handler has no SA_RESTART: its terminal reads retry
     // EINTR and its terminal writes go through pfs.writeAll (#340).
     const terminal_io_test_cmd = b.addSystemCommand(&.{
@@ -2587,6 +2661,18 @@ pub fn build(b: *std.Build) void {
     const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
     gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
     units_test_step.dependOn(&gate_manifest_test_cmd.step);
+    const pr_loop_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_pr_loop",
+        "scripts.tests.test_pr_policy",
+        "scripts.tests.test_ci_evidence",
+        "-v",
+    });
+    const pr_loop_test_step = b.step("test:pr-loop", "Test PR review, repair, exact-head merging and CI evidence");
+    pr_loop_test_step.dependOn(&pr_loop_test_cmd.step);
+    units_test_step.dependOn(&pr_loop_test_cmd.step);
     const release_cut_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2842,6 +2928,17 @@ pub fn build(b: *std.Build) void {
             caps_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
             product_test_step.dependOn(&caps_e2e.step);
         }
+        // What plain `-p` says when a Run fails (#417): real exit code, stdout
+        // and stderr against a loopback mock on all four wires.
+        {
+            const stop_notice_e2e = b.addSystemCommand(&.{
+                if (@import("builtin").os.tag == .windows) "python" else "python3",
+                "tests/e2e/headless_stop_notice_e2e.py",
+            });
+            stop_notice_e2e.step.dependOn(b.getInstallStep());
+            stop_notice_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
+            product_test_step.dependOn(&stop_notice_e2e.step);
+        }
         // The native project-Harness suites (E3 runtime and templates, the
         // E2 evolution lifecycle, the calibration matrix) run the installed
         // product, both zero-provider drivers, the project kernel and the
@@ -2953,6 +3050,7 @@ pub fn build(b: *std.Build) void {
         wireTinyKgTestInput(run_shard, staged_tinykg);
         wireTinyKgdTestInput(run_shard, staged_tinykgd);
         wireLeanKernelTestInputs(run_shard, staged_lean_kernels);
+        wirePinnedRipgrepTestInput(b, run_shard, ripgrep_bundle);
         integration_reports[shard_index] = run_shard.captureStdOut(.{
             .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
         });
@@ -2972,6 +3070,7 @@ pub fn build(b: *std.Build) void {
     wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
     wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
     wireLeanKernelTestInputs(integration_monolithic_run, staged_lean_kernels);
+    wirePinnedRipgrepTestInput(b, integration_monolithic_run, ripgrep_bundle);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
     integration_monolithic_step.dependOn(&integration_monolithic_run.step);
 
@@ -2993,6 +3092,7 @@ pub fn build(b: *std.Build) void {
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
     wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
     wireLeanKernelTestInputs(integration_timed_run, staged_lean_kernels);
+    wirePinnedRipgrepTestInput(b, integration_timed_run, ripgrep_bundle);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
 

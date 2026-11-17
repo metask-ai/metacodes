@@ -44,6 +44,17 @@ pub fn parseName(s: []const u8) ?Mode {
     return parseStrict(buf[0..s.len]);
 }
 
+/// Why a mode the settings disable (`disableBypassPermissionsMode`,
+/// `disableAutoMode`) was refused, in words: what `--web`/`serve` and
+/// `SessionHost` (#445) journal as `message_rejected.message`.
+pub fn disabledReason(m: Mode) []const u8 {
+    return switch (canonical(m)) {
+        .bypass_permissions => "bypassPermissions is disabled by settings",
+        .auto => "auto mode is disabled by settings",
+        else => "permission mode is disabled by settings",
+    };
+}
+
 /// 宽松解析(settings/config 层沿用):未知值退化为 .default。
 pub fn parse(s: []const u8) Mode {
     return parseStrict(s) orelse .default;

@@ -129,7 +129,7 @@ dylib 加载，也不把活跃 Session 的 catalog 改写为新代。
 `Registrar.provide(T, local_name, pointer, cleanup)`，consumer 只有在 descriptor 的
 `requires` 明确包含 provider 时，才能用相同 `T` 与 key 调用 `require`。解析发生在
 依赖拓扑序 activation 中；consumer 把返回指针注入自己的 Host tool/context，commit
-之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 26 C ABI，也不暴露任何内核
+之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 28 C ABI，也不暴露任何内核
 service。
 
 `advisory_hook` capability 接受一个 `StaticPlugin.advisory_policy`。它是同步、借用、
@@ -290,6 +290,23 @@ prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
   init 决定接手这个 Run 之后才真正截断，拒绝时 journal 原样保留。`fail_closed` 下仍是
   `PartialRecord`。
 
+**每 Run 控制（`SessionConfig.run_control`，#445）。** durable Session 的每个 Run 都经
+`project_rule_activation.RunControl.initWithOptions` 打开 journal，与 daemon 每个 Run 打开的
+是同一个控制。`abandoned_run` 选上面的策略（默认 `fail_closed`，daemon 用
+`record_abandoned`）。`project_rules = .enforced` 时，`<dirname(journal 根)>/project-rules`
+里针对 workspace root 的 active bundle 在 provider 请求前重新验证、经 project kernel 判定每次
+工具调用，Run 结束后再验证一次并发布该 Run 的 operational observation；kernel 配置缺失或
+无效、bundle 验证失败、本 Session 仍有运行中的 Bash 后台 job 或它带着 team
+（`ProjectRulesRequireDetachedWorkersIdle`）时，Run 在任何 provider 请求之前失败（journal 里
+以错误名关闭）。与其它失败的 Run 不同，这种拒绝只让这个 Run 失败、不 poison Session（与 daemon
+报告 Run 失败后接着处理下一条消息一致）：本次输入不进入 Conversation，Session 回到 idle。被拒的
+suspended Run 续跑（`resumeWithResults`）同样不 poison，答案不进入 Conversation，SessionHost 保留
+挂起：`run_done` 给出错误名，同一 id 的 `ui_request` 再次写入 journal，请求按未回答记录，之后的
+`respond`（重启后也可以）照常续跑。journal 打不开仍会 poison。默认 `.ignored` 不读 bundle。ephemeral Session 上设置
+非默认值在 create 时被拒（`error.RunControlRequiresRunJournal`）；启用 project rules 的
+Session 拒绝 `runIsolated`（`error.ProjectRulesUnsupportedForIsolatedRun`），因为 executor
+自己的 loop 不在 gate 之内。C ABI 的 `SessionConfigV1` 没有这个字段。
+
 新 lease 先以 `<lock>.<run_id>.<attempt>` 写好记录再用不覆盖的 link（Windows：move）发布，所以
 锁文件名下永远不会出现空文件；不支持硬链接的文件系统退回原地创建。产品宿主在 Run
 被中止（Esc、Ctrl+C、SIGTERM/SIGHUP）后发布派生产物时不再沿用该中止信号，由 kernel
@@ -358,6 +375,22 @@ Session 不变更期间有效；每个 Run 自动计账，checkpoint 恢复（`R
 team 成员由 Host 在 create/restore 时提供，不进 checkpoint。AgentCore 的 `team` 表
 （`describe`/`poll`）就是它的封装。
 
+### 定时 prompt（cron，issue #445）
+
+`RuntimeConfig.enable_cron` 打开后，cron 工具（`CronCreate`/`CronDelete`/`CronList`）
+进入目录（不能经显式 `builtin_tools` 列表进入）；选了其中任一工具的 `AgentSession`
+自带一个 `CronRegistry`，随 Session 生灭、不落盘、不进 checkpoint。工具只负责登记：
+到期的 prompt 由 Host 在 Session 空闲时用 `takeDueCronPrompts(allocator, limit)` 取走
+（运行中 `error.SessionBusy`；至多 `limit` 条，超出的仍保持到期、原样留待下次），
+`cronJobCount()` 报当前登记数，`cronDueCount()` 报其中已到期的数目。`SessionHost` 的
+driver 就这样做：队列空闲时至多每 `cron_poll_ms` 取一次，只取队列 `max_queued` 还
+容得下的条数（#493），每条到期 prompt 成为一个
+`source = "session_host"`、`kind = "cron_fired"` 的 Run。Host 不经 Run 读、删任务
+（#493）：`cronJobs(allocator)` 列出 `cron_registry.JobView`（id、下次触发时间、
+`.once`/`.recurring` 表达式），`cancelCronJob(id)`、`cancelAllCronJobs()` 删除，三者
+都只在空闲时可用；`SessionHost` 经 `Snapshot.cron_jobs` 和
+`Command.cancel_cron_job`/`cancel_all_cron_jobs` 提供它们。C ABI 不提供 cron 工具。
+
 ### 模型能力声明
 
 `SessionConfig.model_capabilities`（`[]const core.image_capability.Declaration`，
@@ -390,6 +423,17 @@ Host 导入的规则层，禁用不了模式，所以给用户开放哪些模式
 存进自己的权限存储，下次用 `permission_rules` 创建或用 `updatePermissionRules` 导入。
 只有 CLI/TUI/Web 这类 App 产品（`permission.AlwaysAllowScope.settings_file`）会追加
 `.claude/settings.local.json`，因为它的 settings loader 会在下次启动时读回。
+
+swarm 成员可以借用 lead 的权限（#445）：`member.inheritPermissions(lead)`（只在 member
+空闲时、只一次）之后，member 每次工具调用都按 lead **当时**的导入规则层和 additional
+directories 判定，"总是允许/拒绝"记进并读自 lead 的 `session_rules`；lead 之后
+`updatePermissionRules`/`setAdditionalDirectories` 或在权限框里选的 always，从 member 的
+下一次工具调用起生效。member 自己的 `updatePermissionRules`/`setAdditionalDirectories`
+返回 `PermissionsInherited`；权限模式、工具、工作区根和 shell 沙箱仍是 member 自己的。
+锁规则：member 的每次判定全程持有 lead 的 `lent_permissions.mutex`（不跨权限询问），
+lead 在同一把锁下替换规则/目录、释放锁后才 free 旧值；lead 的 `destroy` 等所有借用者
+destroy 完才继续，所以先销毁 member。`SessionHost` 的 `InheritLead` 工厂
+（`TeammatePermissions.lead`）自动这样打开成员，见 [API.md](API.md)。
 
 Host 自己持久化 transcript 时，路径只从一处推导，不要手写布局：
 
@@ -437,10 +481,10 @@ admission。
 AgentCore 面向不把 metacodes 源码加入构建图的原生 Host(C11 / C++17 / Zig /
 Rust:同一 C Header + 静态库 + bindings)。消费入口只有
 `metask_agentcore_get_api(uint32_t requested_abi)`。
-当前是实验性的 ABI v1 revision 26。Host 必须同时校验 abi version、精确
+当前是实验性的 ABI v1 revision 28。Host 必须同时校验 abi version、精确
 revision、80 字节根表、七张必选 typed 子表、reserved fields 和 manifest hash;
 不存在静默降级或旧 revision shim。
-revision 26 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
+revision 28 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
 工具、MCP 流式响应、journal profile,以及全部 ownership、回调重入、Session
 poison、并发与持久化语义,只以同 revision 的 Header 与
 [`AGENTCORE_BINARY_ABI.md`](AGENTCORE_BINARY_ABI.md)(Contract 一节及其子节)
@@ -464,7 +508,7 @@ agentcore:gate`)的命令、库文件名与按 target 的发布状态矩阵,见
 | 浏览器/桌面壳 | Web HTTP + SSE + typed request 回填；跨进程的行格式用 `protocol.wire` |
 | 按 id 动态开关多个 Session 的网络宿主(云端、多标签 GUI) | `session_host.SessionHost`(见 API.md "SessionHost") + 宿主自己的传输与认证 |
 | 不带源码的 C/C++/Zig/Rust 原生产品 | 精确 pinned AgentCore bundle |
-| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 26 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
+| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 28 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
 | 不可信/多租户可执行插件 | 暂不支持；process v1 是故障/资源边界，不是 OS sandbox |
 
 这些入口改变的是 Host 表达和扩展组合，不是 agent loop 的因果所有权。

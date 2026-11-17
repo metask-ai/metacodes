@@ -305,7 +305,12 @@ pub const CoreEvent = union(enum) {
         turn: u32,
     },
 
-    /// 流式建连重试提示(第 attempt/max 次,退避 delay_ms)。
+    /// 流式建连重试提示(第 attempt/max 次,退避 delay_ms)。Also announces a
+    /// same-turn re-issue after an accepted stream failed with visible output
+    /// (#452, #461): `attempt` counts this request's failed streams so far,
+    /// this one included, `max` is the most attempts the request may make
+    /// (the first, its own re-issue, what is left of the Run's allowance),
+    /// `delay_ms` the backoff before the re-issue is sent.
     retry_notice: struct {
         attempt: u32,
         max: u32,
@@ -348,6 +353,21 @@ pub const CoreEvent = union(enum) {
         turn: u32,
         group: u32,
         disposition: output_semantics.Disposition,
+        bytes: u64,
+    },
+
+    /// Thinking withdrawn with a re-issued attempt (#452). Every `thinking_chunk`
+    /// delivered while visible-output segment `index` was open belongs to a
+    /// provider attempt that the loop rolled back and is sending again; a
+    /// consumer that kept those chunks removes them, as it drops a `discarded`
+    /// segment's text. `bytes` is their total. Emitted right after that
+    /// segment's `output_segment_end` (disposition `discarded`), for every
+    /// same-turn re-issue (`agent_loop.STREAM_RETRIES_PER_REQUEST` or a Run
+    /// allowance) and only when the attempt delivered thinking.
+    thinking_discarded: struct {
+        index: u32,
+        turn: u32,
+        group: u32,
         bytes: u64,
     },
 
@@ -505,6 +525,16 @@ test "CoreEvent.output_segment_end 可 JSON 序列化(进程外前端整条 unio
     try std.testing.expect(std.mem.indexOf(u8, out, "output_segment_end") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "final") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"bytes\":42") != null);
+}
+
+test "CoreEvent.thinking_discarded names the discarded segment and the thinking bytes" {
+    const ev = CoreEvent{ .thinking_discarded = .{ .index = 3, .turn = 2, .group = 1, .bytes = 17 } };
+    const out = try std.json.Stringify.valueAlloc(std.testing.allocator, ev, .{});
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "{\"thinking_discarded\":{\"index\":3,\"turn\":2,\"group\":1,\"bytes\":17}}",
+        out,
+    );
 }
 
 test "CoreEvent.file_changes 可 JSON 序列化(含 locator union 与可选 diff)" {

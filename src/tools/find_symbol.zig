@@ -267,7 +267,9 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return try common.readAllFromFdCapped(fd, allocator, MAX_SOURCE_BYTES);
 }
 
-/// rg -l -w <name> <path>:列出含该词(词边界)的文件。
+/// rg -l -w --regexp=<name> -- <path>:列出含该词(词边界)的文件。
+/// name 来自模型:只作为 `--regexp=` 的值传入,路径放在 `--` 之后,
+/// 以 `-` 开头的 name(如 `--pre=<程序>`)不会被 rg 当成选项(#460)。
 fn listCandidateFiles(
     allocator: std.mem.Allocator,
     name: []const u8,
@@ -275,7 +277,7 @@ fn listCandidateFiles(
     ctx: *const ToolContext,
 ) ![][]const u8 {
     const rg_path = try toolchain.ripgrepPath();
-    const name_z = try allocator.dupeZ(u8, name);
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "--regexp={s}", .{name}, 0);
     defer allocator.free(name_z);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -286,6 +288,7 @@ fn listCandidateFiles(
         "-w",
         "--no-messages",
         name_z.ptr,
+        "--",
         path_z.ptr,
         null,
     };

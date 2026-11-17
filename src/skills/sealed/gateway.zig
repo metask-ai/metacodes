@@ -553,10 +553,23 @@ pub const Gateway = struct {
         auth: AuthSpec,
     };
 
+    /// The `provider.kind` values of §3.4. Spelled out rather than read off
+    /// `types.ProviderKind`: a transport added there (Bedrock) does not become
+    /// part of the protocol by existing.
+    fn protocolKind(text: []const u8) ?types.ProviderKind {
+        const table = [_]struct { []const u8, types.ProviderKind }{
+            .{ "anthropic", .anthropic },
+            .{ "openai", .openai },
+            .{ "gemini", .gemini },
+        };
+        for (table) |row| if (std.mem.eql(u8, text, row[0])) return row[1];
+        return null;
+    }
+
     fn providerSpecFromParams(value: std.json.Value) MethodError!ProviderSpec {
         if (value != .object) return error.InvalidParams;
         const kind_text = valueString(value, "kind") orelse return error.InvalidParams;
-        const kind = std.meta.stringToEnum(types.ProviderKind, kind_text) orelse return error.InvalidParams;
+        const kind = protocolKind(kind_text) orelse return error.InvalidParams;
         var spec: ProviderSpec = .{
             .kind = kind,
             .base_url = valueString(value, "base_url") orelse "",
@@ -2086,11 +2099,11 @@ pub const Server = struct {
             for (workers[0..spawned]) |thread| thread.join();
         }
         for (workers) |*thread| {
-            thread.* = try std.Thread.spawn(.{}, workerLoop, .{self});
+            thread.* = try @import("platform").thread.spawn(.full, workerLoop, .{self});
             spawned += 1;
         }
         self.workers = workers;
-        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+        self.accept_thread = try @import("platform").thread.spawn(.full, acceptLoop, .{self});
         return self;
     }
 
@@ -2307,7 +2320,7 @@ const Pinger = struct {
 
     fn start(self: *Pinger) void {
         if (self.interval_ms == 0) return;
-        self.thread = std.Thread.spawn(.{}, loop, .{self}) catch null;
+        self.thread = @import("platform").thread.spawn(.full, loop, .{self}) catch null;
     }
 
     fn loop(self: *Pinger) void {

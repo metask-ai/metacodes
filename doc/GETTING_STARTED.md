@@ -7,6 +7,7 @@ the overview; this page holds the details it links to.
 - [Choose a model provider](#choose-a-model-provider)
 - [Metask OAuth](#metask-oauth)
 - [Run it](#run-it)
+- [Sandbox Bash commands](#sandbox-bash-commands)
 - [Build from source](#build-from-source)
 - [Auditing a different TinyKG binary](#auditing-a-different-tinykg-binary)
 
@@ -107,14 +108,33 @@ install record, then `~/.metacodes` ([INSTALL_DESIGN.md](INSTALL_DESIGN.md)).
 ## Choose a model provider
 
 metacodes is model-agnostic. `--provider` selects a provider profile
-(`metask`, `openai`, `gemini`, `zai-coding-plan`, or one you define), `--channel`
-a route within it, and `--offer` pins one exact model route. `metacodes
+(`metask`, `openai`, `gemini`, `zai-coding-plan`, `deepseek`, `kimi`,
+`kimi-code`, `qwen`, `minimax`, `bedrock`, or one you define), `--channel` a route within it, and `--offer` pins one exact model route. `metacodes
 --check-providers` validates the configuration and lists every route without
 touching the network. `--base-url`, `--api-key` and `--model` override the
 endpoint, key and model for a single run; `--openai-protocol responses`
 switches the OpenAI wire from Chat Completions to Responses. Profiles,
 channels, offers and typed credentials are specified in
 [PROVIDER_OFFER_ARCHITECTURE.md](PROVIDER_OFFER_ARCHITECTURE.md).
+
+Each built-in vendor reads its key from its own variable — `DEEPSEEK_API_KEY`,
+`MOONSHOT_API_KEY` (the Moonshot open platform, `kimi`), `KIMI_CODE_API_KEY`
+or `KIMI_API_KEY` (the Kimi Code subscription, `kimi-code`),
+`DASHSCOPE_API_KEY`, `MINIMAX_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock
+API key) — and its integration notes (endpoints, thinking parameters, known
+differences, sources) are the header of `src/api/dialects/<vendor>.zig`.
+`KIMI_API_KEY` belongs to Kimi Code: the open-platform profile reads
+`MOONSHOT_API_KEY` only.
+
+Instead of exporting a key in your shell, you can put it in the install's own
+configuration file, `.env` in its state root (`~/.local/opt/metacodes/state/.env`
+for a release install), and start metacodes again: a file holding one
+provider's key uses that provider, and `METACODES_PROVIDER` and
+`METACODES_MODEL` in it choose among several. `metacodes install` writes a
+template beside it. A `.env` in a project directory is never read. Which
+names it accepts, and how it ranks against a Metask sign-in and a `/model`
+default: [LOCAL_CONFIG.md](LOCAL_CONFIG.md). `METACODES_MODEL` in the shell
+is `--model`.
 
 ## GLM Coding Plan
 
@@ -128,20 +148,67 @@ Z.AI has no third-party sign-in, so the login asks which plan the key is for
 the pasted key without showing it. The key is checked against the plan's
 model list and stored in `$HOME/.metacodes/keys/zai-coding-plan.json` (0600);
 a refused key is not stored. Create it on the Coding Plan page, not the
-standard API-key page: a standard key bills the account balance. `/login`
-and `/model` in the TUI offer the same steps. `ZAI_API_KEY` still works and
-wins over the stored key; `metacodes logout --provider zai-coding-plan`
-forgets it.
+standard API-key page: a standard key bills the account balance. `/login
+zai-coding-plan` in the TUI offers the same steps; `/model` lists the plan
+once a key is stored or set, and until then says where one goes.
+`ZAI_API_KEY` still works and wins over the stored key;
+`metacodes logout --provider zai-coding-plan` forgets it.
+
+## Kimi Code
+
+```sh
+metacodes login --provider kimi-code
+metacodes --provider kimi-code --model k3.1-pro
+```
+
+Kimi Code is the coding subscription of a Kimi membership, a different account
+from the Moonshot open platform (`kimi`): its key comes from the Kimi Code
+Console (https://www.kimi.com/code/console), and a platform key does not work
+on it. The login asks which host to check the key on (China or Global), opens
+the Console, reads the pasted key without showing it, checks it against the
+subscription's model list and stores it in
+`$HOME/.metacodes/keys/kimi-code.json` (0600). `/login` lists it as "Kimi Code
+· API key"; `KIMI_CODE_API_KEY` or `KIMI_API_KEY` in the environment wins over
+the stored key.
+
+Requests go to `https://api.kimi.com/coding/v1` on the Responses wire by
+default (`--channel cn-chat` for Chat Completions, which shows the thinking
+stream; `global-responses` and `global-chat` use the overseas host
+`https://api.kimi.ai/coding/v1`). The models are `k3.1-pro`,
+`k3.1-pro-highspeed`, `k3`, `k3-256k`, `kimi-for-coding` and
+`kimi-for-coding-highspeed`; which ones a key may call depends on the plan
+(legacy Andante plans have `kimi-for-coding` only). `/model` sets the reasoning
+effort (low, high or max; unset is the server's default).
 
 ## Metask OAuth
 
-`metacodes login --provider metask` uses Metask's JSON device authorization
-flow. It prints `METASK_VERIFICATION_URI=...` and `METASK_USER_CODE=...` to
-stderr (use `--no-browser` on a headless machine), then stores the access and
-rotating refresh tokens plus gateway/model URLs in
-`$HOME/.metacodes/oauth/metask.json`. Set `METASK_SITE_URL` for a local control
-plane (`http://localhost:3000`); `METASK_GATEWAY_URL` overrides the gateway
-origin for local development. `METACODES_OAUTH_DIR` changes the OAuth store.
+`metacodes login` (and `/login` in the TUI) signs in to Metask in the browser,
+at Metask's OAuth server `https://www.metask-ai.com`, as the public client
+`metacodes` asking for `read model:invoke`: the browser returns to
+`http://localhost:<port>/auth/metask/callback`, and you choose a model and a
+reasoning level from the `/v1/models` of the gateway the sign-in names. There
+is no API key to choose: the session calls that gateway with its own access
+token, billed to the account. The access and rotating refresh tokens, with the
+gateway and model URLs, are stored as the Metask session in
+`<state root>/oauth/metask.json`; the model and reasoning level in
+`<state root>/auth.json`. The session switches to Metask at once, and later
+starts use it. `/logout` (or `metacodes logout`) revokes the session at Metask,
+removes both files, and switches the session to the provider `.env`
+configures, if any.
+
+On a machine without a browser, `metacodes login --provider metask` uses
+Metask's JSON device authorization flow and stores the same session. It prints
+`METASK_VERIFICATION_URI=...` and `METASK_USER_CODE=...` to stderr (use
+`--no-browser` on a headless machine). At a terminal it then asks for the
+model and reasoning level, as `metacodes login` does, and stores them the same
+way; without one (a script that confirms the code elsewhere) it stores only
+the session and says so, and a start on it names its model with `--model`.
+`/login metask` is the same in the TUI. A plain start signs in with the stored
+session unless a key signs Metask in (`--api-key`, `METASK_API_KEY`, or a key
+in `auth.json` from `metacodes login --api-key` or a sign-in older than this).
+Set `METASK_SITE_URL` for a local control plane (`http://localhost:3000`);
+`METASK_GATEWAY_URL` overrides the gateway origin for local development.
+`METACODES_OAUTH_DIR` changes the OAuth store.
 
 Gateway requests use both Anthropic Messages and OpenAI Chat routes. A request
 that receives `401` with `code=token_expired` is refreshed once and replayed;
@@ -194,6 +261,47 @@ it ([Terminal setup](TERMINAL_SETUP.md)).
 
 `metacodes --help` lists every flag. Embedding the runtime in your own process
 (Zig module or the AgentCore C ABI) starts at [API.md](API.md).
+
+## Sandbox Bash commands
+
+The `sandbox` section of `.claude/settings.json` (in the project or in `~`)
+confines the commands Bash, Monitor and skill `!` lines run:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "filesystem": { "allowWrite": ["~/.cache/zig"], "denyWrite": [".env"], "denyRead": ["~/.ssh"] },
+    "excludedCommands": ["docker"]
+  }
+}
+```
+
+A sandboxed command reads everywhere except `denyRead` and writes only in the
+working directory, `--add-dir` directories, the linked worktree's `.git`, the
+temp directories and `allowWrite`, minus `denyWrite`. Paths take `~/`,
+absolute or working-directory-relative forms.
+
+| Host | Backend |
+|---|---|
+| macOS | Seatbelt, `/usr/bin/sandbox-exec` with a generated profile |
+| Linux | bubblewrap: `/usr/bin/bwrap` or `/bin/bwrap`, or the absolute path in `METACODES_BWRAP`; never `PATH` |
+| Windows | none |
+
+On Linux the command runs in fresh mount, pid and IPC namespaces with `/`
+mounted read-only and the write roots bound back writable at their physical
+paths, so a symlink cannot carry a write out of them. metacodes probes bwrap
+once per process; a missing bwrap, or one the kernel does not let create a
+user namespace, counts as no sandbox. With no backend, `failIfUnavailable`
+refuses every Bash command; without it the command runs unconfined and
+`autoAllowBashIfSandboxed` does not apply. Differences from Seatbelt: a
+`denyWrite` path that does not exist yet makes its nearest existing ancestor
+read-only when that lies in a write root; `/tmp` and `/var/tmp` are the
+temp roots; a command killed by a signal shows as exit 128+N; and the
+network is open unless `network.allowedDomains` or `deniedDomains` lists a
+domain, in which case bwrap removes it entirely, having no per-host filter
+(Seatbelt does not restrict the network either way).
 
 ## Build from source
 

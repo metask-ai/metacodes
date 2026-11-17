@@ -1141,12 +1141,24 @@ pub const SealedSkillProvider = struct {
 };
 
 /// A provider's route, or the reason it cannot be delegated (§8.1): no route
-/// at all, no credential, or a signing scheme that cannot travel in a header.
+/// at all, a transport `provider.kind` has no value for, no credential, or a
+/// signing scheme that cannot travel in a header.
 fn routeOf(origin: provider_mod.Provider) !provider_mod.ProviderRoute {
     const route = origin.route() orelse return error.SealedProviderRouteUnavailable;
+    if (!protocolKind(route.kind)) return error.SealedProviderRouteUnavailable;
     if (route.credential.len == 0) return error.SealedProviderRouteUnavailable;
     if (route.auth_scheme) |scheme| if (scheme == .signed_adapter) return error.SealedProviderRouteUnavailable;
     return route;
+}
+
+/// Whether SSP/1 has a `provider.kind` for this transport (§3.4: `anthropic`,
+/// `openai`, `gemini`). A Bedrock route is not delegable: the gateway would
+/// need the Converse transport, and the protocol would need a new kind.
+fn protocolKind(kind: @import("../../types.zig").ProviderKind) bool {
+    return switch (kind) {
+        .anthropic, .openai, .gemini => true,
+        .bedrock => false,
+    };
 }
 
 /// The route's authentication as the `provider.auth` object (§3.4); "" for
@@ -1374,6 +1386,22 @@ test "the provider route's authentication travels as the auth object" {
     try std.testing.expectEqualStrings("{\"scheme\":\"bearer\"}", try authJson(arena.allocator(), .bearer));
     try std.testing.expectEqualStrings("{\"scheme\":\"api_key_header\",\"header\":\"x-api-key\"}", try authJson(arena.allocator(), .{ .api_key_header = "x-api-key" }));
     try std.testing.expectError(error.SealedProviderRouteUnavailable, authJson(arena.allocator(), .{ .signed_adapter = "aws" }));
+}
+
+test "a Bedrock route is not delegated to a gateway: SSP/1 has no kind for it" {
+    const a = std.testing.allocator;
+    var bedrock = try @import("../../api/provider_factory.zig").makeProvider(a, .bedrock, "brk-key", "us.anthropic.claude-sonnet-4-6", null);
+    defer bedrock.deinit();
+    // The route itself is complete: kind, origin, model and a bearer credential.
+    const route = bedrock.provider().route() orelse return error.TestExpectedRoute;
+    try std.testing.expectEqual(@import("../../types.zig").ProviderKind.bedrock, route.kind);
+    try std.testing.expectEqualStrings("brk-key", route.credential);
+    // `create` and every Step read the route through `routeOf`.
+    try std.testing.expectError(error.SealedProviderRouteUnavailable, routeOf(bedrock.provider()));
+
+    var anthropic = try @import("../../api/provider_factory.zig").makeProvider(a, .anthropic, "ant-key", "claude-sonnet-4-6", null);
+    defer anthropic.deinit();
+    try std.testing.expectEqual(@import("../../types.zig").ProviderKind.anthropic, (try routeOf(anthropic.provider())).kind);
 }
 
 test "stream replays calls, usage, then done" {

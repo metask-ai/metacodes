@@ -110,7 +110,7 @@ pub const SseTransport = struct {
         _ = std.Uri.parse(self.url) catch return error.McpInvalidUrl;
         self.headers = try dupeHeaders(allocator, headers);
         try self.openStream();
-        self.reader = try std.Thread.spawn(.{}, readerMain, .{self});
+        self.reader = try @import("platform").thread.spawn(.full, readerMain, .{self});
         try self.waitEndpoint();
         self.deadline_ms = null;
         self.abort = null;

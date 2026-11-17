@@ -4,8 +4,8 @@
 //! device grant is approved); the TUI's render loop must not. The worker runs
 //! the flow on its own thread, points the flow's `AbortSignal` at its own so
 //! `Esc` can end it, and keeps a bounded transcript of what the flow asks the
-//! user to do — the URL to open, the device code — for the picker to draw in
-//! place of the route list.
+//! user to do — the URL to open, the device code — for `/login`'s pane to
+//! draw.
 //!
 //! Two channels cross the thread boundary: the transcript, under a mutex, and
 //! the state, an atomic. The worker stores its result (`failure_name`,
@@ -112,7 +112,7 @@ pub const LoginWorker = struct {
             return error.ThreadSpawnFailed;
         };
         self.flow.options().abort_signal = &self.abort_signal;
-        self.thread = std.Thread.spawn(.{}, run, .{self}) catch {
+        self.thread = @import("platform").thread.spawn(.full, run, .{self}) catch {
             self.wipeSecret();
             _ = self.owned.reset(.free_all);
             self.state.store(idle, .release);

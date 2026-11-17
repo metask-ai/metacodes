@@ -4,6 +4,16 @@ Metacodes exposes several host shapes over one kernel. The fixed AgentLoop,
 Conversation projection, permission/sandbox chain, budgets, formal verdicts,
 artifact store, and TinyKG admission are not replaceable extensions.
 
+Sandbox execution has two boundaries: native filesystem/command tools use
+confined executors, while external harness workers run as a whole confined
+process tree. Linux combines bubblewrap and seccomp; macOS uses Seatbelt.
+Deploy the bundled `bin/metacodes-fs-helper` beside an embedded Host or set
+`METACODES_SANDBOX_HELPER` to its absolute path. Enabled native file/worker
+sandboxes refuse unavailable backends rather than opening/running on the Host.
+The Zig `sandbox_exec` namespace exposes platform discovery; no C ABI fields
+or wire layouts change. See [sandbox execution](SANDBOX_DESIGN.md) for the
+helper contract and the current network-policy limits.
+
 ## Compatibility matrix
 
 | Interface | Entry point | Status | Compatibility rule |
@@ -11,7 +21,7 @@ artifact store, and TinyKG admission are not replaceable extensions.
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
 | Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 26 | exact root/child layouts and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 28 | exact root/child layouts and bundle manifest |
 | Python package | `import metacodes` ([sdk/python](../sdk/python/README.md)) | experimental, unpublished | speaks exactly the AgentCore ABI revision it was built for and refuses any other |
 | Node package | `require('metacodes')` ([sdk/node](../sdk/node/README.md)) | experimental, unpublished; macOS and Linux | same exact-revision rule; the addon is rebuilt per platform |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
@@ -43,9 +53,10 @@ rules are in [PROGRAMMATIC_TOOL_CALLING.md](PROGRAMMATIC_TOOL_CALLING.md).
 `metacodes login --provider metask` performs the Metask JSON device flow:
 
 * `POST $METASK_SITE_URL/api/oauth/device/code` (default site
-  `https://metask-ai.com`) with `client_id=metacodes` and the local hostname;
-* polling `POST $METASK_SITE_URL/api/oauth/token` with the device grant until
-  approval; and
+  `https://www.metask-ai.com`) with `client_id=metacodes` and
+  `scope=read model:invoke`;
+* polling `POST $METASK_SITE_URL/api/oauth/token` with the device grant and
+  `client_id` until approval; and
 * atomically storing `access_token`, `refresh_token`, `expires_at`,
   `gateway_url`, `models_url`, and `client_name` in
   `$HOME/.metacodes/oauth/metask.json` (or `METACODES_OAUTH_DIR`).
@@ -83,6 +94,11 @@ normative model; the entry points are:
 | Surface | Contract |
 |---|---|
 | `--provider <id\|alias>` / `METACODES_PROVIDER` | resolve the route through the provider registry instead of inferring a transport from the model name |
+| `METACODES_MODEL` | the model, as `--model` gives it (the flag wins) |
+| `<state root>/.env` | the install's local configuration ([LOCAL_CONFIG.md](LOCAL_CONFIG.md)), read once at start and never `setenv`: a layer below the process environment for the names it may set — every registered profile's `env_aliases`, the variables `config.json` names (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`, `METACODES_MODEL`; a provider's aliases are read from it only when the environment sets none of them. Request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`, `METACODES_KG_URL`, any `*_URL`) are refused; other names are ignored with one warning listing them. Its `METACODES_PROVIDER` (else the one provider whose key it holds) applies only when no flag or environment variable names a provider, no `global_selection` is stored and no Metask sign-in exists (`--api-key`, `METASK_API_KEY`, a key or older sign-in in `auth.json`, the Metask session `oauth/metask.json`); keys of several providers and no name choose none, and the run lists them. A `.env` anywhere else, the working directory included, is never read. `metacodes install` writes `<state root>/.env.example` on every install and upgrade and never touches `.env` |
+| no credential at all | the interactive TUI opens without a model (#484): its banner reads `not set — /login, or configure .env`; a prompt, `/retry`, `/edit <n>`, `/init`, `/commit`, `/review`, `/btw`, `/recap` and a Skill are refused with a note before any request is assembled; nothing is probed; no session directory is made until a route binds (`/model`, `/login`). A Metask sign-in in `auth.json` older than #527 with no key and model chosen opens it the same way, and so does a provider named by `--provider`, `--offer`, `METACODES_PROVIDER` or `.env` that has no credential: the note names that provider's variables, and no other provider is used in its place (#485). `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe exit non-zero with the sign-in hint (or the named provider's help) instead. The banner names where a bound route's credential came from (`· Metask`, `· from .env`, `· from shell`, `· saved key`, `· signed in`, `· --api-key`) |
+| stored default without a credential | a `global_selection` whose provider has no credential (a Metask one: no Metask session, no Metask key and no key in `auth.json`; a stored Metask route the session authenticates runs at the session's gateway, never at the compiled endpoint with the session's token, #527) is passed over for the levels below it, with one notice: `The default model, <provider> · <model>, has no key or sign-in; this session uses <model> · <origin>.` (under the TUI's banner, else on stderr) (#485) |
+| `metacodes logout` | revokes the Metask session at `$METASK_SITE_URL/api/oauth/revoke` (bounded; a failure is reported and the local sign-out goes on), removes both Metask sign-ins (`auth.json`, `oauth/metask.json` with its refresh token) and a key stored with `login --provider metask`, forgets a stored default that resolves to Metask, and says which it removed; `METASK_API_KEY` left in the shell or `.env` is named, never removed. `logout --provider metask` is the same (#499) |
 | `--channel <id>` | narrow to one endpoint/region/plan/account binding |
 | `--offer <offer-id>` | pin one exact reproducible route |
 | `--base-url <url>` | validated against the selected profile and route policy before any request URL is built |
@@ -90,30 +106,73 @@ normative model; the entry points are:
 | `METACODES_STREAM_IDLE_TIMEOUT_MS` | stream liveness, **head phase**: a request whose connection stays open but delivers no byte before the response head for this long (default 120000; 0 disables liveness monitoring entirely) is shut down by the client's monitor and retried as a transient network error. Nothing in a blocked socket read notices an abort flag; this is what turns a silent gateway or proxy into a bounded failure instead of a frozen session. Progress is measured per SSE line, not per parsed event: a tool call's `input_json_delta` frames and unknown events keep the request alive, but keepalive lines (`event: ping`, `data: {"type":"ping"}`, `:` comments) do not — they prove the gateway connection is up, not that the model is producing (2026-09-23: a gateway pinged every 15 s for 55 minutes over an upstream that produced nothing) |
 | `METACODES_STREAM_BODY_IDLE_TIMEOUT_MS` | stream liveness, **body phase** (response head accepted): unset = automatic, `clamp(max_tokens × 100 ms, 600000, 1800000)` — a gateway may generate an entire tool call before writing a byte of it, so the tolerated silence scales with the response the request allows; an explicit value is a flat limit in ms; 0 disables body-phase monitoring. Past the limit the client shuts the connection down, the turn ends with `StreamStalled` and the TUI reports `正文空闲超时: <idle> ms 内无任何字节(上限 <limit> ms)` when the connection itself went silent, or `<idle> ms 内无模型输出,但网关 keepalive 仍在到达(最近字节 <n> ms 前)…` when a gateway kept the connection alive over a dead upstream — instead of the generic failure text. A user cancel (Ctrl+C/Esc) that wakes the blocked read is reported as an abort, never as an API error, and the streamed prefix is kept as partial text. A body-phase stall after visible output (text, thinking or a tool call) is not retried automatically in the TUI (the streamed prefix cannot be pretended away); a stall, a stream that ended without a stop report, or a dropped connection before any visible output is re-sent once (an in-stream server error, reported as `API 错误帧: …` on every wire, is not). Independently of this limit, once an endpoint has been seen to send keepalives mid-stream (three pings or SSE comments, each ending a silence of at least 2 s), a streamed body with no byte at all, keepalives included, for max(4 × the longest such interval, 2 minutes) is judged a dead connection and reported as `连接已断: <n> ms 内无任何字节,连 keepalive 也没有…`; 0 here disables that rule as well |
 | `metacodes login --provider <id> --oauth-token-json <file>` | import an OAuth token into that provider's own store; refresh, single flight, and rotated-refresh persistence then run themselves |
-| `metacodes login --provider <id> [--key-page <page>] [--api-key-stdin] [--no-check]` | for a provider that declares key pages instead of a sign-in (`zai-coding-plan`): open the plan page, read the pasted key with echo off (or from stdin), check it with a GET the provider does not bill, and store it in `<state root>/keys/<id>.json` (0600). Only that provider's resolution reads the file, after its environment aliases; `metacodes logout --provider <id>` removes it. `METACODES_KEY_CHECK_URL` (https, or http to a loopback host) replaces the check URL for a local mock |
+| `metacodes login --provider <id> [--key-page <page>] [--api-key-stdin] [--no-check]` | for a provider that declares key pages instead of a sign-in (`zai-coding-plan`, `kimi-code`): open the plan page, read the pasted key with echo off (or from stdin), check it with a GET the provider does not bill, and store it in `<state root>/keys/<id>.json` (0600). Only that provider's resolution reads the file, after its environment aliases; `metacodes logout --provider <id>` removes it. `METACODES_KEY_CHECK_URL` (https, or http to a loopback host) replaces the check URL for a local mock |
 | `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `recent_operation_ids`; written atomically, other keys preserved. The same file declares MCP servers under `"mcpServers"` (Claude Code's schema; the legacy `"mcp_servers":[{"name":"<id>","command":[...]}]` array still works), and Claude Code's `~/.claude.json` / `.mcp.json` and Codex's `config.toml` servers are read too — see [Skills and MCP servers](SKILLS_AND_MCP.md). Each connected server's tools register as deferred `mcp__<id>__<tool>` (listed under the prompt's `# Deferred tools`, activated with `ToolSearch select:mcp__<id>__<tool>`), `/mcp` shows every configured server and why any failed, and `ListMcpResourcesTool` fails with `capability_unsupported` when nothing is |
 | `<session_dir>/runtime-selection.json` | `session_selection`; a session-scoped choice never reaches `config.json` |
 | `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
 
-Interactive surfaces: `Ctrl+O` and `/model` open the route picker (transcript
+Interactive surfaces: `Ctrl+O` and `/model` open the route picker, one screen
+of models under a heading per provider (where its key comes from, who bills
+it), the cursor on the model in use; a model served on several routes lists
+them under it while the cursor is on it, the reasoning level is a line under
+the list changed with ←/→, the three scopes are named in the header (`Tab`
+cycles them), typing filters across every provider, and closing without a
+choice prints `kept <model>` (transcript
 viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
 and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
 names a route (`pin`, `float`, `use`, `remove`); `/models` still selects the
-account key; `/login` opens a Login pane listing the providers this
-installation can sign in to (Metask's own device grant included), and
-`/login <id> [--device-code] [--no-browser] [--client-id <client>]` starts that
-provider's sign-in directly; either runs the kernel OAuth flow on a worker
-thread (`Esc` cancels it) and stores the login where
-`metacodes login --provider <id>` does (issue #33); `--client-id` is needed
+account key of a key route; `/login` alone runs the Metask browser sign-in
+`metacodes login` runs (authorization code + PKCE at
+`https://www.metask-ai.com` as the client `metacodes`, scope
+`read model:invoke`, on a loopback `/auth/metask/callback`; `--no-browser`
+prints the URL without opening it) on a worker thread, then asks for the
+model and reasoning level in the pane, from the `/v1/models` of the gateway
+the token response names (models that gateway does not serve on
+`/v1/messages` are left out); `Esc` at any step stores and changes nothing.
+Once both are chosen it stores the token response as the Metask session
+(`oauth/metask.json`) and the choice in `auth.json`, as `metacodes login`
+does, moves the session onto that gateway with the session's token at once,
+and forgets a stored `global_selection`, so the next start is on the sign-in
+too (#485, #527). `/logout` revokes the Metask session at Metask, removes
+both Metask sign-ins (`auth.json` and the session `oauth/metask.json`) and a
+Metask key
+stored with `login --provider metask`, forgets a stored default that resolves
+to Metask, drops every Metask credential the process holds (nothing is sent
+with one again), and moves a session on Metask to the provider `.env`
+configures (`Switched to <provider> (from .env)`) or leaves it unbound;
+`/logout <id>` removes `keys/<id>.json`, and a session that ran on that key
+holds no credential afterwards. Neither runs in the middle of a turn: a
+command typed then waits in the queue until the turn ends.
+`/login metask` is Metask's device grant in the pane `/login` uses: the code
+is confirmed on any device, then the model and reasoning level are chosen,
+and the sign-in is stored and used as `/login`'s (#527).
+`/login <id> [--device-code] [--no-browser] [--client-id <client>]` starts
+another provider's sign-in directly; it
+runs the kernel OAuth flow on a worker thread (`Esc` cancels it) and stores
+the login where `metacodes login --provider <id>` does (issue #33); `--client-id` is needed
 only when neither the profile nor `providers.<id>.oauth_client_id` in
-`~/.metacodes/config.json` names the installation's registered client (#87). Choosing a route whose
-OAuth-capable provider has no credential signs in inside the picker: the
-authorization URL or device code is drawn in the overlay, `Esc` cancels the
-flow, and the chosen route is committed once the login lands (issue #67). A
-provider that takes a pasted key instead (`zai-coding-plan`) is listed in
-`/login` as "API key", and choosing one of its routes without a key shows its
-key pages in the picker: ↑/↓ picks the plan, Tab opens the page, the key is
-typed masked, and Enter checks and stores it before the route is committed.
+`~/.metacodes/config.json` names the installation's registered client (#87). A
+provider that takes a pasted key instead (`zai-coding-plan`, `kimi-code`) is
+listed in `/login` as "API key": ↑/↓ picks the plan, its page opens, the key is
+typed masked, and Enter checks and stores it.
+
+The picker lists only routes a commit can apply as they are (#488): a route is
+listed when a credential resolves for it now, by the same resolution a commit
+binds with, without a request: the environment, `<state root>/.env`, a key
+`/login <id>` stored, a provider's stored OAuth login, a credential-pool
+member, `--api-key` for the provider it was given for, and for Metask the
+session's own key or, in a session started on another provider, the key
+`metacodes login` stored in `auth.json`. Only a missing credential takes a
+route off the list: a route refused for another reason (two names of its key
+that disagree, say) stays listed, and a commit reports why. A
+provider none of whose routes has one is listed dimmed under "Not
+configured", below the others; choosing it shows the variable its key is read
+from, this install's `<state root>/.env` and `doc/LOCAL_CONFIG.md` (for
+Metask, `/login` first), and nothing else: the picker starts no sign-in, takes
+no key and sends no request. A commit that still finds no credential shows the
+same. `/login <id>` is where a key is pasted or a provider signed in to; the
+in-picker sign-in and key stage of #67 are gone. When a commit moves the
+session to another provider, its confirmation says who bills it from then on.
 
 A committed route is broadcast on the UI event stream as `config_changed` →
 `route`, carrying provider, channel, protocol, wire model id, offer id,
@@ -142,15 +201,54 @@ share one input pipeline (`src/session_intent.zig` + `src/session_service.zig`):
   commands themselves.
 - **Service verbs** (equivalent across hosts): `/model use <id>`, `/mode
   [name]`, `/effort <level>`, `/compact`, `/add-dir <path>`, `/theme <v>`,
-  `/vim`, `/retry`, `/commit`, `/review`, `/init`, plus prompt and `!cmd`
-  submission. Web/daemon reach them via `POST /command` (queued to the driver
-  thread; result arrives as a `command_result` journal event, run-producing
-  commands then execute a normal agent run). Display-only verbs (`/help`,
+  `/vim`, `/retry`, `/edit <n> <text>`, `/commit`, `/review`, `/init`, plus
+  prompt and `!cmd` submission. Web/daemon reach them via `POST /command`
+  (queued to the driver thread; result arrives as a `command_result` journal
+  event, run-producing commands then execute a normal agent run). Display-only verbs (`/help`,
   `/tools`, …) are terminal-rendered; web/daemon report them as unsupported.
 - **Run assembly.** `session_service.buildRunOptions` is the only place App
   state is projected into `agent_loop.Options`; hosts add only host-specific
   fields (UI requester, run-control observers, budgets).
 - Equivalence is locked by `tests/component/session_api_parity_test.zig`.
+
+### Edit and rerun
+
+`/edit <n> <text>` edits message `n` of the conversation, one the user wrote,
+and reruns from it (#432). Messages are numbered from 1 over the whole
+history, compacted ones included. The conversation becomes messages
+`1..n-1` followed by `text`, and a run answers it. The original message `n`
+and everything after it are dropped: later prompts, replies, tool calls and
+tool results. They are discarded, not kept as a branch. In the terminal,
+`/edit` alone lists the messages that can be edited with their numbers.
+
+- **Persistence.** Dropping messages rewrites the transcript from the live
+  conversation at its next flush (the rewrite `/retry` uses), so a resumed
+  session has the edited history, never the dropped one.
+- **Refusals** change nothing and run nothing. Each names its reason
+  (`conversation.RewindError`): `PositionOutOfRange` (no message `n`),
+  `NotUserMessage` (a reply, a tool result, or text the runtime wrote),
+  and `PositionCompacted` (the message is behind the compact boundary, so the
+  context before it exists only as a summary and cannot be rerun). A message
+  at or after the boundary can be edited; the summary stays its preceding
+  context, as in every request since the compaction. The command line also
+  refuses a number that is not a positive integer (`InvalidPosition`) and a
+  missing text.
+- **Context only.** Files written, commands run and other effects of the
+  dropped turns stay. The must-read-first record is cleared (as by `/clear`),
+  since the rerun's context no longer shows what was read.
+- **Hosts.** `POST /command` takes the same line; the Run's `user_message`
+  line carries the text and `"replaces":n`
+  ([Wire lines](#wire-lines-for-out-of-process-hosts)). A Zig Host calls
+  `AgentSession.rewindToUserMessage(position)` while idle and then runs the
+  edited text; `SessionHost` does both for a submission with `.replaces`
+  (see [SessionHost](#sessionhost-a-multi-session-service-for-network-hosts)).
+  An AgentCore Host calls `session_control->rewind_to_user_message(session,
+  position, out_error)` (revision 27, #441) while idle and then runs the
+  edited input: the three refusals are the public statuses
+  `MESSAGE_POSITION_OUT_OF_RANGE` (31), `NOT_USER_MESSAGE` (32) and
+  `MESSAGE_POSITION_COMPACTED` (33), and a checkpoint exported afterwards
+  holds the edited Conversation, so a restored Session continues from it
+  (see [Edit and rerun](AGENTCORE_BINARY_ABI.md#edit-and-rerun)).
 
 This is an internal-consistency contract, not yet a wire-protocol stability
 promise: the HTTP endpoint shapes remain pre-1.0.
@@ -186,7 +284,12 @@ terminal, keep one `key=value` line per check, which scripts parse; `--json` emi
 `{checks: [{name, resolved_path, sha256, expected_sha256, match, source,
 provenance}]}` with `name` in `ripgrep`, `tinykg`, `formal_kernel`,
 `project_kernel`, `tinykgd`, plus a `kg` object when the TinyKG diagnosis could
-be built. `--strict` exits 1 when a binary is unresolved or mismatched, when a
+be built and a `local_config` object for `<state root>/.env`
+(`{path, state, accepted, ignored, malformed_lines, permissions}`: the names a
+session reads from it and the names it ignores, never a value; `state` one of
+`absent`, `read`, `unreadable`, `not_a_file`, `too_large`, `no_state_root`;
+`permissions` the POSIX mode as `"0600"`, null on Windows); the plain form adds
+a `local_config` line, and neither affects `--strict`. `--strict` exits 1 when a binary is unresolved or mismatched, when a
 resolved kernel's `provenance` is not `true`, or when an environment override
 was present but resolved nothing (`source: "env"` with a null `resolved_path`);
 an unpinned kernel or daemon may be absent. `metacodes terminal-setup
@@ -309,7 +412,10 @@ resolve against the current provider's tier table in
 }
 ```
 
-The table is keyed by provider kind (`anthropic`/`openai`/`gemini`) so one
+The table is keyed by provider kind (`anthropic`/`openai`/`gemini`/`bedrock`;
+`bedrock` serves every route on the Bedrock Converse wire, whose tier models
+are Bedrock model or inference-profile ids such as
+`us.anthropic.claude-haiku-4-5-20251001-v1:0`) so one
 user-level file serves any `--provider` session without cross-provider model
 injection. An unconfigured tier inherits the session model and effort — there
 are no built-in per-provider model IDs. A tier's optional `effort` is the
@@ -561,6 +667,46 @@ Provider and differs from it only by `model_override`, so sizing a child's
 results — or its auto-compact thresholds — against the parent's window is how a
 200K parent hands a 32K child a history that endpoint rejects.
 
+### Provider reasoning continuity (DeepSeek, Kimi, MiniMax, Mistral)
+
+Some models want their earlier reasoning back on later requests. DeepSeek's
+thinking mode answers HTTP 400 to a tool turn whose assistant history lacks
+`reasoning_content`; Kimi asks for the assistant message back unchanged,
+reasoning included; MiniMax M3 and later ask for the full response back to keep
+the reasoning chain; Mistral asks for the full assistant message back,
+ThinkChunks included. Core projects every `Block.thinking` into the request IR
+and lets the dialect decide (issues #421, #437):
+
+- A dialect whose profile sets `ModelProfile.echoes_reasoning_content` gets it
+  back: DeepSeek, Kimi and MiniMax M3 and later on the OpenAI chat wire,
+  OpenRouter routes, and a route declaring DeepSeek on the Anthropic Messages
+  wire. OpenAI chat sends the message's thinking text as `reasoning_content` on
+  the assistant message (after `content`, before `tool_calls`); Anthropic
+  Messages sends the non-empty `thinking` blocks in their original position.
+- The Mistral dialect's reasoning models (Small 2603, Medium 3.5, Large 4,
+  Magistral; `ModelProfile.content_chunks = .read_and_echo`) get it back as
+  ThinkChunks on the OpenAI chat wire: an assistant message with non-empty
+  thinking is sent with a list-typed `content` holding
+  `{"type":"thinking","thinking":[{"type":"text","text":…}]}` and
+  `{"type":"text","text":…}` chunks in their original order, before
+  `tool_calls`. The same dialect reads a streamed list-typed `delta.content` the
+  same way. A route that declares another dialect for a Mistral-named model
+  does neither.
+- Every other model is sent exactly the bytes it was sent before: OpenAI
+  native and every other compatible dialect (GLM, Qwen, MiniMax M2, and Mistral
+  models without documented reasoning), OpenAI Responses, Gemini, and Claude. Claude in particular never receives a
+  thinking block: one sent back must carry the signature it was issued with,
+  and the IR keeps none.
+- The dialect follows the route's declaration
+  ([PROVIDER_OFFER_ARCHITECTURE.md](PROVIDER_OFFER_ARCHITECTURE.md)). On the
+  Anthropic wire a model name is never inferred as DeepSeek, so a DeepSeek
+  Anthropic endpoint configured as a custom provider gets its thinking back only
+  when it declares `"dialect": "deepseek"`; the built-in `deepseek` provider
+  declares it.
+
+An assistant message holding nothing but thinking (a reply cut off by
+`max_tokens` inside its reasoning) is still left out of the request.
+
 ### Provider reasoning continuity (OpenAI Responses)
 
 The Responses protocol is used with `store:false`: the server keeps no copy of
@@ -571,10 +717,10 @@ server emitted it (`id`, `summary`, `encrypted_content`), replayed byte for
 byte, and `model` is the model that produced it.
 
 This is not `Block.thinking`. A thinking block is readable assistant
-reasoning that the UI displays and the Anthropic dialect replays as a
-`thinking` block; a reasoning item is opaque provider state that is never
-displayed, never enters a compaction summary, and never becomes assistant
-text. Every dialect other than OpenAI Responses skips it.
+reasoning that the UI displays and that only a model asking for its reasoning
+back receives (see the previous section); a reasoning item is opaque provider
+state that is never displayed, never enters a compaction summary, and never
+becomes assistant text. Every dialect other than OpenAI Responses skips it.
 
 Capture is event-independent: the same item may arrive in
 `response.output_item.done`, in the terminal `response.completed`'s
@@ -734,10 +880,15 @@ in one of five ways:
 
 | Class | Settings | How it changes |
 |---|---|---|
-| Idle-mutable | model, permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value. |
+| Idle-mutable | model, route (provider kind, endpoint, auth scheme, dialect, credential and model together), permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setRoute`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value; a Session that inherits this one's permissions (`inheritPermissions`, #445) decides its next tool call with the new rules and directories, and refuses its own `updatePermissionRules`/`setAdditionalDirectories` (`error.PermissionsInherited`). |
 | Live-replaceable | API key (the provider credential) | `updateCredential`, idle or during a Run, from any thread or from the Session's own callbacks; never `error.SessionBusy`, and refused only for a poisoned Session or an invalid candidate. Create and restore apply the same rule to `SessionConfig.api_key` (1 to 16 KiB of printable ASCII; `error.InvalidCredentialByte`, `error.EmptyCredential`, `error.CredentialTooLong`). The candidate is validated and copied before anything changes; a refusal keeps the previous credential. A request reads the credential when it is sent (once it holds its connection slot), so every request sent after the call returns uses the new credential, retries, tool providers built earlier and requests still waiting for a connection included; one already sent keeps the old one. See [Credential updates](AGENTCORE_BINARY_ABI.md#credential-updates). |
 | Runtime generation | built-in tool set, static and process plugins, provider dialects | `RuntimeHost.replace`. Sessions created afterwards use the new generation; existing Sessions stay on theirs. To move a Session, persist it and restore it with `createRestoredSession` on the new generation. |
 | Fixed at create | provider kind, OpenAI protocol, auth scheme, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
+
+Inherited permission decisions hold the lender lock and read a published rule
+header stored with that lock. Replacing the lead's own optional rule header
+does not change an in-progress decision; publication completes before the
+previous rule allocations are freed.
 | Identity | Session ID | Never; a restore reuses it. |
 
 `SessionConfig.reasoning_effort` is carried by every provider request and kept
@@ -746,7 +897,7 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 `WorkspaceConfig.additional_dirs` widens exactly what the workspace root grants:
 `accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
 writes. It is not named in the system prompt. These two are source-level only;
-AgentCore revision 26 does not carry them.
+AgentCore revision 28 does not carry them.
 
 ### Permission modes the settings disable
 
@@ -789,11 +940,21 @@ with the schema version `v` (currently 1) and a `type`:
 
 ```text
 {"v":1,"type":"<CoreEvent tag>","data":<payload or null>}
+{"v":1,"type":"<CoreEvent tag>","run_id":N,"trace_id":"...","data":...}
+{"v":1,"type":"<HostEvent tag>","data":{...}}
 {"v":1,"type":"ui_request","id":N,"kind":"permission|ask_question|custom","request":{...}}
 {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled|malformed"}
 {"v":1,"type":"ui_request_unavailable","kind":"...","custom_kind":"...","reason":"..."}
 {"v":1,"type":"capabilities_accepted",...}
 ```
+
+Host events (`user_message`, `run_done`, `command_result`,
+`message_rejected`, `session_poisoned`) are what a Host adds around the
+kernel's events ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#11-host-events)). Runs
+are numbered 1, 2, … per Session. A Run's lines run from its `user_message`
+to its `run_done`, and every kernel event in between carries its `run_id`
+([Runs](WIRE_PROTOCOL.md#12-runs)). The bundled `--web` and `serve` host
+journals nothing but these lines.
 
 The normative contract, including which changes keep v1 and which bump
 `SCHEMA_VERSION`, is [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
@@ -823,15 +984,24 @@ holder a Host keeps.
 
 `wire.parseResponse` turns the client's answer (`{"choice":...}`,
 `{"answers":[...]}` or `{"result":...}`) back into a `UiResponse`; anything
-malformed or of another version is answered as a cancellation, never as a
-grant, and closes as `malformed`. An answer that races an interrupt or close
-loses: it is refused or discarded and the request closes as `cancelled`. `tests/fixtures/wire/v1` pins one line for every event tag and request
+malformed or of another version fails as a cancellation, never as a
+grant, and closes as `malformed` (`wire.closedOnParseError`). An answer that
+races an interrupt or close loses: it is refused or discarded and the request
+closes as `cancelled`. A request nobody answered fails through
+`wire.cancelResponse(request, why)`: a permission prompt with the
+`ui_request.Unanswered` error naming the timeout, cancellation or unreadable
+answer, so the model reads that nobody answered instead of that the user
+declined; a question or a custom UI with `InputAborted`
+([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#14-requests-nobody-answered)). `tests/fixtures/wire/v1` pins one line for every event tag and request
 kind, plus capability frames with core's reply to each, and doubles as
 conformance vectors for Hosts in other languages. The bundled `--web` UI
 consumes exactly these lines and declares `permission` and `ask_question`
 when it loads.
 
-The `--web` server streams these lines over SSE with ids `<epoch>-<seq>`. The
+The `--web` server streams these lines over SSE with ids `<epoch>-<seq>`; the
+UDS `attach` op streams the same lines, one per line. Each transport also has
+frames of its own that are not journal lines and carry no `v`
+([Transport frames](WIRE_PROTOCOL.md#13-transport-frames)). The
 epoch names the event journal; a restarted host or a rebuilt session has a new
 one. A client resumes with `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`
 (`/state` reports both). When the cursor belongs to another epoch, names a
@@ -852,7 +1022,18 @@ at `POST /s/<id>/message`:
 
 The UDS transport's `{"op":"message","session":"<id>",...}` reads the same
 three fields with the same checks (replies `{"ok":true}` or
-`{"ok":false,"error":"..."}`).
+`{"ok":false,"error":"..."}`). The other interactive routes have UDS ops too,
+so a UDS-only frontend needs no HTTP side channel:
+`{"op":"respond","session":"<id>","id":N,...}` answers the pending
+`ui_request` N with the same answer fields `POST /respond` takes beside the
+routing fields (`{"ok":true}`; a stale or unknown id replies
+`{"ok":false,"error":"no pending request with this id"}`, the 409 of the HTTP
+surface, and a line without `id` replies `{"ok":false,"error":"missing id"}`),
+and `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}`
+is the capability frame itself
+([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#23-transports)) beside the routing
+fields, answered with the `capabilities_accepted` acknowledgement line (also
+journaled, like the HTTP route) or `capabilities_refused`.
 
 - `text` is required and must not be empty after trimming. A body that is not
   a JSON object is the text itself.
@@ -866,6 +1047,12 @@ three fields with the same checks (replies `{"ok":true}` or
   answered `400 {"error":"invalid permission_mode (...)"}`, a `model` that is
   not a non-empty string `400 {"error":"invalid model: ..."}`, and nothing is
   queued. `200 {"ok":true}` means queued.
+- Other fields are ignored, except `idempotency_key`: these hosts do not
+  de-duplicate yet, so a message carrying one (not `null`) is refused with
+  `400 {"error":"idempotency_key not supported: this host does not de-duplicate messages"}`
+  rather than run once per delivery while the client relies on the key
+  (#447; [`SessionHost`](#sessionhost-a-multi-session-service-for-network-hosts)
+  takes it).
 
 The session's driver takes messages one at a time, after the turn in progress
 and after queued `POST /command`s. For each message it checks the permission
@@ -882,32 +1069,32 @@ message reads, with nothing from the driver in between:
 ```text
 {"v":1,"type":"config_changed","data":{"model":"claude-opus-4-6"}}   if model was given
 {"v":1,"type":"config_changed","data":{"mode":"accept_edits"}}      if permission_mode was given
-{"user_message":"..."}
-... the turn's events ...
-{"run_done":{"stop_reason":"end_turn","err":null}}
+{"v":1,"type":"user_message","data":{"run_id":N,"trace_id":null,"text":"...","replaces":null}}
+... the Run's events, each with "run_id":N ...
+{"v":1,"type":"run_done","data":{"run_id":N,"trace_id":null,"stop_reason":"end_turn","error_name":null,"model_error":null}}
 ```
 
-A turn that stops on the model (`api_error`, `max_tokens_exhausted`) says why,
-on the same line: `err` is the displayable message and `model_error` the
-structured detail. Every other stop writes the line above, byte for byte, with
-no `model_error` key.
+A turn that stops on the model (`api_error`, `max_tokens_exhausted`) says why
+on the same line: `model_error` is the structured detail, and its `message` is
+the text to show. Every other stop has `"model_error":null`. A Run that fails
+without returning (the run control refuses it, or the loop fails) has
+`"stop_reason":null` and names the error in `error_name`.
 
 ```text
-{"run_done":{"stop_reason":"api_error","err":"Balance too low","model_error":{"category":"payment_required","code":"insufficient_balance","type":null,"message":"Balance too low","http_status":402,"request_id":"req_1","retry":"not_retryable","retry_after_ms":null,"attempts":1,"truncated":false}}}
+{"v":1,"type":"run_done","data":{"run_id":N,"trace_id":null,"stop_reason":"api_error","error_name":null,"model_error":{"category":"payment_required","code":"insufficient_balance","type":null,"message":"Balance too low","http_status":402,"request_id":"req_1","retry":"not_retryable","retry_after_ms":null,"attempts":1,"truncated":false}}}
 ```
 
 The fields, what is redacted and how `retry` is decided are specified in
 [AGENTCORE_BINARY_ABI.md](AGENTCORE_BINARY_ABI.md#model-failure-detail).
 `code` passes through whatever the provider sent: metacodes attaches no billing
-or quota meaning to it. The `SessionHost` wire `run_done` carries the same object
-as `model_error` (null when there is none).
+or quota meaning to it. `SessionHost` writes the same `run_done` line.
 
 If either field is refused, neither is applied, the text stays out of the
 conversation, no turn runs, and this line takes the place of `user_message`:
 
 ```text
-{"message_rejected":{"message":"model not available for current provider","text":"...","model":"...","permission_mode":"bypass_permissions"}}
-{"message_rejected":{"message":"bypassPermissions is disabled by settings","text":"...","model":"...","permission_mode":"bypass_permissions"}}
+{"v":1,"type":"message_rejected","data":{"message":"model not available for current provider","text":"...","model":"...","permission_mode":"bypass_permissions"}}
+{"v":1,"type":"message_rejected","data":{"message":"bypassPermissions is disabled by settings","text":"...","model":"...","permission_mode":"bypass_permissions"}}
 ```
 
 `model` and `permission_mode` repeat what the message asked for (`null` when
@@ -916,11 +1103,18 @@ therefore ends in exactly one `user_message` or `message_rejected`.
 `user_message` is journaled when the turn starts, not when the message is
 queued: a message sent during a turn appears after that turn's `run_done`.
 
-`config_changed` lines, whatever caused the change (a message, `/command`, a
-tool), are wire v1 lines whose `data` holds one of `model`, `mode`, `dirs`,
-`reasoning` or `route`. The other host lines (`user_message`, `run_done`,
-`command_result`, `message_rejected`, `session_lifecycle`) keep their
-`{"<name>":...}` shape.
+Every line is a wire v1 line ([Wire lines](#wire-lines-for-out-of-process-hosts)).
+A `config_changed` line has one of `model`, `mode`, `dirs`, `reasoning` or
+`route` in `data`, whatever caused the change: a message, `/command` or a
+tool. `session_lifecycle` is a kernel event. `user_message`, `run_done`,
+`command_result` and `message_rejected` are host events
+([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#11-host-events)). A `/command` is
+answered by `command_result`: `command` is the line's verb, `message` what it
+reports, and `error_name` is set when `ok` is false. A `/command` that plans a
+Run (a prompt, `/edit`, `/retry`, `/commit`, …) journals its `command_result`
+first, then the Run's `user_message` (none for a macro or `/retry`). A
+`user_message` from `/edit <n> <text>` has `"replaces":n`: the conversation
+before the turn is messages `1..n-1` ([Edit and rerun](#edit-and-rerun)).
 
 `GET /state` (`/s/<id>/state`) is the snapshot a client reconciles with after
 connecting or reconnecting:
@@ -950,16 +1144,129 @@ leaving every Host to rebuild them:
   Session's state root). A fresh open under an id that has a transcript
   replaces that transcript at once. `open` and `acquire` return a counted
   reference; `release` gives it back.
+- `HostedSession.submit(.{ .text, .trace_id, .replaces, .model, .permission_mode })` queues a Run.
+  With `.replaces` (a `conversation.MessagePosition`, from
+  `MessagePosition.fromOrdinal(n)`), the text replaces user message `n`: just
+  before the Run the driver drops that message and everything after it
+  (`AgentSession.rewindToUserMessage`), so the Run sees messages `1..n-1`
+  plus the text, and the transcript and a later `open(.resume)` hold that
+  history ([Edit and rerun](#edit-and-rerun)). The `user_message` line
+  carries `"replaces":n`; a refused position ends the Run with `run_done`
+  naming it (`PositionOutOfRange`, `NotUserMessage`, `PositionCompacted`)
+  and changes nothing.
+- A submission may be typed (#447): `source` (where it came from, such as
+  `im:lark`), `kind` (`[a-z0-9][a-z0-9_.-]*`, such as `telemetry`),
+  `attributes` (name/value strings) and `idempotency_key`. A field outside
+  its bounds (`core/typed_submission.zig`) is refused before anything is
+  queued: `error.InvalidSource`, `InvalidKind`, `InvalidAttributes`,
+  `InvalidIdempotencyKey`. The four are echoed on the Run's `user_message`
+  ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#11-host-events)) and reach the
+  provider only through the Session's template, `open(.{ ...,
+  .submission_template })`: `{{text}}`, `{{source}}`, `{{kind}}` and
+  `{{attributes}}` (one JSON object) are substituted, and any other `{{` is
+  `error.InvalidSubmissionTemplate`. Without a template the Run's input is
+  the text, byte for byte, so the provider-visible bytes, a cache contract,
+  are those of an untyped submission.
+- One idempotency key is one Run. A delivery whose key is queued, running,
+  or whose Run started less than `idempotency_retention_ms` ago (24 h) is
+  refused with `error.DuplicateSubmission`: nothing is queued, and the first
+  delivery's Run answers for it, so a transport reports it as accepted (an
+  HTTP Host: `200` and `"duplicate":true`). The same key on a different
+  submission (text, source, kind, attributes or `replaces`) is
+  `error.IdempotencyKeyReused`. With `transcripts`, started keys are kept in
+  the session directory (`idempotency.jsonl`), so a Host that opens the
+  Session again under its id after a restart, resumed or fresh, refuses them
+  too. A key is spent when its Run starts, whatever the Run then does, and
+  not before: a delivery still queued when the Host stopped may be delivered
+  again. A key that cannot be recorded fails its Run
+  (`IdempotencyKeyNotRecorded`) and stays unspent. At most
+  `idempotency_max_keys` (10 000) started keys are kept; the oldest goes
+  first.
+- A submission may carry its own `model` and `permission_mode` (#445), as a
+  `--web`/`serve` message does: the driver applies them just before the
+  Run, as `set_model` then `set_permission_mode` queued right ahead of it
+  would, and journals each as `config_changed` (`{"model":...}` as
+  resolved, `{"mode":...}`) before the Run's `user_message`, also when
+  the value was already in force, as `--web`/`serve` does. They stay the
+  Session's settings afterwards. The mode is checked first
+  (`AgentSession.setPermissionMode`'s check), so when either is refused
+  (a mode the settings disable, or a model `Options.models` or the
+  Session refuses) nothing is applied, the text stays out of the
+  conversation, no Run starts, and `message_rejected` takes the place of
+  `user_message`, its `message` saying why in words (the daemon's, such
+  as `bypassPermissions is disabled by settings` or `model not available
+  for current provider`, where the two refuse alike). Its idempotency key
+  is not spent; `model` and `permission_mode` are not part of what a key
+  compares.
+- With `Options.models` (a `ModelPolicy`), a model name in a submission
+  or a `set_model` command resolves as the bundled daemon resolves one
+  (`api/model_availability.zig`, shared with `/model` and `--web`/`serve`
+  messages): it is trimmed, a tier name (`low`/`mid`/`high`, or
+  `haiku`/`sonnet`/`opus`) becomes the model `tiers` (a borrowed
+  `model_tiers.TierTable`) sets for the Session's provider kind, and the
+  result must be one that provider takes: listed for it in `catalog`
+  (`CatalogModel{ provider, id }`, borrowed), or with an id that names it
+  (`claude-`, `gpt`/`o1`/`o3`, `gemini`). Anything else, an unset tier
+  included, is `error.ModelUnavailable` (`set_model`'s `error_name`) and
+  changes nothing. A tier's reasoning effort is not applied, as on the
+  daemon. Without `Options.models` the name goes to the Session as it is.
+- `SessionHost.setModelCatalog(catalog)` replaces `Options.models`'
+  `catalog` while the Host runs (#445), as the daemon adopts a refreshed
+  `/v1/models` answer (cached at startup, replaced when the background
+  refresh lands). The Host copies `catalog`; from the call on, every
+  Session's next `Submission.model` or `set_model` is checked against it
+  and no longer against the catalog before (replaced, not merged). The
+  model a Session is on stays in force, also when the new catalog no
+  longer lists it. Without `Options.models` it is
+  `error.ModelPolicyUnset` and nothing is kept.
+- The queue holds `max_queued` (64) submissions and commands. Beyond it
+  `submit` and `command` refuse with `error.QueueFull` and hold nothing (an
+  HTTP Host: `429`); a duplicate is answered as one before the bound is
+  checked. `snapshot()` reports `queued` and `max_queued`. Runs the
+  driver starts by itself, a cron job's prompt or a team lead's inbox,
+  count against the same bound and never take `queued` past it (#493).
 - `HostedSession.submit` and `command` (`set_model`, `set_permission_mode`,
   `set_reasoning_effort`, `set_additional_directories`, `set_prompt_profile`,
-  `update_permission_rules`, `compact`) share one FIFO run by the Session's
+  `update_permission_rules`, `compact`, `cancel_cron_job`,
+  `cancel_all_cron_jobs`, `set_route`) share one FIFO run by the Session's
   driver thread, so configuration changes apply between Runs in the order
-  they were queued.
+  they were queued. Each command is answered by `command_result`. As the
+  `--web`/`serve` config sink journals `/model`, `/mode`, `/effort` and
+  `/add-dir` (#445), an accepted `set_model`, `set_permission_mode` or
+  `set_reasoning_effort` is first journaled as `config_changed`
+  (`{"model":...}` as resolved, `{"mode":...}`, `{"reasoning":...}`, `null`
+  when the effort was cleared), also when the value was already in force,
+  and `set_additional_directories` journals `{"dirs":...}` for each
+  directory in force afterwards that was not before, as its resolved path
+  (a directory taken away has no line). A refused command journals none.
+  The permission mode is journaled by a config sink on the Session's
+  permission context, so a mode set any other way is journaled too.
+- `command(.{ .set_route = route })` (issue #16, #445) moves the Session
+  onto a route the Host's provider control plane bound, as the CLI's
+  `/model` commit does (`App.bindCommittedSelection`). `Route.binding` is
+  what the Session sends with (`AgentSession.Route`: provider kind, OpenAI
+  protocol, auth scheme, dialect, credential, model, base URL); the rest
+  says who the route is (`provider_id`, `channel_id`, `protocol`,
+  `offer_id`, `credential_ref`, `scope`). `AgentSession.setRoute` swaps
+  them together while idle, so no request goes out on a mix of the two
+  routes, and keeps the conversation and the reasoning effort; an effort
+  the new provider cannot take is `error.AgentEffortUnsupportedProvider`,
+  never dropped. An accepted route is journaled as `config_changed`
+  `{"model":...}` (the route's model) and then `{"route":{...}}`, as the
+  CLI does, before its `command_result`; the credential is in neither. A
+  refused route (an invalid model or credential, a busy or poisoned
+  Session) changes nothing and journals no `config_changed`. Later
+  `set_model` names resolve for the new provider kind, and a teammate the
+  Session spawns afterwards runs on its route (`TeammateSpawn.lead_route`,
+  which `InheritLead` applies).
 - Every kernel event, host event (`user_message`, `run_done`,
-  `command_result`, `session_poisoned`) and UI request lands in the
-  Session's `journal` as a wire line; CoreEvents carry `run_id` and the
-  submission's `trace_id`. `respond(id, json)` answers a UI request;
-  anything but the pending id is `error.NoSuchRequest`.
+  `command_result`, `message_rejected`, `session_poisoned`, `run_resumed`)
+  and UI request lands in the Session's `journal` as a wire line;
+  CoreEvents carry `run_id` and the submission's `trace_id`. `respond(id, json)` answers a UI request, and
+  may name who answered (`"by"`); anything but an open request is
+  `error.NoSuchRequest`, a second answer to one that has not yet applied its
+  first is `error.AlreadyAnswered`, and neither changes anything (see UI
+  requests below).
 - `declareCapabilities(allocator, frame)` installs the client's capability
   frame ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#2-capability-exchange)) and
   returns, and journals, its `capabilities_accepted` line; a refused frame
@@ -967,7 +1274,8 @@ leaving every Host to rebuild them:
   leaves out is journaled as `ui_request_unavailable` and answered
   `unavailable` without waiting.
 - `interrupt` aborts the Run (or the one being admitted) and answers a
-  pending UI request as cancelled. A Session the kernel poisoned reports
+  pending UI request as cancelled; a suspended Run's request is cancelled
+  too, and the Run resumes only to record that. A Session the kernel poisoned reports
   `session_poisoned`, drops its queue and refuses further work; close and
   reopen it.
 - `close` stops the driver, closes the journal (waking readers), waits only
@@ -975,14 +1283,217 @@ leaving every Host to rebuild them:
   so the id can be opened again as soon as it returns. It never waits for
   references: a holder keeps a closed `HostedSession` readable (journal,
   `snapshot`) until its own `release`, which frees it last.
+- A team lead (`SessionConfig.team` with `.role = .lead`, once its team
+  exists) is fed its inbox: while its queue is empty the driver reads it at
+  most every `session_host.lead_inbox_poll_ms` (500 ms) with
+  `swarm_tools.pollLeadInbox`, and a member's reply becomes the lead's next
+  Run, queued behind any work already there and journaled like a submission
+  without a `trace_id`. The bundled daemon does the same for its `App` lead.
+- A Session that selected the cron tools (`CronCreate`, `CronDelete`,
+  `CronList`; admitted only with `RuntimeConfig.enable_cron`) has its
+  scheduled prompts fired by its driver, as the CLI fires them once it is
+  back at the prompt: while its queue is empty and it has cron jobs, the
+  driver calls `AgentSession.takeDueCronPrompts` at most every
+  `session_host.cron_poll_ms` (1000 ms), and each prompt due becomes a Run
+  typed `source = session_host.cron_source` (`session_host`) and
+  `kind = session_host.cron_kind` (`cron_fired`), in the order the jobs were
+  created. The Run's user message is the prompt byte for byte; the typing
+  reaches the provider only through a submission template. A job never fires
+  during a Run or ahead of queued work, and its jobs close with the Session
+  (they are not persisted, as in the CLI).
+- A Host sees and stops a Session's cron jobs without a Run (#493).
+  `snapshot().cron_jobs` lists them oldest first, each a
+  `session_host.CronJob`: `id` (a `CronJobId`, the 12 hex digits
+  `CronCreate` gave the model), `next_fire_unix` (unix seconds) and
+  `schedule`, `.once` or `.recurring` with its cron expression; the prompt
+  stays with the model. The list is as of the last time the Session was
+  between Runs: a job a Run creates or deletes shows from its `run_done` on,
+  and a one-shot job is gone once it fired. `command(.{ .cancel_cron_job =
+  id })` removes one job and `command(.cancel_all_cron_jobs)` all of them, in
+  queue order like any command; neither job fires again, and a prompt
+  already fired and queued still runs. Each is answered by `command_result`
+  (`cancel_cron_job`, `cancel_all_cron_jobs`), by which time `snapshot()`
+  shows the change; an id the Session does not have is `ok: false`,
+  `error_name: "CronJobNotFound"`. `CronJobId.parse(text)` takes a Host's
+  text and refuses anything but 12 lowercase hex digits
+  (`error.InvalidCronJobId`).
+- Fired prompts count against `max_queued` (#493): the driver takes only
+  as many due prompts as the queue has room for, oldest job first, and a
+  job left out stays due, untouched, and fires once the queue has room. So
+  `queued` never passes `max_queued` and no prompt is lost; a recurring job
+  is rescheduled, and a one-shot job removed, only when its prompt is
+  taken. `AgentSession.takeDueCronPrompts(allocator, limit)` takes that
+  limit; `cronJobs`, `cancelCronJob` and `cancelAllCronJobs` are the idle-only
+  reads and changes the SessionHost makes. A team lead's inbox is read only
+  while the queue has room.
+- A Session whose `SessionConfig.run_control` asks for it opens, for every
+  Run, the per-Run control the bundled daemon opens
+  (`project_rule_activation.RunControl`, #445). It needs a durable
+  `run_journal`: anything but the default on an ephemeral Session is refused
+  by `open` (`error.RunControlRequiresRunJournal`). With
+  `project_rules = .enforced`, an active bundle in
+  `<dirname(run journal root)>/project-rules` (the daemon's layout when the
+  journal root is the Session's directory) for the workspace root is
+  re-attested before the provider request and decides each tool call through
+  the project kernel: a call it blocks reaches the model as a
+  `project_rule_blocked` tool error. A missing or invalid kernel
+  configuration, a bundle that fails attestation, or a Bash job of the
+  Session still running or a team it leads (`ProjectRulesRequireDetachedWorkersIdle`)
+  fails the Run before any provider request: `run_done` names the error and
+  the Run is closed in the journal. Unlike other failed Runs, such a refusal
+  does not poison the Session, as the daemon reports the Run failed and
+  takes the next message: the submission's text never enters the
+  Conversation and the Session is idle again. A refused resumption of a
+  suspended Run (`ui_request_wait = .suspend`) keeps the suspension: after
+  `ui_request_closed` and `run_resumed`, `run_done` names the error, the
+  request's `ui_request` line is journaled again under the same id, the
+  Session is `suspended` with that `pending_request_id`, and the request is
+  recorded open, so the answer the refused Run took is dropped and a later
+  `respond` (also after a restart) resumes the turn. A journal that cannot
+  open still poisons. After a Run the bundle is re-attested and the Run's
+  operational observation is published beside the journal.
+  `abandoned_run = .record_abandoned` closes a Run whose process died as
+  abandoned and runs the next one, as the daemon does; the default,
+  `fail_closed`, keeps the Session closed (`UnfinishedRun`).
+- With `Options.teammates` (a `TeammateFactory`), the SessionHost also
+  fulfils the lead's `SpawnTeammate` requests, as the daemon's `App` starts
+  its teammates: after each Run the lead's driver takes the pending requests
+  oldest first, calls `configure(ctx, arena, spawn)` for the member's
+  `SessionConfig` (provider, workspace, tools and permissions are the
+  Host's; `spawn` names the lead, team, member, prompt, `agent_type` and
+  `effort`), opens it on the same SessionHost as a member of the lead's team
+  under the lead's session id and a fresh lease, and submits the prompt as
+  its first Run. The factory returns `team = null` (the SessionHost owns the
+  identity; anything else is refused). `spawn` also carries the lead's
+  current `lead_model`, `lead_permission_mode` and `lead_reasoning_effort`.
+  A refused or failed spawn becomes the lead's next Run, so its model learns
+  of it: `<teammate-status from="<name>" state="failed">teammate was not
+  started: <error></teammate-status>`, journaled as a typed `user_message`
+  (`source` `session_host`, `kind` `teammate_spawn_failed`;
+  `session_host.spawn_failure_source`/`spawn_failure_kind`). When the name
+  was already open and its member refused the prompt, the text says
+  `teammate did not take the prompt: <error>` instead. A failure while
+  fulfilling such a report Run's own spawns is only logged, so a model that
+  keeps asking for a name that cannot start gets one report, not a Run per
+  retry (under the `App` the failure is a tool result, bounded by the turn
+  limit). A name the lead
+  already opened, still open, takes the prompt as its next Run; one whose
+  member the Host closed is opened again under a fresh lease, after its old
+  roster entry is dropped. Closing the lead closes the members it opened.
+  Without a factory the requests stay pending for the Host to fulfil itself
+  (open a `.role = .member` Session).
+- `session_host.InheritLead{ .base = config }.factory()` is the factory that
+  configures each member like its lead, as the bundled daemon's `App`
+  teammates are: `base` (the configuration the Host opens its leads with;
+  borrowed, outlives the SessionHost) with the lead's current model and
+  permission mode, and the spawn's `effort` or else the lead's reasoning
+  effort. `InheritLead.derive(base, spawn)` is the same mapping as a pure
+  function. `agent_type` is not interpreted. Its factory declares
+  `TeammatePermissions.lead`, below.
+- `TeammateFactory.permissions` (`TeammatePermissions`, default `.own`) says
+  whose permission state a member decides its tool calls with. `.own`: what
+  `configure` returned, fixed when the member opened. `.lead`: its lead's
+  imported rules, additional directories and Session memory, read at each
+  tool call (`AgentSession.inheritPermissions`), as the bundled daemon's
+  in-process teammates borrow their lead's permission context: a rule the
+  lead gains through `update_permission_rules` or an "allow always"/"deny"
+  answer, and a directory it gains through `set_additional_directories`,
+  decide the member's next tool call, also inside a Run already going. Both
+  Sessions remember answers in the lead's memory. The member's own
+  `update_permission_rules` and `set_additional_directories` are refused
+  (`command_result{ok:false, error_name:"PermissionsInherited"}`); its
+  permission mode, tools, workspace root and the sandbox its shell runs in
+  stay what `configure` returned. Locking: each member decision holds the
+  lead's `lent_permissions` lock for the whole decision (never across a
+  prompt); the lead replaces its rules or directories under that lock and
+  frees the old ones after it. The lead's AgentSession outlives its
+  members': the lead closes them before destroying its own, and its
+  `destroy` waits for any member still being destroyed (permission/lent.zig).
 
-Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`.
-Authentication, tenancy, idempotency and the transport stay with the Host.
+Options: `max_queued`, `max_turns`, `teammates`, `transcripts`,
+`ui_request_timeout_ms`, `ui_request_expiry`, `ui_request_wait`,
+`idempotency_retention_ms`, `idempotency_max_keys`, `models`.
+Authentication, tenancy and the transport stay with the Host.
 To stream a Session's journal over SSE, parse the client's position with
 `event_journal.Cursor.fromLastEventId` / `fromSince`, start from
 `EventJournal.planResume(cursor)` (send `resync` when it reports a restart),
 and label lines with `EventJournal.eventId` — the rule the bundled `--web`
 server uses.
+
+UI requests on a long-lived Session (#446; the wire side is
+[WIRE_PROTOCOL.md §1.5](WIRE_PROTOCOL.md#15-ui-requests-approvers-expiry-suspended-runs)):
+
+- **Approver.** An answer may carry `"by":"<approver>"`, 1 to 256 bytes; the
+  request's `ui_request_closed` records it. `respond` refuses any other `by`
+  with `error.InvalidApprover` and leaves the request open. `by` is
+  self-reported, not authenticated: a Host that needs a verified approver
+  sets it from its own authentication (or records the verified identity
+  apart), never from the client's answer body.
+- **Expiry.** `ui_request_timeout_ms` (null: no limit) and
+  `ui_request_expiry`: `.cancel` (default, as before) closes the request
+  `cancelled` and the Run goes on without the answer; `.interrupt` does
+  that and stops the Run; `.re_announce` journals the same `ui_request` line
+  again every period until someone answers. Under `.cancel` and
+  `.interrupt` alike, an expired permission prompt is denied and the model
+  reads that nobody answered in time, and an expired question or custom UI
+  fails with `InputAborted`
+  ([WIRE_PROTOCOL.md §1.4](WIRE_PROTOCOL.md#14-requests-nobody-answered)).
+  `.re_announce` needs a period: with a zero `ui_request_timeout_ms`, `open`
+  is `error.InvalidUiRequestTimeout`.
+- **Waiting work.** A Session runs one thing at a time: a submission or
+  command queued while a request is open waits behind it, never refused for
+  it. `snapshot()` says why in `queue_waiting` (`.none`, `.run`,
+  `.ui_request` with `pending_request_id`). A Host that wants the work to run
+  at once opens another Session.
+- **Suspend mode.** `ui_request_wait = .suspend` (default `.block`; needs
+  `transcripts`, else `open` is `error.SuspendRequiresTranscripts`): a
+  question or custom UI request ends its Run `suspended` (`Phase.suspended`)
+  instead of holding the driver. The Session's directory keeps it
+  (`ui_requests.json`, written whole and fsynced, with a result for every
+  other call of the suspended turn; the kernel's `suspend.json` is not
+  used); `close` leaves it
+  there; `open(.resume)` under the id, after a restart too, announces it
+  again under the same id; `respond` then resumes the Run once through
+  `AdmittedRun.resumeWithResults`, journaled as `ui_request_closed` and
+  `run_resumed`. Exactly once, with the transcript as the witness: the
+  settlement is recorded before it enters the conversation and dropped once
+  the resumed Run's transcript holds the call's result; a crash in between
+  applies it on the next open, and an open that finds the result already
+  there only drops the record. A call of the suspended turn that the kernel
+  did not run (it denied or deferred it) is answered on resume with a result
+  saying it did not run. Nothing else runs while a Run is suspended: queued work
+  waits, and a team lead does not read its inbox, so a teammate's reply
+  waits there, unread, and becomes the lead's next Run after the resumed Run
+  and the queue. The resumed Run keeps the suspended Run's `trace_id`, turn
+  limit and `stream_retry_budget`. A question's answers reach the model as
+  AskUserQuestion's result; a custom UI's `result` is the tool's result as
+  is (the kernel's suspension convention); a cancelled or expired request is
+  the call failing with `InputAborted`. Request ids are kept too, so none is
+  reused across restarts. Each open request has its own id, and `respond`
+  gives an answer only to the request it names: a permission request that
+  blocks beside a suspended question is answered under its own id
+  (`pending_request_id` shows it while it blocks). A `ui_requests.json` this
+  version cannot read (corrupt, or written by a later version; a field it
+  does not know is ignored) is left as it is and never written over:
+  requests then block as under `.block`, under ids past the file's
+  `next_id` and past the clock in milliseconds. A Run submitted under an
+  idempotency key keeps the key spent while it is suspended, however long
+  the request waits; once the resumed Run ends, the key's
+  `idempotency_retention_ms` counts from the Run's start as before, so a
+  Host whose requests may wait long sets the retention above the longest
+  wait plus its redelivery window. One crash window is left: a crash after
+  the suspended turn reaches the transcript and before `ui_requests.json`
+  records its request loses the request; the next Run finds the call without
+  a result and closes it as any unanswered call is closed (message_repair),
+  so the conversation stays valid but the question is not asked again. A
+  fresh `open` under the id drops a suspended Run with the conversation it
+  belonged to. **A permission request is never
+  suspended:** the kernel's permission gate reads a `pending` answer as no
+  answer and denies the tool unasked, so under `.suspend` a permission
+  request blocks as under `.block` (the Session reports `.running` with the
+  request pending) and is cancelled by `close`. Making permission requests
+  survive a restart needs the kernel to suspend at its permission gate and
+  run the approved call on resume; that is follow-up work.
 
 Static trusted plugins can contribute typed tools, streaming tools, services,
 advisory policies, and deterministic provider dialects. Process plugins can only
@@ -998,15 +1509,27 @@ The source-free bundle is one coordinate root: `sdk/metask/agentcore.h`
 (C11/C++17), the `sdk/zig` and `sdk/rust` bindings, one target-specific static
 library, the manifest-pinned ripgrep runtime asset, and a manifest whose file
 allow-list and SHA-256 values are mandatory. Consumers call only
-`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 26,
+`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 28,
 the exact 80-byte root, all seven mandatory typed tables, reserved zeros, function
 slots, and the schema-1 bundle manifest. The ABI is experimental, with no
 compatibility shim between revisions: pin a bundle, not only a semantic version.
 What the seven tables cover, provider protocol selection, the `on_event`
 observation stream and its visible-output tags, input submitted to an active
 Run (`session->submit_input`, the `input_adopted` event and the `RunResultV1`
-input counts), the structured reason a Run stopped with `STOP_API_ERROR` (the
-`model_error` event), the in-place credential update (`session->update_credential`), the Session goal (the `goal` table, goal-continuation Runs, the
+input counts), automatic compaction inside a Run (the model window, a
+provider's context-window refusal and checkpoint capacity each compact the
+Conversation at a safe boundary and the same Run continues; the summary
+request is budgeted and the replacement commits only if the checkpoint fits —
+the `auto_compact` event and its `cause`), the structured reason a Run stopped
+with `STOP_API_ERROR` (the `model_error` event), each request's own re-issue
+after a stream that broke off without an answer and before any tool call
+started (#461), and the Host-granted stream retry budget beyond it
+(`RunOptionsV1.stream_retry_budget`: a Run re-issues such a request further
+times, after output and a started tool call too); for every re-issue of an
+attempt that showed output the Host takes back what it showed through the
+`discarded` segment, `thinking_discarded` and `retry_notice`, which precedes a
+short cancellable backoff, the in-place credential update (`session->update_credential`),
+edit-and-rerun (`session_control->rewind_to_user_message` and its three refusal statuses), the Session goal (the `goal` table, goal-continuation Runs, the
 `goal_updated` event), the host-scheduled team (`enable_teams`, the `team`
 config, and the `team` table's `describe` and `poll`), the Workspace Skill
 catalog and its source priorities (`SkillSourceV1.priority` and the query's
@@ -1074,7 +1597,10 @@ they extend the cached prefix instead of moving the system prompt. The date is
 supplied by default (issue #276): AgentCore leads each Run's context with a
 `currentDate` block in the process's time zone, or in a UTC offset the Host
 gives per Run (`RunOptionsV1.time_context_code` / `utc_offset_minutes`); a Host
-`currentDate` block replaces it, and `TIME_CONTEXT_OFF` drops it. The CLI's
+`currentDate` block replaces it, and `TIME_CONTEXT_OFF` drops it. An explicit
+Skill invocation Run (`RUN_INPUT_SKILL`) takes context blocks and the date
+like any other Run (#534): they lead its invocation record, ahead of the Skill
+body. The CLI's
 user-context message always states the session's start date and zone, and the
 first Run on a later local date gets one "the date has changed" notice in that
 turn (`agent_loop.Options.time_announcer`). Source-level Hosts build the same

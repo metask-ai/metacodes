@@ -23,9 +23,15 @@ metacodes-core 是一个**无 UI、无 CLI** 的 LLM 编码-agent 引擎。它�
 
 ### 1.1 四条 load-bearing 设计不变式(前端开发者必须知道)
 
-1. **core↔UI 物理隔离**。`src/lib.zig` 可达的模块图够不到 `repl/`、`tui/`、`app.zig`、
-   `main.zig`。`zig build test:lib`(refAllDecls 编全图)是**编译器证明**——前端再多,core
-   不被污染,core 不依赖任何前端。
+1. **core↔UI 隔离**。`src/lib.zig` 的 import 闭包不得进入应用侧(`repl/`、`web/`、
+   `daemon/`、`app/`、`main.zig`、`app.zig`、`session_service.zig`、`session_intent.zig`)。
+   `zig build test:lib` 只证明库能单独编译:惰性分析不编译没人调用的 import,证明不了隔离。
+   `zig build subsystem:boundary`(`scripts/subsystem_boundary_gate.zig`)在源码层沿每条
+   `@import`(含函数体与 test 块)检查这条规则;现存的几条边记在只减不增的 baseline 里,
+   `src/core/` 没有 baseline。前端再多,core 不被污染,core 不依赖任何前端。
+   同一个 gate 也管反方向的一条(#445):`src/daemon/`、`src/web/` 下的文件不得直接
+   import `src/core/agent_loop.zig`(宿主经 `core/session_host.zig` 驱动内核),现存的两条
+   (`daemon/app_driver.zig`、`web/session.zig`)记在只减不增的 baseline 里。
 
 2. **窄腰协议(narrow waist)**。core↔UI 全部走 `UiBackend` 的 **emit/poll 两个函数指针** +
    一个**全可序列化**的 `CoreEvent`/`UiEvent` union。无指针、无闭包穿过协议 → 同一协议可进程内
@@ -82,7 +88,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 | `transcript` | 对话持久化(JSONL per-turn)+ 重建 | `Writer`, `loadTranscript`, `sessionDir` |
 | `session_id` | session 身份值类型(多 session 基石) | `SessionId`, `.single`, `gen()` |
 | `permission*` | 权限决策链(模式 + 规则 + 沙箱 + UI 请求) | `PermissionContext`, decision/settings/session_rules |
-| `agents` / `skills` / `mcp` / `sandbox` | subagent 定义 / Skill / MCP 客户端 / Seatbelt 沙箱 | `AgentSet`, `SkillSet`, `mcp_client`, `sandbox_config` |
+| `agents` / `skills` / `mcp` / `sandbox` | subagent 定义 / Skill / MCP 客户端 / Seatbelt / bubblewrap 沙箱 | `AgentSet`, `SkillSet`, `mcp_client`, `sandbox_config` |
 | registries | task/job/agent_job/cron 的运行时态 | `TaskStore`, `JobRegistry`, `AgentJobRegistry`, `CronRegistry` |
 | `client` / `api/stream` | Anthropic HTTP + SSE 流式 + 重试 | `Client.init(WithBaseUrl)`, `sendMessageStreamFull`, `UsageDelta` |
 | 参考 backend | 库自带非-UI 前端(可直接用或当模板) | `WriterBackend`(打印型), `HeadlessBackend`(CoreEvent→JSON) |
@@ -138,6 +144,7 @@ pub const CoreEvent = union(enum) {
     // 输出语义(见 §3.2.1)
     output_segment_begin: struct { index, turn, group },
     output_segment_end: struct { index, turn, group, disposition, bytes },
+    thinking_discarded: struct { index, turn, group, bytes }, // 被重发的尝试流出的 thinking 撤回(#452)
     // 文件修改结果(见 §3.2.2)
     file_changes: struct { id, name, changes, overflow, lost },
 };
@@ -166,7 +173,10 @@ core 因此把它**已经知道**的判定发出来。一个 **段** = 一次 pr
 | `discarded` | 从未进入 Conversation(流内失败回滚),前端须丢弃已缓冲的该段字节 |
 
 `index` 在 Run 内单调,**被丢弃的段也占一个索引**("回滚过"与"没发生过"必须可区分)。
-`thinking_chunk` 不属于任何段——思考永不进入结果。
+`thinking_chunk` 不属于任何段——思考永不进入结果。但它总在本次 stream 的段打开期间到达,所以
+同轮重发(请求自带的那一次或 `retractable_stream_retries` 准许的)撤回一个流出过 thinking 的尝试时,在该段 `discarded` 之后
+紧跟 `thinking_discarded`(同一段的 index/turn/group 与 thinking 字节数):前端丢弃该段打开期间
+到达的 thinking,与丢弃该段文本同理(见 §7 流内重发那一条)。
 
 不想消费事件的调用方挂 `Options.output_ledger: ?*output_semantics.Ledger`,run() 返回后直接
 `ledger.finalText()` / `partialText()`(续写组已拼好)。**账本不传给 subagent**:子 agent 的
@@ -251,6 +261,34 @@ query、Ctrl+O transcript、resume 回放与 `/recap` 把它们与用户输入�
   一次无工具 provider 请求,受自演化 author 上限约束(max_tokens 先验、usage 与成本后验),
   响应只是证据;宿主按 `KgRemember` 同一套头绑定把信封写成 `lesson` 节点,头不符的信封计入
   refused。distill 与 reconcile 合在这一次请求里,报告记一段。形式化:`LearningTurn.lean`。
+
+**隔离验证者(isolated verifier,`core/isolated_verifier.zig` + `agents/isolation.zig` 的 `Snapshot`,
+设计说明 [ISOLATED_VERIFIER_DESIGN.md](ISOLATED_VERIFIER_DESIGN.md))**:钉住检查通过之后,宿主在代码里
+起一个全新的子 agent,对照原始任务逐项找证据。它只能降级,不能升级。
+- **隔离**:不是 `AgentDef`,同名项目 agent 无法顶替;system prompt 是编译期常量 `CHARTER`(SHA-256
+  进记录);唯一的 user 消息是 packet(任务原文、钉住检查与计数、快照路径与 `base`/`candidate` 两个
+  ref,第二个边界另带上次 FAIL 的 probe);工具只有 Bash / Read / Grep / Glob;kg、Skills、MCP、宿主
+  服务、read state、文件改动账本、后台任务全为 null。工作目录是工作区的 git 快照(临时 index,不碰
+  actor 的 index / HEAD / ref / stash;独立仓库经 alternates 读对象;结束后总是删除),绑定树 id **T**,
+  返回后重算 T′,不等即 `unavailable`(`workspace_changed`)。
+- **判定**:只读最后一条 assistant 消息的最后一个非空行 `VERDICT: PASS|FAIL|UNVERIFIED`;其他以
+  `VERDICT:` 开头的行使结果 `unavailable`。每个 `PROBE:` 必须是它真跑过的 Bash 命令的子串,否则 PASS /
+  FAIL 降为 UNVERIFIED。基础设施错误(快照失败、spawn 失败、provider 错误、非 `end_turn`、墙钟、无 token)
+  一律 `unavailable`,回退到钉住判定。
+- **检查门接线**:`Options.isolated_verifier: ?isolated_verifier.Options`(需要 `check_gate`,根 Run,
+  canonical `buildRunOptions` 不带)。enforce:FAIL 变成 `failed`(`State.last_source = .verifier`),
+  在检查门同一个续跑预算内续跑,续跑消息只引用复现过的证据块;UNVERIFIED 且还有预算时开一轮只读
+  leads(至多 3 轮,只跑 Read / Grep / Glob,占一次续跑),再起一个新验证者看同一个 T。observe 只记录。
+  每 Run 至多 2 个边界、每边界至多 2 次 spawn,单次 US$0.20、整 Run US$0.60、单次 300 s。
+- **收尾形态**:print 模式下检查门未武装时,`host_check.runAndIngestVerified` 在干净通过之后跑一次,
+  enforce 在 `host_run` 行上写 `"verifier"` 限定(provenance 不变);`verdict.effectiveRank` 让
+  `verifier=fail` 的行同分时排在未受质疑的 `host_run` 之下、`host_run_tainted` 之上。
+- **独立入口**:`isolated_verifier.verify(gpa, Deps, VerifyRequest) → VerifyResult`,不依赖检查门
+  状态,teamwork 运行时可以直接调用。
+- **CLI 与记录**:`--verifier` / `--verifier-observe` / `--verifier-model <model|tier>`,print 模式另认
+  `METACODES_VERIFIER=enforce|observe`;没有钉住检查、单独给 `--verifier-model`、或与 `--learning-turn`
+  同时开都是参数错误(`main.resolveVerifier`)。武装时 Run 结束发一条 `isolated_verifier` 终局记录
+  (`metacodes-isolated-verifier-v1`)。
 
 #### 3.2.1.1 候选响应边界:这条响应能不能进 Conversation(`core/response_candidate.zig`)
 
@@ -390,7 +428,7 @@ pub const RunResult = struct {
     tool_calls: u32,
     suspend_info: ?SuspendInfo = null,
     stall: ?stall_gate.Report = null, // 非空 ⇔ stop_reason == .stalled
-    continuations: u32 = 0, // 本次 run 的 max_tokens 续写次数(≤ MAX_CONTINUATIONS)
+    continuations: u32 = 0, // 本次 run 的 max_tokens 续写总次数(MAX_CONTINUATIONS 只限连续续写)
     learning: ?learning_turn.Report = null, // 学习回合武装且 Run 走到终局边界时非空
 };
 pub const StopReason = enum {
@@ -813,6 +851,12 @@ session)。这是 `requestUi`/`promptUser` 当前的全部行为。
 (AskUserQuestion→NotATty;plan→answer_queue/reject)。参考 `WriterBackend.initNull()` /
 `HeadlessBackend`。
 
+权限 prompt 没人答时(`promptUser` 返 `permission.PromptUnanswered` 错误：无人可问、
+`.pending`/`.unavailable`、requester 失败、超时、被中断/关闭取消、应答读不懂、前端渲染不了),
+照样拒绝，但告诉模型的是原因，不是"user declined"。requester 用 `ui_request.Unanswered`
+(`UiRequestTimedOut`/`UiRequestCancelled`/`UiAnswerUnreadable`)报告超时、取消与读不懂。
+文本与 `recoverable` 见 [WIRE_PROTOCOL.md §1.4](WIRE_PROTOCOL.md#14-requests-nobody-answered)。
+
 ### 5.3 异步前端(IM / 邮件 / 工作流)— 可挂起路径
 
 人类响应延迟 >> 进程寿命(几小时 + 跨重启),活线程无法存活那么久。**协议层已预留**:
@@ -826,6 +870,14 @@ session)。这是 `requestUi`/`promptUser` 当前的全部行为。
 `suspend.json`，`--resume-response` 通过 `resumeSuspended` 读取 transcript 与挂起状态，
 调用 `resumeRun` 注入成对的 `tool_result` 并继续运行（再次挂起时链式重写状态）。真正的
 Slack/邮件投递器仍属于宿主职责，core 不负责网络传输。
+
+`.pending` 只对工具执行时发起的请求生效（AskUserQuestion、custom UI）。权限请求不在此列：
+权限门在 `executeSlots` 之前同步询问，`permission/prompt.zig` 把 `.pending` 当成没有回答，
+在 `no_interactive_prompt` 下直接拒绝该工具，Run 不会挂起。所以 `SessionHost` 的挂起模式
+（`Options.ui_request_wait = .suspend`，#446）只挂起问答和 custom 请求，权限请求仍同步等待；
+它用 `AdmittedRun.resumeWithResults`（内部即 `agent_loop.resumeRunWithResults`）恢复挂起的
+Run。挂起状态只落在会话目录的 `ui_requests.json`（临时文件 + fsync + rename，自带同轮其余调用的结果），
+不用 `suspend.json`：后者原地覆写、不 fsync，也不保留被拒绝或推迟的兄弟调用。
 
 ---
 
@@ -888,6 +940,20 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
 提供,不进 checkpoint。设计见 `SWARM_DESIGN.md` §7b,C ABI 封装见 `AGENTCORE_BINARY_ABI.md`
 "Teams"。
 
+`RuntimeConfig.enable_cron`(issue #445)把 cron 工具(`CronCreate`/`CronDelete`/`CronList`)
+放进目录;选了它们的 Session 自带 `CronRegistry`(不落盘)。到期 prompt 由 Host 在空闲时经
+`AgentSession.takeDueCronPrompts` 取走;`SessionHost` 的 driver 把每条变成一个
+`cron_fired` Run,只取队列 `max_queued` 容得下的条数,其余仍到期留待下次;Host 经
+`Snapshot.cron_jobs` 看任务、经 `cancel_cron_job`/`cancel_all_cron_jobs` 命令删任务
+(#493,见 `API.md` 的 SessionHost 一节)。C ABI 不提供 cron 工具。
+
+`SessionConfig.run_control`(issue #445)让 durable Session 的每个 Run 打开 daemon 那一套
+`project_rule_activation.RunControl`:`project_rules = .enforced` 时由
+`<dirname(run journal 根)>/project-rules` 的 active bundle 门控工具调用(加载失败、或仍有
+后台 Bash job / team 时 Run 在 provider 请求前失败),`abandoned_run = .record_abandoned`
+把死掉的 owner 留下的 Run 记为 abandoned 后继续。ephemeral Session 设置非默认值被拒
+(`RunControlRequiresRunJournal`)。C ABI 不暴露它。
+
 ---
 
 ## 7. 已知约束与边界(诚实清单)
@@ -940,20 +1006,37 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   经 `client.reportServerError` 写"API 错误帧"现场);`StreamStalled` / `StreamIncomplete` /
   `ContextWindowExceeded` / `Aborted` 各有专名;本地或解析类失败(`StreamTooLong`、`OutOfMemory`…)
   保留原名。
-  **连接没给出答复、又零可见输出时同轮重发一次**:`agent_loop.SILENT_STREAM_RETRY_FLOOR`——失败是
-  `StreamStalled`、`StreamIncomplete` 或 `RequestFailed`(`isSilentRetryFailure`),且本次尝试还没有
-  文本 / thinking / 工具调用到达 backend 时,不论 `max_stream_turn_retries` 是多少(TUI 为 0)都至少重发
-  一次。`ApiError` 是服务端的答复,本地失败重发也不会变,都不重发。已流出可见内容的失败仍按
-  `max_stream_turn_retries`。仍然成立的边界:
-  已流出可见内容的正文 stall 在 TUI 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
+  **每个模型请求自带一次同轮重发**(#461):`agent_loop.STREAM_RETRIES_PER_REQUEST`(1)——失败是
+  `StreamStalled`、`StreamIncomplete` 或 `RequestFailed`(`isSilentRetryFailure`),且失败的响应**没有
+  开始任何工具调用**时,不论 Options 怎么配(TUI、headless、AgentCore 一样)都重发一次同一请求(同
+  provider / wire / 模型 / 绑定,逐字节相同);失败尝试流出的文本与 thinking 一并丢弃,不进 Conversation。
+  "开始了工具调用"包括参数还在流的半截调用:loop 只在块收口时才收到 `tool_use_start`,所以由各 client
+  的解析器经 `StreamHandle.toolCallStarted()` 报告(Anthropic 的 `tool_use` 块开头、chat 的
+  `delta.tool_calls`、Responses 的 `function_call` item 或参数增量、Bedrock 的 `toolUse` 块开头;
+  Gemini 的调用整块到达,loop 自己看得到)。额度按请求计(每个 turn 重置),前面的 turn 用不掉后面的。
+  `ApiError` 是服务端的答复,本地失败重发也不会变,都不重发。
+  **额度之外的重发**:`max_stream_turn_retries`(headless 为 2,任何流内失败,`ApiError` 也算)与
+  `Options.retractable_stream_retries`(#452,AgentCore `RunOptionsV1.stream_retry_budget`,默认 0,只限
+  上面那三种失败,开始了工具调用也可以)按 Run 计、共用一个计数,在请求自己那一次用完之后才用;
+  每次重发各有自己的建连重试。重发一个已流出内容的尝试时,不论用的是哪一份额度,都先告诉宿主撤回什么:
+  该段照常以 `discarded` 收口;流出过 thinking 时紧跟 `thinking_discarded`(同一段的 index/turn/group
+  与 thinking 字节数);再发 `retry_notice`(`attempt` = 本请求已断的流数,含本次;`max` = 本请求至多
+  几次尝试:首次 + 自带一次 + Run 额度余量;`delay_ms` = `Options.stream_retry_backoff_ms`,默认
+  `STREAM_RETRY_BACKOFF_MS` 500 ms),然后等这段退避再重发。退避期间 abort → Run 以 `aborted` 收口,
+  不再发请求。零可见输出的重发不发这些事件、也不等。
+  被丢弃尝试流式预取的只读工具结果在 `Prefetch.joinAll` 之后不可再取:重发的尝试即使复用同一个
+  工具调用 id,也会真正执行该调用。仍然成立的边界:TaskBatch 的 join 有界于空闲上限,
   不会 detach 卡死的 worker;TUI 每个 provider 回合结束就刷 transcript,但一个回合内的内容仍只在
   内存里。
 - **流必须报告它是怎么停的,否则不是收尾**(issue #269):四条 wire 各有一个停止报告——Anthropic
   的 `message_delta.stop_reason`、OpenAI chat 的非 null `finish_reason`、Responses 的
   `response.completed` / `response.incomplete`、Gemini 的 `finishReason`(或整条 prompt 被拒的
   `promptFeedback.blockReason`)。干净 EOF 或只有 `[DONE]` 而没有它,解析器抛
-  `error.StreamIncomplete`(经 `client.reportStreamIncomplete` 写 last_error 与 Run 级的
-  `api/model_error.zig`,后者经线程局部 Scope 归属到具体 Run,`Options.model_error_out` 取走,#408);agent_loop 把它当
+  `error.StreamIncomplete`,由 `client.reportStreamIncomplete` 写 last_error 与 Run 级的
+  `api/model_error.zig` 明细(`stream_interrupted` / `retryable`,带该响应头的 status 与 request id,
+  #451;明细经线程局部 Scope 归属到具体 Run,`Options.model_error_out` 取走,#408)。agent_loop 流循环里
+  的兜底 `model_error.noteStreamReadError` 不覆盖已写的明细,只给没人描述过的失败定性(`RequestFailed`
+  归 `stream_interrupted`,本地或解析类失败归 `unknown`)。agent_loop 把它当
   流内失败:丢弃残片,按 `Options.max_stream_turn_retries` 同轮重发,额度用尽 `stop_reason=api_error`。
   此前它被归一成 `end_turn`——丢的字节恰好是 `max_tokens` / `length` 时,截断的回答读起来是完整的,
   续写安全网不开火。报告过停止原因、只丢了帧尾(`message_stop`、`[DONE]`、其后的 usage 块)的流
@@ -968,12 +1051,14 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   `RunResult.continuations` 记本次 `run` 的
   max_tokens 续写次数,headless `--json` 结果行同名字段携带它:续写后的正文是无缝拼接,只看结果
   的消费者没有别的办法知道回答被截断过。
-- **续写额度用尽后仍被截断 = 显式未完成**(issue #394):一个 `run` 至多续写 `MAX_CONTINUATIONS`
-  (3)次。额度用尽后,没有 tool_use 的一轮仍以 max-token 终止(Anthropic `max_tokens`、chat
+- **续写额度用尽后仍被截断 = 显式未完成**(issue #394):一个 `run` 至多**连续**续写
+  `MAX_CONTINUATIONS`(3)次;某轮不再以 max-token 收尾或带了 tool_use(模型已恢复)时连续计数
+  归零,所以长任务里分散的截断不会累计耗尽额度(`RunResult.continuations` 仍记总数)。额度用尽后,没有 tool_use 的一轮仍以 max-token 终止(Anthropic `max_tokens`、chat
   `length`、Responses `response.incomplete` + `max_output_tokens`、Gemini `MAX_TOKENS`)→
   `stop_reason=max_tokens_exhausted`,该段定性 `partial`,不再走主机门、Stop hook 与 `final`
   收尾。有没有可见正文都一样:正文照样交付(`Ledger.partialText()` 是整个续写组的拼接),
-  headless 结果行 `text_kind=partial`、退出码 1,`--stream-json` 时间线是
+  headless 结果行 `text_kind=partial`、退出码 1,不带 `--json` 时 stdout 只有已有正文、
+  stderr 说明原因(#417),`--stream-json` 时间线是
   `continued → … → partial`;AgentCore ABI v1 报 `api_error`(RunState `failed`),Session
   可接着跑下一个 Run(`AGENTCORE_BINARY_ABI.md`)。此前只有无正文的一轮走这里,带正文的被当成完成的回答
   (`end_turn` / `final`,退出码 0)。完整的 tool_use 照常执行,不算耗尽;续写中途正常收尾
@@ -1001,11 +1086,13 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
 ```bash
 zig build                 # 主二进制(含 TUI 前端)
 zig build test            # 全单测(含协议/工具/权限)
-zig build test:lib        # ★ refAllDecls 编 core 全图 = core↔UI 物理隔离的编译器证明
+zig build test:lib        # refAllDecls 编 core 的公开声明 = 库能单独编译
+zig build subsystem:boundary  # ★ core 的 import 闭包够不到应用侧(源码层检查)
 zig build example         # 跑 example/ 最小前端(真端点;离线见 LIB_API.md §1)
 ```
 
-**`zig build test:lib` 绿 = core 不依赖任何前端**——这是平台内核最该守的不变式,每次改 core 后必跑。
+**`zig build subsystem:boundary` 绿 = core 不依赖任何前端**——这是平台内核最该守的不变式,每次改 core 后必跑
+(`zig build test` 经 `test:units` 也会跑它)。
 
 ---
 

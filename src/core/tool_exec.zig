@@ -89,7 +89,7 @@ pub const Slot = struct {
     name: []const u8, // borrowed(指向 conversation 的 tool_use)
     id: []const u8, // borrowed
     input: []const u8, // borrowed
-    /// PreToolUse's rewritten input, owned only when admission changed it.
+    /// Canonical arguments (including PreToolUse rewrites), owned by this slot.
     admitted_input: ?[]u8 = null,
     /// 执行后填:成功内容 或 错误内容(均 owned by caller allocator)。
     content: ?[]u8 = null,
@@ -440,6 +440,8 @@ const DispatchObservation = struct {
     project_pre_signal: ?project_gate_protocol.PreSignal = null,
     replay: execution_effect.ReplayPolicy = .never,
     boundary_started: bool = false,
+    /// Borrowed from `start` for the plaintext tap; outlives the dispatch.
+    input: []const u8 = "",
 
     fn start(self: *DispatchObservation, input: []const u8) bool {
         if (!emitDispatchStarted(
@@ -453,6 +455,7 @@ const DispatchObservation = struct {
             self.within_root,
         )) return false;
         self.input_bytes = input.len;
+        self.input = input;
         self.started = true;
         if (self.ctx.execution_boundary) |boundary| {
             if (!boundary.emit(.{ .before = .{ .tool_dispatch = .{
@@ -503,6 +506,15 @@ const DispatchObservation = struct {
             result,
             self.effect_slot.*,
         );
+        if (observed) if (self.ctx.tool_observer) |sink| sink.tap(.{
+            .id = self.id,
+            .dispatched_name = self.dispatched_name,
+            .origin = self.ctx.tool_observation_origin,
+            .agent_depth = self.ctx.agent_depth,
+            .outcome = outcome,
+            .input = self.input,
+            .result = result,
+        });
         var boundary_observed = true;
         if (self.boundary_started) {
             const boundary = self.ctx.execution_boundary.?;
@@ -641,7 +653,7 @@ const ObservationCapture = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (event) {
-            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => return true,
+            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .isolated_verifier, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => return true,
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.depth = started.agent_depth;
@@ -1702,7 +1714,7 @@ fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_alloca
 const SpawnJobFn = *const fn (job: *Job) std.Thread.SpawnError!std.Thread;
 
 fn spawnJob(job: *Job) std.Thread.SpawnError!std.Thread {
-    return std.Thread.spawn(.{}, runJob, .{job});
+    return @import("platform").thread.spawn(.full, runJob, .{job});
 }
 
 /// Spawner injection exists solely to make the resource-exhaustion fallback
@@ -2416,7 +2428,7 @@ test "project post gate runs before terminal observation and block preserves act
         fn emit(raw: *anyopaque, event: tool_observation.Event) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
-                .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => {},
+                .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .isolated_verifier, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => {},
                 .dispatch_started => self.starts += 1,
                 .dispatch_finished => |finished| {
                     self.finishes += 1;

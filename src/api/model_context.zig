@@ -10,7 +10,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const log = @import("../util/log.zig");
-const model_name = @import("../api/model_name.zig");
+const model_name = @import("model_name.zig");
 
 const BUNDLED = @embedFile("model_context_default.toml");
 

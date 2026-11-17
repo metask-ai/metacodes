@@ -19,10 +19,13 @@ const config_store = @import("config_store.zig");
 const custom_provider = @import("custom_provider.zig");
 const config_doc = @import("config_doc.zig");
 const openrouter = @import("openrouter.zig");
+const bedrock_catalog = @import("bedrock_catalog.zig");
 const offer_mod = @import("offer.zig");
 const profile_mod = @import("profile.zig");
 const metask_profile = @import("profiles/metask.zig");
 const metask_catalog = @import("metask_catalog.zig");
+const controls_mod = @import("controls.zig");
+const ControlSpec = controls_mod.ControlSpec;
 
 pub const ProviderRegistry = registry_mod.ProviderRegistry;
 pub const OfferCatalog = registry_mod.OfferCatalog;
@@ -163,7 +166,7 @@ pub const Host = struct {
         self.refresh() catch return error.OutOfMemory;
     }
 
-    pub const IngestError = openrouter.AdapterError || registry_mod.RegisterError;
+    pub const IngestError = openrouter.AdapterError || bedrock_catalog.AdapterError || registry_mod.RegisterError;
 
     /// Ingest a provider catalog: one `GET /models` document plus one
     /// `GET /models/{id}/endpoints` document per model the caller cares about.
@@ -254,6 +257,24 @@ pub const Host = struct {
     /// Replace Metask's compiled inventory with a gateway's `/v1/models`
     /// document. The gateway origin is kept separate from either protocol
     /// path; every returned model is materialized once per wire in `wires`.
+    /// The reasoning levels a Metask model takes (`metask_catalog.Model.efforts`,
+    /// the gateway's words), as the `reasoning_effort` control `/model` offers
+    /// and a commit applies; none when the gateway names none. Copied into
+    /// `arena`, which the registry keeps.
+    fn metaskReasoningControls(arena: std.mem.Allocator, efforts: []const []const u8) ![]const ControlSpec {
+        if (efforts.len == 0) return &.{};
+        const values = try arena.alloc([]const u8, efforts.len);
+        for (efforts, 0..) |effort, i| values[i] = try arena.dupe(u8, effort);
+        const specs = try arena.alloc(ControlSpec, 1);
+        specs[0] = .{
+            .id = "reasoning_effort",
+            .label = "Reasoning effort",
+            .kind = .enumeration,
+            .allowed_values = values,
+        };
+        return specs;
+    }
+
     pub fn ingestMetask(
         self: *Host,
         gateway_origin: []const u8,
@@ -293,6 +314,7 @@ pub const Host = struct {
                 },
                 .capabilities = capabilities,
                 .quote = .unknown,
+                .controls = try metaskReasoningControls(scratch, model.efforts),
             };
         }
 
@@ -338,6 +360,24 @@ pub const Host = struct {
         self.refresh() catch return error.OutOfMemory;
     }
 
+    /// The Metask profile the registry holds now, compiled or ingested, for
+    /// a caller that may have to put it back (`restoreMetask`). What it
+    /// points at lives until `destroy`: an ingested profile's arena stays in
+    /// `catalog_arenas`.
+    pub fn metaskProfile(self: *const Host) ?profile_mod.ProviderProfile {
+        const found = self.registry.findById(metask_profile.PROFILE.id) orelse return null;
+        return found.*;
+    }
+
+    /// Put back a Metask profile `metaskProfile` returned, undoing an ingest
+    /// whose purpose failed (a `/login` whose commit did not happen, #485).
+    pub fn restoreMetask(self: *Host, profile: profile_mod.ProviderProfile) HostError!void {
+        try self.registry.checkReplace(profile);
+        try self.registry.reserve(0);
+        self.registry.replaceAssumeCapacity(profile);
+        try self.refresh();
+    }
+
     /// Rebuild the catalog and hand it to the kernel. The previous catalog is
     /// retired rather than freed, so a reader that snapshotted the old pointer
     /// finishes against valid memory.
@@ -371,6 +411,54 @@ pub const Host = struct {
         self.kernel.adoptCatalog(&self.catalog);
     }
 
+    /// Ingest one Bedrock region's catalog: a ListFoundationModels document
+    /// and a ListInferenceProfiles document (`bedrock_catalog.zig`).
+    ///
+    /// The provider is a configured instance (`provider_id`), never the
+    /// built-in `bedrock` profile: a runtime source may replace its own
+    /// registration, not a built-in one. Like `ingestOpenRouter`, the bytes come
+    /// from the caller; this kernel does not fetch.
+    pub fn ingestBedrock(
+        self: *Host,
+        provider_id: Slug,
+        region: []const u8,
+        foundation_models_json: []const u8,
+        inference_profiles_json: ?[]const u8,
+    ) IngestError!void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
+        const scratch = arena.allocator();
+
+        const models = try bedrock_catalog.parseFoundationModels(scratch, foundation_models_json);
+        const profiles = if (inference_profiles_json) |json| try bedrock_catalog.parseInferenceProfiles(scratch, json) else &.{};
+        const channels = try scratch.alloc(profile_mod.ChannelDescriptor, 1);
+        channels[0] = try bedrock_catalog.buildChannel(scratch, region, models, profiles);
+
+        const kinds = try scratch.alloc(profile_mod.CredentialKind, 1);
+        kinds[0] = .api_key;
+        const aliases = try scratch.alloc(profile_mod.EnvAlias, 1);
+        aliases[0] = .{ .name = "AWS_BEARER_TOKEN_BEDROCK", .kind = .api_key, .canonical = true };
+
+        const built = profile_mod.ProviderProfile{
+            .id = provider_id,
+            .implementation_id = Slug.lit("bedrock"),
+            .display_name = "Amazon Bedrock (catalog)",
+            .channels = channels,
+            .accepted_credential_kinds = kinds,
+            .env_aliases = aliases,
+            .auth = .bearer,
+            .default_channel = channels[0].id,
+        };
+        try self.registry.checkUpsert(built);
+        try self.registry.reserve(1);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
+        self.registry.upsertAssumeCapacity(built);
+        self.catalog_arenas.appendAssumeCapacity(arena);
+        moved = true;
+        self.refresh() catch return error.OutOfMemory;
+    }
+
     /// Ingest provider catalogs named by the configuration.
     ///
     /// The documents are read from disk rather than fetched, on purpose: this
@@ -379,11 +467,14 @@ pub const Host = struct {
     /// parsing, the offer construction, and the events are identical either
     /// way, so wiring a fetcher later changes only where the bytes come from.
     ///
-    /// Shape:
+    /// Shape (`kind` defaults to `openrouter`):
     /// ```json
     /// "provider_catalogs": {
     ///   "openrouter": {"models_file": "…/models.json",
-    ///                  "endpoint_files": ["…/deepseek.json"]}
+    ///                  "endpoint_files": ["…/deepseek.json"]},
+    ///   "bedrock-us": {"kind": "bedrock", "region": "us-east-1",
+    ///                  "foundation_models_file": "…/foundation-models.json",
+    ///                  "inference_profiles_file": "…/inference-profiles.json"}
     /// }
     /// ```
     pub fn ingestConfiguredCatalogs(self: *Host, text: []const u8) IngestError!void {
@@ -404,6 +495,19 @@ pub const Host = struct {
             const provider_id = Slug.parse(pair.key_ptr.*) catch return error.InvalidSlug;
             const entry = pair.value_ptr.*;
             if (entry != .object) return error.InvalidDocument;
+            const kind = stringField(entry.object.get("kind")) orelse "openrouter";
+            if (std.mem.eql(u8, kind, "bedrock")) {
+                const region = stringField(entry.object.get("region")) orelse return error.InvalidDocument;
+                const models_path = stringField(entry.object.get("foundation_models_file")) orelse return error.InvalidDocument;
+                const models_json = readFile(arena, models_path) catch return error.InvalidDocument;
+                const profiles_json: ?[]const u8 = if (stringField(entry.object.get("inference_profiles_file"))) |path|
+                    readFile(arena, path) catch return error.InvalidDocument
+                else
+                    null;
+                try self.ingestBedrock(provider_id, region, models_json, profiles_json);
+                continue;
+            }
+            if (!std.mem.eql(u8, kind, "openrouter")) return error.InvalidDocument;
             const models_path = stringField(entry.object.get("models_file")) orelse return error.InvalidDocument;
             const models_json = readFile(arena, models_path) catch return error.InvalidDocument;
 
@@ -617,6 +721,33 @@ test "an API-key Metask catalog offers each gateway model once, on the Messages 
     try std.testing.expectEqual(@as(usize, 2), metask_offers);
 }
 
+test "the www gateway's catalog offers only the models it serves on /v1/messages, with their reasoning levels to choose" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask("https://www.metask-ai.com",
+        \\{"object":"list","data":[
+        \\ {"id":"glm-5.3","capabilities":{"endpoints":{"messages":{"supported":true}},
+        \\   "reasoning":{"supported":true,"disable":{"supported":false},"efforts":["low","medium","high","max"]}}},
+        \\ {"id":"wan3.0-video-prime","capabilities":{"endpoints":{"messages":{"supported":false},"videos":{"supported":true}}}}
+        \\]}
+    , .messages_and_chat);
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("metask")) continue;
+        seen += 1;
+        // The video model is not offered on either route.
+        try std.testing.expectEqualStrings("glm-5.3", item.request_model_id);
+        try std.testing.expectEqual(offer_mod.Tri.supported, item.capabilities.get(.reasoning));
+        const spec = controls_mod.findSpec(item.controls, "reasoning_effort") orelse return error.NoReasoningControl;
+        try std.testing.expectEqual(@as(usize, 4), spec.allowed_values.len);
+        try std.testing.expectEqualStrings("low", spec.allowed_values[0]);
+        try std.testing.expectEqualStrings("max", spec.allowed_values[3]);
+    }
+    // One model, on the Messages and the Chat route.
+    try std.testing.expectEqual(@as(usize, 2), seen);
+}
+
 test "two refreshes keep the retired catalog alive for one generation" {
     const a = std.testing.allocator;
     const host = try Host.create(a);
@@ -725,6 +856,9 @@ test "an ingested catalog becomes offers, and its prices and health become event
     for (items) |item| {
         if (!item.provider_id.eqlText("openrouter")) continue;
         try std.testing.expectEqualStrings("deepseek/deepseek-v4", item.canonical_model_id.?);
+        // The route speaks OpenRouter's dialect, not DeepSeek's, although the
+        // name says deepseek: OpenRouter translates for its upstreams.
+        try std.testing.expectEqual(@import("vendor.zig").Vendor.openrouter, item.dialect.route.?);
         if (item.quote.priced()) |price| {
             priced += 1;
             if (price.provenance.freshness == .inherited) inherited += 1;
@@ -752,6 +886,32 @@ test "an ingested catalog becomes offers, and its prices and health become event
     try std.testing.expect(saw_catalog);
     try std.testing.expect(saw_pricing);
     try std.testing.expect(saw_degraded);
+}
+
+test "a Bedrock catalog becomes Converse offers that declare each model's dialect" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestBedrock(
+        Slug.lit("bedrock-us"),
+        "us-east-1",
+        bedrock_catalog.SAMPLE_FOUNDATION_MODELS,
+        bedrock_catalog.SAMPLE_INFERENCE_PROFILES,
+    );
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("bedrock-us")) continue;
+        seen += 1;
+        try std.testing.expectEqual(profile_mod.Protocol.Wire.bedrock_converse, item.wire.?);
+        try std.testing.expectEqualStrings("https://bedrock-runtime.us-east-1.amazonaws.com", item.endpoint_ref);
+        if (std.mem.eql(u8, item.request_model_id, "us.anthropic.claude-sonnet-4-6"))
+            try std.testing.expectEqual(@import("vendor.zig").Vendor.claude, item.dialect.model.?);
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+    // A refresh replaces its own registration rather than failing on it.
+    try host.ingestBedrock(Slug.lit("bedrock-us"), "us-east-1", bedrock_catalog.SAMPLE_FOUNDATION_MODELS, null);
+    // The built-in profile's id cannot be taken over by a catalog.
+    try std.testing.expect(std.meta.isError(host.ingestBedrock(Slug.lit("bedrock"), "us-east-1", bedrock_catalog.SAMPLE_FOUNDATION_MODELS, null)));
 }
 
 test "a pinned offer survives an unrelated catalog ingest" {

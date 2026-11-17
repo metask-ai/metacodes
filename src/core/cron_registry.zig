@@ -14,13 +14,96 @@ const std = @import("std");
 const rng = @import("platform").rng;
 const util_time = @import("../util/time.zig");
 
+/// A job's id: 12 lowercase hex digits, as `create` makes them. A Host
+/// names a job by it (`SessionHost.Command.cancel_cron_job`, #493); `parse`
+/// takes only that form, so a malformed id never reaches the registry.
+pub const JobId = struct {
+    bytes: [12]u8,
+
+    pub fn parse(text: []const u8) error{InvalidCronJobId}!JobId {
+        if (text.len != 12) return error.InvalidCronJobId;
+        var id: JobId = .{ .bytes = undefined };
+        for (text, &id.bytes) |c, *slot| {
+            switch (c) {
+                '0'...'9', 'a'...'f' => slot.* = c,
+                else => return error.InvalidCronJobId,
+            }
+        }
+        return id;
+    }
+
+    pub fn slice(self: *const JobId) []const u8 {
+        return self.bytes[0..];
+    }
+
+    pub fn eql(a: JobId, b: JobId) bool {
+        return std.mem.eql(u8, &a.bytes, &b.bytes);
+    }
+};
+
+/// How a job fires (#493): once and then it is gone, or again on its cron
+/// expression after each fire (a recurring job always has one: `create`
+/// refuses one it cannot repeat).
+pub const Schedule = union(enum) {
+    once,
+    /// The job's 5-field cron expression.
+    recurring: []const u8,
+};
+
+/// A job as a Host sees it (`CronRegistry.list`): its id, when it fires
+/// next (unix seconds), and whether it repeats. Its prompt stays with the
+/// model.
+pub const JobView = struct {
+    id: JobId,
+    next_fire_unix: i64,
+    schedule: Schedule,
+
+    pub fn dupe(self: JobView, allocator: std.mem.Allocator) error{OutOfMemory}!JobView {
+        var copy = self;
+        switch (self.schedule) {
+            .once => {},
+            .recurring => |expr| copy.schedule = .{ .recurring = try allocator.dupe(u8, expr) },
+        }
+        return copy;
+    }
+
+    pub fn deinit(self: JobView, allocator: std.mem.Allocator) void {
+        switch (self.schedule) {
+            .once => {},
+            .recurring => |expr| allocator.free(expr),
+        }
+    }
+};
+
+/// Frees `views` (`CronRegistry.list`) and each view's expression.
+pub fn freeViews(allocator: std.mem.Allocator, views: []const JobView) void {
+    for (views) |view| view.deinit(allocator);
+    allocator.free(views);
+}
+
+/// `views`, each owned by `allocator` (`freeViews`).
+pub fn dupeViews(allocator: std.mem.Allocator, views: []const JobView) error{OutOfMemory}![]JobView {
+    const copy = try allocator.alloc(JobView, views.len);
+    var filled: usize = 0;
+    errdefer {
+        for (copy[0..filled]) |view| view.deinit(allocator);
+        allocator.free(copy);
+    }
+    for (views, copy) |view, *slot| {
+        slot.* = try view.dupe(allocator);
+        filled += 1;
+    }
+    return copy;
+}
+
 pub const CronJob = struct {
-    id: [12]u8, // hex id
+    id: JobId,
     /// cron 5-field 表达式;one-shot 时为空(用 fire_at_unix)
     cron_expr: []const u8, // owned
     /// 要注入的 prompt
     prompt: []const u8, // owned
-    /// recurring=false 时单次后删除
+    /// recurring=false 时单次后删除。A recurring job has an expression to
+    /// repeat on (`create` refuses one without).
     recurring: bool,
     /// 下次触发的 unix 秒(由 cron_expr 或 delay 计算)
     next_fire_unix: i64,
@@ -45,20 +128,22 @@ pub const CronRegistry = struct {
     }
 
     /// 创建一个 cron。cron_expr 或 delay_seconds 二选一。返回 job id。
+    /// A recurring job repeats on its expression, also after a first fire
+    /// that delay_seconds set, so it needs one that matches within the
+    /// scan's year: otherwise error.InvalidCronExpr, and nothing is stored.
     pub fn create(
         self: *CronRegistry,
         cron_expr: []const u8,
         delay_seconds: ?i64,
         prompt: []const u8,
         recurring: bool,
-    ) ![12]u8 {
+    ) !JobId {
         const now = util_time.nowUnix();
-        var next_fire: i64 = undefined;
-        if (delay_seconds) |d| {
-            next_fire = now + d;
-        } else {
-            next_fire = computeNextFire(cron_expr, now) catch return error.InvalidCronExpr;
-        }
+        const by_expr: ?i64 = if (recurring or delay_seconds == null)
+            computeNextFire(cron_expr, now) catch return error.InvalidCronExpr
+        else
+            null;
+        const next_fire = if (delay_seconds) |d| now + d else by_expr.?;
 
         const id = try genId();
         const job = CronJob{
@@ -73,12 +158,16 @@ pub const CronRegistry = struct {
         return id;
     }
 
-    /// 删除指定 id。返回是否找到。
+    /// 删除指定 id(as the model wrote it)。返回是否找到。
     pub fn delete(self: *CronRegistry, id: []const u8) bool {
+        return self.remove(JobId.parse(id) catch return false);
+    }
+
+    /// Removes job `id`; whether it was there.
+    pub fn remove(self: *CronRegistry, id: JobId) bool {
         for (self.jobs.items, 0..) |j, i| {
-            if (std.mem.eql(u8, j.id[0..], id)) {
-                self.allocator.free(j.cron_expr);
-                self.allocator.free(j.prompt);
+            if (j.id.eql(id)) {
+                self.freeJob(j);
                 _ = self.jobs.orderedRemove(i);
                 return true;
             }
@@ -86,12 +175,30 @@ pub const CronRegistry = struct {
         return false;
     }
 
+    /// Removes every job; how many there were.
+    pub fn clear(self: *CronRegistry) usize {
+        const removed = self.jobs.items.len;
+        for (self.jobs.items) |j| self.freeJob(j);
+        self.jobs.clearRetainingCapacity();
+        return removed;
+    }
+
+    fn freeJob(self: *CronRegistry, j: CronJob) void {
+        self.allocator.free(j.cron_expr);
+        self.allocator.free(j.prompt);
+    }
+
     /// 取所有 due(next_fire <= now)的 cron 的 prompt。同时:
     ///   - recurring=true → 重算 next_fire(滚动)
     ///   - recurring=false → 删除(one-shot)
     ///   - 超过 7 天的 recurring → 最后触发一次后删除(对齐 Claude Code)
+    ///   - a recurring job whose next fire cannot be computed (no expression,
+    ///     or no match within the scan's year) → removed after this fire, not
+    ///     rescheduled
+    /// At most `limit` prompts, oldest job first (#493): a due job past the
+    /// limit is left as it is, still due, and fires on a later call.
     /// 返回的 prompts owned slice(caller free 每个 + 数组)。
-    pub fn collectDue(self: *CronRegistry, allocator: std.mem.Allocator) ![]const []const u8 {
+    pub fn collectDue(self: *CronRegistry, allocator: std.mem.Allocator, limit: usize) ![]const []const u8 {
         const now = util_time.nowUnix();
         var out = std.ArrayList([]const u8).empty;
         errdefer {
@@ -100,7 +207,7 @@ pub const CronRegistry = struct {
         }
 
         var i: usize = 0;
-        while (i < self.jobs.items.len) {
+        while (i < self.jobs.items.len and out.items.len < limit) {
             var j = &self.jobs.items[i];
             if (j.next_fire_unix > now) {
                 i += 1;
@@ -110,15 +217,19 @@ pub const CronRegistry = struct {
             try out.append(allocator, try allocator.dupe(u8, j.prompt));
 
             const expired = (now - j.created_unix) > 7 * 24 * 3600;
-            if (!j.recurring or expired) {
-                self.allocator.free(j.cron_expr);
-                self.allocator.free(j.prompt);
+            // A recurring job with no next fire goes too: rescheduled a
+            // minute on instead, it fired every minute until it expired.
+            const next: ?i64 = if (j.recurring and !expired)
+                computeNextFire(j.cron_expr, now + 1) catch null
+            else
+                null;
+            if (next) |n| {
+                j.next_fire_unix = n;
+                i += 1;
+            } else {
+                self.freeJob(j.*);
                 _ = self.jobs.orderedRemove(i);
                 // 不 i+=1,因为 orderedRemove 把后面前移
-            } else {
-                // 重算下次
-                j.next_fire_unix = computeNextFire(j.cron_expr, now + 1) catch (now + 60);
-                i += 1;
             }
         }
         return try out.toOwnedSlice(allocator);
@@ -128,11 +239,42 @@ pub const CronRegistry = struct {
         return self.jobs.items.len;
     }
 
-    fn genId() ![12]u8 {
+    /// How many jobs `collectDue` would take now without a limit. A job
+    /// counted stays due until it is taken or removed.
+    pub fn dueCount(self: *const CronRegistry) usize {
+        const now = util_time.nowUnix();
+        var due: usize = 0;
+        for (self.jobs.items) |j| {
+            if (j.next_fire_unix <= now) due += 1;
+        }
+        return due;
+    }
+
+    /// What a Host sees of each job, in the order they were created (#493),
+    /// owned by `allocator` (`freeViews`).
+    pub fn list(self: *const CronRegistry, allocator: std.mem.Allocator) error{OutOfMemory}![]JobView {
+        const views = try allocator.alloc(JobView, self.jobs.items.len);
+        var filled: usize = 0;
+        errdefer {
+            for (views[0..filled]) |view| view.deinit(allocator);
+            allocator.free(views);
+        }
+        for (self.jobs.items, views) |j, *view| {
+            view.* = .{
+                .id = j.id,
+                .next_fire_unix = j.next_fire_unix,
+                .schedule = if (j.recurring) .{ .recurring = try allocator.dupe(u8, j.cron_expr) } else .once,
+            };
+            filled += 1;
+        }
+        return views;
+    }
+
+    fn genId() !JobId {
         var raw: [6]u8 = undefined;
         if (!rng.randomBytes(&raw)) return error.RandomFailed;
-        var id: [12]u8 = undefined;
-        _ = std.fmt.bufPrint(&id, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ raw[0], raw[1], raw[2], raw[3], raw[4], raw[5] }) catch unreachable;
+        var id: JobId = .{ .bytes = undefined };
+        _ = std.fmt.bufPrint(&id.bytes, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ raw[0], raw[1], raw[2], raw[3], raw[4], raw[5] }) catch unreachable;
         return id;
     }
 };
@@ -277,7 +419,7 @@ test "CronRegistry: create + delete" {
     defer reg.deinit();
     const id = try reg.create("* * * * *", null, "do thing", true);
     try testing.expectEqual(@as(usize, 1), reg.count());
-    try testing.expect(reg.delete(id[0..]));
+    try testing.expect(reg.delete(id.slice()));
     try testing.expectEqual(@as(usize, 0), reg.count());
     try testing.expect(!reg.delete("nonexistent12"));
 }
@@ -288,7 +430,7 @@ test "CronRegistry: one-shot delay collects + removes" {
     defer reg.deinit();
     // delay = -10 → 已经 due
     _ = try reg.create("", -10, "fire now", false);
-    const due = try reg.collectDue(a);
+    const due = try reg.collectDue(a, std.math.maxInt(usize));
     defer {
         for (due) |p| a.free(p);
         a.free(due);
@@ -304,11 +446,123 @@ test "CronRegistry: future job not collected" {
     var reg = CronRegistry.init(a);
     defer reg.deinit();
     _ = try reg.create("", 3600, "later", false);
-    const due = try reg.collectDue(a);
+    const due = try reg.collectDue(a, std.math.maxInt(usize));
     defer {
         for (due) |p| a.free(p);
         a.free(due);
     }
     try testing.expectEqual(@as(usize, 0), due.len);
     try testing.expectEqual(@as(usize, 1), reg.count()); // 仍在
+}
+
+test "CronRegistry: a recurring job with no next fire is removed after it fires" {
+    const a = testing.allocator;
+    // No expression: what a CronCreate with only delaySeconds stored before
+    // this fix. "0 0 30 2 *" (Feb 30) never matches, as a Feb 29 job finds no
+    // match within a year after a leap day. `create` refuses both as
+    // recurring, so each is stored one-shot and made recurring here.
+    for ([_][]const u8{ "", "0 0 30 2 *" }) |expr| {
+        var reg = CronRegistry.init(a);
+        defer reg.deinit();
+        _ = try reg.create(expr, 0, "fire once", false);
+        reg.jobs.items[0].recurring = true;
+
+        const due = try reg.collectDue(a, std.math.maxInt(usize));
+        defer {
+            for (due) |p| a.free(p);
+            a.free(due);
+        }
+        try testing.expectEqual(@as(usize, 1), due.len);
+        try testing.expectEqualStrings("fire once", due[0]);
+        try testing.expectEqual(@as(usize, 0), reg.count());
+    }
+}
+
+test "CronRegistry: create refuses a recurring job it cannot repeat" {
+    const a = testing.allocator;
+    var reg = CronRegistry.init(a);
+    defer reg.deinit();
+    try testing.expectError(error.InvalidCronExpr, reg.create("", 60, "x", true));
+    try testing.expectError(error.InvalidCronExpr, reg.create("0 0 30 2 *", 60, "x", true));
+    try testing.expectEqual(@as(usize, 0), reg.count());
+    // A delay alone fires once; a delay with an expression is a recurring
+    // job's first fire.
+    _ = try reg.create("", 60, "once", false);
+    _ = try reg.create("*/5 * * * *", 60, "every 5 min", true);
+    try testing.expectEqual(@as(usize, 2), reg.count());
+}
+
+test "CronRegistry: a recurring job is rescheduled on its expression after it fires" {
+    const a = testing.allocator;
+    var reg = CronRegistry.init(a);
+    defer reg.deinit();
+    const before = util_time.nowUnix();
+    _ = try reg.create("* * * * *", 0, "every minute", true);
+
+    const due = try reg.collectDue(a, std.math.maxInt(usize));
+    defer {
+        for (due) |p| a.free(p);
+        a.free(due);
+    }
+    try testing.expectEqual(@as(usize, 1), due.len);
+    try testing.expectEqual(@as(usize, 1), reg.count());
+    const next = reg.jobs.items[0].next_fire_unix;
+    try testing.expect(next > before);
+    try testing.expectEqual(@as(i64, 0), @mod(next, 60));
+}
+
+test "JobId.parse takes only what create makes" {
+    const id = try JobId.parse("0123456789ab");
+    try testing.expectEqualStrings("0123456789ab", id.slice());
+    for ([_][]const u8{ "", "0123456789a", "0123456789abc", "0123456789AB", "0123456789ag" }) |text| {
+        try testing.expectError(error.InvalidCronJobId, JobId.parse(text));
+    }
+}
+
+test "CronRegistry: collectDue takes at most limit prompts, oldest first; the rest stay due" {
+    const a = testing.allocator;
+    var reg = CronRegistry.init(a);
+    defer reg.deinit();
+    _ = try reg.create("", 0, "one", false);
+    _ = try reg.create("* * * * *", 0, "two", true);
+    _ = try reg.create("", 0, "three", false);
+    _ = try reg.create("", 3600, "later", false);
+    try testing.expectEqual(@as(usize, 3), reg.dueCount());
+
+    for ([_][]const []const u8{ &.{ "one", "two" }, &.{"three"} }) |expected| {
+        const due = try reg.collectDue(a, 2);
+        defer {
+            for (due) |p| a.free(p);
+            a.free(due);
+        }
+        try testing.expectEqual(expected.len, due.len);
+        for (expected, due) |want, got| try testing.expectEqualStrings(want, got);
+    }
+    // The recurring job was rescheduled, the due one-shots are gone.
+    try testing.expectEqual(@as(usize, 2), reg.count());
+    try testing.expectEqual(@as(usize, 0), reg.dueCount());
+    const views = try reg.list(a);
+    defer freeViews(a, views);
+    try testing.expectEqualStrings("* * * * *", views[0].schedule.recurring);
+    try testing.expect(views[1].schedule == .once);
+    try testing.expect(views[1].next_fire_unix > util_time.nowUnix());
+
+    const none = try reg.collectDue(a, 0);
+    defer a.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "CronRegistry: remove by id and clear" {
+    const a = testing.allocator;
+    var reg = CronRegistry.init(a);
+    defer reg.deinit();
+    const first = try reg.create("", 60, "a", false);
+    _ = try reg.create("", 60, "b", false);
+    _ = try reg.create("", 60, "c", false);
+    try testing.expect(reg.remove(first));
+    try testing.expect(!reg.remove(first));
+    try testing.expect(!reg.delete("not-an-id"));
+    try testing.expectEqual(@as(usize, 2), reg.clear());
+    try testing.expectEqual(@as(usize, 0), reg.count());
+    try testing.expectEqual(@as(usize, 0), reg.clear());
 }

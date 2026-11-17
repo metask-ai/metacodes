@@ -179,6 +179,12 @@ pub fn event(arena: std.mem.Allocator, value: InternalEvent) error{OutOfMemory}!
             },
             .bytes = v.bytes,
         } },
+        .thinking_discarded => |v| .{ .thinking_discarded = .{
+            .index = v.index,
+            .turn = v.turn,
+            .group = v.group,
+            .bytes = v.bytes,
+        } },
         .stream_done => .stream_done,
         .prompt_manifest => |manifest| .{ .prompt_manifest = try promptManifest(arena, manifest) },
         .goal_updated => |goal| .{ .goal_updated = .{

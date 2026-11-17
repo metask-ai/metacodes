@@ -1,8 +1,44 @@
-//! Google Gemini dialect 实现。
+//! # Google Gemini 接入
 //!
-//! Gemini thinking 控制:generation_config.thinking_level = "low"/"high"(Gemini 2.5+)。
-//! Gemini 不经 OpenAI-compatible 端点,走原生 generateContent;但 dialect 仍提供 serializeThinking
-//! 供未来 Gemini 侧接 thinking 控制时用(当前 gemini_client.zig 未接,留位)。
+//! Gemini 原生 generateContent wire 的方言。
+//!
+//! ## 接入点
+//!
+//! - Provider:`src/provider/profiles/gemini.zig`,渠道 `default`,
+//!   `https://generativelanguage.googleapis.com`(传输层自己拼
+//!   `/v1beta/models/{model}:streamGenerateContent?alt=sse`,`EndpointShape.base_origin`)。
+//! - 环境变量:`GEMINI_API_KEY`(规范名)、`GOOGLE_API_KEY`。
+//!
+//! ## 协议
+//!
+//! - `gemini_generate_content`。鉴权:`x-goog-api-key` 头。
+//!
+//! ## 思考与推理
+//!
+//! - `generation_config.thinking_level`。本方言输出**片段**(不带外层包裹),由
+//!   `gemini_client.zig` 的 gen_cfg 收集器合并;片段之间"非空才加前导逗号",与调用顺序无关。
+//! - Gemini 3 及以后思考关不掉:none / minimal / low → low,medium → medium,
+//!   high / xhigh / max → high。
+//! - Gemini 2.5:none / minimal 不发(可关),low → low,其余 → high。
+//! - 未指定不发,用型号自己的默认(Argon、3.8 Flash 是 medium,3.1 Pro 是 high)。
+//!
+//! ## 回传与缓存
+//!
+//! - Gemini 3 起每步第一个 functionCall 的 thought signature 必须回传:签名按调用 id
+//!   存在客户端(`gemini_signatures.zig`),序列化时放回原 part。
+//! - 缓存:隐式缓存 + `cachedContent` 句柄表(`gemini_client.zig`),不经方言。
+//!
+//! ## 已知差异
+//!
+//! - `tool_choice` → `tool_config.function_calling_config.mode`(AUTO / ANY / NONE),
+//!   指定工具时加 `allowed_function_names`。
+//! - `response_format` 只发 `response_mime_type:"application/json"`,schema 不传。
+//! - 不发 `prompt_cache_key` / `parallel_tool_calls`(Gemini 默认并行)。
+//!
+//! ## 来源
+//!
+//! - https://ai.google.dev/gemini-api/docs/thinking(2026-10 核对:默认档位)
+//! - https://ai.google.dev/gemini-api/docs/function-calling(thought signatures)
 
 const std = @import("std");
 const types = @import("../../types.zig");
@@ -16,6 +52,8 @@ const profileFor = model_adapter.profileFor;
 const ReasoningEffort = types.ReasoningEffort;
 const ToolChoice = dialect_mod.ToolChoice;
 const ResponseFormatRequest = dialect_mod.ResponseFormatRequest;
+const ProviderKind = model_adapter.ProviderKind;
+const Vendor = @import("../../provider/vendor.zig").Vendor;
 
 const Stateless = struct {};
 var stateless: Stateless = .{};
@@ -132,9 +170,22 @@ const Gemini = struct {
     };
 };
 
-pub fn geminiDialectFor(model: []const u8) Dialect {
+pub const vendor: Vendor = .gemini;
+
+/// Gemini 是 generateContent wire 的唯一方言,不参与按名推断。
+pub fn claims(kind: ProviderKind, model: []const u8) bool {
+    _ = kind;
     _ = model;
-    return Gemini.dialect.withCtx(statelessCtx());
+    return false;
+}
+
+pub fn dialect(kind: ProviderKind, model: []const u8) ?Dialect {
+    _ = model;
+    return if (kind == .gemini) Gemini.dialect.withCtx(statelessCtx()) else null;
+}
+
+fn geminiDialectFor(model: []const u8) Dialect {
+    return dialect(.gemini, model).?;
 }
 
 // ── 测试 ─────────────────────────────────────────────────────────────────────

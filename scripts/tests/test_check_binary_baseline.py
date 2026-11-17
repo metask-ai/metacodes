@@ -41,14 +41,30 @@ def _elf(needs: list) -> bytes:
     return header + strtab + verneed + b"".join(sections)
 
 
-def _macho(minimum: tuple, command: int = cbb.LC_BUILD_VERSION) -> bytes:
+TEXT_VMADDR = 0x100000000
+CODE_FLAGS = cbb.S_ATTR_PURE_INSTRUCTIONS | cbb.S_ATTR_SOME_INSTRUCTIONS
+
+
+def _macho(minimum: tuple, command: int = cbb.LC_BUILD_VERSION, sections: tuple = (), dice: tuple = ()) -> bytes:
+    """A thin x86_64 Mach-O executable. `sections` [(name, flags)] go into a
+    __TEXT segment mapped from file offset 0 at TEXT_VMADDR; `dice`
+    [(file offset, length, kind)] into an LC_DATA_IN_CODE table."""
     encoded = (minimum[0] << 16) | (minimum[1] << 8) | minimum[2]
     if command == cbb.LC_BUILD_VERSION:
-        load = struct.pack("<IIIIII", command, 24, 1, encoded, encoded, 0)
+        loads = [struct.pack("<IIIIII", command, 24, 1, encoded, encoded, 0)]
     else:
-        load = struct.pack("<IIII", command, 16, encoded, encoded)
-    header = struct.pack("<IiiIIIII", cbb.MACHO_MAGIC_64, 0x01000007, 3, 2, 1, len(load), 0, 0)
-    return header + load
+        loads = [struct.pack("<IIII", command, 16, encoded, encoded)]
+    if sections:
+        body = b"".join(struct.pack("<16s16sQQIIIIIIII", name.encode(), b"__TEXT", TEXT_VMADDR, 0, 0, 0, 0, 0, flags, 0, 0, 0)
+                        for name, flags in sections)
+        loads.append(struct.pack("<II16sQQQQiiII", cbb.LC_SEGMENT_64, 72 + len(body), b"__TEXT", TEXT_VMADDR, 0x1000000, 0, 0x1000000, 5, 5, len(sections), 0) + body)
+    table = b"".join(struct.pack("<IHH", *entry) for entry in dice)
+    if dice:
+        # The table follows the header and every load command, this one too.
+        table_offset = 32 + sum(len(load) for load in loads) + 16
+        loads.append(struct.pack("<IIII", cbb.LC_DATA_IN_CODE, 16, table_offset, len(table)))
+    header = struct.pack("<IiiIIIII", cbb.MACHO_MAGIC_64, 0x01000007, 3, 2, len(loads), sum(len(load) for load in loads), 0, 0)
+    return header + b"".join(loads) + table
 
 
 LLVM_X86 = """
@@ -91,6 +107,43 @@ GNU_AARCH64_SVE = """
 LLVM_AARCH64_V86 = """
   400020: \tbfdot\tv0.4s, v1.8h, v2.8h
   400024: \tsmmla\tv0.4s, v1.16b, v2.16b
+"""
+# The x86_64 macOS unit of 0.10.0 (release run 41194755285): a 147-entry jump
+# table of repl.loop.readLineRaw's key switch, at 0x1000f17b4 for 588 bytes.
+# Mach-O mode prints its entries as data and resumes at 0x1000f1a00; a linear
+# -d decoded two of them, 62 f1 ff ff 59 f0, as an EVEX vmulsd.
+JUMP_TABLE = (0x1000F17B4, 588, 4)
+MACHO_X86_JUMP_TABLE = """
+/release/bin/metacodes:
+Contents of (__TEXT,__text) section
+1000f17aa:\tmovw\t%r13w, 0x10(%rax)
+1000f17af:\tjmp\t0x1000f0c7e
+1000f17b4:\t.long 4294953688\t@ KIND_JUMP_TABLE32
+1000f18cc:\t.long 4294963554\t@ KIND_JUMP_TABLE32
+1000f18d0:\t.long 4294963554\t@ KIND_JUMP_TABLE32
+1000f18d4:\t.long 4294963289\t@ KIND_JUMP_TABLE32
+1000f19fc:\t.long 4294953682\t@ KIND_JUMP_TABLE32
+1000f1a00:\tpushq\t%rbp
+1000f1a01:\tmovq\t%rsp, %rbp
+1000f1a04:\tleaq\t0x10(%rip), %rax ## literal pool for: "%zmm0 %k1"
+Contents of (__TEXT,__stubs) section
+1004f369a:\tjmpq\t*0xda960(%rip) ## literal pool symbol address: _write
+"""
+LINEAR_X86_JUMP_TABLE = """
+  1000f17af:     \tjmp\t0x1000f0c7e <__text+0xf1007>
+  1000f17b4:     \tfmul\t%st(2), %st
+  1000f18ce:     \t<unknown>
+  1000f18d0:     \tvmulsd\t{rz-sae}, %xmm0, %xmm0, %xmm6 {%k7} {z}
+  1000f18d6:     \t<unknown>
+  1000f1a00:     \tpushq\t%rbp
+"""
+MACHO_X86_AVX512_AFTER_TABLE = """
+1000f19fc:\t.long 4294953682\t@ KIND_JUMP_TABLE32
+1000f1a00:\tvmovups\t%zmm0, 0x40(%rax)
+"""
+MACHO_AARCH64 = """
+100001000:\tadrp\tx0, 1234 ; 0x1004d2000
+100001004:\tadd\tx0, x0, #0x10 ; literal pool for: "z0.d p1/z"
 """
 
 
@@ -169,6 +222,92 @@ class InstructionTest(unittest.TestCase):
         self.assertEqual(len(report.findings), 2)
         self.assertTrue(report.findings[0].startswith("2 AVX-512 instruction(s) beyond the x86_64 baseline, e.g. "))
         self.assertIn("vmovups %zmm0,0x40(%rax)", report.findings[0])
+
+
+class DataInCodeTest(unittest.TestCase):
+    """A Mach-O's LC_DATA_IN_CODE ranges are data, read as data: nothing else
+    is skipped, and a disassembly that decodes them is refused."""
+
+    SECTIONS = (("__text", CODE_FLAGS), ("__stubs", CODE_FLAGS | 0x8), ("__const", 0), ("__cstring", 0x2))
+
+    def executable(self) -> bytes:
+        return _macho((13, 0, 0), sections=self.SECTIONS, dice=((JUMP_TABLE[0] - TEXT_VMADDR, JUMP_TABLE[1], JUMP_TABLE[2]),))
+
+    def check(self, disassembly: str, data: bytes = b"") -> cbb.Report:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metacodes"
+            path.write_bytes(data or self.executable())
+            with mock.patch.object(cbb, "disassemble", return_value=disassembly.splitlines()) as disassemble:
+                report = cbb.check(path, cbb.parse_target("x86_64-macos.13.0"), "objdump")
+            self.assertEqual(disassemble.call_args.kwargs["macho_sections"], [("__TEXT", "__text"), ("__TEXT", "__stubs")])
+            return report
+
+    def test_the_code_sections_and_data_in_code_ranges_are_read_from_the_load_commands(self) -> None:
+        piece, = cbb.macho_slices(self.executable())
+        self.assertEqual(piece.minimum, (13, 0, 0))
+        self.assertEqual(piece.code_sections, (("__TEXT", "__text"), ("__TEXT", "__stubs")))
+        self.assertEqual(piece.data_in_code, (JUMP_TABLE,))
+
+    def test_a_data_in_code_entry_outside_every_segment_is_an_error(self) -> None:
+        with self.assertRaisesRegex(cbb.CheckError, "lies in no segment"):
+            cbb.macho_slices(_macho((13, 0, 0), sections=self.SECTIONS, dice=((0x2000000, 4, 4),)))
+
+    def test_the_jump_table_that_failed_0_10_0_is_data_and_the_unit_passes(self) -> None:
+        report = self.check(MACHO_X86_JUMP_TABLE)
+        self.assertEqual(report.findings, [])
+        self.assertEqual(report.notes, ["minimum macOS 13.0", "1 data-in-code range(s), 588 bytes, read as data"])
+
+    def test_a_disassembly_that_decodes_a_data_in_code_range_is_an_error(self) -> None:
+        with self.assertRaisesRegex(cbb.CheckError, r"decoded 0x1000f17b4, inside the data-in-code range 0x1000f17b4\+588"):
+            self.check(LINEAR_X86_JUMP_TABLE)
+
+    def test_a_disassembly_that_leaves_a_data_in_code_range_out_is_an_error(self) -> None:
+        with self.assertRaisesRegex(cbb.CheckError, r"did not print the data-in-code range 0x1000f17b4\+588"):
+            self.check("1000f17af:\tjmp\t0x1000f0c7e\n1000f1a00:\tpushq\t%rbp\n")
+
+    def test_an_instruction_beyond_the_baseline_after_a_jump_table_still_fails(self) -> None:
+        report = self.check("1000f17b4:\t.long 4294953688\t@ KIND_JUMP_TABLE32\n" + MACHO_X86_AVX512_AFTER_TABLE)
+        self.assertEqual(len(report.findings), 1)
+        self.assertTrue(report.findings[0].startswith("1 AVX-512 instruction(s) beyond the x86_64 baseline"))
+
+    def test_mach_o_mode_comments_are_not_read_as_operands(self) -> None:
+        self.assertEqual(cbb.instruction_findings(MACHO_X86_JUMP_TABLE.splitlines(), "x86_64"), {})
+        self.assertEqual(cbb.instruction_findings(MACHO_AARCH64.splitlines(), "aarch64"), {})
+
+
+class DisassembleTest(unittest.TestCase):
+    def run_objdump(self, stdout: str, llvm: bool = True, sections=(("__TEXT", "__text"), ("__TEXT", "__stubs"))) -> tuple:
+        completed = mock.Mock(returncode=0, stdout=stdout, stderr="")
+        with mock.patch.object(cbb.subprocess, "run", return_value=completed) as run, \
+                mock.patch.object(cbb, "is_llvm", return_value=llvm):
+            lines = cbb.disassemble("objdump", Path("bin/metacodes"), "x86_64", macho_sections=list(sections))
+        return run.call_args.args[0], lines
+
+    def test_a_mach_o_is_disassembled_in_mach_o_mode_over_its_code_sections(self) -> None:
+        argv, lines = self.run_objdump(MACHO_X86_JUMP_TABLE)
+        self.assertEqual(argv, ["objdump", "--macho", "--arch=all", "--no-show-raw-insn",
+                                "--section=__TEXT,__text", "--section=__TEXT,__stubs", "bin/metacodes"])
+        self.assertNotIn("-d", argv)
+        self.assertEqual(lines, MACHO_X86_JUMP_TABLE.splitlines())
+
+    def test_a_section_the_disassembler_did_not_print_is_an_error(self) -> None:
+        with self.assertRaisesRegex(cbb.CheckError, "printed no section __TEXT,__stub_helper"):
+            self.run_objdump(MACHO_X86_JUMP_TABLE, sections=(("__TEXT", "__text"), ("__TEXT", "__stub_helper")))
+
+    def test_a_mach_o_needs_llvm_objdump(self) -> None:
+        with self.assertRaisesRegex(cbb.CheckError, "only its Mach-O mode reads"):
+            self.run_objdump(MACHO_X86_JUMP_TABLE, llvm=False)
+
+    def test_a_mach_o_without_code_sections_is_an_error(self) -> None:
+        with self.assertRaisesRegex(cbb.CheckError, "no section that holds instructions"):
+            self.run_objdump(MACHO_X86_JUMP_TABLE, sections=())
+
+    def test_elf_and_pe_keep_the_linear_disassembly(self) -> None:
+        completed = mock.Mock(returncode=0, stdout=LLVM_X86, stderr="")
+        with mock.patch.object(cbb.subprocess, "run", return_value=completed) as run, \
+                mock.patch.object(cbb, "is_llvm", return_value=False):
+            cbb.disassemble("objdump", Path("bin/metacodes"), "x86_64")
+        self.assertEqual(run.call_args.args[0], ["objdump", "-d", "--no-show-raw-insn", "bin/metacodes"])
 
 
 class MainTest(unittest.TestCase):

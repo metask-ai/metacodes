@@ -13,7 +13,10 @@
 //! - Dialect 在 Provider vtable 之下,不替代 Provider。Provider 管协议族(Anthropic SSE /
 //!   OpenAI chat-completions / Gemini generateContent),Dialect 管同协议族内的 wire 变体
 //!   (thinking 控制 / tool 格式 / tool_choice / response_format / prompt_cache_key...)。
-//! - 新增厂商 = 加一个 Dialect struct 文件 + 注册一行,既有代码零改动。
+//! - 新增厂商 = 加一个接入文件 `dialects/<vendor>.zig`(文件头就是这家厂商的接入文档)
+//!   + `provider/vendor.zig` 加一个值 + `dialects/registry.zig` 登记一行,既有代码零改动。
+//! - 选哪个方言由路由声明(`ModelOffer.dialect`,像 OpenRouter 的 endpoint 声明上游);
+//!   没声明的路由按模型名推断。
 //! - 新增特性 = Dialect 接口加方法(给 default 实现,既有 dialect 不强制改)。
 //! - 类比:Django ORM 的 SQL dialect。
 //!
@@ -26,14 +29,15 @@ const std = @import("std");
 const model_name = @import("model_name.zig");
 const types = @import("../types.zig");
 const model_adapter = @import("model_adapter.zig");
-const openai_dialects = @import("dialects/openai.zig");
-const claude_dialects = @import("dialects/claude.zig");
-const gemini_dialects = @import("dialects/gemini.zig");
+const vendor_dialects = @import("dialects/registry.zig");
 const util_json = @import("../util/json.zig");
 const sync = @import("platform").sync;
 
 pub const ProviderKind = model_adapter.ProviderKind;
+pub const Vendor = @import("../provider/vendor.zig").Vendor;
+pub const DialectDeclaration = @import("../provider/vendor.zig").Declaration;
 pub const ModelProfile = model_adapter.ModelProfile;
+pub const ContentChunks = model_adapter.ContentChunks;
 pub const ImageInputSource = @import("image_capability.zig").Source;
 pub const ReasoningEffort = types.ReasoningEffort;
 
@@ -505,10 +509,12 @@ pub fn appendImageOmittedPlaceholder(media_type: []const u8, out: *std.ArrayList
 /// the pre-plugin lookup table for ordinary CLI/App construction.
 pub const Resolver = struct {
     ctx: *const anyopaque = @ptrFromInt(@as(usize, 0x1)),
-    resolveFn: *const fn (ctx: *const anyopaque, kind: ProviderKind, model: []const u8) Dialect = resolveBuiltin,
+    resolveFn: *const fn (ctx: *const anyopaque, kind: ProviderKind, declared: ?Vendor, model: []const u8) Dialect = resolveBuiltin,
 
-    pub fn resolve(self: Resolver, kind: ProviderKind, model: []const u8) Dialect {
-        return self.resolveFn(self.ctx, kind, model);
+    /// `declared` is the dialect the route declares (`ModelOffer.dialect`); null
+    /// infers it from the model name.
+    pub fn resolve(self: Resolver, kind: ProviderKind, declared: ?Vendor, model: []const u8) Dialect {
+        return self.resolveFn(self.ctx, kind, declared, model);
     }
 
     pub fn builtin() Resolver {
@@ -516,8 +522,8 @@ pub const Resolver = struct {
     }
 };
 
-fn resolveBuiltin(_: *const anyopaque, kind: ProviderKind, model: []const u8) Dialect {
-    return dialectFor(kind, model);
+fn resolveBuiltin(_: *const anyopaque, kind: ProviderKind, declared: ?Vendor, model: []const u8) Dialect {
+    return dialectForVendor(kind, declared, model);
 }
 
 pub const ToolChoiceKind = enum { none, auto, required, function };
@@ -649,23 +655,22 @@ fn defaultProfile(ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelP
     return model_adapter.profileFor(kind, model);
 }
 
-// ── dialectFor:按 (provider_kind, model) 返回 Dialect ────────────────────────
+// ── dialectFor:按 (provider_kind, 声明的厂商, model) 返回 Dialect ─────────────
 //
-// 当前(step 1)只返 defaultDialect——无 ctx 的空实现,所有方法走 default。
-// step 2-4 会加 OpenAI-compatible dialect(glm/kimi/deepseek/qwen/mistral),
-// step 6-7 加 ClaudeDialect / GeminiDialect。注册表见下方 Registry。
+// 每家厂商一个接入文件(`dialects/<vendor>.zig`),登记表 `dialects/registry.zig`。
+// defaultDialect 是无 ctx 的空实现,只给 `other` 协议族用。
 
 const defaultDialect = Dialect{ .ctx = @ptrFromInt(@as(usize, 0x1)) };
 
-/// 按 (provider_kind, model) 返回 Dialect。永不返回 null——未注册模型走 defaultDialect。
-/// 借用:返回的 Dialect 值是静态的(defaultDialect)或 ctx 借用底层实例(具体 dialect)。
+/// 按 (provider_kind, model) 返回 Dialect,厂商按模型名推断。永不返回 null——认不出的
+/// 模型走这条 wire 的基础方言,`other` 走 defaultDialect。
 pub fn dialectFor(kind: ProviderKind, model: []const u8) Dialect {
-    return switch (kind) {
-        .openai => openai_dialects.openaiDialectFor(model),
-        .anthropic => claude_dialects.claudeDialectFor(model),
-        .gemini => gemini_dialects.geminiDialectFor(model),
-        .other => defaultDialect,
-    };
+    return dialectForVendor(kind, null, model);
+}
+
+/// 路由声明了方言(`declared`)时用它,否则按模型名推断;规则见 `dialects/registry.zig`。
+pub fn dialectForVendor(kind: ProviderKind, declared: ?Vendor, model: []const u8) Dialect {
+    return vendor_dialects.dialectFor(kind, declared, model) orelse defaultDialect;
 }
 
 // ── Standalone registry utility ───────────────────────────────────────────

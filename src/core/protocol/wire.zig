@@ -10,7 +10,8 @@
 //!   {"v":1,"type":"<CoreEvent tag>","run_id":N,"trace_id":"...","data":...}   (writeRunEvent)
 //!   {"v":1,"type":"<HostEvent tag>","data":{...}}                              (writeHostEvent)
 //!   {"v":1,"type":"ui_request","id":N,"kind":"<UiRequest tag>","request":{...}}
-//!   {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered"|"cancelled"|"malformed"}
+//!   {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered"|"cancelled"|"malformed","by":"..."}
+//!       (`by` only when the answer named who gave it; writeRequestClosedBy)
 //!   {"v":1,"type":"ui_request_unavailable","kind":"...","custom_kind":"...","reason":"..."}
 //!   {"v":1,"type":"capabilities_accepted","ui_requests":[...],"custom":[...],"events":[...]|null,"ignored":{...}}
 //!   {"v":1,"type":"capabilities_refused","reason":"<RefusalError name>"}
@@ -27,9 +28,19 @@
 //! request, as before.
 //!
 //! Host events are what a session service adds around the kernel's events
-//! (core/session_host.zig): the submitted text, the end of a Run, the result
-//! of a configuration command, a poisoned Session. Their tags never collide
-//! with CoreEvent tags (checked at compile time).
+//! (core/session_host.zig, and the bundled `--web`/`serve` host in src/web):
+//! the submitted text, the end of a Run, the result of a configuration
+//! command, a message refused before it ran, a poisoned Session, a Run that
+//! resumes a suspended one. Their tags never collide with CoreEvent tags
+//! (checked at compile time).
+//!
+//! A Host numbers the Runs of a Session 1, 2, … as they start. A Run's lines
+//! run from its `user_message` (`run_resumed` when it resumes a Run that
+//! ended `suspended`; none when a `/command` macro or `/retry` started it) to
+//! its `run_done`, both carrying its `run_id`; every CoreEvent
+//! journaled in between is written by `writeRunEvent` with the same `run_id`
+//! and the submission's `trace_id`, when it had one. UI request and
+//! capability lines carry no `run_id`; no other host line falls inside a Run.
 //!
 //! `data` is the CoreEvent payload with the field names of
 //! core/protocol/ui_event.zig, except `prompt_manifest`, whose digests are
@@ -53,9 +64,16 @@
 //!   ask_question   {"answers":["...", ...]}  one per question; several labels joined by ", "
 //!   custom         {"result":<any JSON>}
 //!
-//! A malformed answer is never a grant: `parseResponse` answers it the way a
-//! cancelled request is answered (`cancelResponse`) and reports it as
-//! `.malformed`, so the request closes as `"malformed"`, not `"answered"`.
+//! A malformed answer is never a grant: `parseResponse` fails it the way a
+//! request nobody answered fails (`cancelResponse`), so the request closes as
+//! `"malformed"`, not `"answered"`. For a permission prompt the failure names
+//! the cause (`ui_request.Unanswered`), so the model is not told the user
+//! declined (doc/WIRE_PROTOCOL.md §1.4).
+//!
+//! Any answer may also name who gave it, `"by":"<approver>"` (#446): a string
+//! of 1 to `MAX_APPROVER_BYTES` bytes, read by `answerApprover` and written on
+//! the request's `ui_request_closed` line. `by` never changes how the answer
+//! itself is read.
 //!
 //! tests/fixtures/wire/v1 pins one line per event and request kind, and the
 //! capability frames with their replies. Which changes keep v1 and which bump
@@ -70,6 +88,7 @@ const util_json = @import("../../util/json.zig");
 const PermissionChoice = @import("permission_choice.zig").PermissionChoice;
 const prompt_sections = @import("../prompt_sections.zig");
 const goal = @import("../goal.zig");
+const typed_submission = @import("../typed_submission.zig");
 
 const CoreEvent = ui_event.CoreEvent;
 const UiRequest = ui_request.UiRequest;
@@ -82,25 +101,29 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const RequestClosed = enum {
     /// The client's well-formed answer was used.
     answered,
-    /// Interrupt, close or timeout won; the safe answer was used.
+    /// Interrupt, close or timeout won; nothing was granted.
     cancelled,
-    /// The client's answer could not be read; the safe answer was used.
+    /// The client's answer could not be read; nothing was granted.
     malformed,
 };
 
-/// How `parseResponse` read a client's answer.
-pub const Reading = enum {
-    /// Well-formed: `out` holds the client's answer.
-    answer,
-    /// Malformed or of another version: `out` holds `cancelResponse`'s safe
-    /// answer.
-    malformed,
+/// Why a request ended without the client's well-formed answer: what
+/// `cancelResponse` reports and what the Host journals, from one value.
+pub const NoAnswer = enum {
+    /// Nobody answered before the Host's deadline.
+    timed_out,
+    /// An interrupt or a close won.
+    cancelled,
+    /// The client's answer could not be read.
+    unreadable,
 
-    /// The `ui_request_closed` outcome to journal for this reading.
-    pub fn closed(self: Reading) RequestClosed {
+    /// The `ui_request_closed` outcome to journal. A timeout closes as
+    /// `cancelled`: v1's outcome set has no timeout, and adding one is a
+    /// breaking change (doc/WIRE_PROTOCOL.md §4).
+    pub fn closed(self: NoAnswer) RequestClosed {
         return switch (self) {
-            .answer => .answered,
-            .malformed => .malformed,
+            .timed_out, .cancelled => .cancelled,
+            .unreadable => .malformed,
         };
     }
 };
@@ -114,16 +137,56 @@ pub const RunContext = struct {
 
 /// Events a session service emits around the kernel's. Borrowed slices.
 pub const HostEvent = union(enum) {
-    /// A queued submission became the input of Run `run_id`.
-    user_message: struct { run_id: u64, trace_id: ?[]const u8 = null, text: []const u8 },
+    /// A queued submission became the input of Run `run_id` (`UserMessage`).
+    user_message: UserMessage,
     /// Run `run_id` ended: `stop_reason` when it returned, `error_name` when
     /// it failed. `model_error` says why, when the stop was a model failure.
     run_done: struct { run_id: u64, trace_id: ?[]const u8 = null, stop_reason: ?[]const u8 = null, error_name: ?[]const u8 = null, model_error: ?@import("../../api/model_error.zig").Detail.View = null },
-    /// A configuration command was applied (`ok`) or refused.
-    command_result: struct { command: []const u8, ok: bool, error_name: ?[]const u8 = null },
+    /// A configuration command was applied (`ok`) or refused. `command` names
+    /// it: SessionHost's `Command` tag, or the verb of a `--web`/`serve`
+    /// `/command` line (`mode`, `edit`, …; `shell` for `!cmd`, `prompt` for
+    /// plain text). `error_name` is set exactly when `ok` is false. `message`
+    /// is what the command reports for a person (`--web`/`serve`: its outcome
+    /// or a shell command's output); SessionHost has none.
+    command_result: struct { command: []const u8, ok: bool, error_name: ?[]const u8 = null, message: ?[]const u8 = null },
+    /// A message (`--web`/`serve` `POST /message`, UDS `message`; a
+    /// SessionHost `Submission`) started no Run: its `model` or
+    /// `permission_mode` was refused, neither was applied
+    /// and its `text` stayed out of the conversation. It takes the place of
+    /// that message's `user_message`. `model` and `permission_mode` repeat
+    /// what the message asked for (null when not given; the mode in the
+    /// spelling `/state` reports); `message` says why, in words.
+    message_rejected: struct { message: []const u8, text: []const u8, model: ?[]const u8 = null, permission_mode: ?[]const u8 = null },
     /// The Session can no longer run; the Host must close it. Work still
     /// queued was dropped and is counted.
     session_poisoned: struct { error_name: []const u8, dropped: usize },
+    /// Run `run_id` resumes a Run that ended `suspended` on UI request
+    /// `request_id`, whose `ui_request_closed` precedes this line (#446). It
+    /// takes the place of `user_message` as the Run's first line, and
+    /// `trace_id` is the suspended Run's.
+    run_resumed: struct { run_id: u64, trace_id: ?[]const u8 = null, request_id: u64 },
+};
+
+/// `user_message`'s payload. `text` is the submitted text. `replaces` is the
+/// 1-based position of the user message it was submitted to replace
+/// (edit-and-rerun): that message and everything after it leave the
+/// conversation before the Run, unless `run_done` names the refusal
+/// (`PositionOutOfRange`, `NotUserMessage`, `PositionCompacted`). Null when
+/// the text is appended after the whole conversation.
+///
+/// A typed submission (#447) adds `source`, `kind`, `idempotency_key` and
+/// `attributes` (one JSON object), appended under doc/WIRE_PROTOCOL.md §4's
+/// additive rule 2. Each is written only when the submission had it, so the
+/// line of a submission without them keeps its bytes.
+pub const UserMessage = struct {
+    run_id: u64,
+    trace_id: ?[]const u8 = null,
+    text: []const u8,
+    replaces: ?usize = null,
+    source: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    idempotency_key: ?[]const u8 = null,
+    attributes: []const typed_submission.Attribute = &.{},
 };
 
 /// The `type`s of the lines this module writes or reads besides the event
@@ -138,6 +201,9 @@ const LINE_TYPES = [_][]const u8{
 };
 
 comptime {
+    // Every pair of names is compared byte by byte; the default quota of
+    // 1000 backward branches ran out at the sixth HostEvent tag.
+    @setEvalBranchQuota(100_000);
     for (std.meta.fields(HostEvent)) |host| {
         for (std.meta.fields(CoreEvent)) |core| {
             if (std.mem.eql(u8, host.name, core.name)) @compileError("HostEvent tag collides with CoreEvent: " ++ host.name);
@@ -151,6 +217,23 @@ comptime {
             if (std.mem.eql(u8, core.name, line_type)) @compileError("CoreEvent tag collides with a wire line type: " ++ core.name);
         }
     }
+}
+
+/// Whether `name` is the `type` of a v1 line: a CoreEvent or HostEvent tag,
+/// or a request or capability line. A frontend ignores a `type` it does not
+/// know (doc/WIRE_PROTOCOL.md §4); a check of what a Host journals uses this
+/// to refuse any line outside the grammar.
+pub fn isLineType(name: []const u8) bool {
+    inline for (std.meta.fields(CoreEvent)) |field| {
+        if (std.mem.eql(u8, field.name, name)) return true;
+    }
+    inline for (std.meta.fields(HostEvent)) |field| {
+        if (std.mem.eql(u8, field.name, name)) return true;
+    }
+    for (LINE_TYPES) |line_type| {
+        if (std.mem.eql(u8, line_type, name)) return true;
+    }
+    return false;
 }
 
 /// One CoreEvent as a wire line, caller-owned. The event's borrowed slices
@@ -190,7 +273,37 @@ fn writeHostEventTo(json: *std.json.Stringify, event: HostEvent) std.json.String
     try json.write(@tagName(event));
     try json.objectField("data");
     switch (event) {
+        .user_message => |message| try writeUserMessage(json, message),
         inline else => |payload| try json.write(payload),
+    }
+    try json.endObject();
+}
+
+fn writeUserMessage(json: *std.json.Stringify, message: UserMessage) std.json.Stringify.Error!void {
+    try json.beginObject();
+    try json.objectField("run_id");
+    try json.write(message.run_id);
+    try json.objectField("trace_id");
+    try json.write(message.trace_id);
+    try json.objectField("text");
+    try json.write(message.text);
+    try json.objectField("replaces");
+    try json.write(message.replaces);
+    if (message.source) |source| {
+        try json.objectField("source");
+        try json.write(source);
+    }
+    if (message.kind) |kind| {
+        try json.objectField("kind");
+        try json.write(kind);
+    }
+    if (message.idempotency_key) |key| {
+        try json.objectField("idempotency_key");
+        try json.write(key);
+    }
+    if (message.attributes.len != 0) {
+        try json.objectField("attributes");
+        try typed_submission.writeAttributes(json, message.attributes);
     }
     try json.endObject();
 }
@@ -341,6 +454,146 @@ fn writeRequestTo(json: *std.json.Stringify, id: u64, request: *const UiRequest)
 /// The line that closes UI request `id`, caller-owned.
 pub fn writeRequestClosed(allocator: std.mem.Allocator, id: u64, outcome: RequestClosed) error{OutOfMemory}![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"v\":{d},\"type\":\"ui_request_closed\",\"id\":{d},\"outcome\":\"{s}\"}}", .{ SCHEMA_VERSION, id, @tagName(outcome) });
+}
+
+/// `writeRequestClosed` with `by`, who gave the answer the request closed on
+/// (`answerApprover`), appended under doc/WIRE_PROTOCOL.md §4's additive rule
+/// 2 (#446). Null writes exactly `writeRequestClosed`'s line, so a request
+/// whose answer named nobody keeps its bytes. Caller-owned.
+pub fn writeRequestClosedBy(allocator: std.mem.Allocator, id: u64, outcome: RequestClosed, by: ?[]const u8) error{OutOfMemory}![]u8 {
+    const approver = by orelse return writeRequestClosed(allocator, id, outcome);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+    writeRequestClosedTo(&json, id, outcome, approver) catch return error.OutOfMemory;
+    return finish(allocator, &out);
+}
+
+fn writeRequestClosedTo(json: *std.json.Stringify, id: u64, outcome: RequestClosed, approver: []const u8) std.json.Stringify.Error!void {
+    try json.beginObject();
+    try json.objectField("v");
+    try json.write(SCHEMA_VERSION);
+    try json.objectField("type");
+    try json.write("ui_request_closed");
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("outcome");
+    try json.write(@tagName(outcome));
+    try json.objectField("by");
+    try json.write(approver);
+    try json.endObject();
+}
+
+/// The longest approver (`by`) an answer may name, in bytes.
+pub const MAX_APPROVER_BYTES: usize = 256;
+
+pub const ApproverError = error{
+    /// `by` is present but is not a JSON string of 1 to `MAX_APPROVER_BYTES`
+    /// bytes. A Host refuses such an answer before it is taken, so a request
+    /// is never closed on an answer whose approver could not be recorded.
+    InvalidApprover,
+    OutOfMemory,
+};
+
+/// Who gave `json`, an answer to a UI request, as it names them in its
+/// optional `by` field (#446), copied into `allocator`. Self-reported and
+/// unauthenticated: a Host that needs a verified approver takes it from its
+/// own authentication, not from an answer body. Null when it names
+/// nobody: no `by`, `"by":null`, or an answer that is not a JSON object
+/// (`parseResponse` reads that one as malformed anyway). The answer itself is
+/// read by `parseResponse` alone; `by` never changes that reading.
+pub fn answerApprover(allocator: std.mem.Allocator, json: []const u8) ApproverError!?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed != .object) return null;
+    const value = parsed.object.get("by") orelse return null;
+    return switch (value) {
+        .null => null,
+        .string => |name| if (name.len == 0 or name.len > MAX_APPROVER_BYTES)
+            error.InvalidApprover
+        else
+            try allocator.dupe(u8, name),
+        else => error.InvalidApprover,
+    };
+}
+
+/// A `ui_request` line read back: `writeRequest`'s inverse.
+pub const Announcement = struct {
+    id: u64,
+    /// Slices into the arena given to `parseRequest`.
+    request: UiRequest,
+};
+
+/// Reads a `ui_request` line `writeRequest` wrote, for a Host that keeps an
+/// announcement and needs the request again (a suspended request after a
+/// restart, #446). Everything is allocated in `arena`, which the caller frees
+/// as a whole. A line that is not a v1 `ui_request` is `error.NotARequest`.
+pub fn parseRequest(arena: std.mem.Allocator, line: []const u8) error{ NotARequest, OutOfMemory }!Announcement {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.NotARequest,
+    };
+    if (parsed != .object) return error.NotARequest;
+    const object = parsed.object;
+    const version = object.get("v") orelse return error.NotARequest;
+    if (version != .integer or version.integer != SCHEMA_VERSION) return error.NotARequest;
+    const line_type = stringOf(object, "type") orelse return error.NotARequest;
+    if (!std.mem.eql(u8, line_type, "ui_request")) return error.NotARequest;
+    const id = object.get("id") orelse return error.NotARequest;
+    if (id != .integer or id.integer <= 0) return error.NotARequest;
+    const kind = std.meta.stringToEnum(std.meta.Tag(UiRequest), stringOf(object, "kind") orelse return error.NotARequest) orelse
+        return error.NotARequest;
+    const body_value = object.get("request") orelse return error.NotARequest;
+    if (body_value != .object) return error.NotARequest;
+    const body = body_value.object;
+    const request: UiRequest = switch (kind) {
+        .permission => .{ .permission = .{
+            .tool = stringOf(body, "tool") orelse return error.NotARequest,
+            .args = stringOf(body, "args") orelse return error.NotARequest,
+        } },
+        .custom => .{ .custom = .{
+            .kind = stringOf(body, "kind") orelse return error.NotARequest,
+            .payload_json = stringOf(body, "payload_json") orelse return error.NotARequest,
+        } },
+        .ask_question => blk: {
+            const list = body.get("questions") orelse return error.NotARequest;
+            if (list != .array) return error.NotARequest;
+            const questions = try arena.alloc(ui_request.AskQuestion, list.array.items.len);
+            for (list.array.items, questions) |item, *question| {
+                if (item != .object) return error.NotARequest;
+                const multi = item.object.get("multi_select") orelse return error.NotARequest;
+                if (multi != .bool) return error.NotARequest;
+                const option_list = item.object.get("options") orelse return error.NotARequest;
+                if (option_list != .array) return error.NotARequest;
+                const options = try arena.alloc(ui_request.AskOption, option_list.array.items.len);
+                for (option_list.array.items, options) |option_value, *option| {
+                    if (option_value != .object) return error.NotARequest;
+                    option.* = .{
+                        .label = stringOf(option_value.object, "label") orelse return error.NotARequest,
+                        .description = stringOf(option_value.object, "description") orelse return error.NotARequest,
+                        .preview = stringOf(option_value.object, "preview") orelse return error.NotARequest,
+                    };
+                }
+                question.* = .{
+                    .question = stringOf(item.object, "question") orelse return error.NotARequest,
+                    .header = stringOf(item.object, "header") orelse return error.NotARequest,
+                    .multi = multi.bool,
+                    .options = options,
+                };
+            }
+            break :blk .{ .ask_question = questions };
+        },
+    };
+    return .{ .id = @intCast(id.integer), .request = request };
+}
+
+fn stringOf(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return if (value == .string) value.string else null;
 }
 
 /// The line reporting that `request` was not announced because the
@@ -557,51 +810,69 @@ fn finish(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating) error{Ou
     return util_json.repairJsonUtf8(allocator, raw);
 }
 
-/// The answer to a request that was cancelled or answered unreadably: a
-/// permission prompt is denied once, never granted;
-/// a question or a custom UI reports `error.InputAborted`, as Esc does in the
-/// terminal.
-pub fn cancelResponse(request: *const UiRequest, out: *UiResponse) error{InputAborted}!RequestOutcome {
-    switch (request.*) {
-        .permission => {
-            out.* = .{ .permission = .deny_once };
-            return .answered;
+pub const CancelError = error{InputAborted} || ui_request.Unanswered;
+
+/// How a requester fails a request that ended with nobody's answer. Nothing
+/// is ever granted. A permission prompt fails with the `ui_request.Unanswered`
+/// error naming `why`, so the gate denies it and tells the model the user did
+/// not decline it; a question or a custom UI reports `error.InputAborted`, as
+/// Esc does in the terminal.
+pub fn cancelResponse(request: *const UiRequest, why: NoAnswer) CancelError {
+    return switch (request.*) {
+        .permission => switch (why) {
+            .timed_out => error.UiRequestTimedOut,
+            .cancelled => error.UiRequestCancelled,
+            .unreadable => error.UiAnswerUnreadable,
         },
-        .ask_question, .custom => return error.InputAborted,
-    }
+        .ask_question, .custom => error.InputAborted,
+    };
+}
+
+pub const ParseError = error{ InputAborted, UiAnswerUnreadable, OutOfMemory };
+
+/// The `ui_request_closed` outcome for a `parseResponse` failure: an answer
+/// that could not be read is `malformed`; running out of memory reading it
+/// is not the client's fault and closes as `cancelled`.
+pub fn closedOnParseError(err: ParseError) RequestClosed {
+    return switch (err) {
+        error.InputAborted, error.UiAnswerUnreadable => NoAnswer.unreadable.closed(),
+        error.OutOfMemory => .cancelled,
+    };
 }
 
 /// Parses the Host's answer `json` to `request` into `out`. Answer slices
-/// (`answers`, `custom`) are owned by `allocator`. Anything malformed takes
-/// `cancelResponse`'s safe answer and reads as `.malformed`; for a question or
-/// a custom UI that safe answer is `error.InputAborted`.
+/// (`answers`, `custom`) are owned by `allocator`. Anything malformed fails as
+/// `cancelResponse(request, .unreadable)` does and leaves `out` unwritten:
+/// `error.UiAnswerUnreadable` for a permission prompt, `error.InputAborted`
+/// for a question or a custom UI. The Host closes the request as
+/// `closedOnParseError` says, or as `answered` when this returns.
 pub fn parseResponse(
     request: *const UiRequest,
     json: []const u8,
     allocator: std.mem.Allocator,
     out: *UiResponse,
-) error{ InputAborted, OutOfMemory }!Reading {
+) ParseError!void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch
-        return malformed(request, out);
-    if (parsed != .object) return malformed(request, out);
+        return malformed(request);
+    if (parsed != .object) return malformed(request);
     const object = parsed.object;
     if (object.get("v")) |version| {
-        if (version != .integer or version.integer != SCHEMA_VERSION) return malformed(request, out);
+        if (version != .integer or version.integer != SCHEMA_VERSION) return malformed(request);
     }
 
     switch (request.*) {
         .permission => {
-            const choice = choiceField(object, PermissionChoice) orelse return malformed(request, out);
+            const choice = choiceField(object, PermissionChoice) orelse return malformed(request);
             out.* = .{ .permission = choice };
-            return .answer;
+            return;
         },
         .ask_question => |questions| {
-            const value = object.get("answers") orelse return malformed(request, out);
-            if (value != .array or value.array.items.len != questions.len) return malformed(request, out);
+            const value = object.get("answers") orelse return malformed(request);
+            if (value != .array or value.array.items.len != questions.len) return malformed(request);
             for (value.array.items) |item| {
-                if (item != .string) return malformed(request, out);
+                if (item != .string) return malformed(request);
             }
             const answers = try allocator.alloc([]const u8, questions.len);
             var filled: usize = 0;
@@ -614,21 +885,23 @@ pub fn parseResponse(
                 filled += 1;
             }
             out.* = .{ .answers = answers };
-            return .answer;
+            return;
         },
         .custom => {
-            const result = object.get("result") orelse return malformed(request, out);
+            const result = object.get("result") orelse return malformed(request);
             const raw = try std.json.Stringify.valueAlloc(allocator, result, .{});
             defer allocator.free(raw);
             out.* = .{ .custom = try util_json.repairJsonUtf8(allocator, raw) };
-            return .answer;
+            return;
         },
     }
 }
 
-fn malformed(request: *const UiRequest, out: *UiResponse) error{InputAborted}!Reading {
-    _ = try cancelResponse(request, out);
-    return .malformed;
+fn malformed(request: *const UiRequest) error{ InputAborted, UiAnswerUnreadable } {
+    return switch (request.*) {
+        .permission => error.UiAnswerUnreadable,
+        .ask_question, .custom => error.InputAborted,
+    };
 }
 
 fn choiceField(object: std.json.ObjectMap, comptime E: type) ?E {
@@ -652,6 +925,25 @@ test "writeEvent: version, tag and payload; a void payload is null" {
     try testing.expectEqualStrings("{\"v\":1,\"type\":\"stream_done\",\"data\":null}", done);
 }
 
+test "isLineType: every tag and line type of the grammar, and no transport frame" {
+    for ([_][]const u8{ "text_chunk", "session_lifecycle", "user_message", "message_rejected", "session_poisoned", "run_resumed", "ui_request", "ui_request_closed", "ui_request_unavailable", "capabilities", "capabilities_accepted", "capabilities_refused" }) |name| {
+        try testing.expect(isLineType(name));
+    }
+    // UDS `attach` frames sit outside the journal (doc/WIRE_PROTOCOL.md §1.3).
+    for ([_][]const u8{ "keepalive", "session_closed", "resync", "Text_chunk", "" }) |name| {
+        try testing.expect(!isLineType(name));
+    }
+}
+
+test "writeHostEvent: message_rejected, and command_result with what it reports" {
+    const rejected = try writeHostEvent(testing.allocator, .{ .message_rejected = .{ .message = "no", .text = "hi", .permission_mode = "auto" } });
+    defer testing.allocator.free(rejected);
+    try testing.expectEqualStrings("{\"v\":1,\"type\":\"message_rejected\",\"data\":{\"message\":\"no\",\"text\":\"hi\",\"model\":null,\"permission_mode\":\"auto\"}}", rejected);
+    const result = try writeHostEvent(testing.allocator, .{ .command_result = .{ .command = "shell", .ok = true, .message = "$ ls" } });
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"shell\",\"ok\":true,\"error_name\":null,\"message\":\"$ ls\"}}", result);
+}
+
 test "parseResponse: a malformed or wrong-version answer never grants a permission" {
     const request = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     const bad = [_][]const u8{
@@ -664,12 +956,29 @@ test "parseResponse: a malformed or wrong-version answer never grants a permissi
     };
     for (bad) |json| {
         var out: UiResponse = undefined;
-        try testing.expectEqual(Reading.malformed, try parseResponse(&request, json, testing.allocator, &out));
-        try testing.expectEqual(PermissionChoice.deny_once, out.permission);
+        // Unreadable, not the user's deny: the gate tells the model so.
+        try testing.expectError(error.UiAnswerUnreadable, parseResponse(&request, json, testing.allocator, &out));
+        try testing.expectEqual(RequestClosed.malformed, closedOnParseError(error.UiAnswerUnreadable));
     }
     var out: UiResponse = undefined;
-    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"v\":1,\"choice\":\"allow_always\"}", testing.allocator, &out));
+    try parseResponse(&request, "{\"v\":1,\"choice\":\"allow_always\"}", testing.allocator, &out);
     try testing.expectEqual(PermissionChoice.allow_always, out.permission);
+}
+
+test "cancelResponse: a permission prompt nobody answered names why; the journal agrees" {
+    const permission = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    try testing.expectEqual(error.UiRequestTimedOut, cancelResponse(&permission, .timed_out));
+    try testing.expectEqual(error.UiRequestCancelled, cancelResponse(&permission, .cancelled));
+    try testing.expectEqual(error.UiAnswerUnreadable, cancelResponse(&permission, .unreadable));
+    // v1's close outcomes are unchanged: a timeout still closes as cancelled.
+    try testing.expectEqual(RequestClosed.cancelled, NoAnswer.timed_out.closed());
+    try testing.expectEqual(RequestClosed.cancelled, NoAnswer.cancelled.closed());
+    try testing.expectEqual(RequestClosed.malformed, NoAnswer.unreadable.closed());
+    // A question or a custom UI aborts as Esc does, whatever the cause.
+    const custom = UiRequest{ .custom = .{ .kind = "k@1", .payload_json = "{}" } };
+    inline for (.{ NoAnswer.timed_out, NoAnswer.cancelled, NoAnswer.unreadable }) |why| {
+        try testing.expectEqual(error.InputAborted, cancelResponse(&custom, why));
+    }
 }
 
 test "parseResponse: ask_question needs one string per question" {
@@ -682,7 +991,7 @@ test "parseResponse: ask_question needs one string per question" {
     var out: UiResponse = undefined;
     try testing.expectError(error.InputAborted, parseResponse(&request, "{\"answers\":[\"Yes\"]}", testing.allocator, &out));
     try testing.expectError(error.InputAborted, parseResponse(&request, "{\"answers\":[\"Yes\",2]}", testing.allocator, &out));
-    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"answers\":[\"Yes\",\"Yes, No\"]}", testing.allocator, &out));
+    try parseResponse(&request, "{\"answers\":[\"Yes\",\"Yes, No\"]}", testing.allocator, &out);
     defer {
         for (out.answers) |answer| testing.allocator.free(answer);
         testing.allocator.free(out.answers);
@@ -693,7 +1002,7 @@ test "parseResponse: ask_question needs one string per question" {
 test "parseResponse: a custom result reaches the tool as JSON text" {
     const request = UiRequest{ .custom = .{ .kind = "video_timeline", .payload_json = "{}" } };
     var out: UiResponse = undefined;
-    try testing.expectEqual(Reading.answer, try parseResponse(&request, "{\"result\":{\"in\":3,\"out\":42}}", testing.allocator, &out));
+    try parseResponse(&request, "{\"result\":{\"in\":3,\"out\":42}}", testing.allocator, &out);
     defer testing.allocator.free(out.custom);
     try testing.expectEqualStrings("{\"in\":3,\"out\":42}", out.custom);
     try testing.expectError(error.InputAborted, parseResponse(&request, "{\"output\":1}", testing.allocator, &out));
@@ -771,4 +1080,80 @@ test "writeRequestUnavailable: custom requests name their kind, named ones do no
     const named = try writeRequestUnavailable(testing.allocator, &permission, .kind_not_declared);
     defer testing.allocator.free(named);
     try testing.expectEqualStrings("{\"v\":1,\"type\":\"ui_request_unavailable\",\"kind\":\"permission\",\"reason\":\"kind_not_declared\"}", named);
+}
+
+test "writeRequestClosedBy: the approver is appended and escaped; without one the line keeps its bytes" {
+    const plain = try writeRequestClosed(testing.allocator, 4, .answered);
+    defer testing.allocator.free(plain);
+    const unnamed = try writeRequestClosedBy(testing.allocator, 4, .answered, null);
+    defer testing.allocator.free(unnamed);
+    try testing.expectEqualStrings(plain, unnamed);
+    const named = try writeRequestClosedBy(testing.allocator, 4, .malformed, "ops \"on call\"");
+    defer testing.allocator.free(named);
+    try testing.expectEqualStrings("{\"v\":1,\"type\":\"ui_request_closed\",\"id\":4,\"outcome\":\"malformed\",\"by\":\"ops \\\"on call\\\"\"}", named);
+}
+
+test "answerApprover: a string of 1 to MAX_APPROVER_BYTES bytes; nobody when absent or null; anything else refused" {
+    const a = testing.allocator;
+    const alice = (try answerApprover(a, "{\"choice\":\"allow_once\",\"by\":\"alice@example.com\"}")).?;
+    defer a.free(alice);
+    try testing.expectEqualStrings("alice@example.com", alice);
+    for ([_][]const u8{ "{\"choice\":\"allow_once\"}", "{\"by\":null}", "not json", "[\"by\"]" }) |json| {
+        try testing.expect((try answerApprover(a, json)) == null);
+    }
+    const long = "{\"by\":\"" ++ ("x" ** (MAX_APPROVER_BYTES + 1)) ++ "\"}";
+    for ([_][]const u8{ "{\"by\":\"\"}", "{\"by\":7}", "{\"by\":[\"alice\"]}", long }) |json| {
+        try testing.expectError(error.InvalidApprover, answerApprover(a, json));
+    }
+    const longest = "{\"by\":\"" ++ ("x" ** MAX_APPROVER_BYTES) ++ "\"}";
+    const kept = (try answerApprover(a, longest)).?;
+    defer a.free(kept);
+    try testing.expectEqual(MAX_APPROVER_BYTES, kept.len);
+    // The answer is read the same with or without its approver.
+    const request = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    var out: UiResponse = undefined;
+    try parseResponse(&request, "{\"choice\":\"allow_once\",\"by\":7}", a, &out);
+    try testing.expectEqual(PermissionChoice.allow_once, out.permission);
+}
+
+test "parseRequest reads back every kind writeRequest writes, and refuses other lines" {
+    const options = [_]ui_request.AskOption{
+        .{ .label = "Ship", .description = "Release now" },
+        .{ .label = "Wait", .description = "Hold", .preview = "## Plan" },
+    };
+    const questions = [_]ui_request.AskQuestion{.{ .question = "Ship now?", .header = "Decision", .multi = true, .options = &options }};
+    const requests = [_]UiRequest{
+        .{ .permission = .{ .tool = "Write", .args = "{\"file_path\":\"/x\"}" } },
+        .{ .ask_question = &questions },
+        .{ .custom = .{ .kind = "video_timeline@1", .payload_json = "{\"clips\":[]}" } },
+    };
+    for (&requests, 1..) |*request, id| {
+        const line = try writeRequest(testing.allocator, id, request);
+        defer testing.allocator.free(line);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const announced = try parseRequest(arena.allocator(), line);
+        try testing.expectEqual(@as(u64, id), announced.id);
+        const again = try writeRequest(testing.allocator, announced.id, &announced.request);
+        defer testing.allocator.free(again);
+        try testing.expectEqualStrings(line, again);
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{
+        "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\"}",
+        "{\"v\":2,\"type\":\"ui_request\",\"id\":1,\"kind\":\"custom\",\"request\":{\"kind\":\"k\",\"payload_json\":\"{}\"}}",
+        "{\"v\":1,\"type\":\"ui_request\",\"id\":0,\"kind\":\"custom\",\"request\":{\"kind\":\"k\",\"payload_json\":\"{}\"}}",
+        "{\"v\":1,\"type\":\"ui_request\",\"id\":1,\"kind\":\"form\",\"request\":{}}",
+        "{\"v\":1,\"type\":\"ui_request\",\"id\":1,\"kind\":\"ask_question\",\"request\":{\"questions\":[{\"question\":\"q\"}]}}",
+        "not json",
+    }) |line| {
+        try testing.expectError(error.NotARequest, parseRequest(arena.allocator(), line));
+    }
+}
+
+test "writeHostEvent: run_resumed names the resumed Run, its trace and the request it waited for" {
+    const line = try writeHostEvent(testing.allocator, .{ .run_resumed = .{ .run_id = 2, .trace_id = "t-1", .request_id = 7 } });
+    defer testing.allocator.free(line);
+    try testing.expectEqualStrings("{\"v\":1,\"type\":\"run_resumed\",\"data\":{\"run_id\":2,\"trace_id\":\"t-1\",\"request_id\":7}}", line);
 }

@@ -6,7 +6,7 @@
 
 Benchmarked on WorkBuddy-Bench against CodeBuddy Code and Claude Code · a 5.5 MB native binary · a fixed kernel no plugin can bypass · graph memory · a C ABI for every host
 
-[![CI](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml/badge.svg)](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml)
+[![CI](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml?query=event%3Apull_request)
 [![Release](https://img.shields.io/github/v/release/metask-ai/metacodes)](https://github.com/metask-ai/metacodes/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig 0.16](https://img.shields.io/badge/zig-0.16-f7a41d.svg)](https://ziglang.org)
@@ -145,7 +145,7 @@ See [PLUGIN_ARCHITECTURE](doc/PLUGIN_ARCHITECTURE.md),
 | Surface | Use it from |
 |---|---|
 | `metacodes-core` Zig module | Zig hosts on the same toolchain; `zig build example` runs [example/main.zig](example/main.zig) |
-| AgentCore C ABI v1 revision 26 | C, C++, Zig and Rust bindings ship in [sdk/](sdk/README.md); JNA, .NET P/Invoke and any other FFI load the shared library |
+| AgentCore C ABI v1 revision 28 | C, C++, Zig and Rust bindings ship in [sdk/](sdk/README.md); JNA, .NET P/Invoke and any other FFI load the shared library |
 | Python and Node packages | `import metacodes` / `require('metacodes')`: Runtime, Session, streaming events, tools written in Python or JavaScript ([sdk/python](sdk/python/README.md), [sdk/node](sdk/node/README.md); experimental) |
 | Headless `-p --json` / `--stream-json` | Any language that can spawn a process and read NDJSON |
 | `serve` daemon (HTTP and UDS, multi-session) and `--web` | Services, desktop apps, remote UIs |
@@ -232,7 +232,7 @@ This is the research frontier of the project and an open invitation.
 - **Permissions.** Five modes; allow, ask and deny rules in the
   `Tool(specifier)` syntax Claude Code users know; protected paths (`.git`,
   `.env` files, `.ssh`, shell rc files and more) always ask.
-- **Sandbox.** An opt-in macOS Seatbelt sandbox. A Linux backend is wanted.
+- **Sandbox.** An opt-in Bash sandbox: Seatbelt on macOS, bubblewrap on Linux.
 - **Stall gate.** On by default in interactive sessions, it stops runs whose
   tool rounds keep returning nothing new.
 - **Observable output.** Every file change is an event with a bounded diff, and
@@ -257,7 +257,7 @@ That installs the latest release on macOS or Linux, arm64 or x86_64. Windows
 uses `scripts\install.ps1` with the release zip. Then:
 
 ```sh
-metacodes login --provider metask          # or --api-key / --provider openai|gemini|zai-coding-plan
+metacodes login                            # sign in to Metask in the browser (or /login in the TUI)
 metacodes                                  # interactive TUI
 metacodes -p "explain src/main.zig" --json # headless, one NDJSON result
 metacodes --web                            # browser UI on 127.0.0.1:7777
@@ -272,6 +272,18 @@ git clone https://github.com/metask-ai/metacodes.git && cd metacodes
 zig build && ./zig-out/bin/metacodes --help
 zig build example                          # embed the runtime from Zig
 ```
+
+On a machine without a browser (a server, an SSH session), sign in with a
+device code instead: `metacodes login --provider metask --no-browser` prints
+a link and a code to confirm on any device, then asks for the model and
+reasoning level (`/login metask` in the TUI). Either sign-in is kept as the
+Metask session, and a plain `metacodes` uses it.
+
+To use your own provider key instead of signing in, put it in the install's
+`~/.local/opt/metacodes/state/.env` and start again:
+[doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md). `metacodes` opens even with
+nothing set up, and says how to do either; `/logout` switches back from the
+Metask account to that key.
 
 [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) covers isolated installs,
 providers, Metask OAuth, Lean kernels and Windows.
@@ -310,7 +322,7 @@ ship for five targets with checksums.
 | TinyKG memory and task DAG | On by default in the CLI; not yet in AgentCore |
 | Lean project rules | Experimental; dormant until a project activates them |
 | Self-evolution, learning turn, check gate | Experimental, off by default |
-| Sandbox | macOS only, opt-in |
+| Sandbox | macOS (Seatbelt) and Linux (bubblewrap), opt-in |
 
 Milestones are tracked in [ROADMAP.md](ROADMAP.md) and launch readiness in
 [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md).
@@ -333,7 +345,8 @@ We want contributors, and the most useful work right now is:
   fixtures for real failures.
 - **Memory research.** A Markdown-memory or vector-RAG comparison arm against
   TinyKG.
-- **Platforms.** A Linux sandbox backend (bubblewrap or Landlock).
+- **Platforms.** A Windows sandbox backend, and per-host network filtering for
+  the sandbox.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) maps each area to a starting point and
 explains how changes get accepted. Read [AGENTS.md](AGENTS.md) before your
@@ -346,6 +359,7 @@ vulnerabilities go through [SECURITY.md](SECURITY.md), never public issues.
 | | |
 |---|---|
 | [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) | Install, providers, build from source |
+| [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md) | Your own provider key in the install's `.env` |
 | [doc/API.md](doc/API.md) | Every supported entry point and its compatibility |
 | [doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md) | The normative C ABI contract |
 | [doc/BENCHMARKS.md](doc/BENCHMARKS.md) | How metacodes is measured, and every result so far |

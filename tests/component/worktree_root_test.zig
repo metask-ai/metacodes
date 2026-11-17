@@ -353,9 +353,9 @@ test "L2 worktree: Bash after EnterWorktree in the same response is not run ahea
 }
 
 test "L2 worktree: with the sandbox on, Bash can commit in the worktree" {
-    // Seatbelt; the fixture lives under .zig-cache/tmp, outside the temp
-    // directories every sandboxed command may write.
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    // Seatbelt or bubblewrap; the fixture lives under .zig-cache/tmp,
+    // outside the temp directories every sandboxed command may write.
+    if (!cc.sandbox_exec.hostSupported()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const commit = "{\"command\":\"git -c user.email=t@t -c user.name=t commit -q --allow-empty -m from-worktree && git log -1 --format=%s\"}";
     const enter = try toolUseMessage(a, 0, &.{.{ .name = "EnterWorktree", .input = "{\"name\":\"wt-sandbox\"}" }});

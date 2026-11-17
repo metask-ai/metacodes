@@ -64,9 +64,27 @@ is listed in [doc/AGENTCORE_BINARY_ABI.md](../../doc/AGENTCORE_BINARY_ABI.md).
 to it. `session.updateCredential(apiKey)` replaces the provider key in place,
 also during a run and from inside a tool or handler: every request sent
 afterwards (the run's next turn, a retry) carries it, and a request already
-sent keeps the old one. Separate sessions run concurrently; one session runs one prompt at a
+sent keeps the old one. `session.rewindToUserMessage(position)` edits and
+reruns: while idle it drops the user message at `position` (counted from 1 over
+the whole history, as `describe().conversation.message_count` counts) and
+everything after it, and the next `run()` takes its place; a refused position
+throws with code `NOT_USER_MESSAGE`, `MESSAGE_POSITION_OUT_OF_RANGE` or
+`MESSAGE_POSITION_COMPACTED` and changes nothing. Separate sessions run concurrently; one session runs one prompt at a
 time. `session.close()` throws while a run is active, and the session stays
 open; await the run, or `abort()` it, first.
+
+A gateway stream sometimes breaks off mid-answer, and a reasoning model has
+usually shown thinking by then. Every request is sent again once by itself when
+its stream broke off without an answer (a stall, a dropped connection, a stream
+that ended before its stop reason) and no tool call had started.
+`run(prompt, { streamRetryBudget: n })` (and `stream(...)`, 0 to 8, default 0)
+lets the run send a request again up to `n` more times, after a started tool
+call too; a server's error is never re-sent. Before each retry of an attempt
+that showed output the run tells you what to take back: the attempt's
+`output_segment_end` has disposition `'discarded'` (its text is not part of
+`result.text`), a `thinking_discarded` event `{ index, turn, group, bytes }`
+names the thinking shown while that segment was open, and a `retry_notice`
+follows before a short wait.
 
 ## Permissions
 

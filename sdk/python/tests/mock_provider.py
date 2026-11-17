@@ -6,7 +6,9 @@ Each request pops the next step of the script:
 * ``("tool", name, input_dict)`` answers with one ``tool_use`` block;
 * ``("echo",)`` answers with the text of the last tool_result it received,
   prefixed by ``"saw: "``, so a test can prove the result reached the model;
-* ``("status", code, headers_dict, body_dict)`` answers with that non-2xx JSON.
+* ``("status", code, headers_dict, body_dict)`` answers with that non-2xx JSON;
+* ``("thinking_cut", "...")`` streams one thinking delta and then ends the body
+  without a stop reason, the way a dropped gateway stream looks.
 
 Every request body is kept in ``requests`` for assertions, and the
 ``authorization`` header each one carried in ``authorizations``.
@@ -74,6 +76,22 @@ def text_response(index: int, text: str) -> bytes:
             ("content_block_stop", {"type": "content_block_stop", "index": 0}),
         ]
         + _finish("end_turn")
+    )
+
+
+def thinking_cut_response(index: int, thinking: str) -> bytes:
+    return _sse(
+        [
+            _start(index),
+            (
+                "content_block_start",
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+            ),
+            (
+                "content_block_delta",
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking}},
+            ),
+        ]
     )
 
 
@@ -165,6 +183,8 @@ class MockProvider:
                     payload = tool_response(index, step[1], step[2])
                 elif step[0] == "echo":
                     payload = text_response(index, "saw: " + last_tool_result(body))
+                elif step[0] == "thinking_cut":
+                    payload = thinking_cut_response(index, step[1])
                 else:
                     payload = text_response(index, step[1])
                 self.send_response(200)

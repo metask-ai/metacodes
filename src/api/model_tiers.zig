@@ -76,12 +76,14 @@ pub const TierTable = struct {
     anthropic: ProviderTiers = .{},
     openai: ProviderTiers = .{},
     gemini: ProviderTiers = .{},
+    bedrock: ProviderTiers = .{},
 
     pub fn forKind(self: *const TierTable, kind: types.ProviderKind) *const ProviderTiers {
         return switch (kind) {
             .anthropic => &self.anthropic,
             .openai => &self.openai,
             .gemini => &self.gemini,
+            .bedrock => &self.bedrock,
         };
     }
 
@@ -89,6 +91,7 @@ pub const TierTable = struct {
         self.anthropic.deinitSpecs(self.allocator);
         self.openai.deinitSpecs(self.allocator);
         self.gemini.deinitSpecs(self.allocator);
+        self.bedrock.deinitSpecs(self.allocator);
     }
 };
 
@@ -186,6 +189,8 @@ fn parseTable(allocator: std.mem.Allocator, value: std.json.Value) ParseError!Ti
             &table.openai
         else if (std.mem.eql(u8, key, "gemini"))
             &table.gemini
+        else if (std.mem.eql(u8, key, "bedrock"))
+            &table.bedrock
         else
             return error.InvalidTierTable;
         try parseProviderTiers(allocator, entry.value_ptr.*, dest);

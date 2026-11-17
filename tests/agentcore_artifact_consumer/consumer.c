@@ -6,10 +6,10 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 26 must not retain historical callback aliases"
+#error "revision 28 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 26u || \
+#if METASK_AGENTCORE_ABI_REVISION != 28u || \
     METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 != 16384u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
@@ -60,8 +60,12 @@
     METASK_AGENTCORE_TEAM_ROLE_LEAD != 1u || \
     METASK_AGENTCORE_TEAM_ROLE_MEMBER != 2u || \
     METASK_AGENTCORE_MAX_TEAM_NAME_BYTES_V1 != 64u || \
-    METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1 != 64u
-#error "source-free Revision 23-26 codes must match the public contract"
+    METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1 != 64u || \
+    METASK_AGENTCORE_STATUS_MESSAGE_POSITION_OUT_OF_RANGE != 31u || \
+    METASK_AGENTCORE_STATUS_NOT_USER_MESSAGE != 32u || \
+    METASK_AGENTCORE_STATUS_MESSAGE_POSITION_COMPACTED != 33u || \
+    METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1 != 8u
+#error "source-free Revision 23-28 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -586,6 +590,58 @@ static int description_contains(const metask_agentcore_api_v1 *api,
     return scan.found;
 }
 
+/* Revision 27: describe's conversation.message_count, or UINT64_MAX when the
+ * description cannot be read. */
+static uint64_t description_message_count(const metask_agentcore_api_v1 *api,
+                                          metask_agentcore_session *session) {
+    static const char key[] = "\"message_count\":";
+    metask_agentcore_owned_bytes_v1 description = {0};
+    metask_agentcore_owned_bytes_v1 diagnostic = {0};
+    uint64_t count = UINT64_MAX;
+    if (api->session_control->describe(session, &description, &diagnostic) !=
+        METASK_AGENTCORE_STATUS_OK) {
+        api->buffer_release(&diagnostic);
+        return count;
+    }
+    if (description.ptr != NULL && description.len >= sizeof(key) - 1) {
+        size_t len = (size_t)description.len;
+        size_t index;
+        for (index = 0; index + sizeof(key) - 1 <= len; ++index) {
+            if (memcmp(description.ptr + index, key, sizeof(key) - 1) == 0) {
+                size_t digit = index + sizeof(key) - 1;
+                uint64_t value = 0;
+                int any = 0;
+                while (digit < len && description.ptr[digit] >= '0' &&
+                       description.ptr[digit] <= '9') {
+                    value = value * 10u + (uint64_t)(description.ptr[digit] - '0');
+                    any = 1;
+                    ++digit;
+                }
+                if (any) count = value;
+                break;
+            }
+        }
+    }
+    api->buffer_release(&description);
+    return count;
+}
+
+/* Revision 27: rewind_to_user_message's status; a refusal must carry a
+ * diagnostic, which is released here. */
+static uint32_t rewind_status(const metask_agentcore_api_v1 *api,
+                              metask_agentcore_session *session,
+                              uint64_t position) {
+    metask_agentcore_owned_bytes_v1 diagnostic = {0};
+    uint32_t status = api->session_control->rewind_to_user_message(
+        session, position, &diagnostic);
+    if (status != METASK_AGENTCORE_STATUS_OK &&
+        (diagnostic.ptr == NULL || diagnostic.len == 0)) {
+        status = METASK_AGENTCORE_STATUS_INTERNAL_ERROR;
+    }
+    api->buffer_release(&diagnostic);
+    return status;
+}
+
 /* Revision 23: whether goal->get's JSON contains `needle`. */
 static int goal_contains(const metask_agentcore_api_v1 *api,
                          metask_agentcore_session *session,
@@ -800,6 +856,8 @@ int main(int argc, char **argv) {
             raw_api->session_control->set_prompt_profile ||
         api->session_control->update_permission_mode !=
             raw_api->session_control->update_permission_mode ||
+        api->session_control->rewind_to_user_message !=
+            raw_api->session_control->rewind_to_user_message ||
         api->skill->resolve_catalog != raw_api->skill->resolve_catalog ||
         api->skill->release_catalog != raw_api->skill->release_catalog ||
         api->skill->bind_policy != raw_api->skill->bind_policy ||
@@ -1106,6 +1164,35 @@ int main(int argc, char **argv) {
     }
     api->buffer_release(&diagnostic);
 
+    /* Revision 28 (#452): a stream retry budget past its limit, or a nonzero
+     * reserved word beside it, is refused before admission; no provider round
+     * is consumed and the Run id stays reusable. */
+    {
+        metask_agentcore_run_input_v1 probe = {0};
+        probe.struct_size = sizeof(probe);
+        probe.kind_code = METASK_AGENTCORE_RUN_INPUT_TEXT;
+        probe.text = view("refused before admission");
+        metask_agentcore_run_options_v1 over_budget = options;
+        over_budget.stream_retry_budget = METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1 + 1u;
+        metask_agentcore_run_options_v1 dirty_reserved = options;
+        dirty_reserved.reserved0 = 1u;
+        if (api->session->run_input(session, 1, &probe, &over_budget, &result,
+                                    &diagnostic) !=
+                METASK_AGENTCORE_STATUS_RESOURCE_LIMIT ||
+            (api->buffer_release(&diagnostic),
+             api->session->run_input(session, 1, &probe, &dirty_reserved, &result,
+                                     &diagnostic)) !=
+                METASK_AGENTCORE_STATUS_INVALID_ARGUMENT) {
+            api->buffer_release(&diagnostic);
+            stop_server(&server);
+            api->session->destroy(session, &diagnostic);
+            api->buffer_release(&diagnostic);
+            api->runtime->destroy(runtime, &diagnostic);
+            return release_error(api, &diagnostic, 67);
+        }
+        api->buffer_release(&diagnostic);
+    }
+
     /* The family table says Claude takes images; the Host's declaration says
      * this route does not, and the Host wins - before any provider round. */
     if (api->session_control->set_model(session, view("claude-c-consumer"),
@@ -1198,6 +1285,12 @@ int main(int argc, char **argv) {
     metask_agentcore_run_options_v1 offset_options = options;
     offset_options.time_context_code = METASK_AGENTCORE_TIME_CONTEXT_UTC_OFFSET;
     offset_options.utc_offset_minutes = 330;
+    /* Revision 28: a budget at its limit is accepted; this stream completes,
+     * so it re-issues nothing. */
+    offset_options.stream_retry_budget = METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1;
+    /* Revision 27: the Run's own message is message_count + 1, read while
+     * idle just before it. */
+    const uint64_t multimodal_position = description_message_count(api, session) + 1u;
     active_run_id = 2;
     run_status = api->session->run_input(session, 2, &multimodal, &offset_options,
                                          &result, &diagnostic);
@@ -1211,6 +1304,28 @@ int main(int argc, char **argv) {
         api->buffer_release(&diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 24);
+    }
+    /* Revision 27 (#441): positions whose context cannot be rebuilt are
+     * refused with their own status and change nothing; the multimodal
+     * message is dropped with its reply, so the next Run follows exactly the
+     * context before it. */
+    {
+        const uint64_t count = description_message_count(api, session);
+        if (multimodal_position == 0u || count == UINT64_MAX || count <= multimodal_position ||
+            rewind_status(api, session, 0u) != METASK_AGENTCORE_STATUS_INVALID_ARGUMENT ||
+            rewind_status(api, session, multimodal_position + 1u) !=
+                METASK_AGENTCORE_STATUS_NOT_USER_MESSAGE ||
+            rewind_status(api, session, UINT64_MAX) !=
+                METASK_AGENTCORE_STATUS_MESSAGE_POSITION_OUT_OF_RANGE ||
+            description_message_count(api, session) != count ||
+            rewind_status(api, session, multimodal_position) != METASK_AGENTCORE_STATUS_OK ||
+            description_message_count(api, session) != multimodal_position - 1u) {
+            stop_server(&server);
+            api->session->destroy(session, &diagnostic);
+            api->buffer_release(&diagnostic);
+            api->runtime->destroy(runtime, &diagnostic);
+            return release_error(api, &diagnostic, 66);
+        }
     }
 
     /* Revision 23: the Host sets a goal; a goal-continuation Run, whose
@@ -1328,6 +1443,6 @@ int main(int argc, char **argv) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);
-    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, goal, host-scheduled team, credential rotation and lifecycle OK");
+    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, stream retry budget, rewind to a user message, goal, host-scheduled team, credential rotation and lifecycle OK");
     return 0;
 }

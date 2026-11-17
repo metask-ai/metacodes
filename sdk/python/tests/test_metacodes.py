@@ -101,6 +101,64 @@ class PythonSdkTest(unittest.TestCase):
         self.assertEqual(recovered.stop_reason, "end_turn")
         self.assertIsNone(recovered.model_error)
 
+    def test_a_stream_cut_after_thinking_is_sent_again_under_the_budget(self) -> None:
+        # Issue #452: thinking, then the body ends with no stop reason.
+        events = []
+        script = [("thinking_cut", "private reasoning"), ("text", "recovered")]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=()) as runtime:
+                session = self.session(runtime, provider)
+                result = session.run("think", stream_retry_budget=1, on_event=events.append)
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertEqual(result.text, "recovered")
+        self.assertIsNone(result.model_error)
+        # The same request went out twice.
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(provider.requests[0], provider.requests[1])
+        payloads = {}
+        for event in events:
+            tag, payload = next(iter(event.items()))
+            payloads.setdefault(tag, []).append(payload)
+        self.assertEqual(
+            payloads["thinking_discarded"], [{"index": 0, "turn": 1, "group": 0, "bytes": 17}]
+        )
+        # One failed stream of at most three: the first attempt, the request's
+        # own re-issue (#461) and the budget's one, after the short backoff.
+        self.assertEqual(payloads["retry_notice"], [{"attempt": 1, "max": 3, "delay_ms": 500}])
+        self.assertEqual(
+            [segment["disposition"] for segment in result.segments], ["discarded", "final"]
+        )
+        tags = [next(iter(event)) for event in events]
+        self.assertLess(tags.index("thinking_discarded"), tags.index("retry_notice"))
+
+    def test_without_a_budget_a_request_cut_twice_after_thinking_ends_the_run(self) -> None:
+        # Issue #461: every request has one re-issue of its own; the second
+        # cut of the same request ends the Run.
+        events = []
+        script = [
+            ("thinking_cut", "private reasoning"),
+            ("thinking_cut", "private reasoning"),
+            ("text", "never sent"),
+        ]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=()) as runtime:
+                session = self.session(runtime, provider)
+                result = session.run("think", on_event=events.append)
+                with self.assertRaises(ValueError):
+                    session.run("think", stream_retry_budget=_native.MAX_STREAM_RETRY_BUDGET + 1)
+        self.assertEqual(result.stop_reason, "api_error")
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(provider.requests[0], provider.requests[1])
+        payloads = {}
+        for event in events:
+            tag, payload = next(iter(event.items()))
+            payloads.setdefault(tag, []).append(payload)
+        self.assertEqual(
+            payloads["thinking_discarded"], [{"index": 0, "turn": 1, "group": 0, "bytes": 17}]
+        )
+        self.assertEqual(payloads["retry_notice"], [{"attempt": 1, "max": 2, "delay_ms": 500}])
+        self.assertEqual(result.model_error.attempts, 2)
+
     def test_python_tool_result_reaches_the_model(self) -> None:
         calls = []
 
@@ -608,6 +666,35 @@ class PythonSdkTest(unittest.TestCase):
                 session.run("write")
         self.assertTrue((self.root / "allowed.txt").exists())
         self.assertEqual(asked, [])
+
+    def test_rewind_to_user_message_reruns_an_edited_message(self) -> None:
+        script = [("text", "first answer"), ("text", "second answer"), ("text", "edited answer")]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=()) as runtime:
+                session = self.session(runtime, provider)
+                session.run("alpha-prompt")
+                position = session.describe()["conversation"]["message_count"] + 1
+                session.run("beta-prompt")
+                self.assertEqual(session.describe()["conversation"]["message_count"], 4)
+                # An assistant reply and a position past the end are refused
+                # with their own statuses and change nothing.
+                for refused, name in ((2, "NOT_USER_MESSAGE"), (9, "MESSAGE_POSITION_OUT_OF_RANGE")):
+                    with self.assertRaises(metacodes.AgentCoreError) as caught:
+                        session.rewind_to_user_message(refused)
+                    self.assertEqual(caught.exception.status_name, name)
+                with self.assertRaises(ValueError):
+                    session.rewind_to_user_message(0)
+                self.assertEqual(session.describe()["conversation"]["message_count"], 4)
+                self.assertEqual(len(provider.requests), 2)
+                session.rewind_to_user_message(position)
+                self.assertEqual(session.describe()["conversation"]["message_count"], 2)
+                result = session.run("gamma-edited")
+        self.assertEqual(result.text, "edited answer")
+        rerun = str(provider.requests[2]["messages"])
+        self.assertIn("alpha-prompt", rerun)
+        self.assertIn("gamma-edited", rerun)
+        self.assertNotIn("beta-prompt", rerun)
+        self.assertNotIn("second answer", rerun)
 
     def test_set_permission_mode_applies_to_the_next_run(self) -> None:
         with MockProvider(self.write_script("first.txt") + self.write_script("second.txt")) as provider:

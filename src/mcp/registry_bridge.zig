@@ -6,6 +6,9 @@
 //! 每个 MCP tool 注册时：
 //! - ctx_ptr 指向 McpToolBinding（含 *McpClient + original name）
 //! - execute 函数从 ctx_ptr 恢复 client 调 callTool
+//! - 权限分类 `.execute`(`DynRegistry.registerMcpDefinitionBody` 给):default、
+//!   acceptEdits、auto 先问,dontAsk 拒,与 AgentCore 的 MCP 环境一致;server 的
+//!   annotations(`readOnlyHint` 等)不放宽它(#473)。
 //!
 //! 注意：McpToolBinding 的生命周期 = McpSession 的生命周期（至少 process 级）。
 //! McpSession.deinit 清理所有 binding。
@@ -170,6 +173,8 @@ pub const McpSession = struct {
     /// 注册本 server 的 resource 访问工具：`mcp__<server>__list_resources` + `mcp__<server>__read_resource`。
     /// CLI 不再调用(统一走 ListMcpResourcesTool / ReadMcpResourceTool),保留给库宿主。
     /// 复用 McpToolBinding（mcp_tool_name 字段此处不用，置空 dup）。
+    /// 不带权限分类:仍按名字兜底(read)。#473 只把 server 的工具归 `.execute`,
+    /// resource 工具的分类单独决定。
     pub fn registerResourceTools(
         self: *McpSession,
         registry: *DynRegistry,
@@ -299,48 +304,11 @@ fn jsonString(value: ?std.json.Value) ?[]const u8 {
     };
 }
 
-/// 从工具参数 JSON 里取一个字符串字段。容忍键与值之间的空白(模型/服务端产出的 JSON
-/// 常见 `"uri": "x"`),值里的转义引号不截断。
+/// A top-level string argument (still JSON-escaped): the structural lookup
+/// every executor uses, so a key nested in another value or inside a string
+/// is not the argument and whitespace around the colon is the same key (#494).
 fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    if (field.len > 200) return null;
-    buf[0] = '"';
-    @memcpy(buf[1..][0..field.len], field);
-    buf[1 + field.len] = '"';
-    const key = buf[0 .. 2 + field.len];
-    var search: usize = 0;
-    while (std.mem.indexOfPos(u8, data, search, key)) |idx| {
-        var pos = idx + key.len;
-        while (pos < data.len and isJsonWs(data[pos])) : (pos += 1) {}
-        if (pos >= data.len or data[pos] != ':') {
-            search = idx + 1;
-            continue;
-        }
-        pos += 1;
-        while (pos < data.len and isJsonWs(data[pos])) : (pos += 1) {}
-        if (pos >= data.len or data[pos] != '"') return null;
-        const s = pos + 1;
-        var e = s;
-        var escaped = false;
-        while (e < data.len) : (e += 1) {
-            const byte = data[e];
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (byte == '\\') {
-                escaped = true;
-                continue;
-            }
-            if (byte == '"') break;
-        }
-        return data[s..e];
-    }
-    return null;
-}
-
-fn isJsonWs(c: u8) bool {
-    return c == ' ' or c == '\n' or c == '\r' or c == '\t';
+    return @import("../util/json.zig").topLevelStringField(data, field);
 }
 
 // ============================================================================
@@ -417,6 +385,23 @@ test "registerToolsFromJson: Python 风格带空格的 tools/list 全部注册,i
     try testing.expect(std.mem.indexOf(u8, buf.items, "\"required\":[\"query\"]") != null);
 }
 
+test "registerToolsFromJson: every tool a server lists is classified execute, whatever its annotations claim (#473)" {
+    const ToolCategory = @import("../permission/category.zig").ToolCategory;
+    var fake_client: McpClient = undefined;
+    var session = McpSession.init(testing.allocator, &fake_client);
+    defer session.deinit();
+    var reg = DynRegistry.init(testing.allocator);
+    defer reg.deinit();
+
+    // `list_knowledge_bases` carries `readOnlyHint: true`; the others carry nothing.
+    try session.registerToolsFromJson(&reg, "knowforge", SPACED_TOOLS_LIST);
+    try testing.expectEqual(@as(usize, 3), reg.entries.items.len);
+    for (reg.entries.items) |entry| {
+        try testing.expectEqual(@as(?ToolCategory, .execute), reg.category(entry.name));
+    }
+    try testing.expectEqual(@as(?ToolCategory, .execute), reg.category("mcp__knowforge__list_knowledge_bases"));
+}
+
 test "registerToolsFromJson: 根形状不对整体报错,不留半注册" {
     var fake_client: McpClient = undefined;
     var session = McpSession.init(testing.allocator, &fake_client);
@@ -473,6 +458,10 @@ test "registerResourceTools registers list + read tools" {
 
     try testing.expect(reg.find("mcp__myserver__list_resources") != null);
     try testing.expect(reg.find("mcp__myserver__read_resource") != null);
+    // Still classified by name (read): #473 left the resource tools to a
+    // separate decision.
+    try testing.expect(reg.category("mcp__myserver__list_resources") == null);
+    try testing.expect(reg.category("mcp__myserver__read_resource") == null);
 }
 
 test "registerResourceTools rolls back registry and bindings on partial failure" {

@@ -629,11 +629,23 @@ test "formal runtime rejects missing and hash-mismatched checker before executio
     try std.testing.expectEqual(FailureKind.checker_open_failed, missing.failure);
 
     if (builtin.os.tag == .windows) return error.SkipZigTest else {
-        const echo_digest = try hashChecker(std.testing.allocator, "/bin/echo");
-        var wrong = echo_digest.sha256;
+        // The checker is a regular file the test writes. A system program
+        // will not do: where coreutils are links to one multi-call binary
+        // (uutils, the default on Ubuntu 26.04), `/bin/echo` is a symlink,
+        // and hashChecker refuses to follow one.
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+        const root = root_buffer[0..root_len];
+        const checker_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/mismatched-checker", .{root});
+        defer std.testing.allocator.free(checker_path);
+        try writeTestExecutable(std.testing.allocator, checker_path, "#!/bin/sh\nexit 0\n");
+        const checker_digest = try hashChecker(std.testing.allocator, checker_path);
+        var wrong = checker_digest.sha256;
         wrong[0] = if (wrong[0] == '0') '1' else '0';
         var mismatch = try invoke(std.testing.allocator, .{
-            .checker_path = "/bin/echo",
+            .checker_path = checker_path,
             .expected_sha256 = wrong,
         }, "{}", bindings, null);
         defer mismatch.deinit(std.testing.allocator);

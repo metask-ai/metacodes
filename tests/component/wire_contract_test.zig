@@ -63,7 +63,7 @@ const sample_goal = cc.core_goal.Goal{
     .updated_at_ms = 2,
 };
 
-fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [48]CoreEvent {
+fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [49]CoreEvent {
     return .{
         .{ .text_chunk = "hello \"wire\"\n" },
         .{ .thinking_chunk = "considering" },
@@ -97,6 +97,7 @@ fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [48]CoreEvent {
         .stream_done,
         .{ .output_segment_begin = .{ .index = 0, .turn = 1, .group = 0 } },
         .{ .output_segment_end = .{ .index = 0, .turn = 1, .group = 0, .disposition = .final, .bytes = 5 } },
+        .{ .thinking_discarded = .{ .index = 1, .turn = 2, .group = 0, .bytes = 17 } },
         .{ .ui_request_pending = .{ .tool_use_id = "tu_3", .request_json = "{\"kind\":\"video_timeline\"}" } },
         .ui_request_resolved,
         .{ .prompt_manifest = .{ .entries = manifest_entries, .sha256 = [_]u8{0xcd} ** 32 } },
@@ -201,7 +202,8 @@ const routed_away = [_]UiRequest{
 test "wire_contract: every UiRequest kind, close outcome and unavailable reason has a pinned v1 line" {
     const a = std.testing.allocator;
     const closed_count = std.meta.fields(cc.wire.RequestClosed).len;
-    var lines: [requests.len + closed_count + routed_away.len][]u8 = undefined;
+    // One close per outcome, then one naming its approver (#446).
+    var lines: [requests.len + closed_count + 1 + routed_away.len][]u8 = undefined;
     var written: usize = 0;
     defer for (lines[0..written]) |line| a.free(line);
 
@@ -222,6 +224,8 @@ test "wire_contract: every UiRequest kind, close outcome and unavailable reason 
         lines[requests.len + index] = try cc.wire.writeRequestClosed(a, index + 1, @enumFromInt(field.value));
         written += 1;
     }
+    lines[requests.len + closed_count] = try cc.wire.writeRequestClosedBy(a, 1, .answered, "alice@example.com");
+    written += 1;
 
     // The unavailable lines come from routing, not from naming a reason.
     var declaration = try cc.wire.parseCapabilities(a, "{\"v\":1,\"type\":\"capabilities\",\"ui_requests\":[\"permission\"],\"custom\":[\"video_timeline@1\"]}");
@@ -233,7 +237,7 @@ test "wire_contract: every UiRequest kind, close outcome and unavailable reason 
     inline for (std.meta.fields(cc.frontend_capabilities.Unavailable), 0..) |field, index| {
         const route = cc.frontend_capabilities.route(capabilities, &routed_away[index]);
         try std.testing.expectEqual(cc.frontend_capabilities.Route{ .unavailable = @enumFromInt(field.value) }, route);
-        lines[requests.len + closed_count + index] = try cc.wire.writeRequestUnavailable(a, &routed_away[index], route.unavailable);
+        lines[requests.len + closed_count + 1 + index] = try cc.wire.writeRequestUnavailable(a, &routed_away[index], route.unavailable);
         written += 1;
     }
     try compareOrDump(a, &lines, REQUESTS_FIXTURE, "requests.jsonl");
@@ -279,6 +283,13 @@ const host_events = [_]cc.wire.HostEvent{
     .{ .user_message = .{ .run_id = 3, .trace_id = "trace-1", .text = "fix the build" } },
     .{ .run_done = .{ .run_id = 3, .trace_id = "trace-1", .stop_reason = "end_turn" } },
     .{ .run_done = .{ .run_id = 4, .error_name = "ProviderUnavailable" } },
+    // Edit-and-rerun (issue #432): the submission replaced user message 6.
+    .{ .user_message = .{ .run_id = 6, .text = "fix the build, then the tests", .replaces = 6 } },
+    // A typed submission (#447): source, kind, idempotency_key and
+    // attributes are appended, each only when the submission had it.
+    .{ .user_message = .{ .run_id = 8, .text = "heart rate high", .source = "device:hr-01", .kind = "telemetry", .idempotency_key = "hr-01:seq-42", .attributes = &.{ .{ .name = "bpm", .value = "132" }, .{ .name = "unit", .value = "bpm" } } } },
+    .{ .user_message = .{ .run_id = 9, .trace_id = "trace-9", .text = "deploy", .idempotency_key = "im:evt-0001" } },
+    .{ .run_done = .{ .run_id = 7, .error_name = "PositionCompacted" } },
     .{ .run_done = .{ .run_id = 5, .stop_reason = "api_error", .model_error = .{
         .category = .payment_required,
         .code = "insufficient_balance",
@@ -293,7 +304,15 @@ const host_events = [_]cc.wire.HostEvent{
     } } },
     .{ .command_result = .{ .command = "set_model", .ok = true } },
     .{ .command_result = .{ .command = "set_reasoning_effort", .ok = false, .error_name = "AgentEffortUnsupportedProvider" } },
+    // The `--web`/`serve` form (#444): the verb of a `/command` line, and what
+    // it reports for a person.
+    .{ .command_result = .{ .command = "mode", .ok = true, .message = "permission mode → dont_ask" } },
+    .{ .command_result = .{ .command = "help", .ok = false, .error_name = "CommandUnsupported", .message = "unsupported here: /help" } },
+    .{ .message_rejected = .{ .message = "model not available for current provider", .text = "fix the build", .model = "gpt-5.6-luna", .permission_mode = "bypass_permissions" } },
+    .{ .message_rejected = .{ .message = "bypassPermissions is disabled by settings", .text = "fix the build", .permission_mode = "bypass_permissions" } },
     .{ .session_poisoned = .{ .error_name = "CallbackFailed", .dropped = 2 } },
+    // A Run resuming one that ended `suspended` on request 1 (#446).
+    .{ .run_resumed = .{ .run_id = 2, .trace_id = "trace-1", .request_id = 1 } },
 };
 
 test "wire_contract: every HostEvent tag and the Run context form have a pinned v1 line" {

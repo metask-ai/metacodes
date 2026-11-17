@@ -358,6 +358,20 @@ pub fn noteStreamFailure(category: Category, retry: Retry, message: []const u8) 
     detail.message.set(message, capture.credential);
 }
 
+/// The Run stops on a context-window rejection that automatic compaction could
+/// not recover from. The provider's own rejection stays the reported failure
+/// when it is still the latest one; when a later recovery request replaced or
+/// cleared it (a summary request that succeeded, or failed for another
+/// reason), the failure the Run stops on is recorded as what it is.
+pub fn noteContextWindowUnrecovered(message: []const u8) void {
+    const capture = active orelse return;
+    if (capture.has_failure and capture.failure.category == .context_window) return;
+    const detail = capture.fresh();
+    detail.category = .context_window;
+    detail.retry = .not_retryable;
+    detail.message.set(message, capture.credential);
+}
+
 /// `agent_loop`'s net under the clients: a failed send nobody described.
 pub fn noteRequestError(err: anyerror) void {
     const capture = active orelse return;
@@ -371,8 +385,11 @@ pub fn noteRequestError(err: anyerror) void {
 }
 
 /// `agent_loop`'s net under the stream readers: a failed read nobody described.
-/// `RequestFailed` is the name the three clients reserve for a mid-stream
-/// disconnect; any other name is a local decode failure that a resend repeats.
+/// The clients describe a stall and a stream that ended before its stop report
+/// themselves (`client.reportBodyStall`, `client.reportStreamIncomplete`), so
+/// those never reach this undescribed. `RequestFailed` is the name the clients
+/// reserve for a mid-stream disconnect; any other name is a local decode
+/// failure that a resend repeats.
 pub fn noteStreamReadError(err: anyerror) void {
     const capture = active orelse return;
     if (capture.has_failure) return;
@@ -481,6 +498,23 @@ fn technicalCategory(name: ?[]const u8) ?Category {
         .{ "timeout_error", .timeout },
         .{ "request_timeout", .timeout },
         .{ "DEADLINE_EXCEEDED", .timeout },
+        // Amazon Bedrock: the event stream's `:exception-type` (lowerCamel,
+        // ConverseStreamOutput) and the HTTP error names (PascalCase).
+        .{ "throttlingException", .rate_limited },
+        .{ "ThrottlingException", .rate_limited },
+        .{ "serviceUnavailableException", .overloaded },
+        .{ "ServiceUnavailableException", .overloaded },
+        .{ "ModelNotReadyException", .overloaded },
+        .{ "internalServerException", .server_error },
+        .{ "InternalServerException", .server_error },
+        .{ "modelStreamErrorException", .server_error },
+        .{ "ModelStreamErrorException", .server_error },
+        .{ "ModelErrorException", .server_error },
+        .{ "validationException", .invalid_request },
+        .{ "ValidationException", .invalid_request },
+        .{ "AccessDeniedException", .permission },
+        .{ "ResourceNotFoundException", .not_found },
+        .{ "ModelTimeoutException", .timeout },
     };
     for (table) |entry| if (std.mem.eql(u8, entry[0], value)) return entry[1];
     return null;

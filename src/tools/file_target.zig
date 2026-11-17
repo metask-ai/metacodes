@@ -3,10 +3,10 @@
 //! and AgentCore's per-file Permission grant (`file_target`) keys on `resolve`,
 //! so a grant always names the file the tool would write.
 //!
-//! `rawPath` keeps the tools' own reading: `common.extractJsonArg` takes the
-//! first textual occurrence of the key, which a nested object or an escaped
-//! key can supply. A caller that also parses the JSON must compare the two
-//! readings itself before trusting either (see
+//! `rawPath` keeps the tools' own reading: `common.extractJsonArg` reads the
+//! top-level member structurally (#494), so a nested object or an escaped key
+//! no longer supplies the path. A caller that also parses the JSON still
+//! compares the two readings before trusting either (see
 //! `agentcore/session_permission.deriveFileTarget`).
 
 const std = @import("std");

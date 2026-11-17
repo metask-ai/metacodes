@@ -50,7 +50,7 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mo
 
     // config 变更 → host.journal(SSE);setConfigEventSink 也 seed snapshot_cache(须在 server.start 前,
     // 对齐 web run() 的 U5 MINOR#3)。
-    var config_sink = web_session.WebConfigSink{ .journal = &host.journal, .alloc = web_alloc };
+    var config_sink = web_session.WebConfigSink{ .wb = &wb };
     app.setConfigEventSink(config_sink.sink());
     defer app.setConfigEventSink(null);
     app.permission_ctx.ui_requester = wb.requester();

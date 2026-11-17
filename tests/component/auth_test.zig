@@ -148,6 +148,51 @@ test "L2 auth: env API key wins by default, oauth-first is explicit override" {
     try std.testing.expectEqualStrings("oauth-precedence-l2", oauth_resolved.bearer_token);
 }
 
+test "L2 auth: METASK_API_KEY from the layer below the environment is the environment key, behind the process (#486)" {
+    const a = std.testing.allocator;
+    var auth_path_buf: [512]u8 = undefined;
+    const auth_path = authPath(&auth_path_buf, "state-env-layer");
+    defer cc.util_fs.testing.rmrfBestEffort(authDir());
+    _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
+    _ = setenv(cc.core_auth.AUTH_FILE_ENV, auth_path.ptr, 1);
+    defer _ = unsetenv(cc.core_auth.AUTH_FILE_ENV);
+
+    // No stored login: the file's key is what `METASK_API_KEY` would be.
+    var from_file = try cc.core_auth.resolveCredentialWithEnvFallback(a, "", null, .api_key_first, "file-key-l2");
+    defer from_file.deinit(a);
+    try std.testing.expectEqual(cc.core_auth.CredentialSource.env_api_key, from_file.source);
+    try std.testing.expectEqualStrings("file-key-l2", from_file.bearer_token);
+
+    // The process environment wins over the file.
+    _ = setenv(cc.core_auth.METASK_API_KEY_ENV, "process-key-l2", 1);
+    var from_process = try cc.core_auth.resolveCredentialWithEnvFallback(a, "", null, .api_key_first, "file-key-l2");
+    defer from_process.deinit(a);
+    try std.testing.expectEqualStrings("process-key-l2", from_process.bearer_token);
+    _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
+
+    // And it takes the environment key's place in the precedence, no other:
+    // oauth-first still prefers a stored login.
+    var creds = cc.core_auth.StoredCredentials{ .oauth = .{
+        .access_token = try a.dupe(u8, "oauth-state-env-l2"),
+        .refresh_token = try a.dupe(u8, "refresh-state-env-l2"),
+        .expires_at = nowSeconds() + 3600,
+    } };
+    defer creds.deinit(a);
+    try cc.core_auth.saveToPath(a, auth_path, creds);
+    defer {
+        if (std.heap.c_allocator.dupeZ(u8, auth_path)) |z| {
+            @import("platform").fs.unlinkPath(z.ptr) catch {};
+            std.heap.c_allocator.free(z);
+        } else |_| {}
+    }
+    var default_resolved = try cc.core_auth.resolveCredentialWithEnvFallback(a, "", null, .api_key_first, "file-key-l2");
+    defer default_resolved.deinit(a);
+    try std.testing.expectEqualStrings("file-key-l2", default_resolved.bearer_token);
+    var oauth_resolved = try cc.core_auth.resolveCredentialWithEnvFallback(a, "", null, .oauth_first, "file-key-l2");
+    defer oauth_resolved.deinit(a);
+    try std.testing.expectEqual(cc.core_auth.CredentialSource.stored_oauth, oauth_resolved.source);
+}
+
 test "L2 auth: ordinary environment credential remains compatible with process teammates" {
     const a = std.testing.allocator;
     var auth_path_buf: [512]u8 = undefined;
@@ -287,6 +332,35 @@ test "L2 auth: runtime FD rejects an ambient second credential channel" {
     try std.testing.expect(pfs.lseek(fd, 0, .set) < 0);
 }
 
+test "L2 auth: runtime FD rejects a METASK_API_KEY in the layer below the environment (#486)" {
+    const pfs = @import("platform").fs;
+    const ppaths_local = @import("platform").paths;
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/metacodes-auth-fd-state-env-{d}", .{
+        ppaths_local.tempDir(),
+        @import("platform").process.currentPid(),
+    });
+    defer std.testing.allocator.free(path);
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+    defer @import("platform").fs.unlinkPath(path_z.ptr) catch {};
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o600);
+    if (fd < 0) return error.CredentialTestFileOpenFailed;
+    try std.testing.expectEqual(@as(isize, 10), pfs.write(fd, "fd-secret\n"));
+    try std.testing.expectEqual(@as(i64, 0), pfs.lseek(fd, 0, .set));
+
+    var fd_buf: [32]u8 = undefined;
+    const fd_text = try std.fmt.bufPrintZ(&fd_buf, "{d}", .{fd});
+    _ = setenv(cc.core_auth.RUNTIME_API_KEY_FD_ENV, fd_text.ptr, 1);
+    _ = unsetenv(cc.core_auth.METASK_API_KEY_ENV);
+    defer _ = unsetenv(cc.core_auth.RUNTIME_API_KEY_FD_ENV);
+
+    try std.testing.expectError(
+        error.AmbiguousRuntimeCredentials,
+        cc.core_auth.resolveRuntimeCredentialWithEnvFallback(std.testing.allocator, "", null, .api_key_first, "file-secret"),
+    );
+    try std.testing.expect(pfs.lseek(fd, 0, .set) < 0);
+}
+
 test "L2 auth: oversized runtime credential fails closed and closes inherited FD" {
     const a = std.testing.allocator;
     const pfs = @import("platform").fs;
@@ -413,7 +487,9 @@ test "L2 auth: expiring OAuth refreshes before request and persists replacement"
 
     const token_req = token_srv.lastRequest() orelse return error.NoRefreshRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "grant_type=refresh_token") != null);
-    try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "client_id=metacode-cli") != null);
+    // An `auth.json` sign-in is an earlier version's: napi issued it to
+    // `metacode-cli`, and it is refreshed as that client (#527).
+    try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "client_id=metacode-cli&") != null);
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "refresh_token=old%20refresh%2Fl2") != null);
 
     var loaded = try cc.core_auth.loadFromPath(a, auth_path);
@@ -487,7 +563,7 @@ fn sendCallback(input: CallbackInput) void {
     var buf: [1024]u8 = undefined;
     const req = std.fmt.bufPrint(
         &buf,
-        "GET /auth/callback?code={s}&state={s} HTTP/1.1\r\nHost: localhost:{d}\r\nConnection: close\r\n\r\n",
+        "GET /auth/metask/callback?code={s}&state={s} HTTP/1.1\r\nHost: localhost:{d}\r\nConnection: close\r\n\r\n",
         .{ input.code, input.state, input.port },
     ) catch return;
     // fire-and-forget:响应内容不重要,只要请求送达回调 server。
@@ -531,7 +607,7 @@ test "L2 auth: browser OAuth callback exchanges code for stored OAuth credential
     const token_req = token_srv.lastRequest() orelse return error.NoTokenExchangeCaptured;
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "grant_type=authorization_code") != null);
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "code=code-l2-browser") != null);
-    try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "redirect_uri=http%3A%2F%2Flocalhost%3A19455%2Fauth%2Fcallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "redirect_uri=http%3A%2F%2Flocalhost%3A19455%2Fauth%2Fmetask%2Fcallback") != null);
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "code_verifier=") != null);
 }
 
