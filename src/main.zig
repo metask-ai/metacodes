@@ -4095,8 +4095,9 @@ fn resolveProfileCredential(
 /// within `provider_oauth_mod.REFRESH_MARGIN_SECONDS` (two minutes) or already
 /// has, the way a session's turn boundary refreshes it
 /// (`App.oauthAccessToken`). Owned; zero it before freeing. Null when the
-/// profile declares no OAuth lifecycle or no sign-in is stored. Metask's is
-/// its own path (`resolveMetaskBearer`).
+/// profile declares no OAuth lifecycle, when there is no state root, and
+/// when no sign-in is stored. Metask's is its own path
+/// (`resolveMetaskBearer`).
 pub fn providerSignInToken(
     allocator: std.mem.Allocator,
     state_root: []const u8,
@@ -4104,7 +4105,13 @@ pub fn providerSignInToken(
 ) !?[]u8 {
     if (!signInDeclared(profile)) return null;
     const token_url = profile.oauth_token_url.?;
-    var session = try provider_oauth_mod.Session.initHome(allocator, state_root, profile.id);
+    var session = provider_oauth_mod.Session.initHome(allocator, state_root, profile.id) catch |err| switch (err) {
+        // No state root (no `HOME`, `--state-dir` or `METACODES_HOME`): no
+        // sign-in can be stored, so there is none, and the credential help
+        // the caller prints for a missing key stands.
+        error.NoHome => return null,
+        else => return err,
+    };
     defer session.deinit();
     if (!(try session.load())) return null;
     var io_runtime = @import("platform").signal.threadedIo(allocator, .{});

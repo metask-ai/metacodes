@@ -33,7 +33,9 @@
 //!   sends the Codex request profile's headers and body;
 //! - a used-up plan is not retried and says when it resets; a plan without
 //!   Codex is not retried and says so;
-//! - without a sign-in, `-p` says how to sign in and offers no key.
+//! - without a sign-in, `-p` says how to sign in and offers no key;
+//! - with no state root and no key, `-p` gives the provider's credential
+//!   help, not a sign-in failure.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -754,6 +756,28 @@ fn runCli(case: *Case, cli: []const u8, env: []const []const u8, args: []const [
     return .{ .exit_code = out.exit_code, .stderr = out.stderr };
 }
 
+/// `runCli` with no state root: `env -i` leaves no `HOME` or
+/// `METACODES_HOME`, and no `--state-dir` is passed. The binary has no
+/// install manifest beside it, so nothing else names one.
+fn runCliNoStateRoot(case: *Case, cli: []const u8, args: []const []const u8) !Run {
+    const a = case.arena();
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    const base = [_][]const u8{
+        "/usr/bin/env",
+        "-i",
+        "PATH=/usr/bin:/bin",
+        "METACODES_KG_AUTOSTART=0",
+        "METACODES_JEV_URL=off",
+        "METACODES_NO_PROBE=1",
+        cli,
+    };
+    for (base) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
+    for (args) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
+    try argv.append(a, null);
+    const out = try cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 60_000, null, cc.tools_common.MAX_SPAWN_CAPTURE_BYTES, case.work);
+    return .{ .exit_code = out.exit_code, .stderr = out.stderr };
+}
+
 fn backendUrl(a: std.mem.Allocator, server: *harness.MockServer) ![]const u8 {
     return std.fmt.allocPrint(a, "METACODES_BASE_URL=http://127.0.0.1:{d}/backend-api/codex", .{server.port});
 }
@@ -960,4 +984,28 @@ test "L2 chatgpt-codex: without a sign-in, -p says how to sign in and offers no 
     const logout = try runCli(&case, cli, &.{}, &.{ "logout", "--provider", "chatgpt-codex" });
     try testing.expectEqual(@as(i32, 0), logout.exit_code);
     try expectContains(logout.stderr, "No sign-in is stored for ChatGPT (Codex).");
+}
+
+test "L2 chatgpt-codex: with no state root and no key, -p gives the provider's credential help, not a sign-in failure" {
+    // No `HOME`, `--state-dir` or `METACODES_HOME`: no sign-in can be stored,
+    // so there is none. Looking for one used to fail (`NoHome`) and say the
+    // sign-in "could not be used", in place of the help naming the key.
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+
+    const openai = try runCliNoStateRoot(&case, cli, &.{ "--provider", "openai", "-p", "hi" });
+    errdefer std.debug.print("openai: exit {d}; stderr:\n{s}\n", .{ openai.exit_code, openai.stderr });
+    try testing.expect(openai.exit_code != 0);
+    try expectContains(openai.stderr, "Authentication required for provider 'openai'.");
+    try expectContains(openai.stderr, "export OPENAI_API_KEY=...");
+    try expectAbsent(openai.stderr, "could not be used");
+
+    const codex_run = try runCliNoStateRoot(&case, cli, &.{ "--provider", "chatgpt-codex", "-p", "hi" });
+    errdefer std.debug.print("chatgpt-codex: exit {d}; stderr:\n{s}\n", .{ codex_run.exit_code, codex_run.stderr });
+    try testing.expect(codex_run.exit_code != 0);
+    try expectContains(codex_run.stderr, "Authentication required for provider 'chatgpt-codex'.");
+    try expectContains(codex_run.stderr, "login --provider chatgpt-codex   (signs in in the browser, then stores the sign-in)");
+    try expectAbsent(codex_run.stderr, "could not be used");
 }
