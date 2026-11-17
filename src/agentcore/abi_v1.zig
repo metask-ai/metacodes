@@ -3460,6 +3460,7 @@ const AbiSession = struct {
         arguments_json: []const u8,
         max_turns: u32,
         stream_retry_budget: u8,
+        context_reminder: ?[]const u8,
     ) anyerror!SkillExecution {
         const binding = if (self.skill_binding) |*value| value else return error.SkillCatalogNotBound;
         const root_frame = self.policy_root orelse
@@ -3500,7 +3501,13 @@ const AbiSession = struct {
             &plan,
         );
         defer allocator.free(invocation_record);
-        const preflight = try self.preflightRootRecords(&.{invocation_record});
+        // The Host's context (#534) leads the invocation record as its own
+        // text part, so that record is reserved as the two-part record it
+        // becomes, as a Text Run's with context is.
+        const preflight = if (context_reminder) |reminder|
+            try self.preflightRootParts(&.{ .{ .text = reminder }, .{ .text = invocation_record } })
+        else
+            try self.preflightRootRecords(&.{invocation_record});
         var budget_controller = session_budget.Controller.init(
             allocator,
             self.budget_state.profile,
@@ -3551,6 +3558,7 @@ const AbiSession = struct {
             .aborted => .aborted,
             .ready => |ready_value| blk: {
                 var ready = ready_value;
+                ready.context_reminder = context_reminder;
                 break :blk switch (plan.skill.definition.context) {
                     .inline_ctx => try ready.executeInline(&plan, max_turns, stream_retry_budget),
                     .fork => try ready.executeFork(&plan, max_turns, stream_retry_budget),
@@ -3946,6 +3954,11 @@ const MaterializedSkillRun = struct {
     invocation_record: ?[]const u8,
     /// Exact catalog generation retained for this admitted Run.
     mcp_view: ?mcp_session.View,
+    /// The Host's rendered context blocks for a Skill invocation Run (#534),
+    /// borrowed from the synchronous external run. It leads the invocation
+    /// record in the Session Conversation and, for a fork, the child's first
+    /// user record, as its own text part. Null when the Run has no context.
+    context_reminder: ?[]const u8 = null,
 
     fn executeInline(
         self: *MaterializedSkillRun,
@@ -3990,7 +4003,8 @@ const MaterializedSkillRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         };
-        budget_controller.reconcileGeneratedRootPrompts(
+        budget_controller.reconcileGeneratedRootRecords(
+            self.context_reminder,
             &.{ invocation_record, body_record },
         ) catch {
             _ = try self.finishWithoutConversation();
@@ -4087,6 +4101,9 @@ const MaterializedSkillRun = struct {
         };
         // Revision 28 (#452): an inline Skill invocation is the Run's own loop.
         self.admitted.stream_retry_budget = stream_retry_budget;
+        // #534: the Host's context leads the invocation record, which the
+        // first request sends before the Skill body.
+        self.admitted.lead_text = self.context_reminder;
         const result = self.admitted.runUserMessagesWithToolSurfaceUsingProvider(
             &.{ invocation_record, body_record },
             max_turns,
@@ -4158,7 +4175,8 @@ const MaterializedSkillRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         };
-        budget_controller.reconcileGeneratedRootPrompts(
+        budget_controller.reconcileGeneratedRootRecords(
+            self.context_reminder,
             &.{invocation_record},
         ) catch {
             _ = try self.finishWithoutConversation();
@@ -4180,7 +4198,11 @@ const MaterializedSkillRun = struct {
             .budget_controller = budget_controller,
             .budget_provider = budget_provider,
             .mcp_view = if (self.mcp_view) |*run_view| run_view else null,
+            .context_reminder = self.context_reminder,
         };
+        // #534: the Host's context leads the invocation record the Session
+        // Conversation keeps, as for an inline Skill or a Text Run.
+        self.admitted.lead_text = self.context_reminder;
         const result = self.admitted.runIsolated(
             &.{invocation_record},
             .{
@@ -4235,6 +4257,10 @@ const ForkExecutorContext = struct {
     budget_controller: *session_budget.Controller,
     budget_provider: *session_budget.BudgetedProvider,
     mcp_view: ?*const mcp_session.View,
+    /// The Host's context for a Skill invocation Run (#534): it leads the
+    /// child's first user record, before the Skill body. Null for a
+    /// model-invoked fork and for a Run without context.
+    context_reminder: ?[]const u8 = null,
 
     fn execute(
         raw: *anyopaque,
@@ -4362,6 +4388,24 @@ const ForkExecutorContext = struct {
         // 这里逐字节发送同一份。
         const subagent_system_prompt = evidence.system_prompt orelse return error.InvalidSessionState;
 
+        // #534: a Skill invocation Run's context leads the child's first user
+        // record as its own text part, so the child's first request carries
+        // it before the Skill body, in the bytes a Text Run's record has. The
+        // child takes the Conversation's ownership at the call.
+        const child_conversation: ?core.conversation.Conversation = if (self.context_reminder) |reminder| conversation: {
+            var conversation = core.conversation.Conversation.init(output_allocator);
+            errdefer conversation.deinit();
+            const record = try core.message.userMessageFromParts(output_allocator, &.{
+                .{ .text = reminder },
+                .{ .text = self.activation.rendered_body },
+            });
+            conversation.append(record) catch |err| {
+                record.deinit(output_allocator);
+                return err;
+            };
+            break :conversation conversation;
+        } else null;
+
         const child = core.subagent.spawnAgentSink(
             output_allocator,
             child_provider.provider(),
@@ -4419,6 +4463,7 @@ const ForkExecutorContext = struct {
                 .home_dir = self.session.workspace.home,
                 .state_root = self.session.workspace.state_root,
                 .additional_dirs = self.session.permission_ctx.match_ctx.additional_dirs,
+                .prebuilt_conversation = child_conversation,
             },
             &child_backend,
         ) catch |run_error| {
@@ -4814,14 +4859,14 @@ fn parseContextBlocks(
 }
 
 /// Revision 22 (#276): the runtime's `currentDate` block for this Run, or
-/// null when the Host turned it off, supplied its own, or the input is a Skill
-/// invocation (which carries no context). A Host `currentDate` block together
-/// with an explicit UTC offset is two answers to one question and is refused.
+/// null when the Host turned it off or supplied its own. Every input kind
+/// takes it: a Skill invocation carries context too (#534). A Host
+/// `currentDate` block together with an explicit UTC offset is two answers to
+/// one question and is refused.
 fn timeContextBlock(
     arena: std.mem.Allocator,
     options: *const wire.RunOptionsV1,
     host_blocks: []const core.context_blocks.Block,
-    kind_code: u32,
     unix_seconds: i64,
 ) !?core.context_blocks.Block {
     const host_has_time = for (host_blocks) |block| {
@@ -4830,12 +4875,11 @@ fn timeContextBlock(
     const zone: core.time_context.Zone = switch (options.time_context_code) {
         wire.TIME_CONTEXT_SYSTEM => blk: {
             if (options.utc_offset_minutes != 0) return error.InvalidTimeContext;
-            if (host_has_time or kind_code == wire.RUN_INPUT_SKILL) return null;
+            if (host_has_time) return null;
             break :blk core.time_context.systemZone(unix_seconds);
         },
         wire.TIME_CONTEXT_UTC_OFFSET => blk: {
             if (host_has_time) return error.ConflictingTimeContext;
-            if (kind_code == wire.RUN_INPUT_SKILL) return error.InvalidTimeContext;
             break :blk core.time_context.Zone.fromHostOffset(options.utc_offset_minutes) catch
                 return error.InvalidTimeContext;
         },
@@ -8106,7 +8150,6 @@ fn sessionRunInput(
         context_scratch.allocator(),
         options,
         context_blocks,
-        input.kind_code,
         core.time_context.currentUnixSeconds(),
     ) catch |err| return failError(inputErrorStatus(err), err, out_error);
     const run_blocks: []const core.context_blocks.Block = if (time_block) |block| blk: {
@@ -8118,8 +8161,6 @@ fn sessionRunInput(
     } else context_blocks;
     const context_reminder = core.context_blocks.render(context_scratch.allocator(), run_blocks) catch
         return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
-    if (context_reminder != null and input.kind_code == wire.RUN_INPUT_SKILL)
-        return fail(wire.STATUS_INVALID_ARGUMENT, "context blocks are not accepted with SkillInvocation input", out_error);
     self.pruneMovedMcpGrants() catch |err|
         return failError(switch (err) {
             error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
@@ -8211,6 +8252,7 @@ fn sessionRunInput(
                 arguments,
                 options.max_turns,
                 stream_retry_budget,
+                context_reminder,
             ) catch |err| {
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
@@ -14037,6 +14079,7 @@ test "disabled AgentCore Skill fails before admission and materialization" {
         "{\"values\":[]}",
         1,
         0,
+        null,
     ));
     try std.testing.expectEqual(
         wire.STATUS_SKILL_POLICY_VIOLATION,
@@ -14063,6 +14106,7 @@ test "disabled AgentCore Skill fails before admission and materialization" {
         "{\"values\":[]}",
         1,
         0,
+        null,
     ));
     try std.testing.expectEqual(@as(u64, 0), native_session.last_run_id);
     try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);

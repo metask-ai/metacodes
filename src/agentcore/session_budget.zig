@@ -649,20 +649,40 @@ pub const Controller = struct {
         self: *Controller,
         prompts: []const []const u8,
     ) Error!void {
+        return self.reconcileGeneratedRootRecords(null, prompts);
+    }
+
+    /// `reconcileGeneratedRootPrompts` where a non-null `lead` is the first
+    /// record's leading text part (the Host's context for a Skill Run, #534):
+    /// that record is reconciled as the two-part user record it becomes.
+    pub fn reconcileGeneratedRootRecords(
+        self: *Controller,
+        lead: ?[]const u8,
+        prompts: []const []const u8,
+    ) Error!void {
         var raw_input: u64 = 0;
         var exact_delta: u64 = 0;
-        for (prompts) |prompt| {
+        for (prompts, 0..) |prompt, index| {
+            const lead_text = if (index == 0) lead else null;
             raw_input = checkedAdd(raw_input, prompt.len) catch {
                 self.markResourceLimit(std.math.maxInt(u64));
                 return error.ResourceLimit;
             };
-            exact_delta = checkedAdd(
-                exact_delta,
-                checkpoint.encodedTextMessageBytes(prompt) catch {
-                    self.markResourceLimit(std.math.maxInt(u64));
-                    return error.ResourceLimit;
-                },
-            ) catch {
+            if (lead_text) |text| raw_input = checkedAdd(raw_input, text.len) catch {
+                self.markResourceLimit(std.math.maxInt(u64));
+                return error.ResourceLimit;
+            };
+            const record_bytes = (if (lead_text) |text|
+                checkpoint.encodedUserPartsMessageBytes(&.{
+                    .{ .text = text },
+                    .{ .text = prompt },
+                })
+            else
+                checkpoint.encodedTextMessageBytes(prompt)) catch {
+                self.markResourceLimit(std.math.maxInt(u64));
+                return error.ResourceLimit;
+            };
+            exact_delta = checkedAdd(exact_delta, record_bytes) catch {
                 self.markResourceLimit(std.math.maxInt(u64));
                 return error.ResourceLimit;
             };
