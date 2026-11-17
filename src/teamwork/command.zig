@@ -307,15 +307,7 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
         }
     }
     const host = try Host.create(arena, app, cfg);
-    // An OS lifetime lock, not a timed sentinel: a long provider call must
-    // never allow a second process to drive this same run. Crash releases it.
-    const parent = try std.fmt.allocPrint(arena, "{s}/teamwork", .{app.stateRoot()});
-    try util_fs.mkdirParents(parent);
-    const lock_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.host-lock", .{ parent, prepared.id.slice() }, 0);
-    const fd = pfs.open(lock_path, .{ .ACCMODE = .RDWR, .CREAT = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.LockFailed;
-    defer pfs.close(fd);
-    try pfs.tryLockExclusive(fd);
+    // Run owns the OS lifetime lease, shared by CLI and MCP callers.
     const run = if (prepared.action != .@"resume")
         try runtime.Run.start(app.allocator, host.deps(), .{ .text = prepared.request }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
     else

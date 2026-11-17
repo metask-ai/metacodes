@@ -104,6 +104,7 @@ pub const Ledger = struct {
         const pending_bytes = try readAll(gpa, pending_path);
         defer if (pending_bytes) |bytes| gpa.free(bytes);
         const pending: ?Entry = if (pending_bytes) |bytes| try parseEntry(gpa, bytes) else null;
+        const entries_before = if (pending_bytes) |bytes| try pendingBefore(gpa, bytes) else 0;
         if (pending) |entry| {
             if (entry.cost != .reserved) return error.CorruptLedger;
             self.pending_seat = entry.seat_id;
@@ -118,13 +119,14 @@ pub const Ledger = struct {
                 if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
                 const entry = try parseEntry(gpa, line);
                 self.add(entry);
-                if (pending) |p| if (p.seat_id.eql(entry.seat_id)) {
+                if (pending) |p| if (self.entries > entries_before and p.seat_id.eql(entry.seat_id)) {
                     settled = true;
                 };
             }
             if (complete_len != bytes.len) try truncate(path_z, complete_len);
         }
         if (pending) |entry| {
+            if (entries_before > self.entries) return error.CorruptLedger;
             if (settled) {
                 pfs.unlinkPath(pending_path.ptr) catch return error.RepairFailed;
                 self.pending_seat = null;
@@ -157,7 +159,10 @@ pub const Ledger = struct {
         defer pfs.close(fd);
         var buf: [1024]u8 = undefined;
         const bytes = formatEntry(&buf, .{ .seat_id = seat_id, .harness = harness, .wallclock_ms = 0, .cost = .{ .reserved = self.remainingUsd() } });
-        if (!pfs.writeAll(fd, bytes)) return error.WriteFailed;
+        // A verifier may be retried with the same logical seat id after a
+        // crash. Only a charge after this receipt can settle this admission.
+        const suffix = std.fmt.bufPrint(buf[bytes.len - 2 ..], ",\"entries_before\":{d}}}\n", .{self.entries}) catch unreachable;
+        if (!pfs.writeAll(fd, buf[0 .. bytes.len - 2 + suffix.len])) return error.WriteFailed;
         pfs.fsyncChecked(fd) catch return error.WriteFailed;
         self.pending_seat = seat_id;
     }
@@ -205,6 +210,16 @@ pub const Ledger = struct {
         self.entries += 1;
     }
 };
+
+fn pendingBefore(gpa: std.mem.Allocator, bytes: []const u8) LoadError!usize {
+    const Receipt = struct { entries_before: usize };
+    const parsed = std.json.parseFromSlice(Receipt, gpa, bytes, .{ .ignore_unknown_fields = true }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.CorruptLedger,
+    };
+    defer parsed.deinit();
+    return parsed.value.entries_before;
+}
 
 fn formatEntry(buf: []u8, entry: Entry) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -404,6 +419,26 @@ test "ledger: a durable charge settles its reservation without double billing af
     try testing.expectEqual(@as(usize, 1), reopened.entries);
     try testing.expect(!pfs.exists(reopened.pending_path.ptr));
     try reopened.reserve(seat("reviewer-1"), .claude_code);
+}
+
+test "ledger: an older charge for a retried seat cannot settle its new admission" {
+    var root = TestRoot.init("cc-zig-teamwork-reservation-retry");
+    defer root.deinit();
+    var pbuf: [512]u8 = undefined;
+    const path = ledgerPath(&pbuf, &root);
+    {
+        var ledger = try Ledger.load(testing.allocator, path, 5);
+        defer ledger.deinit(testing.allocator);
+        try ledger.reserve(seat("verifier-1"), .metacodes);
+        try ledger.charge(.{ .seat_id = seat("verifier-1"), .harness = .metacodes, .wallclock_ms = 1, .cost = .{ .provider_estimate = 0.25 } });
+        // Recovery can restart audit attempt 1 if its verdict never landed.
+        try ledger.reserve(seat("verifier-1"), .metacodes);
+    }
+    var reopened = try Ledger.load(testing.allocator, path, 5);
+    defer reopened.deinit(testing.allocator);
+    try testing.expect(reopened.isExhausted());
+    try testing.expectEqual(@as(f64, 5), reopened.spent_usd);
+    try testing.expectEqual(@as(usize, 2), reopened.entries);
 }
 
 test "ledger: a torn last line is dropped and truncated; a corrupt complete line fails closed" {

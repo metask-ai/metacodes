@@ -233,14 +233,21 @@ saved repository when invoked elsewhere. An OS lifetime lock permits one
 driver per run. Ctrl-C forwards cancellation to the run. Exit codes are 0 for
 done/status/help, 1 for runtime failure and 2 for invalid input/refusal.
 
-`teamwork mcp --request-file <file> --approve --budget-usd <cap>` reserves
-the same approved-start lifecycle for a manager server. The CLI host exposes
+`teamwork mcp --request-file <file> --approve --budget-usd <cap>` starts
+the same approved lifecycle and serves the [Manager MCP protocol](TEAMWORK_MCP.md)
+on stdin/stdout. The built CLI binds `Server.init(gpa, run).serve()`. The CLI host exposes
 `teamwork_command.Host.create(arena, app, cfg)` / `Host.deps()` and
 `executeWithMcp(arena, app, prepared, ?McpHost)`. The `McpHost.serveFn(gpa,
 run)` callback owns stdin/stdout until return; it receives a live approved
 `runtime.Run` instead of running the deterministic loop. Without a bound
 callback the command refuses before App startup. See
 [TEAMWORK_DESIGN.md](TEAMWORK_DESIGN.md) for the runtime contracts.
+
+Budget admission writes `budget.jsonl.pending` before a paid worker/audit
+call. A durable charge settles it; restart consumes an unresolved allowance
+as `reserved` instead of treating unknown spend as zero. `reserved` is cap
+consumption, not a measured bill. The workers/audit cap does not include the
+MCP client's own Manager model calls.
 
 `metacodes --help` enumerates the current flag set and is the authoritative
 pre-1.0 surface; `metacodes --version` prints `metacodes <semver>` as its first

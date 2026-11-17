@@ -319,7 +319,8 @@ pub fn forSeat(spec: *const SeatSpec, deps: Deps, binding: common.Binding) Drive
   逐字节稳定;含 run id 的 seat 目录路径只出现在环境块里。
 - **宪章**(`charters.forRole(role)`):interviewer、implementer、manager 为原创文本;reviewer 即
   `reviewer.charter`(§6);verifier 是标明的占位,真正的宪章在 verifier 模块(#516)。
-  `charters.digest(role)` 是编译期 SHA-256,尚未写进 seat 记录(`status.json` 格式未改)。
+  两种 harness 都收到同一角色宪章(Claude Code 通过 `--append-system-prompt`)。
+  `charters.digest(role)` 是编译期 SHA-256,runtime 将其写入 seat 的 `status.json`,恢复时保留。
 - **判定顺序**:中止 → `aborted`;预算停(子 agent 因 `cost_budget_usd` 停、Claude Code 报
   `error_max_budget_usd`、wallclock_only seat 到时、账本写不进)→ `budget_exhausted`;硬超时 →
   `failed.timed_out`;被信号杀 → `failed.signaled`;非零退出 → `failed.exited`;否则
@@ -418,7 +419,9 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 ## 8. 公共面
 
 `src/lib.zig` 导出 `teamwork_types`、`teamwork_config`、`teamwork_run_dir`、`teamwork_ledger`、
-`teamwork_issues`、`teamwork_reviewer`、`teamwork_charters`、`teamwork_drivers`(`drivers/factory.zig`)
+`teamwork_issues`、`teamwork_reviewer`、`teamwork_charters`、`teamwork_drivers`(`drivers/factory.zig`)、
+`teamwork_runtime`、`teamwork_swe_loop`、`teamwork_audit`、`teamwork_merge_back`、
+`teamwork_verifier_auditor` 与 `teamwork_mcp_server`
 (与 swarm 子系统相同的方式);`stub_driver.zig` 与 `drivers/drivers_test.zig` 只由测试引用。单元测试同时进入
 `zig build test:units`(`src/main.zig` 的测试根)与 `zig build test:lib`。
 

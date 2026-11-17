@@ -238,7 +238,13 @@ pub const teamwork_config = @import("teamwork/config.zig");
 pub const teamwork_types = @import("teamwork/types.zig");
 // Integration binds the MCP server here; all preparation and lifecycle
 // ownership remain in teamwork_command (stdin/stdout belong to the callback).
-pub const teamwork_mcp_host: ?teamwork_command.McpHost = null;
+pub const teamwork_mcp_server = @import("teamwork/mcp_server.zig");
+pub const teamwork_mcp_host: ?teamwork_command.McpHost = .{ .serveFn = serveTeamworkMcp };
+
+fn serveTeamworkMcp(gpa: std.mem.Allocator, run: *@import("teamwork/runtime.zig").Run) !void {
+    var server = teamwork_mcp_server.Server.init(gpa, run);
+    try server.serve();
+}
 pub const app_route_strings = @import("app/route_strings.zig");
 pub const app_mcp_startup = @import("app/mcp_startup.zig");
 pub const app_install = @import("app/install.zig");

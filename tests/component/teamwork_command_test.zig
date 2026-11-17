@@ -49,11 +49,16 @@ const Case = struct {
     }
 
     fn spawn(self: *Case, args: []const []const u8) !cc.tools_common.SpawnOut {
+        return self.spawnInput(args, null);
+    }
+
+    fn spawnInput(self: *Case, args: []const []const u8, input: ?[]const u8) !cc.tools_common.SpawnOut {
         const a = self.arena.allocator();
         var argv: std.ArrayList(?[*:0]const u8) = .empty;
         for (args) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
         try argv.append(a, null);
-        return cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 60_000, null, 2 << 20, self.repo);
+        const out = try @import("platform").process.capture(argv.items, a, .{ .cwd = self.repo, .stdin_data = input, .timeout_ms = 60_000, .max_bytes = 2 << 20 });
+        return .{ .exit_code = out.exit_code, .stdout = out.stdout, .stderr = out.stderr };
     }
 
     fn cli(self: *Case, args: []const []const u8) !cc.tools_common.SpawnOut {
@@ -61,6 +66,10 @@ const Case = struct {
     }
 
     fn cliWithEnv(self: *Case, args: []const []const u8, extra_env: []const []const u8) !cc.tools_common.SpawnOut {
+        return self.cliInput(args, extra_env, null);
+    }
+
+    fn cliInput(self: *Case, args: []const []const u8, extra_env: []const []const u8, input: ?[]const u8) !cc.tools_common.SpawnOut {
         const raw = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
         const a = self.arena.allocator();
         var argv: std.ArrayList([]const u8) = .empty;
@@ -70,7 +79,7 @@ const Case = struct {
         try argv.appendSlice(a, extra_env);
         try argv.appendSlice(a, &.{ std.mem.span(raw), "--state-dir", self.state, "teamwork" });
         try argv.appendSlice(a, args);
-        const out = try self.spawn(argv.items);
+        const out = try self.spawnInput(argv.items, input);
         if (out.exit_code != 0 and std.mem.indexOf(u8, out.stderr, "error:") == null)
             std.debug.print("teamwork CLI exit {d}: {s}\n", .{ out.exit_code, out.stderr });
         return out;
@@ -294,4 +303,58 @@ test "teamwork command: approved external seats config reaches argv, verifier wi
     const resumed = try c.cli(&.{ "resume", "r1", "--approve", "--api-key", "fixture-key", "--base-url", url });
     try testing.expectEqual(@as(i32, 0), resumed.exit_code);
     try testing.expectEqual(@as(usize, 2), server.requestCount());
+}
+
+test "teamwork command: installed MCP endpoint negotiates on stdio and never self-approves completion" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    var provider = try harness.MockServer.startCassette(&.{}, 0);
+    defer provider.stop();
+    const frames =
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture-manager","version":"1"}}}
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"teamwork_status"}}
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"teamwork_request_completion"}}
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"teamwork_cancel"}}
+        \\
+    ;
+    const out = try c.cliInput(&.{ "mcp", "--request-file", try c.request(), "--id", "mcp1", "--approve", "--budget-usd", "2", "--model", "fixture-model", "--api-key", "fixture-key", "--base-url", try provider.urlOwned(a) }, &.{}, frames);
+    if (out.exit_code != 0) std.debug.print("MCP stderr: {s}\nstdout: {s}\n", .{ out.stderr, out.stdout });
+    try testing.expectEqual(@as(i32, 0), out.exit_code);
+    var replies: [5]std.json.Value = undefined;
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, out.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try testing.expect(count < replies.len);
+        replies[count] = try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{});
+        try testing.expectEqualStrings("2.0", replies[count].object.get("jsonrpc").?.string);
+        try testing.expectEqual(@as(i64, @intCast(count + 1)), replies[count].object.get("id").?.integer);
+        count += 1;
+    }
+    try testing.expectEqual(replies.len, count);
+    try testing.expectEqual(@as(usize, 4), replies[1].object.get("result").?.object.get("tools").?.array.items.len);
+    const initial = replies[2].object.get("result").?.object.get("structuredContent").?.object.get("snapshot").?;
+    try testing.expectEqualStrings("approved", initial.object.get("state").?.object.get("kind").?.string);
+    try testing.expectEqual(@as(usize, 0), initial.object.get("seats").?.array.items.len);
+    const refused = replies[3].object.get("result").?;
+    try testing.expect(refused.object.get("isError").?.bool);
+    try testing.expectEqualStrings("NotApproved", refused.object.get("structuredContent").?.object.get("error").?.string);
+    const final = replies[4].object.get("result").?.object.get("structuredContent").?.object.get("snapshot").?;
+    try testing.expectEqualStrings("cancelled", final.object.get("state").?.object.get("kind").?.string);
+    try testing.expectEqual(@as(usize, 0), provider.requestCount());
+    try testing.expect(!try c.exists("repo/feature.txt"));
+    try testing.expectEqualStrings("Add feature.txt containing feature.\n", try c.read("state/teamwork/mcp1/ORIGINAL_REQUEST.md"));
+    // No seat ran: the ledger is empty. Missing-ledger status is also
+    // read-only, even when the current provider configuration is broken.
+    try testing.expectEqualStrings("", try c.read("state/teamwork/mcp1/budget.jsonl"));
+    const budget_path = try std.fmt.allocPrintSentinel(a, "{s}/teamwork/mcp1/budget.jsonl", .{c.state}, 0);
+    try pfs.unlinkPath(budget_path.ptr);
+    try c.write("state/config.json", "broken configuration");
+    const status = try c.cli(&.{ "status", "mcp1" });
+    try testing.expectEqual(@as(i32, 0), status.exit_code);
+    try testing.expectEqual(@as(usize, 0), provider.requestCount());
 }

@@ -441,12 +441,16 @@ pub const CheckRunner = struct {
         const command: []const u8 = blk: {
             const sb = self.sandbox orelse break :blk check.text;
             if (!sb.enabled) break :blk check.text;
+            var strict = sb.*;
+            const protection = try @import("drivers/write_scope.zig").GitProtection.init(gpa, workspace, strict.deny_write);
+            defer protection.deinit();
+            strict.deny_write = protection.roots;
             const main_git_dir = sandbox_exec.linkedWorktreeGitDir(gpa, workspace);
             defer if (main_git_dir) |g| gpa.free(g);
             wrap = sandbox_exec.wrapAsShellString(gpa, check.text, .{
                 .cwd = workspace,
                 .home = self.home,
-                .sandbox = sb,
+                .sandbox = &strict,
                 .main_git_dir = main_git_dir,
                 .additional_dirs = self.additional_dirs,
             }) catch |err| switch (err) {
