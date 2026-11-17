@@ -12,6 +12,7 @@ pub const PREFIX = "<procedural-skill>\n";
 pub const SUFFIX = "\n</procedural-skill>";
 
 pub const Features = [FEATURE_COUNT]f64;
+/// Offline/research ablations. The product's single RSI switch enables both.
 pub const Flags = struct {
     evolution: bool = false,
     routing: bool = false,

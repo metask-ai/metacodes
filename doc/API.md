@@ -251,15 +251,18 @@ The flag surface is fail-closed: an unknown flag or positional argument exits wi
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
 NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`.
-Procedural skill guidance is separately opt-in with `--skill-policy <file>`,
-`--skill-evolution` / `--no-skill-evolution`, and `--skill-routing` /
-`--no-skill-routing` (both off by default). Evolution selects the frozen
-evolved instruction; routing gates the selected seed/evolved instruction with
-its own local ridge head. Neither flag starts optimization. With both off the
-policy is not opened. The [version-1 protocol](SKILL_RSI_PROTOCOL.md) defines
-the independent switch matrix, offline training, budgets, exact feature vector,
-hash binding and host-origin injection. Zig consumers use `skill_rsi` and
-`agent_loop.Options.skill_policy` / `skill_flags`; C ABI layouts are unchanged.
+Two independent features default to off. `--harnessmm` / `--no-harnessmm`
+enables bounded runtime EDGs, guarded reuse of decisions through the native
+tool dispatcher, and durable callback-substitution certificates; the
+[HarnessMM protocol](HARNESSMM_PROTOCOL.md) defines supported guards and
+conservative fallback. `--rsi` / `--no-rsi`, with `--rsi-policy <file>`,
+enables the evolved procedural instruction and its own local ridge router
+together. With RSI off, its policy is not opened. Neither runtime switch
+starts optimization. The [RSI protocol](SKILL_RSI_PROTOCOL.md) defines offline
+training, budgets, exact features, hash binding and host-origin injection.
+Zig consumers use `harnessmm`, `skill_rsi`, and `agent_loop.Options.harnessmm`,
+`rsi` / `rsi_policy`; C ABI layouts are unchanged and AgentCore Sessions do
+not implicitly inherit CLI features.
 `metacodes update [--check] [--version X.Y.Z] [--release-base <url>] [--pull]
 [--allow-downgrade] [--no-sdk] [--ignore-running] [--json]` brings the install
 the executable belongs to up to date from the source its install record names

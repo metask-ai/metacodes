@@ -58,11 +58,10 @@ pub const Config = struct {
     /// Swarm(teams/teammates):`--agent-teams` 开启。opt-in——默认关,不污染单 agent 会话
     /// 的工具菜单(对齐 cc agentSwarmsEnabled 门)。
     agent_teams: bool = false,
-    /// Independent, opt-in procedural instruction features. The offline RSI
-    /// trainer exports this policy; startup never runs an optimizer model.
-    skill_evolution: bool = false,
-    skill_routing: bool = false,
-    skill_policy_path: ?[]const u8 = null,
+    /// Independent, opt-in runtime decision reuse and offline learned RSI.
+    harnessmm: bool = false,
+    rsi: bool = false,
+    rsi_policy_path: ?[]const u8 = null,
     /// Long-horizon evaluation ablation. `native` preserves the product's normal
     /// behavior; the three explicit arms are injected only by the evaluation
     /// runner so one binary can be compared without revision drift.

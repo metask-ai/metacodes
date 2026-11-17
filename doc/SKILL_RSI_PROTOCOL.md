@@ -1,6 +1,8 @@
-# Procedural skill RSI and task routing, version 1
+# Procedural skill RSI, version 1
 
-Implemented as two independent opt-in features. This protocol covers short
+RSI is one opt-in feature combining offline instruction evolution and a
+candidate-specific ridge router. It is independently switchable from
+[HarnessMM runtime reuse](HARNESSMM_PROTOCOL.md). This protocol covers short
 procedural instructions, not executable `SKILL.md` packages or EDG execution.
 The offline host is `scripts/eval/skill_rsi.py`; the frozen product reader is
 `src/skills/rsi.zig`. Neither feature replaces the AgentLoop or changes tool,
@@ -11,24 +13,23 @@ and feature contract rather than a benchmark reproduction.
 
 ## Product switches
 
-`--skill-policy <file>` names a frozen UTF-8 JSON policy. Both switches default
-to off; the last positive or negative occurrence wins.
+`--rsi-policy <file>` names a frozen UTF-8 JSON policy. `--rsi` enables the
+complete feature; `--no-rsi` disables it. RSI defaults to off; the last
+positive or negative occurrence wins.
 
-| Evolution | Routing | Behavior |
-|---|---|---|
-| off | off | Do not open the policy or change the request. |
-| on | off | Use the selected evolved instruction, unconditionally. |
-| off | on | Apply the seed instruction only when its own router admits the task. |
-| on | on | Apply the selected evolved instruction only when its own router admits the task. |
+When disabled, the policy is not opened and no procedural instruction is
+added. When enabled, the selected evolved instruction is applied only when
+its own router admits the task. Evolution and routing are internal parts of
+RSI, not separate product switches.
 
 If no evolved member exists, evolution uses the seed. An explicit empty
 evolved instruction means that offline selection retained the original
 harness. Missing router, model mismatch, out-of-support features and a score
-below threshold abstain. An enabled feature requires a policy path. Malformed,
+below threshold abstain. Enabling RSI requires a policy path. Malformed,
 oversized or hash-inconsistent policies fail startup before a model request.
-Neither switch runs training or makes an optimizer/selector request at startup.
-Changing the switch combination changes the evaluated policy: validation of a
-routed candidate does not establish its benefit when applied unconditionally.
+The runtime switch does not run training or make an optimizer/selector request
+at startup. The separate offline evolution/routing options below exist for
+research ablations; an artifact without a router abstains in the product.
 
 The CLI hosts (headless, REPL, web and daemon) pass the same immutable policy
 to the kernel. Children do not inherit it. A newly admitted instruction is one
@@ -64,7 +65,7 @@ The shared consumer fixture is
 [`sdk/fixtures/skill-rsi-v1.json`](../sdk/fixtures/skill-rsi-v1.json).
 This adds no AgentCore C ABI field, SDK method or wire revision.
 Zig embedders can use `skill_rsi.Loaded`, `Policy`, `Flags` and
-`agent_loop.Options.skill_policy` / `skill_flags`; they retain the policy for
+`agent_loop.Options.rsi_policy` / `rsi`; they retain the policy for
 the whole Run. CLI flags are not implicitly imported into AgentCore Sessions.
 
 The five features, in array order, are:
@@ -100,7 +101,9 @@ requires explicit user authorization. Dollar values above illustrate syntax,
 not an authorization to run. No provider-backed benchmark is part of tests.
 `--no-evolution` trains the seed's router without invoking the proposer;
 `--no-routing` evolves instructions without fitting any router. With both
-features off, the host exports the seed without any callback or task execution.
+offline stages off, the host exports the seed without any callback or task
+execution. These are training ablations within RSI, not the two product
+features (HarnessMM and RSI).
 
 The manifest is an object with `model`, `seed_instruction`, `train`, and
 `validation`. Each task has exactly `id`, `unit_id`, `prompt`, all nonempty
@@ -149,8 +152,8 @@ The lifecycle is:
    relative token saving. Native scores are in [0,1]; relative saving is clipped
    to [-1,1]. Original and candidate observations include unsuccessful attempts.
 5. Freeze all candidates and router parameters before validation. Compare
-   routed or unconditional candidates, according to the independent routing
-   flag, against the original. Require actual application, no loss of aggregate
+   routed or unconditional candidates, according to the offline routing
+   ablation, against the original. Require actual application, no loss of aggregate
    native score, and an improvement in score or, at equal score, fewer tokens.
    Ties retain the incumbent. Select one instruction/router pair, or the empty
    baseline. Validation never reaches the proposer and does not refit a head.

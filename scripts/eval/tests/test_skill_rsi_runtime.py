@@ -32,7 +32,7 @@ class SkillRSIRuntimeTest(unittest.TestCase):
             result = subprocess.run([
                 str(Path(BIN).resolve()), "--api-key", "fixture", "--base-url", server.url,
                 "--model", self.policy["model"], "--no-theme", "--no-lsp", "--no-progress-updates",
-                "--skill-policy", str(policy_path or self.path), *flags, "-p", prompt, "--json",
+                "--rsi-policy", str(policy_path or self.path), *flags, "-p", prompt, "--json",
             ], cwd=self.root, env={**{k: v for k, v in os.environ.items() if k not in {"CODEX_HOME", "METACODES_HOME"}},
                                    "HOME": str(self.home), "METACODES_KG_AUTOSTART": "0"},
                 capture_output=True, text=True, timeout=60)
@@ -51,15 +51,14 @@ class SkillRSIRuntimeTest(unittest.TestCase):
                     result.append(text)
         return result
 
-    def test_independent_switch_matrix_reaches_provider_without_prefix_churn(self):
+    def test_rsi_is_one_feature_with_evolution_and_routing_inside_it(self):
         scenarios = [
             ([], "count 2 items before editing", None),
-            (["--skill-evolution"], "read", "evolved"),
-            (["--skill-routing"], "count 2 items", "seed"),
-            (["--skill-routing"], "read", None),
-            (["--skill-evolution", "--skill-routing"], "read before editing", "evolved"),
-            (["--skill-evolution", "--skill-routing"], "count 2 items", None),
-            (["--skill-evolution", "--no-skill-evolution", "--skill-routing", "--no-skill-routing"], "count 2 items before editing", None),
+            (["--rsi"], "read before editing", "evolved"),
+            (["--rsi"], "count 2 items", None),
+            (["--rsi", "--no-rsi"], "read before editing", None),
+            (["--harnessmm"], "read before editing", None),
+            (["--harnessmm", "--rsi"], "read before editing", "evolved"),
         ]
         system, tools = None, None
         for flags, prompt, selected in scenarios:
@@ -84,7 +83,7 @@ class SkillRSIRuntimeTest(unittest.TestCase):
         bad = copy.deepcopy(self.policy)
         bad["evolved"]["router"]["instruction_sha256"] = "0" * 64
         self.path.write_bytes(stable(bad))
-        result, requests = self.invoke("count", ["--skill-evolution"])
+        result, requests = self.invoke("count", ["--rsi"])
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(requests, [])
 
@@ -93,18 +92,18 @@ class SkillRSIRuntimeTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 policy = copy.deepcopy(self.policy)
                 if mode == "missing_head":
-                    policy["seed"]["router"] = None
+                    policy["evolved"]["router"] = None
                 else:
                     policy["model"] = "different-model"
                 self.path.write_bytes(stable(policy))
-                result, requests = self.invoke("count", ["--skill-routing"])
+                result, requests = self.invoke("read before editing", ["--rsi"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.notes(requests[0]), [])
 
     def test_note_is_persisted_once_across_tool_rounds(self):
         target = self.root / "input.txt"
         target.write_text("input", encoding="utf-8")
-        result, requests = self.invoke("read before editing", ["--skill-evolution", "--skill-routing"], turns=[
+        result, requests = self.invoke("read before editing", ["--rsi"], turns=[
             slow_text_then_tooluse(n_chunks=0, delay=0, tool="Read", tool_input=json.dumps({"file_path": str(target)})),
             simple_text("done")])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -113,9 +112,10 @@ class SkillRSIRuntimeTest(unittest.TestCase):
         self.assertEqual([self.notes(request) for request in requests], [[note], [note]])
 
     def test_python_and_native_router_share_feature_contract(self):
+        self.path.write_bytes(stable({**self.policy, "evolved": self.policy["seed"]}))
         for prompt in ("总数是多少", "copyright", "read AFTER this", "'quoted'", "İ K 多少", "count " * 10000):
             with self.subTest(prompt=prompt[:40]):
-                result, requests = self.invoke(prompt, ["--skill-routing"])
+                result, requests = self.invoke(prompt, ["--rsi"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 effective = route(self.policy["seed"], prompt, True)
                 self.assertEqual(self.notes(requests[0]), [PREFIX + effective + SUFFIX] if effective else [])
@@ -134,7 +134,7 @@ class SkillRSIRuntimeTest(unittest.TestCase):
         policy, _ = run_rsi(data, call, Settings(evolution=True, routing=True, rounds=1))
         self.assertIsNotNone(policy["evolved"]["router"])
         self.path.write_bytes(stable(policy))
-        result, requests = self.invoke("count 1 items", ["--skill-evolution", "--skill-routing"])
+        result, requests = self.invoke("count 1 items", ["--rsi"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.notes(requests[0]), [PREFIX + "Learned from paired executions." + SUFFIX])
 
