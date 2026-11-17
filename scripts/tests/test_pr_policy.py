@@ -24,6 +24,16 @@ def ruleset():
 
 
 class PolicyTest(unittest.TestCase):
+    def test_hidden_bypass_actors_prevent_any_policy_write(self):
+        limited = ruleset()
+        del limited["bypass_actors"]
+        with patch("pr_loop.adapters.GitHub") as factory, redirect_stdout(io.StringIO()), patch("sys.stderr", new_callable=io.StringIO):
+            api = factory.return_value
+            api.api.return_value = limited
+            self.assertEqual(main(["--apply"]), 1)
+            self.assertEqual(api.api.call_count, 1)
+            self.assertEqual(api.api.call_args.args[0], "repos/metask-ai/metacodes/rulesets/23764453")
+
     def test_exact_payload_preserves_all_other_protections_and_is_idempotent(self):
         original = ruleset()
         before = copy.deepcopy(original)

@@ -102,7 +102,10 @@ The preview prints existing and proposed rules. The write fetches the current
 ruleset, removes only `merge_queue`, enables strict required status checks,
 and preserves every other protection, check source and bypass actor. It
 refuses inactive or broad rulesets and verifies effective main rules after
-the write. A maintain role alone cannot apply it. The watcher refuses direct
+the write. It refuses to write if GitHub hides the bypass-actor list, rather
+than replace a ruleset whose complete contents it cannot read. Restart local
+watchers from the updated checkout before cutover. A maintain role alone
+cannot apply it. The watcher refuses direct
 merges until this policy is active.
 
 The workflows retain `merge_group` as migration compatibility, so this change

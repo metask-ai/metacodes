@@ -53,6 +53,10 @@ def main(argv=None):
         print(json.dumps({"repository": args.repo, "ruleset": args.ruleset,
                           "before": current["rules"], "after": desired["rules"]}, indent=2))
         if args.apply:
+            # GitHub omits bypass actors when the caller cannot write rules.
+            # Never send a replacement ruleset with that hidden field missing.
+            if "bypass_actors" not in current:
+                raise LoopError("GitHub withheld bypass actors: repository rule Administration write permission is required; no rules were changed")
             github.api(path, "PUT", desired)
             require_direct_merge(github.api(f"repos/{args.repo}/rules/branches/main"))
             print("main now requires current-branch PR checks and direct merges")
