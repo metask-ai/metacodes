@@ -209,9 +209,10 @@ pub const KeyError = error{
 
 /// A key the user pasted for a provider with a guided key setup
 /// (`ProviderProfile.api_key_setup`). Running it checks the key where the key
-/// page says — a GET the provider does not bill — and stores it in the
-/// provider's own key file. Every string is borrowed; the login worker copies
-/// them (`LoginWorker.ownFlow`).
+/// page says — a GET the provider does not bill, with the key where the
+/// provider's requests carry it (`auth`) — and stores it in the provider's
+/// own key file. Every string is borrowed; the login worker copies them
+/// (`LoginWorker.ownFlow`).
 pub const ApiKeyPrepared = struct {
     options: Options,
     provider_id: provider_ids.Slug,
@@ -219,6 +220,14 @@ pub const ApiKeyPrepared = struct {
     kind: provider_profile.CredentialKind,
     page: provider_profile.KeyPage,
     secret: []const u8,
+    /// Where the check carries the key: the profile's own scheme, so a key
+    /// is checked the way it will be sent (Gemini reads `x-goog-api-key`
+    /// and answers a bearer token 401 whatever the key).
+    auth: provider_profile.AuthScheme = .bearer,
+    /// What a refusal other than 401/403 means, in the provider's words
+    /// (`ProviderProfile.classify_error`): Gemini refuses a wrong key with
+    /// 400 `API_KEY_INVALID`.
+    classify_error: provider_profile.ClassifyFn = provider_profile.defaultClassifyError,
     /// False stores the key without the check (`login --no-check`).
     check: bool = true,
 
@@ -234,13 +243,15 @@ pub const ApiKeyPrepared = struct {
             var line: [512]u8 = undefined;
             notify.say(std.fmt.bufPrint(&line, "Checking the key with {s}\n", .{url}) catch "Checking the key\n");
             if (self.aborted()) return error.Aborted;
-            const answer = catalog_fetch.fetch(allocator, io, .{ .url = url, .bearer = self.secret }) catch |err| switch (err) {
-                error.Unauthorized => return error.KeyRefused,
+            const answer = catalog_fetch.fetchAnswer(allocator, io, .{
+                .url = url,
+                .credential = .{ .scheme = self.auth, .secret = self.secret },
+            }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.KeyCheckFailed,
             };
             defer allocator.free(answer.body);
-            if (!checkAnswered(allocator, answer.body)) return error.KeyCheckFailed;
+            try keyCheckVerdict(allocator, answer, self.classify_error);
             if (self.aborted()) return error.Aborted;
         };
         try api_key_store.save(
@@ -262,6 +273,55 @@ pub const ApiKeyPrepared = struct {
         return signal.isAborted();
     }
 };
+
+/// What the check's answer says about the key. 401 and 403 refuse it, as
+/// does any status the provider classifies as an invalid key or a denial
+/// (`ProviderProfile.classify_error`: Gemini's 400 `API_KEY_INVALID`). A 2xx
+/// passes only as the provider's own answer (`checkAnswered`). Anything else
+/// — 429, 5xx, a 3xx that was not followed — learned nothing about the key.
+fn keyCheckVerdict(
+    allocator: std.mem.Allocator,
+    answer: catalog_fetch.Answer,
+    classify: provider_profile.ClassifyFn,
+) KeyError!void {
+    if (answer.status >= 200 and answer.status < 300) {
+        if (!checkAnswered(allocator, answer.body)) return error.KeyCheckFailed;
+        return;
+    }
+    if (answer.status == 401 or answer.status == 403) return error.KeyRefused;
+    return switch (classify(answer.status, answer.body)) {
+        .auth_invalid, .auth_expired, .permission_denied => error.KeyRefused,
+        else => error.KeyCheckFailed,
+    };
+}
+
+test "key login: the check refuses on 401/403 and on what the provider calls an invalid key, and learns nothing from the rest" {
+    const a = std.testing.allocator;
+    const Verdict = struct {
+        fn of(status: u16, body: []const u8, classify: provider_profile.ClassifyFn) KeyError!void {
+            var copy: [256]u8 = undefined;
+            @memcpy(copy[0..body.len], body);
+            return keyCheckVerdict(a, .{ .status = status, .body = copy[0..body.len] }, classify);
+        }
+        fn gemini(status: u16, body: []const u8) provider_profile.ErrorClass {
+            if (status == 400 and std.mem.indexOf(u8, body, "API_KEY_INVALID") != null) return .auth_invalid;
+            return provider_profile.defaultClassifyError(status, body);
+        }
+    };
+    const default = provider_profile.defaultClassifyError;
+    try Verdict.of(200, "{\"data\":[]}", default);
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(200, "<html></html>", default));
+    try std.testing.expectError(error.KeyRefused, Verdict.of(401, "{}", default));
+    try std.testing.expectError(error.KeyRefused, Verdict.of(403, "", default));
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(429, "{}", default));
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(500, "{}", default));
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(302, "", default));
+    // 400 says nothing about the key, unless the provider says it does.
+    const invalid = "{\"error\":{\"code\":400,\"status\":\"INVALID_ARGUMENT\",\"details\":[{\"reason\":\"API_KEY_INVALID\"}]}}";
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(400, invalid, default));
+    try std.testing.expectError(error.KeyRefused, Verdict.of(400, invalid, Verdict.gemini));
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(400, "{\"error\":{\"status\":\"FAILED_PRECONDITION\"}}", Verdict.gemini));
+}
 
 /// A 2xx from the check is a pass only when it is the provider answering: a
 /// JSON object that does not report failure. A captive portal or proxy page
@@ -346,6 +406,8 @@ pub fn prepareApiKey(
         .kind = setup.kind,
         .page = page,
         .secret = key,
+        .auth = profile.auth,
+        .classify_error = profile.classify_error,
     };
 }
 

@@ -320,3 +320,124 @@ def test_login_dialog_stores_a_kimi_code_key_checked_on_the_coding_path(bin_path
         if not IS_WINDOWS:
             assert case.opened_urls(1) == [KIMI_CONSOLE], case.opened_urls()
         case.assert_stored(GOOD_KEY, kind="kimi_code_api_key")
+
+
+# ── phase 2: every built-in vendor takes a pasted key ───────────────────────
+
+OPENAI_KEYS = "https://platform.openai.com/api-keys"
+AISTUDIO_KEYS = "https://aistudio.google.com/apikey"
+
+
+class _GeminiKeyCheck(http.server.BaseHTTPRequestHandler):
+    """Gemini's model listing as Google answers it (2026-11-17): the key in
+    `x-goog-api-key`, a wrong one refused with 400 `API_KEY_INVALID`."""
+
+    def log_message(self, fmt, *args):  # noqa: D401
+        return
+
+    def do_GET(self):  # noqa: N802
+        self.server.seen.append((self.path, self.headers.get("authorization"), self.headers.get("x-goog-api-key")))
+        self.server.agents.append(self.headers.get("user-agent") or "")
+        ok = self.headers.get("x-goog-api-key") == GOOD_KEY
+        body = json.dumps({"models": [{"name": "models/gemini-4-argon"}]} if ok else {"error": {
+            "code": 400, "message": "API key not valid. Please pass a valid API key.", "status": "INVALID_ARGUMENT",
+            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "API_KEY_INVALID"}]}}).encode("utf-8")
+        self.send_response(200 if ok else 400)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _GeminiCase(_Case):
+    def __enter__(self):
+        super().__enter__()
+        self.server.shutdown()
+        self.server.server_close()
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _GeminiKeyCheck)
+        self.server.seen = []
+        self.server.agents = []
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self
+
+    def env(self):
+        env = super().env()
+        env.update({"GEMINI_API_KEY": None, "GOOGLE_API_KEY": None,
+                    "METACODES_KEY_CHECK_URL": f"http://127.0.0.1:{self.server.server_port}/v1beta/models"})
+        return env
+
+    def key_file(self):
+        return os.path.join(self.home, ".metacodes", "keys", "gemini.json")
+
+
+def test_login_dialog_checks_a_gemini_key_in_its_own_header_and_refuses_a_wrong_one(bin_path):
+    # Gemini reads the key from x-goog-api-key; as a bearer token Google takes
+    # it for an OAuth token and answers 401 whatever the key, so a check sent
+    # that way would refuse every key. A wrong key is a 400 API_KEY_INVALID.
+    with _GeminiCase() as case:
+        flag = " --no-browser" if IS_WINDOWS else ""
+
+        def attempt(key):
+            return [READY, f"type:/login gemini{flag}", "key:enter",
+                    wait_for("Which plan is the key for?", 10),
+                    "key:enter", wait_for("paste it here", 10),
+                    f"type:{key}", wait_for(f"({len(key)} characters)", 10), "key:enter"]
+
+        events = attempt(BAD_KEY) + [wait_for("was not stored", WAIT_S), "key:esc", wait_for("Login interrupted", 10)]
+        events += attempt(GOOD_KEY) + [wait_for("Stored the key for Google Gemini", WAIT_S)]
+        raw = run(bin_path, events, term_size=(30, 120), env=case.env(), per_key_drain=0.05)
+        a, _ = _screen(raw, 30, 120)
+        if not a.screens_with("The key for Google Gemini was not stored: KeyRefused"):
+            a._fail("a wrong Gemini key should be named as refused, not as a failed check")
+        if not a.screens_with("Google AI Studio"):
+            a._fail("the key step should name Google AI Studio")
+        if not a.screens_with(AISTUDIO_KEYS):
+            a._fail("the key page URL was never shown whole")
+        a.assert_prose_contains("Stored the key for Google Gemini · /model to choose a model")
+        assert BAD_KEY.encode() not in raw and GOOD_KEY.encode() not in raw, "a pasted key was echoed"
+        # Both checks carried the key in x-goog-api-key, never as a bearer token.
+        assert [(auth, goog) for _path, auth, goog in case.server.seen] == [(None, BAD_KEY), (None, GOOD_KEY)], \
+            case.server.seen
+        # The check names metacodes, as every request does.
+        assert all(agent.startswith("metacodes/") for agent in case.server.agents), case.server.agents
+        case.assert_stored(GOOD_KEY, kind="api_key")
+
+
+class _OpenAICase(_Case):
+    def env(self):
+        env = super().env()
+        env.update({"OPENAI_API_KEY": None,
+                    "METACODES_KEY_CHECK_URL": f"http://127.0.0.1:{self.server.server_port}/v1/models"})
+        return env
+
+    def key_file(self):
+        return os.path.join(self.home, ".metacodes", "keys", "openai.json")
+
+
+def test_cli_login_takes_a_pasted_openai_key_while_no_oauth_client_is_configured(bin_path):
+    # OpenAI declares an OAuth grant but no client to present with it, so the
+    # CLI used to start that grant and stop on the missing client id. With a
+    # key page, `login --provider openai` takes a pasted key, as /login does.
+    if IS_WINDOWS:
+        raise SkipTest("the CLI paste prompt is driven over a POSIX pty here")
+    with _OpenAICase() as case:
+        env = dict(os.environ)
+        env.update({k: v for k, v in case.env().items() if v is not None})
+        for name in ("OPENAI_API_KEY", "CODEX_HOME"):
+            env.pop(name, None)
+        env["METACODES_KG_AUTOSTART"] = "0"
+        code, out = _cli(os.path.abspath(bin_path), ["login", "--provider", "openai"], env, [
+            ("Paste the key (it is not shown) and press Enter: ", GOOD_KEY + "\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert "Create an API key for OpenAI." in text, text
+        assert "not to a ChatGPT Plus or Pro plan" in text, text
+        assert OPENAI_KEYS in text, text
+        assert "client id" not in text, text
+        assert "Stored the key for OpenAI." in text, text
+        assert GOOD_KEY not in text, "the pasted key was echoed to the terminal"
+        assert case.opened_urls(1) == [OPENAI_KEYS], case.opened_urls()
+        assert case.checks() == [f"Bearer {GOOD_KEY}"], case.checks()
+        case.assert_stored(GOOD_KEY, kind="api_key")

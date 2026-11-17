@@ -230,6 +230,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **`/login <provider>` and `metacodes login --provider <provider>` reach every
+  built-in vendor.** OpenAI, Google Gemini, Alibaba Qwen, MiniMax and the
+  Moonshot Kimi open platform declare their key pages now, as DeepSeek, the
+  GLM Coding Plan, Kimi Code and Bedrock did: the login opens the page
+  (Qwen, MiniMax and Kimi have one per region, the default following the
+  region of the default channel), reads the pasted key, checks it against the
+  vendor's unbilled `/models` and stores it in `<state root>/keys/<id>.json`.
+  The check now carries the key where the vendor's requests do: Gemini's
+  `x-goog-api-key`, where a bearer token is answered 401 whatever the key, and
+  Gemini's 400 `API_KEY_INVALID` counts as a refused key rather than a failed
+  check. `metacodes login --provider openai` takes a pasted key too while no
+  OAuth client is configured for OpenAI; it used to start the browser sign-in
+  and stop on the missing client id.
+
 - **A `SessionHost` Session can move onto another provider route, journaled
   as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`
   commit moves the session's provider, endpoint, credential and model

@@ -2639,7 +2639,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (provider_name) |name| {
         // A provider without an OAuth grant but with a page to create a key on
         // signs in with a pasted key (`ProviderProfile.api_key_setup`).
-        if (providerTakesPastedKey(allocator, name) or key_page != null or key_from_stdin or !check_key) {
+        if (providerTakesPastedKey(allocator, name, client_id, login_method) or key_page != null or key_from_stdin or !check_key) {
             if (mode == .oauth_json) {
                 std.debug.print("error: --oauth-token-json is for providers that sign in with OAuth\n", .{});
                 return 2;
@@ -2957,13 +2957,19 @@ const KeyLoginRequest = struct {
 };
 
 /// Whether `name` is a provider whose login is a pasted key: it declares a
-/// key page and no OAuth grant.
-fn providerTakesPastedKey(allocator: std.mem.Allocator, name: []const u8) bool {
+/// key page and no OAuth grant this login could run, the rule `/login`
+/// follows (`prepareFlow`). OpenAI declares a grant but no client to present
+/// with it, so it takes a key unless a client is configured for it. Asking
+/// for the grant (`--client-id`, `--device-code`) keeps it for a provider
+/// that has one, which then says what it lacks.
+fn providerTakesPastedKey(allocator: std.mem.Allocator, name: []const u8, client_id: ?[]const u8, method: oauth_login.Method) bool {
     const host = buildProviderHost(allocator) orelse return false;
     defer host.destroy();
     const profile = host.registry.find(name) orelse return false;
     if (profile.api_key_setup == null) return false;
     provider_login.requireOAuthCapable(profile) catch return true;
+    if (client_id != null or method != .loopback) return false;
+    _ = provider_login.prepareProfileWith(profile, .{ .state_root = "" }, host.oauthClientIdFor(profile.id)) catch return true;
     return false;
 }
 

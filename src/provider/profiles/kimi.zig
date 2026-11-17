@@ -154,6 +154,37 @@ const ENV_ALIASES = [_]profile.EnvAlias{
     .{ .name = "MOONSHOT_API_KEY", .kind = .api_key, .canonical = true },
 };
 
+/// Where an open-platform key is created, one page per platform (opened
+/// 2026-11-17: `platform.moonshot.cn/console/api-keys` and
+/// `platform.moonshot.ai/console/api-keys` now lead to these; the global one
+/// answered this machine with a Cloudflare block). Each page checks against
+/// its own platform's model listing: 401 without a valid key
+/// (`invalid_authentication_error`, 2026-11-17), and not a model call.
+const KEY_PAGES = [_]profile.KeyPage{
+    .{
+        .id = Slug.lit("cn"),
+        .label = "China · Kimi API Platform",
+        .url = "https://platform.kimi.com/console/api-keys",
+        .check_url = CN_OPENAI_BASE ++ "/models",
+        .region = "cn",
+    },
+    .{
+        .id = Slug.lit("global"),
+        .label = "Global · Kimi API Platform",
+        .url = "https://platform.kimi.ai/console/api-keys",
+        .check_url = GLOBAL_OPENAI_BASE ++ "/models",
+        .region = "global",
+    },
+};
+
+/// The note mirrors Kimi Code's: the two accounts' keys look alike and
+/// neither works on the other's endpoint.
+const KEY_SETUP = profile.ApiKeySetup{
+    .kind = .api_key,
+    .pages = &KEY_PAGES,
+    .note = "Create the key on the Kimi API Platform. A Kimi Code membership key does not work here: it signs in with /login kimi-code.",
+};
+
 pub const PROFILE = profile.ProviderProfile{
     .id = Slug.lit("kimi"),
     .implementation_id = Slug.lit("kimi"),
@@ -165,7 +196,22 @@ pub const PROFILE = profile.ProviderProfile{
     .env_aliases = &ENV_ALIASES,
     .auth = .bearer,
     .default_channel = Slug.lit("cn-openai"),
+    .api_key_setup = KEY_SETUP,
 };
+
+test "kimi profile: each platform's key page checks against that platform's model listing" {
+    try profile.validateProfile(PROFILE);
+    const default = PROFILE.defaultKeyPage(PROFILE.default_channel).?;
+    try std.testing.expectEqualStrings("https://platform.kimi.com/console/api-keys", default.url);
+    try std.testing.expectEqualStrings("https://api.moonshot.cn/v1/models", default.check_url.?);
+    const global = PROFILE.defaultKeyPage(Slug.lit("global-openai")).?;
+    try std.testing.expectEqualStrings("https://api.moonshot.ai/v1/models", global.check_url.?);
+    // A key stored here is the open platform's, never Kimi Code's kind.
+    try std.testing.expectEqual(profile.CredentialKind.api_key, PROFILE.api_key_setup.?.kind);
+    for (CHANNELS) |channel| {
+        try std.testing.expectEqualStrings(channel.region.?, PROFILE.defaultKeyPage(channel.id).?.region.?);
+    }
+}
 
 test "kimi profile: four channels, every route declares the Kimi dialect" {
     try profile.validateProfile(PROFILE);
