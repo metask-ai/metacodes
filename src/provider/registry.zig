@@ -381,7 +381,7 @@ pub const OfferCatalog = struct {
                                 .upstream_model_id = entry.upstream_model_id,
                                 .protocol = route.protocol.id(),
                                 .wire = route.protocol.wire(),
-                                .dialect = .{ .route = route.dialect, .model = entry.dialect },
+                                .dialect = .{ .route = route.dialect, .model = entry.dialect, .request_profile = route.request_profile },
                                 .endpoint_ref = endpoint,
                                 .credential_ref = bound_credential,
                                 .display_name = entry.display_name,

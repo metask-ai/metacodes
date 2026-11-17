@@ -520,6 +520,17 @@ A profile that declares neither an authorization nor a device endpoint has no
 interactive flow, and says so at the entry point instead of failing later at a
 null URL.
 
+What a profile can say about its browser sign-in, beyond the endpoints and the
+client: the redirect host (`oauth_redirect_host`, `localhost` unless the
+client registered `127.0.0.1`; the listener is on the IPv4 loopback either
+way), the only ports the redirect may use (`oauth_callback_ports`, tried in
+order, all taken an error that names them; empty keeps 1456, then 1457, then
+any), parameters after the standard ones (`oauth_authorize_params`), where
+signing out revokes the refresh token (`oauth_revocation`, JSON or form), and
+how far the vendor stands behind the sign-in (`oauth_support`). A refusal that
+comes back with the right state ends the wait and says what the server said;
+one with another state is a stale tab and is answered and ignored.
+
 ### Stored API keys and the guided key login
 
 Some providers have a plan whose keys are created on a web page and offer no
@@ -970,6 +981,8 @@ on a second line of its confirmation, who bills the session from then on.
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
 | `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
 | `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
+| `src/provider/request_profile.zig` | `RequestProfile`, what one endpoint requires of every request on a route |
+| `src/provider/chatgpt_claims.zig` | the ChatGPT workspace inside OpenAI's OAuth tokens |
 | `src/api/dialects/<vendor>.zig` | one vendor's dialect; its header is the integration document |
 | `src/api/dialects/registry.zig` | vendor → dialect file, name inference, the header contract test |
 | `src/api/bedrock_client.zig` | Bedrock Converse transport |

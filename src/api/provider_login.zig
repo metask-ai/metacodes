@@ -36,6 +36,10 @@ pub const Options = struct {
     /// profile declares none; the refresh grant then presents it too.
     client_id: ?[]const u8 = null,
     port: u16 = oauth_login.DEFAULT_CALLBACK_PORT,
+    /// Replaces the ports the profile registered for its redirect
+    /// (`ProviderProfile.oauth_callback_ports`). For a test, which must not
+    /// take a port a real sign-in on the same machine may be waiting on.
+    callback_ports: []const u16 = &.{},
     timeout_seconds: u32 = 300,
     /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
     abort_signal: ?*const AbortSignal = null,
@@ -132,6 +136,12 @@ pub const Prepared = struct {
         diagnostic: ?*ImportDiagnostic,
     ) !Outcome {
         const provider_id = self.profile.id;
+        // Said before anything opens, so it is read before the browser takes
+        // the screen (plan §3.1).
+        if (self.profile.oauth_support == .unofficial) {
+            var line: [256]u8 = undefined;
+            notify.say(std.fmt.bufPrint(&line, "{s}: {s}\n", .{ self.profile.display_name, provider_profile.UNOFFICIAL_SIGN_IN_NOTICE }) catch provider_profile.UNOFFICIAL_SIGN_IN_NOTICE ++ "\n");
+        }
         const token_json = try oauth_login.acquireFirstToken(allocator, io, .{
             // Checked by `prepare`; unwrapped here so the flow gets a plain URL.
             .token_url = self.profile.oauth_token_url.?,
@@ -139,10 +149,15 @@ pub const Prepared = struct {
             .device_authorization_url = self.profile.oauth_device_authorization_url,
             .client_id = self.client_id,
             .scope = self.profile.oauth_scope,
+            .redirect_host = self.profile.oauth_redirect_host,
+            .authorize_params = self.profile.oauth_authorize_params,
         }, .{
             .method = self.options.method,
             .open_browser = self.options.open_browser,
             .port = self.options.port,
+            // A client that registered its redirect ports takes no other;
+            // `options.callback_ports` (a test's free ports) stands in for them.
+            .callback_ports = if (self.options.callback_ports.len > 0) self.options.callback_ports else self.profile.oauth_callback_ports,
             .timeout_seconds = self.options.timeout_seconds,
             .abort_signal = self.options.abort_signal,
             .notify = notify,
