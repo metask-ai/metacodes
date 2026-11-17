@@ -9,6 +9,7 @@ const manifest = @import("build.zig.zon");
 // github.com/shuzuan-org/highlight-zig),纯 Zig 模块方式消费其源(每个 root 各按自身
 // optimize 编译;未用的 import 零成本)。tree-sitter 已于 2026-07-13 整体移除。
 var g_hl_mod: ?*std.Build.Module = null;
+var g_code_mod: ?*std.Build.Module = null;
 var g_formal_kernel_sha256: ?[]const u8 = null;
 var g_project_kernel_sha256: ?[]const u8 = null;
 fn addHl(b: *std.Build, mod: *std.Build.Module) void {
@@ -27,6 +28,17 @@ fn addHlWithProjectHarnessActuation(
         g_hl_mod = b.createModule(.{ .root_source_file = b.path("lib/highlight-zig/src/lib.zig") });
     }
     mod.addImport("hl", g_hl_mod.?);
+    if (g_code_mod == null) {
+        const code = b.createModule(.{ .root_source_file = b.path("src/code/runtime.zig"), .link_libc = true });
+        code.addIncludePath(b.path("vendor/quickjs"));
+        code.addIncludePath(b.path("src/code"));
+        code.addCSourceFiles(.{
+            .files = &.{ "vendor/quickjs/quickjs.c", "vendor/quickjs/cutils.c", "vendor/quickjs/dtoa.c", "vendor/quickjs/libregexp.c", "vendor/quickjs/libunicode.c", "src/code/bridge.c" },
+            .flags = &.{ "-std=gnu11", "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"2025-09-13\"", "-DMETACODES_NO_ATOMICS", "-fwrapv" },
+        });
+        g_code_mod = code;
+    }
+    mod.addImport("code_runtime", g_code_mod.?);
     addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
     const project_harness_options = b.addOptions();
     project_harness_options.addOption(bool, "evaluation_shadow", evaluation_shadow);
@@ -1829,6 +1841,12 @@ pub fn build(b: *std.Build) void {
     else
         b.addFail("AgentCore bundle requires explicit -Dtarget=<triple>");
     const manifest_cmd = b.addRunArtifact(agentcore_manifest_tool);
+    const install_agentcore_quickjs_license = b.addInstallFileWithDir(
+        b.path("vendor/quickjs/LICENSE"),
+        .prefix,
+        b.fmt("{s}/licenses/quickjs-LICENSE", .{agentcore_bundle_rel}),
+    );
+    manifest_cmd.step.dependOn(&install_agentcore_quickjs_license.step);
     manifest_cmd.addArgs(&.{
         agentcore_install_root,
         resolved_agentcore_target,

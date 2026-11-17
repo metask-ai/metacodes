@@ -50,6 +50,7 @@ pub const CODING_TOOLS = [_][]const u8{
     "Bash",
     "BashOutput",
     "KillShell",
+    "ExecuteCode",
     "WebSearch",
     "WebFetch",
 };
@@ -69,6 +70,7 @@ pub const OFFLINE_CODING_TOOLS = [_][]const u8{
     "Bash",
     "BashOutput",
     "KillShell",
+    "ExecuteCode",
 };
 
 pub const INTERACTION_TOOLS = [_][]const u8{"AskUserQuestion"};

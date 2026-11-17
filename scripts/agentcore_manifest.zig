@@ -163,6 +163,7 @@ pub fn main(init: std.process.Init) !void {
         shared_rel,
         ripgrep_rel,
         "bin/ripgrep-LICENSE-MIT",
+        "licenses/quickjs-LICENSE",
         "include/metask/agentcore.h",
         "bindings/zig/build.zig",
         "bindings/zig/build.zig.zon",

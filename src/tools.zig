@@ -690,6 +690,15 @@ pub const registry: []const ToolEntry = &.{
         .execute = .{ .legacy_inline = swarm_tools.executeSpawnTeammate },
         .swarm_gated = true,
     },
+    .{
+        .name = "ExecuteCode",
+        .description = "Execute JavaScript in a persistent per-session context. Use top-level await tools.ToolName(args) to call tools from the current tools list, e.g. var data = await tools.Read({file_path:'/absolute/path'}); data. Tools retain all permission, hook, sandbox and budget checks. Calls return Promises; await every call. JSON tool results become JS values; text stays a string; tool errors reject with Error.result. Global var/let/const declarations persist across successful calls. The last expression and console.log output are returned; intermediate values stay in the VM. No filesystem, process, network, imports, timers or TypeScript runtime. Up to 128 calls, 64 MiB heap and 64 KiB output. Calls are dispatched sequentially, including Promise.all. Use AskUserQuestion outside scripts. Failed evaluations reset the VM before its next use; tool side effects are retained. timeout_ms bounds JS and time between tools; running tools retain their own timeout/cancellation.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "code", .type = "string", .description = "JavaScript source; top-level await and the last expression are supported. Maximum 256 KiB." },
+            .{ .name = "timeout_ms", .type = "integer", .description = "JavaScript deadline in milliseconds, 1-120000; default 30000. Checked between host calls as well." },
+        }, .required = &.{"code"}, .additional_properties = false },
+        .execute = .{ .legacy_inline = @import("tools/execute_code.zig").execute },
+    },
 };
 
 comptime {

@@ -51,6 +51,13 @@ pub const PendingRequest = struct {
     payload_json: []const u8,
 };
 
+/// Kernel-owned capability installed only for the AgentLoop's serial code tool.
+/// The VM never receives a dispatcher or permission pointer.
+pub const CodeExecutor = struct {
+    ctx: *anyopaque,
+    executeFn: *const fn (*anyopaque, *const ToolContext, []const u8, u32) anyerror![]u8,
+};
+
 // ── 工具回调接口(仿 agent_loop.UsageSink:把裸 *anyopaque+*fn 对收成类型安全的接口值)──
 // 放中立 context 层:agent_loop.Options 和 ToolContext 都引用,零循环依赖
 // (agent_loop → tools.zig → context.zig,context 不反向 import agent_loop)。
@@ -487,6 +494,7 @@ pub const ToolContext = struct {
     /// dispatch authority; tools not selected into it remain unexecutable even
     /// though they exist in the process-wide built-in registry.
     tool_dispatcher: ?ToolDispatcher = null,
+    code_executor: ?CodeExecutor = null,
     /// Optional execution-context upper bound (for example a nested Skill
     /// PolicyFrame). It is checked independently of Session dispatch and
     /// permission so no child context can re-authorize a parent denial.

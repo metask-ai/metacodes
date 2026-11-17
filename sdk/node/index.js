@@ -8,6 +8,7 @@ const path = require('node:path');
 
 const ABI_REVISION = 26;
 const BUILTIN_TOOLS = [
+  'ExecuteCode',
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell',
   'WebSearch', 'WebFetch', 'AskUserQuestion',
 ];

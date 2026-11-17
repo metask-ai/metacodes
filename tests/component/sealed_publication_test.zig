@@ -30,18 +30,26 @@ const FINAL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
-/// One assistant message carrying the named tool calls, all with `{}` input.
+/// One assistant message carrying the named tool calls.
 fn toolCallsSse(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
     try w.writeAll("data: {\"type\":\"message_start\",\"message\":{\"id\":\"tool\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n");
     for (names, 0..) |name, index| {
+        const input = if (std.mem.eql(u8, name, "ExecuteCode"))
+            "{\"code\":\"await tools.SealedTool({}); 1\"}"
+        else if (std.mem.eql(u8, name, "Bash"))
+            BASH_ARGS
+        else
+            "{}";
+        const encoded = try std.json.Stringify.valueAlloc(allocator, input, .{});
+        defer allocator.free(encoded);
         try w.print(
             "data: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu-{d}\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n" ++
-                "data: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{}}\"}}}}\n\n" ++
+                "data: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}}}\n\n" ++
                 "data: {{\"type\":\"content_block_stop\",\"index\":{d}}}\n\n",
-            .{ index, index, name, index, index },
+            .{ index, index, name, index, encoded, index },
         );
     }
     try w.writeAll("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n");
@@ -52,12 +60,13 @@ fn toolCallsSse(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
 /// `SealedTool` finishes a capture the way native tools do (sealed above the
 /// budget); `FatalTool` is a Host tool that returns fatal.
 const Dispatcher = struct {
-    fn dispatch(_: *const anyopaque, ctx: *const cc.tool_context.ToolContext, name: []const u8, _: []const u8) anyerror!cc.tool_context.ToolDispatchOutcome {
+    fn dispatch(_: *const anyopaque, ctx: *const cc.tool_context.ToolContext, name: []const u8, args: []const u8) anyerror!cc.tool_context.ToolDispatchOutcome {
         if (std.mem.eql(u8, name, "FatalTool")) return .host_fatal;
+        if (std.mem.eql(u8, name, "ExecuteCode")) return .{ .ok = cc.tools.ToolResultBody.initInline(try cc.tools.executeTool(cc.tools.getTool(name).?, ctx, args)) };
         // The real Bash tool (#73): its inline JSON carries the spilled stdout
         // as a sealed attachment. The cassette's `{}` input is ignored; the
         // command is fixed here so the test owns the bytes.
-        if (std.mem.eql(u8, name, "BashTool")) return .{ .ok = try cc.bash.executeBody(ctx, BASH_ARGS) };
+        if (std.mem.eql(u8, name, "BashTool") or std.mem.eql(u8, name, "Bash")) return .{ .ok = try cc.bash.executeBody(ctx, BASH_ARGS) };
         if (!std.mem.eql(u8, name, "SealedTool")) return .{ .host_rejected = null };
         var capture = try cc.tool_result_artifact.Capture.begin(ctx.allocator, ctx.artifact_root, cc.tool_result_artifact.MAX_ARTIFACT_BYTES);
         defer capture.deinit();
@@ -77,6 +86,8 @@ const Dispatcher = struct {
             0 => "SealedTool",
             1 => "FatalTool",
             2 => "BashTool",
+            3 => "ExecuteCode",
+            4 => "Bash",
             else => null,
         };
     }
@@ -170,6 +181,8 @@ fn runLoop(allocator: std.mem.Allocator, fixture: *const Fixture, url: []const u
         .{ .name = "SealedTool", .description = "returns a large native result", .input_schema = .{} },
         .{ .name = "FatalTool", .description = "a host tool that fails fatally", .input_schema = .{} },
         .{ .name = "BashTool", .description = "the Bash tool with a fixed large-output command", .input_schema = .{} },
+        .{ .name = "ExecuteCode", .description = "the real JavaScript bridge", .input_schema = .{} },
+        .{ .name = "Bash", .description = "large-output Bash observed by verification", .input_schema = .{} },
     };
     var dispatcher = Dispatcher{};
     const backend = cc.ui_backend.UiBackend{ .ctx = @ptrCast(&run.sink_state), .emit = Sink.emit, .poll = Sink.poll };
@@ -185,6 +198,7 @@ fn runLoop(allocator: std.mem.Allocator, fixture: *const Fixture, url: []const u
             .tool_result_metrics = &run.metrics,
             .emit_tool_cards = false,
             .colorize = false,
+            .verification_final_observe = true,
         },
         &backend,
         allocator,
@@ -314,6 +328,46 @@ test "L2 sealed publication: a publication that fails at commit degrades like th
 }
 
 // ── #73: the Bash tool's spilled channel is an attachment of its inline body ──
+
+test "ExecuteCode L2 sealed publication refreshes sibling results before verification" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try Fixture.init(allocator);
+    defer fixture.deinit(allocator);
+    try fillSessionArtifactQuota(allocator, fixture.root());
+    const before = try countEntries(allocator, fixture.cas_dir);
+    // The inner call creates the combined evidence view; the outer Bash result
+    // is then replaced at commit when its attachment cannot be published.
+    const calls = try toolCallsSse(allocator, &.{ "ExecuteCode", "Bash" });
+    defer allocator.free(calls);
+    const bodies = [_][]const u8{ calls, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+    var run: Run = undefined;
+    run.metrics = .{};
+    run.sink_state = 0;
+    const result = try runLoop(allocator, &fixture, url, &run);
+    defer run.deinit();
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 3), result.tool_calls);
+    try std.testing.expectEqual(before, try countEntries(allocator, fixture.cas_dir));
+    try std.testing.expectEqual(@as(usize, 0), try countEntries(allocator, fixture.spool_dir));
+    const follow_up = (server.requestAt(1) orelse return error.MissingFollowUpRequest).body();
+    var parsed = try lastUserContent(allocator, follow_up);
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    const blocks = messages[messages.len - 1].object.get("content").?.array.items;
+    var seen: usize = 0;
+    for (blocks) |block| {
+        if (!std.mem.eql(u8, block.object.get("type").?.string, "tool_result")) continue;
+        seen += 1;
+        if (!std.mem.eql(u8, block.object.get("tool_use_id").?.string, "tu-1")) continue;
+        try std.testing.expect(std.mem.indexOf(u8, block.object.get("content").?.string, "\"stdout_recoverable\":false") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+}
 
 fn bashStdoutArtifactId(allocator: std.mem.Allocator, follow_up: []const u8) !?[]u8 {
     var parsed = try lastUserContent(allocator, follow_up);

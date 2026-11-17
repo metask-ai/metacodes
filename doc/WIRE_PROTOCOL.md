@@ -18,6 +18,12 @@ In-process frontends (the TUI, headless runs, the AgentCore C ABI's
 directly. They never serialize, never declare capabilities, and behave as
 before this exchange existed.
 
+`ExecuteCode` is an ordinary model tool on this wire. Its inner tool invocations
+emit ordinary tool lifecycle, policy and file-change evidence, but do not create
+additional provider tool-use/result messages. Runtime state is ephemeral and
+never part of a transcript or wire checkpoint. See the normative
+[JavaScript execution contract](PROGRAMMATIC_TOOL_CALLING.md).
+
 ## 1. Lines
 
 Every line is one JSON object with the schema version `v` (currently `1`) and

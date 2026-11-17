@@ -313,7 +313,7 @@ class Runtime:
 
     ``tools`` names the built-in tools (``Read``, ``Write``, ``Edit``,
     ``Glob``, ``Grep``, ``Bash``, ``BashOutput``, ``KillShell``,
-    ``WebSearch``, ``WebFetch``, ``AskUserQuestion``); ``host_tools`` adds
+    ``WebSearch``, ``WebFetch``, ``AskUserQuestion``, ``ExecuteCode``); ``host_tools`` adds
     :class:`Tool` objects implemented in Python.
     """
 

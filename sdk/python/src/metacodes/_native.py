@@ -85,6 +85,7 @@ HOST_FAILED = 1
 MAX_TURNS = 1000
 
 BUILTIN_TOOLS = (
+    "ExecuteCode",
     "Read",
     "Write",
     "Edit",

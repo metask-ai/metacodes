@@ -24,6 +24,18 @@ Beyond the endpoints and access rules of
 general HTTP service API promise yet. The Web and daemon hosts are product
 surfaces built over the same core protocols.
 
+## JavaScript tool orchestration
+
+`ExecuteCode({code, timeout_ms?})` runs JavaScript in a per-session QuickJS
+context. `await tools.Read(args)` and the equivalent interfaces for selected
+built-in, Host and process tools enter the kernel's ordinary tool admission
+and execution pipeline. Meta Code and its tools remain implemented in Zig.
+The result contains the last expression, explicit logs and the inner call count;
+intermediate tool results stay outside provider messages. Coding and offline
+coding profiles include this tool; SDK Hosts may select `ExecuteCode` explicitly.
+No C ABI layout changes are involved. The normative behavior, limits and reset
+rules are in [PROGRAMMATIC_TOOL_CALLING.md](PROGRAMMATIC_TOOL_CALLING.md).
+
 ## Provider selection surface
 
 ### Metask device OAuth and gateway

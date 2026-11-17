@@ -99,6 +99,7 @@ pub const Error = error{
 
 pub const fixed_artifact_files = [_][]const u8{
     "bin/ripgrep-LICENSE-MIT",
+    "licenses/quickjs-LICENSE",
     "include/metask/agentcore.h",
     "bindings/zig/build.zig",
     "bindings/zig/build.zig.zon",
