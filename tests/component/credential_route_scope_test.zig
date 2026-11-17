@@ -18,6 +18,10 @@
 //!     the process's OAuth session on the new provider, and the next turn's
 //!     token refresh installed that provider's token on the route the
 //!     clients were still on.
+//!   * The turn's token refresh followed the kernel's effective selection,
+//!     not the route the clients were bound to, so after a pick in the
+//!     global or once scope it put the previous route's OAuth token on the
+//!     new one, and replaced a key or a pool account a route was bound with.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -484,4 +488,270 @@ test "L2 credential scope: a switch that cannot bind leaves the kernel and the O
     if (before) |id| try std.testing.expect(id.eql(after.?));
     try std.testing.expect(app.oauth_session_provider == null);
     try std.testing.expect(app.oauth_session == null);
+}
+
+// ── the turn's token refresh ─────────────────────────────────────────────────
+
+/// The state root of a session on the Metask device sign-in: a relay on the
+/// Messages wire and an OAuth-only provider.
+fn deviceSessionConfig(setup: std.mem.Allocator, relay_origin: []const u8) ![]u8 {
+    return std.fmt.allocPrint(setup, "{{\"custom_providers\": {{{s}, {s}}}}}", .{
+        try relayDefinition(setup, "relay", "RELAY_TOKEN", relay_origin, "relay-model"),
+        try oauthDefinition(setup, UNREACHABLE_ORIGIN, UNREACHABLE_ORIGIN ++ "/token"),
+    });
+}
+
+/// An App on the Metask device sign-in's route at `metask_origin`, in a case
+/// initialised with `deviceSessionConfig`. Both providers have a live login.
+fn deviceSessionApp(case: *Case, metask_origin: []const u8, io: std.Io) !*App {
+    try case.setEnv("RELAY_TOKEN", RELAY_KEY);
+    const now = cc.util_time.nowUnix();
+    try case.storeOAuthLogin("metask", .{
+        .access_token = METASK_ACCESS,
+        .refresh_token = "fake-metask-refresh",
+        .expires_in_seconds = 3600,
+        .gateway_url = metask_origin,
+    }, now);
+    try case.storeOAuthLogin("house-oauth", .{
+        .access_token = OAUTH_ACCESS_1,
+        .refresh_token = "fake-oauth-refresh-1",
+        .expires_in_seconds = 3600,
+    }, now);
+
+    const allocator = case.arena.allocator();
+    const argv = [_][*:0]const u8{ "metacodes", "--provider", "metask" };
+    var config = try case.config(&argv);
+    // What `main` records for a device sign-in: the gateway's Messages
+    // endpoint, the session's access token as the key.
+    config.metask_oauth_selected = true;
+    config.resolved_provider_id = "metask";
+    config.base_url = try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{metask_origin});
+    config.model = "glm-5.3-flash";
+    config.model_explicit = true;
+    return App.init(std.testing.allocator, io, config, METASK_ACCESS);
+}
+
+/// Commit `provider`'s offer for `model` on the Messages wire (bound to the
+/// account `credential`, or to none) in `scope`, as the picker does after Tab
+/// set the scope.
+fn commitIn(app: *App, provider: []const u8, model: []const u8, credential: ?[]const u8, scope: cc.provider_selection.Scope) !void {
+    const rendered = try offerIdText(app, provider, model, credential);
+    const host = try app.providerHost();
+    const offer = host.kernel.catalogSnapshot().find(try cc.provider_ids.OfferId.parse(&rendered)) orelse return error.OfferMissing;
+    const outcome = try app.commitModelSelection(.{
+        .offer_id = offer.offer_id,
+        .offer_revision = offer.offer_revision,
+        .controls = .{},
+        .scope = scope,
+    });
+    if (outcome != .committed) return error.CommitRefused;
+}
+
+test "L2 credential scope: a pick for every future session takes the turn's token refresh along" {
+    var metask = try harness.MockServer.startCassette(&.{GATEWAY_MODELS}, 0);
+    defer metask.stop();
+    var relay = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer relay.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(setup.allocator(), .{});
+    defer io_runtime.deinit();
+    var case: Case = undefined;
+    try case.init(try deviceSessionConfig(setup.allocator(), try originOf(setup.allocator(), relay)));
+    defer case.deinit();
+    const app = try deviceSessionApp(&case, try originOf(setup.allocator(), metask), io_runtime.io());
+    defer app.deinit();
+
+    // This session's pick: a Metask model, on the device sign-in.
+    try commitIn(app, "metask", "glm-5.3-flash", null, .session);
+    // Then the relay with Tab on "every future session". The clients move to
+    // it; the kernel's session scope still holds the Metask pick, and a
+    // narrower scope wins.
+    try commitIn(app, "relay", "relay-model", null, .global);
+    // The next turn: its token refresh, then the request.
+    const replaced = try app.refreshRouteCredential();
+    try sendOneTurn(app);
+
+    try expectNeverSent(relay, METASK_ACCESS);
+    try std.testing.expect(!replaced);
+    try std.testing.expect(sentBearer(relay, relay.requestCount() - 1, RELAY_KEY));
+}
+
+test "L2 credential scope: a pick for one turn does not follow the session to its next route" {
+    var relay = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer relay.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const config_json = try std.fmt.allocPrint(setup.allocator(), "{{\"custom_providers\": {{{s}, {s}}}}}", .{
+        try relayDefinition(setup.allocator(), "relay", "RELAY_TOKEN", try originOf(setup.allocator(), relay), "relay-model"),
+        try oauthDefinition(setup.allocator(), UNREACHABLE_ORIGIN, UNREACHABLE_ORIGIN ++ "/token"),
+    });
+    var case: Case = undefined;
+    try case.init(config_json);
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+    try case.setEnv("METACODES_NO_PROBE", "1");
+    try case.setEnv("RELAY_TOKEN", RELAY_KEY);
+    // A live login: binding it needs no request.
+    try case.storeOAuthLogin("house-oauth", .{
+        .access_token = OAUTH_ACCESS_1,
+        .refresh_token = "fake-oauth-refresh-1",
+        .expires_in_seconds = 3600,
+    }, cc.util_time.nowUnix());
+
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", UNREACHABLE_ORIGIN ++ "/v1/messages", "--model", "claude-sonnet-4-6" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+
+    // The OAuth provider for "the next turn only", then the relay for the
+    // session. Nothing expires the first, and it outranks the second.
+    try commitIn(app, "house-oauth", "oauth-model", null, .once);
+    try commitIn(app, "relay", "relay-model", null, .session);
+    const replaced = try app.refreshRouteCredential();
+    try sendOneTurn(app);
+
+    try expectNeverSent(relay, OAUTH_ACCESS_1);
+    try std.testing.expect(!replaced);
+    try std.testing.expect(sentBearer(relay, relay.requestCount() - 1, RELAY_KEY));
+}
+
+test "L2 credential scope: the turn's token refresh keeps the account the route was bound to" {
+    var house = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer house.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    // A provider that takes an API key or an OAuth sign-in, with a pool
+    // account and a live login.
+    const config_json = try std.fmt.allocPrint(setup.allocator(),
+        \\{{"custom_providers": {{"house-oauth": {{"display_name": "House OAuth", "credential_kinds": ["api_key", "openai_oauth"],
+        \\  "oauth": {{"token_url": "{s}/token", "client_id": "metacodes-test"}},
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/oauth", "protocol": "anthropic_messages"}}],
+        \\  "models": [{{"request_model_id": "oauth-model", "display_name": "OAuth model"}}]}}}},
+        \\ "providers": {{"house-oauth": {{"credentials": [{{"id": "work", "env": "HOUSE_KEY_WORK", "kind": "api_key"}}]}}}}}}
+    , .{ UNREACHABLE_ORIGIN, try originOf(setup.allocator(), house) });
+    var case: Case = undefined;
+    try case.init(config_json);
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+    try case.setEnv("METACODES_NO_PROBE", "1");
+    try case.setEnv("HOUSE_KEY_WORK", POOL_WORK_KEY);
+    try case.storeOAuthLogin("house-oauth", .{
+        .access_token = OAUTH_ACCESS_1,
+        .refresh_token = "fake-oauth-refresh-1",
+        .expires_in_seconds = 3600,
+    }, cc.util_time.nowUnix());
+
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", UNREACHABLE_ORIGIN ++ "/v1/messages", "--model", "claude-sonnet-4-6" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+
+    // The route names the `work` account: the bind uses its key.
+    try commitIn(app, "house-oauth", "oauth-model", "work", .session);
+    const replaced = try app.refreshRouteCredential();
+    try sendOneTurn(app);
+
+    try expectNeverSent(house, OAUTH_ACCESS_1);
+    try std.testing.expect(!replaced);
+    try std.testing.expect(sentBearer(house, house.requestCount() - 1, POOL_WORK_KEY));
+}
+
+test "L2 credential scope: a start on a provider's own sign-in renews it at the turn boundary" {
+    var house = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer house.stop();
+    const token_json = "{\"access_token\":\"" ++ OAUTH_ACCESS_2 ++ "\",\"refresh_token\":\"fake-oauth-refresh-2\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
+    var token = try harness.MockServer.startCassette(&.{token_json}, 0);
+    defer token.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const house_origin = try originOf(setup.allocator(), house);
+    const token_url = try std.fmt.allocPrint(setup.allocator(), "{s}/token", .{try originOf(setup.allocator(), token)});
+    const config_json = try std.fmt.allocPrint(setup.allocator(), "{{\"custom_providers\": {{{s}}}}}", .{try oauthDefinition(setup.allocator(), house_origin, token_url)});
+    var case: Case = undefined;
+    try case.init(config_json);
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+    try case.setEnv("METACODES_NO_PROBE", "1");
+    // The sign-in startup bound has expired by this turn.
+    try case.storeOAuthLogin("house-oauth", .{
+        .access_token = OAUTH_ACCESS_1,
+        .refresh_token = "fake-oauth-refresh-1",
+        .expires_in_seconds = 10,
+    }, cc.util_time.nowUnix() - 3600);
+
+    const argv = [_][*:0]const u8{ "metacodes", "--provider", "house-oauth" };
+    var config = try case.config(&argv);
+    // What a start that binds the provider's own sign-in records: its route,
+    // the sign-in's access token as the key, `.sign_in` as where it came from.
+    config.resolved_provider_id = "house-oauth";
+    config.provider_kind = .anthropic;
+    config.base_url = try std.fmt.allocPrint(allocator, "{s}/oauth/v1/messages", .{house_origin});
+    config.model = "oauth-model";
+    config.model_explicit = true;
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.initWithOptions(std.testing.allocator, io_runtime.io(), config, OAUTH_ACCESS_1, .{ .route_state = .{ .bound = .sign_in } });
+    defer app.deinit();
+    _ = try app.providerHost();
+
+    // No pick yet: the route is the one the session started on, bound with
+    // that provider's own token, which the turn boundary renews.
+    const replaced = try app.refreshRouteCredential();
+    try sendOneTurn(app);
+
+    try std.testing.expect(replaced);
+    try std.testing.expectEqual(@as(usize, 1), token.requestCount());
+    try std.testing.expect(sentBearer(house, house.requestCount() - 1, OAUTH_ACCESS_2));
+}
+
+const OAUTH_ACCESS_3 = "fake-oauth-access-0012";
+
+test "L2 credential scope: a pick bound with a provider's sign-in renews it at the turn boundary" {
+    var house = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer house.stop();
+    // The pick's refresh answers with a token inside the refresh margin, so
+    // the next turn boundary renews it again.
+    const short_lived = "{\"access_token\":\"" ++ OAUTH_ACCESS_2 ++ "\",\"refresh_token\":\"fake-oauth-refresh-2\",\"token_type\":\"Bearer\",\"expires_in\":60}";
+    const renewed = "{\"access_token\":\"" ++ OAUTH_ACCESS_3 ++ "\",\"refresh_token\":\"fake-oauth-refresh-3\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
+    var token = try harness.MockServer.startCassette(&.{ short_lived, renewed }, 0);
+    defer token.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const token_url = try std.fmt.allocPrint(setup.allocator(), "{s}/token", .{try originOf(setup.allocator(), token)});
+    const config_json = try std.fmt.allocPrint(setup.allocator(), "{{\"custom_providers\": {{{s}}}}}", .{try oauthDefinition(setup.allocator(), try originOf(setup.allocator(), house), token_url)});
+    var case: Case = undefined;
+    try case.init(config_json);
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+    try case.setEnv("METACODES_NO_PROBE", "1");
+    try case.storeOAuthLogin("house-oauth", .{
+        .access_token = OAUTH_ACCESS_1,
+        .refresh_token = "fake-oauth-refresh-1",
+        .expires_in_seconds = 10,
+    }, cc.util_time.nowUnix() - 3600);
+
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", UNREACHABLE_ORIGIN ++ "/v1/messages", "--model", "claude-sonnet-4-6" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+
+    try commitIn(app, "house-oauth", "oauth-model", null, .session);
+    const replaced = try app.refreshRouteCredential();
+    try sendOneTurn(app);
+
+    try std.testing.expect(replaced);
+    try std.testing.expectEqual(@as(usize, 2), token.requestCount());
+    try std.testing.expect(sentBearer(house, house.requestCount() - 1, OAUTH_ACCESS_3));
 }

@@ -528,6 +528,17 @@ status, compatibility boundaries, and entry points are defined by
   (journalled as a failed switch, `binding_failed`) and the previous OAuth
   session; a resumed session's stored route is restored the same way.
 
+- **The turn's token refresh renews only the credential the session's route
+  was bound with.** It refreshed the provider of the kernel's effective
+  selection and put that token in the clients, whatever route they were on.
+  After a `/model` pick in the global or once scope (Tab), a narrower scope
+  still named the previous route, so a Metask device session that picked a
+  relay that way sent the Metask token to the relay every turn; a route
+  bound to a pool account or to a key had it replaced by the provider's
+  OAuth token. The refresh now follows the route the clients were last bound
+  to (before any pick, the one the session started on) and replaces only an
+  OAuth token that route was bound with.
+
 ### Security
 
 - **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**

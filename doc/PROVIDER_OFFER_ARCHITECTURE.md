@@ -470,7 +470,12 @@ the token that was valid then; a session that runs past its expiry would keep
 presenting it and start failing with 401s that look like a broken key. Single
 flight means concurrent turns still perform one exchange, and every borrower —
 clients, subagent registry, swarm context — is repointed before the old bytes
-are released, because a background request thread reads them.
+are released, because a background request thread reads them. It renews the
+credential of the route the clients are bound to (the last commit's, or the
+one the session started on), and only when that route was bound with its
+OAuth token: the kernel's effective selection can name another route (a
+global or once pick under a session one), and a key or a pool account a route
+was bound with stays.
 
 The module performs no I/O. The token exchange is a caller-supplied function, so
 every lifecycle test drives a fake exchange and none needs a network;

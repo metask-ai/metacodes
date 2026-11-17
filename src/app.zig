@@ -386,6 +386,14 @@ pub const MetaskKeyRoute = struct {
 };
 
 pub const App = struct {
+    /// Which provider's credential the live clients carry (`App.live_route`).
+    pub const LiveRoute = struct {
+        provider: provider_ids_mod.Slug,
+        /// The credential is that provider's OAuth access token: the one thing
+        /// the turn-boundary refresh may replace (`refreshRouteCredential`).
+        oauth: bool,
+    };
+
     allocator: std.mem.Allocator,
     config: types.Config,
     /// Owned `<$HOME>/.metacodes` when the host passed no `config.state_root`
@@ -458,6 +466,12 @@ pub const App = struct {
     /// within one call.
     oauth_session: ?provider_oauth_mod.Session = null,
     oauth_session_provider: ?provider_ids_mod.Slug = null,
+    /// The route the live clients were last bound to (`bindCommittedSelection`),
+    /// or null before the first bind, when it is the one the session started
+    /// on (`liveRoute`). The kernel's effective selection can name another: a
+    /// commit to the global or once scope binds the clients while a narrower
+    /// scope still holds the previous route.
+    live_route: ?LiveRoute = null,
     /// Last control-plane event projected into the TinyKG audit plane. Events
     /// are recorded once; a restart starts from the journal's current head
     /// rather than replaying a ring that may already have evicted.
@@ -3310,6 +3324,12 @@ pub const App = struct {
             client.auth_scheme = binding.auth_scheme;
             client.declared_dialect = binding.dialect;
         }
+        // What the turn-boundary refresh renews from now on: this provider's
+        // OAuth token when the binding chose it, nothing otherwise.
+        app.live_route = .{
+            .provider = binding.provider_id,
+            .oauth = if (oauth_token) |token| std.mem.eql(u8, binding.secret, token) else false,
+        };
         // Every out-of-process UI learns the *route*, not just the model name: a
         // visible model name can come from several providers, channels,
         // protocols, and accounts, so broadcasting only the name would announce
@@ -3928,6 +3948,26 @@ pub const App = struct {
         }
     }
 
+    /// The route the live clients carry a credential for: the last bind's, or
+    /// before any, the one the session started on. That is Metask on the
+    /// historical path, else the provider startup resolved (the owner rule of
+    /// `cliApiKey`), and its credential is an OAuth token on the Metask
+    /// device sign-in, or when startup bound the provider's own sign-in
+    /// (`route_state` says `.sign_in`); otherwise it is a key from the
+    /// provider's variables, `--api-key` or its stored key.
+    fn liveRoute(app: *const App) ?LiveRoute {
+        if (app.live_route) |route| return route;
+        const owner = if (app.config.provider_profile == null)
+            provider_ids_mod.Slug.lit("metask")
+        else
+            provider_ids_mod.Slug.parse(app.config.resolved_provider_id orelse return null) catch return null;
+        const signed_in = switch (app.route_state) {
+            .bound => |origin| origin == .sign_in,
+            .unbound => false,
+        };
+        return .{ .provider = owner, .oauth = app.config.metask_oauth_selected or signed_in };
+    }
+
     /// Refresh this session's OAuth access token if it is near expiry, and
     /// repoint every borrower at the new one.
     ///
@@ -3949,8 +3989,12 @@ pub const App = struct {
         // id and skips the work entirely.
         if (app.provider_host == null and app.config.selected_offer_id == null) return false;
         const host = try app.providerHost();
-        const selection = host.kernel.effectiveSelection() orelse return false;
-        const built = resolvedProfileFor(host, selection) orelse return false;
+        // The route the clients are bound to, not the kernel's effective
+        // selection, and only when that route's credential is its OAuth
+        // token: a key, or another account's credential, stays as bound.
+        const live = app.liveRoute() orelse return false;
+        if (!live.oauth) return false;
+        const built = host.registry.findById(live.provider) orelse return false;
         const token = (try app.oauthAccessToken(built, @import("util/time.zig").nowUnix())) orelse
             return false;
         errdefer {
