@@ -33,8 +33,7 @@ jobs:
   # below report success without running the suites again: their steps check
   # FAST_PATH, except the checkouts and the version state gate in the
   # `checks` legs.
-  # Every other PR, every push, and every doubt (the script never fails the
-  # job; an error decides the full path) runs everything.
+  # Other changes use the scope below; every doubt runs the affected suites.
   # doc/RELEASE_AUTOMATION_DESIGN.md §3, "CI fast path".
   release-fast-path:
     name: Release fast path
@@ -90,7 +89,11 @@ jobs:
     name: Change scope
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # a narrow push inherits successful CI on its before SHA
     outputs:
+      scope: ${{ steps.decide.outputs.scope }}
       suites: ${{ steps.decide.outputs.suites }}
       tty: ${{ steps.decide.outputs.tty }}
       reason: ${{ steps.decide.outputs.reason }}
@@ -101,13 +104,19 @@ jobs:
       - name: Decide
         id: decide
         env:
+          GH_TOKEN: ${{ github.token }}
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
         run: |
           case "$GITHUB_EVENT_NAME" in
             pull_request) base=HEAD^1 ;;
             merge_group)
               git fetch -q --no-tags --depth=1 origin "$MERGE_GROUP_BASE_SHA" || echo "could not fetch the merge group base $MERGE_GROUP_BASE_SHA"
               base="$MERGE_GROUP_BASE_SHA"
+              ;;
+            push)
+              base="$PUSH_BASE_SHA"
+              git fetch -q --no-tags --depth=1 origin "$base" || echo "could not fetch the push base $base"
               ;;
             *) base="" ;;
           esac

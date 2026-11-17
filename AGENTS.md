@@ -82,7 +82,7 @@ separate runners; `zig build test` is exactly those three, so a new check
 goes into one of them, and a new CI step names its leg (`doc/CI_DESIGN.md`
 §4, "Where a new check goes"). The one exception is a release or
 reopen PR that adds only `scripts/release_cut.py`'s generated bump to a base
-whose full CI passed: it takes the CI fast path
+whose complete CI coverage passed: it takes the CI fast path
 (`doc/RELEASE_AUTOMATION_DESIGN.md` §3). A change confined to documentation,
 or to documentation and the evaluation harness, skips the CI suites it cannot
 affect (`scripts/ci_scope.py`), and merge-queue groups run the same jobs

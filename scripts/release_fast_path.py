@@ -5,7 +5,7 @@ Design: doc/RELEASE_AUTOMATION_DESIGN.md §3, "CI fast path". A release or
 reopen PR adds only what `scripts/release_cut.py` generates: the two version
 files, the changelog heading, AgentCore's version files, ledger and changelog,
 and the fingerprint repin. When its merge commit
-adds nothing else to a base commit whose full CI already passed on `main`,
+adds nothing else to a base commit whose CI coverage already passed on `main`,
 running the suites again proves nothing new, so ci.yml lets the required jobs
 report success without running them. Every other PR, and every doubt, takes
 the full path.
@@ -20,7 +20,9 @@ Two facts decide it, both checked here:
    reproduces the candidate byte for byte. A bare version over a `-dev` base
    is a cut; a `-dev` version over a bare base is a reopen.
 2. Base. The `CI` workflow's push run for the base commit concluded
-   `success`. A run that is still going (the reopen PR is opened while
+   `success`. Narrow documentation/evaluation pushes inherit unchanged
+   suites from a successful base push (ci_scope.py), preserving complete
+   coverage. A run that is still going (the reopen PR is opened while
    `main`'s run of the release merge is in progress) is waited for, up to
    `--wait-seconds`; anything else is the full path.
 
@@ -200,7 +202,7 @@ def decide(
     state = wait_for_base(lambda: query(base_sha), wait_seconds, sleep, clock)
     if state != "success":
         return False, f"full path: the {kind} to {version} is a generated bump, but CI on its base {base_sha[:12]} is {state}"
-    return True, f"fast path: the {kind} to {version} adds only release_cut's generated files to {base_sha[:12]}, whose full CI passed on main"
+    return True, f"fast path: the {kind} to {version} adds only release_cut's generated files to {base_sha[:12]}, whose CI coverage passed on main"
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -43,7 +43,9 @@ meaning its decision job failed, runs the step.
 
 `scripts/ci_scope.py` compares the changed paths against a base. On a pull
 request the base is `HEAD^1`, the first parent of the merge commit CI tests.
-In a merge queue group it is the group's `base_sha`. Renames count as a delete
+In a merge queue group it is the group's `base_sha`. On a push it is the
+event's `before` SHA, so a multi-commit push includes every commit, rather
+than only its last commit. Renames count as a delete
 plus an add, so moving a file out of `doc/` is a code change.
 
 | Scope | Every changed path is | What runs |
@@ -52,8 +54,31 @@ plus an add, so moving a file out of `doc/` is a code change.
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `full` | anything else | Everything |
 
-Push and manual runs are always `full`, and so are an empty diff and any
-error.
+Manual runs are always `full`, and so are an empty diff and any error.
+For a push to use `docs` or `eval`, the `CI` workflow must also have a
+successful push run on the `before` commit. Otherwise (including a pending,
+cancelled, missing or failed run, an unavailable API or an unknown base) it
+runs in full. There is no wait for the base run. The scope job needs only
+`actions: read` and `contents: read` to check this evidence.
+
+This preserves complete CI coverage for the release fast path: a narrow
+push inherits evidence for unchanged suites from its successful base. That
+base either ran all suites, or inherited its unchanged suites by the same
+rule. A change to CI or its classification scripts itself runs in full,
+establishing the initial baseline. Code, build inputs and release bumps
+still run in full on main.
+
+The scope step writes a **CI change attribution** job summary: the base,
+event, effective scope, reason, planned checks and a status/path/scope table.
+The decision considers every changed path; the table displays at most 200.
+A path's narrow scope does not override a wider scope required by another
+path or by missing baseline evidence. This is a plan, not test-result evidence.
+
+`agentcore-windows.yml` uses this same push decision and its `native` output
+to skip native builds for `docs` and `eval`. On pull requests and merge
+groups its existing native-gate path filter still applies. Required jobs
+continue reporting under their existing names; a missing scope output runs
+the expensive steps.
 
 The boundaries are deliberately narrow:
 
@@ -137,16 +162,16 @@ ruleset can be switched in one edit. A maintainer makes it in `Protect main`:
 
 ### What stays the same
 
-Pushes to `main` still run the full workflow. The release fast path needs
-that run, because its base check is the base commit's push run
+Pushes to `main` retain complete coverage through the baseline rule in §2.
+The release fast path still checks the base commit's successful push run
 (`release_fast_path.py`). When merges land back to back, the concurrency
 group cancels the older push run. A release or reopen PR whose base run was
 cancelled then takes the full path, which costs one run and never coverage.
 
-Once the queue merges every PR, the push run repeats an entry's run on the
-same tree. Replacing it, for instance with a nightly full run plus a
-fast-path base check that accepts the merge group run, is the next step and
-is not designed here. The per-PR `pull_request` run also stays full for now;
+For code changes the push run still repeats an entry's run on the same tree.
+Replacing it, for instance with a nightly full run plus a fast-path base
+check that accepts the merge group run, is not designed here. The per-PR
+`pull_request` run also stays full for code changes;
 with the queue as the final gate it could shrink to a subset.
 
 ## 4. Legs, shards and result jobs
