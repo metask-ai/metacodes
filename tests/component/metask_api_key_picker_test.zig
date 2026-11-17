@@ -226,14 +226,12 @@ test "L2 metask api-key route: the picker offers the gateway's models at the ses
     // The model the session runs is the marked one.
     try std.testing.expectEqualStrings("glm-5.3-flash", currentModel(app).?);
 
-    // Drive the picker the way the keyboard does: provider → model → commit.
+    // Drive the picker the way the keyboard does: type the model, Enter.
     const picker = &app.model_picker;
-    for ("metask") |byte| _ = picker.onKey(.{ .char = byte });
-    _ = picker.onKey(.enter);
-    try std.testing.expectEqual(picker_mod.Stage.model, picker.stage);
     for ("kimi") |byte| _ = picker.onKey(.{ .char = byte });
+    try std.testing.expectEqual(picker_mod.Stage.list, picker.stage);
     const outcome = picker.onKey(.enter);
-    // One wire per model, so the offer stage is skipped.
+    // One wire per model: Enter on the model commits it.
     try std.testing.expect(outcome == .commit);
     const committed = try app.commitModelSelection(outcome.commit);
     try std.testing.expect(committed == .committed);
