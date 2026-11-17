@@ -47,6 +47,7 @@ const audit = @import("audit.zig");
 const merge_back = @import("merge_back.zig");
 const factory = @import("drivers/factory.zig");
 const common = @import("drivers/common.zig");
+const charters = @import("charters.zig");
 
 const Role = types.Role;
 const SeatId = types.SeatId;
@@ -236,6 +237,7 @@ pub const SeatSnapshot = struct {
     role: Role,
     harness: types.Harness,
     status: types.SeatStatus,
+    charter_sha256: ?[64]u8 = null,
     /// Null before the seat ends, and for seats ended before a `reopen`.
     result: ?SeatResult = null,
 };
@@ -291,6 +293,8 @@ pub const CompletionResult = union(enum) {
 // ── errors ──────────────────────────────────────────────────────────────────
 
 pub const Error = run_dir.Error || error{
+    RunBusy,
+    LeaseFailed,
     /// The run is in a terminal state (or just entered one).
     RunEnded,
     /// Only the implementer and the reviewer are dispatched; the verifier is
@@ -316,7 +320,7 @@ pub const Error = run_dir.Error || error{
 
 pub const StartError = Error || merge_back.Error || ledger_mod.LoadError || issues.LoadError || error{EmptyRequest};
 
-pub const ReopenError = StartError || error{StateCorrupt};
+pub const ReopenError = StartError || error{ StateCorrupt, ConfigurationChanged };
 
 // ── the run ─────────────────────────────────────────────────────────────────
 
@@ -325,6 +329,8 @@ pub const Run = struct {
     deps: Deps,
     cfg: config.Config.Enabled,
     dir: run_dir.RunDir,
+    /// Kernel lock, never inherited by a seat. One process drives a run.
+    lease_fd: pfs.Fd,
     ledger: ledger_mod.Ledger,
     issues: issues.Ledger,
     /// Shared by every seat of the run: tripped by `cancel`, by the
@@ -358,13 +364,15 @@ pub const Run = struct {
             errdefer gpa.free(repo);
             var dir = try run_dir.RunDir.create(gpa, options.state_root, options.run_id);
             errdefer dir.deinit(gpa);
+            const lease = try acquireLease(&dir);
+            errdefer pfs.close(lease);
             try dir.writeOriginalRequest(request.text);
             const base = try merge_back.snapshot(gpa, repo, dir.root, null);
             const worktree = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir.root, run_dir.worktree_dir });
             errdefer gpa.free(worktree);
             try merge_back.addWorktree(gpa, repo, worktree, base.commit, null);
             // On success `open` owns `repo`, `dir` and `worktree`.
-            break :blk try open(gpa, deps, cfg, dir, repo, worktree, base, .approved);
+            break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, base, .approved);
         };
         errdefer self.destroy();
         self.worktree_present = true;
@@ -385,12 +393,19 @@ pub const Run = struct {
         const self = blk: {
             var dir = try run_dir.RunDir.open(gpa, state_root, run_id);
             errdefer dir.deinit(gpa);
+            const lease = try acquireLease(&dir);
+            errdefer pfs.close(lease);
             const text = swarm_team.readFileAlloc(gpa, try dir.path(&buf, .state)) orelse return error.StateCorrupt;
             defer gpa.free(text);
             saved = parseSaved(arena_state.allocator(), text) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.StateCorrupt,
             };
+            // Approval pins the entire policy, not just the task text. A
+            // restart must not increase the cap, replace a harness or weaken
+            // the pinned check by reading an edited configuration file.
+            const fingerprint = try configFingerprint(gpa, cfg);
+            if (!std.mem.eql(u8, &fingerprint, &saved.config_sha256)) return error.ConfigurationChanged;
             const repo = try gpa.dupe(u8, saved.repo);
             errdefer gpa.free(repo);
             const worktree = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir.root, run_dir.worktree_dir });
@@ -400,7 +415,7 @@ pub const Run = struct {
                 .merging => .{ .failed = .merge_interrupted },
                 else => saved.state,
             };
-            break :blk try open(gpa, deps, cfg, dir, repo, worktree, saved.base, state);
+            break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, saved.base, state);
         };
         errdefer self.destroy();
         self.worktree_present = pfs.exists((try self.dir.path(&buf, .worktree)).ptr);
@@ -416,13 +431,13 @@ pub const Run = struct {
             const role, const ordinal = parseSeatId(id) orelse continue;
             if (ordinal > self.dispatched.get(role)) self.dispatched.set(role, ordinal);
             var snap: SeatSnapshot = switch (seat) {
-                .recorded => |r| .{ .id = id, .role = r.record.role, .harness = r.record.harness, .status = r.record.status },
+                .recorded => |r| .{ .id = id, .role = r.record.role, .harness = r.record.harness, .status = r.record.status, .charter_sha256 = r.record.charter_sha256 },
                 .damaged => .{ .id = id, .role = role, .harness = cfg.seats.get(role).harnessKind(), .status = .queued },
             };
             if (!snap.status.isTerminal()) {
                 snap.status = .failed;
                 snap.result = .interrupted;
-                try self.dir.writeSeatRecord(.{ .id = id, .role = snap.role, .harness = snap.harness, .status = .failed });
+                try self.dir.writeSeatRecord(.{ .id = id, .role = snap.role, .harness = snap.harness, .status = .failed, .charter_sha256 = snap.charter_sha256 });
             }
             try self.seats.append(gpa, snap);
         }
@@ -435,6 +450,7 @@ pub const Run = struct {
         deps: Deps,
         cfg: config.Config.Enabled,
         dir: run_dir.RunDir,
+        lease: pfs.Fd,
         repo: []u8,
         worktree: []u8,
         base: merge_back.Snapshot,
@@ -456,6 +472,7 @@ pub const Run = struct {
             .deps = deps,
             .cfg = cfg,
             .dir = dir,
+            .lease_fd = lease,
             .ledger = ledger,
             .issues = ledger_issues,
             .abort = types.AbortSignal.init(),
@@ -475,6 +492,7 @@ pub const Run = struct {
     /// be reopened later).
     pub fn destroy(self: *Run) void {
         const gpa = self.gpa;
+        self.releaseLease();
         self.seats.deinit(gpa);
         gpa.free(self.goal);
         gpa.free(self.worktree);
@@ -483,6 +501,11 @@ pub const Run = struct {
         self.ledger.deinit(gpa);
         self.dir.deinit(gpa);
         gpa.destroy(self);
+    }
+
+    fn releaseLease(self: *Run) void {
+        if (self.lease_fd >= 0) pfs.close(self.lease_fd);
+        self.lease_fd = pfs.invalid_fd;
     }
 
     // ── operations ──────────────────────────────────────────────────────────
@@ -539,9 +562,10 @@ pub const Run = struct {
         const ordinal = self.dispatched.get(role) + 1;
         const id = types.seatIdFor(role, ordinal);
         const spec = self.cfg.seats.getPtrConst(role);
-        try self.dir.createSeat(.{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued });
+        const charter_digest = std.fmt.bytesToHex(charters.digest(role), .lower);
+        try self.dir.createSeat(.{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued, .charter_sha256 = charter_digest });
         self.dispatched.set(role, ordinal);
-        try self.seats.append(self.gpa, .{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued });
+        try self.seats.append(self.gpa, .{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued, .charter_sha256 = charter_digest });
         const packet = try self.renderPacket(role, instructions);
         defer self.gpa.free(packet);
         try self.dir.writePacket(id, packet);
@@ -782,7 +806,7 @@ pub const Run = struct {
         for (self.seats.items) |*seat| {
             if (!seat.id.eql(id)) continue;
             seat.status = seat_status;
-            try self.dir.writeSeatRecord(.{ .id = id, .role = seat.role, .harness = seat.harness, .status = seat_status });
+            try self.dir.writeSeatRecord(.{ .id = id, .role = seat.role, .harness = seat.harness, .status = seat_status, .charter_sha256 = seat.charter_sha256 });
             return;
         }
         return error.SeatNotFound;
@@ -951,6 +975,7 @@ pub const Run = struct {
         }
         self.state = next;
         try self.persist();
+        if (next.isTerminal()) self.releaseLease();
     }
 
     // ── run.json ────────────────────────────────────────────────────────────
@@ -966,6 +991,10 @@ pub const Run = struct {
     fn writeState(self: *const Run, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var s: std.json.Stringify = .{ .writer = w };
         try s.beginObject();
+        try s.objectField("config_sha256");
+        const fingerprint = configFingerprint(self.gpa, self.cfg) catch return error.WriteFailed;
+        const fingerprint_hex = std.fmt.bytesToHex(fingerprint, .lower);
+        try s.write(fingerprint_hex[0..]);
         try s.objectField("state");
         try s.write(@tagName(self.state.phase()));
         try s.objectField("detail");
@@ -1006,7 +1035,21 @@ pub const Run = struct {
     }
 };
 
+fn acquireLease(dir: *const run_dir.RunDir) Error!pfs.Fd {
+    var buf: run_dir.PathBuf = undefined;
+    const path = std.fmt.bufPrintZ(&buf, "{s}/runtime.lock", .{dir.root}) catch return error.PathTooLong;
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600);
+    if (fd < 0) return error.LeaseFailed;
+    errdefer pfs.close(fd);
+    pfs.tryLockExclusive(fd) catch |err| return switch (err) {
+        error.WouldBlock => error.RunBusy,
+        error.LockFailed => error.LeaseFailed,
+    };
+    return fd;
+}
+
 const Saved = struct {
+    config_sha256: [32]u8,
     state: State,
     repo: []const u8,
     base: merge_back.Snapshot,
@@ -1053,6 +1096,7 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
         else => return error.StateCorrupt,
     };
     return .{
+        .config_sha256 = try parseFingerprint(try stringField(obj, "config_sha256")),
         .state = state,
         .repo = try stringField(obj, "repo"),
         .base = .{
@@ -1064,6 +1108,21 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
         .last_audit = last_audit,
         .merge_conflicts = try intField(u32, obj, "merge_conflicts"),
     };
+}
+
+fn configFingerprint(gpa: std.mem.Allocator, cfg: config.Config.Enabled) error{OutOfMemory}![32]u8 {
+    const bytes = try std.json.Stringify.valueAlloc(gpa, cfg, .{});
+    defer gpa.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
+fn parseFingerprint(text: []const u8) error{StateCorrupt}![32]u8 {
+    if (text.len != 64) return error.StateCorrupt;
+    var result: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&result, text) catch return error.StateCorrupt;
+    return result;
 }
 
 fn stringField(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {

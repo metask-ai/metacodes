@@ -23,6 +23,9 @@ pub const Source = enum {
     provider_estimate,
     /// The cost an external harness reported in its result.
     harness_reported,
+    /// Conservative cap consumption when a cost-bounded harness exits
+    /// without a usable cost report. This is not a measured bill.
+    reserved,
     /// No cost is known; the seat is bounded by wallclock only.
     wallclock_only,
 
@@ -35,11 +38,12 @@ pub const Source = enum {
 pub const Cost = union(Source) {
     provider_estimate: f64,
     harness_reported: f64,
+    reserved: f64,
     wallclock_only,
 
     pub fn usd(self: Cost) ?f64 {
         return switch (self) {
-            .provider_estimate, .harness_reported => |amount| amount,
+            .provider_estimate, .harness_reported, .reserved => |amount| amount,
             .wallclock_only => null,
         };
     }
@@ -75,6 +79,8 @@ pub const ChargeError = error{
 pub const Ledger = struct {
     /// Owned, NUL-terminated.
     path: [:0]u8,
+    pending_path: [:0]u8,
+    pending_seat: ?types.SeatId = null,
     cap_usd: f64,
     spent_usd: f64 = 0,
     wallclock_ms: u64 = 0,
@@ -88,26 +94,72 @@ pub const Ledger = struct {
     /// already on disk. A missing file is an empty ledger.
     pub fn load(gpa: std.mem.Allocator, path: []const u8, cap_usd: f64) LoadError!Ledger {
         if (!std.math.isFinite(cap_usd) or cap_usd <= 0) return error.InvalidCap;
-        if (path.len >= std.fs.max_path_bytes) return error.PathTooLong;
+        if (path.len + ".pending".len >= std.fs.max_path_bytes) return error.PathTooLong;
         const path_z = try gpa.dupeZ(u8, path);
         errdefer gpa.free(path_z);
-        var self: Ledger = .{ .path = path_z, .cap_usd = cap_usd };
+        const pending_path = try std.fmt.allocPrintSentinel(gpa, "{s}.pending", .{path}, 0);
+        errdefer gpa.free(pending_path);
+        var self: Ledger = .{ .path = path_z, .pending_path = pending_path, .cap_usd = cap_usd };
 
-        const bytes = (try readAll(gpa, path_z)) orelse return self;
-        defer gpa.free(bytes);
-        const complete_len = if (std.mem.lastIndexOfScalar(u8, bytes, '\n')) |nl| nl + 1 else 0;
-        var lines = std.mem.splitScalar(u8, bytes[0..complete_len], '\n');
-        while (lines.next()) |line| {
-            if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
-            self.add(try parseEntry(gpa, line));
+        const pending_bytes = try readAll(gpa, pending_path);
+        defer if (pending_bytes) |bytes| gpa.free(bytes);
+        const pending: ?Entry = if (pending_bytes) |bytes| try parseEntry(gpa, bytes) else null;
+        if (pending) |entry| {
+            if (entry.cost != .reserved) return error.CorruptLedger;
+            self.pending_seat = entry.seat_id;
         }
-        if (complete_len != bytes.len) try truncate(path_z, complete_len);
+        var settled = false;
+
+        if (try readAll(gpa, path_z)) |bytes| {
+            defer gpa.free(bytes);
+            const complete_len = if (std.mem.lastIndexOfScalar(u8, bytes, '\n')) |nl| nl + 1 else 0;
+            var lines = std.mem.splitScalar(u8, bytes[0..complete_len], '\n');
+            while (lines.next()) |line| {
+                if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+                const entry = try parseEntry(gpa, line);
+                self.add(entry);
+                if (pending) |p| if (p.seat_id.eql(entry.seat_id)) {
+                    settled = true;
+                };
+            }
+            if (complete_len != bytes.len) try truncate(path_z, complete_len);
+        }
+        if (pending) |entry| {
+            if (settled) {
+                pfs.unlinkPath(pending_path.ptr) catch return error.RepairFailed;
+                self.pending_seat = null;
+            } else {
+                // The controller died after admission but before a durable
+                // result. Never give a fresh dollar allowance to that seat.
+                self.charge(entry) catch |err| switch (err) {
+                    error.BudgetExhausted => {},
+                    else => return error.RepairFailed,
+                };
+            }
+        }
         return self;
     }
 
     pub fn deinit(self: *Ledger, gpa: std.mem.Allocator) void {
         gpa.free(self.path);
+        gpa.free(self.pending_path);
         self.* = undefined;
+    }
+
+    /// Persist admission before any paid work. An interrupted controller
+    /// consumes this allowance on reopen; a durable charge settles it.
+    /// The live seat still receives the full remaining cap.
+    pub fn reserve(self: *Ledger, seat_id: types.SeatId, harness: types.Harness) ChargeError!void {
+        if (self.isExhausted()) return error.BudgetExhausted;
+        if (self.pending_seat != null) return error.WriteFailed;
+        const fd = pfs.open(self.pending_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600);
+        if (fd < 0) return error.WriteFailed;
+        defer pfs.close(fd);
+        var buf: [1024]u8 = undefined;
+        const bytes = formatEntry(&buf, .{ .seat_id = seat_id, .harness = harness, .wallclock_ms = 0, .cost = .{ .reserved = self.remainingUsd() } });
+        if (!pfs.writeAll(fd, bytes)) return error.WriteFailed;
+        pfs.fsyncChecked(fd) catch return error.WriteFailed;
+        self.pending_seat = seat_id;
     }
 
     /// Append `entry` durably, then add it to the totals. Returns
@@ -126,6 +178,10 @@ pub const Ledger = struct {
         if (!pfs.writeAll(fd, line)) return error.WriteFailed;
         pfs.fsyncChecked(fd) catch return error.WriteFailed;
         self.add(entry);
+        if (self.pending_seat) |pending_id| if (pending_id.eql(entry.seat_id)) {
+            pfs.unlinkPath(self.pending_path.ptr) catch return error.WriteFailed;
+            self.pending_seat = null;
+        };
         if (self.isExhausted()) {
             // `host_failure`: a host-side stop, not a user cancellation.
             if (self.abort_on_exhaustion) |signal| signal.abort(.host_failure);
@@ -191,6 +247,7 @@ fn parseEntry(gpa: std.mem.Allocator, line: []const u8) LoadError!Entry {
         .wallclock_only => if (usd == null) .wallclock_only else return error.CorruptLedger,
         .provider_estimate => .{ .provider_estimate = usd orelse return error.CorruptLedger },
         .harness_reported => .{ .harness_reported = usd orelse return error.CorruptLedger },
+        .reserved => .{ .reserved = usd orelse return error.CorruptLedger },
     };
     if (cost.usd()) |amount| if (!std.math.isFinite(amount) or amount < 0) return error.CorruptLedger;
     return .{ .seat_id = seat_id, .harness = harness, .wallclock_ms = wallclock_ms, .cost = cost };
@@ -298,6 +355,55 @@ test "ledger: crossing the cap is BudgetExhausted, and the charge is still recor
     try testing.expectEqual(@as(usize, 3), reloaded.entries);
     try testing.expect(reloaded.isExhausted());
     try testing.expectError(error.InvalidCap, Ledger.load(testing.allocator, path, 0));
+}
+
+test "ledger: a controller crash after reservation consumes the remaining allowance on reopen" {
+    var root = TestRoot.init("cc-zig-teamwork-reservation-crash");
+    defer root.deinit();
+    var pbuf: [512]u8 = undefined;
+    const path = ledgerPath(&pbuf, &root);
+    {
+        var ledger = try Ledger.load(testing.allocator, path, 5);
+        defer ledger.deinit(testing.allocator);
+        try ledger.charge(.{ .seat_id = seat("implementer-1"), .harness = .metacodes, .wallclock_ms = 0, .cost = .{ .provider_estimate = 1 } });
+        try ledger.reserve(seat("reviewer-1"), .claude_code);
+        try testing.expectEqual(@as(f64, 4), ledger.remainingUsd());
+        try testing.expectError(error.WriteFailed, ledger.reserve(seat("reviewer-2"), .claude_code));
+        // Simulate process loss before a terminal harness event.
+    }
+    var reopened = try Ledger.load(testing.allocator, path, 5);
+    defer reopened.deinit(testing.allocator);
+    try testing.expect(reopened.isExhausted());
+    try testing.expectEqual(@as(usize, 2), reopened.entries);
+    try testing.expect(!pfs.exists(reopened.pending_path.ptr));
+    var again = try Ledger.load(testing.allocator, path, 5);
+    defer again.deinit(testing.allocator);
+    try testing.expectEqual(@as(f64, 5), again.spent_usd);
+    try testing.expectEqual(@as(usize, 2), again.entries);
+}
+
+test "ledger: a durable charge settles its reservation without double billing after a crash" {
+    var root = TestRoot.init("cc-zig-teamwork-reservation-settled");
+    defer root.deinit();
+    var pbuf: [512]u8 = undefined;
+    const path = ledgerPath(&pbuf, &root);
+    {
+        var ledger = try Ledger.load(testing.allocator, path, 5);
+        defer ledger.deinit(testing.allocator);
+        try ledger.reserve(seat("implementer-1"), .metacodes);
+        const receipt = (try readAll(testing.allocator, ledger.pending_path)).?;
+        defer testing.allocator.free(receipt);
+        try ledger.charge(.{ .seat_id = seat("implementer-1"), .harness = .metacodes, .wallclock_ms = 1, .cost = .{ .provider_estimate = 0.25 } });
+        try testing.expect(!pfs.exists(ledger.pending_path.ptr));
+        // A crash just before unlink would leave the same receipt behind.
+        try writeRaw(ledger.pending_path, receipt);
+    }
+    var reopened = try Ledger.load(testing.allocator, path, 5);
+    defer reopened.deinit(testing.allocator);
+    try testing.expectEqual(@as(f64, 0.25), reopened.spent_usd);
+    try testing.expectEqual(@as(usize, 1), reopened.entries);
+    try testing.expect(!pfs.exists(reopened.pending_path.ptr));
+    try reopened.reserve(seat("reviewer-1"), .claude_code);
 }
 
 test "ledger: a torn last line is dropped and truncated; a corrupt complete line fails closed" {

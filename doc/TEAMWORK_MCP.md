@@ -5,6 +5,13 @@ including Claude Code, can drive the same runtime as the built-in SWE manager.
 The manager does not implement review, auditing, budgeting, sandboxing or merge.
 Those remain runtime and driver responsibilities.
 
+The MCP client owns the Manager process and its model billing. The runtime's
+dollar cap covers the workers and audit it launches. It does not account for
+the MCP client's own model usage. Choose the Manager by running the client
+(for example Claude Code); configure worker harnesses independently in the
+teamwork policy. Automatically launching a Manager from `seats.manager` is
+not part of this stdio adapter.
+
 ## Host authorization and ownership
 
 The host obtains user approval, loads the configuration and dependencies, and
@@ -155,7 +162,7 @@ The [example configuration](../examples/teamwork/claude-code-mcp.json) uses
 Claude Code's `mcpServers` stdio format. Replace the two absolute placeholder
 paths with the installed executable and a file containing the user-approved
 request. The launch command is
-`metacodes teamwork mcp --request-file <approved-request> --approve`.
+`metacodes teamwork mcp --request-file <approved-request> --approve --budget-usd 5`.
 That command belongs to the host's CLI integration; the engine itself neither
 parses those flags nor grants approval. The human-configured `--approve` is
 not an MCP argument, tool or manager decision. Keep the host's validated

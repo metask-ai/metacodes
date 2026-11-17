@@ -2,7 +2,8 @@
 
 > 状态:阶段 0(共享类型、配置、运行目录、预算账本)、内置 reviewer(评审结果契约、证据核验、
 > open-issues 台账,§6)与 seat 驱动(metacodes 子 agent、Claude Code 子进程、写入隔离,§7)已落地于
-> `src/teamwork/`;runtime 编排与命令入口尚未实现,见 §10。
+> `src/teamwork/`;runtime 编排、独立完成审计与合回已接入,见 §10。用户入口与 MCP Manager 的
+> 使用方式以 [API.md](API.md) 与 [TEAMWORK_MCP.md](TEAMWORK_MCP.md) 为准。
 > 来源:umbrella issue #514 及子 issue #515–#525。工作方式借鉴 Google Antigravity 的
 > `/teamwork` 预览功能(先批准再开跑、写的人不验、完成必须审计、状态全部落盘);本文与代码中的
 > 角色定义、契约和文字均为原创,未复制其任何提示词或文本。
@@ -184,7 +185,8 @@ packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径
 
 - `source` 为 `provider_estimate`(metacodes 自己的估算)、`harness_reported`(外部 harness 结果
   事件里的花费)或 `wallclock_only`(读不到花费,`usd` 为 null)。类型上 `Cost = union(Source)`,
-  有金额当且仅当来源有金额。
+  有金额当且仅当来源有金额。另有 `reserved` 金额:成本报告丢失时保守消耗剩余额度,
+  它是预留额度,不能解释为实际账单。
 - `Ledger.charge` 先追加并 fsync,再更新合计;合计达到上限(`spent >= cap`)时返回
   `BudgetExhausted`,但这笔仍然入账(钱已经花了),之后每一笔都返回 `BudgetExhausted`。
   负数、NaN、无穷拒收(`InvalidAmount`),不入账。
@@ -194,6 +196,12 @@ packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径
 - `remainingUsd()` 是 metacodes seat 子 agent 的 `cost_budget_usd`(`src/core/subagent.zig`),也是
   Claude Code seat 的 `--max-budget-usd`(§7)。
 - 账本只有 runtime 写,不是线程安全的,由 runtime 串行化。
+
+在 metacodes、成本受限的 Claude Code seat 或 verifier 开始付费工作前,runtime 先写入并 fsync
+`budget.jsonl.pending`,记录该 seat 获准使用的剩余额度。正常结束的 durable charge 清理该记录。
+控制器崩溃后,`Ledger.load` 若只找到预留而没有该 seat 的完成记账,就把预留作为 `reserved`
+入账并停止继续花费;若完成记账已落盘则只清理旧预留,不重复扣除。显式 `wallclock_only` 仍然
+只承诺时间上限。成本模式下,缺少有效结果/花费报告不会被当作零花费后继续重试。
 
 ## 6. 内置 reviewer 与 open-issues 台账(#517)
 
@@ -353,6 +361,7 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
   <command> -p <bootstrap> --output-format stream-json --verbose --add-dir <seat 目录>
     --permission-mode acceptEdits --permission-prompts none --no-session-persistence
     [--model <m>] [--effort <low|medium|high|xhigh|max>] [--max-budget-usd <剩余预算>]
+    --append-system-prompt <该角色的固定宪章>
   ```
 
   `acceptEdits` + `--permission-prompts none`:工作目录内的编辑自动接受,其余需要询问的一律拒绝
@@ -374,8 +383,8 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
   `Options.sandbox=false` 可以不受限运行。
   真实 CLI 在该配置下的运行尚未用真模型验证。
 - **结果**:stdout 只解析最后一个 `result` 事件(`subtype`、`total_cost_usd`),不解析对话。
-  `cost` seat 以 `harness_reported` 记报告的花费(没有结果事件,如被杀,则记 `wallclock_only`);
-  `wallclock_only` seat 记 wallclock。
+  正常交付需要成功的结果事件和 handoff。`cost` seat 以 `harness_reported` 记报告的花费;
+  没有有效花费报告时保守以 `reserved` 消耗剩余额度。只有显式 `wallclock_only` seat 仅记时间。
 
 ### 7.5 测试(L2)
 
@@ -408,18 +417,55 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 
 锦标赛树、数学证明管线、文档评审路线、大规模角色组合(见 #514"不做")。
 
-## 10. 实现状态
+## 10. runtime、审计与合回
+
+`runtime.Run.start` 只接受宿主已经批准的 `ApprovedRequest`。runtime 记录原始请求,对工作区
+创建包含未提交与未忽略文件的快照,再在运行目录中创建 detached worktree。用户的 HEAD、索引与
+文件不变。创建 worktree 禁用仓库钩子;seat 的沙箱额外拒绝写入 `.git` 和 linked worktree 的
+公共 git 目录,防止子 agent 改动用户的 refs、配置或钩子。
+
+Manager 只驱动 `dispatch(implementer/reviewer)`、`status`、`requestCompletion`、`cancel`。
+`swe_loop.drive` 是默认的确定性 Manager,复用同一组操作。状态顺序为:
+
+```text
+approved -> implementing -> reviewing -> review_approved -> auditing -> merging -> done
+               ^               |              |               |
+               +-- 修改/拒绝 ---+              +-- 过期 -> reviewing
+               +------------------------- 第一次审计失败 --------+
+```
+
+每个角色最多派 `max_rounds` 个 seat(默认 3)。reviewer 的结论经过工具调用记录、台账与固定
+检查命令核验;批准绑定工作区树 id。审计前树变了就重新评审,审计后树变了就终止。
+`VerifierAuditor` 调用隔离的 `core/isolated_verifier.verify`:它只接收原始请求、候选快照和
+检查证据,不接收实现者的对话。只有明确 PASS 才合回,FAIL 第一次进入修复轮、第二次失败终止;
+UNVERIFIED 与 unavailable 均不会放行。审计花费必须成功写入预算账本。
+
+`merge_back.mergeBack` 生成二进制补丁,比较用户从启动以来的改动与候选改动。两者修改相同或
+包含关系的路径时停在 `merge_conflict`,保留工作区、worktree、`merge.patch` 与冲突列表。
+通过时用 `git apply` 合回为未提交修改,不自动 commit。预算耗尽、取消、审计失败时不合回。
+
+`runtime.lock` 的内核锁保证同一个运行只有一个控制进程,第二次恢复返回 `RunBusy`。
+`run.json` 原子记录状态、树 id、轮数、审计次数与配置 SHA-256。恢复时必须提供相同的预算、
+seat/harness/model 与固定检查配置,否则 `ConfigurationChanged`;修改配置不会悄悄给旧运行
+增加权限或预算。seat 的 `status.json` 记录宪章 SHA-256 并在恢复后保留。崩溃时未完成的 seat
+记为 interrupted;如果丢失了付费结果,先按预算预留规则停止。中断的审计可以在预算允许时重跑,
+中断的合回停下交由用户检查。
+
+L2 测试在临时 git 仓库驱动真实 worktree、账本与合回,覆盖成功交付、跨轮问题、过期批准、两次
+审计失败、预算中止、冲突保留、恢复与配置变更拒绝。模型调用均用脚本化 provider/假 CLI。
+
+## 11. 实现状态
 
 | Issue | 内容 | 状态 |
 |---|---|---|
-| #515 | runtime / seat 分层、角色配置、worker 契约 | 已做:类型、`SeatDriver` 接口、handoff 解析、配置 parse/merge/validate、测试用 stub 驱动、metacodes 驱动、驱动工厂、角色宪章、L2(改 harness 即改子进程;同一 packet 两种 harness 结果同形)(§7)。待做:接入配置加载(§3)、runtime 编排 |
-| #516 | 独立 verifier / 完成审计 | 待做 |
-| #517 | reviewer 角色与 open-issues 台账 | 已做(§6):宪章与工具表、`review.json` 解析、观测比对(`BashCallLog`)、钉住检查重跑(`check_command`)、零修改与过期批准(树 id)、台账与跨轮 packet。metacodes 驱动已接 `charters.forRole(.reviewer)` 与可选 `tool_observer`(§7.2)。待做:编排器把 `BashCallLog` 插上并再开一轮;流式预取的只读 Bash 以 `speculative_prefetch` 来源分派,`BashCallLog` 不记录它们;Windows 上 `workspaceTree` 返回 `Unsupported`,批准无法确认 |
-| #518 | `/teamwork` 命令、面试与批准 | 待做(含配置接线,§3) |
-| #519 | 运行状态目录与写入隔离 | 已做:目录布局、只写一次的原始请求、seat 状态、崩溃恢复;metacodes seat 的写入隔离(执行策略 + 权限 + 沙箱)及 L2;bootstrap/宪章不含运行路径的 L2 断言(§7.3)。Linux 上 seat 的 Bash 与 Claude Code CLI 经 bubblewrap 受限运行(L2:implementer seat 在工作区构建、写不出去)。未强制:无沙箱后端的平台(Windows、没有可用 bwrap 的 Linux)上 Claude Code seat 不受限运行、metacodes seat 只能跑只读 Bash |
-| #520 | 运行级预算 | 已做:账本、上限、崩溃安全重载;`cost_budget_usd` 与 `--max-budget-usd` 取剩余预算;metacodes 估算与 Claude Code 自报花费入账、wallclock_only 计时(§7)。待做:runtime 在 `isExhausted()` 时停止所有 seat |
+| #515 | runtime / seat 分层、角色配置、worker 契约 | 类型、配置、驱动、runtime、确定性 SWE Manager 已接通(§7、§10)。 |
+| #516 | 独立 verifier / 完成审计 | `VerifierAuditor` 已接隔离 verifier,最多两次审计,失败反馈修复轮;只有 PASS 交付。UNVERIFIED 后的 leads 轮仍待做。 |
+| #517 | reviewer 角色与 open-issues 台账 | runtime 已接证据观测、跨轮台账、固定检查重跑与过期批准检查。Windows `workspaceTree` 尚不支持。 |
+| #518 | `/teamwork` 命令、面试与批准 | CLI 显式批准入口、配置加载、状态和恢复。交互式面试与 REPL `/teamwork` 尚待做。 |
+| #519 | 运行状态目录与写入隔离 | 原生工具与外部 Worker 均使用 Sandbox Foundations;无后端就拒绝。增加 `.git` 拒写、宪章摘要、运行锁。稳定路径别名仍待做。 |
+| #520 | 运行级预算 | 付费调用前预留、退出记账、丢失报告/崩溃时消耗预留、恢复固定原策略、预算触顶停止且不合回。 |
 | #521 | Claude Code 作为 worker | 已做(§7.4):钉住的 argv 与版本/参数探测、环境白名单、进程组、macOS Seatbelt / Linux bubblewrap 沙箱、结果事件记账、失败映射及 L2(假 CLI)。待做:真实 CLI 的手动 e2e job(需预算上限,不进默认 gate) |
-| #522 | Claude Code 作为 Manager(MCP) | 待做 |
-| #523 | worktree 合回 | 待做 |
+| #522 | Claude Code 作为 Manager(MCP) | stdio MCP 接口驱动用户预先批准的 Run,复用独立审计和预算规则。详见 [TEAMWORK_MCP.md](TEAMWORK_MCP.md)。 |
+| #523 | worktree 合回 | 审计通过后补丁合回,保留用户并发修改,冲突时保留两边内容(§10)。 |
 | #524 | 进度面板与 AgentCore 事件 | 待做 |
 | #525 | 并行候选与择优 | 待做 |

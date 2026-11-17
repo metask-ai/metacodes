@@ -623,6 +623,50 @@ test "teamwork runtime L2: a user edit to the implementer's file is a conflict; 
     try testing.expect(std.mem.indexOf(u8, patch, "+feature\n") != null);
 }
 
+test "teamwork runtime L2: reopening cannot change the approved budget, harness or check" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-policy");
+    defer fx.deinit();
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const deps: runtime.Deps = .{ .seats = seats.source(), .auditor = auditor.auditor() };
+    const cfg = try fx.cfg("");
+    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text }, cfg, fx.options());
+    try testing.expectError(error.RunBusy, runtime.Run.reopen(testing.allocator, deps, cfg, fx.state(), fx.options().run_id));
+    run.destroy();
+    var changed = cfg;
+    changed.budget_usd = 50;
+    try testing.expectError(error.ConfigurationChanged, runtime.Run.reopen(testing.allocator, deps, changed, fx.state(), fx.options().run_id));
+    changed = cfg;
+    changed.check_command = try config.CheckCommand.init("true");
+    try testing.expectError(error.ConfigurationChanged, runtime.Run.reopen(testing.allocator, deps, changed, fx.state(), fx.options().run_id));
+    changed = cfg;
+    changed.seats.getPtr(.implementer).model = "another-model";
+    try testing.expectError(error.ConfigurationChanged, runtime.Run.reopen(testing.allocator, deps, changed, fx.state(), fx.options().run_id));
+    const reopened = try runtime.Run.reopen(testing.allocator, deps, cfg, fx.state(), fx.options().run_id);
+    defer reopened.destroy();
+    try testing.expectEqual(@as(f64, 5), reopened.status().budget.cap_usd);
+    try testing.expectEqual(@as(usize, 0), reopened.status().seats.len);
+}
+
+test "teamwork runtime L2: creating a worktree does not run repository hooks" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-hooks");
+    defer fx.deinit();
+    try writeFile(fx.repo(), ".git/hooks/post-checkout", "#!/bin/sh\nprintf hook > hook-ran.txt\n");
+    const out = try sh(fx.repo(), "chmod +x .git/hooks/post-checkout");
+    testing.allocator.free(out);
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const run = try runtime.Run.start(testing.allocator, .{ .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    try testing.expect(!exists(run.status().worktree.?, "hook-ran.txt"));
+}
+
 test "teamwork runtime L2: after a crash, reopen restores seats, counters and budget, and the loop finishes the run" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: Fixture = undefined;
@@ -657,6 +701,9 @@ test "teamwork runtime L2: after a crash, reopen restores seats, counters and bu
     try testing.expectEqual(types.SeatStatus.failed, (try run.dir.readSeatRecord(types.seatIdFor(.reviewer, 1))).status);
     try testing.expectApproxEqAbs(@as(f64, 0.25), snapshot.budget.spent_usd, 1e-9);
     try testing.expectEqual(@as(usize, 1), snapshot.budget.charges);
+    const implementer_record = try run.dir.readSeatRecord(types.seatIdFor(.implementer, 1));
+    const expected_charter = std.fmt.bytesToHex(@import("charters.zig").digest(.implementer), .lower);
+    try testing.expectEqualStrings(&expected_charter, &implementer_record.charter_sha256.?);
     try testing.expect(snapshot.worktree != null);
     try testing.expectEqualStrings("Add a feature file.", snapshot.goal);
 
@@ -801,6 +848,49 @@ test "teamwork runtime L2: the same reviewer claim is rejected when the metacode
 }
 
 // ── through the real isolated verifier ──────────────────────────────────────
+
+test "teamwork runtime L2: a verifier PASS cannot complete when its spend is not durable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const verifier_auditor = @import("verifier_auditor.zig");
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-unrecorded");
+    defer fx.deinit();
+    const before = try fx.workspaceBytes();
+    defer testing.allocator.free(before);
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const turns = [_][]const drivers_test.ScriptedProvider.Event{
+        &.{.{ .tool = .{ .name = "Bash", .input = "{\"command\":\"cat feature.txt\"}" } }},
+        &.{.{ .text = "REQUIREMENT: feature.txt says feature\nSUBSTITUTE: different content\nPROBE: cat feature.txt\nOBSERVED: feature\nVERDICT: PASS" }},
+    };
+    var scripted: drivers_test.ScriptedProvider = .{ .allocator = testing.allocator, .turns = &turns };
+    defer scripted.deinit();
+    var perm = permission_mod.createContext(.accept_edits, testing.allocator);
+    perm.no_interactive_prompt = true;
+    var verifier: verifier_auditor.VerifierAuditor = .{ .deps = .{
+        .provider = scripted.provider(),
+        .tool_defs = try tools_mod.toToolDefinitions(fx.arena.allocator()),
+        .permission_ctx = &perm,
+        .state_root = fx.state(),
+    } };
+    const run = try runtime.Run.start(testing.allocator, .{ .seats = seats.source(), .auditor = verifier.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    _ = try run.dispatch(.implementer, "");
+    _ = try run.dispatch(.reviewer, "");
+    // Simulate a lost ledger mount while keeping the in-memory cap intact.
+    const unusable = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/missing/budget.jsonl", .{fx.state()}, 0);
+    testing.allocator.free(run.ledger.path);
+    run.ledger.path = unusable;
+    try testing.expectEqual(runtime.CompletionResult{ .failed = .audit_unavailable }, try run.requestCompletion());
+    try testing.expectEqual(@as(usize, 2), scripted.calls);
+    const after = try fx.workspaceBytes();
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
 
 test "teamwork runtime L2: the isolated verifier audits the result; its FAIL report drives the repair round, its PASS completes" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;

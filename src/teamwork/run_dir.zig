@@ -114,6 +114,8 @@ pub const SeatRecord = struct {
     role: types.Role,
     harness: types.Harness,
     status: types.SeatStatus,
+    /// The exact immutable role charter used for this dispatch.
+    charter_sha256: ?[64]u8 = null,
 };
 
 pub const Error = error{
@@ -302,8 +304,8 @@ pub const RunDir = struct {
         var text_buf: [512]u8 = undefined;
         const text = std.fmt.bufPrint(
             &text_buf,
-            "{{\"seat_id\":\"{s}\",\"role\":\"{s}\",\"harness\":\"{s}\",\"status\":\"{s}\"}}\n",
-            .{ record.id.slice(), record.role.name(), record.harness.name(), record.status.name() },
+            "{{\"seat_id\":\"{s}\",\"role\":\"{s}\",\"harness\":\"{s}\",\"status\":\"{s}\",\"charter_sha256\":{s}{s}{s}}}\n",
+            .{ record.id.slice(), record.role.name(), record.harness.name(), record.status.name(), if (record.charter_sha256 != null) "\"" else "", if (record.charter_sha256) |digest| &digest else "null", if (record.charter_sha256 != null) "\"" else "" },
         ) catch unreachable; // ids are <= 64 path-safe bytes; enum names are short
         try writeAtomic(try self.seatPath(&buf, record.id, .status), text);
     }
@@ -386,6 +388,13 @@ fn parseRecord(scratch: std.mem.Allocator, seat: SeatId, text: []const u8) !Seat
         .role = types.Role.parse(stringField(obj, "role") orelse return error.StatusCorrupt) orelse return error.StatusCorrupt,
         .harness = types.Harness.parse(stringField(obj, "harness") orelse return error.StatusCorrupt) orelse return error.StatusCorrupt,
         .status = types.SeatStatus.parse(stringField(obj, "status") orelse return error.StatusCorrupt) orelse return error.StatusCorrupt,
+        .charter_sha256 = blk: {
+            const value = obj.get("charter_sha256") orelse break :blk null;
+            if (value == .null) break :blk null;
+            if (value != .string or value.string.len != 64) return error.StatusCorrupt;
+            for (value.string) |c| if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return error.StatusCorrupt;
+            break :blk value.string[0..64].*;
+        },
     };
 }
 

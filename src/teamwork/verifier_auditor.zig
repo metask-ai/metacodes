@@ -68,6 +68,8 @@ pub const VerifierAuditor = struct {
         if (!(budget.cost_usd > 0)) return .{ .unavailable = try gpa.dupe(u8, "No run budget is left for the verifier.\n") };
         var deps = self.deps;
         deps.abort = request.abort;
+        const seat_id = types.seatIdFor(.verifier, request.attempt);
+        request.ledger.reserve(seat_id, .metacodes) catch return .{ .unavailable = try gpa.dupe(u8, "The verifier's budget reservation could not be recorded.\n") };
         var result = try iv.verify(gpa, deps, .{
             .task_statement = request.original_request,
             .workspace = .{ .git = .{ .repo = request.workspace, .base_head = request.base } },
@@ -76,7 +78,7 @@ pub const VerifierAuditor = struct {
             .model = self.model,
         });
         defer result.deinit();
-        charge(request, result.record);
+        if (!charge(request, result.record)) return .{ .unavailable = try gpa.dupe(u8, "The verifier's spend could not be durably recorded.\n") };
 
         return switch (result.outcome) {
             .pass => .pass,
@@ -86,7 +88,7 @@ pub const VerifierAuditor = struct {
         };
     }
 
-    fn charge(request: audit.AuditRequest, record: iv.Record) void {
+    fn charge(request: audit.AuditRequest, record: iv.Record) bool {
         var id_buf: [32]u8 = undefined;
         const id_text = std.fmt.bufPrint(&id_buf, "verifier-{d}", .{request.attempt}) catch unreachable;
         const usd = @as(f64, @floatFromInt(record.cost_microusd)) / 1_000_000.0;
@@ -97,9 +99,13 @@ pub const VerifierAuditor = struct {
             .cost = .{ .provider_estimate = usd },
         }) catch |err| switch (err) {
             // The runtime reads `isExhausted` after the audit.
-            error.BudgetExhausted => {},
-            error.InvalidAmount, error.WriteFailed => log.warn("teamwork", "verifier charge not recorded: {s}", .{@errorName(err)}),
+            error.BudgetExhausted => return true,
+            error.InvalidAmount, error.WriteFailed => {
+                log.warn("teamwork", "verifier charge not recorded: {s}", .{@errorName(err)});
+                return false;
+            },
         };
+        return true;
     }
 };
 

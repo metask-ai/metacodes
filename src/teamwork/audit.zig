@@ -167,7 +167,7 @@ pub const StubAuditor = struct {
 const testing = std.testing;
 
 test "audit: the default auditor is unavailable, never a pass" {
-    var ledger: ledger_mod.Ledger = .{ .path = undefined, .cap_usd = 1 };
+    var ledger: ledger_mod.Ledger = .{ .path = undefined, .pending_path = undefined, .cap_usd = 1 };
     var abort = types.AbortSignal.init();
     var default: UnavailableAuditor = .{};
     var verdict = try default.auditor().audit(testing.allocator, .{
@@ -186,7 +186,7 @@ test "audit: the default auditor is unavailable, never a pass" {
 }
 
 test "audit: the stub replays its script and records the request" {
-    var ledger: ledger_mod.Ledger = .{ .path = undefined, .cap_usd = 1 };
+    var ledger: ledger_mod.Ledger = .{ .path = undefined, .pending_path = undefined, .cap_usd = 1 };
     var abort = types.AbortSignal.init();
     const script = [_]StubAuditor.Scripted{ .{ .fail = "missing flag" }, .pass };
     var stub: StubAuditor = .{ .script = &script, .gpa = testing.allocator };

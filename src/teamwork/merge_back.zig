@@ -148,9 +148,10 @@ pub fn snapshot(gpa: std.mem.Allocator, repo: []const u8, scratch_dir: []const u
     return .{ .commit = try parseObject(commit_text), .tree = tree };
 }
 
-/// Add a detached worktree of `repo` at `path`, checked out at `commit`.
+/// Add a detached worktree without running the repository's post-checkout
+/// hook outside the seat sandbox.
 pub fn addWorktree(gpa: std.mem.Allocator, repo: []const u8, path: []const u8, commit: ObjectId, abort: Abort) Error!void {
-    const out = try gitText(gpa, repo, &.{ "worktree", "add", "--detach", "--quiet", path, commit.slice() }, abort);
+    const out = try gitText(gpa, repo, &.{ "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", "--quiet", path, commit.slice() }, abort);
     gpa.free(out);
 }
 

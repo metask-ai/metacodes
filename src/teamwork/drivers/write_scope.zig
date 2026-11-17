@@ -91,6 +91,41 @@ pub fn seatSandbox(host: ?*const sandbox_config.SandboxSettings) sandbox_config.
     return settings;
 }
 
+/// A linked worktree shares its parent's git metadata. Shell sandbox
+/// wrappers ordinarily allow that directory for git commands; teamwork
+/// seats must never change the user's refs, config or hooks. These denials
+/// apply to both whole-harness and native-file-tool sandboxes.
+pub const GitProtection = struct {
+    gpa: std.mem.Allocator,
+    roots: [][]const u8,
+    dot_git: ?[]u8,
+    common_git: ?[]u8,
+
+    pub fn init(gpa: std.mem.Allocator, workspace: []const u8, inherited: []const []const u8) error{OutOfMemory}!GitProtection {
+        const dot_git = try std.fs.path.joinZ(gpa, &.{ workspace, ".git" });
+        defer gpa.free(dot_git);
+        const existing = if (pfs.exists(dot_git.ptr)) try gpa.dupe(u8, dot_git) else null;
+        errdefer if (existing) |path| gpa.free(path);
+        const common_git = sandbox_exec.linkedWorktreeGitDir(gpa, workspace);
+        errdefer if (common_git) |path| gpa.free(path);
+        const roots = try gpa.alloc([]const u8, inherited.len + @intFromBool(existing != null) + @intFromBool(common_git != null));
+        @memcpy(roots[0..inherited.len], inherited);
+        var next = inherited.len;
+        if (existing) |path| {
+            roots[next] = path;
+            next += 1;
+        }
+        if (common_git) |path| roots[next] = path;
+        return .{ .gpa = gpa, .roots = roots, .dot_git = existing, .common_git = common_git };
+    }
+
+    pub fn deinit(self: GitProtection) void {
+        if (self.dot_git) |path| self.gpa.free(path);
+        if (self.common_git) |path| self.gpa.free(path);
+        self.gpa.free(self.roots);
+    }
+};
+
 pub const InitError = error{ PathTooLong, RootMissing };
 
 pub const Scope = struct {

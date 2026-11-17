@@ -8,7 +8,9 @@
         "mcp",
         "--request-file",
         "/absolute/path/to/user-approved-request.md",
-        "--approve"
+        "--approve",
+        "--budget-usd",
+        "5"
       ]
     }
   }
