@@ -561,7 +561,13 @@ fn failureAdvice(buffer: []u8, name: []const u8, provider_id: []const u8) []cons
 }
 
 pub const LoginDialog = struct {
+    /// Providers the list shows. The pane neither scrolls nor filters yet, so
+    /// the ones past it are named under the list instead (`unlistedCount`),
+    /// and `/login <id>` starts any of them.
     pub const MAX_PROVIDERS = 12;
+    /// Providers a dialog holds: the listed ones, and the ones past them that
+    /// `/login <id>` starts directly.
+    pub const CAPACITY = 64;
 
     pub const Choice = struct {
         profile: *const provider_profile.ProviderProfile,
@@ -592,8 +598,11 @@ pub const LoginDialog = struct {
 
     allocator: std.mem.Allocator,
     io: std.Io,
-    choices: [MAX_PROVIDERS]Choice = undefined,
+    choices: [CAPACITY]Choice = undefined,
     choices_len: usize = 0,
+    /// Providers offered past `CAPACITY`: not held, only counted, so the list
+    /// still says how many it leaves out.
+    dropped: usize = 0,
     sel: usize = 0,
     stage: Stage = .choose,
     worker: ?*login_worker_mod.LoginWorker = null,
@@ -612,18 +621,70 @@ pub const LoginDialog = struct {
     key_buffer: [MAX_KEY_LEN]u8 = undefined,
     key_len: usize = 0,
 
+    /// Offer `choice`; past `CAPACITY` it is only counted (`dropped`).
     pub fn add(self: *LoginDialog, choice: Choice) void {
-        if (self.choices_len >= MAX_PROVIDERS) return;
+        if (self.choices_len >= CAPACITY) {
+            self.dropped += 1;
+            return;
+        }
         self.choices[self.choices_len] = choice;
         self.choices_len += 1;
     }
 
-    /// Jump straight to signing in (`/login <provider>`).
+    /// Offer the provider `/login <id>` named, and return its index for
+    /// `startAt`. It is held even past `CAPACITY`: it takes the last place,
+    /// whose provider is then only counted.
+    pub fn addNamed(self: *LoginDialog, choice: Choice) usize {
+        if (self.choices_len < CAPACITY) {
+            self.add(choice);
+            return self.choices_len - 1;
+        }
+        self.dropped += 1;
+        self.choices[CAPACITY - 1] = choice;
+        return CAPACITY - 1;
+    }
+
+    /// How many the list shows (`MAX_PROVIDERS` at most).
+    pub fn listedLen(self: *const LoginDialog) usize {
+        return @min(self.choices_len, MAX_PROVIDERS);
+    }
+
+    /// How many offered providers the list leaves out.
+    pub fn unlistedCount(self: *const LoginDialog) usize {
+        return self.choices_len - self.listedLen() + self.dropped;
+    }
+
+    /// Jump straight to signing in (`/login <provider>`), listed or not.
     pub fn startAt(self: *LoginDialog, index: usize) void {
-        // A provider past `MAX_PROVIDERS` was never added; the list is shown.
         if (index >= self.choices_len) return;
         self.sel = index;
         self.begin();
+    }
+
+    /// Back to the list. A provider started past it (`/login <id>`) has no
+    /// row to point at, so the pointer goes to the first.
+    fn backToList(self: *LoginDialog) void {
+        if (self.sel >= self.listedLen()) self.sel = 0;
+        self.stage = .choose;
+    }
+
+    /// `3 more not shown: /login <provider> (my-relay, local-vllm, …)`: the
+    /// ids `/login` takes for the providers past the list, as many as fit.
+    fn unlistedLine(self: *const LoginDialog, buffer: []u8, count: usize) []const u8 {
+        var w: std.Io.Writer = .fixed(buffer);
+        w.print("{d} more not shown: /login <provider> (", .{count}) catch return "More providers: /login <provider>";
+        const reserve = ", …)".len;
+        var written: usize = 0;
+        for (self.choices[self.listedLen()..self.choices_len]) |*choice| {
+            const id = choice.profile.id.slice();
+            if (w.end + id.len + 2 + reserve > buffer.len) break;
+            if (written > 0) w.writeAll(", ") catch break;
+            w.writeAll(id) catch break;
+            written += 1;
+        }
+        if (written < count) w.writeAll(if (written == 0) "…" else ", …") catch {};
+        w.writeAll(")") catch {};
+        return w.buffered();
     }
 
     /// Ends any sign-in still owned here, waiting for its thread.
@@ -772,8 +833,16 @@ pub const LoginDialog = struct {
                 try p.blank();
                 try p.text("Select a provider:");
                 try p.blank();
-                for (self.choices[0..self.choices_len], 0..) |*choice, i| {
+                for (self.choices[0..self.listedLen()], 0..) |*choice, i| {
                     try p.option(i + 1, i == self.sel, label(choice), method(choice));
+                }
+                // The pane cannot scroll the rest into view: they are named,
+                // never silently left out.
+                const unlisted = self.unlistedCount();
+                if (unlisted > 0) {
+                    var more_buf: [512]u8 = undefined;
+                    try p.blank();
+                    try p.paragraph(p.th.dim, self.unlistedLine(&more_buf, unlisted));
                 }
                 try p.blank();
                 try p.footer("↑/↓ to select · Enter to sign in · Esc to cancel");
@@ -880,13 +949,15 @@ pub const LoginDialog = struct {
             .choose => switch (k) {
                 .esc, .ctrl_c => return .done,
                 .up => {
-                    if (self.choices_len == 0) return .none;
-                    self.sel = if (self.sel == 0) self.choices_len - 1 else self.sel - 1;
+                    const n = self.listedLen();
+                    if (n == 0) return .none;
+                    self.sel = if (self.sel == 0) n - 1 else self.sel - 1;
                     return .redraw;
                 },
                 .down => {
-                    if (self.choices_len == 0) return .none;
-                    self.sel = (self.sel + 1) % self.choices_len;
+                    const n = self.listedLen();
+                    if (n == 0) return .none;
+                    self.sel = (self.sel + 1) % n;
                     return .redraw;
                 },
                 .enter => {
@@ -898,7 +969,7 @@ pub const LoginDialog = struct {
                     // Number keys pick a provider, as in Claude Code's selects.
                     if (c < '1' or c > '9') return .none;
                     const index: usize = c - '1';
-                    if (index >= self.choices_len) return .none;
+                    if (index >= self.listedLen()) return .none;
                     self.sel = index;
                     self.begin();
                     return .redraw;
@@ -907,7 +978,7 @@ pub const LoginDialog = struct {
             },
             .key_page => switch (k) {
                 .esc => {
-                    self.stage = .choose;
+                    self.backToList();
                     return .redraw;
                 },
                 .ctrl_c => {
@@ -1669,6 +1740,69 @@ test "login: the list wraps, numbers are shown, Esc interrupts" {
     try testing.expectEqual(@as(usize, 0), dialog.sel);
     try testing.expectEqual(Step.done, dialog.key(.esc));
     try testing.expect(dialog.outcome == .interrupted);
+}
+
+/// `count` key providers `p1`…`p<count>` (the GLM Coding Plan's setup).
+fn manyKeyProviders(comptime count: usize) [count]provider_profile.ProviderProfile {
+    comptime {
+        @setEvalBranchQuota(20_000 * count);
+        var list: [count]provider_profile.ProviderProfile = undefined;
+        for (&list, 0..) |*entry, i| {
+            entry.* = @import("../provider/profiles/zai_coding_plan.zig").PROFILE;
+            entry.id = @import("../provider/ids.zig").Slug.lit(std.fmt.comptimePrint("p{d}", .{i + 1}));
+        }
+        return list;
+    }
+}
+
+test "login: past the rows it shows, the list names the rest, and /login <id> still starts one" {
+    const many = comptime manyKeyProviders(14);
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
+    defer dialog.deinit();
+    for (many[0..13]) |*profile| dialog.add(.{ .profile = profile, .method = .api_key });
+    // `/login p14`: the 14th, past the 12 rows.
+    const named = dialog.addNamed(.{ .profile = &many[13], .method = .api_key });
+    try testing.expectEqual(@as(usize, 13), named);
+    try testing.expectEqual(@as(usize, LoginDialog.MAX_PROVIDERS), dialog.listedLen());
+    try testing.expectEqual(@as(usize, 2), dialog.unlistedCount());
+
+    const listed = try renderPlain(&dialog, 160);
+    defer testing.allocator.free(listed);
+    try testing.expect(std.mem.indexOf(u8, listed, "12. Z.AI GLM Coding Plan") != null);
+    try testing.expect(std.mem.indexOf(u8, listed, "13. ") == null);
+    try testing.expect(std.mem.indexOf(u8, listed, "2 more not shown: /login <provider> (p13, p14)") != null);
+    // The keys move over the listed rows only.
+    try testing.expectEqual(Step.redraw, dialog.key(.up));
+    try testing.expectEqual(@as(usize, LoginDialog.MAX_PROVIDERS - 1), dialog.sel);
+    try testing.expectEqual(Step.redraw, dialog.key(.down));
+    try testing.expectEqual(@as(usize, 0), dialog.sel);
+
+    // `/login p14` starts it; Esc leaves it for the list, pointing at a row.
+    dialog.startAt(named);
+    try testing.expectEqual(LoginDialog.Stage.key_page, dialog.stage);
+    try testing.expectEqualStrings("p14", dialog.current().profile.id.slice());
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqual(LoginDialog.Stage.choose, dialog.stage);
+    try testing.expectEqual(@as(usize, 0), dialog.sel);
+}
+
+test "login: past what a dialog holds, the providers are counted and the named one still gets in" {
+    const many = comptime manyKeyProviders(LoginDialog.CAPACITY + 3);
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
+    defer dialog.deinit();
+    for (many[0 .. LoginDialog.CAPACITY + 2]) |*profile| dialog.add(.{ .profile = profile, .method = .api_key });
+    const named = dialog.addNamed(.{ .profile = &many[LoginDialog.CAPACITY + 2], .method = .api_key });
+    try testing.expectEqual(@as(usize, LoginDialog.CAPACITY - 1), named);
+    // Offered: CAPACITY + 3; listed: 12.
+    try testing.expectEqual(@as(usize, LoginDialog.CAPACITY + 3 - LoginDialog.MAX_PROVIDERS), dialog.unlistedCount());
+    // Wide enough that the line is one row.
+    const listed = try renderPlain(&dialog, 400);
+    defer testing.allocator.free(listed);
+    // The ids it holds, then an ellipsis for the ones it only counted.
+    try testing.expect(std.mem.indexOf(u8, listed, "55 more not shown: /login <provider> (p13, p14,") != null);
+    try testing.expect(std.mem.indexOf(u8, listed, "p67, …)") != null);
+    dialog.startAt(named);
+    try testing.expectEqualStrings("p67", dialog.current().profile.id.slice());
 }
 
 test "login: a key provider goes plan page → paste, and the key is never drawn" {

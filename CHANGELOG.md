@@ -396,6 +396,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`/login` names the providers it cannot list.** Its list holds twelve, and
+  the ones past them were dropped without a word; `/login <id>` for one of
+  them then showed the list without it. The list now ends with `N more not
+  shown: /login <provider> (<ids>)`, and `/login <id>` starts any of them.
+
 - **Shift+Enter inserts a newline while a reply streams** (#456). In the
   terminal UI, Shift+Enter during a reply did what Enter does: the draft
   went into the pending queue, the input box was cleared, and when the reply

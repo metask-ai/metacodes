@@ -590,7 +590,10 @@ The two front ends differ only in how the key is typed. The CLI prompts for
 the plan, prints the page whole, opens it, and reads the key with echo off;
 echo goes off before the prompt is written, so a paste that arrives early is
 not echoed by the terminal (`--api-key-stdin` and `--key-page` script it).
-`/login` lists such a provider as "API key" and walks plan page → paste. Both
+`/login` lists such a provider as "API key" and walks plan page → paste. Its
+list shows twelve providers; the pane neither scrolls nor filters, so the
+ones past them are named under the list by id (`N more not shown: /login
+<provider> (…)`), and `/login <id>` starts any of them directly. Both
 mask the key as a character count and draw the page URL whole so it can be
 copied. The picker takes no key (#488): it lists such a provider as not
 configured until a key resolves for it, and says where one goes.
