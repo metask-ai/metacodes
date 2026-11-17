@@ -283,9 +283,8 @@ class Codex:
                         raise LoopError("worker thread belongs to a different worktree")
                     request("thread/resume", {"threadId": thread})
                 else:
-                    # Tool-session admission needs a persisted thread record;
-                    # keep each reviewer independent and read-only, with an
-                    # auditable history rather than an unregistered ephemeral.
+                    # Persist independent read-only reviewers so their identity
+                    # and audit history survive the app-server process.
                     thread = request("thread/start", {"cwd": str(cwd), "sandbox": "read-only",
                                                       "approvalPolicy": "never", "ephemeral": False})["thread"]["id"]
                 # Writable work is confined to the bound checkout. Existing safety

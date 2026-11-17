@@ -137,8 +137,8 @@ answering; an answer does not automatically reconcile a divergent checkout.
 ## Admission contract
 
 1. A review is a fresh, persisted, read-only Codex conversation in a detached snapshot.
-   Persisting the reviewer gives tool-session admission a thread record and
-   retains its audit history; it never reuses the original worker's context.
+   Persisting the reviewer retains its identity and audit history; it never
+   reuses the original worker's context.
    It returns schema-validated `pass`, `fix_required`, `retry` or `needs_decision`.
    A passing report cannot contain unresolved findings or a question.
    A tool or repository-access failure returns `retry` with no findings or
