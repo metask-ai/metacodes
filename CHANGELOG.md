@@ -295,6 +295,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Shift+Enter inserts a newline while a reply streams** (#456). In the
+  terminal UI, Shift+Enter during a reply did what Enter does: the draft
+  went into the pending queue, the input box was cleared, and when the reply
+  ended the line typed so far was sent as the next message. It now inserts
+  a newline in the draft, as it does at the prompt; Enter still queues the
+  whole draft, newline included, as one message.
 - **`/model` names the variable and the file for a provider without a key**
   (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
   chosen without its key ended in `switch failed (MissingCredentials)`: these
