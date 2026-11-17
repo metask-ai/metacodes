@@ -14,6 +14,7 @@ import threading
 import time
 
 from .model import Binding, Busy, LoopError, REPORT_SCHEMA, REQUIRED_CHECKS, SHA, Snapshot, validate_report
+from .policy import require_direct_merge
 
 
 def stop_process(proc):
@@ -90,7 +91,7 @@ class GitHub:
     def checks(self, pr):
         # Actions executes the PR's test merge but attaches its check runs to
         # the PR head SHA. Querying merge_commit_sha misses those runs. The
-        # merge queue performs the final validation against the latest base.
+        # strict up-to-date branch protection rejects a merge after main moves.
         latest = {}
         page = 1
         while True:
@@ -118,13 +119,15 @@ class GitHub:
             "state": state, "context": "agent/review", "description": description[:140],
         })
 
-    def enqueue(self, pr):
-        # Unlike gh pr merge --auto, this never leaves an auto-merge request
-        # waiting to accept a future, unreviewed head. GitHub enforces all rules.
-        self.api("graphql", "POST", {
-            "query": """mutation($input:EnqueuePullRequestInput!){enqueuePullRequest(input:$input){mergeQueueEntry{id}}}""",
-            "variables": {"input": {"pullRequestId": pr.node_id, "expectedHeadOid": pr.head}},
-        })
+    def merge(self, pr):
+        # No deferred auto-merge request: it could accept an unreviewed head.
+        # Strict server-side rules also close the race where main moves after
+        # the controller's final snapshot. Never bypass them.
+        require_direct_merge(self.api(f"repos/{pr.repo}/rules/branches/main"))
+        result = self.api(f"repos/{pr.repo}/pulls/{pr.number}/merge", "PUT", {
+            "sha": pr.head, "merge_method": "merge"})
+        if result.get("merged") is not True or not SHA.fullmatch(result.get("sha", "")):
+            raise LoopError("GitHub did not confirm the exact-head merge: " + json.dumps(result))
 
     def create(self, repo, worktree, head, title, body_file, base):
         return run([*self.command, "pr", "create", "--repo", repo, "--head", head,
@@ -159,11 +162,7 @@ class Git:
 
     @contextmanager
     def review_tree(self, pr):
-        for oid, repo in ((pr.base, pr.repo), (pr.head, pr.head_repo)):
-            try:
-                self.git("cat-file", "-e", oid + "^{commit}")
-            except LoopError:
-                self.git("fetch", "--no-tags", f"https://github.com/{repo}.git", oid)
+        self.fetch_revision(pr)
         with tempfile.TemporaryDirectory(prefix="metacodes-pr-review-") as tmp:
             path = Path(tmp) / "tree"
             self.git("worktree", "add", "--detach", str(path), pr.head)
@@ -171,6 +170,17 @@ class Git:
                 yield path
             finally:
                 self.git("worktree", "remove", "--force", str(path))
+
+    def fetch_revision(self, pr):
+        for oid, repo in ((pr.base, pr.repo), (pr.head, pr.head_repo)):
+            try:
+                self.git("cat-file", "-e", oid + "^{commit}")
+            except LoopError:
+                self.git("fetch", "--no-tags", f"https://github.com/{repo}.git", oid)
+
+    def up_to_date(self, pr):
+        self.fetch_revision(pr)
+        return self.git("merge-base", pr.base, pr.head) == pr.base
 
     def changes(self):
         # NUL-delimited names also cover whitespace and renames without shell parsing.
