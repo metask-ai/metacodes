@@ -575,11 +575,8 @@ fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
 const StoredDefault = startup_order.StoredDefault;
 
 /// Whether the default stored by `/model` can serve this start: its route
-/// resolves and its provider has a credential. A Metask default needs a
-/// Metask device-code session or a Metask key (`metask_key_present`, the
-/// historical path's own sign-in): that is what a named Metask route
-/// authenticates with. Nothing is printed and nothing sent; the strings live
-/// in `arena`.
+/// resolves and its provider has a credential (`storedDefaultOn`). Nothing is
+/// printed and nothing sent; the strings live in `arena`.
 fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_present: bool) StoredDefault {
     var store = provider_config_store.Store.initHome(arena, hostRoot()) catch return .none;
     defer store.deinit();
@@ -588,12 +585,31 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
     const selection = document.global_selection orelse return .none;
     const host = buildProviderHost(arena) orelse return .{ .usable = .{} };
     defer host.destroy();
-    const outcome = provider_startup.resolveSelection(arena, &host.registry, selection) catch return .{ .usable = .{} };
+    return storedDefaultOn(arena, config, metask_key_present, &host.registry, selection);
+}
+
+/// `storedDefault` once the stored selection is read, judged against
+/// `registry`. A Metask default needs a Metask device-code session or a Metask
+/// key (`metask_key_present`, the historical path's own sign-in): that is what
+/// a named Metask route authenticates with. Another provider's needs a key, or
+/// its own sign-in, which counts by being stored (`providerSignInStored`), the
+/// way the Metask session does: refreshing it here would send a request from
+/// `login status` and pass the default over whenever the refresh failed. A
+/// start refreshes it when it uses it. Pub for the component test that gives
+/// the provider a token endpoint of its own.
+pub fn storedDefaultOn(
+    arena: std.mem.Allocator,
+    config: types.Config,
+    metask_key_present: bool,
+    registry: *const provider_registry.ProviderRegistry,
+    selection: provider_selection.RuntimeSelection,
+) StoredDefault {
+    const outcome = provider_startup.resolveSelection(arena, registry, selection) catch return .{ .usable = .{} };
     const route = switch (outcome) {
         .failure => return .{ .usable = .{} },
         .route => |value| value,
     };
-    const provider_name = if (host.registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
+    const provider_name = if (registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
     const label = std.fmt.allocPrint(arena, "{s} · {s}", .{ provider_name, route.request_model_id }) catch return .{ .usable = .{} };
     const usable: StoredDefault.Usable = .{
         .label = label,
@@ -613,11 +629,13 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
         defer session.deinit();
         return if (session.load() catch false) .{ .usable = usable } else .{ .lacks_credential = label };
     }
-    if (resolveProviderScopedCredentialReporting(arena, config, route.provider_id.slice(), .quiet)) |found| {
+    const profile = registry.findById(route.provider_id) orelse return .{ .usable = usable };
+    if (resolveProfileCredential(arena, config, profile, .keys_only)) |found| {
         std.crypto.secureZero(u8, found.secret);
         arena.free(found.secret);
         return .{ .usable = usable };
-    } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .{ .usable = usable };
+    } else |err| if (err != error.MissingCredentials) return .{ .usable = usable };
+    return if (providerSignInStored(arena, config.state_root, profile)) .{ .usable = usable } else .{ .lacks_credential = label };
 }
 
 /// `METACODES_AUTH_PRECEDENCE`, which overrides `--auth-precedence`. A start
@@ -3991,9 +4009,13 @@ pub fn resolveProviderScopedCredential(
     return resolveProviderScopedCredentialReporting(allocator, config, profile_name, .print_help);
 }
 
-/// Whether a failure prints the provider's credential help (`-p`, the CLI)
-/// or leaves saying it to the caller (the TUI's reminder, a dry check).
-const CredentialReport = enum { print_help, quiet };
+/// What a provider-scoped resolution says when it fails, and how far it goes.
+/// `print_help` (`-p`, the CLI) prints the provider's credential help;
+/// `quiet` (the TUI's reminder) leaves saying it to the caller. Both end
+/// with the provider's own sign-in, refreshed when it is due. `keys_only` (a
+/// dry check: the startup order, `login status`) is quiet and stops at the
+/// keys, so it never refreshes a sign-in and sends nothing.
+const CredentialReport = enum { print_help, quiet, keys_only };
 
 fn resolveProviderScopedCredentialReporting(
     allocator: std.mem.Allocator,
@@ -4001,11 +4023,21 @@ fn resolveProviderScopedCredentialReporting(
     profile_name: []const u8,
     report: CredentialReport,
 ) !ScopedCredential {
-    const credential_mod = provider_credential;
-    const provider_ids_local = provider_ids;
     const host = buildProviderHost(allocator) orelse return error.UnknownProviderProfile;
     defer host.destroy();
     const profile = host.registry.find(profile_name) orelse return error.UnknownProviderProfile;
+    return resolveProfileCredential(allocator, config, profile, report);
+}
+
+/// `resolveProviderScopedCredentialReporting` for a profile already found.
+fn resolveProfileCredential(
+    allocator: std.mem.Allocator,
+    config: types.Config,
+    profile: *const provider_profile.ProviderProfile,
+    report: CredentialReport,
+) !ScopedCredential {
+    const credential_mod = provider_credential;
+    const provider_ids_local = provider_ids;
 
     // The key `login --provider` stored for this provider, in its own file.
     var stored_key = provider_api_key_store.load(allocator, config.state_root, profile.id) catch |err| blk: {
@@ -4028,7 +4060,7 @@ fn resolveProviderScopedCredentialReporting(
         // Below every key in the credential order: the provider's own OAuth
         // sign-in (`login --provider`, `/login <provider>`), refreshed first
         // when it expires within two minutes or already has.
-        if (err == error.MissingCredentials) {
+        if (err == error.MissingCredentials and report != .keys_only) {
             if (providerSignInToken(allocator, config.state_root, profile)) |found| {
                 if (found) |token| return .{ .secret = token, .origin = .sign_in };
             } else |sign_in_err| {
@@ -4039,7 +4071,7 @@ fn resolveProviderScopedCredentialReporting(
                 return error.MissingCredentials;
             }
         }
-        if (report == .quiet) return err;
+        if (report != .print_help) return err;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const local_path: []const u8 = if (config.state_root.len == 0) "" else std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{
             config.state_root, std.fs.path.sep, state_env_mod.file_name,
@@ -4070,12 +4102,8 @@ pub fn providerSignInToken(
     state_root: []const u8,
     profile: *const provider_profile.ProviderProfile,
 ) !?[]u8 {
-    if (profile.id.eqlText("metask")) return null;
-    const token_url = profile.oauth_token_url orelse return null;
-    const serves = for (profile.accepted_credential_kinds) |kind| {
-        if (provider_oauth_mod.servesKind(kind)) break true;
-    } else false;
-    if (!serves) return null;
+    if (!signInDeclared(profile)) return null;
+    const token_url = profile.oauth_token_url.?;
     var session = try provider_oauth_mod.Session.initHome(allocator, state_root, profile.id);
     defer session.deinit();
     if (!(try session.load())) return null;
@@ -4088,6 +4116,33 @@ pub fn providerSignInToken(
         .endpoint = .{ .token_url = token_url, .client_id = session.clientIdFor(profile.oauth_client_id) },
     };
     return try session.accessToken(@import("util/time.zig").nowUnix(), exchange.exchange());
+}
+
+/// Whether a start reads `profile`'s own OAuth sign-in at all: it declares a
+/// token endpoint and accepts a credential kind an OAuth token serves.
+/// Metask's sign-in is its own path (`resolveMetaskBearer`).
+fn signInDeclared(profile: *const provider_profile.ProviderProfile) bool {
+    if (profile.id.eqlText("metask") or profile.oauth_token_url == null) return false;
+    for (profile.accepted_credential_kinds) |kind| {
+        if (provider_oauth_mod.servesKind(kind)) return true;
+    }
+    return false;
+}
+
+/// Whether `profile`'s own OAuth sign-in is stored, judged from the file
+/// alone: nothing is refreshed and nothing sent, so one at or past its expiry
+/// counts too (a start refreshes it, `providerSignInToken`). False wherever
+/// that finds none: no sign-in declared, none stored, one that does not
+/// parse, no state root.
+fn providerSignInStored(
+    allocator: std.mem.Allocator,
+    state_root: []const u8,
+    profile: *const provider_profile.ProviderProfile,
+) bool {
+    if (!signInDeclared(profile)) return false;
+    var session = provider_oauth_mod.Session.initHome(allocator, state_root, profile.id) catch return false;
+    defer session.deinit();
+    return session.load() catch false;
 }
 
 /// `command` is the command the user ran (`invokedCommand`); `local_path`

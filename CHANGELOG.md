@@ -432,13 +432,15 @@ status, compatibility boundaries, and entry points are defined by
   `oauth/<provider>.json` reached a session only through a `/model` pick:
   `--provider <id>`, `-p`, and a stored `/model` default on that provider
   found no credential and asked for a key. A start now uses it below every
-  key, refreshing it first when it is at or past expiry, and says `signed
-  in`. `/logout <provider>` and `metacodes logout --provider <id>` removed
-  only a stored key; they now remove the sign-in too, revoked first where
-  the provider declares an endpoint for it (`oauth_revocation`). The help a
-  start prints for a provider that only signs in names `login --provider
-  <id>` and no longer offers `--api-key`, and a refused sign-in is told to
-  sign in again rather than to check a key.
+  key, refreshing it first when it expires within two minutes, and says
+  `signed in`; judging a stored default (`login status`, the startup order)
+  only checks that the sign-in is stored, so it sends nothing and an expired
+  one still counts. `/logout <provider>` and `metacodes logout --provider
+  <id>` removed only a stored key; they now remove the sign-in too, revoked
+  first where the provider declares an endpoint for it (`oauth_revocation`).
+  The help a start prints for a provider that only signs in names `login
+  --provider <id>` and no longer offers `--api-key`, and a refused sign-in
+  is told to sign in again rather than to check a key.
 
 - **Shift+Enter inserts a newline while a reply streams** (#456). In the
   terminal UI, Shift+Enter during a reply did what Enter does: the draft

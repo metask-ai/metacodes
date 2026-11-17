@@ -18,6 +18,8 @@
 //!   the wrong state does not;
 //! - a start refreshes an expired sign-in with the client it recorded, and
 //!   keeps the workspace;
+//! - judging a stored default (`login status`, the startup order) counts the
+//!   sign-in by being stored, near or past its expiry, and sends nothing;
 //! - signing out revokes the refresh token at the endpoint the profile names,
 //!   as JSON, then deletes the sign-in;
 //! - only this route's requests get the Codex body fields.
@@ -483,6 +485,82 @@ test "L2 chatgpt-codex: a start refreshes an expired sign-in with the recorded c
         a.free(again);
     }
     try testing.expectEqualStrings(fresh, again);
+    try testing.expectEqual(@as(usize, 1), token_server.requestCount());
+}
+
+test "L2 chatgpt-codex: a stored default counts its sign-in by being stored, near or past expiry, and sends nothing" {
+    // What `login status` and every start's startup order ask of a default
+    // `/model` stored: can its provider authenticate. Judging that must not
+    // refresh the sign-in: a status command would send a request, and a
+    // refresh that failed (offline, refused) would pass the default over.
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var root: Root = .{ .tmp = undefined };
+    try root.init();
+    defer root.deinit();
+
+    // The real profile with only its token endpoint moved to a local server
+    // that counts what reaches it: whatever refreshed this sign-in would
+    // reach it, and nothing else.
+    const fresh = try accessToken(a, ACCOUNT);
+    defer a.free(fresh);
+    const refreshed = try std.fmt.allocPrint(a, "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt-new\",\"expires_in\":864000}}", .{fresh});
+    defer a.free(refreshed);
+    var token_server = try harness.MockServer.start(refreshed, 0);
+    defer token_server.stop();
+    var profile = codex.PROFILE;
+    profile.oauth_token_url = try std.fmt.allocPrint(fmtArena(), "http://127.0.0.1:{d}/oauth/token", .{token_server.port});
+    var registry = cc.provider_registry.ProviderRegistry.init(a);
+    defer registry.deinit();
+    try registry.register(profile);
+
+    // The default `/model` stores for every future session: GPT-6 Luna here.
+    var catalog = try registry.buildCatalog(a, .{});
+    defer catalog.deinit();
+    const offer = for (catalog.items()) |*candidate| {
+        if (std.mem.eql(u8, candidate.request_model_id, "gpt-6-luna")) break candidate;
+    } else return error.OfferMissing;
+    const selection = cc.provider_selection.RuntimeSelection.pinned(offer.offer_id, offer.offer_revision, .global);
+    var config = cc.parseArgsForTest(&.{"metacodes"}, arena);
+    config.state_root = root.path;
+
+    const access = try accessToken(a, ACCOUNT);
+    defer a.free(access);
+    const now = cc.util_time.nowUnix();
+    // Inside the two-minute refresh margin, then long past expiry: a start
+    // refreshes either before it uses it; judging the default refreshes
+    // neither, and counts both.
+    for ([_]i64{ now + 60, 1 }) |expires_at| {
+        try writeStoredSignIn(&root, a, access, expires_at);
+        const before = try root.read(a, "oauth/chatgpt-codex.json");
+        defer a.free(before);
+        const judged = cc.storedDefaultOn(arena, config, false, &registry, selection);
+        try testing.expect(judged == .usable);
+        try testing.expectEqualStrings("ChatGPT (Codex) · gpt-6-luna", judged.usable.label.?);
+        try testing.expectEqualStrings("chatgpt-codex", judged.usable.provider.?);
+        try testing.expectEqual(@as(usize, 0), token_server.requestCount());
+        const after = try root.read(a, "oauth/chatgpt-codex.json");
+        defer a.free(after);
+        try testing.expectEqualStrings(before, after);
+    }
+
+    // Without a sign-in, the default is passed over, by name.
+    try root.tmp.dir.deleteFile(testing.io, "oauth/chatgpt-codex.json");
+    const without = cc.storedDefaultOn(arena, config, false, &registry, selection);
+    try testing.expect(without == .lacks_credential);
+    try testing.expectEqualStrings("ChatGPT (Codex) · gpt-6-luna", without.lacks_credential);
+
+    // The zero above means something: a start's own resolution of the same
+    // sign-in, inside the margin, does reach the endpoint.
+    try writeStoredSignIn(&root, a, access, now + 60);
+    const token = (try cc.providerSignInToken(a, root.path, &profile)) orelse return error.NoSignIn;
+    defer {
+        std.crypto.secureZero(u8, token);
+        a.free(token);
+    }
+    try testing.expectEqualStrings(fresh, token);
     try testing.expectEqual(@as(usize, 1), token_server.requestCount());
 }
 
