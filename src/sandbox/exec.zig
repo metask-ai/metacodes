@@ -9,7 +9,7 @@
 //!   macOS:  /usr/bin/sandbox-exec -f <profile_file> /bin/bash -c "<cmd>"
 //!           (用 -f 文件而非 -p inline,避免超长 profile 命令行截断;profile.zig)
 //!   Linux:  bwrap --ro-bind / / ... --bind <write roots> ... -- /bin/bash -c "<cmd>"
-//!           (挂载命名空间,无临时文件;bwrap.zig 有逐项映射表与定位/探测规则)
+//!           (挂载命名空间 + seccomp; launcher 经管道传 BPF,无临时文件)
 //! Windows 等其它平台无后端:plan 给 passthrough / unavailable。
 
 const std = @import("std");
@@ -19,6 +19,7 @@ const ppaths = @import("platform").paths;
 const builtin = @import("builtin");
 const profile_mod = @import("profile.zig");
 const bwrap_mod = @import("bwrap.zig");
+const seccomp = @import("seccomp.zig");
 const config_mod = @import("config.zig");
 const util_json = @import("../util/json.zig");
 
@@ -26,7 +27,7 @@ const util_json = @import("../util/json.zig");
 pub const Backend = enum {
     /// macOS `sandbox-exec` with a generated SBPL profile (profile.zig).
     seatbelt,
-    /// Linux bubblewrap mount/pid/ipc(/net) namespaces (bwrap.zig).
+    /// Linux bubblewrap namespaces plus syscall filtering (bwrap/seccomp.zig).
     bwrap,
 };
 
@@ -109,6 +110,9 @@ pub const Plan = enum {
 pub fn plan(sb: *const config_mod.SandboxSettings, cmd: []const u8, disable_for_this_command: bool) Plan {
     // 1. 未启用 / 单次禁用 → passthrough
     if (!sb.enabled or disable_for_this_command) return .passthrough;
+    // No reviewed ABI policy means no Linux sandbox, regardless of the
+    // optional-backend setting. Never mislabel a foreign ABI as confined.
+    if (builtin.os.tag == .linux and !seccomp.supported()) return .unavailable;
     // 2. 本机无可用后端(非 macOS/Linux、sandbox-exec 不存在、bwrap 缺失或建不了命名空间)
     //    → unavailable / passthrough
     if (!hostSupported()) return if (sb.fail_if_unavailable) .unavailable else .passthrough;
@@ -659,6 +663,11 @@ fn runWrapped(cmd: []const u8, opts: WrapOptions) !Ran {
     defer wc.deinit();
     try testing.expectEqual(Backend.bwrap, wc.backend);
     try testing.expect(wc.profile_path == null);
+    return captureWrapped(&wc);
+}
+
+fn captureWrapped(wc: *const WrappedCommand) !Ran {
+    const alloc = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -892,4 +901,349 @@ test "bwrap L2: a bwrap that is missing, relative or cannot sandbox fails closed
         // so autoAllowBashIfSandboxed does not apply.
         try testing.expectEqual(Plan.passthrough, plan(&lax, "touch x", false));
     }
+}
+
+// Independent syscall numbers in the kernel-facing consumer keep these tests
+// from merely restating the generator's std.os.linux enum/table lookups.
+const seccomp_probe =
+    \\import array, ctypes, errno, os, platform, socket, subprocess, sys, threading
+    \\libc = ctypes.CDLL(None, use_errno=True)
+    \\libc.syscall.restype = ctypes.c_long
+    \\arm = platform.machine() == 'aarch64'
+    \\def raw(nr, *args):
+    \\    ctypes.set_errno(0)
+    \\    result = libc.syscall(ctypes.c_long(nr), *[ctypes.c_long(v) for v in (args + (0,)*6)[:6]])
+    \\    return result, ctypes.get_errno()
+    \\def denied(nr, *args):
+    \\    result, err = raw(nr, *args)
+    \\    assert (result, err) == (-1, errno.EPERM), (nr, result, err)
+    \\for nr in ([117, 270, 271, 280, 241, 282, 97, 268, 40, 39, 41, 51] if arm else
+    \\           [101, 310, 311, 321, 298, 323, 272, 308, 165, 166, 155, 161]):
+    \\    denied(nr)
+    \\for nr in [425, 426, 427, 428, 429, 430, 431, 432, 433, 438, 442]:
+    \\    denied(nr)
+    \\# Even invalid fds/arguments yield policy EPERM, before kernel validation.
+    \\denied(29 if arm else 16, -1, 0x5412)
+    \\denied(29 if arm else 16, -1, 0x10000541c)
+    \\for flag in [0x80, 0x20000, 0x2000000, 0x4000000, 0x8000000, 0x10000000, 0x20000000, 0x40000000]:
+    \\    denied(220 if arm else 56, flag | 17)
+    \\assert raw(435) == (-1, errno.ENOSYS)
+    \\for nr in [198 if arm else 41, 199 if arm else 53]:
+    \\    denied(nr, 40, 1) # AF_VSOCK, including socketpair
+    \\    denied(nr, 0x100000028, 1) # kernel truncates domain to int
+    \\denied(199 if arm else 53, 1, 2) # AF_UNIX SOCK_DGRAM pairs can target host paths
+    \\isolated = sys.argv[1] == 'isolated'
+    \\for family in [1, 16, 17, 31]:
+    \\    denied(198 if arm else 41, family, 1)
+    \\if isolated:
+    \\    for family in [2, 10, 16, 17, 31]:
+    \\        denied(198 if arm else 41, family, 1)
+    \\else:
+    \\    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    \\        s.bind(('127.0.0.1', 0)); s.listen()
+    \\        with socket.create_connection(s.getsockname()) as c:
+    \\            conn, _ = s.accept()
+    \\            with conn:
+    \\                c.sendall(b'tcp'); assert conn.recv(3) == b'tcp'
+;
+
+const seccomp_probe_ipc =
+    \\a, b = socket.socketpair()
+    \\with a, b:
+    \\    a.sendall(b'local'); assert b.recv(5) == b'local'
+    \\# The filesystem helper receives file descriptors over a connected pair.
+    \\a, b = socket.socketpair()
+    \\with a, b, open('rights-%d.txt' % os.getpid(), 'w+') as f:
+    \\    f.write('descriptor'); f.flush(); f.seek(0)
+    \\    receiver = '''import array, os, socket, sys
+    \\s = socket.socket(fileno=int(sys.argv[1]))
+    \\data, anc, flags, addr = s.recvmsg(1, socket.CMSG_SPACE(array.array('i').itemsize))
+    \\assert data == b'f' and len(anc) == 1
+    \\level, kind, payload = anc[0]
+    \\assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+    \\fds = array.array('i'); fds.frombytes(payload[:fds.itemsize])
+    \\assert os.read(fds[0], 10) == b'descriptor'
+    \\os.close(fds[0]); s.sendmsg([b'ok']); s.close()
+    \\'''
+    \\    child = subprocess.Popen(['/usr/bin/python3', '-c', receiver, str(b.fileno())], pass_fds=(b.fileno(),))
+    \\    a.sendmsg([b'f'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [f.fileno()]))])
+    \\    assert a.recvmsg(2)[0] == b'ok'; assert child.wait() == 0
+    \\with open('ordinary-%d.txt' % os.getpid(), 'w+') as f:
+    \\    f.write('read/write works'); f.seek(0); assert f.read() == 'read/write works'
+    \\assert libc.prctl(21, 0, 0, 0, 0) == 2 # PR_GET_SECCOMP
+    \\assert libc.prctl(39, 0, 0, 0, 0) == 1 # PR_GET_NO_NEW_PRIVS
+    \\assert libc.prctl(38, 0, 0, 0, 0) == -1 # cannot undo no_new_privs
+    \\for fd in [8, 9]:
+    \\    try: os.fstat(fd)
+    \\    except OSError as e: assert e.errno == errno.EBADF
+    \\    else: raise AssertionError('launcher fd leaked')
+    \\done = []
+    \\def worker():
+    \\    denied(425); done.append(True)
+    \\thread = threading.Thread(target=worker)
+    \\thread.start(); thread.join(); assert done == [True]
+    \\if len(sys.argv) < 3:
+    \\    subprocess.check_call(['/usr/bin/python3', __file__, sys.argv[1], 'child'])
+    \\    print('PARENT_FILTER_OK')
+    \\else:
+    \\    print('EXEC_CHILD_FILTER_OK')
+;
+
+test "bwrap L2 seccomp: kernel denials, inherited filter, ordinary IO and network variants" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireBwrap();
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    // Each child runs the same independent syscall consumer after exec.
+    const script = seccomp_probe ++ "\n" ++ seccomp_probe_ipc;
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "probe.py", .data = script });
+    for ([_]bool{ false, true }) |isolated| {
+        const sb = config_mod.SandboxSettings{ .enabled = true, .allowed_domains = if (isolated) &.{"example.invalid"} else &.{} };
+        const ran = try runWrapped(if (isolated) "python3 probe.py isolated" else "python3 probe.py shared", .{ .cwd = t.root(), .sandbox = &sb });
+        defer ran.deinit();
+        errdefer std.debug.print("stdout={s}\nstderr={s}\n", .{ ran.stdout, ran.stderr });
+        try testing.expectEqual(@as(i32, 0), ran.code);
+        try testing.expect(ran.has("PARENT_FILTER_OK"));
+        try testing.expect(ran.has("EXEC_CHILD_FILTER_OK"));
+    }
+}
+
+test "bwrap L2 seccomp: x32 and foreign audit ABI die in the kernel" {
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    try requireBwrap();
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    const sb = config_mod.SandboxSettings{ .enabled = true };
+    const ran = try runWrapped(
+        \\python3 - <<'PY'
+        \\import ctypes, mmap, os, resource, signal
+        \\resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        \\for machine_code in [
+        \\    bytes.fromhex('b8270000400f05c3'), # x32 getpid
+        \\    bytes.fromhex('b8000200000f05c3'), # legacy untagged x32 nr 512
+        \\    bytes.fromhex('b814000000cd80c3'), # i386 getpid via int 0x80
+        \\]:
+        \\    pid = os.fork()
+        \\    if pid == 0:
+        \\        page = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
+        \\        page.write(machine_code)
+        \\        fn = ctypes.CFUNCTYPE(ctypes.c_long)(ctypes.addressof(ctypes.c_char.from_buffer(page)))
+        \\        fn(); os._exit(99)
+        \\    _, status = os.waitpid(pid, 0)
+        \\    assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGSYS, status
+        \\print('ABI_GUARD_OK')
+        \\PY
+    , .{ .cwd = t.root(), .sandbox = &sb });
+    defer ran.deinit();
+    errdefer std.debug.print("stdout={s}\nstderr={s}\n", .{ ran.stdout, ran.stderr });
+    try testing.expectEqual(@as(i32, 0), ran.code);
+    try testing.expect(ran.has("ABI_GUARD_OK"));
+}
+
+fn agentFilterCount() !u32 {
+    const fd = try pfs.openZ("/proc/self/status", .{ .ACCMODE = .RDONLY }, 0);
+    defer _ = pfs.close(fd);
+    var buf: [8192]u8 = undefined;
+    const n = try pfs.readZ(fd, &buf);
+    const key = "Seccomp_filters:\t";
+    const start = (std.mem.indexOf(u8, buf[0..n], key) orelse return error.MissingSeccompStatus) + key.len;
+    return std.fmt.parseInt(u32, std.mem.sliceTo(buf[start..n], '\n'), 10);
+}
+
+test "bwrap L2 seccomp: compiler and child exec work without filtering the agent" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireBwrap();
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    const before = try agentFilterCount();
+    const sb = config_mod.SandboxSettings{ .enabled = true };
+    const ran = try runWrapped(
+        \\export PATH=/usr/bin:/bin
+        \\printf '#include <stdio.h>\nint main(void) { puts("COMPILED_OK"); return 0; }\n' > main.c
+        \\/usr/bin/cc main.c -o program && ./program
+    , .{ .cwd = t.root(), .sandbox = &sb });
+    defer ran.deinit();
+    errdefer std.debug.print("stdout={s}\nstderr={s}\n", .{ ran.stdout, ran.stderr });
+    try testing.expectEqual(@as(i32, 0), ran.code);
+    try testing.expect(ran.has("COMPILED_OK"));
+    try testing.expectEqual(before, try agentFilterCount());
+}
+
+test "bwrap L2 seccomp: detached shell carries its filter without files or parent fds" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireBwrap();
+    const alloc = testing.allocator;
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    const sb = config_mod.SandboxSettings{ .enabled = true };
+    const opts = WrapOptions{ .cwd = t.root(), .sandbox = &sb };
+    var wc = (try wrapCommand(alloc, "true", opts)).wrapped;
+    wc.deinit(); // Unused wrapper owns only memory, no filesystem/fd resource.
+
+    var shell = (try wrapAsShellString(alloc,
+        \\python3 - <<'PY'
+        \\import ctypes, errno
+        \\libc = ctypes.CDLL(None, use_errno=True)
+        \\assert libc.syscall(425, 0, 0) == -1 and ctypes.get_errno() == errno.EPERM
+        \\print('DETACHED_FILTER_OK')
+        \\PY
+    , opts)).?;
+    const command = try alloc.dupe(u8, shell.command);
+    defer alloc.free(command);
+    try testing.expect(shell.profile_path == null);
+    shell.detached = true;
+    shell.deinit(); // Before launcher startup, exercising the spawn race.
+    const stdout = try runShell(alloc, command);
+    defer alloc.free(stdout);
+    try testing.expect(std.mem.indexOf(u8, stdout, "DETACHED_FILTER_OK") != null);
+    var input_wrap = (try wrapAsShellString(alloc, "IFS= read -r line; [ \"$line\" = STDIN_OK ] && echo STDIN_PRESERVED", opts)).?;
+    defer input_wrap.deinit();
+    const piped = try std.fmt.allocPrint(alloc, "printf 'STDIN_OK\\n' | {s}", .{input_wrap.command});
+    defer alloc.free(piped);
+    const input_stdout = try runShell(alloc, piped);
+    defer alloc.free(input_stdout);
+    try testing.expect(std.mem.indexOf(u8, input_stdout, "STDIN_PRESERVED") != null);
+}
+
+test "bwrap L2 seccomp: empty or corrupt delivery refuses to run payload" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireBwrap();
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    const sb = config_mod.SandboxSettings{ .enabled = true };
+    for ([_]bool{ false, true }) |corrupt| {
+        var wc = (try wrapCommand(testing.allocator, "touch PAYLOAD_RAN", .{ .cwd = t.root(), .sandbox = &sb })).wrapped;
+        defer wc.deinit();
+        // Replace only the BPF producer's positional argument. No valid
+        // filter => bwrap must fail rather than execute the payload bare.
+        const args: [][]const u8 = @constCast(wc.argv);
+        const bad = try testing.allocator.dupe(u8, if (corrupt) "\\0001\\0002\\0003" else "");
+        testing.allocator.free(args[4]);
+        args[4] = bad;
+        const ran = try captureWrapped(&wc);
+        defer ran.deinit();
+        try testing.expect(ran.code != 0);
+        try testing.expect(!pfs.exists(t.path("PAYLOAD_RAN")));
+    }
+}
+
+test "bwrap L2 seccomp: readable host Unix listeners cannot bypass mount protection" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireBwrap();
+    const alloc = testing.allocator;
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "unix-child.py", .data =
+        \\import errno, os, socket
+        \\assert os.path.exists('host.sock') and os.path.exists('host.dgram')
+        \\for kind, name in [(socket.SOCK_STREAM, 'host.sock'), (socket.SOCK_DGRAM, 'host.dgram')]:
+        \\    try:
+        \\        with socket.socket(socket.AF_UNIX, kind) as s:
+        \\            s.connect(name); s.sendall(b'ESCAPED')
+        \\    except OSError as e:
+        \\        assert e.errno == errno.EPERM, e
+        \\    else:
+        \\        raise AssertionError('host listener reached')
+        \\# A connected datagram pair is NOT safe: it can address a host path.
+        \\try:
+        \\    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        \\except OSError as e:
+        \\    assert e.errno == errno.EPERM, e
+        \\else:
+        \\    a.sendto(b'ESCAPED', 'host.dgram'); raise AssertionError('datagram pair escaped')
+        \\for kind in [socket.SOCK_STREAM, socket.SOCK_SEQPACKET]:
+        \\    a, b = socket.socketpair(socket.AF_UNIX, kind)
+        \\    with a, b:
+        \\        try: a.connect('host.sock')
+        \\        except OSError: pass
+        \\        else: raise AssertionError('connected pair retargeted')
+        \\        try: a.sendmsg([b'ESCAPED'], [], 0, 'host.sock')
+        \\        except OSError: pass
+        \\        else: assert b.recv(7) == b'ESCAPED' # SEQPACKET ignores the address
+        \\print('UNIX_HOST_BLOCKED')
+    });
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "unix-host.py", .data =
+        \\import json, os, socket, subprocess, sys
+        \\os.chdir(os.path.dirname(__file__))
+        \\with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as dgram:
+        \\    stream.bind('host.sock'); stream.listen(); stream.settimeout(0.1)
+        \\    dgram.bind('host.dgram'); dgram.settimeout(0.1)
+        \\    # Confirm that both host endpoints work before testing confinement.
+        \\    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+        \\        control.connect('host.sock')
+        \\        accepted, _ = stream.accept(); accepted.close()
+        \\    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as control:
+        \\        control.sendto(b'control', 'host.dgram'); assert dgram.recv(7) == b'control'
+        \\    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        \\    with a, b:
+        \\        a.sendto(b'pair bypass', 'host.dgram'); assert dgram.recv(20) == b'pair bypass'
+        \\    argv = json.load(open(sys.argv[1]))
+        \\    result = subprocess.run(argv, capture_output=True, timeout=10)
+        \\    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+        \\    assert b'UNIX_HOST_BLOCKED' in result.stdout
+        \\    for listener in [stream, dgram]:
+        \\        try:
+        \\            if listener is stream: listener.accept()
+        \\            else: listener.recv(100)
+        \\        except TimeoutError:
+        \\            pass
+        \\        else:
+        \\            raise AssertionError('sandbox reached host listener')
+        \\    for fd in [8, 9]:
+        \\        os.dup2(0, fd)
+        \\        collision = subprocess.run(argv, capture_output=True, pass_fds=(fd,), timeout=10)
+        \\        assert collision.returncode == 125 and b'reserved' in collision.stderr, collision
+        \\        os.close(fd)
+        \\os.unlink('host.sock'); os.unlink('host.dgram')
+        \\print('HOST_LISTENERS_UNREACHED')
+    });
+    for ([_]bool{ false, true }) |isolated| {
+        const sb = config_mod.SandboxSettings{ .enabled = true, .allowed_domains = if (isolated) &.{"example.invalid"} else &.{} };
+        var wc = (try wrapCommand(alloc, "/usr/bin/python3 unix-child.py", .{ .cwd = t.root(), .sandbox = &sb })).wrapped;
+        defer wc.deinit();
+        const json = try std.json.Stringify.valueAlloc(alloc, wc.argv, .{});
+        defer alloc.free(json);
+        try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "unix-argv.json", .data = json });
+        const host_script = try alloc.dupeZ(u8, t.path("unix-host.py"));
+        defer alloc.free(host_script);
+        const argv = [_]?[*:0]const u8{ "/usr/bin/python3", host_script.ptr, "unix-argv.json", null };
+        const out = try pprocess.capture(&argv, alloc, .{ .timeout_ms = RUN_SHELL_TIMEOUT_MS });
+        defer alloc.free(out.stdout);
+        defer alloc.free(out.stderr);
+        errdefer std.debug.print("host stdout={s}\nhost stderr={s}\n", .{ out.stdout, out.stderr });
+        try testing.expectEqual(@as(i32, 0), out.exit_code);
+        try testing.expect(std.mem.indexOf(u8, out.stdout, "HOST_LISTENERS_UNREACHED") != null);
+    }
+}
+
+test "bwrap L2 seccomp: availability rejects a backend without filter support" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var t: Tree = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "legacy-bwrap", .data =
+        \\#!/bin/sh
+        \\# Simulate a legacy backend: namespace options work, --seccomp does not.
+        \\for arg do
+        \\    [ "$arg" != --seccomp ] || exit 64
+        \\done
+        \\exit 0
+        \\
+    });
+    const executable = t.path("legacy-bwrap");
+    try testing.expectEqual(@as(c_int, 0), pfs.chmod(executable, 0o755));
+    const saved: ?[:0]u8 = if (ppaths.bwrapEnv()) |v| try testing.allocator.dupeZ(u8, v) else null;
+    defer if (saved) |v| testing.allocator.free(v);
+    defer if (saved) |v| ppaths.setEnv("METACODES_BWRAP", v.ptr) else ppaths.unsetEnv("METACODES_BWRAP");
+    ppaths.setEnv("METACODES_BWRAP", executable);
+    try testing.expectEqual(bwrap_mod.Availability.probe_failed, bwrap_mod.availability());
+    const strict = config_mod.SandboxSettings{ .enabled = true, .fail_if_unavailable = true };
+    try testing.expectEqual(Plan.unavailable, plan(&strict, "true", false));
+    try testing.expectError(error.SandboxUnavailable, wrapAsShellString(testing.allocator, "true", .{ .cwd = t.root(), .sandbox = &strict }));
 }
