@@ -116,6 +116,7 @@ const model_picker_mod = @import("repl/model_picker.zig");
 const route_strings_mod = @import("app/route_strings.zig");
 pub const route_state_mod = @import("app/route_state.zig");
 const sign_out_mod = @import("app/sign_out.zig");
+const providers_cli_mod = @import("app/providers_cli.zig");
 const provider_startup_mod = @import("provider/startup.zig");
 const kg_provider_audit = @import("kg/provider_audit.zig");
 const provider_alias_mod = @import("provider/alias.zig");
@@ -4000,11 +4001,25 @@ pub const App = struct {
         return false;
     }
 
-    pub fn removeProviderConfiguration(app: *App, id: provider_ids_mod.Slug) !void {
+    /// `/providers remove <id>`. A built-in provider loses its settings
+    /// (`providers.<id>`). One the user defined goes the way `metacodes
+    /// providers remove` takes it (`providers_cli.removeProvider`): its
+    /// definition, settings, stored key and login, and a default on one of
+    /// its models — so it does not come back at the next start. Its routes
+    /// stay in this session's catalog until then: the host reads definitions
+    /// once, when it starts.
+    pub fn removeProviderConfiguration(app: *App, id: provider_ids_mod.Slug) !providers_cli_mod.Removal {
         var store = try provider_config_store.Store.initHome(app.allocator, app.stateRoot());
         defer store.deinit();
+        if (providers_cli_mod.isDefined(app.allocator, app.stateRoot(), id)) {
+            const removed = try providers_cli_mod.removeProvider(app.allocator, app.stateRoot(), id);
+            if (removed.revision) |revision| try app.reapplyProviderConfiguration(&store, revision);
+            if (removed.default_forgotten) (try app.providerHost()).kernel.forgetGlobalSelection();
+            return removed;
+        }
         const result = try provider_config_store.removeProvider(&store, id, null);
         try app.reapplyProviderConfiguration(&store, result.config_revision);
+        return .{ .settings = true, .revision = result.config_revision };
     }
 
     fn reapplyProviderConfiguration(

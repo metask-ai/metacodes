@@ -291,8 +291,10 @@ metacodes providers remove my-relay
   operator is not sent to another.
 - **`remove`** takes the provider whole: its definition, its settings
   (`providers.<id>`, which `/providers disable` writes), its stored key and
-  stored login, and the default model when that was one of its. A running session keeps
-  listing a removed provider until it restarts.
+  stored login, and the default model when that was one of its. `/providers
+  remove <id>` in the terminal UI does the same for a provider you defined;
+  for a built-in vendor it removes only that vendor's settings. A running
+  session keeps listing a removed provider until it restarts.
 
 ### Examples
 

@@ -1089,6 +1089,18 @@ pub fn removeProvider(gpa: std.mem.Allocator, state_root: []const u8, id: Slug) 
     return out;
 }
 
+/// Whether `<state root>/config.json` defines `id` under `custom_providers`.
+pub fn isDefined(gpa: std.mem.Allocator, state_root: []const u8, id: Slug) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var file = config_store.Store.initHome(gpa, state_root) catch return false;
+    defer file.deinit();
+    const text = file.readText() catch return false;
+    defer gpa.free(text);
+    const section = (customSection(arena_state.allocator(), text) catch return false) orelse return false;
+    return section.get(id.slice()) != null;
+}
+
 const ResolvedKey = struct {
     /// In the command's arena.
     secret: []const u8,

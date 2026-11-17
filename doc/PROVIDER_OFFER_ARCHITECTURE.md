@@ -795,7 +795,10 @@ instance, and `/providers remove <id>` deletes its configuration. Disabling
 preserves the instance's configuration and credential references — that is the
 whole difference from removing it — and excludes it from the *catalog*, so
 "disabled" is true in the picker, `model.list`, and `--provider` at once rather
-than being re-checked at three call sites.
+than being re-checked at three call sites. For a provider defined in
+`custom_providers`, removing takes the definition too (below): removing only
+its `providers.<id>` left the definition in the file, and the provider came
+back at the next start.
 
 `metacodes providers add|probe|list|remove` (`src/app/providers_cli.zig`;
 the user's guide is [PROVIDERS.md](PROVIDERS.md#a-model-api-of-your-own))
@@ -834,7 +837,8 @@ writes and reads the same section without hand-written JSON:
   key follows no redirect), with the key placed by the profile's auth
   scheme, and stores nothing. `add --probe` writes the limits a listing
   reports with each model it adds.
-- `remove <id>` is `providers_cli.removeProvider`: one commit
+- `remove <id>` is `providers_cli.removeProvider`, which `/providers remove`
+  calls for a defined provider too: one commit
   (`config_store.removeCustomProvider`) drops `custom_providers.<id>`,
   `providers.<id>` and a `global_selection` that resolved to it (only if it is
   still the selection the command resolved), then `keys/<id>.json` and
@@ -1075,7 +1079,7 @@ on a second line of its confirmation, who bills the session from then on.
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization; rendering and patching a definition |
 | `src/provider/model_listing.zig` | where each wire lists its models, and reading the answer (no I/O) |
 | `src/api/model_probe.zig` | the model-listing GET (`providers probe`, `add --probe`) |
-| `src/app/providers_cli.zig` | `metacodes providers` (`add`, `probe`, `list`, `remove`) |
+| `src/app/providers_cli.zig` | `metacodes providers` (`add`, `probe`, `list`, `remove`); the removal `/providers remove` shares |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
 | `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
 | `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |

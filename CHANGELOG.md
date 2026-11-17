@@ -467,6 +467,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`/providers remove <id>` no longer leaves a defined provider behind.** For
+  a provider defined in `custom_providers` it removed only its settings
+  (`providers.<id>`), so the definition stayed in `config.json` and the
+  provider came back at the next start. It now removes it whole, as
+  `metacodes providers remove` does: the definition, its settings, its stored
+  key and login, and a default on one of its models. A built-in vendor still
+  loses only its settings.
+
 - **`/login` names the providers it cannot list.** Its list holds twelve, and
   the ones past them were dropped without a word; `/login <id>` for one of
   them then showed the list without it. The list now ends with `N more not

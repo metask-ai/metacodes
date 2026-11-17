@@ -25,7 +25,9 @@
 //! - `--replace` changes what it is given, keeps what was written by hand,
 //!   and refuses a new address while a key stored for the old one would
 //!   follow it.
-
+//!
+//! `/providers remove` in the terminal UI takes a defined provider whole, so
+//! it does not come back at the next start.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -617,4 +619,33 @@ test "providers --help is written to stdout" {
     try help.expectExit(0);
     try expectContains(help.stdout, "usage: metacodes providers add <id> --base-url <url> --protocol <wire>");
     try testing.expectEqual(@as(usize, 0), help.stderr.len);
+}
+
+// ── /providers remove in the terminal UI ─────────────────────────────────────
+
+test "the TUI's /providers remove takes a defined provider whole, and a built-in one's settings only" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    const a = case.arena();
+    try (try case.run(&.{}, &.{ "providers", "add", "relay", "--base-url", "https://relay.example.com/v1", "--protocol", "openai_chat", "--model", "glm-4.6" })).expectExit(0);
+    try case.write("state/keys/relay.json", "{\"schema_version\":1,\"kind\":\"api_key\",\"key\":\"sk-x\",\"stored_at\":1}");
+
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    var config = cc.parseArgsForTest(&.{"metacodes"}, a);
+    config.state_root = case.state;
+    const app = try cc.app_module.App.initWithOptions(testing.allocator, io_runtime.io(), config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
+    defer app.deinit();
+    try app.setProviderEnabled(Slug.lit("deepseek"), false);
+
+    const removed = try app.removeProviderConfiguration(Slug.lit("relay"));
+    try testing.expect(removed.definition);
+    try testing.expect(removed.key);
+    try testing.expect((try case.definition("relay")) == null);
+    try testing.expect(!case.exists("state/keys/relay.json"));
+
+    const shipped = try app.removeProviderConfiguration(Slug.lit("deepseek"));
+    try testing.expect(!shipped.definition);
+    try expectAbsent(try case.read("state/config.json"), "\"deepseek\"");
 }
