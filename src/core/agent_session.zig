@@ -190,7 +190,7 @@ test "default AgentRuntime preserves the coding tool surface through first-party
     const inventory = try runtime.describePlugins(std.testing.allocator);
     defer std.testing.allocator.free(inventory);
     try std.testing.expect(std.mem.indexOf(u8, inventory, "metacodes.core.coding") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":11") != null);
 }
 
 test "Runtime creation refuses Glob/Grep when their ripgrep dependency is unresolvable" {
