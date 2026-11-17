@@ -267,6 +267,29 @@ Pro refuses a request with thinking off. K3.1 Pro and K3 declare 262,144
 tokens, the window every plan that offers them gets; quotes stay `unknown`, as
 for the GLM plan.
 
+## Subscription plans
+
+`ProviderProfile.subscription_plan` marks a coding plan billed by the month
+rather than by the token: `kimi-code` and `zai-coding-plan` today, and a test
+in `provider/registry.zig` keeps a new one a deliberate entry. The vendors
+license these plans for a person working in a coding tool — Kimi Code's
+community guidelines name personal, interactive use, and the GLM Coding
+Plan's subscription agreement the tools Zhipu lists — so a start with nobody
+at the keyboard (`-p`, `serve`, a resumed suspension, the REPL reading a pipe)
+prints one `warning:` line on stderr saying so. It never refuses and never
+changes the exit code: the terms are the vendor's to enforce. `--web` is a
+person in a browser and a teammate answers to its lead's session; neither
+prints it.
+
+## User-Agent
+
+Every request says what it is: `src/api/http_connection.zig`, which all of
+`src/` sends through, sets `User-Agent: metacodes/<version>` unless the
+caller names itself (the OTLP exporter keeps `metacodes-otlp`). Vendors
+tell coding tools apart by this header, some refuse a client they do not
+recognise, and their terms forbid a forged one; an honest name is the only
+one a vendor can be asked to admit.
+
 ## Credential pools
 
 A provider can have several credentials — separate accounts, separate plans —

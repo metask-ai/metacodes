@@ -23,7 +23,11 @@
 //! - the file's `METASK_API_KEY` is a sign-in only while the file names no
 //!   provider other than Metask: a named DeepSeek beside it wins, and the
 //!   key does not outrank a login stored in `auth.json` either;
-//! - `doctor` lists the names, never the values.
+//! - `doctor` lists the names, never the values;
+//! - a subscription plan the file configures (the GLM Coding Plan) says once
+//!   on stderr that `-p` is not the interactive use it is licensed for; a
+//!   pay-as-you-go provider says nothing; every request names metacodes as
+//!   its User-Agent, not std's `zig/<version> (std.http)`.
 //!
 //! In process, on a real `App` built with the layer the CLI builds
 //! (`Config.credential_env_fallback`): a `/model` pick mid-session and a
@@ -189,6 +193,16 @@ fn expectOneRequest(run: Run, server: *harness.MockServer, path: []const u8, key
     return captured;
 }
 
+/// The request says it is metacodes (`metacodes/<semver>`), not std's default.
+fn expectMetacodesUserAgent(captured: harness.CapturedRequest) !void {
+    const value = headerValue(captured, "user-agent") orelse {
+        std.debug.print("no user-agent in:\n{s}\n", .{captured.raw});
+        return error.TestUnexpectedResult;
+    };
+    var expected_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&expected_buf, "metacodes/{s}", .{cc.VERSION}), value);
+}
+
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) == null) {
         std.debug.print("expected to find `{s}` in:\n{s}\n", .{ needle, haystack });
@@ -224,6 +238,33 @@ test "state .env: its key and METACODES_PROVIDER reach the request; one provider
     const selected = try case.run(&.{try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}", .{try originOf(a, only)})}, &.{ "-p", "hi" });
     const request = try expectOneRequest(selected, only, "/chat/completions", "sk-file-only");
     try testing.expectEqualStrings("\"deepseek-v4-pro\"", request.jsonField("model") orelse "");
+}
+
+test "state .env: a subscription plan run from -p says so once on stderr; a metered one does not; both requests name metacodes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena();
+
+    // The GLM Coding Plan, on its default (Anthropic) wire.
+    var plan_server = try harness.MockServer.start(ANTHROPIC_SSE, 0);
+    defer plan_server.stop();
+    try case.write("state/.env", "ZAI_API_KEY=sk-plan\nMETACODES_PROVIDER=zai-coding-plan\n");
+    const plan = try case.run(&.{try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}/api/anthropic", .{try originOf(a, plan_server)})}, &.{ "-p", "hi" });
+    const plan_request = try expectOneRequest(plan, plan_server, "/api/anthropic/v1/messages", "sk-plan");
+    try expectMetacodesUserAgent(plan_request);
+    const notice = "warning: Z.AI GLM Coding Plan is a subscription plan for interactive use; its terms may not cover -p, serve or CI.";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, plan.stderr, notice));
+
+    // DeepSeek bills by the token: nothing to say.
+    var metered_server = try harness.MockServer.start(OPENAI_SSE, 0);
+    defer metered_server.stop();
+    try case.write("state/.env", "DEEPSEEK_API_KEY=sk-metered\nMETACODES_PROVIDER=deepseek\n");
+    const metered = try case.run(&.{try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}", .{try originOf(a, metered_server)})}, &.{ "-p", "hi" });
+    const metered_request = try expectOneRequest(metered, metered_server, "/chat/completions", "sk-metered");
+    try expectMetacodesUserAgent(metered_request);
+    try expectAbsent(metered.stderr, "subscription plan");
 }
 
 test "state .env: keys of two providers and no name stop the run before any request, naming both (#486)" {

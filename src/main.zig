@@ -738,6 +738,16 @@ fn providerDisplayName(arena: std.mem.Allocator, name: []const u8) []const u8 {
     return arena.dupe(u8, profile.display_name) catch name;
 }
 
+/// `name`'s display name when it is a subscription plan in the registry this
+/// run builds (`ProviderProfile.subscription_plan`), else null; in `arena`.
+fn subscriptionPlanName(arena: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    const host = buildProviderHost(arena) orelse return null;
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse return null;
+    if (!profile.subscription_plan) return null;
+    return arena.dupe(u8, profile.display_name) catch null;
+}
+
 /// Whether `name` (a provider id or alias, as `--provider` takes it) is
 /// Metask in the registry this run builds.
 fn providerIsMetask(allocator: std.mem.Allocator, name: []const u8) bool {
@@ -1458,6 +1468,17 @@ pub fn main(init: std.process.Init) !void {
         else => null,
     };
     if (skipped_default_notice) |notice| if (!interactive_tui) std.debug.print("warning: {s}\n", .{notice});
+    // A subscription plan is licensed for a person in a coding tool
+    // (`ProviderProfile.subscription_plan`). Said once when nobody is at the
+    // keyboard: `-p`, `serve`, a resumed suspension, the REPL reading a pipe.
+    // `--web` is a person in a browser and a teammate answers to its lead's
+    // session; neither is told. A note, never a refusal.
+    const unattended = config.prompt != null or config.serve_port != null or
+        config.resume_response != null or (interactive_tui and !may_open_unbound);
+    if (unattended and !introspection_only and !metask_scope and provider_secret != null) {
+        if (subscriptionPlanName(allocator, config.resolved_provider_id orelse config.provider_profile.?)) |plan|
+            std.debug.print("warning: {s} is a subscription plan for interactive use; its terms may not cover -p, serve or CI. Use a pay-as-you-go key for automation.\n", .{plan});
+    }
     // 第七节第 3 条 (#485): `.env` configures a provider, yet the start is on
     // Metask, which ranks above it (a sign-in or a stored default). Said once
     // under the TUI's banner, with the two ways to the file's provider.
