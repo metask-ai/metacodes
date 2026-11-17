@@ -54,10 +54,15 @@
 //! `Options.models` a model name resolves as on the daemon: tier names,
 //! then the provider guard (`ModelPolicy`), against the catalog
 //! `setModelCatalog` last installed when the Host refreshes it. Every
-//! change of model, permission mode, reasoning effort or additional
-//! directory is journaled as
+//! change of model, permission mode, reasoning effort, additional
+//! directory or route is journaled as
 //! `config_changed`, as the daemon's config sink journals it: a command's
 //! before its `command_result`, a submission's before its `user_message`.
+//! A route the Host's provider control plane bound (`Command.set_route`)
+//! moves the Session's provider, endpoint, credential and model together,
+//! as the CLI's `/model` commit does, and is journaled as
+//! `config_changed{route}` with the route's identity and never its
+//! credential (issue #16).
 //! `interrupt` is the one cross-thread call into the kernel; its abort is
 //! built for that.
 //!
@@ -145,6 +150,8 @@ const swarm_tools = @import("../swarm/tools.zig");
 const swarm_context = @import("../swarm/context.zig");
 const swarm_team = @import("../swarm/team.zig");
 const cron_registry = @import("cron_registry.zig");
+const provider_ids = @import("../provider/ids.zig");
+const secure = @import("../util/secure.zig");
 
 /// A cron job's id (#493), as `CronCreate` returned it to the model and
 /// `Snapshot.cron_jobs` reports it. `CronJobId.parse` takes a Host's text.
@@ -361,6 +368,10 @@ pub const Submission = struct {
 /// `set_additional_directories` journals `config_changed{dirs}` for each
 /// directory in force afterwards that was not before, its resolved path, as
 /// the daemon's `/add-dir` does; a directory taken away has no line.
+/// An accepted `set_route` (issue #16) journals `config_changed{model}`
+/// (the route's model) and then `config_changed{route}`, as the CLI's
+/// `/model` commit does; the model is taken as the route names it, not
+/// through `Options.models`.
 ///
 /// `cancel_cron_job` and `cancel_all_cron_jobs` (#493) remove the Session's
 /// cron jobs without a Run, so they never fire again; a prompt one of them
@@ -378,7 +389,40 @@ pub const Command = union(enum) {
     compact,
     cancel_cron_job: CronJobId,
     cancel_all_cron_jobs,
+    set_route: Route,
 };
+
+/// `Command.set_route` (issue #16, #445): a route the Host's provider
+/// control plane bound, and who it is. The bundled CLI moves onto a
+/// committed `/model` selection the same way (`App.bindCommittedSelection`):
+/// `binding` comes from the binding's transport, protocol, scheme, dialect,
+/// endpoint, secret and request model id, the rest from its identity.
+/// A refused route (`AgentSession.RouteMutationError`) changes nothing and
+/// journals no `config_changed`. Members a lead opens afterwards inherit it
+/// (`TeammateSpawn.lead_route`).
+pub const Route = struct {
+    /// What the Session sends with. Its credential is never journaled.
+    binding: agent_session.Route,
+    provider_id: provider_ids.Slug,
+    channel_id: provider_ids.Slug,
+    /// The protocol's id (`provider/profile.zig` `Protocol.id`): a built-in
+    /// wire's name or a custom protocol's own.
+    protocol: []const u8,
+    offer_id: provider_ids.OfferId,
+    /// The bound credential's reference, never its secret; null when none.
+    credential_ref: ?provider_ids.Slug = null,
+    scope: RouteScope,
+};
+
+/// `Route`'s identity types (`provider/ids.zig`): a provider, channel or
+/// credential reference id, and an offer id (`OfferId.parse` takes its
+/// `offer-<32 hex>` text).
+pub const RouteSlug = provider_ids.Slug;
+pub const OfferId = provider_ids.OfferId;
+
+/// Where a committed route applies: the provider control plane's
+/// `selection.Scope`, whose name `config_changed{route}.scope` carries.
+pub const RouteScope = enum { once, session, global };
 
 pub const EnqueueError = error{ QueueFull, SessionClosed, SessionPoisoned, OutOfMemory };
 /// `submit`'s refusals. Nothing is queued or held by any of them.
@@ -551,6 +595,11 @@ pub const TeammateSpawn = struct {
     lead_model: []const u8,
     lead_permission_mode: types.PermissionMode,
     lead_reasoning_effort: ?types.ReasoningEffort,
+    /// The route the lead's last accepted `set_route` moved it onto (issue
+    /// #16), credential included; null while the lead runs on the route it
+    /// opened with. A member on the lead's model needs the lead's route, or
+    /// it would send that model to the provider it opened with.
+    lead_route: ?agent_session.Route = null,
 };
 
 /// How the Host configures a member Session (#445). The SessionHost owns the
@@ -617,6 +666,14 @@ pub const InheritLead = struct {
         config.ui_requester = null;
         config.run_ui_requester = null;
         config.model = spawn.lead_model;
+        if (spawn.lead_route) |route| {
+            config.provider_kind = route.provider_kind;
+            config.openai_protocol = route.openai_protocol;
+            config.auth_scheme = route.auth_scheme;
+            config.dialect = route.dialect.rebind(route.model, spawn.lead_model);
+            config.api_key = route.api_key;
+            config.base_url = route.base_url;
+        }
         config.permission_mode = spawn.lead_permission_mode;
         config.reasoning_effort = if (spawn.effort) |name|
             std.meta.stringToEnum(types.ReasoningEffort, name) orelse return error.InvalidTeammateEffort
@@ -627,12 +684,20 @@ pub const InheritLead = struct {
 
     fn configure(ctx: *anyopaque, arena: std.mem.Allocator, spawn: TeammateSpawn) anyerror!SessionConfig {
         const self: *InheritLead = @ptrCast(@alignCast(ctx));
-        var config = try derive(self.base, spawn);
+        var copy = spawn;
         // `spawn` is borrowed for this call only.
-        config.model = try arena.dupe(u8, spawn.lead_model);
-        return config;
+        copy.lead_model = try arena.dupe(u8, spawn.lead_model);
+        if (spawn.lead_route) |route| copy.lead_route = try copyRoute(arena, route);
+        return derive(self.base, copy);
     }
 };
+
+test "RouteScope names exactly the provider control plane's selection scopes" {
+    const Scope = @import("../provider/selection.zig").Scope;
+    const theirs = @typeInfo(Scope).@"enum".fields;
+    try std.testing.expectEqual(theirs.len, @typeInfo(RouteScope).@"enum".fields.len);
+    inline for (theirs) |field| try std.testing.expectEqualStrings(field.name, @tagName(@field(RouteScope, field.name)));
+}
 
 test "InheritLead.derive: the lead's model, mode and effort over the base; the spawn's effort wins; no team" {
     const base: SessionConfig = .{
@@ -1063,9 +1128,13 @@ pub const HostedSession = struct {
     model: []u8,
     reasoning_effort: ?types.ReasoningEffort,
     messages: usize = 0,
-    /// The Session's provider kind, which `setModel` keeps:
-    /// `Options.models` resolves names for it.
+    /// The Session's provider kind, which `setModel` keeps and `set_route`
+    /// changes: `Options.models` resolves names for it.
     provider_kind: types.ProviderKind,
+    /// The route the last accepted `set_route` moved the Session onto, for
+    /// the members it spawns (`TeammateSpawn.lead_route`); null while on
+    /// the route it opened with. Only the driver touches it.
+    held_route: ?HeldRoute = null,
 
     /// One UI request at a time; a second (from a parallel tool) waits.
     ui_serial: sync.Mutex = .{},
@@ -1634,6 +1703,7 @@ pub const HostedSession = struct {
             .lead_model = self.model,
             .lead_permission_mode = self.session.permission_ctx.modeValue(),
             .lead_reasoning_effort = self.reasoning_effort,
+            .lead_route = if (self.held_route) |held| held.route else null,
         });
         if (config.team != null) return error.TeammateTeamConfigNotAllowed;
         const lease = session_id_mod.gen();
@@ -1705,6 +1775,14 @@ pub const HostedSession = struct {
     }
 
     fn freeWork(self: *HostedSession, work: *Work) void {
+        switch (work.item) {
+            // The copy `copyCommand` made in the arena: erased, not just freed.
+            .command => |cmd| switch (cmd) {
+                .set_route => |route| secure.zero(@constCast(route.binding.api_key)),
+                else => {},
+            },
+            else => {},
+        }
         work.arena.deinit();
         self.gpa.destroy(work);
     }
@@ -1976,6 +2054,7 @@ pub const HostedSession = struct {
                 break :blk if (found) null else error.CronJobNotFound;
             },
             .cancel_all_cron_jobs => if (self.session.cancelAllCronJobs()) |_| null else |err| err,
+            .set_route => |route| self.applyRoute(route),
         };
         switch (cmd) {
             // What `snapshot` shows before the `command_result` says so.
@@ -2009,6 +2088,45 @@ pub const HostedSession = struct {
             } else false;
             if (!known) self.emitConfig(.{ .dirs = dir });
         }
+        return null;
+    }
+
+    /// Moves the Session onto `route` (issue #16) and journals it as the CLI
+    /// journals a committed `/model` selection: `config_changed{model}`,
+    /// then `config_changed{route}`, the credential in neither.
+    fn applyRoute(self: *HostedSession, route: Route) ?anyerror {
+        var held = HeldRoute.init(self.gpa, route.binding) catch |err| return err;
+        const model = self.gpa.dupe(u8, route.binding.model) catch |err| {
+            held.deinit();
+            return err;
+        };
+        self.session.setRoute(route.binding) catch |err| {
+            self.gpa.free(model);
+            held.deinit();
+            return err;
+        };
+        self.mutex.lock();
+        const previous = self.model;
+        self.model = model;
+        self.provider_kind = route.binding.provider_kind;
+        self.mutex.unlock();
+        // The transcript's meta names the model; the writer borrows this copy.
+        if (self.writer) |*writer| writer.model = self.model;
+        self.gpa.free(previous);
+        if (self.held_route) |*old| old.deinit();
+        self.held_route = held;
+
+        const offer_id = route.offer_id.render();
+        self.emitConfig(.{ .model = self.model });
+        self.emitConfig(.{ .route = .{
+            .provider_id = route.provider_id.slice(),
+            .channel_id = route.channel_id.slice(),
+            .protocol = route.protocol,
+            .request_model_id = self.model,
+            .offer_id = &offer_id,
+            .credential_ref = if (route.credential_ref) |*ref| ref.slice() else null,
+            .scope = @tagName(route.scope),
+        } });
         return null;
     }
 
@@ -2981,6 +3099,7 @@ pub const HostedSession = struct {
         self.journal.deinit();
         self.ledger.deinit();
         if (self.submission_template) |template| self.gpa.free(template);
+        if (self.held_route) |*held| held.deinit();
         self.gpa.free(self.model);
         self.gpa.destroy(self);
     }
@@ -3003,8 +3122,53 @@ fn wallMs() i64 {
     return @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
 }
 
+/// A route's bytes, owned, for `TeammateSpawn.lead_route`. The credential
+/// is erased before they are freed.
+const HeldRoute = struct {
+    arena: std.heap.ArenaAllocator,
+    route: agent_session.Route,
+
+    fn init(gpa: std.mem.Allocator, route: agent_session.Route) error{OutOfMemory}!HeldRoute {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const copy = try copyRoute(arena.allocator(), route);
+        return .{ .arena = arena, .route = copy };
+    }
+
+    fn deinit(self: *HeldRoute) void {
+        // Allocated by `copyRoute`, so writable.
+        secure.zero(@constCast(self.route.api_key));
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// `route` with every byte it names copied into `a`.
+fn copyRoute(a: std.mem.Allocator, route: agent_session.Route) error{OutOfMemory}!agent_session.Route {
+    var copy = route;
+    copy.api_key = try a.dupe(u8, route.api_key);
+    copy.model = try a.dupe(u8, route.model);
+    copy.base_url = if (route.base_url) |url| try a.dupe(u8, url) else null;
+    copy.auth_scheme = if (route.auth_scheme) |scheme| switch (scheme) {
+        .bearer => .bearer,
+        .api_key_header => |name| .{ .api_key_header = try a.dupe(u8, name) },
+        .signed_adapter => |name| .{ .signed_adapter = try a.dupe(u8, name) },
+        .custom_header => |custom| .{ .custom_header = .{
+            .name = try a.dupe(u8, custom.name),
+            .value_prefix = try a.dupe(u8, custom.value_prefix),
+        } },
+    } else null;
+    return copy;
+}
+
 fn copyCommand(a: std.mem.Allocator, cmd: Command) error{OutOfMemory}!Command {
     return switch (cmd) {
+        .set_route => |route| blk: {
+            var copy = route;
+            copy.binding = try copyRoute(a, route.binding);
+            copy.protocol = try a.dupe(u8, route.protocol);
+            break :blk .{ .set_route = copy };
+        },
         .set_model => |model| .{ .set_model = try a.dupe(u8, model) },
         .set_permission_mode, .set_reasoning_effort, .compact, .cancel_cron_job, .cancel_all_cron_jobs => cmd,
         .set_additional_directories => |dirs| .{ .set_additional_directories = try copyStrings(a, dirs) },

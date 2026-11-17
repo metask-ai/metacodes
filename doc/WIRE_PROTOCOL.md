@@ -90,7 +90,11 @@ What a Host adds around the kernel's events, as
   `model not available for current provider`). A message's accepted
   `model` and `permission_mode` are journaled before its `user_message`
   as `config_changed`, by both Hosts, also when already in force; `model`
-  as resolved (a tier name becomes the tier's model).
+  as resolved (a tier name becomes the tier's model). A route change (the
+  CLI's `/model` commit, `SessionHost`'s `set_route`) is announced as
+  `config_changed` `{"model":...}` and then `{"route":{...}}`; the route
+  names the provider, channel, protocol, request model id, offer id,
+  credential reference and scope, never the credential.
 
 The `user_message` host event carries `replaces`, appended under §4's
 additive rule 2: `null` when the Run's text was appended after the whole

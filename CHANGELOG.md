@@ -143,6 +143,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A `SessionHost` Session can move onto another provider route, journaled
+  as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`
+  commit moves the session's provider, endpoint, credential and model
+  together and broadcasts the route's identity; `SessionHost` had no route
+  at all. The new `Command.set_route` takes a `Route` the Host's provider
+  control plane bound (`binding`: provider kind, wire protocol, auth scheme,
+  dialect, endpoint, credential, model; and the provider, channel, protocol,
+  offer id, credential reference and scope that identify it). The driver
+  applies it between Runs through the new `AgentSession.setRoute`, which
+  swaps all of them at once and keeps the conversation and reasoning effort
+  (an effort the new provider cannot take is refused with
+  `AgentEffortUnsupportedProvider`). It then journals
+  `config_changed{model}` and `config_changed{route}`, as the CLI does, and
+  never the credential. A refused route changes nothing and journals no
+  `config_changed`. A teammate a lead opens afterwards runs on the lead's
+  route (`TeammateSpawn.lead_route`, applied by `InheritLead`). An
+  `AgentSession` now keeps its own copy of `SessionConfig.auth_scheme`.
 - **A hosted lead's members follow the permission rules and directories it
   gains, as the daemon's teammates do** (part of #445). Under
   `session_host.InheritLead` a member decided its tool calls with what its

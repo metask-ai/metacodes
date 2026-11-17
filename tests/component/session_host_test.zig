@@ -1087,12 +1087,20 @@ fn spawnLeadConfig(url: []const u8, workspace: cc.agent_session.WorkspaceConfig)
     return config;
 }
 
-/// The id on `host` that is not `lead`'s; `host` holds exactly two.
+/// The id on `host` that is not `lead`'s; `host` holds exactly two. The
+/// lead's driver opens the member after the lead's Run is journaled as done,
+/// so a caller that saw that `run_done` waits here for the member to open.
 fn memberId(host: *SessionHost, lead: *HostedSession) !cc.session_id.SessionId {
-    const ids = try host.list(std.testing.allocator);
-    defer std.testing.allocator.free(ids);
-    try std.testing.expectEqual(@as(usize, 2), ids.len);
-    return if (std.mem.eql(u8, ids[0].asSlice(), lead.id.asSlice())) ids[1] else ids[0];
+    var waited: u64 = 0;
+    while (true) : (waited += 20) {
+        const ids = try host.list(std.testing.allocator);
+        defer std.testing.allocator.free(ids);
+        if (ids.len >= 2 or waited >= 10_000) {
+            try std.testing.expectEqual(@as(usize, 2), ids.len);
+            return if (std.mem.eql(u8, ids[0].asSlice(), lead.id.asSlice())) ids[1] else ids[0];
+        }
+        std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    }
 }
 
 test "L2 #445 SessionHost InheritLead: the member runs with its lead's current model and permission mode, as an App teammate inherits them" {
@@ -2443,4 +2451,169 @@ test "L2 #445 SessionHost project rules: a Run its dead owner left open keeps a 
     try std.testing.expectEqual(@as(usize, 1), try countLines(&reopened.journal, "\"stop_reason\":\"end_turn\""));
     try std.testing.expectEqual(@as(usize, 1), server.requestCount());
     try std.testing.expect((try cc.tool_observation_journal.validate(journal_root, id)).complete);
+}
+
+/// A route the Host's provider control plane bound (#16): `url` with its own
+/// credential, model and header, under a fixed identity.
+fn testRoute(url: []const u8, api_key: []const u8) !cc.session_host.Route {
+    return .{
+        .binding = .{
+            .provider_kind = .anthropic,
+            .auth_scheme = .{ .api_key_header = "x-api-key" },
+            .api_key = api_key,
+            .model = "route-model",
+            .base_url = url,
+        },
+        .provider_id = try cc.session_host.RouteSlug.parse("acme"),
+        .channel_id = try cc.session_host.RouteSlug.parse("main"),
+        .protocol = "anthropic_messages",
+        .offer_id = try cc.session_host.OfferId.parse("offer-0123456789abcdef0123456789abcdef"),
+        .credential_ref = try cc.session_host.RouteSlug.parse("acme-key"),
+        .scope = .session,
+    };
+}
+
+const ROUTE_LINE = "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"route\":{\"provider_id\":\"acme\",\"channel_id\":\"main\"," ++
+    "\"protocol\":\"anthropic_messages\",\"request_model_id\":\"route-model\",\"offer_id\":\"offer-0123456789abcdef0123456789abcdef\"," ++
+    "\"credential_ref\":\"acme-key\",\"scope\":\"session\"}}}";
+
+test "L2 #445 #16 SessionHost set_route: the Session moves onto the bound route (endpoint, credential, header, model) and journals config_changed{model} then config_changed{route}, as the CLI's /model commit; a refused route changes nothing" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+
+    const first = try textSse(a, "first");
+    defer a.free(first);
+    const opened_bodies = [_][]const u8{first};
+    var opened_srv = try harness.MockServer.startCassette(&opened_bodies, 0);
+    defer opened_srv.stop();
+    const opened_url = try opened_srv.urlOwned(a);
+    defer a.free(opened_url);
+    const second = try textSse(a, "second");
+    defer a.free(second);
+    const route_bodies = [_][]const u8{second};
+    var route_srv = try harness.MockServer.startCassette(&route_bodies, 0);
+    defer route_srv.stop();
+    const route_url = try route_srv.urlOwned(a);
+    defer a.free(route_url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig(opened_url, workspace, home, &.{}) });
+    defer host.release(hosted);
+
+    try hosted.command(.{ .set_reasoning_effort = .high });
+    try hosted.submit(.{ .text = "on the opened route" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 1);
+    // The Host's buffers are copied when queued: overwritten right after,
+    // the route still arrives as bound.
+    var key_buf = "route-key".*;
+    var url_buf: [128]u8 = undefined;
+    @memcpy(url_buf[0..route_url.len], route_url);
+    try hosted.command(.{ .set_route = try testRoute(url_buf[0..route_url.len], &key_buf) });
+    @memset(&key_buf, 'x');
+    @memset(url_buf[0..route_url.len], 'x');
+    // A credential no header can carry is refused: nothing changes.
+    try hosted.command(.{ .set_route = try testRoute(opened_url, "bad key") });
+    try hosted.submit(.{ .text = "on the bound route" });
+    try waitFor(&hosted.journal, "\"type\":\"run_done\"", 2);
+
+    var types_buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "config_changed command_result user_message run_done config_changed config_changed command_result command_result user_message run_done",
+        try hostLineTypes(&hosted.journal, &types_buf),
+    );
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"route-model\"}}"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, ROUTE_LINE));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_route\",\"ok\":true,\"error_name\":null"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"v\":1,\"type\":\"command_result\",\"data\":{\"command\":\"set_route\",\"ok\":false,\"error_name\":\"InvalidCredentialByte\""));
+    // The credential is never journaled.
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, "route-key"));
+
+    // What the lines say is what the next Run used: the bound endpoint, its
+    // credential under its header, its model, and the effort carried over.
+    try std.testing.expectEqual(@as(usize, 1), opened_srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), route_srv.requestCount());
+    const opened = opened_srv.requestAt(0).?.raw;
+    try std.testing.expect(std.mem.indexOf(u8, opened, "Bearer test-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, opened, "\"model\":\"test-model\"") != null);
+    const routed = route_srv.requestAt(0).?.raw;
+    try std.testing.expect(std.mem.indexOf(u8, routed, "x-api-key: route-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routed, "test-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, routed, "Bearer") == null);
+    try std.testing.expect(try modelRead(route_srv, 0, "\"model\":\"route-model\""));
+    try std.testing.expect(try modelRead(route_srv, 0, "\"output_config\":{\"effort\":\"high\"}"));
+    try std.testing.expect(try modelRead(route_srv, 0, "on the opened route"));
+    var snapshot = try hosted.snapshot(a);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqualStrings("route-model", snapshot.model);
+}
+
+test "L2 #445 #16 SessionHost InheritLead: a member the lead spawns after set_route runs on the lead's route, not on the one the Host opened leads with" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try subdir(&tmp, "team", &root_buf);
+
+    const unused = try textSse(a, "unused");
+    defer a.free(unused);
+    const opened_bodies = [_][]const u8{unused};
+    var opened_srv = try harness.MockServer.startCassette(&opened_bodies, 0);
+    defer opened_srv.stop();
+    const opened_url = try opened_srv.urlOwned(a);
+    defer a.free(opened_url);
+    const delegated = try textSse(a, "delegated");
+    defer a.free(delegated);
+    const idle = try textSse(a, "idle");
+    defer a.free(idle);
+    // The lead's Run ends before its member opens; after the member's
+    // SendMessage, its last turn and the lead's next one may come in either
+    // order, so both answer the same.
+    const route_bodies = [_][]const u8{
+        toolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        toolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        delegated,
+        toolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        idle,
+        idle,
+    };
+    var route_srv = try harness.MockServer.startCassette(&route_bodies, 0);
+    defer route_srv.stop();
+    const route_url = try route_srv.urlOwned(a);
+    defer a.free(route_url);
+
+    const workspace: cc.agent_session.WorkspaceConfig = .{ .root = root, .home = root, .state_root = root, .shell = .disabled };
+    const lead_config = spawnLeadConfig(opened_url, workspace);
+    var inherit = cc.session_host.InheritLead{ .base = lead_config };
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{}, .enable_teams = true });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false, .teammates = inherit.factory() });
+    defer host.deinit();
+    const lead = try host.open(.{ .config = lead_config });
+    defer host.release(lead);
+
+    try lead.command(.{ .set_route = try testRoute(route_url, "route-key") });
+    try lead.submit(.{ .text = "form a team and delegate" });
+    try waitFor(&lead.journal, "\"type\":\"run_done\"", 2);
+
+    const member = host.acquire(try memberId(&host, lead)).?;
+    defer host.release(member);
+    try waitFor(&member.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 0), opened_srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 6), route_srv.requestCount());
+    const first = route_srv.requestAt(3).?.raw;
+    try std.testing.expect(std.mem.indexOf(u8, first, "fix the parser") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"model\":\"route-model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "x-api-key: route-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "test-key") == null);
+    var snap = try member.snapshot(a);
+    defer snap.deinit(a);
+    try std.testing.expectEqualStrings("route-model", snap.model);
 }
