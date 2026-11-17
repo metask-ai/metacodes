@@ -317,7 +317,14 @@ separate credential stage: the accounts already are offers.
 
 Because the offer names the credential, binding uses **that** member — not the
 pool's highest-priority one. Resolving to a different account would make the
-offer id identify a route the request does not take.
+offer id identify a route the request does not take. A member whose variable
+is unset leaves its route without a credential (`MissingCredentials`): not the
+next member, not the provider's own variable, not a stored key.
+
+A pool is one provider's. Each member carries the provider whose
+`providers.<id>.credentials[]` declared it, and neither binding nor pool
+selection offers it to another provider's route, whatever kind that
+provider's profile accepts.
 
 Selection among unbound members is deterministic: priority first, then id, so
 configuration order cannot make a failover irreproducible. A member is skipped

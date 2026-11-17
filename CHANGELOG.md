@@ -507,6 +507,17 @@ status, compatibility boundaries, and entry points are defined by
   executable it writes into a temporary directory. Product code is
   unchanged.
 
+- **A credential pool member authenticates only its own provider's
+  routes.** `config.json`'s `providers.<id>.credentials[]` were read as one
+  list for every provider, and a member was chosen by kind alone: a provider
+  with no key of its own (DeepSeek, say) was given another provider's member
+  whenever its profile accepted that kind, and its requests carried it to
+  that provider's endpoint. A route that names an account fell back to
+  another credential when that account's variable was unset: another
+  account's, the provider's own variable, or a stored key. Each provider now
+  reads only its own pool, and a route that names an account uses that
+  account or fails with `MissingCredentials`.
+
 ### Security
 
 - **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**

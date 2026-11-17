@@ -2525,7 +2525,7 @@ pub const App = struct {
         return app.config.credential_env_fallback orelse provider_credential_mod.EnvLookup.empty();
     }
 
-    /// Materialize the configured credential pool.
+    /// Materialize `provider_id`'s configured credential pool.
     ///
     /// Takes the document by pointer and **does not own it**: the returned
     /// entries borrow the account label out of it, so a version of this that
@@ -2533,12 +2533,17 @@ pub const App = struct {
     /// slices. The caller keeps the document alive for as long as it uses the
     /// pool.
     ///
+    /// Only that provider's `providers.<id>.credentials[]`: a key is one
+    /// vendor's, and another provider's members would otherwise be offered
+    /// to this one's routes whenever its profile accepts their kind.
+    ///
     /// Secrets come from the named environment variables, never from the
     /// document: that document is read by several tools and is not mode 0600.
     /// A variable the process environment leaves unset is read from
     /// `env_fallback`, the host's layer below it (`<state root>/.env`, #486).
     pub fn credentialPoolFrom(
         document: *const provider_config_doc.Document,
+        provider_id: provider_ids_mod.Slug,
         buffer: []provider_credential_mod.PoolEntry,
         env_fallback: provider_credential_mod.EnvLookup,
     ) []const provider_credential_mod.PoolEntry {
@@ -2548,11 +2553,13 @@ pub const App = struct {
         // a loop-local copy that dies at the end of the iteration.
         for (document.providers.items) |*entry| {
             if (!entry.enabled) continue;
+            if (!entry.id.eql(provider_id)) continue;
             for (entry.credentials.items()) |*credential| {
                 if (len == buffer.len) break;
                 const secret = env.get(credential.env.slice()) orelse env_fallback.get(credential.env.slice()) orelse continue;
                 const kind = provider_credential_mod.parseCredentialKind(credential.kind.slice()) orelse continue;
                 buffer[len] = .{
+                    .provider_id = entry.id,
                     .id = credential.id,
                     .kind = kind,
                     .secret = secret,
@@ -2729,7 +2736,7 @@ pub const App = struct {
         const snapshot = host.kernel.catalogSnapshot();
         const now = @import("util/time.zig").nowUnix();
         var pool: CredentialPool = .{};
-        pool.load(app);
+        pool.load(app, null);
         defer pool.deinit();
         for (offers, 0..) |summary, first| {
             const provider_id = summary.provider_id;
@@ -2738,6 +2745,7 @@ pub const App = struct {
                 if (earlier.provider_id.eql(provider_id)) break true;
             } else false;
             if (seen) continue;
+            pool.scopeTo(app, provider_id);
             const profile = host.registry.findById(provider_id);
             var stored = StoredKey.load(app, provider_id, .quiet);
             defer stored.deinit();
@@ -2819,16 +2827,24 @@ pub const App = struct {
         return session.load() catch false;
     }
 
-    /// The configured credential pool as a binding reads it. The document
-    /// outlives the pool: its entries borrow their account labels from it.
+    /// The configured credential pool as a binding reads it: one provider's
+    /// members (`credentialPoolFrom`). The document outlives the pool: its
+    /// entries borrow their account labels from it.
     const CredentialPool = struct {
         document: ?provider_config_doc.Document = null,
         buffer: [provider_config_doc.MAX_POOL_CREDENTIALS]provider_credential_mod.PoolEntry = undefined,
         len: usize = 0,
 
-        fn load(pool: *CredentialPool, app: *App) void {
+        fn load(pool: *CredentialPool, app: *App, provider_id: ?provider_ids_mod.Slug) void {
             pool.document = app.loadConfigDocument();
-            if (pool.document) |*document| pool.len = credentialPoolFrom(document, &pool.buffer, app.credentialEnvFallback()).len;
+            pool.scopeTo(app, provider_id);
+        }
+
+        /// `provider_id`'s members of the loaded document; none for null.
+        fn scopeTo(pool: *CredentialPool, app: *const App, provider_id: ?provider_ids_mod.Slug) void {
+            pool.len = 0;
+            const id = provider_id orelse return;
+            if (pool.document) |*document| pool.len = credentialPoolFrom(document, id, &pool.buffer, app.credentialEnvFallback()).len;
         }
 
         fn entries(pool: *const CredentialPool) []const provider_credential_mod.PoolEntry {
@@ -3103,7 +3119,7 @@ pub const App = struct {
         // answer for that provider). The picker judges readiness from the
         // same material (`judgeReadiness`).
         var pool: CredentialPool = .{};
-        pool.load(app);
+        pool.load(app, committed_provider);
         defer pool.deinit();
         var stored_key = StoredKey.load(app, committed_provider, .warn);
         defer stored_key.deinit();
