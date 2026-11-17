@@ -183,6 +183,26 @@ Metask. To use DeepSeek: /model, or /logout`). `/logout` signs you out of
 Metask and switches the session to the provider this file configures
 (`Switched to DeepSeek (from .env)`); later starts use it too.
 
+`metacodes login status` shows this decision without starting anything: the
+provider a plain start here uses, the step that decided, and what each step
+holds (a variable's name, a file's path, a sign-in's expiry; never a key or a
+token). It also names the providers' keys that are only in the shell, which
+choose nothing:
+
+```text
+This start uses DeepSeek from /Users/you/.local/opt/metacodes/state/.env.
+Level 4 of 5 decided; the first that applies wins:
+  1 named at start: nothing (METACODES_PROVIDER is not set)
+  2 stored default: none
+  3 Metask sign-in: no session
+      /Users/you/.local/opt/metacodes/state/auth.json: not stored
+      METASK_API_KEY: not set
+> 4 /Users/you/.local/opt/metacodes/state/.env: read; DEEPSEEK_API_KEY; configures DeepSeek (the one provider whose key it holds)
+  5 nothing: the TUI opens without a model; -p and the rest stop
+Keys in the shell choose no provider: OPENAI_API_KEY (OpenAI). To use one: --provider <id>, or put it in /Users/you/.local/opt/metacodes/state/.env.
+No secret was printed.
+```
+
 A file with keys of several providers and no `METACODES_PROVIDER` chooses
 none: the terminal UI opens without a model, as in step 5, and its red note
 lists those providers; you add `METACODES_PROVIDER` to pick one. `-p` stops

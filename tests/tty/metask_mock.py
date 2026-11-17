@@ -34,6 +34,8 @@ REFRESH_TOKEN = "mk-refresh-tty-0001"
 KEY_SECRET = "sk-mk-tty-dev-0001"
 OTHER_KEY_SECRET = "sk-mk-tty-ops-0002"
 MODEL = "glm-5"
+# The name `/api/oauth/userinfo` gives the signed-in account.
+ACCOUNT_NAME = "Mock User"
 # The device code (`/login metask`, `metacodes login --provider metask`): the
 # code the user would confirm elsewhere. The first poll is answered with the
 # tokens, as if it had been confirmed already.
@@ -89,7 +91,7 @@ DEFAULT_MODELS = [
 
 
 class MetaskMock:
-    def __init__(self, keys=None, reply="METASK_MOCK_REPLY", models=None):
+    def __init__(self, keys=None, reply="METASK_MOCK_REPLY", models=None, userinfo_stalls=False):
         # [(name, secret)]: the keys an older sign-in's key route lists.
         self.keys = [("dev key", KEY_SECRET), ("ops key", OTHER_KEY_SECRET)] if keys is None else keys
         self.models = DEFAULT_MODELS if models is None else models
@@ -98,6 +100,9 @@ class MetaskMock:
         self.messages = []  # (authorization, model) of each /v1/messages request
         self.revocations = []  # the body of each /api/oauth/revoke request
         self.device_requests = []  # the body of each /api/oauth/device/code request
+        # A userinfo request is held, unanswered, until the mock closes.
+        self.userinfo_stalls = userinfo_stalls
+        self._unstall = threading.Event()
 
     def __enter__(self):
         outer = self
@@ -126,6 +131,16 @@ class MetaskMock:
                     data = [{"id": f"key-{i}", "name": name, "api_key": secret, "status": "active"}
                             for i, (name, secret) in enumerate(outer.keys)]
                     return self._send(200, json.dumps({"data": data}).encode())
+                if self.path.startswith("/api/oauth/userinfo"):
+                    # Who the session belongs to, for the line that ends a sign-in.
+                    if outer.userinfo_stalls:
+                        outer._unstall.wait(60)
+                        return
+                    if auth != f"Bearer {ACCESS_TOKEN}":
+                        return self._send(401, b'{"error":"invalid_token"}')
+                    info = {"sub": "mock-user-1", "name": ACCOUNT_NAME, "email": "mock@example.invalid",
+                            "client_id": "metacodes", "authorization_id": "auth-1"}
+                    return self._send(200, json.dumps(info).encode())
                 if self.path.startswith("/v1/models"):
                     allowed = [f"Bearer {ACCESS_TOKEN}"] + [f"Bearer {secret}" for _, secret in outer.keys]
                     if auth not in allowed:
@@ -174,6 +189,7 @@ class MetaskMock:
         return self
 
     def __exit__(self, *exc):
+        self._unstall.set()
         self._server.shutdown()
         self._server.server_close()
 
