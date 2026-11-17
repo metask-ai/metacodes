@@ -326,7 +326,7 @@ fn heartbeatStopped(path: [:0]const u8) bool {
 
 // ── scripted provider ───────────────────────────────────────────────────────
 
-const ScriptedProvider = struct {
+pub const ScriptedProvider = struct {
     allocator: std.mem.Allocator,
     turns: []const []const Event,
     calls: usize = 0,
@@ -337,18 +337,18 @@ const ScriptedProvider = struct {
     /// Every tool result the model was sent, concatenated.
     tool_results: std.ArrayList(u8) = .empty,
 
-    const Event = union(enum) {
+    pub const Event = union(enum) {
         text: []const u8,
         tool: struct { name: []const u8, input: []const u8 },
     };
 
-    fn deinit(self: *ScriptedProvider) void {
+    pub fn deinit(self: *ScriptedProvider) void {
         if (self.first_system) |s| self.allocator.free(s);
         if (self.first_user) |s| self.allocator.free(s);
         self.tool_results.deinit(self.allocator);
     }
 
-    fn provider(self: *ScriptedProvider) provider_mod.Provider {
+    pub fn provider(self: *ScriptedProvider) provider_mod.Provider {
         return .{
             .ctx = self,
             .modelFn = model,

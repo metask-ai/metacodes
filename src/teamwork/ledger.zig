@@ -79,6 +79,10 @@ pub const Ledger = struct {
     spent_usd: f64 = 0,
     wallclock_ms: u64 = 0,
     entries: usize = 0,
+    /// Tripped by the charge that reaches the cap (#520): the runtime hands
+    /// every live seat this signal, so they all stop at once instead of when
+    /// each next looks at the ledger. Borrowed; null = no signal.
+    abort_on_exhaustion: ?*types.AbortSignal = null,
 
     /// Open the ledger at `path` with the run's cap, summing every entry
     /// already on disk. A missing file is an empty ledger.
@@ -122,7 +126,11 @@ pub const Ledger = struct {
         if (!pfs.writeAll(fd, line)) return error.WriteFailed;
         pfs.fsyncChecked(fd) catch return error.WriteFailed;
         self.add(entry);
-        if (self.isExhausted()) return error.BudgetExhausted;
+        if (self.isExhausted()) {
+            // `host_failure`: a host-side stop, not a user cancellation.
+            if (self.abort_on_exhaustion) |signal| signal.abort(.host_failure);
+            return error.BudgetExhausted;
+        }
     }
 
     pub fn isExhausted(self: *const Ledger) bool {
@@ -273,9 +281,14 @@ test "ledger: crossing the cap is BudgetExhausted, and the charge is still recor
 
     var ledger = try Ledger.load(testing.allocator, path, 0.5);
     defer ledger.deinit(testing.allocator);
+    var live_seats = types.AbortSignal.init();
+    ledger.abort_on_exhaustion = &live_seats;
     try ledger.charge(.{ .seat_id = seat("implementer-1"), .harness = .metacodes, .wallclock_ms = 10, .cost = .{ .provider_estimate = 0.3 } });
+    try testing.expect(!live_seats.isAborted());
     try testing.expectError(error.BudgetExhausted, ledger.charge(.{ .seat_id = seat("implementer-1"), .harness = .claude_code, .wallclock_ms = 10, .cost = .{ .harness_reported = 0.3 } }));
     try testing.expect(ledger.isExhausted());
+    // The exhausting charge itself stops every seat sharing the signal.
+    try testing.expect(live_seats.isAborted());
     try testing.expectEqual(@as(f64, 0), ledger.remainingUsd());
     // Every later charge reports exhaustion too.
     try testing.expectError(error.BudgetExhausted, ledger.charge(.{ .seat_id = seat("verifier-1"), .harness = .metacodes, .wallclock_ms = 10, .cost = .wallclock_only }));

@@ -314,11 +314,18 @@ pub const ObservedCall = struct {
 
 /// The observer adapter for a metacodes reviewer seat. Its `sink()` goes in
 /// the seat's `SpawnOptions.tool_observer`; it records, from the dispatch
-/// seam in `tool_exec`, every authoritative Bash dispatch that returned an
-/// exit code. Events are forwarded unchanged to `next` (the run journal, if
-/// any), so plugging it in changes nothing else. A Bash call that was
+/// seam in `tool_exec`, every Bash dispatch that ran and returned an exit
+/// code. Events are forwarded unchanged to `next` (the run journal, if any),
+/// so plugging it in changes nothing else. A Bash call that was
 /// auto-backgrounded has no exit code yet and is not recorded: evidence must
 /// come from commands that finished in the foreground.
+///
+/// Both origins count. A read-only Bash call (the only kind a seat may run
+/// where there is no sandbox backend) is executed by the stream prefetch as
+/// soon as its `tool_use` arrives, and that `speculative_prefetch` dispatch is
+/// the run whose result the model receives; no authoritative dispatch
+/// follows. Either way the command really ran with that exit code, which is
+/// all a piece of evidence claims.
 pub const BashCallLog = struct {
     arena: std.heap.ArenaAllocator,
     next: ?observation.Sink = null,
@@ -357,7 +364,10 @@ pub const BashCallLog = struct {
     fn tap(ctx: *anyopaque, dispatch: observation.DispatchTap) void {
         const self: *BashCallLog = @ptrCast(@alignCast(ctx));
         if (self.next) |next| next.tap(dispatch);
-        if (!std.mem.eql(u8, dispatch.dispatched_name, "Bash") or dispatch.origin != .authoritative) return;
+        if (!std.mem.eql(u8, dispatch.dispatched_name, "Bash")) return;
+        switch (dispatch.origin) {
+            .authoritative, .speculative_prefetch => {},
+        }
         switch (dispatch.outcome) {
             .succeeded, .tool_error => {},
             .pending, .host_failed, .host_rejected, .host_fatal => return,

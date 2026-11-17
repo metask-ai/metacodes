@@ -4417,6 +4417,12 @@ test {
     _ = &@import("teamwork/drivers/claude_code.zig");
     _ = &@import("teamwork/drivers/factory.zig");
     _ = &@import("teamwork/drivers/drivers_test.zig");
+    _ = &@import("teamwork/audit.zig");
+    _ = &@import("teamwork/merge_back.zig");
+    _ = &@import("teamwork/runtime.zig");
+    _ = &@import("teamwork/swe_loop.zig");
+    _ = &@import("teamwork/verifier_auditor.zig");
+    _ = &@import("teamwork/runtime_test.zig");
     _ = &@import("core/memory/import.zig");
     _ = &@import("core/memory/claudemd.zig");
     _ = &@import("core/memory/user_context.zig");
