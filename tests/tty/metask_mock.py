@@ -64,16 +64,24 @@ def _sse_text(text):
     ).encode()
 
 
+# The Anthropic-shaped `effort` block the gateway sends with every chat model,
+# all false, beside its own `reasoning.efforts` (as it answered on 2026-11-17).
+ALL_FALSE_EFFORT = {"low": {"supported": False}, "max": {"supported": False}, "high": {"supported": False},
+                    "medium": {"supported": False}, "supported": False}
+
 # The gateway's `/v1/models`, in its capabilities format (#527): a chat model
-# with two reasoning levels, another chat model, and an image model the gateway
-# does not serve on `/v1/messages` (the sign-in must not offer it).
+# with two reasoning levels that cannot turn reasoning off, another chat model,
+# and an image model the gateway does not serve on `/v1/messages` (the sign-in
+# must not offer it).
 DEFAULT_MODELS = [
     {"id": MODEL, "max_input_tokens": 200000, "max_tokens": 32000,
      "capabilities": {"endpoints": {"messages": {"supported": True, "status": "supported"}},
+                      "effort": ALL_FALSE_EFFORT,
                       "reasoning": {"supported": True, "disable": {"supported": False},
                                     "efforts": ["low", "high"], "translated": True}}},
     {"id": "glm-5-air", "max_input_tokens": 128000, "max_tokens": 16000,
-     "capabilities": {"endpoints": {"messages": {"supported": True, "status": "supported"}}}},
+     "capabilities": {"endpoints": {"messages": {"supported": True, "status": "supported"}},
+                      "effort": ALL_FALSE_EFFORT}},
     {"id": "image-model-only",
      "capabilities": {"endpoints": {"messages": {"supported": False, "status": "unsupported"},
                                     "images_generations": {"supported": True}}}},

@@ -18,7 +18,8 @@ status, compatibility boundaries, and entry points are defined by
   come back on `http://localhost:<port>/auth/metask/callback`. There is no API
   key to choose any more: the model and reasoning level are picked from the
   `/v1/models` of the gateway the sign-in names (image-only models are left
-  out), and turns go there with the session's own access token, billed to the
+  out; `none` is offered only for a model whose reasoning it can turn off),
+  and turns go there with the session's own access token, billed to the
   account. The sign-in is stored as `oauth/metask.json`, its model and
   reasoning level in `auth.json`; a key or an older sign-in there is replaced.
   Until then an older sign-in there keeps refreshing at `napi.metask-ai.com`

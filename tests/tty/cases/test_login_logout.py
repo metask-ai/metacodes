@@ -250,14 +250,17 @@ def test_cli_login_in_the_browser_forgets_a_stored_default(bin_path):
         ])
         text = out.decode("utf-8", "replace")
         assert code == 0, f"exit {code}:\n{text}"
-        assert "Signed in to Metask in the browser. Model glm-5, reasoning none." in text, text
+        assert "Signed in to Metask in the browser. Model glm-5, reasoning low." in text, text
+        # The gateway's levels, not its all-false `effort` block; and no `none`
+        # for a model whose reasoning cannot be turned off.
+        assert "1. low" in text and "2. high" in text and ". none" not in text, text
         assert "Select API key" not in text, text
         assert "image-model-only" not in text, text
         assert "Forgot the stored default model: new sessions start on Metask." in text, text
         with open(config) as f:
             assert json.load(f).get("global_selection") is None
         with open(os.path.join(state, "auth.json")) as f:
-            assert json.load(f) == {"selected_model": MODEL, "reasoning_effort": "none"}
+            assert json.load(f) == {"selected_model": MODEL, "reasoning_effort": "low"}
         assert os.path.exists(os.path.join(state, "oauth", "metask.json"))
         for secret in (KEY_SECRET, ACCESS_TOKEN, REFRESH_TOKEN):
             assert secret.encode() not in out, f"{secret} reached the terminal"
@@ -342,11 +345,11 @@ def test_cli_device_login_at_a_terminal_asks_for_the_model(bin_path):
         text = out.decode("utf-8", "replace")
         assert code == 0, f"exit {code}:\n{text}"
         assert f"METASK_USER_CODE={USER_CODE}" in text, text
-        assert "Signed in to Metask with the device code. Model glm-5, reasoning none." in text, text
+        assert "Signed in to Metask with the device code. Model glm-5, reasoning low." in text, text
         assert "image-model-only" not in text, text
         _expect_device_request(mock)
         with open(os.path.join(state, "auth.json")) as f:
-            assert json.load(f) == {"selected_model": MODEL, "reasoning_effort": "none"}
+            assert json.load(f) == {"selected_model": MODEL, "reasoning_effort": "low"}
         assert os.path.exists(os.path.join(state, "oauth", "metask.json"))
         for secret in (ACCESS_TOKEN, REFRESH_TOKEN, DEVICE_CODE):
             assert secret.encode() not in out, f"{secret} reached the terminal"
