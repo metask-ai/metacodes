@@ -34,9 +34,27 @@ pub const OAUTH_TOKEN_URL_ENV = "METACODE_OAUTH_TOKEN_URL";
 pub const OAUTH_AUTHORIZE_URL_ENV = "METACODE_OAUTH_AUTHORIZE_URL";
 pub const OAUTH_CLIENT_ID_ENV = "METACODE_OAUTH_CLIENT_ID";
 pub const OAUTH_SCOPE_ENV = "METACODE_OAUTH_SCOPE";
-pub const METASK_OAUTH_TOKEN_URL = "https://napi.metask-ai.com/oauth/token";
-pub const METASK_OAUTH_AUTHORIZE_URL = "https://napi.metask-ai.com/oauth/authorize";
-pub const OAUTH_CLIENT_ID = "metacode-cli";
+/// Metask's OAuth authorization server (#527): its
+/// `/.well-known/oauth-authorization-server` names these endpoints, and the
+/// gateway its tokens are for is on the same host.
+pub const METASK_SITE_URL = "https://www.metask-ai.com";
+pub const METASK_OAUTH_TOKEN_URL = METASK_SITE_URL ++ "/api/oauth/token";
+pub const METASK_OAUTH_AUTHORIZE_URL = METASK_SITE_URL ++ "/oauth/authorize";
+/// The public client registered for metacodes there, used by the browser and
+/// the device-code sign-in alike.
+pub const OAUTH_CLIENT_ID = "metacodes";
+/// Without a scope the server grants `read` only, which cannot call models.
+pub const METASK_OAUTH_SCOPE = "read model:invoke";
+/// The loopback path registered for `metacodes`; any port is accepted.
+pub const METASK_CALLBACK_PATH = "/auth/metask/callback";
+/// Where an OAuth sign-in kept in `auth.json` is refreshed. Since #527 the
+/// sign-in is the Metask session (`oauth/metask.json`) and nothing writes one
+/// here, so one found here came from an earlier version's browser sign-in:
+/// napi.metask-ai.com issued it to the client `metacode-cli`, and only that
+/// server can refresh it. Metask keeps that server through the move to www,
+/// so such a sign-in keeps working until the next `/login` replaces it.
+pub const LEGACY_OAUTH_TOKEN_URL = "https://napi.metask-ai.com/oauth/token";
+pub const LEGACY_OAUTH_CLIENT_ID = "metacode-cli";
 const OAUTH_REFRESH_SKEW_SECONDS: i64 = 300;
 const DEFAULT_LOGIN_PORT: u16 = 1455;
 const FALLBACK_LOGIN_PORT: u16 = 1457;
@@ -102,6 +120,49 @@ pub const StoredCredentials = struct {
         if (self.oauth) |*o| o.deinit(allocator);
         if (self.selected_model) |m| allocator.free(m);
         self.* = .{};
+    }
+
+    /// An independent copy for staging a replacement while keeping the
+    /// previous credentials available for rollback. Secret buffers are copied.
+    pub fn clone(self: *const StoredCredentials, allocator: std.mem.Allocator) !StoredCredentials {
+        var out = StoredCredentials{ .reasoning_effort = self.reasoning_effort };
+        errdefer out.deinit(allocator);
+        if (self.api_key) |value| out.api_key = try allocator.dupe(u8, value);
+        if (self.oauth) |value| {
+            out.oauth = blk: {
+                const access = try allocator.dupe(u8, value.access_token);
+                errdefer secureFree(allocator, access);
+                const refresh = try allocator.dupe(u8, value.refresh_token);
+                errdefer secureFree(allocator, refresh);
+                break :blk .{
+                    .access_token = access,
+                    .refresh_token = refresh,
+                    .token_type = value.token_type,
+                    .expires_at = value.expires_at,
+                };
+            };
+            if (value.scope) |text| out.oauth.?.scope = try allocator.dupe(u8, text);
+            if (value.account_id) |text| out.oauth.?.account_id = try allocator.dupe(u8, text);
+            if (value.profile) |text| out.oauth.?.profile = try allocator.dupe(u8, text);
+        }
+        if (self.selected_model) |value| out.selected_model = try allocator.dupe(u8, value);
+        return out;
+    }
+
+    /// What a Metask browser sign-in leaves here (#527): the model and
+    /// reasoning level chosen. The sign-in itself is the Metask session, so
+    /// a key or an older sign-in held here goes: left here it would outrank
+    /// the session at the next start. The model is copied before anything is
+    /// freed, so a copy that fails leaves the credentials whole.
+    pub fn recordSessionChoice(self: *StoredCredentials, allocator: std.mem.Allocator, model: []const u8, effort: ?types.ReasoningEffort) error{OutOfMemory}!void {
+        const model_copy = try allocator.dupe(u8, model);
+        if (self.selected_model) |old| allocator.free(old);
+        self.selected_model = model_copy;
+        self.reasoning_effort = effort;
+        if (self.api_key) |old| secureFree(allocator, old);
+        self.api_key = null;
+        if (self.oauth) |*old| old.deinit(allocator);
+        self.oauth = null;
     }
 };
 
@@ -386,6 +447,17 @@ pub const Notify = struct {
 };
 
 pub fn loginWithBrowser(allocator: std.mem.Allocator, opts: BrowserLoginOptions) !StoredCredentials {
+    const token_body = try loginWithBrowserTokenJson(allocator, opts);
+    defer secureFree(allocator, token_body);
+    return importOAuthTokenResponse(allocator, token_body, nowUnixSeconds());
+}
+
+/// The browser sign-in up to the token endpoint's answer, returned as it
+/// came (owned; secret, so zero it before freeing). Metask's answer names
+/// the gateway its tokens are for (`gateway_url`, `models_url`), which
+/// `auth.json` has no place for: `/login` and `metacodes login` store it as
+/// the Metask session (`provider_login.importTokenResponse`, #527).
+pub fn loginWithBrowserTokenJson(allocator: std.mem.Allocator, opts: BrowserLoginOptions) ![]u8 {
     var pkce = try generatePkce(allocator);
     defer pkce.deinit(allocator);
     const state = if (opts.force_state) |s| try allocator.dupe(u8, s) else try randomBase64Url(allocator, 32);
@@ -393,8 +465,9 @@ pub fn loginWithBrowser(allocator: std.mem.Allocator, opts: BrowserLoginOptions)
 
     var server = try CallbackServer.bind(opts.port);
     defer server.close();
+    server.path = METASK_CALLBACK_PATH;
 
-    const redirect_uri = try std.fmt.allocPrint(allocator, "http://localhost:{d}/auth/callback", .{server.port});
+    const redirect_uri = try std.fmt.allocPrint(allocator, "http://localhost:{d}{s}", .{ server.port, METASK_CALLBACK_PATH });
     defer allocator.free(redirect_uri);
     const authorize_url = try buildAuthorizeUrlFromEnv(allocator, redirect_uri, pkce.code_challenge, state);
     defer allocator.free(authorize_url);
@@ -410,9 +483,7 @@ pub fn loginWithBrowser(allocator: std.mem.Allocator, opts: BrowserLoginOptions)
     const code = try server.waitForAuthorizationCode(allocator, state, opts.abort_signal);
     defer secureFree(allocator, code);
     if (opts.abort_signal) |signal| if (signal.isAborted()) return error.Aborted;
-    const token_body = try exchangeAuthorizationCode(allocator, code, redirect_uri, pkce.code_verifier);
-    defer secureFree(allocator, token_body);
-    return importOAuthTokenResponse(allocator, token_body, nowUnixSeconds());
+    return exchangeAuthorizationCode(allocator, code, redirect_uri, pkce.code_verifier);
 }
 
 /// `text` to `notify`, or to stderr when there is none (the CLI).
@@ -475,7 +546,7 @@ fn buildAuthorizeUrlFromEnv(
 ) ![]u8 {
     const authorize_url = if (std.c.getenv(OAUTH_AUTHORIZE_URL_ENV)) |v| std.mem.span(v) else METASK_OAUTH_AUTHORIZE_URL;
     const client_id = if (std.c.getenv(OAUTH_CLIENT_ID_ENV)) |v| std.mem.span(v) else OAUTH_CLIENT_ID;
-    const scope = if (std.c.getenv(OAUTH_SCOPE_ENV)) |v| std.mem.span(v) else "";
+    const scope = if (std.c.getenv(OAUTH_SCOPE_ENV)) |v| std.mem.span(v) else METASK_OAUTH_SCOPE;
     return buildAuthorizeUrl(allocator, authorize_url, client_id, scope, redirect_uri, code_challenge, state);
 }
 
@@ -682,7 +753,7 @@ fn exchangeAuthorizationCode(
 }
 
 fn postTokenForm(allocator: std.mem.Allocator, form: []const u8) ![]u8 {
-    const url = try oauthTokenUrl(allocator);
+    const url = try oauthTokenUrl(allocator, .metask);
     defer allocator.free(url);
     const uri = std.Uri.parse(url) catch return error.InvalidOAuthTokenUrl;
     var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
@@ -882,7 +953,8 @@ fn checkFilePrivate(path: []const u8) !void {
 fn refreshOAuthCredential(allocator: std.mem.Allocator, old: *const OAuthCredential) !OAuthCredential {
     const body = try buildRefreshRequestBody(allocator, old.refresh_token);
     defer secureFree(allocator, body);
-    const url = try oauthTokenUrl(allocator);
+    // `auth.json`'s sign-in is an earlier version's: napi issued it.
+    const url = try oauthTokenUrl(allocator, .legacy_napi);
     defer allocator.free(url);
     const uri = std.Uri.parse(url) catch return error.InvalidOAuthTokenUrl;
 
@@ -917,16 +989,28 @@ fn refreshOAuthCredential(allocator: std.mem.Allocator, old: *const OAuthCredent
     return parseOAuthTokenResponse(allocator, response_body, nowUnixSeconds(), .optional_replacement, old.refresh_token);
 }
 
-fn oauthTokenUrl(allocator: std.mem.Allocator) ![]u8 {
+/// The OAuth servers a token request goes to: www for the browser sign-in's
+/// code exchange (#527), napi to refresh a sign-in it issued
+/// (`LEGACY_OAUTH_TOKEN_URL`).
+const TokenEndpoint = enum { metask, legacy_napi };
+
+/// `METACODE_OAUTH_TOKEN_URL` (a local server, a test's mock), else the
+/// endpoint's own.
+fn oauthTokenUrl(allocator: std.mem.Allocator, endpoint: TokenEndpoint) ![]u8 {
     if (std.c.getenv(OAUTH_TOKEN_URL_ENV)) |p| return allocator.dupe(u8, std.mem.span(p));
-    return allocator.dupe(u8, METASK_OAUTH_TOKEN_URL);
+    return allocator.dupe(u8, switch (endpoint) {
+        .metask => METASK_OAUTH_TOKEN_URL,
+        .legacy_napi => LEGACY_OAUTH_TOKEN_URL,
+    });
 }
 
+/// The refresh grant for `auth.json`'s sign-in, as the client napi issued it
+/// to (`LEGACY_OAUTH_CLIENT_ID`).
 fn buildRefreshRequestBody(allocator: std.mem.Allocator, refresh_token: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     try appendFormField(&aw.writer, "grant_type", "refresh_token", true);
-    try appendFormField(&aw.writer, "client_id", OAUTH_CLIENT_ID, false);
+    try appendFormField(&aw.writer, "client_id", LEGACY_OAUTH_CLIENT_ID, false);
     try appendFormField(&aw.writer, "refresh_token", refresh_token, false);
     return try aw.toOwnedSlice();
 }
@@ -1095,16 +1179,52 @@ test "browser authorize URL omits empty scope" {
     const a = std.testing.allocator;
     const url = try buildAuthorizeUrlForTest(
         a,
-        "https://napi.metask-ai.com/oauth/authorize",
-        "metacode-cli",
+        METASK_OAUTH_AUTHORIZE_URL,
+        OAUTH_CLIENT_ID,
         "",
-        "http://localhost:1455/auth/callback",
+        "http://localhost:1455" ++ METASK_CALLBACK_PATH,
         "challenge",
         "state",
     );
     defer a.free(url);
     try std.testing.expect(std.mem.indexOf(u8, url, "scope=") == null);
     try std.testing.expect(std.mem.indexOf(u8, url, "code_challenge=challenge") != null);
+}
+
+test "a Metask browser sign-in asks www for model access as metacodes, back on its registered path (#527)" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqualStrings("https://www.metask-ai.com/oauth/authorize", METASK_OAUTH_AUTHORIZE_URL);
+    try std.testing.expectEqualStrings("https://www.metask-ai.com/api/oauth/token", METASK_OAUTH_TOKEN_URL);
+    const url = try buildAuthorizeUrlForTest(
+        a,
+        METASK_OAUTH_AUTHORIZE_URL,
+        OAUTH_CLIENT_ID,
+        METASK_OAUTH_SCOPE,
+        "http://localhost:1455" ++ METASK_CALLBACK_PATH,
+        "challenge",
+        "state",
+    );
+    defer a.free(url);
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://www.metask-ai.com/oauth/authorize?response_type=code&client_id=metacodes&"));
+    try std.testing.expect(std.mem.indexOf(u8, url, "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fmetask%2Fcallback&") != null);
+    // Without `model:invoke` the server grants `read` only.
+    try std.testing.expect(std.mem.indexOf(u8, url, "&scope=read%20model%3Ainvoke&") != null);
+}
+
+test "an auth.json sign-in from before #527 refreshes where it was issued: napi, as metacode-cli" {
+    const a = std.testing.allocator;
+    const body = try buildRefreshRequestBody(a, "old refresh/1");
+    defer a.free(body);
+    try std.testing.expectEqualStrings("grant_type=refresh_token&client_id=metacode-cli&refresh_token=old%20refresh%2F1", body);
+    // The override (a local server, a test's mock) serves both endpoints.
+    if (std.c.getenv(OAUTH_TOKEN_URL_ENV) != null) return error.SkipZigTest;
+    const refresh_url = try oauthTokenUrl(a, .legacy_napi);
+    defer a.free(refresh_url);
+    try std.testing.expectEqualStrings("https://napi.metask-ai.com/oauth/token", refresh_url);
+    // A new browser sign-in's code goes to www.
+    const exchange_url = try oauthTokenUrl(a, .metask);
+    defer a.free(exchange_url);
+    try std.testing.expectEqualStrings("https://www.metask-ai.com/api/oauth/token", exchange_url);
 }
 
 test "the loopback wait returns the code a valid callback carries" {

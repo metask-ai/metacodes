@@ -1,55 +1,58 @@
-//! `/login` (#485): the Metask browser sign-in, off the TUI's thread.
+//! `/login` and `/login metask` (#485, #527): the Metask sign-in, off the
+//! TUI's thread.
 //!
 //! `metacodes login` signs in in the browser and then asks, line by line,
-//! which API key, model and reasoning level to use. The TUI asks the same in
-//! a dialog that keeps drawing while the network works, so the network work
-//! runs here, on a worker thread, in two steps the dialog starts:
+//! which model and reasoning level to use. The TUI asks the same in a dialog
+//! that keeps drawing while the network works, so the network work runs here,
+//! on a worker thread, in one step the dialog starts (`startSignIn`): the
+//! authorization-code + PKCE flow of `auth.loginWithBrowserTokenJson` against
+//! `www.metask-ai.com`, or with `Options.device_code` the device code of
+//! `metask_oauth` (either way the instructions go to the transcript, and
+//! `cancel` ends the wait), then the models the sign-in may use: the
+//! gateway's `/v1/models`, asked with the sign-in's own access token. The
+//! token response names that gateway (`gateway_url`); the sign-in is used
+//! there with its token, so there is no API key to choose.
 //!
-//! 1. `startSignIn`: the authorization-code + PKCE flow of
-//!    `auth.loginWithBrowser` (its instructions, the URL to open, go to the
-//!    transcript; `cancel` ends the wait for the browser), then the account's
-//!    API keys, listed with the sign-in's access token.
-//! 2. `startModels`: the `/v1/models` answer for the key the user chose.
+//! Nothing is stored here: the caller stores the token response as the Metask
+//! session (`provider_login.importTokenResponse`) once a model and reasoning
+//! level are chosen, so a sign-in cancelled at any step changes nothing. The
+//! state is an atomic; the step's results are written before its `.release`
+//! store and read after an `.acquire` load, as in `LoginWorker`.
 //!
-//! Nothing is stored here: the caller writes `auth.json` once key, model and
-//! reasoning level are chosen, so a sign-in cancelled at any step changes
-//! nothing. The state is an atomic; a step's results are written before its
-//! `.release` store and read after an `.acquire` load, as in `LoginWorker`.
-//!
-//! The worker lives on the heap and has two owners while a step runs: the
+//! The worker lives on the heap and has two owners while the step runs: the
 //! dialog and the step's thread. `release` gives up the dialog's share; the
 //! last owner frees it. Closing the dialog therefore never waits on a request
-//! the step cannot abandon (the code exchange, the key list): that thread
+//! the step cannot abandon (the code exchange, the model list): that thread
 //! frees the worker when it is done.
 
 const std = @import("std");
 const sync = @import("platform").sync;
 const auth = @import("../core/auth.zig");
-const api_keys = @import("api_keys.zig");
 const oauth_login = @import("oauth_login.zig");
-const client_mod = @import("../client.zig");
+const metask_oauth = @import("metask_oauth.zig");
+const catalog_fetch = @import("catalog_fetch.zig");
+const provider_oauth = @import("../provider/oauth.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
-/// The Messages endpoint a Metask sign-in's account and keys are reached
-/// through: `METACODES_BASE_URL` (a local gateway, a test's mock), else
-/// Metask's own. `metacodes login` and `/login` (#485) use the same one.
-pub fn messagesUrl() []const u8 {
-    if (std.c.getenv("METACODES_BASE_URL")) |u| {
-        const value = std.mem.span(u);
-        if (value.len > 0) return value;
+/// The gateway a Metask sign-in's token response names, unless
+/// `METASK_GATEWAY_URL` (the documented local-development override, as at
+/// startup) names another origin. Borrowed from `token_json` or the
+/// environment; null when neither names a gateway origin.
+pub fn gatewayOf(arena: std.mem.Allocator, token_json: []const u8) ?[]const u8 {
+    if (std.c.getenv("METASK_GATEWAY_URL")) |raw| {
+        const gateway = std.mem.trimEnd(u8, std.mem.span(raw), "/");
+        return if (metask_oauth.isGatewayOrigin(gateway)) gateway else null;
     }
-    return client_mod.ANTHROPIC_API_URL;
+    const outcome = provider_oauth.parseTokenResponse(arena, token_json) catch return null;
+    const gateway = std.mem.trimEnd(u8, outcome.gateway_url orelse return null, "/");
+    return if (metask_oauth.isGatewayOrigin(gateway)) gateway else null;
 }
 
 pub const State = enum(u8) {
     idle,
-    /// Waiting for the browser, exchanging the code, listing the keys.
+    /// Waiting for the browser, exchanging the code, listing the models.
     signing_in,
-    /// Signed in; `keys` lists the account's API keys (maybe none).
-    keys_ready,
-    /// Fetching the chosen key's models.
-    loading_models,
-    /// `models_json` holds the chosen key's `/v1/models` answer.
+    /// Signed in; `models_json` holds the gateway's `/v1/models` answer.
     models_ready,
     failed,
     cancelled,
@@ -59,12 +62,13 @@ pub const State = enum(u8) {
 pub const TRANSCRIPT_CAPACITY: usize = 2048;
 
 pub const Options = struct {
-    /// The Metask Messages endpoint (`auth.metaskMessagesUrl`): the account's
-    /// key list and a key's models are reached through its origin.
-    messages_url: []const u8,
     open_browser: bool = true,
     /// The loopback port the browser returns to (0 lets the system pick one).
     port: u16 = 1455,
+    /// The device code instead (`/login metask`, #527): a code confirmed in
+    /// a browser on any device, for a machine the browser cannot come back
+    /// to. The models and the rest of the dialog are the same.
+    device_code: bool = false,
 };
 
 pub const Worker = struct {
@@ -72,21 +76,19 @@ pub const Worker = struct {
     io: std.Io,
     /// The dialog's share, plus one while a step's thread runs.
     owners: std.atomic.Value(u8) = std.atomic.Value(u8).init(1),
-    /// Owned copies of `Options`' strings: the thread outlives no caller,
-    /// but a cancelled one may finish after its dialog has closed.
-    messages_url: []u8,
     open_browser: bool,
     port: u16,
+    device_code: bool,
     abort_signal: AbortSignal = AbortSignal.init(),
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(State.idle)),
     thread: ?std.Thread = null,
 
-    /// Set by step 1; owned here until `takeOAuth`.
-    oauth: ?auth.OAuthCredential = null,
-    keys: api_keys.Catalog,
-    /// The key step 2 lists the models of (owned, zeroed on release).
-    chosen_key: ?[]u8 = null,
-    /// Step 2's answer (owned).
+    /// The token endpoint's answer (owned, zeroed on release): what the
+    /// caller stores as the Metask session (`takeTokenJson`).
+    token_json: ?[]u8 = null,
+    /// The gateway origin the tokens are for (owned).
+    gateway: ?[]u8 = null,
+    /// The gateway's `/v1/models` answer for the sign-in (owned).
     models_json: ?[]u8 = null,
 
     failure_name: [64]u8 = undefined,
@@ -102,10 +104,9 @@ pub const Worker = struct {
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .messages_url = try allocator.dupe(u8, options.messages_url),
             .open_browser = options.open_browser,
             .port = options.port,
-            .keys = api_keys.Catalog.init(allocator),
+            .device_code = options.device_code,
         };
         return self;
     }
@@ -128,14 +129,12 @@ pub const Worker = struct {
     /// Everything released, secrets zeroed.
     fn destroy(self: *Worker) void {
         const allocator = self.allocator;
-        if (self.oauth) |*credential| credential.deinit(allocator);
-        self.keys.deinit();
-        if (self.chosen_key) |key| {
-            std.crypto.secureZero(u8, key);
-            allocator.free(key);
+        if (self.token_json) |body| {
+            std.crypto.secureZero(u8, body);
+            allocator.free(body);
         }
+        if (self.gateway) |origin| allocator.free(origin);
         if (self.models_json) |body| allocator.free(body);
-        allocator.free(self.messages_url);
         self.* = undefined;
         allocator.destroy(self);
     }
@@ -162,27 +161,6 @@ pub const Worker = struct {
         };
     }
 
-    /// Step 2, from `keys_ready` or `models_ready` (another key): the models
-    /// `key` can use.
-    pub fn startModels(self: *Worker, key: []const u8) error{ AlreadyStarted, ThreadSpawnFailed, OutOfMemory }!void {
-        const current = self.currentState();
-        if (current != .keys_ready and current != .models_ready) return error.AlreadyStarted;
-        self.join();
-        const copy = try self.allocator.dupe(u8, key);
-        if (self.chosen_key) |old| {
-            std.crypto.secureZero(u8, old);
-            self.allocator.free(old);
-        }
-        self.chosen_key = copy;
-        if (self.models_json) |body| self.allocator.free(body);
-        self.models_json = null;
-        try self.begin(current, .loading_models);
-        self.spawnStep(runModels) catch |err| {
-            self.state.store(@intFromEnum(current), .release);
-            return err;
-        };
-    }
-
     fn begin(self: *Worker, from: State, to: State) error{AlreadyStarted}!void {
         if (self.state.cmpxchgStrong(@intFromEnum(from), @intFromEnum(to), .acq_rel, .acquire) != null) return error.AlreadyStarted;
     }
@@ -192,39 +170,66 @@ pub const Worker = struct {
         self.signIn();
     }
 
-    fn signIn(self: *Worker) void {
-        var stored = auth.loginWithBrowser(self.allocator, .{
+    /// The token endpoint's answer: by the device code (`device_code`), or
+    /// by the browser coming back to the loopback server.
+    fn acquireToken(self: *Worker) ![]u8 {
+        if (self.device_code) return metask_oauth.acquireDeviceTokenWith(
+            self.allocator,
+            self.io,
+            metask_oauth.siteUrl(),
+            self.open_browser,
+            .{ .ctx = self, .show = showDeviceCode },
+            &self.abort_signal,
+        );
+        return auth.loginWithBrowserTokenJson(self.allocator, .{
             .open_browser = self.open_browser,
             .port = self.port,
             .abort_signal = &self.abort_signal,
             .notify = .{ .ctx = self, .write = appendTranscript },
-        }) catch |err| return self.settleError(err);
-        defer stored.deinit(self.allocator);
-        const credential = stored.oauth orelse return self.settleError(error.MissingOAuth);
+        });
+    }
+
+    fn showDeviceCode(ctx: ?*anyopaque, uri: []const u8, code: []const u8) void {
+        const self: *Worker = @ptrCast(@alignCast(ctx.?));
+        var buffer: [1024]u8 = undefined;
+        self.notify().say(std.fmt.bufPrint(&buffer, "Open {s} and enter the code {s}\n", .{ uri, code }) catch
+            "Open the Metask device page and enter the code it shows.\n");
+    }
+
+    fn signIn(self: *Worker) void {
+        const allocator = self.allocator;
+        const token_json = self.acquireToken() catch |err| return self.settleError(err);
+        var kept = false;
+        defer if (!kept) {
+            std.crypto.secureZero(u8, token_json);
+            allocator.free(token_json);
+        };
         if (self.abort_signal.isAborted()) return self.settle(.cancelled);
-        self.notify().say("Signed in. Listing your API keys…\n");
-        api_keys.fetchInto(&self.keys, self.allocator, self.io, self.messages_url, credential.access_token) catch |err|
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const outcome = provider_oauth.parseTokenResponse(arena.allocator(), token_json) catch |err|
             return self.settleError(err);
+        // What the session store requires too (`importTokenResponse`): a
+        // sign-in that cannot be kept is not worth choosing a model for.
+        if (outcome.refresh_token == null) return self.settleError(error.MissingRefreshToken);
+        const gateway = gatewayOf(arena.allocator(), token_json) orelse return self.settleError(error.MetaskGatewayMissing);
+
+        self.notify().say("Signed in. Listing your models…\n");
+        const models_url = std.fmt.allocPrint(arena.allocator(), "{s}/v1/models", .{gateway}) catch |err|
+            return self.settleError(err);
+        const fetched = catalog_fetch.fetchModelPages(allocator, self.io, .{ .url = models_url, .bearer = outcome.access_token }) catch |err|
+            return self.settleError(err);
+        var models_kept = false;
+        defer if (!models_kept) allocator.free(fetched.body);
         if (self.abort_signal.isAborted()) return self.settle(.cancelled);
-        self.oauth = credential;
-        stored.oauth = null;
-        self.settle(.keys_ready);
-    }
+        const gateway_copy = allocator.dupe(u8, gateway) catch |err| return self.settleError(err);
 
-    fn runModels(self: *Worker) void {
-        defer self.finishStep();
-        self.listModels();
-    }
-
-    fn listModels(self: *Worker) void {
-        var client = client_mod.Client.initWithBaseUrl(self.allocator, self.io, self.chosen_key.?, "model-selection", self.messages_url);
-        defer client.deinit();
-        const body = client.fetchModelsList() catch |err| return self.settleError(err);
-        if (self.abort_signal.isAborted()) {
-            self.allocator.free(body);
-            return self.settle(.cancelled);
-        }
-        self.models_json = body;
+        self.token_json = token_json;
+        self.gateway = gateway_copy;
+        self.models_json = fetched.body;
+        kept = true;
+        models_kept = true;
         self.settle(.models_ready);
     }
 
@@ -253,10 +258,7 @@ pub const Worker = struct {
 
     /// Whether no step is running.
     pub fn isSettled(self: *const Worker) bool {
-        return switch (self.currentState()) {
-            .signing_in, .loading_models => false,
-            else => true,
-        };
+        return self.currentState() != .signing_in;
     }
 
     /// Wait for the last step's thread to end (it settled already, or will).
@@ -272,10 +274,11 @@ pub const Worker = struct {
         return self.failure_name[0..self.failure_len];
     }
 
-    /// The sign-in's OAuth credential, handed over (valid from `keys_ready`).
-    pub fn takeOAuth(self: *Worker) ?auth.OAuthCredential {
-        defer self.oauth = null;
-        return self.oauth;
+    /// The sign-in's token response, handed over (valid from
+    /// `models_ready`); the caller zeroes and frees it.
+    pub fn takeTokenJson(self: *Worker) ?[]u8 {
+        defer self.token_json = null;
+        return self.token_json;
     }
 
     /// The transcript so far, copied into `out`.
@@ -310,7 +313,7 @@ test "a sign-in that never gets its callback is cancelled, and nothing is kept" 
     defer io_runtime.deinit();
     // Port 0 keeps a developer's real login server out of the way; the
     // browser is never opened.
-    const worker = try Worker.create(a, io_runtime.io(), .{ .messages_url = "http://127.0.0.1:9/v1/messages", .open_browser = false, .port = 0 });
+    const worker = try Worker.create(a, io_runtime.io(), .{ .open_browser = false, .port = 0 });
     defer worker.release();
     try worker.startSignIn();
     try std.testing.expectError(error.AlreadyStarted, worker.startSignIn());
@@ -326,7 +329,8 @@ test "a sign-in that never gets its callback is cancelled, and nothing is kept" 
     const transcript = worker.copyTranscript(&buffer);
     try std.testing.expect(std.mem.indexOf(u8, transcript, "Open this URL") != null);
     try std.testing.expect(std.mem.indexOf(u8, transcript, callback) != null);
-    try std.testing.expect(std.mem.indexOf(u8, transcript, "%2Fauth%2Fcallback") != null);
+    // The path registered for the `metacodes` client (#527).
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "%2Fauth%2Fmetask%2Fcallback") != null);
     try std.testing.expectEqual(State.signing_in, worker.currentState());
 
     worker.cancel();
@@ -334,6 +338,6 @@ test "a sign-in that never gets its callback is cancelled, and nothing is kept" 
     // Settled, and the step's thread has let go (so `release` reaps it).
     while ((!worker.isSettled() or worker.owners.load(.acquire) != 1) and spins < 1_000) : (spins += 1) @import("../util/time.zig").sleepMs(10);
     try std.testing.expectEqual(State.cancelled, worker.currentState());
-    try std.testing.expect(worker.takeOAuth() == null);
-    try std.testing.expectEqual(@as(usize, 0), worker.keys.entries.items.len);
+    try std.testing.expect(worker.takeTokenJson() == null);
+    try std.testing.expect(worker.models_json == null);
 }

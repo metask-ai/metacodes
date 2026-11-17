@@ -16,7 +16,8 @@ and how metacodes decides which provider to use.
 ## Where the file is
 
 Every install has a state root of its own: the directory that also holds
-`auth.json` (the Metask sign-in) and `config.json`. The file is `.env` in it.
+`oauth/metask.json` (the Metask sign-in), `auth.json` and `config.json`. The
+file is `.env` in it.
 
 | Install | File |
 |---|---|
@@ -155,8 +156,9 @@ At start, metacodes takes the first of these that applies:
 2. **The default you chose in `/model`** (Tab, "use from now on"), kept in
    `config.json`. When its provider has no key (anymore), it is passed over
    for the steps below, and the start says so once.
-3. **A Metask sign-in**: `--api-key`, `METASK_API_KEY` in the shell, or the
-   login `metacodes login` stored in `auth.json`. `METASK_API_KEY` in this
+3. **A Metask sign-in**: `--api-key`, `METASK_API_KEY` in the shell, a key in
+   `auth.json`, or the Metask session `metacodes login` (or `/login`) stored
+   in `oauth/metask.json`; a key comes before the session. `METASK_API_KEY` in this
    file counts too, unless the file's `METACODES_PROVIDER` names another
    provider: the provider the file names is its choice, and a Metask key
    beside it does not overrule that.

@@ -182,7 +182,7 @@ zig build && ./zig-out/bin/metacodes --help
 zig build example                          # 在 Zig 程序里嵌入运行时
 ```
 
-没有浏览器的机器(服务器、SSH)改用设备码登录：`metacodes login --provider metask --no-browser`，它给出一个链接和一个短码，在任何设备上确认即可。直接敲 `metacodes` 暂时还用不上这种登录(#499)，要用 `metacodes --provider metask` 启动。
+没有浏览器的机器(服务器、SSH)改用设备码登录：`metacodes login --provider metask --no-browser`，它给出一个链接和一个短码，在任何设备上确认后，再选模型和推理强度（界面里是 `/login metask`）。两种登录都存成 Metask 会话，直接敲 `metacodes` 就会用它。
 
 不登录、改用自己的 provider key：写进本安装的 `~/.local/opt/metacodes/state/.env`，重新启动即可，见 [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md)。什么都没配时 `metacodes` 也能打开，并告诉你这两条路；`/logout` 从 Metask 账号切回这把 key。
 

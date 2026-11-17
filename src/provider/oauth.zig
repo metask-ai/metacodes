@@ -422,6 +422,50 @@ pub const Session = struct {
     }
 };
 
+/// The exact durable bytes before a login replacement, including whether the
+/// file existed. Used to roll a failed multi-step sign-in back without
+/// reconstructing tokens or changing their recorded expiry.
+pub const StoredSnapshot = struct {
+    allocator: std.mem.Allocator,
+    path: []u8,
+    contents: ?[]u8,
+
+    pub fn capture(allocator: std.mem.Allocator, state_root: []const u8, provider_id: Slug) !StoredSnapshot {
+        var session = try Session.initHome(allocator, state_root, provider_id);
+        defer session.deinit();
+        const path = try allocator.dupe(u8, session.path);
+        errdefer allocator.free(path);
+        const contents = readFile(allocator, path) catch |err| switch (err) {
+            // Classify immediately after the failed open, before another
+            // platform call can replace errno. `readFile`'s error contract
+            // stays unchanged for the API-key store and other callers.
+            error.OpenFailed => if (pfs.lastErrnoIs(.NOENT)) null else return err,
+            else => return err,
+        };
+        return .{ .allocator = allocator, .path = path, .contents = contents };
+    }
+
+    pub fn deinit(self: *StoredSnapshot) void {
+        if (self.contents) |bytes| secureFree(self.allocator, bytes);
+        self.allocator.free(self.path);
+        self.* = undefined;
+    }
+
+    pub fn restore(self: *const StoredSnapshot) !void {
+        if (self.contents) |bytes| {
+            try ensureParent(self.allocator, self.path);
+            try writeAtomicPrivate(self.allocator, self.path, bytes);
+            return;
+        }
+        const path_z = try self.allocator.dupeZ(u8, self.path);
+        defer self.allocator.free(path_z);
+        pfs.unlinkPath(path_z) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+};
+
 fn own(
     allocator: std.mem.Allocator,
     outcome: RefreshOutcome,

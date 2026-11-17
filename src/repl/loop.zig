@@ -2476,15 +2476,16 @@ fn codepointDisplayWidth(cp: u21) usize {
 
 const testing = std.testing;
 
-test "/login: a copy that runs out of memory leaves the stored sign-in whole for its deinit (#485)" {
+test "/login: the model choice replaces an older key in auth.json, and a copy that runs out of memory leaves it whole (#485, #527)" {
     const Run = struct {
         fn run(allocator: std.mem.Allocator) !void {
             var stored: @import("../core/auth.zig").StoredCredentials = .{};
             defer stored.deinit(allocator);
             stored.api_key = try allocator.dupe(u8, "sk-previous-key");
             stored.selected_model = try allocator.dupe(u8, "previous-model");
-            try recordSignInChoice(allocator, &stored, "sk-chosen-key", "glm-5", .low);
-            try std.testing.expectEqualStrings("sk-chosen-key", stored.api_key.?);
+            try recordSignInChoice(allocator, &stored, "glm-5", .low);
+            try std.testing.expect(stored.api_key == null);
+            try std.testing.expect(stored.oauth == null);
             try std.testing.expectEqualStrings("glm-5", stored.selected_model.?);
             try std.testing.expectEqual(@as(?types_mod.ReasoningEffort, .low), stored.reasoning_effort);
         }
@@ -3030,9 +3031,10 @@ fn printLoginUsage() void {
         \\Usage: /login [--no-browser]
         \\       /login <provider> [--device-code] [--no-browser] [--client-id <id>]
         \\With no provider, sign in to Metask in the browser, as `metacodes login`
-        \\does, and choose an API key, a model and a reasoning level; the session
-        \\and new sessions use it. With a provider, sign in to that provider; the
-        \\login is stored where `metacodes login --provider <id>` stores it.
+        \\does, and choose a model and a reasoning level; the session and new
+        \\sessions use it. /login metask does the same with a code confirmed on
+        \\any device. With another provider, sign in to that provider; the login
+        \\is stored where `metacodes login --provider <id>` stores it.
         \\/logout signs out of Metask; /logout <provider> forgets that provider's key.
         \\
     , .{});
@@ -3130,11 +3132,20 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
     // `/login` alone (or with `--no-browser`) is the Metask browser sign-in
     // `metacodes login` runs (#485); the provider list is `/login <provider>`.
     if (named == null and options.method == .loopback and options.client_id == null) {
-        return handleMetaskSignIn(app, options.open_browser);
+        return handleMetaskSignIn(app, options.open_browser, false);
     }
     const host = app.providerHost() catch |err| {
         cmd_output.print("{s}The provider registry is unavailable: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
         return;
+    };
+    // `/login metask` is the device code (#485): the same dialog as `/login`,
+    // with the code confirmed on any device, then the model and reasoning
+    // level (#527). Without them a start on the sign-in would run the
+    // compiled default, which the gateway does not serve.
+    if (named) |name| if (options.client_id == null) {
+        for (host.registry.profiles.items) |*profile| {
+            if (profile.id.eqlText("metask") and profile.matchesName(name)) return handleMetaskSignIn(app, options.open_browser, true);
+        }
     };
 
     var dialog: dialogs.LoginDialog = .{
@@ -3145,6 +3156,9 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
     defer dialog.deinit();
     var start_at: ?usize = null;
     for (host.registry.profiles.items) |*profile| {
+        // Metask signs in by `/login` and `/login metask`, which go on to its
+        // model and reasoning level; the list does not offer a third way.
+        if (named == null and profile.id.eqlText("metask")) continue;
         // `--client-id` names one provider's client; it is not offered to the rest.
         var profile_options = options;
         if (named == null or !profile.matchesName(named.?)) profile_options.client_id = null;
@@ -3195,19 +3209,20 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
     }
 }
 
-/// `/login` (#485): the Metask browser sign-in, then the key, model and
-/// reasoning level, in a dialog (`dialogs.MetaskSignInDialog`). Once all
-/// three are chosen the sign-in is stored where `metacodes login` stores it
-/// (`auth.json`), the session moves onto it, and Metask becomes the default:
-/// a stored `/model` default (which would outrank the sign-in at the next
-/// start) is forgotten. Esc at any step stores and changes nothing.
-fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool) !void {
+/// `/login` (#485, #527): the Metask browser sign-in, or with `device_code`
+/// (`/login metask`) the device code, then the model and reasoning level, in
+/// a dialog (`dialogs.MetaskSignInDialog`). Once both are chosen the sign-in
+/// is stored where `metacodes login` stores it: the token response as the
+/// Metask session (`oauth/metask.json`, the gateway it names included), the
+/// model and reasoning level in `auth.json`. The session moves onto it, and
+/// Metask becomes the default: a stored `/model` default (which would outrank
+/// the sign-in at the next start) is forgotten. Esc at any step stores and
+/// changes nothing.
+fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) !void {
     const th = app.theme;
-    const auth = @import("../core/auth.zig");
     var dialog = dialogs.MetaskSignInDialog.init(app.allocator);
     defer dialog.deinit();
     dialog.term_rows = terminalRows();
-    dialog.site_url = @import("../api/metask_oauth.zig").siteUrl();
     var others: std.ArrayList(u8) = .empty;
     defer others.deinit(app.allocator);
     if (app.providerHost()) |host| {
@@ -3222,87 +3237,61 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool) !void {
         }
     } else |_| {}
     dialog.others = others.items;
-    const messages_url = @import("../api/metask_sign_in.zig").messagesUrl();
-    dialog.start(app.io, .{ .messages_url = messages_url, .open_browser = open_browser });
+    dialog.start(app.io, .{ .open_browser = open_browser, .device_code = device_code });
     runDialog(dialogs.MetaskSignInDialog, &dialog, app);
     if (dialog.outcome != .chosen) {
         cmd_output.print("Login interrupted · nothing was changed\n", .{});
         return;
     }
-    const key = dialog.chosenKey() orelse return;
     const model = dialog.chosenModel() orelse return;
-    const label = dialog.chosenKeyLabel();
     const worker = dialog.takeWorker() orelse return;
     defer worker.release();
+    const token_json = worker.takeTokenJson() orelse return;
+    defer {
+        std.crypto.secureZero(u8, token_json);
+        app.allocator.free(token_json);
+    }
 
-    // auth.json, as `metacodes login` writes it: the sign-in, the key, the
-    // model and the reasoning level.
-    var stored = auth.loadDefault(app.allocator, app.stateRoot()) catch |err| switch (err) {
-        error.NotFound, error.NoHome => auth.StoredCredentials{},
-        else => {
-            cmd_output.print("{s}The sign-in was not stored: {s} could not be read ({s}){s}\n", .{ th.danger, "auth.json", @errorName(err), th.reset });
-            return;
-        },
-    };
-    defer stored.deinit(app.allocator);
-    if (stored.oauth) |*old| old.deinit(app.allocator);
-    stored.oauth = worker.takeOAuth();
-    try recordSignInChoice(app.allocator, &stored, key, model, dialog.effort);
-    auth.saveDefault(app.allocator, app.stateRoot(), stored) catch |err| {
-        cmd_output.print("{s}The sign-in was not stored: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
-        return;
-    };
-
-    // The session moves onto the sign-in, and a stored `/model` default is
-    // forgotten either way: the sign-in is the most recent explicit choice.
-    const applied = app.applyMetaskSignIn(.{
-        .messages_url = messages_url,
-        .key = key,
+    var diagnostic: provider_login.ImportDiagnostic = .{};
+    const applied = app.applyMetaskSession(.{
+        .gateway = worker.gateway.?,
         .model = model,
         .effort = dialog.effort,
-        .models_json = worker.models_json,
-    });
-    if (applied.switch_error) |err| {
-        cmd_output.print("{s}Signed in, but this session could not switch to Metask ({s}); it stays as it was{s}\n", .{ th.danger, @errorName(err), th.reset });
-    } else {
-        cmd_output.print("Signed in to Metask · {s}", .{app.activeModel()});
-        if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
-        if (label.len > 0) cmd_output.print(" · key \"{s}\"", .{label});
-        cmd_output.print("\n", .{});
+        .models_json = worker.models_json.?,
+    }, token_json, &diagnostic);
+    if (applied.storage_error != null or applied.switch_error != null) {
+        const err = if (applied.storage_error) |storage_err| storage_err else applied.switch_error.?;
+        if (applied.rollback_error) |rollback_err| {
+            cmd_output.print("{s}Login failed: {s}; the previous sign-in could not be fully restored ({s}){s}\n", .{ th.danger, @errorName(err), @errorName(rollback_err), th.reset });
+        } else {
+            cmd_output.print("{s}Login failed: {s}; the previous sign-in, model default, and this session are unchanged{s}\n", .{ th.danger, @errorName(err), th.reset });
+        }
+        return;
     }
+    cmd_output.print("Signed in to Metask · {s}", .{app.activeModel()});
+    if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
+    cmd_output.print("\n", .{});
     if (applied.default_error) |err| {
         cmd_output.print("{s}The stored default model could not be cleared ({s}); the next start may use it{s}\n", .{ th.warn, @errorName(err), th.reset });
     } else {
         cmd_output.print("{s}New sessions start on Metask{s}{s}.{s}\n", .{
             th.dim,
-            if (applied.switch_error == null) " too" else "",
+            " too",
             if (applied.default_forgotten) " (the previous default model is forgotten)" else "",
             th.reset,
         });
     }
 }
 
-/// `auth.json`'s part of a `/login` (#485): the chosen key, model and
-/// reasoning level, replacing what the file held. Each copy is made before
-/// the value it replaces is freed, so a copy that fails leaves `stored`
-/// whole for its deinit.
+/// `auth.json`'s part of a `/login` (#485, #527): the chosen model and
+/// reasoning level (`StoredCredentials.recordSessionChoice`).
 fn recordSignInChoice(
     allocator: std.mem.Allocator,
     stored: *@import("../core/auth.zig").StoredCredentials,
-    key: []const u8,
     model: []const u8,
     effort: ?types_mod.ReasoningEffort,
 ) error{OutOfMemory}!void {
-    const key_copy = try allocator.dupe(u8, key);
-    if (stored.api_key) |old| {
-        std.crypto.secureZero(u8, old);
-        allocator.free(old);
-    }
-    stored.api_key = key_copy;
-    const model_copy = try allocator.dupe(u8, model);
-    if (stored.selected_model) |old| allocator.free(old);
-    stored.selected_model = model_copy;
-    stored.reasoning_effort = effort;
+    try stored.recordSessionChoice(allocator, model, effort);
 }
 
 /// `/logout` (#485, #499 part 2): out of Metask, both sign-ins, and the
@@ -3329,14 +3318,20 @@ fn handleLogout(app: *app_mod.App, rest: []const u8) void {
         cmd_output.print("{s}Logout failed: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
         return;
     };
-    if (done.removed.browser and done.removed.device) {
-        cmd_output.print("Signed out of Metask: removed the browser sign-in and the device-code sign-in.\n", .{});
+    // The browser sign-in and the device code both store the Metask
+    // session (#527); `auth.json` alone is an older sign-in or a key.
+    if (done.removed.device) {
+        cmd_output.print("Signed out of Metask: removed the sign-in.\n", .{});
     } else if (done.removed.browser) {
         cmd_output.print("Signed out of Metask: removed the browser sign-in.\n", .{});
-    } else if (done.removed.device) {
-        cmd_output.print("Signed out of Metask: removed the device-code sign-in.\n", .{});
     } else if (!done.key_removed) {
         cmd_output.print("No Metask sign-in was stored.\n", .{});
+    }
+    switch (done.revoke) {
+        .revoked => cmd_output.print("{s}Metask revoked it too.{s}\n", .{ th.dim, th.reset }),
+        .nothing_stored => {},
+        .failed => cmd_output.print("{s}Metask could not revoke it; it stays valid there until it expires.{s}\n", .{ th.warn, th.reset }),
+        .timed_out => cmd_output.print("{s}Metask did not answer the revocation in time; it may stay valid there until it expires.{s}\n", .{ th.warn, th.reset }),
     }
     if (done.key_removed) cmd_output.print("Removed the stored key for Metask.\n", .{});
     if (done.default_cleared) cmd_output.print("Forgot the default model, which was a Metask one.\n", .{});

@@ -86,8 +86,8 @@ pub const HttpExchange = struct {
     }
 };
 
-/// Metask's JSON refresh exchange. Unlike RFC 6749 form exchanges this sends
-/// exactly `{grant_type,refresh_token}`; the client id is intentionally absent.
+/// Metask's JSON refresh exchange: `{grant_type,refresh_token,client_id}`,
+/// as JSON rather than an RFC 6749 form (#527).
 pub const MetaskHttpExchange = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -168,7 +168,7 @@ test "the form body encodes a token that contains reserved characters" {
     );
 }
 
-test "Metask refresh body is JSON and carries no client id" {
+test "Metask refresh body is JSON and names the client (#527)" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -177,5 +177,5 @@ test "Metask refresh body is JSON and carries no client id" {
     // Keep this assertion transport-free; the exact helper is also exercised
     // by the production exchange before any socket is opened.
     const body = @import("metask_oauth.zig").refreshRequestBody(arena.allocator(), "mrt-1") catch unreachable;
-    try std.testing.expect(std.mem.indexOf(u8, body, "client_id") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"client_id\":\"metacodes\"") != null);
 }
