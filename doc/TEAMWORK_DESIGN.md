@@ -276,7 +276,10 @@ review_rejected: RejectReason`;`review_rejected` 由编排器再开一轮。顺�
 **批准绑定最终 diff**:`Approval.tree` 记录评审看到的工作区树 id。宣布完成前 runtime 调
 `confirmApproval`,树变了(含新增未跟踪文件;`.gitignore` 忽略的构建产物不算)即 `stale`,批准作废。
 `workspaceTree` 用临时索引(先复制工作区的 index,放在运行目录里)执行 `git add -A` 与
-`git write-tree`,不动工作区的 index 和文件,唯一副作用是对象库里的 blob。
+`git write-tree`,不动工作区的 index 和文件,唯一副作用是对象库里的 blob。控制器的 Git 调用通过
+`util/controller_git.zig` 逐次禁用 hooks、fsmonitor 和所有已配置的 clean/smudge/process filter
+(含 include 引入的配置),不改仓库配置;过滤器不转换候选文件内容,也不会执行工作区里的过滤脚本。
+配置查询失败、结果被截断或过滤器过多时拒绝计算,不降级到未受限的 Git 调用。
 
 ### 6.3 open-issues 台账
 
