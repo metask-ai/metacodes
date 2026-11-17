@@ -553,6 +553,15 @@ status, compatibility boundaries, and entry points are defined by
   installed and the request replayed at the new route. The client now drops
   it, and the request fails as unauthorized.
 
+- **The `/models` key list is requested only on the Metask API-key route.**
+  It was requested with the Metask sign-in token from `auth.json`, at
+  `/api/v1/keys` under whatever endpoint the session was on: typing `/model`
+  after a switch to another Messages-wire provider, or in a session started
+  on one, sent that token there. Elsewhere the menu now shows the list as
+  unavailable; leaving the Metask route drops a loaded list, and coming back
+  loads it again. A Metask model picked at another Metask gateway (the
+  compiled default, say) is still the Metask route.
+
 ### Security
 
 - **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**

@@ -29,6 +29,8 @@
 //!   * A transport's own refresh on a 401 `token_expired` installed and
 //!     replayed the refreshed token on whatever route the client had been
 //!     moved to while the refresh ran.
+//!   * The `/models` key list was fetched with the Metask sign-in from
+//!     whatever route the session was on.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -979,4 +981,142 @@ test "L2 credential scope: an OpenAI-wire token refreshed while the route moved 
     try expectNeverSent(moved, "fake-refreshed-token");
     try std.testing.expectEqual(@as(usize, 0), moved.requestCount());
     try std.testing.expectEqualStrings(SESSION_KEY, client.credential.lendable().?);
+}
+
+// ── the Metask account's key list ────────────────────────────────────────────
+
+/// A Metask API-key route at `gateway`, a relay on the Messages wire with a
+/// key, and the browser sign-in in `auth.json`.
+fn keyListCase(case: *Case, setup: std.mem.Allocator, relay_origin: []const u8) !void {
+    const config_json = try std.fmt.allocPrint(setup, "{{\"custom_providers\": {{{s}}}}}", .{try relayDefinition(setup, "relay", "RELAY_TOKEN", relay_origin, "relay-model")});
+    try case.init(config_json);
+    try case.setEnv("RELAY_TOKEN", RELAY_KEY);
+    try case.storeMetaskLogin();
+}
+
+test "L2 credential scope: the account's key list is asked for only on the Metask route" {
+    // The startup `/v1/models` probe, then the key list the menu loads once
+    // the session is back on the Metask route.
+    var gateway = try harness.MockServer.startCassette(&.{ GATEWAY_MODELS, KEYS_BODY }, 0);
+    defer gateway.stop();
+    var relay = try harness.MockServer.startCassette(&.{KEYS_BODY}, 0);
+    defer relay.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    var case: Case = undefined;
+    try keyListCase(&case, setup.allocator(), try originOf(setup.allocator(), relay));
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    const gateway_url = try allocator.dupeZ(u8, try gateway.urlOwned(allocator));
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", gateway_url.ptr, "--model", "glm-5.3-flash" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+    try std.testing.expect(app.onMetaskKeyRoute());
+
+    // `/model` typed on another provider's route, before the menu ever
+    // loaded the list (Ctrl+O first, then `/model`).
+    try std.testing.expect(cc.repl_picker_host.useSelector(app, "relay-model") == .switched);
+    try std.testing.expect(!app.onMetaskKeyRoute());
+    app.ensureApiKeyCatalog();
+    try expectNeverSent(relay, LOGIN_TOKEN);
+    try std.testing.expectEqual(@as(usize, 0), relay.requestCount());
+    try std.testing.expectEqual(@as(usize, 0), app.api_key_catalog.entries.items.len);
+
+    // Back on the Metask gateway, the menu loads it from there.
+    const metask_offer = try offerIdText(app, "metask", "glm-5.3-flash", null);
+    try std.testing.expect(cc.repl_picker_host.useSelector(app, &metask_offer) == .switched);
+    try std.testing.expect(app.onMetaskKeyRoute());
+    app.ensureApiKeyCatalog();
+    try std.testing.expectEqual(@as(usize, 2), gateway.requestCount());
+    try std.testing.expect(std.mem.startsWith(u8, requestLine(gateway.requestAt(1).?), "GET /api/v1/keys?"));
+    try std.testing.expect(sentBearer(gateway, 1, LOGIN_TOKEN));
+    try std.testing.expectEqual(@as(usize, 2), app.api_key_catalog.entries.items.len);
+
+    // Leaving the route drops the list; it is the Metask account's.
+    try std.testing.expect(cc.repl_picker_host.useSelector(app, "relay-model") == .switched);
+    try std.testing.expectEqual(@as(usize, 0), app.api_key_catalog.entries.items.len);
+    app.ensureApiKeyCatalog();
+    try std.testing.expectEqual(@as(usize, 0), relay.requestCount());
+}
+
+test "L2 credential scope: a session started on another provider never asks for the key list" {
+    var relay = try harness.MockServer.startCassette(&.{ GATEWAY_MODELS, KEYS_BODY }, 0);
+    defer relay.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const relay_origin = try originOf(setup.allocator(), relay);
+    var case: Case = undefined;
+    try keyListCase(&case, setup.allocator(), relay_origin);
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    const argv = [_][*:0]const u8{ "metacodes", "--provider", "relay" };
+    var config = try case.config(&argv);
+    // What `main`'s startup route resolution records for `--provider relay`.
+    config.resolved_provider_id = "relay";
+    config.provider_kind = .anthropic;
+    config.base_url = try std.fmt.allocPrint(allocator, "{s}/relay/v1/messages", .{relay_origin});
+    config.model = "relay-model";
+    config.model_explicit = true;
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, RELAY_KEY);
+    defer app.deinit();
+
+    // `/model` typed in the input box.
+    app.ensureApiKeyCatalog();
+    try expectNeverSent(relay, LOGIN_TOKEN);
+    // Only the startup `/v1/models` probe, with the relay's own key.
+    try std.testing.expectEqual(@as(usize, 1), relay.requestCount());
+    try std.testing.expect(sentBearer(relay, 0, RELAY_KEY));
+}
+
+// ── a Metask offer at another Metask gateway ────────────────────────────────
+
+test "L2 credential scope: the key list follows the session onto another Metask gateway" {
+    // The key route's own gateway answers the startup probe.
+    var gateway = try harness.MockServer.startCassette(&.{GATEWAY_MODELS}, 0);
+    defer gateway.stop();
+    // Another Metask gateway: the key list, then a pick's `/v1/models`.
+    var other = try harness.MockServer.startCassette(&.{ KEYS_BODY, GATEWAY_MODELS }, 0);
+    defer other.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    var case: Case = undefined;
+    try keyListCase(&case, setup.allocator(), UNREACHABLE_ORIGIN);
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    const gateway_url = try allocator.dupeZ(u8, try gateway.urlOwned(allocator));
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", gateway_url.ptr, "--model", "glm-5.3-flash" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+
+    // Metask's offers at another gateway, as the compiled ones point at the
+    // default gateway rather than a `--base-url` one; the session picks one.
+    const host = try app.providerHost();
+    try host.ingestMetask(try originOf(allocator, other), GATEWAY_MODELS, .messages);
+    try commitIn(app, "metask", "glm-5.3-flash", null, .session);
+
+    // Still a Metask gateway, with a Metask key: the list and a pick work.
+    try std.testing.expect(app.onMetaskKeyRoute());
+    app.ensureApiKeyCatalog();
+    try std.testing.expect(std.mem.startsWith(u8, requestLine(other.requestAt(0) orelse return error.NoKeyList), "GET /api/v1/keys?"));
+    try std.testing.expect(sentBearer(other, 0, LOGIN_TOKEN));
+    var prod: ?usize = null;
+    for (app.api_key_catalog.entries.items, 0..) |entry, index| {
+        if (std.mem.eql(u8, entry.secret, KEY_PROD)) prod = index;
+    }
+    try app.selectApiKeyForModels(prod orelse return error.NoProdKey);
+    try std.testing.expect(sentBearer(other, 1, KEY_PROD));
 }

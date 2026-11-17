@@ -2267,6 +2267,11 @@ pub const App = struct {
     /// to the key in use.
     pub fn ensureApiKeyCatalog(app: *App) void {
         if (app.api_key_catalog_load != .deferred) return;
+        // The list and the sign-in that asks for it are Metask's, and the
+        // request goes to the route's own address: on any other route it
+        // would carry the Metask token there. The menu says the list is
+        // unavailable, and loads it once the session is back.
+        if (!app.onMetaskKeyRoute()) return;
         app.api_key_catalog_load = .loaded;
         const log = @import("util/log.zig");
         const login_token = @import("core/auth.zig").resolveStoredOAuthBearer(app.allocator, app.stateRoot()) catch null;
@@ -2286,6 +2291,32 @@ pub const App = struct {
                 log.debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    /// Whether the session runs on its Metask API-key route now: it has one
+    /// (`metask_key_route`), it is on the Messages wire, and its requests go
+    /// to a Metask gateway: a Metask offer since the last commit, else the
+    /// route's own gateway. A `/model` switch to another provider moves the
+    /// clients, not the record.
+    pub fn onMetaskKeyRoute(app: *const App) bool {
+        const route = app.metask_key_route orelse return false;
+        if (app.config.provider_kind != .anthropic) return false;
+        // After a commit: a Metask offer, whichever Metask gateway it is at
+        // (the compiled one, or one a catalog named), with the session's key.
+        if (app.live_route) |live| return live.provider.eqlText("metask");
+        const origin = MetaskKeyRoute.gatewayOriginOf(app.api_client.base_url) orelse return false;
+        return std.mem.eql(u8, origin, route.gateway_origin);
+    }
+
+    /// Drop a loaded `/models` key list: it is the Metask account's, and the
+    /// session has left the Metask route. The menu loads it again when the
+    /// session is back (`ensureApiKeyCatalog`).
+    fn forgetApiKeyCatalog(app: *App) void {
+        if (app.api_key_catalog_load != .loaded) return;
+        app.api_key_catalog.clear();
+        app.api_key_catalog_load = .deferred;
+        app.models_picker_key_index = null;
+        app.models_picker_model_index = null;
     }
 
     /// Fill `api_client.catalog` from the route's `/v1/models`. With the cache
@@ -3360,6 +3391,9 @@ pub const App = struct {
             .provider = binding.provider_id,
             .oauth = if (oauth_token) |token| std.mem.eql(u8, binding.secret, token) else false,
         };
+        // The `/models` key list is the Metask account's: off the Metask route
+        // it is dropped, and the menu loads it again once the session is back.
+        if (!app.onMetaskKeyRoute()) app.forgetApiKeyCatalog();
         // Every out-of-process UI learns the *route*, not just the model name: a
         // visible model name can come from several providers, channels,
         // protocols, and accounts, so broadcasting only the name would announce
