@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Every request names metacodes as its User-Agent.** Provider, sign-in,
+  key-check, catalog, MCP and service requests used to go out as std's
+  `zig/0.16.0 (std.http)`; they now say `metacodes/<version>`
+  (`src/api/http_connection.zig`). Vendors tell coding tools apart by this
+  header, and their terms forbid a forged one. A request that names itself
+  keeps its own (the OTLP exporter's `metacodes-otlp`).
+
 - **A subscription plan run with nobody at the keyboard says so once.** The
   coding plans (Kimi Code, the Z.AI GLM Coding Plan) are licensed for a
   person in a coding tool, so a `-p`, `serve`, resumed-suspension or piped

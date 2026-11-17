@@ -281,6 +281,15 @@ changes the exit code: the terms are the vendor's to enforce. `--web` is a
 person in a browser and a teammate answers to its lead's session; neither
 prints it.
 
+## User-Agent
+
+Every request says what it is: `src/api/http_connection.zig`, which all of
+`src/` sends through, sets `User-Agent: metacodes/<version>` unless the
+caller names itself (the OTLP exporter keeps `metacodes-otlp`). Vendors
+tell coding tools apart by this header, some refuse a client they do not
+recognise, and their terms forbid a forged one; an honest name is the only
+one a vendor can be asked to admit.
+
 ## Credential pools
 
 A provider can have several credentials — separate accounts, separate plans —
