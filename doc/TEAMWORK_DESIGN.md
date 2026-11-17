@@ -129,12 +129,21 @@ runtime 用它核验 reviewer 的批准(§6.2);各层逐字段覆盖,与其他�
 metacodes seat 根本没有放 `command` 的位置;`BudgetEnforcement.wallclock_only` 自带
 `WallclockLimit`。
 
-**接线点(尚未接)**:`<state root>/config.json` 目前由两处读取——`src/app/config.zig` 的
-`loadFromHome`(`FileConfig`:model、permission_mode 等)和 provider 控制面的
-`src/provider/config_store.zig` `Store.load`(经 `config_doc.zig`,只拥有自己的键并保留其他键)。
-teamwork 段将在 `src/app/config.zig` 旁接入:读出 `teamwork` 成员后交给 `config.parseValue`,
-项目层读 `.metacodes/teamwork.json`,命令行层由 `main.zig` 的参数解析构造 `Layer`,三者经
-`merge` 后 `validate`,在 `/teamwork` 启动前报错。该接线随 #518 落地。
+**CLI 接线**:`src/teamwork/command.zig` 从 `<state root>/config.json` 读出
+`teamwork` 成员交给 `config.parseValue`,仓库根目录 `.metacodes/teamwork.json`
+交给 `config.parse`,再叠加 CLI Layer,经 `merge` / `validate` 后才启动 App。
+入口是 `metacodes teamwork run --request-file <file> --approve --budget-usd <cap>`;
+配置及请求没有显式批准时,不启动 provider、不建运行目录或 worktree。
+`--config-json` 可覆盖 seat 的 harness/model/effort;`--max-rounds` 与
+`--check-command` 接入 runtime 的真实 dispatch cap / pinned check。
+
+CLI 使用确定性 SWE manager 和请求文件,不执行 interviewer;未接线的角色配置明确拒绝。
+`command.Host` 向 worker、pinned check 和 verifier 提供强制沙箱,state root 必须在仓库外。
+`approved-config.json` 保存批准配置并固定 native seat 的继承模型;`teamwork resume <id>
+--approve` 只用这份 policy。`teamwork status <id> [--json]` 只读运行文件,缺失账本为空,
+pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
+`McpHost.serveFn(gpa, run)` 接管 live Run 的管理。完整 CLI 合约见 [API.md](API.md),
+真实 CLI consumer 测试见 `tests/component/teamwork_command_test.zig`(假 harness / 本地 mock)。
 
 ## 4. 运行目录
 
