@@ -154,7 +154,7 @@ pub const PROFILE = profile.ProviderProfile{
 test "openai profile: a pasted key is checked against the model listing, as a bearer" {
     try profile.validateProfile(PROFILE);
     const page = PROFILE.defaultKeyPage(PROFILE.default_channel).?;
-    try std.testing.expectEqualStrings("https://platform.openai.com/api-keys", page.url);
+    try std.testing.expectEqualStrings("https://platform.openai.com/api-keys", page.url.?);
     try std.testing.expectEqualStrings("https://api.openai.com/v1/models", page.check_url.?);
     try std.testing.expectEqual(profile.CredentialKind.api_key, PROFILE.api_key_setup.?.kind);
     try std.testing.expect(PROFILE.auth == .bearer);

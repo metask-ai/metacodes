@@ -27,6 +27,7 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const api_key_store = @import("../provider/api_key_store.zig");
 const provider_credential = @import("../provider/credential.zig");
 const catalog_fetch = @import("catalog_fetch.zig");
+const model_probe = @import("model_probe.zig");
 
 pub const Method = oauth_login.Method;
 
@@ -244,9 +245,13 @@ pub const ApiKeyPrepared = struct {
             var line: [512]u8 = undefined;
             notify.say(std.fmt.bufPrint(&line, "Checking the key with {s}\n", .{url}) catch "Checking the key\n");
             if (self.aborted()) return error.Aborted;
+            // An Anthropic model listing answers 400 without its version
+            // header, which would read as a check that learned nothing.
+            var extra: [1]std.http.Header = undefined;
             const answer = catalog_fetch.fetchAnswer(allocator, io, .{
                 .url = url,
                 .credential = .{ .scheme = self.auth, .secret = self.secret },
+                .extra_headers = model_probe.headersFor(self.page.check_wire, &extra),
             }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.KeyCheckFailed,
@@ -261,7 +266,8 @@ pub const ApiKeyPrepared = struct {
             self.provider_id,
             self.kind,
             self.secret,
-            self.page.id.slice(),
+            // A configured provider's key was pasted, not made on a page.
+            if (self.page.url != null) self.page.id.slice() else null,
             time.nowUnix(),
         );
         var line: [256]u8 = undefined;

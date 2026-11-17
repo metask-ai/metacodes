@@ -271,6 +271,14 @@ status, compatibility boundaries, and entry points are defined by
   OAuth client is configured for OpenAI; it used to start the browser sign-in
   and stop on the missing client id.
 
+- **A provider of your own takes a pasted key.** `/login <id>` and `metacodes
+  login --provider <id>` now work for a provider defined in
+  `custom_providers`: there is no page to open, so they go straight to the
+  paste, check the key against the provider's model list the way its requests
+  send it, and store it in `<state root>/keys/<id>.json`, which only that
+  provider reads. The check may be plain http to a server on this machine,
+  as the provider's own requests may.
+
 - **A Linux sandbox backend: bubblewrap.** With `sandbox.enabled`, Bash,
   Monitor, skill `!` lines, the teamwork reviewer's check command and the
   Claude Code seat's CLI now run on Linux in bwrap mount, pid and IPC

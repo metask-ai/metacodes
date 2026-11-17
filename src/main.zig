@@ -3029,7 +3029,7 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
             std.debug.print("error: no terminal to paste the key into; use --api-key-stdin\n", .{});
             return 2;
         };
-        std.debug.print("Create an API key for {s}.\n", .{profile.display_name});
+        if (page.url != null) std.debug.print("Create an API key for {s}.\n", .{profile.display_name});
         if (setup.note) |note| std.debug.print("{s}\n", .{note});
         if (request.page == null and setup.pages.len > 1) {
             std.debug.print("\nWhich plan is the key for?\n", .{});
@@ -3051,9 +3051,16 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
                 page = setup.pages[choice - 1];
             }
         }
-        std.debug.print("\nOpen this page and create a key:\n{s}\n\n", .{page.url});
-        if (request.open_browser) auth.openBrowser(allocator, page.url) catch {};
-        key_len = readSecretLine("Paste the key (it is not shown) and press Enter: ", &key_buffer) catch |err| {
+        var prompt_buf: [256]u8 = undefined;
+        const prompt = if (page.url) |url| prompt: {
+            std.debug.print("\nOpen this page and create a key:\n{s}\n\n", .{url});
+            if (request.open_browser) auth.openBrowser(allocator, url) catch {};
+            break :prompt "Paste the key (it is not shown) and press Enter: ";
+        } else
+            // A provider the user configured: the key comes from whoever
+            // runs it, and there is no page to open.
+            std.fmt.bufPrint(&prompt_buf, "Paste the API key for {s} (it is not shown) and press Enter: ", .{profile.display_name}) catch "Paste the key (it is not shown) and press Enter: ";
+        key_len = readSecretLine(prompt, &key_buffer) catch |err| {
             std.debug.print("\n", .{});
             if (err == error.Interrupted) {
                 std.debug.print("Login interrupted; nothing was stored.\n", .{});
@@ -5222,11 +5229,13 @@ test {
     _ = &@import("provider/api_key_store.zig");
     _ = &@import("provider/alias.zig");
     _ = &@import("provider/custom_provider.zig");
+    _ = &@import("provider/model_listing.zig");
     _ = &@import("provider/oauth.zig");
     _ = &@import("kg/provider_audit.zig");
     _ = &@import("api/oauth_exchange.zig");
     _ = &@import("api/oauth_login.zig");
     _ = &@import("api/catalog_fetch.zig");
+    _ = &@import("api/model_probe.zig");
     _ = &@import("api/models_pages.zig");
     _ = &@import("api/gemini_signatures.zig");
     _ = &@import("api/models_cache.zig");

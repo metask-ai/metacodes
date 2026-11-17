@@ -526,8 +526,12 @@ Some providers have a plan whose keys are created on a web page and offer no
 grant a third-party client could run; the GLM Coding Plan is the first. Such a
 profile declares `api_key_setup` (`provider/profile.zig`): the credential kind
 the key is, the pages it is created on (`KeyPage { id, label, url, check_url,
-region }`), and a note shown before the user picks one. Validation requires an
-accepted kind, at least one page, https URLs and unique ids. The Coding Plan
+check_wire, region }`), and a note shown before the user picks one. Validation
+requires an accepted kind, at least one page and unique ids; a page's `url` must
+be https, and so must its `check_url`, unless the profile's endpoint policy
+admits it (plain http to a loopback host, or a definition that turned TLS off
+for its own endpoint): the check carries the key, so it may go only where the
+provider's requests do. The Coding Plan
 declares four plan pages — China and Global, personal and team — and its note
 says why the standard API-key page is the wrong one: since 2026-10-16 a key
 from it bills the account balance even on the Coding Plan endpoints. The page
@@ -585,6 +589,19 @@ removes it.
 `METACODES_KEY_CHECK_URL` replaces every page's check URL — the local mock the
 tests use, as `METASK_GATEWAY_URL` is for Metask. Only https or plain http to
 an exact loopback host is accepted, because the check carries the key.
+
+A provider the user defined (`custom_providers`, below) gets a key setup too,
+built from its definition (`custom_provider.zig`, `pastedKeySetup`) whenever it
+accepts an API key: one page with no `url` — whoever runs a relay or a server
+hands its keys out, so there is nothing to open — labelled with its display
+name, and a `check_url` that is the model listing of its default channel
+(`provider/model_listing.zig`: `{base}/models`, `{root}/v1/models?limit=1000`
+with `anthropic-version`, which `check_wire` asks for, or
+`{root}/v1beta/models?pageSize=1000`). A `bedrock_converse` channel lists
+nothing, so its key is stored unchecked, like the built-in Bedrock's. The CLI
+then prompts `Paste the API key for <name>` without opening a page, `/login
+<id>` goes straight to the paste, and the key file records no page. A key that
+the endpoint cannot check (no listing) is stored with `--no-check`.
 
 The two front ends differ only in how the key is typed. The CLI prompts for
 the plan, prints the page whole, opens it, and reads the key with echo off;
@@ -1009,6 +1026,8 @@ on a second line of its confirmation, who bills the session from then on.
 | `src/provider/startup.zig` | CLI/bootstrap route resolution |
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
+| `src/provider/model_listing.zig` | where each wire lists its models, and reading the answer (no I/O) |
+| `src/api/model_probe.zig` | the model-listing GET, and the headers a listing needs |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
 | `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
 | `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |

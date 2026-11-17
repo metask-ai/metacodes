@@ -72,7 +72,7 @@ pub const LoginWorker = struct {
                 self.owns_secret = true;
                 const page = &prepared.page;
                 page.label = try a.dupe(u8, page.label);
-                page.url = try a.dupe(u8, page.url);
+                if (page.url) |url| page.url = try a.dupe(u8, url);
                 if (page.check_url) |url| page.check_url = try a.dupe(u8, url);
                 if (page.region) |region| page.region = try a.dupe(u8, region);
                 // A configured provider's header name lives in its config.

@@ -27,6 +27,7 @@ const ids = @import("ids.zig");
 const offer = @import("offer.zig");
 const controls_mod = @import("controls.zig");
 const profile_mod = @import("profile.zig");
+const model_listing = @import("model_listing.zig");
 
 pub const Slug = ids.Slug;
 pub const ProviderProfile = profile_mod.ProviderProfile;
@@ -181,6 +182,7 @@ fn buildProfile(
     const oauth = try parseOAuth(arena, value.object.get("oauth"));
     if (oauth.token_url != null and !acceptsOAuthKind(kinds))
         return error.OAuthWithoutOAuthCredentialKind;
+    const key_setup = try pastedKeySetup(arena, display, kinds, channelNamed(channels, default_channel));
 
     const built = ProviderProfile{
         .id = id,
@@ -199,12 +201,51 @@ fn buildProfile(
         .oauth_device_authorization_url = oauth.device_authorization_url,
         .oauth_client_id = oauth.client_id,
         .oauth_scope = oauth.scope,
+        .api_key_setup = key_setup,
     };
     // The same structural validation a built-in profile goes through. Doing it
     // here means a malformed definition fails at parse time rather than at the
     // first request.
     profile_mod.validateProfile(built) catch return error.InvalidDocument;
     return built;
+}
+
+fn channelNamed(channels: []const ChannelDescriptor, id: ?Slug) ChannelDescriptor {
+    if (id) |wanted| for (channels) |candidate| {
+        if (candidate.id.eql(wanted)) return candidate;
+    };
+    return channels[0];
+}
+
+/// How a key for a configured provider is stored (`/login <id>`, `metacodes
+/// login --provider <id>`): pasted, because there is no page to create it on
+/// — whoever runs the relay or the server hands it out — and checked with
+/// the model listing of `channel` (the default one; `model_listing.zig`),
+/// sent the way the provider's requests carry the key. A Bedrock Converse
+/// channel lists nothing to check against, so its key is stored unchecked,
+/// as the built-in Bedrock's is. Null when the definition accepts no API key
+/// at all (an OAuth-only gateway).
+fn pastedKeySetup(
+    arena: std.mem.Allocator,
+    display: []const u8,
+    kinds: []const profile_mod.CredentialKind,
+    channel: ChannelDescriptor,
+) DefinitionError!?profile_mod.ApiKeySetup {
+    const accepts_key = for (kinds) |kind| {
+        if (kind == .api_key) break true;
+    } else false;
+    if (!accepts_key) return null;
+    const wire = channel.routes[0].protocol.wire();
+    const check_url = if (wire) |known| try model_listing.listingUrl(arena, channel.base_url, known) else null;
+    const pages = try arena.alloc(profile_mod.KeyPage, 1);
+    pages[0] = .{
+        .id = Slug.lit("key"),
+        .label = display,
+        .url = null,
+        .check_url = check_url,
+        .check_wire = if (check_url != null) wire else null,
+    };
+    return .{ .kind = .api_key, .pages = pages };
 }
 
 const OAuthDefinition = struct {
@@ -976,4 +1017,40 @@ test "a non-finite or out-of-range price is rejected, not converted" {
     }) |text| {
         try testing.expectError(error.InvalidPrice, parse(a, text));
     }
+}
+
+test "a configured provider's key is pasted and checked with its default channel's model listing" {
+    const a = testing.allocator;
+    var definitions = try parse(a,
+        \\{"custom_providers": {
+        \\  "relay": {"display_name": "House relay",
+        \\    "channels": [{"id":"anthropic","base_url":"https://relay.example.com","protocol":"anthropic_messages"},
+        \\                 {"id":"openai","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
+        \\    "models": [{"request_model_id":"m"}]},
+        \\  "local": {"channels": [{"id":"openai","base_url":"http://127.0.0.1:11434/v1","protocol":"openai_chat"}],
+        \\    "models": [{"request_model_id":"qwen3"}]},
+        \\  "bedrock-relay": {"channels": [{"id":"bedrock","base_url":"https://bedrock.example.com","protocol":"bedrock_converse"}],
+        \\    "models": [{"request_model_id":"anthropic.claude"}]},
+        \\  "sso-only": {"credential_kinds": ["openai_oauth"],
+        \\    "oauth": {"token_url":"https://sso.example.com/token","authorize_url":"https://sso.example.com/authorize","client_id":"c"},
+        \\    "channels": [{"id":"openai","base_url":"https://sso.example.com/v1","protocol":"openai_chat"}],
+        \\    "models": [{"request_model_id":"m"}]}}}
+    );
+    defer definitions.deinit();
+
+    const relay = definitions.find("relay").?.api_key_setup.?;
+    try testing.expectEqual(profile_mod.CredentialKind.api_key, relay.kind);
+    try testing.expectEqual(@as(usize, 1), relay.pages.len);
+    // No page to send anyone to; the check is the first channel's listing.
+    try testing.expect(relay.pages[0].url == null);
+    try testing.expectEqualStrings("House relay", relay.pages[0].label);
+    try testing.expectEqualStrings("https://relay.example.com/v1/models?limit=1000", relay.pages[0].check_url.?);
+    try testing.expectEqual(Protocol.Wire.anthropic_messages, relay.pages[0].check_wire.?);
+
+    // A loopback server is checked where its requests go, in plain HTTP.
+    try testing.expectEqualStrings("http://127.0.0.1:11434/v1/models", definitions.find("local").?.api_key_setup.?.pages[0].check_url.?);
+    // Nothing to check a Bedrock key with: stored as it is pasted.
+    try testing.expect(definitions.find("bedrock-relay").?.api_key_setup.?.pages[0].check_url == null);
+    // A gateway that takes only its own sign-in takes no pasted key.
+    try testing.expect(definitions.find("sso-only").?.api_key_setup == null);
 }

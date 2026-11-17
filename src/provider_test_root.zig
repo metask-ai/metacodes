@@ -26,6 +26,7 @@ pub const startup = @import("provider/startup.zig");
 pub const config_store = @import("provider/config_store.zig");
 pub const host = @import("provider/host.zig");
 pub const custom_provider = @import("provider/custom_provider.zig");
+pub const model_listing = @import("provider/model_listing.zig");
 pub const openrouter = @import("provider/openrouter.zig");
 pub const bedrock_catalog = @import("provider/bedrock_catalog.zig");
 pub const vendor = @import("provider/vendor.zig");
