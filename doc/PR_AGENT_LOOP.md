@@ -41,8 +41,8 @@ Placing the script in `.github/` does not make it a hosted Actions workflow.
   checkpoint commits first: some evaluation tests materialize committed HEAD
   and intentionally refuse dirty pinned inputs. A failed checkpoint is never
   pushed; its validation output goes back to the original worker.
-- GitHub permission to publish commit statuses, push the head branch and
-  merge the PR upstream. No admin bypass is used or requested.
+- GitHub permission to push the head branch and merge the PR upstream.
+  No admin bypass is used or requested.
 
 Codex uses its existing local authentication. The controller does not copy
 credentials to GitHub Actions, read auth tokens or write secrets to PR bodies.
