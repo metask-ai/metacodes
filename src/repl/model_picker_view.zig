@@ -303,7 +303,6 @@ fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, 
 /// bracketed, and the value wanted when this route shows the nearest one it
 /// has instead. ←/→ change the first.
 fn controls(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
-    _ = cols;
     const offer = picker.focusedOffer() orelse return 0;
     if (offer.controls.len == 0) {
         line(w);
@@ -318,25 +317,75 @@ fn controls(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u1
         w.print("  {s}{s}{s} ", .{ th.primary, spec.label, th.reset }) catch {};
         if (spec.kind != .enumeration or spec.allowed_values.len == 0) {
             w.print("  {s}(not settable here){s}", .{ th.dim, th.reset }) catch {};
-        } else {
-            const shown = picker.effectiveValue(spec);
-            writeChoice(w, th, "default", shown == null);
-            for (spec.allowed_values) |candidate| {
-                writeChoice(w, th, candidate, if (shown) |value| std.mem.eql(u8, value, candidate) else false);
-            }
-            if (picker.wantedInstead(spec)) |wanted| {
-                w.print("  {s}(nearest to {s}){s}", .{ th.dim, wanted, th.reset }) catch {};
-            }
-            if (first) |walked| if (std.mem.eql(u8, walked.id, spec.id)) {
-                w.print("  {s}←/→{s}", .{ th.dim, th.reset }) catch {};
-            };
-            if (spec.cost_latency_warning) |note| w.print("  {s}{s}{s}", .{ th.dim, note, th.reset }) catch {};
+            newline(w);
+            count += 1;
+            continue;
         }
+        // The choices, and what is said of them, go on under the first
+        // choice where the terminal is too narrow for one row (seven levels
+        // and a note do not fit 80 columns). The rows are counted: a row the
+        // terminal wrapped on its own would move everything drawn below it.
+        const indent = 3 + textWidth(spec.label);
+        var row: ChoiceRow = .{ .w = w, .limit = cols -| 1, .indent = indent, .at = indent };
+        const shown = picker.effectiveValue(spec);
+        row.choice(th, "default", shown == null);
+        for (spec.allowed_values) |candidate| {
+            row.choice(th, candidate, if (shown) |value| std.mem.eql(u8, value, candidate) else false);
+        }
+        if (picker.wantedInstead(spec)) |wanted| row.note(th, "(nearest to ", wanted, ")");
+        if (first) |walked| if (std.mem.eql(u8, walked.id, spec.id)) row.note(th, "←/→", "", "");
+        if (spec.cost_latency_warning) |note| row.note(th, note, "", "");
         newline(w);
-        count += 1;
+        count += 1 + row.more;
     }
     return count;
 }
+
+/// One control's choices on as many rows as the width needs, every row past
+/// the first indented under the first choice. `limit` is the widest a row
+/// may be (the width less one: a row that reaches the last column is wrapped
+/// by some terminals).
+const ChoiceRow = struct {
+    w: *std.Io.Writer,
+    limit: usize,
+    indent: usize,
+    /// Columns written on the current row.
+    at: usize,
+    /// Nothing written on the current row yet.
+    fresh: bool = true,
+    /// Rows written after the first.
+    more: u16 = 0,
+
+    /// Room for `width` more columns: a new row when this one would
+    /// overflow, indented under the first choice, or at the margin when
+    /// that leaves too little room. A row that holds nothing yet takes the
+    /// item even when it is too wide (it would only leave empty rows).
+    fn room(self: *ChoiceRow, width: usize) void {
+        defer self.fresh = false;
+        if (self.at + width <= self.limit or self.fresh) return;
+        newline(self.w);
+        line(self.w);
+        const margin: usize = if (self.indent + width <= self.limit) self.indent else 2;
+        writeSpaces(self.w, margin);
+        self.at = margin;
+        self.more += 1;
+    }
+
+    fn choice(self: *ChoiceRow, th: Theme, text: []const u8, chosen: bool) void {
+        // " [x]" and "  x " are both three columns more than the word.
+        const width = textWidth(text) + 3;
+        self.room(width);
+        writeChoice(self.w, th, text, chosen);
+        self.at += width;
+    }
+
+    fn note(self: *ChoiceRow, th: Theme, before: []const u8, text: []const u8, after: []const u8) void {
+        const width = 2 + textWidth(before) + textWidth(text) + textWidth(after);
+        self.room(width);
+        self.w.print("  {s}{s}{s}{s}{s}", .{ th.dim, before, text, after, th.reset }) catch {};
+        self.at += width;
+    }
+};
 
 fn writeChoice(w: *std.Io.Writer, th: Theme, text: []const u8, chosen: bool) void {
     if (chosen) {
@@ -701,6 +750,14 @@ const REASONING = [_]controls_mod.ControlSpec{.{
     .allowed_values = &.{ "low", "medium", "high", "max" },
 }};
 
+/// Every level a reasoning control may name.
+const ALL_LEVELS = [_]controls_mod.ControlSpec{.{
+    .id = "reasoning_effort",
+    .label = "Reasoning effort",
+    .kind = .enumeration,
+    .allowed_values = &.{ "none", "minimal", "low", "medium", "high", "xhigh", "max" },
+}};
+
 test "a heading per provider says where its key comes from and who bills it; a row per model shows its window and routes" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -967,6 +1024,50 @@ test "every row fits an 80-column terminal" {
                     return error.RowTooWide;
                 }
             }
+            _ = picker.onKey(.down);
+        }
+    }
+}
+
+test "all seven reasoning levels and a note fit an 80-column terminal, and the rows they take are counted" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var seven = offerOf("openai", "default", "gpt-6", "openai_chat");
+    seven.controls = &ALL_LEVELS;
+    var four = offerOf("metask", "default", "glm-5.3", "anthropic_messages");
+    four.controls = &REASONING;
+    const offers = [_]control_plane.OfferSummary{ seven, four };
+    try seed(&picker, &offers, offers[0].offer_id);
+    // The whole screen at 80 and 120 columns; the reasoning rows alone at
+    // narrower widths. On the seven-level model, then on the four-level one,
+    // where the level wanted (minimal) is not offered and a note says so.
+    for ([_]usize{ 80, 120, 60, 40 }) |cols| {
+        picker.restart();
+        picker.presetControl("reasoning_effort", "minimal");
+        for (0..2) |_| {
+            const buffer = try arena.alloc(u8, 32 * 1024);
+            var writer = std.Io.Writer.fixed(buffer);
+            const counted = if (cols >= 80)
+                render(&picker, &writer, theme_mod.dark, cols)
+            else
+                controls(&picker, &writer, theme_mod.dark, cols);
+            const drawn = writer.buffered();
+            // Every row ends with CRLF: the rows counted are the rows drawn.
+            try testing.expectEqual(@as(usize, counted), std.mem.count(u8, drawn, "\r\n"));
+            const rows = try visibleRows(arena, drawn);
+            for (rows) |row| {
+                if (textWidth(row) >= cols) {
+                    std.debug.print("too wide at {d} ({d}): {s}\n", .{ cols, textWidth(row), row });
+                    return error.RowTooWide;
+                }
+            }
+            // Nothing is dropped: every level is on the screen.
+            const text = try std.mem.join(arena, "\n", rows);
+            const offer = picker.focusedOffer().?;
+            for (offer.controls[0].allowed_values) |level| try testing.expect(std.mem.indexOf(u8, text, level) != null);
             _ = picker.onKey(.down);
         }
     }
