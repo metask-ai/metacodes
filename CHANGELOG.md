@@ -12,6 +12,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **`metacodes login status` says which credential a plain start uses, and
+  why** (#537). It names what a start with no flag would use,
+  the step of the startup order that decides (flags and the shell, the
+  default stored with `/model`, a Metask sign-in, `<state root>/.env`,
+  nothing), and what each step holds: the session's path, gateway and
+  expiry, `auth.json`'s model and level, where `METASK_API_KEY` is set, the
+  names the `.env` sets and the provider it configures, and the providers'
+  keys that are only in the shell and choose nothing. Never a key or a
+  token. The start and `login status` take the decision from one place
+  (`src/app/startup_order.zig`).
+
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
   be refused with `INVALID_ARGUMENT`; the blocks now lead the Skill's
