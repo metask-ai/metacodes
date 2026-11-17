@@ -271,6 +271,27 @@ status, compatibility boundaries, and entry points are defined by
   OAuth client is configured for OpenAI; it used to start the browser sign-in
   and stop on the missing client id.
 
+- **`metacodes providers add|probe|list|remove`: a model API of your own
+  without writing JSON** (`doc/PROVIDERS.md`). `providers add <id> --base-url
+  <url> --protocol <wire> --model <id>` writes `custom_providers.<id>` in
+  `<state root>/config.json` — a relay, a company gateway, Ollama or vLLM on
+  this machine, a vendor's coding-plan address — after checking the whole file
+  the way `--check-providers` does, inside the lock that writes it; a
+  definition that would not load, an address the endpoint policy refuses
+  (plain http to another machine, a user name or password in the URL), a
+  built-in id and a key variable another provider reads are refused before
+  anything is written, and every other key of the file keeps its content and
+  order. A relay that serves several protocols is one provider with one
+  channel per `--protocol`. `--probe` asks the endpoint's model list (OpenAI
+  `/models`, Anthropic `/v1/models` with `anthropic-version`, Gemini
+  `/v1beta/models`; the standard `data` array or an enriched `models` map), at
+  a terminal lets you pick, and writes the limits it reports; `providers
+  probe` lists without storing. With no arguments at a terminal, `add` asks
+  for each part. `--replace` changes an existing one and keeps what was
+  written by hand. `providers remove` takes the definition, its settings, its
+  stored key and login, and a default on one of its models. Each change
+  applies from the next start, and the commands say so.
+
 - **A provider of your own takes a pasted key.** `/login <id>` and `metacodes
   login --provider <id>` now work for a provider defined in
   `custom_providers`: there is no page to open, so they go straight to the

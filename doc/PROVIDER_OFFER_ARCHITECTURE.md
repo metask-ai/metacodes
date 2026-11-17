@@ -797,6 +797,53 @@ whole difference from removing it — and excludes it from the *catalog*, so
 "disabled" is true in the picker, `model.list`, and `--provider` at once rather
 than being re-checked at three call sites.
 
+`metacodes providers add|probe|list|remove` (`src/app/providers_cli.zig`;
+the user's guide is [PROVIDERS.md](PROVIDERS.md#a-model-api-of-your-own))
+writes and reads the same section without hand-written JSON:
+
+- `add <id> --base-url <url> --protocol <wire> [--protocol <wire>[=<url>]]…
+  [--model <id>]… [--probe] [--display-name] [--dialect] [--key-env <VAR>]
+  [--auth bearer|header:<name>[:<prefix>]] [--replace]` renders the definition
+  (`custom_provider.renderDraft`: what a person would write, and nothing
+  more), one channel per wire with ids named after the wire (`openai`,
+  `responses`, `anthropic`, `gemini`, `bedrock`), so adding a second protocol
+  never renames the first channel and the offer ids derived from it. An
+  Anthropic or Gemini base is stored without the `/v1` or `/v1beta` its
+  transport appends (`model_listing.channelBase`). With no arguments at a
+  terminal it asks for each part; without a terminal a missing part is an
+  error. `--replace` patches an existing definition
+  (`custom_provider.patchEntry`): only what it is given changes, and a model
+  that stays keeps its object (price, limits, controls). The id never changes.
+- The write is `config_store.putCustomProvider`: a `CommitRequest` with a
+  `member_edits` entry (`json_merge.MemberField`, the one member
+  `custom_providers.<id>`) under the same lock, re-read and atomic rename as
+  every commit, and a `validate` hook that judges the complete document about
+  to be written — inside the lock, so no other writer can change it in
+  between. The CLI's hook runs the stages `--check-providers` runs
+  (`adoptCustomProviders`, `ingestConfiguredCatalogs`,
+  `applyProviderConfiguration`): the definitions must load after an `add`,
+  and no stage that loaded before may stop loading. A refusal is
+  `error.Rejected`, and nothing is written. Before it, the command refuses
+  what it can name: an endpoint the default policy refuses (plain http to
+  another host, userinfo, `%`-escapes), the id or alias of a built-in
+  profile, a taken id without `--replace`, a `--key-env` another provider
+  reads (a key there would go to both), and — with `--replace` — a new
+  origin while `keys/<id>.json` holds a key stored for the old one.
+- `probe <id> | --base-url <url> --protocol <wire>` asks the model listing
+  (`api/model_probe.zig` over `catalog_fetch`, so a request that carries a
+  key follows no redirect), with the key placed by the profile's auth
+  scheme, and stores nothing. `add --probe` writes the limits a listing
+  reports with each model it adds.
+- `remove <id>` is `providers_cli.removeProvider`: one commit
+  (`config_store.removeCustomProvider`) drops `custom_providers.<id>`,
+  `providers.<id>` and a `global_selection` that resolved to it (only if it is
+  still the selection the command resolved), then `keys/<id>.json` and
+  `oauth/<id>.json` go.
+
+The host reads `custom_providers` once, when it is created, so every one of
+these applies from the next start, and each command says so; a running
+session keeps listing a removed provider until then.
+
 `metacodes --check-providers` is the dry run. It builds the provider runtime the
 same way a session does — built-ins, `custom_providers`, configured catalogs,
 the credential pool, the disabled set — so it cannot describe a different set of
@@ -1025,9 +1072,10 @@ on a second line of its confirmation, who bills the session from then on.
 | `src/provider/runtime_binding.zig` | selection → transport parameters |
 | `src/provider/startup.zig` | CLI/bootstrap route resolution |
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
-| `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
+| `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization; rendering and patching a definition |
 | `src/provider/model_listing.zig` | where each wire lists its models, and reading the answer (no I/O) |
-| `src/api/model_probe.zig` | the model-listing GET, and the headers a listing needs |
+| `src/api/model_probe.zig` | the model-listing GET (`providers probe`, `add --probe`) |
+| `src/app/providers_cli.zig` | `metacodes providers` (`add`, `probe`, `list`, `remove`) |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
 | `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
 | `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
@@ -1087,6 +1135,15 @@ omission — and none of them is an acceptance criterion of the issue.
 - **Thinking fields for non-Claude models on Bedrock.** DeepSeek, Qwen, Kimi
   and MiniMax on Bedrock think by their own defaults; only Claude and gpt-oss
   get fields in `additionalModelRequestFields`.
+
+- **Defined providers while a session runs.** The host reads
+  `custom_providers` once, when it starts; `metacodes providers` changes apply
+  from the next start, and `/providers refresh` re-reads only
+  `provider_catalogs`. Re-adopting definitions live would free strings a
+  running route may still borrow.
+- **A defined provider marked as a subscription plan.** The schema has no
+  `subscription_plan` field, so a coding plan defined here (Bailian's, Ark's)
+  gets no non-interactive warning.
 
 - **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
   signed adapter reference, which needs review and signing infrastructure. The

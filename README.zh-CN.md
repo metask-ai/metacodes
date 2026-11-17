@@ -245,6 +245,7 @@ metacodes 由 Metask Lab 开发，也就是 [Metask](https://app.metask-ai.com)�
 | | |
 |---|---|
 | [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) | 安装、provider、从源码构建 |
+| [doc/PROVIDERS.md](doc/PROVIDERS.md) | 模型从哪来：Metask 账号、厂商的 key、自己的模型 API |
 | [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md) | 在本安装的 `.env` 里配置自己的 provider key |
 | [doc/API.md](doc/API.md) | 所有受支持的入口及其兼容性 |
 | [doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md) | C ABI 的规范性契约 |

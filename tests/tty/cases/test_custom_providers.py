@@ -1,8 +1,11 @@
 """A provider of one's own (a relay, a local server), at a terminal.
 
-`/login <id>` and `metacodes login --provider <id>` take a pasted key for it
-with no page to open, check it at the endpoint's model listing, and store it
-in the provider's own key file. A local mock stands in for the relay; nothing goes
+`metacodes providers add` with no arguments asks for each part; with
+`--probe` at a terminal it takes the pasted key, asks the endpoint which
+models it serves and lets the user pick. `/login <id>` and
+`metacodes login --provider <id>` take a pasted key for it with no page to
+open, check it at the endpoint's model listing, and store it in the
+provider's own key file. A local mock stands in for the relay; nothing goes
 anywhere else. The non-terminal paths are covered by
 tests/component/custom_providers_cli_test.zig.
 """
@@ -149,6 +152,53 @@ def _cli(bin_path, args, env, answers, timeout=WAIT_S):
         out += chunk
     os.close(fd)
     return os.waitstatus_to_exitcode(status), out
+
+
+def test_add_asks_for_each_part_then_probes_and_stores_the_pasted_key(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI prompts are driven over a POSIX pty here")
+    with _Case() as case:
+        code, out = _cli(os.path.abspath(bin_path), ["--state-dir", case.state, "providers", "add"], case.env(), [
+            ("Id (lowercase, e.g. my-relay): ", "relay\r"),
+            ("Display name (Enter: relay): ", "House relay\r"),
+            ("Base URL (https://", case.base() + "\r"),
+            ("Choose (several: 1,3): ", "1\r"),
+            ("Choose [1-3]: ", "1\r"),
+            ("Paste the API key (it is not shown) and press Enter: ", GOOD_KEY + "\r"),
+            ("Ask the endpoint which models it serves? [Y/n]: ", "\r"),
+            ("Add which?", "1,3\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert "glm-4.6" in text and "Kimi K2" in text, text
+        assert "Added relay in " in text and "This takes effect at the next start" in text, text
+        assert GOOD_KEY not in text, "the pasted key was echoed to the terminal"
+        # One probe, with the key pasted once.
+        assert case.checks() == [f"Bearer {GOOD_KEY}"], case.checks()
+        relay = case.definition()
+        assert relay["display_name"] == "House relay", relay
+        assert [m["request_model_id"] for m in relay["models"]] == ["glm-4.6", "qwen3-coder-plus"], relay["models"]
+        assert relay["models"][0]["limits"] == {"context_window": 200000, "max_output_tokens": 128000}, relay["models"][0]
+        case.assert_stored(GOOD_KEY)
+
+
+def test_add_with_probe_at_a_terminal_takes_the_key_and_the_pick(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI prompts are driven over a POSIX pty here")
+    with _Case() as case:
+        code, out = _cli(os.path.abspath(bin_path), [
+            "--state-dir", case.state, "providers", "add", "relay",
+            "--base-url", case.base(), "--protocol", "openai_chat", "--probe",
+        ], case.env(), [
+            ("Enter if it needs none): ", GOOD_KEY + "\r"),
+            ("Add which?", "\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert GOOD_KEY not in text, "the pasted key was echoed to the terminal"
+        # Enter takes every listed model.
+        assert [m["request_model_id"] for m in case.definition()["models"]] == ["glm-4.6", "kimi-k2", "qwen3-coder-plus"]
+        case.assert_stored(GOOD_KEY)
 
 
 def test_cli_login_takes_a_pasted_key_for_a_provider_of_ones_own(bin_path):

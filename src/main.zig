@@ -2,6 +2,7 @@ const std = @import("std");
 const model_name = @import("api/model_name.zig");
 const builtin = @import("builtin");
 const platform_term = @import("platform").terminal;
+const terminal_prompt = @import("app/terminal_prompt.zig");
 const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const platform_net = @import("platform").net;
@@ -2498,7 +2499,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     _ = args.next(); // 跳过 argv[0](程序名)
     for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
-    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "mcp", "sealed", "terminal-setup", "update" };
+    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "mcp", "providers", "sealed", "terminal-setup", "update" };
     for (subcommands) |name| {
         if (std.mem.eql(u8, cmd, name)) break;
     } else return null;
@@ -2515,6 +2516,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "sealed")) return @import("app/sealed_cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "mcp")) return @import("app/mcp_cli.zig").run(&args, allocator, init.io, state_dir);
+    if (std.mem.eql(u8, cmd, "providers")) return @import("app/providers_cli.zig").run(&args, allocator, init.io, state_dir, invokedCommand(allocator));
     if (std.mem.eql(u8, cmd, "terminal-setup")) return @import("app/terminal_setup/cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "ledger")) {
         const provider = args.next() orelse {
@@ -3128,51 +3130,9 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
     return 0;
 }
 
-/// Read a line from the terminal without echo (raw mode, so Ctrl+C arrives as
-/// a byte and is honoured). Bracketed-paste markers and other escape sequences
-/// are skipped; a non-terminal stdin is read as a plain line.
-/// Echo is off before the prompt is written: a paste that arrived between the
-/// prompt and the mode switch would be echoed by the terminal itself.
-fn readSecretLine(prompt: []const u8, buf: []u8) !usize {
-    const saved = platform_term.enterRaw(0) orelse {
-        std.debug.print("{s}", .{prompt});
-        return readLine(buf);
-    };
-    defer platform_term.restoreMode(0, saved);
-    std.debug.print("{s}", .{prompt});
-    var len: usize = 0;
-    var in_escape = false;
-    while (true) {
-        var ch: [1]u8 = undefined;
-        const n = pfs.read(0, ch[0..1]);
-        if (n < 0) return error.InputFailed;
-        if (n == 0) break;
-        const c = ch[0];
-        if (in_escape) {
-            // CSI ends on a byte in 0x40..0x7e ('~' for the paste markers).
-            if (c >= 0x40 and c <= 0x7e and c != '[') in_escape = false;
-            continue;
-        }
-        switch (c) {
-            '\r', '\n' => break,
-            0x03 => return error.Interrupted,
-            0x1b => in_escape = true,
-            0x7f, 0x08 => {
-                if (len > 0) {
-                    len -= 1;
-                    buf[len] = 0;
-                }
-            },
-            else => {
-                if (c < 0x20) continue;
-                if (len == buf.len) return error.KeyTooLong;
-                buf[len] = c;
-                len += 1;
-            },
-        }
-    }
-    return len;
-}
+/// Shared with `metacodes providers add` (`app/terminal_prompt.zig`).
+const readSecretLine = terminal_prompt.readSecretLine;
+const readLine = terminal_prompt.readLine;
 
 /// `metacodes logout` (#499 part 2): remove both Metask sign-ins — the
 /// browser one in auth.json and the device-code one in oauth/metask.json,
@@ -3290,20 +3250,6 @@ fn promptChoice(allocator: std.mem.Allocator, count: usize) !usize {
         if (v >= 1 and v <= count) return v - 1;
         std.debug.print("Choice out of range.\n", .{});
     }
-}
-
-fn readLine(buf: []u8) !usize {
-    var len: usize = 0;
-    while (len < buf.len) {
-        var ch: [1]u8 = undefined;
-        const n = pfs.read(0, ch[0..1]);
-        if (n < 0) return error.InputFailed;
-        if (n == 0) break;
-        if (ch[0] == '\n' or ch[0] == '\r') break;
-        buf[len] = ch[0];
-        len += 1;
-    }
-    return len;
 }
 
 /// `metacodes login status`: which credential a plain start here uses and
@@ -4858,6 +4804,10 @@ fn printHelp() void {
         \\                        after a backup; --restore undoes it (terminal-setup --help for more)
         \\  mcp login <server> [--no-browser] | mcp logout <server> | mcp list
         \\                        OAuth login for an HTTP or SSE MCP server (stored, refreshed per session)
+        \\  providers add <id> --base-url <url> --protocol <wire> [--model <id>]... [--probe] | providers probe <id>
+        \\  | providers list | providers remove <id>
+        \\                        A model API of your own (a relay, a gateway, a local server), in config.json;
+        \\                        providers --help for more
         \\  update [--check] [--version X.Y.Z] [--release-base <url>] [--pull] [--allow-downgrade]
         \\         [--no-sdk] [--ignore-running] [--json]
         \\                        Bring this install up to date: the latest release (from its recorded
@@ -5313,6 +5263,8 @@ test {
     _ = &@import("mcp/conformance.zig");
     _ = &@import("mcp/result_commit_test.zig");
     _ = &@import("app/mcp_cli.zig");
+    _ = &@import("app/terminal_prompt.zig");
+    _ = &@import("app/providers_cli.zig");
     _ = &@import("util/toml.zig");
     _ = &@import("skills/runtime/frontmatter.zig");
     _ = &@import("tools/dynamic.zig");

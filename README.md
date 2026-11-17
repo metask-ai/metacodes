@@ -359,6 +359,7 @@ vulnerabilities go through [SECURITY.md](SECURITY.md), never public issues.
 | | |
 |---|---|
 | [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) | Install, providers, build from source |
+| [doc/PROVIDERS.md](doc/PROVIDERS.md) | Where models come from: a Metask account, a vendor's key, a model API of your own |
 | [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md) | Your own provider key in the install's `.env` |
 | [doc/API.md](doc/API.md) | Every supported entry point and its compatibility |
 | [doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md) | The normative C ABI contract |
