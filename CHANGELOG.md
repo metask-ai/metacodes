@@ -399,6 +399,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **An MCP HTTP request on a kept-alive connection the server closed is sent
+  again on macOS too** (#555). A request other than `tools/call` that found
+  its pooled connection closed is sent once more on a new one; on macOS, when
+  the client read only after the server's reset arrived (a loaded machine),
+  the read reported `ConnectionResetByPeer` instead of the end of stream and
+  the request failed as `McpOutcomeIndeterminate`. A reset before any
+  response byte now counts as that close. A `tools/call` whose body went out
+  is still never sent twice.
 - **Shift+Enter inserts a newline while a reply streams** (#456). In the
   terminal UI, Shift+Enter during a reply did what Enter does: the draft
   went into the pending queue, the input box was cleared, and when the reply
