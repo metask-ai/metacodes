@@ -254,12 +254,15 @@ SHIFT_ENTERS = {
 def _reply_with_keys(bin_path, keys):
     """Press `keys` while a slow reply streams, then let the reply end on its
     own. The TTYAssert and the model requests that were made."""
-    from tty_driver import IDLE, READY, wait_for
+    from tty_driver import IDLE, IS_WINDOWS, READY, wait_for
     from slow_mock_server import SlowMockServer, simple_text, slow_text_then_end
 
     # A message queued during the reply is sent when it ends; the second turn
     # answers it at once, so the request is in hand before the case finishes.
-    turns = [slow_text_then_end(n_chunks=14, delay=0.3), simple_text("SECOND_REPLY")]
+    # The reply has to outlast the keys: through ConPTY they land several times
+    # slower than through a pty (a Windows run typed about one key in 0.45 s
+    # and the 4 s reply ended halfway through the draft).
+    turns = [slow_text_then_end(n_chunks=50 if IS_WINDOWS else 14, delay=0.3), simple_text("SECOND_REPLY")]
     with SlowMockServer(turns) as srv:
         raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("esc to interrupt")]
                   + keys + [IDLE, "strictsleep:1.0"],
@@ -327,6 +330,9 @@ def test_enter_after_shift_enter_during_a_reply_sends_one_message(bin_path):
     were joined as `DRAFT_A\\n\\nDRAFT_B`."""
     a, requests = _reply_with_keys(
         bin_path, ["type:DRAFT_A", "key:shift_enter", "type:DRAFT_B", "key:enter"])
+    if not any(_box_rows(a, sc) == ["❯ DRAFT_A", "DRAFT_B"] for sc in _reply_frames(a)):
+        a._fail("the draft was not whole in the box while the reply streamed; "
+                "the keys landed after it ended, so the case tested nothing")
     if len(requests) != 2:
         a._fail(f"expected the reply and the queued draft, got {len(requests)} requests")
     sent = _user_texts(requests[1])[-1]
