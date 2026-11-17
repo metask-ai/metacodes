@@ -1042,9 +1042,11 @@ pub fn main(init: std.process.Init) !void {
     // The state root, after `--version` (which needs no state) and before
     // anything that reads or writes some.
     config.state_root = hostStateRoot() catch std.process.exit(2);
-    // The CLI is the host that opts into the built-in System-One advisor
-    // service; config.json and METACODES_JEV_* still override or empty it.
-    config.jev_builtin_default = true;
+    // The CLI does not take the built-in System-One advisor service (#474):
+    // a session's request and memory excerpts leave the machine for the
+    // advisor only when config.json or METACODES_JEV_URL names one. `doctor`
+    // reads the same constant.
+    config.jev_builtin_default = @import("jev/runtime.zig").CLI_USES_BUILTIN_DEFAULT;
     if (config.state_root.len > 0) {
         // Every subsystem writes beneath the root; create it (and an install's
         // `<prefix>/state` parent chain) once, owner-only, before any of them
@@ -1777,11 +1779,12 @@ pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").
 }
 
 /// The System-One advisor as a CLI session's `App.init` would configure it
-/// (METACODES_JEV_* over config.json `jev` over the built-in default), judged
-/// without contacting the service. Strings live in `arena`.
+/// (METACODES_JEV_* over config.json `jev`, and the built-in default only if
+/// the CLI takes it: `jev.CLI_USES_BUILTIN_DEFAULT`), judged without
+/// contacting the service. Strings live in `arena`.
 fn jevDiagnosis(arena: std.mem.Allocator, io: std.Io, state_root: []const u8) doctor.JevDiagnosis {
     const jev = @import("jev/runtime.zig");
-    return switch (jev.resolve(arena, io, state_root, true, jev.rawFromEnv())) {
+    return switch (jev.resolve(arena, io, state_root, jev.CLI_USES_BUILTIN_DEFAULT, jev.rawFromEnv())) {
         .off => |source| .{ .state = "off", .source = @tagName(source) },
         .invalid => |invalid| .{ .state = "invalid", .source = @tagName(invalid.source), .err = @errorName(invalid.err) },
         .on => |on| if (!@import("jev/client.zig").validOrigin(std.mem.trimEnd(u8, on.settings.origin, "/")))

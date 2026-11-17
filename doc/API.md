@@ -331,16 +331,21 @@ placeholders rather than a claim of free work. Explicit numeric zero usage is
 
 A self-hosted Jev System-One judge can advise four memory decisions (scoped
 recall injection, `KgRecall` evidence, `KgRemember` relations, enumeration
-intent). It is configured by the `jev` object of the install's
-`<state root>/config.json`, each field overridable by its `METACODES_JEV_*`
-variable. A host that sets `Config.jev_builtin_default` (the CLI does) falls
-back to the built-in service — `metask-jev-4b` at `http://58.211.6.133:10420`
-in `advisory` mode, advising `scoped_recall` only, plain HTTP over the public
-network — when neither names a `url`; an embedder that leaves it off has no
-advisor unless one of them does. The default applies as a whole: a layer that
-names its own `url` starts from the plain defaults (`shadow`, no model pin,
-every surface), while one that only sets `mode`, `timeout_ms` or `decisions`
-tunes the default service. An `off` or empty `url` from any layer
+intent). It is off until a service is named: by the `jev` object of the
+install's `<state root>/config.json`, each field overridable by its
+`METACODES_JEV_*` variable. The CLI names none, so `metacodes doctor` of a fresh
+install reports `jev_advisor off … source=none` and nothing of a session
+reaches a Jev server (#474; until then the CLI fell back to the built-in
+service, plain HTTP to a public address). A host that sets
+`Config.jev_builtin_default` (no host in this repository does) falls back to
+that built-in service — `metask-jev-4b` at `http://58.211.6.133:10420` in
+`advisory` mode, advising `scoped_recall` only — when neither names a `url`.
+To use that service from the CLI, write its settings down once
+(doc/JEV_SYSTEM_ONE.md §7 has the object). The default applies as a whole: a
+layer that names its own `url` starts from the plain defaults (`shadow`, no
+model pin, every surface), while one that only sets `mode`, `timeout_ms` or
+`decisions` tunes the default service, or tunes nothing when the host takes no
+default. An `off` or empty `url` from any layer
 (`"jev": false`, `"jev": {"url": "off"}`, `METACODES_JEV_URL=off`) turns it
 off; the build exports `METACODES_JEV_URL=off` to every step it runs. It is
 evidence only: it never gates a tool, a permission, a budget, or a TinyKG
@@ -348,7 +353,7 @@ write. Design, failure semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_
 
 | `jev` field | Override | Contract |
 |---|---|---|
-| `url` | `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); absent everywhere means the built-in default (CLI) or no advisor (embedders); `off` or blank disables the advisor |
+| `url` | `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); absent everywhere means no advisor (the built-in default only for a host that sets `Config.jev_builtin_default`; the CLI does not); `off` or blank disables the advisor |
 | `mode` | `METACODES_JEV_MODE` | `shadow` (when unset: consult and journal, provider-visible bytes unchanged) or `advisory` (the built-in default; judgments change injections and annotate `KgRemember` results) |
 | `timeout_ms` (integer) | `METACODES_JEV_TIMEOUT_MS` | per-consultation deadline, default 2500, 100–30000; a miss falls back to the unadvised path with no retry |
 | `model` | `METACODES_JEV_MODEL` | expected model id; a response from any other model, or one that reports a priced tariff, is refused |

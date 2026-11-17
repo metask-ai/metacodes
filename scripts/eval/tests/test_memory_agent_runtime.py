@@ -3049,13 +3049,39 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertEqual(clean, {"PATH": "/operator/bin"})
 
-    def test_every_arm_starts_with_the_builtin_advisor_off(self):
-        # Stripping the variables is not enough: the CLI would fall back to
-        # its built-in service. `off` is the switch, and a System-One arm's
-        # own settings replace it.
+    def test_every_arm_starts_with_the_advisor_off(self):
+        # The CLI takes no built-in advisor service any more (#474), so an arm
+        # without the variables has none; `off` keeps it that way against a
+        # service a state root names, and a System-One arm's own settings
+        # replace it.
         self.assertEqual(dict(SYSTEM_ONE_OFF_ENVIRONMENT), {"METACODES_JEV_URL": "off"})
         judged = {**SYSTEM_ONE_OFF_ENVIRONMENT, **_system_one_environment("tinykg_jev", "http://127.0.0.1:9", "m")}
         self.assertEqual(judged["METACODES_JEV_URL"], "http://127.0.0.1:9")
+
+    def test_every_system_one_arm_names_the_service_it_reaches(self):
+        # Nothing falls back to a compiled-in service (#474): an arm that uses
+        # the advisor reaches it only through the origin and model its own
+        # environment names (the runner's loopback judge), in advisory mode.
+        for arm in sorted(SYSTEM_ONE_ARMS):
+            with self.subTest(arm=arm):
+                env = {**SYSTEM_ONE_OFF_ENVIRONMENT, **_system_one_environment(arm, "http://127.0.0.1:9", "judge-model")}
+                self.assertEqual(env["METACODES_JEV_URL"], "http://127.0.0.1:9")
+                self.assertEqual(env["METACODES_JEV_MODE"], "advisory")
+                self.assertEqual(env["METACODES_JEV_MODEL"], "judge-model")
+
+    def test_no_evaluation_script_or_config_names_the_compiled_in_service(self):
+        # An arm that wants the advisor writes down the service it measured;
+        # one that merely mentions the product's old default would be
+        # measuring whatever the product happens to take.
+        root = Path(__file__).resolve().parents[3]
+        builtin_host = ".".join(("58", "211", "6", "133"))  # not spelled out: this file is scanned
+        offenders = []
+        for top in ("scripts/eval", "evals"):
+            for path in sorted((root / top).rglob("*")):
+                if path.is_file() and path.suffix in {".py", ".json", ".md", ".sh", ".yml", ".yaml", ".toml"}:
+                    if builtin_host in path.read_text(encoding="utf-8", errors="replace"):
+                        offenders.append(path.relative_to(root).as_posix())
+        self.assertEqual(offenders, [])
 
     def test_production_auth_rejects_parent_environment_and_reads_private_file(self):
         with tempfile.TemporaryDirectory() as directory:

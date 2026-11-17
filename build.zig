@@ -799,11 +799,12 @@ fn addCoreSuiteRun(
 
 pub fn build(b: *std.Build) void {
     validateAggregateTestInventory(b);
-    // The CLI consults the built-in System-One advisor service when nothing
-    // configures one. Every step this build runs — test binaries, the
-    // product they spawn, the Python suites — must not: its answers would
-    // steer recall from a machine outside the test, and the test's state would
-    // leave it. Run steps without their own environment use this map, and
+    // The System-One advisor is on only where a service is named (#474: the CLI
+    // no longer takes a built-in one), and a developer's shell may name one.
+    // Every step this build runs — test binaries, the product they spawn, the
+    // Python suites — must not consult it: its answers would steer recall from
+    // a machine outside the test, and the test's state would leave it. Run
+    // steps without their own environment use this map, and
     // setEnvironmentVariable starts from a copy of it, so one entry covers
     // all; set before any step copies it.
     // `off`, not an empty value: Windows cannot be relied on to pass one.
@@ -2601,6 +2602,19 @@ pub fn build(b: *std.Build) void {
     const scrollback_test_step = b.step("test:scrollback", "Test that only the TUI Renderer erases the screen and writes the scrollback");
     scrollback_test_step.dependOn(&scrollback_test_cmd.step);
     units_test_step.dependOn(&scrollback_test_cmd.step);
+    // No built-in destination that is on by default is cleartext to a public
+    // host (#474): the product's `http://` literals name loopback only, except
+    // the Jev default no host takes, and the CLI's decision stays off.
+    const builtin_egress_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_builtin_egress_discipline",
+        "-v",
+    });
+    const builtin_egress_test_step = b.step("test:builtin-egress", "Test that no default-on built-in destination is cleartext to a public host");
+    builtin_egress_test_step.dependOn(&builtin_egress_test_cmd.step);
+    units_test_step.dependOn(&builtin_egress_test_cmd.step);
     const gate_manifest_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2793,10 +2807,16 @@ pub fn build(b: *std.Build) void {
             // number, so the smoke is POSIX-only until that hand-off gets a
             // Windows handle design (the Python suite marks the same mechanism
             // "anonymous inherited descriptor requires POSIX").
+            //
+            // The System-One arm runs too (#474): the CLI no longer falls back
+            // to a built-in advisor, so an arm that uses one reaches it only
+            // through the service its own environment names (the runner's
+            // loopback judge), and this is what fails when it stops doing so.
             if (@import("builtin").os.tag != .windows) {
                 const memory_runtime_smoke = b.addSystemCommand(&.{
                     eval_python_exe,
                     "scripts/eval/memory_agent_runtime_smoke.py",
+                    "--include-jev-arm",
                     "--binary",
                 });
                 memory_runtime_smoke.addArtifactArg(exe);

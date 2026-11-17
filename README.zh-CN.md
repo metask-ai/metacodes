@@ -156,7 +156,7 @@ TinyKG 是 Metask Lab 自研的图存储，用 Zig 编写。它的源码暂未�
 - **Stall gate。** 交互式会话中默认开启，工具轮次反复拿不到新信息时会停下运行。
 - **可观测的输出。** 每次文件修改都是一个带有限长度 diff 的事件；模型输出被分类为 commentary、final、continued、partial 或 discarded。
 
-> **隐私说明。** CLI 默认会调用 Metask 的小型判定模型 Jev 来对自动记忆召回重新排序。每次调用会通过明文 HTTP，把当前请求（最多 400 字节）和最多 8 段脱敏后的记忆片段发送到 Metask 托管的服务器。设置 `METACODES_JEV_URL=off`，或在配置中写 `"jev": false` 即可关闭。嵌入式 AgentCore 运行时除非宿主主动开启，否则不会使用它。见 [doc/JEV_SYSTEM_ONE.md](doc/JEV_SYSTEM_ONE.md)。
+> **隐私说明。** 除非你指定一个 Jev 服务，CLI 不会向任何 Jev 服务器发送内容。Jev 是 Metask 的小型判定模型，可以对自动记忆召回重新排序。在状态目录的 `config.json` 里写 `"jev": {"url": "https://…"}`（或设置 `METACODES_JEV_URL`）之后，每次调用会把当前请求（最多 400 字节）和最多 8 段脱敏后的记忆片段发送到你配置的服务，协议就是你写下的那个，所以请用 `https://` 或回环地址。在此之前 `metacodes doctor` 显示 `jev_advisor off`。嵌入式 AgentCore 运行时除非宿主主动开启，否则不会使用它。见 [doc/JEV_SYSTEM_ONE.md](doc/JEV_SYSTEM_ONE.md)。
 
 ## 快速开始
 
