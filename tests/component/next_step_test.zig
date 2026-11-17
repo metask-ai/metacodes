@@ -9,7 +9,8 @@
 //! says what to do, in the command line's words (`metacodes-dev login`,
 //! `--provider`), and the exit code stays 1:
 //! - Metask (the historical path, `METASK_API_KEY`): HTTP 401 says sign in
-//!   again, HTTP 402 says top up or switch provider;
+//!   again, HTTP 402 says top up or switch provider, HTTP 403 with the code
+//!   `account_suspended` says the account is suspended, not sign in again;
 //! - DeepSeek, which `<state root>/.env` configures: HTTP 401 names
 //!   `DEEPSEEK_API_KEY` and this install's `.env`, never the key; HTTP 402
 //!   says top up with DeepSeek;
@@ -31,13 +32,15 @@ const deepseek_key = "sk-placeholder-deepseek-key";
 
 const UNAUTHORIZED = "HTTP/1.1 401 Unauthorized";
 const PAYMENT_REQUIRED = "HTTP/1.1 402 Payment Required";
+const FORBIDDEN = "HTTP/1.1 403 Forbidden";
 const BAD_REQUEST = "HTTP/1.1 400 Bad Request";
 const AUTHENTICATION_BODY = "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}";
 const BALANCE_BODY = "{\"error\":\"insufficient_balance\",\"message\":\"Your balance is insufficient. Please top up.\"}";
+const SUSPENDED_BODY = "{\"error\":\"account_suspended\",\"message\":\"This account is suspended.\"}";
 const INVALID_BODY = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"max_tokens is too large\"}}";
 
 /// Every line this change prints starts with one of these.
-const NEXT_STEP_OPENINGS = [_][]const u8{ "Your Metask sign-in", "Your Metask balance", "DeepSeek rejected", "DeepSeek reports" };
+const NEXT_STEP_OPENINGS = [_][]const u8{ "Your Metask sign-in", "Your Metask balance", "Your Metask account", "DeepSeek rejected", "DeepSeek reports" };
 
 const Run = struct {
     exit_code: i32,
@@ -132,7 +135,7 @@ fn expectNextStep(run: Run, server: *harness.MockServer, status: []const u8, lin
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, run.stderr, line));
 }
 
-test "-p: a rejected Metask sign-in and a used-up Metask balance say what to do next" {
+test "-p: a rejected Metask sign-in, a used-up balance and a suspended account say what to do next" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var case: Case = undefined;
     try case.init();
@@ -154,6 +157,15 @@ test "-p: a rejected Metask sign-in and a used-up Metask balance say what to do 
         try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}/v1/messages", .{try originOf(a, broke)}),
     });
     try expectNextStep(no_balance, broke, "HTTP 402", "Your Metask balance has run out. Top up your Metask account, or switch provider: --provider");
+
+    // A 403 like a rejected credential, but signing in again cannot cure it.
+    var suspended = try harness.MockServer.startRepeatingStatus(SUSPENDED_BODY, FORBIDDEN, "");
+    defer suspended.stop();
+    const barred = try case.run(&.{
+        "METASK_API_KEY=" ++ metask_key,
+        try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}/v1/messages", .{try originOf(a, suspended)}),
+    });
+    try expectNextStep(barred, suspended, "HTTP 403", "Your Metask account is suspended. See to it at https://www.metask-ai.com, or switch provider: --provider");
 }
 
 test "-p: DeepSeek from the install's .env names its variable and that file, never the key" {

@@ -53,6 +53,50 @@ These rules apply to the entire repository.
   by SHA-256. Never add TinyKG source vendoring, download-on-build, `PATH` search,
   sibling-checkout discovery, or stale build-output fallback.
 
+## PR review and repair workflow
+
+The developer starts one local watcher during initial development setup,
+from a checkout containing the tooling, and keeps it running while PRs are
+being delivered:
+
+```sh
+python3 .github/pr-loop.py run
+```
+
+The watcher runs on the developer's Mac; local builds and validation run on
+devbox through `dx`. Closing its terminal or taking the Mac offline pauses
+local review and repair. Registration alone does not start the watcher.
+Before handing a PR over, confirm that the developer has the watcher running.
+
+- Submit PRs to **metask-ai/metacodes**, including when `origin` is a fork.
+  Use `python3 .github/pr-loop.py submit` to create and register a PR, or
+  `python3 .github/pr-loop.py bind` for an existing PR. Follow the command
+  examples in [CONTRIBUTING](CONTRIBUTING.md#initial-development-setup).
+- Register the original Codex thread ID and its dedicated worktree explicitly.
+  The branch must already be pushed, the checkout must be clean, and the
+  thread must be accessible to the local App Server. Hand the thread over
+  idle and avoid concurrent edits by another host. Do not invent a thread ID
+  or claim automatic delivery when these prerequisites are missing.
+- The controller reviews each head/base revision in an independent read-only
+  conversation. Blocking findings, failed CI and failed local validation go
+  back to the original worker. During repair, the worker edits; the controller
+  owns checkpoint commits, `dx zig build gate:pr`, and ordinary pushes. Failed
+  checkpoints stay local. A pushed revision receives a fresh review.
+- Only the exact reviewed head with passing required CI and satisfied upstream
+  review requirements may enter the existing merge queue. GitHub performs
+  the final merge. Preserve branch protections, review-thread resolution and
+  the controller's revision checks; a quiet reviewer is not an approval.
+- Ambiguous requirements, additional permissions, policy changes, interrupted
+  writes and exhausted limits require a recorded decision. Check with
+  `python3 .github/pr-loop.py status`; the developer responds with
+  `python3 .github/pr-loop.py answer --pr "$PR_NUMBER" --text "Your decision"`.
+  Preserve progress and invocation limits instead of restarting an unlimited
+  repair loop or answering on the developer's behalf.
+
+The [PR workflow guide](doc/PR_AGENT_LOOP.md) defines prerequisites, limits,
+state storage and recovery. Keep these agent instructions and CONTRIBUTING
+consistent with that guide when changing the workflow.
+
 ## Definition of done
 
 Declaration = wiring = L2 evidence. A schema/config/API field is not implemented

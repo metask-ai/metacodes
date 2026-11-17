@@ -33,7 +33,7 @@ from tty_driver import IS_WINDOWS, READY, case_tmpdir, run, submit, wait_for  # 
 from asserts import TTYAssert  # noqa: E402
 from e2e_helpers import SkipTest  # noqa: E402
 from metask_mock import (  # noqa: E402
-    DEFAULT_MODELS, DEVICE_CODE, KEY_SECRET, MODEL, USER_CODE, MetaskMock, ACCESS_TOKEN, REFRESH_TOKEN,
+    ACCOUNT_NAME, DEFAULT_MODELS, DEVICE_CODE, KEY_SECRET, MODEL, USER_CODE, MetaskMock, ACCESS_TOKEN, REFRESH_TOKEN,
 )
 from test_unbound import KEY_VARIABLES  # noqa: E402
 from test_key_login import _cli  # noqa: E402
@@ -137,7 +137,7 @@ def test_login_signs_in_in_the_browser_and_the_session_and_next_start_use_it(bin
         ] + submit("hi", "METASK_MOCK_REPLY"), env=env, base_url=None, cwd=work, term_size=(30, 140))
         a = TTYAssert(raw, rows=30, cols=140)
         screen = _screen(a)
-        assert "Signed in to Metask · glm-5 · reasoning low" in screen, screen
+        assert f"Signed in to Metask as {ACCOUNT_NAME} · glm-5 · reasoning low" in screen, screen
         # No API key to choose, and the gateway's image-only model is not offered.
         assert b"Select an API key" not in raw
         assert b"image-model-only" not in raw
@@ -153,6 +153,8 @@ def test_login_signs_in_in_the_browser_and_the_session_and_next_start_use_it(bin
         assert not any(p.startswith("/api/v1/keys") for p in paths), paths
         # The models were listed at the gateway with the sign-in's own token.
         assert ("GET", "/v1/models", f"Bearer {ACCESS_TOKEN}") in mock.requests, mock.requests
+        # Who signed in was asked with the same token.
+        assert ("GET", "/api/oauth/userinfo", f"Bearer {ACCESS_TOKEN}") in mock.requests, mock.requests
         # The session moved onto the sign-in at once: the turn went out with
         # the session's token and the chosen model.
         assert mock.messages == [(f"Bearer {ACCESS_TOKEN}", MODEL)], mock.messages
@@ -187,6 +189,32 @@ def _metask_offer_id(model, endpoint="https://napi.metask-ai.com/v1/messages"):
         digest.update(struct.pack("<I", len(raw)))
         digest.update(raw)
     return "offer-" + digest.digest()[:16].hex()
+
+
+def test_login_ends_without_the_account_name_when_userinfo_does_not_answer(bin_path):
+    # Who signed in is only said: a userinfo that never answers costs the name
+    # after a bounded wait, not the sign-in.
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
+    with MetaskMock(userinfo_stalls=True) as mock:
+        home, state, env = _case(mock)
+        work = case_tmpdir("cc-tty-login-work-")
+        raw = run(bin_path, [
+            READY,
+            "type:/login",
+            "key:enter",
+            # Well under the mock's hold (60 s): only a bounded wait gets here.
+            wait_for("Select a model", 15),
+            "key:enter",
+            wait_for("Select a reasoning level", 10),
+            "key:enter",
+            wait_for("Signed in to Metask", 10),
+        ], env=env, base_url=None, cwd=work, term_size=(30, 140))
+        a = TTYAssert(raw, rows=30, cols=140)
+        screen = _screen(a)
+        assert "Signed in to Metask · glm-5 · reasoning low" in screen, screen
+        assert ("GET", "/api/oauth/userinfo", f"Bearer {ACCESS_TOKEN}") in mock.requests, mock.requests
+        assert os.path.exists(os.path.join(state, "oauth", "metask.json"))
 
 
 def test_a_browser_sign_in_serves_a_stored_metask_default_at_the_next_start(bin_path):
@@ -250,7 +278,7 @@ def test_cli_login_in_the_browser_forgets_a_stored_default(bin_path):
         ])
         text = out.decode("utf-8", "replace")
         assert code == 0, f"exit {code}:\n{text}"
-        assert "Signed in to Metask in the browser. Model glm-5, reasoning low." in text, text
+        assert f"Signed in to Metask in the browser as {ACCOUNT_NAME}. Model glm-5, reasoning low." in text, text
         # The gateway's levels, not its all-false `effort` block; and no `none`
         # for a model whose reasoning cannot be turned off.
         assert "1. low" in text and "2. high" in text and ". none" not in text, text
@@ -307,7 +335,7 @@ def test_login_metask_signs_in_with_the_device_code_then_chooses_a_model(bin_pat
         ] + submit("hi", "METASK_MOCK_REPLY"), env=env, base_url=None, cwd=work, term_size=(30, 140))
         a = TTYAssert(raw, rows=30, cols=140)
         screen = _screen(a)
-        assert "Signed in to Metask · glm-5 · reasoning low" in screen, screen
+        assert f"Signed in to Metask as {ACCOUNT_NAME} · glm-5 · reasoning low" in screen, screen
         # The pane showed the code to confirm, and no browser hint.
         assert f"enter the code {USER_CODE}".encode() in raw, raw[-2000:]
         assert b"No browser on this machine?" not in raw
@@ -345,7 +373,7 @@ def test_cli_device_login_at_a_terminal_asks_for_the_model(bin_path):
         text = out.decode("utf-8", "replace")
         assert code == 0, f"exit {code}:\n{text}"
         assert f"METASK_USER_CODE={USER_CODE}" in text, text
-        assert "Signed in to Metask with the device code. Model glm-5, reasoning low." in text, text
+        assert f"Signed in to Metask with the device code as {ACCOUNT_NAME}. Model glm-5, reasoning low." in text, text
         assert "image-model-only" not in text, text
         _expect_device_request(mock)
         with open(os.path.join(state, "auth.json")) as f:

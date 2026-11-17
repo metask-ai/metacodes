@@ -3272,7 +3272,11 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) 
         }
         return;
     }
-    cmd_output.print("Signed in to Metask · {s}", .{app.activeModel()});
+    cmd_output.print("Signed in to Metask", .{});
+    // Who signed in, when the server said (a second account is easy to pick
+    // up from a browser already signed in).
+    if (worker.accountName()) |name| cmd_output.print(" as {s}", .{name});
+    cmd_output.print(" · {s}", .{app.activeModel()});
     if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
     cmd_output.print("\n", .{});
     if (applied.default_error) |err| {

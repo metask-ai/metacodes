@@ -14,9 +14,12 @@
 //! - HTTP 401 or 403 (`authentication`, `permission`): the credential was
 //!   rejected. Metask: sign in again. Another provider: check its key where
 //!   it is read from, then restart.
-//! - HTTP 402 (`payment_required`), or the upstream code `insufficient_balance`
-//!   or `insufficient_quota` whatever the status (OpenAI answers a used-up
-//!   quota with 429): top up, or switch provider.
+//! - HTTP 402 (`payment_required`), or the upstream code `insufficient_balance`,
+//!   `insufficient_quota` or `key_quota_exhausted` whatever the status (OpenAI
+//!   answers a used-up quota with 429): top up, or switch provider.
+//! - The upstream code `account_suspended` (Metask's gateway answers it with
+//!   a 403): the account itself is suspended, which signing in again cannot
+//!   cure. See to it on the provider's site, or switch provider.
 //!
 //! Neither retries nor switches anything. `forFailure` gathers the inputs from
 //! a session. Host-only: the library reports the failure and never knows the
@@ -24,6 +27,7 @@
 
 const std = @import("std");
 const model_error = @import("../api/model_error.zig");
+const auth = @import("../core/auth.zig");
 const app_mod = @import("../app.zig");
 const profile_mod = @import("../provider/profile.zig");
 const provider_host_mod = @import("../provider/host.zig");
@@ -57,18 +61,25 @@ pub const Situation = enum {
     credential_rejected,
     /// HTTP 402, or an upstream code that says the balance or quota is gone.
     balance_exhausted,
+    /// `account_suspended`: the account behind the credential is suspended.
+    account_suspended,
 };
 
 /// The upstream codes that mean no balance or quota is left, whatever the
 /// status says.
-const balance_codes = [_][]const u8{ "insufficient_balance", "insufficient_quota" };
+const balance_codes = [_][]const u8{ "insufficient_balance", "insufficient_quota", "key_quota_exhausted" };
 
 /// The situation `category` and the upstream `code` describe; null for every
 /// other failure. A code that names the balance outranks the status.
 pub fn situation(category: model_error.Category, code: ?[]const u8) ?Situation {
-    if (code) |value| for (balance_codes) |known| {
-        if (std.mem.eql(u8, value, known)) return .balance_exhausted;
-    };
+    if (code) |value| {
+        // A suspended account is refused like a bad credential (403), but
+        // a new sign-in or key cannot cure it: the code outranks the status.
+        if (std.mem.eql(u8, value, "account_suspended")) return .account_suspended;
+        for (balance_codes) |known| {
+            if (std.mem.eql(u8, value, known)) return .balance_exhausted;
+        }
+    }
     return switch (category) {
         .payment_required => .balance_exhausted,
         .authentication, .permission => .credential_rejected,
@@ -116,6 +127,10 @@ pub fn render(allocator: std.mem.Allocator, input: Input) error{OutOfMemory}!?[]
         .balance_exhausted => switch (input.route) {
             .metask => try std.fmt.allocPrint(allocator, "Your Metask balance has run out. Top up your Metask account, or switch provider: {s}", .{switch_provider}),
             .provider => |provider| try std.fmt.allocPrint(allocator, "{s} reports no balance or quota left. Top up with {s}, or switch provider: {s}", .{ provider.name, provider.name, switch_provider }),
+        },
+        .account_suspended => switch (input.route) {
+            .metask => try std.fmt.allocPrint(allocator, "Your Metask account is suspended. See to it at {s}, or switch provider: {s}", .{ auth.METASK_SITE_URL, switch_provider }),
+            .provider => |provider| try std.fmt.allocPrint(allocator, "{s} reports the account is suspended. See to it with {s}, or switch provider: {s}", .{ provider.name, provider.name, switch_provider }),
         },
     };
 }
@@ -298,6 +313,33 @@ test "the upstream code insufficient_balance names the balance whatever the stat
     // Only those exact codes: a code that merely mentions one is not it.
     try testing.expectEqual(@as(?Situation, null), situation(.invalid_request, "Insufficient_Balance"));
     try testing.expectEqual(@as(?Situation, null), situation(.invalid_request, "insufficient_balance_warning"));
+}
+
+test "a suspended account says so, not sign in again, whatever the status" {
+    try expectLine("Your Metask account is suspended. See to it at https://www.metask-ai.com, or switch provider: /model", .{
+        .category = .permission,
+        .code = "account_suspended",
+        .route = .metask,
+        .env_path = state_env_path,
+        .surface = .interactive,
+    });
+    try expectLine("DeepSeek reports the account is suspended. See to it with DeepSeek, or switch provider: --provider", .{
+        .category = .authentication,
+        .code = "account_suspended",
+        .route = .{ .provider = .{ .name = "DeepSeek", .key_variable = "DEEPSEEK_API_KEY" } },
+        .env_path = state_env_path,
+        .surface = .{ .print = "metacodes" },
+    });
+}
+
+test "the gateway's key_quota_exhausted is a used-up quota" {
+    try expectLine("Your Metask balance has run out. Top up your Metask account, or switch provider: /model", .{
+        .category = .permission,
+        .code = "key_quota_exhausted",
+        .route = .metask,
+        .env_path = state_env_path,
+        .surface = .interactive,
+    });
 }
 
 test "every other failure keeps the caller's advice" {

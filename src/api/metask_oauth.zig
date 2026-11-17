@@ -20,6 +20,7 @@ const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const provider_ids = @import("../provider/ids.zig");
+const catalog_fetch = @import("catalog_fetch.zig");
 
 pub const DEFAULT_SITE_URL = auth.METASK_SITE_URL;
 pub const CLIENT_ID = auth.OAUTH_CLIENT_ID;
@@ -61,6 +62,112 @@ pub fn tokenUrl(site: []const u8, buffer: []u8) ![]const u8 {
 
 pub fn revokeUrl(site: []const u8, buffer: []u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{s}/api/oauth/revoke", .{std.mem.trimEnd(u8, site, "/")});
+}
+
+pub fn userinfoUrl(site: []const u8, buffer: []u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}/api/oauth/userinfo", .{std.mem.trimEnd(u8, site, "/")});
+}
+
+/// Longest account name the sign-in line shows.
+pub const MAX_ACCOUNT_NAME: usize = 64;
+
+/// How long a sign-in waits for the account's name before it ends without it.
+pub const ACCOUNT_NAME_WAIT_MS: u64 = 3000;
+
+/// The name the signed-in account goes by (`/api/oauth/userinfo`, which the
+/// `read` scope reaches), asked with the sign-in's access token, for the line
+/// that says who signed in. Owned by `allocator`; null when it cannot be had
+/// within `wait_ms`: it is only said, never relied on, so a failure or a slow
+/// answer costs the name and nothing else. Bounded as `revokeStoredSession`
+/// is: the request runs on its own thread with its own copies, so a server
+/// that never answers does not hold the sign-in up.
+pub fn accountName(allocator: std.mem.Allocator, site: []const u8, access_token: []const u8, wait_ms: u64) ?[]u8 {
+    var url_buf: [1024]u8 = undefined;
+    const url = userinfoUrl(site, &url_buf) catch return null;
+    const job = UserinfoJob.create(url, access_token) catch return null;
+    const thread = @import("platform").thread.spawn(.full, UserinfoJob.run, .{job}) catch {
+        // Only the caller's share is left.
+        _ = job.owners.fetchSub(1, .acq_rel);
+        job.release();
+        return null;
+    };
+    thread.detach();
+    defer job.release();
+    var waited: u64 = 0;
+    while (waited < wait_ms and job.done.load(.acquire) == 0) : (waited += 50) util_time.sleepMs(50);
+    if (job.done.load(.acquire) == 0 or job.name_len == 0) return null;
+    return allocator.dupe(u8, job.name_buf[0..job.name_len]) catch null;
+}
+
+/// One userinfo request, shared by the caller and its thread; the last one
+/// to let go frees it (the token zeroed).
+const UserinfoJob = struct {
+    url: []u8,
+    token: []u8,
+    /// The name, written by the thread before `done`.
+    name_buf: [MAX_ACCOUNT_NAME]u8 = undefined,
+    name_len: usize = 0,
+    /// 0 while it runs, 1 once it has answered or failed.
+    done: std.atomic.Value(u8) = .init(0),
+    owners: std.atomic.Value(u8) = .init(2),
+
+    fn create(url: []const u8, token: []const u8) !*UserinfoJob {
+        const gpa = std.heap.page_allocator;
+        const job = try gpa.create(UserinfoJob);
+        errdefer gpa.destroy(job);
+        const url_copy = try gpa.dupe(u8, url);
+        errdefer gpa.free(url_copy);
+        job.* = .{ .url = url_copy, .token = try gpa.dupe(u8, token) };
+        return job;
+    }
+
+    fn release(job: *UserinfoJob) void {
+        if (job.owners.fetchSub(1, .acq_rel) != 1) return;
+        const gpa = std.heap.page_allocator;
+        std.crypto.secureZero(u8, job.token);
+        gpa.free(job.token);
+        gpa.free(job.url);
+        gpa.destroy(job);
+    }
+
+    fn run(job: *UserinfoJob) void {
+        defer job.release();
+        defer job.done.store(1, .release);
+        var io_runtime = @import("platform").signal.threadedIo(std.heap.page_allocator, .{});
+        defer io_runtime.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const fetched = catalog_fetch.fetch(arena.allocator(), io_runtime.io(), .{ .url = job.url, .bearer = job.token }) catch return;
+        const name = parseAccountName(arena.allocator(), fetched.body) orelse return;
+        @memcpy(job.name_buf[0..name.len], name);
+        job.name_len = name.len;
+    }
+};
+
+/// `name` from a userinfo answer, else `email` (the server's display name is
+/// the name, the address, or a masked phone number). It is printed on a
+/// terminal line, and the server took it from the user: a control character
+/// becomes `?`, so no escape sequence comes through, and it is cut at
+/// `MAX_ACCOUNT_NAME` bytes on a character boundary. Null when neither is a
+/// non-empty string.
+pub fn parseAccountName(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    for ([_][]const u8{ "name", "email" }) |field| {
+        const value = parsed.value.object.get(field) orelse continue;
+        if (value != .string) continue;
+        const text = std.mem.trim(u8, value.string, " \t\r\n");
+        if (text.len == 0) continue;
+        var end = @min(text.len, MAX_ACCOUNT_NAME);
+        while (end > 0 and end < text.len and text[end] & 0xC0 == 0x80) end -= 1;
+        const copy = allocator.dupe(u8, text[0..end]) catch return null;
+        for (copy) |*byte| {
+            if (byte.* < 0x20 or byte.* == 0x7f) byte.* = '?';
+        }
+        return copy;
+    }
+    return null;
 }
 
 /// A gateway override is an origin. Rejecting a request path here prevents a
@@ -408,6 +515,24 @@ test "sign-out revokes with the refresh token, hinted, as the metacodes client (
     try std.testing.expectEqualStrings("token=mrt-a%26b&token_type_hint=refresh_token&client_id=metacodes", body);
     var buffer: [256]u8 = undefined;
     try std.testing.expectEqualStrings("https://www.metask-ai.com/api/oauth/revoke", try revokeUrl(DEFAULT_SITE_URL, &buffer));
+}
+
+test "the account a sign-in shows: its name, else its email, never a control character" {
+    const a = std.testing.allocator;
+    const named = parseAccountName(a, "{\"sub\":\"u-1\",\"email\":\"x@example.com\",\"name\":\"Boyang\",\"client_id\":\"metacodes\"}").?;
+    defer a.free(named);
+    try std.testing.expectEqualStrings("Boyang", named);
+    const mailed = parseAccountName(a, "{\"sub\":\"u-1\",\"email\":\"x@example.com\",\"name\":\" \"}").?;
+    defer a.free(mailed);
+    try std.testing.expectEqualStrings("x@example.com", mailed);
+    // An escape sequence in the name is defused, not passed to the terminal.
+    const hostile = parseAccountName(a, "{\"name\":\"a\\u001b[2Jb\"}").?;
+    defer a.free(hostile);
+    try std.testing.expectEqualStrings("a?[2Jb", hostile);
+    try std.testing.expect(parseAccountName(a, "{\"sub\":\"u-1\"}") == null);
+    try std.testing.expect(parseAccountName(a, "not json") == null);
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("https://www.metask-ai.com/api/oauth/userinfo", try userinfoUrl(DEFAULT_SITE_URL, &buffer));
 }
 
 test "with no Metask session stored, sign-out has nothing to revoke and sends nothing (#527)" {

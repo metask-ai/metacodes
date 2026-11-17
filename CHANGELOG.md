@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **`metacodes login status` says which credential a plain start uses, and
+  why** (#537). It names what a start with no flag would use,
+  the step of the startup order that decides (flags and the shell, the
+  default stored with `/model`, a Metask sign-in, `<state root>/.env`,
+  nothing), and what each step holds: the session's path, gateway and
+  expiry, `auth.json`'s model and level, where `METASK_API_KEY` is set, the
+  names the `.env` sets and the provider it configures, and the providers'
+  keys that are only in the shell and choose nothing. Never a key or a
+  token. The start and `login status` take the decision from one place
+  (`src/app/startup_order.zig`).
 - **`/model` is one screen, models first** (follow-up to #527). The models of
   every configured provider are listed under a heading per provider that says
   where its key comes from and who bills it, the provider in use first and the
@@ -61,6 +71,19 @@ status, compatibility boundaries, and entry points are defined by
   says so. If the running session cannot switch to the chosen model, the new
   session and model choice are rolled back: the previous sign-in, stored
   default, and current route keep working together.
+
+- **The line that ends a Metask sign-in says who signed in** (follow-up to
+  #527). `/login`, `/login metask` and `metacodes login` ask the server for
+  the account's name (`/api/oauth/userinfo`: its name, else its email) and
+  end with `Signed in to Metask as <name> · <model> · reasoning <level>`; a
+  control character in it is shown as `?`. Without an answer within 3 s the
+  line is as before.
+
+- **A suspended Metask account says so** (follow-up to #527). The Metask
+  gateway refuses a suspended account with a 403 `account_suspended`, which
+  read as a rejected sign-in, with "sign in again" as the next step, which
+  cannot help. It now says the account is suspended and where to see to it.
+  `key_quota_exhausted` reads as a used-up quota, like `insufficient_balance`.
 
 - **`/login` signs in to Metask in the browser; `/logout` switches back to
   local configuration** (#485). `/login` alone now runs `metacodes login`'s
