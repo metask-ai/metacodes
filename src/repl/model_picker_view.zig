@@ -639,15 +639,6 @@ fn newline(w: *std.Io.Writer) void {
     w.writeAll("\r\n") catch {};
 }
 
-/// Scope word used by the host when it echoes a commit into the transcript.
-pub fn scopeWord(scope: selection_mod.Scope) []const u8 {
-    return switch (scope) {
-        .session => "session",
-        .global => "global",
-        .once => "once",
-    };
-}
-
 /// How the host's line after a commit says the scope: "switched to glm-5.3
 /// for this session".
 pub fn scopePhrase(scope: selection_mod.Scope) []const u8 {

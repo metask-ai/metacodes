@@ -847,11 +847,6 @@ pub const Picker = struct {
         };
     }
 
-    /// The offer the picker would commit right now, if any.
-    pub fn selectedOffer(self: *const Picker) ?*const OfferSummary {
-        return self.focusedOffer();
-    }
-
     /// The value `spec` takes on the focused route: the value wanted when the
     /// vocabulary has it; for the reasoning effort, the nearest level it has
     /// (`nearestLevel`); null for unset, the provider's own default.
