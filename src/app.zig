@@ -401,10 +401,11 @@ pub const App = struct {
     state_root_default: ?[]u8 = null,
     api_key: []const u8,
     selected_api_key_owned: ?[]u8 = null,
-    /// The key `selected_api_key_owned` held before `/login` or `/logout`
-    /// replaced it (#485). A client may still borrow it (a `/models` key
-    /// switch points them straight at it), so it stays readable for one
-    /// more generation, as `route_strings` keeps a route's (`retireApiKey`).
+    /// The key `selected_api_key_owned` held before `/login`, `/logout` or a
+    /// `/models` pick replaced it (#485). A client may still borrow it (a
+    /// `/models` key switch points them straight at it), so it stays readable
+    /// for one more generation, as `route_strings` keeps a route's
+    /// (`retireApiKey`).
     retired_api_key: ?[]u8 = null,
     api_key_catalog: api_keys_mod.Catalog,
     /// When `api_key_catalog` is filled: never on this route, or once, the
@@ -3427,24 +3428,28 @@ pub const App = struct {
     }
 
     pub fn selectApiKeyForModels(app: *App, idx: usize) !void {
+        // A key of the Metask account, for the Metask route: on another
+        // provider's route the clients and the `/v1/models` probe below would
+        // carry it to that provider.
+        if (!app.onMetaskKeyRoute()) return error.NotOnMetaskKeyRoute;
         if (idx >= app.api_key_catalog.entries.items.len) return error.InvalidApiKeySelection;
         const secret = app.api_key_catalog.entries.items[idx].secret;
         const owned = try app.allocator.dupe(u8, secret);
-        errdefer {
-            @memset(owned, 0);
-            app.allocator.free(owned);
+        {
+            // The App does not hold `owned` yet: on failure nothing points at it.
+            errdefer {
+                std.crypto.secureZero(u8, owned);
+                app.allocator.free(owned);
+            }
+            if (app.agent_jobs) |*aj| try aj.setApiKey(owned);
         }
-        if (app.selected_api_key_owned) |old| {
-            @memset(old, 0);
-            app.allocator.free(old);
-        }
+        // Retired, not freed: a client may still be reading the previous key.
+        if (app.selected_api_key_owned) |old| app.retireApiKey(old);
         app.selected_api_key_owned = owned;
         app.api_key = owned;
+        // The route's own client. The others point at the endpoints of routes
+        // the session left; a commit gives them a key with their endpoint.
         app.api_client.credential = .{ .fixed = owned };
-        if (app.openai_client) |*oc| oc.credential = .{ .fixed = owned };
-        if (app.gemini_client) |*gc| gc.credential = .{ .fixed = owned };
-        if (app.bedrock_client) |*bc| bc.credential = .{ .fixed = owned };
-        if (app.agent_jobs) |*aj| try aj.setApiKey(owned);
 
         app.api_client.catalog.deinit();
         app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);

@@ -562,6 +562,13 @@ status, compatibility boundaries, and entry points are defined by
   loads it again. A Metask model picked at another Metask gateway (the
   compiled default, say) is still the Metask route.
 
+- **A key picked in `/models` stays on the Metask route.** The pick was
+  installed in every client and in the background job registry, and its
+  `/v1/models` probe sent, whatever route the session was on. Off the Metask
+  API-key route it is now refused (`NotOnMetaskKeyRoute`), and on it only the
+  route's own client takes it. The key it replaces stays readable for one
+  more pick instead of being freed while a client may still read it.
+
 ### Security
 
 - **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**

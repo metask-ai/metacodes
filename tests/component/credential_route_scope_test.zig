@@ -31,6 +31,8 @@
 //!     moved to while the refresh ran.
 //!   * The `/models` key list was fetched with the Metask sign-in from
 //!     whatever route the session was on.
+//!   * A key picked in that list was installed on whatever route the session
+//!     was on.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -1119,4 +1121,59 @@ test "L2 credential scope: the key list follows the session onto another Metask 
     }
     try app.selectApiKeyForModels(prod orelse return error.NoProdKey);
     try std.testing.expect(sentBearer(other, 1, KEY_PROD));
+}
+
+test "L2 credential scope: a key picked in /models stays on the Metask route" {
+    // Startup probe, key list, then each pick's `/v1/models`: dev, prod, dev.
+    var gateway = try harness.MockServer.startCassette(&.{ GATEWAY_MODELS, KEYS_BODY, GATEWAY_MODELS, GATEWAY_MODELS, GATEWAY_MODELS }, 0);
+    defer gateway.stop();
+    var relay = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer relay.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    var case: Case = undefined;
+    try keyListCase(&case, setup.allocator(), try originOf(setup.allocator(), relay));
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    const gateway_url = try allocator.dupeZ(u8, try gateway.urlOwned(allocator));
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", gateway_url.ptr, "--model", "glm-5.3-flash" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    // The testing allocator checks that every key a pick replaced is freed.
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+
+    app.ensureApiKeyCatalog();
+    var prod: ?usize = null;
+    var dev: ?usize = null;
+    for (app.api_key_catalog.entries.items, 0..) |entry, index| {
+        if (std.mem.eql(u8, entry.secret, KEY_PROD)) prod = index;
+        if (std.mem.eql(u8, entry.secret, KEY_DEV)) dev = index;
+    }
+    try app.selectApiKeyForModels(dev.?);
+    try std.testing.expect(sentBearer(gateway, 2, KEY_DEV));
+    try app.selectApiKeyForModels(prod.?);
+    try std.testing.expect(sentBearer(gateway, 3, KEY_PROD));
+    // The key it replaced is retired, not freed: a client may still be
+    // reading it.
+    const retired = app.retired_api_key orelse return error.PreviousKeyNotRetired;
+    try std.testing.expectEqualStrings(KEY_DEV, retired);
+    // A third pick retires prod and frees dev, retired two picks ago.
+    try app.selectApiKeyForModels(dev.?);
+    try std.testing.expect(sentBearer(gateway, 4, KEY_DEV));
+    try std.testing.expectEqualStrings(KEY_PROD, app.retired_api_key orelse return error.PreviousKeyNotRetired);
+
+    try std.testing.expect(cc.repl_picker_host.useSelector(app, "relay-model") == .switched);
+    // A list left from the Metask route, picked from on the relay's.
+    try app.api_key_catalog.addCurrentKeyFallback(KEY_DEV);
+    try std.testing.expectError(error.NotOnMetaskKeyRoute, app.selectApiKeyForModels(0));
+    try sendOneTurn(app);
+
+    try expectNeverSent(relay, KEY_DEV);
+    try expectNeverSent(relay, KEY_PROD);
+    try std.testing.expectEqual(@as(usize, 1), relay.requestCount());
+    try std.testing.expect(sentBearer(relay, 0, RELAY_KEY));
 }
