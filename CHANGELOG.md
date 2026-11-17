@@ -65,7 +65,9 @@ status, compatibility boundaries, and entry points are defined by
   `/model (DeepSeek, OpenAI)`. A pick for every future session is the stored
   default later starts use (its key still read from the file); a default
   stored before ranks above the file, as it did. `-p`, `serve` and `--web`
-  are unchanged: they stop and list the providers by id.
+  are unchanged: they stop and list the providers by id. `metacodes login
+  status` says the same: choose one with `/model`, or add
+  `METACODES_PROVIDER`.
 
 - **The Metask sign-in moves to `www.metask-ai.com` and is kept as the Metask
   session** (#527). `/login` and `metacodes login` sign in at Metask's OAuth

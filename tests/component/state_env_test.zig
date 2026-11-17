@@ -1086,3 +1086,15 @@ test "state .env: a key login says which variable is read before the key it stor
     defer stored.deinit();
     try testing.expectEqualStrings("sk-stored-qwen", stored.secret);
 }
+
+test "state .env: login status, for keys of two providers and no name, says to choose in /model (#486)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena();
+    try case.write("state/.env", "DEEPSEEK_API_KEY=sk-status-deepseek\nOPENAI_API_KEY=sk-status-openai\n");
+    const status = try case.run(&.{}, &.{ "login", "status" });
+    try expectContains(status.stderr, try std.fmt.allocPrint(a, "This start uses no provider: {s} holds keys of several (deepseek, openai) and names none. Choose one with /model; Tab there applies it to every future session. Or add METACODES_PROVIDER=<one of them> to it.", .{try std.fs.path.join(a, &.{ case.state, ".env" })}));
+    try expectAbsent(status.stderr, "sk-status-");
+}

@@ -3357,7 +3357,9 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
             else => {},
         },
         .local_unchosen => switch (facts.local) {
-            .several => |ids| std.debug.print("This start uses no provider: {s} holds keys of several ({s}) and names none. Add {s}=<one of them> to it.\n", .{
+            // The terminal UI opens without a model and says to choose in
+            // /model (`route_state.writeUnchosenLocalNotice`); -p stops.
+            .several => |ids| std.debug.print("This start uses no provider: {s} holds keys of several ({s}) and names none. Choose one with /model; Tab there applies it to every future session. Or add {s}=<one of them> to it.\n", .{
                 env_path, std.mem.join(arena, ", ", ids) catch "", state_env_mod.provider_variable,
             }),
             else => {},
