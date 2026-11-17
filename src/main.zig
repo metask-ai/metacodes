@@ -4027,7 +4027,7 @@ fn resolveProviderScopedCredentialReporting(
     }, &reference_buffer) catch |err| {
         // Below every key in the credential order: the provider's own OAuth
         // sign-in (`login --provider`, `/login <provider>`), refreshed first
-        // when it is at or past expiry.
+        // when it expires within two minutes or already has.
         if (err == error.MissingCredentials) {
             if (providerSignInToken(allocator, config.state_root, profile)) |found| {
                 if (found) |token| return .{ .secret = token, .origin = .sign_in };
@@ -4059,8 +4059,9 @@ fn resolveProviderScopedCredentialReporting(
 }
 
 /// The access token of `profile`'s own OAuth sign-in
-/// (`<state root>/oauth/<provider>.json`), refreshed first when it is at or
-/// past expiry, the way a session's turn boundary refreshes it
+/// (`<state root>/oauth/<provider>.json`), refreshed first when it expires
+/// within `provider_oauth_mod.REFRESH_MARGIN_SECONDS` (two minutes) or already
+/// has, the way a session's turn boundary refreshes it
 /// (`App.oauthAccessToken`). Owned; zero it before freeing. Null when the
 /// profile declares no OAuth lifecycle or no sign-in is stored. Metask's is
 /// its own path (`resolveMetaskBearer`).
