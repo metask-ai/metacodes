@@ -1346,6 +1346,21 @@ pub const App = struct {
         });
     }
 
+    /// After `/login <provider>` stored a key: the line naming a key variable
+    /// for that provider which is read before the stored key (the shell's,
+    /// else this install's `.env`), written into `buffer`; null when none is
+    /// set. Names only, never a value.
+    pub fn storedKeyShadowNotice(app: *const App, profile: *const @import("provider/profile.zig").ProviderProfile, buffer: []u8) ?[]const u8 {
+        const provider_login = @import("api/provider_login.zig");
+        const shadow = provider_login.keyShadowedBy(profile, provider_credential_mod.EnvLookup.process(), app.config.credential_env_fallback) orelse return null;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = app.stateRoot();
+        const env_path = if (root.len == 0) ".env" else std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{ root, std.fs.path.sep, @import("app/state_env.zig").file_name }) catch ".env";
+        var w: std.Io.Writer = .fixed(buffer);
+        provider_login.writeKeyShadowNotice(&w, shadow, env_path) catch return null;
+        return w.buffered();
+    }
+
     /// `ids` as `/model` lists them: each provider's display name, the id
     /// itself for one the registry does not know. In `arena`.
     fn displayNames(arena: std.mem.Allocator, host: *provider_host_mod.Host, ids: []const []const u8) ![]const []const u8 {

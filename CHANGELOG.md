@@ -45,6 +45,16 @@ status, compatibility boundaries, and entry points are defined by
   invocation record, so the selected Skill sees them, and the date, from its
   first request (`doc/AGENTCORE_BINARY_ABI.md`).
 
+- **A key login says when a variable is read before the key it stores.**
+  Credential resolution reads a provider's key variables (the shell's, then
+  `<state root>/.env`) before a key stored with `/login <provider>` or
+  `metacodes login --provider <provider>`, and that order stays. The login
+  used to say only that new sessions use the stored key; with such a variable
+  set it now says which one wins and how to use the new key, by name only:
+  `DASHSCOPE_API_KEY is set in your shell and is used before the stored key:
+  unset it to use the key you just stored.` (or `… in <path>/.env is used
+  before the stored key: remove it from that file …`).
+
 - **One `.env` with keys of several providers opens the terminal UI and says
   where to choose** (#486). A `<state root>/.env` holding keys of several
   providers and no `METACODES_PROVIDER` still chooses none, but the terminal

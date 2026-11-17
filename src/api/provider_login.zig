@@ -25,6 +25,7 @@ const provider_profile = @import("../provider/profile.zig");
 const time = @import("../util/time.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const api_key_store = @import("../provider/api_key_store.zig");
+const provider_credential = @import("../provider/credential.zig");
 const catalog_fetch = @import("catalog_fetch.zig");
 
 pub const Method = oauth_login.Method;
@@ -376,6 +377,82 @@ test "the key check override takes https or a loopback host, nothing else" {
     try std.testing.expect(!keyCheckUrlAccepted("http://127.0.0.1.example.com/models"));
     try std.testing.expect(!keyCheckUrlAccepted("http://example.com/models"));
     try std.testing.expect(!keyCheckUrlAccepted("ftp://127.0.0.1/models"));
+}
+
+/// A variable `profile` reads its key from, set where credential resolution
+/// looks before a stored key (`credential.resolve`: the process
+/// environment, then `<state root>/.env`). While one is set, a key `/login
+/// <provider>` stores is not the one used: the login says so, by the
+/// variable's name and never its value.
+pub const KeyShadow = struct {
+    name: []const u8,
+    /// Set in `<state root>/.env` rather than in the process environment.
+    in_local_config: bool,
+};
+
+/// The first of `profile`'s key variables that would win over a stored key:
+/// the process environment's, else the `.env` layer's (`local_config`).
+pub fn keyShadowedBy(
+    profile: *const provider_profile.ProviderProfile,
+    process: provider_credential.EnvLookup,
+    local_config: ?provider_credential.EnvLookup,
+) ?KeyShadow {
+    for (profile.env_aliases) |alias| {
+        if (process.get(alias.name) != null) return .{ .name = alias.name, .in_local_config = false };
+    }
+    const layer = local_config orelse return null;
+    for (profile.env_aliases) |alias| {
+        if (layer.get(alias.name) != null) return .{ .name = alias.name, .in_local_config = true };
+    }
+    return null;
+}
+
+/// `GEMINI_API_KEY is set in your shell and is used before the stored key:
+/// unset it to use the key you just stored.`, or for `.env` `GEMINI_API_KEY
+/// in <env_path> is used before the stored key: remove it from that file to
+/// use the key you just stored.` One line, no newline.
+pub fn writeKeyShadowNotice(w: *std.Io.Writer, shadow: KeyShadow, env_path: []const u8) std.Io.Writer.Error!void {
+    if (shadow.in_local_config) {
+        try w.print("{s} in {s} is used before the stored key: remove it from that file to use the key you just stored.", .{ shadow.name, env_path });
+    } else {
+        try w.print("{s} is set in your shell and is used before the stored key: unset it to use the key you just stored.", .{shadow.name});
+    }
+}
+
+test "key login: a key variable set in the shell, else in .env, is named as winning over the stored key" {
+    const Env = struct {
+        names: []const []const u8,
+        fn get(ctx: *anyopaque, name: []const u8) ?[]const u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            for (self.names) |set| if (std.mem.eql(u8, set, name)) return "value-never-named";
+            return null;
+        }
+        fn lookup(self: *const @This()) provider_credential.EnvLookup {
+            return .{ .ctx = @ptrCast(@constCast(self)), .getFn = get };
+        }
+    };
+    const gemini = &@import("../provider/profiles/gemini.zig").PROFILE;
+    const none: Env = .{ .names = &.{} };
+    const shell: Env = .{ .names = &.{"GOOGLE_API_KEY"} };
+    const file: Env = .{ .names = &.{"GEMINI_API_KEY"} };
+    try std.testing.expect(keyShadowedBy(gemini, none.lookup(), none.lookup()) == null);
+    try std.testing.expect(keyShadowedBy(gemini, none.lookup(), null) == null);
+    // The shell's comes first, as resolution reads it first.
+    const from_shell = keyShadowedBy(gemini, shell.lookup(), file.lookup()).?;
+    try std.testing.expectEqualStrings("GOOGLE_API_KEY", from_shell.name);
+    try std.testing.expect(!from_shell.in_local_config);
+    const from_file = keyShadowedBy(gemini, none.lookup(), file.lookup()).?;
+    try std.testing.expectEqualStrings("GEMINI_API_KEY", from_file.name);
+    try std.testing.expect(from_file.in_local_config);
+
+    var buffer: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buffer);
+    try writeKeyShadowNotice(&w, from_shell, "/s/.env");
+    try std.testing.expectEqualStrings("GOOGLE_API_KEY is set in your shell and is used before the stored key: unset it to use the key you just stored.", w.buffered());
+    w = .fixed(&buffer);
+    try writeKeyShadowNotice(&w, from_file, "/s/.env");
+    try std.testing.expectEqualStrings("GEMINI_API_KEY in /s/.env is used before the stored key: remove it from that file to use the key you just stored.", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "value-never-named") == null);
 }
 
 pub const KeySetupError = error{

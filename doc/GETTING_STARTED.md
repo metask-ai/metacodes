@@ -191,7 +191,8 @@ a China and an international one, whose keys do not cross), checks the key
 against the vendor's model list without billing anything, and stores it in
 `$HOME/.metacodes/keys/<id>.json` (0600). `/login <id>` in the TUI offers the
 same steps; `--api-key-stdin` reads the key from a script. A key in the
-environment or in `.env` wins over the stored one.
+environment or in `.env` wins over the stored one, and the login says so,
+naming the variable, when one is set.
 
 ## Metask OAuth
 

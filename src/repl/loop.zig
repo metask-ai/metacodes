@@ -3191,6 +3191,12 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         .signed_in, .key_stored => |label| {
             if (dialog.outcome == .key_stored) {
                 cmd_output.print("Stored the key for {s} · /model to choose a model\n", .{label});
+                // A key variable in the shell or `.env` is read before the
+                // stored key: say which, by name.
+                var notice_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+                if (app.storedKeyShadowNotice(dialog.chosenProfile(), &notice_buf)) |notice| {
+                    cmd_output.print("{s}{s}{s}\n", .{ th.warn, notice, th.reset });
+                }
             } else {
                 cmd_output.print("Signed in to {s} · /model to choose a model\n", .{label});
             }

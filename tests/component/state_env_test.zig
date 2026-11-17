@@ -1044,3 +1044,45 @@ test "state .env: keys of two providers and no name leave the TUI without a mode
     try testing.expectEqual(@as(usize, 0), decoy.requestCount());
     try expectAbsent(next.stderr, "holds keys for several providers");
 }
+
+test "state .env: a key login says which variable is read before the key it stores, the shell's or the file's, by name (#486)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena();
+    // The key check: any key passes.
+    var check = try harness.MockServer.startRepeatingStatus("{\"object\":\"list\",\"data\":[]}", "HTTP/1.1 200 OK", "");
+    defer check.stop();
+    const check_url = try std.fmt.allocPrint(a, "METACODES_KEY_CHECK_URL={s}/compatible-mode/v1/models", .{try originOf(a, check)});
+    const env_path = try std.fs.path.join(a, &.{ case.state, ".env" });
+    const login = [_][]const u8{ "login", "--provider", "qwen", "--api-key", "sk-stored-qwen" };
+
+    // Nothing else holds a Qwen key: new sessions use the stored one.
+    const plain = try case.run(&.{check_url}, &login);
+    try testing.expectEqual(@as(i32, 0), plain.exit_code);
+    try expectContains(plain.stderr, "Stored the key for Alibaba Qwen.");
+    try expectContains(plain.stderr, "New sessions on Alibaba Qwen use it");
+    try expectAbsent(plain.stderr, "is used before the stored key");
+
+    // The shell's DASHSCOPE_API_KEY is read first.
+    const shell = try case.run(&.{ check_url, "DASHSCOPE_API_KEY=sk-shell-qwen" }, &login);
+    try testing.expectEqual(@as(i32, 0), shell.exit_code);
+    try expectContains(shell.stderr, "Stored the key for Alibaba Qwen.");
+    try expectContains(shell.stderr, "warning: DASHSCOPE_API_KEY is set in your shell and is used before the stored key: unset it to use the key you just stored.");
+    try expectAbsent(shell.stderr, "New sessions on Alibaba Qwen use it");
+
+    // So is this install's .env.
+    try case.write("state/.env", "DASHSCOPE_API_KEY=sk-file-qwen\n");
+    const file = try case.run(&.{check_url}, &login);
+    try testing.expectEqual(@as(i32, 0), file.exit_code);
+    try expectContains(file.stderr, try std.fmt.allocPrint(a, "warning: DASHSCOPE_API_KEY in {s} is used before the stored key: remove it from that file to use the key you just stored.", .{env_path}));
+
+    // Names only, never a value; and the key was stored each time.
+    for ([_]Run{ plain, shell, file }) |run| {
+        for ([_][]const u8{ "sk-stored-qwen", "sk-shell-qwen", "sk-file-qwen" }) |value| try expectAbsent(run.stderr, value);
+    }
+    var stored = (try cc.provider_api_key_store.load(testing.allocator, case.state, cc.provider_ids.Slug.lit("qwen"))).?;
+    defer stored.deinit();
+    try testing.expectEqualStrings("sk-stored-qwen", stored.secret);
+}

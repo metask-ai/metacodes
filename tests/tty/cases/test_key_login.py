@@ -441,3 +441,25 @@ def test_cli_login_takes_a_pasted_openai_key_while_no_oauth_client_is_configured
         assert case.opened_urls(1) == [OPENAI_KEYS], case.opened_urls()
         assert case.checks() == [f"Bearer {GOOD_KEY}"], case.checks()
         case.assert_stored(GOOD_KEY, kind="api_key")
+
+
+def test_login_dialog_says_a_shell_key_is_read_before_the_key_it_stored(bin_path):
+    # GEMINI_API_KEY in the shell is read before a stored key (environment,
+    # then .env, then the key store): the login stores the pasted key and says
+    # which variable wins, by name, never its value.
+    shell_key = "tty-shell-gemini-key-31"
+    with _GeminiCase() as case:
+        flag = " --no-browser" if IS_WINDOWS else ""
+        env = dict(case.env(), GEMINI_API_KEY=shell_key)
+        events = [READY, f"type:/login gemini{flag}", "key:enter",
+                  wait_for("Which plan is the key for?", 10),
+                  "key:enter", wait_for("paste it here", 10),
+                  f"type:{GOOD_KEY}", wait_for(f"({len(GOOD_KEY)} characters)", 10),
+                  "key:enter", wait_for("used before the stored key", WAIT_S)]
+        raw = run(bin_path, events, term_size=(30, 160), env=env, per_key_drain=0.05)
+        a, _ = _screen(raw, 30, 160)
+        a.assert_prose_contains("Stored the key for Google Gemini · /model to choose a model")
+        a.assert_prose_contains("GEMINI_API_KEY is set in your shell and is used before the stored key: "
+                                "unset it to use the key you just stored.")
+        assert shell_key.encode() not in raw and GOOD_KEY.encode() not in raw, "a key value reached the terminal"
+        case.assert_stored(GOOD_KEY, kind="api_key")

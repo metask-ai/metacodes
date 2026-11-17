@@ -654,6 +654,11 @@ pub const LoginDialog = struct {
         return self.choices_len - self.listedLen() + self.dropped;
     }
 
+    /// The provider the dialog last signed in to or stored a key for.
+    pub fn chosenProfile(self: *const LoginDialog) *const provider_profile.ProviderProfile {
+        return self.current().profile;
+    }
+
     /// Jump straight to signing in (`/login <provider>`), listed or not.
     pub fn startAt(self: *LoginDialog, index: usize) void {
         if (index >= self.choices_len) return;
