@@ -667,6 +667,51 @@ test "teamwork runtime L2: creating a worktree does not run repository hooks" {
     try testing.expect(!exists(run.status().worktree.?, "hook-ran.txt"));
 }
 
+test "teamwork runtime L2: candidate clean filters cannot execute code on the controller" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-filters");
+    defer fx.deinit();
+    try writeFile(fx.repo(), "filter.sh", "cat\n");
+    try writeFile(fx.repo(), ".gitattributes", "*.dat filter=worker\n");
+    try writeFile(fx.repo(), "data.dat", "base\n");
+    const setup = try sh(fx.repo(), "git config filter.worker.clean '/bin/sh ./filter.sh' && git config filter.worker.smudge /bin/cat");
+    testing.allocator.free(setup);
+    const modified = try std.fmt.allocPrint(fx.arena.allocator(), "printf called > '{s}/callback-ran'\ncat\n", .{fx.state()});
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .files = &.{ feature, .{ .path = "filter.sh", .bytes = modified }, .{ .path = "data.dat", .bytes = "candidate\n" } } },
+        .{ .seat = "reviewer-1", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const run = try runtime.Run.start(testing.allocator, .{ .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    _ = try run.dispatch(.implementer, "");
+    _ = try run.dispatch(.reviewer, "");
+    try testing.expect(!exists(fx.state(), "callback-ran"));
+}
+
+test "teamwork runtime L2: initial worktree checkout never invokes configured smudge filters" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-checkout-filter");
+    defer fx.deinit();
+    const script = try std.fmt.allocPrint(fx.arena.allocator(), "printf called > '{s}/callback-ran'\ncat\n", .{fx.state()});
+    try writeFile(fx.repo(), "filter.sh", script);
+    try writeFile(fx.repo(), ".gitattributes", "*.dat filter=worker\n");
+    try writeFile(fx.repo(), "data.dat", "base bytes\n");
+    const setup = try sh(fx.repo(), "git config filter.worker.clean '/bin/sh ./filter.sh' && git config filter.worker.smudge '/bin/sh ./filter.sh' && git config filter.worker.required true");
+    testing.allocator.free(setup);
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const run = try runtime.Run.start(testing.allocator, .{ .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    try expectFile(run.status().worktree.?, "data.dat", "base bytes\n");
+    try testing.expect(!exists(fx.state(), "callback-ran"));
+}
+
 test "teamwork runtime L2: after a crash, reopen restores seats, counters and budget, and the loop finishes the run" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: Fixture = undefined;

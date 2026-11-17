@@ -12,7 +12,7 @@
 //! (`agents/isolation.zig` bases its worktree on `HEAD` and creates a
 //! branch, which would drop the user's uncommitted work and leave a ref
 //! behind; this module uses the same git primitives — `git worktree add` and
-//! `teammate_process.removeWorktreeStrict` — with the snapshot commit and a
+//! `git worktree remove` — with the snapshot commit and a
 //! detached `HEAD` instead.)
 //!
 //! Merge-back, only after a passing completion audit, applies the diff from
@@ -28,7 +28,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const common = @import("../tools/common.zig");
-const teammate_process = @import("../swarm/teammate_process.zig");
+const controller_git = @import("../util/controller_git.zig");
 const log = @import("../util/log.zig");
 const run_dir = @import("run_dir.zig");
 const reviewer = @import("reviewer.zig");
@@ -66,6 +66,8 @@ const GitOut = struct {
 };
 
 fn git(gpa: std.mem.Allocator, cwd: []const u8, args: []const []const u8, abort: Abort) Error!GitOut {
+    const prefix = try controller_git.prefix(gpa, cwd, abort);
+    defer prefix.deinit(gpa);
     var owned: std.ArrayList([:0]u8) = .empty;
     defer {
         for (owned.items) |arg| gpa.free(arg);
@@ -74,11 +76,9 @@ fn git(gpa: std.mem.Allocator, cwd: []const u8, args: []const []const u8, abort:
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, "/usr/bin/env");
-    try argv.append(gpa, "git");
+    for (prefix.items) |arg| try appendArgument(gpa, &owned, &argv, arg);
     for (args) |arg| {
-        const z = try gpa.dupeZ(u8, arg);
-        try owned.append(gpa, z);
-        try argv.append(gpa, z.ptr);
+        try appendArgument(gpa, &owned, &argv, arg);
     }
     try argv.append(gpa, null);
     const out = common.spawnCaptureWithStderrTimed(argv.items, gpa, abort, git_timeout_ms, null, max_git_output, cwd) catch |err| switch (err) {
@@ -86,7 +86,21 @@ fn git(gpa: std.mem.Allocator, cwd: []const u8, args: []const []const u8, abort:
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.GitFailed,
     };
+    if (!out.capture_complete) {
+        gpa.free(out.stdout);
+        gpa.free(out.stderr);
+        return error.GitFailed;
+    }
     return .{ .exit_code = out.exit_code, .stdout = out.stdout, .stderr = out.stderr };
+}
+
+fn appendArgument(gpa: std.mem.Allocator, owned: *std.ArrayList([:0]u8), argv: *std.ArrayList(?[*:0]const u8), arg: []const u8) error{OutOfMemory}!void {
+    const z = try gpa.dupeZ(u8, arg);
+    owned.append(gpa, z) catch |err| {
+        gpa.free(z);
+        return err;
+    };
+    try argv.append(gpa, z.ptr);
 }
 
 /// stdout of a git command that must succeed, trimmed; owned by `gpa`.
@@ -148,20 +162,23 @@ pub fn snapshot(gpa: std.mem.Allocator, repo: []const u8, scratch_dir: []const u
     return .{ .commit = try parseObject(commit_text), .tree = tree };
 }
 
-/// Add a detached worktree without running the repository's post-checkout
-/// hook outside the seat sandbox.
+/// Add a detached worktree without running hooks or content filters outside
+/// the seat sandbox.
 pub fn addWorktree(gpa: std.mem.Allocator, repo: []const u8, path: []const u8, commit: ObjectId, abort: Abort) Error!void {
-    const out = try gitText(gpa, repo, &.{ "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", "--quiet", path, commit.slice() }, abort);
+    const out = try gitText(gpa, repo, &.{ "worktree", "add", "--detach", "--quiet", path, commit.slice() }, abort);
     gpa.free(out);
 }
 
 /// Remove the worktree at `path`; true when it is confirmed gone.
 pub fn removeWorktree(gpa: std.mem.Allocator, repo: []const u8, path: []const u8) bool {
-    teammate_process.removeWorktreeStrict(gpa, path, repo, null) catch |err| {
+    const path_z = gpa.dupeZ(u8, path) catch return false;
+    defer gpa.free(path_z);
+    const out = gitText(gpa, repo, &.{ "worktree", "remove", "--force", path }, null) catch |err| {
         log.warn("teamwork", "worktree {s} kept: removal failed: {s}", .{ path, @errorName(err) });
         return false;
     };
-    return true;
+    defer gpa.free(out);
+    return !pfs.exists(path_z.ptr);
 }
 
 /// Paths that differ between two tree-ish objects (repository-relative,

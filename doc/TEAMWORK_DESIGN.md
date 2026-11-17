@@ -439,7 +439,8 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 
 `runtime.Run.start` 只接受宿主已经批准的 `ApprovedRequest`。runtime 记录原始请求,对工作区
 创建包含未提交与未忽略文件的快照,再在运行目录中创建 detached worktree。用户的 HEAD、索引与
-文件不变。创建 worktree 禁用仓库钩子;seat 的沙箱额外拒绝写入 `.git` 和 linked worktree 的
+文件不变。控制器创建 worktree、生成审计快照和合回时均禁用仓库钩子、fsmonitor 与内容过滤器;
+seat 的沙箱额外拒绝写入 `.git` 和 linked worktree 的
 公共 git 目录,防止子 agent 改动用户的 refs、配置或钩子。
 
 Manager 只驱动 `dispatch(implementer/reviewer)`、`status`、`requestCompletion`、`cancel`。

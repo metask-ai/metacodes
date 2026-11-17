@@ -161,6 +161,13 @@ The snapshot takes the lifecycle shape of `Worktree` (create under
 
    The run-start `HEAD` is recorded when the check gate is armed.
 
+   Host Git invocations use `util/controller_git.zig` to disable hooks,
+   fsmonitor and configured clean/smudge/process filters, including drivers
+   from included configuration. The overrides apply only to the invocation;
+   repository configuration is preserved. Candidate scripts are never run
+   by snapshot creation, checkout or the final tree recheck. An incomplete
+   filter query or excessive driver set makes the snapshot unavailable.
+
 2. **A separate repository, not a linked worktree.** `git init` the
    directory, point `objects/info/alternates` at the actor's object
    directory, set `refs/heads/base` and `refs/heads/candidate`, and check out
