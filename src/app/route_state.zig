@@ -206,7 +206,7 @@ fn writeList(w: *std.Io.Writer, items: []const []const u8) std.Io.Writer.Error!v
 
 /// The provider key variables `env` sets among `profiles`' declared aliases,
 /// by name, each once, in profile order. Metask's are left out: a Metask key
-/// in the environment is a sign-in and binds the session (level 3), so it is
+/// in the environment is a sign-in and binds the session (level 5), so it is
 /// never one the reminder has to point out. The names live in `arena`.
 pub fn environmentKeys(
     arena: std.mem.Allocator,

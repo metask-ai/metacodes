@@ -543,7 +543,7 @@ fn warnLocalConfig(allocator: std.mem.Allocator, local: *const state_env_mod.Loa
     if (quiet) log.warn("config", "{s}", .{summary}) else std.debug.print("warning: {s}\n", .{summary});
 }
 
-/// Level 5's other way in, after the sign-in hint: where this install's
+/// Level 7's other way in, after the sign-in hint: where this install's
 /// `.env` is, the template beside it when an install wrote one, and which
 /// providers' keys the file holds when it names none of them.
 fn printLocalConfigHint(local: *const state_env_mod.Loaded, unchosen: []const []const u8) void {
@@ -569,7 +569,7 @@ fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, " (template: {s})", .{template}) catch "";
 }
 
-/// Level 2 of the startup order, judged before it is applied (#485).
+/// Level 4 of the startup order, judged before it is applied (#485).
 const StoredDefault = startup_order.StoredDefault;
 
 /// Whether the default stored by `/model` can serve this start: its route
@@ -784,12 +784,12 @@ fn skippedDefaultNotice(arena: std.mem.Allocator, label: []const u8, instead: ?S
     return std.fmt.allocPrint(arena, "The default model, {s}, has no key or sign-in; this session uses {s}.", .{ label, line }) catch null;
 }
 
-/// Level 3 of the startup order: a Metask sign-in the historical path would
+/// Level 5 of the startup order: a Metask sign-in the historical path would
 /// use — `--api-key`, a runtime key descriptor, `METASK_API_KEY` (the
 /// environment's, or `file_key` from `.env`), or a login stored in
 /// `auth.json`. A stored login that cannot be read counts, so the run says
 /// why rather than quietly using another provider. The Metask session
-/// (`metaskSessionStored`) is level 3 too, after these (#499, #527).
+/// (`metaskSessionStored`) is level 5 too, after these (#499, #527).
 fn metaskSignInPresent(allocator: std.mem.Allocator, config: types.Config, file_key: ?[]const u8) bool {
     if (config.api_key != null) return true;
     if (std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) != null) return true;
@@ -1267,20 +1267,20 @@ pub fn main(init: std.process.Init) !void {
     const startup_facts = startupFacts(allocator, config, &local_config, local_metask_key, &preset_facts);
     const startup_decision = startup_order.decide(startup_facts);
     const metask_legacy_requested = startup_facts.metask_key_requested;
-    // Level 2 (#485): a stored default counts only while its provider has a
+    // Level 4 (#485): a stored default counts only while its provider has a
     // credential; one that lacks it is passed over for the levels below, and
     // the start says so once (`skipped_default_notice`).
     const stored_default: StoredDefault = startup_facts.stored_default;
     // Whether a flag, the shell or a preset named the route: then nothing
     // below is a "default" the start chose for the user.
     const named_at_start = startup_facts.named or startup_decision.byPreset();
-    // Level 3 by the Metask session (#499, #527): the browser sign-in
+    // Level 5 by the Metask session (#499, #527): the browser sign-in
     // (`/login`, `metacodes login`) and the device code both store it, and a
     // plain launch signs in with it the way `--provider metask` does. A key
     // that signs Metask in (`--api-key`, `METASK_API_KEY`, a key in
     // `auth.json`) is the historical path's and keeps serving it.
     const metask_session_sign_in = startup_decision == .metask_session;
-    // Level 4. Nothing below a stored default or a sign-in reads the file's
+    // Level 6. Nothing below a stored default or a sign-in reads the file's
     // choice, and a key that is only in the shell environment never selects
     // a provider: those keys were not put there for metacodes.
     var unchosen_local_providers: []const []const u8 = &.{};
@@ -1351,7 +1351,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
-    // Whether level 2 decided the route: a stored Metask default then also
+    // Whether level 4 decided the route: a stored Metask default then also
     // takes the browser sign-in's key (`browserSignInKey`).
     var stored_default_applied = false;
     if (config.provider_profile) |profile_name| {
@@ -1476,9 +1476,10 @@ pub fn main(init: std.process.Init) !void {
         var browser_key = false;
         provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| blk: {
             const no_sign_in = err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession;
-            // Level 2 (#485): a stored Metask default with no device-code
+            // Level 4 (#485): a stored Metask default with no device-code
             // session authenticates with the browser sign-in's key, on the
-            // stored route, as the historical path would.
+            // stored route, as the historical path would; so does a Metask
+            // preset (#489).
             if (no_sign_in and (stored_default_applied or preset_applied)) if (browserSignInKey(allocator, config.state_root)) |key| {
                 browser_key = true;
                 break :blk key;
@@ -1500,7 +1501,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (!introspection_only and metask_scope and metask_legacy_explicit) {
         provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
     } else if (!introspection_only and !metask_scope) {
-        // Level 1 (and 2 and 4, which name their provider the same way): a
+        // Level 1 (and 2 to 4 and 6, which name their provider the same way): a
         // provider without a key opens the TUI unbound, naming the key it
         // needs (#485, 第十节第 3 条); `-p` and the rest stop with its help.
         const report: CredentialReport = if (may_open_unbound) .quiet else .print_help;
@@ -1531,7 +1532,7 @@ pub fn main(init: std.process.Init) !void {
         allocator.free(secret);
     };
 
-    // Level 5 of the startup order (#484): with no credential at all, the
+    // Level 7 of the startup order (#484): with no credential at all, the
     // interactive TUI opens unbound — no model, nothing sent, a reminder of
     // what to set up — instead of exiting (`may_open_unbound`).
     var resolved_credential: ?auth.ResolvedCredential = null;
@@ -1579,7 +1580,7 @@ pub fn main(init: std.process.Init) !void {
         @as([]const u8, credential.bearer_token)
     else
         "";
-    // Level 2 passed over (#485): said once — in the TUI under its banner,
+    // Level 4 passed over (#485): said once — in the TUI under its banner,
     // elsewhere on stderr now — with what this start uses instead.
     const skipped_default_notice: ?[]const u8 = switch (stored_default) {
         .lacks_credential => |label| skippedDefaultNotice(allocator, label, if (unbound != null) null else .{

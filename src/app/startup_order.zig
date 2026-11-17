@@ -52,7 +52,7 @@ pub const Preset = union(enum) {
     };
 };
 
-/// Level 2, judged before it is applied (#485).
+/// Level 4, judged before it is applied (#485).
 pub const StoredDefault = union(enum) {
     /// No `global_selection` is stored.
     none,

@@ -218,7 +218,7 @@ A file with keys of several providers and no `METACODES_PROVIDER` chooses
 none: the terminal UI opens without a model, as in step 7, and its red note
 lists those providers; you add `METACODES_PROVIDER` to pick one. `-p` stops
 instead, listing them the same way. A `METASK_API_KEY` among them is the
-exception: with no name in the file it is a Metask sign-in (step 3), so that
+exception: with no name in the file it is a Metask sign-in (step 5), so that
 file starts on Metask.
 
 An endpoint you set in the shell (`--base-url`, `METACODES_BASE_URL`) applies
