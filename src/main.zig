@@ -109,6 +109,7 @@ pub const provider_metask_ledger = @import("provider/metask_ledger.zig");
 pub const kg_provider_audit = @import("kg/provider_audit.zig");
 pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_oauth_login = @import("api/oauth_login.zig");
+pub const api_oauth_revoke = @import("api/oauth_revoke.zig"); // L2 reads a provider sign-out's revocation outcome
 pub const api_provider_login = @import("api/provider_login.zig");
 pub const api_login_worker = @import("api/login_worker.zig");
 pub const api_metask_sign_in = @import("api/metask_sign_in.zig"); // `/login`'s browser sign-in on a worker (#485)
@@ -3166,7 +3167,9 @@ fn printRemainingMetaskKeys(allocator: std.mem.Allocator, state_dir: []const u8)
     }
 }
 
-/// `metacodes logout --provider <id>`: forget the API key stored for it.
+/// `metacodes logout --provider <id>`: forget the API key stored for it, and
+/// its own OAuth sign-in, revoked at the provider first where the profile
+/// says (`api/oauth_revoke.zig`).
 fn logoutProviderKey(allocator: std.mem.Allocator, state_dir: []const u8, name: []const u8) u8 {
     const host = buildProviderHost(allocator) orelse {
         std.debug.print("error: the provider registry is unavailable\n", .{});
@@ -3177,14 +3180,39 @@ fn logoutProviderKey(allocator: std.mem.Allocator, state_dir: []const u8, name: 
         std.debug.print("error: unknown provider '{s}'\n", .{name});
         return 2;
     };
+    return logoutProviderProfile(allocator, state_dir, profile, @import("api/oauth_revoke.zig").DEFAULT_WAIT_MS);
+}
+
+/// `logoutProviderKey` for a resolved profile; `revoke_wait_ms` bounds the
+/// revocation (a test points the profile's endpoint at its own mock).
+pub fn logoutProviderProfile(
+    allocator: std.mem.Allocator,
+    state_dir: []const u8,
+    profile: *const provider_profile.ProviderProfile,
+    revoke_wait_ms: u64,
+) u8 {
+    const oauth_revoke = @import("api/oauth_revoke.zig");
     const removed = provider_api_key_store.remove(allocator, state_dir, profile.id) catch |err| {
         std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
         return 1;
     };
+    const sign_in = oauth_revoke.forgetStoredLogin(allocator, state_dir, profile, revoke_wait_ms) catch |err| {
+        std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    if (sign_in.removed) {
+        std.debug.print("Signed out of {s}: removed the sign-in and its refresh token.\n", .{profile.display_name});
+        switch (sign_in.revoke) {
+            .revoked => std.debug.print("{s} revoked it too.\n", .{profile.display_name}),
+            .nothing_stored, .not_offered => {},
+            .failed => std.debug.print("{s} could not revoke it; it stays valid there until it expires.\n", .{profile.display_name}),
+            .timed_out => std.debug.print("{s} did not answer the revocation in time; it may stay valid there until it expires.\n", .{profile.display_name}),
+        }
+    }
     if (removed) {
         std.debug.print("Removed the stored key for {s}.\n", .{profile.display_name});
-    } else {
-        std.debug.print("No key is stored for {s}.\n", .{profile.display_name});
+    } else if (!sign_in.removed) {
+        std.debug.print("{s} is stored for {s}.\n", .{ provider_login.nothingStoredText(profile), profile.display_name });
     }
     return 0;
 }
@@ -3979,6 +4007,20 @@ fn resolveProviderScopedCredentialReporting(
         // `<state root>/.env` (#486), below the process environment.
         .env_fallback = config.credential_env_fallback orelse credential_mod.EnvLookup.empty(),
     }, &reference_buffer) catch |err| {
+        // Below every key in the credential order: the provider's own OAuth
+        // sign-in (`login --provider`, `/login <provider>`), refreshed first
+        // when it is at or past expiry.
+        if (err == error.MissingCredentials) {
+            if (providerSignInToken(allocator, config.state_root, profile)) |found| {
+                if (found) |token| return .{ .secret = token, .origin = .sign_in };
+            } else |sign_in_err| {
+                if (report == .print_help) std.debug.print(
+                    "error: the {s} sign-in could not be used ({s}); sign in again: {s} login --provider {s}\n",
+                    .{ profile.display_name, @errorName(sign_in_err), invokedCommand(allocator), profile.id.slice() },
+                );
+                return error.MissingCredentials;
+            }
+        }
         if (report == .quiet) return err;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const local_path: []const u8 = if (config.state_root.len == 0) "" else std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{
@@ -3996,6 +4038,37 @@ fn resolveProviderScopedCredentialReporting(
         .interactive, .unknown => .unknown,
     };
     return .{ .secret = try allocator.dupe(u8, resolved.secret), .origin = origin };
+}
+
+/// The access token of `profile`'s own OAuth sign-in
+/// (`<state root>/oauth/<provider>.json`), refreshed first when it is at or
+/// past expiry, the way a session's turn boundary refreshes it
+/// (`App.oauthAccessToken`). Owned; zero it before freeing. Null when the
+/// profile declares no OAuth lifecycle or no sign-in is stored. Metask's is
+/// its own path (`resolveMetaskBearer`).
+pub fn providerSignInToken(
+    allocator: std.mem.Allocator,
+    state_root: []const u8,
+    profile: *const provider_profile.ProviderProfile,
+) !?[]u8 {
+    if (profile.id.eqlText("metask")) return null;
+    const token_url = profile.oauth_token_url orelse return null;
+    const serves = for (profile.accepted_credential_kinds) |kind| {
+        if (provider_oauth_mod.servesKind(kind)) break true;
+    } else false;
+    if (!serves) return null;
+    var session = try provider_oauth_mod.Session.initHome(allocator, state_root, profile.id);
+    defer session.deinit();
+    if (!(try session.load())) return null;
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    // The refresh grant presents the client the sign-in recorded.
+    var exchange = oauth_exchange_mod.HttpExchange{
+        .allocator = allocator,
+        .io = io_runtime.io(),
+        .endpoint = .{ .token_url = token_url, .client_id = session.clientIdFor(profile.oauth_client_id) },
+    };
+    return try session.accessToken(@import("util/time.zig").nowUnix(), exchange.exchange());
 }
 
 /// `command` is the command the user ran (`invokedCommand`); `local_path`
@@ -4027,6 +4100,8 @@ fn printProviderCredentialHelp(
             if (profile.api_key_setup) |setup| {
                 std.debug.print("  {s} login --provider {s}   (opens the page the key is created on, then stores it)\n", .{ command, profile.id.slice() });
                 if (setup.note) |note| std.debug.print("  {s}\n", .{note});
+            } else if (profile.declaresInteractiveOAuth() and profile.oauth_client_id != null) {
+                std.debug.print("  {s} login --provider {s}   (signs in in the browser, then stores the sign-in)\n", .{ command, profile.id.slice() });
             }
             for (profile.accepted_credential_kinds) |kind| {
                 if (profile.canonicalEnvAlias(kind)) |canonical| {
@@ -4034,7 +4109,11 @@ fn printProviderCredentialHelp(
                     if (local_path.len > 0) std.debug.print("    or {s}=... in {s} (read when metacodes starts)\n", .{ canonical, local_path });
                 }
             }
-            std.debug.print("  {s} --api-key <key> --provider {s} ...\n", .{ command, profile.id.slice() });
+            // A provider that signs in only (`chatgpt-codex`) takes no key.
+            const takes_key = for (profile.accepted_credential_kinds) |kind| {
+                if (!kind.isOAuth()) break true;
+            } else false;
+            if (takes_key) std.debug.print("  {s} --api-key <key> --provider {s} ...\n", .{ command, profile.id.slice() });
             std.debug.print("No token value was printed.\n", .{});
         },
     }
@@ -5071,6 +5150,7 @@ test {
     _ = &@import("kg/provider_audit.zig");
     _ = &@import("api/oauth_exchange.zig");
     _ = &@import("api/oauth_login.zig");
+    _ = &@import("api/oauth_revoke.zig");
     _ = &@import("api/catalog_fetch.zig");
     _ = &@import("api/models_pages.zig");
     _ = &@import("api/gemini_signatures.zig");

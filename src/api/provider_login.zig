@@ -88,6 +88,19 @@ pub fn refusalText(err: FlowError, method: Method) []const u8 {
     };
 }
 
+/// What a sign-out finds for a provider it has nothing of, by what the
+/// provider takes: `No key`, `No sign-in`, or `No key or sign-in`.
+pub fn nothingStoredText(profile: *const provider_profile.ProviderProfile) []const u8 {
+    var key = false;
+    var sign_in = false;
+    for (profile.accepted_credential_kinds) |kind| {
+        if (provider_oauth.servesKind(kind)) sign_in = true else key = true;
+    }
+    if (sign_in and !key) return "No sign-in";
+    if (sign_in and key) return "No key or sign-in";
+    return "No key";
+}
+
 /// Why the durable import refused a token response. When a step failed rather
 /// than decided, its own error is in the `ImportDiagnostic`.
 pub const ImportError = error{

@@ -21,6 +21,9 @@
 //!   a 403): the account itself is suspended, which signing in again cannot
 //!   cure. See to it on the provider's site, or switch provider.
 //!
+//! A provider that is signed in to rather than given a key is told to sign in
+//! again, with the command that does it.
+//!
 //! Neither retries nor switches anything. `forFailure` gathers the inputs from
 //! a session. Host-only: the library reports the failure and never knows the
 //! `.env` path.
@@ -52,6 +55,9 @@ pub const Route = union(enum) {
         /// The canonical variable its key is read from; null when the profile
         /// declares none.
         key_variable: ?[]const u8,
+        /// The provider id `/login <id>` signs in to, for a provider that
+        /// takes an OAuth sign-in and no key; null for every other.
+        sign_in: ?[]const u8 = null,
     };
 };
 
@@ -122,7 +128,10 @@ pub fn render(allocator: std.mem.Allocator, input: Input) error{OutOfMemory}!?[]
                 .interactive => try allocator.dupe(u8, "Your Metask sign-in is no longer valid. Sign in again: /login"),
                 .print => |command| try std.fmt.allocPrint(allocator, "Your Metask sign-in is no longer valid. Sign in again: {s} login", .{command}),
             },
-            .provider => |provider| try keyRejected(allocator, provider, input.env_path),
+            .provider => |provider| if (provider.sign_in) |id| switch (input.surface) {
+                .interactive => try std.fmt.allocPrint(allocator, "Your {s} sign-in is no longer valid. Sign in again: /login {s}", .{ provider.name, id }),
+                .print => |command| try std.fmt.allocPrint(allocator, "Your {s} sign-in is no longer valid. Sign in again: {s} login --provider {s}", .{ provider.name, command, id }),
+            } else try keyRejected(allocator, provider, input.env_path),
         },
         .balance_exhausted => switch (input.route) {
             .metask => try std.fmt.allocPrint(allocator, "Your Metask balance has run out. Top up your Metask account, or switch provider: {s}", .{switch_provider}),
@@ -204,7 +213,15 @@ fn currentProfile(host: *provider_host_mod.Host) ?*const profile_mod.ProviderPro
 
 pub fn routeFor(profile: profile_mod.ProviderProfile) Route {
     if (profile.id.eqlText("metask")) return .metask;
-    return .{ .provider = .{ .name = profile.display_name, .key_variable = keyVariable(profile) } };
+    const variable = keyVariable(profile);
+    return .{
+        .provider = .{
+            .name = profile.display_name,
+            .key_variable = variable,
+            // Signed in to, with no key to check instead.
+            .sign_in = if (variable == null and profile.declaresInteractiveOAuth()) profile.id.slice() else null,
+        },
+    };
 }
 
 /// The canonical variable of the first credential kind the profile accepts
@@ -342,6 +359,20 @@ test "the gateway's key_quota_exhausted is a used-up quota" {
     });
 }
 
+test "a sign-in provider whose sign-in is refused is told to sign in again, with the command" {
+    const codex: Route = .{ .provider = .{ .name = "ChatGPT (Codex)", .key_variable = null, .sign_in = "chatgpt-codex" } };
+    try expectLine("Your ChatGPT (Codex) sign-in is no longer valid. Sign in again: /login chatgpt-codex", .{
+        .category = .authentication,
+        .route = codex,
+        .surface = .interactive,
+    });
+    try expectLine("Your ChatGPT (Codex) sign-in is no longer valid. Sign in again: metacodes-dev login --provider chatgpt-codex", .{
+        .category = .permission,
+        .route = codex,
+        .surface = .{ .print = "metacodes-dev" },
+    });
+}
+
 test "every other failure keeps the caller's advice" {
     for (std.enums.values(model_error.Category)) |category| {
         const expected: ?Situation = switch (category) {
@@ -404,20 +435,21 @@ test "-p names the command that was run and --provider instead of the slash comm
     }
 }
 
-test "every built-in provider names its key's variable; Metask is the Metask route" {
+test "every built-in provider names its key's variable or its sign-in; Metask is the Metask route" {
     const registry = @import("../provider/registry.zig");
     for (registry.BUILTIN_PROFILES) |profile| {
         switch (routeFor(profile)) {
             .metask => try testing.expect(profile.id.eqlText("metask")),
             .provider => |provider| {
                 try testing.expectEqualStrings(profile.display_name, provider.name);
-                if (provider.key_variable == null) {
-                    std.debug.print("{s} declares no key variable\n", .{profile.id.slice()});
+                if (provider.key_variable == null and provider.sign_in == null) {
+                    std.debug.print("{s} declares no key variable and no sign-in\n", .{profile.id.slice()});
                     return error.TestUnexpectedResult;
                 }
             },
         }
     }
+    try testing.expect(routeFor(registry.openai.PROFILE).provider.sign_in == null);
     // The kind decides, not `.api_key`: Kimi Code's and the GLM plan's keys
     // are kinds of their own. OpenAI also takes OAuth kinds, which have none.
     try testing.expectEqualStrings("DEEPSEEK_API_KEY", routeFor(registry.deepseek.PROFILE).provider.key_variable.?);

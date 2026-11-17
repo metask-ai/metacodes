@@ -370,6 +370,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A provider's own OAuth sign-in is used by a start, and signed out of by
+  `logout`.** A sign-in `login --provider <id>` stored in
+  `oauth/<provider>.json` reached a session only through a `/model` pick:
+  `--provider <id>`, `-p`, and a stored `/model` default on that provider
+  found no credential and asked for a key. A start now uses it below every
+  key, refreshing it first when it is at or past expiry, and says `signed
+  in`. `/logout <provider>` and `metacodes logout --provider <id>` removed
+  only a stored key; they now remove the sign-in too, revoked first where
+  the provider declares an endpoint for it (`oauth_revocation`). The help a
+  start prints for a provider that only signs in names `login --provider
+  <id>` and no longer offers `--api-key`, and a refused sign-in is told to
+  sign in again rather than to check a key.
+
 - **Shift+Enter inserts a newline while a reply streams** (#456). In the
   terminal UI, Shift+Enter during a reply did what Enter does: the draft
   went into the pending queue, the input box was cleared, and when the reply

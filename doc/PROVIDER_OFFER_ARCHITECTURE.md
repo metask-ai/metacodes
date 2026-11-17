@@ -531,6 +531,13 @@ how far the vendor stands behind the sign-in (`oauth_support`). A refusal that
 comes back with the right state ends the wait and says what the server said;
 one with another state is a stale tab and is answered and ignored.
 
+A start reads a provider's stored sign-in below every key
+(`main.providerSignInToken`), refreshing it first when it is at or past
+expiry, so `--provider <id>`, `-p` and a stored `/model` default on that
+provider run on it as a `/model` pick does. `metacodes logout --provider <id>`
+and `/logout <provider>` remove it, revoked first where the profile declares an
+endpoint (`api/oauth_revoke.zig`, bounded as Metask's revocation is).
+
 ### Stored API keys and the guided key login
 
 Some providers have a plan whose keys are created on a web page and offer no
@@ -991,6 +998,7 @@ on a second line of its confirmation, who bills the session from then on.
 | `src/provider/api_key_store.zig` | provider-scoped API keys at rest, one 0600 file per provider |
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
 | `src/api/oauth_login.zig` | the interactive first-token grants (PKCE, device) |
+| `src/api/oauth_revoke.zig` | signing out of a provider's sign-in: revoke the refresh token, then delete |
 | `src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33), or the checked pasted key |
 | `src/api/login_worker.zig` | a prepared login on a worker thread: `AbortSignal` cancellation, bounded `Notify` transcript, atomic state (#67) |
 | `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
