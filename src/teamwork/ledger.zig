@@ -12,6 +12,10 @@
 //! append starts clean. A complete line that does not parse is not a crash
 //! artifact, and `load` fails closed with `CorruptLedger`.
 //!
+//! Admission receipts are fsynced in `budget.jsonl.pending.tmp` and installed
+//! at `budget.jsonl.pending` without replacing an existing receipt. Recovery
+//! ignores unfinished temp files: no paid work starts before installation.
+//!
 //! Not thread-safe: the runtime serializes charges.
 
 const std = @import("std");
@@ -94,7 +98,7 @@ pub const Ledger = struct {
     /// already on disk. A missing file is an empty ledger.
     pub fn load(gpa: std.mem.Allocator, path: []const u8, cap_usd: f64) LoadError!Ledger {
         if (!std.math.isFinite(cap_usd) or cap_usd <= 0) return error.InvalidCap;
-        if (path.len + ".pending".len >= std.fs.max_path_bytes) return error.PathTooLong;
+        if (path.len + ".pending.tmp".len >= std.fs.max_path_bytes) return error.PathTooLong;
         const path_z = try gpa.dupeZ(u8, path);
         errdefer gpa.free(path_z);
         const pending_path = try std.fmt.allocPrintSentinel(gpa, "{s}.pending", .{path}, 0);
@@ -154,16 +158,31 @@ pub const Ledger = struct {
     pub fn reserve(self: *Ledger, seat_id: types.SeatId, harness: types.Harness) ChargeError!void {
         if (self.isExhausted()) return error.BudgetExhausted;
         if (self.pending_seat != null) return error.WriteFailed;
-        const fd = pfs.open(self.pending_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600);
-        if (fd < 0) return error.WriteFailed;
-        defer pfs.close(fd);
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{self.pending_path}) catch return error.WriteFailed;
+        // Installation can leave both names hard-linked after a crash. Never
+        // truncate the stale temp: it may still be the admitted receipt.
+        pfs.unlinkPath(tmp.ptr) catch |err| switch (err) {
+            error.NotFound => {},
+            error.UnlinkFailed => return error.WriteFailed,
+        };
+        defer pfs.unlinkPath(tmp.ptr) catch {};
         var buf: [1024]u8 = undefined;
         const bytes = formatEntry(&buf, .{ .seat_id = seat_id, .harness = harness, .wallclock_ms = 0, .cost = .{ .reserved = self.remainingUsd() } });
         // A verifier may be retried with the same logical seat id after a
         // crash. Only a charge after this receipt can settle this admission.
         const suffix = std.fmt.bufPrint(buf[bytes.len - 2 ..], ",\"entries_before\":{d}}}\n", .{self.entries}) catch unreachable;
-        if (!pfs.writeAll(fd, buf[0 .. bytes.len - 2 + suffix.len])) return error.WriteFailed;
-        pfs.fsyncChecked(fd) catch return error.WriteFailed;
+        {
+            const fd = pfs.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600);
+            if (fd < 0) return error.WriteFailed;
+            defer pfs.close(fd);
+            if (!pfs.writeAll(fd, buf[0 .. bytes.len - 2 + suffix.len])) return error.WriteFailed;
+            pfs.fsyncChecked(fd) catch return error.WriteFailed;
+        }
+        switch (pfs.installNoReplace(tmp.ptr, self.pending_path.ptr) catch return error.WriteFailed) {
+            .moved, .linked => {},
+            .already_exists => return error.WriteFailed,
+        }
         self.pending_seat = seat_id;
     }
 
@@ -395,6 +414,100 @@ test "ledger: a controller crash after reservation consumes the remaining allowa
     defer again.deinit(testing.allocator);
     try testing.expectEqual(@as(f64, 5), again.spent_usd);
     try testing.expectEqual(@as(usize, 2), again.entries);
+}
+
+test "ledger: interrupted reservation temp writes leave recovery and a new admission usable" {
+    for ([_][]const u8{ "", "{\"seat_id\":\"reviewer-1\",\"harness\":" }) |partial| {
+        var root = TestRoot.init("cc-zig-teamwork-reservation-temp");
+        defer root.deinit();
+        var pbuf: [512]u8 = undefined;
+        const path = ledgerPath(&pbuf, &root);
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = try std.fmt.bufPrintZ(&tmp_buf, "{s}.pending.tmp", .{path});
+        {
+            var ledger = try Ledger.load(testing.allocator, path, 5);
+            defer ledger.deinit(testing.allocator);
+            try ledger.charge(.{ .seat_id = seat("implementer-1"), .harness = .metacodes, .wallclock_ms = 1, .cost = .{ .provider_estimate = 1 } });
+            // Process loss before the complete, fsynced receipt is installed.
+            try writeRaw(tmp, partial);
+            try testing.expect(!pfs.exists(ledger.pending_path.ptr));
+        }
+        {
+            var reopened = try Ledger.load(testing.allocator, path, 5);
+            defer reopened.deinit(testing.allocator);
+            try testing.expectEqual(@as(usize, 1), reopened.entries);
+            try testing.expectEqual(@as(f64, 4), reopened.remainingUsd());
+            try testing.expect(reopened.pending_seat == null);
+            try reopened.reserve(seat("reviewer-1"), .claude_code);
+            try testing.expect(!pfs.exists(tmp.ptr));
+            const receipt = (try readAll(testing.allocator, reopened.pending_path)).?;
+            defer testing.allocator.free(receipt);
+            try testing.expectEqual(@as(usize, 1), try pendingBefore(testing.allocator, receipt));
+        }
+        // Only the installed admission consumes the remaining allowance.
+        var recovered = try Ledger.load(testing.allocator, path, 5);
+        defer recovered.deinit(testing.allocator);
+        try testing.expect(recovered.isExhausted());
+        try testing.expectEqual(@as(usize, 2), recovered.entries);
+    }
+}
+
+test "ledger: a stale writer cannot overwrite an installed admission and cleans its temp" {
+    var root = TestRoot.init("cc-zig-teamwork-reservation-immutable");
+    defer root.deinit();
+    var pbuf: [512]u8 = undefined;
+    const path = ledgerPath(&pbuf, &root);
+    {
+        var stale = try Ledger.load(testing.allocator, path, 5);
+        defer stale.deinit(testing.allocator);
+        var ledger = try Ledger.load(testing.allocator, path, 5);
+        defer ledger.deinit(testing.allocator);
+        try ledger.reserve(seat("implementer-1"), .metacodes);
+        const original = (try readAll(testing.allocator, ledger.pending_path)).?;
+        defer testing.allocator.free(original);
+        try testing.expectError(error.WriteFailed, stale.reserve(seat("reviewer-1"), .claude_code));
+        try testing.expect(stale.pending_seat == null);
+        const preserved = (try readAll(testing.allocator, ledger.pending_path)).?;
+        defer testing.allocator.free(preserved);
+        try testing.expectEqualStrings(original, preserved);
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = try std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{ledger.pending_path});
+        try testing.expect(!pfs.exists(tmp.ptr));
+    }
+    var recovered = try Ledger.load(testing.allocator, path, 5);
+    defer recovered.deinit(testing.allocator);
+    try testing.expect(recovered.isExhausted());
+    try testing.expectEqual(@as(usize, 1), recovered.entries);
+}
+
+test "ledger: a temp left hard-linked after installation cannot mutate the admitted receipt" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // Windows installation moves the temp.
+    var root = TestRoot.init("cc-zig-teamwork-reservation-linked-temp");
+    defer root.deinit();
+    var pbuf: [512]u8 = undefined;
+    const path = ledgerPath(&pbuf, &root);
+    {
+        var stale = try Ledger.load(testing.allocator, path, 5);
+        defer stale.deinit(testing.allocator);
+        var ledger = try Ledger.load(testing.allocator, path, 5);
+        defer ledger.deinit(testing.allocator);
+        try ledger.reserve(seat("verifier-1"), .metacodes);
+        const original = (try readAll(testing.allocator, ledger.pending_path)).?;
+        defer testing.allocator.free(original);
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = try std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{ledger.pending_path});
+        // Recreate the two names a crash after link(), before unlink(), leaves.
+        try testing.expectEqual(pfs.InstallNoReplaceResult.linked, try pfs.installNoReplace(ledger.pending_path.ptr, tmp.ptr));
+        try testing.expectError(error.WriteFailed, stale.reserve(seat("reviewer-1"), .claude_code));
+        const preserved = (try readAll(testing.allocator, ledger.pending_path)).?;
+        defer testing.allocator.free(preserved);
+        try testing.expectEqualStrings(original, preserved);
+        try testing.expect(!pfs.exists(tmp.ptr));
+    }
+    var recovered = try Ledger.load(testing.allocator, path, 5);
+    defer recovered.deinit(testing.allocator);
+    try testing.expect(recovered.isExhausted());
+    try testing.expectEqual(@as(usize, 1), recovered.entries);
 }
 
 test "ledger: a durable charge settles its reservation without double billing after a crash" {
