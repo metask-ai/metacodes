@@ -30,7 +30,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-ALLOWED_ENTRIES = frozenset(("bin", "bin/metacodes", "bin/metacodes.exe", "vendor", "vendor/tinykg", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.exe", "vendor/tinykg/tinykg.provenance.json"))
+ALLOWED_ENTRIES = frozenset(("bin", "bin/metacodes", "bin/metacodes.exe", "bin/metacodes-fs-helper", "bin/metacodes-fs-helper.exe", "vendor", "vendor/tinykg", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.exe", "vendor/tinykg/tinykg.provenance.json"))
 RIPGREP_ENTRIES = frozenset(("share", "share/licenses", "share/licenses/ripgrep-LICENSE-MIT", "bin/rg", "bin/rg.exe"))
 # release:stage adds the unit's own licence, TinyKG's, the notices, the docs,
 # the TinyKG daemon, both Lean kernels with their sidecars and the licences of
@@ -96,8 +96,10 @@ def check(prefix: Path, ripgrep: bool = True, release: bool = False) -> list[str
             expected.add("manifest.json")
     if any(p.endswith(".exe") for p in actual if p.startswith("bin/")):
         expected.remove("bin/metacodes")
+        expected.remove("bin/metacodes-fs-helper")
     else:
         expected.remove("bin/metacodes.exe")
+        expected.remove("bin/metacodes-fs-helper.exe")
     if ripgrep:
         if "bin/rg.exe" in actual:
             expected.remove("bin/rg")

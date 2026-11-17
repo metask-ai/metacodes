@@ -207,6 +207,7 @@ def _component(manifest: dict, name: str) -> dict:
 # Everything the executables read from the environment to find a runtime asset
 # or a kernel; stripped so the bundle is judged on its own contents.
 NEUTRALIZED_ENV = (
+    "METACODES_SANDBOX_HELPER",
     "RG_BIN",
     "METACODES_KG_BIN",
     "METACODES_KGD_BIN",
@@ -386,6 +387,7 @@ def _fixture(root: Path) -> dict:
     commit = "0123456789abcdef0123456789abcdef01234567"
     contents = {
         "bin/metacodes": b"metacodes",
+        "bin/metacodes-fs-helper": b"sandbox-helper",
         "bin/rg": b"rg",
         "libexec/metacodes/metacodes-formal-kernel": b"formal",
         "libexec/metacodes/metacodes-formal-kernel.provenance.json": b"{}",

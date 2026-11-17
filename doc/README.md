@@ -48,6 +48,8 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
   admission, route-keyed provider cache, SSE keepalive, the load benchmark
   and the numbers that are the claim.
 - [Core reference](CORE_REFERENCE.md)
+- [Agent sandbox execution](SANDBOX_DESIGN.md) — native tool executors and
+  whole-process external workers; Linux bubblewrap/seccomp and macOS Seatbelt.
 - [Stall gate](STALL_GATE_DESIGN.md) — the in-run breaker for tool rounds that
   keep returning nothing new.
 - [Isolated verifier](ISOLATED_VERIFIER_DESIGN.md) — design only: an LLM

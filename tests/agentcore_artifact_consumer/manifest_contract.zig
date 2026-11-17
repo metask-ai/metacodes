@@ -170,7 +170,7 @@ pub fn validateManifestFiles(
     shared_library_path: []const u8,
     ripgrep_path: []const u8,
 ) Error!void {
-    var seen = [_]bool{false} ** (fixed_artifact_files.len + 3);
+    var seen = [_]bool{false} ** (fixed_artifact_files.len + 4);
     for (files) |file| {
         const index = artifactFileIndex(file.path, library_path, shared_library_path, ripgrep_path) orelse
             return error.UnexpectedFile;
@@ -242,8 +242,10 @@ fn artifactFileIndex(
     if (std.mem.eql(u8, path, library_path)) return 0;
     if (std.mem.eql(u8, path, shared_library_path)) return 1;
     if (std.mem.eql(u8, path, ripgrep_path)) return 2;
+    const helper = if (std.mem.endsWith(u8, ripgrep_path, ".exe")) "bin/metacodes-fs-helper.exe" else "bin/metacodes-fs-helper";
+    if (std.mem.eql(u8, path, helper)) return 3;
     const index = findFixed(&fixed_artifact_files, path) orelse return null;
-    return index + 3;
+    return index + 4;
 }
 
 fn findFixed(comptime expected: []const []const u8, actual: []const u8) ?usize {
@@ -269,13 +271,14 @@ const valid_runtime_assets = [_]RuntimeAsset{.{
     .role = "Glob/Grep execution dependency",
 }};
 
-fn makeValidFiles() [fixed_artifact_files.len + 3]FileEntry {
-    var files: [fixed_artifact_files.len + 3]FileEntry = undefined;
+fn makeValidFiles() [fixed_artifact_files.len + 4]FileEntry {
+    var files: [fixed_artifact_files.len + 4]FileEntry = undefined;
     files[0] = .{ .path = macos_library_path, .sha256 = hash };
     files[1] = .{ .path = macos_shared_path, .sha256 = hash };
     files[2] = .{ .path = posix_ripgrep_path, .sha256 = hash };
+    files[3] = .{ .path = "bin/metacodes-fs-helper", .sha256 = hash };
     for (fixed_artifact_files, 0..) |path, index|
-        files[index + 3] = .{ .path = path, .sha256 = hash };
+        files[index + 4] = .{ .path = path, .sha256 = hash };
     return files;
 }
 
@@ -487,6 +490,7 @@ test "manifest file set validates dynamic library name hashes and exact entries"
     windows_files[0].path = "lib/metask_agentcore.lib";
     windows_files[1].path = "lib/metask_agentcore.dll";
     windows_files[2].path = windows_ripgrep_path;
+    windows_files[3].path = "bin/metacodes-fs-helper.exe";
     try validateManifestFiles(&windows_files, windows_files[0].path, windows_files[1].path, windows_ripgrep_path);
     try std.testing.expectEqualStrings(hash, fileSha256(&valid_files, macos_library_path).?);
     try std.testing.expect(fileSha256(&valid_files, "lib/missing.lib") == null);

@@ -28,6 +28,7 @@ const client_mod = @import("../../client.zig");
 const json_mod = @import("../../json.zig");
 const permission_mod = @import("../../permission.zig");
 const sandbox_config = @import("../../sandbox/config.zig");
+const sandbox_exec = @import("../../sandbox/exec.zig");
 const writer_backend = @import("../../core/writer_backend.zig");
 const tool_context = @import("../../tools/context.zig");
 const usage_mod = @import("../../core/usage.zig");
@@ -100,6 +101,10 @@ pub const MetacodesDriver = struct {
         }
         if (abort.isAborted()) return .aborted;
         if (self.binding.ledger.isExhausted()) return .budget_exhausted;
+        if (!sandbox_exec.hostSupported()) {
+            log.warn("teamwork", "seat {s}: required sandbox is unavailable", .{self.binding.seat.slice()});
+            return .{ .failed = .spawn_failed };
+        }
 
         const seat_dir = common.seatDir(paths);
         var seat_sandbox = write_scope.seatSandbox(self.deps.host_sandbox);

@@ -166,6 +166,8 @@ pub const PERMISSION_DONT_ASK: u32 = 4;
 pub const PERMISSION_FULL_ACCESS: u32 = 5;
 
 pub const SHELL_DISABLED: u32 = 1;
+/// Eager platform probe: macOS Seatbelt / Linux bubblewrap + seccomp.
+/// An unavailable executor refuses Session creation; the ABI layout is unchanged.
 pub const SHELL_SANDBOXED: u32 = 2;
 pub const SHELL_UNRESTRICTED: u32 = 3;
 /// Session-stable execution evidence profile. Journal records are outside

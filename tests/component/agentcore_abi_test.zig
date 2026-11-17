@@ -4729,7 +4729,9 @@ test "L2 sandbox admission is eager while unrestricted skips the probe" {
     host_config.shell_policy_code = wire.SHELL_SANDBOXED;
     var sandboxed: ?*wire.SessionHandle = null;
     const status = api.session().create()(runtime, &config, &callbacks, &sandboxed, &diagnostic);
-    if (@import("builtin").os.tag == .macos) {
+    if (@import("builtin").os.tag == .macos or
+        (@import("builtin").os.tag == .linux and core.sandbox_exec.hostSupported()))
+    {
         try std.testing.expectEqual(wire.STATUS_OK, status);
         try std.testing.expect(sandboxed != null);
         try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(sandboxed, &diagnostic));

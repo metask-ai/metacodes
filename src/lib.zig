@@ -226,6 +226,8 @@ pub const mcp_tool_invocation = @import("mcp/tool_invocation.zig");
 pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
 pub const mcp_result_commit_test = @import("mcp/result_commit_test.zig");
 pub const sandbox_config = @import("sandbox/config.zig");
+/// Platform sandbox discovery used by embedded hosts at Session admission.
+pub const sandbox_exec = @import("sandbox/exec.zig");
 
 // ── 协议(core ↔ UI 契约;实现自定义前端只需这几个)────────────────────────
 pub const protocol = struct {

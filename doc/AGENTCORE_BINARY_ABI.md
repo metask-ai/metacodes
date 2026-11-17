@@ -1075,6 +1075,18 @@ shell tool selected under the disabled shell policy fail Session creation with
 `workspace_home` may be empty, in which case it defaults to the canonicalized
 `workspace_root`; a non-empty value must be absolute.
 
+`SHELL_SANDBOXED` eagerly verifies the platform executor at Session creation:
+Seatbelt on macOS, or bubblewrap with seccomp on Linux. An unavailable backend
+returns `METASK_AGENTCORE_STATUS_INVALID_ARGUMENT` without publishing a handle.
+The bundle also includes `bin/metacodes-fs-helper` (`.exe` on Windows), listed
+and hashed in `files`. Native file operations under an enabled sandbox use
+that helper; deploy it beside the Host executable or set the trusted Host
+environment variable `METACODES_SANDBOX_HELPER` to its absolute path. There is
+no PATH/project-config lookup and no unsandboxed file-operation fallback. The
+helper is an implementation dependency; its private fd-passing protocol adds
+no ABI table, struct field or negotiated capability. Windows currently cannot
+admit a sandboxed shell Session. See [sandbox execution](SANDBOX_DESIGN.md).
+
 ### Provider protocol selection
 
 `SessionHostConfigV1` defines one provider connection as

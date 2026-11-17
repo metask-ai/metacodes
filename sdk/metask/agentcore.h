@@ -80,6 +80,7 @@ extern "C" {
 #define METASK_AGENTCORE_PERMISSION_DONT_ASK 4u
 #define METASK_AGENTCORE_PERMISSION_FULL_ACCESS 5u
 #define METASK_AGENTCORE_SHELL_DISABLED 1u
+/* Eagerly require macOS Seatbelt or Linux bubblewrap + seccomp at Session create. */
 #define METASK_AGENTCORE_SHELL_SANDBOXED 2u
 #define METASK_AGENTCORE_SHELL_UNRESTRICTED 3u
 /* Run journal mode is Session-stable. Durable records never enter model
