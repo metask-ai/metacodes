@@ -232,6 +232,13 @@ pub const repl_headless = @import("repl/headless.zig");
 pub const repl_stream_json = @import("repl/stream_json_backend.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
+pub const teamwork_command = @import("teamwork/command.zig");
+pub const teamwork_runtime = @import("teamwork/runtime.zig");
+pub const teamwork_config = @import("teamwork/config.zig");
+pub const teamwork_types = @import("teamwork/types.zig");
+// Integration binds the MCP server here; all preparation and lifecycle
+// ownership remain in teamwork_command (stdin/stdout belong to the callback).
+pub const teamwork_mcp_host: ?teamwork_command.McpHost = null;
 pub const app_route_strings = @import("app/route_strings.zig");
 pub const app_mcp_startup = @import("app/mcp_startup.zig");
 pub const app_install = @import("app/install.zig");
@@ -826,7 +833,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(code);
     }
 
-    var config = parseArgs(init, allocator);
+    var teamwork_host_config: types.Config = .{};
+    const teamwork_request = try maybePrepareTeamwork(init, allocator, leading_state_dir.consumed, &teamwork_host_config);
+    var config = if (teamwork_request != null) teamwork_host_config else parseArgs(init, allocator);
 
     if (config.parse_error) |parse_err| {
         std.debug.print("error: {s} (use --help to list supported flags)\n", .{parse_err});
@@ -1258,6 +1267,16 @@ pub fn main(init: std.process.Init) !void {
         repl.stopSplash(splash);
         return err;
     };
+
+    if (teamwork_request) |request| {
+        const code = teamwork_command.executeWithMcp(allocator, app, request, teamwork_mcp_host) catch |err| {
+            std.debug.print("error: teamwork: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        // Return through App.deinit (providers, jobs and IO belong to it).
+        if (code != 0) return error.TeamworkRunFailed;
+        return;
+    }
 
     log.info("main", "metacodes starting; model={s}", .{config.model});
 
@@ -2116,6 +2135,44 @@ fn absolutePath(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
         return null;
     };
     return std.fs.path.join(allocator, &.{ cwd, path }) catch null;
+}
+
+fn maybePrepareTeamwork(init: std.process.Init, arena: std.mem.Allocator, leading: u8, host_config: *types.Config) !?teamwork_command.Prepared {
+    var args = argsIter(init);
+    defer args.deinit();
+    _ = args.next();
+    for (0..leading) |_| _ = args.next();
+    const name = args.next() orelse return null;
+    if (!std.mem.eql(u8, name, "teamwork")) return null;
+    const options = teamwork_command.parse(arena, &args) catch |err| {
+        std.debug.print("error: teamwork: {s}\n{s}", .{ @errorName(err), teamwork_command.help });
+        std.process.exit(2);
+    };
+    if (options.action == .help) {
+        dumpWrite(teamwork_command.help);
+        std.process.exit(0);
+    }
+    const state_root = hostStateRoot() catch std.process.exit(2);
+    if (options.action == .status) {
+        teamwork_command.status(arena, state_root, options.id.?) catch |err| {
+            std.debug.print("error: teamwork status: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        std.process.exit(0);
+    }
+    const cwd = try @import("util/fs.zig").getCwd(arena);
+    const prepared = teamwork_command.prepare(arena, options, state_root, cwd) catch |err| {
+        std.debug.print("error: teamwork: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+    if (options.action == .mcp and teamwork_mcp_host == null) {
+        std.debug.print("error: teamwork: McpHostUnavailable\n", .{});
+        std.process.exit(2);
+    }
+    const workspace_z = try arena.dupeZ(u8, prepared.workspace);
+    if (@import("platform").fs.chdir(workspace_z) != 0) return error.WorkingDirectoryUnavailable;
+    host_config.* = options.host_config;
+    return prepared;
 }
 
 fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, leading: u8) !?u8 {
@@ -4139,6 +4196,9 @@ fn printHelp() void {
     dumpWrite(
         \\metacodes — embeddable agent core and coding CLI
         \\Usage: metacodes [options]
+        \\  teamwork run --request-file <file> --approve --budget-usd <cap> [options]
+        \\  teamwork status <id> [--json] | teamwork resume <id> --approve
+        \\                        Approved SWE loop with required sandbox; teamwork --help for options
         \\  --version             Print version and build identity and exit (--json: one JSON document)
         \\  doctor [--json | --plain] [--strict]
         \\                        Report where ripgrep and TinyKG resolve from and whether they match this build

@@ -6,6 +6,7 @@
 //! changing any test body or assertion.
 
 test {
+    _ = @import("component/teamwork_command_test.zig");
     _ = @import("integration/http_stream_e2e_test.zig");
     _ = @import("integration/tool_abort_test.zig");
     _ = @import("integration/mcp_e2e_test.zig");

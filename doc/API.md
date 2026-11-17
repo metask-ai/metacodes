@@ -196,6 +196,52 @@ promise: the HTTP endpoint shapes remain pre-1.0.
 
 ## CLI surface
 
+`metacodes [--state-dir <dir>] teamwork run --request-file <file> --approve
+--budget-usd <cap>` runs the approved SWE loop synchronously: implementer,
+reviewer, isolated completion verifier, then merge-back into the user's
+workspace without committing. `--approve` authorizes the request bytes,
+configured harnesses and pinned check, spend up to the positive dollar cap,
+and merge-back. No App/provider, seat or worktree starts before approval.
+The state root must be outside the repository. All workers, pinned checks
+and verifier tools require Sandbox Foundations; an unavailable backend fails
+closed. Native and Claude Code implementer/reviewer seats are supported.
+
+Configuration precedence is `<state root>/config.json`'s `teamwork` object,
+repository-root `.metacodes/teamwork.json` (a bare teamwork object), then
+`--config-json <object>` / `--budget-usd` / `--max-rounds` /
+`--check-command`. CLI overrides are applied left to right. `--id <id>`
+selects a path-safe run id; otherwise one is generated and printed to stderr.
+Provider options are `--provider`, `--model`, `--base-url`, `--api-key`, and
+`--verbose`. This CLI uses the deterministic manager and an already-written
+request; configured model/effort or external harnesses for manager/interviewer
+are rejected. The verifier must be native; explicit verifier effort and tier
+aliases are rejected until wired. No REPL interviewer is implied.
+
+`metacodes [--state-dir <dir>] teamwork status <id> [--json]` prints JSON
+containing saved state/detail, repository, dispatch counts, audit results,
+merge-conflict count, seats and budget totals. It reads only run files: no
+global provider configuration, credentials, startup, state rewrite or ledger
+repair. A missing budget ledger means no charges yet. A torn budget tail is
+reported and excluded from totals; `budget.pending` shows an outstanding
+pre-call reservation without consuming, settling or deleting it. Reads during
+execution are observations of individually atomic files, not one transaction.
+`teamwork resume <id> --approve` resumes the approved request and saved
+`approved-config.json`; no budget, check, seat or model override is accepted.
+Inherited native seat models are pinned before the first dispatch. Provider
+credentials/endpoint can be supplied again. Resume also accepts the originally
+saved repository when invoked elsewhere. An OS lifetime lock permits one
+driver per run. Ctrl-C forwards cancellation to the run. Exit codes are 0 for
+done/status/help, 1 for runtime failure and 2 for invalid input/refusal.
+
+`teamwork mcp --request-file <file> --approve --budget-usd <cap>` reserves
+the same approved-start lifecycle for a manager server. The CLI host exposes
+`teamwork_command.Host.create(arena, app, cfg)` / `Host.deps()` and
+`executeWithMcp(arena, app, prepared, ?McpHost)`. The `McpHost.serveFn(gpa,
+run)` callback owns stdin/stdout until return; it receives a live approved
+`runtime.Run` instead of running the deterministic loop. Without a bound
+callback the command refuses before App startup. See
+[TEAMWORK_DESIGN.md](TEAMWORK_DESIGN.md) for the runtime contracts.
+
 `metacodes --help` enumerates the current flag set and is the authoritative
 pre-1.0 surface; `metacodes --version` prints `metacodes <semver>` as its first
 line, then the build identity (commit and dirty state, Zig, target and
