@@ -787,7 +787,6 @@ test "request addresses are refused whatever names them" {
     try testing.expect(allowlist.accepts(provider_variable));
     try testing.expect(allowlist.accepts(model_variable));
     try testing.expect(allowlist.accepts(preset_variable));
-    try testing.expect(!allowlist.accepts("METACODES_PRESET"));
 }
 
 const TestRoot = struct {
@@ -837,13 +836,14 @@ test "load: accepted names, ignored names without their values, and the choice" 
     try testing.expectEqualStrings("cat", loaded.get("CATALOG_TOKEN").?);
     try testing.expect(loaded.get("METACODES_BASE_URL") == null);
     try testing.expect(loaded.get("FOO") == null);
-    try testing.expectEqual(@as(usize, 4), loaded.ignored.len);
+    // A preset of config.json by name is read (#489).
+    try testing.expectEqualStrings("fast", loaded.get(preset_variable).?);
+    try testing.expectEqual(@as(usize, 3), loaded.ignored.len);
     try testing.expectEqualStrings("METACODES_BASE_URL", loaded.ignored[0].name);
     try testing.expectEqual(Ignored.Reason.request_address, loaded.ignored[0].reason);
     try testing.expectEqual(Ignored.Reason.request_address, loaded.ignored[1].reason);
     try testing.expectEqualStrings("FOO", loaded.ignored[2].name);
     try testing.expectEqual(Ignored.Reason.unknown, loaded.ignored[2].reason);
-    try testing.expectEqualStrings("METACODES_PRESET", loaded.ignored[3].name);
     try testing.expectEqualSlices(u32, &.{7}, loaded.malformed);
 
     const summary = (try loaded.ignoredSummary(testing.allocator)).?;
