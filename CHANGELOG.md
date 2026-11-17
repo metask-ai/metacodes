@@ -518,6 +518,16 @@ status, compatibility boundaries, and entry points are defined by
   reads only its own pool, and a route that names an account uses that
   account or fails with `MissingCredentials`.
 
+- **A `/model` switch that cannot be applied leaves the session's route
+  where it was.** The kernel recorded the new route before the session bound
+  it and kept it when binding failed (no credential, for instance), and the
+  process's OAuth session had already moved to the new provider. The next
+  turn's token refresh read both: once that provider's token endpoint
+  answered, its token went into the clients still pointed at the previous
+  route's endpoint. A failed bind now puts back the kernel's selection
+  (journalled as a failed switch, `binding_failed`) and the previous OAuth
+  session; a resumed session's stored route is restored the same way.
+
 ### Security
 
 - **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**

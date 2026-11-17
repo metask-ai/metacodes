@@ -621,7 +621,10 @@ Scope is explicit: `once` applies to the next turn and expires, `session`
 affects one session, `global` is durable after an explicit action. Each turn
 snapshots the committed selection at its start, so a mid-stream commit affects
 only the next turn. Mutations carry expected revisions; a stale write is a
-structured conflict, never last-writer-wins.
+structured conflict, never last-writer-wins. A commit the host cannot bind (no
+credential for the route, say) is reverted: its scope holds what it held
+before (`Kernel.revertCommit`), the journal records `runtime.switch_failed`
+with `binding_failed`, and the session stays on the route it was on.
 
 Event payloads are ids and enums only. There is deliberately no free-form string
 field a prompt, token, or provider body could travel in. An evicted cursor is

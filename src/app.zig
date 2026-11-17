@@ -2963,7 +2963,7 @@ pub const App = struct {
         }, candidate, commit.scope);
         switch (outcome) {
             .committed => |accepted| {
-                try app.bindCommittedSelection(host, accepted.selection);
+                try app.bindOrRevert(host, accepted);
                 app.applyCommittedReasoning(accepted.selection);
                 if (accepted.requires_persist) try app.persistGlobalSelection(host, accepted.selection);
                 // A session-scoped choice is durable *for this session*: it has
@@ -2980,6 +2980,45 @@ pub const App = struct {
             .rejected, .conflict => {},
         }
         return outcome;
+    }
+
+    /// Move the session onto a selection the kernel just committed, or undo
+    /// the commit. When the binding fails the session stays on its route, so
+    /// the kernel's selection goes back to it, and so does the process's
+    /// OAuth session, which `oauthAccessToken` may already have moved to the
+    /// committed provider. Left on the commit, the next turn's token refresh
+    /// (`refreshRouteCredential`), which reads both, would install that
+    /// provider's token in the clients still pointed at the previous route.
+    fn bindOrRevert(
+        app: *App,
+        host: *provider_host_mod.Host,
+        accepted: provider_control_plane.CommitOutcome.Committed,
+    ) !void {
+        const oauth_provider = app.oauth_session_provider;
+        app.bindCommittedSelection(host, accepted.selection) catch |err| {
+            host.kernel.revertCommit(accepted);
+            app.restoreOAuthSession(oauth_provider);
+            return err;
+        };
+    }
+
+    /// Make `owner`'s stored login the process's OAuth session again, or
+    /// none when null, if another provider's has taken its place.
+    fn restoreOAuthSession(app: *App, owner: ?provider_ids_mod.Slug) void {
+        if (app.oauth_session_provider) |current| {
+            if (owner) |wanted| if (current.eql(wanted)) return;
+        } else if (owner == null) return;
+        if (app.oauth_session) |*session| session.deinit();
+        app.oauth_session = null;
+        app.oauth_session_provider = null;
+        const id = owner orelse return;
+        var session = provider_oauth_mod.Session.initHome(app.allocator, app.stateRoot(), id) catch return;
+        if (!(session.load() catch false)) {
+            session.deinit();
+            return;
+        }
+        app.oauth_session = session;
+        app.oauth_session_provider = id;
     }
 
     /// A reasoning level chosen with the route (the picker's options step) is
@@ -3029,7 +3068,7 @@ pub const App = struct {
         const outcome = host.kernel.selectionCommit(.{}, selection, .session);
         switch (outcome) {
             .committed => |accepted| {
-                try app.bindCommittedSelection(host, accepted.selection);
+                try app.bindOrRevert(host, accepted);
                 return true;
             },
             // A stored session route that no longer resolves is reported by the

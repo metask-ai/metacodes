@@ -14,6 +14,10 @@
 //!     another provider's member whenever its profile accepted the kind, and
 //!     a route that names an account fell back to another one when that
 //!     account's variable was unset.
+//!   * A `/model` switch that could not bind left the kernel's selection and
+//!     the process's OAuth session on the new provider, and the next turn's
+//!     token refresh installed that provider's token on the route the
+//!     clients were still on.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -416,4 +420,68 @@ test "L2 credential scope: a provider's pool holds only that provider's members"
     try std.testing.expect(pool[0].provider_id.eqlText("relay-b"));
     try std.testing.expectEqualStrings(POOL_PERSONAL_KEY, pool[0].secret);
     try std.testing.expectEqual(@as(usize, 0), App.credentialPoolFrom(&document, Slug.lit("deepseek"), &buffer, cc.provider_credential.EnvLookup.empty()).len);
+}
+
+// ── a switch that cannot bind ────────────────────────────────────────────────
+
+test "L2 credential scope: a switch that cannot bind leaves the kernel and the OAuth session where the session is" {
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer gateway.stop();
+    // The provider's token endpoint is down at the switch and back by the
+    // next turn.
+    const token_json = "{\"access_token\":\"" ++ OAUTH_ACCESS_2 ++ "\",\"refresh_token\":\"fake-oauth-refresh-2\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
+    var token = try harness.MockServer.startHttpCassette(
+        &.{ "{\"error\":\"temporarily_unavailable\"}", token_json },
+        &.{ "HTTP/1.1 503 Service Unavailable", "HTTP/1.1 200 OK" },
+    );
+    defer token.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const token_url = try std.fmt.allocPrint(setup.allocator(), "{s}/token", .{try originOf(setup.allocator(), token)});
+    const config_json = try std.fmt.allocPrint(setup.allocator(), "{{\"custom_providers\": {{{s}}}}}", .{try oauthDefinition(setup.allocator(), UNREACHABLE_ORIGIN, token_url)});
+    var case: Case = undefined;
+    try case.init(config_json);
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+    try case.setEnv("METACODES_NO_PROBE", "1");
+    // A login whose access token has expired: the switch has to refresh it.
+    const now = cc.util_time.nowUnix();
+    try case.storeOAuthLogin("house-oauth", .{
+        .access_token = OAUTH_ACCESS_1,
+        .refresh_token = "fake-oauth-refresh-1",
+        .expires_in_seconds = 10,
+    }, now - 3600);
+
+    const gateway_url = try allocator.dupeZ(u8, try gateway.urlOwned(allocator));
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", gateway_url.ptr, "--model", "claude-sonnet-4-6" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+    const host = try app.providerHost();
+    const before = host.kernel.currentOfferId();
+
+    // The refresh fails, the provider has no other credential: refused.
+    const outcome = cc.repl_picker_host.useSelector(app, "oauth-model");
+    // The next turn boundary, the token endpoint answering again.
+    const replaced = try app.refreshRouteCredential();
+    try sendOneTurn(app);
+
+    try expectNeverSent(gateway, OAUTH_ACCESS_2);
+    try expectNeverSent(gateway, OAUTH_ACCESS_1);
+    try std.testing.expect(outcome == .failed);
+    try std.testing.expectEqualStrings("MissingCredentials", outcome.failed);
+    try std.testing.expect(!replaced);
+    // The refresh at the switch was the only exchange.
+    try std.testing.expectEqual(@as(usize, 1), token.requestCount());
+    try std.testing.expect(sentBearer(gateway, gateway.requestCount() - 1, SESSION_KEY));
+    // The kernel names the route the session is on, and the process keeps
+    // the OAuth session it had (none, on this route).
+    const after = host.kernel.currentOfferId();
+    try std.testing.expectEqual(before == null, after == null);
+    if (before) |id| try std.testing.expect(id.eql(after.?));
+    try std.testing.expect(app.oauth_session_provider == null);
+    try std.testing.expect(app.oauth_session == null);
 }
