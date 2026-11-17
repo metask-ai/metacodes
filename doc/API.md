@@ -1519,3 +1519,24 @@ documented paired release API: AgentCore-owned byte buffers are released with
 registered release function. Hosts must not retain sink pointers, call mutating
 session APIs reentrantly, or destroy a runtime with active sessions. The normative
 ownership rules live beside each public header/type and its consumer fixture.
+
+## Teamwork Manager MCP (#522)
+
+The normative Manager protocol is [TEAMWORK_MCP.md](TEAMWORK_MCP.md).
+`teamwork/mcp_server.zig` exposes `Server.init(gpa, run: *runtime.Run) Server`,
+`handle(self, gpa, line) error{OutOfMemory}!?[]u8`, `serve(self) !void` on
+stdin/stdout, and `serveFds(self, input: platform.fs.Fd, output: platform.fs.Fd)
+!void`. The host starts an already-user-approved run and retains ownership.
+`handle` responses are owned by its allocator; the caller frees them. Serving
+uses bounded NDJSON with protocol-only stdout and cancels live runs on EOF.
+
+The tools are `teamwork_status`, synchronous `teamwork_dispatch` (only
+implementer/reviewer and optional instructions), `teamwork_request_completion`
+and `teamwork_cancel`. No tool starts or approves a run, replaces the approved
+request, changes configuration/budget/check command, or chooses a workspace.
+The runtime alone verifies review approval, independently audits and merges;
+an unavailable audit cannot complete. Results contain real runtime snapshots
+in text and structured content. See the normative document for lifecycle,
+error codes, ownership, limits and cancellation semantics, and the
+[Claude Code consumer fixture](../examples/teamwork/claude-code-mcp.json) for
+host CLI integration.
