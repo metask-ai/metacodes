@@ -11,6 +11,13 @@ The unit is complete on every release target (manifest `schema_version` 2,
 doc/INSTALL_DESIGN.md): the TUI, the full TinyKG (CLI and daemon) and both Lean
 governance kernels, with nothing to install beside it.
 
+Documents and licences are declared in `release/documents.json`. The full
+release and `zig build release:docs` share these exact copy steps.
+`zig build release:docs:check --prefix <empty-directory>` checks their source
+and installed bytes, versioned changelog name, exact document inventory and
+generated notices without compiling an application, library or Lean kernel.
+This documents-only prefix is a CI fixture, not a runnable release unit.
+
 ```
 metacodes-<version>-<target-id>/
 ├── bin/

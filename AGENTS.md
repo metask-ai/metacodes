@@ -86,7 +86,9 @@ whose complete CI coverage passed: it takes the CI fast path
 (`doc/RELEASE_AUTOMATION_DESIGN.md` §3). A change confined to documentation,
 or to documentation and the evaluation harness, skips the CI suites it cannot
 affect (`scripts/ci_scope.py`), and merge-queue groups run the same jobs
-(`doc/CI_DESIGN.md`). Run the full suite with
+(`doc/CI_DESIGN.md`). Document deletions/moves use link and protocol-reference
+checks; release-document changes use `release:docs:check`, which shares the
+release copy steps without compiling the product. Run the full suite with
 `-Doptimize=ReleaseSafe` as well when a change touches unsafe code or an ABI.
 
 The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`).
