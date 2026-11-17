@@ -559,6 +559,39 @@ fn printLocalConfigHint(local: *const state_env_mod.Loaded, unchosen: []const []
     std.debug.print(") and names none: add {s}=<id> to choose one.\n", .{state_env_mod.provider_variable});
 }
 
+/// The notices said once under the banner, one per line; null when none
+/// is set. In `arena` (a notice alone is returned as it is).
+fn joinNotices(arena: std.mem.Allocator, notices: []const ?[]const u8) ?[]const u8 {
+    var first: ?[]const u8 = null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var count: usize = 0;
+    for (notices) |maybe| {
+        const notice = maybe orelse continue;
+        if (count == 0) first = notice;
+        if (count > 0) out.writer.writeByte('\n') catch return first;
+        out.writer.writeAll(notice) catch return first;
+        count += 1;
+    }
+    return if (count <= 1) first else out.written();
+}
+
+/// What the TUI says once under its banner when `.env` holds keys of
+/// several providers and names none (#486): which ones, by display name, and
+/// that `/model` chooses (`route_state.writeUnchosenLocalNotice`). In `arena`.
+fn unchosenLocalNotice(arena: std.mem.Allocator, ids: []const []const u8) ?[]const u8 {
+    if (ids.len == 0) return null;
+    const names = arena.alloc([]const u8, ids.len) catch return null;
+    const host = buildProviderHost(arena);
+    defer if (host) |built| built.destroy();
+    for (ids, names) |id, *name| {
+        const profile = if (host) |built| built.registry.find(id) else null;
+        name.* = if (profile) |found| (arena.dupe(u8, found.display_name) catch id) else id;
+    }
+    var out: std.Io.Writer.Allocating = .init(arena);
+    route_state_mod.writeUnchosenLocalNotice(&out.writer, names) catch return null;
+    return out.written();
+}
+
 /// ` (template: <dir>/.env.example)` when that file exists, else "".
 fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
     const dir = std.fs.path.dirname(env_path) orelse return "";
@@ -1492,10 +1525,19 @@ pub fn main(init: std.process.Init) !void {
         const name = providerDisplayName(allocator, chosen.name);
         break :shadowed std.fmt.allocPrint(allocator, ".env configures {s}; the default is Metask. To use {s}: /model, or /logout", .{ name, name }) catch null;
     };
-    const startup_notice: ?[]const u8 = if (skipped_default_notice != null and shadowed_local_notice != null)
-        std.fmt.allocPrint(allocator, "{s}\n{s}", .{ skipped_default_notice.?, shadowed_local_notice.? }) catch skipped_default_notice
-    else
-        skipped_default_notice orelse shadowed_local_notice;
+    // `.env` holds keys of several providers and names none, and nothing
+    // above it decided (#486): the TUI opens without a model, as with nothing
+    // set up, and says once which providers and that `/model` chooses. `-p`
+    // and the rest stopped above, naming them (`printLocalConfigHint`).
+    const unchosen_local_notice: ?[]const u8 = unchosen: {
+        const reason = unbound orelse break :unchosen null;
+        if (!interactive_tui or reason != .nothing_configured) break :unchosen null;
+        break :unchosen switch (local_choice) {
+            .several => |ids| unchosenLocalNotice(allocator, ids),
+            else => null,
+        };
+    };
+    const startup_notice: ?[]const u8 = joinNotices(allocator, &.{ skipped_default_notice, shadowed_local_notice, unchosen_local_notice });
 
     // The session runs on the general-purpose allocator, never on the process
     // arena `allocator` above: an arena frees nothing, and a session allocates

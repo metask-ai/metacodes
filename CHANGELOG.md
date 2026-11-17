@@ -45,6 +45,18 @@ status, compatibility boundaries, and entry points are defined by
   invocation record, so the selected Skill sees them, and the date, from its
   first request (`doc/AGENTCORE_BINARY_ABI.md`).
 
+- **One `.env` with keys of several providers opens the terminal UI and says
+  where to choose** (#486). A `<state root>/.env` holding keys of several
+  providers and no `METACODES_PROVIDER` still chooses none, but the terminal
+  UI no longer leaves it at "add `METACODES_PROVIDER=<id>`, then restart": it
+  opens without a model and says once under its banner `.env has keys for
+  DeepSeek and OpenAI. Choose one with /model; Tab there applies it to every
+  future session.`, and the red note of a message sent before then points to
+  `/model (DeepSeek, OpenAI)`. A pick for every future session is the stored
+  default later starts use (its key still read from the file); a default
+  stored before ranks above the file, as it did. `-p`, `serve` and `--web`
+  are unchanged: they stop and list the providers by id.
+
 - **The Metask sign-in moves to `www.metask-ai.com` and is kept as the Metask
   session** (#527). `/login` and `metacodes login` sign in at Metask's OAuth
   server as the public client `metacodes`, ask for `read model:invoke`, and

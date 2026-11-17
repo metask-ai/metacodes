@@ -949,3 +949,98 @@ test "state .env: a session that started without a key lists Metask as not confi
     try testing.expect(std.mem.indexOf(u8, text, "metask not signed in") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Sign in: /login") != null);
 }
+
+test "state .env: keys of two providers and no name leave the TUI without a model; a /model pick for every future session is the next start's (#486)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena();
+    var env: InProcessEnv = .{};
+    try env.init((try a.dupeZ(u8, case.home)).ptr);
+    defer env.deinit();
+    var deepseek_env = try EnvGuard.set("DEEPSEEK_API_KEY", null);
+    defer deepseek_env.restore();
+
+    // The relay `config.json` defines and DeepSeek: a key for each in the
+    // file, and no METACODES_PROVIDER. The relay's endpoint is a MockServer,
+    // so the pick can be followed to a request without reaching a vendor.
+    var relay = try harness.MockServer.start(OPENAI_SSE, 0);
+    defer relay.stop();
+    var decoy = try harness.MockServer.start(OPENAI_SSE, 0);
+    defer decoy.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay), ""));
+    try case.write("state/.env", "HOUSE_RELAY_TOKEN=sk-relay-two\nDEEPSEEK_API_KEY=sk-deepseek-two\n");
+    var layer = try cc.app_state_env.load(testing.allocator, case.state, .{
+        .keys = &.{
+            .{ .name = "HOUSE_RELAY_TOKEN", .provider = "house-relay" },
+            .{ .name = "DEEPSEEK_API_KEY", .provider = "deepseek" },
+        },
+    });
+    defer layer.deinit();
+    const ids = switch (layer.choice()) {
+        .several => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(usize, 2), ids.len);
+
+    // `-p` still stops, naming both, and sends nothing.
+    const stopped = try case.run(&.{try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}", .{try originOf(a, decoy)})}, &.{ "-p", "hi" });
+    try testing.expect(stopped.exit_code != 0);
+    try expectContains(stopped.stderr, "holds keys for several providers (deepseek, house-relay) and names none");
+    try testing.expectEqual(@as(usize, 0), relay.requestCount() + decoy.requestCount());
+
+    // The TUI's start (`main`): no model, the file's layer behind the
+    // environment, and the providers it names none of.
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    var config = cc.parseArgsForTest(&.{ "metacodes", "--base-url", "http://127.0.0.1:9/v1/messages", "--model", "claude-sonnet-4-6" }, a);
+    try testing.expect(config.parse_error == null);
+    config.state_root = case.state;
+    config.credential_env_fallback = layer.lookup();
+    const app = try App.initWithOptions(testing.allocator, io_runtime.io(), config, "", .{
+        .route_state = .{ .unbound = .nothing_configured },
+        .unchosen_local_providers = ids,
+    });
+    defer app.deinit();
+    try testing.expect(app.unbound() != null);
+    var reminder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer reminder.deinit();
+    try app.writeUnboundReminder(&reminder.writer);
+    // By the names /model lists, and no edit-and-restart for keys already there.
+    try expectContains(reminder.written(), "  Or use a key in .env:         /model (DeepSeek, House relay)\n");
+    try expectAbsent(reminder.written(), "METACODES_PROVIDER");
+    try expectAbsent(reminder.written(), "sk-relay-two");
+    try expectAbsent(reminder.written(), "sk-deepseek-two");
+
+    // /model lists both as ready; Tab makes the pick every future session's.
+    var ui: cc.tui_ui_state.UiState = .{};
+    cc.repl_picker_host.open(app, &ui, .unguarded);
+    try testing.expect((try cursorOnProvider(app, &ui, "deepseek")).ready);
+    cc.repl_picker_host.close(app, &ui, .unguarded);
+    cc.repl_picker_host.open(app, &ui, .unguarded);
+    try testing.expect((try cursorOnProvider(app, &ui, "house-relay")).ready);
+    _ = cc.repl_picker_host.onKey(app, &ui, .cycle_scope, .unguarded);
+    try testing.expectEqual(cc.repl_model_picker.Scope.global, app.model_picker.scope);
+    var result: cc.repl_picker_host.Result = .ignored;
+    for (0..5) |_| {
+        result = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
+        if (result == .committed) break;
+    }
+    try testing.expectEqual(cc.repl_picker_host.Result.committed, result);
+    // Bound, with the file's key, and billed as from `.env`.
+    try testing.expect(app.unbound() == null);
+    try testing.expectEqual(cc.app_module.route_state_mod.CredentialOrigin.local_config, app.route_state.bound);
+    try testing.expectEqualStrings("sk-relay-two", app.api_key);
+    const stored = try case.tmp.dir.readFileAlloc(testing.io, "state/config.json", a, .limited(1 << 20));
+    try expectContains(stored, "\"global_selection\"");
+    // The definition the file named is still there.
+    try expectContains(stored, "\"house-relay\"");
+
+    // The next start: the stored default (level 2) decides before the file
+    // is asked to, and its key is still the file's.
+    const next = try case.run(&.{try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}", .{try originOf(a, decoy)})}, &.{ "-p", "hi" });
+    _ = try expectOneRequest(next, relay, "/relay/v1/chat/completions", "sk-relay-two");
+    try testing.expectEqual(@as(usize, 0), decoy.requestCount());
+    try expectAbsent(next.stderr, "holds keys for several providers");
+}

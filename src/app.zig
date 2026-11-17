@@ -428,8 +428,10 @@ pub const App = struct {
     /// The provider `<state root>/.env` configures, which `/logout` falls
     /// back to (#485). Borrowed from the host; null when it configures none.
     local_provider: ?LocalProvider = null,
-    /// Said once under the banner (#485: a stored default passed over for
-    /// want of a credential). Borrowed from the host.
+    /// Said once under the banner, one notice per line: a stored default
+    /// passed over for want of a credential (#485), `.env`'s provider ranked
+    /// below Metask, `.env` keys of several providers and none chosen (#486).
+    /// Borrowed from the host.
     startup_notice: ?[]const u8 = null,
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
@@ -1340,9 +1342,18 @@ pub const App = struct {
             .template = template,
             .guide_url = state_env.guide_url,
             .environment_keys = keys,
-            .unchosen_local = app.unchosen_local_providers,
-            .provider_variable = state_env.provider_variable,
+            .unchosen_local = if (host) |found| try displayNames(arena, found, app.unchosen_local_providers) else app.unchosen_local_providers,
         });
+    }
+
+    /// `ids` as `/model` lists them: each provider's display name, the id
+    /// itself for one the registry does not know. In `arena`.
+    fn displayNames(arena: std.mem.Allocator, host: *provider_host_mod.Host, ids: []const []const u8) ![]const []const u8 {
+        const names = try arena.alloc([]const u8, ids.len);
+        for (ids, names) |id, *name| {
+            name.* = if (host.registry.find(id)) |profile| profile.display_name else id;
+        }
+        return names;
     }
 
     /// The provider `id` as the reminder names it: its display name, the
