@@ -182,8 +182,7 @@ class Git:
         paths = self.changes()
         if not paths:
             raise LoopError("worker made no changes")
-        if any(p.startswith((".github/", "tools/pr_loop/")) or p == "tools/__init__.py"
-               or p.endswith("AGENTS.md") for p in paths):
+        if any(p.startswith(".github/") or p.endswith("AGENTS.md") for p in paths):
             raise LoopError("worker changed controller, workflow or agent policy; a human decision is required")
 
     def merge_base(self, base):

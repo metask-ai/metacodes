@@ -1,4 +1,4 @@
-"""Typed boundaries shared by the controller and its process adapters."""
+"""Typed boundaries for the contributor PR controller and process adapters."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass

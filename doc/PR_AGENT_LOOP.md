@@ -1,6 +1,6 @@
 # PR review and repair loop
 
-`python3 -m tools.pr_loop` is an opt-in delivery controller for PRs submitted
+`python3 .github/pr-loop.py` is an opt-in delivery controller for PRs submitted
 to **metask-ai/metacodes**. It registers a PR with its original Codex thread
 and worktree, independently reviews each revision, returns actionable feedback
 to that thread, validates and pushes repairs, and requests admission to the
@@ -13,6 +13,13 @@ contributor's Mac; local builds, tests and gates run on devbox through `dx`.
 The existing GitHub-hosted CI and `Protect main` rules remain the final merge
 authority. See [CI design](CI_DESIGN.md) for the four required result checks
 and the existing `merge_group` wiring.
+
+The launcher and controller package live in [`.github/`](../.github/pr-loop.py).
+Start the watcher as part of the contributor's initial development setup;
+[CONTRIBUTING](../CONTRIBUTING.md#initial-development-setup) includes the setup
+and per-PR registration checklist. Run it on your computer throughout the PR
+lifecycle and restart it after closing its terminal or restarting the computer.
+Placing the script in `.github/` does not make it a hosted Actions workflow.
 
 ## Prerequisites
 
@@ -46,7 +53,7 @@ From the checkout containing this tooling, create a PR **in the mother
 repository** and bind it in one command. Supply your own branch and thread ID:
 
 ```sh
-python3 -m tools.pr_loop submit \
+python3 .github/pr-loop.py submit \
   --repo metask-ai/metacodes \
   --worktree "$TASK_WORKTREE" \
   --thread "$TASK_THREAD_ID" \
@@ -63,7 +70,7 @@ Thread IDs and local paths are stored locally, not in the public PR.
 For a PR created with another tool, register it explicitly:
 
 ```sh
-python3 -m tools.pr_loop bind \
+python3 .github/pr-loop.py bind \
   --repo metask-ai/metacodes --pr "$PR_NUMBER" \
   --worktree "$TASK_WORKTREE" --thread "$TASK_THREAD_ID"
 ```
@@ -76,22 +83,23 @@ to the local host.
 Start the watcher on the Mac, from the tooling checkout:
 
 ```sh
-python3 -m tools.pr_loop run
+python3 .github/pr-loop.py run
 ```
 
 Keep it in a persistent terminal or your service supervisor. The watcher polls
 registered PRs every sixty seconds, so PR creation and subsequent pushes
 trigger work without a public webhook receiver or provider secrets in CI.
 Use `run --once` for one reconciliation pass, or `run --interval 30` to change
-the polling period. A second watcher using the same state database is refused.
+the polling period. Keep one watcher per state database; overlapping
+reconciliation passes are refused by its process lock.
 New PR registration remains available while another PR is being processed.
 Answer commands should be run between reconciliation passes.
 
 ## Decisions and recovery
 
 ```sh
-python3 -m tools.pr_loop status
-python3 -m tools.pr_loop answer --pr "$PR_NUMBER" \
+python3 .github/pr-loop.py status
+python3 .github/pr-loop.py answer --pr "$PR_NUMBER" \
   --text "Keep compatibility with the existing response; add an optional field."
 ```
 
@@ -106,7 +114,7 @@ Budget consumption persists across commits and restarts. Extending it requires
 an explicit answer, for example:
 
 ```sh
-python3 -m tools.pr_loop answer --pr "$PR_NUMBER" \
+python3 .github/pr-loop.py answer --pr "$PR_NUMBER" \
   --text "Continue the same task for two more repair attempts." \
   --extra-rounds 2 --extra-agent-runs 4
 ```
@@ -130,12 +138,12 @@ answering; an answer does not automatically reconcile a divergent checkout.
    validation, and immediately before enqueueing.
 3. The bound worker thread is resumed by ID, never by `--last`. It must be
    handed over idle and must not be driven concurrently by another host.
-   It edits the
-   original checkout. The controller owns validation, commit, ordinary push
+   It edits the original checkout. The controller owns validation, commit, ordinary push
    and merge-queue admission. Policy, workflow and controller edits require
    a decision. The worker's network is disabled; the controller executes the
-   devbox gate and returns failures as feedback. Writable tool access is limited by Codex's workspace sandbox;
-   approval and user-input requests are escalated rather than fabricated.
+   devbox gate and returns failures as feedback. Writable tool access is
+   limited by Codex's workspace sandbox; approval and user-input requests
+   are escalated rather than fabricated.
 4. The four existing gate result checks must report **success** for the current
    PR head, from the GitHub Actions app (PR workflows execute the test merge,
    but their check runs are attached to the head SHA). Missing, pending,

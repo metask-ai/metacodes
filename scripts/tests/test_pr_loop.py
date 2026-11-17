@@ -10,9 +10,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools.pr_loop.adapters import Codex, Git, GitHub, run
-from tools.pr_loop.controller import Controller, Store
-from tools.pr_loop.model import Binding, Busy, DEFAULT_REPO, LoopError, REQUIRED_CHECKS, State, validate_report
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / ".github"))
+
+from pr_loop.adapters import Codex, Git, GitHub, run
+from pr_loop.controller import Controller, Store
+from pr_loop.model import Binding, Busy, DEFAULT_REPO, LoopError, REQUIRED_CHECKS, State, validate_report
 
 
 PASS = {"verdict": "pass", "summary": "No blocking findings", "findings": [], "question": ""}
@@ -345,7 +348,7 @@ class LoopIntegrationTest(unittest.TestCase):
         self.store.bind(self.binding)  # repeated registration is idempotent
 
     def test_submit_creates_upstream_pr_and_persists_explicit_worker_and_limits(self):
-        from tools.pr_loop import __main__ as cli
+        from pr_loop import __main__ as cli
         capture, shim = self.root / "create.json", self.root / "create.py"
         shim.write_text("import json,sys,pathlib; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:])); print('https://github.com/metask-ai/metacodes/pull/7')")
         self.github.command = (sys.executable, str(shim), str(capture))
@@ -370,6 +373,21 @@ class LoopIntegrationTest(unittest.TestCase):
 
 
 class BoundaryTest(unittest.TestCase):
+    def test_github_launcher_can_reconcile_from_another_working_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state.sqlite3"
+            result = subprocess.run([sys.executable, str(ROOT / ".github/pr-loop.py"),
+                                     "--state", str(state), "run", "--once"],
+                                    cwd=root, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(state.exists())
+            store = Store(state)
+            try:
+                self.assertEqual(store.rows(), [])
+            finally:
+                store.close()
+
     def test_contradictory_review_cannot_pass(self):
         with self.assertRaisesRegex(LoopError, "passing"):
             validate_report(dict(FIX, verdict="pass"))

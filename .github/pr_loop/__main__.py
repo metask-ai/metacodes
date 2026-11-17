@@ -1,4 +1,4 @@
-"""New PR entry point: python3 -m tools.pr_loop submit|bind|run|status|answer."""
+"""PR commands exposed by python3 .github/pr-loop.py."""
 from __future__ import annotations
 
 import argparse

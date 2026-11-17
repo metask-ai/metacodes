@@ -1,1 +1,0 @@
-"""Repository-owned contributor tooling."""
