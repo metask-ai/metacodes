@@ -24,7 +24,8 @@
 //!   default on one of its models;
 //! - `--replace` changes what it is given, keeps what was written by hand,
 //!   and refuses a new address while a key stored for the old one would
-//!   follow it.
+//!   follow it — reading the old address from the file, so a definition
+//!   that does not load cannot skip the check.
 //!
 //! `/providers remove` in the terminal UI takes a defined provider whole, so
 //! it does not come back at the next start.
@@ -609,6 +610,37 @@ test "--replace changes what it is given, keeps what was written by hand, and ke
     const nothing = try case.run(&.{}, &.{ "providers", "add", "missing", "--replace", "--display-name", "X" });
     try nothing.expectExit(2);
     try expectContains(nothing.stderr, "there is no 'missing'");
+}
+
+test "--replace keeps a stored key at its address even when the definition does not load" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    // No models: the definition does not load, so the loaded registry knows
+    // nothing of where its key was meant to go. The file still says.
+    try defineByHand(&case, "relay",
+        \\{"channels":[{"id":"openai","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}]}
+    );
+    try case.write("state/keys/relay.json", "{\"schema_version\":1,\"kind\":\"api_key\",\"key\":\"sk-x\",\"stored_at\":1}");
+    const before = try case.read("state/config.json");
+    const moved = try case.run(&.{}, &.{ "providers", "add", "relay", "--replace", "--base-url", "https://elsewhere.example.com/v1", "--protocol", "openai_chat", "--model", "glm-4.6" });
+    try moved.expectExit(2);
+    try expectContains(moved.stderr, "it would now go to https://elsewhere.example.com");
+    try testing.expectEqualStrings(before, try case.read("state/config.json"));
+
+    // At the address it was stored for, the same replace mends it.
+    const mended = try case.run(&.{}, &.{ "providers", "add", "relay", "--replace", "--base-url", "https://relay.example.com/v1", "--protocol", "openai_chat", "--model", "glm-4.6" });
+    try mended.expectExit(0);
+    const checked = try case.run(&.{}, &.{"--check-providers"});
+    try checked.expectExit(0);
+    try expectContains(checked.stderr, "relay/openai [openai_chat] model=glm-4.6");
+
+    // Channels that cannot be read say nowhere: every address is new to the key.
+    try defineByHand(&case, "relay", "{\"channels\":\"unreadable\",\"models\":[{\"request_model_id\":\"m\"}]}");
+    const unknown = try case.run(&.{}, &.{ "providers", "add", "relay", "--replace", "--base-url", "https://relay.example.com/v1", "--protocol", "openai_chat" });
+    try unknown.expectExit(2);
+    try expectContains(unknown.stderr, "a key is stored for 'relay'");
+    try testing.expect(case.exists("state/keys/relay.json"));
 }
 
 test "providers --help is written to stdout" {

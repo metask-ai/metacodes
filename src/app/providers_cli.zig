@@ -412,15 +412,16 @@ const Cli = struct {
 
         // A stored key goes with the definition: one that would now be sent
         // to an address it was never stored for is refused here, before the
-        // key leaves the machine for a host its owner did not choose.
-        if (existing != null and channels.items.len > 0) if (existing_profile) |profile| {
-            if (self.storedKeyExists(id)) {
-                if (newOrigin(profile.channels, channels.items)) |origin| {
-                    std.debug.print("error: a key is stored for '{s}' ({s}), and it would now go to {s}. Forget it first with `{s} logout --provider {s}`, then replace the address; nothing was written.\n", .{
-                        id_text, self.keyPath(id), origin, self.command, id_text,
-                    });
-                    return 2;
-                }
+        // key leaves the machine for a host its owner did not choose. The old
+        // addresses are read from the definition as written, not from the
+        // loaded profile: a definition that does not load (a hand edit gone
+        // wrong) must not let a `--replace` that mends it skip this check.
+        if (existing) |current| if (channels.items.len > 0 and self.storedKeyExists(id)) {
+            if (newOrigin(storedOrigins(arena, current), channels.items)) |origin| {
+                std.debug.print("error: a key is stored for '{s}' ({s}), and it would now go to {s}. Forget it first with `{s} logout --provider {s}`, then replace the address; nothing was written.\n", .{
+                    id_text, self.keyPath(id), origin, self.command, id_text,
+                });
+                return 2;
             }
         };
 
@@ -1144,15 +1145,35 @@ fn probeTarget(channels: []const custom_provider.DraftChannel, existing: ?*const
 
 /// An origin among `new` that none of `old` has, rendered: where a stored
 /// key would go for the first time.
-fn newOrigin(old: []const profile_mod.ChannelDescriptor, new: []const custom_provider.DraftChannel) ?[]const u8 {
+fn newOrigin(old: []const []const u8, new: []const custom_provider.DraftChannel) ?[]const u8 {
     for (new) |channel| {
         const origin = originOf(channel.base_url);
         const known = for (old) |existing| {
-            if (std.ascii.eqlIgnoreCase(originOf(existing.base_url), origin)) break true;
+            if (std.ascii.eqlIgnoreCase(existing, origin)) break true;
         } else false;
         if (!known) return origin;
     }
     return null;
+}
+
+/// The origins of the channels `entry_json` — one `custom_providers` member,
+/// as written — names. Read from the text rather than from the loaded
+/// profile, so a definition that does not load still says where its stored
+/// key was meant to go. One whose channels cannot be read names none, and
+/// every address is then new to it.
+fn storedOrigins(arena: std.mem.Allocator, entry_json: []const u8) []const []const u8 {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, entry_json, .{}) catch return &.{};
+    if (root != .object) return &.{};
+    const channels = root.object.get("channels") orelse return &.{};
+    if (channels != .array) return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (channels.array.items) |channel| {
+        if (channel != .object) continue;
+        const base = channel.object.get("base_url") orelse continue;
+        if (base != .string) continue;
+        out.append(arena, originOf(base.string)) catch break;
+    }
+    return out.items;
 }
 
 /// `scheme://host[:port]` of a URL.
@@ -1558,16 +1579,30 @@ test "a pick reads numbers and ranges, each model once" {
 }
 
 test "a stored key never meets an address it was not stored for" {
-    const routes = [_]profile_mod.ProtocolRoute{.{ .protocol = .openai_chat }};
-    const old = [_]profile_mod.ChannelDescriptor{.{ .id = Slug.lit("openai"), .display_name = "x", .base_url = "https://relay.example.com/v1", .routes = &routes }};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Read from the definition as written, a definition that would not load
+    // (no models) included.
+    const old = storedOrigins(arena,
+        \\{"channels":[{"id":"openai","base_url":"https://relay.example.com/v1","protocol":"openai_chat"},
+        \\ {"id":"bad"},{"id":"also-bad","base_url":7}]}
+    );
+    try testing.expectEqual(@as(usize, 1), old.len);
+    try testing.expectEqualStrings("https://relay.example.com", old[0]);
     const same = [_]custom_provider.DraftChannel{
         .{ .id = "openai", .base_url = "https://relay.example.com/v2", .wire = .openai_chat },
         .{ .id = "anthropic", .base_url = "https://RELAY.example.com", .wire = .anthropic_messages },
     };
-    try testing.expect(newOrigin(&old, &same) == null);
+    try testing.expect(newOrigin(old, &same) == null);
     const moved = [_]custom_provider.DraftChannel{.{ .id = "openai", .base_url = "https://other.example.com/v1", .wire = .openai_chat }};
-    try testing.expectEqualStrings("https://other.example.com", newOrigin(&old, &moved).?);
+    try testing.expectEqualStrings("https://other.example.com", newOrigin(old, &moved).?);
     try testing.expectEqualStrings("http://127.0.0.1:8000", originOf("http://127.0.0.1:8000/v1"));
+    // Channels that cannot be read say nowhere: every address is new.
+    for ([_][]const u8{ "{oops", "[1]", "{\"channels\":\"oops\"}", "{}" }) |text| {
+        try testing.expectEqual(@as(usize, 0), storedOrigins(arena, text).len);
+        try testing.expectEqualStrings("https://relay.example.com", newOrigin(storedOrigins(arena, text), same[0..1]).?);
+    }
 }
 
 test "the ids and aliases metacodes ships are not a custom provider's" {

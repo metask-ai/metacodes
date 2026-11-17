@@ -836,7 +836,9 @@ writes and reads the same section without hand-written JSON:
   another host, userinfo, `%`-escapes), the id or alias of a built-in
   profile, a taken id without `--replace`, a `--key-env` another provider
   reads (a key there would go to both), and — with `--replace` — a new
-  origin while `keys/<id>.json` holds a key stored for the old one.
+  origin while `keys/<id>.json` holds a key stored for the old one (the old
+  origins read from the definition as written, so one that does not load
+  cannot skip the check).
 - `probe <id> | --base-url <url> --protocol <wire>` asks the model listing
   (`api/model_probe.zig` over `catalog_fetch`, so a request that carries a
   key follows no redirect), with the key placed by the profile's auth
