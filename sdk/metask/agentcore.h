@@ -838,8 +838,8 @@ typedef struct {
 typedef struct {
     uint32_t struct_size;
     uint32_t max_turns;
-    /* Optional per-Run Host context for RUN_INPUT_TEXT and RUN_INPUT_MULTIMODAL,
-     * borrowed for the call. Null with zero count adds nothing. */
+    /* Optional per-Run Host context for RUN_INPUT_TEXT, RUN_INPUT_MULTIMODAL and
+     * RUN_INPUT_SKILL, borrowed for the call. Null with zero count adds nothing. */
     const metask_agentcore_context_block_v1 *context_blocks;
     uint64_t context_block_count;
     /* Revision 22: one METASK_AGENTCORE_TIME_CONTEXT_* value; zero is SYSTEM. */

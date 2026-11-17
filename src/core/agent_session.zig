@@ -792,8 +792,13 @@ pub const ProjectRules = enum {
     /// and decides each tool call through the project kernel; a missing or
     /// invalid kernel configuration, a bundle that fails attestation, or a
     /// running background job or active team fails the Run before any
-    /// provider request. After the Run the bundle is re-attested and the
-    /// Run's operational observation published.
+    /// provider request. Such a refusal fails only that Run, as the daemon
+    /// reports it failed and takes the next message: its input never enters
+    /// the Conversation and the Session stays usable. A refused resumption
+    /// (`AdmittedRun.resumeWithResults`) leaves its suspended turn waiting
+    /// for its results, so a later Run can still continue it. After the Run
+    /// the bundle is re-attested and the Run's operational observation
+    /// published.
     enforced,
 };
 
@@ -956,11 +961,65 @@ pub const SubmitInputError = error{
     InvalidSessionState,
 } || run_input.SubmitError;
 
+/// What `AgentSession.setRoute` moves a Session onto (issue #16, #445): the
+/// provider fields of `SessionConfig`, as one value, so a route is never
+/// half-applied. Borrowed for the call, which copies it.
+pub const Route = struct {
+    provider_kind: types.ProviderKind,
+    openai_protocol: types.OpenAIProtocol = .chat_completions,
+    /// Null keeps the historical `authorization: Bearer` bytes.
+    auth_scheme: ?AuthScheme = null,
+    /// Declared for `model`.
+    dialect: @import("../provider/vendor.zig").Declaration = .{},
+    /// The route's credential. Never journaled or logged.
+    api_key: []const u8,
+    /// The model id the route's requests carry.
+    model: []const u8,
+    base_url: ?[]const u8 = null,
+};
+
+const AuthScheme = @import("../provider/credential.zig").AuthScheme;
+
+/// An owned copy of `scheme` and the bytes it names (`freeAuthScheme`).
+fn dupeAuthScheme(allocator: std.mem.Allocator, scheme: ?AuthScheme) error{OutOfMemory}!?AuthScheme {
+    const value = scheme orelse return null;
+    return switch (value) {
+        .bearer => .bearer,
+        .api_key_header => |name| .{ .api_key_header = try allocator.dupe(u8, name) },
+        .signed_adapter => |name| .{ .signed_adapter = try allocator.dupe(u8, name) },
+        .custom_header => |custom| blk: {
+            const name = try allocator.dupe(u8, custom.name);
+            errdefer allocator.free(name);
+            break :blk .{ .custom_header = .{ .name = name, .value_prefix = try allocator.dupe(u8, custom.value_prefix) } };
+        },
+    };
+}
+
+fn freeAuthScheme(allocator: std.mem.Allocator, scheme: ?AuthScheme) void {
+    switch (scheme orelse return) {
+        .bearer => {},
+        .api_key_header, .signed_adapter => |name| allocator.free(name),
+        .custom_header => |custom| {
+            allocator.free(custom.name);
+            allocator.free(custom.value_prefix);
+        },
+    }
+}
+
 pub const ModelMutationError = error{
     SessionBusy,
     InvalidSessionState,
     InvalidModel,
     OutOfMemory,
+};
+
+/// `setRoute` refusals (issue #16, #445). Each leaves the Session on the
+/// route it had: provider, endpoint, credential, model and effort.
+pub const RouteMutationError = ModelMutationError || credential_cell.ValidationError || error{
+    /// The Session has a reasoning effort and the route's provider takes
+    /// none. Clearing it first (`setReasoningEffort(null)`) is the Host's
+    /// explicit choice; it is never dropped silently.
+    AgentEffortUnsupportedProvider,
 };
 
 /// `updateCredential` refusals (issue #336). `InvalidSessionState`: the
@@ -976,6 +1035,10 @@ pub const PermissionRuleMutationError = error{
     OutOfMemory,
     ResourceLimit,
     InvalidRule,
+    /// The Session decides with another Session's rules
+    /// (`AgentSession.inheritPermissions`, #445), so its own would never be
+    /// read. Nothing changes.
+    PermissionsInherited,
 };
 
 pub const PermissionModeMutationError = error{
@@ -994,6 +1057,23 @@ pub const AdditionalDirectoriesMutationError = error{
     InvalidSessionState,
     InvalidAdditionalDirectory,
     OutOfMemory,
+    /// The Session decides with another Session's directories
+    /// (`AgentSession.inheritPermissions`, #445), so a permission decision
+    /// would never read its own. Nothing changes.
+    PermissionsInherited,
+};
+
+/// `AgentSession.inheritPermissions` refusals; each leaves both Sessions as
+/// they were.
+pub const InheritPermissionsError = error{
+    /// This Session is not idle.
+    SessionBusy,
+    /// This Session or the lender is poisoned or being destroyed.
+    InvalidSessionState,
+    /// This Session already decides with another Session's permissions.
+    PermissionsInherited,
+    /// A Session cannot lend to itself.
+    InvalidPermissionLender,
 };
 
 pub const ReasoningEffortMutationError = error{
@@ -1134,6 +1214,41 @@ pub const RunExecutionEvidence = struct {
     system_prompt: ?[]const u8 = null,
 };
 
+/// What an admitted Run puts into the Conversation. `runLoop` appends it
+/// only once the Run's control let the Run go on, so a Run the project
+/// rules refuse leaves the Conversation as it was (#445).
+const RunInput = union(enum) {
+    /// User text records, in order. Borrowed.
+    prompts: []const []const u8,
+    /// User text records whose first leads with its own text part
+    /// (`AdmittedRun.lead_text`, #534). Borrowed.
+    led_prompts: LedPrompts,
+    /// One built user record, owned by the Run: the Conversation takes it,
+    /// or `runLoop` frees it when the Run ends before.
+    record: message_mod.Message,
+    /// Results for the suspended turn's tool calls
+    /// (`agent_loop.resumeRunWithResults`, #446). Borrowed.
+    resumption: []const agent_loop.SuspendInfo.CompletedResult,
+};
+
+/// `RunInput.led_prompts`: `lead` and `prompts[0]` are the two text parts of
+/// the first user record; the rest are text records, in order.
+const LedPrompts = struct {
+    lead: []const u8,
+    prompts: []const []const u8,
+};
+
+/// A durable Run's control once its journal opened (#445).
+const RunControlOpening = union(enum) {
+    /// The Run goes on; the caller finishes and frees it.
+    open: *project_rule_activation.RunControl,
+    /// The project rules refused the Run before any provider request or
+    /// tool action: an active bundle that cannot be attested (or a kernel
+    /// configuration that cannot be used), or a detached worker running.
+    /// The Run is closed in the journal under this error's name.
+    refused: anyerror,
+};
+
 /// Exactly-once capability returned after Run admission but before any
 /// Conversation mutation. AgentCore uses this narrow seam to materialize a
 /// typed Skill without duplicating the Session lifecycle state machine.
@@ -1146,6 +1261,13 @@ pub const AdmittedRun = struct {
     /// (`agent_loop.Options.retractable_stream_retries`, #452). The embedding
     /// layer sets it before the Run starts; 0 keeps the loop's default.
     stream_retry_budget: u8 = 0,
+    /// Text leading the Run's first user record as its own text part, the
+    /// Host's rendered context for this Run (#534): that record holds
+    /// `[lead_text, first prompt]` where it would hold the first prompt
+    /// alone, for `runUserMessages*` and `runIsolated`'s root records. The
+    /// embedding layer sets it before the Run starts; borrowed until the Run
+    /// returns. Null leaves every record a plain text record.
+    lead_text: ?[]const u8 = null,
 
     pub fn identity(self: *const AdmittedRun) RunIdentity {
         std.debug.assert(!self.completed);
@@ -1170,7 +1292,9 @@ pub const AdmittedRun = struct {
 
     /// Append the already-prepared root prompt and reuse the ordinary Run
     /// pipeline. Any failure after this call begins has normal admitted-Run
-    /// poison semantics.
+    /// poison semantics, except the project rules refusing the Run
+    /// (`RunControlConfig.project_rules`, #445): that error returns with the
+    /// Run finished, the prompt not appended and the Session idle.
     pub fn runText(
         self: *AdmittedRun,
         prompt: []const u8,
@@ -1181,7 +1305,8 @@ pub const AdmittedRun = struct {
 
     /// Continue an admitted Run with a caller-defined sequence of user
     /// records and an immutable execution upper bound. Appends and provider
-    /// execution retain the ordinary poison semantics.
+    /// execution retain the ordinary poison semantics; a project-rules
+    /// refusal fails only the Run, as for `runText`.
     pub fn runUserMessagesWithPolicy(
         self: *AdmittedRun,
         prompts: []const []const u8,
@@ -1252,12 +1377,6 @@ pub const AdmittedRun = struct {
         }
         try self.session.claimAdmittedRun(self.identity_value);
         self.completed = true;
-        for (prompts) |prompt| {
-            self.session.conversation.appendText(.user, prompt) catch |err| {
-                _ = self.session.poisonRun();
-                return err;
-            };
-        }
         return self.session.runLoop(
             self.identity_value,
             max_turns,
@@ -1265,7 +1384,10 @@ pub const AdmittedRun = struct {
             tool_surface,
             provider_override,
             self.stream_retry_budget,
-            null,
+            if (self.lead_text) |lead|
+                .{ .led_prompts = .{ .lead = lead, .prompts = prompts } }
+            else
+                .{ .prompts = prompts },
         );
     }
 
@@ -1328,19 +1450,13 @@ pub const AdmittedRun = struct {
             _ = try self.finishWithoutConversation();
             return err;
         };
-        // 显式转移标志而非裸 errdefer:Conversation.append 失败时**不**接管
-        // record,成功后所有权归 conversation。裸 errdefer 会在 append 成功之后
-        // 的任何错误(runLoop 返错是常态)上二次释放。
-        var record_owned = true;
-        errdefer if (record_owned) record.deinit(self.session.conversation.allocator);
-        try self.session.claimAdmittedRun(self.identity_value);
-        self.completed = true;
-        // 此后失败才是普通的 admitted-Run poison 语义。
-        self.session.conversation.append(record) catch |err| {
-            _ = self.session.poisonRun();
+        self.session.claimAdmittedRun(self.identity_value) catch |err| {
+            record.deinit(self.session.conversation.allocator);
             return err;
         };
-        record_owned = false;
+        self.completed = true;
+        // 此后失败才是普通的 admitted-Run poison 语义;record 归 runLoop
+        // (追加进 Conversation,或在追加前失败时由它释放)。
         return self.session.runLoop(
             self.identity_value,
             max_turns,
@@ -1348,7 +1464,7 @@ pub const AdmittedRun = struct {
             tool_surface,
             provider_override,
             self.stream_retry_budget,
-            null,
+            .{ .record = record },
         );
     }
 
@@ -1367,7 +1483,11 @@ pub const AdmittedRun = struct {
     /// Refused before anything changes, the admitted Run finished cleanly:
     /// `error.NothingToResume` when the Conversation does not end in an
     /// assistant turn with tool calls, `error.ResumeMismatch` when a result
-    /// names a call that turn did not make or names one twice.
+    /// names a call that turn did not make or names one twice. The project
+    /// rules refusing the Run (`RunControlConfig.project_rules`, #445) also
+    /// return with the Run finished, the results not recorded and the
+    /// Session idle: the suspended turn still waits for them, and another
+    /// admitted Run can resume it.
     pub fn resumeWithResults(
         self: *AdmittedRun,
         results: []const agent_loop.SuspendInfo.CompletedResult,
@@ -1387,7 +1507,7 @@ pub const AdmittedRun = struct {
             null,
             null,
             self.stream_retry_budget,
-            results,
+            .{ .resumption = results },
         );
     }
 
@@ -1416,12 +1536,10 @@ pub const AdmittedRun = struct {
         // The executor runs on its own Conversation, discarded when it returns:
         // no boundary of this Run can adopt Host input, so stop accepting it.
         self.session.refuseRunInputs();
-        for (root_records) |record| {
-            self.session.conversation.appendText(.user, record) catch |err| {
-                _ = self.session.poisonRun();
-                return err;
-            };
-        }
+        self.session.appendUserTexts(self.lead_text, root_records) catch |err| {
+            _ = self.session.poisonRun();
+            return err;
+        };
 
         var final_text = std.ArrayList(u8).empty;
         defer final_text.deinit(self.session.allocator);
@@ -1515,8 +1633,9 @@ pub const AgentSession = struct {
     openai_protocol: types.OpenAIProtocol,
     /// Carried so a tool-scoped provider authenticates the way the session's
     /// own route does; a subagent sending bearer at an `x-api-key` endpoint has
-    /// the right key and the wrong header.
-    auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
+    /// the right key and the wrong header. Owned (`dupeAuthScheme`), so a
+    /// route `setRoute` took outlives the Host's copy.
+    auth_scheme: ?AuthScheme = null,
     /// Carried with `auth_scheme`: a tool-scoped provider writes the route's
     /// dialect. Declared for `model`; a model switch keeps only the route's part.
     dialect: @import("../provider/vendor.zig").Declaration = .{},
@@ -1618,6 +1737,22 @@ pub const AgentSession = struct {
     /// Broadcast under `mutex` when `in_flight_provider_cancels` reaches zero
     /// (`awaitProviderCancelsDrained`).
     provider_cancels_drained: sync.Condition = .{},
+    /// Issue #445: this Session's imported rules and additional directories
+    /// as other Sessions' permission decisions read them
+    /// (`inheritPermissions`). Republished by `updatePermissionRules` and
+    /// `setAdditionalDirectories`; permission/lent.zig states the locking
+    /// rule.
+    lent_permissions: permission.LentPermissions = .{},
+    /// Sessions that decide with this one's permissions
+    /// (`inheritPermissions`) and are not destroyed yet; under `mutex`.
+    /// `destroy` waits for zero, so a lender outlives every borrower.
+    permission_heirs: usize = 0,
+    /// Broadcast under `mutex` when `permission_heirs` reaches zero.
+    permission_heirs_gone: sync.Condition = .{},
+    /// The Session whose permissions this one decides with
+    /// (`inheritPermissions`): set once while idle, given back only at the
+    /// end of `destroy`.
+    permission_lender: ?*AgentSession = null,
     last_admitted_compact_id: u64 = 0,
     last_terminal_compact_id: u64 = 0,
     callback_failed: bool = false,
@@ -1716,6 +1851,8 @@ pub const AgentSession = struct {
         errdefer allocator.free(model);
         const base_url = if (config.base_url) |url| try allocator.dupe(u8, url) else null;
         errdefer if (base_url) |url| allocator.free(url);
+        const auth_scheme = try dupeAuthScheme(allocator, config.auth_scheme);
+        errdefer freeAuthScheme(allocator, auth_scheme);
         var prompt_profile = try prompt_sections.OwnedProfile.clone(allocator, config.prompt_profile);
         errdefer prompt_profile.deinit();
         var model_capabilities = try image_capability.Declarations.init(allocator, config.model_capabilities);
@@ -1740,7 +1877,7 @@ pub const AgentSession = struct {
             base_url,
             config.openai_protocol,
             runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = config.auth_scheme, .dialect = config.dialect, .limits = null, .capability_declarations = model_capabilities },
+            .{ .auth_scheme = auth_scheme, .dialect = config.dialect, .limits = null, .capability_declarations = model_capabilities },
         );
         errdefer owned_provider.deinit();
         if (config.reasoning_effort) |effort| try owned_provider.provider().setReasoningEffort(effort);
@@ -1788,7 +1925,7 @@ pub const AgentSession = struct {
             .model = model,
             .base_url = base_url,
             .openai_protocol = config.openai_protocol,
-            .auth_scheme = config.auth_scheme,
+            .auth_scheme = auth_scheme,
             .dialect = config.dialect,
             .model_capabilities = model_capabilities,
             .provider = owned_provider,
@@ -1851,6 +1988,7 @@ pub const AgentSession = struct {
         // options): autoAllowBashIfSandboxed allows only a call they really
         // confine, and a sandboxed shell ignores `dangerouslyDisableSandbox`.
         self.permission_ctx.sandbox = self.workspace.sandbox();
+        self.lent_permissions.publish(self.permission_ctx.settings, self.workspace.additional_dirs);
         return self;
     }
 
@@ -1875,11 +2013,16 @@ pub const AgentSession = struct {
                 return error.InvalidSessionState;
             },
         }
+        // #445: a Session others decide with outlives them. `.destroying`
+        // admits no new borrower; the ones there leave at the end of their
+        // own destroy.
+        while (self.permission_heirs > 0) self.permission_heirs_gone.wait(&self.mutex);
         self.mutex.unlock();
 
         const allocator = self.allocator;
         const runtime = self.runtime;
         const sid = self.session_id;
+        const lender = self.permission_lender;
         self.provider.deinit();
         self.conversation.deinit();
         self.run_inputs.deinit();
@@ -1898,12 +2041,16 @@ pub const AgentSession = struct {
         allocator.free(self.artifact_root);
         allocator.free(self.run_journal_root);
         if (self.base_url) |url| allocator.free(url);
+        freeAuthScheme(allocator, self.auth_scheme);
         allocator.free(self.model);
         // After every provider that read it: `provider` above, and each tool
         // provider, which lives within a Run.
         self.credential.destroy();
         self.* = undefined;
         allocator.destroy(self);
+        // Last: nothing of this Session reads the lender's state any more
+        // (its Runs, jobs and scoped permission copies are gone).
+        if (lender) |lead| lead.releasePermissionHeir();
         // destroy 成功必须注销(先于 releaseSession:live==0 时 registry 必须已空)。
         runtime.unregisterSessionId(sid);
         runtime.releaseSession();
@@ -2071,6 +2218,10 @@ pub const AgentSession = struct {
         input: permission_settings.RuleSetInput,
     ) PermissionRuleMutationError!void {
         self.mutex.lock();
+        if (self.permission_lender != null) {
+            self.mutex.unlock();
+            return error.PermissionsInherited;
+        }
         if (self.in_flight_provider_cancels != 0) {
             self.mutex.unlock();
             return error.SessionBusy;
@@ -2109,6 +2260,9 @@ pub const AgentSession = struct {
             rules
         else
             null;
+        // Borrowers' next decision reads the new layer, and none reads
+        // `previous` once `publish` returns, so it is freed below.
+        self.lent_permissions.publish(self.permission_ctx.settings, self.workspace.additional_dirs);
         self.mutex.unlock();
 
         if (previous) |rules_value| {
@@ -2174,6 +2328,10 @@ pub const AgentSession = struct {
         dirs: []const []const u8,
     ) AdditionalDirectoriesMutationError!void {
         self.mutex.lock();
+        if (self.permission_lender != null) {
+            self.mutex.unlock();
+            return error.PermissionsInherited;
+        }
         if (self.in_flight_provider_cancels != 0) {
             self.mutex.unlock();
             return error.SessionBusy;
@@ -2202,6 +2360,9 @@ pub const AgentSession = struct {
         const previous = self.workspace.additional_dirs;
         self.workspace.additional_dirs = replacement;
         self.permission_ctx.match_ctx.additional_dirs = replacement;
+        // As for the rules: borrowers read the new set from their next
+        // decision on, and none reads `previous` once `publish` returns.
+        self.lent_permissions.publish(self.permission_ctx.settings, replacement);
         self.mutex.unlock();
         workspace_mod.freeDirs(self.allocator, previous);
 
@@ -2209,6 +2370,79 @@ pub const AgentSession = struct {
         std.debug.assert(self.state == .mutating);
         self.state = .idle;
         self.mutex.unlock();
+    }
+
+    /// Issue #445: from now on this Session decides every tool call with
+    /// `lead`'s imported permission rules and additional working directories
+    /// as they are at that call, and both Sessions remember "allow
+    /// always"/"deny" answers in `lead`'s Session memory and read it: a rule
+    /// or directory the lead gains later applies to this Session's next tool
+    /// call, as the bundled daemon's in-process teammates borrow their lead's
+    /// permission context. This Session's own rules, directories and memory
+    /// are no longer read, so `updatePermissionRules` and
+    /// `setAdditionalDirectories` on it refuse with
+    /// `error.PermissionsInherited`. Its permission mode, workspace root,
+    /// tools and sandbox stay its own. A lead that itself inherits lends what
+    /// it inherits.
+    ///
+    /// Locking and lifetime (permission/lent.zig): each decision holds the
+    /// lender's `lent_permissions.mutex`; the lender republishes under it and
+    /// frees what it replaced afterwards. The lender outlives this Session:
+    /// its `destroy` waits until every Session that inherits from it is
+    /// destroyed, so destroy borrowers first. Only while this Session is
+    /// idle; once.
+    pub fn inheritPermissions(self: *AgentSession, lead: *AgentSession) InheritPermissionsError!void {
+        const lender = lead.permission_lender orelse lead;
+        if (lender == self) return error.InvalidPermissionLender;
+        self.mutex.lock();
+        if (self.permission_lender != null) {
+            self.mutex.unlock();
+            return error.PermissionsInherited;
+        }
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+
+        // Never under this Session's lock: no path takes the two the other
+        // way round, but none needs to take them together either.
+        lender.mutex.lock();
+        const admitted = lender.state != .destroying and lender.state != .poisoned;
+        if (admitted) lender.permission_heirs += 1;
+        lender.mutex.unlock();
+        if (!admitted) {
+            self.cancelMutation();
+            return error.InvalidSessionState;
+        }
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.permission_lender = lender;
+        self.permission_ctx.inherited = &lender.lent_permissions;
+        self.permission_ctx.session_rules = &lender.session_rules;
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    /// The end of a borrower's `destroy`.
+    fn releasePermissionHeir(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.permission_heirs > 0);
+        self.permission_heirs -= 1;
+        if (self.permission_heirs == 0) self.permission_heirs_gone.broadcast();
     }
 
     /// Issue #445: the prompts of the cron jobs due now, in the order the
@@ -2683,6 +2917,98 @@ pub const AgentSession = struct {
         while (self.in_flight_provider_cancels != 0) self.provider_cancels_drained.wait(&self.mutex);
     }
 
+    /// Move the Session onto another route (issue #16, #445), as the bundled
+    /// CLI binds a committed `/model` selection: provider kind, wire
+    /// protocol, authentication, dialect, endpoint, credential and model
+    /// change together at the idle mutation boundary, so no request is ever
+    /// sent on a mix of the old route and the new. Every request after this
+    /// returns (the Session's own, a tool's, a compaction's) goes to the new
+    /// endpoint with the new credential. The conversation, the Host's model
+    /// capability declarations and the reasoning effort carry over; an
+    /// effort the new provider cannot take is refused
+    /// (`AgentEffortUnsupportedProvider`). Every refusal, out of memory
+    /// included, leaves the previous route in force. The previous credential
+    /// is erased.
+    pub fn setRoute(self: *AgentSession, route: Route) RouteMutationError!void {
+        if (route.model.len == 0 or
+            !std.unicode.utf8ValidateSlice(route.model))
+            return error.InvalidModel;
+        try credential_cell.validate(route.api_key);
+
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        const effort = self.reasoning_effort;
+        self.mutex.unlock();
+        errdefer self.cancelMutation();
+
+        const model = try self.allocator.dupe(u8, route.model);
+        errdefer self.allocator.free(model);
+        const base_url = if (route.base_url) |url| try self.allocator.dupe(u8, url) else null;
+        errdefer if (base_url) |url| self.allocator.free(url);
+        const auth_scheme = try dupeAuthScheme(self.allocator, route.auth_scheme);
+        errdefer freeAuthScheme(self.allocator, auth_scheme);
+        var credential = try self.credential.prepare(route.api_key);
+        errdefer credential.discard();
+        // Reads the cell at each request, so it authenticates with the new
+        // credential once it is published below, and is not used before.
+        var provider = try provider_factory.makeProviderWithOptions(
+            self.allocator,
+            route.provider_kind,
+            .{ .replaceable = self.credential },
+            model,
+            base_url,
+            route.openai_protocol,
+            self.runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = auth_scheme, .dialect = route.dialect, .limits = null, .capability_declarations = self.model_capabilities },
+        );
+        errdefer provider.deinit();
+        if (effort) |value| provider.provider().setReasoningEffort(value) catch
+            return error.AgentEffortUnsupportedProvider;
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        const previous_provider = self.provider;
+        const previous_model = self.model;
+        const previous_base_url = self.base_url;
+        const previous_auth_scheme = self.auth_scheme;
+        self.provider = provider;
+        self.model = model;
+        self.base_url = base_url;
+        self.openai_protocol = route.openai_protocol;
+        self.auth_scheme = auth_scheme;
+        self.dialect = route.dialect;
+        // Lock order: `mutex`, then the credential's own.
+        _ = credential.publish();
+        self.mutex.unlock();
+
+        // Concrete clients borrow their model, endpoint and scheme bytes: the
+        // previous provider goes first. The mutation gate stays held until
+        // cleanup finishes, as in `setModel`.
+        previous_provider.deinit();
+        self.allocator.free(previous_model);
+        if (previous_base_url) |url| self.allocator.free(url);
+        freeAuthScheme(self.allocator, previous_auth_scheme);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
     fn cancelMutation(self: *AgentSession) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2889,10 +3215,14 @@ pub const AgentSession = struct {
         tool_surface: ?RunToolSurface,
         provider_override: ?provider_mod.Provider,
         stream_retry_budget: u8,
-        /// Non-null: the Run resumes a suspended turn with these tool results
-        /// (`agent_loop.resumeRunWithResults`) instead of starting one.
-        resume_with: ?[]const agent_loop.SuspendInfo.CompletedResult,
+        input: RunInput,
     ) anyerror!agent_loop.RunResult {
+        // A built record is the Run's until the Conversation takes it.
+        var pending_record: ?message_mod.Message = switch (input) {
+            .record => |record| record,
+            .prompts, .led_prompts, .resumption => null,
+        };
+        defer if (pending_record) |record| record.deinit(self.conversation.allocator);
         var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
         const tool_definitions = if (tool_surface) |surface|
             surface.definitions
@@ -2937,17 +3267,34 @@ pub const AgentSession = struct {
 
         // #445: the bundled daemon's per-Run control. It opens the durable
         // journal and, under `project_rules = .enforced`, loads and
-        // re-attests the active project rule bundle; a refusal fails the Run
-        // before any provider request or tool action, as a journal that
-        // cannot open does.
+        // re-attests the active project rule bundle. A journal that cannot
+        // open poisons the Session; the project rules refusing the Run fail
+        // only the Run, as the daemon reports such a Run failed and takes the
+        // next message: nothing of it entered the Conversation yet.
         const run_control: ?*project_rule_activation.RunControl = if (self.run_journal_root.len == 0)
             null
-        else
-            self.openRunControl(identity, rendered_prompt.manifest) catch |err| {
-                _ = self.poisonRun();
+        else switch (self.openRunControl(identity, rendered_prompt.manifest) catch |err| {
+            _ = self.poisonRun();
+            return err;
+        }) {
+            .open => |control| control,
+            .refused => |err| {
+                // A resumption's results stay out of the Conversation too:
+                // its suspended turn still waits for them, so a later Run
+                // can still give them (`SessionHost` keeps the suspension).
+                const completion = self.finishRunLifecycle();
+                if (completion.callback_failed) return error.CallbackFailed;
                 return err;
-            };
+            },
+        };
         defer if (run_control) |control| control.deinit();
+        // The Run's input enters the Conversation once the Run may go on.
+        self.appendRunInput(input) catch |err| {
+            if (run_control) |control| control.finishRun(@errorName(err)) catch {};
+            _ = self.poisonRun();
+            return err;
+        };
+        pending_record = null;
         self.announcePromptManifest(rendered_prompt.manifest) catch |err| {
             if (run_control) |control| control.finishRun(@errorName(err)) catch {};
             _ = self.poisonRun();
@@ -3000,10 +3347,10 @@ pub const AgentSession = struct {
             .swarm = if (self.swarm) |*s| s else null,
         };
         const run_provider = provider_override orelse self.provider.provider();
-        var native_result = (if (resume_with) |results|
-            agent_loop.resumeRunWithResults(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, results, run_options, &backend, self.allocator)
-        else
-            agent_loop.run(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, run_options, &backend, self.allocator)) catch |err| {
+        var native_result = (switch (input) {
+            .resumption => |results| agent_loop.resumeRunWithResults(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, results, run_options, &backend, self.allocator),
+            .prompts, .led_prompts, .record => agent_loop.run(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, run_options, &backend, self.allocator),
+        }) catch |err| {
             if (run_control) |control| control.finishRun(@errorName(err)) catch {};
             if (err == error.HostToolFatal) {
                 self.mutex.lock();
@@ -3034,42 +3381,77 @@ pub const AgentSession = struct {
     /// `daemon/app_driver.zig` opens one per Run: the bundle of the
     /// workspace root when `project_rules` is enforced, then the
     /// detached-worker check the daemon makes (a Bash job of this Session
-    /// still running, or a team). A refusal after the journal opened closes
-    /// the Run in it under the error's name.
+    /// still running, or a team). An error is a journal that cannot open;
+    /// the project rules refusing the Run after it opened is `.refused`,
+    /// the Run closed in the journal under the refusal's name.
     fn openRunControl(
         self: *AgentSession,
         identity: RunIdentity,
         prompt: prompt_sections.Manifest,
-    ) !*project_rule_activation.RunControl {
+    ) !RunControlOpening {
         var report: tool_observation_journal.OpenReport = .{};
         const control = try project_rule_activation.RunControl.initWithOptions(
             self.allocator,
             self.run_journal_root,
             identity.session_id,
             .{
-                .project_root = switch (self.run_control.project_rules) {
-                    .ignored => null,
-                    .enforced => self.workspace.root,
-                },
+                .project_root = null,
                 .abandoned_run = self.run_control.abandoned_run,
                 .prompt = prompt,
-                .abort = &self.abort_signal,
                 .report = &report,
             },
         );
-        errdefer control.deinit();
         if (report.unfinished) |abandoned| {
             var text: [512]u8 = undefined;
             log.warn("agent_session", "{s}", .{tool_observation_journal.describeAbandoned(&text, &abandoned)});
+        }
+        switch (self.run_control.project_rules) {
+            .ignored => {},
+            .enforced => control.loadProjectGate(self.workspace.root, &self.abort_signal) catch |err| {
+                control.deinit();
+                return .{ .refused = err };
+            },
         }
         control.requireDetachedIdle(
             if (self.jobs) |*registry| registry.runningCountForOwner(self.session_id) else 0,
             if (self.swarm) |*swarm| swarm.hasTeam() else false,
         ) catch |err| {
             control.finishRun(@errorName(err)) catch {};
-            return err;
+            control.deinit();
+            return .{ .refused = err };
         };
-        return control;
+        return .{ .open = control };
+    }
+
+    /// The Run's input, appended to the Conversation (#445). A record is
+    /// the Conversation's only once this returns; a resumption's results
+    /// enter it through `agent_loop.resumeRunWithResults`.
+    fn appendRunInput(self: *AgentSession, input: RunInput) !void {
+        switch (input) {
+            .prompts => |prompts| try self.appendUserTexts(null, prompts),
+            .led_prompts => |led| try self.appendUserTexts(led.lead, led.prompts),
+            .record => |record| try self.conversation.append(record),
+            .resumption => {},
+        }
+    }
+
+    /// User text records, in order; a non-null `lead` is the first record's
+    /// leading text part (`AdmittedRun.lead_text`, #534).
+    fn appendUserTexts(self: *AgentSession, lead: ?[]const u8, prompts: []const []const u8) !void {
+        for (prompts, 0..) |prompt, index| {
+            if (index == 0) if (lead) |text| {
+                const record = try message_mod.userMessageFromParts(self.conversation.allocator, &.{
+                    .{ .text = text },
+                    .{ .text = prompt },
+                });
+                self.conversation.append(record) catch |err| {
+                    record.deinit(self.conversation.allocator);
+                    return err;
+                };
+                continue;
+            };
+            try self.conversation.appendText(.user, prompt);
+        }
     }
 
     const RunCompletion = struct {
@@ -3794,6 +4176,56 @@ test "AgentSession model mutation rolls back allocation failures" {
     try std.testing.expect(self.conversation.messages.items.ptr == original_message_ptr);
     try std.testing.expectEqualStrings("test-model", self.model);
     try std.testing.expect(!self.isPoisoned());
+}
+
+test "AgentSession route mutation moves provider, endpoint, scheme, credential and model together; a refusal changes none of them (#16)" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.setReasoningEffort(.high);
+
+    try std.testing.expectError(error.InvalidModel, self.setRoute(.{ .provider_kind = .openai, .api_key = "route-key", .model = "" }));
+    try std.testing.expectError(error.InvalidCredentialByte, self.setRoute(.{ .provider_kind = .openai, .api_key = "bad key", .model = "gpt-route" }));
+    // Gemini takes no effort: the Session's is never dropped to fit.
+    try std.testing.expectError(error.AgentEffortUnsupportedProvider, self.setRoute(.{ .provider_kind = .gemini, .api_key = "route-key", .model = "gemini-route" }));
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(types.ProviderKind.anthropic, self.provider.kind());
+    try std.testing.expectEqualStrings("test-model", self.model);
+    try std.testing.expect(self.base_url == null);
+    try std.testing.expect(self.auth_scheme == null);
+    try std.testing.expect(self.credential.matches("test-key"));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, .high), self.reasoning_effort);
+
+    // The caller's bytes are copied: overwritten after the call, the route
+    // stays as bound.
+    var header = "x-route-key".*;
+    var url = "http://127.0.0.1:9/v1".*;
+    try self.setRoute(.{
+        .provider_kind = .openai,
+        .openai_protocol = .responses,
+        .auth_scheme = .{ .api_key_header = &header },
+        .api_key = "route-key",
+        .model = "gpt-route",
+        .base_url = &url,
+    });
+    @memset(&header, 'x');
+    @memset(&url, 'x');
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(types.ProviderKind.openai, self.provider.kind());
+    try std.testing.expectEqual(types.OpenAIProtocol.responses, self.openai_protocol);
+    try std.testing.expectEqualStrings("gpt-route", self.model);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9/v1", self.base_url.?);
+    try std.testing.expectEqualStrings("x-route-key", self.auth_scheme.?.api_key_header);
+    try std.testing.expect(self.credential.matches("route-key"));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, .high), self.reasoning_effort);
+
+    self.state = .poisoned;
+    try std.testing.expectError(error.InvalidSessionState, self.setRoute(.{ .provider_kind = .anthropic, .api_key = "k", .model = "m" }));
+    self.state = .idle;
+    try std.testing.expectEqualStrings("gpt-route", self.model);
 }
 
 test "AgentSession owns initial imported permission rules" {
@@ -5773,4 +6205,124 @@ test "resumeWithResults' precondition: the results answer the last assistant tur
     try std.testing.expectError(error.ResumeMismatch, checkResumable(&conversation, &.{ question, question }));
     try std.testing.expectError(error.ResumeMismatch, checkResumable(&conversation, &.{.{ .tool_use_id = "tu_other", .content = "{}", .is_error = false }}));
     try std.testing.expectError(error.NothingToResume, checkResumable(&conversation, &.{}));
+}
+
+test "AgentSession.inheritPermissions: the lead's rules, directories and memory as they are at each decision; the lead outlives the member" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.createDirPath(std.testing.io, "extra");
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(std.testing.io, &base_buffer);
+    for (base_buffer[0..base_len]) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    const base = base_buffer[0..base_len];
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, "{s}/root", .{base});
+    var extra_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const extra = try std.fmt.bufPrint(&extra_buffer, "{s}/extra", .{base});
+    var args_buffer: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const write_args = try std.fmt.bufPrint(&args_buffer, "{{\"file_path\":\"{s}/x.txt\",\"content\":\"x\"}}", .{extra});
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const lead = try createTestSession(runtime, .bypass_permissions, root);
+    var lead_destroyed = false;
+    defer if (!lead_destroyed) lead.destroy() catch unreachable;
+    const member = try createTestSession(runtime, .accept_edits, root);
+    var member_destroyed = false;
+    defer if (!member_destroyed) member.destroy() catch unreachable;
+
+    try std.testing.expectError(error.InvalidPermissionLender, lead.inheritPermissions(lead));
+    try member.inheritPermissions(lead);
+    try std.testing.expectError(error.PermissionsInherited, member.inheritPermissions(lead));
+    // The member keeps its own mode.
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, member.permission_ctx.modeValue());
+
+    // A Write outside the working directories asks; once the lead gains the
+    // directory, the member's next decision allows it, a scoped copy too.
+    try std.testing.expectEqual(permission.PermissionResult.ask, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+    try lead.setAdditionalDirectories(&.{extra});
+    try std.testing.expectEqual(permission.PermissionResult.allow, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+    const scoped = member.permission_ctx.scopedDerive(null);
+    try std.testing.expectEqual(permission.PermissionResult.allow, permission.checkPermission(&scoped, "Write", write_args));
+
+    // A rule the lead gains decides the member's next call; replacing it
+    // again frees the layer the member read.
+    try lead.updatePermissionRules(.{ .deny = &.{"Write"} });
+    try std.testing.expectEqual(permission.PermissionResult.deny, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+    try lead.updatePermissionRules(.{});
+    try std.testing.expectEqual(permission.PermissionResult.allow, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+
+    // Session memory is the lead's: its "deny" applies to the member.
+    lead.session_rules.rememberDeny("Write");
+    try std.testing.expectEqual(permission.PermissionResult.deny, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+
+    // The member's own rules and directories would never be read: refused.
+    try std.testing.expectError(error.PermissionsInherited, member.updatePermissionRules(.{ .allow = &.{"Write"} }));
+    try std.testing.expectError(error.PermissionsInherited, member.setAdditionalDirectories(&.{}));
+    try std.testing.expectEqual(State.idle, member.state);
+
+    // The lead's destroy waits for the member's.
+    const Destroyer = struct {
+        fn run(session: *AgentSession, done: *std.atomic.Value(bool)) void {
+            session.destroy() catch unreachable;
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Destroyer.run, .{ lead, &done });
+    lead_destroyed = true;
+    std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake) catch {};
+    try std.testing.expect(!done.load(.acquire));
+    try member.destroy();
+    member_destroyed = true;
+    thread.join();
+    try std.testing.expect(done.load(.acquire));
+}
+
+test "AgentSession.inheritPermissions: the lead replaces its rules and directories while a member decides, and no decision reads a freed set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const lead = try createTestSession(runtime, .bypass_permissions, root);
+    defer lead.destroy() catch unreachable;
+    const member = try createTestSession(runtime, .bypass_permissions, root);
+    defer member.destroy() catch unreachable;
+    try member.inheritPermissions(lead);
+
+    const Writer = struct {
+        fn run(session: *AgentSession, dir: []const u8, stop: *std.atomic.Value(bool)) void {
+            var i: usize = 0;
+            while (!stop.load(.acquire)) : (i += 1) {
+                if (i % 2 == 0) {
+                    session.updatePermissionRules(.{ .deny = &.{"Bash"} }) catch unreachable;
+                    session.setAdditionalDirectories(&.{dir}) catch unreachable;
+                } else {
+                    session.updatePermissionRules(.{}) catch unreachable;
+                    session.setAdditionalDirectories(&.{}) catch unreachable;
+                }
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{ lead, root, &stop });
+    var denied: usize = 0;
+    var allowed: usize = 0;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        switch (permission.checkPermission(&member.permission_ctx, "Bash", "{\"command\":\"make\"}")) {
+            .deny => denied += 1,
+            .allow => allowed += 1,
+            else => return error.UnexpectedDecision,
+        }
+    }
+    stop.store(true, .release);
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 2000), denied + allowed);
 }

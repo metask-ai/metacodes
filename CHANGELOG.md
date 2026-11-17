@@ -12,6 +12,123 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **An explicit Skill run takes the Host's context blocks** (#534). An
+  AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
+  be refused with `INVALID_ARGUMENT`; the blocks now lead the Skill's
+  invocation record, so the selected Skill sees them, and the date, from its
+  first request (`doc/AGENTCORE_BINARY_ABI.md`).
+
+- **The Metask sign-in moves to `www.metask-ai.com` and is kept as the Metask
+  session** (#527). `/login` and `metacodes login` sign in at Metask's OAuth
+  server as the public client `metacodes`, ask for `read model:invoke`, and
+  come back on `http://localhost:<port>/auth/metask/callback`. There is no API
+  key to choose any more: the model and reasoning level are picked from the
+  `/v1/models` of the gateway the sign-in names (image-only models are left
+  out; `none` is offered only for a model whose reasoning it can turn off),
+  and turns go there with the session's own access token, billed to the
+  account. The sign-in is stored as `oauth/metask.json`, its model and
+  reasoning level in `auth.json`; a key or an older sign-in there is replaced.
+  Until then an older sign-in there keeps refreshing at `napi.metask-ai.com`
+  as `metacode-cli`, which Metask keeps up for the transition.
+  A plain start signs in with the session, ahead of the provider `.env`
+  configures and after any key that signs Metask in (#499's first part); a
+  stored Metask default the session authenticates runs at the session's
+  gateway. `/logout` and `metacodes logout` revoke the session at Metask
+  first, bounded, and say when that fails. `metacodes login status` shows the
+  session. The device-code sign-in now posts to `www.metask-ai.com` (the bare
+  host answers every request with a redirect, so it failed with
+  `RequestFailed`), asks for the same scope, names the client in every grant
+  and the refresh, and sends no host name. It also asks for the model and
+  reasoning level, as the browser sign-in does: `metacodes login --provider
+  metask` at a terminal, and `/login metask` in `/login`'s pane. Before, it
+  chose none, and a start on it ran the compiled default model, which the
+  gateway does not serve. Without a terminal it stores only the session and
+  says so. If the running session cannot switch to the chosen model, the new
+  session and model choice are rolled back: the previous sign-in, stored
+  default, and current route keep working together.
+
+- **`/login` signs in to Metask in the browser; `/logout` switches back to
+  local configuration** (#485). `/login` alone now runs `metacodes login`'s
+  browser sign-in, then asks for the API key, model and reasoning level in
+  the pane (an account without keys is told where to create one); Esc at any
+  step stores and changes nothing. Once chosen, `auth.json` is written as
+  `metacodes login` writes it, the session moves onto Metask at once, and a
+  stored `/model` default is forgotten so the next start uses the sign-in
+  (`metacodes login` now forgets it too). The provider list it used to open
+  is `/login <provider>` (the pane names those providers); `/login metask` is
+  still the device-code sign-in, which the pane names for a machine without
+  a browser. The new `/logout` removes both Metask sign-ins (`auth.json` and
+  `oauth/metask.json`), forgets a stored default that resolves to Metask,
+  drops every Metask credential the process holds, and moves a session on
+  Metask to the provider `.env` configures (`Switched to <provider> (from
+  .env)`: the parenthesis names where its key came from, and a Metask that
+  `.env` configures runs on `.env`'s key) or leaves it without a model; it
+  names a `METASK_API_KEY` still set in the shell or `.env`. `/logout
+  <provider>` removes the key `/login <provider>` stored. Neither runs in
+  the middle of a turn. A start on Metask while `.env` configures another
+  provider says so once under the banner (`.env configures DeepSeek; the
+  default is Metask. To use DeepSeek: /model, or /logout`).
+- **A provider named at start without a key opens the TUI without a model,
+  and a stored default without one is passed over** (#485). `--provider`,
+  `--offer`, `METACODES_PROVIDER` or `.env` naming a provider that has no
+  credential no longer stops the TUI, nor quietly uses another provider: the
+  TUI opens unbound and its note names the variables that provider reads, or
+  `/login metask` for Metask (`-p` still stops with the provider's help). A
+  `/model` default (`global_selection`) whose provider has no credential is
+  passed over for the Metask sign-in or `.env`, with one notice (`The
+  default model, X, has no key or sign-in; this session uses Y.`), where it
+  used to stop the start.
+  A Metask default is served by the browser sign-in's key (`auth.json`) when
+  there is no device-code sign-in: it used to stop with `Metask session is
+  unavailable`.
+- **`metacodes logout` removes both Metask sign-ins and says which** (#499,
+  part 2). It used to remove `auth.json` only, leaving the device-code
+  sign-in and its refresh token in `oauth/metask.json` usable. It now removes
+  both (and a key stored with `login --provider metask`, which `logout
+  --provider metask` now also does), forgets a stored default that resolves
+  to Metask so the next start falls back instead of failing, and names a
+  `METASK_API_KEY` still set in the shell or `.env`. README's quick start
+  signs in with `metacodes login`, or `metacodes login --provider metask
+  --no-browser` on a machine without a browser.
+- **`metacodes` with nothing configured opens the terminal UI instead of
+  exiting** (#484). With no flag, stored `/model` default, Metask sign-in or
+  `.env` provider, or with a Metask sign-in whose key and model were never
+  chosen (`Metask login is incomplete`), the TUI starts without a model: the
+  banner's model line reads `not set — /login, or configure .env`, slash
+  commands work, and a prompt — or `/retry`, `/init`, `/commit`, `/review`,
+  `/btw`, `/recap`, a Skill — is not sent. A red note in its place names
+  `/login`, this install's `.env` (and `.env.example` when an install wrote
+  it), the provider keys the shell holds by name only (they are still never
+  used on their own: `/model` picks one) and doc/LOCAL_CONFIG.md. The prompt
+  stays in the history for ↑, no request of any kind goes out (not even the
+  `/v1/models` probe), and no session directory is made until a model is
+  chosen. `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe still
+  stop at once, non-zero, with the sign-in hint. The banner now also says
+  where the model's credential came from — `· Metask`, `· from .env`,
+  `· from shell`, `· saved key`, `· signed in`, `· --api-key` — and
+  `metacodes install` ends with the next step while the install has neither a
+  Metask sign-in nor a `.env`.
+
+- **`/model` lists only routes it can apply, and takes no key** (#488). A
+  route is listed when a credential resolves for it now, by the resolution a
+  commit binds with, without sending a request: the environment,
+  `<state root>/.env`, a key `/login <provider>` stored, a provider's stored
+  OAuth login, a credential-pool member, `--api-key` for its provider, and
+  for Metask the session's own key or, in a session started on another
+  provider, the key `metacodes login` stored in `auth.json` (a pick of a
+  Metask route now binds that key; it used to fail with
+  `MissingCredentials`). Only a missing credential takes a route off the
+  list: one refused for another reason (two names of its key that
+  disagree, say) stays listed, and a pick says why. A provider with no such
+  credential is no longer a row that leads to a sign-in or a key field: it
+  is listed dimmed under
+  "Not configured", below the others, and choosing it shows the variable to
+  set, this install's `.env` and `doc/LOCAL_CONFIG.md` (for Metask, `/login`
+  first), and starts nothing. The in-picker sign-in and key-paste stage of
+  #67 are gone; `/login <provider>` pastes a key or signs in, as before. A
+  pick that moves the session to another provider says on a second line who
+  bills it from then on (`from now on billed to your DeepSeek account`).
+
 - **`KIMI_API_KEY` is the Kimi Code subscription's key, no longer an alias
   of `MOONSHOT_API_KEY`** (#487). The `kimi` profile (the Moonshot open
   platform) now reads `MOONSHOT_API_KEY` only, and `KIMI_API_KEY`
@@ -41,6 +158,23 @@ status, compatibility boundaries, and entry points are defined by
   0.12.0 wrote the `command_result` alone. The permission mode is journaled
   by a config sink on the Session's permission context, so a submission's
   mode is journaled once, as before.
+- **A request whose sign-in or key was rejected, or whose balance ran out,
+  ends by saying what to do instead of suggesting `/retry`.** The TUI ended
+  every failed request with `Retry with /retry, or switch models or compact
+  the context first.`, and a retry cannot help either of these. On HTTP 401
+  or 403 the last line is now `Your Metask sign-in is no longer valid. Sign
+  in again: /login` on Metask, and on another provider `DeepSeek rejected
+  the API key. Check DEEPSEEK_API_KEY in <state root>/.env or your shell,
+  then restart.`, with that provider's name and key variable. On HTTP 402,
+  or when the provider's error code is `insufficient_balance` or
+  `insufficient_quota` (OpenAI answers a used-up quota with 429), it is
+  `Your Metask balance has run out. Top up your Metask account, or switch
+  provider: /model`, or `DeepSeek reports no balance or quota left. Top up
+  with DeepSeek, or switch provider: /model`. `-p` prints the same line on
+  stderr after the raw error, naming the command that was run
+  (`metacodes login`) and `--provider` where the TUI names `/login` and
+  `/model`; its exit code stays 1. Every other failure keeps the old
+  advice, and nothing is retried or switched by itself.
 
 ### Added
 
@@ -59,6 +193,37 @@ status, compatibility boundaries, and entry points are defined by
   can build and test in its workspace instead of running read-only commands
   only.
 
+- **A `SessionHost` Session can move onto another provider route, journaled
+  as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`
+  commit moves the session's provider, endpoint, credential and model
+  together and broadcasts the route's identity; `SessionHost` had no route
+  at all. The new `Command.set_route` takes a `Route` the Host's provider
+  control plane bound (`binding`: provider kind, wire protocol, auth scheme,
+  dialect, endpoint, credential, model; and the provider, channel, protocol,
+  offer id, credential reference and scope that identify it). The driver
+  applies it between Runs through the new `AgentSession.setRoute`, which
+  swaps all of them at once and keeps the conversation and reasoning effort
+  (an effort the new provider cannot take is refused with
+  `AgentEffortUnsupportedProvider`). It then journals
+  `config_changed{model}` and `config_changed{route}`, as the CLI does, and
+  never the credential. A refused route changes nothing and journals no
+  `config_changed`. A teammate a lead opens afterwards runs on the lead's
+  route (`TeammateSpawn.lead_route`, applied by `InheritLead`). An
+  `AgentSession` now keeps its own copy of `SessionConfig.auth_scheme`.
+- **A hosted lead's members follow the permission rules and directories it
+  gains, as the daemon's teammates do** (part of #445). Under
+  `session_host.InheritLead` a member decided its tool calls with what its
+  configuration held when it opened, so a rule the lead gained later
+  (`update_permission_rules`, an "allow always" or "deny" answer) or a
+  directory it added (`set_additional_directories`) never reached it. The
+  new `TeammateFactory.permissions = .lead`, which `InheritLead` declares,
+  opens each member through the new `AgentSession.inheritPermissions`: it
+  decides every tool call with its lead's imported rules, additional
+  directories and Session memory as they are at that call, from its next
+  tool call on, and refuses its own `update_permission_rules` and
+  `set_additional_directories` (`PermissionsInherited`). Each decision holds
+  the lead's lock (`permission/lent.zig`); the lead frees replaced rules
+  only after it, and its AgentSession outlives its members'.
 - **A `SessionHost`'s model catalog can be refreshed while it runs, as the
   daemon's is** (part of #445). The daemon's catalog is its cached
   `/v1/models` answer, replaced when the background refresh lands;
@@ -77,7 +242,14 @@ status, compatibility boundaries, and entry points are defined by
   the project kernel, and publishes the Run's operational observer after it;
   a missing or invalid kernel configuration, a bundle that fails
   attestation, or a running background job or active team fails the Run
-  before any provider request. `abandoned_run = .record_abandoned` closes a
+  before any provider request. Such a refusal fails only that Run, as the
+  daemon reports it failed and takes the next message: the submission's
+  text stays out of the Conversation and the Session is idle again, not
+  poisoned (a journal that cannot open still poisons). A refused resumption
+  of a suspended Run (`AdmittedRun.resumeWithResults`) leaves the answer
+  out of the Conversation too, and `SessionHost` keeps the suspension:
+  `run_done` names the error, the request is announced again under its id,
+  recorded open, and a later answer resumes the turn. `abandoned_run = .record_abandoned` closes a
   Run whose process died as abandoned and runs the next one, as the daemon
   does; the default stays `fail_closed`. Either setting on an ephemeral
   Session is refused (`RunControlRequiresRunJournal`), and a Session that
@@ -173,6 +345,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Shift+Enter inserts a newline while a reply streams** (#456). In the
+  terminal UI, Shift+Enter during a reply did what Enter does: the draft
+  went into the pending queue, the input box was cleared, and when the reply
+  ended the line typed so far was sent as the next message. It now inserts
+  a newline in the draft, as it does at the prompt; Enter still queues the
+  whole draft, newline included, as one message.
+- **`/model` names the variable and the file for a provider without a key**
+  (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
+  chosen without its key ended in `switch failed (MissingCredentials)`: these
+  providers have neither a sign-in nor a key page the picker could open.
+  Such a provider is now listed under "Not configured" (#488), and a pick
+  whose key went away after the picker opened shows the same setup: the
+  variable to set (the canonical one, e.g. `MOONSHOT_API_KEY`), this
+  install's `<state root>/.env` and the guide (`doc/LOCAL_CONFIG.md`); the
+  previous route stays active. A picker notice longer than the terminal is
+  wide is broken into rows inside the width instead of running past it.
 - **An idle AgentCore Session no longer holds about 50 MB of private commit
   on Windows** (#503). Zig 0.16's `std.Thread.spawn` hands its 16 MiB
   default stack to `NtCreateThreadEx` as the stack *commit*, so each thread
@@ -279,6 +467,31 @@ status, compatibility boundaries, and entry points are defined by
   and still spawns `/bin/sleep` by that name; the second hashes an
   executable it writes into a temporary directory. Product code is
   unchanged.
+
+### Security
+
+- **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**
+  (#473). The TUI, `-p`, `--web` and `serve` permissioned a tool an MCP
+  server contributes as a read, so `default`, `acceptEdits` and `auto` ran it
+  on the model's decision alone: a tool that changes something outside the
+  machine (a database, a ticket system, a deployment, a device) ran without a
+  prompt, and text the model read in a web page, a file or another tool's
+  output could steer it there. AgentCore already permissioned the same tool
+  as executing and asked. Every tool a server lists is now permissioned as
+  executing, as `Bash` is: `default`, `acceptEdits` and `auto` ask before it
+  runs (`-p`, with nobody to ask, denies it), `dontAsk` denies it, and
+  `bypassPermissions` runs it. A server's annotations (`readOnlyHint` and the
+  rest) are its own claim and do not relax this. To keep a trusted server's
+  tools running without a prompt, allow the server:
+  `{"permissions": {"allow": ["mcp__<server>"]}}` in a settings file
+  (`mcp__<server>__*` and `mcp__<server>__<tool>` work too), or
+  `--allowedTools mcp__<server>`. Approving a project server in `.mcp.json`
+  only starts it. `ListMcpResourcesTool`, `ReadMcpResourceTool` and the
+  Skill tool keep their classification.
+  `tests/component/mcp_permission_test.zig` runs a real App against the
+  stdio mock server in every mode and under each spelling of the allow rule,
+  and checks what the server received; `tests/tty/cases/test_mcp_permission.py`
+  checks the TUI's dialog.
 
 ## 0.12.0 — 2026-11-13
 

@@ -1,9 +1,10 @@
 """Guided API-key login for a provider without OAuth (the GLM Coding Plan, Kimi Code).
 
-Z.AI offers no third-party sign-in, so `/login zai-coding-plan`, the `/model`
-picker and `metacodes login --provider zai-coding-plan` show the plan pages a
-key is created on, take the pasted key without showing it, check it with a
-GET the provider does not bill, and store it in that provider's own key file.
+Z.AI offers no third-party sign-in, so `/login zai-coding-plan` and
+`metacodes login --provider zai-coding-plan` show the plan pages a key is
+created on, take the pasted key without showing it, check it with a GET the
+provider does not bill, and store it in that provider's own key file. The
+`/model` picker takes no key (#488): it only says where one goes.
 
 The check is pointed at a local mock with METACODES_KEY_CHECK_URL; the page a
 key is created on is "opened" through a $BROWSER recorder. The kernel flow and
@@ -183,25 +184,27 @@ def test_login_dialog_refused_key_stores_nothing_and_says_why(bin_path):
         assert not os.path.exists(case.key_file()), "a refused key was stored"
 
 
-def test_model_pick_without_a_key_takes_the_pasted_key_and_switches(bin_path):
+def test_model_takes_no_key_and_shows_where_it_goes(bin_path):
+    # #488: /model no longer opens a key field. Without a key the plan is listed
+    # dimmed under "Not configured"; choosing it shows the variable, this
+    # install's .env and the guide. It checks nothing, opens nothing, stores
+    # nothing: `/login zai-coding-plan` (above) is where a key is pasted.
     with _Case() as case:
         events = [READY, "type:/model", "key:enter", wait_for("Provider", 10),
-                  "type:zai", "sleep:0.5", "key:enter", "sleep:0.8",  # provider
-                  "key:enter", "sleep:0.8",  # GLM-5.3
-                  "key:enter", "sleep:0.8",  # its China · Anthropic channel
-                  "key:enter", wait_for("API key", 10),  # options: apply → no key
-                  f"type:{GOOD_KEY}", wait_for(f"({len(GOOD_KEY)} characters)", 10),
-                  "key:enter", wait_for("switched to glm-5.3", WAIT_S)]
+                  "type:zai", wait_for("Not configured", 10), "key:enter",
+                  wait_for("ZAI_API_KEY", 10), f"type:{GOOD_KEY}", "key:enter", "sleep:0.8"]
         raw = run(bin_path, events, term_size=(40, 120), env=case.env(), per_key_drain=0.05)
         a, text = _screen(raw, 40, 120)
-        if not a.screens_with("China · Personal Coding Plan"):
-            a._fail("the key step should list the plan pages")
-        assert "switched to glm-5.3 for session" in text, "the pending pick was not applied:\n" + text
-        assert GOOD_KEY.encode() not in raw, "the pasted key was echoed to the terminal"
-        assert case.checks() == [f"Bearer {GOOD_KEY}"], case.checks()
-        # Enter checks and stores; only Tab opens the page.
+        env_file = os.path.join(case.home, ".metacodes", ".env")
+        assert f"Set ZAI_API_KEY in {env_file}, then restart" in text, text
+        assert "LOCAL_CONFIG.md" in text, text
+        if a.screens_with("paste it"):
+            a._fail("/model should not offer a key field")
+        # The characters typed in the setup were not taken as a key.
+        assert GOOD_KEY.encode() not in raw, "the typed key was echoed to the terminal"
+        assert case.checks() == [], case.checks()
         assert case.opened_urls() == [], case.opened_urls()
-        case.assert_stored(GOOD_KEY)
+        assert not os.path.exists(case.key_file()), "a key was stored from /model"
 
 
 def _cli(bin_path, args, env, answers, timeout=WAIT_S):
@@ -280,15 +283,17 @@ def test_cli_login_reads_the_key_without_echo(bin_path):
 
 def test_login_dialog_lists_kimi_code_as_an_api_key_provider(bin_path):
     with _KimiCase() as case:
-        events = [READY, "type:/login", "key:enter", wait_for("Select a provider:", 10),
+        # `/login` alone is the Metask sign-in (#485); it names the providers
+        # `/login <provider>` signs in to, the API-key ones among them.
+        events = [READY, "type:/login", "key:enter", wait_for("/login <provider>", 10),
                   "key:esc", wait_for("Login interrupted", 10)]
-        raw = run(bin_path, events, term_size=(30, 120), env=case.env(), per_key_drain=0.05)
-        a, _ = _screen(raw, 30, 120)
-        # The row comes from the profile's api_key_setup, like the GLM plan's.
-        if not a.screens_with("Kimi Code · API key"):
-            a._fail("/login should list Kimi Code as an API-key provider")
-        if not a.screens_with("Z.AI GLM Coding Plan · API key"):
-            a._fail("/login should still list the GLM Coding Plan")
+        raw = run(bin_path, events, term_size=(30, 200), env=dict(case.env(), BROWSER="true"), per_key_drain=0.05)
+        a, _ = _screen(raw, 30, 200)
+        # The names come from the profiles' api_key_setup, the GLM plan's too.
+        if not a.screens_with("kimi-code"):
+            a._fail("/login should name Kimi Code as a provider it signs in to")
+        if not a.screens_with("zai-coding-plan"):
+            a._fail("/login should still name the GLM Coding Plan")
         assert case.checks() == [], case.checks()
 
 

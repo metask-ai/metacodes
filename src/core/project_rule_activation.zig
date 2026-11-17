@@ -93,11 +93,27 @@ pub const RunControl = struct {
         };
         errdefer self.journal.deinit();
         const project_root = options.project_root orelse return self;
-        const project_gate = RunGate.load(
-            allocator,
-            session_dir,
+        try self.loadProjectGate(project_root, options.abort);
+        return self;
+    }
+
+    /// Gates the open Run by the active bundle of `project_root`, as
+    /// `initWithOptions` does when given one. A Host that tells a journal
+    /// that cannot open apart from the project rules refusing the Run
+    /// (`AgentSession`, #445) opens with `project_root = null` and calls
+    /// this: an error here is the rules' refusal, the Run already closed in
+    /// the journal. At most once per RunControl.
+    pub fn loadProjectGate(
+        self: *RunControl,
+        project_root: []const u8,
+        abort: ?*const @import("../util/abort.zig").AbortSignal,
+    ) !void {
+        std.debug.assert(self.project_gate == null);
+        self.project_gate = RunGate.load(
+            self.allocator,
+            self.session_dir,
             project_root,
-            options.abort,
+            abort,
             self.journal.sink(),
         ) catch |err| {
             // No provider request or tool action can occur before RunControl
@@ -108,8 +124,6 @@ pub const RunControl = struct {
             self.journal.finishRun("project_gate_load_failed") catch {};
             return err;
         };
-        self.project_gate = project_gate;
-        return self;
     }
 
     pub fn observer(self: *RunControl) observation.Sink {

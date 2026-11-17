@@ -41,9 +41,10 @@ surfaces built over the same core protocols.
 `metacodes login --provider metask` performs the Metask JSON device flow:
 
 * `POST $METASK_SITE_URL/api/oauth/device/code` (default site
-  `https://metask-ai.com`) with `client_id=metacodes` and the local hostname;
-* polling `POST $METASK_SITE_URL/api/oauth/token` with the device grant until
-  approval; and
+  `https://www.metask-ai.com`) with `client_id=metacodes` and
+  `scope=read model:invoke`;
+* polling `POST $METASK_SITE_URL/api/oauth/token` with the device grant and
+  `client_id` until approval; and
 * atomically storing `access_token`, `refresh_token`, `expires_at`,
   `gateway_url`, `models_url`, and `client_name` in
   `$HOME/.metacodes/oauth/metask.json` (or `METACODES_OAUTH_DIR`).
@@ -82,7 +83,10 @@ normative model; the entry points are:
 |---|---|
 | `--provider <id\|alias>` / `METACODES_PROVIDER` | resolve the route through the provider registry instead of inferring a transport from the model name |
 | `METACODES_MODEL` | the model, as `--model` gives it (the flag wins) |
-| `<state root>/.env` | the install's local configuration ([LOCAL_CONFIG.md](LOCAL_CONFIG.md)), read once at start and never `setenv`: a layer below the process environment for the names it may set — every registered profile's `env_aliases`, the variables `config.json` names (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`, `METACODES_MODEL`; a provider's aliases are read from it only when the environment sets none of them. Request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`, `METACODES_KG_URL`, any `*_URL`) are refused; other names are ignored with one warning listing them. Its `METACODES_PROVIDER` (else the one provider whose key it holds) applies only when no flag or environment variable names a provider, no `global_selection` is stored and no Metask sign-in exists (`--api-key`, `METASK_API_KEY`, `auth.json`); keys of several providers and no name stop the run and list them. A `.env` anywhere else, the working directory included, is never read. `metacodes install` writes `<state root>/.env.example` on every install and upgrade and never touches `.env` |
+| `<state root>/.env` | the install's local configuration ([LOCAL_CONFIG.md](LOCAL_CONFIG.md)), read once at start and never `setenv`: a layer below the process environment for the names it may set — every registered profile's `env_aliases`, the variables `config.json` names (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`, `METACODES_MODEL`; a provider's aliases are read from it only when the environment sets none of them. Request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`, `METACODES_KG_URL`, any `*_URL`) are refused; other names are ignored with one warning listing them. Its `METACODES_PROVIDER` (else the one provider whose key it holds) applies only when no flag or environment variable names a provider, no `global_selection` is stored and no Metask sign-in exists (`--api-key`, `METASK_API_KEY`, a key or older sign-in in `auth.json`, the Metask session `oauth/metask.json`); keys of several providers and no name choose none, and the run lists them. A `.env` anywhere else, the working directory included, is never read. `metacodes install` writes `<state root>/.env.example` on every install and upgrade and never touches `.env` |
+| no credential at all | the interactive TUI opens without a model (#484): its banner reads `not set — /login, or configure .env`; a prompt, `/retry`, `/edit <n>`, `/init`, `/commit`, `/review`, `/btw`, `/recap` and a Skill are refused with a note before any request is assembled; nothing is probed; no session directory is made until a route binds (`/model`, `/login`). A Metask sign-in in `auth.json` older than #527 with no key and model chosen opens it the same way, and so does a provider named by `--provider`, `--offer`, `METACODES_PROVIDER` or `.env` that has no credential: the note names that provider's variables, and no other provider is used in its place (#485). `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe exit non-zero with the sign-in hint (or the named provider's help) instead. The banner names where a bound route's credential came from (`· Metask`, `· from .env`, `· from shell`, `· saved key`, `· signed in`, `· --api-key`) |
+| stored default without a credential | a `global_selection` whose provider has no credential (a Metask one: no Metask session, no Metask key and no key in `auth.json`; a stored Metask route the session authenticates runs at the session's gateway, never at the compiled endpoint with the session's token, #527) is passed over for the levels below it, with one notice: `The default model, <provider> · <model>, has no key or sign-in; this session uses <model> · <origin>.` (under the TUI's banner, else on stderr) (#485) |
+| `metacodes logout` | revokes the Metask session at `$METASK_SITE_URL/api/oauth/revoke` (bounded; a failure is reported and the local sign-out goes on), removes both Metask sign-ins (`auth.json`, `oauth/metask.json` with its refresh token) and a key stored with `login --provider metask`, forgets a stored default that resolves to Metask, and says which it removed; `METASK_API_KEY` left in the shell or `.env` is named, never removed. `logout --provider metask` is the same (#499) |
 | `--channel <id>` | narrow to one endpoint/region/plan/account binding |
 | `--offer <offer-id>` | pin one exact reproducible route |
 | `--base-url <url>` | validated against the selected profile and route policy before any request URL is built |
@@ -99,21 +103,58 @@ Interactive surfaces: `Ctrl+O` and `/model` open the route picker (transcript
 viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
 and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
 names a route (`pin`, `float`, `use`, `remove`); `/models` still selects the
-account key; `/login` opens a Login pane listing the providers this
-installation can sign in to (Metask's own device grant included), and
-`/login <id> [--device-code] [--no-browser] [--client-id <client>]` starts that
-provider's sign-in directly; either runs the kernel OAuth flow on a worker
-thread (`Esc` cancels it) and stores the login where
-`metacodes login --provider <id>` does (issue #33); `--client-id` is needed
+account key of a key route; `/login` alone runs the Metask browser sign-in
+`metacodes login` runs (authorization code + PKCE at
+`https://www.metask-ai.com` as the client `metacodes`, scope
+`read model:invoke`, on a loopback `/auth/metask/callback`; `--no-browser`
+prints the URL without opening it) on a worker thread, then asks for the
+model and reasoning level in the pane, from the `/v1/models` of the gateway
+the token response names (models that gateway does not serve on
+`/v1/messages` are left out); `Esc` at any step stores and changes nothing.
+Once both are chosen it stores the token response as the Metask session
+(`oauth/metask.json`) and the choice in `auth.json`, as `metacodes login`
+does, moves the session onto that gateway with the session's token at once,
+and forgets a stored `global_selection`, so the next start is on the sign-in
+too (#485, #527). `/logout` revokes the Metask session at Metask, removes
+both Metask sign-ins (`auth.json` and the session `oauth/metask.json`) and a
+Metask key
+stored with `login --provider metask`, forgets a stored default that resolves
+to Metask, drops every Metask credential the process holds (nothing is sent
+with one again), and moves a session on Metask to the provider `.env`
+configures (`Switched to <provider> (from .env)`) or leaves it unbound;
+`/logout <id>` removes `keys/<id>.json`, and a session that ran on that key
+holds no credential afterwards. Neither runs in the middle of a turn: a
+command typed then waits in the queue until the turn ends.
+`/login metask` is Metask's device grant in the pane `/login` uses: the code
+is confirmed on any device, then the model and reasoning level are chosen,
+and the sign-in is stored and used as `/login`'s (#527).
+`/login <id> [--device-code] [--no-browser] [--client-id <client>]` starts
+another provider's sign-in directly; it
+runs the kernel OAuth flow on a worker thread (`Esc` cancels it) and stores
+the login where `metacodes login --provider <id>` does (issue #33); `--client-id` is needed
 only when neither the profile nor `providers.<id>.oauth_client_id` in
-`~/.metacodes/config.json` names the installation's registered client (#87). Choosing a route whose
-OAuth-capable provider has no credential signs in inside the picker: the
-authorization URL or device code is drawn in the overlay, `Esc` cancels the
-flow, and the chosen route is committed once the login lands (issue #67). A
-provider that takes a pasted key instead (`zai-coding-plan`, `kimi-code`) is listed in
-`/login` as "API key", and choosing one of its routes without a key shows its
-key pages in the picker: ↑/↓ picks the plan, Tab opens the page, the key is
-typed masked, and Enter checks and stores it before the route is committed.
+`~/.metacodes/config.json` names the installation's registered client (#87). A
+provider that takes a pasted key instead (`zai-coding-plan`, `kimi-code`) is
+listed in `/login` as "API key": ↑/↓ picks the plan, its page opens, the key is
+typed masked, and Enter checks and stores it.
+
+The picker lists only routes a commit can apply as they are (#488): a route is
+listed when a credential resolves for it now, by the same resolution a commit
+binds with, without a request: the environment, `<state root>/.env`, a key
+`/login <id>` stored, a provider's stored OAuth login, a credential-pool
+member, `--api-key` for the provider it was given for, and for Metask the
+session's own key or, in a session started on another provider, the key
+`metacodes login` stored in `auth.json`. Only a missing credential takes a
+route off the list: a route refused for another reason (two names of its key
+that disagree, say) stays listed, and a commit reports why. A
+provider none of whose routes has one is listed dimmed under "Not
+configured", below the others; choosing it shows the variable its key is read
+from, this install's `<state root>/.env` and `doc/LOCAL_CONFIG.md` (for
+Metask, `/login` first), and nothing else: the picker starts no sign-in, takes
+no key and sends no request. A commit that still finds no credential shows the
+same. `/login <id>` is where a key is pasted or a provider signed in to; the
+in-picker sign-in and key stage of #67 are gone. When a commit moves the
+session to another provider, its confirmation says who bills it from then on.
 
 A committed route is broadcast on the UI event stream as `config_changed` →
 `route`, carrying provider, channel, protocol, wire model id, offer id,
@@ -821,7 +862,7 @@ in one of five ways:
 
 | Class | Settings | How it changes |
 |---|---|---|
-| Idle-mutable | model, permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value. |
+| Idle-mutable | model, route (provider kind, endpoint, auth scheme, dialect, credential and model together), permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setRoute`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value; a Session that inherits this one's permissions (`inheritPermissions`, #445) decides its next tool call with the new rules and directories, and refuses its own `updatePermissionRules`/`setAdditionalDirectories` (`error.PermissionsInherited`). |
 | Live-replaceable | API key (the provider credential) | `updateCredential`, idle or during a Run, from any thread or from the Session's own callbacks; never `error.SessionBusy`, and refused only for a poisoned Session or an invalid candidate. Create and restore apply the same rule to `SessionConfig.api_key` (1 to 16 KiB of printable ASCII; `error.InvalidCredentialByte`, `error.EmptyCredential`, `error.CredentialTooLong`). The candidate is validated and copied before anything changes; a refusal keeps the previous credential. A request reads the credential when it is sent (once it holds its connection slot), so every request sent after the call returns uses the new credential, retries, tool providers built earlier and requests still waiting for a connection included; one already sent keeps the old one. See [Credential updates](AGENTCORE_BINARY_ABI.md#credential-updates). |
 | Runtime generation | built-in tool set, static and process plugins, provider dialects | `RuntimeHost.replace`. Sessions created afterwards use the new generation; existing Sessions stay on theirs. To move a Session, persist it and restore it with `createRestoredSession` on the new generation. |
 | Fixed at create | provider kind, OpenAI protocol, auth scheme, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
@@ -1164,7 +1205,7 @@ leaving every Host to rebuild them:
 - `HostedSession.submit` and `command` (`set_model`, `set_permission_mode`,
   `set_reasoning_effort`, `set_additional_directories`, `set_prompt_profile`,
   `update_permission_rules`, `compact`, `cancel_cron_job`,
-  `cancel_all_cron_jobs`) share one FIFO run by the Session's
+  `cancel_all_cron_jobs`, `set_route`) share one FIFO run by the Session's
   driver thread, so configuration changes apply between Runs in the order
   they were queued. Each command is answered by `command_result`. As the
   `--web`/`serve` config sink journals `/model`, `/mode`, `/effort` and
@@ -1177,6 +1218,24 @@ leaving every Host to rebuild them:
   (a directory taken away has no line). A refused command journals none.
   The permission mode is journaled by a config sink on the Session's
   permission context, so a mode set any other way is journaled too.
+- `command(.{ .set_route = route })` (issue #16, #445) moves the Session
+  onto a route the Host's provider control plane bound, as the CLI's
+  `/model` commit does (`App.bindCommittedSelection`). `Route.binding` is
+  what the Session sends with (`AgentSession.Route`: provider kind, OpenAI
+  protocol, auth scheme, dialect, credential, model, base URL); the rest
+  says who the route is (`provider_id`, `channel_id`, `protocol`,
+  `offer_id`, `credential_ref`, `scope`). `AgentSession.setRoute` swaps
+  them together while idle, so no request goes out on a mix of the two
+  routes, and keeps the conversation and the reasoning effort; an effort
+  the new provider cannot take is `error.AgentEffortUnsupportedProvider`,
+  never dropped. An accepted route is journaled as `config_changed`
+  `{"model":...}` (the route's model) and then `{"route":{...}}`, as the
+  CLI does, before its `command_result`; the credential is in neither. A
+  refused route (an invalid model or credential, a busy or poisoned
+  Session) changes nothing and journals no `config_changed`. Later
+  `set_model` names resolve for the new provider kind, and a teammate the
+  Session spawns afterwards runs on its route (`TeammateSpawn.lead_route`,
+  which `InheritLead` applies).
 - Every kernel event, host event (`user_message`, `run_done`,
   `command_result`, `message_rejected`, `session_poisoned`, `run_resumed`)
   and UI request lands in the Session's `journal` as a wire line;
@@ -1257,9 +1316,18 @@ leaving every Host to rebuild them:
   `project_rule_blocked` tool error. A missing or invalid kernel
   configuration, a bundle that fails attestation, or a Bash job of the
   Session still running or a team it leads (`ProjectRulesRequireDetachedWorkersIdle`)
-  fails the Run before any provider request: `run_done` names the error,
-  the Run is closed in the journal and, as for any Run that fails, the
-  Session is poisoned. After a Run the bundle is re-attested and the Run's
+  fails the Run before any provider request: `run_done` names the error and
+  the Run is closed in the journal. Unlike other failed Runs, such a refusal
+  does not poison the Session, as the daemon reports the Run failed and
+  takes the next message: the submission's text never enters the
+  Conversation and the Session is idle again. A refused resumption of a
+  suspended Run (`ui_request_wait = .suspend`) keeps the suspension: after
+  `ui_request_closed` and `run_resumed`, `run_done` names the error, the
+  request's `ui_request` line is journaled again under the same id, the
+  Session is `suspended` with that `pending_request_id`, and the request is
+  recorded open, so the answer the refused Run took is dropped and a later
+  `respond` (also after a restart) resumes the turn. A journal that cannot
+  open still poisons. After a Run the bundle is re-attested and the Run's
   operational observation is published beside the journal.
   `abandoned_run = .record_abandoned` closes a Run whose process died as
   abandoned and runs the next one, as the daemon does; the default,
@@ -1297,7 +1365,27 @@ leaving every Host to rebuild them:
   borrowed, outlives the SessionHost) with the lead's current model and
   permission mode, and the spawn's `effort` or else the lead's reasoning
   effort. `InheritLead.derive(base, spawn)` is the same mapping as a pure
-  function. `agent_type` is not interpreted.
+  function. `agent_type` is not interpreted. Its factory declares
+  `TeammatePermissions.lead`, below.
+- `TeammateFactory.permissions` (`TeammatePermissions`, default `.own`) says
+  whose permission state a member decides its tool calls with. `.own`: what
+  `configure` returned, fixed when the member opened. `.lead`: its lead's
+  imported rules, additional directories and Session memory, read at each
+  tool call (`AgentSession.inheritPermissions`), as the bundled daemon's
+  in-process teammates borrow their lead's permission context: a rule the
+  lead gains through `update_permission_rules` or an "allow always"/"deny"
+  answer, and a directory it gains through `set_additional_directories`,
+  decide the member's next tool call, also inside a Run already going. Both
+  Sessions remember answers in the lead's memory. The member's own
+  `update_permission_rules` and `set_additional_directories` are refused
+  (`command_result{ok:false, error_name:"PermissionsInherited"}`); its
+  permission mode, tools, workspace root and the sandbox its shell runs in
+  stay what `configure` returned. Locking: each member decision holds the
+  lead's `lent_permissions` lock for the whole decision (never across a
+  prompt); the lead replaces its rules or directories under that lock and
+  frees the old ones after it. The lead's AgentSession outlives its
+  members': the lead closes them before destroying its own, and its
+  `destroy` waits for any member still being destroyed (permission/lent.zig).
 
 Options: `max_queued`, `max_turns`, `teammates`, `transcripts`,
 `ui_request_timeout_ms`, `ui_request_expiry`, `ui_request_wait`,
@@ -1486,7 +1574,10 @@ they extend the cached prefix instead of moving the system prompt. The date is
 supplied by default (issue #276): AgentCore leads each Run's context with a
 `currentDate` block in the process's time zone, or in a UTC offset the Host
 gives per Run (`RunOptionsV1.time_context_code` / `utc_offset_minutes`); a Host
-`currentDate` block replaces it, and `TIME_CONTEXT_OFF` drops it. The CLI's
+`currentDate` block replaces it, and `TIME_CONTEXT_OFF` drops it. An explicit
+Skill invocation Run (`RUN_INPUT_SKILL`) takes context blocks and the date
+like any other Run (#534): they lead its invocation record, ahead of the Skill
+body. The CLI's
 user-context message always states the session's start date and zone, and the
 first Run on a later local date gets one "the date has changed" notice in that
 turn (`agent_loop.Options.time_announcer`). Source-level Hosts build the same

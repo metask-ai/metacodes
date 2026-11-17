@@ -257,7 +257,7 @@ That installs the latest release on macOS or Linux, arm64 or x86_64. Windows
 uses `scripts\install.ps1` with the release zip. Then:
 
 ```sh
-metacodes login --provider metask          # or --api-key / --provider openai|gemini|zai-coding-plan
+metacodes login                            # sign in to Metask in the browser (or /login in the TUI)
 metacodes                                  # interactive TUI
 metacodes -p "explain src/main.zig" --json # headless, one NDJSON result
 metacodes --web                            # browser UI on 127.0.0.1:7777
@@ -273,9 +273,17 @@ zig build && ./zig-out/bin/metacodes --help
 zig build example                          # embed the runtime from Zig
 ```
 
+On a machine without a browser (a server, an SSH session), sign in with a
+device code instead: `metacodes login --provider metask --no-browser` prints
+a link and a code to confirm on any device, then asks for the model and
+reasoning level (`/login metask` in the TUI). Either sign-in is kept as the
+Metask session, and a plain `metacodes` uses it.
+
 To use your own provider key instead of signing in, put it in the install's
 `~/.local/opt/metacodes/state/.env` and start again:
-[doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md).
+[doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md). `metacodes` opens even with
+nothing set up, and says how to do either; `/logout` switches back from the
+Metask account to that key.
 
 [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) covers isolated installs,
 providers, Metask OAuth, Lean kernels and Windows.

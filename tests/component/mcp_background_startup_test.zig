@@ -277,7 +277,7 @@ test "headless and every other frontend: App.init returns with every MCP server 
     try std.testing.expect(app.toolSurfaceReady());
     try std.testing.expectEqual(.connected, app.mcp_report.servers[0].state);
 
-    const code = try cc.repl_headless.run(app, session.arena.allocator(), "hello headless", null, false);
+    const code = try cc.repl_headless.run(app, session.arena.allocator(), "hello headless", null, false, null);
     try std.testing.expectEqual(@as(u8, 0), code);
     try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
     try std.testing.expect(std.mem.indexOf(u8, srv.lastRequest().?.body(), GATE_TOOL) != null);

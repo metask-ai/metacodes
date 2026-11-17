@@ -428,7 +428,7 @@ pub const RunResult = struct {
     tool_calls: u32,
     suspend_info: ?SuspendInfo = null,
     stall: ?stall_gate.Report = null, // 非空 ⇔ stop_reason == .stalled
-    continuations: u32 = 0, // 本次 run 的 max_tokens 续写次数(≤ MAX_CONTINUATIONS)
+    continuations: u32 = 0, // 本次 run 的 max_tokens 续写总次数(MAX_CONTINUATIONS 只限连续续写)
     learning: ?learning_turn.Report = null, // 学习回合武装且 Run 走到终局边界时非空
 };
 pub const StopReason = enum {
@@ -1051,8 +1051,9 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   `RunResult.continuations` 记本次 `run` 的
   max_tokens 续写次数,headless `--json` 结果行同名字段携带它:续写后的正文是无缝拼接,只看结果
   的消费者没有别的办法知道回答被截断过。
-- **续写额度用尽后仍被截断 = 显式未完成**(issue #394):一个 `run` 至多续写 `MAX_CONTINUATIONS`
-  (3)次。额度用尽后,没有 tool_use 的一轮仍以 max-token 终止(Anthropic `max_tokens`、chat
+- **续写额度用尽后仍被截断 = 显式未完成**(issue #394):一个 `run` 至多**连续**续写
+  `MAX_CONTINUATIONS`(3)次;某轮不再以 max-token 收尾或带了 tool_use(模型已恢复)时连续计数
+  归零,所以长任务里分散的截断不会累计耗尽额度(`RunResult.continuations` 仍记总数)。额度用尽后,没有 tool_use 的一轮仍以 max-token 终止(Anthropic `max_tokens`、chat
   `length`、Responses `response.incomplete` + `max_output_tokens`、Gemini `MAX_TOKENS`)→
   `stop_reason=max_tokens_exhausted`,该段定性 `partial`,不再走主机门、Stop hook 与 `final`
   收尾。有没有可见正文都一样:正文照样交付(`Ledger.partialText()` 是整个续写组的拼接),
