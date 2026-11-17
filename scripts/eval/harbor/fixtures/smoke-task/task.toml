@@ -1,0 +1,31 @@
+schema_version = "1.4"
+artifacts = []
+
+[task]
+name = "metacodes/harbor-smoke"
+version = "1.0.0"
+description = "Zero-cost adapter smoke: a scripted endpoint drives one Bash call."
+authors = []
+keywords = []
+
+[metadata]
+
+[verifier]
+timeout_sec = 120.0
+environment_mode = "shared"
+collect = []
+
+[verifier.env]
+
+[agent]
+timeout_sec = 300.0
+
+[environment]
+network_mode = "public"
+build_timeout_sec = 600.0
+os = "linux"
+mcp_servers = []
+
+[environment.env]
+
+[solution.env]

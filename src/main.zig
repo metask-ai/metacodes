@@ -2124,7 +2124,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     _ = args.next(); // 跳过 argv[0](程序名)
     for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
-    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "mcp", "sealed", "terminal-setup", "update" };
+    const subcommands = [_][]const u8{ "bench", "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "mcp", "sealed", "terminal-setup", "update" };
     for (subcommands) |name| {
         if (std.mem.eql(u8, cmd, name)) break;
     } else return null;
@@ -2136,6 +2136,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     // `update` repairs an install whose state root may be broken, like `doctor`.
     if (std.mem.eql(u8, cmd, "update")) return runUpdate(&args, init, allocator);
     const state_dir = hostStateRoot() catch return 2;
+    if (std.mem.eql(u8, cmd, "bench")) return @import("app/bench_cli.zig").run(&args, allocator, init.io, state_dir);
     if (state_dir.len > 0) @import("core/context_caps.zig").configureStateRoot(state_dir);
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
@@ -4140,6 +4141,9 @@ fn printHelp() void {
         \\metacodes — embeddable agent core and coding CLI
         \\Usage: metacodes [options]
         \\  --version             Print version and build identity and exit (--json: one JSON document)
+        \\  bench [open|info|list|run] [--url <workbench>] [--no-open]
+        \\                        Open Bench workbench; select tasks/models and run evaluations.
+        \\                        bench run --task <name> --wait prints the result link when done.
         \\  doctor [--json | --plain] [--strict]
         \\                        Report where ripgrep and TinyKG resolve from and whether they match this build
         \\  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]

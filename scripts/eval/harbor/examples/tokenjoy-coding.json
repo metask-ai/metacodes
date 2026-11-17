@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "custom_providers": {
+    "tokenjoy": {
+      "display_name": "TokenJoy · Chat",
+      "auth": {"kind": "bearer"},
+      "env_aliases": [{"name": "TOKENJOY_API_KEY", "kind": "api_key", "canonical": true}],
+      "channels": [{"id": "chat", "base_url": "https://api.tokenjoy.org/v1", "protocol": "openai_chat"}],
+      "models": [
+        {
+          "request_model_id": "GLM5.3-Flash",
+          "canonical_model_id": "zai/glm-5.3-flash",
+          "dialect": "glm",
+          "limits": {"context_window": 200000, "max_output_tokens": 32768}
+        },
+        {
+          "request_model_id": "GLM5.2",
+          "canonical_model_id": "zai/glm-5.2",
+          "dialect": "glm",
+          "limits": {"context_window": 200000, "max_output_tokens": 32768}
+        },
+        {
+          "request_model_id": "passthrough/deepseek-v4.1-flash",
+          "canonical_model_id": "deepseek/deepseek-v4.1-flash",
+          "dialect": "deepseek",
+          "limits": {"context_window": 200000, "max_output_tokens": 32768}
+        },
+        {
+          "request_model_id": "kimi-k3",
+          "canonical_model_id": "moonshotai/kimi-k3",
+          "dialect": "kimi",
+          "limits": {"context_window": 200000, "max_output_tokens": 32768}
+        }
+      ]
+    },
+    "tokenjoy-gpt": {
+      "display_name": "TokenJoy · Responses",
+      "auth": {"kind": "bearer"},
+      "env_aliases": [{"name": "TOKENJOY_API_KEY", "kind": "api_key", "canonical": true}],
+      "channels": [{"id": "responses", "base_url": "https://api.tokenjoy.org/v1", "protocol": "openai_responses"}],
+      "models": [
+        {
+          "request_model_id": "gpt-6.1-sol",
+          "canonical_model_id": "openai/gpt-6.1-sol",
+          "dialect": "openai",
+          "limits": {"context_window": 200000, "max_output_tokens": 32768}
+        }
+      ]
+    },
+    "tokenjoy-claude": {
+      "display_name": "TokenJoy · Messages",
+      "auth": {"kind": "bearer"},
+      "env_aliases": [{"name": "TOKENJOY_API_KEY", "kind": "api_key", "canonical": true}],
+      "channels": [{"id": "messages", "base_url": "https://api.tokenjoy.org", "protocol": "anthropic_messages"}],
+      "models": [
+        {
+          "request_model_id": "kiro/claude-opus-5-5",
+          "canonical_model_id": "anthropic/claude-opus-5-5",
+          "dialect": "claude",
+          "limits": {"context_window": 200000, "max_output_tokens": 32768}
+        }
+      ]
+    }
+  }
+}
