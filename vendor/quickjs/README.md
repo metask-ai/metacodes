@@ -17,6 +17,8 @@ The DynBuf allocator uses a correctly typed `void *` adapter instead of casting
 `js_realloc_rt` to an incompatible callback type, preserving function sanitizer
 checks in ReleaseSafe builds.
 Trailing whitespace is normalized for the repository's whitespace checks.
+The engine and bridge compile with hidden symbol visibility so AgentCore's
+shared library exposes only its declared public ABI.
 
 The C bridge is repository-owned code in `src/code/bridge.c`; its ownership
 and evaluation contracts are declared in `src/code/bridge.h`.

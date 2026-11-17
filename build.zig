@@ -34,9 +34,11 @@ fn addHlWithProjectHarnessActuation(
         const code = b.createModule(.{ .root_source_file = b.path("src/code/runtime.zig"), .link_libc = true });
         code.addIncludePath(b.path("vendor/quickjs"));
         code.addIncludePath(b.path("src/code"));
+        // The embedded engine and bridge are private implementation details;
+        // AgentCore shared libraries export only their declared public ABI.
         code.addCSourceFiles(.{
             .files = &.{ "vendor/quickjs/quickjs.c", "vendor/quickjs/cutils.c", "vendor/quickjs/dtoa.c", "vendor/quickjs/libregexp.c", "vendor/quickjs/libunicode.c", "src/code/bridge.c" },
-            .flags = &.{ "-std=gnu11", "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"2025-09-13\"", "-DMETACODES_NO_ATOMICS", "-fwrapv" },
+            .flags = &.{ "-std=gnu11", "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"2025-09-13\"", "-DMETACODES_NO_ATOMICS", "-fwrapv", "-fvisibility=hidden" },
         });
         g_code_mod = code;
     }
