@@ -1270,6 +1270,8 @@ test "reviewer L2: workspace snapshots fail closed on invalid or excessive filte
     try fx.gitConfig("include.path", "../filters.cfg");
     try fx.workspaceFile("filters.cfg", "[broken\n");
     try testing.expectError(error.GitFailed, fx.tree());
+    try fx.workspaceFile("filters.cfg", "[filter \"unsafe=name\"]\nclean = false\n");
+    try testing.expectError(error.GitFailed, fx.tree());
 
     var cfg: std.Io.Writer.Allocating = .init(testing.allocator);
     defer cfg.deinit();

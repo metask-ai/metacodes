@@ -54,6 +54,9 @@ pub fn prefix(gpa: std.mem.Allocator, cwd: []const u8, abort: ?*const AbortSigna
         const last = std.mem.lastIndexOfScalar(u8, key, '.') orelse return error.GitFailed;
         if (!std.mem.startsWith(u8, key, "filter.") or last <= "filter.".len) return error.GitFailed;
         const driver = key[0..last];
+        // `git -c` splits at the first '='. A legal config subsection can
+        // contain it, but cannot be overridden faithfully with this syntax.
+        if (std.mem.indexOfScalar(u8, driver, '=') != null) return error.GitFailed;
         const entry = try drivers.getOrPut(driver);
         if (entry.found_existing) continue;
         if (drivers.count() > max_drivers) return error.GitFailed;
