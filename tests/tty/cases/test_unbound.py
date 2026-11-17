@@ -260,25 +260,23 @@ def test_env_keys_of_several_providers_open_unbound_and_say_once_where_to_choose
 
 
 def test_env_keys_of_several_providers_a_durable_model_pick_is_the_next_start(bin_path):
-    # The way out the notice names: /model, Tab to "every future session",
-    # a DeepSeek route. The pick binds this session with the file's key, and
-    # the next start begins on it (the stored default, level 2), with no
-    # notice and nothing left to choose.
+    # The way out the notice names: /model, a DeepSeek model, Tab to "from
+    # now on" (every future session), Enter. The pick binds this session with
+    # the file's key, and the next start begins on it (the stored default,
+    # level 2), with no notice and nothing left to choose.
     with _Case() as case:
         case.bin = bin_path
         _write_two_provider_env(case)
         raw = case.run(
-            [READY] + submit("/model", "Provider") + [
-                "type:deepseek", wait_for("deepseek"), "key:tab", wait_for("durable"),
-                "key:enter", f"waitline:Model:{WAIT_S}", "key:enter",
-                wait_for("Channel / offer"), "key:enter",
-                wait_for("Options"), "key:enter", wait_for("switched to"),
+            [READY] + submit("/model", "apply to") + [
+                "type:deepseek", "sleep:0.4", "key:tab", wait_for("[from now on]"),
+                "key:enter", wait_for("switched to"),
             ],
             term_size=(40, 180), per_key_drain=0.1,
         )
         a = TTYAssert(raw, rows=40, cols=180)
         flat = " ".join("\n".join(a.final.line_text(r) for r in range(a.final.rows)).split())
-        assert "switched to deepseek" in flat, flat
+        assert "switched to deepseek" in flat and "from now on" in flat, flat
         assert PLACEHOLDER.encode() not in raw
         with open(os.path.join(case.state, "config.json")) as f:
             stored = json.load(f)

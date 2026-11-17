@@ -214,8 +214,8 @@ as in step 5, and says once under its banner which providers the file has
 keys for (`.env has keys for DeepSeek and OpenAI. Choose one with /model;
 Tab there applies it to every future session.`); a message you send gets
 the red note, which points to `/model` with the same names. A route you
-choose there is this session's; press Tab first ("every future session")
-and it is stored as the default of step 2, so later starts use it without
+choose there is this session's; press Tab first, to "from now on", and it
+is stored as the default of step 2, so later starts use it without
 asking, with its key still read from this file. `-p`, `serve` and
 `--web` stop instead, listing the providers by id; add
 `METACODES_PROVIDER=<id>` to the file, or store a default in `/model` once.
