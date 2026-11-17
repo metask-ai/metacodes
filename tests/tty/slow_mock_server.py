@@ -8,11 +8,22 @@
 
 每个 turn 是一段已就绪的 SSE 文本(含 message_start..message_stop)。服务器按连接顺序逐 turn 回放;
 turn 文本里可用 {"__delay__": 0.5} 之外——简单起见,turn 文本直接是完整 SSE bytes,调用方自己拼延迟。
+A turn can also be an `HttpError`: that request is answered with its status and JSON body
+instead of a stream (a rejected key, an empty balance).
 """
 import http.server
+import json
 import socketserver
 import threading
 import time
+
+
+class HttpError:
+    """A turn answered with HTTP `status` and the JSON `payload` instead of a stream."""
+
+    def __init__(self, status, payload):
+        self.status = status
+        self.body = json.dumps(payload).encode()
 
 
 # 一段"慢吐 N 个 text chunk(每块 delay 秒)后发一个 tool_use(stop_reason=tool_use)"的 SSE。
@@ -176,12 +187,19 @@ class SlowMockServer:
             def do_POST(self):
                 ln = int(self.headers.get('content-length', 0))
                 outer.requests.append(self.rfile.read(ln))
-                self.send_response(200)
-                self.send_header('content-type', 'text/event-stream')
-                self.end_headers()
                 idx = min(outer.turn_idx, len(outer.turns) - 1)
                 outer.turn_idx += 1
                 body = outer.turns[idx]
+                if isinstance(body, HttpError):
+                    self.send_response(body.status)
+                    self.send_header('content-type', 'application/json')
+                    self.send_header('content-length', str(len(body.body)))
+                    self.end_headers()
+                    self.wfile.write(body.body)
+                    return
+                self.send_response(200)
+                self.send_header('content-type', 'text/event-stream')
+                self.end_headers()
                 # 逐段写,遇 __DELAY__ 标记 sleep。
                 for chunk in _split_delays(body):
                     if isinstance(chunk, float):

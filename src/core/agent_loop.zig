@@ -345,8 +345,9 @@ pub const RunResult = struct {
     /// `stall_gate.renderStopNotice`.
     stall: ?stall_gate_mod.Report = null,
     /// How many times this call to `run` asked the model to continue an answer
-    /// the provider cut at its output-token limit (`max_tokens`), at most
-    /// `MAX_CONTINUATIONS`. The visible text of a continued answer is one
+    /// the provider cut at its output-token limit (`max_tokens`), in total.
+    /// `MAX_CONTINUATIONS` bounds consecutive continuations only, so this can
+    /// exceed it when the model recovers between cuts. The visible text of a continued answer is one
     /// seamless concatenation, so this is the only trace a host that reads
     /// only the result has of it (issue #269).
     continuations: u32 = 0,
@@ -1423,7 +1424,8 @@ fn runCaptured(
 }
 
 const RunCounters = struct {
-    /// max_tokens 续写次数(见 MAX_CONTINUATIONS);RunResult.continuations 的来源。
+    /// max_tokens 续写总次数(整个 Run 累计,不重置);RunResult.continuations 的来源。
+    /// 上限 MAX_CONTINUATIONS 只约束连续续写(见 runCounted 的 continuation_streak)。
     continuations: u32 = 0,
     /// The learning turn's report once it decided (RunResult.learning), set by a
     /// defer in runCounted so an abort inside a pass still reports it.
@@ -1861,9 +1863,14 @@ fn runCounted(
     var total_tool_calls: u32 = 0;
     // 环境故障计数(本 run 累计,不重置):见 MAX_ENVIRONMENT_FAULTS。
     var environment_faults: u32 = 0;
-    // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
-    // 计数放在 run() 持有的 counters 里,任何返回路径都会把它带进 RunResult。
+    // max_tokens 续写总数:放在 run() 持有的 counters 里,任何返回路径都会把它带进
+    // RunResult。它只用于报告,不用于封顶。
     const continuations = &counters.continuations;
+    // 连续续写计数:防止模型一直撞上限导致无限续写,上限 MAX_CONTINUATIONS 次。
+    // 一旦某轮不再以 max_tokens 收尾,或这轮带了 tool_use(模型已恢复并在行动),
+    // 就归零。按整个 Run 累计封顶会把"偶尔一轮想太长、续写后就恢复"的长任务在
+    // 第 4 次截断时直接判为 max_tokens_exhausted。
+    var continuation_streak: u32 = 0;
     // 上一轮以 max_tokens 续写提示收尾 → 下一个 turn 边界不消费 UI 队列(见 drainUiEvents)。
     var continuation_pending = false;
     // 输出语义通道:每个 provider stream 一个可见输出段,定性在 loop **真正知道**时才发。
@@ -1933,6 +1940,8 @@ fn runCounted(
     var host_injection_meter = @import("host_injection_meter.zig").Meter{};
     defer if (opts.requirement_ledger or opts.requirement_ledger_observe) recordRequirementLedger(&opts, &requirement_ledger_state, &verification_progress);
     defer if (opts.verification_final_gate or opts.verification_final_observe) recordVerificationFinalGate(&opts, &verification_progress, verification_nudges);
+    // At most this many max_tokens continuations in a row; the streak resets
+    // whenever a turn ends without the cut or carries a tool call.
     const MAX_CONTINUATIONS: u32 = 3;
 
     // Governed lexical recall is run-scoped: the model proposes aliases and
@@ -3451,6 +3460,8 @@ fn runCounted(
         progress_state.observeTurn(visible_model_text_bytes, has_tool_use, util_time.nowNs());
         // 本轮跟着工具调用 → 这段文字是执行过程中的可见说明,不是最终答案。
         if (has_tool_use) output_channel.close(.commentary, assistant_text.items);
+        // 模型这一轮恢复了(没被截断,或带着工具调用往下走)→ 连续续写归零。
+        if (turn_stop_reason != .max_tokens or has_tool_use) continuation_streak = 0;
 
         if (!has_tool_use) {
             // A verifier leads round ended (isolated_verifier.zig §6): its
@@ -3497,9 +3508,10 @@ fn runCounted(
                 log.infoId("agent", rid, "learning turn done passes={d} lessons={d} refused={d}", .{ report.passes, report.lessons_accepted, report.lessons_refused });
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
-            if (turn_stop_reason == .max_tokens and continuations.* >= MAX_CONTINUATIONS) {
+            if (turn_stop_reason == .max_tokens and continuation_streak >= MAX_CONTINUATIONS) {
                 // The provider cut this turn at its output-token limit again
-                // after the last allowed continuation, and the turn has no
+                // after the last allowed consecutive continuation (no turn in
+                // between ended normally or called a tool), and the turn has no
                 // tool call to act on. Any text it streamed is the visible
                 // prefix of an answer that never finished, so it closes as
                 // partial and the Run ends in the explicit exhaustion state,
@@ -3546,15 +3558,16 @@ fn runCounted(
                 continue;
             }
             // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
-            // 注入 continue 提示让它接着写,而不是当作完成。最多 MAX_CONTINUATIONS 次。
-            if (turn_stop_reason == .max_tokens and continuations.* < MAX_CONTINUATIONS) {
+            // 注入 continue 提示让它接着写,而不是当作完成。最多连续 MAX_CONTINUATIONS 次。
+            if (turn_stop_reason == .max_tokens and continuation_streak < MAX_CONTINUATIONS) {
+                continuation_streak += 1;
                 continuations.* += 1;
                 // 被 token 上限截断 → 本段与同 group 的下一段合成一个完整结果,单独任何一段
                 // 都不是 final(`stream_done` 更不是)。
                 output_channel.close(.continued, assistant_text.items);
-                log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d}", .{ continuations.*, MAX_CONTINUATIONS });
+                log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d} (run total {d})", .{ continuation_streak, MAX_CONTINUATIONS, continuations.* });
                 // L4 诊断:续写。
-                backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations.*, .max = MAX_CONTINUATIONS } });
+                backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuation_streak, .max = MAX_CONTINUATIONS } });
                 try conversation.appendHostText("Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
                 continuation_pending = true;
                 continue;

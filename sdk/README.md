@@ -26,7 +26,8 @@ the Agent Runtime surface; it does not expose an independent Completion client.
 (replace the identity, add Host sections; governance sections stay locked) and
 is frozen into the Session and its checkpoints; `session_control->set_prompt_profile`
 replaces it while idle. `RunOptionsV1.context_blocks` adds volatile Host facts to
-one Run as user-role context instead of system-prompt text.
+one Run as user-role context instead of system-prompt text, for a Text,
+Multimodal or Skill invocation Run alike.
 `session_control->update_permission_mode` changes an existing Session's
 permission mode in place while idle: same handle and Conversation, a new policy
 generation, every Session grant revoked; `describe` reports `permission_mode`.

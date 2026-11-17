@@ -487,7 +487,9 @@ test "L2 auth: expiring OAuth refreshes before request and persists replacement"
 
     const token_req = token_srv.lastRequest() orelse return error.NoRefreshRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "grant_type=refresh_token") != null);
-    try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "client_id=metacode-cli") != null);
+    // An `auth.json` sign-in is an earlier version's: napi issued it to
+    // `metacode-cli`, and it is refreshed as that client (#527).
+    try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "client_id=metacode-cli&") != null);
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "refresh_token=old%20refresh%2Fl2") != null);
 
     var loaded = try cc.core_auth.loadFromPath(a, auth_path);
@@ -561,7 +563,7 @@ fn sendCallback(input: CallbackInput) void {
     var buf: [1024]u8 = undefined;
     const req = std.fmt.bufPrint(
         &buf,
-        "GET /auth/callback?code={s}&state={s} HTTP/1.1\r\nHost: localhost:{d}\r\nConnection: close\r\n\r\n",
+        "GET /auth/metask/callback?code={s}&state={s} HTTP/1.1\r\nHost: localhost:{d}\r\nConnection: close\r\n\r\n",
         .{ input.code, input.state, input.port },
     ) catch return;
     // fire-and-forget:响应内容不重要,只要请求送达回调 server。
@@ -605,7 +607,7 @@ test "L2 auth: browser OAuth callback exchanges code for stored OAuth credential
     const token_req = token_srv.lastRequest() orelse return error.NoTokenExchangeCaptured;
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "grant_type=authorization_code") != null);
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "code=code-l2-browser") != null);
-    try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "redirect_uri=http%3A%2F%2Flocalhost%3A19455%2Fauth%2Fcallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "redirect_uri=http%3A%2F%2Flocalhost%3A19455%2Fauth%2Fmetask%2Fcallback") != null);
     try std.testing.expect(std.mem.indexOf(u8, token_req.body(), "code_verifier=") != null);
 }
 

@@ -180,19 +180,22 @@ pub fn open(ctx: *const ToolContext, path: []const u8, flags: pfs.O, mode: c_uin
         null_fd = raised;
     }
     try pfs.makeCloseOnExec(null_fd);
-    const pid = std.c.fork();
-    if (pid < 0) return error.SandboxHelperUnavailable;
-    if (pid == 0) {
-        _ = std.c.setpgid(0, 0);
-        if (std.c.dup2(pair[1], 0) < 0 or std.c.dup2(null_fd, 1) < 0 or std.c.dup2(null_fd, 2) < 0) std.c._exit(127);
-        // A sandbox must not inherit unsandboxed directory/file descriptors
-        // from its host. Keep only the private socket and null output streams.
-        if (builtin.os.tag == .linux) {
+    const pid = if (builtin.os.tag == .macos)
+        try spawnDarwinHelper(argv, envp, pair[1], null_fd)
+    else blk: {
+        const child = std.c.fork();
+        if (child < 0) return error.SandboxHelperUnavailable;
+        if (child == 0) {
+            _ = std.c.setpgid(0, 0);
+            if (std.c.dup2(pair[1], 0) < 0 or std.c.dup2(null_fd, 1) < 0 or std.c.dup2(null_fd, 2) < 0) std.c._exit(127);
+            // A sandbox must not inherit unsandboxed directory/file descriptors
+            // from its host. Keep only the private socket and null output streams.
             if (std.os.linux.syscall3(.close_range, 3, std.math.maxInt(u32), 0) != 0) std.c._exit(127);
-        } else closefrom(3);
-        _ = std.c.execve(argv[0].?, @ptrCast(argv.ptr), envp.ptr);
-        std.c._exit(127);
-    }
+            _ = std.c.execve(argv[0].?, @ptrCast(argv.ptr), envp.ptr);
+            std.c._exit(127);
+        }
+        break :blk child;
+    };
     _ = std.c.close(pair[1]);
     child_socket = null;
     platform.process.forkSerialUnlock();
@@ -213,7 +216,69 @@ pub fn open(ctx: *const ToolContext, path: []const u8, flags: pfs.O, mode: c_uin
     return protocol.receiveResponse(pair[0]);
 }
 
-extern "c" fn closefrom(lowfd: c_int) void;
+// Darwin has no closefrom. POSIX_SPAWN_CLOEXEC_DEFAULT closes unmentioned
+// descriptors in the kernel, including descriptors above a lowered rlimit.
+// The explicit dup2 actions retain only the private channel and null outputs.
+// Opaque handles and flags follow the macOS SDK's spawn.h and sys/spawn.h.
+const DarwinSpawn = struct {
+    const Handle = ?*anyopaque;
+    extern "c" fn posix_spawnattr_init(attr: *Handle) c_int;
+    extern "c" fn posix_spawnattr_destroy(attr: *Handle) c_int;
+    extern "c" fn posix_spawnattr_setflags(attr: *Handle, flags: c_short) c_int;
+    extern "c" fn posix_spawnattr_setpgroup(attr: *Handle, group: std.c.pid_t) c_int;
+    extern "c" fn posix_spawn_file_actions_init(actions: *Handle) c_int;
+    extern "c" fn posix_spawn_file_actions_destroy(actions: *Handle) c_int;
+    extern "c" fn posix_spawn_file_actions_adddup2(actions: *Handle, source: c_int, target: c_int) c_int;
+    extern "c" fn posix_spawn(pid: *std.c.pid_t, path: [*:0]const u8, actions: *const Handle, attr: *const Handle, argv: [*]const ?[*:0]const u8, envp: [*]const ?[*:0]const u8) c_int;
+};
+
+fn spawnDarwinHelper(argv: []const ?[*:0]const u8, envp: []const ?[*:0]const u8, channel: c_int, null_fd: c_int) error{SandboxHelperUnavailable}!std.c.pid_t {
+    var actions: DarwinSpawn.Handle = null;
+    if (DarwinSpawn.posix_spawn_file_actions_init(&actions) != 0) return error.SandboxHelperUnavailable;
+    defer _ = DarwinSpawn.posix_spawn_file_actions_destroy(&actions);
+    var attr: DarwinSpawn.Handle = null;
+    if (DarwinSpawn.posix_spawnattr_init(&attr) != 0) return error.SandboxHelperUnavailable;
+    defer _ = DarwinSpawn.posix_spawnattr_destroy(&attr);
+    const close_unmentioned_and_set_group: c_short = 0x4000 | 0x0002;
+    if (DarwinSpawn.posix_spawnattr_setflags(&attr, close_unmentioned_and_set_group) != 0 or
+        DarwinSpawn.posix_spawnattr_setpgroup(&attr, 0) != 0 or
+        DarwinSpawn.posix_spawn_file_actions_adddup2(&actions, channel, 0) != 0 or
+        DarwinSpawn.posix_spawn_file_actions_adddup2(&actions, null_fd, 1) != 0 or
+        DarwinSpawn.posix_spawn_file_actions_adddup2(&actions, null_fd, 2) != 0)
+        return error.SandboxHelperUnavailable;
+    var pid: std.c.pid_t = undefined;
+    if (DarwinSpawn.posix_spawn(&pid, argv[0].?, &actions, &attr, argv.ptr, envp.ptr) != 0) return error.SandboxHelperUnavailable;
+    return pid;
+}
+
+test "native filesystem sandbox: Darwin helper spawn drops unmentioned host descriptors" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    platform.process.forkSerialLock();
+    defer platform.process.forkSerialUnlock();
+    const null_fd = pfs.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try std.testing.expect(null_fd >= 0);
+    defer _ = std.c.close(null_fd);
+    // Deliberately not CLOEXEC and high enough to avoid loader/shell fd reuse.
+    const host_fd = std.c.fcntl(null_fd, std.c.F.DUPFD, @as(c_int, 200));
+    try std.testing.expect(host_fd >= 200);
+    defer _ = std.c.close(host_fd);
+    var channel: [2]c_int = undefined;
+    try std.testing.expect(std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &channel) == 0);
+    defer _ = std.c.close(channel[0]);
+    defer _ = std.c.close(channel[1]);
+    try pfs.makeCloseOnExec(channel[0]);
+    try pfs.makeCloseOnExec(channel[1]);
+    var command_buffer: [128]u8 = undefined;
+    const command = try std.fmt.bufPrintZ(&command_buffer, "test ! -e /dev/fd/{d}", .{host_fd});
+    const argv = [_]?[*:0]const u8{ "/bin/sh", "-c", command.ptr, null };
+    const envp = [_]?[*:0]const u8{null};
+    const pid = try spawnDarwinHelper(&argv, &envp, channel[1], null_fd);
+    var status: c_int = 0;
+    while (std.c.waitpid(pid, &status, 0) < 0) {
+        if (!pfs.lastErrnoIs(.INTR)) return error.WaitFailed;
+    }
+    try std.testing.expectEqual(@as(c_int, 0), status);
+}
 
 fn shellQuote(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidSandboxPath;

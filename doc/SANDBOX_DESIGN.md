@@ -60,6 +60,9 @@ path, access flags, mode and parent-creation request. SCM_RIGHTS returns the
 opened descriptor. The controller uses that descriptor for existing ReadState,
 exact-edit checks and file-change receipts rather than reopening its pathname.
 The protocol is private implementation detail, not an AgentCore ABI extension.
+The macOS executor uses `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` and
+explicit stdio actions; Linux closes inherited descriptors before `exec`.
+Neither helper receives unrelated host file or directory descriptors.
 
 The trusted Host may set `METACODES_SANDBOX_HELPER` to an absolute executable
 path. Otherwise the executor resolves the helper beside its own physical

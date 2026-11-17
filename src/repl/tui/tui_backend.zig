@@ -632,18 +632,6 @@ pub const TuiBackend = struct {
                     // 卡在 readv 里的读醒不了。这里代它 shutdown 在飞连接(一次)。
                     self.cancelInFlightIfAborted(app);
                     self.region.tickSpinner(app);
-                    // The picker's sign-in runs on a worker thread (#67);
-                    // this tick moves its transcript into the overlay and
-                    // commits the pending route once the login lands.
-                    if (self.region.pickerOpen()) switch (picker_host.poll(app, &self.region.ui, .of(self.region))) {
-                        .committed => {
-                            self.region.writeGenText(picker_host.lastNotice(app));
-                            self.region.writeGenText("\n");
-                            self.region.redrawGen(app);
-                        },
-                        .redraw => self.region.redrawGen(app),
-                        .ignored => {},
-                    };
                 }
                 continue;
             }
@@ -701,9 +689,9 @@ pub const TuiBackend = struct {
     /// 全部语义)。watcher 据返回 Effect:
     ///   · action != .pass_to_editor → dispatch 已消费(开关 help/overlay/滚动),内部已重画,不动 editor;
     ///   · action == .pass_to_editor → dispatch 未消费,按键类型决定生成期独有语义:
-    ///       - enter 系 → 入待发送队列 + clear(dispatch 无"入队"概念,故落 pass_to_editor 由此接);
+    ///       - enter   → 入待发送队列 + clear(dispatch 无"入队"概念,故落 pass_to_editor 由此接);
     ///       - esc     → 无弹层,中断推理(入队已打的字 + abort);
-    ///       - 其余     → 普通编辑键喂 LineEditor。
+    ///       - 其余     → 普通编辑键喂 LineEditor(含 Shift+Enter:插换行,同输入期,#456)。
     /// 关键:enter/esc 也经 dispatch 先过一遍 → overlay/help 开着时它们被 dispatch 路由消费
     /// (transcript 期 enter 被 dispatchTranscriptKey 忽略,不会误入队;help 期 esc 只关 help)。
     /// esc 优先级:overlay 开→关 overlay;help 开→关 help;都关→中断(先关弹层再中断)。
@@ -747,12 +735,15 @@ pub const TuiBackend = struct {
                 return;
             },
             .picker_key => {
-                if (picker_host.onKey(app, &self.region.ui, eff.picker_key, .of(self.region)) == .committed) {
+                switch (picker_host.onKey(app, &self.region.ui, eff.picker_key, .of(self.region))) {
                     // Mid-stream the confirmation goes into scrollback through
                     // the same path streamed text uses, so it survives the
                     // overlay closing without fighting the region for stdout.
-                    self.region.writeGenText(picker_host.lastNotice(app));
-                    self.region.writeGenText("\n");
+                    .committed, .cancelled => {
+                        self.region.writeGenText(picker_host.lastNotice(app));
+                        self.region.writeGenText("\n");
+                    },
+                    .ignored, .redraw => {},
                 }
                 self.region.redrawGen(app);
                 return;
@@ -786,7 +777,9 @@ pub const TuiBackend = struct {
 
         // 走到这:dispatch 未消费该键(pass_to_editor,无弹层激活)。按键类型决定生成期语义。
         switch (key) {
-            .enter, .shift_enter => {
+            // 只有 Enter 入队。Shift+Enter(CSI-u 13;2u、同批到达的 ESC CR、Windows 带 Shift 的
+            // Enter 记录)落到 else,由 LineEditor 插换行,和输入期一样(#456)。
+            .enter => {
                 // 回车 → 入待发送队列(非空才入)+ clear。不立即发。
                 const v = ed.view();
                 const trimmed = std.mem.trim(u8, v, " \t\r\n");

@@ -57,6 +57,9 @@ test {
     _ = @import("component/cli_help_test.zig");
     _ = @import("component/launcher_hint_test.zig");
     _ = @import("component/state_env_test.zig");
+    _ = @import("component/unbound_session_test.zig");
+    _ = @import("component/login_logout_test.zig");
+    _ = @import("component/next_step_test.zig");
     _ = @import("component/task_error_test.zig");
     _ = @import("component/tool_loop_breaker_test.zig");
     _ = @import("component/user_context_inject_test.zig");
@@ -81,6 +84,7 @@ test {
     _ = @import("component/message_origin_test.zig");
     _ = @import("component/startup_catalogs_test.zig");
     _ = @import("component/mcp_background_startup_test.zig");
+    _ = @import("component/mcp_permission_test.zig");
     _ = @import("component/prompt_model_identity_test.zig");
     _ = @import("component/stream_terminator_test.zig");
     _ = @import("component/stream_retractable_retry_test.zig");
