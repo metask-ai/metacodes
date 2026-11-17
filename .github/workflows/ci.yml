@@ -534,7 +534,7 @@ jobs:
         if: matrix.checks && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_check_doc_facts -v
       - name: Third-party notices unit tests
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.RELEASE_DOCS != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.RELEASE_DOCS != 'false'
         run: python3 -m unittest scripts.tests.test_gen_third_party_notices -v
       - name: Gate manifest unit tests
         if: matrix.checks && env.FAST_PATH != 'true'

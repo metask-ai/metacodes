@@ -457,6 +457,9 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(self.jobs["scope"]["outputs"][name], "${{ steps.decide.outputs.%s }}" % name)
             for job in ("gates-linux", "gates-macos"):
                 self.assertEqual(self.jobs[job]["env"][name.upper()], "${{ needs.scope.outputs.%s }}" % name)
+        notices = next(step for step in self.jobs["gates-linux"]["steps"]
+                       if step.get("name") == "Third-party notices unit tests")
+        self.assertTrue(runs_on(notices, "macOS"))
 
     def test_every_other_step_of_a_leg_fails_open(self) -> None:
         for job, var in (("windows-gates", "SUITES"), ("tty-linux", "TTY"), ("tty-windows", "TTY")):
