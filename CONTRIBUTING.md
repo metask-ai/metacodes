@@ -33,6 +33,68 @@ are claimed by commenting on them. For anything larger than a bug fix, open a
 [discussion](https://github.com/metask-ai/metacodes/discussions) or an issue
 first so we can agree on the boundary before you write code.
 
+## Initial development setup
+
+Start the [PR watcher](.github/pr-loop.py) as part of setting up your
+development environment, before submitting your first PR. You need Python
+3.9+, Git, authenticated GitHub CLI (`gh`) and Codex CLI, and `dx` configured
+for the worker checkout. The original Codex worker thread must be accessible
+to the local App Server and handed over idle when the watcher needs to repair
+the PR. See the [PR workflow guide](doc/PR_AGENT_LOOP.md) for prerequisites.
+
+From the repository root, start one watcher in a dedicated terminal:
+
+```sh
+python3 .github/pr-loop.py run
+```
+
+**Keep this process running while your PRs are being delivered.** It is a
+foreground process: closing the terminal, pressing Ctrl+C or shutting down
+the computer stops it. Restart it when you resume development; PR bindings
+and progress persist locally. This script lives under `.github/` and runs
+on your Mac. The loop polls registered PRs every sixty seconds; GitHub CI
+and the merge queue run on GitHub independently. Local review and repair
+pause while the watcher is stopped or your Mac is asleep or offline.
+
+For each task, push its branch and register the PR with its original worker
+thread and worktree. Use `submit` to create the PR in the mother repository
+and register it together:
+
+```sh
+python3 .github/pr-loop.py submit \
+  --worktree "$TASK_WORKTREE" --thread "$TASK_THREAD_ID" \
+  --head "$GITHUB_OWNER:$TASK_BRANCH" \
+  --title "fix: describe the change" --body-file "$PR_BODY_FILE"
+```
+
+The target defaults to `metask-ai/metacodes`, including when your push remote
+is a fork. If you already created the PR another way, register it with:
+
+```sh
+python3 .github/pr-loop.py bind --pr "$PR_NUMBER" \
+  --worktree "$TASK_WORKTREE" --thread "$TASK_THREAD_ID"
+```
+
+`submit` and `bind` register work for the running watcher; they do not start
+it. The watcher reviews each revision in an independent read-only Codex
+conversation, returns blocking findings or CI failures to the original
+worker, checkpoints repairs and validates them through `dx zig build gate:pr`
+on devbox before pushing. It repeats the review after a push, then requests
+admission to the existing merge queue when review and CI pass. Only registered
+PRs participate in this workflow.
+
+When a decision or additional permission is needed, or a configured limit is
+reached, the loop pauses and notifies you locally. Check progress and answer:
+
+```sh
+python3 .github/pr-loop.py status
+python3 .github/pr-loop.py answer --pr "$PR_NUMBER" --text "Your decision"
+```
+
+The [PR workflow guide](doc/PR_AGENT_LOOP.md) covers invocation limits,
+recovery and state storage. Model calls use your existing Codex account and
+incur its normal usage; the controller does not upload credentials to CI.
+
 ## Your first build
 
 You need Zig 0.16.0 (the version in `build.zig.zon`), Python 3.9 or newer with
@@ -79,6 +141,8 @@ reviewer (human or agent) applies. The ideas behind it:
 
 ## Pull requests
 
+- Register your PR through `submit` or `bind` and keep the watcher running
+  as described in [Initial development setup](#initial-development-setup).
 - Keep each pull request to one outcome and describe it from the user's side.
 - Run `zig build gate:pr` and paste the tail of its `Build Summary` into the
   pull request template. Judge a build by its exit code, not by the word
