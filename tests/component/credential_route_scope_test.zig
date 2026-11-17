@@ -22,6 +22,10 @@
 //!     not the route the clients were bound to, so after a pick in the
 //!     global or once scope it put the previous route's OAuth token on the
 //!     new one, and replaced a key or a pool account a route was bound with.
+//!   * The Metask refresh callback stayed on the clients after the session
+//!     left the Metask sign-in's route, so another endpoint's 401
+//!     `token_expired` was retried with the Metask token, and it answered
+//!     with whatever OAuth session the process held.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -754,4 +758,108 @@ test "L2 credential scope: a pick bound with a provider's sign-in renews it at t
     try std.testing.expect(replaced);
     try std.testing.expectEqual(@as(usize, 2), token.requestCount());
     try std.testing.expect(sentBearer(house, house.requestCount() - 1, OAUTH_ACCESS_3));
+}
+
+// ── the Metask refresh callback ──────────────────────────────────────────────
+
+test "L2 credential scope: another provider's expired-token answer is never retried with the Metask sign-in" {
+    // The gateway answers the sign-in's model catalog at startup.
+    var metask = try harness.MockServer.startCassette(&.{GATEWAY_MODELS}, 0);
+    defer metask.stop();
+    // The relay says its token expired, in the Metask gateway's own words.
+    var relay = try harness.MockServer.startHttpCassette(
+        &.{ TOKEN_EXPIRED_BODY, ANTHROPIC_END_TURN_SSE },
+        &.{ "HTTP/1.1 401 Unauthorized", "HTTP/1.1 200 OK" },
+    );
+    defer relay.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(setup.allocator(), .{});
+    defer io_runtime.deinit();
+    var case: Case = undefined;
+    try case.init(try deviceSessionConfig(setup.allocator(), try originOf(setup.allocator(), relay)));
+    defer case.deinit();
+    const app = try deviceSessionApp(&case, try originOf(setup.allocator(), metask), io_runtime.io());
+    defer app.deinit();
+    try std.testing.expect(app.oauth_session_provider.?.eqlText("metask"));
+    try std.testing.expect(app.api_client.refresh_fn != null);
+
+    try std.testing.expect(cc.repl_picker_host.useSelector(app, "relay-model") == .switched);
+    const turn = sendOneTurn(app);
+
+    try expectNeverSent(relay, METASK_ACCESS);
+    try std.testing.expectError(error.Unauthorized, turn);
+    try std.testing.expectEqual(@as(usize, 1), relay.requestCount());
+    try std.testing.expect(sentBearer(relay, 0, RELAY_KEY));
+
+    // Back on the sign-in's route, its token refreshes as before.
+    const metask_offer = try offerIdText(app, "metask", "glm-5.3-flash", null);
+    try std.testing.expect(cc.repl_picker_host.useSelector(app, &metask_offer) == .switched);
+    try std.testing.expect(app.api_client.refresh_fn != null);
+}
+
+test "L2 credential scope: the Metask refresh never answers with another provider's sign-in" {
+    var metask = try harness.MockServer.startCassette(&.{GATEWAY_MODELS}, 0);
+    defer metask.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(setup.allocator(), .{});
+    defer io_runtime.deinit();
+    var case: Case = undefined;
+    try case.init(try deviceSessionConfig(setup.allocator(), UNREACHABLE_ORIGIN));
+    defer case.deinit();
+    const app = try deviceSessionApp(&case, try originOf(setup.allocator(), metask), io_runtime.io());
+    defer app.deinit();
+
+    // The process's OAuth session becomes another provider's, as a route
+    // switch to it does, while the Metask refresh is still installed.
+    const host = try app.providerHost();
+    const other = host.registry.findById(Slug.lit("house-oauth")).?;
+    const token = (try app.oauthAccessToken(other, cc.util_time.nowUnix())).?;
+    std.crypto.secureZero(u8, token);
+    std.testing.allocator.free(token);
+    try std.testing.expect(app.oauth_session_provider.?.eqlText("house-oauth"));
+
+    const refresh = app.api_client.refresh_fn.?;
+    try std.testing.expectError(error.NoTokens, refresh(app.api_client.refresh_ctx.?, METASK_ACCESS));
+}
+
+test "L2 credential scope: another provider's refresh token never reaches Metask's token endpoint" {
+    var metask = try harness.MockServer.startCassette(&.{GATEWAY_MODELS}, 0);
+    defer metask.stop();
+    // Metask's site, whose token endpoint the Metask refresh posts to.
+    const metask_token = "{\"access_token\":\"fake-metask-access-renewed\",\"refresh_token\":\"fake-metask-refresh-2\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
+    var site = try harness.MockServer.startCassette(&.{metask_token}, 0);
+    defer site.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(setup.allocator(), .{});
+    defer io_runtime.deinit();
+    var case: Case = undefined;
+    try case.init(try deviceSessionConfig(setup.allocator(), UNREACHABLE_ORIGIN));
+    defer case.deinit();
+    try case.setEnv("METASK_SITE_URL", (try setup.allocator().dupeZ(u8, try originOf(setup.allocator(), site))).ptr);
+    const app = try deviceSessionApp(&case, try originOf(setup.allocator(), metask), io_runtime.io());
+    defer app.deinit();
+
+    // The process's OAuth session becomes another provider's, as a route
+    // switch to it does, and that provider's own access token is the one a
+    // request on its route carried when it came back 401 `token_expired`.
+    const host = try app.providerHost();
+    const other = host.registry.findById(Slug.lit("house-oauth")).?;
+    const token = (try app.oauthAccessToken(other, cc.util_time.nowUnix())).?;
+    std.crypto.secureZero(u8, token);
+    std.testing.allocator.free(token);
+
+    // Still installed: nothing rebound the clients.
+    const refresh = app.api_client.refresh_fn orelse return error.NoRefreshCallback;
+    if (refresh(app.api_client.refresh_ctx.?, OAUTH_ACCESS_1)) |answered| {
+        std.crypto.secureZero(u8, answered);
+        std.testing.allocator.free(answered);
+    } else |_| {}
+    try expectNeverSent(site, "fake-oauth-refresh-1");
+    try std.testing.expectEqual(@as(usize, 0), site.requestCount());
 }

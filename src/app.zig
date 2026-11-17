@@ -1253,6 +1253,12 @@ pub const App = struct {
 
     fn refreshMetaskToken(ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8 {
         const app: *App = @ptrCast(@alignCast(ctx));
+        // Metask's sign-in only. A `/model` switch to another OAuth provider
+        // makes the process's session that provider's (`oauthAccessToken`):
+        // its refresh token is not Metask's to see, nor its token a Metask
+        // request's.
+        const owner = app.oauth_session_provider orelse return error.NoTokens;
+        if (!owner.eqlText("metask")) return error.NoTokens;
         const session = if (app.oauth_session) |*loaded| loaded else return error.NoTokens;
         var site_buf: [1024]u8 = undefined;
         const token_url = try metask_oauth_mod.tokenUrl(metask_oauth_mod.siteUrl(), &site_buf);
@@ -1262,6 +1268,23 @@ pub const App = struct {
             .token_url = token_url,
         };
         return session.refreshIfStale(@import("util/time.zig").nowUnix(), exchange.exchange(), stale_access_token);
+    }
+
+    /// Install `refreshMetaskToken` on the clients that can run the Metask
+    /// sign-in's route (as `initWithOptions` does when it starts on one), or
+    /// take it off them.
+    fn armMetaskRefresh(app: *App, armed: bool) void {
+        if (armed) {
+            app.api_client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
+            if (app.openai_client) |*client| client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
+            return;
+        }
+        app.api_client.refresh_fn = null;
+        app.api_client.refresh_ctx = null;
+        if (app.openai_client) |*client| {
+            client.refresh_fn = null;
+            client.refresh_ctx = null;
+        }
     }
 
     /// 组装层选 Provider:据 config.provider_kind 返回对应后端的中立 Provider。
@@ -3324,6 +3347,13 @@ pub const App = struct {
             client.auth_scheme = binding.auth_scheme;
             client.declared_dialect = binding.dialect;
         }
+        // A client whose route answers 401 `token_expired` asks
+        // `refreshMetaskToken` for a new token and sends the request again
+        // with it. Only a route the Metask sign-in authenticates may ask: on
+        // any other the answer would be the Metask token, sent to that
+        // route's endpoint.
+        app.armMetaskRefresh(oauth_token != null and binding.provider_id.eqlText("metask") and
+            binding.credential_ref.kind == .metask_oauth);
         // What the turn-boundary refresh renews from now on: this provider's
         // OAuth token when the binding chose it, nothing otherwise.
         app.live_route = .{

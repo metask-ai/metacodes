@@ -539,6 +539,14 @@ status, compatibility boundaries, and entry points are defined by
   to (before any pick, the one the session started on) and replaces only an
   OAuth token that route was bound with.
 
+- **The Metask token refresh runs only on a route the Metask device sign-in
+  authenticates.** The refresh a device-code session installs at startup
+  stayed on the clients after a `/model` switch to another provider, so an
+  endpoint that answered 401 with `"code":"token_expired"` received the
+  request again with the Metask access token. A route switch now installs or
+  removes it with the route, and it answers only while the process's OAuth
+  session is Metask's.
+
 ### Security
 
 - **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**
