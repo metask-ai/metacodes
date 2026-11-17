@@ -26,8 +26,10 @@ const settings_mod = @import("settings.zig");
 
 pub const LentPermissions = struct {
     mutex: sync.Mutex = .{},
-    /// The owner's imported rule layer; null for none.
-    settings: ?*const settings_mod.MergedSettings = null,
+    /// A borrowed view of the owner's immutable rule allocations. Keep the
+    /// header here: the owner's optional header can be replaced before publish
+    /// acquires our lock. The owner alone frees the allocations after publish.
+    settings: ?settings_mod.MergedSettings = null,
     /// The owner's additional working directories (resolved real paths).
     additional_dirs: []const []const u8 = &.{},
 
@@ -35,8 +37,13 @@ pub const LentPermissions = struct {
     pub fn publish(self: *LentPermissions, settings: ?*const settings_mod.MergedSettings, additional_dirs: []const []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.settings = settings;
+        self.settings = if (settings) |merged| merged.* else null;
         self.additional_dirs = additional_dirs;
+    }
+
+    /// Only while holding mutex; the view never owns the rule allocations.
+    pub fn borrowedSettings(self: *const LentPermissions) ?*const settings_mod.MergedSettings {
+        return if (self.settings) |*merged| merged else null;
     }
 };
 
@@ -45,7 +52,7 @@ test "LentPermissions.publish replaces both under the lock" {
     var merged: settings_mod.MergedSettings = .{ .layers = &.{}, .allocator = std.testing.allocator };
     const dirs = [_][]const u8{"/extra"};
     lent.publish(&merged, &dirs);
-    try std.testing.expect(lent.settings == &merged);
+    try std.testing.expect(lent.borrowedSettings().?.layers.ptr == merged.layers.ptr);
     try std.testing.expectEqualStrings("/extra", lent.additional_dirs[0]);
     lent.publish(null, &.{});
     try std.testing.expect(lent.settings == null);

@@ -397,7 +397,7 @@ pub const lean_runtime_licenses = [_][]const u8{
     "share/licenses/libuv-LICENSE-extra",
 };
 
-pub const MAX_EXPECTED_FILES: usize = 23;
+pub const MAX_EXPECTED_FILES: usize = 24;
 
 /// The whitelist for a target, sorted by path. `changelog_name` is
 /// `share/doc/CHANGELOG-<version>.md`, formatted by the caller into memory it
@@ -420,6 +420,7 @@ pub fn expectedFiles(
     var count: usize = 0;
     const fixed = [_][]const u8{
         if (is_windows) "bin/metacodes.exe" else "bin/metacodes",
+        if (is_windows) "bin/metacodes-fs-helper.exe" else "bin/metacodes-fs-helper",
         if (is_windows) "bin/rg.exe" else "bin/rg",
         formal,
         formal_provenance,
@@ -469,6 +470,7 @@ const digest_g = "0" ** 64;
 
 const linux_files = [_]FileEntry{
     .{ .path = "bin/metacodes", .sha256 = digest_a },
+    .{ .path = "bin/metacodes-fs-helper", .sha256 = digest_a },
     .{ .path = "bin/rg", .sha256 = digest_b },
     .{ .path = "libexec/metacodes/metacodes-formal-kernel", .sha256 = digest_e },
     .{ .path = "libexec/metacodes/metacodes-formal-kernel.build-receipt.json", .sha256 = digest_d },
@@ -628,6 +630,7 @@ test "a valid Windows manifest names the .exe files and their sidecars" {
         files[index] = file;
         const renames = [_][2][]const u8{
             .{ "bin/metacodes", "bin/metacodes.exe" },
+            .{ "bin/metacodes-fs-helper", "bin/metacodes-fs-helper.exe" },
             .{ "bin/rg", "bin/rg.exe" },
             .{ "libexec/metacodes/metacodes-formal-kernel", "libexec/metacodes/metacodes-formal-kernel.exe" },
             .{ "libexec/metacodes/metacodes-formal-kernel.build-receipt.json", "libexec/metacodes/metacodes-formal-kernel.exe.build-receipt.json" },
@@ -953,8 +956,9 @@ test "the expected file list is sorted and target-specific" {
     var windows_buffer: [MAX_EXPECTED_FILES][]const u8 = undefined;
     var windows_storage: PathStorage = undefined;
     const windows = expectedFiles("windows", "share/doc/CHANGELOG-0.1.0.md", true, &windows_buffer, &windows_storage);
-    try testing.expectEqualStrings("bin/metacodes.exe", windows[0]);
-    try testing.expectEqualStrings("libexec/metacodes/metacodes-formal-kernel.exe", windows[2]);
-    try testing.expectEqualStrings("libexec/metacodes/metacodes-formal-kernel.exe.build-receipt.json", windows[3]);
+    try testing.expectEqualStrings("bin/metacodes-fs-helper.exe", windows[0]);
+    try testing.expectEqualStrings("bin/metacodes.exe", windows[1]);
+    try testing.expectEqualStrings("libexec/metacodes/metacodes-formal-kernel.exe", windows[3]);
+    try testing.expectEqualStrings("libexec/metacodes/metacodes-formal-kernel.exe.build-receipt.json", windows[4]);
     try testing.expectEqualStrings("vendor/tinykg/tinykgd.exe", windows[windows.len - 2]);
 }

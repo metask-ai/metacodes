@@ -1018,6 +1018,124 @@ test "metacodes logout removes both Metask sign-ins and a Metask default, says w
     try expectContains(again.stderr, "No Metask sign-in was stored.");
 }
 
+test "metacodes login status says which level decides a plain start and what each holds, never a secret" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    const secrets = [_][]const u8{ RELAY_KEY, SESSION_TOKEN, METASK_KEY, "at-login", "rt-login" };
+
+    // Nothing set up: level 5.
+    var out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try testing.expectEqual(@as(i32, 0), out.exit_code);
+    try expectContains(out.stderr, "This start uses no provider: nothing is set up.");
+    try expectContains(out.stderr, "Level 5 of 5 decided; the first that applies wins:");
+    try expectContains(out.stderr, "> 5 nothing");
+    try expectContains(out.stderr, "No secret was printed.");
+
+    // `.env` configures a provider: level 4, named by the file.
+    try case.write("state/config.json", try relayConfig(a, "http://127.0.0.1:9"));
+    try case.write("state/.env", RELAY_ENV ++ "=" ++ RELAY_KEY ++ "\nMETACODES_PROVIDER=house-relay\n");
+    out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
+    try expectContains(out.stderr, "This start uses House relay from ");
+    try expectContains(out.stderr, "Level 4 of 5 decided");
+    try expectContains(out.stderr, "; " ++ RELAY_ENV ++ ", METACODES_PROVIDER; configures House relay\n");
+    for (secrets) |secret| try expectAbsent(out.stderr, secret);
+
+    // The Metask session outranks it: level 3, with the model it chose.
+    try case.storeSession("http://127.0.0.1:9", SESSION_TOKEN);
+    try case.write("state/auth.json", "{\"selected_model\":\"glm-5\",\"reasoning_effort\":\"low\"}");
+    out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
+    try expectContains(out.stderr, "This start uses Metask, signed in · glm-5 · reasoning low.");
+    try expectContains(out.stderr, "> 3 Metask sign-in: the session (");
+    try expectContains(out.stderr, "auth.json: model glm-5, reasoning low\n");
+    for (secrets) |secret| try expectAbsent(out.stderr, secret);
+
+    // A key in auth.json is the historical path's, ahead of the session.
+    try case.writeSignedIn();
+    out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
+    try expectContains(out.stderr, "This start uses Metask with the key in auth.json · glm-5 · reasoning low.");
+    try expectContains(out.stderr, "; a key; an older browser sign-in\n");
+    for (secrets) |secret| try expectAbsent(out.stderr, secret);
+
+    // A default stored with /model whose provider has its key: level 2.
+    try storeDefault(&case, "house-relay", "relay-model");
+    out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
+    try expectContains(out.stderr, "This start uses the default stored with /model: House relay · relay-model.");
+    try expectContains(out.stderr, "> 2 stored default: House relay · relay-model\n");
+
+    // The shell names a provider: level 1, and the stored default is not consulted.
+    out = try runCli(&case, cli, &.{"METACODES_PROVIDER=house-relay"}, &.{ "login", "status" });
+    try expectContains(out.stderr, "This start uses the provider the shell names: METACODES_PROVIDER=house-relay.");
+    try expectContains(out.stderr, "> 1 named at start: METACODES_PROVIDER=house-relay in the shell");
+    try expectContains(out.stderr, "  2 stored default: not consulted, level 1 names a provider");
+
+    // A key only in the shell chooses nothing, and is named, not printed.
+    out = try runCli(&case, cli, &.{"DEEPSEEK_API_KEY=sk-shell-only-deepseek"}, &.{ "login", "status" });
+    try expectContains(out.stderr, "Keys in the shell choose no provider: DEEPSEEK_API_KEY (DeepSeek).");
+    try expectAbsent(out.stderr, "sk-shell-only-deepseek");
+}
+
+test "login status reads METACODES_AUTH_PRECEDENCE as the start does: under oauth-first an empty METASK_API_KEY leaves the session in charge (#537)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    // The gateway: its `/v1/models` (read at the start with the session's
+    // token), then the turn.
+    var gateway = try harness.MockServer.startCassette(&.{ GATEWAY_MODELS, ANTHROPIC_SSE }, 0);
+    defer gateway.stop();
+    try case.storeSession(try originOf(a, gateway), SESSION_TOKEN);
+    try case.write("state/auth.json", "{\"selected_model\":\"glm-5\",\"reasoning_effort\":\"low\"}");
+    // `METASK_API_KEY=` is set but empty: under the default api_key_first it
+    // asks for the historical path; under oauth-first it does not.
+    const oauth_first = [_][]const u8{ "METACODES_AUTH_PRECEDENCE=oauth-first", "METASK_API_KEY=" };
+
+    const status = try runCli(&case, cli, &oauth_first, &.{ "login", "status" });
+    errdefer std.debug.print("status exit {d}; stderr:\n{s}\n", .{ status.exit_code, status.stderr });
+    try expectContains(status.stderr, "This start uses Metask, signed in · glm-5 · reasoning low.");
+    try expectContains(status.stderr, "> 3 Metask sign-in: the session (");
+    try expectContains(status.stderr, "METACODES_AUTH_PRECEDENCE=oauth-first");
+    try expectAbsent(status.stderr, SESSION_TOKEN);
+
+    // And a plain start does sign in with it.
+    const out = try runCli(&case, cli, &oauth_first, &.{ "-p", "hi" });
+    errdefer std.debug.print("start exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try testing.expectEqual(@as(i32, 0), out.exit_code);
+    const turn = gateway.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(turn, "authorization").?);
+
+    // Under the default, the same empty variable sets the session aside, and
+    // both say there is nothing to start with.
+    const default_status = try runCli(&case, cli, &.{"METASK_API_KEY="}, &.{ "login", "status" });
+    try expectContains(default_status.stderr, "Level 5 of 5 decided");
+    const sent = gateway.requestCount();
+    const default_start = try runCli(&case, cli, &.{"METASK_API_KEY="}, &.{ "-p", "hi" });
+    try testing.expect(default_start.exit_code != 0);
+    try testing.expectEqual(sent, gateway.requestCount());
+}
+
+test "login status does not call the /model default's own shell key one that chooses no provider" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    // DeepSeek is the stored default and its key is in the shell. That key is
+    // the default's own credential, so only OpenAI's key chooses no provider.
+    try storeDefault(&case, "deepseek", "deepseek-v4-pro");
+    const out = try runCli(&case, cli, &.{ "DEEPSEEK_API_KEY=sk-shell-deepseek", "OPENAI_API_KEY=sk-shell-openai" }, &.{ "login", "status" });
+    try expectContains(out.stderr, "This start uses the default stored with /model: DeepSeek · deepseek-v4-pro.");
+    try expectContains(out.stderr, "Keys in the shell choose no provider: OPENAI_API_KEY (OpenAI).");
+    try expectAbsent(out.stderr, "DEEPSEEK_API_KEY (DeepSeek)");
+    for ([_][]const u8{ "sk-shell-deepseek", "sk-shell-openai" }) |secret| try expectAbsent(out.stderr, secret);
+}
+
 test "a plain start with only the Metask session signs in with it, at the gateway it names, ahead of .env (#499, #527)" {
     var case: Case = undefined;
     try case.init();

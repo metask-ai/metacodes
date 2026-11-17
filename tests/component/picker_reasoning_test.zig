@@ -132,18 +132,27 @@ fn sendOneTurn(app: *App) !void {
     };
 }
 
-/// Open the picker as `/model` does and walk to the relay's options step.
+/// Open the picker as `/model` does and put the cursor on the relay's model.
 fn openRelayOptions(app: *App, ui: *cc.tui_ui_state.UiState) !void {
     picker_host.open(app, ui, .unguarded);
     // The whole id: the filter is a subsequence match, and "house" alone
     // also matches Metask's `anthropic/claude-sonnet-4-6`.
     for ("house-relay") |byte| _ = picker_host.onKey(app, ui, .{ .char = byte }, .unguarded);
-    _ = picker_host.onKey(app, ui, .enter, .unguarded); // provider
-    _ = picker_host.onKey(app, ui, .enter, .unguarded); // the one model; it declares a control
-    try std.testing.expectEqual(cc.repl_model_picker.Stage.options, app.model_picker.stage);
+    // The relay's one model, the cursor on it; it declares a control, shown
+    // on the line under the list.
+    try std.testing.expectEqual(cc.repl_model_picker.Stage.list, app.model_picker.stage);
+    const offer = app.model_picker.focusedOffer() orelse return error.NoFocusedRoute;
+    try std.testing.expect(cc.repl_model_picker.firstEnumeration(offer.controls) != null);
 }
 
-test "L2 picker: a reasoning level chosen on the options step is the one the request carries" {
+/// The reasoning level the focused route shows (and Enter would commit).
+fn shownLevel(app: *App) ?[]const u8 {
+    const offer = app.model_picker.focusedOffer() orelse return null;
+    const spec = cc.repl_model_picker.firstEnumeration(offer.controls) orelse return null;
+    return app.model_picker.effectiveValue(spec);
+}
+
+test "L2 picker: a reasoning level chosen on the line under the list is the one the request carries" {
     var gateway = try harness.MockServer.start(OPENAI_END_TURN_SSE, 0);
     defer gateway.stop();
     const messages_url = try gateway.urlOwned(std.testing.allocator);
@@ -163,7 +172,7 @@ test "L2 picker: a reasoning level chosen on the options step is the one the req
     // → walks the vocabulary: low, then high.
     _ = picker_host.onKey(app, &ui, .right, .unguarded);
     _ = picker_host.onKey(app, &ui, .right, .unguarded);
-    try std.testing.expect(app.model_picker.controls.get("reasoning_effort").?.text.eqlText("high"));
+    try std.testing.expectEqualStrings("high", shownLevel(app).?);
     // Enter applies the route with the value shown.
     try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
     try std.testing.expectEqualStrings("relay-reasoner", app.activeModel());
@@ -194,7 +203,7 @@ test "L2 picker: the level the session runs with starts selected and survives th
     var ui: cc.tui_ui_state.UiState = .{};
     try openRelayOptions(app, &ui);
     // The relay offers `max`, so it is already the selected value.
-    try std.testing.expect(app.model_picker.controls.get("reasoning_effort").?.text.eqlText("max"));
+    try std.testing.expectEqualStrings("max", shownLevel(app).?);
     try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
     try std.testing.expectEqual(@as(?cc.types_mod.ReasoningEffort, .max), app.config.reasoning_effort);
 

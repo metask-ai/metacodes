@@ -93,6 +93,14 @@ pub const swarm_context = @import("swarm/context.zig"); // Session team membersh
 pub const swarm_team = @import("swarm/team.zig");
 pub const swarm_mailbox = @import("swarm/mailbox.zig");
 pub const swarm_tools = @import("swarm/tools.zig");
+pub const teamwork_types = @import("teamwork/types.zig"); // Teamwork roles, seats, handoff, SeatDriver (#515)
+pub const teamwork_config = @import("teamwork/config.zig"); // `teamwork` config parse/merge/validate
+pub const teamwork_run_dir = @import("teamwork/run_dir.zig"); // per-run state directory (#519)
+pub const teamwork_ledger = @import("teamwork/ledger.zig"); // run budget ledger (#520)
+pub const teamwork_issues = @import("teamwork/issues.zig"); // open_issues.json reviewer-findings ledger (#517)
+pub const teamwork_reviewer = @import("teamwork/reviewer.zig"); // built-in reviewer: charter, review.json, verification (#517)
+pub const teamwork_charters = @import("teamwork/charters.zig"); // role charters (#515)
+pub const teamwork_drivers = @import("teamwork/drivers/factory.zig"); // seat drivers by harness (#515, #521)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
@@ -218,6 +226,8 @@ pub const mcp_tool_invocation = @import("mcp/tool_invocation.zig");
 pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
 pub const mcp_result_commit_test = @import("mcp/result_commit_test.zig");
 pub const sandbox_config = @import("sandbox/config.zig");
+/// Platform sandbox discovery used by embedded hosts at Session admission.
+pub const sandbox_exec = @import("sandbox/exec.zig");
 
 // ── 协议(core ↔ UI 契约;实现自定义前端只需这几个)────────────────────────
 pub const protocol = struct {
@@ -257,4 +267,10 @@ test {
     std.testing.refAllDecls(protocol);
     // Test-only: no re-export reaches it (see the file's header).
     _ = &@import("api/model_name_consumers_test.zig");
+    _ = &@import("teamwork/stub_driver.zig");
+    _ = &@import("teamwork/drivers/common.zig");
+    _ = &@import("teamwork/drivers/write_scope.zig");
+    _ = &@import("teamwork/drivers/metacodes.zig");
+    _ = &@import("teamwork/drivers/claude_code.zig");
+    _ = &@import("teamwork/drivers/drivers_test.zig");
 }

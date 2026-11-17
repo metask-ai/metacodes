@@ -5,7 +5,7 @@ tests pin the wiring: which gate steps still run on a documentation-only
 change, that every other step of a leg or shard reads its scope, that the
 scope fails open, that each required check is a result job that passes only
 when all of its legs did, and that the decision steps pick the right base for
-a pull request, a merge queue group and a push."""
+a pull request and a legacy merge queue group."""
 from __future__ import annotations
 
 import io
@@ -18,7 +18,6 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -65,7 +64,7 @@ RESULT_JOBS = {
 # The leg flags a gate step may be gated on; a step without one runs on every leg.
 LEG_FLAGS = {"units", "integration", "product", "release", "cross", "checks"}
 # Each gate job, its runner OS and the flags its steps read there.
-GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "cross", "checks"}),
+GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "checks"}),
              ("gates-macos", "macOS", {"units", "product", "release", "checks"}),
              ("windows-gates", "Windows", {"units", "integration", "product", "release"}))
 TEST_PARTS = {"test:units", "test:integration", "test:product"}
@@ -183,46 +182,9 @@ class DecideTest(unittest.TestCase):
         def no_diff(base: str, candidate: str):
             raise AssertionError("a manual run must not diff")
 
-        for event in ("workflow_dispatch", ""):
+        for event in ("workflow_dispatch", "push", ""):
             with self.subTest(event=event):
                 self.assertEqual(ci_scope.decide(event, "abc", "HEAD", no_diff)[0], "full")
-
-    def test_a_narrow_push_requires_successful_ci_on_its_base(self) -> None:
-        for path, expected in (("doc/API.md", "docs"), ("scripts/eval/cli.py", "eval")):
-            for state in ("success", "pending", "failure", "unknown"):
-                with self.subTest(path=path, state=state):
-                    seen = []
-
-                    def baseline(sha):
-                        seen.append(sha)
-                        return state
-
-                    scope, reason = ci_scope.decide("push", "before-sha", "HEAD",
-                                                   lambda b, c: [("M", path)], baseline)
-                    self.assertEqual(scope, expected if state == "success" else "full")
-                    self.assertEqual(seen, ["before-sha"])
-                    self.assertIn("before-sha", reason)
-
-    def test_a_failed_or_missing_base_query_runs_in_full(self) -> None:
-        def broken(sha):
-            raise RuntimeError("API unavailable")
-
-        changes = lambda b, c: [("M", "doc/API.md")]
-        self.assertEqual(ci_scope.decide("push", "base", "HEAD", changes)[0], "full")
-        scope, reason = ci_scope.decide("push", "base", "HEAD", changes, broken)
-        self.assertEqual(scope, "full")
-        self.assertIn("API unavailable", reason)
-
-    def test_full_pushes_and_prs_do_not_query_base_ci(self) -> None:
-        def unexpected(sha):
-            raise AssertionError("must not query base CI")
-
-        for event, path, expected in (("push", "src/main.zig", "full"),
-                                      ("pull_request", "doc/API.md", "docs"),
-                                      ("merge_group", "doc/API.md", "docs")):
-            scope, reason = ci_scope.decide(event, "base", "HEAD", lambda b, c: [("M", path)], unexpected)
-            self.assertEqual(scope, expected)
-            self.assertNotIn("scope check failed", reason)
 
     def test_pull_requests_and_merge_groups_diff_against_their_base(self) -> None:
         seen = []
@@ -282,13 +244,13 @@ class MainTest(unittest.TestCase):
     def write_protocol(self):
         (self.repo / ci_scope.PROTOCOL).write_text(json.dumps(self.protocol), encoding="utf-8")
 
-    def run_main(self, event: str, base: str, state: str = "success") -> dict:
+    def run_main(self, event: str, base: str) -> dict:
         out = self.repo / "github-output"
         out.write_text("", encoding="utf-8")
-        with redirect_stdout(io.StringIO()), patch("release_fast_path.base_ci_state", return_value=state):
+        with redirect_stdout(io.StringIO()):
             code = ci_scope.main(["--event", event, "--base", base, "--candidate", "HEAD",
                                   "--github-output", str(out), "--repo-root", str(self.repo),
-                                  "--repository", "o/r", "--github-summary", str(self.repo / "summary.md")])
+                                  "--github-summary", str(self.repo / "summary.md")])
         self.assertEqual(code, 0)
         return dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
 
@@ -301,21 +263,14 @@ class MainTest(unittest.TestCase):
         self.assertIn("| M | doc/A.md | docs |", summary)
         self.assertIn("| Build, unit, integration, product, release | Skip |", summary)
 
-    def test_push_uses_the_whole_batch_instead_of_just_the_last_commit(self) -> None:
+    def test_diff_uses_the_whole_change_instead_of_just_the_last_commit(self) -> None:
         base = self.git("rev-parse", "HEAD").strip()
         (self.repo / "main.zig").write_text("code change\n", encoding="utf-8")
         self.commit("code")
         (self.repo / "doc" / "A.md").write_text("docs\n", encoding="utf-8")
         self.commit("docs")
-        self.assertEqual(self.run_main("push", base)["scope"], "full")
-        self.assertEqual(self.run_main("push", "HEAD^1")["scope"], "docs")
-
-    def test_push_baseline_evidence_reaches_the_cli_decision(self) -> None:
-        (self.repo / "doc" / "A.md").write_text("b\n", encoding="utf-8")
-        self.commit("docs")
-        for state in ("success", "pending", "failure"):
-            self.assertEqual(self.run_main("push", "HEAD^1", state)["scope"],
-                             "docs" if state == "success" else "full")
+        self.assertEqual(self.run_main("pull_request", base)["scope"], "full")
+        self.assertEqual(self.run_main("pull_request", "HEAD^1")["scope"], "docs")
 
     def test_summary_escapes_paths_and_does_not_truncate_the_decision(self) -> None:
         name = "doc/a|`<img>.md"
@@ -406,6 +361,35 @@ class WorkflowTest(unittest.TestCase):
     def test_the_merge_queue_runs_the_workflow(self) -> None:
         triggers = self.workflow.get("on", self.workflow.get(True))  # YAML 1.1 reads `on` as true
         self.assertIn("merge_group", triggers)
+        self.assertIn("pull_request", triggers)
+        self.assertNotIn("push", triggers)  # no duplicate full run after merging
+
+    def test_extended_architectures_are_release_only_and_block_publishing(self) -> None:
+        import yaml
+        release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+        targets = release["jobs"]["build-posix"]["strategy"]["matrix"]["include"]
+        self.assertTrue(any(t["zig_target"] == "x86_64-macos" and t["runner"] == "macos-15-intel" for t in targets))
+        self.assertTrue(any(t["zig_target"] == "aarch64-linux-gnu" and t["runner"] == "ubuntu-24.04-arm" for t in targets))
+        self.assertNotIn("cross", {t["leg"] for t in self.jobs["gates-linux"]["strategy"]["matrix"]["include"]})
+        baseline = next(s for s in self.jobs["gates-macos"]["steps"] if s.get("name") == "macOS release executables need no more than their targets")
+        self.assertNotIn("x86_64-macos", baseline["run"])
+        self.assertIn("aarch64-macos.13.0", baseline["run"])
+        arm = release["jobs"]["windows-arm-cross"]
+        self.assertEqual(arm["strategy"]["matrix"]["target"], ["aarch64-windows-gnu", "aarch64-windows-msvc"])
+        self.assertIn("agentcore:bundle", arm["steps"][-1]["run"])
+        self.assertIn("windows-arm-cross", release["jobs"]["publish"]["needs"])
+        self.assertTrue(any("tinykg:stage -Dtarget=aarch64-linux-musl" in s.get("run", "")
+                            for s in release["jobs"]["build-posix"]["steps"]))
+
+    def test_full_evidence_requires_all_suites_and_excludes_scope_fast_paths(self) -> None:
+        job = self.jobs["full-pr-evidence"]
+        self.assertEqual(set(job["needs"]), {"release-fast-path", "scope", "gates-linux", "gates-macos",
+                                            "windows-gates", "tty-linux", "tty-windows", "sdk-bindings"})
+        self.assertIn("needs.scope.outputs.scope == 'full'", job["if"])
+        self.assertIn("needs.release-fast-path.outputs.fast == 'false'", job["if"])
+        self.assertIn("github.event_name == 'pull_request'", job["if"])
+        self.assertIn('.result == "success"', job["steps"][0]["run"])
+        self.assertIn("ci_evidence.py", job["steps"][2]["run"])
 
     def test_every_leg_reads_its_scope(self) -> None:
         for job, var in LEG_JOBS:
@@ -600,7 +584,6 @@ class WorkflowTest(unittest.TestCase):
             env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}", FAKE_LOG=str(log),
                        GITHUB_EVENT_NAME=event, GITHUB_OUTPUT=str(output), GITHUB_REPOSITORY="o/r",
                        MERGE_GROUP_BASE_SHA="b" * 40 if event == "merge_group" else "")
-            env["PUSH_BASE_SHA"] = "c" * 40 if event == "push" else ""
             proc = subprocess.run([*BASH, step["run"]], env=env, capture_output=True, text=True)
             calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
             return proc, calls, output.read_text(encoding="utf-8")
@@ -621,21 +604,21 @@ class WorkflowTest(unittest.TestCase):
                 self.assertIn("--base %s --candidate HEAD" % ("b" * 40), calls[1])
 
     @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
-    def test_a_push_run_uses_before_and_release_bumps_still_run_in_full(self) -> None:
+    def test_a_push_is_not_a_narrow_scope_event(self) -> None:
         proc, calls, output = self.run_decide("release-fast-path", "push")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls, [])
         self.assertIn("fast=false", output)
         proc, calls, _ = self.run_decide("scope", "push")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(calls[0], "git fetch -q --no-tags --depth=1 origin " + "c" * 40)
-        self.assertTrue(calls[1].startswith("python3 scripts/ci_scope.py --event push --base %s --candidate HEAD " % ("c" * 40)), calls)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertTrue(calls[0].startswith('python3 scripts/ci_scope.py --event push --base  --candidate HEAD '), calls)
 
-    def test_scope_can_read_base_ci_without_granting_write_access(self) -> None:
-        self.assertEqual(self.jobs["scope"]["permissions"], {"contents": "read", "actions": "read"})
+    def test_scope_uses_only_checkout_inputs(self) -> None:
+        self.assertEqual(self.jobs["scope"]["permissions"], {"contents": "read"})
         step = next(s for s in self.jobs["scope"]["steps"] if s.get("id") == "decide")
-        self.assertEqual(step["env"]["GH_TOKEN"], "${{ github.token }}")
-        self.assertEqual(step["env"]["PUSH_BASE_SHA"], "${{ github.event.before }}")
+        self.assertNotIn("GH_TOKEN", step["env"])
+        self.assertNotIn("PUSH_BASE_SHA", step["env"])
 
 
 
@@ -654,6 +637,7 @@ class AgentCoreWorkflowTest(unittest.TestCase):
 
     def test_the_merge_queue_runs_the_workflow(self) -> None:
         self.assertIn("merge_group", self.workflow.get("on", self.workflow.get(True)))
+        self.assertNotIn("push", self.workflow.get("on", self.workflow.get(True)))
 
     def render(self, event: str) -> str:
         values = {
@@ -674,14 +658,10 @@ class AgentCoreWorkflowTest(unittest.TestCase):
             fake.write_text('#!/bin/sh\necho "git $*" >> "$FAKE_LOG"\n'
                             'case "$1" in diff) printf "%s\\n" "$FAKE_CHANGED" ;; esac\n', encoding="utf-8")
             fake.chmod(0o755)
-            python = bindir / "python"
-            python.write_text('#!/bin/sh\necho "python $*" >> "$FAKE_LOG"\n'
-                              'printf "scope=docs\\nsuites=false\\nnative=false\\n" >> "$GITHUB_OUTPUT"\n', encoding="utf-8")
-            python.chmod(0o755)
             output = Path(tmp) / "github-output"
             output.write_text("", encoding="utf-8")
             env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}", FAKE_LOG=str(log),
-                       FAKE_CHANGED=changed, GITHUB_OUTPUT=str(output), PUSH_BASE_SHA="b" * 40)
+                       FAKE_CHANGED=changed, GITHUB_OUTPUT=str(output))
             proc = subprocess.run([*BASH, self.render(event)], env=env, capture_output=True, text=True)
             calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
             return proc, calls, output.read_text(encoding="utf-8")
@@ -697,22 +677,21 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         self.assertIn("relevant=true", output)
 
     @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
-    def test_a_pull_request_uses_its_base_and_a_push_uses_the_shared_scope(self) -> None:
+    def test_a_pull_request_uses_its_base_and_unknown_events_run_in_full(self) -> None:
         proc, calls, _ = self.run_step("pull_request", "doc/API.md")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls[0], "git fetch -q --depth=1 origin " + "p" * 40)
         proc, calls, output = self.run_step("push", "")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(calls[0], "git fetch -q --no-tags --depth=1 origin " + "b" * 40)
-        self.assertIn("python scripts/ci_scope.py --event push --base " + "b" * 40, calls[1])
-        self.assertIn("native=false", output)
+        self.assertEqual(calls, [])
+        self.assertIn("relevant=true", output)
 
-    def test_native_steps_read_both_scopes_and_default_to_running(self) -> None:
+    def test_native_steps_read_relevance(self) -> None:
         steps = self.workflow["jobs"]["native-windows-gate"]["steps"]
         for step in steps:
             if step.get("uses") == CHECKOUT or step.get("id") == "scope":
                 continue
-            self.assertEqual(step.get("if"), "steps.scope.outputs.relevant != 'false' && steps.scope.outputs.native != 'false'")
+            self.assertEqual(step.get("if"), "steps.scope.outputs.relevant == 'true'")
 
 
 if __name__ == "__main__":

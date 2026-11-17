@@ -21,6 +21,7 @@ const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const check_gate_mod = @import("../core/check_gate.zig");
+const isolated_verifier_mod = @import("../core/isolated_verifier.zig");
 const learning_turn_mod = @import("../core/learning_turn.zig");
 const test_integrity_mod = @import("../core/test_integrity.zig");
 const stall_gate_mod = @import("../core/stall_gate.zig");
@@ -1173,6 +1174,11 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
         // Host check gate: primary run only, same host-contract shape (a macro
         // run must not trigger a check or emit a second terminal record).
         run_opts.check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max);
+        // Isolated verifier: follows the check gate's green verdicts.
+        run_opts.isolated_verifier = if (run_opts.check_gate != null)
+            isolated_verifier_mod.optionsFromFlags(app.config.verifier, app.config.verifier_observe, app.config.verifier_model)
+        else
+            null;
         // Learning turn: primary run only, armed where the check gate gives it
         // a verdict; lesson headers name the run by its journal id.
         run_opts.learning_turn = learning_turn_mod.inRunOptions(
@@ -2211,11 +2217,15 @@ fn readLineRaw(
                     continue;
                 },
                 .picker_key => {
-                    if (picker_host.onKey(app, &region.ui, eff.picker_key, .of(region)) == .committed) {
+                    switch (picker_host.onKey(app, &region.ui, eff.picker_key, .of(region))) {
                         // The overlay is gone; the confirmation has to survive
-                        // it or the user cannot tell which route was chosen.
-                        region.clear();
-                        region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
+                        // it or the user cannot tell which route was chosen,
+                        // or that none was ("kept …").
+                        .committed, .cancelled => {
+                            region.clear();
+                            region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
+                        },
+                        .ignored, .redraw => {},
                     }
                     redraw(region, &editor, app);
                     continue;
@@ -3268,7 +3278,11 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) 
         }
         return;
     }
-    cmd_output.print("Signed in to Metask · {s}", .{app.activeModel()});
+    cmd_output.print("Signed in to Metask", .{});
+    // Who signed in, when the server said (a second account is easy to pick
+    // up from a browser already signed in).
+    if (worker.accountName()) |name| cmd_output.print(" as {s}", .{name});
+    cmd_output.print(" · {s}", .{app.activeModel()});
     if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
     cmd_output.print("\n", .{});
     if (applied.default_error) |err| {

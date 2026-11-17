@@ -22,6 +22,7 @@ This documents-only prefix is a CI fixture, not a runnable release unit.
 metacodes-<version>-<target-id>/
 ├── bin/
 │   ├── metacodes[.exe]                 role=primary_executable
+│   ├── metacodes-fs-helper[.exe]       trusted native filesystem executor
 │   └── rg[.exe]                        role=runtime_asset (ripgrep, Glob/Grep)
 ├── libexec/metacodes/
 │   ├── metacodes-formal-kernel[.exe]   role=runtime_asset (formal_kernel)
@@ -49,6 +50,7 @@ metacodes-<version>-<target-id>/
 | Path | Role | Where it comes from | Who checks it |
 |---|---|---|---|
 | `bin/metacodes[.exe]` | the product | `zig build` (the executable is always `ReleaseSmall`, see `build.zig`; `-Doptimize` only affects the test binaries) | `--version --json` must be a strict subset of the manifest (`release:verify`) |
+| `bin/metacodes-fs-helper[.exe]` | native sandbox executor | built from the same source revision with `zig build sandbox:helper` | required by the file whitelist and digest in `files[]`; native tool L2 tests exercise the real helper |
 | `bin/rg[.exe]` | runtime asset | `scripts/stage_ripgrep_binary.py` from `vendor/ripgrep/manifest.json` | digest in `files[]` and `components[]`; `doctor --strict` resolves it here under the release layout |
 | `vendor/tinykg/tinykg[.exe]` | runtime asset | `scripts/stage_tinykg_binary.py` from `vendor/tinykg/manifest.json` | digest; `doctor --strict`; `tinykg version` equals `components[tinykg].version` (`release:verify`) |
 | `vendor/tinykg/tinykg.provenance.json` | staging receipt | same script | listed in `files[]`; `components[tinykg].provenance_path` |

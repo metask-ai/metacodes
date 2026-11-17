@@ -2,16 +2,13 @@ name: AgentCore Windows
 
 on:
   pull_request:
-  # The merge queue (doc/CI_DESIGN.md §3): a check that does not report on
-  # merge_group would hold every group if the ruleset ever requires it.
+  # Inert after the PR-only policy migration; supports landing the migration
+  # itself while main still requires a merge queue (doc/CI_DESIGN.md §3).
   merge_group:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: read # successful CI on a push base, for the shared scope decision
 
 jobs:
   native-windows-gate:
@@ -24,8 +21,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # `native-windows-gate` is a required status check on main, so the job
-      # must report on every pull request; the old `on.pull_request.paths`
+      # The job reports on every pull request so that it can be required;
+      # the old `on.pull_request.paths`
       # filter left doc-only / evals-only PRs permanently BLOCKED (#134). The
       # expensive steps still run only when a path that can affect the native
       # gate changed; other PRs report success from this step alone. A merge
@@ -33,20 +30,11 @@ jobs:
       - name: Decide whether the change can affect the native gate
         id: scope
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PUSH_BASE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           case "${{ github.event_name }}" in
             pull_request) base="${{ github.event.pull_request.base.sha }}" ;;
             merge_group) base="${{ github.event.merge_group.base_sha }}" ;;
-            push)
-              base="$PUSH_BASE_SHA"
-              git fetch -q --no-tags --depth=1 origin "$base" || echo "could not fetch the push base $base"
-              python scripts/ci_scope.py --event push --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT"
-              exit 0
-              ;;
             *) echo "relevant=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
           git fetch -q --depth=1 origin "$base"
@@ -61,13 +49,13 @@ jobs:
           printf 'changed files:\n%s\n' "$changed"
       # See ci.yml `gates` for the cache semantics.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: steps.scope.outputs.relevant != 'false' && steps.scope.outputs.native != 'false'
+        if: steps.scope.outputs.relevant == 'true'
         with:
           version: 0.16.0
           use-cache: true
           cache-size-limit: 4096
       - name: Rust toolchain (Windows)
-        if: steps.scope.outputs.relevant != 'false' && steps.scope.outputs.native != 'false'
+        if: steps.scope.outputs.relevant == 'true'
         shell: cmd
         env:
           # Fail loudly if the image ever drops rustup instead of letting
@@ -92,12 +80,12 @@ jobs:
       # 33186110733, 33229667443, 33229697275; all green on rerun); the
       # wider window only delays reporting of a genuinely wedged test.
       - name: Native AgentCore delivery gate
-        if: steps.scope.outputs.relevant != 'false' && steps.scope.outputs.native != 'false'
+        if: steps.scope.outputs.relevant == 'true'
         shell: cmd
         run: |
           zig version
           zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Native Windows platform gate
-        if: steps.scope.outputs.relevant != 'false' && steps.scope.outputs.native != 'false'
+        if: steps.scope.outputs.relevant == 'true'
         shell: cmd
         run: zig build windows:gate -Dtarget=x86_64-windows-gnu --test-timeout 5m

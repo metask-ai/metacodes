@@ -26,17 +26,11 @@ Scopes, narrowest first:
 - `full`: anything else, every manual run, an empty diff, and any
   error: `suites=true`, `tty=true`.
 
-Pushes compare against the event's `before` SHA, covering every pushed
-commit. A narrow push also requires successful CI on that base: unchanged
-suites inherit its evidence. A pending, failed, cancelled or missing base
-run takes the full scope, preserving the release fast path's base guarantee.
-
 ci.yml: `ci_scope.py --event "$GITHUB_EVENT_NAME" --base <rev> --candidate
 HEAD --github-output "$GITHUB_OUTPUT"`, with the base `HEAD^1` on a pull
 request (the merge commit's base) and the group's `base_sha` in a merge
-queue. It writes scope, suites, tty, native, doc_references, release_docs
-and reason outputs;
-`native` is used by the Windows workflow on pushes. It always exits 0: a
+queue. It writes scope, suites, tty, doc_references, release_docs
+and reason outputs. It always exits 0: a
 doubt is the full scope, never a red job. Python 3.9, stdlib only; tests in
 scripts/tests/test_ci_scope.py.
 """
@@ -54,7 +48,7 @@ from typing import Callable, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 # Manual and unknown events always run in full.
-DIFF_EVENTS = ("pull_request", "merge_group", "push")
+DIFF_EVENTS = ("pull_request", "merge_group")
 # Defaults for pure-function callers; main reads all release sources from the
 # same manifest as build.zig, including licence files outside the doc tree.
 RELEASE_DOCS = ("README.md", "CHANGELOG.md", "THIRD_PARTY_NOTICES.md")
@@ -168,7 +162,6 @@ def decide(
     base: str,
     candidate: str,
     changes: Callable[[str, str], Sequence[Change]],
-    base_ci: Optional[Callable[[str], str]] = None,
     protocol_change: Optional[Callable[[str, str], bool]] = None,
     release_sources: Sequence[str] = RELEASE_DOCS,
 ) -> Tuple[str, str]:
@@ -186,11 +179,6 @@ def decide(
                              and protocol_change(base, candidate))
         scope, reason = classify(paths, [path for status, path in found if status == "D"],
                                  document_protocol=document_protocol, release_sources=release_sources)
-        if event == "push" and scope != "full":
-            state = base_ci(base) if base_ci else "unknown"
-            if state != "success":
-                return "full", f"full scope: {reason}; CI on the push base {base[:12]} is {state}"
-            reason += f"; unchanged suites inherit successful CI on push base {base[:12]}"
         return scope, reason
     except Exception as exc:  # any doubt is the full scope, never a red job
         return "full", f"full scope: the scope check failed: {exc}"
@@ -221,8 +209,6 @@ def write_summary(destination: str, event: str, base: str, candidate: str,
              f"| Release documents, licences and notices | {'Run' if release_docs else 'Skip'} |",
              f"| Build, unit, integration, product, release | {'Run' if suites else 'Skip'} |",
              f"| TTY and SDK | {'Run' if tty else 'Skip'} |"]
-    if event == "push":
-        lines.append(f"| Native Windows | {'Run' if tty else 'Skip'} |")
     lines.extend(["", "| Status | Changed path | Path scope |", "|---|---|---|"])
     for status, path in changes[:200]:
         path_scope, _ = classify([path], [path] if status not in ("A", "M") else [],
@@ -242,7 +228,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--candidate", default="HEAD")
     parser.add_argument("--github-output")
     parser.add_argument("--github-summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
-    parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--repo-root", default=str(ROOT))
     args = parser.parse_args(argv)
     root = Path(args.repo_root)
@@ -251,15 +236,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def changes(base: str, candidate: str) -> Sequence[Change]:
         observed.extend(changed_paths(root, base, candidate))
         return observed
-
-    def base_ci(sha: str) -> str:
-        if not args.repository:
-            return "unknown"
-        # Same successful push-run evidence the release fast path consumes.
-        # Lazy import: PRs and local classification need neither gh nor its token.
-        from release_fast_path import base_ci_state
-        resolved = subprocess.check_output(["git", "rev-parse", sha], cwd=str(root), text=True).strip()
-        return base_ci_state(args.repository, resolved)
 
     try:
         inputs = document_inputs(root)
@@ -270,7 +246,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return json.loads(raw)
             return protocol_documents_only(payload(base), payload(candidate), inputs.release_sources)
 
-        scope, reason = decide(args.event, args.base, args.candidate, changes, base_ci,
+        scope, reason = decide(args.event, args.base, args.candidate, changes,
                                protocol_change, inputs.release_sources)
         doc_references, release_docs = document_checks(scope, observed, inputs)
     except Exception as exc:
@@ -284,7 +260,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with open(args.github_output, "a", encoding="utf-8") as handle:
             handle.write(
                 f"scope={scope}\nsuites={'true' if suites else 'false'}\n"
-                f"tty={'true' if tty else 'false'}\nnative={'true' if tty else 'false'}\nreason={reason}\n"
+                f"tty={'true' if tty else 'false'}\nreason={reason}\n"
                 f"doc_references={'true' if doc_references else 'false'}\n"
                 f"release_docs={'true' if release_docs else 'false'}\n"
             )

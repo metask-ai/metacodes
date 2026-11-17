@@ -665,8 +665,8 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
     // description 仅作日志用途，本期透传但不输出
     _ = common.extractJsonArg(args, "description");
 
-    // Sandbox 包裹(macOS Seatbelt):若 ctx.sandbox 启用,把 command 改写成
-    // `sandbox-exec -f <profile> /bin/bash -c <cmd>`。dangerouslyDisableSandbox=true 仅在
+    // Sandbox 包裹(macOS Seatbelt / Linux bubblewrap):若 ctx.sandbox 启用,把 command 改写成
+    // `sandbox-exec -f <profile> /bin/bash -c <cmd>` 或 `bwrap ... -- /bin/bash -c <cmd>`。dangerouslyDisableSandbox=true 仅在
     // allowUnsandboxedCommands 允许时跳过(sandbox_exec.escapeHatchHonored,权限链同一判定)。
     // sandbox_wrap 非 null 时持有临时 profile 文件,函数返回前 deinit 清理。
     var sandbox_wrap: ?@import("../sandbox/exec.zig").ShellWrap = null;

@@ -90,6 +90,9 @@ pub const Worker = struct {
     gateway: ?[]u8 = null,
     /// The gateway's `/v1/models` answer for the sign-in (owned).
     models_json: ?[]u8 = null,
+    /// The name the account goes by (`metask_oauth.accountName`), for the
+    /// line that says who signed in (owned); null when it could not be had.
+    account_name: ?[]u8 = null,
 
     failure_name: [64]u8 = undefined,
     failure_len: usize = 0,
@@ -135,6 +138,7 @@ pub const Worker = struct {
         }
         if (self.gateway) |origin| allocator.free(origin);
         if (self.models_json) |body| allocator.free(body);
+        if (self.account_name) |name| allocator.free(name);
         self.* = undefined;
         allocator.destroy(self);
     }
@@ -223,6 +227,9 @@ pub const Worker = struct {
         var models_kept = false;
         defer if (!models_kept) allocator.free(fetched.body);
         if (self.abort_signal.isAborted()) return self.settle(.cancelled);
+        // Who signed in, said on the line that ends the sign-in; best effort.
+        self.account_name = metask_oauth.accountName(allocator, metask_oauth.siteUrl(), outcome.access_token, metask_oauth.ACCOUNT_NAME_WAIT_MS);
+        if (self.abort_signal.isAborted()) return self.settle(.cancelled);
         const gateway_copy = allocator.dupe(u8, gateway) catch |err| return self.settleError(err);
 
         self.token_json = token_json;
@@ -272,6 +279,12 @@ pub const Worker = struct {
     /// Valid after the state read `failed`.
     pub fn failureName(self: *const Worker) []const u8 {
         return self.failure_name[0..self.failure_len];
+    }
+
+    /// The name the signed-in account goes by (valid from `models_ready`);
+    /// null when it could not be had. Borrowed.
+    pub fn accountName(self: *const Worker) ?[]const u8 {
+        return self.account_name;
     }
 
     /// The sign-in's token response, handed over (valid from

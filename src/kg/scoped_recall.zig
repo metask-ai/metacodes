@@ -407,13 +407,23 @@ fn rowReward(row: []const u8) f64 {
 }
 
 /// 行的溯源层级(无 prov 字段 → external_oracle,存量行如实兼容)。
+/// Effective rank (`verdict.effectiveRank`): a `host_run` row followed by
+/// ` verifier=fail` is contested and ranks below an uncontested `host_run`
+/// row, above a tainted one; no qualifier ever raises a row.
 fn rowProvenanceRank(row: []const u8) u8 {
     const verdict = @import("../core/verdict.zig");
     const tag = std.mem.indexOf(u8, row, " prov=") orelse
-        return verdict.Provenance.external_oracle.rank();
+        return verdict.effectiveRank(.external_oracle, null);
     const start = tag + " prov=".len;
     const end = std.mem.indexOfScalarPos(u8, row, start, ' ') orelse row.len;
-    return verdict.Provenance.parse(row[start..end]).rank();
+    const provenance = verdict.Provenance.parse(row[start..end]);
+    const qualifier_prefix = " verifier=";
+    const qualifier: ?verdict.VerifierQualifier = if (std.mem.startsWith(u8, row[end..], qualifier_prefix)) blk: {
+        const q_start = end + qualifier_prefix.len;
+        const q_end = std.mem.indexOfScalarPos(u8, row, q_start, ' ') orelse row.len;
+        break :blk verdict.VerifierQualifier.parse(row[q_start..q_end]);
+    } else null;
+    return verdict.effectiveRank(provenance, qualifier);
 }
 
 pub fn bestHistoryRow(history: []const []u8, newest: []const u8) ?[]const u8 {
@@ -1149,4 +1159,28 @@ test "selectionDelta counts candidates only one policy injects" {
     const judged = judgedSelection(&.{ 90, 10, 10, 10, 85 }, &.{ 7.0, 6.0, 1.0, 1.0, 5.0 }, baseline); // {0,4}
     try std.testing.expectEqual(@as(u32, 2), selectionDelta(baseline, judged));
     try std.testing.expectEqual(@as(u32, 2), selectionDelta(baseline, .{}));
+}
+
+test "bestHistoryRow: a contested host_run row loses only at equal reward" {
+    const a = std.testing.allocator;
+    const newest = try a.dupe(u8, "task-outcome-v1: key=t#3 task=t reward=0.5000 tests=1/2 prov=host_run failing=[x]");
+    defer a.free(newest);
+    const clean = try a.dupe(u8, "task-outcome-v1: key=t#1 task=t reward=1.0000 tests=2/2 prov=host_run failing=[]");
+    defer a.free(clean);
+    const contested = try a.dupe(u8, "task-outcome-v1: key=t#2 task=t reward=1.0000 tests=2/2 prov=host_run verifier=fail failing=[]");
+    defer a.free(contested);
+    // Recency would pick the later contested row; the qualifier keeps the
+    // uncontested one.
+    var history = [_][]u8{ clean, contested, newest };
+    try std.testing.expectEqualStrings(clean, bestHistoryRow(&history, newest).?);
+    // Reward still dominates: a contested 1.0 beats a clean 0.97.
+    const lower = try a.dupe(u8, "task-outcome-v1: key=t#4 task=t reward=0.9700 tests=97/100 prov=host_run failing=[y]");
+    defer a.free(lower);
+    var history2 = [_][]u8{ lower, contested, newest };
+    try std.testing.expectEqualStrings(contested, bestHistoryRow(&history2, newest).?);
+    // A verifier PASS leaves the row where host_run puts it (recency breaks the tie).
+    const passed = try a.dupe(u8, "task-outcome-v1: key=t#5 task=t reward=1.0000 tests=2/2 prov=host_run verifier=pass failing=[]");
+    defer a.free(passed);
+    var history3 = [_][]u8{ clean, passed, newest };
+    try std.testing.expectEqualStrings(passed, bestHistoryRow(&history3, newest).?);
 }

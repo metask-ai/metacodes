@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const pfs = @import("platform").fs;
+const filesystem = @import("../sandbox/filesystem.zig");
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
@@ -84,7 +85,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         DEFAULT_LIMIT_LINES;
     if (offset_1based == 0) return error.InvalidOffset;
 
-    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
+    const fd = filesystem.open(ctx, path, .{ .ACCMODE = .RDONLY }, 0, false) catch |err| {
+        if (filesystem.enabled(ctx) and err != error.FileNotFound) return err;
         // 缓存失效优雅提示:tool-results 落盘缓存被 TTL/LRU 清理后,transcript 里的旧 path → 打不开。
         // 返回可操作提示(而非裸 FileNotFound),消除"文件被清了 vs 路径错了"的神秘失败。
         if (std.mem.indexOf(u8, path, "/.metacodes/tool-results/") != null) {
@@ -103,7 +105,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (!has_offset and !has_limit) {
         if (st) |s| {
             if (s.size > MAX_FILE_BYTES) {
-                if (symbol_provider.hasSymbolsFor(ctx, path)) {
+                if (!filesystem.enabled(ctx) and symbol_provider.hasSymbolsFor(ctx, path)) {
                     switch (try readOutlineFromFd(allocator, ctx, path, fd)) {
                         .text => |outline| {
                             defer allocator.free(outline);
@@ -338,8 +340,15 @@ fn isTrue(s: ?[]const u8) bool {
 
 /// outline 模式:打开文件、读全量、渲染符号大纲。三态见 `code_map.Outline`(调用方按态分流)。
 fn readOutline(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8) !code_map.Outline {
-    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = filesystem.open(ctx, path, .{ .ACCMODE = .RDONLY }, 0, false) catch |err| {
+        if (filesystem.enabled(ctx)) return err;
+        return error.FileNotFound;
+    };
     defer _ = pfs.close(fd);
+    // LSP servers are long-lived unsandboxed processes and can reopen a path
+    // after authorization. Until they have a confined execution path, fail
+    // closed rather than letting outline bypass the native open boundary.
+    if (filesystem.enabled(ctx)) return error.SandboxOutlineUnavailable;
     return try readOutlineFromFd(allocator, ctx, path, fd);
 }
 
@@ -447,7 +456,10 @@ pub const MAX_IMAGE_BYTES: usize = types.MAX_IMAGE_BYTES;
 /// 读图像 → base64 → 返回结构化 JSON：{"type":"image","media_type":"...","data":"<b64>"}。
 /// api/request.zig 的 serializeContent 检测到此形态会发成真正的 image content block。
 fn readImage(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, media_type: []const u8) ![]u8 {
-    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = filesystem.open(ctx, path, .{ .ACCMODE = .RDONLY }, 0, false) catch |err| {
+        if (filesystem.enabled(ctx)) return err;
+        return error.FileNotFound;
+    };
     defer _ = pfs.close(fd);
 
     const st = read_state.statFd(fd) catch null;

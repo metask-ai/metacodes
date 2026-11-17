@@ -164,7 +164,7 @@ def test_tty_model_command_opens_the_route_picker(bin_path):
     try:
         raw = run(
             bin_path,
-            submit("/model", "Provider"),
+            submit("/model", "apply to"),
             base_url=base_url,
             env={"METACODES_NO_PROBE": None},
             startup_drain=1.2,
@@ -174,26 +174,22 @@ def test_tty_model_command_opens_the_route_picker(bin_path):
         server.shutdown()
 
     a, menu = _menu_between_box_and_footer(raw)
-    if "Provider" not in menu:
-        a._fail(f"`/model` 提交后应打开 picker 的 provider 阶段:\n{menu}")
-    if "enter apply to this session" not in menu:
-        a._fail(f"picker footer 应说明默认作用域:\n{menu}")
+    if "Model" not in menu or "enter apply" not in menu:
+        a._fail(f"`/model` 提交后应打开 picker:\n{menu}")
+    if "[this session]" not in menu:
+        a._fail(f"picker 应写明默认作用域:\n{menu}")
     if "API keys for this account" in menu:
         a._fail(f"`/model` 不应再进账号 key 菜单(那是 /models):\n{menu}")
 
 
 def test_tty_model_picker_commits_a_route_and_switches(bin_path):
-    # provider(Enter)→ model(Enter)。metask 的每个 canonical model 只有一条路由,
-    # 所以 channel 阶段被跳过、直接提交——正是"只有一个 offer 时跳过 channel 步"。
+    # 一屏:光标停在模型上,Enter 直接提交(metask 的每个 canonical model 只有一条路由)。
     server, base_url = _start_two_step_mock()
     try:
         raw = run(
             bin_path,
-            # 每一阶段等它的标题上屏再按下一个键(Model 用整行匹配:Provider 阶段的
-            # `metask 16 models` 是小写,但别让子串碰运气)。
-            submit("/model", "Provider") + [
-                "key:enter",
-                f"waitline:Model:{WAIT_S}",
+            # 等 picker 的标题行上屏再按 Enter。
+            submit("/model", "apply to") + [
                 "key:enter",
                 wait_for("switched to"),
             ],
@@ -210,7 +206,7 @@ def test_tty_model_picker_commits_a_route_and_switches(bin_path):
     if "switched to" not in text:
         a._fail(f"picker 提交后应回报切换结果:\n{text}")
     # 默认作用域是 session,提交不写任何持久状态。
-    if "for session" not in text:
+    if "for this session" not in text:
         a._fail(f"提交回报应写明作用域:\n{text}")
 
 

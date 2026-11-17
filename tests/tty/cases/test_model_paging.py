@@ -49,7 +49,7 @@ def _run(bin_path, events, rows=40, cols=120):
             events,
             term_size=(rows, cols),
             base_url=f"http://127.0.0.1:{server.server_port}/v1/messages",
-            env={"METACODES_NO_PROBE": None},
+            env={"METACODES_NO_PROBE": None, **{name: None for name in VENDOR_KEYS}},
             startup_drain=1.0,
             per_key_drain=0.08,
         )
@@ -59,25 +59,37 @@ def _run(bin_path, events, rows=40, cols=120):
     return "\n".join(a.final.line_text(r) for r in range(a.final.rows))
 
 
-OPEN_MODEL_STAGE = [READY, "type:/model", "key:enter", wait_for("Provider"), "key:enter", f"waitline:Model:{WAIT_S}"]
+# The picker opens on the models; with no vendor key the list ends with the
+# "Not configured" line, one more stop for the cursor after the last model.
+OPEN_MODEL_STAGE = [READY, "type:/model", "key:enter", wait_for("apply to")]
+VENDOR_KEYS = (
+    "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY",
+    "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY", "KIMI_CODE_API_KEY", "KIMI_API_KEY", "DASHSCOPE_API_KEY",
+    "MINIMAX_API_KEY", "AWS_BEARER_TOKEN_BEDROCK",
+)
+STOPS = COUNT + 1  # every model, and the "Not configured" line
 
 
 def test_picker_end_reaches_the_last_of_many_models(bin_path):
-    text = _run(bin_path, OPEN_MODEL_STAGE + ["key:end", wait_for(f"[{COUNT}/{COUNT}]")])
-    assert f"metask {COUNT} models" not in text  # the provider stage is gone
-    assert f"> Model {COUNT} m-{COUNT}" in text.replace(">  ", "> "), "End 没有选中最后一个模型:\n" + text
-    assert f"[{COUNT}/{COUNT}] · PgUp/PgDn page · Home/End · type to filter" in text, "长列表没有说明翻页键:\n" + text
+    # End: the "Not configured" line; one up: the 300th model.
+    text = _run(bin_path, OPEN_MODEL_STAGE + ["key:end", wait_for(f"[{STOPS}/{STOPS}]"), "key:up",
+                                               wait_for(f"[{COUNT}/{STOPS}]")])
+    assert f"> Model {COUNT}" in text.replace(">  ", "> "), "End 没有到最后一个模型:\n" + text
+    assert f"[{COUNT}/{STOPS}] · PgUp/PgDn page · Home/End · type to filter" in text, "长列表没有说明翻页键:\n" + text
 
 
 def test_picker_up_from_the_first_row_commits_the_last_model(bin_path):
-    text = _run(bin_path, OPEN_MODEL_STAGE + ["key:up", wait_for(f"[{COUNT}/{COUNT}]"), "key:enter",
+    # Up from the first model wraps to the last row, the "Not configured" line;
+    # up again is the 300th model.
+    text = _run(bin_path, OPEN_MODEL_STAGE + ["key:up", wait_for(f"[{STOPS}/{STOPS}]"), "key:up",
+                                               wait_for(f"[{COUNT}/{STOPS}]"), "key:enter",
                                                wait_for(f"switched to m-{COUNT}")])
     assert f"switched to m-{COUNT}" in text, "从第一行上翻绕到最后一个并提交失败:\n" + text
 
 
 def test_picker_page_down_moves_a_page(bin_path):
     text = _run(bin_path, OPEN_MODEL_STAGE + ["raw:\\x1b[6~", "raw:\\x1b[6~", "sleep:0.5"])
-    assert f"/{COUNT}]" in text and f"/256]" not in text, "计数被截断:\n" + text
+    assert f"/{STOPS}]" in text and f"/256]" not in text, "计数被截断:\n" + text
     assert "[1/" not in text, "PgDn 没有移动:\n" + text
 
 

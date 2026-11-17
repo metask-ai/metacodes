@@ -23,7 +23,11 @@
 //! - the file's `METASK_API_KEY` is a sign-in only while the file names no
 //!   provider other than Metask: a named DeepSeek beside it wins, and the
 //!   key does not outrank a login stored in `auth.json` either;
-//! - `doctor` lists the names, never the values.
+//! - `doctor` lists the names, never the values;
+//! - a subscription plan the file configures (the GLM Coding Plan) says once
+//!   on stderr that `-p` is not the interactive use it is licensed for; a
+//!   pay-as-you-go provider says nothing; every request names metacodes as
+//!   its User-Agent, not std's `zig/<version> (std.http)`.
 //!
 //! In process, on a real `App` built with the layer the CLI builds
 //! (`Config.credential_env_fallback`): a `/model` pick mid-session and a
@@ -189,6 +193,16 @@ fn expectOneRequest(run: Run, server: *harness.MockServer, path: []const u8, key
     return captured;
 }
 
+/// The request says it is metacodes (`metacodes/<semver>`), not std's default.
+fn expectMetacodesUserAgent(captured: harness.CapturedRequest) !void {
+    const value = headerValue(captured, "user-agent") orelse {
+        std.debug.print("no user-agent in:\n{s}\n", .{captured.raw});
+        return error.TestUnexpectedResult;
+    };
+    var expected_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&expected_buf, "metacodes/{s}", .{cc.VERSION}), value);
+}
+
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) == null) {
         std.debug.print("expected to find `{s}` in:\n{s}\n", .{ needle, haystack });
@@ -224,6 +238,33 @@ test "state .env: its key and METACODES_PROVIDER reach the request; one provider
     const selected = try case.run(&.{try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}", .{try originOf(a, only)})}, &.{ "-p", "hi" });
     const request = try expectOneRequest(selected, only, "/chat/completions", "sk-file-only");
     try testing.expectEqualStrings("\"deepseek-v4-pro\"", request.jsonField("model") orelse "");
+}
+
+test "state .env: a subscription plan run from -p says so once on stderr; a metered one does not; both requests name metacodes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena();
+
+    // The GLM Coding Plan, on its default (Anthropic) wire.
+    var plan_server = try harness.MockServer.start(ANTHROPIC_SSE, 0);
+    defer plan_server.stop();
+    try case.write("state/.env", "ZAI_API_KEY=sk-plan\nMETACODES_PROVIDER=zai-coding-plan\n");
+    const plan = try case.run(&.{try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}/api/anthropic", .{try originOf(a, plan_server)})}, &.{ "-p", "hi" });
+    const plan_request = try expectOneRequest(plan, plan_server, "/api/anthropic/v1/messages", "sk-plan");
+    try expectMetacodesUserAgent(plan_request);
+    const notice = "warning: Z.AI GLM Coding Plan is a subscription plan for interactive use; its terms may not cover -p, serve or CI.";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, plan.stderr, notice));
+
+    // DeepSeek bills by the token: nothing to say.
+    var metered_server = try harness.MockServer.start(OPENAI_SSE, 0);
+    defer metered_server.stop();
+    try case.write("state/.env", "DEEPSEEK_API_KEY=sk-metered\nMETACODES_PROVIDER=deepseek\n");
+    const metered = try case.run(&.{try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}", .{try originOf(a, metered_server)})}, &.{ "-p", "hi" });
+    const metered_request = try expectOneRequest(metered, metered_server, "/chat/completions", "sk-metered");
+    try expectMetacodesUserAgent(metered_request);
+    try expectAbsent(metered.stderr, "subscription plan");
 }
 
 test "state .env: keys of two providers and no name stop the run before any request, naming both (#486)" {
@@ -642,16 +683,24 @@ fn drawPicker(app: *App, buffer: []u8) []const u8 {
 }
 
 /// Move the provider stage's cursor onto `provider`'s row.
+/// Filter the picker to `provider`, as a user who types its name, and put
+/// the cursor on its first model: that model's row, ready (a pick applies
+/// it) or not (Enter shows where its credential goes).
 fn cursorOnProvider(app: *App, ui: *cc.tui_ui_state.UiState, provider: []const u8) !cc.repl_model_picker.Group {
     const picker = &app.model_picker;
+    for (provider) |byte| _ = cc.repl_picker_host.onKey(app, ui, .{ .char = byte }, .unguarded);
     var rows = cc.repl_model_picker.Picker.RowBuffer.init(testing.allocator);
     defer rows.deinit();
-    const listed = try picker.rows(&rows);
-    const index = for (listed, 0..) |row, index| {
-        if (picker.offers.items[row.provider.offer_index].provider_id.eqlText(provider)) break index;
-    } else return error.ProviderNotListed;
-    for (0..index) |_| _ = cc.repl_picker_host.onKey(app, ui, .down, .unguarded);
-    return listed[index].provider;
+    // Other providers' models can match the name too ("kimi" also finds
+    // kimi-code's): down until the cursor is on this one's.
+    for (0..64) |_| {
+        const listed = try picker.rows(&rows);
+        if (listed.len == 0) return error.ProviderNotListed;
+        const row = listed[@min(picker.cursor, listed.len - 1)];
+        if (row == .model and picker.offers.items[row.model.offer_index].provider_id.eqlText(provider)) return row.model;
+        _ = cc.repl_picker_host.onKey(app, ui, .down, .unguarded);
+    }
+    return error.ProviderNotListed;
 }
 
 fn expectSetupOf(text: []const u8, variable: []const u8, env_path: []const u8) !void {
@@ -726,11 +775,7 @@ test "state .env: a provider whose two key names disagree stays listed, and a pi
     var ui: cc.tui_ui_state.UiState = .{};
     cc.repl_picker_host.open(app, &ui, .unguarded);
     try testing.expect((try cursorOnProvider(app, &ui, "gemini")).ready);
-    // Provider, model, channel: Enter takes the first of each, up to the
-    // options; Enter there applies the route.
-    var steps: usize = 0;
-    while (picker.stage != .options and steps < 5) : (steps += 1) _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
-    try testing.expectEqual(cc.repl_model_picker.Stage.options, picker.stage);
+    // Enter on the model applies its preferred route.
     _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
 
     try testing.expect(picker.stage != .setup);
@@ -760,10 +805,8 @@ test "state .env: a pick whose key went away after the picker opened shows the p
     var ui: cc.tui_ui_state.UiState = .{};
     cc.repl_picker_host.open(app, &ui, .unguarded);
     try testing.expect((try cursorOnProvider(app, &ui, "kimi")).ready);
-    // Provider, model, channel: each Enter takes the first. Then the key
-    // goes, and Enter on the options applies the route.
-    for (0..3) |_| _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
-    try testing.expectEqual(cc.repl_model_picker.Stage.options, picker.stage);
+    // The key goes, then Enter on the model applies its route.
+    try testing.expectEqual(cc.repl_model_picker.Stage.list, picker.stage);
     ppaths.unsetEnv("MOONSHOT_API_KEY");
     try testing.expectEqual(cc.repl_picker_host.Result.redraw, cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded));
 
@@ -773,9 +816,11 @@ test "state .env: a pick whose key went away after the picker opened shows the p
     try testing.expect(std.mem.indexOf(u8, text, "no credential for kimi; the previous route is still active") != null);
     try expectSetupOf(text, "MOONSHOT_API_KEY", try std.fs.path.join(a, &.{ case.state, ".env" }));
     try testing.expectEqualStrings("claude-sonnet-4-6", app.activeModel());
-    // Esc goes back to the route the user was applying.
+    // Esc goes back to the model the user was applying, in the list.
     _ = cc.repl_picker_host.onKey(app, &ui, .escape, .unguarded);
-    try testing.expectEqual(cc.repl_model_picker.Stage.options, picker.stage);
+    try testing.expectEqual(cc.repl_model_picker.Stage.list, picker.stage);
+    const back = picker.focusedOffer() orelse return error.NoFocusedRoute;
+    try testing.expect(back.provider_id.eqlText("kimi"));
 }
 
 test "state .env: /model lists a provider whose key is only in the file as one a pick applies, with the file's key (#488)" {

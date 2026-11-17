@@ -17,6 +17,7 @@ ROWS, COLS = 30, 220
 
 REJECTED = HttpError(401, {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}})
 NO_BALANCE = HttpError(402, {"error": "insufficient_balance", "message": "Your balance is insufficient. Please top up."})
+SUSPENDED = HttpError(403, {"error": "account_suspended", "message": "This account is suspended."})
 BAD_REQUEST = HttpError(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "max_tokens is too large"}})
 RETRY_ADVICE = "Retry with /retry, or switch models or compact the context first."
 
@@ -59,6 +60,15 @@ def test_used_up_metask_balance_says_top_up_or_switch(bin_path):
     last_line = "Your Metask balance has run out. Top up your Metask account, or switch provider: /model"
     screen, requests = _failed_turn(bin_path, NO_BALANCE, last_line)
     _expect_last_line(screen, requests, last_line)
+
+
+def test_suspended_metask_account_says_so_not_sign_in_again(bin_path):
+    # Refused with a 403 like a rejected sign-in, which a new sign-in cannot cure.
+    last_line = ("Your Metask account is suspended. See to it at https://www.metask-ai.com, "
+                 "or switch provider: /model")
+    screen, requests = _failed_turn(bin_path, SUSPENDED, last_line)
+    _expect_last_line(screen, requests, last_line)
+    assert "Sign in again" not in screen, "a suspended account is told to sign in again:\n" + screen
 
 
 def test_rejected_provider_key_names_its_variable_and_the_install_env_file(bin_path):
