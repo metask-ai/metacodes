@@ -104,7 +104,7 @@ pub fn helperPath(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ dir, "metacodes-fs-helper" });
 }
 
-pub fn open(ctx: *const ToolContext, path: []const u8, flags: pfs.O, mode: c_uint, mkdir_parents: bool) !pfs.Fd {
+pub fn open(ctx: *const ToolContext, path: []const u8, flags: pfs.O, mode: c_uint, mkdir_parents: bool) anyerror!pfs.Fd {
     if (!enabled(ctx)) {
         if (mkdir_parents) try @import("../util/fs.zig").mkdirParentsOf(path);
         return pfs.openZ(path, flags, mode);
@@ -310,6 +310,7 @@ fn expectDenied(result: anyerror![]u8) !void {
 }
 
 test "L2 native filesystem sandbox: Read denies text image outline and symlink without read_state" {
+    if (comptime !protocol.supported) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init();
     defer fixture.deinit();
@@ -342,6 +343,7 @@ test "L2 native filesystem sandbox: Read denies text image outline and symlink w
 }
 
 test "L2 native filesystem sandbox: Write Edit outside and symlink denied before truncate or mkdir" {
+    if (comptime !protocol.supported) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init();
     defer fixture.deinit();
@@ -380,9 +382,19 @@ test "L2 native filesystem sandbox: Write Edit outside and symlink denied before
     const pz = try allocator.dupeZ(u8, parent);
     defer allocator.free(pz);
     try std.testing.expect(!pfs.exists(pz));
+    const link_dir = try fixture.path("workspace/escape-dir");
+    defer allocator.free(link_dir);
+    const dz = try allocator.dupeZ(u8, fixture.outside);
+    defer allocator.free(dz);
+    const ldz = try allocator.dupeZ(u8, link_dir);
+    defer allocator.free(ldz);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlink(dz, ldz));
+    try expectDenied(@import("../tools/write.zig").execute(&ctx, "{\"path\":\"escape-dir/new-parent/sub/file.txt\",\"content\":\"damage\"}"));
+    try std.testing.expect(!pfs.exists(pz));
 }
 
 test "L2 native filesystem sandbox: allowed Read Write Edit preserve receipts state and exact nofollow" {
+    if (comptime !protocol.supported) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init();
     defer fixture.deinit();
@@ -405,6 +417,9 @@ test "L2 native filesystem sandbox: allowed Read Write Edit preserve receipts st
     try std.testing.expect(std.mem.indexOf(u8, wr, "structuredPatch") != null);
     try TestFixture.expectBytes(path, "first\n");
     try std.testing.expectEqual(std.hash.Wyhash.hash(0, "first\n"), rs.get(path).?.content_hash);
+    try std.testing.expect(effect.valid);
+    try std.testing.expectEqual(@import("../tools/observation.zig").BeforeState.missing, effect.effect.?.file_mutation_v1.before_state);
+    effect = .{}; // a new dispatch gets a fresh observation slot
     const rd = try @import("../tools/read.zig").execute(&ctx, "{\"path\":\"nested/file.txt\"}");
     defer allocator.free(rd);
     try std.testing.expect(std.mem.indexOf(u8, rd, "1\tfirst") != null);
@@ -418,6 +433,9 @@ test "L2 native filesystem sandbox: allowed Read Write Edit preserve receipts st
     try std.testing.expectEqual(changes.Status.applied, collector.items.items[1].status);
     try std.testing.expect(collector.items.items[1].diff_complete);
     try std.testing.expect(effect.effect != null);
+    try std.testing.expect(effect.valid);
+    try std.testing.expectEqual(@import("../tools/observation.zig").BeforeState.known, effect.effect.?.file_mutation_v1.before_state);
+    try std.testing.expectEqual(@as(usize, 7), effect.effect.?.file_mutation_v1.after_bytes);
 
     ctx.project_write_exclusive_create = true;
     try expectDenied(@import("../tools/write.zig").execute(&ctx, "{\"path\":\"nested/file.txt\",\"content\":\"damage\"}"));
@@ -443,6 +461,7 @@ test "L2 native filesystem sandbox: allowed Read Write Edit preserve receipts st
 }
 
 test "L2 native filesystem sandbox: NotebookEdit reads and mutations are confined" {
+    if (comptime !protocol.supported) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init();
     defer fixture.deinit();
@@ -470,6 +489,7 @@ test "L2 native filesystem sandbox: NotebookEdit reads and mutations are confine
 }
 
 test "L2 native filesystem sandbox: descriptor stays bound across path replacement" {
+    if (comptime !protocol.supported) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init();
     defer fixture.deinit();
@@ -499,7 +519,36 @@ test "L2 native filesystem sandbox: descriptor stays bound across path replaceme
     try std.testing.expect(std.c.fcntl(fd, std.c.F.GETFD) & std.c.FD_CLOEXEC != 0);
 }
 
+test "L2 native filesystem sandbox: missing or relative host helper fails closed before mkdir" {
+    if (comptime !protocol.supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    const original = try helperPath(allocator);
+    defer allocator.free(original);
+    const original_z = try allocator.dupeZ(u8, original);
+    defer allocator.free(original_z);
+    // The build provides this variable; restore it even on failed assertions.
+    defer platform.paths.setEnv("METACODES_SANDBOX_HELPER", original_z);
+    const sb = @import("config.zig").SandboxSettings{ .enabled = true, .fail_if_unavailable = false };
+    const ctx = fixture.context(&sb);
+    platform.paths.setEnv("METACODES_SANDBOX_HELPER", "./untrusted-project-helper");
+    try std.testing.expectError(error.SandboxHelperUnavailable, @import("../tools/write.zig").execute(&ctx, "{\"path\":\"new/sub/file.txt\",\"content\":\"damage\"}"));
+    const missing = try fixture.path("workspace/absent-helper");
+    defer allocator.free(missing);
+    const missing_z = try allocator.dupeZ(u8, missing);
+    defer allocator.free(missing_z);
+    platform.paths.setEnv("METACODES_SANDBOX_HELPER", missing_z);
+    try std.testing.expectError(error.SandboxHelperProtocol, @import("../tools/write.zig").execute(&ctx, "{\"path\":\"new/sub/file.txt\",\"content\":\"damage\"}"));
+    const parent = try fixture.path("workspace/new");
+    defer allocator.free(parent);
+    const pz = try allocator.dupeZ(u8, parent);
+    defer allocator.free(pz);
+    try std.testing.expect(!pfs.exists(pz));
+}
+
 test "L2 native filesystem sandbox: confined Grep Glob omit denied files in inline and spooled paths" {
+    if (comptime !protocol.supported) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init();
     defer fixture.deinit();
@@ -537,4 +586,15 @@ test "L2 native filesystem sandbox: confined Grep Glob omit denied files in inli
         try std.testing.expect(std.mem.indexOf(u8, g, "hidden.txt") == null);
         try std.testing.expect(std.mem.indexOf(u8, l, "hidden.txt") == null);
     }
+}
+
+test "native filesystem sandbox: unsupported hosts refuse explicit sandbox settings" {
+    if (comptime protocol.supported) return error.SkipZigTest;
+    const sb = @import("config.zig").SandboxSettings{ .enabled = true, .fail_if_unavailable = false };
+    var ctx = ToolContext.simple(std.testing.allocator);
+    ctx.sandbox = &sb;
+    try std.testing.expectError(error.SandboxUnavailable, open(&ctx, "unreachable", .{ .ACCMODE = .RDONLY }, 0, false));
+    try std.testing.expectError(error.SandboxUnavailable, open(&ctx, "unreachable", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644, true));
+    const argv = [_]?[*:0]const u8{ "unreachable", null };
+    try std.testing.expectError(error.SandboxUnavailable, wrapArgv(&ctx, &argv));
 }
