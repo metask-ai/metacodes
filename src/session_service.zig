@@ -660,6 +660,8 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .api_client = app.anthropicClientOrNull(),
         .tool_defs = app.tool_defs,
         .system_prompt = app.system_prompt,
+        .skill_policy = if (app.skill_policy) |*policy| &policy.parsed.value else null,
+        .skill_flags = .{ .evolution = app.config.skill_evolution, .routing = app.config.skill_routing },
         .inject_user_context = app.user_context,
         .time_announcer = if (app.time_announcer) |*announcer| announcer else null,
         .goal_meter = if (app.goal_meter) |*meter| meter else null,

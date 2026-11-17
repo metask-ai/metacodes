@@ -25,6 +25,7 @@ pub const plugin = @import("plugin/root.zig");
 
 // ── 引擎 ─────────────────────────────────────────────────────────────────
 pub const agent_loop = @import("core/agent_loop.zig"); // run(), Options, RunResult, StopReason
+pub const skill_rsi = @import("skills/rsi.zig"); // frozen procedural instructions and local ridge routing
 pub const agent_session = @import("core/agent_session.zig");
 pub const tool_catalog = @import("core/tool_catalog.zig");
 pub const workspace_policy = @import("core/workspace_policy.zig");

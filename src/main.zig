@@ -3563,6 +3563,24 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.check_gate_observe = true;
         } else if (std.mem.eql(u8, arg, "--learning-turn")) {
             config.learning_turn = true;
+        } else if (std.mem.eql(u8, arg, "--skill-evolution")) {
+            config.skill_evolution = true;
+        } else if (std.mem.eql(u8, arg, "--no-skill-evolution")) {
+            config.skill_evolution = false;
+        } else if (std.mem.eql(u8, arg, "--skill-routing")) {
+            config.skill_routing = true;
+        } else if (std.mem.eql(u8, arg, "--no-skill-routing")) {
+            config.skill_routing = false;
+        } else if (std.mem.eql(u8, arg, "--skill-policy")) {
+            const path = args.next() orelse {
+                setParseError(config, allocator, "missing value for --skill-policy", .{});
+                return;
+            };
+            if (path.len == 0 or std.mem.startsWith(u8, path, "--")) {
+                setParseError(config, allocator, "invalid value for --skill-policy", .{});
+                return;
+            }
+            config.skill_policy_path = allocator.dupe(u8, path) catch path;
         } else if (std.mem.eql(u8, arg, "--learning-turn-observe")) {
             config.learning_turn_observe = true;
         } else if (std.mem.eql(u8, arg, "--verifier")) {
@@ -4191,6 +4209,9 @@ fn printHelp() void {
         \\  --check-gate          After the model changes files and stops, run --host-check; continue on a clean failure
         \\  --check-gate-observe  Run --host-check at the same points and only record the verdict
         \\  --check-gate-max <n>  Continuations the check gate may grant per run (1..8, default 3)
+        \\  --skill-policy <file> Frozen procedural-skill policy (doc/SKILL_RSI_PROTOCOL.md)
+        \\  --skill-evolution / --no-skill-evolution  Use the selected evolved instruction (default off)
+        \\  --skill-routing / --no-skill-routing  Gate the instruction with its ridge router (default off)
         \\  --learning-turn       After a grounded host verdict, let the model record conditioned lessons
         \\                        for the next attempt (needs --check-gate[-observe], or in print mode
         \\                        METACODES_HOST_CHECK under METACODES_SELF_EVOLUTION with METACODES_TASK_HINT)

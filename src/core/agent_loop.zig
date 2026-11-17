@@ -421,6 +421,9 @@ pub const Options = struct {
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
     system_prompt: ?[]const u8 = null,
+    /// Frozen, host-owned procedural skill. Children do not inherit it.
+    skill_policy: ?*const @import("../skills/rsi.zig").Policy = null,
+    skill_flags: @import("../skills/rsi.zig").Flags = .{},
     /// 首条 user-context message(对齐 cc prependUserContext):CLAUDE.md 链 + AutoMem +
     /// currentDate,`<system-reminder>` 包裹。仅主 session 传(subagent 走 preload 自己的链)。
     /// null → 不 prepend(headless/subagent/无记忆)。由 user_context.build 生成,owned-by-caller,
@@ -1365,6 +1368,32 @@ pub fn run(
     return result;
 }
 
+fn injectProceduralSkill(conversation: *Conversation, opts: Options, model: []const u8, gpa: std.mem.Allocator) !void {
+    if (!opts.skill_flags.enabled()) return;
+    const policy = opts.skill_policy orelse return error.SkillPolicyRequired;
+    const rsi = @import("../skills/rsi.zig");
+    // One persisted host note per participant task. Retrying/resuming does not
+    // append another note or rewrite any earlier provider-visible bytes.
+    var i = conversation.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        const message = conversation.messages.items[i];
+        if (conversation_mod.isUserPrompt(message)) break;
+        if (message.origin == .host) for (message.blocks) |block| {
+            if (block == .text and std.mem.startsWith(u8, block.text, rsi.PREFIX)) return;
+        };
+    }
+    const decision = policy.decide(opts.skill_flags, model, latestUserText(conversation));
+    switch (decision) {
+        .apply => |instruction| {
+            const note = try std.mem.concat(gpa, u8, &.{ rsi.PREFIX, instruction, rsi.SUFFIX });
+            defer gpa.free(note);
+            try conversation.appendHostText(note);
+        },
+        else => log.debug("skill.rsi", "instruction abstained: {s}", .{@tagName(decision)}),
+    }
+}
+
 fn runCaptured(
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -1382,6 +1411,7 @@ fn runCaptured(
     // catalog already rejects them; WebSearch keeps its server tool inside its
     // own isolated sub-request.
     try refuseServerTools(tool_defs, opts);
+    try injectProceduralSkill(conversation, opts, opts.model_override orelse provider.model(), allocator);
     // Run-wide counters that every return path reports. They live here rather
     // than in each of the loop's many result literals, so no exit can forget one.
     var counters: RunCounters = .{};
