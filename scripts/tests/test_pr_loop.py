@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / ".github"))
 
 from pr_loop.adapters import Codex, Git, GitHub, run
 from pr_loop.controller import Controller, Store
-from pr_loop.model import Binding, Busy, DEFAULT_REPO, LoopError, REQUIRED_CHECKS, State, validate_report
+from pr_loop.model import Binding, Busy, DEFAULT_REPO, LoopError, ReadUnavailable, REQUIRED_CHECKS, State, validate_report
 
 
 PASS = {"verdict": "pass", "summary": "No blocking findings", "findings": [], "question": ""}
@@ -92,11 +92,14 @@ class FixtureGitHub(GitHub):
         self.change_target_on_snapshot = None
         self.base_branch = "main"
         self.snapshots = 0
+        self.read_unavailable = False
 
     def api(self, path, method="GET", payload=None):
         self.calls.append((path, method, payload))
         head = git(self.bare, "rev-parse", "refs/heads/feature")
         if path.endswith("/pulls/7"):
+            if self.read_unavailable:
+                raise ReadUnavailable('GitHub read: Bad Gateway')
             self.snapshots += 1
             if self.snapshots == self.change_on_snapshot:
                 self.base = "b" * 40
@@ -205,6 +208,8 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertTrue(any(f"commits/{fixed}/check-runs?" in path for path, _, _ in self.github.calls))
         self.assertFalse(worker_turn["sandboxPolicy"]["networkAccess"])
         self.assertEqual(len(self.requests("thread/start")), 2)  # independent reviewer each revision
+        self.assertTrue(all(r['params']['ephemeral'] is False for r in self.requests('thread/start')))
+        self.assertTrue(all(r['params']['sandbox'] == 'read-only' for r in self.requests('thread/start')))
         self.github.merged = True
         self.controller.once()
         self.assertEqual(self.row()["state"], "merged")
@@ -278,6 +283,17 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(self.row()["state"], "waiting")
         self.assertEqual(len(self.requests("turn/start")), 1)
         self.assertFalse(self.github.merged)
+
+    def test_github_read_outage_recovers_without_spending_an_agent_invocation(self):
+        self.configure()
+        self.github.read_unavailable = True
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'waiting')
+        self.assertEqual(self.row()['agent_runs'], 0)
+        self.assertEqual(self.notifications, [])
+        self.github.read_unavailable = False
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'merged')
 
     def test_unknown_app_cannot_satisfy_required_ci_checks(self):
         self.configure()
@@ -500,6 +516,25 @@ class LoopIntegrationTest(unittest.TestCase):
 
 
 class BoundaryTest(unittest.TestCase):
+    def test_only_transient_read_failures_are_retryable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / 'gh.py'
+            script.write_text("import sys; print(sys.argv[1],file=sys.stderr); sys.exit(1)")
+            github = GitHub((sys.executable, str(script), 'Bad Gateway'))
+            with self.assertRaises(ReadUnavailable):
+                github.api('repos/example/source')
+            with self.assertRaises(ReadUnavailable):
+                github.api('graphql', 'POST', {'query': 'query { viewer { login } }'})
+            for path, method, payload in [('repos/example/source/merge', 'PUT', {}),
+                    ('graphql', 'POST', {'query': 'mutation { doSomething }'})]:
+                with self.assertRaises(LoopError) as caught:
+                    github.api(path, method, payload)
+                self.assertNotIsInstance(caught.exception, ReadUnavailable)
+            github = GitHub((sys.executable, str(script), 'HTTP 403 Forbidden'))
+            with self.assertRaises(LoopError) as caught:
+                github.api('repos/example/source')
+            self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
     def test_github_launcher_can_reconcile_from_another_working_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

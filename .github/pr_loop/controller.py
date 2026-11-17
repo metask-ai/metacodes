@@ -11,7 +11,7 @@ import sys
 import time
 
 from .adapters import Codex, Git, GitHub, WORKER_SCHEMA, run
-from .model import AgentUnavailable, Binding, Busy, IN_FLIGHT, LoopError, REPORT_SCHEMA, State, Verdict, validate_report
+from .model import AgentUnavailable, Binding, Busy, IN_FLIGHT, LoopError, ReadUnavailable, REPORT_SCHEMA, State, Verdict, validate_report
 
 
 def default_state():
@@ -321,9 +321,9 @@ class Controller:
                 with git.review_tree(pr) as tree:
                     prompt = self.codex.review(tree, pr) + "\nUser decision: " + json.dumps(row["answer"])
                     report = validate_report(self.codex.call(tree, prompt, REPORT_SCHEMA, binding.timeout))
-                if not self.current(binding, pr):
-                    return  # a completed review for an obsolete revision is never reused
                 self.store.update(binding, State.WAITING, report=json.dumps(report))
+                if not self.current(binding, pr):
+                    return  # the next snapshot also invalidates obsolete reports
             if report["verdict"] == Verdict.RETRY:
                 self.retry_review(binding, report["summary"])
                 return
@@ -359,6 +359,12 @@ class Controller:
                     return  # main/head moved: update, re-review and re-test next pass
                 raise
             self.store.update(binding, State.MERGED, reason="GitHub confirmed the exact reviewed head merged")
+        except ReadUnavailable as exc:
+            phase = State(self.store.get(binding.repo, binding.number)["state"])
+            if phase in (State.PENDING, State.WAITING, State.QUEUED, State.REVIEWING):
+                self.store.update(binding, State.WAITING, reason="retrying GitHub read: " + str(exc))
+            else:
+                self.decision(binding, str(exc))
         except AgentUnavailable as exc:
             if self.store.get(binding.repo, binding.number)["state"] == State.REVIEWING.value:
                 self.retry_review(binding, str(exc))

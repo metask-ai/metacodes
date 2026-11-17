@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 
-from .model import AgentUnavailable, Binding, Busy, LoopError, REPORT_SCHEMA, REQUIRED_CHECKS, SHA, Snapshot, validate_report
+from .model import AgentUnavailable, Binding, Busy, LoopError, ReadUnavailable, REPORT_SCHEMA, REQUIRED_CHECKS, SHA, Snapshot, validate_report
 from .policy import require_direct_merge
 
 
@@ -62,7 +62,14 @@ class GitHub:
         argv = [*self.command, "api", "--method", method, path]
         if payload is not None:
             argv += ["--input", "-"]
-        data = run(argv, stdin=json.dumps(payload) if payload is not None else None)
+        try:
+            data = run(argv, stdin=json.dumps(payload) if payload is not None else None)
+        except LoopError as exc:
+            readonly = method == "GET" or (path == "graphql" and method == "POST"
+                and isinstance(payload, dict) and str(payload.get("query", "")).lstrip().startswith("query"))
+            if readonly and re.search(r"(?i)(?:HTTP (?:408|429|5\d\d)\b|bad gateway|service unavailable|gateway timeout|timed? ?out|connection (?:reset|refused)|temporary failure|no such host)", str(exc)):
+                raise ReadUnavailable(str(exc)) from exc
+            raise
         result = json.loads(data) if data else {}
         if isinstance(result, dict) and result.get("errors"):
             raise LoopError("GitHub GraphQL request failed: " + json.dumps(result["errors"]))
@@ -276,8 +283,11 @@ class Codex:
                         raise LoopError("worker thread belongs to a different worktree")
                     request("thread/resume", {"threadId": thread})
                 else:
+                    # Tool-session admission needs a persisted thread record;
+                    # keep each reviewer independent and read-only, with an
+                    # auditable history rather than an unregistered ephemeral.
                     thread = request("thread/start", {"cwd": str(cwd), "sandbox": "read-only",
-                                                      "approvalPolicy": "never", "ephemeral": True})["thread"]["id"]
+                                                      "approvalPolicy": "never", "ephemeral": False})["thread"]["id"]
                 # Writable work is confined to the bound checkout. Existing safety
                 # requirements may reject the requested profile; do not bypass them.
                 policy = ({"type": "workspaceWrite", "writableRoots": [str(cwd)], "networkAccess": False}

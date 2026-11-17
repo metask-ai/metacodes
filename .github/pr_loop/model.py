@@ -25,6 +25,10 @@ class AgentUnavailable(LoopError):
     """The agent transport failed; only a read-only invocation may be replayed."""
 
 
+class ReadUnavailable(LoopError):
+    """A transient remote read failed without performing a remote mutation."""
+
+
 class Verdict(str, Enum):
     PASS = "pass"
     FIX = "fix_required"

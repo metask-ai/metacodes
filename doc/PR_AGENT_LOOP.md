@@ -9,6 +9,8 @@ upstream merge after validation against current main. Decisions and interrupted 
 validation return to the worker automatically, within the registered limits.
 Tool availability failures and interrupted read-only reviews also retry
 automatically. Review is part of the repair loop, not an extra GitHub status gate.
+Transient GitHub read failures retry on later polls without spending an agent
+invocation. Failed remote mutations still require reconciliation.
 
 This is contributor tooling, not a metacodes runtime API. It runs on the
 contributor's Mac; local builds, tests and gates run on devbox through `dx`.
@@ -134,7 +136,9 @@ answering; an answer does not automatically reconcile a divergent checkout.
 
 ## Admission contract
 
-1. A review is a fresh, read-only Codex conversation in a detached snapshot.
+1. A review is a fresh, persisted, read-only Codex conversation in a detached snapshot.
+   Persisting the reviewer gives tool-session admission a thread record and
+   retains its audit history; it never reuses the original worker's context.
    It returns schema-validated `pass`, `fix_required`, `retry` or `needs_decision`.
    A passing report cannot contain unresolved findings or a question.
    A tool or repository-access failure returns `retry` with no findings or

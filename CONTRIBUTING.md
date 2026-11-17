@@ -91,6 +91,7 @@ commit-status gate. Unavailable tools, review timeouts and interrupted
 read-only reviews retry on later polls within the same persisted invocation
 limit. Product/permission decisions, interrupted writes and exhausted limits
 still preserve progress for a recorded decision.
+Temporary GitHub read outages retry without consuming an agent invocation.
 
 When a decision or additional permission is needed, or a configured limit is
 reached, the loop pauses and notifies you locally. Check progress and answer:
