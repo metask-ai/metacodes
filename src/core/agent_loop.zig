@@ -1096,7 +1096,23 @@ fn drainFileChanges(
             s.file_changes_overflow = rejected.overflow;
             s.file_changes_lost = rejected.lost;
         }
-        const changes = s.file_changes orelse continue;
+        const changes = s.file_changes orelse {
+            // No record survived, yet the report says it is incomplete: a copy
+            // failed, or a command's effects could not be observed (Bash).
+            // That is still news — dropping it here would let silence read as
+            // "this call changed nothing".
+            if (s.file_changes_overflow or s.file_changes_lost) {
+                backend.emitEvent(sess, .{ .file_changes = .{
+                    .id = s.id,
+                    .name = s.name,
+                    .changes = &.{},
+                    .overflow = s.file_changes_overflow,
+                    .lost = s.file_changes_lost,
+                } });
+                if (journal) |j| j.noteTruncated();
+            }
+            continue;
+        };
         backend.emitEvent(sess, .{ .file_changes = .{
             .id = s.id,
             .name = s.name,

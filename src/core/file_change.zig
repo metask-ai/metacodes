@@ -29,10 +29,16 @@
 //! Sub executions (Agent / Skill / TaskBatch) inherit the same Journal pointer,
 //! so their changes land in the same place with their own `agent_depth`.
 //!
+//! **`Bash`** cannot report what an arbitrary command touched, so the Bash
+//! tool observes the workspace before and after a command that may write and
+//! publishes the difference here (`command_file_changes.zig`). Those records
+//! say what changed in the workspace *while* the command ran, within that
+//! module's stated scope; when the observation cannot cover the call, the
+//! dispatch is marked `lost` rather than reported as changing nothing.
+//!
 //! **What is out of scope**, per the requirement: preview/aggregation/UI,
-//! review verdicts, and filesystem changes made by `Bash` or any other
-//! arbitrary command — this contract covers the typed file tools only, and
-//! says so rather than pretending to be complete.
+//! review verdicts, and filesystem changes made by any other process or tool
+//! (MCP tools, plugins, a background job after its call returned).
 
 const std = @import("std");
 const util_json = @import("../util/json.zig");
@@ -201,9 +207,18 @@ pub fn freeRecords(allocator: std.mem.Allocator, records: []Record) void {
 pub const Sink = struct {
     ctx: *anyopaque,
     publishFn: *const fn (ctx: *anyopaque, draft: Draft) void,
+    incompleteFn: *const fn (ctx: *anyopaque) void,
 
     pub fn publish(self: Sink, draft: Draft) void {
         self.publishFn(self.ctx, draft);
+    }
+
+    /// The tool may have changed files it could not report — an observation
+    /// that could not cover the whole call. Sets the dispatch's `lost`, so the
+    /// consumer is told the report is incomplete instead of reading silence as
+    /// "nothing else changed".
+    pub fn noteIncomplete(self: Sink) void {
+        self.incompleteFn(self.ctx);
     }
 };
 
@@ -211,9 +226,11 @@ pub const Sink = struct {
 /// draft into `allocator` (the parent allocator) so records outlive the tool's
 /// arena.
 ///
-/// Recording never fails a tool: a copy that cannot be made sets `lost`, and an
-/// over-cap publication sets `overflow`. Both travel with the result so a
-/// consumer can say "incomplete" instead of quietly showing less than happened.
+/// Recording never fails a tool: a copy that cannot be made sets `lost`, as does
+/// a tool that says it could not observe everything it may have changed
+/// (`Sink.noteIncomplete`); an over-cap publication sets `overflow`. Both travel
+/// with the result — even with no record at all — so a consumer can say
+/// "incomplete" instead of quietly showing less than happened.
 pub const Collector = struct {
     allocator: std.mem.Allocator,
     ctx: *const ToolContext,
@@ -225,12 +242,17 @@ pub const Collector = struct {
     lost: bool = false,
 
     pub fn sink(self: *Collector) Sink {
-        return .{ .ctx = @ptrCast(self), .publishFn = publishTrampoline };
+        return .{ .ctx = @ptrCast(self), .publishFn = publishTrampoline, .incompleteFn = incompleteTrampoline };
     }
 
     fn publishTrampoline(ctx: *anyopaque, draft: Draft) void {
         const self: *Collector = @ptrCast(@alignCast(ctx));
         self.publish(draft);
+    }
+
+    fn incompleteTrampoline(ctx: *anyopaque) void {
+        const self: *Collector = @ptrCast(@alignCast(ctx));
+        self.lost = true;
     }
 
     pub fn publish(self: *Collector, draft: Draft) void {

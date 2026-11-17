@@ -13,6 +13,8 @@ const artifact = @import("../core/tool_result_artifact.zig");
 const tool_result = @import("../core/tool_result.zig");
 const ResultMetrics = @import("../core/tool_result_metrics.zig").Metrics;
 const result_budget = @import("../core/result_budget.zig");
+const command_file_changes = @import("../core/command_file_changes.zig");
+const bash_readonly = @import("../permission/bash_readonly.zig");
 
 /// nowMs：毫秒时间戳，复用 util/time.zig
 fn nowMs() util_time.Millis {
@@ -640,6 +642,15 @@ fn describeSpawnFailure(ctx: *const ToolContext, err: anyerror, cwd: ?[]const u8
     return error.WorkingDirectoryUnavailable;
 }
 
+/// Whether this call's file changes are observed. A command the read-only
+/// classifier accepts is not: that classifier already decides that the same
+/// command needs no permission and may run beside other tools, so it is
+/// trusted not to write. Without a sink (direct calls, legacy embedders)
+/// there is no one to tell.
+fn observesFileChanges(ctx: *const ToolContext, args: []const u8) bool {
+    return ctx.file_change_sink != null and !bash_readonly.isReadonlyInput(args);
+}
+
 fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_result.SealedHandles) anyerror![]u8 {
     const allocator = ctx.allocator;
     const command_escaped = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
@@ -710,6 +721,9 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
                 const j = registry.spawnBackgroundOwned(command, cwd_opt, ctx.session) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
+                // Nothing watches what a detached command writes. Say so on
+                // the file-change contract instead of reporting no changes.
+                if (observesFileChanges(ctx, args)) ctx.file_change_sink.?.noteIncomplete();
                 // Same rule as the auto-backgrounded snapshot: the spool is a
                 // staging path and never model-visible. BashOutput polls by
                 // job_id and reads incrementally.
@@ -722,6 +736,32 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             }
         }
     }
+
+    // Foreground: observe the workspace around the command and publish what
+    // it changed on the file-change contract (core/command_file_changes.zig).
+    // The deferred finish runs on every exit — a command that failed, timed
+    // out or was aborted may already have written — and after the result is
+    // computed, so the command is done (or backgrounded, `outlived`) by then.
+    // The root is the directory the command runs in: the session root, else
+    // this process's working directory (an unreadable one becomes a gap).
+    //
+    // In a sandboxed session the observation never runs git: any earlier
+    // sandboxed command could have written `.git/config` (the root is
+    // writable), and git here runs outside the sandbox.
+    var observation: ?command_file_changes.Observation = if (observesFileChanges(ctx, args)) blk: {
+        const options: command_file_changes.Options = .{
+            .git_baselines = if (ctx.sandbox) |sb| !sb.enabled else true,
+        };
+        if (ctx.cwd_abs.len > 0) break :blk command_file_changes.Observation.begin(allocator, ctx.cwd_abs, ctx.abort, options);
+        const here = util_fs.getCwd(allocator) catch break :blk command_file_changes.Observation.begin(allocator, "", ctx.abort, options);
+        defer allocator.free(here);
+        break :blk command_file_changes.Observation.begin(allocator, here, ctx.abort, options);
+    } else null;
+    var outlived = false;
+    defer if (observation) |*o| {
+        o.finish(ctx.abort, ctx.file_change_sink.?, outlived);
+        o.deinit();
+    };
 
     const timeout_ms: u64 = blk: {
         if (common.extractJsonArg(args, "timeout")) |s| {
@@ -758,6 +798,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.tool_result_metrics,
             attachments,
             ctx.session,
+            &outlived,
         ) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
     }
 
@@ -782,6 +823,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.tool_result_metrics,
             attachments,
             ctx.session,
+            &outlived,
         ) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
     }
 
@@ -830,6 +872,8 @@ fn runAutoBackgroundable(
     metrics: ?*ResultMetrics,
     attachments: *tool_result.SealedHandles,
     owner: @import("../core/session_id.zig").SessionId,
+    /// Set when the call returns while the command keeps running.
+    outlived: *bool,
 ) ![]u8 {
     // Spooled as private to this call. Every exit below either renders the
     // output and releases the files, or hands the job id to the model and
@@ -869,6 +913,7 @@ fn runAutoBackgroundable(
             // 此刻 job id 进入模型可见结果，BashOutput 随后任何一轮都可能凭它来读
             // → 转为 background 保留期。
             registry.promoteToBackground(job_id[0..]);
+            outlived.* = true;
             return try formatAutoBackgroundedAndRemember(allocator, &j, registry);
         }
     }

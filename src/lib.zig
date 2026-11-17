@@ -273,4 +273,6 @@ test {
     _ = &@import("teamwork/drivers/metacodes.zig");
     _ = &@import("teamwork/drivers/claude_code.zig");
     _ = &@import("teamwork/drivers/drivers_test.zig");
+    // Reached through the Bash tool, not re-exported: name it so its own tests run.
+    _ = &@import("core/command_file_changes.zig");
 }

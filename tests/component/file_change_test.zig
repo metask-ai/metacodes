@@ -84,6 +84,9 @@ fn twoToolSse(
 const EventCapture = struct {
     allocator: std.mem.Allocator,
     pairs: std.ArrayList(Pair) = .empty,
+    /// Tool-use ids of events that declared their report incomplete, whether
+    /// or not they carried a record.
+    lost_ids: std.ArrayList([]u8) = .empty,
 
     const Pair = struct {
         tool_use_id: []u8,
@@ -100,12 +103,17 @@ const EventCapture = struct {
             self.allocator.free(p.first_path);
         }
         self.pairs.deinit(self.allocator);
+        for (self.lost_ids.items) |id| self.allocator.free(id);
+        self.lost_ids.deinit(self.allocator);
     }
 
     fn emit(ctx: *anyopaque, _: cc.session_id.SessionId, ev: cc.ui_event.CoreEvent) void {
         const self: *EventCapture = @ptrCast(@alignCast(ctx));
         switch (ev) {
             .file_changes => |fc| {
+                if (fc.lost) if (self.allocator.dupe(u8, fc.id)) |id| {
+                    self.lost_ids.append(self.allocator, id) catch self.allocator.free(id);
+                } else |_| {};
                 if (fc.changes.len == 0) return;
                 const id = self.allocator.dupe(u8, fc.id) catch return;
                 const tool = self.allocator.dupe(u8, fc.name) catch {
@@ -172,6 +180,16 @@ fn runCassette(
     root: []const u8,
     mode: cc.types_mod.PermissionMode,
 ) !Scenario {
+    return runCassetteWith(allocator, responses, root, mode, null);
+}
+
+fn runCassetteWith(
+    allocator: std.mem.Allocator,
+    responses: []const []const u8,
+    root: []const u8,
+    mode: cc.types_mod.PermissionMode,
+    jobs: ?*cc.job_registry.JobRegistry,
+) !Scenario {
     var server = try harness.MockServer.startCassette(responses, 0);
     defer server.stop();
     const url = try server.urlOwned(allocator);
@@ -211,6 +229,7 @@ fn runCassette(
             .cwd_abs = root,
             .home_dir = root,
             .auto_compact_threshold = std.math.maxInt(usize),
+            .jobs = jobs,
         },
         &backend,
         allocator,
@@ -725,4 +744,97 @@ test "L2 文件修改可观测:重复 drain 不会重复上报(幂等靠标记�
     cc.agent_loop.drainFileChangesForTest(&slots, &ctx, &backend, .single, &journal, a);
     try std.testing.expectEqual(after_first, seen); // 没有第二次事件
     try std.testing.expectEqual(@as(usize, 1), journal.count()); // 账本也没重复
+}
+
+// ── Bash ───────────────────────────────────────────────────────────────────
+//
+// `Bash` cannot report its own writes, so the tool observes the workspace
+// around a command that may write (core/command_file_changes.zig). These runs
+// prove the observation reaches the same contract the typed file tools use:
+// the event stream and the Run journal, with the change itself, and that a
+// call the observation cannot cover is reported incomplete rather than empty.
+
+fn bashSse(allocator: std.mem.Allocator, id: []const u8, command: []const u8, background: bool) ![]u8 {
+    var input: std.Io.Writer.Allocating = .init(allocator);
+    defer input.deinit();
+    try input.writer.writeAll("{\"command\":");
+    try std.json.Stringify.encodeJsonString(command, .{}, &input.writer);
+    if (background) try input.writer.writeAll(",\"run_in_background\":true");
+    try input.writer.writeAll("}");
+    return toolSse(allocator, id, "Bash", input.written());
+}
+
+test "L2 Bash 改文件可观测:脚本改写的文件带着 diff 进事件流与 Run 账本" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX shell + git fixture
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buf);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "clean.py", .data = "x = 1\ny = 2\n" });
+
+    // b0 makes the workspace a repository: it writes only below .git, which is
+    // never a workspace change. b1 is the read/replace/write a script does.
+    // b2 only reads, so it is not observed at all.
+    const b0 = try bashSse(a, "b0", "git init -q && git add -A && git -c user.email=t@example.invalid -c user.name=t -c commit.gpgsign=false commit -qm init", false);
+    defer a.free(b0);
+    const b1 = try bashSse(a, "b1", "printf 'x = 1\\ny = 20\\n' > clean.py && printf 'fresh\\n' > made.txt", false);
+    defer a.free(b1);
+    const b2 = try bashSse(a, "b2", "cat clean.py", false);
+    defer a.free(b2);
+
+    var scenario = try runCassette(a, &.{ b0, b1, b2, END_TURN }, root, .bypass_permissions);
+    defer scenario.deinit();
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, scenario.result.stop_reason);
+
+    // One event, for b1 only; nothing claimed incomplete.
+    try std.testing.expectEqual(@as(usize, 1), scenario.events.pairs.items.len);
+    try std.testing.expectEqualStrings("b1", scenario.events.pairs.items[0].tool_use_id);
+    try std.testing.expectEqualStrings("Bash", scenario.events.pairs.items[0].tool);
+    try std.testing.expectEqual(@as(usize, 2), scenario.events.pairs.items[0].count);
+    try std.testing.expectEqual(@as(usize, 0), scenario.events.lost_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 2), scenario.journal.count());
+    try std.testing.expect(!scenario.journal.truncated);
+
+    const edited = scenario.find("clean.py") orelse return error.TestExpectedRecord;
+    try std.testing.expectEqualStrings("Bash", edited.tool);
+    try std.testing.expectEqualStrings("b1", edited.tool_use_id);
+    try std.testing.expectEqual(file_change.Kind.modified, edited.kind);
+    try std.testing.expectEqual(file_change.Status.applied, edited.status);
+    try std.testing.expectEqual(@as(u64, 12), edited.before_bytes);
+    try std.testing.expectEqual(@as(u64, 13), edited.after_bytes);
+    try std.testing.expect(edited.diff_complete);
+    try std.testing.expectEqualStrings(
+        "--- a/clean.py\n+++ b/clean.py\n@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 20\n",
+        edited.unified_diff orelse return error.TestExpectedDiff,
+    );
+
+    const made = scenario.find("made.txt") orelse return error.TestExpectedRecord;
+    try std.testing.expectEqual(file_change.Kind.created, made.kind);
+    try std.testing.expectEqualStrings("--- a/made.txt\n+++ b/made.txt\n@@ -0,0 +1,1 @@\n+fresh\n", made.unified_diff orelse return error.TestExpectedDiff);
+}
+
+test "L2 后台 Bash 的写入无人观测:报告不完整,而不是报告没改" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buf);
+    var jobs = try cc.job_registry.JobRegistry.init(a);
+    defer jobs.deinit();
+
+    const bg = try bashSse(a, "bg", "printf 'x\\n' > late.txt", true);
+    defer a.free(bg);
+    var scenario = try runCassetteWith(a, &.{ bg, END_TURN }, root, .bypass_permissions, &jobs);
+    defer scenario.deinit();
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, scenario.result.stop_reason);
+
+    // An event with no record still reaches the consumer, flagged lost, and
+    // the Run journal is marked incomplete.
+    try std.testing.expectEqual(@as(usize, 0), scenario.events.pairs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scenario.events.lost_ids.items.len);
+    try std.testing.expectEqualStrings("bg", scenario.events.lost_ids.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), scenario.journal.count());
+    try std.testing.expect(scenario.journal.truncated);
 }

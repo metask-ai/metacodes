@@ -647,6 +647,11 @@ pub const State = struct {
             self.touched = true;
             self.scan_fresh = false;
             const changes = slot.file_changes orelse continue;
+            // Bash records come from a workspace observation that sees only
+            // files git does not ignore, which the scan already compares; they
+            // add nothing here but could fill the path cap and taint every
+            // later pass (core/command_file_changes.zig).
+            if (std.mem.eql(u8, slot.name, "Bash")) continue;
             for (changes) |record| {
                 if (!record.status.changedDisk()) continue;
                 // The first record of a path decides whether it existed
@@ -1211,4 +1216,34 @@ test "report: JSON and notice carry the final files" {
     var empty = Report.init(testing.allocator);
     defer empty.deinit();
     try testing.expect((try empty.renderNotice(testing.allocator)) == null);
+}
+
+test "observeSlots: Bash records never fill the tool-path cap; file-tool records still do" {
+    const a = std.testing.allocator;
+    var records: [MAX_FILES + 1]@import("file_change.zig").Record = undefined;
+    var names: [MAX_FILES + 1][32]u8 = undefined;
+    for (&records, &names, 0..) |*r, *buf, i| {
+        r.* = .{
+            .locator = .{ .workspace_path = try std.fmt.bufPrint(buf, "tests/test_{d}.py", .{i}) },
+            .kind = .modified,
+            .status = .applied,
+            .tool = "Bash",
+            .tool_use_id = "b",
+            .agent_depth = 0,
+            .before_bytes = 1,
+            .after_bytes = 2,
+        };
+    }
+    var bash = State{ .armed = true, .baseline = .{ .coverage = .git } };
+    defer bash.deinit(a);
+    const bash_slot = [_]tool_exec.Slot{.{ .decision = .run, .name = "Bash", .id = "b", .input = "{}", .file_changes = &records }};
+    bash.observeSlots(a, &bash_slot);
+    try std.testing.expect(!bash.tool_paths_overflow);
+    try std.testing.expectEqual(@as(usize, 0), bash.tool_paths.items.len);
+
+    var patch_state = State{ .armed = true, .baseline = .{ .coverage = .git } };
+    defer patch_state.deinit(a);
+    const patch_slot = [_]tool_exec.Slot{.{ .decision = .run, .name = "ApplyPatch", .id = "p", .input = "{}", .file_changes = &records }};
+    patch_state.observeSlots(a, &patch_slot);
+    try std.testing.expect(patch_state.tool_paths_overflow);
 }
