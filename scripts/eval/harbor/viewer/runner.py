@@ -78,19 +78,14 @@ class RunManager:
         account = Account(cfg.get("account_state_dir"), cfg.get("account_gateway"))
         # Re-login or /model changes invalidate the cache immediately. Only
         # directory metadata is cached; workers read the current key afresh.
-        try:
-            stamp = (account.state_dir / "auth.json").stat().st_mtime_ns
-        except OSError:
-            stamp = None
-        identity = (str(account.state_dir), account.gateway, stamp)
+        identity = account.fingerprint()
         with self.account_lock:
             cached = self.account_cache
             if cached and cached[0] == identity and time.monotonic() - cached[1] < 60:
                 return cached[2]
             value = account.catalog()
             # Fetching the account inventory can refresh OAuth on disk.
-            stamp = (account.state_dir / "auth.json").stat().st_mtime_ns
-            self.account_cache = ((str(account.state_dir), account.gateway, stamp), time.monotonic(), value)
+            self.account_cache = (account.fingerprint(), time.monotonic(), value)
             return value
 
     def catalog(self):

@@ -29,12 +29,20 @@ Choose a Linux release bundle and a model once on the execution machine:
 
 ```sh
 uv tool install harbor==0.26.0
-metacodes login                       # select your Metask account key/model
+metacodes login                       # sign in and select a model
 metacodes bench --bundle /path/to/linux-release
 ```
 
-By default the workbench reads the current install's `auth.json` login.
-The account OAuth token lists all active keys/model groups, then each group's
+The workbench reads the current CLI session from `oauth/metask.json` and the
+model/reasoning preferences from `auth.json`. It uses the session's gateway
+and authenticated `/v1/models` directory, leaving out models that explicitly
+do not support `/v1/messages`. Session refresh follows the CLI's JSON grant
+at `METASK_SITE_URL` (default `https://www.metask-ai.com`), with client
+`metacodes`, and persists rotated tokens in the same private session file.
+`METACODES_OAUTH_DIR` and `METACODES_AUTH_FILE` overrides match the CLI.
+
+Older `auth.json` account logins remain supported. Their account OAuth token
+lists all active keys/model groups, then each group's
 key queries its authenticated `/v1/models` directory. The page shows the
 union of these model lists, with duplicates removed. If several groups
 provide a model, the CLI's selected key takes priority. Groups whose model
@@ -43,10 +51,10 @@ The page also lists the account's available groups and whether a key already
 exists for each. Groups without a key are shown separately from runnable
 models; no keys are created and no model ids are guessed from group names.
 
-Model metadata is cached for one minute and invalidated when the login file
+Model metadata is cached for one minute and invalidated when either login file
 changes. The default model and reasoning effort follow the saved login.
-Launching a model resolves its group's current key, checks that the key
-still provides that model, and passes it as `METASK_API_KEY` through Harbor's
+Launching a model resolves the current session token or its legacy group's
+key, checks that it still provides that model, and passes it as `METASK_API_KEY` through Harbor's
 environment reference. The CLI's selected key/model remain unchanged. Only
 non-secret key ids enter run specs; API keys and OAuth refresh tokens never
 enter workbench settings, job specs, or the browser.

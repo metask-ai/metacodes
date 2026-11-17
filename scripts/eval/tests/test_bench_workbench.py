@@ -40,6 +40,11 @@ if os.environ.get('FAKE_PROFILE_REQUEST'):
  ca = next(args[i + 1].removeprefix('metrics_ca=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('metrics_ca='))
  req = urllib.request.Request(relay + '/fix-git__fake/v1/messages', data=json.dumps({{'model':arg('-m').split('/',1)[1]}}).encode(), headers={{'Authorization':'Bearer ' + os.environ['METASK_API_KEY'], 'Content-Type':'application/json'}})
  with urllib.request.urlopen(req,timeout=5,context=ssl.create_default_context(cafile=ca)) as response: response.read()
+if os.environ.get('FAKE_ACCOUNT_REQUEST'):
+ import urllib.request
+ gateway = next(args[i + 1].removeprefix('account_gateway=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('account_gateway='))
+ req = urllib.request.Request(gateway + '/v1/messages', data=json.dumps({{'model':arg('-m').split('/',1)[1]}}).encode(), headers={{'Authorization':'Bearer ' + os.environ['METASK_API_KEY'], 'Content-Type':'application/json'}})
+ with urllib.request.urlopen(req,timeout=5) as response: response.read()
 time.sleep(float(os.environ.get('FAKE_BENCH_DELAY', '.2')))
 if os.environ.get('FAKE_BENCH_FAIL'): sys.exit(7)
 t = root / 'fix-git__fake'; t.mkdir()
@@ -160,6 +165,69 @@ def account_fixture(root, *, expired=True, paginated=False, broken_group=False):
             pass
 
     http = ThreadingHTTPServer(('127.0.0.1', 0), Endpoint)
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    return state, http, calls
+
+
+def session_fixture(root, *, expired=True):
+    """Current native CLI login: preferences + oauth/metask.json."""
+    state = root / 'session-account'
+    state.mkdir()
+    atomic_json(state / 'auth.json', {'selected_model': 'session-model', 'reasoning_effort': 'max'})
+    calls = []
+
+    class Endpoint(BaseHTTPRequestHandler):
+        def reply(self, value, code=200):
+            body = json.dumps(value).encode()
+            self.send_response(code)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            if self.path == '/api/oauth/token':
+                calls.append(('refresh', self.headers.get_content_type(), body))
+                if body != {'grant_type': 'refresh_token', 'client_id': 'metacodes', 'refresh_token': 'session-refresh'}:
+                    self.reply({}, 400)
+                    return
+                self.reply({'access_token': 'session-access', 'refresh_token': 'session-rotated', 'expires_in': 3600})
+            elif self.path == '/v1/messages':
+                calls.append(('model-request', self.headers.get('Authorization'), body))
+                if self.headers.get('Authorization') != 'Bearer session-access':
+                    self.reply({}, 401)
+                    return
+                events = [{'type': 'message_start', 'message': {'usage': {'input_tokens': 50}}},
+                          {'type': 'content_block_delta', 'delta': {'text': 'output'}},
+                          {'type': 'message_delta', 'usage': {'output_tokens': 20}}, {'type': 'message_stop'}]
+                payload = b''.join(b'data: ' + json.dumps(e).encode() + b'\n\n' for e in events)
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            else:
+                self.reply({}, 404)
+
+        def do_GET(self):
+            calls.append((self.path, self.headers.get('Authorization')))
+            if self.path != '/v1/models':
+                self.reply({}, 404)
+            elif self.headers.get('Authorization') not in ('Bearer session-access', 'Bearer replacement-access'):
+                self.reply({}, 401)
+            else:
+                self.reply({'data': [{'id': 'session-model'}, {'id': 'video-model', 'capabilities': {
+                    'endpoints': {'messages': {'supported': False}}}}]})
+
+        def log_message(self, *_args):
+            pass
+
+    http = ThreadingHTTPServer(('127.0.0.1', 0), Endpoint)
+    atomic_json(state / 'oauth/metask.json', {'schema_version': 1, 'access_token': 'old-session',
+                'refresh_token': 'session-refresh', 'token_type': 'Bearer',
+                'expires_at': 0 if expired else int(time.time()) + 3600,
+                'gateway_url': f'http://127.0.0.1:{http.server_port}',
+                'models_url': f'http://127.0.0.1:{http.server_port}/v1/models'})
     threading.Thread(target=http.serve_forever, daemon=True).start()
     return state, http, calls
 
@@ -360,6 +428,51 @@ class WorkbenchTest(unittest.TestCase):
         self.assertGreater(row['tps'], 0)
         self.assertGreaterEqual(row['ttft_ms'], 0)
 
+    def test_current_cli_session_reaches_catalog_and_actual_worker_request(self):
+        state, upstream, calls = session_fixture(self.root)
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        cfg = json.loads(self.manager.config_path.read_text())
+        cfg.update(auth_mode='metask', account_state_dir=str(state), metrics_enabled=True, metrics_bind='127.0.0.1')
+        atomic_json(self.manager.config_path, cfg)
+        with patch.dict(os.environ, {'METASK_SITE_URL': f'http://127.0.0.1:{upstream.server_port}',
+                                     'FAKE_EXPECT_ACCOUNT_KEY': 'session-access', 'FAKE_PROFILE_REQUEST': '1'}):
+            catalog = self.client.request('api/workbench')
+            self.assertEqual([m['id'] for m in catalog['models']], ['metask/session-model'])
+            self.assertEqual(catalog['reasoning_effort'], 'max')
+            self.assertEqual(catalog['warnings'], [])
+            run = self.client.request('api/runs', {**self.request(), 'model': 'metask/session-model'})
+            final = wait_run(self.manager, run['name'])
+            self.assertEqual(final['status'], 'finished', final)
+            row = self.client.request('api/job?name=' + run['name'])['rows'][0]
+            self.assertEqual((row['total_tokens'], row['requests']), (70, 1))
+            self.assertIn(('model-request', 'Bearer session-access', {'model': 'session-model'}), calls)
+            saved = json.loads((state / 'oauth/metask.json').read_text())
+            self.assertEqual(saved['refresh_token'], 'session-rotated')
+            self.assertEqual(json.loads((state / 'auth.json').read_text()),
+                             {'selected_model': 'session-model', 'reasoning_effort': 'max'})
+            saved['access_token'] = 'replacement-access'
+            atomic_json(state / 'oauth/metask.json', saved)
+            self.client.request('api/workbench')
+            self.assertEqual(calls[-1], ('/v1/models', 'Bearer replacement-access'))
+        public = json.dumps(catalog) + ''.join(p.read_text() for p in self.manager.records.iterdir())
+        for secret in ('session-access', 'session-refresh', 'session-rotated', 'replacement-access'):
+            self.assertNotIn(secret, public)
+
+    def test_session_gateway_reaches_child_when_profiling_is_disabled(self):
+        state, upstream, calls = session_fixture(self.root)
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        cfg = json.loads(self.manager.config_path.read_text())
+        cfg.update(auth_mode='metask', account_state_dir=str(state), metrics_enabled=False)
+        atomic_json(self.manager.config_path, cfg)
+        with patch.dict(os.environ, {'METASK_SITE_URL': f'http://127.0.0.1:{upstream.server_port}',
+                                     'FAKE_ACCOUNT_REQUEST': '1'}):
+            run = self.client.request('api/runs', {**self.request(), 'model': 'metask/session-model'})
+            final = wait_run(self.manager, run['name'])
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertIn(('model-request', 'Bearer session-access', {'model': 'session-model'}), calls)
+
 
 class AccountTest(unittest.TestCase):
     def test_oauth_refresh_tokens_are_never_used_as_account_keys(self):
@@ -367,6 +480,35 @@ class AccountTest(unittest.TestCase):
             atomic_json(Path(root) / 'auth.json', {'oauth': {'refresh_token': 'refresh-test'}})
             with self.assertRaisesRegex(ValueError, '查看全部模型组需要 Metask 账号登录'):
                 Account(root).credential()
+
+    def test_current_session_refreshes_rejected_access_once_with_json_grant(self):
+        with tempfile.TemporaryDirectory() as root:
+            state, upstream, calls = session_fixture(Path(root), expired=False)
+            self.addCleanup(upstream.server_close)
+            self.addCleanup(upstream.shutdown)
+            with patch.dict(os.environ, {'METASK_SITE_URL': f'http://127.0.0.1:{upstream.server_port}'}):
+                account = Account(state)
+                self.assertEqual(account.credential('metask/session-model', key_id='session'), 'session-access')
+            refreshes = [c for c in calls if c[0] == 'refresh']
+            self.assertEqual(refreshes, [('refresh', 'application/json', {
+                'grant_type': 'refresh_token', 'client_id': 'metacodes', 'refresh_token': 'session-refresh'})])
+            self.assertEqual(json.loads((state / 'oauth/metask.json').read_text())['schema_version'], 1)
+            if os.name != 'nt':
+                self.assertEqual((state / 'oauth/metask.json').stat().st_mode & 0o777, 0o600)
+
+    def test_current_session_concurrent_refresh_and_invalid_store(self):
+        with tempfile.TemporaryDirectory() as root:
+            state, upstream, calls = session_fixture(Path(root))
+            self.addCleanup(upstream.server_close)
+            self.addCleanup(upstream.shutdown)
+            with patch.dict(os.environ, {'METASK_SITE_URL': f'http://127.0.0.1:{upstream.server_port}'}):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    self.assertEqual(list(pool.map(lambda _: Account(state).oauth_bearer(), [1, 2])),
+                                     ['session-access', 'session-access'])
+                self.assertEqual(len([c for c in calls if c[0] == 'refresh']), 1)
+                atomic_json(state / 'oauth/metask.json', {'access_token': 'broken'})
+                with self.assertRaisesRegex(ValueError, '会话格式无效'):
+                    Account(state).credential()
 
 
 class AccountInventoryTest(unittest.TestCase):

@@ -76,6 +76,7 @@ class MetacodesAgent(BaseInstalledAgent):
         disallowed_tools: Optional[str] = None,
         metrics_proxy: Optional[str] = None,
         metrics_ca: Optional[str] = None,
+        account_gateway: Optional[str] = None,
         **kwargs: Any,
     ):
         bundle_path = bundle or os.environ.get(BUNDLE_ENV)
@@ -92,6 +93,7 @@ class MetacodesAgent(BaseInstalledAgent):
         self._max_tokens = int(max_tokens) if max_tokens is not None else None
         self._metrics_proxy = metrics_proxy
         self._metrics_ca = Path(metrics_ca) if metrics_ca else None
+        self._account_gateway = account_gateway
         self._disallowed_tools = (
             cmd.DEFAULT_DISALLOWED_TOOLS
             if disallowed_tools is None
@@ -189,6 +191,8 @@ class MetacodesAgent(BaseInstalledAgent):
         remote_config: Optional[str] = None
         trial_name = self.logs_dir.parent.name
         flags = list(self._flags)
+        if self._account_gateway and self._provider == "metask" and not self._metrics_proxy:
+            flags += ["--base-url", self._account_gateway]
         if self._metrics_proxy and self._provider in (None, "metask", "anthropic"):
             endpoint = self._metrics_proxy.rstrip("/") + "/" + trial_name
             # Named profiles append their own protocol suffix. Only the

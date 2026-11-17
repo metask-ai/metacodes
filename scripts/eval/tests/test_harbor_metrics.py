@@ -209,7 +209,7 @@ class MetricProjectionTest(unittest.TestCase):
         with urllib.request.urlopen(f'http://127.0.0.1:{http.server_port}/api/jobs') as response:
             result = json.load(response)
         self.assertEqual(result['summary']['tps'], 25)
-        self.assertEqual(result['storage']['jobs_dirs'], [str(self.root)])
+        self.assertEqual(result['storage']['jobs_dirs'], [str(self.root.resolve())])
 
     def test_historical_usage_is_recovered_but_missing_timing_stays_unknown(self):
         trial = _trial(self.job, 'old__aaa', reward=1)

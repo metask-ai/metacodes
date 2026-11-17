@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -18,6 +19,55 @@ import urllib.request
 from pathlib import Path
 
 GATEWAY = "https://napi.metask-ai.com"
+SITE = "https://www.metask-ai.com"
+
+
+def origin_url(value):
+    origin = urllib.parse.urlsplit(value)
+    if origin.scheme not in ("https", "http") or not origin.hostname or origin.path or origin.query or origin.fragment or origin.username or origin.password:
+        raise ValueError("Metask 账号网关必须是 http(s) origin")
+    return value
+
+
+@dataclass(frozen=True)
+class SessionLogin:
+    """The current CLI's OAuth store, separate from legacy auth.json."""
+    path: Path
+    site: str
+
+    def read(self):
+        try:
+            doc = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise ValueError("Metask 会话不可用，请重新运行 metacodes login") from None
+        if (not isinstance(doc, dict) or type(doc.get("expires_at")) is not int
+                or any(not isinstance(doc.get(k), str) or not doc[k] for k in ("access_token", "refresh_token", "gateway_url"))):
+            raise ValueError("Metask 会话格式无效，请重新运行 metacodes login")
+        origin_url(doc["gateway_url"])
+        return doc
+
+    def bearer(self, request, stale=None):
+        with refresh_lock(self.path.parent):
+            current = self.read()
+            if stale is not None and current["access_token"] != stale:
+                return current["access_token"]
+            if stale is None and current["expires_at"] > time.time() + 300:
+                return current["access_token"]
+            token = request("/api/oauth/token", origin=self.site, json_body={
+                "grant_type": "refresh_token", "client_id": "metacodes",
+                "refresh_token": current["refresh_token"]})
+            if (not isinstance(token, dict) or type(token.get("expires_in")) is not int or token["expires_in"] <= 0
+                    or any(not isinstance(token.get(k), str) or not token[k] for k in ("access_token", "refresh_token"))):
+                raise ValueError("Metask 登录刷新失败，请重新运行 metacodes login")
+            latest = self.read()
+            if latest["refresh_token"] != current["refresh_token"]:
+                return latest["access_token"]
+            updated = {**latest, **{k: token[k] for k in (
+                "access_token", "refresh_token", "token_type", "scope", "gateway_url", "models_url", "client_name") if k in token},
+                "expires_at": int(time.time()) + token["expires_in"]}
+            origin_url(updated["gateway_url"])
+            private_json(self.path, updated)
+            return updated["access_token"]
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -87,21 +137,41 @@ class Account:
         if not state_dir:
             raise ValueError("请设置 --account-state-dir，指向已登录 metacodes 的状态目录")
         self.state_dir = Path(state_dir).expanduser().resolve()
-        self.gateway = (gateway or GATEWAY).rstrip("/")
-        origin = urllib.parse.urlsplit(self.gateway)
-        if origin.scheme not in ("https", "http") or not origin.hostname or origin.path or origin.query or origin.fragment or origin.username or origin.password:
-            raise ValueError("Metask 账号网关必须是 http(s) origin")
+        self.auth_path = Path(os.environ.get("METACODES_AUTH_FILE") or self.state_dir / "auth.json")
+        session_path = Path(os.environ.get("METACODES_OAUTH_DIR") or self.state_dir / "oauth") / "metask.json"
+        self.session = SessionLogin(session_path, origin_url(os.environ.get("METASK_SITE_URL", SITE).rstrip("/"))) if session_path.exists() else None
+        self.gateway_override = origin_url(gateway.rstrip("/")) if gateway else None
+
+    @property
+    def gateway(self):
+        return self.gateway_override or (self.session.read()["gateway_url"] if self.session else GATEWAY)
+
+    def fingerprint(self):
+        def stamp(path):
+            try:
+                stat = path.stat()
+                return stat.st_mtime_ns, stat.st_size
+            except OSError:
+                return None
+        return (str(self.state_dir), self.gateway, stamp(self.auth_path),
+                (str(self.session.path), stamp(self.session.path)) if self.session else None)
 
     def login(self):
         try:
-            doc = json.loads((self.state_dir / "auth.json").read_text(encoding="utf-8"))
+            doc = json.loads(self.auth_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            if self.session:
+                self.session.read()
+                return {}
             raise ValueError("执行机器尚未登录 Metask，请在同一状态目录运行 metacodes login") from None
+        if self.session and isinstance(doc, dict):
+            self.session.read()
+            return doc
         if not isinstance(doc, dict) or not (doc.get("api_key") or isinstance(doc.get("oauth"), dict)):
             raise ValueError("执行机器尚未登录 Metask，请运行 metacodes login")
         return doc
 
-    def request(self, path, bearer=None, form=None):
+    def request(self, path, bearer=None, form=None, *, origin=None, json_body=None):
         headers = {"Accept": "application/json"}
         if bearer:
             headers["Authorization"] = "Bearer " + bearer
@@ -109,7 +179,10 @@ class Account:
         if form is not None:
             body = urllib.parse.urlencode(form).encode()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
-        request = urllib.request.Request(self.gateway + path, data=body, headers=headers)
+        if json_body is not None:
+            body = json.dumps(json_body).encode()
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request((origin or self.gateway) + path, data=body, headers=headers)
         try:
             with urllib.request.build_opener(NoRedirect).open(request, timeout=10) as response:
                 body = response.read(8 * 1024 * 1024 + 1)
@@ -122,6 +195,8 @@ class Account:
             raise ValueError("无法读取 Metask 账号目录，请检查执行机器的网络和登录状态") from None
 
     def oauth_bearer(self, stale=None):
+        if self.session:
+            return self.session.bearer(self.request, stale)
         with refresh_lock(self.state_dir):
             login = self.login()
             oauth = login.get("oauth") or {}
@@ -152,11 +227,13 @@ class Account:
                 if name in token:
                     updated[name] = token[name]
             current["oauth"] = updated
-            private_json(self.state_dir / "auth.json", current)
+            private_json(self.auth_path, current)
             return updated["access_token"]
 
     def keys(self):
         login = self.login()
+        if self.session:
+            return [{"id": "session", "secret": self.oauth_bearer(), "group": "Metask", "group_id": ""}]
         if not login.get("oauth"):
             key = login.get("api_key")
             if not isinstance(key, str) or not key.strip():
@@ -197,11 +274,21 @@ class Account:
         return result
 
     def model_directory(self, key):
-        document = self.request("/v1/models", key["secret"])
+        try:
+            document = self.request("/v1/models", key["secret"])
+        except AccountHTTPError as exc:
+            if not self.session or exc.status != 401:
+                raise
+            document = self.request("/v1/models", self.oauth_bearer(stale=key["secret"]))
         rows = document.get("data") if isinstance(document, dict) else None
         if not isinstance(rows, list):
             raise ValueError("Metask 模型目录格式无效")
-        return [m for m in rows if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]]
+        def messages_supported(model):
+            value = model
+            for name in ("capabilities", "endpoints", "messages"):
+                value = value.get(name) if isinstance(value, dict) else None
+            return not isinstance(value, dict) or value.get("supported") is not False
+        return [m for m in rows if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"] and messages_supported(m)]
 
     def credential(self, model=None, key_id=None):
         for key in self.keys():
@@ -209,17 +296,17 @@ class Account:
                 continue
             name = model.removeprefix("metask/") if model else None
             if name is None or any(m["id"] == name for m in self.model_directory(key)):
-                return key["secret"]
+                return self.oauth_bearer() if self.session else key["secret"]
         raise ValueError("所选模型的账号 Key 已不可用，请刷新模型目录后重试")
 
     def catalog(self):
         login = self.login()
         keys = self.keys()
         models, routes, warnings = {}, {}, []
-        if not login.get("oauth"):
+        if not self.session and not login.get("oauth"):
             warnings.append("当前为 Key 登录，仅显示此 Key 的模型；完成 Metask 账号登录后可读取全部模型组")
         groups = []
-        if login.get("oauth"):
+        if not self.session and login.get("oauth"):
             try:
                 directory = items(self.request("/api/v1/groups/available", self.oauth_bearer()))
                 if directory is None:
@@ -260,4 +347,4 @@ class Account:
         return {"models": list(models.values()), "routes": routes, "default_model": default,
                 "account_groups": groups,
                 "warnings": warnings, "account_summary": {"groups": len(keys), "available_groups": available, "models": len(models)},
-                "reasoning_effort": effort if effort in ("low", "medium", "high", "xhigh") else None}
+                "reasoning_effort": effort if effort in ("none", "low", "medium", "high", "xhigh", "max") else None}

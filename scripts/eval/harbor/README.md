@@ -93,6 +93,7 @@ Agent options (`--ak name=value`):
 | `disallowed_tools` | `Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage,EnterPlanMode,ExitPlanMode` | `--disallowed-tools`; an empty value enables every tool |
 | `metrics_proxy` | none | workbench-owned relay URL for request-level TTFT/TPS; payloads are forwarded unchanged |
 | `metrics_ca` | none | public relay CA file; trusted only inside the disposable task container |
+| `account_gateway` | none | account session's gateway origin; used by the Metask route when no timing relay is active |
 
 ### A third-party gateway
 
@@ -141,8 +142,9 @@ not claims about provider maxima. A model being listed or passing offline
 route validation does not establish a benchmark result or live compatibility.
 
 The workbench defaults to the Metask account selected by `metacodes login`.
-Its model list combines the authenticated directories of all active account
-keys/model groups; each launch uses the chosen model's matching key. Existing
+Its model list uses the current CLI session's gateway and bearer. Legacy
+account logins combine all active keys/model groups; each launch uses the
+chosen model's matching credential. Existing
 gateway configurations stay in provider mode until `metacodes bench --auth
 metask` is selected; see [account configuration](../../../doc/BENCH_WORKBENCH.md#configure-execution).
 ## Smoke

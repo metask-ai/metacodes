@@ -22,6 +22,8 @@ def command(spec):
             "--max-retries", "0", "-o", spec["jobs_dir"], "--job-name", spec["name"], "-y"]
     if spec.get("provider_config"):
         argv += ["--ak", "config=" + spec["provider_config"]]
+    if spec.get("auth_mode") == "metask" and spec.get("account_gateway"):
+        argv += ["--ak", "account_gateway=" + spec["account_gateway"]]
     if spec.get("reasoning_effort"):
         argv += ["--ak", "reasoning_effort=" + spec["reasoning_effort"]]
     if spec.get("metrics_proxy"):
@@ -47,8 +49,9 @@ def main(argv=None):
         if spec.get("auth_mode") == "metask":
             # Resolve the key belonging to this model's group, without
             # changing the interactive CLI selection or forwarding OAuth.
-            env["METASK_API_KEY"] = Account(spec.get("account_state_dir"), spec.get("account_gateway")).credential(
-                spec["model"], key_id=spec.get("account_key_id"))
+            account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
+            env["METASK_API_KEY"] = account.credential(spec["model"], key_id=spec.get("account_key_id"))
+            spec = {**spec, "account_gateway": account.gateway}
         upstream = upstream_for(spec) if spec.get("metrics_enabled", True) else None
         if upstream:
             header, prefix = auth_for(spec)
