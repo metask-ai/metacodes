@@ -60,6 +60,13 @@ run; terminal states remain terminal. Transport failure attempts cancellation
 before returning the error. A final frame without a newline is rejected and
 never executed.
 
+Idle POSIX input waits check the shared abort signal at most every 50 ms,
+including before initialization and with a partial frame buffered. Host abort
+cancels the run, discards the incomplete frame and releases the run lease
+without closing host-owned descriptors. Windows descriptor serving currently
+returns `UnsupportedPlatform`; this does not affect the transport-independent
+message engine.
+
 Requests are limited to 1 MiB excluding the delimiter; responses to 4 MiB
 excluding the delimiter. Oversized input is drained through the next newline,
 produces one error, and processing resumes. Invalid JSON also produces an error

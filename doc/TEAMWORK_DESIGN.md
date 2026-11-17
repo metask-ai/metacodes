@@ -207,7 +207,8 @@ packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径
 - 账本只有 runtime 写,不是线程安全的,由 runtime 串行化。
 
 在 metacodes、成本受限的 Claude Code seat 或 verifier 开始付费工作前,runtime 先写入并 fsync
-`budget.jsonl.pending`,记录该 seat 获准使用的剩余额度。正常结束的 durable charge 清理该记录。
+`budget.jsonl.pending`,记录该 seat 获准使用的剩余额度。预留先写临时文件并 fsync,再以不覆盖方式
+原子安装;写临时文件时中断不会留下半份有效预留,重试也不会覆盖旧预留。正常结束的 durable charge 清理该记录。
 控制器崩溃后,`Ledger.load` 若只找到预留而没有该 seat 的完成记账,就把预留作为 `reserved`
 入账并停止继续花费;若完成记账已落盘则只清理旧预留,不重复扣除。显式 `wallclock_only` 仍然
 只承诺时间上限。成本模式下,缺少有效结果/花费报告不会被当作零花费后继续重试。
