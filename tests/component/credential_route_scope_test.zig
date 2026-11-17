@@ -26,6 +26,9 @@
 //!     left the Metask sign-in's route, so another endpoint's 401
 //!     `token_expired` was retried with the Metask token, and it answered
 //!     with whatever OAuth session the process held.
+//!   * A transport's own refresh on a 401 `token_expired` installed and
+//!     replayed the refreshed token on whatever route the client had been
+//!     moved to while the refresh ran.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -862,4 +865,118 @@ test "L2 credential scope: another provider's refresh token never reaches Metask
     } else |_| {}
     try expectNeverSent(site, "fake-oauth-refresh-1");
     try std.testing.expectEqual(@as(usize, 0), site.requestCount());
+}
+
+// ── a refresh that finishes after the route moved ───────────────────────────
+
+/// A refresh callback that moves the client's route before answering, as a
+/// `/model` commit from the reply's key thread does mid-refresh.
+fn RouteMover(comptime ClientT: type) type {
+    return struct {
+        client: *ClientT,
+        to: []const u8,
+        move: bool,
+
+        fn refresh(ctx: *anyopaque, stale: []const u8) anyerror![]u8 {
+            _ = stale;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.move) self.client.base_url = self.to;
+            return std.testing.allocator.dupe(u8, "fake-refreshed-token");
+        }
+    };
+}
+
+test "L2 credential scope: a token refreshed while the route moved is not sent on the new route" {
+    var first = try harness.MockServer.startHttpCassette(
+        &.{ TOKEN_EXPIRED_BODY, ANTHROPIC_END_TURN_SSE },
+        &.{ "HTTP/1.1 401 Unauthorized", "HTTP/1.1 200 OK" },
+    );
+    defer first.stop();
+    var moved = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer moved.stop();
+    const a = std.testing.allocator;
+    const first_url = try first.urlOwned(a);
+    defer a.free(first_url);
+    const moved_url = try moved.urlOwned(a);
+    defer a.free(moved_url);
+
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), SESSION_KEY, "claude-sonnet-4-6", first_url);
+    defer client.deinit();
+    var mover = RouteMover(cc.client_mod.Client){ .client = &client, .to = moved_url, .move = true };
+    client.setRefreshCallback(@ptrCast(&mover), RouteMover(cc.client_mod.Client).refresh);
+
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    if (client.sendMessageStream(empty, null, null)) |sent| {
+        var response = sent;
+        response.deinit();
+        try expectNeverSent(moved, "fake-refreshed-token");
+        return error.ReplayedOnTheNewRoute;
+    } else |err| try std.testing.expectEqual(error.Unauthorized, err);
+    try expectNeverSent(moved, "fake-refreshed-token");
+    try std.testing.expectEqual(@as(usize, 0), moved.requestCount());
+    try std.testing.expectEqualStrings(SESSION_KEY, client.credential.lendable().?);
+
+    // Where the route stayed, the refreshed token is replayed as before.
+    var again = try harness.MockServer.startHttpCassette(
+        &.{ TOKEN_EXPIRED_BODY, ANTHROPIC_END_TURN_SSE },
+        &.{ "HTTP/1.1 401 Unauthorized", "HTTP/1.1 200 OK" },
+    );
+    defer again.stop();
+    const again_url = try again.urlOwned(a);
+    defer a.free(again_url);
+    client.base_url = again_url;
+    mover.move = false;
+    var response = try client.sendMessageStream(empty, null, null);
+    while (true) {
+        const maybe = response.next() catch break;
+        const event = maybe orelse break;
+        switch (event) {
+            .text => |text| a.free(text),
+            else => {},
+        }
+        if (response.done) break;
+    }
+    response.deinit();
+    try std.testing.expect(sentBearer(again, 1, "fake-refreshed-token"));
+}
+
+test "L2 credential scope: an OpenAI-wire token refreshed while the route moved is not sent on the new route" {
+    const OPENAI_SSE =
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" ++
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n" ++
+        "data: [DONE]\n\n";
+    var first = try harness.MockServer.startHttpCassette(
+        &.{ TOKEN_EXPIRED_BODY, OPENAI_SSE },
+        &.{ "HTTP/1.1 401 Unauthorized", "HTTP/1.1 200 OK" },
+    );
+    defer first.stop();
+    var moved = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer moved.stop();
+    var urls = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer urls.deinit();
+    const first_url = try std.fmt.allocPrint(urls.allocator(), "{s}/v1/chat/completions", .{try originOf(urls.allocator(), first)});
+    const moved_url = try std.fmt.allocPrint(urls.allocator(), "{s}/v1/chat/completions", .{try originOf(urls.allocator(), moved)});
+    const a = std.testing.allocator;
+
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.api_openai.OpenAIClient.init(a, io_runtime.io(), SESSION_KEY, "relay-model", first_url);
+    defer client.deinit();
+    var mover = RouteMover(cc.api_openai.OpenAIClient){ .client = &client, .to = moved_url, .move = true };
+    client.setRefreshCallback(@ptrCast(&mover), RouteMover(cc.api_openai.OpenAIClient).refresh);
+
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    if (client.provider().sendStream(&messages, null, null, null, null, null, "")) |sent| {
+        var handle = sent;
+        handle.deinit();
+        try expectNeverSent(moved, "fake-refreshed-token");
+        return error.ReplayedOnTheNewRoute;
+    } else |err| try std.testing.expectEqual(error.Unauthorized, err);
+    try expectNeverSent(moved, "fake-refreshed-token");
+    try std.testing.expectEqual(@as(usize, 0), moved.requestCount());
+    try std.testing.expectEqualStrings(SESSION_KEY, client.credential.lendable().?);
 }

@@ -475,7 +475,8 @@ credential of the route the clients are bound to (the last commit's, or the
 one the session started on), and only when that route was bound with its
 OAuth token: the kernel's effective selection can name another route (a
 global or once pick under a session one), and a key or a pool account a route
-was bound with stays.
+was bound with stays. A transport's own refresh on a 401 `token_expired` is
+dropped when the route moved while it ran.
 
 The module performs no I/O. The token exchange is a caller-supplied function, so
 every lifecycle test drives a fake exchange and none needs a network;

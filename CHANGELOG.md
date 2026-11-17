@@ -547,6 +547,12 @@ status, compatibility boundaries, and entry points are defined by
   removes it with the route, and it answers only while the process's OAuth
   session is Metask's.
 
+- **A token refreshed while the route moved is not sent on the new route.**
+  When a 401 `token_expired` refresh finished after a `/model` commit (made
+  from the reply's key thread) had moved the client, the refreshed token was
+  installed and the request replayed at the new route. The client now drops
+  it, and the request fails as unauthorized.
+
 ### Security
 
 - **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**
