@@ -145,6 +145,10 @@ pub const Result = enum {
     /// leaves the user unable to tell — and a second one naming who bills
     /// the session from now on when that changed (#488).
     committed,
+    /// The picker was closed without a commit (Esc, q). The notice says so
+    /// and names the model the session stays on, for the transcript: "kept
+    /// glm-5.3 · reasoning high".
+    cancelled,
 };
 
 /// Feed one key.
@@ -162,7 +166,11 @@ pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key, guard: Guard) R
         .redraw => return .redraw,
         .closed => {
             close(app, ui, guard);
-            return .redraw;
+            guard.lock();
+            defer guard.unlock();
+            var level_buf: [48]u8 = undefined;
+            app.model_picker.setNotice("kept {s}{s}", .{ app.activeModel(), levelNote(app.config.reasoning_effort, &level_buf) });
+            return .cancelled;
         },
         .commit => |commit| return apply(app, ui, commit, guard),
     }
@@ -211,9 +219,11 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, gu
                     billed,
                 });
             } else {
-                app.model_picker.setNotice("switched to {s} for {s}{s}", .{
+                var level_buf: [48]u8 = undefined;
+                app.model_picker.setNotice("switched to {s} {s}{s}{s}", .{
                     app.activeModel(),
-                    view_mod.scopeWord(accepted.scope),
+                    view_mod.scopePhrase(accepted.scope),
+                    levelNote(committedLevel(commit), &level_buf),
                     billed,
                 });
             }
@@ -237,6 +247,21 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, gu
             return .redraw;
         },
     }
+}
+
+/// " · reasoning high" for a level a route was committed with or the
+/// session runs at, "" for none.
+fn levelNote(level: ?@import("../types.zig").ReasoningEffort, buf: []u8) []const u8 {
+    const effort = level orelse return "";
+    if (!effort.active()) return "";
+    return std.fmt.bufPrint(buf, " · reasoning {s}", .{effort.name()}) catch "";
+}
+
+/// The reasoning level a commit carries, if any.
+fn committedLevel(commit: picker_mod.Commit) ?@import("../types.zig").ReasoningEffort {
+    const value = commit.controls.get("reasoning_effort") orelse return null;
+    if (value != .text) return null;
+    return @import("../types.zig").ReasoningEffort.parse(value.text.slice());
 }
 
 /// The provider of the route the session is on, as the kernel knows it;

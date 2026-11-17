@@ -516,6 +516,15 @@ test "built-in registry accepts every shipped profile" {
     try std.testing.expect(registry.find("nope") == null);
 }
 
+test "the coding plans, and only they, are subscription plans" {
+    // A new subscription plan is a deliberate entry here: its unattended
+    // starts get the stderr note `ProviderProfile.subscription_plan` documents.
+    for (BUILTIN_PROFILES) |entry| {
+        const plan = entry.id.eqlText("kimi-code") or entry.id.eqlText("zai-coding-plan");
+        try std.testing.expectEqual(plan, entry.subscription_plan);
+    }
+}
+
 test "registration rejects duplicate ids and alias collisions" {
     var registry = try ProviderRegistry.initWithBuiltins(std.testing.allocator);
     defer registry.deinit();

@@ -29,13 +29,25 @@
 //! compresses anyway fails there, with `error.HttpContentEncodingUnsupported`,
 //! before any parser sees the body.
 //!
+//! Identity. A request whose caller names no `user-agent` says it is
+//! metacodes (`metacodes/<semver>`), not std's `zig/<version> (std.http)`.
+//! Vendors tell coding tools apart by this header, some of them refuse a
+//! client they do not recognise, and their terms forbid a forged one (Kimi
+//! Code's community guidelines, for one); an honest name is the only one a
+//! vendor can be asked to admit. A caller's own `.override` or `.omit` stays
+//! as it is (the OTLP exporter names itself `metacodes-otlp`).
+//!
 //! Every request in `src/` sends through these two functions instead of the
 //! `Request` methods of the same names; a source guard in
 //! tests/component/http_send_failure_test.zig keeps it that way.
 
 const std = @import("std");
+const version = @import("../version.zig");
 
 const Request = std.http.Client.Request;
+
+/// What a request says it is when its caller names nothing else.
+pub const user_agent = "metacodes/" ++ version.semver;
 
 /// The codings a request accepts: identity only (see the module comment).
 const identity_only = blk: {
@@ -46,16 +58,26 @@ const identity_only = blk: {
 
 /// `request.sendBodyComplete(body)`. A connection the send failed on is closed
 /// by `Request.deinit` instead of being pooled. The request accepts an
-/// uncompressed answer only.
+/// uncompressed answer only, and says it is metacodes unless its caller named
+/// itself.
 pub fn sendBodyComplete(request: *Request, body: []u8) std.Io.Writer.Error!void {
     acceptIdentityOnly(request);
+    identify(request);
     request.sendBodyComplete(body) catch |err| return dropConnection(request, err);
 }
 
 /// `request.sendBodiless()`, with the same rules as `sendBodyComplete`.
 pub fn sendBodiless(request: *Request) std.Io.Writer.Error!void {
     acceptIdentityOnly(request);
+    identify(request);
     request.sendBodiless() catch |err| return dropConnection(request, err);
+}
+
+/// At `.default`, std writes `zig/<version> (std.http)`; name metacodes
+/// instead. A caller's `.omit` or `.override` stays as it is.
+fn identify(request: *Request) void {
+    if (request.headers.user_agent == .default)
+        request.headers.user_agent = .{ .override = user_agent };
 }
 
 fn acceptIdentityOnly(request: *Request) void {

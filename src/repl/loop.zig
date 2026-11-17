@@ -2211,11 +2211,15 @@ fn readLineRaw(
                     continue;
                 },
                 .picker_key => {
-                    if (picker_host.onKey(app, &region.ui, eff.picker_key, .of(region)) == .committed) {
+                    switch (picker_host.onKey(app, &region.ui, eff.picker_key, .of(region))) {
                         // The overlay is gone; the confirmation has to survive
-                        // it or the user cannot tell which route was chosen.
-                        region.clear();
-                        region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
+                        // it or the user cannot tell which route was chosen,
+                        // or that none was ("kept …").
+                        .committed, .cancelled => {
+                            region.clear();
+                            region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
+                        },
+                        .ignored, .redraw => {},
                     }
                     redraw(region, &editor, app);
                     continue;
