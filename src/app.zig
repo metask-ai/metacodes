@@ -4924,7 +4924,7 @@ pub const App = struct {
                         "failIfUnavailable refuses every Bash command"
                     else
                         "Bash commands run unsandboxed and autoAllowBashIfSandboxed does not apply";
-                    @import("util/log.zig").warn("sandbox", "enabled in {s}, but this host has no sandbox backend (macOS sandbox-exec only): {s}", .{ path, consequence });
+                    @import("util/log.zig").warn("sandbox", "enabled in {s}, but this host has no sandbox backend (macOS sandbox-exec, or a Linux bubblewrap at /usr/bin/bwrap, /bin/bwrap or $METACODES_BWRAP that can create user namespaces): {s}", .{ path, consequence });
                 }
                 return;
             }

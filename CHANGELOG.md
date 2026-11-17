@@ -232,6 +232,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A Linux sandbox backend: bubblewrap.** With `sandbox.enabled`, Bash,
+  Monitor, skill `!` lines, the teamwork reviewer's check command and the
+  Claude Code seat's CLI now run on Linux in bwrap mount, pid and IPC
+  namespaces translated from the same settings Seatbelt reads on macOS:
+  `/` read-only, the write roots bound writable at their physical paths,
+  `denyWrite` read-only and `denyRead` hidden on top, `--new-session
+  --die-with-parent`. bwrap is `/usr/bin/bwrap`, `/bin/bwrap` or the absolute
+  path in `METACODES_BWRAP`, never `PATH`, and is probed once per process; one
+  that cannot create a user namespace counts as no sandbox, so
+  `failIfUnavailable` refuses and `autoAllowBashIfSandboxed` does not apply.
+  A domain list in `network` cuts the network off under bwrap (no per-host
+  filter). Teamwork seats on Linux get the sandbox too, so an implementer seat
+  can build and test in its workspace instead of running read-only commands
+  only.
+
 - **A `SessionHost` Session can move onto another provider route, journaled
   as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`
   commit moves the session's provider, endpoint, credential and model

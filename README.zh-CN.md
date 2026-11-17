@@ -152,7 +152,7 @@ TinyKG 是 Metask Lab 自研的图存储，用 Zig 编写。它的源码暂未�
 ### 安全与可观测性
 
 - **权限。** 五种模式；allow、ask、deny 规则使用 Claude Code 用户熟悉的 `Tool(specifier)` 语法；受保护路径（`.git`、`.env` 文件、`.ssh`、shell rc 文件等）始终需要确认。
-- **沙箱。** 可选启用的 macOS Seatbelt 沙箱；Linux 后端有待贡献。
+- **沙箱。** 可选启用的 Bash 沙箱：macOS 用 Seatbelt，Linux 用 bubblewrap。
 - **Stall gate。** 交互式会话中默认开启，工具轮次反复拿不到新信息时会停下运行。
 - **可观测的输出。** 每次文件修改都是一个带有限长度 diff 的事件；模型输出被分类为 commentary、final、continued、partial 或 discarded。
 
@@ -221,7 +221,7 @@ metacodes 处于 1.0 之前，版本号以 `build.zig.zon` 为准，每个发布
 | TinyKG 记忆与任务 DAG | CLI 中默认开启；AgentCore 中尚未提供 |
 | Lean 项目规则 | 实验性；项目激活前保持休眠 |
 | 自演化、learning turn、check gate | 实验性，默认关闭 |
-| 沙箱 | 仅 macOS，需手动开启 |
+| 沙箱 | macOS（Seatbelt）与 Linux（bubblewrap），需手动开启 |
 
 里程碑见 [ROADMAP.md](ROADMAP.md)，开源发布准备情况见 [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md)。
 
@@ -236,7 +236,7 @@ metacodes 由 Metask Lab 开发，也就是 [Metask](https://app.metask-ai.com)�
 - **语言绑定。** Go 绑定、Node 扩展的 Windows 移植、发布 Python 和 Node 包，以及一个 30 行的 C 语言 "hello agent"。
 - **质量。** 补上 WorkBuddy Security 的差距，为真实失败编写离线回归用例。
 - **记忆研究。** 增加一个 Markdown 记忆或向量 RAG 对照组，与 TinyKG 比较。
-- **平台。** Linux 沙箱后端（bubblewrap 或 Landlock）。
+- **平台。** Windows 沙箱后端，以及沙箱的按域名网络过滤。
 
 [CONTRIBUTING.md](CONTRIBUTING.md) 把每个方向对应到具体的入口，并说明改动如何被接受。提交第一个 PR 之前请读一遍 [AGENTS.md](AGENTS.md)，它很短。问题和想法请发到 [Discussions](https://github.com/metask-ai/metacodes/discussions)；安全漏洞请按 [SECURITY.md](SECURITY.md) 私下报告，不要开公开 issue。
 

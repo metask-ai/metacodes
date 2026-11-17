@@ -421,6 +421,32 @@ pub const PipeChild = struct {
         if (is_windows) win.CloseHandle(self.stdout_h) else _ = std.c.close(self.stdout_h);
     }
 
+    /// Whether the child has exited, without blocking. When it has, it is
+    /// reaped (POSIX `waitpid`) or its process handle is closed (Windows), so
+    /// call this until it first returns `.exited` and not after. On POSIX a
+    /// child killed by a signal reports the negated signal number.
+    pub fn tryWait(self: *const PipeChild) ReapStatus {
+        const status = reapNonblock(self.proc);
+        if (is_windows) {
+            if (status == .exited) win.CloseHandle(self.proc);
+        }
+        return status;
+    }
+
+    /// Kill the child together with everything it started: on POSIX the
+    /// child leads its own process group (`setpgid` at spawn), which gets
+    /// SIGTERM, then SIGKILL 50 ms later. Windows has no process group here
+    /// and terminates the child alone. Does not reap: follow with `tryWait`.
+    /// Safe after the child itself has exited, while descendants that kept
+    /// the group live on.
+    pub fn killGroup(self: *const PipeChild) void {
+        if (is_windows) {
+            _ = TerminateProcess(self.proc, 1);
+        } else {
+            killGroupPosix(self.proc);
+        }
+    }
+
     /// 终止子进程并回收。POSIX：SIGTERM→200ms→WNOHANG 查→顽固则 SIGKILL→阻塞收尸（防 ignore-TERM
     /// 的 server 令 waitpid 永挂）；Windows：TerminateProcess+WaitForSingleObject+CloseHandle。
     pub fn terminate(self: *const PipeChild) void {

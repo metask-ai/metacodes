@@ -23,7 +23,7 @@ make-work list.
 | Memory and knowledge graphs | [doc/MEMORY_SYSTEM_DESIGN.md](doc/MEMORY_SYSTEM_DESIGN.md), [doc/TINYKG_INTEGRATION.md](doc/TINYKG_INTEGRATION.md) | Recall quality probes, a Markdown-memory or vector-RAG comparison arm, degraded-mode UX |
 | Models and providers | [doc/PROVIDER_OFFER_ARCHITECTURE.md](doc/PROVIDER_OFFER_ARCHITECTURE.md), `src/api/model_adapter.zig` | A model-family adapter, a local-model (Ollama, llama.cpp, vLLM) recipe, dialect conformance tests |
 | Plugins and tools | [doc/PLUGIN_ARCHITECTURE.md](doc/PLUGIN_ARCHITECTURE.md), [doc/PLUGIN_PROCESS_PROTOCOL.md](doc/PLUGIN_PROCESS_PROTOCOL.md) | A process plugin in any language, a plugin template, a sample Skill pack |
-| Sandboxing and security | `src/sandbox/`, `src/permission/`, [SECURITY.md](SECURITY.md) | A Linux sandbox backend (bubblewrap or Landlock), protected-path coverage, permission-rule fuzzing |
+| Sandboxing and security | `src/sandbox/`, `src/permission/`, [SECURITY.md](SECURITY.md) | A Windows sandbox backend, per-host network filtering, protected-path coverage, permission-rule fuzzing |
 | Docs and translation | [doc/README.md](doc/README.md) | Tutorials, diagrams, keeping [README.zh-CN.md](README.zh-CN.md) and the English README in step |
 
 Issues labelled
