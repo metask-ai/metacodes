@@ -258,6 +258,9 @@ pub const PROFILE = profile.ProviderProfile{
     // transport in this codebase, so it is the default channel.
     .default_channel = Slug.lit("cn-anthropic"),
     .api_key_setup = KEY_SETUP,
+    // The subscription agreement (2026-11-13, §7) limits the plan's quota to
+    // the tools Zhipu lists (docs.bigmodel.cn/cn/coding-plan/tool/others.md).
+    .subscription_plan = true,
     .endpoint_policy = .{ .forbidden_path_fragments = &FORBIDDEN },
     .classify_error = classifyError,
 };

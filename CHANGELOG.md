@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **A subscription plan run with nobody at the keyboard says so once.** The
+  coding plans (Kimi Code, the Z.AI GLM Coding Plan) are licensed for a
+  person in a coding tool, so a `-p`, `serve`, resumed-suspension or piped
+  REPL start on one prints `warning: <plan> is a subscription plan for
+  interactive use; its terms may not cover -p, serve or CI. Use a
+  pay-as-you-go key for automation.` on stderr. It never refuses, and the exit
+  code is unchanged; `--web` (a person in a browser) and teammates are not
+  told. Profiles declare it as `ProviderProfile.subscription_plan`.
+
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
   be refused with `INVALID_ARGUMENT`; the blocks now lead the Skill's
