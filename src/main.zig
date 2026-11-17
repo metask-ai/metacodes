@@ -613,6 +613,15 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
     } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .{ .usable = label };
 }
 
+/// `METACODES_AUTH_PRECEDENCE`, which overrides `--auth-precedence`. A start
+/// applies it before the startup order; `login status` (#537) does too, so
+/// both judge an empty `METASK_API_KEY` the same way under `oauth-first`.
+fn applyAuthPrecedenceEnv(config: *types.Config) void {
+    if (std.c.getenv("METACODES_AUTH_PRECEDENCE")) |c| {
+        if (auth.parsePrecedence(std.mem.span(c))) |p| config.auth_precedence = p;
+    }
+}
+
 /// What the startup order reads (`startup_order.Facts`), for `config` as the
 /// start holds it once its flags and the environment are applied (level 1),
 /// and `local`, the install's `.env`. Reads files, sends nothing, changes
@@ -1064,9 +1073,7 @@ pub fn main(init: std.process.Init) !void {
     if (config.base_url == null) {
         if (std.c.getenv("METACODES_BASE_URL")) |c| config.base_url = std.mem.span(c);
     }
-    if (std.c.getenv("METACODES_AUTH_PRECEDENCE")) |c| {
-        if (auth.parsePrecedence(std.mem.span(c))) |p| config.auth_precedence = p;
-    }
+    applyAuthPrecedenceEnv(&config);
     if (config.record_dir == null) {
         if (std.c.getenv("METACODES_RECORD_DIR")) |c| config.record_dir = std.mem.span(c);
     }
@@ -3202,6 +3209,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     var config: types.Config = .{};
     config.state_root = state_dir;
     config.credential_env_fallback = local_config.lookup();
+    applyAuthPrecedenceEnv(&config);
     if (std.c.getenv("METACODES_PROVIDER")) |raw| config.provider_profile = std.mem.span(raw);
     const facts = startupFacts(arena, config, &local_config, local_metask_key);
     const decision = startup_order.decide(facts);
@@ -3245,7 +3253,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
                 std.debug.print("This start uses the default stored with /model.\n", .{}),
             else => {},
         },
-        .metask_key => std.debug.print("This start uses Metask with {s}{s}.\n", .{ metaskKeySource(local_metask_key, stored, auth_error), metask_model }),
+        .metask_key => std.debug.print("This start uses Metask with {s}{s}.\n", .{ metaskKeySource(config.auth_precedence, local_metask_key, stored, auth_error), metask_model }),
         .metask_session => std.debug.print("This start uses Metask, signed in{s}.\n", .{metask_model}),
         .local_provider => switch (facts.local) {
             .provider => |chosen| std.debug.print("This start uses {s} from {s}{s}{s}.\n", .{
@@ -3299,6 +3307,9 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     } else {
         std.debug.print("      {s}: not stored\n", .{auth_path});
     }
+    if (config.auth_precedence == .oauth_first) {
+        std.debug.print("      METACODES_AUTH_PRECEDENCE=oauth-first: a sign-in comes before a key\n", .{});
+    }
     if (nonEmptyEnv(auth.METASK_API_KEY_ENV) != null) {
         std.debug.print("      METASK_API_KEY: set in the shell\n", .{});
     } else if (local_metask_key != null) {
@@ -3336,16 +3347,18 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
 }
 
 /// What signs Metask in on the historical path, in the order it reads them
-/// (`auth.resolveRuntimeCredentialWithEnvFallback`), for the headline.
-fn metaskKeySource(local_metask_key: ?[]const u8, stored: ?auth.StoredCredentials, auth_error: ?[]const u8) []const u8 {
+/// under `precedence` (`auth.resolveCredentialWithEnvFallback`), for the
+/// headline.
+fn metaskKeySource(precedence: auth.AuthPrecedence, local_metask_key: ?[]const u8, stored: ?auth.StoredCredentials, auth_error: ?[]const u8) []const u8 {
     if (std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) != null) return "the key passed on a file descriptor";
+    if (auth_error != null) return "auth.json, which cannot be read";
+    const stored_key = if (stored) |value| value.api_key != null else false;
+    const stored_sign_in = if (stored) |value| value.oauth != null else false;
+    if (precedence == .oauth_first and stored_sign_in) return "the older browser sign-in in auth.json";
     if (nonEmptyEnv(auth.METASK_API_KEY_ENV) != null) return "METASK_API_KEY from the shell";
     if (local_metask_key != null) return "METASK_API_KEY from .env";
-    if (auth_error != null) return "auth.json, which cannot be read";
-    if (stored) |value| {
-        if (value.api_key != null) return "the key in auth.json";
-        if (value.oauth != null) return "the older browser sign-in in auth.json";
-    }
+    if (stored_key) return "the key in auth.json";
+    if (stored_sign_in) return "the older browser sign-in in auth.json";
     return "a Metask key";
 }
 

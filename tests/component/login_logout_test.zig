@@ -1079,6 +1079,47 @@ test "metacodes login status says which level decides a plain start and what eac
     try expectAbsent(out.stderr, "sk-shell-only-deepseek");
 }
 
+test "login status reads METACODES_AUTH_PRECEDENCE as the start does: under oauth-first an empty METASK_API_KEY leaves the session in charge (#537)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    // The gateway: its `/v1/models` (read at the start with the session's
+    // token), then the turn.
+    var gateway = try harness.MockServer.startCassette(&.{ GATEWAY_MODELS, ANTHROPIC_SSE }, 0);
+    defer gateway.stop();
+    try case.storeSession(try originOf(a, gateway), SESSION_TOKEN);
+    try case.write("state/auth.json", "{\"selected_model\":\"glm-5\",\"reasoning_effort\":\"low\"}");
+    // `METASK_API_KEY=` is set but empty: under the default api_key_first it
+    // asks for the historical path; under oauth-first it does not.
+    const oauth_first = [_][]const u8{ "METACODES_AUTH_PRECEDENCE=oauth-first", "METASK_API_KEY=" };
+
+    const status = try runCli(&case, cli, &oauth_first, &.{ "login", "status" });
+    errdefer std.debug.print("status exit {d}; stderr:\n{s}\n", .{ status.exit_code, status.stderr });
+    try expectContains(status.stderr, "This start uses Metask, signed in · glm-5 · reasoning low.");
+    try expectContains(status.stderr, "> 3 Metask sign-in: the session (");
+    try expectContains(status.stderr, "METACODES_AUTH_PRECEDENCE=oauth-first");
+    try expectAbsent(status.stderr, SESSION_TOKEN);
+
+    // And a plain start does sign in with it.
+    const out = try runCli(&case, cli, &oauth_first, &.{ "-p", "hi" });
+    errdefer std.debug.print("start exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try testing.expectEqual(@as(i32, 0), out.exit_code);
+    const turn = gateway.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(turn, "authorization").?);
+
+    // Under the default, the same empty variable sets the session aside, and
+    // both say there is nothing to start with.
+    const default_status = try runCli(&case, cli, &.{"METASK_API_KEY="}, &.{ "login", "status" });
+    try expectContains(default_status.stderr, "Level 5 of 5 decided");
+    const sent = gateway.requestCount();
+    const default_start = try runCli(&case, cli, &.{"METASK_API_KEY="}, &.{ "-p", "hi" });
+    try testing.expect(default_start.exit_code != 0);
+    try testing.expectEqual(sent, gateway.requestCount());
+}
+
 test "a plain start with only the Metask session signs in with it, at the gateway it names, ahead of .env (#499, #527)" {
     var case: Case = undefined;
     try case.init();
