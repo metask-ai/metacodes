@@ -260,6 +260,16 @@ pub fn noteHttpFailure(status: u16, body: []const u8) void {
     }
 }
 
+/// The failure just recorded said in its body, not in `Retry-After`, how long
+/// until the same request can succeed: a plan's usage window that opens again
+/// at a stated time. The same fact as the header, so the same field, unless
+/// the head already named one.
+pub fn noteRetryAfterInBody(ms: u64) void {
+    const capture = active orelse return;
+    if (!capture.has_failure) return;
+    if (capture.failure.retry_after_ms == null) capture.failure.retry_after_ms = ms;
+}
+
 /// A 3xx to a request that carries a key is an answer, not a hop. The fix is to
 /// use that URL as the endpoint, so the message says where it points.
 pub fn noteRedirect(status: u16, location: []const u8) void {

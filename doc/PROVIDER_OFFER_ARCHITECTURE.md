@@ -270,8 +270,9 @@ for the GLM plan.
 ## Subscription plans
 
 `ProviderProfile.subscription_plan` marks a coding plan billed by the month
-rather than by the token: `kimi-code` and `zai-coding-plan` today, and a test
-in `provider/registry.zig` keeps a new one a deliberate entry. The vendors
+rather than by the token: `kimi-code`, `zai-coding-plan` and `chatgpt-codex`
+today, and a test in `provider/registry.zig` keeps a new one a deliberate
+entry. The vendors
 license these plans for a person working in a coding tool — Kimi Code's
 community guidelines name personal, interactive use, and the GLM Coding
 Plan's subscription agreement the tools Zhipu lists — so a start with nobody
@@ -289,6 +290,67 @@ caller names itself (the OTLP exporter keeps `metacodes-otlp`). Vendors
 tell coding tools apart by this header, some refuse a client they do not
 recognise, and their terms forbid a forged one; an honest name is the only
 one a vendor can be asked to admit.
+
+## ChatGPT (Codex)
+
+```text
+default   https://chatgpt.com/backend-api/codex   openai_responses   request profile chatgpt_codex
+```
+
+`chatgpt-codex` reaches a ChatGPT plan's Codex quota the way the Codex CLI
+does. OpenAI documents no third-party use of it: the sign-in reuses the Codex
+CLI's public client (`app_EMoamEEZ73f0CkXaXp7hrann`) and the requests go to
+the backend the Codex CLI talks to, as OpenCode, pi and KWWK do. Its OAuth
+sign-in is therefore declared `unofficial` (`ProviderProfile.oauth_support`),
+which the sign-in says before it starts, and the provider is one route that
+can stop working without touching any other.
+
+The sign-in is the authorization code with PKCE at `auth.openai.com`, scope
+`openid profile email offline_access`, with three parameters the profile
+declares after the standard ones (`oauth_authorize_params`):
+`id_token_add_organizations=true`, `codex_cli_simplified_flow=true` and
+`originator=metacodes`. The client registered its redirect at
+`http://localhost:1455` and `:1457` only (`oauth_redirect_host`,
+`oauth_callback_ports`); Metask's own sign-in listens on the same two, so two
+sign-ins cannot wait at once, and with both ports taken the sign-in stops and
+names them. Nothing is sent to whatever holds them: unlike the Codex CLI, which
+asks the holder to `/cancel`, a program here cannot know the holder is its
+own. The ChatGPT workspace the grant is for is read from the ID token's
+`https://api.openai.com/auth` claim, else from the access token
+(`provider/chatgpt_claims.zig`), and stored with the sign-in as `account_id`;
+the ID token is not kept. Signing out revokes the refresh token at
+`auth.openai.com/oauth/revoke` (JSON, `oauth_revocation`) before the sign-in
+is deleted.
+
+What the backend wants beyond the Responses wire is the route's **request
+profile** (`ProtocolRoute.request_profile`, `provider/request_profile.zig`):
+`originator: metacodes`, `chatgpt-account-id`, `accept: text/event-stream`,
+`include: ["reasoning.encrypted_content"]` (with `store:false`, the only
+value the backend takes, the server keeps no reasoning between turns and
+returns it encrypted only when asked) and `instructions` even when empty. A
+request profile is a reviewed, named value rather than configuration, since it
+decides which headers reach the network. It travels in the offer's dialect
+declaration (`vendor.Declaration.request_profile`), so every client built on
+the route carries it, subagents and teammates included, and it survives a
+model override on the route. The workspace header is read from the access
+token each request carries, so a refreshed token and its workspace always
+travel together. The `openai` provider's routes declare no request profile and
+send none of it.
+
+A used-up plan answers 429 `usage_limit_reached` with `resets_at`, and a plan
+without Codex 429 `usage_not_included` (`api/codex_usage.zig`). Neither is
+retried; the failure line says when the plan resets, in the local zone and as
+a wait, and the Run's failure detail carries the wait as `retry_after_ms`.
+
+It is a subscription plan (`subscription_plan`, above): a `-p` or `serve`
+start on it says so once on stderr.
+
+The eight models are a static list. The backend lists what it serves at
+`/models?client_version=<version>`, filtered by each model's minimum client
+version; this client would send its own version, never the Codex CLI's, and
+may therefore see fewer models than the Codex CLI. Context windows are
+OpenCode's figures for ChatGPT-plan requests (272k; 500k from GPT-6.1 on), and
+quotes are `unknown`: the plan is a monthly fee.
 
 ## Credential pools
 
@@ -999,6 +1061,7 @@ on a second line of its confirmation, who bills the session from then on.
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
 | `src/api/oauth_login.zig` | the interactive first-token grants (PKCE, device) |
 | `src/api/oauth_revoke.zig` | signing out of a provider's sign-in: revoke the refresh token, then delete |
+| `src/api/codex_usage.zig` | the Codex backend's usage refusals and their wording |
 | `src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33), or the checked pasted key |
 | `src/api/login_worker.zig` | a prepared login on a worker thread: `AbortSignal` cancellation, bounded `Notify` transcript, atomic state (#67) |
 | `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
@@ -1035,6 +1098,14 @@ application.
 
 Listed rather than left silent. Each is a decision with a reason, not an
 omission — and none of them is an acceptance criterion of the issue.
+
+- **`chatgpt-codex`'s device-code sign-in, usage headers and compressed
+  bodies.** The Codex CLI has its own JSON device-code flow for SSH sessions
+  (`/api/accounts/deviceauth/*`), not RFC 8628, which is not written. The
+  backend's `x-codex-*` headers (used percent, reset time) are not read, and
+  request bodies are not zstd-compressed, which the backend wants above about
+  1 MiB. The model list is static, and a 401 is not answered with one refresh
+  and a replay as Metask's gateway is.
 
 - **Bedrock SigV4 and AWS profiles.** The Bedrock transport authenticates with
   a Bedrock API key only; access keys, session tokens and `~/.aws` profiles

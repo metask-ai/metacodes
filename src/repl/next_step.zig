@@ -20,9 +20,14 @@
 //! - The upstream code `account_suspended` (Metask's gateway answers it with
 //!   a 403): the account itself is suspended, which signing in again cannot
 //!   cure. See to it on the provider's site, or switch provider.
+//! - The upstream code `usage_limit_reached` (a subscription plan's usage
+//!   window is used up, the Codex backend's 429): wait for the reset, which
+//!   the failure's `retry_after_ms` says when it is known, or switch provider.
+//! - The upstream code `usage_not_included` (the plan does not include the
+//!   service at all): switch provider.
 //!
-//! A provider that is signed in to rather than given a key is told to sign in
-//! again, with the command that does it.
+//! A provider that is signed in to rather than given a key (`chatgpt-codex`)
+//! is told to sign in again, with the command that does it.
 //!
 //! Neither retries nor switches anything. `forFailure` gathers the inputs from
 //! a session. Host-only: the library reports the failure and never knows the
@@ -35,6 +40,7 @@ const app_mod = @import("../app.zig");
 const profile_mod = @import("../provider/profile.zig");
 const provider_host_mod = @import("../provider/host.zig");
 const state_env = @import("../app/state_env.zig");
+const codex_usage = @import("../api/codex_usage.zig");
 
 /// Where the line is shown.
 pub const Surface = union(enum) {
@@ -69,6 +75,10 @@ pub const Situation = enum {
     balance_exhausted,
     /// `account_suspended`: the account behind the credential is suspended.
     account_suspended,
+    /// The plan's usage window is used up until it resets.
+    usage_limit,
+    /// The plan does not include the service.
+    plan_excludes,
 };
 
 /// The upstream codes that mean no balance or quota is left, whatever the
@@ -85,6 +95,10 @@ pub fn situation(category: model_error.Category, code: ?[]const u8) ?Situation {
         for (balance_codes) |known| {
             if (std.mem.eql(u8, value, known)) return .balance_exhausted;
         }
+        // A plan's usage window, used up or never included: waiting seconds
+        // or a new sign-in does not change it.
+        if (std.mem.eql(u8, value, "usage_limit_reached")) return .usage_limit;
+        if (std.mem.eql(u8, value, "usage_not_included")) return .plan_excludes;
     }
     return switch (category) {
         .payment_required => .balance_exhausted,
@@ -112,6 +126,9 @@ pub const Input = struct {
     /// This install's `<state root>/.env`; empty when it has no state root.
     env_path: []const u8 = "",
     surface: Surface,
+    /// How long until the request can succeed, when the failure said
+    /// (`model_error.Detail.retry_after_ms`).
+    retry_after_ms: ?u64 = null,
 };
 
 /// The line that says what to do next, owned by the caller, or null to keep
@@ -133,6 +150,15 @@ pub fn render(allocator: std.mem.Allocator, input: Input) error{OutOfMemory}!?[]
                 .print => |command| try std.fmt.allocPrint(allocator, "Your {s} sign-in is no longer valid. Sign in again: {s} login --provider {s}", .{ provider.name, command, id }),
             } else try keyRejected(allocator, provider, input.env_path),
         },
+        .usage_limit => blk: {
+            const name = routeName(input.route);
+            const wait_ms = input.retry_after_ms orelse
+                break :blk try std.fmt.allocPrint(allocator, "{s} reports the plan's usage limit is reached. Wait for it to reset, or switch provider: {s}", .{ name, switch_provider });
+            var wait_buffer: [64]u8 = undefined;
+            const wait = codex_usage.waitText(&wait_buffer, wait_ms / std.time.ms_per_s);
+            break :blk try std.fmt.allocPrint(allocator, "{s} reports the plan's usage limit is reached; it resets {s}. Wait until then, or switch provider: {s}", .{ name, wait, switch_provider });
+        },
+        .plan_excludes => try std.fmt.allocPrint(allocator, "{s} reports that the plan does not include it. Switch provider: {s}", .{ routeName(input.route), switch_provider }),
         .balance_exhausted => switch (input.route) {
             .metask => try std.fmt.allocPrint(allocator, "Your Metask balance has run out. Top up your Metask account, or switch provider: {s}", .{switch_provider}),
             .provider => |provider| try std.fmt.allocPrint(allocator, "{s} reports no balance or quota left. Top up with {s}, or switch provider: {s}", .{ provider.name, provider.name, switch_provider }),
@@ -141,6 +167,13 @@ pub fn render(allocator: std.mem.Allocator, input: Input) error{OutOfMemory}!?[]
             .metask => try std.fmt.allocPrint(allocator, "Your Metask account is suspended. See to it at {s}, or switch provider: {s}", .{ auth.METASK_SITE_URL, switch_provider }),
             .provider => |provider| try std.fmt.allocPrint(allocator, "{s} reports the account is suspended. See to it with {s}, or switch provider: {s}", .{ provider.name, provider.name, switch_provider }),
         },
+    };
+}
+
+fn routeName(route: Route) []const u8 {
+    return switch (route) {
+        .metask => "Metask",
+        .provider => |provider| provider.name,
     };
 }
 
@@ -184,6 +217,7 @@ pub fn forFailure(
         .route = route,
         .env_path = env_path,
         .surface = surface,
+        .retry_after_ms = view.retry_after_ms,
     });
 }
 
@@ -218,7 +252,7 @@ pub fn routeFor(profile: profile_mod.ProviderProfile) Route {
         .provider = .{
             .name = profile.display_name,
             .key_variable = variable,
-            // Signed in to, with no key to check instead.
+            // Signed in to, with no key to check instead (`chatgpt-codex`).
             .sign_in = if (variable == null and profile.declaresInteractiveOAuth()) profile.id.slice() else null,
         },
     };
@@ -373,6 +407,29 @@ test "a sign-in provider whose sign-in is refused is told to sign in again, with
     });
 }
 
+test "a used-up plan says when it resets; a plan without the service says to switch" {
+    const codex: Route = .{ .provider = .{ .name = "ChatGPT (Codex)", .key_variable = null, .sign_in = "chatgpt-codex" } };
+    try expectLine("ChatGPT (Codex) reports the plan's usage limit is reached; it resets in about 2 h 5 min. Wait until then, or switch provider: /model", .{
+        .category = .rate_limited,
+        .code = "usage_limit_reached",
+        .route = codex,
+        .surface = .interactive,
+        .retry_after_ms = (2 * 3600 + 5 * 60) * 1000,
+    });
+    try expectLine("ChatGPT (Codex) reports the plan's usage limit is reached. Wait for it to reset, or switch provider: --provider", .{
+        .category = .rate_limited,
+        .code = "usage_limit_reached",
+        .route = codex,
+        .surface = .{ .print = "metacodes" },
+    });
+    try expectLine("ChatGPT (Codex) reports that the plan does not include it. Switch provider: /model", .{
+        .category = .rate_limited,
+        .code = "usage_not_included",
+        .route = codex,
+        .surface = .interactive,
+    });
+}
+
 test "every other failure keeps the caller's advice" {
     for (std.enums.values(model_error.Category)) |category| {
         const expected: ?Situation = switch (category) {
@@ -449,6 +506,7 @@ test "every built-in provider names its key's variable or its sign-in; Metask is
             },
         }
     }
+    try testing.expectEqualStrings("chatgpt-codex", routeFor(registry.chatgpt_codex.PROFILE).provider.sign_in.?);
     try testing.expect(routeFor(registry.openai.PROFILE).provider.sign_in == null);
     // The kind decides, not `.api_key`: Kimi Code's and the GLM plan's keys
     // are kinds of their own. OpenAI also takes OAuth kinds, which have none.

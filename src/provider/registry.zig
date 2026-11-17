@@ -39,6 +39,7 @@ pub const kimi_code = @import("profiles/kimi_code.zig");
 pub const qwen = @import("profiles/qwen.zig");
 pub const minimax = @import("profiles/minimax.zig");
 pub const bedrock = @import("profiles/bedrock.zig");
+pub const chatgpt_codex = @import("profiles/chatgpt_codex.zig");
 
 /// The built-in profile table. One line per provider — this is the extension
 /// point the requirement asks for. Each vendor's integration notes (dialect,
@@ -55,6 +56,7 @@ pub const BUILTIN_PROFILES = [_]ProviderProfile{
     qwen.PROFILE,
     minimax.PROFILE,
     bedrock.PROFILE,
+    chatgpt_codex.PROFILE,
 };
 
 // ── transport bridge ─────────────────────────────────────────────────────────
@@ -516,11 +518,11 @@ test "built-in registry accepts every shipped profile" {
     try std.testing.expect(registry.find("nope") == null);
 }
 
-test "the coding plans, and only they, are subscription plans" {
+test "the coding plans and the ChatGPT plan, and only they, are subscription plans" {
     // A new subscription plan is a deliberate entry here: its unattended
     // starts get the stderr note `ProviderProfile.subscription_plan` documents.
     for (BUILTIN_PROFILES) |entry| {
-        const plan = entry.id.eqlText("kimi-code") or entry.id.eqlText("zai-coding-plan");
+        const plan = entry.id.eqlText("kimi-code") or entry.id.eqlText("zai-coding-plan") or entry.id.eqlText("chatgpt-codex");
         try std.testing.expectEqual(plan, entry.subscription_plan);
     }
 }

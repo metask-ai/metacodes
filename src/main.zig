@@ -5151,6 +5151,7 @@ test {
     _ = &@import("api/oauth_exchange.zig");
     _ = &@import("api/oauth_login.zig");
     _ = &@import("api/oauth_revoke.zig");
+    _ = &@import("api/codex_usage.zig");
     _ = &@import("api/catalog_fetch.zig");
     _ = &@import("api/models_pages.zig");
     _ = &@import("api/gemini_signatures.zig");

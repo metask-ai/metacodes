@@ -52,4 +52,5 @@ test {
     std.testing.refAllDecls(registry.qwen);
     std.testing.refAllDecls(registry.minimax);
     std.testing.refAllDecls(registry.bedrock);
+    std.testing.refAllDecls(registry.chatgpt_codex);
 }

@@ -64,6 +64,8 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("model_context.zig");
 const RequestProfile = @import("../provider/request_profile.zig").RequestProfile;
 const chatgpt_claims = @import("../provider/chatgpt_claims.zig");
+const codex_usage = @import("codex_usage.zig");
+const last_error = @import("last_error.zig");
 
 const StreamEvent = api_stream.StreamEvent;
 const StreamHandle = api_stream.StreamHandle;
@@ -537,6 +539,11 @@ pub const OpenAIClient = struct {
             // retried, an overflow is ContextWindowExceeded with its numbers kept.
             const info = client_mod.errorBodyInfo(status.code, preview);
             self.last_context_window_numbers = info.context_window_numbers;
+            if (self.declared_dialect.request_profile == .chatgpt_codex) if (noteCodexUsageRefusal(status.code, preview)) {
+                // A used-up plan or a plan without Codex: a retry seconds
+                // later only spends attempts, so it ends the request here.
+                return error.HttpError;
+            };
             return client_mod.httpFailureError(status.code, info);
         }
         client_mod.noteRequestAccepted();
@@ -1916,6 +1923,23 @@ fn serializeOpenAITool(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t:
 fn bearerToken(header_value: []const u8) []const u8 {
     const prefix = "Bearer ";
     return if (std.mem.startsWith(u8, header_value, prefix)) header_value[prefix.len..] else header_value;
+}
+
+/// A Codex backend usage refusal (`codex_usage.zig`) in the words the failure
+/// line shows, with the wait in the Run's failure detail. False for any other
+/// failure, which keeps the generic classification.
+fn noteCodexUsageRefusal(status: u16, body: []const u8) bool {
+    var scratch: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const refusal = codex_usage.parse(fba.allocator(), status, body) orelse return false;
+    const now = @import("../util/time.zig").nowUnix();
+    const zone = @import("../core/time_context.zig").systemZone(now);
+    var detail_buffer: [256]u8 = undefined;
+    const summary = codex_usage.summarize(refusal, now, zone.offset_minutes, &detail_buffer);
+    log.err("openai", "{s}: {s}", .{ summary.kind, summary.detail });
+    last_error.recordNamed(summary.kind, summary.detail);
+    if (codex_usage.waitMs(refusal, now)) |wait| model_error.noteRetryAfterInBody(wait);
+    return true;
 }
 
 /// 中立 Conversation/tools → OpenAI **Responses API** 请求 body(/v1/responses)。caller free。

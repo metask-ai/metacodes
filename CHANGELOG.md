@@ -218,6 +218,34 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **`chatgpt-codex`: a ChatGPT plan's Codex quota, the way the Codex CLI
+  reaches it. Unofficial.** `/login chatgpt-codex` and `metacodes login
+  --provider chatgpt-codex` sign in at `auth.openai.com` in the browser with
+  the Codex CLI's public client (`app_EMoamEEZ73f0CkXaXp7hrann`), and say
+  first that the sign-in is unofficial and may stop working at any time
+  (`ProviderProfile.oauth_support`). The redirect can only land on the two
+  ports that client registered, 1455 then 1457, which Metask's own sign-in
+  also uses: with both taken the sign-in stops and names them, and nothing is
+  sent to whatever holds them. A refusal from the authorization server now
+  ends the wait and says what it said (`missing_codex_entitlement` is a
+  workspace without Codex), where it used to wait on. The sign-in is stored
+  as `oauth/chatgpt-codex.json` with the ChatGPT workspace the ID token names
+  (`account_id`; the ID token itself, which names the user, is not kept).
+  Turns go to `chatgpt.com/backend-api/codex/responses` with the route's
+  request profile (`provider/request_profile.zig`): `originator: metacodes`,
+  `chatgpt-account-id` read from the token the request carries, `accept:
+  text/event-stream`, `include: ["reasoning.encrypted_content"]` and
+  `instructions` always; the `openai` provider's requests are unchanged. A
+  used-up plan (`usage_limit_reached`) and a plan without Codex
+  (`usage_not_included`) are no longer retried: the failure says when the
+  plan resets, in local time and as a wait, or that it never will. Signing
+  out (`/logout chatgpt-codex`, `metacodes logout --provider chatgpt-codex`)
+  revokes the refresh token at `auth.openai.com/oauth/revoke` first, bounded,
+  then deletes the sign-in. It is a subscription plan: a `-p` or `serve`
+  start on it says so once. The eight models are a static list; the
+  device-code sign-in, the `x-codex-*` usage headers and zstd request bodies
+  are not done.
+
 - **A `SessionHost` Session can move onto another provider route, journaled
   as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`
   commit moves the session's provider, endpoint, credential and model
