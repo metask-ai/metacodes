@@ -90,7 +90,13 @@ normative model; the entry points are:
 | `<session_dir>/runtime-selection.json` | `session_selection`; a session-scoped choice never reaches `config.json` |
 | `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
 
-Interactive surfaces: `Ctrl+O` and `/model` open the route picker (transcript
+Interactive surfaces: `Ctrl+O` and `/model` open the route picker, one screen
+of models under a heading per provider (where its key comes from, who bills
+it), the cursor on the model in use; a model served on several routes lists
+them under it while the cursor is on it, the reasoning level is a line under
+the list changed with ←/→, the three scopes are named in the header (`Tab`
+cycles them), typing filters across every provider, and closing without a
+choice prints `kept <model>` (transcript
 viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
 and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
 names a route (`pin`, `float`, `use`, `remove`); `/models` still selects the

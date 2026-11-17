@@ -1,15 +1,15 @@
-"""TTY coverage for the cross-UI model picker (issue #16).
+"""TTY coverage for the cross-UI model picker (issue #16; one screen since the follow-up to #527).
 
 Offline: the picker reads compiled provider profiles, so no request is made —
-except on the two Metask logins, whose inventory is the gateway's own
+except on the Metask logins, whose inventory is the gateway's own
 `/v1/models`; those cases run against a local mock gateway. Every route listed
-can be applied as it is (#488): a provider is a normal row only with a
-credential, so a case that walks into one gives it a placeholder key, and the
-others sit dimmed under "Not configured".
+can be applied as it is (#488): a provider is listed, under a heading of its
+own, only with a credential, so a case that picks one gives it a placeholder
+key; the others are counted on one "Not configured" line at the bottom.
 What is asserted here is the behaviour the requirement names and that unit
-tests cannot see — that the overlay reaches a real terminal,
-that it owns the keyboard without eating the draft, and that a mid-stream
-selection does not disturb the reply in flight.
+tests cannot see — that the overlay reaches a real terminal, that it owns the
+keyboard without eating the draft, and that a mid-stream selection does not
+disturb the reply in flight.
 """
 import http.server
 import json
@@ -19,8 +19,14 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import IDLE, READY, WAIT_S, case_tmpdir, run, submit, wait_for  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tty_driver import IDLE, READY, case_tmpdir, run, submit, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
+from metask_mock import ACCESS_TOKEN, MetaskMock  # noqa: E402
+from test_unbound import KEY_VARIABLES  # noqa: E402
+
+# The picker's header line: the title, then the three scopes.
+OPEN = "apply to"
 
 
 def _screen(raw, rows=24, cols=80):
@@ -28,61 +34,56 @@ def _screen(raw, rows=24, cols=80):
     return a, "\n".join(a.final.line_text(r) for r in range(a.final.rows))
 
 
+def _frames(a):
+    return ["\n".join(sc.line_text(r) for r in range(sc.rows)) for sc in a.frame_screens]
+
+
+def _headings(screen):
+    """The provider headings of one frame, by name: "<name> · … · billed to your <name> account"."""
+    return [m.group(1) for m in re.finditer(r"^  (\S[^·\n]*?) ·.*billed to your .* account", screen, re.M)]
+
+
 def test_picker_opens_with_scope_and_next_turn_footer(bin_path):
     raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.5"], per_key_drain=0.1)
     a, text = _screen(raw)
-    assert "Provider" in text, text
-    assert "metask" in text, "内置 provider 未列出:\n" + text
-    # 作用域和"下一轮生效"必须写在用户正在看的那一行,不能只在文档里。
-    assert "enter apply to this session" in text, "footer 未说明默认作用域:\n" + text
+    assert "Model" in text, text
+    assert "Metask" in _headings(text), "内置 provider 未列出:\n" + text
+    # 作用域和"下一轮生效"必须写在用户正在看的地方,不能只在文档里。
+    assert "[this session]" in text, "未显示默认作用域:\n" + text
     assert "next turn" in text, "footer 未说明下一轮语义:\n" + text
     a.assert_no_full_clear()  # 覆盖层不进 alt-screen、不清 scrollback
 
 
-def _provider_rows(text):
-    """Provider 阶段每行的 provider id(行首是 `>`/`*`/空格标记,后跟 id 和 "N models")。"""
-    rows = []
-    for line in text.splitlines():
-        parts = line.replace(">", " ").replace("*", " ").split()
-        if len(parts) == 3 and parts[2] in ("model", "models") and parts[1].isdigit():
-            rows.append(parts[0])
-    return rows
-
-
-def test_model_command_lists_every_provider_and_reaches_its_models(bin_path):
+def test_model_command_lists_each_provider_under_its_own_heading(bin_path):
     # metask / openai / gemini 的 id 都是 6 字节。分组标签曾指向循环变量的栈拷贝,
-    # 等长 id 被并成一行 "metask 16 models",进去只有 metask 的模型:openai、gemini
-    # 在 /model 里根本选不到。OpenAI 给占位 key,它才是能进去的正常行(#488);
-    # gemini 没有 key,排在 "Not configured" 下面,仍是独立一行。
+    # 等长 id 被并成一组,openai、gemini 在 /model 里根本选不到。OpenAI 给占位 key,
+    # 它有自己的标题和模型(#488);gemini 没有 key,在最下面的 "Not configured" 行里。
     raw = run(
         bin_path,
-        submit("/model", "Provider") + ["sleep:0.3", "key:down", "sleep:0.3", "key:enter", wait_for("Model")],
+        # End: the last rows are OpenAI's, under its heading, and the
+        # "Not configured" line.
+        submit("/model", OPEN) + ["sleep:0.4", "key:end", "sleep:0.4"],
         env={"OPENAI_API_KEY": "tty-dummy-openai-key", "GEMINI_API_KEY": None, "GOOGLE_API_KEY": None},
+        term_size=(40, 120),
         per_key_drain=0.1,
     )
-    a, text = _screen(raw)
-
-    def screen_text(sc):
-        return "\n".join(sc.line_text(r) for r in range(sc.rows))
-
-    provider_frames = [screen_text(sc) for sc in a.frame_screens if "Provider" in screen_text(sc)]
-    assert provider_frames, "/model 未打开 picker:\n" + text
-    providers = _provider_rows(provider_frames[-1])
-    for wanted in ("metask", "openai", "gemini", "zai-coding-plan"):
-        assert providers.count(wanted) == 1, f"provider {wanted} 不是独立一行: {providers}\n" + provider_frames[-1]
-    # 第二行是 openai(编译期目录顺序);Enter 进去必须是 openai 自己的模型。
-    assert providers[1] == "openai", f"目录顺序变了,第二行不是 openai: {providers}"
+    a, text = _screen(raw, rows=40, cols=120)
+    # Opened on Metask's models, under its heading; at the end, OpenAI's own.
+    opened = [sc for sc in _frames(a) if OPEN in sc and "Metask" in _headings(sc)]
+    assert opened and _headings(opened[0]).count("Metask") == 1, "Metask 没有自己的标题:\n" + text
+    assert _headings(text).count("OpenAI") == 1, f"标题: {_headings(text)}\n" + text
     lines = text.splitlines()
-    header = [i for i, line in enumerate(lines) if line.strip() == "Model"]
-    assert header, "Enter 后没进 Model 阶段:\n" + text
-    model_rows = []
-    for line in lines[header[-1] + 1:]:
-        if "enter apply" in line:
+    start = next(i for i, line in enumerate(lines) if re.match(r"^  OpenAI ·", line))
+    rows = []
+    for line in lines[start + 1:]:
+        if re.match(r"^  \S", line) or "Not configured" in line or "Reasoning" in line:
             break
-        model_rows.append(line)
-    listed = "\n".join(model_rows)
-    assert "gpt-6-astra" in listed, "进 openai 后没列出它的模型:\n" + text
-    assert "claude" not in listed.lower(), "进 openai 后列的是 metask 的模型:\n" + text
+        rows.append(line)
+    listed = "\n".join(rows)
+    assert "GPT-6 Astra" in listed, "OpenAI 标题下没列出它的模型:\n" + text
+    assert "claude" not in listed.lower(), "OpenAI 标题下列的是 metask 的模型:\n" + text
+    not_configured = next((line for line in lines if "Not configured ·" in line), "")
+    assert "gemini" in not_configured or "providers" in not_configured, "没 key 的 gemini 应在 Not configured 行:\n" + text
 
 
 def test_picker_typing_filters_without_touching_the_draft(bin_path):
@@ -98,7 +99,7 @@ def test_picker_typing_filters_without_touching_the_draft(bin_path):
     assert "explain this" in text, "picker 吃掉了输入框里的草稿:\n" + text
 
 
-def test_picker_escape_clears_filter_then_walks_back_then_closes(bin_path):
+def test_picker_escape_clears_filter_then_closes_and_says_what_was_kept(bin_path):
     raw = run(
         bin_path,
         ["sleep:0.8", "key:ctrl_o", "sleep:0.4", "type:zai", "sleep:0.3",
@@ -106,8 +107,9 @@ def test_picker_escape_clears_filter_then_walks_back_then_closes(bin_path):
         per_key_drain=0.08,
     )
     _, text = _screen(raw)
-    # 第一次 Esc 清过滤(列表回全量),第二次 Esc 在首个阶段=关闭。
-    assert "enter apply to this session" not in text, "首个阶段的 Esc 未关闭 picker:\n" + text
+    # 第一次 Esc 清过滤(列表回全量),第二次 Esc 关闭,并在记录里说保持了哪个模型。
+    assert "enter apply" not in text, "第二次 Esc 未关闭 picker:\n" + text
+    assert "kept claude" in text, "取消后没有留下回执:\n" + text
     assert "❯" in text, "关闭后应回到输入框:\n" + text
 
 
@@ -118,8 +120,8 @@ def test_picker_tab_cycles_scope_and_shows_it(bin_path):
         per_key_drain=0.1,
     )
     _, text = _screen(raw)
-    # global 是显式选择,并且在按下 Enter 之前就必须看得见"durable"。
-    assert "durable" in text, "Tab 未把作用域切到 global 或未显示它:\n" + text
+    # "以后都用"是显式选择,并且在按下 Enter 之前就必须看得见。
+    assert "[from now on]" in text, "Tab 未把作用域切到 global 或未显示它:\n" + text
 
 
 def test_picker_opens_during_generation_without_alt_screen(bin_path):
@@ -133,50 +135,41 @@ def test_picker_opens_during_generation_without_alt_screen(bin_path):
         raw = run(
             bin_path,
             [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_o",
-             wait_for("Provider"), "sleep:10"],
+             wait_for(OPEN), "sleep:10"],
             base_url=srv.url,
             startup_drain=0.8,
             per_key_drain=0.08,
         )
     a, text = _screen(raw)
-
-    def screen_text(sc):
-        return "\n".join(sc.line_text(r) for r in range(sc.rows))
-
-    during = [sc for sc in a.frame_screens
-              if "Provider" in screen_text(sc) and "esc to interrupt" in screen_text(sc)]
+    during = [sc for sc in _frames(a) if OPEN in sc and "esc to interrupt" in sc]
     assert during, "生成期 Ctrl+O 未打开 picker:\n" + text
     assert "tok13" in text and "esc to interrupt" not in text, "回复尚未结束,断言时刻不对:\n" + text
-    assert "Provider" in text, "回复结束时 picker 被丢掉了(#220):\n" + text
+    assert OPEN in text, "回复结束时 picker 被丢掉了(#220):\n" + text
     assert b"\x1b[?1049h" not in raw, "picker 不应进 alt-screen(那是 transcript viewer)"
 
 
 def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
     # #220:生成期里筛到一半的浏览状态(过滤词)在回复结束后原样还在,而且 picker
-    # 仍接收按键:回复结束后按 Esc 清掉过滤,列表回到全量,picker 仍开着。
+    # 仍接收按键:回复结束后按 Esc 清掉过滤,列表回到全量(Metask 的标题回来),picker 仍开着。
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
     with SlowMockServer([slow_text_then_end(n_chunks=10, delay=0.4)]) as srv:
         raw = run(
             bin_path,
             # 回复结束后先等空闲输入框再按 Esc(生成结束到下次读输入之间的键会被 TCSAFLUSH
-            # 丢掉);Esc 清掉过滤后 metask 回到列表(过滤期间它不在屏上),以它为末态标志。
+            # 丢掉);过滤期间没有标题,Esc 清掉过滤后 Metask 的标题回来,以它为末态标志。
             [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_o",
-             wait_for("Provider"), "type:zai", "sleep:10", IDLE, "key:esc", wait_for("metask")],
+             wait_for(OPEN), "type:zai", "sleep:10", IDLE, "key:esc", wait_for("billed to your Metask account")],
             base_url=srv.url,
             startup_drain=0.8,
             per_key_drain=0.08,
         )
     a, text = _screen(raw)
-
-    def screen_text(sc):
-        return "\n".join(sc.line_text(r) for r in range(sc.rows))
-
-    kept = [sc for sc in a.frame_screens
-            if "tok9" in screen_text(sc) and "esc to interrupt" not in screen_text(sc)
-            and "zai-coding-plan" in screen_text(sc) and "metask" not in screen_text(sc)]
+    kept = [sc for sc in _frames(a)
+            if "tok9" in sc and "esc to interrupt" not in sc
+            and "zai-coding-plan" in sc and "billed to your Metask account" not in sc]
     assert kept, "回复结束后过滤状态丢了(#220):\n" + text
-    assert "Provider" in text and "metask" in text, "回复结束后 picker 不再接收按键:\n" + text
+    assert OPEN in text and "billed to your Metask account" in text, "回复结束后 picker 不再接收按键:\n" + text
 
 
 STORED_KEY = "tty-stored-gateway-key"
@@ -259,8 +252,7 @@ def test_picker_on_the_api_key_route_offers_the_gateway_models(bin_path):
     try:
         raw = run(
             bin_path,
-            [READY, "key:ctrl_o", wait_for("Provider"), "key:enter", f"waitline:Model:{WAIT_S}",
-             wait_for("Kimi K3"), "type:kimi", "key:enter", wait_for("switched to kimi-k3"),
+            [READY, "key:ctrl_o", wait_for("Kimi K3"), "type:kimi", "key:enter", wait_for("switched to kimi-k3"),
              READY, "type:ping", "key:enter", wait_for("answered by the gateway")],
             base_url=f"http://127.0.0.1:{server.server_port}/v1/messages",
             env={"HOME": home, "METACODES_NO_PROBE": None, "METASK_API_KEY": None},
@@ -271,55 +263,87 @@ def test_picker_on_the_api_key_route_offers_the_gateway_models(bin_path):
         server.shutdown()
 
     a, text = _screen(raw)
-
-    def screen_text(sc):
-        return "\n".join(sc.line_text(r) for r in range(sc.rows))
-
-    # The Model stage before the filter is typed: its header line is exactly "Model".
-    model_stage = [screen_text(sc) for sc in a.frame_screens
-                   if "Kimi K3" in screen_text(sc)
-                   and any(sc.line_text(r).strip() == "Model" for r in range(sc.rows))]
-    assert model_stage, "picker 的 Model 阶段没出现网关模型:\n" + text
-    listing = model_stage[-1]
+    # The list before the filter is typed: the gateway's models under Metask's heading.
+    listings = [sc for sc in _frames(a) if "Kimi K3" in sc and "billed to your Metask account" in sc]
+    assert listings, "picker 没列出网关模型:\n" + text
+    listing = listings[-1]
     assert re.search(r"\*\s*glm-5\.3-flash", listing), "当前模型 glm-5.3-flash 未标 *:\n" + listing
     assert "Claude" not in listing, "API-key 路由仍列出编译期 Claude 模型:\n" + listing
-    assert "switched to kimi-k3" in text, "选中网关模型后未切换:\n" + text
+    assert "switched to kimi-k3 for this session" in text, "选中网关模型后未切换:\n" + text
     assert "sign in" not in text, "选网关模型不该要求登录:\n" + text
     assert _GatewayMock.message_models[-1:] == ["kimi-k3"], _GatewayMock.message_models
     assert _GatewayMock.message_auths[-1:] == [f"Bearer {STORED_KEY}"], "请求没用存储的 key"
     assert STORED_KEY.encode() not in raw, "TTY 输出泄漏了 API key"
 
 
-def test_picker_options_step_changes_reasoning_with_arrows_and_applies_with_enter(bin_path):
-    # GLM-5.3 declares reasoning_effort (low/high/max). The options step used to
-    # have no key that applied a route: Enter cycled the value. Now ←/→ change
-    # it and Enter applies the route with the value shown.
+def test_picker_reasoning_line_changes_with_arrows_and_enter_applies_it(bin_path):
+    # GLM-5.3 declares reasoning_effort (low/high/max). The level is a line under
+    # the list, changed with ←/→ from the model's own row, and Enter applies the
+    # model with the level shown.
     raw = run(
         bin_path,
-        submit("/model", "Provider") + [
-            "type:zai-coding-plan", wait_for("zai-coding-plan"), "key:enter", f"waitline:Model:{WAIT_S}",
-            "type:glm-5.3", "key:up", "sleep:0.2", "key:home", "sleep:0.2", "key:enter",
-            wait_for("Channel / offer"), "key:enter",
-            wait_for("Options"), "key:right", "key:right", wait_for("= high"),
+        submit("/model", OPEN) + [
+            "type:glm-5.3", wait_for("Reasoning effort"), "key:home",
+            "key:right", "key:right", wait_for("[high]"),
             "key:enter", wait_for("switched to glm-5.3"),
         ],
         env={"ZAI_API_KEY": "tty-dummy-zai-key"},
+        term_size=(30, 120),
         per_key_drain=0.1,
     )
-    a, text = _screen(raw)
-
-    def screen_text(sc):
-        return "\n".join(sc.line_text(r) for r in range(sc.rows))
-
-    options = [screen_text(sc) for sc in a.frame_screens if "Options" in screen_text(sc)]
-    assert options, "没有进入 Options 层:\n" + text
-    assert any("←/→ change · enter apply to" in sc for sc in options), "Options 层没说明改值的键:\n" + options[-1]
-    assert any("Reasoning effort" in sc and "= high" in sc and "[low high max]" in sc for sc in options), \
-        "→ 没有把推理强度改到 high:\n" + options[-1]
-    assert "switched to glm-5.3" in text, "Enter 没有应用线路:\n" + text
-    # Metask to the GLM plan: the bill moves, and the notice says where (#488).
+    a, text = _screen(raw, rows=30, cols=120)
+    lines = [sc for sc in _frames(a) if "Reasoning effort" in sc and "[high]" in sc]
+    assert lines, "→ 没有把推理强度改到 high:\n" + text
+    assert any("←/→ reasoning" in sc for sc in lines), "footer 没说明改推理强度的键:\n" + lines[-1]
     flat = " ".join(text.split())
+    assert "switched to glm-5.3 for this session · reasoning high" in flat, "Enter 没有应用线路或强度:\n" + text
+    # Metask to the GLM plan: the bill moves, and the notice says where (#488).
     assert "from now on billed to your Z.AI GLM Coding Plan account" in flat, "切到另一家没写明扣钱的一方:\n" + text
+
+
+def test_picker_lists_a_models_routes_under_it_and_enter_on_one_takes_it(bin_path):
+    # DeepSeek serves each model on two wires. The routes are listed under the
+    # model the cursor is on, in words; Enter on the model takes the preferred
+    # one, Enter on a route takes that route.
+    raw = run(
+        bin_path,
+        submit("/model", OPEN) + [
+            "type:deepseek-v4-pro", wait_for("Anthropic Messages API"),
+            "key:down", "key:down", "sleep:0.3", "key:enter", wait_for("switched to deepseek-v4-pro"),
+        ],
+        env={"DEEPSEEK_API_KEY": "tty-dummy-deepseek-key"},
+        term_size=(30, 120),
+        per_key_drain=0.1,
+    )
+    a, text = _screen(raw, rows=30, cols=120)
+    routes = [sc for sc in _frames(a) if "Anthropic Messages API" in sc]
+    assert routes, "多线路模型没在光标处展开线路:\n" + text
+    listing = routes[0]
+    assert re.search(r"├ default\s+OpenAI Chat API\s+preferred", listing), listing
+    assert re.search(r"└ anthropic\s+Anthropic Messages API", listing), listing
+    assert "openai_chat" not in listing and "price=?" not in listing, "默认画面露出了工程字段:\n" + listing
+    flat = " ".join(text.split())
+    assert "switched to deepseek-v4-pro for this session" in flat, text
+
+
+def test_picker_lists_providers_with_a_credential_and_counts_the_rest_on_one_line(bin_path):
+    # #488: with no vendor key, only Metask (the session's own key) has a
+    # heading; every vendor is counted on the "Not configured" line, last, and
+    # Enter there lists them. A key gives its vendor a heading of its own.
+    events = submit("/model", OPEN) + ["sleep:0.4", "key:end", "sleep:0.3", "key:enter", wait_for("enter shows where its credential goes")]
+    raw = run(bin_path, events, term_size=(40, 120), env=_no_vendor_keys(), per_key_drain=0.1)
+    a, text = _screen(raw, rows=40, cols=120)
+    lists = [sc for sc in _frames(a) if OPEN in sc]
+    assert lists, "/model 没打开:\n" + text
+    assert _headings(lists[-1]) == ["Metask"], f"没有 key 时只该有 Metask 的标题:{_headings(lists[-1])}\n" + lists[-1]
+    assert "Not configured ·" in lists[-1], lists[-1]
+    for vendor in ("openai", "gemini", "zai-coding-plan", "deepseek", "kimi", "kimi-code"):
+        assert re.search(rf"^\s+[> ][* ] {re.escape(vendor)}\s", text, re.M), f"{vendor} 应在 Not configured 列表里:\n" + text
+
+    keyed = run(bin_path, submit("/model", OPEN) + ["sleep:0.4"], term_size=(40, 120),
+                env=_no_vendor_keys(DEEPSEEK_API_KEY="tty-dummy-deepseek-key"), per_key_drain=0.1)
+    _, keyed_text = _screen(keyed, rows=40, cols=120)
+    assert _headings(keyed_text) == ["Metask", "DeepSeek"], f"有 DEEPSEEK_API_KEY 时 DeepSeek 应有标题:{_headings(keyed_text)}\n" + keyed_text
 
 
 GUIDE = "https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md"
@@ -339,64 +363,17 @@ def _no_vendor_keys(**given):
     return env
 
 
-def _provider_groups(screen):
-    """(normal rows, rows under "Not configured") of one Provider-stage frame."""
-    normal, unconfigured, target = [], [], None
-    for line in screen.splitlines():
-        if line.strip() == "Provider":
-            target = normal
-            continue
-        if line.strip() == "Not configured":
-            target = unconfigured
-            continue
-        parts = line.replace(">", " ").replace("*", " ").split()
-        if target is not None and len(parts) == 3 and parts[2] in ("model", "models") and parts[1].isdigit():
-            target.append(parts[0])
-    return normal, unconfigured
-
-
-def _last_provider_frame(raw, rows, cols):
-    a = TTYAssert(raw, rows=rows, cols=cols)
-    frames = []
-    for sc in a.frame_screens:
-        text = "\n".join(sc.line_text(r) for r in range(sc.rows))
-        if any(sc.line_text(r).strip() == "Provider" for r in range(sc.rows)):
-            frames.append(text)
-    assert frames, "/model 没有打开 Provider 阶段"
-    return frames[-1]
-
-
-def test_picker_lists_only_providers_with_a_credential_and_dims_the_rest_last(bin_path):
-    # #488: with no vendor key, only Metask (the session's own key) is a row a
-    # pick applies; every vendor sits dimmed under "Not configured", last. A
-    # key makes its vendor a normal row.
-    events = submit("/model", "Provider") + ["sleep:0.4"]
-    bare = _last_provider_frame(run(bin_path, events, term_size=(40, 120), env=_no_vendor_keys(),
-                                    per_key_drain=0.1), 40, 120)
-    normal, unconfigured = _provider_groups(bare)
-    assert normal == ["metask"], f"没有 key 时只该有 Metask 一行:{normal}\n" + bare
-    for vendor in ("openai", "gemini", "zai-coding-plan", "deepseek", "kimi", "kimi-code"):
-        assert vendor in unconfigured, f"{vendor} 应灰显在 Not configured 组:{unconfigured}\n" + bare
-
-    keyed = _last_provider_frame(run(bin_path, events, term_size=(40, 120),
-                                     env=_no_vendor_keys(DEEPSEEK_API_KEY="tty-dummy-deepseek-key"),
-                                     per_key_drain=0.1), 40, 120)
-    normal, unconfigured = _provider_groups(keyed)
-    assert normal == ["metask", "deepseek"], f"有 DEEPSEEK_API_KEY 时 DeepSeek 应是正常行:{normal}\n" + keyed
-    assert "deepseek" not in unconfigured, keyed
-
-
 def test_picker_names_the_variable_and_the_env_file_for_a_provider_without_a_key(bin_path):
     # #483, #488: Kimi on Moonshot's open platform has no sign-in and no key
     # page. A route chosen without MOONSHOT_API_KEY ended in a bare
-    # "switch failed (MissingCredentials)". Now the provider is listed dimmed,
-    # and choosing it shows the variable, this install's .env and the guide,
+    # "switch failed (MissingCredentials)". Now a filter finds its models dim,
+    # and Enter on one shows the variable, this install's .env and the guide,
     # and nothing to type. KIMI_API_KEY is Kimi Code's (#487).
     home = case_tmpdir("cc-tty-nokey-home-")
     env_file = os.path.join(home, ".metacodes", ".env")
     raw = run(
         bin_path,
-        submit("/model", "Provider") + [
+        submit("/model", OPEN) + [
             "type:kimi", wait_for("kimi-code"), "key:enter", wait_for("MOONSHOT_API_KEY"),
         ],
         term_size=(30, 160),
@@ -411,6 +388,26 @@ def test_picker_names_the_variable_and_the_env_file_for_a_provider_without_a_key
     assert "MissingCredentials" not in text, text
     assert "KIMI_API_KEY" not in text, text
     assert "enter apply" not in text, "setup 不该提供应用线路:\n" + text
+
+
+def test_picker_filter_lists_whole_matches_before_scattered_ones(bin_path):
+    # The filter also matches letters in order, so `glm` matches
+    # `google/gemini-…` (g…l…m) as well as GLM-5.3. The models that hold the
+    # typed text whole come first, and the cursor starts on one of them.
+    raw = run(
+        bin_path,
+        submit("/model", OPEN) + ["type:glm", wait_for("GLM-5.3"), "sleep:0.3"],
+        term_size=(30, 160),
+        env=_no_vendor_keys(HOME=case_tmpdir("cc-tty-rank-home-")),
+        per_key_drain=0.1,
+    )
+    _, text = _screen(raw, rows=30, cols=160)
+    rows = [line for line in text.split("\n") if re.match(r"^  [> ][* ] \S", line)]
+    names = [("glm" if "GLM" in row else "gemini" if "Gemini" in row else "other") for row in rows]
+    assert "glm" in names and "gemini" in names, "expected GLM and Gemini matches:\n" + text
+    assert names.index("gemini") > len(names) - 1 - names[::-1].index("glm"), \
+        "a scattered match (Gemini) is listed before a whole one (GLM):\n" + text
+    assert rows[0].startswith("  >") and "GLM" in rows[0], "the cursor should start on a GLM model:\n" + text
 
 
 class _DeviceGatewayMock(http.server.BaseHTTPRequestHandler):
@@ -460,7 +457,7 @@ def test_picker_on_a_metask_device_login_offers_the_gateway_models(bin_path):
     try:
         raw = run(
             bin_path,
-            submit("/model", "Provider") + ["key:enter", f"waitline:Model:{WAIT_S}", wait_for("Device Model B")],
+            submit("/model", OPEN) + [wait_for("Device Model B")],
             base_url=None,
             env=_no_vendor_keys(HOME=home, METASK_API_KEY=None, METACODES_BASE_URL=None,
                                 METASK_GATEWAY_URL=None, METASK_SITE_URL="http://127.0.0.1:1"),
@@ -471,16 +468,54 @@ def test_picker_on_a_metask_device_login_offers_the_gateway_models(bin_path):
     finally:
         server.shutdown()
     a, text = _screen(raw)
-
-    def screen_text(sc):
-        return "\n".join(sc.line_text(r) for r in range(sc.rows))
-
-    model_stage = [screen_text(sc) for sc in a.frame_screens
-                   if "Device Model B" in screen_text(sc)
-                   and any(sc.line_text(r).strip() == "Model" for r in range(sc.rows))]
-    assert model_stage, "设备码登录的 Model 阶段没列出网关模型:\n" + text
-    listing = model_stage[-1]
+    listings = [sc for sc in _frames(a) if "Device Model B" in sc and OPEN in sc]
+    assert listings, "设备码登录的 picker 没列出网关模型:\n" + text
+    listing = listings[-1]
     assert "Device Model A" in listing, listing
     assert "Claude" not in listing, "设备码登录仍列出编译期 Claude 模型:\n" + listing
     assert ("/v1/models", "Bearer tty-device-access") in _DeviceGatewayMock.seen, _DeviceGatewayMock.seen
     assert b"tty-device-access" not in raw and b"tty-device-refresh" not in raw, "TTY 输出泄漏了令牌"
+
+
+def _session_case(mock):
+    """A state root signed in to the www gateway mock (the Metask session and the model it chose)."""
+    home = case_tmpdir("cc-tty-picker-session-")
+    state = os.path.join(home, ".metacodes")
+    os.makedirs(state, exist_ok=True)
+    mock.write_session(state)
+    env = {name: None for name in KEY_VARIABLES}
+    env.update({"HOME": home, "METACODES_HOME": None, "METACODES_JEV_URL": "off"})
+    env.update(mock.env(home))
+    return env
+
+
+def test_picker_on_the_session_lists_only_chat_models_with_the_gateways_reasoning_levels(bin_path):
+    # The www gateway (#527) lists an image model beside the chat ones, and
+    # names the reasoning levels each takes (`capabilities.reasoning.efforts`).
+    # /model offers only what it serves on /v1/messages, with those levels.
+    with MetaskMock() as mock:
+        env = _session_case(mock)
+        work = case_tmpdir("cc-tty-picker-work-")
+        raw = run(
+            bin_path,
+            submit("/model", OPEN) + [wait_for("Reasoning effort"), "key:right", wait_for("[high]"),
+                                      "key:enter", wait_for("switched to glm-5")],
+            env=env,
+            base_url=None,
+            cwd=work,
+            term_size=(30, 120),
+            per_key_drain=0.1,
+        )
+        a, text = _screen(raw, rows=30, cols=120)
+        listings = [sc for sc in _frames(a) if OPEN in sc and "glm-5-air" in sc]
+        assert listings, "会话路线的 picker 没列出网关模型:\n" + text
+        listing = listings[0]
+        assert "image-model-only" not in listing, "网关的生图模型不该出现在 /model:\n" + listing
+        # The heading says where the credential comes from: the sign-in.
+        assert "Metask · signed in · billed to your Metask account" in listing, listing
+        # The session runs glm-5 at low (auth.json); the line starts there.
+        assert re.search(r"Reasoning effort\s+default\s+\[low\]\s+high", listing), listing
+        flat = " ".join(text.split())
+        assert "switched to glm-5 for this session · reasoning high" in flat, text
+        # The level reached the gateway with the session's own token.
+        assert mock.messages == [] or all(auth == f"Bearer {ACCESS_TOKEN}" for auth, _ in mock.messages)
