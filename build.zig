@@ -924,7 +924,7 @@ pub fn build(b: *std.Build) void {
         .name = "metacodes-fs-helper",
         .root_module = sandbox_helper_mod,
     });
-    const install_sandbox_helper = b.addInstallArtifact(sandbox_helper_exe, .{});
+    const install_sandbox_helper = b.addInstallArtifact(sandbox_helper_exe, .{ .pdb_dir = .disabled });
     g_sandbox_helper_install = &install_sandbox_helper.step;
     g_sandbox_helper_path = b.getInstallPath(.bin, sandbox_helper_exe.out_filename);
     b.getInstallStep().dependOn(&install_sandbox_helper.step);
@@ -1814,6 +1814,7 @@ pub fn build(b: *std.Build) void {
     });
     const install_agentcore_sandbox_helper = b.addInstallArtifact(sandbox_helper_exe, .{
         .dest_dir = .{ .override = .{ .custom = b.fmt("{s}/bin", .{agentcore_bundle_rel}) } },
+        .pdb_dir = .disabled,
     });
     const install_agentcore_header = b.addInstallFileWithDir(
         b.path("sdk/metask/agentcore.h"),
