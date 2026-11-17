@@ -712,6 +712,26 @@ test "teamwork runtime L2: initial worktree checkout never invokes configured sm
     try testing.expect(!exists(fx.state(), "callback-ran"));
 }
 
+test "teamwork runtime L2: worktree conditional includes cannot re-enable checkout filters" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-conditional-filter");
+    defer fx.deinit();
+    try writeFile(fx.repo(), ".gitattributes", "*.dat filter=conditional\n");
+    try writeFile(fx.repo(), "data.dat", "base bytes\n");
+    const cfg_text = try std.fmt.allocPrint(fx.arena.allocator(), "[filter \"conditional\"]\nsmudge = \"printf called > '{s}/callback-ran'; cat\"\nrequired = true\n", .{fx.state()});
+    try writeFile(fx.repo(), ".git/conditional.cfg", cfg_text);
+    const setup = try sh(fx.repo(), "git config 'includeIf.gitdir:**/worktrees/**.path' conditional.cfg");
+    testing.allocator.free(setup);
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const run = try runtime.Run.start(testing.allocator, .{ .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    try expectFile(run.status().worktree.?, "data.dat", "base bytes\n");
+    try testing.expect(!exists(fx.state(), "callback-ran"));
+}
+
 test "teamwork runtime L2: after a crash, reopen restores seats, counters and budget, and the loop finishes the run" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: Fixture = undefined;

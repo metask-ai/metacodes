@@ -165,8 +165,14 @@ pub fn snapshot(gpa: std.mem.Allocator, repo: []const u8, scratch_dir: []const u
 /// Add a detached worktree without running hooks or content filters outside
 /// the seat sandbox.
 pub fn addWorktree(gpa: std.mem.Allocator, repo: []const u8, path: []const u8, commit: ObjectId, abort: Abort) Error!void {
-    const out = try gitText(gpa, repo, &.{ "worktree", "add", "--detach", "--quiet", path, commit.slice() }, abort);
-    gpa.free(out);
+    // Conditional includes can enable different filters in the new gitdir.
+    // Register without checking out, then discover its own effective config
+    // before populating files. Source-repository overrides alone are not enough.
+    const added = try gitText(gpa, repo, &.{ "worktree", "add", "--no-checkout", "--detach", "--quiet", path, commit.slice() }, abort);
+    defer gpa.free(added);
+    errdefer _ = removeWorktree(gpa, repo, path);
+    const checked_out = try gitText(gpa, path, &.{ "read-tree", "-u", "--reset", commit.slice() }, abort);
+    defer gpa.free(checked_out);
 }
 
 /// Remove the worktree at `path`; true when it is confirmed gone.
