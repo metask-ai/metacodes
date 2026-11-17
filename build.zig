@@ -2611,6 +2611,16 @@ pub fn build(b: *std.Build) void {
     const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
     gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
     units_test_step.dependOn(&gate_manifest_test_cmd.step);
+    const pr_loop_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_pr_loop",
+        "-v",
+    });
+    const pr_loop_test_step = b.step("test:pr-loop", "Test the opt-in PR review, repair and merge-queue controller");
+    pr_loop_test_step.dependOn(&pr_loop_test_cmd.step);
+    units_test_step.dependOn(&pr_loop_test_cmd.step);
     const release_cut_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
