@@ -327,17 +327,17 @@ ledger.remainingUsd()`;`spec.model`/`spec.effort` 作为覆盖。用量经 `Writ
 |---|---|---|
 | 执行策略 | `Scope.executionPolicy()` 作为 `SpawnOptions.execution_policy`,agent_loop/tool_exec 在工具运行前最后一道检查,与权限模式、allow 规则无关 | 只提供该角色的工具(`toolsFor`:implementer = Read/Grep/Glob/Write/Edit/Bash;reviewer = `reviewer.tools` + Write;其余角色 = Read/Grep/Glob/Bash/Write);Write/Edit 的目标按工具自己的解析方式求出后**物理**落在写根内(符号链接解析,含尚不存在的尾部;悬空链接拒绝);写根 = seat 目录,implementer 另加工作区;Bash 必须只读或确实在沙箱内运行 |
 | 权限 | 宿主权限上下文派生:`acceptEdits`、工作目录集 = 工作区 + seat 目录、`no_interactive_prompt`、无 UI 请求器、无会话记忆、无 memdir 豁免 | 需要询问的一律拒绝;宿主 deny 规则、settings、hooks 照样生效 |
-| 沙箱 | `seatSandbox`:有后端(macOS Seatbelt;Linux bubblewrap,`sandbox/bwrap.zig`)时强制开启、`failIfUnavailable`、不可绕过(`allowUnsandboxedCommands = false`),丢弃宿主的 `allowWrite` 与 `excludedCommands` | Bash 只能写工作区、seat 目录和临时目录 |
+| 沙箱 | `seatSandbox`:始终要求后端(macOS Seatbelt;Linux bubblewrap + seccomp)、`failIfUnavailable`、不可绕过(`allowUnsandboxedCommands = false`),丢弃宿主的 `allowWrite` 与 `excludedCommands` | Bash 和原生文件执行器只能写工作区、seat 目录和临时目录;后端不可用即拒绝 seat |
 
 Linux 上 implementer seat 的 Bash 跑在 bubblewrap 里:根目录只读挂载,只把工作区、seat 目录、
 临时目录(`/tmp`、`/var/tmp`、`$TMPDIR`)按物理路径可写绑定,所以能在工作区里构建、跑测试,写不到别处
 (符号链接改变不了挂载)。
 
-**未强制的部分**:Windows,以及没有可用 bwrap(未安装、或内核/容器不允许非特权 user namespace,
-探测失败)的 Linux 没有沙箱后端,seat 的 Bash 只放行只读命令(`bash_readonly`),所以那里的
-metacodes seat 跑不了构建或测试(reviewer 的钉住检查由 runtime 自己重跑,§6.2)。两个后端都总允许
-写工作区(构建缓存)和临时目录,所以对非 implementer seat,Bash 挡不住对工作区的改动;reviewer 由
-工作区树 id 检查兜底。
+Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命名空间)的 Linux,在模型请求前
+即拒绝 seat,不会因探测失败而把原生文件操作切换成无沙箱模式。Read/Write/Edit 等原生文件工具
+经 `metacodes-fs-helper` 在沙箱内打开文件;Grep/Glob 的搜索命令也经过相同边界。
+两个后端都允许写工作区(构建缓存)和临时目录,所以对非 implementer seat,Bash 挡不住对工作区
+的改动;reviewer 仍由工作区树 id 检查兜底。完整边界见 [沙箱执行](SANDBOX_DESIGN.md)。
 
 ### 7.4 Claude Code 驱动
 
@@ -364,11 +364,14 @@ metacodes seat 跑不了构建或测试(reviewer 的钉住检查由 runtime 自�
   Code 用它自己的登录。stdin 立即关闭,stderr 写入 `harness.log`。
 - **进程组**:子进程自成进程组。中止、硬超时、wallclock 预算到时整组 SIGTERM→SIGKILL;正常退出
   后也清扫一次整组,不留后代进程。Windows 只杀 CLI 本身。
-- **沙箱**:整条命令经 `sandbox/exec.zig` 包进宿主的后端(macOS Seatbelt,Linux bubblewrap),
+- **沙箱**:探测(`--version`、`--help`)和正式调用都经通用的 `sandbox/worker.zig`
+  包进宿主后端(macOS Seatbelt,Linux bubblewrap + seccomp),
   可写根 = 工作区、seat 目录、临时目录和 Claude Code 自己的状态(`~/.claude`、`~/.claude.json*`;
-  bwrap 只能绑定启动时已存在的条目)。网络保持开放(CLI 要连它的 API)。bwrap 下 CLI 被信号 N
-  杀死表现为 bwrap 退出码 128+N,驱动换算回信号(`WrappedCommand.childExitCode`)。**没有后端的
-  平台(Windows、没有可用 bwrap 的 Linux),CLI 不受限运行**,写入只靠 Claude Code 自己的权限模式。
+  bwrap 只能绑定启动时已存在的条目)。继承宿主的读写拒绝与网络列表,不继承额外写权限;
+  无网络列表时网络开放(CLI 要连 API)。工厂把同一宿主限制转交给两种 harness。bwrap 下 CLI 被信号 N
+  杀死表现为 bwrap 退出码 128+N,驱动换算回信号(`WrappedCommand.childExitCode`)。
+  **启用沙箱而后端不可用时,在兼容性探测前即拒绝启动**;仅可信宿主显式设置
+  `Options.sandbox=false` 可以不受限运行。
   真实 CLI 在该配置下的运行尚未用真模型验证。
 - **结果**:stdout 只解析最后一个 `result` 事件(`subtype`、`total_cost_usd`),不解析对话。
   `cost` seat 以 `harness_reported` 记报告的花费(没有结果事件,如被杀,则记 `wallclock_only`);

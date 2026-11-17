@@ -18,9 +18,8 @@
 //! 3. `seatSandbox` confines Bash: writes allowed only under the workspace,
 //!    the seat directory and the platform temp roots (Seatbelt profile on
 //!    macOS, bubblewrap mounts on Linux), so an implementer seat can build
-//!    and run tests. On a host without a working backend (Windows; Linux
-//!    without a bwrap that can create user namespaces) only read-only Bash
-//!    commands run. The sandbox always lets Bash write the workspace
+//!    and run tests. A missing backend refuses the seat rather than disabling
+//!    native file or command confinement. The sandbox lets Bash write the workspace
 //!    (build caches), so for a non-implementer seat Bash is not a fence
 //!    against workspace edits; the reviewer's tree check is (reviewer.zig).
 
@@ -71,8 +70,8 @@ fn contains(names: []const []const u8, name: []const u8) bool {
 /// bypassed, and no extra write roots. The host's read restrictions and
 /// network lists carry over; its `allow_write` and `excluded_commands` do
 /// not (either would let a seat write outside its two roots). Without a
-/// backend it is off, so read-only commands still run, and the execution
-/// policy refuses every other command (`Scope.allows`).
+/// backend it remains enabled and fail-closed: discovery cannot turn a
+/// sandboxed seat into an unsandboxed native file tool invocation.
 pub fn seatSandbox(host: ?*const sandbox_config.SandboxSettings) sandbox_config.SandboxSettings {
     var settings: sandbox_config.SandboxSettings = .{};
     if (host) |h| {
@@ -82,7 +81,7 @@ pub fn seatSandbox(host: ?*const sandbox_config.SandboxSettings) sandbox_config.
         settings.allowed_domains = h.allowed_domains;
         settings.denied_domains = h.denied_domains;
     }
-    settings.enabled = sandbox_exec.hostSupported();
+    settings.enabled = true;
     settings.fail_if_unavailable = true;
     settings.allow_unsandboxed_commands = false;
     settings.auto_allow_bash_if_sandboxed = true;
@@ -378,12 +377,12 @@ test "write scope: seat sandbox drops host write widenings and escape hatches" {
         .deny_read = &deny_read,
     };
     const seat = seatSandbox(&host);
-    try testing.expectEqual(sandbox_exec.hostSupported(), seat.enabled);
+    try testing.expect(seat.enabled);
     try testing.expect(seat.fail_if_unavailable and !seat.allow_unsandboxed_commands);
     try testing.expectEqual(@as(usize, 0), seat.allow_write.len);
     try testing.expectEqual(@as(usize, 0), seat.excluded_commands.len);
     try testing.expectEqual(@as(usize, 1), seat.deny_read.len);
-    const want: sandbox_exec.Plan = if (sandbox_exec.hostSupported()) .sandboxed else .passthrough;
+    const want: sandbox_exec.Plan = if (sandbox_exec.hostSupported()) .sandboxed else .unavailable;
     try testing.expectEqual(want, sandbox_exec.plan(&seat, "git commit -m x", false));
 }
 

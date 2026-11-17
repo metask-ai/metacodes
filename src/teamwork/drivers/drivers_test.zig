@@ -171,6 +171,9 @@ const Scenario = enum {
     over_budget,
     /// Its `--help` lacks `--permission-prompts`.
     incompatible,
+    /// Probes and the run try reading/writing a denied directory, including
+    /// through a child shell, before writing the normal handoff.
+    confinement,
 };
 
 const FakeCli = struct {
@@ -212,7 +215,16 @@ const FakeCli = struct {
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(testing.allocator);
         const a = testing.allocator;
-        try text.appendSlice(a, "#!/bin/sh\ncase \"$1\" in\n--version) echo '2.1.323 (Claude Code)'; exit 0 ;;\n--help) cat <<'HELP'\n");
+        try text.appendSlice(a, "#!/bin/sh\n");
+        if (scenario == .confinement) {
+            try text.print(a,
+                \\printf '%s\n' "$1" >> '{s}/confinement-trace'
+                \\if cat '{s}/protected/secret' >/dev/null 2>&1; then exit 78; fi
+                \\if /bin/sh -c 'printf escaped > "$1"' sh '{s}/protected/escape' 2>/dev/null; then exit 79; fi
+                \\
+            , .{ fx.workspace(), fx.root.slice(), fx.root.slice() });
+        }
+        try text.appendSlice(a, "case \"$1\" in\n--version) echo '2.1.323 (Claude Code)'; exit 0 ;;\n--help) cat <<'HELP'\n");
         if (scenario == .incompatible) {
             try text.appendSlice(a, fake_help);
         } else {
@@ -236,7 +248,7 @@ const FakeCli = struct {
             \\
         );
         switch (scenario) {
-            .ok => {
+            .ok, .confinement => {
                 try text.appendSlice(a, "cat > \"$seat/handoff.md\" <<'HANDOFF'\n");
                 try text.appendSlice(a, handoff_text);
                 try text.appendSlice(a, "HANDOFF\n");
@@ -769,6 +781,97 @@ test "teamwork drivers L2: claude seat failures map to outcomes" {
             try testing.expectEqual(@as(usize, 1), fx.ledger.entries);
         }
     }
+}
+
+test "teamwork drivers L2: external harness probes and descendants inherit host sandbox denials" {
+    if (builtin.os.tag == .windows or !sandbox_exec.hostSupported()) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-harness-confined", 5);
+    defer fx.deinit();
+    var protected_buf: PathBuf = undefined;
+    const protected = fx.path(&protected_buf, "protected");
+    try util_fs.mkdirParents(protected);
+    var secret_buf: PathBuf = undefined;
+    const secret = fx.path(&secret_buf, "protected/secret");
+    const secret_fd = try pfs.openZ(secret, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    defer _ = pfs.close(secret_fd);
+    try testing.expect(pfs.writeAll(secret_fd, "host secret"));
+
+    var fake: FakeCli = .{};
+    try fake.install(&fx, .confinement);
+    const seat = try fx.addSeat(.implementer, 1, .claude_code);
+    const spec = try claudeSpec(fake.scriptPath(), .cost);
+    var host_sandbox: @import("../../sandbox/config.zig").SandboxSettings = .{
+        .deny_read = &.{protected},
+        .deny_write = &.{protected},
+    };
+    var host: MetacodesHost = undefined;
+    try host.init();
+    defer host.deinit();
+    const turns = [_][]const ScriptedProvider.Event{&.{.{ .text = "unused" }}};
+    var scripted: ScriptedProvider = .{ .allocator = testing.allocator, .turns = &turns };
+    defer scripted.deinit();
+    var native_deps = host.deps(scripted.provider(), &fx);
+    native_deps.host_sandbox = &host_sandbox;
+    var driver = factory.forSeat(&spec, .{
+        .metacodes = native_deps,
+        .claude_code = claudeOptions(),
+    }, fx.binding(seat));
+    var abort = types.AbortSignal.init();
+    var outcome = try driver.driver().run(testing.allocator, &spec, fx.paths(seat), &abort);
+    defer outcome.deinit(testing.allocator);
+    try testing.expect(outcome == .finished);
+    var escaped_buf: PathBuf = undefined;
+    try testing.expect(!pfs.exists(fx.path(&escaped_buf, "protected/escape")));
+    var trace_buf: PathBuf = undefined;
+    const trace = swarm_team.readFileAlloc(testing.allocator, fx.path(&trace_buf, "workspace/confinement-trace")) orelse return error.NoProbeTrace;
+    defer testing.allocator.free(trace);
+    try testing.expectEqualStrings("--version\n--help\n-p\n", trace);
+}
+
+test "teamwork drivers L2: unavailable sandbox refuses external harness before even its version probe" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const paths = @import("platform").paths;
+    const saved = if (paths.bwrapEnv()) |value| try testing.allocator.dupeZ(u8, value) else null;
+    defer if (saved) |value| testing.allocator.free(value);
+    defer {
+        if (saved) |value| {
+            paths.setEnv("METACODES_BWRAP", value.ptr);
+        } else paths.unsetEnv("METACODES_BWRAP");
+    }
+    paths.setEnv("METACODES_BWRAP", "/nonexistent-metacodes-sandbox/bwrap");
+
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-harness-unavailable", 5);
+    defer fx.deinit();
+    var fake: FakeCli = .{};
+    try fake.install(&fx, .confinement);
+    const seat = try fx.addSeat(.implementer, 1, .claude_code);
+    const spec = try claudeSpec(fake.scriptPath(), .cost);
+    var driver = claude_code.ClaudeCodeDriver.init(claudeOptions(), fx.binding(seat));
+    var abort = types.AbortSignal.init();
+    var outcome = try driver.run(testing.allocator, &spec, fx.paths(seat), &abort);
+    defer outcome.deinit(testing.allocator);
+    try testing.expect(outcome.failed == .spawn_failed);
+    var trace_buf: PathBuf = undefined;
+    try testing.expect(!pfs.exists(fx.path(&trace_buf, "workspace/confinement-trace")));
+    try testing.expectEqual(@as(usize, 0), fx.ledger.entries);
+
+    // Switching harness must not turn the same missing sandbox into a
+    // successful in-process run (or issue even one model request).
+    const local_seat = try fx.addSeat(.implementer, 2, .metacodes);
+    const local_spec: types.SeatSpec = .{ .role = .implementer, .harness = .metacodes };
+    var host: MetacodesHost = undefined;
+    try host.init();
+    defer host.deinit();
+    const turns = [_][]const ScriptedProvider.Event{&.{.{ .text = "should never run" }}};
+    var scripted: ScriptedProvider = .{ .allocator = testing.allocator, .turns = &turns };
+    defer scripted.deinit();
+    var local = metacodes.MetacodesDriver.init(host.deps(scripted.provider(), &fx), fx.binding(local_seat));
+    var local_outcome = try local.run(testing.allocator, &local_spec, fx.paths(local_seat), &abort);
+    defer local_outcome.deinit(testing.allocator);
+    try testing.expect(local_outcome.failed == .spawn_failed);
+    try testing.expectEqual(@as(usize, 0), scripted.calls);
 }
 
 test "teamwork drivers L2: claude seat timeout, wallclock budget and abort kill the whole group" {

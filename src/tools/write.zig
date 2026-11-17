@@ -1,10 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const pfs = @import("platform").fs;
+const filesystem = @import("../sandbox/filesystem.zig");
 const common = @import("common.zig");
 const file_target = @import("file_target.zig");
 const path_mod = @import("../util/path.zig");
-const util_fs = @import("../util/fs.zig");
 const util_json = @import("../util/json.zig");
 const read_state = @import("../core/read_state.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -37,15 +37,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // must-read-first 校验：若挂了 ReadState（正式 agent 路径），文件存在但没读过 → 拒绝
     // 两个例外：1) 文件不存在（即将创建）；2) ReadState 未挂（单测/dev 路径）
     if (ctx.read_state) |rs| {
-        const exists = read_state.statPath(path) catch |err| switch (err) {
+        const exists = filesystem.statPath(ctx, path) catch |err| switch (err) {
             error.StatFailed => null, // 文件不存在，允许创建
+            error.FileNotFound => null,
             else => return err,
         };
         if (exists) |st| {
             const rec = rs.get(path) orelse return error.NotRead;
             // staleness 双判:mtime 变了,但内容哈希没变(且记过哈希)→ 不算 stale(对齐 cc)。
             if (rec.mtime_ns != st.mtime_ns) {
-                const cur_hash = read_state.hashFileContent(path);
+                const cur_hash = try filesystem.hashFileContent(ctx, path);
                 if (rec.content_hash == 0 or cur_hash != rec.content_hash) return error.StaleFile;
             }
         }
@@ -54,7 +55,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 写前抓旧内容（同时用于 structuredPatch / gitDiff 与 typed observation）。
     // 只有明确的 ENOENT 才能声称 missing；权限、类型、过大或读取失败都是
     // unknown，不能为了生成一条好看的 effect 而伪造旧状态。
-    const before = captureBeforeContent(allocator, path);
+    const before = try captureBeforeContent(ctx, allocator, path);
     defer switch (before) {
         .known => |bytes| allocator.free(bytes),
         else => {},
@@ -64,14 +65,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         else => null,
     };
 
-    // 自动建父目录（对齐 TS：Write 到不存在的目录会先 mkdir -p）。
-    try util_fs.mkdirParentsOf(path);
-
     const write_flags: pfs.O = if (ctx.project_write_exclusive_create)
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .EXCL = true }
     else
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
-    const fd = pfs.openZ(path, write_flags, 0o666) catch {
+    // Parent creation and O_TRUNC happen only after the helper is confined.
+    const fd = filesystem.open(ctx, path, write_flags, 0o666, true) catch |err| {
+        if (filesystem.enabled(ctx)) return err;
         // EACCES/EROFS 与其他 open 失败对模型是不同的可行动作:权限失败应换目标
         // 路径或报告权限问题,而不是盲目重试。带 errno 的富 detail 走 error_detail
         // 通道(与 edit.zig setDetail 同款),无通道时退回裸 WriteError。
@@ -122,7 +122,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     @import("../kg/autosync.zig").maybeImportMemoryFile(ctx, path, content);
 
     // M2:LSP baseline 移到盘写后(新建文件 old="")——盘写不被 LSP 阻塞,只结果等诊断。
-    @import("lsp_diag.zig").snapshotBaseline(ctx, path, old_content orelse "");
+    // Long-lived LSP servers can reopen paths outside this confinement.
+    if (!filesystem.enabled(ctx)) @import("lsp_diag.zig").snapshotBaseline(ctx, path, old_content orelse "");
 
     return try renderResult(ctx, allocator, path, old_content orelse "", content, before);
 }
@@ -134,8 +135,15 @@ const MAX_WRITE_OLD_SIZE: usize = 10 * 1024 * 1024;
 /// Capture the exact bytes observed immediately before Write opens the target
 /// with TRUNC. This is evidence of the tool's observation, not a claim that the
 /// path stayed unchanged across the unavoidable open/read/write interval.
-fn captureBeforeContent(allocator: std.mem.Allocator, path: []const u8) observation.BeforeContent {
-    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
+fn captureBeforeContent(ctx: *const ToolContext, allocator: std.mem.Allocator, path: []const u8) !observation.BeforeContent {
+    const fd = filesystem.open(ctx, path, .{ .ACCMODE = .RDONLY }, 0, false) catch |err| {
+        if (filesystem.enabled(ctx)) return switch (err) {
+            error.FileNotFound => .missing,
+            // A denied read supplies no before evidence, but must not grant
+            // write access: the separate confined writable open decides it.
+            error.SandboxAccessDenied => .unknown,
+            else => err,
+        };
         // openZ 在没调 CRT 就拒绝(路径过长)时也写了 errno,所以这里读到的总是本次 open 的原因;
         // 整数比较,不裸转枚举(#121)。
         return if (pfs.lastErrnoIs(.NOENT)) .missing else .unknown;
@@ -184,7 +192,7 @@ fn renderResult(
     try out.writer.writeAll(",\"gitDiff\":");
     try util_json.writeJsonString(&out.writer, git_diff);
     // LSP 被动诊断:写后 delta 诊断附进结果(新建文件的诊断也报)。
-    try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, path, new_content);
+    if (!filesystem.enabled(ctx)) try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, path, new_content);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
 }

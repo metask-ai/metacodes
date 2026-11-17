@@ -4,6 +4,16 @@ Metacodes exposes several host shapes over one kernel. The fixed AgentLoop,
 Conversation projection, permission/sandbox chain, budgets, formal verdicts,
 artifact store, and TinyKG admission are not replaceable extensions.
 
+Sandbox execution has two boundaries: native filesystem/command tools use
+confined executors, while external harness workers run as a whole confined
+process tree. Linux combines bubblewrap and seccomp; macOS uses Seatbelt.
+Deploy the bundled `bin/metacodes-fs-helper` beside an embedded Host or set
+`METACODES_SANDBOX_HELPER` to its absolute path. Enabled native file/worker
+sandboxes refuse unavailable backends rather than opening/running on the Host.
+The Zig `sandbox_exec` namespace exposes platform discovery; no C ABI fields
+or wire layouts change. See [sandbox execution](SANDBOX_DESIGN.md) for the
+helper contract and the current network-policy limits.
+
 ## Compatibility matrix
 
 | Interface | Entry point | Status | Compatibility rule |
