@@ -823,7 +823,7 @@ pub const App = struct {
         errdefer if (app.state_root_default) |owned| allocator.free(owned);
         errdefer app.tool_defs_arena.deinit();
 
-        if (config.rsi) {
+        if (app.config.preview.isEnabled() and app.config.rsi) {
             const path = config.rsi_policy_path orelse return error.SkillPolicyRequired;
             app.rsi_policy = try @import("skills/rsi.zig").Loaded.load(allocator, path);
         }

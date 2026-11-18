@@ -1389,6 +1389,9 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
     // ② spawnBackground(prebuilt=copy)。consume 语义:成功转移给 job,失败它自己释放 copy。
     _ = try reg.spawnBackground(.{
         .preview = app.config.preview.isEnabled(),
+        .harnessmm = app.config.harnessmm,
+        .rsi = app.config.rsi,
+        .rsi_policy = if (app.rsi_policy) |*policy| &policy.parsed.value else null,
         .prompt = "", // 忽略(prebuilt 非 null)
         .system_prompt = app.system_prompt orelse "",
         .session = app.session_id,

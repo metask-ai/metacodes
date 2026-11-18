@@ -424,10 +424,11 @@ pub const Options = struct {
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
     system_prompt: ?[]const u8 = null,
-    /// Frozen, host-owned procedural skill. Children do not inherit it.
+    /// Frozen, host-owned procedural skill. Requires preview and RSI; fresh
+    /// children do not inherit this selection implicitly.
     rsi_policy: ?*const @import("../skills/rsi.zig").Policy = null,
     rsi: bool = false,
-    /// EDG / GDR / CCS, independently enabled from RSI.
+    /// EDG / GDR / CCS selection, effective only when preview is also enabled.
     harnessmm: bool = false,
     /// 首条 user-context message(对齐 cc prependUserContext):CLAUDE.md 链 + AutoMem +
     /// currentDate,`<system-reminder>` 包裹。仅主 session 传(subagent 走 preload 自己的链)。
@@ -1750,7 +1751,7 @@ pub fn run(
 }
 
 fn injectProceduralSkill(conversation: *Conversation, opts: Options, model: []const u8, gpa: std.mem.Allocator) !void {
-    if (!opts.rsi) return;
+    if (!opts.preview or !opts.rsi) return;
     const policy = opts.rsi_policy orelse return error.SkillPolicyRequired;
     const rsi = @import("../skills/rsi.zig");
     // One persisted host note per participant task. Retrying/resuming does not
@@ -2249,14 +2250,15 @@ fn runCounted(
     allocator: std.mem.Allocator,
     counters: *RunCounters,
 ) !RunResult {
+    const harnessmm_enabled = opts.preview and opts.harnessmm;
     var harnessmm = harnessmm_mod.State.init(allocator);
     defer harnessmm.deinit();
-    var harnessmm_journal: ?harnessmm_mod.Journal = if (opts.harnessmm)
+    var harnessmm_journal: ?harnessmm_mod.Journal = if (harnessmm_enabled)
         try harnessmm_mod.Journal.open(allocator, opts.artifact_root)
     else
         null;
     defer if (harnessmm_journal) |*journal| journal.deinit();
-    if (opts.harnessmm) {
+    if (harnessmm_enabled) {
         var present = false;
         var index = conversation.messages.items.len;
         while (index > 0) {
@@ -2627,7 +2629,7 @@ fn runCounted(
         // Provider-response observers admit actual Provider responses; hosts
         // with that extra boundary conservatively retain the slow callback.
         const hooks_allow_reuse = if (permission_ctx.hooks) |hooks| !hooks.hasPre() else true;
-        const fast_action: ?msg.ToolUse = if (opts.harnessmm and hooks_allow_reuse and
+        const fast_action: ?msg.ToolUse = if (harnessmm_enabled and hooks_allow_reuse and
             opts.response_observer == null and !required_first_pending and
             !in_learning_pass and verifier_gate.leads != .active and conversation.messages.items.len > 0)
         blk: {
@@ -3079,7 +3081,10 @@ fn runCounted(
                 // dropping one; the provider's own limit decides the request.
                 log.warn("agent", "image wire cap exceeded by non-trimmable images: over_by={d} cap={d}", .{ image_trim.remaining_over_cap, opts.image_request_bytes_cap });
             }
-            var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
+            var api_messages = try buildApiMessagesWithFeatures(conversation, allocator, opts.inject_user_context, synthetic_user_input, .{
+                .harnessmm = harnessmm_enabled,
+                .rsi = opts.preview and opts.rsi,
+            });
             defer freeApiMessages(&api_messages, allocator);
             if (opts.request_gate) |gate| {
                 const max_input_tokens = serializedRequestInputTokenReserve(
@@ -3915,7 +3920,7 @@ fn runCounted(
 
         // 5. 如果这一轮没有 tool_use，整个请求结束
         const last_msg = &conversation.messages.items[conversation.messages.items.len - 1];
-        if (opts.harnessmm and fast_action == null) try harnessmm.admit(last_msg.*);
+        if (harnessmm_enabled and fast_action == null) try harnessmm.admit(last_msg.*);
         var has_tool_use = false;
         for (last_msg.blocks) |b| if (@as(std.meta.Tag(msg.Block), b) == .tool_use) {
             has_tool_use = true;
@@ -5126,7 +5131,7 @@ fn runCounted(
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
-        if (opts.harnessmm) {
+        if (harnessmm_enabled) {
             var certificate = try harnessmm.observe(conversation.messages.items[conversation.messages.items.len - 1], turns + 1);
             defer if (certificate) |*value| value.deinit();
             if (certificate) |*value| try harnessmm_journal.?.append(allocator, value);
@@ -5388,6 +5393,20 @@ fn buildApiMessages(
     inject_user_context: ?[]const u8,
     synthetic_user_input: ?[]const u8,
 ) !std.ArrayList(types.ApiMessage) {
+    // Estimates conservatively include historical notes. Actual requests use
+    // the resolved run selections below, without rewriting durable history.
+    return buildApiMessagesWithFeatures(conversation, allocator, inject_user_context, synthetic_user_input, .{ .harnessmm = true, .rsi = true });
+}
+
+const OptimizationNotes = struct { harnessmm: bool, rsi: bool };
+
+fn buildApiMessagesWithFeatures(
+    conversation: *const Conversation,
+    allocator: std.mem.Allocator,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    notes: OptimizationNotes,
+) !std.ArrayList(types.ApiMessage) {
     var out = std.ArrayList(types.ApiMessage).empty;
     errdefer {
         freeApiMessages(&out, allocator);
@@ -5416,6 +5435,14 @@ fn buildApiMessages(
     }
 
     for (conversation.activeMessages()) |m| {
+        // A restored host instruction cannot reactivate a disabled feature.
+        // Keep message positions, native calls/results and transcript bytes;
+        // only omit our standalone guidance from this provider projection.
+        if (m.origin == .host and m.blocks.len == 1 and m.blocks[0] == .text) {
+            const text = m.blocks[0].text;
+            if ((!notes.harnessmm and std.mem.startsWith(u8, text, harnessmm_mod.AUTHOR_MARKER)) or
+                (!notes.rsi and std.mem.startsWith(u8, text, @import("../skills/rsi.zig").PREFIX))) continue;
+        }
         // thinking 块随消息投影,由方言决定是否上 wire(`ModelProfile.echoes_reasoning_content`):
         // DeepSeek 要求回传历史思考,Claude 拒收无签名的 thinking 块,其余方言忽略它。
         // 它和 reasoning_item 一样**不足以**撑起一条消息。

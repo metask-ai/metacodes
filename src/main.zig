@@ -158,6 +158,7 @@ pub const message = @import("core/message.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
 pub const agent_loop = @import("core/agent_loop.zig");
 pub const harnessmm = @import("core/harnessmm.zig");
+pub const skill_rsi = @import("skills/rsi.zig");
 pub const agent_session = @import("core/agent_session.zig");
 pub const execution_effect = @import("core/execution_effect.zig");
 pub const response_candidate = @import("core/response_candidate.zig");
@@ -5107,8 +5108,8 @@ fn printHelp() void {
         \\  --check-gate          After the model changes files and stops, run --host-check; continue on a clean failure
         \\  --check-gate-observe  Run --host-check at the same points and only record the verdict
         \\  --check-gate-max <n>  Continuations the check gate may grant per run (1..8, default 3)
-        \\  --harnessmm / --no-harnessmm  Reuse guarded literal decisions and certify omitted callbacks (default off)
-        \\  --rsi / --no-rsi     Use offline-evolved skills and their learned ridge routers (default off)
+        \\  --harnessmm / --no-harnessmm  Preview: guarded decision reuse and callback certificates (requires --preview, default off)
+        \\  --rsi / --no-rsi     Preview: evolved skills and learned routers (requires --preview, default off)
         \\  --rsi-policy <file>  Frozen RSI policy (doc/SKILL_RSI_PROTOCOL.md)
         \\  --learning-turn       After a grounded host verdict, let the model record conditioned lessons
         \\                        for the next attempt (needs --check-gate[-observe], or in print mode

@@ -14,11 +14,15 @@ and feature contract rather than a benchmark reproduction.
 ## Product switches
 
 `--rsi-policy <file>` names a frozen UTF-8 JSON policy. `--rsi` enables the
-complete feature; `--no-rsi` disables it. RSI defaults to off; the last
-positive or negative occurrence wins.
+complete feature only with the shared preview opt-in; `--no-rsi` disables it.
+RSI defaults to off; the last positive or negative occurrence wins.
+Use `metacodes --preview --rsi --rsi-policy policy.json -p "your task"`.
+Alternatively, save the root boolean `"preview": true` in
+`<state root>/config.json`. `--no-preview` overrides that saved value, and the
+last preview flag wins. Preview alone does not select RSI or HarnessMM.
 
-When disabled, the policy is not opened and no procedural instruction is
-added. When enabled, the selected evolved instruction is applied only when
+When either preview or RSI is disabled, the policy is not opened or required,
+and no procedural instruction is added. When both are enabled, the selected evolved instruction is applied only when
 its own router admits the task. Evolution and routing are internal parts of
 RSI, not separate product switches.
 
@@ -31,8 +35,11 @@ The runtime switch does not run training or make an optimizer/selector request
 at startup. The separate offline evolution/routing options below exist for
 research ablations; an artifact without a router abstains in the product.
 
-The CLI hosts (headless, REPL, web and daemon) pass the same immutable policy
-to the kernel. Children do not inherit it. A newly admitted instruction is one
+The CLI hosts (headless, REPL, web and daemon) pass the resolved preview value
+and the same immutable policy to the kernel. Fresh children do not implicitly
+select RSI; an explicit host selection still requires preview in the child.
+Background continuation of the root preserves its selection and borrowed
+policy. A newly admitted instruction is one
 persisted host-origin user-role note after the current participant task:
 
 ```text
@@ -45,7 +52,10 @@ It is appended once per participant task, including across retries. Existing
 messages, the system prompt and tool schemas are not rewritten. Policy paths,
 hashes, router scores, training metadata and journals never enter this note.
 The instruction is guidance only; it is never interpreted as a command,
-permission rule or tool-policy frame. Previous task notes remain in history.
+permission rule or tool-policy frame. Previous task notes remain in history;
+inactive RSI host notes are omitted from subsequent provider requests, including
+resume, without rewriting the transcript. Re-enabling the same feature keeps
+its existing note bytes and does not inject duplicates.
 
 ## Frozen policy
 

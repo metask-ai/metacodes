@@ -100,15 +100,19 @@ class HarnessMMRuntimeTest(unittest.TestCase):
         self.policy = self.root / "policy.json"
         self.policy.write_bytes((ROOT / "sdk/fixtures/skill-rsi-v1.json").read_bytes())
 
-    def run_actor(self, flags, *, plan=None, extra=()):
+    def run_actor(self, flags, *, plan=None, extra=(), saved_preview=None):
         # A stable state root keeps unrelated memory-path prompt bytes equal.
         home = self.root / "home"
         if home.exists():
             shutil.rmtree(home)
         home.mkdir()
+        state = home / ".metacodes"
+        state.mkdir()
+        if saved_preview is not None:
+            (state / "config.json").write_text(json.dumps({"preview": saved_preview}))
         with Actor(plan or self.plan) as actor:
             result = subprocess.run([str(Path(BIN).resolve()), "--api-key", "fixture", "--base-url", f"http://127.0.0.1:{actor.server_port}",
-                "--model", "claude-sonnet-4-20250514", "--no-theme", "--no-lsp", "--no-progress-updates", "--permission", "bypassPermissions",
+                "--state-dir", str(state), "--model", "claude-sonnet-4-20250514", "--no-theme", "--no-lsp", "--no-progress-updates", "--permission", "bypassPermissions",
                 "--rsi-policy", str(self.policy), *flags, *extra, "-p", "read before editing", "--json"],
                 cwd=self.root, env={**{k: v for k, v in os.environ.items() if k not in {"CODEX_HOME", "METACODES_HOME"}},
                                    "HOME": str(home), "METACODES_KG_AUTOSTART": "0"},
@@ -118,9 +122,14 @@ class HarnessMMRuntimeTest(unittest.TestCase):
         return result, requests, certificates
 
     def test_harnessmm_and_rsi_are_independent_product_features(self):
-        system, tools = None, None
-        for flags, reuse, rsi in (([], False, False), (["--harnessmm"], True, False),
-                (["--rsi"], False, True), (["--harnessmm", "--rsi"], True, True)):
+        prefixes = {}
+        fixture = json.loads((ROOT / "sdk/fixtures/preview-feature-selection-v1.json").read_text())
+        scenarios = [(["--" + name for name in ("preview", "harnessmm", "rsi") if row[name]],
+                      row["preview"], row["reuse"], row["instruction"]) for row in fixture["cases"]]
+        scenarios += [
+                (["--preview", "--harnessmm", "--rsi", "--no-preview"], False, False, False),
+                (["--no-preview", "--preview", "--harnessmm", "--rsi"], True, True, True)]
+        for flags, preview, reuse, rsi in scenarios:
             with self.subTest(flags=flags):
                 result, requests, certificates = self.run_actor(flags)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -130,10 +139,8 @@ class HarnessMMRuntimeTest(unittest.TestCase):
                 self.assertEqual("<procedural-skill>" in first, rsi)
                 self.assertEqual("<harnessmm-authoring>" in first, reuse)
                 self.assertNotIn(str(self.policy), first)
-                if system is None:
-                    system, tools = requests[0].get("system"), requests[0]["tools"]
-                self.assertEqual(requests[0].get("system"), system)
-                self.assertEqual(requests[0]["tools"], tools)
+                prefix = (requests[0].get("system"), requests[0]["tools"])
+                self.assertEqual(prefix, prefixes.setdefault(preview, prefix))
                 results = tool_results(requests[-1])
                 self.assertEqual([json.loads(receipt_text(row))["stdout"] for row in results], ["root", "one", "two", "three"])
                 if reuse:
@@ -149,7 +156,7 @@ class HarnessMMRuntimeTest(unittest.TestCase):
                         self.assertEqual(cert["predecessor_receipt_sha256"], hashlib.sha256(receipt_text(receipts[cert["predecessor_call_id"]]).encode()).hexdigest())
 
     def test_negative_flags_restore_original_callback_loop(self):
-        result, requests, certificates = self.run_actor(["--harnessmm", "--rsi", "--no-harnessmm", "--no-rsi"])
+        result, requests, certificates = self.run_actor(["--preview", "--harnessmm", "--rsi", "--no-harnessmm", "--no-rsi"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(requests), 5)
         self.assertEqual(certificates, [])
@@ -170,18 +177,30 @@ class HarnessMMRuntimeTest(unittest.TestCase):
                     plan["nodes"][0]["after"] = "A"
                 else:
                     plan["nodes"][0]["tool"] = "Write"
-                result, requests, certificates = self.run_actor(["--harnessmm"], plan=plan)
+                result, requests, certificates = self.run_actor(["--preview", "--harnessmm"], plan=plan)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(requests), 5)
                 self.assertEqual(certificates, [])
 
     def test_native_permission_denial_stops_the_remaining_graph(self):
-        result, requests, certificates = self.run_actor(["--harnessmm"], extra=["--disallowed-tools", "Bash(printf one)"])
+        result, requests, certificates = self.run_actor(["--preview", "--harnessmm"], extra=["--disallowed-tools", "Bash(printf one)"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(requests), 2)
         self.assertEqual(len(certificates), 1)
         self.assertTrue(certificates[0]["native_receipt_is_error"])
         self.assertTrue(tool_results(requests[-1])[-1]["is_error"])
+
+    def test_saved_preview_and_cli_override_gate_real_reuse_and_rsi(self):
+        for saved, flags, enabled in (
+                (True, ["--harnessmm", "--rsi"], True),
+                (True, ["--harnessmm", "--rsi", "--no-preview"], False),
+                (False, ["--preview", "--harnessmm", "--rsi"], True)):
+            with self.subTest(saved=saved, flags=flags):
+                result, requests, certificates = self.run_actor(flags, saved_preview=saved)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(requests), 2 if enabled else 5)
+                self.assertEqual(len(certificates), 3 if enabled else 0)
+                self.assertEqual("<procedural-skill>" in json.dumps(requests[0]), enabled)
 
 if __name__ == "__main__":
     unittest.main()

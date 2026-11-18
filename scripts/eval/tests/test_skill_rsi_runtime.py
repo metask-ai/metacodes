@@ -27,11 +27,13 @@ class SkillRSIRuntimeTest(unittest.TestCase):
         self.path = self.root / "policy.json"
         self.path.write_bytes(stable(self.policy))
 
-    def invoke(self, prompt, flags, *, policy_path=None, turns=None):
+    def invoke(self, prompt, flags, *, policy_path=None, turns=None, preview=True):
         with SlowMockServer(turns=turns or [simple_text("done")]) as server:
             result = subprocess.run([
                 str(Path(BIN).resolve()), "--api-key", "fixture", "--base-url", server.url,
                 "--model", self.policy["model"], "--no-theme", "--no-lsp", "--no-progress-updates",
+                "--state-dir", str(self.home / ".metacodes"),
+                *(["--preview"] if preview else []),
                 "--rsi-policy", str(policy_path or self.path), *flags, "-p", prompt, "--json",
             ], cwd=self.root, env={**{k: v for k, v in os.environ.items() if k not in {"CODEX_HOME", "METACODES_HOME"}},
                                    "HOME": str(self.home), "METACODES_KG_AUTOSTART": "0"},
@@ -86,6 +88,15 @@ class SkillRSIRuntimeTest(unittest.TestCase):
         result, requests = self.invoke("count", ["--rsi"])
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(requests, [])
+
+    def test_preview_off_skips_policy_io_even_when_rsi_is_selected(self):
+        for path in (self.root / "missing.json", self.root):
+            for flags in (["--rsi"], ["--preview", "--rsi", "--no-preview"]):
+                with self.subTest(path=path, flags=flags):
+                    result, requests = self.invoke("read before editing", flags, policy_path=path, preview=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(self.notes(requests[0]), [])
 
     def test_missing_head_and_model_mismatch_abstain(self):
         for mode in ("missing_head", "model_mismatch"):

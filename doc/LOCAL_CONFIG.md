@@ -11,6 +11,7 @@ and how metacodes decides which provider to use.
 - [Names it accepts](#names-it-accepts)
 - [Which provider and model are used](#which-provider-and-model-are-used)
 - [Presets](#presets)
+- [Preview features](#preview-features)
 - [What the file cannot set](#what-the-file-cannot-set)
 - [Checking it](#checking-it)
 
@@ -47,6 +48,19 @@ metacodes reads `.env` when it starts, so start it again after an edit.
 directory or a repository, or anywhere else: any repository you clone can ship
 a `.env`, and reading it would let that repository choose which provider your
 session uses and with which key.
+
+## Preview features
+
+The unified preview setting is the root boolean `preview` in the state root's
+`config.json`, rather than a variable in `.env`. It defaults to false. Use
+`--preview` or `--no-preview` to override the saved value for an invocation;
+the last flag wins. For example, `{"preview": true}` opts into preview.
+
+HarnessMM and RSI additionally require their independent selections:
+`--harnessmm` and `--rsi --rsi-policy policy.json`. Preview alone selects
+neither. Without preview, those selections leave the ordinary model/tool
+loop in place and do not open the RSI policy or substitution journal. See
+[HarnessMM](HARNESSMM_PROTOCOL.md) and [RSI](SKILL_RSI_PROTOCOL.md).
 
 ## Writing the file
 
