@@ -47,6 +47,7 @@ from harbor.models.trajectories import (
 )
 
 from scripts.eval.harbor import command as cmd
+from scripts.eval.harbor.profiling import routed_config
 
 # Set instead of `--ak bundle=...` when every trial of a job uses one bundle.
 BUNDLE_ENV = "METACODES_HARBOR_BUNDLE"
@@ -73,6 +74,9 @@ class MetacodesAgent(BaseInstalledAgent):
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[Any] = None,
         disallowed_tools: Optional[str] = None,
+        metrics_proxy: Optional[str] = None,
+        metrics_ca: Optional[str] = None,
+        account_gateway: Optional[str] = None,
         **kwargs: Any,
     ):
         bundle_path = bundle or os.environ.get(BUNDLE_ENV)
@@ -87,6 +91,9 @@ class MetacodesAgent(BaseInstalledAgent):
         self._binary_sha256 = _sha256(self._bundle / "bin" / "metacodes")
         self._reasoning_effort = reasoning_effort
         self._max_tokens = int(max_tokens) if max_tokens is not None else None
+        self._metrics_proxy = metrics_proxy
+        self._metrics_ca = Path(metrics_ca) if metrics_ca else None
+        self._account_gateway = account_gateway
         self._disallowed_tools = (
             cmd.DEFAULT_DISALLOWED_TOOLS
             if disallowed_tools is None
@@ -141,6 +148,18 @@ class MetacodesAgent(BaseInstalledAgent):
         result = await self.exec_as_agent(environment, command=self.get_version_command())
         self._version = self.parse_version(result.stdout or "") or self._bundle_version
         await self._ensure_ca_bundle(environment)
+        if self._metrics_ca:
+            # Trust the job-local relay CA in this disposable task image.
+            # Its private key stays on the execution host. Native TLS and
+            # endpoint-policy checks remain enabled.
+            destination = "/tmp/metacodes-bench-relay-ca.pem"
+            await environment.upload_file(self._metrics_ca, destination)
+            bundles = " ".join(shlex.quote(p) for p in cmd.CA_BUNDLE_PATHS)
+            await self.exec_as_root(environment, command=(
+                f"for bundle in {bundles}; do "
+                f'if [ -f "$bundle" ]; then printf "\\n" >> "$bundle"; '
+                f'cat {shlex.quote(destination)} >> "$bundle" || exit 1; fi; done'
+            ))
 
     async def _ensure_ca_bundle(self, environment: BaseEnvironment) -> None:
         """Install the system CA bundle when the image has none.
@@ -170,6 +189,17 @@ class MetacodesAgent(BaseInstalledAgent):
         trial = uuid.uuid4().hex
         remote_instruction = f"/tmp/metacodes-instruction-{trial}.md"
         remote_config: Optional[str] = None
+        trial_name = self.logs_dir.parent.name
+        flags = list(self._flags)
+        if self._account_gateway and self._provider == "metask" and not self._metrics_proxy:
+            flags += ["--base-url", self._account_gateway]
+        if self._metrics_proxy and self._provider in (None, "metask", "anthropic"):
+            endpoint = self._metrics_proxy.rstrip("/") + "/" + trial_name
+            # Named profiles append their own protocol suffix. Only the
+            # historical model-only path takes an absolute request URL.
+            if self._provider is None:
+                endpoint += "/v1/messages"
+            flags += ["--base-url", endpoint]
         with tempfile.TemporaryDirectory(prefix="metacodes-harbor-") as scratch:
             local_instruction = Path(scratch) / "instruction.md"
             local_instruction.write_text(instruction, encoding="utf-8")
@@ -177,10 +207,10 @@ class MetacodesAgent(BaseInstalledAgent):
             config = self.config_source
             if config is not None:
                 local_config = Path(scratch) / "config.json"
-                if isinstance(config, dict):
-                    local_config.write_text(json.dumps(config), encoding="utf-8")
-                else:
-                    local_config.write_bytes(Path(config).read_bytes())
+                document = config if isinstance(config, dict) else json.loads(Path(config).read_text(encoding="utf-8"))
+                if self._metrics_proxy:
+                    document = routed_config(document, self._provider, self._metrics_proxy, trial_name)
+                local_config.write_text(json.dumps(document), encoding="utf-8")
                 remote_config = f"/tmp/metacodes-config-{trial}.json"
                 await environment.upload_file(local_config, remote_config)
         readable = [remote_instruction] + ([remote_config] if remote_config else [])
@@ -191,7 +221,7 @@ class MetacodesAgent(BaseInstalledAgent):
         script = cmd.run_command(
             state_dir=f"/tmp/metacodes-state-{trial}",
             instruction_path=remote_instruction,
-            flags=self._flags,
+            flags=flags,
             config_path=remote_config,
         )
         await self.exec_as_agent(environment, command=f"bash -c {shlex.quote(script)}")

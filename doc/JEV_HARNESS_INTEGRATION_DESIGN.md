@@ -4,8 +4,9 @@
 > 原文保留，作为 [JEV_SYSTEM_ONE.md §5](JEV_SYSTEM_ONE.md#5-与-codex-方案的融合)
 > 逐条取舍的输入。实际落地的是记忆面顾问：内核边界、shadow/advisory 两档、零重试和
 > 离线回放驱动被采纳；JevTree 图搜索、动作族评分和 bounded nudge 推迟；enforced-safe
-> 被拒绝。文中“默认 disabled”已经不成立：CLI 内置默认以 advisory 模式咨询 Jev，且只开
-> `scoped_recall` 一个面（#195、#197）。当前行为以 JEV_SYSTEM_ONE.md 为准。
+> 被拒绝。文中“默认 disabled”曾一度不成立（CLI 内置默认以 advisory 模式咨询 Jev，且只开
+> `scoped_recall` 一个面，#195、#197），#474 之后又成立了：CLI 不再取内置默认，点名服务才开启。
+> 当前行为以 JEV_SYSTEM_ONE.md 为准。
 
 原状态：设计提案。本文不改变当前运行时行为，也不把 Jev 作为默认 provider。
 

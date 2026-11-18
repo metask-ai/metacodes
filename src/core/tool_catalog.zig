@@ -527,7 +527,7 @@ pub const Selection = struct {
             .builtin => |builtin| {
                 try tools.validateRequired(builtin.name, args);
                 try tools.validateTypes(builtin.name, args);
-                return .{ .ok = try builtin.execute.run(tool_ctx, args) };
+                return .{ .ok = try builtin.run(tool_ctx, args) };
             },
             .host_sync => |host| {
                 // Identity is admission-fixed and passed by value; a selected

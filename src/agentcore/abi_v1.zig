@@ -4415,6 +4415,7 @@ const ForkExecutorContext = struct {
             abort,
             self.activation.rendered_body,
             .{
+                .preview = self.session.runtime.preview,
                 .max_turns = self.max_turns,
                 // A Skill invocation Run ends with its child's stop reason, so
                 // the child's failure is the Run's. A model-invoked fork's is a
@@ -4989,7 +4990,7 @@ fn runtimeErrorStatus(err: anyerror) u32 {
         err == error.TooManyServices)
         wire.STATUS_RESOURCE_LIMIT
     else if (err == error.UnknownBuiltinTool or err == error.UnsupportedBuiltinTool or
-        err == error.ToolDependencyUnavailable or
+        err == error.ToolDependencyUnavailable or err == error.PreviewFeatureDisabled or
         err == error.DuplicateToolName or err == error.InvalidHostTool or
         err == error.InvalidPackageRoot or err == error.PackageRootSymlink or
         err == error.PackageManifestMissing or err == error.PackageManifestUntrusted or
@@ -5789,7 +5790,7 @@ fn runtimeCreateImpl(
     emptyError(out_error);
     const config = config_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "runtime config is required", out_error);
     const out = out_runtime orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_runtime is required", out_error);
-    if (config.struct_size != @sizeOf(wire.RuntimeConfigV1) or config.reserved0 != 0 or !allZero(config.reserved))
+    if (config.struct_size != @sizeOf(wire.RuntimeConfigV1) or config.reserved0 != 0 or config.preview > 1 or !allZero(config.reserved))
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid RuntimeConfigV1", out_error);
 
     var scratch = std.heap.ArenaAllocator.init(allocator);
@@ -5949,6 +5950,7 @@ fn runtimeCreateImpl(
         .process_plugins = process_plugins,
         // Issue #277: nonzero admits the team tools into the catalog.
         .enable_teams = config.enable_teams != 0,
+        .preview = config.preview == 1,
     }) catch |err| {
         // 依赖缺失是宿主可修复的部署问题:诊断必须直接说明缺什么、怎么给。
         if (err == error.ToolDependencyUnavailable)

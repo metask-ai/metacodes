@@ -12,6 +12,7 @@ benchmark's pinned Harbor fork and its local proxy.
 | `metacodes_agent.py` | `MetacodesAgent`, the Harbor `BaseInstalledAgent` |
 | `command.py` | Harbor-free core: bundle check, model split, the trial script, trace → ATIF |
 | `smoke.py`, `smoke_provider.py`, `fixtures/smoke-task/` | zero-cost end-to-end smoke through the real `harbor run` |
+| `viewer/` | read-only web page over Harbor job directories ([viewer/README.md](viewer/README.md)) |
 
 Contract tests: `scripts/eval/tests/test_harbor_adapter.py` (part of
 `zig build test:product`).
@@ -90,6 +91,9 @@ Agent options (`--ak name=value`):
 | `reasoning_effort` | the model's default | `--reasoning-effort`: `none` … `max` |
 | `max_tokens` | the model's default | `--max-tokens` |
 | `disallowed_tools` | `Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage,EnterPlanMode,ExitPlanMode` | `--disallowed-tools`; an empty value enables every tool |
+| `metrics_proxy` | none | workbench-owned relay URL for request-level TTFT/TPS; payloads are forwarded unchanged |
+| `metrics_ca` | none | public relay CA file; trusted only inside the disposable task container |
+| `account_gateway` | none | account session's gateway origin; used by the Metask route when no timing relay is active |
 
 ### A third-party gateway
 
@@ -128,10 +132,28 @@ the first request. `dialect` names the vendor whose request parameters the
 model takes (`glm`, `deepseek`, `kimi`, `qwen`, ...). Check the definition
 offline with `metacodes --state-dir <dir with config.json> --check-providers`.
 
+In third-party provider mode, the workbench model menu enumerates the
+`models` in this configuration; it does not automatically import all models
+from a gateway. [examples/tokenjoy-coding.json](examples/tokenjoy-coding.json)
+declares six coding-model choices across Chat Completions, Responses, and
+Anthropic Messages. They use the same credential environment variable.
+The 200K context / 32K output values are conservative benchmark ceilings,
+not claims about provider maxima. A model being listed or passing offline
+route validation does not establish a benchmark result or live compatibility.
+
+The workbench defaults to the Metask account selected by `metacodes login`.
+Its model list uses the current CLI session's gateway and bearer. Legacy
+account logins combine all active keys/model groups; each launch uses the
+chosen model's matching credential. Existing
+gateway configurations stay in provider mode until `metacodes bench --auth
+metask` is selected; see [account configuration](../../../doc/BENCH_WORKBENCH.md#configure-execution).
 ## Smoke
 
 ```sh
 python3 -m scripts.eval.harbor.smoke --bundle /path/to/metacodes-<version>-x86_64-linux-gnu
+# Verify the HTTPS timing relay, still using the local scripted provider:
+python3 -m scripts.eval.harbor.smoke --bundle /path/to/bundle --profile
+python3 -m scripts.eval.harbor.smoke --bundle /path/to/bundle --metask-route
 ```
 
 It starts a scripted Anthropic-Messages endpoint on the Docker bridge
@@ -140,6 +162,9 @@ It starts a scripted Anthropic-Messages endpoint on the Docker bridge
 config pointing at it, and passes only if the endpoint saw its two scripted
 requests, the verifier gave reward 1, and the trajectory holds the Bash call
 and its result. No credential, no provider request.
+`--profile` also checks two complete TTFT/usage records; `--metask-route`
+exercises the built-in Metask route with a fake credential. Both use a
+job-local TLS CA and keep native certificate verification enabled.
 
 ## Leaderboards
 

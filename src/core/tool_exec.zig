@@ -89,6 +89,8 @@ pub const Slot = struct {
     name: []const u8, // borrowed(指向 conversation 的 tool_use)
     id: []const u8, // borrowed
     input: []const u8, // borrowed
+    /// Canonical arguments (including PreToolUse rewrites), owned by this slot.
+    admitted_input: ?[]u8 = null,
     /// 执行后填:成功内容 或 错误内容(均 owned by caller allocator)。
     content: ?[]u8 = null,
     /// Sealed handle published at the batch commit boundary; deinit discards
@@ -126,6 +128,8 @@ pub const Slot = struct {
     /// agent_loop 用单个 defer 遍历调用,覆盖**所有**退出路径(正常/挂起/fatal/错误);
     /// 已转移 ownership 的字段(takeContent 置 null)天然跳过。
     pub fn deinit(self: *Slot, allocator: std.mem.Allocator) void {
+        if (self.admitted_input) |input| allocator.free(input);
+        self.admitted_input = null;
         self.sealed.deinit();
         if (self.content) |c| allocator.free(c);
         self.content = null;
@@ -957,6 +961,11 @@ pub fn executeOne(
     else
         tools_mod.dispatch(&job_ctx, name, input)) catch |err| {
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+        // A nested host/formal failure is control flow, including inside JS.
+        if (err == error.HostToolFatal) {
+            _ = dispatch_observation.finish(.host_fatal, "HostToolFatal", null);
+            return hostFatalResult(&change_collector);
+        }
         if (err == error.OutOfMemory) {
             if (!dispatch_observation.finish(.host_fatal, @errorName(err), null))
                 return hostFatalResult(&change_collector);

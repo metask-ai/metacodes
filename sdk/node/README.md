@@ -27,6 +27,11 @@ The API key comes from `apiKey`, else the provider's usual variable
 `METACODES_API_KEY`. `baseUrl` is the full endpoint; empty means the
 provider's official one.
 
+Preview features default to disabled. `new metacodes.Runtime({ preview: true })`
+opts in and includes the `ExecuteCode` JavaScript orchestration tool; Session
+tool selection and ordinary permission checks still apply. Selecting
+`ExecuteCode` with preview disabled is rejected. This requires AgentCore ABI revision 29.
+
 ## Tools written in JavaScript
 
 ```js

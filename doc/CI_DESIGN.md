@@ -21,7 +21,7 @@ conditions, never by skipping a job, for two reasons:
 - A workflow `paths` filter leaves the check pending the same way, which is
   how doc-only PRs were blocked in #134.
 
-Three switches decide which steps run. Each one fails open: an empty value,
+The switches below decide which steps run. Each one fails open: an empty value,
 meaning its decision job failed, runs the step.
 
 | Switch | Decided by | Effect |
@@ -29,6 +29,8 @@ meaning its decision job failed, runs the step.
 | `FAST_PATH` | `Release fast path` job (`scripts/release_fast_path.py`) | `true` for a generated release or reopen bump over a green base: only the checkout and the version state gate run ([RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md) §3). |
 | `SUITES` | `Change scope` job (`scripts/ci_scope.py`) | `false` for a documentation-only change: the POSIX `checks` legs run only the documentation, version-state and gate-manifest checks, the other gate legs only check out, and the Windows legs run nothing. |
 | `TTY` | `Change scope` job | `false` for a change confined to documentation and the evaluation harness: the TTY shards run nothing. The `SDK bindings` jobs read the same output as `SDK`. They are not required, but they report the same way, so they can become required without holding such PRs. Those jobs also rehearse a formal AgentCore release on the real build ([RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md) §2a). |
+| `DOC_REFERENCES` | `Change scope` job | Runs protocol path/pin validation on the Linux checks leg when a protocol-listed path changes, or the protocol's documentation path list changes. |
+| `RELEASE_DOCS` | `Change scope` job | Runs documents-only release staging, byte/inventory verification and notices checks on the Linux checks leg when a source in `release/documents.json` changes. Only this leg installs Zig for a narrow release-document change; it builds no application or Lean kernel. |
 
 `scripts/tests/test_ci_scope.py` pins the wiring:
 
@@ -43,28 +45,58 @@ meaning its decision job failed, runs the step.
 
 `scripts/ci_scope.py` compares the changed paths against a base. On a pull
 request the base is `HEAD^1`, the first parent of the merge commit CI tests.
-In a merge queue group it is the group's `base_sha`. Renames count as a delete
-plus an add, so moving a file out of `doc/` is a code change.
+In a legacy merge queue group it is the group's `base_sha`. Renames count as a delete
+plus an add. A move remains documentation when both paths are document
+inputs; moving into a code/input tree takes the wider scope.
 
 | Scope | Every changed path is | What runs |
 |---|---|---|
-| `docs` | `doc/**`, or a top-level `*.md` other than the three the release layout installs, added or edited (not removed or changed in type) | Documentation link and fact checks, their unit tests, the gate-manifest test, the version state gate and the diff check |
+| `docs` | `doc/**`, top-level `*.md`, release-document sources, plus protocol edits limited to documentation paths; additions, edits and deletions | Documentation links/facts, their tests, gate manifest, version state and whitespace; independently selected protocol references and release-document checks |
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `full` | anything else | Everything |
 
 Manual runs are always `full`, and so are an empty diff and any error.
 Neither CI workflow runs on ordinary pushes to main.
 
-The boundaries are deliberately narrow:
+The scope step writes a **CI change attribution** job summary: the base,
+event, effective scope, reason, planned checks and a status/path/scope table.
+The decision considers every changed path; the table displays at most 200.
+A path's narrow scope does not override a wider scope required by another
+path or by unavailable attribution inputs. This is a plan, not test-result evidence.
 
-- **`README.md`, `CHANGELOG.md` and `THIRD_PARTY_NOTICES.md` are not
-  documentation for this purpose.** `build.zig` installs all three into the
-  release layout, and `gen_third_party_notices.py --check` regenerates the
-  notices. A test checks the list against `build.zig`.
-- **Removing or moving a documentation file is a code change.** Other files
-  pin doc paths: `evals/plugin-v1/protocol.json` lists some in
-  `implementation_paths`, which `zig build test` resolves. Adding or editing
-  a doc file is harmless, because that fingerprint is stale by design.
+`agentcore-windows.yml` keeps its native-gate path filter for pull requests
+and legacy merge groups. Required jobs
+continue reporting under their existing names; a missing scope output runs
+the expensive steps.
+
+The document checks have separate boundaries:
+
+- **Links and documented facts.** These existing cheap checks run on every
+  documentation change, including deletion and relocation, and catch broken
+  backlinks and fact registrations.
+- **Protocol references.** A change to a path named in
+  `evals/plugin-v1/protocol.json` runs
+  `python3 scripts/eval/plugin_release_gate.py --validate-only`
+  (`zig build doc:references`). This checks regular paths, schema and
+  candidate/scenario/evaluator pins without a product build or provider
+  request. The implementation fingerprint remains stale between freezes by
+  design. A protocol edit can stay in `docs` only when its parsed before/after
+  values differ solely in documentation entries of `implementation_paths`;
+  non-document paths, budgets, runtime pins and all other fields must retain
+  their values and types. Other protocol edits keep the evaluation suites.
+- **Release documents.** `release/documents.json` is shared by
+  `release:stage` and `release:docs`. The latter copies only those documents
+  and licences. `zig build release:docs:check --prefix <empty-directory>`
+  additionally checks generated notices and verifies that each installed byte
+  matches its source, the versioned changelog name is correct, and the prefix
+  contains exactly the document inventory. README, changelog, notices and
+  listed licence changes trigger this check without compiling binaries.
+- **Type changes and unknown metadata.** A file changed into a symlink, an
+  unreadable source manifest or an unclassifiable protocol edit takes the
+  full scope. The check scripts and manifest definitions themselves take the
+  full scope when changed.
+
+The remaining boundaries are deliberately narrow:
 - **Markdown outside `doc/` and the top level is an input.** Prompt templates
   are `@embedFile`'d, and agent and Skill fixtures are read by tests.
 - **The evaluation harness keeps the gates.** `zig build test` runs its suites

@@ -32,8 +32,7 @@ jobs:
   # below report success without running the suites again: their steps check
   # FAST_PATH, except the checkouts and the version state gate in the
   # `checks` legs.
-  # Every other PR, every manual run, and every doubt (the script never fails the
-  # job; an error decides the full path) runs everything.
+  # Other changes use the scope below; every doubt runs the affected suites.
   # doc/RELEASE_AUTOMATION_DESIGN.md §3, "CI fast path".
   release-fast-path:
     name: Release fast path
@@ -87,11 +86,15 @@ jobs:
     name: Change scope
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       scope: ${{ steps.decide.outputs.scope }}
       suites: ${{ steps.decide.outputs.suites }}
       tty: ${{ steps.decide.outputs.tty }}
       reason: ${{ steps.decide.outputs.reason }}
+      doc_references: ${{ steps.decide.outputs.doc_references }}
+      release_docs: ${{ steps.decide.outputs.release_docs }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -149,6 +152,8 @@ jobs:
       # then are the checkout, the version state gate and the documentation
       # and gate-manifest checks (scripts/tests/test_ci_scope.py pins the list).
       SUITES: ${{ needs.scope.outputs.suites }}
+      DOC_REFERENCES: ${{ needs.scope.outputs.doc_references }}
+      RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
       # The suite steps' build runner jobs; see "Offline test suite" below.
       ZIG_BUILD_JOBS: "8"
       # The release layout splits the Linux executable's debug symbols into
@@ -176,7 +181,7 @@ jobs:
       # one full run of these gates produces). cache-key: each leg builds a
       # different share of the graph, so each keeps its own cache line.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
         with:
           version: 0.16.0
           use-cache: true
@@ -484,8 +489,17 @@ jobs:
             python3 scripts/check_binary_baseline.py --target "$target" "$RUNNER_TEMP/baseline-$target/bin/metacodes"
           done
       - name: Third-party notices check
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.RELEASE_DOCS != 'false'
         run: python3 scripts/gen_third_party_notices.py --check
+      - name: Protocol document references
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.DOC_REFERENCES != 'false'
+        run: python3 scripts/eval/plugin_release_gate.py --validate-only
+      - name: Release document package check
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.RELEASE_DOCS != 'false'
+        run: zig build release:docs:check --prefix "$RUNNER_TEMP/release-documents" --summary all
+      - name: Release document check unit tests
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.RELEASE_DOCS != 'false'
+        run: python3 -m unittest scripts.tests.test_check_release_docs -v
       - name: Documentation fact check
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 scripts/check_doc_facts.py
@@ -493,7 +507,7 @@ jobs:
         if: matrix.checks && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_check_doc_facts -v
       - name: Third-party notices unit tests
-        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.RELEASE_DOCS != 'false'
         run: python3 -m unittest scripts.tests.test_gen_third_party_notices -v
       - name: Gate manifest unit tests
         if: matrix.checks && env.FAST_PATH != 'true'
@@ -570,6 +584,8 @@ jobs:
     env:
       FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
       SUITES: ${{ needs.scope.outputs.suites }}
+      DOC_REFERENCES: ${{ needs.scope.outputs.doc_references }}
+      RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
       # Two per core, as on Linux, would overlap more LLVM builds than the
       # runner's 7 GB hold (the app and the drivers peak at 1 to 2 GB each).
       ZIG_BUILD_JOBS: "6"

@@ -3,9 +3,10 @@
 //!
 //! Three layers, each field taken from the highest one that sets it:
 //!
-//! 1. The built-in default (`BUILTIN_DEFAULT`), when the host asks for it.
-//!    The CLI does; library embedders and in-process tests do not, so a host
-//!    that never opted in never sends a session's state anywhere.
+//! 1. The built-in default (`BUILTIN_DEFAULT`), when the host asks for it
+//!    (`Config.jev_builtin_default`). The CLI does not (`CLI_USES_BUILTIN_DEFAULT`,
+//!    #474), and neither do library embedders or in-process tests, so a
+//!    session's state goes nowhere unless layer 2 or 3 names a service.
 //! 2. The install's `<state root>/config.json`, under `jev`:
 //!
 //!        "jev": { "url": "http://host:10420", "mode": "shadow", "timeout_ms": 2500,
@@ -134,11 +135,24 @@ pub const Raw = struct {
     }
 };
 
-/// The service the CLI uses when neither config.json nor the environment
-/// names one: the team's metask-jev-4b on the Kunshan GPU host. Plain HTTP
-/// over the public network — the state it judges (a redacted window of the
-/// session) travels unencrypted; point `url` elsewhere, or empty it, to stop
-/// that.
+/// The service a host gets when it sets `Config.jev_builtin_default` and
+/// neither config.json nor the environment names one: the team's
+/// metask-jev-4b on the Kunshan GPU host.
+///
+/// **No host in this repository takes it.** The CLI did, until #474: with
+/// nothing configured, every session whose TinyKG store held a matching
+/// memory sent a redacted window of the session (the first 400 bytes of the
+/// request and up to eight 480-byte memory excerpts) to this address. It is
+/// plain HTTP to an IP literal over the public network, so the window travels
+/// unencrypted to a host with no TLS identity, and the user was never asked.
+/// A host that sets the flag takes all of that with it; the CLI now leaves the
+/// service to whoever names it in config.json or `METACODES_JEV_URL`
+/// (`CLI_USES_BUILTIN_DEFAULT`). The constant stays for embedders that choose
+/// the team's service on purpose and for the equivalent configuration in
+/// doc/JEV_SYSTEM_ONE.md §7, which a machine can write down once.
+/// `scripts/tests/test_builtin_egress_discipline.py` fails when a host in this
+/// repository takes it while the URL is a non-loopback `http://` one, and when
+/// any other cleartext public destination is compiled into the product.
 ///
 /// Only `scoped_recall` is advised: it is the one surface the paired pilots
 /// found worth having (doc/JEV_SYSTEM_ONE.md §7). The `KgRecall` annotation
@@ -152,6 +166,12 @@ pub const BUILTIN_DEFAULT: Raw = .{
     .model = "metask-jev-4b",
     .decisions = "scoped_recall",
 };
+
+/// Whether a CLI session takes `BUILTIN_DEFAULT` when nothing configures the
+/// advisor: no (#474). `main` hands it to `Config.jev_builtin_default` and
+/// `metacodes doctor` resolves with it, so what doctor reports is what a
+/// session does (doctor once carried its own `true`).
+pub const CLI_USES_BUILTIN_DEFAULT = false;
 
 pub const CONFIG_KEY = "jev";
 const MAX_CONFIG_BYTES: usize = 1 << 20;

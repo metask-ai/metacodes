@@ -145,7 +145,7 @@ See [PLUGIN_ARCHITECTURE](doc/PLUGIN_ARCHITECTURE.md),
 | Surface | Use it from |
 |---|---|
 | `metacodes-core` Zig module | Zig hosts on the same toolchain; `zig build example` runs [example/main.zig](example/main.zig) |
-| AgentCore C ABI v1 revision 28 | C, C++, Zig and Rust bindings ship in [sdk/](sdk/README.md); JNA, .NET P/Invoke and any other FFI load the shared library |
+| AgentCore C ABI v1 revision 29 | C, C++, Zig and Rust bindings ship in [sdk/](sdk/README.md); JNA, .NET P/Invoke and any other FFI load the shared library |
 | Python and Node packages | `import metacodes` / `require('metacodes')`: Runtime, Session, streaming events, tools written in Python or JavaScript ([sdk/python](sdk/python/README.md), [sdk/node](sdk/node/README.md); experimental) |
 | Headless `-p --json` / `--stream-json` | Any language that can spawn a process and read NDJSON |
 | `serve` daemon (HTTP and UDS, multi-session) and `--web` | Services, desktop apps, remote UIs |
@@ -239,12 +239,14 @@ This is the research frontier of the project and an open invitation.
   model output is classified as commentary, final, continued, partial or
   discarded.
 
-> **Privacy note.** By default the CLI consults Jev, Metask's small decision
-> model, to re-rank automatic memory recall. Each consult sends the current
-> request (at most 400 bytes) and up to eight redacted memory excerpts over
-> plain HTTP to a Metask-hosted server. Set `METACODES_JEV_URL=off` or
-> `"jev": false` in the config to turn it off. Embedded AgentCore runtimes do
-> not use it unless the host opts in. See
+> **Privacy note.** The CLI sends nothing to a Jev server unless you name
+> one. Jev is Metask's small decision model; it can re-rank automatic memory
+> recall. Once you set `"jev": {"url": "https://…"}` in the state root's
+> `config.json` (or `METACODES_JEV_URL`), each consult sends the current
+> request (at most 400 bytes) and up to eight redacted memory excerpts to that
+> service, over the scheme you wrote, so use `https://` or a loopback address.
+> `metacodes doctor` shows `jev_advisor off` until then. Embedded AgentCore
+> runtimes do not use it unless the host opts in. See
 > [doc/JEV_SYSTEM_ONE.md](doc/JEV_SYSTEM_ONE.md).
 
 ## Quick start

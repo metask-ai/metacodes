@@ -248,6 +248,7 @@ pub const TeammateEntry = struct {
 
 /// spawn 参数(borrowed;registry 内部 dupe)。
 pub const SpawnTeammateParams = struct {
+    preview: bool = false,
     /// 未清洗的期望名(内部 sanitize;重名由调用方[SW2 工具层]先做后缀去重)。
     name: []const u8,
     /// 已清洗 team 名(config.json 必须已存在——TeamCreate 先行)。
@@ -291,6 +292,7 @@ pub const SpawnTeammateParams = struct {
 /// 线程拥有的输入(dupe 自 params;线程结束自行 cleanup)。
 const TeammateInput = struct {
     allocator: std.mem.Allocator,
+    preview: bool,
     entry: *TeammateEntry,
     prompt: []u8,
     session: session_id_mod.SessionId,
@@ -876,6 +878,7 @@ pub const TeammateRegistry = struct {
 
         input.* = .{
             .allocator = a,
+            .preview = p.preview,
             .entry = entry,
             .prompt = prompt_owned,
             .session = p.session,
@@ -1432,6 +1435,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
     // (teammates=null 无 registry;两串是借用,deinit 会误 free)。
     var teammate_sw = @import("context.zig").SwarmContext{
         .allocator = a,
+        .preview = input.preview,
         .session = input.session,
         .lease = e.agent_ident,
         .state_root = input.state_root,
@@ -1473,6 +1477,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
             &ctx_override,
             .{
                 .max_turns = if (input.max_turns_per_run > 0) input.max_turns_per_run else 20,
+                .preview = input.preview,
                 .session = input.session,
                 .system_prompt = if (input.system_prompt.len > 0) input.system_prompt else null,
                 .abort = &e.abort,
