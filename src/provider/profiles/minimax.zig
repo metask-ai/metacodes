@@ -132,6 +132,35 @@ const ENV_ALIASES = [_]profile.EnvAlias{
     .{ .name = "MINIMAX_API_KEY", .kind = .api_key, .canonical = true },
 };
 
+/// Where a key is created, one page per platform (opened 2026-11-17: the
+/// older `platform.minimaxi.com/user-center/basic-information/interface-key`
+/// and `platform.minimax.io/user-center/…` addresses now lead to these). The
+/// two platforms are separate accounts, so each page checks against its own
+/// model listing: 401 without a valid key (`login fail … (1004)`,
+/// 2026-11-17), and not a model call.
+const KEY_PAGES = [_]profile.KeyPage{
+    .{
+        .id = Slug.lit("cn"),
+        .label = "China · MiniMax API Platform",
+        .url = "https://platform.minimax.cn/console/keys",
+        .check_url = CN_OPENAI_BASE ++ "/models",
+        .region = "cn",
+    },
+    .{
+        .id = Slug.lit("global"),
+        .label = "Global · MiniMax API Platform",
+        .url = "https://platform.minimax.io/console/keys",
+        .check_url = GLOBAL_OPENAI_BASE ++ "/models",
+        .region = "global",
+    },
+};
+
+const KEY_SETUP = profile.ApiKeySetup{
+    .kind = .api_key,
+    .pages = &KEY_PAGES,
+    .note = "The China (minimax.cn) and Global (minimax.io) platforms are separate accounts: a key works only on the platform that issued it.",
+};
+
 pub const PROFILE = profile.ProviderProfile{
     .id = Slug.lit("minimax"),
     .implementation_id = Slug.lit("minimax"),
@@ -142,7 +171,21 @@ pub const PROFILE = profile.ProviderProfile{
     .env_aliases = &ENV_ALIASES,
     .auth = .bearer,
     .default_channel = Slug.lit("cn-openai"),
+    .api_key_setup = KEY_SETUP,
 };
+
+test "minimax profile: each platform's key page checks against that platform's model listing" {
+    try profile.validateProfile(PROFILE);
+    const default = PROFILE.defaultKeyPage(PROFILE.default_channel).?;
+    try std.testing.expectEqualStrings("cn", default.id.slice());
+    try std.testing.expectEqualStrings("https://api.minimax.cn/v1/models", default.check_url.?);
+    const global = PROFILE.defaultKeyPage(Slug.lit("global-anthropic")).?;
+    try std.testing.expectEqualStrings("https://platform.minimax.io/console/keys", global.url);
+    try std.testing.expectEqualStrings("https://api.minimax.io/v1/models", global.check_url.?);
+    for (CHANNELS) |channel| {
+        try std.testing.expectEqualStrings(channel.region.?, PROFILE.defaultKeyPage(channel.id).?.region.?);
+    }
+}
 
 test "minimax profile: China and global, each route declaring the MiniMax dialect" {
     try profile.validateProfile(PROFILE);

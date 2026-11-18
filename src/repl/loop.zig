@@ -3176,10 +3176,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             // No grant to run, but a page to create a key on: the user pastes
             // the key here (`ProviderProfile.api_key_setup`).
             if (profile.api_key_setup != null) {
-                if (named) |name| if (profile.matchesName(name)) {
-                    start_at = dialog.choices_len;
-                };
-                dialog.add(.{ .profile = profile, .method = .api_key });
+                offerLogin(&dialog, &start_at, named, .{ .profile = profile, .method = .api_key });
                 continue;
             }
             if (named) |name| if (profile.matchesName(name)) {
@@ -3188,10 +3185,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             };
             continue;
         };
-        if (named) |name| if (profile.matchesName(name)) {
-            start_at = dialog.choices_len;
-        };
-        dialog.add(.{ .profile = profile, .method = .{ .flow = flow } });
+        offerLogin(&dialog, &start_at, named, .{ .profile = profile, .method = .{ .flow = flow } });
     }
     if (named) |name| if (start_at == null) {
         cmd_output.print("{s}Unknown provider '{s}'{s}\n", .{ th.danger, name, th.reset });
@@ -3207,6 +3201,12 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         .signed_in, .key_stored => |label| {
             if (dialog.outcome == .key_stored) {
                 cmd_output.print("Stored the key for {s} · /model to choose a model\n", .{label});
+                // A key variable in the shell or `.env` is read before the
+                // stored key: say which, by name.
+                var notice_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+                if (app.storedKeyShadowNotice(dialog.chosenProfile(), &notice_buf)) |notice| {
+                    cmd_output.print("{s}{s}{s}\n", .{ th.warn, notice, th.reset });
+                }
             } else {
                 cmd_output.print("Signed in to {s} · /model to choose a model\n", .{label});
             }
@@ -3217,6 +3217,17 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             };
         },
     }
+}
+
+/// Offer one provider in `/login`'s list. The one `/login <id>` named is
+/// held even past the rows the list shows (`LoginDialog.addNamed`), and
+/// `start_at` takes its index.
+fn offerLogin(dialog: *dialogs.LoginDialog, start_at: *?usize, named: ?[]const u8, choice: dialogs.LoginDialog.Choice) void {
+    if (named) |name| if (choice.profile.matchesName(name)) {
+        start_at.* = dialog.addNamed(choice);
+        return;
+    };
+    dialog.add(choice);
 }
 
 /// `/login` (#485, #527): the Metask browser sign-in, or with `device_code`

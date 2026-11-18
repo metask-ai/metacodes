@@ -128,13 +128,16 @@ separate runners; `zig build test` is exactly those three, so a new check
 goes into one of them, and a new CI step names its leg (`doc/CI_DESIGN.md`
 §4, "Where a new check goes"). The one exception is a release or
 reopen PR that adds only `scripts/release_cut.py`'s generated bump to a base
-whose full CI passed: it takes the CI fast path
+whose complete CI coverage passed: it takes the CI fast path
 (`doc/RELEASE_AUTOMATION_DESIGN.md` §3). A change confined to documentation,
 or to documentation and the evaluation harness, skips the CI suites it cannot
 affect (`scripts/ci_scope.py`). CI runs once per PR revision on Linux x86_64,
 macOS ARM64 and Windows x86_64; main pushes do not repeat it. Linux ARM64,
 Intel macOS and Windows ARM64 cross-build checks run in the release workflow
 (`doc/CI_DESIGN.md` §3); keep lightweight target-contract fixtures in PR CI.
+Document deletions/moves use link and protocol-reference checks;
+release-document changes use `release:docs:check`, which shares the release
+copy steps without compiling the product.
 The local `gate:pr` checklist above remains unchanged. Run the full suite with
 `-Doptimize=ReleaseSafe` as well when a change touches unsafe code or an ABI.
 
