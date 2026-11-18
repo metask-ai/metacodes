@@ -61,7 +61,16 @@ def main():
             assert remote.returncode == 0, remote.stderr
             assert json.loads(remote.stdout)['can_run']
             assert json.loads(invoke(['stop', '--json']))['stopped']
-            print('bench CLI smoke: extraction, info/list, service reuse, remote client, run/wait and result link passed (paid=0)')
+            status = json.loads(invoke(['db', 'status', '--json']))
+            assert status['format'] == 'SQLite' and status['counts']['trials'] == 1, status
+            assert status['location'] == str((state / 'bench/bench.sqlite3').resolve()), status
+            copy = root / 'copy.sqlite3'
+            moved = json.loads(invoke(['db', 'migrate', '--to', str(copy), '--switch', '--json']))
+            assert moved['switched'] and moved['tables']['trials']['verified'] == 1, moved
+            assert json.loads(invoke(['db', 'status', '--json']))['location'] == str(copy.resolve())
+            invoke(['db', 'status', '--store-postgres', 'postgresql://u:secret@db/bench'], expected=1)
+            print('bench CLI smoke: extraction, info/list, service reuse, remote client, run/wait, result link '
+                  'and evaluation database status/migrate passed (paid=0)')
         finally:
             if ready.exists():
                 record = json.loads(ready.read_text())

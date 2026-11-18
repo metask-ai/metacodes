@@ -13,6 +13,7 @@ metacodes bench --no-open               # print the workbench link
 metacodes bench info                    # dependencies, models and readiness
 metacodes bench list --json             # previous jobs and results
 metacodes bench stop                    # stop HTTP service; workers continue
+metacodes bench db status               # evaluation database: SQLite or PostgreSQL
 metacodes bench run --task fix-git --task cancel-async-tasks --wait
 ```
 
@@ -154,7 +155,7 @@ token sums report their coverage so missing data cannot look like zero cost.
 
 ### Data storage
 
-All results are ordinary files on the execution machine:
+Harbor writes each run as ordinary files on the execution machine:
 
 ```text
 <jobs-dir>/
@@ -168,11 +169,83 @@ All results are ordinary files on the execution machine:
       verifier/                   # reward, test output, CTRF report
 ```
 
-The overview displays the configured absolute jobs path. The workbench does
-not require a database and does not sync these run files back to a developer
-checkout. Keep this jobs directory when moving or backing up the workbench;
-the state root's `bench/` directory separately holds service settings and its
-private authorization receipt.
+The page reads the [evaluation database](#evaluation-database), which holds
+all of these files and the values computed from them. The overview shows the
+database and the synced jobs directories. Run files are not synced back to a
+developer checkout.
+
+### Evaluation database
+
+Every job directory and launch record is copied into one database: SQLite by
+default (`<state root>/bench/bench.sqlite3`, beside `workbench.json`, with
+the same `--state-dir`/`METACODES_HOME` rules) or a remote PostgreSQL. The
+service syncs its jobs directory when it starts, every ten seconds, and
+before API reads (at most once every two seconds). The worker also syncs its
+job every 15 seconds during a run and does a final, content-verified sync
+before it writes the finished receipt. Ingestion is idempotent. Only files
+whose size or mtime changed are read again, so a job that is still running
+can be ingested safely. A partially written file is replaced on the next
+pass. Symlinks are never followed.
+
+| Layer | Tables | Content |
+|---|---|---|
+| raw | `blobs`, `files`, `runs` | Every file of every job (trajectories, NDJSON, stderr, verifier output, CTRF, request metrics, results), stored as zlib-compressed blobs keyed by SHA-256 of the content, with path, size and mtime; launch receipts with their spec and worker log |
+| normalized | `jobs`, `trials`, `requests`, `usage_events`, `verifier_tests` | Model, dataset, status (enum), reward, tokens, cost and its source, TTFT/TPS, phase seconds, per-request timing/usage, per-event usage and full verifier messages, all queryable with SQL |
+| projection | `jobs.header_json`, `trials.row_json`, `trials.detail_json` | Exactly what the page shows, computed by the viewer's file projection from the stored bytes |
+
+Projections are recomputed from the stored bytes when either the bytes or
+the projection code changes. Metric definitions therefore stay identical to
+a live jobs directory: the contract test compares every view, CSV and
+summary from files with the same view from the database, also after the files
+are deleted. CHECK and foreign-key constraints reject unknown statuses,
+scored trials without a reward, costs whose source contradicts them, and
+dangling rows. Each schema change is a numbered migration recorded in
+`schema_migrations`. A database whose schema is newer than the binary is
+refused. Files larger than 256 MiB are recorded with size and mtime, but
+their content is not stored.
+
+```sh
+metacodes bench db status                       # backend, schema, row counts
+metacodes bench db import --jobs-dir ~/harbor-runs   # add historical jobs
+metacodes bench db migrate --to postgresql://bench@db:5432/bench \
+  --password-env BENCH_PG_PASSWORD --switch
+metacodes bench db migrate --to ~/bench-copy.sqlite3   # PostgreSQL -> SQLite
+```
+
+`db import` does not change the workbench's configured jobs directory. A
+job name that is already stored from another existing directory is skipped.
+`--verify` re-reads every file by content.
+
+`db migrate` copies everything from the active database to the target, in
+either direction. It reads the source in one snapshot and commits the target
+in batches, so an interrupted migration resumes when run again. Rows already
+present and identical are skipped. If the target holds a different row under
+the same key, the command stops before writing and changes nothing. After
+the copy, every source row is compared with the target, and every target blob
+is re-hashed. The command reports row counts per table. `--switch` then
+writes the target into `workbench.json`; restart the service with
+`metacodes bench stop && metacodes bench`. A new `metacodes bench` replaces
+a running service that uses a different database.
+
+Choose the database directly with `--store-sqlite PATH` or
+`--store-postgres DSN [--store-password-env NAME]`, on any `metacodes bench`
+command. Each is saved in `workbench.json` as follows:
+
+```json
+{"store": {"backend": "sqlite", "path": "/abs/bench.sqlite3"}}
+{"store": {"backend": "postgres", "dsn": "postgresql://bench@db:5432/bench",
+           "password_env": "BENCH_PG_PASSWORD"}}
+```
+
+A DSN containing a password is refused. The password comes from the named
+environment variable, or from libpq's `PGPASSWORD`/`~/.pgpass`. It never
+enters `workbench.json`, a run spec, or the browser. PostgreSQL needs
+psycopg 3 in the Python that runs bench
+(`python3 -m pip install 'psycopg[binary]'`). It is imported only when a
+PostgreSQL store is configured; SQLite needs only the standard library.
+Keep the database (or the jobs directory) when moving or backing up the
+workbench. The state root's `bench/` directory also holds service settings
+and the private authorization receipt.
 
 - **新建评测:** choose a configured model and 1–20 Terminal-Bench 2.1 tasks;
   each task runs 1–5 times, with concurrency 1–3. The suggested task names are

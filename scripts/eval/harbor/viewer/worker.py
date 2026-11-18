@@ -13,6 +13,7 @@ from pathlib import Path
 from scripts.eval.harbor.viewer.runner import atomic_json, now, runtime_env
 from scripts.eval.harbor.viewer.account import Account
 from scripts.eval.harbor.profiling import TimingRelay, auth_for, upstream_for
+from scripts.eval.harbor.store.ingest import WorkerSync
 
 
 def command(spec):
@@ -65,6 +66,9 @@ def main(argv=None):
     atomic_json(record_path, record)
     process = None
     relay = None
+    # Ingests the job into the evaluation store while it runs and at the end.
+    sync = WorkerSync(spec)
+    sync.start()
     try:
         env = runtime_env()
         # Account lookups can outlast RunManager's 30 second liveness window.
@@ -118,7 +122,12 @@ def main(argv=None):
     finally:
         if relay:
             relay.__exit__(None, None, None)
+        # The final ingest precedes the terminal receipt, so a finished run's
+        # results are already in the store; touching the receipt keeps the
+        # worker visibly alive meanwhile.
+        sync.finish(lambda: os.utime(record_path))
         atomic_json(record_path, record)
+        sync.record(record["name"])
     return 0 if record.get("status") == "finished" else 1
 
 

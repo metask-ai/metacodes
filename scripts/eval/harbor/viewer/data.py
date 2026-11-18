@@ -538,23 +538,35 @@ def merge_summaries(summaries):
     return result
 
 
-def job_view(job_dir: Path, with_rows: bool = True) -> Dict[str, Any]:
+def job_header(job_dir: Path) -> Dict[str, Any]:
+    """The job-level fields of a view, from the job's own config and result."""
+
     result = read_json(job_dir / "result.json") or {}
-    rows = [trial_row(path) for path in trial_dirs(job_dir)]
+    started = parse_time(result.get("started_at"))
+    finished = parse_time(result.get("finished_at"))
+    return {
+        "name": job_dir.name,
+        **job_identity(job_dir),
+        "planned": result.get("n_total_trials"),
+        "started_at": started.isoformat() if started else None,
+        "finished_at": finished.isoformat() if finished else None,
+    }
+
+
+def assemble_view(header: Dict[str, Any], rows: List[Dict[str, Any]], with_rows: bool = True) -> Dict[str, Any]:
+    """A job view from its header and trial rows (from files or the store)."""
+
     attempts = {}
     for row in sorted(rows, key=trial_order):
         attempts[row["task"]] = attempts.get(row["task"], 0) + 1
         row["attempt_number"] = attempts[row["task"]]
         row["first_attempt"] = row["attempt_number"] == 1
-    planned = result.get("n_total_trials")
-    started = parse_time(result.get("started_at"))
-    finished = parse_time(result.get("finished_at"))
+    planned = header.get("planned")
+    started = parse_time(header.get("started_at"))
+    finished = parse_time(header.get("finished_at"))
     view = {
-        "name": job_dir.name,
-        **job_identity(job_dir),
+        **header,
         "planned": planned if isinstance(planned, int) else len(rows),
-        "started_at": started.isoformat() if started else None,
-        "finished_at": finished.isoformat() if finished else None,
         "running": finished is None,
         "wall_s": ((finished or dt.datetime.now(dt.timezone.utc)) - started).total_seconds() if started else None,
         "summary": summarize(rows),
@@ -562,6 +574,10 @@ def job_view(job_dir: Path, with_rows: bool = True) -> Dict[str, Any]:
     if with_rows:
         view["rows"] = rows
     return view
+
+
+def job_view(job_dir: Path, with_rows: bool = True) -> Dict[str, Any]:
+    return assemble_view(job_header(job_dir), [trial_row(path) for path in trial_dirs(job_dir)], with_rows)
 
 
 class Library:

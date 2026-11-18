@@ -12,7 +12,8 @@ benchmark's pinned Harbor fork and its local proxy.
 | `metacodes_agent.py` | `MetacodesAgent`, the Harbor `BaseInstalledAgent` |
 | `command.py` | Harbor-free core: bundle check, model split, the trial script, trace → ATIF |
 | `smoke.py`, `smoke_provider.py`, `fixtures/smoke-task/` | zero-cost end-to-end smoke through the real `harbor run` |
-| `viewer/` | read-only web page over Harbor job directories ([viewer/README.md](viewer/README.md)) |
+| `viewer/` | web workbench over Harbor job directories ([viewer/README.md](viewer/README.md)) |
+| `store/` | evaluation database (SQLite or PostgreSQL) the workbench syncs jobs into and reads from |
 
 Contract tests: `scripts/eval/tests/test_harbor_adapter.py` (part of
 `zig build test:product`).

@@ -19,7 +19,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-from scripts.eval.harbor.viewer import data
+from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.viewer.runner import RunManager, atomic_json, runtime_env, settings
 
 
@@ -76,14 +76,26 @@ class Client:
         return self.url + ("?token=" + self.token if self.token else "")
 
 
-def ensure_service(args, root, config, jobs_dir):
+def same_service(saved, jobs_dir, store):
+    return bool(saved.get("url")) and saved.get("jobs_dir") == str(jobs_dir) and saved.get("store") == store.describe()
+
+
+def ensure_service(args, root, config, jobs_dir, store):
     ready = root / "service.json"
     saved = settings(ready)
     if saved.get("url") and saved.get("jobs_dir") == str(jobs_dir):
         client = Client(saved["url"], saved.get("token", ""), saved.get("listen_url"))
         try:
             if client.request("api/workbench").get("service") == "metacodes-bench":
-                return client
+                if same_service(saved, jobs_dir, store):
+                    return client
+                # The store changed (or the service predates it): replace
+                # the service so it does not keep writing the old store.
+                client.request("api/stop", {})
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    client.request("api/workbench")
+                    time.sleep(0.1)
         except (OSError, ValueError):
             pass
     # The CLI reserves a separate ready file per startup. A crashed or slow
@@ -120,9 +132,23 @@ def ensure_service(args, root, config, jobs_dir):
     raise ValueError("工作台未在 15 秒内就绪，请查看 " + str(root / "service.log"))
 
 
+def local_overview(store, jobs_dir):
+    """Jobs from the store after bringing it up to date with the jobs directory."""
+    from scripts.eval.harbor.store.backend import Store
+    from scripts.eval.harbor.store.library import StoreLibrary
+
+    library = StoreLibrary(Store(store), [jobs_dir] if jobs_dir.is_dir() else [], owns_store=True)
+    try:
+        library.sync()
+        return library.overview()
+    finally:
+        library.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
-    parser.add_argument("action", nargs="?", default="open", choices=["open", "info", "list", "run", "stop"])
+    parser.add_argument("action", nargs="?", default="open", choices=["open", "info", "list", "run", "stop", "db"])
+    parser.add_argument("db_command", nargs="?", choices=["status", "import", "migrate"], help="bench db 的子命令")
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
     parser.add_argument("--url", default=os.environ.get("METACODES_BENCH_URL"), help="连接已有工作台（例如 devbox）")
     parser.add_argument("--jobs-dir", type=Path)
@@ -142,7 +168,20 @@ def main(argv=None):
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--wait", action="store_true", help="等待评测结束后返回结果和工作台链接")
+    parser.add_argument("--store-sqlite", type=Path, help="评测数据库使用该 SQLite 文件")
+    parser.add_argument("--store-postgres", metavar="DSN", help="评测数据库使用 PostgreSQL（DSN 不含密码）")
+    parser.add_argument("--store-password-env", metavar="NAME", help="PostgreSQL 密码所在的环境变量名")
+    parser.add_argument("--to", metavar="TARGET", help="bench db migrate 的目标：SQLite 路径或 postgresql:// DSN")
+    parser.add_argument("--password-env", metavar="NAME", help="迁移目标 PostgreSQL 密码所在的环境变量名")
+    parser.add_argument("--switch", action="store_true", help="迁移校验后切换工作台到目标数据库")
+    parser.add_argument("--verify", action="store_true", help="bench db import 按内容重新校验每个文件")
     args = parser.parse_args(argv)
+    if (args.db_command is None) != (args.action != "db"):
+        parser.error("bench db 需要子命令 status、import 或 migrate" if args.action == "db" else "多余的参数 " + args.db_command)
+    if args.store_sqlite and args.store_postgres:
+        parser.error("--store-sqlite 与 --store-postgres 只能选一个")
+    if args.store_password_env and not args.store_postgres:
+        parser.error("--store-password-env 需要 --store-postgres")
     try:
         state = args.state_root.expanduser().resolve()
         read_env(state / ".env")
@@ -152,6 +191,20 @@ def main(argv=None):
             root.chmod(0o700)
         config = root / "workbench.json"
         cfg = settings(config)
+        if args.store_sqlite:
+            cfg["store"] = store_config.SqliteConfig(args.store_sqlite.expanduser().resolve()).to_json()
+        elif args.store_postgres:
+            cfg["store"] = store_config.PostgresConfig(args.store_postgres, args.store_password_env).to_json()
+        store = store_config.for_workbench(cfg, config)
+        if args.action == "db":
+            from scripts.eval.harbor.store import commands
+            if args.store_sqlite or args.store_postgres:
+                atomic_json(config, cfg)
+            jobs_dirs = [args.jobs_dir.expanduser().resolve()] if args.jobs_dir else [
+                Path(cfg.get("jobs_dir") or root / "jobs").resolve()]
+            return commands.run(args.db_command, active=store, jobs_dirs=jobs_dirs, target=args.to,
+                                password_env=args.password_env, switch=args.switch, verify=args.verify,
+                                as_json=args.json, config_path=config, settings=cfg, save=atomic_json)
         for name in ("bundle", "provider_config", "jobs_dir", "account_state_dir"):
             value = getattr(args, name)
             if value is not None:
@@ -171,7 +224,7 @@ def main(argv=None):
         client = Client(args.url, os.environ.get("METACODES_BENCH_TOKEN", "")) if args.url else None
         if client is None and args.action in ("info", "list"):
             saved = settings(root / "service.json")
-            if saved.get("url") and saved.get("jobs_dir") == str(jobs_dir):
+            if same_service(saved, jobs_dir, store):
                 existing = Client(saved["url"], saved.get("token", ""), saved.get("listen_url"))
                 try:
                     if existing.request("api/workbench").get("service") == "metacodes-bench":
@@ -199,7 +252,7 @@ def main(argv=None):
                     for model in value.get("models", []):
                         print("模型：" + model["id"])
             else:
-                value = client.request("api/jobs") if client else {"jobs": data.Library([jobs_dir]).overview()}
+                value = client.request("api/jobs") if client else {"jobs": local_overview(store, jobs_dir)}
                 if not args.json:
                     for job in value["jobs"]:
                         summary = job["summary"]
@@ -209,7 +262,7 @@ def main(argv=None):
             if args.json:
                 print(json.dumps(value, ensure_ascii=False))
             return 0
-        client = client or ensure_service(args, root, config, jobs_dir)
+        client = client or ensure_service(args, root, config, jobs_dir, store)
         if args.action == "run":
             if not args.task:
                 parser.error("bench run 需要 --task，可重复选择几道题")
