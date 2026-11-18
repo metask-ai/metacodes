@@ -31,6 +31,9 @@
 //!   effort) are a line under the list, changed with ←/→ from any row. The
 //!   value is remembered as the one wanted, and each model shows and commits
 //!   the nearest value its vocabulary has, so moving the cursor never drops it.
+//!   With nothing wanted, a control that declares its provider's default
+//!   (DeepSeek's reasoning effort: `high`) shows and commits that value, and
+//!   has no unnamed default before it.
 //! - Every route the list offers can be applied as it is (#488). The host
 //!   says, per offer, whether a commit would find a credential for it now
 //!   (`setReadiness`); a provider with none of its offers ready is not
@@ -739,9 +742,17 @@ pub const Picker = struct {
 
     /// The value `spec` takes on the focused route: the value wanted when the
     /// vocabulary has it; for the reasoning effort, the nearest level it has
-    /// (`nearestLevel`); null for unset, the provider's own default.
+    /// (`nearestLevel`). With nothing wanted, or nothing that fits, the
+    /// default the provider declares (`declaredDefault`); null for unset, the
+    /// provider's own default, unnamed.
     pub fn effectiveValue(self: *const Picker, spec: controls_mod.ControlSpec) ?[]const u8 {
         if (spec.kind != .enumeration or spec.allowed_values.len == 0) return null;
+        return self.wantedValue(spec) orelse declaredDefault(spec);
+    }
+
+    /// The value wanted as `spec`'s vocabulary has it, or, for the reasoning
+    /// effort, its nearest level; null when nothing is wanted or nothing fits.
+    fn wantedValue(self: *const Picker, spec: controls_mod.ControlSpec) ?[]const u8 {
         const wanted = self.intents.get(spec.id) orelse return null;
         if (wanted != .text) return null;
         const text = wanted.text.slice();
@@ -930,8 +941,10 @@ pub const Picker = struct {
 
     /// ←/→: the previous / next value of the focused route's first control,
     /// from the one it shows. Unset (the provider's default) sits before the
-    /// first value; the ends do not wrap, like a slider. Nothing here invents
-    /// a value: a control with no `allowed_values` cannot be changed here.
+    /// first value, unless the control declares its default: that default is
+    /// then a value of the vocabulary, and nothing sits before the first. The
+    /// ends do not wrap, like a slider. Nothing here invents a value: a
+    /// control with no `allowed_values` cannot be changed here.
     fn adjust(self: *Picker, forward: bool) Outcome {
         const offer = self.focusedOffer() orelse return .ignored;
         const spec = firstEnumeration(offer.controls) orelse return .ignored;
@@ -943,10 +956,13 @@ pub const Picker = struct {
             }
         }
         const last = spec.allowed_values.len - 1;
+        const unset_first = declaredDefault(spec) == null;
         const next: ?usize = if (forward)
             (if (position) |at| @min(at + 1, last) else 0)
+        else if (position) |at|
+            (if (at > 0) at - 1 else if (unset_first) null else at)
         else
-            (if (position) |at| (if (at == 0) null else at - 1) else null);
+            null;
         if (next == null and position == null) return .ignored;
         if (next != null and position != null and next.? == position.?) return .ignored;
         if (next) |index| {
@@ -1014,6 +1030,18 @@ fn focusableNear(list: []const Row, from: usize, backward: bool) ?usize {
 pub fn firstEnumeration(specs: []const controls_mod.ControlSpec) ?controls_mod.ControlSpec {
     for (specs) |spec| {
         if (spec.kind == .enumeration and spec.allowed_values.len > 0) return spec;
+    }
+    return null;
+}
+
+/// The default `spec` declares for its provider, as its vocabulary spells
+/// it; null when it declares none, or one the vocabulary lacks (a value the
+/// picker could not show among the others, nor the kernel accept).
+pub fn declaredDefault(spec: controls_mod.ControlSpec) ?[]const u8 {
+    const declared = spec.default_value orelse return null;
+    if (declared != .text) return null;
+    for (spec.allowed_values) |candidate| {
+        if (std.ascii.eqlIgnoreCase(candidate, declared.text.slice())) return candidate;
     }
     return null;
 }
@@ -1497,6 +1525,83 @@ test "the level wanted is kept across models, each showing the nearest it takes"
     picker.presetControl("reasoning_effort", "medium");
     _ = picker.onKey(.down);
     try testing.expectEqualStrings("low", picker.effectiveValue(REASONING_SHORT[0]).?);
+}
+
+/// DeepSeek's vocabulary, and the default it declares.
+const REASONING_DECLARED = [_]controls_mod.ControlSpec{.{
+    .id = "reasoning_effort",
+    .label = "Reasoning effort",
+    .kind = .enumeration,
+    .allowed_values = &.{ "none", "low", "high", "max" },
+    .default_value = .{ .text = controls_mod.ControlText.parse("high") catch unreachable },
+}};
+
+fn declaredFixture(picker: *Picker) !void {
+    var offer = fixtureOffer("deepseek", "default", "DeepSeek V4 Pro", null, "deepseek-v4-pro", "openai_chat");
+    offer.controls = &REASONING_DECLARED;
+    try loadFixture(picker, &.{offer}, null);
+    picker.restart();
+}
+
+test "a declared default starts selected and is committed by name, and nothing sits before the first value" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    try declaredFixture(&picker);
+    const spec = REASONING_DECLARED[0];
+    // Nothing wanted: the provider's default, by name.
+    try testing.expectEqualStrings("high", picker.effectiveValue(spec).?);
+    try testing.expect(picker.wantedInstead(spec) == null);
+    const first = picker.onKey(.enter).commit.controls.get("reasoning_effort").?;
+    try testing.expect(first.text.eqlText("high"));
+    // ← walks down to the first value and stops: no unset slot to step
+    // into, from which the default would come back.
+    _ = picker.onKey(.left);
+    try testing.expectEqualStrings("low", picker.effectiveValue(spec).?);
+    _ = picker.onKey(.left);
+    try testing.expectEqualStrings("none", picker.effectiveValue(spec).?);
+    try testing.expect(picker.onKey(.left) == .ignored);
+    try testing.expectEqualStrings("none", picker.effectiveValue(spec).?);
+    const off = picker.onKey(.enter).commit.controls.get("reasoning_effort").?;
+    try testing.expect(off.text.eqlText("none"));
+}
+
+test "a level the session runs with wins over the declared default, none included" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    try declaredFixture(&picker);
+    const spec = REASONING_DECLARED[0];
+    for ([_][]const u8{ "none", "low", "max" }) |level| {
+        picker.restart();
+        picker.presetControl("reasoning_effort", level);
+        try testing.expectEqualStrings(level, picker.effectiveValue(spec).?);
+        const sent = picker.onKey(.enter).commit.controls.get("reasoning_effort").?;
+        try testing.expect(sent.text.eqlText(level));
+    }
+    // A level the vocabulary lacks takes the nearest one it has, as on any
+    // route: the default stands in only when nothing is wanted.
+    picker.restart();
+    picker.presetControl("reasoning_effort", "medium");
+    try testing.expectEqualStrings("low", picker.effectiveValue(spec).?);
+    try testing.expectEqualStrings("medium", picker.wantedInstead(spec).?);
+}
+
+test "a declared default the vocabulary lacks is not shown, and unset stays the default" {
+    const odd = [_]controls_mod.ControlSpec{.{
+        .id = "reasoning_effort",
+        .label = "Reasoning effort",
+        .kind = .enumeration,
+        .allowed_values = &.{ "low", "high" },
+        .default_value = .{ .text = controls_mod.ControlText.parse("turbo") catch unreachable },
+    }};
+    try testing.expect(declaredDefault(odd[0]) == null);
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var offer = fixtureOffer("metask", "default", "M", null, "m", "anthropic_messages");
+    offer.controls = &odd;
+    try loadFixture(&picker, &.{offer}, null);
+    picker.restart();
+    try testing.expect(picker.effectiveValue(odd[0]) == null);
+    try testing.expect(picker.onKey(.enter).commit.controls.get("reasoning_effort") == null);
 }
 
 test "a control the provider did not enumerate cannot be changed from the picker" {

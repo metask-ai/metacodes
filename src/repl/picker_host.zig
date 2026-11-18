@@ -71,10 +71,10 @@ pub fn open(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
     // no provider is configured for (#488).
     app.model_picker.setLocalConfig(env_path, state_env.guide_url);
     // The level the session runs with starts selected on any route that
-    // offers it, so applying a route does not quietly drop it.
-    if (app.config.reasoning_effort) |effort| {
-        if (effort.active()) app.model_picker.presetControl("reasoning_effort", effort.name());
-    }
+    // offers it, so applying a route does not quietly drop it. `none` and
+    // `minimal` too: a level chosen to keep thinking off is a choice, and a
+    // route's declared default (DeepSeek's `high`) must not replace it.
+    if (app.config.reasoning_effort) |effort| app.model_picker.presetControl("reasoning_effort", effort.name());
     app.model_picker.page_rows = pageRowsFor(ui.rows);
     setOpen(ui, true);
 }

@@ -619,6 +619,14 @@ Unsupported values are cleared or normalized according to the declared policy
 (`reject`/`clamp`/`map`), never carried over. Identity and controls commit
 atomically; a rejected combination leaves the old runtime active.
 
+A control may declare its provider's default (`ControlSpec.default_value`):
+the value the provider uses when a request names none. DeepSeek's
+`reasoning_effort` declares `high`, as its API documents. The kernel
+substitutes a declared default only under the `map` policy; the picker shows
+it as the value a route starts at when the session wants no level, commits it
+by name, and draws no separate `default` for that control. A level the
+session runs with, `none` included, is still the one wanted.
+
 Control values are bounded and copyable (8 controls, 48-byte ids, 192-byte
 values) because a selection is persisted, snapshotted per turn, and compared
 across revisions. Exceeding a bound is an error, not truncation.
@@ -902,7 +910,10 @@ API"), while the cursor is on it: Enter on the model takes its preferred route
 (the one in use, else the first), Enter on a route takes that one. The
 reasoning effort the focused route declares is a line under the list, changed
 with ←/→ from any row; the level wanted is remembered, and each model shows and
-commits the nearest one its vocabulary has. A provider no commit could bind now
+commits the nearest one its vocabulary has. The level the session runs with,
+`none` and `minimal` included, is the one wanted when the picker opens; with
+nothing wanted, a route whose control declares its provider's default
+(DeepSeek: `high`) starts at that value. A provider no commit could bind now
 is not listed, and a filter does not find its models; when no provider is
 listed, the list says so and points to `/login` and to this install's `.env`,
 by its path.

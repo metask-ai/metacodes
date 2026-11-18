@@ -107,7 +107,9 @@ as `--model` does; without it the provider's default model is used.
 `METACODES_PRESET` names one of your [presets](#presets) instead, and comes
 before `METACODES_PROVIDER` in the same file. In a session, `/model` changes
 the model and the reasoning effort; the context length follows the model
-chosen.
+chosen. The level the session runs with, `none` included, starts selected;
+with none set, a DeepSeek model starts at `high`, the level DeepSeek uses
+when a request names none, and a pick sends it by name.
 
 One file holds the keys of as many providers as you use: each key is read
 when its provider is chosen, by `--provider`, by `/model`, or by a default

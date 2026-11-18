@@ -272,9 +272,10 @@ fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, 
 }
 
 /// The controls of the focused route, a line each: the vocabulary after
-/// "default" (unset, the provider's own), the value it would commit
-/// bracketed, and the value wanted when this route shows the nearest one it
-/// has instead. ←/→ change the first.
+/// "default" (unset, the provider's own; not drawn for a control that
+/// declares its default, which is then one of the values), the value it
+/// would commit bracketed, and the value wanted when this route shows the
+/// nearest one it has instead. ←/→ change the first.
 fn controls(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
     const offer = picker.focusedOffer() orelse return 0;
     if (offer.controls.len == 0) {
@@ -301,7 +302,7 @@ fn controls(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u1
         const indent = 3 + textWidth(spec.label);
         var row: ChoiceRow = .{ .w = w, .limit = cols -| 1, .indent = indent, .at = indent };
         const shown = picker.effectiveValue(spec);
-        row.choice(th, "default", shown == null);
+        if (picker_mod.declaredDefault(spec) == null) row.choice(th, "default", shown == null);
         for (spec.allowed_values) |candidate| {
             row.choice(th, candidate, if (shown) |value| std.mem.eql(u8, value, candidate) else false);
         }
@@ -852,6 +853,31 @@ test "the reasoning line shows default and the vocabulary, the level shown brack
     try testing.expect(std.mem.indexOf(u8, text, "this model takes no level to choose") != null);
     // Without a level to change, the footer does not offer ←/→.
     try testing.expect(std.mem.indexOf(u8, text, "←/→ reasoning") == null);
+}
+
+test "a control that declares its default shows it bracketed, with no default slot before the values" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const declared = [_]controls_mod.ControlSpec{.{
+        .id = "reasoning_effort",
+        .label = "Reasoning effort",
+        .kind = .enumeration,
+        .allowed_values = &.{ "none", "low", "high", "max" },
+        .default_value = .{ .text = controls_mod.ControlText.parse("high") catch unreachable },
+    }};
+    var offer = offerOf("deepseek", "default", "deepseek-v4-pro", "openai_chat");
+    offer.controls = &declared;
+    try seed(&picker, &.{offer}, null);
+    var text = try screen(arena, &picker, 120);
+    try testing.expect(std.mem.indexOf(u8, text, "Reasoning effort   none   low  [high]  max   ←/→") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "default") == null);
+    // A level the session runs with is bracketed instead.
+    picker.presetControl("reasoning_effort", "none");
+    text = try screen(arena, &picker, 120);
+    try testing.expect(std.mem.indexOf(u8, text, "Reasoning effort  [none]  low   high   max   ←/→") != null);
 }
 
 test "a provider with no credential is not drawn, and a filter does not find it (#488)" {

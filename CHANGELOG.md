@@ -82,14 +82,27 @@ status, compatibility boundaries, and entry points are defined by
   route, Enter on a route takes that one. The reasoning level is a line under
   the list, changed with ←/→ from any row, and kept as the level wanted: each
   model shows and commits the nearest one it takes. The three scopes are named
-  in the header. Providers without a key are not listed, and a filter does not
-  find their models; when none is listed, the picker says so and points to
-  `/login` and to this install's `.env`, by its path. Closing the picker
-  without a choice prints
-  `kept <model>`. On the Metask session, `/model` lists only the models the
-  gateway serves on `/v1/messages`, with the reasoning levels it names
-  (`capabilities.reasoning.efforts`); before, it listed the gateway's image
-  and video models too, and offered no level.
+  in the header. Providers without a key are not listed, and a filter does
+  not find their models; when none is listed, the picker says so and points
+  to `/login` and to this install's `.env`, by its path. Closing the picker
+  without a choice prints `kept <model>`. On the Metask session, `/model`
+  lists only the models the gateway serves on `/v1/messages`, with the
+  reasoning levels it names (`capabilities.reasoning.efforts`); before, it
+  listed the gateway's image and video models too, and offered no level.
+- **`/model` starts a DeepSeek model at `high`, and keeps a level the
+  session already runs with** (follow-up to #539). DeepSeek's
+  `reasoning_effort` control declares `high`, the level its API uses when a
+  request names none ("Thinking mode is enabled by default, with the default
+  effort being `high`", api-docs.deepseek.com/guides/thinking_mode). With no
+  level set, a DeepSeek model in `/model` shows `[high]` where it showed
+  `[default]`, and a pick sends it by name: the request that carried
+  `"thinking":{"type":"enabled"}` alone now also carries
+  `"reasoning_effort":"high"` (on the Anthropic wire,
+  `"output_config":{"effort":"high"}` and the same `thinking`). A route bound
+  without the picker (`--provider`, `.env`, `/model use`) still names no
+  level. When `/model` opens, the level the session runs with starts
+  selected even when it is `none` or `minimal` (before, only a level that
+  thinks did), so DeepSeek's default does not replace thinking turned off.
 
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
