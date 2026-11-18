@@ -329,6 +329,53 @@ def test_picker_lists_a_models_routes_under_it_and_enter_on_one_takes_it(bin_pat
     assert "switched to deepseek-v4-pro for this session" in flat, text
 
 
+def test_picker_starts_deepseek_at_its_documented_default(bin_path):
+    # DeepSeek's API thinks at `high` when a request names no level, and its
+    # control declares that default: with no level set, its line starts at
+    # `[high]`, with no `default` slot, and Enter applies the route with it.
+    raw = run(
+        bin_path,
+        submit("/model", OPEN) + [
+            "type:deepseek-v4-pro", wait_for("Reasoning effort"), "sleep:0.3",
+            "key:enter", wait_for("switched to deepseek-v4-pro"),
+        ],
+        env=_no_vendor_keys(DEEPSEEK_API_KEY="tty-dummy-deepseek-key"),
+        term_size=(30, 120),
+        per_key_drain=0.1,
+    )
+    a, text = _screen(raw, rows=30, cols=120)
+    lines = [sc for sc in _frames(a) if "Reasoning effort" in sc and "deepseek" in sc.lower()]
+    assert lines, "/model 没列出 DeepSeek:\n" + text
+    assert re.search(r"Reasoning effort\s+none\s+low\s+\[high\]\s+max", lines[-1]), lines[-1]
+    assert "default" not in lines[-1].split("Reasoning effort", 1)[1].split("\n", 1)[0], lines[-1]
+    flat = " ".join(text.split())
+    assert "switched to deepseek-v4-pro for this session · reasoning high" in flat, text
+
+
+def test_picker_keeps_a_level_turned_off_over_deepseeks_default(bin_path):
+    # A session started with thinking off (`none`) opens /model with `none`
+    # selected on DeepSeek, not the `high` it declares; Enter keeps it.
+    raw = run(
+        bin_path,
+        submit("/model", OPEN) + [
+            "type:deepseek-v4-pro", wait_for("Reasoning effort"), "sleep:0.3",
+            "key:enter", wait_for("switched to deepseek-v4-pro"),
+        ],
+        env=_no_vendor_keys(DEEPSEEK_API_KEY="tty-dummy-deepseek-key"),
+        extra_args=["--reasoning-effort", "none"],
+        term_size=(30, 120),
+        per_key_drain=0.1,
+    )
+    a, text = _screen(raw, rows=30, cols=120)
+    lines = [sc for sc in _frames(a) if "Reasoning effort" in sc and "deepseek" in sc.lower()]
+    assert lines, "/model 没列出 DeepSeek:\n" + text
+    assert re.search(r"Reasoning effort\s+\[none\]\s+low\s+high\s+max", lines[-1]), lines[-1]
+    assert "[high]" not in lines[-1], "DeepSeek 的默认档位盖掉了会话的 none:\n" + lines[-1]
+    flat = " ".join(text.split())
+    assert "switched to deepseek-v4-pro for this session" in flat, text
+    assert "reasoning high" not in flat, text
+
+
 def test_picker_lists_only_providers_with_a_credential(bin_path):
     # #488: with no vendor key, only Metask (the session's own key) has a
     # heading, and nothing below its models names a vendor. A key gives its
