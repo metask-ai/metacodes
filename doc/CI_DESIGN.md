@@ -5,7 +5,8 @@ offline TTY suites. This document covers how a required job skips work (§1),
 which of that work a change has to pay for (§2), how approved PRs
 land after validation against current main (§3), and how one
 platform's work is spread over several runners so that a run takes about as
-long as its longest leg rather than the sum of a platform's steps (§4).
+long as its longest leg rather than the sum of a platform's steps (§4), and
+which run writes the caches the others read (§5).
 
 ## 1. Required checks and how a job skips work
 
@@ -55,8 +56,9 @@ inputs; moving into a code/input tree takes the wider scope.
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `full` | anything else | Everything |
 
-Manual runs are always `full`, and so are an empty diff and any error.
-Neither CI workflow runs on ordinary pushes to main.
+Manual and scheduled runs are always `full`, and so are an empty diff and
+any error. Neither CI workflow runs on ordinary pushes to main; their nightly
+run on main is a full run that saves the caches (§5).
 
 The scope step writes a **CI change attribution** job summary: the base,
 event, effective scope, reason, planned checks and a status/path/scope table.
@@ -249,9 +251,9 @@ What it costs:
   (three gate legs and `SDK bindings (macOS)`), so macOS groups the flags
   instead of giving each its own runner. Runs that overlap can still queue
   macOS jobs.
-- **Cache lines.** Each gate leg keeps its own setup-zig cache
-  (`cache-key: ${{ matrix.leg }}`), since each builds a different share of
-  the graph. The TTY shards build the same binaries and share one.
+- **Cache lines.** Each gate leg keeps its own Zig cache line
+  (`gates-<leg>`, §5), since each builds a different share of the graph. The
+  TTY shards build the same binaries and share one.
 - **Build runner jobs.** The suite steps pass `-j$ZIG_BUILD_JOBS`: 8 on the
   four-core Linux and Windows runners, 6 on the three-core macOS one, whose
   7 GB cannot hold more overlapping LLVM builds. The build runner runs that
@@ -316,3 +318,64 @@ product (8.2), Gates (macOS) / product (7.2) and Gates (Linux) / units
 (7.1). The organization's job limits bound what more legs can buy: a run
 uses about thirty-five jobs, so two overlapping runs already reach the limit
 of 60, and four macOS jobs leave one of the five for every other run.
+
+## 5. Caches: main writes, pull requests read
+
+Every runner starts empty, so a job compiles only what it cannot restore.
+Until November 2026 every run both restored and saved, through setup-zig's
+`use-cache` and `actions/cache`, and two things went wrong (measured
+2026-11-18):
+
+- **The first run of every pull request compiled cold.** A run can restore
+  what its own ref saved and what its base branch saved, never another pull
+  request's caches. Pull requests saved only to their own ref, and since main
+  pushes stopped running CI (§3) nothing saved to `main`: it held three
+  entries, a macOS Lean cache, one 92 MB Zig cache and the Zig tarball.
+- **Pull requests crowded each other out.** Cache keys are immutable, so
+  every run saved a new copy of every line: 2 to 2.9 GB per run of a pull
+  request. The repository held 12.3 GB against GitHub's 10 GB, and GitHub
+  evicts the least recently used entries, so a pull request's entries could
+  be gone before it pushed again.
+
+So one run writes and every other run reads:
+
+| Run | `WARM_CACHE` | Zig cache | Lean toolchain and products |
+|---|---|---|---|
+| `main`'s `schedule` run (19:00 UTC nightly) or a `workflow_dispatch` on `main` | `true` | Starts empty; each line saves what it built under `zig-0.16.0-<os>-<arch>-<line>-run-<run id>-<attempt>` | Restores; the `units` leg saves when no entry holds this hash of the Lean sources |
+| Everything else: pull requests, a legacy merge group, a dispatch on another branch | `false` | Restores the newest entry `main` saved for its line (that key without the run ID, matched as a prefix); saves nothing | Restores; saves nothing |
+
+A line is a gate leg (`gates-<leg>`), a platform's TTY shards (`tty`, saved
+by shard 1), a platform's SDK job (`sdk`) or the AgentCore Windows gate
+(`agentcore-gate`, `agentcore-windows.yml`). setup-zig still points
+`ZIG_GLOBAL_CACHE_DIR` and `ZIG_LOCAL_CACHE_DIR` at `.zig-cache`, with its own
+cache off because it saves on every run; `actions/cache` (restore, then save
+at the end of the job) gave way to `actions/cache/restore` and
+`actions/cache/save` for the same reason. setup-zig still caches the Zig
+tarball itself (about 50 MB) under an exact key and saves it only on a miss,
+so once `main`'s warm run holds it a pull request only reads it.
+
+**Why nightly, not after every merge.** Zig 0.16's build runner cannot
+compile tests without running them, so warming a line means running it. A
+run after every merge would bring back the post-merge full run §3 removed,
+and take macOS jobs during the working day. A cache a few hours old costs
+little: Zig recompiles every artifact whose sources changed, so a pull
+request that changes `src/` rebuilds the app and the large test binaries
+from either cache. What `main`'s cache saves is what changes rarely: Zig's
+runtime libraries, the Lean products, TinyKG staging, the tools, and test
+binaries the change does not reach. Dispatch `CI` on `main` to warm at once,
+for example after a Zig or Lean toolchain bump.
+
+**What it costs.** One full CI run a night, about thirty jobs and four on
+macOS, which also reports `main`'s health. A pull request's second push
+restores `main`'s cache, not its own first run's; it recompiles what its
+change reaches either way. The warm run starts each Zig line empty, so an
+entry holds only what the current tree builds and does not grow night after
+night (setup-zig's `cache-size-limit` guarded against that growth before);
+earlier nights' entries are no longer read and are evicted first.
+`rule-control.yml` (dispatch only) and `release.yml` (no Zig cache) keep
+their own settings.
+
+`scripts/tests/test_ci_scope.py` (`CacheTest`) pins the wiring: nothing but
+the warm run saves; each restore key is its save key without the run ID, and
+both run wherever Zig is set up; `WARM_CACHE` is true only for `main`'s
+scheduled or dispatched run.

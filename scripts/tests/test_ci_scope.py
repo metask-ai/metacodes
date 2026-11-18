@@ -80,10 +80,14 @@ SETUP_STEPS = {
     "windows-gates": {
         "Release fast path", "Change scope", CHECKOUT,
         "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
+        "Restore the Zig cache main saved", "Save the Zig cache for pull requests",
         "Normalize line endings of the checkout", "Install Python development dependencies",
         "Restore Lean toolchain and build products", "Install pinned elan",
     },
 }
+# Caches (doc/CI_DESIGN.md §5): what main's warm run saves carries its run ID
+# after the prefix every other run restores.
+RUN_SUFFIX = "${{ github.run_id }}-${{ github.run_attempt }}"
 
 
 def runs_on(step: dict, os_name: str) -> bool:
@@ -415,7 +419,7 @@ class WorkflowTest(unittest.TestCase):
                       "env.DOC_REFERENCES": references, "env.RELEASE_DOCS": release_docs,
                       "runner.os": os_name, "matrix.checks": checks}
             condition = step.get("if", "True")
-            condition = re.sub(r"\b(?:env|matrix|runner)\.\w+",
+            condition = re.sub(r"\b(?:env|matrix|runner)\.\w+|\bsteps\.[\w.-]+",
                                lambda match: repr(values.get(match.group(), False)), condition)
             condition = condition.replace("&&", "and").replace("||", "or")
             return eval(condition, {"__builtins__": {}}, {})
@@ -567,7 +571,10 @@ class WorkflowTest(unittest.TestCase):
             if label in ECHO_STEPS:
                 continue
             with self.subTest(step=label):
-                self.assertEqual(step.get("if"), "env.SDK != 'false'")
+                if step.get("uses", "").startswith(("actions/cache/restore@", "actions/cache/save@")):
+                    self.assertTrue(step.get("if", "").endswith(" && env.SDK != 'false'"))  # CacheTest
+                else:
+                    self.assertEqual(step.get("if"), "env.SDK != 'false'")
 
     def run_decide(self, job: str, event: str) -> tuple:
         step = next(s for s in self.jobs[job]["steps"] if s.get("name") == "Decide")
@@ -691,7 +698,103 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         for step in steps:
             if step.get("uses") == CHECKOUT or step.get("id") == "scope":
                 continue
-            self.assertEqual(step.get("if"), "steps.scope.outputs.relevant == 'true'")
+            if step.get("uses", "").startswith(("actions/cache/restore@", "actions/cache/save@")):
+                self.assertTrue(step.get("if", "").endswith(" && steps.scope.outputs.relevant == 'true'"))  # CacheTest
+            else:
+                self.assertEqual(step.get("if"), "steps.scope.outputs.relevant == 'true'")
+
+
+def render_warm_cache(expression: str, ref: str, event: str) -> bool:
+    """The WARM_CACHE expression as the runner evaluates it for one run."""
+    body = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", expression).group(1)
+    body = body.replace("github.event_name", repr(event)).replace("github.ref", repr(ref))
+    return eval(body.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}, {})
+
+
+def zig_cache_steps(steps: list, action: str) -> list:
+    return [step for step in steps
+            if step.get("uses", "").startswith(action) and step.get("with", {}).get("path") == ".zig-cache"]
+
+
+class CacheTest(unittest.TestCase):
+    """Pull requests restore the caches main's nightly run saves, and save
+    none (doc/CI_DESIGN.md §5): a pull request can read its base branch's
+    caches but no other pull request's, and pull requests that saved their own
+    filled the repository's 10 GB with copies nobody else could read."""
+
+    def setUp(self) -> None:
+        try:
+            import yaml
+        except ImportError:  # requirements-dev.txt
+            self.skipTest("PyYAML is not installed")
+        self.workflows = {path.name: yaml.safe_load(path.read_text(encoding="utf-8"))
+                          for path in (WORKFLOW, AGENTCORE_WORKFLOW)}
+
+    def test_only_mains_scheduled_or_dispatched_run_warms(self) -> None:
+        for name, workflow in self.workflows.items():
+            with self.subTest(workflow=name):
+                triggers = workflow.get("on", workflow.get(True))
+                self.assertNotIn("push", triggers)  # no full run after every merge
+                self.assertTrue(triggers["schedule"][0]["cron"])
+                expression = workflow["env"]["WARM_CACHE"]
+                for ref, event, warm in (("refs/heads/main", "schedule", True),
+                                         ("refs/heads/main", "workflow_dispatch", True),
+                                         ("refs/pull/7/merge", "pull_request", False),
+                                         ("refs/heads/topic", "workflow_dispatch", False),
+                                         ("refs/heads/gh-readonly-queue/main/pr-7-" + "a" * 40, "merge_group", False)):
+                    self.assertEqual(render_warm_cache(expression, ref, event), warm, (ref, event))
+
+    def test_nothing_saves_outside_the_warm_run(self) -> None:
+        for name, workflow in self.workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                for step in job.get("steps", []):
+                    uses = step.get("uses", "")
+                    with self.subTest(workflow=name, job=job_id, step=step_label(step)):
+                        # actions/cache and setup-zig's own cache save at the end of every run.
+                        self.assertFalse(uses.startswith("actions/cache@"))
+                        if uses.startswith("mlugg/setup-zig@"):
+                            self.assertIs(step["with"]["use-cache"], False)
+                        if uses.startswith("actions/cache/save@"):
+                            self.assertTrue(step["if"].startswith("env.WARM_CACHE == 'true' && "), step["if"])
+
+    def test_every_zig_job_restores_exactly_what_main_saves(self) -> None:
+        for name, workflow in self.workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                steps = job.get("steps", [])
+                zig = [step for step in steps if step.get("uses", "").startswith("mlugg/setup-zig@")]
+                if not zig:
+                    continue
+                with self.subTest(workflow=name, job=job_id):
+                    restores = zig_cache_steps(steps, "actions/cache/restore@")
+                    saves = zig_cache_steps(steps, "actions/cache/save@")
+                    self.assertEqual((len(zig), len(restores), len(saves)), (1, 1, 1))
+                    zig, restore, save = zig[0], restores[0], saves[0]
+                    key = save["with"]["key"]
+                    self.assertTrue(key.endswith(RUN_SUFFIX), key)
+                    self.assertTrue(key.startswith("zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-"), key)
+                    self.assertEqual(restore["with"]["key"], key[: -len(RUN_SUFFIX)])
+                    self.assertEqual(restore["with"]["restore-keys"], restore["with"]["key"])
+                    # Both run wherever Zig is set up: the restore first, the save last.
+                    self.assertEqual(restore["if"], "env.WARM_CACHE != 'true' && " + zig["if"])
+                    self.assertTrue(save["if"].endswith(" && " + zig["if"]), save["if"])
+                    self.assertEqual(steps.index(restore), steps.index(zig) + 1)
+                    self.assertEqual(steps.index(save), len(steps) - 1)
+
+    def test_lean_products_are_restored_everywhere_and_saved_by_the_warm_run(self) -> None:
+        jobs = self.workflows["ci.yml"]["jobs"]
+        for job_id in ("gates-linux", "gates-macos", "windows-gates"):
+            with self.subTest(job=job_id):
+                steps = jobs[job_id]["steps"]
+                restore = next(s for s in steps if s.get("name") == "Restore Lean toolchain and build products")
+                save = next(s for s in steps if s.get("name") == "Save Lean toolchain and build products")
+                self.assertEqual(restore["id"], "lean")
+                self.assertTrue(restore["uses"].startswith("actions/cache/restore@"))
+                self.assertEqual(save["with"]["path"], restore["with"]["path"])
+                self.assertEqual(save["with"]["key"], "${{ steps.lean.outputs.cache-primary-key }}")
+                # One leg per platform, and only when main does not hold this state of the sources.
+                self.assertIn("matrix.units", save["if"])
+                self.assertIn("steps.lean.outputs.cache-hit != 'true'", save["if"])
+                self.assertLess(steps.index(restore), steps.index(save))
 
 
 if __name__ == "__main__":
