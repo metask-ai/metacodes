@@ -1,6 +1,7 @@
 """One durable Bench launch. Invoked by RunManager, never from browser input."""
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import signal
@@ -35,6 +36,26 @@ def command(spec):
     return argv
 
 
+def prepare(spec, env):
+    """Resolve the account key and start the timing relay for one launch."""
+    if spec.get("auth_mode") == "metask":
+        # Resolve the key belonging to this model's group, without
+        # changing the interactive CLI selection or forwarding OAuth.
+        account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
+        env["METASK_API_KEY"] = account.credential(spec["model"], key_id=spec.get("account_key_id"))
+        spec = {**spec, "account_gateway": account.gateway}
+    relay = None
+    upstream = upstream_for(spec) if spec.get("metrics_enabled", True) else None
+    if upstream:
+        header, prefix = auth_for(spec)
+        relay = TimingRelay(upstream, env[spec["key_env"]],
+                            Path(spec["jobs_dir"]) / spec["name"] / ".bench-metrics",
+                            bind=spec.get("metrics_bind") or "172.17.0.1",
+                            auth_header=header, auth_prefix=prefix, tls=True).__enter__()
+        spec = {**spec, "metrics_proxy": relay.url, "metrics_ca": str(relay.ca_path)}
+    return spec, relay
+
+
 def main(argv=None):
     spec_path = Path((argv or sys.argv[1:])[0])
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
@@ -46,20 +67,26 @@ def main(argv=None):
     relay = None
     try:
         env = runtime_env()
-        if spec.get("auth_mode") == "metask":
-            # Resolve the key belonging to this model's group, without
-            # changing the interactive CLI selection or forwarding OAuth.
-            account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
-            env["METASK_API_KEY"] = account.credential(spec["model"], key_id=spec.get("account_key_id"))
-            spec = {**spec, "account_gateway": account.gateway}
-        upstream = upstream_for(spec) if spec.get("metrics_enabled", True) else None
-        if upstream:
-            header, prefix = auth_for(spec)
-            relay = TimingRelay(upstream, env[spec["key_env"]],
-                                Path(spec["jobs_dir"]) / spec["name"] / ".bench-metrics",
-                                bind=spec.get("metrics_bind") or "172.17.0.1",
-                                auth_header=header, auth_prefix=prefix, tls=True).__enter__()
-            spec = {**spec, "metrics_proxy": relay.url, "metrics_ca": str(relay.ca_path)}
+        # Account lookups can outlast RunManager's 30 second liveness window.
+        # Prepare beside the heartbeat, so a live worker is never shown as
+        # interrupted (which would admit a second launch). A cancel meanwhile
+        # waits for the lookup in flight, which may be rotating the stored
+        # OAuth token, and then ends the run before Harbor starts.
+        last_write = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            preparing = pool.submit(prepare, spec, env)
+            while not preparing.done():
+                if spec_path.with_suffix(".cancel").exists() and record["status"] != "cancelling":
+                    record["status"] = "cancelling"
+                    last_write = 0.0
+                if time.monotonic() - last_write > 2:
+                    atomic_json(record_path, record)
+                    last_write = time.monotonic()
+                concurrent.futures.wait([preparing], timeout=0.25)
+        spec, relay = preparing.result()
+        if spec_path.with_suffix(".cancel").exists():
+            record.update(status="cancelled", finished_at=now())
+            return 1
         process = subprocess.Popen(command(spec), env=env, stdin=subprocess.DEVNULL,
                                    start_new_session=True)
         record["status"] = "running"

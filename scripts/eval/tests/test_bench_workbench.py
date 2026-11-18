@@ -90,6 +90,16 @@ def wait_run(manager, name):
     raise AssertionError('worker did not finish')
 
 
+def wait_status(manager, name, status, timeout=6):
+    """The status the manager shows once it is `status`, or at the deadline."""
+    deadline = time.monotonic() + timeout
+    while True:
+        shown = next((r for r in manager.runs() if r['name'] == name), {}).get('status')
+        if shown == status or time.monotonic() >= deadline:
+            return shown
+        time.sleep(.05)
+
+
 def account_fixture(root, *, expired=True, paginated=False, broken_group=False):
     state = root / 'signed-in-account'
     state.mkdir()
@@ -230,6 +240,33 @@ def session_fixture(root, *, expired=True):
                 'models_url': f'http://127.0.0.1:{http.server_port}/v1/models'})
     threading.Thread(target=http.serve_forever, daemon=True).start()
     return state, http, calls
+
+
+def stalled_account_fixture(root):
+    """A key login whose model directory, once armed, holds each lookup
+    until released: a slow Metask credential lookup, with no provider."""
+    state = root / 'stalled-account'
+    state.mkdir()
+    atomic_json(state / 'auth.json', {'api_key': 'stalled-account-key', 'selected_model': 'glm-test'})
+    armed, entered, release = threading.Event(), threading.Event(), threading.Event()
+
+    class Catalog(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if armed.is_set():
+                entered.set()
+                release.wait(9)
+            body = json.dumps({'data': [{'id': 'glm-test'}]}).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    http = ThreadingHTTPServer(('127.0.0.1', 0), Catalog)
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    return state, http, (armed, entered, release)
 
 
 @unittest.skipUnless(POSIX, 'fake executable and worker signal test are POSIX')
@@ -472,6 +509,47 @@ class WorkbenchTest(unittest.TestCase):
             final = wait_run(self.manager, run['name'])
         self.assertEqual(final['status'], 'finished', final)
         self.assertIn(('model-request', 'Bearer session-access', {'model': 'session-model'}), calls)
+
+    def start_stalled_preparation(self):
+        """Launch a run whose worker is still resolving its account key."""
+        state, upstream, (armed, entered, release) = stalled_account_fixture(self.root)
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        self.addCleanup(release.set)
+        cfg = json.loads(self.manager.config_path.read_text())
+        cfg.update(auth_mode='metask', account_state_dir=str(state),
+                   account_gateway=f'http://127.0.0.1:{upstream.server_port}')
+        atomic_json(self.manager.config_path, cfg)
+        # The catalog read answers at once; only the worker's own lookup stalls.
+        catalog = self.client.request('api/workbench')
+        self.assertTrue(catalog['ready'], catalog['reasons'])
+        armed.set()
+        run = self.client.request('api/runs', {**self.request(), 'model': 'metask/glm-test'})
+        self.assertTrue(entered.wait(10), 'the worker never looked up its account key')
+        return run, release
+
+    def test_slow_preparation_stays_running_and_refuses_a_second_launch(self):
+        run, release = self.start_stalled_preparation()
+        # As if the key lookup had already outlasted the 30 second window.
+        stale = time.time() - 31
+        os.utime(self.manager.records / (run['name'] + '.json'), (stale, stale))
+        shown = wait_status(self.manager, run['name'], 'starting')
+        try:
+            second = self.client.request('api/runs', {**self.request(), 'model': 'metask/glm-test'})['status']
+        except ValueError as exc:
+            second = str(exc)
+        self.assertEqual((shown, second), ('starting', '已有评测正在运行，请等待完成或先停止'))
+        release.set()
+        self.assertEqual(wait_run(self.manager, run['name'])['status'], 'finished')
+
+    def test_cancel_during_slow_preparation_never_starts_harbor(self):
+        run, release = self.start_stalled_preparation()
+        self.client.request('api/cancel', {'name': run['name']})
+        shown = wait_status(self.manager, run['name'], 'cancelling')
+        release.set()
+        final = wait_run(self.manager, run['name'])
+        started = (self.manager.jobs_dir / run['name'] / 'argv.json').exists()
+        self.assertEqual((shown, final['status'], final['exit_code'], started), ('cancelling', 'cancelled', None, False))
 
 
 class AccountTest(unittest.TestCase):
