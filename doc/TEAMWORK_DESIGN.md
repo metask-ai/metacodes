@@ -13,6 +13,17 @@
 teamwork 是一个**显式开启**的运行模式:用户批准一份任务说明后,Manager 把工作派给若干
 **seat**(interviewer、implementer、reviewer、verifier),每个 seat 可以由不同的 harness 承担。
 
+Teamwork 属于统一 **preview** 特性,默认关闭。使用 `--preview` 或状态根 `config.json` 根键
+`"preview": true` 开启;`--no-preview` 覆盖保存值,最后一个 CLI preview flag 生效。它与
+ExecuteCode 共用 `PreviewSetting`、`FileConfig` 与 `resolvePreview`,没有单独的 teamwork
+preview 开关。`--preview` 不代替原任务的 `--approve`、预算、权限或沙箱授权。
+
+宿主当前的 `runtime.Deps.preview` 默认 false,不写入已批准任务配置,也不从 checkpoint 恢复。
+`start/reopen/dispatch/requestCompletion` 在执行前检查;关闭时不得创建或恢复运行、启动 seat
+或其探测、调用模型、花费预算、审计或合回。模型与 MCP 的同名字段不能恢复授权。
+只读状态、已有句柄的取消与销毁/清理继续可用;并发停止仍经原有 abort 信号。CLI 在 App
+初始化前也使用同一配置解析,当前关闭设置优先于旧运行的批准记录。
+
 与 swarm([SWARM_DESIGN.md](SWARM_DESIGN.md))的区别:swarm 是一组对等 teammate 经邮箱和
 任务 DAG 自组织;teamwork 是一条固定流水线(面试 → 批准 → 实现 ⇄ 评审 → 审计 → 合回),
 由 metacodes runtime 掌控每一步的输入、输出、预算和完成判定。

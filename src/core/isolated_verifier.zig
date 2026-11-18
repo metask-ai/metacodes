@@ -431,6 +431,7 @@ pub const VerifyRequest = struct {
 /// directory, dynamic registry, MCP sessions, host services or transcript:
 /// the verifier cannot receive what these fields would carry.
 pub const Deps = struct {
+    preview: bool = false,
     provider: provider_mod.Provider,
     anthropic_client: ?*client_mod.Client = null,
     /// The host's tool definitions; the verifier sees their intersection with
@@ -589,6 +590,7 @@ fn runSpawn(
         &watchdog.child,
         packet,
         .{
+            .preview = deps.preview,
             .max_turns = request.budget.max_turns,
             .system_prompt = CHARTER,
             .cost_budget_usd = request.budget.cost_usd,

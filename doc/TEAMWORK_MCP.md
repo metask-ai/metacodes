@@ -14,6 +14,20 @@ not part of this stdio adapter.
 
 ## Host authorization and ownership
 
+Teamwork uses the shared preview setting and defaults off. The host must
+resolve current preview authorization and supply `runtime.Deps.preview = true`
+before starting or reopening a run. The CLI accepts `--preview` or saved root
+`preview: true`; its final `--no-preview` overrides the saved value. Enabling
+preview is separate from approving the task, configured permissions and spend.
+
+The runtime checks preview again for dispatch and completion. Disabling it on
+an existing host handle leaves initialize/ping, status, cancellation and
+cleanup available, but execution tools return `isError: true` with
+`error: "PreviewDisabled"` and perform no seat, check, audit or merge action.
+Change host authorization only between operations; use the shared abort signal
+to stop concurrent work. Neither saved run data nor a model/MCP `preview`
+argument grants authority; the latter is rejected as an unknown argument.
+
 The host obtains user approval, loads the configuration and dependencies, and
 starts `runtime.Run` with the original approved request. Then it calls:
 
@@ -179,7 +193,7 @@ The [example configuration](../examples/teamwork/claude-code-mcp.json) uses
 Claude Code's `mcpServers` stdio format. Replace the two absolute placeholder
 paths with the installed executable and a file containing the user-approved
 request. The launch command is
-`metacodes teamwork mcp --request-file <approved-request> --approve --budget-usd 5`.
+`metacodes --preview teamwork mcp --request-file <approved-request> --approve --budget-usd 5`.
 That command belongs to the host's CLI integration; the engine itself neither
 parses those flags nor grants approval. The human-configured `--approve` is
 not an MCP argument, tool or manager decision. Keep the host's validated

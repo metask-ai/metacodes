@@ -65,11 +65,30 @@ const Case = struct {
         return self.cliWithEnv(args, &.{});
     }
 
+    fn cliEnabled(self: *Case, args: []const []const u8) !cc.tools_common.SpawnOut {
+        return self.cliEnabledWithEnv(args, &.{});
+    }
+
+    fn cliEnabledWithEnv(self: *Case, args: []const []const u8, env: []const []const u8) !cc.tools_common.SpawnOut {
+        return self.cliEnabledInput(args, env, null);
+    }
+
+    fn cliEnabledInput(self: *Case, args: []const []const u8, env: []const []const u8, input: ?[]const u8) !cc.tools_common.SpawnOut {
+        const opted_in = try self.arena.allocator().alloc([]const u8, args.len + 1);
+        @memcpy(opted_in[0..args.len], args);
+        opted_in[args.len] = "--preview";
+        return self.cliInput(opted_in, env, input);
+    }
+
     fn cliWithEnv(self: *Case, args: []const []const u8, extra_env: []const []const u8) !cc.tools_common.SpawnOut {
         return self.cliInput(args, extra_env, null);
     }
 
     fn cliInput(self: *Case, args: []const []const u8, extra_env: []const []const u8, input: ?[]const u8) !cc.tools_common.SpawnOut {
+        return self.cliLeadingInput(args, extra_env, input, &.{});
+    }
+
+    fn cliLeadingInput(self: *Case, args: []const []const u8, extra_env: []const []const u8, input: ?[]const u8, leading: []const []const u8) !cc.tools_common.SpawnOut {
         const raw = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
         const a = self.arena.allocator();
         var argv: std.ArrayList([]const u8) = .empty;
@@ -77,7 +96,9 @@ const Case = struct {
         try argv.append(a, try std.fmt.allocPrint(a, "HOME={s}", .{self.root}));
         try argv.appendSlice(a, &.{ "METACODES_NO_PROBE=1", "METACODES_KG_AUTOSTART=0", "METACODES_JEV_URL=off" });
         try argv.appendSlice(a, extra_env);
-        try argv.appendSlice(a, &.{ std.mem.span(raw), "--state-dir", self.state, "teamwork" });
+        try argv.appendSlice(a, &.{ std.mem.span(raw), "--state-dir", self.state });
+        try argv.appendSlice(a, leading);
+        try argv.append(a, "teamwork");
         try argv.appendSlice(a, args);
         const out = try self.spawnInput(argv.items, input);
         if (out.exit_code != 0 and std.mem.indexOf(u8, out.stderr, "error:") == null)
@@ -97,43 +118,75 @@ const Case = struct {
     }
 };
 
+test "teamwork command preview L2: default off and final opt-out precede App, MCP, providers and worktrees" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    try c.configuredMcp(".claude.json");
+    var server = try harness.MockServer.startCassette(&.{}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    for ([_][]const u8{ "run", "mcp" }) |action| {
+        const args = [_][]const u8{ action, "--request-file", try c.request(), "--approve", "--budget-usd", "2", "--model", "fixture", "--api-key", "fixture-key", "--base-url", url };
+        const out = try c.cli(&args);
+        try testing.expectEqual(@as(i32, 2), out.exit_code);
+        try testing.expect(std.mem.indexOf(u8, out.stderr, "PreviewDisabled") != null);
+    }
+    try c.write("state/config.json", "{\"preview\":true,\"teamwork\":{\"enabled\":true,\"budget_usd\":2}}");
+    const out = try c.cli(&.{ "run", "--request-file", try c.request(), "--approve", "--preview", "--no-preview", "--api-key", "fixture-key", "--base-url", url });
+    try testing.expectEqual(@as(i32, 2), out.exit_code);
+    try testing.expect(std.mem.indexOf(u8, out.stderr, "PreviewDisabled") != null);
+    const leading_out = try c.cliLeadingInput(&.{ "run", "--request-file", try c.request(), "--approve", "--no-preview" }, &.{}, null, &.{"--preview"});
+    try testing.expectEqual(@as(i32, 2), leading_out.exit_code);
+    try testing.expect(std.mem.indexOf(u8, leading_out.stderr, "PreviewDisabled") != null);
+    const resumed_off = try c.cli(&.{ "resume", "old-checkpoint", "--approve", "--no-preview", "--api-key", "fixture-key", "--base-url", url });
+    try testing.expectEqual(@as(i32, 2), resumed_off.exit_code);
+    try testing.expect(std.mem.indexOf(u8, resumed_off.stderr, "PreviewDisabled") != null);
+    try testing.expectEqual(@as(usize, 0), server.requestCount());
+    try testing.expect(!try c.exists("state/teamwork"));
+    try testing.expect(!try c.exists("state/projects"));
+    try testing.expect(!try c.exists("repo/.git/worktrees"));
+    try testing.expect(!try c.exists("outbound-mcp-started"));
+}
+
 test "teamwork command: approval and budget gates precede App, seats and worktrees" {
     var c: Case = undefined;
     try c.init();
     defer c.deinit();
     // Even broken secret/provider config is not read until explicit approval.
     try c.write("state/config.json", "not json -- secret marker");
-    const refused = try c.cli(&.{ "run", "--request-file", try c.request(), "--budget-usd", "2", "--base-url", "http://127.0.0.1:1/v1/messages" });
+    const refused = try c.cliEnabled(&.{ "run", "--request-file", try c.request(), "--budget-usd", "2", "--base-url", "http://127.0.0.1:1/v1/messages" });
     try testing.expectEqual(@as(i32, 2), refused.exit_code);
     try testing.expect(std.mem.indexOf(u8, refused.stderr, "ApprovalRequired") != null);
     try testing.expect(!try c.exists("state/teamwork"));
-    const mcp = try c.cli(&.{ "mcp", "--request-file", try c.request(), "--budget-usd", "2" });
+    const mcp = try c.cliEnabled(&.{ "mcp", "--request-file", try c.request(), "--budget-usd", "2" });
     try testing.expectEqual(@as(i32, 2), mcp.exit_code);
     try testing.expect(std.mem.indexOf(u8, mcp.stderr, "ApprovalRequired") != null);
     try testing.expect(!try c.exists("state/teamwork"));
     try testing.expect(!try c.exists("state/projects"));
     try c.write("state/config.json", "{}");
-    const missing = try c.cli(&.{ "run", "--request-file", try c.request(), "--approve" });
+    const missing = try c.cliEnabled(&.{ "run", "--request-file", try c.request(), "--approve" });
     try testing.expectEqual(@as(i32, 2), missing.exit_code);
     try testing.expect(std.mem.indexOf(u8, missing.stderr, "BudgetMissing") != null);
     try testing.expect(!try c.exists("state/teamwork"));
-    const unsupported = try c.cli(&.{ "run", "--request-file", try c.request(), "--approve", "--config-json", "{\"budget_usd\":2,\"seats\":{\"verifier\":{\"effort\":\"high\"}}}" });
+    const unsupported = try c.cliEnabled(&.{ "run", "--request-file", try c.request(), "--approve", "--config-json", "{\"budget_usd\":2,\"seats\":{\"verifier\":{\"effort\":\"high\"}}}" });
     try testing.expectEqual(@as(i32, 2), unsupported.exit_code);
     try testing.expect(std.mem.indexOf(u8, unsupported.stderr, "VerifierEffortUnsupported") != null);
     try testing.expect(!try c.exists("state/teamwork"));
-    const resume_override = try c.cli(&.{ "resume", "r1", "--approve", "--budget-usd", "5" });
+    const resume_override = try c.cliEnabled(&.{ "resume", "r1", "--approve", "--budget-usd", "5" });
     try testing.expectEqual(@as(i32, 2), resume_override.exit_code);
     try testing.expect(std.mem.indexOf(u8, resume_override.stderr, "ResumeOverridesForbidden") != null);
-    const resume_model = try c.cli(&.{ "resume", "r1", "--approve", "--model", "changed" });
+    const resume_model = try c.cliEnabled(&.{ "resume", "r1", "--approve", "--model", "changed" });
     try testing.expectEqual(@as(i32, 2), resume_model.exit_code);
     try testing.expect(std.mem.indexOf(u8, resume_model.stderr, "ResumeOverridesForbidden") != null);
     const raw = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
-    const inside = try c.spawn(&.{ std.mem.span(raw), "--state-dir", c.repo, "teamwork", "run", "--request-file", try c.request(), "--approve", "--budget-usd", "2" });
+    const inside = try c.spawn(&.{ std.mem.span(raw), "--state-dir", c.repo, "teamwork", "run", "--preview", "--request-file", try c.request(), "--approve", "--budget-usd", "2" });
     try testing.expectEqual(@as(i32, 2), inside.exit_code);
     try testing.expect(std.mem.indexOf(u8, inside.stderr, "StateRootInsideRepository") != null);
     try testing.expect(!try c.exists("repo/teamwork"));
     if (builtin.os.tag == .linux) {
-        const sandbox = try c.cliWithEnv(&.{ "run", "--request-file", try c.request(), "--approve", "--budget-usd", "2", "--api-key", "fixture-key", "--base-url", "http://127.0.0.1:1/v1/messages" }, &.{"METACODES_BWRAP=/nonexistent-teamwork-backend"});
+        const sandbox = try c.cliEnabledWithEnv(&.{ "run", "--request-file", try c.request(), "--approve", "--budget-usd", "2", "--api-key", "fixture-key", "--base-url", "http://127.0.0.1:1/v1/messages" }, &.{"METACODES_BWRAP=/nonexistent-teamwork-backend"});
         try testing.expectEqual(@as(i32, 1), sandbox.exit_code);
         try testing.expect(std.mem.indexOf(u8, sandbox.stderr, "SandboxUnavailable") != null);
         try testing.expect(!try c.exists("state/teamwork"));
@@ -195,7 +248,7 @@ test "teamwork command: inherited native models are pinned on wire and retained 
     var server = try harness.MockServer.startCassette(&.{text}, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
-    const out = try c.cli(&.{ "run", "--request-file", try c.request(), "--id", "native1", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--model", "fixture-original", "--api-key", "fixture-key", "--base-url", url });
+    const out = try c.cliEnabled(&.{ "run", "--request-file", try c.request(), "--id", "native1", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--model", "fixture-original", "--api-key", "fixture-key", "--base-url", url });
     if (std.mem.indexOf(u8, out.stderr, "SandboxUnavailable") != null) {
         try testing.expectEqual(@as(i32, 1), out.exit_code);
         try testing.expect(!try c.exists("state/teamwork/native1"));
@@ -222,15 +275,20 @@ test "teamwork command: inherited native models are pinned on wire and retained 
     try testing.expect(seats.get("manager").?.object.get("model") == null);
     try testing.expect(seats.get("interviewer").?.object.get("model") == null);
     try c.write("state/config.json", "{\"model\":\"changed-default\",\"teamwork\":{\"budget_usd\":99,\"seats\":{\"implementer\":{\"model\":\"changed-seat\"}}}}");
-    const prepared = try cc.teamwork_command.prepare(a, .{ .action = .@"resume", .approve = true, .id = try cc.teamwork_command.RunId.parse("native1") }, c.state, c.repo);
+    const prepared = try cc.teamwork_command.prepare(a, .{ .action = .@"resume", .host_config = .{ .preview = .enabled }, .approve = true, .id = try cc.teamwork_command.RunId.parse("native1") }, c.state, c.repo);
     try testing.expectEqualStrings("fixture-original", prepared.cfg.seats.get(.implementer).model.?);
     try testing.expectEqual(@as(f64, 2), prepared.cfg.budget_usd);
-    const resumed = try c.cli(&.{ "resume", "native1", "--approve", "--api-key", "fixture-key", "--base-url", url });
+    const resumed = try c.cliEnabled(&.{ "resume", "native1", "--approve", "--api-key", "fixture-key", "--base-url", url });
     try testing.expectEqual(@as(i32, 1), resumed.exit_code); // terminal failure stays terminal
     try testing.expectEqual(@as(usize, 1), server.requestCount());
 }
 
 test "teamwork command: approved external seats config reaches argv, verifier wire, merge and disk-only status" {
+    try externalSeatsCase(false);
+    try externalSeatsCase(true);
+}
+
+fn externalSeatsCase(saved_preview: bool) !void {
     var c: Case = undefined;
     try c.init();
     defer c.deinit();
@@ -288,12 +346,13 @@ test "teamwork command: approved external seats config reaches argv, verifier wi
     const binary = try std.fmt.allocPrintSentinel(a, "{s}/claude-fixture", .{c.root}, 0);
     try testing.expectEqual(@as(c_int, 0), pfs.chmod(binary, 0o755));
     const global = try std.fmt.allocPrint(a,
-        \\{{"teamwork":{{"budget_usd":4,"max_rounds":3,"seats":{{"implementer":{{"harness":"claude_code","command":"{s}","model":"global-impl"}},"reviewer":{{"harness":"claude_code","command":"{s}","model":"global-review"}},"verifier":{{"model":"fixture-verifier"}}}},"check_command":"false"}}}}
-    , .{ binary, binary });
+        \\{{"preview":{s},"teamwork":{{"budget_usd":4,"max_rounds":3,"seats":{{"implementer":{{"harness":"claude_code","command":"{s}","model":"global-impl"}},"reviewer":{{"harness":"claude_code","command":"{s}","model":"global-review"}},"verifier":{{"model":"fixture-verifier"}}}},"check_command":"false"}}}}
+    , .{ if (saved_preview) "true" else "false", binary, binary });
     try c.write("state/config.json", global);
     try c.write("repo/.metacodes/teamwork.json", "{\"budget_usd\":3,\"check_command\":\"/bin/sh check-fixture.sh && test -f feature.txt\",\"seats\":{\"implementer\":{\"model\":\"project-impl\"}}}");
     const shared_temp = try std.fmt.allocPrint(a, "TMPDIR={s}", .{c.root});
-    const out = try c.cliWithEnv(&.{ "run", "--request-file", try c.request(), "--id", "r1", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--config-json", "{\"seats\":{\"reviewer\":{\"model\":\"cli-review\",\"effort\":\"high\"}}}", "--api-key", "fixture-key", "--model", "fixture-host", "--base-url", url }, &.{shared_temp});
+    const args = [_][]const u8{ "run", "--request-file", try c.request(), "--id", "r1", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--config-json", "{\"seats\":{\"reviewer\":{\"model\":\"cli-review\",\"effort\":\"high\"}}}", "--api-key", "fixture-key", "--model", "fixture-host", "--base-url", url };
+    const out = if (saved_preview) try c.cliWithEnv(&args, &.{shared_temp}) else try c.cliLeadingInput(&args, &.{shared_temp}, null, &.{ "--no-preview", "--preview" });
     if (std.mem.indexOf(u8, out.stderr, "SandboxUnavailable") != null) {
         try testing.expectEqual(@as(i32, 1), out.exit_code);
         try testing.expect(!try c.exists("state/teamwork/r1"));
@@ -323,6 +382,12 @@ test "teamwork command: approved external seats config reaches argv, verifier wi
     const wire = server.requestAt(0).?;
     try testing.expectEqualStrings("\"fixture-verifier\"", wire.jsonField("model").?);
     const original_state = try c.read("state/teamwork/r1/run.json");
+    try c.write("state/config.json", "{\"preview\":false}");
+    const denied_resume = try c.cli(&.{ "resume", "r1", "--approve", "--api-key", "fixture-key", "--base-url", url });
+    try testing.expectEqual(@as(i32, 2), denied_resume.exit_code);
+    try testing.expect(std.mem.indexOf(u8, denied_resume.stderr, "PreviewDisabled") != null);
+    try testing.expectEqualStrings(original_state, try c.read("state/teamwork/r1/run.json"));
+    try testing.expectEqual(@as(usize, 2), server.requestCount());
     // Status reads none of the global/provider configuration, does not
     // reinitialize App, and does not rewrite the completed state.
     try c.write("state/config.json", "malformed secret-global-marker");
@@ -337,7 +402,7 @@ test "teamwork command: approved external seats config reaches argv, verifier wi
     try testing.expectEqualStrings(original_state, try c.read("state/teamwork/r1/run.json"));
     try testing.expectEqual(@as(usize, 2), server.requestCount());
     try c.write("state/config.json", "{\"teamwork\":{\"budget_usd\":99,\"check_command\":\"false\"}}");
-    const resumed = try c.cli(&.{ "resume", "r1", "--approve", "--api-key", "fixture-key", "--base-url", url });
+    const resumed = try c.cliEnabled(&.{ "resume", "r1", "--approve", "--api-key", "fixture-key", "--base-url", url });
     try testing.expectEqual(@as(i32, 0), resumed.exit_code);
     try testing.expectEqual(@as(usize, 2), server.requestCount());
 }
@@ -361,7 +426,7 @@ test "teamwork command: installed MCP endpoint negotiates on stdio and never sel
         \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"teamwork_cancel"}}
         \\
     ;
-    const out = try c.cliInput(&.{ "mcp", "--request-file", try c.request(), "--id", "mcp1", "--approve", "--budget-usd", "2", "--model", "fixture-model", "--api-key", "fixture-key", "--base-url", try provider.urlOwned(a) }, &.{}, frames);
+    const out = try c.cliEnabledInput(&.{ "mcp", "--request-file", try c.request(), "--id", "mcp1", "--approve", "--budget-usd", "2", "--model", "fixture-model", "--api-key", "fixture-key", "--base-url", try provider.urlOwned(a) }, &.{}, frames);
     if (out.exit_code != 0) std.debug.print("MCP stderr: {s}\nstdout: {s}\n", .{ out.stderr, out.stdout });
     try testing.expectEqual(@as(i32, 0), out.exit_code);
     var replies: [5]std.json.Value = undefined;
@@ -415,7 +480,7 @@ test "teamwork command: resume refuses a weaker host sandbox policy" {
     var provider = try harness.MockServer.startCassette(&.{}, 0);
     defer provider.stop();
     const url = try provider.urlOwned(a);
-    const started = try c.cliInput(&.{ "mcp", "--request-file", try c.request(), "--id", "policy1", "--approve", "--budget-usd", "2", "--model", "fixture-model", "--api-key", "fixture-key", "--base-url", url }, &.{}, "");
+    const started = try c.cliEnabledInput(&.{ "mcp", "--request-file", try c.request(), "--id", "policy1", "--approve", "--budget-usd", "2", "--model", "fixture-model", "--api-key", "fixture-key", "--base-url", url }, &.{}, "");
     if (std.mem.indexOf(u8, started.stderr, "SandboxUnavailable") != null) return error.SkipZigTest;
     try testing.expectEqual(@as(i32, 0), started.exit_code);
     const saved = try c.read("state/teamwork/policy1/run.json");
@@ -425,7 +490,7 @@ test "teamwork command: resume refuses a weaker host sandbox policy" {
     try testing.expect(!std.mem.eql(u8, saved, live));
     try c.write("state/teamwork/policy1/run.json", live);
     try c.write("repo/.claude/settings.json", "{\"sandbox\":{\"enabled\":true}}");
-    const resumed = try c.cli(&.{ "resume", "policy1", "--approve", "--api-key", "fixture-key", "--base-url", url });
+    const resumed = try c.cliEnabled(&.{ "resume", "policy1", "--approve", "--api-key", "fixture-key", "--base-url", url });
     try testing.expect(resumed.exit_code != 0);
     try testing.expect(std.mem.indexOf(u8, resumed.stderr, "ConfigurationChanged") != null);
     try testing.expectEqual(@as(usize, 0), provider.requestCount());

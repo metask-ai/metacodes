@@ -111,6 +111,7 @@ pub const harness_log_file = "harness.log";
 pub const claude_state_roots = [_][]const u8{ "~/.claude", "~/.claude.json", "~/.claude.json.backup", "~/.claude.json.lock" };
 
 pub const Options = struct {
+    preview: bool = false,
     /// The runtime's environment as `KEY=VALUE` entries
     /// (`platform.paths.environment`), borrowed; filtered by `env_allowlist`.
     parent_env: []const [:0]const u8,
@@ -174,6 +175,7 @@ pub const ClaudeCodeDriver = struct {
         paths: types.SeatPaths,
         abort: *const types.AbortSignal,
     ) types.SeatDriver.Error!types.SeatOutcome {
+        if (!self.options.preview) return .{ .failed = .spawn_failed };
         const external = switch (spec.harness) {
             .claude_code => |external| external,
             .metacodes => {

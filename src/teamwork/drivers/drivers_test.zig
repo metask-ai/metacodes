@@ -290,7 +290,7 @@ const parent_env = [_][:0]const u8{
 };
 
 fn claudeOptions() claude_code.Options {
-    return .{ .parent_env = &parent_env, .home_dir = "/nonexistent-home" };
+    return .{ .preview = true, .parent_env = &parent_env, .home_dir = "/nonexistent-home" };
 }
 
 fn claudeSpec(command: []const u8, budget: types.BudgetEnforcement) !types.SeatSpec {
@@ -527,6 +527,7 @@ const MetacodesHost = struct {
 
     fn deps(self: *const MetacodesHost, prov: provider_mod.Provider, fx: *const Fixture) metacodes.Deps {
         return .{
+            .preview = true,
             .provider = prov,
             .tool_defs = self.tool_defs,
             .permission_ctx = &self.perm,
@@ -586,6 +587,21 @@ test "teamwork drivers L2: switching a seat's harness in config switches the spa
     const deps: factory.Deps = .{ .metacodes = host.deps(scripted.provider(), &fx), .claude_code = claudeOptions() };
 
     var abort = types.AbortSignal.init();
+    var disabled = deps;
+    disabled.metacodes.preview = false;
+    disabled.claude_code.preview = false;
+    for ([_]struct { spec: *const types.SeatSpec, seat: usize }{
+        .{ .spec = local_spec, .seat = local_seat },
+        .{ .spec = external_spec, .seat = external_seat },
+    }) |entry| {
+        var denied_driver = factory.forSeat(entry.spec, disabled, fx.binding(entry.seat));
+        var denied = try denied_driver.driver().run(testing.allocator, entry.spec, fx.paths(entry.seat), &abort);
+        defer denied.deinit(testing.allocator);
+        try testing.expectEqual(types.SeatError.spawn_failed, denied.failed);
+    }
+    try testing.expect(fake.readRecord(testing.allocator) == null);
+    try testing.expectEqual(@as(usize, 0), scripted.calls);
+    try testing.expectEqual(@as(usize, 0), fx.ledger.entries);
     var local_driver = factory.forSeat(local_spec, deps, fx.binding(local_seat));
     try testing.expectEqual(types.Harness.metacodes, local_driver.harness());
     var local_outcome = try local_driver.driver().run(testing.allocator, local_spec, fx.paths(local_seat), &abort);

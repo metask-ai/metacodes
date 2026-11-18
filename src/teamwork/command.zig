@@ -24,12 +24,15 @@ pub const help =
     \\       metacodes [--state-dir <dir>] teamwork mcp --request-file <file> --approve [options]
     \\
     \\Run options: --id <id> --budget-usd <dollars> --max-rounds <n>
+    \\             --preview | --no-preview (last flag wins; overrides saved preview)
     \\             --check-command <command> --config-json <teamwork-object>
     \\Provider options: --provider <profile> --model <model> --base-url <url>
     \\                  --api-key <key> --verbose
     \\Configuration: state/config.json teamwork < project/.metacodes/teamwork.json < CLI.
     \\A positive dollar cap and explicit --approve are required. Approval covers
     \\the request, configured harnesses/check, spend up to the cap and merge-back.
+    \\Teamwork requires preview (off by default). --preview does not approve a task.
+    \\Status and cancellation of an existing handle remain available with preview off.
     \\Runs are synchronous. Resume uses the saved approved policy, never new overrides.
     \\Status always emits JSON and starts no provider. Exit: 0 done/status/help,
     \\1 terminal failure, 2 invalid input/refusal. Required sandbox; no fallback.
@@ -56,7 +59,11 @@ pub fn parse(arena: std.mem.Allocator, args: anytype) !Options {
         out.id = try types.RunId.parse(args.next() orelse return error.RunIdMissing);
     }
     while (args.next()) |arg| {
-        if (eq(arg, "--approve")) {
+        if (eq(arg, "--preview")) {
+            out.host_config.preview = .enabled;
+        } else if (eq(arg, "--no-preview")) {
+            out.host_config.preview = .disabled;
+        } else if (eq(arg, "--approve")) {
             out.approve = true;
         } else if (eq(arg, "--json")) {
             if (out.action != .status) return error.UnknownOption;
@@ -116,6 +123,8 @@ pub const Prepared = struct {
 /// Approval is checked before file reads, git, App startup or run creation.
 pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u8, workspace: []const u8) !Prepared {
     if (!options.approve) return error.ApprovalRequired;
+    const preview = try @import("../app/config.zig").resolvePreview(arena, state_root, options.host_config.preview);
+    if (!preview.isEnabled()) return error.PreviewDisabled;
     if (options.action != .run and options.action != .@"resume" and options.action != .mcp) return error.UnknownCommand;
     const generated = @import("../core/session_id.zig").gen();
     const id = options.id orelse try types.RunId.parse(generated.asSlice());
@@ -237,6 +246,7 @@ pub const Host = struct {
     parent_env: []const [:0]const u8,
 
     pub fn create(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled) !*Host {
+        if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
         try supported(cfg);
         if (!sandbox_exec.hostSupported()) return error.SandboxUnavailable;
         // Other embedders can supply an App with deferred MCP publication.
@@ -271,8 +281,10 @@ pub const Host = struct {
     pub fn deps(self: *Host) runtime.Deps {
         const app = self.app;
         return .{
+            .preview = app.config.preview.isEnabled(),
             .seats = .{ .harness = .{
                 .metacodes = .{
+                    .preview = app.config.preview.isEnabled(),
                     .provider = app.provider(),
                     .anthropic_client = app.anthropicClientOrNull(),
                     .tool_defs = app.tool_defs,
@@ -341,6 +353,7 @@ pub fn execute(arena: std.mem.Allocator, app: *App, prepared: Prepared) !u8 {
 }
 
 pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, mcp: ?McpHost) !u8 {
+    if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
     if (prepared.action == .mcp and mcp == null) return error.McpHostUnavailable;
     var cfg = prepared.cfg;
     if (prepared.action != .@"resume") {

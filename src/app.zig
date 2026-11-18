@@ -759,14 +759,7 @@ pub const App = struct {
         const app = try allocator.create(App);
         errdefer allocator.destroy(app);
         var active_config = config;
-        if (active_config.preview == .inherit) {
-            const saved = if (config.state_root.len > 0)
-                try @import("app/config.zig").loadFromHome(allocator, config.state_root)
-            else
-                @import("app/config.zig").FileConfig{};
-            defer saved.deinit(allocator);
-            active_config.preview = active_config.preview.resolve(saved.preview);
-        }
+        active_config.preview = try @import("app/config.zig").resolvePreview(allocator, config.state_root, config.preview);
 
         // 顺序：先把 conversation/skills/jobs/tasks/abort 等"空壳"放好,
         // 然后注册动态工具（Skill 需要 &app.skills 指针）,

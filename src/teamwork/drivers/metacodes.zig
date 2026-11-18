@@ -38,6 +38,7 @@ const log = @import("../../util/log.zig");
 
 /// What a metacodes seat runs on, all borrowed for the driver's life.
 pub const Deps = struct {
+    preview: bool = false,
     provider: provider_mod.Provider,
     /// For Anthropic server tools; null for any other provider.
     anthropic_client: ?*client_mod.Client = null,
@@ -95,6 +96,7 @@ pub const MetacodesDriver = struct {
         paths: types.SeatPaths,
         abort: *const types.AbortSignal,
     ) types.SeatDriver.Error!types.SeatOutcome {
+        if (!self.deps.preview) return .{ .failed = .spawn_failed };
         if (spec.harness != .metacodes) {
             log.warn("teamwork", "seat {s}: metacodes driver given a {s} seat", .{ self.binding.seat.slice(), spec.harnessKind().name() });
             return .{ .failed = .spawn_failed };
@@ -144,6 +146,7 @@ pub const MetacodesDriver = struct {
             abort,
             prompt,
             .{
+                .preview = self.deps.preview,
                 .max_turns = self.deps.max_turns,
                 .system_prompt = charters.forRole(spec.role),
                 .cost_budget_usd = self.binding.ledger.remainingUsd(),

@@ -2631,9 +2631,14 @@ fn maybePrepareTeamwork(init: std.process.Init, arena: std.mem.Allocator, leadin
     defer args.deinit();
     _ = args.next();
     for (0..leading) |_| _ = args.next();
-    const name = args.next() orelse return null;
+    var name = args.next() orelse return null;
+    var leading_preview: types.PreviewSetting = .inherit;
+    while (std.mem.eql(u8, name, "--preview") or std.mem.eql(u8, name, "--no-preview")) {
+        leading_preview = if (std.mem.eql(u8, name, "--preview")) .enabled else .disabled;
+        name = args.next() orelse return null;
+    }
     if (!std.mem.eql(u8, name, "teamwork")) return null;
-    const options = teamwork_command.parse(arena, &args) catch |err| {
+    var options = teamwork_command.parse(arena, &args) catch |err| {
         std.debug.print("error: teamwork: {s}\n{s}", .{ @errorName(err), teamwork_command.help });
         std.process.exit(2);
     };
@@ -2650,6 +2655,8 @@ fn maybePrepareTeamwork(init: std.process.Init, arena: std.mem.Allocator, leadin
         std.process.exit(0);
     }
     const cwd = try @import("util/fs.zig").getCwd(arena);
+    if (options.host_config.preview == .inherit) options.host_config.preview = leading_preview;
+    if (options.approve) options.host_config.preview = try @import("app/config.zig").resolvePreview(arena, state_root, options.host_config.preview);
     const prepared = teamwork_command.prepare(arena, options, state_root, cwd) catch |err| {
         std.debug.print("error: teamwork: {s}\n", .{@errorName(err)});
         std.process.exit(2);
@@ -5140,7 +5147,7 @@ fn printHelp() void {
         \\  --settings <path>     Extra settings JSON (CLI layer)
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
-        \\  --preview             Enable preview features, including ExecuteCode
+        \\  --preview             Enable preview features, including ExecuteCode and Teamwork
         \\  --no-preview          Disable preview features, overriding config.json
         \\  --verification-checkpoint  Enable the experimental post-test checkpoint
         \\  --verification-final-gate  Enforce the session-end verification obligation

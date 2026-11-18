@@ -89,7 +89,7 @@ const Fixture = struct {
 
     fn start(self: *Fixture, seats: *Seats, auditor: audit.CompletionAuditor) !*runtime.Run {
         const cfg = (try config.validate(try config.parse(self.arena.allocator(), "{\"enabled\":true,\"budget_usd\":5,\"check_command\":\"" ++ check ++ "\"}", null), null)).enabled;
-        return runtime.Run.start(gpa, .{ .seats = .{ .custom = .{ .ctx = seats, .driverFn = Seats.driver } }, .auditor = auditor }, .{ .text = request }, cfg, .{
+        return runtime.Run.start(gpa, .{ .preview = true, .seats = .{ .custom = .{ .ctx = seats, .driverFn = Seats.driver } }, .auditor = auditor }, .{ .text = request }, cfg, .{
             .workspace = self.repo,
             .state_root = self.state,
             .run_id = try types.RunId.parse("run-mcp-test"),
@@ -148,6 +148,38 @@ fn ready(server: *mcp.Server) !void {
     try testing.expect((try server.handle(gpa, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":[]}")) == null);
     try expectRpcError(server, status_call, -32000);
     try testing.expect((try server.handle(gpa, initialized)) == null);
+}
+
+test "teamwork preview L2: MCP cannot dispatch or complete after host opt-out; status and cancel remain usable" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    var seats: Seats = .{};
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const run = try fx.start(&seats, auditor.auditor());
+    defer run.destroy();
+    run.deps.preview = false;
+    var server = mcp.Server.init(gpa, run);
+    try ready(&server);
+    const saved = try readFile(run.dir.root, "run.json");
+    defer gpa.free(saved);
+    for ([_][]const u8{ implement, complete }) |request_line| {
+        var response = try call(&server, request_line);
+        defer response.deinit();
+        try testing.expect(response.value.object.get("result").?.object.get("isError").?.bool);
+        try testing.expectEqualStrings("PreviewDisabled", payload(response.value).object.get("error").?.string);
+    }
+    try expectRpcError(&server, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"teamwork_dispatch\",\"arguments\":{\"role\":\"implementer\",\"preview\":true}}}", -32602);
+    try expectFile(run.dir.root, "run.json", saved);
+    try testing.expectEqual(@as(u32, 0), seats.calls);
+    try testing.expectEqual(@as(f64, 0), run.status().budget.spent_usd);
+    var response = try call(&server, status_call);
+    response.deinit();
+    response = try call(&server, cancel);
+    defer response.deinit();
+    try testing.expectEqual(runtime.Phase.cancelled, run.status().state.phase());
+    try testing.expectEqual(@as(u32, 0), seats.calls);
 }
 
 fn payload(response: std.json.Value) std.json.Value {

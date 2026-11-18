@@ -4,6 +4,7 @@
       "type": "stdio",
       "command": "/absolute/path/to/metacodes",
       "args": [
+        "--preview",
         "teamwork",
         "mcp",
         "--request-file",

@@ -49,6 +49,7 @@ pub const VerifierAuditor = struct {
 
     fn auditFn(ptr: *anyopaque, gpa: std.mem.Allocator, request: audit.AuditRequest) audit.CompletionAuditor.Error!audit.AuditVerdict {
         const self: *VerifierAuditor = @ptrCast(@alignCast(ptr));
+        if (!request.preview) return .{ .unavailable = try gpa.dupe(u8, "Teamwork preview is disabled.\n") };
         var snapshot = isolation.Snapshot.create(gpa, request.scratch_dir, request.workspace, request.base, request.abort) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .unavailable = try gpa.dupe(u8, "The approved audit snapshot could not be created.\n") },
@@ -88,6 +89,7 @@ pub const VerifierAuditor = struct {
         budget.cost_usd = @min(budget.cost_usd, request.ledger.remainingUsd());
         if (!(budget.cost_usd > 0)) return .{ .unavailable = try gpa.dupe(u8, "No run budget is left for the verifier.\n") };
         var deps = self.deps;
+        deps.preview = request.preview;
         deps.abort = request.abort;
         var sandbox = write_scope.seatSandbox(deps.sandbox);
         const git_protection = try write_scope.GitProtection.init(gpa, snapshot.path, sandbox.deny_write);

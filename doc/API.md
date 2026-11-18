@@ -291,7 +291,7 @@ promise: the HTTP endpoint shapes remain pre-1.0.
 
 ## CLI surface
 
-`metacodes [--state-dir <dir>] teamwork run --request-file <file> --approve
+`metacodes [--state-dir <dir>] --preview teamwork run --request-file <file> --approve
 --budget-usd <cap>` runs the approved SWE loop synchronously: implementer,
 reviewer, isolated completion verifier, then merge-back into the user's
 workspace without committing. `--approve` authorizes the request bytes,
@@ -300,6 +300,31 @@ and merge-back. No App/provider, seat or worktree starts before approval.
 The state root must be outside the repository. All workers, pinned checks
 and verifier tools require Sandbox Foundations; an unavailable backend fails
 closed. Native and Claude Code implementer/reviewer seats are supported.
+
+Teamwork is a **preview feature**, disabled by default. It uses the same root
+`"preview": true` in `<state root>/config.json` and the same `--preview` /
+`--no-preview` flags as ExecuteCode. Flags may precede `teamwork` or follow
+the action; the last flag wins and overrides the saved value. CLI dispatch
+before App initialization and App initialization share `app/config.zig`'s
+`resolvePreview` (`FileConfig` loading plus `Setting.resolve`). `--preview`
+selects the feature; it does not approve a task or authorize spend.
+
+With preview disabled, start/resume and Manager execution fail with
+`PreviewDisabled` before App/provider startup, run creation or recovery,
+worker probes, budget admission, auditing or merge-back. A saved approval,
+checkpoint or MCP field cannot grant current preview authorization. Read-only
+CLI status remains available without loading global configuration. Existing
+runtime/MCP handles retain status, cancellation and destruction/cleanup after
+host opt-out; only the host's abort signal is safe to change concurrently.
+
+Zig hosts explicitly supply `teamwork_runtime.Deps.preview` (default false),
+independently of the approved task configuration. `Run.start`, `reopen`,
+`dispatch` and `requestCompletion` enforce it. Production hosts project the
+resolved `app.config.preview.isEnabled()` and propagate that bool into native
+seat and verifier subagents and worker launch admission. Third-party Claude
+Code is gated before probing/launch; it is not passed metacodes-only flags.
+This increment adds no AgentCore ABI field: the shared revision-29 preview
+setting and SDK bindings come from the preview framework dependency.
 
 Configuration precedence is `<state root>/config.json`'s `teamwork` object,
 repository-root `.metacodes/teamwork.json` (a bare teamwork object), then
@@ -320,7 +345,7 @@ repair. A missing budget ledger means no charges yet. A torn budget tail is
 reported and excluded from totals; `budget.pending` shows an outstanding
 pre-call reservation without consuming, settling or deleting it. Reads during
 execution are observations of individually atomic files, not one transaction.
-`teamwork resume <id> --approve` resumes from the approval stored with `run.json`.
+`teamwork resume <id> --preview --approve` resumes from the approval stored with `run.json`.
 The approved budget, check, seat models, effective permissions and sandbox
 restrictions must match the run's saved fingerprints. Older CLI runs without
 a host-policy fingerprint still support status, and need a new approval to run.

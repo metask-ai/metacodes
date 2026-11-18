@@ -16,6 +16,11 @@ empty `### Migration`.
 
 ### Changed
 
+- The Teamwork CLI/Manager consumer fixture explicitly opts in with `--preview`;
+  saved root `preview: true` is equivalent and `--no-preview` overrides it.
+  Direct Zig Teamwork hosts supply current `Deps.preview` separately from saved
+  run data. Task approval and budget remain required. This integration adds no
+  ABI field or offset beyond the shared revision-29 preview setting below.
 - ABI revision 29 adds `RuntimeConfigV1.preview` at offset 72 (0 or 1,
   default 0), consuming one reserved word without changing the 96-byte struct.
   Preview built-ins are excluded unless enabled; selecting `ExecuteCode`
