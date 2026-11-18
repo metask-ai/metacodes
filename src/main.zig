@@ -5028,9 +5028,9 @@ fn printHelp() void {
         \\metacodes — embeddable agent core and coding CLI
         \\Usage: metacodes [options]
         \\  --version             Print version and build identity and exit (--json: one JSON document)
-        \\  bench [open|info|list|run] [--url <workbench>] [--no-open]
-        \\                        Open Bench workbench; select tasks/models and run evaluations.
-        \\                        bench run --task <name> --wait prints the result link when done.
+        \\  bench [open|info|list|run|prepare] [--url <workbench>] [--no-open]
+        \\                        Open Bench workbench; pick a benchmark suite, tasks and model, run evaluations.
+        \\                        bench run [--suite <id>] --task <name> --wait prints the result link when done.
         \\  doctor [--json | --plain] [--strict]
         \\                        Report where ripgrep and TinyKG resolve from and whether they match this build
         \\  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]

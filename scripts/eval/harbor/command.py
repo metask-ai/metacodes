@@ -184,6 +184,37 @@ def metacodes_flags(
     return flags
 
 
+def mcp_servers_config(servers: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
+    """metacodes `mcpServers` entries for the MCP servers a Harbor task declares.
+
+    Harbor passes a task's `[[environment.mcp_servers]]` (MCPServerConfig:
+    name, transport sse/streamable-http/stdio, url, command, args, headers)
+    to the agent; GAIA2's CLI mode serves its environment that way. Without
+    them the agent would see none of the task's tools.
+    """
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for server in servers:
+        get = server.get if isinstance(server, Mapping) else (lambda key, s=server: getattr(s, key, None))
+        name, transport = get("name"), get("transport") or "sse"
+        if not isinstance(name, str) or not name:
+            raise ValueError("MCP server without a name")
+        if transport in ("streamable-http", "sse"):
+            if not get("url"):
+                raise ValueError(f"MCP server {name} has no url")
+            entry: Dict[str, Any] = {"type": "http" if transport == "streamable-http" else "sse", "url": get("url")}
+            if get("headers"):
+                entry["headers"] = dict(get("headers"))
+        elif transport == "stdio":
+            if not get("command"):
+                raise ValueError(f"MCP server {name} has no command")
+            entry = {"type": "stdio", "command": get("command"), "args": list(get("args") or [])}
+        else:
+            raise ValueError(f"MCP server {name}: unsupported transport {transport}")
+        result[name] = entry
+    return result
+
+
 def run_command(
     *,
     state_dir: str,

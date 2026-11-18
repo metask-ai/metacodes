@@ -24,6 +24,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 from http.cookies import SimpleCookie
 
+from scripts.eval.harbor import suites
 from scripts.eval.harbor.viewer import data
 from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
 
@@ -50,6 +51,8 @@ def make_handler(library: data.Library, manager=None, token=""):
     def managed_view(path, with_rows=True):
         view = data.job_view(path)
         run = next((r for r in manager.runs() if r["name"] == path.name), None) if manager else None
+        # Suite/category: the launch record, else inferred from Harbor's dataset.
+        view.update(suites.label((run or {}).get("suite")) or suites.label(suites.infer(view.get("dataset"))))
         if run and run["status"] in {"failed", "cancelled", "interrupted"} and view["running"]:
             # Harbor may be interrupted before it writes a final result.
             # Preserve those files, and display the durable worker outcome.
@@ -137,6 +140,14 @@ def make_handler(library: data.Library, manager=None, token=""):
             elif path == "/api/workbench":
                 catalog = manager.catalog() if manager else {"service": "metacodes-bench", "schema_version": 1, "ready": False, "reasons": ["当前服务为只读模式"], "runs": []}
                 self.send_json({**catalog, "can_run": self.authorized()})
+            elif path == "/api/suite":
+                if manager is None:
+                    self.send_json({"error": "当前服务为只读模式"}, 404)
+                    return
+                try:
+                    self.send_json(manager.suite_tasks(query.get("id")))
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, 404)
             elif path == "/api/run":
                 record = next((r for r in manager.runs() if r["name"] == query.get("name")), None) if manager else None
                 if not record:

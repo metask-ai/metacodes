@@ -16,7 +16,9 @@ from scripts.eval.harbor.profiling import TimingRelay, auth_for, upstream_for
 
 
 def command(spec):
-    argv = [spec["harbor"], "run", "-d", spec["dataset"],
+    # Specs written before suites carried only the Terminal-Bench 2.1 ref.
+    dataset_args = spec.get("dataset_args") or ["-d", spec["dataset"]]
+    argv = [spec["harbor"], "run", *dataset_args,
             "-a", "scripts.eval.harbor.metacodes_agent:MetacodesAgent", "-m", spec["model"],
             "--ak", "bundle=" + spec["bundle"], "--ae", spec["key_env"] + "=${" + spec["key_env"] + "}",
             "-k", str(spec["attempts"]), "-n", str(spec["concurrency"]),
@@ -31,9 +33,18 @@ def command(spec):
         argv += ["--ak", "metrics_proxy=" + spec["metrics_proxy"]]
     if spec.get("metrics_ca"):
         argv += ["--ak", "metrics_ca=" + spec["metrics_ca"]]
-    for task in spec["tasks"]:
-        argv += ["-i", "terminal-bench/" + task]
+    filters = spec.get("task_filters") or ["terminal-bench/" + task for task in spec["tasks"]]
+    for pattern in filters:
+        argv += ["-i", pattern]
     return argv
+
+
+def child_process(spec, env):
+    """(argv, cwd, env) of the evaluation child for this spec's runner."""
+    if spec.get("runner") == "workbuddy":
+        from scripts.eval.harbor.suites import workbuddy
+        return workbuddy.launch(spec, env)
+    return command(spec), None, env
 
 
 def prepare(spec, env):
@@ -87,7 +98,8 @@ def main(argv=None):
         if spec_path.with_suffix(".cancel").exists():
             record.update(status="cancelled", finished_at=now())
             return 1
-        process = subprocess.Popen(command(spec), env=env, stdin=subprocess.DEVNULL,
+        argv, cwd, child_env = child_process(spec, env)
+        process = subprocess.Popen(argv, env=child_env, cwd=cwd, stdin=subprocess.DEVNULL,
                                    start_new_session=True)
         record["status"] = "running"
         cancelled = False
@@ -118,6 +130,12 @@ def main(argv=None):
     finally:
         if relay:
             relay.__exit__(None, None, None)
+        if spec.get("runner") == "workbuddy":
+            from scripts.eval.harbor.suites import workbuddy
+            try:
+                workbuddy.finish(spec)
+            except OSError:
+                record["error"] = record.get("error") or "WorkBuddy 临时配置清理失败"
         atomic_json(record_path, record)
     return 0 if record.get("status") == "finished" else 1
 

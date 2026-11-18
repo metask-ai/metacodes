@@ -19,6 +19,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
+from scripts.eval.harbor import suites
 from scripts.eval.harbor.viewer import data
 from scripts.eval.harbor.viewer.runner import RunManager, atomic_json, runtime_env, settings
 
@@ -120,9 +121,46 @@ def ensure_service(args, root, config, jobs_dir):
     raise ValueError("工作台未在 15 秒内就绪，请查看 " + str(root / "service.log"))
 
 
+def print_suites(value):
+    """Suites grouped by category, with what keeps each from running."""
+    by_category = {}
+    for suite in value.get("suites", []):
+        by_category.setdefault(suite["category"], []).append(suite)
+    for category in value.get("categories", []):
+        rows = by_category.get(category["id"], [])
+        if not rows:
+            continue
+        print(category["name"] + "：")
+        for suite in rows:
+            count = "?" if suite.get("task_count") is None else str(suite["task_count"])
+            state = "可运行" if suite["ready"] else "待配置"
+            print(f"  {suite['id']:<20} {suite['name']}（{count} 题，{state}）")
+            # Service-wide reasons are printed once above.
+            for reason in suite["reasons"]:
+                if reason not in value.get("reasons", []):
+                    print("      " + reason)
+
+
+def prepare_suite(args, root, config, cfg):
+    """Run a harbor-local suite's adapter here, on the execution machine."""
+    suite = suites.get(args.suite)
+    if suite.runner != suites.HARBOR_LOCAL:
+        raise ValueError(suite.name + " 不需要准备数据集")
+    module = suites.adapter_module(suite)
+    if module is None:
+        raise ValueError(suite.name + " 适配器尚未接入")
+    dest = root / "datasets" / suite.id
+    produced = Path(module.prepare(dest)).resolve()
+    if produced != dest.resolve():
+        cfg.setdefault("datasets", {})[suite.id] = str(produced)
+        atomic_json(config, cfg)
+    tasks = suites.local_tasks(produced)
+    return {"suite": suite.id, "dataset": str(produced), "task_count": len(tasks)}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
-    parser.add_argument("action", nargs="?", default="open", choices=["open", "info", "list", "run", "stop"])
+    parser.add_argument("action", nargs="?", default="open", choices=["open", "info", "list", "run", "stop", "prepare"])
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
     parser.add_argument("--url", default=os.environ.get("METACODES_BENCH_URL"), help="连接已有工作台（例如 devbox）")
     parser.add_argument("--jobs-dir", type=Path)
@@ -138,7 +176,11 @@ def main(argv=None):
     parser.add_argument("--public-url", help="输出的工作台地址（用于 devbox 网络访问）")
     parser.add_argument("--no-open", action="store_true", help="仅输出链接，不打开浏览器")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--task", action="append", default=[], help="运行的任务名，可重复")
+    parser.add_argument("--suite", help="评测集 id（bench info 列出；默认 " + suites.DEFAULT_SUITE + "）")
+    parser.add_argument("--task", action="append", default=[], help="运行的任务名，可重复；省略时运行该评测集的推荐样例")
+    parser.add_argument("--dataset", action="append", default=[], metavar="SUITE=DIR",
+                        help="已生成的本地 Harbor 数据集目录（harbor-local 评测集）")
+    parser.add_argument("--workbuddy-checkout", type=Path, help="WorkBuddy-Bench checkout（provision_checkout.sh 准备）")
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--wait", action="store_true", help="等待评测结束后返回结果和工作台链接")
@@ -152,7 +194,7 @@ def main(argv=None):
             root.chmod(0o700)
         config = root / "workbench.json"
         cfg = settings(config)
-        for name in ("bundle", "provider_config", "jobs_dir", "account_state_dir"):
+        for name in ("bundle", "provider_config", "jobs_dir", "account_state_dir", "workbuddy_checkout"):
             value = getattr(args, name)
             if value is not None:
                 cfg[name] = str(value.expanduser().resolve())
@@ -161,6 +203,11 @@ def main(argv=None):
             if value is not None:
                 cfg[name] = value
         cfg.setdefault("account_state_dir", str(state))
+        for item in args.dataset:
+            suite_id, sep, directory = item.partition("=")
+            if not sep or not directory or suites.get(suite_id).runner != suites.HARBOR_LOCAL:
+                parser.error("--dataset 需要 SUITE=DIR，SUITE 为 harbor-local 评测集")
+            cfg.setdefault("datasets", {})[suite_id] = str(Path(directory).expanduser().resolve())
         if args.auth:
             cfg["auth_mode"] = args.auth
         elif args.provider_config:
@@ -178,6 +225,13 @@ def main(argv=None):
                         client = existing
                 except (OSError, ValueError):
                     pass
+        if args.action == "prepare":
+            if args.url or not args.suite:
+                parser.error("bench prepare 需要 --suite，并在执行机器本地运行")
+            value = prepare_suite(args, root, config, cfg)
+            print(json.dumps(value, ensure_ascii=False) if args.json else
+                  f"{value['suite']}：{value['task_count']} 道任务 → {value['dataset']}")
+            return 0
         if args.action == "stop":
             saved = settings(root / "service.json")
             if client is None and saved.get("url"):
@@ -198,6 +252,7 @@ def main(argv=None):
                         print("  " + reason)
                     for model in value.get("models", []):
                         print("模型：" + model["id"])
+                    print_suites(value)
             else:
                 value = client.request("api/jobs") if client else {"jobs": data.Library([jobs_dir]).overview()}
                 if not args.json:
@@ -211,11 +266,18 @@ def main(argv=None):
             return 0
         client = client or ensure_service(args, root, config, jobs_dir)
         if args.action == "run":
-            if not args.task:
-                parser.error("bench run 需要 --task，可重复选择几道题")
-            model = args.model or client.request("api/workbench").get("default_model")
-            record = client.request("api/runs", {"model": model, "tasks": args.task,
-                                    "attempts": args.attempts, "concurrency": args.concurrency})
+            workbench = client.request("api/workbench")
+            suite_id = args.suite or workbench.get("default_suite") or suites.DEFAULT_SUITE
+            tasks = args.task
+            if not tasks:
+                tasks = client.request("api/suite?id=" + urllib.parse.quote(suite_id)).get("default_tasks")
+                if not tasks:
+                    parser.error("bench run 需要 --task（该评测集没有推荐样例），可重复选择几道题")
+            model = args.model or workbench.get("default_model")
+            payload = {"model": model, "tasks": tasks, "attempts": args.attempts, "concurrency": args.concurrency}
+            if args.suite:
+                payload["suite"] = args.suite
+            record = client.request("api/runs", payload)
             url = client.url + "#/run/" + record["name"]
             if args.wait:
                 while record["status"] in ("queued", "starting", "running", "cancelling"):

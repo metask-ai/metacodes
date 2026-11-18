@@ -11,7 +11,7 @@ const PHASES = [['environment', '环境'], ['setup', '安装'], ['agent', 'agent
 const REFRESH_S = 10;
 
 const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, live: false,
-  jobFilter: 'all', jobSearch: '', sort: { key: 'task', dir: 1 }, selected: new Set() };
+  jobFilter: 'all', jobSearch: '', suite: null, category: 'all', sort: { key: 'task', dir: 1 }, selected: new Set() };
 
 // ------------------------------------------------------------ DOM helpers
 function h(tag, props, ...children) {
@@ -172,7 +172,15 @@ async function renderOverview() {
 
   const compareBtn = h('button', { class: 'button primary', type: 'button', disabled: state.selected.size < 2 || null,
     onclick: () => { location.hash = '#/compare/' + [...state.selected].map(encodeURIComponent).join(','); } }, `对比所选 (${state.selected.size})`);
-  const rows = jobs.map((j) => {
+  // Category filter: categories present among the jobs, plus unclassified.
+  const present = new Map();
+  for (const j of jobs) present.set(j.category || 'none', j.category_name || '未分类');
+  if (state.category !== 'all' && !present.has(state.category)) state.category = 'all';
+  const filter = present.size > 1 || state.category !== 'all' ? h('div', { class: 'chips', role: 'group', 'aria-label': '按类别筛选' },
+    [['all', '全部类别'], ...present].map(([id, name]) => h('button', { type: 'button', class: 'chip', 'aria-pressed': String(state.category === id),
+      onclick: () => { state.category = id; render(); } }, name))) : null;
+  const visible = state.category === 'all' ? jobs : jobs.filter((j) => (j.category || 'none') === state.category);
+  const rows = visible.map((j) => {
     const s = j.summary;
     const done = s.trials - s.counts.running;
     const box = h('input', { type: 'checkbox', 'aria-label': '选择 ' + j.name, onclick: (e) => e.stopPropagation(),
@@ -180,7 +188,7 @@ async function renderOverview() {
     box.checked = state.selected.has(j.name);
     return h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
       h('td', {}, box),
-      h('td', {}, h('span', { text: j.name }), h('span', { class: 'sub', text: (j.dataset || '') + (j.running ? ' · 运行中' : '') })),
+      h('td', {}, h('span', { text: j.name }), h('span', { class: 'sub', text: [j.category_name, j.suite_name || j.dataset].filter(Boolean).join(' · ') + (j.running ? ' · 运行中' : '') })),
       h('td', { text: j.model || '—' }),
       h('td', {}, h('span', { class: 'num', text: `${done} / ${j.planned}` }), h('div', { class: 'track' }, h('span', { width: (j.planned ? 100 * done / j.planned : 0) + '%' }))),
       h('td', {}, outcomeBar(s.counts, s.trials)),
@@ -196,10 +204,10 @@ async function renderOverview() {
   });
   const table = h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, ['', '作业', '模型', '进度', '结局分布', '首次满分率', '无效', '任务总 Token', '初始 Token（均值）', 'TPS', 'TTFT', '估算成本', '用时', '开始'].map((t, i) => h('th', { class: i >= 5 ? 'num' : null, text: t })))),
-    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 14, class: 'empty', text: '没有找到 Harbor 作业' })))));
+    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 14, class: 'empty', text: jobs.length ? '该类别下没有作业' : '没有找到 Harbor 作业' })))));
   const launches = runs.length ? panel('工作台发起的评测', `${runs.length} 次`,
     h('div', { class: 'launches' }, runs.map((r) => h('a', { class: 'launch', href: '#/run/' + r.name },
-      h('b', { text: r.name }), h('span', { class: 'muted', text: r.model }),
+      h('b', { text: r.name }), h('span', { class: 'muted', text: [r.suite_name, r.model].filter(Boolean).join(' · ') }),
       h('span', { text: RUN_STATUS[r.status] || r.status }))))) : null;
   const storagePanel = storage ? panel('数据保存位置', storage.format,
     h('div', { class: 'panel-body' },
@@ -207,55 +215,150 @@ async function renderOverview() {
       h('p', { class: 'muted', text: '执行机器本地文件：每个作业保存成绩 JSON、逐次轨迹和判分日志；新运行的请求计时保存在作业的 .bench-metrics/。' }),
       h('p', { class: 'muted', text: '历史日志未采集请求时间戳时，TPS / TTFT 显示未采集。首次满分率只看每道题的首次执行，重跑成绩不回填；基础设施无效项单列。' }),
       storage.records_dir ? h('p', { class: 'muted', text: '工作台启动记录：' + storage.records_dir }) : null)) : null;
-  return h('div', {}, metrics, launches, panel('作业', `${jobs.length} 个`, table, compareBtn), storagePanel);
+  return h('div', {}, metrics, launches, panel('作业', state.category === 'all' ? `${jobs.length} 个` : `${visible.length} / ${jobs.length} 个`, h('div', {}, filter, table), compareBtn), storagePanel);
 }
 
 // ------------------------------------------------------------ run workbench
 const RUN_STATUS = { queued: '等待启动', starting: '准备环境', running: '运行中',
   cancelling: '正在停止', cancelled: '已停止', finished: '运行完成', failed: '执行失败', interrupted: '执行中断' };
 
+const RUNNERS = { 'harbor-registry': 'Harbor 注册表', 'harbor-local': '本地生成数据集', workbuddy: 'WorkBuddy' };
+
 async function renderNewRun() {
   state.live = false;
   navCurrent('new');
   $('#title').textContent = '新建评测';
-  crumbs([{ text: '所有作业', href: '#/' }, { text: '选择任务和模型' }]);
+  crumbs([{ text: '所有作业', href: '#/' }, { text: '选择评测集、任务和模型' }]);
   const c = await api('/api/workbench');
+  const suites = c.suites || [];
+  const byId = new Map(suites.map((s) => [s.id, s]));
+  if (!byId.has(state.suite)) state.suite = byId.has(c.default_suite) ? c.default_suite : (suites[0] || {}).id;
   const form = h('form', { class: 'run-form' });
+
+  // Step 1: benchmark picker, grouped by category.
+  const picker = h('div', { class: 'suite-picker' });
+  const pickerBox = h('fieldset', {}, h('legend', { text: '评测集' }), picker);
+  // Step 2: tasks of the chosen suite.
+  const taskBox = h('fieldset', {}, h('legend', { text: '任务' }), h('div', { class: 'empty', text: '读取任务列表…' }));
   const model = h('select', { name: 'model', required: true },
     (c.models || []).map((m) => h('option', { value: m.id, selected: m.id === c.default_model }, m.label)));
-  form.append(h('label', { class: 'field' }, h('span', { text: '模型' }), model,
-    h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
-    c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
-    c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null));
-  const checks = (c.tasks || []).map((name) => h('label', { class: 'task-option' },
-    h('input', { type: 'checkbox', value: name, name: 'task' }), h('span', { class: 'mono', text: name })));
-  form.append(h('fieldset', {}, h('legend', { text: '试跑任务' }),
-    h('div', { class: 'task-options' }, checks), h('small', { class: 'muted', text: '常用题目；每次可选 1–20 道。' })));
-  const extra = h('textarea', { name: 'extra', rows: 2, placeholder: '其他 Terminal-Bench 2.1 任务名，逗号或换行分隔' });
-  form.append(h('label', { class: 'field' }, h('span', { text: '补充任务（可选）' }), extra));
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: 1, min: 1, max: 5, step: 1, required: true });
   const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: 1, min: 1, max: 3, step: 1, required: true });
-  form.append(h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
-    h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency)));
+  const suiteNotes = h('div', { class: 'callout', hidden: true });
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
-  const submit = h('button', { type: 'submit', class: 'button primary', disabled: !c.ready || !c.can_run }, '开始评测');
-  form.append(h('p', { class: 'muted', text: '评测会调用所选模型。提交后可在工作台持续查看进度，完成后保留结果链接。' }), feedback, submit);
+  const submit = h('button', { type: 'submit', class: 'button primary' }, '开始评测');
+  const selected = new Set();
+  let tasks = [];
+  let defaults = [];
+  let count = null;
+
+  function current() { return byId.get(state.suite); }
+  function syncSubmit() {
+    const s = current();
+    submit.disabled = !s || !s.ready || !c.can_run || !selected.size || selected.size > s.max_tasks;
+    if (count) count.textContent = `已选 ${selected.size} / 上限 ${s ? s.max_tasks : 0}`;
+  }
+  function drawPicker() {
+    picker.replaceChildren(...(c.categories || []).map((cat) => {
+      const members = suites.filter((s) => s.category === cat.id);
+      if (!members.length) return null;
+      return h('div', { class: members.length > 2 ? 'suite-group wide' : 'suite-group' },
+        h('div', { class: 'suite-group-head' }, h('b', { text: cat.name }), h('span', { class: 'muted', text: cat.description })),
+        h('div', { class: 'suite-cards' }, members.map((s) => h('button', {
+          type: 'button', class: 'suite-card', 'aria-pressed': String(s.id === state.suite), 'data-suite': s.id,
+          onclick: () => { if (state.suite !== s.id) { state.suite = s.id; drawPicker(); loadTasks(); } },
+        }, h('span', { class: 'suite-name', text: s.name }),
+        h('span', { class: 'sub', text: (s.task_count === null ? '任务待准备' : s.task_count + ' 题') + ' · ' + (RUNNERS[s.runner] || s.runner) }),
+        h('span', { class: 'suite-state ' + (s.ready ? 'ok' : s.available ? 'todo' : 'off'), text: s.ready ? '可运行' : s.available ? '待配置' : '尚未接入' })))));
+    }).filter(Boolean));
+  }
+  function drawTasks(error) {
+    const s = current();
+    concurrency.max = String(s.max_concurrency);
+    if (Number(concurrency.value) > s.max_concurrency) concurrency.value = String(s.max_concurrency);
+    const reasons = s.reasons || [];
+    suiteNotes.hidden = !reasons.length;
+    suiteNotes.replaceChildren(...reasons.map((text) => h('p', { text })));
+    if (!tasks.length) {
+      count = null;
+      taskBox.replaceChildren(h('legend', { text: `任务 · ${s.name}` }), h('p', { class: 'muted', text: s.description }),
+        h('div', { class: 'empty', text: error || '该评测集暂无可选任务' }));
+      syncSubmit();
+      return;
+    }
+    const list = h('div', { class: 'task-options' });
+    const search = h('input', { type: 'search', placeholder: `搜索 ${tasks.length} 道任务`, 'aria-label': '搜索任务' });
+    count = h('span', { class: 'muted num' });
+    const random = h('input', { type: 'number', min: 1, max: Math.min(s.max_tasks, tasks.length), value: Math.min(10, s.max_tasks, tasks.length), 'aria-label': '随机题数' });
+    const choose = (names) => { selected.clear(); for (const n of names) selected.add(n); drawList(); };
+    function drawList() {
+      const q = search.value.trim().toLowerCase();
+      const shown = q ? tasks.filter((t) => t.toLowerCase().includes(q)) : tasks;
+      list.replaceChildren(...shown.map((name) => {
+        const box = h('input', { type: 'checkbox', value: name, name: 'task', onchange: (e) => { e.target.checked ? selected.add(name) : selected.delete(name); syncSubmit(); } });
+        box.checked = selected.has(name);
+        return h('label', { class: 'task-option' }, box, h('span', { class: 'mono', text: name }));
+      }));
+      syncSubmit();
+    }
+    search.addEventListener('input', drawList);
+    const tools = h('div', { class: 'task-tools' },
+      search,
+      defaults.length ? h('button', { type: 'button', class: 'button', onclick: () => choose(defaults) }, `推荐样例（${defaults.length}）`) : null,
+      tasks.length <= s.max_tasks ? h('button', { type: 'button', class: 'button', onclick: () => choose(tasks) }, `全部（${tasks.length}）`) : null,
+      h('span', { class: 'task-random' }, '随机', random, '题',
+        h('button', { type: 'button', class: 'button', onclick: () => {
+          const n = Math.max(1, Math.min(Number(random.value) || 1, s.max_tasks, tasks.length));
+          const pool = [...tasks];
+          for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+          choose(pool.slice(0, n));
+        } }, '抽取')),
+      h('button', { type: 'button', class: 'button', onclick: () => choose([]) }, '清空'),
+      count);
+    taskBox.replaceChildren(h('legend', { text: `任务 · ${s.name}` }), h('p', { class: 'muted', text: s.description }), tools, list,
+      h('small', { class: 'muted', text: `每次 1–${s.max_tasks} 道；任务名必须属于该评测集。` }));
+    drawList();
+  }
+  async function loadTasks() {
+    const id = state.suite;
+    selected.clear();
+    tasks = []; defaults = [];
+    taskBox.replaceChildren(h('legend', { text: '任务' }), h('div', { class: 'empty', text: '读取任务列表…' }));
+    syncSubmit();
+    let error = null;
+    try {
+      const body = await api('/api/suite?id=' + encodeURIComponent(id));
+      if (id !== state.suite) return;
+      tasks = body.tasks || []; defaults = body.default_tasks || []; error = body.error || null;
+    } catch (e) { error = e.message; }
+    if (id === state.suite) drawTasks(error);
+  }
+
+  form.append(pickerBox, suiteNotes, taskBox,
+    h('label', { class: 'field' }, h('span', { text: '模型' }), model,
+      h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
+      c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
+      c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null),
+    h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
+      h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency)),
+    h('p', { class: 'muted', text: '评测会调用所选模型。提交后可在工作台持续查看进度，完成后保留结果链接。' }), feedback, submit);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
-    const tasks = [...form.querySelectorAll('[name=task]:checked')].map((e) => e.value)
-      .concat(extra.value.split(/[,，\s]+/).filter(Boolean));
     submit.disabled = true;
     feedback.textContent = '正在启动…';
     try {
-      const record = await api('/api/runs', { model: model.value, tasks: [...new Set(tasks)],
+      const record = await api('/api/runs', { suite: state.suite, model: model.value, tasks: tasks.filter((t) => selected.has(t)),
         attempts: Number(attempts.value), concurrency: Number(concurrency.value) });
       location.hash = '#/run/' + record.name;
     } catch (error) {
       feedback.textContent = error.message;
-      submit.disabled = false;
+      syncSubmit();
     }
   });
-  const notes = [...(c.reasons || []), ...(c.warnings || [])];
+  drawPicker();
+  if (state.suite) loadTasks();
+  const notes = [...(c.warnings || [])];
+  if (!suites.length) notes.push(...(c.reasons || []));
   if (!c.can_run) notes.push('请使用 metacodes bench 输出的授权链接打开工作台，启用运行操作。');
   const groupRows = (c.account_groups || []).map((g) => h('tr', {},
     h('td', { text: g.name }), h('td', { text: g.configured ? '已有账号 Key' : '尚未配置 Key' })));
@@ -266,7 +369,7 @@ async function renderNewRun() {
       h('p', { class: 'muted', text: '模型下拉框合并了已有 Key 的模型目录。其他可选组需要先在 Metask 账号中配置对应 Key，刷新后自动加入。' }),
       groupTable)) : null;
   return h('div', {}, notes.length ? h('div', { class: 'callout' }, notes.map((text) => h('p', { text }))) : null,
-    panel('Terminal-Bench 2.1', '独立容器运行 · 完整轨迹 · 自动判分', form), groups);
+    panel('新建评测', '按类别选择评测集 · 独立容器运行 · 完整轨迹 · 自动判分', form), groups);
 }
 
 async function renderRun(name) {
@@ -288,7 +391,7 @@ async function renderRun(name) {
     catch (_) { event.currentTarget.textContent = '请复制下方链接'; }
   } }, '复制结果链接');
   const summary = h('div', { class: 'panel-body run-state' },
-    h('p', { text: `${run.model} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}` }),
+    h('p', { text: `${run.suite_name ? run.suite_name + ' · ' : ''}${run.model} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}` }),
     h('p', { class: 'muted', text: run.error || (state.live ? '运行中，页面每 10 秒更新。' : '执行已结束，逐题结果和轨迹已保留。') }),
     h('a', { class: 'mono', href: url, text: url }));
   const log = h('details', { class: 'panel', 'data-key': 'runlog' }, h('summary', { text: '执行日志' }), h('pre', { text: run.log || '正在准备执行环境…' }));
@@ -331,7 +434,7 @@ async function renderJob(name) {
     metric('输入 / 输出 Token', `${compact(s.input_tokens)} / ${compact(s.output_tokens)}`, `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)}`));
 
   const identity = h('div', { class: 'panel-body' },
-    h('div', { class: 'muted' }, `模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}`),
+    h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}`),
     outcomeBar(s.counts, s.trials, true), legend(s.counts));
 
   const filters = h('div', { class: 'filters' }, ['all', ...ORDER].map((key) => h('button', {
