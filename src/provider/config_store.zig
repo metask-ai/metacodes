@@ -384,9 +384,9 @@ pub const CustomRemoval = struct {
 
 /// Remove a configured provider in one write: its definition
 /// (`custom_providers.<id>`), its settings (`providers.<id>`), and — when
-/// it is still exactly `forget_default`, the selection the caller found to
-/// resolve to this provider — the stored default, which would otherwise name
-/// a route the next start cannot find.
+/// the file still stores `forget_default`, the selection the caller found to
+/// resolve to this provider (`config_doc.sameSelection`) — the stored
+/// default, which would otherwise name a route the next start cannot find.
 pub fn removeCustomProvider(
     store: *const Store,
     id: ids.Slug,
@@ -406,7 +406,7 @@ pub fn removeCustomProvider(
             const current = document.global_selection orelse return;
             // Changed since the caller resolved it: someone chose another
             // default in between, which is not this removal's to forget.
-            if (!std.meta.eql(current, observed)) return;
+            if (!try config_doc.sameSelection(document.allocator, current, observed)) return;
             document.global_selection = null;
             self.default_forgotten = true;
         }
@@ -971,4 +971,36 @@ test "removing a configured provider drops its definition, its settings and a de
     try std.testing.expectEqual(@as(usize, 0), section.count());
     try std.testing.expect(parsed.value.object.get("theme") != null);
     try std.testing.expect(parsed.value.object.get("model_tiers") != null);
+}
+
+test "removing a configured provider forgets the default the file stores, whatever lies past its controls" {
+    // The caller's copy of the default and the one read again under the lock
+    // agree in what is written, not in the control slots past `len`, which
+    // are undefined. Comparing those bytes kept a default that was this
+    // provider's, and on a backend that checks union tags it panicked.
+    const a = std.testing.allocator;
+    var path_buf: [512]u8 = undefined;
+    const path = try testFixturePath(&path_buf, "custom-remove-slots.json");
+    removeFixture(path);
+    defer removeFixture(path);
+    try writeFixture(path, HAND_WRITTEN);
+
+    var store = try Store.initPath(a, path);
+    defer store.deinit();
+    var chosen = config_doc.RuntimeSelection.pinned(.{ .digest = @splat(0x5a) }, 1, .global);
+    try chosen.controls.set("max_output_tokens", .{ .number = 8_000 });
+    _ = try setGlobalSelection(&store, chosen, null, null);
+    var loaded = try store.load();
+    var observed = loaded.global_selection.?;
+    loaded.deinit();
+    // The same default, with a control left behind `len` the way
+    // `ControlValues.remove` leaves one.
+    try observed.controls.set("stale", .{ .boolean = true });
+    try std.testing.expect(observed.controls.remove("stale"));
+
+    const removed = try removeCustomProvider(&store, ids.Slug.lit("relay-a"), observed, null, null);
+    try std.testing.expect(removed.default_forgotten);
+    var after = try store.load();
+    defer after.deinit();
+    try std.testing.expect(after.global_selection == null);
 }
