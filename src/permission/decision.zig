@@ -853,7 +853,7 @@ test "autoAllowBashIfSandboxed allows only a call the sandbox will really wrap" 
     };
     const ctx = Context{ .mode = .default, .sandbox = &sb };
     // 沙箱内:即便是写命令也 allow(物理边界已限制)——前提是本机真有沙箱(macOS
-    // sandbox-exec)。Linux/Windows 上设置开着也裸跑 → 不得按沙箱放行。
+    // sandbox-exec / Linux bubblewrap)。没有后端时设置开着也裸跑 → 不得按沙箱放行。
     const confined: Decision = if (sandbox_exec.hostSupported()) .allow else .ask;
     try std.testing.expectEqual(confined, check(&ctx, "Bash", "{\"command\":\"npm install\"}"));
     // excludedCommands 在沙箱外跑 → ask

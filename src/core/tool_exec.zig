@@ -436,6 +436,8 @@ const DispatchObservation = struct {
     project_pre_signal: ?project_gate_protocol.PreSignal = null,
     replay: execution_effect.ReplayPolicy = .never,
     boundary_started: bool = false,
+    /// Borrowed from `start` for the plaintext tap; outlives the dispatch.
+    input: []const u8 = "",
 
     fn start(self: *DispatchObservation, input: []const u8) bool {
         if (!emitDispatchStarted(
@@ -449,6 +451,7 @@ const DispatchObservation = struct {
             self.within_root,
         )) return false;
         self.input_bytes = input.len;
+        self.input = input;
         self.started = true;
         if (self.ctx.execution_boundary) |boundary| {
             if (!boundary.emit(.{ .before = .{ .tool_dispatch = .{
@@ -499,6 +502,15 @@ const DispatchObservation = struct {
             result,
             self.effect_slot.*,
         );
+        if (observed) if (self.ctx.tool_observer) |sink| sink.tap(.{
+            .id = self.id,
+            .dispatched_name = self.dispatched_name,
+            .origin = self.ctx.tool_observation_origin,
+            .agent_depth = self.ctx.agent_depth,
+            .outcome = outcome,
+            .input = self.input,
+            .result = result,
+        });
         var boundary_observed = true;
         if (self.boundary_started) {
             const boundary = self.ctx.execution_boundary.?;
@@ -637,7 +649,7 @@ const ObservationCapture = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (event) {
-            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => return true,
+            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .isolated_verifier, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => return true,
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.depth = started.agent_depth;
@@ -2407,7 +2419,7 @@ test "project post gate runs before terminal observation and block preserves act
         fn emit(raw: *anyopaque, event: tool_observation.Event) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
-                .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => {},
+                .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .delivery_cadence, .progress_updates, .stall_gate, .check_gate, .isolated_verifier, .learning_turn, .test_integrity, .test_weakening_candidate, .formal_decision, .formal_decision_batch, .system_one_decision => {},
                 .dispatch_started => self.starts += 1,
                 .dispatch_finished => |finished| {
                     self.finishes += 1;

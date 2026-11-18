@@ -1,5 +1,5 @@
-"""The default install prefix is exactly the release executable and the TinyKG
-bundle (#77, B1); `verify_install_prefix.py` is the gate that says so in CI."""
+"""The default install carries the CLI, filesystem helper and pinned tools;
+`verify_install_prefix.py` checks the complete prefix in CI."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,8 +15,13 @@ KERNELS_ABSENT = [
 ]
 
 
+DEFAULT_FILES = (
+    "bin/metacodes", "bin/metacodes-fs-helper", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT",
+    "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json",
+)
+
 RELEASE_FILES = (
-    "bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "share/licenses/metacodes-LICENSE",
+    "bin/metacodes", "bin/metacodes-fs-helper", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "share/licenses/metacodes-LICENSE",
     "share/licenses/tinykg-LICENSE", "share/licenses/THIRD_PARTY_NOTICES.md", "share/doc/README.md",
     "share/licenses/lean4-LICENSE", "share/licenses/gmp-COPYING.LESSERv3", "share/licenses/gmp-COPYINGv3",
     "share/licenses/gmp-COPYINGv2", "share/licenses/libuv-LICENSE", "share/licenses/libuv-LICENSE-extra",
@@ -59,33 +64,40 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         return root
 
     def test_matching_prefix(self):
-        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(DEFAULT_FILES)
         self.assertEqual(check(root), [])
 
+    def test_a_missing_sandbox_helper_is_named(self):
+        root = self._make(DEFAULT_FILES)
+        (root / "bin/metacodes-fs-helper").unlink()
+        self.assertEqual(check(root), ["missing: bin/metacodes-fs-helper"])
+
     def test_prefix_without_vendored_ripgrep_is_accepted_only_when_asked(self):
-        root = self._make(("bin/metacodes", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(("bin/metacodes", "bin/metacodes-fs-helper", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
         self.assertIn("missing: bin/rg", check(root))
         self.assertIn("missing: share/licenses/ripgrep-LICENSE-MIT", check(root))
         self.assertEqual(check(root, ripgrep=False), [])
 
     def test_extra_and_missing_are_named(self):
-        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "extra.txt"))
+        root = self._make(("bin/metacodes", "bin/metacodes-fs-helper", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "extra.txt"))
         findings = check(root)
         self.assertIn("missing: vendor/tinykg/tinykg.provenance.json", findings)
         self.assertIn("unexpected: extra.txt", findings)
 
     def test_windows_names(self):
-        root = self._make(("bin/metacodes.exe", "bin/rg.exe", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg.exe", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(("bin/metacodes.exe", "bin/metacodes-fs-helper.exe", "bin/rg.exe", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg.exe", "vendor/tinykg/tinykg.provenance.json"))
         self.assertEqual(check(root), [])
+        (root / "bin/metacodes-fs-helper.exe").unlink()
+        self.assertEqual(check(root), ["missing: bin/metacodes-fs-helper.exe"])
 
     def test_a_missing_ripgrep_is_named(self):
-        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(DEFAULT_FILES)
         self.assertEqual(check(root), [])
         (root / "bin/rg").unlink()
         self.assertIn("missing: bin/rg", check(root))
 
     def test_doctor_report_accepts_the_adjacent_matching_tinykg(self):
-        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(DEFAULT_FILES)
         report = {
             "checks": [
                 {"name": "ripgrep", "resolved_path": "/usr/bin/rg", "sha256": "ab", "expected_sha256": None, "match": None, "source": "path"},
@@ -107,7 +119,7 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         self.assertEqual(evaluate_doctor(report, root), [])
 
     def test_doctor_report_names_every_deviation(self):
-        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(DEFAULT_FILES)
         report = {
             "checks": [
                 {"name": "tinykg", "resolved_path": "/elsewhere/tinykg", "sha256": "cd", "expected_sha256": "ef", "match": False, "source": "env"},
@@ -143,6 +155,7 @@ class VerifyInstallPrefixTest(unittest.TestCase):
     def test_windows_release_prefix_names_exe_kernels_and_their_sidecars(self):
         renames = {
             "bin/metacodes": "bin/metacodes.exe", "bin/rg": "bin/rg.exe", "vendor/tinykg/tinykg": "vendor/tinykg/tinykg.exe",
+            "bin/metacodes-fs-helper": "bin/metacodes-fs-helper.exe",
             "vendor/tinykg/tinykgd": "vendor/tinykg/tinykgd.exe",
         }
         files = []
@@ -164,7 +177,7 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         return {"checks": base + [{"name": "formal_kernel", "resolved_path": None, "expected_sha256": None, "provenance": None}, entry, KERNELS_ABSENT[2]]}
 
     def test_an_unpinned_absent_kernel_is_fine_in_development_only(self):
-        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json"))
+        root = self._make(DEFAULT_FILES)
         self.assertEqual(evaluate_doctor(self._kernel_report(root), root), [])
         findings = evaluate_doctor(self._kernel_report(root, expected_sha256="ab" * 32), root)
         self.assertEqual(len(findings), 1)
@@ -179,7 +192,7 @@ class VerifyInstallPrefixTest(unittest.TestCase):
         self.assertTrue(any("does not pin the tinykgd it ships" in finding for finding in findings))
 
     def test_a_shipped_kernel_needs_a_matching_digest_and_an_accepted_sidecar(self):
-        root = self._make(("bin/metacodes", "bin/rg", "share/licenses/ripgrep-LICENSE-MIT", "vendor/tinykg/tinykg", "vendor/tinykg/tinykg.provenance.json", "libexec/metacodes/metacodes-project-kernel"))
+        root = self._make(DEFAULT_FILES + ("libexec/metacodes/metacodes-project-kernel",))
         shipped = dict(resolved_path=str(root / "libexec/metacodes/metacodes-project-kernel"), sha256="ab" * 32, expected_sha256="ab" * 32, match=True, source="adjacent", provenance=True)
         self.assertEqual(evaluate_doctor(self._kernel_report(root, **shipped), root), [])
         # The 2026-09-21 failure shape: everything matches, the sidecar was

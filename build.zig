@@ -11,6 +11,8 @@ const manifest = @import("build.zig.zon");
 var g_hl_mod: ?*std.Build.Module = null;
 var g_formal_kernel_sha256: ?[]const u8 = null;
 var g_project_kernel_sha256: ?[]const u8 = null;
+var g_sandbox_helper_install: ?*std.Build.Step = null;
+var g_sandbox_helper_path: ?[]const u8 = null;
 fn addHl(b: *std.Build, mod: *std.Build.Module) void {
     addHlWithProjectHarnessActuation(b, mod, false);
 }
@@ -58,6 +60,10 @@ fn addTestRunArtifact(
     // steps regardless, but state the doctrine here so a future caching change
     // cannot silently turn cached test binaries into stale green evidence.
     run.has_side_effects = true;
+    if (g_sandbox_helper_install) |install| {
+        run.step.dependOn(install);
+        run.setEnvironmentVariable("METACODES_SANDBOX_HELPER", g_sandbox_helper_path.?);
+    }
     return run;
 }
 
@@ -904,6 +910,27 @@ pub fn build(b: *std.Build) void {
     const install_cli = cli_install.step;
     b.getInstallStep().dependOn(install_cli);
 
+    // A small trusted executor opens native tool files inside the platform
+    // sandbox and passes the resulting fd back. Library hosts receive the
+    // same helper in their bundle; neither path depends on Python or PATH.
+    const sandbox_helper_mod = b.createModule(.{
+        .root_source_file = b.path("src/sandbox_helper_root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    addPlatform(b, sandbox_helper_mod);
+    const sandbox_helper_exe = b.addExecutable(.{
+        .name = "metacodes-fs-helper",
+        .root_module = sandbox_helper_mod,
+    });
+    const install_sandbox_helper = b.addInstallArtifact(sandbox_helper_exe, .{ .pdb_dir = .disabled });
+    g_sandbox_helper_install = &install_sandbox_helper.step;
+    g_sandbox_helper_path = b.getInstallPath(.bin, sandbox_helper_exe.out_filename);
+    b.getInstallStep().dependOn(&install_sandbox_helper.step);
+    const sandbox_helper_step = b.step("sandbox:helper", "Build and install the native filesystem sandbox helper");
+    sandbox_helper_step.dependOn(&install_sandbox_helper.step);
+
     // E3 causal evaluation only: same product root/provider/agent/tool path,
     // but formal blocks are observed rather than actuated.  There is no env or
     // CLI switch and this artifact is deliberately absent from default install.
@@ -1086,6 +1113,21 @@ pub fn build(b: *std.Build) void {
         "release:stage",
         "Install the release layout (bin/metacodes, bin/rg, libexec/metacodes kernels, vendor/tinykg CLI + daemon, share/licenses); requires -Drelease-layout=true, a Lean toolchain and pinned kernel digests, and fails closed for a target without vendored runtime assets",
     );
+    // Shared file-copy steps: the docs gate exercises exactly the release's
+    // documents, without depending on install, executables or Lean kernels.
+    const release_documents = parseJsonFile(b, struct {
+        schema: []const u8,
+        files: []const struct { source: []const u8, destination: []const u8 },
+    }, "release/documents.json");
+    if (!std.mem.eql(u8, release_documents.schema, "metacodes.release-documents/v1"))
+        @panic("unsupported release documents manifest");
+    const release_docs_step = b.step("release:docs", "Stage only release documents and licences, without compiling the product");
+    for (release_documents.files) |document| {
+        const destination = std.mem.replaceOwned(u8, b.allocator, document.destination, "{version}", manifest.version) catch @panic("OOM");
+        const install_document = b.addInstallFileWithDir(b.path(document.source), .prefix, destination);
+        release_docs_step.dependOn(&install_document.step);
+    }
+    release_stage_step.dependOn(release_docs_step);
     release_stage_step.dependOn(b.getInstallStep());
     if (!release_layout) {
         release_stage_step.dependOn(&b.addFail(
@@ -1132,26 +1174,6 @@ pub fn build(b: *std.Build) void {
         );
         b.getInstallStep().dependOn(&stage_ripgrep.step);
         b.getInstallStep().dependOn(&install_ripgrep_license.step);
-        // The release unit also carries its own licence, TinyKG's, the
-        // rendered notices and the operator docs (release/LAYOUT.md, #80);
-        // a development install does not.
-        const release_extras = [_]struct { source: []const u8, dir: []const u8, name: []const u8 }{
-            .{ .source = "LICENSE", .dir = "share/licenses", .name = "metacodes-LICENSE" },
-            .{ .source = "vendor/tinykg/LICENSE", .dir = "share/licenses", .name = "tinykg-LICENSE" },
-            .{ .source = "THIRD_PARTY_NOTICES.md", .dir = "share/licenses", .name = "THIRD_PARTY_NOTICES.md" },
-            .{ .source = "vendor/lean-runtime/lean4-LICENSE", .dir = "share/licenses", .name = "lean4-LICENSE" },
-            .{ .source = "vendor/lean-runtime/gmp-COPYING.LESSERv3", .dir = "share/licenses", .name = "gmp-COPYING.LESSERv3" },
-            .{ .source = "vendor/lean-runtime/gmp-COPYINGv3", .dir = "share/licenses", .name = "gmp-COPYINGv3" },
-            .{ .source = "vendor/lean-runtime/gmp-COPYINGv2", .dir = "share/licenses", .name = "gmp-COPYINGv2" },
-            .{ .source = "vendor/lean-runtime/libuv-LICENSE", .dir = "share/licenses", .name = "libuv-LICENSE" },
-            .{ .source = "vendor/lean-runtime/libuv-LICENSE-extra", .dir = "share/licenses", .name = "libuv-LICENSE-extra" },
-            .{ .source = "README.md", .dir = "share/doc", .name = "README.md" },
-            .{ .source = "CHANGELOG.md", .dir = "share/doc", .name = b.fmt("CHANGELOG-{s}.md", .{manifest.version}) },
-        };
-        for (release_extras) |extra| {
-            const install_extra = b.addInstallFileWithDir(b.path(extra.source), .{ .custom = extra.dir }, extra.name);
-            release_stage_step.dependOn(&install_extra.step);
-        }
     } else {
         std.log.warn(
             "no vendored ripgrep for {s}: the install carries no bin/rg and Grep/Glob resolve it from PATH (#86)",
@@ -1785,6 +1807,10 @@ pub fn build(b: *std.Build) void {
         .implib_dir = .disabled,
         .dylib_symlinks = false,
     });
+    const install_agentcore_sandbox_helper = b.addInstallArtifact(sandbox_helper_exe, .{
+        .dest_dir = .{ .override = .{ .custom = b.fmt("{s}/bin", .{agentcore_bundle_rel}) } },
+        .pdb_dir = .disabled,
+    });
     const install_agentcore_header = b.addInstallFileWithDir(
         b.path("sdk/metask/agentcore.h"),
         .prefix,
@@ -1871,6 +1897,7 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.step.dependOn(&agentcore_shared_gate_cmd.step);
     manifest_cmd.step.dependOn(installed_agentcore_lib_ready);
     manifest_cmd.step.dependOn(&install_agentcore_shared.step);
+    manifest_cmd.step.dependOn(&install_agentcore_sandbox_helper.step);
     manifest_cmd.step.dependOn(&install_agentcore_header.step);
     manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
     manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
@@ -2538,10 +2565,41 @@ pub fn build(b: *std.Build) void {
     doc_check_step.dependOn(&doc_check_cmd.step);
     doc_check_step.dependOn(&doc_facts_cmd.step);
     doc_check_step.dependOn(&version_state_cmd.step);
+    const doc_references_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/eval/plugin_release_gate.py",
+        "--validate-only",
+    });
+    const doc_references_step = b.step("doc:references", "Validate protocol paths and pins without running the product or providers");
+    doc_references_step.dependOn(&doc_references_cmd.step);
+    doc_check_step.dependOn(doc_references_step);
+    const release_docs_sources_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/check_release_docs.py",
+    });
+    doc_check_step.dependOn(&release_docs_sources_cmd.step);
     const notices_cmd = b.addSystemCommand(&.{ if (@import("builtin").os.tag == .windows) "python" else "python3", "scripts/gen_third_party_notices.py", "--check" });
     const notices_step = b.step("release:notices", "Check generated third-party notices");
     notices_step.dependOn(&notices_cmd.step);
     doc_check_step.dependOn(notices_step);
+    const release_docs_check_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/check_release_docs.py",
+        "--prefix",
+        b.getInstallPath(.prefix, ""),
+    });
+    release_docs_check_cmd.step.dependOn(release_docs_step);
+    release_docs_check_cmd.step.dependOn(notices_step);
+    const release_docs_check_step = b.step("release:docs:check", "Stage and verify only release documents, licences and generated notices");
+    release_docs_check_step.dependOn(&release_docs_check_cmd.step);
+    const release_docs_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_check_release_docs",
+        "-v",
+    });
+    units_test_step.dependOn(&release_docs_test_cmd.step);
     const doc_facts_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2616,9 +2674,11 @@ pub fn build(b: *std.Build) void {
         "-m",
         "unittest",
         "scripts.tests.test_pr_loop",
+        "scripts.tests.test_pr_policy",
+        "scripts.tests.test_ci_evidence",
         "-v",
     });
-    const pr_loop_test_step = b.step("test:pr-loop", "Test the opt-in PR review, repair and merge-queue controller");
+    const pr_loop_test_step = b.step("test:pr-loop", "Test PR review, repair, exact-head merging and CI evidence");
     pr_loop_test_step.dependOn(&pr_loop_test_cmd.step);
     units_test_step.dependOn(&pr_loop_test_cmd.step);
     const release_cut_test_cmd = b.addSystemCommand(&.{

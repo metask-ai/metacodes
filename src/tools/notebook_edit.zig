@@ -19,6 +19,7 @@
 const std = @import("std");
 const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
+const filesystem = @import("../sandbox/filesystem.zig");
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -33,7 +34,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const path_arg = try util_json.unescapeString(path_raw, a);
     defer a.free(path_arg);
     // 归一化(展开 ~、折叠、查 traversal)。openat 不认 ~。
-    const path = try path_mod.normalizeChecked(a, path_arg, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    const path = try path_mod.normalizeChecked(a, path_arg, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs, .resolve_relative = ctx.resolve_relative_paths });
     defer a.free(path);
     if (!std.mem.endsWith(u8, path, ".ipynb")) return error.NotANotebook;
 
@@ -68,7 +69,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     // 读 notebook
-    const content = try readFile(a, path);
+    const content = try readFile(ctx, a, path);
     defer a.free(content);
 
     var parsed = std.json.parseFromSlice(std.json.Value, a, content, .{}) catch return error.InvalidJson;
@@ -120,7 +121,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 写回
     const out_json = try serializeNotebook(a, root);
     defer a.free(out_json);
-    try writeFile(path, out_json);
+    try writeFile(ctx, path, out_json);
 
     // cell 语言(供高亮):markdown cell 不高亮代码;code cell 用 notebook language_info.name(默认 python)。
     const lang: []const u8 = if (is_markdown) "" else notebookLang(root);
@@ -253,14 +254,20 @@ fn serializeNotebook(allocator: std.mem.Allocator, root: std.json.Value) ![]u8 {
 const MAX_NOTEBOOK_SIZE: usize = 50 * 1024 * 1024;
 
 /// 走轴A统一入口 readAllFromFdCapped(消除各工具本地裸读绕过守卫)。
-fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+fn readFile(ctx: *const ToolContext, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const fd = filesystem.open(ctx, path, .{ .ACCMODE = .RDONLY }, 0, false) catch |err| {
+        if (filesystem.enabled(ctx)) return err;
+        return error.FileNotFound;
+    };
     defer _ = pfs.close(fd);
     return try @import("common.zig").readAllFromFdCapped(fd, allocator, MAX_NOTEBOOK_SIZE);
 }
 
-fn writeFile(path: []const u8, content: []const u8) !void {
-    const fd = pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
+fn writeFile(ctx: *const ToolContext, path: []const u8, content: []const u8) !void {
+    const fd = filesystem.open(ctx, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644, false) catch |err| {
+        if (filesystem.enabled(ctx)) return err;
+        return error.WriteError;
+    };
     defer _ = pfs.close(fd);
     var pos: usize = 0;
     while (pos < content.len) {
@@ -324,7 +331,7 @@ test "NotebookEdit: replace cell source" {
     try testing.expect(std.mem.indexOf(u8, out, "\"success\":true") != null);
 
     // 验证文件含 x = 42
-    const content = try readFile(a, p);
+    const content = try readFile(&ctx, a, p);
     defer a.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "x = 42") != null);
     try testing.expect(std.mem.indexOf(u8, content, "x = 1") == null);
@@ -343,7 +350,7 @@ test "NotebookEdit: insert cell at start" {
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"cells_after\":3") != null);
 
-    const content = try readFile(a, p);
+    const content = try readFile(&ctx, a, p);
     defer a.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "numpy") != null);
 }
@@ -375,7 +382,7 @@ test "NotebookEdit: delete cell" {
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"cells_after\":1") != null);
 
-    const content = try readFile(a, p);
+    const content = try readFile(&ctx, a, p);
     defer a.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "## Title") == null);
     try testing.expect(std.mem.indexOf(u8, content, "x = 1") != null);

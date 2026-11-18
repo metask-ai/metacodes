@@ -5,7 +5,7 @@ tests pin the wiring: which gate steps still run on a documentation-only
 change, that every other step of a leg or shard reads its scope, that the
 scope fails open, that each required check is a result job that passes only
 when all of its legs did, and that the decision steps pick the right base for
-a pull request, a merge queue group and a push."""
+a pull request and a legacy merge queue group."""
 from __future__ import annotations
 
 import io
@@ -41,6 +41,11 @@ DOC_STEPS = {
     "Documentation fact-check unit tests",
     "Gate manifest unit tests",
     "Diff whitespace check",
+    "Protocol document references",
+    "Release document package check",
+    "Release document check unit tests",
+    "Third-party notices check",
+    "Third-party notices unit tests",
 }
 ECHO_STEPS = {"Release fast path", "Change scope"}
 # The jobs that do the work, one runner per leg or shard (doc/CI_DESIGN.md §4),
@@ -59,7 +64,7 @@ RESULT_JOBS = {
 # The leg flags a gate step may be gated on; a step without one runs on every leg.
 LEG_FLAGS = {"units", "integration", "product", "release", "cross", "checks"}
 # Each gate job, its runner OS and the flags its steps read there.
-GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "cross", "checks"}),
+GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "checks"}),
              ("gates-macos", "macOS", {"units", "product", "release", "checks"}),
              ("windows-gates", "Windows", {"units", "integration", "product", "release"}))
 TEST_PARTS = {"test:units", "test:integration", "test:product"}
@@ -69,7 +74,6 @@ TEST_PARTS = {"test:units", "test:integration", "test:product"}
 SETUP_STEPS = {
     "gates-linux": {
         "Release fast path", "Change scope", CHECKOUT,
-        "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
         "Restore Lean toolchain and build products", "Install pinned elan", "Build pinned Lean kernel",
         "Install ripgrep", "Install bubblewrap", "Install Python development dependencies",
     },
@@ -100,28 +104,48 @@ class ClassifyTest(unittest.TestCase):
             with self.subTest(paths=paths):
                 self.assertEqual(ci_scope.classify(paths)[0], "docs")
 
-    def test_markdown_the_release_layout_installs_is_not_documentation(self) -> None:
-        # build.zig installs these into share/doc and share/licenses, and
-        # gen_third_party_notices.py --check regenerates the notices.
+    def test_release_documents_use_the_docs_scope(self) -> None:
         for path in ("README.md", "CHANGELOG.md", "THIRD_PARTY_NOTICES.md"):
             with self.subTest(path=path):
-                self.assertEqual(ci_scope.classify([path])[0], "full")
-                self.assertEqual(ci_scope.classify(["doc/API.md", path])[0], "full")
+                self.assertEqual(ci_scope.classify([path])[0], "docs")
+                self.assertEqual(ci_scope.classify(["doc/API.md", path])[0], "docs")
 
-    def test_every_top_level_file_build_zig_installs_is_excluded(self) -> None:
+    def test_the_release_manifest_is_shared_with_the_build(self) -> None:
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
-        installed = set(re.findall(r'\.source = "([^"/]+\.md)"', build))
-        self.assertIn("THIRD_PARTY_NOTICES.md", installed)  # the pattern still finds them
-        self.assertEqual(installed - set(ci_scope.RELEASE_DOCS), set())
+        self.assertIn('"release/documents.json"', build)
+        inputs = ci_scope.document_inputs(ROOT)
+        self.assertIn("THIRD_PARTY_NOTICES.md", inputs.release_sources)
+        self.assertIn("vendor/tinykg/LICENSE", inputs.release_sources)
+        for path in inputs.release_sources:
+            self.assertEqual(ci_scope.classify([path], release_sources=inputs.release_sources)[0], "docs")
 
-    def test_a_removed_documentation_file_is_the_full_scope(self) -> None:
+    def test_a_removed_documentation_file_keeps_the_docs_scope(self) -> None:
         # evals/plugin-v1/protocol.json pins doc paths that zig build test resolves.
         scope, reason = ci_scope.classify(["doc/CORE_REFERENCE.md", "doc/history/CORE_REFERENCE.md"],
                                           deleted=["doc/CORE_REFERENCE.md"])
-        self.assertEqual(scope, "full")
-        self.assertIn("doc/CORE_REFERENCE.md removed", reason)
+        self.assertEqual(scope, "docs")
+        self.assertIn("checked independently", reason)
         # Removing harness files keeps the eval scope; only doc removals widen it.
         self.assertEqual(ci_scope.classify(["scripts/eval/old.py"], deleted=["scripts/eval/old.py"])[0], "eval")
+
+    def test_document_checks_follow_the_actual_input_paths(self) -> None:
+        inputs = ci_scope.DocumentInputs(frozenset(ci_scope.RELEASE_DOCS), frozenset(["doc/PINNED.md"]))
+        for changes, expected in (([("D", "doc/unreferenced.md")], (False, False)),
+                                  ([("D", "doc/PINNED.md")], (True, False)),
+                                  ([("M", "README.md")], (False, True)),
+                                  ([("M", ci_scope.PROTOCOL)], (True, False)),
+                                  ([("D", "doc/PINNED.md"), ("M", "README.md")], (True, True))):
+            with self.subTest(changes=changes):
+                self.assertEqual(ci_scope.document_checks("docs", changes, inputs), expected)
+        self.assertEqual(ci_scope.document_checks("full", [], inputs), (True, True))
+
+    def test_protocol_document_relocation_cannot_change_other_inputs(self) -> None:
+        before = {"implementation_paths": ["src/main.zig", "doc/A.md"], "budget": 0}
+        moved = {"implementation_paths": ["src/main.zig", "doc/B.md"], "budget": 0}
+        self.assertTrue(ci_scope.protocol_documents_only(before, moved))
+        for after in ({**moved, "budget": 1}, {**moved, "budget": False},
+                      {**moved, "implementation_paths": ["src/other.zig", "doc/B.md"]}):
+            self.assertFalse(ci_scope.protocol_documents_only(before, after))
 
     def test_markdown_outside_doc_and_the_top_level_is_an_input(self) -> None:
         # Prompt templates are @embedFile'd; agent and Skill fixtures are read by tests.
@@ -154,11 +178,11 @@ class ClassifyTest(unittest.TestCase):
 
 
 class DecideTest(unittest.TestCase):
-    def test_push_and_manual_runs_are_full_without_a_diff(self) -> None:
+    def test_manual_and_unknown_runs_are_full_without_a_diff(self) -> None:
         def no_diff(base: str, candidate: str):
-            raise AssertionError("a push run must not diff")
+            raise AssertionError("a manual run must not diff")
 
-        for event in ("push", "workflow_dispatch", ""):
+        for event in ("workflow_dispatch", "push", ""):
             with self.subTest(event=event):
                 self.assertEqual(ci_scope.decide(event, "abc", "HEAD", no_diff)[0], "full")
 
@@ -192,9 +216,19 @@ class MainTest(unittest.TestCase):
         self.git("init", "-q")
         self.git("config", "user.email", "ci@example.invalid")
         self.git("config", "user.name", "ci")
+        (self.repo / ".gitignore").write_text("github-output\nsummary.md\n", encoding="utf-8")
         (self.repo / "doc").mkdir()
         (self.repo / "doc" / "A.md").write_text("a\n", encoding="utf-8")
         (self.repo / "main.zig").write_text("x\n", encoding="utf-8")
+        (self.repo / "README.md").write_text("readme\n", encoding="utf-8")
+        (self.repo / "build.zig.zon").write_text('.{ .version = "1.2.3-dev" }\n', encoding="utf-8")
+        (self.repo / "release").mkdir()
+        (self.repo / "release/documents.json").write_text(json.dumps({
+            "schema": "metacodes.release-documents/v1", "files": [
+                {"source": "README.md", "destination": "share/doc/README.md"}]}), encoding="utf-8")
+        (self.repo / "evals/plugin-v1").mkdir(parents=True)
+        self.protocol = {"implementation_paths": ["main.zig", "doc/A.md"], "budget": 0}
+        self.write_protocol()
         self.commit("base")
 
     def tearDown(self) -> None:
@@ -207,12 +241,16 @@ class MainTest(unittest.TestCase):
         self.git("add", "-A")
         self.git("commit", "-q", "-m", message)
 
+    def write_protocol(self):
+        (self.repo / ci_scope.PROTOCOL).write_text(json.dumps(self.protocol), encoding="utf-8")
+
     def run_main(self, event: str, base: str) -> dict:
         out = self.repo / "github-output"
         out.write_text("", encoding="utf-8")
         with redirect_stdout(io.StringIO()):
             code = ci_scope.main(["--event", event, "--base", base, "--candidate", "HEAD",
-                                  "--github-output", str(out), "--repo-root", str(self.repo)])
+                                  "--github-output", str(out), "--repo-root", str(self.repo),
+                                  "--github-summary", str(self.repo / "summary.md")])
         self.assertEqual(code, 0)
         return dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
 
@@ -221,6 +259,29 @@ class MainTest(unittest.TestCase):
         self.commit("docs")
         got = self.run_main("pull_request", "HEAD^1")
         self.assertEqual((got["scope"], got["suites"], got["tty"]), ("docs", "false", "false"))
+        summary = (self.repo / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("| M | doc/A.md | docs |", summary)
+        self.assertIn("| Build, unit, integration, product, release | Skip |", summary)
+
+    def test_diff_uses_the_whole_change_instead_of_just_the_last_commit(self) -> None:
+        base = self.git("rev-parse", "HEAD").strip()
+        (self.repo / "main.zig").write_text("code change\n", encoding="utf-8")
+        self.commit("code")
+        (self.repo / "doc" / "A.md").write_text("docs\n", encoding="utf-8")
+        self.commit("docs")
+        self.assertEqual(self.run_main("pull_request", base)["scope"], "full")
+        self.assertEqual(self.run_main("pull_request", "HEAD^1")["scope"], "docs")
+
+    def test_summary_escapes_paths_and_does_not_truncate_the_decision(self) -> None:
+        name = "doc/a|`<img>.md"
+        destination = self.repo / "report.md"
+        changes = [("M", name)] + [("M", f"doc/{i}.md") for i in range(200)] + [("M", "src/main.zig")]
+        scope, reason = ci_scope.classify([path for _, path in changes])
+        ci_scope.write_summary(str(destination), "pull_request", "base", "HEAD", scope, reason, changes)
+        summary = destination.read_text(encoding="utf-8")
+        self.assertIn("Scope: **full**", summary)
+        self.assertIn("doc/a&#124;&#96;&lt;img&gt;.md", summary)
+        self.assertIn("Showing 200 of 202 changed paths", summary)
 
     def test_a_rename_out_of_doc_is_the_full_scope(self) -> None:
         self.git("mv", "doc/A.md", "notes.zig")
@@ -228,13 +289,36 @@ class MainTest(unittest.TestCase):
         got = self.run_main("merge_group", self.git("rev-parse", "HEAD^1").strip())
         self.assertEqual((got["scope"], got["suites"], got["tty"]), ("full", "true", "true"))
 
-    def test_a_move_within_doc_is_the_full_scope(self) -> None:
+    def test_a_move_within_doc_only_runs_reference_checks(self) -> None:
         (self.repo / "doc" / "history").mkdir()
         self.git("mv", "doc/A.md", "doc/history/A.md")
         self.commit("retire")
         got = self.run_main("pull_request", "HEAD^1")
-        self.assertEqual((got["scope"], got["suites"], got["tty"]), ("full", "true", "true"))
-        self.assertIn("doc/A.md removed", got["reason"])
+        self.assertEqual((got["scope"], got["suites"], got["tty"]), ("docs", "false", "false"))
+        self.assertEqual((got["doc_references"], got["release_docs"]), ("true", "false"))
+
+    def test_a_move_and_its_protocol_path_update_remain_document_only(self) -> None:
+        self.git("mv", "doc/A.md", "doc/B.md")
+        self.protocol["implementation_paths"][-1] = "doc/B.md"
+        self.write_protocol()
+        self.commit("move documentation and update its protocol path")
+        got = self.run_main("pull_request", "HEAD^1")
+        self.assertEqual((got["scope"], got["suites"], got["doc_references"]), ("docs", "false", "true"))
+        self.protocol["budget"] = 1
+        self.write_protocol()
+        self.commit("change protocol budget")
+        self.assertEqual(self.run_main("pull_request", "HEAD^1")["scope"], "eval")
+
+    def test_readme_runs_release_document_checks_without_build_suites(self) -> None:
+        (self.repo / "README.md").write_text("updated readme\n", encoding="utf-8")
+        self.commit("readme")
+        got = self.run_main("pull_request", "HEAD^1")
+        self.assertEqual((got["scope"], got["suites"], got["release_docs"]), ("docs", "false", "true"))
+
+    def test_unreadable_attribution_inputs_default_to_full(self) -> None:
+        (self.repo / "release/documents.json").write_text("invalid", encoding="utf-8")
+        got = self.run_main("pull_request", "HEAD^1")
+        self.assertEqual((got["scope"], got["doc_references"], got["release_docs"]), ("full", "true", "true"))
 
     @unittest.skipIf(os.name == "nt", "POSIX symlink fixture")
     def test_a_documentation_file_turned_into_a_symlink_is_the_full_scope(self) -> None:
@@ -244,7 +328,7 @@ class MainTest(unittest.TestCase):
         self.commit("symlink")
         got = self.run_main("pull_request", "HEAD^1")
         self.assertEqual(got["scope"], "full")
-        self.assertIn("doc/A.md removed or changed type", got["reason"])
+        self.assertIn("changed type", got["reason"])
 
     def test_an_added_documentation_file_keeps_the_docs_scope(self) -> None:
         (self.repo / "doc" / "B.md").write_text("b\n", encoding="utf-8")
@@ -277,6 +361,35 @@ class WorkflowTest(unittest.TestCase):
     def test_the_merge_queue_runs_the_workflow(self) -> None:
         triggers = self.workflow.get("on", self.workflow.get(True))  # YAML 1.1 reads `on` as true
         self.assertIn("merge_group", triggers)
+        self.assertIn("pull_request", triggers)
+        self.assertNotIn("push", triggers)  # no duplicate full run after merging
+
+    def test_extended_architectures_are_release_only_and_block_publishing(self) -> None:
+        import yaml
+        release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+        targets = release["jobs"]["build-posix"]["strategy"]["matrix"]["include"]
+        self.assertTrue(any(t["zig_target"] == "x86_64-macos" and t["runner"] == "macos-15-intel" for t in targets))
+        self.assertTrue(any(t["zig_target"] == "aarch64-linux-gnu" and t["runner"] == "ubuntu-24.04-arm" for t in targets))
+        self.assertNotIn("cross", {t["leg"] for t in self.jobs["gates-linux"]["strategy"]["matrix"]["include"]})
+        baseline = next(s for s in self.jobs["gates-macos"]["steps"] if s.get("name") == "macOS release executables need no more than their targets")
+        self.assertNotIn("x86_64-macos", baseline["run"])
+        self.assertIn("aarch64-macos.13.0", baseline["run"])
+        arm = release["jobs"]["windows-arm-cross"]
+        self.assertEqual(arm["strategy"]["matrix"]["target"], ["aarch64-windows-gnu", "aarch64-windows-msvc"])
+        self.assertIn("agentcore:bundle", arm["steps"][-1]["run"])
+        self.assertIn("windows-arm-cross", release["jobs"]["publish"]["needs"])
+        self.assertTrue(any("tinykg:stage -Dtarget=aarch64-linux-musl" in s.get("run", "")
+                            for s in release["jobs"]["build-posix"]["steps"]))
+
+    def test_full_evidence_requires_all_suites_and_excludes_scope_fast_paths(self) -> None:
+        job = self.jobs["full-pr-evidence"]
+        self.assertEqual(set(job["needs"]), {"release-fast-path", "scope", "gates-linux", "gates-macos",
+                                            "windows-gates", "tty-linux", "tty-windows", "sdk-bindings"})
+        self.assertIn("needs.scope.outputs.scope == 'full'", job["if"])
+        self.assertIn("needs.release-fast-path.outputs.fast == 'false'", job["if"])
+        self.assertIn("github.event_name == 'pull_request'", job["if"])
+        self.assertIn('.result == "success"', job["steps"][0]["run"])
+        self.assertIn("ci_evidence.py", job["steps"][2]["run"])
 
     def test_every_leg_reads_its_scope(self) -> None:
         for job, var in LEG_JOBS:
@@ -295,6 +408,42 @@ class WorkflowTest(unittest.TestCase):
             else:
                 self.assertIn("env.FAST_PATH != 'true'", condition, step_label(step))
         self.assertEqual(running, DOC_STEPS)
+
+    def test_document_switches_do_not_enable_product_builds(self) -> None:
+        def selected(step, references, release_docs, os_name="Linux", checks=True):
+            values = {"env.FAST_PATH": "false", "env.SUITES": "false",
+                      "env.DOC_REFERENCES": references, "env.RELEASE_DOCS": release_docs,
+                      "runner.os": os_name, "matrix.checks": checks}
+            condition = step.get("if", "True")
+            condition = re.sub(r"\b(?:env|matrix|runner)\.\w+",
+                               lambda match: repr(values.get(match.group(), False)), condition)
+            condition = condition.replace("&&", "and").replace("||", "or")
+            return eval(condition, {"__builtins__": {}}, {})
+
+        steps = self.jobs["gates-linux"]["steps"]
+        zig = next(step for step in steps if step.get("uses", "").startswith("mlugg/setup-zig@"))
+        for references, release_docs in (("false", "false"), ("true", "false"),
+                                          ("false", "true"), ("true", "true")):
+            with self.subTest(references=references, release_docs=release_docs):
+                ran = [step for step in steps if selected(step, references, release_docs)]
+                commands = [step["run"] for step in ran if "zig build " in step.get("run", "")]
+                self.assertEqual(commands, [
+                    'zig build release:docs:check --prefix "$RUNNER_TEMP/release-documents" --summary all'
+                ] if release_docs == "true" else [])
+                names = {step_label(step) for step in ran}
+                self.assertEqual("Protocol document references" in names, references == "true")
+                self.assertEqual(selected(zig, references, release_docs), release_docs == "true")
+                self.assertFalse(selected(zig, references, release_docs, os_name="macOS"))
+                self.assertFalse(selected(zig, references, release_docs, checks=False))
+
+    def test_document_outputs_are_wired_to_the_posix_legs(self) -> None:
+        for name in ("doc_references", "release_docs"):
+            self.assertEqual(self.jobs["scope"]["outputs"][name], "${{ steps.decide.outputs.%s }}" % name)
+            for job in ("gates-linux", "gates-macos"):
+                self.assertEqual(self.jobs[job]["env"][name.upper()], "${{ needs.scope.outputs.%s }}" % name)
+        notices = next(step for step in self.jobs["gates-linux"]["steps"]
+                       if step.get("name") == "Third-party notices unit tests")
+        self.assertTrue(runs_on(notices, "macOS"))
 
     def test_every_other_step_of_a_leg_fails_open(self) -> None:
         for job, var in (("windows-gates", "SUITES"), ("tty-linux", "TTY"), ("tty-windows", "TTY")):
@@ -455,7 +604,7 @@ class WorkflowTest(unittest.TestCase):
                 self.assertIn("--base %s --candidate HEAD" % ("b" * 40), calls[1])
 
     @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
-    def test_a_push_run_takes_the_full_path(self) -> None:
+    def test_a_push_is_not_a_narrow_scope_event(self) -> None:
         proc, calls, output = self.run_decide("release-fast-path", "push")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls, [])
@@ -463,7 +612,13 @@ class WorkflowTest(unittest.TestCase):
         proc, calls, _ = self.run_decide("scope", "push")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(calls), 1, calls)
-        self.assertTrue(calls[0].startswith("python3 scripts/ci_scope.py --event push --base  --candidate HEAD "), calls)
+        self.assertTrue(calls[0].startswith('python3 scripts/ci_scope.py --event push --base  --candidate HEAD '), calls)
+
+    def test_scope_uses_only_checkout_inputs(self) -> None:
+        self.assertEqual(self.jobs["scope"]["permissions"], {"contents": "read"})
+        step = next(s for s in self.jobs["scope"]["steps"] if s.get("id") == "decide")
+        self.assertNotIn("GH_TOKEN", step["env"])
+        self.assertNotIn("PUSH_BASE_SHA", step["env"])
 
 
 
@@ -482,6 +637,7 @@ class AgentCoreWorkflowTest(unittest.TestCase):
 
     def test_the_merge_queue_runs_the_workflow(self) -> None:
         self.assertIn("merge_group", self.workflow.get("on", self.workflow.get(True)))
+        self.assertNotIn("push", self.workflow.get("on", self.workflow.get(True)))
 
     def render(self, event: str) -> str:
         values = {
@@ -521,7 +677,7 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         self.assertIn("relevant=true", output)
 
     @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
-    def test_a_pull_request_diffs_against_its_base_and_a_push_runs_everything(self) -> None:
+    def test_a_pull_request_uses_its_base_and_unknown_events_run_in_full(self) -> None:
         proc, calls, _ = self.run_step("pull_request", "doc/API.md")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls[0], "git fetch -q --depth=1 origin " + "p" * 40)
@@ -529,6 +685,13 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls, [])
         self.assertIn("relevant=true", output)
+
+    def test_native_steps_read_relevance(self) -> None:
+        steps = self.workflow["jobs"]["native-windows-gate"]["steps"]
+        for step in steps:
+            if step.get("uses") == CHECKOUT or step.get("id") == "scope":
+                continue
+            self.assertEqual(step.get("if"), "steps.scope.outputs.relevant == 'true'")
 
 
 if __name__ == "__main__":
