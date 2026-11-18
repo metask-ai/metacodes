@@ -23,9 +23,11 @@ Outcomes follow [doc/BENCHMARKS.md](../../../../doc/BENCHMARKS.md): `invalid`
 the pass rate; `agent 超时` counts as a failure. `空回复结束` marks a trial
 metacodes ended on a reply with no text and no tool call.
 
-Pages refresh every 10 s while a job runs. Analysis reads files only; names
-in requests are checked against the jobs on disk, and every value reaches
-the page as text (no markup from the data, `script-src 'self'`).
+Pages refresh every 10 s while a job runs. The server syncs the jobs
+directories into the [evaluation database](../../../../doc/BENCH_WORKBENCH.md#evaluation-database)
+(`../store/`) and serves every view from it; names in requests are looked up
+in the database, never used as paths, and every value reaches the page as
+text (no markup from the data, `script-src 'self'`).
 
 The overview, job, trial and CSV views expose total/initial tokens, first-attempt
 full-score rate, request-weighted generation TPS, TTFT mean/P50/P95, and cost
@@ -33,7 +35,9 @@ coverage. See [metric definitions and storage](../../../../doc/BENCH_WORKBENCH.m
 Historical timings remain unknown; new workbench runs capture numeric
 request metrics through the host streaming relay.
 
-`data.py` is the projection, `runner.py` validates selections, and `worker.py`
-owns one durable execution. HTTP launch/cancel routes require the workbench
-capability. Contract tests are `scripts/eval/tests/test_harbor_viewer.py` and
-`scripts/eval/tests/test_bench_workbench.py`.
+`data.py` is the projection (applied to the stored bytes by `../store/ingest.py`),
+`runner.py` validates selections, and `worker.py` owns one durable execution
+and ingests its job. HTTP launch/cancel routes require the workbench
+capability. Contract tests are `scripts/eval/tests/test_harbor_viewer.py`,
+`scripts/eval/tests/test_bench_workbench.py` and
+`scripts/eval/tests/test_bench_store.py`.

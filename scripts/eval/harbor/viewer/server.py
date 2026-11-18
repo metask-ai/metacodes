@@ -2,10 +2,11 @@
 
     python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 18766
 
-Read-only: it lists the jobs under each `--jobs-dir`, and serves their
-summaries, per-trial rows, trajectories and verifier output as JSON to a
-static page.  Names in requests are validated against the jobs actually on
-disk, so no request can read outside them.  Python 3.9, stdlib only.
+It ingests the jobs under each `--jobs-dir` into the evaluation store
+(scripts/eval/harbor/store) and serves their summaries, per-trial rows,
+trajectories and verifier output from that store as JSON to a static page.
+Requests address jobs and trials by validated name in the store, never by
+path.  Python 3.9; SQLite needs only the standard library.
 """
 
 from __future__ import annotations
@@ -24,8 +25,11 @@ from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 from http.cookies import SimpleCookie
 
+from scripts.eval.harbor.store import config as store_config
+from scripts.eval.harbor.store.backend import Store, open_ephemeral
+from scripts.eval.harbor.store.library import StoreLibrary
 from scripts.eval.harbor.viewer import data
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
+from scripts.eval.harbor.viewer.runner import RunManager, atomic_json, settings
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC = {
@@ -46,10 +50,13 @@ SECURITY_HEADERS = (
 )
 
 
-def make_handler(library: data.Library, manager=None, token=""):
-    def managed_view(path, with_rows=True):
-        view = data.job_view(path)
-        run = next((r for r in manager.runs() if r["name"] == path.name), None) if manager else None
+def make_handler(library: StoreLibrary, manager=None, token=""):
+    def managed_view(name, with_rows=True):
+        view = library.job_view(name)
+        if view is None:
+            return None
+        run = next((r for r in manager.runs() if r["name"] == name), None) if manager else None
+        run = run or library.run_record(name)
         if run and run["status"] in {"failed", "cancelled", "interrupted"} and view["running"]:
             # Harbor may be interrupted before it writes a final result.
             # Preserve those files, and display the durable worker outcome.
@@ -144,41 +151,46 @@ def make_handler(library: data.Library, manager=None, token=""):
                     return
                 self.send_json({**record, "log": data.tail(manager.records / (record["name"] + ".log"))})
             elif path == "/api/jobs":
-                jobs = [managed_view(p, False) for p in library.jobs().values()]
+                library.maybe_sync()
+                jobs = [view for view in (managed_view(name, False) for name in library.job_names()) if view]
                 jobs.sort(key=lambda view: view["started_at"] or "", reverse=True)
+                storage = library.storage()
                 self.send_json({"jobs": jobs, "runs": manager.runs() if manager else [],
                                 "summary": data.merge_summaries(j["summary"] for j in jobs),
-                                "storage": {"jobs_dirs": [str(root) for root in library.roots],
+                                "storage": {**storage,
                                             "records_dir": str(manager.records) if manager else None,
-                                            "format": "Harbor JSON / JSONL"}})
+                                            "format": storage["database"]["format"]}})
             elif path == "/api/job":
-                job_dir = library.job_dir(query.get("name", ""))
-                if job_dir is None:
+                library.maybe_sync()
+                view = managed_view(query.get("name", ""))
+                if view is None:
                     self.send_json({"error": "no such job"}, 404)
                     return
-                self.send_json(managed_view(job_dir))
+                self.send_json(view)
             elif path == "/api/trial":
-                trial_dir = library.trial_dir(query.get("job", ""), query.get("trial", ""))
-                if trial_dir is None:
+                library.maybe_sync()
+                job, trial = query.get("job", ""), query.get("trial", "")
+                detail = library.trial_detail(job, trial)
+                if detail is None:
                     self.send_json({"error": "no such trial"}, 404)
                     return
-                detail = data.trial_detail(trial_dir)
-                view = managed_view(trial_dir.parent)
-                for row in view["rows"]:
-                    if row["trial"] == trial_dir.name:
+                view = managed_view(job)
+                for row in view["rows"] if view else []:
+                    if row["trial"] == trial:
                         detail["row"] = row
                         break
                 self.send_json(detail)
             elif path == "/api/job.csv":
-                job_dir = library.job_dir(query.get("name", ""))
-                if job_dir is None:
+                library.maybe_sync()
+                view = managed_view(query.get("name", ""))
+                if view is None:
                     self.send_json({"error": "no such job"}, 404)
                     return
-                body = data.job_csv(managed_view(job_dir)).encode("utf-8")
+                body = data.job_csv(view).encode("utf-8")
                 self.send_bytes(
                     body,
                     "text/csv; charset=utf-8",
-                    attachment=f"{job_dir.name}.csv",
+                    attachment=f"{view['name']}.csv",
                 )
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -205,6 +217,13 @@ def make_handler(library: data.Library, manager=None, token=""):
 
 
 class WorkbenchHTTPServer(ThreadingHTTPServer):
+    library: Optional[StoreLibrary] = None
+
+    def server_close(self):
+        super().server_close()
+        if self.library is not None:
+            self.library.close()
+
     def server_bind(self):
         # HTTPServer otherwise reverse-resolves the bind address. A public
         # bind can stall on DNS before the CLI's readiness deadline, even
@@ -213,8 +232,23 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
-def make_server(library: data.Library, bind: str, port: int, manager=None, token="") -> ThreadingHTTPServer:
+def library_for(roots, manager=None) -> StoreLibrary:
+    """The store a service reads: the workbench's configured store, or a
+    private temporary one for a read-only viewer without a workbench."""
+    if manager is not None:
+        store = Store(store_config.for_workbench(settings(manager.config_path), manager.config_path))
+    else:
+        store = open_ephemeral()
+    return StoreLibrary(store, roots, owns_store=True)
+
+
+def make_server(library, bind: str, port: int, manager=None, token="") -> ThreadingHTTPServer:
+    """`library` is a StoreLibrary, or a data.Library whose roots are then
+    served through the workbench's store."""
+    if isinstance(library, data.Library):
+        library = library_for(library.roots, manager)
     server = WorkbenchHTTPServer((bind, port), make_handler(library, manager, token))
+    server.library = library
     server.daemon_threads = True
     return server
 
@@ -232,14 +266,18 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     manager = RunManager(args.jobs_dir[0], args.config) if args.config else None
     token = secrets.token_urlsafe(32) if manager else ""
-    server = make_server(data.Library(args.jobs_dir), args.bind, args.port, manager, token)
+    library = library_for(args.jobs_dir, manager)
+    server = make_server(library, args.bind, args.port, manager, token)
+    # Historical imports can take a while; serve meanwhile.
+    library.start_background()
     host = "127.0.0.1" if args.bind == "0.0.0.0" else args.bind
     url = args.public_url or f"http://{host}:{server.server_address[1]}/"
     url = url.rstrip("/") + "/"
     if args.ready_file:
         atomic_json(args.ready_file, {"url": url, "token": token, "pid": os.getpid(),
                                     "listen_url": f"http://{host}:{server.server_address[1]}/",
-                                    "jobs_dir": str(args.jobs_dir[0].resolve())})
+                                    "jobs_dir": str(args.jobs_dir[0].resolve()),
+                                    "store": library.store.config.describe()})
         args.ready_file.chmod(0o600)
     print("Bench 工作台：" + url, flush=True)
     try:

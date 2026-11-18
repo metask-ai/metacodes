@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 
 from scripts.eval.harbor.command import check_bundle
+from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.viewer import data
 from scripts.eval.harbor.viewer.account import Account
 
@@ -194,7 +195,8 @@ class RunManager:
                     "key_env": catalog["key_env"],
                     "metrics_enabled": cfg.get("metrics_enabled", True),
                     "metrics_bind": cfg.get("metrics_bind", "172.17.0.1"),
-                    "harbor": shutil.which(cfg.get("harbor", "harbor")), "dataset": DATASET}
+                    "harbor": shutil.which(cfg.get("harbor", "harbor")), "dataset": DATASET,
+                    "store": store_config.for_workbench(cfg, self.config_path).to_json()}
             spec_path = self.records / (name + ".spec")
             atomic_json(spec_path, spec)
             try:

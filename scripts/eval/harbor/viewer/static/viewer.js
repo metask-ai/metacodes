@@ -203,8 +203,9 @@ async function renderOverview() {
       h('span', { text: RUN_STATUS[r.status] || r.status }))))) : null;
   const storagePanel = storage ? panel('数据保存位置', storage.format,
     h('div', { class: 'panel-body' },
-      (storage.jobs_dirs || []).map((path) => h('p', {}, h('code', { text: path }))),
-      h('p', { class: 'muted', text: '执行机器本地文件：每个作业保存成绩 JSON、逐次轨迹和判分日志；新运行的请求计时保存在作业的 .bench-metrics/。' }),
+      storage.database ? h('p', {}, '评测数据库：', h('code', { text: storage.database.location })) : null,
+      (storage.jobs_dirs || []).map((path) => h('p', {}, '同步的作业目录：', h('code', { text: path }))),
+      h('p', { class: 'muted', text: '页面读取评测数据库：Harbor 作业目录中的成绩、逐次轨迹、判分日志和请求计时（.bench-metrics/）都会同步进数据库，可用 metacodes bench db migrate 在 SQLite 与 PostgreSQL 之间迁移。' }),
       h('p', { class: 'muted', text: '历史日志未采集请求时间戳时，TPS / TTFT 显示未采集。首次满分率只看每道题的首次执行，重跑成绩不回填；基础设施无效项单列。' }),
       storage.records_dir ? h('p', { class: 'muted', text: '工作台启动记录：' + storage.records_dir }) : null)) : null;
   return h('div', {}, metrics, launches, panel('作业', `${jobs.length} 个`, table, compareBtn), storagePanel);
