@@ -8,9 +8,12 @@ The first non-empty line of answer.txt is the answer; a Jeopardy!-style
 "What is ...?" wrapper is removed. Scoring is the SQuAD/MRQA convention:
 lowercase, drop punctuation, drop the
 articles a/an/the, collapse whitespace; exact match (EM) and token-level F1,
-each taken as the maximum over the gold aliases. Jeopardy answers carry
-alternates in parentheses, so the aliases are the answer as given, the answer
-with every parenthetical removed, and each "(or X)" / "(X)" alternative.
+each taken as the maximum over the gold aliases. Jeopardy answers (J! Archive)
+put optional text in parentheses ("(Ken) Lay", "Victor Emmanuel (III)", "ado
+(in Ecuador)") and mark alternates as "(or X)" or "(X accepted)". The aliases
+are the answer as given (parenthetical text kept), the answer with every
+parenthetical (or any one) removed, and each marked alternate; an unmarked
+parenthetical is never an answer on its own.
 
 Reward 1 iff EM = 1 against some alias. F1 is reported in grade.json but does
 not award credit: Jeopardy answers are one to three tokens, where any F1 short
@@ -46,15 +49,26 @@ def normalize(text: str) -> str:
     return " ".join(text.split())
 
 
+_PAREN = re.compile(r"\(([^()]*)\)")
+_OR_ALTERNATE = re.compile(r"^\s*or\s+(.+?)\s*$", re.IGNORECASE)
+_ACCEPTED_ALTERNATE = re.compile(r"^\s*(.+?)\s+(?:is\s+)?(?:also\s+)?accepted\s*$", re.IGNORECASE)
+
+
 def aliases(answer: str) -> List[str]:
-    out = [answer]
-    stripped = re.sub(r"\([^()]*\)", " ", answer)
-    out.append(stripped)
-    for inner in re.findall(r"\(([^()]*)\)", answer):
-        alt = re.sub(r"^\s*or\s+", "", inner, flags=re.IGNORECASE)
-        out.append(alt)
-        # "(Edgar Allan) Poe": the full name with the parenthetical kept.
-        out.append(answer.replace("(" + inner + ")", inner))
+    # The answer as given (normalising drops the parentheses but keeps their
+    # text: "(Edgar Allan) Poe" -> "edgar allan poe") and with every
+    # parenthetical, or any one of them, left out ("Poe").
+    out = [answer, _PAREN.sub(" ", answer)]
+    for match in _PAREN.finditer(answer):
+        out.append(answer[: match.start()] + " " + answer[match.end() :])
+        # J! Archive marks alternates explicitly: "cocoa (or chocolate)",
+        # "referred pain (referral accepted)". Any other parenthetical is
+        # optional text, never an answer on its own ("(John) Adams" does not
+        # accept "John", "Washington (state)" does not accept "state").
+        inner = match.group(1)
+        alternate = _OR_ALTERNATE.match(inner) or _ACCEPTED_ALTERNATE.match(inner)
+        if alternate:
+            out.append(alternate.group(1))
     seen: List[str] = []
     for item in out:
         norm = normalize(item)

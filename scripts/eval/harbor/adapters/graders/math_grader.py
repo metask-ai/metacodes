@@ -11,11 +11,12 @@ a leading "x =" when the gold has none). They match when any of these holds:
 
 1. the normalised strings are equal;
 2. both evaluate to real numbers within a relative tolerance of 1e-6 (numbers,
-   + - * / ^, \\frac, \\sqrt, \\sqrt[n], \\pi, \\cdot, \\times, implicit
-   products such as 2\\sqrt{3});
-3. both are comma-separated lists of equal length whose items match
-   pairwise by rules 1-2: in order for a gold tuple/interval in ( ) or [ ],
-   in any order for a set or a bare list;
+   + - * / ^, \\frac (also \\frac12, \\dfrac, \\tfrac), \\sqrt, \\sqrt[n],
+   \\pi, \\cdot, \\times, implicit products such as 2\\sqrt{3});
+3. both are comma-separated lists of equal length whose items match by
+   rules 1-2: a gold tuple or interval ( ), [ ], ( ], [ ) needs the same
+   brackets and the same order; a gold set \\{ \\} or bare list matches a set
+   or a bare list in any order (never a tuple or an interval);
 4. the gold is a choice letter (A-E, or a set such as "AC") and the answer
    names the same letters.
 
@@ -201,10 +202,29 @@ class _Parser:
 
     def group(self) -> float:
         opener = self.take()
-        closer = {"{": "}", "(": ")", "[": "]"}[opener]
+        closer = {"{": "}", "(": ")", "[": "]"}.get(opener)
+        if closer is None:
+            raise ValueError("expected a group")
         value = self.expr()
         self.take(closer)
         return value
+
+    def argument(self) -> float:
+        """A macro argument: {group}, or one character / one command as in LaTeX (\\frac12)."""
+        token = self.peek()
+        if token is None:
+            raise ValueError("missing argument")
+        if token == "{":
+            return self.group()
+        if token[0].isdigit():
+            if len(token) > 1:
+                self.tokens[self.index] = token[1:]  # \\frac123 is \\frac{1}{2}3
+            else:
+                self.index += 1
+            return float(token[0])
+        if token.startswith("\\"):
+            return self.atom()
+        raise ValueError("unsupported argument %s" % token)
 
     def atom(self) -> float:
         token = self.peek()
@@ -217,15 +237,15 @@ class _Parser:
             return float(token)
         if token == "\\frac":
             self.take()
-            numerator = self.group()
-            denominator = self.group()
+            numerator = self.argument()
+            denominator = self.argument()
             return numerator / denominator
         if token == "\\sqrt":
             self.take()
             degree = 2.0
             if self.peek() == "[":
                 degree = self.group()
-            radicand = self.group() if self.peek() in ("{", "(") else self.atom()
+            radicand = self.group() if self.peek() == "(" else self.argument()
             if radicand < 0:
                 raise ValueError("complex root")
             return radicand ** (1.0 / degree)
@@ -238,7 +258,7 @@ class _Parser:
 def evaluate(text: str) -> Optional[float]:
     try:
         value = _Parser(text).parse()
-    except (ValueError, ZeroDivisionError, OverflowError, TypeError):
+    except (ValueError, ZeroDivisionError, OverflowError, TypeError, KeyError, IndexError, RecursionError):
         return None
     if isinstance(value, complex) or math.isnan(value) or math.isinf(value):
         return None
@@ -267,13 +287,16 @@ def _split_top_level(text: str) -> List[str]:
     return parts
 
 
-def _strip_brackets(text: str) -> str:
-    for opener, closer in (("\\{", "\\}"), ("(", ")"), ("[", "]"), ("{", "}")):
-        if text.startswith(opener) and text.endswith(closer):
-            inner = text[len(opener) : len(text) - len(closer)]
-            if _balanced(inner):
-                return inner
-    return text
+def _container(text: str) -> Tuple[str, str]:
+    """(kind, inner): "set" for \\{...\\}, the bracket pair for a tuple or an
+    interval ("()", "[]", "(]", "[)"), "bare" for a plain list or a {...} group."""
+    if text.startswith("\\{") and text.endswith("\\}") and _balanced(text[2:-2]):
+        return "set", text[2:-2]
+    if len(text) >= 2 and text[0] in "([" and text[-1] in ")]" and _balanced(text[1:-1]):
+        return text[0] + text[-1], text[1:-1]
+    if len(text) >= 2 and text[0] == "{" and text[-1] == "}" and _balanced(text[1:-1]):
+        return "bare", text[1:-1]
+    return "bare", text
 
 
 def _balanced(text: str) -> bool:
@@ -318,13 +341,16 @@ def equivalent(prediction: str, gold: str) -> bool:
     if gold_choice is not None:
         pred_choice = _choices(re.sub(r"[.:：]$", "", p)) or _choices(p[:1] if p[1:2] in (")", ".", ":") else "")
         return pred_choice == gold_choice
-    g_items = [item for item in _split_top_level(_strip_brackets(g))]
-    p_items = [item for item in _split_top_level(_strip_brackets(p))]
+    g_kind, g_inner = _container(g)
+    p_kind, p_inner = _container(p)
+    g_items = _split_top_level(g_inner)
+    p_items = _split_top_level(p_inner)
     if len(g_items) > 1 and len(g_items) == len(p_items):
-        if all(_atom_match(a, b) for a, b in zip(p_items, g_items)):
-            return True
-        if g.startswith(("(", "[")):
-            return False  # tuples, points and intervals are ordered
+        if g_kind not in ("set", "bare"):
+            # Tuples, points and intervals: same brackets, same order.
+            return p_kind == g_kind and all(_atom_match(a, b) for a, b in zip(p_items, g_items))
+        if p_kind not in ("set", "bare"):
+            return False  # a tuple or an interval is not a set of values
         remaining = list(g_items)
         for item in p_items:
             for index, candidate in enumerate(remaining):

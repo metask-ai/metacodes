@@ -6,9 +6,14 @@ Source: github.com/openai/human-eval data/HumanEval.jsonl.gz at commit
 
 Each task asks for /app/solution.py implementing the problem's function from
 its signature and docstring. The verifier (graders/code_grader.py, in a
-separate offline container) runs the dataset's `check(candidate)` against it
-as an unprivileged user; reward 1 iff every assertion passes. The oracle is
-prompt + canonical_solution.
+separate offline container) follows the reference harness (prompt +
+completion + test + check(entry_point)): the submission process runs the
+prompt and then solution.py in one namespace, so a solution may rely on the
+prompt's helpers (HumanEval/32 `poly`, /38 `encode_cyclic`, /50
+`encode_shift`) or redefine them; the test process runs the prompt and the
+dataset's `check(candidate)` with the entry point bound to the submission's
+function. Reward 1 iff every assertion passes. The oracle is prompt +
+canonical_solution.
 
 Harbor 0.26 references: adapters/humanevalfix/template (task layout, reward
 file), examples/tasks/secure-python-worker (separate verifier grading a
@@ -55,11 +60,13 @@ def instruction(problem: Dict[str, str]) -> str:
     return (
         f"# {problem['task_id']}\n\n"
         f"Implement the Python function `{entry}` described below.\n\n"
-        f"Write a complete, self-contained Python module to `/app/solution.py` that defines "
-        f"`{entry}` with exactly this signature, together with any imports and helper "
-        f"functions it needs. Only `/app/solution.py` is graded: hidden unit tests import "
-        f"nothing else and call `{entry}` directly under Python 3.12 with the standard "
-        f"library only. Do not print anything at import time.\n\n"
+        f"Write a Python module to `/app/solution.py` that defines `{entry}` with exactly "
+        f"this signature, together with any imports and helper functions it needs. As in "
+        f"the reference HumanEval harness, the verifier runs the code below first and then "
+        f"your module in the same namespace, so helpers the code below defines are "
+        f"available (your module may also repeat or redefine them). Only "
+        f"`/app/solution.py` is graded: hidden unit tests call `{entry}` under Python 3.12 "
+        f"with the standard library only. Do not print anything at import time.\n\n"
         "```python\n" + problem["prompt"].rstrip() + "\n```\n"
     )
 
@@ -86,7 +93,12 @@ def build(inputs: Dict[str, Path], out: Path) -> None:
             },
             instruction=instruction(problem),
             oracle=problem["prompt"] + problem["canonical_solution"],
-            spec={"kind": "humaneval", "entry_point": problem["entry_point"], "test": problem["test"]},
+            spec={
+                "kind": "humaneval",
+                "prompt": problem["prompt"],
+                "entry_point": problem["entry_point"],
+                "test": problem["test"],
+            },
             agent_timeout_sec=900.0,
         )
         c.write_task(out / tid, files)

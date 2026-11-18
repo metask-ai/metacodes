@@ -67,11 +67,16 @@ Harbor's `examples/tasks/sidecar-artifacts` and
   `python:3.10-slim-bookworm@sha256:5be5aaecb962a41567bc8041f1e9e3432cb085b037fe057f9a562630b2e4b370`
   (ALFWorld sidecar, forced `linux/amd64`).
 
-Graders (`graders/`) are deterministic and offline. The code grader runs the
-submission as uid 65534 with time and memory limits and accepts a pass only
-with exit 0 plus a per-run nonce printed after the last test; like the
-reference HumanEval/MBPP harnesses, tests share an interpreter with the
-submission.
+Graders (`graders/`) are deterministic and offline. The code grader never
+lets the tests share an interpreter with the submission (the reference
+HumanEval/MBPP harnesses do, which lets a submission forge a pass): the
+submission runs as uid 65534 in one process and serves calls over a pipe;
+the dataset's tests run as uid 65533 in another process that calls it,
+decodes replies as plain data only (anything else is an opaque handle equal
+only to itself) and alone reports the pass. Both have time, memory and file
+size limits; the hidden tests (`spec.json`, mode 0600) are root-only, and
+every process under either uid is killed before the root grader writes
+`reward.txt` (threat model in the `code_grader.py` docstring).
 
 ## Sources, pins and licenses
 
@@ -95,8 +100,13 @@ pinned; transitive dependencies are resolved by pip).
 ## Per-benchmark notes
 
 **HumanEval / MBPP.** The agent writes a complete module to
-`/app/solution.py`. MBPP instructions use the paper's prompt, which shows the
-three asserts that are graded; `challenge_test_list` is not used, as in the
+`/app/solution.py`. HumanEval follows the reference harness (prompt, then
+completion, then `check(entry_point)`): the prompt runs before the solution
+in the same namespace, so a solution may use the prompt's helpers
+(HumanEval/32 `poly`, /38 `encode_cyclic`, /50 `encode_shift`) or redefine
+them. MBPP runs `test_setup_code` after the solution, and the asserts reach
+only the names the reference code or setup binds. MBPP instructions use the
+paper's prompt, which shows the three asserts that are graded; `challenge_test_list` is not used, as in the
 reference evaluation. Two MBPP references (tasks 180 and 493) compare floats
 exactly; they pass on Linux/glibc but not with macOS libm, so check them in
 the Docker oracle run.
@@ -115,9 +125,11 @@ path. The sidecar is `linux/amd64` only.
 (first 200 with an answer and a snippet), read from the 622 MB archive by
 HTTP range requests. The clue, category and all snippets are in
 `instruction.md`; the answer goes to `/app/answer.txt`. Reward 1 iff the
-SQuAD-normalised answer equals the gold answer or one of its parenthetical
-alternates ("cocoa (or chocolate)" accepts "cocoa", "chocolate"); token F1 is
-recorded in `grade.json` but awards nothing.
+SQuAD-normalised answer equals the gold answer as given, the gold with its
+parenthetical text left out ("(Ken) Lay" accepts "Ken Lay" and "Lay", not
+"Ken"), or an alternate J! Archive marks ("cocoa (or chocolate)" accepts
+"chocolate", "referred pain (referral accepted)" accepts "referral"); token
+F1 is recorded in `grade.json` but awards nothing.
 
 **LiveMath.** "LiveMath" is taken to be **LiveMathBench** (OpenCompass,
 arXiv:2412.13147), release v202412, English: AMC_en, CCEE_en, CNMO_en,
@@ -129,7 +141,8 @@ pinned by the git blob SHA-1 and size Hugging Face reports at the pinned
 commit (fail-closed); `prepare()` records the SHA-256 it verified in the
 dataset marker. Grading is deterministic and stricter than the authors' LLM
 judge: equal normalised strings, equal numeric value (fractions, roots,
-pi), equal lists/sets, or the same choice letters.
+pi), equal tuples/intervals (same brackets, same order) or sets/lists (any
+order), or the same choice letters.
 
 ## Checks
 

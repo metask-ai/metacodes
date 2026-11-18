@@ -38,13 +38,18 @@ def agent_dockerfile(extra_lines: Sequence[str] = ()) -> str:
 
 
 def verifier_dockerfile(grader: str) -> str:
+    # The code grader runs the submission as uid 65534 inside this image, so
+    # its hidden tests (spec.json) are root-only and /logs/verifier is not
+    # writable by that uid; the grader itself runs as root (test.sh).
+    spec_mode = "0600" if grader == GRADERS["code"] else "0644"
     return (
         "# Separate verifier image (Harbor builds it from tests/ and does not\n"
         "# upload tests/ in separate mode, so the image owns /tests).\n"
         f"FROM {c.PYTHON_312_IMAGE}\n"
         f"COPY test.sh {grader} spec.json /tests/\n"
-        "RUN chmod 0755 /tests/test.sh && chmod 0644 /tests/" + grader + " /tests/spec.json \\\n"
-        "    && mkdir -p /app /logs/verifier\n"
+        "RUN chmod 0755 /tests/test.sh && chmod 0644 /tests/" + grader + " \\\n"
+        f"    && chmod {spec_mode} /tests/spec.json \\\n"
+        "    && mkdir -p /app /logs/verifier && chmod 0755 /logs /logs/verifier\n"
     )
 
 

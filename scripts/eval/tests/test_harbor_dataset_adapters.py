@@ -318,7 +318,7 @@ class PrepareFlowTest(unittest.TestCase):
             second = humaneval.prepare(self.tmp / "dest")
         self.assertEqual(first, second)
         self.assertEqual(fetched, ["HumanEval.jsonl.gz"])
-        self.assertEqual(humaneval.tasks(first), ["humaneval-0", "humaneval-2"])
+        self.assertEqual(humaneval.tasks(first), ["humaneval-0", "humaneval-2", "humaneval-38"])
 
     def test_remote_zip_reads_members(self) -> None:
         archive = self.tmp / "a.zip"
@@ -374,7 +374,7 @@ class CodeTasksTest(TaskChecks):
 
     def test_generation_oracle_and_wrong_answers(self) -> None:
         built = self._build_all()
-        self.assertEqual(humaneval.tasks(built["humaneval"]), ["humaneval-0", "humaneval-2"])
+        self.assertEqual(humaneval.tasks(built["humaneval"]), ["humaneval-0", "humaneval-2", "humaneval-38"])
         # mbpp task 1 is outside the test split (ids 11-510).
         self.assertEqual(mbpp.tasks(built["mbpp"]), ["mbpp-11", "mbpp-367"])
         self.assertEqual(
@@ -415,6 +415,164 @@ class CodeTasksTest(TaskChecks):
         reward, details = run_grader(task_dir, "code_grader.py", "--solution", solution, self.tmp)
         self.assertEqual(reward, 0)
         self.assertIn("AssertionError", details["stderr_tail"])
+
+    def test_forged_passes_are_rejected(self) -> None:
+        """Submissions that try to report a pass without passing the tests."""
+        built = self._build_all()
+        attacks = {
+            # The old harness kept its nonce in a __main__ global.
+            "nonce from __main__": (
+                "import __main__, sys, os\n"
+                "print('\\nMETACODES-PASS ' + __main__.nonce, flush=True)\n"
+                "os._exit(0)\n"
+            ),
+            # The old harness looked up exec after the submission ran.
+            "replaced builtins.exec": (
+                "import builtins, sys\n"
+                "def has_close_elements(numbers, threshold):\n"
+                "    return None\n"
+                "def fake_exec(code, *args, **kwargs):\n"
+                "    if getattr(code, 'co_filename', '') == 'test.py':\n"
+                "        sys.stdout.write('\\nMETACODES-PASS ' + sys.modules['__main__'].nonce + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "        import os; os._exit(0)\n"
+                "    return real_exec(code, *args, **kwargs)\n"
+                "real_exec = builtins.exec\n"
+                "builtins.exec = fake_exec\n"
+            ),
+            # Equality that always holds defeats `assert candidate(x) == y` in-process.
+            "always-equal result": (
+                "class Equal:\n"
+                "    def __eq__(self, other):\n"
+                "        return True\n"
+                "    __hash__ = object.__hash__\n"
+                "def has_close_elements(numbers, threshold):\n"
+                "    return Equal()\n"
+            ),
+            # Ending a test's iteration early from inside the candidate.
+            "StopIteration from the candidate": (
+                "def has_close_elements(numbers, threshold):\n"
+                "    raise StopIteration\n"
+            ),
+            # Shadowing a builtin the tests use.
+            "shadowed builtins": (
+                "def has_close_elements(numbers, threshold):\n"
+                "    return None\n"
+                "def abs(x):\n"
+                "    return 0\n"
+                "__builtins__ = {}\n"
+            ),
+            # Writing a pass line to every descriptor, then exiting 0.
+            "pass line on every fd": (
+                "import os\n"
+                "for fd in range(3, 64):\n"
+                "    try:\n"
+                "        os.write(fd, b'\\nMETACODES-PASS\\n')\n"
+                "    except OSError:\n"
+                "        pass\n"
+                "print('METACODES-PASS', flush=True)\n"
+                "os._exit(0)\n"
+            ),
+        }
+        # A hand-written reply that names a callable outside the whitelist.
+        planted = self.tmp / "planted"
+        attacks["crafted reply pickle"] = (
+            "import os, struct, sys\n"
+            "wfd = int(sys.argv[sys.argv.index('--wfd') + 1])\n"
+            f"payload = b'cos\\nsystem\\n(S' + repr('touch ' + {str(planted)!r}).encode() + b'\\ntR.'\n"
+            "os.write(wfd, struct.pack('>I', len(payload)) + payload)\n"
+            "os._exit(0)\n"
+        )
+        task_dir = built["humaneval"] / "humaneval-0"
+        solution = self.tmp / "solution.py"
+        accepted = []
+        for label, source in attacks.items():
+            solution.write_text(source)
+            reward, details = run_grader(task_dir, "code_grader.py", "--solution", solution, self.tmp)
+            if reward:
+                accepted.append(label)
+        self.assertEqual(accepted, [])
+        self.assertFalse(planted.exists(), "the test driver ran a callable the submission named")
+
+    def test_humaneval_runs_the_prompt_before_the_solution(self) -> None:
+        """HumanEval/38's tests and its canonical body call encode_cyclic, which only the prompt defines."""
+        built = self._build_all()
+        task_dir = built["humaneval"] / "humaneval-38"
+        solution = self.tmp / "solution.py"
+        # A correct completion that relies on the prompt's helper, as the
+        # reference harness (prompt + completion + test) allows.
+        solution.write_text("def decode_cyclic(s: str):\n    return encode_cyclic(encode_cyclic(s))\n")
+        reward, details = run_grader(task_dir, "code_grader.py", "--solution", solution, self.tmp)
+        self.assertEqual(reward, 1, details)
+        # A self-contained module that redefines nothing from the prompt.
+        solution.write_text(
+            "def decode_cyclic(s):\n"
+            "    groups = [s[(3 * i):min((3 * i + 3), len(s))] for i in range((len(s) + 2) // 3)]\n"
+            "    groups = [(g[-1] + g[:-1]) if len(g) == 3 else g for g in groups]\n"
+            "    return ''.join(groups)\n"
+        )
+        reward, details = run_grader(task_dir, "code_grader.py", "--solution", solution, self.tmp)
+        self.assertEqual(reward, 1, details)
+        # Returning the input unchanged is still wrong.
+        solution.write_text("def decode_cyclic(s):\n    return s\n")
+        self.assertEqual(run_grader(task_dir, "code_grader.py", "--solution", solution, self.tmp)[0], 0)
+
+    @unittest.skipUnless(POSIX, "process groups are POSIX")
+    def test_no_submission_process_outlives_grading(self) -> None:
+        """A background child of the submission is killed before reward.txt is written."""
+        built = self._build_all()
+        task_dir = built["humaneval"] / "humaneval-0"
+        late = self.tmp / "late-write"
+        solution = self.tmp / "solution.py"
+        solution.write_text(
+            "import os, time\n"
+            "if os.fork() == 0:\n"
+            "    time.sleep(1.5)\n"
+            f"    open({str(late)!r}, 'w').write('1')\n"
+            "    os._exit(0)\n"
+            "def has_close_elements(numbers, threshold):\n"
+            "    return any(abs(a - b) < threshold for i, a in enumerate(numbers) for b in numbers[i + 1:])\n"
+        )
+        reward, details = run_grader(task_dir, "code_grader.py", "--solution", solution, self.tmp)
+        self.assertEqual(reward, 1, details)
+        import time
+
+        time.sleep(2.5)
+        self.assertFalse(late.exists(), "a process the submission forked survived grading")
+
+    def test_verifier_image_hides_the_tests_from_the_sandbox(self) -> None:
+        built = self._build_all()
+        dockerfile = (built["humaneval"] / "humaneval-0" / "tests/Dockerfile").read_text()
+        self.assertIn("chmod 0600 /tests/spec.json", dockerfile)
+        self.assertIn("chmod 0755 /logs /logs/verifier", dockerfile)
+
+    def test_mbpp_tests_reach_only_the_reference_names(self) -> None:
+        names = mbpp.solution_names
+        # MBPP 126: the reference itself shadows the builtin the test calls.
+        self.assertEqual(names("def sum(a, b):\n    return a + b\n", "", ["assert sum(10,15) == 6"]), ["sum"])
+        # A builtin the reference does not define stays the driver's own.
+        self.assertEqual(names("def f(x):\n    return x\n", "", ["assert abs(f(-1)) == 1"]), ["f"])
+        # Objects built by test_setup_code (MBPP 367) and solution classes.
+        self.assertEqual(
+            names("class Node:\n    pass\ndef height(n):\n    return 0\n", "root = Node()\n",
+                  ["assert height(root) == 3"]),
+            ["height", "root"],
+        )
+        built = self._build_all()
+        spec = json.loads((built["mbpp"] / "mbpp-367" / "tests/spec.json").read_text())
+        self.assertIn("root", spec["names"])
+        # A submission's own builtin shadow cannot reach an MBPP assert.
+        task_dir = built["mbpp"] / "mbpp-11"
+        tests = json.loads((task_dir / "tests/spec.json").read_text())["tests"]
+        function = re.match(r"assert\s+(\w+)", tests[0]).group(1)
+        solution = self.tmp / "solution.py"
+        solution.write_text(
+            f"def {function}(*args):\n    return None\n"
+            "class Equal:\n    def __eq__(self, other):\n        return True\n"
+            "def str(*args):\n    return Equal()\n"
+            "def repr(*args):\n    return Equal()\n"
+        )
+        self.assertEqual(run_grader(task_dir, "code_grader.py", "--solution", solution, self.tmp)[0], 0)
 
     def test_mbpp_setup_and_imports_reach_the_tests(self) -> None:
         built = self._build_all()
@@ -478,7 +636,7 @@ class SearchQATest(TaskChecks):
         cases = {
             "searchqa-101": (["Federal Reserve", "What is the Federal Reserve?"], ["the central bank", "Fed"]),
             "searchqa-102": (["cocoa", "Chocolate", "cocoa (or chocolate)"], ["coffee", "cocoa beans"]),
-            "searchqa-104": (["Poe", "Edgar Allan Poe"], ["Edgar"]),
+            "searchqa-104": (["Poe", "Edgar Allan Poe"], ["Edgar", "Edgar Allan"]),
         }
         for tid, (right, wrong) in cases.items():
             task_dir = dataset / tid
@@ -501,6 +659,26 @@ class SearchQATest(TaskChecks):
             instruction = (task_dir / "instruction.md").read_text()
             self.assertIn("Retrieved snippets", instruction)
             self.assertIn("/app/answer.txt", instruction)
+
+    def test_parenthetical_aliases(self) -> None:
+        """Answer formats from the pinned subset: a parenthetical is optional
+        text, an alternate only when J! Archive marks it ("or X", "X accepted")."""
+        grader = load_module(ADAPTER_DIR / "graders/qa_grader.py", "qa_grader_under_test")
+        cases = {
+            "(Ken) Lay": (["Ken Lay", "Lay"], ["Ken"]),
+            "Victor Emmanuel (III)": (["Victor Emmanuel III", "Victor Emmanuel"], ["III"]),
+            "ado (in Ecuador)": (["ado", "ado in Ecuador"], ["in Ecuador", "Ecuador"]),
+            "Washington (state)": (["Washington", "Washington state"], ["state"]),
+            "(John) Adams": (["John Adams", "Adams"], ["John"]),
+            "New Mexico (or Colorado)": (["New Mexico", "Colorado"], ["or Colorado"]),
+            "referred pain (referral accepted)": (["referred pain", "referral"], ["referral accepted"]),
+        }
+        for gold, (right, wrong) in cases.items():
+            accepted = grader.aliases(gold)
+            for text in right:
+                self.assertIn(grader.normalize(text), accepted, (gold, text))
+            for text in wrong:
+                self.assertNotIn(grader.normalize(text), accepted, (gold, text))
 
 
 # --- LiveMathBench ----------------------------------------------------------------
@@ -556,6 +734,41 @@ class LiveMathTest(TaskChecks):
         for pred, gold in rejected:
             self.assertFalse(eq(pred, gold), (pred, gold))
         self.assertEqual(self.grader.extract("work...\nso \\boxed{\\frac{1}{2}} done"), "\\frac{1}{2}")
+
+    def test_brackets_keep_their_meaning(self) -> None:
+        """An interval, a tuple and a set are different answers; only a set is order-free."""
+        eq = self.grader.equivalent
+        accepted = [
+            ("[1, 2]", "[1,2]"), ("(1, 2]", "$(1,2]$"), ("\\left[1,2\\right)", "[1,2)"),
+            ("\\{2, 1\\}", "\\{1,2\\}"), ("1, 2", "\\{1,2\\}"), ("\\{2, 1\\}", "1, 2"), ("2, 1", "1, 2"),
+            ("(\\frac{1}{2}, 1)", "(0.5, 1)"),
+        ]
+        rejected = [
+            ("[1,2]", "(1,2)"), ("(1,2)", "[1,2]"), ("\\{1,2\\}", "(1,2)"), ("(1,2)", "\\{1,2\\}"),
+            ("[1,2)", "(1,2)"), ("(1,2]", "[1,2]"), ("[1,2]", "\\{1,2\\}"), ("[2,1]", "[1,2]"),
+            ("1, 2", "(1,2)"), ("(1,2)", "1, 2"),
+        ]
+        for pred, gold in accepted:
+            self.assertTrue(eq(pred, gold), (pred, gold))
+        for pred, gold in rejected:
+            self.assertFalse(eq(pred, gold), (pred, gold))
+
+    def test_braceless_fractions(self) -> None:
+        eq = self.grader.equivalent
+        for pred in ("\\frac12", "\\frac1{2}", "\\frac{1}2", "\\dfrac12", "\\tfrac12", "\\dfrac{1}{2}", "0.5"):
+            self.assertTrue(eq(pred, "\\frac{1}{2}"), pred)
+            self.assertTrue(eq("\\frac{1}{2}", pred), pred)
+        self.assertTrue(eq("\\frac\\pi2", "\\frac{\\pi}{2}"))
+        self.assertTrue(eq("\\frac123", "\\frac{1}{2}3"))  # LaTeX: \frac12 then 3
+        self.assertTrue(eq("\\sqrt2", "\\sqrt{2}"))
+        self.assertFalse(eq("\\frac13", "\\frac{1}{2}"))
+        self.assertIsNone(self.grader.evaluate("\\frac"))
+        self.assertIsNone(self.grader.evaluate("\\frac1"))
+        answer = self.tmp / "answer.txt"
+        answer.write_text("\\boxed{\\frac12}\n")
+        spec = self.tmp / "spec.json"
+        spec.write_text(json.dumps({"answer": "$\\frac{1}{2}$", "question_type": "x"}))
+        self.assertEqual(self.grader.grade(spec, answer)[0], 1)
         self.assertEqual(self.grader.extract("lots of work\n\nFinal answer: 42\n"), "42")
 
 

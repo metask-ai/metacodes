@@ -8,9 +8,10 @@ Hugging Face config.
 
 Each task gives the problem text and its three test asserts, in the paper's
 prompt format, and asks for /app/solution.py. The verifier
-(graders/code_grader.py, in a separate offline container) executes
-test_setup_code and the three `test_list` asserts against the submission as
-an unprivileged user; reward 1 iff all pass. `challenge_test_list` is not
+(graders/code_grader.py, in a separate offline container) runs
+test_setup_code after the submission, as the reference harness does, and the
+three `test_list` asserts in a separate test process that calls into the
+submission's names (`solution_names`); reward 1 iff all pass. `challenge_test_list` is not
 used, as in the reference evaluation. The oracle is the reference `code`.
 
 Harbor 0.26 references: see humaneval.py.
@@ -18,9 +19,10 @@ Harbor 0.26 references: see humaneval.py.
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Set
 
 from scripts.eval.harbor.adapters import _answer_tasks as at
 from scripts.eval.harbor.adapters import _common as c
@@ -63,6 +65,39 @@ def instruction(text: str, tests: Sequence[str], header: str) -> str:
     )
 
 
+def _bound_names(source: str) -> Set[str]:
+    """Names a module's top-level statements bind."""
+    names: Set[str] = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
+        else:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                    names.add(sub.id)
+    return names
+
+
+def solution_names(code: str, setup: str, tests: Sequence[str]) -> List[str]:
+    """The names the tests take from the solution module.
+
+    Those the reference code or test_setup_code binds at top level and the
+    asserts read. The grader's test driver reaches exactly these in the
+    submission (graders/code_grader.py), so a submission cannot shadow a
+    builtin the tests use unless the reference itself does (MBPP 126 `sum`).
+    """
+    bound = _bound_names(code.replace("\r\n", "\n")) | _bound_names(setup.replace("\r\n", "\n"))
+    read = {
+        node.id
+        for test in tests
+        for node in ast.walk(ast.parse(test))
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    return sorted(bound & read)
+
+
 def write_code_task(
     out: Path,
     *,
@@ -86,7 +121,13 @@ def write_code_task(
         metadata={"benchmark": suite, "source_id": source_id, "source": source},
         instruction=instruction(text, tests, header),
         oracle=code.replace("\r\n", "\n"),
-        spec={"kind": "mbpp", "setup": setup, "imports": list(imports), "tests": list(tests)},
+        spec={
+            "kind": "mbpp",
+            "setup": setup,
+            "imports": list(imports),
+            "tests": list(tests),
+            "names": solution_names(code, setup, tests),
+        },
         agent_timeout_sec=900.0,
     )
     c.write_task(out / tid, files)
