@@ -3279,7 +3279,7 @@ fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider
     var w: std.Io.Writer = .fixed(&line_buf);
     const pasted = meta.obtained != null and meta.obtained.? == .pasted;
     (if (pasted) openrouter_login.writeStored(&w, profile.display_name, meta) else openrouter_login.writeSignedIn(&w, profile.display_name, meta)) catch {};
-    w.writeAll(" · /model to choose a model\n") catch {};
+    w.writeAll("\n") catch {};
     cmd_output.print("{s}", .{w.buffered()});
     const current = if (stored) |value| openrouter_login.manageUrl(app.allocator, grant_origin, grant, value.secret) catch null else null;
     defer if (current) |url| app.allocator.free(url);
@@ -3295,6 +3295,12 @@ fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider
     _ = app.refreshOpenRouterListing() catch |err| {
         cmd_output.print("{s}{s}'s model list did not refresh ({s}); /providers refresh retries{s}\n", .{ th.warn, profile.display_name, @errorName(err), th.reset });
     };
+    // Signed in: on to choosing the model, as `/login` goes on for Metask.
+    // The picker opens applying it from now on, so the next start uses it
+    // too; on the free models when the account has no credits, the only ones
+    // that answer then.
+    app.pending_overlay = .model_picker;
+    app.pending_picker_preset = app_mod.PickerPreset.withFilter(.global, if (meta.free_tier orelse false) ":free" else "");
 }
 
 /// Offer one provider in `/login`'s list. The one `/login <id>` named is

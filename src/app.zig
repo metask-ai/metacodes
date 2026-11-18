@@ -283,6 +283,28 @@ pub const PendingOverlay = enum {
     transcript,
 };
 
+/// How the next `/model` picker opens, when something other than the user's
+/// own `/model` asked for it: a sign-in that goes on to choosing a model
+/// (`/login openrouter`) opens it applying `from now on`, and on the free
+/// models when the account has no credits. Taken once, by `picker_host.open`.
+pub const PickerPreset = struct {
+    scope: provider_selection_mod.Scope = .session,
+    filter_buffer: [16]u8 = @splat(0),
+    filter_len: u8 = 0,
+
+    pub fn withFilter(scope: provider_selection_mod.Scope, text: []const u8) PickerPreset {
+        var preset: PickerPreset = .{ .scope = scope };
+        const n: u8 = @intCast(@min(text.len, preset.filter_buffer.len));
+        @memcpy(preset.filter_buffer[0..n], text[0..n]);
+        preset.filter_len = n;
+        return preset;
+    }
+
+    pub fn filter(self: *const PickerPreset) []const u8 {
+        return self.filter_buffer[0..self.filter_len];
+    }
+};
+
 /// The TUI theme for this terminal: monochrome under `--no-theme`; otherwise
 /// the `theme` persisted in `<state root>/config.json`, else auto. Auto on a
 /// colour terminal asks the terminal for its background (OSC 11, a short
@@ -458,6 +480,8 @@ pub const App = struct {
     /// after the input reader returns, so the request is parked here and the
     /// next read consumes it.
     pending_overlay: PendingOverlay = .none,
+    /// How that picker opens, when it is not the user's own `/model`.
+    pending_picker_preset: ?PickerPreset = null,
     /// One OAuth session per provider, kept for the process.
     ///
     /// Single flight is a property of a `Session` object, so a fresh one per

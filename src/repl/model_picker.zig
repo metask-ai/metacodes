@@ -485,6 +485,22 @@ pub const Picker = struct {
         self.intents.set(id, value) catch {};
     }
 
+    /// Open on `text` as if the user had typed it, with the cursor on the
+    /// first model it shows (a sign-in whose account has no credits opens on
+    /// `:free`). Call after `restart`, with the snapshot in place.
+    pub fn presetFilter(self: *Picker, text: []const u8) void {
+        const n = @min(text.len, MAX_FILTER);
+        @memcpy(self.filter_buffer[0..n], text[0..n]);
+        self.filter_len = n;
+        self.focusFirst();
+    }
+
+    /// Open applying `scope` (Tab still cycles it): a sign-in that goes on to
+    /// choosing a model applies it `from now on`, as `/login` does for Metask.
+    pub fn presetScope(self: *Picker, scope: Scope) void {
+        self.scope = scope;
+    }
+
     // ── row construction ────────────────────────────────────────────────────
 
     /// Storage for the rows, owned by the caller and sized by the catalog.
@@ -1481,6 +1497,36 @@ test "scope is session unless the user explicitly cycles it" {
     _ = picker.onKey(.cycle_scope);
     try testing.expectEqual(Scope.global, picker.onKey(.enter).commit.scope);
     // Reopening forgets an explicit scope: it was a choice for that commit.
+    picker.restart();
+    try testing.expectEqual(Scope.session, picker.scope);
+}
+
+test "a sign-in's preset opens on its filter and scope, as if typed and cycled, and Esc clears the filter" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("openrouter", "auto", "Inkling (free)", null, "thinkingmachines/inkling-2-small:free", "openai_chat"),
+        fixtureOffer("openrouter", "auto", "DeepSeek V4.1 Flash", null, "deepseek/deepseek-v4.1-flash", "openai_chat"),
+        fixtureOffer("openrouter", "auto", "Ling 3.2 Flash (free)", null, "inclusionai/ling-3.2-flash:free", "openai_chat"),
+    };
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    picker.presetScope(.global);
+    picker.presetFilter(":free");
+    try testing.expectEqualStrings(":free", picker.filter());
+    var letters: [16]u8 = undefined;
+    // The two free models, flat; not the paid one.
+    try testing.expectEqualStrings("MM", try shape(&picker, &letters));
+    try testing.expectEqual(Scope.global, picker.scope);
+    // Enter applies the one under the cursor from now on.
+    const committed = picker.onKey(.enter).commit;
+    try testing.expectEqual(Scope.global, committed.scope);
+    // The preset is the user's to undo: Esc clears the filter like a typed one.
+    picker.restart();
+    picker.presetFilter(":free");
+    try testing.expect(picker.onKey(.escape) == .redraw);
+    try testing.expectEqual(@as(usize, 0), picker.filter_len);
+    // And a plain reopening knows nothing of it.
     picker.restart();
     try testing.expectEqual(Scope.session, picker.scope);
 }

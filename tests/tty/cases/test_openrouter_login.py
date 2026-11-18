@@ -30,6 +30,9 @@ LISTING = {"data": [
     {"id": "deepseek/deepseek-v4.1-flash", "name": "DeepSeek: DeepSeek V4.1 Flash", "context_length": 1048576,
      "pricing": {"prompt": "0.0000001", "completion": "0.0000004"},
      "supported_parameters": ["tools", "reasoning"], "endpoints": ["/api/v1/chat/completions"]},
+    {"id": "inclusionai/ling-3.2-flash:free", "name": "inclusionAI: Ling 3.2 Flash (free)", "context_length": 262144,
+     "pricing": {"prompt": "0", "completion": "0"},
+     "supported_parameters": ["tools"], "endpoints": ["/api/v1/chat/completions"]},
     {"id": "some/no-tools", "name": "No Tools", "supported_parameters": ["temperature"],
      "endpoints": ["/api/v1/chat/completions"]},
 ]}
@@ -76,7 +79,7 @@ class _OpenRouter(http.server.BaseHTTPRequestHandler):
         if auth not in (f"Bearer {KEY}", f"Bearer {PASTED_KEY}"):
             self._send(401, {"error": {"code": 401, "message": "Missing Authentication header"}})
         elif self.path == "/api/v1/key":
-            self._send(200, DESCRIBED)
+            self._send(200, {"data": dict(DESCRIBED["data"], is_free_tier=self.server.free_tier)})
         elif self.path == "/api/v1/models/user":
             self._send(200, LISTING)
         else:
@@ -87,10 +90,14 @@ class _Case:
     """A scratch HOME, an OpenRouter mock every address is moved onto, and a
     $BROWSER that records the URL it is asked to open."""
 
+    def __init__(self, free_tier=False):
+        self.free_tier = free_tier
+
     def __enter__(self):
         self.home = case_tmpdir("cc-tty-openrouter-")
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OpenRouter)
         self.server.seen = []
+        self.server.free_tier = self.free_tier
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.origin = f"http://127.0.0.1:{self.server.server_port}"
         self.opened = os.path.join(self.home, "opened.txt")
@@ -161,10 +168,10 @@ def test_login_openrouter_asks_which_way_and_signs_in_with_the_browser(bin_path)
                   wait_for("Paste an API key you already have", 10),
                   "key:enter",
                   wait_for("Signed in to OpenRouter", WAIT_S),
-                  "type:/model", "key:enter", wait_for("apply to", 10),
+                  # Signed in: the picker opens by itself, applying from now on.
+                  wait_for("apply to", 10),
                   "type:deepseek-v4.1", wait_for("DeepSeek: DeepSeek V4.1 Flash", 10),
-                  # Esc clears the filter, the second closes the picker.
-                  "key:esc", "key:esc", "sleep:0.5",
+                  "key:enter", wait_for("from now on", 10), "sleep:0.5",
                   "type:/logout openrouter", "key:enter",
                   wait_for("It still works on OpenRouter", 10)]
         raw = run(bin_path, events, term_size=(40, 140), env=case.env(), per_key_drain=0.05)
@@ -176,7 +183,13 @@ def test_login_openrouter_asks_which_way_and_signs_in_with_the_browser(bin_path)
             a._fail("the other device should be offered")
         if not a.screens_with('OpenRouter shows this sign-in as "localhost:'):
             a._fail("the dialog should say how OpenRouter names the sign-in")
-        a.assert_prose_contains('Signed in to OpenRouter · key sk-or-v1-0e6...1c96 on your account · no spending limit · never expires · /model to choose a model')
+        a.assert_prose_contains('Signed in to OpenRouter · key sk-or-v1-0e6...1c96 on your account · no spending limit · never expires')
+        if a.screens_with("/model to choose a model"):
+            a._fail("the picker opens by itself: no need to point at /model")
+        if not a.screens_with("[from now on]"):
+            a._fail("the picker should open applying from now on")
+        if not a.screens_with("switched to deepseek/deepseek-v4.1-flash from now on"):
+            a._fail("Enter in that picker should apply the model from now on")
         # The exchange: the browser's code, S256, a verifier.
         exchanges = case.seen("POST", "/api/v1/auth/keys")
         assert len(exchanges) == 1, case.server.seen
@@ -196,11 +209,13 @@ def test_login_openrouter_asks_which_way_and_signs_in_with_the_browser(bin_path)
 
 
 def test_login_openrouter_on_another_device_takes_the_code_pasted_back(bin_path):
-    with _Case() as case:
+    # An account without credits: the picker that follows opens on its free models.
+    with _Case(free_tier=True) as case:
         events = [READY, "type:/login openrouter --device-code", "key:enter",
                   wait_for("Paste the code here", 10),
                   f"type:{SHOWN_CODE}", wait_for(f"({len(SHOWN_CODE)} characters)", 10),
-                  "key:enter", wait_for("Signed in to OpenRouter", WAIT_S)]
+                  "key:enter", wait_for("Signed in to OpenRouter", WAIT_S),
+                  wait_for("inclusionAI: Ling 3.2 Flash (free)", 10), "sleep:0.3"]
         raw = run(bin_path, events, term_size=(40, 160), env=case.env(), per_key_drain=0.05)
         a, _ = _screen(raw, 40, 160)
         if not a.screens_with("Sign in to OpenRouter on another device"):
@@ -215,6 +230,14 @@ def test_login_openrouter_on_another_device_takes_the_code_pasted_back(bin_path)
         assert body["code"] == SHOWN_CODE, body
         stored = case.stored()
         assert stored["key"] == KEY and stored["obtained"] == "browser_sign_in", stored
+        if not a.screens_with("has no credits yet"):
+            a._fail("an account without credits should be told so")
+        picker = a.screens_with("inclusionAI: Ling 3.2 Flash (free)")
+        if not picker:
+            a._fail("the picker should open on the free models")
+        last = "\n".join(picker[-1].line_text(r) for r in range(picker[-1].rows))
+        assert ":free" in last and "[from now on]" in last, last
+        assert "DeepSeek: DeepSeek V4.1 Flash" not in last, "a paid model listed for an account without credits:\n" + last
 
 
 def test_login_openrouter_takes_a_key_the_user_already_has(bin_path):
@@ -226,7 +249,9 @@ def test_login_openrouter_takes_a_key_the_user_already_has(bin_path):
                   "key:enter", wait_for("Stored the key for OpenRouter", WAIT_S)]
         raw = run(bin_path, events, term_size=(40, 140), env=case.env(), per_key_drain=0.05)
         a, _ = _screen(raw, 40, 140)
-        a.assert_prose_contains('Stored the key for OpenRouter · key sk-or-v1-0e6...1c96 on your account · no spending limit · never expires · /model to choose a model')
+        a.assert_prose_contains('Stored the key for OpenRouter · key sk-or-v1-0e6...1c96 on your account · no spending limit · never expires')
+        if not a.screens_with("apply to"):
+            a._fail("a stored key goes on to choosing a model too")
         assert PASTED_KEY.encode() not in raw, "the pasted key was echoed"
         assert [entry[2] for entry in case.seen("GET", "/api/v1/key")] == [f"Bearer {PASTED_KEY}"], case.server.seen
         assert case.seen("POST", "/api/v1/auth/keys") == [], "a pasted key needs no exchange"

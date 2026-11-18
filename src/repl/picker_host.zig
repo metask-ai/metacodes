@@ -74,6 +74,13 @@ pub fn open(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
         if (effort.active()) app.model_picker.presetControl("reasoning_effort", effort.name());
     }
     app.model_picker.page_rows = pageRowsFor(ui.rows);
+    // A sign-in that goes on to choosing a model (`/login openrouter`) said
+    // how; the user's own `/model` and Ctrl+O open as they always have.
+    if (app.pending_picker_preset) |preset| {
+        app.pending_picker_preset = null;
+        app.model_picker.presetScope(preset.scope);
+        if (preset.filter_len > 0) app.model_picker.presetFilter(preset.filter());
+    }
     setOpen(ui, true);
 }
 
