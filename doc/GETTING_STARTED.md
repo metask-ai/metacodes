@@ -109,7 +109,9 @@ install record, then `~/.metacodes` ([INSTALL_DESIGN.md](INSTALL_DESIGN.md)).
 
 metacodes is model-agnostic. `--provider` selects a provider profile
 (`metask`, `openai`, `gemini`, `zai-coding-plan`, `deepseek`, `kimi`,
-`kimi-code`, `qwen`, `minimax`, `bedrock`, or one you define), `--channel` a route within it, and `--offer` pins one exact model route. `metacodes
+`kimi-code`, `qwen`, `minimax`, `bedrock`, or one you define), `--channel` a route within it, and `--offer` pins one exact model route.
+`--preset <name>` uses a named setup you keep in `config.json`, and a directory
+can remember one ([presets](LOCAL_CONFIG.md#presets)). `metacodes
 --check-providers` validates the configuration and lists every route without
 touching the network. `--base-url`, `--api-key` and `--model` override the
 endpoint, key and model for a single run; `--openai-protocol responses`
@@ -207,9 +209,13 @@ token, billed to the account. The access and rotating refresh tokens, with the
 gateway and model URLs, are stored as the Metask session in
 `<state root>/oauth/metask.json`; the model and reasoning level in
 `<state root>/auth.json`. The session switches to Metask at once, and later
-starts use it. `/logout` (or `metacodes logout`) revokes the session at Metask,
-removes both files, and switches the session to the provider `.env`
-configures, if any.
+starts use it. Signing in again (to change the account, the model or the
+level, or after the sign-in expired) revokes the session it replaces at
+Metask once the new one is stored, so no earlier sign-in from this machine
+stays valid there; if Metask cannot be reached, the sign-in still goes
+through and says the previous one stays valid until it expires. `/logout` (or
+`metacodes logout`) revokes the session at Metask, removes both files, and
+switches the session to the provider `.env` configures, if any.
 
 On a machine without a browser, `metacodes login --provider metask` uses
 Metask's JSON device authorization flow and stores the same session. It prints

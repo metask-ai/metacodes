@@ -221,22 +221,80 @@ pub const RevokeOutcome = enum {
     timed_out,
 };
 
+/// A stored Metask session, as much of it as revoking it takes: its refresh
+/// token, and the gateway it was issued for (null in a file that records
+/// none). Owned by `allocator`; the token is zeroed when it goes.
+pub const StoredSession = struct {
+    allocator: std.mem.Allocator,
+    refresh_token: []u8,
+    gateway_url: ?[]u8,
+
+    /// The Metask session stored under `state_root` now
+    /// (`oauth/metask.json`, or `METACODES_OAUTH_DIR`); null when none is,
+    /// or the file is not one. `error.NoStore` when there is no store to
+    /// look in.
+    pub fn load(allocator: std.mem.Allocator, state_root: []const u8) error{ NoStore, OutOfMemory }!?StoredSession {
+        var session = oauth.Session.initHome(allocator, state_root, provider_ids.Slug.lit("metask")) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.NoStore,
+        };
+        defer session.deinit();
+        if (!(session.load() catch false)) return null;
+        const tokens = session.tokens orelse return null;
+        return try copy(allocator, tokens.refresh_token, tokens.gateway_url);
+    }
+
+    /// The session a stored file's bytes hold: the snapshot a sign-in takes
+    /// of the file it replaces (`oauth.StoredSnapshot`). Null when the bytes
+    /// are not a stored session.
+    pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!?StoredSession {
+        var stored = oauth.parseStored(allocator, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer {
+            stored.tokens.deinit(allocator);
+            if (stored.client_id) |id| allocator.free(id);
+        }
+        return try copy(allocator, stored.tokens.refresh_token, stored.tokens.gateway_url);
+    }
+
+    fn copy(allocator: std.mem.Allocator, refresh_token: []const u8, gateway_url: ?[]const u8) error{OutOfMemory}!StoredSession {
+        const token = try allocator.dupe(u8, refresh_token);
+        errdefer oauth.secureFree(allocator, token);
+        const gateway = if (gateway_url) |url| try allocator.dupe(u8, url) else null;
+        return .{ .allocator = allocator, .refresh_token = token, .gateway_url = gateway };
+    }
+
+    pub fn deinit(self: *StoredSession) void {
+        oauth.secureFree(self.allocator, self.refresh_token);
+        if (self.gateway_url) |url| self.allocator.free(url);
+        self.* = undefined;
+    }
+};
+
 /// Revoke the stored Metask session's authorization at the server (#527),
 /// as the sign-in contract asks a sign-out to do before it removes the local
-/// sign-in. Best effort and bounded: the request runs on its own thread with
-/// its own copies, `wait_ms` is all the caller waits, and sign-out goes on
-/// whatever the outcome. `site` is the authorization server (`siteUrl()`).
+/// sign-in. Best effort and bounded as `revokeRefreshToken`, and sign-out
+/// goes on whatever the outcome. `site` is the authorization server
+/// (`siteUrl()`).
 pub fn revokeStoredSession(state_root: []const u8, site: []const u8, wait_ms: u64) RevokeOutcome {
+    var stored = (StoredSession.load(std.heap.page_allocator, state_root) catch return .failed) orelse return .nothing_stored;
+    defer stored.deinit();
+    return revokeRefreshToken(site, stored.refresh_token, wait_ms);
+}
+
+/// Revoke `refresh_token` at `site`'s revocation endpoint (`revokeUrl`), as
+/// the metacodes client (`revokeRequestBody`). Best effort and bounded: the
+/// request runs on its own thread with its own copies, and `wait_ms` is all
+/// the caller waits. Never `.nothing_stored`.
+pub fn revokeRefreshToken(site: []const u8, refresh_token: []const u8, wait_ms: u64) RevokeOutcome {
     // The request may outlive the caller's wait: nothing it holds is the
     // caller's.
     const gpa = std.heap.page_allocator;
-    var session = oauth.Session.initHome(gpa, state_root, provider_ids.Slug.lit("metask")) catch return .failed;
-    defer session.deinit();
-    if (!(session.load() catch false)) return .nothing_stored;
-    const tokens = session.tokens orelse return .nothing_stored;
     var url_buf: [1024]u8 = undefined;
     const url = revokeUrl(site, &url_buf) catch return .failed;
-    const job = RevokeJob.create(gpa, url, tokens.refresh_token) catch return .failed;
+    const job = RevokeJob.create(gpa, url, refresh_token) catch return .failed;
     const thread = @import("platform").thread.spawn(.full, RevokeJob.run, .{job}) catch {
         // Only the caller's share is left.
         _ = job.owners.fetchSub(1, .acq_rel);
@@ -307,6 +365,134 @@ const RevokeJob = struct {
         return http_status.ResponseStatus.capture(&response).code == 200;
     }
 };
+
+/// What a sign-in did with the Metask session it replaced (#560).
+pub const ReplacedOutcome = enum {
+    /// No session was stored before it, or it stored the same session again:
+    /// there is nothing to revoke.
+    nothing_replaced,
+    /// The server answered 200: the replaced authorization ends there too.
+    revoked,
+    /// The request failed or was refused: it may stay valid at Metask until
+    /// it expires.
+    failed,
+    /// No answer within the wait; the request may still finish.
+    timed_out,
+    /// The replaced session's gateway is not the site asked now (another
+    /// `METASK_SITE_URL`, or none recorded): its refresh token is not sent
+    /// to a server that did not issue it, and it stays valid there.
+    other_site,
+};
+
+/// Revoke the Metask session a sign-in replaced (#560), once the new one is
+/// stored and bound: left alone it stays valid at Metask, and nothing on this
+/// machine can end it any more (`/logout` revokes only the session stored
+/// now). `replaced` is the stored file's bytes from before the sign-in
+/// (`oauth.StoredSnapshot`), `token_json` the token response it stored.
+/// Best effort and bounded as sign-out (`revokeRefreshToken`); the sign-in
+/// stands whatever the outcome.
+///
+/// Nothing is sent when nothing was replaced, when the sign-in stored the
+/// same session again (its refresh token is the new one's, and revoking it
+/// would end the sign-in), or when the replaced session's gateway is not
+/// `site`: a token goes only to the server it was used with, as a session's
+/// token goes only to its own gateway (#536).
+pub fn revokeReplaced(
+    allocator: std.mem.Allocator,
+    replaced: ?[]const u8,
+    token_json: []const u8,
+    site: []const u8,
+    wait_ms: u64,
+) ReplacedOutcome {
+    var previous = (StoredSession.parse(allocator, replaced orelse return .nothing_replaced) catch return .failed) orelse
+        return .nothing_replaced;
+    defer previous.deinit();
+    if (storesRefreshToken(allocator, token_json, previous.refresh_token)) return .nothing_replaced;
+    const gateway = previous.gateway_url orelse return .other_site;
+    if (!sameOrigin(gateway, site)) return .other_site;
+    return switch (revokeRefreshToken(site, previous.refresh_token, wait_ms)) {
+        .revoked => .revoked,
+        .timed_out => .timed_out,
+        .failed, .nothing_stored => .failed,
+    };
+}
+
+/// Whether `token_json` carries `refresh_token`. One that cannot be read is
+/// taken to: a sign-in is never undone on a guess.
+fn storesRefreshToken(allocator: std.mem.Allocator, token_json: []const u8, refresh_token: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const outcome = oauth.parseTokenResponse(arena.allocator(), token_json) catch return true;
+    return std.mem.eql(u8, outcome.refresh_token orelse return true, refresh_token);
+}
+
+/// Whether `a` and `b` are the same http(s) origin: the scheme and host
+/// without regard to case, the port with the scheme's default filled in; a
+/// path is ignored.
+pub fn sameOrigin(a: []const u8, b: []const u8) bool {
+    const left = std.Uri.parse(std.mem.trimEnd(u8, a, "/")) catch return false;
+    const right = std.Uri.parse(std.mem.trimEnd(u8, b, "/")) catch return false;
+    if (!std.ascii.eqlIgnoreCase(left.scheme, right.scheme)) return false;
+    var left_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    var right_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const left_host = left.getHost(&left_buf) catch return false;
+    const right_host = right.getHost(&right_buf) catch return false;
+    if (!std.ascii.eqlIgnoreCase(left_host.bytes, right_host.bytes)) return false;
+    return (left.port orelse defaultPort(left.scheme)) == (right.port orelse defaultPort(right.scheme));
+}
+
+fn defaultPort(scheme: []const u8) ?u16 {
+    if (std.ascii.eqlIgnoreCase(scheme, "https")) return 443;
+    if (std.ascii.eqlIgnoreCase(scheme, "http")) return 80;
+    return null;
+}
+
+/// The Metask session a sign-in is about to replace: read before the sign-in
+/// stores its own, revoked once it has (`revoke`). For the sign-ins that
+/// keep no snapshot of their own (the command line, the device-code flow);
+/// `/login` revokes from the one its transaction holds. Nothing when none
+/// was stored or the store could not be read.
+pub const Replaced = struct {
+    snapshot: ?oauth.StoredSnapshot = null,
+
+    /// For a sign-in that replaces no Metask session (another provider's).
+    pub const none: Replaced = .{};
+
+    pub fn capture(allocator: std.mem.Allocator, state_root: []const u8) Replaced {
+        return .{ .snapshot = oauth.StoredSnapshot.capture(allocator, state_root, provider_ids.Slug.lit("metask")) catch null };
+    }
+
+    pub fn deinit(self: *Replaced) void {
+        if (self.snapshot) |*snapshot| snapshot.deinit();
+        self.* = undefined;
+    }
+
+    /// `revokeReplaced`, once the sign-in (`token_json`) is stored.
+    pub fn revoke(self: *const Replaced, token_json: []const u8, site: []const u8, wait_ms: u64) ReplacedOutcome {
+        const snapshot = self.snapshot orelse return .nothing_replaced;
+        return revokeReplaced(snapshot.allocator, snapshot.contents, token_json, site, wait_ms);
+    }
+};
+
+/// The line a sign-in says about the session it replaced (`replacedNote`).
+pub const ReplacedNote = struct {
+    /// Without its newline.
+    text: []const u8,
+    /// All but a revocation: the replaced session may still be valid.
+    warn: bool,
+};
+
+/// What a sign-in says about the session it replaced, in the words sign-out
+/// uses; null when nothing was replaced.
+pub fn replacedNote(outcome: ReplacedOutcome) ?ReplacedNote {
+    return switch (outcome) {
+        .nothing_replaced => null,
+        .revoked => .{ .text = "Metask revoked the previous sign-in.", .warn = false },
+        .failed => .{ .text = "Metask could not revoke the previous sign-in; it stays valid there until it expires.", .warn = true },
+        .timed_out => .{ .text = "Metask did not answer the revocation of the previous sign-in in time; it may stay valid there until it expires.", .warn = true },
+        .other_site => .{ .text = "The previous sign-in is from another Metask site, so it was not revoked; it stays valid there until it expires.", .warn = true },
+    };
+}
 
 pub fn deviceTokenRequestBody(allocator: std.mem.Allocator, device_code: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -542,6 +728,76 @@ test "with no Metask session stored, sign-out has nothing to revoke and sends no
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
     // A dead port: were anything sent, it would be refused, not answered.
     try std.testing.expectEqual(RevokeOutcome.nothing_stored, revokeStoredSession(root_buf[0..root_len], "http://127.0.0.1:9", 1000));
+}
+
+/// A stored Metask session's bytes (`renderStored`'s layout).
+fn testStored(comptime refresh_token: []const u8, comptime gateway: ?[]const u8) []const u8 {
+    return "{\"schema_version\":1,\"access_token\":\"at-old\",\"refresh_token\":\"" ++ refresh_token ++
+        "\",\"token_type\":\"Bearer\",\"expires_at\":4102444800" ++
+        (if (gateway) |url| ",\"gateway_url\":\"" ++ url ++ "\"" else "") ++ "}";
+}
+
+fn testTokenResponse(comptime refresh_token: []const u8) []const u8 {
+    return "{\"access_token\":\"at-new\",\"refresh_token\":\"" ++ refresh_token ++
+        "\",\"token_type\":\"bearer\",\"expires_in\":3600,\"gateway_url\":\"http://127.0.0.1:9\",\"models_url\":\"http://127.0.0.1:9/v1/models\"}";
+}
+
+test "the session a sign-in replaced: its refresh token and gateway, read from the stored bytes (#560)" {
+    const a = std.testing.allocator;
+    var stored = (try StoredSession.parse(a, testStored("mrt-old", "https://www.metask-ai.com"))).?;
+    defer stored.deinit();
+    try std.testing.expectEqualStrings("mrt-old", stored.refresh_token);
+    try std.testing.expectEqualStrings("https://www.metask-ai.com", stored.gateway_url.?);
+    var bare = (try StoredSession.parse(a, testStored("mrt-old", null))).?;
+    defer bare.deinit();
+    try std.testing.expect(bare.gateway_url == null);
+    // Not a stored session: nothing to revoke.
+    try std.testing.expect((try StoredSession.parse(a, "not json")) == null);
+    try std.testing.expect((try StoredSession.parse(a, "{\"access_token\":\"at-old\"}")) == null);
+}
+
+test "a sign-in sends no revocation when it replaced nothing, stored the same session again, or replaced another site's (#560)" {
+    const a = std.testing.allocator;
+    // A dead port: were anything sent, it would be refused, not answered.
+    const site = "http://127.0.0.1:9";
+    try std.testing.expectEqual(ReplacedOutcome.nothing_replaced, revokeReplaced(a, null, testTokenResponse("mrt-new"), site, 1000));
+    try std.testing.expectEqual(ReplacedOutcome.nothing_replaced, revokeReplaced(a, "", testTokenResponse("mrt-new"), site, 1000));
+    try std.testing.expectEqual(ReplacedOutcome.nothing_replaced, revokeReplaced(a, "{}", testTokenResponse("mrt-new"), site, 1000));
+    // The same token response imported again: revoking would end the sign-in.
+    try std.testing.expectEqual(ReplacedOutcome.nothing_replaced, revokeReplaced(a, testStored("mrt-same", site), testTokenResponse("mrt-same"), site, 1000));
+    // Issued for another site (here, Metask's own): its token is not sent to this one.
+    try std.testing.expectEqual(ReplacedOutcome.other_site, revokeReplaced(a, testStored("mrt-old", DEFAULT_SITE_URL), testTokenResponse("mrt-new"), site, 1000));
+    // A session that names no gateway is not known to be this site's.
+    try std.testing.expectEqual(ReplacedOutcome.other_site, revokeReplaced(a, testStored("mrt-old", null), testTokenResponse("mrt-new"), site, 1000));
+    // Nothing captured is nothing replaced.
+    var nothing: Replaced = .none;
+    defer nothing.deinit();
+    try std.testing.expectEqual(ReplacedOutcome.nothing_replaced, nothing.revoke(testTokenResponse("mrt-new"), site, 1000));
+}
+
+test "the site a replaced session may be revoked at is its gateway's origin (#560)" {
+    try std.testing.expect(sameOrigin("https://www.metask-ai.com", "https://www.metask-ai.com/"));
+    try std.testing.expect(sameOrigin("https://WWW.Metask-AI.com", "https://www.metask-ai.com:443"));
+    try std.testing.expect(sameOrigin("http://127.0.0.1:3000", "http://127.0.0.1:3000/prefix"));
+    try std.testing.expect(!sameOrigin("http://127.0.0.1:3000", "http://127.0.0.1:9000"));
+    try std.testing.expect(!sameOrigin("http://www.metask-ai.com", "https://www.metask-ai.com"));
+    try std.testing.expect(!sameOrigin("https://napi.metask-ai.com", "https://www.metask-ai.com"));
+    try std.testing.expect(!sameOrigin("not a url", "https://www.metask-ai.com"));
+}
+
+test "what a sign-in says about the session it replaced: sign-out's words, a warning unless it was revoked (#560)" {
+    try std.testing.expect(replacedNote(.nothing_replaced) == null);
+    const revoked = replacedNote(.revoked).?;
+    try std.testing.expect(!revoked.warn);
+    try std.testing.expectEqualStrings("Metask revoked the previous sign-in.", revoked.text);
+    const failed = replacedNote(.failed).?;
+    try std.testing.expect(failed.warn);
+    try std.testing.expect(std.mem.endsWith(u8, failed.text, "could not revoke the previous sign-in; it stays valid there until it expires."));
+    for ([_]ReplacedOutcome{ .timed_out, .other_site }) |outcome| {
+        const note = replacedNote(outcome).?;
+        try std.testing.expect(note.warn);
+        try std.testing.expect(std.mem.endsWith(u8, note.text, "valid there until it expires."));
+    }
 }
 
 test "the device flow talks to www, not the bare host that redirects every request (#527)" {

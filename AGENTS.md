@@ -44,6 +44,12 @@ These rules apply to the entire repository.
   through the Renderer; any other direct terminal write is listed with its
   reason ([doc/TUI_VIEWPORT_OWNERSHIP.md](doc/TUI_VIEWPORT_OWNERSHIP.md);
   `zig build test:scrollback` enforces it).
+- Session state leaves the machine for a service only where the user named it.
+  No built-in destination that is on by default is a non-loopback `http://`
+  URL, and the CLI takes no built-in System-One advisor (`jev.BUILTIN_DEFAULT`
+  is for a host that sets `Config.jev_builtin_default`, none here): name a
+  service in `config.json` or the environment, or use https
+  (`zig build test:builtin-egress` enforces it, #474).
 - Preserve the kernel boundaries: plugins cannot replace the AgentLoop or bypass
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,

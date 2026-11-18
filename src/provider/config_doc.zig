@@ -2,10 +2,12 @@
 //! ownership, and read timing").
 //!
 //! This module owns the *document*: its schema version, monotonic revision,
-//! provider map, aliases, and global selection, plus the exact bytes written to
-//! and read from `<state root>/config.json`. It performs no I/O, so the
-//! contract — round-trip fidelity, migration, rejection of newer schemas — is
-//! testable without a filesystem. `config_store.zig` owns the atomic write.
+//! provider map, aliases, global selection, and the named selections a start
+//! can choose (`presets`) with the directories that remember one
+//! (`directory_presets`, #489), plus the exact bytes written to and read from
+//! `<state root>/config.json`. It performs no I/O, so the contract —
+//! round-trip fidelity, migration, rejection of newer schemas — is testable
+//! without a filesystem. `config_store.zig` owns the atomic write.
 //!
 //! Two invariants shape the design:
 //!
@@ -142,6 +144,56 @@ pub const AliasEntry = struct {
     catalog_revision: ?CatalogRevision = null,
 };
 
+pub const MAX_PRESET_NAME_LEN: usize = 48;
+
+/// A preset's name (#489), as `--preset` and `METACODES_PRESET` give it and
+/// `directory_presets` refers to it. Built by `parsePresetName`.
+pub const PresetName = controls_mod.Bounded(MAX_PRESET_NAME_LEN);
+
+/// A name typed on a command line and written in a `.env` file: letters,
+/// digits, `.`, `_` and `-`, starting with a letter or a digit, at most
+/// `MAX_PRESET_NAME_LEN` bytes. Matched exactly, case included.
+pub fn parsePresetName(text: []const u8) error{InvalidPresetName}!PresetName {
+    if (text.len == 0 or text.len > MAX_PRESET_NAME_LEN) return error.InvalidPresetName;
+    if (!std.ascii.isAlphanumeric(text[0])) return error.InvalidPresetName;
+    for (text) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-')) return error.InvalidPresetName;
+    }
+    return PresetName.parse(text) catch error.InvalidPresetName;
+}
+
+/// One named selection (#489): a route (an `auto_route` selector or a
+/// `pinned_offer`, whose offer names the account when it is bound to a pool
+/// credential) and its controls, in the shape `parseSelection` reads.
+pub const Preset = struct {
+    name: PresetName,
+    selection: RuntimeSelection,
+    /// The entry as config.json held it (compact JSON), while it has not been
+    /// replaced through `upsertPreset`: written back as it is, so a preset
+    /// written by hand keeps its own form, and any field this module does not
+    /// model, across every other write to the document. Owned by the
+    /// document.
+    raw: ?[]u8 = null,
+};
+
+/// A directory that remembers a preset (#489). It holds the preset's name,
+/// never a route: editing the preset changes what the directory uses.
+pub const DirectoryPreset = struct {
+    /// Absolute, as written. Owned by the document.
+    path: []u8,
+    preset: PresetName,
+};
+
+/// Whether `path` can key `directory_presets`: an absolute path in UTF-8 (a
+/// JSON string holds nothing else, so another one could not be written back
+/// as it is).
+pub fn isDirectoryKey(path: []const u8) bool {
+    if (path.len == 0 or path.len > std.fs.max_path_bytes) return false;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    if (!std.unicode.utf8ValidateSlice(path)) return false;
+    return std.fs.path.isAbsolute(path);
+}
+
 pub const DocumentError = error{
     UnsupportedSchemaVersion,
     InvalidDocument,
@@ -153,6 +205,18 @@ pub const DocumentError = error{
     TooManyProtocols,
     TooManyControls,
     TooManyCredentials,
+    /// `presets` is not an object, or one of its entries is not a selection
+    /// `parseSelection` reads (#489).
+    InvalidPreset,
+    /// A preset's name breaks `parsePresetName` (#489).
+    InvalidPresetName,
+    /// `directory_presets` is not an object, a key is not an absolute path,
+    /// or a value is not a preset name (#489).
+    InvalidDirectoryPreset,
+    /// A directory was set to remember a preset the document does not define
+    /// (#489). Read from a file, such an entry is kept: the start that would
+    /// use it reports it instead.
+    UnknownPreset,
     OutOfMemory,
 };
 
@@ -168,6 +232,11 @@ pub const Document = struct {
     /// overwrite each other's choice, which is exactly what session scope
     /// promises not to do.
     session_selection: ?RuntimeSelection = null,
+    /// Named selections (#489), in the order the file lists them.
+    presets: std.ArrayList(Preset) = .empty,
+    /// Directories that remember a preset (#489), in the order the file
+    /// lists them.
+    directory_presets: std.ArrayList(DirectoryPreset) = .empty,
     /// Idempotency keys of the most recent commits, oldest first. A retry
     /// carrying any retained key is a no-op instead of a second revision bump.
     recent_operations: [MAX_RECENT_OPERATIONS]OperationId = undefined,
@@ -180,6 +249,10 @@ pub const Document = struct {
     pub fn deinit(self: *Document) void {
         self.providers.deinit(self.allocator);
         self.aliases.deinit(self.allocator);
+        for (self.presets.items) |entry| if (entry.raw) |raw| self.allocator.free(raw);
+        self.presets.deinit(self.allocator);
+        for (self.directory_presets.items) |entry| self.allocator.free(entry.path);
+        self.directory_presets.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -260,6 +333,73 @@ pub const Document = struct {
         return false;
     }
 
+    /// The preset named `name` (exactly, case included), or null.
+    pub fn preset(self: *const Document, name: []const u8) ?*const Preset {
+        for (self.presets.items) |*entry| if (entry.name.eqlText(name)) return entry;
+        return null;
+    }
+
+    /// Insert or replace the preset `name`. The directories that remember it
+    /// follow: they hold its name, not its selection.
+    pub fn upsertPreset(self: *Document, name: []const u8, selection: RuntimeSelection) DocumentError!void {
+        const parsed = try parsePresetName(name);
+        for (self.presets.items) |*existing| {
+            if (!existing.name.eqlText(name)) continue;
+            if (existing.raw) |raw| self.allocator.free(raw);
+            existing.selection = selection;
+            existing.raw = null;
+            return;
+        }
+        try self.presets.append(self.allocator, .{ .name = parsed, .selection = selection });
+    }
+
+    /// Remove the preset `name`. A directory that remembers it keeps its
+    /// entry, and a start there says the preset is gone rather than quietly
+    /// using another route. True when one was removed.
+    pub fn removePreset(self: *Document, name: []const u8) bool {
+        for (self.presets.items, 0..) |entry, index| {
+            if (!entry.name.eqlText(name)) continue;
+            if (entry.raw) |raw| self.allocator.free(raw);
+            _ = self.presets.orderedRemove(index);
+            return true;
+        }
+        return false;
+    }
+
+    /// The entry for `path`, compared byte for byte. Finding the entry for a
+    /// working directory (its canonical key) is the host's job.
+    pub fn directoryPreset(self: *const Document, path: []const u8) ?*const DirectoryPreset {
+        for (self.directory_presets.items) |*entry| if (std.mem.eql(u8, entry.path, path)) return entry;
+        return null;
+    }
+
+    /// Make `path` (absolute) remember the preset `name`, which the document
+    /// must define.
+    pub fn setDirectoryPreset(self: *Document, path: []const u8, name: []const u8) DocumentError!void {
+        if (!isDirectoryKey(path)) return error.InvalidDirectoryPreset;
+        const parsed = try parsePresetName(name);
+        if (self.preset(name) == null) return error.UnknownPreset;
+        for (self.directory_presets.items) |*existing| {
+            if (!std.mem.eql(u8, existing.path, path)) continue;
+            existing.preset = parsed;
+            return;
+        }
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.directory_presets.append(self.allocator, .{ .path = owned, .preset = parsed });
+    }
+
+    /// Forget what `path` remembers. True when it remembered something.
+    pub fn removeDirectoryPreset(self: *Document, path: []const u8) bool {
+        for (self.directory_presets.items, 0..) |entry, index| {
+            if (!std.mem.eql(u8, entry.path, path)) continue;
+            self.allocator.free(entry.path);
+            _ = self.directory_presets.orderedRemove(index);
+            return true;
+        }
+        return false;
+    }
+
     /// Serialize the control-plane keys into `original`, preserving every key
     /// this module does not own.
     pub fn merge(self: *const Document, original: []const u8) DocumentError![]u8 {
@@ -286,6 +426,8 @@ pub const Document = struct {
             try renderSelection(arena, value)
         else
             null;
+        const presets = if (self.presets.items.len > 0) try self.renderPresets(arena) else null;
+        const directory_presets = if (self.directory_presets.items.len > 0) try self.renderDirectoryPresets(arena) else null;
         var operations: ?[]u8 = null;
         if (self.recent_operation_len > 0) {
             var buffer: std.ArrayList(u8) = .empty;
@@ -305,11 +447,39 @@ pub const Document = struct {
             .{ .key = "aliases", .json = aliases },
             .{ .key = "global_selection", .json = selection },
             .{ .key = "session_selection", .json = session },
+            .{ .key = "presets", .json = presets },
+            .{ .key = "directory_presets", .json = directory_presets },
             .{ .key = "recent_operation_ids", .json = operations },
         }, members) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.InvalidDocument,
         };
+    }
+
+    fn renderPresets(self: *const Document, arena: std.mem.Allocator) DocumentError![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.append(arena, '{');
+        for (self.presets.items, 0..) |*entry, index| {
+            if (index > 0) try out.append(arena, ',');
+            try writeJsonString(arena, &out, entry.name.slice());
+            try out.append(arena, ':');
+            try out.appendSlice(arena, entry.raw orelse try renderSelection(arena, entry.selection));
+        }
+        try out.append(arena, '}');
+        return out.items;
+    }
+
+    fn renderDirectoryPresets(self: *const Document, arena: std.mem.Allocator) DocumentError![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.append(arena, '{');
+        for (self.directory_presets.items, 0..) |*entry, index| {
+            if (index > 0) try out.append(arena, ',');
+            try writeJsonString(arena, &out, entry.path);
+            try out.append(arena, ':');
+            try writeJsonString(arena, &out, entry.preset.slice());
+        }
+        try out.append(arena, '}');
+        return out.items;
     }
 
     fn renderProviders(self: *const Document, arena: std.mem.Allocator) DocumentError![]u8 {
@@ -669,6 +839,9 @@ fn parseInto(document: *Document, allocator: std.mem.Allocator, text: []const u8
         if (value != .null) document.session_selection = try parseSelection(value);
     }
 
+    if (root.object.get("presets")) |value| try parsePresets(document, allocator, value);
+    if (root.object.get("directory_presets")) |value| try parseDirectoryPresets(document, allocator, value);
+
     if (root.object.get("recent_operation_ids")) |list| {
         if (list != .array) return error.InvalidDocument;
         for (list.array.items) |item| {
@@ -678,6 +851,41 @@ fn parseInto(document: *Document, allocator: std.mem.Allocator, text: []const u8
     } else if (stringOf(root.object.get("last_operation_id"))) |operation_text| {
         // Documents written before the ring existed carry a single key.
         try document.recordOperation(operation_text);
+    }
+}
+
+/// `presets` (#489): each entry a selection, kept with its own JSON so it is
+/// written back as the file had it (`Preset.raw`).
+fn parsePresets(document: *Document, allocator: std.mem.Allocator, value: std.json.Value) DocumentError!void {
+    if (value == .null) return;
+    if (value != .object) return error.InvalidPreset;
+    var it = value.object.iterator();
+    while (it.next()) |pair| {
+        const name = try parsePresetName(pair.key_ptr.*);
+        const selection = parseSelection(pair.value_ptr.*) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidPreset,
+        };
+        const raw = try std.json.Stringify.valueAlloc(allocator, pair.value_ptr.*, .{});
+        errdefer allocator.free(raw);
+        try document.presets.append(allocator, .{ .name = name, .selection = selection, .raw = raw });
+    }
+}
+
+/// `directory_presets` (#489): an absolute path to a preset's name. A name
+/// the document does not define is kept (see `UnknownPreset`).
+fn parseDirectoryPresets(document: *Document, allocator: std.mem.Allocator, value: std.json.Value) DocumentError!void {
+    if (value == .null) return;
+    if (value != .object) return error.InvalidDirectoryPreset;
+    var it = value.object.iterator();
+    while (it.next()) |pair| {
+        const path = pair.key_ptr.*;
+        if (!isDirectoryKey(path)) return error.InvalidDirectoryPreset;
+        const name_text = stringOf(pair.value_ptr.*) orelse return error.InvalidDirectoryPreset;
+        const name = parsePresetName(name_text) catch return error.InvalidDirectoryPreset;
+        const owned = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned);
+        try document.directory_presets.append(allocator, .{ .path = owned, .preset = name });
     }
 }
 
@@ -1451,4 +1659,168 @@ test "configuration JSON writer repairs malformed UTF-8" {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("label�`�", parsed.value.string);
+}
+
+// ── presets (#489) ───────────────────────────────────────────────────────────
+
+fn presetTestOffer() OfferId {
+    return OfferId.derive(.{
+        .provider_id = Slug.lit("house-relay"),
+        .channel_id = Slug.lit("primary"),
+        .protocol = "openai_chat",
+        .endpoint_url = "http://127.0.0.1:9/relay/v1/chat/completions",
+        .request_model_id = "relay-model",
+    });
+}
+
+test "presets and the directory map round-trip; a preset written by hand is written back as it was" {
+    const a = std.testing.allocator;
+    const offer_text = presetTestOffer().render();
+    const original = try std.fmt.allocPrint(a,
+        \\{{"theme":"dark",
+        \\ "presets":{{
+        \\   "kimi":{{"target":{{"kind":"auto_route","selector":"kimi-k3.1-pro"}},
+        \\            "controls":{{"reasoning_effort":{{"text":"high"}}}},
+        \\            "note":"kept, though no field reads it"}},
+        \\   "client-a":{{"target":{{"kind":"pinned_offer","offer_id":"{s}","offer_revision":2}}}}}},
+        \\ "directory_presets":{{"/work/x":"kimi","/work/y":"client-a"}}}}
+    , .{&offer_text});
+    defer a.free(original);
+
+    var document = try parse(a, original);
+    defer document.deinit();
+    try std.testing.expectEqual(@as(usize, 2), document.presets.items.len);
+    const kimi = document.preset("kimi").?;
+    try std.testing.expect(kimi.selection.target.auto_route.selector.eqlText("kimi-k3.1-pro"));
+    try std.testing.expect(kimi.selection.controls.get("reasoning_effort").?.text.eqlText("high"));
+    const client = document.preset("client-a").?;
+    try std.testing.expect(client.selection.target.pinned_offer.offer_id.eql(presetTestOffer()));
+    try std.testing.expectEqual(@as(OfferRevision, 2), client.selection.target.pinned_offer.offer_revision);
+    // Names match exactly.
+    try std.testing.expect(document.preset("Kimi") == null);
+    try std.testing.expect(document.directoryPreset("/work/x").?.preset.eqlText("kimi"));
+    try std.testing.expect(document.directoryPreset("/work/y").?.preset.eqlText("client-a"));
+    try std.testing.expect(document.directoryPreset("/work") == null);
+
+    // Another writer's commit (a /model default here) leaves both maps as
+    // they were, the field this module does not model included.
+    document.global_selection = try RuntimeSelection.auto("deepseek-v4-pro", .{}, .global);
+    const merged = try document.merge(original);
+    defer a.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "kept, though no field reads it") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "\"dark\"") != null);
+    var reloaded = try parse(a, merged);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), reloaded.presets.items.len);
+    try std.testing.expectEqualStrings("kimi", reloaded.presets.items[0].name.slice());
+    try std.testing.expectEqualStrings("client-a", reloaded.presets.items[1].name.slice());
+    try std.testing.expect(reloaded.preset("kimi").?.selection.controls.eql(kimi.selection.controls));
+    try std.testing.expect(reloaded.preset("client-a").?.selection.target.pinned_offer.offer_id.eql(presetTestOffer()));
+    try std.testing.expectEqual(@as(usize, 2), reloaded.directory_presets.items.len);
+    try std.testing.expectEqualStrings("/work/x", reloaded.directory_presets.items[0].path);
+    try std.testing.expect(reloaded.directoryPreset("/work/y").?.preset.eqlText("client-a"));
+}
+
+test "a preset set through the document round-trips, and every directory that remembers it follows the edit" {
+    const a = std.testing.allocator;
+    var document = Document.init(a);
+    defer document.deinit();
+
+    var first = try RuntimeSelection.auto("relay-model", .{}, .session);
+    try first.controls.set("reasoning_effort", try controls_mod.Value.fromText("low"));
+    try document.upsertPreset("a", first);
+    try document.upsertPreset("b", RuntimeSelection.pinned(presetTestOffer(), 1, .session));
+    try document.setDirectoryPreset("/work/x", "a");
+    try document.setDirectoryPreset("/work/z", "a");
+    try document.setDirectoryPreset("/work/y", "b");
+    // Setting a directory again replaces what it remembers.
+    try document.setDirectoryPreset("/work/z", "b");
+
+    const text = try document.merge("{}");
+    defer a.free(text);
+    var reloaded = try parse(a, text);
+    defer reloaded.deinit();
+    try std.testing.expect(reloaded.preset("a").?.selection.target.auto_route.selector.eqlText("relay-model"));
+    try std.testing.expect(reloaded.preset("a").?.selection.controls.eql(first.controls));
+    try std.testing.expect(reloaded.preset("b").?.selection.target.pinned_offer.offer_id.eql(presetTestOffer()));
+    try std.testing.expectEqual(@as(usize, 3), reloaded.directory_presets.items.len);
+    try std.testing.expect(reloaded.directoryPreset("/work/z").?.preset.eqlText("b"));
+
+    // Editing `a` (written by hand before, so it held its JSON) replaces it
+    // for both directories that name it; neither entry is touched.
+    var edited = try RuntimeSelection.auto("relay-model-b", .{}, .session);
+    try edited.controls.set("reasoning_effort", try controls_mod.Value.fromText("high"));
+    try reloaded.upsertPreset("a", edited);
+    const after = try reloaded.merge(text);
+    defer a.free(after);
+    var again = try parse(a, after);
+    defer again.deinit();
+    try std.testing.expect(again.preset("a").?.selection.target.auto_route.selector.eqlText("relay-model-b"));
+    try std.testing.expect(again.preset("a").?.selection.controls.get("reasoning_effort").?.text.eqlText("high"));
+    try std.testing.expect(again.directoryPreset("/work/x").?.preset.eqlText("a"));
+    try std.testing.expectEqual(@as(usize, 2), again.presets.items.len);
+
+    // Removing a preset keeps the directory that names it (a start there
+    // reports it); an empty map leaves the file.
+    try std.testing.expect(again.removePreset("b"));
+    try std.testing.expect(!again.removePreset("b"));
+    try std.testing.expect(again.directoryPreset("/work/y").?.preset.eqlText("b"));
+    try std.testing.expect(again.removePreset("a"));
+    try std.testing.expect(again.removeDirectoryPreset("/work/x"));
+    try std.testing.expect(again.removeDirectoryPreset("/work/y"));
+    try std.testing.expect(again.removeDirectoryPreset("/work/z"));
+    try std.testing.expect(!again.removeDirectoryPreset("/work/z"));
+    const emptied = try again.merge(after);
+    defer a.free(emptied);
+    try std.testing.expect(std.mem.indexOf(u8, emptied, "presets") == null);
+}
+
+test "an invalid preset or directory entry fails with a typed error" {
+    const a = std.testing.allocator;
+    const valid = "{\"target\":{\"kind\":\"auto_route\",\"selector\":\"m\"}}";
+    const cases = [_]struct { text: []const u8, err: DocumentError }{
+        .{ .text = "{\"presets\":[]}", .err = error.InvalidPreset },
+        .{ .text = "{\"presets\":{\"kimi\":\"kimi-k3.1-pro\"}}", .err = error.InvalidPreset },
+        .{ .text = "{\"presets\":{\"kimi\":{\"target\":{\"kind\":\"cheapest\"}}}}", .err = error.InvalidPreset },
+        .{ .text = "{\"presets\":{\"kimi\":{\"target\":{\"kind\":\"auto_route\"}}}}", .err = error.InvalidPreset },
+        // Controls are tagged (`{"text": "high"}`), as everywhere in the file.
+        .{ .text = "{\"presets\":{\"kimi\":{\"target\":{\"kind\":\"auto_route\",\"selector\":\"m\"},\"controls\":{\"reasoning_effort\":\"high\"}}}}", .err = error.InvalidPreset },
+        .{ .text = "{\"presets\":{\"kimi\":{\"target\":{\"kind\":\"pinned_offer\",\"offer_id\":\"offer-nothex\"}}}}", .err = error.InvalidPreset },
+        .{ .text = "{\"presets\":{\"two words\":" ++ valid ++ "}}", .err = error.InvalidPresetName },
+        .{ .text = "{\"presets\":{\"-dash-first\":" ++ valid ++ "}}", .err = error.InvalidPresetName },
+        .{ .text = "{\"presets\":{\"\":" ++ valid ++ "}}", .err = error.InvalidPresetName },
+        .{ .text = "{\"directory_presets\":[]}", .err = error.InvalidDirectoryPreset },
+        .{ .text = "{\"directory_presets\":{\"relative/dir\":\"kimi\"}}", .err = error.InvalidDirectoryPreset },
+        .{ .text = "{\"directory_presets\":{\"/work/x\":3}}", .err = error.InvalidDirectoryPreset },
+        .{ .text = "{\"directory_presets\":{\"/work/x\":\"two words\"}}", .err = error.InvalidDirectoryPreset },
+    };
+    for (cases) |case| {
+        if (parse(a, case.text)) |parsed| {
+            var unexpected = parsed;
+            unexpected.deinit();
+            std.debug.print("{s}: parsed, expected {s}\n", .{ case.text, @errorName(case.err) });
+            return error.TestUnexpectedResult;
+        } else |err| if (err != case.err) {
+            std.debug.print("{s}: expected {s}, got {s}\n", .{ case.text, @errorName(case.err), @errorName(err) });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // A directory that names a preset the file does not define is read:
+    // the start that would use it says so.
+    var dangling = try parse(a, "{\"directory_presets\":{\"/work/x\":\"gone\"}}");
+    defer dangling.deinit();
+    try std.testing.expect(dangling.directoryPreset("/work/x").?.preset.eqlText("gone"));
+    try std.testing.expect(dangling.preset("gone") == null);
+
+    // Through the document: a directory must be absolute and its preset
+    // defined; a name must be one `--preset` can take.
+    var document = Document.init(a);
+    defer document.deinit();
+    try std.testing.expectError(error.InvalidPresetName, document.upsertPreset("a b", try RuntimeSelection.auto("m", .{}, .session)));
+    try document.upsertPreset("a", try RuntimeSelection.auto("m", .{}, .session));
+    try std.testing.expectError(error.UnknownPreset, document.setDirectoryPreset("/work/x", "b"));
+    try std.testing.expectError(error.InvalidDirectoryPreset, document.setDirectoryPreset("work/x", "a"));
+    try std.testing.expectError(error.InvalidPresetName, parsePresetName("x" ** (MAX_PRESET_NAME_LEN + 1)));
+    _ = try parsePresetName("Client_A.v2-1");
 }

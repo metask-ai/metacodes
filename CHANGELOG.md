@@ -12,6 +12,40 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **The CLI no longer consults a built-in System-One advisor** (#474). Until
+  now every host built on the CLI (the TUI, `-p`, `--web`, `serve`) fell back
+  to the team's `metask-jev-4b` at `http://58.211.6.133:10420` whenever
+  `config.json` and `METACODES_JEV_*` named no service, so a session whose
+  TinyKG store held a matching memory sent the first 400 bytes of the request
+  and up to eight 480-byte memory excerpts over plain HTTP to a public IP
+  address nobody had been asked about. The advisor is now on only where a
+  service is named, by the `jev` object of `<state root>/config.json` or by
+  `METACODES_JEV_URL`; with neither, `metacodes doctor` reports
+  `jev_advisor off url=- source=none`. `"jev": false` and
+  `METACODES_JEV_URL=off` still mean off, and a service named in either place
+  behaves as before. **This changes behavior for anyone who relied on the
+  default** (it replaces the 0.3.0 default below): a machine that wants the
+  team's service names it once, in `<state root>/config.json`
+
+  ```json
+  "jev": {"url": "http://58.211.6.133:10420", "mode": "advisory",
+          "model": "metask-jev-4b", "decisions": ["scoped_recall"]}
+  ```
+
+  or in the environment with `METACODES_JEV_URL`, `METACODES_JEV_MODE=advisory`,
+  `METACODES_JEV_MODEL=metask-jev-4b` and
+  `METACODES_JEV_DECISIONS=scoped_recall` (these four are what the default
+  carried; a `url` alone starts from `shadow` and every surface). That address
+  is still plain HTTP; serving it over https on a hostname, and asking once on
+  first run, are tracked in #474. A library host that sets
+  `Config.jev_builtin_default` still gets the built-in service, and the CLI's
+  choice is one constant that the session and `doctor` both read
+  (`jev.CLI_USES_BUILTIN_DEFAULT`). `zig build test:builtin-egress`, part of
+  `gate:pr`, now fails when a built-in destination that is on by default is a
+  non-loopback `http://` URL, and the memory-agent runtime smoke runs its
+  System-One arm in the build: an evaluation arm that uses the advisor reaches
+  it through the service its own environment names.
+
 - **Every request names metacodes as its User-Agent.** Provider, sign-in,
   key-check, catalog, MCP and service requests used to go out as std's
   `zig/0.16.0 (std.http)`; they now say `metacodes/<version>`
@@ -30,7 +64,8 @@ status, compatibility boundaries, and entry points are defined by
 
 - **`metacodes login status` says which credential a plain start uses, and
   why** (#537). It names what a start with no flag would use,
-  the step of the startup order that decides (flags and the shell, the
+  the step of the startup order that decides (flags and the shell, a
+  preset named at start or remembered for the directory (#489), the
   default stored with `/model`, a Metask sign-in, `<state root>/.env`,
   nothing), and what each step holds: the session's path, gateway and
   expiry, `auth.json`'s model and level, where `METASK_API_KEY` is set, the
@@ -324,6 +359,27 @@ status, compatibility boundaries, and entry points are defined by
   can build and test in its workspace instead of running read-only commands
   only.
 
+- **Named presets, and a preset a directory remembers** (part of #489).
+  `config.json` keeps named setups under `presets`, each in the shape
+  `global_selection` has (an `auto_route` selector or a `pinned_offer`, with
+  `controls` such as `reasoning_effort`), and `directory_presets` maps a
+  directory (its git worktree root, else the directory itself) to a preset by
+  name, so editing a preset changes every directory that uses it. A start
+  takes `--preset <name>` or `METACODES_PRESET` (from the shell, or from
+  `<state root>/.env`) and applies the preset as the flags naming the same
+  route would; `--model`, `--channel` and `--reasoning-effort` replace one
+  field for that run without editing it, and `--provider`/`--offer` set it
+  aside. The startup order gains two levels and has seven: flags, a preset
+  named at start, the directory's preset, the `/model` default, a Metask
+  sign-in, `.env` (its `METACODES_PRESET` before its `METACODES_PROVIDER`),
+  nothing; `metacodes login status` shows them. A preset `config.json` does
+  not define stops `-p`, `serve` and `--web` with exit code 2, listing the
+  presets; the TUI says so under its banner and starts without it. Nothing is
+  written into a project. Malformed entries fail to load with
+  `InvalidPreset`, `InvalidPresetName` or `InvalidDirectoryPreset`; saving a
+  preset or a directory's choice from `/model` comes with the TUI part of
+  #489, until then they are written by hand ([LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#presets)).
+
 - **A `SessionHost` Session can move onto another provider route, journaled
   as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`
   commit moves the session's provider, endpoint, credential and model
@@ -489,6 +545,14 @@ status, compatibility boundaries, and entry points are defined by
   them then showed the list without it. The list now ends with `N more not
   shown: /login <provider> (<ids>)`, and `/login <id>` starts any of them.
 
+- **An MCP HTTP request on a kept-alive connection the server closed is sent
+  again on macOS too** (#555). A request other than `tools/call` that found
+  its pooled connection closed is sent once more on a new one; on macOS, when
+  the client read only after the server's reset arrived (a loaded machine),
+  the read reported `ConnectionResetByPeer` instead of the end of stream and
+  the request failed as `McpOutcomeIndeterminate`. A reset before any
+  response byte now counts as that close. A `tools/call` whose body went out
+  is still never sent twice.
 - **Shift+Enter inserts a newline while a reply streams** (#456). In the
   terminal UI, Shift+Enter during a reply did what Enter does: the draft
   went into the pending queue, the input box was cleared, and when the reply
@@ -611,6 +675,18 @@ status, compatibility boundaries, and entry points are defined by
   and still spawns `/bin/sleep` by that name; the second hashes an
   executable it writes into a temporary directory. Product code is
   unchanged.
+- **Signing in to Metask again revokes the sign-in it replaces** (#560).
+  `/login`, `/login metask`, `metacodes login` and `metacodes login
+  --provider metask` overwrote `oauth/metask.json` and left the session they
+  replaced valid at Metask, where nothing on this machine could end it any
+  more: `/logout` revokes only the session stored now. Once the new session
+  is stored (and, in the TUI, bound), the replaced one is revoked at
+  `$METASK_SITE_URL/api/oauth/revoke`, bounded as sign-out (3 s in the TUI,
+  5 s on the command line). A refusal or no answer never fails the sign-in;
+  one line says the previous sign-in stays valid there until it expires. A
+  sign-in that fails, cannot bind or is cancelled revokes nothing; the same
+  session imported again is not revoked, and a replaced session whose
+  gateway is not the site's origin is not sent there.
 
 ### Security
 

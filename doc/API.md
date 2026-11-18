@@ -49,6 +49,17 @@ surfaces built over the same core protocols.
   `gateway_url`, `models_url`, and `client_name` in
   `$HOME/.metacodes/oauth/metask.json` (or `METACODES_OAUTH_DIR`).
 
+Every Metask sign-in that replaces a stored session (this one, `metacodes
+login`, `/login`, `/login metask`) revokes the replaced one at
+`$METASK_SITE_URL/api/oauth/revoke`, as `metacodes logout` revokes the current
+one (#560): only once the new session is stored (and, in the TUI, bound), so a
+sign-in that fails, cannot bind or is cancelled revokes nothing; bounded (3 s
+in the TUI, 5 s on the command line), and a refusal or no answer is reported
+in one line without failing the sign-in. The same session stored again is not
+revoked, and a replaced session whose `gateway_url` is not the origin of
+`$METASK_SITE_URL` is not sent there: it stays valid until it expires, and the
+sign-in says so.
+
 The refresh grant sends only `grant_type=refresh_token` and the stored refresh
 token. Metask rotates refresh tokens; persistence happens before the new access
 token is used, and an `invalid_grant` is actionable as “log in again”. The
@@ -83,8 +94,9 @@ normative model; the entry points are:
 |---|---|
 | `--provider <id\|alias>` / `METACODES_PROVIDER` | resolve the route through the provider registry instead of inferring a transport from the model name |
 | `METACODES_MODEL` | the model, as `--model` gives it (the flag wins) |
-| `<state root>/.env` | the install's local configuration ([LOCAL_CONFIG.md](LOCAL_CONFIG.md)), read once at start and never `setenv`: a layer below the process environment for the names it may set — every registered profile's `env_aliases`, the variables `config.json` names (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`, `METACODES_MODEL`; a provider's aliases are read from it only when the environment sets none of them. Request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`, `METACODES_KG_URL`, any `*_URL`) are refused; other names are ignored with one warning listing them. Its `METACODES_PROVIDER` (else the one provider whose key it holds) applies only when no flag or environment variable names a provider, no `global_selection` is stored and no Metask sign-in exists (`--api-key`, `METASK_API_KEY`, a key or older sign-in in `auth.json`, the Metask session `oauth/metask.json`); keys of several providers and no name choose none, and the run lists them. A `.env` anywhere else, the working directory included, is never read. `metacodes install` writes `<state root>/.env.example` on every install and upgrade and never touches `.env` |
-| no credential at all | the interactive TUI opens without a model (#484): its banner reads `not set — /login, or configure .env`; a prompt, `/retry`, `/edit <n>`, `/init`, `/commit`, `/review`, `/btw`, `/recap` and a Skill are refused with a note before any request is assembled; nothing is probed; no session directory is made until a route binds (`/model`, `/login`). A Metask sign-in in `auth.json` older than #527 with no key and model chosen opens it the same way, and so does a provider named by `--provider`, `--offer`, `METACODES_PROVIDER` or `.env` that has no credential: the note names that provider's variables, and no other provider is used in its place (#485). `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe exit non-zero with the sign-in hint (or the named provider's help) instead. The banner names where a bound route's credential came from (`· Metask`, `· from .env`, `· from shell`, `· saved key`, `· signed in`, `· --api-key`) |
+| `--preset <name>` / `METACODES_PRESET` | a named setup from `config.json` `presets` (#489; [LOCAL_CONFIG.md](LOCAL_CONFIG.md#presets)), applied as the flags naming its route would: `--model`, `--channel` and `--reasoning-effort` replace one field for that run, `--provider`/`--offer` set it aside, nothing is written back. Below a preset named at start comes the one `directory_presets` remembers for the working directory (its git worktree root, else the directory), then the `/model` default. A name `config.json` does not define stops `-p`, `serve` and `--web` with exit 2, listing the presets; the TUI starts without it and says so under its banner |
+| `<state root>/.env` | the install's local configuration ([LOCAL_CONFIG.md](LOCAL_CONFIG.md)), read once at start and never `setenv`: a layer below the process environment for the names it may set — every registered profile's `env_aliases`, the variables `config.json` names (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`, `METACODES_MODEL`, `METACODES_PRESET`; a provider's aliases are read from it only when the environment sets none of them. Request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`, `METACODES_KG_URL`, any `*_URL`) are refused; other names are ignored with one warning listing them. Its `METACODES_PRESET`, else its `METACODES_PROVIDER` (else the one provider whose key it holds), applies only when no flag or environment variable names a provider or a preset, the working directory remembers no preset, no `global_selection` is stored and no Metask sign-in exists (`--api-key`, `METASK_API_KEY`, a key or older sign-in in `auth.json`, the Metask session `oauth/metask.json`); keys of several providers and no name choose none, and the run lists them. A `.env` anywhere else, the working directory included, is never read. `metacodes install` writes `<state root>/.env.example` on every install and upgrade and never touches `.env` |
+| no credential at all | the interactive TUI opens without a model (#484): its banner reads `not set — /login, or configure .env`; a prompt, `/retry`, `/edit <n>`, `/init`, `/commit`, `/review`, `/btw`, `/recap` and a Skill are refused with a note before any request is assembled; nothing is probed; no session directory is made until a route binds (`/model`, `/login`). A Metask sign-in in `auth.json` older than #527 with no key and model chosen opens it the same way, and so does a provider named by `--provider`, `--offer`, `METACODES_PROVIDER`, a preset or `.env` that has no credential: the note names that provider's variables, and no other provider is used in its place (#485). `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe exit non-zero with the sign-in hint (or the named provider's help) instead. The banner names where a bound route's credential came from (`· Metask`, `· from .env`, `· from shell`, `· saved key`, `· signed in`, `· --api-key`) |
 | stored default without a credential | a `global_selection` whose provider has no credential (a Metask one: no Metask session, no Metask key and no key in `auth.json`; a stored Metask route the session authenticates runs at the session's gateway, never at the compiled endpoint with the session's token, #527) is passed over for the levels below it, with one notice: `The default model, <provider> · <model>, has no key or sign-in; this session uses <model> · <origin>.` (under the TUI's banner, else on stderr) (#485) |
 | `metacodes logout` | revokes the Metask session at `$METASK_SITE_URL/api/oauth/revoke` (bounded; a failure is reported and the local sign-out goes on), removes both Metask sign-ins (`auth.json`, `oauth/metask.json` with its refresh token) and a key stored with `login --provider metask`, forgets a stored default that resolves to Metask, and says which it removed; `METASK_API_KEY` left in the shell or `.env` is named, never removed. `logout --provider metask` is the same (#499) |
 | `--channel <id>` | narrow to one endpoint/region/plan/account binding |
@@ -99,7 +111,7 @@ normative model; the entry points are:
 | `metacodes providers probe <id>` / `probe --base-url <url> --protocol <wire> [--auth …] [--key-env <VAR> \| --api-key-stdin]` | list the models the endpoint serves (the `data` array, an enriched `models` map, or Gemini's `models` array); a key, when there is one, is sent as the provider's requests send it, and no redirect is followed; nothing is stored; exit 1 when no listing answered |
 | `metacodes providers list` | the defined providers: channels, models, where each one's key comes from (names and paths, never a value), disabled ones marked |
 | `metacodes providers remove <id>` | remove a defined provider whole: `custom_providers.<id>`, `providers.<id>` and a `global_selection` that resolved to it in one write, then `keys/<id>.json` and `oauth/<id>.json` (not revoked); a built-in id exits 2. `/providers remove <id>` does the same for a defined provider |
-| `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `recent_operation_ids`; written atomically, other keys preserved. The same file declares MCP servers under `"mcpServers"` (Claude Code's schema; the legacy `"mcp_servers":[{"name":"<id>","command":[...]}]` array still works), and Claude Code's `~/.claude.json` / `.mcp.json` and Codex's `config.toml` servers are read too — see [Skills and MCP servers](SKILLS_AND_MCP.md). Each connected server's tools register as deferred `mcp__<id>__<tool>` (listed under the prompt's `# Deferred tools`, activated with `ToolSearch select:mcp__<id>__<tool>`), `/mcp` shows every configured server and why any failed, and `ListMcpResourcesTool` fails with `capability_unsupported` when nothing is |
+| `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `presets` and `directory_presets` (#489), `recent_operation_ids`; written atomically, other keys preserved. The same file declares MCP servers under `"mcpServers"` (Claude Code's schema; the legacy `"mcp_servers":[{"name":"<id>","command":[...]}]` array still works), and Claude Code's `~/.claude.json` / `.mcp.json` and Codex's `config.toml` servers are read too — see [Skills and MCP servers](SKILLS_AND_MCP.md). Each connected server's tools register as deferred `mcp__<id>__<tool>` (listed under the prompt's `# Deferred tools`, activated with `ToolSearch select:mcp__<id>__<tool>`), `/mcp` shows every configured server and why any failed, and `ListMcpResourcesTool` fails with `capability_unsupported` when nothing is |
 | `<session_dir>/runtime-selection.json` | `session_selection`; a session-scoped choice never reaches `config.json` |
 | `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
 
@@ -125,7 +137,9 @@ Once both are chosen it stores the token response as the Metask session
 (`oauth/metask.json`) and the choice in `auth.json`, as `metacodes login`
 does, moves the session onto that gateway with the session's token at once,
 and forgets a stored `global_selection`, so the next start is on the sign-in
-too (#485, #527). `/logout` revokes the Metask session at Metask, removes
+too (#485, #527); a Metask session it replaced is then revoked at Metask
+(#560, see [Metask device OAuth and gateway](#metask-device-oauth-and-gateway)).
+`/logout` revokes the Metask session at Metask, removes
 both Metask sign-ins (`auth.json` and the session `oauth/metask.json`) and a
 Metask key
 stored with `login --provider metask`, forgets a stored default that resolves
@@ -351,16 +365,21 @@ placeholders rather than a claim of free work. Explicit numeric zero usage is
 
 A self-hosted Jev System-One judge can advise four memory decisions (scoped
 recall injection, `KgRecall` evidence, `KgRemember` relations, enumeration
-intent). It is configured by the `jev` object of the install's
-`<state root>/config.json`, each field overridable by its `METACODES_JEV_*`
-variable. A host that sets `Config.jev_builtin_default` (the CLI does) falls
-back to the built-in service — `metask-jev-4b` at `http://58.211.6.133:10420`
-in `advisory` mode, advising `scoped_recall` only, plain HTTP over the public
-network — when neither names a `url`; an embedder that leaves it off has no
-advisor unless one of them does. The default applies as a whole: a layer that
-names its own `url` starts from the plain defaults (`shadow`, no model pin,
-every surface), while one that only sets `mode`, `timeout_ms` or `decisions`
-tunes the default service. An `off` or empty `url` from any layer
+intent). It is off until a service is named: by the `jev` object of the
+install's `<state root>/config.json`, each field overridable by its
+`METACODES_JEV_*` variable. The CLI names none, so `metacodes doctor` of a fresh
+install reports `jev_advisor off … source=none` and nothing of a session
+reaches a Jev server (#474; until then the CLI fell back to the built-in
+service, plain HTTP to a public address). A host that sets
+`Config.jev_builtin_default` (no host in this repository does) falls back to
+that built-in service — `metask-jev-4b` at `http://58.211.6.133:10420` in
+`advisory` mode, advising `scoped_recall` only — when neither names a `url`.
+To use that service from the CLI, write its settings down once
+(doc/JEV_SYSTEM_ONE.md §7 has the object). The default applies as a whole: a
+layer that names its own `url` starts from the plain defaults (`shadow`, no
+model pin, every surface), while one that only sets `mode`, `timeout_ms` or
+`decisions` tunes the default service, or tunes nothing when the host takes no
+default. An `off` or empty `url` from any layer
 (`"jev": false`, `"jev": {"url": "off"}`, `METACODES_JEV_URL=off`) turns it
 off; the build exports `METACODES_JEV_URL=off` to every step it runs. It is
 evidence only: it never gates a tool, a permission, a budget, or a TinyKG
@@ -368,7 +387,7 @@ write. Design, failure semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_
 
 | `jev` field | Override | Contract |
 |---|---|---|
-| `url` | `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); absent everywhere means the built-in default (CLI) or no advisor (embedders); `off` or blank disables the advisor |
+| `url` | `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); absent everywhere means no advisor (the built-in default only for a host that sets `Config.jev_builtin_default`; the CLI does not); `off` or blank disables the advisor |
 | `mode` | `METACODES_JEV_MODE` | `shadow` (when unset: consult and journal, provider-visible bytes unchanged) or `advisory` (the built-in default; judgments change injections and annotate `KgRemember` results) |
 | `timeout_ms` (integer) | `METACODES_JEV_TIMEOUT_MS` | per-consultation deadline, default 2500, 100–30000; a miss falls back to the unadvised path with no retry |
 | `model` | `METACODES_JEV_MODEL` | expected model id; a response from any other model, or one that reports a priced tariff, is refused |
