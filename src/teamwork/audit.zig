@@ -175,6 +175,7 @@ test "audit: the default auditor is unavailable, never a pass" {
     var verdict = try default.auditor().audit(testing.allocator, .{
         .original_request = "x",
         .workspace = "/w",
+        .approved_tree = try TreeId.parse("a" ** 40),
         .base = "b",
         .check = null,
         .attempt = 1,

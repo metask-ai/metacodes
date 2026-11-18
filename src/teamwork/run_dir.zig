@@ -339,12 +339,12 @@ pub const RunDir = struct {
         var fba = std.heap.FixedBufferAllocator.init(&scratch_bytes);
         const scratch = fba.allocator();
         const status_dir = try joinZ(&buf, &.{ self.root, seat_status_dir });
-        const path = if (pfs.exists(status_dir.ptr)) try self.seatPath(&buf, seat, .status) else blk: {
+        const record_path = if (pfs.exists(status_dir.ptr)) try self.seatPath(&buf, seat, .status) else blk: {
             // Legacy records can still be displayed by read-only status.
             try self.requireSeat(seat);
             break :blk try joinZ(&buf, &.{ self.root, seats_dir, seat.slice(), "status.json" });
         };
-        const text = (readSeatOutput(scratch, path, 512) catch return error.StatusCorrupt) orelse
+        const text = (readSeatOutput(scratch, record_path, 512) catch return error.StatusCorrupt) orelse
             return error.StatusCorrupt;
         return parseRecord(scratch, seat, text) catch error.StatusCorrupt;
     }
