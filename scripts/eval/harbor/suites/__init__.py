@@ -39,6 +39,10 @@ carries it. The module exposes::
     # optional
     def check(ctx) -> list[str]:   # extra readiness reasons (Chinese), [] if ready;
                                    # ctx.cfg / ctx.env / ctx.dataset_dir(suite)
+    HOST_ENV = ("NAME", ...)       # execution-host environment the task's
+                                   # verifier reads (e.g. a judge key); an SSH
+                                   # executor receives these values over the
+                                   # run's SSH stdin, never argv or a file
     def tasks(dataset: Path) -> list[str]:   # default: sorted dirs with task.toml
 
 Task ids must match ``TASK`` (no glob characters: Harbor's ``-i`` is an
@@ -333,6 +337,18 @@ def harbor_dataset_args(suite: Suite, ctx: Context) -> List[str]:
     if suite.runner == HARBOR_LOCAL:
         return ["-p", str(ctx.dataset_dir(suite).resolve())]
     raise ValueError(suite.id + " 不是 Harbor 评测集")
+
+
+ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def host_env(suite: Suite) -> Tuple[str, ...]:
+    """Environment names a harbor-local suite's adapter needs on the
+    execution host (HOST_ENV); forwarded by name to SSH executors."""
+    if suite.runner != HARBOR_LOCAL:
+        return ()
+    names = getattr(adapter_module(suite), "HOST_ENV", ()) or ()
+    return tuple(n for n in names if isinstance(n, str) and ENV_NAME.fullmatch(n))
 
 
 def task_filters(suite: Suite, tasks: List[str]) -> List[str]:

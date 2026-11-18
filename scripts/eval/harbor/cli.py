@@ -160,10 +160,19 @@ def print_suites(value):
             count = "?" if suite.get("task_count") is None else str(suite["task_count"])
             state = "可运行" if suite["ready"] else "待配置"
             print(f"  {suite['id']:<20} {suite['name']}（{count} 题，{state}）")
-            # Service-wide reasons are printed once above.
-            for reason in suite["reasons"]:
-                if reason not in value.get("reasons", []):
+            # Service-wide and executor reasons are printed once above; here
+            # only the suite's own and its per-executor combinations.
+            shown = set(value.get("global_reasons", value.get("reasons", [])) + value.get("harbor_reasons", []))
+            for executor in value.get("executors", []):
+                shown.update(executor["reasons"])
+            for reason in suite.get("suite_reasons", suite["reasons"]):
+                if reason not in shown:
+                    shown.add(reason)
                     print("      " + reason)
+            for name, combo in (suite.get("executors") or {}).items():
+                for reason in combo["reasons"]:
+                    if reason not in shown:
+                        print(f"      [{name}] " + reason)
 
 
 def prepare_suite(args, root, config, cfg):
@@ -185,7 +194,8 @@ def prepare_suite(args, root, config, cfg):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
-    parser.add_argument("action", nargs="?", default="open", choices=["open", "info", "list", "run", "stop", "prepare", "db"])
+    parser.add_argument("action", nargs="?", default="open",
+                        choices=["open", "info", "list", "run", "stop", "prepare", "setup", "db"])
     parser.add_argument("db_command", nargs="?", choices=["status", "import", "migrate"], help="bench db 的子命令")
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
     parser.add_argument("--url", default=os.environ.get("METACODES_BENCH_URL"), help="连接已有工作台（例如 devbox）")
@@ -217,6 +227,12 @@ def main(argv=None):
     parser.add_argument("--password-env", metavar="NAME", help="迁移目标 PostgreSQL 密码所在的环境变量名")
     parser.add_argument("--switch", action="store_true", help="迁移校验后切换工作台到目标数据库")
     parser.add_argument("--verify", action="store_true", help="bench db import 按内容重新校验每个文件")
+    parser.add_argument("--executor", help="执行机器名称（workbench.json 的 executors）")
+    parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令")
+    parser.add_argument("--bundle-version", help="setup：下载这个发行版本的 Linux 包（X.Y.Z）")
+    parser.add_argument("--source", type=Path, help="setup：开发版从这个源码目录交叉编译 Linux 包")
+    parser.add_argument("--metacodes-binary", help=argparse.SUPPRESS)
+    parser.add_argument("--metacodes-version", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if (args.db_command is None) != (args.action != "db"):
         parser.error("bench db 需要子命令 status、import 或 migrate" if args.action == "db" else "多余的参数 " + args.db_command)
@@ -261,6 +277,10 @@ def main(argv=None):
             if not sep or not directory or suites.get(suite_id).runner != suites.HARBOR_LOCAL:
                 parser.error("--dataset 需要 SUITE=DIR，SUITE 为 harbor-local 评测集")
             cfg.setdefault("datasets", {})[suite_id] = str(Path(directory).expanduser().resolve())
+        if args.metacodes_binary or args.metacodes_version:
+            # Non-secret: lets setup pick the matching Linux release and the
+            # page start `metacodes login` for this install.
+            cfg["metacodes"] = {"binary": args.metacodes_binary or "", "version": args.metacodes_version or ""}
         if args.auth:
             cfg["auth_mode"] = args.auth
         elif args.provider_config:
@@ -295,14 +315,35 @@ def main(argv=None):
                 value = client.request("api/stop", {})
             print(json.dumps(value, ensure_ascii=False) if args.json else "Bench 工作台已停止；评测 worker 继续运行。")
             return 0
+        if args.action == "setup":
+            from scripts.eval.harbor.viewer import setup
+
+            def show(progress, seen=set()):
+                if args.json:
+                    return
+                for step in progress["steps"]:
+                    key = (step["id"], step["status"])
+                    if step["status"] != "running" and key not in seen:
+                        seen.add(key)
+                        print(f"  {step['title']}: {step['status']} {step['detail']}", file=sys.stderr, flush=True)
+            options = {"bundle_version": args.bundle_version,
+                       "source": str(args.source.expanduser().resolve()) if args.source else None}
+            progress = setup.run_setup(config, args.executor, dry_run=args.dry_run, on_change=show, options=options)
+            print(json.dumps(progress, ensure_ascii=False) if args.json else setup.format_progress(progress))
+            return 0 if progress["status"] in ("ready", "planned") else 1
         if args.action in ("info", "list"):
             if args.action == "info":
                 value = client.request("api/workbench") if client else RunManager(jobs_dir, config).catalog()
                 if not args.json:
                     print("Bench 工作台：" + (client.url if client else "运行 metacodes bench 启动"))
                     print("执行环境：" + ("已就绪" if value.get("ready") else "待配置"))
-                    for reason in value.get("reasons", []):
+                    for reason in value.get("global_reasons", value.get("reasons", [])) + value.get("harbor_reasons", []):
                         print("  " + reason)
+                    for executor in value.get("executors", []):
+                        print("执行机器：" + executor["label"] + ("（默认）" if executor.get("default") else "") + "：" +
+                              ("已就绪" if executor["ready"] else "待配置"))
+                        for reason in executor["reasons"]:
+                            print("    " + reason)
                     for model in value.get("models", []):
                         print("模型：" + model["id"])
                     print_suites(value)
@@ -330,6 +371,8 @@ def main(argv=None):
             payload = {"model": model, "tasks": tasks, "attempts": args.attempts, "concurrency": args.concurrency}
             if args.suite:
                 payload["suite"] = args.suite
+            if args.executor:
+                payload["executor"] = args.executor
             record = client.request("api/runs", payload)
             url = client.url + "#/run/" + record["name"]
             if args.wait:

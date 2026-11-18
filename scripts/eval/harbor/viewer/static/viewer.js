@@ -220,6 +220,10 @@ async function renderOverview() {
 }
 
 // ------------------------------------------------------------ run workbench
+const SETUP_STATUS = { running: '进行中', ok: '已就绪', done: '已完成', planned: '将执行', manual: '需要你操作',
+  failed: '失败', skipped: '跳过' };
+const SETUP_RESULT = { running: '进行中', ready: '已就绪', planned: '预演完成', needs_user: '还有需要你操作的步骤',
+  failed: '有步骤失败', interrupted: '已中断' };
 const RUN_STATUS = { queued: '等待启动', starting: '准备环境', running: '运行中',
   cancelling: '正在停止', cancelled: '已停止', finished: '运行完成', failed: '执行失败', interrupted: '执行中断' };
 
@@ -234,8 +238,19 @@ async function renderNewRun() {
   const suites = c.suites || [];
   const byId = new Map(suites.map((s) => [s.id, s]));
   if (!byId.has(state.suite)) state.suite = byId.has(c.default_suite) ? c.default_suite : (suites[0] || {}).id;
+  const executorsList = c.executors || [];
+  if (!executorsList.some((e) => e.name === state.executor)) state.executor = c.default_executor;
+  const selectedExecutor = () => executorsList.find((e) => e.name === state.executor) || { reasons: [], ready: true };
+  // Everything keeping suite `s` from launching on the selected executor.
+  const comboReasons = (s) => ((s.executors || {})[state.executor] || s).reasons || [];
+  const comboReady = (s) => !comboReasons(s).length;
   const form = h('form', { class: 'run-form' });
 
+  // Step 0: execution machine (setup branch), when the service lists them.
+  const executor = h('select', { name: 'executor', onchange: () => {
+    state.executor = executor.value; drawNotes(); drawPicker(); drawSuiteNotes(); syncSubmit();
+  } }, executorsList.map((e) => h('option', { value: e.name, selected: e.name === state.executor },
+    e.label + (e.ready ? '' : ' · 待配置'))));
   // Step 1: benchmark picker, grouped by category.
   const picker = h('div', { class: 'suite-picker' });
   const pickerBox = h('fieldset', {}, h('legend', { text: '评测集' }), picker);
@@ -247,7 +262,7 @@ async function renderNewRun() {
   const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: 1, min: 1, max: 3, step: 1, required: true });
   const suiteNotes = h('div', { class: 'callout', hidden: true });
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
-  const submit = h('button', { type: 'submit', class: 'button primary' }, '开始评测');
+  const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '开始评测');
   const selected = new Set();
   let tasks = [];
   let defaults = [];
@@ -256,8 +271,22 @@ async function renderNewRun() {
   function current() { return byId.get(state.suite); }
   function syncSubmit() {
     const s = current();
-    submit.disabled = !s || !s.ready || !c.can_run || !selected.size || selected.size > s.max_tasks;
+    submit.disabled = !s || !comboReady(s) || !c.can_run || !selected.size || selected.size > s.max_tasks;
     if (count) count.textContent = `已选 ${selected.size} / 上限 ${s ? s.max_tasks : 0}`;
+  }
+  // Reasons the setup callout above already shows for this suite/executor.
+  function setupReasons(s) {
+    const harbor = !s || s.runner !== 'workbuddy';
+    return [...(c.global_reasons || []), ...(harbor ? (c.harbor_reasons || []) : []),
+      ...(harbor ? (selectedExecutor().reasons || []) : [])];
+  }
+  function drawSuiteNotes() {
+    const s = current();
+    if (!s) return;
+    const shown = new Set(setupReasons(s));
+    const reasons = comboReasons(s).filter((text) => !shown.has(text));
+    suiteNotes.hidden = !reasons.length;
+    suiteNotes.replaceChildren(...reasons.map((text) => h('p', { text })));
   }
   function drawPicker() {
     picker.replaceChildren(...(c.categories || []).map((cat) => {
@@ -267,19 +296,17 @@ async function renderNewRun() {
         h('div', { class: 'suite-group-head' }, h('b', { text: cat.name }), h('span', { class: 'muted', text: cat.description })),
         h('div', { class: 'suite-cards' }, members.map((s) => h('button', {
           type: 'button', class: 'suite-card', 'aria-pressed': String(s.id === state.suite), 'data-suite': s.id,
-          onclick: () => { if (state.suite !== s.id) { state.suite = s.id; drawPicker(); loadTasks(); } },
+          onclick: () => { if (state.suite !== s.id) { state.suite = s.id; drawPicker(); drawNotes(); loadTasks(); } },
         }, h('span', { class: 'suite-name', text: s.name }),
         h('span', { class: 'sub', text: (s.task_count === null ? '任务待准备' : s.task_count + ' 题') + ' · ' + (RUNNERS[s.runner] || s.runner) }),
-        h('span', { class: 'suite-state ' + (s.ready ? 'ok' : s.available ? 'todo' : 'off'), text: s.ready ? '可运行' : s.available ? '待配置' : '尚未接入' })))));
+        h('span', { class: 'suite-state ' + (comboReady(s) ? 'ok' : s.available ? 'todo' : 'off'), text: comboReady(s) ? '可运行' : s.available ? '待配置' : '尚未接入' })))));
     }).filter(Boolean));
   }
   function drawTasks(error) {
     const s = current();
     concurrency.max = String(s.max_concurrency);
     if (Number(concurrency.value) > s.max_concurrency) concurrency.value = String(s.max_concurrency);
-    const reasons = s.reasons || [];
-    suiteNotes.hidden = !reasons.length;
-    suiteNotes.replaceChildren(...reasons.map((text) => h('p', { text })));
+    drawSuiteNotes();
     if (!tasks.length) {
       count = null;
       taskBox.replaceChildren(h('legend', { text: `任务 · ${s.name}` }), h('p', { class: 'muted', text: s.description }),
@@ -335,6 +362,10 @@ async function renderNewRun() {
     if (id === state.suite) drawTasks(error);
   }
 
+  if (executorsList.length) {
+    form.append(h('label', { class: 'field' }, h('span', { text: '执行机器' }), executor,
+      h('small', { text: '运行 Harbor 和 Docker 的机器。SSH 执行机器的结果会同步回本机作业目录并写入评测数据库。' })));
+  }
   form.append(pickerBox, suiteNotes, taskBox,
     h('label', { class: 'field' }, h('span', { text: '模型' }), model,
       h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
@@ -348,19 +379,85 @@ async function renderNewRun() {
     submit.disabled = true;
     feedback.textContent = '正在启动…';
     try {
-      const record = await api('/api/runs', { suite: state.suite, model: model.value, tasks: tasks.filter((t) => selected.has(t)),
-        attempts: Number(attempts.value), concurrency: Number(concurrency.value) });
+      const request = { suite: state.suite, model: model.value, tasks: tasks.filter((t) => selected.has(t)),
+        attempts: Number(attempts.value), concurrency: Number(concurrency.value) };
+      if (executorsList.length) request.executor = executor.value;
+      const record = await api('/api/runs', request);
       location.hash = '#/run/' + record.name;
     } catch (error) {
       feedback.textContent = error.message;
       syncSubmit();
     }
   });
+  // Setup callout (setup branch): service-wide and executor reasons with
+  // one-click setup and Metask sign-in; suite-specific reasons stay beside
+  // the picker.
+  const callout = h('div', { class: 'callout' });
+  const setupBox = h('div', {});
+  function drawNotes() {
+    const reasons = setupReasons(current());
+    const notes = [...reasons, ...(c.warnings || [])];
+    if (!suites.length) notes.push(...(c.reasons || []));
+    if (!c.can_run) notes.push('请使用 metacodes bench 输出的授权链接打开工作台，启用运行操作。');
+    const actions = [];
+    if (c.can_run && reasons.length) {
+      actions.push(h('button', { type: 'button', class: 'button primary', onclick: () => startSetup(false) }, '一键配置'),
+        h('button', { type: 'button', class: 'button', onclick: () => startSetup(true) }, '预演（不修改）'));
+    }
+    if (c.can_run && c.login?.available && !c.login?.signed_in) {
+      actions.push(h('button', { type: 'button', class: 'button', onclick: startLogin }, '登录 Metask'));
+    }
+    callout.hidden = !notes.length && !actions.length;
+    callout.replaceChildren(...notes.map((text) => h('p', { text })),
+      actions.length ? h('div', { class: 'header-actions setup-actions' }, actions) : '');
+  }
+  async function startSetup(dryRun) {
+    try {
+      await api('/api/setup', { executor: state.executor, dry_run: dryRun });
+      state.setupWatch = true;
+      await drawSetup();
+    } catch (error) { setupBox.replaceChildren(h('div', { class: 'callout', text: error.message })); }
+  }
+  async function startLogin() {
+    try { await api('/api/login', {}); state.setupWatch = true; await drawSetup(); }
+    catch (error) { setupBox.replaceChildren(h('div', { class: 'callout', text: error.message })); }
+  }
+  async function drawSetup() {
+    if (!c.can_run) return;
+    let latest = null;
+    try { latest = (await api('/api/setup')).setup; } catch (_) { return; }
+    let login = null;
+    if (c.login?.available) { try { login = await api('/api/login'); } catch (_) { login = null; } }
+    const parts = [];
+    if (login && (login.running || login.verification_uri)) {
+      parts.push(panel('Metask 登录', login.running ? '等待确认' : (login.signed_in ? '已登录' : '已结束'),
+        h('div', { class: 'panel-body run-state' },
+          login.verification_uri ? h('p', {}, '在自己的浏览器打开 ',
+            h('a', { href: login.verification_uri, target: '_blank', rel: 'noopener noreferrer', text: login.verification_uri }),
+            ' 并输入代码 ', h('b', { class: 'mono', text: login.user_code || '' })) : h('p', { class: 'muted', text: '正在获取设备码…' }),
+          h('p', { class: 'muted', text: '工作台只显示设备码，不接触密码。确认后页面会刷新模型列表。' }))));
+    }
+    if (latest) {
+      const rows = (latest.steps || []).map((step) => h('details', { class: 'setup-step', 'data-key': 'setup-' + step.id },
+        h('summary', {}, h('span', { class: 'setup-status s-' + step.status, text: SETUP_STATUS[step.status] || step.status }),
+          h('b', { text: step.title }), h('span', { class: 'muted', text: step.detail || '' })),
+        step.command ? h('p', { class: 'mono', text: '请运行：' + step.command }) : null,
+        (step.commands || []).length ? h('pre', { text: step.commands.map((x) => (x.executed ? '$ ' : '将执行 ') + x.command).join('\n') }) : null,
+        (step.log || []).length ? h('pre', { class: 'muted', text: step.log.join('\n') }) : null));
+      parts.push(panel('一键配置 · ' + latest.executor, (latest.dry_run ? '预演 · ' : '') + (SETUP_RESULT[latest.status] || latest.status),
+        h('div', { class: 'panel-body' }, rows.length ? rows : h('p', { class: 'muted', text: '正在检查…' }))));
+    }
+    const open = new Set([...setupBox.querySelectorAll('details[open]')].map((d) => d.dataset.key));
+    setupBox.replaceChildren(...parts);
+    for (const d of setupBox.querySelectorAll('details')) if (open.has(d.dataset.key)) d.open = true;
+    const active = (latest && latest.status === 'running') || (login && login.running);
+    if (active && route().view === 'new') { state.setupWatch = true; setTimeout(drawSetup, 2000); }
+    else if (state.setupWatch && !active) { state.setupWatch = false; setTimeout(render, 500); }
+  }
   drawPicker();
+  drawNotes();
   if (state.suite) loadTasks();
-  const notes = [...(c.warnings || [])];
-  if (!suites.length) notes.push(...(c.reasons || []));
-  if (!c.can_run) notes.push('请使用 metacodes bench 输出的授权链接打开工作台，启用运行操作。');
+  drawSetup();
   const groupRows = (c.account_groups || []).map((g) => h('tr', {},
     h('td', { text: g.name }), h('td', { text: g.configured ? '已有账号 Key' : '尚未配置 Key' })));
   const groupTable = h('div', { class: 'table-scroll' }, h('table', {},
@@ -369,8 +466,8 @@ async function renderNewRun() {
     h('div', { class: 'panel-body' },
       h('p', { class: 'muted', text: '模型下拉框合并了已有 Key 的模型目录。其他可选组需要先在 Metask 账号中配置对应 Key，刷新后自动加入。' }),
       groupTable)) : null;
-  return h('div', {}, notes.length ? h('div', { class: 'callout' }, notes.map((text) => h('p', { text }))) : null,
-    panel('新建评测', '按类别选择评测集 · 独立容器运行 · 完整轨迹 · 自动判分', form), groups);
+  return h('div', {}, callout, setupBox,
+    panel('新建评测', '选择执行机器和评测集 · 独立容器运行 · 完整轨迹 · 自动判分', form), groups);
 }
 
 async function renderRun(name) {

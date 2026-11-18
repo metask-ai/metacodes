@@ -13,10 +13,12 @@ metacodes bench --no-open               # print the workbench link
 metacodes bench info                    # dependencies, models, suites and readiness
 metacodes bench list --json             # previous jobs and results
 metacodes bench stop                    # stop HTTP service; workers continue
+metacodes bench setup [--executor NAME] [--dry-run] [--json]   # install what is missing
 metacodes bench db status               # evaluation database: SQLite or PostgreSQL
 metacodes bench run --task fix-git --task cancel-async-tasks --wait
 metacodes bench run --suite aime-2025 --wait          # the suite's default sample
 metacodes bench run --suite terminal-bench-2.0 --task fix-git
+metacodes bench run --suite aime --executor relay-4090 --wait   # on an SSH executor
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
 ```
 
@@ -116,7 +118,71 @@ remain with `launch_gate`.
 
 ## Configure execution
 
-Choose a Linux release bundle and a model once on the execution machine:
+`metacodes bench setup` prepares an execution machine in one go; the page's
+新建评测 callout has the same 一键配置 button (and 预演, a dry run) whenever
+something is missing:
+
+```sh
+metacodes bench setup --dry-run         # checks only; lists every command it would run
+metacodes bench setup                   # this machine
+metacodes bench setup --executor relay-4090 --json
+```
+
+Each step checks first, installs only what is missing and verifies the
+result. Every command is logged (in the terminal, or in the page's step list),
+`--dry-run` executes only read-only checks, and no secret is stored or
+printed. Steps that need root run only when `sudo -n` works; otherwise the
+step reports the exact command to run. The page's `POST /api/setup`
+(`{"executor": NAME, "dry_run": bool}`) has the same capability and
+same-origin rules as `/api/runs`, and its progress (`GET /api/setup`) is only
+shown to the capability holder. Setup refuses to run while a benchmark is
+active, because it may restart Docker.
+
+| Step | What it does |
+|---|---|
+| SSH access (`ssh` executors) | Runs a probe over `ssh -o BatchMode=yes`; if the key cannot run commands, it stops here and says so |
+| Python 3.9+ (`ssh` executors) | Needed by the remote driver |
+| uv | macOS: `brew install uv` when Homebrew exists; otherwise (and on Linux) the official installer pinned to uv 0.13.9 into `~/.local/bin` |
+| Harbor | `uv tool install --force --python 3.12 harbor==0.26.0` (Harbor 0.26 needs Python 3.12); the resulting path is saved |
+| Docker | macOS: Homebrew `docker docker-compose docker-buildx colima`, the plugin directory in `~/.docker/config.json`, then `colima start` (see [Colima](#colima-on-apple-silicon)); Linux: `get.docker.com` with passwordless sudo, otherwise the command for the user; also starts the daemon, adds the user to the `docker` group and installs the compose plugin when needed |
+| OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
+| Linux bundle | See [the release bundle](#the-linux-release-bundle) |
+| Copy runtime (`ssh` executors) | Ships the bench runtime and the bundle (below) |
+| psycopg | Only when `workbench.json` has `"store": {"backend": "postgres"}`: `pip install --user psycopg[binary]` pinned for the workbench's Python |
+| Metask login | Never automated. The step names the command; the page's 登录 button runs `metacodes login --provider metask --no-browser` and shows its device-flow URL and code |
+
+Results the readiness checks read are written to
+`<state root>/bench/workbench.json`: `harbor` (or the executor's `harbor`),
+`bundle` and `bundle_source`, and on macOS `metrics_bind`/`metrics_host`.
+
+### The Linux release bundle
+
+The release workflow publishes `metacodes-<version>-x86_64-linux-gnu.tar.gz`
+and `metacodes-<version>-SHA256SUMS` on the GitHub release
+(`release/LAYOUT.md`). When the running executable is a release (`X.Y.Z`),
+setup downloads that version's Linux x86_64 unit, checks its SHA-256 against
+the release's `SHA256SUMS`, extracts only regular files and directories into
+`<state root>/bench/bundles/` and validates the release layout. A development
+build (`X.Y.Z-dev`) has no published unit: when the executable lives in a
+checkout (or `--source <checkout>` names one), setup downloads the newest
+release the same way and cross-compiles this checkout's executable over it:
+
+```sh
+zig build install -Drelease-layout=true -Doptimize=ReleaseSafe \
+  -Dtarget=x86_64-linux-gnu.2.31 -Dlean-kernels=off \
+  -Dformal-kernel-sha256=<release kernel> -Dproject-kernel-sha256=<release kernel> \
+  --prefix <copy of the release unit>
+```
+
+The Lean kernels are only built natively in CI, so the overlay keeps the
+release's kernels and pins their digests; its `manifest.json` is the base
+release's. `--bundle-version X.Y.Z` picks a published unit instead, and
+`metacodes bench --bundle <dir>` still sets one by hand. `METACODES_RELEASE_BASE`
+points the download at a mirror of the releases page.
+
+### Manual configuration
+
+The equivalent manual steps on an execution machine are:
 
 ```sh
 uv tool install harbor==0.26.0
@@ -189,6 +255,117 @@ Harbor jobs directory. Both paths respect a leading `--state-dir` or
 runtime directory under the same state root. No release-layout file or
 SDK/AgentCore ABI changes are required.
 
+## Execution machines
+
+Without an `executors` list, trials run on the workbench's own machine. A
+list in `workbench.json` names several machines; the page shows readiness
+per machine and lets each run pick one (`metacodes bench run --executor NAME`
+does the same):
+
+```json
+{
+  "executors": [
+    {"name": "devbox-mac", "kind": "local"},
+    {"name": "relay-4090", "kind": "ssh", "host": "10.126.126.1", "user": "bench",
+     "port": 22, "identity_file": "~/.ssh/bench_relay", "state_dir": ".metacodes-bench"}
+  ],
+  "default_executor": "devbox-mac"
+}
+```
+
+An `ssh` entry also accepts `harbor` (written by setup), `python`
+(default `python3`), `metrics_bind` (default `172.17.0.1`) and
+`metrics_enabled`. Names, hosts, users and paths are validated before any
+`ssh` argv is built; unknown fields are refused. Readiness probes are cached
+for 15 seconds.
+
+### SSH prerequisites
+
+- An SSH key that may run commands on the host. A key restricted to port
+  forwarding (or a forced command) is reported as such: readiness says that
+  SSH connected but cannot run commands, and setup stops at its first step.
+- The host key is accepted on first use (`StrictHostKeyChecking=accept-new`);
+  connections use `BatchMode=yes`, so a passphrase prompt fails instead of
+  hanging. Load the key into an agent or use one without a passphrase.
+- Linux with `sh`, `tar` and Python 3.9+; Harbor, Docker and OpenSSL can be
+  installed by `metacodes bench setup --executor <name>`. Docker installation
+  and group changes need passwordless sudo, or the user runs the reported
+  command.
+
+### How an SSH run works
+
+The local worker stays the durable owner of the run: it resolves the
+account (or provider) key exactly as for a local run, then
+
+1. ships the bench runtime and the Linux bundle as tar streams over SSH into
+   `<state_dir>/runtime/<digest>` and `<state_dir>/bundles/<digest>`, once per
+   content digest (complete directories are marked and reused);
+2. uploads the run's secret-free spec (and provider configuration, if any) to
+   `<state_dir>/runs/<name>/`;
+3. starts `python3 -m scripts.eval.harbor.viewer.remote run …` over SSH and
+   writes the credential as the first line on the SSH channel's stdin. The
+   remote driver keeps it only in its own environment and Harbor's (`--ae
+   NAME=${NAME}` as locally): it is never in argv, in a file, or in the SSH
+   command line. `SendEnv` is not used because it needs the server's
+   `AcceptEnv`;
+4. the driver starts the timing relay next to the remote Docker daemon (on
+   the executor's `metrics_bind`), runs Harbor in its own process group and
+   prints heartbeats; Harbor's output reaches the local run log;
+5. the worker copies the remote job directory into the local jobs directory
+   every 10 seconds and once more at the end, transferring only files whose
+   size or modification time changed. The viewer and other readers of local
+   job directories see ordinary Harbor files.
+
+Suites on an SSH executor: `harbor-registry` suites run there unchanged
+(the remote Harbor resolves `-d` itself). A `harbor-local` suite's dataset
+directory is generated on the workbench's machine (`bench prepare`, or
+`--dataset SUITE=DIR`) and shipped like the bundle, into
+`<state_dir>/datasets/<digest>`, once per content digest; Harbor's `-p` then
+names that copy. Execution-host variables a suite's verifier reads (GAIA2's
+`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `JUDGE_MODEL`, declared by the adapter's
+`HOST_ENV`) travel with the credential on the SSH channel's stdin. WorkBuddy
+suites drive the workbench machine's own checkout and Docker, so they run on
+the `local` executor only; readiness on an SSH executor says so and the
+launch is refused.
+
+Readiness is per suite and executor: `GET /api/workbench` lists, for every
+suite, `executors.<name>.reasons` (service-wide reasons such as sign-in, the
+Linux bundle and the executor's own Harbor/Docker/OpenSSL readiness for
+Harbor suites, the suite's own prerequisites, and refused combinations),
+plus `suite_reasons`; `ready`/`reasons` on the suite and at the top level
+are those of the default executor (the top level for the default suite).
+
+Cancel sends `cancel` on the channel: the driver interrupts Harbor (SIGINT,
+then SIGKILL after 20 seconds). If the channel closes, or no heartbeat
+arrives for 90 seconds, the driver stops Harbor as well, so a lost connection
+never leaves trials running unsupervised.
+
+### Colima on Apple Silicon
+
+Docker Desktop is not used (licensing). Setup installs Colima and the docker
+CLI from Homebrew and starts:
+
+```sh
+colima start --runtime docker --cpu 4 --memory 8 --disk 100 \
+  --vm-type vz --vz-rosetta --arch aarch64 --mount-type virtiofs --mount "$HOME:w"
+```
+
+Terminal-Bench images are linux/amd64. With `vz` + Rosetta the VM is native
+arm64 and amd64 containers run through Rosetta's Linux binfmt handler: close
+to native speed, but Rosetta does not translate every x86 extension, so a
+task that needs one fails. `"colima": {"emulation": "qemu"}` in
+`workbench.json` instead runs a whole x86_64 VM under QEMU (exact amd64,
+several times slower; Homebrew `qemu` and `lima-additional-guestagents`).
+`cpu`, `memory` and `disk` can be set there too. Rosetta for Linux VMs must
+be installed (`softwareupdate --install-rosetta --agree-to-license`).
+Verification runs `docker run --platform linux/amd64 alpine:3.20 uname -m`.
+
+Inside Colima, `172.17.0.1` is the VM's bridge, not the Mac. Setup therefore
+sets `metrics_bind: 127.0.0.1` and `metrics_host: 192.168.5.2` (Lima's
+`host.lima.internal`, which forwards to the Mac's loopback) and checks that a
+container reaches it. Colima does not start at login; when Docker becomes
+unreachable after a reboot, readiness says so and 一键配置 starts it again.
+
 ## Devbox and remote access
 
 ```sh
@@ -245,7 +422,9 @@ token sums report their coverage so missing data cannot look like zero cost.
 
 ### Data storage
 
-Harbor writes each run as ordinary files on the execution machine:
+All results are ordinary files on the workbench's machine (an SSH
+executor's job directory is copied back into the same layout, and from
+there into the evaluation database):
 
 ```text
 <jobs-dir>/
@@ -259,6 +438,10 @@ Harbor writes each run as ordinary files on the execution machine:
       verifier/                   # reward, test output, CTRF report
     workbuddy/<harbor run>/<trial>/  # WorkBuddy launches: trials of its own Harbor runs
 ```
+
+WorkBuddy trials under `workbuddy/<harbor run>/` are ingested as trials of
+the workbench job, with the same projection as top-level trials (request
+metrics are read from `.bench-metrics/` beside them).
 
 The page reads the [evaluation database](#evaluation-database), which holds
 all of these files and the values computed from them. The overview shows the

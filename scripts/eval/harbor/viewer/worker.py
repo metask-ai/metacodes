@@ -14,6 +14,7 @@ from scripts.eval.harbor.viewer.runner import atomic_json, now, runtime_env
 from scripts.eval.harbor.viewer.account import Account
 from scripts.eval.harbor.profiling import TimingRelay, auth_for, upstream_for
 from scripts.eval.harbor.store.ingest import WorkerSync
+from scripts.eval.harbor.viewer.executors import RemoteRun
 
 
 def command(spec):
@@ -58,14 +59,70 @@ def prepare(spec, env):
         spec = {**spec, "account_gateway": account.gateway}
     relay = None
     upstream = upstream_for(spec) if spec.get("metrics_enabled", True) else None
+    if (spec.get("executor") or {}).get("kind") == "ssh":
+        if spec.get("runner") == "workbuddy":
+            # RunManager refuses this combination; never run it half-remote.
+            raise ValueError("WorkBuddy 评测只能在本机执行器运行")
+        # The relay must sit beside the Docker daemon that runs the trials,
+        # so the remote driver starts it; here only files are staged.
+        remote = RemoteRun(spec)
+        remote.stage()
+        upstream = upstream if spec["executor"].get("metrics_enabled", True) else None
+        remote_spec = remote.remote_spec(upstream, auth_for(spec) if upstream else None)
+        return {**spec, "remote_spec_path": remote.upload_run(remote_spec)}, remote
     if upstream:
         header, prefix = auth_for(spec)
         relay = TimingRelay(upstream, env[spec["key_env"]],
                             Path(spec["jobs_dir"]) / spec["name"] / ".bench-metrics",
                             bind=spec.get("metrics_bind") or "172.17.0.1",
+                            public_host=spec.get("metrics_host"),
                             auth_header=header, auth_prefix=prefix, tls=True).__enter__()
         spec = {**spec, "metrics_proxy": relay.url, "metrics_ca": str(relay.ca_path)}
     return spec, relay
+
+
+def supervise_remote(remote, spec, env, spec_path, record_path, record):
+    """Run Harbor on an SSH executor: heartbeat, cancel, incremental sync."""
+    # The run's key plus the suite's execution-host variables (a judge key),
+    # all over the SSH channel's stdin.
+    secret_env = {name: env[name] for name in spec.get("forward_env") or () if env.get(name)}
+    secret_env[spec["key_env"]] = env[spec["key_env"]]
+    remote.start(secret_env, spec["remote_spec_path"])
+    record.update(status="running", executor=spec["executor"]["name"])
+    cancelled_at = None
+    last_write = last_sync = 0.0
+    while remote.process.poll() is None:
+        now_s = time.monotonic()
+        if spec_path.with_suffix(".cancel").exists() and cancelled_at is None:
+            cancelled_at = now_s
+            record["status"] = "cancelling"
+            remote.cancel()
+        if cancelled_at and now_s - cancelled_at > 40:
+            remote.hang_up()
+        if cancelled_at and now_s - cancelled_at > 60:
+            remote.process.kill()
+        if now_s - remote.last_event > remote.HEARTBEAT_TIMEOUT and cancelled_at is None:
+            # A silent channel: closing it makes the driver stop Harbor.
+            record["error"] = "远程执行机器心跳超时"
+            cancelled_at = now_s
+            remote.hang_up()
+        if now_s - last_sync > remote.SYNC_INTERVAL:
+            remote.sync()
+            last_sync = time.monotonic()
+        if now_s - last_write > 2:
+            atomic_json(record_path, record)
+            last_write = time.monotonic()
+        time.sleep(0.25)
+    remote.hang_up()
+    remote.sync()
+    code = remote.exit_code()
+    if code is None:
+        record.update(status="cancelled" if cancelled_at and not record.get("error") else "failed",
+                      exit_code=remote.process.returncode, finished_at=now(),
+                      error=record.get("error") or ("SSH 连接中断" if not cancelled_at else None))
+        return
+    record.update(status="cancelled" if cancelled_at else ("finished" if code == 0 else "failed"),
+                  exit_code=code, finished_at=now())
 
 
 def main(argv=None):
@@ -99,9 +156,16 @@ def main(argv=None):
                     last_write = time.monotonic()
                 concurrent.futures.wait([preparing], timeout=0.25)
         spec, relay = preparing.result()
+        remote = None
+        if isinstance(relay, RemoteRun):
+            # Not a context manager: nothing to close before it starts.
+            remote, relay = relay, None
         if spec_path.with_suffix(".cancel").exists():
             record.update(status="cancelled", finished_at=now())
             return 1
+        if remote is not None:
+            supervise_remote(remote, spec, env, spec_path, record_path, record)
+            return 0 if record.get("status") == "finished" else 1
         argv, cwd, child_env = child_process(spec, env)
         process = subprocess.Popen(argv, env=child_env, cwd=cwd, stdin=subprocess.DEVNULL,
                                    start_new_session=True)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import hmac
 import http.client
+import ipaddress
 import json
 import math
 import re
@@ -125,9 +126,25 @@ class StreamMetrics:
                 **self.usage}
 
 
+def subject_alt_names(*hosts):
+    names = []
+    for host in dict.fromkeys(hosts):
+        try:
+            ipaddress.ip_address(host)
+            names.append("IP:" + host)
+        except ValueError:
+            pass
+        names.append("DNS:" + host)
+    return ",".join(names)
+
+
 class TimingRelay:
     def __init__(self, target, credential, metrics_dir, *, bind="172.17.0.1", port=0,
-                 auth_header="Authorization", auth_prefix="Bearer ", tls=False):
+                 auth_header="Authorization", auth_prefix="Bearer ", tls=False, public_host=None):
+        # `public_host` is the address containers dial when it differs from
+        # the bind address: Colima's VM reaches the Mac's loopback through
+        # its user-mode gateway (host.lima.internal, 192.168.5.2).
+        public_host = public_host or bind
         origin = urlsplit(target)
         if origin.scheme not in ("http", "https") or not origin.hostname or origin.username or origin.password or origin.query or origin.fragment:
             raise ValueError("invalid profiling upstream")
@@ -263,7 +280,7 @@ class TimingRelay:
                 subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "2", "-nodes",
                                 # Zig 0.16 verifies dNSName SANs only; retain
                                 # the IP SAN for other TLS clients as well.
-                                "-subj", "/CN=metacodes-bench-relay", "-addext", "subjectAltName=IP:" + bind + ",DNS:" + bind,
+                                "-subj", "/CN=metacodes-bench-relay", "-addext", "subjectAltName=" + subject_alt_names(public_host, bind),
                                 "-addext", "basicConstraints=critical,CA:TRUE", "-keyout", str(key), "-out", str(self.ca_path)],
                                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -276,7 +293,7 @@ class TimingRelay:
             if self.cert_dir:
                 self.cert_dir.cleanup()
             raise
-        self.url = f"{'https' if tls else 'http'}://{bind}:{self.server.server_port}"
+        self.url = f"{'https' if tls else 'http'}://{public_host}:{self.server.server_port}"
 
     def record(self, trial, metric):
         with self.lock:

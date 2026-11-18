@@ -26,6 +26,9 @@ from pathlib import Path
 
 SOURCE_ENV = "METACODES_BENCH_HARBOR_SOURCE"
 JUDGE_KEY_ENV = "OPENAI_API_KEY"
+# The verifier's judge reads these on the execution host; an SSH executor
+# receives them over the run's SSH stdin.
+HOST_ENV = (JUDGE_KEY_ENV, "OPENAI_BASE_URL", "JUDGE_MODEL")
 
 SUITE = {
     "name": "GAIA2（CLI 模式）",
