@@ -84,7 +84,8 @@ Before handing a PR over, confirm that the developer has the watcher running.
   checkpoints stay local. A pushed revision receives a fresh review.
 - Review and repair are automatic work, not an additional `agent/review`
   commit-status gate. Unavailable tools and interrupted read-only reviews
-  retry full review automatically within the existing invocation limits.
+  retry full review automatically. There is no fixed invocation or repair-round
+  cap; keep both counters as durable audit evidence.
   Never substitute a limited review or manufacture approval after a timeout.
 - Keep the PR branch current with main. The controller merges updated main,
   validates and pushes it, then requires fresh review and PR CI. Only the exact
@@ -92,14 +93,14 @@ Before handing a PR over, confirm that the developer has the watcher running.
   may be merged. Require strict up-to-date branch protection; no merge queue,
   deferred auto-merge or admin bypass. Preserve review-thread resolution and
   revision checks; a quiet reviewer is not an approval.
-- Ambiguous requirements, additional permissions, policy changes, interrupted
-  writes and exhausted limits require a recorded decision. Check with
+- Ambiguous requirements, additional permissions, policy changes and interrupted
+  writes require a recorded decision. Check with
   `python3 .github/pr-loop.py status`; the developer responds with
   `python3 .github/pr-loop.py answer --pr "$PR_NUMBER" --text "Your decision"`.
-  Preserve progress and invocation limits instead of restarting an unlimited
-  repair loop or answering on the developer's behalf.
+  Preserve progress and invocation/repair counters across restarts instead of
+  resetting them or answering on the developer's behalf.
 
-The [PR workflow guide](doc/PR_AGENT_LOOP.md) defines prerequisites, limits,
+The [PR workflow guide](doc/PR_AGENT_LOOP.md) defines prerequisites, timeouts,
 state storage and recovery. Keep these agent instructions and CONTRIBUTING
 consistent with that guide when changing the workflow.
 

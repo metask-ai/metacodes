@@ -24,8 +24,6 @@ def main(argv=None):
         sub.add_argument("--thread", default=os.environ.get("CODEX_THREAD_ID"), required=not os.environ.get("CODEX_THREAD_ID"))
         sub.add_argument("--worktree", type=Path, default=Path.cwd())
         sub.add_argument("--remote", default="origin")
-        sub.add_argument("--max-rounds", type=int, default=5)
-        sub.add_argument("--max-agent-runs", type=int, default=16)
         sub.add_argument("--timeout", type=int, default=1800)
         if name == "bind":
             sub.add_argument("--pr", type=int, required=True)
@@ -41,8 +39,6 @@ def main(argv=None):
     answer.add_argument("--repo", default=DEFAULT_REPO)
     answer.add_argument("--pr", type=int, required=True)
     answer.add_argument("--text", required=True)
-    answer.add_argument("--extra-rounds", type=int, default=0)
-    answer.add_argument("--extra-agent-runs", type=int, default=0)
     args = parser.parse_args(argv)
     store = Store(args.state)
     try:
@@ -56,7 +52,7 @@ def main(argv=None):
             if args.command == "submit":
                 # Validate local arguments before creating anything on GitHub.
                 Binding(args.repo, 1, args.thread, str(git.worktree), git.branch(), args.repo,
-                        args.remote, args.max_rounds, args.max_agent_runs, args.timeout)
+                        args.remote, args.timeout)
                 url = github.create(args.repo, git.worktree, args.head, args.title, args.body_file.resolve(), "main")
                 match = re.search(r"/pull/(\d+)$", url)
                 if not match:
@@ -67,7 +63,7 @@ def main(argv=None):
             if not pr.open or pr.merged or pr.base_branch != "main":
                 raise LoopError("only an open PR targeting main can be registered")
             binding = Binding(args.repo, number, args.thread, str(git.worktree), git.branch(), pr.head_repo,
-                              args.remote, args.max_rounds, args.max_agent_runs, args.timeout)
+                              args.remote, args.timeout)
             git.verify(binding, pr)
             if binding.branch != pr.branch:
                 raise LoopError("local branch does not match the PR")
@@ -75,7 +71,7 @@ def main(argv=None):
             print(json.dumps({"registered": f"{args.repo}#{number}", "state": str(store.path)}))
         elif args.command == "answer":
             with store.lock():
-                store.answer(args.repo, args.pr, args.text, args.extra_rounds, args.extra_agent_runs)
+                store.answer(args.repo, args.pr, args.text)
         elif args.command == "status":
             for row in store.rows():
                 print(json.dumps({k: row[k] for k in ("repo", "number", "state", "rounds", "agent_runs", "reason")}, ensure_ascii=False))

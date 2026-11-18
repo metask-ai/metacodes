@@ -78,7 +78,7 @@ class Store:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             for row in self.rows():
-                other = Binding(**json.loads(row["binding"]))
+                other = Binding.from_json(row["binding"])
                 if (other.repo, other.number) == (binding.repo, binding.number):
                     if other == binding:
                         return
@@ -114,15 +114,11 @@ class Store:
                 self.db.execute("INSERT INTO events(repo,number,at,state,detail) VALUES(?,?,?,?,?)",
                     (binding.repo, binding.number, time.time(), state.value, json.dumps(fields)))
 
-    def answer(self, repo, number, answer, extra_rounds=0, extra_agent_runs=0):
+    def answer(self, repo, number, answer):
         row = self.get(repo, number)
         if row["state"] != State.DECISION.value or not answer.strip():
             raise LoopError("answer requires a pending decision and a non-empty response")
-        if min(extra_rounds, extra_agent_runs) < 0:
-            raise LoopError("budget extensions cannot be negative")
-        binding = Binding(**json.loads(row["binding"]))
-        binding = replace(binding, max_rounds=binding.max_rounds + extra_rounds,
-                          max_agent_runs=binding.max_agent_runs + extra_agent_runs)
+        binding = Binding.from_json(row["binding"])
         with self.db:
             self.db.execute("UPDATE prs SET binding=? WHERE repo=? AND number=?",
                             (json.dumps(asdict(binding)), repo, number))
@@ -158,20 +154,14 @@ class Controller:
         self.store.update(binding, State.DECISION, reason=reason)
         self.notifier(binding, reason)
 
-    def reserve(self, binding, state):
+    def start_agent(self, binding, state):
         row = self.store.get(binding.repo, binding.number)
-        if row["agent_runs"] >= binding.max_agent_runs:
-            raise LoopError(f"agent-run budget exhausted ({binding.max_agent_runs})")
         self.store.update(binding, state, agent_runs=row["agent_runs"] + 1)
 
     def retry_review(self, binding, reason):
         # A failed or interrupted read-only review made no candidate writes.
-        # Keep its spent invocation, discard incomplete evidence and let the
+        # Keep its invocation count, discard incomplete evidence and let the
         # next poll inspect the current revision. Never manufacture approval.
-        row = self.store.get(binding.repo, binding.number)
-        if row["agent_runs"] >= binding.max_agent_runs:
-            self.decision(binding, f"agent-run budget exhausted ({binding.max_agent_runs}): {reason}")
-            return
         self.store.update(binding, State.PENDING, report=None, reason="retrying full review: " + reason)
 
     def current(self, binding, expected):
@@ -218,9 +208,7 @@ class Controller:
             git.merge_base(pr.base)
         while True:
             row = self.store.get(binding.repo, binding.number)
-            if row["rounds"] >= binding.max_rounds:
-                raise LoopError(f"repair-round budget exhausted ({binding.max_rounds})")
-            self.reserve(binding, State.WORKING)
+            self.start_agent(binding, State.WORKING)
             self.store.update(binding, rounds=row["rounds"] + 1)
             prompt = (
                 "Continue the original PR task using the feedback below. Fix blocking findings and failing CI; "
@@ -236,7 +224,7 @@ class Controller:
             try:
                 result = self.codex.call(Path(binding.worktree), prompt, WORKER_SCHEMA, binding.timeout, binding.thread)
             except Busy:
-                # Busy means no turn ran; don't spend the repair or invocation budget.
+                # Busy means no turn ran; don't count an unstarted invocation.
                 self.store.update(binding, State.WAITING, rounds=row["rounds"], agent_runs=row["agent_runs"],
                                   reason="worker is busy")
                 return
@@ -317,7 +305,7 @@ class Controller:
                 report = validate_report(json.loads(row["report"]))
             else:
                 git.verify(binding, pr, allow_dirty=bool(row["answer"]))
-                self.reserve(binding, State.REVIEWING)
+                self.start_agent(binding, State.REVIEWING)
                 with git.review_tree(pr) as tree:
                     prompt = self.codex.review(tree, pr) + "\nUser decision: " + json.dumps(row["answer"])
                     report = validate_report(self.codex.call(tree, prompt, REPORT_SCHEMA, binding.timeout))
@@ -378,4 +366,4 @@ class Controller:
     def once(self):
         with self.store.lock():
             for row in self.store.rows():
-                self.tick(Binding(**json.loads(row["binding"])))
+                self.tick(Binding.from_json(row["binding"]))

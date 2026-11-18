@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import Enum
+import json
 from pathlib import Path
 import re
 
@@ -66,21 +67,30 @@ class Binding:
     branch: str
     head_repo: str
     remote: str = "origin"
-    max_rounds: int = 5
-    max_agent_runs: int = 16
     timeout: int = 1800
 
     def __post_init__(self):
         if not REPO.fullmatch(self.repo) or not REPO.fullmatch(self.head_repo):
             raise LoopError("repository must be OWNER/REPO")
-        if self.number < 1 or min(self.max_rounds, self.max_agent_runs, self.timeout) < 1:
-            raise LoopError("PR number, limits and timeout must be positive")
+        if self.number < 1 or self.timeout < 1:
+            raise LoopError("PR number and timeout must be positive")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.thread):
             raise LoopError("an explicit Codex thread ID is required")
         if not Path(self.worktree).is_absolute() or not self.branch or self.branch.startswith("-"):
             raise LoopError("an absolute worktree path and a branch are required")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", self.remote) or self.remote.startswith("-"):
             raise LoopError("invalid push remote")
+
+    @classmethod
+    def from_json(cls, source: str) -> Binding:
+        value = json.loads(source)
+        if not isinstance(value, dict):
+            raise LoopError("stored worker binding must be an object")
+        # Older registrations included count caps. They no longer control
+        # execution; the separate durable counters remain audit evidence.
+        value.pop("max_rounds", None)
+        value.pop("max_agent_runs", None)
+        return cls(**value)
 
 
 @dataclass(frozen=True)

@@ -88,20 +88,21 @@ time ([CI design](doc/CI_DESIGN.md#3-pr-only-validation-and-merge-policy)).
 
 Review and repair run automatically without an additional `agent/review`
 commit-status gate. Unavailable tools, review timeouts and interrupted
-read-only reviews retry on later polls within the same persisted invocation
-limit. Product/permission decisions, interrupted writes and exhausted limits
-still preserve progress for a recorded decision.
+read-only reviews retry on later polls. There is no fixed cap on agent calls
+or repair rounds; counters and review evidence persist across restarts.
+Product/permission decisions and interrupted writes preserve progress for a
+recorded decision.
 Temporary GitHub read outages retry without consuming an agent invocation.
 
-When a decision or additional permission is needed, or a configured limit is
-reached, the loop pauses and notifies you locally. Check progress and answer:
+When a decision or additional permission is needed, the loop pauses and notifies
+you locally. Check progress and answer:
 
 ```sh
 python3 .github/pr-loop.py status
 python3 .github/pr-loop.py answer --pr "$PR_NUMBER" --text "Your decision"
 ```
 
-The [PR workflow guide](doc/PR_AGENT_LOOP.md) covers invocation limits,
+The [PR workflow guide](doc/PR_AGENT_LOOP.md) covers invocation tracking,
 recovery and state storage. Model calls use your existing Codex account and
 incur its normal usage; the controller does not upload credentials to CI.
 

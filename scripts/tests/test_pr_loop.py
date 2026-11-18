@@ -233,7 +233,7 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(self.notifications, [])
         self.assertFalse(any('/statuses/' in path for path, _, _ in self.github.calls))
 
-    def test_interrupted_readonly_review_recovers_without_resetting_budget(self):
+    def test_interrupted_readonly_review_recovers_without_resetting_count(self):
         self.store.update(self.binding, State.REVIEWING, agent_runs=1)
         self.controller.once()
         self.assertEqual(self.row()['state'], 'pending')
@@ -245,18 +245,18 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(self.row()['agent_runs'], 2)
         self.assertEqual(self.notifications, [])
 
-    def test_review_retries_still_stop_at_persisted_invocation_limit(self):
-        binding = replace(self.binding, max_agent_runs=2)
-        with self.store.db:
-            self.store.db.execute('UPDATE prs SET binding=?', (json.dumps(binding.__dict__),))
+    def test_review_retries_continue_past_old_call_cap(self):
+        self.store.update(self.binding, agent_runs=16)
         self.configure(reports=[RETRY, RETRY, PASS])
         self.controller.once()
+        self.assertEqual(self.row()['state'], 'pending')
         self.controller.once()
+        self.assertEqual(self.row()['state'], 'pending')
         self.controller.once()
-        self.assertEqual(self.row()['state'], 'needs_decision')
-        self.assertIn('budget exhausted', self.row()['reason'])
-        self.assertEqual(len(self.requests('turn/start')), 2)
-        self.assertFalse(self.github.merged)
+        self.assertEqual(self.row()['state'], 'merged')
+        self.assertEqual(self.row()['agent_runs'], 19)
+        self.assertEqual(len(self.requests('turn/start')), 3)
+        self.assertEqual(self.notifications, [])
 
     def test_worker_transport_failure_preserves_candidate_and_stops_for_reconciliation(self):
         self.configure(reports=[FIX], drop_worker=True)
@@ -349,7 +349,7 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(len(self.notifications), 1)
         self.assertEqual(self.requests("turn/start"), [])
 
-    def test_worker_busy_does_not_spend_repair_budget(self):
+    def test_worker_busy_does_not_count_an_unstarted_repair(self):
         self.configure(reports=[FIX], worker_status="active")
         self.controller.once()
         self.assertEqual(self.row()["state"], "waiting")
@@ -436,32 +436,53 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)
         self.assertTrue((self.work / ".github/workflows/ci.yml").exists())
 
-    def test_budget_is_durable_and_can_only_be_extended_explicitly(self):
-        self.configure(reports=[FIX], worker_texts=["half fixed\n"])
-        binding = replace(self.binding, max_rounds=1)
+    def test_legacy_capped_registration_resumes_checkpoint_and_keeps_evidence(self):
+        (self.work / 'app.txt').write_text('half fixed\n')
+        git(self.work, 'commit', '-qam', 'preserved local checkpoint')
+        checkpoint = git(self.work, 'rev-parse', 'HEAD')
+        self.store.update(self.binding, State.DECISION, head=self.head, base=self.base,
+                          checkpoint=checkpoint, report=json.dumps(FIX), agent_runs=16,
+                          rounds=5, reason='agent-run budget exhausted (16)')
+        legacy = dict(self.binding.__dict__, max_rounds=5, max_agent_runs=16)
         with self.store.db:
-            self.store.db.execute("UPDATE prs SET binding=?", (json.dumps(binding.__dict__),))
-        self.controller.once()
-        self.assertIn("budget exhausted", self.row()["reason"])
-        self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)
-        self.assertEqual(self.row()["checkpoint"], git(self.work, "rev-parse", "HEAD"))
-        self.store.answer(DEFAULT_REPO, 7, "Continue with the same acceptance condition", extra_rounds=1)
-        cfg = json.loads(self.config.read_text())
-        cfg["worker_texts"] = ["fixed\n"]
-        self.config.write_text(json.dumps(cfg))
-        self.controller.once()
-        self.assertEqual(self.row()["rounds"], 2)
-        self.assertEqual(self.row()["state"], "pending")
-        self.assertIsNone(self.row()["checkpoint"])
+            self.store.db.execute('UPDATE prs SET binding=?', (json.dumps(legacy),))
+        self.configure(reports=[PASS], worker_texts=['fixed\n'])
+        restarted = Store(self.store.path)
+        try:
+            restarted.bind(self.binding)  # old count caps do not change worker identity
+            restarted.answer(DEFAULT_REPO, 7, 'Remove fixed call and repair-round caps')
+            self.assertEqual(json.loads(self.row()['report']), FIX)
+            self.assertEqual(self.row()['checkpoint'], checkpoint)
+            self.assertEqual((self.row()['agent_runs'], self.row()['rounds']), (16, 5))
+            self.assertNotIn('max_agent_runs', json.loads(self.row()['binding']))
+            self.assertNotIn('max_rounds', json.loads(self.row()['binding']))
+            controller = Controller(restarted, self.github, self.codex,
+                lambda b, r: self.notifications.append(r), gate=self.controller.gate)
+            controller.once()
+            fixed = git(self.bare, 'rev-parse', 'feature')
+            self.assertNotEqual(fixed, self.head)
+            self.assertEqual(self.row()['rounds'], 6)
+            self.assertIsNone(self.row()['checkpoint'])
+            self.assertEqual(git(self.work, 'status', '--porcelain'), '')
+            controller.once()
+            self.assertEqual(self.row()['state'], 'merged')
+            self.assertEqual(self.row()['agent_runs'], 18)
+            self.assertEqual(len(self.requests('turn/start')), 2)  # saved finding -> repair -> fresh review
+            self.assertEqual(self.github.assert_merge, {'sha': fixed, 'merge_method': 'merge'})
+            self.assertEqual(self.notifications, [])
+        finally:
+            restarted.close()
 
-    def test_agent_call_budget_stops_before_another_provider_invocation(self):
-        binding = replace(self.binding, max_agent_runs=1)
-        with self.store.db:
-            self.store.db.execute("UPDATE prs SET binding=?", (json.dumps(binding.__dict__),))
+    def test_review_and_repair_continue_past_both_old_caps(self):
+        self.store.update(self.binding, agent_runs=16, rounds=5)
         self.controller.once()
-        self.assertEqual(self.row()["state"], "needs_decision")
-        self.assertIn("agent-run budget exhausted", self.row()["reason"])
-        self.assertEqual(len(self.requests("turn/start")), 1)
+        fixed = git(self.bare, 'rev-parse', 'feature')
+        self.assertNotEqual(fixed, self.head)
+        self.assertEqual((self.row()['agent_runs'], self.row()['rounds']), (18, 6))
+        self.controller.once()
+        self.assertEqual(self.row()['state'], 'merged')
+        self.assertEqual(self.row()['agent_runs'], 19)
+        self.assertEqual(self.notifications, [])
 
     def test_approval_request_stops_and_notifies_once(self):
         self.configure(approval=True)
@@ -490,7 +511,7 @@ class LoopIntegrationTest(unittest.TestCase):
             self.store.bind(replace(self.binding, number=8))
         self.store.bind(self.binding)  # repeated registration is idempotent
 
-    def test_submit_creates_upstream_pr_and_persists_explicit_worker_and_limits(self):
+    def test_submit_creates_upstream_pr_with_worker_and_timeout_without_count_caps(self):
         from pr_loop import __main__ as cli
         capture, shim = self.root / "create.json", self.root / "create.py"
         shim.write_text("import json,sys,pathlib; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:])); print('https://github.com/metask-ai/metacodes/pull/7')")
@@ -501,7 +522,7 @@ class LoopIntegrationTest(unittest.TestCase):
         with patch.object(cli, "GitHub", return_value=self.github):
             code = cli.main(["--state", str(state), "submit", "--thread", "worker-submit",
                 "--worktree", str(self.work), "--head", "example:feature", "--title", "fix: result",
-                "--body-file", str(body), "--max-rounds", "2", "--max-agent-runs", "7", "--timeout", "45"])
+                "--body-file", str(body), "--timeout", "45"])
         self.assertEqual(code, 0)
         argv = json.loads(capture.read_text())
         self.assertEqual(argv[:4], ["pr", "create", "--repo", DEFAULT_REPO])
@@ -509,8 +530,9 @@ class LoopIntegrationTest(unittest.TestCase):
         submitted = Store(state)
         try:
             binding = json.loads(submitted.get(DEFAULT_REPO, 7)["binding"])
-            self.assertEqual((binding["thread"], binding["max_rounds"], binding["max_agent_runs"], binding["timeout"]),
-                             ("worker-submit", 2, 7, 45))
+            self.assertEqual((binding['thread'], binding['timeout']), ('worker-submit', 45))
+            self.assertNotIn('max_rounds', binding)
+            self.assertNotIn('max_agent_runs', binding)
         finally:
             submitted.close()
 

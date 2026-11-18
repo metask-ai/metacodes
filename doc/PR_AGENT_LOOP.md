@@ -6,7 +6,7 @@ and worktree, independently reviews each revision, returns actionable feedback
 to that thread, validates and pushes repairs, and requests an exact-head
 upstream merge after validation against current main. Decisions and interrupted writes stop in a durable
 `needs_decision` state. Ordinary review findings, failing CI and failed local
-validation return to the worker automatically, within the registered limits.
+validation return to the worker automatically, with no fixed call or repair-round cap.
 Tool availability failures and interrupted read-only reviews also retry
 automatically. Review is part of the repair loop, not an extra GitHub status gate.
 Transient GitHub read failures retry on later polls without spending an agent
@@ -46,10 +46,10 @@ Placing the script in `.github/` does not make it a hosted Actions workflow.
 
 Codex uses its existing local authentication. The controller does not copy
 credentials to GitHub Actions, read auth tokens or write secrets to PR bodies.
-Agent calls incur the signed-in account's normal usage. Defaults allow five
-repair rounds, sixteen total agent calls (including reviews) and thirty
-minutes per agent or gate invocation. These are invocation and time bounds,
-not a dollar or token spending cap.
+Agent calls incur the signed-in account's normal usage. The watcher has no fixed
+cap on agent calls or repair rounds. It retains both counters for audit and keeps
+working through review findings and validation failures. Each agent or gate
+invocation still has a configurable timeout, thirty minutes by default.
 
 ## New PR entry point
 
@@ -114,14 +114,11 @@ next review or worker turn. Partially edited files are preserved for that
 continuation. No automatic reset, force push or deletion of worker changes is
 performed.
 
-Budget consumption persists across commits and restarts. Extending it requires
-an explicit answer, for example:
-
-```sh
-python3 .github/pr-loop.py answer --pr "$PR_NUMBER" \
-  --text "Continue the same task for two more repair attempts." \
-  --extra-rounds 2 --extra-agent-runs 4
-```
+Invocation and repair-round counts persist across commits and restarts, without
+stopping work at a fixed number. Legacy registrations' `max_agent_runs` and
+`max_rounds` fields are ignored. A PR already paused by the old count cap can
+resume through `answer` with the developer's recorded decision; its review,
+checkpoint and counters are preserved. Count-extension flags are no longer used.
 
 The default SQLite database is
 `~/.local/state/metacodes/pr-loop.sqlite3`. Use the global `--state PATH`
@@ -187,7 +184,7 @@ repositories and pushes to a local bare repository, a fake stdio Codex process,
 and recorded GitHub API requests. It proves review → original-thread repair →
 validation → push → fresh review → exact-head merge → observed merge, without
 provider calls. It also exercises stale review rejection, CI failures, busy
-workers, decision recovery, invocation limits, policy edits and interrupted
+workers, decision recovery, durable counters, legacy registrations, policy edits and interrupted
 operations. It also proves unavailable tools → full review retry → repair →
 validation → fresh review → merge without publishing a review status gate.
 No live PR is opened or merged by the tests.
