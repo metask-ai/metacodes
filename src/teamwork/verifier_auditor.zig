@@ -3,11 +3,11 @@
 //!
 //! One audit:
 //!
-//! 1. The pinned `check_command`, if configured, is re-run in the worktree
+//! 1. The pinned `check_command`, if configured, is re-run in the approved snapshot
 //!    (`reviewer.CheckRunner`, sandboxed like the Bash tool). A failing check
 //!    is an audit `fail` without spawning the verifier; a check that cannot
 //!    run is `unavailable`.
-//! 2. `isolated_verifier.verify` judges a disposable snapshot of the worktree
+//! 2. `isolated_verifier.verify` judges that snapshot of the worktree
 //!    against `ORIGINAL_REQUEST.md`, with `base` = the worktree's base commit,
 //!    so `git diff base candidate` is exactly the run's change. Its cost cap is
 //!    the smaller of the verifier's own and what is left of the run budget.
@@ -27,6 +27,9 @@ const log = @import("../util/log.zig");
 const types = @import("types.zig");
 const audit = @import("audit.zig");
 const reviewer = @import("reviewer.zig");
+const isolation = @import("../agents/isolation.zig");
+const write_scope = @import("drivers/write_scope.zig");
+const pfs = @import("platform").fs;
 
 pub const VerifierAuditor = struct {
     /// The verifier's host dependencies; `abort` is replaced by the run's
@@ -46,9 +49,25 @@ pub const VerifierAuditor = struct {
 
     fn auditFn(ptr: *anyopaque, gpa: std.mem.Allocator, request: audit.AuditRequest) audit.CompletionAuditor.Error!audit.AuditVerdict {
         const self: *VerifierAuditor = @ptrCast(@alignCast(ptr));
+        var snapshot = isolation.Snapshot.create(gpa, request.scratch_dir, request.workspace, request.base, request.abort) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .unavailable = try gpa.dupe(u8, "The approved audit snapshot could not be created.\n") },
+        };
+        defer snapshot.deinit();
+        if (!std.mem.eql(u8, snapshot.tree, request.approved_tree.slice()))
+            return .{ .unavailable = try gpa.dupe(u8, "The audit snapshot does not match the approved tree.\n") };
+        if (!try snapshotMatches(gpa, &snapshot, request))
+            return .{ .unavailable = try gpa.dupe(u8, "The audit checkout does not match the approved tree.\n") };
+        const temp = try std.fs.path.joinZ(gpa, &.{ request.scratch_dir, "tmp" });
+        defer gpa.free(temp);
+        if (pfs.mkdir(temp.ptr, 0o700) != 0 and !pfs.lastErrnoIs(.EXIST))
+            return .{ .unavailable = try gpa.dupe(u8, "The audit temporary directory could not be created.\n") };
+        var check_runner = self.check_runner;
+        if (check_runner.sandbox == null) check_runner.sandbox = self.deps.sandbox;
+        check_runner.private_temp = temp;
         var pinned: ?iv.PinnedCheck = null;
         if (request.check) |check| {
-            const ran = self.check_runner.run(gpa, check, request.workspace, request.abort) catch |err| switch (err) {
+            const ran = check_runner.run(gpa, check, snapshot.path, request.abort) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Aborted => return .{ .unavailable = try gpa.dupe(u8, "The audit was aborted.\n") },
             };
@@ -60,6 +79,8 @@ pub const VerifierAuditor = struct {
                     .{ check.text, code },
                 ) },
             }
+            if (!try snapshotMatches(gpa, &snapshot, request))
+                return .{ .unavailable = try gpa.dupe(u8, "The pinned check changed the approved audit checkout.\n") };
             pinned = .{ .command = check.text, .passed = 1, .total = 1 };
         }
 
@@ -68,11 +89,18 @@ pub const VerifierAuditor = struct {
         if (!(budget.cost_usd > 0)) return .{ .unavailable = try gpa.dupe(u8, "No run budget is left for the verifier.\n") };
         var deps = self.deps;
         deps.abort = request.abort;
+        var sandbox = write_scope.seatSandbox(deps.sandbox);
+        const git_protection = try write_scope.GitProtection.init(gpa, snapshot.path, sandbox.deny_write);
+        defer git_protection.deinit();
+        sandbox.deny_write = git_protection.roots;
+        sandbox.temp_writes = .{ .isolated = temp };
+        if (deps.sandbox != null) deps.sandbox = &sandbox;
         const seat_id = types.seatIdFor(.verifier, request.attempt);
         request.ledger.reserve(seat_id, .metacodes) catch return .{ .unavailable = try gpa.dupe(u8, "The verifier's budget reservation could not be recorded.\n") };
         var result = try iv.verify(gpa, deps, .{
             .task_statement = request.original_request,
-            .workspace = .{ .git = .{ .repo = request.workspace, .base_head = request.base } },
+            .workspace = .{ .snapshot = &snapshot },
+            .relative_workspace_packet = true,
             .pinned_check = pinned,
             .budget = budget,
             .model = self.model,
@@ -81,11 +109,22 @@ pub const VerifierAuditor = struct {
         if (!charge(request, result.record)) return .{ .unavailable = try gpa.dupe(u8, "The verifier's spend could not be durably recorded.\n") };
 
         return switch (result.outcome) {
-            .pass => .pass,
+            .pass => if (std.mem.eql(u8, result.record.tree, request.approved_tree.slice()) and try snapshotMatches(gpa, &snapshot, request))
+                .{ .pass = request.approved_tree }
+            else
+                .{ .unavailable = try gpa.dupe(u8, "The verifier did not confirm the approved audit checkout.\n") },
             .fail => |report| .{ .fail = try render(gpa, "FAIL", report.evidence, null, null) },
             .unverified => |u| .{ .unverified = try render(gpa, "UNVERIFIED", u.evidence, u.not_established, u.downgrade) },
             .unavailable => |why| .{ .unavailable = try std.fmt.allocPrint(gpa, "The isolated verifier produced no verdict: {s}.\n", .{@tagName(why)}) },
         };
+    }
+
+    fn snapshotMatches(gpa: std.mem.Allocator, snapshot: *const isolation.Snapshot, request: audit.AuditRequest) error{OutOfMemory}!bool {
+        const tree = reviewer.workspaceTree(gpa, snapshot.path, snapshot.root, request.abort) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
+        return tree.eql(request.approved_tree);
     }
 
     fn charge(request: audit.AuditRequest, record: iv.Record) bool {

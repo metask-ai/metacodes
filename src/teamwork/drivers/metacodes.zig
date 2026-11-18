@@ -108,6 +108,7 @@ pub const MetacodesDriver = struct {
 
         const seat_dir = common.seatDir(paths);
         var seat_sandbox = write_scope.seatSandbox(self.deps.host_sandbox);
+        seat_sandbox.temp_writes = .{ .isolated = seat_dir };
         const git_protection = try write_scope.GitProtection.init(gpa, paths.workspace, seat_sandbox.deny_write);
         defer git_protection.deinit();
         seat_sandbox.deny_write = git_protection.roots;

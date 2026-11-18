@@ -15,8 +15,8 @@
 //! 2. The seat's permission context (metacodes.zig) runs in `acceptEdits`
 //!    with exactly those two roots as its working directories and no prompt
 //!    channel, so anything that would ask is refused.
-//! 3. `seatSandbox` confines Bash: writes allowed only under the workspace,
-//!    the seat directory and the platform temp roots (Seatbelt profile on
+//! 3. `seatSandbox` confines Bash: writes allowed only under the workspace
+//!    and the seat directory (also its private temp root, via Seatbelt on
 //!    macOS, bubblewrap mounts on Linux), so an implementer seat can build
 //!    and run tests. A missing backend refuses the seat rather than disabling
 //!    native file or command confinement. The sandbox lets Bash write the workspace
@@ -87,6 +87,7 @@ pub fn seatSandbox(host: ?*const sandbox_config.SandboxSettings) sandbox_config.
     settings.auto_allow_bash_if_sandboxed = true;
     settings.allow_write = &.{};
     settings.excluded_commands = &.{};
+    settings.temp_writes = .{ .isolated = null };
     settings.allocator = null; // borrowed slices: never freed through this copy
     return settings;
 }

@@ -90,6 +90,15 @@ pub const Deps = struct {
     /// Re-runs the pinned check for review verification (sandboxed like
     /// the Bash tool when the host has a sandbox).
     check_runner: reviewer.CheckRunner = .{},
+    cli_approval: ?CliApproval = null,
+    recheck_audited_tree: *const fn (std.mem.Allocator, []const u8, []const u8, ?*const types.AbortSignal) reviewer.TreeError!TreeId = reviewer.workspaceTree,
+};
+
+/// A CLI host can reopen without loading mutable project configuration. The
+/// serialized policy is borrowed for the run, together with the host digest.
+pub const CliApproval = struct {
+    config_json: []const u8,
+    host_sha256: [32]u8,
 };
 
 pub const StartOptions = struct {
@@ -362,22 +371,39 @@ pub const Run = struct {
             // Resolve the repository before anything is written.
             const repo = try merge_back.toplevel(gpa, options.workspace, null);
             errdefer gpa.free(repo);
-            var dir = try run_dir.RunDir.create(gpa, options.state_root, options.run_id);
+            var dir = try run_dir.RunDir.reserveRoot(gpa, options.state_root, options.run_id, true);
             errdefer dir.deinit(gpa);
             const lease = try acquireLease(&dir);
             errdefer pfs.close(lease);
-            try dir.writeOriginalRequest(request.text);
+            var buf: run_dir.PathBuf = undefined;
+            if (pfs.exists((try dir.path(&buf, .state)).ptr) or pfs.exists((try dir.path(&buf, .worktree)).ptr)) return error.RunExists;
+            try dir.initialize();
+            dir.writeOriginalRequest(request.text) catch |err| switch (err) {
+                error.OriginalRequestExists => {
+                    const prior = try dir.readOriginalRequest(gpa);
+                    defer gpa.free(prior);
+                    if (!std.mem.eql(u8, prior, request.text)) return error.RunExists;
+                },
+                else => |e| return e,
+            };
             const base = try merge_back.snapshot(gpa, repo, dir.root, null);
             const worktree = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir.root, run_dir.worktree_dir });
             errdefer gpa.free(worktree);
-            try merge_back.addWorktree(gpa, repo, worktree, base.commit, null);
             // On success `open` owns `repo`, `dir` and `worktree`.
             break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, base, .approved);
         };
         errdefer self.destroy();
-        self.worktree_present = true;
+        // Publish the approval and base together before creating a worktree.
+        // Resume can finish an interrupted checkout under the same lease.
+        try self.persist();
+        try self.completeInitialCheckout();
         try self.persist();
         return self;
+    }
+
+    fn completeInitialCheckout(self: *Run) merge_back.Error!void {
+        try merge_back.ensureInitialWorktree(self.gpa, self.repo, self.worktree, self.base.commit);
+        self.worktree_present = true;
     }
 
     /// Continue a run after a restart, from its directory alone. A seat the
@@ -406,6 +432,8 @@ pub const Run = struct {
             // the pinned check by reading an edited configuration file.
             const fingerprint = try configFingerprint(gpa, cfg);
             if (!std.mem.eql(u8, &fingerprint, &saved.config_sha256)) return error.ConfigurationChanged;
+            const host_sha256: ?[32]u8 = if (deps.cli_approval) |approval| approval.host_sha256 else null;
+            if (!std.meta.eql(host_sha256, saved.host_sha256)) return error.ConfigurationChanged;
             const repo = try gpa.dupe(u8, saved.repo);
             errdefer gpa.free(repo);
             const worktree = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir.root, run_dir.worktree_dir });
@@ -419,6 +447,10 @@ pub const Run = struct {
         };
         errdefer self.destroy();
         self.worktree_present = pfs.exists((try self.dir.path(&buf, .worktree)).ptr);
+        if (saved.initial_checkout_pending) {
+            if (self.state != .approved) return error.StateCorrupt;
+            try self.completeInitialCheckout();
+        }
         self.dispatched = saved.dispatched;
         self.audits = saved.audits;
         self.last_audit = saved.last_audit;
@@ -638,6 +670,7 @@ pub const Run = struct {
         var verdict = try self.deps.auditor.audit(self.gpa, .{
             .original_request = request,
             .workspace = self.worktree,
+            .approved_tree = approved,
             .base = self.base.commit.slice(),
             .check = self.cfg.check_command,
             .attempt = attempt,
@@ -656,7 +689,7 @@ pub const Run = struct {
         }
         if (self.abort.isAborted()) return self.settleAbort();
         switch (verdict) {
-            .pass => {},
+            .pass => |tree| if (!tree.eql(approved)) return self.failWith(.audit_changed_worktree),
             .fail => {
                 if (attempt < max_audits) {
                     try self.transition(.implementing);
@@ -668,10 +701,12 @@ pub const Run = struct {
             .unavailable => return self.failWith(.audit_unavailable),
         }
 
-        const after = reviewer.workspaceTree(self.gpa, self.worktree, self.dir.root, null) catch |err| switch (err) {
+        const after = self.deps.recheck_audited_tree(self.gpa, self.worktree, self.dir.root, &self.abort) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Aborted => return self.settleAbort(),
             else => return self.failWith(.approval_unconfirmable),
         };
+        if (self.abort.isAborted()) return self.settleAbort();
         if (!after.eql(approved)) return self.failWith(.audit_changed_worktree);
         try self.transition(.{ .merging = approved });
         return self.mergeBack(approved);
@@ -711,23 +746,16 @@ pub const Run = struct {
     const SeatFiles = struct {
         packet: run_dir.PathBuf = undefined,
         handoff: run_dir.PathBuf = undefined,
-        dir: run_dir.PathBuf = undefined,
         packet_len: usize = 0,
         handoff_len: usize = 0,
-        dir_len: usize = 0,
 
         fn init(self: *SeatFiles, run: *const run_dir.RunDir, id: SeatId) error{PathTooLong}!void {
             self.packet_len = (try run.seatPath(&self.packet, id, .packet)).len;
             self.handoff_len = (try run.seatPath(&self.handoff, id, .handoff)).len;
-            self.dir_len = (try run.seatDir(&self.dir, id)).len;
         }
 
         fn paths(self: *const SeatFiles, workspace: []const u8) types.SeatPaths {
             return .{ .packet = self.packet[0..self.packet_len], .handoff = self.handoff[0..self.handoff_len], .workspace = workspace };
-        }
-
-        fn seatDir(self: *const SeatFiles) []const u8 {
-            return self.dir[0..self.dir_len];
         }
     };
 
@@ -748,7 +776,7 @@ pub const Run = struct {
     fn runReviewer(self: *Run, id: SeatId, spec: *const types.SeatSpec, round: u32) Error!SeatResult {
         var files: SeatFiles = .{};
         try files.init(&self.dir, id);
-        const before = reviewer.workspaceTree(self.gpa, self.worktree, files.seatDir(), &self.abort) catch |err| switch (err) {
+        const before = reviewer.workspaceTree(self.gpa, self.worktree, self.dir.root, &self.abort) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Aborted => return .aborted,
             else => return .{ .review = .unjudgeable },
@@ -777,15 +805,24 @@ pub const Run = struct {
             .budget_exhausted => return .budget_exhausted,
             .aborted => return .aborted,
         }
-        const after = reviewer.workspaceTree(self.gpa, self.worktree, files.seatDir(), &self.abort) catch |err| switch (err) {
+        const after = reviewer.workspaceTree(self.gpa, self.worktree, self.dir.root, &self.abort) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Aborted => return .aborted,
             else => return .{ .review = .unjudgeable },
         };
+        var check_runner = self.deps.check_runner;
+        var check_tmp_buf: run_dir.PathBuf = undefined;
+        if (self.cfg.check_command != null) {
+            const check_tmp = std.fmt.bufPrintZ(&check_tmp_buf, "{s}/check-{s}", .{ self.dir.root, id.slice() }) catch return error.PathTooLong;
+            // The completed seat could have replaced an entry in its output
+            // directory. Its paths must not become a new sandbox write grant.
+            if (pfs.mkdir(check_tmp.ptr, 0o700) != 0) return error.MkdirFailed;
+            check_runner.private_temp = check_tmp;
+        }
         const judged = reviewer.judgeSeat(self.gpa, &self.dir, id, &self.issues, .{
             .observed = if (observable) .{ .calls = calls.calls() } else .unobservable,
             .check = self.cfg.check_command,
-            .runner = self.deps.check_runner,
+            .runner = check_runner,
             .workspace = self.worktree,
             .tree_before = before,
             .tree_after = after,
@@ -995,6 +1032,15 @@ pub const Run = struct {
         const fingerprint = configFingerprint(self.gpa, self.cfg) catch return error.WriteFailed;
         const fingerprint_hex = std.fmt.bytesToHex(fingerprint, .lower);
         try s.write(fingerprint_hex[0..]);
+        if (self.deps.cli_approval) |approval| {
+            try s.objectField("approved_config_json");
+            try s.write(approval.config_json);
+            try s.objectField("host_policy_sha256");
+            const host_hex = std.fmt.bytesToHex(approval.host_sha256, .lower);
+            try s.write(host_hex[0..]);
+        }
+        try s.objectField("initial_checkout_pending");
+        try s.write(self.state == .approved and !self.worktree_present);
         try s.objectField("state");
         try s.write(@tagName(self.state.phase()));
         try s.objectField("detail");
@@ -1050,6 +1096,8 @@ fn acquireLease(dir: *const run_dir.RunDir) Error!pfs.Fd {
 
 const Saved = struct {
     config_sha256: [32]u8,
+    host_sha256: ?[32]u8,
+    initial_checkout_pending: bool,
     state: State,
     repo: []const u8,
     base: merge_back.Snapshot,
@@ -1097,6 +1145,14 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
     };
     return .{
         .config_sha256 = try parseFingerprint(try stringField(obj, "config_sha256")),
+        .host_sha256 = if (obj.get("host_policy_sha256")) |value|
+            if (value == .string) try parseFingerprint(value.string) else return error.StateCorrupt
+        else
+            null,
+        .initial_checkout_pending = if (obj.get("initial_checkout_pending")) |value|
+            if (value == .bool) value.bool else return error.StateCorrupt
+        else
+            false,
         .state = state,
         .repo = try stringField(obj, "repo"),
         .base = .{

@@ -214,8 +214,8 @@ test "teamwork command: inherited native models are pinned on wire and retained 
         try testing.expect(found);
     }
     try testing.expect(!try c.exists("outbound-mcp-started"));
-    const policy_text = try c.read("state/teamwork/native1/approved-config.json");
-    const policy = try std.json.parseFromSliceLeaky(std.json.Value, a, policy_text, .{});
+    const saved = try std.json.parseFromSliceLeaky(std.json.Value, a, try c.read("state/teamwork/native1/run.json"), .{});
+    const policy = try std.json.parseFromSliceLeaky(std.json.Value, a, saved.object.get("approved_config_json").?.string, .{});
     const seats = policy.object.get("seats").?.object;
     for ([_][]const u8{ "implementer", "reviewer", "verifier" }) |role|
         try testing.expectEqualStrings("fixture-original", seats.get(role).?.object.get("model").?.string);
@@ -238,12 +238,22 @@ test "teamwork command: approved external seats config reaches argv, verifier wi
     var server = try harness.MockServer.startCassette(&.{ probe, pass }, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
+    const guard = try std.fmt.allocPrint(a,
+        \\for path in '{s}/README' '{s}/teamwork/r1/ORIGINAL_REQUEST.md' '{s}/teamwork/r1/budget.jsonl' '{s}/teamwork/r1/runtime.lock'; do
+        \\  if (printf changed > "$path") 2>/dev/null; then exit 91; fi
+        \\done
+        \\scratch=$(mktemp "$TMPDIR/teamwork-check.XXXXXX") || exit 92
+        \\rm "$scratch"
+        \\
+    , .{ c.repo, c.state, c.state, c.state });
+    try c.write("repo/check-fixture.sh", guard);
     const script =
         \\#!/bin/sh
         \\case "$1" in
         \\--version) echo '2.1.323 (Claude Code)'; exit 0 ;;
         \\--help) echo '--print --output-format stream-json --verbose --add-dir --permission-mode acceptEdits dontAsk --permission-prompts host none --no-session-persistence --model --effort --max-budget-usd --append-system-prompt --strict-mcp-config --mcp-config'; exit 0 ;;
         \\esac
+        \\/bin/sh check-fixture.sh || exit $?
         \\seat=''; prev=''
         \\for arg in "$@"; do
         \\  if [ "$prev" = '--add-dir' ]; then seat="$arg"; fi
@@ -260,24 +270,30 @@ test "teamwork command: approved external seats config reaches argv, verifier wi
         \\## Conclusion
         \\k
         \\## Verification
-        \\test -f feature.txt
+        \\/bin/sh check-fixture.sh && test -f feature.txt
         \\HANDOFF
         \\case "$seat" in
         \\*implementer-*) printf 'feature\n' > feature.txt ;;
-        \\*reviewer-*) echo '{"verdict":"approve","evidence":[{"command":"test -f feature.txt","exit_code":0,"output_digest":"0000000000000000000000000000000000000000000000000000000000000000","output_excerpt":"passed"}],"issues":{"opened":[],"closed":[],"still_open":[]}}' > "$seat/review.json" ;;
+        \\*reviewer-*)
+        \\  echo '{"verdict":"approve","evidence":[{"command":"/bin/sh check-fixture.sh && test -f feature.txt","exit_code":0,"output_digest":"0000000000000000000000000000000000000000000000000000000000000000","output_excerpt":"passed"}],"issues":{"opened":[],"closed":[],"still_open":[]}}' > "$seat/review.json"
+        \\  ln -s "$TEAMWORK_FIXTURE_SENTINEL" "$seat/status.json.tmp" || exit 93
+        \\  ;;
         \\esac
         \\echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1}'
         \\
     ;
-    try c.write("claude-fixture", script);
+    const sentinel = try std.fmt.allocPrint(a, "TEAMWORK_FIXTURE_SENTINEL='{s}/README'\n", .{c.repo});
+    // Preserve the shebang as the first line of the installed fixture.
+    try c.write("claude-fixture", try std.mem.concat(a, u8, &.{ "#!/bin/sh\n", sentinel, script["#!/bin/sh\n".len..] }));
     const binary = try std.fmt.allocPrintSentinel(a, "{s}/claude-fixture", .{c.root}, 0);
     try testing.expectEqual(@as(c_int, 0), pfs.chmod(binary, 0o755));
     const global = try std.fmt.allocPrint(a,
         \\{{"teamwork":{{"budget_usd":4,"max_rounds":3,"seats":{{"implementer":{{"harness":"claude_code","command":"{s}","model":"global-impl"}},"reviewer":{{"harness":"claude_code","command":"{s}","model":"global-review"}},"verifier":{{"model":"fixture-verifier"}}}},"check_command":"false"}}}}
     , .{ binary, binary });
     try c.write("state/config.json", global);
-    try c.write("repo/.metacodes/teamwork.json", "{\"budget_usd\":3,\"check_command\":\"test -f feature.txt\",\"seats\":{\"implementer\":{\"model\":\"project-impl\"}}}");
-    const out = try c.cli(&.{ "run", "--request-file", try c.request(), "--id", "r1", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--config-json", "{\"seats\":{\"reviewer\":{\"model\":\"cli-review\",\"effort\":\"high\"}}}", "--api-key", "fixture-key", "--model", "fixture-host", "--base-url", url });
+    try c.write("repo/.metacodes/teamwork.json", "{\"budget_usd\":3,\"check_command\":\"/bin/sh check-fixture.sh && test -f feature.txt\",\"seats\":{\"implementer\":{\"model\":\"project-impl\"}}}");
+    const shared_temp = try std.fmt.allocPrint(a, "TMPDIR={s}", .{c.root});
+    const out = try c.cliWithEnv(&.{ "run", "--request-file", try c.request(), "--id", "r1", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--config-json", "{\"seats\":{\"reviewer\":{\"model\":\"cli-review\",\"effort\":\"high\"}}}", "--api-key", "fixture-key", "--model", "fixture-host", "--base-url", url }, &.{shared_temp});
     if (std.mem.indexOf(u8, out.stderr, "SandboxUnavailable") != null) {
         try testing.expectEqual(@as(i32, 1), out.exit_code);
         try testing.expect(!try c.exists("state/teamwork/r1"));
@@ -286,6 +302,9 @@ test "teamwork command: approved external seats config reaches argv, verifier wi
     if (out.exit_code != 0) std.debug.print("teamwork run: {s}\n{s}\n", .{ out.stdout, out.stderr });
     try testing.expectEqual(@as(i32, 0), out.exit_code);
     try testing.expectEqualStrings("feature\n", try c.read("repo/feature.txt"));
+    try testing.expectEqualStrings("fixture\n", try c.read("repo/README"));
+    try testing.expectEqualStrings("Add feature.txt containing feature.\n", try c.read("state/teamwork/r1/ORIGINAL_REQUEST.md"));
+    try testing.expectEqualStrings("", try c.read("state/teamwork/r1/runtime.lock"));
     const impl = try c.read("state/teamwork/r1/seats/implementer-1/argv.txt");
     const review = try c.read("state/teamwork/r1/seats/reviewer-1/argv.txt");
     try testing.expect(std.mem.indexOf(u8, impl, "--model\nproject-impl\n") != null);
@@ -379,4 +398,36 @@ test "teamwork command: installed MCP endpoint negotiates on stdio and never sel
     const status = try c.cli(&.{ "status", "mcp1" });
     try testing.expectEqual(@as(i32, 0), status.exit_code);
     try testing.expectEqual(@as(usize, 0), provider.requestCount());
+}
+
+test "teamwork command: resume refuses a weaker host sandbox policy" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    try c.tmp.dir.createDirPath(testing.io, "repo/.claude");
+    const denied = try std.fs.path.join(a, &.{ c.root, "host-private" });
+    try c.write("host-private", "fixture data\n");
+    const settings = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(.{
+        .sandbox = .{ .enabled = true, .filesystem = .{ .denyRead = .{denied} } },
+    }, .{})});
+    try c.write("repo/.claude/settings.json", settings);
+    var provider = try harness.MockServer.startCassette(&.{}, 0);
+    defer provider.stop();
+    const url = try provider.urlOwned(a);
+    const started = try c.cliInput(&.{ "mcp", "--request-file", try c.request(), "--id", "policy1", "--approve", "--budget-usd", "2", "--model", "fixture-model", "--api-key", "fixture-key", "--base-url", url }, &.{}, "");
+    if (std.mem.indexOf(u8, started.stderr, "SandboxUnavailable") != null) return error.SkipZigTest;
+    try testing.expectEqual(@as(i32, 0), started.exit_code);
+    const saved = try c.read("state/teamwork/policy1/run.json");
+    // Keep the same run and restore its approved phase to exercise the
+    // installed resume entry before it can start another worker.
+    const live = try std.mem.replaceOwned(u8, a, saved, "\"state\":\"cancelled\"", "\"state\":\"approved\"");
+    try testing.expect(!std.mem.eql(u8, saved, live));
+    try c.write("state/teamwork/policy1/run.json", live);
+    try c.write("repo/.claude/settings.json", "{\"sandbox\":{\"enabled\":true}}");
+    const resumed = try c.cli(&.{ "resume", "policy1", "--approve", "--api-key", "fixture-key", "--base-url", url });
+    try testing.expect(resumed.exit_code != 0);
+    try testing.expect(std.mem.indexOf(u8, resumed.stderr, "ConfigurationChanged") != null);
+    try testing.expectEqual(@as(usize, 0), provider.requestCount());
+    try testing.expectEqualStrings(live, try c.read("state/teamwork/policy1/run.json"));
 }

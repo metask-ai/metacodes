@@ -273,7 +273,7 @@ pub const Review = struct {
 /// Read and parse a seat's `review.json`.
 pub fn readReview(gpa: std.mem.Allocator, run: *const run_dir.RunDir, seat: types.SeatId) ReadReviewError!Review {
     var buf: run_dir.PathBuf = undefined;
-    const text = swarm_team.readFileAlloc(gpa, try run.seatPath(&buf, seat, .review)) orelse
+    const text = (try run_dir.readSeatOutput(gpa, try run.seatPath(&buf, seat, .review), max_review_bytes + 1)) orelse
         return error.ReviewMissing;
     defer gpa.free(text);
     return Review.parse(gpa, text);
@@ -427,6 +427,7 @@ pub const CheckRunner = struct {
     sandbox: ?*const sandbox_config.SandboxSettings = null,
     home: []const u8 = "",
     additional_dirs: []const []const u8 = &.{},
+    private_temp: ?[]const u8 = null,
     timeout_ms: u64 = 180_000,
     max_output_bytes: usize = 256 * 1024,
 
@@ -443,6 +444,7 @@ pub const CheckRunner = struct {
             const sb = self.sandbox orelse break :blk check.text;
             if (!sb.enabled) break :blk check.text;
             var strict = sb.*;
+            if (strict.temp_writes == .isolated) strict.temp_writes = .{ .isolated = self.private_temp };
             const protection = try @import("drivers/write_scope.zig").GitProtection.init(gpa, workspace, strict.deny_write);
             defer protection.deinit();
             strict.deny_write = protection.roots;

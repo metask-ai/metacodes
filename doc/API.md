@@ -272,8 +272,10 @@ repair. A missing budget ledger means no charges yet. A torn budget tail is
 reported and excluded from totals; `budget.pending` shows an outstanding
 pre-call reservation without consuming, settling or deleting it. Reads during
 execution are observations of individually atomic files, not one transaction.
-`teamwork resume <id> --approve` resumes the approved request and saved
-`approved-config.json`; no budget, check, seat or model override is accepted.
+`teamwork resume <id> --approve` resumes from the approval stored with `run.json`.
+The approved budget, check, seat models, effective permissions and sandbox
+restrictions must match the run's saved fingerprints. Older CLI runs without
+a host-policy fingerprint still support status, and need a new approval to run.
 Inherited native seat models are pinned before the first dispatch. Provider
 credentials/endpoint can be supplied again. Resume also accepts the originally
 saved repository when invoked elsewhere. An OS lifetime lock permits one
@@ -295,6 +297,11 @@ call. A durable charge settles it; restart consumes an unresolved allowance
 as `reserved` instead of treating unknown spend as zero. `reserved` is cap
 consumption, not a measured bill. The workers/audit cap does not include the
 MCP client's own Manager model calls.
+
+The completion auditor's PASS includes the reviewed tree ID. Pinned checks
+and verifier probes run in a disposable checkout of that tree. Merge-back
+checks full file preimages against a private Git index. Changes to submodule
+commit pointers are refused and the candidate and patch are retained.
 
 Teamwork CLI hosts set `Config.mcp_connect = .disabled`: configured outbound
 MCP servers (including imported Claude Code config) are not launched. The

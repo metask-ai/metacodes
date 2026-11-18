@@ -17,12 +17,12 @@
 //!
 //! Merge-back, only after a passing completion audit, applies the diff from
 //! the snapshot commit to the approved tree onto the user's workspace with
-//! `git apply` (no index, no commit). If the user changed, during the run,
+//! `git apply --index` against a disposable index, with no commit. If the user changed, during the run,
 //! any path the implementer changed (or a parent or child of one), nothing
 //! is applied: the conflicting paths go to `merge-conflicts.txt`, the patch
 //! to `merge.patch`, the worktree is kept, and both sides stay as they are.
-//! `git apply` is all-or-nothing, so a patch that does not apply leaves the
-//! workspace unchanged too.
+//! Git checks the patch against full preimages before writing. This does
+//! not lock the checkout against unrelated processes while Git writes files.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -66,6 +66,10 @@ const GitOut = struct {
 };
 
 fn git(gpa: std.mem.Allocator, cwd: []const u8, args: []const []const u8, abort: Abort) Error!GitOut {
+    return gitWithIndex(gpa, cwd, args, abort, null);
+}
+
+fn gitWithIndex(gpa: std.mem.Allocator, cwd: []const u8, args: []const []const u8, abort: Abort, index: ?[]const u8) Error!GitOut {
     const prefix = try controller_git.prefix(gpa, cwd, abort);
     defer prefix.deinit(gpa);
     var owned: std.ArrayList([:0]u8) = .empty;
@@ -76,6 +80,11 @@ fn git(gpa: std.mem.Allocator, cwd: []const u8, args: []const []const u8, abort:
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, "/usr/bin/env");
+    if (index) |path| {
+        const assignment = try std.fmt.allocPrint(gpa, "GIT_INDEX_FILE={s}", .{path});
+        defer gpa.free(assignment);
+        try appendArgument(gpa, &owned, &argv, assignment);
+    }
     for (prefix.items) |arg| try appendArgument(gpa, &owned, &argv, arg);
     for (args) |arg| {
         try appendArgument(gpa, &owned, &argv, arg);
@@ -175,6 +184,15 @@ pub fn addWorktree(gpa: std.mem.Allocator, repo: []const u8, path: []const u8, c
     defer gpa.free(checked_out);
 }
 
+/// The persisted approval says no seat was ever dispatched into this
+/// checkout. Discard a partial registration before retrying initialization.
+pub fn ensureInitialWorktree(gpa: std.mem.Allocator, repo: []const u8, path: []const u8, commit: ObjectId) Error!void {
+    const z = try gpa.dupeZ(u8, path);
+    defer gpa.free(z);
+    if (pfs.exists(z.ptr) and !removeWorktree(gpa, repo, path)) return error.GitFailed;
+    try addWorktree(gpa, repo, path, commit, null);
+}
+
 /// Remove the worktree at `path`; true when it is confirmed gone.
 pub fn removeWorktree(gpa: std.mem.Allocator, repo: []const u8, path: []const u8) bool {
     const path_z = gpa.dupeZ(u8, path) catch return false;
@@ -194,7 +212,7 @@ pub fn changedPaths(gpa: std.mem.Allocator, repo: []const u8, from: ObjectId, to
     errdefer list.deinit(gpa);
     if (from.eql(to)) return list;
     // The flags keep the user's git configuration out of machine-read output.
-    var out = try git(gpa, repo, &.{ "diff", "--name-only", "-z", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", from.slice(), to.slice() }, abort);
+    var out = try git(gpa, repo, &.{ "diff", "--name-only", "-z", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none", from.slice(), to.slice() }, abort);
     defer out.deinit(gpa);
     if (out.exit_code != 0) return error.GitFailed;
     var it = std.mem.splitScalar(u8, out.stdout, 0);
@@ -217,7 +235,7 @@ pub const PathList = struct {
 
 /// The binary patch from `from` to `to`, owned by `gpa`.
 pub fn diffPatch(gpa: std.mem.Allocator, repo: []const u8, from: ObjectId, to: ObjectId, abort: Abort) Error![]u8 {
-    const out = try git(gpa, repo, &.{ "diff", "--binary", "--full-index", "--src-prefix=a/", "--dst-prefix=b/", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", from.slice(), to.slice() }, abort);
+    const out = try git(gpa, repo, &.{ "diff", "--binary", "--full-index", "--src-prefix=a/", "--dst-prefix=b/", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none", from.slice(), to.slice() }, abort);
     defer gpa.free(out.stderr);
     if (out.exit_code != 0) {
         gpa.free(out.stdout);
@@ -259,14 +277,70 @@ pub const Result = union(enum) {
 };
 
 /// Apply the approved change to the user's workspace, or report why not.
-/// The workspace is either fully updated or left byte-for-byte unchanged.
+/// Conflict detection and patch validation precede writes to the workspace.
 pub fn mergeBack(gpa: std.mem.Allocator, in: Input) Error!Result {
+    return mergeBackAfterScan(gpa, in, null);
+}
+
+/// Test seam for the interval between conflict discovery and apply.
+pub fn mergeBackAfterScan(gpa: std.mem.Allocator, in: Input, after_scan: ?*const fn (Input) Error!void) Error!Result {
     var ours = try changedPaths(gpa, in.repo, in.base.commit, in.approved, null);
     defer ours.deinit(gpa);
     const patch = try diffPatch(gpa, in.repo, in.base.commit, in.approved, null);
     defer gpa.free(patch);
     run_dir.writeAtomic(in.patch_path, patch) catch return error.GitFailed;
 
+    if (try changesGitlinks(gpa, in)) {
+        run_dir.writeAtomic(in.conflicts_path, "The approved diff changes submodule commits. Apply the saved patch manually.\n") catch return error.GitFailed;
+        return .apply_failed;
+    }
+
+    const conflicts = try recordConflicts(gpa, in, ours.items.items);
+    if (conflicts != 0) return .{ .conflict = conflicts };
+    if (ours.items.items.len == 0) return .{ .applied = .{ .files = 0 } };
+    if (after_scan) |hook| try hook(in);
+
+    // Seed the throwaway index from the approved diff's preimages, with no
+    // stat data copied from the user checkout. --index makes apply verify the
+    // complete target files and modes against those preimages in the same
+    // operation that checks and writes the patch. The real index is untouched.
+    const index = try std.fs.path.joinZ(gpa, &.{ in.scratch_dir, "merge-index" });
+    defer gpa.free(index);
+    pfs.unlinkPath(index.ptr) catch |err| switch (err) {
+        error.NotFound => {},
+        error.UnlinkFailed => return error.GitFailed,
+    };
+    defer pfs.unlinkPath(index.ptr) catch {};
+    var seeded = try gitWithIndex(gpa, in.repo, &.{ "-c", "core.splitIndex=false", "read-tree", in.base.commit.slice() }, null, index);
+    defer seeded.deinit(gpa);
+    if (seeded.exit_code != 0) return error.GitFailed;
+    var out = try gitWithIndex(gpa, in.repo, &.{ "-c", "core.splitIndex=false", "apply", "--index", "--binary", "--whitespace=nowarn", in.patch_path }, null, index);
+    defer out.deinit(gpa);
+    if (out.exit_code != 0) {
+        const late_conflicts = try recordConflicts(gpa, in, ours.items.items);
+        if (late_conflicts != 0) return .{ .conflict = late_conflicts };
+        run_dir.writeAtomic(in.conflicts_path, out.stderr) catch {};
+        log.warn("teamwork", "merge-back: git apply refused the patch: {s}", .{std.mem.trimEnd(u8, out.stderr, "\r\n")});
+        return .apply_failed;
+    }
+    return .{ .applied = .{ .files = @intCast(ours.items.items.len) } };
+}
+
+fn changesGitlinks(gpa: std.mem.Allocator, in: Input) Error!bool {
+    var out = try git(gpa, in.repo, &.{ "diff", "--raw", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", in.base.commit.slice(), in.approved.slice() }, null);
+    defer out.deinit(gpa);
+    if (out.exit_code != 0) return error.GitFailed;
+    var fields = std.mem.splitScalar(u8, out.stdout, 0);
+    while (fields.next()) |header| {
+        if (header.len == 0) break;
+        if (header.len < 15 or header[0] != ':' or header[7] != ' ' or header[14] != ' ') return error.GitFailed;
+        if ((fields.next() orelse return error.GitFailed).len == 0) return error.GitFailed;
+        if (std.mem.eql(u8, header[1..7], "160000") or std.mem.eql(u8, header[8..14], "160000")) return true;
+    }
+    return false;
+}
+
+fn recordConflicts(gpa: std.mem.Allocator, in: Input, ours: []const []u8) Error!u32 {
     const user_now = reviewer.workspaceTree(gpa, in.repo, in.scratch_dir, null) catch |err| return switch (err) {
         error.NotARepository => error.NotARepository,
         error.Unsupported => error.Unsupported,
@@ -281,7 +355,7 @@ pub fn mergeBack(gpa: std.mem.Allocator, in: Input) Error!Result {
     var report: std.ArrayList(u8) = .empty;
     defer report.deinit(gpa);
     var conflicts: u32 = 0;
-    for (ours.items.items) |path| {
+    for (ours) |path| {
         for (theirs.items.items) |user_path| {
             if (!collide(path, user_path)) continue;
             conflicts += 1;
@@ -289,20 +363,8 @@ pub fn mergeBack(gpa: std.mem.Allocator, in: Input) Error!Result {
             break;
         }
     }
-    if (conflicts != 0) {
-        run_dir.writeAtomic(in.conflicts_path, report.items) catch return error.GitFailed;
-        return .{ .conflict = conflicts };
-    }
-    if (ours.items.items.len == 0) return .{ .applied = .{ .files = 0 } };
-
-    var out = try git(gpa, in.repo, &.{ "apply", "--binary", "--whitespace=nowarn", in.patch_path }, null);
-    defer out.deinit(gpa);
-    if (out.exit_code != 0) {
-        run_dir.writeAtomic(in.conflicts_path, out.stderr) catch {};
-        log.warn("teamwork", "merge-back: git apply refused the patch: {s}", .{std.mem.trimEnd(u8, out.stderr, "\r\n")});
-        return .apply_failed;
-    }
-    return .{ .applied = .{ .files = @intCast(ours.items.items.len) } };
+    if (conflicts != 0) run_dir.writeAtomic(in.conflicts_path, report.items) catch return error.GitFailed;
+    return conflicts;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

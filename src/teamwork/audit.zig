@@ -25,6 +25,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const config = @import("config.zig");
 const ledger_mod = @import("ledger.zig");
+const TreeId = @import("reviewer.zig").TreeId;
 
 /// What an auditor is given. Every slice and pointer is borrowed for the
 /// call.
@@ -35,6 +36,7 @@ pub const AuditRequest = struct {
     /// approved. The auditor must not modify it (the runtime re-checks the
     /// tree afterwards and fails the run if it changed).
     workspace: []const u8,
+    approved_tree: TreeId,
     /// The commit the worktree started from: `git diff <base>` against the
     /// workspace is exactly the run's change.
     base: []const u8,
@@ -54,7 +56,7 @@ pub const AuditRequest = struct {
 /// release them with `deinit`.
 pub const AuditVerdict = union(enum) {
     /// Every requirement of the original request is met, with evidence.
-    pass,
+    pass: TreeId,
     /// The result does not fulfil the request. The report says what is
     /// missing; the runtime forwards it to the repair round.
     fail: []u8,
@@ -154,7 +156,7 @@ pub const StubAuditor = struct {
         self.last_workspace = try self.gpa.dupe(u8, request.workspace);
         self.last_attempt = request.attempt;
         return switch (self.script[index]) {
-            .pass => .pass,
+            .pass => .{ .pass = request.approved_tree },
             .fail => |text| .{ .fail = try gpa.dupe(u8, text) },
             .unverified => |text| .{ .unverified = try gpa.dupe(u8, text) },
             .unavailable => |text| .{ .unavailable = try gpa.dupe(u8, text) },
@@ -191,7 +193,7 @@ test "audit: the stub replays its script and records the request" {
     const script = [_]StubAuditor.Scripted{ .{ .fail = "missing flag" }, .pass };
     var stub: StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer stub.deinit();
-    const request: AuditRequest = .{ .original_request = "req", .workspace = "/wt", .base = "b", .check = null, .attempt = 1, .scratch_dir = "/s", .ledger = &ledger, .abort = &abort };
+    const request: AuditRequest = .{ .original_request = "req", .workspace = "/wt", .approved_tree = try TreeId.parse("a" ** 40), .base = "b", .check = null, .attempt = 1, .scratch_dir = "/s", .ledger = &ledger, .abort = &abort };
     var first = try stub.auditor().audit(testing.allocator, request);
     defer first.deinit(testing.allocator);
     try testing.expectEqualStrings("missing flag", first.fail);

@@ -333,6 +333,8 @@ fn heartbeatStopped(path: [:0]const u8) bool {
 pub const ScriptedProvider = struct {
     allocator: std.mem.Allocator,
     turns: []const []const Event,
+    default_model: []const u8 = "scripted-seat-model",
+    requested_model: ?[]const u8 = null,
     calls: usize = 0,
     step: usize = 0,
     /// Copies of what the first request carried.
@@ -370,8 +372,8 @@ pub const ScriptedProvider = struct {
         return @ptrCast(@alignCast(raw));
     }
 
-    fn model(_: *anyopaque) []const u8 {
-        return "scripted-seat-model";
+    fn model(raw: *anyopaque) []const u8 {
+        return cast(raw).default_model;
     }
 
     fn currentTurn(self: *const ScriptedProvider) []const Event {
@@ -385,11 +387,12 @@ pub const ScriptedProvider = struct {
         system: ?[]const u8,
         _: ?[]const json_mod.ToolDefinition,
         _: ?*const types.AbortSignal,
-        _: ?[]const u8,
+        model_override: ?[]const u8,
         _: ?json_mod.ToolChoice,
         _: []const u8,
     ) anyerror!provider_mod.StreamHandle {
         const self = cast(raw);
+        self.requested_model = model_override;
         if (self.calls == 0) {
             self.first_system = try self.allocator.dupe(u8, system orelse "");
             for (messages[0].content) |block| switch (block) {
@@ -1039,16 +1042,39 @@ test "teamwork drivers L2: a metacodes reviewer seat taps the plugged-in tool ob
     try testing.expect(std.mem.indexOf(u8, scripted.tool_results.items, "outside the current execution policy") != null);
 }
 
+test "teamwork drivers L2: native seat budget gates the next request using the model on the wire" {
+    if (!sandbox_exec.hostSupported()) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-seat-cost-model", 0.02);
+    defer fx.deinit();
+    const seat = try fx.addSeat(.implementer, 1, .metacodes);
+    var host: MetacodesHost = undefined;
+    try host.init();
+    defer host.deinit();
+    const turns = [_][]const ScriptedProvider.Event{
+        &.{.{ .tool = .{ .name = "Bash", .input = "{\"command\":\"pwd\"}" } }},
+        &.{.{ .text = "The budget must prevent this request" }},
+    };
+    var scripted: ScriptedProvider = .{ .allocator = testing.allocator, .turns = &turns, .default_model = "claude-haiku-4-5" };
+    defer scripted.deinit();
+    var driver = metacodes.MetacodesDriver.init(host.deps(scripted.provider(), &fx), fx.binding(seat));
+    var abort = types.AbortSignal.init();
+    var outcome = try driver.driver().run(testing.allocator, &.{ .role = .implementer, .model = "claude-opus-4" }, fx.paths(seat), &abort);
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqualStrings("claude-opus-4", scripted.requested_model.?);
+    try testing.expectEqual(@as(usize, 1), scripted.calls);
+    try testing.expect(outcome == .budget_exhausted);
+    try testing.expect(fx.ledger.isExhausted());
+}
+
 test "teamwork drivers L2: an implementer seat's Bash builds in its workspace inside the sandbox and writes nothing outside" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest; // comptime: the rest is POSIX-only
+    if (!sandbox_exec.hostSupported()) return error.SkipZigTest;
     var fx: Fixture = undefined;
     try fx.init("cc-zig-teamwork-drivers-bash", 5);
     defer fx.deinit();
-    // Outside every temp root the sandbox opens (the fixture lives in /tmp).
-    var outside_dir = testing.tmpDir(.{});
-    defer outside_dir.cleanup();
     var outside_buf: PathBuf = undefined;
-    const outside = outside_buf[0..try outside_dir.dir.realPath(testing.io, &outside_buf)];
+    const outside = fx.path(&outside_buf, "original-checkout");
+    try util_fs.mkdirParents(outside);
     var host: MetacodesHost = undefined;
     try host.init();
     defer host.deinit();
@@ -1071,7 +1097,7 @@ test "teamwork drivers L2: an implementer seat's Bash builds in its workspace in
     const turns = [_][]const ScriptedProvider.Event{
         &.{
             // A build step: writes its output into the workspace (cwd).
-            .{ .tool = .{ .name = "Bash", .input = try bash(arena, "mkdir -p zig-out && echo built > zig-out/built.ok && echo BUILD_DONE") } },
+            .{ .tool = .{ .name = "Bash", .input = try bash(arena, "mkdir -p zig-out && echo built > zig-out/built.ok && echo scratch > \"$TMPDIR/fixture.tmp\" && echo BUILD_DONE") } },
             .{ .tool = .{ .name = "Bash", .input = try bash(arena, escape) } },
             .{ .tool = .{ .name = "Bash", .input = try bash(arena, "echo changed > .git/config") } },
             .{ .tool = .{ .name = "Write", .input = "{\"file_path\":\".git/config\",\"content\":\"changed\"}" } },
@@ -1099,13 +1125,6 @@ test "teamwork drivers L2: an implementer seat's Bash builds in its workspace in
     defer testing.allocator.free(config_bytes);
     try testing.expectEqualStrings("original config\n", config_bytes);
     errdefer std.debug.print("tool results: {s}\n", .{scripted.tool_results.items});
-    if (sandbox_exec.hostSupported()) {
-        // Seatbelt or bubblewrap: the write command ran, confined.
-        try testing.expect(pfs.exists(built.ptr));
-        try testing.expect(std.mem.indexOf(u8, scripted.tool_results.items, "BUILD_DONE") != null);
-    } else {
-        // No backend: only read-only commands run.
-        try testing.expect(!pfs.exists(built.ptr));
-        try testing.expect(std.mem.indexOf(u8, scripted.tool_results.items, "outside the current execution policy") != null);
-    }
+    try testing.expect(pfs.exists(built.ptr));
+    try testing.expect(std.mem.indexOf(u8, scripted.tool_results.items, "BUILD_DONE") != null);
 }

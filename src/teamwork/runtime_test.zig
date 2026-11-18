@@ -23,6 +23,8 @@ const util_fs = @import("../util/fs.zig");
 const permission_mod = @import("../permission.zig");
 const tools_mod = @import("../tools.zig");
 const drivers_test = @import("drivers/drivers_test.zig");
+const reviewer = @import("reviewer.zig");
+const merge_back = @import("merge_back.zig");
 
 const testing = std.testing;
 const PathBuf = [std.fs.max_path_bytes]u8;
@@ -627,6 +629,152 @@ test "teamwork runtime L2: a user edit to the implementer's file is a conflict; 
     try testing.expect(std.mem.indexOf(u8, patch, "+feature\n") != null);
 }
 
+test "teamwork runtime L2: merge-back checks complete preimages after conflict discovery" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const original = "old headline\n" ++ "unchanged context\n" ** 12 ++ "old footer\n";
+    const edited = "old headline\n" ++ "unchanged context\n" ** 12 ++ "user footer\n";
+    const candidate = "new headline\n" ++ "unchanged context\n" ** 12 ++ "old footer\n";
+    const Edit = struct {
+        fn afterScan(in: merge_back.Input) merge_back.Error!void {
+            writeFile(in.repo, "src/app.txt", edited) catch return error.GitFailed;
+        }
+    };
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-merge-preimage");
+    defer fx.deinit();
+    const gpa = testing.allocator;
+    try writeFile(fx.repo(), "src/app.txt", original);
+    const base = try merge_back.snapshot(gpa, fx.repo(), fx.state(), null);
+    const wt = try std.fs.path.join(fx.arena.allocator(), &.{ fx.state(), "candidate" });
+    try merge_back.addWorktree(gpa, fx.repo(), wt, base.commit, null);
+    defer _ = merge_back.removeWorktree(gpa, fx.repo(), wt);
+    try writeFile(wt, "src/app.txt", candidate);
+    try writeFile(wt, "feature.txt", "feature\n");
+    const approved = try reviewer.workspaceTree(gpa, wt, fx.state(), null);
+    const patch = try std.fs.path.joinZ(fx.arena.allocator(), &.{ fx.state(), "merge.patch" });
+    const conflicts = try std.fs.path.joinZ(fx.arena.allocator(), &.{ fx.state(), "merge-conflicts.txt" });
+    try testing.expectEqual(merge_back.Result{ .conflict = 1 }, try merge_back.mergeBackAfterScan(gpa, .{
+        .repo = fx.repo(),
+        .base = base,
+        .approved = approved,
+        .scratch_dir = fx.state(),
+        .patch_path = patch,
+        .conflicts_path = conflicts,
+    }, Edit.afterScan));
+    try expectFile(fx.repo(), "src/app.txt", edited);
+    try expectFile(wt, "src/app.txt", candidate);
+    try testing.expect(!exists(fx.repo(), "feature.txt"));
+}
+
+test "teamwork runtime L2: merge-back refuses a gitlink before applying any ordinary files" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-gitlink");
+    defer fx.deinit();
+    const gpa = testing.allocator;
+    const before = try fx.workspaceBytes();
+    defer gpa.free(before);
+    const base = try merge_back.snapshot(gpa, fx.repo(), fx.state(), null);
+    const wt = try std.fs.path.join(fx.arena.allocator(), &.{ fx.state(), "candidate" });
+    try merge_back.addWorktree(gpa, fx.repo(), wt, base.commit, null);
+    defer _ = merge_back.removeWorktree(gpa, fx.repo(), wt);
+    try writeFile(wt, "feature.txt", "feature\n");
+    const tree = try sh(wt, "git add feature.txt && git update-index --add --cacheinfo 160000,$(git rev-parse HEAD),sub && git write-tree");
+    defer gpa.free(tree);
+    const patch = try std.fs.path.joinZ(fx.arena.allocator(), &.{ fx.state(), "merge.patch" });
+    const conflicts = try std.fs.path.joinZ(fx.arena.allocator(), &.{ fx.state(), "merge-conflicts.txt" });
+    const result = try merge_back.mergeBack(gpa, .{
+        .repo = fx.repo(),
+        .base = base,
+        .approved = try reviewer.TreeId.parse(std.mem.trimEnd(u8, tree, "\n")),
+        .scratch_dir = fx.state(),
+        .patch_path = patch,
+        .conflicts_path = conflicts,
+    });
+    try testing.expect(result == .apply_failed);
+    const after = try fx.workspaceBytes();
+    defer gpa.free(after);
+    try testing.expectEqualStrings(before, after);
+    try expectFile(wt, "feature.txt", "feature\n");
+}
+
+test "teamwork runtime L2: interrupted admission is retryable before publication and resumable after it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-admission-recovery");
+    defer fx.deinit();
+    const gpa = testing.allocator;
+    const opts = fx.options();
+    {
+        var incomplete = try run_dir.RunDir.create(gpa, fx.state(), opts.run_id);
+        defer incomplete.deinit(gpa);
+        try incomplete.writeOriginalRequest(request_text);
+    }
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const deps: runtime.Deps = .{
+        .seats = seats.source(),
+        .auditor = auditor.auditor(),
+        .cli_approval = .{ .config_json = "{\"enabled\":true,\"budget_usd\":5}", .host_sha256 = @splat(0) },
+    };
+    const cfg = try fx.cfg("");
+    const run = try runtime.Run.start(gpa, deps, .{ .text = request_text }, cfg, opts);
+    run.destroy();
+    var path_buf: PathBuf = undefined;
+    const dir = fx.runFile(&path_buf, "");
+    const published = readFile(dir, "run.json") orelse return error.MissingRunState;
+    defer gpa.free(published);
+    const interrupted = try std.mem.replaceOwned(u8, gpa, published, "\"initial_checkout_pending\":false", "\"initial_checkout_pending\":true");
+    defer gpa.free(interrupted);
+    try testing.expect(!std.mem.eql(u8, published, interrupted));
+    try testing.expect(std.mem.indexOf(u8, interrupted, "\"approved_config_json\"") != null);
+    try writeFile(dir, "run.json", interrupted);
+    const resumed = try runtime.Run.reopen(gpa, deps, cfg, fx.state(), opts.run_id);
+    defer resumed.destroy();
+    try testing.expectEqual(runtime.Phase.approved, resumed.state.phase());
+    try expectFile(resumed.status().worktree.?, "src/app.txt", "v1\n");
+    const registrations = try sh(fx.repo(), "git worktree list --porcelain | grep -c '^worktree '");
+    defer gpa.free(registrations);
+    try testing.expectEqualStrings("2\n", registrations);
+}
+
+test "teamwork runtime L2: abort during the final audit tree read keeps the checkout untouched" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const Recheck = struct {
+        fn abortRead(_: std.mem.Allocator, _: []const u8, _: []const u8, signal: ?*const types.AbortSignal) reviewer.TreeError!reviewer.TreeId {
+            @constCast(signal orelse return error.GitFailed).abort(.user_interrupt);
+            return error.Aborted;
+        }
+    };
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-abort-recheck");
+    defer fx.deinit();
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.StubAuditor = .{ .script = &.{.pass}, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const run = try runtime.Run.start(testing.allocator, .{
+        .seats = seats.source(),
+        .auditor = auditor.auditor(),
+        .recheck_audited_tree = Recheck.abortRead,
+    }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    _ = try run.dispatch(.implementer, "");
+    _ = try run.dispatch(.reviewer, "");
+    try testing.expectEqual(runtime.CompletionResult.cancelled, try run.requestCompletion());
+    try expectFile(run.status().worktree.?, "feature.txt", "feature\n");
+    try testing.expect(!exists(fx.repo(), "feature.txt"));
+    var state_buf: PathBuf = undefined;
+    const state = readFile(fx.runFile(&state_buf, ""), "run.json") orelse return error.MissingRunState;
+    defer testing.allocator.free(state);
+    try testing.expect(std.mem.indexOf(u8, state, "\"state\":\"cancelled\"") != null);
+}
+
 test "teamwork runtime L2: reopening cannot change the approved budget, harness or check" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: Fixture = undefined;
@@ -918,6 +1066,97 @@ test "teamwork runtime L2: the same reviewer claim is rejected when the metacode
 
 // ── through the real isolated verifier ──────────────────────────────────────
 
+test "teamwork runtime L2: separate audit checkouts send the same initial verifier request" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const Capture = struct {
+        fn packet(gpa: std.mem.Allocator, tag: []const u8) ![]u8 {
+            var fx: Fixture = undefined;
+            try fx.init(tag);
+            defer fx.deinit();
+            const plans = [_]Plan{
+                .{ .seat = "implementer-1", .files = &.{feature} },
+                .{ .seat = "reviewer-1", .review = approve_review },
+            };
+            var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+            defer seats.deinit();
+            const Event = drivers_test.ScriptedProvider.Event;
+            const turns = [_][]const Event{
+                &.{.{ .tool = .{ .name = "Bash", .input = "{\"command\":\"cat feature.txt\"}" } }},
+                &.{.{ .text = "REQUIREMENT: feature.txt says feature\nSUBSTITUTE: different content\nPROBE: cat feature.txt\nOBSERVED: feature\nVERDICT: PASS" }},
+            };
+            var scripted: drivers_test.ScriptedProvider = .{ .allocator = gpa, .turns = &turns };
+            defer scripted.deinit();
+            var perm = permission_mod.createContext(.accept_edits, gpa);
+            perm.no_interactive_prompt = true;
+            var verifier: @import("verifier_auditor.zig").VerifierAuditor = .{ .deps = .{
+                .provider = scripted.provider(),
+                .tool_defs = try tools_mod.toToolDefinitions(fx.arena.allocator()),
+                .permission_ctx = &perm,
+                .state_root = fx.state(),
+            } };
+            const run = try runtime.Run.start(gpa, .{ .seats = seats.source(), .auditor = verifier.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+            defer run.destroy();
+            try testing.expectEqual(runtime.Phase.done, (try swe_loop.drive(run)).phase());
+            const text = scripted.first_user orelse return error.VerifierRequestMissing;
+            try testing.expect(std.mem.indexOf(u8, text, fx.root.slice()) == null);
+            return gpa.dupe(u8, text);
+        }
+    };
+    const gpa = testing.allocator;
+    const first = try Capture.packet(gpa, "cc-zig-teamwork-audit-wire-first");
+    defer gpa.free(first);
+    const second = try Capture.packet(gpa, "cc-zig-teamwork-audit-wire-second");
+    defer gpa.free(second);
+    try testing.expectEqualStrings(first, second);
+}
+
+test "teamwork runtime L2: an A to B to A checkout cannot borrow a verifier pass" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const verifier_auditor = @import("verifier_auditor.zig");
+    const Switch = struct {
+        delegate: audit.CompletionAuditor,
+
+        fn run(ptr: *anyopaque, gpa: std.mem.Allocator, request: audit.AuditRequest) audit.CompletionAuditor.Error!audit.AuditVerdict {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // This boundary runs after the runtime confirmed tree A and
+            // before the verifier materializes its own checkout.
+            writeFile(request.workspace, "feature.txt", "candidate B\n") catch unreachable;
+            defer writeFile(request.workspace, feature.path, feature.bytes) catch unreachable;
+            return self.delegate.audit(gpa, request);
+        }
+    };
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-audit-identity");
+    defer fx.deinit();
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var provider: drivers_test.ScriptedProvider = .{ .allocator = testing.allocator, .turns = &.{} };
+    defer provider.deinit();
+    var permission = permission_mod.createContext(.accept_edits, testing.allocator);
+    var verifier: verifier_auditor.VerifierAuditor = .{ .deps = .{
+        .provider = provider.provider(),
+        .tool_defs = &.{},
+        .permission_ctx = &permission,
+        .state_root = fx.state(),
+    } };
+    var swap: Switch = .{ .delegate = verifier.auditor() };
+    const run = try runtime.Run.start(testing.allocator, .{
+        .seats = seats.source(),
+        .auditor = .{ .ptr = &swap, .vtable = &.{ .audit = Switch.run } },
+    }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    _ = try run.dispatch(.implementer, "");
+    _ = try run.dispatch(.reviewer, "");
+    try testing.expectEqual(runtime.CompletionResult{ .failed = .audit_unavailable }, try run.requestCompletion());
+    try testing.expectEqual(@as(usize, 0), provider.calls);
+    try expectFile(run.status().worktree.?, feature.path, feature.bytes);
+    try testing.expect(!exists(fx.repo(), feature.path));
+}
+
 test "teamwork runtime L2: a verifier PASS cannot complete when its spend is not durable" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const verifier_auditor = @import("verifier_auditor.zig");
@@ -1017,6 +1256,8 @@ test "teamwork runtime L2: the isolated verifier audits the result; its FAIL rep
     try expectFile(fx.repo(), "feature.txt", "feature\n");
     // The verifier's packet is the recorded request, verbatim.
     try testing.expect(std.mem.indexOf(u8, scripted.first_user.?, request_text) != null);
+    try testing.expect(std.mem.indexOf(u8, scripted.first_user.?, "path: . (your working directory)") != null);
+    try testing.expect(std.mem.indexOf(u8, scripted.first_user.?, fx.root.slice()) == null);
     var run_buf: PathBuf = undefined;
     const report = readFile(fx.runFile(&run_buf, ""), "audits/audit-1.md") orelse return error.NoReport;
     defer testing.allocator.free(report);

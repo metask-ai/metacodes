@@ -140,8 +140,8 @@ metacodes seat 根本没有放 `command` 的位置;`BudgetEnforcement.wallclock_
 
 CLI 使用确定性 SWE manager 和请求文件,不执行 interviewer;未接线的角色配置明确拒绝。
 `command.Host` 向 worker、pinned check 和 verifier 提供强制沙箱,state root 必须在仓库外。
-`approved-config.json` 保存批准配置并固定 native seat 的继承模型;`teamwork resume <id>
---approve` 只用这份 policy。`teamwork status <id> [--json]` 只读运行文件,缺失账本为空,
+`run.json` 在创建候选 worktree 前原子保存批准配置、继承模型和宿主权限指纹。`teamwork resume <id>
+--approve` 使用这份配置,拒绝权限和沙箱策略发生变化的恢复请求。`teamwork status <id> [--json]` 只读运行文件,缺失账本为空,
 pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
 `McpHost.serveFn(gpa, run)` 接管 live Run 的管理。完整 CLI 合约见 [API.md](API.md),
 真实 CLI consumer 测试见 `tests/component/teamwork_command_test.zig`(假 harness / 本地 mock)。
@@ -159,7 +159,7 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
     packet.md             runtime 写
     handoff.md            seat 写
     progress.md           seat 写
-    status.json           runtime 写:{seat_id, role, harness, status}
+  seat-status/<id>.json   runtime 写:{seat_id, role, harness, status}，不在 worker 可写目录内
     review.json           reviewer seat 写(§6.1)
     open_issues.json      runtime 写给本 seat 的台账只读副本(§6.3)
     harness.log           Claude Code 驱动写:CLI 的 stderr 与兼容性诊断(§7.4)
@@ -170,7 +170,8 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
 - `RunDir.create` 拒绝接管已存在的目录(`RunExists`);`RunDir.open` 用于重启后重新进入。
 - `writeOriginalRequest`:先写临时文件并 fsync,再以不覆盖方式安装(`pfs.installNoReplace`);
   第二次写返回 `OriginalRequestExists`,崩溃不会留下半截请求。
-- `status.json` 经临时文件 + rename 原子替换。`SeatStatus` 为
+- seat 状态经独占创建临时文件后 rename 原子替换。评审索引也放在控制器目录中。
+  `SeatStatus` 为
   `queued / working / needs_you / waiting / done / failed`。
 - `recover()` 只凭目录内容重建 seat 表:每个名字合法的 `seats/<id>/`,读得出记录的给出
   `recorded`(含 `has_handoff`),读不出的(建目录后、首次写 status 前崩溃,或记录被破坏、
@@ -325,7 +326,7 @@ pub fn forSeat(spec: *const SeatSpec, deps: Deps, binding: common.Binding) Drive
 - **宪章**(`charters.forRole(role)`):interviewer、implementer、manager 为原创文本;reviewer 即
   `reviewer.charter`(§6);verifier 是标明的占位,真正的宪章在 verifier 模块(#516)。
   两种 harness 都收到同一角色宪章(Claude Code 通过 `--append-system-prompt`)。
-  `charters.digest(role)` 是编译期 SHA-256,runtime 将其写入 seat 的 `status.json`,恢复时保留。
+  `charters.digest(role)` 是编译期 SHA-256,runtime 将其写入控制器的 seat 状态文件,恢复时保留。
 - **判定顺序**:中止 → `aborted`;预算停(子 agent 因 `cost_budget_usd` 停、Claude Code 报
   `error_max_budget_usd`、wallclock_only seat 到时、账本写不进)→ `budget_exhausted`;硬超时 →
   `failed.timed_out`;被信号杀 → `failed.signaled`;非零退出 → `failed.exited`;否则
@@ -350,16 +351,15 @@ ledger.remainingUsd()`;`spec.model`/`spec.effort` 作为覆盖。用量经 `Writ
 |---|---|---|
 | 执行策略 | `Scope.executionPolicy()` 作为 `SpawnOptions.execution_policy`,agent_loop/tool_exec 在工具运行前最后一道检查,与权限模式、allow 规则无关 | 只提供该角色的工具(`toolsFor`:implementer = Read/Grep/Glob/Write/Edit/Bash;reviewer = `reviewer.tools` + Write;其余角色 = Read/Grep/Glob/Bash/Write);Write/Edit 的目标按工具自己的解析方式求出后**物理**落在写根内(符号链接解析,含尚不存在的尾部;悬空链接拒绝);写根 = seat 目录,implementer 另加工作区;Bash 必须只读或确实在沙箱内运行 |
 | 权限 | 宿主权限上下文派生:`acceptEdits`、工作目录集 = 工作区 + seat 目录、`no_interactive_prompt`、无 UI 请求器、无会话记忆、无 memdir 豁免 | 需要询问的一律拒绝;宿主 deny 规则、settings、hooks 照样生效 |
-| 沙箱 | `seatSandbox`:始终要求后端(macOS Seatbelt;Linux bubblewrap + seccomp)、`failIfUnavailable`、不可绕过(`allowUnsandboxedCommands = false`),丢弃宿主的 `allowWrite` 与 `excludedCommands` | Bash 和原生文件执行器只能写工作区、seat 目录和临时目录;后端不可用即拒绝 seat |
+| 沙箱 | `seatSandbox`:始终要求后端(macOS Seatbelt;Linux bubblewrap + seccomp)、`failIfUnavailable`、不可绕过(`allowUnsandboxedCommands = false`),丢弃宿主的 `allowWrite` 与 `excludedCommands` | Bash 和原生文件执行器只能写工作区和 seat 目录。`TMPDIR` 指向本 seat 目录。后端不可用即拒绝 seat |
 
-Linux 上 implementer seat 的 Bash 跑在 bubblewrap 里:根目录只读挂载,只把工作区、seat 目录、
-临时目录(`/tmp`、`/var/tmp`、`$TMPDIR`)按物理路径可写绑定,所以能在工作区里构建、跑测试,写不到别处
-(符号链接改变不了挂载)。
+Linux 上 implementer seat 的 Bash 跑在 bubblewrap 里:根目录只读挂载,工作区和 seat 目录按物理路径可写绑定。
+macOS 和 Linux 均只提供本次调用的私有临时目录。原仓库和控制器文件位于系统临时目录时也受保护。
 
 Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命名空间)的 Linux,在模型请求前
 即拒绝 seat,不会因探测失败而把原生文件操作切换成无沙箱模式。Read/Write/Edit 等原生文件工具
 经 `metacodes-fs-helper` 在沙箱内打开文件;Grep/Glob 的搜索命令也经过相同边界。
-两个后端都允许写工作区(构建缓存)和临时目录,所以对非 implementer seat,Bash 挡不住对工作区
+两个后端都允许写工作区(构建缓存),所以对非 implementer seat,Bash 挡不住对工作区
 的改动;reviewer 仍由工作区树 id 检查兜底。完整边界见 [沙箱执行](SANDBOX_DESIGN.md)。
 
 ### 7.4 Claude Code 驱动
@@ -392,7 +392,7 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
   后也清扫一次整组,不留后代进程。Windows 只杀 CLI 本身。
 - **沙箱**:探测(`--version`、`--help`)和正式调用都经通用的 `sandbox/worker.zig`
   包进宿主后端(macOS Seatbelt,Linux bubblewrap + seccomp),
-  可写根 = 工作区、seat 目录、临时目录和 Claude Code 自己的状态(`~/.claude`、`~/.claude.json*`;
+  可写根 = 工作区、seat 目录和 Claude Code 自己的状态(`~/.claude`、`~/.claude.json*`;
   bwrap 只能绑定启动时已存在的条目)。继承宿主的读写拒绝与网络列表,不继承额外写权限;
   无网络列表时网络开放(CLI 要连 API)。工厂把同一宿主限制转交给两种 harness。bwrap 下 CLI 被信号 N
   杀死表现为 bwrap 退出码 128+N,驱动换算回信号(`WrappedCommand.childExitCode`)。
@@ -456,18 +456,20 @@ approved -> implementing -> reviewing -> review_approved -> auditing -> merging 
 
 每个角色最多派 `max_rounds` 个 seat(默认 3)。reviewer 的结论经过工具调用记录、台账与固定
 检查命令核验;批准绑定工作区树 id。审计前树变了就重新评审,审计后树变了就终止。
-`VerifierAuditor` 调用隔离的 `core/isolated_verifier.verify`:它只接收原始请求、候选快照和
-检查证据,不接收实现者的对话。只有明确 PASS 才合回,FAIL 第一次进入修复轮、第二次失败终止;
+`VerifierAuditor` 在与批准树一致的独立快照上执行固定检查,然后调用 `core/isolated_verifier.verify`。
+审计请求用相对工作目录标识,不会包含生成的快照路径。只有绑定到批准树的 PASS 才合回,
+FAIL 第一次进入修复轮、第二次失败终止;
 UNVERIFIED 与 unavailable 均不会放行。审计花费必须成功写入预算账本。
 
 `merge_back.mergeBack` 生成二进制补丁,比较用户从启动以来的改动与候选改动。两者修改相同或
 包含关系的路径时停在 `merge_conflict`,保留工作区、worktree、`merge.patch` 与冲突列表。
-通过时用 `git apply` 合回为未提交修改,不自动 commit。预算耗尽、取消、审计失败时不合回。
+通过时用基于原始树的临时索引执行 `git apply --index`，写入前复核目标文件的完整内容与模式。
+子模块指针变更会拒绝合回并保留补丁。成功时改动留为未提交修改，真实索引保持原状。
 
 `runtime.lock` 的内核锁保证同一个运行只有一个控制进程,第二次恢复返回 `RunBusy`。
-`run.json` 原子记录状态、树 id、轮数、审计次数与配置 SHA-256。恢复时必须提供相同的预算、
-seat/harness/model 与固定检查配置,否则 `ConfigurationChanged`;修改配置不会悄悄给旧运行
-增加权限或预算。seat 的 `status.json` 记录宪章 SHA-256 并在恢复后保留。崩溃时未完成的 seat
+`run.json` 原子记录批准配置、状态、树 id、轮数、审计次数与配置 SHA-256。首次 checkout 中断时可以用同一运行 ID 恢复。
+恢复时必须提供相同的预算、seat/harness/model、固定检查和有效权限配置,否则 `ConfigurationChanged`。
+控制器的 seat 状态文件记录宪章 SHA-256 并在恢复后保留。崩溃时未完成的 seat
 记为 interrupted;如果丢失了付费结果,先按预算预留规则停止。中断的审计可以在预算允许时重跑,
 中断的合回停下交由用户检查。
 

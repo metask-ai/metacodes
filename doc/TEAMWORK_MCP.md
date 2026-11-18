@@ -116,6 +116,10 @@ work. The adapter does not claim MCP task or progress support.
 Completion without current verified reviewer approval returns `NotApproved`.
 The runtime rechecks approval against the current tree, independently audits,
 then merges the audited work into the original user workspace, uncommitted.
+The verifier and pinned check use a disposable checkout of the reviewed tree.
+A passing audit names that tree before the runtime can enter merge-back.
+Merge-back checks target-file preimages using a private Git index and refuses
+submodule commit changes before touching the workspace.
 An unavailable auditor yields `failed/audit_unavailable`, never `done`.
 Stale approval or a first failed audit can request review or repair; callers
 must inspect the returned state. Only `snapshot.state.kind == "done"` means

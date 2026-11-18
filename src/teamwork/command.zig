@@ -126,10 +126,12 @@ pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u
         if (options.has_overrides) return error.ResumeOverridesForbidden;
         var dir = try run_dir.RunDir.open(arena, state_root, id);
         defer dir.deinit(arena);
-        layer = try config.parse(arena, try readRequired(arena, try std.fmt.allocPrint(arena, "{s}/approved-config.json", .{dir.root})), null);
         var buf: run_dir.PathBuf = undefined;
         const saved = try std.json.parseFromSliceLeaky(std.json.Value, arena, try readRequired(arena, try dir.path(&buf, .state)), .{});
         if (saved != .object) return error.StateCorrupt;
+        const policy = saved.object.get("approved_config_json") orelse return error.ConfigurationChanged;
+        if (policy != .string) return error.StateCorrupt;
+        layer = try config.parse(arena, policy.string, null);
         const saved_repo = saved.object.get("repo") orelse return error.StateCorrupt;
         if (saved_repo != .string) return error.StateCorrupt;
         repo = try @import("merge_back.zig").toplevel(arena, saved_repo.string, null);
@@ -287,6 +289,45 @@ pub const Host = struct {
             .check_runner = self.auditor.check_runner,
         };
     }
+
+    /// Pin the effective inputs consulted by child tools and pinned checks.
+    /// Hash data only, never allocator addresses, session IDs or live handles.
+    fn policyFingerprint(self: *const Host, arena: std.mem.Allocator) ![32]u8 {
+        const permission = &self.app.permission_ctx;
+        var out: std.Io.Writer.Allocating = .init(arena);
+        defer out.deinit();
+        var s: std.json.Stringify = .{ .writer = &out.writer };
+        try s.beginObject();
+        try s.objectField("sandbox");
+        try s.write(.{
+            .home = self.app.homeDir(),
+            .allow_read = self.sandbox.allow_read,
+            .deny_read = self.sandbox.deny_read,
+            .deny_write = self.sandbox.deny_write,
+            .allowed_domains = self.sandbox.allowed_domains,
+            .denied_domains = self.sandbox.denied_domains,
+        });
+        try s.objectField("mode");
+        try s.write(permission.effectiveMode());
+        try s.objectField("rules");
+        if (permission.rules) |rules| try s.write(rules.rules.items) else try s.write(null);
+        try s.objectField("settings");
+        if (permission.settings) |settings| try s.write(settings.layers) else try s.write(null);
+        try s.objectField("hooks");
+        if (permission.hooks) |hooks| {
+            try s.write(.{
+                .pre_tool_use = hooks.pre_tool_use,
+                .post_tool_use = hooks.post_tool_use,
+                .stop = hooks.stop,
+                .pre_compact = hooks.pre_compact,
+                .post_compact = hooks.post_compact,
+            });
+        } else try s.write(null);
+        try s.endObject();
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(out.written(), &digest, .{});
+        return digest;
+    }
 };
 
 /// The coordinator binds this to mcp_server.Server.init(gpa, run).serve().
@@ -310,16 +351,17 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
         }
     }
     const host = try Host.create(arena, app, cfg);
+    if (cfg.seats.get(.implementer).harnessKind() == .claude_code or cfg.seats.get(.reviewer).harnessKind() == .claude_code) {
+        try requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), prepared.workspace);
+    }
+    var deps = host.deps();
+    deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
     // Run owns the OS lifetime lease, shared by CLI and MCP callers.
     const run = if (prepared.action != .@"resume")
-        try runtime.Run.start(app.allocator, host.deps(), .{ .text = prepared.request }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
+        try runtime.Run.start(app.allocator, deps, .{ .text = prepared.request }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
     else
-        try runtime.Run.reopen(app.allocator, host.deps(), cfg, app.stateRoot(), prepared.id);
+        try runtime.Run.reopen(app.allocator, deps, cfg, app.stateRoot(), prepared.id);
     defer run.destroy();
-    if (prepared.action != .@"resume") {
-        const path = try std.fmt.allocPrintSentinel(arena, "{s}/approved-config.json", .{run.dir.root}, 0);
-        try run_dir.writeAtomic(path, try policyJson(arena, cfg));
-    }
     std.debug.print("teamwork run {s}; status: metacodes teamwork status {s}\n", .{ prepared.id.slice(), prepared.id.slice() });
     var stopped = std.atomic.Value(bool).init(false);
     const watcher = try platform.thread.spawn(.waiter, forwardAbort, .{ &app.abort, &run.abort, &stopped });
@@ -356,7 +398,10 @@ pub fn status(arena: std.mem.Allocator, state_root: []const u8, id: types.RunId)
     if (saved != .object) return error.StateCorrupt;
     const phase = saved.object.get("state") orelse return error.StateCorrupt;
     if (phase != .string or runtime.Phase.parse(phase.string) == null) return error.StateCorrupt;
-    const policy = try readRequired(arena, try std.fmt.allocPrint(arena, "{s}/approved-config.json", .{dir.root}));
+    const policy = if (saved.object.get("approved_config_json")) |value|
+        if (value == .string) value.string else return error.StateCorrupt
+    else
+        try readRequired(arena, try std.fmt.allocPrint(arena, "{s}/approved-config.json", .{dir.root}));
     const cfg = try config.validate(try config.parse(arena, policy, null), null);
     if (cfg != .enabled) return error.StateCorrupt;
     const budget_path = try dir.path(&buf, .budget);
@@ -459,6 +504,34 @@ fn readOptional(arena: std.mem.Allocator, path: []const u8) !?[]const u8 {
 
 fn readRequired(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
     return try readOptional(arena, path) orelse error.FileNotFound;
+}
+
+/// Keep the external harness's writable login and metadata grants separate
+/// from the original checkout and the run controller's state.
+fn requireSeparateClaudeState(arena: std.mem.Allocator, home: []const u8, state_root: []const u8, repo: []const u8) !void {
+    if (!std.fs.path.isAbsolute(home)) return error.InvalidClaudeHome;
+    const physical_home = try physicalExisting(arena, home);
+    const state = try physicalExisting(arena, state_root);
+    const workspace = try physicalExisting(arena, repo);
+    for (@import("drivers/claude_code.zig").claude_state_roots) |root| {
+        const path = try std.fs.path.join(arena, &.{ physical_home, root[2..] });
+        const physical = try physicalExisting(arena, path);
+        if (within(state, physical) or within(physical, state) or within(workspace, physical) or within(physical, workspace))
+            return error.ClaudeStateOverlapsRun;
+    }
+}
+
+fn within(path: []const u8, root: []const u8) bool {
+    if (eq(path, root)) return true;
+    return root.len > 0 and path.len > root.len and std.mem.startsWith(u8, path, root) and
+        (std.fs.path.isSep(root[root.len - 1]) or std.fs.path.isSep(path[root.len]));
+}
+
+fn physicalExisting(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const z = try arena.dupeZ(u8, path);
+    var buf: run_dir.PathBuf = undefined;
+    if (pfs.finalPath(z, &buf)) |physical| return arena.dupe(u8, std.mem.span(physical));
+    return path;
 }
 
 fn requireExternalState(arena: std.mem.Allocator, state_root: []const u8, repo: []const u8) !void {

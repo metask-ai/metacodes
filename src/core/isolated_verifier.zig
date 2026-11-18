@@ -416,6 +416,7 @@ pub const VerifyRequest = struct {
     /// The user message that started the run, verbatim.
     task_statement: []const u8,
     workspace: Workspace,
+    relative_workspace_packet: bool = false,
     pinned_check: ?PinnedCheck = null,
     budget: Budget = .{},
     /// `--verifier-model`: a model name or a tier name; null = the actor's.
@@ -477,7 +478,7 @@ pub fn renderPacket(allocator: std.mem.Allocator, request: *const VerifyRequest,
     } else {
         try w.writeAll("PINNED CHECK: none was given.\n\n");
     }
-    try w.print("CANDIDATE SNAPSHOT\npath: {s} (your working directory)\nrefs: `base` is the state before the work, `candidate` is the work; `git diff base candidate` shows exactly what changed.\n", .{snapshot.path});
+    try w.print("CANDIDATE SNAPSHOT\npath: {s} (your working directory)\nrefs: `base` is the state before the work, `candidate` is the work; `git diff base candidate` shows exactly what changed.\n", .{if (request.relative_workspace_packet) "." else snapshot.path});
     if (request.prior_failing_probes.len > 0) {
         try w.writeAll("\nPRIOR FAILING PROBES (from an earlier verifier; re-run each)\n");
         for (request.prior_failing_probes) |probe| try w.print("- {s}\n", .{probe});

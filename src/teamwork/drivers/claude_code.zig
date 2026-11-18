@@ -108,7 +108,7 @@ pub const env_allowlist = [_][]const u8{
 pub const harness_log_file = "harness.log";
 
 /// Claude Code's own state, writable inside the sandbox.
-const claude_state_roots = [_][]const u8{ "~/.claude", "~/.claude.json", "~/.claude.json.backup", "~/.claude.json.lock" };
+pub const claude_state_roots = [_][]const u8{ "~/.claude", "~/.claude.json", "~/.claude.json.backup", "~/.claude.json.lock" };
 
 pub const Options = struct {
     /// The runtime's environment as `KEY=VALUE` entries
@@ -364,6 +364,7 @@ pub const ClaudeCodeDriver = struct {
             .allow_unsandboxed_commands = false,
             .auto_allow_bash_if_sandboxed = false,
             .allow_write = &claude_state_roots,
+            .temp_writes = .{ .isolated = seat_dir },
         };
         if (self.options.host_sandbox) |host| {
             settings.deny_read = host.deny_read;
@@ -686,7 +687,7 @@ const HarnessLog = struct {
 
     fn open(arena: std.mem.Allocator, seat_dir: []const u8) HarnessLog {
         const path = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ seat_dir, harness_log_file }, 0) catch return .{ .fd = null };
-        const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+        const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
         return .{ .fd = if (fd < 0) null else fd };
     }
 
