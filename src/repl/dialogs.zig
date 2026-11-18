@@ -106,8 +106,14 @@ pub const HelpDialog = struct {
 
     fn count(self: *const HelpDialog, kind: complete.SlashKind) usize {
         var n: usize = 0;
-        for (self.catalog.entries) |cmd| n += @intFromBool(cmd.kind == kind);
+        for (self.catalog.entries) |cmd| n += @intFromBool(listed(cmd, kind));
         return n;
+    }
+
+    /// A command of `kind` as help lists it: once, by its own name, not again
+    /// for each argument the `/` menu spells out (`/login openrouter`).
+    fn listed(cmd: complete.SlashCmd, kind: complete.SlashKind) bool {
+        return cmd.kind == kind and cmd.arg_of.len == 0;
     }
 
     /// Each entry takes two rows (name, description).
@@ -128,7 +134,7 @@ pub const HelpDialog = struct {
         var index: usize = 0;
         var shown: usize = 0;
         for (self.catalog.entries) |cmd| {
-            if (cmd.kind != kind) continue;
+            if (!listed(cmd, kind)) continue;
             defer index += 1;
             if (index < self.top or shown >= visible) continue;
             shown += 1;

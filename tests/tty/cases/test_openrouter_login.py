@@ -240,6 +240,31 @@ def test_login_openrouter_on_another_device_takes_the_code_pasted_back(bin_path)
         assert "DeepSeek: DeepSeek V4.1 Flash" not in last, "a paid model listed for an account without credits:\n" + last
 
 
+def test_login_lists_the_providers_it_signs_in_to_and_logout_the_keys_stored(bin_path):
+    """Typing `/login` shows what can follow it; `/logout`, the keys stored here."""
+    with _Case() as case:
+        events = [READY, "type:/login", wait_for("/login openrouter", 10), "sleep:0.3",
+                  "key:ctrl_u", "sleep:0.3", "type:/logout", "sleep:0.8"]
+        raw = run(bin_path, events, term_size=(40, 140), env=case.env(), per_key_drain=0.05)
+        a, _ = _screen(raw, 40, 140)
+        if not a.screens_with("Sign in to OpenRouter: in the browser, on another device, or with a key"):
+            a._fail("/login should list OpenRouter, and how it signs in")
+        if a.screens_with("/logout openrouter"):
+            a._fail("/logout lists only the keys stored here, and none is")
+        assert case.server.seen == [], "nothing was asked of OpenRouter"
+    with _Case() as case:
+        keys = os.path.join(case.home, ".metacodes", "keys")
+        os.makedirs(keys)
+        with open(os.path.join(keys, "openrouter.json"), "w") as f:
+            json.dump({"schema_version": 1, "kind": "api_key", "key": KEY}, f)
+        os.chmod(os.path.join(keys, "openrouter.json"), 0o600)
+        events = [READY, "type:/logout", wait_for("/logout openrouter", 10), "sleep:0.3"]
+        raw = run(bin_path, events, term_size=(40, 140), env=case.env(), per_key_drain=0.05)
+        a, _ = _screen(raw, 40, 140)
+        if not a.screens_with("Forget the OpenRouter key stored here"):
+            a._fail("/logout should list the OpenRouter key stored here")
+
+
 def test_login_openrouter_takes_a_key_the_user_already_has(bin_path):
     with _Case() as case:
         events = [READY, "type:/login openrouter", "key:enter",

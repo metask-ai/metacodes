@@ -1678,7 +1678,51 @@ fn slashCatalog(arena: std.mem.Allocator, app: *const app_mod.App) complete.Slas
         }
         entries.appendAssumeCapacity(entry);
     }
+    appendProviderRows(arena, &entries, app);
     return .{ .entries = entries.items };
+}
+
+/// `/login <provider>` for each provider `/login` signs in to, and `/logout
+/// <provider>` for each with a key stored here, as rows of their own, so
+/// typing `/login` shows what can follow it (`SlashCmd.arg_of`). Providers
+/// that sign in on their own site (OpenRouter) come first. Without a provider
+/// host yet there are none: `/login`'s own row still names `<provider>`.
+fn appendProviderRows(arena: std.mem.Allocator, entries: *std.ArrayList(complete.SlashCmd), app: *const app_mod.App) void {
+    const host = app.provider_host orelse return;
+    for ([_]bool{ true, false }) |site_sign_in| {
+        for (host.registry.profiles.items) |*profile| {
+            // Metask is `/login` itself.
+            if (profile.id.eqlText("metask")) continue;
+            if ((profile.key_grant != null) != site_sign_in) continue;
+            const desc = loginRowText(arena, host, profile, app.stateRoot()) orelse continue;
+            const name = std.fmt.allocPrint(arena, "/login {s}", .{profile.id.slice()}) catch return;
+            entries.append(arena, .{ .name = name, .desc = desc, .arg_of = "/login" }) catch return;
+        }
+    }
+    for (host.registry.profiles.items) |*profile| {
+        if (profile.id.eqlText("metask")) continue;
+        const path = api_key_store.pathFor(arena, app.stateRoot(), profile.id) catch continue;
+        const path_z = arena.dupeZ(u8, path) catch return;
+        if (!pfs.exists(path_z.ptr)) continue;
+        const name = std.fmt.allocPrint(arena, "/logout {s}", .{profile.id.slice()}) catch return;
+        const desc = std.fmt.allocPrint(arena, "Forget the {s} key stored here", .{profile.display_name}) catch return;
+        entries.append(arena, .{ .name = name, .desc = desc, .arg_of = "/logout" }) catch return;
+    }
+}
+
+/// What `/login <provider>` does for `profile`, or null when it cannot sign
+/// in to it (the same test the `/login` list applies).
+fn loginRowText(arena: std.mem.Allocator, host: *const @import("../provider/host.zig").Host, profile: *const @import("../provider/profile.zig").ProviderProfile, state_root: []const u8) ?[]const u8 {
+    if (profile.key_grant != null) {
+        return std.fmt.allocPrint(arena, "Sign in to {s}: in the browser, on another device, or with a key", .{profile.display_name}) catch null;
+    }
+    if (provider_login.prepareFlow(profile, .{ .state_root = state_root }, host.oauthClientIdFor(profile.id))) |_| {
+        return std.fmt.allocPrint(arena, "Sign in to {s}", .{profile.display_name}) catch null;
+    } else |_| {}
+    if (profile.api_key_setup != null) {
+        return std.fmt.allocPrint(arena, "Store a {s} API key", .{profile.display_name}) catch null;
+    }
+    return null;
 }
 
 /// Open the result block of a `/command`. A built-in's echo is written at
@@ -1804,6 +1848,9 @@ fn readLineRaw(
     // 本次读取是一个输入阶段(#330):上一阶段打开的 agent 列表/help/slash 高亮已随它结束,
     // 停在 list 态的 agent 切换器吞掉新提示输入(#298)的那类泄漏无从发生。catalog 借用上面的
     // arena,读取结束时随阶段 payload 一起消失(下方 defer 在 arena 释放之前跑)。
+    // The menu's `/login <provider>` rows read the provider host, which a
+    // session with no model may not have built yet.
+    _ = app.providerHost() catch null;
     region.beginInput(slashCatalog(slash_arena.allocator(), app));
     // 终端 resize 监听:SIGWINCH → 下次 poll 超时时重画自适应。
     g_winch.store(false, .release);
