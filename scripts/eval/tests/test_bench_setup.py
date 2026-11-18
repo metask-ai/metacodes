@@ -122,6 +122,8 @@ elif name == "ssh":
             remote[key] = env[key]
     os.chdir(home)
     os.execve("/bin/sh", ["sh", "-c", command], remote)
+elif name == "sysctl":
+    print(env.get("FAKE_HV_SUPPORT", "1"))
 elif name == "zig":
     if args[:1] == ["version"]:
         print("0.16.0")
@@ -134,7 +136,7 @@ elif name == "metacodes":
     print("Open https://example.invalid/device and enter the code ABCD-1234", file=sys.stderr, flush=True)
 '''
 
-SIMPLE = ("uname", "brew", "uv", "curl", "sudo", "docker", "colima", "ssh", "zig", "metacodes")
+SIMPLE = ("uname", "brew", "uv", "curl", "sudo", "docker", "colima", "ssh", "zig", "metacodes", "sysctl")
 SYSTEM_TOOLS = ("sh", "env", "mkdir", "tar", "cp", "chmod", "rm", "mv", "mktemp", "touch", "cat", "python3",
                 "openssl", "grep", "sed", "ls", "id", "head", "tail", "dirname", "basename", "true", "false", "git")
 
@@ -190,7 +192,7 @@ class SetupFixture(unittest.TestCase):
         (self.templates / "harbor").write_text(FAKE_HARBOR.format(python=sys.executable))
         (self.templates / "harbor").chmod(0o755)
         os.symlink(self.templates / "brew", self.local_bin / "brew")  # Homebrew is present locally
-        for tool in ("uname", "curl", "sudo", "ssh", "zig"):
+        for tool in ("uname", "curl", "sudo", "ssh", "zig", "sysctl"):
             os.symlink(self.templates / tool, self.common / tool)
         # Only these host tools are visible: a host's own docker, brew, ip or
         # apt-get must not change which branch a step takes.
@@ -339,6 +341,17 @@ class LocalSetupTest(SetupFixture):
         self.assertTrue(bundle.name.startswith("metacodes-dev-") and bundle.name.endswith("-x86_64-linux-gnu"))
         self.assertEqual((bundle / "bin/metacodes").read_text(), "cross-compiled overlay")
         self.assertEqual(self.cfg()["bundle_source"]["base_release"], "9.9.9")
+
+    def test_mac_vm_without_nested_virtualization_fails_before_installing(self):
+        os.environ["FAKE_HV_SUPPORT"] = "0"
+        progress = setup.run_setup(self.config)
+        docker = self.step(progress, "docker")
+        self.assertEqual(docker["status"], "failed")
+        self.assertIn("kern.hv_support=0", docker["detail"])
+        self.assertIn("SSH 执行机器", docker["detail"])
+        self.assertNotIn(["install", "docker", "docker-compose", "docker-buildx", "colima"],
+                         [c[1] for c in self.calls("brew")])
+        self.assertEqual(self.calls("colima"), [])
 
     def test_linux_without_sudo_reports_the_root_command(self):
         os.environ["FAKE_UNAME"] = "Linux"

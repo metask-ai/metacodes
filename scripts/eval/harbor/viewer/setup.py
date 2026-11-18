@@ -402,6 +402,11 @@ def step_docker_macos(s: Setup):
     wanted = ["docker", "docker-compose", "docker-buildx", "colima"]
     if settings["emulation"] == "qemu":
         wanted += ["qemu", "lima-additional-guestagents"]
+    if settings["emulation"] == "rosetta" and s.found("sysctl") and s.out("sysctl -n kern.hv_support 2>/dev/null") == "0":
+        # A macOS guest without nested virtualization (e.g. a cloud Mac VM)
+        # cannot start the vz VM Colima needs; fail before installing anything.
+        raise Failed("这台 Mac 本身是虚拟机，没有嵌套虚拟化（kern.hv_support=0），Colima 无法启动，"
+                     "本机不能运行 Docker。请在 workbench.json 的 executors 配置一台 Linux SSH 执行机器")
     installed = set(s.out("brew list --formula -1 2>/dev/null").split()) if brew else set()
     missing = [f for f in wanted if f not in installed]
     if missing and not brew:
