@@ -71,22 +71,55 @@ def html_fragment(view, utc_offset):
         if detail.get("log"):
             lines.append(block("本地日志 " + detail["log"]))
         evidence = "".join(lines)
-        summary = f'<time class="text-muted">{at}</time> <strong>{e(label)}</strong>'
+        summary = f'<time class="text-muted">{at}</time> <span>{e(label)}</span>'
         if not evidence:
             return "<li>" + summary + "</li>"
-        return f"<li><details><summary>{summary}</summary>{evidence}</details></li>"
+        return f'<li><details><summary class="cursor-interaction">{summary}</summary>{evidence}</details></li>'
 
     count = f'{view["agent_runs"]} 次调用 · {view["rounds"]} 轮修复'
-    rows = "\n".join(item(event) for event in reversed(view["events"]))
-    return f"""<section id="pr-timeline-{view['number']}" aria-label="PR 流程记录">
+    recent = view["events"][-10:]
+    earlier = view["events"][:-10]
+    rows = "\n".join(item(event) for event in reversed(recent))
+    history = ""
+    if earlier:
+        old_rows = "\n".join(item(event) for event in reversed(earlier))
+        history = f'<details><summary class="cursor-interaction">更早的记录（{len(earlier)}）</summary><ul>{old_rows}</ul></details>'
+    return f"""<section id="pr-timeline-{view['number']}" aria-label="PR 流程记录"
+ data-repo="{e(view['repo'])}" data-number="{view['number']}">
 <style>
 #pr-timeline-{view['number']} li {{ margin-block: .55rem; }}
 #pr-timeline-{view['number']} li p {{ margin: .4rem 0; overflow-wrap: anywhere; white-space: pre-wrap; }}
-#pr-timeline-{view['number']} summary {{ cursor: pointer; }}
 #pr-timeline-{view['number']} time {{ font-variant-numeric: tabular-nums; margin-right: .5rem; }}
+#pr-timeline-{view['number']} [hidden] {{ display: none; }}
 </style>
-<div><strong>{e(view['repo'])} #{view['number']}</strong> · {e(LABELS.get(view['state'], view['state']))}</div>
+<div>{e(view['repo'])} #{view['number']} · {e(LABELS.get(view['state'], view['state']))}</div>
 <div class="text-muted">{e(count)} · {e((view['head'] or '')[:8])}</div>
 <ul>{rows}</ul>
+{history}
+<button class="btn" type="button" data-refresh hidden>刷新 PR 时间线</button>
+<p data-refresh-status aria-live="polite"></p>
 </section>
+<script>
+(() => {{
+  const root = document.getElementById("pr-timeline-{view['number']}");
+  const button = root.querySelector("[data-refresh]");
+  const status = root.querySelector("[data-refresh-status]");
+  if (typeof window.openai?.sendFollowUpMessage !== "function") return;
+  button.hidden = false;
+  button.addEventListener("click", async () => {{
+    button.disabled = true;
+    status.textContent = "";
+    try {{
+      await window.openai.sendFollowUpMessage({{
+        title: "刷新 PR 时间线",
+        prompt: `在当前聊天中重新读取并展示 ${{root.dataset.repo}} #${{root.dataset.number}} 的 PR 时间线。`
+      }});
+    }} catch {{
+      status.textContent = "刷新请求未发送，请重试。";
+    }} finally {{
+      button.disabled = false;
+    }}
+  }});
+}})();
+</script>
 """

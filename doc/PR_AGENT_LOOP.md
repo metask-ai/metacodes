@@ -110,11 +110,11 @@ python3 .github/pr-loop.py timeline --pr "$PR_NUMBER" --format html
 The timeline stores the review report and reviewer ID, repair summary and
 worker ID, local validation result and log path, CI result, published
 revision, and merge outcome. Its JSON output includes a cursor for fetching
-only subsequent events with `--after`. Read it while the watcher is working and
-render a snapshot in the source chat when a contributor asks for progress.
-The watcher records events locally. Updating the contents of a desktop chat
-automatically requires a chat-side consumer. The timeline commands do not
-start or resume an App Server conversation.
+only subsequent events with `--after`. Render a snapshot in the source chat
+where its refresh button can request a new snapshot in that same conversation.
+The watcher records events locally. Automatically posting each event into a
+desktop chat requires a chat-side consumer. The timeline commands read state
+without starting or resuming an App Server conversation.
 
 Existing PR registrations acquire their dedicated worker on the next allowed
 repair. The upgrade preserves review history, checkpoints, decisions, and
