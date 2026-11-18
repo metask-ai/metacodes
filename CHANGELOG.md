@@ -523,6 +523,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **An OpenRouter catalog reads what OpenRouter's API answers today**
+  (`src/provider/openrouter.zig`). Fed the live documents of 2026-11-18,
+  three things failed: the whole `/models` listing was refused
+  (`MalformedPrice`), because OpenRouter prices its router models (such as
+  `openrouter/auto`) at `"-1"`, "whatever the model it picks costs" — now an
+  unknown price, while any other negative is still refused; an endpoint's
+  request named its display string ("Wafer | deepseek/…-20260910") as the
+  model, which no request can carry — now the model's own id; and two models
+  served by one upstream gave two channels one id (`DuplicateChannelId`), so
+  a catalog of more than one model never ingested — an endpoint's channel is
+  now named by its routing tag (`deepinfra/fp8` → `deepinfra-fp8`) and holds
+  every model it serves. The model bound grew from 512 (478 were listed) to
+  4096.
+
 - **`/login` names the providers it cannot list.** Its list holds twelve, and
   the ones past them were dropped without a word; `/login <id>` for one of
   them then showed the list without it. The list now ends with `N more not

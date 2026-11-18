@@ -219,7 +219,19 @@ pub const Host = struct {
                 if (endpoint.health.status == .unavailable) worst = .unavailable;
             }
             const built = try openrouter.buildChannels(scratch, model.*, endpoints.endpoints.items);
-            channels.appendSlice(scratch, built) catch return error.OutOfMemory;
+            // One channel per endpoint, across models: the endpoint a tag (or
+            // an upstream name) names serves every model it lists, and two
+            // channels with one id are not a profile the registry admits.
+            for (built) |channel| {
+                for (channels.items) |*existing| {
+                    if (!existing.id.eql(channel.id)) continue;
+                    const merged = try scratch.alloc(profile_mod.ModelEntry, existing.models.len + channel.models.len);
+                    @memcpy(merged[0..existing.models.len], existing.models);
+                    @memcpy(merged[existing.models.len..], channel.models);
+                    existing.models = merged;
+                    break;
+                } else channels.append(scratch, channel) catch return error.OutOfMemory;
+            }
         }
         if (channels.items.len == 0) return error.InvalidDocument;
 
@@ -1565,6 +1577,7 @@ test "built OpenRouter channels copy every string the parse results held" {
     };
     const endpoint = openrouter.Endpoint{
         .provider_name = try source.text("Alpha"),
+        .tag = try source.text("alpha/fp8"),
         .channel_id = Slug.lit("alpha"),
         .request_model_id = try source.text("x/y:fp8"),
         .context_length = null,
@@ -1599,6 +1612,41 @@ test "built OpenRouter channels copy every string the parse results held" {
     try std.testing.expectEqualStrings("high", control.allowed_values[1]);
     try std.testing.expectEqualStrings("slower", control.cost_latency_warning.?);
     try std.testing.expectEqualStrings("{\"x\":1}", control.extension_data.?);
+}
+
+test "two models served by one endpoint ingest as one channel holding both" {
+    // OpenRouter's endpoints are the same for every model they serve: Wafer's
+    // US endpoint serving two models is one channel with two models, not two
+    // channels with one id (which the registry refuses, failing the ingest).
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestOpenRouter(
+        Slug.lit("or-catalog"),
+        \\{"data": [{"id": "deepseek/deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash"},
+        \\          {"id": "moonshotai/kimi-k3", "name": "Kimi K3"}]}
+    ,
+        &.{
+            \\{"data": {"id": "deepseek/deepseek-v4.1-flash", "endpoints": [
+            \\  {"name": "Wafer | deepseek/deepseek-v4.1-flash-20260910", "provider_name": "Wafer", "tag": "wafer/us", "status": 0}]}}
+            ,
+            \\{"data": {"id": "moonshotai/kimi-k3", "endpoints": [
+            \\  {"name": "Wafer | moonshotai/kimi-k3", "provider_name": "Wafer", "tag": "wafer/us", "status": 0},
+            \\  {"name": "KT | moonshotai/kimi-k3", "provider_name": "KT", "tag": "kt", "status": 0}]}}
+        },
+    );
+    const profile = host.registry.find("or-catalog").?;
+    try std.testing.expectEqual(@as(usize, 2), profile.channels.len);
+    const wafer = profile.channel(Slug.lit("wafer-us")).?;
+    try std.testing.expectEqual(@as(usize, 2), wafer.models.len);
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("or-catalog")) continue;
+        seen += 1;
+        // The model, never the endpoint's display name.
+        try std.testing.expect(std.mem.indexOf(u8, item.request_model_id, "|") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
 }
 
 test "an ingest for one provider leaves another provider's ingested catalog intact" {

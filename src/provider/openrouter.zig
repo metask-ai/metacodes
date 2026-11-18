@@ -34,7 +34,9 @@ const controls_mod = @import("controls.zig");
 pub const Slug = ids.Slug;
 pub const RoutePolicy = selection_mod.RoutePolicy;
 
-pub const MAX_MODELS: usize = 512;
+/// The live listing had 478 models on 2026-11-18; the bound is for a hostile
+/// document, not a growing catalog (which `catalog_fetch` already caps at 8 MB).
+pub const MAX_MODELS: usize = 4096;
 pub const MAX_ENDPOINTS: usize = 64;
 
 pub const AdapterError = error{
@@ -121,10 +123,17 @@ pub fn parseModels(allocator: std.mem.Allocator, text: []const u8) AdapterError!
 pub const Endpoint = struct {
     /// Upstream provider name as OpenRouter reports it, e.g. "DeepInfra".
     provider_name: []const u8,
-    /// Slug derived from `provider_name`; it becomes the `ChannelId`.
+    /// The endpoint's routing slug (`provider[/variant][/region][/tier]`, e.g.
+    /// "deepinfra/fp8"), which a request names to reach exactly this
+    /// endpoint; null in a document that does not carry one.
+    tag: ?[]const u8,
+    /// Derived from `tag` when there is one, else from `provider_name`; it
+    /// becomes the `ChannelId`. The tag names the same endpoint for every
+    /// model it serves, so one channel holds them all.
     channel_id: Slug,
-    /// The exact string the request must carry. Often the canonical model id,
-    /// but a router may expose a different one.
+    /// The exact string the request must carry: the model's own id (or a
+    /// variant slug a document names), never the endpoint's display `name`
+    /// ("Wafer | deepseek/deepseek-v4.1-flash-20260910").
     request_model_id: []const u8,
     context_length: ?u32,
     max_output_tokens: ?u32,
@@ -170,7 +179,8 @@ pub fn parseEndpoints(allocator: std.mem.Allocator, text: []const u8) AdapterErr
     for (list_value.array.items) |item| {
         if (item != .object) return error.InvalidDocument;
         const provider_name = stringOf(item.object.get("provider_name")) orelse return error.InvalidDocument;
-        var channel_id = channelSlug(provider_name) catch return error.InvalidSlug;
+        const tag = stringOf(item.object.get("tag"));
+        var channel_id = channelSlug(tag orelse provider_name) catch return error.InvalidSlug;
         // Two endpoints from one upstream provider differ by quantization or
         // region; the slug has to stay unique or they would collapse into one
         // offer. The suffix search continues until the slug is actually free —
@@ -186,9 +196,11 @@ pub fn parseEndpoints(allocator: std.mem.Allocator, text: []const u8) AdapterErr
         const status = optionalF64(item.object.get("status"));
         try out.endpoints.append(allocator, .{
             .provider_name = try dupe(arena, provider_name),
+            .tag = try dupeOptional(arena, tag),
             .channel_id = channel_id,
-            .request_model_id = try dupe(arena, stringOf(item.object.get("model_variant_slug")) orelse
-                stringOf(item.object.get("name")) orelse out.canonical_model_id),
+            // `name` is a display string ("Wafer | deepseek/…-20260910"): a
+            // request carrying it names no model.
+            .request_model_id = try dupe(arena, stringOf(item.object.get("model_variant_slug")) orelse out.canonical_model_id),
             .context_length = optionalU32(item.object.get("context_length")),
             .max_output_tokens = optionalU32(item.object.get("max_completion_tokens")),
             .quote = try parsePricing(item.object.get("pricing")),
@@ -537,6 +549,10 @@ fn priceField(value: ?std.json.Value) AdapterError!?u64 {
         .null => return null,
         else => return error.MalformedPrice,
     };
+    // OpenRouter's router models (`openrouter/auto` and the like) price at
+    // whatever model they pick, and say so with -1: unknown, not free, and
+    // not a reason to refuse the whole listing. Any other negative is.
+    if (per_token == -1) return null;
     return try scaledMicros(per_token, 1_000_000.0 * 1_000_000.0);
 }
 
@@ -1088,4 +1104,61 @@ test "three endpoints from one provider get three distinct channels" {
             try testing.expect(!left.channel_id.eql(right.channel_id));
         }
     }
+}
+
+// Shapes OpenRouter's live API answered with on 2026-11-18, trimmed to the
+// fields these tests read.
+const LIVE_MODELS =
+    \\{"data": [
+    \\  {"id": "openrouter/auto", "name": "Auto Router", "context_length": 2000000,
+    \\   "pricing": {"prompt": "-1", "completion": "-1"},
+    \\   "supported_parameters": ["tools", "reasoning"],
+    \\   "endpoints": ["/api/v1/chat/completions", "/api/v1/messages"]},
+    \\  {"id": "deepseek/deepseek-v4.1-flash", "name": "DeepSeek: DeepSeek V4.1 Flash",
+    \\   "context_length": 1048576, "pricing": {"prompt": "0.0000001", "completion": "0.0000004"},
+    \\   "supported_parameters": ["tools"], "endpoints": ["/api/v1/chat/completions"]},
+    \\  {"id": "moonshotai/kimi-k3", "name": "MoonshotAI: Kimi K3",
+    \\   "pricing": {"prompt": "0.0000006", "completion": "0.0000025"},
+    \\   "supported_parameters": ["tools"], "endpoints": ["/api/v1/chat/completions"]}
+    \\]}
+;
+
+const LIVE_DEEPSEEK_ENDPOINTS =
+    \\{"data": {"id": "deepseek/deepseek-v4.1-flash", "endpoints": [
+    \\  {"name": "Wafer | deepseek/deepseek-v4.1-flash-20260910", "model_id": "deepseek/deepseek-v4.1-flash",
+    \\   "provider_name": "Wafer", "tag": "wafer/us", "quantization": "mxfp4", "status": 0},
+    \\  {"name": "InferenceNet | deepseek/deepseek-v4.1-flash-20260910", "model_id": "deepseek/deepseek-v4.1-flash",
+    \\   "provider_name": "InferenceNet", "tag": "inference-net/us", "quantization": "fp8", "status": 0},
+    \\  {"name": "InferenceNet | deepseek/deepseek-v4.1-flash-20260910", "model_id": "deepseek/deepseek-v4.1-flash",
+    \\   "provider_name": "InferenceNet", "tag": "inference-net/fp8", "quantization": "fp8", "status": 0}
+    \\]}}
+;
+
+test "the live listing parses: a router model's -1 price is unknown, not a reason to refuse the rest" {
+    const a = testing.allocator;
+    var models = try parseModels(a, LIVE_MODELS);
+    defer models.deinit();
+    try testing.expectEqual(@as(usize, 3), models.models.items.len);
+    try testing.expect(!models.find("openrouter/auto").?.quote.isKnown());
+    try testing.expect(models.find("deepseek/deepseek-v4.1-flash").?.quote.isKnown());
+    // Any other negative is still hostile.
+    try testing.expectError(error.MalformedPrice, parseModels(a,
+        \\{"data": [{"id": "x/y", "pricing": {"prompt": "-2"}}]}
+    ));
+}
+
+test "a live endpoint requests the model by its id, never by its display name, and its tag names its channel" {
+    const a = testing.allocator;
+    var endpoints = try parseEndpoints(a, LIVE_DEEPSEEK_ENDPOINTS);
+    defer endpoints.deinit();
+    try testing.expectEqual(@as(usize, 3), endpoints.endpoints.items.len);
+    for (endpoints.endpoints.items) |endpoint| {
+        try testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", endpoint.request_model_id);
+        try testing.expect(std.mem.indexOf(u8, endpoint.request_model_id, "|") == null);
+    }
+    // Two endpoints of one upstream are two channels, named by their tags.
+    try testing.expectEqualStrings("wafer-us", endpoints.endpoints.items[0].channel_id.slice());
+    try testing.expectEqualStrings("inference-net-us", endpoints.endpoints.items[1].channel_id.slice());
+    try testing.expectEqualStrings("inference-net-fp8", endpoints.endpoints.items[2].channel_id.slice());
+    try testing.expectEqualStrings("inference-net/fp8", endpoints.endpoints.items[2].tag.?);
 }
