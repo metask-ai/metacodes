@@ -345,12 +345,15 @@ a wait, and the Run's failure detail carries the wait as `retry_after_ms`.
 It is a subscription plan (`subscription_plan`, above): a `-p` or `serve`
 start on it says so once on stderr.
 
-The eight models are a static list. The backend lists what it serves at
+The ten models are a static list, GPT-6.2 Sol first: a start that names no
+model uses it. The backend lists what it serves at
 `/models?client_version=<version>`, filtered by each model's minimum client
-version; this client would send its own version, never the Codex CLI's, and
-may therefore see fewer models than the Codex CLI. Context windows are
-OpenCode's figures for ChatGPT-plan requests (272k; 500k from GPT-6.1 on), and
-quotes are `unknown`: the plan is a monthly fee.
+version; this client sends its own version, never the Codex CLI's, and on
+2026-11-18 that list was empty for 0.12.1. A model the list lacks still goes
+out under `--model <id>` or `/model use <id>`. Context windows are
+OpenCode's figures for ChatGPT-plan requests (272k; 500k from GPT-6.1 on);
+GPT-6.2's are the defaults OpenAI's model page gives for Codex (Sol 500k,
+Astra 272k). Quotes are `unknown`: the plan is a monthly fee.
 
 ## Credential pools
 

@@ -118,8 +118,14 @@ fn model(comptime request_model_id: []const u8, comptime display_name: []const u
     };
 }
 
-/// Plan appendix B (2026-11), newest first.
+/// Plan appendix B (2026-11), newest first. The first is what a start that
+/// names no model uses. GPT-6.2 (2026-11-18, OpenAI's model page): Sol "for
+/// everyday tasks", Astra "for demanding projects", each at its default
+/// context in Codex; Sol leads, as the page's example configuration and the
+/// Codex app's default do.
 const MODELS = [_]profile.ModelEntry{
+    model("gpt-6.2-sol", "GPT-6.2 Sol", WINDOW_500K),
+    model("gpt-6.2-astra", "GPT-6.2 Astra", WINDOW_272K),
     model("gpt-6.1-sol", "GPT-6.1 Sol", WINDOW_500K),
     model("gpt-6.1-terra", "GPT-6.1 Terra", WINDOW_500K),
     model("gpt-6-astra", "GPT-6 Astra", WINDOW_272K),
@@ -227,8 +233,15 @@ test "chatgpt-codex: a used-up plan and a plan without Codex are not retried" {
     try std.testing.expectEqual(profile.ErrorClass.auth_expired, classifyError(401, ""));
 }
 
+test "chatgpt-codex: GPT-6.2 Sol leads the list, so a start that names no model uses it" {
+    try std.testing.expectEqualStrings("gpt-6.2-sol", MODELS[0].request_model_id);
+    try std.testing.expectEqual(WINDOW_500K, MODELS[0].limits.context_window.?);
+    try std.testing.expectEqualStrings("gpt-6.2-astra", MODELS[1].request_model_id);
+    try std.testing.expectEqual(WINDOW_272K, MODELS[1].limits.context_window.?);
+}
+
 test "chatgpt-codex: every model is a Responses model with reasoning levels the neutral type carries" {
-    try std.testing.expectEqual(@as(usize, 8), MODELS.len);
+    try std.testing.expectEqual(@as(usize, 10), MODELS.len);
     for (MODELS) |entry| {
         const spec = controls.findSpec(entry.controls, "reasoning_effort").?;
         for (spec.allowed_values) |value| try std.testing.expect(@import("../../types.zig").ReasoningEffort.parse(value) != null);

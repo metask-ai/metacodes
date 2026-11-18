@@ -294,7 +294,8 @@ status, compatibility boundaries, and entry points are defined by
   out (`/logout chatgpt-codex`, `metacodes logout --provider chatgpt-codex`)
   revokes the refresh token at `auth.openai.com/oauth/revoke` first, bounded,
   then deletes the sign-in. It is a subscription plan: a `-p` or `serve`
-  start on it says so once. The eight models are a static list; the
+  start on it says so once. The ten models are a static list, GPT-6.2
+  Sol first (a start that names no model uses it); the
   device-code sign-in, the `x-codex-*` usage headers and zstd request bodies
   are not done.
 

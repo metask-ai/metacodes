@@ -832,7 +832,8 @@ test "L2 chatgpt-codex: -p signs in with the stored sign-in and sends the Codex 
     try testing.expectEqual(@as(i32, 0), out.exit_code);
     const turn = backend.lastRequest() orelse return error.NoRequestCaptured;
     try expectCodexRequest(turn, access);
-    try testing.expectEqualStrings("\"gpt-6.1-sol\"", turn.jsonField("model").?);
+    // No `--model`: the list's first, GPT-6.2 Sol.
+    try testing.expectEqualStrings("\"gpt-6.2-sol\"", turn.jsonField("model").?);
     try expectAbsent(out.stderr, access);
     try expectAbsent(out.stderr, "rt-cli");
     // A ChatGPT plan with nobody at the keyboard says so, once.
