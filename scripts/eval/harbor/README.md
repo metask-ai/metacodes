@@ -14,6 +14,8 @@ benchmark's pinned Harbor fork and its local proxy.
 | `smoke.py`, `smoke_provider.py`, `fixtures/smoke-task/` | zero-cost end-to-end smoke through the real `harbor run` |
 | `viewer/` | web workbench over Harbor job directories ([viewer/README.md](viewer/README.md)) |
 | `store/` | evaluation database (SQLite or PostgreSQL) the workbench syncs jobs into and reads from |
+| `suites/` | benchmark catalog (categories, harbor-registry / harbor-local / WorkBuddy suites) and the WorkBuddy runner |
+| `adapters/` | dataset adapters for harbor-local suites ([adapters/README.md](adapters/README.md)) |
 
 Contract tests: `scripts/eval/tests/test_harbor_adapter.py` (part of
 `zig build test:product`).

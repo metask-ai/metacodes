@@ -41,11 +41,12 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 
 | Category | Suite id | Runner | Harbor 0.26 source | Tasks (cap per launch) |
 |---|---|---|---|---|
-| 代码生成 | `humaneval` | harbor-local | adapter `humaneval` (not yet available) | per adapter (164) |
-| 基础编程 | `mbpp` | harbor-local | adapter `mbpp` (not yet available) | per adapter (200) |
-| 交互规划 | `alfworld` | harbor-local | adapter `alfworld` (not yet available) | per adapter (134) |
-| 问答 | `searchqa` | harbor-local | adapter `searchqa` (not yet available) | per adapter (200) |
-| 数学推理 | `livemath` | harbor-local | adapter `livemath` (not yet available) | per adapter (200) |
+| 代码生成 | `humaneval` | harbor-local | adapter `humaneval` (openai/human-eval, pinned) | 164 (164) |
+| 基础编程 | `mbpp` | harbor-local | adapter `mbpp` (full test split, pinned) | 500 (200) |
+| 基础编程 | `mbpp-sanitized` | harbor-local | adapter `mbpp_sanitized` (sanitized test split, pinned) | 257 (200) |
+| 交互规划 | `alfworld` | harbor-local | adapter `alfworld` (valid_unseen; sidecar linux/amd64 only) | 134 (134) |
+| 问答 | `searchqa` | harbor-local | adapter `searchqa` (pinned 200-question test subset) | 200 (200) |
+| 数学推理 | `livemath` | harbor-local | adapter `livemath` (LiveMathBench v202412 EN; gated, needs `HF_TOKEN` to prepare) | per prepared set (200) |
 | 竞赛数学 | `aime` | harbor-registry | `-d aime@1.0` | 60 (60) |
 | 竞赛数学 | `aime-2025` | harbor-registry | `-d aime@1.0`, 2025 I/II only | 30 (30) |
 | 终端工程 | `terminal-bench-2.1` | harbor-registry | `-d terminal-bench/terminal-bench-2-1` | 89 (89) |
@@ -75,6 +76,13 @@ by `METACODES_BENCH_HARBOR_SOURCE` (`uv` and the Hugging Face `datasets`
 package; the dataset is public), or register an existing directory with
 `metacodes bench --dataset gaia2-cli=<dir>`.
 
+The harbor-local adapters download pinned sources (verified by hash) into
+`<dataset>/.cache/` on `bench prepare --suite <id>` and write Harbor task
+directories beside it; see the
+[adapter README](../scripts/eval/harbor/adapters/README.md) for sources,
+graders and what only a Docker host can check. A suite's `arch` (from the
+adapter's `SUITE`) is listed in the catalog and on the page.
+
 ### Adding a harbor-local suite
 
 An adapter is `scripts/eval/harbor/adapters/<name>.py`, registered by an entry
@@ -82,8 +90,10 @@ in `ADAPTER_SUITES` (its id and category are authoritative) and listed in
 `scripts/bench_assets.zig` so the binary carries it. It exposes:
 
 ```python
+SUITE_ID = "humaneval"                                 # the catalog id
 SUITE = {"name": "HumanEval", "description": "…", "default_tasks": [...],
-         "max_tasks": 164, "max_concurrency": 8}       # all optional
+         "max_tasks": 164, "max_concurrency": 8, "arch": "amd64, arm64"}  # all optional
+HOST_ENV = ("OPENAI_API_KEY",)        # optional: verifier env, forwarded to SSH executors
 
 def prepare(dest: Path) -> Path:
     """Write Harbor task dirs (<dest>/<task-id>/task.toml, …); return the dataset dir."""
@@ -95,8 +105,11 @@ def tasks(dataset: Path) -> list[str]: # optional; default: dirs with task.toml
 Task ids must match `[A-Za-z0-9][A-Za-z0-9._-]*` (no glob characters).
 `metacodes bench prepare --suite <id>` calls `prepare` on the execution
 machine with `dest = <state root>/bench/datasets/<suite id>`; a returned
-directory elsewhere is recorded in `workbench.json` `datasets`. Until the
-module exists the page lists the suite as not yet available.
+directory elsewhere is recorded in `workbench.json` `datasets`. The suite id
+may differ from the module name (`mbpp-sanitized` is `mbpp_sanitized.py`);
+`ADAPTER_SUITES` names the module. Until the module exists the page lists the
+suite as not yet available. On an SSH executor only the task directories are
+shipped (dot entries such as `.cache/` stay on the workbench machine).
 
 ### WorkBuddy
 

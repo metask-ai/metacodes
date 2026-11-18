@@ -343,7 +343,8 @@ async function renderNewRun() {
         } }, '抽取')),
       h('button', { type: 'button', class: 'button', onclick: () => choose([]) }, '清空'),
       count);
-    taskBox.replaceChildren(h('legend', { text: `任务 · ${s.name}` }), h('p', { class: 'muted', text: s.description }), tools, list,
+    taskBox.replaceChildren(h('legend', { text: `任务 · ${s.name}` }), h('p', { class: 'muted', text: s.description }),
+      s.arch ? h('p', { class: 'muted', text: '容器架构：' + s.arch }) : null, tools, list,
       h('small', { class: 'muted', text: `每次 1–${s.max_tasks} 道；任务名必须属于该评测集。` }));
     drawList();
   }

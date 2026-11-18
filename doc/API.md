@@ -37,7 +37,9 @@ surfaces built over the same core protocols.
 ## Provider selection surface
 
 The `metacodes bench` CLI starts/opens a Bench workbench, inspects jobs and
-launches Harbor trials. Its command, JSON output, HTTP launch contract and
+launches Harbor trials. Its command, JSON output, HTTP launch contract
+(`suite` and `executor` in `POST /api/runs`, `GET /api/suite`,
+`/api/setup` and `/api/login`), `bench setup`, `bench prepare` and
 the `bench db` evaluation-database commands are documented in
 [Bench workbench](BENCH_WORKBENCH.md). This adds a CLI surface;
 AgentCore ABI and SDK layouts are unchanged.

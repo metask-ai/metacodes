@@ -39,6 +39,9 @@ request metrics through the host streaming relay.
 `runner.py` validates selections, and `worker.py` owns one durable execution
 and ingests its job. HTTP launch/cancel routes require the workbench
 capability. The benchmark catalog (suites, categories, adapters, WorkBuddy
-runner) is `scripts/eval/harbor/suites/`. Contract tests are
+runner) is `scripts/eval/harbor/suites/`. `executors.py` (this machine or
+SSH hosts), `remote.py` (the driver on an SSH host) and `setup.py`
+(`bench setup`, page sign-in) let a launch run on any configured executor
+through the same worker. Contract tests are
 `scripts/eval/tests/test_harbor_viewer.py`, `test_bench_workbench.py`,
-`test_bench_store.py` and `test_bench_suites.py`.
+`test_bench_store.py`, `test_bench_suites.py` and `test_bench_setup.py`.

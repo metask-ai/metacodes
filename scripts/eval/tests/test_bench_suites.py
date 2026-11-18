@@ -78,6 +78,50 @@ def fake_adapter(module_name, tasks, **suite):
     return module
 
 
+ADAPTER_IDS = ("humaneval", "mbpp", "mbpp-sanitized", "alfworld", "searchqa", "livemath")
+
+
+@contextlib.contextmanager
+def offline_adapter_sources(tmp):
+    """The real adapters' prepare(), fed the checked-in fixtures instead of
+    their pinned downloads (no network): every pin resolves to a fixture."""
+    import gzip
+    import zipfile
+    from scripts.eval.harbor.adapters import _common as c
+    from scripts.eval.harbor.adapters import alfworld, humaneval, livemath, mbpp, mbpp_sanitized, searchqa
+    from scripts.eval.tests.test_harbor_dataset_adapters import FIXTURES, searchqa_zip
+
+    tmp = Path(tmp)
+    tmp.mkdir(parents=True, exist_ok=True)
+    he = tmp / humaneval.PIN.name
+    with gzip.open(he, "wb") as handle:
+        handle.write((FIXTURES / "humaneval.sample.jsonl").read_bytes())
+    games = json.loads((FIXTURES / "alfworld.sample.json").read_text())["games"]
+    archive = tmp / alfworld.PIN.name
+    with zipfile.ZipFile(archive, "w") as zf:
+        for name, body in games.items():
+            zf.writestr(name, json.dumps(body))
+    sources = {humaneval.PIN.name: he, mbpp.PIN.name: FIXTURES / "mbpp.sample.jsonl",
+               mbpp_sanitized.PIN.name: FIXTURES / "sanitized-mbpp.sample.json", alfworld.PIN.name: archive}
+    sets = json.loads((FIXTURES / "livemath.sample.json").read_text())
+    for name, _, _ in livemath.SETS:
+        path = tmp / f"{name}_en.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in sets[name]))
+        sources[path.name] = path
+    qa = tmp / "searchqa-test.zip"
+    searchqa_zip(qa)
+    remote = c.RemoteZip(c.FileRangeSource(qa))
+    digest = searchqa.subset_digest(searchqa.select_subset(remote, 3, None))
+
+    def fetch(pin, cache):
+        return sources[pin.name]
+
+    with patch.object(c, "fetch", fetch), patch.object(searchqa, "SUBSET_SIZE", 3), \
+            patch.object(searchqa, "SUBSET_SHA256", digest), \
+            patch.object(c, "HttpRangeSource", lambda url, size: c.FileRangeSource(qa)):
+        yield
+
+
 class CatalogTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -122,10 +166,26 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(len(suites.validate_tasks(suites.get("aime"), self.ctx, list(suites.get("aime").tasks))), 60)
 
     def test_missing_adapter_is_listed_as_not_yet_available(self):
-        entry = suites.public(suites.get("humaneval"), self.ctx)
+        # Every catalogued adapter exists now; a missing module still lists.
+        with patch.dict(sys.modules, {"scripts.eval.harbor.adapters.humaneval": None}):
+            entry = suites.public(suites.get("humaneval"), self.ctx)
         self.assertFalse(entry["ready"] or entry["available"])
         self.assertIn("adapters/humaneval.py", entry["reasons"][0])
         self.assertIsNone(entry["task_count"])
+
+    def test_every_adapter_suite_maps_to_its_module(self):
+        harbor_local = [s for s in suites.ALL if s.runner == suites.HARBOR_LOCAL]
+        self.assertEqual({s.id for s in harbor_local}, set(ADAPTER_IDS) | {"gaia2-cli"})
+        for suite in harbor_local:
+            module = suites.adapter_module(suite)
+            self.assertIsNotNone(module, suite.id)
+            # The hyphenated id names the underscored module (mbpp-sanitized).
+            self.assertEqual(getattr(module, "SUITE_ID", suite.id), suite.id)
+            self.assertEqual(suites.get(suite.id).category, suite.category)
+        self.assertEqual(suites.get("mbpp-sanitized").category, suites.get("mbpp").category)
+        alfworld = suites.public(suites.get("alfworld"), self.ctx)
+        self.assertIn("amd64", alfworld["arch"])
+        self.assertTrue(alfworld["available"])
 
     def test_registered_adapter_prepares_and_lists_local_tasks(self):
         adapter = fake_adapter("humaneval", ["humaneval-0", "humaneval-1", "bad name"],
@@ -299,7 +359,7 @@ class SuiteLaunchTest(unittest.TestCase):
         by_id = {s["id"]: s for s in catalog["suites"]}
         self.assertTrue(by_id["aime-2025"]["ready"])
         self.assertEqual(by_id["aime-2025"]["task_count"], 30)
-        self.assertFalse(by_id["mbpp"]["available"])
+        self.assertTrue(by_id["mbpp"]["available"] and not by_id["mbpp"]["ready"])  # not prepared yet
         self.assertTrue(catalog["ready"])  # the default suite, as before
         tasks = self.client.request("api/suite?id=terminal-bench-2.0")
         self.assertEqual(len(tasks["tasks"]), 89)
@@ -354,6 +414,39 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("-p") + 1], prepared["dataset"])
         self.assertNotIn("-d", argv)
         self.assertEqual(self.filters(argv), ["humaneval-7"])
+
+    def test_each_adapter_suite_is_ready_after_prepare_and_runs_its_local_dataset(self):
+        state = self.root / "state"
+        catalog = self.client.request("api/workbench")
+        before = {s["id"]: s for s in catalog["suites"]}
+        with offline_adapter_sources(self.root / "sources"):
+            for suite_id in ADAPTER_IDS:
+                with self.subTest(suite=suite_id):
+                    self.assertFalse(before[suite_id]["ready"])
+                    with contextlib.redirect_stdout(io.StringIO()) as out:
+                        code = cli.main(["prepare", "--state-root", str(state), "--suite", suite_id, "--json"])
+                    self.assertEqual(code, 0)
+                    prepared = json.loads(out.getvalue())
+                    self.assertGreater(prepared["task_count"], 0)
+                    cfg = json.loads(self.manager.config_path.read_text())
+                    cfg.setdefault("datasets", {})[suite_id] = prepared["dataset"]
+                    atomic_json(self.manager.config_path, cfg)
+        catalog = self.client.request("api/workbench")
+        by_id = {s["id"]: s for s in catalog["suites"]}
+        for suite_id in ADAPTER_IDS:
+            with self.subTest(suite=suite_id):
+                entry = by_id[suite_id]
+                self.assertTrue(entry["ready"], entry["reasons"])
+                listing = self.client.request("api/suite?id=" + suite_id)
+                self.assertEqual(len(listing["tasks"]), entry["task_count"])
+                task = listing["tasks"][-1]
+                run, argv = self.launch(suite=suite_id, tasks=[task])
+                dataset = state.resolve() / "bench" / "datasets" / suite_id
+                self.assertEqual(argv[argv.index("-p") + 1], str(dataset))
+                self.assertNotIn("-d", argv)
+                self.assertEqual(self.filters(argv), [task])
+                self.assertTrue((dataset / task / "task.toml").is_file())
+                self.assertEqual(run["suite"], suite_id)
 
     def test_cli_runs_a_suite_with_its_default_sample(self):
         with patch.dict(os.environ, {"METACODES_BENCH_TOKEN": "cap"}):

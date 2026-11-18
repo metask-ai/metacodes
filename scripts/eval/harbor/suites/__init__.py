@@ -146,6 +146,9 @@ class Suite:
     # workbench can launch it (judged subsets need a judge budget).
     subset: str = ""
     notes: Tuple[str, ...] = field(default_factory=tuple)
+    # harbor-local: container architectures the adapter's tasks support
+    # (SUITE["arch"]), shown on the page; ALFWorld's sidecar is amd64 only.
+    arch: str = ""
 
 
 SUITES: Tuple[Suite, ...] = (
@@ -173,8 +176,10 @@ SUITES: Tuple[Suite, ...] = (
 ADAPTER_SUITES: Tuple[Suite, ...] = (
     Suite("humaneval", "code-generation", "HumanEval", "根据函数描述写出实现，通过单元测试",
           HARBOR_LOCAL, adapter="humaneval", max_tasks=164, max_concurrency=8),
-    Suite("mbpp", "basic-programming", "MBPP", "MBPP / MBPP-sanitized Python 编程任务",
+    Suite("mbpp", "basic-programming", "MBPP", "MBPP full 测试集 500 道 Python 编程任务",
           HARBOR_LOCAL, adapter="mbpp", max_tasks=MAX_TASKS, max_concurrency=8),
+    Suite("mbpp-sanitized", "basic-programming", "MBPP sanitized", "MBPP sanitized 测试集 257 道人工校对的 Python 编程任务",
+          HARBOR_LOCAL, adapter="mbpp_sanitized", max_tasks=MAX_TASKS, max_concurrency=8),
     Suite("alfworld", "interactive-planning", "ALFWorld", "多步骤家庭任务的规划与执行",
           HARBOR_LOCAL, adapter="alfworld", max_tasks=134),
     Suite("searchqa", "question-answering", "SearchQA", "根据检索到的段落回答问题",
@@ -259,7 +264,7 @@ def resolved(suite: Suite) -> Suite:
         return suite
     module = adapter_module(suite)
     meta = getattr(module, "SUITE", None) or {}
-    allowed = {"name", "description", "default_tasks", "max_tasks", "max_concurrency"}
+    allowed = {"name", "description", "default_tasks", "max_tasks", "max_concurrency", "arch"}
     changes = {k: v for k, v in meta.items() if k in allowed}
     if "default_tasks" in changes:
         changes["default_tasks"] = tuple(changes["default_tasks"])
@@ -267,6 +272,8 @@ def resolved(suite: Suite) -> Suite:
         limit = MAX_TASKS if key == "max_tasks" else MAX_CONCURRENCY
         if key in changes and not (type(changes[key]) is int and 1 <= changes[key] <= limit):
             changes.pop(key)
+    if not isinstance(changes.get("arch", ""), str):
+        changes.pop("arch")
     return replace(suite, **changes)
 
 
@@ -388,7 +395,7 @@ def public(suite: Suite, ctx: Context, common_reasons=()) -> dict:
             "description": suite.description, "runner": suite.runner,
             "dataset": suite.dataset or None, "task_count": count,
             "default_tasks": list(suite.default_tasks), "max_tasks": suite.max_tasks,
-            "max_concurrency": suite.max_concurrency,
+            "max_concurrency": suite.max_concurrency, "arch": suite.arch or None,
             "available": suite.runner != HARBOR_LOCAL or adapter_module(suite) is not None,
             "ready": not reasons, "reasons": reasons}
 

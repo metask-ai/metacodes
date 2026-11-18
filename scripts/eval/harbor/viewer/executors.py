@@ -462,7 +462,9 @@ def ship_dataset(executor: SshExecutor, dataset: Path, log=print, **kwargs) -> s
     dataset = Path(dataset)
     if not dataset.is_dir():
         raise ValueError("本地数据集目录不存在：" + str(dataset))
-    names = tree_files(dataset)
+    # Adapters keep their download cache in <dataset>/.cache/ (Harbor and the
+    # catalog skip it); only the generated task directories travel.
+    names = [n for n in tree_files(dataset) if not n.split("/", 1)[0].startswith(".")]
     destination = executor.remote("datasets", tree_digest(dataset, names))
     ship(executor, dataset, names, destination, log=log, **kwargs)
     return destination

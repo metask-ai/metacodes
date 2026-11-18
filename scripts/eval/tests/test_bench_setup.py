@@ -671,6 +671,45 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertEqual(spec["forward_env"], ["FAKE_JUDGE_KEY"])
         self.assertEqual(spec["local_dataset"], str(dataset.resolve()))
 
+    def test_real_adapter_suites_ship_their_tasks_but_not_the_download_cache(self):
+        from scripts.eval.harbor.viewer.runner import settings
+        from scripts.eval.tests.test_bench_suites import ADAPTER_IDS, offline_adapter_sources
+
+        manager, client, _ = self.prepare_remote()
+        os.environ["FAKE_EXPECT_ACCOUNT_KEY"] = "session-access"
+        prepared = {}
+        with offline_adapter_sources(self.root / "sources"):
+            for suite_id in ADAPTER_IDS:
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(cli.main(["prepare", "--state-root", str(self.state), "--suite", suite_id,
+                                               "--json"]), 0)
+                prepared[suite_id] = Path(json.loads(out.getvalue())["dataset"])
+        cfg = settings(self.config)
+        cfg["datasets"] = {k: str(v) for k, v in prepared.items()}
+        atomic_json(self.config, cfg)
+        remote_root = (self.remote_home / ".metacodes-bench").resolve()
+        by_id = {s["id"]: s for s in client.request("api/workbench")["suites"]}
+        for suite_id, dataset in prepared.items():
+            with self.subTest(suite=suite_id):
+                self.assertTrue(by_id[suite_id]["executors"]["relay-4090"]["ready"],
+                                by_id[suite_id]["executors"]["relay-4090"])
+                # prepare() keeps downloads in <dataset>/.cache/; they stay local.
+                (dataset / ".cache").mkdir(exist_ok=True)
+                (dataset / ".cache" / "download.bin").write_bytes(b"x" * 1024)
+                task = client.request("api/suite?id=" + suite_id)["tasks"][0]
+                run = client.request("api/runs", {"suite": suite_id, "model": "metask/session-model",
+                                                  "tasks": [task], "executor": "relay-4090"})
+                final = wait_run(manager, run["name"])
+                self.assertEqual(final["status"], "finished", data.tail(manager.records / (run["name"] + ".log")))
+                argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
+                shipped = Path(argv[argv.index("-p") + 1])
+                self.assertEqual(shipped.parent, remote_root / "datasets")
+                self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-i"], [task])
+                self.assertTrue((shipped / task / "task.toml").is_file())
+                self.assertFalse((shipped / ".cache").exists())
+                self.assertEqual(sorted(p.name for p in shipped.iterdir() if not p.name.startswith(".")),
+                                 sorted(p.name for p in dataset.iterdir() if not p.name.startswith(".")))
+
     def test_harbor_local_suite_without_a_local_dataset_is_not_ready_anywhere(self):
         manager, client, _ = self.prepare_remote()
         self.harbor_local_suite()
