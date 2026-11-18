@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 28 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 29 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 28 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 29 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 28u
+#define METASK_AGENTCORE_ABI_REVISION 29u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -518,7 +518,9 @@ typedef struct {
      * TeamDelete / SendMessage / SpawnTeammate) into the catalog so a team
      * Session can select them. Teams are opt-in; zero keeps them out. */
     uint64_t enable_teams;
-    uint64_t reserved[3];
+    /* Revision 29: 0 disables preview features; 1 explicitly opts in. */
+    uint64_t preview;
+    uint64_t reserved[2];
 } metask_agentcore_runtime_config_v1;
 
 /* Explicit executable authority. root is an absolute package directory with
@@ -1105,7 +1107,7 @@ typedef uint32_t (*metask_agentcore_team_poll_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 28. No earlier revision layout
+/* Function-table order is fixed within Revision 29. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -1331,8 +1333,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 28u,
-                               "AgentCore revision 28");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 29u,
+                               "AgentCore revision 29");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1421,6 +1423,8 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, configuration_fin
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, mcp_servers, 40);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, mcp_catalog_limits, 56);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, enable_teams, 64);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, preview, 72);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, reserved, 80);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_process_plugin_source_v1, root, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_plugin_config_v1, process_plugins, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_plugin_config_v1, host_stream_tools, 24);

@@ -428,8 +428,10 @@ pub const App = struct {
     /// The provider `<state root>/.env` configures, which `/logout` falls
     /// back to (#485). Borrowed from the host; null when it configures none.
     local_provider: ?LocalProvider = null,
-    /// Said once under the banner (#485: a stored default passed over for
-    /// want of a credential). Borrowed from the host.
+    /// Said once under the banner, one notice per line: a stored default
+    /// passed over for want of a credential (#485), `.env`'s provider ranked
+    /// below Metask, `.env` keys of several providers and none chosen (#486).
+    /// Borrowed from the host.
     startup_notice: ?[]const u8 = null,
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
@@ -756,13 +758,22 @@ pub const App = struct {
     ) !*App {
         const app = try allocator.create(App);
         errdefer allocator.destroy(app);
+        var active_config = config;
+        if (active_config.preview == .inherit) {
+            const saved = if (config.state_root.len > 0)
+                try @import("app/config.zig").loadFromHome(allocator, config.state_root)
+            else
+                @import("app/config.zig").FileConfig{};
+            defer saved.deinit(allocator);
+            active_config.preview = active_config.preview.resolve(saved.preview);
+        }
 
         // 顺序：先把 conversation/skills/jobs/tasks/abort 等"空壳"放好,
         // 然后注册动态工具（Skill 需要 &app.skills 指针）,
         // 最后 toToolDefinitionsWithDyn 一次性构造给 API 的 tool 清单。
         app.* = .{
             .allocator = allocator,
-            .config = config,
+            .config = active_config,
             .api_key = api_key,
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
             .model_picker = model_picker_mod.Picker.init(allocator),
@@ -1157,6 +1168,7 @@ pub const App = struct {
         // 构造参数 + home。api_key/base_url/model 借 App 生命周期稳定内存(App 存活期不变)。
         app.swarm = .{
             .allocator = allocator,
+            .preview = app.config.preview.isEnabled(),
             .session = app.session_id,
             .state_root = app.stateRoot(),
             .api_key = app.api_key,
@@ -1340,9 +1352,33 @@ pub const App = struct {
             .template = template,
             .guide_url = state_env.guide_url,
             .environment_keys = keys,
-            .unchosen_local = app.unchosen_local_providers,
-            .provider_variable = state_env.provider_variable,
+            .unchosen_local = if (host) |found| try displayNames(arena, found, app.unchosen_local_providers) else app.unchosen_local_providers,
         });
+    }
+
+    /// After `/login <provider>` stored a key: the line naming a key variable
+    /// for that provider which is read before the stored key (the shell's,
+    /// else this install's `.env`), written into `buffer`; null when none is
+    /// set. Names only, never a value.
+    pub fn storedKeyShadowNotice(app: *const App, profile: *const @import("provider/profile.zig").ProviderProfile, buffer: []u8) ?[]const u8 {
+        const provider_login = @import("api/provider_login.zig");
+        const shadow = provider_login.keyShadowedBy(profile, provider_credential_mod.EnvLookup.process(), app.config.credential_env_fallback) orelse return null;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = app.stateRoot();
+        const env_path = if (root.len == 0) ".env" else std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{ root, std.fs.path.sep, @import("app/state_env.zig").file_name }) catch ".env";
+        var w: std.Io.Writer = .fixed(buffer);
+        provider_login.writeKeyShadowNotice(&w, shadow, env_path) catch return null;
+        return w.buffered();
+    }
+
+    /// `ids` as `/model` lists them: each provider's display name, the id
+    /// itself for one the registry does not know. In `arena`.
+    fn displayNames(arena: std.mem.Allocator, host: *provider_host_mod.Host, ids: []const []const u8) ![]const []const u8 {
+        const names = try arena.alloc([]const u8, ids.len);
+        for (ids, names) |id, *name| {
+            name.* = if (host.registry.find(id)) |profile| profile.display_name else id;
+        }
+        return names;
     }
 
     /// The provider `id` as the reminder names it: its display name, the
@@ -1561,6 +1597,8 @@ pub const App = struct {
         /// Why the stored default could not be forgotten: the next start
         /// may still use it.
         default_error: ?anyerror = null,
+        /// What revoking the Metask session the sign-in replaced did (#560).
+        replaced: metask_oauth_mod.ReplacedOutcome = .nothing_replaced,
     };
 
     /// `/login`, once `auth.json` holds the sign-in: move this session onto
@@ -1698,9 +1736,10 @@ pub const App = struct {
 
     /// `/login`'s durable and live sign-in as one transaction (#527). A
     /// failure before or during the route switch restores the previous
-    /// session and `auth.json`; the default is forgotten only after the
-    /// switch commits. Thus the current process and the next start never
-    /// disagree about which login the previous route should use.
+    /// session and `auth.json`; the default is forgotten, and the previous
+    /// session revoked at Metask (#560), only after the switch commits. Thus
+    /// the current process and the next start never disagree about which
+    /// login the previous route should use.
     pub fn applyMetaskSession(
         app: *App,
         sign_in: MetaskSession,
@@ -1767,6 +1806,11 @@ pub const App = struct {
         } else |err| {
             applied.default_error = err;
         }
+        // Stored and bound: the session the snapshot holds, which a rollback
+        // would have put back, is revoked at Metask now (#560), bounded as
+        // `/logout`. Left alone it would stay valid there, with nothing
+        // here that could end it.
+        applied.replaced = metask_oauth_mod.revokeReplaced(app.allocator, snapshot.contents, token_json, metask_oauth_mod.siteUrl(), 3000);
         return applied;
     }
 
@@ -1983,6 +2027,47 @@ pub const App = struct {
             }
         }
         return result;
+    }
+
+    /// `/login <provider>` stored a key or a sign-in (#566): a session running
+    /// on that provider moves onto it, on the same route (model, channel,
+    /// scope). A commit takes its credential once (`bindCommittedSelection`),
+    /// so the session kept sending the replaced one until `/model` committed
+    /// again. The route is bound again the way `/model` binds it; the selection
+    /// itself does not change, so it is neither validated nor stored again. A
+    /// session on another provider, or on no route, is left as it is. True
+    /// when the session moved; a binding that fails is logged and leaves the
+    /// previous one in force.
+    pub fn adoptProviderLogin(app: *App, provider_id: provider_ids_mod.Slug) bool {
+        // Metask's sign-in moves the session itself (`applyMetaskSession`),
+        // onto the gateway the new session names.
+        if (provider_id.eqlText("metask")) return false;
+        // The process holds one OAuth session (single flight), which read its
+        // tokens before this sign-in stored new ones. It goes, so the next
+        // token request (the binding below, a turn's refresh, a later
+        // `/model`) loads the login just stored, not the one it replaced.
+        if (app.oauth_session_provider) |id| if (id.eql(provider_id)) {
+            if (app.oauth_session) |*held| held.deinit();
+            app.oauth_session = null;
+            app.oauth_session_provider = null;
+        };
+        const host = app.providerHost() catch return false;
+        const selection = host.kernel.effectiveSelection() orelse return false;
+        const resolution = provider_selection_mod.resolve(host.kernel.catalogSnapshot(), selection) catch return false;
+        const offer = resolution.primary();
+        if (!offer.provider_id.eql(provider_id)) return false;
+        // Only the route the session runs on. The kernel can name another: a
+        // stored default passed over at the start for want of a credential
+        // (the session went on Metask), or the offer of a `--base-url` start,
+        // which runs at another endpoint. Binding that would move the session
+        // to another provider or endpoint, which a login must not do.
+        if (!std.mem.eql(u8, offer.endpoint_ref, app.config.base_url orelse "") or
+            !std.mem.eql(u8, offer.request_model_id, app.activeModel())) return false;
+        app.bindCommittedSelection(host, selection) catch |err| {
+            @import("util/log.zig").warn("provider", "/login {s}: the session keeps its previous credential ({s})", .{ provider_id.slice(), @errorName(err) });
+            return false;
+        };
+        return true;
     }
 
     /// Drop the Metask material this process holds, for `/logout`: the
@@ -2682,8 +2767,6 @@ pub const App = struct {
         current: ?provider_control_plane.OfferId = null,
         /// Per offer of `page`: a commit could bind it now (#488).
         ready: std.ArrayList(bool) = .empty,
-        /// Where each provider with no ready offer gets its credential.
-        setups: std.ArrayList(model_picker_mod.Setup) = .empty,
         /// What each provider with a ready offer says in its heading: its
         /// name, and where the credential a commit would use comes from.
         notes: std.ArrayList(model_picker_mod.ProviderNote) = .empty,
@@ -2691,7 +2774,6 @@ pub const App = struct {
         pub fn deinit(listing: *ModelListing, allocator: std.mem.Allocator) void {
             listing.page.deinit(allocator);
             listing.ready.deinit(allocator);
-            listing.setups.deinit(allocator);
             listing.notes.deinit(allocator);
         }
     };
@@ -2712,16 +2794,16 @@ pub const App = struct {
     pub fn adoptModelListing(app: *App, listing: *const ModelListing) !void {
         const listed = listing.listed orelse return app.model_picker.markFailed();
         try app.model_picker.adopt(listed, listing.current);
-        try app.model_picker.setReadiness(listing.ready.items, listing.setups.items, listing.notes.items);
+        try app.model_picker.setReadiness(listing.ready.items, listing.notes.items);
     }
 
     /// Which offers of `listing` a commit could bind now (#488): for each, the
     /// binding `bindCommittedSelection` runs, from the same credential
     /// material (`credentialSources`), without a request. The one difference
     /// is the OAuth token a commit refreshes first: here a stored login
-    /// stands for it (`oauthLoginStored`). Every provider none of whose
-    /// offers is ready gets its setup. Reads files (the pool's config.json,
-    /// stored keys and logins), once per provider.
+    /// stands for it (`oauthLoginStored`). The picker does not list a
+    /// provider none of whose offers is ready. Reads files (the pool's
+    /// config.json, stored keys and logins), once per provider.
     fn judgeReadiness(app: *App, host: *provider_host_mod.Host, listing: *ModelListing) !void {
         const offers = listing.page.items;
         try listing.ready.resize(app.allocator, offers.len);
@@ -2752,11 +2834,11 @@ pub const App = struct {
                 if (!candidate.provider_id.eql(provider_id)) continue;
                 const offer = snapshot.find(candidate.offer_id) orelse continue;
                 var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
-                // Only a missing credential makes a route not configured. Any
+                // Only a missing credential takes a route off the list. Any
                 // other refusal (two names of its key that disagree, a kind
                 // the provider does not take, a wire it cannot drive) is not
-                // cured by setting the variable the setup would name, so the
-                // route stays listed and a commit reports why, as before.
+                // cured by setting its key, so the route stays listed and a
+                // commit reports why, as before.
                 if (provider_binding_mod.bindOffer(&host.registry, offer, sources, &reference_buffer, false)) |binding| {
                     // The first route that binds says where the provider's
                     // credential comes from, for its heading in the picker.
@@ -2768,18 +2850,16 @@ pub const App = struct {
                 listing.ready.items[index] = true;
                 any_ready = true;
             }
-            if (!any_ready) {
-                try listing.setups.append(app.allocator, providerSetup(host, provider_id));
-            } else {
+            if (any_ready) {
                 const name = if (profile) |built| built.display_name else provider_id.slice();
                 try listing.notes.append(app.allocator, model_picker_mod.ProviderNote.init(provider_id, name, origin));
             }
         }
     }
 
-    /// Where `provider` gets its credential, for the picker's setup (#488):
-    /// the variable its key is read from (the canonical alias, else the
-    /// first), and, for Metask, `/login`.
+    /// Where `provider` gets its credential, for the setup the picker shows
+    /// when a commit finds none (#483, #488): the variable its key is read
+    /// from (the canonical alias, else the first), and, for Metask, `/login`.
     pub fn providerSetup(host: *provider_host_mod.Host, provider_id: provider_ids_mod.Slug) model_picker_mod.Setup {
         const profile = host.registry.findById(provider_id) orelse return .{ .provider = provider_id };
         const variable: ?[]const u8 = for (profile.env_aliases) |alias| {
@@ -5201,6 +5281,7 @@ pub const App = struct {
         // `--agent-teams` would leave them out of "Using your tools").
         const defs_allocator = app.tool_defs_arena.allocator();
         const probe_ctx = tools_mod.PromptContext{
+            .preview = app.config.preview.isEnabled(),
             .agent_teams = app.config.agent_teams,
             .tinykg_enabled = app.config.long_horizon_arm.usesTinyKg(),
         };
@@ -5209,6 +5290,7 @@ pub const App = struct {
         for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
 
         const prompt_ctx = tools_mod.PromptContext{
+            .preview = app.config.preview.isEnabled(),
             .permission_mode = app.config.permission_mode,
             .enabled_tool_names = enabled_names,
             .agent_type = "", // 主对话

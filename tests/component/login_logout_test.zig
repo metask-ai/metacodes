@@ -15,11 +15,18 @@
 //!   again; with no `.env` provider the session is unbound and nothing is
 //!   sent at all;
 //! - `forgetProviderKey` (`/logout <provider>`) removes the stored key and
-//!   leaves a session that ran on it without a credential.
+//!   leaves a session that ran on it without a credential;
+//! - `adoptProviderLogin` (`/login <provider>` once it stored a key or a
+//!   sign-in, #566) moves a session running on that provider onto it, on the
+//!   same route, and leaves any other session where it is;
+//! - `applyMetaskSession` (`/login`) revokes the session it replaced, once
+//!   the new one is stored and bound, and never when it fails (#560).
 //!
 //! Through the real CLI (`METACODES_TEST_CLI_BIN`):
 //! - `metacodes logout` removes both sign-ins and a Metask default, says
 //!   which, and the next start falls back to `.env` instead of failing;
+//! - `metacodes login --provider metask` revokes the session it replaced
+//!   (#560);
 //! - a plain start with only the Metask session signs in with it, at the
 //!   gateway it names (#499, #527);
 //! - a stored default whose provider has no key is passed over with one
@@ -575,6 +582,232 @@ test "a second /login's first request carries its own token to its own gateway, 
     try testing.expectEqual(@as(usize, 1), first.requestCount());
 }
 
+// ── a sign-in revokes the session it replaced (#560) ────────────────────────
+
+/// A third Metask session's access token.
+const THIRD_SESSION_TOKEN = "at-metask-session-three";
+
+/// The fake site's answer to a device-code request: the code is confirmed
+/// at once, so the first poll gets the token response.
+const DEVICE_GRANT = "{\"device_code\":\"dev-560\",\"user_code\":\"CODE-560\",\"verification_uri\":\"http://127.0.0.1:9/device\",\"expires_in\":60,\"interval\":1}";
+
+const ReplacedOutcome = cc.api_metask_oauth.ReplacedOutcome;
+
+/// The refresh token of the Metask session stored now.
+fn storedRefreshToken(case: *Case) ![]const u8 {
+    var session = try cc.provider_oauth.Session.initHome(testing.allocator, case.state, cc.provider_ids.Slug.lit("metask"));
+    defer session.deinit();
+    if (!try session.load()) return error.NoSessionStored;
+    return case.arena().dupe(u8, session.tokens.?.refresh_token);
+}
+
+/// How many requests `server` received whose request line starts so.
+fn countRequests(server: *harness.MockServer, line_prefix: []const u8) usize {
+    var count: usize = 0;
+    for (0..server.requestCount()) |index| {
+        const captured = server.requestAt(index) orelse continue;
+        if (std.mem.startsWith(u8, requestLine(captured), line_prefix)) count += 1;
+    }
+    return count;
+}
+
+/// Request `index` is a revocation of the session whose access token is
+/// `access`: its refresh token, as the metacodes client, and nothing else.
+fn expectRevocationOf(server: *harness.MockServer, index: usize, comptime access: []const u8) !void {
+    const captured = server.requestAt(index) orelse return error.NoRequestCaptured;
+    try testing.expect(std.mem.startsWith(u8, requestLine(captured), "POST /api/oauth/revoke "));
+    try testing.expectEqualStrings("token=mrt-" ++ access ++ "&token_type_hint=refresh_token&client_id=metacodes", captured.body());
+    try expectAbsent(captured.raw, "Bearer");
+}
+
+/// A session on no route, as `main` starts the TUI with nothing configured.
+fn unboundApp(case: *Case, io: std.Io) !*App {
+    var config = cc.parseArgsForTest(&.{"metacodes"}, case.arena());
+    config.state_root = case.state;
+    return App.initWithOptions(testing.allocator, io, config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
+}
+
+test "a second /login revokes the session it replaced, once, with its refresh token, after the new token response (#560)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    // Metask's site and its gateway at one origin, as at www.metask-ai.com:
+    // a turn on the first session; the second sign-in's device code and
+    // token response (naming the site, filled in once its port is known);
+    // the revocation; a turn on the second session.
+    var replies = [_][]const u8{ ANTHROPIC_SSE, DEVICE_GRANT, "", "", ANTHROPIC_SSE };
+    var site = try harness.MockServer.startCassette(&replies, 0);
+    defer site.stop();
+    const origin = try originOf(a, site);
+    replies[2] = try case.tokenJson(origin, NEW_SESSION_TOKEN);
+    try case.guard("METASK_SITE_URL", (try a.dupeZ(u8, origin)).ptr);
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    const app = try unboundApp(&case, io_runtime.io());
+    defer app.deinit();
+
+    // The first /login replaces nothing.
+    var applied = app.applyMetaskSession(
+        .{ .gateway = origin, .model = "glm-5", .models_json = GATEWAY_MODELS },
+        try case.tokenJson(origin, SESSION_TOKEN),
+        null,
+    );
+    try testing.expect(applied.switch_error == null and applied.storage_error == null);
+    try testing.expectEqual(ReplacedOutcome.nothing_replaced, applied.replaced);
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(site.lastRequest().?, "authorization").?);
+
+    // The second: its device code and token response, then the switch.
+    const token_json = try cc.api_metask_oauth.acquireDeviceToken(testing.allocator, io_runtime.io(), origin, false, null);
+    defer testing.allocator.free(token_json);
+    applied = app.applyMetaskSession(.{ .gateway = origin, .model = "glm-5", .models_json = GATEWAY_MODELS }, token_json, null);
+    try testing.expect(applied.switch_error == null and applied.storage_error == null and applied.rollback_error == null);
+    try testing.expectEqual(ReplacedOutcome.revoked, applied.replaced);
+    try testing.expectEqualStrings("mrt-" ++ NEW_SESSION_TOKEN, try storedRefreshToken(&case));
+
+    // Revoked after the new token response, with the first session's
+    // refresh token and nothing of the second's.
+    try testing.expectEqual(@as(usize, 4), site.requestCount());
+    try testing.expect(std.mem.startsWith(u8, requestLine(site.requestAt(2).?), "POST /api/oauth/token "));
+    try expectRevocationOf(site, 3, SESSION_TOKEN);
+    try expectAbsent(site.requestAt(3).?.raw, NEW_SESSION_TOKEN);
+
+    // The next turn carries the second session's token: the revocation
+    // ended the first one only.
+    try sendOneTurn(app);
+    const turn = site.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expect(std.mem.startsWith(u8, requestLine(turn), "POST /v1/messages "));
+    try testing.expectEqualStrings("Bearer " ++ NEW_SESSION_TOKEN, headerValue(turn, "authorization").?);
+    try testing.expectEqual(@as(usize, 1), countRequests(site, "POST /api/oauth/revoke "));
+}
+
+test "a /login that is not stored or cannot bind sends no revocation: the previous session stays stored and working (#560)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    // The site and its gateway: any request gets a turn's answer.
+    var site = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer site.stop();
+    const origin = try originOf(a, site);
+    try case.guard("METASK_SITE_URL", (try a.dupeZ(u8, origin)).ptr);
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    const app = try unboundApp(&case, io_runtime.io());
+    defer app.deinit();
+    var applied = app.applyMetaskSession(
+        .{ .gateway = origin, .model = "glm-5", .models_json = GATEWAY_MODELS },
+        try case.tokenJson(origin, SESSION_TOKEN),
+        null,
+    );
+    try testing.expect(applied.switch_error == null and applied.storage_error == null);
+
+    // Not stored: the token response names no gateway.
+    const unusable = "{\"access_token\":\"" ++ NEW_SESSION_TOKEN ++ "\",\"refresh_token\":\"mrt-" ++ NEW_SESSION_TOKEN ++ "\",\"token_type\":\"bearer\",\"expires_in\":3600}";
+    applied = app.applyMetaskSession(.{ .gateway = origin, .model = "glm-5", .models_json = GATEWAY_MODELS }, unusable, null);
+    try testing.expect(applied.storage_error != null);
+    try testing.expectEqual(ReplacedOutcome.nothing_replaced, applied.replaced);
+
+    // Stored, but no route to bind (a model the gateway does not list), so
+    // rolled back.
+    applied = app.applyMetaskSession(
+        .{ .gateway = origin, .model = "glm-7", .models_json = GATEWAY_MODELS },
+        try case.tokenJson(origin, NEW_SESSION_TOKEN),
+        null,
+    );
+    try testing.expectEqual(@as(?anyerror, error.OfferUnavailable), applied.switch_error);
+    try testing.expect(applied.rollback_error == null);
+    try testing.expectEqual(ReplacedOutcome.nothing_replaced, applied.replaced);
+
+    // Nothing reached the site; the first session is the one stored, and works.
+    try testing.expectEqual(@as(usize, 0), site.requestCount());
+    try testing.expectEqualStrings("mrt-" ++ SESSION_TOKEN, try storedRefreshToken(&case));
+    try sendOneTurn(app);
+    try testing.expectEqual(@as(usize, 1), site.requestCount());
+    try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(site.lastRequest().?, "authorization").?);
+}
+
+test "a revocation that is refused or not answered in time leaves the /login done (#560)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    // The site refuses the first revocation, answers the second only when
+    // released, then serves the turn.
+    var site = try harness.MockServer.startHttpCassette(
+        &.{ "{\"error\":\"server_error\"}", "", ANTHROPIC_SSE },
+        &.{ "HTTP/1.1 500 Internal Server Error", "HTTP/1.1 200 OK", "HTTP/1.1 200 OK" },
+    );
+    defer site.stop();
+    const origin = try originOf(a, site);
+    try case.guard("METASK_SITE_URL", (try a.dupeZ(u8, origin)).ptr);
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    const app = try unboundApp(&case, io_runtime.io());
+    defer app.deinit();
+    const choice: App.MetaskSession = .{ .gateway = origin, .model = "glm-5", .models_json = GATEWAY_MODELS };
+    var applied = app.applyMetaskSession(choice, try case.tokenJson(origin, SESSION_TOKEN), null);
+    try testing.expectEqual(ReplacedOutcome.nothing_replaced, applied.replaced);
+
+    // Refused: the sign-in stands.
+    applied = app.applyMetaskSession(choice, try case.tokenJson(origin, NEW_SESSION_TOKEN), null);
+    try testing.expect(applied.switch_error == null and applied.storage_error == null and applied.rollback_error == null);
+    try testing.expectEqual(ReplacedOutcome.failed, applied.replaced);
+    try testing.expectEqualStrings("mrt-" ++ NEW_SESSION_TOKEN, try storedRefreshToken(&case));
+    try expectRevocationOf(site, 0, SESSION_TOKEN);
+
+    // Not answered: the sign-in stands once the bound is up.
+    site.gateResponseAt(1);
+    applied = app.applyMetaskSession(choice, try case.tokenJson(origin, THIRD_SESSION_TOKEN), null);
+    try testing.expect(applied.switch_error == null and applied.storage_error == null and applied.rollback_error == null);
+    try testing.expectEqual(ReplacedOutcome.timed_out, applied.replaced);
+    site.releaseGatedResponse();
+    try testing.expectEqualStrings("mrt-" ++ THIRD_SESSION_TOKEN, try storedRefreshToken(&case));
+    try expectRevocationOf(site, 1, NEW_SESSION_TOKEN);
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ THIRD_SESSION_TOKEN, headerValue(site.lastRequest().?, "authorization").?);
+}
+
+test "/login metask outside the dialog revokes the session it replaced and says so where it reports (#560)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var replies = [_][]const u8{ DEVICE_GRANT, "", "" };
+    var site = try harness.MockServer.startCassette(&replies, 0);
+    defer site.stop();
+    const origin = try originOf(a, site);
+    replies[1] = try case.tokenJson(origin, NEW_SESSION_TOKEN);
+    try case.guard("METASK_SITE_URL", (try a.dupeZ(u8, origin)).ptr);
+    try case.storeSession(origin, SESSION_TOKEN);
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    // The line-mode REPL's `/login metask`, and the login list's Metask
+    // entry, run this flow; it says what it did through its sink.
+    var said: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer said.deinit();
+    const Sink = struct {
+        fn write(ctx: *anyopaque, text: []const u8) void {
+            const out: *std.Io.Writer.Allocating = @ptrCast(@alignCast(ctx));
+            out.writer.writeAll(text) catch {};
+        }
+    };
+    const prepared: cc.api_provider_login.MetaskPrepared = .{ .options = .{ .state_root = case.state, .open_browser = false } };
+    const outcome = try prepared.run(testing.allocator, io_runtime.io(), .{ .ctx = &said, .write = Sink.write }, null);
+    try testing.expect(outcome.provider_id.eqlText("metask"));
+    try testing.expectEqualStrings("mrt-" ++ NEW_SESSION_TOKEN, try storedRefreshToken(&case));
+    try testing.expectEqual(@as(usize, 3), site.requestCount());
+    try testing.expect(std.mem.startsWith(u8, requestLine(site.requestAt(1).?), "POST /api/oauth/token "));
+    try expectRevocationOf(site, 2, SESSION_TOKEN);
+    try expectContains(said.written(), "Metask revoked the previous sign-in.\n");
+}
+
 /// A `/v1/models` answer of another account: no glm-5-air.
 const OTHER_GATEWAY_MODELS = "{\"object\":\"list\",\"data\":[{\"id\":\"glm-5\",\"max_input_tokens\":200000,\"max_tokens\":32000},{\"id\":\"glm-6\",\"max_input_tokens\":200000,\"max_tokens\":32000}]}";
 
@@ -883,6 +1116,215 @@ test "/logout <provider>: the stored key goes, and a session that ran on it hold
     try expectContains(reminder.written(), "No model is set up: House relay has no key.\n  Put " ++ RELAY_ENV ++ " in your shell, or in ");
 }
 
+// ── /login <provider> while a session runs on it (#566) ─────────────────────
+
+const HOUSE = cc.provider_ids.Slug.lit("house-relay");
+const SPARE = cc.provider_ids.Slug.lit("spare-relay");
+const OAUTH_RELAY = cc.provider_ids.Slug.lit("oauth-relay");
+/// The keys `/login house-relay` stores, one after the other.
+const SAVED_KEY = "sk-relay-saved-one";
+const NEW_SAVED_KEY = "sk-relay-saved-two";
+const SPARE_KEY = "sk-spare-saved";
+
+/// `relayConfig`'s provider, and a second one, `spare-relay`, at `spare`.
+fn twoRelaysConfig(a: std.mem.Allocator, origin: []const u8, spare: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\{{"custom_providers": {{
+        \\ "house-relay": {{
+        \\  "display_name": "House relay",
+        \\  "credential_kinds": ["api_key"],
+        \\  "env_aliases": [{{"name": "{s}", "kind": "api_key", "canonical": true}}],
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/relay/v1", "protocol": "openai_chat"}}],
+        \\  "models": [{{"request_model_id": "relay-model", "display_name": "Relay model"}}]}},
+        \\ "spare-relay": {{
+        \\  "display_name": "Spare relay",
+        \\  "credential_kinds": ["api_key"],
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/spare/v1", "protocol": "openai_chat"}}],
+        \\  "models": [{{"request_model_id": "spare-model", "display_name": "Spare model"}}]}}}}}}
+    , .{ RELAY_ENV, origin, spare });
+}
+
+/// A provider that signs in (`openai_oauth`), at `origin`. Its token
+/// endpoint is a dead port: nothing here refreshes, so the token a request
+/// carries is one a login stored.
+fn oauthRelayConfig(a: std.mem.Allocator, origin: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\{{"custom_providers": {{"oauth-relay": {{
+        \\  "display_name": "OAuth relay",
+        \\  "credential_kinds": ["openai_oauth"],
+        \\  "oauth": {{"token_url": "http://127.0.0.1:9/token", "client_id": "relay-cli"}},
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/oauth/v1", "protocol": "openai_chat"}}],
+        \\  "models": [{{"request_model_id": "oauth-model", "display_name": "OAuth model"}}]}}}}}}
+    , .{origin});
+}
+
+/// Store `key` for `provider` as `/login <provider>` stores a pasted key:
+/// the step the dialog's worker runs (`ApiKeyPrepared.run`). A configured
+/// provider has no key page, so the case builds what `prepareApiKey` hands
+/// the worker; the check before storing is `provider_key_login_test`'s.
+fn storeKeyAsLogin(case: *Case, io: std.Io, provider: cc.provider_ids.Slug, key: []const u8) !void {
+    const prepared: cc.api_provider_login.ApiKeyPrepared = .{
+        .options = .{ .state_root = case.state },
+        .provider_id = provider,
+        .provider_label = provider.slice(),
+        .kind = .api_key,
+        .page = .{ .id = cc.provider_ids.Slug.lit("keys"), .label = "Keys", .url = "https://keys.invalid/" },
+        .secret = key,
+        .check = false,
+    };
+    _ = try prepared.run(testing.allocator, io, cc.api_oauth_login.stderrNotify(), null);
+}
+
+/// Store a sign-in to `oauth-relay` as `/login oauth-relay` stores one: the
+/// import its grant ends in.
+fn storeRelaySignIn(case: *Case, access: []const u8) !void {
+    const token_json = try std.fmt.allocPrint(case.arena(),
+        \\{{"access_token":"{s}","refresh_token":"rt-{s}","token_type":"bearer","expires_in":3600}}
+    , .{ access, access });
+    try cc.api_provider_login.importTokenResponse(testing.allocator, case.state, OAUTH_RELAY, token_json, "relay-cli", null);
+}
+
+/// A session started on no route, put on `model` the way a `/model` pick
+/// puts it.
+fn sessionOn(case: *Case, io: std.Io, model: []const u8) !*App {
+    var config = cc.parseArgsForTest(&.{"metacodes"}, case.arena());
+    config.state_root = case.state;
+    const app = try App.initWithOptions(testing.allocator, io, config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
+    errdefer app.deinit();
+    try testing.expect(cc.repl_picker_host.useSelector(app, model) == .switched);
+    return app;
+}
+
+test "/login <provider> stores a new key while the session runs on its saved key: the next turn sends the new key, on the same route (#566)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    try storeKeyAsLogin(&case, io_runtime.io(), HOUSE, SAVED_KEY);
+    const app = try sessionOn(&case, io_runtime.io(), "relay-model");
+    defer app.deinit();
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ SAVED_KEY, headerValue(relay.lastRequest().?, "authorization").?);
+
+    // The provider stopped taking that key (deleted on its site, say):
+    // `/login house-relay` stores another, and the session goes on with it.
+    try storeKeyAsLogin(&case, io_runtime.io(), HOUSE, NEW_SAVED_KEY);
+    try testing.expect(app.adoptProviderLogin(HOUSE));
+    try sendOneTurn(app);
+    const captured = relay.lastRequest().?;
+    try testing.expect(std.mem.startsWith(u8, requestLine(captured), "POST /relay/v1/chat/completions "));
+    try testing.expectEqualStrings("Bearer " ++ NEW_SAVED_KEY, headerValue(captured, "authorization").?);
+    try testing.expectEqual(@as(usize, 2), relay.requestCount());
+    // Only the key moved: the route, its model and the pick's scope stay.
+    const current = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(current.provider_id.eqlText("house-relay"));
+    try testing.expectEqualStrings("relay-model", current.request_model_id);
+    const host = try app.providerHost();
+    try testing.expectEqual(cc.provider_selection.Scope.session, host.kernel.effectiveSelection().?.scope);
+    var line_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("relay-model · saved key", app.bannerModelLine(&line_buf));
+}
+
+test "/login <provider> for a provider the session is not on leaves the session as it is (#566)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    var spare = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer spare.stop();
+    try case.write("state/config.json", try twoRelaysConfig(a, try originOf(a, relay), try originOf(a, spare)));
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    try storeKeyAsLogin(&case, io_runtime.io(), HOUSE, SAVED_KEY);
+    const app = try sessionOn(&case, io_runtime.io(), "relay-model");
+    defer app.deinit();
+    const bound = app.api_key;
+
+    try storeKeyAsLogin(&case, io_runtime.io(), SPARE, SPARE_KEY);
+    try testing.expect(!app.adoptProviderLogin(SPARE));
+    // Not bound again: the session holds the very bytes it held, not a copy.
+    try testing.expect(app.api_key.ptr == bound.ptr);
+    const current = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(current.provider_id.eqlText("house-relay"));
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ SAVED_KEY, headerValue(relay.lastRequest().?, "authorization").?);
+    try testing.expectEqual(@as(usize, 0), spare.requestCount());
+    try expectNeverSent(relay, SPARE_KEY);
+}
+
+test "/login <provider> signs in again while the session runs on its sign-in: the session sends the new token, not the one the process held (#566)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try oauthRelayConfig(a, try originOf(a, relay)));
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    try storeRelaySignIn(&case, "at-relay-one");
+    const app = try sessionOn(&case, io_runtime.io(), "oauth-model");
+    defer app.deinit();
+    var line_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("oauth-model · signed in", app.bannerModelLine(&line_buf));
+    // Each turn starts as the REPL starts it, with the token refresh.
+    _ = try app.refreshRouteCredential();
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer at-relay-one", headerValue(relay.lastRequest().?, "authorization").?);
+
+    // `/login oauth-relay` again (another account, say). The process held
+    // the first login's tokens; the session moves onto the new one at once,
+    // and the turn's refresh keeps it there.
+    try storeRelaySignIn(&case, "at-relay-two");
+    try testing.expect(app.adoptProviderLogin(OAUTH_RELAY));
+    try testing.expectEqualStrings("at-relay-two", app.api_key);
+    try testing.expect(!(try app.refreshRouteCredential()));
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer at-relay-two", headerValue(relay.lastRequest().?, "authorization").?);
+    try testing.expectEqualStrings("oauth-model · signed in", app.bannerModelLine(&line_buf));
+}
+
+test "/login <provider> leaves a session running elsewhere where it is, though the stored default is on that provider (#566)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer gateway.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    try storeDefault(&case, "house-relay", "relay-model");
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    // The default had no key at the start, so the session went on the
+    // Metask sign-in; the kernel still names the default as current.
+    const app = try signedInApp(&case, io_runtime.io(), try originOf(a, gateway), null);
+    defer app.deinit();
+    const named = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(named.provider_id.eqlText("house-relay"));
+
+    // A key for the default: the session does not move onto it.
+    try storeKeyAsLogin(&case, io_runtime.io(), HOUSE, SAVED_KEY);
+    try testing.expect(!app.adoptProviderLogin(HOUSE));
+    try testing.expectEqualStrings(METASK_KEY, app.api_key);
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ METASK_KEY, headerValue(gateway.lastRequest().?, "authorization").?);
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
+}
+
 // ── through the real CLI ─────────────────────────────────────────────────────
 
 const Run = struct {
@@ -924,6 +1366,83 @@ test "/logout revokes the Metask session at the server first, as the metacodes c
     // The access token goes nowhere at sign-out; the gateway heard nothing.
     try expectAbsent(revoke.raw, "Bearer");
     try testing.expectEqual(@as(usize, 0), gateway.requestCount());
+}
+
+test "metacodes login --provider metask without a terminal revokes the session it replaced, after the new token response, and says so (#560)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    // Two sign-ins at the site (and gateway): each a device code and a token
+    // response (filled in once the port is known), then the revocation, the
+    // second one refused.
+    var replies = [_][]const u8{ DEVICE_GRANT, "", "", DEVICE_GRANT, "", "{\"error\":\"server_error\"}" };
+    const ok = "HTTP/1.1 200 OK";
+    var site = try harness.MockServer.startHttpCassette(&replies, &.{ ok, ok, ok, ok, ok, "HTTP/1.1 500 Internal Server Error" });
+    defer site.stop();
+    const origin = try originOf(a, site);
+    replies[1] = try case.tokenJson(origin, NEW_SESSION_TOKEN);
+    replies[4] = try case.tokenJson(origin, THIRD_SESSION_TOKEN);
+    try case.storeSession(origin, SESSION_TOKEN);
+    const site_env = try std.fmt.allocPrint(a, "METASK_SITE_URL={s}", .{origin});
+    const secrets = [_][]const u8{ SESSION_TOKEN, NEW_SESSION_TOKEN, THIRD_SESSION_TOKEN, "mrt-" };
+
+    const out = try runCli(&case, cli, &.{site_env}, &.{ "login", "--provider", "metask", "--no-browser" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try testing.expectEqual(@as(i32, 0), out.exit_code);
+    try expectContains(out.stderr, "Stored Metask OAuth session. No secret was printed.\nMetask revoked the previous sign-in.\n");
+    try testing.expectEqualStrings("mrt-" ++ NEW_SESSION_TOKEN, try storedRefreshToken(&case));
+    try testing.expectEqual(@as(usize, 3), site.requestCount());
+    try testing.expect(std.mem.startsWith(u8, requestLine(site.requestAt(1).?), "POST /api/oauth/token "));
+    try expectRevocationOf(site, 2, SESSION_TOKEN);
+    for (secrets) |secret| try expectAbsent(out.stderr, secret);
+
+    // Refused: the sign-in is stored all the same, and the run says what
+    // stays valid, in sign-out's words.
+    const refused = try runCli(&case, cli, &.{site_env}, &.{ "login", "--provider", "metask", "--no-browser" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ refused.exit_code, refused.stderr });
+    try testing.expectEqual(@as(i32, 0), refused.exit_code);
+    try expectContains(refused.stderr, "warning: Metask could not revoke the previous sign-in; it stays valid there until it expires.\n");
+    try testing.expectEqualStrings("mrt-" ++ THIRD_SESSION_TOKEN, try storedRefreshToken(&case));
+    try testing.expectEqual(@as(usize, 6), site.requestCount());
+    try expectRevocationOf(site, 5, NEW_SESSION_TOKEN);
+    for (secrets) |secret| try expectAbsent(refused.stderr, secret);
+}
+
+test "metacodes login --provider metask --oauth-token-json revokes the session it replaced, not the same session imported again (#560)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    // The site answers the one revocation.
+    var site = try harness.MockServer.startCassette(&.{""}, 0);
+    defer site.stop();
+    const origin = try originOf(a, site);
+    try case.storeSession(origin, SESSION_TOKEN);
+    try case.write("work/token.json", try case.tokenJson(origin, NEW_SESSION_TOKEN));
+    const site_env = try std.fmt.allocPrint(a, "METASK_SITE_URL={s}", .{origin});
+    const args = [_][]const u8{ "login", "--provider", "metask", "--oauth-token-json", try std.fs.path.join(a, &.{ case.work, "token.json" }) };
+
+    const out = try runCli(&case, cli, &.{site_env}, &args);
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try testing.expectEqual(@as(i32, 0), out.exit_code);
+    try expectContains(out.stderr, "Stored an OAuth login for provider 'metask'. No secret was printed.\nMetask revoked the previous sign-in.\n");
+    try testing.expectEqualStrings("mrt-" ++ NEW_SESSION_TOKEN, try storedRefreshToken(&case));
+    try testing.expectEqual(@as(usize, 1), site.requestCount());
+    try expectRevocationOf(site, 0, SESSION_TOKEN);
+
+    // The same token response again: the session stored is that one, and
+    // revoking it would end it. Nothing is sent, and nothing said.
+    const again = try runCli(&case, cli, &.{site_env}, &args);
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ again.exit_code, again.stderr });
+    try testing.expectEqual(@as(i32, 0), again.exit_code);
+    try expectAbsent(again.stderr, "revoke");
+    try testing.expectEqual(@as(usize, 1), site.requestCount());
+    try testing.expectEqualStrings("mrt-" ++ NEW_SESSION_TOKEN, try storedRefreshToken(&case));
 }
 
 fn runCli(case: *Case, cli: []const u8, env: []const []const u8, args: []const []const u8) !Run {
@@ -1027,30 +1546,30 @@ test "metacodes login status says which level decides a plain start and what eac
     const a = case.arena();
     const secrets = [_][]const u8{ RELAY_KEY, SESSION_TOKEN, METASK_KEY, "at-login", "rt-login" };
 
-    // Nothing set up: level 5.
+    // Nothing set up: level 7.
     var out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
     errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
     try testing.expectEqual(@as(i32, 0), out.exit_code);
     try expectContains(out.stderr, "This start uses no provider: nothing is set up.");
-    try expectContains(out.stderr, "Level 5 of 5 decided; the first that applies wins:");
-    try expectContains(out.stderr, "> 5 nothing");
+    try expectContains(out.stderr, "Level 7 of 7 decided; the first that applies wins:");
+    try expectContains(out.stderr, "> 7 nothing");
     try expectContains(out.stderr, "No secret was printed.");
 
-    // `.env` configures a provider: level 4, named by the file.
+    // `.env` configures a provider: level 6, named by the file.
     try case.write("state/config.json", try relayConfig(a, "http://127.0.0.1:9"));
     try case.write("state/.env", RELAY_ENV ++ "=" ++ RELAY_KEY ++ "\nMETACODES_PROVIDER=house-relay\n");
     out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
     try expectContains(out.stderr, "This start uses House relay from ");
-    try expectContains(out.stderr, "Level 4 of 5 decided");
+    try expectContains(out.stderr, "Level 6 of 7 decided");
     try expectContains(out.stderr, "; " ++ RELAY_ENV ++ ", METACODES_PROVIDER; configures House relay\n");
     for (secrets) |secret| try expectAbsent(out.stderr, secret);
 
-    // The Metask session outranks it: level 3, with the model it chose.
+    // The Metask session outranks it: level 5, with the model it chose.
     try case.storeSession("http://127.0.0.1:9", SESSION_TOKEN);
     try case.write("state/auth.json", "{\"selected_model\":\"glm-5\",\"reasoning_effort\":\"low\"}");
     out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
     try expectContains(out.stderr, "This start uses Metask, signed in · glm-5 · reasoning low.");
-    try expectContains(out.stderr, "> 3 Metask sign-in: the session (");
+    try expectContains(out.stderr, "> 5 Metask sign-in: the session (");
     try expectContains(out.stderr, "auth.json: model glm-5, reasoning low\n");
     for (secrets) |secret| try expectAbsent(out.stderr, secret);
 
@@ -1061,17 +1580,17 @@ test "metacodes login status says which level decides a plain start and what eac
     try expectContains(out.stderr, "; a key; an older browser sign-in\n");
     for (secrets) |secret| try expectAbsent(out.stderr, secret);
 
-    // A default stored with /model whose provider has its key: level 2.
+    // A default stored with /model whose provider has its key: level 4.
     try storeDefault(&case, "house-relay", "relay-model");
     out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
     try expectContains(out.stderr, "This start uses the default stored with /model: House relay · relay-model.");
-    try expectContains(out.stderr, "> 2 stored default: House relay · relay-model\n");
+    try expectContains(out.stderr, "> 4 stored default: House relay · relay-model\n");
 
     // The shell names a provider: level 1, and the stored default is not consulted.
     out = try runCli(&case, cli, &.{"METACODES_PROVIDER=house-relay"}, &.{ "login", "status" });
     try expectContains(out.stderr, "This start uses the provider the shell names: METACODES_PROVIDER=house-relay.");
     try expectContains(out.stderr, "> 1 named at start: METACODES_PROVIDER=house-relay in the shell");
-    try expectContains(out.stderr, "  2 stored default: not consulted, level 1 names a provider");
+    try expectContains(out.stderr, "  4 stored default: not consulted, level 1 names a provider");
 
     // A key only in the shell chooses nothing, and is named, not printed.
     out = try runCli(&case, cli, &.{"DEEPSEEK_API_KEY=sk-shell-only-deepseek"}, &.{ "login", "status" });
@@ -1099,7 +1618,7 @@ test "login status reads METACODES_AUTH_PRECEDENCE as the start does: under oaut
     const status = try runCli(&case, cli, &oauth_first, &.{ "login", "status" });
     errdefer std.debug.print("status exit {d}; stderr:\n{s}\n", .{ status.exit_code, status.stderr });
     try expectContains(status.stderr, "This start uses Metask, signed in · glm-5 · reasoning low.");
-    try expectContains(status.stderr, "> 3 Metask sign-in: the session (");
+    try expectContains(status.stderr, "> 5 Metask sign-in: the session (");
     try expectContains(status.stderr, "METACODES_AUTH_PRECEDENCE=oauth-first");
     try expectAbsent(status.stderr, SESSION_TOKEN);
 
@@ -1113,7 +1632,7 @@ test "login status reads METACODES_AUTH_PRECEDENCE as the start does: under oaut
     // Under the default, the same empty variable sets the session aside, and
     // both say there is nothing to start with.
     const default_status = try runCli(&case, cli, &.{"METASK_API_KEY="}, &.{ "login", "status" });
-    try expectContains(default_status.stderr, "Level 5 of 5 decided");
+    try expectContains(default_status.stderr, "Level 7 of 7 decided");
     const sent = gateway.requestCount();
     const default_start = try runCli(&case, cli, &.{"METASK_API_KEY="}, &.{ "-p", "hi" });
     try testing.expect(default_start.exit_code != 0);

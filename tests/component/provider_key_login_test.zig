@@ -8,9 +8,9 @@
 //! and a `/model` pick of a Z.AI model without one ended in
 //! `MissingCredentials`.
 //!
-//! `/model` takes no key itself (#488): a provider without one is listed as
-//! not configured, and the key this login stores makes its routes ones a
-//! pick applies.
+//! `/model` takes no key itself (#488): a provider without one is not
+//! listed, and the key this login stores makes its routes ones a pick
+//! applies.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -58,6 +58,11 @@ const cleared_variables = [_][*:0]const u8{
     "GLM_API_KEY",
     "Z_AI_API_KEY",
     "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "MINIMAX_API_KEY",
+    "MOONSHOT_API_KEY",
     "METASK_API_KEY",
     "METASK_GATEWAY_URL",
     "METACODES_PROVIDER",
@@ -292,7 +297,7 @@ test "L2 key login: a stored key starts a Z.AI session and reaches its requests,
     try std.testing.expectEqualStrings("Bearer " ++ GOOD_KEY, headerValue(captured, "authorization").?);
 }
 
-test "L2 key login (#488): /model takes no key; a provider without one is not configured, and the key /login stored makes its routes applicable" {
+test "L2 key login (#488): /model takes no key and does not list a provider without one; the key /login stored makes its routes applicable" {
     var case: Case = undefined;
     try case.init();
     defer case.deinit();
@@ -311,26 +316,20 @@ test "L2 key login (#488): /model takes no key; a provider without one is not co
     var rows = cc.repl_model_picker.Picker.RowBuffer.init(std.testing.allocator);
     defer rows.deinit();
 
-    // No key: typing finds the plan's models, dim (not configured), and
-    // Enter on one shows where the key goes. No key stage, no worker, no
+    // No key: the plan is not listed, so typing its name finds nothing, and
+    // Enter neither commits nor shows a setup. No key stage, no worker, no
     // request.
     var ui: cc.tui_ui_state.UiState = .{};
     picker_host.open(app, &ui, .unguarded);
     for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
-    const unconfigured = try picker.rows(&rows);
-    try std.testing.expect(unconfigured.len > 0);
-    for (unconfigured) |row| {
-        try std.testing.expect(row == .model and !row.model.ready);
-        try std.testing.expect(picker.offers.items[row.model.offer_index].provider_id.eqlText("zai-coding-plan"));
-    }
-    try std.testing.expectEqual(picker_host.Result.redraw, picker_host.onKey(app, &ui, .enter, .unguarded));
-    try std.testing.expectEqual(cc.repl_model_picker.Stage.setup, picker.stage);
-    try std.testing.expectEqualStrings("ZAI_API_KEY", picker.setup.?.variable.?);
-    const env_path = try std.fs.path.join(allocator, &.{ case.root, ".env" });
-    try std.testing.expectEqualStrings(env_path, picker.localConfigPath());
-    for ([_]cc.repl_model_picker.Key{ .enter, .{ .char = 'k' }, .cycle_scope }) |key| {
+    try std.testing.expectEqual(@as(usize, 0), (try picker.rows(&rows)).len);
+    for ([_]cc.repl_model_picker.Key{ .enter, .right }) |key| {
         try std.testing.expectEqual(picker_host.Result.ignored, picker_host.onKey(app, &ui, key, .unguarded));
     }
+    try std.testing.expectEqual(cc.repl_model_picker.Stage.list, picker.stage);
+    try std.testing.expect(picker.setup == null);
+    const env_path = try std.fs.path.join(allocator, &.{ case.root, ".env" });
+    try std.testing.expectEqualStrings(env_path, picker.localConfigPath());
     try std.testing.expectEqual(@as(usize, 0), check.requestCount());
     try std.testing.expect(try key_store.load(std.testing.allocator, case.root, Slug.lit("zai-coding-plan")) == null);
     // The session stays on the route it started on.
@@ -338,13 +337,14 @@ test "L2 key login (#488): /model takes no key; a provider without one is not co
     picker_host.close(app, &ui, .unguarded);
 
     // The key `/login zai-coding-plan` would store: the next /model lists
-    // the plan as ready, and a pick applies its route with that key.
+    // the plan, and a pick applies its route with that key.
     try key_store.save(std.testing.allocator, case.root, Slug.lit("zai-coding-plan"), .zai_coding_plan_api_key, GOOD_KEY, null, 1);
     picker_host.open(app, &ui, .unguarded);
     for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
     const configured = try picker.rows(&rows);
     try std.testing.expect(configured.len > 0);
-    try std.testing.expect(configured[0] == .model and configured[0].model.ready);
+    try std.testing.expect(configured[0] == .model);
+    try std.testing.expect(picker.offers.items[configured[0].model.offer_index].provider_id.eqlText("zai-coding-plan"));
     // The cursor is on GLM-5.3, listed first; Enter applies its preferred
     // route, the first (cn-anthropic).
     const focused = picker.focusedOffer() orelse return error.NoFocusedOffer;
@@ -355,4 +355,119 @@ test "L2 key login (#488): /model takes no key; a provider without one is not co
     // Another provider bills the session from here, and the notice says so.
     try std.testing.expect(std.mem.indexOf(u8, picker.notice(), "from now on billed to your Z.AI GLM Coding Plan account") != null);
     try std.testing.expectEqual(@as(usize, 0), check.requestCount());
+}
+
+// ── phase 2: every built-in vendor takes a pasted key ───────────────────────
+
+/// A vendor `/login <id>` now guides to a key page, and where its requests
+/// (so its key check) carry the key.
+const GuidedVendor = struct {
+    id: []const u8,
+    /// The page the default channel's region leads to.
+    page: []const u8,
+    header: []const u8,
+    prefix: []const u8 = "",
+};
+
+const GUIDED_VENDORS = [_]GuidedVendor{
+    .{ .id = "openai", .page = "platform", .header = "authorization", .prefix = "Bearer " },
+    // Gemini reads `x-goog-api-key`; a bearer token is an OAuth token to it.
+    .{ .id = "gemini", .page = "aistudio", .header = "x-goog-api-key" },
+    .{ .id = "qwen", .page = "cn", .header = "authorization", .prefix = "Bearer " },
+    .{ .id = "minimax", .page = "cn", .header = "authorization", .prefix = "Bearer " },
+    .{ .id = "kimi", .page = "cn", .header = "authorization", .prefix = "Bearer " },
+};
+
+test "L2 key login (phase 2): OpenAI, Gemini, Qwen, MiniMax and Kimi check a pasted key where their requests carry it, and store it as theirs" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    var registry = try cc.provider_registry.ProviderRegistry.initWithBuiltins(std.testing.allocator);
+    defer registry.deinit();
+
+    for (GUIDED_VENDORS) |vendor| {
+        errdefer std.debug.print("vendor: {s}\n", .{vendor.id});
+        var server = try harness.MockServer.start(MODELS_OK, 0);
+        defer server.stop();
+        try case.checkAt(server);
+        const profile = registry.find(vendor.id).?;
+        const key = try std.fmt.allocPrint(allocator, "guided-{s}-key", .{vendor.id});
+        const prepared = try provider_login.prepareApiKey(profile, null, profile.default_channel, key, .{ .state_root = case.root });
+        try std.testing.expectEqualStrings(vendor.page, prepared.page.id.slice());
+        _ = try prepared.run(std.testing.allocator, io_runtime.io(), cc.api_oauth_login.stderrNotify(), null);
+
+        const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+        try std.testing.expectEqualStrings("GET /api/coding/paas/v4/models HTTP/1.1", requestLine(captured));
+        const expected = try std.fmt.allocPrint(allocator, "{s}{s}", .{ vendor.prefix, key });
+        try std.testing.expectEqualStrings(expected, headerValue(captured, vendor.header) orelse "");
+        // The key goes in one place only.
+        if (!std.mem.eql(u8, vendor.header, "authorization")) try std.testing.expect(headerValue(captured, "authorization") == null);
+        // The check says it is metacodes, as every request does
+        // (`http_connection.user_agent`), not std's `zig/<version>`.
+        try std.testing.expectEqualStrings("metacodes/" ++ cc.VERSION, headerValue(captured, "user-agent") orelse "");
+
+        var stored = (try key_store.load(std.testing.allocator, case.root, try Slug.parse(vendor.id))).?;
+        defer stored.deinit();
+        try std.testing.expectEqualStrings(key, stored.secret);
+        try std.testing.expectEqual(cc.provider_credential.CredentialKind.api_key, stored.kind);
+        try std.testing.expectEqualStrings(vendor.page, stored.page.?);
+    }
+}
+
+test "L2 key login (phase 2): Gemini's 400 API_KEY_INVALID refuses the key; that 400 from a bearer vendor, or a 400 for another reason, only fails the check" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(case.arena.allocator(), .{});
+    defer io_runtime.deinit();
+    var registry = try cc.provider_registry.ProviderRegistry.initWithBuiltins(std.testing.allocator);
+    defer registry.deinit();
+    const run = struct {
+        fn key(root: []const u8, io: std.Io, profile: *const cc.provider_profile.ProviderProfile) !void {
+            const prepared = try provider_login.prepareApiKey(profile, null, profile.default_channel, "guided-wrong-key", .{ .state_root = root });
+            _ = try prepared.run(std.testing.allocator, io, cc.api_oauth_login.stderrNotify(), null);
+        }
+    };
+
+    // Google's answer to a made-up key on the model listing (2026-11-17).
+    var refused = try harness.MockServer.startRepeatingStatus(
+        "{\"error\":{\"code\":400,\"message\":\"API key not valid. Please pass a valid API key.\",\"status\":\"INVALID_ARGUMENT\"," ++
+            "\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"API_KEY_INVALID\",\"domain\":\"googleapis.com\"}]}}",
+        "HTTP/1.1 400 Bad Request",
+        "",
+    );
+    defer refused.stop();
+    try case.checkAt(refused);
+    try std.testing.expectError(error.KeyRefused, run.key(case.root, io_runtime.io(), registry.find("gemini").?));
+    try std.testing.expect(try key_store.load(std.testing.allocator, case.root, Slug.lit("gemini")) == null);
+    // The same 400 from a vendor that does not word refusals that way says
+    // nothing about the key.
+    try std.testing.expectError(error.KeyCheckFailed, run.key(case.root, io_runtime.io(), registry.find("qwen").?));
+    try std.testing.expect(try key_store.load(std.testing.allocator, case.root, Slug.lit("qwen")) == null);
+
+    // Gemini's 400 for an unsupported location is not about the key either.
+    var located = try harness.MockServer.startRepeatingStatus(
+        "{\"error\":{\"code\":400,\"message\":\"User location is not supported for the API use.\",\"status\":\"FAILED_PRECONDITION\"}}",
+        "HTTP/1.1 400 Bad Request",
+        "",
+    );
+    defer located.stop();
+    try case.checkAt(located);
+    try std.testing.expectError(error.KeyCheckFailed, run.key(case.root, io_runtime.io(), registry.find("gemini").?));
+    try std.testing.expect(try key_store.load(std.testing.allocator, case.root, Slug.lit("gemini")) == null);
+
+    // A key in its own header follows no redirect either: the host the 302
+    // names never sees it.
+    var target = try harness.MockServer.start(MODELS_OK, 0);
+    defer target.stop();
+    const location = try std.fmt.allocPrint(case.arena.allocator(), "location: http://localhost:{d}/api/coding/paas/v4/models\r\n", .{target.port});
+    var redirect = try harness.MockServer.startRepeatingStatus("", "HTTP/1.1 302 Found", location);
+    defer redirect.stop();
+    try case.checkAt(redirect);
+    try std.testing.expectError(error.KeyCheckFailed, run.key(case.root, io_runtime.io(), registry.find("gemini").?));
+    try std.testing.expectEqualStrings("guided-wrong-key", headerValue(redirect.lastRequest().?, "x-goog-api-key").?);
+    try std.testing.expectEqual(@as(usize, 0), target.requestCount());
 }

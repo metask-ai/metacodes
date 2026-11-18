@@ -39,6 +39,18 @@ function open(t, runtimeOptions, provider, root, sessionOptions = {}) {
   return { runtime, session };
 }
 
+test('preview must be enabled before a preview tool enters the native runtime', { skip }, async (t) => {
+  assert.throws(() => new metacodes.Runtime({ tools: ['ExecuteCode'] }), /PreviewFeatureDisabled/);
+  const provider = await withProvider(t, [
+    ['tool', 'ExecuteCode', { code: '40 + 2' }],
+    ['echo'],
+  ]);
+  const { session } = open(t, { tools: [], preview: true }, provider, workspace(t), { permissionMode: 'full_access' });
+  const result = await session.run('compute with preview');
+  assert.match(result.text, /"value":42/);
+  assert.ok(provider.requests[0].tools.some((tool) => tool.name === 'ExecuteCode'));
+});
+
 test('a text run returns the final answer, events and usage', { skip }, async (t) => {
   const provider = await withProvider(t, [['text', 'hello from the mock']]);
   const { session } = open(t, { tools: [] }, provider, workspace(t));

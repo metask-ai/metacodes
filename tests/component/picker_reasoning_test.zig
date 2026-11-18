@@ -9,6 +9,14 @@
 //! The route is a configured relay on the OpenAI wire whose model declares a
 //! `reasoning_effort` control, served by a MockServer; the session starts on
 //! the historical Metask path and switches to the relay through the picker.
+//!
+//! DeepSeek's own route declares the level its API uses when a request names
+//! none (`high`): a pick in the picker sends it by name, where the route
+//! bound without a level names none; and a level the session runs with,
+//! `none` included, still starts selected rather than that default. Those
+//! cases bind DeepSeek's real route with a placeholder key and point the
+//! bound client at a MockServer, so the body is the one DeepSeek would get
+//! and nothing leaves the machine.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -62,7 +70,7 @@ const Case = struct {
     tmp: std.testing.TmpDir,
     root_buf: [std.fs.max_path_bytes]u8,
     root: []const u8,
-    guards: [cleared_variables.len + 4]EnvGuard,
+    guards: [cleared_variables.len + 5]EnvGuard,
     guard_count: usize,
 
     fn init(self: *Case, relay_origin: []const u8) !void {
@@ -152,6 +160,45 @@ fn shownLevel(app: *App) ?[]const u8 {
     return app.model_picker.effectiveValue(spec);
 }
 
+/// What `/model use` commits for DeepSeek's chat route of `model` (the
+/// `default` channel, the OpenAI wire): the route, and no level.
+fn deepseekRoute(app: *App, model: []const u8) !cc.repl_model_picker.Commit {
+    const host = try app.providerHost();
+    for (host.kernel.catalogSnapshot().items()) |*candidate| {
+        if (!candidate.provider_id.eqlText("deepseek") or !candidate.channel_id.eqlText("default")) continue;
+        if (!std.mem.eql(u8, candidate.request_model_id, model)) continue;
+        return .{
+            .offer_id = candidate.offer_id,
+            .offer_revision = candidate.offer_revision,
+            .controls = .{},
+            .scope = .session,
+        };
+    }
+    return error.OfferMissing;
+}
+
+/// Point the client a DeepSeek commit bound at `endpoint`, a MockServer: the
+/// key, wire and dialect stay DeepSeek's, so the body is the one DeepSeek
+/// would get. A commit binds DeepSeek's endpoint again, so this follows
+/// every commit.
+fn sendToMock(app: *App, endpoint: []const u8) !void {
+    try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, app.config.provider_kind);
+    if (app.openai_client) |*client| {
+        try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", client.base_url orelse "");
+        client.base_url = endpoint;
+    } else return error.NoOpenAiClient;
+}
+
+/// A MockServer answering two turns on the OpenAI wire, and the chat
+/// completions endpoint on it.
+fn deepseekMock(case: *Case) !struct { *harness.MockServer, []const u8 } {
+    const server = try harness.MockServer.startCassette(&.{ OPENAI_END_TURN_SSE, OPENAI_END_TURN_SSE }, 0);
+    errdefer server.stop();
+    const url = try server.urlOwned(case.arena.allocator());
+    const origin = url[0 .. url.len - "/v1/messages".len];
+    return .{ server, try std.fmt.allocPrint(case.arena.allocator(), "{s}/chat/completions", .{origin}) };
+}
+
 test "L2 picker: a reasoning level chosen on the line under the list is the one the request carries" {
     var gateway = try harness.MockServer.start(OPENAI_END_TURN_SSE, 0);
     defer gateway.stop();
@@ -210,4 +257,77 @@ test "L2 picker: the level the session runs with starts selected and survives th
     try sendOneTurn(app);
     const captured = gateway.lastRequest() orelse return error.NoRequestCaptured;
     try std.testing.expectEqualStrings("\"max\"", captured.jsonField("reasoning_effort").?);
+}
+
+test "L2 picker: DeepSeek starts at the level it documents as its default, high, and a pick sends it by name" {
+    var case: Case = undefined;
+    try case.init("http://127.0.0.1:9");
+    defer case.deinit();
+    try case.setEnv("DEEPSEEK_API_KEY", "deepseek-placeholder-key");
+    const deepseek, const endpoint = try deepseekMock(&case);
+    defer deepseek.stop();
+
+    var io_runtime = @import("platform").signal.threadedIo(case.arena.allocator(), .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), try case.config(), "metask-key");
+    defer app.deinit();
+
+    // DeepSeek's chat route bound with no level, as `/model use` binds it:
+    // the request names none, and DeepSeek thinks at its own default.
+    try std.testing.expect(try app.commitModelSelection(try deepseekRoute(app, "deepseek-v4-pro")) == .committed);
+    try std.testing.expectEqual(@as(?cc.types_mod.ReasoningEffort, null), app.config.reasoning_effort);
+    try sendToMock(app, endpoint);
+    try sendOneTurn(app);
+    const unnamed = deepseek.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expectEqualStrings("{\"type\":\"enabled\"}", unnamed.jsonField("thinking").?);
+    try std.testing.expect(unnamed.jsonField("reasoning_effort") == null);
+
+    // `/model` on that route: the level starts at the default DeepSeek
+    // declares, and Enter applies the route with it, by name.
+    var ui: cc.tui_ui_state.UiState = .{};
+    picker_host.open(app, &ui, .unguarded);
+    try std.testing.expectEqualStrings("deepseek-v4-pro", app.model_picker.focusedOffer().?.request_model_id);
+    try std.testing.expectEqualStrings("high", shownLevel(app).?);
+    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
+    try std.testing.expectEqual(@as(?cc.types_mod.ReasoningEffort, .high), app.config.reasoning_effort);
+    try std.testing.expect(std.mem.indexOf(u8, app.model_picker.notice(), "for this session · reasoning high") != null);
+
+    try sendToMock(app, endpoint);
+    try sendOneTurn(app);
+    const named = deepseek.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expectEqual(@as(usize, 2), deepseek.requestCount());
+    try std.testing.expectEqualStrings("\"deepseek-v4-pro\"", named.jsonField("model").?);
+    try std.testing.expectEqualStrings("{\"type\":\"enabled\"}", named.jsonField("thinking").?);
+    try std.testing.expectEqualStrings("\"high\"", named.jsonField("reasoning_effort").?);
+}
+
+test "L2 picker: a level turned off on DeepSeek stays off when /model opens again, not replaced by its default" {
+    var case: Case = undefined;
+    try case.init("http://127.0.0.1:9");
+    defer case.deinit();
+    try case.setEnv("DEEPSEEK_API_KEY", "deepseek-placeholder-key");
+    const deepseek, const endpoint = try deepseekMock(&case);
+    defer deepseek.stop();
+
+    var io_runtime = @import("platform").signal.threadedIo(case.arena.allocator(), .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), try case.config(), "metask-key");
+    defer app.deinit();
+    try std.testing.expect(try app.commitModelSelection(try deepseekRoute(app, "deepseek-v4-pro")) == .committed);
+    try app.setReasoningEffort(.none);
+
+    // The session turned thinking off: that, not DeepSeek's `high`, is
+    // selected, and Enter keeps it.
+    var ui: cc.tui_ui_state.UiState = .{};
+    picker_host.open(app, &ui, .unguarded);
+    try std.testing.expectEqualStrings("deepseek-v4-pro", app.model_picker.focusedOffer().?.request_model_id);
+    try std.testing.expectEqualStrings("none", shownLevel(app).?);
+    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
+    try std.testing.expectEqual(@as(?cc.types_mod.ReasoningEffort, .none), app.config.reasoning_effort);
+
+    try sendToMock(app, endpoint);
+    try sendOneTurn(app);
+    const sent = deepseek.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expectEqualStrings("{\"type\":\"disabled\"}", sent.jsonField("thinking").?);
+    try std.testing.expect(sent.jsonField("reasoning_effort") == null);
 }

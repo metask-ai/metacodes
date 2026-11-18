@@ -57,6 +57,8 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
   source after a green pinned check; demote-only provenance and the
   pre-registered check-gate v3 replay.
 - [Memory system](MEMORY_SYSTEM_DESIGN.md)
+- [JavaScript tool orchestration](PROGRAMMATIC_TOOL_CALLING.md) — ExecuteCode's
+  persistent QuickJS context, tool admission, output isolation and resource limits.
 - [Learning turn](LEARNING_TURN_DESIGN.md) — post-verdict
   distill-and-reconcile turn that turns a check verdict into conditioned
   lessons; in-run path implemented, CLI flags pending.
@@ -85,6 +87,8 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 
 ## Benchmarks and evaluation
 
+- [Bench workbench](BENCH_WORKBENCH.md) — `metacodes bench`: launch the
+  browser workbench, run selected Harbor tasks, and inspect results.
 - [Benchmarks](BENCHMARKS.md) — performance gates, internal paired evidence,
   and the external WorkBuddy-Bench mainline with current ladder status.
 - [Plugin evaluation](PLUGIN_EVALUATION.md) — plugin kernel v1 evidence record.

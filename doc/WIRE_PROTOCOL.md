@@ -18,6 +18,15 @@ In-process frontends (the TUI, headless runs, the AgentCore C ABI's
 directly. They never serialize, never declare capabilities, and behave as
 before this exchange existed.
 
+`ExecuteCode` is a preview feature, disabled by default. The Host's preview
+configuration controls its availability: without opt-in it is absent from the
+tool menu and direct invocation is rejected before VM creation. Model input
+cannot enable preview. When enabled it is an ordinary model tool on this wire. Its inner tool invocations
+emit ordinary tool lifecycle, policy and file-change evidence, but do not create
+additional provider tool-use/result messages. Runtime state is ephemeral and
+never part of a transcript or wire checkpoint. See the normative
+[JavaScript execution contract](PROGRAMMATIC_TOOL_CALLING.md).
+
 ## 1. Lines
 
 Every line is one JSON object with the schema version `v` (currently `1`) and
@@ -250,6 +259,17 @@ another, applying the answer as before.
 ```text
 {"v":1,"type":"ui_request_closed","id":1,"outcome":"answered","by":"alice@example.com"}
 ```
+
+**Ids across restarts.** An answer names its request by id alone, so an id
+must not come back. `--web` and `serve` never hand one out twice, across
+their restarts and across a session destroyed and restored. An answer to an
+earlier request, delivered again (a webhook that retries, a client that
+reconnects), is refused as stale (409, or the UDS `no pending request with
+this id`). It never answers a newer request. Their ids come from one counter
+per process that stays above the wall clock in milliseconds. They are large
+integers (about 1.8×10¹² in 2026, far below 2⁵³), which a frontend copies back
+as given. `SessionHost` keeps its ids across restarts under `.suspend`
+(below), and not yet under `.block`, its default.
 
 **Expiry** (`SessionHost.Options.ui_request_expiry`, with
 `ui_request_timeout_ms`). Every policy closes a request with an outcome v1

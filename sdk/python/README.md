@@ -30,6 +30,11 @@ The API key comes from `api_key=`, else the provider's usual variable
 provider's official one. An OpenAI-compatible server is addressed with
 `provider="openai"` and its full URL.
 
+Preview features default to disabled. `metacodes.Runtime(preview=True)` opts
+in and includes the `ExecuteCode` JavaScript orchestration tool; Session tool
+selection and ordinary permission checks still apply. Selecting `ExecuteCode`
+with preview disabled is rejected. This requires AgentCore ABI revision 29.
+
 ## Tools written in Python
 
 ```python
