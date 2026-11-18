@@ -378,6 +378,15 @@ share a key:
 | `session` | `<session_dir>/runtime-selection.json` → `session_selection` | `App.restoreSessionSelection` on `/resume` |
 | `once` | nowhere | expires with the turn |
 
+Named selections are kept beside them (#489): `presets` maps a name to a
+selection in the `global_selection` shape, and `directory_presets` maps an
+absolute directory to a preset name, never to a route. A start applies at most
+one, chosen by `src/app/startup_order.zig` (`--preset`/`METACODES_PRESET`, then
+the working directory's), by lowering it into the fields the flags naming the
+same route would set (`src/app/presets.zig`); nothing is persisted by using
+one. A preset written by hand is written back as it was by every other commit
+(`config_doc.Preset.raw`).
+
 Session scope is narrower, so on resume it wins: a resumed session continues on
 the route it was using, not on whatever became global in the meantime. A stored
 selection that no longer resolves is reported — as a startup error for global,
@@ -652,7 +661,8 @@ store, and health plane land — see the deferred list.
 ## Persistence
 
 `~/.metacodes/config.json` gains `schema_version`, `config_revision`,
-`providers`, `aliases`, `global_selection`, and `last_operation_id`. The
+`providers`, `aliases`, `global_selection`, `presets`, `directory_presets`, and
+`last_operation_id`. The
 document is a provider *map*: several providers, accounts, regions, and relays
 coexist, and disabling one preserves its configuration and credential reference.
 
@@ -691,6 +701,10 @@ metacodes --provider zai-coding-plan --channel cn-anthropic --model glm-5.3
   model-name inference to registry route resolution.
 - `--channel <id>` narrows to one endpoint/region/plan binding.
 - `--offer <offer-id>` pins one exact reproducible route.
+- `--preset <name>` (or `METACODES_PRESET`) applies a named selection from
+  `config.json` `presets`; `--model`, `--channel` and `--reasoning-effort`
+  replace one of its fields for that run, `--provider` and `--offer` set it
+  aside ([LOCAL_CONFIG.md](LOCAL_CONFIG.md#presets)).
 - `--base-url <url>` is validated against the profile and route policy first.
   Without `--channel` it belongs to one channel: the default channel when all
   its routes accept the URL, otherwise the first channel whose routes do. A URL

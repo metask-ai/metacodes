@@ -207,7 +207,7 @@ fn writeList(w: *std.Io.Writer, items: []const []const u8) std.Io.Writer.Error!v
 /// Said once under the banner when `.env` holds keys of several providers
 /// and names none (#486), so the TUI opened without a model: which ones, by
 /// display name, and where choosing one is done. Tab in `/model` is what
-/// makes the choice the default of later starts (level 2 of the startup
+/// makes the choice the default of later starts (level 4 of the startup
 /// order), which no longer stop here.
 ///
 ///     .env has keys for DeepSeek and OpenAI. Choose one with /model; Tab there applies it to every future session.
@@ -222,7 +222,7 @@ pub fn writeUnchosenLocalNotice(w: *std.Io.Writer, providers: []const []const u8
 
 /// The provider key variables `env` sets among `profiles`' declared aliases,
 /// by name, each once, in profile order. Metask's are left out: a Metask key
-/// in the environment is a sign-in and binds the session (level 3), so it is
+/// in the environment is a sign-in and binds the session (level 5), so it is
 /// never one the reminder has to point out. The names live in `arena`.
 pub fn environmentKeys(
     arena: std.mem.Allocator,

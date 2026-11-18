@@ -261,6 +261,9 @@ pub const Config = struct {
     provider_channel: ?[]const u8 = null,
     /// Exact offer id (`--offer`), which pins one reproducible route.
     provider_offer: ?[]const u8 = null,
+    /// A preset of config.json by name (`--preset`, #489). The host applies
+    /// it at start (`src/app/presets.zig`); nothing below the host reads it.
+    preset: ?[]const u8 = null,
     /// Offer id of the resolved startup route, rendered for display/logs.
     selected_offer_id: ?[]const u8 = null,
     /// Canonical `ProviderId` of the resolved startup route. Recorded once at

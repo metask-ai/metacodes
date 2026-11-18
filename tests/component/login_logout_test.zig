@@ -1027,30 +1027,30 @@ test "metacodes login status says which level decides a plain start and what eac
     const a = case.arena();
     const secrets = [_][]const u8{ RELAY_KEY, SESSION_TOKEN, METASK_KEY, "at-login", "rt-login" };
 
-    // Nothing set up: level 5.
+    // Nothing set up: level 7.
     var out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
     errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
     try testing.expectEqual(@as(i32, 0), out.exit_code);
     try expectContains(out.stderr, "This start uses no provider: nothing is set up.");
-    try expectContains(out.stderr, "Level 5 of 5 decided; the first that applies wins:");
-    try expectContains(out.stderr, "> 5 nothing");
+    try expectContains(out.stderr, "Level 7 of 7 decided; the first that applies wins:");
+    try expectContains(out.stderr, "> 7 nothing");
     try expectContains(out.stderr, "No secret was printed.");
 
-    // `.env` configures a provider: level 4, named by the file.
+    // `.env` configures a provider: level 6, named by the file.
     try case.write("state/config.json", try relayConfig(a, "http://127.0.0.1:9"));
     try case.write("state/.env", RELAY_ENV ++ "=" ++ RELAY_KEY ++ "\nMETACODES_PROVIDER=house-relay\n");
     out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
     try expectContains(out.stderr, "This start uses House relay from ");
-    try expectContains(out.stderr, "Level 4 of 5 decided");
+    try expectContains(out.stderr, "Level 6 of 7 decided");
     try expectContains(out.stderr, "; " ++ RELAY_ENV ++ ", METACODES_PROVIDER; configures House relay\n");
     for (secrets) |secret| try expectAbsent(out.stderr, secret);
 
-    // The Metask session outranks it: level 3, with the model it chose.
+    // The Metask session outranks it: level 5, with the model it chose.
     try case.storeSession("http://127.0.0.1:9", SESSION_TOKEN);
     try case.write("state/auth.json", "{\"selected_model\":\"glm-5\",\"reasoning_effort\":\"low\"}");
     out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
     try expectContains(out.stderr, "This start uses Metask, signed in · glm-5 · reasoning low.");
-    try expectContains(out.stderr, "> 3 Metask sign-in: the session (");
+    try expectContains(out.stderr, "> 5 Metask sign-in: the session (");
     try expectContains(out.stderr, "auth.json: model glm-5, reasoning low\n");
     for (secrets) |secret| try expectAbsent(out.stderr, secret);
 
@@ -1061,17 +1061,17 @@ test "metacodes login status says which level decides a plain start and what eac
     try expectContains(out.stderr, "; a key; an older browser sign-in\n");
     for (secrets) |secret| try expectAbsent(out.stderr, secret);
 
-    // A default stored with /model whose provider has its key: level 2.
+    // A default stored with /model whose provider has its key: level 4.
     try storeDefault(&case, "house-relay", "relay-model");
     out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
     try expectContains(out.stderr, "This start uses the default stored with /model: House relay · relay-model.");
-    try expectContains(out.stderr, "> 2 stored default: House relay · relay-model\n");
+    try expectContains(out.stderr, "> 4 stored default: House relay · relay-model\n");
 
     // The shell names a provider: level 1, and the stored default is not consulted.
     out = try runCli(&case, cli, &.{"METACODES_PROVIDER=house-relay"}, &.{ "login", "status" });
     try expectContains(out.stderr, "This start uses the provider the shell names: METACODES_PROVIDER=house-relay.");
     try expectContains(out.stderr, "> 1 named at start: METACODES_PROVIDER=house-relay in the shell");
-    try expectContains(out.stderr, "  2 stored default: not consulted, level 1 names a provider");
+    try expectContains(out.stderr, "  4 stored default: not consulted, level 1 names a provider");
 
     // A key only in the shell chooses nothing, and is named, not printed.
     out = try runCli(&case, cli, &.{"DEEPSEEK_API_KEY=sk-shell-only-deepseek"}, &.{ "login", "status" });
@@ -1099,7 +1099,7 @@ test "login status reads METACODES_AUTH_PRECEDENCE as the start does: under oaut
     const status = try runCli(&case, cli, &oauth_first, &.{ "login", "status" });
     errdefer std.debug.print("status exit {d}; stderr:\n{s}\n", .{ status.exit_code, status.stderr });
     try expectContains(status.stderr, "This start uses Metask, signed in · glm-5 · reasoning low.");
-    try expectContains(status.stderr, "> 3 Metask sign-in: the session (");
+    try expectContains(status.stderr, "> 5 Metask sign-in: the session (");
     try expectContains(status.stderr, "METACODES_AUTH_PRECEDENCE=oauth-first");
     try expectAbsent(status.stderr, SESSION_TOKEN);
 
@@ -1113,7 +1113,7 @@ test "login status reads METACODES_AUTH_PRECEDENCE as the start does: under oaut
     // Under the default, the same empty variable sets the session aside, and
     // both say there is nothing to start with.
     const default_status = try runCli(&case, cli, &.{"METASK_API_KEY="}, &.{ "login", "status" });
-    try expectContains(default_status.stderr, "Level 5 of 5 decided");
+    try expectContains(default_status.stderr, "Level 7 of 7 decided");
     const sent = gateway.requestCount();
     const default_start = try runCli(&case, cli, &.{"METASK_API_KEY="}, &.{ "-p", "hi" });
     try testing.expect(default_start.exit_code != 0);

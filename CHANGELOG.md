@@ -30,7 +30,8 @@ status, compatibility boundaries, and entry points are defined by
 
 - **`metacodes login status` says which credential a plain start uses, and
   why** (#537). It names what a start with no flag would use,
-  the step of the startup order that decides (flags and the shell, the
+  the step of the startup order that decides (flags and the shell, a
+  preset named at start or remembered for the directory (#489), the
   default stored with `/model`, a Metask sign-in, `<state root>/.env`,
   nothing), and what each step holds: the session's path, gateway and
   expiry, `auth.json`'s model and level, where `METASK_API_KEY` is set, the
@@ -285,6 +286,27 @@ status, compatibility boundaries, and entry points are defined by
   filter). Teamwork seats on Linux get the sandbox too, so an implementer seat
   can build and test in its workspace instead of running read-only commands
   only.
+
+- **Named presets, and a preset a directory remembers** (part of #489).
+  `config.json` keeps named setups under `presets`, each in the shape
+  `global_selection` has (an `auto_route` selector or a `pinned_offer`, with
+  `controls` such as `reasoning_effort`), and `directory_presets` maps a
+  directory (its git worktree root, else the directory itself) to a preset by
+  name, so editing a preset changes every directory that uses it. A start
+  takes `--preset <name>` or `METACODES_PRESET` (from the shell, or from
+  `<state root>/.env`) and applies the preset as the flags naming the same
+  route would; `--model`, `--channel` and `--reasoning-effort` replace one
+  field for that run without editing it, and `--provider`/`--offer` set it
+  aside. The startup order gains two levels and has seven: flags, a preset
+  named at start, the directory's preset, the `/model` default, a Metask
+  sign-in, `.env` (its `METACODES_PRESET` before its `METACODES_PROVIDER`),
+  nothing; `metacodes login status` shows them. A preset `config.json` does
+  not define stops `-p`, `serve` and `--web` with exit code 2, listing the
+  presets; the TUI says so under its banner and starts without it. Nothing is
+  written into a project. Malformed entries fail to load with
+  `InvalidPreset`, `InvalidPresetName` or `InvalidDirectoryPreset`; saving a
+  preset or a directory's choice from `/model` comes with the TUI part of
+  #489, until then they are written by hand ([LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#presets)).
 
 - **A `SessionHost` Session can move onto another provider route, journaled
   as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`

@@ -479,6 +479,112 @@ pub fn setSessionSelection(
     });
 }
 
+/// Insert or replace the preset `name` (#489). The directories that remember
+/// it follow on their next start: they hold its name, not its selection. A
+/// name `--preset` cannot take is `error.InvalidPresetName`.
+pub fn setPreset(
+    store: *const Store,
+    name: []const u8,
+    selection: config_doc.RuntimeSelection,
+    expected: ?ConfigRevision,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        name: []const u8,
+        value: config_doc.RuntimeSelection,
+        failure: ?config_doc.DocumentError = null,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            document.upsertPreset(self.name, self.value) catch |err| {
+                self.failure = err;
+                return err;
+            };
+        }
+    };
+    var apply = Apply{ .name = name, .value = selection };
+    return store.commit(.{
+        .expected_config_revision = expected,
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    }) catch |err| return if (err == error.MutationFailed) apply.failure orelse err else err;
+}
+
+/// Remove the preset `name` (#489); says whether one was defined. A
+/// directory that remembers it keeps its entry, and a start there says the
+/// preset is gone instead of quietly using another route.
+pub fn removePreset(
+    store: *const Store,
+    name: []const u8,
+    operation_id: ?[]const u8,
+) StoreError!struct { removed: bool, result: CommitResult } {
+    const Apply = struct {
+        name: []const u8,
+        removed: bool = false,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.removed = document.removePreset(self.name);
+        }
+    };
+    var apply = Apply{ .name = name };
+    const result = try store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+    return .{ .removed = apply.removed, .result = result };
+}
+
+/// Make the directory `path` (absolute, the host's canonical key for it)
+/// remember the preset `name` (#489), which must be defined:
+/// `error.UnknownPreset` otherwise, `error.InvalidDirectoryPreset` for a path
+/// that is not absolute.
+pub fn setDirectoryPreset(
+    store: *const Store,
+    path: []const u8,
+    name: []const u8,
+    operation_id: ?[]const u8,
+) StoreError!CommitResult {
+    const Apply = struct {
+        path: []const u8,
+        name: []const u8,
+        failure: ?config_doc.DocumentError = null,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            document.setDirectoryPreset(self.path, self.name) catch |err| {
+                self.failure = err;
+                return err;
+            };
+        }
+    };
+    var apply = Apply{ .path = path, .name = name };
+    return store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    }) catch |err| return if (err == error.MutationFailed) apply.failure orelse err else err;
+}
+
+/// Forget what the directory `path` remembers (#489); says whether it
+/// remembered a preset.
+pub fn removeDirectoryPreset(
+    store: *const Store,
+    path: []const u8,
+    operation_id: ?[]const u8,
+) StoreError!struct { removed: bool, result: CommitResult } {
+    const Apply = struct {
+        path: []const u8,
+        removed: bool = false,
+        fn run(ctx: *anyopaque, document: *Document) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.removed = document.removeDirectoryPreset(self.path);
+        }
+    };
+    var apply = Apply{ .path = path };
+    const result = try store.commit(.{
+        .operation_id = operation_id,
+        .mutation = .{ .ctx = @ptrCast(&apply), .applyFn = Apply.run },
+    });
+    return .{ .removed = apply.removed, .result = result };
+}
+
 /// 测试 fixture 路径 `<tmpRoot>/cc-zig-provider-<name>-<pid>`(本子系统不得导入 tools/,
 /// 走 util/fs.zig 的规则源;文件直接放在临时根下,不需要先建目录)。
 fn testFixturePath(buf: []u8, name: []const u8) ![]const u8 {
@@ -714,4 +820,56 @@ test "a learned credential failure is durable and leaves the other members alone
         @as(?i64, 1_300),
         after.provider(ids.Slug.lit("openai")).?.credentials.items()[0].cooldown_until,
     );
+}
+
+test "presets and the directories that remember them persist through the store, typed errors included (#489)" {
+    const a = std.testing.allocator;
+    var path_buf: [512]u8 = undefined;
+    const path = try testFixturePath(&path_buf, "presets-test.json");
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        const target = std.fmt.bufPrintZ(&buffer, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    }
+    defer for ([_][]const u8{ "", ".lock", ".tmp" }) |suffix| {
+        var cleanup: [std.fs.max_path_bytes]u8 = undefined;
+        const target = std.fmt.bufPrintZ(&cleanup, "{s}{s}", .{ path, suffix }) catch continue;
+        pfs.unlinkPath(target) catch {};
+    };
+
+    var store = try Store.initPath(a, path);
+    defer store.deinit();
+
+    const first = try config_doc.RuntimeSelection.auto("relay-model", .{}, .session);
+    _ = try setPreset(&store, "a", first, null, null);
+    _ = try setPreset(&store, "b", try config_doc.RuntimeSelection.auto("other-model", .{}, .session), null, null);
+    _ = try setDirectoryPreset(&store, "/work/x", "a", null);
+    _ = try setDirectoryPreset(&store, "/work/y", "b", null);
+    // The errors a caller can act on come back as themselves, and nothing
+    // is written for them.
+    try std.testing.expectError(error.UnknownPreset, setDirectoryPreset(&store, "/work/z", "c", null));
+    try std.testing.expectError(error.InvalidDirectoryPreset, setDirectoryPreset(&store, "work/z", "a", null));
+    try std.testing.expectError(error.InvalidPresetName, setPreset(&store, "a b", first, null, null));
+
+    // Editing `a` is what `/work/x` uses from then on; its entry is untouched.
+    var edited = try config_doc.RuntimeSelection.auto("relay-model-b", .{}, .session);
+    try edited.controls.set("reasoning_effort", try @import("controls.zig").Value.fromText("high"));
+    _ = try setPreset(&store, "a", edited, null, null);
+    var loaded = try store.load();
+    defer loaded.deinit();
+    try std.testing.expect(loaded.directoryPreset("/work/x").?.preset.eqlText("a"));
+    try std.testing.expect(loaded.preset("a").?.selection.target.auto_route.selector.eqlText("relay-model-b"));
+    try std.testing.expect(loaded.preset("a").?.selection.controls.get("reasoning_effort").?.text.eqlText("high"));
+    try std.testing.expect(loaded.directoryPreset("/work/z") == null);
+
+    // Removing a preset keeps the directory that names it.
+    try std.testing.expect((try removePreset(&store, "b", null)).removed);
+    try std.testing.expect(!(try removePreset(&store, "b", null)).removed);
+    try std.testing.expect((try removeDirectoryPreset(&store, "/work/x", null)).removed);
+    try std.testing.expect(!(try removeDirectoryPreset(&store, "/work/x", null)).removed);
+    var after = try store.load();
+    defer after.deinit();
+    try std.testing.expect(after.preset("b") == null);
+    try std.testing.expect(after.directoryPreset("/work/y").?.preset.eqlText("b"));
+    try std.testing.expect(after.directoryPreset("/work/x") == null);
 }
