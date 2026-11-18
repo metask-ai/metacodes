@@ -35,9 +35,12 @@ Placing the script in `.github/` does not make it a hosted Actions workflow.
    registers the session, the worktree and both agents.
 4. The watcher starts a fresh, read-only, adversarial review of the exact
    head/base revision, by default with the agent that did not write the code.
-5. Findings go to a dedicated fork of the source session. It repairs them or
-   rebuts a finding with an argument; the next fresh review rules on each
-   rebuttal. The controller validates, commits and pushes repairs, merges a
+5. Findings go back to the developer's own live session (attended; see
+   [Visible review conversation](#visible-review-conversation)), or to a
+   dedicated fork of it when unattended. The worker repairs each finding or
+   rebuts it with an argument; the next fresh review rules on each rebuttal.
+   Pre-existing defects come back as non-blocking follow-ups for a separate
+   session and PR. The controller validates, commits and pushes repairs, merges a
    moved main itself, and returns conflicts and CI failures to the worker.
 6. The loop repeats until a review passes and the four required checks
    succeed on the same head.
@@ -160,13 +163,47 @@ repair. The upgrade preserves review history, checkpoints, decisions, and
 counters. Older records contain only the events the previous watcher saved.
 Validation logs live in the private directory alongside the SQLite database.
 
+## Visible review conversation
+
+A PR shipped from a live session is **attended** (`--attended`, the default
+when `ship` detects the session; `--no-attended` otherwise). Review feedback
+is not sent to a background worker. The watcher stores it, enters
+`awaiting_session`, notifies the developer and waits for that session:
+
+```sh
+python3 .github/pr-loop.py inbox --pr "$PR_NUMBER" --follow   # one line per loop event
+python3 .github/pr-loop.py feedback --pr "$PR_NUMBER"         # the waiting findings, in full
+python3 .github/pr-loop.py reply --pr "$PR_NUMBER" --result updated \
+  --summary "What changed" [--rebuttal "INDEX:argument"]
+```
+
+The session edits the bound worktree in front of the developer and replies. It
+does not commit or push. The watcher admits the reply exactly like a worker
+turn: checkpoint, `gate:pr`, push and fresh review. A failed gate returns to
+the same session. While the session edits, a moved main does not interrupt
+it; the next pass merges main. With no reply after `attended_timeout` (one
+hour), the watcher records `attended_timeout` and forks an unattended worker
+from the session. `attach --pr N` re-attaches the source session, and
+`attach --pr N --off` detaches it.
+
+With `--mirror` (the default for `ship` and `submit`) every adversarial review
+(findings, follow-ups, risk), every repair reply (summary, rebuttals, pushed
+SHA), gate failures and approvals are posted on the PR conversation. Before
+anything is posted, the developer's `answer` texts are kept local and
+redacted from it. The human-approval notice is built only from controller
+text: path rules and a count of the reviewer's concerns.
+
 ## Adversarial review and rebuttals
 
 The reviewer is told to find reasons the PR must not merge: error and cleanup
 paths, allocation ownership, concurrency, platform differences, the provider
 cache contract, kernel boundaries and tests that declare without proving.
-It reports only blocking defects, each with a failure scenario and an
-acceptance condition, and it classifies the revision's risk.
+It reports only blocking defects the PR introduces, each with a failure
+scenario and an acceptance condition, and it classifies the revision's risk.
+A real defect that already exists on the base and that the PR neither causes
+nor touches is a `followup`: it does not block the merge, it is recorded and
+mirrored, and the session fixes it in a new session and a separate PR. The
+reviewer reads a controller-written `pr.diff` next to the snapshot.
 
 A worker that believes a finding is wrong returns a rebuttal naming the
 finding's index and arguing from the code. `disputed` means it changed
@@ -179,7 +216,8 @@ PR becomes a `needs_decision` for the developer.
 
 A revision needs a human approval bound to its exact head SHA when either:
 
-- a changed path matches a rule in
+- a changed path is a script that a workflow on the trusted base runs
+  directly (for example `scripts/ci_scope.py`), or matches a rule in
   [`.github/pr_loop/risk.py`](../.github/pr_loop/risk.py): the CODEOWNERS core
   directories, the permission, sandbox, formal and plugin boundaries,
   credentials and authentication, pinned binaries, the build graph and
@@ -198,8 +236,8 @@ continue meanwhile. After review and checks pass, the PR stays in
 
 - an `APPROVED` GitHub review on that commit by a collaborator with write,
   maintain or admin access (GitHub does not let authors approve their own PR);
-- a PR comment `/approve <sha>` (at least seven hex digits) by a maintainer or
-  admin;
+- a PR comment `/approve <sha>` with the full 40-digit SHA by a maintainer or
+  admin, so that an abbreviation can never match a later commit;
 - `python3 .github/pr-loop.py approve --pr "$PR_NUMBER" --sha "$HEAD_SHA"`.
 
 Any push changes the head and needs a new approval. Stale branches, conflicts
@@ -260,9 +298,13 @@ answering; an answer does not automatically reconcile a divergent checkout.
    and exact-head merging. Policy, workflow and controller edits require
    a decision. The worker's network is disabled; the controller executes the
    devbox gate and returns failures as feedback. Writable tool access is
-   limited by Codex's workspace sandbox, or for Claude Code by file tools plus
-   read-only git with `--permission-prompts none`; approval and user-input
-   requests are escalated or denied rather than fabricated.
+   limited by Codex's workspace sandbox. Claude Code gets no Bash or other
+   code-running tool (reviewer: Read/Glob/Grep; worker: plus Edit/Write,
+   confined to the checkout by `acceptEdits`), user settings only, no MCP
+   servers and `--permission-prompts none`. A Claude fork's ID is reserved
+   before launch, and a fork that never launched is created on the next
+   repair. Approval and user-input requests are escalated or denied rather
+   than fabricated.
 4. The four existing gate result checks must report **success** for the current
    PR head, from the GitHub Actions app (PR workflows execute the test merge,
    but their check runs are attached to the head SHA). Missing, pending,
@@ -300,10 +342,16 @@ workers, decision recovery, the replayable timeline, durable counters, legacy
 registrations, policy edits and interrupted
 operations. It also proves unavailable tools → full review retry → repair →
 validation → fresh review → merge without publishing a review status gate;
-a Claude Code worker forked once and then resumed, reviewed by Codex; a
-read-only Claude Code reviewer; rebuttal → fresh review → merge and the
-dispute limit; core paths and reviewer risk → one notice → exact-head local,
-review or comment approval → merge; and `ship` pushing, opening and binding.
+a Claude Code worker forked once and then resumed, reviewed by Codex, and
+recovery from a fork that never launched; a read-only Claude Code reviewer;
+rebuttal → fresh review → merge, the dispute limit, and an answered deadlock
+reaching a fresh reviewer; core paths, workflow entry points and reviewer
+risk → one notice → exact-head local, review or full-SHA comment approval →
+merge; attended feedback → session reply → gate → push → merge, including a
+gate failure, a moved main and the silent-session fallback; the mirrored PR
+conversation with private decisions redacted; a missing reviewer executable
+retrying; bounded process-tree cleanup; and `ship` validating the head
+repository before it pushes, opens and binds.
 No live PR is opened or merged by the tests.
 
 Protocol references: [Codex App Server](https://learn.chatgpt.com/docs/app-server),

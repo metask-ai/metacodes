@@ -85,6 +85,14 @@ python3 .github/pr-loop.py bind --pr "$PR_NUMBER" \
   --worktree "$TASK_WORKTREE" --thread "$TASK_THREAD_ID"
 ```
 
+`ship` from a live session makes the PR **attended**: review findings come back
+to that session, which shows them to you, fixes or rebuts them in front of you
+and answers with `pr-loop.py reply`. Watch the loop from the session with
+`pr-loop.py inbox --pr "$PR_NUMBER" --follow` and print waiting findings with
+`pr-loop.py feedback --pr "$PR_NUMBER"`. Each review, reply and gate result is
+also posted on the PR. A finding the reviewer marks as a pre-existing follow-up
+does not block the PR; fix it in a new session and a separate PR.
+
 `ship`, `submit` and `bind` register work for the running watcher; they do not
 start it. The watcher reviews each revision in a fresh read-only adversarial
 conversation, sends blocking findings or CI failures to the dedicated repair
@@ -117,7 +125,7 @@ python3 .github/pr-loop.py answer --pr "$PR_NUMBER" --text "Your decision"
 A revision that touches core or boundary code, or that the reviewer calls high
 risk, waits in `needs_human` after review and CI pass. The watcher notifies you
 and comments on the PR. Approve that exact head with a GitHub review, a
-maintainer comment `/approve <sha>`, or locally:
+maintainer comment `/approve <full sha>`, or locally:
 
 ```sh
 python3 .github/pr-loop.py approve --pr "$PR_NUMBER" --sha "$HEAD_SHA"

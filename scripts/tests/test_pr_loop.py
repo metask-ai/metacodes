@@ -22,17 +22,23 @@ from pr_loop.timeline import snapshot
 
 
 NORMAL = {"level": "normal", "reasons": []}
-PASS = {"verdict": "pass", "summary": "No blocking findings", "findings": [], "question": "", "risk": NORMAL}
-RETRY = {"verdict": "retry", "summary": "Repository tools timed out", "findings": [], "question": "", "risk": NORMAL}
+PASS = {"verdict": "pass", "summary": "No blocking findings", "findings": [], "followups": [], "question": "", "risk": NORMAL}
+RETRY = {"verdict": "retry", "summary": "Repository tools timed out", "findings": [], "followups": [], "question": "", "risk": NORMAL}
 FIX = {"verdict": "fix_required", "summary": "Incorrect result", "findings": [
-    {"path": "app.txt", "line": 1, "reason": "The result is incorrect", "acceptance": "The file says fixed"}], "question": "", "risk": NORMAL}
+    {"path": "app.txt", "line": 1, "reason": "The result is incorrect", "acceptance": "The file says fixed"}], "followups": [], "question": "", "risk": NORMAL}
 
+import os
+NO_SESSION = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")}
 HIGH = {"level": "high", "reasons": ["Deletes persisted sessions without a migration"]}
 DISPUTED = {"result": "disputed", "summary": "The finding misreads app.txt", "question": "",
             "rebuttals": [{"finding": 0, "argument": "bug is the specified output for this task"}]}
+DECIDE = {"verdict": "needs_decision", "summary": "Scope unclear", "findings": [], "followups": [],
+          "question": "Should app.txt keep the old output?", "risk": NORMAL}
+LEGACY_FIX = {k: v for k, v in FIX.items() if k not in ("risk", "followups")}
+FOLLOWUP = {"path": "lib.txt", "line": 3, "reason": "An existing parser drops CRLF", "acceptance": "CRLF parses"}
 
-# A stand-in for `claude -p`: records argv/stdin, answers with the schema the
-# controller asked for, and edits the checkout only on a worker turn.
+# A stand-in for `claude -p`: records argv/stdin, knows which sessions exist,
+# answers with the schema the controller asked for, and edits only as a worker.
 CLAUDE = r'''
 import json, pathlib, sys
 config, trace = map(pathlib.Path, sys.argv[1:3])
@@ -41,14 +47,30 @@ prompt = sys.stdin.read()
 cfg = json.loads(config.read_text())
 with trace.open("a") as f:
     f.write(json.dumps({"argv": argv, "stdin": prompt, "cwd": str(pathlib.Path.cwd().resolve())}) + "\n")
+sessions = cfg.setdefault("sessions", ["worker-7"])
+def save():
+    config.write_text(json.dumps(cfg))
+if "--session-id" in argv:
+    session = argv[argv.index("--session-id") + 1]
+    if cfg.get("fail_launch"):
+        cfg["fail_launch"] -= 1
+        save()
+        print("launch failed before the session existed", file=sys.stderr)
+        sys.exit(2)
+    sessions.append(session)
+else:
+    session = argv[argv.index("--resume") + 1]
+    if session not in sessions:
+        save()
+        print(f"No conversation found with session ID: {session}", file=sys.stderr)
+        sys.exit(1)
 schema = json.loads(argv[argv.index("--json-schema") + 1])
 if "verdict" in schema["properties"]:
     output = cfg["claude_reports"].pop(0)
 else:
     output = {"result": "updated", "summary": "Claude fixed it", "question": "", "rebuttals": []}
     pathlib.Path("app.txt").write_text(cfg["worker_texts"].pop(0))
-config.write_text(json.dumps(cfg))
-session = argv[argv.index("--session-id") + 1] if "--session-id" in argv else argv[argv.index("--resume") + 1]
+save()
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": session,
                   "structured_output": output}))
 '''
@@ -125,8 +147,9 @@ class FixtureGitHub(GitHub):
         self.base_branch = "main"
         self.snapshots = 0
         self.read_unavailable = False
-        self.reviews, self.comments, self.posted, self.requested = [], [], [], []
+        self.reviews, self.comments, self.posted, self.requested, self.created = [], [], [], [], []
         self.roles = {}
+        self.forks = {"example/source": DEFAULT_REPO}
 
     def api(self, path, method="GET", payload=None):
         self.calls.append((path, method, payload))
@@ -166,6 +189,12 @@ class FixtureGitHub(GitHub):
                 "status": "in_progress" if self.check_state == "pending" else "completed",
                 "conclusion": self.check_state, "html_url": "https://github.com/check/1"}
                 for i, name in enumerate(REQUIRED_CHECKS)]}
+        if path == f"repos/{DEFAULT_REPO}/pulls" and method == "POST":
+            self.created.append(payload)
+            return {"html_url": f"https://github.com/{DEFAULT_REPO}/pull/7"}
+        if path.startswith("repos/") and path.count("/") == 2 and method == "GET":
+            name = path.removeprefix("repos/")
+            return {"fork": name in self.forks, "source": {"full_name": self.forks.get(name, name)}}
         if "/pulls/7/reviews?" in path:
             return self.reviews
         if "/issues/7/comments" in path:
@@ -508,7 +537,7 @@ class LoopIntegrationTest(unittest.TestCase):
         git(self.work, 'commit', '-qam', 'preserved local checkpoint')
         checkpoint = git(self.work, 'rev-parse', 'HEAD')
         self.store.update(self.binding, State.DECISION, head=self.head, base=self.base,
-                          checkpoint=checkpoint, report=json.dumps(FIX), agent_runs=16,
+                          checkpoint=checkpoint, report=json.dumps(LEGACY_FIX), agent_runs=16,
                           rounds=5, reason='agent-run budget exhausted (16)')
         legacy = dict(self.binding.__dict__, max_rounds=5, max_agent_runs=16)
         with self.store.db:
@@ -518,7 +547,7 @@ class LoopIntegrationTest(unittest.TestCase):
         try:
             restarted.bind(self.binding)  # old count caps do not change worker identity
             restarted.answer(DEFAULT_REPO, 7, 'Remove fixed call and repair-round caps')
-            self.assertEqual(json.loads(self.row()['report']), FIX)
+            self.assertEqual(json.loads(self.row()['report']), LEGACY_FIX)
             self.assertEqual(self.row()['checkpoint'], checkpoint)
             self.assertEqual((self.row()['agent_runs'], self.row()['rounds']), (16, 5))
             self.assertNotIn('max_agent_runs', json.loads(self.row()['binding']))
@@ -580,24 +609,21 @@ class LoopIntegrationTest(unittest.TestCase):
 
     def test_submit_creates_upstream_pr_with_worker_and_timeout_without_count_caps(self):
         from pr_loop import __main__ as cli
-        capture, shim = self.root / "create.json", self.root / "create.py"
-        shim.write_text("import json,sys,pathlib; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:])); print('https://github.com/metask-ai/metacodes/pull/7')")
-        self.github.command = (sys.executable, str(shim), str(capture))
         body = self.root / "body.md"
         body.write_text("PR description\n")
         state = self.root / "submitted.sqlite3"
-        with patch.object(cli, "GitHub", return_value=self.github):
+        with patch.object(cli, "GitHub", return_value=self.github), patch.dict("os.environ", NO_SESSION, clear=True):
             code = cli.main(["--state", str(state), "submit", "--thread", "worker-submit",
                 "--worktree", str(self.work), "--head", "example:feature", "--title", "fix: result",
                 "--body-file", str(body), "--timeout", "45"])
         self.assertEqual(code, 0)
-        argv = json.loads(capture.read_text())
-        self.assertEqual(argv[:4], ["pr", "create", "--repo", DEFAULT_REPO])
-        self.assertEqual(argv[argv.index("--head") + 1], "example:feature")
+        self.assertEqual(self.github.created[0]["head"], "example:feature")
+        self.assertEqual(self.github.created[0]["head_repo"], "example/source")
         submitted = Store(state)
         try:
             binding = json.loads(submitted.get(DEFAULT_REPO, 7)["binding"])
             self.assertEqual((binding['thread'], binding['timeout']), ('worker-submit', 45))
+            self.assertFalse(binding['attended'])  # no live session ran it
             self.assertNotIn('max_rounds', binding)
             self.assertNotIn('max_agent_runs', binding)
         finally:
@@ -612,6 +638,11 @@ class LoopIntegrationTest(unittest.TestCase):
         git(self.work, "push", "-q", "origin", "feature")
         return git(self.work, "rev-parse", "HEAD")
 
+    def rebind(self, **fields):
+        self.binding = replace(self.binding, **fields)
+        with self.store.db:
+            self.store.db.execute("UPDATE prs SET binding=?", (json.dumps(self.binding.__dict__),))
+
     def test_core_path_waits_for_exact_head_human_approval_then_merges(self):
         head = self.commit_feature("src/core/agent_loop.zig", "// changed\n")
         self.configure(reports=[PASS])
@@ -622,7 +653,7 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertFalse(self.github.merged)
         self.assertEqual(len(self.notifications), 1)
         self.assertIn(head[:12], self.notifications[0])
-        self.assertEqual(len(self.github.posted), 1)
+        self.assertEqual(len(self.github.posted), 1)  # the gate notice is posted even without mirroring
         self.assertIn(f"/approve {head}", self.github.posted[0])
         self.assertEqual(self.github.requested, [{"reviewers": ["wayfind"]}])
         self.controller.once()  # polling neither re-reviews nor re-notifies
@@ -637,18 +668,19 @@ class LoopIntegrationTest(unittest.TestCase):
         approved = [e["detail"] for e in events if e["state"] == "human_approved"]
         self.assertEqual(approved, [{"head": head, "source": "local", "by": "dev", "url": ""}])
 
-    def test_reviewer_risk_needs_maintainer_comment_naming_the_current_head(self):
+    def test_approval_comment_must_name_the_full_current_head(self):
         self.configure(reports=[dict(PASS, risk=HIGH)])
         self.github.roles = {"dev": "maintain", "outsider": "write"}
         self.github.comments = [
             {"user": {"login": "outsider"}, "body": f"/approve {self.head}"},   # not a maintainer
-            {"user": {"login": "dev"}, "body": "/approve 0123456789abcdef"},     # another revision
+            {"user": {"login": "dev"}, "body": f"/approve {self.head[:12]}"},   # an abbreviation could drift
+            {"user": {"login": "dev"}, "body": "/approve " + "0" * 40},         # another revision
             {"user": {"login": "stranger"}, "body": f"/approve {self.head}"},   # not a collaborator
         ]
         self.controller.once()
         self.assertEqual(self.row()["state"], "needs_human")
         self.assertIn("reviewer: Deletes persisted sessions", self.row()["reason"])
-        self.github.comments.append({"user": {"login": "dev"}, "body": f" /approve {self.head[:9]} ",
+        self.github.comments.append({"user": {"login": "dev"}, "body": f" /approve {self.head} ",
                                      "html_url": "https://github.com/c/1"})
         self.controller.once()
         self.assertEqual(self.row()["state"], "merged")
@@ -664,12 +696,60 @@ class LoopIntegrationTest(unittest.TestCase):
         self.controller.once()
         self.assertEqual(self.row()["state"], "merged")
 
+    def test_script_a_base_workflow_runs_needs_a_human(self):
+        git(self.work, "switch", "-q", "main")
+        (self.work / ".github/workflows").mkdir(parents=True)
+        (self.work / ".github/workflows/ci.yml").write_text("steps:\n  - run: python3 scripts/ci_scope.py --pr\n")
+        git(self.work, "add", ".")
+        git(self.work, "commit", "-qm", "workflow")
+        git(self.work, "push", "-q", "origin", "main")
+        self.github.base = git(self.work, "rev-parse", "HEAD")
+        git(self.work, "switch", "-q", "feature")
+        git(self.work, "merge", "-q", "--no-edit", "main")
+        self.commit_feature("scripts/ci_scope.py", "SKIP_EVERYTHING = True\n")
+        self.configure(reports=[PASS])
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_human")
+        self.assertIn("CI entry point run by a workflow: scripts/ci_scope.py", self.row()["reason"])
+
     def test_normal_risk_merges_without_human_or_notice(self):
         self.commit_feature("src/repl/hint.zig", "// ok\n")
         self.configure(reports=[PASS])
         self.controller.once()
         self.assertEqual(self.row()["state"], "merged")
         self.assertEqual((self.notifications, self.github.posted), ([], []))
+
+    def test_private_decisions_never_leave_the_machine(self):
+        self.rebind(mirror=True)
+        marker = "INCIDENT-4471 customer data was exposed"
+        echo = dict(PASS, summary=f"Per the developer: {marker}.", risk=dict(HIGH, reasons=[marker]))
+        self.configure(reports=[DECIDE, echo])
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_decision")
+        self.store.answer(DEFAULT_REPO, 7, marker)
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_human")
+        outbound = json.dumps([p for _, m, p in self.github.calls if m == "POST"])
+        self.assertNotIn("INCIDENT-4471", outbound)
+        self.assertIn("[private decision]", outbound)
+        self.assertIn(marker, self.row()["report"])  # local evidence keeps it
+
+    def test_mirror_posts_the_whole_conversation_to_the_pr(self):
+        self.rebind(mirror=True)
+        self.configure(reports=[FIX, dict(PASS, followups=[FOLLOWUP])], worker_texts=["fixed\n"])
+        self.controller.once()
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+        fixed = git(self.bare, "rev-parse", "feature")
+        posted = self.github.posted
+        self.assertIn("**fix_required**", posted[0])
+        self.assertIn("`app.txt:1`: The result is incorrect", posted[0])
+        self.assertIn("repair round 1 (codex, unattended fork): **updated**", posted[1])
+        self.assertIn(f"Pushed `{fixed}`", posted[1])
+        self.assertIn("**pass**", posted[2])
+        self.assertIn("Follow-ups", posted[2])
+        followups = [e for e in snapshot(self.store, DEFAULT_REPO, 7, 0)["events"] if e["state"] == "followups"]
+        self.assertEqual(followups[0]["detail"]["followups"], [FOLLOWUP])
 
     def test_worker_rebuttal_goes_to_a_fresh_review_without_a_push(self):
         self.configure(reports=[FIX, PASS], worker_result=DISPUTED)
@@ -685,77 +765,194 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual((self.row()["dispute"], self.row()["disputes"]), (None, 0))
         self.assertEqual(self.notifications, [])
 
-    def test_unresolved_dispute_becomes_a_human_decision(self):
-        self.configure(reports=[FIX, FIX, FIX], worker_result=DISPUTED)
+    def test_answered_dispute_goes_to_a_fresh_reviewer_with_the_ruling(self):
+        self.configure(reports=[FIX, FIX, FIX, PASS], worker_result=DISPUTED)
         for _ in range(3):
             self.controller.once()
         self.assertEqual(self.row()["state"], "needs_decision")
         self.assertIn("still disagree", self.notifications[-1])
         self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)
+        workers = len(self.requests("thread/fork")) + len(self.requests("thread/resume"))
+        self.store.answer(DEFAULT_REPO, 7, "Keep the current output; the worker is right.")
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+        self.assertEqual(len(self.requests("thread/fork")) + len(self.requests("thread/resume")), workers)
+        last_review = self.requests("turn/start")[-1]["params"]["input"][0]["text"]
+        self.assertIn("Keep the current output", last_review)
+        self.assertIn("bug is the specified output", last_review)
+
+    def test_missing_reviewer_executable_retries_without_a_decision(self):
+        self.controller.agents["codex"] = Codex(("/nonexistent/codex", "app-server"))
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "pending")
+        self.assertIn("retrying full review", self.row()["reason"])
+        self.assertEqual(self.notifications, [])
+        self.controller.agents["codex"] = self.codex
+        self.configure(reports=[PASS])
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
 
     def test_report_from_before_risk_classification_is_reviewed_again(self):
-        legacy = {k: v for k, v in PASS.items() if k != "risk"}
+        legacy = {k: v for k, v in PASS.items() if k not in ("risk", "followups")}
         self.store.update(self.binding, State.WAITING, head=self.head, base=self.base, report=json.dumps(legacy))
         self.configure(reports=[PASS])
         self.controller.once()
         self.assertEqual(len(self.requests("turn/start")), 1)
         self.assertEqual(self.row()["state"], "merged")
 
+    # ---- attended: the developer's own session is the worker ----------------------
+
+    def test_attended_feedback_waits_for_the_session_then_validates_and_pushes(self):
+        from pr_loop import __main__ as cli
+        self.rebind(attended=True, mirror=True)
+        self.configure(reports=[FIX, PASS])
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "awaiting_session")
+        self.assertEqual((self.requests("thread/fork"), self.requests("thread/resume")), ([], []))
+        self.assertIn("waiting in your session", self.notifications[-1])
+        shown = cli.render_feedback(self.row(), 7)
+        self.assertIn("[0] app.txt:1", shown)
+        self.controller.once()  # still waiting: nothing else happens
+        self.assertEqual(self.row()["state"], "awaiting_session")
+        (self.work / "app.txt").write_text("fixed\n")  # the live session edits in front of the developer
+        with self.assertRaisesRegex(LoopError, "existing finding"):
+            self.store.set_reply(DEFAULT_REPO, 7, dict(DISPUTED, rebuttals=[{"finding": 4, "argument": "x"}]))
+        state = str(self.store.path)
+        self.assertEqual(cli.main(["--state", state, "reply", "--pr", "7", "--result", "updated",
+                                   "--summary", "Wrote the fixed output"]), 0)
+        self.controller.once()
+        fixed = git(self.bare, "rev-parse", "feature")
+        self.assertNotEqual(fixed, self.head)
+        self.assertIn("repair round 1 (codex, your session): **updated**", self.github.posted[1])
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+        lines = [cli.inbox_line(e, 7) for e in snapshot(self.store, DEFAULT_REPO, 7, 0)["events"]]
+        self.assertTrue(any("feedback waiting for your session" in l for l in lines))
+        self.assertTrue(any("repair updated: Wrote the fixed output" in l for l in lines))
+
+    def test_attended_gate_failure_returns_to_the_session(self):
+        self.rebind(attended=True)
+        self.configure(reports=[FIX, PASS])
+        self.controller.once()
+        (self.work / "app.txt").write_text("almost\n")
+        self.store.set_reply(DEFAULT_REPO, 7, {"result": "updated", "summary": "try", "question": "", "rebuttals": []})
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "awaiting_session")
+        self.assertIn("local_gate_failure", self.row()["feedback"])
+        self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)  # the failed checkpoint stays local
+        (self.work / "app.txt").write_text("fixed\n")
+        self.store.set_reply(DEFAULT_REPO, 7, {"result": "updated", "summary": "fixed", "question": "", "rebuttals": []})
+        self.controller.once()
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+
+    def test_attended_session_survives_a_moved_main(self):
+        self.rebind(attended=True)
+        self.configure(reports=[FIX, PASS])
+        self.controller.once()
+        (self.work / "app.txt").write_text("fixed\n")  # editing in progress
+        self.github.base = "b" * 40  # main moved meanwhile
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "awaiting_session")
+        self.assertEqual(self.notifications[-1].count("decision"), 0)
+
+    def test_silent_session_falls_back_to_an_unattended_fork(self):
+        self.rebind(attended=True, attended_timeout=60)
+        self.configure(reports=[FIX, PASS], worker_texts=["fixed\n"])
+        self.controller.once()
+        with self.store.db:
+            self.store.db.execute("UPDATE events SET at=at-120 WHERE state='awaiting_session'")
+        self.controller.once()
+        self.assertEqual(self.requests("thread/fork")[0]["params"]["threadId"], "worker-7")
+        self.assertNotEqual(git(self.bare, "rev-parse", "feature"), self.head)
+        events = [e["state"] for e in snapshot(self.store, DEFAULT_REPO, 7, 0)["events"]]
+        self.assertIn("attended_timeout", events)
+
+    def test_only_the_source_session_can_attach(self):
+        with self.assertRaisesRegex(LoopError, "source session"):
+            self.store.attach(DEFAULT_REPO, 7, "someone-else", True)
+        binding = self.store.attach(DEFAULT_REPO, 7, "worker-7", True, mirror=True)
+        self.assertTrue(binding.attended and binding.mirror)
+        self.assertFalse(self.store.attach(DEFAULT_REPO, 7, None, False).attended)
+
+    # ---- Claude Code ------------------------------------------------------------------
+
     def claude_controller(self, reviewer):
         fake, ctrace = self.root / "claude.py", self.root / "claude.jsonl"
         fake.write_text(CLAUDE)
         claude = Claude((sys.executable, str(fake), str(self.config), str(ctrace)))
-        binding = replace(self.binding, agent="claude", reviewer=reviewer)
-        with self.store.db:
-            self.store.db.execute("UPDATE prs SET binding=?", (json.dumps(binding.__dict__),))
+        self.rebind(agent="claude", reviewer=reviewer)
         self.controller.agents["claude"] = claude
         return ctrace
+
+    def claude_calls(self, ctrace):
+        return [json.loads(line) for line in ctrace.read_text().splitlines()]
 
     def test_claude_session_forks_once_then_resumes_and_codex_reviews(self):
         ctrace = self.claude_controller("codex")
         self.configure(reports=[FIX, PASS], worker_texts=["still bug\n", "fixed\n"])
         self.controller.once()   # the first repair fails the gate, so the same worker repairs again
-        calls = [json.loads(line) for line in ctrace.read_text().splitlines()]
-        first, second = calls[0]["argv"], calls[1]["argv"]
-        worker = first[first.index("--session-id") + 1]
-        self.assertEqual(first[first.index("--resume") + 1], "worker-7")
-        self.assertIn("--fork-session", first)
-        self.assertEqual(second[second.index("--resume") + 1], worker)
-        self.assertNotIn("--fork-session", second)
-        self.assertIn("local_gate_failure", calls[1]["stdin"])
-        self.assertEqual(self.row()["worker_thread"], worker)
-        self.assertEqual(first[first.index("--tools") + 1], "Read,Edit,Write,Glob,Grep,Bash")
-        allowed = first[first.index("--allowedTools") + 1:first.index("--permission-prompts")]
-        self.assertTrue(all(a.startswith("Bash(git ") or a == "Bash(rg:*)" for a in allowed))
-        self.assertEqual(first[first.index("--permission-prompts") + 1], "none")
-        self.assertIn("--strict-mcp-config", first)
-        self.assertIn("Incorrect result", calls[0]["stdin"])
-        self.assertEqual(calls[0]["cwd"], str(self.work.resolve()))
+        calls = self.claude_calls(ctrace)
+        reserved = self.row()["worker_thread"]
+        # The reserved ID is tried first; it does not exist yet, so the fork creates it.
+        self.assertEqual(calls[0]["argv"][calls[0]["argv"].index("--resume") + 1], reserved)
+        fork = calls[1]["argv"]
+        self.assertEqual(fork[fork.index("--session-id") + 1], reserved)
+        self.assertIn("--fork-session", fork)
+        self.assertIn("worker-7", fork)
+        again = calls[2]["argv"]
+        self.assertEqual(again[again.index("--resume") + 1], reserved)
+        self.assertNotIn("--fork-session", again)
+        self.assertIn("local_gate_failure", calls[2]["stdin"])
+        self.assertEqual(fork[fork.index("--tools") + 1], "Read,Edit,Write,Glob,Grep")
+        for flag in ("--strict-mcp-config", "--setting-sources"):
+            self.assertIn(flag, fork)
+        self.assertEqual(fork[fork.index("--setting-sources") + 1], "user")
+        self.assertNotIn("--allowedTools", fork)
+        self.assertEqual(fork[fork.index("--permission-prompts") + 1], "none")
+        self.assertIn("Incorrect result", calls[1]["stdin"])
+        self.assertEqual(calls[1]["cwd"], str(self.work.resolve()))
         self.controller.once()
         self.assertEqual(self.row()["state"], "merged")
         self.assertEqual(len(self.requests("thread/start")), 2)  # the Codex reviewer judged both revisions
+
+    def test_claude_fork_that_never_launched_is_created_on_the_next_repair(self):
+        ctrace = self.claude_controller("codex")
+        self.configure(reports=[FIX, PASS], worker_texts=["fixed\n"], fail_launch=1)
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_decision")
+        reserved = self.row()["worker_thread"]
+        self.store.answer(DEFAULT_REPO, 7, "The launcher is fixed; continue.")
+        self.controller.once()
+        self.assertEqual(self.row()["worker_thread"], reserved)
+        last = self.claude_calls(ctrace)[-1]["argv"]
+        self.assertEqual(last[last.index("--session-id") + 1], reserved)
+        self.assertIn("--fork-session", last)
+        self.assertNotEqual(git(self.bare, "rev-parse", "feature"), self.head)
 
     def test_claude_reviewer_is_read_only_and_adversarial(self):
         ctrace = self.claude_controller("claude")
         self.configure(claude_reports=[PASS])
         self.controller.once()
         self.assertEqual(self.row()["state"], "merged")
-        call = json.loads(ctrace.read_text().splitlines()[0])
+        call = self.claude_calls(ctrace)[0]
         argv = call["argv"]
         self.assertNotIn("--resume", argv)
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
-        self.assertNotIn("Edit", argv[argv.index("--tools") + 1])
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Glob,Grep")
         self.assertIn("adversarial reviewer", call["stdin"])
-        self.assertNotEqual(call["cwd"], str(self.work.resolve()))  # a detached review snapshot
+        self.assertIn("pr.diff", call["stdin"])
+        tree = Path(call["cwd"])
+        self.assertNotEqual(tree, self.work.resolve())  # a detached review snapshot
+        self.assertEqual(Path(argv[argv.index("--add-dir") + 1]).resolve(), tree.parent)
         self.assertEqual(self.requests("turn/start"), [])
+
+    # ---- ship -------------------------------------------------------------------------
 
     def test_ship_pushes_the_confirmed_branch_then_opens_and_registers_it(self):
         from pr_loop import __main__ as cli
         local = self.commit_feature("app.txt", "shipped\n")
         git(self.bare, "update-ref", "refs/heads/feature", self.head)  # the new commit is not on GitHub yet
-        capture, shim = self.root / "create.json", self.root / "create.py"
-        shim.write_text("import json,sys,pathlib; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:])); print('https://github.com/metask-ai/metacodes/pull/7')")
-        self.github.command = (sys.executable, str(shim), str(capture))
         body = self.root / "body.md"
         body.write_text("PR description\n")
         state = self.root / "shipped.sqlite3"
@@ -765,15 +962,30 @@ class LoopIntegrationTest(unittest.TestCase):
                              "--title", "fix: result", "--body-file", str(body)])
         self.assertEqual(code, 0)
         self.assertEqual(git(self.bare, "rev-parse", "feature"), local)
-        argv = json.loads(capture.read_text())
-        self.assertEqual(argv[argv.index("--head") + 1], "example:feature")
+        self.assertEqual(self.github.created, [{"title": "fix: result", "body": "PR description\n", "base": "main",
+                                                "head": "example:feature", "head_repo": "example/source"}])
         shipped = Store(state)
         try:
             binding = json.loads(shipped.get(DEFAULT_REPO, 7)["binding"])
             self.assertEqual((binding["agent"], binding["reviewer"], binding["thread"]),
                              ("claude", "codex", env["CLAUDE_CODE_SESSION_ID"]))
+            self.assertTrue(binding["attended"] and binding["mirror"])
         finally:
             shipped.close()
+
+    def test_ship_refuses_a_head_outside_the_upstream_network_before_pushing(self):
+        from pr_loop import __main__ as cli
+        local = self.commit_feature("app.txt", "shipped\n")
+        git(self.bare, "update-ref", "refs/heads/feature", self.head)
+        self.github.forks = {}
+        body = self.root / "body.md"
+        body.write_text("x\n")
+        with patch.object(cli, "GitHub", return_value=self.github):
+            code = cli.main(["--state", str(self.root / "s.sqlite3"), "ship", "--thread", "t1", "--worktree",
+                             str(self.work), "--title", "t", "--body-file", str(body)])
+        self.assertEqual(code, 1)
+        self.assertNotEqual(git(self.bare, "rev-parse", "feature"), local)
+        self.assertEqual(self.github.created, [])
 
     def test_ship_refuses_main(self):
         from pr_loop import __main__ as cli
@@ -789,6 +1001,23 @@ class LoopIntegrationTest(unittest.TestCase):
 
 
 class BoundaryTest(unittest.TestCase):
+    def test_timeout_reaps_descendants_holding_the_pipes(self):
+        import time
+        start = time.monotonic()
+        # The launcher exits at once; its child keeps stdout open in the same group.
+        launcher = "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])"
+        with self.assertRaisesRegex(LoopError, "timeout"):
+            run([sys.executable, "-c", launcher], timeout=1)
+        # A descendant in its own session escapes the group: collection is abandoned, not awaited.
+        escaped = ("import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+                   "start_new_session=True); import time; time.sleep(60)")
+        with tempfile.TemporaryFile(mode="w+") as log:
+            with self.assertRaisesRegex(LoopError, "timeout"):
+                run([sys.executable, "-c", escaped], timeout=1, log=log)
+            log.seek(0)
+            self.assertIn("abandoned", log.read())
+        self.assertLess(time.monotonic() - start, 20)
+
     def test_risk_rules_cover_kernel_boundaries_but_not_ordinary_code(self):
         hits = risk.classify(["src/core/agent_loop.zig", "src/permission/rule.zig", "src/api/oauth_login.zig",
                               ".github/pr_loop/risk.py", "doc/AGENTS.md", "src/repl/hint.zig", "doc/guide.md"])

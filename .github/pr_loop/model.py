@@ -59,6 +59,9 @@ class State(str, Enum):
     # Every automatic gate passed; a high-risk head waits for a human approval
     # bound to its exact SHA. Polling continues so approvals are observed.
     HUMAN = "needs_human"
+    # Attended binding: findings wait for the developer's own live session,
+    # which edits in front of the developer and answers with `pr-loop reply`.
+    AWAITING = "awaiting_session"
     MERGED = "merged"
     CLOSED = "closed"
 
@@ -80,11 +83,17 @@ class Binding:
     # Registrations made before multi-agent support were Codex on both sides.
     agent: str = Agent.CODEX.value
     reviewer: str = Agent.CODEX.value
+    # Attended: repairs go to the developer's live session, with an unattended
+    # fork only after attended_timeout seconds without a reply.
+    attended: bool = False
+    attended_timeout: int = 3600
+    # Mirror reviews, replies and gate events to the PR conversation.
+    mirror: bool = False
 
     def __post_init__(self):
         if not REPO.fullmatch(self.repo) or not REPO.fullmatch(self.head_repo):
             raise LoopError("repository must be OWNER/REPO")
-        if self.number < 1 or self.timeout < 1:
+        if self.number < 1 or self.timeout < 1 or self.attended_timeout < 1:
             raise LoopError("PR number and timeout must be positive")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.thread):
             raise LoopError("an explicit worker session or thread ID is required")
@@ -135,23 +144,27 @@ class Snapshot:
         return self.head, self.base
 
 
+FINDING = {
+    "type": "object", "properties": {
+        "path": {"type": "string"}, "line": {"type": "integer"},
+        "reason": {"type": "string"}, "acceptance": {"type": "string"},
+    }, "required": ["path", "line", "reason", "acceptance"], "additionalProperties": False,
+}
+
 REPORT_SCHEMA = {
     "type": "object",
     "properties": {
         "verdict": {"type": "string", "enum": [v.value for v in Verdict]},
         "summary": {"type": "string"},
-        "findings": {"type": "array", "items": {
-            "type": "object", "properties": {
-                "path": {"type": "string"}, "line": {"type": "integer"},
-                "reason": {"type": "string"}, "acceptance": {"type": "string"},
-            }, "required": ["path", "line", "reason", "acceptance"], "additionalProperties": False,
-        }},
+        "findings": {"type": "array", "items": FINDING},
+        # Pre-existing defects this PR does not cause: a separate session and PR.
+        "followups": {"type": "array", "items": FINDING},
         "question": {"type": "string"},
         "risk": {"type": "object", "properties": {
             "level": {"type": "string", "enum": ["normal", "high"]},
             "reasons": {"type": "array", "items": {"type": "string"}},
         }, "required": ["level", "reasons"], "additionalProperties": False},
-    }, "required": ["verdict", "summary", "findings", "question", "risk"], "additionalProperties": False,
+    }, "required": ["verdict", "summary", "findings", "followups", "question", "risk"], "additionalProperties": False,
 }
 
 REPORT_KEYS = frozenset(REPORT_SCHEMA["required"])
@@ -178,9 +191,10 @@ def validate_report(value: dict) -> dict:
         raise LoopError("reviewer returned an invalid verdict") from exc
     if not isinstance(value["summary"], str) or not value["summary"].strip():
         raise LoopError("review report has no summary")
-    if not isinstance(value["question"], str) or not isinstance(value["findings"], list):
-        raise LoopError("invalid findings or question")
-    for finding in value["findings"]:
+    if (not isinstance(value["question"], str) or not isinstance(value["findings"], list)
+            or not isinstance(value["followups"], list)):
+        raise LoopError("invalid findings, follow-ups or question")
+    for finding in value["findings"] + value["followups"]:
         if not isinstance(finding, dict) or set(finding) != {"path", "line", "reason", "acceptance"}:
             raise LoopError("invalid finding")
         path = finding["path"]
@@ -205,6 +219,21 @@ def validate_report(value: dict) -> dict:
     if risk["level"] == "high" and not risk["reasons"]:
         raise LoopError("a high-risk classification needs a reason")
     return value
+
+
+def upgrade_report(value):
+    """A report stored before scope and risk classification, or None.
+
+    Repair evidence stays usable: a cached fix_required report keeps driving
+    the (possibly checkpointed) repair, and risk only matters for a pass. A
+    cached pass is never upgraded: risk is unknown, so it is reviewed again.
+    """
+    if not isinstance(value, dict) or set(value) == REPORT_KEYS:
+        return value
+    if set(value) - REPORT_KEYS or value.get("verdict") == Verdict.PASS.value:
+        return None
+    upgraded = {"followups": [], "risk": {"level": "normal", "reasons": []}, **value}
+    return upgraded if set(upgraded) == REPORT_KEYS else None
 
 
 def validate_worker(value: dict, findings: int) -> dict:

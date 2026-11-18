@@ -85,10 +85,21 @@ Before handing a PR over, confirm that the developer has the watcher running.
 - Register the invoking session explicitly. Codex sessions and Claude Code
   sessions are both supported (`--agent codex|claude`); run from inside the
   session, `ship` detects it from `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`.
-  The checkout must be clean. The watcher forks the source session once into
-  a dedicated repair worker and saves that worker ID before its first edit;
-  the source session stays free for discussion. Avoid concurrent edits to the
-  bound worktree. Do not invent a session ID.
+  The checkout must be clean. Do not invent a session ID.
+- The loop must stay visible to the developer. A PR shipped from a live
+  session is attended: review feedback waits for that session instead of a
+  background worker. Right after `ship`, watch
+  `python3 .github/pr-loop.py inbox --pr N --follow`. When feedback arrives,
+  show the developer `pr-loop.py feedback --pr N` in full, fix or rebut each
+  finding in front of them, and answer with `pr-loop.py reply`; do not commit
+  or push yourself. Reviews, replies and gate results are also mirrored to the
+  PR conversation. Only when the session stays silent past its timeout does
+  the watcher fork it into an unattended worker; `pr-loop.py attach --pr N`
+  routes feedback back to the live session.
+- Fix in the current session only what the PR introduced. A reviewer
+  follow-up is a pre-existing defect outside this PR's scope: after the
+  developer agrees, fix it in a new session and worktree and ship it as a
+  separate PR. Never widen the current PR to absorb it.
 - The controller reviews each head/base revision in a fresh, read-only,
   adversarial conversation, by default with the other agent than the worker
   (`--reviewer`). Blocking findings, failed CI and failed local validation go
@@ -118,7 +129,7 @@ Before handing a PR over, confirm that the developer has the watcher running.
   policy) or when the reviewer classifies it as high risk. The watcher notifies
   the developer, comments on the PR once per head, and keeps repairing CI while
   it waits. Approve with a GitHub review on that commit, a maintainer comment
-  `/approve <sha>`, or `python3 .github/pr-loop.py approve --pr N --sha <sha>`.
+  `/approve <full sha>`, or `python3 .github/pr-loop.py approve --pr N --sha <sha>`.
   A later push requires a new approval. Never approve on the developer's behalf.
   Stale branches, merge conflicts and failed checks are not human work: the
   controller merges main and the worker resolves them.

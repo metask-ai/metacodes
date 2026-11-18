@@ -41,10 +41,18 @@ RULES = (
 )
 
 
-def classify(paths):
-    """Return {reason: [paths]} for every changed path a rule covers."""
+def classify(paths, ci_entry_points=()):
+    """Return {reason: [paths]} for every changed path a rule covers.
+
+    ci_entry_points are the files the trusted base's workflows run directly
+    (scripts/ci_scope.py, gate scripts): changing one changes what CI proves.
+    """
     hits = {}
+    entry = set(ci_entry_points)
     for path in paths:
+        if path in entry:
+            hits.setdefault("CI entry point run by a workflow", []).append(path)
+            continue
         for pattern, reason in RULES:
             if fnmatchcase(path, pattern):
                 hits.setdefault(reason, []).append(path)
@@ -52,10 +60,20 @@ def classify(paths):
     return hits
 
 
-def reasons(paths, report):
+def reasons(paths, report, ci_entry_points=()):
     """Path rules and the adversarial reviewer's own risk call, in one list."""
     found = [f"{reason}: {', '.join(sorted(files)[:5])}{' …' if len(files) > 5 else ''}"
-             for reason, files in sorted(classify(paths).items())]
+             for reason, files in sorted(classify(paths, ci_entry_points).items())]
     if report["risk"]["level"] == "high":
         found.extend("reviewer: " + reason for reason in report["risk"]["reasons"])
+    return found
+
+
+def public_reasons(paths, report, ci_entry_points=()):
+    """Controller-generated text only: safe to publish on the PR."""
+    found = [f"{reason}: {', '.join(sorted(files)[:5])}{' …' if len(files) > 5 else ''}"
+             for reason, files in sorted(classify(paths, ci_entry_points).items())]
+    if report["risk"]["level"] == "high":
+        found.append(f"the adversarial reviewer classified this revision high risk "
+                     f"({len(report['risk']['reasons'])} concern(s), recorded locally)")
     return found

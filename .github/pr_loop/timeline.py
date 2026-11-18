@@ -16,6 +16,8 @@ LABELS = {
     "closed": "已关闭", "needs_decision": "等待处理决定",
     "needs_human": "等待人工批准", "human_requested": "请求人工批准",
     "human_approved": "人工已批准", "notice_failed": "通知失败",
+    "awaiting_session": "等待本地会话", "feedback_sent": "意见已发往会话",
+    "attended_timeout": "会话超时转后台", "followups": "后续问题",
 }
 
 
