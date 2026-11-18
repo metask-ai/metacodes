@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -82,18 +83,25 @@ def prepare(spec, env):
 
 
 def supervise_remote(remote, spec, env, spec_path, record_path, record):
-    """Run Harbor on an SSH executor: heartbeat, cancel, incremental sync."""
+    """Run Harbor on an SSH executor: heartbeat, cancel, background sync.
+
+    The receipt is rewritten every two seconds whatever the copy-back is
+    doing (RunManager shows a receipt older than 30 seconds as interrupted),
+    and the run is `finished` only when the final copy was verified
+    complete; otherwise the receipt says where the results still are."""
     # The run's key plus the suite's execution-host variables (a judge key),
     # all over the SSH channel's stdin.
     secret_env = {name: env[name] for name in spec.get("forward_env") or () if env.get(name)}
     secret_env[spec["key_env"]] = env[spec["key_env"]]
     remote.start(secret_env, spec["remote_spec_path"])
     record.update(status="running", executor=spec["executor"]["name"])
+    remote.start_sync()
+    cancel_path = spec_path.with_suffix(".cancel")
     cancelled_at = None
-    last_write = last_sync = 0.0
+    last_write = 0.0
     while remote.process.poll() is None:
         now_s = time.monotonic()
-        if spec_path.with_suffix(".cancel").exists() and cancelled_at is None:
+        if cancel_path.exists() and cancelled_at is None:
             cancelled_at = now_s
             record["status"] = "cancelling"
             remote.cancel()
@@ -106,23 +114,46 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record):
             record["error"] = "远程执行机器心跳超时"
             cancelled_at = now_s
             remote.hang_up()
-        if now_s - last_sync > remote.SYNC_INTERVAL:
-            remote.sync()
-            last_sync = time.monotonic()
         if now_s - last_write > 2:
             atomic_json(record_path, record)
             last_write = time.monotonic()
         time.sleep(0.25)
     remote.hang_up()
-    remote.sync()
+    # Copy what is left beside the heartbeat; a cancel now stops the copy
+    # (the results stay on the executor and the receipt says so). A lost
+    # channel (no exit event) tries briefly: the host is likely unreachable.
+    stop = threading.Event()
+    timeout = None if remote.exit_code() is not None else min(remote.final_timeout, 120)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        copying = pool.submit(remote.final_sync, stop, timeout)
+        while not copying.done():
+            if cancel_path.exists() and cancelled_at is None:
+                stop.set()
+            if time.monotonic() - last_write > 2:
+                atomic_json(record_path, record)
+                last_write = time.monotonic()
+            concurrent.futures.wait([copying], timeout=0.25)
+    try:
+        complete = copying.result()
+    except Exception as exc:  # never lose the run's outcome to the copy
+        remote.log(f"同步远程作业目录失败：{type(exc).__name__}: {exc}")
+        complete = False
     code = remote.exit_code()
     if code is None:
         record.update(status="cancelled" if cancelled_at and not record.get("error") else "failed",
                       exit_code=remote.process.returncode, finished_at=now(),
                       error=record.get("error") or ("SSH 连接中断" if not cancelled_at else None))
-        return
-    record.update(status="cancelled" if cancelled_at else ("finished" if code == 0 else "failed"),
-                  exit_code=code, finished_at=now())
+    else:
+        record.update(status="cancelled" if cancelled_at else ("finished" if code == 0 else "failed"),
+                      exit_code=code, finished_at=now())
+    if not complete:
+        note = remote.results_note()
+        message = (f"结果未能完整同步回本机，仍在执行机器 {note['executor']} 的 {note['path']}；"
+                   f"同步后再查看：{note['retry']}")
+        if record["status"] == "finished":
+            record["status"] = "failed"
+        record.update(remote_results={**note, "message": message},
+                      error="；".join(e for e in (record.get("error"), message) if e))
 
 
 def main(argv=None):

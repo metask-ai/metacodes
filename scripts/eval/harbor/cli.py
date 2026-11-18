@@ -195,7 +195,7 @@ def prepare_suite(args, root, config, cfg):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
     parser.add_argument("action", nargs="?", default="open",
-                        choices=["open", "info", "list", "run", "stop", "prepare", "setup", "db"])
+                        choices=["open", "info", "list", "run", "stop", "prepare", "setup", "db", "sync"])
     parser.add_argument("db_command", nargs="?", choices=["status", "import", "migrate"], help="bench db 的子命令")
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
     parser.add_argument("--url", default=os.environ.get("METACODES_BENCH_URL"), help="连接已有工作台（例如 devbox）")
@@ -220,7 +220,7 @@ def main(argv=None):
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--wait", action="store_true", help="等待评测结束后返回结果和工作台链接")
-    parser.add_argument("--store-sqlite", type=Path, help="评测数据库使用该 SQLite 文件")
+    parser.add_argument("--store-sqlite", help="评测数据库使用该 SQLite 文件")
     parser.add_argument("--store-postgres", metavar="DSN", help="评测数据库使用 PostgreSQL（DSN 不含密码）")
     parser.add_argument("--store-password-env", metavar="NAME", help="PostgreSQL 密码所在的环境变量名")
     parser.add_argument("--to", metavar="TARGET", help="bench db migrate 的目标：SQLite 路径或 postgresql:// DSN")
@@ -228,6 +228,7 @@ def main(argv=None):
     parser.add_argument("--switch", action="store_true", help="迁移校验后切换工作台到目标数据库")
     parser.add_argument("--verify", action="store_true", help="bench db import 按内容重新校验每个文件")
     parser.add_argument("--executor", help="执行机器名称（workbench.json 的 executors）")
+    parser.add_argument("--run", metavar="NAME", help="sync：把这次 SSH 执行机器运行的结果同步回本机")
     parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令")
     parser.add_argument("--bundle-version", help="setup：下载这个发行版本的 Linux 包（X.Y.Z）")
     parser.add_argument("--source", type=Path, help="setup：开发版从这个源码目录交叉编译 Linux 包")
@@ -250,7 +251,8 @@ def main(argv=None):
         config = root / "workbench.json"
         cfg = settings(config)
         if args.store_sqlite:
-            cfg["store"] = store_config.SqliteConfig(args.store_sqlite.expanduser().resolve()).to_json()
+            store_config.check_sqlite_path(args.store_sqlite)  # before a path collapses `://`
+            cfg["store"] = store_config.SqliteConfig(Path(args.store_sqlite).expanduser().resolve()).to_json()
         elif args.store_postgres:
             cfg["store"] = store_config.PostgresConfig(args.store_postgres, args.store_password_env).to_json()
         store = store_config.for_workbench(cfg, config)
@@ -304,6 +306,14 @@ def main(argv=None):
             value = prepare_suite(args, root, config, cfg)
             print(json.dumps(value, ensure_ascii=False) if args.json else
                   f"{value['suite']}：{value['task_count']} 道任务 → {value['dataset']}")
+            return 0
+        if args.action == "sync":
+            if not args.run:
+                parser.error("bench sync 需要 --run NAME")
+            from scripts.eval.harbor.viewer import executors
+            value = executors.sync_run(jobs_dir, args.run, log=lambda text: print(text, file=sys.stderr, flush=True))
+            print(json.dumps(value, ensure_ascii=False) if args.json else
+                  f"{value['name']}：已同步 {value['files']} 个文件到 {value['local_dir']}（{value['status']}）")
             return 0
         if args.action == "stop":
             saved = settings(root / "service.json")

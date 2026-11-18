@@ -7,6 +7,8 @@ is opened, so SQLite users need nothing beyond the standard library.
 from __future__ import annotations
 
 import datetime as dt
+import json
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -33,6 +35,36 @@ def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+# Text the database must refuse: a lone UTF-16 surrogate (a broken emoji in
+# a trajectory, a non-UTF-8 file name decoded with surrogateescape) cannot be
+# encoded as UTF-8 by either driver, and PostgreSQL TEXT cannot hold NUL.
+_UNSTORABLE = re.compile("[\ud800-\udfff\x00]")
+
+
+def clean_text(value: str) -> str:
+    """`value` as both backends store it: lone surrogates and NUL become
+    U+FFFD. Applied to every bound string, so SQLite and PostgreSQL hold the
+    same text and a migration between them compares equal."""
+    return _UNSTORABLE.sub("\ufffd", value) if _UNSTORABLE.search(value) else value
+
+
+def json_text(value: Any) -> str:
+    """JSON text that is valid UTF-8: a lone surrogate inside a string is
+    written as its `\\uXXXX` escape (json.loads reads back the same value);
+    NUL is always escaped by json.dumps."""
+    text = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    if not _SURROGATE.search(text):
+        return text
+    return _SURROGATE.sub(lambda match: "\\u%04x" % ord(match.group()), text)
+
+
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _bind(params: Sequence[Any]) -> Tuple[Any, ...]:
+    return tuple(clean_text(v) if isinstance(v, str) else v for v in params)
+
+
 class Tx:
     """One transaction on one connection."""
 
@@ -46,7 +78,7 @@ class Tx:
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         cursor = self.connection.cursor()
         try:
-            cursor.execute(self._sql(sql), tuple(params))
+            cursor.execute(self._sql(sql), _bind(params))
             return cursor.rowcount
         finally:
             cursor.close()
@@ -56,14 +88,14 @@ class Tx:
             return
         cursor = self.connection.cursor()
         try:
-            cursor.executemany(self._sql(sql), [tuple(row) for row in rows])
+            cursor.executemany(self._sql(sql), [_bind(row) for row in rows])
         finally:
             cursor.close()
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> List[Tuple[Any, ...]]:
         cursor = self.connection.cursor()
         try:
-            cursor.execute(self._sql(sql), tuple(params))
+            cursor.execute(self._sql(sql), _bind(params))
             return [tuple(row) for row in cursor.fetchall()]
         finally:
             cursor.close()
@@ -79,7 +111,7 @@ class Tx:
         else:
             cursor = self.connection.cursor()
         try:
-            cursor.execute(self._sql(sql), tuple(params))
+            cursor.execute(self._sql(sql), _bind(params))
             while True:
                 rows = cursor.fetchmany(size)
                 if not rows:

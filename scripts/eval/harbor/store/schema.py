@@ -5,17 +5,21 @@ edited. `schema_migrations` records the applied versions, and a store whose
 version is newer than this code is refused rather than misread.
 
 The SQL is written once for SQLite and PostgreSQL: natural keys (job name,
-trial name, path) instead of generated ids keep rows identical across the
+trial directory, path) instead of generated ids keep rows identical across the
 two backends, so a migration copies them verbatim and compares them exactly.
 
 Layers:
 
 - raw: `blobs` (content-addressed bytes, sha256 of the uncompressed content)
-  and `files` (every file of a Harbor job directory) and `runs` (workbench
+  and `files` (every file of a Harbor job directory, keyed by its relative
+  path; a file over the size limit keeps only a bounded tail) and `runs` (workbench
   launch receipts with their spec and worker log). They alone can rebuild
   everything else.
 - normalized: `jobs`, `trials`, `requests`, `usage_events`,
-  `verifier_tests`, queryable with SQL.
+  `verifier_tests`, queryable with SQL. A trial is keyed by its directory
+  relative to the job (`task__id`, or `workbuddy/<run>/task__id` for a
+  WorkBuddy launch), so one name in two nested runs is two trials, as on
+  disk; `row_json.trial` is the directory name the page shows.
 - projection: `jobs.header_json`, `trials.row_json` and `trials.detail_json`
   are exactly what scripts/eval/harbor/viewer/data.py computes from the stored
   bytes; `projection` names the code that computed them and
@@ -186,9 +190,19 @@ V1 = [
     "CREATE INDEX runs_log_sha256 ON runs (log_sha256)",
 ]
 
+# A file over the ingestion size limit keeps a bounded tail (the part the
+# projections read: stderr and verifier output tails), so its projection is
+# the same as from the live file.
+V2 = [
+    "ALTER TABLE files ADD COLUMN tail_sha256 TEXT REFERENCES blobs(sha256) "
+    "CHECK (tail_sha256 IS NULL OR state = 'oversize')",
+    "CREATE INDEX files_tail_sha256 ON files (tail_sha256)",
+]
+
 # (version, description, statements). Append only.
 MIGRATIONS: List[Tuple[int, str, List[str]]] = [
     (1, "evaluation store: raw files, jobs, trials, requests, tests, runs", V1),
+    (2, "bounded tail of oversize files", V2),
 ]
 LATEST = MIGRATIONS[-1][0]
 
@@ -208,7 +222,7 @@ COLUMNS: Dict[str, Tuple[str, ...]] = {
     "blobs": ("sha256", "size", "encoding", "content"),
     "jobs": ("name", "source_dir", "agent", "model", "dataset", "attempts", "concurrency", "planned",
              "started_at", "finished_at", "header_json", "inputs_digest", "projection", "ingested_at"),
-    "files": ("job", "relpath", "trial", "kind", "size", "mtime_ns", "state", "sha256"),
+    "files": ("job", "relpath", "trial", "kind", "size", "mtime_ns", "state", "sha256", "tail_sha256"),
     "trials": ("job", "name", "task", "status", "cause", "reward", "exception", "stop_reason", "empty_final",
                "turns", "tool_calls", "input_tokens", "cache_tokens", "output_tokens", "total_tokens",
                "initial_input_tokens", "tokens_partial", "cost_usd", "cost_source", "requests",

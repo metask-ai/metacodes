@@ -298,13 +298,23 @@ def harbor_state(s: Setup):
     return path, version
 
 
+def record_harbor(s: Setup, path):
+    """Save the Harbor path an executor reported. An SSH executor's entry
+    must still parse afterwards: a path it would refuse is reported instead
+    of written, so it cannot make the executors list unreadable."""
+    if s.remote and not executors.remote_path_ok(path, executable=True):
+        raise Failed(f"找到的 Harbor 路径 {path!r} 含有执行机器配置不接受的字符；"
+                     "请把 Harbor 装到普通路径，或在 executors 中手工填写 harbor")
+    s.set_executor_value("harbor", path)
+
+
 def step_harbor(s: Setup):
     s.require_shell()
     path, version = harbor_state(s)
     recorded = s.executor.harbor if s.remote else s.cfg.get("harbor")
     if path and version == HARBOR_VERSION:
         if recorded != path:
-            s.set_executor_value("harbor", path)
+            record_harbor(s, path)
         return "ok", f"Harbor {version}（{path}）"
     if not s.found("uv") and not s.dry_run:
         raise Failed("需要先安装 uv")
@@ -314,7 +324,7 @@ def step_harbor(s: Setup):
     path, version = harbor_state(s)
     if not path or version != HARBOR_VERSION:
         raise Failed(f"Harbor 安装后验证失败（找到 {path or '无'} {version}）")
-    s.set_executor_value("harbor", path)
+    record_harbor(s, path)
     return "done", f"Harbor {version}（{path}）"
 
 
@@ -839,6 +849,12 @@ class SetupManager:
         self.directory = self.config_path.parent / "setup"
         self.lock = threading.Lock()
         self.process = None
+
+    def mutating(self):
+        """Whether a setup that changes the machine (not a dry run) is
+        running: a launch waits for it, as it waits for a launch."""
+        value = self.latest()
+        return isinstance(value, dict) and value.get("status") == "running" and not value.get("dry_run")
 
     def latest(self):
         files = sorted(self.directory.glob("*.json"), key=lambda p: p.stat().st_mtime) if self.directory.is_dir() else []

@@ -37,7 +37,7 @@ from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import FAKE_HARBOR, session_fixture, wait_run
 
 FAKES = r'''
-import json, os, shutil, subprocess, sys
+import json, os, shutil, subprocess, sys, time
 from pathlib import Path
 name, args = sys.argv[1], sys.argv[2:]
 env = os.environ
@@ -120,6 +120,12 @@ elif name == "ssh":
                 "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX"):
         if key in env:
             remote[key] = env[key]
+    if " pack " in command:
+        # A slow or broken copy-back of the job directory.
+        if env.get("FAKE_SSH_PACK_FAIL"):
+            print("pack refused", file=sys.stderr)
+            sys.exit(1)
+        time.sleep(float(env.get("FAKE_SSH_PACK_DELAY") or 0))
     os.chdir(home)
     os.execve("/bin/sh", ["sh", "-c", command], remote)
 elif name == "sysctl":
@@ -434,6 +440,61 @@ class ExecutorConfigTest(unittest.TestCase):
         self.assertEqual(executors.configured({})[0][0].name, "local")
 
 
+class ExecutorEntryTest(SetupFixture):
+    def test_harbor_path_with_space_and_at_parses_and_a_bad_entry_spares_the_others(self):
+        relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h",
+                                 "harbor": "/home/a b@corp/.local/bin/harbor", "python": "/opt/py 3/bin/python3"})
+        self.assertEqual(relay.harbor, "/home/a b@corp/.local/bin/harbor")
+        self.assertIn("'/home/a b@corp/.local/bin/harbor'", executors.probe_script(relay))
+        for bad in ("/home/$(id)/harbor", "-oProxyCommand=x", "../harbor", "/home/x'y/harbor", " /lead"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                executors.parse({"name": "relay", "kind": "ssh", "host": "h", "harbor": bad})
+        cfg = self.cfg()
+        cfg["executors"] = [{"name": "devbox-mac", "kind": "local"},
+                            {"name": "broken", "kind": "ssh", "host": "h", "harbor": "/x/$(id)"},
+                            {"name": "relay-4090", "kind": "ssh", "host": "10.126.126.1", "user": "bench"}]
+        atomic_json(self.config, cfg)
+        invalid = []
+        found, default = executors.configured(cfg, invalid)
+        self.assertEqual(([e.name for e in found], default), (["devbox-mac", "relay-4090"], "devbox-mac"))
+        self.assertEqual([name for name, _ in invalid], ["broken"])
+        self.assertEqual(executors.find(cfg, "relay-4090").host, "10.126.126.1")
+        states = {s["name"]: s for s in RunManager(self.state / "bench/jobs", self.config).catalog()["executors"]}
+        self.assertEqual(sorted(states), ["broken", "devbox-mac", "relay-4090"])
+        self.assertFalse(states["broken"]["ready"])
+        self.assertIn("harbor", states["broken"]["reasons"][0])
+        self.assertEqual(states["relay-4090"]["label"], "relay-4090（SSH bench@10.126.126.1:22）")
+
+    def test_setup_never_writes_a_harbor_path_the_executor_list_would_refuse(self):
+        self.add_ssh_executor()
+        written = []
+        stub = types.SimpleNamespace(remote=True, set_executor_value=lambda key, value: written.append((key, value)))
+        setup.record_harbor(stub, "/home/a b@corp/.local/bin/harbor")
+        self.assertEqual(written, [("harbor", "/home/a b@corp/.local/bin/harbor")])
+        with self.assertRaisesRegex(setup.Failed, "harbor"):
+            setup.record_harbor(stub, "/home/we$ird/.local/bin/harbor")
+        self.assertEqual(len(written), 1)
+        # Through the real step: the remote Harbor lives under a home with
+        # a space and `@`; the saved entry still parses.
+        home = self.root / "remote home@corp"
+        self.remote_home.rename(home)
+        os.environ["FAKE_REMOTE_HOME"] = str(home)
+        self.remote_home = home
+        (home / ".local/bin").mkdir(parents=True)
+        harbor = home / ".local/bin/harbor"
+        harbor.write_text('#!/bin/sh\necho "harbor 0.26.0"\n')
+        harbor.chmod(0o755)
+        os.symlink(self.templates / "uv", self.remote_bin / "uv")
+        (self.root / "state-remote").mkdir(exist_ok=True)
+        (self.root / "state-remote" / "harbor").touch()
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "harbor")
+        self.assertEqual(step["status"], "ok", step)
+        entry = next(e for e in self.cfg()["executors"] if e["name"] == "relay-4090")
+        self.assertEqual(entry["harbor"], str(harbor))
+        self.assertEqual(executors.find(self.cfg(), "relay-4090").harbor, str(harbor))
+
+
 class SshExecutorTest(SetupFixture):
     def test_readiness_names_missing_ssh_shell_access(self):
         self.add_ssh_executor()
@@ -541,6 +602,98 @@ class SshRunTest(SetupFixture):
         self.assertEqual(view["summary"]["counts"]["pass"], 1)
         self.assertEqual((view["rows"][0]["requests"], view["rows"][0]["total_tokens"]), (1, 70))
         self.assertTrue(list((local / ".bench-metrics").glob("*.jsonl")))
+
+    def watch_until_done(self, manager, name, timeout=60):
+        """Every status the page shows until the run ends."""
+        shown, deadline = [], time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            run = next((r for r in manager.runs() if r["name"] == name), {})
+            shown.append(run.get("status"))
+            if run.get("status") in ("finished", "failed", "cancelled", "interrupted"):
+                return run, shown
+            time.sleep(0.1)
+        raise AssertionError(f"run did not finish: {shown[-5:]}")
+
+    def test_slow_copy_back_keeps_the_run_alive_and_cancellable(self):
+        """A copy-back slower than the liveness window never shows the run
+        as interrupted, never admits a second launch, and cancel works."""
+        manager, client, _ = self.prepare_remote()
+        os.environ.update(FAKE_SSH_PACK_DELAY="6", FAKE_BENCH_DELAY="2")
+        with patch.object(RunManager, "STALE_AFTER", 3):
+            run = client.request("api/runs", self.request())
+            final, shown = self.watch_until_done(manager, run["name"])
+            self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
+            self.assertNotIn("interrupted", shown)
+            self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+
+            os.environ["FAKE_BENCH_DELAY"] = "30"
+            second = client.request("api/runs", self.request())
+            deadline = time.monotonic() + 30
+            while not (self.remote_home / ".metacodes-bench/jobs" / second["name"] / "argv.json").exists():
+                self.assertLess(time.monotonic(), deadline, data.tail(manager.records / (second["name"] + ".log")))
+                time.sleep(0.1)
+            time.sleep(4)  # a copy-back pass is in flight now
+            with self.assertRaisesRegex(ValueError, "已有评测正在运行"):
+                client.request("api/runs", self.request())
+            client.request("api/cancel", {"name": second["name"]})
+            final, shown = self.watch_until_done(manager, second["name"])
+            self.assertEqual(final["status"], "cancelled", final)
+            self.assertNotIn("interrupted", shown)
+
+    def test_unfinished_copy_back_is_reported_and_bench_sync_recovers(self):
+        manager, client, _ = self.prepare_remote()
+        os.environ.update(FAKE_SSH_PACK_FAIL="1", METACODES_BENCH_FINAL_SYNC_TIMEOUT="2")
+        run = client.request("api/runs", self.request())
+        final, _ = self.watch_until_done(manager, run["name"])
+        # Harbor exited 0, but the results never reached this host.
+        self.assertEqual((final["status"], final["exit_code"]), ("failed", 0), final)
+        self.assertEqual(final["remote_results"]["path"], ".metacodes-bench/jobs/" + run["name"])
+        self.assertIn("metacodes bench sync --run " + run["name"], final["error"])
+        local = manager.jobs_dir / run["name"]
+        self.assertFalse((local / "fix-git__fake" / "result.json").exists())
+
+        del os.environ["FAKE_SSH_PACK_FAIL"]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(["--state-root", str(self.state), "sync", "--run", run["name"], "--json"])
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["status"], "finished")
+        self.assertTrue((local / "fix-git__fake" / "result.json").exists())
+        record = next(r for r in manager.runs() if r["name"] == run["name"])
+        self.assertEqual((record["status"], record.get("error"), record.get("remote_results")), ("finished", None, None))
+
+    def test_copy_back_is_bounded_per_pass_and_appends_grown_files(self):
+        manager, _, _ = self.prepare_remote()
+        relay = executors.find(self.cfg(), "relay-4090")
+        runtime = executors.ship_runtime(relay, log=lambda _t: None)
+        remote_dir = self.remote_home / "jobs" / "grow"
+        (remote_dir / "t__1").mkdir(parents=True)
+        for index in range(5):
+            (remote_dir / "t__1" / f"small-{index}.json").write_text(json.dumps({"index": index}))
+        log = remote_dir / "t__1" / "agent.log"
+        log.write_bytes(os.urandom(300 * 1024))
+        local = self.root / "local-jobs" / "grow"
+        sync = executors.JobSync(relay, runtime, "jobs/grow", local, log=lambda _t: None)
+        sync.PASS_BYTES = 100 * 1024
+        self.assertEqual(sync.sync(), 5)  # the small files first; the log waits
+        self.assertEqual(sync.pending, 1)
+        self.assertFalse((local / "t__1/agent.log").exists())
+        self.assertEqual(sync.sync(), 1)  # alone, larger than one pass: still sent
+        self.assertTrue(sync.complete())
+        received = sync.bytes
+        with log.open("ab") as handle:
+            handle.write(b"appended line\n" * 100)
+        (remote_dir / "t__1" / "small-0.json").write_text(json.dumps({"index": "rewritten"}))
+        self.assertEqual(sync.sync(), 2)
+        self.assertLess(sync.bytes - received, 32 * 1024)  # the 1.4 KiB append, not 300 KiB again
+        self.assertEqual((local / "t__1/agent.log").read_bytes(), log.read_bytes())
+        self.assertEqual(json.loads((local / "t__1/small-0.json").read_text()), {"index": "rewritten"})
+        # A file rewritten with different earlier bytes is copied whole.
+        log.write_bytes(os.urandom(400 * 1024))
+        sync.PASS_BYTES = 1 << 30
+        sync.sync()
+        self.assertEqual((local / "t__1/agent.log").read_bytes(), log.read_bytes())
+        self.assertTrue(sync.complete())
 
     def test_cancel_reaches_the_remote_harbor_process(self):
         manager, client, _ = self.prepare_remote()
@@ -793,6 +946,27 @@ class SetupHttpTest(SetupFixture):
         self.assertEqual([s["id"] for s in latest["steps"]], ["uv", "harbor", "docker", "openssl", "bundle", "psycopg", "login"])
         self.assertIn("brew install uv", [c["command"] for c in latest["steps"][0]["commands"]])
         self.assertEqual([c for c in self.calls("brew") if c[1][:1] == ["install"]], [])
+
+    def test_launch_and_a_changing_setup_exclude_each_other(self):
+        setups = self.state / "bench" / "setup"
+        setups.mkdir(parents=True)
+        progress = setups / "20261118-000000-abcdef.json"
+        atomic_json(progress, {"schema_version": 1, "id": "x", "executor": "local", "dry_run": False,
+                               "status": "running", "steps": []})
+        with self.assertRaisesRegex(ValueError, "一键配置正在进行"):
+            self.client.request("api/runs", {"model": "tokenjoy/test-model", "tasks": ["fix-git"]})
+        with self.assertRaisesRegex(ValueError, "一键配置正在进行"):
+            self.manager.launch({"model": "tokenjoy/test-model", "tasks": ["fix-git"]})
+        # A dry run changes nothing and does not block a launch.
+        atomic_json(progress, {**json.loads(progress.read_text()), "dry_run": True})
+        self.assertFalse(self.manager.setup_running())
+        atomic_json(progress, {**json.loads(progress.read_text()), "dry_run": False, "status": "ready"})
+        self.assertFalse(self.manager.setup_running())
+        # And the other way round: an active run refuses a changing setup.
+        records = self.manager.records
+        atomic_json(records / "bench-live.json", {"name": "bench-live", "status": "running"})
+        with self.assertRaisesRegex(ValueError, "有评测正在运行"):
+            self.client.request("api/setup", {})
 
     def test_login_shows_device_code_from_metacodes_login(self):
         cfg = self.cfg()

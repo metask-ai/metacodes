@@ -24,7 +24,19 @@ from urllib.parse import parse_qs, urlsplit
 DEFAULT_SQLITE_NAME = "bench.sqlite3"
 ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 PG_SCHEMES = ("postgres", "postgresql")
+PG_URI = re.compile(r"^\s*postgres(?:ql)?://", re.IGNORECASE)
 KEYWORD_PASSWORD = re.compile(r"(^|\s)password\s*=", re.IGNORECASE)
+# libpq connection keywords (`host=db user=bench dbname=bench`): a target
+# naming any of them is a keyword DSN, never a file name.
+LIBPQ_KEYWORDS = frozenset((
+    "host", "hostaddr", "port", "dbname", "user", "password", "passfile", "require_auth", "channel_binding",
+    "connect_timeout", "client_encoding", "options", "application_name", "fallback_application_name",
+    "keepalives", "keepalives_idle", "keepalives_interval", "keepalives_count", "tcp_user_timeout",
+    "replication", "gssencmode", "sslmode", "sslnegotiation", "requiressl", "sslcompression", "sslcert",
+    "sslkey", "sslpassword", "sslcertmode", "sslrootcert", "sslcrl", "sslcrldir", "sslsni",
+    "requirepeer", "ssl_min_protocol_version", "ssl_max_protocol_version", "krbsrvname", "gsslib",
+    "gssdelegation", "service", "target_session_attrs", "load_balance_hosts"))
+KEYWORD = re.compile(r"(?:^|\s)([A-Za-z_]+)\s*=")
 
 
 class ConfigError(ValueError):
@@ -34,6 +46,9 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class SqliteConfig:
     path: Path
+
+    def __post_init__(self) -> None:
+        check_sqlite_path(str(self.path))
 
     @property
     def backend(self) -> str:
@@ -101,17 +116,32 @@ def check_dsn(dsn: Any) -> None:
 
 
 def is_postgres_target(text: str) -> bool:
-    return any(text.startswith(scheme + "://") for scheme in PG_SCHEMES)
+    """A PostgreSQL URI in any letter case, or a libpq keyword DSN."""
+    return bool(PG_URI.match(text)) or any(key.lower() in LIBPQ_KEYWORDS for key in KEYWORD.findall(text))
+
+
+def check_sqlite_path(text: str) -> None:
+    """Refuse a SQLite path that is really a connection string, or that
+    carries a password: it would become a file name, appear in reports and
+    be saved in workbench.json. The message never repeats the value."""
+    if is_postgres_target(text) or "://" in text:
+        raise ConfigError("this looks like a database connection string, not a SQLite path; "
+                          "use a postgresql:// DSN (without a password) for PostgreSQL")
+    if "password" in text.lower():
+        raise ConfigError("a SQLite path must not contain 'password'; "
+                          "for PostgreSQL use a DSN without a password and password_env")
 
 
 def from_target(text: str, password_env: Optional[str] = None) -> StoreConfig:
-    """A command-line target: a postgresql:// DSN, otherwise a SQLite path."""
+    """A command-line target: a PostgreSQL DSN (URI in any letter case, or
+    libpq keywords), otherwise a SQLite path."""
     if not isinstance(text, str) or not text:
         raise ConfigError("store target is empty")
     if is_postgres_target(text):
         return PostgresConfig(text, password_env)
     if password_env:
         raise ConfigError("a password environment variable applies only to PostgreSQL")
+    check_sqlite_path(text)  # before resolving: a path collapses `://`
     return SqliteConfig(Path(text).expanduser().resolve())
 
 
@@ -126,6 +156,7 @@ def parse(value: Any, base: Path) -> StoreConfig:
         path = value.get("path")
         if not isinstance(path, str) or not path:
             raise ConfigError("sqlite store needs a path")
+        check_sqlite_path(path)
         resolved = Path(path).expanduser()
         return SqliteConfig((resolved if resolved.is_absolute() else base / resolved).resolve())
     if backend == "postgres":

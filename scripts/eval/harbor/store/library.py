@@ -12,7 +12,7 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from scripts.eval.harbor.store import ingest
 from scripts.eval.harbor.store.backend import Store
@@ -55,7 +55,7 @@ class StoreLibrary:
                 results.append(ingest.ingest_root(self.store, root, verify=verify, log=self.log))
             except ValueError as exc:
                 self.log("bench store: " + str(exc))
-        ingest.refresh_projections(self.store)
+        ingest.refresh_projections(self.store, self.log)
         self._last_sync = time.monotonic()
         return results
 
@@ -105,18 +105,19 @@ class StoreLibrary:
         with self.store.read() as tx:
             if names is None:
                 headers = tx.query("SELECT name, header_json FROM jobs")
-                trials = tx.query("SELECT job, row_json FROM trials")
+                trials = tx.query("SELECT job, name, row_json FROM trials")
             else:
                 headers, trials = [], []
                 for name in names:
                     headers += tx.query("SELECT name, header_json FROM jobs WHERE name = ?", (name,))
-                    trials += tx.query("SELECT job, row_json FROM trials WHERE job = ?", (name,))
-        rows: Dict[str, List[Dict[str, Any]]] = {}
-        for job, row_json in trials:
-            rows.setdefault(job, []).append(_refresh(json.loads(row_json), moment))
+                    trials += tx.query("SELECT job, name, row_json FROM trials WHERE job = ?", (name,))
+        rows: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+        for job, key, row_json in trials:
+            rows.setdefault(job, []).append((key, _refresh(json.loads(row_json), moment)))
         views = {}
         for name, header_json in headers:
-            job_rows = sorted(rows.get(name, []), key=lambda row: row["trial"])
+            # data.trial_dirs' order: by name, then by path (the key).
+            job_rows = [row for _, row in sorted(rows.get(name, []), key=lambda item: (item[1]["trial"], item[0]))]
             views[name] = data.assemble_view(json.loads(header_json), job_rows, with_rows)
         return views
 
@@ -132,11 +133,15 @@ class StoreLibrary:
     def trial_detail(self, job: Any, trial: Any) -> Optional[Dict[str, Any]]:
         if not all(isinstance(v, str) and data.NAME.match(v) for v in (job, trial)):
             return None
+        # A trial is keyed by its directory; the page names it by the
+        # directory's name. A name repeated in two nested runs resolves like
+        # data.Library.trial_dir: the first by path.
         with self.store.read() as tx:
-            row = tx.one("SELECT detail_json FROM trials WHERE job = ? AND name = ?", (job, trial))
-        if row is None:
+            found = tx.query("SELECT name, detail_json FROM trials WHERE job = ? AND (name = ? OR "
+                             "substr(name, length(name) - length(?)) = ?)", (job, trial, trial, "/" + trial))
+        if not found:
             return None
-        detail = json.loads(row[0])
+        detail = json.loads(min(found)[1])
         _refresh(detail["row"], dt.datetime.now(dt.timezone.utc))
         return detail
 

@@ -2,7 +2,7 @@
 
     python3 -m scripts.eval.harbor.viewer.remote run <spec.json>
     python3 -m scripts.eval.harbor.viewer.remote manifest <job-dir>
-    python3 -m scripts.eval.harbor.viewer.remote pack <job-dir>   # JSON names on stdin
+    python3 -m scripts.eval.harbor.viewer.remote pack <job-dir>   # JSON items on stdin
 
 `run` reads exactly one JSON line from stdin, `{"env": {NAME: value}}`: the
 run's credential, carried by the SSH channel instead of argv or a file. It
@@ -10,10 +10,17 @@ starts the timing relay beside this host's Docker daemon (when the spec asks
 for one), runs Harbor in its own process group and prints JSON events on
 stdout (`started`, `heartbeat` every 2 s, `exit`). A later stdin line
 `cancel`, or the channel closing, interrupts Harbor (SIGINT, then SIGKILL
-after 20 s). Python 3.9, stdlib only.
+after 20 s).
+
+`pack` streams a PAX tar of the requested files. An item is a name, or
+`[name, offset, sha256]`: when the DELTA_CHECK_BYTES before `offset` still
+hash to `sha256`, only the bytes from `offset` on are sent and the member
+carries `metacodes.offset`; otherwise the whole file. Every member carries
+`metacodes.stamp` ("size mtime_ns" of what was read). Python 3.9, stdlib only.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -23,6 +30,8 @@ import tarfile
 import threading
 import time
 from pathlib import Path, PurePosixPath
+
+DELTA_CHECK_BYTES = 64 * 1024  # executors.DELTA_CHECK_BYTES
 
 
 def emit(event, **fields):
@@ -119,24 +128,71 @@ def files(root):
     if not root.is_dir():
         return result
     for path in root.rglob("*"):
-        if path.is_file() and not path.is_symlink():
-            stat = path.stat()
-            result[path.relative_to(root).as_posix()] = [stat.st_size, stat.st_mtime_ns]
+        try:
+            if path.is_file() and not path.is_symlink():
+                stat = path.stat()
+                result[path.relative_to(root).as_posix()] = [stat.st_size, stat.st_mtime_ns]
+        except OSError:
+            continue  # removed while listing
     return result
+
+
+class Exactly:
+    """`size` bytes of a file that may shrink while it is read (zero padded;
+    the next manifest shows the change and the file is sent again)."""
+
+    def __init__(self, handle, size):
+        self.handle, self.left = handle, size
+
+    def read(self, size=-1):
+        size = self.left if size is None or size < 0 else min(size, self.left)
+        chunk = self.handle.read(size)
+        chunk += b"\0" * (size - len(chunk))
+        self.left -= len(chunk)
+        return chunk
+
+
+def pack_item(archive, root, item):
+    if isinstance(item, str):
+        name, offset, base = item, 0, None
+    elif (isinstance(item, list) and len(item) == 3 and isinstance(item[0], str) and type(item[1]) is int
+          and isinstance(item[2], str)):
+        name, offset, base = item
+    else:
+        return
+    if not name or PurePosixPath(name).is_absolute() or ".." in PurePosixPath(name).parts:
+        return
+    path = root / name
+    if path.is_symlink() or not path.is_file() or root not in path.resolve().parents:
+        return
+    try:
+        handle = open(path, "rb")
+    except OSError:
+        return
+    with handle:
+        info = os.fstat(handle.fileno())
+        start = 0
+        if base is not None and DELTA_CHECK_BYTES <= offset <= info.st_size:
+            handle.seek(offset - DELTA_CHECK_BYTES)
+            if hashlib.sha256(handle.read(DELTA_CHECK_BYTES)).hexdigest() == base:
+                start = offset
+        member = tarfile.TarInfo(name)
+        member.size = info.st_size - start
+        member.mtime = int(info.st_mtime)
+        member.mode = 0o644
+        member.pax_headers = {"metacodes.stamp": f"{info.st_size} {info.st_mtime_ns}"}
+        if start:
+            member.pax_headers["metacodes.offset"] = str(start)
+        handle.seek(start)
+        archive.addfile(member, Exactly(handle, member.size))
 
 
 def pack(root):
     root = Path(root).resolve()
-    names = json.loads(sys.stdin.read() or "[]")
-    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
-        for name in names:
-            parts = PurePosixPath(name).parts
-            if not isinstance(name, str) or PurePosixPath(name).is_absolute() or ".." in parts:
-                continue
-            path = root / name
-            if path.is_symlink() or not path.is_file() or root not in path.resolve().parents:
-                continue
-            archive.add(str(path), arcname=name, recursive=False)
+    items = json.loads(sys.stdin.read() or "[]")
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+        for item in items if isinstance(items, list) else []:
+            pack_item(archive, root, item)
     sys.stdout.flush()
     return 0
 

@@ -11,6 +11,7 @@ an empty database the test may create schemas in, e.g.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import io
 import json
@@ -264,12 +265,13 @@ class EquivalenceTest(StoreCase):
             kinds = dict(((relpath), (trial, kind)) for relpath, trial, kind in tx.query(
                 "SELECT relpath, trial, kind FROM files WHERE job = ?", ("bench-wb",)))
         prefix = "workbuddy/metacodes-bench-wb/"
-        self.assertEqual(kinds[prefix + "bug_fix-easy-alpha__wb1/result.json"],
-                         ("bug_fix-easy-alpha__wb1", "trial_result"))
+        # A trial is keyed by its directory relative to the job.
+        trial_key = prefix + "bug_fix-easy-alpha__wb1"
+        self.assertEqual(kinds[prefix + "bug_fix-easy-alpha__wb1/result.json"], (trial_key, "trial_result"))
         self.assertEqual(kinds[prefix + "bug_fix-easy-alpha__wb1/agent/metacodes-stderr.log"],
-                         ("bug_fix-easy-alpha__wb1", "agent_log"))
+                         (trial_key, "agent_log"))
         self.assertEqual(kinds[prefix + ".bench-metrics/bug_fix-easy-alpha__wb1.jsonl"],
-                         ("bug_fix-easy-alpha__wb1", "request_metrics"))
+                         (trial_key, "request_metrics"))
         self.assertEqual(kinds[prefix + "config.json"], (None, "job_other"))
         self.assertEqual(kinds["workbuddy/metacodes-bench-wb-retry/half__made/result.json"], (None, "job_other"))
 
@@ -443,7 +445,8 @@ class SchemaTest(StoreCase):
         store.close()
         reopened = self.sqlite()
         with reopened.read() as tx:
-            self.assertEqual(tx.query("SELECT version FROM schema_migrations"), [(schema.LATEST,)])
+            self.assertEqual(tx.query("SELECT version FROM schema_migrations ORDER BY version"),
+                             [(version,) for version, _, _ in schema.MIGRATIONS])
         with reopened.transaction() as tx:
             tx.execute("INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                        (schema.LATEST + 1, "future", "now"))
@@ -492,6 +495,21 @@ class ConfigTest(unittest.TestCase):
             config.password()
         with self.assertRaises(store_config.ConfigError):
             store_config.PostgresConfig("postgresql://bench@db/bench", "lower-case")
+
+    def test_dsn_targets_are_recognized_and_never_become_file_names(self):
+        for target in ("POSTGRESQL://bench@db/bench", "Postgres://bench@db/bench", "host=db dbname=bench",
+                       "  host=db user=bench sslmode=require"):
+            with self.subTest(target=target):
+                self.assertIsInstance(store_config.from_target(target), store_config.PostgresConfig)
+        for target in ("host=db user=u password=s3cret", "POSTGRESQL://u:s3cret@h/db", "postgresql://u@h/d?PASSWORD=s3cret",
+                       "user=u PassWord = s3cret host=db", "/tmp/password=s3cret.sqlite3", "mysql://u:s3cret@h/db"):
+            with self.subTest(target=target), self.assertRaises(store_config.ConfigError) as caught:
+                store_config.from_target(target)
+            self.assertNotIn("s3cret", str(caught.exception))
+        with self.assertRaises(store_config.ConfigError):
+            store_config.SqliteConfig(Path("/tmp/host=db user=u"))
+        with self.assertRaises(store_config.ConfigError):
+            store_config.parse({"backend": "sqlite", "path": "dbname=x password=s3cret"}, Path("/tmp"))
 
     def test_postgres_without_psycopg_names_the_optional_dependency(self):
         with patch.dict("sys.modules", {"psycopg": None}), self.assertRaisesRegex(StoreError, "psycopg"):
@@ -613,6 +631,24 @@ class CliTest(StoreCase):
         self.assertEqual(sorted(j["name"] for j in listed), ["glm-pilot", "metrics-job", "qwen-pilot"])
         self.assertEqual(normal(listed), normal(file_outputs(self.root)["overview"]))
 
+    def test_migrate_to_a_keyword_dsn_never_writes_or_prints_its_password(self):
+        build_fixture(self.root)
+        self.assertEqual(self.bench("db", "import", "--jobs-dir", str(self.root), "--json")[0], 0)
+        before = sorted(p.name for p in self.temp.rglob("*"))
+        for target in ("host=db user=u password=s3cret", "POSTGRESQL://u:s3cret@db/bench"):
+            errors = io.StringIO()
+            with self.subTest(target=target), contextlib.redirect_stderr(errors):
+                code, out = self.bench("db", "migrate", "--to", target, "--switch", "--json")
+            self.assertEqual(code, 1)
+            self.assertNotIn("s3cret", out + errors.getvalue())
+            self.assertNotIn("s3cret", json.dumps(settings_of(self.temp)))
+            self.assertEqual(sorted(p.name for p in self.temp.rglob("*")), before)
+        code, _ = self.bench("db", "status", "--store-sqlite", str(self.temp / "password-s3cret.sqlite3"))
+        self.assertEqual(code, 1)
+        code, _ = self.bench("db", "status", "--store-sqlite", "postgresql://u@db/bench")
+        self.assertEqual(code, 1)
+        self.assertNotIn("s3cret", json.dumps(settings_of(self.temp)))
+
     def test_store_flags_validate_and_persist(self):
         code, _ = self.bench("db", "status", "--store-postgres", "postgresql://u:pw@h/d")
         self.assertEqual(code, 1)
@@ -628,6 +664,270 @@ class CliTest(StoreCase):
             self.bench("list", "status")
         code, _ = self.bench("db", "migrate", "--to", str(path))
         self.assertEqual(code, 1)  # same database
+
+
+def unstorable_job(root: Path) -> Path:
+    """A job whose files carry text neither driver can bind as-is: a lone
+    surrogate in a trajectory (a truncated emoji), NUL in a verifier
+    message and in a stop reason."""
+    job = _job(root, "odd-text", "m", planned=2)
+    _trial(job, "emoji__a", reward=1.0, stop="end\u0000turn",
+           tests=[{"name": "t::nul", "status": "failed", "message": "bad\u0000byte \ud83d"}],
+           steps=[{"step_id": 1, "source": "agent", "message": "half an emoji \ud83d here"}])
+    _trial(job, "plain__b", reward=0.0)
+    return job
+
+
+class TextSafetyTest(StoreCase):
+    def test_unencodable_text_is_stored_and_served_like_the_files(self):
+        frozen_time(self)
+        unstorable_job(self.root)
+        expected = normal(file_outputs(self.root))
+        store = self.sqlite()
+        result = ingest.ingest_root(store, self.root, log=lambda m: None)
+        self.assertEqual([(j.name, j.outcome) for j in result.jobs], [("odd-text", "new")])
+        library = StoreLibrary(store)
+        actual = store_outputs(library)
+        # The projections keep the exact text (JSON escapes); only the
+        # normalized text columns replace what a database cannot hold.
+        self.assertEqual(normal(actual["jobs"]), expected["jobs"])
+        self.assertEqual(actual["trials"]["odd-text|emoji__a"]["steps"][0]["message"], "half an emoji \ud83d here")
+        with store.read() as tx:
+            self.assertEqual(tx.one("SELECT message FROM verifier_tests"), ("bad�byte �",))
+            self.assertEqual(tx.one("SELECT stop_reason FROM trials WHERE name = 'emoji__a'"), ("end�turn",))
+        # The page serves it as valid UTF-8 JSON.
+        http = server.make_server(library, "127.0.0.1", 0)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        url = f"http://127.0.0.1:{http.server_address[1]}/api/trial?job=odd-text&trial=emoji__a"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            served = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(served["steps"][0]["message"], "half an emoji \ud83d here")
+
+    def test_non_utf8_file_name_is_stored(self):
+        job = _job(self.root, "odd-name", "m", planned=1)
+        _trial(job, "task__a", reward=1.0)
+        try:
+            (job / "task__a" / os.fsdecode(b"agent/log-\xff.txt")).write_bytes(b"x")
+        except (OSError, UnicodeError):
+            self.skipTest("this file system refuses non-UTF-8 names")
+        store = self.sqlite()
+        result = ingest.ingest_root(store, self.root, log=lambda m: None)
+        self.assertEqual(result.jobs[0].outcome, "new")
+        with store.read() as tx:
+            names = {row[0] for row in tx.query("SELECT relpath FROM files")}
+        self.assertIn("task__a/agent/log-�.txt", names)
+        self.assertEqual(ingest.ingest_root(store, self.root).jobs[0].outcome, "unchanged")
+
+    def test_one_failing_trial_never_drops_the_job(self):
+        job = _job(self.root, "partly", "m", planned=2)
+        _trial(job, "good__a", reward=1.0)
+        _trial(job, "bad__b", reward=0.0)
+        store = self.sqlite()
+        original = ingest.project_trial
+
+        def flaky(trial_dir):
+            if trial_dir.name == "bad__b":
+                raise UnicodeEncodeError("utf-8", "\ud83d", 0, 1, "surrogates not allowed")
+            return original(trial_dir)
+
+        logged = []
+        with patch.object(ingest, "project_trial", flaky):
+            result = ingest.ingest_root(store, self.root, log=logged.append)
+        self.assertEqual((result.jobs[0].outcome, result.jobs[0].trials_derived, result.jobs[0].trials_failed),
+                         ("new", 1, 1))
+        self.assertTrue(any("bad__b" in line for line in logged), logged)
+        library = StoreLibrary(store)
+        self.assertEqual([r["trial"] for r in library.job_view("partly")["rows"]], ["good__a"])
+        retried = ingest.ingest_root(store, self.root)  # the next pass derives it
+        self.assertEqual(retried.jobs[0].trials_derived, 1)
+        self.assertEqual(sorted(r["trial"] for r in library.job_view("partly")["rows"]), ["bad__b", "good__a"])
+
+    def test_legacy_nul_rows_compare_equal_after_migration(self):
+        """A SQLite file written before text was cleaned may hold NUL; the
+        copy stores the cleaned text and verification accepts it."""
+        unstorable_job(self.root)
+        source = self.sqlite("source.sqlite3")
+        ingest.ingest_root(source, self.root)
+        raw = sqlite3.connect(str(self.temp / "source.sqlite3"))
+        raw.execute("UPDATE verifier_tests SET message = ?", ("legacy\x00nul",))
+        raw.commit()
+        raw.close()
+        target = self.sqlite("target.sqlite3")
+        report = migrate.migrate(source, target)
+        self.assertEqual(report.tables["verifier_tests"].verified, report.tables["verifier_tests"].source)
+        with target.read() as tx:
+            self.assertEqual(tx.one("SELECT message FROM verifier_tests"), ("legacy�nul",))
+
+
+class PathSafetyTest(StoreCase):
+    def crafted(self, relpath: str, job: str = "victim", database: str = "bench.sqlite3") -> Store:
+        """A store as someone else could hand it over: a stale projection
+        and a file row whose path climbs out of the job directory."""
+        _trial(_job(self.root, "victim", "m", planned=1), "x__1", reward=1.0)
+        store = self.sqlite(database)
+        ingest.ingest_root(store, self.root)
+        shutil.rmtree(self.root)
+        with store.transaction() as tx:
+            digest = tx.one("SELECT sha256 FROM files WHERE relpath = 'x__1/result.json'")[0]
+            if job != "victim":
+                tx.execute("INSERT INTO jobs (name, source_dir, header_json, inputs_digest, projection, ingested_at) "
+                           "SELECT ?, source_dir, header_json, inputs_digest, 'old', ingested_at FROM jobs "
+                           "WHERE name = 'victim'", (job,))
+                tx.execute("INSERT INTO files (job, relpath, trial, kind, size, mtime_ns, state, sha256) "
+                           "SELECT ?, relpath, trial, kind, size, mtime_ns, state, sha256 FROM files "
+                           "WHERE job = 'victim'", (job,))
+            tx.execute("INSERT INTO files (job, relpath, trial, kind, size, mtime_ns, state, sha256) "
+                       "VALUES (?, ?, 'x__1', 'trial_other', 3, 1, 'stored', ?)", (job, relpath, digest))
+            tx.execute("UPDATE jobs SET projection = 'old'")
+            tx.execute("UPDATE trials SET projection = 'old'")
+        return store
+
+    def test_refresh_never_writes_outside_its_temporary_directory(self):
+        scratch = self.temp / "scratch" / "a" / "b"
+        scratch.mkdir(parents=True)
+        crafted = ("x__1/../../../../escape.txt", "x__1/agent/../../../../escape.txt", "/abs/escape.txt",
+                   "x__1\\..\\..\\escape.txt", "x__1//escape.txt", "x__1/nul\x00.txt")
+        for index, relpath in enumerate(crafted):
+            with self.subTest(relpath=relpath), patch.object(tempfile, "tempdir", str(scratch)):
+                store = self.crafted(relpath, database=f"crafted-{index}.sqlite3")
+                ingest.refresh_projections(store)
+                self.assertEqual(sorted(p.name for p in self.temp.rglob("escape.txt")), [])
+                self.assertEqual(StoreLibrary(store).job_view("victim")["rows"][0]["status"], "pass")
+
+    def test_unsafe_job_names_and_paths_are_refused(self):
+        scratch = self.temp / "s1" / "s2"
+        scratch.mkdir(parents=True)
+        with patch.object(tempfile, "tempdir", str(scratch)):
+            store = self.crafted("x__1/ok.txt", job="../../evil")
+            logged = []
+            ingest.refresh_projections(store, logged.append)
+        self.assertTrue(any("evil" in line for line in logged), logged)
+        self.assertEqual(list(self.temp.rglob("evil")), [])
+        with self.assertRaisesRegex(StoreError, "unsafe path"):
+            ingest.materialize(self.temp, "job", [ingest.Entry("a/../../b", b"", 0)])
+        with self.assertRaisesRegex(StoreError, "plain job name"):
+            ingest.materialize(self.temp, "..", [])
+        # A migration refuses to carry them into another database.
+        with self.assertRaisesRegex(StoreError, "unsafe"):
+            migrate.migrate(store, self.sqlite("target.sqlite3"))
+
+
+class IncrementalTest(StoreCase):
+    def test_job_result_rewrite_does_not_rederive_trials(self):
+        job = _job(self.root, "live", "m", planned=3, finished=False)
+        _trial(job, "a__1", reward=1.0)
+        _trial(job, "b__2", reward=0.0)
+        store = self.sqlite()
+        ingest.ingest_root(store, self.root)
+        with store.read() as tx:
+            before = tx.query("SELECT name, ingested_at, inputs_digest FROM trials ORDER BY name")
+        # Harbor rewrites the job's result.json after every trial.
+        document = data.read_json(job / "result.json")
+        document["n_total_trials"] = 4
+        _write(job / "result.json", document)
+        _trial(job, "c__3", reward=1.0)
+        result = ingest.ingest_job(store, job)
+        self.assertEqual((result.outcome, result.trials_derived), ("updated", 1))
+        with store.read() as tx:
+            after = tx.query("SELECT name, ingested_at, inputs_digest FROM trials ORDER BY name")
+            self.assertEqual(tx.one("SELECT planned FROM jobs"), (4,))  # the header follows result.json
+        self.assertEqual(after[:2], before)
+
+    def test_oversize_files_project_like_the_live_files(self):
+        """Files over the stored size keep their size and tail: stderr
+        tails and partial-token marks match the live view, also after the
+        files are gone and the projection is rebuilt from the store."""
+        frozen_time(self)
+        job = _job(self.root, "big", "m", planned=1, finished=False)
+        trial = _trial(job, "huge__a", finished=False)
+        _write(trial / "agent/metacodes-stderr.log", "".join(f"line {i}\n" for i in range(4000)))
+        _write(trial / "agent/metacodes-output.jsonl", "\n".join(json.dumps(
+            {"type": "usage", "input_tokens": i, "output_tokens": 1}) for i in range(3000)))
+        _write(trial / "verifier/test-stdout.txt", "ok\n" * 5000)
+        with patch.object(ingest, "MAX_FILE_BYTES", 20_000), patch.object(data, "MAX_JSON_BYTES", 10_000):
+            expected = normal(file_outputs(self.root))
+            store = self.sqlite()
+            library = StoreLibrary(store, [self.root])
+            library.sync()
+            with store.read() as tx:
+                states = dict(tx.query("SELECT relpath, state FROM files WHERE relpath LIKE 'huge__a/%'"))
+            self.assertEqual(states["huge__a/agent/metacodes-stderr.log"], "oversize")
+            self.assertEqual(states["huge__a/agent/metacodes-output.jsonl"], "oversize")
+            actual = normal(store_outputs(library))
+            self.assertEqual(actual["jobs"], expected["jobs"])
+            self.assertEqual(actual["trials"], expected["trials"])
+            detail = actual["trials"]["big|huge__a"]
+            self.assertTrue(detail["stderr"].endswith("line 3999\n"))
+            self.assertTrue(detail["row"]["tokens_partial"])
+            # The log grows: its new tail replaces the old one.
+            with (trial / "agent/metacodes-stderr.log").open("a") as log:
+                log.write("the very end\n")
+            expected = normal(file_outputs(self.root))
+            library.sync()
+            self.assertEqual(normal(store_outputs(library))["trials"], expected["trials"])
+            shutil.rmtree(self.root)
+            self.root.mkdir()
+            with store.transaction() as tx:
+                tx.execute("UPDATE trials SET projection = 'old'")
+            ingest.refresh_projections(store)
+            self.assertEqual(normal(store_outputs(library))["trials"], expected["trials"])
+            with store.read() as tx:
+                orphans = tx.one("SELECT COUNT(*) FROM blobs WHERE sha256 NOT IN (SELECT sha256 FROM files WHERE "
+                                 "sha256 IS NOT NULL) AND sha256 NOT IN (SELECT tail_sha256 FROM files WHERE "
+                                 "tail_sha256 IS NOT NULL)")[0]
+            self.assertEqual(orphans, 0)  # the replaced tail was collected
+
+    def test_one_trial_name_in_two_workbuddy_runs_is_two_trials(self):
+        frozen_time(self)
+        job = _job(self.root, "bench-wb", "m", planned=2)
+        first = _trial(job / data.NESTED_RUNS / "run-a", "same-task__x", reward=1.0)
+        _trial(job / data.NESTED_RUNS / "run-b", "same-task__x", reward=0.0)
+        expected = normal(file_outputs(self.root))
+        self.assertEqual(len(expected["jobs"]["bench-wb"]["rows"]), 2)
+        library = StoreLibrary(self.sqlite(), [self.root])
+        library.sync()
+        actual = normal(store_outputs(library))
+        for key in ("overview", "jobs", "csv", "summary"):
+            with self.subTest(key=key):
+                self.assertEqual(actual[key], expected[key])
+        # The trial page resolves the name like data.Library: first by path.
+        self.assertEqual(normal(library.trial_detail("bench-wb", "same-task__x")), normal(data.trial_detail(first)))
+        self.assertEqual(library.trial_detail("bench-wb", "task__x"), None)
+
+
+class MigrationDuringRunTest(StoreCase):
+    def test_source_changing_during_migration_verifies_and_resumes(self):
+        job = _job(self.root, "live", "m", planned=2, finished=False)
+        _trial(job, "a__1", finished=False)
+        source = self.sqlite("source.sqlite3")
+        ingest.ingest_root(source, self.root)
+        target = self.sqlite("target.sqlite3")
+        original = migrate._verify
+
+        def ingest_meanwhile(source_tx, target_store, report):
+            # A running job is ingested again between the copy and the
+            # verification: the trial finishes, the job grows a trial.
+            _trial(job, "a__1", reward=1.0)
+            _trial(job, "b__2", reward=0.0)
+            ingest.ingest_job(source, job)
+            return original(source_tx, target_store, report)
+
+        with patch.object(migrate, "_verify", ingest_meanwhile):
+            report = migrate.migrate(source, target)
+        self.assertEqual(report.tables["trials"].verified, 1)  # the snapshot that was copied
+
+        # Run again (the job kept running): older rows of the same keys are
+        # brought up to date instead of refused.
+        _write(job / "a__1" / "agent" / "metacodes-stderr.log", "more\n")
+        ingest.ingest_job(source, job)
+        report = migrate.migrate(source, target)
+        self.assertGreater(report.tables["trials"].updated, 0)
+        self.assertGreater(report.tables["files"].updated + report.tables["files"].copied, 0)
+        self.assertEqual(table_dump(target), table_dump(source))
+        with target.read() as tx:
+            self.assertEqual(tx.one("SELECT status FROM trials WHERE name = 'a__1'"), ("pass",))
 
 
 @unittest.skipUnless(os.name != "nt", "the fake Harbor executable is a POSIX script")
@@ -714,6 +1014,50 @@ class PostgresTest(StoreCase):
         migrate.migrate(pg, back)
         self.assertEqual(table_dump(back), table_dump(sqlite_store))
         self.assertEqual(sum(t.copied for t in migrate.migrate(sqlite_store, pg).tables.values()), 0)
+
+    def test_unstorable_text_reaches_postgres_directly_and_by_migration(self):
+        frozen_time(self)
+        unstorable_job(self.root)
+        expected = normal(file_outputs(self.root))
+        pg = self.pg()
+        library = StoreLibrary(pg, [self.root])
+        library.sync()
+        self.assertEqual(normal(store_outputs(library))["jobs"], expected["jobs"])
+        with pg.read() as tx:
+            self.assertEqual(tx.one("SELECT message FROM verifier_tests"), ("bad�byte �",))
+        # A SQLite file holding NUL (written before text was cleaned) still
+        # migrates: the copy stores the cleaned text and verifies.
+        sqlite_store = self.sqlite()
+        ingest.ingest_root(sqlite_store, self.root)
+        raw = sqlite3.connect(str(self.temp / "bench.sqlite3"))
+        raw.execute("UPDATE verifier_tests SET message = ?", ("legacy\x00nul",))
+        raw.commit()
+        raw.close()
+        target = self.pg()
+        report = migrate.migrate(sqlite_store, target)
+        self.assertEqual(report.tables["verifier_tests"].verified, 1)
+        with target.read() as tx:
+            self.assertNotIn("\x00", tx.one("SELECT message FROM verifier_tests")[0])
+
+    def test_migration_from_a_postgres_store_that_keeps_ingesting(self):
+        job = _job(self.root, "live", "m", planned=2, finished=False)
+        _trial(job, "a__1", finished=False)
+        pg = self.pg()
+        ingest.ingest_root(pg, self.root)
+        target = self.sqlite("target.sqlite3")
+        original = migrate._verify
+
+        def ingest_meanwhile(source_tx, target_store, report):
+            _trial(job, "a__1", reward=1.0)
+            _trial(job, "b__2", reward=0.0)
+            ingest.ingest_job(pg, job)
+            return original(source_tx, target_store, report)
+
+        with patch.object(migrate, "_verify", ingest_meanwhile):
+            self.assertEqual(migrate.migrate(pg, target).tables["trials"].verified, 1)
+        report = migrate.migrate(pg, target)
+        self.assertGreater(report.tables["trials"].updated, 0)
+        self.assertEqual(table_dump(target), table_dump(pg))
 
     def test_postgres_ingests_directly_and_is_idempotent(self):
         frozen_time(self)

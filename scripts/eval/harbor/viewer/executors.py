@@ -40,6 +40,11 @@ NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]{0,252}$")
 USER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 REMOTE_PATH = re.compile(r"^[A-Za-z0-9._/+-]{1,512}$")
+# An executable's path (harbor, python) may also hold spaces and `@`, as a
+# home directory can: it only ever travels as one argv word (shlex.join on
+# the SSH command line, an argv list on the executor). state_dir stays
+# strict; it is also interpolated into remote shell scripts.
+REMOTE_EXECUTABLE = re.compile(r"^[A-Za-z0-9._/+@ -]{1,512}$")
 DEFAULT_STATE_DIR = ".metacodes-bench"
 DEFAULT_LOCAL = "local"
 # Where `bench setup` installs tools (uv's ~/.local/bin, Homebrew). They are
@@ -163,7 +168,7 @@ def parse(entry) -> Executor:
         value = entry.get(field)
         if value is None:
             continue
-        if not isinstance(value, str) or not REMOTE_PATH.fullmatch(value) or ".." in value.split("/") or value.startswith("-"):
+        if not remote_path_ok(value, executable=field != "state_dir"):
             raise ValueError(f"{name}: {field} 只能是普通路径")
         values[field] = value
     bind = entry.get("metrics_bind", "172.17.0.1")
@@ -176,14 +181,36 @@ def parse(entry) -> Executor:
                        metrics_bind=bind, metrics_enabled=enabled, **values)
 
 
-def configured(cfg) -> Tuple[List[Executor], str]:
-    """The executors in `cfg` and the default name. Without a list, this host."""
+def remote_path_ok(value, executable=False) -> bool:
+    """A plain path on the executor (see REMOTE_PATH / REMOTE_EXECUTABLE)."""
+    pattern = REMOTE_EXECUTABLE if executable else REMOTE_PATH
+    return (isinstance(value, str) and bool(pattern.fullmatch(value)) and ".." not in value.split("/")
+            and not value.startswith("-") and value == value.strip())
+
+
+def configured(cfg, invalid: Optional[List[Tuple[str, str]]] = None) -> Tuple[List[Executor], str]:
+    """The executors in `cfg` and the default name. Without a list, this host.
+
+    A malformed entry is left out (and appended to `invalid` as (name,
+    reason)), so one bad entry never makes the others unusable; a list
+    without one valid entry, duplicate names or a default naming no valid
+    entry is an error."""
     entries = cfg.get("executors")
     if entries is None:
         return [LocalExecutor(DEFAULT_LOCAL, cfg.get("harbor"))], DEFAULT_LOCAL
     if not isinstance(entries, list) or not entries:
         raise ValueError("executors 必须是非空列表")
-    result = [parse(entry) for entry in entries]
+    result, problems = [], []
+    for index, entry in enumerate(entries):
+        try:
+            result.append(parse(entry))
+        except ValueError as exc:
+            label = entry.get("name") if isinstance(entry, dict) and isinstance(entry.get("name"), str) else ""
+            problems.append((label if NAME.fullmatch(label or "") else f"executors[{index}]", str(exc)))
+    if invalid is not None:
+        invalid.extend(problems)
+    if not result:
+        raise ValueError("executors 中没有有效的执行机器：" + "；".join(p for _, p in problems))
     names = [e.name for e in result]
     if len(set(names)) != len(names):
         raise ValueError("执行机器名称重复")
@@ -193,7 +220,8 @@ def configured(cfg) -> Tuple[List[Executor], str]:
               for e in result]
     default = cfg.get("default_executor") or names[0]
     if default not in names:
-        raise ValueError("default_executor 不在 executors 中")
+        broken = next((p for n, p in problems if n == default), None)
+        raise ValueError("default_executor 配置无效：" + broken if broken else "default_executor 不在 executors 中")
     return result, default
 
 
@@ -489,62 +517,215 @@ def safe_member(name: str) -> bool:
     return bool(name) and not path.is_absolute() and ".." not in path.parts and "\\" not in name
 
 
+# Bytes before an offset that must match for a grown file to be sent as an
+# append (remote.py checks them; see JobSync.plan).
+DELTA_CHECK_BYTES = 64 * 1024
+
+
+class _Watched:
+    """A pipe reader that records when bytes last arrived (pack watchdog)."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.last = time.monotonic()
+        self.bytes = 0
+
+    def read(self, size=-1):
+        chunk = self.stream.read(size)
+        self.last = time.monotonic()
+        self.bytes += len(chunk)
+        return chunk
+
+
 class JobSync:
-    """Incrementally mirror one remote job directory into the local jobs dir."""
+    """Incrementally mirror one remote job directory into the local jobs dir.
+
+    One pass (`sync`) reads the remote manifest and transfers a bounded batch
+    of changed files (PASS_BYTES / PASS_FILES, smallest first, at least one
+    file) as a tar stream extracted while it arrives, so a pass always
+    finishes and every pass makes progress, however much a job wrote. A file
+    that grew since it was last copied, and whose bytes before the old end
+    are unchanged, arrives as an append (a growing log is never sent twice).
+    `pending` counts the changed files a pass left for the next one;
+    `complete()` proves the local copy matches the remote job.
+    """
+
+    MANIFEST_TIMEOUT = 120
+    PACK_IDLE_TIMEOUT = 120
+    PASS_BYTES = 128 * 1024 * 1024
+    PASS_FILES = 2000
 
     def __init__(self, executor: SshExecutor, runtime: str, remote_dir: str, local_dir: Path,
-                 runner=subprocess.run, log=print):
+                 runner=subprocess.run, log=print, popen=subprocess.Popen):
         self.executor, self.runtime, self.remote_dir = executor, runtime, remote_dir
         self.local_dir = Path(local_dir)
-        self.runner, self.log = runner, log
+        self.runner, self.log, self.popen = runner, log, popen
         self.seen: Dict[str, List[int]] = {}
         self.files = 0
+        self.bytes = 0  # tar stream bytes received
+        self.pending = 0
 
     def remote_python(self, *args: str) -> List[str]:
         return ssh_argv(self.executor, ["env", "PYTHONPATH=" + self.runtime, self.executor.python,
                                         "-m", "scripts.eval.harbor.viewer.remote", *args])
 
-    def sync(self) -> int:
+    def manifest(self) -> Dict[str, List[int]]:
         listing = self.runner(self.remote_python("manifest", self.remote_dir), stdin=subprocess.DEVNULL,
-                              capture_output=True, timeout=120)
+                              capture_output=True, timeout=self.MANIFEST_TIMEOUT)
         if listing.returncode != 0:
             raise ValueError("读取远程作业目录失败")
         current = json.loads(listing.stdout or b"{}")
-        changed = sorted(name for name, stamp in current.items()
-                         if safe_member(name) and self.seen.get(name) != stamp)
-        if not changed:
+        if not isinstance(current, dict):
+            raise ValueError("远程作业目录清单无效")
+        return {name: stamp for name, stamp in current.items() if safe_member(name)
+                and isinstance(stamp, list) and len(stamp) == 2 and all(type(v) is int for v in stamp)}
+
+    def local_path(self, name: str) -> Optional[Path]:
+        target = self.local_dir / name
+        return target if self.local_dir.resolve() in target.resolve().parents else None
+
+    def plan(self, current: Dict[str, List[int]]) -> Tuple[List, int]:
+        """(request items, files left over) for one pass. An item is a name,
+        or [name, offset, sha256 of the DELTA_CHECK_BYTES before offset] for
+        a file this sync copied before and that only grew."""
+        changed = [name for name, stamp in current.items() if self.seen.get(name) != stamp]
+        items = []
+        for name in changed:
+            stamp, item, cost = current[name], name, current[name][0]
+            target = self.local_path(name)
+            if name in self.seen and target is not None and target.is_file():
+                offset = target.stat().st_size
+                if DELTA_CHECK_BYTES <= offset < stamp[0]:
+                    with target.open("rb") as source:
+                        source.seek(offset - DELTA_CHECK_BYTES)
+                        base = hashlib.sha256(source.read(DELTA_CHECK_BYTES)).hexdigest()
+                    item, cost = [name, offset, base], stamp[0] - offset
+            items.append((cost, name, item))
+        items.sort(key=lambda entry: (entry[0], entry[1]))
+        chosen, total = [], 0
+        for cost, _, item in items:
+            if chosen and (total + cost > self.PASS_BYTES or len(chosen) >= self.PASS_FILES):
+                break
+            chosen.append(item)
+            total += cost
+        return chosen, len(items) - len(chosen)
+
+    def sync(self) -> int:
+        """One bounded pass; the number of files written."""
+        current = self.manifest()
+        items, left = self.plan(current)
+        self.pending = len(items) + left
+        if not items:
             return 0
-        packed = self.runner(self.remote_python("pack", self.remote_dir),
-                             input=json.dumps(changed).encode(), capture_output=True, timeout=600)
-        if packed.returncode != 0:
-            raise ValueError("复制远程作业文件失败")
-        count = 0
-        with tarfile.open(fileobj=io.BytesIO(packed.stdout), mode="r|") as archive:
-            for member in archive:
-                if not member.isfile() or not safe_member(member.name) or member.name not in current:
-                    continue
-                target = self.local_dir / member.name
-                if self.local_dir.resolve() not in target.resolve().parents:
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                source = archive.extractfile(member)
-                temporary = target.with_name(target.name + "." + uuid.uuid4().hex[:8] + ".sync")
+        count = self.pack(items, current)
+        self.pending = max(0, self.pending - count)
+        self.files += count
+        return count
+
+    def pack(self, items: List, current: Dict[str, List[int]]) -> int:
+        """Request `items` and extract the tar stream as it arrives; a stream
+        idle for PACK_IDLE_TIMEOUT is abandoned (the files already written
+        stay written)."""
+        import tempfile
+        requested = {item if isinstance(item, str) else item[0] for item in items}
+        with tempfile.TemporaryFile() as errors:
+            process = self.popen(self.remote_python("pack", self.remote_dir), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=errors)
+            stream = _Watched(process.stdout)
+            done = threading.Event()
+
+            def watchdog():
+                while not done.wait(1):
+                    if time.monotonic() - stream.last > self.PACK_IDLE_TIMEOUT:
+                        process.kill()
+                        return
+
+            threading.Thread(target=watchdog, name="bench-sync-watchdog", daemon=True).start()
+            count = 0
+            try:
+                try:
+                    process.stdin.write(json.dumps(items).encode())
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+                with tarfile.open(fileobj=stream, mode="r|") as archive:
+                    for member in archive:
+                        if member.name in requested and self.receive(archive, member, current):
+                            count += 1
+            except tarfile.TarError:
+                pass  # a truncated stream: what arrived complete is kept
+            finally:
+                done.set()
+                self.bytes += stream.bytes
+                process.stdout.close()
+                code = process.wait()
+            if code != 0 and not count:
+                errors.seek(0)
+                detail = errors.read().decode(errors="replace").strip()[-300:]
+                raise ValueError("复制远程作业文件失败" + ("：" + detail if detail else ""))
+        return count
+
+    def receive(self, archive, member, current) -> bool:
+        if not member.isfile() or not safe_member(member.name):
+            return False
+        target = self.local_path(member.name)
+        if target is None:
+            return False
+        source = archive.extractfile(member)
+        offset = int(member.pax_headers.get("metacodes.offset", "0") or 0)
+        if offset:
+            # An append: valid only onto the local copy it was planned from.
+            if not target.is_file() or target.stat().st_size != offset:
+                self.seen.pop(member.name, None)
+                return False
+            with target.open("r+b") as output:
+                output.seek(offset)
+                shutil.copyfileobj(source, output)
+                output.truncate()
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(target.name + "." + uuid.uuid4().hex[:8] + ".sync")
+            try:
                 with temporary.open("wb") as output:
                     shutil.copyfileobj(source, output)
                 temporary.replace(target)
-                self.seen[member.name] = current[member.name]
-                count += 1
-        self.files += count
-        return count
+            finally:
+                temporary.unlink(missing_ok=True)
+        stamp = member.pax_headers.get("metacodes.stamp", "").split()
+        # The size and mtime of what was read, so a file that changed after
+        # the manifest is sent again and an unchanged one is not.
+        self.seen[member.name] = ([int(v) for v in stamp] if len(stamp) == 2 and all(v.isdigit() for v in stamp)
+                                  else current.get(member.name))
+        return True
+
+    def complete(self) -> bool:
+        """Whether the local copy holds every remote file at its current
+        size, as of a fresh manifest (no pass left anything behind)."""
+        current = self.manifest()
+        self.pending = sum(1 for name, stamp in current.items() if self.seen.get(name) != stamp)
+        if self.pending:
+            return False
+        for name, (size, _) in current.items():
+            target = self.local_path(name)
+            if target is None or not target.is_file() or target.stat().st_size != size:
+                self.seen.pop(name, None)
+                self.pending += 1
+        return not self.pending
 
 
 # ------------------------------------------------------------------ remote run
 
 class RemoteRun:
-    """Supervise one Harbor run on an SSH executor from the local worker."""
+    """Supervise one Harbor run on an SSH executor from the local worker.
+
+    The job directory is copied back on a background thread (`start_sync`),
+    so the supervisor's heartbeat and cancel handling never wait for a
+    transfer; `final_sync` copies what is left after Harbor exits and says
+    whether the local copy was verified complete."""
 
     HEARTBEAT_TIMEOUT = 90
     SYNC_INTERVAL = 10
+    FINAL_SYNC_TIMEOUT = 1800
 
     def __init__(self, spec: Dict, runner=subprocess.run, popen=subprocess.Popen, log=None):
         self.executor = parse({k: v for k, v in spec["executor"].items() if v is not None})
@@ -558,6 +739,11 @@ class RemoteRun:
         self.events: List[Dict] = []
         self.last_event = time.monotonic()
         self.sync_state = None
+        self.sync_stop = threading.Event()
+        self.sync_thread = None
+        # How long the final copy may take before the run reports its
+        # results as still on the executor (the environment can shorten it).
+        self.final_timeout = float(os.environ.get("METACODES_BENCH_FINAL_SYNC_TIMEOUT") or self.FINAL_SYNC_TIMEOUT)
 
     @property
     def remote_job_dir(self) -> str:
@@ -623,8 +809,7 @@ class RemoteRun:
         self.process.stdin.write((json.dumps({"env": secret_env}) + "\n").encode())
         self.process.stdin.flush()
         threading.Thread(target=self.read_events, daemon=True).start()
-        self.sync_state = JobSync(self.executor, self.runtime, self.remote_job_dir,
-                                  Path(self.spec["jobs_dir"]) / self.spec["name"], runner=self.runner, log=self.log)
+        self.sync_state = self.job_sync()
 
     def read_events(self) -> None:
         for line in self.process.stdout:
@@ -655,8 +840,104 @@ class RemoteRun:
                 return event.get("code")
         return None
 
-    def sync(self) -> None:
+    @property
+    def local_job_dir(self) -> Path:
+        return Path(self.spec["jobs_dir"]) / self.spec["name"]
+
+    def job_sync(self, runtime: Optional[str] = None) -> JobSync:
+        return JobSync(self.executor, runtime or self.runtime, self.remote_job_dir, self.local_job_dir,
+                       runner=self.runner, log=self.log, popen=self.popen)
+
+    def sync(self) -> bool:
+        """One pass; False when it failed (logged, retried by the caller)."""
         try:
             self.sync_state.sync()
+            return True
         except (ValueError, OSError, subprocess.TimeoutExpired, tarfile.TarError) as exc:
             self.log("同步远程作业目录失败：" + str(exc))
+            return False
+
+    def start_sync(self) -> None:
+        """Copy the job back every SYNC_INTERVAL seconds on a thread; a pass
+        that left files behind is followed by the next one at once."""
+        def loop():
+            while not self.sync_stop.is_set():
+                ok = self.sync()
+                if self.sync_stop.wait(0 if ok and self.sync_state.pending else self.SYNC_INTERVAL):
+                    return
+
+        self.sync_thread = threading.Thread(target=loop, name="bench-remote-sync", daemon=True)
+        self.sync_thread.start()
+
+    def final_sync(self, stop: Optional[threading.Event] = None, timeout: Optional[float] = None) -> bool:
+        """After Harbor exited: finish the running pass, then copy until a
+        fresh manifest shows the local copy complete. False when that could
+        not be verified within `timeout` or `stop` was set."""
+        self.sync_stop.set()
+        if self.sync_thread is not None:
+            self.sync_thread.join()
+        deadline = time.monotonic() + (self.final_timeout if timeout is None else timeout)
+        stop = stop or threading.Event()
+        while time.monotonic() < deadline and not stop.is_set():
+            pause = self.SYNC_INTERVAL
+            try:
+                if self.sync_state.complete():
+                    return True
+                # Files left: copy at once; a pass that copied nothing (a
+                # file the remote side cannot read yet) waits a little.
+                pause = 0 if self.sync_state.sync() else 1
+            except (ValueError, OSError, subprocess.TimeoutExpired, tarfile.TarError) as exc:
+                self.log("同步远程作业目录失败：" + str(exc))
+            stop.wait(min(pause, max(0.0, deadline - time.monotonic())))
+        return False
+
+    def results_note(self) -> Dict:
+        """Where the results still are, and how to copy them."""
+        return {"executor": self.executor.name, "path": self.remote_job_dir,
+                "retry": "metacodes bench sync --run " + self.spec["name"]}
+
+
+RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]*$")
+
+
+def sync_run(jobs_dir: Path, name: str, log=print, timeout: Optional[float] = None) -> Dict:
+    """`metacodes bench sync --run NAME`: copy an SSH run's job directory
+    back after its worker could not, and clear the receipt's note. A run
+    whose Harbor exited 0 becomes `finished` once its copy is complete."""
+    from scripts.eval.harbor.viewer.runner import ACTIVE, RunManager, atomic_json
+    if not isinstance(name, str) or not RUN_NAME.fullmatch(name):
+        raise ValueError("运行名称无效")
+    records = Path(jobs_dir) / ".bench-runs"
+    record_path, spec_path = records / (name + ".json"), records / (name + ".spec")
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("运行不存在：" + name) from None
+    if (spec.get("executor") or {}).get("kind") != "ssh":
+        raise ValueError(name + " 不是在 SSH 执行机器上运行的，结果已在本机")
+    fresh = time.time() - record_path.stat().st_mtime <= RunManager.STALE_AFTER
+    if record.get("status") in ACTIVE and fresh:
+        raise ValueError(name + " 仍在运行；它结束时会自己同步结果")
+    remote = RemoteRun(spec, log=log)
+    job = remote.job_sync(ship_runtime(remote.executor, log=log))
+    deadline = time.monotonic() + (RemoteRun.FINAL_SYNC_TIMEOUT if timeout is None else timeout)
+    complete = False
+    while time.monotonic() < deadline:
+        if job.complete():
+            complete = True
+            break
+        if not job.sync():
+            time.sleep(1)
+    if not complete:
+        raise ValueError(f"仍有 {job.pending} 个文件未同步完整，请稍后重试")
+    note = record.pop("remote_results", None)
+    if isinstance(note, dict):
+        rest = [part for part in str(record.get("error") or "").split("；") if part and part not in
+                str(note.get("message") or "").split("；")]
+        record["error"] = "；".join(rest) or None
+        if record.get("status") == "failed" and record.get("exit_code") == 0 and not rest:
+            record["status"] = "finished"
+        atomic_json(record_path, record)
+    return {"name": name, "files": job.files, "status": record.get("status"),
+            "local_dir": str(remote.local_job_dir)}

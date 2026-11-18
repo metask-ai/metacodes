@@ -40,7 +40,7 @@ def import_dirs(active: store_config.StoreConfig, roots: List[Path], verify: boo
     store = Store(active)
     try:
         results = [ingest.ingest_root(store, root, verify=verify, log=ingest.stderr_log) for root in roots]
-        ingest.refresh_projections(store)
+        ingest.refresh_projections(store, ingest.stderr_log)
     finally:
         store.close()
     value = {"database": active.describe(), "imports": [r.to_json() for r in results]}
